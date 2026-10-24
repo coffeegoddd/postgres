@@ -114,6 +114,9 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 									 "'s snapshot" : "");
 				else if (xlrec->op == BMAP_TREE_SNAPSHOT)
 					appendStringInfoString(buf, "snapshot");
+				else if (xlrec->op == BMAP_TREE_MOVE)
+					appendStringInfo(buf, "move %u -> %u", xlrec->from,
+									 xlrec->node);
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

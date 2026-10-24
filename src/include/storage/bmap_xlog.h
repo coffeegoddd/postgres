@@ -179,11 +179,7 @@ typedef struct xl_bmap_extend
  *						page whose pointer takes it (the root page, or a node);
  *						then the node, as an image; then the allocator's
  *						metapage and bitmap pages.  Redo extends the store to
- *						reach it, writing nothing over a block it had.  A node
- *						moved down (BMAP_TREE_MOVED) from block 'from', its
- *						entries the old one's, was written and synced before
- *						the record: redo writes and syncs it before the parent
- *						takes it, and the parent after.
+ *						reach it, writing nothing over a block it had.
  * BMAP_TREE_HOLD		a node is to be copied: reference-count pages of
  *						children of it, each holder more (the copy's), set
  *						before the copy holds them
@@ -199,6 +195,11 @@ typedef struct xl_bmap_extend
  *						subtrees, each a holder more; a copy of a snapshot
  *						(BMAP_TREE_OF_SNAPSHOT) has its header next, and
  *						then, if its shared_below rose, the source's header
+ * BMAP_TREE_MOVE		a node, 'from', moved down to 'node' (a copy of it
+ *						made by an earlier BMAP_TREE_NODE, written and synced
+ *						since): block 0 is the page whose pointer named 'from'
+ *						and now names 'node'.  Redo writes and syncs the copy
+ *						before the page takes it, and the page after.
  * BMAP_TREE_SNAPSHOT	a snapshot of the tree kept, or let go of: block 0 is
  *						the root page, whose slot changes, then (when kept)
  *						the header (its epoch raised) and the
@@ -210,10 +211,10 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_COPY			4
 #define BMAP_TREE_SHARE			5
 #define BMAP_TREE_SNAPSHOT		6
+#define BMAP_TREE_MOVE			7
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
-#define BMAP_TREE_MOVED			0x04
 
 typedef struct xl_bmap_tree
 {

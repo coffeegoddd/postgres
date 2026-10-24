@@ -10433,9 +10433,11 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("block-mapped storage moved tree nodes during online backup"),
+					 errdetail("A tree node was moved at or after the backup's starting point."),
 					 errhint("This means that the backup being taken is corrupt "
 							 "and should not be used. "
-							 "Try taking another online backup.")));
+							 "Try taking another online backup; on a standby, "
+							 "after a restartpoint past the move.")));
 	}
 
 	/*

@@ -29,6 +29,8 @@ autovacuum = off
 checkpoint_timeout = 1h
 wal_keep_size = '1GB'
 shared_buffers = 128MB
+bgwriter_lru_maxpages = 0
+restart_after_crash = on
 wal_consistency_checking = 'all'
 });
 $node->start;
@@ -193,7 +195,7 @@ my $s = $node->background_psql('postgres');
 $s->query_safe(q{SELECT injection_points_set_local();
 	SELECT injection_points_attach('bmap-compact-nodes', 'wait')});
 $s->query_until(qr/sweeping/, qq{\\echo sweeping
-	SELECT injection_points_attach('bmap-compact-moved', 'wait');
+	SELECT injection_points_attach('bmap-compact-nodes-installed', 'wait');
 	$sweep;
 });
 $node->wait_for_event('client backend', 'bmap-compact-nodes');
@@ -201,12 +203,12 @@ $b->query_safe(q{SELECT pg_backup_start('overlapping', true)});
 $node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-compact-nodes');
 	SELECT injection_points_wakeup('bmap-compact-nodes')});
 # (stopped once the nodes have moved, before their old blocks are freed)
-$node->wait_for_event('client backend', 'bmap-compact-moved');
+$node->wait_for_event('client backend', 'bmap-compact-nodes-installed');
 $b->query(q{SELECT * FROM pg_backup_stop()});
 like($b->{stderr}, qr/moved tree nodes during online backup/,
 	'a backup that overlapped the moves fails at its stop, during the sweep');
-$node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-compact-moved');
-	SELECT injection_points_wakeup('bmap-compact-moved')});
+$node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-compact-nodes-installed');
+	SELECT injection_points_wakeup('bmap-compact-nodes-installed')});
 $s->quit;
 isnt(nodes('t3'), $nodes3, 'the sweep moves the nodes');
 $b->quit;
@@ -227,6 +229,136 @@ like($sb->{stderr}, qr/moved tree nodes during online backup/,
 $sb->quit;
 is(digest('t4', $standby), digest('t4'), 'the standby reads the moved table');
 
+# A standby backup started after a replayed move, from a restartpoint past
+# it (a checkpoint on the primary, replayed, then one on the standby),
+# succeeds.
+sql('CHECKPOINT');
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+$standby->safe_psql('postgres', 'CHECKPOINT');
+$sb = $standby->background_psql('postgres', on_error_stop => 0);
+$sb->query_safe(q{SET client_min_messages = warning});
+$sb->query_safe(q{SELECT pg_backup_start('after', true)});
+$sb->query(q{SELECT * FROM pg_backup_stop()});
+unlike($sb->{stderr}, qr/moved tree nodes/,
+	'a standby backup from a restartpoint past the moves succeeds');
+$sb->quit;
 $standby->stop;
+
+# The changes a crash must keep: made after a checkpoint, twice (images,
+# then deltas), on pages under a leaf the sweep moves.
+my $changes = q{UPDATE %s SET b = 'pre' WHERE a IN (401, 501, 601, 701);
+	UPDATE %s SET b = 'changed' WHERE a IN (401, 501, 601, 701)};
+sub changed
+{
+	my ($t) = @_;
+	sql('CHECKPOINT');
+	sql(sprintf($changes, $t, $t));
+	return digest($t);
+}
+
+# A crash, then a sweep and another crash: the table as it was, each time.
+sub crash_keeps
+{
+	my ($t, $want, $what) = @_;
+	$node->stop('immediate');
+	$node->start;
+	is(digest($t), $want, "$what: a crash keeps the changes");
+	sql($sweep);
+	$node->stop('immediate');
+	$node->start;
+	is(digest($t), $want, "$what: and a sweep and a crash after");
+}
+
+# The copy's block taken from a table that had it after the checkpoint
+# (its extension zeroing it, its pages written there), dropped before the
+# sweep: redo of those records leaves the copy alone.
+copied_leaf('p');
+{
+	# (a sweep under a backup: the data pages move, the leaf doesn't)
+	my $bk = $node->background_psql('postgres');
+	$bk->query_safe(q{SET client_min_messages = warning});
+	$bk->query_safe(q{SELECT pg_backup_start('p', true)});
+	sql($sweep);
+	$bk->query_safe(q{SELECT * FROM pg_backup_stop()});
+	$bk->quit;
+}
+my $pnodes = nodes('p');
+sql('CHECKPOINT');
+sql(q{CREATE TABLE q (a int, b text) WITH (fillfactor = 10);
+	INSERT INTO q SELECT g, repeat('q', 300) FROM generate_series(1, 2) g});
+sql(sprintf($changes, 'p', 'p'));
+my $wantp = digest('p');
+sql(q{DROP TABLE q; SELECT * FROM test_bmap_release_drain()});
+sql($sweep);
+isnt(nodes('p'), $pnodes, 'the leaf moves to a block another table had since the checkpoint');
+crash_keeps('p', $wantp, 'a copy on a block with recent records');
+
+# A crash at each step of a move.
+for my $point (qw(bmap-compact-nodes bmap-compact-node-written
+	bmap-compact-node-moved bmap-compact-nodes-installed
+	bmap-compact-parents-synced))
+{
+	my $t = 'x_' . ($point =~ s/-/_/gr);
+	copied_leaf($t);
+	my $want = changed($t);
+	my $w = $node->background_psql('postgres', on_error_stop => 0);
+	$w->query_safe(qq{SELECT injection_points_set_local();
+		SELECT injection_points_attach('$point', 'wait')});
+	$w->query_until(qr/sweeping/, qq{\\echo sweeping
+		$sweep;
+	});
+	$node->wait_for_event('client backend', $point);
+	$node->stop('immediate');
+	eval { $w->quit };
+	$node->start;
+	is(digest($t), $want, "a crash at $point keeps the changes");
+	sql($sweep);
+	$node->stop('immediate');
+	$node->start;
+	is(digest($t), $want, "and a sweep and a crash after it");
+}
+
+# A cancel while a move is being finished waits for it (the parents
+# synced), and cancels the sweep; the next sweep frees the old block.
+copied_leaf('e1');
+my $wante1 = changed('e1');
+my $e1nodes = nodes('e1');
+my $w = $node->background_psql('postgres', on_error_stop => 0);
+$w->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-compact-node-moved', 'wait')});
+my $pid = $w->query_safe('SELECT pg_backend_pid()');
+$w->query_until(qr/sweeping/, qq{\\echo sweeping
+	$sweep;
+});
+$node->wait_for_event('client backend', 'bmap-compact-node-moved');
+sql(qq{SELECT pg_cancel_backend($pid)});
+# (a cancel that ended the wait leaves nothing to wake)
+$node->psql('postgres', q{SELECT injection_points_wakeup('bmap-compact-node-moved')});
+$w->quit;
+isnt(nodes('e1'), $e1nodes, 'a cancelled sweep finishes the move it began');
+# (the next sweep frees and cuts off the old block before any crash)
+sql($sweep);
+$node->stop('immediate');
+$node->start;
+is(digest('e1'), $wante1, 'after a cancelled sweep, a sweep and a crash keep the changes');
+
+# An error while a move is being finished: the server restarts, and redo
+# finishes it.
+copied_leaf('e2');
+my $wante2 = changed('e2');
+my ($ret, $out, $err) = $node->psql('postgres', qq{
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-compact-node-moved', 'error');
+	$sweep;
+});
+like($err, qr/server closed the connection|terminated/,
+	'an error while finishing a move is a PANIC');
+$node->poll_query_until('postgres', 'SELECT true');
+is(digest('e2'), $wante2, 'and recovery keeps the changes');
+sql($sweep);
+$node->stop('immediate');
+$node->start;
+is(digest('e2'), $wante2, 'and after a sweep and a crash');
+
 $node->stop;
 done_testing();
