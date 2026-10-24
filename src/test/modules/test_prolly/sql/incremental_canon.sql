@@ -218,7 +218,7 @@ SELECT length(dolt_commit('-am', 'before statuses')::text) > 0 AS committed;
 UPDATE many.hot SET v = v + 1;
 SELECT count(*) AS changes FROM dolt_status;
 :reset
-UPDATE many.t1 SET v = 'w' WHERE id = 1;
+INSERT INTO many.t12 VALUES (12, 'twelve');
 SELECT * FROM dolt_status ORDER BY 1;
 SELECT nextval('many.seq') > 0 AS moved;
 SELECT * FROM dolt_status ORDER BY 1;
@@ -229,7 +229,7 @@ SELECT length(dolt_commit('-am', 'after statuses')::text) > 0 AS committed;
 :flush
 SELECT 'commit after statuses' AS fold, * FROM work();
 -- (a definition changed: read again)
-ALTER TABLE many.t2 ADD COLUMN w int;
+ALTER TABLE many.t13 ADD COLUMN w int;
 :reset
 SELECT * FROM dolt_status ORDER BY 1;
 :flush
