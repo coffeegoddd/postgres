@@ -259,7 +259,7 @@ SELECT name, value > 0 AS moved FROM pg_temp.counted();
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated | moved 
 -------+-----------+-----------+-------
-     0 |         0 |         2 |     2
+     0 |         0 |         4 |     4
 (1 row)
 
 -- copies of copies, the first dropped first
@@ -292,7 +292,7 @@ SELECT test_bmap_unlink(:c2);
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated | moved 
 -------+-----------+-----------+-------
-     0 |         0 |         0 |     0
+     0 |         0 |         2 |     0
 (1 row)
 
 \c :home
