@@ -55,6 +55,7 @@ extern void tree_diff_across_heights(const ProllyImplInfo *impl);
 extern void tree_diff_unordered_matches(const ProllyImplInfo *impl);
 extern void tree_diff_estimate_bounds(const ProllyImplInfo *impl);
 extern void tree_seeks_in_order(const ProllyImplInfo *impl);
+extern void tree_apply_reads_paths_once(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 extern void tree_large_values(const ProllyImplInfo *impl);
 extern void tree_held_references(const ProllyImplInfo *impl);

@@ -25,6 +25,7 @@ BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 CkptSortItem *CkptBufferIds;
+pg_atomic_uint64 *BufferSmgrGeneration;
 
 static void BufferManagerShmemRequest(void *arg);
 static void BufferManagerShmemInit(void *arg);
@@ -101,6 +102,11 @@ BufferManagerShmemRequest(void *arg)
 	 * the checkpointer is restarted, memory allocation failures would be
 	 * painful.
 	 */
+	ShmemRequestStruct(.name = "Buffer Smgr Generation",
+					   .size = sizeof(pg_atomic_uint64),
+					   .ptr = (void **) &BufferSmgrGeneration,
+		);
+
 	ShmemRequestStruct(.name = "Checkpoint BufferIds",
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
@@ -126,6 +132,7 @@ BufferManagerShmemInit(void *arg)
 		ClearBufferTag(&buf->tag);
 
 		pg_atomic_init_u64(&buf->state, 0);
+		pg_atomic_init_u64(&buf->smgr_gen, 0);
 		buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
 
 		buf->buf_id = i;
@@ -135,4 +142,7 @@ BufferManagerShmemInit(void *arg)
 		proclist_init(&buf->lock_waiters);
 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
 	}
+
+	/* (above every buffer's: a page loaded is settled at none) */
+	pg_atomic_init_u64(BufferSmgrGeneration, 1);
 }
