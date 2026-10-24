@@ -342,6 +342,7 @@ tests += {
       't/221_reload_first_use.pl',
       't/250_snapshot_mount_pins.pl',
       't/280_merge_kept_references.pl',
+      't/310_reflog_after_gc.pl',
     ],
   },
 }

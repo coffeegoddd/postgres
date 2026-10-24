@@ -5022,6 +5022,38 @@ typedef struct ReflogRow
 	bool		nulls[4];
 } ReflogRow;
 
+/* Every ref a root names, in its order: ReflogRef *. */
+static void
+reflog_collect(const char *ref, const ProllyHash *commit, void *arg)
+{
+	List	  **named = arg;
+	ReflogRef  *r = palloc(sizeof(ReflogRef));
+
+	r->ref = pstrdup(ref);
+	r->commit = *commit;
+	*named = lappend(*named, r);
+}
+
+/* Does a root name the refs a collection left, each at its commit? */
+static bool
+reflog_same_refs(const ProllyHash *root, List *left)
+{
+	List	   *named = NIL;
+	bool		same;
+
+	(void) PROLLY_CALL(refs(), root_refs, root, reflog_collect, &named);
+	same = list_length(named) == list_length(left);
+	for (int i = 0; same && i < list_length(named); i++)
+	{
+		ReflogRef  *a = list_nth(named, i);
+		ReflogRef  *b = list_nth(left, i);
+
+		same = strcmp(a->ref, b->ref) == 0 && same_hash(&a->commit, &b->commit);
+	}
+	list_free_deep(named);
+	return same;
+}
+
 static void
 reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
 {
@@ -5086,7 +5118,11 @@ reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
  * Each change of a ref (a branch's head, a remote-tracking branch's
  * commit) the chunk store still records, newest first: as Dolt's reflog,
  * read from the roots the store was moved to, each with its time; a
- * garbage collection forgets the moves before it.  An argument names one
+ * garbage collection forgets the moves before it.  As in Dolt, whose roots
+ * after a collection are each a ref's change, the first of them that
+ * changed a ref lists every ref it names; those before it that changed
+ * none (a working set's checkpoint, as the fold worker takes, which moves
+ * the root and no ref) list nothing.  An argument names one
  * ref ("main", or "refs/heads/main"); "--all" lists every ref, which they
  * all are here already.
  */
@@ -5101,6 +5137,9 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	ReflogRoots rr = {0};
 	ReflogScan	rs = {0};
 	uint64		first;
+	ProllyHash	before = {0};
+	List	   *left = NIL;
+	bool		unchanged = false;
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -5130,13 +5169,26 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	rr.roots = palloc(sizeof(ReflogRoot) * REFLOG_ROOTS);
 	PROLLY_CALL(cs, roots, PROLLY_CALL(cs, open, MyDatabaseId,
 									   MyDatabaseTableSpace),
-				reflog_root, &rr);
+				&before, reflog_root, &rr);
 	first = rr.n > REFLOG_ROOTS ? rr.n - REFLOG_ROOTS : 0;
+	/* (with the oldest roots passed over, it isn't the one before them) */
+	if (before.len > 0 && first == 0)
+	{
+		(void) PROLLY_CALL(refs(), root_refs, &before, reflog_collect, &left);
+		unchanged = true;
+	}
 	for (uint64 i = first; i < rr.n; i++)
 	{
 		ReflogRoot *r = &rr.roots[i % REFLOG_ROOTS];
 
 		CHECK_FOR_INTERRUPTS();
+		if (unchanged)
+		{
+			if (same_hash(&r->root, &before) ||
+				reflog_same_refs(&r->root, left))
+				continue;
+			unchanged = false;
+		}
 		rs.at = r->at;
 		(void) PROLLY_CALL(refs(), root_refs, &r->root, reflog_ref, &rs);
 	}

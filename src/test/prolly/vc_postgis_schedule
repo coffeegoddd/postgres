@@ -4,3 +4,5 @@ test: vc_gis_moves
 test: vc_gis_history
 test: vc_gis_types
 test: vc_gis_remotes
+test: vc_gis_outdb
+test: vc_gis_extension

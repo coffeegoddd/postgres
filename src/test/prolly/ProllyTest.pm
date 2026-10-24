@@ -72,7 +72,7 @@ sub run_requirements
 	setup_target($node, 'regression', $am);
 	my $out = "$PostgreSQL::Test::Utils::tmp_check/$kind";
 	make_path($out);
-	my $runner = $kind eq 'isolation'
+	my $runner = $kind =~ /isolation\z/
 	  ? "$ENV{top_builddir}/src/test/isolation/pg_isolation_regress"
 	  : $ENV{PG_REGRESS};
 	my $rc = system($runner, '--use-existing', '--bindir=',
