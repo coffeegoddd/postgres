@@ -138,6 +138,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_VALUES_READ] = "values_read",
 	[PGSTAT_PROLLY_VALUE_BYTES_READ] = "value_bytes_read",
 	[PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS] = "bmap_release_growth_drains",
+	[PGSTAT_PROLLY_DEFINITIONS_REUSED] = "definitions_reused",
 };
 
 /*
