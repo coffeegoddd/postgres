@@ -63,6 +63,11 @@
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
+ *	'A' name	-> the role that made the branch, which owns it (its OID,
+ *				   native byte order); main has none, being the database
+ *				   owner's
+ *	'G' name	-> the role that made the tag here (the same): none for a
+ *				   tag fetched or pushed
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
@@ -227,6 +232,8 @@
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
+#define TAG_CREATOR		'A'	/* the role that made a branch */
+#define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
@@ -236,7 +243,7 @@
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
  * trees a pin keeps; 12: a schema-conflicted table's names on each side.
  */
-#define REFS_FORMAT		"12"
+#define REFS_FORMAT		"13"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -487,16 +494,16 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			kept_declare(p, end, refs);
 			break;
 		case TAG_STASH:
-			/* (each entry: its commit, then its branch's name) */
+			/* (each entry: its commit, its branch's name, its maker) */
 			while (p < end)
 			{
 				uint64		blen;
 
 				p = declare_hashes(p, end, 1, refs);
 				blen = prolly_get_varint(&p, end);
-				if (blen > (uint64) (end - p))
+				if (blen + sizeof(Oid) > (uint64) (end - p))
 					break;
-				p += blen;
+				p += blen + sizeof(Oid);
 			}
 			break;
 		default:
@@ -1125,6 +1132,7 @@ branch_entry(const char *key, int keylen)
 		case TAG_IDENTITY:
 		case TAG_REBASE:
 		case TAG_KEPT:
+		case TAG_CREATOR:
 			return true;
 		default:
 			return false;
@@ -1241,9 +1249,48 @@ branch_head(const char *name, ProllyHash *head)
 	return found && head->len > 0;
 }
 
+/* Record role (InvalidOid: none) as the role that made branch (tag) name. */
+static void
+maker_put(char tag, const char *name, Oid role)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, tag);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &role, sizeof(role));
+	refs_put(key.data, key.len, OidIsValid(role) ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* The role that made branch (tag) name; false if none is recorded. */
+static bool
+maker_get(char tag, const char *name, Oid *role)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, tag);
+	appendStringInfoString(&key, name);
+	found = refs_get(key.data, key.len, &v) && v.len == sizeof(Oid);
+	if (found)
+		memcpy(role, v.data, sizeof(Oid));
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
- * that moved it (head_moved_unseen()).
+ * that moved it (head_moved_unseen()).  A branch that gets its first head
+ * here (a fetch's, a clone's or a push's new branch) is the session role's,
+ * unless it was made with a role recorded already; main is never anyone's.
  */
 static void
 branch_set_head(const char *name, const ProllyHash *head)
@@ -1252,10 +1299,15 @@ branch_set_head(const char *name, const ProllyHash *head)
 	StringInfoData v;
 	FullTransactionId xid = head ? GetTopFullTransactionId() :
 		InvalidFullTransactionId;
+	Oid			role;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
 	branch_key(name, &key);
+	if (head && strcmp(name, "main") != 0 && !refs_get(key.data, key.len, &v) &&
+		!maker_get(TAG_CREATOR, name, &role))
+		maker_put(TAG_CREATOR, name, GetUserId());
+	resetStringInfo(&v);
 	if (head)
 		put_hash(&v, head);
 	refs_put(key.data, key.len, head ? &v : NULL);
@@ -3941,68 +3993,117 @@ get_time(const StringInfoData *v, TimestampTz *at)
 	return true;
 }
 
+/* The most items a commit has (write_commit's). */
+#define COMMIT_ITEMS	8
+
+/* Is a commit's item k the one named name? */
+static bool
+item_is(const ProllyKey *k, const char *name)
+{
+	return k->len == strlen(name) && memcmp(k->data, name, k->len) == 0;
+}
+
+/* Does item k sort after the one named name (by bytes, as a commit's do)? */
+static bool
+item_after(const ProllyKey *k, const char *name)
+{
+	size_t		len = strlen(name);
+	int			c = memcmp(k->data, name, Min(k->len, len));
+
+	return c > 0 || (c == 0 && k->len > len);
+}
+
+/*
+ * A commit's items are read in one pass: a get of each would descend the
+ * commit's tree once per item.  Any hash may name a commit here (a ref
+ * given in hex), so the pass stops past the last of a commit's items, or
+ * past as many items as a commit has: a descent of whatever tree the hash
+ * names, and a leaf or so.
+ */
 static bool
 copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 {
 	ProllyNodeRef ref;
-	StringInfoData v;
-	ProllyHash	root;
-	const char *p;
-	const char *end;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		has_root = false;
+	int			nitems = 0;
 
 	refs_init();
 	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
 		return false;
 	ref_of(id, &ref);
-	initStringInfo(&v);
-	if (!read_item(&ref, "root", &v))
-		return false;			/* a chunk, but not a commit */
 	memset(info, 0, sizeof(*info));
 	info->id = *id;
-	(void) get_hash(v.data, v.data + v.len, &root);
-	ref_of(&root, &info->root);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "parents", &v);
-	p = v.data;
-	end = v.data + v.len;
-	while (p < end && info->nparents < PROLLY_MAX_PARENTS)
-		p = get_hash(p, end, &info->parents[info->nparents++]);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "author", &v);
-	info->author = pstrdup(v.data);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "message", &v);
-	info->message = pstrdup(v.data);
-	resetStringInfo(&v);
-	if (read_item(&ref, "dependencies", &v))
+	info->author = pstrdup("");
+	info->message = pstrdup("");
+	c = PROLLY_CALL(tree, cursor_open, &env, &ref, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
-		ProllyHash	deps;
+		const char *p = (const char *) v.data;
+		const char *end = p + v.len;
 
-		(void) get_hash(v.data, v.data + v.len, &deps);
-		ref_of(&deps, &info->dependencies);
-		info->has_dependencies = true;
-	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "height", &v))
-	{
-		uint64		height;
-
-		if (get_uint64(&v, &height) && height > 0 && height <= PG_INT64_MAX)
+		/*
+		 * (past a commit's last item in key order, "time", or past as many
+		 * items as a commit has: whatever else the hash names, no more of
+		 * it is read)
+		 */
+		if (item_after(&k, "time") || ++nitems > COMMIT_ITEMS)
 		{
-			info->height = (int64) height;
-			info->has_height = true;
+			if (nitems > COMMIT_ITEMS)
+				has_root = false;
+			break;
+		}
+		if (item_is(&k, "root"))
+		{
+			ProllyHash	root;
+
+			(void) get_hash(p, end, &root);
+			ref_of(&root, &info->root);
+			has_root = true;
+		}
+		else if (item_is(&k, "parents"))
+		{
+			while (p < end && info->nparents < PROLLY_MAX_PARENTS)
+				p = get_hash(p, end, &info->parents[info->nparents++]);
+		}
+		else if (item_is(&k, "author"))
+			info->author = pnstrdup(p, v.len);
+		else if (item_is(&k, "message"))
+			info->message = pnstrdup(p, v.len);
+		else if (item_is(&k, "dependencies"))
+		{
+			ProllyHash	deps;
+
+			(void) get_hash(p, end, &deps);
+			ref_of(&deps, &info->dependencies);
+			info->has_dependencies = true;
+		}
+		else if (item_is(&k, "height") || item_is(&k, "time"))
+		{
+			StringInfoData n = {unconstify(char *, p), v.len, v.len, 0};
+			uint64		height;
+
+			if (item_is(&k, "time"))
+				(void) get_time(&n, &info->committed_at);
+			else if (get_uint64(&n, &height) && height > 0 &&
+					 height <= PG_INT64_MAX)
+			{
+				info->height = (int64) height;
+				info->has_height = true;
+			}
+		}
+		else if (item_is(&k, "identity") && v.len > 0)
+		{
+			info->identity = pnstrdup(p, v.len);
+			info->identity_len = v.len;
 		}
 	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "identity", &v) && v.len > 0)
-	{
-		info->identity = pnstrdup(v.data, v.len);
-		info->identity_len = v.len;
-	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "time", &v))
-		(void) get_time(&v, &info->committed_at);
-	pfree(v.data);
+	PROLLY_CALL(tree, cursor_close, c);
+	if (!has_root)
+		return false;			/* a chunk, but not a commit */
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS_READ, 1);
 	return true;
 }
@@ -4370,6 +4471,38 @@ head_names(const char *name, const ProllyHash *head)
 	return lines;
 }
 
+/* The role that made branch name, if one is recorded (never main's). */
+static bool
+copies_branch_creator(const char *name, Oid *role)
+{
+	refs_init();
+	return maker_get(TAG_CREATOR, name, role);
+}
+
+static void
+copies_branch_set_creator(const char *name, Oid role)
+{
+	refs_init();
+	lock_refs();
+	if (strcmp(name, "main") != 0)
+		maker_put(TAG_CREATOR, name, role);
+}
+
+static void
+copies_tag_set_creator(const char *name, Oid role)
+{
+	refs_init();
+	lock_refs();
+	maker_put(TAG_TAG_CREATOR, name, role);
+}
+
+static bool
+copies_tag_creator(const char *name, Oid *role)
+{
+	refs_init();
+	return maker_get(TAG_TAG_CREATOR, name, role);
+}
+
 /*
  * The commit the session branch's record of its tables is of, if it lists
  * relation relid among them (the head may have moved since, uncommitted).
@@ -4730,6 +4863,7 @@ copies_branch_create(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", name)));
+	maker_put(TAG_CREATOR, name, GetUserId());
 
 	/*
 	 * A branch starts at its start point's head commit, as in Dolt: a
@@ -4827,6 +4961,7 @@ copies_branch_delete(const char *name, bool force)
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
+	maker_put(TAG_CREATOR, name, InvalidOid);
 	/* (and the commits its pages were kept as of: they went with them) */
 	kept_put(name, NIL);
 }
@@ -4841,7 +4976,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES, TAG_IDENTITY, TAG_REBASE, TAG_KEPT};
+	TAG_NAMES, TAG_IDENTITY, TAG_REBASE, TAG_KEPT, TAG_CREATOR};
 	ListCell   *lc;
 
 	lock_branch(name);
@@ -4872,9 +5007,9 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->rename(name, newname, force);
 	else
 	{
-		/* (one with only a head: no session is on it) */
+		/* (one with only a head: no session is on it; checked as one with copies) */
 		branch_ops()->check_drop(name);
-		branch_ops()->check_create(newname);
+		prolly_check_branch_rename(newname);
 	}
 	/*
 	 * (violations, kept one entry each, moved apart from the tags'; the
@@ -5152,9 +5287,9 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
  * whose baseline lags the head keeps it, till the next fold advances it.
  */
 static int
-copies_commit_rows(const char *message, const ProllyRowChanges *changes,
-				   int nchanges, const Oid *sequences, int nsequences,
-				   ProllyHash *commit_id)
+commit_rows(const char *message, const ProllyRowChanges *changes,
+			int nchanges, const Oid *sequences, int nsequences,
+			ProllyHash *commit_id)
 {
 	char	   *name = branch_ops()->current();
 	ProllyHash	head;
@@ -5223,6 +5358,42 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 			branch_set_baseline(name, &next, NULL);
 	}
 	return 1;
+}
+
+/*
+ * A small commit reads the same nodes again and again: the refs' root for
+ * each entry got and put, the head's commit, the root's and each table's
+ * upper nodes for the seek and then the apply.  Its trees are held (the
+ * branch is locked) till it ends, so it keeps the nodes it reads, and
+ * reads each once.
+ */
+static int
+copies_commit_rows(const char *message, const ProllyRowChanges *changes,
+				   int nchanges, const Oid *sequences, int nsequences,
+				   ProllyHash *commit_id)
+{
+	MemoryContext kept = NULL;
+	int			r;
+
+	refs_init();
+	if (PROLLY_HAS(tree, keep_nodes))
+	{
+		kept = AllocSetContextCreate(CurrentMemoryContext, "commit's kept nodes",
+									 ALLOCSET_DEFAULT_SIZES);
+		PROLLY_CALL(tree, keep_nodes, kept);
+	}
+	PG_TRY();
+	{
+		r = commit_rows(message, changes, nchanges, sequences, nsequences,
+						commit_id);
+	}
+	PG_FINALLY();
+	{
+		if (kept)
+			MemoryContextDelete(kept);
+	}
+	PG_END_TRY();
+	return r;
 }
 
 /*
@@ -7389,6 +7560,8 @@ copies_tag_set(const char *name, const ProllyHash *expected,
 		put_hash(&v, &info.commit);
 	}
 	refs_put(key.data, key.len, tag ? &v : NULL);
+	/* (a tag deleted, made or moved is no one's until its maker is told) */
+	maker_put(TAG_TAG_CREATOR, name, InvalidOid);
 	pfree(key.data);
 	pfree(v.data);
 	return true;
@@ -7625,7 +7798,8 @@ copies_set_rebase_state(const ProllyRebaseState *state)
 
 /* ------------------------------------------------------------------------
  * Stashes: TAG_STASH and a list's name, its entries newest first, each its
- * commit's hash, then its branch's name (a varint length, then the bytes).
+ * commit's hash, then its branch's name (a varint length, then the bytes),
+ * then the role that pushed it (its OID, native byte order).
  * ------------------------------------------------------------------------
  */
 
@@ -7633,6 +7807,7 @@ typedef struct StashEntry
 {
 	ProllyHash	stash;
 	char	   *branch;
+	Oid			maker;
 } StashEntry;
 
 static List *
@@ -7647,12 +7822,14 @@ stash_list(const char *p, const char *end)
 
 		p = get_hash(p, end, &e->stash);
 		blen = prolly_get_varint(&p, end);
-		if (blen > (uint64) (end - p))
+		if (blen + sizeof(Oid) > (uint64) (end - p))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("corrupt prolly stash list")));
 		e->branch = pnstrdup(p, blen);
 		p += blen;
+		memcpy(&e->maker, p, sizeof(Oid));
+		p += sizeof(Oid);
 		entries = lappend(entries, e);
 	}
 	return entries;
@@ -7701,6 +7878,7 @@ stash_set(const char *name, List *entries)
 		put_hash(&v, &e->stash);
 		prolly_put_varint(&v, strlen(e->branch));
 		appendStringInfoString(&v, e->branch);
+		appendBinaryStringInfo(&v, &e->maker, sizeof(Oid));
 	}
 	refs_put(key.data, key.len, entries ? &v : NULL);
 	pfree(key.data);
@@ -7731,7 +7909,23 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
+	e->maker = GetUserId();
 	stash_set(name, lcons(e, entries));
+}
+
+/* The role that pushed name's nth stash; false if it has none. */
+static bool
+copies_stash_maker(const char *name, int n, Oid *role)
+{
+	List	   *entries;
+
+	refs_init();
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	*role = ((StashEntry *) list_nth(entries, n))->maker;
+	return true;
 }
 
 static void
@@ -7886,4 +8080,9 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
 	.recorded_relation = copies_recorded_relation,
+	.branch_creator = copies_branch_creator,
+	.branch_set_creator = copies_branch_set_creator,
+	.tag_creator = copies_tag_creator,
+	.tag_set_creator = copies_tag_set_creator,
+	.stash_maker = copies_stash_maker,
 };

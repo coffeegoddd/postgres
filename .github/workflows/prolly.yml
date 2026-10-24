@@ -111,6 +111,8 @@ jobs:
           make -s -j4 -C contrib COPT=-Werror
           make -s -j4 -C src/test/modules COPT=-Werror
           make -s install
+          make -s -C contrib/amcheck install
+          make -s -C contrib/pg_buffercache install
 
       - uses: actions/setup-java@v4
         with:
@@ -155,6 +157,23 @@ jobs:
             --known src/tools/prolly_bench/configs/v_shape_known.toml \
             --json "$PWD/engine-results/v-shape/vshape.json" \
             --markdown "$PWD/engine-results/v-shape/vshape.md"
+
+      # The same queries' rows before and after every storage cleanup: a
+      # difference fails the run; the latencies are reported, not gated.
+      # Nightly, at a larger size too.
+      - name: V suite cleanup invariance
+        env:
+          V10_SIZES: ${{ (github.event_name == 'schedule' || inputs.nightly) && 'pr,nightly' || 'pr' }}
+        run: |
+          src/tools/prolly_bench/prolly_bench run V --am prolly \
+            --workloads V10 --config src/tools/prolly_bench/configs/v_cleanup.toml \
+            --sizes "$V10_SIZES" \
+            --work-dir "$RUNNER_TEMP/v-cleanup" --out "$PWD/engine-results/v-cleanup"
+          src/tools/prolly_bench/prolly_bench vclean "$PWD"/engine-results/v-cleanup/*-V-prolly \
+            --json "$PWD/engine-results/v-cleanup/vclean.json" \
+            --markdown "$PWD/engine-results/v-cleanup/vclean.md"
+          { echo '### V10 cleanup invariance: paired latency, phase 2 over phase 1'; echo;
+            cat "$PWD/engine-results/v-cleanup/vclean.md"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark evidence
         if: always()

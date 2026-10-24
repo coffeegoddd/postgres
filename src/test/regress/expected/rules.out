@@ -1297,8 +1297,9 @@ dolt_branches| SELECT name,
     owner_role,
     protected,
     kind,
-    base
-   FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty, owner, owner_role, protected, kind, base);
+    base,
+    creator
+   FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty, owner, owner_role, protected, kind, base, creator);
 dolt_commit_ancestors| SELECT commit_hash,
     parent_hash,
     parent_index

@@ -185,7 +185,8 @@ static const struct rolinfo RolInfo[] = {
 	{"pg_create_subscription", ROLE_PG_CREATE_SUBSCRIPTION},
 	{"pg_signal_autovacuum_worker", ROLE_PG_SIGNAL_AUTOVACUUM_WORKER},
 	{"pg_prolly_fetch", ROLE_PG_PROLLY_FETCH},
-	{"pg_prolly_push", ROLE_PG_PROLLY_PUSH}
+	{"pg_prolly_push", ROLE_PG_PROLLY_PUSH},
+	{"pg_prolly_write", ROLE_PG_PROLLY_WRITE}
 };
 
 

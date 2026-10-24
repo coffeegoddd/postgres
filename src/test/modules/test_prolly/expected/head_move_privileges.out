@@ -1,0 +1,862 @@
+-- Moving a branch's head (a commit, a reset of any kind, a merge, a
+-- cherry-pick, a revert, a rebase, a branch's deletion, rename or forced
+-- move, an integration) takes owning the branch, the database's CREATE
+-- privilege, or pg_prolly_write's privileges: a role with only SELECT on
+-- the tables can't move a branch every session on it reads (#895).
+CREATE DATABASE regress_head_moves;
+\c regress_head_moves
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA hm VERSIONED;
+CREATE TABLE hm.t (a int PRIMARY KEY);
+CREATE ROLE regress_hm_reader;
+CREATE ROLE regress_hm_inserter;
+CREATE ROLE regress_hm_writer IN ROLE pg_prolly_write;
+CREATE ROLE regress_hm_creator;
+CREATE ROLE regress_hm_owner;
+CREATE ROLE regress_hm_dml;
+GRANT USAGE ON SCHEMA hm TO PUBLIC;
+GRANT SELECT ON hm.t TO regress_hm_reader;
+GRANT SELECT, INSERT ON hm.t TO regress_hm_inserter;
+GRANT ALL ON hm.t TO regress_hm_writer, regress_hm_creator, regress_hm_owner,
+	regress_hm_dml;
+GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_creator;
+INSERT INTO hm.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+INSERT INTO hm.t VALUES (2);
+SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('feat');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('gone');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feat');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'feat'"}
+(1 row)
+
+INSERT INTO hm.t VALUES (10);
+SELECT length(dolt_commit('-Am', 'feat')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO hm.t VALUES (3);
+SELECT length(dolt_commit('-Am', 'three')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- a branch the owner role made, while it could make branches
+GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_owner;
+SET ROLE regress_hm_owner;
+SELECT dolt_branch('mine');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('mine2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_head_moves FROM regress_hm_owner;
+-- Each statement list run, then undone: 'ok', 'denied' (insufficient
+-- privilege), or the error otherwise.
+CREATE FUNCTION public.try(VARIADIC q text[]) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	s text;
+BEGIN
+	BEGIN
+		FOREACH s IN ARRAY q LOOP
+			EXECUTE s;
+		END LOOP;
+		RAISE EXCEPTION 'undo';
+	EXCEPTION
+		WHEN insufficient_privilege THEN
+			RETURN 'denied';
+		WHEN OTHERS THEN
+			IF SQLERRM = 'undo' THEN
+				RETURN 'ok';
+			END IF;
+			RETURN 'error: ' || SQLERRM;
+	END;
+END $$;
+CREATE TABLE public.ops (n int, op text, q text[]);
+INSERT INTO public.ops VALUES
+	(1, 'commit', ARRAY[$$SELECT dolt_commit('--allow-empty', '-m', 'empty')$$]),
+	(2, 'reset --soft', ARRAY[$$SELECT dolt_reset('--soft', 'HEAD~1')$$]),
+	(3, 'reset (mixed)', ARRAY[$$SELECT dolt_reset('HEAD~1')$$]),
+	(4, 'reset --hard', ARRAY[$$SELECT dolt_reset('--hard', 'HEAD~1')$$]),
+	(5, 'reset --hard HEAD', ARRAY[$$SELECT dolt_reset('--hard')$$]),
+	(6, 'merge', ARRAY[$$SELECT dolt_merge('feat')$$]),
+	(7, 'merge --squash', ARRAY[$$SELECT dolt_merge('--squash', 'feat')$$]),
+	(8, 'cherry-pick', ARRAY[$$SELECT dolt_cherry_pick('feat')$$]),
+	(9, 'revert', ARRAY[$$SELECT dolt_revert('HEAD')$$]),
+	(10, 'rebase', ARRAY[$$SELECT dolt_rebase('feat')$$]),
+	(11, 'branch -d', ARRAY[$$SELECT dolt_branch('-D', 'gone')$$]),
+	(12, 'branch -m', ARRAY[$$SELECT dolt_branch('-m', 'gone', 'gone2')$$]),
+	(13, 'branch -f', ARRAY[$$SELECT dolt_branch('-f', 'gone', 'feat')$$]),
+	(14, 'branch -c -f', ARRAY[$$SELECT dolt_branch('-c', '-f', 'feat', 'gone')$$]);
+GRANT SELECT ON public.ops TO PUBLIC;
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/head_moves/' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_hashof('main') AS main_head \gset
+-- the superuser: every one
+SELECT n, op, try(VARIADIC q) FROM public.ops ORDER BY n;
+ n  |        op         | try 
+----+-------------------+-----
+  1 | commit            | ok
+  2 | reset --soft      | ok
+  3 | reset (mixed)     | ok
+  4 | reset --hard      | ok
+  5 | reset --hard HEAD | ok
+  6 | merge             | ok
+  7 | merge --squash    | ok
+  8 | cherry-pick       | ok
+  9 | revert            | ok
+ 10 | rebase            | ok
+ 11 | branch -d         | ok
+ 12 | branch -m         | ok
+ 13 | branch -f         | ok
+ 14 | branch -c -f      | ok
+(14 rows)
+
+-- SELECT only: none (nor with INSERT too)
+SET ROLE regress_hm_reader;
+SELECT n, op, try(VARIADIC q) FROM public.ops ORDER BY n;
+ n  |        op         |  try   
+----+-------------------+--------
+  1 | commit            | denied
+  2 | reset --soft      | denied
+  3 | reset (mixed)     | denied
+  4 | reset --hard      | denied
+  5 | reset --hard HEAD | denied
+  6 | merge             | denied
+  7 | merge --squash    | denied
+  8 | cherry-pick       | denied
+  9 | revert            | denied
+ 10 | rebase            | denied
+ 11 | branch -d         | denied
+ 12 | branch -m         | denied
+ 13 | branch -f         | denied
+ 14 | branch -c -f      | denied
+(14 rows)
+
+SET ROLE regress_hm_inserter;
+SELECT n, op, try(VARIADIC q) FROM public.ops ORDER BY n;
+ n  |        op         |  try   
+----+-------------------+--------
+  1 | commit            | denied
+  2 | reset --soft      | denied
+  3 | reset (mixed)     | denied
+  4 | reset --hard      | denied
+  5 | reset --hard HEAD | denied
+  6 | merge             | denied
+  7 | merge --squash    | denied
+  8 | cherry-pick       | denied
+  9 | revert            | denied
+ 10 | rebase            | denied
+ 11 | branch -d         | denied
+ 12 | branch -m         | denied
+ 13 | branch -f         | denied
+ 14 | branch -c -f      | denied
+(14 rows)
+
+SELECT dolt_reset('--soft', 'HEAD~1');
+ERROR:  permission denied to move the head of branch "main"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+SELECT dolt_branch('-D', 'gone');
+ERROR:  permission denied to move the head of branch "gone"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+-- (nor a pull: refused before the fetch)
+SELECT dolt_pull('origin', 'main');
+ERROR:  permission denied to move the head of branch "main"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+-- (a branch not made yet isn't made either)
+SELECT dolt_branch('newer');
+ERROR:  permission denied for database regress_head_moves
+RESET ROLE;
+SELECT dolt_hashof('main') = :'main_head' AS head_kept;
+ head_kept 
+-----------
+ t
+(1 row)
+
+-- pg_prolly_write's privileges, or the database's CREATE: every one
+SET ROLE regress_hm_writer;
+SELECT n, op, try(VARIADIC q) FROM public.ops ORDER BY n;
+ n  |        op         | try 
+----+-------------------+-----
+  1 | commit            | ok
+  2 | reset --soft      | ok
+  3 | reset (mixed)     | ok
+  4 | reset --hard      | ok
+  5 | reset --hard HEAD | ok
+  6 | merge             | ok
+  7 | merge --squash    | ok
+  8 | cherry-pick       | ok
+  9 | revert            | ok
+ 10 | rebase            | ok
+ 11 | branch -d         | ok
+ 12 | branch -m         | ok
+ 13 | branch -f         | ok
+ 14 | branch -c -f      | ok
+(14 rows)
+
+SET ROLE regress_hm_creator;
+SELECT n, op, try(VARIADIC q) FROM public.ops ORDER BY n;
+ n  |        op         | try 
+----+-------------------+-----
+  1 | commit            | ok
+  2 | reset --soft      | ok
+  3 | reset (mixed)     | ok
+  4 | reset --hard      | ok
+  5 | reset --hard HEAD | ok
+  6 | merge             | ok
+  7 | merge --squash    | ok
+  8 | cherry-pick       | ok
+  9 | revert            | ok
+ 10 | rebase            | ok
+ 11 | branch -d         | ok
+ 12 | branch -m         | ok
+ 13 | branch -f         | ok
+ 14 | branch -c -f      | ok
+(14 rows)
+
+-- (and an integration of another's branch into main)
+SET ROLE regress_hm_writer;
+SELECT dolt_checkout('gone');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'gone'"}
+(1 row)
+
+SELECT try($$SELECT dolt_integrate('-m', 'in')$$) AS integrate;
+ integrate 
+-----------
+ ok
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+RESET ROLE;
+-- the branch's owner: its own branch's head, not main's
+SET ROLE regress_hm_owner;
+SELECT n, op, try(VARIADIC q) FROM public.ops WHERE n IN (1, 6, 11, 12) ORDER BY n;
+ n  |    op     |  try   
+----+-----------+--------
+  1 | commit    | denied
+  6 | merge     | denied
+ 11 | branch -d | denied
+ 12 | branch -m | denied
+(4 rows)
+
+SELECT dolt_checkout('mine');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'mine'"}
+(1 row)
+
+SELECT try($$SELECT dolt_commit('--allow-empty', '-m', 'mine')$$) AS commit_own,
+	try($$SELECT dolt_reset('--soft', 'HEAD~1')$$) AS soft_reset_own,
+	try($$SELECT dolt_reset('--hard')$$) AS hard_reset_own,
+	try($$SELECT dolt_merge('feat')$$) AS merge_into_own,
+	try($$SELECT dolt_cherry_pick('feat')$$) AS pick_onto_own,
+	try($$SELECT dolt_commit('--allow-empty', '-m', 'mine')$$,
+		$$SELECT dolt_rebase('feat')$$) AS rebase_own,
+	try($$SELECT dolt_integrate('-m', 'in')$$) AS integrate_into_main;
+ commit_own | soft_reset_own | hard_reset_own | merge_into_own | pick_onto_own | rebase_own | integrate_into_main 
+------------+----------------+----------------+----------------+---------------+------------+---------------------
+ ok         | ok             | ok             | ok             | ok            | ok         | denied
+(1 row)
+
+-- (a rebase's own branch, made on the role's behalf, isn't renamed into a
+-- branch of its choosing)
+SELECT dolt_commit('--allow-empty', '-m', 'mine, to rebase') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'feat') IS NOT NULL AS began;
+ began 
+-------
+ t
+(1 row)
+
+SELECT active_branch();
+  active_branch   
+------------------
+ dolt_rebase_mine
+(1 row)
+
+SELECT dolt_branch('-m', 'dolt_rebase_mine', 'free_branch');
+ERROR:  a rebase's branch can't be renamed
+HINT:  Finish the rebase with dolt_rebase('--continue'), or abort it.
+SELECT dolt_rebase('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- a rename takes a new name, as making a branch does: not the owner's
+SELECT try($$SELECT dolt_branch('-m', 'mine2', 'mine3')$$) AS rename_own,
+	try($$SELECT dolt_branch('-D', 'mine2')$$) AS delete_own,
+	try($$SELECT dolt_branch('-f', 'mine2', 'feat')$$) AS force_own;
+ rename_own | delete_own | force_own 
+------------+------------+-----------
+ denied     | ok         | ok
+(1 row)
+
+RESET ROLE;
+-- a branch's owner is kept by its new name
+SET ROLE regress_hm_writer;
+SELECT dolt_branch('-m', 'mine2', 'mine3');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT name, CASE WHEN creator = current_user THEN '(database owner)' ELSE creator END AS creator
+FROM dolt_branches WHERE name IN ('main', 'mine', 'mine3')
+ORDER BY name;
+ name  |     creator      
+-------+------------------
+ main  | (database owner)
+ mine  | regress_hm_owner
+ mine3 | regress_hm_owner
+(3 rows)
+
+SET ROLE regress_hm_owner;
+SELECT try($$SELECT dolt_branch('-D', 'mine3')$$) AS delete_renamed;
+ delete_renamed 
+----------------
+ ok
+(1 row)
+
+RESET ROLE;
+-- a branch deleted and made again by another isn't the old owner's
+SELECT dolt_branch('-D', 'mine3');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('mine3');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET ROLE regress_hm_owner;
+SELECT try($$SELECT dolt_branch('-D', 'mine3')$$) AS delete_others;
+ delete_others 
+---------------
+ denied
+(1 row)
+
+RESET ROLE;
+-- a branch whose maker was dropped is the database owner's
+CREATE ROLE regress_hm_gone;
+GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_gone;
+SET ROLE regress_hm_gone;
+SELECT dolt_branch('orphan');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT name, creator = 'regress_hm_gone' AS by_gone FROM dolt_branches
+WHERE name = 'orphan';
+  name  | by_gone 
+--------+---------
+ orphan | t
+(1 row)
+
+REVOKE CREATE ON DATABASE regress_head_moves FROM regress_hm_gone;
+DROP ROLE regress_hm_gone;
+SELECT name, creator = current_user AS database_owners FROM dolt_branches
+WHERE name = 'orphan';
+  name  | database_owners 
+--------+-----------------
+ orphan | t
+(1 row)
+
+-- stashes: dropped (or popped) only by the role that pushed them, or one
+-- that writes the refs; a clear clears only the role's own
+INSERT INTO hm.t VALUES (50);
+SET ROLE regress_hm_dml;
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+INSERT INTO hm.t VALUES (51);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT name, stash_id FROM dolt_stashes ORDER BY stash_id;
+ name  | stash_id  
+-------+-----------
+ shelf | stash@{0}
+ shelf | stash@{1}
+(2 rows)
+
+SET ROLE regress_hm_reader;
+SELECT try($$SELECT dolt_stash('drop', 'shelf', 'stash@{1}')$$) AS drop_others,
+	try($$SELECT dolt_stash('pop', 'shelf', 'stash@{1}')$$) AS pop_others,
+	try($$SELECT dolt_stash('clear', 'shelf')$$) AS clear_none_own;
+ drop_others | pop_others | clear_none_own 
+-------------+------------+----------------
+ denied      | denied     | ok
+(1 row)
+
+RESET ROLE;
+SELECT count(*) AS kept FROM dolt_stashes;
+ kept 
+------
+    2
+(1 row)
+
+SET ROLE regress_hm_dml;
+SELECT try($$SELECT dolt_stash('drop', 'shelf', 'stash@{0}')$$) AS drop_others,
+	try($$SELECT dolt_stash('drop', 'shelf', 'stash@{1}')$$) AS drop_own;
+ drop_others | drop_own 
+-------------+----------
+ denied      | ok
+(1 row)
+
+SELECT dolt_stash('clear', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT name, stash_id FROM dolt_stashes ORDER BY stash_id;
+ name  | stash_id  
+-------+-----------
+ shelf | stash@{0}
+(1 row)
+
+SET ROLE regress_hm_writer;
+SELECT dolt_stash('clear', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT count(*) AS left FROM dolt_stashes;
+ left 
+------
+    0
+(1 row)
+
+-- tags: made by a role that writes the refs, deleted by their maker too
+SET ROLE regress_hm_reader;
+SELECT try($$SELECT dolt_tag('v_reader')$$) AS tag_reader;
+ tag_reader 
+------------
+ denied
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_hm_owner;
+SELECT try($$SELECT dolt_tag('v_owner')$$) AS tag_branch_owner;
+ tag_branch_owner 
+------------------
+ denied
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_hm_creator;
+SELECT dolt_tag('v_creator');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT dolt_tag('v_super');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SET ROLE regress_hm_inserter;
+SELECT try($$SELECT dolt_tag('-d', 'v_creator')$$) AS delete_others;
+ delete_others 
+---------------
+ denied
+(1 row)
+
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_head_moves FROM regress_hm_creator;
+SET ROLE regress_hm_creator;
+SELECT try($$SELECT dolt_tag('-d', 'v_super')$$) AS delete_others,
+	try($$SELECT dolt_tag('-d', 'v_creator')$$) AS delete_own;
+ delete_others | delete_own 
+---------------+------------
+ denied        | ok
+(1 row)
+
+RESET ROLE;
+GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_creator;
+SET ROLE regress_hm_writer;
+SELECT try($$SELECT dolt_tag('-d', 'v_super')$$) AS delete_as_writer;
+ delete_as_writer 
+------------------
+ ok
+(1 row)
+
+RESET ROLE;
+-- remotes: added and removed by a role that writes the refs
+SET ROLE regress_hm_reader;
+SELECT try($$SELECT dolt_remote('add', 'other', 'file:///nowhere')$$) AS add_reader,
+	try($$SELECT dolt_remote('remove', 'origin')$$) AS remove_reader;
+ add_reader | remove_reader 
+------------+---------------
+ denied     | denied
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_hm_writer;
+SELECT try($$SELECT dolt_remote('add', 'other', 'file:///nowhere')$$,
+		   $$SELECT dolt_remote('remove', 'other')$$) AS add_remove_writer;
+ add_remove_writer 
+-------------------
+ ok
+(1 row)
+
+RESET ROLE;
+-- a fetch sets the remote's tags here only for a role that writes the
+-- refs: another's leaves them, and a fetched tag is no one's to delete
+SELECT dolt_tag('v_remote') IS NOT NULL AS tagged;
+ tagged 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('origin', 'v_remote') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_tag('-d', 'v_remote') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+CREATE ROLE regress_hm_fetcher IN ROLE pg_read_server_files;
+SET ROLE regress_hm_fetcher;
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+NOTICE:  the remote's tags were not fetched
+DETAIL:  Setting tags takes the database's CREATE privilege or the privileges of the "pg_prolly_write" role.
+ fetched 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+ v_remote_here 
+---------------
+             0
+(1 row)
+
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+ fetched 
+---------
+ t
+(1 row)
+
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+ v_remote_here 
+---------------
+             1
+(1 row)
+
+SET ROLE regress_hm_fetcher;
+SELECT try($$SELECT dolt_tag('-d', 'v_remote')$$) AS delete_fetched;
+ delete_fetched 
+----------------
+ denied
+(1 row)
+
+RESET ROLE;
+DROP ROLE regress_hm_fetcher;
+-- a forced move of a branch without commits keeps its owner, and is a
+-- head move: its owner's, without CREATE
+CREATE DATABASE regress_head_moves_empty;
+\c regress_head_moves_empty
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA hme VERSIONED;
+GRANT CREATE ON DATABASE regress_head_moves_empty TO regress_hm_owner;
+SET ROLE regress_hm_owner;
+SELECT dolt_branch('empty1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_head_moves_empty FROM regress_hm_owner;
+SET ROLE regress_hm_owner;
+SELECT dolt_branch('-f', 'empty1', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_hm_writer;
+SELECT dolt_branch('-f', 'empty1', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT name, creator FROM dolt_branches WHERE name = 'empty1';
+  name  |     creator      
+--------+------------------
+ empty1 | regress_hm_owner
+(1 row)
+
+\c regress_head_moves
+-- writer modes: a writer with its tables' grants alone integrates its own
+-- writer branch where it may write the rows it changes as they changed; a
+-- change to rows it may not write so takes a head move's privileges (and
+-- the rows a move applies take all of a table's write privileges)
+CREATE TABLE hm.w (id int PRIMARY KEY, v text);
+INSERT INTO hm.w VALUES (1, 'one');
+GRANT SELECT, INSERT, UPDATE, DELETE ON hm.w TO regress_hm_inserter;
+CREATE TABLE hm.v (id int PRIMARY KEY, v text);
+INSERT INTO hm.v VALUES (1, 'one');
+GRANT SELECT, INSERT, DELETE ON hm.v TO regress_hm_inserter;
+-- (keys from a serial and an identity column: their sequences' values move)
+CREATE TABLE hm.ser (id serial PRIMARY KEY, v text);
+CREATE TABLE hm.idt (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+GRANT SELECT, INSERT, UPDATE, DELETE ON hm.ser, hm.idt TO regress_hm_inserter;
+GRANT USAGE ON SEQUENCE hm.ser_id_seq, hm.idt_id_seq TO regress_hm_inserter;
+SELECT length(dolt_commit('-Am', 'w and v')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET ROLE regress_hm_inserter;
+SET dolt.writer = 'plain';
+INSERT INTO hm.w VALUES (2, 'plain');
+NOTICE:  writing on branch "writer/plain/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...): rows of tables this role may write as they changed integrate; a change to a definition, or to rows it may not write so, takes the privileges of the "pg_prolly_write" role or the database's CREATE privilege.
+SELECT active_branch();
+   active_branch   
+-------------------
+ writer/plain/main
+(1 row)
+
+INSERT INTO hm.ser (v) VALUES ('plain');
+INSERT INTO hm.idt (v) VALUES ('plain');
+SELECT length(dolt_commit('-am', 'plain row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_integrate('-m', 'plain in'))[1] = dolt_hashof('main') AS integrated;
+ integrated 
+------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT id, v FROM hm.w ORDER BY id;
+ id |   v   
+----+-------
+  1 | one
+  2 | plain
+(2 rows)
+
+SELECT id, v FROM hm.ser;
+ id |   v   
+----+-------
+  1 | plain
+(1 row)
+
+SELECT id, v FROM hm.idt;
+ id |   v   
+----+-------
+  1 | plain
+(1 row)
+
+INSERT INTO hm.w VALUES (3, 'plain');
+NOTICE:  writing on branch "writer/plain/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...): rows of tables this role may write as they changed integrate; a change to a definition, or to rows it may not write so, takes the privileges of the "pg_prolly_write" role or the database's CREATE privilege.
+SELECT active_branch();
+   active_branch   
+-------------------
+ writer/plain/main
+(1 row)
+
+SELECT length(dolt_commit('-am', 'plain row 3')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+RESET ROLE;
+-- (a row of main's changed on the writer's branch, by the database's owner,
+-- in a table the writer may not update)
+SELECT dolt_checkout('writer/plain/main');
+                dolt_checkout                
+---------------------------------------------
+ {0,"Already on branch 'writer/plain/main'"}
+(1 row)
+
+UPDATE hm.v SET v = 'changed' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'changed one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET ROLE regress_hm_inserter;
+\set VERBOSITY terse
+SELECT dolt_integrate('-m', 'in');
+ERROR:  permission denied to move the head of branch "main"
+\set VERBOSITY default
+RESET ROLE;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('-m', 'plain in', 'writer/plain/main'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT id, v FROM hm.w ORDER BY id;
+ id |   v   
+----+-------
+  1 | one
+  2 | plain
+  3 | plain
+(3 rows)
+
+SELECT id, v FROM hm.v ORDER BY id;
+ id |    v    
+----+---------
+  1 | changed
+(1 row)
+
+RESET dolt.writer;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+-- dolt.transaction_commit's commit is a head move too
+SET ROLE regress_hm_inserter;
+SET dolt.transaction_commit = on;
+INSERT INTO hm.t VALUES (100);
+ERROR:  permission denied to move the head of branch "main"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+RESET dolt.transaction_commit;
+RESET ROLE;
+SELECT count(*) AS not_inserted FROM hm.t WHERE a = 100;
+ not_inserted 
+--------------
+            0
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_head_moves;
+DROP DATABASE regress_head_moves_empty;
+DROP ROLE regress_hm_reader, regress_hm_inserter, regress_hm_writer,
+	regress_hm_creator, regress_hm_owner, regress_hm_dml;

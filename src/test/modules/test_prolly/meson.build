@@ -224,6 +224,7 @@ tests += {
       'kept_commit_shares',
       'snapshot_mounts',
       'history_mounts',
+      'head_move_privileges',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -381,6 +382,7 @@ tests += {
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
       't/336_compared_fold_restart.pl',
+      't/360_cleanup_invariance.pl',
     ],
   },
 }

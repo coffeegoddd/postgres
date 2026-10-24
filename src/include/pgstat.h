@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFD
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD01
 
 typedef struct PgStat_ArchiverStats
 {
@@ -777,6 +777,10 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_DEFINITIONS_REUSED,	/* definitions reads (a status's)
 										 * that took the last one's, only
 										 * sequences read again */
+	PGSTAT_PROLLY_STATUS_REUSED,	/* comparisons into the working set (a
+									 * status's) that took the last one's,
+									 * only tables written since compared
+									 * again */
 	PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, /* autovacuum's collections
 											 * skipped: another collection
 											 * of the store was running */
