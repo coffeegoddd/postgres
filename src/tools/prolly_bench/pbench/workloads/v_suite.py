@@ -598,7 +598,8 @@ class V9(VWorkload):
     @staticmethod
     def unrelated(k: int) -> str:
         """K shared tables in a plain schema and K tables on another branch,
-        made from a commit before the table's."""
+        made from a commit before the table's (committed a hundred at a
+        time, so that no transaction holds the locks of them all)."""
         table = "(id int PRIMARY KEY, a text, b int, c date)"
         return f"""
             CREATE TABLE v9_first (id int PRIMARY KEY);
@@ -606,11 +607,13 @@ class V9(VWorkload):
             CREATE SCHEMA v9_plain;
             DO $$ BEGIN FOR g IN 1..{k} LOOP
                 EXECUTE format('CREATE TABLE v9_plain.p%s {table}', g);
+                IF g % 100 = 0 THEN COMMIT; END IF;
             END LOOP; END $$;
             SELECT dolt_branch('v9_other');
             SELECT dolt_checkout('v9_other');
             DO $$ BEGIN FOR g IN 1..{k} LOOP
                 EXECUTE format('CREATE TABLE v9_o%s {table}', g);
+                IF g % 100 = 0 THEN COMMIT; END IF;
             END LOOP; END $$;
             SELECT dolt_checkout('main');
         """
