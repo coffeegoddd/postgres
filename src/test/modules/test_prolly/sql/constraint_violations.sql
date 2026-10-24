@@ -442,6 +442,33 @@ COMMIT;
 SELECT dolt_branch('-D', 'ex_x');
 DROP SCHEMA ex CASCADE;
 
+-- A row a merge doesn't write for breaking unique indexes is recorded as
+-- Dolt records it: once for each unique index it breaks, and so is each
+-- row it collides with there (the table keeps them: a unique index holds
+-- one of two).  An index of an expression, or with a predicate, has only
+-- the refused row recorded, when its write was refused for it.
+CREATE SCHEMA ux VERSIONED;
+CREATE TABLE ux.t (pk int PRIMARY KEY, a int UNIQUE, b int UNIQUE, c int);
+CREATE UNIQUE INDEX t_c_expr ON ux.t ((c * 2));
+INSERT INTO ux.t VALUES (1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'ux base')::text) AS committed;
+SELECT dolt_branch('ux_side');
+INSERT INTO ux.t VALUES (2, 20, 30, 40), (3, 21, 31, 41);
+SELECT length(dolt_commit('-am', 'ux ours')::text) AS committed;
+SELECT dolt_checkout('ux_side');
+-- (a row colliding with ours' pk 2 on a and pk 3 on b; one with pk 2 on c * 2)
+INSERT INTO ux.t VALUES (4, 20, 31, 50), (5, 60, 60, 40);
+SELECT length(dolt_commit('-am', 'ux theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('ux_side'))[3:4];
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('ux.t') ORDER BY 1, 2;
+SELECT pk FROM ux.t ORDER BY pk;
+ROLLBACK;
+SELECT dolt_branch('-D', 'ux_side');
+DROP SCHEMA ux CASCADE;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
 DROP ROLE regress_cv_owner;

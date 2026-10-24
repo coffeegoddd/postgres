@@ -56,7 +56,7 @@ SELECT length(dolt_commit('-am', 'main changes')::text) AS committed;
 -- Outside a transaction block, the merge is rolled back.
 SELECT dolt_merge('feature');
 ERROR:  merge constraint violations detected, transaction rolled back
-DETAIL:  2 rows violate constraints.
+DETAIL:  3 rows violate constraints.
 HINT:  Merge in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.
 SELECT id FROM cv.child ORDER BY id;
  id 
@@ -76,7 +76,7 @@ SELECT (dolt_merge('feature'))[3:4];
 SELECT * FROM dolt_constraint_violations();
  table_name | num_violations 
 ------------+----------------
- cv.child   |              2
+ cv.child   |              3
 (1 row)
 
 SELECT violation_type, violating_row, violation_info
@@ -85,7 +85,8 @@ FROM dolt_constraint_violations('cv.child') ORDER BY violation_type;
 ----------------+----------------------------------+----------------------------------------------------------------------------------------------------------------------------------------
  foreign key    | {"id": 2, "pid": 2, "code": "b"} | {"Table": "cv.child", "Columns": ["pid"], "ForeignKey": "child_pid_fkey", "ReferencedTable": "cv.parent", "ReferencedColumns": ["id"]}
  unique index   | {"id": 4, "pid": 1, "code": "x"} | {"Name": "child_code_key", "Columns": ["code"]}
-(2 rows)
+ unique index   | {"id": 3, "pid": 1, "code": "x"} | {"Name": "child_code_key", "Columns": ["code"]}
+(3 rows)
 
 SELECT id, pid, code FROM cv.child ORDER BY id;
  id | pid | code 
@@ -261,7 +262,8 @@ SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child')
  violation_type |          violating_row           
 ----------------+----------------------------------
  unique index   | {"id": 1, "pid": 1, "code": "z"}
-(1 row)
+ unique index   | {"id": 7, "pid": 1, "code": "z"}
+(2 rows)
 
 -- (a table dropped since has none to fix)
 SAVEPOINT s;
@@ -365,7 +367,7 @@ RESET dolt.allow_commit_conflicts;
 SELECT table_name, num_violations FROM dolt_constraint_violations();
  table_name | num_violations 
 ------------+----------------
- cv.child   |              1
+ cv.child   |              2
 (1 row)
 
 -- A branch deleted takes its violations with it.
@@ -537,10 +539,12 @@ ORDER BY table_name;
 ------------+----------------------+-----------------------------------+-------------------------------------------------
  dv.ex      | exclusion constraint | {"r": "[5,7)", "pk": 3}           | {"Name": "ex_r_excl", "Columns": ["r"]}
  dv.later   | unique index         | {"x": 5, "pk": 3}                 | {"Name": "later_x_key", "Columns": ["x"]}
+ dv.later   | unique index         | {"x": 5, "pk": 2}                 | {"Name": "later_x_key", "Columns": ["x"]}
  dv.now     | unique index         | {"x": 5, "pk": 3}                 | {"Name": "now_x_key", "Columns": ["x"]}
+ dv.now     | unique index         | {"x": 5, "pk": 2}                 | {"Name": "now_x_key", "Columns": ["x"]}
  dv.pk      | unique index         | {"x": 3, "pk": 2}                 | {"Name": "pk_pkey", "Columns": ["pk"]}
  dv.wo      | exclusion constraint | {"k": "[1,2)", "during": "[5,8)"} | {"Name": "wo_pkey", "Columns": ["k", "during"]}
-(5 rows)
+(7 rows)
 
 SELECT * FROM dv.later ORDER BY pk;
  pk | x 
@@ -886,20 +890,33 @@ ORDER BY 1, 3;
  t | violation_type |        violating_row         
 ---+----------------+------------------------------
  a | unique index   | {"b": 99, "c": 200, "pk": 2}
+ a | unique index   | {"b": 99, "c": 300, "pk": 3}
  b | unique index   | {"b": 20, "c": 999, "pk": 2}
+ b | unique index   | {"b": 30, "c": 999, "pk": 3}
  c | unique index   | {"b": 99, "c": 200, "pk": 2}
+ c | unique index   | {"b": 99, "c": 300, "pk": 3}
+ p | unique index   | {"b": 3, "c": 2, "pk": 2}
+ p | unique index   | {"b": 4, "c": 1, "pk": 1}
  p | unique index   | {"b": 4, "c": 2, "pk": 1}
  p | unique index   | {"b": 4, "c": 2, "pk": 2}
  r | unique index   | {"b": 999, "c": 0, "pk": 1}
+ r | unique index   | {"b": 999, "c": 0, "pk": 2}
  s | unique index   | {"b": 999, "c": 0, "pk": 1}
+ s | unique index   | {"b": 999, "c": 0, "pk": 2}
+ u | unique index   | {"x": 1, "pk": 1}
  u | unique index   | {"x": 1, "pk": 2}
  w | unique index   | {"x": 2, "pk": 1}
+ w | unique index   | {"x": 2, "pk": 2}
  w | unique index   | {"x": 5, "pk": 2}
+ w | unique index   | {"x": 5, "pk": 3}
  x | unique index   | {"b": 0, "c": 1, "pk": 3}
+ x | unique index   | {"b": 0, "c": 2, "pk": 4}
  x | unique index   | {"b": 3, "c": 0, "pk": 2}
+ x | unique index   | {"b": 3, "c": 1, "pk": 3}
  x | unique index   | {"b": 3, "c": 2, "pk": 4}
+ x | unique index   | {"b": 4, "c": 0, "pk": 2}
  x | unique index   | {"b": 4, "c": 3, "pk": 1}
-(14 rows)
+(27 rows)
 
 ROLLBACK;
 SELECT dolt_branch('-D', 'uv_theirs');
@@ -1037,12 +1054,18 @@ ORDER BY 1, 3;
  t  | violation_type |        violating_row         
 ----+----------------+------------------------------
  ad | unique index   | {"b": 99, "c": 200, "pk": 2}
+ ad | unique index   | {"b": 99, "c": 300, "pk": 3}
  ai | unique index   | {"b": 99, "c": 200, "pk": 2}
+ ai | unique index   | {"b": 99, "c": 300, "pk": 3}
  d  | unique index   | {"x": 5, "pk": 1}
+ d  | unique index   | {"x": 5, "pk": 2}
  d  | unique index   | {"x": 7, "pk": 2}
+ d  | unique index   | {"x": 7, "pk": 3}
  i  | unique index   | {"x": 5, "pk": 1}
+ i  | unique index   | {"x": 5, "pk": 2}
  i  | unique index   | {"x": 7, "pk": 2}
-(6 rows)
+ i  | unique index   | {"x": 7, "pk": 3}
+(12 rows)
 
 ROLLBACK;
 SELECT dolt_branch('-D', 'dw_theirs');
@@ -1188,7 +1211,9 @@ FROM dolt_constraint_violations('ex.a') ORDER BY 1;
 ----+----------------
  1  | unique index
  2  | unique index
-(2 rows)
+ 2  | unique index
+ 3  | unique index
+(4 rows)
 
 SELECT * FROM ex.a ORDER BY pk;
  pk  |  b   |   c    
@@ -1271,6 +1296,89 @@ DROP SCHEMA ex CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table ex.a
 drop cascades to table ex.x
+-- A row a merge doesn't write for breaking unique indexes is recorded as
+-- Dolt records it: once for each unique index it breaks, and so is each
+-- row it collides with there (the table keeps them: a unique index holds
+-- one of two).  An index of an expression, or with a predicate, has only
+-- the refused row recorded, when its write was refused for it.
+CREATE SCHEMA ux VERSIONED;
+CREATE TABLE ux.t (pk int PRIMARY KEY, a int UNIQUE, b int UNIQUE, c int);
+CREATE UNIQUE INDEX t_c_expr ON ux.t ((c * 2));
+INSERT INTO ux.t VALUES (1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'ux base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ux_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO ux.t VALUES (2, 20, 30, 40), (3, 21, 31, 41);
+SELECT length(dolt_commit('-am', 'ux ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ux_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'ux_side'"}
+(1 row)
+
+-- (a row colliding with ours' pk 2 on a and pk 3 on b; one with pk 2 on c * 2)
+INSERT INTO ux.t VALUES (4, 20, 31, 50), (5, 60, 60, 40);
+SELECT length(dolt_commit('-am', 'ux theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('ux_side'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('ux.t') ORDER BY 1, 2;
+ pk |  index   
+----+----------
+ 2  | t_a_key
+ 3  | t_b_key
+ 4  | t_a_key
+ 4  | t_b_key
+ 5  | t_c_expr
+(5 rows)
+
+SELECT pk FROM ux.t ORDER BY pk;
+ pk 
+----
+  1
+  2
+  3
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'ux_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA ux CASCADE;
+NOTICE:  drop cascades to table ux.t
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

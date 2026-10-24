@@ -150,7 +150,7 @@
         "rows": [
           [
             "public.t",
-            "1"
+            "4"
           ]
         ],
         "order": "bag"
@@ -167,7 +167,7 @@
       "expect": {
         "rows": [
           [
-            "1"
+            "4"
           ]
         ],
         "order": "bag"
@@ -183,6 +183,24 @@
       "sql": "SELECT violation_type, violating_row->>'pk', violating_row->>'a', violating_row->>'b' FROM dolt_constraint_violations('t') ORDER BY violating_row->>'pk', violation_info::text",
       "expect": {
         "rows": [
+          [
+            "unique index",
+            "1",
+            "0",
+            "0"
+          ],
+          [
+            "unique index",
+            "1",
+            "0",
+            "0"
+          ],
+          [
+            "unique index",
+            "2",
+            "0",
+            "0"
+          ],
           [
             "unique index",
             "2",
@@ -204,7 +222,7 @@
       "expect": {
         "rows": [
           [
-            "0"
+            "2"
           ]
         ],
         "order": "bag"
@@ -221,7 +239,7 @@
       "expect": {
         "rows": [
           [
-            "1"
+            "2"
           ]
         ],
         "order": "bag"

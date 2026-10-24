@@ -2188,6 +2188,8 @@ typedef struct Recorded
 	bool		last_unique;	/* the one recorded last breaks a unique index
 								 * or exclusion constraint */
 	StringInfoData buf;			/* (reading the attempt's back) */
+	Tuplesortstate *unique;		/* the unique index violations kept, to
+								 * complete (complete_unique_violations()) */
 } Recorded;
 
 /* A violation kept, as sorted: its strings follow, each with its NUL. */
@@ -2366,6 +2368,8 @@ violation_keep(Oid relid, const char *type, const char *row, const char *info)
 	KeptViolation *t = kept_of(relid, type, row, info, 1, recorded->nkept++);
 
 	kept_sort_put(recorded->kept, t);
+	if (recorded->unique && strcmp(type, "unique index") == 0)
+		kept_sort_put(recorded->unique, t);
 	pfree(t);
 }
 
@@ -2379,6 +2383,7 @@ recorded_begin(void)
 										  ALLOCSET_DEFAULT_SIZES);
 	recorded->owner = CurrentResourceOwner;
 	recorded->kept = kept_sort_begin(comparetup_kept);
+	recorded->unique = kept_sort_begin(comparetup_kept);
 	recorded->buf.data = NULL;
 }
 
@@ -2390,6 +2395,8 @@ recorded_end(void)
 		return;
 	if (recorded->kept)
 		tuplesort_end(recorded->kept);
+	if (recorded->unique)
+		tuplesort_end(recorded->unique);
 	if (recorded->forgotten)
 		tuplesort_end(recorded->forgotten);
 	if (recorded->attempt)
@@ -2582,6 +2589,185 @@ note_written(Oid relid)
 	MemoryContextSwitchTo(old);
 }
 
+static char *row_json(TupleTableSlot *slot);
+static char *quote_json(const char *s);
+static const char *only_unless_partitioned(Oid relid);
+
+/*
+ * What a unique index breaks, as constraint_info() describes it: its name
+ * and its columns'.
+ */
+static char *
+index_info(Relation rel, Oid index)
+{
+	HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index));
+	StringInfoData s;
+	bool		first = true;
+
+	initStringInfo(&s);
+	appendStringInfo(&s, "{\"Name\": %s, \"Columns\": [",
+					 quote_json(get_rel_name(index)));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_index ix = (Form_pg_index) GETSTRUCT(tup);
+
+		for (int i = 0; i < ix->indnkeyatts; i++)
+		{
+			if (ix->indkey.values[i] == 0)
+				continue;
+			appendStringInfo(&s, "%s%s", first ? "" : ", ",
+							 quote_json(get_attname(RelationGetRelid(rel),
+													ix->indkey.values[i], false)));
+			first = false;
+		}
+		ReleaseSysCache(tup);
+	}
+	appendStringInfoString(&s, "]}");
+	return s.data;
+}
+
+/*
+ * The query finding the rows of rel a row (as JSON, $1) collides with in
+ * unique index index, not the row's own key's: its columns equal (NULLs
+ * distinct, unless the index says not), or NULL if the index isn't one
+ * of plain columns without a predicate (whose collisions aren't found so).
+ */
+static char *
+collision_query(Relation rel, Oid index, const Bitmapset *pk)
+{
+	HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index));
+	Form_pg_index ix;
+	StringInfoData q;
+	char	   *name;
+	int			col;
+
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	ix = (Form_pg_index) GETSTRUCT(tup);
+	if (!ix->indisunique || ix->indisprimary || !ix->indisvalid ||
+		!heap_attisnull(tup, Anum_pg_index_indpred, NULL) ||
+		!heap_attisnull(tup, Anum_pg_index_indexprs, NULL))
+	{
+		ReleaseSysCache(tup);
+		return NULL;
+	}
+	name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+									  RelationGetRelationName(rel));
+	initStringInfo(&q);
+	appendStringInfo(&q, "SELECT row_to_json(t)::text FROM %s%s t, "
+					 "json_populate_record(NULL::%s, $1::json) r WHERE true",
+					 only_unless_partitioned(RelationGetRelid(rel)), name, name);
+	for (int i = 0; i < ix->indnkeyatts; i++)
+	{
+		const char *att = quote_identifier(get_attname(RelationGetRelid(rel),
+													   ix->indkey.values[i],
+													   false));
+
+		appendStringInfo(&q, ix->indnullsnotdistinct ?
+						 " AND t.%s IS NOT DISTINCT FROM r.%s" :
+						 " AND t.%s = r.%s", att, att);
+	}
+	col = -1;
+	if (!bms_is_empty(pk))
+	{
+		bool		first = true;
+
+		appendStringInfoString(&q, " AND (");
+		while ((col = bms_next_member(pk, col)) >= 0)
+		{
+			const char *att = quote_identifier(get_attname(RelationGetRelid(rel),
+														   col + FirstLowInvalidHeapAttributeNumber,
+														   false));
+
+			appendStringInfo(&q, "%st.%s IS DISTINCT FROM r.%s",
+							 first ? "" : " OR ", att, att);
+			first = false;
+		}
+		appendStringInfoChar(&q, ')');
+	}
+	ReleaseSysCache(tup);
+	return q.data;
+}
+
+/*
+ * The unique index violations a merge kept, completed as Dolt records
+ * them: a row the merge didn't write for breaking a unique index is
+ * recorded for every unique index it breaks, not only the one its write
+ * was refused for, and so is each row of the table it collides with
+ * there (which the table keeps).  The rows the merge refused aren't
+ * written still: a Postgres unique index holds one of them.  Indexes of
+ * expressions, or with predicates, are left to the refusal's own record.
+ */
+static void
+complete_unique_violations(void)
+{
+	const KeptViolation *t;
+	Oid			relid = InvalidOid;
+	Relation	rel = NULL;
+	List	   *queries = NIL;	/* each unique index's: (query, info) */
+	Bitmapset  *pk = NULL;
+	ListCell   *lc;
+	Oid			argtypes[1] = {TEXTOID};
+	Tuplesortstate *unique = recorded->unique;
+
+	/* (those kept here aren't completed again) */
+	recorded->unique = NULL;
+	tuplesort_performsort(unique);
+	SPI_connect();
+	while ((t = kept_sort_next(unique)) != NULL)
+	{
+		if (t->relid != relid)
+		{
+			if (rel)
+				table_close(rel, NoLock);
+			relid = t->relid;
+			rel = try_table_open(relid, AccessShareLock);
+			queries = NIL;
+			if (rel == NULL)
+				continue;
+			pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+			foreach(lc, RelationGetIndexList(rel))
+			{
+				char	   *q = collision_query(rel, lfirst_oid(lc), pk);
+
+				if (q)
+					queries = lappend(queries,
+									  list_make2(q, index_info(rel, lfirst_oid(lc))));
+			}
+		}
+		if (rel == NULL)
+			continue;
+		foreach(lc, queries)
+		{
+			char	   *q = linitial(lfirst(lc));
+			char	   *info = lsecond(lfirst(lc));
+			Datum		arg = CStringGetTextDatum(KEPT_ROW(t));
+
+			if (SPI_execute_with_args(q, 1, argtypes, &arg, NULL, true, 0) != SPI_OK_SELECT)
+				elog(ERROR, "could not find the rows a merged row collides with");
+			if (SPI_processed == 0)
+				continue;
+
+			/* (each once: the kept violations' sort keeps one of each) */
+			violation_keep(relid, "unique index", KEPT_ROW(t), info);
+			for (uint64 i = 0; i < SPI_processed; i++)
+			{
+				char	   *row = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+
+				violation_keep(relid, "unique index", row, info);
+				pfree(row);
+			}
+			SPI_freetuptable(SPI_tuptable);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (rel)
+		table_close(rel, NoLock);
+	SPI_finish();
+	tuplesort_end(unique);
+}
+
 /*
  * Merge base to theirs into ours, recording the violations it leaves (with
  * those the branch had): its rows it didn't write, and those of the tables
@@ -2605,6 +2791,7 @@ merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
 								conflicted);
 		recording = false;
 		foreign_key_violations(written, NIL, found_kept, NULL);
+		complete_unique_violations();
 		*nviolations = keep_violations();
 	}
 	PG_FINALLY();

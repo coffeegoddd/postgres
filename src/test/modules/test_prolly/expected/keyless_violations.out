@@ -270,7 +270,8 @@ SELECT violation_type, violating_row FROM dolt_constraint_violations('kv.u');
  violation_type |  violating_row   
 ----------------+------------------
  unique index   | {"x": 5, "y": 5}
-(1 row)
+ unique index   | {"x": 5, "y": 9}
+(2 rows)
 
 SET LOCAL dolt.allow_commit_conflicts = on;
 SELECT length(dolt_commit('-am', 'merged with a violation')::text) AS committed;
