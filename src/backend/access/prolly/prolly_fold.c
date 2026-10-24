@@ -32,6 +32,7 @@ bool		debug_prolly_force_full_fold = false;
 bool		prolly_fold_counted = true;
 int			prolly_log_full_folds = -1;
 bool		prolly_fold_on_rewrite = true;
+double		prolly_map_reshaped_dead_ratio = 1.5;
 ProllyFullFold prolly_last_full_fold;
 
 static const char *const reason_names[PROLLY_FULL_REASONS] = {
@@ -718,6 +719,33 @@ prolly_fold_mappable(Relation rel, const ProllyValue *old)
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(cxt);
 	return mappable;
+}
+
+/*
+ * (measured: a map costs about 0.46 us a row, a full fold 0.36 us a live
+ * row and 0.07 us a dead version, so a map wins past about 1.5 dead
+ * versions a live row; the table's statistics count them, as autovacuum
+ * reads them, and a table they don't know of yet is read in full)
+ */
+bool
+prolly_fold_map_cheaper(Relation rel)
+{
+	PgStat_StatTabEntry *t;
+	bool		may_free = false;
+	bool		cheaper;
+
+	if (prolly_map_reshaped_dead_ratio <= 0)
+		return true;
+	/* (the branch's own statistics: each branch has its relations' own) */
+	t = pgstat_fetch_stat_tabentry_ext(rel->rd_rel->relisshared,
+									   RelationGetStatsId(rel), &may_free);
+	if (t == NULL)
+		return false;
+	cheaper = (double) t->dead_tuples >=
+		prolly_map_reshaped_dead_ratio * (double) Max(t->live_tuples, 1);
+	if (may_free)
+		pfree(t);
+	return cheaper;
 }
 
 /*

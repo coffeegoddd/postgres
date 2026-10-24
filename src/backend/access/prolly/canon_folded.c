@@ -1820,7 +1820,8 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
  * or one shape_holds() says its rows are as they were under), or one whose
- * rows map to it (shape_mappable()); with a next baseline being made, its
+ * rows map to it (shape_mappable()) where mapping them costs less than
+ * reading the table (prolly_fold_map_cheaper()); with a next baseline being made, its
  * entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
@@ -1849,7 +1850,8 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		/* (when reading another table: not mapped, as its rows aren't read) */
 		if (!cn->no_rows &&
 			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
-			shape_mappable(cn, rel, bt, &shape, &tf.shape))
+			shape_mappable(cn, rel, bt, &shape, &tf.shape) &&
+			prolly_fold_map_cheaper(rel))
 			tf.reshaped = true;
 		else
 			bt = NULL;
