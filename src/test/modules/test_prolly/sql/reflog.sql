@@ -84,8 +84,12 @@ SELECT dolt_push('o-a', 'main') IS NOT NULL AS pushed;
 COMMIT;
 SELECT ref FROM dolt_reflog('--all') WHERE ref LIKE 'refs/remotes/%';
 
--- A garbage collection forgets the moves before it.
+-- A garbage collection forgets the moves before it.  A move since that
+-- changed no ref (a working set's checkpoint, as the fold worker takes)
+-- lists nothing, read from another session too; the first that changes
+-- one lists every ref it names, as Dolt's first root after a collection.
 SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT prolly_checkpoint() IS NOT NULL AS checkpointed;
 \c reflog_db
 SELECT count(*) FROM dolt_reflog();
 SELECT dolt_checkout('-b', 'after_gc') IS NOT NULL AS checked_out;
