@@ -337,6 +337,16 @@ typedef struct ProllyTreeRoutine
 	 */
 	uint64		(*rank) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						 const ProllyKey *key);
+
+	/*
+	 * Optional: until cxt is reset or deleted, the tree may keep the nodes
+	 * it reads (in cxt), and read again from them rather than from the
+	 * chunk store, so a caller that descends the same trees many times (a
+	 * commit's reads and small applies, one after another) reads each
+	 * node once.  nodes_read counts only reads from the store.  The caller
+	 * reads only trees it holds while the scope is open.  Scopes nest.
+	 */
+	void		(*keep_nodes) (MemoryContext cxt);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -344,9 +354,9 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered", "diff_estimate", "value_splice", "rank"
+	"diff_unordered", "diff_estimate", "value_splice", "rank", "keep_nodes"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK rank
+#define PROLLY_TREE_LAST_CALLBACK keep_nodes
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

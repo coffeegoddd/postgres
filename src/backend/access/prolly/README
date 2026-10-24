@@ -742,6 +742,13 @@ trees (fold_rows), with no fold and no snapshot checked.  A transaction
 that changed definitions, or more rows than it keeps (or than
 maintenance_work_mem holds), or whose rows can't be applied so (a table
 the head describes otherwise), commits its working set instead.
+Such a commit descends the same trees many times (the refs' root for each
+entry it gets and puts, the head's commit and root, each row's path for its
+seek and then its apply), so it opens a tree keep_nodes() scope: each node
+above the leaves, and each root, is read from the chunk store once (up to
+maintenance_work_mem of them), and a
+3-row commit reads about its rows' paths.  An apply keeps them so on its
+own too, as each level's pass starts from the root.
 
 A fold isn't made again while nothing it reads has changed: the refs
 (refs_generations.c) keep in shared memory each branch's generation,

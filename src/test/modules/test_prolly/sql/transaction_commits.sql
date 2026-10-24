@@ -277,6 +277,58 @@ BEGIN
 END $$;
 SET dolt.transaction_commit = on;
 
+-- A small commit reads each node it needs once, however often it descends
+-- it: the refs' root for each entry it gets and puts, the head's commit, the
+-- root's and the table's upper nodes for each row's seek and then the
+-- apply, each level of which starts from the root.  Three rows of a table
+-- three levels high read about their paths, not a descent per use.
+CREATE TABLE tc.tall (id int PRIMARY KEY, v int, pad text);
+INSERT INTO tc.tall SELECT g, 0, md5(g::text) FROM generate_series(1, 20000) g;
+UPDATE tc.tall SET v = 1 WHERE id IN (1, 10000, 19999);
+SELECT pg_stat_force_next_flush();
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+UPDATE tc.tall SET v = 2 WHERE id IN (2, 10001, 20000);
+SELECT pg_stat_force_next_flush();
+SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
+  WHERE name = 'nodes_read' \gset
+SELECT CASE WHEN :nodes_read <= 25 THEN 'at most 25' ELSE :nodes_read::text END
+  AS nodes_read;
+
+-- A hash that names a tree but no commit (here, a commit's root, of many
+-- items) is found not to be one from a descent of that tree, not a read
+-- of all of it.
+DO $$
+BEGIN
+	FOR i IN 1..150 LOOP
+		EXECUTE format('CREATE TABLE tc.wide%s (id int PRIMARY KEY, %s)', i,
+			(SELECT string_agg(format('column_with_a_long_name_%s text', c), ', ')
+			 FROM generate_series(1, 12) c));
+	END LOOP;
+END $$;
+SELECT length(dolt_commit('-Am', 'wide')::text) > 0 AS committed;
+CREATE FUNCTION pg_temp.names_commit(h text) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM dolt_hashof(h);
+	RETURN true;
+EXCEPTION WHEN OTHERS THEN
+	RETURN false;
+END $$;
+SELECT root AS wide_root FROM test_commit_roots('HEAD') \gset
+SELECT pg_stat_force_next_flush();
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SELECT pg_temp.names_commit(:'wide_root') AS names_commit;
+SELECT pg_stat_force_next_flush();
+SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
+  WHERE name = 'nodes_read' \gset
+SELECT CASE WHEN :nodes_read <= 6 THEN 'at most 6' ELSE :nodes_read::text END
+  AS nodes_read;
+DO $$
+BEGIN
+	FOR i IN 1..150 LOOP
+		EXECUTE format('DROP TABLE tc.wide%s', i);
+	END LOOP;
+END $$;
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
