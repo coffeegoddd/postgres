@@ -89,11 +89,12 @@ toast_external_info_get(const struct varlena *attr, toast_external_data *toast_e
  * cache of the values it detoasted by (PostGIS keeps the geometries a
  * function was last given, so a nested loop probing one polygon per outer
  * row detoasts it once): two pointers with one identity name the same
- * bytes, for as long as the value they were read from is live.  For an
- * on-disk pointer, its tag, TOAST relation and value ID; for a hash
- * pointer, its tag, tree length and form, and the root it names, so equal
- * values in any rows of any tables share it.  Zero-padded, compared whole.
- * TOAST_POINTER_IDENTITY says this is here.
+ * bytes, for as long as the value they were read from is live.  An on-disk
+ * pointer's names its TOAST relation and value ID; a hash pointer's, its
+ * content (its tree's root, length and form), so equal values in any rows
+ * of any tables share it.  Its bytes are opaque: compare them whole
+ * (toast_pointer_identity_equal()).  TOAST_POINTER_IDENTITY says this is
+ * here.
  */
 #define TOAST_POINTER_IDENTITY 1
 
@@ -104,35 +105,12 @@ typedef struct ToastPointerIdentity
 
 /*
  * The identity of an out-of-line value's pointer, into *id; false (and *id
- * zeroed) for any other datum: inline, compressed in line, or an indirect
- * or expanded pointer, whose memory the caller's caller owns.
+ * zeroed) for any other datum.  A value in line (compressed or not) has
+ * none, nor has an indirect or expanded pointer: it points at memory its
+ * maker owns, which may be freed or changed after the call, so it names no
+ * value that outlives it.
  */
-static inline bool
-toast_pointer_identity(const struct varlena *attr, ToastPointerIdentity *id)
-{
-	memset(id, 0, sizeof(*id));
-	if (VARATT_IS_EXTERNAL_ONDISK(attr))
-	{
-		toast_external_data d;
-
-		toast_external_info_get(attr, &d);
-		id->bytes[0] = (uint8) d.tag;
-		memcpy(id->bytes + 1, &d.toastrelid, sizeof(d.toastrelid));
-		memcpy(id->bytes + 1 + sizeof(d.toastrelid), &d.valueid, sizeof(d.valueid));
-		return true;
-	}
-	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
-	{
-		varatt_external_hash h;
-
-		VARATT_EXTERNAL_GET_POINTER(h, attr);
-		id->bytes[0] = (uint8) VARTAG_EXTERNAL(attr);
-		memcpy(id->bytes + 1, &h.va_extinfo, sizeof(h.va_extinfo));
-		memcpy(id->bytes + 1 + sizeof(h.va_extinfo), h.va_hash, sizeof(h.va_hash));
-		return true;
-	}
-	return false;
-}
+extern bool toast_pointer_identity(const struct varlena *attr, ToastPointerIdentity *id);
 
 static inline bool
 toast_pointer_identity_equal(const ToastPointerIdentity *a, const ToastPointerIdentity *b)

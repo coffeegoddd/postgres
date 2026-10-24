@@ -41,4 +41,62 @@ SELECT (SELECT test_toast_identity(t) FROM toast_identity_heap WHERE id = 1) =
 SELECT (SELECT test_toast_identity(t) FROM toast_identity_heap WHERE id = 1) <>
 	   test_toast_identity(test_toast_hash_pointer(a)) AS kinds_differ
 FROM v;
+-- and a TOAST relation with 8-byte value IDs (VARTAG_ONDISK_OID8): its
+-- tag in the identity, another kind's
+CREATE TABLE toast_identity_oid8 (t text) USING heap WITH (toast_value_type = 'oid8');
+ALTER TABLE toast_identity_oid8 ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO toast_identity_oid8 SELECT a FROM v;
+SELECT get_byte(test_toast_identity(o.t), 0) <> get_byte(test_toast_identity(h.t), 0) AS oid8_tag,
+	   test_toast_identity(o.t) <> test_toast_identity(h.t) AS oid8_other
+FROM toast_identity_oid8 o, toast_identity_heap h WHERE h.id = 1;
+DROP TABLE toast_identity_oid8;
 DROP TABLE toast_identity_heap;
+
+-- a value compressed in line has none
+CREATE TABLE toast_identity_inline (t text) USING heap;
+ALTER TABLE toast_identity_inline ALTER COLUMN t SET STORAGE MAIN;
+INSERT INTO toast_identity_inline VALUES (repeat('abc', 2000));
+SELECT pg_column_compression(t) IS NOT NULL AS compressed,
+	   test_toast_identity(t) IS NULL AS compressed_none
+FROM toast_identity_inline;
+DROP TABLE toast_identity_inline;
+
+-- nor has an expanded value (a PL/pgSQL array variable)
+DO $$
+DECLARE
+	arr int[] := array_fill(1, ARRAY[1000]);
+BEGIN
+	arr[1] := 2;
+	RAISE NOTICE 'expanded none: %', test_toast_identity(arr) IS NULL;
+END
+$$;
+
+-- rows of versioned tables: one value in several rows of two tables has
+-- one identity, its content's
+CREATE SCHEMA ti VERSIONED;
+CREATE TABLE ti.one (id int PRIMARY KEY, t text);
+CREATE TABLE ti.two (id int PRIMARY KEY, t text);
+INSERT INTO ti.one SELECT g, a FROM v, generate_series(1, 3) g;
+INSERT INTO ti.two SELECT g, a FROM v, generate_series(1, 2) g;
+SELECT count(*) AS rows, count(DISTINCT test_toast_identity(t)) AS identities,
+	   bool_and(test_toast_identity(t) =
+				(SELECT test_toast_identity(test_toast_hash_pointer(a)) FROM v)) AS the_contents
+FROM (SELECT t FROM ti.one UNION ALL SELECT t FROM ti.two) r;
+DROP SCHEMA ti CASCADE;
+
+-- A hash pointer's identity holds its form: in a LATIN1 database a text
+-- of ASCII and its UTF-8 bytes as bytea are one tree, but not one value.
+CREATE DATABASE regress_toast_identity_latin1 ENCODING 'LATIN1'
+	LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;
+\c regress_toast_identity_latin1
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE TEMP TABLE v AS SELECT string_agg(md5(g::text), '') AS a FROM generate_series(1, 3000) g;
+SELECT (test_toast_pointer(test_toast_hash_pointer(a))).root =
+	   (test_toast_pointer(test_toast_hash_pointer(convert_to(a, 'UTF8')))).root AS one_tree,
+	   test_toast_identity(test_toast_hash_pointer(a)) <>
+	   test_toast_identity(test_toast_hash_pointer(convert_to(a, 'UTF8'))) AS two_identities
+FROM v;
+\c contrib_regression
+DROP DATABASE regress_toast_identity_latin1;
