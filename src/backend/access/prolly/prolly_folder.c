@@ -447,6 +447,16 @@ fold_pass(const ProllyRefsRoutine *refs)
 		StartTransactionCommand();
 		PG_TRY();
 		{
+			/*
+			 * (never waiting for a lock: the fold keeps its locks on the
+			 * change logs it consumed past its table's, and a DROP or other
+			 * DDL holding the tables and waiting for a log would deadlock
+			 * with the fold waiting for the next table; a lock not free at
+			 * once rolls the fold back, to fold again next pass)
+			 */
+			(void) set_config_option("lock_timeout", "1", PGC_USERSET,
+									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
+									 false);
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
@@ -488,18 +498,34 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 		PG_CATCH();
 		{
+			bool		locked = geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE;
+
 			HOLD_INTERRUPTS();
-			EmitErrorReport();
+			if (!locked)
+				EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
 			RESUME_INTERRUPTS();
 
-			/*
-			 * (passed over until written again: an error that recurs isn't
-			 * met again every pass)
-			 */
-			refs->saw_branch(moved[i].branch, moved[i].generation);
-			backed_off_done(moved[i].branch);
+			if (locked)
+			{
+				/* (a lock another holds: folded again once backed off) */
+				pending = true;
+				back_off(moved[i].branch);
+				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
+				AtEOXact_PgStat_Prolly();
+				elog(DEBUG1, "fold worker left branch %u for its next pass: "
+					 "a lock it needed was held", moved[i].branch);
+			}
+			else
+			{
+				/*
+				 * (passed over until written again: an error that recurs
+				 * isn't met again every pass)
+				 */
+				refs->saw_branch(moved[i].branch, moved[i].generation);
+				backed_off_done(moved[i].branch);
+			}
 		}
 		PG_END_TRY();
 		any = any || folded;
