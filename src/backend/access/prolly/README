@@ -389,8 +389,18 @@ writes the nodes on that path, not the document), and prolly_jsonb_diff()
 diffs two trees by their nodes; anything a tree doesn't handle, and any
 document that isn't one, they do whole, as #>, jsonb_set() and a diff of
 the documents would.  PostgreSQL's own jsonb functions read the document
-whole.  The setting changes what folds write, so every server writing a
-history must agree on it.
+whole, and so does a whole read of a tree, which builds jsonb from the
+items (dearer than decoding a document's bytes).  An array's indexes are
+in its elements' keys, so prolly_jsonb_set() only replaces an element: an
+insert or a removal, which would renumber every element after it, is done
+whole.  Reading a row from history (AS OF, dolt_history_table(), history
+mounts, the rows a checkout, reset or merge writes back) reads a JSON
+tree's document whole; written back, it is stored as the same tree again.
+The setting changes what folds write (a document folds as its JSON tree
+with it on, as its bytes with it off, and a fold meeting the other form
+reads the value and writes it in its own), so every server writing a
+history must agree on it: two that don't reach different roots for the
+same rows.  Folded format 21 is the first whose rows may hold JSON trees.
 
 
 Writers
