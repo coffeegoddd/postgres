@@ -477,13 +477,6 @@ typedef struct BmapWatch
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
-
-	/*
-	 * Reads of a map that may be a dropped relation's (dropped_read_begin()):
-	 * how many are under way, and how many ever began.
-	 */
-	pg_atomic_uint32 dropped_readers;
-	pg_atomic_uint64 dropped_reads;
 	pg_atomic_uint64 stuck_held;	/* holders a stuck count gained, ever */
 	pg_atomic_uint64 watch_key[BMAP_WATCHED_MAX];
 	slock_t		mutex;			/* protects what follows */
@@ -556,8 +549,6 @@ static void
 BmapShmemInit(void *arg)
 {
 	pg_atomic_init_u32(&bmap_shared->sweeps, 0);
-	pg_atomic_init_u32(&bmap_shared->dropped_readers, 0);
-	pg_atomic_init_u64(&bmap_shared->dropped_reads, 0);
 	pg_atomic_init_u64(&bmap_shared->stuck_held, 0);
 	SpinLockInit(&bmap_shared->mutex);
 	bmap_shared->nlisted = 0;
@@ -704,77 +695,6 @@ sweep_note(RelFileLocator rel, bool begin)
 		pg_atomic_fetch_sub_u32(&bmap_shared->sweeps, 1);
 }
 
-/*
- * Reads of maps that may be dropped relations' (a page sweep's, a snapshot
- * reclaim's, a compaction's: each map of a page store, a dropped relation's
- * too until its files are unlinked), counted so that a drop knows whether
- * one may have read its map back into shared buffers after it dropped them
- * (bmapdropbuffers(), bmapreaddropped()).  A backend exiting part way
- * through one is counted out as it exits.
- */
-static bool dropped_reading = false;
-static bool dropped_exit_registered = false;
-
-static void
-dropped_read_end(void)
-{
-	if (!dropped_reading)
-		return;
-	dropped_reading = false;
-	pg_atomic_fetch_sub_u32(&bmap_shared->dropped_readers, 1);
-}
-
-static void
-dropped_read_exit(int code, Datum arg)
-{
-	dropped_read_end();
-}
-
-static void
-dropped_read_begin(void)
-{
-	Assert(!dropped_reading);
-	if (!dropped_exit_registered)
-	{
-		before_shmem_exit(dropped_read_exit, 0);
-		dropped_exit_registered = true;
-	}
-	pg_atomic_fetch_add_u64(&bmap_shared->dropped_reads, 1);
-	pg_atomic_fetch_add_u32(&bmap_shared->dropped_readers, 1);
-	dropped_reading = true;
-}
-
-/* the reads under way, and begun, as a drop's buffers were dropped */
-static uint32 drop_readers;
-static uint64 drop_reads;
-
-/*
- * Before the buffers of relations being unlinked are dropped: the reads of
- * maps that may be dropped relations' under way, and begun, noted.
- */
-void
-bmapdropbuffers(void)
-{
-	pg_memory_barrier();
-	drop_readers = pg_atomic_read_u32(&bmap_shared->dropped_readers);
-	drop_reads = pg_atomic_read_u64(&bmap_shared->dropped_reads);
-}
-
-/*
- * After they are unlinked: may such a read have brought pages of theirs
- * back into shared buffers since their buffers were dropped?  Only if one
- * was under way then, or is now, or began in between.  One that begins
- * after this finds their files gone.
- */
-bool
-bmapreaddropped(void)
-{
-	pg_memory_barrier();
-	return drop_readers > 0 ||
-		pg_atomic_read_u32(&bmap_shared->dropped_readers) > 0 ||
-		pg_atomic_read_u64(&bmap_shared->dropped_reads) != drop_reads;
-}
-
 /* none of a dropped relation's map or changes list in shared buffers */
 static void
 drop_gone_buffers(SMgrRelation reln)
@@ -789,13 +709,16 @@ drop_gone_buffers(SMgrRelation reln)
 typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
 
 /*
- * Read reln's map, which may be a dropped relation's, by read(): counted
- * (dropped_read_begin()), and in a subtransaction, so that whether it
- * returns or fails, its pins are let go of and, if the relation is gone
- * by then, none of its pages stays in shared buffers, where a relation
- * given its file number later would find them.  A read that fails because
- * the files went (the drop's invalidation closing them, say) fails as
- * before, its pages dropped first.
+ * Read reln's map, which may be a dropped relation's, by read(): every map
+ * of a page store is read so (a sweep's, a snapshot reclaim's, a
+ * compaction's, a size count's), a dropped relation's too until its files
+ * are unlinked.  In a subtransaction, so that whether it returns or fails,
+ * its pins are let go of and, if the relation is gone by then, none of its
+ * pages stays in shared buffers, where a relation given its file number
+ * later would find them.  (One read before the unlink, the files still
+ * there as it ends, is the drop's to drop: smgrdounlinkall().)  A read
+ * that fails because the files went (the drop's invalidation closing
+ * them, say) fails as before, its pages dropped first.
  */
 static void
 read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
@@ -804,7 +727,6 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 	ResourceOwner oldowner = CurrentResourceOwner;
 	ErrorData  *edata = NULL;
 
-	dropped_read_begin();
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
 	PG_TRY();
@@ -825,7 +747,6 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 	}
 	PG_END_TRY();
 	drop_gone_buffers(reln);
-	dropped_read_end();
 	if (edata != NULL)
 		ReThrowError(edata);
 }
@@ -9585,10 +9506,21 @@ size_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
  * held shared meanwhile, so no extension, truncation or prune of it runs.
  * Its length, or 0 if it was dropped since the directory was read.
  */
-static BlockNumber
-size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
-			  BlockNumber hw)
+typedef struct SizeRead
 {
+	uint64	   *mapped;
+	uint64	   *listed;
+	BlockNumber hw;
+	BlockNumber nblocks;
+} SizeRead;
+
+static void
+size_relation_read(SMgrRelation reln, void *arg)
+{
+	SizeRead   *sr = arg;
+	uint64	   *mapped = sr->mapped;
+	uint64	   *listed = sr->listed;
+	BlockNumber hw = sr->hw;
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BlockNumber nblocks;
 	Buffer		headerbuf;
@@ -9596,14 +9528,15 @@ size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
 	uint32		nchanges;
 	BmapChange *changes;
 
+	sr->nblocks = 0;
 	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
-		return 0;
+		return;
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
 	{
 		UnlockReleaseBuffer(headerbuf);
-		return 0;
+		return;
 	}
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
@@ -9625,7 +9558,18 @@ size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
 		pfree(changes);
 	}
 	UnlockReleaseBuffer(headerbuf);
-	return nblocks;
+	sr->nblocks = nblocks;
+}
+
+/* size_relation_read(), the relation perhaps dropped as it is read */
+static BlockNumber
+size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
+			  BlockNumber hw)
+{
+	SizeRead	sr = {mapped, listed, hw, 0};
+
+	read_maybe_dropped(reln, size_relation_read, &sr);
+	return sr.nblocks;
 }
 
 static int

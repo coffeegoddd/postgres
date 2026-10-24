@@ -55,8 +55,6 @@ extern bool bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum);
 extern void bmapprecommitdrop(SMgrRelation reln);
 extern void bmapenddrops(void);
-extern void bmapdropbuffers(void);
-extern bool bmapreaddropped(void);
 extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber nblocks);
 extern uint32 bmapreleasestep(SMgrRelation reln);
