@@ -6,6 +6,8 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE bulk_moves;
+-- (the rows moves write, not pages given back: kept_pages tests those)
+ALTER DATABASE bulk_moves SET prolly.kept_commits = 0;
 \c bulk_moves
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;
@@ -196,6 +198,8 @@ SELECT count(*) AS fired FROM public.fired;
 SELECT dolt_remote('add', 'origin', :'url');
 SELECT dolt_push('origin', 'main') AS pushed;
 CREATE DATABASE bulk_moves_clone;
+-- (the rows moves write, not pages given back: kept_pages tests those)
+ALTER DATABASE bulk_moves_clone SET prolly.kept_commits = 0;
 \c bulk_moves_clone
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;

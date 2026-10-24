@@ -7012,6 +7012,67 @@ MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * MarkBufferedRelationsShared -- MarkBufferedRelationShared() of each of
+ * rels[] (n of them), in one pass over the buffers.
+ */
+void
+MarkBufferedRelationsShared(SMgrRelation *rels, int n, ForkNumber forknum)
+{
+	RelFileLocator *locs;
+	bool		use_bsearch = n > RELS_BSEARCH_THRESHOLD;
+
+	if (n == 0)
+		return;
+	if (n == 1)
+	{
+		MarkBufferedRelationShared(rels[0], forknum);
+		return;
+	}
+	locs = palloc_array(RelFileLocator, n);
+	for (int i = 0; i < n; i++)
+		locs[i] = rels[i]->smgr_rlocator.locator;
+	if (use_bsearch)
+		qsort(locs, n, sizeof(RelFileLocator), rlocator_comparator);
+
+	for (int i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *buf_hdr = GetBufferDescriptor(i);
+		RelFileLocator *match = NULL;
+		uint64		buf_state;
+
+		/* unlocked precheck, as in DropRelationsAllBuffers */
+		if (!use_bsearch)
+		{
+			for (int j = 0; j < n && match == NULL; j++)
+			{
+				if (BufTagMatchesRelFileLocator(&buf_hdr->tag, &locs[j]))
+					match = &locs[j];
+			}
+		}
+		else
+		{
+			RelFileLocator rlocator = BufTagGetRelFileLocator(&buf_hdr->tag);
+
+			match = bsearch(&rlocator, locs, n, sizeof(RelFileLocator),
+							rlocator_comparator);
+		}
+		if (match == NULL)
+			continue;
+
+		buf_state = LockBufHdr(buf_hdr);
+		if (BufTagMatchesRelFileLocator(&buf_hdr->tag, match) &&
+			BufTagGetForkNum(&buf_hdr->tag) == forknum &&
+			(buf_state & BM_TAG_VALID))
+			UnlockBufHdrExt(buf_hdr, buf_state,
+							BM_SMGR_PREPARE | BM_SMGR_REMARKED,
+							BM_SMGR_SHARED | BM_SMGR_OWN, 0);
+		else
+			UnlockBufHdr(buf_hdr);
+	}
+	pfree(locs);
+}
+
+/*
  * Acquire the content_lock for the buffer.
  */
 void

@@ -15,7 +15,11 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('kept_checkouts');
 $node->init;
+# (prolly.kept_commits 0: the kept materializations, not pages kept as of
+# a branch's head, which come before them and move nothing: t/203 and
+# t/204 test those)
 $node->append_conf('postgresql.conf', qq{
+prolly.kept_commits = 0
 autovacuum = off
 prolly_fold_worker = off
 debug_prolly_verify_fold_caches = on

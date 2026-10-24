@@ -171,6 +171,14 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.kept_commits",
+							"How many of the commits each branch was last at its pages are kept as of.",
+							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",
+							&prolly_kept_commits,
+							2, 0, 8,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.log_full_folds",
 							"Logs each fold that reads its table in full, with why, once it reads at least this many rows.",
 							"-1 logs none; 0 logs every one.",

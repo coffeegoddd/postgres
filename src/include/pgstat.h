@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF5
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF8
 
 typedef struct PgStat_ArchiverStats
 {
@@ -745,9 +745,16 @@ typedef enum PgStat_ProllyCounter
 											 * of past the budget */
 	PGSTAT_PROLLY_MOVE_TABLES_WRITTEN,	/* tables and materialized views a
 										 * move wrote rows into */
+	PGSTAT_PROLLY_PAGES_KEPT,	/* relations' pages kept as of a commit, a
+								 * snapshot of each taken */
+	PGSTAT_PROLLY_RELATIONS_RESTORED,	/* relations a move gave back the
+										 * pages kept as of its commit */
+	PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT,	/* tables a branch's first use
+											 * made of pages kept as of its
+											 * head */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MOVE_TABLES_WRITTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT + 1)
 
 typedef struct PgStat_ProllyStats
 {

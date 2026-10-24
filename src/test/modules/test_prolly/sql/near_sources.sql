@@ -8,6 +8,9 @@
 -- since(counter): pg_stat_prolly's counter's growth since it was last
 -- asked (the session's counts flushed first, :flush).
 CREATE DATABASE regress_near_sources;
+-- (the move planner's sources, not pages kept as of the head, which come
+-- before them and move nothing: first_use_kept tests those)
+ALTER DATABASE regress_near_sources SET prolly.kept_commits = 0;
 \c regress_near_sources
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -115,6 +118,9 @@ DROP DATABASE regress_near_sources;
 -- (each of its 20000 to be written back) is further than main, 2000 of
 -- whose table's rows differ.
 CREATE DATABASE regress_near_views;
+-- (the move planner's sources, not pages kept as of the head, which come
+-- before them and move nothing: first_use_kept tests those)
+ALTER DATABASE regress_near_views SET prolly.kept_commits = 0;
 \c regress_near_views
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

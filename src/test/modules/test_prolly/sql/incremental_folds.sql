@@ -4,6 +4,10 @@
 -- it read is counted.
 SET debug_prolly_change_finder = pages;
 
+-- (no pages kept as of the commits: a snapshot shares every page, which
+-- changes how many a change copies, and lists, though not what is folded)
+SET prolly.kept_commits = 0;
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;

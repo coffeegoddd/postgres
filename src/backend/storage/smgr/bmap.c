@@ -5420,8 +5420,52 @@ snapshot_slot(SMgrRelation reln, uint64 id, BmapRoot *root)
  * blocks then hold what the snapshot holds, which redo skipping a page's
  * records from before a copy of its path relies on (tree_find()).
  */
+static uint64 snapshot_take_slot(SMgrRelation reln);
+
 uint64
 bmap_snapshot_take(SMgrRelation reln)
+{
+	uint64		id = snapshot_take_slot(reln);
+
+	/* as after a share (bmapshare()), but synced before it is relied on */
+	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
+	FlushRelationsAllBuffers(&reln, 1);
+	mdimmedsync(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM);
+	INJECTION_POINT("bmap-snapshot-taken", NULL);
+	return id;
+}
+
+/*
+ * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
+ * their pages written out in one pass over the buffers, and their page
+ * stores synced once each, as the transaction commits (bmapsyncshares()),
+ * as a share's are.  For a caller that relies on the snapshots only once
+ * its transaction has committed: until then a crash leaves them unsynced,
+ * kept by nobody.  Each id is set as its snapshot is taken (the others 0),
+ * so that, if one fails, the caller knows of those taken already.
+ */
+void
+bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
+{
+	for (int i = 0; i < n; i++)
+		ids[i] = 0;
+	for (int i = 0; i < n; i++)
+	{
+		ids[i] = snapshot_take_slot(rels[i]);
+		INJECTION_POINT("bmap-snapshot-slot-taken", NULL);
+	}
+	MarkBufferedRelationsShared(rels, n, MAIN_FORKNUM);
+	if (n > 0)
+		FlushRelationsAllBuffers(rels, n);
+	for (int i = 0; i < n; i++)
+		sync_store_later(rels[i]->smgr_rlocator.locator);
+	if (n > 0)
+		INJECTION_POINT("bmap-snapshot-taken", NULL);
+}
+
+/* A snapshot's slot of reln set, the map's epoch raised: its id. */
+static uint64
+snapshot_take_slot(SMgrRelation reln)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -5529,12 +5573,6 @@ bmap_snapshot_take(SMgrRelation reln)
 	ReleaseBuffer(rootbuf);
 	UnlockReleaseBuffer(headerbuf);
 	LockRelease(&sweeptag, ShareLock, false);
-
-	/* as after a share (bmapshare()), but synced before it is relied on */
-	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
-	FlushRelationsAllBuffers(&reln, 1);
-	mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
-	INJECTION_POINT("bmap-snapshot-taken", NULL);
 	return id;
 }
 
@@ -5632,6 +5670,46 @@ bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max)
 		n++;
 	}
 	return n;
+}
+
+/*
+ * Are reln's pages still those of its snapshot 'id': its root page pointing
+ * to the subtrees the snapshot holds, and its length the snapshot's?  O(1):
+ * a page changed since the snapshot was taken was copied first, its path
+ * with it, so the root page points to a copy of a subtree the snapshot
+ * holds where anything under it changed.  False if reln keeps no snapshot
+ * 'id'.  The caller keeps reln from changing, or takes the answer as of
+ * when it was asked.
+ */
+bool
+bmap_snapshot_unchanged(SMgrRelation reln, uint64 id)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	BmapRoot	root;
+	BlockNumber nblocks;
+	int			slot;
+	bool		same;
+
+	if (id == 0)
+		return false;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	slot = snapshot_slot(reln, id, &root);
+	UnlockReleaseBuffer(headerbuf);
+	if (slot < 0)
+		return false;
+	same = root.snap[slot].nblocks == nblocks;
+	for (int k = 0; same && k < BMAP_TREE_TOPS; k++)
+	{
+		const BmapEntry *top = &snapshot_tops(&root.snap[slot])[k];
+
+		same = root.top[k].block == top->block &&
+			(!BlockNumberIsValid(top->block) || root.top[k].since == top->since);
+	}
+	return same;
 }
 
 /*
@@ -9728,6 +9806,26 @@ bmap_redo(XLogReaderState *record)
 									   xlrec->old_hw, xlrec->new_hw);
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
+
+				/*
+				 * A snapshot kept (its header changed too, which a let-go
+				 * leaves): as the primary did, the relation's pages as of
+				 * this record written to the blocks the snapshot holds, and
+				 * durably.  Without online backups no image of them is
+				 * logged, and the pages redo made of the records before
+				 * this go elsewhere once a remap moves the relation off
+				 * them: the snapshot's blocks would keep what they had
+				 * when redo began.
+				 */
+				if (xlrec->op == BMAP_TREE_SNAPSHOT &&
+					XLogRecHasBlockRef(record, 1))
+				{
+					SMgrRelation reln = smgropen(xlrec->locator,
+												 INVALID_PROC_NUMBER);
+
+					FlushRelationsAllBuffers(&reln, 1);
+					mdimmedsync(store_smgr(xlrec->locator), MAIN_FORKNUM);
+				}
 				break;
 			}
 		case XLOG_BMAP_FREE:

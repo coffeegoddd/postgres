@@ -11,6 +11,10 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('minimal_remap');
 $node->init;
+# (first uses that copy the source's storage: one made of pages kept as of
+# its head holds none of the rows written since, nor waits for writers;
+# t/203_first_use_kept_snapshots.pl tests those)
+$node->append_conf('postgresql.conf', 'prolly.kept_commits = 0');
 $node->append_conf('postgresql.conf', qq{
 wal_level = minimal
 max_wal_senders = 0

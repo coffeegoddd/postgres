@@ -129,6 +129,9 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_KEPT_CHECKOUTS_REUSED] = "kept_checkouts_reused",
 	[PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED] = "kept_checkouts_evicted",
 	[PGSTAT_PROLLY_MOVE_TABLES_WRITTEN] = "move_tables_written",
+	[PGSTAT_PROLLY_PAGES_KEPT] = "pages_kept",
+	[PGSTAT_PROLLY_RELATIONS_RESTORED] = "relations_restored",
+	[PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT] = "first_use_tables_kept",
 };
 
 /*
