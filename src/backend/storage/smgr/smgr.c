@@ -156,6 +156,28 @@ typedef struct f_smgr
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 
 	/*
+	 * Before the commit record of a transaction that drops the relation at
+	 * commit: what the drop will let go of may be recorded now, as the
+	 * transaction's, so that a crash after the commit can't lose it.  May
+	 * be NULL.
+	 */
+	void		(*smgr_precommitdrop) (SMgrRelation reln);
+
+	/*
+	 * As a top-level transaction's drops are done, at commit or abort; may
+	 * be NULL.
+	 */
+	void		(*smgr_enddrops) (void);
+
+	/*
+	 * Before the fork is extended by nblocks through shared buffers, holding
+	 * no heavyweight lock that takes no others (a relation's extension
+	 * lock); may be NULL.
+	 */
+	void		(*smgr_beforeextend) (SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber nblocks);
+
+	/*
 	 * One step of letting go of what dropped storage still holds in the
 	 * relation's store (pages it may share with the relation, which count as
 	 * shared until then): how many of what it held were let go of, 0 if
@@ -251,6 +273,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
 		.smgr_predrop = bmappredrop,
+		.smgr_precommitdrop = bmapprecommitdrop,
+		.smgr_enddrops = bmapenddrops,
+		.smgr_beforeextend = bmapbeforeextend,
 		.smgr_releasestep = bmapreleasestep,
 		.smgr_writesread = bmapwritesread,
 		.smgr_unlink = bmapunlink,
@@ -830,6 +855,46 @@ bool
 smgrcanshare(SMgrRelation reln)
 {
 	return smgrsw[reln->smgr_which].smgr_share != NULL;
+}
+
+/*
+ * smgrprecommitdrop() -- Prepare to drop a relation at commit, before the
+ *						  commit record.
+ *
+ * The transaction may still abort after this, leaving the relation as it
+ * is.
+ */
+void
+smgrprecommitdrop(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_precommitdrop != NULL)
+		smgrsw[reln->smgr_which].smgr_precommitdrop(reln);
+}
+
+/*
+ * smgrbeforeextend() -- Prepare to extend a fork by nblocks.
+ *
+ * Called by the buffer manager before it takes the relation's extension
+ * lock.
+ */
+void
+smgrbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_beforeextend != NULL)
+		smgrsw[reln->smgr_which].smgr_beforeextend(reln, forknum, nblocks);
+}
+
+/*
+ * smgrenddrops() -- A top-level transaction's drops are done.
+ */
+void
+smgrenddrops(void)
+{
+	for (int i = 0; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_enddrops)
+			smgrsw[i].smgr_enddrops();
+	}
 }
 
 /*

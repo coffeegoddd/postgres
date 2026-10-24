@@ -754,9 +754,12 @@ typedef enum PgStat_ProllyCounter
 											 * head */
 	PGSTAT_PROLLY_BMAP_BLOCKS_MOVED,	/* page-store blocks a sweep moved
 										 * down, to shorten the store */
+	PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS,	/* extensions that took
+												 * release steps before
+												 * the store grew */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BLOCKS_MOVED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS + 1)
 
 typedef struct PgStat_ProllyStats
 {

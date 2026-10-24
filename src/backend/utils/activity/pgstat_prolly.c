@@ -133,6 +133,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_RELATIONS_RESTORED] = "relations_restored",
 	[PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT] = "first_use_tables_kept",
 	[PGSTAT_PROLLY_BMAP_BLOCKS_MOVED] = "bmap_blocks_moved",
+	[PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS] = "bmap_release_growth_drains",
 };
 
 /*

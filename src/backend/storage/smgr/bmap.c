@@ -92,8 +92,9 @@
  * the header, which the backend writing it out may hold exclusively.
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * four cases: a crash between a drop's commit and the records queuing its
- * blocks, a crash part way through a prune, a crash (or an error, not an
+ * four cases: a crash between a drop's commit and the records queuing what
+ * it didn't queue before its commit record (snapshots whose takers hadn't
+ * committed, a prepared transaction's drops), a crash part way through a prune, a crash (or an error, not an
  * interrupt, which the header's lock holds off) between the records
  * letting go of a truncation's blocks and those freeing them, and a count
  * stuck at 255 maps.
@@ -164,6 +165,7 @@
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/autovacuum.h"
 #include "port/pg_bitutils.h"
 #include "storage/bmap.h"
 #include "storage/bmap_xlog.h"
@@ -298,6 +300,14 @@ typedef struct BmapQueueMeta
 
 /* the lock a sweep holds off branch creation with: an object no catalog has */
 #define BMAP_SWEEP_CLASSID	((Oid) 0x424D5357)
+
+/*
+ * The lock a transaction that queued its drops before its commit record
+ * holds, by its id, until they are done (see bmapprecommitdrop())
+ */
+#define BMAP_DROP_CLASSID	((Oid) 0x424D4452)
+#define DROP_LOCK(tag, xid) \
+	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, BMAP_DROP_CLASSID, (xid), 0)
 
 /* reference-count pages one record changes at most */
 #define BMAP_REFS_PER_RECORD	24
@@ -5415,39 +5425,71 @@ snapshot_slot(SMgrRelation reln, uint64 id, BmapRoot *root)
 }
 
 /*
+ * What became of the (sub)transaction 'owner' that wrote something into
+ * the storage before it committed (a snapshot's slot, a drop's release
+ * queue entries): OWNER_NONE if there is none, OWNER_RUNNING while it runs
+ * (or is prepared, or is this backend's), OWNER_COMMITTED, OWNER_ENDED if
+ * it aborted or a crash ended it, and OWNER_UNKNOWN if it is too old for
+ * the commit log to say, which each caller takes the safe way.  Owners are
+ * FullTransactionIds, never mistaken for a later transaction of the same
+ * 32-bit id.  As for a tuple, the transaction is asked whether it is in
+ * progress before the commit log is: a commit sets the log first.  Not in
+ * recovery.
+ */
+typedef enum OwnerState
+{
+	OWNER_NONE,
+	OWNER_RUNNING,
+	OWNER_COMMITTED,
+	OWNER_ENDED,
+	OWNER_UNKNOWN,
+} OwnerState;
+
+static OwnerState
+owner_state(FullTransactionId owner)
+{
+	TransactionId xid = XidFromFullTransactionId(owner);
+	FullTransactionId now;
+	OwnerState	state;
+
+	Assert(!RecoveryInProgress());
+	if (!TransactionIdIsNormal(xid))
+		return OWNER_NONE;
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return OWNER_RUNNING;
+	now = ReadNextFullTransactionId();
+	if (!FullTransactionIdPrecedes(owner, now))
+		return OWNER_UNKNOWN;
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	if (FullTransactionIdPrecedes(owner,
+								  FullTransactionIdFromAllowableAt(now,
+																   TransamVariables->oldestClogXid)))
+		state = OWNER_UNKNOWN;
+	else if (TransactionIdIsInProgress(xid))
+		state = OWNER_RUNNING;
+	else if (TransactionIdDidCommit(xid))
+		state = OWNER_COMMITTED;
+	else
+		state = OWNER_ENDED;
+	LWLockRelease(XactTruncationLock);
+	return state;
+}
+
+/*
  * Is snapshot 'snap' kept by nobody, the (sub)transaction that took it
- * having ended without committing?  A snapshot is in the storage, not the
- * transaction: one taken by a transaction that aborts, or that a crash
- * ends, would otherwise hold its subtrees for as long as the relation
- * lasts.  Its owner is a FullTransactionId, so it is never mistaken for a
- * later transaction of the same 32-bit id; one too old for the commit log
- * to say is taken as committed (kept), as is one still running or
- * prepared.  As for a tuple, the transaction is asked whether it is in
- * progress before the commit log is: a commit sets the log first.
+ * having ended without committing (owner_state())?  A snapshot is in the
+ * storage, not the transaction: one taken by a transaction that aborts, or
+ * that a crash ends, would otherwise hold its subtrees for as long as the
+ * relation lasts.  One whose taker is too old for the commit log to say is
+ * taken as committed (kept), as is one still running or prepared.  During
+ * recovery, none.
  */
 static bool
 snapshot_abandoned(const xl_bmap_snapshot *snap)
 {
-	FullTransactionId owner = FullTransactionIdFromU64(snap->owner);
-	TransactionId xid = XidFromFullTransactionId(owner);
-	FullTransactionId now;
-	bool		abandoned = false;
-
-	if (snap->id == 0 || !TransactionIdIsNormal(xid) || RecoveryInProgress())
+	if (snap->id == 0 || RecoveryInProgress())
 		return false;
-	if (TransactionIdIsCurrentTransactionId(xid))
-		return false;
-	now = ReadNextFullTransactionId();
-	if (!FullTransactionIdPrecedes(owner, now))
-		return false;
-	LWLockAcquire(XactTruncationLock, LW_SHARED);
-	if (!FullTransactionIdPrecedes(owner,
-								   FullTransactionIdFromAllowableAt(now,
-																	TransamVariables->oldestClogXid)) &&
-		!TransactionIdIsInProgress(xid) && !TransactionIdDidCommit(xid))
-		abandoned = true;
-	LWLockRelease(XactTruncationLock);
-	return abandoned;
+	return owner_state(FullTransactionIdFromU64(snap->owner)) == OWNER_ENDED;
 }
 
 /*
@@ -6477,7 +6519,16 @@ tree_release_tops(SMgrRelation reln, const BmapEntry *tops)
  * Drains run in autovacuum workers (prolly_autovacuum()), in a sweep before
  * it counts, and before a VACUUM of a relation of the store
  * (bmapreleasestep()): a page a dropped map still holds counts as shared,
- * which VACUUM would otherwise leave as it is or copy to change.
+ * which VACUUM would otherwise leave as it is or copy to change.  With
+ * autovacuum off, an extension that would grow the store drains first
+ * (bmapbeforeextend()).
+ *
+ * A relation a top-level transaction drops at commit is queued before the
+ * commit record (bmapprecommitdrop()), each entry naming the transaction
+ * (queued_owner()), so that a crash after the commit finds it queued.  Such
+ * an entry holds nothing until its transaction has committed and finished
+ * its drops (queued_state()): a step stops at it before, and pops it with
+ * nothing let go of if the transaction didn't commit.
  *
  * Locks: the metapage, exclusively, for a push or a step; a push then
  * locks the pages it writes.  A step reads the pages it pops from under
@@ -6768,6 +6819,92 @@ queued(BlockNumber block, uint16 level, BlockNumber first, XLogRecPtr since)
 	return q;
 }
 
+/* (an entry's owner keeps a FullTransactionId's low 48 bits) */
+#define QUEUED_OWNER_BITS	48
+#define QUEUED_OWNER_MASK	((UINT64CONST(1) << QUEUED_OWNER_BITS) - 1)
+
+static inline void
+queued_set_owner(BmapQueued *q, FullTransactionId owner)
+{
+	uint64		v = U64FromFullTransactionId(owner) & QUEUED_OWNER_MASK;
+
+	q->owner_hi = (uint16) (v >> 32);
+	q->owner_lo = (uint32) v;
+}
+
+/*
+ * The transaction an entry names (InvalidFullTransactionId: none), the
+ * latest one whose low 48 bits it keeps that isn't in the future: one of
+ * 2^48 transactions ago would be taken for a later one, which no queue
+ * entry lasts for.
+ */
+static FullTransactionId
+queued_owner(const BmapQueued *q)
+{
+	uint64		v = ((uint64) q->owner_hi << 32) | q->owner_lo;
+	uint64		now;
+	uint64		full;
+
+	if (v == 0)
+		return InvalidFullTransactionId;
+	now = U64FromFullTransactionId(ReadNextFullTransactionId());
+	full = (now & ~QUEUED_OWNER_MASK) | v;
+	if (full > now && full > QUEUED_OWNER_MASK)
+		full -= UINT64CONST(1) << QUEUED_OWNER_BITS;
+	return FullTransactionIdFromU64(full);
+}
+
+/*
+ * Is the transaction 'owner', committed, still to finish the drops it
+ * queued before its commit record?  Until its drop of a relation has
+ * dropped the relation's buffers, a dirty one written out would go through
+ * its map to a block the queue may have freed and given another relation:
+ * so it holds the lock DROP_LOCK names from before it queues them until
+ * they are done, at commit or abort (bmapenddrops()), or the backend
+ * exits.  Not waited for.  This backend's own count as in flight.
+ */
+static bool
+drop_in_flight(FullTransactionId owner)
+{
+	LOCKTAG		tag;
+
+	DROP_LOCK(tag, XidFromFullTransactionId(owner));
+	if (LockHeldByMe(&tag, ExclusiveLock, false))
+		return true;
+	if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return true;
+	LockRelease(&tag, ShareLock, false);
+	return false;
+}
+
+/*
+ * What an entry holds by its owner (owner_state()): OWNER_NONE or
+ * OWNER_COMMITTED, the block as a map holds it; OWNER_RUNNING, nothing yet
+ * (its map still holds what it names, its drop not yet done: a committed
+ * owner whose drops are in flight counts so too); OWNER_ENDED, nothing
+ * (the drop didn't happen); OWNER_UNKNOWN, taken as nothing, the safe
+ * way: if the drop did commit, the blocks are left to a sweep.
+ */
+static OwnerState
+queued_state(const BmapQueued *q)
+{
+	FullTransactionId owner = queued_owner(q);
+	OwnerState	state;
+
+	if (!FullTransactionIdIsValid(owner))
+		return OWNER_NONE;
+	state = owner_state(owner);
+	if (state == OWNER_COMMITTED && drop_in_flight(owner))
+		state = OWNER_RUNNING;
+	return state;
+}
+
+static inline bool
+queued_holds(OwnerState state)
+{
+	return state == OWNER_NONE || state == OWNER_COMMITTED;
+}
+
 /* the subtrees 'tops' points to (a root page's, or a snapshot's), as entries */
 static uint32
 queued_tops(const BmapEntry *tops, BmapQueued *items)
@@ -6786,50 +6923,82 @@ queued_tops(const BmapEntry *tops, BmapQueued *items)
 }
 
 /*
- * drop_blocks(): the map's subtrees, its snapshots' and its changes list's
- * blocks queued, to be let go of in the background.  The map stays until
- * the relation is unlinked, and a sweep reads it until then (see
- * sweep_relation()), but once queued the nodes it points to may be freed,
- * and made something else: so its root page is written out with no
- * subtrees, under the header's lock (which a sweep reads it under), and
- * with no record, the relation's drop being logged already (redo removes
- * the map).  The queue's records come first, under the same lock: a sweep
- * that reads the map with its subtrees gone reads the queue after, with
- * them.
+ * A relation this transaction drops at commit whose storage was queued
+ * before the commit record (bmapprecommitdrop()), and the snapshots that
+ * were queued with it: its drop then queues only what was left, the
+ * snapshots whose takers hadn't committed (those may be let go of by their
+ * takers meanwhile, or come to be kept, so they wait for the drop itself).
  */
-static void
-tree_drop(SMgrRelation reln)
+typedef struct PreQueuedDrop
+{
+	RelFileLocator rel;
+	int			nsnaps;
+	uint64		snaps[BMAP_TREE_SNAPSHOTS];
+} PreQueuedDrop;
+
+static List *prequeued = NIL;	/* PreQueuedDrop *, in TopMemoryContext */
+static FullTransactionId prequeued_xid;	/* the transaction they are of */
+static bool drop_locked = false;	/* DROP_LOCK held, for drop_locked_xid */
+static TransactionId drop_locked_xid;
+
+/*
+ * The relation's drop queued before this transaction's commit record, if
+ * it was and that transaction has committed: an abort's drops (of storage
+ * made in it) queue everything, as the entries queued before are let go of
+ * with nothing released.
+ */
+static PreQueuedDrop *
+prequeued_find(RelFileLocator rel)
+{
+	FullTransactionId top = GetTopFullTransactionIdIfAny();
+
+	if (prequeued == NIL || !FullTransactionIdIsValid(top) ||
+		!FullTransactionIdEquals(top, prequeued_xid) ||
+		!TransactionIdDidCommit(XidFromFullTransactionId(top)))
+		return NULL;
+	foreach_ptr(PreQueuedDrop, d, prequeued)
+	{
+		if (RelFileLocatorEquals(d->rel, rel))
+			return d;
+	}
+	return NULL;
+}
+
+static bool
+prequeued_has(const PreQueuedDrop *d, uint64 id)
+{
+	for (int i = 0; i < d->nsnaps; i++)
+		if (d->snaps[i] == id)
+			return true;
+	return false;
+}
+
+/*
+ * Queue what a map holds (root's subtrees and its snapshots', and its
+ * changes list's blocks), under its header's lock, the entries naming
+ * 'owner' if valid.  With 'done', only the snapshots that one didn't
+ * queue; with 'record' (and an owner), only the snapshots whose takers
+ * have committed (or are too old to say), recorded there.  The changes
+ * list's blocks first, in as many records as they take, and the subtrees
+ * last, in one record of their own: a failure before it leaves nothing
+ * queued that the root page still reaches (the blocks queued are listed by
+ * the changes list too, so counted twice, which keeps them).  Returns the
+ * end of the last record, if any.
+ */
+static XLogRecPtr
+queue_map(SMgrRelation reln, const BmapRoot *root, FullTransactionId owner,
+		  const PreQueuedDrop *done, PreQueuedDrop *record)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	BmapRoot	root;
-	Buffer		headerbuf = map_read(rel, 0);
-	Buffer		buf;
-	PGIOAlignedBlock copy;
-	void	   *pages[1] = {copy.data};
 	BmapQueued *items;
 	uint32		n = 0;
 	BmapChangesHead head;
 	uint32		nchanges = 0;
-	BmapChange *changes;
+	BmapChange *changes = NULL;
+	XLogRecPtr	end;
 
-	/* (a queue to make takes a lock, not to be waited for under the header) */
-	ensure_queue(rel);
-	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
-	buf = map_read(rel, 1);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
-	root = *PageGetBmapRoot(BufferGetPage(buf));
-	UnlockReleaseBuffer(buf);
-
-	/*
-	 * The changes list's blocks first, in as many records as they take, and
-	 * the subtrees last, in one record of their own: a failure before it
-	 * leaves nothing queued that the root page still reaches (the blocks
-	 * queued are listed by the changes list too, so counted twice, which
-	 * keeps them).  The root page is written out with no subtrees only
-	 * once they are queued.
-	 */
-	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
+	if (done == NULL)
+		changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
 	items = palloc_array(BmapQueued, Max(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS),
 										 changes ? nchanges : 0));
 	if (changes != NULL)
@@ -6842,32 +7011,95 @@ tree_drop(SMgrRelation reln)
 		pfree(held);
 		pfree(changes);
 	}
+	for (uint32 i = 0; i < n && FullTransactionIdIsValid(owner); i++)
+		queued_set_owner(&items[i], owner);
+	(void) queue_push(rel, items, n);
+	INJECTION_POINT("bmap-drop-changes-queued", NULL);
+
+	n = done == NULL ? queued_tops(root->top, items) : 0;
+	if (record != NULL)
+		record->nsnaps = 0;
+	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
+	{
+		OwnerState	state;
+
+		if (root->snap[s].id == 0 ||
+			(done != NULL && prequeued_has(done, root->snap[s].id)))
+			continue;
+		if (record != NULL)
+		{
+			state = owner_state(FullTransactionIdFromU64(root->snap[s].owner));
+			if (state == OWNER_RUNNING || state == OWNER_ENDED)
+				continue;
+			record->snaps[record->nsnaps++] = root->snap[s].id;
+		}
+		n += queued_tops(snapshot_tops(&root->snap[s]), items + n);
+	}
+	StaticAssertStmt(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS) <=
+					 (BMAP_QUEUE_PAGES_PER_RECORD - 1) * BMAP_QUEUE_PER_PAGE,
+					 "a map's subtrees are queued in one record");
+	for (uint32 i = 0; i < n && FullTransactionIdIsValid(owner); i++)
+		queued_set_owner(&items[i], owner);
+	end = queue_push(rel, items, n);
+	pfree(items);
+	return end;
+}
+
+/*
+ * drop_blocks(): the map's subtrees, its snapshots' and its changes list's
+ * blocks queued, to be let go of in the background.  The map stays until
+ * the relation is unlinked, and a sweep reads it until then (see
+ * sweep_relation()), but once queued the nodes it points to may be freed,
+ * and made something else: so its root page is written out with no
+ * subtrees, under the header's lock (which a sweep reads it under), and
+ * with no record, the relation's drop being logged already (redo removes
+ * the map).  The queue's records come first, under the same lock: a sweep
+ * that reads the map with its subtrees gone reads the queue after, with
+ * them.  A relation dropped at a commit had them queued before the commit
+ * record, as the transaction's (bmapprecommitdrop()): then only the
+ * snapshots left out then are queued.
+ */
+static void
+tree_drop(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapRoot	root;
+	Buffer		headerbuf = map_read(rel, 0);
+	Buffer		buf;
+	PGIOAlignedBlock copy;
+	void	   *pages[1] = {copy.data};
+	PreQueuedDrop *done = prequeued_find(rel);
+
+	/* (a queue to make takes a lock, not to be waited for under the header) */
+	ensure_queue(rel);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
 
 	/*
 	 * The drop's commit is flushed, these records maybe not: the WAL writer
 	 * is asked to flush them soon, not waited for.  A crash first leaves
 	 * the blocks held by nothing, as a crash before the push does, for the
-	 * sweep a restart makes due (bmap_sweep_due()).
+	 * sweep a restart makes due (bmap_sweep_due()).  That is only what a
+	 * commit's drop didn't queue before its commit record, or an abort's.
 	 */
 	{
-		XLogRecPtr	end;
+		XLogRecPtr	end = queue_map(reln, &root, InvalidFullTransactionId,
+									done, NULL);
 
-		(void) queue_push(rel, items, n);
-		INJECTION_POINT("bmap-drop-changes-queued", NULL);
-		n = queued_tops(root.top, items);
-		for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
-			if (root.snap[s].id != 0)
-				n += queued_tops(snapshot_tops(&root.snap[s]), items + n);
-		StaticAssertStmt(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS) <=
-						 (BMAP_QUEUE_PAGES_PER_RECORD - 1) * BMAP_QUEUE_PER_PAGE,
-						 "a map's subtrees are queued in one record");
-		end = queue_push(rel, items, n);
 		if (!XLogRecPtrIsInvalid(end))
 			XLogSetAsyncXactLSN(end);
 		else if (!XLogRecPtrIsInvalid(XactLastRecEnd))
 			XLogSetAsyncXactLSN(XactLastRecEnd);
 	}
-	pfree(items);
+	if (done != NULL)
+	{
+		prequeued = list_delete_ptr(prequeued, done);
+		pfree(done);
+	}
 
 	buf = map_read(rel, 1);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -6880,6 +7112,108 @@ tree_drop(SMgrRelation reln)
 	mdwritev(reln, BMAP_FORKNUM, 1, (const void **) pages, 1, false);
 	UnlockReleaseBuffer(buf);
 	UnlockReleaseBuffer(headerbuf);
+}
+
+/*
+ * Before the commit record of a transaction that drops reln at commit:
+ * queue what its map holds, each entry naming the transaction, so that a
+ * crash after the commit record finds the entries there to drain, not the
+ * blocks held by nothing.  Until the transaction commits the entries hold
+ * nothing (the map still does), and if it doesn't, they are let go of with
+ * nothing released (release_step()); a sweep counts them only once it has
+ * committed.  The snapshots whose takers haven't committed are left to the
+ * drop.  Nothing for a transaction with no id, which wrote no catalog.
+ */
+void
+bmapprecommitdrop(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	FullTransactionId top = GetTopFullTransactionIdIfAny();
+	Buffer		headerbuf;
+	Buffer		buf;
+	BmapRoot	root;
+	PreQueuedDrop *d;
+	MemoryContext old;
+
+	if (!FullTransactionIdIsValid(top) || RecoveryInProgress() ||
+		!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
+		return;
+	/* (what an earlier transaction left, had its end not let go of it) */
+	if (!FullTransactionIdEquals(top, prequeued_xid))
+	{
+		bmapenddrops();
+		prequeued_xid = top;
+	}
+	foreach_ptr(PreQueuedDrop, q, prequeued)
+	{
+		if (RelFileLocatorEquals(q->rel, rel))
+			return;
+	}
+
+	/* (held past the commit, until the drops are done) */
+	if (!drop_locked)
+	{
+		LOCKTAG		tag;
+
+		DROP_LOCK(tag, XidFromFullTransactionId(top));
+		(void) LockAcquire(&tag, ExclusiveLock, true, false);
+		drop_locked = true;
+		drop_locked_xid = XidFromFullTransactionId(top);
+	}
+
+	ensure_queue(rel);
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	d = palloc0(sizeof(PreQueuedDrop));
+	MemoryContextSwitchTo(old);
+	d->rel = rel;
+	PG_TRY();
+	{
+		(void) queue_map(reln, &root, top, NULL, d);
+	}
+	PG_CATCH();
+	{
+		pfree(d);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	prequeued = lappend(prequeued, d);
+	MemoryContextSwitchTo(old);
+	UnlockReleaseBuffer(headerbuf);
+	INJECTION_POINT("bmap-drop-prequeued", NULL);
+}
+
+/*
+ * As a top-level transaction's drops are done, at commit or abort: the
+ * entries it queued before its commit record (bmapprecommitdrop()) are
+ * drained from now on, if it committed.
+ */
+void
+bmapenddrops(void)
+{
+	LOCKTAG		tag;
+
+	list_free_deep(prequeued);
+	prequeued = NIL;
+	if (!drop_locked)
+		return;
+	DROP_LOCK(tag, drop_locked_xid);
+	LockRelease(&tag, ExclusiveLock, true);
+	drop_locked = false;
 }
 
 /*
@@ -7023,7 +7357,10 @@ queued_children(RelFileLocator rel, const BmapQueued *node,
 /*
  * One step of a drain: entries popped from the top of the queue, as many as
  * one record lets go of (up to and including the first node), and let go
- * of, all in one record.  False if the queue is empty.
+ * of, all in one record.  An entry whose drop didn't commit (queued_state())
+ * is popped with nothing let go of; one whose drop is still to commit stops
+ * the step there.  False if the queue is empty, or its top waits for its
+ * drop to commit.
  */
 static bool
 release_step(RelFileLocator rel, BmapRelease *done)
@@ -7036,6 +7373,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	BlockNumber sorted[BMAP_RELEASE_STEP];
 	BlockNumber tofree[BMAP_RELEASE_STEP];
 	uint32		k = 0;
+	uint32		ndiscard = 0;
+	uint32		npop;
 	uint32		nblocks = 0;
 	uint32		nfree = 0;
 	uint32		freed = 0;
@@ -7077,12 +7416,16 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		int			nbit = 0;
 		Buffer		buf = InvalidBuffer;
 		BlockNumber cur = InvalidBlockNumber;
+		FullTransactionId last_owner = InvalidFullTransactionId;
+		OwnerState	last_state = OWNER_NONE;
 
-		while (k < BMAP_RELEASE_STEP && k < n)
+		while (k + ndiscard < BMAP_RELEASE_STEP && k + ndiscard < n)
 		{
-			uint32		pos = n - 1 - k;
+			uint32		pos = n - 1 - k - ndiscard;
 			BmapQueued	e;
 			int			saveref = nref;
+			FullTransactionId owner;
+			OwnerState	state = OWNER_NONE;
 
 			if (QUEUE_PAGE(pos) != cur)
 			{
@@ -7096,6 +7439,25 @@ release_step(RelFileLocator rel, BmapRelease *done)
 						   MAIN_FORKNUM, cur);
 			}
 			e = PageGetBmapQueued(BufferGetPage(buf))[QUEUE_SLOT(pos)];
+
+			/* (a drop's entries are together, of one owner) */
+			owner = queued_owner(&e);
+			if (FullTransactionIdIsValid(owner))
+			{
+				if (!FullTransactionIdEquals(owner, last_owner))
+				{
+					last_owner = owner;
+					last_state = queued_state(&e);
+				}
+				state = last_state;
+			}
+			if (state == OWNER_RUNNING)
+				break;
+			if (!queued_holds(state))
+			{
+				ndiscard++;
+				continue;
+			}
 			if (!page_fits(REF_PAGE(e.block), refpages, &nref,
 						   BMAP_RELEASE_REFS_PAGES))
 				break;
@@ -7115,7 +7477,12 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);
 	}
-	Assert(k > 0);
+	npop = k + ndiscard;
+	if (npop == 0)
+	{
+		UnlockReleaseBuffer(metabuf);
+		return false;
+	}
 
 	/* a node's children, read first (an entry not naming its node: none) */
 	nlet = k;
@@ -7244,20 +7611,20 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	qp.n = 0;
 	if (npushed > 0)
 	{
-		queue_cover(rel, QUEUE_PAGE(n - k + npushed - 1) + 1);
-		queue_write(rel, &qp, n - k, children, npushed);
+		queue_cover(rel, QUEUE_PAGE(n - npop + npushed - 1) + 1);
+		queue_write(rel, &qp, n - npop, children, npushed);
 	}
 
 	xlrec.locator = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
 	xlrec.op = BMAP_RELEASE_DRAIN;
-	xlrec.npopped = k;
+	xlrec.npopped = npop;
 	nblockids = 1 + qp.n + rp.n + (nfree > 0 ? 1 + nbits : 0);
 	XLogEnsureRecordSpace(nblockids - 1, 1 + nblockids);
 	INJECTION_POINT("bmap-release-step", NULL);
 	START_CRIT_SECTION();
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	register_queue_meta(metabuf, isnew, &mdelta, n - k + npushed);
+	register_queue_meta(metabuf, isnew, &mdelta, n - npop + npushed);
 	id = queue_apply_register(&qp, 1);
 	id = refs_apply_register(&rp, id);
 	if (nfree > 0)
@@ -7305,10 +7672,11 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	for (uint32 i = 0; i < nfree; i++)
 		store_written(rel, tofree[i], 1);
 
-	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_DRAINED, k);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_DRAINED, npop);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED, freed);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_QUEUED, npushed);
-	done->entries += k;
+	done->entries += npop;
+	done->discarded += ndiscard;
 	done->freed += freed;
 	done->unrefs += unrefs;
 	return true;
@@ -7386,7 +7754,9 @@ bmap_release_pending(Oid spcOid, Oid dbOid)
  * The sweep holds drains off, so entries are only pushed meanwhile, and
  * those pushed after this read are of maps the sweep read before they were
  * dropped (a drop pushes before it lets go of its root page, under its
- * header's lock).
+ * header's lock).  An entry of a drop yet to commit holds nothing (its map,
+ * read before, still held what it names), nor does one of a drop that
+ * didn't, or is too old to say of (queued_state()).
  */
 static void
 sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
@@ -7429,6 +7799,8 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 	{
 		BmapEntry	ptr;
 
+		if (!queued_holds(queued_state(&entries[i])))
+			continue;
 		ptr.block = entries[i].block;
 		ptr.epoch = 0;
 		ptr.since = entries[i].since;
@@ -9220,6 +9592,53 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	INJECTION_POINT("bmap-predrop", NULL);
 	drop_blocks(reln);
 	INJECTION_POINT("bmap-dropped", NULL);
+}
+
+/* release steps an extension takes at most before the store grows */
+#define BMAP_GROWTH_RELEASE_STEPS	64
+
+/*
+ * Before reln's main fork is extended by nblocks through shared buffers: if
+ * its page store has fewer free blocks than that and its release queue
+ * isn't empty, take release steps first (not waiting for another drain or
+ * a sweep), until enough are free, the queue is empty or its top waits for
+ * a drop, or BMAP_GROWTH_RELEASE_STEPS were taken, so that dropped storage
+ * is reused before the store grows.  Only with autovacuum off, whose
+ * workers otherwise drain the queue in the background, and only in a
+ * transaction.  The caller holds no extension lock (a step takes locks of
+ * its own), but may hold a relation's page locked, as a B-tree split does:
+ * a step locks the allocator's pages and counts, as the extension's
+ * allocation does, and the queue's pages, none of which a backend waits
+ * for while holding a relation's page.
+ */
+void
+bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	BmapRelease done = {0};
+
+	if (forknum != MAIN_FORKNUM || nblocks == 0 || AutoVacuumingActive() ||
+		!IsTransactionState() || CritSectionCount > 0 ||
+		RecoveryInProgress() || !queue_exists(rel) ||
+		bmap_release_pending(rel.spcOid, rel.dbOid) == 0)
+		return;
+
+	for (int step = 0; step < BMAP_GROWTH_RELEASE_STEPS; step++)
+	{
+		uint32		nfree;
+
+		buf = alloc_read(rel, 0);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+		nfree = PageGetBmapMeta(BufferGetPage(buf))->nfree;
+		UnlockReleaseBuffer(buf);
+		if (nfree >= nblocks ||
+			!bmap_release_step(rel.spcOid, rel.dbOid, false, &done))
+			break;
+	}
+	if (done.entries > 0)
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS, 1);
 }
 
 /*
