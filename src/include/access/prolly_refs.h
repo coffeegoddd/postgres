@@ -795,6 +795,14 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*set_commit_relations) (const ProllyHash *commit,
 										 List *relations);
+
+	/*
+	 * Optional: forget the relation records of commits the chunk store no
+	 * longer has, as a step after a collection (true if any was).  A record
+	 * isn't a reference the collection follows, so it would outlive its
+	 * commit.
+	 */
+	bool		(*forget_records) (void);
 } ProllyRefsRoutine;
 
 /*
@@ -848,9 +856,9 @@ extern PGDLLIMPORT List *prolly_commit_local_tables;
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", "relation_class", "set_relation_class", \
-	"set_commit_relations"
+	"set_commit_relations", "forget_records"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK set_commit_relations
+#define PROLLY_REFS_LAST_CALLBACK forget_records
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

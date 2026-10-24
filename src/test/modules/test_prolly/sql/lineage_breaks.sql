@@ -551,6 +551,26 @@ SELECT * FROM dolt_at('HEAD', NULL::ln.p) ORDER BY id;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.p) ORDER BY id;
 RESET ROLE;
 
+-- a collected commit's record goes after the collection; a live one's
+-- stays
+SELECT dolt_hashof('HEAD') AS live_commit \gset
+SELECT dolt_branch('abandon') IS NOT NULL AS made;
+SELECT dolt_checkout('abandon') IS NOT NULL AS on_abandon;
+INSERT INTO ln.p VALUES (90, 'abandoned');
+SELECT length(dolt_commit('-am', 'to abandon')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS abandoned \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'abandon') IS NOT NULL AS deleted;
+SELECT test_refs_value('L' || :'abandoned') IS NOT NULL AS recorded;
+SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT test_refs_walk_reaches(:'abandoned') AS reached,
+	test_chunk_has(:'abandoned') AS stored,
+	test_refs_value('L' || :'abandoned') IS NULL AS forgotten,
+	test_refs_value('L' || :'live_commit') IS NOT NULL AS kept;
+SET ROLE regress_lb_reader;
+SELECT count(*) AS rows_live FROM dolt_at('HEAD', NULL::ln.p);
+RESET ROLE;
+
 -- commits made elsewhere (cloned) have no records: their versions are
 -- read by full readers only, and stay so under a commit made here
 \getenv abs_builddir PG_ABS_BUILDDIR

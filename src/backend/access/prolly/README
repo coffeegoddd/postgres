@@ -299,7 +299,10 @@ that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
 format 16: each table's OID and qualified name, a line each, the name's
 backslashes and newlines escaped so that no name makes a line of its
-own; read strictly, a damaged record refused), and a version is the
+own; read strictly, a damaged record refused; a record isn't a reference
+a collection follows, so after each collection, as a step of its own,
+the records of the commits the store no longer has are forgotten: refs'
+forget_records()), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as

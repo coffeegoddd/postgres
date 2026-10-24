@@ -4751,6 +4751,85 @@ copies_commit_relations(const ProllyHash *commit, List **relations)
 }
 
 /*
+ * Does the store's root hold refs of this build's format (into *root)?
+ * Asked without refusing: a store given another root (a test's chunk, an
+ * older build's refs) has nothing a step after its collection may forget.
+ */
+static bool
+refs_tree_held(ProllyNodeRef *root)
+{
+	ProllyHash	h;
+	StringInfoData data;
+	StringInfoData v;
+	ProllyChunkNode chunk;
+	ProllyKey	k = {(const uint8 *) "!", 1};
+	bool		held;
+
+	PROLLY_CALL(env.chunk_store, root, env.chunks, &h);
+	if (scoped)
+	{
+		rebase_scoped(&h);
+		h = scoped_mine;
+	}
+	if (h.len == 0)
+		return false;
+	initStringInfo(&data);
+	if (!PROLLY_CALL(env.chunk_store, get, env.chunks, &h, &data) ||
+		!PROLLY_CALL(env.chunk_format, open, (const uint8 *) data.data,
+					 data.len, &chunk))
+	{
+		pfree(data.data);
+		return false;
+	}
+	pfree(data.data);
+	ref_of(&h, root);
+	initStringInfo(&v);
+	held = PROLLY_CALL(tree, get, &env, root, &k, &v) &&
+		v.len == strlen(REFS_FORMAT) && memcmp(v.data, REFS_FORMAT, v.len) == 0;
+	pfree(v.data);
+	return held;
+}
+
+/*
+ * Forget the relation records of commits the store no longer has (a
+ * collection took them): a record is kept by its commit's key alone, never
+ * as a reference a collection follows, so it would outlive its commit.
+ * Asked of the store's index, after the collection: a collected commit's
+ * chunk isn't read.  True if any was forgotten.
+ */
+static bool
+copies_forget_records(void)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag = TAG_LINEAGE;
+	ProllyKey	from = {(const uint8 *) &tag, 1};
+	List	   *gone = NIL;
+	ListCell   *lc;
+
+	refs_init();
+	if (!refs_tree_held(&root))
+		return false;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == TAG_LINEAGE)
+	{
+		ProllyHash	commit;
+
+		if (!prolly_hash_from_hex((const char *) k.data + 1, k.len - 1, &commit) ||
+			!PROLLY_CALL(env.chunk_store, has, env.chunks, &commit))
+			gone = lappend(gone, pnstrdup((const char *) k.data, k.len));
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	foreach(lc, gone)
+		refs_put(lfirst(lc), strlen(lfirst(lc)), NULL);
+	return gone != NIL;
+}
+
+/*
  * Of the first parent's relation record (parent, or its lines had), the
  * lines of relations the session still has (of now's): a commit that
  * isn't its working set (a merge's, a pick's or a revert's, made over
@@ -8518,4 +8597,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.relation_class = copies_relation_class,
 	.set_commit_relations = copies_set_commit_relations,
 	.set_relation_class = copies_set_relation_class,
+	.forget_records = copies_forget_records,
 };
