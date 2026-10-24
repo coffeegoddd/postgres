@@ -118,6 +118,7 @@ tests += {
       'redefined_merges',
       'retyped_merges',
       'matview_merges',
+      'matview_status',
       'type_moves',
       'detached_checkout',
       'branch_start',

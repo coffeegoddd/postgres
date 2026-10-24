@@ -78,6 +78,7 @@
 #include "utils/resowner.h"
 #include "utils/typcache.h"
 #include "utils/tuplesort.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -1477,6 +1478,35 @@ working_rows_differ(const Table *r, const Table *t, bool *known)
 }
 
 /*
+ * The working set's materialized views, as its definitions read without
+ * rows have them (root), hold their baselines' rows: true if each prolly
+ * one's change finder finds no change since, as for one refreshed (its
+ * rows rewritten, and the branch folded) or not refreshed at all.  A
+ * concurrent refresh changes its rows in place, as writes to a table do;
+ * then, or where it can't be told, false: the caller folds.
+ */
+static bool
+working_matviews_unchanged(const ProllyNodeRef *root)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+
+	foreach_ptr(Table, m, matviews_in_root(root))
+	{
+		Oid			relid = table_named(m->name);
+		ProllyNodeRef base;
+		bool		any = false;
+
+		if (OidIsValid(relid) && get_rel_relam(relid) != PROLLY_TABLE_AM_OID)
+			continue;			/* (no rows held: no tree) */
+		if (!OidIsValid(relid) ||
+			!refs->working_changes(relid, &base, first_change, &any) ||
+			any || !same_hash(&base.hash, &m->data.hash))
+			return false;
+	}
+	return true;
+}
+
+/*
  * folded_tables() from a version to the working set, from its definitions
  * read without its rows: a table defined alike whose baseline holds the
  * version's rows changed if the change finder finds a change since.  False
@@ -1550,6 +1580,8 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
 			b = lnext(ts.tables, b);
 		}
 	}
+	if (!rows && !working_matviews_unchanged(&to_root))
+		return false;
 
 	/* the other objects (the definitions' are the working set's) */
 	if (PROLLY_HAS(components().canonicalizer, objects) &&
