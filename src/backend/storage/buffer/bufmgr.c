@@ -673,6 +673,8 @@ static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
+static void drop_relations_all_buffers(SMgrRelation *smgr_reln,
+									   int nlocators, bool sized);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -5085,13 +5087,34 @@ DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
 void
 DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 {
+	drop_relations_all_buffers(smgr_reln, nlocators, true);
+}
+
+/* ---------------------------------------------------------------------
+ *		DropUnlinkedRelationsAllBuffers
+ *
+ *		DropRelationsAllBuffers() for relations whose files are already
+ *		unlinked: what was read of them before the unlink is dropped.  Their
+ *		forks' sizes can't be known, so the whole buffer pool is scanned.
+ *		--------------------------------------------------------------------
+ */
+void
+DropUnlinkedRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
+{
+	drop_relations_all_buffers(smgr_reln, nlocators, false);
+}
+
+static void
+drop_relations_all_buffers(SMgrRelation *smgr_reln, int nlocators,
+						   bool sized)
+{
 	int			i;
 	int			n = 0;
 	SMgrRelation *rels;
 	BlockNumber (*block)[MAX_FORKNUM + 1];
 	uint64		nBlocksToInvalidate = 0;
 	RelFileLocator *locators;
-	bool		cached = true;
+	bool		cached = sized;
 	bool		use_bsearch;
 	DropPasses	passes;
 	bool		deferred = false;

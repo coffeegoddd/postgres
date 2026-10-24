@@ -8110,7 +8110,9 @@ sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
 	/*
 	 * A relation dropped while it was read (its buffers dropped before
 	 * these were read): none of its pages stays in shared buffers, where a
-	 * relation given its file number later would find them.
+	 * relation given its file number later would find them.  One whose
+	 * files are still there, its drop past dropping its buffers, has these
+	 * dropped by the drop once it has unlinked them (smgrdounlinkall()).
 	 */
 	if (!bmap_relation_exists(rel))
 	{
