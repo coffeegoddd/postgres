@@ -1,0 +1,37 @@
+--
+-- Out-of-database rasters: a raster band can name a file on the server
+-- instead of holding its pixels.  A commit holds the raster's bytes, so
+-- the path, band number and metadata come back byte-identical through
+-- reset, checkout, merge and a file-remote clone, and the pixels are read
+-- from the file wherever the raster is.  The file itself isn't versioned:
+-- rewrite it, and every commit's raster reads the new pixels.
+--
+\set ECHO none
+written|0
+reads the file|1:true:6:78,2:true:6:78
+band kinds|1:true/true,2:false/true
+commit|t
+branch|t
+commit edit|t
+reset back|t
+reset: same bytes|t
+reset: reads the file|1:true:6:78,2:true:6:78
+reset forward|t
+checkout|t
+checkout: same bytes|t
+checkout: reads the file|1:true:6:78,2:true:6:78
+side commit|t
+checkout main|t
+merge|{0,0,"merge successful"}
+merged: reads the file|1:true:6:78,2:true:6:78,3:true:6:78
+remote|t
+push|t
+clone|t
+clone: same bytes|t
+clone: reads the file|1:true:6,2:true:6,3:true:6
+rewritten|100
+now|1:true:106:1278,2:true:106:1278,3:true:106:1278
+reset to the first commit|t
+its bytes|t
+its pixels: the new file's|1:true:106:1278,2:true:106:1278
+nothing to commit|0

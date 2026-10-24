@@ -81,7 +81,7 @@ made against this tree's installation prefix:
 	make -C src/test/prolly check-postgis POSTGIS_BUILD=DIR
 
 The build is installed from DIR into the temporary installation.  PostGIS
-goes in public, versioned on prolly, as PostGIS's own tests expect.  Two
+goes in public, versioned on prolly, as PostGIS's own tests expect.  The
 groups:
 
 	check-postgis-semantics  PostGIS on the AM under test answers as on
@@ -99,6 +99,22 @@ groups:
 	                aggregates evaluated on the stored corpus
 	                (gis_catalog); metadata views and column management
 	                (gis_metadata)
+	check-postgis-isolation  concurrency as on heap (t/295_postgis_isolation.pl,
+	                postgis_isolation_schedule; also run by check-heap):
+	                SERIALIZABLE checks with spatial predicates, whose
+	                GiST predicate locks fail one of two overlapping
+	                inserts and neither of two far apart; an exclusion
+	                constraint race; row locks on KNN results, waited for
+	                and skipped
+	check-postgis-durability  crash recovery (t/296_postgis_crash.pl, also
+	                run by check-heap): committed geometries, large ones
+	                out of line, survive a crash in a bulk load byte for
+	                byte (EWKB digests), the load's don't, and the GiST
+	                index agrees, under wal_consistency_checking; on
+	                prolly, a crash in a commit of large geometries (in
+	                its fold, and with its chunks reserved but not
+	                committed) leaves the head and the working set as
+	                they were
 	check-vc-postgis  PostGIS through version control, on prolly
 	                (vc_postgis_schedule): byte-identical values and
 	                index agreement through checkout, reset, merge,
@@ -108,7 +124,15 @@ groups:
 	                merges of spatial edits and conflicts on other bytes,
 	                geometry keys (vc_gis_history); types without binary
 	                send/recv and NaN points (vc_gis_types); clone, push,
-	                fetch and pull through a file remote (vc_gis_remotes)
+	                fetch and pull through a file remote (vc_gis_remotes);
+	                out-of-database rasters, whose paths come back through
+	                moves and a clone, and whose files aren't versioned
+	                (vc_gis_outdb); ALTER EXTENSION postgis UPDATE with
+	                committed and uncommitted data on two branches, and
+	                DROP EXTENSION refused for another branch's columns
+	                (vc_gis_extension)
+	check-tap-vc-postgis  clone, push, fetch and pull through a network
+	                remote, between two servers (t/297_postgis_network.pl)
 
 gis_catalog's list changes when PostGIS adds a type, operator class,
 operator or aggregate: the group fails until the new member is covered or
