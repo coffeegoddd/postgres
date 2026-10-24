@@ -45,15 +45,28 @@ my $empty = sql(q{SELECT 'SELECT ' || string_agg('(SELECT count(*) FROM pg_toast
 	FROM pg_class WHERE oid IN ('s.a'::regclass, 's.b'::regclass)});
 ok($node->poll_query_until('postgres', $empty), 'the worker folded the base');
 
-# the worker stops once it has trimmed a log, its deletes uncommitted
-sql(q{SELECT injection_points_attach('prolly-log-trimmed', 'wait')});
+my $deleting = sql(q{SELECT 'SELECT ' || string_agg('(SELECT count(*) FROM pg_toast.pg_prolly_log_' || oid || ' WHERE xmax <> 0)', ' + ') || ' > 0'
+	FROM pg_class WHERE oid IN ('s.a'::regclass, 's.b'::regclass)});
+
+# the worker's fold held back until the writes are done, then stopped
+# once it has trimmed a log, its deletes uncommitted
+sql(q{SELECT injection_points_attach('prolly-fold-worker-fold', 'wait')});
 sql(q{UPDATE s.a SET v = 1; UPDATE s.b SET v = 1});
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		  WHERE backend_type = 'prolly fold worker'
+		    AND wait_event = 'prolly-fold-worker-fold'}),
+	'the worker is about to fold');
+sql(q{SELECT injection_points_attach('prolly-log-trimmed', 'wait')});
+sql(q{SELECT injection_points_detach('prolly-fold-worker-fold')});
+sql(q{SELECT injection_points_wakeup('prolly-fold-worker-fold')});
 ok( $node->poll_query_until(
 		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
 		  WHERE backend_type = 'prolly fold worker'
 		    AND wait_event = 'prolly-log-trimmed'}),
 	'the worker trimmed a log');
 sql(q{SELECT injection_points_detach('prolly-log-trimmed')});
+is(sql($deleting), 't', 'its deletes of the log\'s rows uncommitted');
 
 # a commit's fold trims the same rows: it goes through without waiting
 my $log_offset = -s $node->logfile;
