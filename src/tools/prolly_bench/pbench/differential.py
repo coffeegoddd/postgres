@@ -26,6 +26,7 @@ def run(args) -> int:
         options += ["-replay", str(args.replay.resolve())]
     if args.self_test:
         options += ["-self-test"]
+    options += postgis_options(args)
     return run_on_cluster(args, args.am, options)
 
 
@@ -38,7 +39,20 @@ def run_vc(args) -> int:
         options += ["-replay", args.replay]
     if args.self_test:
         options += ["-self-test"]
+    options += postgis_options(args)
     return run_on_cluster(args, "prolly", options)
+
+
+def postgis_options(args) -> list[str]:
+    """The runner's -postgis, once the server is seen to have PostGIS: a
+    run without it would fail in its first setup statement."""
+    if not getattr(args, "postgis", False):
+        return []
+    share = subprocess.check_output([str(args.pg_bin.resolve() / "pg_config"), "--sharedir"],
+                                    text=True).strip()
+    if not (Path(share) / "extension" / "postgis.control").is_file():
+        raise SystemExit(f"--postgis: no PostGIS in {share}/extension; build it with build_postgis.py")
+    return ["-postgis"]
 
 
 def run_on_cluster(args, engine: str, options: list[str]) -> int:
@@ -59,6 +73,7 @@ def run_on_cluster(args, engine: str, options: list[str]) -> int:
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     (out / "environment.json").write_text(json.dumps({
         "revision": revision, "dirty": bool(dirty), "engine": engine, "settings": settings,
+        "postgis": "-postgis" in options,
         "pg_bin": str(args.pg_bin.resolve()),
         "postgres_version": subprocess.check_output(
             [str(args.pg_bin.resolve() / "postgres"), "--version"], text=True).strip(),

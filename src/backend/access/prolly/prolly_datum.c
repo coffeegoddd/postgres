@@ -24,8 +24,10 @@
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgtime.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/bytea.h"
 #include "utils/catcache.h"
 #include "utils/datum.h"
 #include "utils/float.h"
@@ -36,6 +38,7 @@
 #include "utils/memutils.h"
 #include "utils/multirangetypes.h"
 #include "utils/numeric.h"
+#include "utils/pg_locale.h"
 #include "utils/resowner.h"
 #include "utils/rangetypes.h"
 #include "utils/syscache.h"
@@ -531,24 +534,110 @@ send_floats(ProllyDatumCodec *c, Datum value)
 /*
  * Settings a type's text form may depend on, fixed while one is written or
  * read: the shortest exact float output (extra_float_digits 1), ISO dates
- * in MDY order, the postgres interval style.  A nest level to end, or -1 if
- * they were so already.
+ * in MDY order, the postgres interval style, hex bytea, times in UTC with
+ * the default zone abbreviations, and the C locale's money, numbers and
+ * dates (what PGLC_localeconv() and to_char() read).  A type that prints a
+ * time with its zone's offset, or an amount with a locale's symbol and
+ * separators, would otherwise give the same value a different canonical
+ * form in each committer's session.
+ */
+typedef struct FixedSetting
+{
+	const char *name;
+	const char *value;
+	bool		(*already) (void);	/* is it so now? */
+} FixedSetting;
+
+static bool
+float_digits_fixed(void)
+{
+	return extra_float_digits == 1;
+}
+
+static bool
+datestyle_fixed(void)
+{
+	return DateStyle == USE_ISO_DATES && DateOrder == DATEORDER_MDY;
+}
+
+static bool
+intervalstyle_fixed(void)
+{
+	return IntervalStyle == INTSTYLE_POSTGRES;
+}
+
+static bool
+bytea_output_fixed(void)
+{
+	return bytea_output == BYTEA_OUTPUT_HEX;
+}
+
+static bool
+timezone_fixed(void)
+{
+	return strcmp(pg_get_timezone_name(session_timezone), "UTC") == 0;
+}
+
+static bool
+abbreviations_fixed(void)
+{
+	return strcmp(GetConfigOption("timezone_abbreviations", false, false), "Default") == 0;
+}
+
+static bool
+monetary_fixed(void)
+{
+	return strcmp(locale_monetary, "C") == 0;
+}
+
+static bool
+numeric_fixed(void)
+{
+	return strcmp(locale_numeric, "C") == 0;
+}
+
+static bool
+time_fixed(void)
+{
+	return strcmp(locale_time, "C") == 0;
+}
+
+static const FixedSetting fixed_settings[] = {
+	{"extra_float_digits", "1", float_digits_fixed},
+	{"datestyle", "ISO, MDY", datestyle_fixed},
+	{"intervalstyle", "postgres", intervalstyle_fixed},
+	{"bytea_output", "hex", bytea_output_fixed},
+	{"timezone", "UTC", timezone_fixed},
+	{"timezone_abbreviations", "Default", abbreviations_fixed},
+	{"lc_monetary", "C", monetary_fixed},
+	{"lc_numeric", "C", numeric_fixed},
+	{"lc_time", "C", time_fixed},
+};
+
+/* in prolly_datum_fixed_text(): the settings are fixed, and stay so */
+static int	fixed_text_depth = 0;
+
+/*
+ * Fix the settings, those not so already: a nest level to end, or -1 if
+ * there are none to change (they were so, or prolly_datum_fixed_text()
+ * holds them so).
  */
 static int
 fixed_text_settings(void)
 {
-	int			nest;
+	int			nest = -1;
 
-	if (extra_float_digits == 1 && DateStyle == USE_ISO_DATES &&
-		DateOrder == DATEORDER_MDY && IntervalStyle == INTSTYLE_POSTGRES)
+	if (fixed_text_depth > 0)
 		return -1;
-	nest = NewGUCNestLevel();
-	(void) set_config_option("extra_float_digits", "1", PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-	(void) set_config_option("datestyle", "ISO, MDY", PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-	(void) set_config_option("intervalstyle", "postgres", PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
+	for (int i = 0; i < lengthof(fixed_settings); i++)
+	{
+		if (fixed_settings[i].already())
+			continue;
+		if (nest < 0)
+			nest = NewGUCNestLevel();
+		(void) set_config_option(fixed_settings[i].name, fixed_settings[i].value,
+								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	}
 	return nest;
 }
 
@@ -557,6 +646,35 @@ end_text_settings(int nest)
 {
 	if (nest >= 0)
 		AtEOXact_GUC(true, nest);
+}
+
+void
+prolly_datum_fixed_text(void (*run) (void *arg), void *arg)
+{
+	int			nest;
+
+	if (fixed_text_depth > 0)
+	{
+		run(arg);
+		return;
+	}
+	nest = fixed_text_settings();
+	fixed_text_depth++;
+	PG_TRY();
+	{
+		run(arg);
+	}
+	PG_CATCH();
+	{
+		/* (the settings as they were, and values fixed one by one again) */
+		fixed_text_depth--;
+		if (nest >= 0)
+			AtEOXact_GUC(false, nest);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	fixed_text_depth--;
+	end_text_settings(nest);
 }
 
 static bytea *send_utf8(FmgrInfo *send, Datum value);
@@ -803,9 +921,28 @@ received_form(ProllyDatumCodec *c, bytea *b)
 	return result;
 }
 
+typedef struct BatchRun
+{
+	void		(*run) (void *arg);
+	void	   *arg;
+} BatchRun;
+
+static void batch_fixed(void *arg);
+
+/* (with the text settings fixed once for the batch, not once a value) */
 void
 prolly_datum_batch(void (*run) (void *arg), void *arg)
 {
+	BatchRun	b = {run, arg};
+
+	prolly_datum_fixed_text(batch_fixed, &b);
+}
+
+static void
+batch_fixed(void *barg)
+{
+	void		(*run) (void *arg) = ((BatchRun *) barg)->run;
+	void	   *arg = ((BatchRun *) barg)->arg;
 	MemoryContext mcxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	bool		refused = false;

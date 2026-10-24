@@ -50,7 +50,9 @@ $$;
 -- A status after a row written takes each table's description as it reads
 -- that table's changes; the first reads the definitions too, and the
 -- second takes those it read (nothing they're of changed since), which
--- the check reads again, describing both; a commit's fold takes both.
+-- the check reads again, describing both, and the first's answer, only
+-- the table written since compared again (its description taken once);
+-- a commit's fold takes both.
 UPDATE dc.u SET w = 'c' WHERE id = 1;
 SELECT count(*) AS changes FROM dolt_status;
 :flush

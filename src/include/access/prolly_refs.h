@@ -741,6 +741,31 @@ typedef struct ProllyRefsRoutine
 	 * through this, as a commit holds tables by name and identity alone.
 	 */
 	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
+
+	/*
+	 * Optional: the role that made branch name, which owns it; false if
+	 * none is recorded (main, the database owner's, never has one).
+	 */
+	bool		(*branch_creator) (const char *name, Oid *role);
+
+	/*
+	 * Optional: record role (InvalidOid: none) as the one that made branch
+	 * name, as a branch made again in its own place keeps its owner.
+	 */
+	void		(*branch_set_creator) (const char *name, Oid role);
+
+	/*
+	 * Optional: the role that made tag name here (false: none recorded), and the role that pushed name's nth stash
+	 * (false: it has none).
+	 */
+	bool		(*tag_creator) (const char *name, Oid *role);
+	bool		(*stash_maker) (const char *name, int n, Oid *role);
+
+	/*
+	 * Optional: record role as the one that made tag name here (tag_set()
+	 * records none: a tag fetched or pushed is no one's).
+	 */
+	void		(*tag_set_creator) (const char *name, Oid role);
 } ProllyRefsRoutine;
 
 /*
@@ -784,9 +809,10 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "recorded_relation"
+	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
+	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK recorded_relation
+#define PROLLY_REFS_LAST_CALLBACK tag_set_creator
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

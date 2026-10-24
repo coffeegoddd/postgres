@@ -88,6 +88,7 @@
 #include "access/prolly_datum.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 #define COW_IMPL_ID		1
@@ -117,26 +118,165 @@ node_loaded(const TNode *node)
 }
 
 /*
- * A chunk node by hash, from the chunk store, its bytes allocated in cxt:
- * the context of whatever keeps the node (an iterator, a cursor), which
- * may outlive the one current at the read.
+ * Kept nodes.  Each level's pass of an apply descends from the root to the
+ * nodes of its level, so a node at level L would be read once for each of
+ * the L + 1 passes below and at it: a tree of height H would read about
+ * H^2 / 2 nodes per edited path, where H + 1 are needed.  And a caller
+ * that makes several small changes in a row (a transaction's commit:
+ * seeking its rows, then applying them; getting and putting refs entries
+ * one at a time) descends the same upper nodes each time.  So while a
+ * scope is open (an apply's own, or one keep_nodes() opened), every node
+ * read or written above the leaves, and every root read, is kept until
+ * the scope ends, and read from the chunk store once.  Other leaves aren't
+ * kept: they are read once by a pass that changes them, and a large change
+ * would otherwise hold every leaf it read.  A node is found by its hash,
+ * which names its bytes, so a kept node is never stale; and a scope's
+ * caller reads only trees it holds, so none of their nodes leaves the
+ * store while it is open.  A scope keeps at most maintenance_work_mem of
+ * them; past it, nodes are read again each time, as without one.
+ */
+typedef struct KeptKey
+{
+	uint8		len;
+	uint8		bytes[PROLLY_HASH_MAX_LEN];
+} KeptKey;
+
+typedef struct KeptNode
+{
+	KeptKey		key;
+	uint8	   *data;
+	Size		len;
+} KeptNode;
+
+typedef struct KeepScope
+{
+	HTAB	   *nodes;
+	MemoryContext cxt;			/* the scope lasts as long as this does */
+	struct KeepScope *outer;
+	MemoryContextCallback ended;
+	Size		bytes;			/* of the nodes kept */
+} KeepScope;
+
+static KeepScope *keeping = NULL;
+/*
+ * An apply whose root is a leaf: the last leaf it writes, which is its new
+ * root if that is a leaf, kept by the apply once it knows (the leaves
+ * written before it aren't read again).
+ */
+static bool keep_written_leaves = false;
+static StringInfoData last_leaf = {NULL};
+static ProllyHash last_leaf_hash;
+
+/* (the scope's context going away ends it, on error too) */
+static void
+keep_scope_ended(void *arg)
+{
+	KeepScope  *ks = arg;
+
+	/* (scopes nest: an inner one's context goes first) */
+	if (keeping == ks)
+		keeping = ks->outer;
+	else
+	{
+		for (KeepScope *s = keeping; s != NULL; s = s->outer)
+			if (s->outer == ks)
+			{
+				s->outer = ks->outer;
+				break;
+			}
+	}
+}
+
+static void
+keep_scope_open(MemoryContext cxt)
+{
+	KeepScope  *ks = MemoryContextAllocZero(cxt, sizeof(KeepScope));
+	HASHCTL		ctl;
+
+	ctl.keysize = sizeof(KeptKey);
+	ctl.entrysize = sizeof(KeptNode);
+	ctl.hcxt = cxt;
+	ks->nodes = hash_create("prolly kept nodes", 16, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ks->cxt = cxt;
+	ks->outer = keeping;
+	ks->ended.func = keep_scope_ended;
+	ks->ended.arg = ks;
+	MemoryContextRegisterResetCallback(cxt, &ks->ended);
+	keeping = ks;
+}
+
+static void
+kept_key(const ProllyHash *hash, KeptKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	key->len = hash->len;
+	memcpy(key->bytes, hash->bytes, hash->len);
+}
+
+/* Keep a node's bytes until the open scope ends, if one is open. */
+static void
+kept_put(const ProllyHash *hash, const char *data, Size len)
+{
+	KeptKey		key;
+	KeptNode   *kn;
+	bool		found;
+
+	if (keeping == NULL)
+		return;
+
+	/*
+	 * (no more than maintenance_work_mem kept: past it, nodes are read
+	 * again, as without a scope)
+	 */
+	if (keeping->bytes + len > (Size) maintenance_work_mem * 1024)
+		return;
+	kept_key(hash, &key);
+	kn = hash_search(keeping->nodes, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		kn->data = MemoryContextAlloc(keeping->cxt, Max(len, 1));
+		memcpy(kn->data, data, len);
+		kn->len = len;
+		keeping->bytes += len + sizeof(KeptNode);
+	}
+}
+
+/*
+ * A chunk node by hash, from the chunk store (or the open scope's kept
+ * nodes), its bytes allocated in cxt: the context of whatever keeps the
+ * node (an iterator, a cursor), which may outlive the one current at the
+ * read.  root: the node is a tree's root, kept even if it is a leaf.
  */
 static void
-node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
-			 MemoryContext cxt)
+node_read_keep(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+			   MemoryContext cxt, bool root)
 {
 	StringInfoData data;
 	MemoryContext old = MemoryContextSwitchTo(cxt);
+	KeptNode   *kn = NULL;
 
 	node->chunk.data = NULL;
 	initStringInfo(&data);
 	MemoryContextSwitchTo(old);
-	if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("prolly tree node missing from its chunk store")));
-	if (env->counters)
-		env->counters->nodes_read++;
+	if (keeping != NULL)
+	{
+		KeptKey		key;
+
+		kept_key(&ref->hash, &key);
+		kn = hash_search(keeping->nodes, &key, HASH_FIND, NULL);
+	}
+	if (kn != NULL)
+		appendBinaryStringInfo(&data, (const char *) kn->data, kn->len);
+	else
+	{
+		if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly tree node missing from its chunk store")));
+		if (env->counters)
+			env->counters->nodes_read++;
+	}
 	if (!PROLLY_CALL(env->chunk_format, open, (const uint8 *) data.data,
 					 data.len, &node->chunk))
 		ereport(ERROR,
@@ -145,6 +285,15 @@ node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 	node->level = node->chunk.level;
 	node->nitems = node->chunk.nitems;
 	node->ref = *ref;
+	if (kn == NULL && (root || node->level > 0))
+		kept_put(&ref->hash, data.data, data.len);
+}
+
+static void
+node_read_in(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+			 MemoryContext cxt)
+{
+	node_read_keep(env, ref, node, cxt, false);
 }
 
 /* Read a node kept no longer than the current context. */
@@ -303,6 +452,22 @@ write_node(const ProllyTreeEnv *env, uint16 level, const Item *items, int n,
 			env->counters->nodes_written++;
 		PROLLY_CALL(env->chunk_store, put, env->chunks, &ref->hash, chunk.data,
 					chunk.len);
+	}
+	/* (an apply's new root may be read again, to drop single-child roots) */
+	if (level > 0)
+		kept_put(&ref->hash, chunk.data, chunk.len);
+	else if (keep_written_leaves)
+	{
+		if (last_leaf.data == NULL)
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			initStringInfo(&last_leaf);
+			MemoryContextSwitchTo(old);
+		}
+		resetStringInfo(&last_leaf);
+		appendBinaryStringInfo(&last_leaf, chunk.data, chunk.len);
+		last_leaf_hash = ref->hash;
 	}
 	pfree(chunk.data);
 	pfree(keys);
@@ -1788,7 +1953,7 @@ iter_open(Iter *it, const ProllyTreeEnv *env, const ProllyNodeRef *root,
 	it->env = env;
 	it->cxt = CurrentMemoryContext;
 	it->root = *root;
-	node_read_in(env, root, &it->f[0].node, it->cxt);
+	node_read_keep(env, root, &it->f[0].node, it->cxt, true);
 	if (level > it->f[0].node.level)
 		elog(ERROR, "prolly tree has no level %u", level);
 	it->target = it->f[0].node.level - level;
@@ -1847,6 +2012,18 @@ iter_seek_node(Iter *it, const ProllyKey *key, bool rightmost)
 	}
 	if (it->f[it->target].node.nitems == 0)
 		it->at_end = true;
+}
+
+/* Is there a target-level node after the one it is in?  (Nothing read.) */
+static bool
+iter_has_next_node(const Iter *it)
+{
+	for (int d = it->target - 1; d >= 0; d--)
+	{
+		if (it->f[d].idx + 1 < it->f[d].node.nitems)
+			return true;
+	}
+	return false;
 }
 
 /* Move to the next target-level node (idx 0); false at the end. */
@@ -2480,9 +2657,10 @@ apply_level(const ProllyTreeEnv *env, const ProllyNodeRef *root, uint16 level,
 			 * this must be checked before resynchronization: a clean chunker
 			 * here would otherwise leave them unconsumed, and the next window
 			 * would re-chunk this same node forever.  Otherwise a clean
-			 * chunker means the window has resynchronized.
+			 * chunker means the window has resynchronized, and the next node
+			 * is read only if the window goes on into it.
 			 */
-			if (!iter_next_node(&it))
+			if (!iter_has_next_node(&it))
 			{
 				for (; i < edits->n; i++)
 				{
@@ -2494,6 +2672,7 @@ apply_level(const ProllyTreeEnv *env, const ProllyNodeRef *root, uint16 level,
 			}
 			if (lb.nitems == 0)
 				break;			/* resynchronized: the rest is unchanged */
+			(void) iter_next_node(&it);
 		}
 		levelbuf_free(&lb);
 
@@ -2598,8 +2777,8 @@ apply_root(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 }
 
 static void
-cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
-		  const ProllyEdit *edits, int nedits, ProllyNodeRef *new_root)
+apply_edits(const ProllyTreeEnv *env, const ProllyNodeRef *root,
+			const ProllyEdit *edits, int nedits, ProllyNodeRef *new_root)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "prolly apply", ALLOCSET_DEFAULT_SIZES);
@@ -2633,7 +2812,7 @@ cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		editlist_add(&cur, &e);
 	}
 
-	node_read(env, root, &rootnode);
+	node_read_keep(env, root, &rootnode, CurrentMemoryContext, true);
 	rootlevel = rootnode.level;
 	node_release(&rootnode);
 
@@ -2650,7 +2829,15 @@ cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 	}
 	if (changed)
 	{
+		keep_written_leaves = rootlevel == 0;
+		last_leaf_hash.len = 0;
 		apply_root(env, root, &cur, &result);
+		keep_written_leaves = false;
+		if (last_leaf_hash.len > 0 &&
+			last_leaf_hash.len == result.hash.len &&
+			memcmp(last_leaf_hash.bytes, result.hash.bytes,
+				   result.hash.len) == 0)
+			kept_put(&result.hash, last_leaf.data, last_leaf.len);
 
 		/* A root with one child isn't a root: its child is. */
 		for (;;)
@@ -2674,6 +2861,45 @@ cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 	MemoryContextSwitchTo(old);
 	*new_root = result;
 	MemoryContextDelete(cxt);
+}
+
+/*
+ * An apply reads each node it keeps once (see "Kept nodes"): in the open
+ * scope, if there is one, else in its own.
+ */
+static void
+cow_apply(const ProllyTreeEnv *env, const ProllyNodeRef *root,
+		  const ProllyEdit *edits, int nedits, ProllyNodeRef *new_root)
+{
+	MemoryContext cxt = NULL;
+
+	if (keeping == NULL)
+	{
+		cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly apply nodes",
+									ALLOCSET_DEFAULT_SIZES);
+		keep_scope_open(cxt);
+	}
+	PG_TRY();
+	{
+		apply_edits(env, root, edits, nedits, new_root);
+	}
+	PG_FINALLY();
+	{
+		keep_written_leaves = false;
+		if (cxt)
+			MemoryContextDelete(cxt);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Until cxt is reset or deleted, every node read or written above the
+ * leaves, and every root read, is read from the chunk store once.
+ */
+static void
+cow_keep_nodes(MemoryContext cxt)
+{
+	keep_scope_open(cxt);
 }
 
 /* ------------------------------------------------------------------------
@@ -2702,7 +2928,7 @@ side_open(DiffSide *s, const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	s->env = env;
 	s->cxt = CurrentMemoryContext;
 	s->depth = 0;
-	node_read_in(env, root, &s->f[0].node, s->cxt);
+	node_read_keep(env, root, &s->f[0].node, s->cxt, true);
 	s->f[0].idx = 0;
 	if (s->f[0].node.nitems == 0)
 	{
@@ -3662,6 +3888,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.cursor_next = cow_cursor_next,
 	.cursor_close = cow_cursor_close,
 	.apply = cow_apply,
+	.keep_nodes = cow_keep_nodes,
 	.count = cow_count,
 	.walk = cow_walk,
 	.diff = cow_diff,
