@@ -236,6 +236,56 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
 SELECT length(dolt_commit('-am', 'after statuses')::text) > 0 AS committed;
 :flush
 SELECT 'commit after statuses' AS fold, * FROM work();
+-- A status after another, of the same head and definitions, takes the
+-- last one's answer (status_reused) and compares again only the tables
+-- written since: not every table's change finder asked, a few nodes read.
+-- A table written shows; written back as it was, it doesn't.  (verify
+-- off where work is counted: each taken is compared in full too.)
+CREATE FUNCTION status_reused() RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE name = 'status_reused'
+$$;
+SET debug_prolly_verify_fold_caches = off;
+UPDATE many.hot SET v = v + 1;
+SELECT * FROM dolt_status ORDER BY 1;
+UPDATE many.hot SET v = v + 1;
+:reset
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	AS status_nodes \gset
+SELECT status_reused() AS reused,
+	CASE WHEN :status_nodes <= 100 THEN 'at most 100' ELSE :status_nodes::text END
+	AS status_nodes;
+INSERT INTO many.t20 VALUES (20, 'twenty');
+SELECT * FROM dolt_status ORDER BY 1;
+DELETE FROM many.t20;
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT status_reused() AS reused;
+-- (a transaction's own rows, in an answer taken while it wrote, aren't
+-- there once it, or the savepoint they were written in, rolls back)
+BEGIN;
+INSERT INTO many.t22 VALUES (22, 'twenty-two');
+SELECT * FROM dolt_status ORDER BY 1;
+ROLLBACK;
+SELECT * FROM dolt_status ORDER BY 1;
+BEGIN;
+UPDATE many.hot SET v = v + 1;
+SAVEPOINT s;
+INSERT INTO many.t23 VALUES (23, 'twenty-three');
+SELECT * FROM dolt_status ORDER BY 1;
+ROLLBACK TO s;
+SELECT * FROM dolt_status ORDER BY 1;
+COMMIT;
+RESET debug_prolly_verify_fold_caches;
+INSERT INTO many.t21 VALUES (21, 'twenty-one');
+SELECT * FROM dolt_status ORDER BY 1;
+DELETE FROM many.t21;
+SELECT * FROM dolt_status ORDER BY 1;
+SELECT length(dolt_commit('-am', 'after reused statuses')::text) > 0 AS committed;
+SELECT * FROM dolt_status ORDER BY 1;
+
 -- (a definition changed: read again)
 ALTER TABLE many.t13 ADD COLUMN w int;
 :reset
