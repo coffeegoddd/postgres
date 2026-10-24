@@ -6434,25 +6434,41 @@ typedef struct NameLineage
 /*
  * The name in from of to's table name: name if the step's changes don't
  * list it; NULL if to made it (from has none), or a read left it out.
+ * The step's summary is made in a context of its own, freed after: only
+ * the name is kept, in the caller's.
  */
 static char *
 lineage_name_before(const char *from, const char *to, const char *name)
 {
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext step = AllocSetContextCreate(caller, "prolly lineage step",
+											   ALLOCSET_DEFAULT_SIZES);
 	List	   *rows = NIL;
 	ListCell   *lc;
+	const char *before = name;
 
+	MemoryContextSwitchTo(step);
 	PROLLY_CALL(diff_merge(), summary, from, to, false, collect_change, &rows);
 	foreach(lc, rows)
 	{
 		SummaryRow *r = lfirst(lc);
 
 		if (r->not_covered && r->from_name && strcmp(r->from_name, name) == 0)
-			return NULL;
+		{
+			before = NULL;
+			break;
+		}
 		if (r->object == PROLLY_OBJECT_TABLE && r->to_name &&
 			strcmp(r->to_name, name) == 0)
-			return r->from_name;
+		{
+			before = r->from_name;
+			break;
+		}
 	}
-	return pstrdup(name);
+	MemoryContextSwitchTo(caller);
+	before = before ? pstrdup(before) : NULL;
+	MemoryContextDelete(step);
+	return (char *) before;
 }
 
 static void
@@ -6702,6 +6718,77 @@ prolly_check_history_by_name(const char *name, const char *commit,
 		}
 		(void) hash_search(lineages_known, key, HASH_ENTER, &found);
 	}
+}
+
+/*
+ * A reader of a table's history, version by version: who may read it
+ * (checked once) and the table's lineage (walked once, as far as the
+ * versions asked of need).
+ */
+struct ProllyHistoryReader
+{
+	char	   *name;			/* the table's name here */
+	bool		reads_all;		/* the database's owner, or pg_read_all_data */
+	MemoryContext cxt;			/* its lineage's, as long as the reader */
+	List	   *lineages;
+	const char *fn;
+};
+
+ProllyHistoryReader *
+prolly_history_reader_begin(const char *name, const char *fn)
+{
+	ProllyHistoryReader *r = palloc0(sizeof(ProllyHistoryReader));
+	Oid			relid;
+	AclResult	aclresult;
+
+	r->name = pstrdup(name);
+	r->fn = fn;
+	r->cxt = CurrentMemoryContext;
+	r->reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+	if (r->reads_all)
+		return r;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+						fn, name),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, fn);
+	return r;
+}
+
+/*
+ * Refuse reading the version commit (hex) has of the reader's table, by
+ * the name it has there, unless it is the table here (its lineage reaches
+ * back to it), as dolt_history_table() by name refuses it.
+ */
+void
+prolly_history_reader_check(ProllyHistoryReader *r, const char *commit,
+							const char *version_name)
+{
+	MemoryContext old;
+	bool		has;
+
+	if (r->reads_all)
+		return;
+	/* (the lineage, walked as far as asked, kept for the next commit) */
+	old = MemoryContextSwitchTo(r->cxt);
+	has = lineage_has(name_lineage(&r->lineages, r->name), commit, version_name);
+	MemoryContextSwitchTo(old);
+	if (!has)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+						r->fn, version_name),
+				 errdetail("The name was without a table since commit %s, so the table here is another.",
+						   commit),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 }
 
 /* rows_begin_described() of a table's version, or refused. */

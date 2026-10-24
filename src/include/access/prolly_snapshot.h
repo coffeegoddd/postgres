@@ -33,6 +33,21 @@ extern void prolly_check_history_by_name(const char *name, const char *commit,
 										 bool lineage, const char *fn);
 
 /*
+ * A reader of the history of the table named name: who may read it,
+ * checked as prolly_check_history_by_name() checks it, at begin; then each
+ * version, by its name there, held to the table's lineage, walked once
+ * however many versions are asked of (refused as the by-name history
+ * functions refuse a version).
+ */
+typedef struct ProllyHistoryReader ProllyHistoryReader;
+
+extern ProllyHistoryReader *prolly_history_reader_begin(const char *name,
+														const char *fn);
+extern void prolly_history_reader_check(ProllyHistoryReader *r,
+										const char *commit,
+										const char *version_name);
+
+/*
  * Schema nsp is being dropped: a snapshot mount of its name goes with it,
  * its pin released.
  */
