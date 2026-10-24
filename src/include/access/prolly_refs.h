@@ -107,8 +107,9 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "check constraint", "not null":
- * the merge didn't write it), and what it breaks, as JSON.
+ * the row is in the table; "unique index", "exclusion constraint", "check
+ * constraint", "not null": the merge didn't write it), and what it breaks,
+ * as JSON.
  */
 typedef struct ProllyViolation
 {
@@ -710,9 +711,14 @@ extern PGDLLIMPORT int prolly_kept_commits;
  * For refs implementations: a commit's info by its id (false if there is
  * no such commit), and the best common ancestor of two commits (no other
  * common one descending from it; of two such, the one furthest from the
- * history's roots, then the least id), found with it.  The walks visit a
- * commit at most once each: a's ancestors, b's down to the common ones,
- * and, with several of those, theirs and the history beneath them.
+ * history's roots, then the least id), found with it.  Where the commits
+ * record their heights, it reads the commits above the best common ones
+ * and their parents, and holds marks for those alone, however long the
+ * history beneath them (criss-cross merges, and a side reaching beneath
+ * the base through an older merge, included).  Otherwise
+ * the walks visit a commit at most once each: a's ancestors, b's down to
+ * the common ones, and, with several of those, theirs and the history
+ * beneath them.
  */
 typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
 									ProllyCommitInfo *info, void *arg);

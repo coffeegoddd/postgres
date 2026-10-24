@@ -19,6 +19,20 @@ content-addressed prolly trees, kept in the database's chunk store, and
 names the canonical root (canon_folded.c).  Diffs and merges compare
 those trees; remotes exchange their chunks.
 
+Each versioned object has catalog rows on every branch that has used it,
+each carrying its branch (catalog/branch.c).  Every branch-aware catalog
+has an index on its branch column alone (pg_shdepend one on its database
+and branch), and what reads a branch's objects reads them by it
+(catalog_branch_beginscan()): a branch's first use copies the rows on its
+source, a branch's delete removes the rows on it, and a commit's
+canonical form, and the checks of a working set against a commit, read
+the rows on the session's branch.  That work is in the objects on the
+branch, however many rows other branches and shared objects have.  One
+catalog is still read whole for the canonical form: pg_cast
+(describe_casts()), since a cast between a type an extension has in a
+versioned schema and a type outside it, made outside the extension, is
+shared yet described; pg_cast grows only with user casts.
+
 
 Interfaces and implementations
 ------------------------------
@@ -89,6 +103,17 @@ send formats produced with the client encoding fixed to UTF-8
 (SetClientEncodingOverride in mbutils.c), and OID-free encodings of arrays
 and composites.  valenc_canonical.c stores live columns only, without
 trailing NULLs, and decodes rows encoded under an earlier layout.
+
+A reader that needs only some columns asks for those (the value encoder's
+decode_columns(), the keying's decode_row_columns()): the others are
+skipped by their length prefixes, so no type decoder runs for them and no
+long value of theirs is read from its tree.  fields() gives each column's
+encoded bytes, or its value tree's reference, without decoding anything,
+for callers that compare columns by their bytes (two rows hold a column
+alike exactly when its bytes are the same) and decode only some
+(decode_field()).  pg_stat_prolly counts the columns decoded
+(columns_decoded) and the long values read whole (values_read,
+value_bytes_read).
 
 Folded format 17 (key/value encoder version 6) normalizes binary I/O for
 extension base types and for ranges whose bounds reach one (including
@@ -310,6 +335,16 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A keyed row both sides of a merge changed is merged column by column.  A
+long value is held out of line by a reference naming its canonical bytes,
+so where a side's reference is base's, decoded by the same keying, that
+side didn't change the column: neither value is read (decode_row_kept()),
+and a merged row taking it is written with the reference
+(encode_row_kept()).  A large value neither side changed is not fetched to
+find that out, nor when the merged row is applied.  A column whose base
+value is unsure (below) is compared by value, as are values either side
+changed.
+
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
 spools its ordered keys, conflict flags and canonical values to a temporary
@@ -457,7 +492,11 @@ waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is
 kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
 head moves every transaction.  The refs record each kept commit with the
-branch's baseline then and each table's relations and snapshots ('K').  A
+branch's baseline then and each table's relations and snapshots ('K').
+A snapshot's slot names the transaction that took it, so one whose
+transaction doesn't commit (a crash between the keep and the commit
+included) is kept by nobody: the relation's next snapshot, or a page
+sweep, lets go of it.  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

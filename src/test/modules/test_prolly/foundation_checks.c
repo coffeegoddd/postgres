@@ -870,6 +870,94 @@ valenc_long_values(const ProllyImplInfo *impl)
 }
 
 /*
+ * Long values kept: decode_kept() of a row against one with the same long
+ * values leaves them unread and marks them, and encode_kept() of what it
+ * decoded, the kept columns taken from that row, gives the row encode()
+ * gave, without reading them.  A column marked kept where that row holds
+ * no reference is an error.
+ */
+void
+valenc_kept_values(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {{COL_I4}, {COL_TEXT}, {COL_I4_ARRAY}};
+	TupleDesc	desc = make_desc(cols, lengthof(cols));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *dst = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	ProllyTreeEnv env;
+	ProllyValueStore values = {0};
+	StringInfoData long_row;
+	StringInfoData short_row;
+	StringInfoData again;
+	ProllyValue lrow;
+	ProllyValue srow;
+	bool		kept[3];
+	char	   *text = palloc(100001);
+	bool		failed = false;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	prolly_folded_tree_env(&env);
+	values.tree = prolly_tree_lookup("cow");
+	values.env = &env;
+	PROLLY_CALL(ve, set_values, enc, &values);
+	for (int i = 0; i < 100000; i++)
+		text[i] = 'a' + (i * 7 + i / 26) % 26;
+	text[100000] = '\0';
+	initStringInfo(&long_row);
+	initStringInfo(&short_row);
+	initStringInfo(&again);
+	store_row(src, cols, 1, 0, text);
+	encode_row(ve, enc, src, &long_row);
+	lrow.data = (const uint8 *) long_row.data;
+	lrow.len = long_row.len;
+	store_row(src, cols, 1, 0, "short");
+	encode_row(ve, enc, src, &short_row);
+	srow.data = (const uint8 *) short_row.data;
+	srow.len = short_row.len;
+
+	PROLLY_CALL(ve, decode_kept, enc, &lrow, &lrow, dst, kept);
+	if (kept[0] || !kept[1] || kept[2] || !dst->tts_isnull[1])
+		elog(ERROR, "decode_kept() didn't keep just the long value");
+	PROLLY_CALL(ve, encode_kept, enc, dst, &lrow, kept, &again);
+	if (again.len != long_row.len ||
+		memcmp(again.data, long_row.data, again.len) != 0)
+		elog(ERROR, "encode_kept() of a row kept from itself isn't the row");
+
+	/* the short row: nothing kept, encoded as encode() does */
+	PROLLY_CALL(ve, decode_kept, enc, &srow, &lrow, dst, kept);
+	if (kept[0] || kept[1] || kept[2])
+		elog(ERROR, "decode_kept() kept a value the rows don't share");
+	resetStringInfo(&again);
+	PROLLY_CALL(ve, encode_kept, enc, dst, &lrow, kept, &again);
+	if (again.len != short_row.len ||
+		memcmp(again.data, short_row.data, again.len) != 0)
+		elog(ERROR, "encode_kept() with nothing kept isn't encode()");
+
+	/* kept from a row holding no reference there */
+	kept[1] = true;
+	resetStringInfo(&again);
+	PG_TRY();
+	{
+		PROLLY_CALL(ve, encode_kept, enc, dst, &srow, kept, &again);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		failed = true;
+	}
+	PG_END_TRY();
+	if (!failed)
+		elog(ERROR, "encode_kept() kept a reference the row doesn't hold");
+
+	pfree(text);
+	ExecDropSingleTupleTableSlot(src);
+	ExecDropSingleTupleTableSlot(dst);
+	PROLLY_CALL(ve, end, enc);
+}
+
+/*
  * Reference encodings of rows 1 and 9 of a table (int4, text, int8, bool,
  * numeric); row 9 has NULLs.  These bytes are the canonical format, so they
  * are the same on every platform.  An implementation whose bytes depend on
@@ -1046,6 +1134,272 @@ valenc_missing_values(const ProllyImplInfo *impl)
 		PROLLY_CALL(ve, decode, aenc, &value, out);
 		check_same_row(aslot, out, 3);
 	}
+}
+
+/* Column c of two rows holds the same value (both NULL, or equal output). */
+static void
+check_same_column(Oid type, bool anull, Datum a, bool bnull, Datum b,
+				  int row, int c, const char *what)
+{
+	Oid			out;
+	bool		varlena;
+
+	if (anull != bnull)
+		elog(ERROR, "row %d column %d: %s gave %s, decode() %s", row, c + 1,
+			 what, bnull ? "NULL" : "a value", anull ? "NULL" : "a value");
+	if (anull)
+		return;
+	getTypeOutputInfo(type, &out, &varlena);
+	if (strcmp(OidOutputFunctionCall(out, a), OidOutputFunctionCall(out, b)) != 0)
+		elog(ERROR, "row %d column %d: %s gave another value than decode()",
+			 row, c + 1, what);
+}
+
+/*
+ * fields(), decode_field() and decode_columns() against decode(): every
+ * column fields() gives decodes as decode() decodes it, NULLs, dropped
+ * columns and columns a row predates (their missing values) included;
+ * decode_columns() decodes the columns asked for alike and leaves the
+ * others NULL.  An unwanted value out of line is never read: decoding the
+ * row's other columns reads no node of the value store.  Rows holding the
+ * same long value give that column the same bytes (its reference), and a
+ * row with a byte after its values is refused, as decode() refuses it.
+ * fields_alike() takes a column a row predates as its missing value, and
+ * field_compatible() holds only between columns that encode alike.
+ */
+void
+valenc_selected_columns(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {
+		{COL_I4}, {COL_TEXT}, {COL_I8}, {COL_TEXT, true}, {COL_TEXT},
+		{COL_I4_ARRAY}, {COL_I4, false, true},
+	};
+	static const ColSpec before[] = {{COL_I4}, {COL_TEXT}, {COL_I8}, {COL_TEXT, true}};
+	int			natts = lengthof(cols);
+	TupleDesc	desc = make_desc(cols, natts);
+	TupleDesc	bdesc = make_desc(before, lengthof(before));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	ProllyValueEncoder *benc = PROLLY_CALL(ve, begin, bdesc, CurrentMemoryContext);
+	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *bsrc = MakeSingleTupleTableSlot(bdesc, &TTSOpsVirtual);
+	TupleTableSlot *all = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *some = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	ProllyEncodedField *fields = palloc_array(ProllyEncodedField, natts);
+	ProllyEncodedField *other = palloc_array(ProllyEncodedField, natts);
+	bool	   *wanted = palloc_array(bool, natts);
+	ProllyTreeEnv env;
+	ProllyNodeCounters counters = {0};
+	ProllyValueStore values = {0};
+	StringInfoData buf;
+	StringInfoData buf2;
+	char	   *longtext;
+	MemoryContext cxt = CurrentMemoryContext;
+	bool		failed;
+
+	prolly_folded_tree_env(&env);
+	env.counters = &counters;
+	values.tree = prolly_tree_lookup("cow");
+	values.env = &env;
+	PROLLY_CALL(ve, set_values, enc, &values);
+	initStringInfo(&buf);
+	initStringInfo(&buf2);
+	longtext = palloc(100001);
+	for (int i = 0; i < 100000; i++)
+		longtext[i] = 'a' + (i * 7 + i / 26) % 26;
+	longtext[100000] = '\0';
+
+	for (int r = 0; r < 48; r++)
+	{
+		ProllyValue row;
+
+		if (r % 12 == 11)
+		{
+			/* a row from before the last three columns were added */
+			store_row(bsrc, before, r, 0, "old");
+			resetStringInfo(&buf);
+			PROLLY_CALL(ve, encode, benc, bsrc, &buf);
+		}
+		else
+		{
+			/* rows 0..7 have no NULLs; later rows NULL a varying set */
+			store_row(src, cols, r, r < 8 ? 0 : (uint32) (r * 37) & 0x37,
+					  r % 4 == 1 ? longtext : "abc");
+			encode_row(ve, enc, src, &buf);
+		}
+		row.data = (const uint8 *) buf.data;
+		row.len = buf.len;
+		PROLLY_CALL(ve, decode, enc, &row, all);
+		slot_getallattrs(all);
+
+		PROLLY_CALL(ve, fields, enc, &row, fields);
+		for (int c = 0; c < natts; c++)
+		{
+			bool		isnull;
+			Datum		d;
+
+			if (TupleDescAttr(desc, c)->attisdropped)
+			{
+				if (fields[c].stored)
+					elog(ERROR, "row %d: a dropped column is stored", r);
+				continue;
+			}
+			if (fields[c].isnull != all->tts_isnull[c])
+				elog(ERROR, "row %d column %d: fields() says %s", r, c + 1,
+					 fields[c].isnull ? "NULL" : "not NULL");
+			if (r % 12 == 11 && c >= 4 && fields[c].stored)
+				elog(ERROR, "row %d column %d: a column the row predates is stored",
+					 r, c + 1);
+			d = PROLLY_CALL(ve, decode_field, enc, c, &fields[c], &isnull);
+			check_same_column(TupleDescAttr(desc, c)->atttypid,
+							  all->tts_isnull[c], all->tts_values[c],
+							  isnull, d, r, c, "decode_field()");
+		}
+
+		for (int pick = 0; pick < 3; pick++)
+		{
+			uint64		read_before = counters.nodes_read;
+
+			for (int c = 0; c < natts; c++)
+				wanted[c] = (pick == 0) ? (c % 2 == 0) :
+					(pick == 1) ? (c % 2 == 1) : (c == 0 || c == 2);
+			PROLLY_CALL(ve, decode_columns, enc, &row, wanted, some);
+			slot_getallattrs(some);
+			for (int c = 0; c < natts; c++)
+			{
+				if (TupleDescAttr(desc, c)->attisdropped)
+					continue;
+				if (!wanted[c])
+				{
+					if (!some->tts_isnull[c])
+						elog(ERROR, "row %d column %d: decode_columns() decoded a column not asked for",
+							 r, c + 1);
+					continue;
+				}
+				check_same_column(TupleDescAttr(desc, c)->atttypid,
+								  all->tts_isnull[c], all->tts_values[c],
+								  some->tts_isnull[c], some->tts_values[c],
+								  r, c, "decode_columns()");
+			}
+			/* the long values are columns 2 and 5 */
+			if (!wanted[1] && !wanted[4] && counters.nodes_read != read_before)
+				elog(ERROR, "row %d: decoding columns but its long values read %d nodes",
+					 r, (int) (counters.nodes_read - read_before));
+			if (wanted[1] && fields[1].out_of_line &&
+				counters.nodes_read == read_before)
+				elog(ERROR, "row %d: a long value asked for was not read", r);
+		}
+	}
+
+	/*
+	 * A row that predates column 7 has its missing value, 5: alike with a
+	 * row that stores 5 there, and not with one storing NULL or another
+	 * value, in either order.
+	 */
+	{
+		ProllyEncodedField predates[lengthof(cols)];
+		static const int stored[] = {5, -1, 6};
+
+		store_row(bsrc, before, 3, 0, "old");
+		resetStringInfo(&buf2);
+		PROLLY_CALL(ve, encode, benc, bsrc, &buf2);
+		{
+			ProllyValue a = {(const uint8 *) buf2.data, buf2.len};
+
+			PROLLY_CALL(ve, fields, enc, &a, predates);
+		}
+		if (predates[6].stored || !predates[6].missing || predates[6].isnull)
+			elog(ERROR, "a row predating a column with a missing value isn't given it");
+		for (int s = 0; s < lengthof(stored); s++)
+		{
+			ProllyValue b;
+			bool		alike;
+
+			store_row(src, cols, 3, 0, "old");
+			src->tts_isnull[6] = stored[s] < 0;
+			src->tts_values[6] = Int32GetDatum(stored[s]);
+			encode_row(ve, enc, src, &buf);
+			b.data = (const uint8 *) buf.data;
+			b.len = buf.len;
+			PROLLY_CALL(ve, fields, enc, &b, other);
+			for (int order = 0; order < 2; order++)
+			{
+				alike = PROLLY_CALL(ve, fields_alike, enc, 6,
+									order ? &other[6] : &predates[6],
+									order ? &predates[6] : &other[6]);
+				if (alike != (stored[s] == 5))
+					elog(ERROR, "a missing 5 and a stored %s compare %s",
+						 stored[s] < 0 ? "NULL" : psprintf("%d", stored[s]),
+						 alike ? "alike" : "different");
+			}
+		}
+	}
+
+	/*
+	 * Columns compare by their bytes across encoders only where they encode
+	 * alike: the same column in another layout, not another type.
+	 */
+	{
+		static const ColSpec retyped[] = {{COL_I8}, {COL_TEXT}};
+		TupleDesc	rdesc = make_desc(retyped, lengthof(retyped));
+		ProllyValueEncoder *renc = PROLLY_CALL(ve, begin, rdesc, CurrentMemoryContext);
+
+		if (!PROLLY_CALL(ve, field_compatible, enc, 0, benc, 0) ||
+			!PROLLY_CALL(ve, field_compatible, enc, 1, renc, 1))
+			elog(ERROR, "columns encoding alike are not compatible");
+		if (PROLLY_CALL(ve, field_compatible, enc, 0, renc, 0) ||
+			PROLLY_CALL(ve, field_compatible, enc, 3, benc, 3) ||
+			PROLLY_CALL(ve, field_compatible, enc, 1, enc, 2))
+			elog(ERROR, "a retyped or dropped column is compatible");
+		PROLLY_CALL(ve, end, renc);
+	}
+
+	/* the same long value in two rows: the same bytes, its reference */
+	store_row(src, cols, 1, 0, longtext);
+	encode_row(ve, enc, src, &buf);
+	store_row(src, cols, 5, 0x1, longtext);
+	resetStringInfo(&buf2);
+	PROLLY_CALL(ve, encode, enc, src, &buf2);
+	{
+		ProllyValue a = {(const uint8 *) buf.data, buf.len};
+		ProllyValue b = {(const uint8 *) buf2.data, buf2.len};
+
+		PROLLY_CALL(ve, fields, enc, &a, fields);
+		PROLLY_CALL(ve, fields, enc, &b, other);
+		if (!fields[1].out_of_line || !other[1].out_of_line ||
+			fields[1].bytes.len != other[1].bytes.len ||
+			memcmp(fields[1].bytes.data, other[1].bytes.data, fields[1].bytes.len) != 0)
+			elog(ERROR, "two rows holding one long value hold it differently");
+		if (fields[2].bytes.len == other[2].bytes.len &&
+			memcmp(fields[2].bytes.data, other[2].bytes.data, fields[2].bytes.len) == 0)
+			elog(ERROR, "two rows holding different values hold them alike");
+	}
+
+	/* a row with a byte after its values: refused */
+	appendStringInfoChar(&buf, '\x01');
+	failed = false;
+	PG_TRY();
+	{
+		ProllyValue bad = {(const uint8 *) buf.data, buf.len};
+
+		PROLLY_CALL(ve, fields, enc, &bad, fields);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		failed = true;
+	}
+	PG_END_TRY();
+	if (!failed)
+		elog(ERROR, "fields() took a row with a trailing byte");
+
+	ExecDropSingleTupleTableSlot(src);
+	ExecDropSingleTupleTableSlot(bsrc);
+	ExecDropSingleTupleTableSlot(all);
+	ExecDropSingleTupleTableSlot(some);
+	PROLLY_CALL(ve, end, enc);
+	PROLLY_CALL(ve, end, benc);
 }
 
 /* ------------------------------------------------------------------------

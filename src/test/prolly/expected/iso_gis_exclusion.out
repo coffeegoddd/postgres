@@ -1,0 +1,50 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s2_begin s1_add s2_overlap s1_commit s2_commit s3_show
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_add: INSERT INTO gis_parcels VALUES (10, ST_MakeEnvelope(10, 10, 20, 20));
+step s2_overlap: INSERT INTO gis_parcels VALUES (11, ST_MakeEnvelope(15, 15, 25, 25)); <waiting ...>
+step s1_commit: COMMIT;
+step s2_overlap: <... completed>
+ERROR:  conflicting key value violates exclusion constraint "gis_parcels_g_excl"
+step s2_commit: COMMIT;
+step s3_show: SELECT id, ST_AsText(g) FROM gis_parcels ORDER BY id;
+id|st_astext                               
+--+----------------------------------------
+ 1|POLYGON((0 0,0 1,1 1,1 0,0 0))          
+10|POLYGON((10 10,10 20,20 20,20 10,10 10))
+(2 rows)
+
+
+starting permutation: s1_begin s2_begin s1_add s2_overlap s1_rollback s2_commit s3_show
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_add: INSERT INTO gis_parcels VALUES (10, ST_MakeEnvelope(10, 10, 20, 20));
+step s2_overlap: INSERT INTO gis_parcels VALUES (11, ST_MakeEnvelope(15, 15, 25, 25)); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_overlap: <... completed>
+step s2_commit: COMMIT;
+step s3_show: SELECT id, ST_AsText(g) FROM gis_parcels ORDER BY id;
+id|st_astext                               
+--+----------------------------------------
+ 1|POLYGON((0 0,0 1,1 1,1 0,0 0))          
+11|POLYGON((15 15,15 25,25 25,25 15,15 15))
+(2 rows)
+
+
+starting permutation: s1_begin s2_begin s1_add s2_apart s1_commit s2_commit s3_show
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_add: INSERT INTO gis_parcels VALUES (10, ST_MakeEnvelope(10, 10, 20, 20));
+step s2_apart: INSERT INTO gis_parcels VALUES (12, ST_MakeEnvelope(30, 30, 40, 40));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+step s3_show: SELECT id, ST_AsText(g) FROM gis_parcels ORDER BY id;
+id|st_astext                               
+--+----------------------------------------
+ 1|POLYGON((0 0,0 1,1 1,1 0,0 0))          
+10|POLYGON((10 10,10 20,20 20,20 10,10 10))
+12|POLYGON((30 30,30 40,40 40,40 30,30 30))
+(3 rows)
+

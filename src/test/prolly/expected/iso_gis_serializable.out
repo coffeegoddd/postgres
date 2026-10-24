@@ -1,0 +1,55 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s2_begin s1_check s2_check s1_add s2_add s1_commit s2_commit s3_show
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_check: SELECT count(*) FROM gis_zones WHERE ST_Intersects(g, ST_MakeEnvelope(2, 2, 8, 8));
+count
+-----
+    0
+(1 row)
+
+step s2_check: SELECT count(*) FROM gis_zones WHERE ST_Intersects(g, ST_MakeEnvelope(4, 4, 9, 9));
+count
+-----
+    0
+(1 row)
+
+step s1_add: INSERT INTO gis_zones VALUES (-1, ST_MakeEnvelope(2, 2, 8, 8));
+step s2_add: INSERT INTO gis_zones VALUES (-2, ST_MakeEnvelope(4, 4, 9, 9));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s3_show: SELECT id, ST_AsText(g) FROM gis_zones WHERE id < 0 ORDER BY id;
+id|st_astext                     
+--+------------------------------
+-1|POLYGON((2 2,2 8,8 8,8 2,2 2))
+(1 row)
+
+
+starting permutation: s1_begin s2_begin s1_check s2_check_far s1_add s2_add_far s1_commit s2_commit s3_show
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_check: SELECT count(*) FROM gis_zones WHERE ST_Intersects(g, ST_MakeEnvelope(2, 2, 8, 8));
+count
+-----
+    0
+(1 row)
+
+step s2_check_far: SELECT count(*) FROM gis_zones WHERE ST_Intersects(g, ST_MakeEnvelope(482, 482, 488, 488));
+count
+-----
+    0
+(1 row)
+
+step s1_add: INSERT INTO gis_zones VALUES (-1, ST_MakeEnvelope(2, 2, 8, 8));
+step s2_add_far: INSERT INTO gis_zones VALUES (-2, ST_MakeEnvelope(482, 482, 488, 488));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+step s3_show: SELECT id, ST_AsText(g) FROM gis_zones WHERE id < 0 ORDER BY id;
+id|st_astext                                         
+--+--------------------------------------------------
+-2|POLYGON((482 482,482 488,488 488,488 482,482 482))
+-1|POLYGON((2 2,2 8,8 8,8 2,2 2))                    
+(2 rows)
+

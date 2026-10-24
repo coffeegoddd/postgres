@@ -104,6 +104,16 @@ typedef struct ProllyKeyingRoutine
 									TupleTableSlot *slot, bool *kept);
 
 	/*
+	 * Append the canonical encoding of slot's row to row, as encode_row()
+	 * does (no key, no content hash), except the columns marked in kept are
+	 * the references row before holds there (the value encoder's
+	 * encode_kept()): columns decode_row_kept() left unread.
+	 */
+	void		(*encode_row_kept) (ProllyKeying *k, TupleTableSlot *slot,
+									const ProllyValue *before,
+									const bool *kept, StringInfo row);
+
+	/*
 	 * Append slot's row's key to key, as encode_row() does, without the
 	 * rest of the row; false, appending nothing, for a keying that keys
 	 * rows by content (whose keys are a fixed few bytes and a hash).
@@ -168,15 +178,49 @@ typedef struct ProllyKeyingRoutine
 	 */
 	ProllyKeying *(*open_shape) (Relation rel, const ProllyValue *old,
 								 MemoryContext mcxt, TupleDesc *desc);
+
+	/*
+	 * Optional: decode_row() of only the attributes wanted marks (by
+	 * attribute index of slot's descriptor; NULL: all), the value encoder's
+	 * decode_columns(): the others are left NULL, never decoded or read
+	 * out of line.
+	 */
+	void		(*decode_row_columns) (ProllyKeying *k, const ProllyValue *row,
+									   const bool *wanted,
+									   TupleTableSlot *slot);
+
+	/*
+	 * Optional: the value encoder's fields() of an encoded row, by
+	 * attribute index of the keying's own columns; and decode_field() of
+	 * one of them.  For a caller that compares or picks columns by their
+	 * bytes and decodes only some.
+	 */
+	void		(*row_fields) (ProllyKeying *k, const ProllyValue *row,
+							   ProllyEncodedField *fields);
+	Datum		(*decode_field) (ProllyKeying *k, int attno,
+								 const ProllyEncodedField *field,
+								 bool *isnull);
+
+	/*
+	 * Optional: the value encoder's fields_alike() and field_compatible()
+	 * of the keyings' own columns.
+	 */
+	bool		(*fields_alike) (ProllyKeying *k, int attno,
+								 const ProllyEncodedField *a,
+								 const ProllyEncodedField *b);
+	bool		(*field_compatible) (ProllyKeying *k, int attno,
+									 ProllyKeying *other, int other_attno);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
-	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
-	"row_shape", "shape_extends", "open_shape"
+	"decode_row_kept", "encode_row_kept", "encode_key", "parse_value_as", \
+	"open_described", "row_shape", "shape_extends", "open_shape", \
+	"decode_row_columns", "row_fields", "decode_field", "fields_alike", \
+	"field_compatible"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK open_shape
+#define PROLLY_KEYING_LAST_CALLBACK field_compatible
 
 /*
  * Set up a data tree's environment and k's value store for each other:

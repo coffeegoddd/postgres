@@ -736,6 +736,54 @@ pkprefix_decode_row_kept(ProllyKeying *k, const ProllyValue *row,
 				before, slot, kept);
 }
 
+static void
+pkprefix_encode_row_kept(ProllyKeying *k, TupleTableSlot *slot,
+						 const ProllyValue *before, const bool *kept,
+						 StringInfo row)
+{
+	PROLLY_CALL(k->valenc_routine, encode_kept, k->valenc, slot, before, kept,
+				row);
+}
+
+static void
+pkprefix_decode_row_columns(ProllyKeying *k, const ProllyValue *row,
+							const bool *wanted, TupleTableSlot *slot)
+{
+	PROLLY_CALL(k->valenc_routine, decode_columns, decoder_for(k, slot), row,
+				wanted, slot);
+}
+
+static void
+pkprefix_row_fields(ProllyKeying *k, const ProllyValue *row,
+					ProllyEncodedField *fields)
+{
+	PROLLY_CALL(k->valenc_routine, fields, k->valenc, row, fields);
+}
+
+static Datum
+pkprefix_decode_field(ProllyKeying *k, int attno,
+					  const ProllyEncodedField *field, bool *isnull)
+{
+	return PROLLY_CALL(k->valenc_routine, decode_field, k->valenc, attno,
+					   field, isnull);
+}
+
+static bool
+pkprefix_fields_alike(ProllyKeying *k, int attno, const ProllyEncodedField *a,
+					  const ProllyEncodedField *b)
+{
+	return PROLLY_CALL(k->valenc_routine, fields_alike, k->valenc, attno, a, b);
+}
+
+static bool
+pkprefix_field_compatible(ProllyKeying *k, int attno, ProllyKeying *other,
+						  int other_attno)
+{
+	return k->valenc_routine == other->valenc_routine &&
+		PROLLY_CALL(k->valenc_routine, field_compatible, k->valenc, attno,
+					other->valenc, other_attno);
+}
+
 static int
 pkprefix_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 {
@@ -800,6 +848,12 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.set_values = pkprefix_set_values,
 	.row_refs = pkprefix_row_refs,
 	.decode_row_kept = pkprefix_decode_row_kept,
+	.encode_row_kept = pkprefix_encode_row_kept,
+	.decode_row_columns = pkprefix_decode_row_columns,
+	.row_fields = pkprefix_row_fields,
+	.decode_field = pkprefix_decode_field,
+	.fields_alike = pkprefix_fields_alike,
+	.field_compatible = pkprefix_field_compatible,
 	.encode_key = pkprefix_encode_key,
 	.row_shape = pkprefix_row_shape,
 	.shape_extends = pkprefix_shape_extends,

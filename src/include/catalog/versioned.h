@@ -36,8 +36,12 @@ extern void check_versioned_dependencies(const ObjectAddress *depender,
 /* does a branch other than the session's have copies? */
 extern bool other_branches_have_copies(void);
 
-/* error if an object on another branch depends on object, being dropped */
-extern void check_other_branch_dependents(const ObjectAddress *object);
+/*
+ * error if an object on another branch depends on object, being dropped
+ * with named (the object the statement drops it with), which the error names
+ */
+extern void check_other_branch_dependents(const ObjectAddress *object,
+										  const ObjectAddress *named);
 
 /*
  * the name of another branch whose objects depend on object (with

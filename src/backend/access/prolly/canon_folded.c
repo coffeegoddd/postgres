@@ -3846,7 +3846,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	 * comparators they call.  Inspect every canonical table's key types.
 	 */
 	rel = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -3865,7 +3865,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	table_close(rel, AccessShareLock);
 
 	rel = table_open(DependRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
@@ -4391,7 +4391,7 @@ collect(Canon *cn)
 
 	/* Relations. */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(pg_class, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	systable_endscan(scan);
@@ -4401,7 +4401,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_ns = table_open(NamespaceRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_ns, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_ns, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
@@ -4417,7 +4417,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_type = table_open(TypeRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_type, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_type, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
@@ -4441,7 +4441,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_proc = table_open(ProcedureRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_proc, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_proc, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
@@ -4535,7 +4535,7 @@ refuse_undescribed(Canon *cn)
 			continue;
 		oidatt = get_object_attnum_oid(classid);
 		rel = table_open(classid, AccessShareLock);
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			bool		isnull;
@@ -4584,7 +4584,7 @@ static void
 describe_collations(Canon *cn)
 {
 	Relation	rel = table_open(CollationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
 	HeapTuple	tup;
 
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -4628,7 +4628,10 @@ describe_collations(Canon *cn)
  * type's to its multirange type): "x:" items named "source AS target",
  * each its method ("function" and the function's qualified signature,
  * "inout" or "binary") and its context ("explicit", "assignment" or
- * "implicit"), a line each.  (What initdb made casts no such type.)
+ * "implicit"), a line each.  (What initdb made casts no such type.)  Every
+ * cast is read, not only the branch's: one between a type an extension has
+ * in a versioned schema and a type outside, made outside the extension, is
+ * shared, as both its types are.
  */
 static void
 describe_casts(Canon *cn)
@@ -5435,7 +5438,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 	PG_TRY();
 	{
 		classes = table_open(RelationRelationId, AccessShareLock);
-		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(classes, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -12671,8 +12674,7 @@ folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
 	else
 	{
 		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-		SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false,
-											  NULL, 0, NULL);
+		SysScanDesc scan = catalog_branch_beginscan(pg_class, MyBranch);
 		HeapTuple	tup;
 
 		while ((tup = systable_getnext(scan)) != NULL)

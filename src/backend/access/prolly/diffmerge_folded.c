@@ -2185,7 +2185,8 @@ typedef struct Recorded
 	Tuplesortstate *forgotten;	/* handles, as int8 */
 	int			nforgotten;
 	bool		attempting;
-	bool		last_unique;	/* the one recorded last breaks a unique index */
+	bool		last_unique;	/* the one recorded last breaks a unique index
+								 * or exclusion constraint */
 	StringInfoData buf;			/* (reading the attempt's back) */
 } Recorded;
 
@@ -2512,7 +2513,8 @@ violation_record(Oid relid, const char *type, const char *row,
 {
 	AttemptViolation av;
 
-	recorded->last_unique = strcmp(type, "unique index") == 0;
+	recorded->last_unique = strcmp(type, "unique index") == 0 ||
+		strcmp(type, "exclusion constraint") == 0;
 	if (!recorded->attempting)
 	{
 		violation_keep(relid, type, row, info);
@@ -3500,7 +3502,8 @@ check_expr(Oid con)
 
 /*
  * What a row a merge couldn't write breaks (ed, the error writing it
- * raised), as Dolt describes it: a unique index by its name and columns, a
+ * raised), as Dolt describes it: a unique index (or an exclusion
+ * constraint, which Dolt hasn't) by its name and columns, a
  * check constraint by its name and expression (a domain's, of the domain
  * ed names), a not-null constraint by its column (a domain's, by the
  * column of the domain's value).
@@ -3575,8 +3578,9 @@ refusal_type(int sqlerrcode)
 	switch (sqlerrcode)
 	{
 		case ERRCODE_UNIQUE_VIOLATION:
-		case ERRCODE_EXCLUSION_VIOLATION:
 			return "unique index";
+		case ERRCODE_EXCLUSION_VIOLATION:
+			return "exclusion constraint";
 		case ERRCODE_CHECK_VIOLATION:
 			return "check constraint";
 		case ERRCODE_NOT_NULL_VIOLATION:
@@ -4489,7 +4493,8 @@ typedef struct KeyWrite
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
 	int			violation;		/* its handle, as recorded (-1: none) */
-	bool		unique;			/* it breaks a unique index */
+	bool		unique;			/* it breaks a unique index or exclusion
+								 * constraint */
 } KeyWrite;
 
 /*
@@ -4634,9 +4639,34 @@ typedef struct CellMerge
 	TupleTableSlot *ours;
 	TupleTableSlot *theirs;
 	TupleTableSlot *merged;
-	StringInfoData key;
+	/* by attribute index: a value out of line with base's reference */
+	bool	   *base_kept;		/* (ours' reference, as ours_kept) */
+	bool	   *ours_kept;
+	bool	   *theirs_kept;
+	bool	   *merged_kept;
 	StringInfoData row;
 } CellMerge;
+
+/*
+ * A tree value's row into slot, each column whose value is out of line
+ * with the same reference in before's row left unread and marked in kept
+ * (decode_row_kept()).
+ */
+static void
+decode_kept(Changes *c, const StringInfoData *value,
+			const StringInfoData *before, TupleTableSlot *slot, bool *kept)
+{
+	ProllyValue v = {(const uint8 *) value->data, value->len};
+	ProllyValue b = {(const uint8 *) before->data, before->len};
+	ProllyValue row;
+	ProllyValue brow;
+	uint64		count;
+
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &row, &count);
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &b, &brow, &count);
+	ExecClearTuple(slot);
+	PROLLY_CALL(c->rd.kr, decode_row_kept, c->rd.k, &row, &brow, slot, kept);
+}
 
 /*
  * Merge a keyed row both sides changed, column by column, as Dolt does: a
@@ -4647,6 +4677,15 @@ typedef struct CellMerge
  * unsure: see ReadFor) is taken as changed on both sides.  False on a
  * conflict; else *merged is the merged row's tree value (palloc'd).
  * (Only rows both sides changed are decoded.)
+ *
+ * A long value is out of line, by a reference naming its canonical bytes.
+ * Where a side's reference is base's, decoded by the same keying, the side
+ * didn't change the column, and its value isn't read (nor base's): taken,
+ * the merged row holds the reference.  So a large value neither side
+ * changed isn't fetched to find that out.  Where ours' is base's and
+ * theirs' isn't, theirs changed it: a different value's bytes.  Other
+ * columns are compared decoded, as are all of a row with unsure columns
+ * (base's bytes there aren't its value).
  */
 static bool
 merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
@@ -4656,11 +4695,25 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
 	StringInfo	value;
 	ProllyValue row;
-	ProllyHash	content;
+	ProllyValue base_value = {(const uint8 *) base->data, base->len};
+	ProllyValue base_row;
+	uint64		count;
 
-	(void) decode(c, base, cm->base);
-	(void) decode(c, ours, cm->ours);
-	(void) decode(c, theirs, cm->theirs);
+	if (bms_is_empty(unsure))
+	{
+		decode_kept(c, base, ours, cm->base, cm->base_kept);
+		decode_kept(c, ours, base, cm->ours, cm->ours_kept);
+		decode_kept(c, theirs, base, cm->theirs, cm->theirs_kept);
+	}
+	else
+	{
+		(void) decode(c, base, cm->base);
+		(void) decode(c, ours, cm->ours);
+		(void) decode(c, theirs, cm->theirs);
+		memset(cm->base_kept, 0, sizeof(bool) * desc->natts);
+		memset(cm->ours_kept, 0, sizeof(bool) * desc->natts);
+		memset(cm->theirs_kept, 0, sizeof(bool) * desc->natts);
+	}
 	slot_getallattrs(cm->base);
 	slot_getallattrs(cm->ours);
 	slot_getallattrs(cm->theirs);
@@ -4674,9 +4727,14 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 		Datum		bv = cm->base->tts_values[i];
 		Datum		ov = cm->ours->tts_values[i];
 		Datum		tv = cm->theirs->tts_values[i];
+		bool		ours_kept = cm->ours_kept[i];
+		bool		theirs_kept = cm->theirs_kept[i];
 		bool		ours_changed;
 		bool		theirs_changed;
 
+		/* (base's reference is ours' just where ours' is base's) */
+		Assert(cm->base_kept[i] == ours_kept);
+		cm->merged_kept[i] = false;
 		if (att->attisdropped)
 		{
 			cm->merged->tts_isnull[i] = true;
@@ -4686,24 +4744,35 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 		{
 			cm->merged->tts_isnull[i] = on;
 			cm->merged->tts_values[i] = ov;
+			cm->merged_kept[i] = ours_kept;
 			continue;
 		}
-		ours_changed = bn != on || bms_is_member(i, unsure) ||
-			(!bn && !datum_image_eq(bv, ov, att->attbyval, att->attlen));
-		theirs_changed = bn != tn || bms_is_member(i, unsure) ||
-			(!bn && !datum_image_eq(bv, tv, att->attbyval, att->attlen));
+		if (ours_kept)
+			ours_changed = false;
+		else
+			ours_changed = bn != on || bms_is_member(i, unsure) ||
+				(!bn && !datum_image_eq(bv, ov, att->attbyval, att->attlen));
+		if (theirs_kept)
+			theirs_changed = false;
+		else if (ours_kept)
+			theirs_changed = true;	/* (base's value is unread) */
+		else
+			theirs_changed = bn != tn || bms_is_member(i, unsure) ||
+				(!bn && !datum_image_eq(bv, tv, att->attbyval, att->attlen));
+		/* (both changed: neither is base's, and all three were read) */
 		if (ours_changed && theirs_changed &&
 			(on != tn ||
 			 (!on && !datum_image_eq(ov, tv, att->attbyval, att->attlen))))
 			return false;
 		cm->merged->tts_isnull[i] = theirs_changed ? tn : on;
 		cm->merged->tts_values[i] = theirs_changed ? tv : ov;
+		cm->merged_kept[i] = theirs_changed ? theirs_kept : ours_kept;
 	}
 	ExecStoreVirtualTuple(cm->merged);
-	resetStringInfo(&cm->key);
 	resetStringInfo(&cm->row);
-	PROLLY_CALL(c->rd.kr, encode_row, c->rd.k, cm->merged, &cm->key, &cm->row,
-				&content);
+	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &base_value, &base_row, &count);
+	PROLLY_CALL(c->rd.kr, encode_row_kept, c->rd.k, cm->merged, &base_row,
+				cm->merged_kept, &cm->row);
 	row.data = (const uint8 *) cm->row.data;
 	row.len = cm->row.len;
 	value = palloc(sizeof(StringInfoData));
@@ -5788,7 +5857,10 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		mw.cm.theirs = table_slot_create(rel, NULL);
 		mw.cm.merged = MakeSingleTupleTableSlot(RelationGetDescr(rel),
 												&TTSOpsVirtual);
-		initStringInfo(&mw.cm.key);
+		mw.cm.base_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		mw.cm.ours_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		mw.cm.theirs_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		mw.cm.merged_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		initStringInfo(&mw.cm.row);
 	}
 
@@ -5844,6 +5916,10 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		ExecDropSingleTupleTableSlot(mw.cm.ours);
 		ExecDropSingleTupleTableSlot(mw.cm.theirs);
 		ExecDropSingleTupleTableSlot(mw.cm.merged);
+		pfree(mw.cm.base_kept);
+		pfree(mw.cm.ours_kept);
+		pfree(mw.cm.theirs_kept);
+		pfree(mw.cm.merged_kept);
 	}
 	if (fits.estate)
 		FreeExecutorState(fits.estate);
