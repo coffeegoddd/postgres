@@ -627,7 +627,7 @@ test_bmap_share_snapshot(PG_FUNCTION_ARGS)
 											 RELPERSISTENCE_PERMANENT);
 	SMgrRelation dst = smgropen(locator_of(copy), INVALID_PROC_NUMBER);
 
-	bmap_share_snapshot(src, (uint64) PG_GETARG_INT64(1), dst);
+	bmap_share_snapshot(src, (uint64) PG_GETARG_INT64(1), dst, false);
 	PG_RETURN_OID(copy);
 }
 

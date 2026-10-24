@@ -2051,6 +2051,18 @@ pages_changes(Relation rel, const ProllyTreeEnv *env,
 	return false;
 }
 
+
+/*
+ * The pages finder reads its record a page at a time, with no count of
+ * the rows changed short of reading them: it never tells (a caller that
+ * would restore pages instead restores them).
+ */
+static bool
+pages_fewer_changes(Relation rel, const ProllyTableFold *baseline, int limit)
+{
+	return false;
+}
+
 const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.info = {
 		.iface = PROLLY_IFACE_CHANGE_FINDER,
@@ -2070,4 +2082,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.full_reason = pages_full_reason,
 	.fold_on_leave = pages_fold_on_leave,
 	.changes = pages_changes,
+	.fewer_changes = pages_fewer_changes,
 };

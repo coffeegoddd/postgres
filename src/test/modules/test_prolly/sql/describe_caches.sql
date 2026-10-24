@@ -47,10 +47,10 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
 $$;
 
--- A status after a row written takes both tables' descriptions as it reads
--- the definitions, and each table's again as it reads that table's
--- changes, and the check's fold takes both again; a commit's fold takes
--- both.
+-- A status after a row written takes each table's description as it reads
+-- that table's changes; the first reads the definitions too, and the
+-- second takes those it read (nothing they're of changed since), which
+-- the check reads again, describing both; a commit's fold takes both.
 UPDATE dc.u SET w = 'c' WHERE id = 1;
 SELECT count(*) AS changes FROM dolt_status;
 :flush
