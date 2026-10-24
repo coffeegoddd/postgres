@@ -536,7 +536,10 @@ extern char *prolly_store_format_text(const ProllyStoreFormat *format);
  * included), each after those it names, descending only into chunks kept
  * and not already stored (a stored chunk names only stored ones):
  * whatever is kept past the step.  prolly_local_chunks_end() forgets the
- * rest, as does the end of the (sub)transaction that began them.  Never
+ * rest, as does the end of the (sub)transaction that began them.  Past
+ * maintenance_work_mem of chunks kept, those kept are persisted and the
+ * keeping routine puts in the server's store from then on: a step that
+ * builds much keeps nothing in memory, and saves nothing.  Never
  * nested; prolly_local_chunks_active() says whether they are begun, and
  * prolly_local_chunks_kept() whether an environment's store keeps its
  * chunks so (whose chunks nothing outside the step may remember).
@@ -548,5 +551,12 @@ extern void prolly_local_chunks_persist(const ProllyHash *hash);
 extern const ProllyChunkStoreRoutine *prolly_local_chunks_keeping(void);
 extern const ProllyChunkStoreRoutine *prolly_local_chunks_reading(void);
 extern bool prolly_local_chunks_kept(const ProllyChunkStoreRoutine *store);
+
+/*
+ * The store a routine is: the server's for either routine above (struct
+ * copies of its routine, told apart by pointer), any other as it is.  An
+ * environment compared with another's by its store asks this of both.
+ */
+extern const ProllyChunkStoreRoutine *prolly_local_chunks_store(const ProllyChunkStoreRoutine *store);
 
 #endif							/* PROLLY_CHUNKSTORE_H */

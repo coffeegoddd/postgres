@@ -107,5 +107,63 @@ SELECT length(dolt_commit('-am', 'after a redefining reset')::text) > 0
 	AS committed;
 SELECT test_fold_root(true) = prolly_root_hash('main') AS redefined_rows;
 
+-- Long values stored out of line, by content: a tree kept in memory takes
+-- a stored value's tree by its pointer, as any fold does, reading and
+-- hashing none of its bytes (20 new values of 200 kB: 4 MB if each were
+-- read and hashed again).
+CREATE TABLE cf.big (id int PRIMARY KEY, big text STORAGE EXTERNAL);
+INSERT INTO cf.big SELECT g, 'small' FROM generate_series(1, 50) g;
+SELECT length(dolt_commit('-Am', 'big')::text) > 0 AS committed;
+SET debug_prolly_verify_fold_caches = off;
+UPDATE cf.big SET big = (SELECT string_agg(md5(id || ':' || i), '')
+						 FROM generate_series(1, 6250) i)
+WHERE id <= 20;
+:flush
+SELECT pg_temp.since('bytes_hashed') IS NOT NULL AS hashing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending;
+SELECT dolt_reset('--hard');
+:flush
+SELECT pg_temp.since('bytes_hashed') < 1000000 AS values_not_hashed,
+	pg_temp.since('chunks_appended') < 20 AS long_reset_appends_few;
+RESET debug_prolly_verify_fold_caches;
+SELECT count(*) FILTER (WHERE big <> 'small') AS long_left FROM cf.big;
+SELECT test_fold_root(true) = prolly_root_hash('main') AS long_rows;
+
+-- The same, not advanced (the definitions moved too): the fold's trees
+-- persisted, the values' named as stored.
+ALTER TABLE cf.big ADD COLUMN w int;
+UPDATE cf.big SET big = (SELECT string_agg(md5(id || '/' || i), '')
+						 FROM generate_series(1, 6250) i)
+WHERE id <= 20;
+SELECT dolt_reset('--hard');
+SELECT count(*) FILTER (WHERE big <> 'small') AS long_left FROM cf.big;
+SELECT test_fold_root(true) = prolly_root_hash('main') AS long_redefined_rows;
+
+-- Past maintenance_work_mem kept, the step puts in the store as before:
+-- the fold's trees appended, the rows put back all the same.
+SET maintenance_work_mem = '1MB';
+SET debug_prolly_verify_fold_caches = off;
+UPDATE cf.t SET v = 'spilled ' || id WHERE id % 100 = 0;
+:flush
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending;
+SELECT dolt_reset('--hard');
+:flush
+SELECT pg_temp.since('chunks_appended') > 500 AS spilled_appends;
+RESET debug_prolly_verify_fold_caches;
+RESET maintenance_work_mem;
+SELECT count(*) FILTER (WHERE v LIKE 'spilled%') AS spilled_left FROM cf.t;
+SELECT * FROM dolt_status;
+SELECT test_fold_root(true) = prolly_root_hash('main') AS spilled_rows;
+
+-- Everything the refs name is in the store, the baselines' trees with it,
+-- and a full collection keeps what they reach.
+SELECT test_refs_walk_count(NULL) > 0 AS walked;
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+SELECT test_refs_walk_count(NULL) > 0 AS walked_after_gc;
+UPDATE cf.t SET v = 'after gc' WHERE id = 10;
+SELECT length(dolt_commit('-am', 'after the collection')::text) > 0
+	AS committed;
+SELECT test_fold_root(true) = prolly_root_hash('main') AS collected_rows;
+
 \c contrib_regression
 DROP DATABASE regress_compared_folds;

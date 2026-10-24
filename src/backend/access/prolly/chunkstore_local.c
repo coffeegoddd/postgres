@@ -46,8 +46,10 @@ typedef struct LocalChunk
 	bool		persisted;
 } LocalChunk;
 
-static HTAB *local_chunks = NULL;
+static HTAB *local_chunks = NULL;	/* NULL once spilled */
 static MemoryContext local_cxt = NULL;
+static bool local_open = false;
+static Size local_bytes = 0;
 static SubTransactionId local_subid = InvalidSubTransactionId;
 static bool callbacks_registered = false;
 
@@ -74,6 +76,8 @@ local_find(const ProllyHash *hash)
 	return hash_search(local_chunks, &key, HASH_FIND, NULL);
 }
 
+static void local_spill(ProllyChunkStore *store);
+
 static void
 keeping_put(ProllyChunkStore *store, const ProllyHash *hash, const void *data,
 			Size len)
@@ -87,6 +91,12 @@ keeping_put(ProllyChunkStore *store, const ProllyHash *hash, const void *data,
 		PROLLY_CALL(prolly_chunk_store(), put, store, hash, data, len);
 		return;
 	}
+	if (local_bytes + len > (Size) maintenance_work_mem * 1024)
+	{
+		local_spill(store);
+		PROLLY_CALL(prolly_chunk_store(), put, store, hash, data, len);
+		return;
+	}
 	memset(&key, 0, sizeof(key));
 	key.len = hash->len;
 	memcpy(key.bytes, hash->bytes, hash->len);
@@ -97,6 +107,7 @@ keeping_put(ProllyChunkStore *store, const ProllyHash *hash, const void *data,
 	memcpy(c->data, data, len);
 	c->len = len;
 	c->persisted = false;
+	local_bytes += len;
 }
 
 static bool
@@ -208,21 +219,39 @@ prolly_local_chunks_kept(const ProllyChunkStoreRoutine *store)
 	return store == &keeping && local_chunks != NULL;
 }
 
+const ProllyChunkStoreRoutine *
+prolly_local_chunks_store(const ProllyChunkStoreRoutine *store)
+{
+	if (routines_ready && (store == &keeping || store == &reading))
+		return prolly_chunk_store();
+	return store;
+}
+
 bool
 prolly_local_chunks_active(void)
 {
-	return local_chunks != NULL;
+	return local_open;
+}
+
+static void
+local_forget(void)
+{
+	if (local_chunks != NULL)
+		hash_destroy(local_chunks);
+	local_chunks = NULL;
+	if (local_cxt != NULL)
+		MemoryContextDelete(local_cxt);
+	local_cxt = NULL;
+	local_bytes = 0;
 }
 
 void
 prolly_local_chunks_end(void)
 {
-	if (local_chunks == NULL)
+	if (!local_open)
 		return;
-	hash_destroy(local_chunks);
-	local_chunks = NULL;
-	MemoryContextDelete(local_cxt);
-	local_cxt = NULL;
+	local_forget();
+	local_open = false;
 	local_subid = InvalidSubTransactionId;
 }
 
@@ -245,7 +274,7 @@ prolly_local_chunks_begin(void)
 {
 	HASHCTL		ctl;
 
-	if (local_chunks != NULL)
+	if (local_open)
 		elog(ERROR, "local chunks are begun already");
 	if (!callbacks_registered)
 	{
@@ -263,6 +292,8 @@ prolly_local_chunks_begin(void)
 	local_chunks = hash_create("prolly local chunks", 256, &ctl,
 							   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	local_subid = GetCurrentSubTransactionId();
+	local_bytes = 0;
+	local_open = true;
 }
 
 /* The chunks a chunk names, collected. */
@@ -324,4 +355,27 @@ prolly_local_chunks_persist(const ProllyHash *hash)
 	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
 	if (!PROLLY_CALL(cs, has, store, hash))
 		persist_chunk(store, c);
+}
+
+/*
+ * Past maintenance_work_mem of chunks kept, the step stops keeping them:
+ * those kept are persisted (each after those it names) and forgotten, and
+ * every put from then on goes to the store, as if nothing had been kept.
+ * So a step that builds much (a fold of most of a table) costs the memory
+ * an ordinary fold's pending appends do, no more, and saves nothing.
+ */
+static void
+local_spill(ProllyChunkStore *store)
+{
+	HASH_SEQ_STATUS seq;
+	LocalChunk *c;
+
+	elog(DEBUG1, "chunks kept in memory past maintenance_work_mem: %zu bytes put in the store",
+		 local_bytes);
+	hash_seq_init(&seq, local_chunks);
+	while ((c = hash_seq_search(&seq)) != NULL)
+		if (!c->persisted &&
+			!PROLLY_CALL(prolly_chunk_store(), has, store, &c->key))
+			persist_chunk(store, c);
+	local_forget();
 }

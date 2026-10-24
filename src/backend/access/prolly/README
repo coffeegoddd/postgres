@@ -811,7 +811,13 @@ nothing from it.  At the end, prolly_local_chunks_persist() puts those of
 the backend's chunks the baseline reaches, descending only into chunks
 the store hasn't: its own few nodes when it was advanced, the fold's
 trees it still names where it couldn't be (as before).  So a hard reset
-of 1,000 dirty rows over 100,000 appends 4 chunks, not about 1,250.
+of 1,000 dirty rows over 100,000 appends 4 chunks, not about 1,250.  The
+table is bounded by maintenance_work_mem: past it, what it keeps is
+persisted and the rest of the step puts in the store as before (a fold of
+most of a table, which the baseline mostly can't be advanced past
+anyway).  A tree only the backend keeps may still take a stored value's
+tree by its TOAST pointer, or the memo's reference to one: each is stored,
+which is where persisting stops.
 
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its
