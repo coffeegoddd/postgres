@@ -763,6 +763,19 @@ the data trees' differences when the rows are keyed and laid out alike,
 else builds it again; the first build sorts every row's entry in memory
 (maintenance_work_mem).  A plain mount builds none and reads no row.
 
+A history mount (prolly_mount(..., history => true)) is dolt_history_table()
+as a foreign table: each table's columns as the mounted commit has them,
+then commit_hash, committer and commit_date, with a row for each row at
+each commit the mounted one reaches (each commit once, merges' parents
+too), read as that commit describes the table, column by name (one the
+commit hasn't, or holds as another type, is NULL).  A scan reads a commit
+at a time and streams its rows, so LIMIT stops it.  An equality on
+commit_hash (a constant, a parameter, or a join's outer row) reads that
+commit alone, if the mounted commit reaches it (the refs' merge_base());
+the primary key's bounds seek in each commit whose key is the version's,
+and a commit keyed otherwise is read whole.  The dolt_history_table()
+functions still read every commit.
+
 
 Core hooks
 ----------
