@@ -45,16 +45,16 @@ SELECT dolt_checkout('main');
 -- each drop is refused from main, with CASCADE too
 DROP EXTENSION citext;
 ERROR:  cannot drop extension citext because objects on branch "sd_side" depend on it
-DETAIL:  They depend on type sd_ext.citext, which it would drop.
+DETAIL:  They depend on type sd_ext.citext, which dropping extension citext would drop.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 DROP EXTENSION citext CASCADE;
 ERROR:  cannot drop extension citext because objects on branch "sd_side" depend on it
-DETAIL:  They depend on type sd_ext.citext, which it would drop.
+DETAIL:  They depend on type sd_ext.citext, which dropping extension citext would drop.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 DROP SCHEMA sd_ext CASCADE;
 NOTICE:  drop cascades to extension citext
 ERROR:  cannot drop schema sd_ext because objects on branch "sd_side" depend on it
-DETAIL:  They depend on type sd_ext.citext, which it would drop.
+DETAIL:  They depend on type sd_ext.citext, which dropping schema sd_ext would drop.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 DROP DOMAIN public.sd_pos;
 ERROR:  cannot drop type sd_pos because objects on branch "sd_side" depend on it
@@ -124,7 +124,7 @@ SELECT dolt_checkout('main');
 
 DROP EXTENSION citext;
 ERROR:  cannot drop extension citext because objects on branch "sd_side" depend on it
-DETAIL:  Objects on 2 branches other than the session's depend on type sd_ext.citext, which it would drop.
+DETAIL:  Objects on 2 branches other than the session's depend on type sd_ext.citext, which dropping extension citext would drop.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 SELECT dolt_checkout('sd_third');
             dolt_checkout            

@@ -525,11 +525,13 @@ check_other_branch_dependents(const ObjectAddress *object,
 					getObjectDescription(member ? named : object, false),
 					branch_name_for_message(linitial_oid(others))),
 			 member && list_length(others) > 1 ?
-			 errdetail("Objects on %d branches other than the session's depend on %s, which it would drop.",
-					   list_length(others), getObjectDescription(object, false)) :
+			 errdetail("Objects on %d branches other than the session's depend on %s, which dropping %s would drop.",
+					   list_length(others), getObjectDescription(object, false),
+					   getObjectDescription(named, false)) :
 			 member ?
-			 errdetail("They depend on %s, which it would drop.",
-					   getObjectDescription(object, false)) :
+			 errdetail("They depend on %s, which dropping %s would drop.",
+					   getObjectDescription(object, false),
+					   getObjectDescription(named, false)) :
 			 list_length(others) > 1 ?
 			 errdetail("Objects on %d branches other than the session's depend on it.",
 					   list_length(others)) : 0,
