@@ -595,6 +595,64 @@ SELECT try($$SELECT dolt_remote('add', 'other', 'file:///nowhere')$$,
 (1 row)
 
 RESET ROLE;
+-- a fetch sets the remote's tags here only for a role that writes the
+-- refs: another's leaves them, and a fetched tag is no one's to delete
+SELECT dolt_tag('v_remote') IS NOT NULL AS tagged;
+ tagged 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('origin', 'v_remote') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_tag('-d', 'v_remote') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+CREATE ROLE regress_hm_fetcher IN ROLE pg_read_server_files;
+SET ROLE regress_hm_fetcher;
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+NOTICE:  the remote's tags were not fetched
+DETAIL:  Setting tags takes the database's CREATE privilege or the privileges of the "pg_prolly_write" role.
+ fetched 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+ v_remote_here 
+---------------
+             0
+(1 row)
+
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+ fetched 
+---------
+ t
+(1 row)
+
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+ v_remote_here 
+---------------
+             1
+(1 row)
+
+SET ROLE regress_hm_fetcher;
+SELECT try($$SELECT dolt_tag('-d', 'v_remote')$$) AS delete_fetched;
+ delete_fetched 
+----------------
+ denied
+(1 row)
+
+RESET ROLE;
+DROP ROLE regress_hm_fetcher;
 -- a forced move of a branch without commits keeps its owner, and is a
 -- head move: its owner's, without CREATE
 CREATE DATABASE regress_head_moves_empty;
@@ -644,6 +702,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON hm.w TO regress_hm_inserter;
 CREATE TABLE hm.v (id int PRIMARY KEY, v text);
 INSERT INTO hm.v VALUES (1, 'one');
 GRANT SELECT, INSERT, DELETE ON hm.v TO regress_hm_inserter;
+-- (keys from a serial and an identity column: their sequences' values move)
+CREATE TABLE hm.ser (id serial PRIMARY KEY, v text);
+CREATE TABLE hm.idt (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+GRANT SELECT, INSERT, UPDATE, DELETE ON hm.ser, hm.idt TO regress_hm_inserter;
+GRANT USAGE ON SEQUENCE hm.ser_id_seq, hm.idt_id_seq TO regress_hm_inserter;
 SELECT length(dolt_commit('-Am', 'w and v')::text) AS committed;
  committed 
 -----------
@@ -668,6 +731,8 @@ SELECT active_branch();
  writer/plain/main
 (1 row)
 
+INSERT INTO hm.ser (v) VALUES ('plain');
+INSERT INTO hm.idt (v) VALUES ('plain');
 SELECT length(dolt_commit('-am', 'plain row')::text) AS committed;
  committed 
 -----------
@@ -692,6 +757,18 @@ SELECT id, v FROM hm.w ORDER BY id;
   1 | one
   2 | plain
 (2 rows)
+
+SELECT id, v FROM hm.ser;
+ id |   v   
+----+-------
+  1 | plain
+(1 row)
+
+SELECT id, v FROM hm.idt;
+ id |   v   
+----+-------
+  1 | plain
+(1 row)
 
 INSERT INTO hm.w VALUES (3, 'plain');
 NOTICE:  writing on branch "writer/plain/main"

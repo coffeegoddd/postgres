@@ -73,7 +73,8 @@
  *	'A' name	-> the role that made the branch, which owns it (its OID,
  *				   native byte order); main has none, being the database
  *				   owner's
- *	'G' name	-> the role that made the tag (the same)
+ *	'G' name	-> the role that made the tag here (the same): none for a
+ *				   tag fetched or pushed
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
@@ -4429,6 +4430,14 @@ copies_branch_set_creator(const char *name, Oid role)
 		maker_put(TAG_CREATOR, name, role);
 }
 
+static void
+copies_tag_set_creator(const char *name, Oid role)
+{
+	refs_init();
+	lock_refs();
+	maker_put(TAG_TAG_CREATOR, name, role);
+}
+
 static bool
 copies_tag_creator(const char *name, Oid *role)
 {
@@ -7459,11 +7468,8 @@ copies_tag_set(const char *name, const ProllyHash *expected,
 		put_hash(&v, &info.commit);
 	}
 	refs_put(key.data, key.len, tag ? &v : NULL);
-	/* (a tag made here is its session role's; one deleted, no one's) */
-	if (tag == NULL)
-		maker_put(TAG_TAG_CREATOR, name, InvalidOid);
-	else if (!exists)
-		maker_put(TAG_TAG_CREATOR, name, GetUserId());
+	/* (a tag deleted, made or moved is no one's until its maker is told) */
+	maker_put(TAG_TAG_CREATOR, name, InvalidOid);
 	pfree(key.data);
 	pfree(v.data);
 	return true;
@@ -7985,6 +7991,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branch_creator = copies_branch_creator,
 	.branch_set_creator = copies_branch_set_creator,
 	.tag_creator = copies_tag_creator,
+	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
 	.lineage_note = copies_lineage_note,
 };

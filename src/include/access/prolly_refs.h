@@ -755,12 +755,17 @@ typedef struct ProllyRefsRoutine
 	void		(*branch_set_creator) (const char *name, Oid role);
 
 	/*
-	 * Optional: the role that made tag name, as tag_set() made it here
-	 * (false: none recorded), and the role that pushed name's nth stash
+	 * Optional: the role that made tag name here (false: none recorded), and the role that pushed name's nth stash
 	 * (false: it has none).
 	 */
 	bool		(*tag_creator) (const char *name, Oid *role);
 	bool		(*stash_maker) (const char *name, int n, Oid *role);
+
+	/*
+	 * Optional: record role as the one that made tag name here (tag_set()
+	 * records none: a tag fetched or pushed is no one's).
+	 */
+	void		(*tag_set_creator) (const char *name, Oid role);
 
 	/*
 	 * Optional: what commit's branch's record of its tables (see
@@ -818,7 +823,8 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
 	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
-	"branch_set_creator", "tag_creator", "stash_maker", "lineage_note"
+	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
+	"lineage_note"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK lineage_note
 

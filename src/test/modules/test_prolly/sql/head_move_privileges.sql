@@ -233,6 +233,23 @@ SELECT try($$SELECT dolt_remote('add', 'other', 'file:///nowhere')$$,
 		   $$SELECT dolt_remote('remove', 'other')$$) AS add_remove_writer;
 RESET ROLE;
 
+-- a fetch sets the remote's tags here only for a role that writes the
+-- refs: another's leaves them, and a fetched tag is no one's to delete
+SELECT dolt_tag('v_remote') IS NOT NULL AS tagged;
+SELECT dolt_push('origin', 'v_remote') IS NOT NULL AS pushed;
+SELECT dolt_tag('-d', 'v_remote') IS NOT NULL AS deleted;
+CREATE ROLE regress_hm_fetcher IN ROLE pg_read_server_files;
+SET ROLE regress_hm_fetcher;
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+RESET ROLE;
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+SELECT dolt_fetch('origin') IS NOT NULL AS fetched;
+SELECT count(*) AS v_remote_here FROM dolt_tags WHERE tag_name = 'v_remote';
+SET ROLE regress_hm_fetcher;
+SELECT try($$SELECT dolt_tag('-d', 'v_remote')$$) AS delete_fetched;
+RESET ROLE;
+DROP ROLE regress_hm_fetcher;
+
 -- a forced move of a branch without commits keeps its owner, and is a
 -- head move: its owner's, without CREATE
 CREATE DATABASE regress_head_moves_empty;
@@ -263,16 +280,25 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON hm.w TO regress_hm_inserter;
 CREATE TABLE hm.v (id int PRIMARY KEY, v text);
 INSERT INTO hm.v VALUES (1, 'one');
 GRANT SELECT, INSERT, DELETE ON hm.v TO regress_hm_inserter;
+-- (keys from a serial and an identity column: their sequences' values move)
+CREATE TABLE hm.ser (id serial PRIMARY KEY, v text);
+CREATE TABLE hm.idt (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+GRANT SELECT, INSERT, UPDATE, DELETE ON hm.ser, hm.idt TO regress_hm_inserter;
+GRANT USAGE ON SEQUENCE hm.ser_id_seq, hm.idt_id_seq TO regress_hm_inserter;
 SELECT length(dolt_commit('-Am', 'w and v')::text) AS committed;
 SELECT dolt_writer_mode('branch-auto');
 SET ROLE regress_hm_inserter;
 SET dolt.writer = 'plain';
 INSERT INTO hm.w VALUES (2, 'plain');
 SELECT active_branch();
+INSERT INTO hm.ser (v) VALUES ('plain');
+INSERT INTO hm.idt (v) VALUES ('plain');
 SELECT length(dolt_commit('-am', 'plain row')::text) AS committed;
 SELECT (dolt_integrate('-m', 'plain in'))[1] = dolt_hashof('main') AS integrated;
 SELECT dolt_checkout('main');
 SELECT id, v FROM hm.w ORDER BY id;
+SELECT id, v FROM hm.ser;
+SELECT id, v FROM hm.idt;
 INSERT INTO hm.w VALUES (3, 'plain');
 SELECT active_branch();
 SELECT length(dolt_commit('-am', 'plain row 3')::text) AS committed;
