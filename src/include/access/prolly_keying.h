@@ -212,6 +212,15 @@ typedef struct ProllyKeyingRoutine
 									 ProllyKeying *other, int other_attno);
 
 	/*
+	 * Optional: the value encoder's encode_fields() of the keying's own
+	 * columns: the encoded row (as encode_row() appends it, no key) whose
+	 * columns hold fields' values, appended to row.
+	 */
+	void		(*encode_row_fields) (ProllyKeying *k,
+									  const ProllyEncodedField *fields,
+									  StringInfo row);
+
+	/*
 	 * Optional: open_described(), keyed instead by a primary key of nkeys
 	 * of desc's columns (attnos, 1-based), with their btree operator
 	 * families, collations and INDOPTION_* options, as a version of a table
@@ -241,7 +250,7 @@ typedef struct ProllyKeyingRoutine
 	"decode_row_kept", "encode_row_kept", "encode_key", "parse_value_as", \
 	"open_described", "row_shape", "shape_extends", "open_shape", \
 	"decode_row_columns", "row_fields", "decode_field", "fields_alike", \
-	"field_compatible", \
+	"field_compatible", "encode_row_fields", \
 	"open_keyed", "encode_key_bound"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 #define PROLLY_KEYING_LAST_CALLBACK encode_key_bound

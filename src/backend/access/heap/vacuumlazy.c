@@ -1484,9 +1484,13 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * dead line pointers is pruned as any (copied: the space it frees is
 		 * real, and left, its dead would be counted at every VACUUM and
 		 * never removed), and an aggressive VACUUM that must freeze a tuple
-		 * of it still does (lazy_scan_noprune() says so).
+		 * of it still does (lazy_scan_noprune() says so).  A page shared only
+		 * with the relation's own snapshots (the pages a commit keeps) is
+		 * vacuumed as any: the copy is the relation's for good, and the
+		 * snapshot's version goes once the commit stops being kept.
 		 */
 		if (got_cleanup_lock && BufferPageIsShared(buf) &&
+			BufferPageIsSharedElsewhere(buf) &&
 			!lazy_scan_reclaimable(vacrel, buf, blkno, page))
 		{
 			got_cleanup_lock = false;

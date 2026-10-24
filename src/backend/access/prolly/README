@@ -363,15 +363,19 @@ of other objects, a conflicted table renamed on either side, and one the
 other side's objects use in its version (a view over a column it added)
 fail as before, the last two saying so.
 
-A keyed row both sides of a merge changed is merged column by column.  A
-long value is held out of line by a reference naming its canonical bytes,
-so where a side's reference is base's, decoded by the same keying, that
-side didn't change the column: neither value is read (decode_row_kept()),
-and a merged row taking it is written with the reference
-(encode_row_kept()).  A large value neither side changed is not fetched to
-find that out, nor when the merged row is applied.  A column whose base
-value is unsure (below) is compared by value, as are values either side
-changed.
+A keyed row both sides of a merge changed is merged column by column, on
+its encoded fields (the keying's row_fields()): all three versions are
+rows of the table as defined now (a version of another shape is converted
+first), so a column's bytes name its value.  A column whose bytes one side
+left as base's takes the other's, one both changed alike keeps it, and the
+merged row is assembled from the fields taken (encode_row_fields()), long
+values by their references, no column decoded.  A large value neither side
+changed is not fetched to find that out, nor when the merged row is
+applied.  A row with a column whose base value is unsure (below) is
+decoded and compared by value instead, except that where a side's long
+value has base's reference neither is read (decode_row_kept()) and the
+merged row keeps the reference (encode_row_kept()).  An assert-enabled
+build merges each row both ways and checks they agree.
 
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
@@ -524,7 +528,11 @@ branch's baseline then and each table's relations and snapshots ('K').
 A snapshot's slot names the transaction that took it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  A
+sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
+relation shares only with its own snapshots, copying them (the kept
+version goes once its commit stops being kept), but leaves as they are
+the pages another branch shares, which the block map tells apart by when
+each page's entry was born (its header's shared_below).  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
@@ -694,8 +702,15 @@ mark doesn't cover folds everything.  A commit's fold begins the next
 baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
-without rows and asks each table's change finder, so it still visits
-every table.
+without rows and asks each table's change finder (from that table's
+baseline entry alone), so it still visits every table; but the
+definitions are those the last read here made while nothing they're of
+changed (no catalog change in this backend's epoch, the same deparsing
+settings and baseline, the tree still stored), only every sequence's item
+worked out again (pg_stat_prolly's definitions_reused).  They're kept
+apart from the folds' items, so a status between two commits leaves the
+second's fold to work out only what was written.
+debug_prolly_verify_fold_caches reads them all again and compares.
 
 
 Remotes
