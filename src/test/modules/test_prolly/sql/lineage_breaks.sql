@@ -1,12 +1,12 @@
--- A history read takes a version of a table for the table here only over
--- its lineage: the name never without a table between.  Commits name tables
--- by name and identity alone, so a table dropped and made again with its
--- name looks continuous to them wherever a commit records the new table
--- above one holding the old: a head moved to the old table's commit and
--- then committed, a merge of a branch that still has it, a squash of the
--- drop into the re-make.  The branch's record of its tables tells them
--- apart: a commit whose parent isn't the record's commit vouches for the
--- parent's version only if both share a history the name stays in (#862).
+-- A history read by a role that doesn't read every version takes a
+-- version for the table here only along commits made from the table's
+-- relation, as each commit this database makes records them.  Commits name
+-- tables by name and identity alone, and a table dropped and made again
+-- keeps its name's identity, so the names can't tell it from the old one
+-- wherever a commit holds the new table above one holding the old: a head
+-- moved to the old table's commit and then committed, a merge of a branch
+-- that still has it, a squash of the drop into the re-make, a branch made
+-- at the old table's commit.  The records can (#862).
 CREATE DATABASE regress_lineage_breaks;
 \c regress_lineage_breaks
 CREATE EXTENSION test_prolly;
@@ -93,9 +93,9 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t) ORDER BY id;
 RESET ROLE;
 
--- a branch just made has its source's record of its tables: on it, the
--- head moved to the old table's commit and committed is told apart too,
--- and before a commit of its own the reader reads the table's history
+-- on a branch just made, before a commit of its own, the reader reads the
+-- table's history; the head moved to the old table's commit and committed
+-- is told apart there too
 SELECT dolt_checkout('-b', 'fresh') IS NOT NULL AS made;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t) ORDER BY id;
@@ -110,7 +110,7 @@ RESET ROLE;
 SELECT dolt_checkout('main') IS NOT NULL AS back;
 
 -- a squash of the drop into the re-make, by a rebase: one commit whose
--- parent holds the old table; the commit after it doesn't vouch for that
+-- parent holds the old table, which wasn't made from this one
 SELECT dolt_checkout('-b', 'squashed', :'old_commit') IS NOT NULL AS made;
 DROP TABLE ln.t;
 SELECT length(dolt_commit('-Am', 'dropped')::text) AS committed;
@@ -132,9 +132,85 @@ SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 RESET ROLE;
 SELECT dolt_checkout('main');
 
+-- a branch made at the old table's branch's head (from its hash: it has
+-- copies of main's relation, moved to the old rows), merging main in, and
+-- merged back: its commits are of this relation (and its rows, merged, are
+-- the table's: #936), the old table's commits aren't
+SELECT dolt_hashof('main') AS before_k \gset
+SELECT dolt_branch('k3', dolt_hashof('keeps_old')) IS NOT NULL AS made;
+SELECT dolt_checkout('k3') IS NOT NULL AS on_k3;
+SELECT (dolt_merge('-m', 'main into k3', 'main'))[3] AS conflicts;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'k3 in', 'k3'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
+SELECT * FROM dolt_at('keeps_old', NULL::ln.t);
+SELECT * FROM dolt_at('HEAD^2^1', NULL::ln.t);
+SELECT count(*) AS rows_now FROM ln.t;
+SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
+RESET ROLE;
+SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+
+-- a branch made at the new table's commit by hash, its head moved to the
+-- old table's commit by a write role and committed
+SELECT dolt_branch('k4', :'new_commit') IS NOT NULL AS made;
+SET ROLE regress_lb_writer;
+SELECT dolt_checkout('k4') IS NOT NULL AS on_k4;
+SELECT dolt_reset('--soft', :'old_commit') IS NOT NULL AS moved;
+SELECT length(dolt_commit('--allow-empty', '-m', 'over the old, k4')::text) AS committed;
+RESET ROLE;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
+SELECT * FROM dolt_at('k4~', NULL::ln.t);
+RESET ROLE;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+
+-- a table made on a branch and merged in is made again here, a relation
+-- of its own: its branch's history isn't its grantee's (it fails closed)
+SELECT dolt_branch('feature') IS NOT NULL AS made;
+SELECT dolt_checkout('feature') IS NOT NULL AS on_feature;
+CREATE TABLE ln.f (id int PRIMARY KEY);
+INSERT INTO ln.f VALUES (1);
+SELECT length(dolt_commit('-Am', 'feature table')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO ln.t VALUES (30, 'main, meanwhile');
+SELECT length(dolt_commit('-am', 'meanwhile')::text) AS committed;
+SELECT (dolt_merge('--no-ff', '-m', 'feature in', 'feature'))[3] AS conflicts;
+GRANT SELECT ON ln.f TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.f);
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.f);
+-- (the table here's own history reads, through the merge)
+SELECT count(*) > 0 AS read FROM dolt_at('HEAD^1', NULL::ln.t);
+RESET ROLE;
+
+-- a refused read reads each commit's record about once: a chain of the
+-- old table's commits, merged with main's now and then
+SELECT dolt_checkout('-b', 'chain', 'keeps_old') IS NOT NULL AS made;
+DO $$
+BEGIN
+	FOR i IN 1..20 LOOP
+		INSERT INTO ln.t VALUES (100 + i, 'old chain');
+		PERFORM dolt_commit('-am', 'chain ' || i);
+		IF i % 4 = 0 THEN
+			PERFORM dolt_merge('-m', 'main into chain', 'main');
+		END IF;
+	END LOOP;
+END $$;
+SELECT count(*) AS chain_commits FROM dolt_log('chain') \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT pg_stat_force_next_flush();
+SELECT value AS read_before FROM pg_stat_prolly WHERE name = 'commits_read' \gset
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('chain', NULL::ln.t);
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+SELECT value - :read_before <= 3 * :chain_commits AS linear
+FROM pg_stat_prolly WHERE name = 'commits_read';
+
 -- the old table's branch merging main in, then merged back (a
--- fast-forward): its merge's note is of the old table's relation, not
--- this one's, so it vouches for no parent of its
+-- fast-forward): the merge is of the old table's relation, so the head is
+-- no version of this one's
 SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
 SELECT (dolt_merge('-m', 'main into old', 'main'))[3] AS conflicts;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;

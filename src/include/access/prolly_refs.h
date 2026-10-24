@@ -731,18 +731,6 @@ typedef struct ProllyRefsRoutine
 	void		(*pins) (ProllyPinVisit visit, void *arg);
 
 	/*
-	 * Optional: the commit (*at) whose tables the session branch's own
-	 * record of them lists relation relid among, the record made by the
-	 * branch's last commit; false if it doesn't (a table made, or dropped
-	 * and made again, since that commit), or there is no record.  The
-	 * branch's head may have moved since without a commit (a reset, a
-	 * fast-forward): the record is still of the commit that made it.  A
-	 * history read takes a version of a table for the table here only
-	 * through this, as a commit holds tables by name and identity alone.
-	 */
-	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
-
-	/*
 	 * Optional: the role that made branch name, which owns it; false if
 	 * none is recorded (main, the database owner's, never has one).
 	 */
@@ -755,8 +743,8 @@ typedef struct ProllyRefsRoutine
 	void		(*branch_set_creator) (const char *name, Oid role);
 
 	/*
-	 * Optional: the role that made tag name here (false: none recorded), and the role that pushed name's nth stash
-	 * (false: it has none).
+	 * Optional: the role that made tag name here (false: none recorded),
+	 * and the role that pushed name's nth stash (false: it has none).
 	 */
 	bool		(*tag_creator) (const char *name, Oid *role);
 	bool		(*stash_maker) (const char *name, int n, Oid *role);
@@ -768,18 +756,14 @@ typedef struct ProllyRefsRoutine
 	void		(*tag_set_creator) (const char *name, Oid role);
 
 	/*
-	 * Optional: what commit's branch's record of its tables (see
-	 * recorded_relation) held before the commit, when the commit's parents
-	 * aren't that record's commit alone (a merge; a commit after the head
-	 * moved): the record's commit (*was), and *lines, a line for each table
-	 * both records list by relation, its OID (10 digits), a tab, its name
-	 * in the commit, a tab, and its name in the record before (palloc'd).
-	 * False if none is kept.  A history read takes a parent's version of
-	 * such a table for the table's only if it shares the record's commit's
-	 * history.
+	 * Optional: the relations commit was made from, as this database made
+	 * it: *lines, a line for each prolly table, its OID (10 digits), a
+	 * space, and its qualified name (palloc'd); false for a commit made
+	 * elsewhere (fetched, cloned, pushed here) or before they were kept.
+	 * A history read takes a version for the session's table only along
+	 * commits made from the table's relation.
 	 */
-	bool		(*lineage_note) (const ProllyHash *commit, ProllyHash *was,
-								 char **lines);
+	bool		(*commit_relations) (const ProllyHash *commit, char **lines);
 } ProllyRefsRoutine;
 
 /*
@@ -823,11 +807,11 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
+	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
-	"lineage_note"
+	"commit_relations"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK lineage_note
+#define PROLLY_REFS_LAST_CALLBACK commit_relations
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
