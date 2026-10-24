@@ -333,6 +333,7 @@ tests += {
       't/203_first_use_kept_snapshots.pl',
       't/204_kept_pages_crash.pl',
       't/205_bmap_deferred_unlink.pl',
+      't/207_bmap_compact.pl',
       't/210_bmap_release_queue.pl',
       't/211_bmap_release_autovacuum.pl',
       't/212_vacuum_release_bounds.pl',

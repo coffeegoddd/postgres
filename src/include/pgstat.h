@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF8
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF9
 
 typedef struct PgStat_ArchiverStats
 {
@@ -752,9 +752,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT,	/* tables a branch's first use
 											 * made of pages kept as of its
 											 * head */
+	PGSTAT_PROLLY_BMAP_BLOCKS_MOVED,	/* page-store blocks a sweep moved
+										 * down, to shorten the store */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BLOCKS_MOVED + 1)
 
 typedef struct PgStat_ProllyStats
 {

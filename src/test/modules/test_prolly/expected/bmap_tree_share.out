@@ -33,9 +33,9 @@ SELECT pg_relation_size('small') / 8192 > 509 AS small_two_subtrees,
 SELECT test_bmap_rows_digest(:small) AS small_rows,
 	test_bmap_rows_digest(:big) AS big_rows \gset
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 -- a share: one map page, a count for each subtree
@@ -185,9 +185,9 @@ SELECT (SELECT refs FROM test_bmap_tree(:big) WHERE level = 1) AS source_node_re
 (1 row)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 -- dropping a copy: a count less for each subtree, whatever the size, by
@@ -257,9 +257,9 @@ SELECT name, value > 0 AS moved FROM pg_temp.counted();
 (5 rows)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         2 |     2
 (1 row)
 
 -- copies of copies, the first dropped first
@@ -290,9 +290,9 @@ SELECT test_bmap_unlink(:c2);
 (1 row)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 \c :home

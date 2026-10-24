@@ -5829,7 +5829,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        the background by autovacuum, a node's children queued in its place),
        <literal>bmap_release_blocks_freed</literal> and
        <literal>bmap_release_refcount_updates</literal> (the blocks that
-       drain freed and the reference counts it set).  Bytes are counted when
+       drain freed and the reference counts it set); <literal>bmap_blocks_moved</literal>
+       (page-store blocks a page sweep moved down into blocks freed before
+       them, so that it could shorten the store).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

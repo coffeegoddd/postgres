@@ -25,9 +25,9 @@ SELECT count(DISTINCT block) AS src_nodes FROM test_bmap_tree(:src) \gset
 -- Nothing to do in a store whose counts are right.
 CHECKPOINT;
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 -- 300 copies: the counts of the subtrees they share stick at 255.
@@ -153,9 +153,9 @@ SELECT count(*), sum(a) FROM cow.v;
 
 CHECKPOINT;
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 -- A sweep is due when a stuck count loses a holder (it keeps it, stuck),

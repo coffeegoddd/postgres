@@ -102,8 +102,9 @@
  * relation's read under its header's lock, and what the queue still holds
  * (drains held off meanwhile), and
  * frees the blocks allocated as it began that nothing holds, rewrites the
- * stuck counts that now fit, and shortens the store to its last allocated
- * block (SHRINK, which redo truncates by too).  Branch creation (a share,
+ * stuck counts that now fit, moves the blocks past the allocated count down
+ * into free ones (compact_store()), and shortens the store to its last
+ * allocated block (SHRINK, which redo truncates by too).  Branch creation (a share,
  * the one thing that adds holders) waits for it while it counts, and the
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
@@ -147,6 +148,7 @@
 #include <unistd.h>
 
 #include "access/bufmask.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
@@ -173,6 +175,7 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
+#include "utils/relfilenumbermap.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 
@@ -7648,6 +7651,429 @@ block_list_add(BlockList *l, BlockNumber b)
 	l->blocks[l->n++] = b;
 }
 
+/* ----------------------------------------------------------------
+ * Compaction: the blocks past where the page store would end moved down
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Freeing leaves holes where the freed blocks were (a vacuumed change
+ * log's, among its table's).  The store keeps them until later allocations
+ * fill them: a sweep can shorten it only to its last allocated block.  So
+ * after counting, a sweep moves the blocks past the allocated count down,
+ * each to the lowest free block, and then shortens the store past them
+ * (sweep_shrink()).  It moves only data pages one relation alone holds, its
+ * leaf and every node above it the relation's own, each as a copy before a
+ * change would move it, which redo replays the same way: copied to the new
+ * block by a REMAP (the page's image, the leaf's entry, the allocation)
+ * under its buffer's cleanup lock, then the old block freed.  Its entry
+ * keeps its epoch, so a page as of a fold stays one.  The image restores
+ * the page whatever records redo skips for it from before the move.
+ *
+ * A tree's nodes stay where they are: a node moved would get a new pointer,
+ * and recovery skips the records of every page under a pointer newer than
+ * them (tree_find()), which only a share's flushing and syncing of those
+ * pages makes safe; so does anything shared, a snapshot's, on a changes
+ * list, or busy (a pinned buffer).  A node in the tail ends what the store
+ * can be shortened by.  A crash between a move and the freeing of
+ * its old block leaves that block allocated and held by nothing, for the
+ * next sweep.  At wal_level minimal, a relation whose data skips WAL (made
+ * in a transaction not yet committed) isn't moved: its later changes reach
+ * its blocks without records, and replaying the move's image would undo
+ * them.
+ */
+
+/* a data page to move */
+typedef struct CompactMove
+{
+	BlockNumber phys;
+	BlockNumber blkno;
+} CompactMove;
+
+typedef struct CompactWalk
+{
+	BlockNumber target;			/* move the blocks from here */
+	BlockNumber nblocks;		/* the relation's length */
+	CompactMove *moves;
+	uint32		n;
+	uint32		cap;
+} CompactWalk;
+
+static void
+compact_note(CompactWalk *cw, BlockNumber phys, BlockNumber blkno)
+{
+	if (cw->n == cw->cap)
+	{
+		cw->cap = Max(cw->cap * 2, 64);
+		cw->moves = cw->moves ?
+			repalloc_array(cw->moves, CompactMove, cw->cap) :
+			palloc_array(CompactMove, cw->cap);
+	}
+	cw->moves[cw->n].phys = phys;
+	cw->moves[cw->n].blkno = blkno;
+	cw->n++;
+}
+
+static bool
+compact_visit_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	return true;
+}
+
+static void
+compact_visit_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	CompactWalk *cw = arg;
+
+	/* (not a snapshot's, nor one past the relation's length) */
+	if (entry->block >= cw->target && BlockNumberIsValid(blkno) &&
+		blkno < cw->nblocks)
+		compact_note(cw, entry->block, blkno);
+}
+
+/*
+ * Has rel's page store a free block below 'below'?  Read under the
+ * allocator's share locks: an allocation may take it meanwhile, which the
+ * move then finds (alloc_take() gives it another).
+ */
+static bool
+compact_has_room(RelFileLocator rel, BlockNumber below)
+{
+	Buffer		metabuf = alloc_read(rel, 0);
+	BmapMeta   *meta;
+	bool		room = false;
+
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	if (meta->nfree > 0)
+	{
+		for (uint32 pageno = meta->hint; pageno < meta->nbitmap && !room &&
+			 (BlockNumber) pageno * BMAP_BITS_PER_PAGE < below; pageno++)
+		{
+			Buffer		buf = alloc_read(rel, meta->bitmap[pageno]);
+			uint64	   *words;
+			BlockNumber base = pageno * BMAP_BITS_PER_PAGE;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
+					   MAIN_FORKNUM, meta->bitmap[pageno]);
+			words = PageGetBmapBits(BufferGetPage(buf));
+			for (uint32 b = 0; b < BMAP_BITS_PER_PAGE && base + b < below; b++)
+			{
+				if (b % 64 == 0 && words[b / 64] == PG_UINT64_MAX)
+				{
+					b += 63;
+					continue;
+				}
+				if ((words[b / 64] & (UINT64CONST(1) << (b % 64))) == 0)
+				{
+					room = true;
+					break;
+				}
+			}
+			UnlockReleaseBuffer(buf);
+		}
+	}
+	UnlockReleaseBuffer(metabuf);
+	return room;
+}
+
+/*
+ * May data page 'blkno' of reln, at physical block 'phys', move?  Its entry
+ * still names the block, which nothing else holds, on a path the relation
+ * owns.  The header is held, at least shared.
+ */
+static bool
+compact_page_movable(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
+					 BlockNumber phys, BmapEntry *entry, MapPage *mp)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapHeader *header = PageGetBmapHeader(BufferGetPage(headerbuf));
+
+	return blkno < header->nblocks &&
+		lookup_entry_at(reln, blkno, entry, mp, NULL) &&
+		entry->block == phys &&
+		lookup_ref(rel, phys) == 0 &&
+		tree_path_own(reln, blkno, header->epoch);
+}
+
+/*
+ * Move data page 'blkno' of reln from physical block 'phys' to a lower free
+ * block.  True if it moved (and 'phys' is to be freed).  Locks as
+ * bmapprepareforchange()'s copy: the page's buffer, the header shared, the
+ * allocator's pages, then the leaf last.
+ */
+static bool
+compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	Buffer		headerbuf;
+	Buffer		mapbuf;
+	BmapEntry	entry;
+	MapPage		mp;
+	Allocation	alloc;
+	BlockNumber new_block;
+	xl_bmap_remap xlrec;
+	xl_bmap_node_delta *ndelta;
+	xl_bmap_entry_delta *ent;
+	Page		page;
+	bool		zeroed;
+	int			id;
+	XLogRecPtr	lsn;
+
+	if (!compact_has_room(rel, phys))
+		return false;
+	INJECTION_POINT("bmap-compact-room", NULL);
+
+	/*
+	 * Asked first without the page: preparing its buffer for the change
+	 * below would copy a page another relation shares, which isn't to be
+	 * moved at all.
+	 */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	if (!compact_page_movable(reln, headerbuf, blkno, phys, &entry, &mp))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return false;
+	}
+	LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
+
+	/* the page, which nothing else may hold meanwhile */
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	if (!ConditionalLockBufferForCleanupUnprepared(buf))
+	{
+		ReleaseBuffer(buf);
+		ReleaseBuffer(headerbuf);
+		return false;
+	}
+	/* (as a change of no row, which claims an entry nothing else holds) */
+	BufferPrepareForChange(buf);
+
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	if (!compact_page_movable(reln, headerbuf, blkno, phys, &entry, &mp))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	alloc_take(rel, 1, &new_block, &alloc);
+	if (new_block >= phys)
+	{
+		/*
+		 * The room was taken meanwhile: nothing is changed yet (a page store
+		 * grown for it by a block too many is shortened as it ends).
+		 */
+		alloc_release(&alloc);
+		UnlockReleaseBuffer(headerbuf);
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	page = BufferGetPage(buf);
+	zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
+	if (new_block < alloc.old_hw && !zeroed)
+		drop_node_buffer(rel, new_block);
+	prepare_store(rel, alloc.old_hw, alloc.new_hw, &new_block,
+				  zeroed && new_block < alloc.old_hw ? 1 : 0, false,
+				  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
+
+	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
+	ndelta->kind = BMAP_DELTA_NODE;
+	ndelta->nentries = 1;
+	ent = (xl_bmap_entry_delta *) (ndelta + 1);
+	ent->slot = MP_SLOT(&mp, blkno);
+	ent->block = new_block;
+	ent->epoch = entry.epoch;
+
+	mapbuf = mp_read(reln, &mp);
+	map_lock(mapbuf, false);
+	mp_check(reln, &mp, BufferGetPage(mapbuf));
+
+	xlrec.locator = rel;
+	xlrec.blkno = blkno;
+	xlrec.old_block = phys;
+	xlrec.new_block = new_block;
+	xlrec.old_hw = alloc.old_hw;
+	xlrec.new_hw = alloc.new_hw;
+	xlrec.flags = zeroed ? BMAP_REMAP_ZERO : 0;
+
+	XLogEnsureRecordSpace(5 + BMAP_ALLOC_MAX_PAGES, 0);
+	ndelta->since = GetXLogInsertRecPtr();
+	START_CRIT_SECTION();
+	apply_node_delta(BufferGetPage(mapbuf), ndelta);
+	MarkBufferDirty(mapbuf);
+	/* the page is written to its new block from here on */
+	MarkBufferDirty(buf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
+	id = alloc_apply_register(&alloc, 1);
+	if (zeroed)
+		XLogRegisterBuffer(id, buf, REGBUF_WILL_INIT);
+	else
+		XLogRegisterBuffer(id, buf, REGBUF_FORCE_IMAGE |
+						   (page_hole_is_zero(page) ? REGBUF_STANDARD : 0));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_REMAP);
+	PageSetLSN(BufferGetPage(mapbuf), lsn);
+	alloc_set_lsn(&alloc, lsn);
+	if (!zeroed)
+		PageSetLSN(page, lsn);
+	END_CRIT_SECTION();
+
+	alloc_release(&alloc);
+	map_unlock(mapbuf);
+	ReleaseBuffer(mapbuf);
+	UnlockReleaseBuffer(headerbuf);
+	UnlockReleaseBuffer(buf);
+	pfree(ndelta);
+	return true;
+}
+
+static int
+cmp_move_desc(const void *a, const void *b)
+{
+	const CompactMove *x = (const CompactMove *) a;
+	const CompactMove *y = (const CompactMove *) b;
+
+	return pg_cmp_u32(y->phys, x->phys);
+}
+
+/*
+ * Move one relation's blocks from 'target' on, the highest first; the old
+ * blocks go back to the allocator.
+ */
+static uint64
+compact_relation(SMgrRelation reln, BlockNumber target)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	CompactWalk cw = {target, 0, NULL, 0, 0};
+	Buffer		headerbuf;
+	BlockList	freed = {NULL, 0, 0};
+	uint64		moved = 0;
+
+	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
+		return 0;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return 0;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	cw.nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	tree_walk(reln, compact_visit_node, compact_visit_entry, &cw);
+	UnlockReleaseBuffer(headerbuf);
+	if (cw.n == 0)
+		return 0;
+
+	qsort(cw.moves, cw.n, sizeof(CompactMove), cmp_move_desc);
+	for (uint32 i = 0; i < cw.n; i++)
+	{
+		const CompactMove *m = &cw.moves[i];
+
+		if (compact_page(reln, m->blkno, m->phys))
+		{
+			block_list_add(&freed, m->phys);
+			moved++;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	INJECTION_POINT("bmap-compact-moved", NULL);
+	if (freed.n > 0)
+	{
+		qsort(freed.blocks, freed.n, sizeof(BlockNumber), cmp_block);
+		free_blocks(rel, freed.blocks, freed.n);
+		pfree(freed.blocks);
+	}
+	pfree(cw.moves);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_BLOCKS_MOVED, moved);
+	return moved;
+}
+
+/*
+ * Move the blocks of a database's page store in a tablespace (directory
+ * 'path') that lie past its allocated count: how many moved.  Each relation
+ * is moved in a subtransaction of its own, so one dropped or truncated
+ * meanwhile is passed over.
+ */
+static uint64
+compact_store(RelFileLocator rel, const char *path)
+{
+	Buffer		metabuf = alloc_read(rel, 0);
+	BmapMeta   *meta;
+	BlockNumber hw;
+	BlockNumber target;
+	DIR		   *dir;
+	struct dirent *de;
+	uint64		moved = 0;
+	Oid			spc = rel.spcOid == MyDatabaseTableSpace ? InvalidOid : rel.spcOid;
+
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	hw = meta->hw;
+	target = meta->hw - meta->nfree;
+	UnlockReleaseBuffer(metabuf);
+	if (target == hw)
+		return 0;
+
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		char	   *end;
+		SMgrRelation reln;
+		MemoryContext oldcxt = CurrentMemoryContext;
+		ResourceOwner oldowner = CurrentResourceOwner;
+
+		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
+		if (end == de->d_name || strcmp(end, "_bmap") != 0)
+			continue;
+		/* (one whose data may skip WAL: see above) */
+		if (!XLogIsNeeded() &&
+			!OidIsValid(RelidByRelfilenumber(spc, relnumber)))
+			continue;
+		reln = smgropen(with_relnumber(rel, relnumber), INVALID_PROC_NUMBER);
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(oldcxt);
+		PG_TRY();
+		{
+			moved += compact_relation(reln, target);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+			ereport(DEBUG1,
+					(errmsg_internal("blocks of relation %u not moved: %s",
+									 relnumber, edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	}
+	FreeDir(dir);
+	return moved;
+}
+
 void
 bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 {
@@ -7678,6 +8104,7 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
 	sweep_done(0, PointerGetDatum(&rel));
+	result->moved = compact_store(rel, path);
 	result->truncated = sweep_shrink(rel);
 	swept_note(rel, false, &released);
 	pfree(path);
