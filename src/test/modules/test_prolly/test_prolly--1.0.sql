@@ -512,6 +512,11 @@ CREATE FUNCTION test_commit_chain(parent text, n int)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A commit after parent recording height as its own, right or not.
+CREATE FUNCTION test_commit_at_height(parent text, height int8)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The height a commit records; NULL if it records none.
 CREATE FUNCTION test_commit_height(commit_id text)
 RETURNS int8
