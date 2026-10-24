@@ -321,6 +321,16 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A keyed row both sides of a merge changed is merged column by column.  A
+long value is held out of line by a reference naming its canonical bytes,
+so where a side's reference is base's, decoded by the same keying, that
+side didn't change the column: neither value is read (decode_row_kept()),
+and a merged row taking it is written with the reference
+(encode_row_kept()).  A large value neither side changed is not fetched to
+find that out, nor when the merged row is applied.  A column whose base
+value is unsure (below) is compared by value, as are values either side
+changed.
+
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
 spools its ordered keys, conflict flags and canonical values to a temporary

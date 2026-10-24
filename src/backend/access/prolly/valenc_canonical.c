@@ -272,11 +272,21 @@ canonical_begin_layout(TupleDesc desc, const ProllyValue *layout,
 	return enc;
 }
 
+static ProllyValue *row_refs_by_column(ProllyValueEncoder *enc,
+									   const ProllyValue *row, int *n);
+
+/*
+ * Encode slot's row into out; with before, each column marked in kept is
+ * before's reference there, slot's value not read.
+ */
 static void
-canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
+encode_into(ProllyValueEncoder *enc, TupleTableSlot *slot,
+			const ProllyValue *before, const bool *kept, StringInfo out)
 {
 	MemoryContext old;
 	int			n = 0;
+	ProllyValue *brefs = NULL;
+	int			nb = 0;
 
 	if (enc->decode_only)
 		elog(ERROR, "a prolly encoder for an earlier row layout can only decode");
@@ -287,12 +297,14 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	{
 		int			i = enc->live_attno[j];
 
-		enc->nulls[j] = slot->tts_isnull[i];
-		if (!slot->tts_isnull[i] || enc->has_missing[j])
+		enc->nulls[j] = slot->tts_isnull[i] && !(before && kept[i]);
+		if (!enc->nulls[j] || enc->has_missing[j])
 			n = j + 1;
 	}
 
 	old = MemoryContextSwitchTo(enc->tmpcxt);
+	if (before)
+		brefs = row_refs_by_column(enc, before, &nb);
 	prolly_put_varint(out, n);
 	for (int j = 0; j < n; j += 8)
 	{
@@ -313,6 +325,17 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 
 		if (enc->nulls[j])
 			continue;
+
+		/* A value kept: the reference before holds, not read. */
+		if (before && kept[i])
+		{
+			if (j >= nb || brefs[j].len == 0)
+				elog(ERROR, "a kept prolly column has no reference in the row it is kept from");
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) brefs[j].len);
+			appendBinaryStringInfo(out, (const char *) brefs[j].data,
+								   brefs[j].len);
+			continue;
+		}
 
 		/*
 		 * A value stored by content: its tree is the column's, when it holds
@@ -379,6 +402,20 @@ canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(enc->tmpcxt);
+}
+
+static void
+canonical_encode(ProllyValueEncoder *enc, TupleTableSlot *slot, StringInfo out)
+{
+	encode_into(enc, slot, NULL, NULL, out);
+}
+
+static void
+canonical_encode_kept(ProllyValueEncoder *enc, TupleTableSlot *slot,
+					  const ProllyValue *before, const bool *kept,
+					  StringInfo out)
+{
+	encode_into(enc, slot, before, kept, out);
 }
 
 /* Called with each out-of-line value of a row: its column and reference. */
@@ -898,6 +935,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.set_values = canonical_set_values,
 	.refs = canonical_refs,
 	.decode_kept = canonical_decode_kept,
+	.encode_kept = canonical_encode_kept,
 	.fields = canonical_fields,
 	.decode_field = canonical_decode_field,
 	.fields_alike = canonical_fields_alike,

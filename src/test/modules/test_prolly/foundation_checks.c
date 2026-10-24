@@ -870,6 +870,94 @@ valenc_long_values(const ProllyImplInfo *impl)
 }
 
 /*
+ * Long values kept: decode_kept() of a row against one with the same long
+ * values leaves them unread and marks them, and encode_kept() of what it
+ * decoded, the kept columns taken from that row, gives the row encode()
+ * gave, without reading them.  A column marked kept where that row holds
+ * no reference is an error.
+ */
+void
+valenc_kept_values(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {{COL_I4}, {COL_TEXT}, {COL_I4_ARRAY}};
+	TupleDesc	desc = make_desc(cols, lengthof(cols));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *dst = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	ProllyTreeEnv env;
+	ProllyValueStore values = {0};
+	StringInfoData long_row;
+	StringInfoData short_row;
+	StringInfoData again;
+	ProllyValue lrow;
+	ProllyValue srow;
+	bool		kept[3];
+	char	   *text = palloc(100001);
+	bool		failed = false;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	prolly_folded_tree_env(&env);
+	values.tree = prolly_tree_lookup("cow");
+	values.env = &env;
+	PROLLY_CALL(ve, set_values, enc, &values);
+	for (int i = 0; i < 100000; i++)
+		text[i] = 'a' + (i * 7 + i / 26) % 26;
+	text[100000] = '\0';
+	initStringInfo(&long_row);
+	initStringInfo(&short_row);
+	initStringInfo(&again);
+	store_row(src, cols, 1, 0, text);
+	encode_row(ve, enc, src, &long_row);
+	lrow.data = (const uint8 *) long_row.data;
+	lrow.len = long_row.len;
+	store_row(src, cols, 1, 0, "short");
+	encode_row(ve, enc, src, &short_row);
+	srow.data = (const uint8 *) short_row.data;
+	srow.len = short_row.len;
+
+	PROLLY_CALL(ve, decode_kept, enc, &lrow, &lrow, dst, kept);
+	if (kept[0] || !kept[1] || kept[2] || !dst->tts_isnull[1])
+		elog(ERROR, "decode_kept() didn't keep just the long value");
+	PROLLY_CALL(ve, encode_kept, enc, dst, &lrow, kept, &again);
+	if (again.len != long_row.len ||
+		memcmp(again.data, long_row.data, again.len) != 0)
+		elog(ERROR, "encode_kept() of a row kept from itself isn't the row");
+
+	/* the short row: nothing kept, encoded as encode() does */
+	PROLLY_CALL(ve, decode_kept, enc, &srow, &lrow, dst, kept);
+	if (kept[0] || kept[1] || kept[2])
+		elog(ERROR, "decode_kept() kept a value the rows don't share");
+	resetStringInfo(&again);
+	PROLLY_CALL(ve, encode_kept, enc, dst, &lrow, kept, &again);
+	if (again.len != short_row.len ||
+		memcmp(again.data, short_row.data, again.len) != 0)
+		elog(ERROR, "encode_kept() with nothing kept isn't encode()");
+
+	/* kept from a row holding no reference there */
+	kept[1] = true;
+	resetStringInfo(&again);
+	PG_TRY();
+	{
+		PROLLY_CALL(ve, encode_kept, enc, dst, &srow, kept, &again);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		failed = true;
+	}
+	PG_END_TRY();
+	if (!failed)
+		elog(ERROR, "encode_kept() kept a reference the row doesn't hold");
+
+	pfree(text);
+	ExecDropSingleTupleTableSlot(src);
+	ExecDropSingleTupleTableSlot(dst);
+	PROLLY_CALL(ve, end, enc);
+}
+
+/*
  * Reference encodings of rows 1 and 9 of a table (int4, text, int8, bool,
  * numeric); row 9 has NULLs.  These bytes are the canonical format, so they
  * are the same on every platform.  An implementation whose bytes depend on

@@ -30,6 +30,7 @@ extern void keyenc_order_matches_opclass(const ProllyImplInfo *impl);
 extern void keyenc_desc_and_nulls(const ProllyImplInfo *impl);
 extern void valenc_round_trip(const ProllyImplInfo *impl);
 extern void valenc_long_values(const ProllyImplInfo *impl);
+extern void valenc_kept_values(const ProllyImplInfo *impl);
 extern void valenc_platform_independent(const ProllyImplInfo *impl);
 extern void valenc_independent_of_history(const ProllyImplInfo *impl);
 extern void valenc_independent_of_session(const ProllyImplInfo *impl);
