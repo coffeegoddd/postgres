@@ -6430,6 +6430,7 @@ typedef struct LineageStep
 typedef struct NameLineage
 {
 	char	   *now;			/* the table's name now */
+	Oid			relid;			/* and its relation */
 	HTAB	   *steps;			/* LineageStep, each version reached */
 	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
 	bool		started;
@@ -6496,7 +6497,17 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 
 		l->started = true;
 		lineage_enter(l, "WORKING", l->now);
-		if (PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
+
+		/*
+		 * (the head's version is this table only if the branch's own record
+		 * of its head's tables, made by its commit, has this relation: a
+		 * table made again with the name, or a head moved to a commit
+		 * holding another table of it, has the same name and identity, so
+		 * the step's changes can't tell)
+		 */
+		if (OidIsValid(l->relid) && PROLLY_HAS(refs(), head_has_relation) &&
+			PROLLY_CALL(refs(), head_has_relation, l->relid) &&
+			PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
 			(before = lineage_name_before(hash_hex(&h), "WORKING", l->now)) != NULL)
 			l->queue = lappend(lappend(l->queue, copy_hash(&h)), before);
 	}
@@ -6605,7 +6616,7 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 
 /* The lineage of the table here named now: from lineages, or begun. */
 static NameLineage *
-name_lineage(List **lineages, const char *now)
+name_lineage(List **lineages, const char *now, Oid relid)
 {
 	NameLineage *l;
 	HASHCTL		ctl = {0};
@@ -6619,6 +6630,7 @@ name_lineage(List **lineages, const char *now)
 	}
 	l = palloc0(sizeof(NameLineage));
 	l->now = pstrdup(now);
+	l->relid = relid;
 	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
 	ctl.entrysize = sizeof(LineageStep);
 	ctl.hcxt = CurrentMemoryContext;
@@ -6628,6 +6640,25 @@ name_lineage(List **lineages, const char *now)
 	return l;
 }
 
+/* Does the user read every version, whatever its grants? */
+static bool
+reads_all_history(void)
+{
+	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+}
+
+/* A history read the version control can't check, refused. */
+static void
+history_unchecked(const char *fn)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s can't check which versions are the table's", fn),
+			 errdetail("The database's version control lists no changes to follow a table by."),
+			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+}
+
 /*
  * May the user read a table's rows as its versions (at from_ref and
  * to_ref) have them, by name?  Where the session has a table of either
@@ -6635,11 +6666,13 @@ name_lineage(List **lineages, const char *now)
  * the table's row type), a grant that covers each version that is that
  * table (name_lineage()).  A version no table here is (dropped since, or
  * one of its name made after it) has no grant to check: only the
- * database's owner or a member of pg_read_all_data may read it.
+ * database's owner or a member of pg_read_all_data may read it.  Refused
+ * as an error, or (noError) false.
  */
-static void
-check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
-				 List **lineages, const char *fn)
+static bool
+named_rows_allowed(const SummaryRow *r, const char *from_ref,
+				   const char *to_ref, List **lineages, const char *fn,
+				   bool noError)
 {
 	const char *names[2] = {r->to_name, r->from_name};
 	bool		from_ok = r->from_item == NULL;
@@ -6653,8 +6686,7 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 	 * what the working set changed since the head, a fold of its rows,
 	 * whatever the refs diffed)
 	 */
-	reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+	reads_all = reads_all_history();
 	for (int i = 0; i < 2; i++)
 	{
 		Oid			relid;
@@ -6669,40 +6701,48 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			continue;
 		aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
 		if (aclresult != ACLCHECK_OK)
+		{
+			if (noError)
+				return false;
 			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+		}
+		if (noError && check_enable_rls(relid, InvalidOid, true) == RLS_ENABLED)
+			return false;
 		check_history_rls(relid, fn);
 		some = true;
 		if (reads_all)
 			continue;
-		l = name_lineage(lineages, names[i]);
+		l = name_lineage(lineages, names[i], relid);
 		if (!from_ok)
 			from_ok = lineage_reaches(l, from_ref, r->from_name);
 		if (!to_ok)
 			to_ok = lineage_reaches(l, to_ref, r->to_name);
 	}
 	if ((from_ok && to_ok) || reads_all)
-		return;
+		return true;
+	if (noError)
+		return false;
 	name = !from_ok ? r->from_name : r->to_name;
 	if (some)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
 						fn, name),
-				 errdetail("The name was without a table since that version, so the table here is another."),
+				 errdetail("The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another."),
 				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 	ereport(ERROR,
 			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 			 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
 					fn, name),
 			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	return false;				/* keep the compiler quiet */
 }
 
-/* Does the user read every version, whatever its grants? */
-static bool
-reads_all_history(void)
+static void
+check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
+				 List **lineages, const char *fn)
 {
-	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+	(void) named_rows_allowed(r, from_ref, to_ref, lineages, fn, false);
 }
 
 /*
@@ -6721,11 +6761,10 @@ check_typed_diff(Oid relid, const char *from_ref, const char *to_ref,
 	SummaryRow *r;
 	char	   *name;
 
-	if (reads_all_history() || !PROLLY_HAS(diff_merge(), summary))
+	if (reads_all_history())
 		return;
-	name = qualified_name(relid);
-	if (name == NULL)
-		return;
+	if (!PROLLY_HAS(diff_merge(), summary) || (name = qualified_name(relid)) == NULL)
+		history_unchecked(fn);
 	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, false, collect_change, &rows);
 	r = named_table(rows, name);
 	if (r != NULL)
@@ -6733,29 +6772,41 @@ check_typed_diff(Oid relid, const char *from_ref, const char *to_ref,
 }
 
 /*
- * A read of relid's table as ref has it (dolt_at(), dolt_history_table()),
- * which reads ref's table of its name: refused if that is another table's
- * version (check_named_rows()'s rule), unless the user reads every version.
+ * May the user read relid's table as ref has it (dolt_at(),
+ * dolt_history_table(), which read ref's table of its name)?  Not if that
+ * is another table's version (check_named_rows()'s rule), unless the user
+ * reads every version: an error, or (noError) false.
  */
-static void
-check_typed_at(Oid relid, const char *ref, List **lineages, const char *fn)
+static bool
+typed_at_allowed(Oid relid, const char *ref, List **lineages, const char *fn,
+				 bool noError)
 {
 	List	   *rows = NIL;
 	SummaryRow *r;
 	char	   *name;
 
-	if (reads_all_history() || !PROLLY_HAS(diff_merge(), summary))
-		return;
-	name = qualified_name(relid);
-	if (name == NULL ||
-		lineage_reaches(name_lineage(lineages, name), ref, name))
-		return;
+	if (reads_all_history())
+		return true;
+	if (!PROLLY_HAS(diff_merge(), summary) || (name = qualified_name(relid)) == NULL)
+	{
+		if (noError)
+			return false;
+		history_unchecked(fn);
+	}
+	if (lineage_reaches(name_lineage(lineages, name, relid), ref, name))
+		return true;
 	/* (no table of the name there: nothing of another's is read) */
 	PROLLY_CALL(diff_merge(), summary, NULL, ref, false, collect_change, &rows);
 	r = named_table(rows, name);
 	if (r == NULL || r->to_item == NULL)
-		return;
-	check_named_rows(r, NULL, ref, lineages, fn);
+		return true;
+	return named_rows_allowed(r, NULL, ref, lineages, fn, noError);
+}
+
+static void
+check_typed_at(Oid relid, const char *ref, List **lineages, const char *fn)
+{
+	(void) typed_at_allowed(relid, ref, lineages, fn, false);
 }
 
 /* rows_begin_described() of a table's version, or refused. */
@@ -7164,12 +7215,15 @@ dolt_at_support(PG_FUNCTION_ARGS)
 			Node	   *ref = estimate_expression_value(req->root, linitial(args));
 			Oid			relid = get_typ_typrelid(exprType(lsecond(args)));
 			double		rows;
+			List	   *lineages = NIL;
 
 			if (IsA(ref, Const) && !((Const *) ref)->constisnull &&
 				OidIsValid(relid))
 			{
 				req->root->glob->dependsOnRole = true;
 				if (history_access(relid, ACL_SELECT, true) == HISTORY_READABLE &&
+					typed_at_allowed(relid, TextDatumGetCString(((Const *) ref)->constvalue),
+									 &lineages, "dolt_at", true) &&
 					PROLLY_CALL(diff_merge(), row_count,
 								TextDatumGetCString(((Const *) ref)->constvalue),
 								relid, &rows))
@@ -7627,6 +7681,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	char	   *name = NULL;
 	List	   *stats;
 	ListCell   *lc;
+	List	   *lineages = NIL;
 
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
@@ -7665,6 +7720,15 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		bool		nulls[12] = {0};
 
 		if (r->not_covered || r->object != PROLLY_OBJECT_TABLE)
+			continue;
+
+		/*
+		 * (counts are history too: a table's, as a read of its rows takes
+		 * it; one the user may not read is left out of the list, and
+		 * refused when named)
+		 */
+		if (!named_rows_allowed(r, from_ref, to_ref, &lineages, "dolt_diff_stat",
+								name == NULL))
 			continue;
 		if (r->from_item)
 			table_version(r->from_item, r->from_len, &old_rows, &old_columns, &keyed);

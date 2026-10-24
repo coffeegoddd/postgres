@@ -89,6 +89,15 @@ SELECT * FROM dolt_diff('HEAD~', 'HEAD', 'feel');
 
 -- the table of a version's name the session has: SELECT on it; a dropped
 -- one, no grant to check: the database's owner, or pg_read_all_data
+-- (a plan's row estimate for a query)
+CREATE FUNCTION pg_temp.estimated(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXECUTE 'EXPLAIN ' || q LOOP
+		RETURN substring(line from 'rows=[0-9]+');
+	END LOOP;
+END $$;
 CREATE ROLE regress_dn_reader;
 GRANT USAGE ON SCHEMA dn TO regress_dn_reader;
 SET ROLE regress_dn_reader;
@@ -133,6 +142,29 @@ SELECT diff_type FROM dolt_diff_table(NULL::dn.secret);
 SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
 SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', NULL::dn.secret);
 SELECT diff_type, to_row FROM dolt_diff_table(NULL::dn.secret, 'HEAD~');
+-- a planner's estimate of the version's rows is history too: refused, the
+-- default estimate taken
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD~2'', NULL::dn.secret)');
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD'', NULL::dn.secret)');
+-- and a statistic of its rows: left out, and refused by name
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~');
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~', 'dn.secret');
+SELECT table_name, rows_added FROM dolt_diff_stat('HEAD~', 'HEAD');
+RESET ROLE;
+-- the head moved back to the dropped table's commit, by the reader: the
+-- head's version is no longer this table's by the branch's record of its
+-- head, so the step from the working set to the head vouches for nothing
+SELECT dolt_hashof('HEAD') AS secret_head \gset
+SET ROLE regress_dn_reader;
+SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+SELECT row FROM dolt_history_table(NULL::dn.secret);
+SELECT row FROM dolt_history_table('dn.secret');
+SELECT * FROM dolt_at('WORKING', NULL::dn.secret);
+RESET ROLE;
+SELECT dolt_reset('--soft', :'secret_head') IS NOT NULL AS back;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
 RESET ROLE;
 -- (the database's owner reads both)
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');

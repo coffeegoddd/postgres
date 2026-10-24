@@ -4211,6 +4211,36 @@ head_names(const char *name, const ProllyHash *head)
 	return lines;
 }
 
+/*
+ * Did the session branch's head commit have relation relid among its tables,
+ * by the record its commit made (the record of another head: unknown)?
+ */
+static bool
+copies_head_has_relation(Oid relid)
+{
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	char	   *lines;
+	char		want[16];
+	bool		found = false;
+
+	if (!branch_head(name, &head) || (lines = head_names(name, &head)) == NULL)
+		return false;
+	snprintf(want, sizeof(want), "%010u ", relid);
+	for (char *p = lines; p && *p; p = strchr(p, '\n'))
+	{
+		if (*p == '\n')
+			p++;
+		if (strncmp(p, want, strlen(want)) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+	pfree(lines);
+	return found;
+}
+
 /* The record of head, now of next (a commit that renamed nothing). */
 static void
 carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *next)
@@ -7515,4 +7545,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
+	.head_has_relation = copies_head_has_relation,
 };
