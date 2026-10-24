@@ -935,8 +935,13 @@ baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
 without rows and asks each table's change finder (from that table's
-baseline entry alone), so a status in full visits every table; but the
-definitions are those the last read here made while nothing they're of
+baseline entry alone), so a status in full visits every table.  A
+materialized view's rows read so are its baseline's: a plain REFRESH
+folds the branch as it ends, but a concurrent one changes the rows in
+place, so a status folds unless each prolly materialized view's change
+finder finds no change since (a keyless table's, only when its log has no
+entry since).  The definitions are those the last read here made while
+nothing they're of
 changed (no catalog change in this backend's epoch, the same deparsing
 settings and baseline, the tree still stored), only every sequence's item
 worked out again (pg_stat_prolly's definitions_reused).  They're kept
@@ -950,8 +955,10 @@ only those tables are compared again (pg_stat_prolly's status_reused), so
 a status after a row write costs about the tables written, not every
 table.  The answer is this backend's own, and is kept only from a
 comparison of every table's changes read so: a table whose change finder
-can't tell its changes that way (a keyless or partitioned one) makes every
-status a fold, and status_reused never moves.
+can't tell its changes that way (a partitioned one, or a keyless one with
+log entries since its baseline) makes every status a fold, and
+status_reused never moves.  A materialized view written since the mark
+(refreshed concurrently) is asked again as the full comparison asks it.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 

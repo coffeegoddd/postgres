@@ -1689,12 +1689,35 @@ visit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
 	return vc->visit(kind, key, before, after, vc->arg);
 }
 
+/* (log entries counted, to a limit; an emptying stops the count unknown) */
+typedef struct EntryCount
+{
+	int			n;
+	int			limit;
+	bool		unknown;
+} EntryCount;
+
+static bool
+count_entry(HeapTuple entry, int32 delta, void *arg)
+{
+	EntryCount *c = arg;
+
+	if (entry == NULL)
+	{
+		c->unknown = true;
+		return false;
+	}
+	return ++c->n < c->limit;
+}
+
 /*
  * The rows that differ from the baseline's, from the log's entries since,
  * as a fold from the baseline finds them, without the tree: only where that
  * fold would read nothing else (not in full, not for a snapshot that
- * doesn't see the baseline's fold, nor from a baseline unsettled, nor for a
- * keyless table, whose rows are counts, nor after the table was emptied).
+ * doesn't see the baseline's fold, nor from a baseline unsettled, nor after
+ * the table was emptied).  A keyless table's rows are counts, which its
+ * entries don't tell as changes: it is answered only when it has no entry
+ * since, none changed (a materialized view, keyless, asked by a status).
  */
 static bool
 log_changes(Relation rel, const ProllyTreeEnv *env,
@@ -1716,10 +1739,24 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 	prolly_components_for_relation(rel, &c);
 	if (c.change_log)
 		identity = PROLLY_CALL(c.change_log, identity, rel);
-	ok = !f.keyless && !f.give_up && !prolly_full_fold_wanted(&f.reason) &&
+	ok = !f.give_up && !prolly_full_fold_wanted(&f.reason) &&
 		identity != 0 && parse_state(&baseline->state, &st) &&
 		st.log == identity && sees_fold(f.snap, &st) &&
 		!(st.flags & STATE_UNSETTLED) && !storage_unseen(rel, f.snap);
+	if (ok && f.keyless)
+	{
+		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
+		EntryCount	count = {0, 1, false};
+
+		/* (a read refused, an entry to read the table in full: unknown) */
+		ok = PROLLY_CALL(c.change_log, read, f.rel, f.snap, &pos,
+						 count_entry, &count) &&
+			!count.unknown && count.n == 0;
+		finder_close(&f);
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(cxt);
+		return ok;
+	}
 	if (ok)
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
@@ -1742,27 +1779,6 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cxt);
 	return ok;
-}
-
-/* (log entries counted, to a limit; an emptying stops the count unknown) */
-typedef struct EntryCount
-{
-	int			n;
-	int			limit;
-	bool		unknown;
-} EntryCount;
-
-static bool
-count_entry(HeapTuple entry, int32 delta, void *arg)
-{
-	EntryCount *c = arg;
-
-	if (entry == NULL)
-	{
-		c->unknown = true;
-		return false;
-	}
-	return ++c->n < c->limit;
 }
 
 /*
@@ -1791,9 +1807,15 @@ log_fewer_changes(Relation rel, const ProllyTableFold *baseline, int limit)
 		storage_unseen(rel, snap))
 		return false;
 	pos = (ProllyLogPosition) {st.fxmax, st.fown, st.nxip, st.fxip};
-	(void) PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
-					   &count);
-	return !count.unknown && count.n < count.limit;
+
+	/*
+	 * (false from the read: the count reached limit, a visit stopping it,
+	 * or an entry says to read the table in full, which says nothing of
+	 * how many rows changed)
+	 */
+	return PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
+					   &count) &&
+		!count.unknown && count.n < count.limit;
 }
 
 /*
