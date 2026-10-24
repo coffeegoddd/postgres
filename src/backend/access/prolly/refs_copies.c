@@ -227,9 +227,9 @@
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
- * pages retired; 6: pins; 7: the trees a pin keeps.
+ * pages retired; 6: pins; 9: the trees a pin keeps.
  */
-#define REFS_FORMAT		"7"
+#define REFS_FORMAT		"9"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a

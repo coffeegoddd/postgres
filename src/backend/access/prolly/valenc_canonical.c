@@ -798,11 +798,17 @@ canonical_project(ProllyValueEncoder *enc, const ProllyValue *row,
 	int			n = 0;
 
 	canonical_fields(enc, row, fields);
+
+	/*
+	 * Columns up to the last wanted that isn't NULL, or that has a missing
+	 * value: a column a row ends before reads as its missing value, so one
+	 * that is NULL (wanted or not) must be stored as NULL.
+	 */
 	for (int j = 0; j < enc->nlive; j++)
 	{
 		int			i = enc->live_attno[j];
 
-		if (wanted[i] && fields[i].stored && !fields[i].isnull)
+		if ((wanted[i] && !fields[i].isnull) || enc->has_missing[j])
 			n = j + 1;
 	}
 	prolly_put_varint(out, n);
@@ -814,7 +820,7 @@ canonical_project(ProllyValueEncoder *enc, const ProllyValue *row,
 		{
 			int			i = enc->live_attno[j + k];
 
-			if (!(wanted[i] && fields[i].stored && !fields[i].isnull))
+			if (!wanted[i] || fields[i].isnull)
 				b |= 1 << k;
 		}
 		appendStringInfoChar(out, (char) b);
@@ -824,8 +830,12 @@ canonical_project(ProllyValueEncoder *enc, const ProllyValue *row,
 		int			i = enc->live_attno[j];
 		ProllyEncodedField *f = &fields[i];
 
-		if (!(wanted[i] && f->stored && !f->isnull))
+		if (!wanted[i] || f->isnull)
 			continue;
+		if (f->missing && f->bytes.len > VALUE_INLINE_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a row's long missing value can't be projected")));
 		prolly_put_varint(out, f->out_of_line ?
 						  VALUE_INLINE_MAX + 1 + (uint64) f->bytes.len :
 						  (uint64) f->bytes.len);

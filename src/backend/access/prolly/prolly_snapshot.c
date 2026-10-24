@@ -183,10 +183,45 @@ typedef struct MountInfo
 /*
  * The record: its format, its owner (a local role), the source ref and
  * schema, whether every table, whether indexes and whether history are
- * mounted, then a line per table ("t", a tab, its name) and per index tree ("x", then its table, index, definition's hash
- * and root, tab-separated).  Names never hold a newline: mounts refuse
- * one; a tab only ends the index's name, the last of the names.
+ * mounted, then a line per table ("t", a tab, its name) and per index tree
+ * ("x", then its root, definition's hash, table and index, tab-separated,
+ * the names in hex: a name may hold a tab).  Names never hold a newline:
+ * mounts refuse one.
  */
+static char *
+hex_name(const char *name)
+{
+	StringInfoData out;
+
+	initStringInfo(&out);
+	for (const unsigned char *c = (const unsigned char *) name; *c; c++)
+		appendStringInfo(&out, "%02x", *c);
+	return out.data;
+}
+
+static char *
+unhex_name(const char *hex)
+{
+	size_t		len = strlen(hex);
+	char	   *out = palloc(len / 2 + 1);
+
+	if (len % 2 != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid snapshot mount record")));
+	for (size_t i = 0; i < len / 2; i++)
+	{
+		unsigned int c;
+
+		if (sscanf(hex + 2 * i, "%2x", &c) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid snapshot mount record")));
+		out[i] = (char) c;
+	}
+	out[len / 2] = '\0';
+	return out;
+}
 static void
 mount_info_write(const MountInfo *mi, StringInfo out)
 {
@@ -203,8 +238,8 @@ mount_info_write(const MountInfo *mi, StringInfo out)
 		MountIndex *x = lfirst(lc);
 
 		appendStringInfo(out, "x\t%s\t%016" PRIx64 "\t%s\t%s\n",
-						 prolly_hash_hex(&x->root), x->definition, x->table,
-						 x->index);
+						 prolly_hash_hex(&x->root), x->definition,
+						 hex_name(x->table), hex_name(x->index));
 	}
 }
 
@@ -275,8 +310,8 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 								(errcode(ERRCODE_DATA_CORRUPTED),
 								 errmsg("invalid snapshot mount record")));
 					x->definition = strtou64(f[1], NULL, 16);
-					x->table = pstrdup(f[2]);
-					x->index = pstrdup(f[3]);
+					x->table = unhex_name(f[2]);
+					x->index = unhex_name(f[3]);
 					mi->built = lappend(mi->built, x);
 				}
 				else
@@ -488,7 +523,8 @@ typedef struct IndexBuild
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	MemoryContext cxt;
-	Size		used;			/* bytes of entries held */
+	MemoryContext entries;		/* the entries, and the array of them */
+	uint64		used;			/* entries made */
 	Size		budget;
 } IndexBuild;
 
@@ -529,6 +565,8 @@ index_build_begin(IndexBuild *ib, const ProllyHistoricalTable *t,
 		ib->keycols[ix->attnos[i] - 1] = true;
 	ib->covered = index_covered(t, ix);
 	ib->budget = (Size) maintenance_work_mem * 1024;
+	ib->entries = AllocSetContextCreate(ib->cxt, "prolly snapshot index entries",
+										ALLOCSET_DEFAULT_SIZES);
 }
 
 /* The entry of a data tree item (its key and tree value). */
@@ -568,15 +606,24 @@ index_entry(IndexBuild *ib, const ProllyKey *dkey, const ProllyValue *dvalue,
 	initStringInfo(&value);
 	PROLLY_CALL(ib->c.keying, make_value, ib->order.k, &p, count, &value);
 	ExecClearTuple(ib->slot);
-	e->key.data = (const uint8 *) key.data;
-	e->key.len = key.len;
-	e->value.data = (const uint8 *) value.data;
-	e->value.len = value.len;
+	{
+		/* (the entry in one allocation of its size) */
+		uint8	   *bytes = MemoryContextAlloc(ib->entries, key.len + value.len);
+
+		memcpy(bytes, key.data, key.len);
+		memcpy(bytes + key.len, value.data, value.len);
+		e->key.data = bytes;
+		e->key.len = key.len;
+		e->value.data = bytes + key.len;
+		e->value.len = value.len;
+	}
 	e->is_delete = false;
 	pfree(idx.data);
+	pfree(key.data);
 	pfree(proj.data);
-	ib->used += key.len + value.len + sizeof(ProllyEdit);
-	if (ib->used > ib->budget)
+	pfree(value.data);
+	if ((++ib->used & 63) == 0 &&
+		MemoryContextMemAllocated(ib->entries, true) > ib->budget)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("index \"%s\" is too large to build within maintenance_work_mem",
@@ -612,7 +659,7 @@ add_edit(DiffEdits *d, const ProllyEdit *e)
 	{
 		d->max = Max(64, d->max * 2);
 		d->edits = d->edits ? repalloc_array(d->edits, ProllyEdit, d->max) :
-			palloc_array(ProllyEdit, d->max);
+			MemoryContextAlloc(d->ib->entries, sizeof(ProllyEdit) * d->max);
 	}
 	d->edits[d->n++] = *e;
 }
@@ -718,19 +765,43 @@ build_index(const ProllyHistoricalTable *t, const ProllyHistoricalIndex *ix,
 }
 
 /*
- * Whether a version's index trees built over old's rows can be brought to
- * new's by their differences: the rows keyed and laid out alike.
+ * Whether index ix's tree built over old's rows (by oix, its definition
+ * then) can be brought to new's by the rows that differ: the rows keyed
+ * and laid out alike (every column's name, type, typmod and collation),
+ * and the index's entries ordered and made alike (its columns, operator
+ * families, collations and options, and its INCLUDE columns).  The
+ * definition's text alone doesn't tell: it leaves out a collation that is
+ * its column's, and names columns, not where the rows hold them.
  */
 static bool
-same_rows(const ProllyHistoricalTable *old, const ProllyHistoricalTable *new)
+same_rows(const ProllyHistoricalTable *old, const ProllyHistoricalTable *new,
+		  const ProllyHistoricalIndex *oix, const ProllyHistoricalIndex *ix)
 {
+	if (oix == NULL || oix->unusable || oix->nkeys != ix->nkeys ||
+		oix->ninclude != ix->ninclude || oix->unique != ix->unique)
+		return false;
+	for (int i = 0; i < ix->nkeys; i++)
+		if (oix->attnos[i] != ix->attnos[i] ||
+			oix->opfamilies[i] != ix->opfamilies[i] ||
+			oix->collations[i] != ix->collations[i] ||
+			oix->options[i] != ix->options[i])
+			return false;
+	for (int i = 0; i < ix->ninclude; i++)
+		if (oix->include[i] != ix->include[i])
+			return false;
 	if (old->keyed != new->keyed || old->nkeys != new->nkeys ||
 		old->desc->natts != new->desc->natts)
 		return false;
 	for (int i = 0; i < old->desc->natts; i++)
-		if (TupleDescAttr(old->desc, i)->atttypid != TupleDescAttr(new->desc, i)->atttypid ||
-			TupleDescAttr(old->desc, i)->atttypmod != TupleDescAttr(new->desc, i)->atttypmod)
+	{
+		Form_pg_attribute a = TupleDescAttr(old->desc, i);
+		Form_pg_attribute b = TupleDescAttr(new->desc, i);
+
+		if (a->atttypid != b->atttypid || a->atttypmod != b->atttypmod ||
+			a->attcollation != b->attcollation ||
+			strcmp(NameStr(a->attname), NameStr(b->attname)) != 0)
 			return false;
+	}
 	for (int i = 0; i < old->nkeys; i++)
 		if (old->key_attnos[i] != new->key_attnos[i] ||
 			old->opfamilies[i] != new->opfamilies[i] ||
@@ -861,7 +932,7 @@ make_indexes(MountInfo *mi, const char *table, const char *name,
 		bool		incremental = false;
 		MemoryContext prev;
 
-		if (ix->unusable || strchr(ix->name, '\n') || strchr(ix->name, '\t'))
+		if (ix->unusable || strchr(ix->name, '\n'))
 			continue;
 		def = definition_hash(ix->definition);
 		before = built_before(old, table, ix->name, def);
@@ -869,9 +940,16 @@ make_indexes(MountInfo *mi, const char *table, const char *name,
 		{
 			bool		found;
 
-			incremental = PROLLY_CALL(canonicalizer(), table_metadata, oldroot,
-									  name, &ot, &found) == NULL &&
-				found && same_rows(&ot, t);
+			if (PROLLY_CALL(canonicalizer(), table_metadata, oldroot, name,
+							&ot, &found) == NULL && found)
+			{
+				ListCell   *ol;
+
+				foreach(ol, ot.indexes)
+					if (strcmp(((ProllyHistoricalIndex *) lfirst(ol))->name,
+							   ix->name) == 0)
+						incremental = same_rows(&ot, t, lfirst(ol), ix);
+			}
 		}
 		root = build_index(t, ix, name, incremental ? &ot.data : NULL,
 						   incremental ? &before->root : NULL);
