@@ -32,6 +32,7 @@ func run() error {
 	reduce := flag.Int("reduce", 0, "maximum replay attempts to reduce a mismatch")
 	timeout := flag.Duration("timeout", 30*time.Second, "timeout per statement")
 	selfTest := flag.Bool("self-test", false, "prove the comparator rejects a known mismatch")
+	postgis := flag.Bool("postgis", false, "add a geometry table and spatial families (needs PostGIS installed)")
 	flag.Parse()
 	if *dsn == "" || *out == "" || *seeds < 1 || *steps < 1 || *timeout <= 0 || *reduce < 0 {
 		return fmt.Errorf("requires -dsn, -out, positive -seeds/-steps/-timeout and nonnegative -reduce")
@@ -79,7 +80,7 @@ func run() error {
 		programs = append(programs, p)
 	} else {
 		for i := 0; i < *seeds; i++ {
-			programs = append(programs, enginediff.Generate(*seed+int64(i), *steps))
+			programs = append(programs, enginediff.GenerateWith(*seed+int64(i), *steps, enginediff.Options{PostGIS: *postgis}))
 		}
 	}
 	completed := 0

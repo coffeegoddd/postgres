@@ -30,9 +30,28 @@ type mutant struct {
 	apply func(e vcfuzz.Engine, op vcfuzz.Op) (vcfuzz.Outcome, error)
 	// rootHash, if set, replaces the engine's root hashes.
 	rootHash func(commit string) string
+	// windows, if set, changes what the engine's window queries return.
+	windows func([][]int) [][]int
+	// beforeWindows, if set, runs before the engine's window queries.
+	beforeWindows func(e vcfuzz.Engine) error
 }
 
 func (m *mutant) Apply(op vcfuzz.Op) (vcfuzz.Outcome, error) { return m.apply(m.Engine, op) }
+
+func (m *mutant) Windows(s int) ([][]int, bool, error) {
+	if m.beforeWindows != nil {
+		if err := m.beforeWindows(m.Engine); err != nil {
+			return nil, false, err
+		}
+	}
+	w, indexed, err := m.Engine.(vcfuzz.Spatial).Windows(s)
+	if m.windows != nil && err == nil {
+		w = m.windows(w)
+	}
+	return w, indexed, err
+}
+
+func (m *mutant) Misplaced(s int) ([]int, error) { return m.Engine.(vcfuzz.Spatial).Misplaced(s) }
 
 func (m *mutant) Heads() (map[string]string, error) {
 	return m.Engine.(vcfuzz.Identities).Heads()
@@ -47,9 +66,11 @@ func (m *mutant) RootHash(commit string) (string, error) {
 
 // selfTest proves the checks pass the history on the engine and reject
 // engines wrong in known ways: resolving conflicts with the other side,
-// committing nothing, and hashing commits of the same rows differently.
-func selfTest(open vcfuzz.Opener) error {
+// committing nothing, and hashing commits of the same rows differently;
+// with PostGIS, also losing a row from a window query.
+func selfTest(open vcfuzz.Opener, postgis bool) error {
 	h := selfTestHistory()
+	h.PostGIS = postgis
 	r, err := vcfuzz.Run(h, open)
 	if err != nil {
 		return err
@@ -77,6 +98,34 @@ func selfTest(open vcfuzz.Opener) error {
 			apply:    func(e vcfuzz.Engine, op vcfuzz.Op) (vcfuzz.Outcome, error) { return e.Apply(op) },
 			rootHash: func(commit string) string { return commit },
 		}},
+	}
+	if postgis {
+		// (the history's row 1 keeps b 1, a half circle that the third
+		// window holds: dropped, with each window's first row)
+		type named = struct {
+			name, kind string
+			m          mutant
+		}
+		mutants = append(mutants, named{"reads windows without the GiST index", "GiST index", mutant{
+			apply: func(e vcfuzz.Engine, op vcfuzz.Op) (vcfuzz.Outcome, error) { return e.Apply(op) },
+			beforeWindows: func(e vcfuzz.Engine) error {
+				return e.(*vcfuzz.Postgres).Exec(0, "DROP INDEX IF EXISTS t_g")
+			},
+		}})
+		mutants = append(mutants, struct {
+			name, kind string
+			m          mutant
+		}{"loses a row from a window query", "window", mutant{
+			apply: func(e vcfuzz.Engine, op vcfuzz.Op) (vcfuzz.Outcome, error) { return e.Apply(op) },
+			windows: func(w [][]int) [][]int {
+				for i := range w {
+					if len(w[i]) > 0 {
+						w[i] = w[i][1:]
+					}
+				}
+				return w
+			},
+		}})
 	}
 	for _, mu := range mutants {
 		m := mu.m
