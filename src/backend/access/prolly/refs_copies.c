@@ -43,7 +43,8 @@
  *				   merge recorded them: each table's OID, then its name's
  *				   length (a varint) and bytes; and the tables in schema
  *				   conflicts, kept as the branch has them, each as OID 0
- *				   and its name so
+ *				   and its names so: ours', base's and theirs', NUL
+ *				   between them
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
@@ -68,6 +69,11 @@
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
  *				   no tag object)
+ *	'P' name	-> a pin: a commit kept for a reader outside the refs (a
+ *				   snapshot mount), named by it (hash length, hash), the
+ *				   count (a varint) and roots (hash length, hash each) of
+ *				   the trees it keeps beside it, then the reader's own
+ *				   record of it
  *	'E' name	-> the branch's rebase in progress: the branch rebased (a
  *				   varint length, then the bytes), its head then and the
  *				   commit replayed onto (hash length, hash each), a flags
@@ -114,7 +120,7 @@
  * The chunks a commit's items and the refs' entries name (its dependencies,
  * parents and root; a tag's commit; a branch's head, baseline and working
  * set, a merge's commits, a remote branch's head, a tag's object and
- * commit, a kept commit and its baseline) are declared to the tree as the
+ * commit, a kept commit and its baseline, a pin's commit) are declared to the tree as the
  * references to chunks its leaves hold (commit_chunk_refs(),
  * refs_chunk_refs()), so
  * a collection follows them without reading values.
@@ -220,15 +226,17 @@
 #define TAG_TAG			'T'	/* a tag, by name */
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
+#define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
  * pages retired; 8: a merge's tables in schema conflicts, in its merge
- * names entry; 9: kept pages' keeping transaction.
+ * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
+ * trees a pin keeps; 12: a schema-conflicted table's names on each side.
  */
-#define REFS_FORMAT		"9"
+#define REFS_FORMAT		"12"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -431,6 +439,15 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 		case TAG_BASELINE:
 		case TAG_TAG:
 			(void) declare_hashes(p, end, 2, refs);
+			break;
+		case TAG_PIN:
+			{
+				uint64		n;
+
+				p = declare_hashes(p, end, 1, refs);
+				n = prolly_get_varint(&p, end);
+				(void) declare_hashes(p, end, (int) Min(n, INT_MAX), refs);
+			}
 			break;
 		case TAG_MERGE:
 			{
@@ -5534,9 +5551,20 @@ merge_names_put(const char *branch, const ProllyMergeState *state)
 		}
 	for (int i = 0; state && i < state->nschema; i++)
 	{
+		const char *base = state->schema_base_tables ?
+			state->schema_base_tables[i] : state->schema_tables[i];
+		const char *theirs = state->schema_their_tables ?
+			state->schema_their_tables[i] : state->schema_tables[i];
+
+		/* (ours' name, then base's and theirs', a NUL before each) */
 		put_be32(&v, InvalidOid);
-		prolly_put_varint(&v, strlen(state->schema_tables[i]));
+		prolly_put_varint(&v, strlen(state->schema_tables[i]) + 1 +
+						  strlen(base) + 1 + strlen(theirs));
 		appendStringInfoString(&v, state->schema_tables[i]);
+		appendStringInfoChar(&v, '\0');
+		appendStringInfoString(&v, base);
+		appendStringInfoChar(&v, '\0');
+		appendStringInfoString(&v, theirs);
 		any = true;
 	}
 	{
@@ -5564,6 +5592,8 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 	state->table_names = NULL;
 	state->nschema = 0;
 	state->schema_tables = NULL;
+	state->schema_base_tables = NULL;
+	state->schema_their_tables = NULL;
 	if (refs_get(key.data, key.len, &v))
 	{
 		const char *p = v.data;
@@ -5572,6 +5602,8 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 
 		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
 		state->schema_tables = palloc(sizeof(char *) * cap);
+		state->schema_base_tables = palloc(sizeof(char *) * cap);
+		state->schema_their_tables = palloc(sizeof(char *) * cap);
 		while (end - p >= 4)
 		{
 			Oid			oid = get_be32(p);
@@ -5585,13 +5617,36 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 						 errmsg("prolly refs hold an invalid merge state")));
 			if (oid == InvalidOid)
 			{
+				char	   *names = palloc(len + 1);
+				char	   *base;
+				char	   *theirs;
+
+				memcpy(names, p, len);
+				names[len] = '\0';
+				base = names + strlen(names) + 1;
+
+				if (base > names + len)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("prolly refs hold an invalid merge state")));
+				theirs = base + strlen(base) + 1;
+				if (theirs > names + len)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("prolly refs hold an invalid merge state")));
 				if (state->nschema == cap)
 				{
 					cap *= 2;
 					state->schema_tables = repalloc(state->schema_tables,
 													sizeof(char *) * cap);
+					state->schema_base_tables = repalloc(state->schema_base_tables,
+														 sizeof(char *) * cap);
+					state->schema_their_tables = repalloc(state->schema_their_tables,
+														  sizeof(char *) * cap);
 				}
-				state->schema_tables[state->nschema++] = pnstrdup(p, len);
+				state->schema_base_tables[state->nschema] = base;
+				state->schema_their_tables[state->nschema] = theirs;
+				state->schema_tables[state->nschema++] = names;
 			}
 			for (int i = 0; i < state->ntables; i++)
 				if (state->tables[i] == oid)
@@ -6062,10 +6117,13 @@ violations_append(const char *branch, ProllyViolation *const *violations,
 	edits[0].value.len = next.len;
 	for (int i = 0; i < n; i++)
 	{
-		initStringInfo(&keys[i]);
+		/* (sized to them: a batch holds as many as its rows' bytes allow) */
+		initStringInfoExt(&keys[i], prefix.len + 8 + 1);
 		appendBinaryStringInfo(&keys[i], prefix.data, prefix.len);
 		put_be64(&keys[i], place + i);
-		initStringInfo(&values[i]);
+		initStringInfoExt(&values[i], 4 + 3 * 4 + strlen(violations[i]->type) +
+						  strlen(violations[i]->row) +
+						  strlen(violations[i]->info) + 1);
 		put_violation(&values[i], violations[i]);
 		edits[i + 1].key.data = (const uint8 *) keys[i].data;
 		edits[i + 1].key.len = keys[i].len;
@@ -7227,6 +7285,130 @@ copies_tags(ProllyTagVisit visit, void *arg)
 }
 
 /* ------------------------------------------------------------------------
+ * Pins: TAG_PIN and a pin's name -> the commit it keeps, then its holder's
+ * record (the rest of the value, its own bytes).
+ * ------------------------------------------------------------------------
+ */
+
+static void
+pin_key(const char *name, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_PIN);
+	appendStringInfoString(key, name);
+}
+
+/*
+ * Pin commit under name with info beside it (commit NULL: unpin it).  The
+ * refs are held first, as for any change of them that isn't a branch's.
+ */
+static void
+copies_pin_set(const char *name, const ProllyHash *commit,
+			   const ProllyHash *keep, int nkeep, const ProllyValue *info)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	lock_refs();
+	if (commit)
+	{
+		ProllyCommitInfo ci;
+
+		if (!copies_commit_get(commit, &ci))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("commit %s does not exist", prolly_hash_hex(commit))));
+	}
+	initStringInfo(&key);
+	initStringInfo(&v);
+	pin_key(name, &key);
+	if (commit)
+	{
+		put_hash(&v, commit);
+		prolly_put_varint(&v, nkeep);
+		for (int i = 0; i < nkeep; i++)
+		{
+			if (!PROLLY_CALL(env.chunk_store, has, env.chunks, &keep[i]))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("tree %s does not exist", prolly_hash_hex(&keep[i]))));
+			put_hash(&v, &keep[i]);
+		}
+		if (info)
+			appendBinaryStringInfo(&v, (const char *) info->data, info->len);
+	}
+	refs_put(key.data, key.len, commit ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static bool
+copies_pin_get(const char *name, ProllyHash *commit, StringInfo info)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	pin_key(name, &key);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		const char *end = v.data + v.len;
+		const char *p = get_hash(v.data, end, commit);
+		uint64		n = prolly_get_varint(&p, end);
+		ProllyHash	h;
+
+		for (uint64 i = 0; i < n && p < end; i++)
+			p = get_hash(p, end, &h);
+		if (info)
+			appendBinaryStringInfo(info, p, v.data + v.len - p);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+typedef struct PinVisit
+{
+	ProllyPinVisit visit;
+	void	   *arg;
+} PinVisit;
+
+static void
+visit_pin_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	PinVisit   *pv = arg;
+	char	   *name = pnstrdup((const char *) k->data + 1, k->len - 1);
+	const char *end = (const char *) v->data + v->len;
+	ProllyHash	commit;
+	const char *p = get_hash((const char *) v->data, end, &commit);
+	uint64		n = prolly_get_varint(&p, end);
+	ProllyHash	h;
+	ProllyValue info;
+
+	for (uint64 i = 0; i < n && p < end; i++)
+		p = get_hash(p, end, &h);
+	info.data = (const uint8 *) p;
+	info.len = (uint32) (end - p);
+
+	pv->visit(name, &commit, &info, pv->arg);
+	pfree(name);
+}
+
+static void
+copies_pins(ProllyPinVisit visit, void *arg)
+{
+	PinVisit	pv = {visit, arg};
+	char		tag = TAG_PIN;
+
+	refs_init();
+	visit_prefix(&tag, 1, visit_pin_entry, &pv);
+}
+
+/* ------------------------------------------------------------------------
  * Rebases: TAG_REBASE and the branch rebasing on -> its rebase state.
  * ------------------------------------------------------------------------
  */
@@ -7554,6 +7736,9 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_lookup = copies_tag_lookup,
 	.tag_set = copies_tag_set,
 	.tags = copies_tags,
+	.pin_set = copies_pin_set,
+	.pin_get = copies_pin_get,
+	.pins = copies_pins,
 	.rebase_state = copies_rebase_state,
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,

@@ -16,9 +16,11 @@
  * worker takes a working-set checkpoint of each such branch (the refs'
  * checkpoint_unless_moved(), the branch's fold its baseline from then on),
  * one branch to a transaction so the refs are held no longer than its
- * fold, and exits once no branch has moved for two passes.  A branch the
- * refs are held for, or that moved during its fold, is folded again next
- * pass.  Writers pay nothing: what a fold costs is the worker's, off their
+ * fold, and exits once no branch has moved for two passes, or after
+ * FOLDER_MAX_PASSES passes (the launcher takes the databases written in
+ * turn, so one written without pause doesn't keep a slot from others).  A branch the
+ * refs are held for, that moved during its fold, or whose store's root
+ * isn't free, is folded again after a backoff (FOLDER_MAX_BACKOFF).  Writers pay nothing: what a fold costs is the worker's, off their
  * transactions.  A worker's error is reported, and the branch passed over
  * until it is written again.  Off, the launcher sleeps until the setting
  * changes.
@@ -79,6 +81,22 @@ int			prolly_fold_worker_max_delay = 1000;
 /* The most databases, and branches of one, a pass looks at. */
 #define FOLDER_MAX_DATABASES	64
 #define FOLDER_MAX_BRANCHES		256
+
+/*
+ * A worker exits after this many passes, the launcher starting one again
+ * if its database is still written, after the others waiting for a slot
+ * (it takes them in turn): a busy database never keeps a slot for good.
+ */
+#define FOLDER_MAX_PASSES		64
+
+/*
+ * A branch whose fold was given up (the refs held, the branch moved
+ * meanwhile, or the store's root not free) is tried again after 2^k - 1
+ * passes for its k-th time in a row, k at most this: so a transaction
+ * holding the refs long is asked of less and less, every 63 passes at the
+ * most.
+ */
+#define FOLDER_MAX_BACKOFF		6
 
 /* The launcher, once a server, from the end of recovery. */
 void
@@ -164,6 +182,7 @@ ProllyFolderLauncherMain(Datum main_arg)
 {
 	Running		running[FOLDER_MAX_DATABASES];
 	int			nrunning = 0;
+	int			turn = 0;		/* the moved database to start from */
 
 	ProllyDatabaseComponents dc;
 
@@ -206,9 +225,12 @@ ProllyFolderLauncherMain(Datum main_arg)
 		if (!prolly_fold_worker || !PROLLY_HAS(dc.refs, moved_databases))
 			continue;
 
+		/* (in turn, a pass starting from the next: none waits for good) */
 		n = dc.refs->moved_databases(databases, lengthof(databases));
-		for (int i = 0; i < n && nrunning < prolly_fold_worker_max_workers; i++)
+		turn = n > 0 ? (turn + 1) % n : 0;
+		for (int k = 0; k < n && nrunning < prolly_fold_worker_max_workers; k++)
 		{
+			int			i = (turn + k) % n;
 			bool		busy = false;
 			BackgroundWorkerHandle *handle;
 
@@ -296,6 +318,57 @@ fold_due(const ProllyMovedBranch *b, TimestampTz now)
 								   prolly_fold_worker_naptime);
 }
 
+/*
+ * The branches whose folds were given up, in a row: how many times, and how
+ * many passes are left before the next try.
+ */
+typedef struct Backoff
+{
+	Oid			branch;
+	int			tries;
+	int			wait;
+} Backoff;
+
+static Backoff backoffs[FOLDER_MAX_BRANCHES];
+static int	nbackoffs = 0;
+
+static Backoff *
+backoff_of(Oid branch)
+{
+	for (int i = 0; i < nbackoffs; i++)
+		if (backoffs[i].branch == branch)
+			return &backoffs[i];
+	return NULL;
+}
+
+/* A fold of branch given up again: waited for 2^tries - 1 passes. */
+static void
+back_off(Oid branch)
+{
+	Backoff    *b = backoff_of(branch);
+
+	if (b == NULL)
+	{
+		if (nbackoffs == lengthof(backoffs))
+			return;				/* (tried every pass, as before) */
+		b = &backoffs[nbackoffs++];
+		b->branch = branch;
+		b->tries = 0;
+	}
+	b->tries = Min(b->tries + 1, FOLDER_MAX_BACKOFF);
+	b->wait = (1 << b->tries) - 1;
+}
+
+/* branch folded, or passed over: no longer backed off. */
+static void
+backed_off_done(Oid branch)
+{
+	Backoff    *b = backoff_of(branch);
+
+	if (b != NULL)
+		*b = backoffs[--nbackoffs];
+}
+
 /* What a pass did. */
 typedef enum PassResult
 {
@@ -327,7 +400,15 @@ fold_pass(const ProllyRefsRoutine *refs)
 	now = GetCurrentTimestamp();
 	for (int i = 0; i < m.n; i++)
 	{
-		if (fold_due(&moved[i], now))
+		Backoff    *b = backoff_of(moved[i].branch);
+
+		if (b != NULL && b->wait > 0)
+		{
+			/* (given up last time: tried again once its wait is over) */
+			b->wait--;
+			pending = true;
+		}
+		else if (fold_due(&moved[i], now))
 			moved[ndue++] = moved[i];
 		else
 		{
@@ -360,6 +441,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 		if (names[i] == NULL && moved[i].branch != MyBranch)
 		{
 			refs->saw_branch(moved[i].branch, moved[i].generation);
+			backed_off_done(moved[i].branch);
 			continue;
 		}
 		StartTransactionCommand();
@@ -381,6 +463,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 				 * again next pass; one not folded stays to be folded)
 				 */
 				refs->saw_branch(moved[i].branch, moved[i].generation);
+				backed_off_done(moved[i].branch);
 				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_FOLDS, 1);
 				elog(DEBUG1, "fold worker folded branch %u at generation %llu",
 					 moved[i].branch, (unsigned long long) moved[i].generation);
@@ -388,12 +471,17 @@ fold_pass(const ProllyRefsRoutine *refs)
 			else
 			{
 				/*
-				 * (moved meanwhile, or the refs held by another: what this
-				 * fold consumed given back, the branch not seen, so it's
-				 * folded again next pass)
+				 * (moved meanwhile, the refs held by another, or the store's
+				 * root not free: what this fold consumed given back, the
+				 * branch not seen, so it's folded again once its backoff is
+				 * over)
 				 */
 				AbortCurrentTransaction();
 				pending = true;
+				back_off(moved[i].branch);
+				/* (counted outside a transaction: flushed with the pass's) */
+				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
+				AtEOXact_PgStat_Prolly();
 				elog(DEBUG1, "fold worker left branch %u for its next pass: "
 					 "the refs held, or the branch moved", moved[i].branch);
 			}
@@ -411,6 +499,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 			 * met again every pass)
 			 */
 			refs->saw_branch(moved[i].branch, moved[i].generation);
+			backed_off_done(moved[i].branch);
 		}
 		PG_END_TRY();
 		any = any || folded;
@@ -426,6 +515,7 @@ ProllyFolderWorkerMain(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
 	int			idle = 0;
+	int			passes = 0;
 	ProllyDatabaseComponents dc;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -439,10 +529,11 @@ ProllyFolderWorkerMain(Datum main_arg)
 		proc_exit(0);
 
 	/*
-	 * (until two passes in a row find no branch moved: one left pending, as
-	 * for refs held, keeps it, asking again each naptime)
+	 * (until two passes in a row find no branch moved, one left pending, as
+	 * for refs held, keeping it, asking again each naptime; or for at most
+	 * FOLDER_MAX_PASSES passes)
 	 */
-	while (idle < 2)
+	while (idle < 2 && passes++ < FOLDER_MAX_PASSES)
 	{
 		PassResult	r;
 

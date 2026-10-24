@@ -1233,5 +1233,76 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- Theirs renames a table and a column of it; ours changes another table:
+-- the merge renames the branch's table and its column, the column first,
+-- while the table still has the name its rename names it by.
+CREATE TABLE app.rn (pk int PRIMARY KEY, v int);
+CREATE TABLE app.rn_other (pk int PRIMARY KEY);
+INSERT INTO app.rn VALUES (1, 10);
+SELECT length(dolt_commit('-Am', 'rn base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('rn_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO app.rn_other VALUES (1);
+SELECT length(dolt_commit('-am', 'rn ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('rn_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'rn_theirs'"}
+(1 row)
+
+ALTER TABLE app.rn RENAME TO rn2;
+ALTER TABLE app.rn2 RENAME COLUMN v TO w;
+INSERT INTO app.rn2 VALUES (2, 20);
+SELECT length(dolt_commit('-am', 'rn theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('rn_theirs'))[3:4] AS merged;
+         merged         
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT * FROM app.rn2 ORDER BY pk;
+ pk | w  
+----+----
+  1 | 10
+  2 | 20
+(2 rows)
+
+SELECT to_regclass('app.rn') IS NULL AS no_rn;
+ no_rn 
+-------
+ t
+(1 row)
+
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_identity_renames;

@@ -78,12 +78,18 @@ $s->quit;
 # delete: a wait would deadlock), and folds once they're free.
 my $read = q{SELECT pg_stat_force_next_flush();
 	SELECT value FROM pg_stat_prolly WHERE name = 'fold_rows_read'};
+my $retries = q{SELECT value FROM pg_stat_prolly WHERE name = 'fold_worker_retries'};
 $s = $node->background_psql('postgres');
 $s->query_safe(q{BEGIN});
 $s->query_safe(q{SELECT dolt_reset('--soft', 'HEAD')});
 my $reads_before = sql($read);
+my $retries_before = sql($retries);
 sql(q{UPDATE s.t SET v = 'held' WHERE id <= 20});
 usleep(1_000_000);
+my $tried = sql($retries) - $retries_before;
+cmp_ok($tried, '>=', 2, 'a fold given up counts a retry');
+# (backed off: tried after 1, 3, 7, 15... passes, not each of the ~20)
+cmp_ok($tried, '<=', 8, 'tried again less and less often');
 is( sql(q{SELECT count(*) FROM pg_stat_activity
 		  WHERE backend_type = 'prolly fold worker' AND wait_event_type = 'Lock'}),
 	'0', 'the worker waits for no lock while the refs are held');

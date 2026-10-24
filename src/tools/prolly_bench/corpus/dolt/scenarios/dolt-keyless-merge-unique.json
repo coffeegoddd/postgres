@@ -158,6 +158,11 @@
         "rows": [
           [
             "unique index",
+            "1",
+            "1"
+          ],
+          [
+            "unique index",
             "2",
             "1"
           ]

@@ -7209,7 +7209,9 @@ struct ProllyChunkGc
 	bool		settle;			/* the files written are settled */
 	Manifest	m;				/* as the seal left it */
 	uint64		segment;		/* where appends go from the seal */
-	ProllyHash	sealed_root;	/* the root the sealed segments end at */
+	ProllyHash	sealed_root;	/* the root the collected segments end at,
+								 * the base of the moves kept (len 0: not
+								 * known) */
 	int			nfiles;
 	GcFile	   *files;
 	uint64		nslots;
@@ -7744,20 +7746,21 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 }
 
 /*
- * The root the sealed segments' moves end at: the last ROOT record they
- * hold, the newest segment's first, or else the root the seal saw (the
- * manifest's).  Asked once every move in flight at the seal has ended, its
- * ROOT (or its PAD, aborted) written in a sealed segment: one in flight is
- * newer than the root the seal saw.
+ * The root the moves of the manifest's segments before upto end at: the
+ * last ROOT record they hold, the newest segment's first, or else
+ * fallback (none of them moved the root).  Asked once every move in flight
+ * at the seal has ended, its ROOT (or its PAD, aborted) written in a
+ * sealed segment: one in flight is newer than the root the seal saw.
  */
 static void
-sealed_root(ProllyChunkGc *gc, ProllyHash *root)
+segments_root(ProllyChunkGc *gc, int upto, const ProllyHash *fallback,
+			  ProllyHash *root)
 {
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
-	*root = gc->m.root;
-	for (int i = gc->m.nsegments - 2; i >= 0; i--)
+	*root = *fallback;
+	for (int i = upto - 1; i >= 0; i--)
 	{
 		Segment		g = {0};
 		uint64		offset = JOURNAL_HEADER_SIZE;
@@ -8044,10 +8047,36 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		list_free(prepared);
 
 		/*
-		 * The root a reflog's moves begin at after the swap, kept whole: a
-		 * root as of the seal, or one a move in flight then moved to.
+		 * The root a reflog's moves begin at after the swap, kept whole.
+		 * With every sealed segment collected, the root they end at (as of
+		 * the seal, or one a move in flight then moved to).  With the
+		 * newest sealed ones kept for a logical slot, their moves are kept
+		 * too, so the root the collected ones before them end at (else the
+		 * old manifest's base: no move since it).  Kept sealed segments
+		 * that aren't the newest (one sealed when the WAL position wasn't
+		 * known) leave it unknown.
 		 */
-		sealed_root(gc, &gc->sealed_root);
+		{
+			int			upto = gc->m.nsegments - 1;
+			ProllyHash	fallback = gc->m.root;
+
+			if (gc->nretained > 0)
+			{
+				int			first = upto - gc->nretained;
+
+				for (int k = 0; k < gc->nretained && upto >= 0; k++)
+					if (first < 0 || gc->m.segments[first + k] != gc->retained[k])
+						upto = -1;
+				if (upto >= 0)
+				{
+					upto = first;
+					fallback = gc->m.base;
+				}
+			}
+			memset(&gc->sealed_root, 0, sizeof(gc->sealed_root));
+			if (upto >= 0)
+				segments_root(gc, upto, &fallback, &gc->sealed_root);
+		}
 		if (gc->sealed_root.len > 0)
 			visit(&gc->sealed_root, NULL, 0, arg);
 	}
@@ -8514,11 +8543,10 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 
 	/*
 	 * What a reflog reads from: the moves the segments kept record, after
-	 * the root the sealed ones end at, which the collection kept whole.
-	 * Not known with sealed segments kept: their moves are older than it.
+	 * the root the collected ones end at, which the collection kept whole
+	 * (gc_new()'s; none if it couldn't tell).
 	 */
-	if (gc->nretained == 0)
-		nm.base = gc->sealed_root;
+	nm.base = gc->sealed_root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	jindex_append_unlock(s->ix);
 	gc->window = false;

@@ -192,6 +192,11 @@
             "unique index",
             "2",
             "3"
+          ],
+          [
+            "unique index",
+            "3",
+            "3"
           ]
         ],
         "order": "bag"

@@ -54,11 +54,21 @@ typedef struct ProllyKeyEncoderRoutine
 							const ProllyKey *b);
 
 	void		(*end) (ProllyKeyEncoder *enc);
+
+	/*
+	 * Optional: append a bound for seeking among keys whose first n columns
+	 * are values (NULL where isnull): compare() orders it at or before
+	 * every such key (high: at or after), and strictly before (after) every
+	 * key that begins otherwise and follows (precedes) them.
+	 */
+	void		(*encode_bound) (ProllyKeyEncoder *enc, const Datum *values,
+								 const bool *isnull, int n, bool high,
+								 StringInfo out);
 } ProllyKeyEncoderRoutine;
 
 #define PROLLY_KEYENC_CALLBACK_NAMES \
-	"supports", "begin", "encode", "compare", "end"
+	"supports", "begin", "encode", "compare", "end", "encode_bound"
 #define PROLLY_KEYENC_FIRST_CALLBACK supports
-#define PROLLY_KEYENC_LAST_CALLBACK end
+#define PROLLY_KEYENC_LAST_CALLBACK encode_bound
 
 #endif							/* PROLLY_KEYENC_H */

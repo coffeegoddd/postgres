@@ -42,7 +42,7 @@ SELECT * FROM prolly_page_sweep();
 -- the relation changes: each page changed is copied, the snapshot keeps it
 UPDATE big SET b = 'changed' WHERE a % 100 = 0;
 DELETE FROM big WHERE a > 25000;
-VACUUM big;
+-- (no VACUUM: it would copy every page the snapshot alone shares, to set it all-visible)
 SELECT test_bmap_rows_digest(:big) <> :'big_rows' AS big_changed;
 -- a relation made of the snapshot has the pages as they were
 SELECT pg_stat_force_next_flush();
