@@ -94,6 +94,7 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_class.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
@@ -12633,14 +12634,150 @@ merge_held(const char *branch, const char *message, int flags,
 	return 0;
 }
 
+/* A relation of the session's branch, as named before a merge. */
+typedef struct NamedRelation
+{
+	char		name[2 * NAMEDATALEN + 2];	/* schema, a dot, relation */
+	Oid			relid;
+} NamedRelation;
+
+/* the hash key of relation rel (pg_class row): its schema's name and its */
+static void
+relation_key(Form_pg_class rel, char *key)
+{
+	char	   *nsp = get_namespace_name(rel->relnamespace);
+
+	memset(key, 0, 2 * NAMEDATALEN + 2);
+	snprintf(key, 2 * NAMEDATALEN + 2, "%s.%s", nsp ? nsp : "",
+			 NameStr(rel->relname));
+}
+
+/* Does a relation of this kind have privileges of its own? */
+static bool
+has_privileges(char relkind)
+{
+	return relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE ||
+		relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW ||
+		relkind == RELKIND_SEQUENCE || relkind == RELKIND_FOREIGN_TABLE;
+}
+
+/* The session branch's relations with privileges of their own: a scan. */
+static SysScanDesc
+branch_relations_begin(Relation pg_class)
+{
+	return catalog_branch_beginscan(pg_class, MyBranch);
+}
+
+static Form_pg_class
+branch_relations_next(SysScanDesc scan)
+{
+	HeapTuple	tup;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class rel = (Form_pg_class) GETSTRUCT(tup);
+
+		if (has_privileges(rel->relkind))
+			return rel;
+	}
+	return NULL;
+}
+
+/*
+ * The session branch's relations with privileges (its versioned schemas'),
+ * before a merge: by name (returned) and by id (*relids).
+ */
+static HTAB *
+relations_before(HTAB **relids)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	SysScanDesc scan = branch_relations_begin(pg_class);
+	Form_pg_class rel;
+	HASHCTL		ctl;
+	HTAB	   *names;
+
+	ctl.keysize = 2 * NAMEDATALEN + 2;
+	ctl.entrysize = sizeof(NamedRelation);
+	ctl.hcxt = CurrentMemoryContext;
+	names = hash_create("merge's relations by name", 64, &ctl,
+						HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	*relids = hash_create("merge's relations by id", 64, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	while ((rel = branch_relations_next(scan)) != NULL)
+	{
+		char		key[2 * NAMEDATALEN + 2];
+		NamedRelation *n;
+
+		relation_key(rel, key);
+		n = hash_search(names, key, HASH_ENTER, NULL);
+		n->relid = rel->oid;
+		(void) hash_search(*relids, &rel->oid, HASH_ENTER, NULL);
+	}
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+	return names;
+}
+
+/*
+ * The session branch's relations with privileges made since
+ * relations_before() found names and relids: those of a name and an id it
+ * didn't find (not one renamed, nor one made again in another's place).
+ */
+static List *
+relations_made(HTAB *names, HTAB *relids)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	SysScanDesc scan = branch_relations_begin(pg_class);
+	Form_pg_class rel;
+	List	   *made = NIL;
+
+	while ((rel = branch_relations_next(scan)) != NULL)
+	{
+		char		key[2 * NAMEDATALEN + 2];
+		bool		found;
+
+		relation_key(rel, key);
+		(void) hash_search(names, key, HASH_FIND, &found);
+		if (found)
+			continue;
+		(void) hash_search(relids, &rel->oid, HASH_FIND, &found);
+		if (!found)
+			made = lappend_oid(made, rel->oid);
+	}
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+	return made;
+}
+
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
 {
 	/* the heads read under the refs held, as they are */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = merge_held(branch, message, flags, commit_id);
+	const BranchOpsRoutine *ops = branch_ops();
+	const char *source = branch;
+	HTAB	   *before_names = NULL;
+	HTAB	   *before_relids = NULL;
+	int			result;
 
+	/*
+	 * A relation the merge makes here, new to the branch, has the
+	 * privileges of the source branch's of its name: its commits hold none,
+	 * and a branch of this database has them (one merged as a remote's
+	 * ref, a tag or a commit has none to give).
+	 */
+	if (strncmp(source, "refs/heads/", 11) == 0)
+		source += 11;
+	if (ops->carry_privileges != NULL &&
+		SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(source)))
+		before_names = relations_before(&before_relids);
+	result = merge_held(branch, message, flags, commit_id);
+	if (before_names != NULL)
+		ops->carry_privileges(source,
+							  relations_made(before_names, before_relids));
 	if (pushed)
 		PopActiveSnapshot();
 	return result;

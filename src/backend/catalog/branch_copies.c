@@ -64,6 +64,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/trigger.h"
@@ -1961,6 +1962,165 @@ copies_let_go(const BranchKeptRelation *kept)
 	let_go_of(kept_locator(kept), kept->snapshot);
 }
 
+/*
+ * Branch's row of the relation called relname in the schema called nspname
+ * (copies, found by name: a relation made on one branch has another OID
+ * on the next), or NULL if branch has none.
+ */
+static HeapTuple
+class_row_named(Oid branch, const char *nspname, const char *relname)
+{
+	Relation	pg_namespace = table_open(NamespaceRelationId, AccessShareLock);
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	result = NULL;
+
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		Oid			nsp = InvalidOid;
+
+		ScanKeyInit(&key[0], Anum_pg_namespace_nspname, BTEqualStrategyNumber,
+					F_NAMEEQ, CStringGetDatum(nspname));
+		ScanKeyInit(&key[1], Anum_pg_namespace_nspbranch, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(branch));
+		scan = systable_beginscan(pg_namespace, NamespaceNameIndexId, true,
+								  NULL, 2, key);
+		if ((tup = systable_getnext(scan)) != NULL)
+			nsp = ((Form_pg_namespace) GETSTRUCT(tup))->oid;
+		systable_endscan(scan);
+		if (OidIsValid(nsp))
+		{
+			ScanKeyInit(&key[0], Anum_pg_class_relname, BTEqualStrategyNumber,
+						F_NAMEEQ, CStringGetDatum(relname));
+			ScanKeyInit(&key[1], Anum_pg_class_relnamespace,
+						BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
+			ScanKeyInit(&key[2], Anum_pg_class_relbranch, BTEqualStrategyNumber,
+						F_OIDEQ, ObjectIdGetDatum(branch));
+			scan = systable_beginscan(pg_class, ClassNameNspIndexId, true,
+									  NULL, 3, key);
+			if ((tup = systable_getnext(scan)) != NULL)
+				result = heap_copytuple(tup);
+			systable_endscan(scan);
+		}
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(pg_class, AccessShareLock);
+	table_close(pg_namespace, AccessShareLock);
+	return result;
+}
+
+/*
+ * Set the privileges of relation relid's row in catalog (pg_class, or its
+ * column attnum's pg_attribute row: tup, a modifiable copy) to acl, as
+ * owner's, recording its grantees' shared dependencies.
+ */
+static void
+set_privileges(Relation catalog, HeapTuple tup, AttrNumber aclattr,
+			   Oid relid, AttrNumber attnum, Oid owner, Acl *acl)
+{
+	TupleDesc	desc = RelationGetDescr(catalog);
+	Datum	   *values = palloc0_array(Datum, desc->natts);
+	bool	   *nulls = palloc0_array(bool, desc->natts);
+	bool	   *replaces = palloc0_array(bool, desc->natts);
+	bool		isnull;
+	Datum		old = heap_getattr(tup, aclattr, desc, &isnull);
+	Oid		   *oldmembers = NULL;
+	Oid		   *newmembers = NULL;
+	int			noldmembers = isnull ? 0 :
+		aclmembers(DatumGetAclP(old), &oldmembers);
+	int			nnewmembers = aclmembers(acl, &newmembers);
+	HeapTuple	newtup;
+
+	values[aclattr - 1] = PointerGetDatum(acl);
+	replaces[aclattr - 1] = true;
+	newtup = heap_modify_tuple(tup, desc, values, nulls, replaces);
+	CatalogTupleUpdate(catalog, &newtup->t_self, newtup);
+	updateAclDependencies(RelationRelationId, relid, attnum, owner,
+						  noldmembers, oldmembers, nnewmembers, newmembers);
+	heap_freetuple(newtup);
+}
+
+/*
+ * Give each of the session branch's relations relids the privileges its
+ * namesake on branch source has (the relation of its schema's and its own
+ * name there), the relation's and each column's (by the column's name),
+ * as the relation's owner here gives them.  Nothing for one source hasn't,
+ * nor where source is no branch here (one never used has no copies).
+ */
+static void
+copies_carry_privileges(const char *source, List *relids)
+{
+	Oid			src = branch_oid(source, true);
+	Relation	pg_class;
+	Relation	pg_attribute;
+
+	if (!OidIsValid(src) || src == MyBranch || relids == NIL)
+		return;
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
+	foreach_oid(relid, relids)
+	{
+		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		Form_pg_class rel;
+		char	   *nspname;
+		HeapTuple	from;
+		Form_pg_class fromrel;
+		Datum		acl;
+		bool		isnull;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		rel = (Form_pg_class) GETSTRUCT(tup);
+		nspname = get_namespace_name(rel->relnamespace);
+		from = nspname ? class_row_named(src, nspname, NameStr(rel->relname)) : NULL;
+		if (from == NULL)
+			continue;
+		fromrel = (Form_pg_class) GETSTRUCT(from);
+		acl = heap_getattr(from, Anum_pg_class_relacl,
+						   RelationGetDescr(pg_class), &isnull);
+		if (!isnull)
+			set_privileges(pg_class, tup, Anum_pg_class_relacl, relid, 0,
+						   rel->relowner,
+						   aclnewowner(DatumGetAclP(acl), fromrel->relowner,
+									   rel->relowner));
+		foreach_ptr(HeapTupleData, att,
+					branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+								Anum_pg_attribute_attrelid, fromrel->oid, src))
+		{
+			Form_pg_attribute fromatt = (Form_pg_attribute) GETSTRUCT(att);
+			HeapTuple	mine;
+
+			if (fromatt->attnum <= 0 || fromatt->attisdropped)
+				continue;
+			acl = heap_getattr(att, Anum_pg_attribute_attacl,
+							   RelationGetDescr(pg_attribute), &isnull);
+			if (isnull)
+				continue;
+			mine = SearchSysCacheCopyAttName(relid, NameStr(fromatt->attname));
+			if (!HeapTupleIsValid(mine))
+				continue;
+			set_privileges(pg_attribute, mine, Anum_pg_attribute_attacl, relid,
+						   ((Form_pg_attribute) GETSTRUCT(mine))->attnum,
+						   rel->relowner,
+						   aclnewowner(DatumGetAclP(acl), fromrel->relowner,
+									   rel->relowner));
+			heap_freetuple(mine);
+		}
+		heap_freetuple(from);
+		heap_freetuple(tup);
+	}
+	table_close(pg_attribute, RowExclusiveLock);
+	table_close(pg_class, RowExclusiveLock);
+	CommandCounterIncrement();
+}
+
 static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
@@ -1980,6 +2140,7 @@ static const BranchOpsRoutine branch_copies = {
 	.restore = copies_restore,
 	.let_go = copies_let_go,
 	.share_kept = copies_share_kept,
+	.carry_privileges = copies_carry_privileges,
 };
 
 const BranchOpsRoutine *
