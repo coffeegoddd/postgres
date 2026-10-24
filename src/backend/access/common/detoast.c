@@ -31,6 +31,40 @@ static varlena *toast_fetch_datum_slice(varlena *attr,
 static varlena *toast_decompress_datum(varlena *attr);
 static varlena *toast_decompress_datum_slice(varlena *attr, int32 slicelength);
 
+/* Each kind's identity, its tag and fields, fits in an identity's bytes. */
+StaticAssertDecl(1 + sizeof(Oid) + sizeof(Oid8) <= sizeof(((ToastPointerIdentity *) 0)->bytes),
+				 "an on-disk pointer's identity must fit");
+StaticAssertDecl(1 + sizeof(uint32) + sizeof(((varatt_external_hash *) 0)->va_hash) <=
+				 sizeof(((ToastPointerIdentity *) 0)->bytes),
+				 "a hash pointer's identity must fit");
+
+bool
+toast_pointer_identity(const struct varlena *attr, ToastPointerIdentity *id)
+{
+	memset(id, 0, sizeof(*id));
+	if (VARATT_IS_EXTERNAL_ONDISK(attr))
+	{
+		toast_external_data d;
+
+		toast_external_info_get(attr, &d);
+		id->bytes[0] = (uint8) d.tag;
+		memcpy(id->bytes + 1, &d.toastrelid, sizeof(d.toastrelid));
+		memcpy(id->bytes + 1 + sizeof(d.toastrelid), &d.valueid, sizeof(d.valueid));
+		return true;
+	}
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(attr))
+	{
+		varatt_external_hash h;
+
+		VARATT_EXTERNAL_GET_POINTER(h, attr);
+		id->bytes[0] = (uint8) VARTAG_EXTERNAL(attr);
+		memcpy(id->bytes + 1, &h.va_extinfo, sizeof(h.va_extinfo));
+		memcpy(id->bytes + 1 + sizeof(h.va_extinfo), h.va_hash, sizeof(h.va_hash));
+		return true;
+	}
+	return false;
+}
+
 /* ----------
  * detoast_external_attr -
  *

@@ -84,6 +84,40 @@ toast_external_info_get(const struct varlena *attr, toast_external_data *toast_e
 	}
 }
 
+/*
+ * A stable identity for an out-of-line value, which an extension can key a
+ * cache of the values it detoasted by (PostGIS keeps the geometries a
+ * function was last given, so a nested loop probing one polygon per outer
+ * row detoasts it once): two pointers with one identity name the same
+ * bytes, for as long as the value they were read from is live.  An on-disk
+ * pointer's names its TOAST relation and value ID; a hash pointer's, its
+ * content (its tree's root, length and form), so equal values in any rows
+ * of any tables share it.  Its bytes are opaque: compare them whole
+ * (toast_pointer_identity_equal()).  TOAST_POINTER_IDENTITY says this is
+ * here.
+ */
+#define TOAST_POINTER_IDENTITY 1
+
+typedef struct ToastPointerIdentity
+{
+	uint8		bytes[32];
+} ToastPointerIdentity;
+
+/*
+ * The identity of an out-of-line value's pointer, into *id; false (and *id
+ * zeroed) for any other datum.  A value in line (compressed or not) has
+ * none, nor has an indirect or expanded pointer: it points at memory its
+ * maker owns, which may be freed or changed after the call, so it names no
+ * value that outlives it.
+ */
+extern bool toast_pointer_identity(const struct varlena *attr, ToastPointerIdentity *id);
+
+static inline bool
+toast_pointer_identity_equal(const ToastPointerIdentity *a, const ToastPointerIdentity *b)
+{
+	return memcmp(a->bytes, b->bytes, sizeof(a->bytes)) == 0;
+}
+
 /* ----------
  * detoast_external_attr() -
  *

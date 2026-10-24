@@ -202,6 +202,7 @@ tests += {
       'send_canonical',
       'receive_refusals',
       'hash_pointers',
+      'toast_identity',
       'toast_by_content',
       'toast_folds',
       'redefined_rows',

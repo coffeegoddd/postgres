@@ -3,15 +3,17 @@
 # Crash recovery replays records of block-mapped storage that is dropped
 # later in the WAL, whose map is gone from disk.  An earlier record's image
 # of the map's header makes the map's file again (redo makes a missing file
-# to restore an image in), with no root page.  In recovery such a map is
-# none: the relation is md.c's, whose redo notes its records' pages as
+# to restore an image in), with no root page.  The relation stays
+# block-mapped: replay of its records skips them, noting their pages
 # invalid, and the drop's replay forgets them, so recovery completes; it
 # doesn't fail looking up the relation's pages in a map with no root
-# ("could not read blocks 1..1").  A record of a node of the dropped map,
-# whose block was freed and made another relation's page since, leaves that
-# page alone (with full_page_writes off, nothing else restores it).  A live
-# relation whose map lost its root page is none either, and recovery fails
-# as it ends: its records' pages stay invalid.
+# ("could not read blocks 1..1").  Images of its pages restored to buffers
+# go nowhere when written out.  A record of a node of the dropped map, whose
+# block was freed and made another relation's page since, leaves that page
+# alone (with full_page_writes off, nothing else restores it).  A live
+# relation whose map lost its root page is treated the same, so an archive
+# or standby recovery fails reaching consistency: its records' pages stay
+# invalid.
 
 use strict;
 use warnings FATAL => 'all';
@@ -78,10 +80,8 @@ log_min_messages = debug1
 	my $log = substr(slurp_file($node->logfile), $log_from);
 	unlike($log, qr/could not read blocks|invalid page in block/,
 		"fpw $fpw: without failing on s's map or the blocks t took");
-	# (with full_page_writes on, their images are restored in md.c's file)
 	like($log, qr/page \d+ of relation \Q$srel\E does not exist/,
-		"fpw $fpw: s's pages are noted invalid, as md.c's")
-	  if $fpw eq 'off';
+		"fpw $fpw: s's pages are noted invalid");
 	is($sql->(q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM t}),
 		$want, "fpw $fpw: t reads its rows");
 	ok(!-e $spath, "fpw $fpw: and s's map is gone again");
@@ -93,9 +93,10 @@ run_case('on');
 run_case('off');
 
 # A live map that lost its root page, on a standby restarting from a
-# restartpoint before a change of the relation: the relation is md.c's, its
-# page invalid, and recovery fails reaching consistency, as for a relation
-# whose file is lost.  (Crash recovery, as for md.c, notes it and goes on.)
+# restartpoint before a change of the relation: the relation stays
+# block-mapped, its record's page is noted invalid, and recovery fails
+# reaching consistency, as for a relation whose file is lost.  (Crash
+# recovery doesn't check invalid pages, for md.c's either, and goes on.)
 {
 	my $node = PostgreSQL::Test::Cluster->new('lost_root');
 	$node->init(allows_streaming => 1);
