@@ -132,21 +132,6 @@ branch_name(Oid branch)
 
 static HeapTuple class_row(Relation pg_class, Oid relid, Oid branch);
 
-/*
- * A scan of the session branch's rows of a branch-aware catalog, by its
- * index on the branch column: the work is the branch's rows, however many
- * rows other branches and shared objects have.
- */
-static SysScanDesc
-session_branch_scan(Relation rel, const CatalogBranchInfo *info)
-{
-	ScanKeyData key;
-
-	ScanKeyInit(&key, info->attnum, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(MyBranch));
-	return systable_beginscan(rel, info->indexid, true, NULL, 1, &key);
-}
-
 /* the storage locator of a pg_class row */
 static RelFileLocator
 class_locator(Form_pg_class c, RelFileNumber relnumber)
@@ -264,7 +249,7 @@ branch_relations(void)
 	List	   *relids = NIL;
 	List	   *toasts = NIL;
 
-	scan = session_branch_scan(rel, catalog_branch_info(RelationRelationId));
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -513,7 +498,7 @@ copy_rows(Oid target, List *fresh, const BranchKeptRelation *const *kept,
 		HeapTuple	tup;
 
 		/* rows added here are the target's, not seen by this scan */
-		scan = session_branch_scan(rel, info);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			HeapTuple	copy;
@@ -584,7 +569,7 @@ delete_rows(void)
 		SysScanDesc scan;
 		HeapTuple	tup;
 
-		scan = session_branch_scan(rel, info);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Assert(catalog_row_branch(info, tup) == MyBranch);

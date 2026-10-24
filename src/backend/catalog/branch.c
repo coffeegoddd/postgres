@@ -219,6 +219,18 @@ catalog_tuple_on_branch(HeapTuple tup)
 	return branch == InvalidOid || branch == MyBranch;
 }
 
+SysScanDesc
+catalog_branch_beginscan(Relation rel, Oid branch)
+{
+	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
+	ScanKeyData key;
+
+	Assert(info != NULL);
+	ScanKeyInit(&key, info->attnum, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(branch));
+	return systable_beginscan(rel, info->indexid, true, NULL, 1, &key);
+}
+
 Oid
 catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup)
 {

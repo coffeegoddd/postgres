@@ -2722,7 +2722,7 @@ copies_hold_unseen(void)
 	bool		found = false;
 
 	classes = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(classes, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -3908,7 +3908,7 @@ static void
 table_names(StringInfo out)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
 	HeapTuple	tup;
 	List	   *lines = NIL;
 	ListCell   *lc;
