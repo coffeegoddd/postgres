@@ -260,7 +260,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(194 rows)
+(196 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
