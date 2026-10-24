@@ -10,6 +10,9 @@ CREATE DATABASE regress_shape_folds;
 -- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
 -- counted here is what the next fold reads after one)
 SET prolly.fold_on_rewrite = off;
+-- (every mappable baseline mapped, whatever reading the table would cost:
+-- the cost's choice is tested at the end)
+SET prolly.map_reshaped_dead_ratio = 0;
 CREATE EXTENSION test_prolly;
 CREATE FUNCTION full_folds() RETURNS text LANGUAGE sql AS $$
 	SELECT coalesce(string_agg(substr(name, 11), ',' ORDER BY name), 'none')
@@ -324,6 +327,32 @@ ALTER TABLE sf.rk2 ADD PRIMARY KEY (a);
 :check
 SELECT * FROM sf.k3 ORDER BY a;
 SELECT * FROM sf.rk2 ORDER BY a;
+
+-- mapped only where reading the table costs more: a heap of live rows is
+-- read in full, one holding more dead versions than
+-- prolly.map_reshaped_dead_ratio a live row is mapped
+RESET prolly.map_reshaped_dead_ratio;
+CREATE TABLE sf.cost (id int PRIMARY KEY, v int);
+INSERT INTO sf.cost SELECT g, 0 FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'cost')::text) > 0 AS committed;
+SELECT pg_stat_force_next_flush();
+ALTER TABLE sf.cost ADD COLUMN w int DEFAULT 7;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+-- (mapped whatever it costs: pending none)
+SET prolly.map_reshaped_dead_ratio = 0;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+RESET prolly.map_reshaped_dead_ratio;
+:check
+UPDATE sf.cost SET v = v + 1;
+UPDATE sf.cost SET v = v + 1;
+SELECT length(dolt_commit('-am', 'dead versions')::text) > 0 AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT n_dead_tup >= 1.5 * n_live_tup AS mostly_dead
+  FROM pg_stat_user_tables WHERE relid = 'sf.cost'::regclass;
+ALTER TABLE sf.cost ADD COLUMN x int DEFAULT 8;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+:check
+SELECT count(*), sum(w), sum(x) FROM sf.cost;
 
 
 \c contrib_regression

@@ -8407,7 +8407,7 @@
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_schema_merge.go",
       "suite": "SchemaChangeTestsConstraints",
       "index": 5,
-      "name": "foreign keys – drop tables with FK reference between them",
+      "name": "foreign keys \u2013 drop tables with FK reference between them",
       "source_sha256": "5ff512db629ea6bdee32ca88830f48137587c9c94880eb3f4f11d76bc9b5df2f",
       "scenario_sha256": "ad8cabee38b97ba8b8242d2c88ed5f18a7430bb39ccc87891d3830e952a3ae72",
       "setup": [
@@ -16642,7 +16642,7 @@
       "index": 3,
       "name": "index conflicts: both sides add an index with the same name, same columns, but different type",
       "source_sha256": "09c3374057198709c2c1087dd8f8f84712083f12ad336b7b67fecc801c04a60a",
-      "scenario_sha256": "bcb2790e2fabbb8dfdb675e93cb8d0ce00927413fe86e45788cd5ea095ac29d4",
+      "scenario_sha256": "0e5a487355c75c8c13ca787bf2dea1d4505dd18ca974f0f2073ddb669aa37c11",
       "setup": [
         {
           "index": 0,
@@ -16705,12 +16705,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: each side added an index the base lacks, defined differently. (D6, D16)"
         }
       ],
       "adaptations": [
@@ -16725,7 +16727,7 @@
       "index": 4,
       "name": "modifying a column on one side of a merge, and deleting it on the other",
       "source_sha256": "e71a824e079f618713b19efa45c11d8d9a1796de1f6496a5b2ba5659e6deb3ff",
-      "scenario_sha256": "8ce96258e051f227efc0d5cca305244aa562e6071231fab4228a9e43561fa5ac",
+      "scenario_sha256": "d04339fdc522b1344920487d5acd8ac983f5ff000222f06cd75f1037a2c10bee",
       "setup": [
         {
           "index": 0,
@@ -16774,12 +16776,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name. (D6)"
         }
       ],
       "adaptations": [
@@ -16794,7 +16798,7 @@
       "index": 5,
       "name": "type changes to a column on both sides of a merge",
       "source_sha256": "a1866bb24374e8a9ff045f9d1a57e44c9945ce6baa70017579e0bf02bd23f33f",
-      "scenario_sha256": "ee09e93292b56978b45707b29a3f5e93c7858413a14c8ebdf6712b0f68bd137d",
+      "scenario_sha256": "cac22824c58d229a92ad007c869f5eb124498027abc36f2e1c3f5976933d9eec",
       "setup": [
         {
           "index": 0,
@@ -16843,12 +16847,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name. (D6)"
         }
       ],
       "adaptations": [
@@ -16863,7 +16869,7 @@
       "index": 6,
       "name": "changing the type of a column",
       "source_sha256": "1630635691fee1f75c87aeda6be2b763db10d0cb803abb8ab391b510faa26a2b",
-      "scenario_sha256": "234369754089273771d08f4c0f0831c49b1b594648d1838daae975851204ecb5",
+      "scenario_sha256": "9bc642f9487426057821e06ca15c275da88ea956de2347f5b8e34ec3eb5d713e",
       "setup": [
         {
           "index": 0,
@@ -16926,12 +16932,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: one side as base, the other retyped (in either direction). (D6, D16)"
         }
       ],
       "adaptations": [
@@ -16946,7 +16954,7 @@
       "index": 7,
       "name": "changing the type of a column with an index",
       "source_sha256": "02ae88bbc8cbd935809e90072879a65df02ae74e7779e9fd8a3447aba623a9a4",
-      "scenario_sha256": "5986c07b0440e605646fa7d6ffdbd9c848065e05948657339bb41aa3a2e5e589",
+      "scenario_sha256": "384ae76d352183213370d50cec5ce9fb0ed3a5fc1b43c23f838f909025c48061",
       "setup": [
         {
           "index": 0,
@@ -17010,12 +17018,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: one side as base, the other retyped (in either direction). (D6, D16)"
         }
       ],
       "adaptations": [
@@ -17030,7 +17040,7 @@
       "index": 12,
       "name": "varchar narrowing",
       "source_sha256": "1aec957e69fa2a382784cc4a2d7283a7198753ea206620598163219f55bfcfe7",
-      "scenario_sha256": "0e1784d027b531804b39ee2e3e73ed7b8872a4085289a44a927c49501051ba62",
+      "scenario_sha256": "b24420cc74ef2a291f699e4461ffa2ec3658d7d37daf33fd06fe5d6cce8d0c8b",
       "setup": [
         {
           "index": 0,
@@ -17100,12 +17110,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name, with Dolt's description of the column whose types differ. (D6)"
         }
       ],
       "adaptations": [
@@ -17120,7 +17132,7 @@
       "index": 13,
       "name": "TEXT to VARCHAR narrowing",
       "source_sha256": "d1cd6415fe6b4a0bbef976eaab20b2115ac41cd57fdfe0884a82bbda9f1c2289",
-      "scenario_sha256": "40daf1a811eed93064e3696840f64471c00a8cf74d62ecc7b8a584f4acca009f",
+      "scenario_sha256": "9f6a67bf84e3a136919258514b5ccbcb11cfd9458a761d044854934b5351aff2",
       "setup": [
         {
           "index": 0,
@@ -17190,12 +17202,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name, with Dolt's description of the column whose types differ. (D6)"
         }
       ],
       "adaptations": [
@@ -20899,7 +20913,7 @@
           "steps": [
             "b-rows"
           ],
-          "note": "MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         }
       ],
       "assertions": [
@@ -20919,7 +20933,7 @@
         }
       ],
       "adaptations": [
-        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x… literals as '\\x…'::bytea, KEY as CREATE INDEX. (D10)",
+        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x\u2026 literals as '\\x\u2026'::bytea, KEY as CREATE INDEX. (D10)",
         "The tables are in a versioned schema (the adapter's public), so their rows and indexes are prolly's. (D2)"
       ]
     },
@@ -20958,7 +20972,7 @@
           "steps": [
             "child-row"
           ],
-          "note": "MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         }
       ],
       "assertions": [
@@ -20967,18 +20981,18 @@
           "steps": [
             "assert-0"
           ],
-          "note": "Checked by its tag: UPDATE n (MySQL's OK result counts the rows matched and updated). (D10) MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "Checked by its tag: UPDATE n (MySQL's OK result counts the rows matched and updated). (D10) MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved upstream expected rows. MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "Preserved upstream expected rows. MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         }
       ],
       "adaptations": [
-        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x… literals as '\\x…'::bytea, KEY as CREATE INDEX. (D10)",
+        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x\u2026 literals as '\\x\u2026'::bytea, KEY as CREATE INDEX. (D10)",
         "The tables are in a versioned schema (the adapter's public), so their rows and indexes are prolly's. (D2)"
       ]
     },
@@ -21010,14 +21024,14 @@
           "steps": [
             "parent-row"
           ],
-          "note": "MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         },
         {
           "index": 3,
           "steps": [
             "child-row"
           ],
-          "note": "MySQL's 0x… literals as bytea ('\\x…'). (D10)"
+          "note": "MySQL's 0x\u2026 literals as bytea ('\\x\u2026'). (D10)"
         }
       ],
       "assertions": [
@@ -21037,7 +21051,7 @@
         }
       ],
       "adaptations": [
-        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x… literals as '\\x…'::bytea, KEY as CREATE INDEX. (D10)",
+        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x\u2026 literals as '\\x\u2026'::bytea, KEY as CREATE INDEX. (D10)",
         "The tables are in a versioned schema (the adapter's public), so their rows and indexes are prolly's. (D2)"
       ]
     },
@@ -21080,14 +21094,14 @@
           "steps": [
             "assert-0"
           ],
-          "note": "MySQL's ALTER TABLE … RENAME INDEX as ALTER INDEX … RENAME TO; checked by its tag. The unquoted A_IDX folds to a_idx, as MySQL's index names are case-insensitive. (D10)"
+          "note": "MySQL's ALTER TABLE \u2026 RENAME INDEX as ALTER INDEX \u2026 RENAME TO; checked by its tag. The unquoted A_IDX folds to a_idx, as MySQL's index names are case-insensitive. (D10)"
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "MySQL's ALTER TABLE … RENAME INDEX as ALTER INDEX … RENAME TO (the unique constraint's index, which b_fk uses); checked by its tag. (D10)"
+          "note": "MySQL's ALTER TABLE \u2026 RENAME INDEX as ALTER INDEX \u2026 RENAME TO (the unique constraint's index, which b_fk uses); checked by its tag. (D10)"
         },
         {
           "index": 2,
@@ -21119,7 +21133,7 @@
         }
       ],
       "adaptations": [
-        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x… literals as '\\x…'::bytea, KEY as CREATE INDEX. (D10)",
+        "MySQL DDL in PostgreSQL syntax: BINARY(n) as bytea, 0x\u2026 literals as '\\x\u2026'::bytea, KEY as CREATE INDEX. (D10)",
         "The tables are in a versioned schema (the adapter's public), so their rows and indexes are prolly's. (D2)",
         "CALL DOLT_COMMIT becomes a commit; errors are SQLSTATEs. (D3, D4)"
       ]
@@ -40938,6 +40952,3528 @@
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
         "dolt_rebase is a view over the plan, edited through its INSTEAD OF trigger, as Dolt's table is edited."
+      ]
+    },
+    {
+      "id": "dolt-rebase-active-merge",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 3,
+      "name": "dolt_rebase errors: active merge, cherry-pick, or rebase",
+      "source_sha256": "156432ce1d3cdab3164747daf99f61b6e38a9dd3d270a3abc1f4b82466f47f3b",
+      "scenario_sha256": "3d5753ad2e4c6cc539642d2bb2cafbc0e7bf4eec67a956f01308931babbc53ff",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as dolt_merge; same result columns (hash, fast_forward, conflicts, message), in the transaction block. (D3, D5)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Expected error checked as its SQLSTATE: Dolt's 'unable to start rebase while a merge is in progress', 55000 with the same text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits."
+      ]
+    },
+    {
+      "id": "dolt-rebase-edit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 5,
+      "name": "dolt_rebase: edit action functionality test",
+      "source_sha256": "c1c509b10e010ad5a6c70e3cb3b79075f7a3df18b476b52c544ee026cdd6820a",
+      "scenario_sha256": "a0a42bb4f2f546126984c5daadaabe233ffc416cbd932b98ec1f0d2e86260652",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "Dolt's editPauseMessage validator is a regular expression on the message, the commit id the engine's own. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-edit-many",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 6,
+      "name": "dolt_rebase: multiple edit actions",
+      "source_sha256": "cbcc827c78899523aa903197dc35bb8c610fdd7a305a85bfc88a23888cea6e0b",
+      "scenario_sha256": "28c4966fe803e80a9b351b26d620e712a97756772fef9aec6ddc7354fc4dcc58",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL; two rows updated, checked as the command tag."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "Dolt's editPauseMessage validator is a regular expression on the message, the commit id the engine's own. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-edit-conflict",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 7,
+      "name": "dolt_rebase: edit action followed by conflict",
+      "source_sha256": "2bebd11e1e00af8fdd5feffac2e2817e41417732dc43c71b2f6e0c1fb6ef7b06",
+      "scenario_sha256": "bf3e6901d775d4c94d176b7c4378e88a36d4fe79f371d1e37137ca12bed7a561",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. @@dolt_allow_commit_conflicts as dolt.allow_commit_conflicts: conflicts a statement leaves are kept as it commits. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its command tag."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3) Upstream SkipResultsCheck becomes the checked result."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "CALL becomes SELECT; the amend's commit id, checked as one returned. Upstream SkipResultsCheck becomes that check. (D3, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: with dolt.allow_commit_conflicts on, the stop is kept and returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Deleting dolt_conflicts_t's rows keeps ours: dolt_conflicts_resolve('--ours', 't'), which prolly resolves with. Upstream SkipResultsCheck becomes its result. (D3)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its command tag."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified."
+      ]
+    },
+    {
+      "id": "dolt-rebase-branch-exists",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 8,
+      "name": "dolt_rebase errors: rebase working branch already exists",
+      "source_sha256": "3e7429628e8d67d0bf4119bc464137b52dd44909254e4fb796bdd1499e323e40",
+      "scenario_sha256": "dd583533808bd5737fca2d3c27d4fd7a635a7a7de3cb11977418676c96afc45a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its SQLSTATE: Dolt's 'fatal: A branch named 'dolt_rebase_branch1' already exists.', 42710 with the same text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits."
+      ]
+    },
+    {
+      "id": "dolt-rebase-invalid-plans",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 9,
+      "name": "dolt_rebase errors: invalid rebase plans",
+      "source_sha256": "069709ead4bb76a673637e32a661445d4efe86f9a9d8ed9e6521280f6631dad9",
+      "scenario_sha256": "ea0bd6e7c24e8bc89f4928fa81a58c25885f9253c5e1abf25226ae62d3e8cadc",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Expected error checked as its SQLSTATE: Dolt's duplicate primary key, a unique violation (23505), rebase orders being the plan's key. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; two rows updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Expected error checked as its SQLSTATE: ErrInvalidRebasePlanSquashFixupWithoutPick, 22023 with Dolt's text. (D4)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its SQLSTATE: ErrInvalidRebasePlanSquashFixupWithoutPick, 22023 with Dolt's text. (D4)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Dolt takes the hash and refuses it at --continue ('invalid commit hash: doesnotexist'); prolly refuses it as the plan is edited, the same text, 22023, so the plan keeps its step. (D4)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "The plan is as before the refused edit: --continue still refuses its squash, 22023. Dolt's refusal of the hash was made by the edit above. (D4)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Refused as the plan is edited, not at --continue: Dolt's 'unable to resolve commit hash ...: target commit not found', 42704. (D4)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "The plan is as before the refused edit: --continue refuses its squash, 22023; Dolt's missing commit was refused by the edit above. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "A plan edit naming a commit hash that isn't one, or a commit that doesn't exist, is refused as the edit runs, not at --continue."
+      ]
+    },
+    {
+      "id": "dolt-rebase-unresolved",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 10,
+      "name": "dolt_rebase errors: unresolved conflicts",
+      "source_sha256": "3e74fadfc3e51624814c1c6872c5dc6fff36c5d6fbe5967e5400b13355ccd539",
+      "scenario_sha256": "12555dec08f4ed527d3d70de52a9d4d4826debc801beed854e9b75bf78bbd5c7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; one row deleted, checked as the command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Expected error checked as its SQLSTATE: ErrRebaseUnresolvedConflicts, 55000 with Dolt's text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-uncommitted-continue",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 11,
+      "name": "dolt_rebase errors: uncommitted changes before first --continue",
+      "source_sha256": "4af1387c4d86519f0d94932a94f8acb109e541749f21167603d9d94dd0bb7cb5",
+      "scenario_sha256": "09236397a7c1bcdaafe1b94772fb34e370191e4942a74978a6b7db475334534f",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; one row inserted, checked as the command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its SQLSTATE: ErrRebaseUncommittedChanges, 55000 with Dolt's text. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits."
+      ]
+    },
+    {
+      "id": "dolt-rebase-conflict-autocommit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 12,
+      "name": "dolt_rebase errors: data conflicts when @@autocommit is enabled",
+      "source_sha256": "028308a9527093249b1b2fba958091147b3d81da436a62a94dcc319b4840498e",
+      "scenario_sha256": "1a59abd11b3bf02f20c36fce0f7ed36d8a1c9a9cb8e9750d0e7454ec9356744a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-4",
+            "assert-5"
+          ],
+          "note": "Dolt's ErrRebaseDataConflictsCantBeResolved: outside a transaction block the conflicts fail the statement, 40001 (D4), and its error rolls it back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Expected error checked as its SQLSTATE: the plan is there only during a rebase, 42P01 as Dolt's missing table. (D4)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "A conflict outside a transaction block fails --continue, which rolls back: the rebase stays as it was before it, where Dolt aborts it. (D5)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-negative-order",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 19,
+      "name": "dolt_rebase: negative rebase order",
+      "source_sha256": "5aeb029949eddaeefff5a93329058a73b2e3496bc277f769bb977f7da8685501",
+      "scenario_sha256": "6683d31009603c6166065d1dcc162c4d742a5a32508b5563978c2f3eaa94c79f",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; three rows updated, checked as the command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-conflict-pick",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 20,
+      "name": "dolt_rebase: data conflicts with pick",
+      "source_sha256": "104a17abaa1296d6b76c9fc1a4a7553a7a8753a53f8ada82e26d8bbba6c1e74d",
+      "scenario_sha256": "758ce13d3a44d5a9a45b590a05f00320002d37d2ea3781795b903e94f0ec4771",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 12,
+          "steps": [],
+          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "CALL becomes SELECT; a commit id, checked as one returned. (D3, D7)"
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "assert-22"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 24,
+          "steps": [
+            "assert-23"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-conflict-squash",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 21,
+      "name": "dolt_rebase: data conflicts with squash",
+      "source_sha256": "be0a24714c1798931ea627d0178bd3af119cc5bea3f057eb3c0235bfbc206fee",
+      "scenario_sha256": "bbd64ebb11c88ed258b010b202c66f177564bf16ffca01190d6c0dde18ea15b7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 11,
+          "steps": [],
+          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "CALL becomes SELECT; a commit id, checked as one returned. (D3, D7)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "assert-22"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-conflict-fixup",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 22,
+      "name": "dolt_rebase: data conflicts with fixup",
+      "source_sha256": "b79be314479faa46ac0a3e1d6fc63ad5fc6e2f6cace5409648b86c6c01f6b47d",
+      "scenario_sha256": "7d5b4f85c6e18d0c5d9bee0bbc479bd707ebbfb70c7c5cb24373ac1fb59dd726",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 11,
+          "steps": [],
+          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "assert-22"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-conflict-reword",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 23,
+      "name": "dolt_rebase: data conflicts with reword",
+      "source_sha256": "10d9dd46b35e91a80683e1c9783ba9aa6fa635215f19290a98195e2143c73e29",
+      "scenario_sha256": "824b1f5f823aa3893d18871af972be7731623d6ac32f5a9dada9b02b0a9a3e3f",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "MySQL autocommit off becomes BEGIN: what follows runs in one transaction block, as Dolt's session does until it commits. (D5, D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_conflicts lists tables as table_name, schema-qualified (public.t), where Dolt has table."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 11,
+          "steps": [],
+          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: in a transaction block the stop returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "dolt_conflicts_t becomes dolt_conflicts(NULL::t): its rows' columns as (base_row).pk and so on."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "CALL becomes SELECT; dolt_conflicts_resolve returns {0}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "@@autocommit=0 becomes BEGIN, so the rest runs in one transaction block and its commits are query steps. (D5, D10)",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-schema-conflict",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 24,
+      "name": "dolt_rebase: schema conflicts",
+      "source_sha256": "f9f2656196884cae0f67e5c0b547e8941eced7bcd816a9f92959be4c1cdd6136",
+      "scenario_sha256": "731a10f14908ab7bc7de6ba3b139d68746551c74c8f8710ff042929d440fa880",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "MySQL fills a NOT NULL column added to rows with its type's zero value; PostgreSQL needs the default given, '' here. (D10)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10",
+            "setup-11"
+          ],
+          "note": "MySQL's MODIFY COLUMN redefines the column, nullable now and with a comment: in PostgreSQL, NOT NULL dropped and COMMENT ON COLUMN. (D10)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-4",
+            "assert-5"
+          ],
+          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Expected error checked as its SQLSTATE: no rebase in progress, 55000. (D4)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 6,
+          "steps": [],
+          "note": "Not ported: prolly keeps no schema conflicts (there is no dolt_schema_conflicts; a schema conflict is an error, never kept), so the case is partial."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "A schema conflict fails --continue, which rolls back: the rebase stays as it was before it, where Dolt aborts it. (D5)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-plan-changes",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 25,
+      "name": "dolt_rebase: non-standard plan changes",
+      "source_sha256": "db128a8527ebd64404add21ca29c10423f348b7e4a9fe000e474daf5e69fff92",
+      "scenario_sha256": "c6b3033e2ef1667ff9d7566280cf2c1d933134994e4e255c00fe95af9d1146e3",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "setup-15"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; two rows deleted, checked as the command tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "hashof() as dolt_hashof(); one row inserted, checked as the command tag."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows, compared as a bag."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
+        "hashof() is dolt_hashof()."
+      ]
+    },
+    {
+      "id": "dolt-rebase-merge-commits",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 26,
+      "name": "dolt_rebase: merge commits",
+      "source_sha256": "d468fc76865bf4a524519233e47301dafdb0468f5202b6ee547b9858fa6d6518",
+      "scenario_sha256": "53d9e99706d497f6c8e87f75fb8cc34b963f7d6b3f3e7e59571ef5b4664c26c0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Native merge; it commits, its commit captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows, compared as a bag: across the merge, commits of one height (row 0 on main, row 1 on branch1) are listed in another order than Dolt's date-ordered walk; the order after the rebase, one line of commits, is checked below."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-multiline",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 27,
+      "name": "dolt_rebase: handles multi-line commit messages",
+      "source_sha256": "49210179096ddd3bff696e5177f583784e6c5053eb0c507433614bc95dc4754b",
+      "scenario_sha256": "975a15d82f2a6f6048d726020281418eae52cc519b87f526dc3f78d3de4ea87d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. An empty commit, as Dolt's. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "An empty commit with a message of three lines, as Dolt's. (D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale (D3), and each doltCommit is the branch's commit captured as it was made (D7)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-edit-workflow",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseScriptTests",
+      "index": 28,
+      "name": "dolt_rebase: comprehensive edit and conflict workflow",
+      "source_sha256": "1be3a4b1f3e77bc1dbd622a0b82e85b9d4e2032081ca57dfd6b11b7a6314f2c7",
+      "scenario_sha256": "818fb65caf6439b3f88c595ac127d51e9ff0d614d201d9a670138b5d25e44e8f",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. @@dolt_allow_commit_conflicts as dolt.allow_commit_conflicts: conflicts a statement leaves are kept as it commits. (D5, D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "setup-15"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "setup-16"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "setup-17"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "setup-18"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "setup-19"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        },
+        {
+          "index": 20,
+          "steps": [
+            "setup-20"
+          ],
+          "note": "Preserved SQL; one row updated, checked as the command tag."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; rebase_order shows its scale. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its command tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3) Upstream SkipResultsCheck becomes the checked result."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "CALL becomes SELECT; the amend's commit id, checked as one returned. Upstream SkipResultsCheck becomes that check. (D3, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Dolt's ErrRebaseDataConflict: with dolt.allow_commit_conflicts on, the stop is kept and returns {1, message} with Dolt's text, where Dolt raises it, which here would roll the stop back; checked as status 1 and the message's beginning and commit. (D3, D5)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "dolt_conflicts_t1 becomes dolt_conflicts(NULL::t1): its rows' columns as (our_row).pk and so on."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Deleting dolt_conflicts_t1's rows keeps ours: dolt_conflicts_resolve('--ours', 't1'), which prolly resolves with. Upstream SkipResultsCheck becomes its result. (D3)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its command tag."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3) Upstream SkipResultsCheck becomes the checked result."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's editPauseMessage validator as a regular expression on the message, the commit id being the engine's own (any hexadecimal, D7), with status 0."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its command tag."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "No staging area: dolt_add stages nothing and returns {0}, Dolt's row as a text array. (D1, D3) Upstream SkipResultsCheck becomes the checked result."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "CALL becomes SELECT; the commit id, checked as one returned. Upstream SkipResultsCheck becomes that check. (D3, D7)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call."
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Preserved expected rows, in dolt_log's order (height, newest first) where Dolt orders by date."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "A conflict that stops the rebase in a transaction block returns {1, message} with Dolt's text, where Dolt raises it as an error. (D3, D5)",
+        "dolt_conflicts_t is dolt_conflicts(NULL::t), and dolt_conflicts names tables schema-qualified.",
+        "Dolt's editPauseMessage validator is a regular expression on the message, the commit id the engine's own. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-rebase-head-moved",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+      "suite": "DoltRebaseMultiSessionScriptTests",
+      "index": 0,
+      "name": "dolt_rebase errors: branch HEAD changed during rebase",
+      "source_sha256": "61d1d55dc072bd5ad1a8bd083ce0b32370c9723c7a439c35674f3fe65115698f",
+      "scenario_sha256": "20f50a4fdcffd08d7b88192b147f61ea9aab62abeaf4fed1e7b006634eb794e6",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. MySQL DDL in PostgreSQL syntax. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2",
+            "setup-3"
+          ],
+          "note": "dolt_checkout('-b') as a native branch, then a native checkout."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call. Client a."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Client b's dolt_checkout as a native checkout on session b; the adapter verifies the active branch."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; active_branch() as a function call. Client b."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_rebase returns {status, message}, Dolt's row as a text array. (D3) Client a."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; checked as its command tag. Client b."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7) Client b; upstream SkipResultsCheck becomes the commit made."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Expected error checked as its SQLSTATE: 'rebase aborted due to changes in branch branch1', 55000 with Dolt's text. (D4) Client a."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_rebase returns {status, message} where Dolt returns a row of them. (D3)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "No staging area: -a/-A commit the whole working set. (D1)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "Dolt's /* client a */ and /* client b */ are the scenario's sessions a and b, run one after the other. (D8)"
       ]
     }
   ],

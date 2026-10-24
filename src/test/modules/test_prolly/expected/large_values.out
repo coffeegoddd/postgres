@@ -594,3 +594,34 @@ SELECT length(dolt_commit('-Am', 'lv gone')::text) AS committed;
         42
 (1 row)
 
+-- An edit of a value tree spliced in place reads the nodes on its path
+-- and the leaves around it, as a slice does, whatever the value's size,
+-- and writes the nodes along its path; a rewrite reads every leaf.  (The
+-- splice runs first and writes the nodes, so the rewrite, giving the same
+-- tree, finds them stored.)
+SELECT s.size, c.method, c.nodes_read, c.nodes_written
+FROM (VALUES (1048576::int8), (16777216)) s(size),
+	LATERAL test_value_edit_cost(s.size, s.size / 2, 10, 10) c
+ORDER BY 1, 2;
+   size   |   method   | nodes_read | nodes_written 
+----------+------------+------------+---------------
+  1048576 | read slice |          3 |             0
+  1048576 | read whole |        479 |             0
+  1048576 | rewrite    |        479 |             0
+  1048576 | splice     |          6 |             3
+ 16777216 | read slice |          3 |             0
+ 16777216 | read whole |       7731 |             0
+ 16777216 | rewrite    |       7731 |             0
+ 16777216 | splice     |          6 |             3
+(8 rows)
+
+SELECT method, nodes_read, nodes_written
+FROM test_value_edit_cost(16777216, 0, 0, 65536);
+   method   | nodes_read | nodes_written 
+------------+------------+---------------
+ read slice |         32 |             0
+ read whole |       7731 |             0
+ splice     |         22 |            21
+ rewrite    |       7731 |             0
+(4 rows)
+

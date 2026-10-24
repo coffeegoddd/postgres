@@ -181,6 +181,36 @@ static void DeleteInitPrivs(const ObjectAddress *object);
 
 
 /*
+ * The object the statement named that targets[i] is dropped with: the
+ * original object it was reached from, following what forced each drop
+ * (an extension, for one of its members); i itself if none is found.
+ */
+static int
+named_drop(const ObjectAddresses *targets, int i)
+{
+	int			at = i;
+
+	for (int steps = 0; steps < targets->numrefs; steps++)
+	{
+		const ObjectAddress *dependee;
+		int			j;
+
+		if (targets->extras[at].flags & DEPFLAG_ORIGINAL)
+			return at;
+		dependee = &targets->extras[at].dependee;
+		for (j = 0; j < targets->numrefs; j++)
+			if (targets->refs[j].classId == dependee->classId &&
+				targets->refs[j].objectId == dependee->objectId &&
+				targets->refs[j].objectSubId == dependee->objectSubId)
+				break;
+		if (j == targets->numrefs)
+			break;
+		at = j;
+	}
+	return i;
+}
+
+/*
  * Go through the objects given running the final actions on them, and execute
  * the actual deletion.
  */
@@ -235,7 +265,8 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 			if ((flags & PERFORM_DELETION_SKIP_ORIGINAL) &&
 				(targetObjects->extras[i].flags & DEPFLAG_ORIGINAL))
 				continue;
-			check_other_branch_dependents(&targetObjects->refs[i]);
+			check_other_branch_dependents(&targetObjects->refs[i],
+										  &targetObjects->refs[named_drop(targetObjects, i)]);
 		}
 	}
 

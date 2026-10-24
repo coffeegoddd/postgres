@@ -79,6 +79,7 @@ DECLARE_TOAST(pg_statistic_ext, 3439, 3440);
 DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380, StatisticExtOidIndexId, pg_statistic_ext, btree(oid oid_ops, stxbranch oid_ops));
 DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997, StatisticExtNameIndexId, pg_statistic_ext, btree(stxname name_ops, stxnamespace oid_ops, stxbranch oid_ops));
 DECLARE_INDEX(pg_statistic_ext_relid_index, 3379, StatisticExtRelidIndexId, pg_statistic_ext, btree(stxrelid oid_ops));
+DECLARE_INDEX(pg_statistic_ext_branch_index, 9177, StatisticExtBranchIndexId, pg_statistic_ext, btree(stxbranch oid_ops));
 
 MAKE_SYSCACHE(STATEXTOID, pg_statistic_ext_oid_index, 4);
 MAKE_SYSCACHE(STATEXTNAMENSP, pg_statistic_ext_name_index, 4);

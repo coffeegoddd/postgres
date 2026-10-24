@@ -1,0 +1,28 @@
+{
+		Name: "dolt_rebase errors: active merge, cherry-pick, or rebase",
+		SetUpScript: []string{
+			"create table t (pk int primary key, col1 varchar(100));",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+			"insert into t values (0, 'zero');",
+			"call dolt_commit('-am', 'inserting row 0');",
+
+			"call dolt_checkout('branch1');",
+			"insert into t values (0, 'nada');",
+			"call dolt_commit('-am', 'inserting row 0');",
+
+			"set @@autocommit=0;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// Merging main creates a conflict, so we're in an active
+				// merge until we resolve.
+				Query:    "call dolt_merge('main');",
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
+			},
+			{
+				Query:          "call dolt_rebase('-i', 'main');",
+				ExpectedErrStr: "unable to start rebase while a merge is in progress – abort the current merge before proceeding",
+			},
+		},
+	}

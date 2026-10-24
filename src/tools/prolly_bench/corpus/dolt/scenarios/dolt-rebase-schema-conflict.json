@@ -1,0 +1,295 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-schema-conflict",
+  "description": "Reviewed Dolt port: dolt_rebase: schema conflicts",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: schema conflicts"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 0",
+        "-a"
+      ],
+      "save": "m0"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 1",
+        "-a"
+      ],
+      "save": "b1"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN c1 varchar(100) NOT NULL DEFAULT ''",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "adding column c1",
+        "-a"
+      ],
+      "save": "b2"
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ALTER COLUMN c1 DROP NOT NULL",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMENT ON COLUMN t.c1 IS 'foo'",
+      "expect": {
+        "tag": "COMMENT"
+      }
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "altering column c1",
+        "-a"
+      ],
+      "save": "b3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_branch1; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT * FROM dolt_rebase ORDER BY rebase_order ASC",
+      "expect": {
+        "rows": [
+          [
+            "1.00",
+            "pick",
+            {
+              "ref": "b1"
+            },
+            "inserting row 1"
+          ],
+          [
+            "2.00",
+            "pick",
+            {
+              "ref": "b2"
+            },
+            "adding column c1"
+          ],
+          [
+            "3.00",
+            "pick",
+            {
+              "ref": "b3"
+            },
+            "altering column c1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "UPDATE dolt_rebase SET rebase_order = 3.1 WHERE rebase_order = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "sqlstate": "40001"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.rebase"
+      ],
+      "sql": "SELECT active_branch(), (SELECT count(*) FROM dolt_rebase)",
+      "expect": {
+        "rows": [
+          [
+            "dolt_rebase_branch1",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--abort')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Interactive rebase aborted\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "branch1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

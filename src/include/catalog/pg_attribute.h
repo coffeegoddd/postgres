@@ -222,6 +222,7 @@ typedef struct FormExtraData_pg_attribute
 
 DECLARE_UNIQUE_INDEX(pg_attribute_relid_attnam_index, 2658, AttributeRelidNameIndexId, pg_attribute, btree(attrelid oid_ops, attname name_ops, attbranch oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_attribute_relid_attnum_index, 2659, AttributeRelidNumIndexId, pg_attribute, btree(attrelid oid_ops, attnum int2_ops, attbranch oid_ops));
+DECLARE_INDEX(pg_attribute_branch_index, 9162, AttributeBranchIndexId, pg_attribute, btree(attbranch oid_ops));
 
 MAKE_SYSCACHE(ATTNAME, pg_attribute_relid_attnam_index, 32);
 MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);

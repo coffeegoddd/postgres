@@ -243,7 +243,10 @@ typedef struct xl_bmap_release
  * An entry of the release queue: a tree's node of 'level', mapping from
  * 'first', born at 'since' (the pointer to it, as a map has it); or a data
  * block (level BMAP_QUEUED_BLOCK).  It holds the block as a map's pointer
- * or entry does.
+ * or entry does.  An entry pushed by a drop before its transaction commits
+ * names that transaction (owner_hi and owner_lo, the low 48 bits of its
+ * FullTransactionId; zero: none): it holds the block only once that
+ * commits, and is let go of with nothing released if it doesn't.
  */
 #define BMAP_QUEUED_BLOCK		0xFFFF
 
@@ -251,9 +254,9 @@ typedef struct BmapQueued
 {
 	BlockNumber block;
 	uint16		level;
-	uint16		unused;
+	uint16		owner_hi;
 	BlockNumber first;
-	uint32		unused2;
+	uint32		owner_lo;
 	XLogRecPtr	since;
 } BmapQueued;
 
@@ -333,11 +336,14 @@ typedef struct xl_bmap_root_delta
 
 /*
  * A snapshot a tree's root page keeps: its id (0: the slot is free), the
- * relation's length and last fold's epoch then, and the subtrees it holds.
+ * (sub)transaction that took it (a FullTransactionId), the relation's length
+ * and last fold's epoch then, and the subtrees it holds.  A snapshot whose
+ * transaction ended without committing, a crash included, is kept by nobody.
  */
 typedef struct xl_bmap_snapshot
 {
 	uint64		id;
+	uint64		owner;
 	BlockNumber nblocks;
 	uint32		fold_epoch;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];

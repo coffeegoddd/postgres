@@ -51,6 +51,10 @@ extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
+extern void bmapprecommitdrop(SMgrRelation reln);
+extern void bmapenddrops(void);
+extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber nblocks);
 extern uint32 bmapreleasestep(SMgrRelation reln);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
@@ -120,7 +124,10 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
  * page, each a reference to the subtrees it had then, taken and let go of in
  * O(1) of the relation's size; a new relation can be made of one.  The
  * caller of bmap_snapshot_take() keeps the relation from changing, as for a
- * share.
+ * share.  A snapshot is kept only once the (sub)transaction taking it
+ * commits: one whose taker aborted, or was ended by a crash, is listed by
+ * nobody and let go of by the relation's next snapshot or its page store's
+ * next sweep.
  */
 #define BMAP_SNAPSHOTS_MAX	16
 
@@ -174,13 +181,18 @@ extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
  * block freed, a node's children queued in its place.  A step is one
  * record: some entries popped, what they let go of, the children pushed.
  * Steps are taken by one backend of a page store at a time; another, or a
- * sweep counting holders, makes a step take none.
+ * sweep counting holders, makes a step take none.  A relation dropped at a
+ * commit is queued before the commit record, its entries naming the
+ * transaction: they hold nothing until it commits (a step stops at them),
+ * and are popped with nothing let go of if it doesn't.  With autovacuum
+ * off, a relation's extension takes steps first when the store would grow.
  */
 typedef struct BmapRelease
 {
 	uint64		entries;		/* entries popped */
 	uint64		freed;			/* blocks freed */
 	uint64		unrefs;			/* counts made one less (or more) */
+	uint64		discarded;		/* of those popped, of drops that didn't commit */
 } BmapRelease;
 
 extern bool bmap_release_step(Oid spcOid, Oid dbOid, bool wait,
