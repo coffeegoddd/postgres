@@ -8094,7 +8094,10 @@ sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
  * another map sharing a snapshot's subtree shares everything under it,
  * the subtrees and blocks the tree has in common with the snapshot among
  * them, through a copy of a node as much as through the node itself); an
- * entry is, if its leaf or its block is.  The
+ * entry is, if its leaf or its block is.  Only what more than one page
+ * holds is tracked (a node or block held once is held by its one parent
+ * alone, as that parent is held), so the table is of the shared part of
+ * the map, not the whole.  The
  * snapshots' subtrees are walked first, a node reached again walked again
  * when it is newly held elsewhere, so that the tree's walk, last, finds
  * each node's mark as every pointer to it leaves it.
@@ -8143,7 +8146,7 @@ own_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
 	OwnHolders *oh = arg;
 	OwnHolder  *h;
 
-	if (node >= oh->hw)
+	if (node >= oh->hw || oh->holders[node] <= 1)
 		return true;
 	h = own_holder(oh, node);
 	h->count++;
@@ -8158,7 +8161,7 @@ own_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
 {
 	OwnHolders *oh = arg;
 
-	if (entry->block < oh->hw)
+	if (entry->block < oh->hw && oh->holders[entry->block] > 1)
 		own_holder(oh, entry->block)->count++;
 }
 
@@ -8170,6 +8173,8 @@ held_elsewhere(OwnHolders *oh, BlockNumber b)
 
 	if (b >= oh->hw)
 		return true;
+	if (oh->holders[b] <= 1)
+		return false;
 	h = hash_search(oh->own, &b, HASH_FIND, NULL);
 	return h == NULL || oh->holders[b] > h->count;
 }
@@ -8191,6 +8196,13 @@ shared_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
 	if (node >= oh->hw)
 	{
 		oh->elsewhere[level] = true;
+		return true;
+	}
+
+	/* (one held once is reached once, from its one parent) */
+	if (oh->holders[node] <= 1)
+	{
+		oh->elsewhere[level] = oh->elsewhere[level + 1];
 		return true;
 	}
 	h = own_holder(oh, node);
@@ -8219,14 +8231,15 @@ shared_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
 
 	if (!oh->tree)
 	{
-		if (oh->elsewhere[0] && entry->block < oh->hw)
+		if (oh->elsewhere[0] && entry->block < oh->hw &&
+			oh->holders[entry->block] > 1)
 			own_holder(oh, entry->block)->elsewhere = true;
 		return;
 	}
 	oh->entries++;
 	if (entry->epoch >= oh->shared_below)
 		return;
-	h = entry->block < oh->hw ?
+	h = entry->block < oh->hw && oh->holders[entry->block] > 1 ?
 		hash_search(oh->own, &entry->block, HASH_FIND, NULL) : NULL;
 	if (oh->elsewhere[0] || held_elsewhere(oh, entry->block) ||
 		(h != NULL && h->elsewhere))
@@ -8402,21 +8415,13 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 		!bmap_relation_exists(rel))
 		return;
 
-	/* (most have none to lower: their headers read first, holding nothing) */
-	headerbuf = map_read(rel, 0);
-	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
-	if (PageIsNew(BufferGetPage(headerbuf)) ||
-		PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below == 0)
-	{
-		UnlockReleaseBuffer(headerbuf);
-		return;
-	}
-	UnlockReleaseBuffer(headerbuf);
-
 	/*
-	 * (held against its drop: else a drop committed before the lowering's
-	 * record would be replayed before it, and a header dirtied after the
-	 * drop's buffers are dropped would be written to a fork unlinked)
+	 * (held against its drop before anything of it is read: else a page read
+	 * after a drop dropped its buffers would stay in shared buffers once the
+	 * fork is unlinked, for a relation given its file number later to find,
+	 * a drop committed before the lowering's record would be replayed
+	 * before it, and a header dirtied then would be written to a fork
+	 * unlinked)
 	 */
 	if (!hold_relation(rel, &held))
 		return;
@@ -8475,19 +8480,6 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	}
 	UnlockReleaseBuffer(headerbuf);
 	let_go_relation(&held);
-
-	/*
-	 * (dropped meanwhile all the same, by what holds nothing the sweep
-	 * tried: none of its pages stays in shared buffers, as sweep_relation()
-	 * makes sure)
-	 */
-	if (!bmap_relation_exists(rel))
-	{
-		ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
-		BlockNumber firsts[2] = {0, 0};
-
-		DropRelationBuffers(reln, forks, 2, firsts);
-	}
 }
 
 /*

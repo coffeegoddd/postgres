@@ -344,6 +344,7 @@ tests += {
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
       't/226_shared_below_sweep.pl',
+      't/227_shared_below_drop.pl',
       't/225_kept_commit_snapshots.pl',
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',

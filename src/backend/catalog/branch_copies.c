@@ -1005,7 +1005,8 @@ copies_drop(const char *name)
 	if (!lock_branch_for_delete(branch))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("branch \"%s\" is checked out in another session", name)));
+				 errmsg("branch \"%s\" is checked out in another session", name),
+				 errdetail("Another session is on it, or holds it for a moment (a page sweep reading its maps).")));
 	lock_branch_unprepared(branch, name);
 
 	on_branch(branch, delete_here, NULL);
@@ -1048,6 +1049,7 @@ copies_rename(const char *name, const char *newname, bool force)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("branch \"%s\" is checked out in another session", name),
+				 errdetail("Another session is on it, or holds it for a moment (a page sweep reading its maps)."),
 				 errhint("Rename it anyway with -f.")));
 
 	tup = SearchSysCacheCopy1(BRANCHOID, ObjectIdGetDatum(branch));
