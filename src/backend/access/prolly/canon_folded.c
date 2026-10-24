@@ -5975,8 +5975,8 @@ changes_run(void *arg)
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
  * a table collect() describes as a table and reads (not a partition, nor
- * one with columns of types that hold OIDs), whose baseline is of its
- * definition now.
+ * one with columns of types that hold OIDs), or a prolly materialized
+ * view, whose baseline is of its definition now.
  */
 static bool
 table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
@@ -6008,7 +6008,8 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 	PG_TRY();
 	{
 		form = rel->rd_rel;
-		if (form->relkind == RELKIND_RELATION &&
+		if ((form->relkind == RELKIND_RELATION ||
+			 form->relkind == RELKIND_MATVIEW) &&
 			form->relam == PROLLY_TABLE_AM_OID && !form->relispartition &&
 			canon_namespace(form->relnamespace) &&
 			!in_extension(RelationRelationId, relid) &&
@@ -6019,9 +6020,10 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			ProllyHash	dh;
 			BaseTable  *bt;
 			int			save_nestlevel;
+			bool		matview = form->relkind == RELKIND_MATVIEW;
 
 			initStringInfo(&key);
-			appendStringInfoString(&key, "t:");
+			appendStringInfoString(&key, matview ? "m:" : "t:");
 			append_utf8(&key, qualified(form->relnamespace,
 										NameStr(form->relname)));
 			/* (the table's entry alone: a status asks each table so) */
@@ -6035,7 +6037,18 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
 									 false);
 			initStringInfo(&desc);
-			table_description(&cn, rel, &desc, &dh);
+			if (matview)
+			{
+				/* (as collect_relation() describes one) */
+				append_matview_state(&desc, form);
+				append_utf8(&desc,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(relid),
+																	BoolGetDatum(false))));
+				table_shape(&cn, rel, &desc, &dh, NULL);
+			}
+			else
+				table_description(&cn, rel, &desc, &dh);
 
 			/*
 			 * (its rows folded under the shape they have now, as table_root()
