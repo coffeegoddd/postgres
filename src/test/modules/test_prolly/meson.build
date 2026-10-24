@@ -343,6 +343,7 @@ tests += {
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/280_merge_kept_references.pl',
+      't/281_unique_collation_collisions.pl',
       't/310_reflog_after_gc.pl',
     ],
   },

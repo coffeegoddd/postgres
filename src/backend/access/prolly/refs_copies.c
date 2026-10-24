@@ -5771,10 +5771,13 @@ violations_append(const char *branch, ProllyViolation *const *violations,
 	edits[0].value.len = next.len;
 	for (int i = 0; i < n; i++)
 	{
-		initStringInfo(&keys[i]);
+		/* (sized to them: a batch holds as many as its rows' bytes allow) */
+		initStringInfoExt(&keys[i], prefix.len + 8 + 1);
 		appendBinaryStringInfo(&keys[i], prefix.data, prefix.len);
 		put_be64(&keys[i], place + i);
-		initStringInfo(&values[i]);
+		initStringInfoExt(&values[i], 4 + 3 * 4 + strlen(violations[i]->type) +
+						  strlen(violations[i]->row) +
+						  strlen(violations[i]->info) + 1);
 		put_violation(&values[i], violations[i]);
 		edits[i + 1].key.data = (const uint8 *) keys[i].data;
 		edits[i + 1].key.len = keys[i].len;

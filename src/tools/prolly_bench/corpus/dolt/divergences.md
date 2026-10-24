@@ -300,8 +300,9 @@ OF` are built in D18's shapes.
   constraint: the branch keeps its own version of that key (none, for a
   new one). The violations are Dolt's: the row not written and each row
   it collides with, once for each unique index it breaks (an index of
-  plain columns without a predicate; for another, the row not written
-  alone, for the index its write was refused for). Check and not-null
+  plain columns, by the index's own equality and collation; for an index
+  of expressions, the row not written alone, for the index its write was
+  refused for). Check and not-null
   constraints keep their breaking rows out too: those rows are recorded,
   not written. A row breaking
   an exclusion constraint (which Dolt doesn't have) is handled the same
@@ -324,8 +325,9 @@ OF` are built in D18's shapes.
   table can't hold both, so there is no state in which Dolt's rows
   exist.
 - **Port:** expected violations are Dolt's; expected rows follow
-  prolly's: the table has one row fewer than Dolt's (a count of its
-  rows, as `DELETE`'s, is one lower).
+  prolly's: the table has one row fewer than Dolt's for each row the
+  merge didn't write (a count of its rows, as `DELETE`'s, is that much
+  lower).
 
 ## D13. Rows breaking a check a merge adds
 

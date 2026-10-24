@@ -399,9 +399,14 @@ A row a merge didn't write for breaking a unique index is recorded as
 Dolt records it: once for each unique index it breaks, and so is each
 row of the table it collides with there (the table keeping those).
 Those kept are spooled to a tuplesort of their own; once the merge's
-rows are written, each is matched, by a query per unique index of plain
-columns without a predicate, against the rows it collides with, and the
-violations found are kept as any other.
+rows are written, they are matched a batch at a time, by a query per
+unique index of plain columns (its predicate, if any, held by both rows;
+each column compared by the index's own equality and collation, so the
+index serves the lookup, but for NULLS NOT DISTINCT), against the rows
+they collide with, as the merge's other checks run (seeing its writes,
+as the table's owner, row security aside), and the violations found are
+kept as any other.  A refused row colliding with none now, or refused
+for an index of expressions, keeps its refusal's own record.
 
 The violations a merge keeps go to a tuplesort of their own (work_mem,
 spilling past it).  To publish them, the branch's violations are visited

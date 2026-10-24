@@ -207,8 +207,8 @@ SELECT * FROM cm.u ORDER BY pk;
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cm.u');
  violation_type |          violating_row          
 ----------------+---------------------------------
- unique index   | {"pk": 2, "col1": 1, "col2": 1}
  unique index   | {"pk": 1, "col1": 1, "col2": 1}
+ unique index   | {"pk": 2, "col1": 1, "col2": 1}
 (2 rows)
 
 ROLLBACK;

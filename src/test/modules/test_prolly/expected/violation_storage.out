@@ -133,8 +133,8 @@ FROM unnest(ARRAY['vs.child', 'vs.u']) t,
 -------+----------------+--------------------
  child | foreign key    | {"p": 1, "id": 1}
  child | foreign key    | {"p": 2, "id": 2}
- u     | unique index   | {"b": 1, "pk": 11}
  u     | unique index   | {"b": 1, "pk": 10}
+ u     | unique index   | {"b": 1, "pk": 11}
 (4 rows)
 
 SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
@@ -195,8 +195,8 @@ FROM unnest(ARRAY['vs.child', 'vs.u']) t,
 -------+----------------+--------------------
  child | foreign key    | {"p": 1, "id": 1}
  child | foreign key    | {"p": 2, "id": 2}
- u     | unique index   | {"b": 1, "pk": 11}
  u     | unique index   | {"b": 1, "pk": 10}
+ u     | unique index   | {"b": 1, "pk": 11}
 (4 rows)
 
 -- Set again (the rows fixed and checked), those fixed go.
@@ -212,8 +212,8 @@ FROM unnest(ARRAY['vs.child', 'vs.u']) t,
 	LATERAL dolt_constraint_violations(t);
  t | violation_type |   violating_row    
 ---+----------------+--------------------
- u | unique index   | {"b": 1, "pk": 11}
  u | unique index   | {"b": 1, "pk": 10}
+ u | unique index   | {"b": 1, "pk": 11}
 (2 rows)
 
 SELECT length(dolt_commit('-afm', 'vs checked')::text) AS committed;

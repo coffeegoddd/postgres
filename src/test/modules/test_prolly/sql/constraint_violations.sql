@@ -469,6 +469,82 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'ux_side');
 DROP SCHEMA ux CASCADE;
 
+-- The rows collided with are as the merge left them: pk 1, whose a ours
+-- moved to 9 and whose c theirs changed, is recorded with theirs' c
+CREATE SCHEMA uy VERSIONED;
+CREATE TABLE uy.t (pk int PRIMARY KEY, a int UNIQUE, c text);
+INSERT INTO uy.t VALUES (1, 1, 'base');
+SELECT length(dolt_commit('-Am', 'uy base')::text) AS committed;
+SELECT dolt_branch('uy_side');
+UPDATE uy.t SET a = 9;
+SELECT length(dolt_commit('-am', 'uy ours')::text) AS committed;
+SELECT dolt_checkout('uy_side');
+UPDATE uy.t SET c = 'theirs';
+INSERT INTO uy.t VALUES (2, 9, 'new');
+SELECT length(dolt_commit('-am', 'uy theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uy_side'))[3:4];
+SELECT * FROM uy.t ORDER BY pk;
+SELECT violating_row::text, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.t') ORDER BY 1;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uy_side');
+
+-- a column named t; NULLS NOT DISTINCT; a partial index (its predicate
+-- held by both rows); and an index's own equality: under record_image_ops
+-- (1.0) and (1.00) are different values, so they don't collide
+CREATE TYPE uy.n AS (v numeric);
+CREATE TABLE uy.x (pk int PRIMARY KEY, t int UNIQUE, n int UNIQUE NULLS NOT DISTINCT,
+	p int, r uy.n);
+CREATE UNIQUE INDEX x_p_part ON uy.x (p) WHERE p > 0;
+CREATE UNIQUE INDEX x_r_image ON uy.x (r record_image_ops);
+INSERT INTO uy.x VALUES (1, 1, 1, 1, ROW(1));
+SELECT length(dolt_commit('-Am', 'uy x base')::text) AS committed;
+SELECT dolt_branch('uy_x');
+INSERT INTO uy.x VALUES (10, 7, NULL, 5, ROW(1.0)), (11, 8, 11, -1, ROW(2));
+SELECT length(dolt_commit('-am', 'uy x ours')::text) AS committed;
+SELECT dolt_checkout('uy_x');
+-- (20: t with 10; 21: NULL n with 10; 22: p 5 with 10; 23: p -1 is out of
+-- the index; 24: (1.00) isn't (1.0) by its image; 25: (1.0) is)
+INSERT INTO uy.x VALUES (20, 7, 20, 20, ROW(20)), (21, 21, NULL, 21, ROW(21)),
+	(22, 22, 22, 5, ROW(22)), (23, 23, 23, -1, ROW(23)), (24, 24, 24, 24, ROW(1.00)),
+	(25, 25, 25, 25, ROW(1.0));
+SELECT length(dolt_commit('-am', 'uy x theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uy_x'))[3:4];
+SELECT pk FROM uy.x ORDER BY pk;
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.x') ORDER BY 1, 2;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uy_x');
+
+-- a row collided with that row security hides is found, as a foreign
+-- key's checks find rows
+CREATE TABLE uy.s (pk int PRIMARY KEY, a int UNIQUE, c text);
+ALTER TABLE uy.s ENABLE ROW LEVEL SECURITY;
+ALTER TABLE uy.s FORCE ROW LEVEL SECURITY;
+CREATE POLICY sel ON uy.s FOR SELECT USING (c <> 'hidden');
+CREATE POLICY ins ON uy.s FOR INSERT WITH CHECK (true);
+CREATE POLICY upd ON uy.s FOR UPDATE USING (true);
+CREATE POLICY del ON uy.s FOR DELETE USING (true);
+INSERT INTO uy.s VALUES (1, 1, 'base');
+SELECT length(dolt_commit('-Am', 'uy s base')::text) AS committed;
+SELECT dolt_branch('uy_s');
+INSERT INTO uy.s VALUES (2, 7, 'hidden');
+SELECT length(dolt_commit('-am', 'uy s ours')::text) AS committed;
+SELECT dolt_checkout('uy_s');
+INSERT INTO uy.s VALUES (3, 7, 'theirs');
+SELECT length(dolt_commit('-am', 'uy s theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uy_s'))[3:4];
+SELECT violating_row::text FROM dolt_constraint_violations('uy.s') ORDER BY 1;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uy_s');
+DROP SCHEMA uy CASCADE;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
 DROP ROLE regress_cv_owner;

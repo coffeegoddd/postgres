@@ -269,8 +269,8 @@ SELECT * FROM kv.sibling;
 SELECT violation_type, violating_row FROM dolt_constraint_violations('kv.u');
  violation_type |  violating_row   
 ----------------+------------------
- unique index   | {"x": 5, "y": 5}
  unique index   | {"x": 5, "y": 9}
+ unique index   | {"x": 5, "y": 5}
 (2 rows)
 
 SET LOCAL dolt.allow_commit_conflicts = on;
