@@ -100,11 +100,15 @@ SELECT email FROM h.users LIMIT 3;
 SELECT count(*) FROM h.users WHERE commit_hash = 'nonsense';
 SELECT count(*) FROM h.users WHERE commit_hash = NULL;
 SELECT count(*) FROM h.users WHERE commit_hash = :'cside' AND tenant_id = 60;
--- joined to the log: a nested loop reads each outer row's commit alone
+-- joined to some commits: a nested loop reads each outer row's commit
+-- alone; and to the log
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-EXPLAIN (COSTS OFF) SELECT c.message, u.email FROM dolt_log c
-JOIN h.users u ON u.commit_hash = c.commit_hash AND u.tenant_id = 4 AND u.id = 42;
+EXPLAIN (COSTS OFF) SELECT u.email FROM (VALUES (:'c1'), (:'c2')) v(c)
+JOIN h.users u ON u.commit_hash = v.c AND u.tenant_id = 4 AND u.id = 42;
+SELECT u.email, u.commit_hash = :'c1' AS at_c1 FROM (VALUES (:'c1'), (:'c2')) v(c)
+JOIN h.users u ON u.commit_hash = v.c AND u.tenant_id = 4 AND u.id = 42
+ORDER BY 2 DESC;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 SELECT c.message, u.email FROM dolt_log c

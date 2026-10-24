@@ -1,0 +1,417 @@
+-- History mounts: a table at every commit a commit reaches, as
+-- dolt_history_table() gives it, as a foreign table
+-- (prolly_mount(..., history => true)).  A scan streams a commit at a
+-- time; an equality on commit_hash reads that commit alone, and the
+-- primary key's bounds seek in each commit.
+CREATE DATABASE regress_history_mounts;
+\c regress_history_mounts
+CREATE EXTENSION test_prolly;
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked of (the session's counts flushed by the statement before).
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA hs VERSIONED;
+CREATE TABLE hs.users (tenant_id int, id int, email text, PRIMARY KEY (tenant_id, id));
+INSERT INTO hs.users SELECT g / 100, g % 100, 'p' || g FROM generate_series(0, 999) g;
+CREATE TABLE hs.bag (v int);
+INSERT INTO hs.bag VALUES (1), (1), (2);
+SELECT length(dolt_commit('-Am', 'first')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c1 \gset
+UPDATE hs.users SET email = 'changed' WHERE tenant_id = 4 AND id = 42;
+DELETE FROM hs.bag WHERE v = 2;
+SELECT length(dolt_commit('-Am', 'second')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c2 \gset
+-- a column added: older commits have it NULL
+ALTER TABLE hs.users ADD COLUMN note text;
+UPDATE hs.users SET note = 'n' WHERE id = 1;
+-- a table made later: no rows before it
+CREATE TABLE hs.late (id int PRIMARY KEY);
+INSERT INTO hs.late VALUES (1);
+SELECT length(dolt_commit('-Am', 'third')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c3 \gset
+-- a merge: its branch's commits too, each once
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+INSERT INTO hs.users VALUES (50, 1, 'side', NULL);
+SELECT length(dolt_commit('-Am', 'on side')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS cside \gset
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO hs.users VALUES (60, 1, 'main', NULL);
+SELECT length(dolt_commit('-Am', 'on main')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT length(dolt_merge('side')::text) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS commits FROM dolt_log \gset
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'h', NULL, false, true);
+ mount 
+-------
+ h
+(1 row)
+
+SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+FROM pg_attribute a WHERE a.attrelid = 'h.users'::regclass AND a.attnum > 0
+ORDER BY a.attnum;
+   attname   |       format_type        
+-------------+--------------------------
+ tenant_id   | integer
+ id          | integer
+ email       | text
+ note        | text
+ commit_hash | text
+ committer   | text
+ commit_date | timestamp with time zone
+(7 rows)
+
+-- the rows of every commit, as dolt_history_table() has them
+SELECT count(DISTINCT commit_hash) = :commits AS every_commit FROM h.users;
+ every_commit 
+--------------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM (
+		SELECT tenant_id, id, email, note, commit_hash, committer, commit_date FROM h.users
+		EXCEPT ALL
+		SELECT (row).tenant_id, (row).id, (row).email, (row).note, commit_hash, committer, commit_date
+		FROM dolt_history_table(NULL::hs.users)) d) AS only_mount,
+	(SELECT count(*) FROM (
+		SELECT (row).tenant_id, (row).id, (row).email, (row).note, commit_hash, committer, commit_date
+		FROM dolt_history_table(NULL::hs.users)
+		EXCEPT ALL
+		SELECT tenant_id, id, email, note, commit_hash, committer, commit_date FROM h.users) d) AS only_function;
+ only_mount | only_function 
+------------+---------------
+          0 |             0
+(1 row)
+
+-- and as its jsonb overload has them, by name
+SELECT count(*) = (SELECT count(*) FROM h.users) AS as_many,
+	count(*) FILTER (WHERE row->>'email' = 'changed') AS changed
+FROM dolt_history_table('hs.users');
+ as_many | changed 
+---------+---------
+ t       |       5
+(1 row)
+
+-- a row through its versions
+SELECT email, note, commit_hash = :'c1' AS at_c1 FROM h.users
+WHERE tenant_id = 4 AND id = 42 ORDER BY commit_date, email;
+  email  | note | at_c1 
+---------+------+-------
+ p442    |      | t
+ changed |      | f
+ changed |      | f
+ changed |      | f
+ changed |      | f
+ changed |      | f
+(6 rows)
+
+SELECT count(*) FILTER (WHERE note IS NOT NULL) AS noted,
+	count(*) FILTER (WHERE commit_hash = :'c1') AS at_c1
+FROM h.users WHERE id = 1;
+ noted | at_c1 
+-------+-------
+    40 |    10
+(1 row)
+
+-- keyless copies; a table only some commits have
+SELECT v, count(*) FROM h.bag WHERE commit_hash = :'c1' GROUP BY v ORDER BY v;
+ v | count 
+---+-------
+ 1 |     2
+ 2 |     1
+(2 rows)
+
+SELECT v, count(*) FROM h.bag WHERE commit_hash = :'c2' GROUP BY v ORDER BY v;
+ v | count 
+---+-------
+ 1 |     2
+(1 row)
+
+SELECT count(*) = :commits - 2 AS later_commits FROM h.late;
+ later_commits 
+---------------
+ t
+(1 row)
+
+-- the merged-in branch's commit is in the history once
+SELECT count(*) FROM h.users WHERE commit_hash = :'cside' AND tenant_id = 50;
+ count 
+-------
+     1
+(1 row)
+
+-- An equality on commit_hash reads that commit alone, a key equality
+-- seeks in each commit; LIMIT stops the scan.
+SET plan_cache_mode = force_generic_plan;
+PREPARE at_commit(text) AS
+	SELECT email FROM h.users WHERE commit_hash = $1 AND tenant_id = 4 AND id = 42;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+EXECUTE at_commit(:'c1');
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Foreign Scan on users (actual rows=1.00 loops=1)
+   Filter: ((commit_hash = $1) AND (tenant_id = 4) AND (id = 42))
+   Snapshot Access: history of one commit, primary key, 2 equal
+   Rows Read: 1
+(4 rows)
+
+EXECUTE at_commit(:'c1');
+ email 
+-------
+ p442
+(1 row)
+
+EXECUTE at_commit(:'c2');
+  email  
+---------
+ changed
+(1 row)
+
+DEALLOCATE at_commit;
+RESET plan_cache_mode;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT email FROM h.users WHERE tenant_id = 4 AND id = 42;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Foreign Scan on users (actual rows=6.00 loops=1)
+   Filter: ((tenant_id = 4) AND (id = 42))
+   Snapshot Access: history, primary key, 2 equal
+   Rows Read: 6
+(4 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT email FROM h.users LIMIT 3;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Limit (actual rows=3.00 loops=1)
+   ->  Foreign Scan on users (actual rows=3.00 loops=1)
+         Snapshot Access: history, full
+         Rows Read: 3
+(4 rows)
+
+-- a commit the mount's commit doesn't reach, or no commit at all: none
+SELECT count(*) FROM h.users WHERE commit_hash = 'nonsense';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM h.users WHERE commit_hash = NULL;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM h.users WHERE commit_hash = :'cside' AND tenant_id = 60;
+ count 
+-------
+     0
+(1 row)
+
+-- joined to some commits: a nested loop reads each outer row's commit
+-- alone; and to the log
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+EXPLAIN (COSTS OFF) SELECT u.email FROM (VALUES (:'c1'), (:'c2')) v(c)
+JOIN h.users u ON u.commit_hash = v.c AND u.tenant_id = 4 AND u.id = 42;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Values Scan on "*VALUES*"
+   ->  Foreign Scan on users u
+         Filter: ((tenant_id = 4) AND (id = 42) AND (commit_hash = "*VALUES*".column1))
+         Snapshot Access: history of one commit, primary key, 2 equal
+(5 rows)
+
+SELECT u.email, u.commit_hash = :'c1' AS at_c1 FROM (VALUES (:'c1'), (:'c2')) v(c)
+JOIN h.users u ON u.commit_hash = v.c AND u.tenant_id = 4 AND u.id = 42
+ORDER BY 2 DESC;
+  email  | at_c1 
+---------+-------
+ p442    | t
+ changed | f
+(2 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT c.message, u.email FROM dolt_log c
+JOIN h.users u ON u.commit_hash = c.commit_hash AND u.tenant_id = 4 AND u.id = 42
+ORDER BY c.commit_order;
+            message            |  email  
+-------------------------------+---------
+ first                         | p442
+ second                        | changed
+ third                         | changed
+ on main                       | changed
+ on side                       | changed
+ Merge branch 'side' into main | changed
+(6 rows)
+
+-- Work: a selective lookup decodes the same, however long the history; a
+-- full read decodes every commit's rows.
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT email FROM h.users WHERE commit_hash = :'c2' AND tenant_id = 4 AND id = 42;
+  email  
+---------
+ changed
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS one_commit_lookup;
+ one_commit_lookup 
+-------------------
+                 3
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'more')::text) > 0,
+	length(dolt_commit('--allow-empty', '-m', 'and more')::text) > 0;
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT prolly_refresh_mount('h') IS NOT NULL AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT email FROM h.users WHERE commit_hash = :'c2' AND tenant_id = 4 AND id = 42;
+  email  
+---------
+ changed
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS longer_history_lookup;
+ longer_history_lookup 
+-----------------------
+                     3
+(1 row)
+
+SELECT count(*) FROM h.users WHERE tenant_id = 4 AND id = 42;
+ count 
+-------
+     8
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') <= (:commits + 2) * 4 AS per_commit_seek;
+ per_commit_seek 
+-----------------
+ t
+(1 row)
+
+-- A key changed in history: the commits keyed otherwise are read whole,
+-- and still give their rows.
+CREATE TABLE hs.rekeyed (a int, b int, PRIMARY KEY (a));
+INSERT INTO hs.rekeyed VALUES (1, 10), (2, 20);
+SELECT length(dolt_commit('-Am', 'keyed by a')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE hs.rekeyed DROP CONSTRAINT rekeyed_pkey, ADD PRIMARY KEY (b);
+SELECT length(dolt_commit('-Am', 'keyed by b')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'hk', ARRAY['rekeyed'], false, true);
+ mount 
+-------
+ hk
+(1 row)
+
+SELECT a, count(*) FROM hk.rekeyed WHERE b = 20 GROUP BY a;
+ a | count 
+---+-------
+ 2 |     2
+(1 row)
+
+-- Refused: a history mount with index trees, or of a table with a column
+-- named as the commit's.
+SELECT * FROM prolly_mount('HEAD', 'hs', 'hx', NULL, true, true);
+ERROR:  a history mount can't build index trees
+HINT:  Mount the history without indexes, or a commit with them.
+CREATE TABLE hs.clash (id int PRIMARY KEY, commit_hash text);
+SELECT length(dolt_commit('-Am', 'clash')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT * FROM prolly_mount('HEAD', 'hs', 'hc', ARRAY['clash'], false, true);
+ERROR:  prolly_mount can't mount the history of "hs.clash": it has a column "commit_hash"
+DETAIL:  A history mount's table adds commit_hash, committer and commit_date.
+SELECT prolly_unmount('h'), prolly_unmount('hk');
+ prolly_unmount | prolly_unmount 
+----------------+----------------
+                | 
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_history_mounts;

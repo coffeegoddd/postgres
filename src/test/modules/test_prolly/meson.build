@@ -211,6 +211,7 @@ tests += {
       'kept_pages',
       'first_use_kept',
       'snapshot_mounts',
+      'history_mounts',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
