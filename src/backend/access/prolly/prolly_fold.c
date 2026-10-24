@@ -16,6 +16,7 @@
 #include "access/prolly_changes.h"
 #include "access/prolly_config.h"
 #include "access/prolly_fold.h"
+#include "access/prolly_folder.h"
 #include "access/tableam.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -392,6 +393,7 @@ prolly_fold_reorder(const ProllyKeyingRoutine *kr, ProllyKeying *k,
 
 		fold_sort_put(sort, &kb, &vb, 1);
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	PROLLY_CALL(tree, cursor_close, cur);
 	tuplesort_performsort(sort);
@@ -414,6 +416,7 @@ prolly_fold_reorder(const ProllyKeyingRoutine *kr, ProllyKeying *k,
 		resetStringInfo(&prev);
 		appendBinaryStringInfo(&prev, (const char *) key.data, key.len);
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	PROLLY_CALL(tree, build_finish, builder, &reordered);
 	if (unique)
@@ -484,6 +487,7 @@ fold_sort_build(Tuplesortstate *sort, const ProllyKeyingRoutine *kr,
 		}
 		copies += t->copies;
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	/* (a tree begun is finished, used or not) */
 	PROLLY_CALL(tree, build_finish, b, data);
@@ -520,6 +524,7 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 		fold_sort_put(sort, &key, &row, 1);
 		done->rows_read++;
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	table_endscan(scan);
 	if (!fold_sort_build(sort, kr, k, keyless, tree, env, data, done))
@@ -846,6 +851,7 @@ map_pass(Map *m, const ProllyNodeRef *from, bool sorted, ProllyNodeRef *data)
 		}
 		m->rows++;
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	PROLLY_CALL(m->tree, cursor_close, cur);
 	if (sorted)

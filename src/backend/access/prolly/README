@@ -674,7 +674,11 @@ settled, leaves the working set known to be a commit's root, each
 block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
 change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
-since a commit kept already reusing that one's.  Only while nothing else
+since a commit kept already reusing that one's.  A snapshot writes out only
+the relation's pages changed since its last snapshot (those its map walk
+finds), never visiting the buffers; redo of one still flushes the
+relation's buffers in a pass over them all, so a standby or crash recovery
+pays O(the buffers) per snapshot replayed.  Only while nothing else
 can be on the pages: the relations are locked against writers without
 waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is
@@ -828,6 +832,31 @@ without pause doesn't keep a slot from the others.  Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.
+
+The fold worker's folds can be paced as vacuum is, under the cost-based
+delay: prolly_fold_worker_cost_delay (ms; 0, the default, is off) and
+prolly_fold_worker_cost_limit (-1 takes vacuum_cost_limit).  While a fold
+of the worker's is paced, the buffer manager charges the pages it reads
+and dirties (the change logs', the tables', their indexes'), and
+prolly_fold_delay_point(), in the folds' row loops (the log finder's and
+the full fold's), charges the tree nodes read since as hit pages and
+those written as dirtied ones (each is appended, WAL-logged and synced),
+then naps once the limit is spent; pg_stat_prolly's
+fold_worker_cost_delays counts the naps.  So background folds take a
+share of the I/O and CPU, not all they can.  A paced fold holds its locks and its
+snapshot through its naps, so it gives way to whoever waits for them:
+before each nap, if another backend waits for a lock that conflicts with
+one it holds, fast-path ones included, or for its virtual transaction (as
+CREATE INDEX CONCURRENTLY waits for older snapshots) (AnyLockHasWaiters()),
+it gives up, a retry
+(fold_worker_retries), the branch backed off; and it naps 10 s in all at
+most, then goes on unpaced, so its snapshot holds the xmin horizon back
+no longer.  A reload of the settings reaches a fold under way.  The trade: a paced fold
+takes longer, so more writes queue behind it, which batches them (fewer
+chunk writes) but leaves a commit or status during the writes more to
+fold itself.  It is off by default; fold_worker_retries showing folds
+lost to commits, under load, is the reason to turn it on.  No other fold
+(a commit's, a status's, autovacuum's automatic fold) is paced.
 
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the

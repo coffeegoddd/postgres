@@ -770,6 +770,8 @@ typedef enum PgStat_ProllyCounter
 										 * back, the refs held or the
 										 * branch moved meanwhile: tried
 										 * again next pass */
+	PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS,	/* naps the fold worker's paced
+											 * folds took */
 	PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED,	/* branch checkpoints after
 												 * a table rewrite given up:
 												 * a lock not free, or an
