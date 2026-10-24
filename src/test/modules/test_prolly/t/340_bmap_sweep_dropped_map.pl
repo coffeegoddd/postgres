@@ -5,7 +5,9 @@
 # its files not yet unlinked, is read by a sweep run meanwhile: its map's
 # pages come back into shared buffers.  Once the files are unlinked none of
 # them is left there, where a relation given its file number after the next
-# checkpoint would find them.
+# checkpoint would find them.  A drop no such read can have come in the
+# middle of (no sweep under way as it dropped its buffers, and none begun
+# since) leaves the buffer pool unscanned after the unlink.
 
 use strict;
 use warnings FATAL => 'all';
@@ -31,6 +33,8 @@ sql(q{
 	CREATE SCHEMA kv VERSIONED;
 	CREATE TABLE kv.t1 (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
 	INSERT INTO kv.t1 SELECT g, repeat('y', 100) FROM generate_series(1, 3000) g;
+	CREATE TABLE kv.t2 (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO kv.t2 SELECT g, repeat('y', 100) FROM generate_series(1, 300) g;
 	CHECKPOINT;
 });
 
@@ -42,7 +46,8 @@ my $cached_map = qq{SELECT count(*) FROM pg_buffercache
 # t1 dropped: committed, its buffers dropped, its files not yet unlinked
 my $drop = $node->background_psql('postgres');
 $drop->query_safe(q{SELECT injection_points_set_local();
-	SELECT injection_points_attach('bmap-drops-done', 'wait')});
+	SELECT injection_points_attach('bmap-drops-done', 'wait');
+	SELECT injection_points_attach('smgr-redrop-buffers', 'notice')});
 $drop->query_until(qr/started/, qq{
 	\\echo started
 	DROP TABLE kv.t1;
@@ -60,11 +65,22 @@ cmp_ok(sql($cached_map), '>', 0, 'the sweep read the dropped map');
 sql(q{SELECT injection_points_wakeup('bmap-drops-done')});
 $drop->query_until(qr/done/, '');
 is(sql($cached), '0', 'none of the dropped map\'s pages stays cached after the unlink');
+like($drop->{stderr}, qr/smgr-redrop-buffers/, 'the drop scanned the buffer pool again');
 
 # a sweep after finds nothing of t1 either
 sql(q{SELECT count(*) FROM prolly_page_sweep()});
 is(sql($cached), '0', 'nor after a later sweep');
 
 $drop->quit;
+
+# with no sweep, the drop doesn't scan the buffer pool again
+my ($ret, $out, $err) = $node->psql('postgres', q{
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('smgr-redrop-buffers', 'notice');
+	DROP TABLE kv.t2;
+});
+is($ret, 0, 'a drop with no sweep under way');
+unlike($err, qr/smgr-redrop-buffers/, 'leaves the buffer pool unscanned after the unlink');
+
 $node->stop;
 done_testing();

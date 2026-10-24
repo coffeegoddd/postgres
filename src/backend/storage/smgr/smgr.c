@@ -73,6 +73,7 @@
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 
 
@@ -200,13 +201,17 @@ typedef struct f_smgr
 	bool		(*smgr_writesread) (ForkNumber forknum);
 
 	/*
-	 * Does the storage manager read a relation whose drop has committed
-	 * until its files are unlinked (a page sweep counting what every map of
-	 * a store holds)?  Such a read, after the relation's buffers were
-	 * dropped, brings pages back into shared buffers, so they are dropped
-	 * again once the files are gone.
+	 * For a storage manager that reads relations whose drop has committed,
+	 * until their files are unlinked (a page sweep counting what every map
+	 * of a store holds): such a read after the relations' buffers were
+	 * dropped brings pages back into shared buffers.  smgr_dropbuffers is
+	 * called before the buffers of relations being unlinked are dropped,
+	 * smgr_readdropped after the files are unlinked: true if such a read
+	 * may have come in between, the relations' buffers then dropped again.
+	 * Both NULL, or neither.
 	 */
-	bool		smgr_readsdropped;
+	void		(*smgr_dropbuffers) (void);
+	bool		(*smgr_readdropped) (void);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
@@ -296,7 +301,8 @@ static const f_smgr smgrsw[] = {
 		.smgr_beforeextend = bmapbeforeextend,
 		.smgr_releasestep = bmapreleasestep,
 		.smgr_writesread = bmapwritesread,
-		.smgr_readsdropped = true,
+		.smgr_dropbuffers = bmapdropbuffers,
+		.smgr_readdropped = bmapreaddropped,
 		.smgr_unlink = bmapunlink,
 		.smgr_extend = bmapextend,
 		.smgr_zeroextend = bmapzeroextend,
@@ -1019,6 +1025,24 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 			smgrsw[which].smgr_predrop(rels[i], isRedo);
 	}
 
+	/* (what reads the relations meanwhile, told: see below) */
+	if (!isRedo)
+	{
+		for (int which = 0; which < NSmgr; which++)
+		{
+			if (smgrsw[which].smgr_dropbuffers == NULL)
+				continue;
+			for (i = 0; i < nrels; i++)
+			{
+				if (rels[i]->smgr_which == which)
+				{
+					smgrsw[which].smgr_dropbuffers();
+					break;
+				}
+			}
+		}
+	}
+
 	/*
 	 * Get rid of any remaining buffers for the relations.  bufmgr will just
 	 * drop them without bothering to write the contents.
@@ -1074,21 +1098,37 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	}
 
 	/*
-	 * The buffers a storage manager's own readers read back between the drop
-	 * of the buffers and the unlink, dropped too.  A reader that reads them
-	 * after this finds the files gone, once it has read them, and drops them
-	 * itself.  (Recovery runs no such readers.)
+	 * The buffers a storage manager's own readers may have read back between
+	 * the drop of the buffers and the unlink, dropped too.  A reader that
+	 * reads them after this finds the files gone, once it is done with them
+	 * (or fails), and drops them itself.  (Recovery runs no such readers.)
 	 */
 	if (!isRedo)
 	{
 		SMgrRelation *redrop = palloc_array(SMgrRelation, nrels);
 		int			nredrop = 0;
+		bool		asked[lengthof(smgrsw)] = {0};
+		bool		read[lengthof(smgrsw)] = {0};
 
 		for (i = 0; i < nrels; i++)
-			if (smgrsw[rels[i]->smgr_which].smgr_readsdropped)
+		{
+			int			which = rels[i]->smgr_which;
+
+			if (smgrsw[which].smgr_readdropped == NULL)
+				continue;
+			if (!asked[which])
+			{
+				read[which] = smgrsw[which].smgr_readdropped();
+				asked[which] = true;
+			}
+			if (read[which])
 				redrop[nredrop++] = rels[i];
+		}
 		if (nredrop > 0)
+		{
+			INJECTION_POINT("smgr-redrop-buffers", NULL);
 			DropUnlinkedRelationsAllBuffers(redrop, nredrop);
+		}
 		pfree(redrop);
 	}
 
