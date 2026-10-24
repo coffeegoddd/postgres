@@ -1707,6 +1707,25 @@ typedef struct TreeLeaf
 #define TREE_FIND_TRIES		8
 
 /*
+ * In recovery: has reln's map no root page, neither in a buffer nor on disk
+ * (one made in this replay has it in a buffer until it is written out)?
+ * Then it is a map dropped later in the WAL, whose header an earlier
+ * record's image made again (redo makes a missing file to restore an image
+ * in), or one that lost its pages.  The root's buffer is asked first, as it
+ * is nearly always cached; the file only when it isn't.
+ */
+static bool
+map_root_lost(SMgrRelation reln)
+{
+	PrefetchBufferResult r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, 1);
+
+	if (BufferIsValid(r.recent_buffer))
+		return false;
+	return mdexists(reln, BMAP_FORKNUM) &&
+		mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES;
+}
+
+/*
  * Look up logical block 'blkno' in reln's map, if it is a tree: its leaf
  * into *leaf, and the leaf's entries from the block's on, at most n (and
  * none past the leaf), into entries[].  See read_entries() for 'for_write'
@@ -1726,25 +1745,6 @@ typedef struct TreeLeaf
  * needs the old.)  So the block's records from before then are skipped,
  * and its pages go nowhere: TREE_UNAVAILABLE.
  */
-/*
- * In recovery: has reln's map no root page, neither on disk nor in a buffer
- * (one made in this replay has it in a buffer until it is written out)?
- * Then it is a map dropped later in the WAL, whose header an earlier
- * record's image made again (redo makes a missing file to restore an image
- * in), or one that lost its pages.
- */
-static bool
-map_root_lost(SMgrRelation reln)
-{
-	PrefetchBufferResult r;
-
-	if (!mdexists(reln, BMAP_FORKNUM) ||
-		mdnblocks(reln, BMAP_FORKNUM) >= BMAP_TREE_MAP_PAGES)
-		return false;
-	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, 1);
-	return !BufferIsValid(r.recent_buffer);
-}
-
 static TreeFound
 tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 		  bool cached_only, uint32 n, BmapEntry *entries, TreeLeaf *leaf)
