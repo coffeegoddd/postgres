@@ -17267,12 +17267,158 @@ index_columns(const char *what, const ProllyComponents *c, List *stale,
 }
 
 /*
+ * The routines and types of the session's branch a commit's record lists
+ * (prolly_owned_objects()), kept from one commit to the next: a commit
+ * lists them all, so that a move finds any one's owner, but works out
+ * again only those changed since.  Each is kept with its catalog row's
+ * place and inserting transaction, which any change to the row (an ALTER,
+ * an owner changed) changes, so an unchanged row's name is taken as it
+ * was.  The caches' invalidations say when to look again: a routine's row
+ * changed (PROCOID) has the routines read again, each row not seen before
+ * worked out; a type's or a schema's (TYPEOID, NAMESPACEOID), which may
+ * rename what routines' and types' names are made of, has both worked out
+ * again in full, as does a move to another branch.  Every member, an
+ * extension's too, is listed: membership changes (ALTER EXTENSION ... ADD)
+ * invalidate nothing, and a line no item has is never read.
+ */
+typedef struct OwnedObject
+{
+	Oid			oid;
+	Oid			owner;
+	char		kind;
+	char	   *name;
+	ItemPointerData tid;
+	TransactionId xmin;
+} OwnedObject;
+
+/* An OwnedObject known before, by OID */
+typedef struct OwnedKnown
+{
+	Oid			oid;
+	OwnedObject *o;
+} OwnedKnown;
+
+static MemoryContext owned_cxt = NULL;
+static Oid	owned_branch = InvalidOid;
+static List *owned_routines = NIL;
+static List *owned_types = NIL;
+static bool owned_routines_known = false;
+static bool owned_names_known = false;
+static bool owned_callbacks = false;
+
+/*
+ * (only flags: an invalidation may come while the lists are read, which
+ * goes on with what it has; the next listing reads them again)
+ */
+static void
+owned_forget(Datum arg, int cacheid, uint32 hashvalue)
+{
+	owned_routines_known = false;
+	/* (names of either may change: worked out again in full) */
+	if (cacheid != PROCOID)
+		owned_names_known = false;
+}
+
+/*
+ * The branch's routines (proc) or types (else), as they are now, from
+ * those known before (was): each row unchanged since taken as it was.
+ */
+static List *
+owned_rows(bool proc, List *was)
+{
+	Oid			catalog = proc ? ProcedureRelationId : TypeRelationId;
+	HTAB	   *known = NULL;
+	List	   *out = NIL;
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (was != NIL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(OwnedKnown);
+		ctl.hcxt = CurrentMemoryContext;
+		known = hash_create("prolly owned objects", list_length(was), &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		foreach_ptr(OwnedObject, o, was)
+		{
+			OwnedKnown *e = hash_search(known, &o->oid, HASH_ENTER, NULL);
+
+			e->o = o;
+		}
+	}
+	rel = table_open(catalog, AccessShareLock);
+	scan = catalog_branch_beginscan(rel, MyBranch);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Oid			oid;
+		Oid			nsp;
+		Oid			owner;
+		OwnedObject *o;
+		OwnedKnown *e;
+
+		if (proc)
+		{
+			Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+
+			oid = p->oid;
+			nsp = p->pronamespace;
+			owner = p->proowner;
+		}
+		else
+		{
+			Form_pg_type t = (Form_pg_type) GETSTRUCT(tup);
+
+			/* (a relation's row type, or an array, is its relation's or element's) */
+			if (OidIsValid(t->typrelid) || IsTrueArrayType(t))
+				continue;
+			oid = t->oid;
+			nsp = t->typnamespace;
+			owner = t->typowner;
+		}
+		if (!canon_namespace(nsp))
+			continue;
+		e = known ? hash_search(known, &oid, HASH_FIND, NULL) : NULL;
+		o = MemoryContextAllocZero(owned_cxt, sizeof(OwnedObject));
+		o->oid = oid;
+		o->owner = owner;
+		o->kind = proc ? 'P' : 'T';
+		o->tid = tup->t_self;
+		o->xmin = HeapTupleHeaderGetXmin(tup->t_data);
+		if (e != NULL && ItemPointerEquals(&e->o->tid, &o->tid) &&
+			TransactionIdEquals(e->o->xmin, o->xmin))
+			o->name = MemoryContextStrdup(owned_cxt, e->o->name);
+		else if (proc)
+			o->name = MemoryContextStrdup(owned_cxt,
+										  routine_item_name((Form_pg_proc) GETSTRUCT(tup)));
+		else
+			o->name = MemoryContextStrdup(owned_cxt,
+										  qualified(nsp, NameStr(((Form_pg_type) GETSTRUCT(tup))->typname)));
+		{
+			MemoryContext old = MemoryContextSwitchTo(owned_cxt);
+
+			out = lappend(out, o);
+			MemoryContextSwitchTo(old);
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	if (known)
+		hash_destroy(known);
+	return out;
+}
+
+/*
  * Each object of the session's branch a commit may hold, other than its
  * prolly tables, partitioned tables and materialized views (which the refs
  * list themselves): its views ('v'), sequences ('S'), foreign tables ('f'),
  * routines ('P'), types ('T'), versioned schemas ('N') and collations
  * ('C'), each emit()ted with its OID, owner, that kind and its name as the
  * commit's items name it (so a move making it finds its recorded owner).
+ * Routines and types as last listed where unchanged since (see
+ * OwnedObject).
  */
 void
 prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
@@ -17285,6 +17431,34 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 	HeapTuple	tup;
 
 	describing_settings();
+	if (!owned_callbacks)
+	{
+		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
+										  ALLOCSET_DEFAULT_SIZES);
+		CacheRegisterSyscacheCallback(PROCOID, owned_forget, (Datum) 0);
+		CacheRegisterSyscacheCallback(TYPEOID, owned_forget, (Datum) 0);
+		CacheRegisterSyscacheCallback(NAMESPACEOID, owned_forget, (Datum) 0);
+		owned_callbacks = true;
+	}
+	AcceptInvalidationMessages();
+	if (owned_branch != MyBranch || !owned_names_known)
+	{
+		MemoryContextReset(owned_cxt);
+		owned_routines = owned_types = NIL;
+		owned_routines_known = false;
+		owned_branch = MyBranch;
+		owned_names_known = true;
+		PG_TRY();
+		{
+			owned_types = owned_rows(false, NIL);
+		}
+		PG_CATCH();
+		{
+			owned_names_known = false;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 	rel = table_open(RelationRelationId, AccessShareLock);
 	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -17309,36 +17483,52 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
-	rel = table_open(ProcedureRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
-	while ((tup = systable_getnext(scan)) != NULL)
+	/*
+	 * (each list made whole before it is kept: an error leaves it unknown,
+	 * an invalidation while it is read, worked out again next time)
+	 */
+	if (!owned_routines_known)
 	{
-		Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
+		MemoryContext was_cxt = owned_cxt;
+		List	   *was = owned_routines;
 
-		if (!canon_namespace(proc->pronamespace) ||
-			in_extension(ProcedureRelationId, proc->oid))
-			continue;
-		emit(proc->oid, proc->proowner, 'P', routine_item_name(proc), arg);
+		owned_routines_known = true;
+		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
+										  ALLOCSET_DEFAULT_SIZES);
+		PG_TRY();
+		{
+			List	   *types = NIL;
+
+			/* (the types kept too, in the new context) */
+			foreach_ptr(OwnedObject, o, owned_types)
+			{
+				OwnedObject *c = MemoryContextAlloc(owned_cxt, sizeof(OwnedObject));
+				MemoryContext old;
+
+				*c = *o;
+				c->name = MemoryContextStrdup(owned_cxt, o->name);
+				old = MemoryContextSwitchTo(owned_cxt);
+				types = lappend(types, c);
+				MemoryContextSwitchTo(old);
+			}
+			owned_routines = owned_rows(true, was);
+			owned_types = types;
+		}
+		PG_CATCH();
+		{
+			MemoryContextDelete(owned_cxt);
+			owned_cxt = was_cxt;
+			owned_routines = owned_types = NIL;
+			owned_routines_known = owned_names_known = false;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		MemoryContextDelete(was_cxt);
 	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	rel = table_open(TypeRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
-
-		/* (a relation's row type, or an array, is its relation's or element's) */
-		if (OidIsValid(typ->typrelid) || IsTrueArrayType(typ) ||
-			!canon_namespace(typ->typnamespace) ||
-			in_extension(TypeRelationId, typ->oid))
-			continue;
-		emit(typ->oid, typ->typowner, 'T',
-			 qualified(typ->typnamespace, NameStr(typ->typname)), arg);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
+	foreach_ptr(OwnedObject, o, owned_routines)
+		emit(o->oid, o->owner, o->kind, o->name, arg);
+	foreach_ptr(OwnedObject, o, owned_types)
+		emit(o->oid, o->owner, o->kind, o->name, arg);
 
 	rel = table_open(NamespaceRelationId, AccessShareLock);
 	scan = catalog_branch_beginscan(rel, MyBranch);

@@ -474,6 +474,38 @@ WHERE castsource = 'rm.e6'::regtype ORDER BY 2::text;
 SELECT dolt_merge('c7', '-m', 'merged c7');
 SELECT count(*) AS casts FROM pg_cast WHERE castsource = 'rm.e6'::regtype;
 
+-- a commit's record of owners lists every routine and type, worked out
+-- again only where changed since the last: a routine's owner changed, and
+-- a type its arguments name renamed, are recorded so, and a reset making
+-- the routine from that commit makes it as the owner recorded then
+SET ROLE regress_rm_alice;
+CREATE FUNCTION rm.cf() RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cf')::text) AS committed;
+ALTER FUNCTION rm.cf() OWNER TO regress_rm_w;
+SELECT length(dolt_commit('--allow-empty', '-Am', 'cf owner')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS cf2 \gset
+DROP FUNCTION rm.cf();
+SELECT length(dolt_commit('-Am', 'cf dropped')::text) AS committed;
+SELECT dolt_reset('--hard', :'cf2') IS NOT NULL AS reset;
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cf';
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.ty1 AS ENUM ('a');
+CREATE FUNCTION rm.cg(rm.ty1) RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cg')::text) AS committed;
+SET ROLE regress_rm_alice;
+ALTER TYPE rm.ty1 RENAME TO ty2;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'ty1 renamed')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS cg2 \gset
+DROP FUNCTION rm.cg(rm.ty2);
+SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
+SELECT dolt_reset('--hard', :'cg2') IS NOT NULL AS reset;
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cg';
+
 -- a recorded owner is matched by OID and name: the role renamed (or
 -- another made with its OID) refuses the move
 CREATE ROLE regress_rm_ren;
