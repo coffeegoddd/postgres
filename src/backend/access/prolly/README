@@ -75,6 +75,7 @@ Changes to this design are tracked in GitHub issues:
 	matcache          prolly_matcache.h       branches, stub
 	json_tree         prolly_jsontree.h       paths, stub
 	node_cache        prolly_nodecache.h      shared, stub
+	commit_cache      prolly_commitcache.h    shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -721,6 +722,19 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+Walking history (HEAD~n, ^n, a commit named by its hash) takes each
+commit's links (its root, parents and height) from the commit cache
+(prolly_commitcache.h; "shared", commitcache_shared.c), a table in shared
+memory of prolly_commit_cache_entries commits (4096; 0 turns it off),
+before reading the commit.  The node cache lets go of the commits as soon
+as a large diff or reset reads past them, so without it each step of a
+walk could be a read from disk.  An entry is of the chunk
+store's GC generation it was read in (the chunk store's generation()) and
+is found only in that generation, so a collection's swap lets go of them
+all; dropping a database forgets its entries.  A transaction's entries
+are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
+and commit_cache_misses).
+
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
@@ -913,8 +927,67 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers, and so does redo of one, walking the
-snapshot's own leaves as the record names them.  Redo visits every buffer
+finds), never visiting the buffers.  Redo of one writes nothing when the
+record says those pages were logged as images (a WAL level for backups,
+below); at wal_level minimal it writes the same pages, walking the
+snapshot's own leaves as the record names them.
+
+Durability through WAL.  The blocks a share or snapshot comes to share
+must hold its pages durably, as long as anything holds them: they never
+change in place again, and recovery that finds a newer map skips the
+records of a page from before it moved off them.  At a WAL level for
+backups (wal_level replica or logical), WAL makes them so: each own block
+is logged as an image (PRESERVE) before the share's or snapshot's record,
+which says so, and its write (still needed: a relation made of the share
+reads the blocks) registers the block's segment for the checkpointer's
+sync like any page's.  Recovery from a checkpoint before an image replays
+it to the block, torn or lost writes included; one from a later
+checkpoint finds the block written and synced by it (a page dirty as a
+checkpoint begins is written by it, and every write registered before
+its sync phase is synced).  WAL holding an image is let go of only past
+such a checkpoint, a commit relying on the share flushes WAL past its
+images (with synchronous_commit off, a crash may lose the commit, but WAL
+is replayed as a prefix: no commit survives without the images before
+it), and a base backup either replays the image or copies the block
+after its start checkpoint wrote and synced it.  Redo of such a record
+writes and syncs nothing (the images' redo wrote each block, and a
+restartpoint syncs it), so a standby, or a promoted one, follows the same
+argument.  Redo goes by the record's flag, not the current wal_level,
+which can change only across a restart, whose shutdown checkpoint syncs
+everything.
+
+At wal_level minimal no image is logged, and a share or snapshot syncs the
+database's page store, a whole-file fsync that writes back every page the
+kernel holds unwritten for the store, whoever wrote it: a hard reset's
+discarded working set, another branch's dirty pages.  One that holds no
+block of its own (a table just restored or shared, or unchanged since its
+last snapshot: every block held by another map or snapshot already) skips
+its flush and the sync when the store is durable already.  Its blocks were
+each written out by the share or snapshot that first shared them (their
+own blocks then) and can't change in place since (a change copies a
+shared page first, and only a hint reaches its buffer).  Shared memory
+follows each store's flushes of own blocks: begun before the blocks'
+counts are raised (under the relation's header, so whoever finds them
+shared finds the flush in flight or written), written, and synced by a
+sync that began after the write.  With none in flight and every one
+written synced since, the blocks are on disk, and the sync would add
+nothing the share or snapshot needs: the other pages it would write are
+WAL's to protect and the checkpointer's to sync, as any page's.  (At the
+other levels, a share with no block of its own skips its flush when no
+flush is in flight.)  A flush written whose transaction ends unsynced (an
+abort) leaves the store not durable until the next sync; one given up
+before its write was done (an error part way) may have left its pages in
+their buffers alone, which no sync writes, and leaves the store not
+durable (nor, at the other levels, written out) until a checkpoint begun
+after it completes.  A store isn't known durable until its first sync
+after the server (or its shared memory, after a crash) starts, which
+covers writes from before.  At most 64 stores are followed at once: past
+that, the least recently used idle one is let go of, and reads as not
+durable until its next sync.
+prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
+measure what they cost.
+
+Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
 data checksums off (a torn page would go unseen), or at a map or count
 page newer than the replay (a crash's, or a base backup's), one that

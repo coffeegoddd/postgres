@@ -21,6 +21,7 @@
 #include "access/prolly_chunker.h"
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_commitcache.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_jsontree.h"
 #include "access/prolly_keyenc.h"
@@ -63,6 +64,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyReclaimRoutine *reclamation;
 	const ProllyWritersRoutine *writers;
 	const ProllyMatCacheRoutine *matcache;
+	const ProllyCommitCacheRoutine *commit_cache;
 } ProllyDatabaseComponents;
 
 /* Components for rel: a prolly table, or an index on one (an error otherwise). */
