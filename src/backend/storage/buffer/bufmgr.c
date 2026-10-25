@@ -7235,6 +7235,24 @@ LockBufferInternal(Buffer buffer, BufferLockMode mode)
 }
 
 /*
+ * ConditionalLockBufferShared -- the content lock in share mode, but only if
+ * we don't have to wait.
+ *
+ * For a caller that holds a lock that a holder of the page's exclusive lock
+ * may wait for (a storage manager's map, which preparing a page reads): it
+ * gives up what it holds and waits for the page instead.
+ */
+bool
+ConditionalLockBufferShared(Buffer buffer)
+{
+	Assert(BufferIsPinned(buffer));
+	if (BufferIsLocal(buffer))
+		return true;			/* act as though we got it */
+	return BufferLockConditional(buffer, GetBufferDescriptor(buffer - 1),
+								 BUFFER_LOCK_SHARE);
+}
+
+/*
  * Acquire the content_lock for the buffer, but only if we don't have to wait.
  *
  * This assumes the caller wants BUFFER_LOCK_EXCLUSIVE mode.

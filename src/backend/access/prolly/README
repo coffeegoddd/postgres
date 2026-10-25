@@ -12,7 +12,12 @@ under version control.  Their tables use the table access method "prolly"
 block-mapped storage (storage/smgr/bmap.c), so each branch's copy of a
 table shares its pages copy-on-write with the others.  That working set is
 ordinary Postgres: MVCC, WAL, indexes, constraints and triggers all work
-as they do on heap.
+as they do on heap.  One lock-order rule comes with it: never wait for a
+buffer's content lock while holding a relation's block map header (or
+another of its map pages).  Preparing a page for a change, and asking
+whether it is shared, read the map with the page locked; a share or a
+snapshot that must read the relation's pages under its header tries their
+locks, and lets go of the header to wait.
 
 A commit folds the session branch's versioned schemas into canonical,
 content-addressed prolly trees, kept in the database's chunk store, and
