@@ -2504,6 +2504,38 @@ drop_node_buffer(RelFileLocator rel, BlockNumber blk)
 }
 
 /*
+ * In redo of the record at 'lsn': does the page store's block 'blk' hold a
+ * page written after the record?  Only the relation the record gave the
+ * block to, or one that got the block after it, can have written one: a
+ * block's earlier holder let go of it, by a record before this one, after
+ * its last change.  A page that is all zeroes, or whose header isn't sane
+ * (a torn write), holds nothing to keep.  The checksum isn't verified: a
+ * newer page may be a later holder's, at another logical block than the
+ * record's, and checked with the record's it would fail, be zeroed and be
+ * lost (the later holder's records may be skipped too).  A reader checks
+ * it, with its own logical block.
+ */
+static bool
+store_block_newer(SMgrRelation ssrel, BlockNumber blk, XLogRecPtr lsn)
+{
+	PGIOAlignedBlock copy;
+	void	   *pages[1] = {copy.data};
+	PageHeader	p = (PageHeader) copy.data;
+
+	mdreadv(ssrel, MAIN_FORKNUM, blk, pages, 1);
+	if (PageIsNew((Page) copy.data))
+		return false;
+	return PageGetPageSize((Page) copy.data) == BLCKSZ &&
+		PageGetPageLayoutVersion((Page) copy.data) == PG_PAGE_LAYOUT_VERSION &&
+		(p->pd_flags & ~PD_VALID_FLAG_BITS) == 0 &&
+		p->pd_lower <= p->pd_upper &&
+		p->pd_upper <= p->pd_special &&
+		p->pd_special <= BLCKSZ &&
+		p->pd_special == MAXALIGN(p->pd_special) &&
+		PageGetLSN((Page) copy.data) > lsn;
+}
+
+/*
  * Make the page store hold the blocks below 'new_hw', zeroing the blocks
  * from 'old_hw', and zero the reused blocks.  Done before the record that
  * maps them, and again by its redo unless 'skip_existing': then blocks the
@@ -2512,13 +2544,24 @@ drop_node_buffer(RelFileLocator rel, BlockNumber blk)
  * (which pg_stat_io counts as extends too) or bulk writes' (which nothing
  * else counts) by what the blocks are for.
  *
+ * In redo ('redo_lsn' the record's position, else invalid), a block holding
+ * a page written after the record is left as it is too (store_block_newer()).
+ * Zeroing is for a block that has an earlier holder's page, which a page
+ * of zeroes the relation leaves uninitialized mustn't read as.  A newer page
+ * may be one that nothing in the rest of the replay writes again: a share
+ * or a snapshot at wal_level minimal syncs the page store rather than log
+ * its own blocks, and the replay skips the records that made those pages
+ * once the relation that made them was dropped or gave the block up (each
+ * block then held by the copies alone).  Zeroed, the copies would read a
+ * page of zeroes.
+ *
  * A reused block may have been a tree's node, whose page may still be in a
  * buffer, dirty: it is dropped first (drop_node_buffer()).
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 			  const BlockNumber *reused, uint32 nreused, bool skip_existing,
-			  PgStat_ProllyCounter counter)
+			  XLogRecPtr redo_lsn, PgStat_ProllyCounter counter)
 {
 	SMgrRelation ssrel = store_smgr(rel);
 	BlockNumber store_cur = mdnblocks(ssrel, MAIN_FORKNUM);
@@ -2531,6 +2574,9 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		drop_node_buffer(rel, reused[i]);
 		if (skip_existing && reused[i] < store_cur)
 			continue;
+		if (XLogRecPtrIsValid(redo_lsn) && reused[i] < store_cur &&
+			store_block_newer(ssrel, reused[i], redo_lsn))
+			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
 		store_written(rel, reused[i], 1);
 		pgstat_count_prolly(counter, BLCKSZ);
@@ -2540,6 +2586,9 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		const void *page = zero_block.data;
 
 		if (skip_existing)
+			continue;
+		if (XLogRecPtrIsValid(redo_lsn) &&
+			store_block_newer(ssrel, blk, redo_lsn))
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, blk, &page, 1, false);
 		store_written(rel, blk, 1);
@@ -3143,7 +3192,8 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, const MapPage *leaf,
 	map_lock(mapbuf, false);
 
 	/* the page store before the record */
-	prepare_store(rel, old_hw, new_hw, reused, nreused, false, counter);
+	prepare_store(rel, old_hw, new_hw, reused, nreused, false,
+				  InvalidXLogRecPtr, counter);
 	if (content)
 	{
 		const void *page = content;
@@ -7161,7 +7211,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			drop_node_buffer(rel, new_block);
 		prepare_store(rel, alloc.old_hw, alloc.new_hw,
 					  &new_block, zeroed && reused ? 1 : 0, false,
-					  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
+					  InvalidXLogRecPtr, PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 
 		/* a listed block keeps the reference, which the list holds */
 		if (count == BMAP_REFS_STUCK && !listed)
@@ -9992,7 +10042,7 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 		drop_node_buffer(rel, new_block);
 	prepare_store(rel, alloc.old_hw, alloc.new_hw, &new_block,
 				  zeroed && new_block < alloc.old_hw ? 1 : 0, false,
-				  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
+				  InvalidXLogRecPtr, PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
@@ -12661,6 +12711,7 @@ bmap_redo(XLogReaderState *record)
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  reused, xlrec->nreused,
 							  (xlrec->flags & BMAP_EXTEND_SKIP_ZERO) != 0,
+							  record->ReadRecPtr,
 							  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
@@ -12837,7 +12888,8 @@ bmap_redo(XLogReaderState *record)
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  &xlrec->new_block,
 							  zeroed && xlrec->new_block < xlrec->old_hw ? 1 : 0,
-							  !zeroed, PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
+							  !zeroed, record->ReadRecPtr,
+							  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
 				for (uint8 id = 0; id < last; id++)
 					redo_block(record, id);
 				if (zeroed)

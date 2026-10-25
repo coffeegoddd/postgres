@@ -437,6 +437,7 @@ tests += {
       't/446_store_sync_slot_races.pl',
       't/484_minimal_shrink_crash.pl',
       't/468_bmap_shared_redo_changes.pl',
+      't/483_minimal_reset_crash.pl',
     ],
   },
 }
