@@ -44,6 +44,23 @@
  *   It returns false for what it doesn't handle (an array index that isn't
  *   one of the array's, counting from either end, a key too long for the
  *   tree): the caller sets the document whole.
+ * - exists() is whether the document has, at its top level, one (any) or
+ *   all of keys[0..nkeys): an object's keys, or an array's string
+ *   elements, as jsonb's ?| and ?& find them.  An object's keys are looked
+ *   up; an array's elements are read in order, until the answer is known,
+ *   what a container element holds skipped unread.
+ * - edit() gives the tree of edit(doc, path, npath, arg), for an edit that
+ *   changes the document at path alone (jsonb_insert(), #-, a subscript's
+ *   assignment): it follows path through the containers that aren't
+ *   packed, then calls edit on a document of only what is along path (each
+ *   container above holding just the step to it, an array's index made 0,
+ *   and the item at path, if any), with path's array indexes so made, and
+ *   puts back what the edit made of that item.  So the edit's own errors
+ *   are raised as on the document.  It returns false for an edit it can't
+ *   put back as an item's (one that moves an array's other elements: an
+ *   insertion or deletion other than at an array's end, or a path to an
+ *   index outside an array, or not an integer): the caller edits the
+ *   document whole.  *new_root, *delta and *whole are as set() gives them.
  * - diff() reports each scalar path whose value differs between two
  *   trees, in order (an empty container counting as a scalar), skipping
  *   the subtrees both share unread, so d changed items cost
@@ -90,6 +107,14 @@ typedef void (*ProllyJsonChangeVisit) (ProllyDiffKind kind, char **path,
 									   int npath, Jsonb *before, Jsonb *after,
 									   void *arg);
 
+/*
+ * An edit of a document (in memory, in the database's encoding) at a path
+ * (npath elements, as text): the document edited, as a jsonb function
+ * gives it.
+ */
+typedef Jsonb *(*ProllyJsonEdit) (Jsonb *doc, char **path, int npath,
+								  void *arg);
+
 typedef struct ProllyJsonTreeRoutine
 {
 	ProllyImplInfo info;
@@ -103,6 +128,12 @@ typedef struct ProllyJsonTreeRoutine
 	bool		(*set) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						char **path, int npath, Jsonb *value, bool create,
 						ProllyNodeRef *new_root, int64 *delta, Jsonb **whole);
+	bool		(*exists) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						   char **keys, int nkeys, bool all);
+	bool		(*edit) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						 char **path, int npath, ProllyJsonEdit edit,
+						 void *arg, ProllyNodeRef *new_root, int64 *delta,
+						 Jsonb **whole);
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyJsonChangeVisit visit,
 						 void *arg);
@@ -111,7 +142,8 @@ typedef struct ProllyJsonTreeRoutine
 } ProllyJsonTreeRoutine;
 
 #define PROLLY_JSONTREE_CALLBACK_NAMES \
-	"build", "read", "get", "kind", "set", "diff", "diff_documents"
+	"build", "read", "get", "kind", "set", "exists", "edit", "diff", \
+	"diff_documents"
 #define PROLLY_JSONTREE_FIRST_CALLBACK build
 #define PROLLY_JSONTREE_LAST_CALLBACK diff_documents
 

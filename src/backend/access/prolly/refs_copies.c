@@ -5760,7 +5760,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * would see none of a fold that moved the baseline in between (the check
  * then passing), and read every table in full.  The fold waits for no
  * relation's lock: one not free at once fails it, with
- * ERRCODE_LOCK_NOT_AVAILABLE.
+ * ERRCODE_LOCK_NOT_AVAILABLE.  The caller keeps no snapshot, active or
+ * registered: the fold's is to be the oldest the transaction holds, or its
+ * trim of the change logs is held back (see below).
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -5782,6 +5784,16 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 		return false;
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
+
+	/*
+	 * (the fold's snapshot the oldest the transaction keeps: one older, the
+	 * caller's or the catalog snapshot the lookups above took, from while a
+	 * writer the fold sees committed was running, would hold the xmin
+	 * horizon below that writer, and the fold's trim of the log would keep
+	 * its rows; the fold after, finding nothing new, trims nothing)
+	 */
+	Assert(!HaveRegisteredOrActiveSnapshot());
+	InvalidateCatalogSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/*
@@ -6435,6 +6447,29 @@ copies_pending_full_folds(ProllyPendingFullVisit visit, void *arg)
 	have = branch_baseline(branch_ops()->current(), &baseline);
 	PROLLY_CALL(dc.canonicalizer, pending_full, have ? &baseline : NULL,
 				visit, arg);
+}
+
+/*
+ * The last fold of the session branch known (branch_fold_last()), from
+ * its baseline now, and when it was known; never one only this backend's
+ * chunks hold, nor one a fold forced to read would skip.
+ */
+static bool
+copies_last_fold(Snapshot snap, ProllyNodeRef *root, ProllyFoldMark *mark)
+{
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	bool		have;
+
+	if (!fold_caches_usable() || prolly_local_chunks_active() ||
+		!OidIsValid(MyBranch))
+		return false;
+	have = branch_baseline(branch_ops()->current(), &baseline);
+	if (!branch_fold_last(MyBranch, snap, have ? &baseline.hash : NULL, &h,
+						  mark))
+		return false;
+	ref_of(&h, root);
+	return true;
 }
 
 static void
@@ -8862,4 +8897,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_relation_class = copies_set_relation_class,
 	.made_object = copies_made_object,
 	.stash_set_maker = copies_stash_set_maker,
+	.last_fold = copies_last_fold,
 };

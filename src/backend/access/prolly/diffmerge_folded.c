@@ -1760,6 +1760,169 @@ split_change(const char *name, ProllyDiffKind kind, char object, void *arg)
 	sc->visit(name, kind, object, sc->arg);
 }
 
+/* What a diff of a version's root and the last fold's holds. */
+typedef struct FoldDiff
+{
+	List	   *tables;			/* char *, the tables whose items differ */
+	List	   *rest;			/* NotedChange *, the other objects' */
+	bool		unsure;			/* a type or materialized view differs */
+} FoldDiff;
+
+static void
+fold_diff_table(const char *name, ProllyDiffKind kind, char object, void *arg)
+{
+	FoldDiff   *fd = arg;
+
+	fd->tables = lappend(fd->tables, pstrdup(name));
+}
+
+static void
+fold_diff_object(const char *name, ProllyDiffKind kind, char object,
+				 void *arg)
+{
+	FoldDiff   *fd = arg;
+
+	/*
+	 * (a type tells a table's enums' labels apart, and a materialized
+	 * view's rows are its baseline's or not: both read from every table's
+	 * or view's, as the full comparison does)
+	 */
+	if (object == 'y' || object == 'm')
+		fd->unsure = true;
+	fd->rest = lappend(fd->rest, noted(name, kind, object));
+}
+
+/* Table name of root, its types those given, or NULL if root hasn't it. */
+static Table *
+root_table_named(const ProllyNodeRef *root, TypeDefs *types, const char *name)
+{
+	Tables		ts = {NIL, types};
+
+	PROLLY_CALL(components().canonicalizer, tables, root, name, add_table,
+				&ts);
+	return find_table(ts.tables, name);
+}
+
+/*
+ * folded_tables() from a version to the working set, from the last fold
+ * of it known (the refs' last_fold()) where writers have ended since: true
+ * if answered so.  The working set is that fold's root, its sequences'
+ * values read again, but for the relations written since it was known.
+ * So a table not written since differs if its item differs, as the
+ * working set known, rows and all, is compared; one written since is
+ * compared as the definitions read without rows compare it (its rows from
+ * the change finder's record since the baseline, which is the fold's).
+ * The tables and other objects whose items differ are read from the two
+ * roots' tree diff, not from every table: after a commit, or in a backend
+ * that hasn't answered before, a status costs the tables written since
+ * the fold and what the diff holds.  False where it can't be told so (no
+ * such fold, the relations written since unknown, a type or materialized
+ * view differing, a materialized view written): the caller compares as
+ * before.
+ */
+static bool
+tables_from_fold(const char *from_ref, const ProllyNodeRef *from_root,
+				 ProllyTableChangeVisit visit, void *arg)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef fold_root;
+	ProllyNodeRef to_root;
+	ProllyFoldMark mark;
+	Oid		   *relids;
+	int			nrelids;
+	FoldDiff	fd = {NIL, NIL, false};
+	List	   *names;
+	List	   *written = NIL;
+	TypeDefs   *from_types;
+	TypeDefs   *to_types;
+	List	   *tables = NIL;
+	SortedChange *sorted;
+	int			n = 0;
+
+	if (!PROLLY_HAS(dc.refs, last_fold) || !PROLLY_HAS(dc.refs, written_since) ||
+		!PROLLY_HAS(dc.refs, working_changes) ||
+		!PROLLY_HAS(dc.canonicalizer, objects_diffed) ||
+		!PROLLY_HAS(dc.canonicalizer, sequences_now) ||
+		!ActiveSnapshotSet() || XactHasInvalidations() ||
+		!dc.refs->last_fold(GetActiveSnapshot(), &fold_root, &mark) ||
+		!dc.refs->written_since(&mark, GetActiveSnapshot(), &relids, &nrelids) ||
+		!dc.canonicalizer->sequences_now(&fold_root, &to_root))
+		return false;
+	dc.canonicalizer->objects_diffed(from_root, &to_root, fold_diff_object,
+									 fold_diff_table, &fd);
+	if (fd.unsure)
+		return false;
+
+	/* the tables to compare: those the diff holds, and those written since */
+	names = fd.tables;
+	for (int i = 0; i < nrelids; i++)
+	{
+		char	   *name;
+
+		if (get_rel_relkind(relids[i]) == RELKIND_MATVIEW)
+			return false;
+		if (get_rel_name(relids[i]) == NULL)
+			continue;			/* (dropped since: a catalog change) */
+		name = table_name(relids[i]);
+		written = lappend(written, name);
+		if (!list_member_name(names, name))
+			names = lappend(names, name);
+	}
+	from_types = type_defs(from_root);
+	types_of_ref(from_types, from_ref);
+	to_types = type_defs(&to_root);
+	types_of_ref(to_types, "WORKING");
+	foreach_ptr(char, name, names)
+	{
+		Table	   *ta = root_table_named(from_root, from_types, name);
+		Table	   *tb = root_table_named(&to_root, to_types, name);
+		bool		known = true;
+		bool		differ;
+
+		/* (a relation written that is neither's table: as it was) */
+		if (ta == NULL && tb == NULL)
+			continue;
+		if (tb == NULL)
+		{
+			tables = lappend(tables, noted(ta->name, PROLLY_DIFF_REMOVED,
+										   PROLLY_OBJECT_TABLE));
+			continue;
+		}
+		if (ta == NULL)
+		{
+			tables = lappend(tables, noted(tb->name, PROLLY_DIFF_ADDED,
+										   PROLLY_OBJECT_TABLE));
+			continue;
+		}
+		differ = !same_description(ta, tb);
+		if (!differ)
+			differ = list_member_name(written, name) ?
+				working_rows_differ(ta, tb, &known) :
+				!same_hash(&ta->data.hash, &tb->data.hash);
+		if (!known)
+			return false;
+		if (differ)
+			tables = lappend(tables, noted(ta->name, PROLLY_DIFF_MODIFIED,
+										   PROLLY_OBJECT_TABLE));
+	}
+
+	/* (the tables in the canonical tree's order: by UTF-8 name) */
+	sorted = palloc_array(SortedChange, Max(list_length(tables), 1));
+	foreach_ptr(NotedChange, c, tables)
+	{
+		sorted[n].utf8 = noted_utf8(c);
+		sorted[n++].change = c;
+	}
+	qsort(sorted, n, sizeof(SortedChange), sorted_change_cmp);
+	for (int i = 0; i < n; i++)
+		visit(sorted[i].change->name, sorted[i].change->kind,
+			  sorted[i].change->object, arg);
+	foreach_ptr(NotedChange, c, fd.rest)
+		visit(c->name, c->kind, c->object, arg);
+	pgstat_count_prolly(PGSTAT_PROLLY_STATUS_FROM_FOLD, 1);
+	return true;
+}
+
 /*
  * folded_tables() from a version to the working set, from its definitions
  * read without its rows: a table defined alike whose baseline holds the
@@ -1797,8 +1960,36 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit outer_visit,
 	/* (the version's tables listed only if the last answer can't be taken) */
 	Assert(!is_working(from_ref));
 	root_of(from_ref, &from_root);
+
+	/*
+	 * (the last fold known, writers having ended since: not the
+	 * definitions read, which describes every object, nor every table
+	 * compared)
+	 */
+	if (tables_from_fold(from_ref, &from_root, outer_visit, outer_arg))
+	{
+		*read_changes = true;
+		return true;
+	}
 	refs->read_definitions(&to_root, &left_out, &rows, &read);
 	*read_changes = !rows;
+
+	/*
+	 * (the working set known, the version's root itself: nothing differs
+	 * but what the read left out)
+	 */
+	if (rows && same_hash(&from_root.hash, &to_root.hash))
+	{
+		list_sort(left_out, string_cmp);
+		foreach(lc, left_out)
+		{
+			if (foreach_current_index(lc) == 0 ||
+				strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
+				outer_visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED,
+							PROLLY_OBJECT_UNKNOWN, outer_arg);
+		}
+		return true;
+	}
 
 	/*
 	 * (marked before any table's change finder is asked: a table written
