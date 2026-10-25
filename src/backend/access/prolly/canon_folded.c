@@ -8881,6 +8881,25 @@ move_guard_refuse(Oid classId, Oid objectId, int subId, Oid owner,
 
 	ObjectAddressSubSet(addr, classId, objectId, subId);
 	desc = getObjectDescription(&addr, true);
+	/* (one being made, not yet seen by the caches: its catalog row's name) */
+	if (desc == NULL && is_objectclass_supported(classId) &&
+		get_object_attnum_name(classId) != InvalidAttrNumber)
+	{
+		Relation	catalog = table_open(classId, AccessShareLock);
+		HeapTuple	tup = catalog_row_now(catalog, classId, objectId);
+		bool		isnull;
+
+		if (HeapTupleIsValid(tup))
+		{
+			Datum		name = heap_getattr(tup, get_object_attnum_name(classId),
+											RelationGetDescr(catalog), &isnull);
+
+			if (!isnull)
+				desc = psprintf("%s \"%s\"", get_object_class_descr(classId),
+								NameStr(*DatumGetName(name)));
+		}
+		table_close(catalog, AccessShareLock);
+	}
 	elog(ERROR, "a move's statement with no maker would %s %s, which role \"%s\" %s, as role \"%s\": \"%s\"",
 		 what, desc ? desc : "an object", owner_name ? owner_name : "?",
 		 strcmp(what, "make") == 0 ? "is to make" : "owns",
