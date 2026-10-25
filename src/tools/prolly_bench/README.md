@@ -116,6 +116,35 @@ reported as `failed_transactions`: this BenchBase revision classifies
 them as unexpected errors rather than retrying them. Other unexpected
 SQL errors still fail the cell.
 
+## Dolt's sysbench tests
+
+S10 runs sysbench's own OLTP scripts. Dolt's benchmarks run 19 tests:
+sysbench's ten, and nine scripts of their own from
+[dolthub/sysbench-lua-scripts](https://github.com/dolthub/sysbench-lua-scripts)
+(`covering_index_scan`, `groupby_scan`, `index_join`, `index_join_scan`,
+`index_scan`, `table_scan`, `types_table_scan`, `oltp_delete_insert`,
+`types_delete_insert`). Given a checkout of that repository, S10 runs
+those too, from its `*_postgres.lua` scripts:
+
+```toml
+[workloads.S10]
+tests = "dolt"            # all 19; or name any of them in a list
+
+[tools]
+sysbench_lua_scripts = "~/cursor_src/sysbench-lua-scripts"
+```
+
+```sh
+git clone https://github.com/dolthub/sysbench-lua-scripts ~/cursor_src/sysbench-lua-scripts
+```
+
+The checkout's commit is recorded with the run's environment. A script
+test without the checkout is reported unavailable. The scripts make their
+own tables (`sbtest1`, and `sbtest2` for the scans and joins) of
+`sysbench_table_size` rows, except `oltp_delete_insert`, which always has
+10,000; `sysbench_tables` doesn't apply to them. Dolt runs sysbench with
+`--db-ps-mode=disable --rand-type=uniform`; S10 uses sysbench's defaults.
+
 ## The C suite
 
 ```sh

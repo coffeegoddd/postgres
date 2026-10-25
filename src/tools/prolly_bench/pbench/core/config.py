@@ -247,6 +247,12 @@ def validate(cfg: dict, suite: str) -> None:
     for wid, params in cfg["workloads"].items():
         if wid not in keys or set(params) - (keys[wid] | common):
             raise ConfigError(f"unknown workload or parameters for {wid}: {sorted(params)}")
+        if wid == "S10" and "tests" in params:
+            from pbench.workloads.sysbench import DEFAULT_TESTS, DOLT_TESTS
+            tests = params["tests"]
+            if tests != "dolt" and (type(tests) is not list or
+                                    set(tests) - set(DEFAULT_TESTS) - set(DOLT_TESTS)):
+                raise ConfigError(f'S10.tests must be "dolt" or a list of sysbench tests: {tests!r}')
         for name, choices in {"sample": {"all", "per_directory"},
                               "protocol": {"simple", "extended", "prepared"}}.items():
             if name in params and params[name] not in choices:

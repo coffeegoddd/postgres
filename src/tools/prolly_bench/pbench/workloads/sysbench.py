@@ -6,10 +6,19 @@ comparisons with, so these numbers can be set beside theirs.
 
 Tables are created by `sysbench prepare` through libpq, which picks up
 PGOPTIONS, so they use the table AM under test like every other workload.
+
+Dolt's benchmarks also run scripts of their own (scans, group-by, joins, a
+many-typed table: https://github.com/dolthub/sysbench-lua-scripts).  With
+[tools] sysbench_lua_scripts naming a checkout of them, those tests can be
+run too, by name, from its *_postgres.lua scripts; `tests = "dolt"` is
+every test Dolt's benchmarks run.  The scripts make their own tables, of
+`table_size` rows (oltp_delete_insert: 10,000 always), and take no
+--tables.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
 import shutil
 from pbench.core import process
@@ -27,9 +36,29 @@ DEFAULT_TESTS = [
     "select_random_ranges", "bulk_insert",
 ]
 
+# Dolt's own scripts, in the sysbench_lua_scripts checkout as
+# <name>_postgres.lua, and the tables each makes.
+DOLT_SCRIPTS = {
+    "covering_index_scan": ["sbtest1", "sbtest2"], "groupby_scan": ["sbtest1", "sbtest2"],
+    "index_join": ["sbtest1", "sbtest2"], "index_join_scan": ["sbtest1", "sbtest2"],
+    "index_scan": ["sbtest1", "sbtest2"], "table_scan": ["sbtest1", "sbtest2"],
+    "types_table_scan": ["sbtest1"], "oltp_delete_insert": ["sbtest1"],
+    "types_delete_insert": ["sbtest1"],
+}
+
+# The tests Dolt's benchmarks run: sysbench's own and its scripts.
+DOLT_TESTS = [
+    "oltp_read_only", "oltp_insert", "bulk_insert", "oltp_point_select",
+    "select_random_points", "select_random_ranges", "oltp_write_only",
+    "oltp_read_write", "oltp_update_index", "oltp_update_non_index",
+    *DOLT_SCRIPTS,
+]
+
 # Tests that only read.
 _READ_ONLY = {"oltp_read_only", "oltp_point_select", "select_random_points",
-              "select_random_ranges"}
+              "select_random_ranges", "covering_index_scan", "groupby_scan",
+              "index_join", "index_join_scan", "index_scan", "table_scan",
+              "types_table_scan"}
 
 # Tests whose scripts only support a single table.
 _ONE_TABLE = {"select_random_points", "select_random_ranges"}
@@ -60,14 +89,23 @@ class S10(Workload):
     id, suite, title = "S10", "S", "sysbench OLTP"
 
     def variants(self, params):
-        return [(t, {"test": t}) for t in params.get("tests", DEFAULT_TESTS)]
+        tests = params.get("tests", DEFAULT_TESTS)
+        return [(t, {"test": t}) for t in (DOLT_TESTS if tests == "dolt" else tests)]
 
     def check(self, ctx: Context) -> None:
         if shutil.which("sysbench") is None:
             raise Unavailable("sysbench is not installed")
+        if ctx.params["test"] in DOLT_SCRIPTS and not self._script(ctx).is_file():
+            raise Unavailable(f"no {self._script(ctx).name} under [tools] sysbench_lua_scripts = "
+                              f"{ctx.tools.get('sysbench_lua_scripts')}")
+
+    def _script(self, ctx: Context) -> Path:
+        return Path(ctx.tools.get("sysbench_lua_scripts") or "") / f"{ctx.params['test']}_postgres.lua"
 
     def _tables(self, ctx: Context) -> int:
         test = ctx.params["test"]
+        if test in DOLT_SCRIPTS:
+            return len(DOLT_SCRIPTS[test])
         if test in _ONE_TABLE:
             return 1
         if test == "bulk_insert":
@@ -76,19 +114,25 @@ class S10(Workload):
 
     def _args(self, ctx: Context, command: str, extra: list[str]) -> list[str]:
         env = ctx.cluster.client_env()
-        return ["sysbench", ctx.params["test"], "--db-driver=pgsql",
+        script = ctx.params["test"] in DOLT_SCRIPTS
+        return ["sysbench", str(self._script(ctx)) if script else ctx.params["test"], "--db-driver=pgsql",
                 f"--pgsql-host={env['PGHOST']}", f"--pgsql-port={env['PGPORT']}",
                 "--pgsql-user=postgres", f"--pgsql-db={ctx.dbname}",
-                f"--tables={self._tables(ctx)}",
+                *([] if script else [f"--tables={self._tables(ctx)}"]),
                 f"--table-size={int(ctx.size_params.get('sysbench_table_size', 100000))}",
                 f"--threads={ctx.key.clients}", f"--rand-seed={ctx.params.get('seed', 1)}", *extra, command]
 
     def _sysbench(self, ctx: Context, command: str, tag: str,
                   extra: Optional[list[str]] = None) -> str:
         args = self._args(ctx, command, extra or [])
+        env = ctx.cluster.client_env(ctx.session_options())
+        if ctx.params["test"] in DOLT_SCRIPTS:
+            # (the scripts require their common code by module name; ";;"
+            # keeps sysbench's own after it)
+            env = {**env, "LUA_PATH": str(self._script(ctx).parent / "?.lua") + ";;"}
         r = process.run(args, capture_output=True, text=True,
                            timeout=int(ctx.params.get("timeout_seconds", 7200)),
-                           env=ctx.cluster.client_env(ctx.session_options()))
+                           env=env)
         out = " ".join(args) + "\n\n" + r.stdout + r.stderr
         (ctx.raw_dir / f"sysbench-{tag}.out").write_text(out)
         if r.returncode != 0:
@@ -152,4 +196,6 @@ class S10(Workload):
                        read_only=ctx.params["test"] in _READ_ONLY)
 
     def tables(self, ctx: Context) -> list[str]:
+        if ctx.params["test"] in DOLT_SCRIPTS:
+            return list(DOLT_SCRIPTS[ctx.params["test"]])
         return [f"sbtest{i}" for i in range(1, self._tables(ctx) + 1)]
