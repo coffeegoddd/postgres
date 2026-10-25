@@ -20,6 +20,7 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 prolly_fold_worker = off
+prolly.kept_commits = 1
 });
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
@@ -35,7 +36,8 @@ my $c = sql(q{SELECT dolt_hashof('HEAD')});
 my $counts = q{SELECT pg_stat_force_next_flush();
 	SELECT value FROM pg_stat_prolly WHERE name = 'relations_restored'};
 
-# (back and forth, so a's kept pages are gone and c's, the head's, kept)
+# (back and forth, so a is no longer kept and c, the head, is: only the
+# head is kept here, as a restore carries the other kept commits along)
 sub cycle
 {
 	sql("SELECT dolt_reset('--hard', '$c')");
