@@ -3312,8 +3312,14 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
 		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
+	{
+		int			before = list_length(restored);
+
 		restore_kept(&dc, &at_head, was, &kept, restored, &commit->root,
 					 &baseline, &restored);
+		if (list_length(restored) > before)
+			branch_note_head_restore(MyBranch);
+	}
 	if (restored == NIL)
 		return;
 	kept_put(name, kept);
@@ -6075,6 +6081,25 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 }
 
 /*
+ * A transaction whose snapshot can't move, coming to branch name (oid)'s
+ * working set, refused if a move since its snapshot gave the branch's
+ * tables the pages kept as of its head (restore_pages()): it would read
+ * the head's rows, which neither its snapshot nor the branch ever had.
+ * (Sessions on the branch as the move ran held it back instead.)
+ */
+static void
+check_head_restore_seen(const char *name, Oid oid)
+{
+	if (IsolationUsesXactSnapshot() &&
+		branch_head_restore_unseen(oid, GetTransactionSnapshot()))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was given its head's kept pages since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+}
+
+/*
  * Leaving a branch leaves its changes in its copies, unfolded: its next
  * fold (a commit, a status, another session's read) reads them from its
  * change finder's record, as it would have had the session stayed.  Only a
@@ -6126,6 +6151,8 @@ copies_checkout(const char *name)
 				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
 						name),
 				 errhint("The transaction might succeed if retried.")));
+	if (strcmp(current, name) != 0 && OidIsValid(oid))
+		check_head_restore_seen(name, oid);
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(oid) && PROLLY_HAS(finder, fold_on_leave) &&
@@ -6746,6 +6773,7 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 	/* (one with only a head: its working set is the head's) */
 	if (!OidIsValid(branch_oid(branch)))
 		return head_working_set(branch, root);
+	check_head_restore_seen(branch, branch_oid(branch));
 	branch_ops()->run_on(branch, fold_into, root);
 	return true;
 }

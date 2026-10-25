@@ -1035,7 +1035,12 @@ without folding from the baseline and the change finder's count since it
 writes), and only while no other session on the branch holds a snapshot
 (on main, which sessions don't lock, no other backend of the database):
 such a snapshot would read the head's rows, neither its own nor the
-commit's.  A restore of the commit's own kept pages, and a share, aren't
+commit's.  A transaction elsewhere whose snapshot can't move (REPEATABLE
+READ, SERIALIZABLE) may come to the branch later, by a checkout or a read
+of its working set: the move records that it gave the branch its head's
+pages (in shared memory: no snapshot outlives a restart), and such a
+transaction, if its snapshot doesn't see the move, fails with a
+serialization failure instead.  A restore of the commit's own kept pages, and a share, aren't
 held back so: a snapshot then reads the commit's rows, as after a
 TRUNCATE, a state the move makes rather than one that never was.  A branch reset back and forth between two commits
 takes this path: each restore gives a table new storage, and the other

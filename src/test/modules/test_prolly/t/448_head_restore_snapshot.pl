@@ -108,5 +108,31 @@ is($side->query_safe('SELECT sum(v) FROM q.t'),
 $side->query_safe('COMMIT');
 $side->quit;
 
+# A snapshot taken off the branch, its transaction coming to the branch
+# after the move: refused, as REPEATABLE READ refuses a conflict, rather
+# than reading the head's rows.
+on_side("SELECT dolt_reset('--hard', '$c'); SELECT dolt_reset('--hard', '$a');
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 7;
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 5");
+my $late = $node->background_psql('postgres', on_error_stop => 0);
+$late->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+$before = sql($counts);
+on_side("SELECT dolt_reset('--hard', '$a')");
+cmp_ok(sql($counts), '>', $before, 'the head\'s pages are given back on side');
+$late->query(q{SELECT dolt_checkout('side')});
+like($late->{stderr},
+	qr/could not serialize access: branch "side" was given its head's kept pages/,
+	'a transaction whose snapshot is older can\'t come to the branch');
+$late->{stderr} = '';
+$late->query_safe('ROLLBACK');
+# (a new transaction comes to it, and reads the commit's rows)
+$late->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ});
+$late->query_safe(q{SELECT dolt_checkout('side')});
+is($late->query_safe('SELECT sum(v) FROM q.t'), '0',
+	'a later one comes to it, and reads the commit\'s rows');
+$late->query_safe('COMMIT');
+$late->quit;
+
 $node->stop;
 done_testing();
