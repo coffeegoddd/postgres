@@ -411,6 +411,13 @@ another's table, under its grants:
   the head of has on it (branch_ops' carry_privileges(), as a merge of
   that branch gives a table it makes).  The merge's commit then records
   the chosen relations.
+- (Every kind of object a move makes, re-makes or changes is treated as
+  below for tables: types and domains, routines, views, sequences,
+  foreign tables, versioned schemas and collations, as well as tables and
+  materialized views.  A commit's record of relations lists every object
+  it may hold, each with its kind and owner, named as the commit's items
+  name it (the canonicalizer's prolly_owned_objects()); a type move's
+  statements on the tables using a type run as each table's owner.)
 - Every move that makes a table or materialized view from a commit (a
   reset, a table's checkout, a branch's first use, a rebase's end, an
   abort, a stash's push or apply, a merge, a pick, a revert, '--theirs')
@@ -440,8 +447,8 @@ another's table, under its grants:
   rows written and checked so, where the role moving has that owner's
   privileges (a superuser, a member of the owning role): the owner's code
   never runs with more than the owner's own.  One made again keeps its
-  owner and gets its grants back (its own, its columns' and its
-  sequences').  A role without the owner's privileges moves as itself,
+  owner and gets exactly its grants back (its own, its columns' and its
+  sequences', a NULL ACL as well: nothing its making gave it stays).  A role without the owner's privileges moves as itself,
   as its DDL would run, refused where it doesn't own what changes (and a
   writer branch's role as its base allows: see "Writers"); whether
   row-level security refuses the rows is the mover's.  Owner-run

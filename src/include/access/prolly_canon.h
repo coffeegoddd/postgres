@@ -626,6 +626,18 @@ typedef struct ProllyMakerSwitch
 extern Oid	prolly_move_mover(void);
 
 /*
+ * Each object of the session's branch a commit may hold, but its prolly
+ * tables, partitioned tables and materialized views: its OID, its owner,
+ * its kind ('v' view, 'S' sequence, 'f' foreign table, 'P' routine, 'T'
+ * type, 'N' schema, 'C' collation) and its name as commits' items name it.
+ * The refs record them with a commit's relations, so that a move making
+ * one from the commit makes it as its recorded owner.
+ */
+extern void prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
+											   const char *name, void *arg),
+								 void *arg);
+
+/*
  * Run as relid's maker (prolly_move_maker()), if it has one, until
  * prolly_as_maker_end(): callers end it in a PG_FINALLY().
  */

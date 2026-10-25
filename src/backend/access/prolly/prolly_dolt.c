@@ -7237,7 +7237,8 @@ made_from(NameLineage *l, const ProllyHash *commit)
 	{
 		ProllyCommitRelation *r = lfirst(lc);
 
-		if (r->relid == l->relid && r->relkind != RELKIND_MATVIEW)
+		if (r->relid == l->relid &&
+			(r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE))
 			return r->name;
 	}
 	return NULL;

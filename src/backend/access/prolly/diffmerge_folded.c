@@ -4791,10 +4791,18 @@ recorded_relid(const ProllyHash *commit, const char *name)
 	{
 		ProllyCommitRelation *r = lfirst(lc);
 
-		if (strcmp(r->name, name) == 0 && r->relkind != RELKIND_MATVIEW)
+		if (strcmp(r->name, name) == 0 &&
+			(r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE))
 			return r->relid;
 	}
 	return InvalidOid;
+}
+
+/* Whether a record's line is a table's (or partitioned table's) */
+static bool
+record_is_table(const ProllyCommitRelation *r)
+{
+	return r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE;
 }
 
 /*
@@ -4836,7 +4844,11 @@ prolly_versions_may_mismatch(const ProllyHash *commits, int n)
 		foreach(lc, relations)
 		{
 			ProllyCommitRelation *r = lfirst(lc);
-			Oid			here = prolly_table_named(r->name);
+			Oid			here;
+
+			if (!record_is_table(r))
+				continue;
+			here = prolly_table_named(r->name);
 
 			if (OidIsValid(here) && here != r->relid)
 				return true;
@@ -13115,7 +13127,7 @@ identities_may_conflict(const ProllyHash *theirs, const ProllyNodeRef *base_root
 		return false;
 	foreach_ptr(ProllyCommitRelation, r, relations)
 	{
-		Oid			here = prolly_table_named(r->name);
+		Oid			here = record_is_table(r) ? prolly_table_named(r->name) : InvalidOid;
 		Table	   *bt;
 		Table	   *tt;
 
@@ -14568,7 +14580,8 @@ recorded_maker(const ProllyHash *commit, const char *name, Oid relid)
 		!PROLLY_CALL(dc.refs, commit_relations, commit, &relations))
 		return InvalidOid;
 	foreach_ptr(ProllyCommitRelation, r, relations)
-		if (r->relid == relid && r->relkind != RELKIND_MATVIEW)
+		if (r->relid == relid &&
+			(r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE))
 			return prolly_recorded_owner(name, r->owner, r->owner_name);
 	return InvalidOid;
 }
@@ -14730,7 +14743,7 @@ prolly_drop_mismatched_tables(const ProllyHash *head, const char *why,
 		return;
 	foreach_ptr(ProllyCommitRelation, r, relations)
 	{
-		Oid			here = prolly_table_named(r->name);
+		Oid			here = record_is_table(r) ? prolly_table_named(r->name) : InvalidOid;
 
 		if (OidIsValid(here) && here != r->relid)
 		{
