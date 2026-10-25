@@ -557,7 +557,8 @@ refs_init(void)
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
 	env.compare = prolly_bytes_compare;
-	env.counters = pgstat_prolly_tree_counters();
+	/* (counted apart too: see pgstat_prolly_refs_tree_counters()) */
+	env.counters = pgstat_prolly_refs_tree_counters();
 	commit_env = env;
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;

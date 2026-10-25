@@ -51,12 +51,16 @@ MAP = ("bmap_map_pages_copied", "bmap_refcount_updates", "bmap_blocks_freed", "p
        "bmap_pages_preserved")
 APPLY = ("apply_rows", "apply_index_tuples")
 WORK = TREE + MAP + APPLY + ("catalog_rows_copied",)
+# The reference-count pages a merge's snapshot reads to tell its own map
+# pages from shared ones: gated on the merges alone, a page each for the
+# children of a map page, not one for each child (#870).
+REFS = ("bmap_refcount_reads",)
 # What an operation reads of the catalogs: block fetches of every system
 # catalog and index (not a pg_stat_prolly counter; V9 reads it with them).
 CATALOG = ("catalog_blocks_read",)
 
 # Below these, a counter's values are noise to a fit.
-FLOORS = {name: 8.0 for name in WORK}
+FLOORS = {name: 8.0 for name in WORK + REFS}
 FLOORS["catalog_blocks_read"] = 64.0
 FLOORS.update({"nodes_read": 32.0, "bmap_refcount_updates": 64.0, "bmap_blocks_freed": 64.0,
                "page_copies_shared": 64.0, "bmap_pages_preserved": 64.0})
@@ -98,13 +102,14 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     ("diff", "delta"): {"nodes_read": "linear"},
     # a merge: the differences examined and written, and the pages kept as
     # of its commit (the map's work of the paths changed)
-    ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP)},
+    ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP),
+                        **_all("log", REFS)},
     ("merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
     # a fast-forward merge: the same, but the map pages it copies, which sit
     # on the bound between log and linear (0.35): gated at linear, so the
     # check doesn't flip between met and known with a page more or less
     ("ff_merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP),
-                           "bmap_map_pages_copied": "linear"},
+                           **_all("log", REFS), "bmap_map_pages_copied": "linear"},
     ("ff_merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
     # a transaction's own commit: Δ descents of the tree, and the chunks
     # the last one wrote read from the cache, not the files.  (Not Δ: past
