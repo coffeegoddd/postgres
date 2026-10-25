@@ -1828,12 +1828,73 @@ can_restore(Form_pg_class c, const BranchKeptRelation *k)
 }
 
 /*
+ * Relation relid moved from storage old to new storage dst, old dropped as
+ * the transaction commits: each snapshot of old that carry[] names
+ * (ncarry of them; the branch's kept commits' pages of it) kept by dst too,
+ * carried[] naming it there, so that it outlives old
+ * (bmap_snapshot_carry(), O(1) each).  One not of old, no longer there,
+ * or 'skip' (the snapshot restored, which dst keeps its own of, taken
+ * after) is left as carry[] names it.  At most as many as leave dst room
+ * for the snapshot it then keeps of itself, and for other users.
+ */
+static void
+carry_kept(Oid relid, RelFileLocator old, uint64 skip, RelFileLocator dst,
+		   const BranchKeptRelation *carry, int ncarry,
+		   BranchKeptRelation *carried)
+{
+	SMgrRelation src = smgropen(old, INVALID_PROC_NUMBER);
+	SMgrRelation to = smgropen(dst, INVALID_PROC_NUMBER);
+	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	int			n;
+	int			room = KEEP_SNAPSHOTS_MAX - 1;
+
+	if (!bmap_relation_exists(old))
+		return;
+	n = bmap_snapshot_list(src, snaps, BMAP_SNAPSHOTS_MAX);
+	for (int j = 0; j < ncarry && room > 0; j++)
+	{
+		const BranchKeptRelation *c = &carry[j];
+		bool		there = false;
+		bool		done = false;
+
+		if (c->relid != relid ||
+			!RelFileLocatorEquals(kept_locator(c), old) || c->snapshot == skip)
+			continue;
+		for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
+			there |= snaps[s].id == c->snapshot;
+
+		/* (one snapshot two commits keep carried once) */
+		for (int p = 0; p < j && !done; p++)
+		{
+			if (carry[p].relid == c->relid &&
+				carry[p].relfilenumber == c->relfilenumber &&
+				carry[p].tablespace == c->tablespace &&
+				carry[p].snapshot == c->snapshot &&
+				carried[p].relfilenumber != c->relfilenumber)
+			{
+				carried[j] = carried[p];
+				done = true;
+			}
+		}
+		if (!there || done)
+			continue;
+		carried[j] = *c;
+		carried[j].relfilenumber = dst.relNumber;
+		carried[j].snapshot = bmap_snapshot_carry(src, c->snapshot, to);
+		note_taken(dst, carried[j].snapshot);
+		room--;
+	}
+}
+
+/*
  * Give the session branch's relations kept[] back the pages keep() kept
  * (see branch_ops.h).
  */
 static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
-			   BranchKeptRelation *renewed, TimestampTz *wait_start)
+			   BranchKeptRelation *renewed, const BranchKeptRelation *carry,
+			   int ncarry, BranchKeptRelation *carried,
+			   TimestampTz *wait_start)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -1843,6 +1904,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	Taking		taking;
 
 	let_go_of_abandoned();
+	for (int j = 0; j < ncarry; j++)
+		carried[j] = carry[j];
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 	taking_begin(&taking, nkept);
 
@@ -1905,6 +1968,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 														  INVALID_PROC_NUMBER),
 												 k->snapshot, false, true, true);
 		renewed[i].relfilenumber = relnumber;
+		carry_kept(k->relid, class_locator(oc, oc->relfilenode), k->snapshot,
+				   class_locator(oc, relnumber), carry, ncarry, carried);
 		taking_add(&taking, class_locator(oc, relnumber), &renewed[i]);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
@@ -1919,6 +1984,18 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	}
 	if (ok && any)
 		taking_end(&taking);
+
+	/* (another commit kept by the restored snapshot: by its new one too) */
+	for (int j = 0; j < ncarry && ok && any; j++)
+		for (int i = 0; i < nkept; i++)
+			if (carry[j].relid == kept[i].relid &&
+				carry[j].relfilenumber == kept[i].relfilenumber &&
+				carry[j].tablespace == kept[i].tablespace &&
+				carry[j].snapshot == kept[i].snapshot)
+			{
+				carried[j].relfilenumber = renewed[i].relfilenumber;
+				carried[j].snapshot = renewed[i].snapshot;
+			}
 	if (ok && any)
 		CommandCounterIncrement();
 	table_close(pg_class, RowExclusiveLock);
@@ -1938,12 +2015,16 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
  */
 static bool
 copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
-				  TimestampTz *wait_start)
+				  const BranchKeptRelation *carry, int ncarry,
+				  BranchKeptRelation *carried, TimestampTz *wait_start)
 {
 	bool		other = source != MyBranch;
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
 	bool		ok = true;
+
+	for (int j = 0; j < ncarry; j++)
+		carried[j] = carry[j];
 
 	/* (not the pages of a branch being deleted) */
 	if (other && !pin_branch(source))
@@ -2011,6 +2092,15 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
 												 k->snapshot, false, false, true);
+
+		/*
+		 * (the session's own kept snapshots carried, as restore() carries
+		 * them; another branch's storage is of another lineage, whose
+		 * epochs say nothing of the session's snapshots)
+		 */
+		if (!other)
+			carry_kept(k->relid, class_locator(oc, oc->relfilenode), 0,
+					   class_locator(oc, relnumber), carry, ncarry, carried);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
