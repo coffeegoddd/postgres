@@ -41,6 +41,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_keying.h"
 #include "access/relscan.h"
@@ -111,11 +112,14 @@ typedef struct RowsEntry
 static void
 check_no_rls(Oid relid)
 {
-	if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+	/* (the move's role's, where it runs as a relation's maker) */
+	Oid			user = prolly_move_mover();
+
+	if (check_enable_rls(relid, user, false) == RLS_ENABLED)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("user \"%s\" cannot apply rows to relation with row-level security enabled: \"%s\"",
-						GetUserNameFromId(GetUserId(), true),
+						GetUserNameFromId(user, true),
 						get_rel_name(relid))));
 }
 

@@ -706,23 +706,21 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  t
 (1 row)
 
--- a writer that owns none of them uses a branch (its first use), and
--- merges, where alice changed her tables since: the changes are made as
--- alice
+-- a role without alice's privileges moves as itself, as its DDL would
+-- run: a writer that owns none of her tables can't use a branch (its first
+-- use), nor merge, where alice changed them since; refused, nothing is left
+-- behind.  (A role that has them, a superuser, moves as alice, above.)
 -- (the writer may read alice's definitions: the function her check calls)
 GRANT USAGE ON SCHEMA rm_pub TO regress_rm_w;
 SET ROLE regress_rm_w;
 SELECT dolt_checkout('xx') IS NOT NULL AS on_xx;
- on_xx 
--------
- t
-(1 row)
-
+ERROR:  must be owner of view vw
+CONTEXT:  SQL statement "DROP VIEW IF EXISTS rm.vw"
 SELECT relowner::regrole, (SELECT count(*) FROM pg_attribute WHERE attrelid = 'rm.other'::regclass AND attname = 'extra') AS has_extra
 FROM pg_class WHERE oid = 'rm.other'::regclass;
      relowner     | has_extra 
 ------------------+-----------
- regress_rm_alice |         0
+ regress_rm_alice |         1
 (1 row)
 
 SELECT dolt_checkout('xm') IS NOT NULL AS on_xm;
@@ -732,16 +730,13 @@ SELECT dolt_checkout('xm') IS NOT NULL AS on_xm;
 (1 row)
 
 SELECT (dolt_merge('main'))[2:2] AS fast_forward;
- fast_forward 
---------------
- {1}
-(1 row)
-
+ERROR:  must be owner of view vw
+CONTEXT:  SQL statement "DROP VIEW IF EXISTS rm.vw"
 SELECT relowner::regrole, (SELECT count(*) FROM pg_attribute WHERE attrelid = 'rm.other'::regclass AND attname = 'extra') AS has_extra
 FROM pg_class WHERE oid = 'rm.other'::regclass;
      relowner     | has_extra 
 ------------------+-----------
- regress_rm_alice |         1
+ regress_rm_alice |         0
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;

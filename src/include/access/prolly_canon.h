@@ -614,7 +614,16 @@ typedef struct ProllyMakerSwitch
 	Oid			user;
 	int			sec;
 	int			nest;			/* (the GUC level its search_path is set at) */
+	Oid			mover;			/* (prolly_move_mover()'s before) */
 } ProllyMakerSwitch;
+
+/*
+ * The role running the move, while it runs as a maker; else the current
+ * user.  Whether row-level security applies to the rows a move writes is
+ * the mover's, as it was before makers: running as one restricts the move,
+ * it never lets it write what the mover's policies would refuse.
+ */
+extern Oid	prolly_move_mover(void);
 
 /*
  * Run as relid's maker (prolly_move_maker()), if it has one, until
