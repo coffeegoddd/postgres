@@ -28,6 +28,8 @@ typedef struct BranchFoldStamp
 extern Size branch_generations_shmem_size(void);
 extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
+extern void branch_note_head_restore(Oid branch);
+extern bool branch_head_restore_unseen(Oid branch, Snapshot snap);
 extern void branch_generations_note_relation(Oid branch, Oid relid,
 											 int nrows);
 

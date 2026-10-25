@@ -132,6 +132,12 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The slot following the page store's syncs for shares and snapshots.
+CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT synced int8,
+	OUT flushing int4)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_sweep_due()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -358,6 +364,12 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- Whether the refs' walk, what reclamation keeps, reaches a commit.
 CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The commits a branch's pages are kept as of, newest first, as the refs
+-- offer them to a move or a first use (not those retired).
+CREATE FUNCTION test_kept_commits(branch text)
+RETURNS TABLE (commit_id text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The value of the refs' entry key (a tag, then a name).
@@ -634,6 +646,17 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- from commit "from" doesn't: what "to" added to the chunk store.
 CREATE FUNCTION test_walk_new_count(from_commit text, to_commit text)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The GC generation of this database's chunk store now.
+CREATE FUNCTION test_chunk_generation()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Whether the shared commit cache has commit id (hex) of database dboid in
+-- GC generation generation (a lookup: counted as a hit or miss).
+CREATE FUNCTION test_commit_cache_has(dboid oid, generation int8, id text)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- What the value memo's lookups found since the last reset.

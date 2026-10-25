@@ -5221,6 +5221,14 @@ journal_root_free(ProllyChunkStore *s)
 	return true;
 }
 
+/* The GC generation of the manifest now (read again if it changed). */
+static uint32
+journal_generation(ProllyChunkStore *s)
+{
+	refresh_segments(s);
+	return s->gc_generation;
+}
+
 static bool
 journal_move_root(ProllyChunkStore *s, const ProllyHash *expected,
 				  const ProllyHash *root)
@@ -9210,4 +9218,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.other_bytes = journal_other_bytes,
 	.try_hold_root = journal_try_hold_root,
 	.root_free = journal_root_free,
+	.generation = journal_generation,
 };

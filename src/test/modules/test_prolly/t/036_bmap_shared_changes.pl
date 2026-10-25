@@ -14,9 +14,14 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('shared_changes');
 $node->init;
+# The fold worker is off: a background fold of a table makes its pages
+# as of the fold, which VACUUM and a page's next change then copy, and
+# logs WAL of its own, while the checks below count the pages copied and
+# read the WAL a change logs.
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 checkpoint_timeout = 1h
+prolly_fold_worker = off
 });
 $node->start;
 

@@ -851,6 +851,14 @@ typedef struct ProllyRefsRoutine
 							  ProllyFoldMark *mark);
 
 	/*
+	 * Optional: visit the branches whose names begin with prefix, as
+	 * branches() visits them: the work is in those, however many other
+	 * branches there are.
+	 */
+	void		(*branches_named) (const char *prefix, ProllyBranchVisit visit,
+								   void *arg);
+
+	/*
 	 * Optional: forget the relation records of commits the chunk store no
 	 * longer has, as a step after a collection (true if any was), and the
 	 * entries records share (their routines and types) that no record left
@@ -918,7 +926,8 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
-	"made_object", "stash_set_maker", "last_fold", "forget_records"
+	"made_object", "stash_set_maker", "last_fold", "branches_named", \
+	"forget_records"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK forget_records
 

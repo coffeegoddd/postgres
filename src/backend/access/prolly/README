@@ -12,7 +12,12 @@ under version control.  Their tables use the table access method "prolly"
 block-mapped storage (storage/smgr/bmap.c), so each branch's copy of a
 table shares its pages copy-on-write with the others.  That working set is
 ordinary Postgres: MVCC, WAL, indexes, constraints and triggers all work
-as they do on heap.
+as they do on heap.  One lock-order rule comes with it: never wait for a
+buffer's content lock while holding a relation's block map header (or
+another of its map pages).  Preparing a page for a change, and asking
+whether it is shared, read the map with the page locked; a share or a
+snapshot that must read the relation's pages under its header tries their
+locks, and lets go of the header to wait.
 
 A commit folds the session branch's versioned schemas into canonical,
 content-addressed prolly trees, kept in the database's chunk store, and
@@ -75,6 +80,7 @@ Changes to this design are tracked in GitHub issues:
 	matcache          prolly_matcache.h       branches, stub
 	json_tree         prolly_jsontree.h       paths, stub
 	node_cache        prolly_nodecache.h      shared, stub
+	commit_cache      prolly_commitcache.h    shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -904,6 +910,19 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+Walking history (HEAD~n, ^n, a commit named by its hash) takes each
+commit's links (its root, parents and height) from the commit cache
+(prolly_commitcache.h; "shared", commitcache_shared.c), a table in shared
+memory of prolly_commit_cache_entries commits (4096; 0 turns it off),
+before reading the commit.  The node cache lets go of the commits as soon
+as a large diff or reset reads past them, so without it each step of a
+walk could be a read from disk.  An entry is of the chunk
+store's GC generation it was read in (the chunk store's generation()) and
+is found only in that generation, so a collection's swap lets go of them
+all; dropping a database forgets its entries.  A transaction's entries
+are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
+and commit_cache_misses).
+
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
@@ -1098,8 +1117,71 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers, and so does redo of one, walking the
-snapshot's own leaves as the record names them.  Redo visits every buffer
+finds), never visiting the buffers.  Redo of one writes the same pages,
+walking the snapshot's own leaves as the record names them, and syncs
+nothing when the record says those pages were logged as images (a WAL
+level for backups, below).
+
+Durability through WAL.  The blocks a share or snapshot comes to share
+must hold its pages durably, as long as anything holds them: they never
+change in place again, and recovery that finds a newer map skips the
+records of a page from before it moved off them.  At a WAL level for
+backups (wal_level replica or logical), WAL makes them so: each own block
+is logged as an image (PRESERVE) before the share's or snapshot's record,
+which says so, and its write (still needed: a relation made of the share
+reads the blocks) registers the block's segment for the checkpointer's
+sync like any page's.  Recovery from a checkpoint before an image replays
+it to the block, torn or lost writes included; one from a later
+checkpoint finds the block written and synced by it (a page dirty as a
+checkpoint begins is written by it, and every write registered before
+its sync phase is synced).  WAL holding an image is let go of only past
+such a checkpoint, a commit relying on the share flushes WAL past its
+images (with synchronous_commit off, a crash may lose the commit, but WAL
+is replayed as a prefix: no commit survives without the images before
+it), and a base backup either replays the image or copies the block
+after its start checkpoint wrote and synced it.  Redo of such a record
+syncs nothing (the images' redo wrote each block, and a restartpoint
+syncs it), so a standby, or a promoted one, follows the same argument.
+It still writes the relation's pages out, as the primary does: a page
+found the relation's own before the share or snapshot may change in place
+after its image and before the record (a row lock or a prune, which don't
+ask the map), and that change's redo reaches the relation's buffer only,
+which nothing else would write to the block before a restartpoint.
+Redo goes by the record's flag, not the current wal_level, which can
+change only across a restart, whose shutdown checkpoint syncs everything.
+
+At wal_level minimal no image is logged, and a share or snapshot syncs the
+database's page store, a whole-file fsync that writes back every page the
+kernel holds unwritten for the store, whoever wrote it: a hard reset's
+discarded working set, another branch's dirty pages.  One that holds no
+block of its own (a table just restored or shared, or unchanged since its
+last snapshot: every block held by another map or snapshot already) skips
+its flush and the sync when the store is durable already.  Its blocks were
+each written out by the share or snapshot that first shared them (their
+own blocks then) and can't change in place since (a change copies a
+shared page first, and only a hint reaches its buffer).  Shared memory
+follows each store's flushes of own blocks: begun before the blocks'
+counts are raised (under the relation's header, so whoever finds them
+shared finds the flush in flight or written), written, and synced by a
+sync that began after the write.  With none in flight and every one
+written synced since, the blocks are on disk, and the sync would add
+nothing the share or snapshot needs: the other pages it would write are
+WAL's to protect and the checkpointer's to sync, as any page's.  (At the
+other levels, a share with no block of its own skips its flush when no
+flush is in flight.)  A flush written whose transaction ends unsynced (an
+abort) leaves the store not durable until the next sync; one given up
+before its write was done (an error part way) may have left its pages in
+their buffers alone, which no sync writes, and leaves the store not
+durable (nor, at the other levels, written out) until a checkpoint begun
+after it completes.  A store isn't known durable until its first sync
+after the server (or its shared memory, after a crash) starts, which
+covers writes from before.  At most 64 stores are followed at once: past
+that, the least recently used idle one is let go of, and reads as not
+durable until its next sync.
+prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
+measure what they cost.
+
+Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
 data checksums off (a torn page would go unseen), or at a map or count
 page newer than the replay (a crash's, or a base backup's), one that
@@ -1136,8 +1218,29 @@ snapshot, O(1), its pg_class row repointed with its oldest transaction ids
 then, as TRUNCATE gives a relation new storage, and the old storage dropped
 at commit; the baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
-of its rows.  Whatever still differs (definitions, sequences, a table not
-restored) the move writes as before.  A table isn't restored if its
+of its rows.  A move to a commit whose pages aren't kept, or whose kept
+pages for a table are gone, may give that table the pages kept as of the
+branch's head instead: that discards the working set's changes in O(1),
+as a reset to the head does, and the move then writes only the rows the
+head and the commit differ by.  It does so only where that costs less
+than writing the rows the working set and the commit differ by, as told
+without folding from the baseline and the change finder's count since it
+(the working set may have been brought near the commit by its own
+writes), and only while no other session on the branch holds a snapshot
+(on main, which sessions don't lock, no other backend of the database):
+such a snapshot would read the head's rows, neither its own nor the
+commit's.  A transaction elsewhere whose snapshot can't move (REPEATABLE
+READ, SERIALIZABLE) may come to the branch later, by a checkout or a read
+of its working set: the move records that it gave the branch its head's
+pages (in shared memory: no snapshot outlives a restart), and such a
+transaction, if its snapshot doesn't see the move, fails with a
+serialization failure instead.  A restore of the commit's own kept pages, and a share, aren't
+held back so: a snapshot then reads the commit's rows, as after a
+TRUNCATE, a state the move makes rather than one that never was.  A branch reset back and forth between two commits
+takes this path: each restore gives a table new storage, and the other
+commit's snapshot goes with the old storage.  Whatever still differs
+(definitions, sequences, a table not restored) the move writes as before.
+A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
@@ -1164,6 +1267,26 @@ under locks against writers.  The new branch's baseline takes those
 tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
+
+A restore gives each table it restores new storage, and the storage it
+replaces, where every other kept commit's snapshot of the table was, goes
+with it at commit; so does a rewrite's, or a dropped table's.  Each keep
+and each restore asks what is left of each kept commit's pages (branch
+operations' kept_status()).  One with nothing left at all (every
+relation's storage, or its snapshot there, gone, as the transaction sees
+it) is dropped from the list at once, with nothing to let go of, and its
+commit and baseline are no longer kept from collection.  One none of
+whose tables can be given its pages any more, but with a snapshot still
+left (a TRUNCATE gives a table and its indexes new storage, but not its
+change log; its rows' transaction ids are older than the database still
+knows), is retired, as above: it stays in the record, keeping its commit
+and baseline from collection, until a later keep lets go of its
+snapshots.  Neither counts toward prolly.kept_commits or is offered to a
+move or a first use.  A commit with a table whose relations are all still
+on the storage that kept them stays kept (restore_pages() may still pass
+the table over, renamed or with other relations since).  Snapshots that a
+dropped commit shares with one let go of are kept until a later keep: the
+change that made it gone may roll back.
 
 Kept commits are kept states of the materialization cache
 (prolly_matcache.h), beside kept checkouts: the cache's visit() gives

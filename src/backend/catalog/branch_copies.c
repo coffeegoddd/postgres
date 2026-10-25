@@ -1118,6 +1118,39 @@ copies_branches(BranchVisit visit, void *arg)
 	table_close(brel, AccessShareLock);
 }
 
+/*
+ * The branches named with prefix: an ordered scan of the name index from
+ * prefix, until a name doesn't begin with it (names compare as bytes, as
+ * the index orders them).
+ */
+static void
+copies_branches_named(const char *prefix, BranchVisit visit, void *arg)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	Relation	irel = index_open(BranchNameIndexId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	NameData	start;
+	size_t		len = strlen(prefix);
+
+	namestrcpy(&start, prefix);
+	ScanKeyInit(&key, Anum_pg_branch_brname, BTGreaterEqualStrategyNumber,
+				F_NAMEGE, NameGetDatum(&start));
+	scan = systable_beginscan_ordered(brel, irel, NULL, 1, &key);
+	while ((tup = systable_getnext_ordered(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_branch b = (Form_pg_branch) GETSTRUCT(tup);
+
+		if (strncmp(NameStr(b->brname), prefix, len) != 0)
+			break;
+		visit(NameStr(b->brname), b->oid, arg);
+	}
+	systable_endscan_ordered(scan);
+	index_close(irel, AccessShareLock);
+	table_close(brel, AccessShareLock);
+}
+
 static void
 copies_run_on(const char *name, void (*fn) (void *arg), void *arg)
 {
@@ -1563,9 +1596,10 @@ kept_locator(const BranchKeptRelation *k)
 /*
  * Snapshots to take, together (bmap_snapshot_take_many(): the generation
  * of sharing raised once, each relation's pages changed since its last
- * snapshot written out, and each page store synced once as the transaction
- * commits, which the refs naming them commit with): each one's storage
- * and where its id goes.
+ * snapshot written out, and made durable by the transaction's commit, which
+ * the refs naming them commit with: through the images of those pages it
+ * logged, or at wal_level minimal each page store synced once as it
+ * commits): each one's storage and where its id goes.
  */
 typedef struct Taking
 {
@@ -1735,20 +1769,37 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 }
 
 /*
- * Is relation c (its row k) still on the branch with the storage that kept
- * it, its snapshot there, and its rows' transaction ids ones the database
- * still knows (none older than its datfrozenxid and datminmxid, whose
- * status may be gone)?  Asked before the pages kept are given back, and
- * before a branch is made of them.
+ * What is left of relation c's (its row k's) kept pages: restorable if it
+ * is still on the branch with the storage that kept it, its snapshot there,
+ * and its rows' transaction ids ones the database still knows (none older
+ * than its datfrozenxid and datminmxid, whose status may be gone); gone if
+ * that storage, or its snapshot, is no longer there, or the relation is on
+ * other storage now (its own goes when the change commits); held if the
+ * snapshot is still there but can't be given back.
  */
-static bool
-can_restore(Form_pg_class c, const BranchKeptRelation *k)
+static BranchKeptStatus
+kept_status_of(Form_pg_class c, const BranchKeptRelation *k)
 {
 	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
 	HeapTuple	dbtup;
 	TransactionId datfrozenxid;
 	MultiXactId datminmxid;
+	bool		there = false;
 	int			n;
+
+	if (c->relfilenode != k->relfilenumber ||
+		c->reltablespace != k->tablespace ||
+		!bmap_relation_exists(kept_locator(k)))
+		return BRANCH_KEPT_GONE;
+	n = bmap_snapshot_list(smgropen(kept_locator(k), INVALID_PROC_NUMBER),
+						   snaps, BMAP_SNAPSHOTS_MAX);
+	for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
+	{
+		if (snaps[s].id == k->snapshot)
+			there = true;
+	}
+	if (!there)
+		return BRANCH_KEPT_GONE;
 
 	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	if (!HeapTupleIsValid(dbtup))
@@ -1756,24 +1807,24 @@ can_restore(Form_pg_class c, const BranchKeptRelation *k)
 	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
 	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
 	ReleaseSysCache(dbtup);
-
-	if (c->relfilenode != k->relfilenumber ||
-		c->reltablespace != k->tablespace ||
-		c->relpersistence != RELPERSISTENCE_PERMANENT ||
-		!bmap_relation_exists(kept_locator(k)) ||
+	if (c->relpersistence != RELPERSISTENCE_PERMANENT ||
 		(TransactionIdIsNormal(k->frozenxid) &&
 		 TransactionIdPrecedes(k->frozenxid, datfrozenxid)) ||
 		(MultiXactIdIsValid(k->minmxid) &&
 		 MultiXactIdPrecedes(k->minmxid, datminmxid)))
-		return false;
-	n = bmap_snapshot_list(smgropen(kept_locator(k), INVALID_PROC_NUMBER),
-						   snaps, BMAP_SNAPSHOTS_MAX);
-	for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
-	{
-		if (snaps[s].id == k->snapshot)
-			return true;
-	}
-	return false;
+		return BRANCH_KEPT_HELD;
+	return BRANCH_KEPT_RESTORABLE;
+}
+
+/*
+ * Can relation c's (its row k's) kept pages be given back
+ * (kept_status_of())?  Asked before they are, and before a branch is made
+ * of them.
+ */
+static bool
+can_restore(Form_pg_class c, const BranchKeptRelation *k)
+{
+	return kept_status_of(c, k) == BRANCH_KEPT_RESTORABLE;
 }
 
 /*
@@ -1990,6 +2041,26 @@ copies_let_go(const BranchKeptRelation *kept)
 }
 
 /*
+ * What is left of the pages keep() kept of the session branch's relation
+ * kept (see branch_ops.h).
+ */
+static BranchKeptStatus
+copies_kept_status(const BranchKeptRelation *kept)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	HeapTuple	t = class_row(pg_class, kept->relid, MyBranch);
+	BranchKeptStatus status = BRANCH_KEPT_GONE;
+
+	if (t != NULL)
+	{
+		status = kept_status_of((Form_pg_class) GETSTRUCT(t), kept);
+		heap_freetuple(t);
+	}
+	table_close(pg_class, AccessShareLock);
+	return status;
+}
+
+/*
  * Add acl to the privileges of relation relid's row in catalog (pg_class,
  * or its column attnum's pg_attribute row: tup, a modifiable copy), as
  * owner's, recording its grantees' shared dependencies.  The privileges
@@ -2193,12 +2264,14 @@ static const BranchOpsRoutine branch_copies = {
 	.checkout = copies_checkout,
 	.current = copies_current,
 	.branches = copies_branches,
+	.branches_named = copies_branches_named,
 	.run_on = copies_run_on,
 	.share = copies_share,
 	.keep = copies_keep,
 	.make_kept = copies_make_kept,
 	.restore = copies_restore,
 	.let_go = copies_let_go,
+	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
 	.relation_owner = copies_relation_owner,

@@ -86,6 +86,7 @@
 #include "utils/timestamp.h"
 
 #define BRANCH_GENERATIONS	1024
+#define HEAD_RESTORES		64
 #define ENDED_WRITERS		8
 #define WRITTEN_RELATIONS	32
 
@@ -138,6 +139,17 @@ typedef struct BranchGeneration
 	WrittenRelation rels[WRITTEN_RELATIONS];
 } BranchGeneration;
 
+/*
+ * A branch whose tables a move gave the pages kept as of its head, and the
+ * transaction that did: see branch_note_head_restore().
+ */
+typedef struct HeadRestore
+{
+	Oid			database;
+	Oid			branch;			/* InvalidOid: a free entry */
+	FullTransactionId xid;
+} HeadRestore;
+
 typedef struct BranchGenerations
 {
 	LWLock		lock;
@@ -150,6 +162,10 @@ typedef struct BranchGenerations
 	FullTransactionId overflow_ended;	/* the latest of them that ended */
 	int			hand;			/* the next entry to evict, if it can be */
 	BranchGeneration entries[BRANCH_GENERATIONS];
+	/* (head restores: the latest of those let go of stands for them all) */
+	int			restores_hand;
+	FullTransactionId restores_evicted;
+	HeadRestore restores[HEAD_RESTORES];
 } BranchGenerations;
 
 static BranchGenerations *gens = NULL;
@@ -231,6 +247,93 @@ later(FullTransactionId a, FullTransactionId b)
 		(FullTransactionIdIsValid(b) && FullTransactionIdFollows(b, a)))
 		return b;
 	return a;
+}
+
+/*
+ * The transaction gave branch's tables the pages kept as of its head (a
+ * move to a commit whose own pages are gone): a snapshot taken before it
+ * commits that reads them after would read the head's rows, a state the
+ * branch never had.  Sessions on the branch are asked of before (their
+ * snapshots hold the move back); one that comes to the branch later in a
+ * transaction whose snapshot can't move asks branch_head_restore_unseen()
+ * first.  Remembered by the last HEAD_RESTORES branches, the latest of the
+ * others' standing for all of them (so a branch let go of is asked of as
+ * if restored as late as any was).  Nothing survives a restart, nor needs
+ * to: no snapshot after one is older than a restore before it.
+ */
+void
+branch_note_head_restore(Oid branch)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId xid = GetTopFullTransactionId();
+	HeadRestore *slot = NULL;
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < HEAD_RESTORES && slot == NULL; i++)
+	{
+		HeadRestore *r = &g->restores[i];
+
+		if (r->branch == branch && r->database == MyDatabaseId)
+			slot = r;
+	}
+	for (int i = 0; i < HEAD_RESTORES && slot == NULL; i++)
+	{
+		if (!OidIsValid(g->restores[i].branch))
+			slot = &g->restores[i];
+	}
+	if (slot == NULL)
+	{
+		slot = &g->restores[g->restores_hand];
+		g->restores_hand = (g->restores_hand + 1) % HEAD_RESTORES;
+		g->restores_evicted = later(g->restores_evicted, slot->xid);
+	}
+	if (slot->branch == branch && slot->database == MyDatabaseId)
+		slot->xid = later(slot->xid, xid);
+	else
+		slot->xid = xid;
+	slot->database = MyDatabaseId;
+	slot->branch = branch;
+	LWLockRelease(&g->lock);
+}
+
+/*
+ * Did a transaction snap doesn't see give branch's tables the pages kept
+ * as of its head (branch_note_head_restore())?  One that didn't commit
+ * counts too, while snap can't tell it from one running.
+ */
+bool
+branch_head_restore_unseen(Oid branch, Snapshot snap)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId xid = InvalidFullTransactionId;
+	bool		found = false;
+	FullTransactionId xmin;
+
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC)
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	for (int i = 0; i < HEAD_RESTORES && !found; i++)
+	{
+		HeadRestore *r = &g->restores[i];
+
+		if (r->branch == branch && r->database == MyDatabaseId)
+		{
+			xid = r->xid;
+			found = true;
+		}
+	}
+	if (!found)
+		xid = g->restores_evicted;
+	LWLockRelease(&g->lock);
+	if (!FullTransactionIdIsValid(xid) ||
+		TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(xid)))
+		return false;
+	xmin = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											snap->xmin);
+	return !FullTransactionIdPrecedes(xid, xmin) &&
+		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
 }
 
 /* Remember a writer that ended (the lock held exclusively). */
