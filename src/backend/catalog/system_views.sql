@@ -1205,6 +1205,7 @@ CREATE VIEW pg_stat_database_conflicts AS
             pg_stat_get_db_conflict_bufferpin(D.oid) AS confl_bufferpin,
             pg_stat_get_db_conflict_startup_deadlock(D.oid) AS confl_deadlock,
             pg_stat_get_db_conflict_logicalslot(D.oid) AS confl_active_logicalslot,
+            pg_stat_get_db_conflict_chunk_store(D.oid) AS confl_chunk_store,
             pg_stat_get_db_stat_reset_time(D.oid) AS stats_reset
     FROM pg_database D;
 
