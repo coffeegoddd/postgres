@@ -987,6 +987,19 @@ durable until its next sync.
 prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
 measure what they cost.
 
+A synced block is durable only if recovery leaves it alone.  Redo of the
+record that gave a block to a relation (an extension, or a remap to a page
+of zeroes) zeroes it again, so that a page the relation leaves
+uninitialized reads as zeroes rather than as an earlier holder's page.
+Without images, nothing later in the replay writes a shared block once the
+relation that made its page is dropped (a hard reset's replaced storage)
+or has moved the page off it: those records are skipped.  So redo zeroes
+no block holding a page written after its record (a sane header, an LSN
+past the record's; the checksum goes by the logical block, which the page
+store doesn't know).  Only the relation the record gave the block to, or
+a later holder, can have written such a page: an earlier holder let go of
+the block before the record, after its last change.
+
 Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
 data checksums off (a torn page would go unseen), or at a map or count
