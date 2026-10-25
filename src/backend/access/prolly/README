@@ -404,7 +404,10 @@ shared with the old tree.  Nodes are chunks (chunkformat_basic.c) in the
 database's chunk store (chunkstore_journal.c): an append-only journal,
 later conjoined into table files (tablefile_basic.c), with the store's root
 moved by commit records and its appends logged by the ProllyChunks WAL
-resource manager (prolly_xlog.h).
+resource manager (prolly_xlog.h).  A node's level is its chunk's, which
+another server may have made, so every read refuses (DATA_CORRUPTED) a
+node of level 32 or more (the most a tree has; its walks keep a frame a
+level) and a child that isn't one level below its parent.
 
 Large values stay TOAST's in the working set.  A commit stores a column
 whose canonical bytes are longer than 2048 as a reference to a value tree
