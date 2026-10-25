@@ -27,13 +27,26 @@ prolly.restore_min_changes = 100000000
 });
 $node->start;
 
-sub sql { return $node->safe_psql('postgres', $_[0]); }
+# Each case in a database of its own, with a page store of its own.
+my $db;
+
+sub sql { return $node->safe_psql($db, $_[0]); }
+
+sub use_db
+{
+	$db = $_[0];
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	sql(q{CREATE EXTENSION amcheck; CREATE SCHEMA app VERSIONED});
+}
+
+sub store
+{
+	return $node->data_dir . '/base/' .
+	  sql(q{SELECT oid FROM pg_database WHERE datname = current_database()}) . '/9421';
+}
 
 sub crash { $node->stop('immediate'); $node->start; }
 
-sql(q{CREATE EXTENSION amcheck; CREATE SCHEMA app VERSIONED});
-my $store = $node->data_dir . '/base/' .
-  sql(q{SELECT oid FROM pg_database WHERE datname = 'postgres'}) . '/9421';
 
 # Blocks for a shrink to cut: a large table's, dropped and committed.
 sub junk
@@ -49,7 +62,7 @@ sub junk
 sub check
 {
 	my ($t, $what) = @_;
-	my ($ret, $out, $err) = $node->psql('postgres', qq{
+	my ($ret, $out, $err) = $node->psql($db, qq{
 		SELECT count(*), sum(v) FROM app.$t;
 		SET enable_seqscan = off;
 		SELECT count(*) FROM app.$t WHERE id > 0;
@@ -65,6 +78,7 @@ sub check
 
 # A table made and loaded in one transaction, its writes skipping WAL and
 # synced at commit, in blocks an explicit sweep's shrink cut.
+use_db('explicit');
 junk();
 sql(q{CHECKPOINT});
 cmp_ok(sql(q{SELECT truncated FROM prolly_page_sweep()}), '>', 0,
@@ -78,8 +92,10 @@ is(check('w', 'a WAL-skipped table after a shrink and a crash'),
 	"3000|3000\n3000\nt", 'its rows');
 
 # The same, with autovacuum's sweep doing the shrink.
+use_db('auto');
 junk();
 sql(q{CHECKPOINT});
+my $store = store();
 my $size = -s $store;
 sql(q{ALTER SYSTEM SET autovacuum = on; SELECT pg_reload_conf()});
 my $shrunk = 0;
@@ -101,12 +117,13 @@ is(check('a', 'a WAL-skipped table after autovacuum\'s shrink and a crash'),
 # Pages a snapshot syncs, in blocks a shrink cut: the table's writes are
 # logged, but its storage is replaced by a hard reset, so recovery skips
 # the records that made the kept commit's pages.
+use_db('kept');
 sql(q{CREATE TABLE app.s (id int PRIMARY KEY, v int NOT NULL);
 	SELECT dolt_commit('-Am', 's0')});
 junk();
 sql(q{CHECKPOINT});
 cmp_ok(sql(q{SELECT truncated FROM prolly_page_sweep()}), '>', 0,
-	'the sweep shrinks the page store again');
+	'the sweep shrinks the page store');
 sql(q{INSERT INTO app.s SELECT g, 3 FROM generate_series(1, 3000) g;
 	SELECT dolt_commit('-am', 's1');
 	UPDATE app.s SET v = 4 WHERE id % 7 = 0; SELECT dolt_reset('--hard');

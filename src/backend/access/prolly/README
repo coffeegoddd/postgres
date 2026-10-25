@@ -1005,6 +1005,15 @@ than the record's, so a reader verifies it, with its own).  Only the relation th
 a later holder, can have written such a page: an earlier holder let go of
 the block before the record, after its last change.
 
+For the same reason crash recovery doesn't cut a page store where a
+replayed sweep shrank it: the blocks cut may have been handed out again
+after the shrink, to a relation whose writes skip WAL (it always takes
+blocks from the high-water mark, synced at commit) or to pages a share or
+snapshot synced.  Cut there, the later extension's replay would find them
+past the file and extend it with zeroes.  The store is cut once the replay
+is done, to the high-water mark the replay left.  A standby truncates at
+once, as the primary did: the WAL it replays logs every such page.
+
 Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
 data checksums off (a torn page would go unseen), or at a map or count
