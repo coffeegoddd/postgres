@@ -7716,6 +7716,7 @@ drop_blocks(SMgrRelation reln)
 	ResourceOwner owner = ResourceOwnerCreate(NULL, "block map drop");
 	MemoryContext oldcxt = CurrentMemoryContext;
 	uint32		holdoff = InterruptHoldoffCount;
+	int			lwlocks = LWLockHeldCount();
 
 	CurrentResourceOwner = owner;
 	PG_TRY();
@@ -7726,6 +7727,12 @@ drop_blocks(SMgrRelation reln)
 	{
 		ErrorData  *edata;
 
+		/*
+		 * No abort follows to let go of what the error left held: the
+		 * LWLocks taken since, here (the buffers' content locks, with
+		 * their pins, as the resource owner is released below).
+		 */
+		LWLockReleaseTo(lwlocks);
 		/* an error resets the hold-off our caller set up */
 		InterruptHoldoffCount = holdoff;
 		MemoryContextSwitchTo(oldcxt);

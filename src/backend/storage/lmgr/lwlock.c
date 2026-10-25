@@ -1877,6 +1877,34 @@ LWLockReleaseAll(void)
 
 
 /*
+ * LWLockHeldCount - how many LWLocks my process holds
+ *
+ * With LWLockReleaseTo(), for code that catches an error and goes on
+ * without aborting the transaction (which would release them all).
+ */
+int
+LWLockHeldCount(void)
+{
+	return num_held_lwlocks;
+}
+
+/*
+ * LWLockReleaseTo - release the LWLocks acquired since my process held
+ * nheld of them (as LWLockHeldCount() said then), newest first
+ */
+void
+LWLockReleaseTo(int nheld)
+{
+	Assert(nheld >= 0 && nheld <= num_held_lwlocks);
+	while (num_held_lwlocks > nheld)
+	{
+		HOLD_INTERRUPTS();		/* match the upcoming RESUME_INTERRUPTS */
+
+		LWLockRelease(held_lwlocks[num_held_lwlocks - 1].lock);
+	}
+}
+
+/*
  * LWLockHeldByMe - test whether my process holds a lock in any mode
  *
  * This is meant as debug support only.

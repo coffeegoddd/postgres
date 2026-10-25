@@ -152,6 +152,11 @@ CREATE FUNCTION test_bmap_release_pending()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- does this backend hold the LWLock test_error_holding_lwlock() takes?
+CREATE FUNCTION test_lwlock_left_held()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,
 	done bool DEFAULT false)
 RETURNS void

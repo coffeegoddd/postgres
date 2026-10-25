@@ -35,6 +35,7 @@
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/lwlock.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/tuplestore.h"
@@ -319,6 +320,33 @@ test_bmap_write_one_crash(const char *name, const void *private_data,
 		FlushOneBuffer(buf);
 	elog(PANIC, "crashing at injection point \"%s\" with buffer %u written",
 		 name, (unsigned) i);
+}
+
+/*
+ * An injection point callback, attached with injection_points_attach(name,
+ * 'test_prolly', 'test_error_holding_lwlock'): raise an error holding an
+ * LWLock (XactTruncationLock, shared), as code that fails part way through
+ * work under one does.
+ */
+extern PGDLLEXPORT void test_error_holding_lwlock(const char *name,
+												  const void *private_data,
+												  void *arg);
+
+void
+test_error_holding_lwlock(const char *name, const void *private_data,
+						  void *arg)
+{
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	elog(ERROR, "error holding an LWLock at injection point \"%s\"", name);
+}
+
+/* test_lwlock_left_held(): does this backend hold XactTruncationLock? */
+PG_FUNCTION_INFO_V1(test_lwlock_left_held);
+
+Datum
+test_lwlock_left_held(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(LWLockHeldByMe(XactTruncationLock));
 }
 
 /*
