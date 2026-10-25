@@ -884,7 +884,36 @@ through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
 finds), never visiting the buffers, and so does redo of one, walking the
-snapshot's own leaves as the record names them.  Redo visits every buffer
+snapshot's own leaves as the record names them.
+
+A share or a snapshot then syncs the database's page store, a whole-file
+fsync that writes back every page the kernel holds unwritten for the
+store, whoever wrote it: a hard reset's discarded working set, another
+branch's dirty pages.  One that holds no block of its own (a table just
+restored or shared, or unchanged since its last snapshot: every block held
+by another map or snapshot already) skips its flush and the sync when the
+store is durable already.  Its blocks were each written out by the share
+or snapshot that first shared them (their own blocks then) and can't
+change in place since (a change copies a shared page first, and only a
+hint reaches its buffer).  Shared memory follows each store's flushes of
+own blocks: begun before the blocks' counts are raised (under the
+relation's header, so whoever finds them shared finds the flush in flight
+or written), written, and synced by a sync that began after the write.
+With none in flight and every one written synced since, the blocks are on
+disk, and the sync would add nothing the share or snapshot needs: the
+other pages it would write are WAL's to protect and the checkpointer's to
+sync, as any page's.  A flush whose transaction ends unsynced (an abort,
+an error) leaves the store not durable until the next sync.  A store isn't
+known durable until its first sync after the server (or its shared
+memory, after a crash) starts, which covers writes from before; and past
+64 stores followed, the rest always sync.  Base backups and standbys
+don't depend on the sync: a backup reads the blocks as the earlier write
+left them, or replays the images logged as they were first shared, and a
+standby replays each share and snapshot with its own flush and sync.
+prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
+measure what they cost.
+
+Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
 data checksums off (a torn page would go unseen), or at a map or count
 page newer than the replay (a crash's, or a base backup's), one that
