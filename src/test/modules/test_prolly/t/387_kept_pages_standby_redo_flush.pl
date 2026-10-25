@@ -1,11 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A streaming standby replaying commits that keep their pages.  Redo of
-# each snapshot writes out the relation's pages changed since its last
-# one, found by walking the snapshot's own leaves, not by visiting every
-# buffer: the server log says when redo visits the buffers instead (a map
-# page newer than the replay), which a standby streaming from a
-# consistent point never reads.  With few buffers, the standby writes
+# A streaming standby replaying commits that keep their pages.  Their own
+# pages were logged as images, whose redo wrote them, so redo of each
+# snapshot writes nothing (nor visits every buffer, as it does at
+# wal_level minimal when it can't trust the walk of the snapshot's own
+# leaves).  With few buffers, the standby writes
 # kept pages out between their changes; crashed with its map written out
 # and replayed again (where its map pages may be newer than the replay),
 # then promoted, it gives the kept pages back.
@@ -70,7 +69,14 @@ $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $digest), $now, 'the standby replayed them');
 ok( !$standby->log_contains(
 		'redo of a snapshot of .* writes out every buffer of it', $log_offset),
-	"redo wrote out each snapshot's own pages, visiting no buffer");
+	"redo visited no buffer");
+# (at this WAL level each kept snapshot's own pages were logged as images,
+# whose redo wrote them: redo of the snapshot writes nothing; the walk that
+# writes them at wal_level minimal is t/386's, t/389's and t/443's)
+ok( $standby->log_contains(
+		'redo of a snapshot of .* writes nothing: its own pages were logged as images',
+		$log_offset),
+	"redo of each snapshot wrote nothing, its own pages logged as images");
 
 # the standby's map written out, then a crash
 is($standby->safe_psql('postgres', q{

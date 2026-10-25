@@ -116,37 +116,76 @@ is(syncs_of(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 1},
 		qq{SELECT test_bmap_snapshot_take($plain)}),
 	'0', 'nor does a snapshot taken on its own');
 
-# A commit's kept blocks lost by the machine, after the working set moved
-# off them (its pages changed again, copied first): recovery rebuilds them
-# from the images, the checkpoint before them being where it begins, and a
-# hard reset back to the commit gives them back.
-sql(q{UPDATE app.t SET v = v + 1, pad = pad || 'z' WHERE id % 7 = 0;
-	SELECT dolt_commit('-am', 'c2')});
-my $kept = sql($contents);
-my @lost = blocks_of('t.id % 7 = 0');
-ok(@lost > 0, 'the commit changed pages: ' . scalar(@lost));
-sql(q{UPDATE app.t SET v = v + 1 WHERE id % 7 = 0});
-my $moved = sql($contents);
-is(scalar(grep { my $b = $_; grep { $_ == $b } @lost } blocks_of('t.id % 7 = 0')),
-	0, 'the working set moved off the kept blocks');
-# (its map written out: recovery then skips the records of the pages from
-# before they moved, as of a newer map, so only the images rebuild them)
-is(sql(q{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
-	FROM pg_buffercache WHERE relfilenode = pg_relation_filenode('app.t')}),
-	't', 'the table\'s buffers written out and evicted');
-$node->stop('immediate');
-lose_block($_) for @lost;
-$node->start;
-is(sql($contents), $moved, 'after a crash, the working set');
-my $restored = sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'relations_restored'});
-is(sql(q{SELECT dolt_reset('--hard'); SELECT pg_stat_force_next_flush();
-	SELECT count(*), sum(v), sum(length(pad)) FROM app.t}) =~ s/^.*\n//sr,
-	$kept, 'after their writes were lost, a hard reset gives back the commit\'s pages');
-cmp_ok(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'relations_restored'}),
-	'>', $restored, 'restored from the kept blocks');
+# The buffers of relation file number 'rel' written out and evicted: its
+# map with them, so that recovery skips the records of pages from before
+# they moved, as of a newer map, and only images rebuild what they left.
+sub evict
+{
+	my ($rel) = @_;
+	return sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
+		FROM pg_buffercache WHERE relfilenode = $rel});
+}
 
-# After a checkpoint, the same commit's blocks are on disk: a crash then
-# needs no image.
+# A commit's kept blocks lost by the machine, after the working set moved
+# off them (its pages changed again, copied first), then a crash, with
+# 'conf' appended to the configuration before the restart: recovery
+# rebuilds them from the images, the checkpoint before them being where it
+# begins, and a hard reset back to the commit gives them back.
+my $round = 0;
+sub lose_kept
+{
+	my ($mod, $how, $conf) = @_;
+	$round++;
+	sql(qq{UPDATE app.t SET v = v + 1, pad = pad || 'z' WHERE id % $mod = 0;
+		SELECT dolt_commit('-am', 'lost $round')});
+	my $kept = sql($contents);
+	my @lost = blocks_of("t.id % $mod = 0");
+	ok(@lost > 0, "the commit changed pages ($how): " . scalar(@lost));
+	sql(qq{UPDATE app.t SET v = v + 1 WHERE id % $mod = 0});
+	my $moved = sql($contents);
+	is(scalar(grep { my $b = $_; grep { $_ == $b } @lost } blocks_of("t.id % $mod = 0")),
+		0, "the working set moved off the kept blocks ($how)");
+	is(evict(q{pg_relation_filenode('app.t')}), 't',
+		"the table's buffers written out and evicted ($how)");
+	$node->stop('immediate');
+	lose_block($_) for @lost;
+	$node->append_conf('postgresql.conf', $conf) if $conf;
+	$node->start;
+	is(sql($contents), $moved, "after a crash, the working set ($how)");
+	my $restored = sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'relations_restored'});
+	is(sql(q{SELECT dolt_reset('--hard'); SELECT pg_stat_force_next_flush();
+		SELECT count(*), sum(v), sum(length(pad)) FROM app.t}) =~ s/^.*\n//sr,
+		$kept, "after their writes were lost, a hard reset gives back the commit's pages ($how)");
+	cmp_ok(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'relations_restored'}),
+		'>', $restored, "restored from the kept blocks ($how)");
+}
+lose_kept(7, 'at replica');
+
+# A share's own blocks lost the same way: the copy's rows come back from
+# the images, and redo of the share writes nothing.
+sql(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 3});
+my @shared = split /\n/, sql(qq{
+	SELECT DISTINCT m.phys FROM plain p, test_bmap_map($plain) m
+	WHERE p.a % 10 = 3 AND m.blkno = (p.ctid::text::point)[0]});
+$digest = sql(qq{SELECT test_bmap_rows_digest($plain)});
+my $copy2 = sql(qq{SELECT test_bmap_share($plain)});
+sql(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 3});
+is(evict($plain), 't', 'the source\'s buffers written out and evicted');
+my $log_offset = -s $node->logfile;
+$node->append_conf('postgresql.conf', 'log_min_messages = debug1');
+$node->stop('immediate');
+lose_block($_) for @shared;
+$node->start;
+is(sql(qq{SELECT test_bmap_rows_digest($copy2)}), $digest,
+	'after the share\'s blocks were lost, recovery gives the copy its rows');
+ok($node->log_contains(
+		'redo of a share of .* writes nothing: its own pages were logged as images',
+		$log_offset),
+	'redo of the share wrote nothing');
+
+# After a checkpoint, a commit's blocks were written and synced by it, so
+# a crash then needs no image: recovery begins past them.  (No write lost
+# here: one the checkpoint synced isn't lost to a crash.)
 sql(q{UPDATE app.t SET v = v + 1 WHERE id % 11 = 0;
 	SELECT dolt_commit('-am', 'c3'); CHECKPOINT});
 my $c3 = sql($contents);
@@ -155,25 +194,26 @@ $node->start;
 is(sql($contents), $c3, 'after a checkpoint and a crash, the commit\'s pages');
 
 # Logged at replica, recovered at minimal: redo goes by the record.
-sql(q{UPDATE app.t SET v = v + 2 WHERE id % 13 = 0;
-	SELECT dolt_commit('-am', 'c4')});
-my $c4 = sql($contents);
-@lost = blocks_of('t.id % 13 = 0');
-$node->stop('immediate');
-lose_block($_) for @lost;
-$node->append_conf('postgresql.conf',
+lose_kept(13, 'logged at replica, recovered at minimal',
 	"wal_level = minimal\nmax_wal_senders = 0\nmax_replication_slots = 0");
-$node->start;
-is(sql($contents), $c4,
-	'WAL written at replica rebuilds the lost pages at wal_level minimal');
 is( syncs_of(
 		q{UPDATE app.t SET v = v + 1 WHERE id % 10 = 0},
 		q{SELECT dolt_commit('-am', 'c5')}),
 	'1', 'at minimal, a commit keeping pages syncs the page store');
 my $c5 = sql($contents);
+
+# Logged at minimal (no images), recovered at replica: redo writes the
+# snapshot's own pages out, walking its leaves.
+$log_offset = -s $node->logfile;
 $node->stop('immediate');
+$node->append_conf('postgresql.conf', "wal_level = replica\nmax_wal_senders = 10");
 $node->start;
-is(sql($contents), $c5, 'and its pages survive a crash at minimal');
+is(sql($contents), $c5, 'WAL written at minimal recovers at replica');
+ok($node->log_contains('redo of a snapshot of .* writes out its own pages', $log_offset),
+	'redo of a snapshot logged at minimal writes out its own pages');
+like(sql(q{UPDATE app.t SET v = 0; SELECT dolt_reset('--hard');
+	SELECT count(*), sum(v), sum(length(pad)) FROM app.t}),
+	qr/^\Q$c5\E$/m, 'and a hard reset gives back its kept pages');
 
 $node->stop;
 done_testing();

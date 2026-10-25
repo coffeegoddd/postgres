@@ -59,6 +59,11 @@ my @lost = split /\n/, sql(q{
 	WHERE t.id % 8 = 0 AND m.blkno = (t.ctid::text::point)[0]});
 sql(q{UPDATE app.t SET v = v + 100 WHERE id % 3 = 0;
 	SELECT dolt_branch('side'); SELECT dolt_checkout('side')});
+# and a share of block-mapped storage holding blocks of its own
+sql(q{SET debug_block_mapped_heap = on;
+	CREATE TABLE plain (a int, b text);
+	INSERT INTO plain SELECT g, repeat('p', 200) FROM generate_series(1, 2000) g;
+	SELECT test_bmap_share(pg_relation_filenode('plain'))});
 my $now = sql($contents);
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $contents), $now, 'the standby replayed them');
@@ -68,6 +73,10 @@ ok( $standby->log_contains(
 	'redo of a kept snapshot writes nothing');
 ok( !$standby->log_contains('redo of a snapshot of .* writes out', $log_offset),
 	'and never writes out its pages');
+ok( $standby->log_contains(
+		'redo of a share of .* writes nothing: its own pages were logged as images',
+		$log_offset),
+	'nor does redo of a share');
 
 # The standby's machine loses the last commit's kept blocks (their
 # restartpoint was before the commit), then the standby crashes.
@@ -110,6 +119,28 @@ $standby->safe_psql('postgres', qq{SELECT dolt_reset('--hard', '$hash')});
 is($standby->safe_psql('postgres', $contents), $at[1],
 	"a reset to round 2 has its commit's rows");
 $standby->stop;
+
+# A base backup taken while commits keep pages, none syncing a page store:
+# restored, its last commit's kept pages hold that commit's rows.
+sql(q{SELECT dolt_checkout('main'); SELECT dolt_reset('--hard');
+	CREATE TABLE app.b (id int PRIMARY KEY, v int);
+	INSERT INTO app.b SELECT g, 0 FROM generate_series(1, 1000) g;
+	SELECT dolt_commit('-Am', 'b0')});
+my $bg = $primary->background_psql('postgres');
+$bg->query_until(qr/started/, "\\echo started\n" . join('', map {
+	"UPDATE app.b SET v = $_ WHERE id % 10 = 0; SELECT dolt_commit('-am', 'b$_');\n" } 1 .. 300));
+$primary->backup('during');
+$bg->quit;
+my $during = PostgreSQL::Test::Cluster->new('wal_durable_during');
+$during->init_from_backup($primary, 'during');
+$during->start;
+my $last = $during->safe_psql('postgres',
+	q{SELECT max(substr(message, 2)::int) FROM dolt_log WHERE message ~ '^b[0-9]+$'});
+ok($last >= 0, "the backup has commits to b$last");
+$during->safe_psql('postgres', q{UPDATE app.b SET v = -1; SELECT dolt_reset('--hard')});
+is($during->safe_psql('postgres', q{SELECT sum(v) FROM app.b}), 100 * $last,
+	'a backup taken during commits gives back its last commit\'s pages');
+$during->stop;
 
 # A base backup right after a commit that synced no page store.
 sql(q{SELECT dolt_checkout('main'); SELECT dolt_reset('--hard');

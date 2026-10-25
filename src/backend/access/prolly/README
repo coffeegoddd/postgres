@@ -890,7 +890,9 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers, and so does redo of one, walking the
+finds), never visiting the buffers.  Redo of one writes nothing when the
+record says those pages were logged as images (a WAL level for backups,
+below); at wal_level minimal it writes the same pages, walking the
 snapshot's own leaves as the record names them.
 
 Durability through WAL.  The blocks a share or snapshot comes to share
@@ -907,7 +909,9 @@ checkpoint finds the block written and synced by it (a page dirty as a
 checkpoint begins is written by it, and every write registered before
 its sync phase is synced).  WAL holding an image is let go of only past
 such a checkpoint, a commit relying on the share flushes WAL past its
-images, and a base backup either replays the image or copies the block
+images (with synchronous_commit off, a crash may lose the commit, but WAL
+is replayed as a prefix: no commit survives without the images before
+it), and a base backup either replays the image or copies the block
 after its start checkpoint wrote and synced it.  Redo of such a record
 writes and syncs nothing (the images' redo wrote each block, and a
 restartpoint syncs it), so a standby, or a promoted one, follows the same
