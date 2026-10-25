@@ -17,6 +17,7 @@
 #include <limits.h>
 
 #include "access/htup_details.h"
+#include "access/prolly_jsonb.h"
 #include "access/tupdesc.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -42,6 +43,7 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 #include "utils/typcache.h"
+#include "varatt.h"
 
 /* Operations available for setPath */
 #define JB_PATH_CREATE					0x0001
@@ -860,13 +862,82 @@ json_object_field(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 }
 
+/*
+ * The value at a path of a versioned table's document stored as a JSON
+ * tree, read from the tree without the rest of the document
+ * (prolly_jsonb.h): false if jb, as stored, isn't one.  *result is the
+ * value as jsonb, or as ->> gives it (as_text), and *isnull whether there
+ * is none.  kind is what the document must be for path to name anything.
+ */
+static bool
+jsonb_tree_get(Datum jb, ProllyJsonbKind kind, char **path, int npath,
+			   bool as_text, Datum *result, bool *isnull)
+{
+	Jsonb	   *found;
+
+	if (!prolly_jsonb_tree_get(jb, kind, path, npath, &found))
+		return false;
+	*isnull = true;
+	if (found == NULL)
+		return true;
+	if (!as_text)
+		*result = JsonbPGetDatum(found);
+	else if (JB_ROOT_IS_SCALAR(found))
+	{
+		JsonbValue	v;
+		text	   *t;
+
+		(void) JsonbExtractScalar(&found->root, &v);
+		t = JsonbValueAsText(&v);	/* (NULL for JSON null) */
+		if (t == NULL)
+			return true;
+		*result = PointerGetDatum(t);
+	}
+	else
+		*result = PointerGetDatum(cstring_to_text(JsonbToCString(NULL,
+																 &found->root,
+																 VARSIZE(found))));
+	*isnull = false;
+	return true;
+}
+
+/*
+ * jb -> key or jb -> index (and ->>) on a JSON tree, by jsonb_tree_get():
+ * a key names nothing in an array, nor an index in an object.
+ */
+static bool
+jsonb_tree_step(FunctionCallInfo fcinfo, bool index, bool as_text,
+				Datum *result, bool *isnull)
+{
+	char	   *step;
+
+	/* (an ordinary value is told apart before its step is made) */
+	if (!VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))))
+		return false;
+	step = index ? psprintf("%d", PG_GETARG_INT32(1)) :
+		text_to_cstring(PG_GETARG_TEXT_PP(1));
+	return jsonb_tree_get(PG_GETARG_DATUM(0),
+						  index ? PROLLY_JSONB_ARRAY : PROLLY_JSONB_OBJECT,
+						  &step, 1, as_text, result, isnull);
+}
+
 Datum
 jsonb_object_field(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	text	   *key = PG_GETARG_TEXT_PP(1);
 	JsonbValue *v;
 	JsonbValue	vbuf;
+	Datum		tree_result;
+	bool		tree_isnull;
+
+	if (jsonb_tree_step(fcinfo, false, false, &tree_result, &tree_isnull))
+	{
+		if (tree_isnull)
+			PG_RETURN_NULL();
+		PG_RETURN_DATUM(tree_result);
+	}
+	jb = PG_GETARG_JSONB_P(0);
 
 	if (!JB_ROOT_IS_OBJECT(jb))
 		PG_RETURN_NULL();
@@ -901,10 +972,20 @@ json_object_field_text(PG_FUNCTION_ARGS)
 Datum
 jsonb_object_field_text(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	text	   *key = PG_GETARG_TEXT_PP(1);
 	JsonbValue *v;
 	JsonbValue	vbuf;
+	Datum		tree_result;
+	bool		tree_isnull;
+
+	if (jsonb_tree_step(fcinfo, false, true, &tree_result, &tree_isnull))
+	{
+		if (tree_isnull)
+			PG_RETURN_NULL();
+		PG_RETURN_DATUM(tree_result);
+	}
+	jb = PG_GETARG_JSONB_P(0);
 
 	if (!JB_ROOT_IS_OBJECT(jb))
 		PG_RETURN_NULL();
@@ -938,9 +1019,19 @@ json_array_element(PG_FUNCTION_ARGS)
 Datum
 jsonb_array_element(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	int			element = PG_GETARG_INT32(1);
 	JsonbValue *v;
+	Datum		tree_result;
+	bool		tree_isnull;
+
+	if (jsonb_tree_step(fcinfo, true, false, &tree_result, &tree_isnull))
+	{
+		if (tree_isnull)
+			PG_RETURN_NULL();
+		PG_RETURN_DATUM(tree_result);
+	}
+	jb = PG_GETARG_JSONB_P(0);
 
 	if (!JB_ROOT_IS_ARRAY(jb))
 		PG_RETURN_NULL();
@@ -981,9 +1072,19 @@ json_array_element_text(PG_FUNCTION_ARGS)
 Datum
 jsonb_array_element_text(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	int			element = PG_GETARG_INT32(1);
 	JsonbValue *v;
+	Datum		tree_result;
+	bool		tree_isnull;
+
+	if (jsonb_tree_step(fcinfo, true, true, &tree_result, &tree_isnull))
+	{
+		if (tree_isnull)
+			PG_RETURN_NULL();
+		PG_RETURN_DATUM(tree_result);
+	}
+	jb = PG_GETARG_JSONB_P(0);
 
 	if (!JB_ROOT_IS_ARRAY(jb))
 		PG_RETURN_NULL();
@@ -1501,7 +1602,7 @@ jsonb_extract_path_text(PG_FUNCTION_ARGS)
 static Datum
 get_jsonb_path_all(FunctionCallInfo fcinfo, bool as_text)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1);
 	Datum	   *pathtext;
 	bool	   *pathnulls;
@@ -1521,6 +1622,24 @@ get_jsonb_path_all(FunctionCallInfo fcinfo, bool as_text)
 
 	deconstruct_array_builtin(path, TEXTOID, &pathtext, &pathnulls, &npath);
 
+	/* a versioned table's document stored as a JSON tree: the path alone */
+	if (npath > 0 &&
+		VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))))
+	{
+		char	  **steps = palloc(sizeof(char *) * npath);
+
+		for (int i = 0; i < npath; i++)
+			steps[i] = TextDatumGetCString(pathtext[i]);
+		if (jsonb_tree_get(PG_GETARG_DATUM(0), PROLLY_JSONB_ANY, steps, npath,
+						   as_text, &res, &isnull))
+		{
+			if (isnull)
+				PG_RETURN_NULL();
+			PG_RETURN_DATUM(res);
+		}
+	}
+
+	jb = PG_GETARG_JSONB_P(0);
 	res = jsonb_get_element(jb, pathtext, npath, &isnull, as_text);
 
 	if (isnull)
@@ -4854,7 +4973,7 @@ jsonb_delete_idx(PG_FUNCTION_ARGS)
 Datum
 jsonb_set(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *in = PG_GETARG_JSONB_P(0);
+	Jsonb	   *in;
 	ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1);
 	Jsonb	   *newjsonb = PG_GETARG_JSONB_P(2);
 	JsonbValue	newval;
@@ -4864,7 +4983,18 @@ jsonb_set(PG_FUNCTION_ARGS)
 	int			path_len;
 	JsonbIterator *it;
 	JsonbInState st = {0};
+	Datum		tree_result;
 
+	/*
+	 * A versioned table's document stored as a JSON tree: the tree edited
+	 * along the path, giving a pointer to the new tree (prolly_jsonb.h).
+	 */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))) &&
+		prolly_jsonb_tree_set(PG_GETARG_DATUM(0), path, newjsonb, create,
+							  &tree_result))
+		PG_RETURN_DATUM(tree_result);
+
+	in = PG_GETARG_JSONB_P(0);
 	JsonbToJsonbValue(newjsonb, &newval);
 
 	if (ARR_NDIM(path) > 1)
@@ -4946,8 +5076,14 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(handle_val, "return_target") == 0)
 	{
-		Jsonb	   *in = PG_GETARG_JSONB_P(0);
+		Jsonb	   *in;
+		enum jbvType kind;
 
+		/* (a JSON tree as it is, unread: prolly_jsonb.h) */
+		if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))) &&
+			prolly_jsonb_tree_kind(PG_GETARG_DATUM(0), &kind))
+			PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+		in = PG_GETARG_JSONB_P(0);
 		PG_RETURN_JSONB_P(in);
 	}
 	else
@@ -4960,18 +5096,73 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 }
 
 /*
+ * path[0..npath) as a text array, for the edits below, which a JSON tree
+ * gives a document of what is along the path (prolly_jsonb.h).
+ */
+static ArrayType *
+text_path(char **path, int npath)
+{
+	Datum	   *elems = palloc(sizeof(Datum) * Max(npath, 1));
+
+	for (int i = 0; i < npath; i++)
+		elems[i] = CStringGetTextDatum(path[i]);
+	return construct_array_builtin(elems, npath, TEXTOID);
+}
+
+static Jsonb *
+delete_path_edit(Jsonb *doc, char **path, int npath, void *arg)
+{
+	return DatumGetJsonbP(DirectFunctionCall2(jsonb_delete_path,
+											  JsonbPGetDatum(doc),
+											  PointerGetDatum(text_path(path, npath))));
+}
+
+typedef struct InsertEdit
+{
+	Jsonb	   *value;
+	bool		after;
+} InsertEdit;
+
+static Jsonb *
+insert_edit(Jsonb *doc, char **path, int npath, void *arg)
+{
+	InsertEdit *ie = arg;
+
+	return DatumGetJsonbP(DirectFunctionCall4(jsonb_insert,
+											  JsonbPGetDatum(doc),
+											  PointerGetDatum(text_path(path, npath)),
+											  JsonbPGetDatum(ie->value),
+											  BoolGetDatum(ie->after)));
+}
+
+/*
  * SQL function jsonb_delete_path(jsonb, text[])
  */
 Datum
 jsonb_delete_path(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *in = PG_GETARG_JSONB_P(0);
+	Jsonb	   *in;
 	ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1);
 	Datum	   *path_elems;
 	bool	   *path_nulls;
 	int			path_len;
 	JsonbIterator *it;
 	JsonbInState st = {0};
+	char	  **tree_path;
+	int			tree_npath;
+	Datum		tree_result;
+
+	/*
+	 * A versioned table's document stored as a JSON tree: the tree edited
+	 * at the path (prolly_jsonb.h).
+	 */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))) &&
+		prolly_jsonb_path_elements(path, &tree_path, &tree_npath) &&
+		prolly_jsonb_tree_edit(PG_GETARG_DATUM(0), tree_path, tree_npath,
+							   delete_path_edit, NULL, &tree_result))
+		PG_RETURN_DATUM(tree_result);
+
+	in = PG_GETARG_JSONB_P(0);
 
 	if (ARR_NDIM(path) > 1)
 		ereport(ERROR,
@@ -5005,7 +5196,7 @@ jsonb_delete_path(PG_FUNCTION_ARGS)
 Datum
 jsonb_insert(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *in = PG_GETARG_JSONB_P(0);
+	Jsonb	   *in;
 	ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1);
 	Jsonb	   *newjsonb = PG_GETARG_JSONB_P(2);
 	JsonbValue	newval;
@@ -5015,7 +5206,22 @@ jsonb_insert(PG_FUNCTION_ARGS)
 	int			path_len;
 	JsonbIterator *it;
 	JsonbInState st = {0};
+	char	  **tree_path;
+	int			tree_npath;
+	Datum		tree_result;
+	InsertEdit	ie = {newjsonb, after};
 
+	/*
+	 * A versioned table's document stored as a JSON tree: the tree edited
+	 * at the path (prolly_jsonb.h).
+	 */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))) &&
+		prolly_jsonb_path_elements(path, &tree_path, &tree_npath) &&
+		prolly_jsonb_tree_edit(PG_GETARG_DATUM(0), tree_path, tree_npath,
+							   insert_edit, &ie, &tree_result))
+		PG_RETURN_DATUM(tree_result);
+
+	in = PG_GETARG_JSONB_P(0);
 	JsonbToJsonbValue(newjsonb, &newval);
 
 	if (ARR_NDIM(path) > 1)

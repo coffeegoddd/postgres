@@ -540,17 +540,18 @@ ResolveRecoveryConflictWithSnapshotFullXid(FullTransactionId snapshotConflictHor
 
 /*
  * Cancel the queries of waitlist (an InvalidVirtualTransactionId at its
- * end), those running when files they may read stopped being named, before
- * the files are removed: after max_standby_streaming_delay, as a snapshot
- * conflict.  For storage whose files are replaced whole (prolly's chunk
- * store).
+ * end), those that may read files, or hold pointers to chunks, of a chunk
+ * store that a replayed collection stops naming, before it does: after
+ * max_standby_streaming_delay.  For storage whose files are replaced whole
+ * (prolly's chunk store).  hot_standby_feedback doesn't prevent these: the
+ * primary's collection waits for no standby.
  */
 void
 ResolveRecoveryConflictWithFileReaders(VirtualTransactionId *waitlist)
 {
 	ResolveRecoveryConflictWithVirtualXIDs(waitlist,
-										   RECOVERY_CONFLICT_SNAPSHOT,
-										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
+										   RECOVERY_CONFLICT_CHUNK_STORE,
+										   WAIT_EVENT_RECOVERY_CONFLICT_CHUNK_STORE,
 										   true);
 }
 
@@ -1533,6 +1534,9 @@ get_recovery_conflict_desc(RecoveryConflictReason reason)
 			break;
 		case RECOVERY_CONFLICT_LOGICALSLOT:
 			reasonDesc = _("recovery conflict on replication slot");
+			break;
+		case RECOVERY_CONFLICT_CHUNK_STORE:
+			reasonDesc = _("recovery conflict on chunk store");
 			break;
 		case RECOVERY_CONFLICT_STARTUP_DEADLOCK:
 			reasonDesc = _("recovery conflict on deadlock");

@@ -13,17 +13,36 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_jsonb.h"
 #include "catalog/pg_type.h"
+#include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/jsonb.h"
+#include "varatt.h"
 
 Datum
 jsonb_exists(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	text	   *key = PG_GETARG_TEXT_PP(1);
 	JsonbValue	kval;
 	JsonbValue *v = NULL;
+
+	/*
+	 * A versioned table's document stored as a JSON tree: an object's key
+	 * looked up in the tree, an array's string elements read from it
+	 * (prolly_jsonb.h).
+	 */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))))
+	{
+		char	   *k = text_to_cstring(key);
+		bool		found;
+
+		if (prolly_jsonb_tree_exists(PG_GETARG_DATUM(0), &k, 1, false, &found))
+			PG_RETURN_BOOL(found);
+	}
+
+	jb = PG_GETARG_JSONB_P(0);
 
 	/*
 	 * We only match Object keys (which are naturally always Strings), or
@@ -42,15 +61,44 @@ jsonb_exists(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(v != NULL);
 }
 
+/*
+ * keys ?| (all: ?&) of a versioned table's document stored as a JSON tree,
+ * found in the tree (prolly_jsonb.h): false if doc, as stored, isn't one.
+ * NULL keys are passed over, as below.
+ */
+static bool
+jsonb_tree_exists(Datum doc, ArrayType *keys, bool all, bool *result)
+{
+	Datum	   *key_datums;
+	bool	   *key_nulls;
+	int			elem_count;
+	char	  **k;
+	int			n = 0;
+
+	if (!VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(doc)))
+		return false;
+	deconstruct_array_builtin(keys, TEXTOID, &key_datums, &key_nulls, &elem_count);
+	k = palloc(sizeof(char *) * Max(elem_count, 1));
+	for (int i = 0; i < elem_count; i++)
+		if (!key_nulls[i])
+			k[n++] = TextDatumGetCString(key_datums[i]);
+	return prolly_jsonb_tree_exists(doc, k, n, all, result);
+}
+
 Datum
 jsonb_exists_any(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	ArrayType  *keys = PG_GETARG_ARRAYTYPE_P(1);
 	int			i;
 	Datum	   *key_datums;
 	bool	   *key_nulls;
 	int			elem_count;
+	bool		found;
+
+	if (jsonb_tree_exists(PG_GETARG_DATUM(0), keys, false, &found))
+		PG_RETURN_BOOL(found);
+	jb = PG_GETARG_JSONB_P(0);
 
 	deconstruct_array_builtin(keys, TEXTOID, &key_datums, &key_nulls, &elem_count);
 
@@ -78,12 +126,17 @@ jsonb_exists_any(PG_FUNCTION_ARGS)
 Datum
 jsonb_exists_all(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	ArrayType  *keys = PG_GETARG_ARRAYTYPE_P(1);
 	int			i;
 	Datum	   *key_datums;
 	bool	   *key_nulls;
 	int			elem_count;
+	bool		found;
+
+	if (jsonb_tree_exists(PG_GETARG_DATUM(0), keys, true, &found))
+		PG_RETURN_BOOL(found);
+	jb = PG_GETARG_JSONB_P(0);
 
 	deconstruct_array_builtin(keys, TEXTOID, &key_datums, &key_nulls, &elem_count);
 

@@ -4,8 +4,9 @@
  *	  The prolly shared-memory subsystem and checkpoint hook.
  *
  * At postmaster startup this reserves a shared area for every registered
- * chunk store, value memo and refs implementation whose shmem_size() is
- * non-zero, named after the implementation, and calls its shmem_init() with the area once.
+ * chunk store, value memo, refs, materialization cache, node cache and
+ * commit cache implementation whose shmem_size() is non-zero, named after
+ * the implementation, and calls its shmem_init() with the area once.
  * Every process finds the area again with prolly_shmem_area().
  *
  * IDENTIFICATION
@@ -16,8 +17,10 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_commitcache.h"
 #include "access/prolly_matcache.h"
 #include "access/prolly_memo.h"
+#include "access/prolly_nodecache.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_shmem.h"
@@ -30,6 +33,8 @@ static const ProllyInterface shmem_interfaces[] = {
 	PROLLY_IFACE_VALUE_MEMO,
 	PROLLY_IFACE_REFS,
 	PROLLY_IFACE_MATERIALIZATION_CACHE,
+	PROLLY_IFACE_NODE_CACHE,
+	PROLLY_IFACE_COMMIT_CACHE,
 };
 
 #define MAX_AREAS 64
@@ -74,6 +79,18 @@ impl_shmem_size(const ProllyImplInfo *impl)
 
 				return r->shmem_size ? r->shmem_size() : 0;
 			}
+		case PROLLY_IFACE_NODE_CACHE:
+			{
+				const ProllyNodeCacheRoutine *r = (const ProllyNodeCacheRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
+		case PROLLY_IFACE_COMMIT_CACHE:
+			{
+				const ProllyCommitCacheRoutine *r = (const ProllyCommitCacheRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
 		default:
 			return 0;
 	}
@@ -95,6 +112,12 @@ impl_shmem_init(const ProllyImplInfo *impl, void *area)
 			break;
 		case PROLLY_IFACE_MATERIALIZATION_CACHE:
 			PROLLY_CALL(((const ProllyMatCacheRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_NODE_CACHE:
+			PROLLY_CALL(((const ProllyNodeCacheRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_COMMIT_CACHE:
+			PROLLY_CALL(((const ProllyCommitCacheRoutine *) impl), shmem_init, area);
 			break;
 		default:
 			elog(ERROR, "prolly %s implementations have no shared memory",

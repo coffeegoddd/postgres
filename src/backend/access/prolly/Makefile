@@ -27,6 +27,8 @@ OBJS = \
 	chunker_stub.o \
 	chunkstore_journal.o \
 	chunkstore_local.o \
+	commitcache_shared.o \
+	commitcache_stub.o \
 	diffmerge_folded.o \
 	hash_blake3.o \
 	journal_index.o \
@@ -45,6 +47,8 @@ OBJS = \
 	merge_stub.o \
 	moveplan_costs.o \
 	moveplan_stub.o \
+	nodecache_shared.o \
+	nodecache_stub.o \
 	prolly_chunkstore.o \
 	prolly_config.o \
 	prolly_hashtext.o \

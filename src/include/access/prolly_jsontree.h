@@ -29,19 +29,38 @@
  *   longer than the tree's longest key.
  * - read() gives the document back, in the database's encoding, every
  *   item read; get() the value at a path (path[i] an object's key or an
- *   array's index, as #> takes them), reading only the items under it and
- *   the nodes above them: NULL if there is none.  A path neither handles
- *   (an array index that isn't a non-negative integer) makes get() return
- *   false, for the caller to read the document whole.  get(), set() and
- *   diff() work in UTF-8: callers in another encoding read whole.
+ *   array's index, as #> takes them, a negative index counting from the
+ *   end), reading only the items under it and the nodes above them: NULL
+ *   if there is none.  A path get() doesn't handle makes it return false,
+ *   for the caller to read the document whole ("paths" handles every
+ *   path).  kind() is whether the document is an object (jbvObject) or an
+ *   array (jbvArray), reading the nodes to its first item.  get(), set()
+ *   and diff() work in UTF-8: callers in another encoding read whole.
  * - set() gives the tree of jsonb_set(doc, path, value, create) in
  *   *new_root, by applying edits for the items under path and the
  *   containers above it alone, and *delta an estimate of the change in
  *   the document's jsonb size.  When the result is too short to be a tree,
  *   it is *whole instead (else NULL): no estimate decides what is a tree.
  *   It returns false for what it doesn't handle (an array index that isn't
- *   one of the array's, a key too long for the tree): the caller sets the
- *   document whole.
+ *   one of the array's, counting from either end, a key too long for the
+ *   tree): the caller sets the document whole.
+ * - exists() is whether the document has, at its top level, one (any) or
+ *   all of keys[0..nkeys): an object's keys, or an array's string
+ *   elements, as jsonb's ?| and ?& find them.  An object's keys are looked
+ *   up; an array's elements are read in order, until the answer is known,
+ *   what a container element holds skipped unread.
+ * - edit() gives the tree of edit(doc, path, npath, arg), for an edit that
+ *   changes the document at path alone (jsonb_insert(), #-, a subscript's
+ *   assignment): it follows path through the containers that aren't
+ *   packed, then calls edit on a document of only what is along path (each
+ *   container above holding just the step to it, an array's index made 0,
+ *   and the item at path, if any), with path's array indexes so made, and
+ *   puts back what the edit made of that item.  So the edit's own errors
+ *   are raised as on the document.  It returns false for an edit it can't
+ *   put back as an item's (one that moves an array's other elements: an
+ *   insertion or deletion other than at an array's end, or a path to an
+ *   index outside an array, or not an integer): the caller edits the
+ *   document whole.  *new_root, *delta and *whole are as set() gives them.
  * - diff() reports each scalar path whose value differs between two
  *   trees, in order (an empty container counting as a scalar), skipping
  *   the subtrees both share unread, so d changed items cost
@@ -51,7 +70,11 @@
  *   read() checks what it reads is a document's tree (paths well formed,
  *   an array's indexes from 0 without gaps, nothing under an item, each
  *   container packed exactly when it is short enough) and the document
- *   what jsonb builds, as canonical jsonb bytes are checked.
+ *   what jsonb builds, as canonical jsonb bytes are checked.  get(),
+ *   kind() and set() check the items and nodes they read, and only those:
+ *   an index is found by its key, and an array's size taken from its last
+ *   element's key, so a gap in an array's indexes elsewhere is not seen
+ *   (the array as read by read() is refused).
  *
  * Provisional (v0).
  *
@@ -84,6 +107,14 @@ typedef void (*ProllyJsonChangeVisit) (ProllyDiffKind kind, char **path,
 									   int npath, Jsonb *before, Jsonb *after,
 									   void *arg);
 
+/*
+ * An edit of a document (in memory, in the database's encoding) at a path
+ * (npath elements, as text): the document edited, as a jsonb function
+ * gives it.
+ */
+typedef Jsonb *(*ProllyJsonEdit) (Jsonb *doc, char **path, int npath,
+								  void *arg);
+
 typedef struct ProllyJsonTreeRoutine
 {
 	ProllyImplInfo info;
@@ -93,9 +124,16 @@ typedef struct ProllyJsonTreeRoutine
 	Jsonb	   *(*read) (const ProllyTreeEnv *env, const ProllyNodeRef *root);
 	bool		(*get) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						char **path, int npath, Jsonb **result);
+	enum jbvType (*kind) (const ProllyTreeEnv *env, const ProllyNodeRef *root);
 	bool		(*set) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						char **path, int npath, Jsonb *value, bool create,
 						ProllyNodeRef *new_root, int64 *delta, Jsonb **whole);
+	bool		(*exists) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						   char **keys, int nkeys, bool all);
+	bool		(*edit) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						 char **path, int npath, ProllyJsonEdit edit,
+						 void *arg, ProllyNodeRef *new_root, int64 *delta,
+						 Jsonb **whole);
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyJsonChangeVisit visit,
 						 void *arg);
@@ -104,7 +142,8 @@ typedef struct ProllyJsonTreeRoutine
 } ProllyJsonTreeRoutine;
 
 #define PROLLY_JSONTREE_CALLBACK_NAMES \
-	"build", "read", "get", "set", "diff", "diff_documents"
+	"build", "read", "get", "kind", "set", "exists", "edit", "diff", \
+	"diff_documents"
 #define PROLLY_JSONTREE_FIRST_CALLBACK build
 #define PROLLY_JSONTREE_LAST_CALLBACK diff_documents
 

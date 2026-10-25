@@ -17,13 +17,17 @@
  *									jsonb_set(doc, path, value, create)
  *	prolly_jsonb_diff(a, b)			each scalar path whose value differs
  *
- * prolly_jsonb_set() on a JSON tree returns a hash pointer to the new
- * tree, which a versioned table's row takes as it is: an UPDATE writes the
- * nodes along the path, not the document.  (The pointer's sizes are an
- * estimate; whether a document is a tree never depends on them.)  A
- * version of a row read from history names its tree too, so diffing two
- * versions by prolly_jsonb_diff() reads only what differs.  In a database
- * whose encoding isn't UTF-8 they all read documents whole.
+ * jsonb's own operators and functions take a tree's path the same way,
+ * through prolly_jsonb_tree_get(), _exists(), _set() and _edit()
+ * (prolly_jsonb.h), so prolly_jsonb_set() is jsonb_set() itself.
+ *
+ * An edit on a JSON tree returns a hash pointer to the new tree, which a
+ * versioned table's row takes as it is: an UPDATE writes the nodes along
+ * the path, not the document.  (The pointer's sizes are an estimate;
+ * whether a document is a tree never depends on them.)  A version of a
+ * row read from history names its tree too, so diffing two versions by
+ * prolly_jsonb_diff() reads only what differs.  In a database whose
+ * encoding isn't UTF-8 they all read documents whole.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_jsonb.c
@@ -32,8 +36,11 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_jsonb.h"
 #include "access/prolly_jsontree.h"
 #include "access/prolly_toast.h"
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -75,45 +82,181 @@ path_elements(ArrayType *path, char ***elems, int *n)
 }
 
 /*
- * The value argument argno as stored: a JSON tree's root, if it is one.
- * A tree's paths and strings are in UTF-8, so in another encoding the
- * document is read whole.
+ * A jsonb value as stored: a JSON tree's root, if it is one.  A tree's
+ * paths and strings are in UTF-8, so in another encoding the document is
+ * read whole.
  */
+static bool
+datum_tree(Datum value, ProllyNodeRef *root, Size *rawsize)
+{
+	varlena    *v = (varlena *) DatumGetPointer(value);
+
+	/* (an ordinary value, in memory or toasted, is told apart unread) */
+	if (!VARATT_IS_EXTERNAL_ONDISK_HASH(v))
+		return false;
+	return GetDatabaseEncoding() == PG_UTF8 &&
+		prolly_toast_json_tree(v, root, rawsize);
+}
+
 static bool
 arg_tree(FunctionCallInfo fcinfo, int argno, ProllyNodeRef *root,
 		 Size *rawsize)
 {
-	varlena    *v = (varlena *) DatumGetPointer(PG_GETARG_DATUM(argno));
+	return datum_tree(PG_GETARG_DATUM(argno), root, rawsize);
+}
 
-	return GetDatabaseEncoding() == PG_UTF8 &&
-		prolly_toast_json_tree(v, root, rawsize);
+bool
+prolly_jsonb_tree_kind(Datum doc, enum jbvType *kind)
+{
+	ProllyNodeRef root;
+	Size		rawsize;
+
+	if (!datum_tree(doc, &root, &rawsize))
+		return false;
+	*kind = PROLLY_CALL(json_tree(), kind, prolly_toast_env(), &root);
+	return true;
+}
+
+bool
+prolly_jsonb_tree_get(Datum doc, ProllyJsonbKind kind, char **path,
+					  int npath, Jsonb **found)
+{
+	ProllyNodeRef root;
+	Size		rawsize;
+
+	if (!datum_tree(doc, &root, &rawsize))
+		return false;
+	if (kind != PROLLY_JSONB_ANY)
+	{
+		enum jbvType is = PROLLY_CALL(json_tree(), kind, prolly_toast_env(),
+									  &root);
+
+		if (is != (kind == PROLLY_JSONB_OBJECT ? jbvObject : jbvArray))
+		{
+			*found = NULL;
+			return true;
+		}
+	}
+	return PROLLY_CALL(json_tree(), get, prolly_toast_env(), &root, path,
+					   npath, found);
+}
+
+/*
+ * An edit puts the new tree's nodes in the chunk store as the top
+ * transaction's, so it is taken only where they outlive the result: not in
+ * a parallel operation (a worker's chunks are its own, lost when it exits,
+ * and it can take no transaction ID), nor in a subtransaction (an aborted
+ * one's chunks go with it, while the result may live on in a variable),
+ * nor where nothing may be written (a read-only transaction, recovery).
+ */
+static bool
+edit_allowed(void)
+{
+	return !IsInParallelMode() && GetCurrentTransactionNestLevel() <= 1 &&
+		!XactReadOnly && !RecoveryInProgress();
+}
+
+/* An edit's result as the caller returns it. */
+static Datum
+edited(Datum doc, const ProllyNodeRef *root, Size rawsize,
+	   const ProllyNodeRef *new_root, int64 delta, Jsonb *whole)
+{
+	/* a document too short to be a tree is itself */
+	if (whole != NULL)
+		return JsonbPGetDatum(whole);
+	if (new_root->hash.len == root->hash.len &&
+		memcmp(new_root->hash.bytes, root->hash.bytes, root->hash.len) == 0)
+		return doc;
+	return PointerGetDatum(prolly_toast_json_pointer(new_root,
+													 (Size) Max((int64) rawsize + delta,
+																VARHDRSZ + 1)));
+}
+
+bool
+prolly_jsonb_tree_exists(Datum doc, char **keys, int nkeys, bool all,
+						 bool *result)
+{
+	ProllyNodeRef root;
+	Size		rawsize;
+
+	if (!datum_tree(doc, &root, &rawsize))
+		return false;
+	*result = PROLLY_CALL(json_tree(), exists, prolly_toast_env(), &root,
+						  keys, nkeys, all);
+	return true;
+}
+
+bool
+prolly_jsonb_tree_edit(Datum doc, char **path, int npath, ProllyJsonEdit edit,
+					   void *arg, Datum *result)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+	Size		rawsize;
+	int64		delta;
+	Jsonb	   *whole;
+
+	if (!edit_allowed() || !datum_tree(doc, &root, &rawsize))
+		return false;
+	if (!PROLLY_CALL(json_tree(), edit, prolly_toast_env(), &root, path,
+					 npath, edit, arg, &new_root, &delta, &whole))
+		return false;
+	*result = edited(doc, &root, rawsize, &new_root, delta, whole);
+	return true;
+}
+
+bool
+prolly_jsonb_path_elements(ArrayType *path, char ***elems, int *n)
+{
+	return ARR_NDIM(path) <= 1 && path_elements(path, elems, n);
+}
+
+bool
+prolly_jsonb_tree_set(Datum doc, ArrayType *patharr, Jsonb *value,
+					  bool create, Datum *result)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+	Size		rawsize;
+	char	  **path;
+	int			npath;
+	int64		delta;
+	Jsonb	   *whole;
+
+	/*
+	 * (edit_allowed(); a path of more than one dimension, or with a NULL
+	 * step, is an error)
+	 */
+	if (!edit_allowed() || ARR_NDIM(patharr) > 1 ||
+		!datum_tree(doc, &root, &rawsize) ||
+		!path_elements(patharr, &path, &npath))
+		return false;
+	if (!PROLLY_CALL(json_tree(), set, prolly_toast_env(), &root, path,
+					 npath, value, create, &new_root, &delta, &whole))
+		return false;
+	*result = edited(doc, &root, rawsize, &new_root, delta, whole);
+	return true;
 }
 
 Datum
 prolly_jsonb_get(PG_FUNCTION_ARGS)
 {
 	ArrayType  *patharr = PG_GETARG_ARRAYTYPE_P(1);
-	ProllyNodeRef root;
-	Size		rawsize;
 	char	  **path;
 	int			npath;
 	Datum	   *datums;
 	bool	   *nulls;
 	bool		isnull;
 	Datum		result;
+	Jsonb	   *found;
 
-	if (arg_tree(fcinfo, 0, &root, &rawsize) &&
-		path_elements(patharr, &path, &npath))
+	if (path_elements(patharr, &path, &npath) &&
+		prolly_jsonb_tree_get(PG_GETARG_DATUM(0), PROLLY_JSONB_ANY, path,
+							  npath, &found))
 	{
-		Jsonb	   *found;
-
-		if (PROLLY_CALL(json_tree(), get, prolly_toast_env(), &root, path,
-						npath, &found))
-		{
-			if (found == NULL)
-				PG_RETURN_NULL();
-			PG_RETURN_JSONB_P(found);
-		}
+		if (found == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_JSONB_P(found);
 	}
 
 	/* as #> does it */
@@ -128,41 +271,11 @@ prolly_jsonb_get(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
+/* jsonb_set() takes the tree's path itself */
 Datum
 prolly_jsonb_set(PG_FUNCTION_ARGS)
 {
-	ProllyNodeRef root;
-	Size		rawsize;
-	char	  **path;
-	int			npath;
-
-	if (arg_tree(fcinfo, 0, &root, &rawsize) &&
-		path_elements(PG_GETARG_ARRAYTYPE_P(1), &path, &npath))
-	{
-		ProllyNodeRef new_root;
-		int64		delta;
-		Jsonb	   *whole;
-
-		if (PROLLY_CALL(json_tree(), set, prolly_toast_env(), &root, path,
-						npath, PG_GETARG_JSONB_P(2), PG_GETARG_BOOL(3),
-						&new_root, &delta, &whole))
-		{
-			/* a document too short to be a tree is itself */
-			if (whole != NULL)
-				PG_RETURN_JSONB_P(whole);
-			if (new_root.hash.len == root.hash.len &&
-				memcmp(new_root.hash.bytes, root.hash.bytes, root.hash.len) == 0)
-				PG_RETURN_DATUM(PG_GETARG_DATUM(0));
-			PG_RETURN_POINTER(prolly_toast_json_pointer(&new_root,
-														(Size) Max((int64) rawsize + delta,
-																   VARHDRSZ + 1)));
-		}
-	}
-	return DirectFunctionCall4(jsonb_set,
-							   PointerGetDatum(PG_GETARG_JSONB_P(0)),
-							   PG_GETARG_DATUM(1),
-							   PointerGetDatum(PG_GETARG_JSONB_P(2)),
-							   PG_GETARG_DATUM(3));
+	return jsonb_set(fcinfo);
 }
 
 typedef struct DiffOut

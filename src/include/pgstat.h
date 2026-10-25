@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD01
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD0B
 
 typedef struct PgStat_ArchiverStats
 {
@@ -438,6 +438,7 @@ typedef struct PgStat_StatDBEntry
 	PgStat_Counter conflict_snapshot;
 	PgStat_Counter conflict_logicalslot;
 	PgStat_Counter conflict_bufferpin;
+	PgStat_Counter conflict_chunk_store;
 	PgStat_Counter conflict_startup_deadlock;
 	PgStat_Counter temp_files;
 	PgStat_Counter temp_bytes;
@@ -691,8 +692,10 @@ typedef enum PgStat_ProllyCounter
 										 * many at once */
 	PGSTAT_PROLLY_APPLY_LOADS,	/* tables it filled from nothing, their
 								 * indexes built after the rows */
-	PGSTAT_PROLLY_CHUNK_CACHE_HITS,	/* chunks read from the backend's cache
-									 * instead of the store's files */
+	PGSTAT_PROLLY_NODE_CACHE_HITS,	/* chunks read from the shared node
+									 * cache instead of the store's files */
+	PGSTAT_PROLLY_NODE_CACHE_MISSES,	/* reads that looked there and found
+										 * nothing */
 	PGSTAT_PROLLY_FOLD_ROWS_LOCATED,	/* rows a fold read where the change
 										 * log said, not by their key */
 	PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED,	/* map pages a share of a
@@ -723,6 +726,9 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, /* page images of the blocks a
 										 * relation alone held, logged as a
 										 * share or snapshot shares them */
+	PGSTAT_PROLLY_BMAP_PRESERVE_WAITS,	/* walks preserving them given up on
+										 * a page another backend held, and
+										 * walked again once it was let go */
 	PGSTAT_PROLLY_MOVE_PLANS,	/* moves the move planner costed: the
 								 * sources a branch's first use weighed */
 	PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY,	/* first uses that copied the
@@ -786,9 +792,34 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, /* autovacuum's collections
 											 * skipped: another collection
 											 * of the store was running */
+	PGSTAT_PROLLY_REFS_NODES_READ,	/* of nodes_read, the refs' and commits'
+									 * trees' */
+	PGSTAT_PROLLY_REFS_NODES_WRITTEN,	/* of nodes_written, theirs */
+	PGSTAT_PROLLY_BMAP_REFCOUNT_READS,	/* reference-count pages read to
+										 * look up blocks' counts */
+	PGSTAT_PROLLY_STATUS_FROM_FOLD, /* comparisons into the working set (a
+									 * status's) from the last fold known,
+									 * only tables written since compared
+									 * again */
+	PGSTAT_PROLLY_COMMIT_CACHE_HITS,	/* commits' links found in the commit
+										 * cache, not read */
+	PGSTAT_PROLLY_COMMIT_CACHE_MISSES,	/* and those looked for there and
+										 * read */
+	PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED,	/* shares and snapshots whose
+											 * blocks a sync of their page
+											 * store was to make durable */
+	PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN,	/* of those, with no
+													 * block of their own:
+													 * every one held
+													 * elsewhere already */
+	PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, /* of those, that needed no
+											 * sync: the store durable
+											 * already */
+	PGSTAT_PROLLY_BMAP_STORE_SYNCS, /* page-store syncs run for shares and
+									 * snapshots */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_STORE_SYNCS + 1)
 
 typedef struct PgStat_ProllyStats
 {
@@ -952,9 +983,11 @@ pgstat_count_prolly(PgStat_ProllyCounter c, uint64 n)
 }
 
 extern struct ProllyNodeCounters *pgstat_prolly_tree_counters(void);
+extern struct ProllyNodeCounters *pgstat_prolly_refs_tree_counters(void);
 extern const char *pgstat_prolly_counter_name(PgStat_ProllyCounter c);
 extern void AtEOXact_PgStat_Prolly(void);
 extern PgStat_ProllyStats *pgstat_fetch_stat_prolly(Oid dboid);
+extern void pgstat_prolly_session_counts(PgStat_Counter *counts);
 
 /*
  * Functions in pgstat_database.c

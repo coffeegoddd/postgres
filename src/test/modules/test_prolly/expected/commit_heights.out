@@ -317,7 +317,7 @@ SELECT dolt_merge_base('mb_side', 'main') = dolt_hashof('main~1') AS either_way;
 SELECT counted('commits_read') AS commits_read;
  commits_read 
 --------------
-            7
+            6
 (1 row)
 
 SELECT (dolt_merge('mb_side', '--no-ff', '-m', 'mb merged'))[3:4];

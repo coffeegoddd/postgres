@@ -115,7 +115,14 @@
  *   visits the chunks told of since it began (false: too many to
  *   remember, and the collector must keep every chunk collected).  keep()
  *   fails (a serialization failure) if a swap dropped the chunk before it
- *   was told.
+ *   was told.  A hot standby's transaction, which has no xid, is noted as
+ *   holding pointers instead, and the replay of a swap of its store
+ *   resolves a recovery conflict with it (cancels it, after
+ *   max_standby_streaming_delay) before the replayed manifest stops naming
+ *   what it may hold; a keep() during that replay by a transaction not
+ *   noted before it waits for it and then fails if the chunk is gone (one
+ *   noted goes on: the replay waits for it).  One begun on a standby and running at its
+ *   promotion stays noted, and gc_new() waits for it, too.
  * - A collection never waits for a prepared transaction, which may stay
  *   for days: gc_new() keeps as roots the chunks one appended to the
  *   segments collected, and gc_retire() doesn't wait for one running at
@@ -414,6 +421,15 @@ typedef struct ProllyChunkStoreRoutine
 	 * the work only to find it held).
 	 */
 	bool		(*root_free) (ProllyChunkStore *store);
+
+	/*
+	 * Optional: the store's GC generation now.  A chunk found in the store
+	 * stays there until the generation changes (only a collection's swap
+	 * drops chunks, and each swap begins the next generation), so what is
+	 * known of the store's chunks can be kept by the generation it was
+	 * learned in.
+	 */
+	uint32		(*generation) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -428,9 +444,9 @@ typedef struct ProllyChunkStoreRoutine
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
-	"root_free"
+	"root_free", "generation"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK root_free
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK generation
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -483,8 +499,6 @@ extern void prolly_chunk_frame_plain(const char *frame, Size len,
 /* (a session's: frames this server sends it, by get_stored, are plain) */
 extern PGDLLIMPORT bool prolly_serve_uncompressed;
 
-/* prolly_chunk_cache_size: kB of decoded chunks a backend keeps */
-extern PGDLLIMPORT int prolly_chunk_cache_size;
 extern bool prolly_chunk_unframe(const char *frame, Size len, StringInfo out);
 extern bool prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len);
 
