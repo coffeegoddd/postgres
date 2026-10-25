@@ -159,9 +159,7 @@ SELECT length(dolt_commit('-Am', 'without it')::text) > 0 AS committed;
 -- (another routine, a column default, a materialized view) left as it
 -- is.  A materialized view grouping by the key goes and comes again.
 CREATE ROLE regress_kr_owner;
-ERROR:  role "regress_kr_owner" already exists
 CREATE ROLE regress_kr_user;
-ERROR:  role "regress_kr_user" already exists
 CREATE SCHEMA ko VERSIONED;
 GRANT USAGE ON SCHEMA ko TO regress_kr_owner;
 CREATE TABLE ko.t (id int PRIMARY KEY, a int);
