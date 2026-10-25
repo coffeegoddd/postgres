@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD04
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD05
 
 typedef struct PgStat_ArchiverStats
 {
@@ -789,6 +789,8 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_REFS_NODES_READ,	/* of nodes_read, the refs' and commits'
 									 * trees' */
 	PGSTAT_PROLLY_REFS_NODES_WRITTEN,	/* of nodes_written, theirs */
+	PGSTAT_PROLLY_BMAP_REFCOUNT_READS,	/* reference-count pages read to
+										 * look up blocks' counts */
 	PGSTAT_PROLLY_STATUS_FROM_FOLD, /* comparisons into the working set (a
 									 * status's) from the last fold known,
 									 * only tables written since compared
