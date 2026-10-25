@@ -3183,8 +3183,10 @@ dolt_integrate(PG_FUNCTION_ARGS)
 		check_integrated_rows(target, needs);
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
-	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
-												 message, 0, &id));
+	/* (the tables it makes take their classes from mine's head's record) */
+	WITH_PROVENANCE(&mine_head, mine_head.len > 0 ? 1 : 0,
+					BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
+																 message, 0, &id)));
 	if (conflicts > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3198,8 +3200,9 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	/* and the branch, fast-forwarded to target's new head */
 	checkout_branch(mine);
 	note_integration();
-	BRANCH_WRITES_HUSHED((void) PROLLY_CALL(diff_merge(), merge, target, NULL,
-											0, &ignored));
+	WITH_PROVENANCE(&id, id.len > 0 ? 1 : 0,
+					BRANCH_WRITES_HUSHED((void) PROLLY_CALL(diff_merge(), merge, target, NULL,
+															0, &ignored)));
 	settled();
 
 	branch_return_done(returning);
