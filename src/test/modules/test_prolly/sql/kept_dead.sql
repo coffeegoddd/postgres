@@ -1,7 +1,7 @@
--- A commit whose kept pages are gone is no longer kept: a restore of
--- another commit gives each table it restores new storage, and the
--- storage replaced, which every other commit's snapshot of the table was
--- in, goes with it, as it does after a TRUNCATE or a rewrite.  Such a
+-- A commit whose kept pages are gone is no longer kept: its table's
+-- storage replaced, with its snapshot there, by a rewrite or a TRUNCATE,
+-- or the table dropped.  (A restore of another commit gives the table new
+-- storage too, but carries the other commits' snapshots into it.)  Such a
 -- commit is dropped from the branch's kept commits by the same
 -- transaction, so it no longer counts toward prolly.kept_commits, keeps
 -- its commit and baseline from collection, or is offered to a move; one
@@ -46,25 +46,21 @@ INSERT INTO names SELECT (dolt_commit('-am', 'c'))[1], 'c';
 SELECT kept();
 
 -- a hard reset to b restores kd.t: c's and a's snapshots were in the
--- storage it replaced, so they are kept no more, nor kept from collection
+-- storage it replaced, and are carried into the new storage, still kept
 SELECT pg_stat_force_next_flush();
 SELECT restored() AS before \gset
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT pg_stat_force_next_flush();
 SELECT restored() > :before AS restored;
 SELECT kept();
-SET client_min_messages = error;
-SELECT kept > 0 AS kept FROM test_chunk_gc(true);
-RESET client_min_messages;
-SELECT test_chunk_has(named('c')) AS c_stored;
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
 
--- so the next commits keep b, the one restorable, with them
+-- so the next commits keep them, as many as are kept
 UPDATE kd.t SET v = 3 WHERE id <= 100;
 INSERT INTO names SELECT (dolt_commit('-am', 'd'))[1], 'd';
 SELECT kept();
 
--- and a reset back to b is still O(1): its pages given back
+-- and a reset back to b is O(1) again: its pages given back
 SELECT restored() AS before \gset
 SELECT dolt_reset('--hard', named('b'));
 SELECT pg_stat_force_next_flush();
@@ -141,5 +137,32 @@ SELECT count(*) FILTER (WHERE v = 1) AS at_n FROM kr.u;
 SELECT count(*) FILTER (WHERE v = 0) AS at_n FROM kr.t;
 RESET prolly.kept_commits;
 
+-- a commit only the kept record names, its tables dropped: dropped from
+-- the record, so collected
+\c :home
+CREATE DATABASE kept_dead_gc;
+ALTER DATABASE kept_dead_gc SET prolly.restore_min_changes = 0;
+\c kept_dead_gc
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA kg VERSIONED;
+CREATE TABLE kg.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO kg.t SELECT g, 0 FROM generate_series(1, 2000) g;
+SELECT dolt_commit('-Am', 'p') IS NOT NULL AS committed;
+UPDATE kg.t SET v = 1 WHERE id <= 100;
+SELECT (dolt_commit('-am', 'q'))[1] AS q \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT count(*) AS kept FROM test_kept_commits('main') k WHERE k.commit_id = :'q';
+DROP TABLE kg.t;
+CREATE TABLE kg.z (id int PRIMARY KEY);
+SELECT dolt_commit('-Am', 'r') IS NOT NULL AS committed;
+SELECT count(*) AS kept FROM test_kept_commits('main') k WHERE k.commit_id = :'q';
+SET client_min_messages = error;
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+RESET client_min_messages;
+SELECT test_chunk_has(:'q') AS q_stored;
+
 \c :home
 DROP DATABASE kept_dead;
+DROP DATABASE kept_dead_gc;
