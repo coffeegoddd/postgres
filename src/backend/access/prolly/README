@@ -713,9 +713,12 @@ through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
 finds), never visiting the buffers, and so does redo of one, walking the
-snapshot's own leaves as the record names them; only a map page newer
-than the replay (a crash's, or a base backup's) sends redo through every
-buffer of the relation instead.  Only while nothing else
+snapshot's own leaves as the record names them.  Redo visits every buffer
+of the relation instead when it can't trust a page the walk reads: with
+data checksums off (a torn page would go unseen), or at a map or count
+page newer than the replay (a crash's, or a base backup's), one that
+fails verification, one past its file, or one not the node its pointer
+names (a node freed since and its block taken as a relation's page).  Only while nothing else
 can be on the pages: the relations are locked against writers without
 waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is

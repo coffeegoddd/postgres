@@ -5305,26 +5305,60 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
 }
 
 /*
+ * In redo's walk of a snapshot (redo_own_blocks()), page 'blk' of 'rel' (the
+ * page store's file or its counts') into dst: as replay holds it in a
+ * buffer, if it does, else as it is on disk, if its checksum verifies it.
+ * Never through a buffer read for it: the block may hold what the replay
+ * hasn't reached, a relation's page (whose checksum is of its logical
+ * block) in a node freed since, or a page torn by the crash whose image
+ * comes later in the WAL.  False if it is past the file, or not verified.
+ */
+static bool
+redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
+{
+	SMgrRelation srel = smgropen(rel, INVALID_PROC_NUMBER);
+	PrefetchBufferResult r;
+	void	   *page = dst;
+
+	if (!smgrexists(srel, MAIN_FORKNUM) || blk >= mdnblocks(srel, MAIN_FORKNUM))
+		return false;
+	r = PrefetchSharedBuffer(srel, MAIN_FORKNUM, blk);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(rel, MAIN_FORKNUM, blk, r.recent_buffer))
+	{
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		memcpy(dst, BufferGetPage(r.recent_buffer), BLCKSZ);
+		UnlockReleaseBuffer(r.recent_buffer);
+		return true;
+	}
+	mdreadv(srel, MAIN_FORKNUM, blk, &page, 1);
+	return PageIsVerified(dst, blk, 0, NULL);
+}
+
+/*
  * In redo, the count of 'phys' into *count, as lookup_ref() reads it; false
- * if its page is newer than 'lsn' (see redo_own_blocks()).
+ * if its page can't be read as one replay has reached (redo_walk_read()),
+ * isn't a count page, or is newer than 'lsn' (see redo_own_blocks()).
  */
 static bool
 redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
 				uint8 *count)
 {
-	Buffer		buf;
-	bool		older;
+	PGIOAlignedBlock page;
 
 	*count = 0;
 	if (REF_PAGE(phys) >= refs_nblocks(rel))
 		return true;
-	buf = refs_read(rel, REF_PAGE(phys));
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
-	older = PageGetLSN(BufferGetPage(buf)) <= lsn;
-	*count = page_ref(BufferGetPage(buf), phys);
-	UnlockReleaseBuffer(buf);
-	return older;
+	if (!redo_walk_read(with_relnumber(rel, BMAP_REFS_RELNUMBER),
+						REF_PAGE(phys), page.data))
+		return false;
+	/* (a page extended and never written counts none) */
+	if (PageIsNew(page.data))
+		return true;
+	if (!map_page_is(&page, BMAP_PAGE_REFS) || PageGetLSN(page.data) > lsn)
+		return false;
+	*count = page_ref(page.data, phys);
+	return true;
 }
 
 static bool
@@ -5332,8 +5366,8 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			  BlockNumber first, BlockNumber nblocks, uint32 epoch,
 			  XLogRecPtr lsn, BlockList *own)
 {
+	PGIOAlignedBlock page;
 	BmapEntry  *entries;
-	Buffer		buf;
 	uint8		count;
 	bool		ok = true;
 
@@ -5346,21 +5380,14 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 		if (count > 0)
 			return true;
 	}
-	/* (a pointer of a page newer than the replay may be past the store) */
-	if (ptr->block >= smgrnblocks(store_smgr(rel), MAIN_FORKNUM))
+	if (!redo_walk_read(with_relnumber(rel, BMAP_STORE_RELNUMBER), ptr->block,
+						page.data) ||
+		PageGetLSN(page.data) > lsn ||
+		!tree_node_is(page.data, level, first, ptr->since))
 		return false;
-	buf = tree_read(rel, ptr->block, RBM_NORMAL);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (PageGetLSN(BufferGetPage(buf)) > lsn ||
-		!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
-	{
-		UnlockReleaseBuffer(buf);
-		return false;
-	}
 	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
-	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+	memcpy(entries, PageGetBmapEntries(page.data),
 		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
-	UnlockReleaseBuffer(buf);
 	for (uint32 i = 0; i < BMAP_TREE_FANOUT && ok; i++)
 	{
 		uint64		child = (uint64) first + (level == 0 ? i :
@@ -5392,10 +5419,14 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
  * Recovery may read a map page, or a count page, newer than the replay: a
  * version written past this point before a crash, or a base backup's.  Its
  * pointers and counts may name as shared a subtree that changed since the
- * last snapshot, and the walk would miss a page redo dirtied there.  So
- * every page the walk reads is to be older than the record, or the walk
- * gives up (false): the caller writes out every buffer of the relation
- * instead.
+ * last snapshot, and the walk would miss a page redo dirtied there.  The
+ * block may also hold another page by now (a node freed since and taken
+ * as a relation's page), or one the crash tore.  So the walk gives up
+ * (false), and the caller writes out every buffer of the relation instead,
+ * at a page it reads (redo_walk_read()) that is past its file, isn't
+ * verified, is newer than the record, or isn't the node (or count page)
+ * the pointer to it names.  It relies on data checksums to find a torn
+ * page: without them the caller doesn't walk.
  */
 static bool
 redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
@@ -11753,6 +11784,7 @@ bmap_redo(XLogReaderState *record)
 				bool		kept = xlrec->op == BMAP_TREE_SNAPSHOT &&
 					XLogRecHasBlockRef(record, 1);
 				bool		walked = false;
+				const char *why = NULL;
 
 				/* the store reaches a node made, which its image makes */
 				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
@@ -11764,12 +11796,17 @@ bmap_redo(XLogReaderState *record)
 					Size		len;
 					char	   *data = XLogRecGetBlockData(record, 0, &len);
 
-					if (data != NULL && len == sizeof(sdelta))
-					{
-						memcpy(&sdelta, data, sizeof(sdelta));
-						walked = redo_own_blocks(xlrec->locator, &sdelta.snap,
-												 record->ReadRecPtr, &own);
-					}
+					/* (the root's delta comes with its image too) */
+					if (data == NULL || len != sizeof(sdelta))
+						elog(PANIC, "block map snapshot record without its slot's delta");
+					memcpy(&sdelta, data, sizeof(sdelta));
+					if (!DataChecksumsNeedVerify())
+						why = "data checksums are off, so a page it would read could be torn";
+					else if (!redo_own_blocks(xlrec->locator, &sdelta.snap,
+											  record->ReadRecPtr, &own))
+						why = "a page of its map or counts read is newer than the replay, unverified, or not the node named";
+					else
+						walked = true;
 				}
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
@@ -11785,9 +11822,11 @@ bmap_redo(XLogReaderState *record)
 				 * when redo began.  The pages written are those of the
 				 * snapshot's own blocks (redo_own_blocks()), each looked up
 				 * in the buffers, as bmap_snapshot_take() writes them: as
-				 * many as changed since the last snapshot.  Only if the
-				 * walk read a page newer than the replay is every buffer
-				 * visited.
+				 * many as changed since the last snapshot.  Every buffer is
+				 * visited instead if the walk can't trust what it reads:
+				 * with data checksums off, or once it reads a page newer
+				 * than the replay, one not verified, or one not the node
+				 * the pointer to it names (redo_own_blocks()).
 				 */
 				if (kept)
 				{
@@ -11799,8 +11838,8 @@ bmap_redo(XLogReaderState *record)
 											own.n);
 					else
 					{
-						elog(DEBUG1, "redo of a snapshot of %s writes out every buffer of it: its map is newer than the replay",
-							 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
+						elog(DEBUG1, "redo of a snapshot of %s writes out every buffer of it: %s",
+							 relpathperm(xlrec->locator, MAIN_FORKNUM).str, why);
 						FlushRelationsAllBuffers(&reln, 1);
 					}
 					if (own.blocks)

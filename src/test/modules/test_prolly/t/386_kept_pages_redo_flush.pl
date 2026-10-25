@@ -80,5 +80,47 @@ cmp_ok(counted('relations_restored'), '>', $restored,
 	'the reset gave the kept pages back');
 is(sql($digest), $at, "and they hold the commit's rows");
 
+
+# The same in a relation of more pages than a leaf maps: its second
+# subtree is a node over leaves, of which the commit's change copies the
+# path to its second only (block 1100: a leaf maps 509).  Redo's walk goes
+# down through the copied node to that leaf and passes over the first,
+# still shared (by its count), and over the first subtree, shared whole.
+sql(q{
+	CREATE TABLE app.big (id int PRIMARY KEY, v int, pad text) WITH (fillfactor = 10);
+	INSERT INTO app.big SELECT g, 0, repeat('x', 100) FROM generate_series(1, 7000) g;
+	SELECT dolt_commit('-Am', 'big');
+});
+cmp_ok(sql(q{SELECT pg_relation_size('app.big') / 8192}), '>', 1200,
+	'app.big spans leaves under a node');
+sql('CHECKPOINT');
+my $bigdigest = q{SELECT md5(string_agg(id || ':' || v, ',' ORDER BY id)) FROM app.big};
+my @ids = split /\n/, sql(q{SELECT id FROM app.big
+	WHERE (ctid::text::point)[0] = 1100 ORDER BY id LIMIT 3});
+is(scalar @ids, 3, 'rows of block 1100');
+sql(qq{UPDATE app.big SET v = 1 WHERE id = $ids[0]});
+sql(q{UPDATE public.churn SET a = a + 1});
+sql(qq{UPDATE app.big SET v = 2 WHERE id = $ids[1]});
+sql(q{SELECT dolt_commit('-am', 'block 1100')});
+$at = sql($bigdigest);
+sql(qq{UPDATE app.big SET v = 3 WHERE id = $ids[2]});
+$now = sql($bigdigest);
+
+$log_offset = -s $node->logfile;
+$node->append_conf('postgresql.conf', 'log_min_messages = debug1');
+$node->stop('immediate');
+$node->start;
+is(sql($bigdigest), $now, 'after a crash, app.big as it was');
+ok( !$node->log_contains(
+		'redo of a snapshot of .* writes out every buffer of it', $log_offset),
+	"redo wrote out app.big's own pages, visiting no buffer");
+$node->append_conf('postgresql.conf', 'log_min_messages = warning');
+$node->reload;
+$restored = counted('relations_restored');
+sql(q{SELECT dolt_reset('--hard')});
+cmp_ok(counted('relations_restored'), '>', $restored,
+	"the reset gave app.big's kept pages back");
+is(sql($bigdigest), $at, "and they hold the commit's rows");
+
 $node->stop;
 done_testing();
