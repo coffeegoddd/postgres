@@ -786,9 +786,12 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, /* autovacuum's collections
 											 * skipped: another collection
 											 * of the store was running */
+	PGSTAT_PROLLY_RECORDS_FORGOTTEN,	/* relation records of collected
+										 * commits forgotten after a
+										 * collection */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RECORDS_FORGOTTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

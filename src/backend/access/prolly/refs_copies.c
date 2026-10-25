@@ -285,6 +285,7 @@ typedef struct ScopedSave
 	bool		whole;
 	ProllyHash	base;
 	ProllyHash	mine;
+	int			nrecords;		/* of scoped_records */
 } ScopedSave;
 
 static bool scoped = false;
@@ -293,6 +294,18 @@ static ProllyHash scoped_base;
 static ProllyHash scoped_mine;
 static bool published = false;
 static List *scoped_saved = NIL;	/* ScopedSave *, innermost last */
+
+/*
+ * The keys of the relation records the scoped changes put (in
+ * TopTransactionContext), put again whenever they are rebuilt on a root
+ * another moved: a record equal to one the base had is no change of the
+ * base's, and a step after a collection that forgot it meanwhile (its
+ * commit gone, then made again) would otherwise take it with it.
+ */
+static List *scoped_records = NIL;
+
+typedef struct ScopedEdits ScopedEdits;
+static void put_records_again(const ProllyNodeRef *mine, ScopedEdits *se);
 
 /*
  * The branches whose merge states the transaction set (names, in
@@ -749,6 +762,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			whole = false;
 			published = false;
 			scoped_saved = NIL;
+			scoped_records = NIL;
 			break;
 		default:
 			break;
@@ -845,6 +859,7 @@ scoped_save(void)
 	save->whole = whole;
 	save->base = scoped_base;
 	save->mine = scoped_mine;
+	save->nrecords = list_length(scoped_records);
 	scoped_saved = lappend(scoped_saved, save);
 	MemoryContextSwitchTo(old);
 }
@@ -868,6 +883,7 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		whole = last->whole;
 		scoped_base = last->base;
 		scoped_mine = last->mine;
+		scoped_records = list_truncate(scoped_records, last->nrecords);
 		scoped_saved = list_delete_last(scoped_saved);
 	}
 	else if (event == SUBXACT_EVENT_COMMIT_SUB)
@@ -883,12 +899,12 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	}
 }
 
-typedef struct ScopedEdits
+struct ScopedEdits
 {
 	ProllyEdit *edits;
 	int			n;
 	int			max;
-} ScopedEdits;
+};
 
 static void
 collect_edit(ProllyDiffKind kind, const ProllyKey *key,
@@ -942,6 +958,7 @@ rebase_scoped(const ProllyHash *cur)
 	ref_of(&scoped_base, &from);
 	ref_of(&scoped_mine, &to);
 	PROLLY_CALL(tree, diff, &env, &from, &to, collect_edit, &se);
+	put_records_again(&to, &se);
 	if (se.n == 0)
 		scoped_mine = *cur;
 	else
@@ -959,6 +976,65 @@ rebase_scoped(const ProllyHash *cur)
 	}
 	if (se.edits)
 		pfree(se.edits);
+}
+
+static int
+edit_cmp(const void *a, const void *b)
+{
+	const ProllyEdit *x = a;
+	const ProllyEdit *y = b;
+	int			c = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+
+	return c != 0 ? c : (x->key.len > y->key.len) - (x->key.len < y->key.len);
+}
+
+/*
+ * The relation records the scoped changes put (scoped_records), as mine
+ * has them, added to the edits rebuilt on another root where the diff
+ * hasn't them (equal to the base's), in key order.
+ */
+static void
+put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
+{
+	ListCell   *lc;
+	bool		added = false;
+
+	foreach(lc, scoped_records)
+	{
+		const char *key = lfirst(lc);
+		int			len = strlen(key);
+		ProllyKey	k = {(const uint8 *) key, len};
+		StringInfoData v;
+		bool		have = false;
+		ProllyEdit *e;
+
+		for (int i = 0; i < se->n && !have; i++)
+			have = se->edits[i].key.len == len &&
+				memcmp(se->edits[i].key.data, key, len) == 0;
+		if (have)
+			continue;
+		initStringInfo(&v);
+		if (!PROLLY_CALL(tree, get, &env, mine, &k, &v))
+		{
+			pfree(v.data);
+			continue;
+		}
+		if (se->n == se->max)
+		{
+			se->max = Max(8, se->max * 2);
+			se->edits = se->edits ? repalloc_array(se->edits, ProllyEdit, se->max) :
+				palloc_array(ProllyEdit, se->max);
+		}
+		e = &se->edits[se->n++];
+		e->key.data = (const uint8 *) pstrdup(key);
+		e->key.len = len;
+		e->is_delete = false;
+		e->value.data = (const uint8 *) v.data;
+		e->value.len = v.len;
+		added = true;
+	}
+	if (added)
+		qsort(se->edits, se->n, sizeof(ProllyEdit), edit_cmp);
 }
 
 /*
@@ -1216,6 +1292,13 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 			ref_of(&scoped_mine, &root);
 			PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
 			scoped_mine = new_root.hash;
+			if (key[0] == TAG_LINEAGE && value != NULL)
+			{
+				MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+				scoped_records = lappend(scoped_records, pnstrdup(key, keylen));
+				MemoryContextSwitchTo(old);
+			}
 			return;
 		}
 	}
@@ -4791,28 +4874,20 @@ refs_tree_held(ProllyNodeRef *root)
 }
 
 /*
- * Forget the relation records of commits the store no longer has (a
- * collection took them): a record is kept by its commit's key alone, never
- * as a reference a collection follows, so it would outlive its commit.
- * Asked of the store's index, after the collection: a collected commit's
- * chunk isn't read.  True if any was forgotten.
+ * The keys of the relation records under root whose commits the store
+ * doesn't have, in key order.
  */
-static bool
-copies_forget_records(void)
+static List *
+records_gone(const ProllyNodeRef *root)
 {
-	ProllyNodeRef root;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
 	char		tag = TAG_LINEAGE;
 	ProllyKey	from = {(const uint8 *) &tag, 1};
 	List	   *gone = NIL;
-	ListCell   *lc;
 
-	refs_init();
-	if (!refs_tree_held(&root))
-		return false;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
 		   k.len >= 1 && k.data[0] == TAG_LINEAGE)
@@ -4824,9 +4899,54 @@ copies_forget_records(void)
 			gone = lappend(gone, pnstrdup((const char *) k.data, k.len));
 	}
 	PROLLY_CALL(tree, cursor_close, c);
+	return gone;
+}
+
+/*
+ * Forget the relation records of commits the store no longer has (a
+ * collection took them): a record is kept by its commit's key alone, never
+ * as a reference a collection follows, so it would outlive its commit.
+ * Asked of the store's index, after the collection: a collected commit's
+ * chunk isn't read.  If any is found, the refs are held whole and the
+ * records asked again of the root then, so that a commit made again
+ * meanwhile (the same id) by a transaction that published since keeps its
+ * record, and one publishing after waits for this one and puts its record
+ * back over it; the records are deleted in one edit of the tree.  True if
+ * any was forgotten.
+ */
+static bool
+copies_forget_records(void)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+	List	   *gone;
+	ProllyEdit *edits;
+	int			n = 0;
+	ListCell   *lc;
+
+	refs_init();
+	if (!refs_tree_held(&root) || records_gone(&root) == NIL)
+		return false;
+	lock_refs();
+	if (!refs_root(&root))
+		return false;
+	gone = records_gone(&root);
+	if (gone == NIL)
+		return false;
+	edits = palloc0(sizeof(ProllyEdit) * list_length(gone));
 	foreach(lc, gone)
-		refs_put(lfirst(lc), strlen(lfirst(lc)), NULL);
-	return gone != NIL;
+	{
+		edits[n].key.data = (const uint8 *) lfirst(lc);
+		edits[n].key.len = strlen(lfirst(lc));
+		edits[n].is_delete = true;
+		n++;
+	}
+	PROLLY_CALL(tree, apply, &env, &root, edits, n, &new_root);
+	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
+					 &new_root.hash))
+		elog(ERROR, "prolly refs moved while held");
+	pgstat_count_prolly(PGSTAT_PROLLY_RECORDS_FORGOTTEN, n);
+	return true;
 }
 
 /*

@@ -570,6 +570,28 @@ SELECT test_refs_walk_reaches(:'abandoned') AS reached,
 SET ROLE regress_lb_reader;
 SELECT count(*) AS rows_live FROM dolt_at('HEAD', NULL::ln.p);
 RESET ROLE;
+-- (many at once are forgotten in one edit of the refs: what it appends
+-- doesn't grow a tree path per record)
+SELECT dolt_branch('abandon_many') IS NOT NULL AS made;
+SELECT dolt_checkout('abandon_many') IS NOT NULL AS on_many;
+DO $$
+BEGIN
+	FOR i IN 1..40 LOOP
+		INSERT INTO ln.p VALUES (100 + i, 'abandoned');
+		PERFORM dolt_commit('-am', 'to abandon ' || i);
+	END LOOP;
+END $$;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'abandon_many') IS NOT NULL AS deleted;
+SELECT pg_stat_force_next_flush();
+SELECT value AS forgotten_before FROM pg_stat_prolly WHERE name = 'records_forgotten' \gset
+SELECT value AS journal_before FROM pg_stat_prolly WHERE name = 'journal_bytes_written' \gset
+SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT pg_stat_force_next_flush();
+SELECT value - :forgotten_before AS forgotten
+FROM pg_stat_prolly WHERE name = 'records_forgotten';
+SELECT value - :journal_before < 20000 AS one_edit
+FROM pg_stat_prolly WHERE name = 'journal_bytes_written';
 
 -- commits made elsewhere (cloned) have no records: their versions are
 -- read by full readers only, and stay so under a commit made here
