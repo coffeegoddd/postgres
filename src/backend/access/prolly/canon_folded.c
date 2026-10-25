@@ -8222,6 +8222,15 @@ statement_maker(const char *sql)
  * query: search_path too (RestrictSearchPath(): pg_catalog, then pg_temp,
  * so that the mover's temporary objects are never found first).
  */
+/* The role running the move, while it runs as a maker (InvalidOid: not) */
+static Oid	move_mover = InvalidOid;
+
+Oid
+prolly_move_mover(void)
+{
+	return OidIsValid(move_mover) ? move_mover : GetUserId();
+}
+
 static void
 as_role(Oid role, ProllyMakerSwitch *sw)
 {
@@ -8229,6 +8238,9 @@ as_role(Oid role, ProllyMakerSwitch *sw)
 	if (!OidIsValid(role))
 		return;
 	GetUserIdAndSecContext(&sw->user, &sw->sec);
+	sw->mover = move_mover;
+	if (!OidIsValid(move_mover))
+		move_mover = sw->user;
 	SetUserIdAndSecContext(role, sw->sec | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_RESTRICTED_OPERATION);
 	sw->nest = NewGUCNestLevel();
@@ -8243,6 +8255,8 @@ typedef struct MakerRelid
 	Oid			owner;
 } MakerRelid;
 
+
+static Oid	relation_named(const char *name);
 
 Oid
 prolly_move_maker(Oid relid)
@@ -8280,8 +8294,7 @@ prolly_move_maker(Oid relid)
 
 		if (OidIsValid(mm->relid) || (mm->kind != 't' && mm->kind != 'm'))
 			continue;
-		mm->relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mm->name, NULL)),
-									 NoLock, true);
+		mm->relid = relation_named(mm->name);
 		if (!OidIsValid(mm->relid))
 			continue;
 		n = hash_search(makers_by_relid, &mm->relid, HASH_ENTER, &found);
@@ -8308,6 +8321,7 @@ prolly_as_maker_end(ProllyMakerSwitch *sw)
 	{
 		AtEOXact_GUC(true, sw->nest);
 		SetUserIdAndSecContext(sw->user, sw->sec);
+		move_mover = sw->mover;
 	}
 	sw->switched = false;
 }
@@ -8478,6 +8492,24 @@ table_sequences(const char *name, const TableDef *td)
 
 static Oid	item_owner(const MoveItem *it, bool *known);
 
+/*
+ * The relation of a qualified name (a move item's), looked up without the
+ * schema USAGE check RangeVarGetRelid() makes: a move reads what the branch
+ * has whatever its role may use (InvalidOid: none).
+ */
+static Oid
+relation_named(const char *name)
+{
+	List	   *names = stringToQualifiedNameList(name, NULL);
+	Oid			nsp;
+
+	if (list_length(names) != 2)
+		return InvalidOid;
+	nsp = get_namespace_oid(strVal(linitial(names)), true);
+	return OidIsValid(nsp) ? get_relname_relid(strVal(lsecond(names)), nsp) :
+		InvalidOid;
+}
+
 /* relid's owner (InvalidOid: no such relation) */
 static Oid
 relation_owner_of(Oid relid)
@@ -8591,8 +8623,7 @@ restore_saved_acls(List *saved)
 	CommandCounterIncrement();
 	foreach_ptr(SavedAcl, sa, saved)
 	{
-		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(sa->name, NULL)),
-											 NoLock, true);
+		Oid			relid = relation_named(sa->name);
 		Relation	catalog = sa->attname ? pg_attribute : pg_class;
 		AttrNumber	aclattr = sa->attname ? Anum_pg_attribute_attacl : Anum_pg_class_relacl;
 		HeapTuple	tup;
@@ -8639,13 +8670,20 @@ restore_saved_acls(List *saved)
 
 /*
  * The makers of the relations the branch has (from's items) that a move
- * changes or makes again: each its owner here.  Before the move's
- * statements are made (move_makers_before() adds those it makes from a
- * commit).
+ * changes or makes again: each its owner here, where the role moving has
+ * that owner's privileges (a superuser, a member of the owning role), so
+ * that the owner's code (a check's function, a materialized view's query)
+ * never runs with more than the owner's own.  A role without them moves
+ * as itself, as its DDL would run: it may change only what it owns, and a
+ * writer branch's role only what its base defines (move_authority()).
+ * Before the move's statements are made (move_makers_before() adds those
+ * it makes from a commit).
  */
 static void
 move_owners_before(List *from)
 {
+	Oid			mover = GetUserId();
+
 	reset_makers();
 	foreach_ptr(MoveItem, f, from)
 	{
@@ -8655,7 +8693,8 @@ move_owners_before(List *from)
 		if (f->kind != 't' && f->kind != 'm' && f->kind != 'v' && f->kind != 's')
 			continue;
 		owner = item_owner(f, &known);
-		if (known && OidIsValid(owner))
+		if (known && OidIsValid(owner) && owner != mover &&
+			has_privs_of_role(mover, owner))
 			(void) add_maker(f->name, f->kind, owner, false);
 	}
 }
@@ -8672,8 +8711,7 @@ save_remade(const char *name, char kind)
 
 	if (mm == NULL || mm->made || mm->saved != NIL)
 		return;
-	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
-							 NoLock, true);
+	relid = relation_named(name);
 	if (OidIsValid(relid))
 		mm->saved = saved_acls(relid);
 }
@@ -11578,8 +11616,7 @@ item_owner(const MoveItem *it, bool *known)
 	else if (it->kind == 't' || it->kind == 'v' || it->kind == 'm' ||
 			 it->kind == 's' || it->kind == 'f')
 	{
-		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(it->name, NULL)),
-											 NoLock, true);
+		Oid			relid = relation_named(it->name);
 		HeapTuple	tup;
 
 		if (OidIsValid(relid) &&
@@ -12486,8 +12523,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 		if (mm->kind == 'S' || mm->kind == 's' || (!mm->made && mm->saved == NIL))
 			continue;			/* (a table's, or unchanged) */
-		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mm->name, NULL)),
-								 NoLock, true);
+		relid = relation_named(mm->name);
 		if (!OidIsValid(relid))
 			continue;
 		if (mm->made)

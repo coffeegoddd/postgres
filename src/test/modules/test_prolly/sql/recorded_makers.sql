@@ -270,9 +270,10 @@ SELECT has_column_privilege('regress_rm_spy', 'rm.v', 'b', 'UPDATE') AS spy_upda
 FROM pg_attribute WHERE attrelid = 'rm.v'::regclass AND attname = 'b';
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 
--- a writer that owns none of them uses a branch (its first use), and
--- merges, where alice changed her tables since: the changes are made as
--- alice
+-- a role without alice's privileges moves as itself, as its DDL would
+-- run: a writer that owns none of her tables can't use a branch (its first
+-- use), nor merge, where alice changed them since; refused, nothing is left
+-- behind.  (A role that has them, a superuser, moves as alice, above.)
 -- (the writer may read alice's definitions: the function her check calls)
 GRANT USAGE ON SCHEMA rm_pub TO regress_rm_w;
 SET ROLE regress_rm_w;
