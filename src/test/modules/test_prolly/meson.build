@@ -235,6 +235,7 @@ tests += {
       'first_use_kept',
       'branch_catalog_index',
       'kept_commit_shares',
+      'kept_dead',
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',

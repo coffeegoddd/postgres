@@ -2856,6 +2856,77 @@ kept_settled(void *arg)
 }
 
 /*
+ * What is left of kept commit kc's pages: restorable if some table's
+ * relations all are (restore_pages() can give that table its pages back);
+ * gone if nothing of any is left (each relation's storage, or its
+ * snapshot there, gone: a restore, a TRUNCATE or a rewrite gave it new
+ * storage, or it was dropped); else held (a snapshot is left to let go of,
+ * but no table can be given its pages).  Without kept_status(), always
+ * restorable, as restore() then tells.
+ */
+static BranchKeptStatus
+kept_commit_status(const KeptCommit *kc)
+{
+	bool		any_left = false;
+
+	if (branch_ops()->kept_status == NULL)
+		return BRANCH_KEPT_RESTORABLE;
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		bool		all = true;
+
+		for (int r = 0; r < kc->tables[t].nrels; r++)
+		{
+			BranchKeptStatus s = branch_ops()->kept_status(&kc->tables[t].rels[r]);
+
+			if (s != BRANCH_KEPT_RESTORABLE)
+				all = false;
+			if (s != BRANCH_KEPT_GONE)
+				any_left = true;
+			if (!all && any_left)
+				break;
+		}
+		if (all)
+			return BRANCH_KEPT_RESTORABLE;
+	}
+	return any_left ? BRANCH_KEPT_HELD : BRANCH_KEPT_GONE;
+}
+
+/*
+ * The commits of kept (a branch's list) whose pages are gone dropped from
+ * it, and those no table can be given its pages of any more retired: a
+ * retired one keeps its commit and baseline from collection, as any does,
+ * until a later keep lets go of its snapshots (a first use may be reading
+ * it), a dropped one no longer.  Neither counts toward
+ * prolly.kept_commits or is offered to a move or a first use.  A commit's
+ * storage goes with the change that replaced it (a restore of another
+ * commit, a rewrite, a DROP), so the list changes with the same
+ * transaction; one whose pages are gone has nothing for a first use
+ * reading the list from before to make a branch of, nor anything to let
+ * go of.  (A TRUNCATE leaves a table's change log on its storage: its
+ * commits are retired, not dropped.)  but: an entry left as it is (NULL:
+ * none).
+ */
+static List *
+kept_drop_dead(List *kept, const KeptCommit *but)
+{
+	List	   *left = NIL;
+
+	foreach_ptr(KeptCommit, o, kept)
+	{
+		BranchKeptStatus s = o == but ? BRANCH_KEPT_RESTORABLE :
+			kept_commit_status(o);
+
+		if (s == BRANCH_KEPT_GONE)
+			continue;
+		if (s == BRANCH_KEPT_HELD && !FullTransactionIdIsValid(o->retired))
+			o->retired = GetTopFullTransactionId();
+		left = lappend(left, o);
+	}
+	return left;
+}
+
+/*
  * Keep the session branch's pages as of commit_id, whose root its working
  * set is known to be (snap's view, with the transaction's own changes).
  * Nothing is kept if a lock isn't free or another's writes may be on the
@@ -2891,6 +2962,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	List	   *names = NIL;
 	List	   *kept;
 	List	   *holding = NIL;
+	List	   *before;
 	List	   *releasing = NIL;
 	List	   *next = NIL;
 	BranchKeptRelation *prior;
@@ -2936,6 +3008,14 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 		else
 			holding = lappend(holding, o);
 	}
+	/*
+	 * (a commit dropped as gone still holds what it shares with one let go
+	 * of now: it is gone as this transaction sees the branch, and the
+	 * change that made it so may yet roll back, bringing it back, while a
+	 * snapshot let go of stays so)
+	 */
+	before = holding;
+	holding = kept_drop_dead(holding, NULL);
 	foreach_ptr(KeptCommit, o, holding)
 	{
 		for (int t = 0; t < o->ntables; t++)
@@ -2960,7 +3040,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	{
 		for (int t = 0; t < o->ntables; t++)
 			for (int r = 0; r < o->tables[t].nrels; r++)
-				if (!kept_holds(holding, &o->tables[t].rels[r]))
+				if (!kept_holds(before, &o->tables[t].rels[r]))
 					release[nrelease++] = o->tables[t].rels[r];
 	}
 	out = palloc0_array(BranchKeptRelation, Max(list_length(relids), 1));
@@ -3260,9 +3340,13 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	if (now == NIL)
 		return;
 
-	/* (the restored tables' snapshots of their new storage kept at once) */
+	/*
+	 * (the restored tables' snapshots of their new storage kept at once;
+	 * the other commits whose pages were in the storage replaced dropped
+	 * with it)
+	 */
 	was->retired = GetTopFullTransactionId();
-	*kept = lcons(kc, *kept);
+	*kept = kept_drop_dead(lcons(kc, *kept), kc);
 	ref_of(&kc->baseline, &from);
 	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,
 				&spliced);

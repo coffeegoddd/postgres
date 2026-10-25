@@ -1769,20 +1769,37 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 }
 
 /*
- * Is relation c (its row k) still on the branch with the storage that kept
- * it, its snapshot there, and its rows' transaction ids ones the database
- * still knows (none older than its datfrozenxid and datminmxid, whose
- * status may be gone)?  Asked before the pages kept are given back, and
- * before a branch is made of them.
+ * What is left of relation c's (its row k's) kept pages: restorable if it
+ * is still on the branch with the storage that kept it, its snapshot there,
+ * and its rows' transaction ids ones the database still knows (none older
+ * than its datfrozenxid and datminmxid, whose status may be gone); gone if
+ * that storage, or its snapshot, is no longer there, or the relation is on
+ * other storage now (its own goes when the change commits); held if the
+ * snapshot is still there but can't be given back.
  */
-static bool
-can_restore(Form_pg_class c, const BranchKeptRelation *k)
+static BranchKeptStatus
+kept_status_of(Form_pg_class c, const BranchKeptRelation *k)
 {
 	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
 	HeapTuple	dbtup;
 	TransactionId datfrozenxid;
 	MultiXactId datminmxid;
+	bool		there = false;
 	int			n;
+
+	if (c->relfilenode != k->relfilenumber ||
+		c->reltablespace != k->tablespace ||
+		!bmap_relation_exists(kept_locator(k)))
+		return BRANCH_KEPT_GONE;
+	n = bmap_snapshot_list(smgropen(kept_locator(k), INVALID_PROC_NUMBER),
+						   snaps, BMAP_SNAPSHOTS_MAX);
+	for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
+	{
+		if (snaps[s].id == k->snapshot)
+			there = true;
+	}
+	if (!there)
+		return BRANCH_KEPT_GONE;
 
 	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	if (!HeapTupleIsValid(dbtup))
@@ -1790,24 +1807,24 @@ can_restore(Form_pg_class c, const BranchKeptRelation *k)
 	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
 	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
 	ReleaseSysCache(dbtup);
-
-	if (c->relfilenode != k->relfilenumber ||
-		c->reltablespace != k->tablespace ||
-		c->relpersistence != RELPERSISTENCE_PERMANENT ||
-		!bmap_relation_exists(kept_locator(k)) ||
+	if (c->relpersistence != RELPERSISTENCE_PERMANENT ||
 		(TransactionIdIsNormal(k->frozenxid) &&
 		 TransactionIdPrecedes(k->frozenxid, datfrozenxid)) ||
 		(MultiXactIdIsValid(k->minmxid) &&
 		 MultiXactIdPrecedes(k->minmxid, datminmxid)))
-		return false;
-	n = bmap_snapshot_list(smgropen(kept_locator(k), INVALID_PROC_NUMBER),
-						   snaps, BMAP_SNAPSHOTS_MAX);
-	for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
-	{
-		if (snaps[s].id == k->snapshot)
-			return true;
-	}
-	return false;
+		return BRANCH_KEPT_HELD;
+	return BRANCH_KEPT_RESTORABLE;
+}
+
+/*
+ * Can relation c's (its row k's) kept pages be given back
+ * (kept_status_of())?  Asked before they are, and before a branch is made
+ * of them.
+ */
+static bool
+can_restore(Form_pg_class c, const BranchKeptRelation *k)
+{
+	return kept_status_of(c, k) == BRANCH_KEPT_RESTORABLE;
 }
 
 /*
@@ -2024,6 +2041,26 @@ copies_let_go(const BranchKeptRelation *kept)
 }
 
 /*
+ * What is left of the pages keep() kept of the session branch's relation
+ * kept (see branch_ops.h).
+ */
+static BranchKeptStatus
+copies_kept_status(const BranchKeptRelation *kept)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	HeapTuple	t = class_row(pg_class, kept->relid, MyBranch);
+	BranchKeptStatus status = BRANCH_KEPT_GONE;
+
+	if (t != NULL)
+	{
+		status = kept_status_of((Form_pg_class) GETSTRUCT(t), kept);
+		heap_freetuple(t);
+	}
+	table_close(pg_class, AccessShareLock);
+	return status;
+}
+
+/*
  * Add acl to the privileges of relation relid's row in catalog (pg_class,
  * or its column attnum's pg_attribute row: tup, a modifiable copy), as
  * owner's, recording its grantees' shared dependencies.  The privileges
@@ -2215,6 +2252,7 @@ static const BranchOpsRoutine branch_copies = {
 	.make_kept = copies_make_kept,
 	.restore = copies_restore,
 	.let_go = copies_let_go,
+	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
 };

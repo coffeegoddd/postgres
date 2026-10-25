@@ -1078,6 +1078,26 @@ tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
 
+A restore gives each table it restores new storage, and the storage it
+replaces, where every other kept commit's snapshot of the table was, goes
+with it at commit; so does a rewrite's, or a dropped table's.  Each keep
+and each restore asks what is left of each kept commit's pages (branch
+operations' kept_status()).  One with nothing left at all (every
+relation's storage, or its snapshot there, gone, as the transaction sees
+it) is dropped from the list at once, with nothing to let go of, and its
+commit and baseline are no longer kept from collection.  One none of
+whose tables can be given its pages any more, but with a snapshot still
+left (a TRUNCATE gives a table and its indexes new storage, but not its
+change log; its rows' transaction ids are older than the database still
+knows), is retired, as above: it stays in the record, keeping its commit
+and baseline from collection, until a later keep lets go of its
+snapshots.  Neither counts toward prolly.kept_commits or is offered to a
+move or a first use.  A commit with a table whose relations are all still
+on the storage that kept them stays kept (restore_pages() may still pass
+the table over, renamed or with other relations since).  Snapshots that a
+dropped commit shares with one let go of are kept until a later keep: the
+change that made it gone may roll back.
+
 Kept commits are kept states of the materialization cache
 (prolly_matcache.h), beside kept checkouts: the cache's visit() gives
 each branch's kept commits (the refs' kept_commits(), each recording the

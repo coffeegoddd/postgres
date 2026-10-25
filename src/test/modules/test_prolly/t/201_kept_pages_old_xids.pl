@@ -5,7 +5,8 @@
 # a branch's first use doesn't make the branch of them (their xids'
 # status is gone) but copies the source as it is, and a keep letting go
 # of a commit retired then asks no transaction's status.  Both used to
-# fail, and go on failing at every try.
+# fail, and go on failing at every try.  The commits whose pages are kept
+# but can't be given back are retired by that keep.
 
 use strict;
 use warnings FATAL => 'all';
@@ -77,6 +78,10 @@ is($ret, 0, 'a commit after the retiring transaction\'s status is gone');
 is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('ko.t'))}),
 	'2', 'c1\'s snapshot let go of, c4 kept by its own');
 like($err, qr/^$/, 'without an error') or diag $err;
+# (c3 and c2, their snapshots still there but their xids frozen past, can
+# give no table its pages: retired, not counted or offered)
+is(sql(q{SELECT count(*) FROM test_kept_commits('main')}), '1',
+	'only c4 kept: those whose pages can\'t be given back retired');
 
 $node->stop;
 done_testing();

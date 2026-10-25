@@ -366,6 +366,12 @@ CREATE FUNCTION test_refs_walk_reaches(commit_id text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The commits a branch's pages are kept as of, newest first, as the refs
+-- offer them to a move or a first use (not those retired).
+CREATE FUNCTION test_kept_commits(branch text)
+RETURNS TABLE (commit_id text)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The value of the refs' entry key (a tag, then a name).
 CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea
