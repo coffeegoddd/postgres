@@ -235,6 +235,7 @@ tests += {
       'history_mounts',
       'head_move_privileges',
       'lineage_breaks',
+      'key_routines',
       'role_makers',
       'writer_definitions',
     ],

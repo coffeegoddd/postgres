@@ -162,9 +162,6 @@ sql(q{ALTER TABLE m.t ADD PRIMARY KEY (id);
 	CREATE FUNCTION m.f() RETURNS SETOF int LANGUAGE sql
 		BEGIN ATOMIC SELECT a FROM m.t GROUP BY id; END});
 my $mb = (split /\n/, sql(q{SELECT (dolt_commit('-Am', 'mb'))[1]}))[-1];
-# (back without the routine first: a reset doesn't yet drop a routine
-# before the constraint it depends on)
-sql(q{DROP FUNCTION m.f()});
 sql(qq{SELECT dolt_reset('--hard', '$ma')});
 my ($rc, $o, $e) = $node->psql('postgres', qq{SELECT dolt_reset('--hard', '$mb')});
 is($rc, 0, 'a move making a routine that relies on a key it adds succeeds');

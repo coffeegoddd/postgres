@@ -138,6 +138,7 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_func.h"
 #include "parser/parser.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -10982,6 +10983,320 @@ writer_base_items(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
+ * The routines depending on the object (refclassid, refobjid, and its
+ * column refsubid, or any of its columns if -1), added to *procs;
+ * *matviews set if a materialized view does.
+ */
+static void
+add_dependents(Oid refclassid, Oid refobjid, int32 refsubid, List **procs,
+			   bool *matviews)
+{
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyData key[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(refclassid));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(refobjid));
+	ScanKeyInit(&key[2], Anum_pg_depend_refobjsubid, BTEqualStrategyNumber,
+				F_INT4EQ, Int32GetDatum(refsubid));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL,
+							  refsubid >= 0 ? 3 : 2, key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (d->classid == ProcedureRelationId)
+			*procs = list_append_unique_oid(*procs, d->objid);
+		else if (d->classid == RewriteRelationId)
+		{
+			Relation	rwRel = table_open(RewriteRelationId, AccessShareLock);
+			ScanKeyData rkey;
+			SysScanDesc rscan;
+			HeapTuple	rtup;
+
+			ScanKeyInit(&rkey, Anum_pg_rewrite_oid, BTEqualStrategyNumber,
+						F_OIDEQ, ObjectIdGetDatum(d->objid));
+			rscan = systable_beginscan(rwRel, RewriteOidIndexId, true, NULL, 1, &rkey);
+			if ((rtup = systable_getnext(rscan)) != NULL &&
+				get_rel_relkind(((Form_pg_rewrite) GETSTRUCT(rtup))->ev_class) ==
+				RELKIND_MATVIEW)
+				*matviews = true;
+			systable_endscan(rscan);
+			table_close(rwRel, AccessShareLock);
+		}
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+}
+
+/*
+ * What the move drops of from's tables, and the routines (their OIDs) that
+ * use it: a table that goes, or is made again (table_remade()), a column
+ * dropped, and a constraint whose line to doesn't have.  A routine with a
+ * SQL-standard body depends on the tables and columns it reads, and on a
+ * primary key it relies on (to group by it, selecting the columns the key
+ * determines), so it would keep them from going: those are returned.  A
+ * routine of any language whose arguments or result are a table's row type
+ * depends on the type, which goes with the table: those are *retyped.
+ * *matviews is set if a materialized view depends on what goes: those go
+ * and come again.  Tables the move leaves as they are aren't looked up.
+ */
+static List *
+routines_on_going(List *from, List *to, List **retyped, bool *matviews)
+{
+	List	   *procs = NIL;
+	ListCell   *lc;
+
+	*retyped = NIL;
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t;
+		TableDef	ftd;
+		TableDef	ttd;
+		bool		gone;
+		List	   *going = NIL;
+		List	   *columns = NIL;	/* names of the columns dropped */
+		Oid			relid;
+		Relation	conrel;
+		ScanKeyData key;
+		SysScanDesc scan;
+		HeapTuple	tup;
+		ListCell   *c;
+
+		if (f->kind != 't')
+			continue;
+		t = find_item(to, 't', f->name);
+		if (t && strcmp(t->def, f->def) == 0)
+			continue;
+		parse_table_def(f->def, &ftd);
+		if (t)
+			parse_table_def(t->def, &ttd);
+		gone = t == NULL || table_remade(&ftd, &ttd);
+		if (!gone)
+		{
+			List	   *to_names = NIL;
+
+			foreach(c, ftd.constraints)
+				if (!list_has_string(ttd.constraints, lfirst(c)))
+					going = lappend(going, first_field(lfirst(c)));
+			foreach(c, ttd.columns)
+				to_names = lappend(to_names, first_field(lfirst(c)));
+			foreach(c, ftd.columns)
+				if (!list_has_string(to_names, first_field(lfirst(c))))
+					columns = lappend(columns, first_field(lfirst(c)));
+			if (going == NIL && columns == NIL)
+				continue;
+		}
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(f->name, NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid))
+			continue;
+		if (gone)
+		{
+			add_dependents(RelationRelationId, relid, -1, &procs, matviews);
+			add_dependents(TypeRelationId, get_rel_type_id(relid), -1, retyped,
+						   matviews);
+		}
+		for (AttrNumber att = 1; columns != NIL; att++)
+		{
+			HeapTuple	atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+											   Int16GetDatum(att));
+			Form_pg_attribute attr;
+
+			if (!HeapTupleIsValid(atup))
+				break;
+			attr = (Form_pg_attribute) GETSTRUCT(atup);
+			if (!attr->attisdropped &&
+				list_has_string(columns, quote_identifier(NameStr(attr->attname))))
+				add_dependents(RelationRelationId, relid, att, &procs, matviews);
+			ReleaseSysCache(atup);
+		}
+		conrel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(relid));
+		scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+								  NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+			if (gone ||
+				list_has_string(going, quote_identifier(NameStr(con->conname))))
+				add_dependents(ConstraintRelationId, con->oid, -1, &procs,
+							   matviews);
+		}
+		systable_endscan(scan);
+		table_close(conrel, AccessShareLock);
+	}
+	return procs;
+}
+
+/* Routine f's OID (from's: there now), or InvalidOid. */
+static Oid
+routine_oid(const MoveItem *f)
+{
+	/* (its name is as DROP FUNCTION takes it, argument names and all) */
+	List	   *raw = raw_parser(drop_routine_sql(f), RAW_PARSE_DEFAULT);
+	DropStmt   *drop = castNode(DropStmt, linitial_node(RawStmt, raw)->stmt);
+
+	return LookupFuncWithArgs(OBJECT_ROUTINE, linitial(drop->objects), true);
+}
+
+/* Where a routine's SQL-standard body begins in its definition, or NULL. */
+static const char *
+sql_body(const char *def)
+{
+	const char *body = strstr(def, "\nBEGIN ATOMIC");
+
+	return body ? body : strstr(def, "\nRETURN ");
+}
+
+/*
+ * Routine f (with a SQL-standard body) with a body that uses nothing: its
+ * definition up to the body, with an empty SQL body, which
+ * (check_function_bodies off) isn't parsed, so records no dependencies.
+ * Replaced so, it keeps its OID, owner, grants and comment, its
+ * volatility, strictness, parallel safety and cost (a generated column or
+ * an index made meanwhile may call it), and what uses it keeps using it,
+ * while what it read can go; it goes, or is made again as to defines it,
+ * after.  (Only a superuser may make a routine LEAKPROOF: for another
+ * role it is replaced without, and to's definition, made again, refused.)
+ */
+static char *
+unbodied_routine_sql(const MoveItem *f)
+{
+	const char *body = sql_body(f->def);
+	char	   *head = pnstrdup(f->def, body ? body - f->def : strlen(f->def));
+
+	if (!superuser())
+	{
+		char	   *lp;
+
+		while ((lp = strstr(head, " LEAKPROOF")) != NULL)
+			memmove(lp, lp + 10, strlen(lp + 10) + 1);
+	}
+	return psprintf("%s\nAS $prolly_move$$prolly_move$", head);
+}
+
+/*
+ * A routine dropped and made again (its row type's table made again): its
+ * owner, privileges and comment, which a commit doesn't hold, given back
+ * once it is made (restore_routines()).  Its OID is new, so what depends
+ * on it (another routine calling it, a default, a view) keeps it from
+ * being dropped, and the move fails as dropping it would.
+ */
+typedef struct DroppedRoutine
+{
+	char	   *name;			/* as DROP FUNCTION takes it */
+	char	   *def;			/* from's definition */
+	Oid			owner;
+	Acl		   *acl;			/* NULL: the default */
+	char	   *comment;		/* NULL: none */
+} DroppedRoutine;
+
+static DroppedRoutine *
+note_dropped_routine(const MoveItem *f, Oid proc)
+{
+	HeapTuple	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(proc));
+	DroppedRoutine *dr = palloc(sizeof(DroppedRoutine));
+	Datum		acl;
+	bool		isnull;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", proc);
+	dr->name = pstrdup(f->name);
+	dr->def = pstrdup(f->def);
+	dr->owner = ((Form_pg_proc) GETSTRUCT(tup))->proowner;
+	acl = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_proacl, &isnull);
+	dr->acl = isnull ? NULL : DatumGetAclPCopy(acl);
+	ReleaseSysCache(tup);
+	dr->comment = GetComment(proc, ProcedureRelationId, 0);
+	return dr;
+}
+
+/* The routines note_dropped_routine() noted, made again: theirs given back. */
+static void
+restore_routines(List *dropped)
+{
+	ListCell   *lc;
+
+	if (dropped == NIL)
+		return;
+	CommandCounterIncrement();
+	foreach(lc, dropped)
+	{
+		DroppedRoutine *dr = lfirst(lc);
+		MoveItem	it = {'f', dr->name, dr->def};
+		Oid			proc = routine_oid(&it);
+		Relation	rel;
+		HeapTuple	tup;
+		Datum		values[Natts_pg_proc] = {0};
+		bool		nulls[Natts_pg_proc] = {0};
+		bool		replaces[Natts_pg_proc] = {0};
+		HeapTuple	newtup;
+		Oid		   *members = NULL;
+		int			nmembers;
+		Oid		   *old_members = NULL;
+		int			old_nmembers;
+		Datum		old_acl;
+		bool		isnull;
+		Oid			old_owner;
+
+		if (!OidIsValid(proc))
+			continue;			/* (not made again: to doesn't have it) */
+		rel = table_open(ProcedureRelationId, RowExclusiveLock);
+		tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(proc));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for function %u", proc);
+		old_owner = ((Form_pg_proc) GETSTRUCT(tup))->proowner;
+		old_acl = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_proacl, &isnull);
+		old_nmembers = isnull ? 0 : aclmembers(DatumGetAclP(old_acl), &old_members);
+		values[Anum_pg_proc_proowner - 1] = ObjectIdGetDatum(dr->owner);
+		replaces[Anum_pg_proc_proowner - 1] = true;
+		if (dr->acl != NULL)
+			values[Anum_pg_proc_proacl - 1] = PointerGetDatum(dr->acl);
+		else
+			nulls[Anum_pg_proc_proacl - 1] = true;
+		replaces[Anum_pg_proc_proacl - 1] = true;
+		newtup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
+								   replaces);
+		CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+		ReleaseSysCache(tup);
+		heap_freetuple(newtup);
+		table_close(rel, RowExclusiveLock);
+		if (old_owner != dr->owner)
+			changeDependencyOnOwner(ProcedureRelationId, proc, dr->owner);
+		nmembers = dr->acl ? aclmembers(dr->acl, &members) : 0;
+		updateAclDependencies(ProcedureRelationId, proc, 0, dr->owner,
+							  old_nmembers, old_members, nmembers, members);
+		if (dr->comment != NULL)
+			CreateComments(proc, ProcedureRelationId, 0, dr->comment);
+	}
+	CommandCounterIncrement();
+}
+
+/*
+ * Statements tried in turn, again while any is made: those still failing
+ * for another statement (try_statement()) are left, in order.
+ */
+static List *
+try_until_stuck(List *stmts)
+{
+	int			n;
+
+	do
+	{
+		n = list_length(stmts);
+		stmts = try_statements(stmts);
+	} while (stmts != NIL && list_length(stmts) < n);
+	return stmts;
+}
+
+/*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
  * rows(arg), which writes them, then what they must satisfy (the checks,
@@ -11011,6 +11326,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *keyed;
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
+	List	   *unkeyed = NIL;	/* routines kept, emptied of their bodies */
+	List	   *unbodied = NIL;	/* those emptied, first */
+	List	   *going_users;	/* routines using what goes */
+	List	   *retyped;		/* routines on a row type that goes */
+	List	   *redone = NIL;	/* routines dropped and made again */
+	List	   *dropped_routines = NIL; /* DroppedRoutine *: theirs */
+	bool		going_matviews = false;	/* a matview uses what goes */
 	List	   *foreign_makes = NIL;	/* foreign tables made, after those going */
 	List	   *foreign_alters = NIL;	/* foreign tables changed in place */
 	List	   *foreign_routines = NIL; /* routines using those made again,
@@ -11078,6 +11400,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			foreign_makes = lappend(foreign_makes, create_foreign_table_sql(t->name, t->def));
 	}
 
+	going_users = routines_on_going(from, to, &retyped, &going_matviews);
+
 	/* Going: views first, as they may use anything; then tables, routines, the rest. */
 	foreach(lc, from)
 	{
@@ -11104,6 +11428,39 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			matview_drops = lappend(matview_drops,
 									psprintf("DROP MATERIALIZED VIEW IF EXISTS %s",
 											 f->name));
+		/*
+		 * (one using what goes, emptied of its body first: see
+		 * unbodied_routine_sql(); to's made again with the rest)
+		 */
+		if (f->kind == 'f' && !is_aggregate(f) &&
+			(going_users != NIL || retyped != NIL))
+		{
+			Oid			proc = routine_oid(f);
+
+			/*
+			 * (one whose arguments or result are a row type that goes:
+			 * dropped, as its signature can't stay, and made again as to
+			 * defines it, its owner, privileges and comment given back)
+			 */
+			if (list_member_oid(retyped, proc))
+			{
+				unbodied = lappend(unbodied, drop_routine_sql(f));
+				if (t)
+				{
+					dropped_routines = lappend(dropped_routines,
+											   note_dropped_routine(f, proc));
+					unkeyed = lappend(unkeyed, f->name);
+					redone = lappend(redone, f->name);
+				}
+				continue;
+			}
+			if (list_member_oid(going_users, proc) && sql_body(f->def) != NULL)
+			{
+				unbodied = lappend(unbodied, unbodied_routine_sql(f));
+				if (t)
+					unkeyed = lappend(unkeyed, f->name);
+			}
+		}
 		if (t && strcmp(t->def, f->def) == 0)
 			continue;
 		switch (f->kind)
@@ -11422,10 +11779,12 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					aggregates_made = lappend(aggregates_made, t->def);
 				continue;
 			}
-			if (f && strcmp(t->def, f->def) == 0)
+			if (f && strcmp(t->def, f->def) == 0 &&
+				!list_has_string(unkeyed, t->name))
 				continue;
 			/* (CREATE OR REPLACE can't change what a routine returns) */
-			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
+			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0 &&
+				!list_has_string(redone, t->name))
 				sm.before = lappend(sm.before, drop_routine_sql(f));
 			/*
 			 * (one with an SQL-standard body is parsed as it's made, so needs
@@ -11433,7 +11792,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			 * move makes: tried with the rest, again after the tables, and
 			 * last with the views, each after those it uses)
 			 */
-			if (strstr(t->def, "\nBEGIN ATOMIC") != NULL || strstr(t->def, "\nRETURN ") != NULL)
+			if (sql_body(t->def) != NULL || list_has_string(redone, t->name))
 				sql_bodies = lappend(sql_bodies, t->def);
 			else
 				sm.before = lappend(sm.before, t->def);
@@ -11510,7 +11869,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * if any changes, or a view or a type they may use does: all of them,
 	 * each after those it uses (one going takes no other with it).
 	 */
-	matviews_change = tm.any || view_drops != NIL || foreign_remade;
+	matviews_change = tm.any || view_drops != NIL || foreign_remade ||
+		going_matviews;
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -11604,6 +11964,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 	places = index_places(from);
 	run_policy_statements(policy_drops);
+	run_statements(unbodied);
 
 	/*
 	 * Rows to go before their columns change type (with every row written
@@ -11640,6 +12001,17 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	make_views(type_drops);
 	run_statements(collation_drops);
 	run_statements(schema_drops);
+
+	/*
+	 * The routines and views not made yet, tried again now, before what
+	 * may call them (the rows written, with their generated columns and
+	 * checks, then indexes, triggers, the checks validated): a routine
+	 * reading a view the move makes again, emptied of its body before,
+	 * is made again here.  What still waits on another is made last.
+	 */
+	sql_bodies = try_until_stuck(list_concat(sql_bodies, views));
+	views = NIL;
+	restore_routines(dropped_routines);
 	CommandCounterIncrement();
 	/* the rows in the caller's memory: what they keep outlives SPI's */
 	{
@@ -11674,7 +12046,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		run_statements(sm.fk_validations);
 	run_statements(links);
 	restore_locality(relinked, to);
-	make_views(list_concat(sql_bodies, views));
+	make_views(sql_bodies);
+	restore_routines(dropped_routines);
 	run_policy_statements(policy_makes);
 	restore_index_places(places);
 	if (as_base)
