@@ -180,6 +180,8 @@
 #prolly_fold_worker_naptime = 200ms     # time between its passes
 #prolly_node_cache_size = 128MB         # decoded chunks, shared by all backends
                                         # (change requires restart)
+#prolly_commit_cache_entries = 4096     # commits whose links all backends keep
+                                        # (change requires restart; 0 turns it off)
 #prolly_value_memo_entries = 8192       # values in versioned tables' TOAST
                                         # relations whose references a fold
                                         # remembers (0 turns it off)

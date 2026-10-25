@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_database.c
- *	  Keeping prolly state in step with CREATE DATABASE.
+ *	  Keeping prolly state in step with CREATE DATABASE and DROP DATABASE.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_database.c
@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_commitcache.h"
 #include "access/prolly_database.h"
 #include "access/prolly_registry.h"
 
@@ -42,6 +43,17 @@ ProllyDropDatabase(Oid dboid)
 
 		if (PROLLY_HAS(r, drop_database))
 			r->drop_database(dboid);
+	}
+	list_free(impls);
+
+	/* (what the commit caches hold of the store dropped goes too) */
+	impls = prolly_list_impls(PROLLY_IFACE_COMMIT_CACHE);
+	foreach(lc, impls)
+	{
+		const ProllyCommitCacheRoutine *r = lfirst(lc);
+
+		if (PROLLY_HAS(r, forget_database))
+			r->forget_database(dboid);
 	}
 	list_free(impls);
 }

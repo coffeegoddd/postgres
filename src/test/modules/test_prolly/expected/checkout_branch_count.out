@@ -1,0 +1,308 @@
+-- A checkout's work doesn't grow with the number of branches: its sweep
+-- reads only the hidden branches (detached/, writer/), and finding a
+-- branch by name looks up that name alone.  So a warm checkout, and
+-- resolving a commit's hash, read as many refs nodes with 600 branches as
+-- with 200 (as many as the refs tree's height, which is the same for
+-- both).  And the sweep still finds the hidden branches among them.
+-- (In a database of its own: other tests' branches would change the
+-- refs tree's height.)
+SELECT current_database() AS home \gset
+CREATE DATABASE checkout_branch_count;
+\c checkout_branch_count
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE FUNCTION pg_temp.work() RETURNS TABLE (counter text, grew int8)
+LANGUAGE sql AS $$
+	SELECT c, pg_temp.since(c)
+	FROM unnest(ARRAY['refs_nodes_read', 'commits_read']) c
+$$;
+CREATE TEMP TABLE runs (branches int, what text, counter text, grew int8);
+-- record(n, what): what the statement before read, with n branches
+CREATE FUNCTION pg_temp.record(n int, what text) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO runs SELECT n, what, counter, grew FROM pg_temp.work()
+$$;
+CREATE SCHEMA cbc VERSIONED;
+CREATE TABLE cbc.t (id int PRIMARY KEY);
+INSERT INTO cbc.t VALUES (1);
+SELECT (dolt_commit('-Am', 'cbc'))[1] AS head \gset
+SELECT dolt_branch('cbc_a') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT count(dolt_branch('cbc_many_' || g)) AS made
+FROM generate_series(1, 199) g;
+ made 
+------
+  199
+(1 row)
+
+-- (cbc_a used once: what follows are switches; and the commit resolved
+-- once, so that the commit cache has it in both measurements)
+SELECT (dolt_checkout('cbc_a'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+-- A checkout to cbc_a and back, and resolving the commit by its hash.
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) >= 0 AS reset FROM pg_temp.work();
+ reset 
+-------
+ t
+(1 row)
+
+SELECT (dolt_checkout('cbc_a'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(200, 'checkout');
+ record 
+--------
+ 
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(200, 'checkout back');
+ record 
+--------
+ 
+(1 row)
+
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(200, 'resolve hash');
+ record 
+--------
+ 
+(1 row)
+
+-- 400 more, and the same again.
+SELECT count(dolt_branch('cbc_many_' || g)) AS made
+FROM generate_series(200, 599) g;
+ made 
+------
+  400
+(1 row)
+
+SELECT (dolt_checkout('cbc_a'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) >= 0 AS reset FROM pg_temp.work();
+ reset 
+-------
+ t
+(1 row)
+
+SELECT (dolt_checkout('cbc_a'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(600, 'checkout');
+ record 
+--------
+ 
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(600, 'checkout back');
+ record 
+--------
+ 
+(1 row)
+
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.record(600, 'resolve hash');
+ record 
+--------
+ 
+(1 row)
+
+-- The same work with 400 more branches.
+SELECT what, counter, a.grew = b.grew AS same, a.grew <= 16 AS bounded
+FROM runs a JOIN runs b USING (what, counter)
+WHERE a.branches = 200 AND b.branches = 600
+ORDER BY what, counter;
+     what      |     counter     | same | bounded 
+---------------+-----------------+------+---------
+ checkout      | commits_read    | t    | t
+ checkout      | refs_nodes_read | t    | t
+ checkout back | commits_read    | t    | t
+ checkout back | refs_nodes_read | t    | t
+ resolve hash  | commits_read    | t    | t
+ resolve hash  | refs_nodes_read | t    | t
+(6 rows)
+
+-- Among the 600, the sweep still finds the hidden branches: a commit's
+-- (none kept: let go of once left) and a writer's done with.
+SET prolly.kept_checkouts = 0;
+SELECT (dolt_checkout(:'head'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT count(*) AS detached FROM pg_branch WHERE brname LIKE 'detached/%';
+ detached 
+----------
+        1
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT count(*) AS detached FROM pg_branch WHERE brname LIKE 'detached/%';
+ detached 
+----------
+        0
+(1 row)
+
+RESET prolly.kept_checkouts;
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'cbcw';
+INSERT INTO cbc.t VALUES (2);
+NOTICE:  writing on branch "writer/cbcw/main"
+DETAIL:  Branch "main" is protected.
+HINT:  Integrate the writes with dolt_integrate('-m', ...).
+SELECT active_branch();
+  active_branch   
+------------------
+ writer/cbcw/main
+(1 row)
+
+SELECT (dolt_integrate('-m', 'cbcw''s'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT (dolt_checkout('main'))[1];
+ dolt_checkout 
+---------------
+ 0
+(1 row)
+
+SELECT count(*) AS writer_branches FROM dolt_branches() WHERE kind = 'writer';
+ writer_branches 
+-----------------
+               0
+(1 row)
+
+RESET dolt.writer;
+\c :home
+DROP DATABASE checkout_branch_count;

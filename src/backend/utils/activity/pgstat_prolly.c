@@ -163,6 +163,12 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_REFS_NODES_WRITTEN] = "refs_nodes_written",
 	[PGSTAT_PROLLY_BMAP_REFCOUNT_READS] = "bmap_refcount_reads",
 	[PGSTAT_PROLLY_STATUS_FROM_FOLD] = "status_from_fold",
+	[PGSTAT_PROLLY_COMMIT_CACHE_HITS] = "commit_cache_hits",
+	[PGSTAT_PROLLY_COMMIT_CACHE_MISSES] = "commit_cache_misses",
+	[PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED] = "bmap_store_syncs_asked",
+	[PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN] = "bmap_store_syncs_asked_no_own",
+	[PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED] = "bmap_store_syncs_skipped",
+	[PGSTAT_PROLLY_BMAP_STORE_SYNCS] = "bmap_store_syncs",
 };
 
 /*

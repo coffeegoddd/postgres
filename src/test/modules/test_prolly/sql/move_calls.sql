@@ -149,8 +149,10 @@ SELECT * FROM mc.dt;
 -- the superuser's PL/pgSQL routine calling alice's SQL one, its plans
 -- cached before the merge (alice's inlined into them, its call set up
 -- unhooked): in an earlier transaction, and in the merge's own, both are
--- planned again as the merge begins, so alice's runs as alice
-CREATE FUNCTION mc_pub.su_simple(v int) RETURNS bool LANGUAGE plpgsql AS $$
+-- planned again as the merge begins, so alice's runs as alice (its own
+-- search_path, so the move's restricted one doesn't replan it anyway)
+CREATE FUNCTION mc_pub.su_simple(v int) RETURNS bool LANGUAGE plpgsql
+	SET search_path = mc_pub, pg_catalog AS $$
 DECLARE r bool;
 BEGIN
 	r := mc_pub.is_alice(v);
