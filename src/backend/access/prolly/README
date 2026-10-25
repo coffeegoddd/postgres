@@ -427,13 +427,19 @@ another's table, under its grants:
   name it (the canonicalizer's prolly_owned_objects() and
   prolly_owned_routines()).  Its routines and types are stored once under
   their lines' hash (refs 'J') and named by it, so a commit that changed
-  none names its parent's entry, and the session works out again only the
-  rows the caches' invalidations say changed.  A type move's statements on
-  the tables using a type run as each table's owner, and the conversion
-  runs the type's code (its input, a domain's checks) over the table's
-  rows: a type move is refused where the type's owner isn't the table's
-  and hasn't that role's privileges, as it would run the type owner's code
-  with more than its own.  A cast is made and dropped as the owner of one
+  none names its parent's entry; one that changed a routine writes a new
+  entry, whose value tree (cut by content) shares all but the chunks
+  around the changed line with the last.  The session works out again
+  only the names the caches' invalidations say may have changed: a
+  routine's row changed, or a type or schema its name or arguments name
+  (by the caches' hash of their OIDs), so a table or temporary table made
+  works out none.  A type move's statements on the tables using a type
+  run as each table's owner; each routine the conversion runs (a domain's
+  check's, a cast's) runs as its own owner (below), so a type owner's code
+  never gets the table owner's authority, however the type is nested (a
+  domain within the table owner's composite or domain).  A domain's check
+  expression itself runs as it does for each row the table's owner writes,
+  as in PostgreSQL.  A cast is made and dropped as the owner of one
   of its types, as CREATE CAST requires (the role moving, if it owns one;
   else an owner whose privileges it has), and refused otherwise.)
 - Every statement a move runs says, as it is made, which object it makes
@@ -441,13 +447,35 @@ another's table, under its grants:
   where the object is its own or no other role's); nothing is read back
   from a statement's text, and makers are found by the whole of an
   object's name, however long (a routine's names every argument).  A
-  statement nothing said this of runs as the role moving, guarded by an
-  object access hook: one that would make, change, drop or empty an
-  object of another role's whose privileges the role has, run such a
-  role's routine, or make an object the move has another maker for, is
-  refused, as an internal error.  So a statement the move fails to
+  statement nothing said this of is refused, as an internal error,
+  whenever the move has makers; in one that has none it runs as the role
+  moving, guarded by an object access hook: one that would make, change,
+  drop or empty an object of another role's whose privileges the role
+  has, run such a role's routine (but an extension's as installed: owned
+  by its extension's owner, the bootstrap superuser or a role with the
+  mover's privileges), or make an object the move has another maker for,
+  is refused, as an internal error.  So a statement the move fails to
   attribute fails closed, never runs with the mover's authority over
   another's object.
+- While a move runs (its statements, row writes and checks:
+  prolly_move_calls_begin()), every routine called that isn't the
+  system's (an OID below FirstNormalObjectId) runs as its owner under
+  SECURITY_RESTRICTED_OPERATION, as a SECURITY DEFINER routine would, with
+  search_path pg_catalog, pg_temp unless it sets its own: through the
+  function manager's hooks (needs_fmgr_hook, fmgr_hook), whatever path
+  calls it, a statement run as a maker or as the mover, a check, default
+  or index expression of the rows written, a domain's check in a
+  conversion, a materialized view's query, another routine.  A routine
+  whose owner has the caller's privileges (the caller's own, a
+  superuser's) runs as the caller, as in PostgreSQL: running it as its
+  owner would give the caller more.  A routine the hook is needed for is
+  never inlined, so an SQL routine's body can't run unseen in the
+  expression calling it; domains' checks the type cache planned before
+  the move are planned again as it begins, and no query or index build
+  of the move runs in parallel workers, which the hooks don't reach.
+  (A routine whose owner and caller have neither's privileges runs as its
+  owner, as SECURITY DEFINER does: its owner's code never runs with the
+  caller's authority.)
 - Every move that makes a table or materialized view from a commit (a
   reset, a table's checkout, a branch's first use, a rebase's end, an
   abort, a stash's push or apply, a merge, a pick, a revert, '--theirs')
