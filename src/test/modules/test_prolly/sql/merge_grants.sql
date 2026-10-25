@@ -313,6 +313,20 @@ SELECT relkind, pg_temp.grants(c.oid) FROM pg_class c
 WHERE relnamespace = 'mg'::regnamespace AND relname LIKE 'odd %' AND relkind <> 'i'
 ORDER BY relkind;
 
+-- Records name relations alike in any session: committed under
+-- quote_all_identifiers, merged without it, the same.
+SELECT dolt_checkout('-b', 'mg_qai') IS NOT NULL AS on_qai;
+SET quote_all_identifiers = on;
+CREATE TABLE mg.qai (id int PRIMARY KEY);
+GRANT SELECT ON mg.qai TO regress_mg_r;
+CREATE SEQUENCE mg.qai_seq;
+GRANT USAGE ON SEQUENCE mg.qai_seq TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'qai')::text) AS committed;
+RESET quote_all_identifiers;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('mg_qai'))[2:2] AS fast_forward;
+SELECT pg_temp.grants('mg.qai'), pg_temp.grants('mg.qai_seq') AS seq_grants;
+
 SELECT dolt_branch('-D', 'mg_ff');
 SELECT dolt_branch('-D', 'mg_m');
 SELECT dolt_branch('-D', 'mg_noff');
@@ -331,7 +345,12 @@ SELECT dolt_branch('-D', 'mg_w2');
 SELECT dolt_branch('-D', 'mg_y');
 SELECT dolt_branch('-D', 'mg_y2');
 SELECT dolt_branch('-D', 'mg_mm2');
+SELECT test_refs_value('Hmg_odd') IS NOT NULL AS has_record;
 SELECT dolt_branch('-D', 'mg_odd');
+SELECT dolt_branch('-D', 'mg_qai');
+-- (a deleted branch's records of its relations go with it)
+SELECT test_refs_value('Hmg_odd') IS NULL AS no_record,
+	   test_refs_value('Nmg_odd') IS NULL AS no_names;
 SELECT dolt_branch('-D', 'mg_mm');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;

@@ -12797,7 +12797,7 @@ has_privileges(char relkind)
 
 /*
  * relation relid's qualified name, as the refs' records of relations write
- * it (quote_qualified_identifier()'s), or NULL
+ * it (prolly_record_relation_name()'s), or NULL
  */
 static char *
 qualified_relation(Oid relid)
@@ -12811,7 +12811,7 @@ qualified_relation(Oid relid)
 		char	   *nsp = get_namespace_name(rel->relnamespace);
 
 		if (nsp != NULL)
-			name = pstrdup(quote_qualified_identifier(nsp, NameStr(rel->relname)));
+			name = prolly_record_relation_name(nsp, NameStr(rel->relname));
 		ReleaseSysCache(tup);
 	}
 	return name;

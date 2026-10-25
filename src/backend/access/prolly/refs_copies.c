@@ -269,7 +269,8 @@
  * 13: branches', tags' and stashes' makers; 14: a maker record's shared
  * dependency id, after its role; 15: the relations commits were made from
  * (names escaped), and relations' equivalence classes under their own tag;
- * 16: a branch's head's other relations with privileges of their own.
+ * 16: a branch's head's other relations with privileges of their own, and
+ * every record's relation names quoted as with quote_all_identifiers off.
  */
 #define REFS_FORMAT		"16"
 
@@ -4586,6 +4587,31 @@ bad:
 }
 
 /*
+ * A relation's qualified name as the records of relations write it, and
+ * as commits name tables: quote_qualified_identifier()'s with
+ * quote_all_identifiers off, whatever the session's setting, so a record
+ * written in one session matches a name looked up in another.
+ */
+char *
+prolly_record_relation_name(const char *nspname, const char *relname)
+{
+	bool		save = quote_all_identifiers;
+	char	   *name;
+
+	quote_all_identifiers = false;
+	PG_TRY();
+	{
+		name = pstrdup(quote_qualified_identifier(nspname, relname));
+	}
+	PG_FINALLY();
+	{
+		quote_all_identifiers = save;
+	}
+	PG_END_TRY();
+	return name;
+}
+
+/*
  * The session's prolly tables, each a relation_line(), by relid: as the
  * branch's catalog names them now.
  */
@@ -4608,8 +4634,8 @@ table_names(StringInfo out)
 
 			initStringInfo(&line);
 			relation_line(&line, c->oid,
-						  quote_qualified_identifier(get_namespace_name(c->relnamespace),
-													 NameStr(c->relname)));
+						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
+													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
 		}
 	}
@@ -4647,8 +4673,8 @@ privileged_names(StringInfo out)
 
 			initStringInfo(&line);
 			relation_line(&line, c->oid,
-						  quote_qualified_identifier(get_namespace_name(c->relnamespace),
-													 NameStr(c->relname)));
+						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
+													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
 		}
 	}
@@ -5110,7 +5136,7 @@ copy_head_records(const char *from, const char *to, const ProllyHash *head)
 /*
  * The relation (*relid) that branch's records of its head's relations list
  * under the qualified name name, and the commit they are of (*at).  name is
- * written as the records write it, quote_qualified_identifier()'s, and
+ * written as the records write it, prolly_record_relation_name()'s, and
  * compared with each line's name unescaped (relation_lines()), so a name
  * of any characters matches itself.
  */
@@ -5330,8 +5356,8 @@ copies_anchor_identity(const ProllyValue *identity)
 static bool
 named_as_at_head(List *at_head, Relation rel)
 {
-	char	   *name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-												  RelationGetRelationName(rel));
+	char	   *name = prolly_record_relation_name(get_namespace_name(RelationGetNamespace(rel)),
+												   RelationGetRelationName(rel));
 	ListCell   *lc;
 
 	foreach(lc, at_head)
@@ -5576,6 +5602,9 @@ copies_branch_delete(const char *name, bool force)
 		violations_clear(name);
 		resetStringInfo(&key);
 		names_key(&key, name);
+		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
+		privileged_key(&key, name);
 		refs_put(key.data, key.len, NULL);
 		resetStringInfo(&key);
 		appendStringInfoChar(&key, TAG_REBASE);

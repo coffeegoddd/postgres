@@ -315,9 +315,11 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 16: each table's OID and qualified name, a line each, the name's
+format 15: each table's OID and qualified name, a line each, the name's
 backslashes and newlines escaped so that no name makes a line of its
-own; read strictly, a damaged record refused), and a version is the
+own, and since format 16 quoted as with quote_all_identifiers off in any
+session, as commits name tables; read strictly, a damaged record
+refused), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as

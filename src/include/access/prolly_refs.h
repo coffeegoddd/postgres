@@ -747,7 +747,7 @@ typedef struct ProllyRefsRoutine
 	 * Optional: the relation (*relid) that branch's records of its head's
 	 * relations (its tables, and its other relations with privileges of
 	 * their own), made by its last commit, list under the qualified name
-	 * name (quote_qualified_identifier()'s), and that commit (*at); false
+	 * name (prolly_record_relation_name()'s), and that commit (*at); false
 	 * if they list none so, or there is none.  A relation of the branch
 	 * now of that name and another OID was made since: it isn't the one
 	 * the commit's object was made from.
@@ -844,6 +844,13 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
  * relation of the class its first parent's record lists.
  */
 extern PGDLLIMPORT List *prolly_commit_local_tables;
+
+/*
+ * A relation's qualified name as the refs' records of relations write it:
+ * quoted as needed with quote_all_identifiers off, in any session.
+ */
+extern char *prolly_record_relation_name(const char *nspname,
+										 const char *relname);
 
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \

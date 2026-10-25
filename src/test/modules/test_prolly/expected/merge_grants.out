@@ -935,6 +935,44 @@ ORDER BY relkind;
  v       | regress_mg_w SELECT
 (2 rows)
 
+-- Records name relations alike in any session: committed under
+-- quote_all_identifiers, merged without it, the same.
+SELECT dolt_checkout('-b', 'mg_qai') IS NOT NULL AS on_qai;
+ on_qai 
+--------
+ t
+(1 row)
+
+SET quote_all_identifiers = on;
+CREATE TABLE mg.qai (id int PRIMARY KEY);
+GRANT SELECT ON mg.qai TO regress_mg_r;
+CREATE SEQUENCE mg.qai_seq;
+GRANT USAGE ON SEQUENCE mg.qai_seq TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'qai')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+RESET quote_all_identifiers;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('mg_qai'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {1}
+(1 row)
+
+SELECT pg_temp.grants('mg.qai'), pg_temp.grants('mg.qai_seq') AS seq_grants;
+       grants        |     seq_grants     
+---------------------+--------------------
+ regress_mg_r SELECT | regress_mg_w USAGE
+(1 row)
+
 SELECT dolt_branch('-D', 'mg_ff');
  dolt_branch 
 -------------
@@ -1043,10 +1081,30 @@ SELECT dolt_branch('-D', 'mg_mm2');
  {0}
 (1 row)
 
+SELECT test_refs_value('Hmg_odd') IS NOT NULL AS has_record;
+ has_record 
+------------
+ t
+(1 row)
+
 SELECT dolt_branch('-D', 'mg_odd');
  dolt_branch 
 -------------
  {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_qai');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (a deleted branch's records of its relations go with it)
+SELECT test_refs_value('Hmg_odd') IS NULL AS no_record,
+	   test_refs_value('Nmg_odd') IS NULL AS no_names;
+ no_record | no_names 
+-----------+----------
+ t         | t
 (1 row)
 
 SELECT dolt_branch('-D', 'mg_mm');
@@ -1056,7 +1114,7 @@ SELECT dolt_branch('-D', 'mg_mm');
 (1 row)
 
 DROP SCHEMA mg CASCADE;
-NOTICE:  drop cascades to 25 other objects
+NOTICE:  drop cascades to 27 other objects
 DETAIL:  drop cascades to table mg.t
 drop cascades to table mg.n
 drop cascades to table mg.o
@@ -1081,6 +1139,8 @@ drop cascades to table mg.made
 drop cascades to table mg.made2
 drop cascades to table mg."odd ""name""\ 
 x"
+drop cascades to sequence mg.qai_seq
+drop cascades to table mg.qai
 drop cascades to table mg.audited
 drop cascades to view mg."odd ""view""\ 
 x"
