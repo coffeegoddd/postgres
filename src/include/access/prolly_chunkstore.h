@@ -115,7 +115,8 @@
  *   visits the chunks told of since it began (false: too many to
  *   remember, and the collector must keep every chunk collected).  keep()
  *   fails (a serialization failure) if a swap dropped the chunk before it
- *   was told.
+ *   was told.  During recovery keep() does nothing: a hot standby writes no
+ *   table and runs no collection, and its reads assign no transaction id.
  * - A collection never waits for a prepared transaction, which may stay
  *   for days: gc_new() keeps as roots the chunks one appended to the
  *   segments collected, and gc_retire() doesn't wait for one running at

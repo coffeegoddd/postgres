@@ -299,8 +299,12 @@ version's columns under the names the working set gives the same columns.
 Diffs read its tables that way too, and a summary (the canonicalizer's
 changes()) pairs a table renamed as one renamed table, its rows and
 definition perhaps changed too.  dolt_at and dolt_history_table read a
-version's table by its name, as Dolt's AS OF and history do.  Tables
-alike but unrelated are never paired.  The canonicalizer's renames()
+version's table by its name, as Dolt's AS OF and history do.  These
+reads write nothing and assign no transaction id, so a hot standby serves
+them as its primary does: a long value read from history is handed out as
+a hash pointer without the chunk store's keep(), which only a transaction
+that can write a table needs.  Tables alike but unrelated are never
+paired.  The canonicalizer's renames()
 works out the renames and rename_description() applies them in memory,
 so nothing is written.  A merge names base, ours and theirs as one, using
 merge_renames().  An

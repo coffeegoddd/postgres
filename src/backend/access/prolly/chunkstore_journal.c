@@ -1674,12 +1674,26 @@ touches(JournalShared *js)
 static void
 journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 {
-	JournalShared *js = shared();
-	KeepTouch  *t = &touches(js)[MyProcNumber];
-	TransactionId xid = GetTopTransactionId();
-	uint64		begun = pg_atomic_read_u64(&js->keeps_begun);
+	JournalShared *js;
+	KeepTouch  *t;
+	TransactionId xid;
+	uint64		begun;
 	ProllyHash	key;
 	bool		found;
+
+	/*
+	 * During recovery there is nothing to keep: a hot standby's
+	 * transaction writes no table a pointer could be put in, and no
+	 * collection runs here (one writes the store).  So a read that hands
+	 * out a pointer (a history row's long value) asks for no transaction
+	 * id, which a standby can't assign.
+	 */
+	if (RecoveryInProgress())
+		return;
+	js = shared();
+	t = &touches(js)[MyProcNumber];
+	xid = GetTopTransactionId();
+	begun = pg_atomic_read_u64(&js->keeps_begun);
 
 	/*
 	 * Told already in this transaction, and no keep set begun since: the
