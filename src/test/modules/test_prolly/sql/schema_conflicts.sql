@@ -318,6 +318,9 @@ ALTER TABLE sc.n RENAME TO m;
 ALTER TABLE sc.tmp RENAME TO n;
 ALTER TABLE sc.n ALTER COLUMN v TYPE text;
 SELECT length(dolt_commit('-am', 'sw theirs')::text) AS committed;
+-- (first used from main: from sw_theirs, whose tables swapped names, its
+-- copies would be other tables' relations, made again)
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_checkout('mk_theirs') IS NOT NULL AS on_mk;
 ALTER TABLE sc.m RENAME TO m3;
 ALTER TABLE sc.m3 ALTER COLUMN v TYPE text;

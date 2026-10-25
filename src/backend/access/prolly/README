@@ -345,22 +345,33 @@ class from those commits.  A class outlives its relation's drop: commits
 made from the dropped relation are still read through it, and a branch's
 copy of the relation, of the same OID, may still be in use.  So a
 relation given a dropped relation's OID again (after the OID counter
-wraps) is of the dropped relation's class, and reads its versions.  A move (a hard
-reset, a merge or pull, a cherry-pick, a revert) or a branch's first use
-that changes a table's version to one a commit made here holds of another
-table (its record lists no relation of the table's class) makes the table
-again: a relation and a class of its own, the mover's (a first use's, the
-branch owner's), with no grants (prolly_remake_foreign_versions(), through
-the canonicalizer's move with prolly_move_remade).  The rows are as the
-move left them, and a commit the move made is recorded made from the new
-relation.  So the old table's rows don't land in the new table's
-relation, under its grants: its grants must be given again, to whom
-they're for.  The mover needs what dropping and making the table takes
-(its owner's privileges, CREATE on its schema).  What the records can't:
-a version of a commit made elsewhere (fetched, cloned, pushed: no record)
-keeps the relation and its grants, so an old table's version come back
-from a remote can land its rows in the table here (its history stays
-refused).
+wraps) is of the dropped relation's class, and reads its versions.  Every
+move that brings a commit's table versions into the working set (a hard
+reset, a merge or pull, an integration, a cherry-pick, a rebase's picks, a
+revert, a table's checkout from a commit, a stash's pop or apply, a
+conflict's resolution with the other side's rows, a merge's or reset's
+abort), a branch's first use, and a push's move of a branch, run as one
+(VERSION_MOVE() in prolly_dolt.c, the refs' first use and branch move):
+where the move changes a table's version to one that a commit it takes
+versions from, made here, records under the table's name as made from a
+relation of another class, the table is made again
+(prolly_remake_foreign_versions(), through the canonicalizer's move with
+prolly_move_remade): a relation of its own with no grants, the mover's
+(a first use's: made as the table's owner, the least role that may,
+restricted, and given to the branch's owner).  A mover who can't drop and
+make the table (its ownership, CREATE on its schema) is refused, saying
+so.  A table that holds the version whole (a reset's, a table's
+checkout's, a first use's) is of the class of the relation the version is
+of, so a later move to it (a reset that discards changes) keeps the
+relation and its grants; one that holds a mix (a merge's, a pick's) is a
+class of its own.  The rows are as the move left them, a commit the move
+made is recorded made from the new relation, and a merge's conflicts in
+the table are of it.  So another table's rows don't land in a relation
+under its grants: they must be given again, to whom they're for.  What
+the records can't: a version of a commit made elsewhere (fetched, cloned,
+pushed: no record) keeps the relation and its grants, so an old table's
+version come back from a remote can land its rows in the table here (its
+history stays refused).
 A refused read reads each commit's record about once: a walk that meets
 nothing marks the commits it saw apart.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and

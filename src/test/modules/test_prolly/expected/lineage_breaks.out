@@ -436,21 +436,33 @@ SELECT count(*) AS rows_now FROM ln.t;
         4
 (1 row)
 
--- (the merge brought in versions of the old table's relation, so it made
--- the table again, a relation of its own: main's history before it is
--- another relation's now, and is refused)
+-- (k3's merge of main made its table again, a relation of its own, and
+-- main's merge of k3 brought in k3's version whole, so it made main's
+-- table again, of k3's table's class: k3's merge reads, as main's table
+-- holds its rows; main's history before it is another relation's now, and
+-- is refused)
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
 DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
-ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
-HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+ id |       note       
+----+------------------
+  2 | old secret, kept
+ 10 | public
+ 11 | public, side
+ 12 | public, main
+(4 rows)
+
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
-ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
-HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+ id |       note       
+----+------------------
+  2 | old secret, kept
+ 10 | public
+ 11 | public, side
+ 12 | public, main
+(4 rows)
+
 RESET ROLE;
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
  back 

@@ -2403,7 +2403,7 @@ move_settled_remade(void *arg)
 	}
 	PG_END_TRY();
 	if (had)
-		prolly_remake_foreign_versions(&before, &ms->head, 1, NULL);
+		prolly_remake_foreign_versions(&before, &ms->head, 1, NULL, InvalidOid);
 }
 
 /*
@@ -3831,8 +3831,10 @@ done:
  * A first use's move (move_copies()), then its tables whose copies are of
  * another table than its head was made from made again, relations of their
  * own (prolly_remake_foreign_versions()): the copies are of the nearest
- * source's relations, whatever commit they are moved to.  Made as the
- * branch's owner, whose branch it is, not as whoever first used it.
+ * source's relations, whatever commit they are moved to.  Made as each
+ * table's owner, the least role that may (whoever first uses the branch,
+ * and whatever its owner may), and given to the branch's owner, whose
+ * branch it is.
  */
 static void
 move_copies_remade(void *arg)
@@ -3840,25 +3842,12 @@ move_copies_remade(void *arg)
 	MoveCopies *mc = arg;
 	ProllyNodeRef before;
 	bool		had;
-	Oid			save_user;
-	int			save_sec;
 
 	had = prolly_versions_may_be_foreign(&mc->head, 1) &&
 		copies_working_set(NULL, &before);
 	move_copies(arg);
-	if (!had)
-		return;
-	GetUserIdAndSecContext(&save_user, &save_sec);
-	SetUserIdAndSecContext(mc->owner, save_sec | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		prolly_remake_foreign_versions(&before, &mc->head, 1, NULL);
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(save_user, save_sec);
-	}
-	PG_END_TRY();
+	if (had)
+		prolly_remake_foreign_versions(&before, &mc->head, 1, NULL, mc->owner);
 }
 
 static void
@@ -8336,6 +8325,15 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 		identify_working(InvalidOid, &identity, NULL);
 		write_commit(&root->hash, &head, 1, prolly_commit_author(),
 					 psprintf("WIP on %s", branch), &identity, stash);
+	}
+	/* (made of the working set, its relations: a pop tells them apart) */
+	{
+		StringInfoData lines;
+
+		initStringInfo(&lines);
+		table_names(&lines);
+		note_relations(stash, lines.data);
+		pfree(lines.data);
 	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
