@@ -1,11 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A hard reset or a first checkout whose shares and snapshots skip their
-# flush and page-store sync (they hold no block of their own, and the store
-# is durable already) leave nothing recovery can't rebuild: a crash right
-# after either, with a dirty working set elsewhere, then recovery, leaves
-# every branch's tables as they were.  Then the same again with the pages
-# written out and the cache cold, so the reads are of the page store.
+# A hard reset or a first checkout, at wal_level minimal, syncs no page
+# store: its shares and snapshots log images of their own blocks, and skip
+# their flush when they hold none.  They leave nothing recovery can't
+# rebuild: a crash right after either, with a dirty working set elsewhere,
+# then recovery, leaves every branch's tables as they were.  Then the same
+# again with the pages written out and the cache cold, so the reads are of
+# the page store.
 
 use strict;
 use warnings FATAL => 'all';
@@ -55,8 +56,7 @@ sub on_branch
 
 my $clean = on_branch('main');
 
-# A crash, and recovery; then a hard reset of a dirty set, which syncs the
-# page store (its first sync since the start), so the next can skip theirs.
+# A crash, and recovery; then a hard reset of a dirty set.
 sub crash
 {
 	$node->stop('immediate');
@@ -69,8 +69,8 @@ sub warm_up
 	sql(q{SELECT dolt_reset('--hard')});
 }
 
-# Each case: a dirty working set, an operation skipping its syncs, and an
-# immediate stop right after it.
+# Each case: a dirty working set, an operation, and an immediate stop right
+# after it.
 for my $cold (0, 1)
 {
 	my $how = $cold ? 'with the pages written out first' : 'with dirty buffers';
@@ -79,12 +79,7 @@ for my $cold (0, 1)
 	sql($dirty);
 	sql($dirty) if $cold;
 	sql('CHECKPOINT') if $cold;
-	my $skipped = sql(q{
-		CREATE TEMP TABLE before AS SELECT * FROM test_prolly_session_stats();
-		SELECT dolt_reset('--hard');
-		SELECT s.value - b.value FROM test_prolly_session_stats() s
-		JOIN before b USING (name) WHERE s.name = 'bmap_store_syncs'});
-	like($skipped, qr/^0$/m, "the hard reset skipped the sync, $how");
+	sql(q{SELECT dolt_reset('--hard')});
 	crash();
 	is(on_branch('main'), $clean,
 		"after a crash, the hard reset's tables are the commit's, $how");
@@ -98,12 +93,7 @@ for my $cold (0, 1)
 	sql('CHECKPOINT') if $cold;
 	my $branch = $cold ? 'fresh_cold' : 'fresh';
 	sql("SELECT dolt_branch('$branch')");
-	$skipped = sql(qq{
-		CREATE TEMP TABLE before AS SELECT * FROM test_prolly_session_stats();
-		SELECT dolt_checkout('$branch');
-		SELECT s.value - b.value FROM test_prolly_session_stats() s
-		JOIN before b USING (name) WHERE s.name = 'bmap_store_syncs'});
-	like($skipped, qr/^0$/m, "the first checkout skipped the sync, $how");
+	sql(qq{SELECT dolt_checkout('$branch')});
 	crash();
 	is(on_branch($branch), $clean,
 		"after a crash, the checked-out branch has the commit's rows, $how");

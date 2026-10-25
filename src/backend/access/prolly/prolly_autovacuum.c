@@ -195,14 +195,6 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
-	DefineCustomBoolVariable("prolly.debug_skip_store_sync",
-							 "Skips the page-store syncs that shares and snapshots of block-mapped storage ask for.  Unsafe: for measurement only.",
-							 "A crash of the machine (not only of the server) can then lose pages that a committed branch, checkout or reset relies on.  Measures what those syncs cost.",
-							 &bmap_debug_skip_store_sync,
-							 false,
-							 PGC_SUSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.kept_commits",
 							"How many of the commits each branch was last at its pages are kept as of.",
 							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",

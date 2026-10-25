@@ -773,6 +773,13 @@ ALTER TABLE adds a TOAST relation.  The TOAST relation will skip WAL, while
 the table owning it will not.  ALTER TABLE SET TABLESPACE will cause a table
 to skip WAL, but that won't affect its indexes.
 
+Block-mapped storage (storage/smgr/bmap.c) skips WAL the same way, but at
+commit its pages are always logged as full-page images, whatever
+wal_skip_threshold says, never only fsynced: its page store is one file
+that many relations' blocks share and that a sweep may shorten, and replay
+of a block's earlier holders' records could overwrite or cut what an fsync
+alone made durable.
+
 
 Asynchronous Commit
 -------------------

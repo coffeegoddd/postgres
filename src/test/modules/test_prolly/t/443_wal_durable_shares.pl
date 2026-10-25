@@ -1,14 +1,13 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# At a WAL level for backups, a share or a kept snapshot of block-mapped
-# storage is made durable by WAL: each block it shares that was its own is
-# logged as an image first, and its write is synced by the next checkpoint,
-# as any page's.  So it doesn't sync the database's page store (#947), and
-# its record says the images were logged.  A write the machine lost (the
-# block zeroed, as an unsynced write may be after a crash of the machine)
-# is rebuilt by recovery from the image, even once the server comes back at
-# wal_level minimal; after a checkpoint the block was synced by it.  At
-# minimal, the store is synced as before.
+# At every WAL level, a share or a kept snapshot of block-mapped storage is
+# made durable by WAL: each block it shares that was its own is logged as
+# an image first, and its write is synced by the next checkpoint, as any
+# page's.  So it doesn't sync the database's page store, and its record
+# says the images were logged.  A write the machine lost (the block zeroed,
+# as an unsynced write may be after a crash of the machine) is rebuilt by
+# recovery from the image, whichever level the WAL was written and is
+# replayed at; after a checkpoint the block was synced by it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -35,19 +34,19 @@ sql(q{
 	SELECT dolt_commit('-Am', 'base');
 });
 
-# The page-store syncs a session's statement 'op' ran, after 'setup'.
-sub syncs_of
+# The WAL a session's statement 'op' wrote, after 'setup': the PRESERVE
+# images and the BlockMap records saying images were logged.
+sub logged_by
 {
 	my ($setup, $op) = @_;
-	my $out = sql(qq{
-		$setup;
-		CREATE TEMP TABLE before AS SELECT * FROM test_prolly_session_stats();
-		$op;
-		SELECT 'syncs=' || (s.value - b.value)
-		FROM test_prolly_session_stats() s JOIN before b USING (name)
-		WHERE s.name = 'bmap_store_syncs';
-	});
-	return ($out =~ /^syncs=(\d+)$/m)[0];
+	sql($setup);
+	my $start = sql(q{SELECT pg_current_wal_insert_lsn()});
+	sql($op);
+	my $end = sql(q{SELECT pg_current_wal_insert_lsn()});
+	return sql(qq{SELECT count(*) FILTER (WHERE record_type = 'PRESERVE') > 0
+			AND count(*) FILTER (WHERE description LIKE '%(images logged)%') > 0
+		FROM pg_get_wal_records_info('$start', '$end')
+		WHERE resource_manager = 'BlockMap'});
 }
 
 my $contents = q{SELECT count(*), sum(v), sum(length(pad)) FROM app.t};
@@ -78,13 +77,11 @@ sub blocks_of
 		WHERE $where AND m.blkno = (t.ctid::text::point)[0]});
 }
 
-# A commit keeps snapshots holding blocks of their own: no sync, and the
-# records say their images were logged.
+# A commit keeps snapshots holding blocks of their own: the records say
+# their images were logged.
+sql(q{UPDATE app.t SET v = v + 1 WHERE id % 10 = 0});
 my $start = sql(q{SELECT pg_current_wal_insert_lsn()});
-is( syncs_of(
-		q{UPDATE app.t SET v = v + 1 WHERE id % 10 = 0},
-		q{SELECT dolt_commit('-am', 'c1')}),
-	'0', 'a commit keeping pages changed since syncs no page store');
+sql(q{SELECT dolt_commit('-am', 'c1')});
 my $end = sql(q{SELECT pg_current_wal_insert_lsn()});
 ok( sql(qq{SELECT count(*) > 0 AND bool_and(description LIKE '%(images logged)%')
 		FROM pg_get_wal_records_info('$start', '$end')
@@ -94,14 +91,11 @@ ok( sql(qq{SELECT count(*) > 0 FROM pg_get_wal_records_info('$start', '$end')
 		WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'}) eq 't',
 	'and the images are there');
 
-# A share of a relation with blocks of its own: none either.
+# A share of a relation with blocks of its own: the same.
 sql(q{SET debug_block_mapped_heap = on;
 	CREATE TABLE plain (a int, b text);
 	INSERT INTO plain SELECT g, repeat('p', 200) FROM generate_series(1, 2000) g});
 my $plain = sql(q{SELECT pg_relation_filenode('plain')});
-is(syncs_of(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 0},
-		qq{SELECT test_bmap_share($plain)}),
-	'0', 'a share of pages its own syncs no page store');
 sql(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 2});
 my $digest = sql(qq{SELECT test_bmap_rows_digest($plain)});
 $start = sql(q{SELECT pg_current_wal_insert_lsn()});
@@ -112,9 +106,9 @@ is(sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$start', '$end')
 	'1', 'the share\'s record says the images were logged');
 is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'the share reads the source\'s rows');
-is(syncs_of(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 1},
+is(logged_by(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 1},
 		qq{SELECT test_bmap_snapshot_take($plain)}),
-	'0', 'nor does a snapshot taken on its own');
+	't', 'and a snapshot taken on its own logs its images too');
 
 # The buffers of relation file number 'rel' written out and evicted: its
 # map with them, so that recovery skips the records of pages from before
@@ -196,21 +190,27 @@ is(sql($contents), $c3, 'after a checkpoint and a crash, the commit\'s pages');
 # Logged at replica, recovered at minimal: redo goes by the record.
 lose_kept(13, 'logged at replica, recovered at minimal',
 	"wal_level = minimal\nmax_wal_senders = 0\nmax_replication_slots = 0");
-is( syncs_of(
+
+# At minimal too, a commit keeping pages logs their images, and lost writes
+# come back from them.
+is( logged_by(
 		q{UPDATE app.t SET v = v + 1 WHERE id % 10 = 0},
 		q{SELECT dolt_commit('-am', 'c5')}),
-	'1', 'at minimal, a commit keeping pages syncs the page store');
+	't', 'at minimal, a commit keeping pages logs their images');
+lose_kept(17, 'logged and recovered at minimal');
 my $c5 = sql($contents);
 
-# Logged at minimal (no images), recovered at replica: redo writes the
-# snapshot's own pages out, walking its leaves.
+# Logged at minimal, recovered at replica: redo syncs nothing.
 $log_offset = -s $node->logfile;
+sql(q{UPDATE app.t SET v = v + 1 WHERE id % 19 = 0;
+	SELECT dolt_commit('-am', 'c6')});
+$c5 = sql($contents);
 $node->stop('immediate');
 $node->append_conf('postgresql.conf', "wal_level = replica\nmax_wal_senders = 10");
 $node->start;
 is(sql($contents), $c5, 'WAL written at minimal recovers at replica');
-ok($node->log_contains('redo of a snapshot of .* writes out its own pages', $log_offset),
-	'redo of a snapshot logged at minimal writes out its own pages');
+ok($node->log_contains('redo of a snapshot of .* syncs nothing: its own pages were logged as images', $log_offset),
+	'redo of a snapshot logged at minimal syncs nothing');
 like(sql(q{UPDATE app.t SET v = 0; SELECT dolt_reset('--hard');
 	SELECT count(*), sum(v), sum(length(pad)) FROM app.t}),
 	qr/^\Q$c5\E$/m, 'and a hard reset gives back its kept pages');

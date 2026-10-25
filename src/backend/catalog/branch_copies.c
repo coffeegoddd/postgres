@@ -165,8 +165,8 @@ copy_storage(Form_pg_class c)
 
 	/*
 	 * Storage made in this transaction that skips WAL (wal_level minimal; a
-	 * new relation, or one truncated or rewritten) is synced at commit; a
-	 * copy of it would be neither logged nor synced.
+	 * new relation, or one truncated or rewritten) is logged at commit; a
+	 * copy of it would be neither.
 	 */
 	if (RelFileLocatorSkippingWAL(src))
 		ereport(ERROR,
@@ -1597,9 +1597,8 @@ kept_locator(const BranchKeptRelation *k)
  * Snapshots to take, together (bmap_snapshot_take_many(): the generation
  * of sharing raised once, each relation's pages changed since its last
  * snapshot written out, and made durable by the transaction's commit, which
- * the refs naming them commit with: through the images of those pages it
- * logged, or at wal_level minimal each page store synced once as it
- * commits): each one's storage and where its id goes.
+ * the refs naming them commit with, through the images of those pages it
+ * logged): each one's storage and where its id goes.
  */
 typedef struct Taking
 {

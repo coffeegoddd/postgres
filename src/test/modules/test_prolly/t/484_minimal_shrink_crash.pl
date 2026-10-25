@@ -1,0 +1,170 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# At wal_level minimal, a crash's replay writes blocks of the page store
+# again before the records that last gave them out: the extensions that
+# gave them to earlier holders zero them, those holders' images and records
+# put their pages there, and a shrink of the store cuts them.  Pages made
+# durable by a sync alone would be lost: a relation's whose writes skip WAL
+# (made and loaded in one transaction), or a kept commit's whose relation's
+# records the replay skips (its storage replaced by a hard reset).  So
+# they are logged as images, after all of those.  Each case writes into
+# blocks an earlier holder had, crashes, and reads every page back.
+use strict;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+use Time::HiRes qw(usleep);
+
+my $node = PostgreSQL::Test::Cluster->new('minimal_shrink_crash');
+$node->init;
+$node->append_conf('postgresql.conf', qq{
+wal_level = minimal
+max_wal_senders = 0
+autovacuum = off
+autovacuum_naptime = 1s
+checkpoint_timeout = '1h'
+prolly.restore_min_changes = 100000000
+});
+$node->start;
+
+# Each case in a database of its own, with a page store of its own.
+my $db;
+
+sub sql { return $node->safe_psql($db, $_[0]); }
+
+sub use_db
+{
+	$db = $_[0];
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	sql(q{CREATE EXTENSION amcheck; CREATE SCHEMA app VERSIONED});
+}
+
+sub store
+{
+	return $node->data_dir . '/base/' .
+	  sql(q{SELECT oid FROM pg_database WHERE datname = current_database()}) . '/9421';
+}
+
+sub crash { $node->stop('immediate'); $node->start; }
+
+
+# Blocks for a shrink to cut: a large table's, dropped and committed.
+sub junk
+{
+	sql(q{CREATE TABLE app.junk (id int PRIMARY KEY, v text);
+		INSERT INTO app.junk SELECT g, repeat('x', 500) FROM generate_series(1, 20000) g;
+		SELECT dolt_commit('-Am', 'junk')});
+	sql(q{DROP TABLE app.junk; SELECT dolt_commit('-Am', 'no junk')});
+}
+
+# Every page of table $t, its index, its change log and the log's index,
+# read: the rows counted by a scan of each, each btree checked.
+sub check
+{
+	my ($t, $what) = @_;
+	my ($ret, $out, $err) = $node->psql($db, qq{
+		SELECT count(*), sum(v) FROM app.$t;
+		SET enable_seqscan = off;
+		SELECT count(*) FROM app.$t WHERE id > 0;
+		RESET enable_seqscan;
+		SELECT bool_and(bt_index_check(i.indexrelid, true) IS NOT NULL)
+			FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE i.indrelid = 'app.$t'::regclass
+			   OR c.relname = 'pg_prolly_log_' || 'app.$t'::regclass::oid || '_index';
+	});
+	is($ret, 0, "$what: every page reads") or diag($err);
+	return $out;
+}
+
+# A table made and loaded in one transaction, its writes skipping WAL, in
+# blocks an explicit sweep's shrink cut.
+use_db('explicit');
+junk();
+sql(q{CHECKPOINT});
+cmp_ok(sql(q{SELECT truncated FROM prolly_page_sweep()}), '>', 0,
+	'the sweep shrinks the page store');
+sql(q{SET wal_skip_threshold = 0; BEGIN;
+	CREATE TABLE app.w (id int PRIMARY KEY, v int NOT NULL);
+	INSERT INTO app.w SELECT g, 1 FROM generate_series(1, 3000) g;
+	COMMIT});
+crash();
+is(check('w', 'a WAL-skipped table after a shrink and a crash'),
+	"3000|3000\n3000\nt", 'its rows');
+
+# The same, with autovacuum's sweep doing the shrink.
+use_db('auto');
+junk();
+sql(q{CHECKPOINT});
+my $store = store();
+my $size = -s $store;
+sql(q{ALTER SYSTEM SET autovacuum = on; SELECT pg_reload_conf()});
+my $shrunk = 0;
+foreach (1 .. $PostgreSQL::Test::Utils::timeout_default * 10)
+{
+	if (-s $store < $size) { $shrunk = 1; last; }
+	usleep(100_000);
+}
+sql(q{ALTER SYSTEM RESET autovacuum; SELECT pg_reload_conf()});
+ok($shrunk, 'autovacuum\'s sweep shrinks the page store');
+sql(q{SET wal_skip_threshold = 0; BEGIN;
+	CREATE TABLE app.a (id int PRIMARY KEY, v int NOT NULL);
+	INSERT INTO app.a SELECT g, 2 FROM generate_series(1, 3000) g;
+	COMMIT});
+crash();
+is(check('a', 'a WAL-skipped table after autovacuum\'s shrink and a crash'),
+	"3000|6000\n3000\nt", 'its rows');
+
+# A kept commit's pages, in blocks a shrink cut: the table's writes are
+# logged, but its storage is replaced by a hard reset, so recovery skips
+# the records that made the kept commit's pages.
+use_db('kept');
+sql(q{CREATE TABLE app.s (id int PRIMARY KEY, v int NOT NULL);
+	SELECT dolt_commit('-Am', 's0')});
+junk();
+sql(q{CHECKPOINT});
+cmp_ok(sql(q{SELECT truncated FROM prolly_page_sweep()}), '>', 0,
+	'the sweep shrinks the page store');
+sql(q{INSERT INTO app.s SELECT g, 3 FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-am', 's1');
+	UPDATE app.s SET v = 4 WHERE id % 7 = 0; SELECT dolt_reset('--hard');
+	UPDATE app.s SET v = 5 WHERE id % 13 = 0});
+crash();
+sql(q{SELECT dolt_reset('--hard')});
+is(check('s', 'a kept commit after a shrink and a crash'),
+	"3000|9000\n3000\nt", 'the commit\'s rows');
+
+# The earlier holder's records after the checkpoint: the dropped table
+# made after it, so its extension and images are replayed into the blocks
+# before the WAL-skipped table's.
+use_db('early');
+sql(q{CHECKPOINT});
+junk();
+cmp_ok(sql(q{SELECT truncated FROM prolly_page_sweep()}), '>', 0,
+	'the sweep shrinks the page store');
+sql(q{SET wal_skip_threshold = 0; BEGIN;
+	CREATE TABLE app.w (id int PRIMARY KEY, v int NOT NULL);
+	INSERT INTO app.w SELECT g, 1 FROM generate_series(1, 3000) g;
+	COMMIT});
+crash();
+is(check('w', 'a WAL-skipped table, the earlier holder after the checkpoint'),
+	"3000|3000\n3000\nt", 'its rows');
+
+# The same for a kept commit's pages, with no sweep: the earlier holder's
+# images replayed after the checkpoint come before the commit's.
+use_db('earlykept');
+sql(q{CREATE TABLE app.s (id int PRIMARY KEY, v int NOT NULL);
+	SELECT dolt_commit('-Am', 's0')});
+sql(q{CHECKPOINT});
+junk();
+sql(q{INSERT INTO app.s SELECT g, 3 FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-am', 's1');
+	UPDATE app.s SET v = 4 WHERE id % 7 = 0; SELECT dolt_reset('--hard');
+	UPDATE app.s SET v = 5 WHERE id % 13 = 0});
+crash();
+sql(q{SELECT dolt_reset('--hard')});
+is(check('s', 'a kept commit, the earlier holder after the checkpoint'),
+	"3000|9000\n3000\nt", 'the commit\'s rows');
+
+$node->stop;
+done_testing();
