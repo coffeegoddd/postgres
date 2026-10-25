@@ -94,7 +94,9 @@ $bg->query_until(qr/start/, qq{\\echo start
 });
 $node->wait_for_event('client backend', 'bmap-snapshot-carried');
 $node->stop('immediate');
-$bg->quit;
+# (its backend gone with the crash: ended without writing to it, as a
+# write to the closed pipe would kill the test)
+eval { $bg->{run}->kill_kill; };
 $node->start;
 is(sql($digest), $dirty, 'after the crash, the working set as it was');
 $restored = counted('relations_restored');
