@@ -8810,7 +8810,15 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	 */
 	if (!hold_relation(rel, &held, true))
 		return;
-	INJECTION_POINT("bmap-shared-below-held", NULL);
+#ifdef USE_INJECTION_POINTS
+	{
+		/* (the relation's file number, for a test to stop at one only) */
+		char		relnumber[16];
+
+		snprintf(relnumber, sizeof(relnumber), "%u", rel.relNumber);
+		INJECTION_POINT("bmap-shared-below-held", relnumber);
+	}
+#endif
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
