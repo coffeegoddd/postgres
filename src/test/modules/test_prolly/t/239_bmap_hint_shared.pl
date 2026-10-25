@@ -102,10 +102,11 @@ $conf
 	my $orel = $sql->(q{SELECT pg_relation_filenode('own')});
 	$sql->('CHECKPOINT');
 	my $digest = q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM own};
-	my $want = $sql->($digest);
+	# (the first read after the checkpoint sets the hints, each page's
+	# image logged first: measured over that read, not a later one, whose
+	# WAL is only what other hints it sets happen to log, a catalog page's)
 	my $lsn = $sql->('SELECT pg_current_wal_insert_lsn()');
-	# (hints set, and the pages written out, a hint's image logged first)
-	$sql->(q{SELECT count(*) FROM own});
+	my $want = $sql->($digest);
 	cmp_ok($dirty->($orel), '>', 0, "$name: hints dirty the relation's own pages");
 	cmp_ok($sql->(qq{SELECT pg_current_wal_insert_lsn() - '$lsn'::pg_lsn}), '>', 8192,
 		"$name: and log their images");
