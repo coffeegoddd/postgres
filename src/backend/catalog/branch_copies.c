@@ -1118,6 +1118,39 @@ copies_branches(BranchVisit visit, void *arg)
 	table_close(brel, AccessShareLock);
 }
 
+/*
+ * The branches named with prefix: an ordered scan of the name index from
+ * prefix, until a name doesn't begin with it (names compare as bytes, as
+ * the index orders them).
+ */
+static void
+copies_branches_named(const char *prefix, BranchVisit visit, void *arg)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	Relation	irel = index_open(BranchNameIndexId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	NameData	start;
+	size_t		len = strlen(prefix);
+
+	namestrcpy(&start, prefix);
+	ScanKeyInit(&key, Anum_pg_branch_brname, BTGreaterEqualStrategyNumber,
+				F_NAMEGE, NameGetDatum(&start));
+	scan = systable_beginscan_ordered(brel, irel, NULL, 1, &key);
+	while ((tup = systable_getnext_ordered(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_branch b = (Form_pg_branch) GETSTRUCT(tup);
+
+		if (strncmp(NameStr(b->brname), prefix, len) != 0)
+			break;
+		visit(NameStr(b->brname), b->oid, arg);
+	}
+	systable_endscan_ordered(scan);
+	index_close(irel, AccessShareLock);
+	table_close(brel, AccessShareLock);
+}
+
 static void
 copies_run_on(const char *name, void (*fn) (void *arg), void *arg)
 {
@@ -2212,6 +2245,7 @@ static const BranchOpsRoutine branch_copies = {
 	.checkout = copies_checkout,
 	.current = copies_current,
 	.branches = copies_branches,
+	.branches_named = copies_branches_named,
 	.run_on = copies_run_on,
 	.share = copies_share,
 	.keep = copies_keep,
