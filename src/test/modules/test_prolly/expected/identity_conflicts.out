@@ -144,12 +144,13 @@ SELECT * FROM dolt_conflicts();
  ic.t       |             1
 (1 row)
 
-SELECT table_name, our_relation = :new_oid AS ours, our_owner,
-	their_table, their_relation = :old_oid AS theirs, their_owner, tree
+SELECT table_name, our_relation = :new_oid AS ours, our_owner = current_user::regrole AS our_owner,
+	their_table, their_relation = :old_oid AS theirs,
+	their_owner = current_user::regrole AS their_owner, tree
 FROM dolt_identity_conflicts();
  table_name | ours | our_owner | their_table | theirs | their_owner | tree 
 ------------+------+-----------+-------------+--------+-------------+------
- ic.t       | t    | postgres  | ic.t        | t      | postgres    |    0
+ ic.t       | t    | t         | ic.t        | t      | t           |    0
 (1 row)
 
 SET LOCAL ROLE regress_ic_reader;

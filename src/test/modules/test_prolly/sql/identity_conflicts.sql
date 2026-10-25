@@ -60,8 +60,9 @@ BEGIN;
 SELECT (dolt_merge('keeps_old'))[2:4] AS merged;
 SELECT * FROM dolt_status;
 SELECT * FROM dolt_conflicts();
-SELECT table_name, our_relation = :new_oid AS ours, our_owner,
-	their_table, their_relation = :old_oid AS theirs, their_owner, tree
+SELECT table_name, our_relation = :new_oid AS ours, our_owner = current_user::regrole AS our_owner,
+	their_table, their_relation = :old_oid AS theirs,
+	their_owner = current_user::regrole AS their_owner, tree
 FROM dolt_identity_conflicts();
 SET LOCAL ROLE regress_ic_reader;
 SELECT * FROM ic.t;
