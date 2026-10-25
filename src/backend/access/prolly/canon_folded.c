@@ -10803,6 +10803,84 @@ writer_base_items(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
+ * Does routine f (from's) use a constraint the move drops?  A routine with
+ * a SQL-standard body may rely on a table's primary key (to group by it,
+ * selecting the columns the key determines), which records a dependency on
+ * the key: the key can't go while the routine is there, so the routine
+ * goes first (and, if to keeps it, is made again with the rest).  A
+ * constraint goes if from's line for it isn't to's, as table moves have
+ * it, or its table goes.
+ */
+static bool
+uses_constraint_going(const MoveItem *f, List *from, List *to)
+{
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	Datum		proc;
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		going = false;
+
+	if (!DirectInputFunctionCallSafe(regprocedurein, f->name, InvalidOid, -1,
+									 (Node *) &escontext, &proc))
+		return false;
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
+				F_OIDEQ, proc);
+	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
+	while (!going && (tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+		HeapTuple	ctup;
+		Form_pg_constraint con;
+		char	   *table;
+		char	   *conname;
+		MoveItem   *ft;
+		MoveItem   *tt;
+		TableDef	ftd;
+		TableDef	ttd;
+		ListCell   *lc;
+
+		if (d->refclassid != ConstraintRelationId)
+			continue;
+		ctup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(d->refobjid));
+		if (!HeapTupleIsValid(ctup))
+			continue;
+		con = (Form_pg_constraint) GETSTRUCT(ctup);
+		if (!OidIsValid(con->conrelid))
+		{
+			ReleaseSysCache(ctup);
+			continue;
+		}
+		table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(con->conrelid)),
+										   get_rel_name(con->conrelid));
+		conname = pstrdup(quote_identifier(NameStr(con->conname)));
+		ReleaseSysCache(ctup);
+		ft = find_item(from, 't', table);
+		if (ft == NULL)
+			continue;
+		tt = find_item(to, 't', table);
+		if (tt == NULL)
+		{
+			going = true;
+			continue;
+		}
+		parse_table_def(ft->def, &ftd);
+		parse_table_def(tt->def, &ttd);
+		foreach(lc, ftd.constraints)
+			if (strcmp(first_field(lfirst(lc)), conname) == 0 &&
+				!list_has_string(ttd.constraints, lfirst(lc)))
+				going = true;
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	return going;
+}
+
+/*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
  * rows(arg), which writes them, then what they must satisfy (the checks,
@@ -10832,6 +10910,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *keyed;
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
+	List	   *unkeyed = NIL;	/* routines kept, gone before a constraint */
 	List	   *foreign_makes = NIL;	/* foreign tables made, after those going */
 	List	   *foreign_alters = NIL;	/* foreign tables changed in place */
 	List	   *foreign_routines = NIL; /* routines using those made again,
@@ -10925,6 +11004,15 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			matview_drops = lappend(matview_drops,
 									psprintf("DROP MATERIALIZED VIEW IF EXISTS %s",
 											 f->name));
+		/* (one using a constraint that goes, before it: see above) */
+		if (f->kind == 'f' && !is_aggregate(f) &&
+			uses_constraint_going(f, from, to))
+		{
+			sm.before = lcons(drop_routine_sql(f), sm.before);
+			if (t)
+				unkeyed = lappend(unkeyed, f->name);
+			continue;
+		}
 		if (t && strcmp(t->def, f->def) == 0)
 			continue;
 		switch (f->kind)
@@ -11243,7 +11331,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 					aggregates_made = lappend(aggregates_made, t->def);
 				continue;
 			}
-			if (f && strcmp(t->def, f->def) == 0)
+			if (f && strcmp(t->def, f->def) == 0 &&
+				!list_has_string(unkeyed, t->name))
 				continue;
 			/* (CREATE OR REPLACE can't change what a routine returns) */
 			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
