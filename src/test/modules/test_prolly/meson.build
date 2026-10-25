@@ -229,6 +229,7 @@ tests += {
       'history_mounts',
       'head_move_privileges',
       'lineage_breaks',
+      'role_makers',
       'writer_definitions',
       'remade_versions',
     ],
@@ -401,6 +402,8 @@ tests += {
       't/336_compared_fold_restart.pl',
       't/337_lock_has_waiters.pl',
       't/360_cleanup_invariance.pl',
+      't/375_role_maker_oid_reuse.pl',
+      't/376_role_maker_races.pl',
     ],
   },
 }

@@ -789,6 +789,20 @@ typedef struct ProllyRefsRoutine
 	void		(*set_relation_class) (Oid relid, Oid cls);
 
 	/*
+	 * Optional, together: each maker the refs record (a branch's, a tag's,
+	 * a stash's) is a shared dependency of its role, as an object's owner
+	 * is (pg_shdepend: classId RefsBranchClassId, RefsTagClassId or
+	 * RefsStashClassId, and an id the record keeps, newMadeObjectId()'s),
+	 * recorded, moved and dropped with the record, by the transaction.
+	 * made_object() finds the object of kind classId whose record has id,
+	 * appending its name (a stash's, its list's) and setting *n to a
+	 * stash's place in its list; false if none has.  stash_set_maker()
+	 * records role as the one that pushed name's nth stash.
+	 */
+	bool		(*made_object) (Oid classId, Oid id, StringInfo name, int *n);
+	void		(*stash_set_maker) (const char *name, int n, Oid role);
+
+	/*
 	 * Optional: record commit as made from relations (as
 	 * commit_relations() gives them): a move that made a commit and then
 	 * made one of its tables again, a relation of its own, says so.
@@ -856,7 +870,7 @@ extern PGDLLIMPORT List *prolly_commit_local_tables;
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", "relation_class", "set_relation_class", \
-	"set_commit_relations", "forget_records"
+	"made_object", "stash_set_maker", "set_commit_relations", "forget_records"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK forget_records
 
