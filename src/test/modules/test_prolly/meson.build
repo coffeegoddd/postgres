@@ -426,6 +426,12 @@ tests += {
       't/447_node_cache.pl',
       't/453_branch_switch_caches.pl',
       't/454_commit_cache.pl',
+      't/441_store_sync_skipped.pl',
+      't/442_store_sync_skip_crash.pl',
+      't/443_wal_durable_shares.pl',
+      't/444_wal_durable_standby.pl',
+      't/445_store_sync_slots.pl',
+      't/446_store_sync_slot_races.pl',
     ],
   },
 }
