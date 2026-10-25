@@ -118,6 +118,16 @@ extern bool prolly_writes_refs(void);
 extern Oid	prolly_branch_owner(const char *name);
 extern bool prolly_may_move_head(const char *name);
 extern void prolly_check_head_move(const char *name);
+
+/*
+ * A merge, cherry-pick, revert or stash apply runs between
+ * prolly_move_begin() and prolly_move_end() (the end in a PG_FINALLY);
+ * inside it, prolly_check_not_moving() refuses a head move, a checkout or
+ * another move (prolly_check_head_move() refuses too).
+ */
+extern void prolly_move_begin(void);
+extern void prolly_move_end(void);
+extern void prolly_check_not_moving(void);
 extern void prolly_check_branch_rename(const char *newname);
 
 /*

@@ -225,6 +225,20 @@ typedef struct BranchOpsRoutine
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept, TimestampTz *wait_start);
+
+	/*
+	 * Optional: add to each of the session branch's relations relids the
+	 * privileges of the relation of branch source at the same place in
+	 * fromids, the one the object a move brought was made from: the
+	 * relation's and each column's (by name), as the relation's owner here
+	 * gives them, and the source relation's owner's own a grant to it.
+	 * For a relation a merge of source, or a pick of its head, made here,
+	 * whose commits hold no privileges.  None for one source
+	 * hasn't, or has now of another kind or name, nor where source is no
+	 * branch with copies.
+	 */
+	void		(*carry_privileges) (const char *source, List *relids,
+									 List *fromids);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

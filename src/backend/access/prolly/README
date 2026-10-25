@@ -316,9 +316,11 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 16: each table's OID and qualified name, a line each, the name's
+format 15: each table's OID and qualified name, a line each, the name's
 backslashes and newlines escaped so that no name makes a line of its
-own; read strictly, a damaged record refused), and a version is the
+own, and since format 16 quoted as with quote_all_identifiers off in any
+session, as commits name tables; read strictly, a damaged record
+refused), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as
@@ -559,6 +561,47 @@ work's); the rows it writes go as the session's role, under its
 privileges.  A writer with its tables' grants alone so moves to what its
 base's writers defined, never to definitions of its own choosing on
 objects it doesn't own.
+
+Commits hold no privileges, so a relation a move makes has only the ones
+its making gives it.  A merge (or fast-forward) of a branch of this
+database, though, gives each relation it makes on the target, one new to
+it (not one made again in the place of one of its name the move dropped),
+the privileges of the source branch's relation it was made from: the
+relation's, and each column's by name, as the new relation's owner (the
+merging role) gives them, with their shared dependencies (branch_ops'
+carry_privileges), added to those its making gave it (the target's
+default privileges).  The source relation's owner keeps its own, as a
+grant to it from the new owner.  The merging role approves them as it
+approves the table.  The relations the move makes and drops are found by
+the object access hook as it runs, so this costs only as much as the move
+changes.
+
+The source's relation is the one the branch's records of its head's
+relations list under the name (quoted and escaped as 'L' records write
+names): its tables' ('N', the record its commits' 'L' records are made
+from) and its other relations' with privileges of their own ('H': views,
+sequences, partitioned and foreign tables), both written by each of its
+commits, and only while the branch's head is their commit.  One of the
+name made since, uncommitted (another relation, perhaps of another
+kind), gives nothing, nor does a branch whose head moved without a
+commit (a fast-forward, a reset).  A branch made from another starts
+with both records, as with its relations, of the same OIDs: its first
+commit's 'L' record so keeps what its start point's had, as a later
+commit's keeps its parent's.  dolt_integrate()
+merges so too.  A cherry-pick of one ref that names a branch (so picks
+its head) takes that branch's privileges alone; one of a commit named
+otherwise (a hash, HEAD~n, several refs) takes none, since the commit
+may be older than any branch's head, whose relation of the name may be
+another made since, and no one branch is its source.  A revert takes
+none: what it makes again, its commit dropped.  A relation merged from
+a remote's ref (a fetch, a pull), a tag or a commit arrives with only
+those its making gives it, as does one a reset makes.  A merge,
+cherry-pick, revert or stash apply runs between prolly_move_begin()
+and prolly_move_end(); inside it (from a function the rows it writes
+call), nothing that moves a head or the working set runs: another of
+them, a reset, a checkout, a commit (prolly_check_not_moving(), which
+prolly_check_head_move() calls too) is refused.  Row security and policies are held in commits, so they arrive
+with the relation whatever its source.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag
