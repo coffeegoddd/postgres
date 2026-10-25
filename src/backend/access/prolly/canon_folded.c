@@ -17305,6 +17305,7 @@ static List *owned_types = NIL;
 static bool owned_routines_known = false;
 static bool owned_names_known = false;
 static bool owned_callbacks = false;
+static uint64 owned_generation = 0;
 
 /*
  * (only flags: an invalidation may come while the lists are read, which
@@ -17413,12 +17414,11 @@ owned_rows(bool proc, List *was)
 /*
  * Each object of the session's branch a commit may hold, other than its
  * prolly tables, partitioned tables and materialized views (which the refs
- * list themselves): its views ('v'), sequences ('S'), foreign tables ('f'),
- * routines ('P'), types ('T'), versioned schemas ('N') and collations
- * ('C'), each emit()ted with its OID, owner, that kind and its name as the
- * commit's items name it (so a move making it finds its recorded owner).
- * Routines and types as last listed where unchanged since (see
- * OwnedObject).
+ * list themselves) and its routines and types (prolly_owned_routines()):
+ * its views ('v'), sequences ('S'), foreign tables ('f'), versioned
+ * schemas ('N') and collations ('C'), each emit()ted with its OID, owner,
+ * that kind and its name as the commit's items name it (so a move making
+ * it finds its recorded owner).
  */
 void
 prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
@@ -17431,34 +17431,6 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 	HeapTuple	tup;
 
 	describing_settings();
-	if (!owned_callbacks)
-	{
-		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
-										  ALLOCSET_DEFAULT_SIZES);
-		CacheRegisterSyscacheCallback(PROCOID, owned_forget, (Datum) 0);
-		CacheRegisterSyscacheCallback(TYPEOID, owned_forget, (Datum) 0);
-		CacheRegisterSyscacheCallback(NAMESPACEOID, owned_forget, (Datum) 0);
-		owned_callbacks = true;
-	}
-	AcceptInvalidationMessages();
-	if (owned_branch != MyBranch || !owned_names_known)
-	{
-		MemoryContextReset(owned_cxt);
-		owned_routines = owned_types = NIL;
-		owned_routines_known = false;
-		owned_branch = MyBranch;
-		owned_names_known = true;
-		PG_TRY();
-		{
-			owned_types = owned_rows(false, NIL);
-		}
-		PG_CATCH();
-		{
-			owned_names_known = false;
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
 	rel = table_open(RelationRelationId, AccessShareLock);
 	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -17483,6 +17455,74 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
+	rel = table_open(NamespaceRelationId, AccessShareLock);
+	scan = catalog_branch_beginscan(rel, MyBranch);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
+
+		if (canon_namespace(ns->oid))
+			emit(ns->oid, ns->nspowner, 'N',
+				 quote_identifier(NameStr(ns->nspname)), arg);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	rel = table_open(CollationRelationId, AccessShareLock);
+	scan = catalog_branch_beginscan(rel, MyBranch);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(tup);
+
+		if (coll->oid < FirstNormalObjectId || !canon_namespace(coll->collnamespace) ||
+			in_extension(CollationRelationId, coll->oid))
+			continue;
+		emit(coll->oid, coll->collowner, 'C',
+			 qualified(coll->collnamespace, NameStr(coll->collname)), arg);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	AtEOXact_GUC(true, save_nestlevel);
+}
+
+bool
+prolly_owned_routines(uint64 *generation,
+					  void (*emit) (Oid oid, Oid owner, char kind,
+									const char *name, void *arg),
+					  void *arg)
+{
+	int			save_nestlevel = NewGUCNestLevel();
+
+	describing_settings();
+	if (!owned_callbacks)
+	{
+		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
+										  ALLOCSET_DEFAULT_SIZES);
+		CacheRegisterSyscacheCallback(PROCOID, owned_forget, (Datum) 0);
+		CacheRegisterSyscacheCallback(TYPEOID, owned_forget, (Datum) 0);
+		CacheRegisterSyscacheCallback(NAMESPACEOID, owned_forget, (Datum) 0);
+		owned_callbacks = true;
+	}
+	AcceptInvalidationMessages();
+	if (owned_branch != MyBranch || !owned_names_known)
+	{
+		MemoryContextReset(owned_cxt);
+		owned_routines = owned_types = NIL;
+		owned_routines_known = false;
+		owned_branch = MyBranch;
+		owned_names_known = true;
+		owned_generation++;
+		PG_TRY();
+		{
+			owned_types = owned_rows(false, NIL);
+		}
+		PG_CATCH();
+		{
+			owned_names_known = false;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 	/*
 	 * (each list made whole before it is kept: an error leaves it unknown,
 	 * an invalidation while it is read, worked out again next time)
@@ -17493,6 +17533,7 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 		List	   *was = owned_routines;
 
 		owned_routines_known = true;
+		owned_generation++;
 		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
 										  ALLOCSET_DEFAULT_SIZES);
 		PG_TRY();
@@ -17525,39 +17566,18 @@ prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 		PG_END_TRY();
 		MemoryContextDelete(was_cxt);
 	}
+	if (*generation != 0 && *generation == owned_generation)
+	{
+		AtEOXact_GUC(true, save_nestlevel);
+		return false;
+	}
 	foreach_ptr(OwnedObject, o, owned_routines)
 		emit(o->oid, o->owner, o->kind, o->name, arg);
 	foreach_ptr(OwnedObject, o, owned_types)
 		emit(o->oid, o->owner, o->kind, o->name, arg);
-
-	rel = table_open(NamespaceRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
-
-		if (canon_namespace(ns->oid))
-			emit(ns->oid, ns->nspowner, 'N',
-				 quote_identifier(NameStr(ns->nspname)), arg);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	rel = table_open(CollationRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(tup);
-
-		if (coll->oid < FirstNormalObjectId || !canon_namespace(coll->collnamespace) ||
-			in_extension(CollationRelationId, coll->oid))
-			continue;
-		emit(coll->oid, coll->collowner, 'C',
-			 qualified(coll->collnamespace, NameStr(coll->collname)), arg);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
+	*generation = owned_generation;
 	AtEOXact_GUC(true, save_nestlevel);
+	return true;
 }
 
 /*

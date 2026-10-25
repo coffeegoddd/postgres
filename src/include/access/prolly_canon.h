@@ -647,15 +647,27 @@ extern Oid	prolly_move_mover(void);
 
 /*
  * Each object of the session's branch a commit may hold, but its prolly
- * tables, partitioned tables and materialized views: its OID, its owner,
- * its kind ('v' view, 'S' sequence, 'f' foreign table, 'P' routine, 'T'
- * type, 'N' schema, 'C' collation) and its name as commits' items name it.
- * The refs record them with a commit's relations, so that a move making
- * one from the commit makes it as its recorded owner.
+ * tables, partitioned tables and materialized views, and its routines and
+ * types: its OID, its owner, its kind ('v' view, 'S' sequence, 'f' foreign
+ * table, 'N' schema, 'C' collation) and its name as commits' items name
+ * it.  The refs record them with a commit's relations, so that a move
+ * making one from the commit makes it as its recorded owner.
  */
 extern void prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 											   const char *name, void *arg),
 								 void *arg);
+
+/*
+ * The same of the branch's routines ('P') and types ('T'), each emitted,
+ * unless *generation is their listing's generation already (unchanged
+ * since it was given: false, nothing emitted; 0 is none).  The listing is
+ * kept from one call to the next, worked out again only where the caches'
+ * invalidations say it changed, and its generation moves each time.
+ */
+extern bool prolly_owned_routines(uint64 *generation,
+								  void (*emit) (Oid oid, Oid owner, char kind,
+												const char *name, void *arg),
+								  void *arg);
 
 /*
  * Run as relid's maker (prolly_move_maker()), if it has one, until
