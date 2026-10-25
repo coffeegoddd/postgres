@@ -49,6 +49,12 @@ typedef enum
 	RECOVERY_CONFLICT_BUFFERPIN,
 
 	/*
+	 * Backend may read files, or hold pointers to chunks, of a prolly chunk
+	 * store that a replayed collection stops naming
+	 */
+	RECOVERY_CONFLICT_CHUNK_STORE,
+
+	/*
 	 * The backend is requested to check for deadlocks. The startup process
 	 * doesn't check for deadlock directly, because we want to kill one of the
 	 * other backends instead of the startup process.

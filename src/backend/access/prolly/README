@@ -465,11 +465,17 @@ short enough to be inline comes back whole), and prolly_jsonb_diff()
 diffs two trees by their nodes; anything a tree doesn't handle, any
 document that isn't one, and every document in a database whose encoding
 isn't UTF-8, they do whole, as #>, jsonb_set() and a diff of the
-documents would.  jsonb's own ->, ->>, #>, #>> and ? and jsonb_set() do
-the same before they detoast their argument (prolly_jsonb.h): -> by a
-key only on an object and by an index only on an array, ? by the key's
-path on an object (an array's string elements are found whole), and
-prolly_jsonb_set() is jsonb_set() itself.  An edit's nodes are the top
+documents would.  jsonb's own ->, ->>, #>, #>>, subscripts (read and
+assigned), ?, ?|, ?&, #-, jsonb_set(), jsonb_set_lax() and jsonb_insert()
+do the same before they detoast their argument (prolly_jsonb.h): -> by a
+key only on an object and by an index only on an array, ? and its kin by
+the keys' paths on an object and by reading an array's elements in order
+(skipping what a container element holds), and prolly_jsonb_set() is
+jsonb_set() itself.  #-, jsonb_insert() and a subscript's assignment go
+through the tree's edit(): it runs the jsonb function itself on a
+document of only what is along the path (so its errors are the
+function's), and puts back what it made of the item there; an edit that
+would move an array's other elements is done whole.  An edit's nodes are the top
 transaction's chunks, so it is done whole in a parallel operation, a
 subtransaction, a read-only transaction and recovery; a result no row
 takes leaves its nodes for the chunk store's collection.  Other jsonb
@@ -478,8 +484,30 @@ the document whole.  A negative index counts from the array's end, its
 size read from its last element's key.  An array's indexes are in its
 elements' keys, so an edit only replaces an element of an array that
 isn't packed: an insert or a removal, which would renumber every element
-after it, is done whole.  Folded format 22 is the first whose rows hold JSON
+after it, is done whole, unless it is at the array's end (an element
+appended, the last one removed).  Folded format 22 is the first whose rows hold JSON
 trees.
+
+A hash pointer a read hands out (a long value of history, read or not)
+names chunks a collection may drop: the chunk store's keep() is told of
+it, and a collection keeps the chunk or waits for the transaction, read
+only or not.  A hot standby's transaction has no transaction id to be
+waited for, and the collections are the primary's, replayed: keep() notes
+it (its virtual transaction) as holding pointers, and the replay of a
+swap cancels each holder of the store's, after
+max_standby_streaming_delay, as a recovery conflict on the chunk store
+(pg_stat_database_conflicts.confl_chunk_store), before the replayed
+manifest stops naming what it may hold.  Every holder is cancelled,
+whether or not the collection drops what it holds, and
+hot_standby_feedback doesn't prevent it: the primary's collection waits
+for no standby.  A holder's own keep() during the replay goes on (the
+replay is waiting for it), but anyone else's waits for the swap to be
+replayed (ProllySwapReplay) and then fails if its chunk is gone: while the
+replay waits out the holders, up to max_standby_streaming_delay (with -1,
+until they end), new history reads of long values in that database stall.
+One begun on a standby and still running at its promotion stays noted,
+and the new primary's collections wait for it.  So history reads assign
+no transaction id, and a hot standby serves them as its primary does.
 
 
 Writers
@@ -1158,6 +1186,24 @@ log entries since its baseline) makes every status a fold, and
 status_reused never moves.  A materialized view written since the mark
 (refreshed concurrently) is asked again as the full comparison asks it.
 debug_prolly_verify_fold_caches reads them all again and compares.
+A status in any backend takes the last fold of the branch known first,
+once writers have ended since (the refs' last_fold(); while it is still
+known, nobody writing, it is the working set, and a status whose version
+has that root compares no table at all).  The branch's shared entry keeps
+that fold's root with the generation it was known at, so the working set
+is that root but for the relations written since (written_since() of that
+mark), while the baseline is the one it folded from, nothing it left out,
+and no catalog change or collection since.  Its sequences' values are read
+again (the canonicalizer's sequences_now()), and the version's root and it
+are diffed (objects_diffed()): the tables whose items differ are compared
+as the known working set's are, rows and all, those written since as the
+definitions read without rows compare them (their change finders), and
+the other objects as objects() would visit them.  So a status right after
+a commit, or a backend's first one, costs the tables written since and
+what the diff holds, describes nothing and reads no catalog through
+(pg_stat_prolly's status_from_fold).  A type or materialized view the diff
+holds, a materialized view written, or a table's rows that can't be told
+so leave it to the comparison above.
 
 
 Remotes

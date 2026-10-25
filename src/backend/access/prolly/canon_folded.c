@@ -6913,6 +6913,138 @@ folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	merge_items(&cn, from, to, true, object_pair, &w);
 }
 
+/* What objects_diffed() visits, as the diff of two roots gives it. */
+typedef struct DiffedWalk
+{
+	ObjectsWalk w;
+	ProllyCanonObjectVisit table;
+} DiffedWalk;
+
+static void
+diffed_change(ProllyDiffKind kind, const ProllyKey *key,
+			  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	DiffedWalk *dw = arg;
+	char	   *name;
+
+	/* (what next_item() skips: the format, ordering, collations) */
+	if (key->len < 2 || key->data[1] != ':' || key->data[0] == '!' ||
+		key->data[0] == 'c')
+		return;
+	if (key->data[0] == PROLLY_OBJECT_TABLE)
+	{
+		if (dw->table == NULL)
+			return;
+		name = from_utf8(key->data + 2, key->len - 2);
+		dw->table(name, before == NULL ? PROLLY_DIFF_ADDED :
+				  after == NULL ? PROLLY_DIFF_REMOVED : PROLLY_DIFF_MODIFIED,
+				  PROLLY_OBJECT_TABLE, dw->w.arg);
+		pfree(name);
+		return;
+	}
+	(void) object_pair(before ? key : NULL, before, after ? key : NULL, after,
+					   &dw->w);
+}
+
+/*
+ * objects() read from the roots' tree diff: an object whose items are the
+ * same in both is one objects() doesn't visit either, and the diff gives
+ * the rest in key order, as objects()'s merge of every item does.
+ */
+static void
+folded_objects_diffed(const ProllyNodeRef *from, const ProllyNodeRef *to,
+					  ProllyCanonObjectVisit visit,
+					  ProllyCanonObjectVisit table, void *arg)
+{
+	Canon		cn;
+	DiffedWalk	dw = {{visit, arg}, table};
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	dw.w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
+	PROLLY_CALL(cn.tree, diff, &cn.env, from, to, diffed_change, &dw);
+}
+
+/*
+ * root with its sequences' values read again, as describe_sequence()
+ * appends them to each one's definition: a sequence's item is its
+ * definition's line, then its value's (none where it can't be read).
+ */
+static bool
+folded_sequences_now(const ProllyNodeRef *root, ProllyNodeRef *out)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	from = {(const uint8 *) "s:", 2};
+	List	   *edits = NIL;
+	bool		ok = true;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (ok && PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		char	   *name;
+		List	   *parts;
+		Oid			nsp;
+		Oid			seqid = InvalidOid;
+		const char *nl;
+		StringInfoData value;
+		int64		last;
+		bool		called;
+
+		if (k.len < 2 || memcmp(k.data, "s:", 2) != 0)
+			break;
+		name = from_utf8(k.data + 2, k.len - 2);
+		parts = stringToQualifiedNameList(name, NULL);
+		if (list_length(parts) == 2 &&
+			OidIsValid(nsp = get_namespace_oid(strVal(linitial(parts)), true)))
+			seqid = get_relname_relid(strVal(lsecond(parts)), nsp);
+		nl = memchr(v.data, '\n', v.len);
+		if (!OidIsValid(seqid) || get_rel_relkind(seqid) != RELKIND_SEQUENCE ||
+			nl == NULL)
+		{
+			ok = false;
+			break;
+		}
+		initStringInfo(&value);
+		appendBinaryStringInfo(&value, (const char *) v.data,
+							   (int) (nl - (const char *) v.data) + 1);
+		if (ReadSequenceState(seqid, &last, &called))
+			appendStringInfo(&value, INT64_FORMAT "\t%s\n", last,
+							 called ? "t" : "f");
+		if (value.len != v.len || memcmp(value.data, v.data, v.len) != 0)
+		{
+			ProllyEdit *e = palloc(sizeof(ProllyEdit));
+			uint8	   *kd = palloc(k.len);
+
+			memcpy(kd, k.data, k.len);
+			e->key = (ProllyKey) {kd, k.len};
+			e->value = (ProllyValue) {(const uint8 *) value.data, value.len};
+			e->is_delete = false;
+			edits = lappend(edits, e);
+		}
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	if (!ok)
+		return false;
+	if (edits == NIL)
+		*out = *root;
+	else
+	{
+		ProllyEdit *all = palloc_array(ProllyEdit, list_length(edits));
+		int			n = 0;
+
+		foreach_ptr(ProllyEdit, e, edits)
+			all[n++] = *e;
+		PROLLY_CALL(cn.tree, apply, &cn.root_env, root, all, n, out);
+	}
+	return true;
+}
+
 /* An object's change, as the roots' tree diff gives it, copied. */
 typedef struct Changed
 {
@@ -15372,4 +15504,6 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.rename_objects = folded_rename_objects,
 	.table_metadata = folded_table_metadata,
 	.table_names = folded_table_names,
+	.objects_diffed = folded_objects_diffed,
+	.sequences_now = folded_sequences_now,
 };

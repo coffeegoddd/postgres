@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD03
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD05
 
 typedef struct PgStat_ArchiverStats
 {
@@ -438,6 +438,7 @@ typedef struct PgStat_StatDBEntry
 	PgStat_Counter conflict_snapshot;
 	PgStat_Counter conflict_logicalslot;
 	PgStat_Counter conflict_bufferpin;
+	PgStat_Counter conflict_chunk_store;
 	PgStat_Counter conflict_startup_deadlock;
 	PgStat_Counter temp_files;
 	PgStat_Counter temp_bytes;
@@ -791,9 +792,13 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_REFS_NODES_WRITTEN,	/* of nodes_written, theirs */
 	PGSTAT_PROLLY_BMAP_REFCOUNT_READS,	/* reference-count pages read to
 										 * look up blocks' counts */
+	PGSTAT_PROLLY_STATUS_FROM_FOLD, /* comparisons into the working set (a
+									 * status's) from the last fold known,
+									 * only tables written since compared
+									 * again */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_REFCOUNT_READS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_STATUS_FROM_FOLD + 1)
 
 typedef struct PgStat_ProllyStats
 {

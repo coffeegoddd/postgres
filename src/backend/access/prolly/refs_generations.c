@@ -51,7 +51,11 @@
  * WRITTEN_RELATIONS of them, and the generation since which every one is
  * there.  A canonicalizer that marked a fold (branch_fold_mark()) asks
  * later which relations were written since (branch_written_since()), and
- * works out again only those.  Anything that changes a fold otherwise
+ * works out again only those.  The last fold known stays with the branch
+ * once a writer ends too, with the generation it was known at
+ * (branch_fold_last()): any backend can take it as the working set but
+ * for the relations written since, while its baseline is the branch's and
+ * the epoch hasn't moved.  Anything that changes a fold otherwise
  * moves what the mark took: a catalog change or collection the epoch, a
  * writer of every branch or a prepared transaction's end the overflow, a
  * writer of too many relations or an eviction the generation since which
@@ -116,6 +120,8 @@ typedef struct BranchGeneration
 	uint64		overflow;
 	ProllyHash	baseline;		/* folded from (len 0: none) */
 	ProllyHash	root;
+	bool		last;			/* the fold below was known, at generation */
+	uint64		last_generation;	/* (kept as writers end: see below) */
 	uint64		seen;			/* the generation the fold worker last saw */
 	/* what the writers that ended since then did: rows, when, how late */
 	uint64		rows;
@@ -701,6 +707,8 @@ make_known(BranchGenerations *g, const PendingFold *pf)
 	e->overflow = pf->overflow;
 	e->baseline = pf->baseline;
 	e->root = pf->root;
+	e->last = true;
+	e->last_generation = e->generation;
 }
 
 /*
@@ -831,6 +839,41 @@ branch_fold_known_at(Oid branch, Snapshot snap, const ProllyHash *baseline,
 			at->overflow = g->overflow;
 			at->epoch = e->epoch;
 		}
+		found = true;
+	}
+	LWLockRelease(&g->lock);
+	return found;
+}
+
+bool
+branch_fold_last(Oid branch, Snapshot snap, const ProllyHash *baseline,
+				 ProllyHash *root, ProllyFoldMark *mark)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	ProllyHash	none = {0};
+	bool		found = false;
+
+	if (!markable(snap))
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, branch);
+
+	/*
+	 * (one still known, nobody writing, is branch_fold_known()'s: taken as
+	 * the working set, rows and all)
+	 */
+	if (e != NULL && e->last && e->complete && !(e->known && e->writers == 0) &&
+		e->overflow == g->overflow &&
+		e->epoch == pg_atomic_read_u64(&g->epoch) &&
+		same_hash(&e->baseline, baseline ? baseline : &none) &&
+		sees_writers(g, e, snap))
+	{
+		*root = e->root;
+		mark->branch = branch;
+		mark->generation = e->last_generation;
+		mark->overflow = e->overflow;
+		mark->epoch = e->epoch;
 		found = true;
 	}
 	LWLockRelease(&g->lock);

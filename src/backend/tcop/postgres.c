@@ -2660,6 +2660,9 @@ errdetail_recovery_conflict(RecoveryConflictReason reason)
 		case RECOVERY_CONFLICT_LOGICALSLOT:
 			errdetail("User was using a logical replication slot that must be invalidated.");
 			break;
+		case RECOVERY_CONFLICT_CHUNK_STORE:
+			errdetail("User query might have needed chunks that a chunk store collection must remove.");
+			break;
 		case RECOVERY_CONFLICT_STARTUP_DEADLOCK:
 			errdetail("User transaction caused deadlock with recovery.");
 			break;
@@ -3264,6 +3267,7 @@ ProcessRecoveryConflictInterrupt(RecoveryConflictReason reason)
 		case RECOVERY_CONFLICT_LOCK:
 		case RECOVERY_CONFLICT_TABLESPACE:
 		case RECOVERY_CONFLICT_SNAPSHOT:
+		case RECOVERY_CONFLICT_CHUNK_STORE:
 
 			/*
 			 * If we aren't in a transaction any longer then ignore.
