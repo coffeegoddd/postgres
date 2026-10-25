@@ -1963,13 +1963,6 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 #define SHARE_RELATION_USEC	300
 #define SHARE_BLOCKS_PER_USEC	64
 
-/*
- * Nodes the count of a table's changes reads, at most, for each change
- * sharing must beat: a change makes a node or two differ at each level of
- * each tree, so more nodes than this differing means more changes.
- */
-#define SHARE_NODES_PER_CHANGE	16
-
 /* A root's table, as tables() visits it. */
 typedef struct NamedTree
 {
@@ -2013,26 +2006,6 @@ count_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	(*(uint64 *) arg)++;
-}
-
-/*
- * Do more than past keys differ between from and to?  Only that is asked,
- * so the count stops reading once it is known: by the tree's estimate,
- * which reads no more than SHARE_NODES_PER_CHANGE nodes for each of the
- * past changes and is never below the count (so at most past means at most
- * past), and is cut short, past it, only where that many nodes differ.
- */
-static bool
-changes_past(const ProllyTreeEnv *denv, const ProllyNodeRef *from,
-			 const ProllyNodeRef *to, uint64 past)
-{
-	uint64		changes = 0;
-
-	if (PROLLY_HAS(tree, diff_estimate))
-		return PROLLY_CALL(tree, diff_estimate, denv, from, to,
-						   (past + 1) * SHARE_NODES_PER_CHANGE) > past;
-	PROLLY_CALL(tree, diff, denv, from, to, count_change, &changes);
-	return changes > past;
 }
 
 /*
@@ -2317,6 +2290,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
 		ShareSource *s;
+		uint64		changes = 0;
 		uint64		blocks;
 		Oid			relid;
 		List	   *relids;
@@ -2332,11 +2306,11 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
-		/* (shared if the rows that differ cost more to write) */
-		if (!changes_past(&denv, &o->data, &t->data,
-						  (uint64) (((double) list_length(relids) * SHARE_RELATION_USEC +
-									 (double) blocks / SHARE_BLOCKS_PER_USEC) /
-									MOVE_ROW_USEC)))
+		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
+					&changes);
+		if ((double) changes * MOVE_ROW_USEC <=
+			(double) list_length(relids) * SHARE_RELATION_USEC +
+			(double) blocks / SHARE_BLOCKS_PER_USEC)
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
