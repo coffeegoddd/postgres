@@ -67,6 +67,12 @@ SELECT name, CASE WHEN name = 'bmap_map_pages_copied' THEN value
 	ELSE (value > 0)::int END AS value FROM pg_temp.counted();
 SELECT test_bmap_snapshot_release(:big, :big_snap) AS released_twice;
 SELECT count(*) FROM test_bmap_snapshots(:big);
+-- Compaction passes over a page someone else has pinned just then, and a
+-- checkpoint or the background writer pins a dirty page to write it out.
+-- After a checkpoint no page here is dirty, so neither touches one, and a
+-- single sweep has to do all of it: the sweep after it finds nothing left.
+CHECKPOINT;
+SELECT * FROM prolly_page_sweep();
 SELECT * FROM prolly_page_sweep();
 
 -- letting go of a snapshot of an unchanged relation frees nothing
