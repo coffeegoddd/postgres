@@ -313,21 +313,56 @@ merge's.
 A history read of a table's rows (dolt_at, dolt_history_table, dolt_diff,
 dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
-that table: those reached back from the working set through the head's
-history, or forward from one of them along another branch's commits,
-the name never without a table between (a rename followed).  A version of
-another table of its name, one dropped before this one was made, is read
-only by the database's owner or a member of pg_read_all_data.  The head's
-version is the table's only through the branch's record of its tables,
-made by its last commit, having the table's relation: at that commit, or
-at a head moved since without a commit to one of its descendants or
-ancestors, the name never without a table between.  A head moved to a
-commit holding a dropped table and then committed, or a merge of a
-branch still holding it, isn't told from the table's own history either;
-moving a head takes a write role (see Writers), not SELECT alone.
-A plan's row estimate of a version, and dolt_diff_stat's counts, are
-read on the same rule.  A table dropped and made again within one commit
-isn't told from one kept (#891).
+that table, as relation-made history: every commit this database makes of
+a branch records the relations its working set's tables were ('L', refs
+format 16: each table's OID and qualified name, a line each, the name's
+backslashes and newlines escaped so that no name makes a line of its
+own; read strictly, a damaged record refused), and a version is the
+table's when its commit was made from the table's relation, reached back
+from the working set through the head and each commit's parents, a step
+taken only where both commits were made from it (its name at each, as
+the record has it, so a rename is followed), or forward from one of them
+along another branch's commits made from it.  A version of another table
+of its name, one dropped before this one was made, is read only by the
+database's owner or a member of pg_read_all_data, as is a commit without
+a record: one made in another database (fetched, pulled, cloned or pushed
+here).  Commits name tables by name and identity alone, and a re-made
+table keeps its name's identity (#891), so the names can't tell a head
+moved to a commit holding a dropped table and then committed, a merge of
+a branch still holding it, a squash of the drop into the re-make, a
+table dropped and made again within one commit, or a branch made at the
+old table's commit from the new one; the records can.  A commit that
+isn't its working set folded (a merge's, a pick's or a revert's, over
+uncommitted changes) is recorded made only from the relations its first
+parent's record and the working set both have, as it holds a table
+dropped and made again in the working set as the parent had it; and a
+table such a move changed in the working set, uncommitted (set aside, or
+left out of the commit), is recorded only as of a relation of the class
+its first parent's record lists (refs' prolly_commit_local_tables, as the
+merge, pick or revert tells it).  Relations are compared by equivalence
+class ('J'): a relation a move makes again of a table (a
+definition it can't alter in place, as a branch's first use may when its
+copies are moved to its head), or a merge, pick or revert makes of the
+other side's table (the class of the relation the commit it takes the
+version from was made from: prolly_move_provenance), is the same table
+as the one it comes from, whatever its OID; what the move sets aside of
+the uncommitted changes and puts back is the branch's own, taking no
+class from those commits.  A class outlives its relation's drop: commits
+made from the dropped relation are still read through it, and a branch's
+copy of the relation, of the same OID, may still be in use.  So a
+relation given a dropped relation's OID again (after the OID counter
+wraps) is of the dropped relation's class, and reads its versions.  What the
+records can't: a
+branch's first use may make its copies from another branch's relation
+(the table here's, moved to the old rows), and its commits are then that
+relation's; a move that brings the old table's rows (a merge, a hard
+reset, a revert of the drop, a cherry-pick) writes them into the new
+table, whose rows they then are (#936); and a role given a dropped
+relation's OID again would read that relation's versions.
+A refused read reads each commit's record about once: a walk that meets
+nothing marks the commits it saw apart.  Moving a head takes a write role
+(see Writers), not SELECT alone.  A plan's row estimate of a version, and
+dolt_diff_stat's counts, are read on the same rule.
 
 Folded format 18 records identities in commits.  Formats are not kept
 compatible while the prototype iterates: this build reads, moves to and
@@ -1136,8 +1171,8 @@ NULL with a warning once a scan, one the commit hasn't NULL).  A commit
 whose table can't be read here (its key ordered by what isn't built in)
 is an error, as a commit missing from the store is.  A reader other than
 the database's owner or pg_read_all_data is refused a commit whose table
-of the name isn't the one here (its lineage, walked once a scan, doesn't
-reach it), as dolt_history_table() by name refuses it.  A scan reads a
+of the name isn't the one here (not made from its relation, walked once a
+scan), as dolt_history_table() by name refuses it.  A scan reads a
 commit at a time and streams its rows, so LIMIT stops it.  An equality
 on commit_hash (a constant, a parameter, or a join's outer row) reads
 that commit alone, if the mounted commit reaches it: the history is

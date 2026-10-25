@@ -2149,6 +2149,44 @@ test_chunk_declaring_tree(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&ref.hash));
 }
 
+/*
+ * A tree of the items keys[i] -> vals[i] (keys in byte order), declaring
+ * no references; its root's hash.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_items_tree);
+Datum
+test_chunk_items_tree(PG_FUNCTION_ARGS)
+{
+	ArrayType  *karr = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *varr = PG_GETARG_ARRAYTYPE_P(1);
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	Datum	   *keys;
+	Datum	   *vals;
+	int			nkeys;
+	int			nvals;
+
+	deconstruct_array(karr, TEXTOID, -1, false, TYPALIGN_INT, &keys, NULL, &nkeys);
+	deconstruct_array(varr, TEXTOID, -1, false, TYPALIGN_INT, &vals, NULL, &nvals);
+	if (nkeys != nvals)
+		elog(ERROR, "as many values as keys are needed");
+	prolly_folded_tree_env(&env);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	for (int i = 0; i < nkeys; i++)
+	{
+		text	   *kt = DatumGetTextPP(keys[i]);
+		text	   *vt = DatumGetTextPP(vals[i]);
+		ProllyKey	k = {(const uint8 *) VARDATA_ANY(kt), VARSIZE_ANY_EXHDR(kt)};
+		ProllyValue v = {(const uint8 *) VARDATA_ANY(vt), VARSIZE_ANY_EXHDR(vt)};
+
+		PROLLY_CALL(tree, build_add, b, &k, &v);
+	}
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
 PG_FUNCTION_INFO_V1(test_chunk_put_leaf);
 Datum
 test_chunk_put_leaf(PG_FUNCTION_ARGS)
