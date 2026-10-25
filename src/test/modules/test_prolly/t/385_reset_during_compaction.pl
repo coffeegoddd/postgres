@@ -193,31 +193,24 @@ wake_sweep($sweep);
 # a lowering of shared_below holds each relation too, for a pass over its
 # map that doesn't stop part way: a reset waits for that pass (no longer)
 interleave();
+# (stopped at kp.t only: the point is told each relation's file number)
+my $filenode = sql(q{SELECT pg_relation_filenode('kp.t')});
 $sweep = $node->background_psql('postgres');
 $sweeper = $sweep->query_safe(q{SELECT pg_backend_pid()});
-$sweep->query_safe(q{SELECT injection_points_set_local();
-	SELECT injection_points_attach('bmap-shared-below-held', 'wait')});
+$sweep->query_safe(qq{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-shared-below-held', 'wait', '$filenode')});
 $sweep->query_until(qr/started/, q{
 	\echo started
 	SELECT 'moved ' || moved FROM prolly_page_sweep();
 	\echo done
 });
-my $holding = 0;
-for my $try (1 .. 1000)
-{
-	$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE pid = $sweeper AND wait_event = 'bmap-shared-below-held'})
-	  or die 'the lowering did not stop';
-	if (sql(qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE pid = $sweeper AND wait_event = 'bmap-shared-below-held'})
+  or die 'the lowering did not stop';
+is( sql(qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
 		WHERE l.pid = $sweeper AND l.locktype = 'relation' AND l.granted
-		  AND c.oid = 'kp.t'::regclass}) eq '1')
-	{
-		$holding = 1;
-		last;
-	}
-	sql(q{SELECT injection_points_wakeup('bmap-shared-below-held')});
-}
-ok($holding, 'the lowering of shared_below stopped holding kp.t');
+		  AND c.oid = 'kp.t'::regclass}),
+	'1', 'the lowering of shared_below stopped holding kp.t');
 $restored = counted('relations_restored');
 $applied = counted('apply_rows');
 $reset = $node->background_psql('postgres');
