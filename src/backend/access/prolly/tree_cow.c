@@ -252,17 +252,22 @@ kept_put(const ProllyHash *hash, const char *data, Size len)
  * read.  root: the node is a tree's root, kept even if it is a leaf.
  * level: the level the node must be at (its parent's less one), or
  * LEVEL_ANY.  A node's level comes from its chunk, which may be another
- * server's: none is MAX_LEVELS or more (every walk keeps a frame a level),
- * and each child is one level below its parent, so a walk's depth is the
- * root's level.
+ * server's: none is MAX_LEVELS - 1 or more (every walk keeps a frame a
+ * level, and a build makes a level above its root's one node: so 30 is the
+ * highest a tree's root is written at, and read at), each child is one
+ * level below its parent, so a walk's depth is the root's level, and an
+ * internal node has children.
  */
 static void
 node_read_level(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 				MemoryContext cxt, bool root, int level)
 {
 	StringInfoData data;
-	MemoryContext old = MemoryContextSwitchTo(cxt);
+	MemoryContext old;
 	KeptNode   *kn = NULL;
+
+	CHECK_FOR_INTERRUPTS();
+	old = MemoryContextSwitchTo(cxt);
 
 	node->chunk.data = NULL;
 	initStringInfo(&data);
@@ -293,11 +298,16 @@ node_read_level(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 	node->level = node->chunk.level;
 	node->nitems = node->chunk.nitems;
 	node->ref = *ref;
-	if (node->level >= MAX_LEVELS)
+	if (node->level >= MAX_LEVELS - 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("prolly tree node of level %u: a tree has at most %d levels",
-						node->level, MAX_LEVELS)));
+				 errmsg("prolly tree node of level %u: a tree's levels are 0 to %d",
+						node->level, MAX_LEVELS - 2)));
+	if (node->level > 0 && node->nitems == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly tree node of level %u with no children",
+						node->level)));
 	if (level != LEVEL_ANY && node->level != level)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -2311,15 +2321,24 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 }
 
 static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
-					  ProllyTreeVisitNode visit, void *arg);
+					  int nest, ProllyTreeVisitNode visit, void *arg);
+
+/*
+ * How deep value trees nest: a row's leaf names value trees (nest 1),
+ * whose leaves hold bytes and name nothing.  A walk refuses a deeper one,
+ * which only a chunk made elsewhere could be: each nesting is a recursion,
+ * and a chain of them would overflow the stack.
+ */
+#define MAX_VALUE_NESTING	1
 
 /*
  * A leaf item's value trees walked: its own, if it is stored out of line,
- * and those of the references it holds.
+ * and those of the references it holds.  nest: how deep the leaf's tree
+ * is in value trees (0 for a tree the walk began at).
  */
 static void
 walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
-		   ProllyTreeVisitNode visit, void *arg)
+		   int nest, ProllyTreeVisitNode visit, void *arg)
 {
 	ProllyValue v = *value;
 	ProllyValue refs;
@@ -2329,29 +2348,35 @@ walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
 
 	if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
 		return;
+	if (nest >= MAX_VALUE_NESTING)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly value tree naming value trees more than %d deep",
+						MAX_VALUE_NESTING)));
 	item_payload(&v, flags, &refs, NULL);
 	value_env(env, &venv);
 	if (flags & PROLLY_ITEM_VALUE_REF)
 	{
 		decode_value_ref(&v, &vroot, &len);
-		(void) walk_node(&venv, &vroot, LEVEL_ANY, visit, arg);
+		(void) walk_node(&venv, &vroot, LEVEL_ANY, nest + 1, visit, arg);
 	}
 	for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
 	{
 		next_value_ref(&p, end, &vroot, &len);
-		(void) walk_node(&venv, &vroot, LEVEL_ANY, visit, arg);
+		(void) walk_node(&venv, &vroot, LEVEL_ANY, nest + 1, visit, arg);
 	}
 }
 
 /* Whether the visitor took the node. */
 static bool
 walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
-		  ProllyTreeVisitNode visit, void *arg)
+		  int nest, ProllyTreeVisitNode visit, void *arg)
 {
 	TNode		node;
 	bool		took;
 
 	CHECK_FOR_INTERRUPTS();
+	check_stack_depth();
 	node_read_level(env, ref, &node, CurrentMemoryContext, false, level);
 	took = visit(&node.ref, node.level, arg);
 	if (took)
@@ -2368,7 +2393,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
 			uint8		flags;
 
 			node_item(env, &node, i, &k, &v, &flags);
-			walk_value(env, &v, flags, visit, arg);
+			walk_value(env, &v, flags, nest, visit, arg);
 		}
 	}
 	else
@@ -2379,7 +2404,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
 			uint64		count;
 
 			node_child(env, &node, i, &child, &count);
-			(void) walk_node(env, &child, node.level - 1, visit, arg);
+			(void) walk_node(env, &child, node.level - 1, nest, visit, arg);
 		}
 	}
 	node_release(&node);
@@ -2390,7 +2415,7 @@ static bool
 cow_walk(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		 ProllyTreeVisitNode visit, void *arg)
 {
-	return walk_node(env, root, LEVEL_ANY, visit, arg);
+	return walk_node(env, root, LEVEL_ANY, 0, visit, arg);
 }
 
 /* ------------------------------------------------------------------------
@@ -3736,7 +3761,7 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 
 	if (from == NULL || from->hash.len == 0)
 	{
-		(void) walk_node(env, to, LEVEL_ANY, visit, arg);
+		(void) walk_node(env, to, LEVEL_ANY, 0, visit, arg);
 		return;
 	}
 	if (same_hash(&from->hash, &to->hash))
@@ -3764,12 +3789,12 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			if (side_height(&b) > 0)
 			{
 				side_child(&b, &cb);
-				(void) walk_node(env, &cb, side_height(&b) - 1, visit, arg);
+				(void) walk_node(env, &cb, side_height(&b) - 1, 0, visit, arg);
 			}
 			else
 			{
 				side_leaf_item(&b, &kb, &vb, &fb);
-				walk_value(env, &vb, fb, visit, arg);
+				walk_value(env, &vb, fb, 0, visit, arg);
 			}
 			side_advance(&b);
 			continue;
@@ -3818,7 +3843,7 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			{
 				if (r > 0 || fa != fb || va.len != vb.len ||
 					memcmp(va.data, vb.data, va.len) != 0)
-					walk_value(env, &vb, fb, visit, arg);
+					walk_value(env, &vb, fb, 0, visit, arg);
 				if (r == 0)
 					side_advance(&a);
 				side_advance(&b);
