@@ -11053,7 +11053,9 @@ unbodied_routine_sql(const MoveItem *f)
 /*
  * A routine dropped and made again (its row type's table made again): its
  * owner, privileges and comment, which a commit doesn't hold, given back
- * once it is made (restore_routines()).
+ * once it is made (restore_routines()).  Its OID is new, so what depends
+ * on it (another routine calling it, a default, a view) keeps it from
+ * being dropped, and the move fails as dropping it would.
  */
 typedef struct DroppedRoutine
 {
