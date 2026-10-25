@@ -7,7 +7,9 @@
 # gives the table back its kept pages (no row written) rather than falling
 # back to writing the rows.  With lock_timeout, it waits no longer than
 # that.  A branch's deletion asks the same of a compaction holding the
-# branch.
+# branch, and waits for that one hold: asked, the compaction passes over
+# the branch's other relations.  A lowering of shared_below, which holds
+# each relation for a pass over its map, is waited for the same way.
 
 use strict;
 use warnings FATAL => 'all';
@@ -177,10 +179,70 @@ ok( $node->poll_query_until(
 		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
 		FROM pg_stat_activity WHERE pid = $deleterpid}),
 	'the deletion waits for the compaction to let go');
-wake_sweep($sweep);
-like($deleter->query_until(qr/done/, ''), qr/deleted/, 'and deletes the branch');
+
+# one move let through, the point still attached: the compaction lets go
+# of the branch and passes over its other relations (its change logs, its
+# indexes), so the deletion waits for that one hold, not for each
+sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
+like($deleter->query_until(qr/done/, ''), qr/deleted/,
+	'and deletes the branch after that one move');
 $deleter->quit;
 is(sql(q{SELECT count(*) FROM dolt_branches WHERE name = 'gone'}), '0', 'gone');
+wake_sweep($sweep);
+
+# a lowering of shared_below holds each relation too, for a pass over its
+# map that doesn't stop part way: a reset waits for that pass (no longer)
+interleave();
+$sweep = $node->background_psql('postgres');
+$sweeper = $sweep->query_safe(q{SELECT pg_backend_pid()});
+$sweep->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-shared-below-held', 'wait')});
+$sweep->query_until(qr/started/, q{
+	\echo started
+	SELECT 'moved ' || moved FROM prolly_page_sweep();
+	\echo done
+});
+my $holding = 0;
+for my $try (1 .. 1000)
+{
+	$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE pid = $sweeper AND wait_event = 'bmap-shared-below-held'})
+	  or die 'the lowering did not stop';
+	if (sql(qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+		WHERE l.pid = $sweeper AND l.locktype = 'relation' AND l.granted
+		  AND c.oid = 'kp.t'::regclass}) eq '1')
+	{
+		$holding = 1;
+		last;
+	}
+	sql(q{SELECT injection_points_wakeup('bmap-shared-below-held')});
+}
+ok($holding, 'the lowering of shared_below stopped holding kp.t');
+$restored = counted('relations_restored');
+$applied = counted('apply_rows');
+$reset = $node->background_psql('postgres');
+$resetter = $reset->query_safe(q{SELECT pg_backend_pid()});
+$reset->query_until(qr/started/, q{
+	\echo started
+	SELECT dolt_reset('--hard');
+	SELECT pg_stat_force_next_flush();
+	\echo done
+});
+ok( $node->poll_query_until(
+		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+		FROM pg_stat_activity WHERE pid = $resetter}),
+	'the reset waits for the lowering to let go');
+sql(q{SELECT injection_points_detach('bmap-shared-below-held')});
+sql(q{SELECT injection_points_wakeup('bmap-shared-below-held')});
+$reset->query_until(qr/done/, '');
+$reset->quit;
+$sweep->query_until(qr/done/, '');
+$sweep->quit;
+cmp_ok(counted('relations_restored'), '>', $restored,
+	'the reset gives back the kept pages');
+is(counted('apply_rows'), $applied, 'writing no row');
+is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
+	'kp.t reads as committed');
 
 $node->stop;
 done_testing();

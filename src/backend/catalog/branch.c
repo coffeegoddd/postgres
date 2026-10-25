@@ -767,20 +767,21 @@ branch_locktag(LOCKTAG *tag, Oid branch)
 
 /*
  * Try AccessExclusiveLock on a branch (its lock 'tag'), not waiting for
- * it, but waiting out a page sweep's compaction that holds the branch
- * while it moves one of its relations' blocks: asked, it lets go after the
- * move under way (bmap_compaction_let_go()).  A session on the branch
- * turns the try away.
+ * it, but waiting out a page sweep that holds the branch while it moves
+ * one of its relations' blocks: asked, it lets go after the move under way
+ * and passes over the branch from then on (bmap_compaction_let_go()), all
+ * within lock_timeout.  A session on the branch turns the try away.
  */
 static LockAcquireResult
 try_branch_lock(const LOCKTAG *tag)
 {
 	LockAcquireResult res;
+	TimestampTz start = 0;
 
 	while ((res = LockAcquire(tag, AccessExclusiveLock, false, true)) ==
 		   LOCKACQUIRE_NOT_AVAIL)
 	{
-		if (!bmap_compaction_let_go(tag))
+		if (!bmap_compaction_let_go(tag, &start))
 			return LockAcquire(tag, AccessExclusiveLock, false, true);
 	}
 	return res;
@@ -811,7 +812,7 @@ branch_in_use(Oid branch)
 	LockAcquireResult res;
 
 	branch_locktag(&tag, branch);
-	res = try_branch_lock(&tag);
+	res = LockAcquire(&tag, AccessExclusiveLock, false, true);
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return true;
 	if (res == LOCKACQUIRE_OK)

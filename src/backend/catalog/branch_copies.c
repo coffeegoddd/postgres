@@ -201,22 +201,36 @@ copy_storage(Form_pg_class c)
 }
 
 /*
+ * When this statement's tries at its relations' locks first waited for a
+ * page sweep (bmap_compaction_let_go()), so that lock_timeout bounds the
+ * waits of the whole operation (a reset trying each kept table's
+ * relations in turn), not each.  Reset by the next statement.
+ */
+static TimestampTz compaction_wait_start = 0;
+static TimestampTz compaction_wait_statement = 0;
+
+/*
  * Try 'mode' on relation relid, as ConditionalLockRelationOid() does, but
- * waiting out a page sweep's compaction that holds it: asked, it lets go
- * after the move under way (bmap_compaction_let_go()), as it does for a
- * waiter in the lock's queue, so a hold of a moment doesn't turn the try
- * away.  Any other holder does.
+ * waiting out a page sweep that holds it: asked, it lets go after the move
+ * under way (bmap_compaction_let_go()), as it does for a waiter in the
+ * lock's queue, so a hold of a moment doesn't turn the try away.  Any
+ * other holder does.  *start is the statement's (compaction_wait_start).
  */
 static bool
-try_lock_relation(Oid relid, LOCKMODE mode)
+try_lock_relation(Oid relid, LOCKMODE mode, TimestampTz *start)
 {
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid,
 								relation_lock_branch(relid));
+	if (compaction_wait_statement != GetCurrentStatementStartTimestamp())
+	{
+		compaction_wait_statement = GetCurrentStatementStartTimestamp();
+		*start = 0;
+	}
 	while (!ConditionalLockRelationOid(relid, mode))
 	{
-		if (!bmap_compaction_let_go(&tag))
+		if (!bmap_compaction_let_go(&tag, start))
 			return ConditionalLockRelationOid(relid, mode);
 	}
 	return true;
@@ -1329,7 +1343,7 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	{
 		LOCKTAG		tag;
 
-		if (!try_lock_relation(relid, AccessExclusiveLock))
+		if (!try_lock_relation(relid, AccessExclusiveLock, &compaction_wait_start))
 			return false;
 		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, source);
 		if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
@@ -1813,7 +1827,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	 */
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
-		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock, &compaction_wait_start))
 			ok = false;
 		changed[i] = true;
 	}
@@ -1901,7 +1915,7 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
 	{
 		LOCKTAG		tag;
 
-		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock, &compaction_wait_start))
 			return false;
 		if (!other)
 			continue;
