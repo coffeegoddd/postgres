@@ -2469,16 +2469,6 @@
   check_hook => 'check_primary_slot_name',
 },
 
-{ name => 'prolly_chunk_cache_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
-  short_desc => 'Sets how much of the prolly chunk store\'s decoded chunks each backend keeps for its later reads.',
-  long_desc => 'Chunks are named by their content, so one kept is never stale. 0 keeps none.',
-  flags => 'GUC_UNIT_KB',
-  variable => 'prolly_chunk_cache_size',
-  boot_val => '16384',
-  min => '0',
-  max => 'MAX_KILOBYTES',
-},
-
 { name => 'prolly_fold_worker', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Folds branches\' working sets in the background soon after they are written.',
   long_desc => 'A status, a diff into the working set or a commit then folds only what came since the last background fold.',
@@ -2541,6 +2531,16 @@
   boot_val => '200',
   min => '10',
   max => '600000',
+},
+
+{ name => 'prolly_node_cache_size', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
+  short_desc => 'Sets the shared memory the prolly chunk stores keep decoded tree nodes and other chunks in, for every backend\'s later reads.',
+  long_desc => 'Chunks are named by their content, so one kept is never stale; a collection\'s removals are never served. 0 turns the cache off, and reserves no shared memory for it.',
+  flags => 'GUC_UNIT_KB',
+  variable => 'prolly_node_cache_size',
+  boot_val => '131072',
+  min => '0',
+  max => 'MAX_KILOBYTES',
 },
 
 { name => 'prolly_serve_uncompressed', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_OTHER',
