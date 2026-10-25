@@ -34,9 +34,9 @@ SELECT id, (test_toast_pointer(t)).form AS t_form, (test_toast_pointer(b)).form 
 FROM tc.docs ORDER BY id;
  id | t_form | b_form | j_form | t_uncompressed | no_compression 
 ----+--------+--------+--------+----------------+----------------
-  1 |      0 |      0 |      2 | t              | t
-  2 |      0 |      0 |      2 | t              | t
-  3 |      0 |      0 |      2 | t              | t
+  1 |      0 |      0 |      3 | t              | t
+  2 |      0 |      0 |      3 | t              | t
+  3 |      0 |      0 |      3 | t              | t
 (3 rows)
 
 SELECT pg_relation_size(reltoastrelid) AS toast_size FROM pg_class

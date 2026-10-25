@@ -2324,12 +2324,14 @@ static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int le
 					  int nest, ProllyTreeVisitNode visit, void *arg);
 
 /*
- * How deep value trees nest: a row's leaf names value trees (nest 1),
- * whose leaves hold bytes and name nothing.  A walk refuses a deeper one,
- * which only a chunk made elsewhere could be: each nesting is a recursion,
- * and a chain of them would overflow the stack.
+ * How deep value trees nest: a row's leaf names value trees (nest 1): a
+ * long value's, or a long jsonb document's JSON tree, whose leaves name
+ * the value trees of its long strings (nest 2), whose leaves hold bytes
+ * and name nothing.  A walk refuses a deeper one, which only a chunk made
+ * elsewhere could be: each nesting is a recursion, and a chain of them
+ * would overflow the stack.
  */
-#define MAX_VALUE_NESTING	1
+#define MAX_VALUE_NESTING	2
 
 /*
  * A leaf item's value trees walked: its own, if it is stored out of line,

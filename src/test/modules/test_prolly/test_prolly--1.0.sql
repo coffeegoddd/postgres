@@ -581,6 +581,17 @@ CREATE FUNCTION test_chunk_put_leaf(vals bytea[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A hash pointer naming a root (a tree made by test_chunk_put_leaf or
+-- test_chunk_items_tree) as a
+-- JSON tree; and the memory this backend's last whole read of a JSON tree
+-- took (its working memory and the document).
+CREATE FUNCTION test_json_tree_pointer(root text)
+RETURNS jsonb
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION test_json_read_memory()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Collect the chunk store's garbage (full: all of it): the chunks kept and
 -- freed of those collected, the bytes freed, and how long (microseconds)
 -- appends were held off.

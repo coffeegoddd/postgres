@@ -52,10 +52,11 @@ SELECT * FROM pg_temp.reads(test_chunk_put_node(65535, ARRAY[test_chunk_put_leaf
 SELECT * FROM pg_temp.reads(test_chunk_put('\x010101000000000000'::bytea));
 SELECT * FROM pg_temp.reads(test_chunk_put_node(2, ARRAY[test_chunk_put('\x010101000000000000'::bytea)]));
 
--- A value tree's leaves hold bytes and name nothing: a leaf naming a value
--- tree that names another (chunks made by hand: a leaf of one item, key
--- 'k', flagged as stored out of line, naming the chunk before) is refused
--- by a walk, as is a chain of them deep enough to overflow the stack.
+-- Value trees nest two deep at most (a row, a JSON tree, a long string's
+-- value tree, whose leaves hold bytes and name nothing): a deeper chain
+-- (chunks made by hand: a leaf of one item, key 'k', flagged as stored out
+-- of line, naming the chunk before) is refused by a walk, as is a chain of
+-- them deep enough to overflow the stack.
 CREATE FUNCTION pg_temp.ref(h text, cnt int) RETURNS bytea LANGUAGE sql AS $$
 	SELECT set_byte('\x00'::bytea, 0, length(decode(h, 'hex'))) || decode(h, 'hex')
 		|| set_byte('\x00'::bytea, 0, cnt) $$;
@@ -70,7 +71,9 @@ BEGIN
 	END LOOP;
 	RETURN h;
 END $$;
--- (one: a row naming a value tree)
+-- (one: a row naming a value tree; two: a row naming a JSON tree naming
+-- a long string's value tree)
 SELECT test_tree_read(pg_temp.nest(1), 'walk') AS walked;
-SELECT * FROM pg_temp.reads(pg_temp.nest(2)) WHERE how IN ('walk', 'diff_nodes');
+SELECT test_tree_read(pg_temp.nest(2), 'walk') AS walked;
+SELECT * FROM pg_temp.reads(pg_temp.nest(3)) WHERE how IN ('walk', 'diff_nodes');
 SELECT * FROM pg_temp.reads(pg_temp.nest(60000)) WHERE how IN ('walk', 'diff_nodes');

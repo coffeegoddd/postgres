@@ -30,6 +30,8 @@ OBJS = \
 	diffmerge_folded.o \
 	hash_blake3.o \
 	journal_index.o \
+	jsontree_paths.o \
+	jsontree_stub.o \
 	hash_sha256.o \
 	hash_stub.o \
 	keyenc_ordered.o \
@@ -50,6 +52,7 @@ OBJS = \
 	prolly_datum.o \
 	prolly_deps.o \
 	prolly_extconfig.o \
+	prolly_jsonb.o \
 	prolly_registry.o \
 	prolly_seen.o \
 	prolly_fold.o \
