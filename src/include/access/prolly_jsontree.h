@@ -53,7 +53,11 @@
  *   read() checks what it reads is a document's tree (paths well formed,
  *   an array's indexes from 0 without gaps, nothing under an item, each
  *   container packed exactly when it is short enough) and the document
- *   what jsonb builds, as canonical jsonb bytes are checked.
+ *   what jsonb builds, as canonical jsonb bytes are checked.  get(),
+ *   kind() and set() check the items and nodes they read, and only those:
+ *   an index is found by its key, and an array's size taken from its last
+ *   element's key, so a gap in an array's indexes elsewhere is not seen
+ *   (the array as read by read() is refused).
  *
  * Provisional (v0).
  *

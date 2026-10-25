@@ -152,14 +152,24 @@ INSERT INTO set_values VALUES (0, '"set"'), (1, 'null'), (2, '{"n": [1, 2.50]}')
 CREATE TEMP TABLE set_cases AS
 SELECT p.id, p.path, (random() * 5)::int AS n, random() < 0.5 AS c
 FROM paths p WHERE random() < 0.3;
-SELECT count(*) > 1000 AS many_sets FROM set_cases;
+-- (the heap's document tells which are errors: try_set's subtransaction
+-- takes no tree edit, so the others are compared outside one)
+ALTER TABLE set_cases ADD COLUMN err bool;
+UPDATE set_cases s SET err = try_set(h.j, s.path, v.v, s.c) LIKE 'error:%'
+FROM plain h, set_values v WHERE h.id = s.id AND v.n = s.n;
+SELECT count(*) > 1000 AS many_sets, count(*) FILTER (WHERE err) > 0 AS errors
+FROM set_cases;
+WITH ok AS MATERIALIZED (SELECT * FROM set_cases WHERE NOT err)
 SELECT s.id, s.path, s.n, s.c
-FROM set_cases s JOIN set_values USING (n) JOIN vt.docs d USING (id) JOIN plain h USING (id)
-WHERE try_set(d.j, s.path, v, s.c) IS DISTINCT FROM try_set(h.j, s.path, v, s.c)
+FROM ok s JOIN set_values USING (n) JOIN vt.docs d USING (id) JOIN plain h USING (id)
+WHERE jsonb_set(d.j, s.path, v, s.c)::text IS DISTINCT FROM jsonb_set(h.j, s.path, v, s.c)::text
 ORDER BY 1, 2, 3, 4;
--- the errors were reached
-SELECT count(*) FILTER (WHERE try_set(h.j, s.path, v, s.c) LIKE 'error:%') > 0 AS errors
-FROM set_cases s JOIN set_values USING (n) JOIN plain h USING (id);
+-- the errors, each statement on its own (a tree edit would give a row)
+SELECT format('SELECT jsonb_set(j, %L, %L, %L) FROM vt.docs WHERE id = %s',
+			  s.path, v.v, s.c, s.id)
+FROM (SELECT * FROM set_cases WHERE err AND n <> 4 ORDER BY id, path::text, n, c LIMIT 12) s
+	 JOIN set_values v USING (n)
+ORDER BY s.id, s.path::text, s.n, s.c \gexec
 -- a path of more than one dimension: jsonb_set's error
 SELECT jsonb_set(j, '{{a},{b}}', '1') FROM vt.docs WHERE id = 1;
 
@@ -175,7 +185,7 @@ DECLARE
 BEGIN
 	FOR e IN SELECT s.*, v FROM set_cases s JOIN set_values USING (n)
 			 WHERE s.path IS NOT NULL AND array_position(s.path, NULL) IS NULL
-				   AND try_set((SELECT j FROM plain WHERE id = s.id), s.path, v, s.c) NOT LIKE 'error:%'
+				   AND NOT s.err
 			 ORDER BY random() LIMIT 60 LOOP
 		k := k + 1;
 		UPDATE vt.docs SET j = jsonb_set(j, e.path, e.v, e.c) WHERE id = e.id;
@@ -232,10 +242,64 @@ SELECT (test_toast_counters(true)).nodes_read AS set_nodes \gset
 SELECT :set_nodes > 0 AND :set_nodes * 10 < :whole_nodes AS set_reads_less;
 SELECT j #>> '{items,k77,name}' AS edited, (test_toast_pointer(j)).form AS form FROM vt.big WHERE id = 1;
 
--- An edit in a read-only transaction.
+-- No tree edit where its nodes wouldn't outlive the result, or can't be
+-- written: jsonb_set() edits the document whole, giving what it gives.
+-- In a read-only transaction, taking no transaction ID:
 BEGIN READ ONLY;
-SELECT jsonb_set(j, '{items,k78,name}', '"read only"') #>> '{items,k78,name}' AS set FROM vt.big WHERE id = 1;
+SELECT jsonb_set(j, '{items,k78,name}', '"read only"') #>> '{items,k78,name}' AS set,
+	   (test_toast_pointer(jsonb_set(j, '{items,k78,name}', '"read only"'))) IS NULL AS whole
+FROM vt.big WHERE id = 1;
+SELECT pg_current_xact_id_if_assigned() IS NULL AS no_xid;
 COMMIT;
+-- In a subtransaction that aborts, the result living on in a variable:
+CREATE FUNCTION set_in_subxact() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	x jsonb;
+BEGIN
+	BEGIN
+		SELECT jsonb_set(j, '{items,k5}', '"in subxact"') INTO x FROM vt.big WHERE id = 1;
+		RAISE EXCEPTION 'boom';
+	EXCEPTION WHEN OTHERS THEN
+		NULL;
+	END;
+	INSERT INTO vt.big VALUES (4, x);
+	RETURN x #>> '{items,k5}';
+END $$;
+SELECT set_in_subxact();
+SELECT j #>> '{items,k5}' AS kept, (SELECT j FROM vt.big WHERE id = 4) =
+	   jsonb_set((SELECT j FROM vt.big WHERE id = 1), '{items,k5}', '"in subxact"') AS same
+FROM vt.big WHERE id = 4;
+-- In a parallel plan, its workers' edits: a worker's chunks would be lost
+-- with it, and it can take no transaction ID.
+CREATE TABLE vt.many (id int PRIMARY KEY, j jsonb);
+INSERT INTO vt.many
+SELECT i, (SELECT jsonb_object_agg('k' || g, md5((i * 1000 + g)::text)) FROM generate_series(1, 100) g)
+FROM generate_series(1, 300) i;
+SELECT count(*) FILTER (WHERE (test_toast_pointer(j)).form = 3) AS trees FROM vt.many;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM vt.many WHERE jsonb_set(j, '{k5}', '"x"') ->> 'k5' = 'x';
+SELECT count(*) FROM vt.many WHERE jsonb_set(j, '{k5}', '"x"') ->> 'k5' = 'x';
+BEGIN;
+INSERT INTO vt.many VALUES (1000, '{}');
+CREATE TEMP TABLE many_copy AS SELECT id, jsonb_set(j, '{k5}', '"x"') AS j FROM vt.many WHERE id < 1000;
+SELECT count(*) FILTER (WHERE j ->> 'k5' = 'x' AND j ->> 'k6' IS NOT NULL) AS edited FROM many_copy;
+COMMIT;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- and a plan run in a worker by debug_parallel_query
+SET debug_parallel_query = on;
+BEGIN;
+INSERT INTO vt.many VALUES (1001, '{}');
+CREATE TEMP TABLE forced_copy AS SELECT id, jsonb_set(j, '{k7}', '"y"') AS j FROM vt.many WHERE id = 7;
+SELECT j ->> 'k7' AS k7, j ->> 'k8' IS NOT NULL AS rest FROM forced_copy;
+COMMIT;
+RESET debug_parallel_query;
 
 \c postgres
 DROP DATABASE regress_jsonb_tree_ops;

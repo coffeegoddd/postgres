@@ -39,6 +39,8 @@
 #include "access/prolly_jsonb.h"
 #include "access/prolly_jsontree.h"
 #include "access/prolly_toast.h"
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -151,8 +153,19 @@ prolly_jsonb_tree_set(Datum doc, ArrayType *patharr, Jsonb *value,
 	int64		delta;
 	Jsonb	   *whole;
 
-	/* a path of more than one dimension, or with a NULL step, is an error */
-	if (ARR_NDIM(patharr) > 1 ||
+	/*
+	 * An edit puts the new tree's nodes in the chunk store as the top
+	 * transaction's, so it is taken only where they outlive the result:
+	 * not in a parallel operation (a worker's chunks are its own, lost
+	 * when it exits, and it can take no transaction ID), nor in a
+	 * subtransaction (an aborted one's chunks go with it, while the
+	 * result may live on in a variable), nor where nothing may be written
+	 * (a read-only transaction, recovery).  A path of more than one
+	 * dimension, or with a NULL step, is an error.
+	 */
+	if (IsInParallelMode() || GetCurrentTransactionNestLevel() > 1 ||
+		XactReadOnly || RecoveryInProgress() ||
+		ARR_NDIM(patharr) > 1 ||
 		!datum_tree(doc, &root, &rawsize) ||
 		!path_elements(patharr, &path, &npath))
 		return false;

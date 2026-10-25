@@ -50,6 +50,12 @@ extern bool prolly_jsonb_tree_get(Datum doc, ProllyJsonbKind kind,
  * jsonb_set(doc, path, value, create), if doc (as stored) is a JSON tree:
  * *result a hash pointer to the edited tree, doc itself if nothing
  * changed, or the document whole if it became too short to be a tree.
+ * The edited tree's nodes are the top transaction's chunks (it takes a
+ * transaction ID), so the edit is declined where they wouldn't outlive
+ * the result or can't be written: in a parallel operation, a
+ * subtransaction, a read-only transaction or recovery.  A result that no
+ * row takes leaves its nodes unreferenced, for the chunk store's
+ * collection to remove.
  */
 extern bool prolly_jsonb_tree_set(Datum doc, ArrayType *path, Jsonb *value,
 								  bool create, Datum *result);
