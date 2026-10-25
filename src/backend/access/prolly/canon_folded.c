@@ -231,6 +231,7 @@
 #include "utils/inval.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
@@ -9317,8 +9318,90 @@ drop_routine_sql(const MoveItem *it)
 }
 
 /*
- * Run each statement in a subtransaction of its own: those that fail, left
- * for later (each as is), in order.
+ * Is ed an error a move's definition may fail with only for what another
+ * of the move's statements makes, drops or changes first, so that it may
+ * succeed once those have run?  A routine with a SQL-standard body, a view
+ * or a materialized view is parsed against the objects it uses, which may
+ * not be made yet, or not be as they will be (a column it groups by not
+ * yet functionally dependent on a primary key the move adds, a type not
+ * yet changed): any error of the statement's own is such a failure, and
+ * one that never succeeds is raised once no statement makes progress
+ * (make_views()).  Not so a cancel, a timeout or a shutdown (class 57),
+ * running out of memory or disk (53), a system error (58), an internal
+ * error or corruption (XX), a deadlock or serialization failure (40), or
+ * a lock not granted in time: those are the move's, not the statement's,
+ * and are raised as they are.
+ */
+static bool
+waits_on_another(const ErrorData *ed)
+{
+	switch (ERRCODE_TO_CATEGORY(ed->sqlerrcode))
+	{
+		case ERRCODE_OPERATOR_INTERVENTION:
+		case ERRCODE_INSUFFICIENT_RESOURCES:
+		case ERRCODE_SYSTEM_ERROR:
+		case ERRCODE_INTERNAL_ERROR:
+		case ERRCODE_TRANSACTION_ROLLBACK:
+			return false;
+		default:
+			return ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE;
+	}
+}
+
+/*
+ * Run sql in a subtransaction of its own: true if it ran.  If it failed
+ * for another of the move's statements (waits_on_another()), its error is
+ * returned in *failure, in mcxt, the subtransaction rolled back; any other
+ * error is raised again, the subtransaction rolled back first so that
+ * whatever catches it finds its own (sub)transaction current.
+ */
+static bool
+try_statement(const char *sql, MemoryContext mcxt, ResourceOwner owner,
+			  ErrorData **failure)
+{
+	bool		ran = false;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(mcxt);
+	PG_TRY();
+	{
+		int			rc;
+
+		INJECTION_POINT("prolly-move-try-statement", NULL);
+		rc = SPI_execute(sql, false, 0);
+		if (rc < 0)
+			elog(ERROR, "could not run \"%s\": %s", sql,
+				 SPI_result_code_string(rc));
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+		ran = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(mcxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+		if (!waits_on_another(ed))
+			ReThrowError(ed);
+		if (failure)
+			*failure = ed;
+		else
+			FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	return ran;
+}
+
+/*
+ * Run each statement in a subtransaction of its own: those that fail for
+ * another statement of the move (waits_on_another()), left for later (each
+ * as is), in order.
  */
 static List *
 try_statements(List *stmts)
@@ -9330,37 +9413,16 @@ try_statements(List *stmts)
 
 	foreach(lc, stmts)
 	{
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(mcxt);
-		PG_TRY();
-		{
-			int			rc = SPI_execute(lfirst(lc), false, 0);
-
-			if (rc < 0)
-				elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
-					 SPI_result_code_string(rc));
-			ReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(mcxt);
-			CurrentResourceOwner = owner;
-		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(mcxt);
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(mcxt);
-			CurrentResourceOwner = owner;
+		if (!try_statement(lfirst(lc), mcxt, owner, NULL))
 			failed = lappend(failed, lfirst(lc));
-		}
-		PG_END_TRY();
 	}
 	return failed;
 }
 
 /*
  * Make views, each after the views it uses, or drop them, each after those
- * using it: those that fail are tried again once others are done, until
- * none can be.
+ * using it: those that fail for another (waits_on_another()) are tried
+ * again once others are done, until none can be.
  */
 static void
 make_views(List *views)
@@ -9376,30 +9438,15 @@ make_views(List *views)
 
 		foreach(lc, views)
 		{
-			BeginInternalSubTransaction(NULL);
-			MemoryContextSwitchTo(mcxt);
-			PG_TRY();
-			{
-				int			rc = SPI_execute(lfirst(lc), false, 0);
+			ErrorData  *ed = NULL;
 
-				if (rc < 0)
-					elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
-						 SPI_result_code_string(rc));
-				ReleaseCurrentSubTransaction();
-				MemoryContextSwitchTo(mcxt);
-				CurrentResourceOwner = owner;
-			}
-			PG_CATCH();
+			if (!try_statement(lfirst(lc), mcxt, owner, &ed))
 			{
-				MemoryContextSwitchTo(mcxt);
-				last = CopyErrorData();
-				FlushErrorState();
-				RollbackAndReleaseCurrentSubTransaction();
-				MemoryContextSwitchTo(mcxt);
-				CurrentResourceOwner = owner;
+				if (last)
+					FreeErrorData(last);
+				last = ed;
 				failed = lappend(failed, lfirst(lc));
 			}
-			PG_END_TRY();
 		}
 		if (list_length(failed) == list_length(views))
 			ReThrowError(last);
