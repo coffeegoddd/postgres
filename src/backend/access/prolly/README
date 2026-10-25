@@ -927,10 +927,10 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers.  Redo of one writes nothing when the
-record says those pages were logged as images (a WAL level for backups,
-below); at wal_level minimal it writes the same pages, walking the
-snapshot's own leaves as the record names them.
+finds), never visiting the buffers.  Redo of one writes the same pages,
+walking the snapshot's own leaves as the record names them, and syncs
+nothing when the record says those pages were logged as images (a WAL
+level for backups, below).
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
@@ -950,11 +950,15 @@ images (with synchronous_commit off, a crash may lose the commit, but WAL
 is replayed as a prefix: no commit survives without the images before
 it), and a base backup either replays the image or copies the block
 after its start checkpoint wrote and synced it.  Redo of such a record
-writes and syncs nothing (the images' redo wrote each block, and a
-restartpoint syncs it), so a standby, or a promoted one, follows the same
-argument.  Redo goes by the record's flag, not the current wal_level,
-which can change only across a restart, whose shutdown checkpoint syncs
-everything.
+syncs nothing (the images' redo wrote each block, and a restartpoint
+syncs it), so a standby, or a promoted one, follows the same argument.
+It still writes the relation's pages out, as the primary does: a page
+found the relation's own before the share or snapshot may change in place
+after its image and before the record (a row lock or a prune, which don't
+ask the map), and that change's redo reaches the relation's buffer only,
+which nothing else would write to the block before a restartpoint.
+Redo goes by the record's flag, not the current wal_level, which can
+change only across a restart, whose shutdown checkpoint syncs everything.
 
 At wal_level minimal no image is logged, and a share or snapshot syncs the
 database's page store, a whole-file fsync that writes back every page the
@@ -1049,9 +1053,17 @@ head and the commit differ by.  It does so only where that costs less
 than writing the rows the working set and the commit differ by, as told
 without folding from the baseline and the change finder's count since it
 (the working set may have been brought near the commit by its own
-writes), and only while no other backend of the database holds a
-snapshot: such a snapshot would read the head's rows, neither its own
-nor the commit's.  A branch reset back and forth between two commits
+writes), and only while no other session on the branch holds a snapshot
+(on main, which sessions don't lock, no other backend of the database):
+such a snapshot would read the head's rows, neither its own nor the
+commit's.  A transaction elsewhere whose snapshot can't move (REPEATABLE
+READ, SERIALIZABLE) may come to the branch later, by a checkout or a read
+of its working set: the move records that it gave the branch its head's
+pages (in shared memory: no snapshot outlives a restart), and such a
+transaction, if its snapshot doesn't see the move, fails with a
+serialization failure instead.  A restore of the commit's own kept pages, and a share, aren't
+held back so: a snapshot then reads the commit's rows, as after a
+TRUNCATE, a state the move makes rather than one that never was.  A branch reset back and forth between two commits
 takes this path: each restore gives a table new storage, and the other
 commit's snapshot goes with the old storage.  Whatever still differs
 (definitions, sequences, a table not restored) the move writes as before.

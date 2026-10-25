@@ -437,6 +437,7 @@ tests += {
       't/444_wal_durable_standby.pl',
       't/445_store_sync_slots.pl',
       't/446_store_sync_slot_races.pl',
+      't/468_bmap_shared_redo_changes.pl',
       't/471_kept_carried_crash.pl',
       't/472_kept_carried_standby.pl',
     ],

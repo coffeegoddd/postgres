@@ -96,7 +96,8 @@ typedef struct xl_bmap_rel
  * SHARE's and SHARED's main data: the relation shared and its copy.  With
  * BMAP_PRESERVE_LOGGED (SHARED), the source's own blocks were logged as
  * PRESERVE images before the record, whose redo wrote them to their
- * blocks: redo of the share writes and syncs nothing.
+ * blocks: redo of the share syncs nothing (it writes the source's buffers
+ * out, for a page changed in place after its image).
  */
 #define BMAP_PRESERVE_LOGGED	0x01
 
