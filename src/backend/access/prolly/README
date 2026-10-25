@@ -465,11 +465,20 @@ short enough to be inline comes back whole), and prolly_jsonb_diff()
 diffs two trees by their nodes; anything a tree doesn't handle, any
 document that isn't one, and every document in a database whose encoding
 isn't UTF-8, they do whole, as #>, jsonb_set() and a diff of the
-documents would.  PostgreSQL's own jsonb functions read the document
-whole.  An array's indexes are in its elements' keys, so
-prolly_jsonb_set() only replaces an element of an array that isn't
-packed: an insert or a removal, which would renumber every element after
-it, is done whole.  Folded format 22 is the first whose rows hold JSON
+documents would.  jsonb's own ->, ->>, #>, #>> and ? and jsonb_set() do
+the same before they detoast their argument (prolly_jsonb.h): -> by a
+key only on an object and by an index only on an array, ? by the key's
+path on an object (an array's string elements are found whole), and
+prolly_jsonb_set() is jsonb_set() itself.  An edit's nodes are the top
+transaction's chunks, so it is done whole in a parallel operation, a
+subtransaction, a read-only transaction and recovery; a result no row
+takes leaves its nodes for the chunk store's collection.  Other jsonb
+functions read
+the document whole.  A negative index counts from the array's end, its
+size read from its last element's key.  An array's indexes are in its
+elements' keys, so an edit only replaces an element of an array that
+isn't packed: an insert or a removal, which would renumber every element
+after it, is done whole.  Folded format 22 is the first whose rows hold JSON
 trees.
 
 A hash pointer a read hands out (a long value of history, read or not)
@@ -1194,7 +1203,8 @@ SQL
 ---
 
 prolly_jsonb.c is the prolly_jsonb_* functions, on JSON trees (Trees and
-chunks, above).
+chunks, above), and the path reads and edits jsonb's operators take on
+them (prolly_jsonb.h).
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
 arguments and results, so scripts written for Doltgres run here.  A tag

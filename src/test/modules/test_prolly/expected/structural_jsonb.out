@@ -65,7 +65,7 @@ FROM sj.docs d JOIN plain p USING (id) ORDER BY id;
 
 -- Paths read from the tree give what #> gives: objects, arrays, scalars,
 -- empty containers, JSON null (not SQL NULL), nothing there, a path into a
--- scalar, an index that isn't one, a negative index (read whole), the
+-- scalar, an index that isn't one, a negative index (from the end), the
 -- whole document.
 CREATE TEMP TABLE paths (path text[]);
 INSERT INTO paths VALUES ('{items,5}'), ('{items,5,name}'), ('{items,5,price}'),
@@ -129,8 +129,8 @@ SELECT :path_nodes > 0 AND :path_nodes * 10 < :whole_nodes AS path_reads_less;
 -- a value replaced, a key added (into an empty object too), a container
 -- set to a scalar and back, an array element replaced, a value set to
 -- what it was, a missing key without create, a path through a scalar,
--- and what the tree leaves to a whole edit (an index past the end, a
--- negative one, a scalar document).  After each, the tree's root is the
+-- a negative index (from the end), and what the tree leaves to a whole
+-- edit (an index past the end, a scalar document).  After each, the tree's root is the
 -- root a document built whole has.
 CREATE TEMP TABLE edits (n int, id int, path text[], v jsonb, c bool);
 INSERT INTO edits VALUES
