@@ -287,6 +287,8 @@ fold_branch(void *arg)
 	ProllyNodeRef root;
 
 	INJECTION_POINT("prolly-fold-worker-fold", NULL);
+	/* (no snapshot kept under the fold: see fold_pass()) */
+	Assert(!HaveRegisteredOrActiveSnapshot());
 	prolly_database_components(&dc);
 	if (PROLLY_HAS(dc.refs, checkpoint_unless_moved))
 		*folded = dc.refs->checkpoint_unless_moved(&root);
