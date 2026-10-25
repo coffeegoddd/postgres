@@ -29,6 +29,7 @@
 #include "access/prolly_matcache.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_moveplan.h"
+#include "access/prolly_nodecache.h"
 #include "access/prolly_merge.h"
 #include "access/prolly_reclaim.h"
 #include "access/prolly_refs.h"
@@ -74,6 +75,9 @@ extern void prolly_database_components(ProllyDatabaseComponents *components);
 
 /* The content hash every chunk is named by. */
 extern const ProllyHashRoutine *prolly_content_hash(void);
+
+/* The cache of decoded chunks the chunk stores read through (NULL: none). */
+extern const ProllyNodeCacheRoutine *prolly_node_cache(void);
 
 /*
  * The components a table's committed versions are written with, without

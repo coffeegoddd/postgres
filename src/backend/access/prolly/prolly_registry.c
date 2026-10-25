@@ -69,6 +69,7 @@ static const char *const changelog_callbacks[] = {PROLLY_CHANGELOG_CALLBACK_NAME
 static const char *const moveplan_callbacks[] = {PROLLY_MOVEPLAN_CALLBACK_NAMES};
 static const char *const matcache_callbacks[] = {PROLLY_MATCACHE_CALLBACK_NAMES};
 static const char *const jsontree_callbacks[] = {PROLLY_JSONTREE_CALLBACK_NAMES};
+static const char *const nodecache_callbacks[] = {PROLLY_NODECACHE_CALLBACK_NAMES};
 static const char *const commitcache_callbacks[] = {PROLLY_COMMITCACHE_CALLBACK_NAMES};
 
 /*
@@ -106,6 +107,7 @@ CHECK_ROUTINE(ProllyChangeLogRoutine, PROLLY_CHANGELOG_FIRST_CALLBACK, PROLLY_CH
 CHECK_ROUTINE(ProllyMovePlannerRoutine, PROLLY_MOVEPLAN_FIRST_CALLBACK, PROLLY_MOVEPLAN_LAST_CALLBACK, moveplan_callbacks);
 CHECK_ROUTINE(ProllyMatCacheRoutine, PROLLY_MATCACHE_FIRST_CALLBACK, PROLLY_MATCACHE_LAST_CALLBACK, matcache_callbacks);
 CHECK_ROUTINE(ProllyJsonTreeRoutine, PROLLY_JSONTREE_FIRST_CALLBACK, PROLLY_JSONTREE_LAST_CALLBACK, jsontree_callbacks);
+CHECK_ROUTINE(ProllyNodeCacheRoutine, PROLLY_NODECACHE_FIRST_CALLBACK, PROLLY_NODECACHE_LAST_CALLBACK, nodecache_callbacks);
 CHECK_ROUTINE(ProllyCommitCacheRoutine, PROLLY_COMMITCACHE_FIRST_CALLBACK, PROLLY_COMMITCACHE_LAST_CALLBACK, commitcache_callbacks);
 
 #define IFACE(name, type, first, names) \
@@ -158,6 +160,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("matcache", ProllyMatCacheRoutine, PROLLY_MATCACHE_FIRST_CALLBACK, matcache_callbacks),
 	[PROLLY_IFACE_JSON_TREE] =
 	IFACE("json_tree", ProllyJsonTreeRoutine, PROLLY_JSONTREE_FIRST_CALLBACK, jsontree_callbacks),
+	[PROLLY_IFACE_NODE_CACHE] =
+	IFACE("node_cache", ProllyNodeCacheRoutine, PROLLY_NODECACHE_FIRST_CALLBACK, nodecache_callbacks),
 	[PROLLY_IFACE_COMMIT_CACHE] =
 	IFACE("commit_cache", ProllyCommitCacheRoutine, PROLLY_COMMITCACHE_FIRST_CALLBACK, commitcache_callbacks),
 };

@@ -47,6 +47,8 @@ OBJS = \
 	merge_stub.o \
 	moveplan_costs.o \
 	moveplan_stub.o \
+	nodecache_shared.o \
+	nodecache_stub.o \
 	prolly_chunkstore.o \
 	prolly_config.o \
 	prolly_hashtext.o \

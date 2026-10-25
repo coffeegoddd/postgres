@@ -35,6 +35,8 @@ backend_sources += files(
   'merge_stub.c',
   'moveplan_costs.c',
   'moveplan_stub.c',
+  'nodecache_shared.c',
+  'nodecache_stub.c',
   'prolly_chunkstore.c',
   'prolly_config.c',
   'prolly_hashtext.c',

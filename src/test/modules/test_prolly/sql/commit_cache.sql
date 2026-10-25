@@ -1,6 +1,6 @@
 -- The commit cache: walking history (HEAD~n, a commit by its hash) takes
 -- each commit's links from a table in shared memory, so a walk reads each
--- commit once, not once each time a backend's chunk cache lets go of it.
+-- commit once, not once each time the node cache lets go of it.
 -- What a transaction read is everyone's only once it commits, and a
 -- collection lets go of everything.
 
@@ -62,13 +62,11 @@ SELECT dolt_hashof('HEAD~4') = :'base' AS resolved;
 :flush
 SELECT * FROM pg_temp.work();
 
--- Without the backend's chunk cache, still none read.
-SET prolly_chunk_cache_size = 0;
+-- The walk's end, by its hash: read once, then found.
 SELECT dolt_hashof('HEAD~4') = :'base' AS resolved;
 SELECT dolt_hashof(:'base') = :'base' AS by_hash;
 :flush
 SELECT * FROM pg_temp.work();
-RESET prolly_chunk_cache_size;
 
 -- A commit a transaction made and read is its own: found again inside
 -- it, never after it rolls back (the commit is in no store).

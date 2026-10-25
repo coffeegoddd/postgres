@@ -65,6 +65,7 @@ Changes to this design are tracked in GitHub issues:
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
 	json_tree         prolly_jsontree.h       paths, stub
+	node_cache        prolly_nodecache.h      shared, stub
 	commit_cache      prolly_commitcache.h    shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
@@ -417,6 +418,19 @@ more than two deep (the walk recurses a nesting; a row's leaf names a
 JSON tree, whose leaves name its long strings' value trees, and nothing
 deeper names one).
 
+The store's reads of chunks from its files (a read of the file, a CRC
+check and a decompression each) go through the node cache
+(prolly_nodecache.h, nodecache_shared.c): decoded chunks in a fixed area
+of shared memory, prolly_node_cache_size of it, for every backend and the
+fold worker, so a session's reads of trees another session or an earlier
+connection read touch no file.  It is evicted by a clock, so chunks read
+again and again (upper levels, the nodes repeated diffs share) stay.  An
+entry is of a store as of a collection's generation: a chunk is named by
+its content, so nothing kept is stale, and a read after a collection
+finds nothing of what the collection removed.  Each read's level checks
+run on what the cache gives as on what the files do.  pg_stat_prolly
+counts its hits and misses (node_cache_hits, node_cache_misses).
+
 Large values stay TOAST's in the working set.  A commit stores a column
 whose canonical bytes are longer than 2048 as a reference to a value tree
 of its own (valenc_canonical.c, through the tree's value_write()), so
@@ -703,9 +717,9 @@ Walking history (HEAD~n, ^n, a commit named by its hash) takes each
 commit's links (its root, parents and height) from the commit cache
 (prolly_commitcache.h; "shared", commitcache_shared.c), a table in shared
 memory of prolly_commit_cache_entries commits (4096; 0 turns it off),
-before reading the commit.  A backend's own chunk cache lets go of the
-commits as soon as a large diff or reset reads past them, so without it
-each step of a walk could be a read from disk.  An entry is of the chunk
+before reading the commit.  The node cache lets go of the commits as soon
+as a large diff or reset reads past them, so without it each step of a
+walk could be a read from disk.  An entry is of the chunk
 store's GC generation it was read in (the chunk store's generation()) and
 is found only in that generation, so a collection's swap lets go of them
 all; dropping a database forgets its entries.  A transaction's entries

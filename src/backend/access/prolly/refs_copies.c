@@ -4261,8 +4261,7 @@ commit_cache(void)
  * cache, if it has them for the store's GC generation now, else read
  * (copies_commit_get()) and remembered there.  False if id names no commit
  * in the store.  Walking history this way reads each commit once for every
- * backend, rather than once each time a backend's chunk cache has let go
- * of it.
+ * backend, rather than once each time the node cache has let go of it.
  */
 static bool
 commit_links(const ProllyHash *id, ProllyCommitLinks *links)

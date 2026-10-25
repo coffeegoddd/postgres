@@ -6,9 +6,9 @@
  *	  the chunk store GC generation it was read in.
  *
  * Every backend walking the same history reads the same commits, so one
- * table serves them all, and it outlives any backend's own chunk cache:
- * a long diff or reset that reads a backend's chunks out of that cache
- * leaves this one as it was.
+ * table serves them all, and it holds only commits: a long diff or reset
+ * that reads every other chunk out of the node cache leaves this one as
+ * it was.
  *
  * A transaction's entries are kept in its backend until it commits (a
  * commit it wrote is in no one else's store until then), and forgotten if

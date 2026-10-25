@@ -5,10 +5,11 @@
  *	  height), found by its id without reading the commit.
  *
  * Walking history (HEAD~n, a merge base, a log) reads one commit per step,
- * and a commit is a chunk somewhere in the store's files.  The chunks a
- * backend keeps (the chunk store's cache) are let go of as soon as a large
- * diff or reset reads past them, and the page cache may have let go of the
- * files too, so each step can be a read from disk.  A commit is named by
+ * and a commit is a chunk somewhere in the store's files.  The decoded
+ * chunks kept in memory (the node cache) are let go of, least recently
+ * used first, as soon as a large diff or reset reads past them, and the
+ * page cache may have let go of the files too, so each step can be a read
+ * from disk.  A commit is named by
  * its content, so what it links to never changes: a cache of the links
  * never needs invalidating, only forgetting.
  *
