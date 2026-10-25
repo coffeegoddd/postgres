@@ -206,15 +206,21 @@ prolly_fold_rewritten(Oid relid)
 		 * checkpoint folds every table of the branch, and one the next
 		 * commit refuses (a value its type's text form no longer reads
 		 * back as, say) is that commit's to report, not this table's
-		 * ALTER's.  A cancel still cancels, and an internal error or
-		 * corruption (class XX) is never set aside.  Another error is
-		 * logged as it was raised, its fields kept, under a message
-		 * naming the table.
+		 * ALTER's.  A cancel, a timeout or a shutdown (class 57), running
+		 * out of memory or disk (53), a system error (58), an internal
+		 * error or corruption (XX), or a deadlock or serialization failure
+		 * (40) is never set aside.  Another error is logged as it was
+		 * raised, its fields kept, under a message naming the table.
 		 */
-		if (ed->sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			ERRCODE_TO_CATEGORY(ed->sqlerrcode) ==
-			ERRCODE_TO_CATEGORY(ERRCODE_INTERNAL_ERROR))
-			ReThrowError(ed);
+		switch (ERRCODE_TO_CATEGORY(ed->sqlerrcode))
+		{
+			case ERRCODE_OPERATOR_INTERVENTION:
+			case ERRCODE_INSUFFICIENT_RESOURCES:
+			case ERRCODE_SYSTEM_ERROR:
+			case ERRCODE_INTERNAL_ERROR:
+			case ERRCODE_TRANSACTION_ROLLBACK:
+				ReThrowError(ed);
+		}
 		FlushErrorState();
 		pgstat_count_prolly(PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED, 1);
 		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
