@@ -111,11 +111,13 @@ extern PGDLLIMPORT int prolly_kept_checkouts;
  * ROLE's, when something depends on the role: a kept state's objects would
  * otherwise keep a role they name from being dropped, as any branch's do):
  * false if it has none, so nothing changed.  Another database's kept
- * states are let go of only from that database; prolly_kept_states_named()
- * says whether a dependency report (checkSharedDependencies()'s) names
- * objects that may be some.
+ * states are let go of only from that database.  prolly_drop_role_hint()
+ * is DROP ROLE's hint for a dependency report (checkSharedDependencies()'s)
+ * that names objects of other databases, which may be their kept states'
+ * or makers of their branches, tags and stashes, or a hidden branch here
+ * (NULL: none).
  */
 extern bool prolly_let_go_of_kept_states(void);
-extern bool prolly_kept_states_named(const char *detail);
+extern const char *prolly_drop_role_hint(const char *detail);
 
 #endif							/* PROLLY_MATCACHE_H */

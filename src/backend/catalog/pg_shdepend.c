@@ -17,6 +17,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -56,6 +57,7 @@
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/typecmds.h"
+#include "access/prolly_config.h"
 #include "catalog/branch.h"
 #include "catalog/pg_branch.h"
 #include "miscadmin.h"
@@ -1450,6 +1452,7 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 	Relation	sdepRel;
 	ListCell   *cell;
 	ObjectAddresses *deleteobjs;
+	List	   *made = NIL;
 
 	deleteobjs = new_object_addresses();
 
@@ -1588,6 +1591,21 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 				case SHARED_DEPENDENCY_OWNER:
 
 					/*
+					 * A branch, tag or stash the role made is no catalog's
+					 * object: the version control drops or gives it up
+					 * below, as the dependency mechanism can't.
+					 */
+					if (sdepForm->dbid == MyDatabaseId &&
+						IsRefsMadeClassId(sdepForm->classid))
+					{
+						ObjectAddress *m = palloc_object(ObjectAddress);
+
+						ObjectAddressSet(*m, sdepForm->classid, sdepForm->objid);
+						made = lappend(made, m);
+						break;
+					}
+
+					/*
 					 * Save it for deletion below, if it's a local object or a
 					 * role grant. Other shared objects, such as databases,
 					 * should not be removed here.
@@ -1628,6 +1646,14 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 
 		systable_endscan(scan);
 	}
+
+	foreach(cell, made)
+	{
+		ObjectAddress *m = lfirst(cell);
+
+		prolly_drop_made_object(m->classId, m->objectId);
+	}
+	list_free_deep(made);
 
 	/*
 	 * For stability of deletion-report ordering, sort the objects into
@@ -1790,6 +1816,13 @@ shdepReassignOwned_Owner(Form_pg_shdepend sdepForm, Oid newrole)
 	/* Issue the appropriate ALTER OWNER call */
 	switch (sdepForm->classid)
 	{
+		case RefsBranchClassId:
+		case RefsTagClassId:
+		case RefsStashClassId:
+			prolly_reassign_made_object(sdepForm->classid, sdepForm->objid,
+										newrole);
+			break;
+
 		case TypeRelationId:
 			AlterTypeOwner_oid(sdepForm->objid, newrole, true);
 			break;
@@ -1971,4 +2004,46 @@ dropBranchSharedDependencies(Oid branch)
 		CatalogTupleDelete(sdepRel, &tup->t_self);
 	systable_endscan(scan);
 	table_close(sdepRel, RowExclusiveLock);
+}
+
+/*
+ * newMadeObjectId
+ *
+ * An id for a new object of kind classId that no catalog lists (a branch,
+ * tag or stash a role made, kept in the database's refs), by which its
+ * maker's entry names it: no entry of this database's names another of
+ * that kind by it.
+ */
+Oid
+newMadeObjectId(Oid classId)
+{
+	Relation	sdepRel = table_open(SharedDependRelationId, AccessShareLock);
+	Oid			id;
+	bool		used;
+
+	do
+	{
+		ScanKeyData key[3];
+		SysScanDesc scan;
+
+		id = GetNewObjectId();
+		ScanKeyInit(&key[0],
+					Anum_pg_shdepend_dbid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(MyDatabaseId));
+		ScanKeyInit(&key[1],
+					Anum_pg_shdepend_classid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(classId));
+		ScanKeyInit(&key[2],
+					Anum_pg_shdepend_objid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(id));
+		scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
+								  NULL, 3, key);
+		used = HeapTupleIsValid(systable_getnext(scan));
+		systable_endscan(scan);
+	} while (used);
+	table_close(sdepRel, AccessShareLock);
+	return id;
 }

@@ -17,6 +17,7 @@
 
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
@@ -26,6 +27,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_branch.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_collation.h"
@@ -4122,6 +4124,13 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case RefsBranchClassId:
+		case RefsTagClassId:
+		case RefsStashClassId:
+			prolly_describe_made_object(&buffer, object->classId,
+										object->objectId);
+			break;
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -4725,6 +4734,18 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case TransformRelationId:
 			appendStringInfoString(&buffer, "transform");
+			break;
+
+		case RefsBranchClassId:
+			appendStringInfoString(&buffer, "branch");
+			break;
+
+		case RefsTagClassId:
+			appendStringInfoString(&buffer, "tag");
+			break;
+
+		case RefsStashClassId:
+			appendStringInfoString(&buffer, "stash");
 			break;
 
 		default:
@@ -6113,6 +6134,39 @@ getObjectIdentityParts(const ObjectAddress *object,
 				}
 
 				table_close(transformDesc, AccessShareLock);
+			}
+			break;
+
+		case RefsBranchClassId:
+		case RefsTagClassId:
+		case RefsStashClassId:
+			{
+				char	   *name;
+				int			n;
+
+				if (!prolly_made_object_identity(object->classId,
+												 object->objectId, &name, &n))
+				{
+					if (!missing_ok)
+						elog(ERROR, "could not find %s %u in the refs",
+							 getObjectTypeDescription(object, false),
+							 object->objectId);
+					break;
+				}
+				if (object->classId == RefsStashClassId)
+				{
+					appendStringInfo(&buffer, "stash@{%d} of %s", n,
+									 quote_identifier(name));
+					if (objname)
+						*objname = list_make2(pstrdup(name),
+											  psprintf("%d", n));
+				}
+				else
+				{
+					appendStringInfoString(&buffer, quote_identifier(name));
+					if (objname)
+						*objname = list_make1(pstrdup(name));
+				}
 			}
 			break;
 

@@ -49,7 +49,8 @@
  *				   between them
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
- *				   then the bytes)
+ *				   then the bytes), then the maker record of the role that
+ *				   pushed it (as 'A''s)
  *	'I' name	-> the working set's identity anchor (the canonicalizer's
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
@@ -65,11 +66,14 @@
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
- *	'A' name	-> the role that made the branch, which owns it (its OID,
- *				   native byte order); main has none, being the database
- *				   owner's
- *	'G' name	-> the role that made the tag here (the same): none for a
- *				   tag fetched or pushed
+ *	'A' name	-> the maker record of the role that made the branch,
+ *				   which owns it: the role's OID, then the id its shared
+ *				   dependency (pg_shdepend, RefsBranchClassId) names the
+ *				   branch by (native byte order each); main has none,
+ *				   being the database owner's
+ *	'G' name	-> the role that made the tag here (the same, its
+ *				   dependency's RefsTagClassId): none for a tag fetched or
+ *				   pushed
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
@@ -188,6 +192,7 @@
 #include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
@@ -243,9 +248,13 @@
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
  * pages retired; 8: a merge's tables in schema conflicts, in its merge
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
- * trees a pin keeps; 12: a schema-conflicted table's names on each side.
+ * trees a pin keeps; 12: a schema-conflicted table's names on each side;
+ * 14: a maker record's shared dependency id, after its role.
  */
-#define REFS_FORMAT		"13"
+#define REFS_FORMAT		"14"
+
+/* A maker record's length: the role, then its dependency's id (each an OID) */
+#define MAKER_RECORD_LEN	(2 * sizeof(Oid))
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -503,9 +512,9 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 
 				p = declare_hashes(p, end, 1, refs);
 				blen = prolly_get_varint(&p, end);
-				if (blen + sizeof(Oid) > (uint64) (end - p))
+				if (blen + MAKER_RECORD_LEN > (uint64) (end - p))
 					break;
-				p += blen + sizeof(Oid);
+				p += blen + MAKER_RECORD_LEN;
 			}
 			break;
 		default:
@@ -1251,26 +1260,52 @@ branch_head(const char *name, ProllyHash *head)
 	return found && head->len > 0;
 }
 
-/* Record role (InvalidOid: none) as the role that made branch (tag) name. */
-static void
-maker_put(char tag, const char *name, Oid role)
+/*
+ * A maker record: the role, and the id its shared dependency names the
+ * object by (newMadeObjectId()).
+ */
+typedef struct MakerRecord
 {
-	StringInfoData key;
-	StringInfoData v;
+	Oid			role;
+	Oid			id;
+} MakerRecord;
 
-	initStringInfo(&key);
-	initStringInfo(&v);
-	appendStringInfoChar(&key, tag);
-	appendStringInfoString(&key, name);
-	appendBinaryStringInfo(&v, &role, sizeof(role));
-	refs_put(key.data, key.len, OidIsValid(role) ? &v : NULL);
-	pfree(key.data);
-	pfree(v.data);
+/* The kind of object (pg_shdepend's classid) a maker record of tag is of */
+static Oid
+maker_class(char tag)
+{
+	return tag == TAG_CREATOR ? RefsBranchClassId : RefsTagClassId;
 }
 
-/* The role that made branch (tag) name; false if none is recorded. */
+/*
+ * Make role (InvalidOid: none) the recorded maker of an object of kind
+ * classId, *rec its record (rec->role InvalidOid: none yet), and its role's
+ * shared dependency so: a new one has an id given, one given up its
+ * dependency dropped, and one whose maker changes keeps its id.
+ */
+static void
+maker_change(Oid classId, MakerRecord *rec, Oid role)
+{
+	if (rec->role == role)
+		return;
+	if (!OidIsValid(role))
+	{
+		deleteSharedDependencyRecordsFor(classId, rec->id, 0);
+		rec->id = InvalidOid;
+	}
+	else if (!OidIsValid(rec->role))
+	{
+		rec->id = newMadeObjectId(classId);
+		recordDependencyOnOwner(classId, rec->id, role);
+	}
+	else
+		changeDependencyOnOwner(classId, rec->id, role);
+	rec->role = role;
+}
+
+/* Branch (tag) name's maker record; false (*rec none) if none is recorded. */
 static bool
-maker_get(char tag, const char *name, Oid *role)
+maker_record(char tag, const char *name, MakerRecord *rec)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -1280,12 +1315,55 @@ maker_get(char tag, const char *name, Oid *role)
 	initStringInfo(&v);
 	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
-	found = refs_get(key.data, key.len, &v) && v.len == sizeof(Oid);
+	found = refs_get(key.data, key.len, &v) && v.len == MAKER_RECORD_LEN;
 	if (found)
-		memcpy(role, v.data, sizeof(Oid));
+	{
+		memcpy(&rec->role, v.data, sizeof(Oid));
+		memcpy(&rec->id, v.data + sizeof(Oid), sizeof(Oid));
+	}
+	else
+		rec->role = rec->id = InvalidOid;
 	pfree(key.data);
 	pfree(v.data);
 	return found;
+}
+
+/*
+ * Record role (InvalidOid: none) as the role that made branch (tag) name,
+ * with its shared dependency (maker_change()).
+ */
+static void
+maker_put(char tag, const char *name, Oid role)
+{
+	StringInfoData key;
+	StringInfoData v;
+	MakerRecord rec;
+
+	(void) maker_record(tag, name, &rec);
+	if (rec.role == role)
+		return;
+	maker_change(maker_class(tag), &rec, role);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, tag);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &rec.role, sizeof(Oid));
+	appendBinaryStringInfo(&v, &rec.id, sizeof(Oid));
+	refs_put(key.data, key.len, OidIsValid(role) ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* The role that made branch (tag) name; false if none is recorded. */
+static bool
+maker_get(char tag, const char *name, Oid *role)
+{
+	MakerRecord rec;
+
+	if (!maker_record(tag, name, &rec))
+		return false;
+	*role = rec.role;
+	return true;
 }
 
 /*
@@ -7271,9 +7349,9 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 				p = get_hash(p, end, h);
 				heads = lappend(heads, h);
 				blen = prolly_get_varint(&p, end);
-				if (blen > (uint64) (end - p))
+				if (blen + MAKER_RECORD_LEN > (uint64) (end - p))
 					break;
-				p += blen;
+				p += blen + MAKER_RECORD_LEN;
 			}
 			continue;
 		}
@@ -7905,7 +7983,7 @@ copies_set_rebase_state(const ProllyRebaseState *state)
 /* ------------------------------------------------------------------------
  * Stashes: TAG_STASH and a list's name, its entries newest first, each its
  * commit's hash, then its branch's name (a varint length, then the bytes),
- * then the role that pushed it (its OID, native byte order).
+ * then the maker record of the role that pushed it (MAKER_RECORD_LEN).
  * ------------------------------------------------------------------------
  */
 
@@ -7913,7 +7991,7 @@ typedef struct StashEntry
 {
 	ProllyHash	stash;
 	char	   *branch;
-	Oid			maker;
+	MakerRecord maker;
 } StashEntry;
 
 static List *
@@ -7928,14 +8006,15 @@ stash_list(const char *p, const char *end)
 
 		p = get_hash(p, end, &e->stash);
 		blen = prolly_get_varint(&p, end);
-		if (blen + sizeof(Oid) > (uint64) (end - p))
+		if (blen + MAKER_RECORD_LEN > (uint64) (end - p))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("corrupt prolly stash list")));
 		e->branch = pnstrdup(p, blen);
 		p += blen;
-		memcpy(&e->maker, p, sizeof(Oid));
-		p += sizeof(Oid);
+		memcpy(&e->maker.role, p, sizeof(Oid));
+		memcpy(&e->maker.id, p + sizeof(Oid), sizeof(Oid));
+		p += MAKER_RECORD_LEN;
 		entries = lappend(entries, e);
 	}
 	return entries;
@@ -7984,7 +8063,8 @@ stash_set(const char *name, List *entries)
 		put_hash(&v, &e->stash);
 		prolly_put_varint(&v, strlen(e->branch));
 		appendStringInfoString(&v, e->branch);
-		appendBinaryStringInfo(&v, &e->maker, sizeof(Oid));
+		appendBinaryStringInfo(&v, &e->maker.role, sizeof(Oid));
+		appendBinaryStringInfo(&v, &e->maker.id, sizeof(Oid));
 	}
 	refs_put(key.data, key.len, entries ? &v : NULL);
 	pfree(key.data);
@@ -8015,7 +8095,8 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
-	e->maker = GetUserId();
+	e->maker.role = e->maker.id = InvalidOid;
+	maker_change(RefsStashClassId, &e->maker, GetUserId());
 	stash_set(name, lcons(e, entries));
 }
 
@@ -8030,8 +8111,23 @@ copies_stash_maker(const char *name, int n, Oid *role)
 	entries = stash_get(name);
 	if (n < 0 || n >= list_length(entries))
 		return false;
-	*role = ((StashEntry *) list_nth(entries, n))->maker;
+	*role = ((StashEntry *) list_nth(entries, n))->maker.role;
 	return true;
+}
+
+static void
+copies_stash_set_maker(const char *name, int n, Oid role)
+{
+	List	   *entries;
+
+	refs_init();
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return;
+	maker_change(RefsStashClassId,
+				 &((StashEntry *) list_nth(entries, n))->maker, role);
+	stash_set(name, entries);
 }
 
 static void
@@ -8083,11 +8179,14 @@ static bool
 copies_stash_drop(const char *name, int n)
 {
 	List	   *entries;
+	StashEntry *e;
 
 	lock_refs();
 	entries = stash_get(name);
 	if (n < 0 || n >= list_length(entries))
 		return false;
+	e = list_nth(entries, n);
+	maker_change(RefsStashClassId, &e->maker, InvalidOid);
 	stash_set(name, list_delete_nth_cell(entries, n));
 	return true;
 }
@@ -8095,9 +8194,78 @@ copies_stash_drop(const char *name, int n)
 static void
 copies_stash_clear(const char *name)
 {
+	List	   *entries;
+	ListCell   *lc;
+
 	lock_refs();
-	if (stash_get(name) != NIL)
+	entries = stash_get(name);
+	foreach(lc, entries)
+		maker_change(RefsStashClassId, &((StashEntry *) lfirst(lc))->maker,
+					 InvalidOid);
+	if (entries != NIL)
 		stash_set(name, NIL);
+}
+
+/*
+ * The object of kind classId whose maker record has id: a branch or tag
+ * by its 'A' or 'G' entries, a stash by the lists' entries.
+ */
+static bool
+copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag;
+	ProllyKey	from = {(const uint8 *) &tag, 1};
+	bool		found = false;
+
+	if (classId == RefsBranchClassId)
+		tag = TAG_CREATOR;
+	else if (classId == RefsTagClassId)
+		tag = TAG_TAG_CREATOR;
+	else if (classId == RefsStashClassId)
+		tag = TAG_STASH;
+	else
+		return false;
+	refs_init();
+	if (!refs_root(&root))
+		return false;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (!found && PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == tag)
+	{
+		if (tag == TAG_STASH)
+		{
+			int			i = 0;
+			ListCell   *lc;
+
+			foreach(lc, stash_list((const char *) v.data,
+								   (const char *) v.data + v.len))
+			{
+				if (((StashEntry *) lfirst(lc))->maker.id == id)
+				{
+					*n = i;
+					found = true;
+					break;
+				}
+				i++;
+			}
+		}
+		else if (v.len == MAKER_RECORD_LEN)
+		{
+			Oid			rid;
+
+			memcpy(&rid, v.data + sizeof(Oid), sizeof(Oid));
+			found = rid == id;
+		}
+		if (found)
+			appendBinaryStringInfo(name, (const char *) k.data + 1, k.len - 1);
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	return found;
 }
 
 const ProllyRefsRoutine prolly_refs_copies = {
@@ -8192,4 +8360,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_creator = copies_tag_creator,
 	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
+	.made_object = copies_made_object,
+	.stash_set_maker = copies_stash_set_maker,
 };
