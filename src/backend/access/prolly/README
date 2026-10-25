@@ -927,10 +927,10 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers.  Redo of one writes nothing when the
-record says those pages were logged as images (a WAL level for backups,
-below); at wal_level minimal it writes the same pages, walking the
-snapshot's own leaves as the record names them.
+finds), never visiting the buffers.  Redo of one writes the same pages,
+walking the snapshot's own leaves as the record names them, and syncs
+nothing when the record says those pages were logged as images (a WAL
+level for backups, below).
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
@@ -950,11 +950,15 @@ images (with synchronous_commit off, a crash may lose the commit, but WAL
 is replayed as a prefix: no commit survives without the images before
 it), and a base backup either replays the image or copies the block
 after its start checkpoint wrote and synced it.  Redo of such a record
-writes and syncs nothing (the images' redo wrote each block, and a
-restartpoint syncs it), so a standby, or a promoted one, follows the same
-argument.  Redo goes by the record's flag, not the current wal_level,
-which can change only across a restart, whose shutdown checkpoint syncs
-everything.
+syncs nothing (the images' redo wrote each block, and a restartpoint
+syncs it), so a standby, or a promoted one, follows the same argument.
+It still writes the relation's pages out, as the primary does: a page
+found the relation's own before the share or snapshot may change in place
+after its image and before the record (a row lock or a prune, which don't
+ask the map), and that change's redo reaches the relation's buffer only,
+which nothing else would write to the block before a restartpoint.
+Redo goes by the record's flag, not the current wal_level, which can
+change only across a restart, whose shutdown checkpoint syncs everything.
 
 At wal_level minimal no image is logged, and a share or snapshot syncs the
 database's page store, a whole-file fsync that writes back every page the

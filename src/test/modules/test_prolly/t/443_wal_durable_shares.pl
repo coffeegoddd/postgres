@@ -162,7 +162,7 @@ sub lose_kept
 lose_kept(7, 'at replica');
 
 # A share's own blocks lost the same way: the copy's rows come back from
-# the images, and redo of the share writes nothing.
+# the images, and redo of the share syncs nothing.
 sql(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 3});
 my @shared = split /\n/, sql(qq{
 	SELECT DISTINCT m.phys FROM plain p, test_bmap_map($plain) m
@@ -179,9 +179,9 @@ $node->start;
 is(sql(qq{SELECT test_bmap_rows_digest($copy2)}), $digest,
 	'after the share\'s blocks were lost, recovery gives the copy its rows');
 ok($node->log_contains(
-		'redo of a share of .* writes nothing: its own pages were logged as images',
+		'redo of a share of .* syncs nothing: its own pages were logged as images',
 		$log_offset),
-	'redo of the share wrote nothing');
+	'redo of the share synced nothing');
 
 # After a checkpoint, a commit's blocks were written and synced by it, so
 # a crash then needs no image: recovery begins past them.  (No write lost
