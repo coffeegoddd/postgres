@@ -3044,17 +3044,41 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 	return same_hash(&base.hash, &data->hash);
 }
 
-/* Does another backend of the database hold a snapshot? */
+/*
+ * Does another backend that may read the session branch's tables hold a
+ * snapshot?  A session on a branch other than main holds the branch's lock
+ * for as long as it is on it, so the backends holding a snapshot are asked
+ * of only among those holding the lock: one on another branch reads other
+ * relations.  Nobody holds main's, so on main every backend of the
+ * database holding one counts.  (A fold of the branch in the background
+ * reads it under its own snapshot without the lock; a fold made of pages
+ * a move changed under it isn't used, the move having changed the
+ * branch's generation, as with any restore.)
+ */
 static bool
 other_snapshots(void)
 {
-	VirtualTransactionId *vxids;
+	VirtualTransactionId *snaps;
+	VirtualTransactionId *holders;
+	LOCKTAG		tag;
 	int			n;
+	bool		found = false;
 
-	vxids = GetCurrentVirtualXIDs(InvalidTransactionId, true, false,
+	snaps = GetCurrentVirtualXIDs(InvalidTransactionId, true, false,
 								  PROC_IS_AUTOVACUUM | PROC_IN_VACUUM, &n);
-	pfree(vxids);
-	return n > 0;
+	if (n == 0 || MyBranch == BRANCH_MAIN_OID)
+	{
+		pfree(snaps);
+		return n > 0;
+	}
+	branch_locktag(&tag, MyBranch);
+	holders = GetLockConflicts(&tag, AccessExclusiveLock, NULL);
+	for (int h = 0; !found && VirtualTransactionIdIsValid(holders[h]); h++)
+		for (int i = 0; !found && i < n; i++)
+			found = VirtualTransactionIdEquals(holders[h], snaps[i]);
+	pfree(snaps);
+	pfree(holders);
+	return found;
 }
 
 static uint64
@@ -3085,8 +3109,9 @@ count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
  * A count the change finder can't give counts as large.  And not while
- * another backend of the database holds a snapshot (an open REPEATABLE
- * READ transaction, a statement running): a restore isn't MVCC-safe, and
+ * another backend on the branch holds a snapshot (other_snapshots(): an
+ * open REPEATABLE READ transaction, a statement running): a restore isn't
+ * MVCC-safe, and
  * such a snapshot, taken before the move commits, would read the head's
  * rows, neither its own nor the commit's, where writing the rows keeps it
  * safe.  (One that read the table holds a lock the restore would find

@@ -20,6 +20,7 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 prolly_fold_worker = off
+prolly.kept_commits = 1
 });
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
@@ -68,6 +69,44 @@ sql("SELECT dolt_reset('--hard', '$a')");
 cmp_ok(sql($counts), '>', $before,
 	'with no older snapshot, the head\'s pages are given back');
 is(sql('SELECT sum(v) FROM q.t'), '0', 'and the reset reached the commit');
+
+# On a branch other than main, only a snapshot of a session on the branch
+# holds the head path back: a session on another branch reads other
+# relations.  (Nobody holds main's lock, so on main every snapshot counts.)
+# (main back at c, so that no state but side's keeps a's pages: a reset
+# could otherwise be given them by a share, which isn't the head path)
+sql("SELECT dolt_reset('--hard', '$c')");
+sql(q{SELECT dolt_branch('side', dolt_hashof('HEAD'))});
+sub on_side { return sql("SELECT dolt_checkout('side'); $_[0]"); }
+# (back and forth on side, and a reset of a dirty working set to the head,
+# whose restore gives the table new storage: a's kept pages are gone)
+on_side("SELECT dolt_reset('--hard', '$c'); SELECT dolt_reset('--hard', '$a');
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 7;
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 5");
+my $main = $node->background_psql('postgres');
+$main->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+$before = sql($counts);
+on_side("SELECT dolt_reset('--hard', '$a')");
+cmp_ok(sql($counts), '>', $before,
+	'a snapshot on another branch doesn\'t hold the head path back');
+$main->query_safe('COMMIT');
+$main->quit;
+
+on_side("SELECT dolt_reset('--hard', '$c'); SELECT dolt_reset('--hard', '$a');
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 7;
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 5");
+my $side = $node->background_psql('postgres');
+$side->query_safe(q{SELECT dolt_checkout('side')});
+$side->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+$before = sql($counts);
+on_side("SELECT dolt_reset('--hard', '$a')");
+is(sql($counts), $before, 'a snapshot on the branch does');
+is($side->query_safe('SELECT sum(v) FROM q.t'),
+	'5000', 'and it still reads what it saw');
+$side->query_safe('COMMIT');
+$side->quit;
 
 $node->stop;
 done_testing();
