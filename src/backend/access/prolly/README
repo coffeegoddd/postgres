@@ -315,7 +315,8 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 16: each table's OID and qualified name, a line each, the name's
+format 17: each table's and partitioned table's OID and qualified name, a
+line each, the name's
 backslashes and newlines escaped so that no name makes a line of its
 own; read strictly, a damaged record refused; a record isn't a reference
 a collection follows, so after each collection, as a step of its own,
@@ -342,45 +343,81 @@ dropped and made again in the working set as the parent had it; and a
 table such a move changed in the working set, uncommitted (set aside, or
 left out of the commit), is recorded only as of a relation of the class
 its first parent's record lists (refs' prolly_commit_local_tables, as the
-merge, pick or revert tells it).  Relations are compared by equivalence
-class ('J'): a relation a move makes again of a table (a
-definition it can't alter in place, as a branch's first use may when its
-copies are moved to its head), or a merge, pick or revert makes of the
-other side's table (the class of the relation the commit it takes the
-version from was made from: prolly_move_provenance), is the same table
-as the one it comes from, whatever its OID; what the move sets aside of
-the uncommitted changes and puts back is the branch's own, taking no
-class from those commits.  A class outlives its relation's drop: commits
-made from the dropped relation are still read through it, and a branch's
-copy of the relation, of the same OID, may still be in use.  So a
-relation given a dropped relation's OID again (after the OID counter
-wraps) is of the dropped relation's class, and reads its versions.  Every
-move that brings a commit's table versions into the working set (a hard
-reset, a merge or pull, an integration, a cherry-pick, a rebase's picks, a
-revert, a table's checkout from a commit, a stash's pop or apply, a
-conflict's resolution with the other side's rows, a merge's or reset's
-abort), a branch's first use, and a push's move of a branch, run as one
-(VERSION_MOVE() in prolly_dolt.c, the refs' first use and branch move):
-where the move changes a table's version to one that a commit it takes
-versions from, made here, records under the table's name as made from a
-relation of another class, the table is made again
-(prolly_remake_foreign_versions(), through the canonicalizer's move with
-prolly_move_remade): a relation of its own with no grants, the mover's
-(a first use's: made as the table's owner, the least role that may,
-restricted, and given to the branch's owner).  A mover who can't drop and
-make the table (its ownership, CREATE on its schema) is refused, saying
-so.  A table that holds the version whole (a reset's, a table's
-checkout's, a first use's) is of the class of the relation the version is
-of, so a later move to it (a reset that discards changes) keeps the
-relation and its grants; one that holds a mix (a merge's, a pick's) is a
-class of its own.  The rows are as the move left them, a commit the move
-made is recorded made from the new relation, and a merge's conflicts in
-the table are of it.  So another table's rows don't land in a relation
-under its grants: they must be given again, to whom they're for.  What
-the records can't: a version of a commit made elsewhere (fetched, cloned,
-pushed: no record) keeps the relation and its grants, so an old table's
-version come back from a remote can land its rows in the table here (its
-history stays refused).
+merge, pick or revert tells it).  Relations are compared by OID: a move
+keeps a table's relation, so a relation's history is its own.  A table a
+move makes is the relation its version is of, by its OID (the canonicalizer's
+move_relids_before(), asked by heap_create_with_catalog() as the table is
+made, prolly_move_kept_relid()): the relation the commit it takes the
+version from records under the name (prolly_move_provenance; a merge of a
+table the other side made, a reset to a commit holding one dropped here),
+the one a caller names (prolly_move_kept: a conflict's resolution with
+theirs, the uncommitted changes put back after a move that set them
+aside), or the one it was, for a table the move makes again (a definition
+it can't alter in place).  Its storage is a file of its own; a relation
+cache entry of that OID, of another branch's relation or of the one just
+dropped, is forgotten first (RelationForgetForNewRelation()), and where it
+can't be (open) or the branch has a relation of that OID, the table is a
+new relation.  A branch's copies keep their OIDs, so a table is the same
+relation on every branch that has it from the same making.
+
+A table is its relation and its name together.  Two relations of one name
+are two tables, whatever identity the name gives them: one dropped and
+made again, one renamed into a dropped one's name, or one made on each of
+two branches apart (#936).  So no move puts one relation's version into
+another's table, under its grants:
+- A merge (a pull, an integration, a cherry-pick, a revert, a rebase's
+  step) whose other side changed (or made) a table since the base, where
+  the other side's commit records it, under the name the merge matches,
+  as made from another relation than the table here (or than the base's),
+  keeps the table as the branch has it, with every table of its
+  inheritance or partition tree (names linked through any side's
+  definitions, the canonicalizer's table_parents()): base and theirs take
+  those tables as ours has them (splice()), so the merge changes nothing
+  in them and no row of theirs is read or listed.  Each is a table
+  identity conflict (diffmerge_folded.c's identity_conflicts()), recorded
+  in the merge in progress ('D', refs format 17: each table's relation
+  here and theirs, its tree, its names, and the local branch theirs was
+  the head of) and counted as a conflict: shown by dolt_status ("identity
+  conflict"), dolt_conflicts (one each) and dolt_identity_conflicts (ours
+  and theirs, relation and owner, the tree), kept by
+  dolt.allow_commit_conflicts as other conflicts are, refusing a commit
+  until resolved, and cleared by the merge's abort.  A fast-forward isn't
+  made where theirs may bring such a version: the merge is three-way.
+  A stash's apply, which has no merge in progress, and a merge that fails
+  on conflicts (an integration) refuse it.
+- dolt_conflicts_resolve('--ours', t) keeps the branch's relations, rows
+  and grants: the conflict is resolved as the branch has it.  '--theirs'
+  makes the other side's relations the branch's tables, a tree at once:
+  it takes owning each of the branch's, which are dropped
+  (performMultipleDeletions(), CASCADE, an object access hook watching):
+  refused where the drop would take anything the move can't make again as
+  the merge has it (anything outside the versioned schemas, another table
+  or a column of one, a materialized view, whose query would run as the
+  resolver); views, foreign keys and policies of versioned tables are made
+  again.  Then the move makes theirs' (their definitions, indexes,
+  constraints, policies and rows, from theirs' commit) as the session's
+  role, each of its OID, and gives each the privileges the local branch
+  theirs was the head of has on it (branch_ops' carry_privileges(), as a
+  merge of that branch gives a table it makes).  The merge's commit then
+  records the chosen relations.
+- A hard reset, a table's checkout from a commit and a push's move of a
+  branch (dolt_serve_move_head) that would put into a table here a version
+  of another relation (as the commit moved to records it, under the
+  table's name) are refused, checked after the move and before its
+  transaction can commit (VERSION_MOVE() in prolly_dolt.c, the refs'
+  branch move), with a hint to drop the table here first: the move then
+  makes the version's relation again, of its OID, with no grants.  A move
+  back to the branch's head that undoes the branch's own work (a merge's,
+  pick's or revert's abort, a stash's push) drops such tables itself and
+  makes the head's relations again; so does a branch's first use, whose
+  copies (of the nearest source's relations) may be other relations than
+  its head's, and a rebase's end, the rebased commits being the branch's.
+  The grants of a table so made again went with the relation it replaced.
+  A move between versions of one relation keeps it, and its grants.
+- Moves to commits made elsewhere (fetched, cloned, pushed: no record)
+  keep the relation and its grants, as before, so an old table's version
+  come back from a remote can land its rows in the table here (its
+  history stays refused).
 A refused read reads each commit's record about once: a walk that meets
 nothing marks the commits it saw apart.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and
@@ -606,9 +643,11 @@ identity) is kept under ours' names, its own and its columns': the
 merge's names are made again so (merge_renames()'s keep_ours), found by
 merging the definitions once before the merge does.
 dolt_conflicts_resolve() refuses it, and the merge can't be committed
-until it is aborted.  A cherry-pick or revert, schema conflicts of other
-objects, and a table the other side's objects use in its version (a view
-over a column it added) fail as before, the last saying so.
+until it is aborted.  A table the other side has as another relation is a
+table identity conflict instead (see "Identity across renames").  A
+cherry-pick or revert, schema conflicts of other objects, and a table the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last saying so.
 
 A keyed row both sides of a merge changed is merged column by column, on
 its encoded fields (the keying's row_fields()): all three versions are

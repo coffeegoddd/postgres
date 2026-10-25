@@ -2932,6 +2932,33 @@ RelationForgetRelation(Oid rid)
 }
 
 /*
+ *		RelationForgetForNewRelation
+ *
+ *		Make way for a relation about to be made with OID rid: a versioned
+ *		table a move makes keeps its version's relation, by OID, and the
+ *		cache may still hold an entry of that OID, of a relation of another
+ *		branch, or of the one the move just dropped.  The entry is removed
+ *		whatever its rd_*Subid say: what they tell of a relation the new one
+ *		replaces is rebuilt from the catalogs if a rollback brings it back.
+ *		False, the entry left, if it is open: the caller makes the relation
+ *		with another OID.
+ */
+bool
+RelationForgetForNewRelation(Oid rid)
+{
+	Relation	relation;
+
+	RelationIdCacheLookup(rid, relation);
+	if (!relation)
+		return true;
+	if (!RelationHasReferenceCountZero(relation) || relation->rd_isnailed)
+		return false;
+	RelationCacheDelete(relation);
+	RelationDestroyRelation(relation, false);
+	return true;
+}
+
+/*
  *		RelationCacheInvalidateEntry
  *
  *		This routine is invoked for SI cache flush messages.

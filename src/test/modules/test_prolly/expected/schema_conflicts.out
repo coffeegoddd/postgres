@@ -1088,14 +1088,6 @@ SELECT length(dolt_commit('-am', 'sw theirs')::text) AS committed;
         42
 (1 row)
 
--- (first used from main: from sw_theirs, whose tables swapped names, its
--- copies would be other tables' relations, made again)
-SELECT dolt_checkout('main') IS NOT NULL AS on_main;
- on_main 
----------
- t
-(1 row)
-
 SELECT dolt_checkout('mk_theirs') IS NOT NULL AS on_mk;
  on_mk 
 -------

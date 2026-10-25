@@ -671,18 +671,23 @@ OF` are built in D18's shapes.
   one commit (its record names the new relation, its parent's the old).
   A merge, pick or revert committed over uncommitted changes is recorded
   made only from what its first parent's record and the working set both
-  have. A move (a hard reset, a merge or pull, a cherry-pick, a revert) or
-  a branch's first use that changes a table's version to one a commit made
-  here holds of another table makes the table again, a relation of its
-  own: the mover's (a first use's, the branch owner's), with no grants,
-  which must be given again
-  ([#936](https://github.com/coffeegoddd/postgres/issues/936)); in Dolt,
-  grants are on table names and survive any move. Further, a table such a
-  move changed in the working set is recorded only as
-  of the class its first parent's record lists. Relations are compared by
-  equivalence class: a relation a move makes again of a table, or a merge,
-  pick or revert makes of the other side's, is the same table as the one
-  it comes from. Known limits, as commits name tables by name and identity
+  have. A table is its relation and its name together: a move keeps a
+  table's relation by OID (a table a merge or reset makes is the relation
+  its version's commit records), and no move puts one relation's version
+  into another's table
+  ([#936](https://github.com/coffeegoddd/postgres/issues/936)). A merge,
+  pull, cherry-pick, revert or rebase step whose other side brings,
+  under a table's name, another relation's version stops on a table
+  identity conflict (`dolt_identity_conflicts`): the table kept as the
+  branch has it, its rows not merged, until `dolt_conflicts_resolve`
+  keeps ours or takes theirs (the other side's relation, rows and grants,
+  ours dropped); a stash's apply and an integration refuse it; a hard
+  reset, a table's checkout and a push's branch move refuse, until the
+  table is dropped there; a branch's first use makes the head's relation.
+  So two tables made apart of one name on two branches, or a table
+  dropped and made again on one, never merge rows; in Dolt they do, the
+  table matched by name (and tag), and grants, on names, survive any
+  move. Known limits, as commits name tables by name and identity
   alone and a table made again keeps its name's identity (#891, decided:
   commit identities don't change): unrecorded commits (made elsewhere)
   fail closed for history, but a move to one keeps the relation, so an old

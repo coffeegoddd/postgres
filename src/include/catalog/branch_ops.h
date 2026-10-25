@@ -24,6 +24,7 @@
 #define BRANCH_OPS_H
 
 #include "common/relpath.h"
+#include "datatype/timestamp.h"
 
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
@@ -128,9 +129,16 @@ typedef struct BranchOpsRoutine
 	 * kept).
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
+	 *
+	 * A lock held by a page sweep (bmap_compaction_let_go()) is waited
+	 * for, here and in restore() and share_kept(), the sweep asked to let
+	 * go: within lock_timeout of *wait_start, the operation's (0 until one
+	 * of its tries first waits, which sets it), so that lock_timeout bounds
+	 * the waits of all the calls one operation makes.
 	 */
 	bool		(*share) (Oid source, List *relids,
-						  bool (*unchanged) (void *arg), void *arg);
+						  bool (*unchanged) (void *arg), void *arg,
+						  TimestampTz *wait_start);
 
 	/*
 	 * Optional: keep the pages of the session branch's relations relids as
@@ -174,7 +182,8 @@ typedef struct BranchOpsRoutine
 	 * the restored storage once it commits.
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
-							BranchKeptRelation *renewed);
+							BranchKeptRelation *renewed,
+							TimestampTz *wait_start);
 
 	/*
 	 * Optional: let go of a snapshot keep() or restore() took, if its
@@ -215,7 +224,27 @@ typedef struct BranchOpsRoutine
 	 * so the caller gives only pages kept before every snapshot there is.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
-							   int nkept);
+							   int nkept, TimestampTz *wait_start);
+
+	/*
+	 * Optional: add to each of the session branch's relations relids the
+	 * privileges of the relation of branch source at the same place in
+	 * fromids, the one the object a move brought was made from: the
+	 * relation's and each column's (by name), as the relation's owner here
+	 * gives them, and the source relation's owner's own a grant to it.
+	 * For a relation a merge of source, or a pick of its head, made here,
+	 * whose commits hold no privileges.  None for one source
+	 * hasn't, or has now of another kind or name, nor where source is no
+	 * branch with copies.
+	 */
+	void		(*carry_privileges) (const char *source, List *relids,
+									 List *fromids);
+
+	/*
+	 * Optional: the owner of branch's relation relid (InvalidOid: branch
+	 * hasn't it, or is no branch with copies).
+	 */
+	Oid			(*relation_owner) (const char *branch, Oid relid);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

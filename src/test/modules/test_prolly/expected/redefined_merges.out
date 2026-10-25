@@ -247,8 +247,10 @@ SELECT length(dolt_commit('-am', 'resolved')::text) AS committed;
 (1 row)
 
 COMMIT;
--- A conflict in a table neither base nor ours had (both made it): its
--- versions are listed, the base's as none.
+-- A conflict in a table the base hadn't: its versions are listed, the
+-- base's as none.  (Both sides have the table as one relation, not two
+-- made apart, which would be a table identity conflict: a pick of the
+-- commit that made it, onto a branch that has it, changed, since.)
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -269,14 +271,20 @@ SELECT length(dolt_commit('-Am', 'feature: both')::text) AS committed;
         42
 (1 row)
 
+SELECT dolt_hashof('HEAD') AS both_made \gset
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
  {0,"Switched to branch 'main'"}
 (1 row)
 
-CREATE TABLE rm.both (id int PRIMARY KEY, v text);
-INSERT INTO rm.both VALUES (1, 'ours');
+SELECT (dolt_merge('feature'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+UPDATE rm.both SET v = 'ours';
 SELECT length(dolt_commit('-Am', 'main: both')::text) AS committed;
  committed 
 -----------
@@ -284,10 +292,10 @@ SELECT length(dolt_commit('-Am', 'main: both')::text) AS committed;
 (1 row)
 
 BEGIN;
-SELECT (dolt_merge('feature'))[3:4];
-      dolt_merge       
------------------------
- {1,"conflicts found"}
+SELECT (dolt_cherry_pick(:'both_made'))[2] AS conflicts;
+ conflicts 
+-----------
+ 1
 (1 row)
 
 SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rm.both);
@@ -555,5 +563,5 @@ SELECT dolt_branch('-D', 'feature');
 
 DROP SCHEMA rm CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table rm.k
-drop cascades to table rm.t
+DETAIL:  drop cascades to table rm.t
+drop cascades to table rm.k

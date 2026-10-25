@@ -345,12 +345,34 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- (sm7.p, dropped and made again on the feature, is another table there:
+-- a table identity conflict, resolved with the feature's)
+BEGIN;
 SELECT (dolt_merge('sm7_feature'))[2:4];
-        dolt_merge        
---------------------------
- {1,0,"merge successful"}
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
 (1 row)
 
+SELECT table_name FROM dolt_identity_conflicts();
+ table_name 
+------------
+ sm7.p
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'sm7.p');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('-m', 'sm7 feature merged')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+COMMIT;
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
  same_root 
 -----------
@@ -400,6 +422,9 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- (the base's sm7.p is another table: dropped here first, the reset makes
+-- it again)
+DROP TABLE sm7.p;
 SELECT dolt_reset('--hard', :'sm7_base');
  dolt_reset 
 ------------
@@ -440,10 +465,10 @@ SELECT dolt_branch('-D', 'sm7_feature');
 DROP SCHEMA sm7 CASCADE;
 NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table sm7.a
+drop cascades to table sm7.p
 drop cascades to table sm7.k
 drop cascades to table sm7.r
 drop cascades to function sm7.f(integer)
-drop cascades to table sm7.p
 SELECT length(dolt_commit('-Am', 'without sm7')::text) AS committed;
  committed 
 -----------
@@ -876,6 +901,9 @@ SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
     |  2 |  2 |     |  1
 (1 row)
 
+-- (main's sm12.kr, dropped and made again there, is another table: dropped
+-- here first, the reset makes main's)
+DROP TABLE sm12.kr;
 SELECT dolt_reset('--hard', :'sm12_main');
  dolt_reset 
 ------------
@@ -1267,14 +1295,14 @@ SELECT * FROM dolt_status();
 
 DROP SCHEMA sm14 CASCADE;
 NOTICE:  drop cascades to 8 other objects
-DETAIL:  drop cascades to table sm14.v
-drop cascades to table sm14.names
-drop cascades to table sm14.na
-drop cascades to table sm14.ni
-drop cascades to table sm14.nic
-drop cascades to table sm14.q
+DETAIL:  drop cascades to table sm14.q
 drop cascades to table sm14.d
 drop cascades to table sm14.u
+drop cascades to table sm14.v
+drop cascades to table sm14.names
+drop cascades to table sm14.ni
+drop cascades to table sm14.nic
+drop cascades to table sm14.na
 SELECT length(dolt_commit('-Am', 'without sm14')::text) AS committed;
  committed 
 -----------
@@ -1286,11 +1314,12 @@ NOTICE:  drop cascades to table sm_full.u
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table app.t
-drop cascades to table app.p
--- Two tables' names swapped: a move back to the head puts each back (the
--- NOT NULL of a key going after the key, whatever their names' order),
--- by a hard reset, and by a merge's abort.
+DETAIL:  drop cascades to table app.p
+drop cascades to table app.t
+-- Two tables' names swapped: a hard reset back to the head, which matches
+-- tables by name, would put each table's version into the other's
+-- relation, and is refused; with the tables dropped it makes each its own
+-- relation again.  A merge's abort does that itself.
 CREATE SCHEMA sw VERSIONED;
 CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
 CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
@@ -1301,13 +1330,25 @@ SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
         42
 (1 row)
 
+SELECT 'sw.a'::regclass::oid AS sw_a, 'sw.b'::regclass::oid AS sw_b \gset
 ALTER TABLE sw.a RENAME TO tmp;
 ALTER TABLE sw.b RENAME TO a;
 ALTER TABLE sw.tmp RENAME TO b;
 SELECT dolt_reset('--hard');
+ERROR:  cannot move tables sw.a, sw.b to versions of other tables
+DETAIL:  The version of sw.a this moves to was made from another relation of that name: a table dropped and made again since, or made apart from the one here.
+HINT:  Drop the table on this branch first: the move then makes the version's own relation again.
+DROP TABLE sw.a, sw.b;
+SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
  {0}
+(1 row)
+
+SELECT 'sw.a'::regclass::oid = :sw_a AS a_again, 'sw.b'::regclass::oid = :sw_b AS b_again;
+ a_again | b_again 
+---------+---------
+ t       | t
 (1 row)
 
 SELECT * FROM sw.a;
@@ -1374,6 +1415,12 @@ SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
  aborted 
 ---------
  t
+(1 row)
+
+SELECT 'sw.a'::regclass::oid = :sw_a AS a_again, 'sw.b'::regclass::oid = :sw_b AS b_again;
+ a_again | b_again 
+---------+---------
+ t       | t
 (1 row)
 
 SELECT * FROM sw.a;
@@ -1467,8 +1514,8 @@ SELECT dolt_reset('--hard');
 
 DROP SCHEMA sb CASCADE;
 NOTICE:  drop cascades to 5 other objects
-DETAIL:  drop cascades to function sb.seven()
-drop cascades to table sb.t
+DETAIL:  drop cascades to table sb.t
+drop cascades to function sb.seven()
 drop cascades to function sb.from_t()
 drop cascades to materialized view sb.m
 drop cascades to function sb.from_m()

@@ -1151,8 +1151,8 @@ prolly_check_branch_rename(const char *newname)
 
 /*
  * Run fn(arg) with prolly_move_provenance the commits from (n of them): the
- * commits a move takes versions from, which the tables it makes take their
- * relations' equivalence classes from.
+ * commits a move takes versions from, whose records name the relations the
+ * tables it makes are (a table keeps its relation, by OID).
  */
 #define WITH_PROVENANCE(from_, n_, ...) \
 	do { \
@@ -1178,54 +1178,51 @@ typedef struct VersionMove
 	int			n;
 	bool		folded;			/* before is the branch folded before it */
 	ProllyNodeRef before;
-	bool		had_head;
-	ProllyHash	head;			/* the head before it */
+	List	   *relids;			/* and its tables' relations then */
 } VersionMove;
 
+/*
+ * Before the move: the branch folded, and its tables' relations, if a table
+ * here may take a version of another relation of its name from the commits,
+ * as their records alone tell (cheaply: else nothing is folded, nor
+ * checked after).
+ */
 static void
 version_move_begin(VersionMove *vm, const ProllyHash *from, int n)
 {
 	vm->from = from;
 	vm->n = n;
-	vm->had_head = PROLLY_CALL(refs(), resolve, "HEAD", &vm->head);
-	vm->folded = n > 0 && prolly_versions_may_be_foreign(from, n) &&
+	vm->relids = NIL;
+	vm->folded = n > 0 && prolly_versions_may_mismatch(from, n) &&
 		PROLLY_CALL(refs(), working_set, NULL, &vm->before);
+	if (vm->folded)
+		vm->relids = prolly_relations_of(&vm->before);
 }
 
 /*
- * After the move: its tables whose versions came from another table's
- * commits made again, relations of their own
- * (prolly_remake_foreign_versions()), as the session's role; and the
- * commit it made, if it made one (the head moved, not to a commit of
- * those), recorded made from them.
+ * After it: refused, before the transaction can commit (the error undoes
+ * what it wrote), if it put into a table here a version of another relation
+ * (prolly_refuse_mismatched_versions()).  A merge keeps such a table as the
+ * branch has it, a table identity conflict, so this refuses only what it
+ * didn't tell.
  */
 static void
 version_move_end(VersionMove *vm)
 {
-	ProllyHash	now;
-	bool		made;
-
-	if (!vm->folded)
-		return;
-	made = PROLLY_CALL(refs(), resolve, "HEAD", &now) &&
-		!(vm->had_head && same_hash(&now, &vm->head));
-	for (int i = 0; made && i < vm->n; i++)
-		if (same_hash(&now, &vm->from[i]))
-			made = false;
-	BRANCH_WRITES_HUSHED(prolly_remake_foreign_versions(&vm->before, vm->from,
-														vm->n, made ? &now : NULL,
-														InvalidOid));
+	if (vm->folded)
+		prolly_refuse_mismatched_versions(&vm->before, vm->relids, vm->from,
+										  vm->n, PROLLY_MISMATCH_MOVE);
 }
 
 /*
  * Every move that brings a commit's table versions into the session's
  * branch (a reset, a merge, a pick, a revert, a table's checkout, a
- * stash's apply, a conflict's resolution) runs as VERSION_MOVE(), with the
- * commits it takes them from (from_, n_ of them): its writes hushed, its
- * tables' classes taken from those commits' records (WITH_PROVENANCE()),
- * and, where one of those records says a table's new version is another
- * table's, the table made again after it (version_move_end()).  A branch's
- * first use, and a push's move of a branch, do the same in the refs.
+ * stash's apply, a conflict's resolution, an abort) runs as
+ * VERSION_MOVE(), with the commits it takes them from (from_, n_ of them):
+ * its writes hushed, the tables it makes the relations those commits'
+ * records name (WITH_PROVENANCE()), and refused if it put into a table
+ * here a version of another relation (version_move_end()).  A branch's
+ * first use, and a push's move of a branch, are checked so in the refs.
  */
 #define VERSION_MOVE(from_, n_, ...) \
 	do { \
@@ -1988,7 +1985,8 @@ checkout_tables(const char *ref, char **names, int nnames)
 	 * it; the branch may be its head's again, its changes all put back)
 	 */
 	branch_note_write(MyBranch);
-	VERSION_MOVE(&commit, 1, PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	VERSION_MOVE(&commit, 1,
+				 PROLLY_CALL(diff_merge(), move_to, &target, &working));
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
@@ -2517,7 +2515,13 @@ abort_in_progress(const char *what)
 
 	branch_note_write(MyBranch);
 	(void) PROLLY_CALL(refs(), resolve, "HEAD", &head);
-	VERSION_MOVE(&head, head.len > 0 ? 1 : 0, PROLLY_CALL(refs(), reset, "HEAD"));
+	/* (a table its resolution made theirs: the head's relation again) */
+	if (head.len > 0)
+		BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
+														   psprintf("abort the %s", what),
+														   true));
+	VERSION_MOVE(&head, head.len > 0 ? 1 : 0,
+				 PROLLY_CALL(refs(), reset, "HEAD"));
 	settled();
 }
 
@@ -2530,8 +2534,18 @@ static void
 stopped_outside_block(const char *what, const char *What, const char *between,
 					  int conflicts, int nviolations)
 {
+	ProllyMergeState ms;
+
 	if (IsTransactionBlock() || prolly_allow_commit_conflicts())
 		return;
+	/* (a table that is another table on the other side: kept, not merged) */
+	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.nidentity > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflict detected, transaction rolled back", what),
+				 errdetail("Table %s is another table on the other side, a relation of its own of that name: a table identity conflict.",
+						   ms.identity[0].name),
+				 errhint("%s in a transaction block to resolve it with dolt_conflicts_resolve('--ours') or ('--theirs') before committing, or set dolt.allow_commit_conflicts to keep it.", What)));
 	if (conflicts > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -3326,7 +3340,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 		check_integrated_rows(target, needs);
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
-	/* (the tables it makes take their classes from mine's head's record) */
+	/* (the tables it makes are the relations mine's head's record names) */
 	VERSION_MOVE(&mine_head, mine_head.len > 0 ? 1 : 0,
 				 conflicts = PROLLY_CALL(diff_merge(), merge, mine, message, 0, &id));
 	if (conflicts > 0)
@@ -3650,6 +3664,11 @@ dolt_stash(PG_FUNCTION_ARGS)
 			ProllyHash	at = {0};
 
 			(void) PROLLY_CALL(refs(), resolve, "HEAD", &at);
+			/* (a table made again since: the head's relation again) */
+			if (at.len > 0)
+				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&at,
+																   "stash the changes",
+																   true));
 			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
 						 PROLLY_CALL(refs(), reset, "HEAD"));
 		}
@@ -3677,7 +3696,8 @@ dolt_stash(PG_FUNCTION_ARGS)
 		 */
 		branch_note_write(MyBranch);
 		VERSION_MOVE(&stash, 1,
-					 PROLLY_CALL(diff_merge(), apply, hash_hex(&stash), "dolt_stash"));
+					 PROLLY_CALL(diff_merge(), apply, hash_hex(&stash),
+								 "dolt_stash"));
 		if (strcmp(cmd, "pop") == 0)
 			(void) PROLLY_CALL(refs(), stash_drop, name, n);
 	}
@@ -3977,16 +3997,20 @@ dolt_tags(PG_FUNCTION_ARGS)
 /*
  * The tables with conflicts and the tables with constraint violations a
  * pick or revert in progress left, as Dolt counts them (tables, not rows):
- * the branch had no violations before it (refuse_violations()).
+ * the branch had no violations before it (refuse_violations()); and the
+ * tables in table identity conflicts (identity, if wanted).
  */
 static void
-tables_left(int *conflicted, int *violated)
+tables_left(int *conflicted, int *violated, int *identity)
 {
 	ProllyMergeState ms;
 	List	   *relids = NIL;
 	ListCell   *lc;
+	bool		merging = PROLLY_CALL(refs(), merge_state, &ms);
 
-	*conflicted = PROLLY_CALL(refs(), merge_state, &ms) ? ms.ntables : 0;
+	*conflicted = merging ? ms.ntables : 0;
+	if (identity)
+		*identity = merging ? ms.nidentity : 0;
 	foreach(lc, PROLLY_CALL(refs(), violations))
 		relids = list_append_unique_oid(relids, ((ProllyViolation *) lfirst(lc))->relid);
 	*violated = list_length(relids);
@@ -4116,12 +4140,14 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
+		int			itables;
 
 		stopped_outside_block("cherry-pick", "Cherry-pick", "sides",
 							  conflicts - nviolations, nviolations);
-		tables_left(&ctables, &vtables);
+		tables_left(&ctables, &vtables, &itables);
 		result[0] = "";
 		result[1] = psprintf("%d", ctables);
+		result[2] = psprintf("%d", itables);
 		result[3] = psprintf("%d", vtables);
 		PG_RETURN_DATUM(text_array(4, result));
 	}
@@ -4168,12 +4194,14 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
+		int			itables;
 
 		stopped_outside_block("revert", "Revert", "sides",
 							  stopped - nviolations, nviolations);
-		tables_left(&ctables, &vtables);
+		tables_left(&ctables, &vtables, &itables);
 		result[0] = "";
 		result[1] = psprintf("%d", ctables);
+		result[2] = psprintf("%d", itables);
 		result[3] = psprintf("%d", vtables);
 		return;
 	}
@@ -4244,15 +4272,20 @@ dolt_revert(PG_FUNCTION_ARGS)
 			note_integration();
 			if (abort_revert)
 			{
+				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&ms.series_head,
+																   "abort the revert",
+																   true));
 				VERSION_MOVE(&ms.series_head, 1,
 							 PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
 				settled();
 			}
-			else if (ms.ntables > 0 || PROLLY_CALL(refs(), violations) != NIL)
+			else if (ms.ntables > 0 || ms.nidentity > 0 ||
+					 PROLLY_CALL(refs(), violations) != NIL)
 			{
 				/* (Dolt reports what is still to resolve, without error) */
-				tables_left(&ms.ntables, &nrefs);
+				tables_left(&ms.ntables, &nrefs, &ms.nidentity);
 				result[1] = psprintf("%d", ms.ntables);
+				result[2] = psprintf("%d", ms.nidentity);
 				result[3] = psprintf("%d", nrefs);
 			}
 			else
@@ -4906,9 +4939,10 @@ rebase_continue(const char **result)
 	{
 		int			ctables;
 		int			vtables;
+		int			itables;
 
-		tables_left(&ctables, &vtables);
-		if (ctables > 0 || vtables > 0)
+		tables_left(&ctables, &vtables, &itables);
+		if (ctables > 0 || vtables > 0 || itables > 0)
 		{
 			StringInfoData names;
 
@@ -4920,6 +4954,9 @@ rebase_continue(const char **result)
 
 				appendStringInfo(&names, "%s%s", i ? ", " : "", n ? n : "?");
 			}
+			for (int i = 0; i < ms.nidentity; i++)
+				appendStringInfo(&names, "%s%s", names.len ? ", " : "",
+								 ms.identity[i].name);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("conflicts detected in tables %s; resolve conflicts before continuing the rebase",
@@ -5034,7 +5071,17 @@ rebase_continue(const char **result)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("rebase aborted due to changes in branch %s", rs.branch)));
 	}
-	force_branch(rs.branch, working);
+	/* (the rebased commits are the branch's, its relations theirs) */
+	prolly_move_replaces = true;
+	PG_TRY();
+	{
+		force_branch(rs.branch, working);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_replaces = false;
+	}
+	PG_END_TRY();
 	checkout_branch(rs.branch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
 	settled();
@@ -6438,6 +6485,9 @@ dolt_status(PG_FUNCTION_ARGS)
 			for (int i = 0; i < ms.nschema; i++)
 				names = with_status_named(names, ms.schema_tables[i],
 										  "schema conflict");
+			for (int i = 0; i < ms.nidentity; i++)
+				names = with_status_named(names, ms.identity[i].name,
+										  "identity conflict");
 		}
 	}
 	else
@@ -7096,47 +7146,12 @@ typedef struct NameLineage
 	HTAB	   *steps;			/* LineageStep, each version reached */
 	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
 	HTAB	   *apart;			/* commits a walk back from found apart */
-	HTAB	   *classes;		/* relations' classes, as read (RelClass) */
-	Oid			cls;			/* relid's */
 	bool		started;
 } NameLineage;
 
-typedef struct RelClass
-{
-	Oid			relid;
-	Oid			cls;
-} RelClass;
-
-/* relid's equivalence class (refs' relation_class()), read once a lineage */
-static Oid
-lineage_class(NameLineage *l, Oid relid)
-{
-	RelClass   *rc;
-	bool		found;
-
-	if (!PROLLY_HAS(refs(), relation_class))
-		return relid;
-	if (l->classes == NULL)
-	{
-		HASHCTL		ctl = {0};
-
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(RelClass);
-		ctl.hcxt = CurrentMemoryContext;
-		l->classes = hash_create("prolly relation classes", 64, &ctl,
-								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
-	rc = hash_search(l->classes, &relid, HASH_ENTER, &found);
-	if (!found)
-		rc->cls = PROLLY_CALL(refs(), relation_class, relid);
-	return rc->cls;
-}
-
 /*
  * The name l's table had in commit, as its record has it; NULL if the
- * commit wasn't made from a relation of the table's class (the relation
- * itself, or one the same table as it: refs' relation_class()), or has no
- * record.
+ * commit wasn't made from the table's relation, or has no record.
  */
 static char *
 made_from(NameLineage *l, const ProllyHash *commit)
@@ -7147,13 +7162,11 @@ made_from(NameLineage *l, const ProllyHash *commit)
 	if (!OidIsValid(l->relid) || !PROLLY_HAS(refs(), commit_relations) ||
 		!PROLLY_CALL(refs(), commit_relations, commit, &relations))
 		return NULL;
-	if (!OidIsValid(l->cls))
-		l->cls = lineage_class(l, l->relid);
 	foreach(lc, relations)
 	{
 		ProllyCommitRelation *r = lfirst(lc);
 
-		if (r->relid == l->relid || lineage_class(l, r->relid) == l->cls)
+		if (r->relid == l->relid)
 			return r->name;
 	}
 	return NULL;
@@ -8761,6 +8774,70 @@ dolt_conflicts_summary(PG_FUNCTION_ARGS)
 		nulls[1] = cs.unreadable;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+	/* (a table in an identity conflict: one conflict, the table's own) */
+	for (int i = 0; i < ms.nidentity; i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		values[0] = CStringGetTextDatum(ms.identity[i].name);
+		values[1] = Int64GetDatum(1);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * dolt_identity_conflicts(OUT table_name text, OUT our_relation oid, OUT
+ * our_owner regrole, OUT their_table text, OUT their_relation oid, OUT
+ * their_owner regrole, OUT tree int4) returns setof record
+ *
+ * The tables the merge in progress kept as the branch has them because
+ * the other side's version of one (or of a table of its inheritance or
+ * partition tree) is another relation of its name: the table here and
+ * theirs, each its relation and owner (theirs': the local branch merged's,
+ * if it was one's head; else NULL), and the tree resolved with it.  Never
+ * rows: the two are different tables.
+ */
+Datum
+dolt_identity_conflicts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyMergeState ms;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_CALL(refs(), merge_state, &ms))
+		return (Datum) 0;
+	for (int i = 0; i < ms.nidentity; i++)
+	{
+		ProllyIdentityConflict *c = &ms.identity[i];
+		Datum		values[7];
+		bool		nulls[7] = {0};
+		HeapTuple	tup = OidIsValid(c->relid) ?
+			SearchSysCache1(RELOID, ObjectIdGetDatum(c->relid)) : NULL;
+		Oid			their_owner = InvalidOid;
+
+		values[0] = CStringGetTextDatum(c->name);
+		values[1] = ObjectIdGetDatum(c->relid);
+		nulls[1] = !OidIsValid(c->relid);
+		nulls[2] = !HeapTupleIsValid(tup);
+		if (HeapTupleIsValid(tup))
+		{
+			values[2] = ObjectIdGetDatum(((Form_pg_class) GETSTRUCT(tup))->relowner);
+			ReleaseSysCache(tup);
+		}
+		values[3] = CStringGetTextDatum(c->their_name);
+		values[4] = ObjectIdGetDatum(c->their_relid);
+		nulls[4] = !OidIsValid(c->their_relid);
+		if (ms.identity_source != NULL && OidIsValid(c->their_relid) &&
+			branch_ops()->relation_owner != NULL)
+			their_owner = branch_ops()->relation_owner(ms.identity_source,
+													   c->their_relid);
+		values[5] = ObjectIdGetDatum(their_owner);
+		nulls[5] = !OidIsValid(their_owner);
+		values[6] = Int32GetDatum(c->tree);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
 	return (Datum) 0;
 }
 
@@ -9239,8 +9316,13 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		else if (strcmp(a, ".") == 0)
 		{
 			if (PROLLY_CALL(refs(), merge_state, &ms))
+			{
 				for (int j = 0; j < ms.ntables; j++)
 					tables = list_append_unique_oid(tables, ms.tables[j]);
+				for (int j = 0; j < ms.nidentity; j++)
+					if (OidIsValid(ms.identity[j].relid))
+						tables = list_append_unique_oid(tables, ms.identity[j].relid);
+			}
 		}
 		else
 		{
@@ -9259,6 +9341,31 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_conflicts_resolve needs --ours or --theirs")));
 	PreventCommandIfReadOnly("dolt_conflicts_resolve()");
+
+	/*
+	 * (an identity conflict's tree is resolved whole, through any of its
+	 * tables: once)
+	 */
+	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.nidentity > 0)
+	{
+		List	   *trees = NIL;
+		List	   *once = NIL;
+
+		foreach(lc, tables)
+		{
+			int			tree = -1;
+
+			for (int j = 0; j < ms.nidentity; j++)
+				if (ms.identity[j].relid == lfirst_oid(lc))
+					tree = ms.identity[j].tree;
+			if (tree >= 0 && list_member_int(trees, tree))
+				continue;
+			if (tree >= 0)
+				trees = lappend_int(trees, tree);
+			once = lappend_oid(once, lfirst_oid(lc));
+		}
+		tables = once;
+	}
 	branch_note_write(MyBranch);
 	{
 		/* (a side's rows are of the merge's other side's commit) */

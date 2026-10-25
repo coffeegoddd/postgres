@@ -136,7 +136,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (88 of 88 callbacks missing)
+ refs          | stub           | complete                       | not implemented (85 of 85 callbacks missing)
  transfer      | chunks         | identity                       | pass
  transfer      | chunks         | receive_then_send              | no checks yet
  transfer      | chunks         | complete                       | pass
@@ -216,7 +216,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
- canonicalizer | stub           | complete                       | not implemented (39 of 39 callbacks missing)
+ canonicalizer | stub           | complete                       | not implemented (40 of 40 callbacks missing)
  chunk_store   | journal        | identity                       | pass
  chunk_store   | journal        | complete                       | pass
  chunk_format  | basic          | identity                       | pass
