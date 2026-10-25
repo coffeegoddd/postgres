@@ -410,6 +410,7 @@ tests += {
       't/360_cleanup_invariance.pl',
       't/375_role_maker_oid_reuse.pl',
       't/376_role_maker_races.pl',
+      't/425_fold_worker_trim_own_snapshot.pl',
     ],
   },
 }
