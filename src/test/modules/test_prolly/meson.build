@@ -424,6 +424,7 @@ tests += {
       't/447_node_cache.pl',
       't/465_bmap_preserve_waits.pl',
       't/466_bmap_preserve_moved.pl',
+      't/467_bmap_preserve_skipped.pl',
     ],
   },
 }

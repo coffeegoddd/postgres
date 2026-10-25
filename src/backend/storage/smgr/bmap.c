@@ -5305,7 +5305,11 @@ block_list_add(BlockList *l, BlockNumber b)
  * with the page locked (shared) in 'held' (preserve_header_lock()), let go
  * of once the walk logs it.  'logged' has the physical blocks the walks
  * logged, each with its logical block, which a walk again doesn't log
- * again while the relation's map still names them so.
+ * again while the relation's map still names them so.  It is made only
+ * once a walk is given up, so a walk that isn't costs no memory for it:
+ * the first walk's are the relation's own blocks below the one it gave up
+ * on, as the map names them then, which a pass recording them
+ * ('record_below') finds before the header is let go.
  */
 typedef struct PreserveWalk
 {
@@ -5314,6 +5318,7 @@ typedef struct PreserveWalk
 	BlockNumber held_block;		/* the page locked before the walk, if any */
 	Buffer		held;
 	HTAB	   *logged;			/* PreserveLogged, by physical block */
+	BlockNumber record_below;	/* recording 'logged' up to it, if valid */
 } PreserveWalk;
 
 typedef struct PreserveLogged
@@ -5396,6 +5401,16 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	PreserveLogged *logged;
 	bool		found;
 
+	/* (the walks' logical order: below the busy page, every block logged) */
+	if (BlockNumberIsValid(walk->record_below))
+	{
+		if (blkno >= walk->record_below)
+			return false;
+		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
+		logged->blkno = blkno;
+		return true;
+	}
+
 	if (walk->own)
 		block_list_add(walk->own, blkno);
 
@@ -5439,18 +5454,11 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, 1);
 
-	if (walk->logged == NULL)
+	if (walk->logged)
 	{
-		HASHCTL		ctl;
-
-		ctl.keysize = sizeof(BlockNumber);
-		ctl.entrysize = sizeof(PreserveLogged);
-		ctl.hcxt = CurrentMemoryContext;
-		walk->logged = hash_create("bmap preserved blocks", 256, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
+		logged->blkno = blkno;
 	}
-	logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
-	logged->blkno = blkno;
 	return true;
 }
 
@@ -5588,10 +5596,13 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
  * or a snapshot, may raise the epoch and make blocks shared.  The walk again
  * starts from the header as it is then, its length and epoch, and so finds
  * the blocks as they are mapped then, logging those not logged already
- * (preserve_shared_page()).  Each walk given up leaves one more block
- * logged, the page it holds next (unless that is no longer the relation's
- * own): the walks end, however many backends lock the pages meanwhile, each
- * page logged once unless it moved, and only one page held at a time.
+ * (preserve_shared_page()).  A walk gives up only on a block it hasn't
+ * logged (one logged is skipped without its lock), and the next walk holds
+ * that page and logs it; so the walks given up are no more than the blocks
+ * logged, which are the relation's own pages and those that a copy or a
+ * compaction gave another block while the header was let go.  The walks
+ * end however many backends lock the pages meanwhile, each page logged
+ * once unless it moved, and only one page held at a time.
  */
 static Buffer
 preserve_header_lock(SMgrRelation src, BlockList *own)
@@ -5602,6 +5613,7 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 
 	walk.own = own;
 	walk.held_block = InvalidBlockNumber;
+	walk.record_below = InvalidBlockNumber;
 	for (;;)
 	{
 		BmapHeader *header;
@@ -5619,6 +5631,21 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 		preserve_release_held(&walk);
 		if (done)
 			break;
+
+		/* the first walk given up: the blocks it logged, recorded */
+		if (walk.logged == NULL)
+		{
+			HASHCTL		ctl;
+
+			ctl.keysize = sizeof(BlockNumber);
+			ctl.entrysize = sizeof(PreserveLogged);
+			ctl.hcxt = CurrentMemoryContext;
+			walk.logged = hash_create("bmap preserved blocks", 256, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+			walk.record_below = walk.busy;
+			(void) tree_preserve(src, header->nblocks, header->epoch, &walk);
+			walk.record_below = InvalidBlockNumber;
+		}
 
 		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 		INJECTION_POINT("bmap-preserve-restart", NULL);
