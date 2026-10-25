@@ -13,9 +13,12 @@ use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('share_primary');
 $primary->init(allows_streaming => 1);
+# The fold worker is off: its fold of the new rows scans the source while
+# the share runs, which is checked elsewhere.
 $primary->append_conf('postgresql.conf', qq{
 autovacuum = off
 checkpoint_timeout = 1h
+prolly_fold_worker = off
 });
 $primary->start;
 $primary->backup('base');
@@ -39,18 +42,24 @@ sql(q{
 });
 
 # The rows are only in buffers (no checkpoint since the backup) when the
-# copy is made.
+# copy is made.  The pages are compared as rows, without hint bits: a
+# reader of the source (a scan, as the one below, or a fold) may set
+# HEAP_XMIN_COMMITTED in the source's buffers after the share wrote them,
+# which the copy's buffers, the standby and a crash need not see, with no
+# row changed.
 sql(q{INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(1, 30000) g});
 my $src = sql(q{SELECT pg_relation_filenode('cow.t')});
 my $copy = sql(qq{SELECT test_bmap_share($src)});
-my $digest = sql(qq{SELECT test_bmap_digest($src)});
+my $digest = sql(qq{SELECT test_bmap_rows_digest($src)});
+my $source_rows = q{SELECT md5(string_agg(t::text, ',' ORDER BY a)) FROM cow.t};
+my $srows = sql($source_rows);
 my $refs = qq{SELECT string_agg(blkno || ':' || phys || ':' || refs, ',' ORDER BY blkno)
 	FROM test_bmap_map($copy)};
 my $map = sql($refs);
-is(sql(qq{SELECT test_bmap_digest($copy)}), $digest, 'the copy reads the source\'s pages');
+is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $digest, 'the copy reads the source\'s pages');
 
 $primary->wait_for_replay_catchup($standby);
-is(ssql(qq{SELECT test_bmap_digest($copy)}), $digest,
+is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'a standby\'s copy reads them too');
 is(ssql($refs), $map, 'with the same blocks and counts');
 
@@ -58,8 +67,9 @@ is(ssql($refs), $map, 'with the same blocks and counts');
 # reach the shared blocks, and the counts come back.
 $primary->stop('immediate');
 $primary->start;
-is(sql(qq{SELECT test_bmap_digest($copy)}), $digest, 'the copy survives a crash');
+is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $digest, 'the copy survives a crash');
 is(sql($refs), $map, 'so do its blocks and counts');
+is(sql($source_rows), $srows, 'and the source\'s rows');
 
 # Changing the source copies its pages first: the copy keeps reading the
 # rows it was made with, on the standby and after a crash too.  (Reading the

@@ -1563,9 +1563,10 @@ kept_locator(const BranchKeptRelation *k)
 /*
  * Snapshots to take, together (bmap_snapshot_take_many(): the generation
  * of sharing raised once, each relation's pages changed since its last
- * snapshot written out, and each page store synced once as the transaction
- * commits, which the refs naming them commit with): each one's storage
- * and where its id goes.
+ * snapshot written out, and made durable by the transaction's commit, which
+ * the refs naming them commit with: through the images of those pages it
+ * logged, or at wal_level minimal each page store synced once as it
+ * commits): each one's storage and where its id goes.
  */
 typedef struct Taking
 {

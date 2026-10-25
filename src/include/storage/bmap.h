@@ -32,6 +32,13 @@ extern PGDLLIMPORT bool debug_block_mapped_heap;
 /* logical blocks recovery remembers a later remap of, at most */
 extern PGDLLIMPORT int block_map_replay_entries;
 
+/*
+ * prolly.debug_skip_store_sync: skip the page-store syncs that shares and
+ * snapshots ask for.  Unsafe (a crash of the machine can lose what a commit
+ * relied on); for measuring what those syncs cost only.
+ */
+extern PGDLLIMPORT bool bmap_debug_skip_store_sync;
+
 /* storage manager callbacks */
 extern void bmapinit(void);
 extern bool bmapclaims(RelFileLocatorBackend rlocator);
@@ -162,6 +169,8 @@ extern void bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit,
 							  void *arg);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
+extern bool bmap_inspect_store_sync(RelFileLocator rel, uint64 *written,
+									uint64 *synced, uint32 *flushing);
 
 /*
  * The sweep: what a database's page store in a tablespace holds counted

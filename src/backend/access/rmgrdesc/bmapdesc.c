@@ -53,9 +53,11 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 			{
 				xl_bmap_share *xlrec = (xl_bmap_share *) rec;
 
-				appendStringInfo(buf, "rel %u/%u/%u; copy %u",
+				appendStringInfo(buf, "rel %u/%u/%u; copy %u%s",
 								 xlrec->src.spcOid, xlrec->src.dbOid,
-								 xlrec->src.relNumber, xlrec->dst.relNumber);
+								 xlrec->src.relNumber, xlrec->dst.relNumber,
+								 (xlrec->flags & BMAP_PRESERVE_LOGGED) ?
+								 " (images logged)" : "");
 				break;
 			}
 		case XLOG_BMAP_PRESERVE:
@@ -115,7 +117,9 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 				else if (xlrec->op == BMAP_TREE_SNAPSHOT)
 					appendStringInfoString(buf,
 										   (xlrec->flags & BMAP_TREE_CARRIED) ?
-										   "snapshot carried" : "snapshot");
+										   "snapshot carried" :
+										   (xlrec->flags & BMAP_TREE_PRESERVE_LOGGED) ?
+										   "snapshot (images logged)" : "snapshot");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;
