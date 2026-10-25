@@ -373,6 +373,7 @@ tests += {
       't/387_kept_pages_standby_redo_flush.pl',
       't/388_sweep_exit_hook.pl',
       't/389_kept_pages_redo_reused_node.pl',
+      't/406_received_open_errors.pl',
       't/405_cancel_not_set_aside.pl',
       't/420_status_from_fold.pl',
       't/340_bmap_sweep_dropped_map.pl',
@@ -413,6 +414,9 @@ tests += {
       't/360_cleanup_invariance.pl',
       't/375_role_maker_oid_reuse.pl',
       't/376_role_maker_races.pl',
+      't/410_standby_history_reads.pl',
+      't/411_standby_gc_pointers.pl',
+      't/412_standby_holder_keeps.pl',
     ],
   },
 }

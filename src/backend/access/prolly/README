@@ -481,6 +481,27 @@ isn't packed: an insert or a removal, which would renumber every element
 after it, is done whole.  Folded format 22 is the first whose rows hold JSON
 trees.
 
+A hash pointer a read hands out (a long value of history, read or not)
+names chunks a collection may drop: the chunk store's keep() is told of
+it, and a collection keeps the chunk or waits for the transaction, read
+only or not.  A hot standby's transaction has no transaction id to be
+waited for, and the collections are the primary's, replayed: keep() notes
+it (its virtual transaction) as holding pointers, and the replay of a
+swap cancels each holder of the store's, after
+max_standby_streaming_delay, as a recovery conflict on the chunk store
+(pg_stat_database_conflicts.confl_chunk_store), before the replayed
+manifest stops naming what it may hold.  Every holder is cancelled,
+whether or not the collection drops what it holds, and
+hot_standby_feedback doesn't prevent it: the primary's collection waits
+for no standby.  A holder's own keep() during the replay goes on (the
+replay is waiting for it), but anyone else's waits for the swap to be
+replayed (ProllySwapReplay) and then fails if its chunk is gone: while the
+replay waits out the holders, up to max_standby_streaming_delay (with -1,
+until they end), new history reads of long values in that database stall.
+One begun on a standby and still running at its promotion stays noted,
+and the new primary's collections wait for it.  So history reads assign
+no transaction id, and a hot standby serves them as its primary does.
+
 
 Writers
 -------
