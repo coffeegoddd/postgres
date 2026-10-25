@@ -287,6 +287,68 @@ SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
 INSERT INTO mc.ck VALUES (2);
 ERROR:  new row for relation "ck" violates check constraint "ck_alice"
 DETAIL:  Failing row contains (2).
+-- the same through alice's domain, whose check the type cache planned
+-- (inlining her SQL routine) before the merge, outside any move: planned
+-- again as the merge begins, so it runs as alice there too
+SET ROLE regress_mc_alice;
+CREATE DOMAIN mc.da AS int CHECK (mc_pub.is_alice(VALUE));
+RESET ROLE;
+CREATE TABLE mc.dt (id int PRIMARY KEY, x mc.da);
+GRANT SELECT, INSERT ON mc.dt TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'dt')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dt_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su3 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su3')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('dt_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.dt VALUES (1, 1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'dt row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT 1::mc.da;
+ERROR:  value for domain mc.da violates check constraint "da_check"
+SELECT (dolt_merge('dt_side', '-m', 'merged dt_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT * FROM mc.dt;
+ id | x 
+----+---
+  1 | 1
+(1 row)
+
 -- a role without alice's privileges merging its own table, whose check
 -- calls alice's routine: the routine runs as alice, never as the writer
 SET ROLE regress_mc_w;
