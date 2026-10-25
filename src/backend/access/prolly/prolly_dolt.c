@@ -1702,7 +1702,7 @@ sweep_one(const char *name, void *arg)
 	{
 		PROLLY_CALL(refs(), lock);
 		AcceptInvalidationMessages();
-		PROLLY_CALL(refs(), branches, add_detached, &still);
+		PROLLY_CALL(refs(), branches_named, name, add_detached, &still);
 		if (still.found)
 		{
 			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
@@ -1765,7 +1765,9 @@ sweep_detached(char *current, bool kept_only)
 
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
-	PROLLY_CALL(refs(), branches, add_detached, &db);
+	/* (only hidden branches are candidates: those named so are read) */
+	PROLLY_CALL(refs(), branches_named, PROLLY_DETACHED_PREFIX, add_detached, &db);
+	PROLLY_CALL(refs(), branches_named, PROLLY_WRITER_PREFIX, add_detached, &db);
 	if (db.names == NIL)
 		return;
 	XactReadOnly = false;

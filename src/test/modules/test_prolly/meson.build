@@ -110,6 +110,7 @@ tests += {
       'kept_planned',
       'share_layouts',
       'checkout_table_work',
+      'checkout_branch_count',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',
