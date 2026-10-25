@@ -709,8 +709,10 @@ node_cache(void)
 	if (!looked)
 	{
 		nc = prolly_node_cache();
+		/* (one off, its size 0, is none: no lookup, nor a miss counted) */
 		if (nc != NULL &&
-			(!PROLLY_HAS(nc, lookup) || !PROLLY_HAS(nc, insert)))
+			(!PROLLY_HAS(nc, lookup) || !PROLLY_HAS(nc, insert) ||
+			 !PROLLY_HAS(nc, capacity) || nc->capacity() == 0))
 			nc = NULL;
 		looked = true;
 	}
@@ -763,7 +765,7 @@ chunk_cache_limit(void)
 {
 	const ProllyNodeCacheRoutine *nc = node_cache();
 
-	return nc != NULL && PROLLY_HAS(nc, capacity) ? nc->capacity() : 0;
+	return nc != NULL ? nc->capacity() : 0;
 }
 
 /*
@@ -2586,10 +2588,11 @@ check_root(ProllyChunkStore *s)
  * writing a little at a time (dolt.transaction_commit) reads first, in its
  * next transaction, what this one wrote last, the refs' and the trees'
  * upper nodes, each once before it is replaced.  Only a small
- * transaction's: none appended before (no flush), at most an eighth of the
- * cache's bytes, so a large one doesn't churn it; and only if no
- * collection swapped the store since the transaction began (one dropped as
- * stored already may be in a segment the swap removed).  Decoded before
+ * transaction's: none appended before (no flush), at most
+ * PENDING_CACHED_MAX bytes and an eighth of the cache's, so a large one
+ * doesn't push out what every backend reads, nor copy much as it commits;
+ * and only if no collection swapped the store since the transaction began
+ * (one dropped as stored already may be in a segment the swap removed).  Decoded before
  * the commit record, where allocating may fail, into the backend's memory,
  * and let into the shared cache once the transaction has committed
  * (pending_cached_end()), where nothing may fail and the cache's inserts
@@ -2603,6 +2606,9 @@ typedef struct StagedChunk
 	uint32		len;
 } StagedChunk;
 
+/* (enough for the refs' and a few trees' upper nodes a commit rewrites) */
+#define PENDING_CACHED_MAX	(256 * 1024)
+
 static StringInfo staged = NULL;	/* the chunks' bytes */
 static StagedChunk *staged_chunks = NULL;
 static int	nstaged = 0;
@@ -2613,7 +2619,7 @@ pending_cached(ProllyChunkStore *s)
 {
 	HASH_SEQ_STATUS status;
 	IndexEntry *e;
-	Size		budget = chunk_cache_limit() / 8;
+	Size		budget = Min(chunk_cache_limit() / 8, PENDING_CACHED_MAX);
 	Size		total = 0;
 	long		n;
 	MemoryContext old;

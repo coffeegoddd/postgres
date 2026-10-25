@@ -122,3 +122,22 @@ SELECT convert_from(test_chunk_get(:'dropped'), 'UTF8') AS dropped_again;
 
 \c :home
 DROP DATABASE node_cache_gc;
+
+-- A dropped database's chunks are let go of with it: a database given its
+-- OID after has none of them, and isn't given them from the cache.
+CREATE DATABASE node_cache_oid OID = 900001;
+\c node_cache_oid
+CREATE EXTENSION test_prolly;
+SELECT test_chunk_put('oid reuse chunk') AS h \gset
+\c node_cache_oid
+SELECT test_chunk_get(:'h') IS NOT NULL AS read;
+SELECT test_chunk_get(:'h') IS NOT NULL AS read_again;
+SELECT test_chunk_get(:'h') IS NOT NULL AS read_from_cache;
+\c :home
+DROP DATABASE node_cache_oid;
+CREATE DATABASE node_cache_oid OID = 900001;
+\c node_cache_oid
+CREATE EXTENSION test_prolly;
+SELECT test_chunk_has(:'h') AS has, test_chunk_get(:'h') IS NULL AS get_none;
+\c :home
+DROP DATABASE node_cache_oid;

@@ -39,7 +39,10 @@
  * chunks read once are what the hand frees.  An insert that can't free
  * enough in a bounded sweep keeps nothing: inserts never wait for one
  * another and never fail.  The hand takes a lock only conditionally, so
- * it never waits on readers either.
+ * it never waits on readers either; an entry whose partition is busy as
+ * the hand passes is passed over, so it ages a little more slowly than
+ * the rest.  The free lists are read without their lock first, which is
+ * taken only when they may have enough.
  *
  * Nothing outlives a restart.
  *
@@ -66,7 +69,7 @@ int			prolly_node_cache_size = 131072;
 #define NODE_MAX_USAGE		5
 #define NODE_MAX_ENTRY		(256 * 1024)
 /* (entries the hand looks at, at most, to free room for one insert) */
-#define NODE_SWEEP(c)		(2 * (NODE_MAX_USAGE + 1) * (c)->nentries)
+#define NODE_SWEEP(c)		((NODE_MAX_USAGE + 1) * (c)->nentries)
 
 #define NONE				(-1)
 
@@ -339,16 +342,23 @@ blocks_for(uint32 len)
 	return (int32) Max((len + NODE_BLOCK - 1) / NODE_BLOCK, 1);
 }
 
-/* Unlink entry i, in use in bucket, its lock held exclusive. */
-static void
+/*
+ * Unlink entry i from its bucket, the bucket's lock held exclusive: false,
+ * nothing changed, if it isn't there (the clock read an entry another
+ * partition's lock was changing).
+ */
+static bool
 unlink_entry(NodeEntry *e, int32 i)
 {
 	int32	   *link = &buckets[e->bucket];
 
-	while (*link != i)
+	while (*link != NONE && *link != i)
 		link = &entries[*link].next;
+	if (*link != i)
+		return false;
 	*link = e->next;
 	e->used = false;
+	return true;
 }
 
 /*
@@ -373,8 +383,19 @@ clock_step(NodeCache *c)
 	lock = part_lock(c, bucket);
 	if (!LWLockConditionalAcquire(lock, LW_EXCLUSIVE))
 		return;
-	/* (looked at again under the lock: it may have changed hands) */
-	if (!e->used || e->bucket % NODE_PARTITIONS != bucket % NODE_PARTITIONS)
+	/*
+	 * (looked at again under the lock: it may have changed hands.  An
+	 * entry's bucket and use are set under its bucket's lock, so they're
+	 * read in that order here, and an entry another partition's lock was
+	 * changing isn't found in this one's chain, and is passed over)
+	 */
+	if (!e->used)
+	{
+		LWLockRelease(lock);
+		return;
+	}
+	pg_read_barrier();
+	if (e->bucket % NODE_PARTITIONS != bucket % NODE_PARTITIONS)
 	{
 		LWLockRelease(lock);
 		return;
@@ -386,7 +407,11 @@ clock_step(NodeCache *c)
 		LWLockRelease(lock);
 		return;
 	}
-	unlink_entry(e, i);
+	if (!unlink_entry(e, i))
+	{
+		LWLockRelease(lock);
+		return;
+	}
 	first = e->first;
 	n = blocks_for(e->len);
 	LWLockRelease(lock);
@@ -402,6 +427,12 @@ take_free(NodeCache *c, int32 nblocks, int32 *entry, int32 *first)
 {
 	for (int64 steps = 0; steps <= NODE_SWEEP(c); steps++)
 	{
+		/* (read unlocked first: the lock is taken only where it may serve) */
+		if (c->free_entry == NONE || c->nfree_blocks < nblocks)
+		{
+			clock_step(c);
+			continue;
+		}
 		SpinLockAcquire(&c->mutex);
 		if (c->free_entry != NONE && c->nfree_blocks >= nblocks)
 		{
@@ -463,7 +494,6 @@ shared_insert(const ProllyNodeCacheScope *scope, const ProllyHash *hash,
 	memcpy(e->hash.bytes, hash->bytes, hash->len);
 	e->len = (uint32) len;
 	e->first = first;
-	e->bucket = bucket;
 	pg_atomic_write_u32(&e->usage, 1);
 	p = data;
 	left = len;
@@ -486,6 +516,8 @@ shared_insert(const ProllyNodeCacheScope *scope, const ProllyHash *hash,
 	}
 	e->next = buckets[bucket];
 	buckets[bucket] = i;
+	e->bucket = bucket;
+	pg_write_barrier();
 	e->used = true;
 	LWLockRelease(lock);
 }
@@ -509,11 +541,8 @@ shared_forget_database(Oid dboid)
 				NodeEntry  *e = &entries[i];
 				int32		next = e->next;
 
-				if (e->scope.dboid == dboid)
-				{
-					unlink_entry(e, i);
+				if (e->scope.dboid == dboid && unlink_entry(e, i))
 					give_back(c, i, e->first, blocks_for(e->len));
-				}
 				i = next;
 			}
 		}

@@ -416,6 +416,7 @@ tests += {
       't/410_standby_history_reads.pl',
       't/411_standby_gc_pointers.pl',
       't/412_standby_holder_keeps.pl',
+      't/447_node_cache.pl',
     ],
   },
 }
