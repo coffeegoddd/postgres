@@ -2938,11 +2938,19 @@ RelationForgetRelation(Oid rid)
  *		table a move makes keeps its version's relation, by OID, and the
  *		cache may still hold an entry of that OID, of a relation of another
  *		branch, or of the one the move just dropped.  False, the entry left,
- *		if it is open, or its rd_*Subid say this transaction still needs it
- *		(a relation made, or given new storage, or dropped in it, which a
+ *		if it is open, or its rd_*Subid say an earlier subtransaction still
+ *		needs it (a relation it made, gave new storage or dropped, which a
  *		rollback to a savepoint would bring back as it was): the caller then
  *		makes the relation with another OID.
  */
+/* none, or the current subtransaction */
+static bool
+subid_is_current(SubTransactionId subid)
+{
+	return subid == InvalidSubTransactionId ||
+		subid == GetCurrentSubTransactionId();
+}
+
 bool
 RelationForgetForNewRelation(Oid rid)
 {
@@ -2953,10 +2961,15 @@ RelationForgetForNewRelation(Oid rid)
 		return true;
 	if (!RelationHasReferenceCountZero(relation) || relation->rd_isnailed)
 		return false;
-	/* (kept for this transaction's bookkeeping: left be, another OID used) */
-	if (relation->rd_createSubid != InvalidSubTransactionId ||
-		relation->rd_droppedSubid != InvalidSubTransactionId ||
-		relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
+	/*
+	 * (kept for an earlier subtransaction's bookkeeping, which a rollback
+	 * to a savepoint would need: left be, another OID used.  What the
+	 * current subtransaction made, gave storage or dropped goes with what
+	 * replaces it, however it ends.)
+	 */
+	if (!subid_is_current(relation->rd_createSubid) ||
+		!subid_is_current(relation->rd_droppedSubid) ||
+		!subid_is_current(relation->rd_firstRelfilelocatorSubid))
 		return false;
 	RelationCacheDelete(relation);
 	RelationDestroyRelation(relation, false);
