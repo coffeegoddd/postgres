@@ -458,15 +458,32 @@ has the privileges of the branch's owner, or writes the refs at large
 (prolly_writes_refs(): it owns the database, has the database's CREATE
 privilege, which makes branches, or has the privileges of
 pg_prolly_write).  A branch's owner is the role that made it, recorded in
-the refs ('A', refs format 13) as it is made, its first head set by a
+the refs ('A', refs format 14) as it is made, its first head set by a
 fetch, clone or push included, kept by a rename and by a forced move that
-makes a branch without commits again; main, a branch whose maker isn't
-recorded, and one whose maker was dropped are the database owner's.
-dolt_branches shows it (creator).  The record is a role's OID, not a
-dependency: DROP ROLE doesn't refuse a role that owns branches (its
-branches fall to the database's owner), REASSIGN OWNED and DROP OWNED
-don't see them, and a role given the dropped one's OID again would own
-them.  A rename's new name takes what making a branch of it takes, or
+makes a branch without commits again; main and a branch whose maker isn't
+recorded are the database owner's.  dolt_branches shows it (creator).
+Each maker the refs record (a branch's, a tag's, a stash's) is a shared
+dependency of its role in pg_shdepend, as an object's owner is: the
+record keeps the role's OID and an id of its own (newMadeObjectId()),
+which the entry names it by (classid RefsBranchClassId, RefsTagClassId or
+RefsStashClassId), and the entry is recorded, moved and dropped with the
+record, in the same transaction.  So DROP ROLE refuses a role that still
+makes any and lists them, REASSIGN OWNED makes the new role their maker,
+and DROP OWNED deletes the role's tags and stashes but gives its branches
+to the database's owner (their maker no longer recorded): deleting a
+branch would lose the commits no other branch has, and the working set
+every session on it shares.  No maker record outlives its role, so a
+role later given a dropped role's OID inherits nothing.  A writer
+branch's record of the role that forked it (in the writer modes' config)
+is the one exception, a bare OID checked only for existing; it grants
+nothing alone, since a writer's integration also moves its writer
+branch's head, which takes the branch's owner, its maker: a writer
+branch reassigned is no longer the old writer's to integrate, and one
+given up is no writer's.  The refs
+lock is held while REASSIGN OWNED and DROP OWNED find each object by its
+record's id, so a concurrent push onto a stash list or a rename can't
+redirect them.  DROP ROLE's hint for objects in another database names
+REASSIGN OWNED and DROP OWNED there.  A rename's new name takes what making a branch of it takes, or
 pg_prolly_write's privileges, and a rebase's own branch isn't renamed: a
 rebase's branch and a writer branch are made on the session's behalf,
 without the privilege to make branches, and are its role's.  In the
