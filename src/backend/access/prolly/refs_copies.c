@@ -228,7 +228,9 @@
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "commands/trigger.h"
+#include "common/cryptohash.h"
 #include "common/hashfn.h"
+#include "common/sha2.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "refs_generations.h"
@@ -272,6 +274,7 @@
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_LINEAGE		'L'	/* the relations a commit was made from */
+#define TAG_OWNED		'J'	/* routines and types such records list */
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
@@ -1290,7 +1293,7 @@ scoped_key(const char *key, int keylen)
 {
 	if (published || whole)
 		return false;
-	if (keylen > 1 && key[0] == TAG_LINEAGE)
+	if (keylen > 1 && (key[0] == TAG_LINEAGE || key[0] == TAG_OWNED))
 		return true;
 	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
 }
@@ -4790,17 +4793,63 @@ read_line_name(const char **c, StringInfo out, bool spaces)
  * data on), each a ProllyCommitRelation: a line of any other form is
  * refused, as a damaged record, never read in part.
  */
+typedef enum RelationLines
+{
+	LINES_OWNED,				/* a record, with its routines and types */
+	LINES_RELATIONS,			/* a record, without them */
+	LINES_ROUTINES				/* the routines and types a record names */
+} RelationLines;
+
+static List *relation_lines_of(const char *data, RelationLines what);
+
 static List *
 relation_lines(const char *data)
+{
+	return relation_lines_of(data, LINES_OWNED);
+}
+
+/*
+ * ... with or without the lines of the routines and types its last line
+ * may name, by their hash (table_names()).
+ */
+static List *
+relation_lines_of(const char *data, RelationLines what)
 {
 	List	   *out = NIL;
 
 	for (const char *p = data; *p;)
 	{
-		ProllyCommitRelation *r = palloc(sizeof(ProllyCommitRelation));
+		ProllyCommitRelation *r;
 		StringInfoData owner;
 		StringInfoData name;
 		const char *c;
+
+		if (*p == '@')
+		{
+			const char *nl = strchr(p, '\n');
+			StringInfoData key;
+			StringInfoData v;
+
+			if (what == LINES_ROUTINES || nl == NULL ||
+				nl - p != 1 + 2 * PG_SHA256_DIGEST_LENGTH || nl[1] != '\0')
+				goto bad;
+			for (const char *h = p + 1; h < nl; h++)
+				if (!isxdigit((unsigned char) *h))
+					goto bad;
+			if (what == LINES_RELATIONS)
+				break;
+			initStringInfo(&key);
+			initStringInfo(&v);
+			appendStringInfoChar(&key, TAG_OWNED);
+			appendBinaryStringInfo(&key, p + 1, nl - p - 1);
+			if (!refs_get(key.data, key.len, &v))
+				goto bad;
+			out = list_concat(out, relation_lines_of(v.data, LINES_ROUTINES));
+			pfree(key.data);
+			pfree(v.data);
+			break;
+		}
+		r = palloc(sizeof(ProllyCommitRelation));
 
 		for (int i = 0; i < 10; i++)
 			if (!isdigit((unsigned char) p[i]))
@@ -4883,6 +4932,92 @@ owned_object_line(Oid oid, Oid owner, char kind, const char *name, void *arg)
  * and each other object a commit may hold (prolly_owned_objects()), so that
  * a move making one from a commit made of them finds its owner.
  */
+/*
+ * The branch's routines and types, as a record of relations lists them:
+ * their lines (relation_line()'s, sorted) are stored apart, once, under
+ * their content's hash (TAG_OWNED), and the record names them by it, in a
+ * last line of '@' and the hash in hex.  A commit whose routines and types
+ * are those its parent's record named (as most are) names the same lines,
+ * which are neither written nor worked out again: the canonicalizer keeps
+ * its listing from one commit to the next (prolly_owned_routines()), and
+ * the session the lines and hash it made of it, until the listing changes
+ * or a role is renamed (whose name a line holds).
+ */
+static uint64 owned_generation = 0;
+static char *owned_hash = NULL;	/* (NULL: none listed) */
+static char *owned_text = NULL;
+static bool owned_callback = false;
+
+static void
+owned_role_renamed(Datum arg, int cacheid, uint32 hashvalue)
+{
+	owned_generation = 0;
+}
+
+static void
+owned_names(StringInfo out)
+{
+	List	   *lines = NIL;
+	StringInfoData key;
+	StringInfoData v;
+	uint64		generation = owned_generation;
+
+	if (!owned_callback)
+	{
+		CacheRegisterSyscacheCallback(AUTHOID, owned_role_renamed, (Datum) 0);
+		owned_callback = true;
+	}
+	if (prolly_owned_routines(&generation, owned_object_line, &lines))
+	{
+		StringInfoData text;
+		pg_cryptohash_ctx *ctx;
+		uint8		digest[PG_SHA256_DIGEST_LENGTH];
+
+		initStringInfo(&text);
+		list_sort(lines, line_cmp);
+		foreach_ptr(char, line, lines)
+			appendStringInfoString(&text, line);
+		owned_generation = 0;
+		if (owned_text)
+			pfree(owned_text);
+		if (owned_hash)
+			pfree(owned_hash);
+		owned_text = MemoryContextStrdup(TopMemoryContext, text.data);
+		owned_hash = NULL;
+		if (text.len > 0)
+		{
+			ctx = pg_cryptohash_create(PG_SHA256);
+			if (ctx == NULL || pg_cryptohash_init(ctx) < 0 ||
+				pg_cryptohash_update(ctx, (const uint8 *) text.data, text.len) < 0 ||
+				pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
+				elog(ERROR, "could not hash the routines and types of a record of relations");
+			pg_cryptohash_free(ctx);
+			owned_hash = MemoryContextAllocZero(TopMemoryContext,
+												2 * PG_SHA256_DIGEST_LENGTH + 1);
+			hex_encode((const char *) digest, sizeof(digest), owned_hash);
+		}
+		pfree(text.data);
+		/* (known only once its lines and hash are) */
+		owned_generation = generation;
+	}
+	if (owned_hash == NULL)
+		return;
+	/* (stored once: a transaction that aborted may have stored it alone) */
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_OWNED);
+	appendStringInfoString(&key, owned_hash);
+	if (!refs_get(key.data, key.len, &v))
+	{
+		resetStringInfo(&v);
+		appendStringInfoString(&v, owned_text);
+		refs_put(key.data, key.len, &v);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	appendStringInfo(out, "@%s\n", owned_hash);
+}
+
 static void
 table_names(StringInfo out)
 {
@@ -4915,6 +5050,7 @@ table_names(StringInfo out)
 	list_sort(lines, line_cmp);
 	foreach(lc, lines)
 		appendStringInfoString(out, lfirst(lc));
+	owned_names(out);
 }
 
 /*
@@ -6080,7 +6216,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * would see none of a fold that moved the baseline in between (the check
  * then passing), and read every table in full.  The fold waits for no
  * relation's lock: one not free at once fails it, with
- * ERRCODE_LOCK_NOT_AVAILABLE.
+ * ERRCODE_LOCK_NOT_AVAILABLE.  The caller keeps no snapshot, active or
+ * registered: the fold's is to be the oldest the transaction holds, or its
+ * trim of the change logs is held back (see below).
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -6102,6 +6240,16 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 		return false;
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
+
+	/*
+	 * (the fold's snapshot the oldest the transaction keeps: one older, the
+	 * caller's or the catalog snapshot the lookups above took, from while a
+	 * writer the fold sees committed was running, would hold the xmin
+	 * horizon below that writer, and the fold's trim of the log would keep
+	 * its rows; the fold after, finding nothing new, trims nothing)
+	 */
+	Assert(!HaveRegisteredOrActiveSnapshot());
+	InvalidateCatalogSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/*
@@ -6762,6 +6910,29 @@ copies_pending_full_folds(ProllyPendingFullVisit visit, void *arg)
 	have = branch_baseline(branch_ops()->current(), &baseline);
 	PROLLY_CALL(dc.canonicalizer, pending_full, have ? &baseline : NULL,
 				visit, arg);
+}
+
+/*
+ * The last fold of the session branch known (branch_fold_last()), from
+ * its baseline now, and when it was known; never one only this backend's
+ * chunks hold, nor one a fold forced to read would skip.
+ */
+static bool
+copies_last_fold(Snapshot snap, ProllyNodeRef *root, ProllyFoldMark *mark)
+{
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	bool		have;
+
+	if (!fold_caches_usable() || prolly_local_chunks_active() ||
+		!OidIsValid(MyBranch))
+		return false;
+	have = branch_baseline(branch_ops()->current(), &baseline);
+	if (!branch_fold_last(MyBranch, snap, have ? &baseline.hash : NULL, &h,
+						  mark))
+		return false;
+	ref_of(&h, root);
+	return true;
 }
 
 static void
@@ -9324,5 +9495,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_relations = copies_commit_relations,
 	.made_object = copies_made_object,
 	.stash_set_maker = copies_stash_set_maker,
+	.last_fold = copies_last_fold,
 	.forget_records = copies_forget_records,
 };

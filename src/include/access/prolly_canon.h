@@ -547,6 +547,26 @@ typedef struct ProllyCanonRoutine
 	 * of: its parents, whose rows a read of them reads with its own.
 	 */
 	List	   *(*table_parents) (const ProllyValue *description);
+
+	/*
+	 * Optional: what objects() visits of from and to, read from their tree
+	 * diff (equal subtrees skipped, not every object's items merged); and,
+	 * if table isn't NULL, each table whose item differs (added, removed or
+	 * modified, as the diff has it), by its name, into table.  Both in key
+	 * order.
+	 */
+	void		(*objects_diffed) (const ProllyNodeRef *from,
+								   const ProllyNodeRef *to,
+								   ProllyCanonObjectVisit visit,
+								   ProllyCanonObjectVisit table, void *arg);
+
+	/*
+	 * Optional: root with each of its sequences' values as they are now
+	 * (as a fold reads them, whatever the session may), into *out; the
+	 * rest as root has it.  False, *out undefined, where a sequence it
+	 * holds isn't one now by its name.
+	 */
+	bool		(*sequences_now) (const ProllyNodeRef *root, ProllyNodeRef *out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -558,9 +578,9 @@ typedef struct ProllyCanonRoutine
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects", "table_metadata", \
-	"table_names", "table_parents"
+	"table_names", "table_parents", "objects_diffed", "sequences_now"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK table_parents
+#define PROLLY_CANON_LAST_CALLBACK sequences_now
 
 /*
  * While set, the commits (ProllyHash *) a move takes its versions from: a
@@ -627,15 +647,27 @@ extern Oid	prolly_move_mover(void);
 
 /*
  * Each object of the session's branch a commit may hold, but its prolly
- * tables, partitioned tables and materialized views: its OID, its owner,
- * its kind ('v' view, 'S' sequence, 'f' foreign table, 'P' routine, 'T'
- * type, 'N' schema, 'C' collation) and its name as commits' items name it.
- * The refs record them with a commit's relations, so that a move making
- * one from the commit makes it as its recorded owner.
+ * tables, partitioned tables and materialized views, and its routines and
+ * types: its OID, its owner, its kind ('v' view, 'S' sequence, 'f' foreign
+ * table, 'N' schema, 'C' collation) and its name as commits' items name
+ * it.  The refs record them with a commit's relations, so that a move
+ * making one from the commit makes it as its recorded owner.
  */
 extern void prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
 											   const char *name, void *arg),
 								 void *arg);
+
+/*
+ * The same of the branch's routines ('P') and types ('T'), each emitted,
+ * unless *generation is their listing's generation already (unchanged
+ * since it was given: false, nothing emitted; 0 is none).  The listing is
+ * kept from one call to the next, worked out again only where the caches'
+ * invalidations say it changed, and its generation moves each time.
+ */
+extern bool prolly_owned_routines(uint64 *generation,
+								  void (*emit) (Oid oid, Oid owner, char kind,
+												const char *name, void *arg),
+								  void *arg);
 
 /*
  * Run as relid's maker (prolly_move_maker()), if it has one, until

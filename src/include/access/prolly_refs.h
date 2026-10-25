@@ -838,6 +838,19 @@ typedef struct ProllyRefsRoutine
 	void		(*stash_set_maker) (const char *name, int n, Oid role);
 
 	/*
+	 * Optional: the session branch's working set as the last fold of it
+	 * known made it, though writers may have ended since, into *root, and
+	 * a mark (fold_mark()'s) as of when it was known into *mark: the
+	 * working set is that root but for the relations written_since(mark)
+	 * says were written since.  Only a fold that left nothing out, from the
+	 * branch's baseline now, with no catalog change or collection since,
+	 * as snap sees the branch's writers; false where there's none such.
+	 * Its tree is in the store, whichever backend made it.
+	 */
+	bool		(*last_fold) (Snapshot snap, ProllyNodeRef *root,
+							  ProllyFoldMark *mark);
+
+	/*
 	 * Optional: forget the relation records of commits the chunk store no
 	 * longer has, as a step after a collection (true if any was).  A record
 	 * isn't a reference the collection follows, so it would outlive its
@@ -904,7 +917,7 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
-	"made_object", "stash_set_maker", "forget_records"
+	"made_object", "stash_set_maker", "last_fold", "forget_records"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK forget_records
 

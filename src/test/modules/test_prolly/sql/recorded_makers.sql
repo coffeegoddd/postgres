@@ -376,6 +376,136 @@ ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM regress_rm_spy;
 RESET ROLE;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 
+-- each statement a move makes is its object's, said as it is made, never
+-- read back from the statement's text: a routine with a long signature (a
+-- dozen named arguments) is made and made again as its owner, and an
+-- index a type move makes again, whatever its name holds (here another
+-- role's table's name after " ON "), as its table's owner
+SET ROLE regress_rm_w;
+CREATE TABLE rm.bt (id int PRIMARY KEY);
+RESET ROLE;
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e4 AS ENUM ('a', 'b');
+CREATE TABLE rm.it (id int PRIMARY KEY, x rm.e4);
+CREATE INDEX "i ON rm.bt" ON rm.it (id) WHERE x <> 'a';
+INSERT INTO rm.it VALUES (1, 'b');
+SELECT format('CREATE FUNCTION rm.long2(%s) RETURNS int LANGUAGE sql SECURITY DEFINER AS ''SELECT 1''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'long base')::text) AS committed;
+SELECT dolt_branch('feat6') IS NOT NULL AS made;
+SELECT dolt_checkout('feat6') IS NOT NULL AS on_feat6;
+SET ROLE regress_rm_alice;
+SELECT format('CREATE FUNCTION rm.longsig(%s) RETURNS text LANGUAGE sql SECURITY DEFINER AS ''SELECT current_user::text''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+SELECT format('DROP FUNCTION rm.long2(%s)', string_agg('integer', ', ')) FROM generate_series(1, 12) i \gexec
+SELECT format('CREATE FUNCTION rm.long2(%s) RETURNS text LANGUAGE sql SECURITY DEFINER AS ''SELECT current_user::text''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+ALTER TYPE rm.e4 RENAME VALUE 'b' TO 'bb';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'feat6')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE rm.su6 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su6')::text) AS committed;
+SELECT (dolt_merge('feat6', '-m', 'merged feat6'))[2:2] AS fast_forward;
+SELECT p.proname, p.proowner::regrole, length(pg_get_function_identity_arguments(p.oid)) > 264 AS long_identity
+FROM pg_proc p WHERE p.pronamespace = 'rm'::regnamespace AND p.proname IN ('longsig', 'long2')
+ORDER BY 1;
+SET ROLE regress_rm_alice;
+SELECT format('SELECT rm.%s(%s) AS runs_as', f, string_agg('1', ', '))
+FROM generate_series(1, 12) i, (VALUES ('longsig'), ('long2')) v(f) GROUP BY f ORDER BY f \gexec
+RESET ROLE;
+SELECT c.relname, c.relowner::regrole, i.indrelid::regclass AS of_table
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'rm.it'::regclass ORDER BY 1;
+SELECT pg_get_indexdef('rm."i ON rm.bt"'::regclass) AS made_again, x FROM rm.it;
+
+-- a type move converts each table using the type as the table's owner,
+-- which runs the type's code (its input, a domain's checks) over the
+-- table's rows: refused where the type's owner isn't the table's and
+-- hasn't that role's privileges (alice's enum, the writer's table, in a
+-- superuser's merge)
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e5 AS ENUM ('a', 'b');
+RESET ROLE;
+SET ROLE regress_rm_w;
+CREATE TABLE rm.pt (id int PRIMARY KEY, x rm.e5);
+INSERT INTO rm.pt VALUES (1, 'b');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'pt')::text) AS committed;
+SELECT dolt_branch('ty6') IS NOT NULL AS made;
+SELECT dolt_checkout('ty6') IS NOT NULL AS on_ty6;
+SET ROLE regress_rm_alice;
+ALTER TYPE rm.e5 RENAME VALUE 'b' TO 'bb';
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'e5 renamed')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_merge('ty6', '-m', 'merged ty6');
+SELECT x FROM rm.pt;
+
+-- a cast is made as the owner of one of its types, as CREATE CAST
+-- requires: alice's, for a superuser's merge of casts on her type.  One
+-- she may not make (to the writer's type, which she may not use) is
+-- refused, though the superuser made it
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e6 AS ENUM ('a');
+RESET ROLE;
+SET ROLE regress_rm_w;
+CREATE TYPE rm.wz AS ENUM ('a');
+REVOKE USAGE ON TYPE rm.wz FROM PUBLIC;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'e6')::text) AS committed;
+SELECT dolt_branch('c6') IS NOT NULL AS made;
+SELECT dolt_branch('c7') IS NOT NULL AS made;
+SELECT dolt_checkout('c6') IS NOT NULL AS on_c6;
+SET ROLE regress_rm_alice;
+CREATE CAST (rm.e6 AS text) WITH INOUT;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'inout cast')::text) AS committed;
+SELECT dolt_checkout('c7') IS NOT NULL AS on_c7;
+CREATE CAST (rm.e6 AS rm.wz) WITH INOUT;
+SELECT length(dolt_commit('-Am', 'binary cast')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE rm.su7 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su7')::text) AS committed;
+SELECT (dolt_merge('c6', '-m', 'merged c6'))[2:2] AS fast_forward;
+SELECT castsource::regtype, casttarget::regtype, castmethod FROM pg_cast
+WHERE castsource = 'rm.e6'::regtype ORDER BY 2::text;
+SELECT dolt_merge('c7', '-m', 'merged c7');
+SELECT count(*) AS casts FROM pg_cast WHERE castsource = 'rm.e6'::regtype;
+
+-- a commit's record of owners lists every routine and type, worked out
+-- again only where changed since the last: a routine's owner changed, and
+-- a type its arguments name renamed, are recorded so, and a reset making
+-- the routine from that commit makes it as the owner recorded then
+SET ROLE regress_rm_alice;
+CREATE FUNCTION rm.cf() RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cf')::text) AS committed;
+ALTER FUNCTION rm.cf() OWNER TO regress_rm_w;
+SELECT length(dolt_commit('--allow-empty', '-Am', 'cf owner')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS cf2 \gset
+DROP FUNCTION rm.cf();
+SELECT length(dolt_commit('-Am', 'cf dropped')::text) AS committed;
+SELECT dolt_reset('--hard', :'cf2') IS NOT NULL AS reset;
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cf';
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.ty1 AS ENUM ('a');
+CREATE FUNCTION rm.cg(rm.ty1) RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cg')::text) AS committed;
+SET ROLE regress_rm_alice;
+ALTER TYPE rm.ty1 RENAME TO ty2;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'ty1 renamed')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS cg2 \gset
+DROP FUNCTION rm.cg(rm.ty2);
+SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
+SELECT dolt_reset('--hard', :'cg2') IS NOT NULL AS reset;
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cg';
+
 -- a recorded owner is matched by OID and name: the role renamed (or
 -- another made with its OID) refuses the move
 CREATE ROLE regress_rm_ren;
