@@ -424,6 +424,218 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_serve_move_head('pushed', pg_temp.h('pushed'), pg_temp.h(:'old_commit'), :'fmt', false);
 SELECT dolt_hashof('pushed') = dolt_hashof('main') AS not_moved;
 
+-- a table a move makes from a commit (a branch's first use, a rebase's
+-- end, a reset or table checkout) is its recorded owner's, with no grants:
+-- the role moving gains nothing, and one that owns no table and reads none
+-- can't take a dropped table's old relation by using a branch at its
+-- commit
+DROP VIEW ic.tv;
+DROP MATERIALIZED VIEW ic.tm;
+SELECT length(dolt_commit('-Am', 'no views')::text) AS committed;
+CREATE ROLE regress_ic_owner;
+GRANT USAGE, CREATE ON SCHEMA ic TO regress_ic_owner;
+GRANT CREATE ON SCHEMA ic TO regress_ic_writer;
+SELECT format('GRANT CREATE ON DATABASE %I TO regress_ic_writer', current_database()) \gexec
+SET ROLE regress_ic_owner;
+CREATE TABLE ic.o (id int PRIMARY KEY, note text);
+INSERT INTO ic.o VALUES (1, 'owner secret');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'o')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS o_commit \gset
+SELECT 'ic.o'::regclass::oid AS o_oid \gset
+SET ROLE regress_ic_owner;
+DROP TABLE ic.o;
+CREATE TABLE ic.o (id int PRIMARY KEY, note text);
+INSERT INTO ic.o VALUES (10, 'owner public');
+GRANT SELECT, INSERT, UPDATE, DELETE ON ic.o TO regress_ic_writer;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'o again')::text) AS committed;
+SET ROLE regress_ic_writer;
+SELECT dolt_branch('o_old', :'o_commit') IS NOT NULL AS made;
+SELECT dolt_checkout('o_old') IS NOT NULL AS on_o_old;
+SELECT 'ic.o'::regclass::oid = :o_oid AS old_relation,
+	(SELECT relowner::regrole FROM pg_class WHERE oid = 'ic.o'::regclass) AS owner,
+	has_table_privilege('ic.o', 'SELECT') AS can_read;
+SELECT * FROM ic.o;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+RESET ROLE;
+-- (a reset making a table dropped since makes it so too)
+SELECT dolt_hashof('HEAD') AS o_now \gset
+DROP TABLE ic.o;
+SELECT dolt_reset('--hard', :'o_commit') IS NOT NULL AS reset;
+SELECT (SELECT relowner::regrole FROM pg_class WHERE oid = 'ic.o'::regclass) AS owner,
+	(SELECT relacl FROM pg_class WHERE oid = 'ic.o'::regclass) IS NULL AS no_grants;
+DROP TABLE ic.o;
+SELECT dolt_reset('--hard', :'o_now') IS NOT NULL AS back;
+-- (made so too, its grants given again)
+GRANT SELECT, INSERT, UPDATE, DELETE ON ic.o TO regress_ic_writer;
+SELECT length(dolt_commit('--allow-empty', '-m', 'o granted')::text) AS committed;
+
+-- a rebase's end: the rebased commits are the branch's; resolved with
+-- --ours (the upstream's relation) the table is its recorded owner's, not
+-- the rebaser's; with --theirs, the branch's own relation, its owner and
+-- grants, stays
+SELECT dolt_branch('feat') IS NOT NULL AS made;
+SELECT dolt_branch('feat2') IS NOT NULL AS made;
+-- (each used, its copies made, before main makes its table again)
+SELECT dolt_checkout('feat') IS NOT NULL AS on_feat;
+SELECT dolt_checkout('feat2') IS NOT NULL AS on_feat2;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_ic_owner;
+DROP TABLE ic.o;
+CREATE TABLE ic.o (id int PRIMARY KEY, note text);
+INSERT INTO ic.o VALUES (20, 'main, made again');
+GRANT INSERT, UPDATE, DELETE ON ic.o TO regress_ic_writer;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'o made again on main')::text) AS committed;
+SELECT 'ic.o'::regclass::oid AS main_o \gset
+SET ROLE regress_ic_writer;
+SELECT dolt_checkout('feat') IS NOT NULL AS on_feat;
+SELECT 'ic.o'::regclass::oid AS feat_o \gset
+INSERT INTO ic.o VALUES (3, 'feat');
+SELECT length(dolt_commit('-am', 'f1')::text) AS committed;
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS stopped;
+SELECT dolt_conflicts_resolve('--ours', 'ic.o') IS NOT NULL AS resolved;
+SELECT (dolt_rebase('--continue'))[1] AS status;
+COMMIT;
+SELECT 'ic.o'::regclass::oid = :main_o AS upstream_relation,
+	(SELECT relowner::regrole FROM pg_class WHERE oid = 'ic.o'::regclass) AS owner,
+	has_table_privilege('ic.o', 'SELECT') AS can_read;
+SELECT * FROM ic.o;
+SELECT dolt_checkout('feat2') IS NOT NULL AS on_feat2;
+SELECT 'ic.o'::regclass::oid AS feat2_o \gset
+INSERT INTO ic.o VALUES (4, 'feat2');
+SELECT length(dolt_commit('-am', 'f2')::text) AS committed;
+RESET ROLE;
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS stopped;
+SELECT dolt_conflicts_resolve('--theirs', 'ic.o') IS NOT NULL AS resolved;
+SELECT (dolt_rebase('--continue'))[1] AS status;
+COMMIT;
+SELECT 'ic.o'::regclass::oid = :feat2_o AS own_relation,
+	(SELECT relowner::regrole FROM pg_class WHERE oid = 'ic.o'::regclass) AS owner,
+	has_table_privilege('regress_ic_writer', 'ic.o', 'SELECT') AS writer_reads;
+SELECT * FROM ic.o ORDER BY id;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+
+-- an abort after --theirs gives the branch's relation back as it was: its
+-- grants and its columns', and its views' (made again by --theirs, and by
+-- the abort, they get theirs back)
+CREATE TABLE ic.g (id int PRIMARY KEY, note text);
+CREATE VIEW ic.gv AS SELECT id FROM ic.g;
+INSERT INTO ic.g VALUES (1, 'g base');
+SELECT length(dolt_commit('-Am', 'g')::text) AS committed;
+SELECT dolt_branch('g_side') IS NOT NULL AS made;
+DROP TABLE ic.g CASCADE;
+CREATE TABLE ic.g (id int PRIMARY KEY, note text);
+CREATE VIEW ic.gv AS SELECT id FROM ic.g;
+INSERT INTO ic.g VALUES (10, 'g public');
+GRANT SELECT ON ic.g TO regress_ic_reader;
+GRANT UPDATE (note) ON ic.g TO regress_ic_writer;
+GRANT SELECT ON ic.gv TO regress_ic_reader;
+SELECT length(dolt_commit('-Am', 'g again')::text) AS committed;
+SELECT 'ic.g'::regclass::oid AS g_oid \gset
+SELECT dolt_checkout('g_side') IS NOT NULL AS on_side;
+UPDATE ic.g SET note = 'g side secret';
+SELECT length(dolt_commit('-am', 'g side')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TEMP TABLE g_was AS SELECT 'ic.g'::regclass::oid AS relid;
+CREATE FUNCTION pg_temp.g_grants() RETURNS TABLE (g_relation bool, g aclitem[], g_note aclitem[], gv aclitem[])
+LANGUAGE sql AS $$
+	SELECT 'ic.g'::regclass::oid = (SELECT relid FROM g_was),
+		(SELECT relacl FROM pg_class WHERE oid = 'ic.g'::regclass),
+		(SELECT attacl FROM pg_attribute WHERE attrelid = 'ic.g'::regclass AND attname = 'note'),
+		(SELECT relacl FROM pg_class WHERE oid = 'ic.gv'::regclass)
+$$;
+SELECT * FROM pg_temp.g_grants();
+BEGIN;
+SELECT (dolt_merge('g_side'))[2:4] AS merged;
+SELECT dolt_conflicts_resolve('--theirs', 'ic.g') IS NOT NULL AS resolved;
+SELECT * FROM pg_temp.g_grants();
+SELECT (dolt_merge('--abort'))[4] AS aborted;
+SELECT * FROM pg_temp.g_grants();
+COMMIT;
+SET ROLE regress_ic_reader;
+SELECT * FROM ic.gv;
+RESET ROLE;
+
+-- --theirs refuses while objects of other roles depend on the table here:
+-- made again, they would be the resolver's
+CREATE ROLE regress_ic_viewer;
+GRANT USAGE, CREATE ON SCHEMA ic TO regress_ic_viewer;
+GRANT SELECT ON ic.g TO regress_ic_viewer;
+CREATE TABLE ic.h (id int PRIMARY KEY);
+GRANT SELECT ON ic.h TO regress_ic_viewer;
+SET ROLE regress_ic_viewer;
+CREATE VIEW ic.hv AS SELECT id FROM ic.h;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'h')::text) AS committed;
+SELECT dolt_branch('h_side') IS NOT NULL AS made;
+DROP TABLE ic.h CASCADE;
+CREATE TABLE ic.h (id int PRIMARY KEY);
+GRANT SELECT ON ic.h TO regress_ic_viewer;
+SET ROLE regress_ic_viewer;
+CREATE VIEW ic.hv AS SELECT id FROM ic.h;
+RESET ROLE;
+SELECT length(dolt_commit('--allow-empty', '-Am', 'h again')::text) AS committed;
+SELECT dolt_checkout('h_side') IS NOT NULL AS on_side;
+INSERT INTO ic.h VALUES (1);
+SELECT length(dolt_commit('-am', 'h side')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT (dolt_merge('h_side'))[2:4] AS merged;
+SELECT dolt_conflicts_resolve('--theirs', 'ic.h');
+ROLLBACK;
+
+-- a branch first used, its source having a materialized view over the
+-- table made again: the copy, and the view, are another branch's; the
+-- first use makes the head's
+SELECT dolt_branch('mv_old') IS NOT NULL AS made;
+DROP VIEW ic.gv;
+DROP TABLE ic.g;
+CREATE TABLE ic.g (id int PRIMARY KEY, note text);
+CREATE MATERIALIZED VIEW ic.gm AS SELECT id FROM ic.g;
+SELECT length(dolt_commit('-Am', 'g with a materialized view')::text) AS committed;
+SELECT dolt_checkout('mv_old') IS NOT NULL AS on_mv_old;
+SELECT 'ic.g'::regclass::oid = :g_oid AS head_relation, to_regclass('ic.gm') IS NULL AS no_matview;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+
+-- a hard reset to the head discards the branch's own uncommitted drop and
+-- re-make: the head's relation again
+SELECT 'ic.g'::regclass::oid AS g_now \gset
+DROP MATERIALIZED VIEW ic.gm;
+DROP TABLE ic.g;
+CREATE TABLE ic.g (id int PRIMARY KEY, note text);
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+SELECT 'ic.g'::regclass::oid = :g_now AS head_relation, to_regclass('ic.gm') IS NOT NULL AS matview_back;
+
+-- a forced move of a branch to a commit whose table is another relation
+-- than the branch's: refused, the branch as it was
+SELECT dolt_branch('forced') IS NOT NULL AS made;
+SELECT dolt_checkout('forced') IS NOT NULL AS on_forced;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_hashof('forced') AS forced_head \gset
+SELECT dolt_branch('-f', 'forced', :'old_commit');
+SELECT dolt_hashof('forced') = :'forced_head' AS unchanged;
+
+-- a table whose recorded owner was dropped since can't be made as the
+-- commit has it
+CREATE ROLE regress_ic_gone;
+GRANT USAGE, CREATE ON SCHEMA ic TO regress_ic_gone;
+SET ROLE regress_ic_gone;
+CREATE TABLE ic.gone (id int PRIMARY KEY);
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'gone')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS gone_commit \gset
+DROP TABLE ic.gone;
+SELECT length(dolt_commit('-Am', 'gone dropped')::text) AS committed;
+REVOKE USAGE, CREATE ON SCHEMA ic FROM regress_ic_gone;
+DROP ROLE regress_ic_gone;
+SELECT dolt_reset('--hard', :'gone_commit');
+SELECT to_regclass('ic.gone') IS NULL AS not_made;
+
 \c contrib_regression
 DROP DATABASE regress_identity_conflicts;
-DROP ROLE regress_ic_reader, regress_ic_old_reader, regress_ic_writer;
+DROP ROLE regress_ic_reader, regress_ic_old_reader, regress_ic_writer,
+	regress_ic_owner, regress_ic_viewer;

@@ -35,6 +35,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -1268,6 +1269,26 @@ version_move_end(VersionMove *vm)
 	} while (0)
 
 /*
+ * A VERSION_MOVE() that restores the commits' versions (a reset, a table's
+ * checkout, an abort, a stash's push): each table it makes is the
+ * commit's, its recorded owner's with no grants (prolly_move_recorded_owners),
+ * not the mover's.
+ */
+#define RESTORING_MOVE(from_, n_, ...) \
+	do { \
+		prolly_move_recorded_owners = true; \
+		PG_TRY(_restoring); \
+		{ \
+			VERSION_MOVE(from_, n_, __VA_ARGS__); \
+		} \
+		PG_FINALLY(_restoring); \
+		{ \
+			prolly_move_recorded_owners = false; \
+		} \
+		PG_END_TRY(_restoring); \
+	} while (0)
+
+/*
  * Hold the refs (to the transaction's end) before what reads the head and
  * then replaces commits from it, as an amend or a rebase does: a commit
  * another session made in between would be dropped from the branch, the
@@ -2020,8 +2041,8 @@ checkout_tables(const char *ref, char **names, int nnames)
 	 * it; the branch may be its head's again, its changes all put back)
 	 */
 	branch_note_write(MyBranch);
-	VERSION_MOVE(&commit, 1,
-				 PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	RESTORING_MOVE(&commit, 1,
+				   PROLLY_CALL(diff_merge(), move_to, &target, &working));
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
@@ -2549,7 +2570,12 @@ static void
 abort_in_progress(const char *what)
 {
 	ProllyHash	head = {0};
+	ProllyMergeState ms;
+	char	   *saved = NULL;
 
+	/* (the privileges a resolution with theirs took from the branch's) */
+	if (PROLLY_CALL(refs(), merge_state, &ms))
+		saved = ms.identity_saved;
 	branch_note_write(MyBranch);
 	(void) PROLLY_CALL(refs(), resolve, "HEAD", &head);
 	/* (a table its resolution made theirs: the head's relation again) */
@@ -2557,8 +2583,9 @@ abort_in_progress(const char *what)
 		BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
 														   psprintf("abort the %s", what),
 														   true));
-	VERSION_MOVE(&head, head.len > 0 ? 1 : 0,
-				 PROLLY_CALL(refs(), reset, "HEAD"));
+	RESTORING_MOVE(&head, head.len > 0 ? 1 : 0,
+				   PROLLY_CALL(refs(), reset, "HEAD"));
+	BRANCH_WRITES_HUSHED(prolly_restore_privileges(saved, false));
 	settled();
 }
 
@@ -3542,9 +3569,22 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	target = {0};
 
+		ProllyHash	head = {0};
+
 		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
-		VERSION_MOVE(&target, target.len > 0 ? 1 : 0,
-					 PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+
+		/*
+		 * (to the head: discarding the branch's own work, a table made
+		 * again since its commit is the head's relation again, as a
+		 * stash's push makes it)
+		 */
+		if (target.len > 0 && PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			same_hash(&head, &target))
+			BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
+															   "reset the branch",
+															   true));
+		RESTORING_MOVE(&target, target.len > 0 ? 1 : 0,
+					   PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	}
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
@@ -3706,8 +3746,8 @@ dolt_stash(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&at,
 																   "stash the changes",
 																   true));
-			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
-						 PROLLY_CALL(refs(), reset, "HEAD"));
+			RESTORING_MOVE(&at, at.len > 0 ? 1 : 0,
+						   PROLLY_CALL(refs(), reset, "HEAD"));
 		}
 		settled();
 	}
@@ -4312,8 +4352,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&ms.series_head,
 																   "abort the revert",
 																   true));
-				VERSION_MOVE(&ms.series_head, 1,
-							 PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
+				RESTORING_MOVE(&ms.series_head, 1,
+							   PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
+				BRANCH_WRITES_HUSHED(prolly_restore_privileges(ms.identity_saved, false));
 				settled();
 			}
 			else if (ms.ntables > 0 || ms.nidentity > 0 ||

@@ -38,11 +38,11 @@
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
  *				   working set named them: the head's hash, then a line
- *				   per table (its OID, then its qualified name, as 'L'
+ *				   per table (its OID, owner and qualified name, as 'L'
  *				   lines are)
  *	'H' name	-> the head's other relations with privileges of their own
- *				   (views, materialized views, sequences, partitioned and
- *				   foreign tables), as 'N' has its tables: the head's hash,
+ *				   (views, materialized views, sequences and foreign
+ *				   tables), as 'N' has its tables: the head's hash,
  *				   then a line for each (as 'L' lines are), none written
  *				   when there are none; a merge of the branch, or a pick
  *				   of its head, takes their privileges
@@ -74,14 +74,16 @@
  *	'L' commit	-> the relations the commit was made from, as this database
  *				   made it (commits fetched, cloned or pushed here have
  *				   none): a line for each prolly table and partitioned
- *				   table, its OID (10 digits), a space, and its qualified
- *				   name (a backslash in it written as two, a newline as a
- *				   backslash and 'n')
+ *				   table, its OID and its owner's (10 digits each, a space
+ *				   after each), and its qualified name (a backslash in it
+ *				   written as two, a newline as a backslash and 'n')
  *	'D' name	-> the branch's merge's table identity conflicts: tables the
  *				   merge kept as the branch has them, as theirs is another
  *				   relation of the name: the local branch merged, if
  *				   theirs was one's head (a varint length, then the bytes;
- *				   0: none), then each table's relation here and theirs
+ *				   0: none), the privileges of the branch's relations a
+ *				   resolution with theirs dropped (the same: lines of
+ *				   kind, name, column and ACL), then each table's relation here and theirs
  *				   (OIDs, 4 bytes each, big-endian), the inheritance or
  *				   partition tree it was kept with (a varint), its name
  *				   here and in theirs (a varint length, then the bytes,
@@ -2519,6 +2521,7 @@ move_settled_checked(void *arg)
 	if (folded)
 		relids = prolly_relations_of(&before);
 	prolly_move_provenance = list_make1(&ms->head);
+	prolly_move_recorded_owners = true;
 	PG_TRY();
 	{
 		move_settled(ms->info);
@@ -2526,6 +2529,7 @@ move_settled_checked(void *arg)
 	PG_FINALLY();
 	{
 		prolly_move_provenance = NIL;
+		prolly_move_recorded_owners = false;
 	}
 	PG_END_TRY();
 	if (folded)
@@ -3980,7 +3984,16 @@ move_copies_checked(void *arg)
 		copies_working_set(NULL, &before);
 	if (folded)
 		relids = prolly_relations_of(&before);
-	move_copies(arg);
+	prolly_move_recorded_owners = true;
+	PG_TRY();
+	{
+		move_copies(arg);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_recorded_owners = false;
+	}
+	PG_END_TRY();
 	if (folded)
 		prolly_refuse_mismatched_versions(&before, relids, &mc->head, 1,
 										  PROLLY_MISMATCH_FIRST_USE);
@@ -4618,14 +4631,15 @@ line_cmp(const ListCell *a, const ListCell *b)
 
 /*
  * A relation's line in a record of tables: its OID (10 digits), a space,
- * and its qualified name, each backslash in it written as two and each
- * newline as a backslash and 'n', so that no name, whatever it holds,
- * makes a line of its own; then a newline.
+ * its owner's OID (10 digits), a space, and its qualified name, each
+ * backslash in it written as two and each newline as a backslash and 'n',
+ * so that no name, whatever it holds, makes a line of its own; then a
+ * newline.
  */
 static void
-relation_line(StringInfo out, Oid relid, const char *name)
+relation_line(StringInfo out, Oid relid, Oid owner, const char *name)
 {
-	appendStringInfo(out, "%010u ", relid);
+	appendStringInfo(out, "%010u %010u ", relid, owner);
 	for (const char *c = name; *c; c++)
 	{
 		if (*c == '\\')
@@ -4660,6 +4674,13 @@ relation_lines(const char *data)
 		if (p[10] != ' ')
 			goto bad;
 		r->relid = (Oid) strtoul(p, NULL, 10);
+		for (int i = 11; i < 21; i++)
+			if (!isdigit((unsigned char) p[i]))
+				goto bad;
+		if (p[21] != ' ')
+			goto bad;
+		r->owner = (Oid) strtoul(p + 11, NULL, 10);
+		c = p + 22;
 		initStringInfo(&name);
 		for (; *c && *c != '\n'; c++)
 		{
@@ -4738,7 +4759,7 @@ table_names(StringInfo out)
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid,
+			relation_line(&line, c->oid, c->relowner,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -4776,7 +4797,7 @@ privileged_names(StringInfo out)
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid,
+			relation_line(&line, c->oid, c->relowner,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -4926,7 +4947,7 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 					keep = true;
 		}
 		if (keep)
-			relation_line(&out, r->relid, r->name);
+			relation_line(&out, r->relid, r->owner, r->name);
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -4977,7 +4998,7 @@ note_head_privileged(const char *name, const ProllyHash *head,
 			foreach_ptr(ProllyCommitRelation, b, before)
 				if (b->relid == r->relid && strcmp(b->name, r->name) == 0)
 				{
-					relation_line(&kept, r->relid, r->name);
+					relation_line(&kept, r->relid, r->owner, r->name);
 					break;
 				}
 		lines = kept.data;
@@ -6631,7 +6652,9 @@ identity_conflicts_put(const char *branch, const ProllyMergeState *state)
 	StringInfoData key;
 	StringInfoData v;
 	StringInfoData had;
-	bool		any = state != NULL && state->nidentity > 0;
+	bool		any = state != NULL &&
+		(state->nidentity > 0 ||
+		 (state->identity_saved != NULL && state->identity_saved[0] != '\0'));
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -6642,8 +6665,12 @@ identity_conflicts_put(const char *branch, const ProllyMergeState *state)
 	{
 		const char *source = state->identity_source ? state->identity_source : "";
 
+		const char *saved = state->identity_saved ? state->identity_saved : "";
+
 		prolly_put_varint(&v, strlen(source));
 		appendStringInfoString(&v, source);
+		prolly_put_varint(&v, strlen(saved));
+		appendStringInfoString(&v, saved);
 		for (int i = 0; i < state->nidentity; i++)
 		{
 			const ProllyIdentityConflict *c = &state->identity[i];
@@ -6694,6 +6721,7 @@ identity_conflicts_get(const char *branch, ProllyMergeState *state)
 	state->nidentity = 0;
 	state->identity = NULL;
 	state->identity_source = NULL;
+	state->identity_saved = NULL;
 	if (refs_get(key.data, key.len, &v))
 	{
 		const char *p = v.data;
@@ -6703,6 +6731,7 @@ identity_conflicts_get(const char *branch, ProllyMergeState *state)
 		state->identity_source = identity_conflicts_string(&p, end);
 		if (state->identity_source[0] == '\0')
 			state->identity_source = NULL;
+		state->identity_saved = identity_conflicts_string(&p, end);
 		state->identity = palloc(sizeof(ProllyIdentityConflict) * cap);
 		while (p < end)
 		{

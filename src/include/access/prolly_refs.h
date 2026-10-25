@@ -117,6 +117,10 @@ typedef struct ProllyMergeState
 										 * (palloc'd) */
 	char	   *identity_source;	/* the local branch theirs was the head
 									 * of, or NULL */
+	char	   *identity_saved; /* the privileges of the branch's relations
+								 * --theirs dropped, for an abort to give
+								 * back (prolly_save_privileges()'s), or
+								 * NULL */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -254,11 +258,12 @@ typedef struct ProllyMovedBranch
 
 /*
  * A relation a commit was made from (refs' commit_relations()): its OID,
- * and the table's qualified name then (quoted as needed).
+ * its owner's, and the table's qualified name then (quoted as needed).
  */
 typedef struct ProllyCommitRelation
 {
 	Oid			relid;
+	Oid			owner;			/* its owner then */
 	char	   *name;
 } ProllyCommitRelation;
 

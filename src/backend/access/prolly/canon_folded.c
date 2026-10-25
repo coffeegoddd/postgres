@@ -7989,10 +7989,86 @@ typedef struct MoveRelid
 {
 	char	   *name;
 	Oid			relid;
+	Oid			owner;			/* the role it is made as (InvalidOid: the
+								 * move's) */
 } MoveRelid;
+
+bool		prolly_move_recorded_owners = false;
+
+/* The tables a move makes as their recorded owners, once made (MoveRelid *) */
+static List *move_owned_tables = NIL;
 
 /* While a move's statements run, the relations its tables are to be. */
 static List *move_kept_relids = NIL;
+
+/*
+ * The role table name is made as by a move that restores it from a commit
+ * (prolly_move_recorded_owners): owner, the one the commit records, which
+ * must still exist.
+ */
+static Oid
+recorded_owner(const char *name, Oid owner)
+{
+	if (!OidIsValid(owner) ||
+		!SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(owner)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("cannot make table %s as the commit has it: the role that owned it there no longer exists",
+						name),
+				 errdetail("A table a move makes from a commit is its recorded owner's, with no grants."),
+				 errhint("Move to a commit whose tables' owners exist, or drop the table at the commit first.")));
+	return owner;
+}
+
+/*
+ * Give each table of owned (MoveRelid *, by name) the move made to its
+ * recorded owner, with no grants: what made it (the move's role, its
+ * default privileges) gains nothing by it.  After the move's statements
+ * and rows, which ran as they do for any move.
+ */
+static void
+give_made_tables(List *owned)
+{
+	foreach_ptr(MoveRelid, mr, owned)
+	{
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mr->name, NULL)),
+											 NoLock, true);
+		Relation	pg_class;
+		HeapTuple	tup;
+		bool		isnull;
+		Datum		acl;
+
+		if (!OidIsValid(relid))
+			continue;
+		ATExecChangeOwner(relid, mr->owner, true, AccessExclusiveLock);
+		CommandCounterIncrement();
+		pg_class = table_open(RelationRelationId, RowExclusiveLock);
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", relid);
+		acl = heap_getattr(tup, Anum_pg_class_relacl, RelationGetDescr(pg_class),
+						   &isnull);
+		if (!isnull)
+		{
+			Datum		values[Natts_pg_class] = {0};
+			bool		nulls[Natts_pg_class] = {0};
+			bool		replaces[Natts_pg_class] = {0};
+			Oid		   *members;
+			int			nmembers = aclmembers(DatumGetAclP(acl), &members);
+			HeapTuple	newtup;
+
+			nulls[Anum_pg_class_relacl - 1] = true;
+			replaces[Anum_pg_class_relacl - 1] = true;
+			newtup = heap_modify_tuple(tup, RelationGetDescr(pg_class), values,
+									   nulls, replaces);
+			CatalogTupleUpdate(pg_class, &newtup->t_self, newtup);
+			updateAclDependencies(RelationRelationId, relid, 0, mr->owner,
+								  nmembers, members, 0, NULL);
+		}
+		table_close(pg_class, RowExclusiveLock);
+		CommandCounterIncrement();
+	}
+}
 
 /*
  * The relations the tables a move makes are to be: a table it makes again
@@ -8024,7 +8100,7 @@ move_relids_before(List *from, List *to, List *remade)
 								 NoLock, true);
 		if (!OidIsValid(relid))
 			continue;
-		mr = palloc(sizeof(MoveRelid));
+		mr = palloc0(sizeof(MoveRelid));
 		mr->name = lfirst(lc);
 		mr->relid = relid;
 		out = lappend(out, mr);
@@ -8040,10 +8116,11 @@ move_relids_before(List *from, List *to, List *remade)
 		foreach_ptr(ProllyKeptRelation, k, prolly_move_kept)
 			if (!given && strcmp(k->name, t->name) == 0)
 			{
-				MoveRelid  *mr = palloc(sizeof(MoveRelid));
+				MoveRelid  *mr = palloc0(sizeof(MoveRelid));
 
 				mr->name = t->name;
 				mr->relid = k->relid;
+				mr->owner = k->owner;
 				out = lappend(out, mr);
 				given = true;
 			}
@@ -8063,9 +8140,11 @@ move_relids_before(List *from, List *to, List *remade)
 					of = lfirst(rc);
 			if (of == NULL)
 				continue;
-			mr = palloc(sizeof(MoveRelid));
+			mr = palloc0(sizeof(MoveRelid));
 			mr->name = t->name;
 			mr->relid = of->relid;
+			if (prolly_move_recorded_owners)
+				mr->owner = recorded_owner(t->name, of->owner);
 			out = lappend(out, mr);
 			break;
 		}
@@ -11076,6 +11155,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			remade = lappend(remade, f->name);
 	}
 	move_kept_relids = move_relids_before(from, to, remade);
+	move_owned_tables = NIL;
+	foreach_ptr(MoveRelid, mr, move_kept_relids)
+		if (OidIsValid(mr->owner))
+			move_owned_tables = lappend(move_owned_tables, mr);
 
 	/*
 	 * Tables whose columns change type in turn (type_moves()) are emptied
@@ -11565,6 +11648,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MemoryContextSwitchTo(spi);
 	}
 	move_kept_relids = NIL;
+	give_made_tables(move_owned_tables);
+	move_owned_tables = NIL;
 	SPI_finish();
 	AtEOXact_GUC(true, save_nestlevel);
 	return;

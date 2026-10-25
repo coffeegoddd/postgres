@@ -393,27 +393,50 @@ another's table, under its grants:
   refused where the drop would take anything the move can't make again as
   the merge has it (anything outside the versioned schemas, another table
   or a column of one, a materialized view, whose query would run as the
-  resolver); views, foreign keys and policies of versioned tables are made
-  again.  Then the move makes theirs' (their definitions, indexes,
+  resolver), or an object of another role's (made again, it would be the
+  resolver's: each is listed); the resolver's views, foreign keys and
+  policies of versioned tables are made again, the views given back their
+  grants.  The privileges of the branch's tables (their own and their
+  columns') and of the views the drop took are saved in the merge in
+  progress, and its abort gives them back (prolly_restore_privileges()).  Then the move makes theirs' (their definitions, indexes,
   constraints, policies and rows, from theirs' commit) as the session's
   role, each of its OID, and gives each the privileges the local branch
   theirs was the head of has on it (branch_ops' carry_privileges(), as a
   merge of that branch gives a table it makes).  The merge's commit then
   records the chosen relations.
-- A hard reset, a table's checkout from a commit and a push's move of a
-  branch (dolt_serve_move_head) that would put into a table here a version
+- A table a move makes from a commit it restores (a reset, a table's
+  checkout, a branch's first use, a rebase's end, an abort, a stash's
+  push) is the commit's: its recorded owner's (each line of a commit's
+  record of relations has its owner), with no grants
+  (prolly_move_recorded_owners; the canonicalizer's give_made_tables()).
+  The role moving gains nothing by it, and where the recorded owner no
+  longer exists the move is refused.  (The statements making it, and its
+  rows, run as for any move, as the session's role; ownership and the
+  privileges are set after.)  A table a merge makes is the merging
+  role's, given the source branch's grants (carry_privileges()).
+- A hard reset, a table's checkout from a commit and a push's or forced
+  move of a branch (dolt_serve_move_head, dolt_branch -f) that would put
+  into a table here a version
   of another relation (as the commit moved to records it, under the
   table's name) are refused, checked after the move and before its
   transaction can commit (VERSION_MOVE() in prolly_dolt.c, the refs'
   branch move), with a hint to drop the table here first: the move then
-  makes the version's relation again, of its OID, with no grants.  A move
-  back to the branch's head that undoes the branch's own work (a merge's,
-  pick's or revert's abort, a stash's push) drops such tables itself and
-  makes the head's relations again; so does a branch's first use, whose
-  copies (of the nearest source's relations) may be other relations than
-  its head's, and a rebase's end, the rebased commits being the branch's.
-  The grants of a table so made again went with the relation it replaced.
-  A move between versions of one relation keeps it, and its grants.
+  makes the version's relation again, of its OID.  A move back to the
+  branch's head that undoes the branch's own work (a merge's, pick's or
+  revert's abort, a stash's push, a hard reset to the head) drops such
+  tables itself and makes the head's relations again; so does a branch's
+  first use, whose copies (of the nearest source's relations, materialized
+  views over them too) may be other relations than its head's, and a
+  rebase's end, the rebased commits being the branch's (where its own
+  relation is the rebased head's, it stays, with its grants).  The grants
+  of a table so made again went with the relation it replaced, but for an
+  abort's.  A move between versions of one relation keeps it, and its
+  grants.
+- History reads (#932) of a table whose merge's other parent holds another
+  relation of its name are refused for a SELECT grantee where they reach
+  that parent's versions (dolt_history_table, dolt_diff_table and history
+  mounts walk every version): the table's own first-parent versions are
+  read by dolt_at, and dolt_diff_table between them.
 - Moves to commits made elsewhere (fetched, cloned, pushed: no record)
   keep the relation and its grants, as before, so an old table's version
   come back from a remote can land its rows in the table here (its

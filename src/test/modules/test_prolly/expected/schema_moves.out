@@ -1318,8 +1318,8 @@ DETAIL:  drop cascades to table app.p
 drop cascades to table app.t
 -- Two tables' names swapped: a hard reset back to the head, which matches
 -- tables by name, would put each table's version into the other's
--- relation, and is refused; with the tables dropped it makes each its own
--- relation again.  A merge's abort does that itself.
+-- relation; discarding the branch's own changes, it makes each its own
+-- relation again instead, by its OID, as a merge's abort does.
 CREATE SCHEMA sw VERSIONED;
 CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
 CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
@@ -1334,11 +1334,6 @@ SELECT 'sw.a'::regclass::oid AS sw_a, 'sw.b'::regclass::oid AS sw_b \gset
 ALTER TABLE sw.a RENAME TO tmp;
 ALTER TABLE sw.b RENAME TO a;
 ALTER TABLE sw.tmp RENAME TO b;
-SELECT dolt_reset('--hard');
-ERROR:  cannot move tables sw.a, sw.b to versions of other tables
-DETAIL:  The version of sw.a this moves to was made from another relation of that name: a table dropped and made again since, or made apart from the one here.
-HINT:  Drop the table on this branch first: the move then makes the version's own relation again.
-DROP TABLE sw.a, sw.b;
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------

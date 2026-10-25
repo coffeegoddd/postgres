@@ -155,7 +155,7 @@ typedef enum ProllyMismatchedMove
 {
 	PROLLY_MISMATCH_MOVE,		/* a reset, a table's checkout, ... */
 	PROLLY_MISMATCH_FIRST_USE,	/* a branch's first use */
-	PROLLY_MISMATCH_PUSH,		/* a push's move of a branch */
+	PROLLY_MISMATCH_PUSH,		/* a push's or forced move of a branch */
 } ProllyMismatchedMove;
 
 extern void prolly_refuse_mismatched_versions(const ProllyNodeRef *before,
@@ -175,6 +175,13 @@ extern void prolly_refuse_mismatched_versions(const ProllyNodeRef *before,
  */
 extern void prolly_drop_mismatched_tables(const ProllyHash *head,
 										  const char *why, bool owned);
+
+/*
+ * Give back privileges a merge's resolution saved (the merge in progress's
+ * identity_saved) to the relations of those names now: only views', or
+ * all (an abort's).
+ */
+extern void prolly_restore_privileges(const char *saved, bool views);
 
 /*
  * While set, a branch's move to a commit (refs' branch_move()) replaces
