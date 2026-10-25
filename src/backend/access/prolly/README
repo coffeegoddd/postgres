@@ -65,6 +65,7 @@ Changes to this design are tracked in GitHub issues:
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
 	json_tree         prolly_jsontree.h       paths, stub
+	commit_cache      prolly_commitcache.h    shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -690,6 +691,19 @@ commit in the same transaction: a collection after it ends drops a commit
 no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
+
+Walking history (HEAD~n, ^n, a commit named by its hash) takes each
+commit's links (its root, parents and height) from the commit cache
+(prolly_commitcache.h; "shared", commitcache_shared.c), a table in shared
+memory of prolly_commit_cache_entries commits (4096; 0 turns it off),
+before reading the commit.  A backend's own chunk cache lets go of the
+commits as soon as a large diff or reset reads past them, so without it
+each step of a walk could be a read from disk.  An entry is of the chunk
+store's GC generation it was read in (the chunk store's generation()) and
+is found only in that generation, so a collection's swap lets go of them
+all; dropping a database forgets its entries.  A transaction's entries
+are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
+and commit_cache_misses).
 
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed

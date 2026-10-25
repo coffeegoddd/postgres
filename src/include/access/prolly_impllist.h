@@ -45,6 +45,7 @@ PG_PROLLY_IMPL(ProllyValueMemoRoutine, prolly_memo_shared)
 PG_PROLLY_IMPL(ProllyWritersRoutine, prolly_writers_modes)
 PG_PROLLY_IMPL(ProllyMatCacheRoutine, prolly_matcache_branches)
 PG_PROLLY_IMPL(ProllyJsonTreeRoutine, prolly_jsontree_paths)
+PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_shared)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
@@ -70,3 +71,4 @@ PG_PROLLY_IMPL(ProllyChangeLogRoutine, prolly_changelog_stub)
 PG_PROLLY_IMPL(ProllyMovePlannerRoutine, prolly_moveplan_stub)
 PG_PROLLY_IMPL(ProllyMatCacheRoutine, prolly_matcache_stub)
 PG_PROLLY_IMPL(ProllyJsonTreeRoutine, prolly_jsontree_stub)
+PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_stub)

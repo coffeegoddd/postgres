@@ -58,7 +58,9 @@ FROM prolly_implementations();
  matcache      | stub         |       0 |              0
  json_tree     | paths        |       1 |              2
  json_tree     | stub         |       0 |              0
-(49 rows)
+ commit_cache  | shared       |       1 |              1
+ commit_cache  | stub         |       0 |              0
+(51 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -278,7 +280,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  json_tree     | paths          | complete                       | pass
  json_tree     | stub           | identity                       | pass
  json_tree     | stub           | complete                       | not implemented (7 of 7 callbacks missing)
-(212 rows)
+ commit_cache  | shared         | identity                       | pass
+ commit_cache  | shared         | complete                       | pass
+ commit_cache  | stub           | identity                       | pass
+ commit_cache  | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+(216 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

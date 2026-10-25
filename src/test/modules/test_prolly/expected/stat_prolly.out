@@ -162,7 +162,9 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  refs_nodes_written            |     9
  bmap_refcount_reads           |     0
  status_from_fold              |     0
-(106 rows)
+ commit_cache_hits             |     0
+ commit_cache_misses           |     0
+(108 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,

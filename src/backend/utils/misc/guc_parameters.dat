@@ -2479,6 +2479,15 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'prolly_commit_cache_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
+  short_desc => 'Sets how many commits\' parents, heights and roots are kept in shared memory for walking history.',
+  long_desc => 'A commit is named by its content, so one kept is never stale; a collection of the chunk store lets go of all. 0 turns the cache off, and reserves no shared memory for it.',
+  variable => 'prolly_commit_cache_entries',
+  boot_val => '4096',
+  min => '0',
+  max => '16777216',
+},
+
 { name => 'prolly_fold_worker', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Folds branches\' working sets in the background soon after they are written.',
   long_desc => 'A status, a diff into the working set or a commit then folds only what came since the last background fold.',

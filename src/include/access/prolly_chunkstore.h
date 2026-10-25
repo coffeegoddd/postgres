@@ -421,6 +421,15 @@ typedef struct ProllyChunkStoreRoutine
 	 * the work only to find it held).
 	 */
 	bool		(*root_free) (ProllyChunkStore *store);
+
+	/*
+	 * Optional: the store's GC generation now.  A chunk found in the store
+	 * stays there until the generation changes (only a collection's swap
+	 * drops chunks, and each swap begins the next generation), so what is
+	 * known of the store's chunks can be kept by the generation it was
+	 * learned in.
+	 */
+	uint32		(*generation) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -435,9 +444,9 @@ typedef struct ProllyChunkStoreRoutine
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
-	"root_free"
+	"root_free", "generation"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK root_free
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK generation
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

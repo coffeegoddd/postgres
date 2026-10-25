@@ -162,6 +162,7 @@ tests += {
       'stat_prolly',
       'stat_prolly_moves',
       'chunk_cache',
+      'commit_cache',
       'store_sizes',
       'storage_breakdown',
       'get_many',
