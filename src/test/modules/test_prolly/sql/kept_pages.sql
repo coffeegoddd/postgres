@@ -138,8 +138,8 @@ SELECT since(:'before') ->> 'apply_rows' AS applied,
 SELECT rows_digest() = :'at_load' AS as_loaded, clean(), indexes_valid();
 
 -- and back to the commit made after the reset: kept too (the last two
--- are), but the reset just made gave kp.t new storage, which its
--- snapshots of that commit went with; kp.t's rows are written
+-- are), and though the reset just made gave kp.t new storage, its
+-- snapshots of that commit were carried into it: no row written
 SELECT pg_stat_force_next_flush();
 SELECT now_counted() AS before \gset
 SELECT dolt_reset('--hard', :'second');

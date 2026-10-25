@@ -2,10 +2,10 @@
 -- with many changes, gives each table the pages kept as of the head first
 -- (O(1), as a reset to the head does), then writes only the rows the head
 -- and the commit differ by: not those and every row changed since the
--- head.  A branch reset back and forth between two commits keeps losing
--- one's pages (each restore gives a table new storage, and the snapshot
--- the other commit was kept by goes with the old storage), so this is the
--- reset that case takes.
+-- head.  That is the reset a commit no longer kept takes: here, with only
+-- the head kept (prolly.kept_commits = 1), every commit reset away from.
+-- (A restore carries the other kept commits' snapshots into the storage it
+-- gives a table, so with more kept they stay kept.)
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_head_restore;
@@ -27,6 +27,7 @@ $$;
 CREATE FUNCTION now_counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM counted()
 $$;
+SET prolly.kept_commits = 1;
 CREATE SCHEMA kh VERSIONED;
 CREATE TABLE kh.t (id bigint PRIMARY KEY, v int NOT NULL, w text NOT NULL);
 CREATE INDEX t_v ON kh.t (v);
@@ -51,9 +52,8 @@ UPDATE kh.t SET v = 1 WHERE id % 100 = 0;
 SELECT (dolt_commit('-am', 'b'))[1] AS b \gset
 SELECT rows_digest() AS at_b \gset
 
--- Back and forth: to a (its pages given back), to b (b's went with the
--- storage a's restore replaced: its 50 rows written), to a again (given
--- back), so b's pages are gone and a's, the head's, are kept.
+-- Back and forth: to a, to b, to a again, so that b is no longer kept and
+-- a, the head, is.
 SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
 SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
 SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
@@ -132,6 +132,32 @@ SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
 SELECT md5(string_agg(n::text, ',' ORDER BY id)) = :'n_digest' AS at_na, clean(),
 	indexes_valid()
 FROM kh.n n;
+
+-- With two commits kept: a reset to b, not kept, given the head's pages,
+-- keeps b and the head (a's snapshot carried, or kept anew); a reset back
+-- to a then gives a's pages back, writing no row.
+SET prolly.kept_commits = 2;
+DROP TABLE kh.n;
+SELECT dolt_commit('-am', 'n dropped') IS NOT NULL AS committed;
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+SELECT rows_digest() = :'at_a' AS at_a;
+UPDATE kh.t SET v = 2, w = w || 'x' WHERE id % 5 = 1;
+SELECT pg_stat_force_next_flush();
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+SELECT pg_stat_force_next_flush();
+SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
+	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
+SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
+UPDATE kh.t SET v = 3 WHERE id % 7 = 1;
+SELECT pg_stat_force_next_flush();
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+SELECT pg_stat_force_next_flush();
+SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
+	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
+SELECT rows_digest() = :'at_a' AS at_a, clean(), indexes_valid();
+RESET prolly.kept_commits;
 
 \c :home
 DROP DATABASE kept_head_restore;

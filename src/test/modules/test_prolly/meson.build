@@ -236,6 +236,7 @@ tests += {
       'branch_catalog_index',
       'kept_commit_shares',
       'kept_dead',
+      'kept_carried',
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',
@@ -441,6 +442,8 @@ tests += {
       't/465_bmap_preserve_waits.pl',
       't/466_bmap_preserve_moved.pl',
       't/467_bmap_preserve_skipped.pl',
+      't/471_kept_carried_crash.pl',
+      't/472_kept_carried_standby.pl',
     ],
   },
 }
