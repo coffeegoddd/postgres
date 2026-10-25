@@ -161,7 +161,7 @@ tests += {
       'statistics_casts',
       'stat_prolly',
       'stat_prolly_moves',
-      'chunk_cache',
+      'node_cache',
       'store_sizes',
       'storage_breakdown',
       'get_many',
@@ -421,6 +421,7 @@ tests += {
       't/412_standby_holder_keeps.pl',
       't/425_fold_worker_trim_own_snapshot.pl',
       't/426_autofold_trim_own_snapshot.pl',
+      't/447_node_cache.pl',
     ],
   },
 }
