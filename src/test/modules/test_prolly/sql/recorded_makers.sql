@@ -420,11 +420,10 @@ FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
 WHERE i.indrelid = 'rm.it'::regclass ORDER BY 1;
 SELECT pg_get_indexdef('rm."i ON rm.bt"'::regclass) AS made_again, x FROM rm.it;
 
--- a type move converts each table using the type as the table's owner,
--- which runs the type's code (its input, a domain's checks) over the
--- table's rows: refused where the type's owner isn't the table's and
--- hasn't that role's privileges (alice's enum, the writer's table, in a
--- superuser's merge)
+-- a type move converts each table using the type as the table's owner;
+-- any routine the conversion runs runs as its own owner (move_calls), so
+-- alice's enum changed, used by the writer's table, merges in a
+-- superuser's merge
 SET ROLE regress_rm_alice;
 CREATE TYPE rm.e5 AS ENUM ('a', 'b');
 RESET ROLE;
@@ -440,7 +439,7 @@ ALTER TYPE rm.e5 RENAME VALUE 'b' TO 'bb';
 RESET ROLE;
 SELECT length(dolt_commit('-am', 'e5 renamed')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-SELECT dolt_merge('ty6', '-m', 'merged ty6');
+SELECT (dolt_merge('ty6', '-m', 'merged ty6'))[4] AS merged;
 SELECT x FROM rm.pt;
 
 -- a cast is made as the owner of one of its types, as CREATE CAST

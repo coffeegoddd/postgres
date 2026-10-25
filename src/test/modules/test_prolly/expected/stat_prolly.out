@@ -118,7 +118,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  describe_cache_hits           |     1
  apply_rows_batched            |     0
  apply_loads                   |     0
- chunk_cache_hits              |    27
+ node_cache_hits               |    27
+ node_cache_misses             |     0
  fold_rows_located             |  1000
  bmap_map_pages_copied         |     0
  bmap_refcount_updates         |     0
@@ -163,7 +164,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  bmap_refcount_reads           |     0
  status_from_fold              |     0
  records_forgotten             |     0
-(107 rows)
+(108 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,

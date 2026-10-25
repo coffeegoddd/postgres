@@ -4603,26 +4603,26 @@ static void apply_rows_as_mover(Oid relid, const Table *from, const Table *to);
 /*
  * (as relid's maker, if the move makes it from a commit: the canonicalizer's
  * prolly_move_maker(), so that what writing them runs, an index's
- * expressions, runs as its owner's, restricted, not the mover's)
+ * expressions, runs as its owner's, restricted, not the mover's; and each
+ * routine that runs, as its own owner: prolly_move_calls_begin())
  */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
 {
-	ProllyMakerSwitch sw;
+	ProllyMakerSwitch sw = {0};
+	int			calls = prolly_move_calls_begin();
+	bool		done = false;
 
-	prolly_as_maker(relid, &sw);
-	if (!sw.switched)
-	{
-		apply_rows_as_mover(relid, from, to);
-		return;
-	}
 	PG_TRY();
 	{
+		prolly_as_maker(relid, &sw);
 		apply_rows_as_mover(relid, from, to);
+		done = true;
 	}
 	PG_FINALLY();
 	{
 		prolly_as_maker_end(&sw);
+		prolly_move_calls_end(calls, done);
 	}
 	PG_END_TRY();
 }
@@ -11213,9 +11213,32 @@ run_check(const char *sql, const CheckQuery *q, bool removing,
  * key's own checks see them.  A keyed query is made and run a batch of its
  * keys at a time.  Removing: the queries delete the rows they return.
  */
+static void violating_rows_run(List *queries, const char *type, bool removing,
+							   ViolationFound found, void *arg);
+
+/* (each routine the checks run, as its owner: prolly_move_calls_begin()) */
 static void
 violating_rows(List *queries, const char *type, bool removing,
 			   ViolationFound found, void *arg)
+{
+	int			calls = prolly_move_calls_begin();
+	bool		done = false;
+
+	PG_TRY();
+	{
+		violating_rows_run(queries, type, removing, found, arg);
+		done = true;
+	}
+	PG_FINALLY();
+	{
+		prolly_move_calls_end(calls, done);
+	}
+	PG_END_TRY();
+}
+
+static void
+violating_rows_run(List *queries, const char *type, bool removing,
+				   ViolationFound found, void *arg)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	MemoryContext batch_cxt;

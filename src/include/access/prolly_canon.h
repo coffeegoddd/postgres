@@ -670,6 +670,18 @@ extern bool prolly_owned_routines(uint64 *generation,
 								  void *arg);
 
 /*
+ * While a move runs, from prolly_move_calls_begin() to the end its result
+ * is given (done: whether the move got there, else it is failing; callers
+ * end it in a PG_FINALLY()): each routine called that isn't the system's
+ * runs as its owner, under SECURITY_RESTRICTED_OPERATION, as a SECURITY
+ * DEFINER routine would, unless its owner has the caller's privileges
+ * (then as the caller, as in PostgreSQL).  None is inlined, and no query
+ * runs in parallel workers.  Nested calls are one move.
+ */
+extern int	prolly_move_calls_begin(void);
+extern void prolly_move_calls_end(int nest, bool done);
+
+/*
  * Run as relid's maker (prolly_move_maker()), if it has one, until
  * prolly_as_maker_end(): callers end it in a PG_FINALLY().
  */
