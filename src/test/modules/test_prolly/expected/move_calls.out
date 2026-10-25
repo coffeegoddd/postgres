@@ -349,6 +349,194 @@ SELECT * FROM mc.dt;
   1 | 1
 (1 row)
 
+-- the superuser's PL/pgSQL routine calling alice's SQL one, its plans
+-- cached before the merge (alice's inlined into them, its call set up
+-- unhooked): in an earlier transaction, and in the merge's own, both are
+-- planned again as the merge begins, so alice's runs as alice
+CREATE FUNCTION mc_pub.su_simple(v int) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE r bool;
+BEGIN
+	r := mc_pub.is_alice(v);
+	INSERT INTO mc_pub.log VALUES (current_user, 'su_simple: is_alice ' || r);
+	RETURN true;
+END $$;
+CREATE TABLE mc.sk (id int PRIMARY KEY);
+ALTER TABLE mc.sk ADD CONSTRAINT sk_chk CHECK (mc_pub.su_simple(id)) NOT VALID;
+GRANT SELECT, INSERT ON mc.sk TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'sk')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('sk_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su4 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su4')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('sk_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.sk VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'sk row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- (a fresh session, its first plans those the warm-up makes)
+-- (the warm-up's own call logs false, as the superuser)
+\c regress_move_calls
+TRUNCATE mc_pub.log;
+SELECT mc_pub.su_simple(0) AS warmed;
+ warmed 
+--------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('sk_side', '-m', 'merged sk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+ su_simple: is_alice true
+(2 rows)
+
+ROLLBACK;
+\c regress_move_calls
+TRUNCATE mc_pub.log;
+BEGIN;
+SELECT mc_pub.su_simple(0) AS warmed;
+ warmed 
+--------
+ t
+(1 row)
+
+SELECT (dolt_merge('sk_side', '-m', 'merged sk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+ su_simple: is_alice true
+(2 rows)
+
+COMMIT;
+-- (and after the merge, planned again unhooked: inlined, as the caller)
+TRUNCATE mc_pub.log;
+SELECT mc_pub.su_simple(0) AS called;
+ called 
+--------
+ t
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+(1 row)
+
+-- alice's SECURITY DEFINER routine in the superuser's table's check runs
+-- as alice, restricted: it can't make a temporary table, which the
+-- session would then find first, as the mover
+CREATE FUNCTION mc_pub.who_def(v int) RETURNS bool LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = mc_pub AS $$
+BEGIN
+	BEGIN
+		CREATE TEMP TABLE mc_def_tmp (x int);
+		DROP TABLE mc_def_tmp;
+		INSERT INTO log VALUES (current_user, 'definer: not restricted');
+	EXCEPTION WHEN insufficient_privilege THEN
+		INSERT INTO log VALUES (current_user, 'definer: restricted');
+	END;
+	RETURN true;
+END $$;
+ALTER FUNCTION mc_pub.who_def(int) OWNER TO regress_mc_alice;
+CREATE TABLE mc.dk (id int PRIMARY KEY);
+ALTER TABLE mc.dk ADD CONSTRAINT dk_chk CHECK (mc_pub.who_def(id)) NOT VALID;
+GRANT SELECT, INSERT ON mc.dk TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'dk')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dk_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su5 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su5')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('dk_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.dk VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'dk row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+TRUNCATE mc_pub.log;
+SELECT (dolt_merge('dk_side', '-m', 'merged dk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
+       who        |        what         
+------------------+---------------------
+ regress_mc_alice | definer: restricted
+(1 row)
+
 -- a role without alice's privileges merging its own table, whose check
 -- calls alice's routine: the routine runs as alice, never as the writer
 SET ROLE regress_mc_w;
