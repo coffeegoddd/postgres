@@ -21,12 +21,14 @@
 #include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_branch.h"
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "pgstat.h"
 #include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
@@ -152,11 +154,14 @@ test_prolly_session_stats(PG_FUNCTION_ARGS)
 /*
  * What the caches let go of: an injection point callback, attached with
  * injection_points_attach('catcache-reset' or 'relcache-reset-entry',
- * 'test_prolly', 'test_count_cache_reset', NULL), counting the catalog
- * caches reset, and the system catalogs' relation entries invalidated, in
- * this backend.
+ * 'test_prolly', 'test_count_cache_reset', NULL), noting the catalogs
+ * whose caches are reset, and counting the system catalogs' relation
+ * entries invalidated, in this backend.
  */
-static int64 catcaches_reset = 0;
+#define MAX_RESET_CATALOGS 128
+
+static Oid	reset_catalogs[MAX_RESET_CATALOGS];
+static int	nreset_catalogs = 0;
 static int64 system_entries_reset = 0;
 
 extern PGDLLEXPORT void test_count_cache_reset(const char *name,
@@ -167,14 +172,22 @@ void
 test_count_cache_reset(const char *name, const void *private_data, void *arg)
 {
 	if (strcmp(name, "catcache-reset") == 0)
-		catcaches_reset++;
+	{
+		Oid			reloid = ((CatCache *) arg)->cc_reloid;
+
+		for (int i = 0; i < nreset_catalogs; i++)
+			if (reset_catalogs[i] == reloid)
+				return;
+		if (nreset_catalogs < MAX_RESET_CATALOGS)
+			reset_catalogs[nreset_catalogs++] = reloid;
+	}
 	else if (IsCatalogRelationOid(RelationGetRelid((Relation) arg)))
 		system_entries_reset++;
 }
 
 /*
- * test_cache_resets(): the counts since the last call, with how many
- * catalog caches there are
+ * test_cache_resets(): the catalogs whose caches were reset, and the
+ * system catalogs' relation entries invalidated, since the last call
  */
 PG_FUNCTION_INFO_V1(test_cache_resets);
 
@@ -182,15 +195,27 @@ Datum
 test_cache_resets(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	Datum	   *oids = palloc_array(Datum, Max(nreset_catalogs, 1));
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	values[0] = Int64GetDatum(catcaches_reset);
-	values[1] = Int32GetDatum(SysCacheSize);
-	values[2] = Int64GetDatum(system_entries_reset);
-	catcaches_reset = 0;
+	for (int i = 0; i < nreset_catalogs; i++)
+		oids[i] = ObjectIdGetDatum(reset_catalogs[i]);
+	values[0] = PointerGetDatum(construct_array_builtin(oids, nreset_catalogs,
+														OIDOID));
+	values[1] = Int64GetDatum(system_entries_reset);
+	nreset_catalogs = 0;
 	system_entries_reset = 0;
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* test_syscache_catalog(relid): whether a catalog cache is of relid */
+PG_FUNCTION_INFO_V1(test_syscache_catalog);
+
+Datum
+test_syscache_catalog(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(RelationHasSysCache(PG_GETARG_OID(0)));
 }

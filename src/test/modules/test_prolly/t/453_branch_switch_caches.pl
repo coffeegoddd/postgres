@@ -32,10 +32,19 @@ $node->safe_psql('postgres', q{
 	SELECT dolt_branch('other');
 });
 
-# What a switch resets (to a branch used before): some catalog caches,
-# not all of them, and no system catalog's relation entry.  (A reset of every cache, as before,
-# resets each of them and the system catalogs' entries too.)
-my $resets = $node->safe_psql('postgres', q{
+# What a switch resets (to a branch used before): the caches of exactly
+# the catalogs that have a branch column (an OID column named *branch,
+# as every branch-aware catalog's is), all of them and no other, and no
+# system catalog's relation entry.  (A reset of every cache resets the
+# others too, and the system catalogs' entries; one that kept a
+# branch-aware catalog's cache would miss it.)
+my $branch_aware = q{
+	SELECT coalesce(array_agg(c.oid::regclass::text ORDER BY c.oid), '{}')
+	FROM pg_class c
+	WHERE c.oid < 16384 AND c.relkind = 'r' AND test_syscache_catalog(c.oid)
+	  AND EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = c.oid
+				  AND a.atttypid = 'oid'::regtype AND a.attname ~ 'branch$')};
+my $resets = $node->safe_psql('postgres', qq{
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('catcache-reset', 'test_prolly',
 		'test_count_cache_reset', NULL);
@@ -46,11 +55,14 @@ my $resets = $node->safe_psql('postgres', q{
 	SELECT count(*) FROM s.t;
 	SELECT * FROM test_cache_resets();
 	SELECT (dolt_checkout('other'))[1];
-	SELECT catcaches > 0, catcaches < syscaches, system_relations
-	FROM test_cache_resets();
+	CREATE TEMP TABLE r AS SELECT * FROM test_cache_resets();
+	SELECT (SELECT coalesce(array_agg(o::regclass::text ORDER BY o), '{}')
+			FROM r, unnest(r.catalogs) o) = ($branch_aware),
+		(SELECT system_relations FROM r),
+		array_length(($branch_aware), 1) > 5;
 });
-is((split /\n/, $resets)[-1], 't|t|0',
-	'a switch resets only the branch-aware catalog caches, and no system catalog entry');
+is((split /\n/, $resets)[-1], 't|0|t',
+	'a switch resets exactly the branch-aware catalogs\' caches, and no system catalog entry');
 
 # Messages arriving during a switch: a session on main holds at the switch
 # to other (its branch set, its caches not yet reset) while another session
