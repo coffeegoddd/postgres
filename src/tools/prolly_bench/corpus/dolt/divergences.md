@@ -713,7 +713,7 @@ OF` are built in D18's shapes.
   `dolt_pull`, `dolt_cherry_pick`, `dolt_revert`, `dolt_rebase`,
   `dolt_integrate`, and `dolt_branch`'s delete, rename and forced move)
   take one of: owning the branch (having made it; main, and a branch
-  whose maker was dropped, is the database owner's; `dolt_branches.creator`
+  whose maker's objects were dropped, is the database owner's; `dolt_branches.creator`
   shows it), owning the database, the database's `CREATE` privilege, or
   the privileges of the predefined role `pg_prolly_write`. Privileges on
   the branch's tables alone don't give them: a role with `SELECT` can't
@@ -732,12 +732,13 @@ OF` are built in D18's shapes.
   definition or to rows it may not write so, or another branch's
   integration, takes the privileges above. There is no per-branch table of grants:
   protected branches stay the database owner's to move outside
-  integrations. A branch's owner is recorded by role OID, not as a
-  dependency: `DROP ROLE` doesn't refuse it, `REASSIGN OWNED` and
-  `DROP OWNED` don't move or drop it, and a role later given a dropped
-  role's OID (after OID wraparound, or as a dump and restore assigns role
-  OIDs anew) would own its branches, tags and stashes
-  ([#931](https://github.com/coffeegoddd/postgres/issues/931)). A fetch
+  integrations. The maker of a branch, tag or stash is a shared
+  dependency of its role, as an object's owner is: `DROP ROLE` refuses a
+  role that still makes any and lists them, `REASSIGN OWNED` gives them
+  to the new role, and `DROP OWNED` deletes the role's tags and stashes
+  but gives its branches to the database's owner rather than deleting
+  them, since a deleted branch would lose the commits only it has. No
+  role later given a dropped role's OID inherits them. A fetch
   sets the remote's tags here only for a role with those privileges, and
   a fetched or pushed tag has no maker here.
 - **Why:** Postgres has no default write grant on a database to mirror

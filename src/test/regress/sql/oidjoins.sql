@@ -28,6 +28,11 @@ begin
     else
       cmd := cmd || ' FROM ' || fk.fktable::text || ' fk WHERE ';
     end if;
+    -- (pg_shdepend's entries for the version control's objects that no
+    -- catalog lists, a branch's, tag's or stash's maker, name no relation)
+    if fk.fktable = 'pg_shdepend'::regclass and fk.fkcols = '{classid}' then
+      cmd := cmd || 'classid NOT IN (9907, 9908, 9909) AND ';
+    end if;
     if fk.is_opt then
       for i in 1 .. nkeys loop
         cmd := cmd || quote_ident(fk.fkcols[i]) || ' != 0 AND ';

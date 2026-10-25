@@ -107,7 +107,7 @@ extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
  * Privileges over the version control's shared state.  prolly_writes_refs():
  * the role owns the database, has its CREATE privilege, or has
  * pg_prolly_write's privileges.  prolly_branch_owner(): the role that made a
- * branch, else (main, a maker unrecorded or dropped) the database's owner.
+ * branch, else (main, or a maker unrecorded) the database's owner.
  * A move of a branch's head (a commit, reset, merge, cherry-pick, revert or
  * rebase, its deletion or rename) takes either (prolly_may_move_head(),
  * prolly_check_head_move()); a rename's new name takes the first, as
@@ -141,6 +141,25 @@ extern void prolly_remake_foreign_versions(const ProllyNodeRef *before,
 										   const ProllyHash *provenance,
 										   int nprovenance,
 										   const ProllyHash *made, Oid owner);
+
+/*
+ * The branches, tags and stashes roles made, as the role commands see them:
+ * each maker recorded in the refs is a shared dependency of its role
+ * (classId RefsBranchClassId, RefsTagClassId or RefsStashClassId, objid the
+ * record's id), so DROP ROLE refuses a role that still makes any.
+ * prolly_describe_made_object() appends the object's description (DROP
+ * ROLE's detail), and prolly_made_object_identity() its name (a stash's
+ * list's) and a stash's place in its list, false if the refs no longer
+ * have it; prolly_reassign_made_object() makes newrole its maker
+ * (REASSIGN OWNED); prolly_drop_made_object() deletes a tag or stash and
+ * gives a branch to the database's owner (DROP OWNED).  One the refs no
+ * longer have is described by its id, and its entry is changed or dropped.
+ */
+extern void prolly_describe_made_object(StringInfo buf, Oid classId, Oid id);
+extern bool prolly_made_object_identity(Oid classId, Oid id, char **name,
+										int *n);
+extern void prolly_reassign_made_object(Oid classId, Oid id, Oid newrole);
+extern void prolly_drop_made_object(Oid classId, Oid id);
 
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);

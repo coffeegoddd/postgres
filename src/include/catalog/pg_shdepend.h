@@ -42,7 +42,11 @@ CATALOG(pg_shdepend,1214,SharedDependRelationId) BKI_SHARED_RELATION
 	/*
 	 * Identification of the dependent (referencing) object.
 	 *
-	 * Note that dbid can be zero to denote a shared object.
+	 * Note that dbid can be zero to denote a shared object.  classid is a
+	 * catalog's OID but for the version control's objects a role makes
+	 * and no catalog lists (RefsBranchClassId, RefsTagClassId and
+	 * RefsStashClassId, see pg_branch.h), kept in a database's refs: those
+	 * entries are exempt from the lookup's foreign key.
 	 */
 	Oid			dbid BKI_LOOKUP_OPT(pg_database);	/* OID of database
 													 * containing object */
