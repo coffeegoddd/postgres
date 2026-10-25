@@ -2,7 +2,8 @@
 -- in the database's chunk store.  Detoasting fetches the value, a slice
 -- fetches its bytes, sizes come from the pointer, and equal values are
 -- one tree.  Text in another encoding and jsonb are stored in their
--- canonical form, and fetched back in their own.
+-- canonical form (a long document as a JSON tree), and fetched back in
+-- their own.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -15,7 +16,7 @@ SELECT string_agg(md5(g::text), '') AS t,
 FROM generate_series(1, 3000) g;
 
 -- Each read back whole, through a pointer whose form says what its tree
--- holds: the value's bytes, or a document's canonical bytes.
+-- holds: the value's bytes, or a long document's JSON tree (form 3).
 SELECT (test_toast_pointer(test_toast_hash_pointer(t))).form AS text_form,
 	   (test_toast_pointer(test_toast_hash_pointer(b))).form AS bytea_form,
 	   (test_toast_pointer(test_toast_hash_pointer(j))).form AS jsonb_form,
@@ -53,7 +54,7 @@ SELECT test_toast_pointer(test_toast_hash_pointer(t)) =
 FROM v;
 
 -- In a LATIN1 database, text is stored in UTF-8 and read back in LATIN1,
--- whole or sliced; jsonb in its canonical form.
+-- whole or sliced; jsonb as its JSON tree, its strings in UTF-8.
 SELECT current_database() AS db \gset
 CREATE DATABASE hp_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C'
   TEMPLATE template0;

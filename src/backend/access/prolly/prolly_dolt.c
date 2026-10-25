@@ -34,6 +34,7 @@
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_snapshot.h"
+#include "access/prolly_toast.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -6725,14 +6726,25 @@ rows_end(Rows *r)
  * The row a tree value holds, as a composite datum of its own (the slot
  * is reused for the next value); and its copies.
  */
-static Datum
-rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+/*
+ * A version's row decoded into r->slot, its long values as the trees they
+ * are where a hash pointer can name them (read only as a composite datum
+ * of the row is made).
+ */
+static void
+rows_slot(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
 	rows_parse(r, value, &row, count);
 	ExecClearTuple(r->slot);
 	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
+}
+
+static Datum
+rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+{
+	rows_slot(r, value, count);
 	return ExecFetchSlotHeapTupleDatum(r->slot);
 }
 
@@ -7977,7 +7989,13 @@ at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (after == NULL)
 		return;
 	old = rows_next(&s->rows);
-	row = rows_value(&s->rows, s->json, after, &copies);
+	if (s->history)
+		row = rows_value(&s->rows, s->json, after, &copies);
+	else
+	{
+		rows_slot(&s->rows, after, &copies);
+		row = (Datum) 0;
+	}
 	if (!s->rows.keyless)
 		copies = 1;
 	for (uint64 i = 0; i < copies; i++)

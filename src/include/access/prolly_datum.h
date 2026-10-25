@@ -92,6 +92,7 @@
 #define PROLLY_DATUM_H
 
 #include "lib/stringinfo.h"
+#include "utils/jsonb.h"
 #include "nodes/pg_list.h"
 
 typedef struct ProllyDatumCodec ProllyDatumCodec;
@@ -165,6 +166,20 @@ extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,
  */
 extern Datum prolly_datum_decode(ProllyDatumCodec *codec, const char *data,
 								 int len);
+
+/*
+ * Check that doc's len bytes (a jsonb document's binary, after its varlena
+ * header) are a document jsonb builds, its strings in UTF-8, as canonical
+ * jsonb bytes are checked: an error if not.
+ */
+extern void prolly_jsonb_check_utf8(const char *doc, uint32 len);
+
+/*
+ * jb, whose strings are in UTF-8, in the database's encoding: jb itself in
+ * a UTF-8 database or when it is all ASCII, else a copy with its strings
+ * converted (which can reorder its keys).
+ */
+extern Jsonb *prolly_jsonb_from_utf8(Jsonb *jb);
 
 /*
  * What values of typid encode by besides their type: the definitions their

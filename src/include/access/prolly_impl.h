@@ -54,10 +54,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_CHANGE_LOG = 30,
 	PROLLY_IFACE_MOVE_PLANNER = 31,
 	PROLLY_IFACE_MATERIALIZATION_CACHE = 32,
+	PROLLY_IFACE_JSON_TREE = 33,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_CHUNKER
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_MATERIALIZATION_CACHE
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_JSON_TREE
 
 /*
  * Identity of an implementation.  The first member of every routine struct.

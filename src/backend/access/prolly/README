@@ -64,6 +64,7 @@ Changes to this design are tracked in GitHub issues:
 	writers           prolly_writers.h        modes, stub
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
+	json_tree         prolly_jsontree.h       paths, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -410,9 +411,10 @@ resource manager (prolly_xlog.h).  A node's level is its chunk's, which
 another server may have made, so every read refuses (DATA_CORRUPTED) a
 node of level 31 or more (a build writes a root at 30 at most; walks keep
 a frame a level), a child that isn't one level below its parent, and an
-internal node with no children; and a walk refuses a value tree's leaf
-that names value trees (the walk recurses a nesting, and only a row's
-leaf names one).
+internal node with no children; and a walk refuses value trees nested
+more than two deep (the walk recurses a nesting; a row's leaf names a
+JSON tree, whose leaves name its long strings' value trees, and nothing
+deeper names one).
 
 Large values stay TOAST's in the working set.  A commit stores a column
 whose canonical bytes are longer than 2048 as a reference to a value tree
@@ -431,6 +433,44 @@ trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
+
+JSON trees.  A jsonb document whose canonical bytes are longer than 2048
+is stored by content, and folded, as a JSON tree (prolly_jsontree.h,
+jsontree_paths.c) rather than a value tree of its bytes: a tree of the
+tree interface keyed by paths, the keys' bytes sorting as jsonb orders
+the document.  A container of 1024 bytes or fewer is one item holding its
+jsonb bytes; a longer one is its children's items, each scalar an item.
+The tree is built from the canonical bytes (strings in UTF-8), so its
+root is a function of the document: equal documents share it however
+they were made, and a fold takes the tree from the row's hash pointer
+unread.  A document that can't be a tree (a scalar, or a path too long
+for a key) is a value tree of its bytes.  A row's reference to a JSON
+tree records length 0, which no value tree out of line has.  A whole read
+lays the items out as jsonb lays a document out, a packed container's
+bytes copied as they are, checks the result as canonical jsonb bytes are
+checked, and converts it to the database's encoding; it holds the
+document's children as small records and their bytes in one arena, so it
+takes a bounded multiple of the document's size however many containers
+it has.  A tree may come from another server: every other reader checks
+a packed container's bytes before parsing them.  Decoding a row
+whose tree is in the database's store gives a hash pointer to it, so
+history (dolt_at(), snapshot mounts) and the rows a checkout, reset or merge
+writes back name the tree unread; dolt_history_table()'s composite rows
+read it.  prolly_jsonb.c's SQL functions take the value as stored:
+prolly_jsonb_get() reads only the items under a path, prolly_jsonb_set()
+replaces the items under it (a packed container's edited by jsonb_set())
+and packs the containers above it that have become short enough (an
+UPDATE then writes the nodes on that path, not the document; a result
+short enough to be inline comes back whole), and prolly_jsonb_diff()
+diffs two trees by their nodes; anything a tree doesn't handle, any
+document that isn't one, and every document in a database whose encoding
+isn't UTF-8, they do whole, as #>, jsonb_set() and a diff of the
+documents would.  PostgreSQL's own jsonb functions read the document
+whole.  An array's indexes are in its elements' keys, so
+prolly_jsonb_set() only replaces an element of an array that isn't
+packed: an insert or a removal, which would renumber every element after
+it, is done whole.  Folded format 22 is the first whose rows hold JSON
+trees.
 
 
 Writers
@@ -1139,6 +1179,9 @@ change: refs or a manifest of another format are refused, never read.
 
 SQL
 ---
+
+prolly_jsonb.c is the prolly_jsonb_* functions, on JSON trees (Trees and
+chunks, above).
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
 arguments and results, so scripts written for Doltgres run here.  A tag
