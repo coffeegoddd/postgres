@@ -9,7 +9,10 @@ SELECT (dolt_commit('-Am', 'no key'))[1] AS c1 \gset
 ALTER TABLE kr.t ADD PRIMARY KEY (id);
 CREATE FUNCTION kr.f() RETURNS SETOF int LANGUAGE sql
 	BEGIN ATOMIC SELECT a FROM kr.t GROUP BY id ORDER BY id; END;
-SELECT (dolt_commit('-Am', 'key and routine'))[1] AS c2 \gset
+-- (one with a named argument too)
+CREATE FUNCTION kr.g(x int) RETURNS SETOF int LANGUAGE sql
+	BEGIN ATOMIC SELECT a + x FROM kr.t GROUP BY id ORDER BY id; END;
+SELECT (dolt_commit('-Am', 'key and routines'))[1] AS c2 \gset
 -- back across the key: the routine goes before it
 SELECT dolt_reset('--hard', :'c1');
  dolt_reset 
@@ -23,12 +26,13 @@ SELECT dolt_hashof('HEAD') = :'c1' AS at_first;
  t
 (1 row)
 
-SELECT to_regprocedure('kr.f()') IS NULL AS no_routine,
+SELECT to_regprocedure('kr.f()') IS NULL AND to_regprocedure('kr.g(int)') IS NULL
+		AS no_routines,
 	(SELECT count(*) FROM pg_constraint WHERE conrelid = 'kr.t'::regclass
 		AND contype = 'p') AS keys;
- no_routine | keys 
-------------+------
- t          |    0
+ no_routines | keys 
+-------------+------
+ t           |    0
 (1 row)
 
 -- and forward again: the routine is made once the key is
@@ -49,6 +53,13 @@ SELECT * FROM kr.f();
 ----
  10
  20
+(2 rows)
+
+SELECT * FROM kr.g(1);
+ g  
+----
+ 11
+ 21
 (2 rows)
 
 -- the key renamed, the routine kept: it goes before the old key, and
@@ -101,8 +112,9 @@ SELECT c.conname AS routine_uses
  t_key
 (1 row)
 
--- the table and the routine going together
+-- the table and the routines going together
 DROP FUNCTION kr.f();
+DROP FUNCTION kr.g(int);
 DROP TABLE kr.t;
 SELECT (dolt_commit('-am', 'both gone'))[1] AS c4 \gset
 SELECT dolt_reset('--hard', :'c3');

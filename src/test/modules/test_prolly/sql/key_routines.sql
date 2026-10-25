@@ -10,18 +10,23 @@ SELECT (dolt_commit('-Am', 'no key'))[1] AS c1 \gset
 ALTER TABLE kr.t ADD PRIMARY KEY (id);
 CREATE FUNCTION kr.f() RETURNS SETOF int LANGUAGE sql
 	BEGIN ATOMIC SELECT a FROM kr.t GROUP BY id ORDER BY id; END;
-SELECT (dolt_commit('-Am', 'key and routine'))[1] AS c2 \gset
+-- (one with a named argument too)
+CREATE FUNCTION kr.g(x int) RETURNS SETOF int LANGUAGE sql
+	BEGIN ATOMIC SELECT a + x FROM kr.t GROUP BY id ORDER BY id; END;
+SELECT (dolt_commit('-Am', 'key and routines'))[1] AS c2 \gset
 
 -- back across the key: the routine goes before it
 SELECT dolt_reset('--hard', :'c1');
 SELECT dolt_hashof('HEAD') = :'c1' AS at_first;
-SELECT to_regprocedure('kr.f()') IS NULL AS no_routine,
+SELECT to_regprocedure('kr.f()') IS NULL AND to_regprocedure('kr.g(int)') IS NULL
+		AS no_routines,
 	(SELECT count(*) FROM pg_constraint WHERE conrelid = 'kr.t'::regclass
 		AND contype = 'p') AS keys;
 -- and forward again: the routine is made once the key is
 SELECT dolt_reset('--hard', :'c2');
 SELECT dolt_hashof('HEAD') = :'c2' AS at_second;
 SELECT * FROM kr.f();
+SELECT * FROM kr.g(1);
 
 -- the key renamed, the routine kept: it goes before the old key, and
 -- comes again on the new one
@@ -37,8 +42,9 @@ SELECT c.conname AS routine_uses
 	FROM pg_depend d JOIN pg_constraint c ON c.oid = d.refobjid
 	WHERE d.objid = 'kr.f()'::regprocedure AND d.refclassid = 'pg_constraint'::regclass;
 
--- the table and the routine going together
+-- the table and the routines going together
 DROP FUNCTION kr.f();
+DROP FUNCTION kr.g(int);
 DROP TABLE kr.t;
 SELECT (dolt_commit('-am', 'both gone'))[1] AS c4 \gset
 SELECT dolt_reset('--hard', :'c3');

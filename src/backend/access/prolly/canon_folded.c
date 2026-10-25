@@ -138,6 +138,7 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_func.h"
 #include "parser/parser.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -10861,22 +10862,26 @@ writer_base_items(Canon *cn, ProllyNodeRef *root)
 static bool
 uses_constraint_going(const MoveItem *f, List *from, List *to)
 {
-	ErrorSaveContext escontext = {T_ErrorSaveContext};
-	Datum		proc;
+	List	   *raw;
+	DropStmt   *drop;
+	Oid			proc;
 	Relation	depRel;
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tup;
 	bool		going = false;
 
-	if (!DirectInputFunctionCallSafe(regprocedurein, f->name, InvalidOid, -1,
-									 (Node *) &escontext, &proc))
+	/* (its name is as DROP FUNCTION takes it, argument names and all) */
+	raw = raw_parser(drop_routine_sql(f), RAW_PARSE_DEFAULT);
+	drop = castNode(DropStmt, linitial_node(RawStmt, raw)->stmt);
+	proc = LookupFuncWithArgs(OBJECT_ROUTINE, linitial(drop->objects), true);
+	if (!OidIsValid(proc))
 		return false;
 	depRel = table_open(DependRelationId, AccessShareLock);
 	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
 	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
-				F_OIDEQ, proc);
+				F_OIDEQ, ObjectIdGetDatum(proc));
 	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
 	while (!going && (tup = systable_getnext(scan)) != NULL)
 	{
