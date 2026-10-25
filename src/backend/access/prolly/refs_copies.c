@@ -5760,7 +5760,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * would see none of a fold that moved the baseline in between (the check
  * then passing), and read every table in full.  The fold waits for no
  * relation's lock: one not free at once fails it, with
- * ERRCODE_LOCK_NOT_AVAILABLE.
+ * ERRCODE_LOCK_NOT_AVAILABLE.  The caller keeps no snapshot, active or
+ * registered: the fold's is to be the oldest the transaction holds, or its
+ * trim of the change logs is held back (see below).
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -5782,6 +5784,16 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 		return false;
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
+
+	/*
+	 * (the fold's snapshot the oldest the transaction keeps: one older, the
+	 * caller's or the catalog snapshot the lookups above took, from while a
+	 * writer the fold sees committed was running, would hold the xmin
+	 * horizon below that writer, and the fold's trim of the log would keep
+	 * its rows; the fold after, finding nothing new, trims nothing)
+	 */
+	Assert(!HaveRegisteredOrActiveSnapshot());
+	InvalidateCatalogSnapshot();
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/*

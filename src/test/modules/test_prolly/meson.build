@@ -416,6 +416,8 @@ tests += {
       't/410_standby_history_reads.pl',
       't/411_standby_gc_pointers.pl',
       't/412_standby_holder_keeps.pl',
+      't/425_fold_worker_trim_own_snapshot.pl',
+      't/426_autofold_trim_own_snapshot.pl',
     ],
   },
 }
