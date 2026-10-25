@@ -541,12 +541,12 @@ UPDATE ic.g SET note = 'g side secret';
 SELECT length(dolt_commit('-am', 'g side')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 CREATE TEMP TABLE g_was AS SELECT 'ic.g'::regclass::oid AS relid;
-CREATE FUNCTION pg_temp.g_grants() RETURNS TABLE (g_relation bool, g aclitem[], g_note aclitem[], gv aclitem[])
+CREATE FUNCTION pg_temp.g_grants() RETURNS TABLE (g_relation bool, reader_g bool, writer_note bool, reader_gv bool)
 LANGUAGE sql AS $$
 	SELECT 'ic.g'::regclass::oid = (SELECT relid FROM g_was),
-		(SELECT relacl FROM pg_class WHERE oid = 'ic.g'::regclass),
-		(SELECT attacl FROM pg_attribute WHERE attrelid = 'ic.g'::regclass AND attname = 'note'),
-		(SELECT relacl FROM pg_class WHERE oid = 'ic.gv'::regclass)
+		has_table_privilege('regress_ic_reader', 'ic.g', 'SELECT'),
+		has_column_privilege('regress_ic_writer', 'ic.g', 'note', 'UPDATE'),
+		has_table_privilege('regress_ic_reader', 'ic.gv', 'SELECT')
 $$;
 SELECT * FROM pg_temp.g_grants();
 BEGIN;
