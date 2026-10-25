@@ -10851,85 +10851,146 @@ writer_base_items(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
- * Does routine f (from's) use a constraint the move drops?  A routine with
- * a SQL-standard body may rely on a table's primary key (to group by it,
- * selecting the columns the key determines), which records a dependency on
- * the key: the key can't go while the routine is there, so the routine
- * goes first (and, if to keeps it, is made again with the rest).  A
- * constraint goes if from's line for it isn't to's, as table moves have
- * it, or its table goes.
+ * The routines depending on the object (refclassid, refobjid), added to
+ * *procs; *matviews set if a materialized view does.
  */
-static bool
-uses_constraint_going(const MoveItem *f, List *from, List *to)
+static void
+add_dependents(Oid refclassid, Oid refobjid, List **procs, bool *matviews)
 {
-	List	   *raw;
-	DropStmt   *drop;
-	Oid			proc;
-	Relation	depRel;
+	Relation	depRel = table_open(DependRelationId, AccessShareLock);
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tup;
-	bool		going = false;
 
-	/* (its name is as DROP FUNCTION takes it, argument names and all) */
-	raw = raw_parser(drop_routine_sql(f), RAW_PARSE_DEFAULT);
-	drop = castNode(DropStmt, linitial_node(RawStmt, raw)->stmt);
-	proc = LookupFuncWithArgs(OBJECT_ROUTINE, linitial(drop->objects), true);
-	if (!OidIsValid(proc))
-		return false;
-	depRel = table_open(DependRelationId, AccessShareLock);
-	ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
-	ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(proc));
-	scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
-	while (!going && (tup = systable_getnext(scan)) != NULL)
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(refclassid));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(refobjid));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
-		HeapTuple	ctup;
-		Form_pg_constraint con;
-		char	   *table;
-		char	   *conname;
-		MoveItem   *ft;
-		MoveItem   *tt;
-		TableDef	ftd;
-		TableDef	ttd;
-		ListCell   *lc;
 
-		if (d->refclassid != ConstraintRelationId)
-			continue;
-		ctup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(d->refobjid));
-		if (!HeapTupleIsValid(ctup))
-			continue;
-		con = (Form_pg_constraint) GETSTRUCT(ctup);
-		if (!OidIsValid(con->conrelid))
+		if (d->classid == ProcedureRelationId)
+			*procs = list_append_unique_oid(*procs, d->objid);
+		else if (d->classid == RewriteRelationId)
 		{
-			ReleaseSysCache(ctup);
-			continue;
+			Relation	rwRel = table_open(RewriteRelationId, AccessShareLock);
+			ScanKeyData rkey;
+			SysScanDesc rscan;
+			HeapTuple	rtup;
+
+			ScanKeyInit(&rkey, Anum_pg_rewrite_oid, BTEqualStrategyNumber,
+						F_OIDEQ, ObjectIdGetDatum(d->objid));
+			rscan = systable_beginscan(rwRel, RewriteOidIndexId, true, NULL, 1, &rkey);
+			if ((rtup = systable_getnext(rscan)) != NULL &&
+				get_rel_relkind(((Form_pg_rewrite) GETSTRUCT(rtup))->ev_class) ==
+				RELKIND_MATVIEW)
+				*matviews = true;
+			systable_endscan(rscan);
+			table_close(rwRel, AccessShareLock);
 		}
-		table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(con->conrelid)),
-										   get_rel_name(con->conrelid));
-		conname = pstrdup(quote_identifier(NameStr(con->conname)));
-		ReleaseSysCache(ctup);
-		ft = find_item(from, 't', table);
-		if (ft == NULL)
-			continue;
-		tt = find_item(to, 't', table);
-		if (tt == NULL)
-		{
-			going = true;
-			continue;
-		}
-		parse_table_def(ft->def, &ftd);
-		parse_table_def(tt->def, &ttd);
-		foreach(lc, ftd.constraints)
-			if (strcmp(first_field(lfirst(lc)), conname) == 0 &&
-				!list_has_string(ttd.constraints, lfirst(lc)))
-				going = true;
 	}
 	systable_endscan(scan);
 	table_close(depRel, AccessShareLock);
-	return going;
+}
+
+/*
+ * The routines (their OIDs) that use what the move drops of from's
+ * tables: a table that goes, or is made again (table_remade()), and a
+ * constraint whose line to doesn't have.  A routine with a SQL-standard
+ * body depends on the tables and columns it reads, and on a primary key
+ * it relies on (to group by it, selecting the columns the key
+ * determines), so it would keep them from going.  *matviews is set if a
+ * materialized view depends on them: those go and come again.  Tables
+ * the move leaves as they are aren't looked up.
+ */
+static List *
+routines_on_going(List *from, List *to, bool *matviews)
+{
+	List	   *procs = NIL;
+	ListCell   *lc;
+
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		MoveItem   *t;
+		TableDef	ftd;
+		TableDef	ttd;
+		bool		gone;
+		List	   *going = NIL;
+		Oid			relid;
+		Relation	conrel;
+		ScanKeyData key;
+		SysScanDesc scan;
+		HeapTuple	tup;
+		ListCell   *c;
+
+		if (f->kind != 't')
+			continue;
+		t = find_item(to, 't', f->name);
+		if (t && strcmp(t->def, f->def) == 0)
+			continue;
+		parse_table_def(f->def, &ftd);
+		if (t)
+			parse_table_def(t->def, &ttd);
+		gone = t == NULL || table_remade(&ftd, &ttd);
+		if (!gone)
+		{
+			foreach(c, ftd.constraints)
+				if (!list_has_string(ttd.constraints, lfirst(c)))
+					going = lappend(going, first_field(lfirst(c)));
+			if (going == NIL)
+				continue;
+		}
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(f->name, NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid))
+			continue;
+		if (gone)
+			add_dependents(RelationRelationId, relid, &procs, matviews);
+		conrel = table_open(ConstraintRelationId, AccessShareLock);
+		ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(relid));
+		scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+								  NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+			if (gone ||
+				list_has_string(going, quote_identifier(NameStr(con->conname))))
+				add_dependents(ConstraintRelationId, con->oid, &procs, matviews);
+		}
+		systable_endscan(scan);
+		table_close(conrel, AccessShareLock);
+	}
+	return procs;
+}
+
+/* Routine f's OID (from's: there now), or InvalidOid. */
+static Oid
+routine_oid(const MoveItem *f)
+{
+	/* (its name is as DROP FUNCTION takes it, argument names and all) */
+	List	   *raw = raw_parser(drop_routine_sql(f), RAW_PARSE_DEFAULT);
+	DropStmt   *drop = castNode(DropStmt, linitial_node(RawStmt, raw)->stmt);
+
+	return LookupFuncWithArgs(OBJECT_ROUTINE, linitial(drop->objects), true);
+}
+
+/*
+ * Routine f with a body that uses nothing: its signature with an empty SQL
+ * body, which (check_function_bodies off) isn't parsed, so records no
+ * dependencies.  Replaced so, it keeps its OID, owner, grants and comment,
+ * and what uses it keeps using it, while what it read can go; it goes, or
+ * is made again as to defines it, after.
+ */
+static char *
+unbodied_routine_sql(const MoveItem *f)
+{
+	return psprintf("%s\n LANGUAGE sql\nAS $prolly_move$$prolly_move$",
+					routine_signature(f->def));
 }
 
 /*
@@ -10962,7 +11023,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *keyed;
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
-	List	   *unkeyed = NIL;	/* routines kept, gone before a constraint */
+	List	   *unkeyed = NIL;	/* routines kept, emptied of their bodies */
+	List	   *unbodied = NIL;	/* those emptied, first */
+	List	   *going_users;	/* routines using what goes */
+	bool		going_matviews = false;	/* a matview uses what goes */
 	List	   *foreign_makes = NIL;	/* foreign tables made, after those going */
 	List	   *foreign_alters = NIL;	/* foreign tables changed in place */
 	List	   *foreign_routines = NIL; /* routines using those made again,
@@ -11030,6 +11094,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			foreign_makes = lappend(foreign_makes, create_foreign_table_sql(t->name, t->def));
 	}
 
+	going_users = routines_on_going(from, to, &going_matviews);
+
 	/* Going: views first, as they may use anything; then tables, routines, the rest. */
 	foreach(lc, from)
 	{
@@ -11056,14 +11122,16 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			matview_drops = lappend(matview_drops,
 									psprintf("DROP MATERIALIZED VIEW IF EXISTS %s",
 											 f->name));
-		/* (one using a constraint that goes, before it: see above) */
-		if (f->kind == 'f' && !is_aggregate(f) &&
-			uses_constraint_going(f, from, to))
+		/*
+		 * (one using what goes, emptied of its body first: see
+		 * unbodied_routine_sql(); to's made again with the rest)
+		 */
+		if (f->kind == 'f' && !is_aggregate(f) && going_users != NIL &&
+			list_member_oid(going_users, routine_oid(f)))
 		{
-			sm.before = lcons(drop_routine_sql(f), sm.before);
+			unbodied = lappend(unbodied, unbodied_routine_sql(f));
 			if (t)
 				unkeyed = lappend(unkeyed, f->name);
-			continue;
 		}
 		if (t && strcmp(t->def, f->def) == 0)
 			continue;
@@ -11472,7 +11540,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * if any changes, or a view or a type they may use does: all of them,
 	 * each after those it uses (one going takes no other with it).
 	 */
-	matviews_change = tm.any || view_drops != NIL || foreign_remade;
+	matviews_change = tm.any || view_drops != NIL || foreign_remade ||
+		going_matviews;
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -11566,6 +11635,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	}
 	places = index_places(from);
 	run_policy_statements(policy_drops);
+	run_statements(unbodied);
 
 	/*
 	 * Rows to go before their columns change type (with every row written
