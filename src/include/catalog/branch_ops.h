@@ -45,6 +45,22 @@ typedef struct BranchKeptRelation
 	MultiXactId minmxid;
 } BranchKeptRelation;
 
+/*
+ * What is left of a relation's kept pages (kept_status()): restorable, as
+ * restore() and share_kept() require; held, its snapshot still in the
+ * storage that kept it but the pages not to be given back (its rows'
+ * transaction ids older than the database still knows); or gone, that
+ * storage or its snapshot no longer there, or the relation on other
+ * storage now, its old storage going with the change, so nothing is left
+ * to give back or let go of.
+ */
+typedef enum BranchKeptStatus
+{
+	BRANCH_KEPT_RESTORABLE,
+	BRANCH_KEPT_HELD,
+	BRANCH_KEPT_GONE,
+} BranchKeptStatus;
+
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
 {
@@ -190,6 +206,13 @@ typedef struct BranchOpsRoutine
 	 * storage still has it (a dropped relation's went with it).
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: what is left of the pages keep() or restore() kept of the
+	 * session branch's relation kept, as the transaction sees the branch
+	 * (a relation it gave new storage is gone from its old storage's).
+	 */
+	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch

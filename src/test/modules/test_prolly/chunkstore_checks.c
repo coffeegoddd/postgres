@@ -683,6 +683,36 @@ test_refs_walk_count(PG_FUNCTION_ARGS)
 }
 
 static void
+kept_commit_row(const ProllyKeptCommit *kept, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[1];
+	bool		nulls[1] = {0};
+
+	values[0] = PointerGetDatum(hash_text(&kept->commit));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * The commits branch name's pages are kept as of, newest first, as the
+ * refs offer them to a move or a first use (not those retired).
+ */
+PG_FUNCTION_INFO_V1(test_kept_commits);
+Datum
+test_kept_commits(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	prolly_database_components(&dc);
+	if (PROLLY_HAS(dc.refs, kept_commits))
+		PROLLY_CALL(dc.refs, kept_commits, text_to_cstring(PG_GETARG_TEXT_PP(0)),
+					kept_commit_row, rsinfo);
+	return (Datum) 0;
+}
+
+static void
 tree_row(const char *name, const ProllyNodeRef *data,
 		 const ProllyValue *description, const char *unreadable, void *arg)
 {
