@@ -441,12 +441,17 @@ typedef struct KeepSet
 	ProllyHash	hashes[KEEP_MAX];
 } KeepSet;
 
-/* a transaction that told keep() of a chunk (xid invalid: none) */
+/*
+ * A transaction that told keep() of a chunk (xid invalid: none), or one
+ * begun on a hot standby that did, which has no xid: held is its local
+ * transaction id (invalid: none).
+ */
 typedef struct KeepTouch
 {
 	Oid			dboid;
 	Oid			spcoid;
 	TransactionId xid;
+	LocalTransactionId held;
 } KeepTouch;
 
 /* shared by every backend */
@@ -465,6 +470,14 @@ typedef struct JournalShared
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
 	pg_atomic_uint64 keeps_begun;	/* keep sets begun */
+
+	/*
+	 * The store whose collection's swap is being replayed (dboid invalid:
+	 * none), under mutex, and broadcast once it has been.
+	 */
+	Oid			swap_dboid;
+	Oid			swap_spcoid;
+	ConditionVariable swapped;
 
 	/*
 	 * A sync request the checkpointer's queue refused: the next checkpoint
@@ -640,6 +653,7 @@ typedef void (*DatabaseDirFn) (const char *dir, Oid dboid, Oid spcoid);
 static void each_database_dir(DatabaseDirFn fn);
 static void retire_files(Oid dboid, Oid spcoid, const Manifest *before,
 						 const Manifest *after);
+static void keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t);
 static void standby_readers_note(Oid dboid);
 static void standby_readers_resolve(Oid dboid);
 static void check_dropped(ProllyChunkStore *s, const ProllyHash *root);
@@ -1670,30 +1684,25 @@ touches(JournalShared *js)
  * collection holds from before it last reads its keep set until its
  * swap, so a chunk isn't added once it has been read for the last time.
  * A swap before then may have dropped the chunk: the transaction fails.
+ *
+ * A transaction of a hot standby can't be given an xid, and the
+ * collections that drop chunks run on the primary, which knows nothing of
+ * it.  It is noted as holding pointers instead (keep_held()), so that the
+ * replay of a swap cancels it before the store stops naming what it holds.
+ * One begun on a standby promoted since stays noted so: a collection on
+ * the new primary waits for it, and keeps what it is told of now.
  */
 static void
 journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 {
-	JournalShared *js;
-	KeepTouch  *t;
-	TransactionId xid;
-	uint64		begun;
+	JournalShared *js = shared();
+	KeepTouch  *t = &touches(js)[MyProcNumber];
+	bool		recovery = RecoveryInProgress();
+	bool		standby = recovery || TransactionStartedDuringRecovery();
+	TransactionId xid = standby ? InvalidTransactionId : GetTopTransactionId();
+	uint64		begun = pg_atomic_read_u64(&js->keeps_begun);
 	ProllyHash	key;
 	bool		found;
-
-	/*
-	 * During recovery there is nothing to keep: a hot standby's
-	 * transaction writes no table a pointer could be put in, and no
-	 * collection runs here (one writes the store).  So a read that hands
-	 * out a pointer (a history row's long value) asks for no transaction
-	 * id, which a standby can't assign.
-	 */
-	if (RecoveryInProgress())
-		return;
-	js = shared();
-	t = &touches(js)[MyProcNumber];
-	xid = GetTopTransactionId();
-	begun = pg_atomic_read_u64(&js->keeps_begun);
 
 	/*
 	 * Told already in this transaction, and no keep set begun since: the
@@ -1721,27 +1730,32 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 	if (found)
 		return;
 
-	jindex_append_lock(s->ix, false);
-	SpinLockAcquire(&js->mutex);
-	if (!TransactionIdIsValid(t->xid))
+	if (standby)
+		keep_held(s, js, t);
+	if (!recovery)
 	{
-		t->dboid = s->dboid;
-		t->spcoid = s->spcoid;
-		t->xid = xid;
-	}
-	for (int i = 0; i < KEEP_COLLECTIONS; i++)
-	{
-		KeepSet    *k = &js->keeps[i];
+		jindex_append_lock(s->ix, false);
+		SpinLockAcquire(&js->mutex);
+		if (TransactionIdIsValid(xid) && !TransactionIdIsValid(t->xid))
+		{
+			t->dboid = s->dboid;
+			t->spcoid = s->spcoid;
+			t->xid = xid;
+		}
+		for (int i = 0; i < KEEP_COLLECTIONS; i++)
+		{
+			KeepSet    *k = &js->keeps[i];
 
-		if (!k->active || k->dboid != s->dboid || k->spcoid != s->spcoid)
-			continue;
-		if (k->n < KEEP_MAX)
-			k->hashes[k->n++] = *hash;
-		else
-			k->overflow = true;
+			if (!k->active || k->dboid != s->dboid || k->spcoid != s->spcoid)
+				continue;
+			if (k->n < KEEP_MAX)
+				k->hashes[k->n++] = *hash;
+			else
+				k->overflow = true;
+		}
+		SpinLockRelease(&js->mutex);
+		jindex_append_unlock(s->ix);
 	}
-	SpinLockRelease(&js->mutex);
-	jindex_append_unlock(s->ix);
 	if (!journal_has(s, hash))
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -1749,6 +1763,86 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 				 errdetail("A value stored by content was collected meanwhile."),
 				 errhint("The transaction might succeed if retried.")));
 	(void) hash_search(kept_here, &key, HASH_ENTER, NULL);
+}
+
+/*
+ * This transaction of a hot standby (or begun as one) holds pointers: its
+ * local id noted, for a swap's replay to resolve a recovery conflict with
+ * before the store stops naming what it may read, and for a collection
+ * after a promotion to wait for.  Not while a swap of the store is being
+ * replayed: the conflict was resolved with the holders noted before, so
+ * this one waits for the swap and then finds whether its chunk survived.
+ */
+static void
+keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t)
+{
+	for (;;)
+	{
+		bool		replaying;
+
+		SpinLockAcquire(&js->mutex);
+		replaying = js->swap_dboid == s->dboid && js->swap_spcoid == s->spcoid;
+		if (!replaying && t->held != MyProc->vxid.lxid)
+		{
+			t->dboid = s->dboid;
+			t->spcoid = s->spcoid;
+			t->held = MyProc->vxid.lxid;
+		}
+		SpinLockRelease(&js->mutex);
+		if (!replaying)
+			break;
+		ConditionVariableSleep(&js->swapped, WAIT_EVENT_PROLLY_SWAP_REPLAY);
+	}
+	ConditionVariableCancelSleep();
+}
+
+/*
+ * A swap of a store is being replayed: the standby's transactions noted as
+ * holding its pointers are cancelled, after max_standby_streaming_delay,
+ * before the new manifest stops naming what they hold.  A transaction
+ * that tells keep() of a chunk meanwhile waits for swap_replayed().
+ */
+static void
+swap_holders_resolve(Oid dboid, Oid spcoid)
+{
+	JournalShared *js = shared();
+	KeepTouch  *ts = touches(js);
+	VirtualTransactionId *holders =
+		palloc(sizeof(VirtualTransactionId) * (js->nranges + 1));
+	int			n = 0;
+
+	SpinLockAcquire(&js->mutex);
+	js->swap_dboid = dboid;
+	js->swap_spcoid = spcoid;
+	for (int i = 0; i < js->nranges; i++)
+	{
+		KeepTouch  *t = &ts[i];
+
+		if (t->held != InvalidLocalTransactionId && t->dboid == dboid &&
+			t->spcoid == spcoid)
+		{
+			holders[n].procNumber = i;
+			holders[n].localTransactionId = t->held;
+			n++;
+		}
+	}
+	SpinLockRelease(&js->mutex);
+	SetInvalidVirtualTransactionId(holders[n]);
+	ResolveRecoveryConflictWithFileReaders(holders);
+	pfree(holders);
+}
+
+/* The swap has been replayed: keep() is told of chunks again. */
+static void
+swap_replayed(void)
+{
+	JournalShared *js = shared();
+
+	SpinLockAcquire(&js->mutex);
+	js->swap_dboid = InvalidOid;
+	js->swap_spcoid = InvalidOid;
+	SpinLockRelease(&js->mutex);
+	ConditionVariableBroadcast(&js->swapped);
 }
 
 /*
@@ -1766,26 +1860,33 @@ keep_touch_end(void)
 		return;
 	js = journal_shared;
 	t = &touches(js)[MyProcNumber];
-	if (!TransactionIdIsValid(t->xid))
+	if (!TransactionIdIsValid(t->xid) && t->held == InvalidLocalTransactionId)
 		return;
 	SpinLockAcquire(&js->mutex);
 	t->xid = InvalidTransactionId;
+	t->held = InvalidLocalTransactionId;
 	SpinLockRelease(&js->mutex);
 }
 
 /*
  * A collection begins keeping what keep() is told of, and will wait for
  * the transactions told of one before: its keep set, or -1 if none is free
- * (it then keeps every chunk).
+ * (it then keeps every chunk).  Those with an xid are added to *xids; those
+ * begun on this server as a hot standby, before a promotion, to *held
+ * (*nheld of them).
  */
 static int
-keep_begin(ProllyChunkStore *s, List **xids)
+keep_begin(ProllyChunkStore *s, List **xids, VirtualTransactionId **held,
+		   int *nheld)
 {
 	JournalShared *js = shared();
 	KeepTouch  *ts = touches(js);
 	TransactionId *found = palloc(sizeof(TransactionId) * js->nranges);
 	int			nfound = 0;
 	int			slot = -1;
+
+	*held = palloc(sizeof(VirtualTransactionId) * js->nranges);
+	*nheld = 0;
 
 	SpinLockAcquire(&js->mutex);
 	for (int i = 0; i < KEEP_COLLECTIONS && slot < 0; i++)
@@ -1804,9 +1905,16 @@ keep_begin(ProllyChunkStore *s, List **xids)
 	{
 		KeepTouch  *t = &ts[i];
 
-		if (TransactionIdIsValid(t->xid) && t->dboid == s->dboid &&
-			t->spcoid == s->spcoid)
+		if (t->dboid != s->dboid || t->spcoid != s->spcoid)
+			continue;
+		if (TransactionIdIsValid(t->xid))
 			found[nfound++] = t->xid;
+		if (t->held != InvalidLocalTransactionId)
+		{
+			(*held)[*nheld].procNumber = i;
+			(*held)[*nheld].localTransactionId = t->held;
+			(*nheld)++;
+		}
 	}
 	SpinLockRelease(&js->mutex);
 	for (int i = 0; i < nfound; i++)
@@ -5901,6 +6009,7 @@ table_files_redo(XLogReaderState *record)
 		 */
 		if (info == XLOG_CHUNKS_SWAP)
 		{
+			swap_holders_resolve(xlrec.dboid, xlrec.spcoid);
 			standby_readers_note(xlrec.dboid);
 			/* (and a logical slot being created starts after it) */
 			ReplicationSlotsCollectionReplayed(record->EndRecPtr);
@@ -5923,6 +6032,8 @@ table_files_redo(XLogReaderState *record)
 		pfree(temp);
 		pfree(path);
 		manifests_changed();
+		if (info == XLOG_CHUNKS_SWAP)
+			swap_replayed();
 		if (info == XLOG_CHUNKS_RETIRE)
 		{
 			XLogFlush(record->EndRecPtr);
@@ -7338,6 +7449,8 @@ struct ProllyChunkGc
 	uint8		hash_len;
 	List	   *xids;			/* TransactionId: appended to the sealed
 								 * segments, in progress at the seal */
+	VirtualTransactionId *held; /* begun as a standby's, holding pointers */
+	int			nheld;
 	bool		waited;
 	Segment    *appended;		/* the segment appended to from the seal */
 	int			keep;			/* its KeepSet, -1 once let go */
@@ -7856,7 +7969,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 	 * transaction that named a chunk since is waited for), its set let go
 	 * by gc_abort() if the collection fails.
 	 */
-	gc->keep = keep_begin(s, &gc->xids);
+	gc->keep = keep_begin(s, &gc->xids, &gc->held, &gc->nheld);
 	gc->keep_all = (gc->keep < 0);
 	s->gc = gc;
 
@@ -8165,6 +8278,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			if (wait_unprepared(lfirst_xid(lc)))
 				prepared = lappend_xid(prepared, lfirst_xid(lc));
 		}
+		wait_for_readers(gc->held, gc->nheld);
 		gc->waited = true;
 		if (prepared != NIL)
 			gc_prepared(gc, prepared, visit, arg);
@@ -8916,6 +9030,7 @@ journal_shmem_init(void *area)
 	pg_atomic_init_u32(&js->sync_all, 0);
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
+	ConditionVariableInit(&js->swapped);
 	js->nranges = append_ranges();
 }
 

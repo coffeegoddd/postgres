@@ -148,6 +148,7 @@ PARALLEL_CREATE_INDEX_SCAN	"Waiting for parallel <command>CREATE INDEX</command>
 PARALLEL_FINISH	"Waiting for parallel workers to finish computing."
 PROCARRAY_GROUP_UPDATE	"Waiting for the group leader to clear the transaction ID at transaction end."
 PROLLY_JOURNAL_APPEND	"Waiting for the appends reserved in a prolly chunk journal to be written."
+PROLLY_SWAP_REPLAY	"Waiting for the replay of a prolly chunk store collection's swap, to keep a chunk on a hot standby."
 PROC_SIGNAL_BARRIER	"Waiting for a barrier event to be processed by all backends."
 PROMOTE	"Waiting for standby promotion."
 RECOVERY_CONFLICT_SNAPSHOT	"Waiting for recovery conflict resolution for a vacuum cleanup."

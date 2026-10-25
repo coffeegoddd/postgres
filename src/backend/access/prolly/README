@@ -299,12 +299,8 @@ version's columns under the names the working set gives the same columns.
 Diffs read its tables that way too, and a summary (the canonicalizer's
 changes()) pairs a table renamed as one renamed table, its rows and
 definition perhaps changed too.  dolt_at and dolt_history_table read a
-version's table by its name, as Dolt's AS OF and history do.  These
-reads write nothing and assign no transaction id, so a hot standby serves
-them as its primary does: a long value read from history is handed out as
-a hash pointer without the chunk store's keep(), which only a transaction
-that can write a table needs.  Tables alike but unrelated are never
-paired.  The canonicalizer's renames()
+version's table by its name, as Dolt's AS OF and history do.  Tables
+alike but unrelated are never paired.  The canonicalizer's renames()
 works out the renames and rename_description() applies them in memory,
 so nothing is written.  A merge names base, ours and theirs as one, using
 merge_renames().  An
@@ -475,6 +471,19 @@ prolly_jsonb_set() only replaces an element of an array that isn't
 packed: an insert or a removal, which would renumber every element after
 it, is done whole.  Folded format 22 is the first whose rows hold JSON
 trees.
+
+A hash pointer a read hands out (a long value of history, read or not)
+names chunks a collection may drop: the chunk store's keep() is told of
+it, and a collection keeps the chunk or waits for the transaction, read
+only or not.  A hot standby's transaction has no transaction id to be
+waited for, and the collections are the primary's, replayed: keep() notes
+it (its virtual transaction) as holding pointers, and the replay of a
+swap cancels each holder of the store's, after
+max_standby_streaming_delay, as a recovery conflict, before the replayed
+manifest stops naming what it may hold.  One begun on a standby and still
+running at its promotion stays noted, and the new primary's collections
+wait for it.  So history reads assign no transaction id, and a hot
+standby serves them as its primary does.
 
 
 Writers
