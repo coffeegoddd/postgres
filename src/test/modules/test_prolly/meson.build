@@ -420,6 +420,7 @@ tests += {
       't/442_store_sync_skip_crash.pl',
       't/443_wal_durable_shares.pl',
       't/444_wal_durable_standby.pl',
+      't/445_store_sync_slots.pl',
     ],
   },
 }

@@ -166,6 +166,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -484,10 +485,25 @@ typedef struct BmapWatch
  * own blocks begun and not yet written, those written, and of those the
  * most a sync began after and completed.  The store is durable for a share
  * or snapshot holding no block of its own when no flush is in flight and
- * every one written was synced since (store_durable()).  A store with no
- * slot is not known durable: it has had no sync since the server (or its
- * shared memory) began.  Slots are never let go of; past the most, a
- * store is never known durable, and every share and snapshot syncs it.
+ * every one written was synced since (store_durable()).  A flush given up
+ * part way (its transaction ended by an error before or during its write)
+ * may have left its pages only in their buffers, which no sync of the
+ * store writes: it poisons the slot instead, which is durable again only
+ * once a checkpoint that began after it has completed (written and synced
+ * every page dirty when it began), poison_lsn below that checkpoint's redo
+ * pointer.  A store with no slot is not known durable, nor is one whose
+ * slot was just taken: a slot begins as one flush written, standing for
+ * whatever was written before (since the server, or its shared memory,
+ * began, or since an earlier slot of the store was let go of), which the
+ * first sync to begin after it covers.  A sync updates only the slot it
+ * began with.  Letting go of any slot is safe, as the store then reads as not
+ * durable until its next sync, but for one with a flush in flight, whose
+ * end must find it, or one poisoned; the least recently used of the others
+ * is let go of for a store that needs a slot.  A database dropped and its
+ * OID reused may find its old store's slot: CREATE DATABASE either syncs
+ * the files it copies or logs their pages as images, so the new store's
+ * blocks need nothing of the old slot's syncs, and a block another map
+ * holds there was made durable that way.
  */
 typedef struct BmapStoreSync
 {
@@ -495,6 +511,9 @@ typedef struct BmapStoreSync
 	uint32		flushing;
 	uint64		written;
 	uint64		synced;
+	XLogRecPtr	poison_lsn;		/* 0: none */
+	uint64		used;			/* as sync_clock was, when last used */
+	uint64		gen;			/* as sync_clock was, when taken */
 } BmapStoreSync;
 
 typedef struct BmapShared
@@ -531,6 +550,7 @@ typedef struct BmapShared
 	/* the page stores whose syncs are followed (also the mutex's) */
 	int			nsyncs_followed;
 	bool		syncs_overflowed;	/* a flush found no slot */
+	uint64		sync_clock;
 	BmapStoreSync syncs_followed[BMAP_SYNCS_FOLLOWED];
 } BmapShared;
 
@@ -637,6 +657,7 @@ BmapShmemInit(void *arg)
 	bmap_shared->watch_clock = 0;
 	bmap_shared->nsyncs_followed = 0;
 	bmap_shared->syncs_overflowed = false;
+	bmap_shared->sync_clock = 0;
 	for (int i = 0; i < BMAP_WATCHED_MAX; i++)
 	{
 		pg_atomic_init_u64(&bmap_shared->watch_key[i], 0);
@@ -700,6 +721,11 @@ store_unwatch(RelFileLocator rel)
 		pg_atomic_write_u64(&bmap_shared->watch_key[i], 0);
 		bmap_shared->watch[i].token = 0;
 	}
+	/* (nor are its syncs followed: no flush of it can be in flight) */
+	for (int i = 0; i < bmap_shared->nsyncs_followed; i++)
+		if (bmap_shared->syncs_followed[i].key == key &&
+			bmap_shared->syncs_followed[i].flushing == 0)
+			bmap_shared->syncs_followed[i].used = 0;
 	SpinLockRelease(&bmap_shared->mutex);
 }
 
@@ -906,7 +932,7 @@ with_relnumber(RelFileLocator rel, RelFileNumber relnumber)
 static void sync_store_later(RelFileLocator rel);
 static void sync_store(RelFileLocator rel);
 static void store_flush_begin(RelFileLocator rel);
-static void store_flush_end(RelFileLocator rel);
+static void store_flush_end(RelFileLocator rel, bool given_up);
 static bool store_durable(RelFileLocator rel);
 static bool store_written_out(RelFileLocator rel);
 
@@ -5927,7 +5953,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	if (own.n > 0 || !(preserved ? store_written_out(srel) : store_durable(srel)))
 		FlushRelationsAllBuffers(&src, 1);
 	if (own.n > 0)
-		store_flush_end(srel);
+		store_flush_end(srel, false);
 	if (preserved || (own.n == 0 && store_durable(srel)))
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, 1);
 	else
@@ -5973,18 +5999,43 @@ static BmapStoreSync *
 store_sync_slot(RelFileLocator rel, bool take)
 {
 	uint64		key = watch_key(rel);
-	BmapStoreSync *slot;
+	BmapStoreSync *slot = NULL;
 
 	for (int i = 0; i < bmap_shared->nsyncs_followed; i++)
 		if (bmap_shared->syncs_followed[i].key == key)
-			return &bmap_shared->syncs_followed[i];
-	if (!take || bmap_shared->nsyncs_followed == BMAP_SYNCS_FOLLOWED)
+		{
+			slot = &bmap_shared->syncs_followed[i];
+			slot->used = ++bmap_shared->sync_clock;
+			return slot;
+		}
+	if (!take)
 		return NULL;
-	slot = &bmap_shared->syncs_followed[bmap_shared->nsyncs_followed++];
+	if (bmap_shared->nsyncs_followed < BMAP_SYNCS_FOLLOWED)
+		slot = &bmap_shared->syncs_followed[bmap_shared->nsyncs_followed++];
+	else
+	{
+		/* the least recently used slot that may be let go of, if any */
+		for (int i = 0; i < BMAP_SYNCS_FOLLOWED; i++)
+		{
+			BmapStoreSync *s = &bmap_shared->syncs_followed[i];
+
+			if (s->flushing == 0 && s->poison_lsn == InvalidXLogRecPtr &&
+				(slot == NULL || s->used < slot->used))
+				slot = s;
+		}
+		if (slot == NULL)
+			return NULL;
+	}
+	/*
+	 * (what was written before is not known: as one flush written, which a
+	 * sync beginning from now on covers)
+	 */
 	slot->key = key;
 	slot->flushing = 0;
-	slot->written = 0;
+	slot->written = 1;
 	slot->synced = 0;
+	slot->poison_lsn = InvalidXLogRecPtr;
+	slot->used = slot->gen = ++bmap_shared->sync_clock;
 	return slot;
 }
 
@@ -6031,12 +6082,17 @@ store_flush_begin(RelFileLocator rel)
 		flushing_stores[n_flushing_stores++] = rel;
 }
 
-/* The flush store_flush_begin() began is written. */
+/*
+ * The flush store_flush_begin() began is written; or, if 'given_up' (its
+ * transaction ending before it was), may not have been, which poisons the
+ * store's slot (BmapStoreSync).
+ */
 static void
-store_flush_end(RelFileLocator rel)
+store_flush_end(RelFileLocator rel, bool given_up)
 {
 	uint64		key = watch_key(rel);
 	BmapStoreSync *slot;
+	XLogRecPtr	poison;
 	int			i;
 
 	for (i = n_flushing_stores - 1; i >= 0; i--)
@@ -6045,11 +6101,16 @@ store_flush_end(RelFileLocator rel)
 	if (i < 0)
 		return;
 	flushing_stores[i] = flushing_stores[--n_flushing_stores];
+	/* (past every record the flush's relations may have, as it ends) */
+	poison = given_up ? GetXLogInsertRecPtr() : InvalidXLogRecPtr;
 	SpinLockAcquire(&bmap_shared->mutex);
 	slot = store_sync_slot(rel, false);
 	Assert(slot && slot->flushing > 0);
 	slot->flushing--;
-	slot->written++;
+	if (given_up)
+		slot->poison_lsn = Max(slot->poison_lsn, poison);
+	else
+		slot->written++;
 	SpinLockRelease(&bmap_shared->mutex);
 }
 
@@ -6061,18 +6122,27 @@ store_flush_end(RelFileLocator rel)
  * changed in place since (a change copies a shared page first).  Those
  * writes are the flushes the store's slot counts: none in flight, and every
  * one written synced since, they are on disk.  Writes from before the
- * server (or its shared memory) began are covered by its first sync of the
- * store, until which the store has no slot and is not durable.
+ * slot was taken are covered by the first sync begun after (BmapStoreSync),
+ * and a flush given up part way, whose pages may be only in their buffers,
+ * by the first checkpoint begun after.
  */
 static bool
 store_durable(RelFileLocator rel)
 {
 	BmapStoreSync *slot;
 	bool		durable;
+	XLogRecPtr	checkpointed;
+	TimeLineID	tli;
 
+	/* (the redo pointer of the last checkpoint completed) */
+	GetOldestRestartPoint(&checkpointed, &tli);
 	SpinLockAcquire(&bmap_shared->mutex);
 	slot = store_sync_slot(rel, false);
-	durable = slot && slot->flushing == 0 && slot->synced == slot->written;
+	if (slot && slot->poison_lsn != InvalidXLogRecPtr &&
+		checkpointed > slot->poison_lsn)
+		slot->poison_lsn = InvalidXLogRecPtr;
+	durable = slot && slot->flushing == 0 && slot->synced == slot->written &&
+		slot->poison_lsn == InvalidXLogRecPtr;
 	SpinLockRelease(&bmap_shared->mutex);
 	return durable;
 }
@@ -6081,20 +6151,29 @@ store_durable(RelFileLocator rel)
  * Is every block a share of a relation of rel's page store, holding no
  * block of its own, holds written out already, though perhaps not synced?
  * As for store_durable(), each was written by the share or snapshot that
- * first shared it: so when none of those flushes is in flight.  A store
- * with no slot had none since the server began, unless one found no slot.
- * Enough where WAL makes the blocks durable (bmapshare()): a relation made
- * of the share reads the blocks, which must hold the pages by then.
+ * first shared it: so when none of those flushes is in flight, and none
+ * given up part way (a poisoned slot) since the last checkpoint began.  A
+ * store with no slot had none in flight (a slot is let go of only with
+ * none, and unpoisoned), unless a flush found no slot.  Enough where WAL
+ * makes the blocks durable (bmapshare()): a relation made of the share
+ * reads the blocks, which must hold the pages by then.
  */
 static bool
 store_written_out(RelFileLocator rel)
 {
 	BmapStoreSync *slot;
 	bool		written;
+	XLogRecPtr	checkpointed;
+	TimeLineID	tli;
 
+	GetOldestRestartPoint(&checkpointed, &tli);
 	SpinLockAcquire(&bmap_shared->mutex);
 	slot = store_sync_slot(rel, false);
-	written = slot ? slot->flushing == 0 : !bmap_shared->syncs_overflowed;
+	if (slot && slot->poison_lsn != InvalidXLogRecPtr &&
+		checkpointed > slot->poison_lsn)
+		slot->poison_lsn = InvalidXLogRecPtr;
+	written = slot ? slot->flushing == 0 && slot->poison_lsn == InvalidXLogRecPtr :
+		!bmap_shared->syncs_overflowed;
 	SpinLockRelease(&bmap_shared->mutex);
 	return written;
 }
@@ -6108,26 +6187,29 @@ sync_store(RelFileLocator rel)
 {
 	BmapStoreSync *slot;
 	uint64		began = 0;
+	uint64		gen = 0;
 
 	if (bmap_debug_skip_store_sync)
 		return;
 	SpinLockAcquire(&bmap_shared->mutex);
-	slot = store_sync_slot(rel, false);
+	slot = store_sync_slot(rel, true);
 	if (slot)
+	{
 		began = slot->written;
+		gen = slot->gen;
+	}
 	SpinLockRelease(&bmap_shared->mutex);
 
 	mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS, 1);
 
 	/*
-	 * (a store with no slot as the sync began had no flush since the server
-	 * began; one taken since may count flushes written after it began, which
-	 * stay unsynced)
+	 * (only the slot the sync began with: one let go of meanwhile, and taken
+	 * again, may count flushes written after it began, which stay unsynced)
 	 */
 	SpinLockAcquire(&bmap_shared->mutex);
-	slot = store_sync_slot(rel, true);
-	if (slot)
+	slot = store_sync_slot(rel, false);
+	if (slot && slot->gen == gen)
 		slot->synced = Max(slot->synced, began);
 	SpinLockRelease(&bmap_shared->mutex);
 }
@@ -6140,7 +6222,7 @@ void
 bmapsyncshares(bool isCommit)
 {
 	while (n_flushing_stores > 0)
-		store_flush_end(flushing_stores[n_flushing_stores - 1]);
+		store_flush_end(flushing_stores[n_flushing_stores - 1], true);
 	if (isCommit)
 		while (n_unsynced_stores > 0)
 		{
@@ -6337,7 +6419,7 @@ bmap_snapshot_take(SMgrRelation reln)
 	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
 	if (own.n > 0)
-		store_flush_end(reln->smgr_rlocator.locator);
+		store_flush_end(reln->smgr_rlocator.locator, false);
 	else
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
 	if (XLogIsNeeded() ||
@@ -6379,7 +6461,7 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
 		if (own[i].n > 0)
-			store_flush_end(rels[i]->smgr_rlocator.locator);
+			store_flush_end(rels[i]->smgr_rlocator.locator, false);
 		else
 			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
 		if (own[i].blocks)

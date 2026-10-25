@@ -926,11 +926,16 @@ written synced since, the blocks are on disk, and the sync would add
 nothing the share or snapshot needs: the other pages it would write are
 WAL's to protect and the checkpointer's to sync, as any page's.  (At the
 other levels, a share with no block of its own skips its flush when no
-flush is in flight.)  A flush whose transaction ends unsynced (an abort,
-an error) leaves the store not durable until the next sync.  A store isn't
-known durable until its first sync after the server (or its shared
-memory, after a crash) starts, which covers writes from before; and past
-64 stores followed, the rest always sync.
+flush is in flight.)  A flush written whose transaction ends unsynced (an
+abort) leaves the store not durable until the next sync; one given up
+before its write was done (an error part way) may have left its pages in
+their buffers alone, which no sync writes, and leaves the store not
+durable (nor, at the other levels, written out) until a checkpoint begun
+after it completes.  A store isn't known durable until its first sync
+after the server (or its shared memory, after a crash) starts, which
+covers writes from before.  At most 64 stores are followed at once: past
+that, the least recently used idle one is let go of, and reads as not
+durable until its next sync.
 prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
 measure what they cost.
 

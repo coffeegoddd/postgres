@@ -89,6 +89,64 @@ like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
 	qr/^bmap_store_syncs=0 bmap_store_syncs_skipped=[1-9]/m,
 	'and the next skips it again');
 
+SKIP:
+{
+	skip 'injection points not supported by this build', 7
+	  unless $ENV{enable_injection_points} eq 'yes';
+	sql(q{CREATE EXTENSION injection_points});
+
+	# A share of blocks of its own in flight in another session (its counts
+	# raised, its blocks not yet written): a hard reset syncs.  Then the
+	# share written, its sync not yet run (its commit waiting): one syncs
+	# again.  Once the share's sync ran, the next skips.
+	sql(q{UPDATE plain SET a = a + 1 WHERE a % 10 = 2});
+	my $b = $node->background_psql('postgres', on_error_stop => 0);
+	$b->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('bmap-share-map-page', 'wait');
+		SELECT injection_points_attach('bmap-sync-shares', 'wait')});
+	$b->query_until(qr/started/, qq{\\echo started
+		BEGIN;
+		SELECT test_bmap_share($plain, true);
+	});
+	$node->wait_for_event('client backend', 'bmap-share-map-page');
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=1 /m,
+		'a share in flight in another session: a hard reset syncs');
+	sql(q{SELECT injection_points_wakeup('bmap-share-map-page')});
+	$b->query_until(qr/committing/, q{\echo committing
+		COMMIT;
+	});
+	$node->wait_for_event('client backend', 'bmap-sync-shares');
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=1 /m,
+		'a share written, its sync not yet run: a hard reset syncs');
+	sql(q{SELECT injection_points_wakeup('bmap-sync-shares')});
+	$b->quit;
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=0 bmap_store_syncs_skipped=[1-9]/m,
+		'once the share synced, the next skips');
+
+	# A keep failing after a snapshot's slot was taken: that relation's own
+	# blocks may not have been written.  Each later hard reset syncs until a
+	# checkpoint begun since completes.
+	my ($ret, $out, $err) = $node->psql('postgres',
+		q{UPDATE app.t SET v = v + 1 WHERE id % 7 = 0;
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('bmap-snapshot-slot-taken', 'error');
+		SELECT dolt_commit('-am', 'fails')});
+	like($err, qr/bmap-snapshot-slot-taken/, 'the keep failed after a slot was taken');
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=1 /m,
+		'after a flush given up, a hard reset syncs');
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=1 /m,
+		'and so does the next, the sync writing no buffer');
+	sql('CHECKPOINT');
+	like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
+		qr/^bmap_store_syncs=0 bmap_store_syncs_skipped=[1-9]/m,
+		'after a checkpoint, the next skips');
+}
+
 # And after a restart: the first syncs again.
 $node->restart;
 like(syncs_of($dirty, q{SELECT dolt_reset('--hard')}),
