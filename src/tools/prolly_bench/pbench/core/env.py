@@ -92,6 +92,8 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str],
         env["benchbase_build_commit"] = _read(tools["benchbase_build_commit_file"])
     if tools.get("sqllogictest"):
         env["sqllogictest"] = _git(Path(tools["sqllogictest"]))
+    if tools.get("sysbench_lua_scripts"):
+        env["sysbench_lua_scripts"] = _git(Path(tools["sysbench_lua_scripts"]))
     if tools.get("slt_source_hash_file"):
         env["slt_build_source_hash"] = _read(tools["slt_source_hash_file"])
         env["slt_source_hash"] = slt_source_hash(repo)

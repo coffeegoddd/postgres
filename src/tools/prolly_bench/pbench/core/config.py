@@ -232,7 +232,7 @@ def validate(cfg: dict, suite: str) -> None:
               "perf_frequency", "hash_symbols", "latency_sampling_rate", "timeout_seconds",
               "rate", "latency_limit_ms", "transactions"}
     keys = {"S3": {"ranges"}, "S5": {"hot_rows"}, "S8": {"percents"},
-            "S9": {"isolation", "weights"}, "S10": {"tests"}, "S13": {"modes", "weights", "isolation"},
+            "S9": {"isolation", "weights"}, "S10": {"tests", "dolt_options"}, "S13": {"modes", "weights", "isolation"},
             "V1": {"iterations", "background"}, "V2": {"iterations", "background", "changes"},
             "V3": {"background", "changes", "locality", "conflict_percent"}, "V4": {"background", "changes"},
             "V6": {"background", "branches", "changes"}, "V7": {"background", "commit_modes", "commits"},
@@ -247,6 +247,14 @@ def validate(cfg: dict, suite: str) -> None:
     for wid, params in cfg["workloads"].items():
         if wid not in keys or set(params) - (keys[wid] | common):
             raise ConfigError(f"unknown workload or parameters for {wid}: {sorted(params)}")
+        if wid == "S10" and "tests" in params:
+            from pbench.workloads.sysbench import DEFAULT_TESTS, DOLT_TESTS
+            tests = params["tests"]
+            if tests != "dolt" and (type(tests) is not list or
+                                    set(tests) - set(DEFAULT_TESTS) - set(DOLT_TESTS)):
+                raise ConfigError(f'S10.tests must be "dolt" or a list of sysbench tests: {tests!r}')
+        if wid == "S10" and type(params.get("dolt_options", False)) is not bool:
+            raise ConfigError("S10.dolt_options must be true or false")
         for name, choices in {"sample": {"all", "per_directory"},
                               "protocol": {"simple", "extended", "prepared"}}.items():
             if name in params and params[name] not in choices:

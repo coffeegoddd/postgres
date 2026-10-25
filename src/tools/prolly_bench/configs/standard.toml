@@ -110,3 +110,6 @@ background = ["none"]
 benchbase = "build-bench/benchbase/benchbase-postgres"
 benchbase_source = "~/cursor_src/benchbase"
 benchbase_build_commit_file = "build-bench/benchbase/BUILD_COMMIT"
+# A checkout of dolthub/sysbench-lua-scripts, for S10's Dolt tests
+# (tests = "dolt"); optional.
+# sysbench_lua_scripts = "~/cursor_src/sysbench-lua-scripts"
