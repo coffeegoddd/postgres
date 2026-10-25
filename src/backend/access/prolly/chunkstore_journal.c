@@ -692,11 +692,13 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
  * may remove it.  So what is kept is of the store as of a collection's
  * generation (the manifest's gc_generation), and a read finds only what
  * was kept in the generation it reads in: one after a collection finds
- * nothing of what was removed, as the store's own reads then do.  Kept:
- * those read from the files (checked as they are read), and the chunks a
- * transaction appends as it commits (pending_cached()), once it has; not
- * while pending or transient, which an abort takes back, nor one read
- * through a source.
+ * nothing of what was removed, as the store's own reads then do.  Offered:
+ * those read from the files (checked as they are read), which the cache
+ * keeps once read again lately, so a read of many chunks once each, as a
+ * scan or a fold of many rows reads leaves, neither churns it nor pays to
+ * fill it; and the chunks a transaction appends as it commits
+ * (pending_cached()), kept at once, once it has.  Not while pending or
+ * transient, which an abort takes back, nor one read through a source.
  */
 static const ProllyNodeCacheRoutine *
 node_cache(void)
@@ -745,7 +747,7 @@ chunk_cache_take(const ProllyChunkStore *s, const ProllyHash *key,
 
 static void
 chunk_cache_put(const ProllyChunkStore *s, const ProllyHash *key,
-				const char *data, uint32 len, uint32 generation)
+				const char *data, uint32 len, uint32 generation, bool at_once)
 {
 	const ProllyNodeCacheRoutine *nc = node_cache();
 	ProllyNodeCacheScope scope;
@@ -753,7 +755,7 @@ chunk_cache_put(const ProllyChunkStore *s, const ProllyHash *key,
 	if (nc == NULL)
 		return;
 	cache_scope(s, generation, &scope);
-	nc->insert(&scope, key, data, len);
+	nc->insert(&scope, key, data, len, at_once);
 }
 
 static Size
@@ -2666,7 +2668,7 @@ pending_cached_end(bool commit)
 		for (int i = 0; i < nstaged; i++)
 			chunk_cache_put(session_store, &staged_chunks[i].hash,
 							staged->data + staged_chunks[i].offset,
-							staged_chunks[i].len, staged_generation);
+							staged_chunks[i].len, staged_generation, true);
 	}
 	nstaged = 0;
 	/* (a large one's memory let go of) */
@@ -5082,7 +5084,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			if (!stored && s == session_store)
 			{
 				chunk_cache_put(s, &key, out->data + start, out->len - start,
-								s->gc_generation);
+								s->gc_generation, false);
 				trust_named(s, out->data + start, out->len - start,
 							s->gc_generation);
 			}
@@ -5097,7 +5099,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 				if (!stored && s == session_store)
 				{
 					chunk_cache_put(s, &key, out->data + start, out->len - start,
-									s->gc_generation);
+									s->gc_generation, false);
 					trust_named(s, out->data + start, out->len - start,
 								s->gc_generation);
 				}
@@ -5148,7 +5150,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		if (s == session_store)
 		{
 			chunk_cache_put(s, &key, out->data + start, out->len - start,
-							s->gc_generation);
+							s->gc_generation, false);
 			trust_named(s, out->data + start, out->len - start,
 						s->gc_generation);
 		}

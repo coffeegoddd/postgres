@@ -100,12 +100,17 @@ SELECT since('node_cache_misses') >= 0 AS counting,
 	since('chunk_file_reads') >= 0 AS reading;
 SELECT test_chunk_has(:'dropped') AS has_dropped,
 	test_chunk_get(:'dropped') IS NULL AS get_none;
--- The kept chunk was cached before the collection, so after it the first
--- read misses and reads the file; the second is a hit.
+-- The kept chunk was cached before the collection, so after it a read
+-- misses and reads the file.  A chunk read from the files is kept once it
+-- is read again (one read once isn't), so the third read is a hit.
 SELECT convert_from(test_chunk_get(:'kept'), 'UTF8') AS kept;
 SELECT pg_stat_force_next_flush();
 SELECT since('node_cache_misses') > 0 AS missed,
 	since('chunk_file_reads') > 0 AS read_file;
+SELECT convert_from(test_chunk_get(:'kept'), 'UTF8') AS kept;
+SELECT pg_stat_force_next_flush();
+SELECT since('node_cache_misses') > 0 AS missed_again,
+	since('chunk_file_reads') > 0 AS read_file_again;
 SELECT convert_from(test_chunk_get(:'kept'), 'UTF8') AS kept;
 SELECT pg_stat_force_next_flush();
 SELECT since('node_cache_misses') AS misses_after,

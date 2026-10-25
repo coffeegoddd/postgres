@@ -19,6 +19,14 @@
  * chunks, and of one, don't wait for each other; a change to a chain holds
  * it exclusive.  The free entries and blocks are lists under a spinlock.
  *
+ * A chunk offered from a read of the files is kept only if it was offered
+ * lately before: a table as long as the buckets' holds, for each slot,
+ * the fingerprint of the last chunk offered there and not kept, so a
+ * chunk read once (a scan's leaves, a fold's) costs the cache a word, not
+ * an entry and a copy, and evicts nothing; the second read of a chunk
+ * within about as many reads as the cache holds entries keeps it.  A
+ * transaction's own chunks, offered as it commits, are kept at once.
+ *
  * An insert takes an entry and the blocks it needs from the free lists,
  * fills them without any lock (they are no one else's yet), and links the
  * entry into its bucket.  When the free lists are short, the clock frees
@@ -85,11 +93,13 @@ typedef struct NodeCache
 	int32		nentries;
 	int32		nblocks;
 	uint32		nbuckets;		/* a power of two */
-	/* then buckets, entries, the blocks' chain and the blocks */
+	/* then buckets, the offers' fingerprints, entries, the blocks' chain
+	 * and the blocks */
 } NodeCache;
 
 static NodeCache *cache = NULL;
 static int32 *buckets;
+static pg_atomic_uint32 *offered;	/* nbuckets of them */
 static NodeEntry *entries;
 static int32 *block_next;
 static char *blocks;
@@ -124,6 +134,7 @@ shared_shmem_size(void)
 		return 0;
 	size = MAXALIGN(sizeof(NodeCache));
 	size = add_size(size, MAXALIGN(mul_size(nbuckets, sizeof(int32))));
+	size = add_size(size, MAXALIGN(mul_size(nbuckets, sizeof(pg_atomic_uint32))));
 	size = add_size(size, MAXALIGN(mul_size(nentries, sizeof(NodeEntry))));
 	size = add_size(size, MAXALIGN(mul_size(nblocks, sizeof(int32))));
 	size = add_size(size, mul_size(nblocks, NODE_BLOCK));
@@ -137,6 +148,8 @@ attach(NodeCache *c)
 
 	buckets = (int32 *) p;
 	p += MAXALIGN(c->nbuckets * sizeof(int32));
+	offered = (pg_atomic_uint32 *) p;
+	p += MAXALIGN(c->nbuckets * sizeof(pg_atomic_uint32));
 	entries = (NodeEntry *) p;
 	p += MAXALIGN(c->nentries * sizeof(NodeEntry));
 	block_next = (int32 *) p;
@@ -159,7 +172,10 @@ shared_shmem_init(void *area)
 	pg_atomic_init_u32(&c->hand, 0);
 	attach(c);
 	for (uint32 b = 0; b < c->nbuckets; b++)
+	{
 		buckets[b] = NONE;
+		pg_atomic_init_u32(&offered[b], 0);
+	}
 	for (int32 i = 0; i < c->nentries; i++)
 	{
 		memset(&entries[i], 0, sizeof(NodeEntry));
@@ -189,16 +205,40 @@ shared(void)
 }
 
 static uint32
-bucket_of(const NodeCache *c, const ProllyNodeCacheScope *scope,
-		  const ProllyHash *hash)
+key_hash(const ProllyNodeCacheScope *scope, const ProllyHash *hash)
 {
 	uint32		h = hash->len >= 4 ? prolly_hash_bucket(hash->bytes) :
 		hash_bytes(hash->bytes, hash->len);
 
 	h = hash_combine(h, scope->dboid);
 	h = hash_combine(h, scope->spcoid);
-	h = hash_combine(h, scope->generation);
-	return h & (c->nbuckets - 1);
+	return hash_combine(h, scope->generation);
+}
+
+static uint32
+bucket_of(const NodeCache *c, const ProllyNodeCacheScope *scope,
+		  const ProllyHash *hash)
+{
+	return key_hash(scope, hash) & (c->nbuckets - 1);
+}
+
+/*
+ * Was the chunk offered lately, and not kept?  If not, it is noted as
+ * offered, in place of whichever chunk its slot noted.
+ */
+static bool
+offered_before(NodeCache *c, const ProllyNodeCacheScope *scope,
+			   const ProllyHash *hash)
+{
+	uint32		h = key_hash(scope, hash);
+	pg_atomic_uint32 *slot = &offered[pg_rotate_right32(h, 16) &
+									  (c->nbuckets - 1)];
+	uint32		print = h | 1;	/* (never 0, a slot's first value) */
+
+	if (pg_atomic_read_u32(slot) == print)
+		return true;
+	pg_atomic_write_u32(slot, print);
+	return false;
 }
 
 static LWLock *
@@ -386,7 +426,7 @@ take_free(NodeCache *c, int32 nblocks, int32 *entry, int32 *first)
 
 static void
 shared_insert(const ProllyNodeCacheScope *scope, const ProllyHash *hash,
-			  const char *data, Size len)
+			  const char *data, Size len, bool at_once)
 {
 	NodeCache  *c = shared();
 	uint32		bucket;
@@ -410,7 +450,7 @@ shared_insert(const ProllyNodeCacheScope *scope, const ProllyHash *hash,
 	if (i != NONE)
 		raise_usage(&entries[i]);
 	LWLockRelease(lock);
-	if (i != NONE)
+	if (i != NONE || (!at_once && !offered_before(c, scope, hash)))
 		return;
 
 	nblocks = blocks_for((uint32) len);

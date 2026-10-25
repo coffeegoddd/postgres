@@ -25,11 +25,14 @@
  * Contract:
  * - lookup() appends the bytes kept for hash in scope to out: false if
  *   none are (a miss).
- * - insert() keeps a chunk's bytes for hash in scope: bytes the store has
+ * - insert() offers a chunk's bytes for hash in scope: bytes the store has
  *   in its files as of that scope's generation (read from them, or
  *   appended by a transaction that has committed), checked as the store
- *   checks what it reads.  It never raises an error and may keep nothing
- *   (the cache full of what is in use, a chunk too large, the cache off).
+ *   checks what it reads.  With at_once the cache keeps them now; without,
+ *   it may keep only a chunk offered again lately, so that chunks read
+ *   once (a scan's leaves) neither churn it nor pay to fill it.  It never
+ *   raises an error and may keep nothing (the cache full of what is in
+ *   use, a chunk too large, the cache off).
  * - forget_database() lets go of everything kept for a database, which is
  *   being dropped: its OID may be given to a new database, whose store has
  *   none of these chunks.
@@ -67,7 +70,7 @@ typedef struct ProllyNodeCacheRoutine
 						   const ProllyHash *hash, StringInfo out);
 	void		(*insert) (const ProllyNodeCacheScope *scope,
 						   const ProllyHash *hash, const char *data,
-						   Size len);
+						   Size len, bool at_once);
 	void		(*forget_database) (Oid dboid);
 	Size		(*capacity) (void);
 } ProllyNodeCacheRoutine;
