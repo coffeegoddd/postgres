@@ -540,6 +540,26 @@ typedef struct ProllyCanonRoutine
 	 * in the server's encoding), in root's order, from its items alone.
 	 */
 	List	   *(*table_names) (const ProllyNodeRef *root, const char *schema);
+
+	/*
+	 * Optional: what objects() visits of from and to, read from their tree
+	 * diff (equal subtrees skipped, not every object's items merged); and,
+	 * if table isn't NULL, each table whose item differs (added, removed or
+	 * modified, as the diff has it), by its name, into table.  Both in key
+	 * order.
+	 */
+	void		(*objects_diffed) (const ProllyNodeRef *from,
+								   const ProllyNodeRef *to,
+								   ProllyCanonObjectVisit visit,
+								   ProllyCanonObjectVisit table, void *arg);
+
+	/*
+	 * Optional: root with each of its sequences' values as they are now
+	 * (as a fold reads them, whatever the session may), into *out; the
+	 * rest as root has it.  False, *out undefined, where a sequence it
+	 * holds isn't one now by its name.
+	 */
+	bool		(*sequences_now) (const ProllyNodeRef *root, ProllyNodeRef *out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -551,9 +571,9 @@ typedef struct ProllyCanonRoutine
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects", "table_metadata", \
-	"table_names"
+	"table_names", "objects_diffed", "sequences_now"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK table_names
+#define PROLLY_CANON_LAST_CALLBACK sequences_now
 
 /*
  * While set, the commits (ProllyHash *) a move takes its versions from: a

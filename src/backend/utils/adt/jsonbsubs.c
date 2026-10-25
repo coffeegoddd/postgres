@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_jsonb.h"
 #include "catalog/pg_type_d.h"
 #include "executor/execExpr.h"
 #include "nodes/nodeFuncs.h"
@@ -22,6 +23,7 @@
 #include "parser/parse_expr.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
+#include "varatt.h"
 
 
 /* SubscriptingRefState.workspace for jsonb subscripting execution */
@@ -227,6 +229,52 @@ jsonb_subscript_check_subscripts(ExprState *state,
 }
 
 /*
+ * The subscripts (as text, nsubs of them) as strings, for a versioned
+ * table's document stored as a JSON tree (prolly_jsonb.h).
+ */
+static char **
+subscript_path(const Datum *index, int nsubs)
+{
+	char	  **path = palloc(sizeof(char *) * Max(nsubs, 1));
+
+	for (int i = 0; i < nsubs; i++)
+		path[i] = TextDatumGetCString(index[i]);
+	return path;
+}
+
+/*
+ * The element at the subscripts of a versioned table's document stored as
+ * a JSON tree, read from the tree (prolly_jsonb.h): false if doc, as
+ * stored, isn't one.  The subscripts are followed as #> follows its path.
+ */
+static bool
+jsonb_tree_subscript(Datum doc, const Datum *index, int nsubs, Datum *result,
+					 bool *isnull)
+{
+	Jsonb	   *found;
+
+	if (!VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(doc)) ||
+		!prolly_jsonb_tree_get(doc, PROLLY_JSONB_ANY,
+							   subscript_path(index, nsubs), nsubs, &found))
+		return false;
+	*isnull = found == NULL;
+	*result = found ? JsonbPGetDatum(found) : (Datum) 0;
+	return true;
+}
+
+/* jsonb_set_element() on what a JSON tree's edit gives (prolly_jsonb.h) */
+static Jsonb *
+set_element_edit(Jsonb *doc, char **path, int npath, void *arg)
+{
+	JsonbValue	value = *(JsonbValue *) arg;
+	Datum	   *elems = palloc(sizeof(Datum) * Max(npath, 1));
+
+	for (int i = 0; i < npath; i++)
+		elems[i] = CStringGetTextDatum(path[i]);
+	return DatumGetJsonbP(jsonb_set_element(doc, elems, npath, &value));
+}
+
+/*
  * Evaluate SubscriptingRef fetch for a jsonb element.
  *
  * Source container is in step's result variable (it's known not NULL, since
@@ -244,6 +292,10 @@ jsonb_subscript_fetch(ExprState *state,
 	/* Should not get here if source jsonb (or any subscript) is null */
 	Assert(!(*op->resnull));
 
+	if (jsonb_tree_subscript(*op->resvalue, workspace->index,
+							 sbsrefstate->numupper, op->resvalue,
+							 op->resnull))
+		return;
 	jsonbSource = DatumGetJsonbP(*op->resvalue);
 	*op->resvalue = jsonb_get_element(jsonbSource,
 									  workspace->index,
@@ -303,7 +355,25 @@ jsonb_subscript_assign(ExprState *state,
 		*op->resnull = false;
 	}
 	else
+	{
+		Datum		tree_result;
+
+		/*
+		 * A versioned table's document stored as a JSON tree: the tree
+		 * edited at the subscripts (prolly_jsonb.h).
+		 */
+		if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(*op->resvalue)) &&
+			prolly_jsonb_tree_edit(*op->resvalue,
+								   subscript_path(workspace->index,
+												  sbsrefstate->numupper),
+								   sbsrefstate->numupper, set_element_edit,
+								   &replacevalue, &tree_result))
+		{
+			*op->resvalue = tree_result;
+			return;
+		}
 		jsonbSource = DatumGetJsonbP(*op->resvalue);
+	}
 
 	*op->resvalue = jsonb_set_element(jsonbSource,
 									  workspace->index,
@@ -333,7 +403,11 @@ jsonb_subscript_fetch_old(ExprState *state,
 		sbsrefstate->prevvalue = (Datum) 0;
 		sbsrefstate->prevnull = true;
 	}
-	else
+	else if (!jsonb_tree_subscript(*op->resvalue,
+								   ((JsonbSubWorkspace *) sbsrefstate->workspace)->index,
+								   sbsrefstate->numupper,
+								   &sbsrefstate->prevvalue,
+								   &sbsrefstate->prevnull))
 	{
 		Jsonb	   *jsonbSource = DatumGetJsonbP(*op->resvalue);
 
