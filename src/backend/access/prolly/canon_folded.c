@@ -9183,33 +9183,33 @@ drop_routine_sql(const MoveItem *it)
 }
 
 /*
- * Is ed a definition failing only for what another of the move's
- * statements makes or drops first, so that it may succeed once those have
- * run?  A routine with a SQL-standard body, a view or a materialized view
- * names the objects it uses, which may not be made yet (an undefined
- * table, column, function, type, schema or other object), or may be
- * defined differently until a later statement changes them (a type
- * mismatch, an object of another kind); and an object dropped may still be
- * used by one dropped after it (dependent objects).  Anything else (a
- * cancel or timeout, running out of memory, an internal error, or a
- * statement that is simply wrong) is not set aside: it is raised as it is.
+ * Is ed an error a move's definition may fail with only for what another
+ * of the move's statements makes, drops or changes first, so that it may
+ * succeed once those have run?  A routine with a SQL-standard body, a view
+ * or a materialized view is parsed against the objects it uses, which may
+ * not be made yet, or not be as they will be (a column it groups by not
+ * yet functionally dependent on a primary key the move adds, a type not
+ * yet changed): any error of the statement's own is such a failure, and
+ * one that never succeeds is raised once no statement makes progress
+ * (make_views()).  Not so a cancel, a timeout or a shutdown (class 57),
+ * running out of memory or disk (53), a system error (58), an internal
+ * error or corruption (XX), a deadlock or serialization failure (40), or
+ * a lock not granted in time: those are the move's, not the statement's,
+ * and are raised as they are.
  */
 static bool
 waits_on_another(const ErrorData *ed)
 {
-	switch (ed->sqlerrcode)
+	switch (ERRCODE_TO_CATEGORY(ed->sqlerrcode))
 	{
-		case ERRCODE_UNDEFINED_TABLE:
-		case ERRCODE_UNDEFINED_COLUMN:
-		case ERRCODE_UNDEFINED_FUNCTION:
-		case ERRCODE_UNDEFINED_OBJECT:
-		case ERRCODE_UNDEFINED_SCHEMA:
-		case ERRCODE_DATATYPE_MISMATCH:
-		case ERRCODE_WRONG_OBJECT_TYPE:
-		case ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST:
-			return true;
-		default:
+		case ERRCODE_OPERATOR_INTERVENTION:
+		case ERRCODE_INSUFFICIENT_RESOURCES:
+		case ERRCODE_SYSTEM_ERROR:
+		case ERRCODE_INTERNAL_ERROR:
+		case ERRCODE_TRANSACTION_ROLLBACK:
 			return false;
+		default:
+			return ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE;
 	}
 }
 
