@@ -5830,21 +5830,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        only the tables written since and the sequences, as nothing else had
        changed); <literal>bmap_pages_preserved</literal> (page images
        logged of the blocks a relation alone held as a share of its blocks,
-       or a snapshot of them, begins to share them, so that recovery and
-       backups' redo can restore them); <literal>bmap_refcount_reads</literal>
+       or a snapshot of them, begins to share them, at every
+       <varname>wal_level</varname>, so that recovery and backups' redo can
+       restore them); <literal>bmap_refcount_reads</literal>
        (reference-count pages read to look blocks' counts up: a snapshot or
        a share reads each page once for the blocks of a map page it walks);
-       <literal>bmap_store_syncs_asked</literal> (shares and snapshots of a
-       block-mapped relation whose blocks a sync of their page store was to
-       make durable), <literal>bmap_store_syncs_asked_no_own</literal> (of
-       those, the ones holding no block of their own, every block held by
-       another map or snapshot already), <literal>bmap_store_syncs_skipped</literal>
-       (of those, the ones that needed no sync: at
-       <varname>wal_level</varname> <literal>replica</literal> or above, every
-       one, as page images logged for their blocks make them durable, and at
-       <literal>minimal</literal>, those with no block of their own once the
-       page store is durable already) and <literal>bmap_store_syncs</literal> (syncs of a whole page
-       store run for them);
        <literal>move_plans</literal> (moves the move planner
        costed: each branch a branch's first use weighed copying, when no
        branch is at its head) and <literal>first_use_sources_busy</literal>

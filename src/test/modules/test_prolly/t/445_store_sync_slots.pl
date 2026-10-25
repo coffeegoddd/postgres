@@ -1,10 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Shared memory follows the syncs of at most 64 page stores (a database's
-# in a tablespace) for skipping the sync of a share or snapshot that holds
-# nothing new (#947).  Past that, the least recently used idle store's slot
-# is let go of: a store used later still skips its syncs once synced, and
-# one whose slot was let go of syncs again first, as one not known durable.
+# Shared memory follows the flushes of shares' and snapshots' own blocks of
+# at most 64 page stores (a database's in a tablespace), so that a share
+# holding nothing new skips its flush when none is in flight.  Past that,
+# the least recently used idle store's slot is let go of: a store used
+# later takes a slot again, counting its flushes from there.
 
 use strict;
 use warnings FATAL => 'all';
@@ -19,24 +19,27 @@ $node->start;
 
 my $stores = 70;
 
-# In database 'db': a snapshot with blocks of its own, then one with none:
-# the store syncs each ran.
+# In database 'db': a snapshot with blocks of its own, then one with none;
+# then the store's slot: its flushes written, and in flight ('none' if it
+# has no slot).
 sub snapshots
 {
 	my ($db, $setup) = @_;
 	return $node->safe_psql($db, qq{
 		$setup
 		SET debug_block_mapped_heap = on;
-		CREATE TEMP TABLE before AS SELECT * FROM test_prolly_session_stats();
-		UPDATE plain SET a = a + 1 WHERE a % 10 = 0;
+		UPDATE plain SET a = a + 10 WHERE a % 10 = 0;
 		SELECT test_bmap_snapshot_take(pg_relation_filenode('plain'));
-		CREATE TEMP TABLE mid AS SELECT * FROM test_prolly_session_stats();
 		SELECT test_bmap_snapshot_take(pg_relation_filenode('plain'));
-		SELECT (m.value - b.value) || ',' || (s.value - m.value)
-		FROM test_prolly_session_stats() s JOIN mid m USING (name)
-			JOIN before b USING (name)
-		WHERE s.name = 'bmap_store_syncs';
+		SELECT coalesce(written || ',' || flushing, 'none') FROM test_bmap_store_sync();
 	}) =~ s/^.*\n//sr;
+}
+
+sub slot_of
+{
+	my ($db) = @_;
+	return $node->safe_psql($db, q{
+		SELECT coalesce(written || ',' || flushing, 'none') FROM test_bmap_store_sync()});
 }
 
 my @got;
@@ -50,29 +53,13 @@ for my $i (1 .. $stores)
 		INSERT INTO plain SELECT g, repeat('p', 100) FROM generate_series(1, 500) g;});
 }
 is_deeply(\@got, [ ('1,0') x $stores ],
-	"in each of $stores stores, a snapshot with nothing new skips its sync");
+	"in each of $stores stores, the snapshot with blocks of its own counts one flush written, the other none");
 
-# Two snapshots with nothing new: the store syncs each ran.
-sub unchanged
-{
-	my ($db) = @_;
-	return $node->safe_psql($db, q{
-		CREATE TEMP TABLE before AS SELECT * FROM test_prolly_session_stats();
-		SELECT test_bmap_snapshot_take(pg_relation_filenode('plain'));
-		CREATE TEMP TABLE mid AS SELECT * FROM test_prolly_session_stats();
-		SELECT test_bmap_snapshot_take(pg_relation_filenode('plain'));
-		SELECT (m.value - b.value) || ',' || (s.value - m.value)
-		FROM test_prolly_session_stats() s JOIN mid m USING (name)
-			JOIN before b USING (name)
-		WHERE s.name = 'bmap_store_syncs';
-	}) =~ s/^.*\n//sr;
-}
-
-# The first store's slot was let go of: its next snapshot with nothing new
-# syncs (the store not known durable), and the one after skips.  The last
+# The first stores' slots were let go of for the last ones; the last
 # store's slot is still there.
-is(unchanged('s1'), '1,0', 'a store whose slot was let go of syncs, then skips again');
-is(unchanged("s$stores"), '0,0', 'a store that kept its slot skips both');
+is(slot_of('s1'), 'none', 'the least recently used store\'s slot was let go of');
+is(slot_of("s$stores"), '1,0', 'a store used since keeps its slot');
+is(snapshots('s1', ''), '1,0', 'a store whose slot was let go of takes one again');
 
 $node->stop;
 done_testing();

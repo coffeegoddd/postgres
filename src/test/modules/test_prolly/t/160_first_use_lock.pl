@@ -87,36 +87,14 @@ $user->query(q{SELECT dolt_checkout('b2')});
 is($user->{stderr}, '', 'tried again once the writer is done, it checks out');
 is($user->query_safe($rows), '1:1,2:2,3:3', 'the branch as its head has it');
 
-# The page store is synced once the locks are let go, at commit: a writer
-# then goes ahead too.
-SKIP:
-{
-	skip 'injection points not supported by this build', 4
-	  unless $ENV{enable_injection_points} eq 'yes';
-
-	sql(q{CREATE EXTENSION injection_points;
-		SELECT dolt_branch('b3');
-		SELECT injection_points_attach('bmap-sync-shares', 'wait')});
-	$user->query_until(qr/started/, q{
-		\echo started
-		SELECT dolt_checkout('b3');
-		\echo done
-	});
-	my $b3 = q{SELECT wait_event FROM pg_stat_activity
-		WHERE query LIKE '%dolt_checkout(''b3'')%' AND pid <> pg_backend_pid()};
-	$node->poll_query_until('postgres', qq{SELECT state = 'idle'
-		OR wait_event = 'bmap-sync-shares' FROM pg_stat_activity
-		WHERE query LIKE '%dolt_checkout(''b3'')%' AND pid <> pg_backend_pid()});
-	is(sql($b3), 'bmap-sync-shares', 'the first use syncs the page store at commit');
-	$other->query(q{UPDATE app.t SET v = 400 WHERE id = 3});
-	is($other->{stderr}, '', 'a writer meanwhile is not held up');
-	sql(q{SELECT injection_points_detach('bmap-sync-shares');
-		SELECT injection_points_wakeup('bmap-sync-shares')});
-	$user->query_until(qr/done/, '');
-	is($user->{stderr}, '', 'and the first use commits');
-	is($user->query_safe($rows), '1:1,2:2,3:3', 'the branch as its head has it');
-	$user->query_safe(q{SELECT dolt_checkout('main')});
-}
+# Another first use, then a writer: the first use holds nothing past its
+# commit (it syncs no page store: WAL makes its shared blocks durable).
+sql(q{SELECT dolt_branch('b3')});
+$user->query_safe(q{SELECT dolt_checkout('b3')});
+is($user->query_safe($rows), '1:1,2:2,3:3', 'the branch as its head has it');
+$other->query(q{UPDATE app.t SET v = 400 WHERE id = 3});
+is($other->{stderr}, '', 'a writer after it goes ahead');
+$user->query_safe(q{SELECT dolt_checkout('main')});
 
 $user->quit;
 $other->quit;
@@ -127,10 +105,7 @@ $node->stop('immediate');
 $node->start;
 is($node->safe_psql('postgres/b1', $rows), '1:1,2:2,3:3', 'after a crash, b1');
 is($node->safe_psql('postgres/b2', $rows), '1:1,2:2,3:3', 'and b2');
-is(sql($rows),
-	$ENV{enable_injection_points} eq 'yes' ? '1:100,2:200,3:400' : '1:100,2:200,3:300',
-	'and main');
-is($node->safe_psql('postgres/b3', $rows), '1:1,2:2,3:3', 'and b3')
-  if $ENV{enable_injection_points} eq 'yes';
+is(sql($rows), '1:100,2:200,3:400', 'and main');
+is($node->safe_psql('postgres/b3', $rows), '1:1,2:2,3:3', 'and b3');
 
 done_testing();
