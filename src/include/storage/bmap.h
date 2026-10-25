@@ -16,8 +16,10 @@
 #ifndef BMAP_H
 #define BMAP_H
 
+#include "datatype/timestamp.h"
 #include "storage/bmap_files.h"
 #include "storage/bmap_xlog.h"
+#include "storage/locktag.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
 
@@ -175,6 +177,21 @@ typedef struct BmapSweep
 } BmapSweep;
 
 extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
+
+/*
+ * A page sweep holds each relation it compacts, or lowers the shared_below
+ * of, against its drop (AccessShareLock on it and on its branch), and a
+ * compaction stops its moves once another waits for that hold.  One who
+ * only tries a lock the hold conflicts with isn't waiting: it asks instead.
+ * If a sweep holds 'tag', bmap_compaction_let_go() asks it to let go (a
+ * compaction after the move under way, a lowering once done) and waits
+ * until that hold has ended: true then, false if none held it, or if
+ * lock_timeout passed since *start (set by the first call that waits, if
+ * 0: one deadline for all the tries of an operation).  Asked, the sweep
+ * passes over the branch (or the relation of none) for the rest of its
+ * run.  Either way the lock is to be tried again.
+ */
+extern bool bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start);
 
 /*
  * The release queue: a dropped map's subtrees and blocks, queued as it is

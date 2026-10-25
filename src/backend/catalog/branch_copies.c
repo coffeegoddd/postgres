@@ -202,6 +202,29 @@ copy_storage(Form_pg_class c)
 	return relnumber;
 }
 
+/*
+ * Try 'mode' on relation relid, as ConditionalLockRelationOid() does, but
+ * waiting out a page sweep that holds it: asked, it lets go after the move
+ * under way (bmap_compaction_let_go()), as it does for a waiter in the
+ * lock's queue, so a hold of a moment doesn't turn the try away.  Any
+ * other holder does.  *start is the operation's (see BranchOpsRoutine's
+ * share()).
+ */
+static bool
+try_lock_relation(Oid relid, LOCKMODE mode, TimestampTz *start)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid,
+								relation_lock_branch(relid));
+	while (!ConditionalLockRelationOid(relid, mode))
+	{
+		if (!bmap_compaction_let_go(&tag, start))
+			return ConditionalLockRelationOid(relid, mode);
+	}
+	return true;
+}
+
 /* the longest wait between tries at the copy's locks, in milliseconds */
 #define COPY_LOCK_MAX_DELAY_MS	100
 
@@ -1291,7 +1314,7 @@ stored_alike(Oid relid, Oid source, Form_pg_class oc, Form_pg_class tc)
  */
 static bool
 copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
-			 void *arg)
+			 void *arg, TimestampTz *wait_start)
 {
 	Relation	pg_class;
 	List	   *ours = NIL;
@@ -1309,7 +1332,7 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	{
 		LOCKTAG		tag;
 
-		if (!ConditionalLockRelationOid(relid, AccessExclusiveLock))
+		if (!try_lock_relation(relid, AccessExclusiveLock, wait_start))
 			return false;
 		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, source);
 		if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
@@ -1759,7 +1782,7 @@ can_restore(Form_pg_class c, const BranchKeptRelation *k)
  */
 static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
-			   BranchKeptRelation *renewed)
+			   BranchKeptRelation *renewed, TimestampTz *wait_start)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -1793,7 +1816,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	 */
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
-		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock,
+							   wait_start))
 			ok = false;
 		changed[i] = true;
 	}
@@ -1862,7 +1886,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
  * keep() kept of branch source's (see branch_ops.h).
  */
 static bool
-copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
+copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
+				  TimestampTz *wait_start)
 {
 	bool		other = source != MyBranch;
 	Relation	pg_class;
@@ -1881,7 +1906,8 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
 	{
 		LOCKTAG		tag;
 
-		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock,
+							   wait_start))
 			return false;
 		if (!other)
 			continue;
