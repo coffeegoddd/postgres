@@ -419,6 +419,7 @@ tests += {
       't/441_store_sync_skipped.pl',
       't/442_store_sync_skip_crash.pl',
       't/445_store_sync_slots.pl',
+      't/446_store_sync_slot_races.pl',
     ],
   },
 }

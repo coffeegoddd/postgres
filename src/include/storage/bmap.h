@@ -167,6 +167,8 @@ extern void bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit,
 							  void *arg);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
+extern bool bmap_inspect_store_sync(RelFileLocator rel, uint64 *written,
+									uint64 *synced, uint32 *flushing);
 
 /*
  * The sweep: what a database's page store in a tablespace holds counted
