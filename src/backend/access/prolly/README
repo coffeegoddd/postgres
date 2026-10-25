@@ -33,6 +33,15 @@ catalog is still read whole for the canonical form: pg_cast
 versioned schema and a type outside it, made outside the extension, is
 shared yet described; pg_cast grows only with user casts.
 
+A session switching branch (set_session_branch()) drops the caches that
+may hold the other branch's rows: every catalog cache entry and list of a
+branch-aware catalog, and every relation cache entry but system catalogs'
+(InvalidateBranchCaches()).  The caches of catalogs with no branch column
+(pg_authid, pg_database, pg_am and the like), which every branch reads the
+same, and the system catalogs' own relation entries, built only from rows
+of objects in pg_catalog, are kept, so the statements after a checkout
+don't rebuild them.
+
 
 Interfaces and implementations
 ------------------------------

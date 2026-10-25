@@ -80,6 +80,7 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -700,7 +701,8 @@ branch_session_init(const char *branch)
 /*
  * Make branch the session's: from now on a versioned object's rows on it
  * are the ones seen.  Caches keyed by OID may hold another branch's rows,
- * so they are all dropped.
+ * so they are dropped, all but those that are every branch's
+ * (InvalidateBranchCaches()).
  */
 void
 set_session_branch(Oid branch)
@@ -713,7 +715,8 @@ set_session_branch(Oid branch)
 	if (IsTransactionState())
 		prolly_change_logs_flush();
 	MyBranch = branch;
-	InvalidateSystemCaches();
+	INJECTION_POINT("branch-switch-caches", NULL);
+	InvalidateBranchCaches();
 	RelationCacheRebuildNew(from);
 }
 

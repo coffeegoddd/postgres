@@ -19,6 +19,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_impl.h"
 #include "catalog/branch.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_branch.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -26,6 +27,7 @@
 #include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
@@ -145,4 +147,50 @@ test_prolly_session_stats(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;
+}
+
+/*
+ * What the caches let go of: an injection point callback, attached with
+ * injection_points_attach('catcache-reset' or 'relcache-reset-entry',
+ * 'test_prolly', 'test_count_cache_reset', NULL), counting the catalog
+ * caches reset, and the system catalogs' relation entries invalidated, in
+ * this backend.
+ */
+static int64 catcaches_reset = 0;
+static int64 system_entries_reset = 0;
+
+extern PGDLLEXPORT void test_count_cache_reset(const char *name,
+											   const void *private_data,
+											   void *arg);
+
+void
+test_count_cache_reset(const char *name, const void *private_data, void *arg)
+{
+	if (strcmp(name, "catcache-reset") == 0)
+		catcaches_reset++;
+	else if (IsCatalogRelationOid(RelationGetRelid((Relation) arg)))
+		system_entries_reset++;
+}
+
+/*
+ * test_cache_resets(): the counts since the last call, with how many
+ * catalog caches there are
+ */
+PG_FUNCTION_INFO_V1(test_cache_resets);
+
+Datum
+test_cache_resets(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum(catcaches_reset);
+	values[1] = Int32GetDatum(SysCacheSize);
+	values[2] = Int64GetDatum(system_entries_reset);
+	catcaches_reset = 0;
+	system_entries_reset = 0;
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
