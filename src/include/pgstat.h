@@ -786,9 +786,13 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, /* autovacuum's collections
 											 * skipped: another collection
 											 * of the store was running */
+	PGSTAT_PROLLY_STATUS_FROM_FOLD, /* comparisons into the working set (a
+									 * status's) from the last fold known,
+									 * only tables written since compared
+									 * again */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_STATUS_FROM_FOLD + 1)
 
 typedef struct PgStat_ProllyStats
 {

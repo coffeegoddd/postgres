@@ -6436,6 +6436,29 @@ copies_pending_full_folds(ProllyPendingFullVisit visit, void *arg)
 				visit, arg);
 }
 
+/*
+ * The last fold of the session branch known (branch_fold_last()), from
+ * its baseline now, and when it was known; never one only this backend's
+ * chunks hold, nor one a fold forced to read would skip.
+ */
+static bool
+copies_last_fold(Snapshot snap, ProllyNodeRef *root, ProllyFoldMark *mark)
+{
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	bool		have;
+
+	if (!fold_caches_usable() || prolly_local_chunks_active() ||
+		!OidIsValid(MyBranch))
+		return false;
+	have = branch_baseline(branch_ops()->current(), &baseline);
+	if (!branch_fold_last(MyBranch, snap, have ? &baseline.hash : NULL, &h,
+						  mark))
+		return false;
+	ref_of(&h, root);
+	return true;
+}
+
 static void
 copies_publish_definitions(void *read, const ProllyNodeRef *root,
 						   bool complete)
@@ -8861,4 +8884,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_relation_class = copies_set_relation_class,
 	.made_object = copies_made_object,
 	.stash_set_maker = copies_stash_set_maker,
+	.last_fold = copies_last_fold,
 };

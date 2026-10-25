@@ -146,6 +146,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_DEFINITIONS_REUSED] = "definitions_reused",
 	[PGSTAT_PROLLY_STATUS_REUSED] = "status_reused",
 	[PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED] = "auto_collections_skipped",
+	[PGSTAT_PROLLY_STATUS_FROM_FOLD] = "status_from_fold",
 };
 
 /*
