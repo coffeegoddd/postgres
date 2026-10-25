@@ -9664,6 +9664,19 @@ compact_store(RelFileLocator rel, const char *path)
 			compacting_end(0, 0);
 			MemoryContextSwitchTo(oldcxt);
 			CurrentResourceOwner = oldowner;
+			/*
+			 * (a relation whose blocks can't be moved is passed over; a
+			 * cancel or timeout, a shutdown, or running out of memory or
+			 * disk ends the sweep)
+			 */
+			if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+				ERRCODE_OPERATOR_INTERVENTION ||
+				ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+				ERRCODE_INSUFFICIENT_RESOURCES)
+			{
+				FreeDir(dir);
+				ReThrowError(edata);
+			}
 			ereport(DEBUG1,
 					(errmsg_internal("blocks of relation %u not moved: %s",
 									 relnumber, edata->message)));

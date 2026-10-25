@@ -13,17 +13,39 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_jsonb.h"
 #include "catalog/pg_type.h"
+#include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/jsonb.h"
+#include "varatt.h"
 
 Datum
 jsonb_exists(PG_FUNCTION_ARGS)
 {
-	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	Jsonb	   *jb;
 	text	   *key = PG_GETARG_TEXT_PP(1);
 	JsonbValue	kval;
 	JsonbValue *v = NULL;
+	enum jbvType kind;
+
+	/*
+	 * A versioned table's object stored as a JSON tree: whether the key's
+	 * path is in the tree (prolly_jsonb.h).  An array's string elements
+	 * are found in the document.
+	 */
+	if (VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(PG_GETARG_DATUM(0))) &&
+		prolly_jsonb_tree_kind(PG_GETARG_DATUM(0), &kind) && kind == jbvObject)
+	{
+		char	   *k = text_to_cstring(key);
+		Jsonb	   *found;
+
+		if (prolly_jsonb_tree_get(PG_GETARG_DATUM(0), PROLLY_JSONB_ANY,
+								  &k, 1, &found))
+			PG_RETURN_BOOL(found != NULL);
+	}
+
+	jb = PG_GETARG_JSONB_P(0);
 
 	/*
 	 * We only match Object keys (which are naturally always Strings), or

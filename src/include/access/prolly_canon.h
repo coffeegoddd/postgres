@@ -566,7 +566,9 @@ typedef struct ProllyCanonRoutine
  * While set, the commits (ProllyHash *) a move takes its versions from: a
  * table the move makes is the relation (by OID) a commit of them was made
  * from for its name, as its record says; one it makes again stays the
- * relation it was (prolly_move_kept_relid()).
+ * relation it was (prolly_move_kept_relid()).  A table or materialized
+ * view the move makes from such a commit is made by the owner the record
+ * names (see prolly_move_maker()).
  */
 extern PGDLLIMPORT List *prolly_move_provenance;
 
@@ -592,12 +594,42 @@ typedef struct ProllyKeptRelation
 } ProllyKeptRelation;
 
 /*
- * While set, a move restores tables from the commits it takes versions
- * from (a reset, a table's checkout, a first use, an abort): each table
- * it makes is its recorded owner's (the commit's record of relations
- * names it), with no grants, refused if that role no longer exists.
+ * The role a relation the running move makes from a commit is made by:
+ * the owner the commit's record of relations names (or the one
+ * prolly_move_kept names), for a table, a materialized view, or a sequence
+ * such a table owns; InvalidOid for any other relation, or outside a move.
+ * Each statement making it, its rows, the checks of them and its
+ * materialized view's query run as that role, under
+ * SECURITY_RESTRICTED_OPERATION (prolly_as_maker()), as REFRESH runs a
+ * materialized view's owner's query: the role moving runs none of the
+ * owner's code, and gains no relation it doesn't own.  The relation gets no
+ * grants from its making.
  */
-extern PGDLLIMPORT bool prolly_move_recorded_owners;
+extern Oid	prolly_move_maker(Oid relid);
+
+/* A role switch prolly_as_maker() made, for prolly_as_maker_end(). */
+typedef struct ProllyMakerSwitch
+{
+	bool		switched;
+	Oid			user;
+	int			sec;
+} ProllyMakerSwitch;
+
+/*
+ * Run as relid's maker (prolly_move_maker()), if it has one, until
+ * prolly_as_maker_end(): callers end it in a PG_FINALLY().
+ */
+extern void prolly_as_maker(Oid relid, ProllyMakerSwitch *sw);
+extern void prolly_as_maker_end(ProllyMakerSwitch *sw);
+
+/*
+ * The role a relation (name) a commit's record of relations lists as owned
+ * by owner, then named owner_name, is made by: refused if that role no
+ * longer exists, or is named otherwise now (another role, made with the OID
+ * once the counter wrapped, or the role renamed).
+ */
+extern Oid	prolly_recorded_owner(const char *name, Oid owner,
+								  const char *owner_name);
 
 extern PGDLLIMPORT List *prolly_move_kept;
 

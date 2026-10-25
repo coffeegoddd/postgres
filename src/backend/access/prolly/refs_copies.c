@@ -73,9 +73,12 @@
  *				   each but the snapshot, native byte order)
  *	'L' commit	-> the relations the commit was made from, as this database
  *				   made it (commits fetched, cloned or pushed here have
- *				   none): a line for each prolly table and partitioned
- *				   table, its OID and its owner's (10 digits each, a space
- *				   after each), and its qualified name (a backslash in it
+ *				   none): a line for each prolly table, partitioned
+ *				   table and materialized view: its OID and its owner's
+ *				   (10 digits each, a space after each), its kind (its
+ *				   relkind, then a space), its owner's name (escaped as
+ *				   the name is, and a space as a backslash and 's'; a
+ *				   space after), and its qualified name (a backslash in it
  *				   written as two, a newline as a backslash and 'n')
  *	'D' name	-> the branch's merge's table identity conflicts: tables the
  *				   merge kept as the branch has them, as theirs is another
@@ -585,7 +588,8 @@ refs_init(void)
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
 	env.compare = prolly_bytes_compare;
-	env.counters = pgstat_prolly_tree_counters();
+	/* (counted apart too: see pgstat_prolly_refs_tree_counters()) */
+	env.counters = pgstat_prolly_refs_tree_counters();
 	commit_env = env;
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;
@@ -2604,7 +2608,6 @@ move_settled_checked(void *arg)
 	if (folded)
 		relids = prolly_relations_of(&before);
 	prolly_move_provenance = list_make1(&ms->head);
-	prolly_move_recorded_owners = true;
 	PG_TRY();
 	{
 		move_settled(ms->info);
@@ -2612,7 +2615,6 @@ move_settled_checked(void *arg)
 	PG_FINALLY();
 	{
 		prolly_move_provenance = NIL;
-		prolly_move_recorded_owners = false;
 	}
 	PG_END_TRY();
 	if (folded)
@@ -4067,16 +4069,7 @@ move_copies_checked(void *arg)
 		copies_working_set(NULL, &before);
 	if (folded)
 		relids = prolly_relations_of(&before);
-	prolly_move_recorded_owners = true;
-	PG_TRY();
-	{
-		move_copies(arg);
-	}
-	PG_FINALLY();
-	{
-		prolly_move_recorded_owners = false;
-	}
-	PG_END_TRY();
+	move_copies(arg);
 	if (folded)
 		prolly_refuse_mismatched_versions(&before, relids, &mc->head, 1,
 										  PROLLY_MISMATCH_FIRST_USE);
@@ -4713,26 +4706,79 @@ line_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
- * A relation's line in a record of tables: its OID (10 digits), a space,
- * its owner's OID (10 digits), a space, and its qualified name, each
- * backslash in it written as two and each newline as a backslash and 'n',
- * so that no name, whatever it holds, makes a line of its own; then a
- * newline.
+ * A name in a relation's line: each backslash in it written as two, each
+ * newline as a backslash and 'n' and, where it is followed by another
+ * field (spaces), each space as a backslash and 's', so that no name,
+ * whatever it holds, makes a line or a field of its own.
  */
 static void
-relation_line(StringInfo out, Oid relid, Oid owner, const char *name)
+line_name(StringInfo out, const char *name, bool spaces)
 {
-	appendStringInfo(out, "%010u %010u ", relid, owner);
 	for (const char *c = name; *c; c++)
 	{
 		if (*c == '\\')
 			appendStringInfoString(out, "\\\\");
 		else if (*c == '\n')
 			appendStringInfoString(out, "\\n");
+		else if (*c == ' ' && spaces)
+			appendStringInfoString(out, "\\s");
 		else
 			appendStringInfoChar(out, *c);
 	}
+}
+
+/*
+ * A relation's line in a record of tables: its OID (10 digits), a space,
+ * its owner's OID (10 digits), a space, its kind (relkind), a space, its
+ * owner's name (line_name(), spaces escaped), a space, and its qualified
+ * name (line_name()); then a newline.  The owner's name is kept with its
+ * OID so that a role made later with the OID, once the counter wraps, is
+ * told from the one that owned the relation.
+ */
+static void
+relation_line(StringInfo out, Oid relid, Oid owner, char relkind,
+			  const char *name)
+{
+	char	   *owner_name = GetUserNameFromId(owner, true);
+
+	appendStringInfo(out, "%010u %010u %c ", relid, owner, relkind);
+	line_name(out, owner_name ? owner_name : "", true);
+	appendStringInfoChar(out, ' ');
+	line_name(out, name, false);
 	appendStringInfoChar(out, '\n');
+}
+
+/*
+ * A name of a relation's line (line_name()'s), from *c on to the end of
+ * the field (a space, if spaces, else the line's end), unescaped into out;
+ * false if malformed.  *c is left at the field's end.
+ */
+static bool
+read_line_name(const char **c, StringInfo out, bool spaces)
+{
+	const char *p = *c;
+
+	for (; *p && *p != '\n' && !(spaces && *p == ' '); p++)
+	{
+		if (*p != '\\')
+			appendStringInfoChar(out, *p);
+		else if (p[1] == '\\')
+			appendStringInfoChar(out, *++p);
+		else if (p[1] == 'n')
+		{
+			appendStringInfoChar(out, '\n');
+			p++;
+		}
+		else if (p[1] == 's' && spaces)
+		{
+			appendStringInfoChar(out, ' ');
+			p++;
+		}
+		else
+			return false;
+	}
+	*c = p;
+	return true;
 }
 
 /*
@@ -4748,8 +4794,9 @@ relation_lines(const char *data)
 	for (const char *p = data; *p;)
 	{
 		ProllyCommitRelation *r = palloc(sizeof(ProllyCommitRelation));
+		StringInfoData owner;
 		StringInfoData name;
-		const char *c = p + 11;
+		const char *c;
 
 		for (int i = 0; i < 10; i++)
 			if (!isdigit((unsigned char) p[i]))
@@ -4763,24 +4810,23 @@ relation_lines(const char *data)
 		if (p[21] != ' ')
 			goto bad;
 		r->owner = (Oid) strtoul(p + 11, NULL, 10);
-		c = p + 22;
-		initStringInfo(&name);
-		for (; *c && *c != '\n'; c++)
-		{
-			if (*c != '\\')
-				appendStringInfoChar(&name, *c);
-			else if (c[1] == '\\')
-				appendStringInfoChar(&name, *++c);
-			else if (c[1] == 'n')
-			{
-				appendStringInfoChar(&name, '\n');
-				c++;
-			}
-			else
-				goto bad;
-		}
-		if (*c != '\n' || name.len == 0)
+		r->relkind = p[22];
+		if ((r->relkind != RELKIND_RELATION &&
+			 r->relkind != RELKIND_PARTITIONED_TABLE &&
+			 r->relkind != RELKIND_MATVIEW && r->relkind != RELKIND_VIEW &&
+			 r->relkind != RELKIND_SEQUENCE &&
+			 r->relkind != RELKIND_FOREIGN_TABLE) ||
+			p[23] != ' ')
 			goto bad;
+		c = p + 24;
+		initStringInfo(&owner);
+		if (!read_line_name(&c, &owner, true) || *c != ' ')
+			goto bad;
+		c++;
+		initStringInfo(&name);
+		if (!read_line_name(&c, &name, false) || *c != '\n' || name.len == 0)
+			goto bad;
+		r->owner_name = owner.data;
 		r->name = name.data;
 		out = lappend(out, r);
 		p = c + 1;
@@ -4836,13 +4882,14 @@ table_names(StringInfo out)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if ((c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION) ||
+		if ((c->relam == PROLLY_TABLE_AM_OID &&
+			 (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW)) ||
 			c->relkind == RELKIND_PARTITIONED_TABLE)
 		{
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid, c->relowner,
+			relation_line(&line, c->oid, c->relowner, c->relkind,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -4880,7 +4927,7 @@ privileged_names(StringInfo out)
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid, c->relowner,
+			relation_line(&line, c->oid, c->relowner, c->relkind,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -5146,7 +5193,7 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 					keep = true;
 		}
 		if (keep)
-			relation_line(&out, r->relid, r->owner, r->name);
+			relation_line(&out, r->relid, r->owner, r->relkind, r->name);
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -5197,7 +5244,7 @@ note_head_privileged(const char *name, const ProllyHash *head,
 			foreach_ptr(ProllyCommitRelation, b, before)
 				if (b->relid == r->relid && strcmp(b->name, r->name) == 0)
 				{
-					relation_line(&kept, r->relid, r->owner, r->name);
+					relation_line(&kept, r->relid, r->owner, r->relkind, r->name);
 					break;
 				}
 		lines = kept.data;

@@ -1256,9 +1256,11 @@ version_move_end(VersionMove *vm)
  * stash's apply, a conflict's resolution, an abort) runs as
  * VERSION_MOVE(), with the commits it takes them from (from_, n_ of them):
  * its writes hushed, the tables it makes the relations those commits'
- * records name (WITH_PROVENANCE()), and refused if it put into a table
- * here a version of another relation (version_move_end()).  A branch's
- * first use, and a push's move of a branch, are checked so in the refs.
+ * records name (WITH_PROVENANCE()), each made by the owner the record
+ * names (the canonicalizer's prolly_move_maker()), and refused if it put
+ * into a table here a version of another relation (version_move_end()).
+ * A branch's first use, and a push's move of a branch, are checked so in
+ * the refs.
  */
 #define VERSION_MOVE(from_, n_, ...) \
 	do { \
@@ -1266,26 +1268,6 @@ version_move_end(VersionMove *vm)
 		version_move_begin(&vm_, (from_), (n_)); \
 		WITH_PROVENANCE(from_, n_, BRANCH_WRITES_HUSHED(__VA_ARGS__)); \
 		version_move_end(&vm_); \
-	} while (0)
-
-/*
- * A VERSION_MOVE() that restores the commits' versions (a reset, a table's
- * checkout, an abort, a stash's push): each table it makes is the
- * commit's, its recorded owner's with no grants (prolly_move_recorded_owners),
- * not the mover's.
- */
-#define RESTORING_MOVE(from_, n_, ...) \
-	do { \
-		prolly_move_recorded_owners = true; \
-		PG_TRY(_restoring); \
-		{ \
-			VERSION_MOVE(from_, n_, __VA_ARGS__); \
-		} \
-		PG_FINALLY(_restoring); \
-		{ \
-			prolly_move_recorded_owners = false; \
-		} \
-		PG_END_TRY(_restoring); \
 	} while (0)
 
 /*
@@ -2041,7 +2023,7 @@ checkout_tables(const char *ref, char **names, int nnames)
 	 * it; the branch may be its head's again, its changes all put back)
 	 */
 	branch_note_write(MyBranch);
-	RESTORING_MOVE(&commit, 1,
+	VERSION_MOVE(&commit, 1,
 				   PROLLY_CALL(diff_merge(), move_to, &target, &working));
 	{
 		ProllyHash	head;
@@ -2583,7 +2565,7 @@ abort_in_progress(const char *what)
 		BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
 														   psprintf("abort the %s", what),
 														   true));
-	RESTORING_MOVE(&head, head.len > 0 ? 1 : 0,
+	VERSION_MOVE(&head, head.len > 0 ? 1 : 0,
 				   PROLLY_CALL(refs(), reset, "HEAD"));
 	BRANCH_WRITES_HUSHED(prolly_restore_privileges(saved, false));
 	settled();
@@ -3583,7 +3565,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 			BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
 															   "reset the branch",
 															   true));
-		RESTORING_MOVE(&target, target.len > 0 ? 1 : 0,
+		VERSION_MOVE(&target, target.len > 0 ? 1 : 0,
 					   PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	}
 	settled();
@@ -3746,7 +3728,7 @@ dolt_stash(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&at,
 																   "stash the changes",
 																   true));
-			RESTORING_MOVE(&at, at.len > 0 ? 1 : 0,
+			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
 						   PROLLY_CALL(refs(), reset, "HEAD"));
 		}
 		settled();
@@ -4352,7 +4334,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&ms.series_head,
 																   "abort the revert",
 																   true));
-				RESTORING_MOVE(&ms.series_head, 1,
+				VERSION_MOVE(&ms.series_head, 1,
 							   PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
 				BRANCH_WRITES_HUSHED(prolly_restore_privileges(ms.identity_saved, false));
 				settled();
@@ -7255,7 +7237,7 @@ made_from(NameLineage *l, const ProllyHash *commit)
 	{
 		ProllyCommitRelation *r = lfirst(lc);
 
-		if (r->relid == l->relid)
+		if (r->relid == l->relid && r->relkind != RELKIND_MATVIEW)
 			return r->name;
 	}
 	return NULL;
