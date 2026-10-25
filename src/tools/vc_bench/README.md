@@ -156,7 +156,7 @@ change counts to an existing root and run `prepare` again.
 | Changed rows K | `changes` | 1,000 |
 | Pending dirty rows Q | `dirty_sizes` | xsmall 0.001%, small 0.01%, medium 1%, large 10% of N |
 | Distance D from current HEAD | `history_depths` | 1, 4, 16, 32 commits |
-| Repetitions | `repetitions`, `warmups` | 7 measured, 1 discarded per pass |
+| Repetitions | `repetitions`, `warmups` | 7 measured per pass; no discarded warmups (set `warmups` to run some first) |
 | Memory sampling | `sample_interval_ms` | 10 ms |
 
 Every commit updates the **same K evenly spaced primary keys**, setting their
