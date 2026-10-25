@@ -2099,7 +2099,8 @@ vac_truncate_clog(TransactionId frozenXID,
  * It is a saving, not the VACUUM's work: an anti-wraparound VACUUM, which
  * must not be put off, doesn't do it, and an error in it (a queue that
  * can't be read) is reported as a warning and the VACUUM goes on, the
- * subtransaction it ran in rolled back.
+ * subtransaction it ran in rolled back.  A cancel, a shutdown or running
+ * out of resources still ends the VACUUM.
  */
 static uint64 release_budget_used = 0;
 
@@ -2147,6 +2148,16 @@ vacuum_release_dropped(Relation rel, const VacuumParams *params)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
+		/*
+		 * A cancel or timeout (raised by the cost-based delay's interrupt
+		 * check), a shutdown, or running out of memory or disk is the
+		 * VACUUM's own, not the queue's.
+		 */
+		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+			ERRCODE_OPERATOR_INTERVENTION ||
+			ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+			ERRCODE_INSUFFICIENT_RESOURCES)
+			ReThrowError(edata);
 		ereport(WARNING,
 				(errmsg("could not let go of dropped storage before vacuuming \"%s\": %s",
 						RelationGetRelationName(rel), edata->message)));

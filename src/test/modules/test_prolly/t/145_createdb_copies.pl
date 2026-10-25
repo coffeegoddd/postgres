@@ -22,10 +22,21 @@ autovacuum = off
 checkpoint_timeout = 1h
 });
 $node->start;
+
+# The standby streams through a slot, so the primary keeps the segments
+# it still needs: restarted, it asks for WAL again from the start of the
+# segment its own WAL ends in, and a checkpoint of the primary's
+# (pg_backup_start()'s, below) made before it has caught up would
+# otherwise remove that segment.
+$node->safe_psql('postgres',
+	q{SELECT pg_create_physical_replication_slot('standby', true)});
 $node->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('createdb_copies_standby');
 $standby->init_from_backup($node, 'base', has_streaming => 1);
-$standby->append_conf('postgresql.conf', 'checkpoint_timeout = 1h');
+$standby->append_conf('postgresql.conf', qq{
+checkpoint_timeout = 1h
+primary_slot_name = 'standby'
+});
 $standby->start;
 
 # A template whose store has journal chunks and a table file, of 32 kB

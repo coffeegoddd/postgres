@@ -41,6 +41,18 @@ PgStat_Counter PendingProllyStats[PGSTAT_PROLLY_NUM_COUNTERS];
 /* what trees whose environments count here count */
 static ProllyNodeCounters PendingProllyTree;
 
+/*
+ * ... and the refs' and commits' trees, apart: their nodes count in
+ * nodes_read and nodes_written too, and in refs_nodes_read and
+ * refs_nodes_written, so that a caller can tell a table's trees' work from
+ * theirs (whose leaves hold hashes and dates, so where their chunks split
+ * varies from commit to commit).
+ */
+static ProllyNodeCounters PendingProllyRefsTree;
+
+/* what this backend has flushed, since it began */
+static PgStat_Counter SessionProllyStats[PGSTAT_PROLLY_NUM_COUNTERS];
+
 static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_NODES_READ] = "nodes_read",
 	[PGSTAT_PROLLY_NODES_WRITTEN] = "nodes_written",
@@ -146,6 +158,8 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_DEFINITIONS_REUSED] = "definitions_reused",
 	[PGSTAT_PROLLY_STATUS_REUSED] = "status_reused",
 	[PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED] = "auto_collections_skipped",
+	[PGSTAT_PROLLY_REFS_NODES_READ] = "refs_nodes_read",
+	[PGSTAT_PROLLY_REFS_NODES_WRITTEN] = "refs_nodes_written",
 	[PGSTAT_PROLLY_BMAP_REFCOUNT_READS] = "bmap_refcount_reads",
 };
 
@@ -157,6 +171,13 @@ ProllyNodeCounters *
 pgstat_prolly_tree_counters(void)
 {
 	return &PendingProllyTree;
+}
+
+/* The node counters the refs' and commits' trees count into. */
+ProllyNodeCounters *
+pgstat_prolly_refs_tree_counters(void)
+{
+	return &PendingProllyRefsTree;
 }
 
 const char *
@@ -175,6 +196,14 @@ absorb_tree_counts(void)
 	PendingProllyStats[PGSTAT_PROLLY_VALUE_NODES_WRITTEN] +=
 		PendingProllyTree.value_nodes_written;
 	memset(&PendingProllyTree, 0, sizeof(PendingProllyTree));
+	PendingProllyStats[PGSTAT_PROLLY_NODES_READ] += PendingProllyRefsTree.nodes_read;
+	PendingProllyStats[PGSTAT_PROLLY_NODES_WRITTEN] += PendingProllyRefsTree.nodes_written;
+	PendingProllyStats[PGSTAT_PROLLY_VALUE_NODES_WRITTEN] +=
+		PendingProllyRefsTree.value_nodes_written;
+	PendingProllyStats[PGSTAT_PROLLY_REFS_NODES_READ] += PendingProllyRefsTree.nodes_read;
+	PendingProllyStats[PGSTAT_PROLLY_REFS_NODES_WRITTEN] +=
+		PendingProllyRefsTree.nodes_written;
+	memset(&PendingProllyRefsTree, 0, sizeof(PendingProllyRefsTree));
 }
 
 static bool
@@ -182,6 +211,10 @@ have_pending(void)
 {
 	if (PendingProllyTree.nodes_read != 0 || PendingProllyTree.nodes_written != 0 ||
 		PendingProllyTree.value_nodes_written != 0)
+		return true;
+	if (PendingProllyRefsTree.nodes_read != 0 ||
+		PendingProllyRefsTree.nodes_written != 0 ||
+		PendingProllyRefsTree.value_nodes_written != 0)
 		return true;
 	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
 		if (PendingProllyStats[i] != 0)
@@ -220,6 +253,7 @@ pgstat_prolly_flush_cb(bool nowait)
 	{
 		memset(PendingProllyStats, 0, sizeof(PendingProllyStats));
 		memset(&PendingProllyTree, 0, sizeof(PendingProllyTree));
+		memset(&PendingProllyRefsTree, 0, sizeof(PendingProllyRefsTree));
 		return false;
 	}
 
@@ -231,11 +265,36 @@ pgstat_prolly_flush_cb(bool nowait)
 	absorb_tree_counts();
 	shstats = (PgStatShared_Prolly *) entry_ref->shared_stats;
 	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+	{
 		shstats->stats.counts[i] += PendingProllyStats[i];
+		SessionProllyStats[i] += PendingProllyStats[i];
+	}
 	pgstat_unlock_entry(entry_ref);
 
 	memset(PendingProllyStats, 0, sizeof(PendingProllyStats));
 	return false;
+}
+
+/*
+ * What this backend has counted since it began, flushed or not, into
+ * counts[] (one for each counter): its own work alone, which other
+ * backends' doesn't move, for a caller measuring its own statements.
+ */
+void
+pgstat_prolly_session_counts(PgStat_Counter *counts)
+{
+	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+		counts[i] = SessionProllyStats[i] + PendingProllyStats[i];
+	counts[PGSTAT_PROLLY_NODES_READ] += PendingProllyTree.nodes_read;
+	counts[PGSTAT_PROLLY_NODES_WRITTEN] += PendingProllyTree.nodes_written;
+	counts[PGSTAT_PROLLY_VALUE_NODES_WRITTEN] +=
+		PendingProllyTree.value_nodes_written;
+	counts[PGSTAT_PROLLY_NODES_READ] += PendingProllyRefsTree.nodes_read;
+	counts[PGSTAT_PROLLY_NODES_WRITTEN] += PendingProllyRefsTree.nodes_written;
+	counts[PGSTAT_PROLLY_VALUE_NODES_WRITTEN] +=
+		PendingProllyRefsTree.value_nodes_written;
+	counts[PGSTAT_PROLLY_REFS_NODES_READ] += PendingProllyRefsTree.nodes_read;
+	counts[PGSTAT_PROLLY_REFS_NODES_WRITTEN] += PendingProllyRefsTree.nodes_written;
 }
 
 void
