@@ -97,7 +97,7 @@ def init(root, smoke):
         "changes": [8] if smoke else [1000],
         "dirty_sizes": default_dirty_sizes(),
         "history_depths": [1, 4] if smoke else [1, 4, 16, 32],
-        "repetitions": 2 if smoke else 7, "warmups": 0,
+        "repetitions": 2 if smoke else 1, "warmups": 0,
         "passes": list(PASSES), "sample_interval_ms": 10,
         "batch_rows": 1000, "timeout_seconds": 3600, "seed": 20261021,
         "engines": {name: e.default_config(root, sources) for name, e in ENGINES.items()},

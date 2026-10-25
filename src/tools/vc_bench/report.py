@@ -25,8 +25,8 @@ CPU_SHORT_TICKS = 3
 # A series drifts when its samples, in run order, rise or fall together
 # more than chance allows: a two-sided Mann-Kendall test below DRIFT_P.  A
 # report holds hundreds of series, so the bar is high; a cell's seven
-# default repetitions rising every time clear it (p 0.0004), six of them
-# don't.  Too few samples can't.
+# repetitions rising every time clear it (p 0.0004), six of them don't.
+# Too few samples (the default single repetition) can't.
 DRIFT_P = 0.001
 DRIFT_MIN_SAMPLES = 5
 

@@ -156,7 +156,7 @@ change counts to an existing root and run `prepare` again.
 | Changed rows K | `changes` | 1,000 |
 | Pending dirty rows Q | `dirty_sizes` | xsmall 0.001%, small 0.01%, medium 1%, large 10% of N |
 | Distance D from current HEAD | `history_depths` | 1, 4, 16, 32 commits |
-| Repetitions | `repetitions`, `warmups` | 7 measured per pass; no discarded warmups (set `warmups` to run some first) |
+| Repetitions | `repetitions`, `warmups` | 1 measured per pass; no discarded warmups (set `warmups` to run some first) |
 | Memory sampling | `sample_interval_ms` | 10 ms |
 
 Every commit updates the **same K evenly spaced primary keys**, setting their
@@ -357,7 +357,8 @@ not only on the operation measured. The report tests every cell's latency
 repetitions and each engine counter of its `counters` pass repetitions in
 the order they ran: a two-sided Mann-Kendall trend test, exact without ties
 and normal with the tie correction, flagged at p < 0.001 with at least five
-samples. Seven repetitions that rise every time are flagged (p = 0.0004);
+samples (so not at the default single repetition: set `repetitions` to 5 or
+more for it). Seven repetitions that rise every time are flagged (p = 0.0004);
 seven with one pair out of order are not (p = 0.003). The bar is high because
 a report tests hundreds of series. Flagged latencies are marked `[drift ↑]`
 or `[drift ↓]` in their cells, and **Run-order drift** lists every flagged
@@ -409,7 +410,7 @@ command also adds them to existing complete runs without rerunning benchmarks.
 
 Each fit varies one of N, K, D, or Q while holding the other recorded dimensions
 fixed. At least four levels spanning 8x and five repetitions per level are
-required. Memory fits also require positive samples and no short-operation flags.
+required (the default is one). Memory fits also require positive samples and no short-operation flags.
 The default three dirty sizes provide descriptive comparisons; add a fourth
 distinct size for a Q scaling fit. Fractional dirty sizes change Q with N, so
 use fixed `rows` profiles for an N sweep with Q held constant. Q fits group by
