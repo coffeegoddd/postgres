@@ -35,6 +35,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_commitcache.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_remote.h"
@@ -2417,6 +2418,37 @@ test_walk_new_count(PG_FUNCTION_ARGS)
 	PROLLY_CALL(dc.refs, walk_commit, &to, note_node, &n);
 	hash_destroy(n.seen);
 	PG_RETURN_INT64(n.visited);
+}
+
+/* test_chunk_generation(): the GC generation of the database's store now */
+PG_FUNCTION_INFO_V1(test_chunk_generation);
+Datum
+test_chunk_generation(PG_FUNCTION_ARGS)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+
+	PG_RETURN_INT64((int64) PROLLY_CALL(cs, generation, store));
+}
+
+/*
+ * test_commit_cache_has(dboid, generation, id): whether the shared commit
+ * cache has commit id (hex) of database dboid in that GC generation
+ */
+PG_FUNCTION_INFO_V1(test_commit_cache_has);
+Datum
+test_commit_cache_has(PG_FUNCTION_ARGS)
+{
+	char	   *hex = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	ProllyHash	id;
+	ProllyCommitLinks links;
+
+	if (!prolly_hash_from_hex(hex, strlen(hex), &id))
+		elog(ERROR, "not a commit id: \"%s\"", hex);
+	PG_RETURN_BOOL(PROLLY_CALL(prolly_commitcache_lookup("shared"), lookup,
+							   PG_GETARG_OID(0), (uint32) PG_GETARG_INT64(1),
+							   &id, &links));
 }
 
 /* test_memo_counters(reset): the value memo's hits and misses. */

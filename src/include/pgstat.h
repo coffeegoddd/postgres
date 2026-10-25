@@ -798,6 +798,10 @@ typedef enum PgStat_ProllyCounter
 									 * status's) from the last fold known,
 									 * only tables written since compared
 									 * again */
+	PGSTAT_PROLLY_COMMIT_CACHE_HITS,	/* commits' links found in the commit
+										 * cache, not read */
+	PGSTAT_PROLLY_COMMIT_CACHE_MISSES,	/* and those looked for there and
+										 * read */
 	PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED,	/* shares and snapshots whose
 											 * blocks a sync of their page
 											 * store was to make durable */

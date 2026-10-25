@@ -4238,6 +4238,60 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 	return true;
 }
 
+/* The database's commit cache, if its configuration has one. */
+static const ProllyCommitCacheRoutine *
+commit_cache(void)
+{
+	static const ProllyCommitCacheRoutine *cc = NULL;
+	static bool looked = false;
+
+	if (!looked)
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		cc = dc.commit_cache;
+		looked = true;
+	}
+	return cc;
+}
+
+/*
+ * What commit id links to (its root, parents and height): from the commit
+ * cache, if it has them for the store's GC generation now, else read
+ * (copies_commit_get()) and remembered there.  False if id names no commit
+ * in the store.  Walking history this way reads each commit once for every
+ * backend, rather than once each time the node cache has let go of it.
+ */
+static bool
+commit_links(const ProllyHash *id, ProllyCommitLinks *links)
+{
+	const ProllyCommitCacheRoutine *cc = commit_cache();
+	bool		cached;
+	uint32		generation = 0;
+	ProllyCommitInfo info;
+
+	refs_init();
+	cached = cc != NULL && PROLLY_HAS(env.chunk_store, generation);
+	if (cached)
+	{
+		generation = PROLLY_CALL(env.chunk_store, generation, env.chunks);
+		if (PROLLY_CALL(cc, lookup, MyDatabaseId, generation, id, links))
+			return true;
+	}
+	if (!copies_commit_get(id, &info))
+		return false;
+	memset(links, 0, sizeof(*links));
+	links->root = info.root.hash;
+	links->nparents = info.nparents;
+	for (int i = 0; i < info.nparents; i++)
+		links->parents[i] = info.parents[i];
+	links->height = info.has_height ? info.height : 0;
+	if (cached)
+		PROLLY_CALL(cc, remember, MyDatabaseId, generation, id, links);
+	return true;
+}
+
 /* Just the date of commit id, which is read only for it. */
 static bool
 commit_time(const ProllyHash *id, TimestampTz *at)
@@ -4288,7 +4342,7 @@ parse_commit_id(const char *refname, ProllyHash *id)
 static bool
 resolve_base(const char *refname, ProllyHash *commit_id)
 {
-	ProllyCommitInfo info;
+	ProllyCommitLinks links;
 	bool		branch_only = false;
 
 	/*
@@ -4321,7 +4375,7 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	if (tracking_head(refname, commit_id))
 		return true;
 	return parse_commit_id(refname, commit_id) &&
-		copies_commit_get(commit_id, &info);
+		commit_links(commit_id, &links);
 }
 
 static bool
@@ -4341,7 +4395,7 @@ copies_resolve(const char *refname, ProllyHash *commit_id)
 	{
 		char		op = *p++;
 		long		n = 1;
-		ProllyCommitInfo info;
+		ProllyCommitLinks links;
 
 		if (isdigit((unsigned char) *p))
 		{
@@ -4354,18 +4408,18 @@ copies_resolve(const char *refname, ProllyHash *commit_id)
 		{
 			for (long i = 0; i < n && found; i++)
 			{
-				found = copies_commit_get(commit_id, &info) && info.nparents > 0;
+				found = commit_links(commit_id, &links) && links.nparents > 0;
 				if (found)
-					*commit_id = info.parents[0];
+					*commit_id = links.parents[0];
 			}
 		}
 		else if (op == '^')
 		{
 			if (n == 0)
 				continue;
-			found = copies_commit_get(commit_id, &info) && n <= info.nparents;
+			found = commit_links(commit_id, &links) && n <= links.nparents;
 			if (found)
-				*commit_id = info.parents[n - 1];
+				*commit_id = links.parents[n - 1];
 		}
 		else
 			found = false;

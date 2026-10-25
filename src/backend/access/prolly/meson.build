@@ -15,6 +15,8 @@ backend_sources += files(
   'chunker_stub.c',
   'chunkstore_journal.c',
   'chunkstore_local.c',
+  'commitcache_shared.c',
+  'commitcache_stub.c',
   'diffmerge_folded.c',
   'hash_blake3.c',
   'journal_index.c',
