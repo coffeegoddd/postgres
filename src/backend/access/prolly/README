@@ -435,8 +435,14 @@ another's table, under its grants:
   in place, drops, or makes again (a table whose definition ALTER can't
   change in place, a materialized view or view made again as what it
   uses changes) is changed and made as its owner here, restricted, its
-  rows written and checked so; one made again keeps its owner and gets
-  its grants back (its own, its columns' and its sequences').  Owner-run
+  rows written and checked so, where the role moving has that owner's
+  privileges (a superuser, a member of the owning role): the owner's code
+  never runs with more than the owner's own.  One made again keeps its
+  owner and gets its grants back (its own, its columns' and its
+  sequences').  A role without the owner's privileges moves as itself,
+  as its DDL would run, refused where it doesn't own what changes (and a
+  writer branch's role as its base allows: see "Writers"); whether
+  row-level security refuses the rows is the mover's.  Owner-run
   statements, rows and checks use search_path pg_catalog, pg_temp
   (RestrictSearchPath()), as REFRESH does.
 - A hard reset, a table's checkout from a commit and a push's or forced
