@@ -438,6 +438,9 @@ tests += {
       't/483_minimal_reset_crash.pl',
       't/484_minimal_shrink_crash.pl',
       't/468_bmap_shared_redo_changes.pl',
+      't/465_bmap_preserve_waits.pl',
+      't/466_bmap_preserve_moved.pl',
+      't/467_bmap_preserve_skipped.pl',
     ],
   },
 }

@@ -98,6 +98,14 @@
  * exclusively (a change prepared under it held shared lets go and takes it
  * so to copy a path); a write looks its page up from the root page, never
  * the header, which the backend writing it out may hold exclusively.
+ * A relation's pages come before its map: preparing a page for a change
+ * (bmapprepareforchange()), or asking whether it is shared, reads the
+ * header and the map with the page's buffer locked, exclusively for a
+ * change, so nothing waits for a page's content lock while holding a map
+ * page of the relation.  A share or a snapshot, which reads the
+ * relation's own pages to log them with the header held exclusively, only
+ * tries their locks; it lets go of the header to wait for one
+ * (preserve_header_lock()).
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
  * four cases: a crash between a drop's commit and the records queuing what
@@ -5338,6 +5346,99 @@ block_list_add(BlockList *l, BlockNumber b)
 }
 
 /*
+ * A walk preserving a relation's own blocks (tree_preserve()).  It holds
+ * the relation's header exclusively, so it never waits for a page's content
+ * lock: a backend holding a page exclusively may be preparing it for a
+ * change, which reads the header (bmapprepareforchange()).  A page the walk
+ * can't lock at once is left 'busy', and the walk given up; its caller lets
+ * go of the header, waits for the page holding no map page, and walks again
+ * with the page locked (shared) in 'held' (preserve_header_lock()), let go
+ * of once the walk logs it.  'logged' has the physical blocks the walks
+ * logged, each with its logical block, which a walk again doesn't log
+ * again while the relation's map still names them so.  It is made only
+ * once a walk is given up, so a walk that isn't costs no memory for it:
+ * the first walk's are the relation's own blocks below the one it gave up
+ * on, as the map names them then, which a pass recording them
+ * ('record_below') finds before the header is let go.
+ */
+typedef struct PreserveWalk
+{
+	BlockList  *own;			/* the relation's own blocks, if collected */
+	BlockNumber busy;			/* the page the walk gave up on */
+	BlockNumber held_block;		/* the page locked before the walk, if any */
+	Buffer		held;
+	HTAB	   *logged;			/* PreserveLogged, by physical block */
+	BlockNumber record_below;	/* recording 'logged' up to it, if valid */
+	XLogRecPtr	began;			/* the WAL's insert position as this walk began */
+} PreserveWalk;
+
+typedef struct PreserveLogged
+{
+	BlockNumber phys;			/* hash key */
+	BlockNumber blkno;
+	XLogRecPtr	since;			/* logged by a walk begun here */
+} PreserveLogged;
+
+/*
+ * The LSN of page 'blkno' of 'rel', without its content lock (the walk's
+ * held one if it holds it): a pin, and the buffer header's.
+ */
+static XLogRecPtr
+preserve_page_lsn(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk)
+{
+	Buffer		buf;
+	XLogRecPtr	lsn;
+
+	if (walk->held_block == blkno)
+		return PageGetLSN(BufferGetPage(walk->held));
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	lsn = BufferGetLSNAtomic(buf);
+	ReleaseBuffer(buf);
+	return lsn;
+}
+
+/* let go of the page the walk holds, if it does */
+static void
+preserve_release_held(PreserveWalk *walk)
+{
+	if (!BlockNumberIsValid(walk->held_block))
+		return;
+	UnlockReleaseBuffer(walk->held);
+	walk->held_block = InvalidBlockNumber;
+}
+
+/*
+ * Copy page 'blkno' of 'rel' into 'dst', under its content lock: the one
+ * the walk holds (let go of then), or one taken without waiting.  False, the
+ * walk's 'busy' set, if it would have to wait.
+ */
+static bool
+preserve_read_page(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk,
+				   char *dst)
+{
+	Buffer		buf;
+
+	if (walk->held_block == blkno)
+	{
+		memcpy(dst, BufferGetPage(walk->held), BLCKSZ);
+		preserve_release_held(walk);
+		return true;
+	}
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	if (!ConditionalLockBufferShared(buf))
+	{
+		ReleaseBuffer(buf);
+		walk->busy = blkno;
+		return false;
+	}
+	memcpy(dst, BufferGetPage(buf), BLCKSZ);
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/*
  * Before a private block is shared, log its contents with its physical
  * address.  A base backup may have read the page store before our flush,
  * and the source's map after a later remap.  Redo then skips the source's
@@ -5356,25 +5457,68 @@ block_list_add(BlockList *l, BlockNumber b)
  * header exclusively and keeps its writers out, but has not locked the
  * destination map page.
  *
- * With 'own', the block is added to it whether logged or not: a page that
- * may be only in its buffer, to be written out (see bmap_snapshot_take()).
+ * With the walk's 'own', the block is added to it whether logged or not: a
+ * page that may be only in its buffer, to be written out (see
+ * bmap_snapshot_take()).
+ *
+ * The page is read under its content lock, the walk's held one or one
+ * taken only if that needn't wait (PreserveWalk): false, with the walk's
+ * 'busy' set to the page, if it would have to.  A block an earlier walk of
+ * the same share logged is not logged again while the same entry names it.
  */
-static void
+static bool
 preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
-					 BlockList *own)
+					 PreserveWalk *walk)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	PGIOAlignedBlock copy;
-	Buffer		buf;
+	PreserveLogged *logged;
+	bool		found;
 
-	if (own)
-		block_list_add(own, blkno);
+	/* (the walks' logical order: below the busy page, every block logged) */
+	if (BlockNumberIsValid(walk->record_below))
+	{
+		if (blkno >= walk->record_below)
+			return false;
+		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
+		logged->blkno = blkno;
+		logged->since = walk->began;
+		return true;
+	}
 
-	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno,
-								   RBM_NORMAL, NULL, true);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
-	UnlockReleaseBuffer(buf);
+	if (walk->own)
+		block_list_add(walk->own, blkno);
+
+	/*
+	 * Logged by an earlier walk, still named by the same entry, and not
+	 * changed since: not logged again.  Its image is in the WAL before the
+	 * share's record, and is the page as it is: the relation's writers are
+	 * kept out, and a change that reached the page in place since (a prune,
+	 * a SELECT FOR UPDATE's lock, a hint logged) set its LSN past the
+	 * walk's beginning, so the page is logged again, as redo of the share
+	 * takes the images for the pages as of the share and writes nothing
+	 * else to the blocks.  A change that moves the page (a copy, a
+	 * compaction's move) gives it another block, which is logged.  The
+	 * block can't have held another page meanwhile: the map or changes list
+	 * naming it held it all along.  So recovery, a standby or a base
+	 * backup's redo gets the block the copy shares from the earlier image
+	 * as from a new one.
+	 */
+	if (walk->logged)
+	{
+		logged = hash_search(walk->logged, &phys, HASH_FIND, NULL);
+		if (logged && logged->blkno == blkno &&
+			preserve_page_lsn(rel, blkno, walk) < logged->since)
+		{
+			if (walk->held_block == blkno)
+				preserve_release_held(walk);
+			return true;
+		}
+	}
+
+	INJECTION_POINT("bmap-preserve-page", NULL);
+	if (!preserve_read_page(rel, blkno, walk, copy.data))
+		return false;
 
 	XLogBeginInsert();
 	XLogRegisterData(&phys, sizeof(phys));
@@ -5382,24 +5526,34 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 					 REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, 1);
+
+	if (walk->logged)
+	{
+		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
+		logged->blkno = blkno;
+		logged->since = walk->began;
+	}
+	return true;
 }
 
 /*
  * Before a tree is shared, preserve (preserve_shared_page()) the blocks of
  * its own leaves, under its length: those of shared ones were preserved when
  * they came to be shared, and can't change in place since.  So a share that
- * follows another walks only what changed in between.  With 'own', the
- * blocks are collected into it too.  The header is held exclusively.
+ * follows another walks only what changed in between.  With the walk's
+ * 'own', the blocks are collected into it too.  The header is held
+ * exclusively.  False if the walk was given up on a busy page
+ * (PreserveWalk).
  *
  * 'ptr' is the relation's own node (tree_node_own()).  Its children's
  * counts are looked up together (lookup_refs()): a node copied for one
  * change has a child for each leaf under it, up to a node's fanout, and a
  * leaf an entry for each block, every one of which is asked about.
  */
-static void
+static bool
 tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 				   BlockNumber first, BlockNumber nblocks, uint32 epoch,
-				   BlockList *own)
+				   PreserveWalk *walk)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	BmapEntry  *entries;
@@ -5408,9 +5562,10 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 	uint8	   *counts;
 	uint32		nask = 0;
 	Buffer		buf;
+	bool		done = true;
 
 	if (first >= nblocks)
-		return;
+		return true;
 	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	buf = tree_read(rel, ptr->block, RBM_NORMAL);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -5444,7 +5599,7 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 		slot[nask++] = i;
 	}
 	lookup_refs(rel, ask, nask, counts);
-	for (uint32 k = 0, i = 0; i < BMAP_TREE_FANOUT; i++)
+	for (uint32 k = 0, i = 0; i < BMAP_TREE_FANOUT && done; i++)
 	{
 		uint64		child = (uint64) first + (level == 0 ? i :
 											   i * tree_span(level - 1));
@@ -5457,21 +5612,23 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 		if (held_elsewhere)
 			continue;
 		if (level == 0)
-			preserve_shared_page(src, (BlockNumber) child, entries[i].block,
-								 own);
+			done = preserve_shared_page(src, (BlockNumber) child,
+										entries[i].block, walk);
 		else
-			tree_preserve_node(src, &entries[i], level - 1,
-							   (BlockNumber) child, nblocks, epoch, own);
+			done = tree_preserve_node(src, &entries[i], level - 1,
+									  (BlockNumber) child, nblocks, epoch,
+									  walk);
 	}
 	pfree(counts);
 	pfree(slot);
 	pfree(ask);
 	pfree(entries);
+	return done;
 }
 
-static void
+static bool
 tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
-			  BlockList *own)
+			  PreserveWalk *walk)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	BmapRoot	root;
@@ -5486,11 +5643,93 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
 	for (int k = 0; k < BMAP_TREE_TOPS && first < nblocks; k++)
 	{
 		if (BlockNumberIsValid(root.top[k].block) &&
-			tree_node_own(rel, &root.top[k], epoch, true))
-			tree_preserve_node(src, &root.top[k], k, (BlockNumber) first,
-							   nblocks, epoch, own);
+			tree_node_own(rel, &root.top[k], epoch, true) &&
+			!tree_preserve_node(src, &root.top[k], k, (BlockNumber) first,
+								nblocks, epoch, walk))
+			return false;
 		first += tree_span(k);
 	}
+	return true;
+}
+
+/*
+ * The relation's header, locked exclusively, its own blocks preserved
+ * (tree_preserve()), and collected into 'own' if that is given.
+ *
+ * A walk given up on a busy page (PreserveWalk) lets go of the header,
+ * waits for the page's share lock holding no map page, and walks again with
+ * the page held until it is logged.  What may change while the header is let
+ * go: the caller keeps the relation's writers and VACUUM out, and a sweep's
+ * counting (the sweep lock, held), so only a change of no row or a row
+ * lock's (a prune, a SELECT FOR UPDATE's lock) prepares a page meanwhile,
+ * which may claim or copy it and change its entry and the counts; a
+ * compaction under way may move a page to another block; and another share,
+ * or a snapshot, may raise the epoch and make blocks shared.  The walk again
+ * starts from the header as it is then, its length and epoch, and so finds
+ * the blocks as they are mapped then, logging those not logged already
+ * (preserve_shared_page()).  A walk gives up only on a block it hasn't
+ * logged (one logged is skipped without its lock), and the next walk holds
+ * that page and logs it; so the walks given up are no more than the blocks
+ * logged, which are the relation's own pages and those that a copy or a
+ * compaction gave another block while the header was let go.  The walks
+ * end however many backends lock the pages meanwhile, each page logged
+ * once unless it moved, and only one page held at a time.
+ */
+static Buffer
+preserve_header_lock(SMgrRelation src, BlockList *own)
+{
+	RelFileLocator rel = src->smgr_rlocator.locator;
+	Buffer		headerbuf = map_read(rel, 0);
+	PreserveWalk walk = {0};
+
+	walk.own = own;
+	walk.held_block = InvalidBlockNumber;
+	walk.record_below = InvalidBlockNumber;
+	for (;;)
+	{
+		BmapHeader *header;
+		bool		done;
+
+		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel,
+				   BMAP_FORKNUM, 0);
+		header = PageGetBmapHeader(BufferGetPage(headerbuf));
+		if (own)
+			own->n = 0;
+		walk.busy = InvalidBlockNumber;
+		walk.began = GetXLogInsertRecPtr();
+		done = tree_preserve(src, header->nblocks, header->epoch, &walk);
+		/* (a page held that the walk found no longer the relation's own) */
+		preserve_release_held(&walk);
+		if (done)
+			break;
+
+		/* the first walk given up: the blocks it logged, recorded */
+		if (walk.logged == NULL)
+		{
+			HASHCTL		ctl;
+
+			ctl.keysize = sizeof(BlockNumber);
+			ctl.entrysize = sizeof(PreserveLogged);
+			ctl.hcxt = CurrentMemoryContext;
+			walk.logged = hash_create("bmap preserved blocks", 256, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+			walk.record_below = walk.busy;
+			(void) tree_preserve(src, header->nblocks, header->epoch, &walk);
+			walk.record_below = InvalidBlockNumber;
+		}
+
+		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
+		INJECTION_POINT("bmap-preserve-restart", NULL);
+		walk.held = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, walk.busy,
+											  RBM_NORMAL, NULL, true);
+		LockBuffer(walk.held, BUFFER_LOCK_SHARE);
+		walk.held_block = walk.busy;
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PRESERVE_WAITS, 1);
+	}
+	if (walk.logged)
+		hash_destroy(walk.logged);
+	return headerbuf;
 }
 
 /*
@@ -5824,15 +6063,13 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	create_map(dst);
 
-	/* src's header, held until the epochs are raised: no change meanwhile */
-	sheader = map_read(srel, 0);
-	LockBuffer(sheader, BUFFER_LOCK_EXCLUSIVE);
-	check_page(BufferGetPage(sheader), BMAP_PAGE_HEADER, srel, BMAP_FORKNUM, 0);
+	/*
+	 * src's header, held until the epochs are raised: no change meanwhile.
+	 * src's own blocks preserved, its subtrees a holder more.
+	 */
+	sheader = preserve_header_lock(src, &own);
 	nblocks = PageGetBmapHeader(BufferGetPage(sheader))->nblocks;
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
-
-	/* src's own blocks preserved, its subtrees a holder more */
-	tree_preserve(src, nblocks, epoch, &own);
 	if (own.n > 0)
 		store_flush_begin(srel);
 	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
@@ -6417,11 +6654,8 @@ snapshot_take_slot(SMgrRelation reln, BlockList *own)
 	refs_cover(rel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	headerbuf = map_read(rel, 0);
-	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	headerbuf = preserve_header_lock(reln, own);
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
-	tree_preserve(reln, header->nblocks, header->epoch, own);
 	if (own->n > 0)
 		store_flush_begin(rel);
 	INJECTION_POINT("bmap-snapshot-preserved", NULL);
@@ -12505,7 +12739,7 @@ bmap_redo(XLogReaderState *record)
 				 * the pointer to it names (redo_own_blocks()).
 				 *
 				 * With the own blocks logged as images just before the
-				 * record (at a WAL level for backups), they are still
+				 * record (as every share and snapshot logs them), they are still
 				 * written out: a page may have changed in place after its
 				 * image and before the record (a row lock, a prune), whose
 				 * redo went to the relation's buffer only.  Only the sync is
