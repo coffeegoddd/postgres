@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD03
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD04
 
 typedef struct PgStat_ArchiverStats
 {
@@ -438,6 +438,7 @@ typedef struct PgStat_StatDBEntry
 	PgStat_Counter conflict_snapshot;
 	PgStat_Counter conflict_logicalslot;
 	PgStat_Counter conflict_bufferpin;
+	PgStat_Counter conflict_chunk_store;
 	PgStat_Counter conflict_startup_deadlock;
 	PgStat_Counter temp_files;
 	PgStat_Counter temp_bytes;
