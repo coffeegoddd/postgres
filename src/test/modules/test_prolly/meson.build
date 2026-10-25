@@ -117,6 +117,7 @@ tests += {
       'violation_storage',
       'redefined_merges',
       'retyped_merges',
+      'merge_conversions',
       'matview_merges',
       'matview_status',
       'type_moves',
