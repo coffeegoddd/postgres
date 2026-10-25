@@ -423,6 +423,7 @@ tests += {
       't/426_autofold_trim_own_snapshot.pl',
       't/447_node_cache.pl',
       't/465_bmap_preserve_waits.pl',
+      't/466_bmap_preserve_moved.pl',
     ],
   },
 }
