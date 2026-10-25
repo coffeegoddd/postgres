@@ -549,8 +549,9 @@ END $$;
 NOTICE:  memory bounded: t
 SET dolt.transaction_commit = on;
 -- A small commit reads each node it needs once, however often it descends
--- it: the refs' root for each entry it gets and puts, the head's commit, the
--- root's and the table's upper nodes for each row's seek and then the
+-- it: the refs' root for each entry it gets and puts (its record of the
+-- relations it was made from, a new entry, among them), the head's commit,
+-- the root's and the table's upper nodes for each row's seek and then the
 -- apply, each level of which starts from the root.  Three rows of a table
 -- three levels high read about their paths, not a descent per use.
 CREATE TABLE tc.tall (id int PRIMARY KEY, v int, pad text);
@@ -572,11 +573,11 @@ SELECT pg_stat_force_next_flush();
 
 SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
   WHERE name = 'nodes_read' \gset
-SELECT CASE WHEN :nodes_read <= 25 THEN 'at most 25' ELSE :nodes_read::text END
+SELECT CASE WHEN :nodes_read <= 40 THEN 'at most 40' ELSE :nodes_read::text END
   AS nodes_read;
  nodes_read 
 ------------
- at most 25
+ at most 40
 (1 row)
 
 -- A hash that names a tree but no commit (here, a commit's root, of many

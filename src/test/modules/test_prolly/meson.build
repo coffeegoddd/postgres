@@ -228,6 +228,7 @@ tests += {
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',
+      'lineage_breaks',
       'role_makers',
       'writer_definitions',
     ],

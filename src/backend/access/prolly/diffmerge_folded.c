@@ -12195,6 +12195,52 @@ without_local(const Local *l, ProllyNodeRef *root)
 }
 
 /*
+ * Commit as refs' commit_with() does, the uncommitted changes l names (if
+ * any) told to the refs (prolly_commit_local_tables): the commit holds those
+ * tables as its first parent did, set aside or left out, so its record of
+ * the relations it was made from lists only those of the parent's class.
+ */
+static void
+commit_over_local(const Local *l, const char *message, const ProllyHash *parents,
+				  int nparents, const ProllyNodeRef *root, ProllyHash *commit_id)
+{
+	prolly_commit_local_tables = has_local_changes(l) ? l->tables : NIL;
+	PG_TRY();
+	{
+		PROLLY_CALL(components().refs, commit_with, message, parents, nparents,
+					root, commit_id);
+	}
+	PG_FINALLY();
+	{
+		prolly_commit_local_tables = NIL;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * folded_move_to() for a move of the branch's own (setting its uncommitted
+ * changes aside, or putting them back): what it makes is the branch's, not
+ * of the commits the merge, pick or revert around it takes versions from,
+ * so it runs without their provenance (prolly_move_provenance).
+ */
+static void
+own_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
+{
+	List	   *provenance = prolly_move_provenance;
+
+	prolly_move_provenance = NIL;
+	PG_TRY();
+	{
+		folded_move_to(target, folded);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_provenance = provenance;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Uncommitted changes a merge (or pick, or revert) changing definitions
  * goes ahead over: the branch moved to its head, writing only what they
  * changed, so the merge is made as over a clean working set and its
@@ -12203,7 +12249,7 @@ without_local(const Local *l, ProllyNodeRef *root)
 static void
 set_aside(Local *l)
 {
-	folded_move_to(&l->head, &l->working);
+	own_move_to(&l->head, &l->working);
 	l->aside = true;
 }
 
@@ -12366,7 +12412,7 @@ put_back(const Local *l, const char *what)
 
 	PG_TRY();
 	{
-		folded_move_to(&target, &merged);
+		own_move_to(&target, &merged);
 	}
 	PG_CATCH();
 	{
@@ -12719,8 +12765,8 @@ merge_held(const char *branch, const char *message, int flags,
 
 		if (has_local_changes(&local))
 			without_local(&local, &merged);
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 1,
-					has_local_changes(&local) ? &merged : NULL, commit_id);
+		commit_over_local(&local, message, parents, 1,
+						  has_local_changes(&local) ? &merged : NULL, commit_id);
 		put_back(&local, "merge");
 		return 0;
 	}
@@ -12730,10 +12776,10 @@ merge_held(const char *branch, const char *message, int flags,
 		ProllyNodeRef merged;
 
 		without_local(&local, &merged);
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, &merged, commit_id);
+		commit_over_local(&local, message, parents, 2, &merged, commit_id);
 	}
 	else
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
+		commit_over_local(&local, message, parents, 2, NULL, commit_id);
 	put_back(&local, "merge");
 	return 0;
 }
@@ -12798,17 +12844,15 @@ static void
 commit_one_parent(const char *message, const ProllyHash *head, const Local *l,
 				  ProllyHash *commit_id)
 {
-	ProllyDatabaseComponents dc = components();
-
 	if (has_local_changes(l))
 	{
 		ProllyNodeRef root;
 
 		without_local(l, &root);
-		PROLLY_CALL(dc.refs, commit_with, message, head, 1, &root, commit_id);
+		commit_over_local(l, message, head, 1, &root, commit_id);
 	}
 	else
-		PROLLY_CALL(dc.refs, commit_with, message, head, 1, NULL, commit_id);
+		commit_over_local(l, message, head, 1, NULL, commit_id);
 }
 
 /*

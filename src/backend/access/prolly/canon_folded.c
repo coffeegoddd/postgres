@@ -7953,6 +7953,104 @@ partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
 	}
 }
 
+List	   *prolly_move_provenance = NIL;
+
+/*
+ * A table a move makes a relation of again, or makes: its name, and the
+ * relation whose equivalence class (refs' relation_class()) the new one
+ * joins.
+ */
+typedef struct MoveClass
+{
+	char	   *name;
+	Oid			of;
+} MoveClass;
+
+/*
+ * The tables a move makes again (move_table()'s remade) are the same tables,
+ * in their old relations' classes; those it makes are, if a commit the
+ * move takes its versions from (prolly_move_provenance) was made from a
+ * relation of the name, in that one's.  Read before the move's statements.
+ */
+static List *
+move_classes_before(List *from, List *to, List *remade)
+{
+	ProllyDatabaseComponents dc;
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, relation_class))
+		return NIL;
+	foreach(lc, remade)
+	{
+		MoveClass  *mc;
+		Oid			relid;
+
+		if (find_item(to, 't', lfirst(lc)) == NULL)
+			continue;
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(lc), NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid))
+			continue;
+		mc = palloc(sizeof(MoveClass));
+		mc->name = lfirst(lc);
+		mc->of = relid;
+		out = lappend(out, mc);
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		ListCell   *pc;
+
+		if (t->kind != 't' || find_item(from, 't', t->name) != NULL)
+			continue;
+		foreach(pc, prolly_move_provenance)
+		{
+			List	   *relations;
+			ProllyCommitRelation *of = NULL;
+			ListCell   *rc;
+			MoveClass  *mc;
+
+			if (!PROLLY_HAS(dc.refs, commit_relations) ||
+				!PROLLY_CALL(dc.refs, commit_relations, lfirst(pc), &relations))
+				continue;
+			foreach(rc, relations)
+				if (strcmp(((ProllyCommitRelation *) lfirst(rc))->name, t->name) == 0)
+					of = lfirst(rc);
+			if (of == NULL)
+				continue;
+			mc = palloc(sizeof(MoveClass));
+			mc->name = t->name;
+			mc->of = of->relid;
+			out = lappend(out, mc);
+			break;
+		}
+	}
+	return out;
+}
+
+/* What move_classes_before() found, recorded of the relations made now. */
+static void
+move_classes_after(List *classes)
+{
+	ProllyDatabaseComponents dc;
+	ListCell   *lc;
+
+	prolly_database_components(&dc);
+	foreach(lc, classes)
+	{
+		MoveClass  *mc = lfirst(lc);
+		Oid			now = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mc->name, NULL)),
+										   NoLock, true);
+
+		if (OidIsValid(now) && now != mc->of &&
+			PROLLY_HAS(dc.refs, set_relation_class))
+			PROLLY_CALL(dc.refs, set_relation_class, now,
+						PROLLY_CALL(dc.refs, relation_class, mc->of));
+	}
+}
+
 /*
  * Whether move_table() makes a table again, its definition from as to has
  * it (both): a column added before a kept one, kept ones in another order,
@@ -10745,6 +10843,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	Oid			session_user = InvalidOid;
 	int			session_sec = 0;
 	List	   *remade = NIL;
+	List	   *classes;		/* MoveClass *: what the move makes again */
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
 	List	   *collation_drops = NIL;
@@ -10915,6 +11014,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
 			remade = lappend(remade, f->name);
 	}
+	classes = move_classes_before(from, to, remade);
 
 	/*
 	 * Tables whose columns change type in turn (type_moves()) are emptied
@@ -11403,6 +11503,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		rows(arg);
 		MemoryContextSwitchTo(spi);
 	}
+	move_classes_after(classes);
 	SPI_finish();
 	AtEOXact_GUC(true, save_nestlevel);
 	return;
