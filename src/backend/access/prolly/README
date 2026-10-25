@@ -404,7 +404,11 @@ for a key) is a value tree of its bytes.  A row's reference to a JSON
 tree records length 0, which no value tree out of line has.  A whole read
 lays the items out as jsonb lays a document out, a packed container's
 bytes copied as they are, checks the result as canonical jsonb bytes are
-checked, and converts it to the database's encoding.  Decoding a row
+checked, and converts it to the database's encoding; it holds the
+document's children as small records and their bytes in one arena, so it
+takes a bounded multiple of the document's size however many containers
+it has.  A tree may come from another server: every other reader checks
+a packed container's bytes before parsing them.  Decoding a row
 whose tree is in the database's store gives a hash pointer to it, so
 history (dolt_at(), snapshot mounts) and the rows a checkout, reset or merge
 writes back name the tree unread; dolt_history_table()'s composite rows

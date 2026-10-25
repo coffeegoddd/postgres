@@ -108,6 +108,13 @@ typedef struct ProllyJsonTreeRoutine
 #define PROLLY_JSONTREE_FIRST_CALLBACK build
 #define PROLLY_JSONTREE_LAST_CALLBACK diff_documents
 
+/*
+ * The memory this backend's last whole read of a tree took, its working
+ * memory and the document: "paths" bounds it by a multiple of the
+ * document's size.  For tests.
+ */
+extern PGDLLIMPORT Size prolly_jsontree_read_memory;
+
 static inline const ProllyJsonTreeRoutine *
 prolly_jsontree_lookup(const char *name)
 {

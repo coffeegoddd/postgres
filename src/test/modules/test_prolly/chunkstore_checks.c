@@ -49,6 +49,8 @@
 #include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 #include "miscadmin.h"
+#include "access/prolly_jsontree.h"
+#include "access/prolly_toast.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -2147,6 +2149,30 @@ test_chunk_declaring_tree(PG_FUNCTION_ARGS)
 		pfree(got.data);
 	}
 	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
+PG_FUNCTION_INFO_V1(test_json_tree_pointer);
+PG_FUNCTION_INFO_V1(test_json_read_memory);
+
+/*
+ * A hash pointer naming root as a JSON tree, as a row from another server
+ * would decode to: for trees made by hand.
+ */
+Datum
+test_json_tree_pointer(PG_FUNCTION_ARGS)
+{
+	ProllyNodeRef root;
+
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	PG_RETURN_POINTER(prolly_toast_json_pointer(&root, 0));
+}
+
+/* The memory this backend's last whole read of a JSON tree took. */
+Datum
+test_json_read_memory(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) prolly_jsontree_read_memory);
 }
 
 PG_FUNCTION_INFO_V1(test_chunk_put_leaf);

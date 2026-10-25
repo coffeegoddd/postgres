@@ -76,6 +76,8 @@
 #define VAL_NUMERIC		'd'
 #define VAL_CONTAINER	'j'
 
+Size		prolly_jsontree_read_memory = 0;
+
 /* (as a walk's pack_max) no container packed but the empty ones */
 #define PACK_NONE		(-1)
 
@@ -218,6 +220,28 @@ parse_steps(Steps *st, const uint8 *key, int len, int from)
 	}
 }
 
+/*
+ * Check a packed container's item value (its kind byte, then its jsonb
+ * bytes) is one: a container, not a scalar, short enough, and one jsonb
+ * builds (as canonical jsonb bytes are checked, nesting bounded by the
+ * stack).  Every reader parsing a packed container's bytes checks them so
+ * first: a tree may come from another server.  (A whole read copies them
+ * unparsed and checks the document it lays out.)
+ */
+static void
+check_packed(const uint8 *val, int len)
+{
+	if (len < 1 || val[0] != VAL_CONTAINER)
+		bad_tree("a container's item that isn't one");
+	if (len - 1 < (int) sizeof(uint32))
+		bad_tree("a container without a header");
+	if (len - 1 > PROLLY_JSON_PACK_MAX)
+		bad_tree("a container too long to be one item, as one");
+	if ((jb_u32((const char *) val + 1) & JB_FSCALAR) != 0)
+		bad_tree("a scalar as a container");
+	prolly_jsonb_check_utf8((const char *) val + 1, (uint32) (len - 1));
+}
+
 /* ------------------------------------------------------------------------
  * A document's items, in order
  * ------------------------------------------------------------------------
@@ -274,7 +298,7 @@ walk_value(Walk *w, const char *doc, uint32 from, uint32 stop, uint32 type)
 			{
 				uint32		at = INTALIGN(from);
 
-				if (stop < at + VARHDRSZ)
+				if (stop < at || stop - at < VARHDRSZ)
 					elog(ERROR, "a jsonb numeric cut short");
 				appendStringInfoChar(&w->val, VAL_NUMERIC);
 				appendBinaryStringInfo(&w->val, doc + at + VARHDRSZ,
@@ -293,7 +317,11 @@ walk_value(Walk *w, const char *doc, uint32 from, uint32 stop, uint32 type)
 		case JENTRY_ISCONTAINER:
 			{
 				uint32		at = INTALIGN(from);
-				uint32		count = jb_u32(doc + at) & JB_CMASK;
+				uint32		count;
+
+				if (stop < at || stop - at < sizeof(uint32))
+					elog(ERROR, "a jsonb container cut short");
+				count = jb_u32(doc + at) & JB_CMASK;
 
 				if ((w->pack_max != PACK_NONE && stop - at > (uint32) w->pack_max) ||
 					(w->pack_max == PACK_NONE && count > 0))
@@ -319,21 +347,27 @@ walk_container(Walk *w, const char *doc, uint32 at, uint32 end)
 	uint32		count = header & JB_CMASK;
 	bool		object = (header & JB_FOBJECT) != 0;
 	uint32		nchildren = object ? count * 2 : count;
-	uint32		data = at + sizeof(uint32) + nchildren * sizeof(JEntry);
-	uint32	   *ends = palloc(sizeof(uint32) * Max(nchildren, 1));
+	uint32		data;
+	uint32	   *ends;
 	uint32		prev = 0;
 	int			base = w->path.len;
 
+	/* (what is walked was checked, or built here: these only guard) */
 	check_stack_depth();
+	if ((uint64) nchildren * sizeof(JEntry) > end - at - sizeof(uint32))
+		elog(ERROR, "a jsonb container's entries run past it");
+	data = at + sizeof(uint32) + nchildren * sizeof(JEntry);
+	ends = palloc(sizeof(uint32) * Max(nchildren, 1));
 	for (uint32 i = 0; i < nchildren; i++)
 	{
 		JEntry		e = jb_u32(doc + at + sizeof(uint32) + i * sizeof(JEntry));
+		uint32		stop = JBE_HAS_OFF(e) ? JBE_OFFLENFLD(e) : prev + JBE_OFFLENFLD(e);
 
-		prev = JBE_HAS_OFF(e) ? JBE_OFFLENFLD(e) : prev + JBE_OFFLENFLD(e);
+		if (stop < prev || stop > end - data)
+			elog(ERROR, "a jsonb entry outside its container");
+		prev = stop;
 		ends[i] = prev;
 	}
-	if (data + prev > end)
-		elog(ERROR, "a jsonb container runs past its entry");
 	for (uint32 i = 0; i < count; i++)
 	{
 		uint32		vi = object ? count + i : i;
@@ -392,32 +426,47 @@ walk_jsonb(Walk *w, Jsonb *jb)
  * ------------------------------------------------------------------------
  */
 
-typedef struct LayFrame LayFrame;
-
 /*
- * A container being read: its children's keys and values, a child that is
- * a container of items of its own kept as its frame, so that each byte is
- * copied once into the frames and once into the document.
+ * A document being read is kept as its children's records, in arrays for
+ * the whole read, and their keys' and values' bytes, in one arena in the
+ * order the items come: so it takes a bounded multiple of the document's
+ * jsonb size, however many containers it has.  A container's children are
+ * a list of records; a child that is a container of items of its own
+ * names its container's record.
  */
-struct LayFrame
+typedef struct LayChild
 {
-	bool		object;
+	uint32		key_off;		/* in the arena */
+	uint32		key_len;
+	uint32		val_off;
+	uint32		val_len;		/* its bytes, without padding */
+	uint32		sub;			/* its container's record + 1, or 0 */
+	uint32		next;			/* the next child's record + 1, or 0 */
+	uint8		type;			/* its entry's type */
+} LayChild;
+
+typedef struct LayCont
+{
+	uint32		first;			/* its first child's record + 1, or 0 */
+	uint32		last;
 	uint32		n;				/* children */
-	uint32		max;
-	uint32	   *klen;			/* an object's keys' lengths */
-	uint32	   *vlen;			/* values' bytes, without padding */
-	uint8	   *vtype;			/* their entries' types */
-	LayFrame  **sub;			/* a child's frame, or NULL */
-	StringInfoData keys;
-	StringInfoData vals;		/* the values but the frames' */
+	uint32		keys;			/* an object's keys' bytes */
 	uint32		laid;			/* (closed) its length laid out */
-};
+	bool		object;
+} LayCont;
 
 typedef struct Assemble
 {
 	int			strip;			/* the bytes of the path read under */
 	bool		any;
-	LayFrame  **frames;			/* the open containers, outermost first */
+	StringInfoData arena;
+	LayChild   *children;
+	uint32		nchildren;
+	uint32		maxchildren;
+	LayCont    *conts;
+	uint32		nconts;
+	uint32		maxconts;
+	uint32	   *open;			/* the open containers' records, outermost first */
 	int			depth;
 	int			maxdepth;
 	Steps		steps;
@@ -430,69 +479,106 @@ assemble_init(Assemble *as, int strip)
 {
 	memset(as, 0, sizeof(*as));
 	as->strip = strip;
-	as->maxdepth = 8;
-	as->frames = palloc(sizeof(LayFrame *) * as->maxdepth);
+	initStringInfo(&as->arena);
+	as->maxchildren = 64;
+	as->children = palloc(sizeof(LayChild) * as->maxchildren);
+	as->maxconts = 16;
+	as->conts = palloc(sizeof(LayCont) * as->maxconts);
+	as->maxdepth = 16;
+	as->open = palloc(sizeof(uint32) * as->maxdepth);
 	steps_init(&as->steps);
 	steps_init(&as->prev_steps);
 	initStringInfo(&as->prev);
 }
 
-static LayFrame *
-frame_open(Assemble *as, uint8 tag)
+/*
+ * The least the document read so far takes as jsonb (its bytes, an entry
+ * for each child, a header for each container) can't pass what a jsonb
+ * container may hold: so a tree can't make a read hold more than a
+ * bounded multiple of that.
+ */
+static void
+assemble_bound(Assemble *as)
 {
-	LayFrame   *f = palloc0(sizeof(LayFrame));
+	uint64		least = (uint64) as->arena.len +
+		(uint64) as->nchildren * sizeof(JEntry) +
+		(uint64) as->nconts * sizeof(uint32);
 
+	if (least > JENTRY_OFFLENMASK)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("total size of jsonb container elements exceeds the maximum of %d bytes",
+						JENTRY_OFFLENMASK)));
+}
+
+/* A new container, open, its record's index. */
+static uint32
+cont_open(Assemble *as, uint8 tag)
+{
+	LayCont    *c;
+
+	if (as->nconts == as->maxconts)
+	{
+		as->maxconts *= 2;
+		as->conts = repalloc_huge(as->conts, sizeof(LayCont) * as->maxconts);
+	}
 	if (as->depth == as->maxdepth)
 	{
 		as->maxdepth *= 2;
-		as->frames = repalloc(as->frames, sizeof(LayFrame *) * as->maxdepth);
+		as->open = repalloc(as->open, sizeof(uint32) * as->maxdepth);
 	}
-	as->frames[as->depth++] = f;
-	f->max = 16;
-	f->klen = palloc(sizeof(uint32) * f->max);
-	f->vlen = palloc(sizeof(uint32) * f->max);
-	f->vtype = palloc(f->max);
-	f->sub = palloc(sizeof(LayFrame *) * f->max);
-	initStringInfo(&f->keys);
-	initStringInfo(&f->vals);
-	f->object = (tag == STEP_KEY);
-	return f;
+	c = &as->conts[as->nconts];
+	memset(c, 0, sizeof(*c));
+	c->object = (tag == STEP_KEY);
+	as->open[as->depth++] = as->nconts;
+	return as->nconts++;
 }
 
-/* A child of f at step s (of key), its value to come. */
-static void
-frame_child(LayFrame *f, const Step *s, const uint8 *key)
+/* A child of container ci at step s (of key), its value to come. */
+static LayChild *
+cont_child(Assemble *as, uint32 ci, const Step *s, const uint8 *key)
 {
-	if (f->object != (s->tag == STEP_KEY))
+	LayCont    *c = &as->conts[ci];
+	LayChild   *ch;
+
+	if (c->object != (s->tag == STEP_KEY))
 		bad_tree("an object's key and an array's index in one container");
-	if (!f->object && s->n != f->n)
+	if (!c->object && s->n != c->n)
 		bad_tree("an array's indexes with a gap");
-	if (f->n == f->max)
+	if (as->nchildren == as->maxchildren)
 	{
-		f->max *= 2;
-		f->klen = repalloc(f->klen, sizeof(uint32) * f->max);
-		f->vlen = repalloc(f->vlen, sizeof(uint32) * f->max);
-		f->vtype = repalloc(f->vtype, f->max);
-		f->sub = repalloc(f->sub, sizeof(LayFrame *) * f->max);
+		as->maxchildren *= 2;
+		as->children = repalloc_huge(as->children, sizeof(LayChild) * as->maxchildren);
 	}
-	if (f->object)
+	ch = &as->children[as->nchildren];
+	memset(ch, 0, sizeof(*ch));
+	if (c->object)
 	{
-		appendBinaryStringInfo(&f->keys, (const char *) key + s->off + STEP_HEADER,
+		ch->key_off = (uint32) as->arena.len;
+		ch->key_len = s->n;
+		appendBinaryStringInfo(&as->arena, (const char *) key + s->off + STEP_HEADER,
 							   (int) s->n);
-		f->klen[f->n] = s->n;
+		c->keys += s->n;
 	}
-	f->vlen[f->n] = 0;
-	f->vtype[f->n] = 0;
-	f->sub[f->n] = NULL;
-	f->n++;
+	if (c->last)
+		as->children[c->last - 1].next = as->nchildren + 1;
+	else
+		c->first = as->nchildren + 1;
+	c->last = ++as->nchildren;
+	c->n++;
+	assemble_bound(as);
+	return ch;
 }
 
-/* An item's value as f's last child. */
+/*
+ * An item's value as child ch's.  A packed container's bytes are copied
+ * unparsed here: the document read is checked whole once laid out.
+ */
 static void
-frame_value(LayFrame *f, const uint8 *val, int len)
+child_value(Assemble *as, LayChild *ch, const uint8 *val, int len)
 {
 	uint32		type;
-	int			start = f->vals.len;
+	int			start = as->arena.len;
 
 	if (len < 1)
 		bad_tree("an item without a value");
@@ -508,7 +594,7 @@ frame_value(LayFrame *f, const uint8 *val, int len)
 			break;
 		case VAL_STRING:
 			type = JENTRY_ISSTRING;
-			appendBinaryStringInfo(&f->vals, (const char *) val + 1, len - 1);
+			appendBinaryStringInfo(&as->arena, (const char *) val + 1, len - 1);
 			break;
 		case VAL_NUMERIC:
 			{
@@ -516,8 +602,8 @@ frame_value(LayFrame *f, const uint8 *val, int len)
 
 				type = JENTRY_ISNUMERIC;
 				SET_VARSIZE(hdr, VARHDRSZ + len - 1);
-				appendBinaryStringInfo(&f->vals, (const char *) hdr, VARHDRSZ);
-				appendBinaryStringInfo(&f->vals, (const char *) val + 1, len - 1);
+				appendBinaryStringInfo(&as->arena, (const char *) hdr, VARHDRSZ);
+				appendBinaryStringInfo(&as->arena, (const char *) val + 1, len - 1);
 				break;
 			}
 		case VAL_CONTAINER:
@@ -526,14 +612,16 @@ frame_value(LayFrame *f, const uint8 *val, int len)
 			if (len - 1 > PROLLY_JSON_PACK_MAX)
 				bad_tree("a container too long to be one item, as one");
 			type = JENTRY_ISCONTAINER;
-			appendBinaryStringInfo(&f->vals, (const char *) val + 1, len - 1);
+			appendBinaryStringInfo(&as->arena, (const char *) val + 1, len - 1);
 			break;
 		default:
 			bad_tree("a value of no kind");
 			type = 0;			/* keep compiler quiet */
 	}
-	f->vtype[f->n - 1] = (uint8) (type >> 28);
-	f->vlen[f->n - 1] = (uint32) (f->vals.len - start);
+	ch->type = (uint8) (type >> 28);
+	ch->val_off = (uint32) start;
+	ch->val_len = (uint32) (as->arena.len - start);
+	assemble_bound(as);
 }
 
 static void
@@ -553,63 +641,76 @@ padded(uint32 type)
 	return type == JENTRY_ISNUMERIC || type == JENTRY_ISCONTAINER;
 }
 
-/* f's length laid out, its frames' laid already. */
-static uint32
-frame_length(LayFrame *f)
+/* Child ch's length laid out, without the padding before it. */
+static inline uint32
+child_length(Assemble *as, const LayChild *ch)
 {
-	uint64		rel = sizeof(uint32) +
-		(uint64) (f->object ? f->n * 2 : f->n) * sizeof(JEntry) + f->keys.len;
+	return ch->sub ? as->conts[ch->sub - 1].laid : ch->val_len;
+}
 
-	for (uint32 i = 0; i < f->n; i++)
+/* Container ci's length laid out, its containers' laid already. */
+static uint32
+cont_length(Assemble *as, uint32 ci)
+{
+	LayCont    *c = &as->conts[ci];
+	uint64		rel = sizeof(uint32) +
+		(uint64) (c->object ? c->n * 2 : c->n) * sizeof(JEntry) + c->keys;
+
+	for (uint32 k = c->first; k; k = as->children[k - 1].next)
 	{
-		if (padded((uint32) f->vtype[i] << 28))
+		LayChild   *ch = &as->children[k - 1];
+
+		if (padded((uint32) ch->type << 28))
 			rel = INTALIGN(rel);
-		rel += f->sub[i] ? f->sub[i]->laid : f->vlen[i];
+		rel += child_length(as, ch);
 		offlen_check(rel);
 	}
 	return (uint32) rel;
 }
 
 /*
- * f laid out at the end of dst, as convertJsonbObject() and
+ * Container ci laid out at the end of dst, as convertJsonbObject() and
  * convertJsonbArray() lay a container out (the padding before it, which is
  * its parent's, left out).  dst has room for it.
  */
 static void
-frame_layout(LayFrame *f, StringInfo dst)
+cont_layout(Assemble *as, uint32 ci, StringInfo dst)
 {
+	LayCont    *c = &as->conts[ci];
 	int			start = dst->len;
-	uint32		header = f->n | (f->object ? JB_FOBJECT : JB_FARRAY);
-	uint32		nentries = f->object ? f->n * 2 : f->n;
+	uint32		header = c->n | (c->object ? JB_FOBJECT : JB_FARRAY);
+	uint32		nentries = c->object ? c->n * 2 : c->n;
 	char	   *entries;
 	uint32		total = 0;
-	uint32		voff = 0;
+	uint32		i;
 
-	Assert(dst->maxlen - dst->len > (int) f->laid);
+	check_stack_depth();
+	Assert(dst->maxlen - dst->len > (int) c->laid);
 	memcpy(dst->data + dst->len, &header, sizeof(header));
 	dst->len += sizeof(header);
 	entries = dst->data + dst->len;
 	dst->len += nentries * sizeof(JEntry);
 
-	if (f->object)
+	i = 0;
+	for (uint32 k = c->first; c->object && k; k = as->children[k - 1].next, i++)
 	{
-		memcpy(dst->data + dst->len, f->keys.data, f->keys.len);
-		dst->len += f->keys.len;
-	}
-	for (uint32 i = 0; f->object && i < f->n; i++)
-	{
+		LayChild   *ch = &as->children[k - 1];
 		JEntry		meta;
 
-		total += f->klen[i];
+		memcpy(dst->data + dst->len, as->arena.data + ch->key_off, ch->key_len);
+		dst->len += ch->key_len;
+		total += ch->key_len;
 		meta = JENTRY_ISSTRING | ((i % JB_OFFSET_STRIDE) == 0 ?
-								  (total | JENTRY_HAS_OFF) : f->klen[i]);
+								  (total | JENTRY_HAS_OFF) : ch->key_len);
 		memcpy(entries + i * sizeof(JEntry), &meta, sizeof(meta));
 	}
-	for (uint32 i = 0; i < f->n; i++)
+	i = 0;
+	for (uint32 k = c->first; k; k = as->children[k - 1].next, i++)
 	{
-		uint32		type = (uint32) f->vtype[i] << 28;
+		LayChild   *ch = &as->children[k - 1];
+		uint32		type = (uint32) ch->type << 28;
 		uint32		len = 0;
-		uint32		index = f->object ? f->n + i : i;
+		uint32		index = c->object ? c->n + i : i;
 		JEntry		meta;
 
 		if (padded(type))
@@ -621,39 +722,36 @@ frame_layout(LayFrame *f, StringInfo dst)
 			dst->len += pad;
 			len = pad;
 		}
-		if (f->sub[i])
-		{
-			frame_layout(f->sub[i], dst);
-			len += f->sub[i]->laid;
-		}
+		if (ch->sub)
+			cont_layout(as, ch->sub - 1, dst);
 		else
 		{
-			memcpy(dst->data + dst->len, f->vals.data + voff, f->vlen[i]);
-			dst->len += f->vlen[i];
-			voff += f->vlen[i];
-			len += f->vlen[i];
+			memcpy(dst->data + dst->len, as->arena.data + ch->val_off, ch->val_len);
+			dst->len += ch->val_len;
 		}
+		len += child_length(as, ch);
 		total += len;
 		meta = type | ((index % JB_OFFSET_STRIDE) == 0 ?
 					   (total | JENTRY_HAS_OFF) : len);
 		memcpy(entries + index * sizeof(JEntry), &meta, sizeof(meta));
 	}
-	Assert((uint32) (dst->len - start) == f->laid);
+	Assert((uint32) (dst->len - start) == c->laid);
 	dst->data[dst->len] = '\0';
 }
 
 /* The innermost open container closed, its parent's last child. */
 static void
-frame_close(Assemble *as, bool checked)
+cont_close(Assemble *as, bool checked)
 {
-	LayFrame   *f = as->frames[--as->depth];
-	LayFrame   *parent = as->frames[as->depth - 1];
+	uint32		ci = as->open[--as->depth];
+	LayCont    *parent = &as->conts[as->open[as->depth - 1]];
+	LayChild   *ch = &as->children[parent->last - 1];
 
-	f->laid = frame_length(f);
-	if (checked && f->laid <= PROLLY_JSON_PACK_MAX)
+	as->conts[ci].laid = cont_length(as, ci);
+	if (checked && as->conts[ci].laid <= PROLLY_JSON_PACK_MAX)
 		bad_tree("a container short enough to be one item, as items");
-	parent->vtype[parent->n - 1] = (uint8) (JENTRY_ISCONTAINER >> 28);
-	parent->sub[parent->n - 1] = f;
+	ch->type = (uint8) (JENTRY_ISCONTAINER >> 28);
+	ch->sub = ci + 1;
 }
 
 static void
@@ -685,21 +783,22 @@ assemble_add(Assemble *as, const uint8 *key, int keylen, const uint8 *val,
 			bad_tree("an item under another");
 		keep = Min(common, pv->n - 1) + 1;
 		while (as->depth > keep)
-			frame_close(as, true);
+			cont_close(as, true);
 	}
 	else
 	{
 		as->any = true;
-		frame_open(as, st->s[0].tag);
+		cont_open(as, st->s[0].tag);
 	}
 
 	for (int i = keep - 1; i < st->n; i++)
 	{
-		frame_child(as->frames[i], &st->s[i], key);
+		LayChild   *ch = cont_child(as, as->open[i], &st->s[i], key);
+
 		if (i < st->n - 1)
-			frame_open(as, st->s[i + 1].tag);
+			cont_open(as, st->s[i + 1].tag);
 		else
-			frame_value(as->frames[i], val, vallen);
+			child_value(as, ch, val, vallen);
 	}
 
 	resetStringInfo(&as->prev);
@@ -719,22 +818,22 @@ assemble_finish(Assemble *as, MemoryContext cxt, uint32 limit, bool checked)
 {
 	StringInfoData out;
 	MemoryContext old;
-	LayFrame   *root;
+	LayCont    *root;
 	Jsonb	   *jb;
 
 	if (!as->any)
 		return NULL;
 	while (as->depth > 1)
-		frame_close(as, checked);
-	root = as->frames[0];
-	root->laid = frame_length(root);
+		cont_close(as, checked);
+	root = &as->conts[as->open[0]];
+	root->laid = cont_length(as, as->open[0]);
 	if (limit > 0 && root->laid > limit)
 		return NULL;
 	old = MemoryContextSwitchTo(cxt);
 	initStringInfoExt(&out, VARHDRSZ + root->laid + 1);
 	MemoryContextSwitchTo(old);
 	out.len = VARHDRSZ;
-	frame_layout(root, &out);
+	cont_layout(as, as->open[0], &out);
 	jb = (Jsonb *) out.data;
 	SET_VARSIZE(jb, out.len);
 	return jb;
@@ -754,11 +853,12 @@ value_doc(const uint8 *val, int len)
 	{
 		case VAL_CONTAINER:
 			{
-				Jsonb	   *jb = palloc(VARHDRSZ + len - 1);
+				Jsonb	   *jb;
 
+				check_packed(val, len);
+				jb = palloc(VARHDRSZ + len - 1);
 				SET_VARSIZE(jb, VARHDRSZ + len - 1);
 				memcpy(VARDATA(jb), val + 1, len - 1);
-				prolly_jsonb_check_utf8(VARDATA(jb), len - 1);
 				return prolly_jsonb_from_utf8(jb);
 			}
 		case VAL_NULL:
@@ -881,6 +981,8 @@ read_under(ProllyTreeCursor *c, const char *prefix, int len, bool document)
 		CHECK_FOR_INTERRUPTS();
 	}
 	result = assemble_finish(&as, caller, 0, true);
+	prolly_jsontree_read_memory = MemoryContextMemAllocated(cxt, true) +
+		(result ? VARSIZE(result) : 0);
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(cxt);
 	if (result == NULL)
@@ -1584,7 +1686,11 @@ report_scalars(DiffState *ds, const KeyList *a, const KeyList *b)
 static void
 item_scalars(const ProllyKey *key, const ProllyValue *v, KeyList *kl)
 {
-	if (v->len > 1 && v->data[0] == VAL_CONTAINER &&
+	if (v->len < 1)
+		bad_tree("an item without a value");
+	if (v->data[0] == VAL_CONTAINER)
+		check_packed(v->data, (int) v->len);
+	if (v->data[0] == VAL_CONTAINER &&
 		(jb_u32((const char *) v->data + 1) & JB_CMASK) > 0)
 	{
 		Walk		w;

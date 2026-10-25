@@ -226,6 +226,29 @@ SELECT length(dolt_commit('--allow-empty', '-Am', 'built whole')::text) > 0 AS c
 SELECT prolly_root_hash('built') = prolly_root_hash(:'c1') AS same_root;
 SELECT dolt_checkout('main');
 
+-- A tree may come from another server, so its packed containers' bytes
+-- are checked before anything parses them: an error, not a crash.  (Leaves
+-- made by hand: a packed array whose header claims a million children in
+-- four bytes, one without a header, and a null to diff against.)
+SELECT test_chunk_put_leaf(ARRAY['\x6a0000104001000000'::bytea]) AS bad \gset
+SELECT test_chunk_put_leaf(ARRAY['\x6a'::bytea]) AS headless \gset
+SELECT test_chunk_put_leaf(ARRAY['\x6e'::bytea]) AS good \gset
+SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'good'), test_json_tree_pointer(:'bad'));
+SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'bad'), test_json_tree_pointer(:'good'));
+SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'good'), test_json_tree_pointer(:'headless'));
+SELECT test_json_tree_pointer(:'bad')::text;
+
+-- A whole read takes a bounded multiple of the document's jsonb size,
+-- however many containers it has: here 50 paths 1000 arrays deep.
+CREATE TABLE sj.deep (id int PRIMARY KEY, j jsonb);
+INSERT INTO sj.deep SELECT 1, ('[' || string_agg(repeat('[', 1000) || g || repeat(']', 1000), ',')
+	|| ']')::jsonb FROM generate_series(1, 50) g;
+SELECT (test_toast_pointer(j)).form AS form, j = j::text::jsonb AS same FROM sj.deep;
+SELECT pg_column_size(j::text::jsonb) AS doc_size FROM sj.deep \gset
+SELECT jsonb_typeof(j) FROM sj.deep;
+SELECT test_json_read_memory() < 20 * :doc_size AS bounded;
+DROP TABLE sj.deep;
+
 -- A document that can't be a tree (a scalar) is its bytes, as a value
 -- tree; the functions read it whole, with the same results.
 SELECT (test_toast_pointer(j)).form AS form, prolly_jsonb_get(j, '{}') = j AS whole_get,
