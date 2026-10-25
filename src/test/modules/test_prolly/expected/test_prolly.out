@@ -56,7 +56,7 @@ FROM prolly_implementations();
  move_planner  | stub         |       0 |              0
  matcache      | branches     |       1 |              1
  matcache      | stub         |       0 |              0
- json_tree     | paths        |       1 |              1
+ json_tree     | paths        |       1 |              2
  json_tree     | stub         |       0 |              0
 (49 rows)
 
