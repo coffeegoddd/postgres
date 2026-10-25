@@ -1667,6 +1667,23 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 		db->names = lappend(db->names, pstrdup(name));
 }
 
+/*
+ * add_detached() each branch named with prefix, and with prefix2 (NULL:
+ * none): those alone, if the refs can visit branches by their names, else
+ * every branch.
+ */
+static void
+visit_hidden(const char *prefix, const char *prefix2, DetachedBranches *db)
+{
+	if (!PROLLY_HAS(refs(), branches_named))
+	{
+		PROLLY_CALL(refs(), branches, add_detached, db);
+		return;
+	}
+	PROLLY_CALL(refs(), branches_named, prefix, add_detached, db);
+	if (prefix2 != NULL)
+		PROLLY_CALL(refs(), branches_named, prefix2, add_detached, db);
+}
 
 /* What a sweep deletes its candidates with (sweep_one()). */
 typedef struct Sweep
@@ -1702,7 +1719,7 @@ sweep_one(const char *name, void *arg)
 	{
 		PROLLY_CALL(refs(), lock);
 		AcceptInvalidationMessages();
-		PROLLY_CALL(refs(), branches_named, name, add_detached, &still);
+		visit_hidden(name, NULL, &still);
 		if (still.found)
 		{
 			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
@@ -1766,8 +1783,7 @@ sweep_detached(char *current, bool kept_only)
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
 	/* (only hidden branches are candidates: those named so are read) */
-	PROLLY_CALL(refs(), branches_named, PROLLY_DETACHED_PREFIX, add_detached, &db);
-	PROLLY_CALL(refs(), branches_named, PROLLY_WRITER_PREFIX, add_detached, &db);
+	visit_hidden(PROLLY_DETACHED_PREFIX, PROLLY_WRITER_PREFIX, &db);
 	if (db.names == NIL)
 		return;
 	XactReadOnly = false;

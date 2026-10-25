@@ -1643,32 +1643,24 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	pfree(v.data);
 }
 
-typedef struct FindBranch
-{
-	const char *name;
-	Oid			branch;
-} FindBranch;
-
-static void
-find_branch(const char *name, Oid branch, void *arg)
-{
-	FindBranch *fb = arg;
-
-	if (strcmp(name, fb->name) == 0)
-		fb->branch = branch;
-}
-
 /*
- * The id of the branch called name; InvalidOid if there's none.  (Of the
- * branches named with name: the work is in those.)
+ * The id of the branch called name; InvalidOid if there's none (its
+ * pg_branch row found by its name, as the session sees the catalog).
  */
 static Oid
 branch_oid(const char *name)
 {
-	FindBranch	fb = {name, InvalidOid};
+	HeapTuple	tup;
+	Oid			oid;
 
-	branch_ops()->branches_named(name, find_branch, &fb);
-	return fb.branch;
+	if (strlen(name) >= NAMEDATALEN)
+		return InvalidOid;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	oid = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+	return oid;
 }
 
 /*
