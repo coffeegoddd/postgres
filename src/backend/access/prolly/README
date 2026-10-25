@@ -176,7 +176,20 @@ same settings, with search_path pg_catalog (prolly_datum_fix_text_settings(),
 at the describer's own GUC nest level), so a constant in a default, a
 CHECK, a generated column, an index's expression, a view or a policy
 prints alike in any session, and a move runs the descriptions it makes
-the definitions again from under them too (since folded format 21).
+the definitions again from under them too (since folded format 21).  A
+merge (a cherry-pick, a revert) converts the values it reads across a
+column's change of type, by the column's cast or as the value's text
+form, under the same fixed settings,
+and lists its conflicts so too: the same merge makes the same rows and the
+same commit in any session.  The statements a merge replays to make the
+branch's definitions the merged ones (an ALTER TABLE ... TYPE's USING, an
+added column's default, the CHECKs the rows are tested against) run under
+them as well, so a merge succeeds or fails alike in any session; only its
+materialized views are refreshed under the session's.  A side's own ALTER
+TABLE ... TYPE converts under that session's settings, so where a side's
+ALTER ran under others, a value it wrote can differ from the one the merge
+makes of base's (a timestamptz made text under TimeZone Asia/Tokyo, which
+the merge reads in UTC).
 
 
 Extension ordering and history compatibility
