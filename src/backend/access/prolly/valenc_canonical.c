@@ -670,6 +670,7 @@ decode_value(ProllyValueEncoder *enc, int i, const char *p, uint64 len,
 			if (PROLLY_CALL(tenv->chunk_store, has, tenv->chunks, &root))
 				return PointerGetDatum(prolly_toast_json_pointer(&jroot, 0));
 		}
+		INJECTION_POINT("prolly-value-read", NULL);
 		pgstat_count_prolly(PGSTAT_PROLLY_VALUES_READ, 1);
 		return JsonbPGetDatum(PROLLY_CALL(json_tree(), read, enc->values->env,
 										  &jroot));
