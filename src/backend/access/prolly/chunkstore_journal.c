@@ -1731,7 +1731,16 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 		return;
 
 	if (standby)
+	{
 		keep_held(s, js, t);
+
+		/*
+		 * (read again once noted: a collection begins only after recovery
+		 * has ended, so either it sees this transaction noted, or this
+		 * sees recovery over and adds the chunk to its keep set)
+		 */
+		recovery = RecoveryInProgress();
+	}
 	if (!recovery)
 	{
 		jindex_append_lock(s->ix, false);
@@ -1770,8 +1779,11 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
  * local id noted, for a swap's replay to resolve a recovery conflict with
  * before the store stops naming what it may read, and for a collection
  * after a promotion to wait for.  Not while a swap of the store is being
- * replayed: the conflict was resolved with the holders noted before, so
- * this one waits for the swap and then finds whether its chunk survived.
+ * replayed: the conflict is being resolved with the holders noted before,
+ * so a transaction not among them waits for the swap and then finds
+ * whether its chunk survived.  One among them doesn't wait (the replay
+ * waits for it): it is cancelled, or ends, before the swap stops naming
+ * what it keeps now.
  */
 static void
 keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t)
@@ -1781,7 +1793,8 @@ keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t)
 		bool		replaying;
 
 		SpinLockAcquire(&js->mutex);
-		replaying = js->swap_dboid == s->dboid && js->swap_spcoid == s->spcoid;
+		replaying = js->swap_dboid == s->dboid &&
+			js->swap_spcoid == s->spcoid && t->held != MyProc->vxid.lxid;
 		if (!replaying && t->held != MyProc->vxid.lxid)
 		{
 			t->dboid = s->dboid;

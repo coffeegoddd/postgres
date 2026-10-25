@@ -119,8 +119,9 @@
  *   holding pointers instead, and the replay of a swap of its store
  *   resolves a recovery conflict with it (cancels it, after
  *   max_standby_streaming_delay) before the replayed manifest stops naming
- *   what it may hold; a keep() during that replay waits for it and then
- *   fails if the chunk is gone.  One begun on a standby and running at its
+ *   what it may hold; a keep() during that replay by a transaction not
+ *   noted before it waits for it and then fails if the chunk is gone (one
+ *   noted goes on: the replay waits for it).  One begun on a standby and running at its
  *   promotion stays noted, and gc_new() waits for it, too.
  * - A collection never waits for a prepared transaction, which may stay
  *   for days: gc_new() keeps as roots the chunks one appended to the

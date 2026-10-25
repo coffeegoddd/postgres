@@ -414,6 +414,7 @@ tests += {
       't/376_role_maker_races.pl',
       't/410_standby_history_reads.pl',
       't/411_standby_gc_pointers.pl',
+      't/412_standby_holder_keeps.pl',
     ],
   },
 }

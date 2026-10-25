@@ -1200,6 +1200,9 @@ PG_STAT_GET_DBENTRY_INT64(xact_rollback)
 /* pg_stat_get_db_conflict_logicalslot */
 PG_STAT_GET_DBENTRY_INT64(conflict_logicalslot)
 
+/* pg_stat_get_db_conflict_chunk_store */
+PG_STAT_GET_DBENTRY_INT64(conflict_chunk_store)
+
 Datum
 pg_stat_get_db_stat_reset_time(PG_FUNCTION_ARGS)
 {
@@ -1234,6 +1237,7 @@ pg_stat_get_db_conflict_all(PG_FUNCTION_ARGS)
 						  dbentry->conflict_snapshot +
 						  dbentry->conflict_logicalslot +
 						  dbentry->conflict_bufferpin +
+						  dbentry->conflict_chunk_store +
 						  dbentry->conflict_startup_deadlock);
 
 	PG_RETURN_INT64(result);

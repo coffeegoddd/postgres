@@ -97,6 +97,11 @@ my $log = slurp_file($standby->logfile, $offset);
 like($log, qr/FATAL:  40001: terminating connection due to conflict with recovery/,
 	'the standby cursor is cancelled as a recovery conflict at the swap');
 unlike($c->{stderr}, qr/tree node missing/, 'not left to find its chunks missing');
+like($log, qr/DETAIL:  User query might have needed chunks that a chunk store collection must remove/,
+	'a conflict on the chunk store');
+ok($standby->poll_query_until('postgres', q{SELECT confl_chunk_store > 0 AND confl_snapshot = 0
+	FROM pg_stat_database_conflicts WHERE datname = 'postgres'}),
+	'counted as one, not as a snapshot conflict');
 eval { $c->quit; };
 unlike(slurp_file($standby->logfile), qr/tree node missing/,
 	'no standby read found a chunk missing');

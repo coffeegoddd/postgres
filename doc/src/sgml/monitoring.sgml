@@ -4478,6 +4478,17 @@ description | Waiting for a newly initialized WAL file to reach durable storage
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>confl_chunk_store</structfield> <type>bigint</type>
+      </para>
+      <para>
+       Number of queries in this database that have been canceled because a
+       collection of the database's prolly chunk store, replayed from the
+       primary, stops naming files or chunks they may read
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>stats_reset</structfield> <type>timestamp with time zone</type>
       </para>
       <para>

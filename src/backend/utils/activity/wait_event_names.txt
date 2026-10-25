@@ -153,6 +153,7 @@ PROC_SIGNAL_BARRIER	"Waiting for a barrier event to be processed by all backends
 PROMOTE	"Waiting for standby promotion."
 RECOVERY_CONFLICT_SNAPSHOT	"Waiting for recovery conflict resolution for a vacuum cleanup."
 RECOVERY_CONFLICT_TABLESPACE	"Waiting for recovery conflict resolution for dropping a tablespace."
+RECOVERY_CONFLICT_CHUNK_STORE	"Waiting for recovery conflict resolution for a chunk store collection."
 RECOVERY_END_COMMAND	"Waiting for <xref linkend="guc-recovery-end-command"/> to complete."
 RECOVERY_PAUSE	"Waiting for recovery to be resumed."
 REPACK_WORKER_EXPORT	"Waiting for decoding worker to export a new output file."
