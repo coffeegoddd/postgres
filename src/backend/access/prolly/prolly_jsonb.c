@@ -17,8 +17,8 @@
  *									jsonb_set(doc, path, value, create)
  *	prolly_jsonb_diff(a, b)			each scalar path whose value differs
  *
- * jsonb's own ->, ->>, #>, #>>, ? and jsonb_set() take a tree's path the
- * same way, through prolly_jsonb_tree_get() and prolly_jsonb_tree_set()
+ * jsonb's own operators and functions take a tree's path the same way,
+ * through prolly_jsonb_tree_get(), _exists(), _set() and _edit()
  * (prolly_jsonb.h), so prolly_jsonb_set() is jsonb_set() itself.
  *
  * An edit on a JSON tree returns a hash pointer to the new tree, which a
@@ -141,6 +141,76 @@ prolly_jsonb_tree_get(Datum doc, ProllyJsonbKind kind, char **path,
 					   npath, found);
 }
 
+/*
+ * An edit puts the new tree's nodes in the chunk store as the top
+ * transaction's, so it is taken only where they outlive the result: not in
+ * a parallel operation (a worker's chunks are its own, lost when it exits,
+ * and it can take no transaction ID), nor in a subtransaction (an aborted
+ * one's chunks go with it, while the result may live on in a variable),
+ * nor where nothing may be written (a read-only transaction, recovery).
+ */
+static bool
+edit_allowed(void)
+{
+	return !IsInParallelMode() && GetCurrentTransactionNestLevel() <= 1 &&
+		!XactReadOnly && !RecoveryInProgress();
+}
+
+/* An edit's result as the caller returns it. */
+static Datum
+edited(Datum doc, const ProllyNodeRef *root, Size rawsize,
+	   const ProllyNodeRef *new_root, int64 delta, Jsonb *whole)
+{
+	/* a document too short to be a tree is itself */
+	if (whole != NULL)
+		return JsonbPGetDatum(whole);
+	if (new_root->hash.len == root->hash.len &&
+		memcmp(new_root->hash.bytes, root->hash.bytes, root->hash.len) == 0)
+		return doc;
+	return PointerGetDatum(prolly_toast_json_pointer(new_root,
+													 (Size) Max((int64) rawsize + delta,
+																VARHDRSZ + 1)));
+}
+
+bool
+prolly_jsonb_tree_exists(Datum doc, char **keys, int nkeys, bool all,
+						 bool *result)
+{
+	ProllyNodeRef root;
+	Size		rawsize;
+
+	if (!datum_tree(doc, &root, &rawsize))
+		return false;
+	*result = PROLLY_CALL(json_tree(), exists, prolly_toast_env(), &root,
+						  keys, nkeys, all);
+	return true;
+}
+
+bool
+prolly_jsonb_tree_edit(Datum doc, char **path, int npath, ProllyJsonEdit edit,
+					   void *arg, Datum *result)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+	Size		rawsize;
+	int64		delta;
+	Jsonb	   *whole;
+
+	if (!edit_allowed() || !datum_tree(doc, &root, &rawsize))
+		return false;
+	if (!PROLLY_CALL(json_tree(), edit, prolly_toast_env(), &root, path,
+					 npath, edit, arg, &new_root, &delta, &whole))
+		return false;
+	*result = edited(doc, &root, rawsize, &new_root, delta, whole);
+	return true;
+}
+
+bool
+prolly_jsonb_path_elements(ArrayType *path, char ***elems, int *n)
+{
+	return ARR_NDIM(path) <= 1 && path_elements(path, elems, n);
+}
+
 bool
 prolly_jsonb_tree_set(Datum doc, ArrayType *patharr, Jsonb *value,
 					  bool create, Datum *result)
@@ -154,34 +224,17 @@ prolly_jsonb_tree_set(Datum doc, ArrayType *patharr, Jsonb *value,
 	Jsonb	   *whole;
 
 	/*
-	 * An edit puts the new tree's nodes in the chunk store as the top
-	 * transaction's, so it is taken only where they outlive the result:
-	 * not in a parallel operation (a worker's chunks are its own, lost
-	 * when it exits, and it can take no transaction ID), nor in a
-	 * subtransaction (an aborted one's chunks go with it, while the
-	 * result may live on in a variable), nor where nothing may be written
-	 * (a read-only transaction, recovery).  A path of more than one
-	 * dimension, or with a NULL step, is an error.
+	 * (edit_allowed(); a path of more than one dimension, or with a NULL
+	 * step, is an error)
 	 */
-	if (IsInParallelMode() || GetCurrentTransactionNestLevel() > 1 ||
-		XactReadOnly || RecoveryInProgress() ||
-		ARR_NDIM(patharr) > 1 ||
+	if (!edit_allowed() || ARR_NDIM(patharr) > 1 ||
 		!datum_tree(doc, &root, &rawsize) ||
 		!path_elements(patharr, &path, &npath))
 		return false;
 	if (!PROLLY_CALL(json_tree(), set, prolly_toast_env(), &root, path,
 					 npath, value, create, &new_root, &delta, &whole))
 		return false;
-	/* a document too short to be a tree is itself */
-	if (whole != NULL)
-		*result = JsonbPGetDatum(whole);
-	else if (new_root.hash.len == root.hash.len &&
-			 memcmp(new_root.hash.bytes, root.hash.bytes, root.hash.len) == 0)
-		*result = doc;
-	else
-		*result = PointerGetDatum(prolly_toast_json_pointer(&new_root,
-															(Size) Max((int64) rawsize + delta,
-																	   VARHDRSZ + 1)));
+	*result = edited(doc, &root, rawsize, &new_root, delta, whole);
 	return true;
 }
 

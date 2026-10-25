@@ -279,7 +279,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  json_tree     | paths          | identity                       | pass
  json_tree     | paths          | complete                       | pass
  json_tree     | stub           | identity                       | pass
- json_tree     | stub           | complete                       | not implemented (7 of 7 callbacks missing)
+ json_tree     | stub           | complete                       | not implemented (9 of 9 callbacks missing)
  commit_cache  | shared         | identity                       | pass
  commit_cache  | shared         | complete                       | pass
  commit_cache  | stub           | identity                       | pass

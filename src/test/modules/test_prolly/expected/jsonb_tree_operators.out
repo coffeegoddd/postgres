@@ -247,7 +247,7 @@ BEGIN
 		SELECT prolly_jsonb_tree_root(j) INTO r1 FROM vt.docs WHERE id = e.id;
 		SELECT prolly_jsonb_tree_root(j) INTO r2 FROM vt.docs WHERE id = 100;
 		INSERT INTO edit_results
-		SELECT k, d.j = h.j, r1 IS NOT DISTINCT FROM r2
+		SELECT k, d.j::text = h.j::text, r1 IS NOT DISTINCT FROM r2
 		FROM vt.docs d JOIN plain h USING (id) WHERE id = e.id;
 	END LOOP;
 	DELETE FROM vt.docs WHERE id = 100;
