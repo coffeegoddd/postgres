@@ -71,7 +71,7 @@
  *				   table, its OID (10 digits), a space, and its qualified
  *				   name (a backslash in it written as two, a newline as a
  *				   backslash and 'n')
- *	'H' name	-> the branch's merge's table identity conflicts: tables the
+ *	'D' name	-> the branch's merge's table identity conflicts: tables the
  *				   merge kept as the branch has them, as theirs is another
  *				   relation of the name: the local branch merged, if
  *				   theirs was one's head (a varint length, then the bytes;
@@ -256,7 +256,7 @@
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_LINEAGE		'L'	/* the relations a commit was made from */
-#define TAG_IDENTITY_CONFLICTS 'H'	/* a branch's merge's table identity conflicts */
+#define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*

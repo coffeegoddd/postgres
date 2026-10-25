@@ -372,7 +372,7 @@ another's table, under its grants:
   those tables as ours has them (splice()), so the merge changes nothing
   in them and no row of theirs is read or listed.  Each is a table
   identity conflict (diffmerge_folded.c's identity_conflicts()), recorded
-  in the merge in progress ('H', refs format 17: each table's relation
+  in the merge in progress ('D', refs format 17: each table's relation
   here and theirs, its tree, its names, and the local branch theirs was
   the head of) and counted as a conflict: shown by dolt_status ("identity
   conflict"), dolt_conflicts (one each) and dolt_identity_conflicts (ours
