@@ -124,6 +124,28 @@ SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
 -- (outside a move, the superuser's own write runs them as itself: refused)
 INSERT INTO mc.ck VALUES (2);
 
+-- the same through alice's domain, whose check the type cache planned
+-- (inlining her SQL routine) before the merge, outside any move: planned
+-- again as the merge begins, so it runs as alice there too
+SET ROLE regress_mc_alice;
+CREATE DOMAIN mc.da AS int CHECK (mc_pub.is_alice(VALUE));
+RESET ROLE;
+CREATE TABLE mc.dt (id int PRIMARY KEY, x mc.da);
+GRANT SELECT, INSERT ON mc.dt TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'dt')::text) AS committed;
+SELECT dolt_branch('dt_side') IS NOT NULL AS made;
+CREATE TABLE mc.su3 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su3')::text) AS committed;
+SELECT dolt_checkout('dt_side') IS NOT NULL AS on_side;
+SET ROLE regress_mc_alice;
+INSERT INTO mc.dt VALUES (1, 1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'dt row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT 1::mc.da;
+SELECT (dolt_merge('dt_side', '-m', 'merged dt_side'))[4] AS merged;
+SELECT * FROM mc.dt;
+
 -- a role without alice's privileges merging its own table, whose check
 -- calls alice's routine: the routine runs as alice, never as the writer
 SET ROLE regress_mc_w;

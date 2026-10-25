@@ -2667,6 +2667,19 @@ TypeCacheConstrCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 
 
 /*
+ * TypeCacheForgetDomainConstraints
+ *		Have every domain's constraints looked up and planned again on next
+ *		use, as if a pg_constraint row had changed.  For a caller that has
+ *		changed how routines are planned (whether the planner may inline
+ *		one), so that no check planned before is used.
+ */
+void
+TypeCacheForgetDomainConstraints(void)
+{
+	TypeCacheConstrCallback((Datum) 0, CONSTROID, 0);
+}
+
+/*
  * Check if given OID is part of the subset that's sortable by comparisons
  */
 static inline bool

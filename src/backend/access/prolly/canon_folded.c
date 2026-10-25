@@ -9239,7 +9239,7 @@ prolly_move_calls_begin(void)
 								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
 								 true, 0, false);
 		/* (the type cache's domain checks, planned again) */
-		CallSyscacheCallbacks(CONSTROID, 0);
+		TypeCacheForgetDomainConstraints();
 	}
 	return nest;
 }
