@@ -43,7 +43,12 @@
  * items' paths are all it writes, and the containers above it reads only
  * until they are known to be long.  Indexes are part of keys, so inserting
  * into an array, or removing from it, would move every element after;
- * set() only replaces elements of an array that isn't packed.
+ * set() only replaces elements of an array that isn't packed.  edit()
+ * finds the item at the path the same way, runs the edit on a document of
+ * only what is along the path, and puts back what it made of the item:
+ * replaced, added to an object, removed (a container left empty packed),
+ * or an element appended to the array's end; any other change to an
+ * array's elements is left to a whole edit.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/jsontree_paths.c
@@ -1516,7 +1521,8 @@ keylist_value_bytes(const KeyList *kl)
 }
 
 /*
- * The tree at *root with the value at path (len bytes) made value's: its
+ * The tree at *root with the value at path (len bytes) made value's (none,
+ * if value is NULL: the container holding it keeps another item): its
  * items there replaced, and each container above that has become short
  * enough packed.  False if a key would be too long for the tree.
  */
@@ -1536,9 +1542,12 @@ replace_at(const ProllyTreeEnv *denv, ProllyNodeRef *root, const char *path,
 
 	keylist_init(&old);
 	keylist_init(&new);
-	walk_init(&w, path, len, PROLLY_JSON_PACK_MAX, emit_keylist, &new);
-	walk_jsonb(&w, value);
-	walk_done(&w);
+	if (value != NULL)
+	{
+		walk_init(&w, path, len, PROLLY_JSON_PACK_MAX, emit_keylist, &new);
+		walk_jsonb(&w, value);
+		walk_done(&w);
+	}
 	for (int i = 0; i < new.n; i++)
 		if ((Size) new.key_len[i] > key_max)
 			return false;
@@ -1692,6 +1701,398 @@ paths_set(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	if (*whole != NULL)
 		*whole = prolly_jsonb_from_utf8(*whole);
 	return true;
+}
+
+/* ------------------------------------------------------------------------
+ * Exists
+ * ------------------------------------------------------------------------
+ */
+
+static bool
+paths_exists(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **keys,
+			 int nkeys, bool all)
+{
+	const ProllyTreeRoutine *tree = doc_tree();
+	ProllyTreeEnv denv;
+	ProllyTreeCursor *c;
+	StringInfoData p;
+	PathKind	kind;
+	bool	   *found = palloc0(sizeof(bool) * Max(nkeys, 1));
+	int			nfound = 0;
+
+	doc_env(env, &denv);
+	c = PROLLY_CALL(tree, cursor_open, &denv, root, CurrentMemoryContext);
+	initStringInfo(&p);
+	kind = path_kind(c, &p, NULL);
+	if (kind != PATH_OBJECT && kind != PATH_ARRAY)
+		bad_tree(kind == PATH_NONE ? "a document of no items" :
+				 "an item where its container is");
+	if (kind == PATH_OBJECT)
+	{
+		/* an object's keys: looked up */
+		for (int i = 0; i < nkeys && (all ? nfound == i : nfound == 0); i++)
+		{
+			resetStringInfo(&p);
+			put_key_step(&p, keys[i], strlen(keys[i]));
+			if (path_kind(c, &p, NULL) != PATH_NONE)
+				nfound++;
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+		pfree(p.data);
+		return all ? nfound == nkeys : nfound > 0;
+	}
+
+	/*
+	 * An array's elements, in order: each that is an item (a scalar or a
+	 * packed container) checked as it is read, a string compared with the
+	 * keys; one whose items are its own skipped, to the next index.
+	 */
+	{
+		ProllyKey	k;
+		ProllyValue v;
+		bool		more;
+
+		PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+		more = PROLLY_CALL(tree, cursor_next, c, &k, &v);
+		while (more && (all ? nfound < nkeys : nfound == 0))
+		{
+			uint32		index;
+
+			CHECK_FOR_INTERRUPTS();
+			if (k.len < STEP_HEADER || k.data[0] != STEP_INDEX)
+				bad_tree("an array's item without an index");
+			index = get_u32(k.data + 1);
+			if (k.len == STEP_HEADER)
+			{
+				Jsonb	   *e = value_doc(v.data, (int) v.len);
+
+				if (v.data[0] == VAL_STRING)
+				{
+					for (int i = 0; i < nkeys; i++)
+						if (!found[i] && strlen(keys[i]) == v.len - 1 &&
+							memcmp(keys[i], v.data + 1, v.len - 1) == 0)
+						{
+							found[i] = true;
+							nfound++;
+						}
+				}
+				pfree(e);
+				more = PROLLY_CALL(tree, cursor_next, c, &k, &v);
+			}
+			else
+			{
+				ProllyKey	seek;
+
+				if (index == PG_UINT32_MAX)
+					break;
+				resetStringInfo(&p);
+				put_index_step(&p, index + 1);
+				seek.data = (const uint8 *) p.data;
+				seek.len = (uint32) p.len;
+				PROLLY_CALL(tree, cursor_seek, c, &seek, ForwardScanDirection);
+				more = PROLLY_CALL(tree, cursor_next, c, &k, &v);
+			}
+		}
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(p.data);
+	return all ? nfound == nkeys : nfound > 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Edit
+ * ------------------------------------------------------------------------
+ */
+
+/* inner (NULL: nothing) as the one entry of a container of kind, at key. */
+static Jsonb *
+wrap_one(Jsonb *inner, PathKind kind, const char *key)
+{
+	JsonbInState st = {0};
+	JsonbValue	v;
+
+	if (kind == PATH_OBJECT)
+	{
+		pushJsonbValue(&st, WJB_BEGIN_OBJECT, NULL);
+		if (inner != NULL)
+		{
+			v.type = jbvString;
+			v.val.string.val = (char *) key;
+			v.val.string.len = strlen(key);
+			pushJsonbValue(&st, WJB_KEY, &v);
+			JsonbToJsonbValue(inner, &v);
+			pushJsonbValue(&st, WJB_VALUE, &v);
+		}
+		pushJsonbValue(&st, WJB_END_OBJECT, NULL);
+	}
+	else
+	{
+		pushJsonbValue(&st, WJB_BEGIN_ARRAY, NULL);
+		if (inner != NULL)
+		{
+			JsonbToJsonbValue(inner, &v);
+			pushJsonbValue(&st, WJB_ELEM, &v);
+		}
+		pushJsonbValue(&st, WJB_END_ARRAY, NULL);
+	}
+	return JsonbValueToJsonb(st.result);
+}
+
+/*
+ * The entries of jb, a container of kind (false if it isn't one): *n how
+ * many, *first the first (an object's at key, NULL if it has none there),
+ * *second the second.
+ */
+static bool
+unwrap(Jsonb *jb, PathKind kind, const char *key, int *n, Jsonb **first,
+	   Jsonb **second)
+{
+	JsonbValue *v;
+
+	*first = *second = NULL;
+	if (JB_ROOT_IS_SCALAR(jb) ||
+		(kind == PATH_OBJECT ? !JB_ROOT_IS_OBJECT(jb) : !JB_ROOT_IS_ARRAY(jb)))
+		return false;
+	*n = JB_ROOT_COUNT(jb);
+	if (kind == PATH_OBJECT)
+	{
+		JsonbValue	k;
+
+		k.type = jbvString;
+		k.val.string.val = (char *) key;
+		k.val.string.len = strlen(key);
+		v = findJsonbValueFromContainer(&jb->root, JB_FOBJECT, &k);
+		if (v != NULL)
+			*first = JsonbValueToJsonb(v);
+		return true;
+	}
+	if (*n >= 1)
+		*first = JsonbValueToJsonb(getIthJsonbValueFromContainer(&jb->root, 0));
+	if (*n >= 2)
+		*second = JsonbValueToJsonb(getIthJsonbValueFromContainer(&jb->root, 1));
+	return true;
+}
+
+static bool
+same_doc(Jsonb *a, Jsonb *b)
+{
+	if (a == NULL || b == NULL)
+		return a == b;
+	return compareJsonbContainers(&a->root, &b->root) == 0;
+}
+
+/*
+ * Whether the container at path (plen bytes) holds an item other than
+ * those at child (clen bytes, under it).
+ */
+static bool
+has_other_item(ProllyTreeCursor *c, const char *path, int plen,
+			   const char *child, int clen)
+{
+	const ProllyTreeRoutine *tree = doc_tree();
+	ProllyKey	seek = {(const uint8 *) path, (uint32) plen};
+	ProllyKey	k;
+	ProllyValue v;
+
+	PROLLY_CALL(tree, cursor_seek, c, plen > 0 ? &seek : NULL,
+				ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		if ((int) k.len < plen || memcmp(k.data, path, plen) != 0)
+			return false;
+		if ((int) k.len < clen || memcmp(k.data, child, clen) != 0)
+			return true;
+		CHECK_FOR_INTERRUPTS();
+	}
+	return false;
+}
+
+static bool
+paths_edit(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
+		   int npath, ProllyJsonEdit edit, void *arg, ProllyNodeRef *new_root,
+		   int64 *delta, Jsonb **whole)
+{
+	const ProllyTreeRoutine *tree = doc_tree();
+	ProllyTreeEnv denv;
+	ProllyTreeCursor *c;
+	StringInfoData p;			/* the container the edit is in */
+	StringInfoData cp;			/* the step to the item it edits */
+	StringInfoData item;
+	PathKind	kind;
+	PathKind	ck;
+	PathKind   *kinds;
+	char	  **mpath;
+	int64		at = 0;
+	int64		size = 0;
+	int			i;
+	Jsonb	   *child;
+	Jsonb	   *mini;
+	Jsonb	   *r;
+	Jsonb	   *first;
+	Jsonb	   *second;
+	int			n;
+
+	*new_root = *root;
+	*delta = 0;
+	*whole = NULL;
+	if (npath == 0)
+		return false;
+
+	doc_env(env, &denv);
+	c = PROLLY_CALL(tree, cursor_open, &denv, root, CurrentMemoryContext);
+	initStringInfo(&p);
+	initStringInfo(&cp);
+	initStringInfo(&item);
+	kinds = palloc(sizeof(PathKind) * npath);
+	mpath = palloc(sizeof(char *) * npath);
+	kind = path_kind(c, &p, NULL);
+	if (kind != PATH_OBJECT && kind != PATH_ARRAY)
+		bad_tree(kind == PATH_NONE ? "a document of no items" :
+				 "an item where its container is");
+
+	/* down the containers that aren't packed, to the item the edit is at */
+	for (i = 0;; i++)
+	{
+		kinds[i] = kind;
+		mpath[i] = path[i];
+		resetStringInfo(&cp);
+		appendBinaryStringInfo(&cp, p.data, p.len);
+		if (kind == PATH_ARRAY)
+		{
+			int			index;
+
+			if (!path_index(path[i], &index))
+			{
+				PROLLY_CALL(tree, cursor_close, c);
+				return false;
+			}
+			size = array_size(c, &p);
+			at = index < 0 ? (int64) index + size : index;
+			if (at < 0 || at >= size)
+			{
+				PROLLY_CALL(tree, cursor_close, c);
+				return false;
+			}
+			put_index_step(&cp, (uint32) at);
+			mpath[i] = "0";
+		}
+		else
+			put_key_step(&cp, path[i], strlen(path[i]));
+		ck = path_kind(c, &cp, &item);
+		if ((ck == PATH_OBJECT || ck == PATH_ARRAY) && i < npath - 1)
+		{
+			resetStringInfo(&p);
+			appendBinaryStringInfo(&p, cp.data, cp.len);
+			kind = ck;
+			continue;
+		}
+		break;
+	}
+	for (int j = i + 1; j < npath; j++)
+		mpath[j] = path[j];
+	child = ck == PATH_NONE ? NULL :
+		ck == PATH_ITEM ? value_doc((const uint8 *) item.data, item.len) :
+		read_under(c, cp.data, cp.len, false);
+
+	/* the edit, on what is along the path */
+	mini = wrap_one(child, kinds[i], mpath[i]);
+	for (int j = i - 1; j >= 0; j--)
+		mini = wrap_one(mini, kinds[j], mpath[j]);
+	r = edit(mini, mpath, npath, arg);
+
+	/* what it made of the item, the containers above holding just it */
+	for (int j = 0; j < i; j++)
+	{
+		if (!unwrap(r, kinds[j], mpath[j], &n, &first, &second) || n != 1 ||
+			first == NULL)
+		{
+			PROLLY_CALL(tree, cursor_close, c);
+			return false;
+		}
+		r = first;
+	}
+	if (!unwrap(r, kinds[i], mpath[i], &n, &first, &second) ||
+		(kinds[i] == PATH_OBJECT && n != (first != NULL ? 1 : 0)))
+	{
+		PROLLY_CALL(tree, cursor_close, c);
+		return false;
+	}
+	if (kinds[i] == PATH_ARRAY)
+	{
+		/* (only at the array's end does no other element move) */
+		if (n == 0 || n == 2)
+		{
+			if (at != size - 1 || (n == 2 && !same_doc(first, child)))
+			{
+				PROLLY_CALL(tree, cursor_close, c);
+				return false;
+			}
+		}
+		else if (n != 1)
+		{
+			PROLLY_CALL(tree, cursor_close, c);
+			return false;
+		}
+	}
+
+	if (kinds[i] == PATH_ARRAY && n == 2)
+	{
+		/* an element appended */
+		PROLLY_CALL(tree, cursor_close, c);
+		resetStringInfo(&cp);
+		appendBinaryStringInfo(&cp, p.data, p.len);
+		put_index_step(&cp, (uint32) size);
+		if (!replace_at(&denv, new_root, cp.data, cp.len, second, delta))
+			goto decline;
+	}
+	else if (first == NULL)
+	{
+		/* the item removed */
+		bool		other;
+
+		if (child == NULL)
+		{
+			PROLLY_CALL(tree, cursor_close, c);
+			return true;		/* (nothing there to remove) */
+		}
+		other = has_other_item(c, p.data, p.len, cp.data, cp.len);
+		PROLLY_CALL(tree, cursor_close, c);
+		if (other)
+		{
+			if (!replace_at(&denv, new_root, cp.data, cp.len, NULL, delta))
+				goto decline;
+		}
+		else if (p.len == 0)
+		{
+			/* the document's only entry: it is empty, short */
+			*whole = prolly_jsonb_from_utf8(wrap_one(NULL, kinds[i], NULL));
+			return true;
+		}
+		else if (!replace_at(&denv, new_root, p.data, p.len,
+							 wrap_one(NULL, kinds[i], NULL), delta))
+			goto decline;
+	}
+	else
+	{
+		PROLLY_CALL(tree, cursor_close, c);
+		if (same_doc(first, child))
+			return true;
+		if (!replace_at(&denv, new_root, cp.data, cp.len, first, delta))
+			goto decline;
+	}
+
+	/* a document edited short enough to be inline is no tree */
+	c = PROLLY_CALL(tree, cursor_open, &denv, new_root, CurrentMemoryContext);
+	*whole = short_container(c, "", 0, PROLLY_JSON_TREE_MIN - 1);
+	PROLLY_CALL(tree, cursor_close, c);
+	if (*whole != NULL)
+		*whole = prolly_jsonb_from_utf8(*whole);
+	return true;
+
+decline:
+	*new_root = *root;
+	*delta = 0;
+	return false;
 }
 
 /* ------------------------------------------------------------------------
@@ -1881,6 +2282,8 @@ const ProllyJsonTreeRoutine prolly_jsontree_paths = {
 	.get = paths_get,
 	.kind = paths_kind,
 	.set = paths_set,
+	.exists = paths_exists,
+	.edit = paths_edit,
 	.diff = paths_diff,
 	.diff_documents = paths_diff_documents,
 };
