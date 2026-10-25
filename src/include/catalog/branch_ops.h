@@ -254,9 +254,15 @@ typedef struct BranchOpsRoutine
 	 * snapshot taken before the keeping transaction ended could read
 	 * versions source made and deleted, rows never the session branch's,
 	 * so the caller gives only pages kept before every snapshot there is.
+	 * With source the session's own branch, carry[] is carried into the
+	 * new storage as restore() carries it, carried[] naming each there
+	 * (every one of them, the snapshot shared included, none being taken
+	 * after); with another's, carried[] is carry[] as it is.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
-							   int nkept, TimestampTz *wait_start);
+							   int nkept, const BranchKeptRelation *carry,
+							   int ncarry, BranchKeptRelation *carried,
+							   TimestampTz *wait_start);
 
 	/*
 	 * Optional: add to each of the session branch's relations relids the

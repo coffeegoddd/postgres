@@ -1030,7 +1030,15 @@ between kept commits restore every time.  A carry's record (a snapshot
 record flagged BMAP_TREE_CARRIED, without the header) is redone writing
 and syncing nothing: its blocks are the original snapshot's, written out
 when that was kept.  An abort or a crash before the commit drops or
-orphans the new storage, slots and all; the old one is untouched.  The
+orphans the new storage, slots and all; the old one is untouched.  A
+move that gives a table the pages another of the branch's own kept
+commits holds of the target's rows (share_kept(), from a commit with the
+same data: an empty commit's, an amend's) carries them the same way.  A
+move that gives a table another branch's storage (share(), or
+share_kept() of another branch's kept pages) replaces the table's storage
+too but carries nothing: the other storage's epochs say nothing of this
+branch's snapshots, so the branch's kept commits of that table are
+dropped (kept_drop_dead()), and a reset back to one writes its rows.  The
 baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
 of its rows.  Whatever still differs (definitions, sequences, a table not

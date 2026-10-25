@@ -2243,6 +2243,13 @@ source_of(List *sources, const NamedTree *t)
 	return NULL;
 }
 
+struct KeptCommit;
+static List *kept_get(const char *name);
+static void kept_put(const char *name, List *kept);
+static int	kept_carried(List *kept, const struct KeptCommit *was,
+						 const char *name, BranchKeptRelation **carry,
+						 BranchKeptRelation ***into);
+
 /*
  * The tables of the session's branch whose rows differ from target's made
  * the copies another state has where that costs less (true: some were);
@@ -2266,6 +2273,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	ListCell   *c;
 	char	   *current = branch_ops()->current();
 	int			nshared = 0;
+	List	   *kept = NIL;		/* the branch's kept commits, if shared from */
+	bool		renamed = false;
 
 	prolly_database_components(&dc);
 	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
@@ -2337,9 +2346,29 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		if (s->kept_commit != NULL)
 		{
 			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
+			BranchKeptRelation *carry;
+			BranchKeptRelation *carried;
+			BranchKeptRelation **into;
+			int			ncarry = 0;
 
+			/*
+			 * (the session's own kept pages: the branch's kept commits'
+			 * snapshots of the table carried into its new storage, as a
+			 * restore carries them, and their entries renamed)
+			 */
+			if (s->branch == MyBranch && kept == NIL)
+				kept = kept_get(current);
+			if (s->branch == MyBranch)
+				ncarry = kept_carried(kept, NULL, table, &carry, &into);
+			else
+				carry = NULL;
+			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
+											carry, ncarry, carried,
 											&move_wait_start);
+			for (int j = 0; done && j < ncarry; j++)
+				*into[j] = carried[j];
+			renamed |= done && ncarry > 0;
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
@@ -2350,6 +2379,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			nshared++;
 		}
 	}
+	if (renamed)
+		kept_put(current, kept);
 	if (nshared == 0)
 		return false;
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
@@ -3136,7 +3167,7 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
  * the storage it replaces.  How many.
  */
 static int
-kept_carried(List *kept, const KeptCommit *was, const char *name,
+kept_carried(List *kept, const struct KeptCommit *was, const char *name,
 			 BranchKeptRelation **carry, BranchKeptRelation ***into)
 {
 	int			n = 0;

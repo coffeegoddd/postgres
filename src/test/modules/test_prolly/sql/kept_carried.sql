@@ -111,6 +111,33 @@ SELECT count(*) FROM kc.t WHERE id <= 5 AND big = repeat('b', 5000);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
+-- a move that gives the table the pages another kept commit holds of the
+-- target's rows (share_kept(): an empty commit's, which shares c's
+-- snapshot) carries the other kept commits' snapshots too
+UPDATE kc.t SET v = 5 WHERE id <= 30;
+SELECT (dolt_commit('-am', 'c'))[1] AS c \gset
+SELECT rows_digest() AS at_c \gset
+SELECT dolt_commit('--allow-empty', '-m', 'empty') IS NOT NULL AS committed;
+-- (a no longer kept: its rows written, then kept with the empty commit)
+SELECT dolt_reset('--hard', :'a');
+SELECT count(*) AS kept FROM test_kept_commits('main');
+UPDATE kc.t SET v = v + 10 WHERE id % 7 = 2;
+SELECT pg_stat_force_next_flush();
+SELECT counted('move_tables_shared') AS sh, counted('apply_rows') AS ap \gset
+SELECT dolt_reset('--hard', :'c');
+SELECT pg_stat_force_next_flush();
+SELECT counted('move_tables_shared') > :sh AS shared,
+	   counted('apply_rows') - :ap AS applied, rows_digest() = :'at_c' AS as_c;
+SELECT count(*) AS kept FROM test_kept_commits('main');
+UPDATE kc.t SET v = v + 10 WHERE id % 7 = 3;
+SELECT pg_stat_force_next_flush();
+SELECT counted('relations_restored') AS r, counted('apply_rows') AS ap \gset
+SELECT dolt_reset('--hard', :'a');
+SELECT pg_stat_force_next_flush();
+SELECT counted('relations_restored') > :r AS restored,
+	   counted('apply_rows') - :ap AS applied, rows_digest() = :'at_a' AS as_a,
+	   indexes_valid();
+
 -- every block the stores hold is held by a map or a snapshot kept
 SELECT dolt_commit('--allow-empty', '-m', 'settled') IS NOT NULL AS committed;
 SELECT freed FROM prolly_page_sweep();
