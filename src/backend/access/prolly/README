@@ -1041,8 +1041,21 @@ branch's snapshots, so the branch's kept commits of that table are
 dropped (kept_drop_dead()), and a reset back to one writes its rows.  The
 baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
-of its rows.  Whatever still differs (definitions, sequences, a table not
-restored) the move writes as before.  A table isn't restored if its
+of its rows.  A move to a commit whose pages aren't kept, or whose kept
+pages for a table are gone, may give that table the pages kept as of the
+branch's head instead: that discards the working set's changes in O(1),
+as a reset to the head does, and the move then writes only the rows the
+head and the commit differ by.  It does so only where that costs less
+than writing the rows the working set and the commit differ by, as told
+without folding from the baseline and the change finder's count since it
+(the working set may have been brought near the commit by its own
+writes), and only while no other backend of the database holds a
+snapshot: such a snapshot would read the head's rows, neither its own
+nor the commit's.  A branch reset back and forth between two commits
+takes this path: each restore gives a table new storage, and the other
+commit's snapshot goes with the old storage.  Whatever still differs
+(definitions, sequences, a table not restored) the move writes as before.
+A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
