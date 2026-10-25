@@ -132,10 +132,10 @@ SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 RESET ROLE;
 SELECT dolt_checkout('main');
 
--- a branch made at the old table's branch's head (from its hash: it has
--- copies of main's relation, moved to the old rows), merging main in, and
--- merged back: its commits are of this relation (and its rows, merged, are
--- the table's: #936), the old table's commits aren't
+-- a branch made at the old table's branch's head (from its hash), merging
+-- main in, and merged back: its first use copies keeps_old's relation, the
+-- nearest source's, the old table's, so neither its commits nor the old
+-- table's are this table's
 SELECT dolt_hashof('main') AS before_k \gset
 SELECT dolt_branch('k3', dolt_hashof('keeps_old')) IS NOT NULL AS made;
 SELECT dolt_checkout('k3') IS NOT NULL AS on_k3;
@@ -154,7 +154,8 @@ RESET ROLE;
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
 
 -- a branch made at the old table's commit after the re-make, first used
--- there, with a commit of its own, merged in
+-- there, with a commit of its own, merged in (its copies are the nearest
+-- source's relation's, here the old table's)
 SELECT dolt_branch('late2', :'old_commit') IS NOT NULL AS made;
 SELECT dolt_checkout('late2') IS NOT NULL AS on_late2;
 INSERT INTO ln.t VALUES (3, 'late2 row');
@@ -231,6 +232,24 @@ SELECT * FROM dolt_at('HEAD', NULL::ln.f);
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.f);
 -- (the table here's own history reads, through the merge)
 SELECT count(*) > 0 AS read FROM dolt_at('HEAD^1', NULL::ln.t);
+RESET ROLE;
+-- (and so for a table a branch's integration brings in: the merge it
+-- makes into main is one of the branch's head)
+SELECT dolt_branch('feature_i') IS NOT NULL AS made;
+SELECT dolt_checkout('feature_i') IS NOT NULL AS on_feature_i;
+CREATE TABLE ln.fi (id int PRIMARY KEY);
+INSERT INTO ln.fi VALUES (1);
+SELECT length(dolt_commit('-Am', 'integrated table')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO ln.t VALUES (31, 'main, meanwhile again');
+SELECT length(dolt_commit('-am', 'meanwhile again')::text) AS committed;
+SELECT dolt_checkout('feature_i') IS NOT NULL AS on_feature_i;
+SELECT dolt_integrate('-m', 'feature_i in') IS NOT NULL AS integrated;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+GRANT SELECT ON ln.fi TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.fi);
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.fi);
 RESET ROLE;
 
 -- a refused read reads each commit's record about once: a chain of the
@@ -483,12 +502,21 @@ ALTER TABLE ln.pu ADD COLUMN c int;
 SELECT length(dolt_commit('-am', 'pside alter')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS p_alter \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ALTER TABLE ln.pu ADD COLUMN r int;
+SELECT length(dolt_commit('-am', 'main alter')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS p_ralter \gset
 DROP TABLE ln.p;
 SELECT length(dolt_commit('-Am', 'dropped p')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS p_dropped \gset
 -- (a cherry-pick: the table made again has no class of another's)
 CREATE TABLE ln.p (id int PRIMARY KEY, note text);
 SELECT (dolt_cherry_pick(:'p_alter'))[1] IS NOT NULL AS picked;
+SELECT test_refs_value('J' || lpad('ln.p'::regclass::oid::text, 10, '0')) IS NULL
+	AS own_class;
+SELECT dolt_reset('--hard', :'p_dropped') IS NOT NULL AS back;
+-- (a revert, of a commit whose parent has the old table: the same)
+CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+SELECT (dolt_revert(:'p_ralter'))[1] IS NOT NULL AS reverted;
 SELECT test_refs_value('J' || lpad('ln.p'::regclass::oid::text, 10, '0')) IS NULL
 	AS own_class;
 SELECT dolt_reset('--hard', :'p_dropped') IS NOT NULL AS back;

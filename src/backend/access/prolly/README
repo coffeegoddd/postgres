@@ -331,7 +331,9 @@ as the one it comes from, whatever its OID; what the move sets aside of
 the uncommitted changes and puts back is the branch's own, taking no
 class from those commits.  A class outlives its relation's drop: commits
 made from the dropped relation are still read through it, and a branch's
-copy of the relation, of the same OID, may still be in use.  What the
+copy of the relation, of the same OID, may still be in use.  So a
+relation given a dropped relation's OID again (after the OID counter
+wraps) is of the dropped relation's class, and reads its versions.  What the
 records can't: a
 branch's first use may make its copies from another branch's relation
 (the table here's, moved to the old rows), and its commits are then that
