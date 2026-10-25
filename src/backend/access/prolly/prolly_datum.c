@@ -633,12 +633,23 @@ fixed_text_settings(void)
 	{
 		if (fixed_settings[i].already())
 			continue;
-		if (nest < 0)
-			nest = NewGUCNestLevel();
+		nest = NewGUCNestLevel();
+		prolly_datum_fix_text_settings();
+		break;
+	}
+	return nest;
+}
+
+void
+prolly_datum_fix_text_settings(void)
+{
+	for (int i = 0; i < lengthof(fixed_settings); i++)
+	{
+		if (fixed_settings[i].already())
+			continue;
 		(void) set_config_option(fixed_settings[i].name, fixed_settings[i].value,
 								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	}
-	return nest;
 }
 
 static void
