@@ -414,8 +414,30 @@ another's table, under its grants:
   foreign tables, versioned schemas and collations, as well as tables and
   materialized views.  A commit's record of relations lists every object
   it may hold, each with its kind and owner, named as the commit's items
-  name it (the canonicalizer's prolly_owned_objects()); a type move's
-  statements on the tables using a type run as each table's owner.)
+  name it (the canonicalizer's prolly_owned_objects() and
+  prolly_owned_routines()).  Its routines and types are stored once under
+  their lines' hash (refs 'J') and named by it, so a commit that changed
+  none names its parent's entry, and the session works out again only the
+  rows the caches' invalidations say changed.  A type move's statements on
+  the tables using a type run as each table's owner, and the conversion
+  runs the type's code (its input, a domain's checks) over the table's
+  rows: a type move is refused where the type's owner isn't the table's
+  and hasn't that role's privileges, as it would run the type owner's code
+  with more than its own.  A cast is made and dropped as the owner of one
+  of its types, as CREATE CAST requires (the role moving, if it owns one;
+  else an owner whose privileges it has), and refused otherwise.)
+- Every statement a move runs says, as it is made, which object it makes
+  or changes, and so whose role runs it (its maker, or the role moving
+  where the object is its own or no other role's); nothing is read back
+  from a statement's text, and makers are found by the whole of an
+  object's name, however long (a routine's names every argument).  A
+  statement nothing said this of runs as the role moving, guarded by an
+  object access hook: one that would make, change, drop or empty an
+  object of another role's whose privileges the role has, run such a
+  role's routine, or make an object the move has another maker for, is
+  refused, as an internal error.  So a statement the move fails to
+  attribute fails closed, never runs with the mover's authority over
+  another's object.
 - Every move that makes a table or materialized view from a commit (a
   reset, a table's checkout, a branch's first use, a rebase's end, an
   abort, a stash's push or apply, a merge, a pick, a revert, '--theirs')
