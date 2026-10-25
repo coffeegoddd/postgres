@@ -129,6 +129,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -17493,14 +17494,20 @@ index_columns(const char *what, const ProllyComponents *c, List *stale,
  * lists them all, so that a move finds any one's owner, but works out
  * again only those changed since.  Each is kept with its catalog row's
  * place and inserting transaction, which any change to the row (an ALTER,
- * an owner changed) changes, so an unchanged row's name is taken as it
- * was.  The caches' invalidations say when to look again: a routine's row
- * changed (PROCOID) has the routines read again, each row not seen before
- * worked out; a type's or a schema's (TYPEOID, NAMESPACEOID), which may
- * rename what routines' and types' names are made of, has both worked out
- * again in full, as does a move to another branch.  Every member, an
- * extension's too, is listed: membership changes (ALTER EXTENSION ... ADD)
- * invalidate nothing, and a line no item has is never read.
+ * an owner changed) changes, and with what its name is made of besides:
+ * the schemas and types a routine's name and arguments name, a type's
+ * schema.  The caches' invalidations say what to look at again: a
+ * routine's row (PROCOID) has the routines read again; a type's or a
+ * schema's (TYPEOID, NAMESPACEOID) has both read again, and the name of
+ * each one whose row or whose names' objects that invalidation is of
+ * (matched by the caches' hash of their OIDs) worked out again.  Every
+ * other row unchanged keeps its name.  So a table made, a temporary one
+ * too (a type invalidation for its row type), reads the rows but works
+ * out no name.  A reset of the caches, or many invalidations at once, has
+ * everything worked out again, as does a move to another branch.  Every
+ * member, an extension's too, is listed: membership changes (ALTER
+ * EXTENSION ... ADD) invalidate nothing, and a line no item has is never
+ * read.
  */
 typedef struct OwnedObject
 {
@@ -17510,6 +17517,10 @@ typedef struct OwnedObject
 	char	   *name;
 	ItemPointerData tid;
 	TransactionId xmin;
+	int			ntypes;			/* (the types its name names) */
+	Oid		   *types;
+	int			nschemas;		/* (and the schemas) */
+	Oid		   *schemas;
 } OwnedObject;
 
 /* An OwnedObject known before, by OID */
@@ -17524,26 +17535,139 @@ static Oid	owned_branch = InvalidOid;
 static List *owned_routines = NIL;
 static List *owned_types = NIL;
 static bool owned_routines_known = false;
+static bool owned_types_known = false;
 static bool owned_names_known = false;
 static bool owned_callbacks = false;
 static uint64 owned_generation = 0;
 
 /*
- * (only flags: an invalidation may come while the lists are read, which
- * goes on with what it has; the next listing reads them again)
+ * The caches' hash values of the types and schemas invalidated since the
+ * listing was last read (a reset, or more than fit: owned_names_known
+ * false instead).
+ */
+#define OWNED_CHANGED_MAX 64
+static uint32 owned_changed_types[OWNED_CHANGED_MAX];
+static int	owned_nchanged_types = 0;
+static uint32 owned_changed_schemas[OWNED_CHANGED_MAX];
+static int	owned_nchanged_schemas = 0;
+
+/*
+ * (only flags and hash values: an invalidation may come while the lists
+ * are read, which goes on with what it has; the next listing reads them
+ * again)
  */
 static void
 owned_forget(Datum arg, int cacheid, uint32 hashvalue)
 {
 	owned_routines_known = false;
-	/* (names of either may change: worked out again in full) */
-	if (cacheid != PROCOID)
+	if (cacheid == PROCOID)
+		return;
+	owned_types_known = false;
+	if (hashvalue == 0)
 		owned_names_known = false;
+	else if (cacheid == TYPEOID)
+	{
+		if (owned_nchanged_types < OWNED_CHANGED_MAX)
+			owned_changed_types[owned_nchanged_types++] = hashvalue;
+		else
+			owned_names_known = false;
+	}
+	else
+	{
+		if (owned_nchanged_schemas < OWNED_CHANGED_MAX)
+			owned_changed_schemas[owned_nchanged_schemas++] = hashvalue;
+		else
+			owned_names_known = false;
+	}
+}
+
+static bool
+hash_among(uint32 h, const uint32 *hashes, int n)
+{
+	for (int i = 0; i < n; i++)
+		if (hashes[i] == h)
+			return true;
+	return false;
+}
+
+/* Whether an invalidation since it was known may have changed o's name. */
+static bool
+owned_name_changed(const OwnedObject *o)
+{
+	for (int i = 0; i < o->ntypes && owned_nchanged_types > 0; i++)
+		if (hash_among(GetSysCacheHashValue1(TYPEOID, ObjectIdGetDatum(o->types[i])),
+					   owned_changed_types, owned_nchanged_types))
+			return true;
+	for (int i = 0; i < o->nschemas && owned_nchanged_schemas > 0; i++)
+		if (hash_among(GetSysCacheHashValue1(NAMESPACEOID, ObjectIdGetDatum(o->schemas[i])),
+					   owned_changed_schemas, owned_nchanged_schemas))
+			return true;
+	return false;
+}
+
+/*
+ * What a routine's item name is made of besides its row (o's types and
+ * schemas, in owned_cxt): its schema, and each argument's type, its
+ * element's if an array, and their schemas.
+ */
+static void
+routine_name_parts(OwnedObject *o, HeapTuple tup)
+{
+	Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+	Oid		   *argtypes;
+	char	  **argnames;
+	char	   *argmodes;
+	int			nargs = get_func_arg_info(tup, &argtypes, &argnames, &argmodes);
+	List	   *types = NIL;
+	List	   *schemas = list_make1_oid(p->pronamespace);
+	int			i;
+
+	for (i = 0; i < nargs; i++)
+	{
+		Oid			t = argtypes[i];
+
+		while (OidIsValid(t) && !list_member_oid(types, t))
+		{
+			HeapTuple	tt = SearchSysCache1(TYPEOID, ObjectIdGetDatum(t));
+			Form_pg_type typ;
+
+			types = lappend_oid(types, t);
+			if (!HeapTupleIsValid(tt))
+				break;
+			typ = (Form_pg_type) GETSTRUCT(tt);
+			schemas = list_append_unique_oid(schemas, typ->typnamespace);
+			t = IsTrueArrayType(typ) ? typ->typelem : InvalidOid;
+			ReleaseSysCache(tt);
+		}
+	}
+	o->ntypes = list_length(types);
+	o->types = MemoryContextAlloc(owned_cxt, sizeof(Oid) * Max(1, o->ntypes));
+	i = 0;
+	foreach_oid(t, types)
+		o->types[i++] = t;
+	o->nschemas = list_length(schemas);
+	o->schemas = MemoryContextAlloc(owned_cxt, sizeof(Oid) * o->nschemas);
+	i = 0;
+	foreach_oid(s, schemas)
+		o->schemas[i++] = s;
+}
+
+/* The same of o (known before) into c, copied into owned_cxt */
+static void
+copy_name_parts(OwnedObject *c, const OwnedObject *o)
+{
+	c->ntypes = o->ntypes;
+	c->types = MemoryContextAlloc(owned_cxt, sizeof(Oid) * Max(1, o->ntypes));
+	memcpy(c->types, o->types, sizeof(Oid) * o->ntypes);
+	c->nschemas = o->nschemas;
+	c->schemas = MemoryContextAlloc(owned_cxt, sizeof(Oid) * Max(1, o->nschemas));
+	memcpy(c->schemas, o->schemas, sizeof(Oid) * o->nschemas);
 }
 
 /*
  * The branch's routines (proc) or types (else), as they are now, from
- * those known before (was): each row unchanged since taken as it was.
+ * those known before (was): each row unchanged since, with no part of its
+ * name invalidated since, taken as it was.
  */
 static List *
 owned_rows(bool proc, List *was)
@@ -17610,14 +17734,26 @@ owned_rows(bool proc, List *was)
 		o->tid = tup->t_self;
 		o->xmin = HeapTupleHeaderGetXmin(tup->t_data);
 		if (e != NULL && ItemPointerEquals(&e->o->tid, &o->tid) &&
-			TransactionIdEquals(e->o->xmin, o->xmin))
+			TransactionIdEquals(e->o->xmin, o->xmin) &&
+			!owned_name_changed(e->o))
+		{
 			o->name = MemoryContextStrdup(owned_cxt, e->o->name);
+			copy_name_parts(o, e->o);
+		}
 		else if (proc)
+		{
 			o->name = MemoryContextStrdup(owned_cxt,
 										  routine_item_name((Form_pg_proc) GETSTRUCT(tup)));
+			routine_name_parts(o, tup);
+		}
 		else
+		{
 			o->name = MemoryContextStrdup(owned_cxt,
 										  qualified(nsp, NameStr(((Form_pg_type) GETSTRUCT(tup))->typname)));
+			o->nschemas = 1;
+			o->schemas = MemoryContextAlloc(owned_cxt, sizeof(Oid));
+			o->schemas[0] = nsp;
+		}
 		{
 			MemoryContext old = MemoryContextSwitchTo(owned_cxt);
 
@@ -17630,6 +17766,27 @@ owned_rows(bool proc, List *was)
 	if (known)
 		hash_destroy(known);
 	return out;
+}
+
+/* Whether two listings list the same objects, owners and names, in order. */
+static bool
+same_owned(List *a, List *b)
+{
+	ListCell   *la;
+	ListCell   *lb;
+
+	if (list_length(a) != list_length(b))
+		return false;
+	forboth(la, a, lb, b)
+	{
+		OwnedObject *x = lfirst(la);
+		OwnedObject *y = lfirst(lb);
+
+		if (x->oid != y->oid || x->owner != y->owner || x->kind != y->kind ||
+			strcmp(x->name, y->name) != 0)
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -17729,63 +17886,78 @@ prolly_owned_routines(uint64 *generation,
 	{
 		MemoryContextReset(owned_cxt);
 		owned_routines = owned_types = NIL;
-		owned_routines_known = false;
+		owned_routines_known = owned_types_known = false;
+		owned_nchanged_types = owned_nchanged_schemas = 0;
 		owned_branch = MyBranch;
 		owned_names_known = true;
 		owned_generation++;
-		PG_TRY();
-		{
-			owned_types = owned_rows(false, NIL);
-		}
-		PG_CATCH();
-		{
-			owned_names_known = false;
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
 	}
+
 	/*
-	 * (each list made whole before it is kept: an error leaves it unknown,
-	 * an invalidation while it is read, worked out again next time)
+	 * (each list made whole before it is kept: an error leaves it unknown;
+	 * an invalidation while it is read, read again next time, with the
+	 * hash values it brought kept for then)
 	 */
-	if (!owned_routines_known)
+	if (!owned_routines_known || !owned_types_known)
 	{
 		MemoryContext was_cxt = owned_cxt;
-		List	   *was = owned_routines;
+		List	   *was_routines = owned_routines;
+		List	   *was_types = owned_types;
+		List	   *routines = NIL;
+		List	   *types = NIL;
+		bool		read_types = !owned_types_known;
+		int			ntypes = owned_nchanged_types;
+		int			nschemas = owned_nchanged_schemas;
 
-		owned_routines_known = true;
-		owned_generation++;
+		owned_routines_known = owned_types_known = true;
 		owned_cxt = AllocSetContextCreate(TopMemoryContext, "prolly owned objects",
 										  ALLOCSET_DEFAULT_SIZES);
 		PG_TRY();
 		{
-			List	   *types = NIL;
-
-			/* (the types kept too, in the new context) */
-			foreach_ptr(OwnedObject, o, owned_types)
+			if (read_types)
+				types = owned_rows(false, was_types);
+			else
 			{
-				OwnedObject *c = MemoryContextAlloc(owned_cxt, sizeof(OwnedObject));
-				MemoryContext old;
+				/* (the types kept, in the new context) */
+				foreach_ptr(OwnedObject, o, was_types)
+				{
+					OwnedObject *c = MemoryContextAlloc(owned_cxt, sizeof(OwnedObject));
+					MemoryContext old;
 
-				*c = *o;
-				c->name = MemoryContextStrdup(owned_cxt, o->name);
-				old = MemoryContextSwitchTo(owned_cxt);
-				types = lappend(types, c);
-				MemoryContextSwitchTo(old);
+					*c = *o;
+					c->name = MemoryContextStrdup(owned_cxt, o->name);
+					copy_name_parts(c, o);
+					old = MemoryContextSwitchTo(owned_cxt);
+					types = lappend(types, c);
+					MemoryContextSwitchTo(old);
+				}
 			}
-			owned_routines = owned_rows(true, was);
-			owned_types = types;
+			routines = owned_rows(true, was_routines);
 		}
 		PG_CATCH();
 		{
 			MemoryContextDelete(owned_cxt);
 			owned_cxt = was_cxt;
 			owned_routines = owned_types = NIL;
-			owned_routines_known = owned_names_known = false;
+			owned_routines_known = owned_types_known = owned_names_known = false;
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
+		if (!same_owned(routines, was_routines) || !same_owned(types, was_types))
+			owned_generation++;
+		owned_routines = routines;
+		owned_types = types;
 		MemoryContextDelete(was_cxt);
+		/* (the hash values read with, gone; any come since, kept) */
+		if (owned_names_known)
+		{
+			memmove(owned_changed_types, owned_changed_types + ntypes,
+					sizeof(uint32) * (owned_nchanged_types - ntypes));
+			owned_nchanged_types -= ntypes;
+			memmove(owned_changed_schemas, owned_changed_schemas + nschemas,
+					sizeof(uint32) * (owned_nchanged_schemas - nschemas));
+			owned_nchanged_schemas -= nschemas;
+		}
 	}
 	if (*generation != 0 && *generation == owned_generation)
 	{
