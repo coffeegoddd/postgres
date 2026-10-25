@@ -3044,17 +3044,41 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 	return same_hash(&base.hash, &data->hash);
 }
 
-/* Does another backend of the database hold a snapshot? */
+/*
+ * Does another backend that may read the session branch's tables hold a
+ * snapshot?  A session on a branch other than main holds the branch's lock
+ * for as long as it is on it, so the backends holding a snapshot are asked
+ * of only among those holding the lock: one on another branch reads other
+ * relations.  Nobody holds main's, so on main every backend of the
+ * database holding one counts.  (A fold of the branch in the background
+ * reads it under its own snapshot without the lock; a fold made of pages
+ * a move changed under it isn't used, the move having changed the
+ * branch's generation, as with any restore.)
+ */
 static bool
 other_snapshots(void)
 {
-	VirtualTransactionId *vxids;
+	VirtualTransactionId *snaps;
+	VirtualTransactionId *holders;
+	LOCKTAG		tag;
 	int			n;
+	bool		found = false;
 
-	vxids = GetCurrentVirtualXIDs(InvalidTransactionId, true, false,
+	snaps = GetCurrentVirtualXIDs(InvalidTransactionId, true, false,
 								  PROC_IS_AUTOVACUUM | PROC_IN_VACUUM, &n);
-	pfree(vxids);
-	return n > 0;
+	if (n == 0 || MyBranch == BRANCH_MAIN_OID)
+	{
+		pfree(snaps);
+		return n > 0;
+	}
+	branch_locktag(&tag, MyBranch);
+	holders = GetLockConflicts(&tag, AccessExclusiveLock, NULL);
+	for (int h = 0; !found && VirtualTransactionIdIsValid(holders[h]); h++)
+		for (int i = 0; !found && i < n; i++)
+			found = VirtualTransactionIdEquals(holders[h], snaps[i]);
+	pfree(snaps);
+	pfree(holders);
+	return found;
 }
 
 static uint64
@@ -3085,8 +3109,9 @@ count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
  * A count the change finder can't give counts as large.  And not while
- * another backend of the database holds a snapshot (an open REPEATABLE
- * READ transaction, a statement running): a restore isn't MVCC-safe, and
+ * another backend on the branch holds a snapshot (other_snapshots(): an
+ * open REPEATABLE READ transaction, a statement running): a restore isn't
+ * MVCC-safe, and
  * such a snapshot, taken before the move commits, would read the head's
  * rows, neither its own nor the commit's, where writing the rows keeps it
  * safe.  (One that read the table holds a lock the restore would find
@@ -3287,8 +3312,14 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
 		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
+	{
+		int			before = list_length(restored);
+
 		restore_kept(&dc, &at_head, was, &kept, restored, &commit->root,
 					 &baseline, &restored);
+		if (list_length(restored) > before)
+			branch_note_head_restore(MyBranch);
+	}
 	if (restored == NIL)
 		return;
 	kept_put(name, kept);
@@ -6050,6 +6081,25 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 }
 
 /*
+ * A transaction whose snapshot can't move, coming to branch name (oid)'s
+ * working set, refused if a move since its snapshot gave the branch's
+ * tables the pages kept as of its head (restore_pages()): it would read
+ * the head's rows, which neither its snapshot nor the branch ever had.
+ * (Sessions on the branch as the move ran held it back instead.)
+ */
+static void
+check_head_restore_seen(const char *name, Oid oid)
+{
+	if (IsolationUsesXactSnapshot() &&
+		branch_head_restore_unseen(oid, GetTransactionSnapshot()))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was given its head's kept pages since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+}
+
+/*
  * Leaving a branch leaves its changes in its copies, unfolded: its next
  * fold (a commit, a status, another session's read) reads them from its
  * change finder's record, as it would have had the session stayed.  Only a
@@ -6101,6 +6151,8 @@ copies_checkout(const char *name)
 				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
 						name),
 				 errhint("The transaction might succeed if retried.")));
+	if (strcmp(current, name) != 0 && OidIsValid(oid))
+		check_head_restore_seen(name, oid);
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(oid) && PROLLY_HAS(finder, fold_on_leave) &&
@@ -6721,6 +6773,7 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 	/* (one with only a head: its working set is the head's) */
 	if (!OidIsValid(branch_oid(branch)))
 		return head_working_set(branch, root);
+	check_head_restore_seen(branch, branch_oid(branch));
 	branch_ops()->run_on(branch, fold_into, root);
 	return true;
 }
