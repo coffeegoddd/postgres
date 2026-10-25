@@ -471,11 +471,19 @@ another's table, under its grants:
   owner would give the caller more.  A routine the hook is needed for is
   never inlined, so an SQL routine's body can't run unseen in the
   expression calling it; domains' checks the type cache planned before
-  the move are planned again as it begins, and no query or index build
-  of the move runs in parallel workers, which the hooks don't reach.
-  (A routine whose owner and caller have neither's privileges runs as its
-  owner, as SECURITY DEFINER does: its owner's code never runs with the
-  caller's authority.)
+  the move, and every plan the session cached (ResetPlanCache(): a
+  PL/pgSQL routine's plans and simple expressions too), are planned again
+  as it begins, and the plans made in it once more as it ends; and no
+  query or index build of the move runs in parallel workers, which the
+  hooks don't reach.  Another role's SECURITY DEFINER routine (not a
+  superuser's) runs restricted too.  (A routine whose owner and caller
+  have neither's privileges runs as its owner, as SECURITY DEFINER does:
+  its owner's code never runs with the caller's authority.)  Function
+  lookups long-lived caches made before the move aren't hooked: index
+  and partition support functions in the relation cache, the type
+  cache's comparison and range functions.  Those are an operator class's
+  (which a superuser makes), C functions (which only a superuser can
+  make), or a range type's subtype difference (its maker's choice).
 - Every move that makes a table or materialized view from a commit (a
   reset, a table's checkout, a branch's first use, a rebase's end, an
   abort, a stash's push or apply, a merge, a pick, a revert, '--theirs')

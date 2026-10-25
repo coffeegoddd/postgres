@@ -243,6 +243,7 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/plancache.h"
 #include "utils/typcache.h"
 
 typedef struct CanonItem
@@ -9075,14 +9076,22 @@ execute_statement(const char *sql)
  * own, a superuser's, the bootstrap superuser's, an extension's installed
  * by one) runs as that caller, as in PostgreSQL: its code gains nothing by
  * it, while running it as its owner would give the caller the owner's
- * authority.  A SECURITY DEFINER routine runs as its owner already.  A
+ * authority.  A SECURITY DEFINER routine runs as its owner already, and
+ * here restricted too (but a superuser's).  A
  * routine's own search_path setting is kept; any other runs with
  * pg_catalog, then pg_temp (RestrictSearchPath()).  The routine still
  * needs EXECUTE for its caller, checked before the call.
  *
- * Domain checks the type cache planned before the move (and so may have
- * inlined an SQL routine in) are planned again; and no query or index
+ * Domain checks the type cache planned before the move, and every plan the
+ * session cached (either may have inlined an SQL routine, or set up its
+ * calls unhooked: a PL/pgSQL routine's), are planned again as it begins,
+ * and the plans made in it once more as it ends; and no query or index
  * build of the move runs in parallel workers, which the hooks don't reach.
+ * Function lookups other long-lived caches made before the move (index and
+ * partition support functions, the type cache's comparison and range
+ * functions) aren't hooked: those routines are an operator class's, which
+ * a superuser makes, C functions, which only a superuser can make, or a
+ * range type's subtype difference, which the type's maker chose.
  */
 static int	move_calls_depth = 0;
 static bool move_calls_installed = false;
@@ -9181,6 +9190,21 @@ move_calls_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 				repalloc(move_call_switches, sizeof(MoveCallSwitch) * max);
 			move_call_max = max;
 		}
+		/*
+		 * (a SECURITY DEFINER routine's owner the function manager has made
+		 * the user already, unrestricted, and gives the caller back itself
+		 * before this hook hears the end: restricted here, unless a
+		 * superuser's, whose privileges every caller's are within)
+		 */
+		if (move_calls_depth > 0 && flinfo->fn_oid >= FirstNormalObjectId &&
+			c->definer && !superuser_arg(c->owner))
+		{
+			Oid			user;
+			int			sec;
+
+			GetUserIdAndSecContext(&user, &sec);
+			SetUserIdAndSecContext(user, sec | SECURITY_RESTRICTED_OPERATION);
+		}
 		if (move_calls_depth > 0 && flinfo->fn_oid >= FirstNormalObjectId &&
 			!c->definer && c->owner != caller &&
 			!has_privs_of_role(c->owner, caller))
@@ -9238,8 +9262,13 @@ prolly_move_calls_begin(void)
 		(void) set_config_option("max_parallel_maintenance_workers", "0",
 								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
 								 true, 0, false);
-		/* (the type cache's domain checks, planned again) */
+		/*
+		 * (the type cache's domain checks, and every plan the session
+		 * cached, planned again: one made before may have another role's
+		 * SQL routine inlined, or set up its calls unhooked)
+		 */
 		TypeCacheForgetDomainConstraints();
+		ResetPlanCache();
 	}
 	return nest;
 }
@@ -9249,7 +9278,11 @@ prolly_move_calls_end(int nest, bool done)
 {
 	Assert(move_calls_depth > 0);
 	if (--move_calls_depth == 0 && nest > 0)
+	{
 		AtEOXact_GUC(done, nest);
+		/* (and those made in the move, hooked, not kept past it) */
+		ResetPlanCache();
+	}
 }
 
 /* Set a catalog row's ACL column to NULL (no grants), as owner's. */
