@@ -2093,7 +2093,76 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
 	count = page_ref(BufferGetPage(buf), phys);
 	UnlockReleaseBuffer(buf);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_REFCOUNT_READS, 1);
 	return count;
+}
+
+/* a block whose count to look up, with where the count goes */
+typedef struct RefWanted
+{
+	BlockNumber phys;
+	uint32		i;
+} RefWanted;
+
+static int
+cmp_ref_wanted(const void *a, const void *b)
+{
+	BlockNumber pa = ((const RefWanted *) a)->phys;
+	BlockNumber pb = ((const RefWanted *) b)->phys;
+
+	return pa < pb ? -1 : pa > pb ? 1 : 0;
+}
+
+/*
+ * lookup_ref() of each of phys[0..n-1], into counts[]: each count page read
+ * once, under a share lock held alone, and the file's length asked once.
+ * (A walk asks for every entry of a map page, whose blocks are near one
+ * another: one or two count pages, where a lookup each would read its page
+ * and ask the file's length every time.)
+ */
+static void
+lookup_refs(RelFileLocator rel, const BlockNumber *phys, uint32 n,
+			uint8 *counts)
+{
+	RefWanted  *wanted;
+	BlockNumber nrefs;
+	BlockNumber held = InvalidBlockNumber;
+	Buffer		buf = InvalidBuffer;
+
+	if (n == 0)
+		return;
+	nrefs = refs_nblocks(rel);
+	wanted = palloc(n * sizeof(RefWanted));
+	for (uint32 i = 0; i < n; i++)
+	{
+		wanted[i].phys = phys[i];
+		wanted[i].i = i;
+	}
+	qsort(wanted, n, sizeof(RefWanted), cmp_ref_wanted);
+	for (uint32 k = 0; k < n; k++)
+	{
+		BlockNumber page = REF_PAGE(wanted[k].phys);
+
+		if (page >= nrefs)
+		{
+			counts[wanted[k].i] = 0;
+			continue;
+		}
+		if (page != held)
+		{
+			if (BufferIsValid(buf))
+				UnlockReleaseBuffer(buf);
+			buf = refs_read(rel, page);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			check_refs_page(BufferGetPage(buf), rel, page);
+			held = page;
+			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_REFCOUNT_READS, 1);
+		}
+		counts[wanted[k].i] = page_ref(BufferGetPage(buf), wanted[k].phys);
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	pfree(wanted);
 }
 
 /*
@@ -5229,9 +5298,10 @@ block_list_add(BlockList *l, BlockNumber b)
  * images safely would require an interlock with backup startup.
  *
  * Blocks already held by another map or changes list have been preserved
- * by their first share or REMAP, and cannot change in place.  Do not read
- * or log them again.  The caller holds the source's header exclusively
- * and keeps its writers out, but has not locked the destination map page.
+ * by their first share or REMAP, and cannot change in place: the caller
+ * passes only those whose count is zero.  The caller holds the source's
+ * header exclusively and keeps its writers out, but has not locked the
+ * destination map page.
  *
  * With 'own', the block is added to it whether logged or not: a page that
  * may be only in its buffer, to be written out (see bmap_snapshot_take()).
@@ -5244,8 +5314,6 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	PGIOAlignedBlock copy;
 	Buffer		buf;
 
-	if (lookup_ref(rel, phys) > 0)
-		return;
 	if (own)
 		block_list_add(own, blkno);
 
@@ -5274,6 +5342,11 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
  * follows another walks only what changed in between.  With 'own', the
  * blocks are collected into it, at any WAL level.  The header is held
  * exclusively.
+ *
+ * 'ptr' is the relation's own node (tree_node_own()).  Its children's
+ * counts are looked up together (lookup_refs()): a node copied for one
+ * change has a child for each leaf under it, up to a node's fanout, and a
+ * leaf an entry for each block, every one of which is asked about.
  */
 static void
 tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
@@ -5282,9 +5355,13 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	BmapEntry  *entries;
+	BlockNumber *ask;
+	uint32	   *slot;
+	uint8	   *counts;
+	uint32		nask = 0;
 	Buffer		buf;
 
-	if (first >= nblocks || !tree_node_own(rel, ptr, epoch, true))
+	if (first >= nblocks)
 		return;
 	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	buf = tree_read(rel, ptr->block, RBM_NORMAL);
@@ -5297,12 +5374,39 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
 		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * The children whose counts say whether they are the relation's own: a
+	 * leaf's every block, a node's children set before the map's epoch
+	 * (those set in it are its own whatever their count)
+	 */
+	ask = palloc(BMAP_TREE_FANOUT * sizeof(BlockNumber));
+	slot = palloc(BMAP_TREE_FANOUT * sizeof(uint32));
+	counts = palloc(BMAP_TREE_FANOUT * sizeof(uint8));
 	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
 	{
 		uint64		child = (uint64) first + (level == 0 ? i :
 											   i * tree_span(level - 1));
 
 		if (!BlockNumberIsValid(entries[i].block) || child >= nblocks)
+			continue;
+		if (level > 0 && entries[i].epoch >= epoch)
+			continue;
+		ask[nask] = entries[i].block;
+		slot[nask++] = i;
+	}
+	lookup_refs(rel, ask, nask, counts);
+	for (uint32 k = 0, i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		uint64		child = (uint64) first + (level == 0 ? i :
+											   i * tree_span(level - 1));
+		bool		held_elsewhere = false;
+
+		if (!BlockNumberIsValid(entries[i].block) || child >= nblocks)
+			continue;
+		if (k < nask && slot[k] == i)
+			held_elsewhere = counts[k++] > 0;
+		if (held_elsewhere)
 			continue;
 		if (level == 0)
 			preserve_shared_page(src, (BlockNumber) child, entries[i].block,
@@ -5311,6 +5415,9 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 			tree_preserve_node(src, &entries[i], level - 1,
 							   (BlockNumber) child, nblocks, epoch, own);
 	}
+	pfree(counts);
+	pfree(slot);
+	pfree(ask);
 	pfree(entries);
 }
 
@@ -5333,7 +5440,8 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
 	UnlockReleaseBuffer(buf);
 	for (int k = 0; k < BMAP_TREE_TOPS && first < nblocks; k++)
 	{
-		if (BlockNumberIsValid(root.top[k].block))
+		if (BlockNumberIsValid(root.top[k].block) &&
+			tree_node_own(rel, &root.top[k], epoch, true))
 			tree_preserve_node(src, &root.top[k], k, (BlockNumber) first,
 							   nblocks, epoch, own);
 		first += tree_span(k);
