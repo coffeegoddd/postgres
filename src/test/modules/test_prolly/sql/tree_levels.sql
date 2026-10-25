@@ -1,0 +1,48 @@
+-- A tree node's level comes from its chunk, which another server may have
+-- made: a node of level MAX_LEVELS (32) or more, or a child not one level
+-- below its parent, is refused (DATA_CORRUPTED) by every reader, which
+-- keeps a frame a level and descends by level.  Nodes made by hand: a leaf
+-- of one item, and chains of one-child internal nodes above it.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE FUNCTION pg_temp.chain(top int) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE h text := test_chunk_put_leaf(ARRAY['\x6e'::bytea]);
+BEGIN
+	FOR lv IN 1..top LOOP
+		h := test_chunk_put_node(lv, ARRAY[h]);
+	END LOOP;
+	RETURN h;
+END $$;
+
+-- each reader's count, or its error's code and message
+CREATE FUNCTION pg_temp.reads(root text) RETURNS TABLE (how text, result text)
+LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+	FOREACH how IN ARRAY ARRAY['scan', 'walk', 'diff', 'diff_nodes', 'diff_unordered',
+							   'diff_estimate', 'rank', 'apply'] LOOP
+		BEGIN
+			result := test_tree_read(root, how)::text;
+		EXCEPTION WHEN OTHERS THEN
+			result := SQLSTATE || ': ' || SQLERRM;
+		END;
+		RETURN NEXT;
+	END LOOP;
+END $$;
+
+-- 31 levels above the leaf: a tree as tall as one may be
+SELECT * FROM pg_temp.reads(pg_temp.chain(31));
+
+-- 32: too tall
+SELECT * FROM pg_temp.reads(pg_temp.chain(32));
+
+-- a node of level 2 naming a leaf
+SELECT * FROM pg_temp.reads(test_chunk_put_node(2, ARRAY[test_chunk_put_leaf(ARRAY['\x6e'::bytea])]));
+
+-- a node of level 1 naming one of level 1
+SELECT * FROM pg_temp.reads(test_chunk_put_node(1, ARRAY[pg_temp.chain(1)]));
+
+-- a root of level 65535 naming a leaf
+SELECT * FROM pg_temp.reads(test_chunk_put_node(65535, ARRAY[test_chunk_put_leaf(ARRAY['\x6e'::bytea])]));

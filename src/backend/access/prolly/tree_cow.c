@@ -242,15 +242,23 @@ kept_put(const ProllyHash *hash, const char *data, Size len)
 	}
 }
 
+/* (as node_read_level()'s level) a node of any level a tree may have */
+#define LEVEL_ANY		(-1)
+
 /*
  * A chunk node by hash, from the chunk store (or the open scope's kept
  * nodes), its bytes allocated in cxt: the context of whatever keeps the
  * node (an iterator, a cursor), which may outlive the one current at the
  * read.  root: the node is a tree's root, kept even if it is a leaf.
+ * level: the level the node must be at (its parent's less one), or
+ * LEVEL_ANY.  A node's level comes from its chunk, which may be another
+ * server's: none is MAX_LEVELS or more (every walk keeps a frame a level),
+ * and each child is one level below its parent, so a walk's depth is the
+ * root's level.
  */
 static void
-node_read_keep(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
-			   MemoryContext cxt, bool root)
+node_read_level(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+				MemoryContext cxt, bool root, int level)
 {
 	StringInfoData data;
 	MemoryContext old = MemoryContextSwitchTo(cxt);
@@ -285,8 +293,25 @@ node_read_keep(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 	node->level = node->chunk.level;
 	node->nitems = node->chunk.nitems;
 	node->ref = *ref;
+	if (node->level >= MAX_LEVELS)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly tree node of level %u: a tree has at most %d levels",
+						node->level, MAX_LEVELS)));
+	if (level != LEVEL_ANY && node->level != level)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly tree node of level %u below a node of level %d",
+						node->level, level + 1)));
 	if (kn == NULL && (root || node->level > 0))
 		kept_put(&ref->hash, data.data, data.len);
+}
+
+static void
+node_read_keep(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+			   MemoryContext cxt, bool root)
+{
+	node_read_level(env, ref, node, cxt, root, LEVEL_ANY);
 }
 
 static void
@@ -301,6 +326,14 @@ static void
 node_read(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node)
 {
 	node_read_in(env, ref, node, CurrentMemoryContext);
+}
+
+/* Read the child at ref of a node of level parent, in cxt. */
+static void
+node_read_child(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
+				MemoryContext cxt, uint16 parent)
+{
+	node_read_level(env, ref, node, cxt, false, (int) parent - 1);
 }
 
 static void
@@ -912,13 +945,13 @@ prefetch_range(const ProllyTreeEnv *env, TNode *node, uint64 offset,
  * its parent (or the reference, for the root) says holds size bytes.
  */
 static void
-read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
 				 uint64 size, uint64 offset, uint64 len, StringInfo out)
 {
 	TNode		node;
 
 	CHECK_FOR_INTERRUPTS();
-	node_read(env, ref, &node);
+	node_read_level(env, ref, &node, CurrentMemoryContext, false, level);
 	if (node.level == 0)
 	{
 		ProllyKey	k;
@@ -952,7 +985,7 @@ read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 				continue;
 			}
 			take = Min(len, count - offset);
-			read_value_range(env, &child, count, offset, take, out);
+			read_value_range(env, &child, node.level - 1, count, offset, take, out);
 			len -= take;
 			offset = 0;
 		}
@@ -988,7 +1021,7 @@ read_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 				 errmsg("prolly value of %llu bytes is too large to read",
 						(unsigned long long) len)));
 	enlargeStringInfo(out, (int) len);
-	read_value_range(&venv, &root, total, offset, len, out);
+	read_value_range(&venv, &root, LEVEL_ANY, total, offset, len, out);
 }
 
 /* Append the bytes of the value a reference refers to. */
@@ -1087,7 +1120,8 @@ splice_next(const ProllyTreeEnv *env, SpliceCursor *cs, int k)
 		c->at_end = true;
 		return;
 	}
-	node_read(env, &cs[k + 1].ref, &c->parent);
+	node_read_level(env, &cs[k + 1].ref, &c->parent, CurrentMemoryContext, false,
+					k + 1);
 	splice_cursor_at(env, c, 0);
 }
 
@@ -1213,7 +1247,7 @@ static void
 splice_leaf_bytes(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 				  uint64 count, uint64 from, StringInfo out)
 {
-	read_value_range(env, ref, count, from, count - from, out);
+	read_value_range(env, ref, 0, count, from, count - from, out);
 }
 
 /*
@@ -1290,7 +1324,8 @@ splice_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 		SpliceCursor *c = &cs[k];
 		int			i = 0;
 
-		node_read(&venv, &cs[k + 1].ref, &c->parent);
+		node_read_level(&venv, &cs[k + 1].ref, &c->parent, CurrentMemoryContext,
+						false, k + 1);
 		if (k + 1 < height)
 			path[k + 1] = c->parent;
 		c->start = cs[k + 1].start;
@@ -1326,7 +1361,7 @@ splice_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 		initStringInfo(&chunk);
 		initStringInfo(&tail);
 		if (offset > cs[0].start)
-			read_value_range(&venv, &cs[0].ref, cs[0].count, 0,
+			read_value_range(&venv, &cs[0].ref, 0, cs[0].count, 0,
 							 offset - cs[0].start, &tail);
 		appendBinaryStringInfo(&tail, (const char *) insert, ilen);
 		for (;;)
@@ -1439,14 +1474,15 @@ splice_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 		ProllyNodeRef r = {0};
 
 		r.hash = made.nodes[0].only;
-		for (;;)
+		for (int want = LEVEL_ANY;;)
 		{
 			TNode		n;
 			ProllyNodeRef child;
 			uint64		count;
 
 			top = r.hash;
-			node_read(&venv, &r, &n);
+			node_read_level(&venv, &r, &n, CurrentMemoryContext, false, want);
+			want = (int) n.level - 1;
 			if (n.level == 0 || n.nitems != 1)
 			{
 				node_release(&n);
@@ -1981,7 +2017,8 @@ iter_load_child(Iter *it, int d)
 			   ref.hash.len) == 0)
 		return;
 	node_release(&it->f[d + 1].node);
-	node_read_in(it->env, &ref, &it->f[d + 1].node, it->cxt);
+	node_read_child(it->env, &ref, &it->f[d + 1].node, it->cxt,
+					it->f[d].node.level);
 }
 
 /*
@@ -2174,6 +2211,7 @@ cow_rank(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 {
 	ProllyNodeRef ref = *root;
 	uint64		below = 0;
+	int			level = LEVEL_ANY;
 
 	for (;;)
 	{
@@ -2181,7 +2219,8 @@ cow_rank(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		int			idx;
 		uint64		count;
 
-		node_read(env, &ref, &node);
+		node_read_level(env, &ref, &node, CurrentMemoryContext, false, level);
+		level = (int) node.level - 1;
 		idx = lower_bound(env, &node, key);
 		if (node.level == 0)
 		{
@@ -2271,7 +2310,7 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 	pfree(hashes);
 }
 
-static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+static bool walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
 					  ProllyTreeVisitNode visit, void *arg);
 
 /*
@@ -2295,25 +2334,25 @@ walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
 	if (flags & PROLLY_ITEM_VALUE_REF)
 	{
 		decode_value_ref(&v, &vroot, &len);
-		(void) walk_node(&venv, &vroot, visit, arg);
+		(void) walk_node(&venv, &vroot, LEVEL_ANY, visit, arg);
 	}
 	for (const char *p = (const char *) refs.data, *end = p + refs.len; p < end;)
 	{
 		next_value_ref(&p, end, &vroot, &len);
-		(void) walk_node(&venv, &vroot, visit, arg);
+		(void) walk_node(&venv, &vroot, LEVEL_ANY, visit, arg);
 	}
 }
 
 /* Whether the visitor took the node. */
 static bool
-walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref, int level,
 		  ProllyTreeVisitNode visit, void *arg)
 {
 	TNode		node;
 	bool		took;
 
 	CHECK_FOR_INTERRUPTS();
-	node_read(env, ref, &node);
+	node_read_level(env, ref, &node, CurrentMemoryContext, false, level);
 	took = visit(&node.ref, node.level, arg);
 	if (took)
 		prefetch_below(env, &node);
@@ -2340,7 +2379,7 @@ walk_node(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 			uint64		count;
 
 			node_child(env, &node, i, &child, &count);
-			(void) walk_node(env, &child, visit, arg);
+			(void) walk_node(env, &child, node.level - 1, visit, arg);
 		}
 	}
 	node_release(&node);
@@ -2351,7 +2390,7 @@ static bool
 cow_walk(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 		 ProllyTreeVisitNode visit, void *arg)
 {
-	return walk_node(env, root, visit, arg);
+	return walk_node(env, root, LEVEL_ANY, visit, arg);
 }
 
 /* ------------------------------------------------------------------------
@@ -2840,13 +2879,14 @@ apply_edits(const ProllyTreeEnv *env, const ProllyNodeRef *root,
 			kept_put(&result.hash, last_leaf.data, last_leaf.len);
 
 		/* A root with one child isn't a root: its child is. */
-		for (;;)
+		for (int want = LEVEL_ANY;;)
 		{
 			TNode		n;
 			ProllyNodeRef child;
 			uint64		count;
 
-			node_read(env, &result, &n);
+			node_read_level(env, &result, &n, CurrentMemoryContext, false, want);
+			want = (int) n.level - 1;
 			if (n.level == 0 || n.nitems != 1)
 			{
 				node_release(&n);
@@ -2971,7 +3011,8 @@ side_descend(DiffSide *s)
 		elog(ERROR, "prolly tree is more than %d levels high", MAX_LEVELS);
 	side_child(s, &ref);
 	child = &s->f[s->depth + 1];
-	node_read_in(s->env, &ref, &child->node, s->cxt);
+	node_read_child(s->env, &ref, &child->node, s->cxt,
+					s->f[s->depth].node.level);
 	if (child->node.nitems == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -3235,10 +3276,11 @@ loose_expand(const ProllyTreeEnv *env, LooseSide *s, int i)
 {
 	TNode		node;
 	ProllyNodeRef ref = s->nodes[i];
+	uint16		level = s->levels[i];
 
 	s->nodes[i] = s->nodes[--s->n];
 	s->levels[i] = s->levels[s->n];
-	node_read(env, &ref, &node);
+	node_read_level(env, &ref, &node, CurrentMemoryContext, false, level);
 	for (int j = 0; j < node.nitems; j++)
 	{
 		if (node.level > 0)
@@ -3497,9 +3539,10 @@ estimate_expand(const ProllyTreeEnv *env, EstimateSide *s, int i)
 {
 	TNode		node;
 	ProllyNodeRef ref = s->nodes[i];
+	uint16		level = s->levels[i];
 
 	estimate_drop_node(s, i);
-	node_read(env, &ref, &node);
+	node_read_level(env, &ref, &node, CurrentMemoryContext, false, level);
 	for (int j = 0; j < node.nitems; j++)
 	{
 		if (node.level > 0)
@@ -3693,7 +3736,7 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 
 	if (from == NULL || from->hash.len == 0)
 	{
-		(void) walk_node(env, to, visit, arg);
+		(void) walk_node(env, to, LEVEL_ANY, visit, arg);
 		return;
 	}
 	if (same_hash(&from->hash, &to->hash))
@@ -3721,7 +3764,7 @@ cow_diff_nodes(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			if (side_height(&b) > 0)
 			{
 				side_child(&b, &cb);
-				(void) walk_node(env, &cb, visit, arg);
+				(void) walk_node(env, &cb, side_height(&b) - 1, visit, arg);
 			}
 			else
 			{

@@ -209,6 +209,10 @@ RESET client_min_messages;
 SELECT test_chunk_move_root(test_chunk_root(), test_chunk_declaring_tree('{}'));
 SELECT name FROM dolt_branches;
 SELECT dolt_tag('v1');
+-- (and refs of the format before this build's)
+SELECT test_chunk_move_root(test_chunk_root(),
+							test_chunk_items_tree('{!}', '{14}'));
+SELECT name FROM dolt_branches;
 \c :db
 DROP DATABASE regress_tags_old;
 SELECT :'dir' || '/old-' || txid_current() AS olddir \gset

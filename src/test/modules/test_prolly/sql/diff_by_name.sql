@@ -212,9 +212,8 @@ SET ROLE regress_dn_reader;
 SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
 RESET ROLE;
 SELECT dolt_reset('--soft', :'five_head') IS NOT NULL AS back;
--- (a head moved to the dropped table's commit and then committed records
--- the re-made table at a commit whose parent holds the dropped one, which
--- the names and identities alone can't tell from one table: #891, #895)
+-- (a head moved to the dropped table's commit and then committed:
+-- lineage_breaks)
 SELECT dolt_branch('-D', 'dn_side') IS NOT NULL AS deleted;
 SELECT dolt_branch('-D', 'dn_other') IS NOT NULL AS deleted;
 

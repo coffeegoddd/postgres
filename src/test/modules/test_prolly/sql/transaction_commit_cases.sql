@@ -239,10 +239,23 @@ SET dolt.transaction_commit = off;
 INSERT INTO tcc.w SELECT g, 'v' || g FROM generate_series(1, 2000) g;
 SELECT length(dolt_commit('-Am', 'tcc cost')::text) AS committed;
 SET dolt.transaction_commit = on;
+-- (Each is measured three times, and the least of each counter taken: the
+-- counters are the database's, and what another process does for it
+-- meanwhile, under load, only adds.)
 CREATE TEMP TABLE cost (k text, name text, value bigint);
 SELECT pg_stat_force_next_flush() IS NULL AS flushed;
 SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
 UPDATE tcc.w SET v = 'clean' WHERE id = 10;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+UPDATE tcc.w SET v = 'clean' WHERE id = 13;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+UPDATE tcc.w SET v = 'clean' WHERE id = 14;
 SELECT pg_stat_force_next_flush() IS NULL AS flushed;
 INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
 SET dolt.transaction_commit = off;
@@ -254,11 +267,22 @@ SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
 UPDATE tcc.w SET v = 'busy' WHERE id = 11;
 SELECT pg_stat_force_next_flush() IS NULL AS flushed;
 INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+UPDATE tcc.w SET v = 'busy' WHERE id = 15;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+UPDATE tcc.w SET v = 'busy' WHERE id = 16;
+SELECT pg_stat_force_next_flush() IS NULL AS flushed;
+INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
 SELECT c.name, c.value = b.value AS same,
 	CASE WHEN c.name NOT LIKE 'fold\_%' THEN c.value > 0 END AS counted
-  FROM cost c JOIN cost b USING (name)
- WHERE c.k = 'clean' AND b.k = 'busy'
-   AND c.name IN ('nodes_read', 'nodes_written', 'commits', 'fold_rows_read',
+  FROM (SELECT name, min(value) AS value FROM cost WHERE k = 'clean' GROUP BY name) c
+  JOIN (SELECT name, min(value) AS value FROM cost WHERE k = 'busy' GROUP BY name) b
+ USING (name)
+ WHERE c.name IN ('nodes_read', 'nodes_written', 'commits', 'fold_rows_read',
 				  'fold_pages', 'fold_candidates', 'fold_full_tables')
  ORDER BY c.name;
 SELECT (SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.w)) AS committed_rows,

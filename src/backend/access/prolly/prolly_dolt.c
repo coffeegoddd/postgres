@@ -1151,6 +1151,28 @@ prolly_check_branch_rename(const char *newname)
 }
 
 /*
+ * Run fn(arg) with prolly_move_provenance the commits from (n of them): the
+ * commits a move takes versions from, which the tables it makes take their
+ * relations' equivalence classes from.
+ */
+#define WITH_PROVENANCE(from_, n_, ...) \
+	do { \
+		List	   *prov_ = NIL; \
+		for (int pi_ = 0; pi_ < (n_); pi_++) \
+			prov_ = lappend(prov_, (void *) &(from_)[pi_]); \
+		prolly_move_provenance = prov_; \
+		PG_TRY(_provenance); \
+		{ \
+			__VA_ARGS__; \
+		} \
+		PG_FINALLY(_provenance); \
+		{ \
+			prolly_move_provenance = NIL; \
+		} \
+		PG_END_TRY(_provenance); \
+	} while (0)
+
+/*
  * Hold the refs (to the transaction's end) before what reads the head and
  * then replaces commits from it, as an amend or a rebase does: a commit
  * another session made in between would be dropped from the branch, the
@@ -2609,8 +2631,10 @@ dolt_merge(PG_FUNCTION_ARGS)
 	date_given = dated;
 	PG_TRY();
 	{
-		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
-													 message, flags, &id));
+		WITH_PROVENANCE(&theirs, theirs.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge,
+																	 branch, message,
+																	 flags, &id)));
 	}
 	PG_FINALLY();
 	{
@@ -3237,8 +3261,10 @@ dolt_integrate(PG_FUNCTION_ARGS)
 		check_integrated_rows(target, needs);
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
-	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
-												 message, 0, &id));
+	/* (the tables it makes take their classes from mine's head's record) */
+	WITH_PROVENANCE(&mine_head, mine_head.len > 0 ? 1 : 0,
+					BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
+																 message, 0, &id)));
 	if (conflicts > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3252,8 +3278,9 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	/* and the branch, fast-forwarded to target's new head */
 	checkout_branch(mine);
 	note_integration();
-	BRANCH_WRITES_HUSHED((void) PROLLY_CALL(diff_merge(), merge, target, NULL,
-											0, &ignored));
+	WITH_PROVENANCE(&id, id.len > 0 ? 1 : 0,
+					BRANCH_WRITES_HUSHED((void) PROLLY_CALL(diff_merge(), merge, target, NULL,
+															0, &ignored)));
 	settled();
 
 	branch_return_done(returning);
@@ -3398,7 +3425,14 @@ dolt_reset(PG_FUNCTION_ARGS)
 		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 		PROLLY_CALL(writers(), take, MyBranch);
 	note_integration();
-	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+	{
+		ProllyHash	target = {0};
+
+		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+		WITH_PROVENANCE(&target, target.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset,
+														 ref ? ref : "HEAD")));
+	}
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -4000,8 +4034,15 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	prolly_check_head_move(branch_ops()->current());
 	refuse_violations("cherry-pick");
 	note_integration();
-	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
-												 &ref, 1, allow_empty, &id));
+	{
+		ProllyHash	picked = {0};
+
+		(void) PROLLY_CALL(refs(), resolve, ref, &picked);
+		WITH_PROVENANCE(&picked, picked.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+																	 &ref, 1, allow_empty,
+																	 &id)));
+	}
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
@@ -4036,8 +4077,25 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 
 	refuse_violations("revert");
 	note_integration();
-	BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
-											   series_head, &id));
+	{
+		ProllyHash *from = palloc0(sizeof(ProllyHash) * Max(n, 1));
+		int			nfrom = 0;
+
+		/* (a revert brings back what each commit's parent had) */
+		for (int i = 0; i < n; i++)
+		{
+			ProllyHash	c;
+			ProllyCommitInfo info;
+
+			if (PROLLY_CALL(refs(), resolve, ids[i], &c) &&
+				PROLLY_CALL(refs(), commit_get, &c, &info) && info.nparents > 0)
+				from[nfrom++] = info.parents[0];
+		}
+		WITH_PROVENANCE(from, nfrom,
+						BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert,
+																   ids, n, series_head,
+																   &id)));
+	}
 	must_commit(stopped, "a revert");
 	if (stopped > 0)
 	{
@@ -6951,15 +7009,17 @@ named_table(List *rows, const char *name)
 }
 
 /*
- * What a table of the session's has been called back through history: the
- * versions that are it, as commits name tables.  A commit holds tables by
- * name alone, so a table here vouches for a version of its name only if
- * the name was never without a table between them: from the working set
- * back through the head, each commit's parents, a step at a time, the name
- * followed across a rename the step pairs.  A table dropped and made again
- * by its name breaks it, at the commit that hasn't one: the older one's
- * rows aren't this one's, whatever grants this one has.  Walked as far as
- * a question needs (lineage_has()), each commit seen once.
+ * A table of the session's history: the versions that are it, as the
+ * commits this database made record the relations they were made from
+ * (refs' commit_relations()).  A commit holds tables by name and identity
+ * alone, and a table made again keeps its name's identity, so its names
+ * can't tell the table from another of its name; its record can.  From the
+ * working set back through the head, each commit's parents, a step is
+ * taken only where both commits were made from the table's relation (its
+ * name at each, a rename followed, as the record has it).  A commit without
+ * a record (made elsewhere: fetched, cloned, pushed here) is no version of
+ * it.  Walked as far as a question needs (lineage_has()), each commit's
+ * record read once.
  */
 typedef struct LineageStep
 {
@@ -6974,47 +7034,68 @@ typedef struct NameLineage
 	Oid			relid;			/* and its relation */
 	HTAB	   *steps;			/* LineageStep, each version reached */
 	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
+	HTAB	   *apart;			/* commits a walk back from found apart */
+	HTAB	   *classes;		/* relations' classes, as read (RelClass) */
+	Oid			cls;			/* relid's */
 	bool		started;
 } NameLineage;
 
+typedef struct RelClass
+{
+	Oid			relid;
+	Oid			cls;
+} RelClass;
+
+/* relid's equivalence class (refs' relation_class()), read once a lineage */
+static Oid
+lineage_class(NameLineage *l, Oid relid)
+{
+	RelClass   *rc;
+	bool		found;
+
+	if (!PROLLY_HAS(refs(), relation_class))
+		return relid;
+	if (l->classes == NULL)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(RelClass);
+		ctl.hcxt = CurrentMemoryContext;
+		l->classes = hash_create("prolly relation classes", 64, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	rc = hash_search(l->classes, &relid, HASH_ENTER, &found);
+	if (!found)
+		rc->cls = PROLLY_CALL(refs(), relation_class, relid);
+	return rc->cls;
+}
+
 /*
- * The name in from of to's table name: name if the step's changes don't
- * list it; NULL if to made it (from has none), or a read left it out.
- * The step's summary is made in a context of its own, freed after: only
- * the name is kept, in the caller's.
+ * The name l's table had in commit, as its record has it; NULL if the
+ * commit wasn't made from a relation of the table's class (the relation
+ * itself, or one the same table as it: refs' relation_class()), or has no
+ * record.
  */
 static char *
-lineage_name_before(const char *from, const char *to, const char *name)
+made_from(NameLineage *l, const ProllyHash *commit)
 {
-	MemoryContext caller = CurrentMemoryContext;
-	MemoryContext step = AllocSetContextCreate(caller, "prolly lineage step",
-											   ALLOCSET_DEFAULT_SIZES);
-	List	   *rows = NIL;
+	List	   *relations;
 	ListCell   *lc;
-	const char *before = name;
 
-	MemoryContextSwitchTo(step);
-	PROLLY_CALL(diff_merge(), summary, from, to, false, collect_change, &rows);
-	foreach(lc, rows)
+	if (!OidIsValid(l->relid) || !PROLLY_HAS(refs(), commit_relations) ||
+		!PROLLY_CALL(refs(), commit_relations, commit, &relations))
+		return NULL;
+	if (!OidIsValid(l->cls))
+		l->cls = lineage_class(l, l->relid);
+	foreach(lc, relations)
 	{
-		SummaryRow *r = lfirst(lc);
+		ProllyCommitRelation *r = lfirst(lc);
 
-		if (r->not_covered && r->from_name && strcmp(r->from_name, name) == 0)
-		{
-			before = NULL;
-			break;
-		}
-		if (r->object == PROLLY_OBJECT_TABLE && r->to_name &&
-			strcmp(r->to_name, name) == 0)
-		{
-			before = r->from_name;
-			break;
-		}
+		if (r->relid == l->relid || lineage_class(l, r->relid) == l->cls)
+			return r->name;
 	}
-	MemoryContextSwitchTo(caller);
-	before = before ? pstrdup(before) : NULL;
-	MemoryContextDelete(step);
-	return (char *) before;
+	return NULL;
 }
 
 static void
@@ -7028,59 +7109,28 @@ lineage_enter(NameLineage *l, const char *key, const char *name)
 		st->name = pstrdup(name);
 }
 
-/*
- * Is commit to, its table named to_name, reached back from commit from,
- * its table named from_name, by parents, the name never without a table
- * between (a rename followed)?
- */
-static bool
-name_walk_reaches(const ProllyHash *from, const char *from_name,
-				  const ProllyHash *to, const char *to_name)
+/* commit's parents made from l's relation, each with its name there, to queue */
+static List *
+parents_made_from(NameLineage *l, const ProllyHash *commit, List *queue,
+				  HTAB *seen)
 {
-	List	   *queue = list_make2(copy_hash(from), pstrdup(from_name));
-	HTAB	   *seen;
-	HASHCTL		ctl = {0};
-	bool		found = false;
+	ProllyCommitInfo info;
+	char	   *hex = hash_hex(commit);
 
-	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
-	ctl.entrysize = PROLLY_HASH_MAX_LEN * 2 + 1;
-	ctl.hcxt = CurrentMemoryContext;
-	seen = hash_create("prolly name walk", 64, &ctl,
-					   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-	while (queue != NIL && !found)
+	if (!PROLLY_CALL(refs(), commit_get, commit, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit %s is missing", hex)));
+	for (int i = 0; i < info.nparents; i++)
 	{
-		ProllyHash *at = linitial(queue);
-		char	   *at_name = lsecond(queue);
-		char	   *hex = hash_hex(at);
-		ProllyCommitInfo info;
-		bool		dup;
+		char	   *name;
 
-		CHECK_FOR_INTERRUPTS();
-		queue = list_delete_first(list_delete_first(queue));
-		(void) hash_search(seen, hex, HASH_ENTER, &dup);
-		if (dup)
+		if (hash_search(seen, hash_hex(&info.parents[i]), HASH_FIND, NULL) != NULL)
 			continue;
-		if (same_hash(at, to))
-		{
-			found = strcmp(at_name, to_name) == 0;
-			break;
-		}
-		if (!PROLLY_CALL(refs(), commit_get, at, &info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit %s is missing", hex)));
-		for (int i = 0; i < info.nparents; i++)
-		{
-			char	   *before = lineage_name_before(hash_hex(&info.parents[i]),
-													 hex, at_name);
-
-			if (before)
-				queue = lappend(lappend(queue, copy_hash(&info.parents[i])),
-								before);
-		}
+		if ((name = made_from(l, &info.parents[i])) != NULL)
+			queue = lappend(lappend(queue, copy_hash(&info.parents[i])), name);
 	}
-	hash_destroy(seen);
-	return found;
+	return queue;
 }
 
 /*
@@ -7105,36 +7155,14 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 
 	if (!l->started)
 	{
-		char	   *before;
-		ProllyHash	at;
+		char	   *at_name;
 
 		l->started = true;
 		lineage_enter(l, "WORKING", l->now);
-
-		/*
-		 * (the head's version is this table only by the branch's own record
-		 * of its tables, made by its last commit, that has this relation: a
-		 * table made again with the name, or a head moved to a commit
-		 * holding another table of it, has the same name and identity, so
-		 * the step's changes can't tell.  The head moved since without a
-		 * commit, its version is this table's if one of the head and the
-		 * record's commit is the other's ancestor with the table's name
-		 * never without a table between: a fast-forward, a reset to an
-		 * earlier version of it)
-		 */
-		if (OidIsValid(l->relid) && PROLLY_HAS(refs(), recorded_relation) &&
-			PROLLY_CALL(refs(), recorded_relation, l->relid, &at) &&
-			PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
-			(before = lineage_name_before(hash_hex(&h), "WORKING", l->now)) != NULL)
-		{
-			char	   *at_name;
-
-			if (same_hash(&h, &at) ||
-				((at_name = lineage_name_before(hash_hex(&at), "WORKING", l->now)) != NULL &&
-				 (name_walk_reaches(&h, before, &at, at_name) ||
-				  name_walk_reaches(&at, at_name, &h, before))))
-				l->queue = lappend(lappend(l->queue, copy_hash(&h)), before);
-		}
+		/* (the head's version is the table's if the head was made of it) */
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
+			(at_name = made_from(l, &h)) != NULL)
+			l->queue = lappend(lappend(l->queue, copy_hash(&h)), at_name);
 	}
 	while ((st = hash_search(l->steps, key, HASH_FIND, NULL)) == NULL &&
 		   l->queue != NIL)
@@ -7142,42 +7170,35 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 		ProllyHash *at = linitial(l->queue);
 		char	   *at_name = lsecond(l->queue);
 		char	   *hex = hash_hex(at);
-		ProllyCommitInfo info;
 
 		CHECK_FOR_INTERRUPTS();
 		l->queue = list_delete_first(list_delete_first(l->queue));
 		if (hash_search(l->steps, hex, HASH_FIND, NULL) != NULL)
 			continue;
 		lineage_enter(l, hex, at_name);
-		if (!PROLLY_CALL(refs(), commit_get, at, &info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit %s is missing", hex)));
-		for (int i = 0; i < info.nparents; i++)
-		{
-			char	   *phex = hash_hex(&info.parents[i]);
-			char	   *before;
-
-			if (hash_search(l->steps, phex, HASH_FIND, NULL) != NULL)
-				continue;
-			before = lineage_name_before(phex, hex, at_name);
-			if (before)
-				l->queue = lappend(lappend(l->queue, copy_hash(&info.parents[i])),
-								   before);
-		}
+		l->queue = parents_made_from(l, at, l->queue, l->steps);
 	}
 	return st != NULL && strcmp(st->name, name) == 0;
 }
 
+/* a commit a walk back from another ref reached, and how */
+typedef struct ReachStep
+{
+	char		key[PROLLY_HASH_MAX_LEN * 2 + 1];	/* the commit's hex */
+	char		child[PROLLY_HASH_MAX_LEN * 2 + 1]; /* the one it was reached
+													 * from ("": the ref) */
+	char	   *name;			/* the table's name there */
+} ReachStep;
+
 /*
  * Is the version ref has of the table named name l's table, in ref's
  * history if not the session's?  One of the lineage's versions
- * (lineage_has()), or one that later commits made of one of them, the
- * name never without a table between: another branch's commit, made from
- * the history this table shares.  Walked back from ref, a step at a time,
- * until a path meets a version of the lineage (it is l's table only if it
- * has l's name there) or its name was without a table (made since: another
- * table).
+ * (lineage_has()), or a commit made from the table's relation whose walk
+ * back, by such commits, meets one of them: another branch's commit, made
+ * from the history this table shares.  A walk that meets the lineage adds
+ * the path it took to it, and one that meets none marks every commit it
+ * saw apart, so no later walk takes either again: each commit's record is
+ * read about once a lineage.
  */
 static bool
 lineage_reaches(NameLineage *l, const char *ref, const char *name)
@@ -7186,36 +7207,44 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 	List	   *queue = NIL;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
-	bool		found = false;
+	ReachStep  *found = NULL;
+	ReachStep  *rs;
+	char	   *at_name;
+	HASH_SEQ_STATUS hs;
 
 	if (lineage_has(l, ref, name))
 		return true;
 	if (ref == NULL || pg_strcasecmp(ref, "WORKING") == 0 ||
 		pg_strcasecmp(ref, "STAGED") == 0 ||
-		!PROLLY_CALL(refs(), resolve, ref, &h))
+		!PROLLY_CALL(refs(), resolve, ref, &h) ||
+		(at_name = made_from(l, &h)) == NULL ||
+		strcmp(at_name, name) != 0)
 		return false;
 	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
 	ctl.entrysize = PROLLY_HASH_MAX_LEN * 2 + 1;
 	ctl.hcxt = CurrentMemoryContext;
+	if (l->apart == NULL)
+		l->apart = hash_create("prolly lineage apart", 64, &ctl,
+							   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	ctl.entrysize = sizeof(ReachStep);
 	seen = hash_create("prolly lineage reached", 64, &ctl,
 					   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-	queue = lappend(lappend(queue, copy_hash(&h)), pstrdup(name));
-	while (queue != NIL && !found)
+	rs = hash_search(seen, hash_hex(&h), HASH_ENTER, NULL);
+	rs->child[0] = '\0';
+	rs->name = at_name;
+	queue = lappend(queue, copy_hash(&h));
+	while (queue != NIL && found == NULL)
 	{
 		ProllyHash *at = linitial(queue);
-		char	   *at_name = lsecond(queue);
 		char	   *hex = hash_hex(at);
 		ProllyCommitInfo info;
-		bool		dup;
 
 		CHECK_FOR_INTERRUPTS();
-		queue = list_delete_first(list_delete_first(queue));
-		(void) hash_search(seen, hex, HASH_ENTER, &dup);
-		if (dup)
-			continue;
-		if (lineage_has(l, hex, at_name))
+		queue = list_delete_first(queue);
+		rs = hash_search(seen, hex, HASH_FIND, NULL);
+		if (lineage_has(l, hex, rs->name))
 		{
-			found = true;
+			found = rs;
 			break;
 		}
 		/* (a version of the lineage of another name: another table's) */
@@ -7227,16 +7256,38 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 					 errmsg("prolly commit %s is missing", hex)));
 		for (int i = 0; i < info.nparents; i++)
 		{
-			char	   *before = lineage_name_before(hash_hex(&info.parents[i]),
-													 hex, at_name);
+			char	   *phex = hash_hex(&info.parents[i]);
+			char	   *pname;
+			bool		dup;
+			ReachStep  *ps;
 
-			if (before)
-				queue = lappend(lappend(queue, copy_hash(&info.parents[i])),
-								before);
+			if (hash_search(l->apart, phex, HASH_FIND, NULL) != NULL ||
+				hash_search(seen, phex, HASH_FIND, NULL) != NULL ||
+				(pname = made_from(l, &info.parents[i])) == NULL)
+				continue;
+			ps = hash_search(seen, phex, HASH_ENTER, &dup);
+			strlcpy(ps->child, hex, sizeof(ps->child));
+			ps->name = pname;
+			queue = lappend(queue, copy_hash(&info.parents[i]));
 		}
 	}
+	if (found != NULL)
+	{
+		/* (the path from the ref to the lineage joins it) */
+		for (rs = found; rs->child[0] != '\0';)
+		{
+			rs = hash_search(seen, rs->child, HASH_FIND, NULL);
+			lineage_enter(l, rs->key, rs->name);
+		}
+	}
+	else
+	{
+		hash_seq_init(&hs, seen);
+		while ((rs = hash_seq_search(&hs)) != NULL)
+			(void) hash_search(l->apart, rs->key, HASH_ENTER, NULL);
+	}
 	hash_destroy(seen);
-	return found;
+	return found != NULL;
 }
 
 /* The lineage of the table here named now: from lineages, or begun. */
