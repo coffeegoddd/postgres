@@ -62,13 +62,26 @@ sub interleave
 	sql(q{SELECT test_bmap_release_drain()});
 }
 
-# a sweep stopped before a move, holding a relation of the versioned schema
+# kp.t's file number, on the session's branch or on 'branch'
+sub filenode
+{
+	my ($branch) = @_;
+	my $checkout = $branch ? "SELECT dolt_checkout('$branch');" : '';
+	my @out = split /\n/, sql(qq{$checkout SELECT pg_relation_filenode('kp.t')});
+	return $out[-1];
+}
+
+# a sweep stopped before a move of kp.t's blocks (on 'branch' if given),
+# holding it: the point is told each relation's file number, and stops at
+# kp.t's only, whatever the sweep reaches first
 sub start_sweep
 {
+	my ($branch) = @_;
+	my $filenode = filenode($branch);
 	my $sweep = $node->background_psql('postgres');
 	my $pid = $sweep->query_safe(q{SELECT pg_backend_pid()});
-	$sweep->query_safe(q{SELECT injection_points_set_local();
-		SELECT injection_points_attach('bmap-compact-room', 'wait')});
+	$sweep->query_safe(qq{SELECT injection_points_set_local();
+		SELECT injection_points_attach('bmap-compact-room', 'wait', '$filenode')});
 	$sweep->query_until(qr/started/, q{
 		\echo started
 		SELECT 'moved ' || moved FROM prolly_page_sweep();
@@ -164,7 +177,7 @@ is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
 # a branch's deletion while the compaction holds the branch (no session on it)
 sql(q{SELECT dolt_branch('gone')});
 interleave(undef, 'gone');
-($sweep, $sweeper) = start_sweep();
+($sweep, $sweeper) = start_sweep('gone');
 cmp_ok(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $sweeper
 	AND locktype = 'object' AND classid = 'pg_branch'::regclass AND granted}),
 	'>', 0, 'the compaction holds a branch');
@@ -193,31 +206,24 @@ wake_sweep($sweep);
 # a lowering of shared_below holds each relation too, for a pass over its
 # map that doesn't stop part way: a reset waits for that pass (no longer)
 interleave();
+# (stopped at kp.t only, as start_sweep() stops a compaction)
+my $filenode = filenode();
 $sweep = $node->background_psql('postgres');
 $sweeper = $sweep->query_safe(q{SELECT pg_backend_pid()});
-$sweep->query_safe(q{SELECT injection_points_set_local();
-	SELECT injection_points_attach('bmap-shared-below-held', 'wait')});
+$sweep->query_safe(qq{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-shared-below-held', 'wait', '$filenode')});
 $sweep->query_until(qr/started/, q{
 	\echo started
 	SELECT 'moved ' || moved FROM prolly_page_sweep();
 	\echo done
 });
-my $holding = 0;
-for my $try (1 .. 1000)
-{
-	$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE pid = $sweeper AND wait_event = 'bmap-shared-below-held'})
-	  or die 'the lowering did not stop';
-	if (sql(qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE pid = $sweeper AND wait_event = 'bmap-shared-below-held'})
+  or die 'the lowering did not stop';
+is( sql(qq{SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
 		WHERE l.pid = $sweeper AND l.locktype = 'relation' AND l.granted
-		  AND c.oid = 'kp.t'::regclass}) eq '1')
-	{
-		$holding = 1;
-		last;
-	}
-	sql(q{SELECT injection_points_wakeup('bmap-shared-below-held')});
-}
-ok($holding, 'the lowering of shared_below stopped holding kp.t');
+		  AND c.oid = 'kp.t'::regclass}),
+	'1', 'the lowering of shared_below stopped holding kp.t');
 $restored = counted('relations_restored');
 $applied = counted('apply_rows');
 $reset = $node->background_psql('postgres');

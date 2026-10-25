@@ -17,6 +17,14 @@
  * pointer doesn't say its type, so fetching couldn't decode them): their
  * pointers' hashes aren't the columns' references.
  *
+ * A long jsonb document is stored as a JSON tree (prolly_jsontree.h), and
+ * a fold makes it the column's tree: a pointer of form
+ * PROLLY_TOAST_FORM_JSON_TREE names its root, and a reference to it in a
+ * row records length 0, which no value tree out of line has.  The
+ * pointer's sizes are the document's jsonb's when it was stored, and an
+ * estimate after an edit by path or read from history (never less than a
+ * long document's): nothing canonical depends on them.
+ *
  * src/include/access/prolly_toast.h
  *
  *-------------------------------------------------------------------------
@@ -25,6 +33,7 @@
 #define PROLLY_TOAST_H
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_jsontree.h"
 #include "access/prolly_tree.h"
 #include "access/toast_destination.h"
 #include "access/xlogdefs.h"
@@ -34,6 +43,8 @@
 #define PROLLY_TOAST_FORM_BYTES		0	/* the value's bytes */
 #define PROLLY_TOAST_FORM_UTF8		1	/* a text-like value's, in UTF-8 */
 #define PROLLY_TOAST_FORM_JSONB		2	/* a document's canonical bytes */
+#define PROLLY_TOAST_FORM_JSON_TREE	3	/* a document's JSON tree */
+
 
 /* the destination of the prolly access method's tables */
 extern PGDLLIMPORT const ToastDestinationRoutine prolly_toast_chunkstore;
@@ -97,6 +108,23 @@ extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
  */
 extern void prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
 								   void *arg);
+
+/*
+ * Whether a value is a hash pointer to a JSON tree: its root, and the
+ * document's jsonb size as the pointer has it (*rawsize, with its header).
+ */
+extern bool prolly_toast_json_tree(const varlena *pointer, ProllyNodeRef *root,
+								   Size *rawsize);
+
+/* A hash pointer to the JSON tree at root, of a document of rawsize bytes. */
+extern varlena *prolly_toast_json_pointer(const ProllyNodeRef *root,
+										  Size rawsize);
+
+/*
+ * The environment values stored by content are written and read in, the
+ * current database's: for the JSON trees hash pointers name.
+ */
+extern const ProllyTreeEnv *prolly_toast_env(void);
 
 /*
  * The value tree nodes this backend read and wrote through this

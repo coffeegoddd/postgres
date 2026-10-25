@@ -253,13 +253,15 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "21", whose definitions (defaults,
- * checks, generated columns, index expressions, views, policies) are
- * described with the settings values' text forms are written under fixed
- * (describing_settings()), so a constant in one prints alike in any
- * session; "20" printed them under the committer's DateStyle,
- * IntervalStyle, TimeZone and the rest, and was the first whose text
- * forms of values (a type without binary I/O's, or one its receive
+ * The format a folded root is in: "22", whose rows may hold a long jsonb
+ * document as a JSON tree (valenc_canonical.c); "21" held every long value
+ * as a value tree of its bytes, and was the first whose definitions
+ * (defaults, checks, generated columns, index expressions, views,
+ * policies) are described with the settings values' text forms are
+ * written under fixed (describing_settings()), so a constant in one prints
+ * alike in any session; "20" printed them under the committer's
+ * DateStyle, IntervalStyle, TimeZone and the rest, and was the first whose
+ * text forms of values (a type without binary I/O's, or one its receive
  * refuses) are written with times in UTC, hex bytea and the C locale's
  * money, numbers and dates (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
  * bytea_output, and was the first whose
@@ -301,12 +303,13 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"21"
+#define FOLDED_FORMAT	"22"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
  * The format versions of the encoders FOLDED_FORMAT's trees are written
- * with: the key encoder's, the value encoder's and the keying's.  A tree's
+ * with: the key encoder's, the value encoder's, the keying's and the JSON
+ * trees' (which long jsonb documents are).  A tree's
  * bytes are theirs, so one changed alone would read trees of the format
  * as its own, with phantom changes in every status, diff and commit, and
  * spurious conflicts in merges.  Changing one means changing
@@ -314,8 +317,9 @@ typedef struct BaseTable BaseTable;
  * agree (folded_encoders_checked()).
  */
 #define FOLDED_KEY_ENCODER		7
-#define FOLDED_VALUE_ENCODER	7
+#define FOLDED_VALUE_ENCODER	8
 #define FOLDED_KEYING			1
+#define FOLDED_JSON_TREE		2
 
 /*
  * What a canonical tree or baseline built here was folded at, for a later
@@ -528,14 +532,16 @@ static void
 folded_encoders_checked(void)
 {
 	static bool checked = false;
-	const ProllyImplInfo *impls[3];
-	const int	pinned[3] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING};
+	const ProllyImplInfo *impls[4];
+	const int	pinned[4] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING,
+	FOLDED_JSON_TREE};
 
 	if (checked)
 		return;
 	impls[0] = prolly_get_impl(PROLLY_IFACE_KEY_ENCODER, "ordered");
 	impls[1] = prolly_get_impl(PROLLY_IFACE_VALUE_ENCODER, "canonical");
 	impls[2] = prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_prefix");
+	impls[3] = prolly_get_impl(PROLLY_IFACE_JSON_TREE, "paths");
 	for (int i = 0; i < lengthof(impls); i++)
 		if (impls[i] && impls[i]->format_version != pinned[i])
 			elog(ERROR, "prolly %s \"%s\" is at format version %u, but folded format %s pins %d: change FOLDED_FORMAT with it",

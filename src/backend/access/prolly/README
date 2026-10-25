@@ -64,6 +64,7 @@ Changes to this design are tracked in GitHub issues:
 	writers           prolly_writers.h        modes, stub
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
+	json_tree         prolly_jsontree.h       paths, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -315,10 +316,12 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 17: each table's and partitioned table's OID and qualified name, a
-line each, the name's
+format 17: each table's and partitioned table's OID, owner and qualified
+name, a line each, the name's
 backslashes and newlines escaped so that no name makes a line of its
-own; read strictly, a damaged record refused), and a version is the
+own, and since format 16 quoted as with quote_all_identifiers off in any
+session, as commits name tables; read strictly, a damaged record
+refused), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as
@@ -460,7 +463,14 @@ shared with the old tree.  Nodes are chunks (chunkformat_basic.c) in the
 database's chunk store (chunkstore_journal.c): an append-only journal,
 later conjoined into table files (tablefile_basic.c), with the store's root
 moved by commit records and its appends logged by the ProllyChunks WAL
-resource manager (prolly_xlog.h).
+resource manager (prolly_xlog.h).  A node's level is its chunk's, which
+another server may have made, so every read refuses (DATA_CORRUPTED) a
+node of level 31 or more (a build writes a root at 30 at most; walks keep
+a frame a level), a child that isn't one level below its parent, and an
+internal node with no children; and a walk refuses value trees nested
+more than two deep (the walk recurses a nesting; a row's leaf names a
+JSON tree, whose leaves name its long strings' value trees, and nothing
+deeper names one).
 
 Large values stay TOAST's in the working set.  A commit stores a column
 whose canonical bytes are longer than 2048 as a reference to a value tree
@@ -479,6 +489,44 @@ trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
+
+JSON trees.  A jsonb document whose canonical bytes are longer than 2048
+is stored by content, and folded, as a JSON tree (prolly_jsontree.h,
+jsontree_paths.c) rather than a value tree of its bytes: a tree of the
+tree interface keyed by paths, the keys' bytes sorting as jsonb orders
+the document.  A container of 1024 bytes or fewer is one item holding its
+jsonb bytes; a longer one is its children's items, each scalar an item.
+The tree is built from the canonical bytes (strings in UTF-8), so its
+root is a function of the document: equal documents share it however
+they were made, and a fold takes the tree from the row's hash pointer
+unread.  A document that can't be a tree (a scalar, or a path too long
+for a key) is a value tree of its bytes.  A row's reference to a JSON
+tree records length 0, which no value tree out of line has.  A whole read
+lays the items out as jsonb lays a document out, a packed container's
+bytes copied as they are, checks the result as canonical jsonb bytes are
+checked, and converts it to the database's encoding; it holds the
+document's children as small records and their bytes in one arena, so it
+takes a bounded multiple of the document's size however many containers
+it has.  A tree may come from another server: every other reader checks
+a packed container's bytes before parsing them.  Decoding a row
+whose tree is in the database's store gives a hash pointer to it, so
+history (dolt_at(), snapshot mounts) and the rows a checkout, reset or merge
+writes back name the tree unread; dolt_history_table()'s composite rows
+read it.  prolly_jsonb.c's SQL functions take the value as stored:
+prolly_jsonb_get() reads only the items under a path, prolly_jsonb_set()
+replaces the items under it (a packed container's edited by jsonb_set())
+and packs the containers above it that have become short enough (an
+UPDATE then writes the nodes on that path, not the document; a result
+short enough to be inline comes back whole), and prolly_jsonb_diff()
+diffs two trees by their nodes; anything a tree doesn't handle, any
+document that isn't one, and every document in a database whose encoding
+isn't UTF-8, they do whole, as #>, jsonb_set() and a diff of the
+documents would.  PostgreSQL's own jsonb functions read the document
+whole.  An array's indexes are in its elements' keys, so
+prolly_jsonb_set() only replaces an element of an array that isn't
+packed: an insert or a removal, which would renumber every element after
+it, is done whole.  Folded format 22 is the first whose rows hold JSON
+trees.
 
 
 Writers
@@ -569,6 +617,47 @@ work's); the rows it writes go as the session's role, under its
 privileges.  A writer with its tables' grants alone so moves to what its
 base's writers defined, never to definitions of its own choosing on
 objects it doesn't own.
+
+Commits hold no privileges, so a relation a move makes has only the ones
+its making gives it.  A merge (or fast-forward) of a branch of this
+database, though, gives each relation it makes on the target, one new to
+it (not one made again in the place of one of its name the move dropped),
+the privileges of the source branch's relation it was made from: the
+relation's, and each column's by name, as the new relation's owner (the
+merging role) gives them, with their shared dependencies (branch_ops'
+carry_privileges), added to those its making gave it (the target's
+default privileges).  The source relation's owner keeps its own, as a
+grant to it from the new owner.  The merging role approves them as it
+approves the table.  The relations the move makes and drops are found by
+the object access hook as it runs, so this costs only as much as the move
+changes.
+
+The source's relation is the one the branch's records of its head's
+relations list under the name (quoted and escaped as 'L' records write
+names): its tables' ('N', the record its commits' 'L' records are made
+from) and its other relations' with privileges of their own ('H': views,
+sequences, partitioned and foreign tables), both written by each of its
+commits, and only while the branch's head is their commit.  One of the
+name made since, uncommitted (another relation, perhaps of another
+kind), gives nothing, nor does a branch whose head moved without a
+commit (a fast-forward, a reset).  A branch made from another starts
+with both records, as with its relations, of the same OIDs: its first
+commit's 'L' record so keeps what its start point's had, as a later
+commit's keeps its parent's.  dolt_integrate()
+merges so too.  A cherry-pick of one ref that names a branch (so picks
+its head) takes that branch's privileges alone; one of a commit named
+otherwise (a hash, HEAD~n, several refs) takes none, since the commit
+may be older than any branch's head, whose relation of the name may be
+another made since, and no one branch is its source.  A revert takes
+none: what it makes again, its commit dropped.  A relation merged from
+a remote's ref (a fetch, a pull), a tag or a commit arrives with only
+those its making gives it, as does one a reset makes.  A merge,
+cherry-pick, revert or stash apply runs between prolly_move_begin()
+and prolly_move_end(); inside it (from a function the rows it writes
+call), nothing that moves a head or the working set runs: another of
+them, a reset, a checkout, a commit (prolly_check_not_moving(), which
+prolly_check_head_move() calls too) is refused.  Row security and policies are held in commits, so they arrive
+with the relation whatever its source.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag
@@ -822,15 +911,20 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers; redo of one still flushes the
-relation's buffers in a pass over them all, so a standby or crash recovery
-pays O(the buffers) per snapshot replayed.  Only while nothing else
-can be on the pages: the relations are locked against writers without
-waiting, and the snapshot the commit or move went by saw every writer of
-the branch that ended and nobody else is writing it; otherwise nothing is
-kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
-head moves every transaction.  The refs record each kept commit with the
-branch's baseline then and each table's relations and snapshots ('K').
+finds), never visiting the buffers, and so does redo of one, walking the
+snapshot's own leaves as the record names them.  Redo visits every buffer
+of the relation instead when it can't trust a page the walk reads: with
+data checksums off (a torn page would go unseen), or at a map or count
+page newer than the replay (a crash's, or a base backup's), one that
+fails verification, one past its file, or one not the node its pointer
+names (a node freed since and its block taken as a relation's page).
+Only while nothing else can be on the pages: the relations are locked
+against writers without waiting, and the snapshot the commit or move went
+by saw every writer of the branch that ended and nobody else is writing
+it; otherwise nothing is kept.  Not at a transaction's own commit
+(dolt.transaction_commit), whose head moves every transaction.  The refs
+record each kept commit with the branch's baseline then and each table's
+relations and snapshots ('K').
 A snapshot's slot names the transaction that took it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is kept by nobody: the relation's next snapshot, or a page
@@ -1143,6 +1237,9 @@ change: refs or a manifest of another format are refused, never read.
 
 SQL
 ---
+
+prolly_jsonb.c is the prolly_jsonb_* functions, on JSON trees (Trees and
+chunks, above).
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
 arguments and results, so scripts written for Doltgres run here.  A tag

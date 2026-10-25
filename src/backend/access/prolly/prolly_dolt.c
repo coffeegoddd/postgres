@@ -34,6 +34,7 @@
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_snapshot.h"
+#include "access/prolly_toast.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -1109,9 +1110,43 @@ prolly_may_move_head(const char *name)
 		has_privs_of_role(GetUserId(), prolly_branch_owner(name));
 }
 
+/*
+ * How many moves of the branch (merges, cherry-picks, reverts, stash
+ * applies) this backend is running.  Nothing else that moves a head or
+ * the working set (a reset, a checkout, a commit, another move) runs
+ * inside one, as from a function the rows it writes call: it would change
+ * the working set, merge state and privileges under it.
+ */
+static int	moves_running = 0;
+
+void
+prolly_check_not_moving(void)
+{
+	if (moves_running > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a branch can't be moved inside a merge, cherry-pick, revert or stash apply"),
+				 errdetail("It was called while one was running, as from a function the rows it wrote called.")));
+}
+
+void
+prolly_move_begin(void)
+{
+	prolly_check_not_moving();
+	moves_running++;
+}
+
+void
+prolly_move_end(void)
+{
+	Assert(moves_running > 0);
+	moves_running--;
+}
+
 void
 prolly_check_head_move(const char *name)
 {
+	prolly_check_not_moving();
 	if (!prolly_may_move_head(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -2027,6 +2062,8 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	bool		is_branch = false;	/* names[0] is a branch */
 	bool		is_table = false;	/* names[0] is a table (or ".") */
 
+	/* (it changes the working set, or the branch's, a move's under it) */
+	prolly_check_not_moving();
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];
@@ -6812,14 +6849,25 @@ rows_end(Rows *r)
  * The row a tree value holds, as a composite datum of its own (the slot
  * is reused for the next value); and its copies.
  */
-static Datum
-rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+/*
+ * A version's row decoded into r->slot, its long values as the trees they
+ * are where a hash pointer can name them (read only as a composite datum
+ * of the row is made).
+ */
+static void
+rows_slot(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
 	rows_parse(r, value, &row, count);
 	ExecClearTuple(r->slot);
 	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
+}
+
+static Datum
+rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+{
+	rows_slot(r, value, count);
 	return ExecFetchSlotHeapTupleDatum(r->slot);
 }
 
@@ -8027,7 +8075,13 @@ at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (after == NULL)
 		return;
 	old = rows_next(&s->rows);
-	row = rows_value(&s->rows, s->json, after, &copies);
+	if (s->history)
+		row = rows_value(&s->rows, s->json, after, &copies);
+	else
+	{
+		rows_slot(&s->rows, after, &copies);
+		row = (Datum) 0;
+	}
 	if (!s->rows.keyless)
 		copies = 1;
 	for (uint64 i = 0; i < copies; i++)

@@ -97,6 +97,8 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_operator.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_class.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
@@ -13279,14 +13281,265 @@ merge_held(const char *branch, const char *message, int flags,
 	return 0;
 }
 
+/* Does a relation of this kind have privileges of its own? */
+static bool
+has_privileges(char relkind)
+{
+	return relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE ||
+		relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW ||
+		relkind == RELKIND_SEQUENCE || relkind == RELKIND_FOREIGN_TABLE;
+}
+
+/*
+ * relation relid's qualified name, as the refs' records of relations write
+ * it (prolly_record_relation_name()'s), or NULL
+ */
+static char *
+qualified_relation(Oid relid)
+{
+	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	char	   *name = NULL;
+
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_class rel = (Form_pg_class) GETSTRUCT(tup);
+		char	   *nsp = get_namespace_name(rel->relnamespace);
+
+		if (nsp != NULL)
+			name = prolly_record_relation_name(nsp, NameStr(rel->relname));
+		ReleaseSysCache(tup);
+	}
+	return name;
+}
+
+/*
+ * The relations a move makes, as it makes them, and the names of those it
+ * drops, for the privileges of the local branches its objects come from:
+ * found by the object access hook, so only as much as the move changes.
+ */
+typedef struct CarriedPrivileges
+{
+	List	   *sources;		/* branches' names */
+	List	   *made;			/* relations' OIDs */
+	List	   *dropped;		/* relations' qualified names */
+	MemoryContext cxt;
+	struct CarriedPrivileges *outer;
+} CarriedPrivileges;
+
+/*
+ * The innermost move carrying privileges (a move can run inside another:
+ * a constraint's function the outer one's rows call, say), and the hook
+ * carry_access() was installed over, once, by the outermost.
+ */
+static CarriedPrivileges *carrying = NULL;
+static bool carry_installed = false;
+static object_access_hook_type carry_prev = NULL;
+
+/*
+ * The relation events of the innermost carrying move, its own; none once
+ * no move is carrying (left installed under a hook installed after it).
+ */
+static void
+carry_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
+			 void *arg)
+{
+	CarriedPrivileges *c = carrying;
+
+	if (carry_prev)
+		carry_prev(access, classId, objectId, subId, arg);
+	if (c == NULL || classId != RelationRelationId || subId != 0)
+		return;
+	if (access == OAT_POST_CREATE)
+	{
+		MemoryContext old = MemoryContextSwitchTo(c->cxt);
+
+		c->made = lappend_oid(c->made, objectId);
+		MemoryContextSwitchTo(old);
+	}
+	else if (access == OAT_DROP && !list_member_oid(c->made, objectId))
+	{
+		/* (one the move made, dropped again, held no other's place) */
+		MemoryContext old = MemoryContextSwitchTo(c->cxt);
+		char	   *name = qualified_relation(objectId);
+
+		if (name != NULL)
+			c->dropped = lappend(c->dropped, name);
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/*
+ * Before a move whose objects come from branches sources (NIL: none of
+ * this database), watch what relations it makes and drops; carry_stop()
+ * after it, whether it fails or not.
+ */
+static void
+carry_begin(CarriedPrivileges *c, List *sources)
+{
+	c->sources = branch_ops()->carry_privileges != NULL ? sources : NIL;
+	c->made = NIL;
+	c->dropped = NIL;
+	c->cxt = CurrentMemoryContext;
+	c->outer = carrying;
+	if (c->sources != NIL)
+	{
+		if (!carry_installed)
+		{
+			carry_prev = object_access_hook;
+			object_access_hook = carry_access;
+			carry_installed = true;
+		}
+		carrying = c;
+	}
+}
+
+/*
+ * The outermost, done, takes carry_access() out, unless a hook installed
+ * since chains to it: then it stays, passing events on.
+ */
+static void
+carry_stop(CarriedPrivileges *c)
+{
+	if (c->sources == NIL)
+		return;
+	carrying = c->outer;
+	if (carrying == NULL && object_access_hook == carry_access)
+	{
+		object_access_hook = carry_prev;
+		carry_prev = NULL;
+		carry_installed = false;
+	}
+}
+
+/*
+ * After it, each relation it made, new to the branch (not one made in the
+ * place of one of its name it dropped), has too the privileges of each
+ * source branch's relation it was made from: the one the branch's record
+ * of its relations, made by the commit that is its head, lists under its
+ * name.  None from a branch whose head isn't the commit of its record, or
+ * whose relation of the name was made since: they may not be the ones the
+ * move's objects came from.  Its commits hold no privileges; a branch of
+ * this database has them.
+ */
+static void
+carry_end(CarriedPrivileges *c)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *names = NIL;
+	List	   *relids = NIL;
+
+	if (c->sources == NIL || c->made == NIL ||
+		!PROLLY_HAS(dc.refs, recorded_relid))
+		return;
+	foreach_oid(relid, c->made)
+	{
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+		bool		carried;
+		char	   *name;
+
+		if (!HeapTupleIsValid(tup))
+			continue;			/* (made and dropped again) */
+		carried = has_privileges(((Form_pg_class) GETSTRUCT(tup))->relkind);
+		ReleaseSysCache(tup);
+		if (!carried || (name = qualified_relation(relid)) == NULL)
+			continue;
+		foreach_ptr(char, d, c->dropped)
+			if (strcmp(d, name) == 0)
+				carried = false;
+		if (carried)
+		{
+			names = lappend(names, name);
+			relids = lappend_oid(relids, relid);
+		}
+	}
+	foreach_ptr(char, source, c->sources)
+	{
+		ProllyHash	head;
+		List	   *mine = NIL;
+		List	   *theirs = NIL;
+		ListCell   *ln;
+		ListCell   *lr;
+
+		if (!PROLLY_CALL(dc.refs, resolve, psprintf("refs/heads/%s", source),
+						 &head))
+			continue;
+		forboth(ln, names, lr, relids)
+		{
+			Oid			fromid;
+			ProllyHash	at;
+
+			if (PROLLY_CALL(dc.refs, recorded_relid, source, lfirst(ln),
+							&fromid, &at) && same_hash(&at, &head))
+			{
+				mine = lappend_oid(mine, lfirst_oid(lr));
+				theirs = lappend_oid(theirs, fromid);
+			}
+		}
+		if (mine != NIL)
+			branch_ops()->carry_privileges(source, mine, theirs);
+	}
+}
+
+/*
+ * The branch of this database ref names, as resolving it finds one first
+ * (a branch named so itself, else by its full ref name), or NULL.
+ */
+static const char *
+merged_branch(const char *ref)
+{
+	if (pg_strcasecmp(ref, "HEAD") == 0 &&
+		!SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)))
+		return NULL;
+	if (strncmp(ref, "refs/heads/", 11) == 0 && ref[11] != '\0' &&
+		!SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)))
+		ref += 11;
+	return SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)) ? ref : NULL;
+}
+
+/*
+ * The branch a cherry-pick's commits come from: the branch of this
+ * database its one ref names (its head the commit picked), or none.  A
+ * commit named otherwise (by hash, or HEAD~n) may be older than the
+ * branch's head, whose relations of its tables' names may be others made
+ * since; and several refs, or a commit several branches have, name no one
+ * branch whose privileges alone it takes.
+ */
+static List *
+picked_sources(const char *const *refs, int nrefs)
+{
+	const char *source = nrefs == 1 ? merged_branch(refs[0]) : NULL;
+
+	return source != NULL ? list_make1((char *) source) : NIL;
+}
+
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
 {
 	/* the heads read under the refs held, as they are */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = merge_held(branch, message, flags, commit_id);
+	const char *source = merged_branch(branch);
+	CarriedPrivileges carried;
+	volatile int result;
+	volatile bool begun = false;
 
+	prolly_check_not_moving();
+	/* (one merged as a remote's ref, a tag or a commit has none to give) */
+	carry_begin(&carried, source ? list_make1((char *) source) : NIL);
+	PG_TRY();
+	{
+		prolly_move_begin();
+		begun = true;
+		result = merge_held(branch, message, flags, commit_id);
+	}
+	PG_FINALLY();
+	{
+		if (begun)
+			prolly_move_end();
+		carry_stop(&carried);
+	}
+	PG_END_TRY();
+	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
@@ -14129,8 +14382,26 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	CarriedPrivileges carried;
+	volatile int result;
+	volatile bool begun = false;
 
+	prolly_check_not_moving();
+	carry_begin(&carried, picked_sources(refs, nrefs));
+	PG_TRY();
+	{
+		prolly_move_begin();
+		begun = true;
+		result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	}
+	PG_FINALLY();
+	{
+		if (begun)
+			prolly_move_end();
+		carry_stop(&carried);
+	}
+	PG_END_TRY();
+	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
@@ -14148,7 +14419,16 @@ folded_apply(const char *ref, const char *fn)
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	ProllyHash	ignored;
 
-	(void) pick_held(&ref, 1, true, &ignored, fn);
+	prolly_move_begin();
+	PG_TRY();
+	{
+		(void) pick_held(&ref, 1, true, &ignored, fn);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_end();
+	}
+	PG_END_TRY();
 	if (pushed)
 		PopActiveSnapshot();
 }
@@ -14158,8 +14438,18 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 			  ProllyHash *commit_id)
 {
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = revert_held(refs, nrefs, series_head, commit_id);
+	volatile int result;
 
+	prolly_move_begin();
+	PG_TRY();
+	{
+		result = revert_held(refs, nrefs, series_head, commit_id);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_end();
+	}
+	PG_END_TRY();
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
