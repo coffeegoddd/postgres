@@ -422,6 +422,7 @@ tests += {
       't/425_fold_worker_trim_own_snapshot.pl',
       't/426_autofold_trim_own_snapshot.pl',
       't/447_node_cache.pl',
+      't/465_bmap_preserve_waits.pl',
     ],
   },
 }
