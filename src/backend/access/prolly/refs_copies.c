@@ -236,6 +236,7 @@
 #include "commands/trigger.h"
 #include "common/cryptohash.h"
 #include "common/hashfn.h"
+#include "utils/injection_point.h"
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -5422,6 +5423,7 @@ copies_forget_records(void)
 		return false;
 	gone = records_gone(&root);
 	unreached = owned_unreached(&root, gone);
+	INJECTION_POINT("prolly-forget-records-locked", NULL);
 	if (gone == NIL && unreached == NIL)
 		return false;
 	/* (in key order: TAG_OWNED's before TAG_LINEAGE's) */
