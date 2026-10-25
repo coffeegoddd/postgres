@@ -92,11 +92,19 @@ typedef struct xl_bmap_rel
 	RelFileLocator locator;
 } xl_bmap_rel;
 
-/* SHARE's and SHARED's main data: the relation shared and its copy. */
+/*
+ * SHARE's and SHARED's main data: the relation shared and its copy.  With
+ * BMAP_PRESERVE_LOGGED (SHARED), the source's own blocks were logged as
+ * PRESERVE images before the record, whose redo wrote them to their
+ * blocks: redo of the share writes and syncs nothing.
+ */
+#define BMAP_PRESERVE_LOGGED	0x01
+
 typedef struct xl_bmap_share
 {
 	RelFileLocator src;
 	RelFileLocator dst;
+	uint8		flags;
 } xl_bmap_share;
 
 /*
@@ -209,6 +217,8 @@ typedef struct xl_bmap_extend
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
+/* a snapshot kept whose own blocks were logged as PRESERVE images first */
+#define BMAP_TREE_PRESERVE_LOGGED	0x04
 
 typedef struct xl_bmap_tree
 {

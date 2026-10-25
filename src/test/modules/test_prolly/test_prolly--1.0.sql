@@ -132,6 +132,12 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The slot following the page store's syncs for shares and snapshots.
+CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT synced int8,
+	OUT flushing int4)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_sweep_due()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -150,6 +156,19 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_bmap_release_pending()
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- the catalogs whose caches were reset, and the system catalogs' relation
+-- entries invalidated, since the last call, noted by
+-- test_count_cache_reset() at the injection points catcache-reset and
+-- relcache-reset-entry
+CREATE FUNCTION test_cache_resets(OUT catalogs oid[], OUT system_relations int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- whether a catalog cache is of the catalog relid
+CREATE FUNCTION test_syscache_catalog(relid oid)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,
@@ -616,6 +635,17 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- from commit "from" doesn't: what "to" added to the chunk store.
 CREATE FUNCTION test_walk_new_count(from_commit text, to_commit text)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The GC generation of this database's chunk store now.
+CREATE FUNCTION test_chunk_generation()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Whether the shared commit cache has commit id (hex) of database dboid in
+-- GC generation generation (a lookup: counted as a hit or miss).
+CREATE FUNCTION test_commit_cache_has(dboid oid, generation int8, id text)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- What the value memo's lookups found since the last reset.
