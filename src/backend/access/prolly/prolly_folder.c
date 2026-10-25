@@ -287,6 +287,8 @@ fold_branch(void *arg)
 	ProllyNodeRef root;
 
 	INJECTION_POINT("prolly-fold-worker-fold", NULL);
+	/* (no snapshot kept under the fold: see fold_pass()) */
+	Assert(!HaveRegisteredOrActiveSnapshot());
 	prolly_database_components(&dc);
 	if (PROLLY_HAS(dc.refs, checkpoint_unless_moved))
 		*folded = dc.refs->checkpoint_unless_moved(&root);
@@ -611,7 +613,15 @@ fold_pass(const ProllyRefsRoutine *refs)
 		StartTransactionCommand();
 		PG_TRY();
 		{
-			PushActiveSnapshot(GetTransactionSnapshot());
+			/*
+			 * (no snapshot of the pass's kept under the fold: the fold reads
+			 * by one it takes as it begins, and one of the worker's from
+			 * before that, while a writer the fold then sees committed was
+			 * running, would hold the horizon below that writer, so the
+			 * fold's trim of the log would keep the writer's rows; the fold
+			 * after, finding nothing new, trims nothing, and they would stay
+			 * until the table is written again)
+			 */
 			pace_begin();
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
@@ -619,7 +629,6 @@ fold_pass(const ProllyRefsRoutine *refs)
 			else
 				branch_ops()->run_on(names[i], fold_branch, &folded);
 			pace_end();
-			PopActiveSnapshot();
 			if (folded)
 			{
 				CommitTransactionCommand();
