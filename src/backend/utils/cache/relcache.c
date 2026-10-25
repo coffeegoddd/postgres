@@ -86,6 +86,7 @@
 #include "utils/catcache.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -292,6 +293,7 @@ static void RelationReloadIndexInfo(Relation relation);
 static void RelationReloadNailed(Relation relation);
 static void RelationFlushRelation(Relation relation);
 static void RememberToFreeTupleDescAtEOX(TupleDesc td);
+static void relation_cache_invalidate(bool debug_discard, bool branch_switch);
 #ifdef USE_ASSERT_CHECKING
 static void AssertPendingSyncConsistency(Relation relation);
 #endif
@@ -3150,6 +3152,36 @@ RelationCacheRebuildNew(Oid from_branch)
 void
 RelationCacheInvalidate(bool debug_discard)
 {
+	relation_cache_invalidate(debug_discard, false);
+}
+
+/*
+ * RelationCacheInvalidateBranch
+ *	 After the session changes branch: as RelationCacheInvalidate(), but
+ *	 the entries of system catalogs (and their indexes and TOAST tables)
+ *	 are kept.
+ *
+ *	 Such an entry is built only from catalog rows that belong to the
+ *	 catalog itself (its pg_class, pg_attribute, pg_index, pg_attrdef and
+ *	 pg_constraint rows, and any trigger, rule or policy on it), and the
+ *	 catalog is an object in pg_catalog, which is not a versioned schema.
+ *	 A row belonging to an object outside a versioned schema has branch 0
+ *	 (row_branch()), and every branch sees that same row
+ *	 (catalog_tuple_on_branch()); no branch has a row of its own for the
+ *	 catalog.  So the entry is the same on every branch, and a change to
+ *	 one of those rows invalidates it as on any branch.  An entry whose
+ *	 pg_class row has a branch anyway is not kept.  The relation map is
+ *	 the same on every branch too, so it isn't reloaded.
+ */
+void
+RelationCacheInvalidateBranch(void)
+{
+	relation_cache_invalidate(false, true);
+}
+
+static void
+relation_cache_invalidate(bool debug_discard, bool branch_switch)
+{
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
 	Relation	relation;
@@ -3161,7 +3193,8 @@ RelationCacheInvalidate(bool debug_discard)
 	/*
 	 * Reload relation mapping data before starting to reconstruct cache.
 	 */
-	RelationMapInvalidateAll();
+	if (!branch_switch)
+		RelationMapInvalidateAll();
 
 	/* Phase 1 */
 	hash_seq_init(&status, RelationIdCache);
@@ -3179,6 +3212,12 @@ RelationCacheInvalidate(bool debug_discard)
 		if (relation->rd_createSubid != InvalidSubTransactionId ||
 			relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
 			continue;
+
+		/* (a system catalog's entry is every branch's) */
+		if (branch_switch && IsCatalogRelationOid(RelationGetRelid(relation)) &&
+			!OidIsValid(relation->rd_rel->relbranch))
+			continue;
+		INJECTION_POINT("relcache-reset-entry", relation);
 
 		relcacheInvalsReceived++;
 

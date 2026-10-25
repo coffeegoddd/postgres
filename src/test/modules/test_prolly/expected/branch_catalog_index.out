@@ -211,10 +211,13 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 SELECT catalog_blocks() - :b0 AS large \gset
--- About as many catalog blocks with the unrelated objects as without
--- (a few more, for larger indexes over the same rows).  A scan of each
--- catalog's every row would read several times as many in b.
-SELECT :large - :small < :small / 4 AS flat, :small > 0 AS counted;
+-- About as many catalog blocks with the unrelated objects as without:
+-- a few more, for b's larger indexes over the same rows (its 401
+-- unrelated tables deepen them), fewer than 2.25 a table (about 1.9 now).
+-- A scan of each catalog's every row would read several times as many in
+-- b.  (Bounded by the objects added, not by a's count, which other work,
+-- the caches a checkout keeps, changes.)
+SELECT :large - :small < 401 * 9 / 4 AS flat, :small > 0 AS counted;
  flat | counted 
 ------+---------
  t    | t
