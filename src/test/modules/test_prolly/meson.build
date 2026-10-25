@@ -372,6 +372,7 @@ tests += {
       't/387_kept_pages_standby_redo_flush.pl',
       't/388_sweep_exit_hook.pl',
       't/389_kept_pages_redo_reused_node.pl',
+      't/405_cancel_not_set_aside.pl',
       't/340_bmap_sweep_dropped_map.pl',
       't/341_fold_trim_no_wait.pl',
       't/342_fold_worker_drop.pl',
