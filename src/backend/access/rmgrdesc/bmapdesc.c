@@ -113,7 +113,9 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 									 (xlrec->flags & BMAP_TREE_OF_SNAPSHOT) ?
 									 "'s snapshot" : "");
 				else if (xlrec->op == BMAP_TREE_SNAPSHOT)
-					appendStringInfoString(buf, "snapshot");
+					appendStringInfoString(buf,
+										   (xlrec->flags & BMAP_TREE_CARRIED) ?
+										   "snapshot carried" : "snapshot");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

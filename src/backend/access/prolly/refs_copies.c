@@ -3118,6 +3118,49 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 }
 
 /*
+ * The relations of table name as the other commits of kept (but was, and
+ * those retired) keep them: copies into *carry, and where each is into
+ * *into, for a restore of the table to carry their snapshots into the
+ * storage it gives it (restore()'s carry[]), which would otherwise go with
+ * the storage it replaces.  How many.
+ */
+static int
+kept_carried(List *kept, const KeptCommit *was, const char *name,
+			 BranchKeptRelation **carry, BranchKeptRelation ***into)
+{
+	int			n = 0;
+
+	foreach_ptr(KeptCommit, o, kept)
+	{
+		if (o == was || FullTransactionIdIsValid(o->retired))
+			continue;
+		for (int t = 0; t < o->ntables; t++)
+			if (strcmp(o->tables[t].name, name) == 0)
+				n += o->tables[t].nrels;
+	}
+	*carry = palloc_array(BranchKeptRelation, Max(n, 1));
+	*into = palloc_array(BranchKeptRelation *, Max(n, 1));
+	n = 0;
+	foreach_ptr(KeptCommit, o, kept)
+	{
+		if (o == was || FullTransactionIdIsValid(o->retired))
+			continue;
+		for (int t = 0; t < o->ntables; t++)
+		{
+			if (strcmp(o->tables[t].name, name) != 0)
+				continue;
+			for (int r = 0; r < o->tables[t].nrels; r++)
+			{
+				(*carry)[n] = o->tables[t].rels[r];
+				(*into)[n] = &o->tables[t].rels[r];
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
+/*
  * Before a move of the session's branch to commit: if its pages are kept
  * as of the commit, each table's given back (those that changed since,
  * O(1) each), and its baseline entry made the kept one's.  A table not on
@@ -3188,6 +3231,10 @@ restore_pages(const ProllyCommitInfo *commit)
 		Oid			relid = table_named(kt->name);
 		NamedTree  *target = NULL;
 		BranchKeptRelation *renewed;
+		BranchKeptRelation *carry;
+		BranchKeptRelation *carried;
+		BranchKeptRelation **into;
+		int			ncarry;
 		bool		any = false;
 
 		foreach_ptr(NamedTree, r, readable)
@@ -3201,9 +3248,13 @@ restore_pages(const ProllyCommitInfo *commit)
 			few_changes(&dc, &baseline, relid, &target->data))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
-		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed,
-								   &move_wait_start))
+		ncarry = kept_carried(kept, was, kt->name, &carry, &into);
+		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
+		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
+								   carried, &move_wait_start))
 			continue;
+		for (int j = 0; j < ncarry; j++)
+			*into[j] = carried[j];
 		for (int r = 0; r < kt->nrels; r++)
 			any |= renewed[r].relfilenumber != kt->rels[r].relfilenumber;
 		if (!any)

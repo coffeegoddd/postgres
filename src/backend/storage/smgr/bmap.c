@@ -6454,6 +6454,144 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 }
 
+/*
+ * Carry src's snapshot 'id' into 'dst', a copy of another of src's
+ * snapshots made to take src's place (bmap_share_snapshot() with
+ * 'replacing'): a slot of dst's root page gets the snapshot as src keeps
+ * it (its subtrees, length, last fold's epoch and epoch), each subtree
+ * gaining a holder, so that the snapshot outlives src, dropped as the
+ * transaction commits.  Returns its id in dst, which names it there until
+ * bmap_snapshot_release().  O(1) in the relation's size, and nothing
+ * written out or synced: the snapshot's blocks were when src's was taken,
+ * and are the same blocks.  The slot names the carrying (sub)transaction,
+ * as a snapshot taken does: if that doesn't commit, dst goes with it.  The
+ * caller keeps src and dst from changing meanwhile.  dst's epoch is src's
+ * (a copy made of src's snapshot takes it), so every snapshot src keeps
+ * was taken before it, and a page of dst one of them holds is copied
+ * before it changes, as in src.
+ */
+uint64
+bmap_snapshot_carry(SMgrRelation src, uint64 id, SMgrRelation dst)
+{
+	RelFileLocator srel = src->smgr_rlocator.locator;
+	RelFileLocator drel = dst->smgr_rlocator.locator;
+	LOCKTAG		sweeptag;
+	Buffer		sheaderbuf;
+	Buffer		headerbuf;
+	Buffer		metabuf;
+	Buffer		rootbuf;
+	BmapRoot	sroot;
+	BmapRoot	root;
+	BlockNumber tops[BMAP_TREE_TOPS];
+	uint32		ntops = 0;
+	int			sslot;
+	int			slot;
+	RefsPages	rp;
+	xl_bmap_snapshot_delta sdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+	uint64		carried;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot keep a snapshot of a relation during recovery")));
+	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
+		elog(ERROR, "block-mapped relation %s can't keep a snapshot of %s, in another page store",
+			 relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+
+	SET_LOCKTAG_OBJECT(sweeptag, srel.dbOid, BMAP_SWEEP_CLASSID, srel.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	metabuf = alloc_read(drel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, drel, MAIN_FORKNUM, 0);
+	refs_cover(drel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
+	UnlockReleaseBuffer(metabuf);
+
+	sheaderbuf = map_read(srel, 0);
+	LockBuffer(sheaderbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(sheaderbuf), BMAP_PAGE_HEADER, srel, BMAP_FORKNUM, 0);
+	sslot = snapshot_slot(src, id, &sroot);
+	if (id == 0 || sslot < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("block-mapped relation %s keeps no snapshot %llu",
+						relpath(src->smgr_rlocator, MAIN_FORKNUM).str,
+						(unsigned long long) id)));
+
+	headerbuf = map_read(drel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, drel, BMAP_FORKNUM, 0);
+	if (PageGetBmapHeader(BufferGetPage(headerbuf))->epoch <
+		sroot.snap[sslot].epoch)
+		elog(ERROR, "block-mapped relation %s is older than the snapshot of %s it would keep",
+			 relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+	slot = snapshot_slot(dst, 0, &root);
+	if (slot < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("block-mapped relation %s keeps %d snapshots already",
+						relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
+						BMAP_TREE_SNAPSHOTS)));
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		if (BlockNumberIsValid(sroot.snap[sslot].tops[k].block))
+			tops[ntops++] = sroot.snap[sslot].tops[k].block;
+	qsort(tops, ntops, sizeof(BlockNumber), cmp_block);
+	rp.n = 0;
+	if (ntops > 0 && refs_lock(drel, tops, ntops, &rp) != ntops)
+		elog(ERROR, "the subtrees of \"%s\" span too many count pages",
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+	refs_add_holders(&rp, tops, ntops);
+
+	rootbuf = map_read(drel, 1);
+	map_lock(rootbuf, false);
+	check_page(BufferGetPage(rootbuf), BMAP_PAGE_ROOT, drel, BMAP_FORKNUM, 1);
+	memset(&sdelta, 0, sizeof(sdelta));
+	sdelta.kind = BMAP_DELTA_SNAPSHOT;
+	sdelta.slot = slot;
+	sdelta.snap = sroot.snap[sslot];
+	sdelta.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
+	xlrec.locator = drel;
+	xlrec.op = BMAP_TREE_SNAPSHOT;
+	xlrec.flags = BMAP_TREE_CARRIED;
+	xlrec.node = InvalidBlockNumber;
+	xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	XLogEnsureRecordSpace(2 + BMAP_TREE_TOPS, 3 + BMAP_TREE_TOPS);
+	/* (a position no other record has, as the snapshot's id) */
+	carried = sdelta.snap.id = GetXLogInsertRecPtr();
+	START_CRIT_SECTION();
+	apply_snapshot_delta(BufferGetPage(rootbuf), &sdelta);
+	MarkBufferDirty(rootbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+
+	/*
+	 * (no header: redo of a snapshot kept writes out and syncs its own
+	 * blocks, and this one has none of its own, its blocks src's snapshot's,
+	 * written and synced when that was taken)
+	 */
+	XLogRegisterBuffer(0, rootbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &sdelta, sizeof(sdelta));
+	refs_apply_register(&rp, 1);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(rootbuf), lsn);
+	refs_set_lsn(&rp, lsn);
+	END_CRIT_SECTION();
+
+	refs_release(&rp);
+	map_unlock(rootbuf);
+	ReleaseBuffer(rootbuf);
+	UnlockReleaseBuffer(headerbuf);
+	UnlockReleaseBuffer(sheaderbuf);
+	LockRelease(&sweeptag, ShareLock, false);
+	INJECTION_POINT("bmap-snapshot-carried", NULL);
+	return carried;
+}
+
 /* ----------------------------------------------------------------
  * Copying shared pages before they change
  * ----------------------------------------------------------------
@@ -12178,6 +12316,7 @@ bmap_redo(XLogReaderState *record)
 
 				BlockList	own = {0};
 				bool		kept = xlrec->op == BMAP_TREE_SNAPSHOT &&
+					!(xlrec->flags & BMAP_TREE_CARRIED) &&
 					XLogRecHasBlockRef(record, 1);
 				bool		walked = false;
 				const char *why = NULL;
@@ -12209,7 +12348,8 @@ bmap_redo(XLogReaderState *record)
 
 				/*
 				 * A snapshot kept (its header changed too, which a let-go
-				 * leaves): as the primary did, the relation's pages as of
+				 * leaves, and not carried, whose blocks are another
+				 * snapshot's, written when that was kept): as the primary did, the relation's pages as of
 				 * this record written to the blocks the snapshot holds, and
 				 * durably.  Without online backups no image of them is
 				 * logged, and the pages redo made of the records before

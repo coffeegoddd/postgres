@@ -232,6 +232,7 @@ tests += {
       'branch_catalog_index',
       'kept_commit_shares',
       'kept_dead',
+      'kept_carried',
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',
@@ -423,6 +424,8 @@ tests += {
       't/425_fold_worker_trim_own_snapshot.pl',
       't/426_autofold_trim_own_snapshot.pl',
       't/447_node_cache.pl',
+      't/471_kept_carried_crash.pl',
+      't/472_kept_carried_standby.pl',
     ],
   },
 }
