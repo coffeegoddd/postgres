@@ -128,5 +128,95 @@ SELECT * FROM dolt_status();
 
 DROP SCHEMA ko CASCADE;
 SELECT length(dolt_commit('-Am', 'without ko')::text) > 0 AS committed;
+
+-- A routine emptied of its body that can only be made again once a view
+-- the move makes again is there is made before what calls it is built or
+-- checked: a re-made table's CHECK, expression index and generated
+-- column.  The placeholder keeps its volatility (IMMUTABLE, LEAKPROOF
+-- for a superuser), so the generated column can be made meanwhile.
+CREATE SCHEMA kv VERSIONED;
+CREATE TABLE kv.t (id int PRIMARY KEY, a int);
+INSERT INTO kv.t VALUES (1, 10), (2, 20);
+CREATE VIEW kv.v AS SELECT id, a FROM kv.t;
+CREATE FUNCTION kv.lk(x int) RETURNS int LANGUAGE sql IMMUTABLE STRICT LEAKPROOF
+	BEGIN ATOMIC SELECT t.a FROM kv.t JOIN kv.v USING (id) WHERE t.id = x GROUP BY t.id; END;
+CREATE TABLE kv.u (x int CHECK (kv.lk(x) IS NOT NULL),
+	y int GENERATED ALWAYS AS (kv.lk(x)) STORED);
+CREATE INDEX ON kv.u ((kv.lk(x)));
+INSERT INTO kv.u VALUES (1), (2);
+SELECT (dolt_commit('-Am', 'v1'))[1] AS v1 \gset
+ALTER TABLE kv.t RENAME CONSTRAINT t_pkey TO t_key;
+CREATE OR REPLACE VIEW kv.v AS SELECT id, a, 1 AS one FROM kv.t;
+ALTER TABLE kv.u RENAME TO u_old;
+CREATE TABLE kv.u (z int, x int CHECK (kv.lk(x) IS NOT NULL),
+	y int GENERATED ALWAYS AS (kv.lk(x)) STORED);
+CREATE INDEX ON kv.u ((kv.lk(x)));
+INSERT INTO kv.u (z, x) SELECT 0, x FROM kv.u_old;
+DROP TABLE kv.u_old;
+SELECT (dolt_commit('-Am', 'v2'))[1] AS v2 \gset
+SELECT dolt_reset('--hard', :'v1');
+SELECT dolt_hashof('HEAD') = :'v1' AS at_v1, provolatile, proisstrict, proleakproof
+	FROM pg_proc WHERE oid = 'kv.lk(int)'::regprocedure;
+SELECT x, y FROM kv.u ORDER BY x;
+SELECT dolt_reset('--hard', :'v2');
+SELECT dolt_hashof('HEAD') = :'v2' AS at_v2;
+SELECT z, x, y FROM kv.u ORDER BY x;
+SELECT * FROM dolt_status();
+DROP SCHEMA kv CASCADE;
+SELECT length(dolt_commit('-Am', 'without kv')::text) > 0 AS committed;
+
+-- A routine whose argument or result is a re-made table's row type is
+-- dropped and made again (its signature can't stay), its owner,
+-- privileges and comment given back; one with a SQL-standard body and one
+-- in PL/pgSQL.
+CREATE SCHEMA kt VERSIONED;
+GRANT USAGE ON SCHEMA kt TO regress_kr_owner;
+CREATE TABLE kt.t (z int, id int PRIMARY KEY, a int);
+INSERT INTO kt.t VALUES (0, 1, 10);
+CREATE FUNCTION kt.rows() RETURNS SETOF kt.t LANGUAGE sql BEGIN ATOMIC SELECT * FROM kt.t; END;
+CREATE FUNCTION kt.first(r kt.t) RETURNS int LANGUAGE plpgsql AS $$BEGIN RETURN r.a; END$$;
+ALTER FUNCTION kt.rows() OWNER TO regress_kr_owner;
+REVOKE EXECUTE ON FUNCTION kt.rows() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION kt.rows() TO regress_kr_user;
+COMMENT ON FUNCTION kt.first(kt.t) IS 'a row''s a';
+SELECT (dolt_commit('-Am', 't1'))[1] AS t1 \gset
+DROP FUNCTION kt.rows();
+DROP FUNCTION kt.first(kt.t);
+ALTER TABLE kt.t DROP COLUMN z;
+CREATE FUNCTION kt.rows() RETURNS SETOF kt.t LANGUAGE sql BEGIN ATOMIC SELECT * FROM kt.t; END;
+CREATE FUNCTION kt.first(r kt.t) RETURNS int LANGUAGE plpgsql AS $$BEGIN RETURN r.a; END$$;
+ALTER FUNCTION kt.rows() OWNER TO regress_kr_owner;
+REVOKE EXECUTE ON FUNCTION kt.rows() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION kt.rows() TO regress_kr_user;
+COMMENT ON FUNCTION kt.first(kt.t) IS 'a row''s a';
+SELECT (dolt_commit('-Am', 't2'))[1] AS t2 \gset
+-- (t made again: z added before the columns it keeps)
+SELECT dolt_reset('--hard', :'t1');
+SELECT dolt_hashof('HEAD') = :'t1' AS at_t1;
+SELECT p.proname, p.proowner::regrole, p.proacl, obj_description(p.oid, 'pg_proc') AS comment
+	FROM pg_proc p WHERE p.pronamespace = 'kt'::regnamespace ORDER BY 1;
+SELECT (r).z, kt.first(r) FROM kt.rows() r;
+SELECT dolt_reset('--hard', :'t2');
+SELECT dolt_hashof('HEAD') = :'t2' AS at_t2;
+SELECT kt.first(r) FROM kt.rows() r;
+SELECT * FROM dolt_status();
+DROP SCHEMA kt CASCADE;
+SELECT length(dolt_commit('-Am', 'without kt')::text) > 0 AS committed;
+
+-- A column the move drops in place: a routine reading it first emptied of
+-- its body (and here dropped with it, as the commit has neither).
+CREATE SCHEMA kc VERSIONED;
+CREATE TABLE kc.t (id int PRIMARY KEY, a int);
+INSERT INTO kc.t VALUES (1, 10);
+SELECT (dolt_commit('-Am', 'c1'))[1] AS kc1 \gset
+ALTER TABLE kc.t ADD COLUMN b int;
+CREATE FUNCTION kc.f() RETURNS SETOF int LANGUAGE sql BEGIN ATOMIC SELECT b FROM kc.t; END;
+SELECT (dolt_commit('-Am', 'c2'))[1] AS kc2 \gset
+SELECT dolt_reset('--hard', :'kc1');
+SELECT dolt_hashof('HEAD') = :'kc1' AS at_c1, to_regprocedure('kc.f()') IS NULL AS no_routine;
+SELECT dolt_reset('--hard', :'kc2');
+SELECT * FROM kc.f();
+DROP SCHEMA kc CASCADE;
+SELECT length(dolt_commit('-Am', 'without kc')::text) > 0 AS committed;
 DROP ROLE regress_kr_owner;
 DROP ROLE regress_kr_user;
