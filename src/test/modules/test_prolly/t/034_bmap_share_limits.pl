@@ -101,9 +101,9 @@ SKIP:
 $node->stop;
 
 # With WAL skipped for new relations, committing a copy doesn't log or
-# write its shared pages again: the share itself is logged and synced.  The
-# fold worker is off: its fold of the new rows would log WAL of its own
-# while the commit's is measured.
+# write its shared pages again: the share itself logs the source's own
+# blocks as images, once each.  The fold worker is off: its fold of the new
+# rows would log WAL of its own while the commit's is measured.
 my $min = PostgreSQL::Test::Cluster->new('share_minimal');
 $min->init;
 $min->append_conf('postgresql.conf', qq{
@@ -133,7 +133,8 @@ my $copy = msql(qq{
 	COMMIT;
 });
 my $wal = msql(qq{SELECT pg_current_wal_insert_lsn() - '$before'::pg_lsn});
-cmp_ok($wal, '<', $pages * 8192 / 4, 'the commit logs no image of the copy\'s pages');
+cmp_ok($wal, '>', $pages * 8192 / 2, 'the share logs the source\'s own pages as images');
+cmp_ok($wal, '<', $pages * 8192 * 5 / 4, 'once each: the commit logs no image of the copy\'s pages');
 is(msql(qq{SELECT count(*) FROM test_bmap_map($copy) c JOIN test_bmap_map($t) s
 	USING (blkno, phys)}),
 	$pages, 'the copy still shares every page');
