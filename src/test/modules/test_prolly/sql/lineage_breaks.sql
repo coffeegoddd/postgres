@@ -651,9 +651,9 @@ SELECT value - :forgotten_before AS forgotten
 FROM pg_stat_prolly WHERE name = 'records_forgotten';
 SELECT value - :journal_before < 20000 AS one_edit
 FROM pg_stat_prolly WHERE name = 'journal_bytes_written';
--- a record names its routines and types through shared entries (a list
--- of pieces, and the pieces): those only a collected commit's record named
--- go with it; those a live record names stay
+-- a record names its routines and types through an entry records share:
+-- one only a collected commit's record named goes with it; one a live
+-- record names stays
 SELECT dolt_branch('routines') IS NOT NULL AS made;
 SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
 CREATE FUNCTION ln.kept_routine() RETURNS int LANGUAGE sql AS 'SELECT 1';
@@ -663,25 +663,17 @@ SELECT dolt_checkout('abandon_routine') IS NOT NULL AS on_abandon;
 CREATE FUNCTION ln.abandoned_routine() RETURNS int LANGUAGE sql AS 'SELECT 2';
 SELECT length(dolt_commit('-Am', 'routine to abandon')::text) AS committed;
 SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
-	FROM '@([0-9a-f]{64})\n$') AS gone_list \gset
+	FROM '@([0-9a-f]{64})\n$') AS gone_owned \gset
 SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
 SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
-	FROM '@([0-9a-f]{64})\n$') AS live_list \gset
+	FROM '@([0-9a-f]{64})\n$') AS live_owned \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'abandon_routine') IS NOT NULL AS deleted;
-CREATE TEMP TABLE owned_pieces AS
-SELECT l.which, p AS piece
-FROM (VALUES ('gone', :'gone_list'), ('live', :'live_list')) l (which, list),
-	regexp_split_to_table(rtrim(convert_from(test_refs_value('J' || l.list), 'UTF8'), E'\n'), E'\n') p;
-SELECT which, count(*) AS pieces FROM owned_pieces GROUP BY 1 ORDER BY 1;
+SELECT :'gone_owned' <> :'live_owned' AS another_entry,
+	test_refs_value('J' || :'gone_owned') IS NOT NULL AS stored;
 SELECT dolt_gc() IS NOT NULL AS collected;
-SELECT test_refs_value('J' || :'gone_list') IS NULL AS list_forgotten,
-	test_refs_value('J' || :'live_list') IS NOT NULL AS list_kept;
-SELECT which, bool_and(test_refs_value('J' || piece) IS NOT NULL) AS stored
-FROM owned_pieces
-WHERE which = 'live' OR piece NOT IN (SELECT piece FROM owned_pieces WHERE which = 'live')
-GROUP BY 1 ORDER BY 1;
-DROP TABLE owned_pieces;
+SELECT test_refs_value('J' || :'gone_owned') IS NULL AS forgotten,
+	test_refs_value('J' || :'live_owned') IS NOT NULL AS kept;
 SELECT dolt_branch('-D', 'routines') IS NOT NULL AS deleted;
 
 -- commits made elsewhere (cloned) have no records: their versions are

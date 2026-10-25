@@ -1094,14 +1094,13 @@ put_again(const ProllyNodeRef *mine, ScopedEdits *se, const char *key, int len)
 }
 
 static bool owned_reference(const char *value, int len, char *hash);
-static List *owned_list_pieces(const char *list);
 
 /*
  * The relation records the scoped changes put (scoped_records), as mine
  * has them, added to the edits rebuilt on another root where the diff
  * hasn't them (equal to the base's), in key order; and the routines' and
- * types' entries (TAG_OWNED) each record put names, where the diff hasn't
- * them: one found stored already wasn't put, and a collection since may
+ * types' entry (TAG_OWNED) each record put names, where the diff hasn't
+ * it: one found stored already wasn't put, and a collection since may
  * have forgotten it, no record then naming it.
  */
 static void
@@ -1123,7 +1122,6 @@ put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
 		ProllyEdit *e = &se->edits[i];
 		char		hash[2 * PG_SHA256_DIGEST_LENGTH + 1];
 		char		key[1 + 2 * PG_SHA256_DIGEST_LENGTH + 1];
-		ProllyValue v;
 
 		if (e->is_delete || e->key.len < 1 ||
 			(e->key.data[0] != TAG_LINEAGE && e->key.data[0] != TAG_NAMES) ||
@@ -1131,17 +1129,6 @@ put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
 			continue;
 		snprintf(key, sizeof(key), "%c%s", TAG_OWNED, hash);
 		added |= put_again(mine, se, key, strlen(key));
-		if (!edit_of(se, key, strlen(key), &v))
-			continue;
-		{
-			char	   *list = pnstrdup((const char *) v.data, v.len);
-
-			foreach_ptr(char, piece, owned_list_pieces(list))
-			{
-				snprintf(key, sizeof(key), "%c%s", TAG_OWNED, piece);
-				added |= put_again(mine, se, key, strlen(key));
-			}
-		}
 	}
 	if (added)
 		qsort(se->edits, se->n, sizeof(ProllyEdit), edit_cmp);
@@ -4971,28 +4958,6 @@ owned_reference(const char *value, int len, char *hash)
 	return true;
 }
 
-/* The pieces' hashes a list of them (text) names, or NIL if it is damaged */
-static List *
-owned_list_pieces(const char *list)
-{
-	const int	hlen = 2 * PG_SHA256_DIGEST_LENGTH;
-	List	   *out = NIL;
-
-	for (const char *h = list; *h;)
-	{
-		const char *e = strchr(h, '\n');
-
-		if (e == NULL || e - h != hlen)
-			return NIL;
-		for (const char *x = h; x < e; x++)
-			if (!isxdigit((unsigned char) *x))
-				return NIL;
-		out = lappend(out, pnstrdup(h, hlen));
-		h = e + 1;
-	}
-	return out;
-}
-
 /*
  * A relation's qualified name as the records of relations write it, and
  * as commits name tables: quote_qualified_identifier()'s with
@@ -5364,19 +5329,15 @@ string_set(const char *what, int keysize)
 /*
  * The keys of the routines' and types' entries (TAG_OWNED) under root that
  * no record (TAG_LINEAGE, TAG_NAMES) names, but through those of gone (the
- * keys of records to be forgotten), in key order.  An entry is named by a
- * record that names the list of pieces it is, or a list it is a piece of.
+ * keys of records to be forgotten), in key order.
  */
 static List *
 owned_unreached(const ProllyNodeRef *root, List *gone)
 {
 	const int	hlen = 2 * PG_SHA256_DIGEST_LENGTH;
 	HTAB	   *forgetting = string_set("prolly records forgotten", 2 * hlen + 4);
-	HTAB	   *lists = string_set("prolly owned lists", hlen + 1);
 	HTAB	   *reached = string_set("prolly owned reached", hlen + 1);
 	const char	tags[] = {TAG_LINEAGE, TAG_NAMES};
-	HASH_SEQ_STATUS seq;
-	char	   *list;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
@@ -5402,27 +5363,10 @@ owned_unreached(const ProllyNodeRef *root, List *gone)
 				hash_search(forgetting, key, HASH_FIND, NULL) != NULL;
 
 			if (!skip && owned_reference((const char *) v.data, v.len, hash))
-				(void) hash_search(lists, hash, HASH_ENTER, NULL);
+				(void) hash_search(reached, hash, HASH_ENTER, NULL);
 			pfree(key);
 		}
 		PROLLY_CALL(tree, cursor_close, c);
-	}
-	hash_seq_init(&seq, lists);
-	while ((list = hash_seq_search(&seq)) != NULL)
-	{
-		char		key[1 + 2 * PG_SHA256_DIGEST_LENGTH + 1];
-		ProllyKey	lk;
-		StringInfoData lv;
-
-		(void) hash_search(reached, list, HASH_ENTER, NULL);
-		snprintf(key, sizeof(key), "%c%s", TAG_OWNED, list);
-		lk.data = (const uint8 *) key;
-		lk.len = strlen(key);
-		initStringInfo(&lv);
-		if (PROLLY_CALL(tree, get, &env, root, &lk, &lv))
-			foreach_ptr(char, piece, owned_list_pieces(lv.data))
-				(void) hash_search(reached, piece, HASH_ENTER, NULL);
-		pfree(lv.data);
 	}
 	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
@@ -5437,7 +5381,6 @@ owned_unreached(const ProllyNodeRef *root, List *gone)
 	}
 	PROLLY_CALL(tree, cursor_close, c);
 	hash_destroy(forgetting);
-	hash_destroy(lists);
 	hash_destroy(reached);
 	return out;
 }
