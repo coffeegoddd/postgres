@@ -85,14 +85,11 @@
  *				   space after), and its qualified name (a backslash in it
  *				   written as two, a newline as a backslash and 'n'); the
  *				   routines and types last, by reference: a line of '@'
- *				   and the hex SHA-256 of the list of their pieces (none
- *				   if there are none), held under 'J'
- *	'J' hash	-> under its content's hash in hex, written once and named
- *				   by every record using it: a list of the pieces of a
- *				   record's routines and types (each piece's hash in hex,
- *				   then a newline), or a piece (lines as 'L' lines are, in
- *				   sorted order: the lines of a sorted listing, cut after
- *				   each line whose hash_bytes() ends in five zero bits)
+ *				   and the hex SHA-256 of their lines (none if there are
+ *				   none), held under 'J'
+ *	'J' hash	-> the lines of a record's routines and types (as 'L'
+ *				   lines are, sorted), under their content's hash in hex,
+ *				   written once and named by every record listing them
  *	'D' name	-> the branch's merge's table identity conflicts: tables the
  *				   merge kept as the branch has them, as theirs is another
  *				   relation of the name: the local branch merged, if
@@ -4770,29 +4767,7 @@ relation_lines_of(const char *data, RelationLines what)
 			appendBinaryStringInfo(&key, p + 1, nl - p - 1);
 			if (!refs_get(key.data, key.len, &v))
 				goto bad;
-			/* (the list of the pieces' hashes, each a line) */
-			for (const char *h = v.data; *h;)
-			{
-				StringInfoData pk;
-				StringInfoData pv;
-				const char *e = strchr(h, '\n');
-
-				if (e == NULL || e - h != 2 * PG_SHA256_DIGEST_LENGTH)
-					goto bad;
-				for (const char *x = h; x < e; x++)
-					if (!isxdigit((unsigned char) *x))
-						goto bad;
-				initStringInfo(&pk);
-				initStringInfo(&pv);
-				appendStringInfoChar(&pk, TAG_OWNED);
-				appendBinaryStringInfo(&pk, h, e - h);
-				if (!refs_get(pk.data, pk.len, &pv))
-					goto bad;
-				out = list_concat(out, relation_lines_of(pv.data, LINES_ROUTINES));
-				pfree(pk.data);
-				pfree(pv.data);
-				h = e + 1;
-			}
+			out = list_concat(out, relation_lines_of(v.data, LINES_ROUTINES));
 			pfree(key.data);
 			pfree(v.data);
 			break;
@@ -4882,33 +4857,22 @@ owned_object_line(Oid oid, Oid owner, char kind, const char *name, void *arg)
  */
 /*
  * The branch's routines and types, as a record of relations lists them:
- * their lines (relation_line()'s, sorted) are stored apart, in pieces:
- * cut after each line whose hash ends in OWNED_PIECE_BITS zero bits (on
- * average every 2^OWNED_PIECE_BITS lines), so a piece's bounds depend
- * only on its own lines, and one routine changed, made or dropped changes
- * the piece it is in (or two, at a bound) and no other.  Each piece is
- * held once, under its content's hash (TAG_OWNED), as is the list of the
- * pieces' hashes, and the record names that list by its hash, in a last
- * line of '@' and the hash in hex.  A commit whose routines and types are
- * those its parent's record named (as most are) names the same list, and
- * writes nothing; one that changed a routine writes the piece holding it
- * and the list.  The canonicalizer keeps its listing from one commit to
- * the next (prolly_owned_routines()), and the session the pieces and
- * hashes it made of it, until the listing changes or a role is renamed
- * (whose name a line holds).
+ * their lines (relation_line()'s, sorted) are stored apart, once, under
+ * their content's hash (TAG_OWNED), and the record names them by it, in a
+ * last line of '@' and the hash in hex.  A commit whose routines and types
+ * are those its parent's record named (as most are) names the same lines,
+ * which are neither written nor worked out again: the canonicalizer keeps
+ * its listing from one commit to the next (prolly_owned_routines()), and
+ * the session the lines and hash it made of it, until the listing changes
+ * or a role is renamed (whose name a line holds).  A commit that changed
+ * one routine writes a new entry, but not the whole listing again: a long
+ * value is held out of line in a value tree cut by its content, so the new
+ * one shares every chunk but those around the changed line with the last
+ * (the lines are sorted by OID, a new routine's last).
  */
-#define OWNED_PIECE_BITS 5
-
-typedef struct OwnedPiece
-{
-	char		hash[2 * PG_SHA256_DIGEST_LENGTH + 1];
-	char	   *text;
-} OwnedPiece;
-
 static uint64 owned_generation = 0;
-static char *owned_hash = NULL;	/* (the list's; NULL: none listed) */
-static char *owned_list = NULL;
-static List *owned_pieces = NIL;	/* OwnedPiece *, in TopMemoryContext */
+static char *owned_hash = NULL;	/* (NULL: none listed) */
+static char *owned_text = NULL;
 static bool owned_callback = false;
 
 static void
@@ -4917,47 +4881,12 @@ owned_role_renamed(Datum arg, int cacheid, uint32 hashvalue)
 	owned_generation = 0;
 }
 
-/* The hex SHA-256 of len bytes of data into hex (2 * digest + 1 bytes) */
-static void
-owned_content_hash(const char *data, int len, char *hex)
-{
-	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
-	uint8		digest[PG_SHA256_DIGEST_LENGTH];
-
-	if (ctx == NULL || pg_cryptohash_init(ctx) < 0 ||
-		pg_cryptohash_update(ctx, (const uint8 *) data, len) < 0 ||
-		pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
-		elog(ERROR, "could not hash the routines and types of a record of relations");
-	pg_cryptohash_free(ctx);
-	hex_encode((const char *) digest, sizeof(digest), hex);
-	hex[2 * PG_SHA256_DIGEST_LENGTH] = '\0';
-}
-
-/* Put value under TAG_OWNED and hash, unless it is there already. */
-static void
-put_owned(const char *hash, const char *value)
-{
-	StringInfoData key;
-	StringInfoData v;
-
-	initStringInfo(&key);
-	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_OWNED);
-	appendStringInfoString(&key, hash);
-	if (!refs_get(key.data, key.len, &v))
-	{
-		resetStringInfo(&v);
-		appendStringInfoString(&v, value);
-		refs_put(key.data, key.len, &v);
-	}
-	pfree(key.data);
-	pfree(v.data);
-}
-
 static void
 owned_names(StringInfo out)
 {
 	List	   *lines = NIL;
+	StringInfoData key;
+	StringInfoData v;
 	uint64		generation = owned_generation;
 
 	if (!owned_callback)
@@ -4967,83 +4896,52 @@ owned_names(StringInfo out)
 	}
 	if (prolly_owned_routines(&generation, owned_object_line, &lines))
 	{
-		StringInfoData piece;
-		StringInfoData list;
-		MemoryContext old;
+		StringInfoData text;
+		pg_cryptohash_ctx *ctx;
+		uint8		digest[PG_SHA256_DIGEST_LENGTH];
 
+		initStringInfo(&text);
+		list_sort(lines, line_cmp);
+		foreach_ptr(char, line, lines)
+			appendStringInfoString(&text, line);
 		owned_generation = 0;
-		foreach_ptr(OwnedPiece, p, owned_pieces)
-		{
-			pfree(p->text);
-			pfree(p);
-		}
-		list_free(owned_pieces);
-		owned_pieces = NIL;
-		if (owned_list)
-			pfree(owned_list);
+		if (owned_text)
+			pfree(owned_text);
 		if (owned_hash)
 			pfree(owned_hash);
-		owned_list = owned_hash = NULL;
-		list_sort(lines, line_cmp);
-		initStringInfo(&piece);
-		initStringInfo(&list);
-		old = MemoryContextSwitchTo(TopMemoryContext);
-		for (int i = 0; i < list_length(lines); i++)
+		owned_text = MemoryContextStrdup(TopMemoryContext, text.data);
+		owned_hash = NULL;
+		if (text.len > 0)
 		{
-			const char *line = list_nth(lines, i);
-
-			appendStringInfoString(&piece, line);
-			if ((hash_bytes((const unsigned char *) line, strlen(line)) &
-				 ((1 << OWNED_PIECE_BITS) - 1)) == 0 ||
-				i == list_length(lines) - 1)
-			{
-				OwnedPiece *p = palloc(sizeof(OwnedPiece));
-
-				owned_content_hash(piece.data, piece.len, p->hash);
-				p->text = pstrdup(piece.data);
-				owned_pieces = lappend(owned_pieces, p);
-				appendStringInfo(&list, "%s\n", p->hash);
-				resetStringInfo(&piece);
-			}
+			ctx = pg_cryptohash_create(PG_SHA256);
+			if (ctx == NULL || pg_cryptohash_init(ctx) < 0 ||
+				pg_cryptohash_update(ctx, (const uint8 *) text.data, text.len) < 0 ||
+				pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
+				elog(ERROR, "could not hash the routines and types of a record of relations");
+			pg_cryptohash_free(ctx);
+			owned_hash = MemoryContextAllocZero(TopMemoryContext,
+												2 * PG_SHA256_DIGEST_LENGTH + 1);
+			hex_encode((const char *) digest, sizeof(digest), owned_hash);
 		}
-		if (list.len > 0)
-		{
-			owned_list = pstrdup(list.data);
-			owned_hash = palloc(2 * PG_SHA256_DIGEST_LENGTH + 1);
-			owned_content_hash(list.data, list.len, owned_hash);
-		}
-		MemoryContextSwitchTo(old);
-		pfree(piece.data);
-		pfree(list.data);
-		/* (known only once its pieces and hashes are) */
+		pfree(text.data);
+		/* (known only once its lines and hash are) */
 		owned_generation = generation;
 	}
 	if (owned_hash == NULL)
 		return;
-
-	/*
-	 * (each stored once: the list's there, its pieces are, but a
-	 * transaction that aborted may have stored a piece alone)
-	 */
+	/* (stored once: a transaction that aborted may have stored it alone) */
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_OWNED);
+	appendStringInfoString(&key, owned_hash);
+	if (!refs_get(key.data, key.len, &v))
 	{
-		StringInfoData key;
-		StringInfoData v;
-		bool		have;
-
-		initStringInfo(&key);
-		initStringInfo(&v);
-		appendStringInfoChar(&key, TAG_OWNED);
-		appendStringInfoString(&key, owned_hash);
-		have = refs_get(key.data, key.len, &v);
-		pfree(key.data);
-		pfree(v.data);
-		if (!have)
-		{
-			foreach_ptr(OwnedPiece, p, owned_pieces)
-				put_owned(p->hash, p->text);
-			put_owned(owned_hash, owned_list);
-		}
+		resetStringInfo(&v);
+		appendStringInfoString(&v, owned_text);
+		refs_put(key.data, key.len, &v);
 	}
+	pfree(key.data);
+	pfree(v.data);
 	appendStringInfo(out, "@%s\n", owned_hash);
 }
 
