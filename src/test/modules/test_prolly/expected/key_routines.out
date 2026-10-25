@@ -440,11 +440,11 @@ SELECT dolt_hashof('HEAD') = :'t1' AS at_t1;
  t
 (1 row)
 
-SELECT p.proname, p.proowner::regrole, p.proacl, obj_description(p.oid, 'pg_proc') AS comment
+SELECT p.proname, nullif(p.proowner::regrole::text, current_user) AS proowner, p.proacl, obj_description(p.oid, 'pg_proc') AS comment
 	FROM pg_proc p WHERE p.pronamespace = 'kt'::regnamespace ORDER BY 1;
  proname |     proowner     |                                  proacl                                  |  comment  
 ---------+------------------+--------------------------------------------------------------------------+-----------
- first   | dustin           |                                                                          | a row's a
+ first   |                  |                                                                          | a row's a
  rows    | regress_kr_owner | {regress_kr_owner=X/regress_kr_owner,regress_kr_user=X/regress_kr_owner} | 
 (2 rows)
 

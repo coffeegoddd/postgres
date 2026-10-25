@@ -193,7 +193,7 @@ SELECT (dolt_commit('-Am', 't2'))[1] AS t2 \gset
 -- (t made again: z added before the columns it keeps)
 SELECT dolt_reset('--hard', :'t1');
 SELECT dolt_hashof('HEAD') = :'t1' AS at_t1;
-SELECT p.proname, p.proowner::regrole, p.proacl, obj_description(p.oid, 'pg_proc') AS comment
+SELECT p.proname, nullif(p.proowner::regrole::text, current_user) AS proowner, p.proacl, obj_description(p.oid, 'pg_proc') AS comment
 	FROM pg_proc p WHERE p.pronamespace = 'kt'::regnamespace ORDER BY 1;
 SELECT (r).z, kt.first(r) FROM kt.rows() r;
 SELECT dolt_reset('--hard', :'t2');
