@@ -76,6 +76,23 @@ SELECT count(*) AS at_v2 FROM kh.t WHERE v = 2;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
+-- The same with the working set folded first (a checkpoint folds it, as the
+-- fold worker does in the background): the baseline holds the working
+-- set's rows, so it tells how far they are from b, and the head's pages
+-- are given back as before.
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+UPDATE kh.t SET v = 2, w = w || 'x' WHERE id % 5 = 1;
+SELECT prolly_checkpoint() IS NOT NULL AS folded;
+SELECT pg_stat_force_next_flush();
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+SELECT pg_stat_force_next_flush();
+SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
+	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
+SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
+
 -- A working set a few rows from the commit (fewer than
 -- prolly.restore_min_changes): the head's pages aren't given back, the
 -- few rows written as they are
@@ -90,6 +107,31 @@ SELECT pg_stat_force_next_flush();
 SELECT (since(:'before') ->> 'relations_restored')::int AS restored;
 SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
 
+
+-- A working set brought close to the commit by ordinary writes, its head
+-- far from it: the head's pages don't pay (the working set is about as far
+-- from the head as the head is from the commit, so it may be near the
+-- commit), and only the few rows that differ are written, not the
+-- head's 10,000.
+CREATE TABLE kh.n (id int PRIMARY KEY, v int);
+INSERT INTO kh.n SELECT g, 0 FROM generate_series(1, 20000) g;
+SELECT (dolt_commit('-Am', 'n a'))[1] AS na \gset
+SELECT n_digest FROM (SELECT md5(string_agg(n::text, ',' ORDER BY id)) AS n_digest FROM kh.n n) x \gset
+UPDATE kh.n SET v = 1 WHERE id <= 10000;
+SELECT length(dolt_commit('-am', 'n b')::text) > 0 AS committed;
+UPDATE kh.n SET v = 2 WHERE id <= 10;
+SELECT length(dolt_commit('-am', 'n c')::text) > 0 AS committed;
+UPDATE kh.n SET v = 0 WHERE id <= 10000;
+UPDATE kh.n SET v = 9 WHERE id <= 5;
+SELECT pg_stat_force_next_flush();
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'na') IS NOT NULL AS reset;
+SELECT pg_stat_force_next_flush();
+SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
+	   (since(:'before') ->> 'relations_restored')::int AS restored;
+SELECT md5(string_agg(n::text, ',' ORDER BY id)) = :'n_digest' AS at_na, clean(),
+	indexes_valid()
+FROM kh.n n;
 
 \c :home
 DROP DATABASE kept_head_restore;

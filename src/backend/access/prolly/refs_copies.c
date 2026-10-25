@@ -219,6 +219,7 @@
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/lock.h"
 #include "utils/acl.h"
@@ -3048,6 +3049,87 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 	return same_hash(&base.hash, &data->hash);
 }
 
+/* Does another backend of the database hold a snapshot? */
+static bool
+other_snapshots(void)
+{
+	VirtualTransactionId *vxids;
+	int			n;
+
+	vxids = GetCurrentVirtualXIDs(InvalidTransactionId, true, false,
+								  PROC_IS_AUTOVACUUM | PROC_IN_VACUUM, &n);
+	pfree(vxids);
+	return n > 0;
+}
+
+static uint64
+count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
+{
+	ProllyTreeEnv denv;
+	uint64		changes = 0;
+
+	if (same_hash(&from->hash, &to->hash))
+		return 0;
+	prolly_folded_tree_env(&denv);
+	PROLLY_CALL(tree, diff, &denv, from, to, count_change, &changes);
+	return changes;
+}
+
+/*
+ * Would giving table relid the pages kept as of the head (its rows there,
+ * head) and then writing the rows the head and the move's commit (target)
+ * differ by cost less than writing the rows the working set and the
+ * commit differ by?  Asked without folding the working set, from the
+ * baseline (as given) and the change finder's count of rows changed since
+ * it, which together bound how far the working set is from the commit:
+ * - the baseline holds the head's rows: the working set is that many rows
+ *   (L) from the head, so at least L - H from the commit, where H is how
+ *   far the head is from it.  The head's pages pay if L >= 2H + 1, so the
+ *   H rows written are fewer than the L - H otherwise;
+ * - the baseline holds other rows (a fold since the head, the fold
+ *   worker's): it is B rows from the commit, and the working set at least
+ *   B - L.  They pay if B - L > H.
+ * A count the change finder can't give counts as large.  And not while
+ * another backend of the database holds a snapshot (an open REPEATABLE
+ * READ transaction, a statement running): a restore isn't MVCC-safe, and
+ * such a snapshot, taken before the move commits, would read the head's
+ * rows, neither its own nor the commit's, where writing the rows keeps it
+ * safe.  (One that read the table holds a lock the restore would find
+ * taken, and no restore is made; one that hasn't would be read through.)
+ */
+static bool
+head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
+			   Oid relid, const ProllyNodeRef *head, const ProllyNodeRef *target)
+{
+	ProllyNodeRef base;
+	bool		none;
+	uint64		h;
+	uint64		b;
+
+	if (other_snapshots())
+		return false;
+	if (!PROLLY_HAS(dc->canonicalizer, table_fewer_changes))
+		return false;
+	/*
+	 * (the baseline's entry for the table, found by asking of one change;
+	 * none since: the working set is the baseline's rows)
+	 */
+	base.hash.len = 0;
+	none = dc->canonicalizer->table_fewer_changes(baseline, relid, 1, &base);
+	if (base.hash.len == 0)
+		return false;
+	if (same_hash(&base.hash, &head->hash))
+		return !none &&
+			!dc->canonicalizer->table_fewer_changes(baseline, relid,
+													2 * count_diff(head, target) + 1,
+													&base);
+	h = count_diff(head, target);
+	b = count_diff(&base, target);
+	return b > h &&
+		(none ||
+		 dc->canonicalizer->table_fewer_changes(baseline, relid, b - h, &base));
+}
+
 /*
  * Give the session branch's tables back the pages kept as of commit
  * (was, in the branch's list kept), but those named in skip: each that
@@ -3056,8 +3138,8 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
  * relations, storage replaced since), or not restored (a lock not free,
  * its snapshot gone), is left for the move to write, as is one with so few
  * rows changed that writing them costs less (few_changes()), or, with
- * moving_to, one that few rows of the working set changed from as that
- * commit holds it: the move writes those few.  The tables
+ * moving_to (the move's commit, when commit is the head), one whose pages
+ * as of the head don't pay (head_pages_pay()).  The tables
  * restored are added to *restored, and *baseline spliced with the kept
  * one's entries for them; *kept is the branch's list with the commit kept
  * anew (by the restored tables' new storage), to be put once the restores
@@ -3140,7 +3222,9 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 			!OidIsValid(relid) || relid != kt->rels[0].relid ||
 			!same_relations(kept_relations(relid), kt) || !may_restore(relid) ||
 			few_changes(dc, baseline, relid, &target->data) ||
-			(moved != NULL && few_changes(dc, baseline, relid, &moved->data)))
+			(moving_to != NULL &&
+			 (moved == NULL ||
+			  !head_pages_pay(dc, baseline, relid, &target->data, &moved->data))))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
 		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed,
