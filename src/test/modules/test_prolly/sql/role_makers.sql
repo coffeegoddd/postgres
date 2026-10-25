@@ -48,6 +48,14 @@ SELECT dolt_stash('drop', 'shelf', 'stash@{0}');
 SELECT * FROM made ORDER BY object;
 SELECT name, creator FROM dolt_branches WHERE name <> 'main' ORDER BY name;
 
+-- each is identified as the role commands' objects are
+SELECT (pg_identify_object(classid, objid, 0)).*,
+	(pg_identify_object_as_address(classid, objid, 0)).*
+FROM pg_shdepend
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+	AND classid IN (9907, 9908, 9909)
+ORDER BY 1, 4;
+
 -- DROP ROLE refuses the role, naming what it makes
 DROP ROLE regress_rm_maker;
 

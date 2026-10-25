@@ -125,12 +125,16 @@ extern void prolly_check_branch_rename(const char *newname);
  * (classId RefsBranchClassId, RefsTagClassId or RefsStashClassId, objid the
  * record's id), so DROP ROLE refuses a role that still makes any.
  * prolly_describe_made_object() appends the object's description (DROP
- * ROLE's detail); prolly_reassign_made_object() makes newrole its maker
+ * ROLE's detail), and prolly_made_object_identity() its name (a stash's
+ * list's) and a stash's place in its list, false if the refs no longer
+ * have it; prolly_reassign_made_object() makes newrole its maker
  * (REASSIGN OWNED); prolly_drop_made_object() deletes a tag or stash and
  * gives a branch to the database's owner (DROP OWNED).  One the refs no
  * longer have is described by its id, and its entry is changed or dropped.
  */
 extern void prolly_describe_made_object(StringInfo buf, Oid classId, Oid id);
+extern bool prolly_made_object_identity(Oid classId, Oid id, char **name,
+										int *n);
 extern void prolly_reassign_made_object(Oid classId, Oid id, Oid newrole);
 extern void prolly_drop_made_object(Oid classId, Oid id);
 

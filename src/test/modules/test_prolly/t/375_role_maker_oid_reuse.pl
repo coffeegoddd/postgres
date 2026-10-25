@@ -69,5 +69,26 @@ like($stderr, qr/permission denied to move the head of branch "feat"/,
 is(sql(q{SELECT count(*) FROM dolt_tags}), '0', 'the tag was deleted');
 is(sql(q{SELECT count(*) FROM dolt_stashes}), '0', 'and the stash');
 
+# A role that makes a branch in another database: DROP ROLE's hint names
+# DROP OWNED there, which lets it go.
+$node->safe_psql('postgres', q{CREATE DATABASE far;
+	CREATE ROLE regress_far;
+	GRANT CREATE ON DATABASE far TO regress_far});
+$node->safe_psql('far', q{CREATE EXTENSION test_prolly;
+	CREATE SCHEMA r VERSIONED;
+	CREATE TABLE r.t (a int PRIMARY KEY);
+	INSERT INTO r.t VALUES (1);
+	SELECT dolt_commit('-Am', 'one');
+	SET ROLE regress_far;
+	SELECT dolt_branch('far_branch')});
+($ret, $stdout, $stderr) = $node->psql('postgres',
+	q{REVOKE CREATE ON DATABASE far FROM regress_far; DROP ROLE regress_far});
+isnt($ret, 0, 'DROP ROLE refuses a role that makes a branch in another database');
+like($stderr, qr/REASSIGN OWNED or DROP OWNED there changes the branches/,
+	'and its hint names DROP OWNED there');
+$node->safe_psql('far', q{DROP OWNED BY regress_far});
+$node->safe_psql('postgres', q{DROP ROLE regress_far});
+pass('DROP OWNED there lets the role go');
+
 $node->stop;
 done_testing();

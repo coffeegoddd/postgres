@@ -130,6 +130,21 @@ SELECT name, creator FROM dolt_branches WHERE name <> 'main' ORDER BY name;
  renamed | regress_rm_maker
 (2 rows)
 
+-- each is identified as the role commands' objects are
+SELECT (pg_identify_object(classid, objid, 0)).*,
+	(pg_identify_object_as_address(classid, objid, 0)).*
+FROM pg_shdepend
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+	AND classid IN (9907, 9908, 9909)
+ORDER BY 1, 4;
+  type  | schema | name |      identity      |  type  | object_names | object_args 
+--------+--------+------+--------------------+--------+--------------+-------------
+ branch |        |      | made               | branch | {made}       | {}
+ branch |        |      | renamed            | branch | {renamed}    | {}
+ stash  |        |      | stash@{0} of shelf | stash  | {shelf,0}    | {}
+ tag    |        |      | made_tag           | tag    | {made_tag}   | {}
+(4 rows)
+
 -- DROP ROLE refuses the role, naming what it makes
 DROP ROLE regress_rm_maker;
 ERROR:  role "regress_rm_maker" cannot be dropped because some objects depend on it

@@ -6137,6 +6137,39 @@ getObjectIdentityParts(const ObjectAddress *object,
 			}
 			break;
 
+		case RefsBranchClassId:
+		case RefsTagClassId:
+		case RefsStashClassId:
+			{
+				char	   *name;
+				int			n;
+
+				if (!prolly_made_object_identity(object->classId,
+												 object->objectId, &name, &n))
+				{
+					if (!missing_ok)
+						elog(ERROR, "could not find %s %u in the refs",
+							 getObjectTypeDescription(object, false),
+							 object->objectId);
+					break;
+				}
+				if (object->classId == RefsStashClassId)
+				{
+					appendStringInfo(&buffer, "stash@{%d} of %s", n,
+									 quote_identifier(name));
+					if (objname)
+						*objname = list_make2(pstrdup(name),
+											  psprintf("%d", n));
+				}
+				else
+				{
+					appendStringInfoString(&buffer, quote_identifier(name));
+					if (objname)
+						*objname = list_make1(pstrdup(name));
+				}
+			}
+			break;
+
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);
 	}

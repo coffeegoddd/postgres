@@ -70,7 +70,9 @@ MAKE_SYSCACHE(BRANCHNAME, pg_branch_name_index, 4);
  * catalog lists: a branch, a tag, a stash, kept in a database's refs.  Each
  * is recorded with an id of its own as a shared dependency of its maker
  * (pg_shdepend's classid and objid), so that the role commands see it as
- * any object the role owns.
+ * any object the role owns.  No relation has these OIDs, so the entries
+ * are exempt from pg_shdepend.classid's foreign key to pg_class (the
+ * oidjoins check leaves them out).
  */
 DECLARE_OID_DEFINING_MACRO(RefsBranchClassId, 9907);
 DECLARE_OID_DEFINING_MACRO(RefsTagClassId, 9908);
