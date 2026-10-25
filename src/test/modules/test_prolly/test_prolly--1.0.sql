@@ -663,3 +663,10 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- virtual transaction (what a paced fold gives way to).
 CREATE FUNCTION test_any_lock_has_waiters() RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The engine's work counters as this backend alone has counted them since
+-- it began, flushed or not: what pg_stat_prolly shows of its own work,
+-- which other backends' doesn't move.
+CREATE FUNCTION test_prolly_session_stats(OUT name text, OUT value int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
