@@ -158,6 +158,16 @@ class SysbenchDoltScriptsTest(unittest.TestCase):
         self.assertEqual(w._args(builtin, "run", [])[1], "oltp_read_write")
         self.assertIn("--tables=4", w._args(builtin, "run", []))
 
+    def test_dolt_options_run_sysbench_as_dolt_does(self):
+        from pbench.workloads.sysbench import S10
+        ctx = self._ctx("oltp_read_write")
+        self.assertNotIn("--rand-type=uniform", S10()._args(ctx, "run", []))
+        ctx.params["dolt_options"] = True
+        args = S10()._args(ctx, "run", [])
+        self.assertIn("--db-ps-mode=disable", args)
+        self.assertIn("--rand-type=uniform", args)
+        self.assertEqual(args[-1], "run")
+
     def test_a_script_without_the_checkout_is_unavailable(self):
         from pbench.core.interfaces import Unavailable
         from pbench.workloads.sysbench import S10
@@ -172,6 +182,9 @@ class SysbenchDoltScriptsTest(unittest.TestCase):
         for tests in ("all", ["oltp_nope"]):
             with self.assertRaises(config.ConfigError):
                 config.load(path, {"workloads": {"S10": {"tests": tests}}})
+        config.load(path, {"workloads": {"S10": {"dolt_options": True}}})
+        with self.assertRaises(config.ConfigError):
+            config.load(path, {"workloads": {"S10": {"dolt_options": "yes"}}})
 
 
 class SqlErrorTest(unittest.TestCase):

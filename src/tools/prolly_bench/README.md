@@ -142,8 +142,18 @@ The checkout's commit is recorded with the run's environment. A script
 test without the checkout is reported unavailable. The scripts make their
 own tables (`sbtest1`, and `sbtest2` for the scans and joins) of
 `sysbench_table_size` rows, except `oltp_delete_insert`, which always has
-10,000; `sysbench_tables` doesn't apply to them. Dolt runs sysbench with
-`--db-ps-mode=disable --rand-type=uniform`; S10 uses sysbench's defaults.
+10,000; `sysbench_tables` doesn't apply to them.
+
+Dolt runs sysbench with `--db-ps-mode=disable --rand-type=uniform`: no
+prepared statements, and uniformly random keys rather than sysbench's
+default skewed ("special") distribution. `dolt_options = true` runs S10
+the same way, for any of its tests:
+
+```toml
+[workloads.S10]
+tests = "dolt"
+dolt_options = true
+```
 
 ## The C suite
 

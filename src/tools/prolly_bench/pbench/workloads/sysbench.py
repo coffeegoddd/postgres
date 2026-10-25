@@ -13,7 +13,8 @@ many-typed table: https://github.com/dolthub/sysbench-lua-scripts).  With
 run too, by name, from its *_postgres.lua scripts; `tests = "dolt"` is
 every test Dolt's benchmarks run.  The scripts make their own tables, of
 `table_size` rows (oltp_delete_insert: 10,000 always), and take no
---tables.
+--tables.  `dolt_options = true` runs sysbench as Dolt's benchmarks do
+(DOLT_OPTIONS), with no prepared statements and uniformly random keys.
 """
 
 from __future__ import annotations
@@ -53,6 +54,9 @@ DOLT_TESTS = [
     "oltp_read_write", "oltp_update_index", "oltp_update_non_index",
     *DOLT_SCRIPTS,
 ]
+
+# The options Dolt's benchmarks run sysbench with.
+DOLT_OPTIONS = ["--db-ps-mode=disable", "--rand-type=uniform"]
 
 # Tests that only read.
 _READ_ONLY = {"oltp_read_only", "oltp_point_select", "select_random_points",
@@ -120,7 +124,8 @@ class S10(Workload):
                 "--pgsql-user=postgres", f"--pgsql-db={ctx.dbname}",
                 *([] if script else [f"--tables={self._tables(ctx)}"]),
                 f"--table-size={int(ctx.size_params.get('sysbench_table_size', 100000))}",
-                f"--threads={ctx.key.clients}", f"--rand-seed={ctx.params.get('seed', 1)}", *extra, command]
+                f"--threads={ctx.key.clients}", f"--rand-seed={ctx.params.get('seed', 1)}",
+                *(DOLT_OPTIONS if ctx.params.get("dolt_options") else []), *extra, command]
 
     def _sysbench(self, ctx: Context, command: str, tag: str,
                   extra: Optional[list[str]] = None) -> str:
