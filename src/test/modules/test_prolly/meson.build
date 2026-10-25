@@ -165,6 +165,7 @@ tests += {
       'store_sizes',
       'storage_breakdown',
       'get_many',
+      'tree_levels',
       'put_batches',
       'full_folds',
       'spilled_folds',

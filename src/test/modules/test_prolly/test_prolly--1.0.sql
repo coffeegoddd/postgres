@@ -562,6 +562,13 @@ CREATE FUNCTION test_chunk_put_node(level int, refs text[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Read the tree at root as one reader does ('scan', 'walk', 'diff',
+-- 'diff_nodes', 'diff_unordered', 'diff_estimate', 'rank', 'apply'); what
+-- it counted.
+CREATE FUNCTION test_tree_read(root text, how text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A tree of the items keys[i] -> vals[i] (keys in byte order), declaring
 -- no references; its root's hash.
 CREATE FUNCTION test_chunk_items_tree(keys text[], vals text[])
