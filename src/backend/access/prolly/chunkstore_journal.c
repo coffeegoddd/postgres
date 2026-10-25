@@ -1783,11 +1783,14 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
  * so a transaction not among them waits for the swap and then finds
  * whether its chunk survived.  One among them doesn't wait (the replay
  * waits for it): it is cancelled, or ends, before the swap stops naming
- * what it keeps now.
+ * what it keeps now.  Never in a parallel worker: its local id isn't its
+ * leader's, so it would wait for a replay that waits for the leader.
  */
 static void
 keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t)
 {
+	Assert(!IsParallelWorker());
+
 	for (;;)
 	{
 		bool		replaying;
