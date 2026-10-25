@@ -18,24 +18,56 @@ EXCEPTION WHEN OTHERS THEN
 	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
 END $$;
 
+-- (This store's counts as each step left them, to show which step wrote
+-- what when a count below isn't the one expected: printed only then.
+-- #1020: the counts have come out otherwise now and then, with another
+-- suite running beside.)
+CREATE TEMP TABLE steps (n serial, step text, counts jsonb);
+CREATE FUNCTION pg_temp.note(step text) RETURNS bool LANGUAGE sql AS $$
+	INSERT INTO steps (step, counts)
+	SELECT step, jsonb_object_agg(name, value) FROM pg_stat_prolly;
+	SELECT true
+$$;
+\set diverged false
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('start') AS _n \gset
+
 CREATE SCHEMA app VERSIONED;
 CREATE TABLE app.t (id int PRIMARY KEY, v text);
 INSERT INTO app.t SELECT g, 'main ' || g FROM generate_series(1, 20) g;
 SELECT length(dolt_commit('-m', 'small main')::text) AS committed;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('small main') AS _n \gset
 
 -- A big branch, settled by a collection, then deleted.
 SELECT dolt_branch('big');
 SELECT dolt_checkout('big');
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('checkout big') AS _n \gset
 INSERT INTO app.t SELECT g, repeat('big', 50) || g FROM generate_series(21, 3000) g;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('insert on big') AS _n \gset
 SELECT length(dolt_commit('-m', 'on big')::text) AS committed;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('commit on big') AS _n \gset
 SELECT dolt_hashof('big') AS big_head \gset
 SELECT dolt_checkout('main');
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('checkout main') AS _n \gset
 SELECT dolt_gc();
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('gc 1') AS _n \gset
 SELECT count(*) AS files, bool_and(settled) AS settled FROM test_chunk_table_files();
 SELECT dolt_branch('-D', 'big');
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('branch -D big') AS _n \gset
 
 -- A default collection keeps it: it is settled.
-SELECT kept, freed FROM test_chunk_gc(false);
+SELECT kept, freed FROM test_chunk_gc(false) \gset gc_
+SELECT :gc_kept AS kept, :gc_freed AS freed;
+SELECT :'diverged'::bool OR :gc_freed <> 7 AS diverged \gset
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('default collection') AS _n \gset
 SELECT test_chunk_has(:'big_head') AS big_head;
 
 -- A full one frees it: the file is mostly garbage, so rewritten.
@@ -43,6 +75,8 @@ SELECT name AS big_file FROM test_chunk_table_files()
 ORDER BY chunks DESC, name LIMIT 1 \gset
 SELECT kept > 0 AS kept, freed > 10 AS freed, bytes_freed > 10000 AS bytes_freed
 FROM test_chunk_gc(true);
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('full collection') AS _n \gset
 SELECT test_chunk_has(:'big_head') AS big_head;
 SELECT count(*) FILTER (WHERE name = :'big_file') AS big_file_left,
 	bool_and(settled) AS settled
@@ -54,22 +88,49 @@ SELECT message FROM dolt_log('main');
 -- A mostly live store: a full collection keeps a settled file whole if
 -- at most half of it is garbage.
 INSERT INTO app.t SELECT g, repeat('more', 50) || g FROM generate_series(21, 3000) g;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('insert more') AS _n \gset
 SELECT length(dolt_commit('-m', 'more on main')::text) AS committed;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('commit more') AS _n \gset
 SELECT dolt_gc();
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('gc 2') AS _n \gset
 SELECT name AS live_file FROM test_chunk_table_files()
 ORDER BY chunks DESC, name LIMIT 1 \gset
 UPDATE app.t SET v = 'changed' WHERE id = 7;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('update') AS _n \gset
 SELECT length(dolt_commit('-m', 'a change')::text) AS committed;
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('commit change') AS _n \gset
 SELECT dolt_gc();
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('gc 3') AS _n \gset
 -- (Which files it keeps, by name: the mostly live ones kept whole, none
 -- rewritten, the one wholly garbage gone.)
 SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
+SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 7 FROM test_chunk_table_files()
+	WHERE name = 'prolly_table_000000000000000a'), true) AS diverged \gset
 SELECT freed > 0 AS freed FROM test_chunk_gc(true);
+SELECT pg_stat_force_next_flush() AS _f \gset
+SELECT pg_temp.note('full collection 2') AS _n \gset
 SELECT count(*) AS live_file_kept_whole FROM test_chunk_table_files()
 WHERE name = :'live_file';
 SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
 SELECT count(*) AS rows FROM app.t;
 SELECT message FROM dolt_log('main');
+-- (what each step counted, if a count above isn't the expected one)
+\if :diverged
+SELECT s.n, s.step, d.key AS counter, d.value::int8 - (p.counts ->> d.key)::int8 AS grew
+FROM steps s JOIN steps p ON p.n = s.n - 1, jsonb_each_text(s.counts) d
+WHERE d.value::int8 <> coalesce((p.counts ->> d.key)::int8, 0)
+  AND (d.key IN ('chunks_appended', 'nodes_written', 'refs_nodes_written',
+				 'value_nodes_written', 'commits', 'head_moves', 'move_plans',
+				 'manifest_bytes_written', 'table_file_bytes_written')
+	   OR d.key LIKE 'fold\_%' OR d.key LIKE 'gc\_%')
+ORDER BY s.n, d.key;
+\endif
 
 -- dolt_gc('--full') runs it.
 SELECT dolt_gc('--full');

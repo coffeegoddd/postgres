@@ -1,8 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A streaming standby replaying shares and kept snapshots whose own blocks
-# were logged as images: redo of each writes and syncs nothing, the
-# images' redo having written the blocks (#947).  A block the standby's
+# were logged as images: redo of each syncs nothing, the images' redo
+# having written the blocks (#947); it writes out the relation's pages, as
+# one may have changed in place after its image.  A block the standby's
 # machine lost (zeroed) before a restartpoint synced it is rebuilt from
 # the image after a crash; promoted, the standby gives each commit's kept
 # pages back.  A base backup taken right after such a commit, the store
@@ -68,15 +69,15 @@ my $now = sql($contents);
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $contents), $now, 'the standby replayed them');
 ok( $standby->log_contains(
-		'redo of a snapshot of .* writes nothing: its own pages were logged as images',
+		'redo of a snapshot of .* syncs nothing: its own pages were logged as images',
 		$log_offset),
-	'redo of a kept snapshot writes nothing');
-ok( !$standby->log_contains('redo of a snapshot of .* writes out', $log_offset),
-	'and never writes out its pages');
+	'redo of a kept snapshot syncs nothing');
+ok( $standby->log_contains('redo of a snapshot of .* writes out', $log_offset),
+	'but writes out its pages');
 ok( $standby->log_contains(
-		'redo of a share of .* writes nothing: its own pages were logged as images',
+		'redo of a share of .* syncs nothing: its own pages were logged as images',
 		$log_offset),
-	'nor does redo of a share');
+	'nor does redo of a share sync');
 
 # The standby's machine loses the last commit's kept blocks (their
 # restartpoint was before the commit), then the standby crashes.
