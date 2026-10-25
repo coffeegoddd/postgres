@@ -158,6 +158,19 @@ CREATE FUNCTION test_bmap_release_pending()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- the catalogs whose caches were reset, and the system catalogs' relation
+-- entries invalidated, since the last call, noted by
+-- test_count_cache_reset() at the injection points catcache-reset and
+-- relcache-reset-entry
+CREATE FUNCTION test_cache_resets(OUT catalogs oid[], OUT system_relations int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- whether a catalog cache is of the catalog relid
+CREATE FUNCTION test_syscache_catalog(relid oid)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,
 	done bool DEFAULT false)
 RETURNS void

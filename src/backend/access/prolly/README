@@ -33,6 +33,15 @@ catalog is still read whole for the canonical form: pg_cast
 versioned schema and a type outside it, made outside the extension, is
 shared yet described; pg_cast grows only with user casts.
 
+A session switching branch (set_session_branch()) drops the caches that
+may hold the other branch's rows: every catalog cache entry and list of a
+branch-aware catalog, and every relation cache entry but system catalogs'
+(InvalidateBranchCaches()).  The caches of catalogs with no branch column
+(pg_authid, pg_database, pg_am and the like), which every branch reads the
+same, and the system catalogs' own relation entries, built only from rows
+of objects in pg_catalog, are kept, so the statements after a checkout
+don't rebuild them.
+
 
 Interfaces and implementations
 ------------------------------
@@ -65,6 +74,7 @@ Changes to this design are tracked in GitHub issues:
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
 	json_tree         prolly_jsontree.h       paths, stub
+	node_cache        prolly_nodecache.h      shared, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -415,6 +425,19 @@ internal node with no children; and a walk refuses value trees nested
 more than two deep (the walk recurses a nesting; a row's leaf names a
 JSON tree, whose leaves name its long strings' value trees, and nothing
 deeper names one).
+
+The store's reads of chunks from its files (a read of the file, a CRC
+check and a decompression each) go through the node cache
+(prolly_nodecache.h, nodecache_shared.c): decoded chunks in a fixed area
+of shared memory, prolly_node_cache_size of it, for every backend and the
+fold worker, so a session's reads of trees another session or an earlier
+connection read touch no file.  It is evicted by a clock, so chunks read
+again and again (upper levels, the nodes repeated diffs share) stay.  An
+entry is of a store as of a collection's generation: a chunk is named by
+its content, so nothing kept is stale, and a read after a collection
+finds nothing of what the collection removed.  Each read's level checks
+run on what the cache gives as on what the files do.  pg_stat_prolly
+counts its hits and misses (node_cache_hits, node_cache_misses).
 
 Large values stay TOAST's in the working set.  A commit stores a column
 whose canonical bytes are longer than 2048 as a reference to a value tree

@@ -19,6 +19,7 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
@@ -756,6 +757,8 @@ ResetCatalogCache(CatCache *cache, bool debug_discard)
 	dlist_mutable_iter iter;
 	int			i;
 
+	INJECTION_POINT("catcache-reset", cache);
+
 	/* Remove each list in this cache, or at least mark it dead */
 	for (i = 0; i < cache->cc_nlbuckets; i++)
 	{
@@ -833,6 +836,36 @@ ResetCatalogCachesExt(bool debug_discard)
 	}
 
 	CACHE_elog(DEBUG2, "end of ResetCatalogCaches call");
+}
+
+/*
+ *		ResetBranchCatalogCaches
+ *
+ * Reset the caches whose rows may differ by branch, when the session
+ * changes branch.  A catalog with no branch column (catalog_branch_info()
+ * is NULL: every shared catalog, such as pg_database and pg_authid, and
+ * the local ones that are never versioned, such as pg_am or pg_branch) is
+ * read the same on every branch: catalog_tuple_on_branch() lets through
+ * every row of such a catalog whatever the session's branch, so a lookup
+ * finds the same tuple, or the same absence of one, before and after the
+ * switch, and anything that changes such a row sends the invalidation
+ * that would remove it anyway.  Their entries are kept.  Every entry of a
+ * branch-aware catalog goes, positive or negative, and every list: even a
+ * row shared by every branch (branch 0) may share its key with a row of
+ * the branch switched to, which then must be found instead.
+ */
+void
+ResetBranchCatalogCaches(void)
+{
+	slist_iter	iter;
+
+	slist_foreach(iter, &CacheHdr->ch_caches)
+	{
+		CatCache   *cache = slist_container(CatCache, cc_next, iter.cur);
+
+		if (catalog_branch_info(cache->cc_reloid) != NULL)
+			ResetCatalogCache(cache, false);
+	}
 }
 
 /*

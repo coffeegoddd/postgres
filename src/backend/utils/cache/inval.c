@@ -791,14 +791,40 @@ PrepareInplaceInvalidationState(void)
  * ----------------------------------------------------------------
  */
 
+static void call_all_invalidation_callbacks(void);
+
 void
 InvalidateSystemCachesExtended(bool debug_discard)
 {
-	int			i;
-
 	InvalidateCatalogSnapshot();
 	ResetCatalogCachesExt(debug_discard);
 	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
+	call_all_invalidation_callbacks();
+}
+
+/*
+ * InvalidateBranchCaches
+ *
+ * After the session changes branch: drop what may hold another branch's
+ * catalog rows (ResetBranchCatalogCaches(), RelationCacheInvalidateBranch()
+ * say what is kept, and why it is every branch's), and tell every
+ * callback, as a reset of all caches does, so that caches built on these
+ * (plans, type and namespace caches, and any of an extension) start over.
+ */
+void
+InvalidateBranchCaches(void)
+{
+	InvalidateCatalogSnapshot();
+	ResetBranchCatalogCaches();
+	RelationCacheInvalidateBranch();
+	call_all_invalidation_callbacks();
+}
+
+/* Every registered invalidation callback, told that everything changed. */
+static void
+call_all_invalidation_callbacks(void)
+{
+	int			i;
 
 	for (i = 0; i < syscache_callback_count; i++)
 	{
