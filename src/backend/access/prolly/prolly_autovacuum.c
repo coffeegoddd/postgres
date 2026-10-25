@@ -559,6 +559,15 @@ autofold(void)
 	}
 	table_endscan(scan);
 	table_close(classrel, AccessShareLock);
+
+	/*
+	 * (the scan's snapshots let go before the fold, which reads by one of
+	 * its own: one from before a writer the fold sees committed, as one
+	 * kept while the scan waited for a table's lock would be, would hold
+	 * the xmin horizon below that writer, and the fold's trim of the log
+	 * would keep its rows, which no fold after, finding nothing new, trims)
+	 */
+	PopActiveSnapshot();
 	if (due)
 	{
 		bool		folded = true;
@@ -612,7 +621,6 @@ autofold(void)
 					(errmsg_internal("automatic fold of database \"%s\" given up: the refs held, the branch moved, or a relation locked",
 									 get_database_name(MyDatabaseId))));
 	}
-	PopActiveSnapshot();
 }
 
 /* The default branch's folds checked against full ones, a sample of tables. */
