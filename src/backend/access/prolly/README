@@ -995,8 +995,9 @@ Without images, nothing later in the replay writes a shared block once the
 relation that made its page is dropped (a hard reset's replaced storage)
 or has moved the page off it: those records are skipped.  So redo zeroes
 no block holding a page written after its record (a sane header, an LSN
-past the record's; the checksum goes by the logical block, which the page
-store doesn't know).  Only the relation the record gave the block to, or
+past the record's, and the page size and layout version right; not the
+checksum: a newer page may be a later holder's, at another logical block
+than the record's, so a reader verifies it, with its own).  Only the relation the record gave the block to, or
 a later holder, can have written such a page: an earlier holder let go of
 the block before the record, after its last change.
 

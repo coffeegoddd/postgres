@@ -2509,8 +2509,11 @@ drop_node_buffer(RelFileLocator rel, BlockNumber blk)
  * block to, or one that got the block after it, can have written one: a
  * block's earlier holder let go of it, by a record before this one, after
  * its last change.  A page that is all zeroes, or whose header isn't sane
- * (a torn write), holds nothing to keep.  (The checksum can't be verified:
- * it goes by the logical block, which the page store doesn't know.)
+ * (a torn write), holds nothing to keep.  The checksum isn't verified: a
+ * newer page may be a later holder's, at another logical block than the
+ * record's, and checked with the record's it would fail, be zeroed and be
+ * lost (the later holder's records may be skipped too).  A reader checks
+ * it, with its own logical block.
  */
 static bool
 store_block_newer(SMgrRelation ssrel, BlockNumber blk, XLogRecPtr lsn)
@@ -2522,7 +2525,9 @@ store_block_newer(SMgrRelation ssrel, BlockNumber blk, XLogRecPtr lsn)
 	mdreadv(ssrel, MAIN_FORKNUM, blk, pages, 1);
 	if (PageIsNew((Page) copy.data))
 		return false;
-	return (p->pd_flags & ~PD_VALID_FLAG_BITS) == 0 &&
+	return PageGetPageSize((Page) copy.data) == BLCKSZ &&
+		PageGetPageLayoutVersion((Page) copy.data) == PG_PAGE_LAYOUT_VERSION &&
+		(p->pd_flags & ~PD_VALID_FLAG_BITS) == 0 &&
 		p->pd_lower <= p->pd_upper &&
 		p->pd_upper <= p->pd_special &&
 		p->pd_special <= BLCKSZ &&
