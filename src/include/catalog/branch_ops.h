@@ -223,9 +223,8 @@ typedef struct BranchOpsRoutine
 	 * fromids, the one the object a move brought was made from: the
 	 * relation's and each column's (by name), as the relation's owner here
 	 * gives them, and the source relation's owner's own a grant to it.
-	 * For a relation a merge of source, or a pick or revert of a commit
-	 * source's history has, made here, whose commits hold no privileges.
-	 * Called for several sources, it adds each one's.  None for one source
+	 * For a relation a merge of source, or a pick of its head, made here,
+	 * whose commits hold no privileges.  None for one source
 	 * hasn't, or has now of another kind or name, nor where source is no
 	 * branch with copies.
 	 */

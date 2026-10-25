@@ -4590,6 +4590,32 @@ copies_recorded_relid(const char *branch, const char *name, Oid *relid,
 	return found;
 }
 
+/*
+ * Branch from's record of its relations, if of head, now branch to's too:
+ * made at that head, to's relations are from's, of the same OIDs.
+ */
+static void
+copy_head_names(const char *from, const char *to, const ProllyHash *head)
+{
+	char	   *lines = head_names(from, head);
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex;
+
+	if (lines == NULL)
+		return;
+	hex = prolly_hash_hex(head);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, to);
+	appendStringInfo(&v, "%s%s", hex, lines);
+	refs_put(key.data, key.len, &v);
+	pfree(hex);
+	pfree(lines);
+	pfree(key.data);
+	pfree(v.data);
+}
+
 /* The record of head, now of next (a commit that renamed nothing). */
 static void
 carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *next)
@@ -4940,6 +4966,9 @@ copies_branch_create(const char *name, const char *start_point)
 				 errmsg("branch or commit \"%s\" does not exist", from)));
 	branch_set_head(name, &id);
 	branch_set_baseline(name, NULL, NULL);
+	/* (and its start point's record of its relations, of that head) */
+	if (from_exists)
+		copy_head_names(from, name, &id);
 }
 
 static void

@@ -12768,21 +12768,31 @@ typedef struct CarriedPrivileges
 	List	   *made;			/* relations' OIDs */
 	List	   *dropped;		/* relations' qualified names */
 	MemoryContext cxt;
-	object_access_hook_type prev;
 	struct CarriedPrivileges *outer;
 } CarriedPrivileges;
 
+/*
+ * The innermost move carrying privileges (a move can run inside another:
+ * a constraint's function the outer one's rows call, say), and the hook
+ * carry_access() was installed over, once, by the outermost.
+ */
 static CarriedPrivileges *carrying = NULL;
+static bool carry_installed = false;
+static object_access_hook_type carry_prev = NULL;
 
+/*
+ * The relation events of the innermost carrying move, its own; none once
+ * no move is carrying (left installed under a hook installed after it).
+ */
 static void
 carry_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 			 void *arg)
 {
 	CarriedPrivileges *c = carrying;
 
-	if (c->prev)
-		c->prev(access, classId, objectId, subId, arg);
-	if (classId != RelationRelationId || subId != 0)
+	if (carry_prev)
+		carry_prev(access, classId, objectId, subId, arg);
+	if (c == NULL || classId != RelationRelationId || subId != 0)
 		return;
 	if (access == OAT_POST_CREATE)
 	{
@@ -12814,22 +12824,34 @@ carry_begin(CarriedPrivileges *c, List *sources)
 	c->made = NIL;
 	c->dropped = NIL;
 	c->cxt = CurrentMemoryContext;
-	c->prev = object_access_hook;
 	c->outer = carrying;
 	if (c->sources != NIL)
 	{
+		if (!carry_installed)
+		{
+			carry_prev = object_access_hook;
+			object_access_hook = carry_access;
+			carry_installed = true;
+		}
 		carrying = c;
-		object_access_hook = carry_access;
 	}
 }
 
+/*
+ * The outermost, done, takes carry_access() out, unless a hook installed
+ * since chains to it: then it stays, passing events on.
+ */
 static void
 carry_stop(CarriedPrivileges *c)
 {
-	if (c->sources != NIL)
+	if (c->sources == NIL)
+		return;
+	carrying = c->outer;
+	if (carrying == NULL && object_access_hook == carry_access)
 	{
-		object_access_hook = c->prev;
-		carrying = c->outer;
+		object_access_hook = carry_prev;
+		carry_prev = NULL;
+		carry_installed = false;
 	}
 }
 
@@ -12902,64 +12924,6 @@ carry_end(CarriedPrivileges *c)
 	}
 }
 
-/* The local branches a pick's commits come from, as they are found. */
-typedef struct PickSources
-{
-	const ProllyHash *commits;
-	int			ncommits;
-	const char *current;		/* the session's branch: not one */
-	List	   *names;
-} PickSources;
-
-/* Is branch name, at head, one a pick's commits come from (arg's)? */
-static void
-pick_source(const char *name, const ProllyHash *head, void *arg)
-{
-	PickSources *ps = arg;
-	ProllyDatabaseComponents dc = components();
-
-	if (head->len == 0 || strcmp(name, ps->current) == 0)
-		return;
-	for (int i = 0; i < ps->ncommits; i++)
-	{
-		ProllyHash	base;
-
-		if (PROLLY_CALL(dc.refs, merge_base, &ps->commits[i], head, &base) &&
-			same_hash(&base, &ps->commits[i]))
-		{
-			ps->names = lappend(ps->names, pstrdup(name));
-			return;
-		}
-	}
-}
-
-/*
- * The branches of this database, other than the session's, that refs'
- * commits (a cherry-pick's or a revert's) come from: those whose history
- * has one of them.  A commit only a remote's ref, a tag or no ref at all
- * has comes from none.
- */
-static List *
-picked_sources(const char *const *refs, int nrefs)
-{
-	ProllyDatabaseComponents dc = components();
-	ProllyHash *commits;
-	PickSources ps = {0};
-
-	if (branch_ops()->carry_privileges == NULL || nrefs == 0)
-		return NIL;
-	commits = palloc_array(ProllyHash, nrefs);
-	for (int i = 0; i < nrefs; i++)
-		if (PROLLY_CALL(dc.refs, resolve, refs[i], &commits[ps.ncommits]))
-			ps.ncommits++;
-	if (ps.ncommits == 0)
-		return NIL;
-	ps.commits = commits;
-	ps.current = branch_ops()->current();
-	PROLLY_CALL(dc.refs, branches, pick_source, &ps);
-	return ps.names;
-}
-
 /*
  * The branch of this database ref names, as resolving it finds one first
  * (a branch named so itself, else by its full ref name), or NULL.
@@ -12976,6 +12940,41 @@ merged_branch(const char *ref)
 	return SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)) ? ref : NULL;
 }
 
+/*
+ * The branch a cherry-pick's commits come from: the branch of this
+ * database its one ref names (its head the commit picked), or none.  A
+ * commit named otherwise (by hash, or HEAD~n) may be older than the
+ * branch's head, whose relations of its tables' names may be others made
+ * since; and several refs, or a commit several branches have, name no one
+ * branch whose privileges alone it takes.
+ */
+static List *
+picked_sources(const char *const *refs, int nrefs)
+{
+	const char *source = nrefs == 1 ? merged_branch(refs[0]) : NULL;
+
+	return source != NULL ? list_make1((char *) source) : NIL;
+}
+
+/*
+ * How many merges, cherry-picks and reverts this backend is running: one
+ * can't run inside another (as from a function the rows the first writes
+ * call), whose working set, merge state and privileges it would change
+ * under it.
+ */
+static int	moves_running = 0;
+
+static void
+move_enter(void)
+{
+	if (moves_running > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a merge, cherry-pick or revert can't run inside another"),
+				 errdetail("It was called while another was moving the branch, as from a function the rows it wrote called.")));
+	moves_running++;
+}
+
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
@@ -12986,6 +12985,7 @@ folded_merge(const char *branch, const char *message, int flags,
 	CarriedPrivileges carried;
 	volatile int result;
 
+	move_enter();
 	/* (one merged as a remote's ref, a tag or a commit has none to give) */
 	carry_begin(&carried, source ? list_make1((char *) source) : NIL);
 	PG_TRY();
@@ -12995,6 +12995,7 @@ folded_merge(const char *branch, const char *message, int flags,
 	PG_FINALLY();
 	{
 		carry_stop(&carried);
+		moves_running--;
 	}
 	PG_END_TRY();
 	carry_end(&carried);
@@ -13555,6 +13556,7 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 	CarriedPrivileges carried;
 	volatile int result;
 
+	move_enter();
 	carry_begin(&carried, picked_sources(refs, nrefs));
 	PG_TRY();
 	{
@@ -13563,6 +13565,7 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 	PG_FINALLY();
 	{
 		carry_stop(&carried);
+		moves_running--;
 	}
 	PG_END_TRY();
 	carry_end(&carried);
@@ -13583,7 +13586,16 @@ folded_apply(const char *ref, const char *fn)
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	ProllyHash	ignored;
 
-	(void) pick_held(&ref, 1, true, &ignored, fn);
+	move_enter();
+	PG_TRY();
+	{
+		(void) pick_held(&ref, 1, true, &ignored, fn);
+	}
+	PG_FINALLY();
+	{
+		moves_running--;
+	}
+	PG_END_TRY();
 	if (pushed)
 		PopActiveSnapshot();
 }
@@ -13593,20 +13605,18 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 			  ProllyHash *commit_id)
 {
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	CarriedPrivileges carried;
 	volatile int result;
 
-	carry_begin(&carried, picked_sources(refs, nrefs));
+	move_enter();
 	PG_TRY();
 	{
 		result = revert_held(refs, nrefs, series_head, commit_id);
 	}
 	PG_FINALLY();
 	{
-		carry_stop(&carried);
+		moves_running--;
 	}
 	PG_END_TRY();
-	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
