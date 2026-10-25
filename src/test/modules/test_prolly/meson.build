@@ -148,6 +148,7 @@ tests += {
       'extension_clone',
       'extension_config_rows',
       'text_types',
+      'definition_settings',
       'versioned_event_triggers',
       'internal_move_events',
       'foreign_tables',

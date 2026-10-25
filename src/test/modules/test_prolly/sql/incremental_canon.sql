@@ -159,7 +159,8 @@ COMMIT;
 SELECT scans, incremental FROM work();
 SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;
 
--- A setting a definition prints by: everything.
+-- A setting a definition would print by, changed: its descriptions are
+-- made under fixed settings, so only what changed is folded.
 UPDATE many.hot SET v = v + 1;
 SELECT length(dolt_commit('-am', 'before the setting')::text) > 0 AS committed;
 SET DateStyle = 'SQL, DMY';
