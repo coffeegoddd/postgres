@@ -341,10 +341,10 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(core.ENGINES['doltgres'].ids_in(ids),
                          'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
 
-    def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',)):
+    def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',), warmups=1):
         import random
         from experiment import run_cell
-        c = {'passes': list(passes), 'warmups': 1, 'repetitions': 1, 'history_depths': [1, 3],
+        c = {'passes': list(passes), 'warmups': warmups, 'repetitions': 1, 'history_depths': [1, 3],
              'sample_interval_ms': 10, 'payload_bytes': 16,
              'dirty_sizes': {'small': {'rows': 3}, 'half': {'fraction': 0.5}}}
         out = io.StringIO()
@@ -477,6 +477,13 @@ class BenchTests(unittest.TestCase):
         # the fixture branch is left as it was, and only it
         self.assertEqual(list(sql.branches), ['fixture'])
         self.assertEqual(sql.current, 'fixture')
+
+    def test_no_warmups_measures_each_case_once(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        records = self._run_cell(sql, n, k, commits, warmups=0)
+        self.assertTrue(records and not any(r['warmup'] for r in records))
+        self.assertEqual(len([r for r in records if r['operation'] == 'reset_hard']), 3 * 3)
 
     def test_a_hard_reset_that_keeps_dirty_rows_is_caught(self):
         n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
