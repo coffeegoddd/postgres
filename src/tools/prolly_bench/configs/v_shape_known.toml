@@ -35,3 +35,16 @@ counter = "bmap_refcount_updates"
 current = "linear"
 issue = "#870"
 reason = "as merge's"
+
+# The count pages a merge reads: a page for the children of each map page
+# its snapshot walks, and one for each page its copies look up.  Those
+# follow the map pages it copies (the entry above): the Δ changed rows
+# land in more leaves as the table grows, until there are more leaves than
+# changes (from 64k rows, where the series is log).
+[[known]]
+check = "merge"
+sweep = "rows"
+counter = "bmap_refcount_reads"
+current = "linear"
+issue = "#870"
+reason = "follows the map pages a merge copies, which grow with the table while it has fewer leaves than changed rows"
