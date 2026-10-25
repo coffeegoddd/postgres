@@ -4407,8 +4407,37 @@ apply_passes(void *arg)
  * if it removes rows and a violation is recorded
  * (refuse_keyless_violations()).
  */
+static void apply_rows_as_mover(Oid relid, const Table *from, const Table *to);
+
+/*
+ * (as relid's maker, if the move makes it from a commit: the canonicalizer's
+ * prolly_move_maker(), so that what writing them runs, an index's
+ * expressions, runs as its owner's, restricted, not the mover's)
+ */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
+{
+	ProllyMakerSwitch sw;
+
+	prolly_as_maker(relid, &sw);
+	if (!sw.switched)
+	{
+		apply_rows_as_mover(relid, from, to);
+		return;
+	}
+	PG_TRY();
+	{
+		apply_rows_as_mover(relid, from, to);
+	}
+	PG_FINALLY();
+	{
+		prolly_as_maker_end(&sw);
+	}
+	PG_END_TRY();
+}
+
+static void
+apply_rows_as_mover(Oid relid, const Table *from, const Table *to)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	MemoryContext cxt = CurrentMemoryContext;
@@ -4762,7 +4791,7 @@ recorded_relid(const ProllyHash *commit, const char *name)
 	{
 		ProllyCommitRelation *r = lfirst(lc);
 
-		if (strcmp(r->name, name) == 0)
+		if (strcmp(r->name, name) == 0 && r->relkind != RELKIND_MATVIEW)
 			return r->relid;
 	}
 	return InvalidOid;
@@ -11009,29 +11038,40 @@ violating_rows(List *queries, const char *type, bool removing,
 	foreach_ptr(CheckQuery, q, queries)
 	{
 		MemoryContext old = MemoryContextSwitchTo(batch_cxt);
+		ProllyMakerSwitch sw;
 
-		if (q->keys == NIL)
-			run_check(q->sql, q, removing, &fr);
-		else
+		/* (a table the move makes: checked as its maker, restricted) */
+		prolly_as_maker(q->relid, &sw);
+		PG_TRY();
 		{
-			KeyBatches kb;
-			StringInfoData literal;
-			StringInfoData sql;
-
-			memset(&kb, 0, sizeof(kb));
-			kb.spools = q->keys;
-			initStringInfo(&kb.key);
-			initStringInfo(&literal);
-			initStringInfo(&sql);
-			while (key_batches_next(&kb, &literal))
+			if (q->keys == NIL)
+				run_check(q->sql, q, removing, &fr);
+			else
 			{
-				resetStringInfo(&sql);
-				appendStringInfo(&sql, "%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
-								 q->sql, q->cols, literal.data, q->defs);
-				run_check(sql.data, q, removing, &fr);
-				CHECK_FOR_INTERRUPTS();
+				KeyBatches kb;
+				StringInfoData literal;
+				StringInfoData sql;
+
+				memset(&kb, 0, sizeof(kb));
+				kb.spools = q->keys;
+				initStringInfo(&kb.key);
+				initStringInfo(&literal);
+				initStringInfo(&sql);
+				while (key_batches_next(&kb, &literal))
+				{
+					resetStringInfo(&sql);
+					appendStringInfo(&sql, "%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
+									 q->sql, q->cols, literal.data, q->defs);
+					run_check(sql.data, q, removing, &fr);
+					CHECK_FOR_INTERRUPTS();
+				}
 			}
 		}
+		PG_FINALLY();
+		{
+			prolly_as_maker_end(&sw);
+		}
+		PG_END_TRY();
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(batch_cxt);
 	}
@@ -14120,10 +14160,36 @@ saved_field(StringInfo out, const char *s)
 }
 
 /*
+ * An ACL's items, each as saved_acl_line() appends them: its grantee's OID
+ * and name (0 and '' for PUBLIC), its grantor's OID and name, and its
+ * privileges (ai_privs, in hex), a tab before each.  Roles are kept by OID
+ * and name both, so that a restore gives each grant back to the role it
+ * was of, and to no other role that took its name or its OID since.
+ */
+static void
+saved_acl(StringInfo out, const Acl *acl)
+{
+	const AclItem *items = ACL_DAT(acl);
+
+	for (int i = 0; i < ACL_NUM(acl); i++)
+	{
+		char	   *grantee = items[i].ai_grantee == ACL_ID_PUBLIC ? "" :
+			GetUserNameFromId(items[i].ai_grantee, true);
+		char	   *grantor = GetUserNameFromId(items[i].ai_grantor, true);
+
+		appendStringInfo(out, "\t%u\t", items[i].ai_grantee);
+		saved_field(out, grantee ? grantee : "");
+		appendStringInfo(out, "\t%u\t", items[i].ai_grantor);
+		saved_field(out, grantor ? grantor : "");
+		appendStringInfo(out, "\t%x", (unsigned int) items[i].ai_privs);
+	}
+}
+
+/*
  * Append to out the privileges relation relid has (its own and each
- * column's), a line each: its kind, qualified name, column ('' for the
- * relation's own) and ACL (aclitem[]'s text, which names roles), tab
- * between.  Nothing for privileges at their defaults.
+ * column's), a line each: its kind, qualified name and column ('' for the
+ * relation's own), tab between, then its ACL's items (saved_acl()).
+ * Nothing for privileges at their defaults.
  */
 static void
 save_privileges(StringInfo out, Oid relid)
@@ -14148,8 +14214,8 @@ save_privileges(StringInfo out, Oid relid)
 	{
 		appendStringInfo(out, "%c\t", c->relkind);
 		saved_field(out, name);
-		appendStringInfoString(out, "\t\t");
-		saved_field(out, OidOutputFunctionCall(F_ARRAY_OUT, acl));
+		appendStringInfoChar(out, '\t');
+		saved_acl(out, DatumGetAclP(acl));
 		appendStringInfoChar(out, '\n');
 	}
 	ReleaseSysCache(tup);
@@ -14171,8 +14237,7 @@ save_privileges(StringInfo out, Oid relid)
 		saved_field(out, name);
 		appendStringInfoChar(out, '\t');
 		saved_field(out, NameStr(a->attname));
-		appendStringInfoChar(out, '\t');
-		saved_field(out, OidOutputFunctionCall(F_ARRAY_OUT, acl));
+		saved_acl(out, DatumGetAclP(acl));
 		appendStringInfoChar(out, '\n');
 	}
 	systable_endscan(scan);
@@ -14327,8 +14392,10 @@ drop_for_move(List *relids, const char *why, bool owned, StringInfo saved)
 /*
  * Give back the privileges saved (save_privileges()'s lines) to the
  * relations of their names the branch has now, of the same kind, and to
- * their columns of those names: a line only views' (views), or all.  A
- * line naming a role since dropped is passed over.
+ * their columns of those names: a line only views' (views), or all.  Each
+ * grant is given back only if its grantee and grantor are the roles they
+ * were (the same OID and the same name): one of a role dropped or renamed
+ * since is passed over, with a notice, and the line's others given back.
  */
 void
 prolly_restore_privileges(const char *saved, bool views)
@@ -14346,11 +14413,13 @@ prolly_restore_privileges(const char *saved, bool views)
 	pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
 	for (line = copy; line && *line; line = next)
 	{
-		char	   *f[4];
-		int			nf = 0;
+		List	   *f = NIL;
+		int			nf;
 		const char *p = line;
 		Oid			relid;
 		Acl		   *acl;
+		AclItem    *items;
+		int			nitems = 0;
 		HeapTuple	tup;
 		Relation	catalog;
 		AttrNumber	aclattr;
@@ -14362,8 +14431,7 @@ prolly_restore_privileges(const char *saved, bool views)
 		Oid		   *newmembers;
 		int			noldmembers = 0;
 		int			nnewmembers;
-		MemoryContext cxt = CurrentMemoryContext;
-		ResourceOwner ro = CurrentResourceOwner;
+		char		kind;
 
 		next = strchr(line, '\n');
 		if (next)
@@ -14382,8 +14450,7 @@ prolly_restore_privileges(const char *saved, bool views)
 				}
 				else if (*p == '\t' || *p == '\0')
 				{
-					if (nf < 4)
-						f[nf++] = pstrdup(field.data);
+					f = lappend(f, pstrdup(field.data));
 					resetStringInfo(&field);
 					if (*p == '\0')
 						break;
@@ -14392,35 +14459,63 @@ prolly_restore_privileges(const char *saved, bool views)
 					appendStringInfoChar(&field, *p);
 			}
 		}
-		if (nf != 4 || (views && f[0][0] != RELKIND_VIEW))
+		nf = list_length(f);
+		if (nf < 3 || (nf - 3) % 5 != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold a damaged record of saved privileges")));
+		kind = ((char *) linitial(f))[0];
+		if (views && kind != RELKIND_VIEW)
 			continue;
-		relid = rel_named(f[1], true);
+		relid = rel_named(lsecond(f), true);
 		if (!OidIsValid(relid) ||
-			(f[0][0] != 'c' && get_rel_relkind(relid) != f[0][0]))
+			(kind != 'c' && get_rel_relkind(relid) != kind))
 			continue;
-		BeginInternalSubTransaction(NULL);
-		PG_TRY();
+		acl = (Acl *) palloc0(ACL_N_SIZE((nf - 3) / 5));
+		acl->ndim = 1;
+		acl->dataoffset = 0;
+		acl->elemtype = ACLITEMOID;
+		ARR_LBOUND(acl)[0] = 1;
+		items = ACL_DAT(acl);
+		for (int i = 3; i < nf; i += 5)
 		{
-			acl = DatumGetAclPCopy(OidInputFunctionCall(F_ARRAY_IN, f[3],
-														ACLITEMOID, -1));
-			ReleaseCurrentSubTransaction();
+			Oid			grantee = (Oid) strtoul(list_nth(f, i), NULL, 10);
+			const char *grantee_name = list_nth(f, i + 1);
+			Oid			grantor = (Oid) strtoul(list_nth(f, i + 2), NULL, 10);
+			const char *grantor_name = list_nth(f, i + 3);
+			char	   *grantee_now = grantee == ACL_ID_PUBLIC ? "" :
+				GetUserNameFromId(grantee, true);
+			char	   *grantor_now = GetUserNameFromId(grantor, true);
+
+			if (grantee_now == NULL || strcmp(grantee_now, grantee_name) != 0 ||
+				grantor_now == NULL || strcmp(grantor_now, grantor_name) != 0)
+			{
+				bool		grantee_gone = grantee_now == NULL ||
+					strcmp(grantee_now, grantee_name) != 0;
+
+				ereport(NOTICE,
+						(errmsg("privileges of role \"%s\" on %s%s%s not given back",
+								grantee == ACL_ID_PUBLIC ? "public" : grantee_name,
+								(char *) lsecond(f), kind == 'c' ? " column " : "",
+								kind == 'c' ? (char *) lthird(f) : ""),
+						 errdetail("Role \"%s\", which %s, was dropped or renamed since they were saved.",
+								   grantee_gone ? grantee_name : grantor_name,
+								   grantee_gone ? "held them" : "granted them")));
+				continue;
+			}
+			items[nitems].ai_grantee = grantee;
+			items[nitems].ai_grantor = grantor;
+			items[nitems].ai_privs = (AclMode) strtoul(list_nth(f, i + 4), NULL, 16);
+			nitems++;
 		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(cxt);
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			acl = NULL;
-		}
-		PG_END_TRY();
-		MemoryContextSwitchTo(cxt);
-		CurrentResourceOwner = ro;
-		if (acl == NULL)
+		if (nitems == 0)
 			continue;
+		ARR_DIMS(acl)[0] = nitems;
+		SET_VARSIZE(acl, ACL_N_SIZE(nitems));
 		owner = rel_owner(relid);
-		if (f[0][0] == 'c')
+		if (kind == 'c')
 		{
-			tup = SearchSysCacheCopyAttName(relid, f[2]);
+			tup = SearchSysCacheCopyAttName(relid, lthird(f));
 			catalog = pg_attribute;
 			aclattr = Anum_pg_attribute_attacl;
 			if (HeapTupleIsValid(tup))
@@ -14456,6 +14551,26 @@ prolly_restore_privileges(const char *saved, bool views)
 	table_close(pg_attribute, RowExclusiveLock);
 	table_close(pg_class, RowExclusiveLock);
 	CommandCounterIncrement();
+}
+
+/*
+ * The role a table (name here) of commit's relation relid is made by: the
+ * owner commit's record of relations names (InvalidOid: it has no record,
+ * or none of relid).
+ */
+static Oid
+recorded_maker(const ProllyHash *commit, const char *name, Oid relid)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *relations;
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, commit, &relations))
+		return InvalidOid;
+	foreach_ptr(ProllyCommitRelation, r, relations)
+		if (r->relid == relid && r->relkind != RELKIND_MATVIEW)
+			return prolly_recorded_owner(name, r->owner, r->owner_name);
+	return InvalidOid;
 }
 
 /*
@@ -14535,6 +14650,7 @@ take_their_tables(ProllyMergeState *ms, List *conflicts)
 
 			k->name = c->name;
 			k->relid = c->their_relid;
+			k->owner = recorded_maker(&ms->theirs, c->name, c->their_relid);
 			prolly_move_kept = lappend(prolly_move_kept, k);
 		}
 	PG_TRY();

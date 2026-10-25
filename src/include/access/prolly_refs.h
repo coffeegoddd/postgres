@@ -258,12 +258,16 @@ typedef struct ProllyMovedBranch
 
 /*
  * A relation a commit was made from (refs' commit_relations()): its OID,
- * its owner's, and the table's qualified name then (quoted as needed).
+ * its kind (RELKIND_RELATION, RELKIND_PARTITIONED_TABLE or
+ * RELKIND_MATVIEW), its owner's OID and name then, and its qualified name
+ * then (quoted as needed).
  */
 typedef struct ProllyCommitRelation
 {
 	Oid			relid;
+	char		relkind;
 	Oid			owner;			/* its owner then */
+	char	   *owner_name;		/* that role's name then */
 	char	   *name;
 } ProllyCommitRelation;
 
@@ -808,8 +812,8 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Optional: the relations commit was made from, as this database made
-	 * it: *relations, a ProllyCommitRelation for each prolly table and
-	 * partitioned table (palloc'd); false for a commit made elsewhere
+	 * it: *relations, a ProllyCommitRelation for each prolly table,
+	 * partitioned table and materialized view (palloc'd); false for a commit made elsewhere
 	 * (fetched, cloned, pushed here) or before they were kept.  A history read takes a
 	 * version for the session's table only along commits made from the
 	 * table's relation.

@@ -1789,8 +1789,8 @@ SELECT length(dolt_commit('-Am', 'gone dropped')::text) AS committed;
 REVOKE USAGE, CREATE ON SCHEMA ic FROM regress_ic_gone;
 DROP ROLE regress_ic_gone;
 SELECT dolt_reset('--hard', :'gone_commit');
-ERROR:  cannot make table ic.gone as the commit has it: the role that owned it there no longer exists
-DETAIL:  A table a move makes from a commit is its recorded owner's, with no grants.
+ERROR:  cannot make ic.gone as the commit has it: the role that owned it there no longer exists
+DETAIL:  A relation a move makes from a commit is made by its recorded owner, with no grants.
 HINT:  Move to a commit whose tables' owners exist, or drop the table at the commit first.
 SELECT to_regclass('ic.gone') IS NULL AS not_made;
  not_made 

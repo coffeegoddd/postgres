@@ -237,6 +237,7 @@ tests += {
       'role_makers',
       'writer_definitions',
       'identity_conflicts',
+      'recorded_makers',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
