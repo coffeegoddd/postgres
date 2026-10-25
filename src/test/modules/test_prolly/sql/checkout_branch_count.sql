@@ -39,9 +39,11 @@ SELECT (dolt_commit('-Am', 'cbc'))[1] AS head \gset
 SELECT dolt_branch('cbc_a') IS NOT NULL AS made;
 SELECT count(dolt_branch('cbc_many_' || g)) AS made
 FROM generate_series(1, 199) g;
--- (cbc_a used once: what follows are switches)
+-- (cbc_a used once: what follows are switches; and the commit resolved
+-- once, so that the commit cache has it in both measurements)
 SELECT (dolt_checkout('cbc_a'))[1];
 SELECT (dolt_checkout('main'))[1];
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
 
 -- A checkout to cbc_a and back, and resolving the commit by its hash.
 :flush

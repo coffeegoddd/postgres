@@ -46,7 +46,8 @@ FROM generate_series(1, 199) g;
   199
 (1 row)
 
--- (cbc_a used once: what follows are switches)
+-- (cbc_a used once: what follows are switches; and the commit resolved
+-- once, so that the commit cache has it in both measurements)
 SELECT (dolt_checkout('cbc_a'))[1];
  dolt_checkout 
 ---------------
@@ -57,6 +58,12 @@ SELECT (dolt_checkout('main'))[1];
  dolt_checkout 
 ---------------
  0
+(1 row)
+
+SELECT dolt_hashof(:'head') = :'head' AS resolved;
+ resolved 
+----------
+ t
 (1 row)
 
 -- A checkout to cbc_a and back, and resolving the commit by its hash.
