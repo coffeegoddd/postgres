@@ -110,6 +110,7 @@ tests += {
       'kept_planned',
       'share_layouts',
       'checkout_table_work',
+      'branch_switch_caches',
       'checkout_branch_count',
       'constraint_violations',
       'keyless_violations',
@@ -423,6 +424,7 @@ tests += {
       't/425_fold_worker_trim_own_snapshot.pl',
       't/426_autofold_trim_own_snapshot.pl',
       't/447_node_cache.pl',
+      't/453_branch_switch_caches.pl',
     ],
   },
 }
