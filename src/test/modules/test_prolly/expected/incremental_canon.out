@@ -592,7 +592,8 @@ SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type FROM do
  many.made  | added
 (2 rows)
 
--- A setting a definition prints by: everything.
+-- A setting a definition would print by, changed: its descriptions are
+-- made under fixed settings, so only what changed is folded.
 UPDATE many.hot SET v = v + 1;
 SELECT length(dolt_commit('-am', 'before the setting')::text) > 0 AS committed;
  committed 
@@ -628,7 +629,7 @@ SELECT length(dolt_commit('-am', 'datestyle')::text) > 0 AS committed;
 SELECT scans, incremental FROM work();
  scans | incremental 
 -------+-------------
-     1 |           0
+     0 |           1
 (1 row)
 
 RESET DateStyle;

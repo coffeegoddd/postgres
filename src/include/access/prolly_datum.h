@@ -147,6 +147,14 @@ extern void prolly_datum_batch(void (*run) (void *arg), void *arg);
  */
 extern void prolly_datum_fixed_text(void (*run) (void *arg), void *arg);
 
+/*
+ * Set the settings prolly_datum_fixed_text() fixes, those not so already,
+ * at the caller's GUC nest level (one it ends with AtEOXact_GUC()): for
+ * code that already sets others so, as a fold sets search_path while it
+ * describes definitions, whose constants print by these settings too.
+ */
+extern void prolly_datum_fix_text_settings(void);
+
 /* Append the canonical bytes of a non-NULL value. */
 extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,
 								StringInfo out);
