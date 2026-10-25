@@ -790,9 +790,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_REFS_NODES_READ,	/* of nodes_read, the refs' and commits'
 									 * trees' */
 	PGSTAT_PROLLY_REFS_NODES_WRITTEN,	/* of nodes_written, theirs */
+	PGSTAT_PROLLY_BMAP_REFCOUNT_READS,	/* reference-count pages read to
+										 * look up blocks' counts */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_REFS_NODES_WRITTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_REFCOUNT_READS + 1)
 
 typedef struct PgStat_ProllyStats
 {
