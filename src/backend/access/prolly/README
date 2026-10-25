@@ -372,35 +372,39 @@ value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
 
-JSON trees (a prototype, prolly.structural_jsonb, off by default).  With
-the setting on, a jsonb document whose canonical bytes are longer than
-2048 is stored by content, and folded, as a JSON tree (prolly_jsontree.h,
+JSON trees.  A jsonb document whose canonical bytes are longer than 2048
+is stored by content, and folded, as a JSON tree (prolly_jsontree.h,
 jsontree_paths.c) rather than a value tree of its bytes: a tree of the
-tree interface whose items are the document's scalars keyed by their
-paths, the keys' bytes sorting as jsonb orders the document, each empty
-container an item of its own.  Its root is a function of the document,
-so equal documents share it however they were made, and a fold takes the
-tree from the row's hash pointer unread.  A row's reference to one
-records length 0, which no value tree out of line has; decoding reads
-the document from its items.  prolly_jsonb.c's SQL functions take the
-value as stored: prolly_jsonb_get() reads only the items under a path,
-prolly_jsonb_set() applies edits for the items under it (an UPDATE then
-writes the nodes on that path, not the document), and prolly_jsonb_diff()
-diffs two trees by their nodes; anything a tree doesn't handle, and any
-document that isn't one, they do whole, as #>, jsonb_set() and a diff of
-the documents would.  PostgreSQL's own jsonb functions read the document
-whole, and so does a whole read of a tree, which builds jsonb from the
-items (dearer than decoding a document's bytes).  An array's indexes are
-in its elements' keys, so prolly_jsonb_set() only replaces an element: an
-insert or a removal, which would renumber every element after it, is done
-whole.  Reading a row from history (AS OF, dolt_history_table(), history
-mounts, the rows a checkout, reset or merge writes back) reads a JSON
-tree's document whole; written back, it is stored as the same tree again.
-The setting changes what folds write (a document folds as its JSON tree
-with it on, as its bytes with it off, and a fold meeting the other form
-reads the value and writes it in its own), so every server writing a
-history must agree on it: two that don't reach different roots for the
-same rows.  Folded format 21 is the first whose rows may hold JSON trees.
+tree interface keyed by paths, the keys' bytes sorting as jsonb orders
+the document.  A container of 1024 bytes or fewer is one item holding its
+jsonb bytes; a longer one is its children's items, each scalar an item.
+The tree is built from the canonical bytes (strings in UTF-8), so its
+root is a function of the document: equal documents share it however
+they were made, and a fold takes the tree from the row's hash pointer
+unread.  A document that can't be a tree (a scalar, or a path too long
+for a key) is a value tree of its bytes.  A row's reference to a JSON
+tree records length 0, which no value tree out of line has.  A whole read
+lays the items out as jsonb lays a document out, a packed container's
+bytes copied as they are, checks the result as canonical jsonb bytes are
+checked, and converts it to the database's encoding.  Decoding a row
+whose tree is in the database's store gives a hash pointer to it, so
+history (dolt_at(), snapshot mounts) and the rows a checkout, reset or merge
+writes back name the tree unread; dolt_history_table()'s composite rows
+read it.  prolly_jsonb.c's SQL functions take the value as stored:
+prolly_jsonb_get() reads only the items under a path, prolly_jsonb_set()
+replaces the items under it (a packed container's edited by jsonb_set())
+and packs the containers above it that have become short enough (an
+UPDATE then writes the nodes on that path, not the document; a result
+short enough to be inline comes back whole), and prolly_jsonb_diff()
+diffs two trees by their nodes; anything a tree doesn't handle, any
+document that isn't one, and every document in a database whose encoding
+isn't UTF-8, they do whole, as #>, jsonb_set() and a diff of the
+documents would.  PostgreSQL's own jsonb functions read the document
+whole.  An array's indexes are in its elements' keys, so
+prolly_jsonb_set() only replaces an element of an array that isn't
+packed: an insert or a removal, which would renumber every element after
+it, is done whole.  Folded format 21 is the first whose rows hold JSON
+trees.
 
 
 Writers

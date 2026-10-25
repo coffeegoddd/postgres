@@ -17,15 +17,13 @@
  * pointer doesn't say its type, so fetching couldn't decode them): their
  * pointers' hashes aren't the columns' references.
  *
- * With prolly.structural_jsonb on, a long jsonb document is stored as a
- * JSON tree (prolly_jsontree.h) in a UTF-8 database, and a fold makes it
- * the column's tree: a pointer of form PROLLY_TOAST_FORM_JSON_TREE names
- * its root, its sizes those of the document's jsonb (after an edit by
- * path, estimated: see prolly_jsontree.h), and a reference to it in a row
- * records length 0, which no value tree out of line has.  With it off,
- * such a document folds as its bytes, read whole.  The setting changes
- * what a fold writes, so every server writing one history must agree on
- * it.
+ * A long jsonb document is stored as a JSON tree (prolly_jsontree.h), and
+ * a fold makes it the column's tree: a pointer of form
+ * PROLLY_TOAST_FORM_JSON_TREE names its root, and a reference to it in a
+ * row records length 0, which no value tree out of line has.  The
+ * pointer's sizes are the document's jsonb's when it was stored, and an
+ * estimate after an edit by path or read from history (never less than a
+ * long document's): nothing canonical depends on them.
  *
  * src/include/access/prolly_toast.h
  *
@@ -47,14 +45,6 @@
 #define PROLLY_TOAST_FORM_JSONB		2	/* a document's canonical bytes */
 #define PROLLY_TOAST_FORM_JSON_TREE	3	/* a document's JSON tree */
 
-/*
- * A jsonb document whose canonical bytes are longer is a JSON tree when
- * those are wanted: the length past which a row holds a value out of line.
- */
-#define PROLLY_JSON_TREE_MIN		2048
-
-/* prolly.structural_jsonb */
-extern PGDLLIMPORT bool prolly_structural_jsonb;
 
 /* the destination of the prolly access method's tables */
 extern PGDLLIMPORT const ToastDestinationRoutine prolly_toast_chunkstore;
@@ -118,12 +108,6 @@ extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
  */
 extern void prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
 								   void *arg);
-
-/*
- * Whether long jsonb documents are stored, and folded, as JSON trees: the
- * setting is on and the database's encoding UTF-8.
- */
-extern bool prolly_json_tree_wanted(void);
 
 /*
  * Whether a value is a hash pointer to a JSON tree: its root, and the

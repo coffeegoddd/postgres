@@ -14,13 +14,14 @@
  * UTF-8).  Fetching converts back.  A slice of a value stored as its bytes
  * reads only the tree's nodes that hold it; one converted is read whole.
  *
- * With prolly.structural_jsonb on, a jsonb document whose canonical bytes
- * are too long to be inline in a row is stored as a JSON tree instead
- * (prolly_jsontree.h), in a UTF-8 database: a tree of its scalars keyed
- * by path, which is then the column's tree in history too, so a fold
- * takes it unread, and a path is read or a value set
+ * A jsonb document whose canonical bytes are too long to be inline in a
+ * row is stored as a JSON tree instead (prolly_jsontree.h), built from
+ * those bytes: a tree keyed by path, which is the column's tree in history
+ * too, so a fold takes it unread, and a path is read or a value set
  * (prolly_toast_json_tree()) without the whole document.  Fetching it
- * reads every item.
+ * reads every item, and converts the document to the database's encoding.
+ * A document that can't be a tree (a scalar, or a path too long for a
+ * key) is stored as its bytes.
  *
  * A value is stored converted only if fetching gives its bytes back: the
  * conversion is checked to undo itself (it doesn't for characters of
@@ -91,7 +92,6 @@ static ProllyNodeCounters counters; /* this backend's reads and writes */
 static ProllyDatumCodec *jsonb_codec;
 static const ProllyJsonTreeRoutine *json_tree;
 
-bool		prolly_structural_jsonb = false;
 
 static void
 ensure_env(void)
@@ -269,23 +269,6 @@ prolly_toast_store(Datum value, Oid typid)
 	data = VARDATA_ANY(plain);
 	len = VARSIZE_ANY_EXHDR(plain);
 
-	/* (a document's canonical bytes are a version byte and its own) */
-	if (toast_form(typid) == PROLLY_TOAST_FORM_JSONB &&
-		prolly_json_tree_wanted() && len + 1 > PROLLY_JSON_TREE_MIN)
-	{
-		ProllyNodeRef jroot;
-
-		if (PROLLY_CALL(json_tree, build, &env, (Jsonb *) plain, &jroot))
-		{
-			PROLLY_CALL(env.chunk_store, keep, env.chunks, &jroot.hash);
-			result = make_pointer(&jroot.hash, len, PROLLY_TOAST_FORM_JSON_TREE,
-								  len + VARHDRSZ);
-			if (plain != v)
-				pfree(plain);
-			return result;
-		}
-	}
-
 	initStringInfo(&canonical);
 	switch (toast_form(typid))
 	{
@@ -297,6 +280,22 @@ prolly_toast_store(Datum value, Oid typid)
 			if (to_utf8(data, len, &canonical))
 				form = PROLLY_TOAST_FORM_UTF8;
 			break;
+	}
+
+	/* a document's canonical bytes are a version byte and its binary */
+	if (form == PROLLY_TOAST_FORM_JSONB && canonical.len > PROLLY_JSON_TREE_MIN)
+	{
+		ProllyNodeRef jroot;
+
+		if (PROLLY_CALL(json_tree, build, &env, canonical.data + 1,
+						canonical.len - 1, &jroot))
+		{
+			result = prolly_toast_json_pointer(&jroot, len + VARHDRSZ);
+			pfree(canonical.data);
+			if (plain != v)
+				pfree(plain);
+			return result;
+		}
 	}
 	if (form != PROLLY_TOAST_FORM_BYTES)
 	{
@@ -339,17 +338,15 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 	form = pointer_root(pointer, &root, len);
 
 	/*
-	 * A document is the column's tree in history as a JSON tree when those
-	 * are wanted, and as its bytes when they aren't.
+	 * A long document is the column's tree in history as a JSON tree; one
+	 * stored as its bytes is read, to be one if it can.
 	 */
 	if (form == PROLLY_TOAST_FORM_JSON_TREE)
 	{
-		if (canonical_form(typid) != PROLLY_TOAST_FORM_JSONB ||
-			!prolly_json_tree_wanted())
+		if (canonical_form(typid) != PROLLY_TOAST_FORM_JSONB)
 			return false;
 	}
-	else if (form != canonical_form(typid) ||
-			 (form == PROLLY_TOAST_FORM_JSONB && prolly_json_tree_wanted()))
+	else if (form != canonical_form(typid) || form == PROLLY_TOAST_FORM_JSONB)
 		return false;
 
 	/* the trees of history's value store are these, in this store */
@@ -398,12 +395,6 @@ prolly_toast_reference(const varlena *pointer, StringInfo ref)
 }
 
 bool
-prolly_json_tree_wanted(void)
-{
-	return prolly_structural_jsonb && GetDatabaseEncoding() == PG_UTF8;
-}
-
-bool
 prolly_toast_json_tree(const varlena *pointer, ProllyNodeRef *root,
 					   Size *rawsize)
 {
@@ -426,7 +417,8 @@ prolly_toast_json_pointer(const ProllyNodeRef *root, Size rawsize)
 {
 	ensure_env();
 	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root->hash);
-	rawsize = Max(rawsize, VARHDRSZ + 1);
+	/* (a tree's document is longer than any inline one, whatever is known) */
+	rawsize = Max(rawsize, VARHDRSZ + PROLLY_JSON_TREE_MIN + 1);
 	rawsize = Min(rawsize, (Size) VARLENA_EXTSIZE_MASK);
 	return make_pointer(&root->hash, rawsize - VARHDRSZ,
 						PROLLY_TOAST_FORM_JSON_TREE, rawsize);

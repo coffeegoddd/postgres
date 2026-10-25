@@ -30,13 +30,14 @@
  * name as that pointer, unread (prolly_toast_pointer()): the row holds the
  * tree history has, and a value no one reads is never fetched.
  *
- * With prolly.structural_jsonb on (prolly_toast.h), a jsonb value whose
- * canonical bytes are longer than VALUE_INLINE_MAX is out of line as a
- * JSON tree (prolly_jsontree.h) instead: the reference names its root,
- * with length 0, which no value tree out of line has (a value tree holds
- * more than VALUE_INLINE_MAX bytes).  Decoding reads the document from
- * it.  Walks and collections follow the reference as any, the JSON tree
- * being a tree of the same nodes.  A value TOAST stored out of line in a TOAST
+ * A jsonb value whose canonical bytes are longer than VALUE_INLINE_MAX is
+ * out of line as a JSON tree (prolly_jsontree.h), if it can be one: the
+ * reference names its root, with length 0, which no value tree out of
+ * line has (a value tree holds more than VALUE_INLINE_MAX bytes).
+ * Decoding gives a hash pointer to the tree when the tree is in this
+ * database's store, else the document read from it.  Walks and
+ * collections follow the reference as any, the JSON tree being a tree of
+ * the same nodes.  A value TOAST stored out of line in a TOAST
  * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
@@ -241,7 +242,7 @@ column_typdef(ProllyValueEncoder *enc, int i)
 static bool
 json_tree_column(ProllyValueEncoder *enc, int i)
 {
-	return enc->jsonb[i] && prolly_json_tree_wanted();
+	return enc->jsonb[i];
 }
 
 static const ProllyJsonTreeRoutine *
@@ -255,42 +256,25 @@ json_tree(void)
 }
 
 /*
- * The JSON tree of document doc, its reference appended to ref; false
- * (nothing appended) if it can't be one.
- */
-static bool
-write_json_tree(ProllyValueEncoder *enc, Datum doc, StringInfo ref)
-{
-	ProllyNodeRef root;
-	Jsonb	   *jb = DatumGetJsonbP(doc);
-	bool		made;
-
-	made = PROLLY_CALL(json_tree(), build, enc->values->env, jb, &root);
-	if (made)
-		PROLLY_CALL(enc->values->tree, value_reference, &root.hash, 0, ref);
-	if ((Pointer) jb != DatumGetPointer(doc))
-		pfree(jb);
-	return made;
-}
-
-/*
  * The reference for attribute i's canonical bytes, len of them (longer
- * than VALUE_INLINE_MAX), appended to ref: their value tree's, or the
- * document's JSON tree's.  value, if not 0, is the value they encode.
+ * than VALUE_INLINE_MAX), appended to ref: the document's JSON tree's, if
+ * it is one, else their value tree's.
  */
 static void
-write_long_value(ProllyValueEncoder *enc, int i, Datum value,
-				 const uint8 *bytes, Size len, StringInfo ref)
+write_long_value(ProllyValueEncoder *enc, int i, const uint8 *bytes, Size len,
+				 StringInfo ref)
 {
+	ProllyNodeRef root;
+
 	if (enc->values == NULL)
 		no_values();
-	if (json_tree_column(enc, i))
+	/* (a document's canonical bytes are a version byte and its binary) */
+	if (json_tree_column(enc, i) &&
+		PROLLY_CALL(json_tree(), build, enc->values->env,
+					(const char *) bytes + 1, len - 1, &root))
 	{
-		Datum		doc = value != (Datum) 0 ? value :
-			prolly_datum_decode(enc->codecs[i], (const char *) bytes, (int) len);
-
-		if (write_json_tree(enc, doc, ref))
-			return;
+		PROLLY_CALL(enc->values->tree, value_reference, &root.hash, 0, ref);
+		return;
 	}
 	PROLLY_CALL(enc->values->tree, value_write, enc->values->env, bytes, len,
 				ref);
@@ -460,8 +444,7 @@ encode_into(ProllyValueEncoder *enc, TupleTableSlot *slot,
 				resetStringInfo(&ref);	/* (the lookup's) */
 			else
 				initStringInfo(&ref);
-			write_long_value(enc, i, slot->tts_values[i],
-							 (const uint8 *) val.data, val.len, &ref);
+			write_long_value(enc, i, (const uint8 *) val.data, val.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
 			/*
@@ -548,8 +531,8 @@ canonical_encode_fields(ProllyValueEncoder *enc,
 			StringInfoData ref;
 
 			initStringInfo(&ref);
-			write_long_value(enc, enc->live_attno[j], (Datum) 0,
-							 f->bytes.data, f->bytes.len, &ref);
+			write_long_value(enc, enc->live_attno[j], f->bytes.data,
+							 f->bytes.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
 			pfree(ref.data);
@@ -662,7 +645,12 @@ decode_value(ProllyValueEncoder *enc, int i, const char *p, uint64 len,
 
 	PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
 
-	/* a document's JSON tree: the document read from it */
+	/*
+	 * A document's JSON tree: named by a hash pointer, not read, when the
+	 * tree is in the store values by content are in (so a version from history
+	 * diffs and edits by its tree, and a row written back keeps it); else
+	 * the document read from it.
+	 */
 	if (vlen == 0)
 	{
 		ProllyNodeRef jroot;
@@ -672,7 +660,16 @@ decode_value(ProllyValueEncoder *enc, int i, const char *p, uint64 len,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("a JSON tree in a prolly row's column of type %s",
 							format_type_be(TupleDescAttr(enc->desc, i)->atttypid))));
+		memset(&jroot, 0, sizeof(jroot));
 		jroot.hash = root;
+		if (OidIsValid(MyDatabaseId) &&
+			root.len == sizeof(((varatt_external_hash *) NULL)->va_hash))
+		{
+			const ProllyTreeEnv *tenv = prolly_toast_env();
+
+			if (PROLLY_CALL(tenv->chunk_store, has, tenv->chunks, &root))
+				return PointerGetDatum(prolly_toast_json_pointer(&jroot, 0));
+		}
 		pgstat_count_prolly(PGSTAT_PROLLY_VALUES_READ, 1);
 		return JsonbPGetDatum(PROLLY_CALL(json_tree(), read, enc->values->env,
 										  &jroot));

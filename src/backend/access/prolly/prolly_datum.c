@@ -1983,6 +1983,21 @@ check_jsonb_container(const char *doc, uint32 at, uint32 end, bool top)
 		bad_value("bytes after a jsonb container's last child");
 }
 
+void
+prolly_jsonb_check_utf8(const char *doc, uint32 len)
+{
+	check_jsonb_container(doc, 0, len, true);
+}
+
+Jsonb *
+prolly_jsonb_from_utf8(Jsonb *jb)
+{
+	if (GetDatabaseEncoding() == PG_UTF8 ||
+		all_ascii(VARDATA(jb), VARSIZE(jb) - VARHDRSZ))
+		return jb;
+	return jsonb_convert(jb, false);
+}
+
 static Datum
 decode_jsonb(ProllyDatumCodec *c, const char *data, int len)
 {

@@ -12812,7 +12812,7 @@
   proname => 'prolly_jsonb_set', provolatile => 's', proparallel => 'r',
   prorettype => 'jsonb', proargtypes => 'jsonb _text jsonb bool',
   proargnames => '{doc,path,value,create_if_missing}',
-  prosrc => 'prolly_jsonb_set' },
+  proargdefaults => '{true}', prosrc => 'prolly_jsonb_set' },
 { oid => '8396',
   descr => 'prolly: the scalar paths whose values differ between two jsonb documents',
   proname => 'prolly_jsonb_diff', prorows => '10', proretset => 't',

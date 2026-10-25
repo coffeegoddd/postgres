@@ -5,43 +5,53 @@
  *	  structure, so a path is read, and a value set, without the whole
  *	  document.
  *
- * A document's tree is a tree of the tree interface (prolly_tree.h) whose
- * items are the document's scalars, each keyed by its path, in jsonb's own
- * order: an object's keys as jsonb sorts them (shorter first, then by
- * bytes), an array's elements by index, a container before what it holds.
- * An empty container is an item of its own, at its path; a document that
- * is one scalar is one item, at the empty path.  The tree's items are a
- * function of the document alone, and a tree's root of its items alone,
- * so the root is a function of the document: the same document has the
- * same root however it was made, built whole or edited a value at a time.
- * jsonb's semantics are kept: numerics as jsonb holds them (1.0 stays
- * 1.0), JSON null as an item (SQL NULL is no document), strings in UTF-8.
+ * A document's tree is a tree of the tree interface (prolly_tree.h) keyed
+ * by paths, in jsonb's own order: an object's keys as jsonb sorts them
+ * (shorter first, then by bytes), an array's elements by index, a
+ * container before what it holds.  A container whose jsonb bytes are
+ * PROLLY_JSON_PACK_MAX or fewer is one item, at its path, holding those
+ * bytes; a longer one is no item of its own, but its children's: each
+ * scalar an item, each container one item or its children's again.  So
+ * the items are a function of the document alone, and a tree's root of
+ * its items alone: the same document has the same root however it was
+ * made, built whole or edited a value at a time.  jsonb's semantics are
+ * kept: numerics as jsonb holds them (1.0 stays 1.0), JSON null as a value
+ * (SQL NULL is no document), strings in UTF-8 whatever the database's
+ * encoding.  A document is a tree only if its canonical bytes (a version
+ * byte and its jsonb binary) are longer than PROLLY_JSON_TREE_MIN, and it
+ * is a container: a shorter one, or a scalar, is its bytes.
  *
  * Contract:
- * - build() writes the tree of doc into env's chunk store and sets *root;
- *   false (nothing to use written) if the document can't be one, a path
+ * - build() writes the tree of a document, given as its jsonb binary with
+ *   its strings in UTF-8 (canonical jsonb bytes after their version
+ *   byte), into env's chunk store and sets *root; false (nothing to use
+ *   written) if the document can't be one: a scalar, too short, or a path
  *   longer than the tree's longest key.
- * - read() gives the document back, every item read; get() the value at
- *   a path (path[i] an object's key or an array's index, as #> takes
- *   them), reading only the items under it and the nodes above them: NULL
- *   if there is none.  A path neither handles (an array index that isn't
- *   a non-negative integer) makes get() return false, for the caller to
- *   read the document whole.
+ * - read() gives the document back, in the database's encoding, every
+ *   item read; get() the value at a path (path[i] an object's key or an
+ *   array's index, as #> takes them), reading only the items under it and
+ *   the nodes above them: NULL if there is none.  A path neither handles
+ *   (an array index that isn't a non-negative integer) makes get() return
+ *   false, for the caller to read the document whole.  get(), set() and
+ *   diff() work in UTF-8: callers in another encoding read whole.
  * - set() gives the tree of jsonb_set(doc, path, value, create) in
- *   *new_root, by applying edits for the items under path alone, and
- *   *delta the change in the document's jsonb size (exact for the value
- *   replaced, so an estimate only in jsonb's padding).  It returns false
- *   for what it doesn't handle (an array index that isn't one of the
- *   array's, a document that is a scalar): the caller sets the document
- *   whole.
+ *   *new_root, by applying edits for the items under path and the
+ *   containers above it alone, and *delta an estimate of the change in
+ *   the document's jsonb size.  When the result is too short to be a tree,
+ *   it is *whole instead (else NULL): no estimate decides what is a tree.
+ *   It returns false for what it doesn't handle (an array index that isn't
+ *   one of the array's, a key too long for the tree): the caller sets the
+ *   document whole.
  * - diff() reports each scalar path whose value differs between two
- *   trees, in order, skipping the subtrees both share unread, so d changed
- *   items cost O((d + 1) log n) nodes; diff_documents() reports the same
- *   for two documents in memory, which a caller without trees uses.
+ *   trees, in order (an empty container counting as a scalar), skipping
+ *   the subtrees both share unread, so d changed items cost
+ *   O((d + 1) log n) nodes; diff_documents() reports the same for two
+ *   documents in memory, which a caller without trees uses.
  * - Every tree read must have been written by the same implementation:
- *   read() checks what it reads is a document's (paths well formed, an
- *   array's indexes from 0 without gaps, nothing under a scalar, strings
- *   in UTF-8, numerics as numeric builds them).
+ *   read() checks what it reads is a document's tree (paths well formed,
+ *   an array's indexes from 0 without gaps, nothing under an item, each
+ *   container packed exactly when it is short enough) and the document
+ *   what jsonb builds, as canonical jsonb bytes are checked.
  *
  * Provisional (v0).
  *
@@ -57,6 +67,15 @@
 #include "utils/jsonb.h"
 
 /*
+ * A document whose canonical bytes are this long or shorter is not a tree:
+ * the length past which a row holds a value out of line.
+ */
+#define PROLLY_JSON_TREE_MIN	2048
+
+/* A container whose jsonb bytes are this long or shorter is one item. */
+#define PROLLY_JSON_PACK_MAX	1024
+
+/*
  * Called for each changed scalar path diff() finds: the path's npath
  * elements (keys, and indexes in decimal), and the value before and after
  * (NULL for a path added or removed).
@@ -69,14 +88,14 @@ typedef struct ProllyJsonTreeRoutine
 {
 	ProllyImplInfo info;
 
-	bool		(*build) (const ProllyTreeEnv *env, Jsonb *doc,
+	bool		(*build) (const ProllyTreeEnv *env, const char *doc, Size len,
 						  ProllyNodeRef *root);
 	Jsonb	   *(*read) (const ProllyTreeEnv *env, const ProllyNodeRef *root);
 	bool		(*get) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						char **path, int npath, Jsonb **result);
 	bool		(*set) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
 						char **path, int npath, Jsonb *value, bool create,
-						ProllyNodeRef *new_root, int64 *delta);
+						ProllyNodeRef *new_root, int64 *delta, Jsonb **whole);
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyJsonChangeVisit visit,
 						 void *arg);

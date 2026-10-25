@@ -1,16 +1,15 @@
--- JSON trees: with prolly.structural_jsonb on, a long jsonb document of a
--- versioned table is stored as a tree of its scalars keyed by path, and
--- folded so.  prolly_jsonb_get() and prolly_jsonb_set() read a path and
--- set a value on the tree, prolly_jsonb_diff() diffs two trees by their
--- nodes; each gives what #>, jsonb_set() and a diff of the documents give.
--- The tree is a function of the document: the same document has the same
--- root however it was made.
+-- JSON trees: a long jsonb document of a versioned table is stored as a
+-- tree keyed by path, its short containers (1024 bytes or fewer) one item
+-- each, and folded so.  prolly_jsonb_get() and prolly_jsonb_set() read a
+-- path and set a value on the tree, prolly_jsonb_diff() diffs two trees
+-- by their nodes; each gives what #>, jsonb_set() and a diff of the
+-- documents give.  The tree is a function of the document: the same
+-- document has the same root however it was made.
 CREATE DATABASE regress_structural_jsonb ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;
 \c regress_structural_jsonb
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
 RESET client_min_messages;
-SET prolly.structural_jsonb = on;
 
 CREATE SCHEMA sj VERSIONED;
 CREATE TABLE sj.docs (id int PRIMARY KEY, j jsonb);
@@ -41,11 +40,13 @@ INSERT INTO plain SELECT 4, jsonb_object_agg('key' || g, g) FROM generate_series
 INSERT INTO plain VALUES (5, '{"small": [1, 2, 3]}');
 INSERT INTO sj.docs SELECT * FROM plain;
 
--- Stored as trees (form 3), all but the short one; read back as they were.
+-- Stored as trees (form 3), all but the short one and the scalar (its
+-- bytes, form 2); read back as they were, byte for byte.
 SELECT id, (test_toast_pointer(j)).form AS form,
 	   prolly_jsonb_tree_root(j) IS NOT NULL AS tree
 FROM sj.docs ORDER BY id;
-SELECT d.id, d.j = p.j AS same, d.j::text = p.j::text AS same_text
+SELECT d.id, d.j = p.j AS same, d.j::text = p.j::text AS same_text,
+	   prolly_canonical_value(d.j) = prolly_canonical_value(p.j) AS same_bytes
 FROM sj.docs d JOIN plain p USING (id) ORDER BY id;
 
 -- Paths read from the tree give what #> gives: objects, arrays, scalars,
@@ -99,6 +100,13 @@ INSERT INTO edits VALUES
 	(10, 1, '{items,2000}', '"appended"', true),
 	(11, 1, '{items,-1}', '"last"', true),
 	(12, 1, '{meta,big}', to_jsonb(repeat('another long string ', 300)), true),
+	(17, 1, '{items,6}', jsonb_build_object('grown', repeat('past a packed container ', 60)), true),
+	(18, 1, '{items,6,grown}', '"short again"', true),
+	(19, 1, '{items,10}', (SELECT jsonb_agg(g) FROM generate_series(1, 400) g), true),
+	(20, 1, '{items,10,7}', '"in a long array"', true),
+	(21, 1, '{items,10}', '[]', true),
+	(22, 1, '{items,11,tags,-1}', '"packed: jsonb_set does it"', true),
+	(23, 1, '{items,11,tags,9}', '"appended inside"', true),
 	(13, 2, '{150,2,k151}', '[]', true),
 	(15, 4, '{key0}', '0', true),
 	(16, 4, '{key400}', '"four hundred"', true);
@@ -123,7 +131,7 @@ BEGIN
 	DELETE FROM sj.docs WHERE id = 100;
 END $$;
 SELECT * FROM edit_results ORDER BY n;
--- a document that is a scalar: jsonb_set's error
+-- a document that is a scalar: its bytes, so jsonb_set's error
 SELECT prolly_jsonb_set(j, '{a}', '1', true) FROM sj.docs WHERE id = 3;
 SELECT jsonb_set(j, '{a}', '1', true) FROM plain WHERE id = 3;
 
@@ -131,6 +139,46 @@ SELECT jsonb_set(j, '{a}', '1', true) FROM plain WHERE id = 3;
 SELECT test_toast_counters(true) IS NOT NULL AS reset;
 UPDATE sj.docs SET j = prolly_jsonb_set(j, '{key200}', '"edited"', true) WHERE id = 4;
 SELECT (test_toast_counters(true)).nodes_written BETWEEN 1 AND 8 AS few_written;
+
+-- create_if_missing is true unless said, as jsonb_set's is
+SELECT prolly_jsonb_set(j, '{defaulted}', '"added"') #> '{defaulted}' AS created
+FROM sj.docs WHERE id = 4;
+
+-- A key too long for a tree's key: done whole, as jsonb_set does it (the
+-- result a document in memory, which is stored as its bytes).
+SELECT (test_toast_pointer(prolly_jsonb_set(j, ARRAY[repeat('k', 40000)], '1', true))).form AS form,
+	   prolly_jsonb_set(j, ARRAY[repeat('k', 40000)], '1', true) =
+	   jsonb_set(j, ARRAY[repeat('k', 40000)], '1', true) AS same
+FROM sj.docs WHERE id = 4;
+
+-- A document edited short enough to be inline is no tree: the edit gives
+-- it whole, so it is the row a document built whole is, and a commit of
+-- either has one root, without a phantom change or a merge's assertion.
+CREATE TABLE sj.shrink (id int PRIMARY KEY, j jsonb);
+INSERT INTO sj.shrink VALUES (1, jsonb_build_object('big',
+	(SELECT left(string_agg(md5(g::text), ''), 2100) FROM generate_series(1, 70) g)));
+DO $$ BEGIN FOR i IN 1..80 LOOP
+	UPDATE sj.shrink SET j = prolly_jsonb_set(j, ARRAY['k' || lpad(i::text, 3, '0')], '1', true);
+END LOOP; END $$;
+SELECT (test_toast_pointer(j)).form AS form FROM sj.shrink;
+UPDATE sj.shrink SET j = prolly_jsonb_set(j, '{big}', '""', true);
+SELECT (test_toast_pointer(j)).form AS form, pg_column_size(j) = pg_column_size(j::text::jsonb) AS exact
+FROM sj.shrink;
+SELECT length(dolt_commit('-Am', 'shrunk')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS shrunk \gset
+SELECT dolt_branch('fresh');
+SELECT dolt_checkout('fresh');
+UPDATE sj.shrink SET j = j::text::jsonb;
+SELECT length(dolt_commit('--allow-empty', '-Am', 'fresh')::text) > 0 AS committed;
+SELECT prolly_root_hash('fresh') = prolly_root_hash(:'shrunk') AS same_root;
+SELECT count(*) AS changed FROM dolt_diff(:'shrunk', 'fresh', 'sj.shrink');
+SELECT dolt_checkout('main');
+UPDATE sj.shrink SET j = jsonb_set(j, '{k001}', '2');
+SELECT length(dolt_commit('-Am', 'main k001')::text) > 0 AS committed;
+SELECT length(dolt_merge('fresh')::text) > 0 AS merged;
+SELECT j -> 'k001' AS k001 FROM sj.shrink;
+DROP TABLE sj.shrink;
+SELECT dolt_branch('-D', 'fresh');
 
 -- Diffs of trees give what a diff of the documents gives.
 CREATE TEMP TABLE before_docs AS SELECT * FROM sj.docs;
@@ -152,6 +200,21 @@ SELECT d.id, d.j = p.j AS same
 FROM dolt_at(:'c1', NULL::sj.docs) d JOIN plain p USING (id) ORDER BY id;
 SELECT prolly_jsonb_get(j, '{items,3,name}') FROM dolt_at(:'c1', NULL::sj.docs) WHERE id = 1;
 
+-- A version from history names its tree, unread: diffing it with another
+-- reads what differs, not the documents.  So does a mount of a commit.
+SELECT (test_toast_pointer(j)).form AS form FROM dolt_at(:'c1', NULL::sj.docs) WHERE id = 1;
+UPDATE sj.docs SET j = prolly_jsonb_set(j, '{items,12,name}', '"after c1"', true) WHERE id = 1;
+SELECT test_toast_counters(true) IS NOT NULL AS reset;
+SELECT * FROM prolly_jsonb_diff((SELECT j FROM dolt_at(:'c1', NULL::sj.docs) WHERE id = 1),
+								(SELECT j FROM sj.docs WHERE id = 1));
+SELECT (test_toast_counters(true)).nodes_read < :whole_nodes / 10 AS read_little;
+SELECT mount FROM prolly_mount(:'c1', 'sj', 'sjm', NULL, false, false);
+SELECT (test_toast_pointer(j)).form AS form, j = (SELECT j FROM plain WHERE id = 1) AS same
+FROM sjm.docs WHERE id = 1;
+SELECT prolly_unmount('sjm');
+UPDATE sj.docs SET j = (SELECT j FROM dolt_at(:'c1', NULL::sj.docs) WHERE id = 1) WHERE id = 1;
+SELECT count(*) AS unchanged FROM dolt_diff('HEAD', 'WORKING', 'sj.docs');
+
 -- The same documents reached another way (each built whole on a branch)
 -- give the same root.
 SELECT dolt_branch('built');
@@ -163,24 +226,11 @@ SELECT length(dolt_commit('--allow-empty', '-Am', 'built whole')::text) > 0 AS c
 SELECT prolly_root_hash('built') = prolly_root_hash(:'c1') AS same_root;
 SELECT dolt_checkout('main');
 
--- Folded with the setting off, the documents are their bytes again: the
--- same documents, another root.
-SELECT dolt_branch('bytes');
-SELECT dolt_checkout('bytes');
-SET prolly.structural_jsonb = off;
-DELETE FROM sj.docs;
-INSERT INTO sj.docs SELECT id, j::text::jsonb FROM plain;
-SELECT (test_toast_pointer(j)).form AS form FROM sj.docs WHERE id = 1;
-SELECT length(dolt_commit('-Am', 'bytes')::text) > 0 AS committed;
-SELECT prolly_root_hash('bytes') <> prolly_root_hash(:'c1') AS another_root;
-SELECT d.id, d.j = p.j AS same
-FROM dolt_at('bytes', NULL::sj.docs) d JOIN plain p USING (id) ORDER BY id;
--- the functions read such documents whole, with the same results
-SELECT prolly_jsonb_get(j, '{items,3,name}') AS whole_get,
-	   prolly_jsonb_set(j, '{items,3,name}', '"x"', true) #> '{items,3,name}' AS whole_set
-FROM sj.docs WHERE id = 1;
-SET prolly.structural_jsonb = on;
-SELECT dolt_checkout('main');
+-- A document that can't be a tree (a scalar) is its bytes, as a value
+-- tree; the functions read it whole, with the same results.
+SELECT (test_toast_pointer(j)).form AS form, prolly_jsonb_get(j, '{}') = j AS whole_get,
+	   prolly_jsonb_get(j, '{0}') AS into_scalar
+FROM sj.docs WHERE id = 3;
 
 -- A merge writes rows from history: a document changed on a branch comes
 -- back as its tree.
@@ -197,12 +247,41 @@ SELECT id, (test_toast_pointer(j)).form AS form, prolly_jsonb_get(j, '{key1}') A
 FROM sj.docs WHERE id IN (2, 4) ORDER BY id;
 
 -- A collection keeps every tree the pages and the commits name.
-SELECT dolt_branch('-D', 'built', 'bytes', 'side');
+SELECT dolt_branch('-D', 'built', 'side');
 SELECT dolt_gc() IS NOT NULL AS collected;
 SELECT d.id, d.j = p.j::jsonb AS same
 FROM sj.docs d JOIN (SELECT id, j FROM dolt_at(:'c1', NULL::sj.docs)) p USING (id)
 WHERE d.id IN (1, 3, 5) ORDER BY id;
 SELECT count(*) AS commits_readable FROM dolt_history_table(NULL::sj.docs) WHERE (row).j IS NOT NULL;
+
+-- A tree's strings are UTF-8 whatever the database's encoding: one cloned
+-- into a LATIN1 database is read with its keys and strings converted (and
+-- the keys ordered as they convert), and one stored there is built from
+-- the document's UTF-8 bytes.  The functions read whole in that encoding.
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/sjson-' || txid_current() AS url \gset
+CREATE TABLE sj.enc (id int PRIMARY KEY, j jsonb);
+INSERT INTO sj.enc SELECT 1, jsonb_object_agg('clé' || g, 'café ' || md5(g::text))
+FROM generate_series(1, 100) g;
+SELECT (test_toast_pointer(j)).form AS form FROM sj.enc;
+SELECT length(dolt_commit('-Am', 'encodings')::text) > 0 AS committed;
+SELECT dolt_remote('add', 'origin', :'url');
+SELECT dolt_push('origin', 'main') AS pushed;
+CREATE DATABASE regress_sj_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;
+\c regress_sj_latin1
+SET client_encoding = 'UTF8';
+SELECT dolt_clone(:'url') IS NOT NULL AS cloned;
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT j -> 'clé1' AS v, left(j::text, 30) AS text FROM sj.enc;
+INSERT INTO sj.enc SELECT 2, jsonb_object_agg('ñ' || g, 'ü ' || md5(g::text))
+FROM generate_series(1, 100) g;
+SELECT id, (test_toast_pointer(j)).form AS form, j -> 'ñ1' AS v FROM sj.enc ORDER BY id;
+SELECT prolly_jsonb_get(j, '{ñ2}') AS got, prolly_jsonb_set(j, '{ñ2}', '"é"') -> 'ñ2' AS set
+FROM sj.enc WHERE id = 2;
+\c regress_structural_jsonb
+DROP DATABASE regress_sj_latin1;
 
 \c postgres
 DROP DATABASE regress_structural_jsonb;
