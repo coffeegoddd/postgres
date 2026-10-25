@@ -956,9 +956,9 @@ It still writes the relation's pages out, as the primary does: a page
 found the relation's own before the share or snapshot may change in place
 after its image and before the record (a row lock or a prune, which don't
 ask the map), and that change's redo reaches the relation's buffer only,
-which nothing else would write to the block before a restartpoint.  Redo goes by the record's flag, not the current wal_level,
-which can change only across a restart, whose shutdown checkpoint syncs
-everything.
+which nothing else would write to the block before a restartpoint.
+Redo goes by the record's flag, not the current wal_level, which can
+change only across a restart, whose shutdown checkpoint syncs everything.
 
 At wal_level minimal no image is logged, and a share or snapshot syncs the
 database's page store, a whole-file fsync that writes back every page the

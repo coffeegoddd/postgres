@@ -5,7 +5,10 @@
 # place (the page found the source's own before the share, so neither asks
 # the map).  Redo of the share has the copy read the page as changed, as
 # the primary's flush of the source's buffers gives it: after a crash, on a
-# standby, and from a base backup taken across the share.
+# standby, and from a base backup taken across the share.  The same holds
+# for a kept snapshot taken at commit: a page of the snapshot's own changed
+# in place after its image reads as changed from the snapshot on a promoted
+# standby.
 
 use strict;
 use warnings FATAL => 'all';
