@@ -9335,6 +9335,11 @@ refresh_matview(Oid view)
  * rows as they are) is given them too.  The refreshes come last, each
  * after those of the views it reads (through views and functions), so
  * that it reads their merged rows.
+ *
+ * The refreshes run with the text settings fixed, as the rows' merge
+ * does (merge_rows()): a query that prints a timestamptz, or reads a date
+ * from text, makes the same rows in any session, so the same merge makes
+ * the same commit in any.
  */
 static void
 merge_matviews(MergeRows *mr)
@@ -9389,8 +9394,8 @@ merge_matviews(MergeRows *mr)
 		return;
 
 	/*
-	 * (as the session would, its owner's query reading the merged rows)
-	 * Each after the views it reads.  One calling a function that records
+	 * (as the session would, its owner's query reading the merged rows,
+	 * though under the fixed settings) Each after the views it reads.  One calling a function that records
 	 * nothing of what it reads (opaque) may read any of them: so after a
 	 * pass over all of them, the opaque ones and those reading them are
 	 * refreshed again, once per opaque one, each pass leaving one more of
@@ -9455,6 +9460,13 @@ merge_matviews(MergeRows *mr)
 
 static void merge_tables_rows(void *arg);
 
+/* merge_matviews(), as prolly_datum_fixed_text() runs it */
+static void
+merging_matviews(void *arg)
+{
+	merge_matviews((MergeRows *) arg);
+}
+
 /*
  * Each table's rows, after the definitions are merged (or alike): three-way
  * where both sides define it alike (against no rows, for a table both
@@ -9480,9 +9492,8 @@ merge_rows(void *arg)
 	MergeRows  *mr = arg;
 
 	prolly_datum_fixed_text(merge_tables_rows, mr);
-	/* (a materialized view's query runs under the session's settings) */
 	if (!mr->matviews_later)
-		merge_matviews(mr);
+		prolly_datum_fixed_text(merging_matviews, mr);
 }
 
 /* merge_rows()'s rows, with the text settings fixed */
@@ -9769,8 +9780,8 @@ moving_schema(void *arg)
  * default an added column is filled with, a CHECK the rows are tested
  * against, all convert alike in any session, so the merge succeeds or
  * fails alike in any.  The definitions they replay were written so too.
- * The materialized views are refreshed after, under the session's
- * settings, as merge_rows() refreshes them.
+ * The materialized views are merged after (merge_matviews()), the move
+ * done, with the same settings fixed.
  */
 static void
 move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
@@ -9823,7 +9834,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 						   ed->message)));
 	}
 	PG_END_TRY();
-	merge_matviews(mr);
+	prolly_datum_fixed_text(merging_matviews, mr);
 }
 
 /*

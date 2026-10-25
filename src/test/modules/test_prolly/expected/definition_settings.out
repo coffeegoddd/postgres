@@ -1,10 +1,11 @@
 -- A fold describes definitions (defaults, checks, generated columns,
 -- index expressions, views, policies) with the settings values' text
 -- forms are written under fixed: TimeZone UTC, ISO dates, the postgres
--- IntervalStyle, the shortest floats, hex bytea.  A constant in one prints
--- alike in any session, so the same definitions committed in sessions of
--- other settings make the same root, and a fold in one session agrees
--- with one in another (a reset, a status).
+-- IntervalStyle, the shortest floats, hex bytea; and quote_all_identifiers
+-- off.  A constant or a name in one prints alike in any session, so the
+-- same definitions committed in sessions of other settings make the same
+-- root, and a fold in one session agrees with one in another (a reset, a
+-- status).
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -148,6 +149,53 @@ SELECT count(*) AS changes FROM dolt_status();
        0
 (1 row)
 
+SET DateStyle = 'ISO, MDY';
+SET IntervalStyle = postgres;
+DROP SCHEMA ds CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table ds.t
+drop cascades to view ds.v
+SELECT length(dolt_commit('-Am', 'ds gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- Every name quoted, in a session that quotes them all.
+SET quote_all_identifiers = on;
+SELECT ds_make();
+ ds_make 
+---------
+ 
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'ds quoted')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT prolly_root_hash('HEAD') = :'fixed_root' AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+RESET quote_all_identifiers;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changes FROM dolt_status();
+ changes 
+---------
+       0
+(1 row)
+
+SET DateStyle = 'Postgres, MDY';
+SET IntervalStyle = postgres_verbose;
 -- (the session's own settings show the definitions as it would)
 SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
 WHERE adrelid = 'ds.t'::regclass AND adnum = 2;

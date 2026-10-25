@@ -1609,17 +1609,23 @@ static void describe_type(Canon *cn, Form_pg_type typ);
 /*
  * The settings definitions are described under, and their descriptions
  * run under when a move makes them again, set at the caller's GUC nest
- * level: search_path pg_catalog, so each name prints qualified, and the
- * settings values' text forms are written under (TimeZone UTC, ISO dates,
- * the postgres IntervalStyle, and the rest: prolly_datum.h), so a
- * constant in a default, a check, an index's expression or a view prints,
- * and reads back, alike in any session.
+ * level: search_path pg_catalog, so each name prints qualified;
+ * quote_all_identifiers off, so names are quoted alike (string constants
+ * always print standard conforming); and the settings values' text
+ * forms are written under (TimeZone UTC, ISO dates, the postgres
+ * IntervalStyle, and the rest: prolly_datum.h), so a constant in a
+ * default, a check, an index's expression or a view prints, and reads
+ * back, alike in any session.  No other setting changes how a description
+ * prints, so the descriptions cached (described) hold in any session.
  */
 static void
 describing_settings(void)
 {
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	if (quote_all_identifiers)
+		(void) set_config_option("quote_all_identifiers", "off", PGC_USERSET,
+								 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	prolly_datum_fix_text_settings();
 }
 
@@ -3261,7 +3267,6 @@ static bool fold_caches_registered = false;
 static uint64 catalog_epoch = 0;	/* moved by each callback */
 static MemoryContext described_cxt = NULL;
 static HTAB *described = NULL;
-static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
 
@@ -3334,16 +3339,6 @@ typedef struct Member
 	Oid			objid;
 	Oid			extension;
 } Member;
-
-/*
- * The settings that change how a description prints a constant (a
- * default's, a check's), whatever the search path.
- */
-static const char *const deparse_settings[] = {
-	"DateStyle", "IntervalStyle", "TimeZone", "extra_float_digits",
-	"bytea_output", "standard_conforming_strings", "quote_all_identifiers",
-	"lc_monetary", "lc_numeric"
-};
 
 static void
 forget_descriptions(void)
@@ -3473,29 +3468,6 @@ fold_caches_begin(void)
 		fold_caches_registered = true;
 	}
 	AcceptInvalidationMessages();
-}
-
-/* Drop the descriptions if the deparsing settings changed since. */
-static void
-check_deparse_settings(void)
-{
-	StringInfoData now;
-
-	initStringInfo(&now);
-	for (int i = 0; i < lengthof(deparse_settings); i++)
-		appendStringInfo(&now, "%s\n",
-						 GetConfigOption(deparse_settings[i], false, false));
-	if (described_settings == NULL || strcmp(now.data, described_settings) != 0)
-	{
-		forget_descriptions();
-		items_at.valid = false;
-		baseline_at.valid = false;
-		defs_valid = false;
-		if (described_settings)
-			pfree(described_settings);
-		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
-	}
-	pfree(now.data);
 }
 
 /*
@@ -5626,11 +5598,11 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	ProllyDatabaseComponents dc;
 
 	/*
-	 * Deparse with every name qualified, whatever the session's settings;
-	 * tables described as before taken from the cache (#483).
+	 * Deparse with every name qualified, whatever the session's settings
+	 * (describing_settings()); tables described as before taken from the
+	 * cache (#483).
 	 */
 	fold_caches_begin();
-	check_deparse_settings();
 	cn->cached = true;
 
 	/* (marked before anything is read) */
@@ -6049,7 +6021,6 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			load_baseline_keys(&cn, baseline, list_make1(&key));
 			/* (described as collect() describes it: see build_canonical()) */
 			fold_caches_begin();
-			check_deparse_settings();
 			cn.cached = true;
 			save_nestlevel = NewGUCNestLevel();
 			describing_settings();

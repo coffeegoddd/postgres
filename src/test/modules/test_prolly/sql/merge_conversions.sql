@@ -253,3 +253,47 @@ SELECT dolt_branch('-D', 'ma_f');
 SELECT dolt_branch('-D', 'ma_pre');
 DROP SCHEMA ma CASCADE;
 SELECT length(dolt_commit('-Am', 'ma gone')::text) AS committed;
+
+-- A materialized view both sides refreshed is refreshed again from the
+-- merged rows, with the settings fixed: its query's text forms (a
+-- timestamptz shown as text) are alike in any session, so the same merge
+-- makes the same root.
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, MDY';
+CREATE SCHEMA mv VERSIONED;
+CREATE TABLE mv.t (id int PRIMARY KEY, ts timestamptz);
+INSERT INTO mv.t SELECT g, '2024-03-01 12:00:00+00'::timestamptz + g * interval '1 hour'
+FROM generate_series(1, 3) g;
+CREATE MATERIALIZED VIEW mv.shown AS SELECT id, ts::text AS ts_text FROM mv.t;
+SELECT length(dolt_commit('-Am', 'mv base')::text) AS committed;
+SELECT dolt_branch('mv_f');
+UPDATE mv.t SET ts = ts + interval '1 day' WHERE id = 1;
+REFRESH MATERIALIZED VIEW mv.shown;
+SELECT length(dolt_commit('-am', 'mv ours')::text) AS committed;
+SELECT dolt_checkout('mv_f') IS NOT NULL AS on_f;
+UPDATE mv.t SET ts = ts + interval '2 days' WHERE id = 2;
+REFRESH MATERIALIZED VIEW mv.shown;
+SELECT length(dolt_commit('-am', 'mv theirs')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('mv_pre');
+SELECT (dolt_merge('mv_f', '--no-commit'))[3:4];
+SELECT length(dolt_commit('-am', 'merged', '--date', '2024-01-01 00:00:00+00')::text) AS committed;
+SELECT prolly_root_hash('HEAD') AS mv_root \gset
+SELECT * FROM mv.shown ORDER BY id;
+SELECT dolt_reset('--hard', 'mv_pre');
+SET TimeZone = 'Asia/Tokyo';
+SET DateStyle = 'SQL, DMY';
+SELECT (dolt_merge('mv_f', '--no-commit'))[3:4];
+SELECT length(dolt_commit('-am', 'merged', '--date', '2024-01-01 00:00:00+00')::text) AS committed;
+SELECT prolly_root_hash('HEAD') = :'mv_root' AS same_root;
+SHOW TimeZone;
+RESET TimeZone;
+RESET DateStyle;
+SET TimeZone = 'UTC';
+SELECT * FROM mv.shown ORDER BY id;
+SELECT dolt_reset('--hard', 'mv_pre');
+SELECT dolt_branch('-D', 'mv_f');
+SELECT dolt_branch('-D', 'mv_pre');
+DROP SCHEMA mv CASCADE;
+SELECT length(dolt_commit('-Am', 'mv gone')::text) AS committed;
+RESET TimeZone;
