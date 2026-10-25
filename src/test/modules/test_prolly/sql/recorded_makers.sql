@@ -136,7 +136,8 @@ DROP TABLE rm.e;
 SELECT length(dolt_commit('-Am', 'e dropped again')::text) AS committed;
 
 -- the sequences a made table owns (a serial's, an identity's) are its
--- owner's with no grants: the mover's default privileges give them none
+-- owner's with no grants: neither the mover's default privileges nor its
+-- owner's give them any
 SET ROLE regress_rm_alice;
 CREATE TABLE rm.sq (id serial PRIMARY KEY, n int GENERATED ALWAYS AS IDENTITY, note text);
 INSERT INTO rm.sq (note) VALUES ('sq secret');
@@ -147,6 +148,7 @@ SET ROLE regress_rm_alice;
 DROP TABLE rm.sq;
 RESET ROLE;
 SELECT length(dolt_commit('-Am', 'sq dropped')::text) AS committed;
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_rm_alice GRANT SELECT ON SEQUENCES TO regress_rm_spy;
 SET ROLE regress_rm_w;
 ALTER DEFAULT PRIVILEGES GRANT SELECT ON SEQUENCES TO regress_rm_spy;
 ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO regress_rm_spy;
@@ -162,6 +164,7 @@ SET ROLE regress_rm_w;
 ALTER DEFAULT PRIVILEGES REVOKE SELECT ON SEQUENCES FROM regress_rm_spy;
 ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM regress_rm_spy;
 RESET ROLE;
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_rm_alice REVOKE SELECT ON SEQUENCES FROM regress_rm_spy;
 
 -- merges, picks, reverts and stash applies make a table as its recorded
 -- owner too, never as the mover: a writer can't get a committed table of
