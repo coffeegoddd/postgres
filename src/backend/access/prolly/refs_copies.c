@@ -43,8 +43,9 @@
  *	'H' name	-> the head's other relations with privileges of their own
  *				   (views, materialized views, sequences, partitioned and
  *				   foreign tables), as 'N' has its tables: the head's hash,
- *				   then a line for each (as 'L' lines are); a merge of the
- *				   branch, or a pick of its head, takes their privileges
+ *				   then a line for each (as 'L' lines are), none written
+ *				   when there are none; a merge of the branch, or a pick
+ *				   of its head, takes their privileges
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
  *				   merge recorded them: each table's OID, then its name's
  *				   length (a varint) and bytes; and the tables in schema
@@ -4918,9 +4919,16 @@ note_head_privileged(const char *name, const ProllyHash *head,
 		lines = kept.data;
 		pfree(phex);
 	}
-	resetStringInfo(&v);
-	appendStringInfo(&v, "%s\n%s", hex, lines);
-	refs_put(key.data, key.len, &v);
+	/*
+	 * (none, none written: a record of an earlier head, left, is of no
+	 * head this branch has, so lists nothing of it, as wanted)
+	 */
+	if (lines[0] != '\0')
+	{
+		resetStringInfo(&v);
+		appendStringInfo(&v, "%s\n%s", hex, lines);
+		refs_put(key.data, key.len, &v);
+	}
 	pfree(hex);
 	pfree(key.data);
 	pfree(v.data);
