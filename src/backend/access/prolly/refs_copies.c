@@ -2898,15 +2898,18 @@ kept_commit_status(const KeptCommit *kc)
 
 /*
  * The commits of kept (a branch's list) whose pages are gone dropped from
- * it, and those no table can be given its pages of any more retired (their
- * snapshots let go of by a later keep): neither counts toward
- * prolly.kept_commits, keeps its commit and baseline from collection, or
- * is offered to a move or a first use.  A commit's storage goes with the
- * change that replaced it (a restore of another commit, a TRUNCATE or a
- * rewrite), so the list changes with the same transaction; one whose pages
- * are gone has nothing for a first use reading the list from before to
- * make a branch of, nor anything to let go of.  but: an entry left as it
- * is (NULL: none).
+ * it, and those no table can be given its pages of any more retired: a
+ * retired one keeps its commit and baseline from collection, as any does,
+ * until a later keep lets go of its snapshots (a first use may be reading
+ * it), a dropped one no longer.  Neither counts toward
+ * prolly.kept_commits or is offered to a move or a first use.  A commit's
+ * storage goes with the change that replaced it (a restore of another
+ * commit, a rewrite, a DROP), so the list changes with the same
+ * transaction; one whose pages are gone has nothing for a first use
+ * reading the list from before to make a branch of, nor anything to let
+ * go of.  (A TRUNCATE leaves a table's change log on its storage: its
+ * commits are retired, not dropped.)  but: an entry left as it is (NULL:
+ * none).
  */
 static List *
 kept_drop_dead(List *kept, const KeptCommit *but)
@@ -2963,6 +2966,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	List	   *names = NIL;
 	List	   *kept;
 	List	   *holding = NIL;
+	List	   *before;
 	List	   *releasing = NIL;
 	List	   *next = NIL;
 	BranchKeptRelation *prior;
@@ -3008,6 +3012,13 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 		else
 			holding = lappend(holding, o);
 	}
+	/*
+	 * (a commit dropped as gone still holds what it shares with one let go
+	 * of now: it is gone as this transaction sees the branch, and the
+	 * change that made it so may yet roll back, bringing it back, while a
+	 * snapshot let go of stays so)
+	 */
+	before = holding;
 	holding = kept_drop_dead(holding, NULL);
 	foreach_ptr(KeptCommit, o, holding)
 	{
@@ -3033,7 +3044,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	{
 		for (int t = 0; t < o->ntables; t++)
 			for (int r = 0; r < o->tables[t].nrels; r++)
-				if (!kept_holds(holding, &o->tables[t].rels[r]))
+				if (!kept_holds(before, &o->tables[t].rels[r]))
 					release[nrelease++] = o->tables[t].rels[r];
 	}
 	out = palloc0_array(BranchKeptRelation, Max(list_length(relids), 1));

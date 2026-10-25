@@ -4,8 +4,11 @@
 -- in, goes with it, as it does after a TRUNCATE or a rewrite.  Such a
 -- commit is dropped from the branch's kept commits by the same
 -- transaction, so it no longer counts toward prolly.kept_commits, keeps
--- its commit and baseline from collection, or is offered to a move.  A
--- commit some table of which can still be given its pages stays kept.
+-- its commit and baseline from collection, or is offered to a move; one
+-- with a snapshot left but no table restorable is retired.  A commit some
+-- table of which can still be given its pages stays kept, whatever else
+-- happens to the table, and one made gone by a change rolled back is kept
+-- as it was, its snapshots too.
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_dead;
@@ -67,8 +70,9 @@ SELECT dolt_reset('--hard', named('b'));
 SELECT pg_stat_force_next_flush();
 SELECT restored() > :before AS restored, kept();
 
--- a commit whose table's storage TRUNCATE replaced is gone too, but one
--- with a table it left still kept
+-- a commit whose table TRUNCATE gave new storage is retired (its change
+-- log still holds a snapshot, let go of by a later keep), but one with a
+-- table it left still kept
 CREATE TABLE kd.u (id int PRIMARY KEY);
 INSERT INTO kd.u SELECT generate_series(1, 10);
 INSERT INTO names SELECT (dolt_commit('-Am', 'e'))[1], 'e';
@@ -80,6 +84,62 @@ SELECT kept();
 TRUNCATE kd.u;
 INSERT INTO names SELECT (dolt_commit('-am', 'g'))[1], 'g';
 SELECT kept();
+
+-- what leaves a table on its storage leaves its commits kept
+INSERT INTO names SELECT (dolt_commit('--allow-empty', '-m', 'h'))[1], 'h';
+SELECT kept();
+VACUUM kd.t;
+VACUUM (FREEZE) kd.u;
+ANALYZE kd.t;
+ALTER TABLE kd.t ADD COLUMN w int;
+INSERT INTO names SELECT (dolt_commit('-am', 'i'))[1], 'i';
+SELECT kept();
+CREATE INDEX t_w ON kd.t (w);
+INSERT INTO names SELECT (dolt_commit('-am', 'j'))[1], 'j';
+SELECT kept();
+
+-- a TRUNCATE rolled back to a savepoint, with a commit after it: kept as
+-- it was
+BEGIN;
+SAVEPOINT s;
+TRUNCATE kd.t, kd.u;
+INSERT INTO names SELECT (dolt_commit('-am', 'k'))[1], 'k';
+ROLLBACK TO s;
+COMMIT;
+SELECT kept();
+
+-- a commit made gone by a change that rolls back still has every
+-- snapshot it had, though a commit let go of shared one with it: kr.t's
+-- relations, unchanged since m, are kept by m's snapshots for n and o too
+SET prolly.kept_commits = 2;
+CREATE SCHEMA kr VERSIONED;
+CREATE TABLE kr.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO kr.t SELECT g, 0 FROM generate_series(1, 2000) g;
+CREATE TABLE kr.u (id int PRIMARY KEY, v int);
+INSERT INTO kr.u SELECT g, 0 FROM generate_series(1, 2000) g;
+INSERT INTO names SELECT (dolt_commit('-Am', 'm'))[1], 'm';
+UPDATE kr.u SET v = 1 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'n'))[1], 'n';
+UPDATE kr.u SET v = 2 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'o'))[1], 'o';
+SELECT kept();
+CREATE TABLE kr.w (id int PRIMARY KEY);
+BEGIN;
+DROP TABLE kd.t, kd.u, kr.t, kr.u;
+SELECT dolt_commit('-Am', 'gone') IS NOT NULL AS committed;
+ROLLBACK;
+SELECT kept();
+UPDATE kr.u SET v = 3 WHERE id <= 100;
+UPDATE kr.t SET v = 3 WHERE id <= 100;
+SELECT pg_stat_force_next_flush();
+SELECT restored() AS before \gset
+SELECT dolt_reset('--hard', named('n'));
+SELECT pg_stat_force_next_flush();
+-- (kr.t's and kr.u's: each heap, index, change log and its index)
+SELECT restored() - :before AS restored;
+SELECT count(*) FILTER (WHERE v = 1) AS at_n FROM kr.u;
+SELECT count(*) FILTER (WHERE v = 0) AS at_n FROM kr.t;
+RESET prolly.kept_commits;
 
 \c :home
 DROP DATABASE kept_dead;
