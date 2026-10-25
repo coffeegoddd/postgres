@@ -5795,9 +5795,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        (rows that moving a branch to a commit, a merge or a clone inserted many
        at once, and the tables it filled from nothing with their indexes built
        after the rows);
-       <literal>chunk_cache_hits</literal> (chunks read from the backend's
-       cache of decoded chunks, <varname>prolly_chunk_cache_size</varname>,
-       instead of the chunk store's files);
+       <literal>node_cache_hits</literal> and
+       <literal>node_cache_misses</literal> (chunks read from the shared cache
+       of decoded chunks, <varname>prolly_node_cache_size</varname>, instead
+       of the chunk store's files, and reads that looked there and found
+       nothing);
        <literal>fold_rows_located</literal> (rows a fold read where the
        table's change log said they are, instead of by their key);
        <literal>bmap_map_pages_copied</literal> (block-map pages a share of
