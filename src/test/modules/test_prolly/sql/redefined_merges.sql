@@ -72,19 +72,22 @@ SELECT id, v, z FROM rm.t WHERE id = 5;
 SELECT length(dolt_commit('-am', 'resolved')::text) AS committed;
 COMMIT;
 
--- A conflict in a table neither base nor ours had (both made it): its
--- versions are listed, the base's as none.
+-- A conflict in a table the base hadn't: its versions are listed, the
+-- base's as none.  (Both sides have the table as one relation, not two
+-- made apart, which would be a table identity conflict: a pick of the
+-- commit that made it, onto a branch that has it, changed, since.)
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'main');
 CREATE TABLE rm.both (id int PRIMARY KEY, v text);
 INSERT INTO rm.both VALUES (1, 'theirs');
 SELECT length(dolt_commit('-Am', 'feature: both')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS both_made \gset
 SELECT dolt_checkout('main');
-CREATE TABLE rm.both (id int PRIMARY KEY, v text);
-INSERT INTO rm.both VALUES (1, 'ours');
+SELECT (dolt_merge('feature'))[3:4];
+UPDATE rm.both SET v = 'ours';
 SELECT length(dolt_commit('-Am', 'main: both')::text) AS committed;
 BEGIN;
-SELECT (dolt_merge('feature'))[3:4];
+SELECT (dolt_cherry_pick(:'both_made'))[2] AS conflicts;
 SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rm.both);
 ROLLBACK;
 DROP TABLE rm.both;

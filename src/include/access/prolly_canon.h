@@ -542,6 +542,13 @@ typedef struct ProllyCanonRoutine
 	List	   *(*table_names) (const ProllyNodeRef *root, const char *schema);
 
 	/*
+	 * Optional: the tables (qualified and quoted, in the server's encoding)
+	 * a table as description describes it inherits from, or is a partition
+	 * of: its parents, whose rows a read of them reads with its own.
+	 */
+	List	   *(*table_parents) (const ProllyValue *description);
+
+	/*
 	 * Optional: what objects() visits of from and to, read from their tree
 	 * diff (equal subtrees skipped, not every object's items merged); and,
 	 * if table isn't NULL, each table whose item differs (added, removed or
@@ -571,17 +578,126 @@ typedef struct ProllyCanonRoutine
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects", "table_metadata", \
-	"table_names", "objects_diffed", "sequences_now"
+	"table_names", "table_parents", "objects_diffed", "sequences_now"
 #define PROLLY_CANON_FIRST_CALLBACK walk
 #define PROLLY_CANON_LAST_CALLBACK sequences_now
 
 /*
  * While set, the commits (ProllyHash *) a move takes its versions from: a
- * table the move makes joins the equivalence class of the relation a
- * commit of them was made from for its name (refs' relation_class()); one
- * it makes again of a table stays in that table's class.
+ * table the move makes is the relation (by OID) a commit of them was made
+ * from for its name, as its record says; one it makes again stays the
+ * relation it was (prolly_move_kept_relid()).  A table or materialized
+ * view the move makes from such a commit is made by the owner the record
+ * names (see prolly_move_maker()).
  */
 extern PGDLLIMPORT List *prolly_move_provenance;
+
+/*
+ * The OID a table the session's move makes now (named relname, in schema
+ * relnamespace) is to have, if the branch has no relation of it: the
+ * relation its version is of, or the one it was, before it was made again
+ * (InvalidOid: a new one).  heap_create_with_catalog() asks it.
+ */
+extern Oid	prolly_move_kept_relid(const char *relname, Oid relnamespace);
+
+/*
+ * While set, the relations (ProllyKeptRelation *) tables a move makes are
+ * to be, by name, before any prolly_move_provenance records: a merge's
+ * conflict resolution making the other side's relation the branch's.
+ */
+typedef struct ProllyKeptRelation
+{
+	char	   *name;			/* qualified, quoted as roots name tables */
+	Oid			relid;
+	Oid			owner;			/* the role it is made as (InvalidOid: the
+								 * move's) */
+} ProllyKeptRelation;
+
+/*
+ * The role a relation the running move makes from a commit is made by:
+ * the owner the commit's record of relations names (or the one
+ * prolly_move_kept names), for a table, a materialized view, or a sequence
+ * such a table owns; InvalidOid for any other relation, or outside a move.
+ * Each statement making it, its rows, the checks of them and its
+ * materialized view's query run as that role, under
+ * SECURITY_RESTRICTED_OPERATION (prolly_as_maker()), as REFRESH runs a
+ * materialized view's owner's query: the role moving runs none of the
+ * owner's code, and gains no relation it doesn't own.  The relation gets no
+ * grants from its making.
+ */
+extern Oid	prolly_move_maker(Oid relid);
+
+/* A role switch prolly_as_maker() made, for prolly_as_maker_end(). */
+typedef struct ProllyMakerSwitch
+{
+	bool		switched;
+	Oid			user;
+	int			sec;
+	int			nest;			/* (the GUC level its search_path is set at) */
+	Oid			mover;			/* (prolly_move_mover()'s before) */
+} ProllyMakerSwitch;
+
+/*
+ * The role running the move, while it runs as a maker; else the current
+ * user.  Whether row-level security applies to the rows a move writes is
+ * the mover's, as it was before makers: running as one restricts the move,
+ * it never lets it write what the mover's policies would refuse.
+ */
+extern Oid	prolly_move_mover(void);
+
+/*
+ * Each object of the session's branch a commit may hold, but its prolly
+ * tables, partitioned tables and materialized views, and its routines and
+ * types: its OID, its owner, its kind ('v' view, 'S' sequence, 'f' foreign
+ * table, 'N' schema, 'C' collation) and its name as commits' items name
+ * it.  The refs record them with a commit's relations, so that a move
+ * making one from the commit makes it as its recorded owner.
+ */
+extern void prolly_owned_objects(void (*emit) (Oid oid, Oid owner, char kind,
+											   const char *name, void *arg),
+								 void *arg);
+
+/*
+ * The same of the branch's routines ('P') and types ('T'), each emitted,
+ * unless *generation is their listing's generation already (unchanged
+ * since it was given: false, nothing emitted; 0 is none).  The listing is
+ * kept from one call to the next, worked out again only where the caches'
+ * invalidations say it changed, and its generation moves each time.
+ */
+extern bool prolly_owned_routines(uint64 *generation,
+								  void (*emit) (Oid oid, Oid owner, char kind,
+												const char *name, void *arg),
+								  void *arg);
+
+/*
+ * While a move runs, from prolly_move_calls_begin() to the end its result
+ * is given (done: whether the move got there, else it is failing; callers
+ * end it in a PG_FINALLY()): each routine called that isn't the system's
+ * runs as its owner, under SECURITY_RESTRICTED_OPERATION, as a SECURITY
+ * DEFINER routine would, unless its owner has the caller's privileges
+ * (then as the caller, as in PostgreSQL).  None is inlined, and no query
+ * runs in parallel workers.  Nested calls are one move.
+ */
+extern int	prolly_move_calls_begin(void);
+extern void prolly_move_calls_end(int nest, bool done);
+
+/*
+ * Run as relid's maker (prolly_move_maker()), if it has one, until
+ * prolly_as_maker_end(): callers end it in a PG_FINALLY().
+ */
+extern void prolly_as_maker(Oid relid, ProllyMakerSwitch *sw);
+extern void prolly_as_maker_end(ProllyMakerSwitch *sw);
+
+/*
+ * The role a relation (name) a commit's record of relations lists as owned
+ * by owner, then named owner_name, is made by: refused if that role no
+ * longer exists, or is named otherwise now (another role, made with the OID
+ * once the counter wrapped, or the role renamed).
+ */
+extern Oid	prolly_recorded_owner(const char *name, Oid owner,
+								  const char *owner_name);
+
+extern PGDLLIMPORT List *prolly_move_kept;
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

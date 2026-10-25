@@ -1,0 +1,1433 @@
+-- A table or materialized view a move makes from a commit (a branch's
+-- first use, a reset, a rebase's end, a merge, a pick, a revert, a stash's
+-- apply) is made by the owner the commit's record of relations names, with
+-- no grants: its statements, its rows, the checks of them and its
+-- materialized view's query run as that owner, restricted
+-- (SECURITY_RESTRICTED_OPERATION), as REFRESH runs them.  The role moving
+-- runs none of the owner's code, gains no relation, and reads nothing it
+-- wasn't granted, through the table or a materialized view over it.  A merge
+-- adds the source branch's grants on top.
+CREATE DATABASE regress_recorded_makers;
+\c regress_recorded_makers
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA rm VERSIONED;
+CREATE ROLE regress_rm_alice IN ROLE pg_prolly_write;
+CREATE ROLE regress_rm_w IN ROLE pg_prolly_write;
+CREATE ROLE regress_rm_spy;
+GRANT USAGE, CREATE ON SCHEMA rm TO regress_rm_alice, regress_rm_w;
+GRANT USAGE ON SCHEMA rm TO regress_rm_spy;
+SELECT format('GRANT CREATE ON DATABASE %I TO regress_rm_alice, regress_rm_w',
+			  current_database()) \gexec
+GRANT CREATE ON DATABASE regress_recorded_makers TO regress_rm_alice, regress_rm_w
+-- (who owns a relation, and whether the writer may read it)
+CREATE FUNCTION pg_temp.made(r text) RETURNS TABLE (owner regrole, writer_reads bool, grants aclitem[])
+LANGUAGE sql AS $$
+	SELECT c.relowner::regrole,
+		has_table_privilege('regress_rm_w', c.oid, 'SELECT'), c.relacl
+	FROM pg_class c WHERE c.oid = to_regclass(r)
+$$;
+SET ROLE regress_rm_alice;
+CREATE TABLE rm.t (id int PRIMARY KEY, note text);
+INSERT INTO rm.t VALUES (1, 'c1 secret');
+CREATE MATERIALIZED VIEW rm.mv AS SELECT * FROM rm.t;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'c1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c1 \gset
+SELECT dolt_branch('x') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('r') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+DROP TABLE rm.t CASCADE;
+NOTICE:  drop cascades to materialized view rm.mv
+CREATE TABLE rm.t (id int PRIMARY KEY, note text);
+INSERT INTO rm.t VALUES (2, 'c2 public');
+GRANT SELECT ON rm.t TO regress_rm_w;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'c2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- a branch's first use makes the head's table and materialized view as
+-- their recorded owner: the writer reads neither
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('x') IS NOT NULL AS on_x;
+ on_x 
+------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.t');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.mv');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.mv;
+ERROR:  permission denied for materialized view mv
+SELECT * FROM rm.t;
+ERROR:  permission denied for table t
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- a reset to a commit holding them, on a branch where their owner dropped
+-- them: the same
+SELECT dolt_checkout('r') IS NOT NULL AS on_r;
+ on_r 
+------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+DROP TABLE rm.t CASCADE;
+NOTICE:  drop cascades to materialized view rm.mv
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'r dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET ROLE regress_rm_w;
+SELECT dolt_reset('--hard', :'c1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.t');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.mv');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.mv;
+ERROR:  permission denied for materialized view mv
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- a rebase's end, the branch's copy of the table replaced by the
+-- upstream's relation: the upstream's materialized view over it is its
+-- owner's too
+SELECT dolt_branch('feat') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('feat') IS NOT NULL AS on_feat;
+ on_feat 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+DROP TABLE rm.t;
+CREATE TABLE rm.t (id int PRIMARY KEY, note text);
+INSERT INTO rm.t VALUES (3, 'main, made again: secret');
+CREATE MATERIALIZED VIEW rm.tmv AS SELECT * FROM rm.t;
+GRANT INSERT, UPDATE, DELETE ON rm.t TO regress_rm_w;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'made again on main')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('feat') IS NOT NULL AS on_feat;
+ on_feat 
+---------
+ t
+(1 row)
+
+CREATE TABLE rm.f (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'f1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_rebase('main'))[1] AS status;
+ status 
+--------
+ 0
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.t');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.tmv');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.tmv;
+ERROR:  permission denied for materialized view tmv
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- the owner's code (a check's function) runs as the owner, restricted,
+-- when a superuser's reset makes the table: it can't make its owner a
+-- superuser, nor write what only the mover may
+CREATE SCHEMA rm_pub;
+CREATE TABLE rm_pub.mover_only (who name);
+CREATE TABLE rm_pub.log (who name, what text);
+GRANT USAGE ON SCHEMA rm_pub TO regress_rm_alice;
+GRANT INSERT ON rm_pub.log TO regress_rm_alice;
+CREATE FUNCTION rm_pub.f(int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+	INSERT INTO rm_pub.log VALUES (current_user, 'checked, search_path ' || current_setting('search_path'));
+	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+		EXECUTE 'ALTER ROLE regress_rm_alice SUPERUSER';
+	END IF;
+	BEGIN
+		INSERT INTO rm_pub.mover_only VALUES (current_user);
+	EXCEPTION WHEN insufficient_privilege THEN
+		INSERT INTO rm_pub.log VALUES (current_user, 'mover_only denied');
+	END;
+	RETURN $1;
+END $$;
+ALTER FUNCTION rm_pub.f(int) OWNER TO regress_rm_alice;
+SET ROLE regress_rm_alice;
+CREATE TABLE rm.e (id int PRIMARY KEY, CONSTRAINT e_chk CHECK (rm_pub.f(id) > 0));
+INSERT INTO rm.e VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'e')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS e1 \gset
+SET ROLE regress_rm_alice;
+DROP TABLE rm.e;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'e dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+TRUNCATE rm_pub.log;
+SELECT dolt_reset('--hard', :'e1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT rolsuper AS owner_superuser FROM pg_roles WHERE rolname = 'regress_rm_alice';
+ owner_superuser 
+-----------------
+ f
+(1 row)
+
+SELECT DISTINCT who, what FROM rm_pub.log ORDER BY 1, 2;
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_rm_alice | checked, search_path pg_catalog, pg_temp
+ regress_rm_alice | mover_only denied
+(2 rows)
+
+SELECT count(*) AS mover_only_rows FROM rm_pub.mover_only;
+ mover_only_rows 
+-----------------
+               0
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.e');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+DROP TABLE rm.e;
+SELECT length(dolt_commit('-Am', 'e dropped again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- the sequences a made table owns (a serial's, an identity's) are its
+-- owner's with no grants: neither the mover's default privileges nor its
+-- owner's give them any
+SET ROLE regress_rm_alice;
+CREATE TABLE rm.sq (id serial PRIMARY KEY, n int GENERATED ALWAYS AS IDENTITY, note text);
+INSERT INTO rm.sq (note) VALUES ('sq secret');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'sq')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS sq1 \gset
+SET ROLE regress_rm_alice;
+DROP TABLE rm.sq;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'sq dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_rm_alice GRANT SELECT ON SEQUENCES TO regress_rm_spy;
+SET ROLE regress_rm_w;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON SEQUENCES TO regress_rm_spy;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO regress_rm_spy;
+SELECT dolt_reset('--hard', :'sq1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT * FROM pg_temp.made('rm.sq');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.sq_id_seq');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.sq_n_seq');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT has_sequence_privilege('regress_rm_spy', 'rm.sq_id_seq', 'SELECT') AS spy_reads_serial,
+	has_sequence_privilege('regress_rm_spy', 'rm.sq_n_seq', 'SELECT') AS spy_reads_identity;
+ spy_reads_serial | spy_reads_identity 
+------------------+--------------------
+ f                | f
+(1 row)
+
+SELECT nextval('rm.sq_id_seq') AS next_id;
+ next_id 
+---------
+       2
+(1 row)
+
+SET ROLE regress_rm_w;
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON SEQUENCES FROM regress_rm_spy;
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM regress_rm_spy;
+RESET ROLE;
+ALTER DEFAULT PRIVILEGES FOR ROLE regress_rm_alice REVOKE SELECT ON SEQUENCES FROM regress_rm_spy;
+-- merges, picks, reverts and stash applies make a table as its recorded
+-- owner too, never as the mover: a writer can't get a committed table of
+-- another role's back as its own
+SET ROLE regress_rm_alice;
+CREATE TABLE rm.p (id int PRIMARY KEY, note text);
+INSERT INTO rm.p VALUES (1, 'p secret');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'p')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS p1 \gset
+SET ROLE regress_rm_alice;
+DROP TABLE rm.p;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'p dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('pk') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('rv') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('q1') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('q2') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+-- (a pick of the commit that made it)
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('pk') IS NOT NULL AS on_pk;
+ on_pk 
+-------
+ t
+(1 row)
+
+SELECT length(dolt_cherry_pick(:'p1')::text) > 0 AS picked;
+ picked 
+--------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.p');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.p;
+ERROR:  permission denied for table p
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- (a revert of its drop)
+SELECT dolt_checkout('rv') IS NOT NULL AS on_rv;
+ on_rv 
+-------
+ t
+(1 row)
+
+SELECT length(dolt_revert('HEAD')::text) > 0 AS reverted;
+ reverted 
+----------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.p');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.p;
+ERROR:  permission denied for table p
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- (a merge of a branch that restored it from its commit)
+SELECT dolt_checkout('q1') IS NOT NULL AS on_q1;
+ on_q1 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout(:'p1', 'rm.p') IS NOT NULL AS restored;
+ restored 
+----------
+ t
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'restored')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('q2') IS NOT NULL AS on_q2;
+ on_q2 
+-------
+ t
+(1 row)
+
+SELECT (dolt_merge('q1'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {1}
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.p');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.p;
+ERROR:  permission denied for table p
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- (a stash of alice's, uncommitted, applied by the writer: the stash's
+-- record names its owner)
+SELECT dolt_branch('al') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('wb') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+SELECT dolt_checkout('al') IS NOT NULL AS on_al;
+ on_al 
+-------
+ t
+(1 row)
+
+CREATE TABLE rm.st (id int PRIMARY KEY, note text);
+INSERT INTO rm.st VALUES (1, 'stashed secret');
+SELECT dolt_stash('push', 'st') IS NOT NULL AS stashed;
+ stashed 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('wb') IS NOT NULL AS on_wb;
+ on_wb 
+-------
+ t
+(1 row)
+
+SELECT dolt_stash('apply', 'st') IS NOT NULL AS applied;
+ applied 
+---------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.st');
+      owner       | writer_reads | grants 
+------------------+--------------+--------
+ regress_rm_alice | f            | 
+(1 row)
+
+SELECT * FROM rm.st;
+ERROR:  permission denied for table st
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+-- a relation the branch has that a move changes or makes again (a table
+-- whose column becomes an identity, its materialized view and view, made
+-- again as a table they use changes) is changed and made as its owner
+-- here, restricted, keeping its owner and grants: a superuser's merge runs
+-- none of alice's code as the superuser
+SET ROLE regress_rm_alice;
+CREATE TABLE rm.v (id int PRIMARY KEY, b int NOT NULL, CONSTRAINT v_chk CHECK (rm_pub.f(id) > 0));
+INSERT INTO rm.v VALUES (1, 1);
+CREATE MATERIALIZED VIEW rm.vmv AS SELECT rm_pub.f(id) AS x FROM rm.v;
+CREATE TABLE rm.other (id int PRIMARY KEY);
+CREATE VIEW rm.vw AS SELECT id FROM rm.other;
+GRANT SELECT ON rm.v, rm.vmv, rm.vw TO regress_rm_spy;
+GRANT UPDATE (b) ON rm.v TO regress_rm_spy;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'v')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('y') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('xx') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('xm') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('y') IS NOT NULL AS on_y;
+ on_y 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('xm') IS NOT NULL AS on_xm;
+ on_xm 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+ALTER TABLE rm.other ADD COLUMN extra int;
+CREATE OR REPLACE VIEW rm.vw AS SELECT id, extra FROM rm.other;
+ALTER TABLE rm.v ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'v changed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('y') IS NOT NULL AS on_y;
+ on_y 
+------
+ t
+(1 row)
+
+CREATE TABLE rm.su (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su on y')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+TRUNCATE rm_pub.log;
+SELECT (dolt_merge('main', '-m', 'merged main'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT DISTINCT who, what FROM rm_pub.log ORDER BY 1, 2;
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_rm_alice | checked, search_path pg_catalog, pg_temp
+ regress_rm_alice | mover_only denied
+(2 rows)
+
+SELECT c.relname, c.relowner::regrole,
+	has_table_privilege('regress_rm_spy', c.oid, 'SELECT') AS spy_reads
+FROM pg_class c WHERE c.oid IN ('rm.v'::regclass, 'rm.vmv'::regclass, 'rm.vw'::regclass)
+ORDER BY 1;
+ relname |     relowner     | spy_reads 
+---------+------------------+-----------
+ v       | regress_rm_alice | t
+ vmv     | regress_rm_alice | t
+ vw      | regress_rm_alice | t
+(3 rows)
+
+SELECT has_column_privilege('regress_rm_spy', 'rm.v', 'b', 'UPDATE') AS spy_updates_b,
+	attidentity AS b_identity
+FROM pg_attribute WHERE attrelid = 'rm.v'::regclass AND attname = 'b';
+ spy_updates_b | b_identity 
+---------------+------------
+ t             | d
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- a role without alice's privileges moves as itself, as its DDL would
+-- run: a writer that owns none of her tables can't use a branch (its first
+-- use), nor merge, where alice changed them since; refused, nothing is left
+-- behind.  (A role that has them, a superuser, moves as alice, above.)
+-- (the writer may read alice's definitions: the function her check calls)
+GRANT USAGE ON SCHEMA rm_pub TO regress_rm_w;
+SET ROLE regress_rm_w;
+SELECT dolt_checkout('xx') IS NOT NULL AS on_xx;
+ERROR:  must be owner of view vw
+CONTEXT:  SQL statement "DROP VIEW IF EXISTS rm.vw"
+SELECT relowner::regrole, (SELECT count(*) FROM pg_attribute WHERE attrelid = 'rm.other'::regclass AND attname = 'extra') AS has_extra
+FROM pg_class WHERE oid = 'rm.other'::regclass;
+     relowner     | has_extra 
+------------------+-----------
+ regress_rm_alice |         1
+(1 row)
+
+SELECT dolt_checkout('xm') IS NOT NULL AS on_xm;
+ on_xm 
+-------
+ t
+(1 row)
+
+SELECT (dolt_merge('main'))[2:2] AS fast_forward;
+ERROR:  must be owner of view vw
+CONTEXT:  SQL statement "DROP VIEW IF EXISTS rm.vw"
+SELECT relowner::regrole, (SELECT count(*) FROM pg_attribute WHERE attrelid = 'rm.other'::regclass AND attname = 'extra') AS has_extra
+FROM pg_class WHERE oid = 'rm.other'::regclass;
+     relowner     | has_extra 
+------------------+-----------
+ regress_rm_alice |         0
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+REVOKE USAGE ON SCHEMA rm_pub FROM regress_rm_w;
+-- every other kind of object a move makes, re-makes or changes is made as
+-- its owner too: types and domains (and the tables using them, converted
+-- or checked again as theirs), routines, views, sequences no table owns,
+-- schemas.  Those it makes from a commit are their recorded owner's (each
+-- in the commit's record of relations); those the branch has keep their
+-- owner and exactly their grants, none added.  A superuser's merges run
+-- none of alice's code as the superuser, and give her nothing.
+CREATE TABLE rm.secret (id int PRIMARY KEY, s text);
+INSERT INTO rm.secret VALUES (1, 'postgres only');
+SET ROLE regress_rm_alice;
+CREATE DOMAIN rm.d AS int CHECK (rm_pub.f(VALUE) > 0);
+CREATE TABLE rm.dt (id int PRIMARY KEY, x rm.d);
+INSERT INTO rm.dt VALUES (1, 5), (2, 7);
+CREATE TYPE rm.e AS ENUM ('a', 'b');
+CREATE TABLE rm.et (id int PRIMARY KEY, x rm.e, CONSTRAINT et_chk CHECK (rm_pub.f(length(x::text)) > 0));
+INSERT INTO rm.et VALUES (1, 'b');
+CREATE FUNCTION rm.g0() RETURNS int LANGUAGE sql AS 'SELECT 1';
+REVOKE EXECUTE ON FUNCTION rm.g0() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION rm.g0() TO regress_rm_spy;
+CREATE TABLE rm.q (id int PRIMARY KEY, b int NOT NULL);
+CREATE TABLE rm.q2 (id int PRIMARY KEY, b int NOT NULL);
+GRANT UPDATE (b) ON rm.q2 TO regress_rm_spy;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'kinds base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('feat2') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('yb') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('yb') IS NOT NULL AS on_yb;
+ on_yb 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('feat2') IS NOT NULL AS on_feat2;
+ on_feat2 
+----------
+ t
+(1 row)
+
+-- (on feat2, alice's new routines, view, sequence and schema, and her
+-- routine made again: what it returns changes)
+SET ROLE regress_rm_alice;
+CREATE FUNCTION rm.g() RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS
+	$$BEGIN EXECUTE 'ALTER ROLE regress_rm_alice SUPERUSER'; RETURN current_user; END$$;
+DROP FUNCTION rm.g0();
+CREATE FUNCTION rm.g0() RETURNS text LANGUAGE sql SECURITY DEFINER AS $$ SELECT s FROM rm.secret $$;
+REVOKE EXECUTE ON FUNCTION rm.g0() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION rm.g0() TO regress_rm_spy;
+CREATE VIEW rm.leak AS SELECT * FROM rm.secret;
+GRANT SELECT ON rm.leak TO regress_rm_spy;
+CREATE SEQUENCE rm.ss;
+CREATE SCHEMA rm2 VERSIONED;
+CREATE TABLE rm2.t (id int PRIMARY KEY);
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'feat2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- (on main, alice's domain and enum changed, and q, q2 made again)
+SET ROLE regress_rm_alice;
+ALTER DOMAIN rm.d ADD CONSTRAINT d2 CHECK (VALUE < 1000);
+ALTER TYPE rm.e RENAME VALUE 'b' TO 'bb';
+ALTER TABLE rm.q ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY;
+ALTER TABLE rm.q2 ALTER COLUMN b ADD GENERATED BY DEFAULT AS IDENTITY;
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO regress_rm_spy;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'kinds changed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('yb') IS NOT NULL AS on_yb;
+ on_yb 
+-------
+ t
+(1 row)
+
+CREATE TABLE rm.su2 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+TRUNCATE rm_pub.log;
+SELECT (dolt_merge('main', '-m', 'merged main'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT (dolt_merge('feat2', '-m', 'merged feat2'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT DISTINCT who, what FROM rm_pub.log ORDER BY 1, 2;
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_rm_alice | checked, search_path pg_catalog, pg_temp
+ regress_rm_alice | mover_only denied
+(2 rows)
+
+SELECT rolsuper AS alice_superuser FROM pg_roles WHERE rolname = 'regress_rm_alice';
+ alice_superuser 
+-----------------
+ f
+(1 row)
+
+SELECT typname, typowner::regrole FROM pg_type
+WHERE oid IN ('rm.d'::regtype, 'rm.e'::regtype) ORDER BY 1;
+ typname |     typowner     
+---------+------------------
+ d       | regress_rm_alice
+ e       | regress_rm_alice
+(2 rows)
+
+SELECT p.proname, p.proowner::regrole, p.prosecdef,
+	has_function_privilege('regress_rm_spy', p.oid, 'EXECUTE') AS spy_runs,
+	has_function_privilege('regress_rm_w', p.oid, 'EXECUTE') AS writer_runs
+FROM pg_proc p WHERE p.pronamespace = 'rm'::regnamespace AND p.proname IN ('g', 'g0')
+ORDER BY 1;
+ proname |     proowner     | prosecdef | spy_runs | writer_runs 
+---------+------------------+-----------+----------+-------------
+ g       | regress_rm_alice | t         | t        | t
+ g0      | regress_rm_alice | t         | t        | f
+(2 rows)
+
+SELECT c.relname, c.relowner::regrole, c.relacl
+FROM pg_class c WHERE c.oid IN ('rm.leak'::regclass, 'rm.ss'::regclass, 'rm.q'::regclass, 'rm.q2'::regclass)
+ORDER BY 1;
+ relname |     relowner     |                                     relacl                                     
+---------+------------------+--------------------------------------------------------------------------------
+ leak    | regress_rm_alice | {regress_rm_alice=arwdDxtm/regress_rm_alice,regress_rm_spy=r/regress_rm_alice}
+ q       | regress_rm_alice | 
+ q2      | regress_rm_alice | 
+ ss      | regress_rm_alice | 
+(4 rows)
+
+SELECT has_column_privilege('regress_rm_spy', 'rm.q2', 'b', 'UPDATE') AS spy_updates_q2_b,
+	has_table_privilege('regress_rm_spy', 'rm.q', 'SELECT') AS spy_reads_q;
+ spy_updates_q2_b | spy_reads_q 
+------------------+-------------
+ t                | f
+(1 row)
+
+SELECT nspowner::regrole AS rm2_owner FROM pg_namespace WHERE nspname = 'rm2';
+    rm2_owner     
+------------------
+ regress_rm_alice
+(1 row)
+
+SET ROLE regress_rm_spy;
+SELECT * FROM rm.leak;
+ERROR:  permission denied for table secret
+RESET ROLE;
+SET ROLE regress_rm_alice;
+SELECT rm.g0();
+ERROR:  permission denied for table secret
+CONTEXT:  SQL function "g0" statement 1
+SELECT rm.g();
+ERROR:  permission denied to alter role
+DETAIL:  Only roles with the SUPERUSER attribute may change the SUPERUSER attribute.
+CONTEXT:  SQL statement "ALTER ROLE regress_rm_alice SUPERUSER"
+PL/pgSQL function rm.g() line 1 at EXECUTE
+RESET ROLE;
+SELECT rolsuper AS alice_superuser FROM pg_roles WHERE rolname = 'regress_rm_alice';
+ alice_superuser 
+-----------------
+ f
+(1 row)
+
+SET ROLE regress_rm_alice;
+ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM regress_rm_spy;
+RESET ROLE;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- each statement a move makes is its object's, said as it is made, never
+-- read back from the statement's text: a routine with a long signature (a
+-- dozen named arguments) is made and made again as its owner, and an
+-- index a type move makes again, whatever its name holds (here another
+-- role's table's name after " ON "), as its table's owner
+SET ROLE regress_rm_w;
+CREATE TABLE rm.bt (id int PRIMARY KEY);
+RESET ROLE;
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e4 AS ENUM ('a', 'b');
+CREATE TABLE rm.it (id int PRIMARY KEY, x rm.e4);
+CREATE INDEX "i ON rm.bt" ON rm.it (id) WHERE x <> 'a';
+INSERT INTO rm.it VALUES (1, 'b');
+SELECT format('CREATE FUNCTION rm.long2(%s) RETURNS int LANGUAGE sql SECURITY DEFINER AS ''SELECT 1''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+CREATE FUNCTION rm.long2(argument_number_1 integer, argument_number_2 integer, argument_number_3 integer, argument_number_4 integer, argument_number_5 integer, argument_number_6 integer, argument_number_7 integer, argument_number_8 integer, argument_number_9 integer, argument_number_10 integer, argument_number_11 integer, argument_number_12 integer) RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'long base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('feat6') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('feat6') IS NOT NULL AS on_feat6;
+ on_feat6 
+----------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+SELECT format('CREATE FUNCTION rm.longsig(%s) RETURNS text LANGUAGE sql SECURITY DEFINER AS ''SELECT current_user::text''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+CREATE FUNCTION rm.longsig(argument_number_1 integer, argument_number_2 integer, argument_number_3 integer, argument_number_4 integer, argument_number_5 integer, argument_number_6 integer, argument_number_7 integer, argument_number_8 integer, argument_number_9 integer, argument_number_10 integer, argument_number_11 integer, argument_number_12 integer) RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT current_user::text'
+SELECT format('DROP FUNCTION rm.long2(%s)', string_agg('integer', ', ')) FROM generate_series(1, 12) i \gexec
+DROP FUNCTION rm.long2(integer, integer, integer, integer, integer, integer, integer, integer, integer, integer, integer, integer)
+SELECT format('CREATE FUNCTION rm.long2(%s) RETURNS text LANGUAGE sql SECURITY DEFINER AS ''SELECT current_user::text''',
+	string_agg(format('argument_number_%s integer', i), ', ')) FROM generate_series(1, 12) i \gexec
+CREATE FUNCTION rm.long2(argument_number_1 integer, argument_number_2 integer, argument_number_3 integer, argument_number_4 integer, argument_number_5 integer, argument_number_6 integer, argument_number_7 integer, argument_number_8 integer, argument_number_9 integer, argument_number_10 integer, argument_number_11 integer, argument_number_12 integer) RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT current_user::text'
+ALTER TYPE rm.e4 RENAME VALUE 'b' TO 'bb';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'feat6')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE rm.su6 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su6')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('feat6', '-m', 'merged feat6'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT p.proname, p.proowner::regrole, length(pg_get_function_identity_arguments(p.oid)) > 264 AS long_identity
+FROM pg_proc p WHERE p.pronamespace = 'rm'::regnamespace AND p.proname IN ('longsig', 'long2')
+ORDER BY 1;
+ proname |     proowner     | long_identity 
+---------+------------------+---------------
+ long2   | regress_rm_alice | t
+ longsig | regress_rm_alice | t
+(2 rows)
+
+SET ROLE regress_rm_alice;
+SELECT format('SELECT rm.%s(%s) AS runs_as', f, string_agg('1', ', '))
+FROM generate_series(1, 12) i, (VALUES ('longsig'), ('long2')) v(f) GROUP BY f ORDER BY f \gexec
+SELECT rm.long2(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1) AS runs_as
+     runs_as      
+------------------
+ regress_rm_alice
+(1 row)
+
+SELECT rm.longsig(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1) AS runs_as
+     runs_as      
+------------------
+ regress_rm_alice
+(1 row)
+
+RESET ROLE;
+SELECT c.relname, c.relowner::regrole, i.indrelid::regclass AS of_table
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE i.indrelid = 'rm.it'::regclass ORDER BY 1;
+  relname   |     relowner     | of_table 
+------------+------------------+----------
+ i ON rm.bt | regress_rm_alice | rm.it
+ it_pkey    | regress_rm_alice | rm.it
+(2 rows)
+
+SELECT pg_get_indexdef('rm."i ON rm.bt"'::regclass) AS made_again, x FROM rm.it;
+                                 made_again                                  | x  
+-----------------------------------------------------------------------------+----
+ CREATE INDEX "i ON rm.bt" ON rm.it USING btree (id) WHERE (x <> 'a'::rm.e4) | bb
+(1 row)
+
+-- a type move converts each table using the type as the table's owner;
+-- any routine the conversion runs runs as its own owner (move_calls), so
+-- alice's enum changed, used by the writer's table, merges in a
+-- superuser's merge
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e5 AS ENUM ('a', 'b');
+RESET ROLE;
+SET ROLE regress_rm_w;
+CREATE TABLE rm.pt (id int PRIMARY KEY, x rm.e5);
+INSERT INTO rm.pt VALUES (1, 'b');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'pt')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ty6') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('ty6') IS NOT NULL AS on_ty6;
+ on_ty6 
+--------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+ALTER TYPE rm.e5 RENAME VALUE 'b' TO 'bb';
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'e5 renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('ty6', '-m', 'merged ty6'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT x FROM rm.pt;
+ x  
+----
+ bb
+(1 row)
+
+-- a cast is made as the owner of one of its types, as CREATE CAST
+-- requires: alice's, for a superuser's merge of casts on her type.  One
+-- she may not make (to the writer's type, which she may not use) is
+-- refused, though the superuser made it
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.e6 AS ENUM ('a');
+RESET ROLE;
+SET ROLE regress_rm_w;
+CREATE TYPE rm.wz AS ENUM ('a');
+REVOKE USAGE ON TYPE rm.wz FROM PUBLIC;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'e6')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('c6') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('c7') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('c6') IS NOT NULL AS on_c6;
+ on_c6 
+-------
+ t
+(1 row)
+
+SET ROLE regress_rm_alice;
+CREATE CAST (rm.e6 AS text) WITH INOUT;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'inout cast')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('c7') IS NOT NULL AS on_c7;
+ on_c7 
+-------
+ t
+(1 row)
+
+CREATE CAST (rm.e6 AS rm.wz) WITH INOUT;
+SELECT length(dolt_commit('-Am', 'binary cast')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE rm.su7 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su7')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('c6', '-m', 'merged c6'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT castsource::regtype, casttarget::regtype, castmethod FROM pg_cast
+WHERE castsource = 'rm.e6'::regtype ORDER BY 2::text;
+ castsource | casttarget | castmethod 
+------------+------------+------------
+ rm.e6      | text       | i
+(1 row)
+
+SELECT dolt_merge('c7', '-m', 'merged c7');
+ERROR:  permission denied for type rm.wz
+CONTEXT:  SQL statement "CREATE CAST (rm.e6 AS rm.wz) WITH INOUT"
+SELECT count(*) AS casts FROM pg_cast WHERE castsource = 'rm.e6'::regtype;
+ casts 
+-------
+     1
+(1 row)
+
+-- a commit's record of owners lists every routine and type, worked out
+-- again only where changed since the last: a routine's owner changed, and
+-- a type its arguments name renamed, are recorded so, and a reset making
+-- the routine from that commit makes it as the owner recorded then
+SET ROLE regress_rm_alice;
+CREATE FUNCTION rm.cf() RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cf')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER FUNCTION rm.cf() OWNER TO regress_rm_w;
+SELECT length(dolt_commit('--allow-empty', '-Am', 'cf owner')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS cf2 \gset
+DROP FUNCTION rm.cf();
+SELECT length(dolt_commit('-Am', 'cf dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_reset('--hard', :'cf2') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cf';
+   oid   |   proowner   
+---------+--------------
+ rm.cf() | regress_rm_w
+(1 row)
+
+SET ROLE regress_rm_alice;
+CREATE TYPE rm.ty1 AS ENUM ('a');
+CREATE FUNCTION rm.cg(rm.ty1) RETURNS int LANGUAGE sql AS 'SELECT 1';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'cg')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET ROLE regress_rm_alice;
+ALTER TYPE rm.ty1 RENAME TO ty2;
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'ty1 renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS cg2 \gset
+DROP FUNCTION rm.cg(rm.ty2);
+SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_reset('--hard', :'cg2') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT p.oid::regprocedure, p.proowner::regrole FROM pg_proc p
+WHERE p.pronamespace = 'rm'::regnamespace AND p.proname = 'cg';
+      oid      |     proowner     
+---------------+------------------
+ rm.cg(rm.ty2) | regress_rm_alice
+(1 row)
+
+-- a recorded owner is matched by OID and name: the role renamed (or
+-- another made with its OID) refuses the move
+CREATE ROLE regress_rm_ren;
+GRANT USAGE, CREATE ON SCHEMA rm TO regress_rm_ren;
+SET ROLE regress_rm_ren;
+CREATE TABLE rm.n (id int PRIMARY KEY);
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS n1 \gset
+DROP TABLE rm.n;
+SELECT length(dolt_commit('-Am', 'n dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER ROLE regress_rm_ren RENAME TO regress_rm_ren2;
+SELECT dolt_reset('--hard', :'n1');
+ERROR:  cannot make rm.n as the commit has it: the role that owned it there, "regress_rm_ren", is now named "regress_rm_ren2"
+DETAIL:  A relation a move makes from a commit is made by its recorded owner, matched by its OID and its name; the OID now names another role, or the role was renamed.
+HINT:  Rename the role back, or move to a commit whose tables' owners exist.
+SELECT to_regclass('rm.n') IS NULL AS not_made;
+ not_made 
+----------
+ t
+(1 row)
+
+ALTER ROLE regress_rm_ren2 RENAME TO regress_rm_ren;
+SELECT dolt_reset('--hard', :'n1') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made('rm.n');
+     owner      | writer_reads | grants 
+----------------+--------------+--------
+ regress_rm_ren | f            | 
+(1 row)
+
+DROP TABLE rm.n;
+SELECT length(dolt_commit('-Am', 'n dropped again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- the privileges --theirs saves are given back by role OID and name: a
+-- grantee dropped or renamed since is passed over, with a notice, and the
+-- others on the line given back
+CREATE ROLE regress_rm_g1;
+CREATE ROLE regress_rm_g2;
+CREATE ROLE regress_rm_g3;
+CREATE TABLE rm.g (id int PRIMARY KEY, note text);
+INSERT INTO rm.g VALUES (1, 'g base');
+SELECT length(dolt_commit('-Am', 'g')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('g_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+DROP TABLE rm.g;
+CREATE TABLE rm.g (id int PRIMARY KEY, note text);
+GRANT SELECT ON rm.g TO regress_rm_g1, regress_rm_g2, regress_rm_g3;
+SELECT length(dolt_commit('-Am', 'g again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('g_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE rm.g SET note = 'g side';
+SELECT length(dolt_commit('-am', 'g side')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('g_side'))[2:4] AS merged;
+         merged          
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rm.g') IS NOT NULL AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+DROP ROLE regress_rm_g2;
+ALTER ROLE regress_rm_g3 RENAME TO regress_rm_g3x;
+CREATE ROLE regress_rm_g3;
+SELECT (dolt_merge('--abort'))[4] AS aborted;
+NOTICE:  privileges of role "regress_rm_g2" on rm.g not given back
+DETAIL:  Role "regress_rm_g2", which held them, was dropped or renamed since they were saved.
+NOTICE:  privileges of role "regress_rm_g3" on rm.g not given back
+DETAIL:  Role "regress_rm_g3", which held them, was dropped or renamed since they were saved.
+    aborted    
+---------------
+ merge aborted
+(1 row)
+
+SELECT has_table_privilege('regress_rm_g1', 'rm.g', 'SELECT') AS g1_reads,
+	has_table_privilege('regress_rm_g3', 'rm.g', 'SELECT') AS new_g3_reads,
+	has_table_privilege('regress_rm_g3x', 'rm.g', 'SELECT') AS renamed_g3_reads;
+ g1_reads | new_g3_reads | renamed_g3_reads 
+----------+--------------+------------------
+ t        | f            | f
+(1 row)
+
+COMMIT;
+\c contrib_regression
+DROP DATABASE regress_recorded_makers;
+DROP ROLE regress_rm_alice, regress_rm_w, regress_rm_spy, regress_rm_ren,
+	regress_rm_g1, regress_rm_g3, regress_rm_g3x;

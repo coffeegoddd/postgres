@@ -1,0 +1,603 @@
+-- While a move runs, every routine it calls that isn't the system's runs
+-- as its owner, restricted, as a SECURITY DEFINER routine would: whatever
+-- path reaches it (a statement the move runs as a maker or as itself, a
+-- check of the rows it writes, a domain's check in a column's conversion),
+-- and an SQL routine is never inlined into the expression calling it.  A
+-- routine whose owner has the caller's privileges runs as the caller, as in
+-- PostgreSQL.  The routines here only log whom they run as.
+CREATE DATABASE regress_move_calls;
+\c regress_move_calls
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA mc VERSIONED;
+CREATE ROLE regress_mc_alice IN ROLE pg_prolly_write;
+CREATE ROLE regress_mc_w IN ROLE pg_prolly_write;
+GRANT USAGE, CREATE ON SCHEMA mc TO regress_mc_alice, regress_mc_w;
+SELECT format('GRANT CREATE ON DATABASE %I TO regress_mc_alice, regress_mc_w',
+			  current_database()) \gexec
+GRANT CREATE ON DATABASE regress_move_calls TO regress_mc_alice, regress_mc_w
+CREATE SCHEMA mc_pub;
+CREATE TABLE mc_pub.log (who name, what text);
+GRANT USAGE ON SCHEMA mc_pub TO PUBLIC;
+GRANT INSERT ON mc_pub.log TO PUBLIC;
+-- (alice's routines: one logging whom it runs as and its search_path, one
+-- with a search_path of its own, and an SQL one the planner would inline)
+CREATE FUNCTION mc_pub.who(what text, v int) RETURNS bool LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+	INSERT INTO mc_pub.log VALUES (current_user, what || ', search_path ' || current_setting('search_path'));
+	RETURN v IS NOT NULL;
+END $$;
+CREATE FUNCTION mc_pub.who_set(what text, v int) RETURNS bool LANGUAGE plpgsql VOLATILE
+SET search_path = mc_pub AS $$
+BEGIN
+	INSERT INTO log VALUES (current_user, what || ', search_path ' || current_setting('search_path'));
+	RETURN v IS NOT NULL;
+END $$;
+CREATE FUNCTION mc_pub.is_alice(v int) RETURNS bool LANGUAGE sql VOLATILE AS
+	$$ SELECT v IS NOT NULL AND current_user = 'regress_mc_alice' $$;
+ALTER FUNCTION mc_pub.who(text, int) OWNER TO regress_mc_alice;
+ALTER FUNCTION mc_pub.who_set(text, int) OWNER TO regress_mc_alice;
+ALTER FUNCTION mc_pub.is_alice(int) OWNER TO regress_mc_alice;
+SET ROLE regress_mc_alice;
+CREATE DOMAIN mc.d AS int;
+CREATE TYPE mc.e AS ENUM ('a', 'b');
+RESET ROLE;
+SET ROLE regress_mc_w;
+CREATE TABLE mc.et (id int PRIMARY KEY, x mc.e);
+INSERT INTO mc.et VALUES (1, 'b');
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS base \gset
+SELECT dolt_branch('feat') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('feat2') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+-- (here, the superuser's composite and domain over alice's domain, used by
+-- its tables)
+CREATE TYPE mc.comp AS (x mc.d);
+CREATE DOMAIN mc.d2 AS mc.d;
+CREATE TABLE mc.t (id int PRIMARY KEY, c mc.comp);
+CREATE TABLE mc.t2 (id int PRIMARY KEY, d2 mc.d2);
+INSERT INTO mc.t VALUES (1, ROW(1));
+INSERT INTO mc.t2 VALUES (1, 2);
+SELECT length(dolt_commit('-Am', 'su types')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- alice's domain gets a check calling her routine.  The superuser's merge
+-- converts the superuser's tables using it through the composite and the
+-- domain over it, as their owner: alice's routine runs as alice
+SELECT dolt_checkout('feat') IS NOT NULL AS on_feat;
+ on_feat 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+ALTER DOMAIN mc.d ADD CONSTRAINT k CHECK (mc_pub.who('d check', VALUE));
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'd checked')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+TRUNCATE mc_pub.log;
+SELECT (dolt_merge('feat', '-m', 'merged feat'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_mc_alice | d check, search_path pg_catalog, pg_temp
+(1 row)
+
+SELECT * FROM mc.t;
+ id |  c  
+----+-----
+  1 | (1)
+(1 row)
+
+SELECT * FROM mc.t2;
+ id | d2 
+----+----
+  1 |  2
+(1 row)
+
+-- alice's new domain with a check not yet validated, and her enum with a
+-- value added (the writer's table uses it): the superuser's merge and
+-- reset make and change them, as alice
+SELECT dolt_checkout('feat2') IS NOT NULL AS on_feat2;
+ on_feat2 
+----------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+CREATE DOMAIN mc.added AS int;
+ALTER DOMAIN mc.added ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+ALTER TYPE mc.e ADD VALUE 'c';
+RESET ROLE;
+SELECT length(dolt_commit('-Am', 'added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS added \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('feat2', '-m', 'merged feat2'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT t.typname, t.typowner::regrole, c.conname, c.convalidated
+FROM pg_type t JOIN pg_constraint c ON c.contypid = t.oid
+WHERE t.oid = 'mc.added'::regtype;
+ typname |     typowner     | conname  | convalidated 
+---------+------------------+----------+--------------
+ added   | regress_mc_alice | positive | f
+(1 row)
+
+SELECT enum_range(NULL::mc.e), x FROM mc.et;
+ enum_range | x 
+------------+---
+ {a,b,c}    | b
+(1 row)
+
+SELECT dolt_branch('r', :'base') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('r') IS NOT NULL AS on_r;
+ on_r 
+------
+ t
+(1 row)
+
+SELECT to_regtype('mc.added') IS NULL AS not_yet;
+ not_yet 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'added') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT typowner::regrole FROM pg_type WHERE oid = 'mc.added'::regtype;
+     typowner     
+------------------
+ regress_mc_alice
+(1 row)
+
+SELECT enum_range(NULL::mc.e);
+ enum_range 
+------------
+ {a,b,c}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- the superuser's table checks its rows with alice's routines: an SQL one
+-- (not inlined, so it runs as alice and sees her as current_user) and one
+-- with a search_path of its own (kept).  alice writes a row on a branch,
+-- and the superuser's merge writes it here, checked as alice
+CREATE TABLE mc.ck (id int PRIMARY KEY);
+ALTER TABLE mc.ck ADD CONSTRAINT ck_alice
+	CHECK (mc_pub.is_alice(id) AND mc_pub.who_set('ck check', id)) NOT VALID;
+GRANT SELECT, INSERT ON mc.ck TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'ck')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ck_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su2 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ck_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.ck VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'ck row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+TRUNCATE mc_pub.log;
+SELECT (dolt_merge('ck_side', '-m', 'merged ck_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT * FROM mc.ck;
+ id 
+----
+  1
+(1 row)
+
+SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
+       who        |             what             
+------------------+------------------------------
+ regress_mc_alice | ck check, search_path mc_pub
+(1 row)
+
+-- (outside a move, the superuser's own write runs them as itself: refused)
+INSERT INTO mc.ck VALUES (2);
+ERROR:  new row for relation "ck" violates check constraint "ck_alice"
+DETAIL:  Failing row contains (2).
+-- the same through alice's domain, whose check the type cache planned
+-- (inlining her SQL routine) before the merge, outside any move: planned
+-- again as the merge begins, so it runs as alice there too
+SET ROLE regress_mc_alice;
+CREATE DOMAIN mc.da AS int CHECK (mc_pub.is_alice(VALUE));
+RESET ROLE;
+CREATE TABLE mc.dt (id int PRIMARY KEY, x mc.da);
+GRANT SELECT, INSERT ON mc.dt TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'dt')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dt_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su3 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su3')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('dt_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.dt VALUES (1, 1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'dt row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT 1::mc.da;
+ERROR:  value for domain mc.da violates check constraint "da_check"
+SELECT (dolt_merge('dt_side', '-m', 'merged dt_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT * FROM mc.dt;
+ id | x 
+----+---
+  1 | 1
+(1 row)
+
+-- the superuser's PL/pgSQL routine calling alice's SQL one, its plans
+-- cached before the merge (alice's inlined into them, its call set up
+-- unhooked): in an earlier transaction, and in the merge's own, both are
+-- planned again as the merge begins, so alice's runs as alice (its own
+-- search_path, so the move's restricted one doesn't replan it anyway)
+CREATE FUNCTION mc_pub.su_simple(v int) RETURNS bool LANGUAGE plpgsql
+	SET search_path = mc_pub, pg_catalog AS $$
+DECLARE r bool;
+BEGIN
+	r := mc_pub.is_alice(v);
+	INSERT INTO mc_pub.log VALUES (current_user, 'su_simple: is_alice ' || r);
+	RETURN true;
+END $$;
+CREATE TABLE mc.sk (id int PRIMARY KEY);
+ALTER TABLE mc.sk ADD CONSTRAINT sk_chk CHECK (mc_pub.su_simple(id)) NOT VALID;
+GRANT SELECT, INSERT ON mc.sk TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'sk')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('sk_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su4 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su4')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('sk_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.sk VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'sk row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- (a fresh session, its first plans those the warm-up makes)
+-- (the warm-up's own call logs false, as the superuser)
+\c regress_move_calls
+TRUNCATE mc_pub.log;
+SELECT mc_pub.su_simple(0) AS warmed;
+ warmed 
+--------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('sk_side', '-m', 'merged sk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+ su_simple: is_alice true
+(2 rows)
+
+ROLLBACK;
+\c regress_move_calls
+TRUNCATE mc_pub.log;
+BEGIN;
+SELECT mc_pub.su_simple(0) AS warmed;
+ warmed 
+--------
+ t
+(1 row)
+
+SELECT (dolt_merge('sk_side', '-m', 'merged sk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+ su_simple: is_alice true
+(2 rows)
+
+COMMIT;
+-- (and after the merge, planned again unhooked: inlined, as the caller)
+TRUNCATE mc_pub.log;
+SELECT mc_pub.su_simple(0) AS called;
+ called 
+--------
+ t
+(1 row)
+
+SELECT DISTINCT what FROM mc_pub.log ORDER BY 1;
+           what            
+---------------------------
+ su_simple: is_alice false
+(1 row)
+
+-- alice's SECURITY DEFINER routine in the superuser's table's check runs
+-- as alice, restricted: it can't make a temporary table, which the
+-- session would then find first, as the mover
+CREATE FUNCTION mc_pub.who_def(v int) RETURNS bool LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = mc_pub AS $$
+BEGIN
+	BEGIN
+		CREATE TEMP TABLE mc_def_tmp (x int);
+		DROP TABLE mc_def_tmp;
+		INSERT INTO log VALUES (current_user, 'definer: not restricted');
+	EXCEPTION WHEN insufficient_privilege THEN
+		INSERT INTO log VALUES (current_user, 'definer: restricted');
+	END;
+	RETURN true;
+END $$;
+ALTER FUNCTION mc_pub.who_def(int) OWNER TO regress_mc_alice;
+CREATE TABLE mc.dk (id int PRIMARY KEY);
+ALTER TABLE mc.dk ADD CONSTRAINT dk_chk CHECK (mc_pub.who_def(id)) NOT VALID;
+GRANT SELECT, INSERT ON mc.dk TO regress_mc_alice;
+SELECT length(dolt_commit('-Am', 'dk')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dk_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.su5 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'su5')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('dk_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+SET ROLE regress_mc_alice;
+INSERT INTO mc.dk VALUES (1);
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'dk row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+TRUNCATE mc_pub.log;
+SELECT (dolt_merge('dk_side', '-m', 'merged dk_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
+       who        |        what         
+------------------+---------------------
+ regress_mc_alice | definer: restricted
+(1 row)
+
+-- a role without alice's privileges merging its own table, whose check
+-- calls alice's routine: the routine runs as alice, never as the writer
+SET ROLE regress_mc_w;
+CREATE TABLE mc.wt (id int PRIMARY KEY);
+ALTER TABLE mc.wt ADD CONSTRAINT wt_chk CHECK (mc_pub.who('wt check', id)) NOT VALID;
+SELECT length(dolt_commit('-Am', 'wt')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('wt_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+CREATE TABLE mc.w2 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'w2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('wt_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+INSERT INTO mc.wt VALUES (1);
+SELECT length(dolt_commit('-am', 'wt row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET ROLE;
+TRUNCATE mc_pub.log;
+SET ROLE regress_mc_w;
+SELECT (dolt_merge('wt_side', '-m', 'merged wt_side'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+RESET ROLE;
+SELECT DISTINCT who, what FROM mc_pub.log ORDER BY 1, 2;
+       who        |                   what                    
+------------------+-------------------------------------------
+ regress_mc_alice | wt check, search_path pg_catalog, pg_temp
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_move_calls;
+DROP ROLE regress_mc_alice, regress_mc_w;

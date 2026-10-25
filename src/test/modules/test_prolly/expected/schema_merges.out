@@ -58,12 +58,34 @@ SELECT length(dolt_commit('-Am', 'main rows')::text) AS committed;
         42
 (1 row)
 
+-- (app.same, made on both sides, is two tables: a table identity
+-- conflict, resolved with the feature's, which main then has)
+BEGIN;
 SELECT (dolt_merge('feature'))[2:4];
-        dolt_merge        
---------------------------
- {0,0,"merge successful"}
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
 (1 row)
 
+SELECT table_name FROM dolt_identity_conflicts();
+ table_name 
+------------
+ app.same
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'app.same');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT length(dolt_commit('-m', 'Merge branch ''feature'' into main')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+COMMIT;
 SELECT dolt_hashof('HEAD^2') = dolt_hashof('feature') AS merge_commit;
  merge_commit 
 --------------
@@ -419,7 +441,9 @@ SELECT * FROM mr.t ORDER BY id;
   2 | b
 (2 rows)
 
--- A table both sides made alike merges its rows three-way.
+-- A table both sides made alike is two tables, each made apart: a table
+-- identity conflict, its rows not merged; resolved with theirs, the
+-- table is the side's, its rows the side's.
 SELECT dolt_branch('-D', 'mr_side');
  dolt_branch 
 -------------
@@ -460,19 +484,44 @@ SELECT length(dolt_commit('-Am', 'main makes both')::text) AS committed;
         42
 (1 row)
 
+BEGIN;
 SELECT (dolt_merge('mr_side'))[2:4];
-        dolt_merge        
---------------------------
- {0,0,"merge successful"}
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name FROM dolt_identity_conflicts();
+ table_name 
+------------
+ mr."both"
 (1 row)
 
 SELECT * FROM mr.both ORDER BY k;
  k 
 ---
  1
- 2
-(2 rows)
+(1 row)
 
+SELECT dolt_conflicts_resolve('--theirs', 'mr.both');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM mr.both ORDER BY k;
+ k 
+---
+ 2
+(1 row)
+
+SELECT length(dolt_commit('-m', 'both merged')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+COMMIT;
 -- A column one side narrows, where the other side changed the table too, is
 -- a schema conflict, as in Dolt: ours narrows it, theirs adds a row too
 -- long for it.
@@ -703,8 +752,8 @@ SELECT dolt_branch('-D', 'mr_side');
 
 DROP SCHEMA mr CASCADE;
 NOTICE:  drop cascades to 5 other objects
-DETAIL:  drop cascades to table mr.u
-drop cascades to table mr.t
+DETAIL:  drop cascades to table mr.t
+drop cascades to table mr.u
 drop cascades to table mr."both"
 drop cascades to function mr.twice(integer)
 drop cascades to view mr.tv
@@ -780,8 +829,8 @@ DROP SCHEMA ma CASCADE;
 NOTICE:  drop cascades to 4 other objects
 DETAIL:  drop cascades to function ma.add(integer,integer)
 drop cascades to table ma.t
-drop cascades to table ma.m
 drop cascades to table ma.s
+drop cascades to table ma.m
 SELECT length(dolt_commit('-Am', 'ma dropped')::text) AS committed;
  committed 
 -----------
@@ -814,8 +863,8 @@ DROP SCHEMA ma CASCADE;
 NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to function ma.add(integer,integer)
 drop cascades to table ma.t
-drop cascades to table ma.m
 drop cascades to table ma.s
+drop cascades to table ma.m
 drop cascades to function ma.mul(integer,integer,integer)
 SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
  committed 
@@ -1875,8 +1924,8 @@ DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.u
+drop cascades to table app.n
 drop cascades to table app.same
 drop cascades to function app.twice(integer)
-drop cascades to table app.n
 drop cascades to table app.sg_main
 drop cascades to view app.tv

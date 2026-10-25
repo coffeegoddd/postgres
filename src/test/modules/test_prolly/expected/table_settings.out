@@ -882,14 +882,14 @@ SELECT dolt_branch('-D', 'settings_conflict');
 
 DROP SCHEMA settings CASCADE;
 NOTICE:  drop cascades to 13 other objects
-DETAIL:  drop cascades to table settings.compression
-drop cascades to table settings.opts
-drop cascades to table settings.stats
-drop cascades to table settings.storage
+DETAIL:  drop cascades to table settings.opts
 drop cascades to table settings.repl
+drop cascades to table settings.storage
+drop cascades to table settings.compression
+drop cascades to table settings.stats
+drop cascades to table settings.parent
 drop cascades to table settings.inhparent
 drop cascades to table settings.inhchild
-drop cascades to table settings.parent
 drop cascades to table settings.words
 drop cascades to type settings.word
 drop cascades to table settings.ri

@@ -401,6 +401,15 @@ SELECT dolt_checkout('pc_cases');
  {0,"Switched to branch 'pc_cases'"}
 (1 row)
 
+-- (pt.r, made again on main, is another table there: refused, then
+-- dropped here, with the foreign key into it, for the reset to make
+-- main's; and so back)
+SELECT dolt_reset('--hard', 'main');
+ERROR:  cannot move table pt.r to a version of another table
+DETAIL:  The version of pt.r this moves to was made from another relation of that name: a table dropped and made again since, or made apart from the one here.
+HINT:  Drop the table on this branch first: the move then makes the version's own relation again.
+DROP TABLE pt.r CASCADE;
+NOTICE:  drop cascades to constraint q_ref_fkey on table pt.q
 SELECT dolt_reset('--hard', 'main');
  dolt_reset 
 ------------
@@ -429,6 +438,8 @@ SELECT * FROM pg_temp.shape();
  part pt.mover of pt.new
 (12 rows)
 
+DROP TABLE pt.r CASCADE;
+NOTICE:  drop cascades to constraint q_ref_fkey on table pt.q
 SELECT dolt_reset('--hard', 'HEAD~1');
  dolt_reset 
 ------------

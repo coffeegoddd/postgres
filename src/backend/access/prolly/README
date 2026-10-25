@@ -332,7 +332,9 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 15: each table's OID and qualified name, a line each, the name's
+format 17: each table's, partitioned table's and materialized view's
+OID, owner's OID, kind, owner's name and qualified name, a line each,
+the names'
 backslashes and newlines escaped so that no name makes a line of its
 own, and since format 16 quoted as with quote_all_identifiers off in any
 session, as commits name tables; read strictly, a damaged record
@@ -358,26 +360,199 @@ dropped and made again in the working set as the parent had it; and a
 table such a move changed in the working set, uncommitted (set aside, or
 left out of the commit), is recorded only as of a relation of the class
 its first parent's record lists (refs' prolly_commit_local_tables, as the
-merge, pick or revert tells it).  Relations are compared by equivalence
-class ('J'): a relation a move makes again of a table (a
-definition it can't alter in place, as a branch's first use may when its
-copies are moved to its head), or a merge, pick or revert makes of the
-other side's table (the class of the relation the commit it takes the
-version from was made from: prolly_move_provenance), is the same table
-as the one it comes from, whatever its OID; what the move sets aside of
-the uncommitted changes and puts back is the branch's own, taking no
-class from those commits.  A class outlives its relation's drop: commits
-made from the dropped relation are still read through it, and a branch's
-copy of the relation, of the same OID, may still be in use.  So a
-relation given a dropped relation's OID again (after the OID counter
-wraps) is of the dropped relation's class, and reads its versions.  What the
-records can't: a
-branch's first use may make its copies from another branch's relation
-(the table here's, moved to the old rows), and its commits are then that
-relation's; a move that brings the old table's rows (a merge, a hard
-reset, a revert of the drop, a cherry-pick) writes them into the new
-table, whose rows they then are (#936); and a role given a dropped
-relation's OID again would read that relation's versions.
+merge, pick or revert tells it).  Relations are compared by OID: a move
+keeps a table's relation, so a relation's history is its own.  A table a
+move makes is the relation its version is of, by its OID (the canonicalizer's
+move_relids_before(), asked by heap_create_with_catalog() as the table is
+made, prolly_move_kept_relid()): the relation the commit it takes the
+version from records under the name (prolly_move_provenance; a merge of a
+table the other side made, a reset to a commit holding one dropped here),
+the one a caller names (prolly_move_kept: a conflict's resolution with
+theirs, the uncommitted changes put back after a move that set them
+aside), or the one it was, for a table the move makes again (a definition
+it can't alter in place).  Its storage is a file of its own; a relation
+cache entry of that OID, of another branch's relation or of the one just
+dropped, is forgotten first (RelationForgetForNewRelation()), and where it
+can't be (open) or the branch has a relation of that OID, the table is a
+new relation.  A branch's copies keep their OIDs, so a table is the same
+relation on every branch that has it from the same making.
+
+A table is its relation and its name together.  Two relations of one name
+are two tables, whatever identity the name gives them: one dropped and
+made again, one renamed into a dropped one's name, or one made on each of
+two branches apart (#936).  So no move puts one relation's version into
+another's table, under its grants:
+- A merge (a pull, an integration, a cherry-pick, a revert, a rebase's
+  step) whose other side changed (or made) a table since the base, where
+  the other side's commit records it, under the name the merge matches,
+  as made from another relation than the table here (or than the base's),
+  keeps the table as the branch has it, with every table of its
+  inheritance or partition tree (names linked through any side's
+  definitions, the canonicalizer's table_parents()): base and theirs take
+  those tables as ours has them (splice()), so the merge changes nothing
+  in them and no row of theirs is read or listed.  Each is a table
+  identity conflict (diffmerge_folded.c's identity_conflicts()), recorded
+  in the merge in progress ('D', refs format 17: each table's relation
+  here and theirs, its tree, its names, and the local branch theirs was
+  the head of) and counted as a conflict: shown by dolt_status ("identity
+  conflict"), dolt_conflicts (one each) and dolt_identity_conflicts (ours
+  and theirs, relation and owner, the tree), kept by
+  dolt.allow_commit_conflicts as other conflicts are, refusing a commit
+  until resolved, and cleared by the merge's abort.  A fast-forward isn't
+  made where theirs may bring such a version: the merge is three-way.
+  A stash's apply, which has no merge in progress, and a merge that fails
+  on conflicts (an integration) refuse it.
+- dolt_conflicts_resolve('--ours', t) keeps the branch's relations, rows
+  and grants: the conflict is resolved as the branch has it.  '--theirs'
+  makes the other side's relations the branch's tables, a tree at once:
+  it takes owning each of the branch's, which are dropped
+  (performMultipleDeletions(), CASCADE, an object access hook watching):
+  refused where the drop would take anything the move can't make again as
+  the merge has it (anything outside the versioned schemas, another table
+  or a column of one, a materialized view, whose query would run as the
+  resolver), or an object of another role's (made again, it would be the
+  resolver's: each is listed); the resolver's views, foreign keys and
+  policies of versioned tables are made again, the views given back their
+  grants.  The privileges of the branch's tables (their own and their
+  columns') and of the views the drop took are saved in the merge in
+  progress, each grant with its grantee and grantor by OID and name, and
+  its abort gives them back (prolly_restore_privileges()): each grant whose
+  roles are still those roles, the others (a role dropped or renamed
+  since, or another role made with its name) passed over with a notice.
+  Then the move makes theirs' (their definitions, indexes, constraints,
+  policies and rows, from theirs' commit) as theirs' recorded owner, each
+  of its OID, and gives each the privileges the local branch theirs was
+  the head of has on it (branch_ops' carry_privileges(), as a merge of
+  that branch gives a table it makes).  The merge's commit then records
+  the chosen relations.
+- (Every kind of object a move makes, re-makes or changes is treated as
+  below for tables: types and domains, routines, views, sequences,
+  foreign tables, versioned schemas and collations, as well as tables and
+  materialized views.  A commit's record of relations lists every object
+  it may hold, each with its kind and owner, named as the commit's items
+  name it (the canonicalizer's prolly_owned_objects() and
+  prolly_owned_routines()).  Its routines and types are stored once under
+  their lines' hash (refs 'J') and named by it, so a commit that changed
+  none names its parent's entry; one that changed a routine writes a new
+  entry, whose value tree (cut by content) shares all but the chunks
+  around the changed line with the last.  The session works out again
+  only the names the caches' invalidations say may have changed: a
+  routine's row changed, or a type or schema its name or arguments name
+  (by the caches' hash of their OIDs), so a table or temporary table made
+  works out none.  A type move's statements on the tables using a type
+  run as each table's owner; each routine the conversion runs (a domain's
+  check's, a cast's) runs as its own owner (below), so a type owner's code
+  never gets the table owner's authority, however the type is nested (a
+  domain within the table owner's composite or domain).  A domain's check
+  expression itself runs as it does for each row the table's owner writes,
+  as in PostgreSQL.  A cast is made and dropped as the owner of one
+  of its types, as CREATE CAST requires (the role moving, if it owns one;
+  else an owner whose privileges it has), and refused otherwise.)
+- Every statement a move runs says, as it is made, which object it makes
+  or changes, and so whose role runs it (its maker, or the role moving
+  where the object is its own or no other role's); nothing is read back
+  from a statement's text, and makers are found by the whole of an
+  object's name, however long (a routine's names every argument).  A
+  statement nothing said this of is refused, as an internal error,
+  whenever the move has makers; in one that has none it runs as the role
+  moving, guarded by an object access hook: one that would make, change,
+  drop or empty an object of another role's whose privileges the role
+  has, run such a role's routine (but an extension's as installed: owned
+  by its extension's owner, the bootstrap superuser or a role with the
+  mover's privileges), or make an object the move has another maker for,
+  is refused, as an internal error.  So a statement the move fails to
+  attribute fails closed, never runs with the mover's authority over
+  another's object.
+- While a move runs (its statements, row writes and checks:
+  prolly_move_calls_begin()), every routine called that isn't the
+  system's (an OID below FirstNormalObjectId) runs as its owner under
+  SECURITY_RESTRICTED_OPERATION, as a SECURITY DEFINER routine would, with
+  search_path pg_catalog, pg_temp unless it sets its own: through the
+  function manager's hooks (needs_fmgr_hook, fmgr_hook), whatever path
+  calls it, a statement run as a maker or as the mover, a check, default
+  or index expression of the rows written, a domain's check in a
+  conversion, a materialized view's query, another routine.  A routine
+  whose owner has the caller's privileges (the caller's own, a
+  superuser's) runs as the caller, as in PostgreSQL: running it as its
+  owner would give the caller more.  A routine the hook is needed for is
+  never inlined, so an SQL routine's body can't run unseen in the
+  expression calling it; domains' checks the type cache planned before
+  the move, and every plan the session cached (ResetPlanCache(): a
+  PL/pgSQL routine's plans and simple expressions too), are planned again
+  as it begins, and the plans made in it once more as it ends; and no
+  query or index build of the move runs in parallel workers, which the
+  hooks don't reach.  Another role's SECURITY DEFINER routine (not a
+  superuser's) runs restricted too.  (A routine whose owner and caller
+  have neither's privileges runs as its owner, as SECURITY DEFINER does:
+  its owner's code never runs with the caller's authority.)  Function
+  lookups long-lived caches made before the move aren't hooked: index
+  and partition support functions in the relation cache, the type
+  cache's comparison and range functions.  Those are an operator class's
+  (which a superuser makes), C functions (which only a superuser can
+  make), or a range type's subtype difference (its maker's choice).
+- Every move that makes a table or materialized view from a commit (a
+  reset, a table's checkout, a branch's first use, a rebase's end, an
+  abort, a stash's push or apply, a merge, a pick, a revert, '--theirs')
+  makes it as its maker: the owner the record of relations of the commit
+  it takes the version from names (each line has its owner's OID and
+  name), or, for uncommitted changes a move sets aside and puts back, the
+  table's owner (the canonicalizer's prolly_move_maker()).  Every
+  statement making it (its definition, indexes, constraints and their
+  validation, policies, inheritance, the sequences it owns, a
+  materialized view's query), its rows, and the checks a merge runs over
+  them run as that owner under SECURITY_RESTRICTED_OPERATION, as REFRESH
+  and CLUSTER run an owner's code: the role moving runs none of the
+  owner's code with its own privileges, never owns the relation, and reads
+  nothing of it, through it or a materialized view over it, that it wasn't
+  granted.  The relation, its columns and the sequences it owns get no
+  grants from their making (neither role's default privileges); a merge
+  adds the source branch's grants on top (carry_privileges()).  The owner
+  needs what making it takes (CREATE on its schema), as it did to make it
+  first.  A recorded owner that no longer exists, or whose OID now names
+  another role or a renamed one (the OID counter wrapped), refuses the
+  move.  A commit with no record (fetched, cloned or pushed here) makes
+  its tables as the mover, as before.  So, too, a relation the branch
+  has (a table, materialized view, view or sequence) that a move changes
+  in place, drops, or makes again (a table whose definition ALTER can't
+  change in place, a materialized view or view made again as what it
+  uses changes) is changed and made as its owner here, restricted, its
+  rows written and checked so, where the role moving has that owner's
+  privileges (a superuser, a member of the owning role): the owner's code
+  never runs with more than the owner's own.  One made again keeps its
+  owner and gets exactly its grants back (its own, its columns' and its
+  sequences', a NULL ACL as well: nothing its making gave it stays).  A role without the owner's privileges moves as itself,
+  as its DDL would run, refused where it doesn't own what changes (and a
+  writer branch's role as its base allows: see "Writers"); whether
+  row-level security refuses the rows is the mover's.  Owner-run
+  statements, rows and checks use search_path pg_catalog, pg_temp
+  (RestrictSearchPath()), as REFRESH does.
+- A hard reset, a table's checkout from a commit and a push's or forced
+  move of a branch (dolt_serve_move_head, dolt_branch -f) that would put
+  into a table here a version
+  of another relation (as the commit moved to records it, under the
+  table's name) are refused, checked after the move and before its
+  transaction can commit (VERSION_MOVE() in prolly_dolt.c, the refs'
+  branch move), with a hint to drop the table here first: the move then
+  makes the version's relation again, of its OID.  A move back to the
+  branch's head that undoes the branch's own work (a merge's, pick's or
+  revert's abort, a stash's push, a hard reset to the head) drops such
+  tables itself and makes the head's relations again; so does a branch's
+  first use, whose copies (of the nearest source's relations, materialized
+  views over them too) may be other relations than its head's, and a
+  rebase's end, the rebased commits being the branch's (where its own
+  relation is the rebased head's, it stays, with its grants).  The grants
+  of a table so made again went with the relation it replaced, but for an
+  abort's.  A move between versions of one relation keeps it, and its
+  grants.
+- History reads (#932) of a table whose merge's other parent holds another
+  relation of its name are refused for a SELECT grantee where they reach
+  that parent's versions (dolt_history_table, dolt_diff_table and history
+  mounts walk every version): the table's own first-parent versions are
+  read by dolt_at, and dolt_diff_table between them.
+- Moves to commits made elsewhere (fetched, cloned, pushed: no record)
+  keep the relation and its grants, as before, so an old table's version
+  come back from a remote can land its rows in the table here (its
+  history stays refused).
 A refused read reads each commit's record about once: a walk that meets
 nothing marks the commits it saw apart.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and
@@ -624,7 +799,9 @@ makes them the base's.  This rests on a move running no user code: its
 statements are deparsed definitions, run with check_function_bodies off,
 and no trigger or event trigger fires for its own DDL (internal history
 work's); the rows it writes go as the session's role, under its
-privileges.  A writer with its tables' grants alone so moves to what its
+privileges (a table or materialized view it makes from a commit is made,
+and its rows written, as its recorded owner, restricted: see "Identity
+across renames" above).  A writer with its tables' grants alone so moves to what its
 base's writers defined, never to definitions of its own choosing on
 objects it doesn't own.
 
@@ -633,11 +810,12 @@ its making gives it.  A merge (or fast-forward) of a branch of this
 database, though, gives each relation it makes on the target, one new to
 it (not one made again in the place of one of its name the move dropped),
 the privileges of the source branch's relation it was made from: the
-relation's, and each column's by name, as the new relation's owner (the
-merging role) gives them, with their shared dependencies (branch_ops'
-carry_privileges), added to those its making gave it (the target's
-default privileges).  The source relation's owner keeps its own, as a
-grant to it from the new owner.  The merging role approves them as it
+relation's, and each column's by name, as the new relation's owner (its
+maker, the owner its commit records, or the merging role for a commit
+with no record) gives them, with their shared dependencies (branch_ops'
+carry_privileges); a relation with a maker has no others, its making
+giving it none.  The source relation's owner, if another role, keeps its
+own, as a grant to it from the new owner.  The merging role approves them as it
 approves the table.  The relations the move makes and drops are found by
 the object access hook as it runs, so this costs only as much as the move
 changes.
@@ -752,9 +930,11 @@ identity) is kept under ours' names, its own and its columns': the
 merge's names are made again so (merge_renames()'s keep_ours), found by
 merging the definitions once before the merge does.
 dolt_conflicts_resolve() refuses it, and the merge can't be committed
-until it is aborted.  A cherry-pick or revert, schema conflicts of other
-objects, and a table the other side's objects use in its version (a view
-over a column it added) fail as before, the last saying so.
+until it is aborted.  A table the other side has as another relation is a
+table identity conflict instead (see "Identity across renames").  A
+cherry-pick or revert, schema conflicts of other objects, and a table the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last saying so.
 
 A keyed row both sides of a merge changed is merged column by column, on
 its encoded fields (the keying's row_fields()): all three versions are

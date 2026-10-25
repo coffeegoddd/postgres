@@ -284,6 +284,12 @@ typedef struct BranchOpsRoutine
 	 */
 	void		(*carry_privileges) (const char *source, List *relids,
 									 List *fromids);
+
+	/*
+	 * Optional: the owner of branch's relation relid (InvalidOid: branch
+	 * hasn't it, or is no branch with copies).
+	 */
+	Oid			(*relation_owner) (const char *branch, Oid relid);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

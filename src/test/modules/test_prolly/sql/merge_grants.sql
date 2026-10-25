@@ -1,8 +1,9 @@
--- A table a merge (or a fast-forward) makes on the branch, new to it, has
--- the privileges the source branch's table of its name has, with the ones its
--- making gives it (the branch's default privileges): commits hold
--- no privileges, but a branch of this database does.  One a remote's ref
--- brings (a fetch, a pull) arrives with only the ones its making gives it.
+-- A table a merge (or a fast-forward) makes on the branch, new to it, is
+-- made by the owner its commit's record names, with no grants of its
+-- making, and has the privileges the source branch's table of its name
+-- has: commits hold no privileges, but a branch of this database does.
+-- One a remote's ref brings (a fetch, a pull), whose commits have no
+-- record, is the merging role's, with only the ones its making gives it.
 -- A cherry-pick of a branch (its head) the same; of a commit named otherwise,
 -- or a revert, none.
 
@@ -44,7 +45,8 @@ SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
 SELECT 'mg.n'::regclass::oid AS ff_oid \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('mg_ff'))[2:2] AS fast_forward;
-SELECT 'mg.n'::regclass::oid <> :ff_oid AS new_relation,
+-- (the branch's relation, by its OID, made on main: its grants carried)
+SELECT 'mg.n'::regclass::oid = :ff_oid AS same_relation,
 	   pg_temp.grants('mg.n'), pg_temp.grants('mg.n_id_seq') AS seq_grants;
 -- (the grantee reads it, and writes the column it was given)
 SET ROLE regress_mg_r;
@@ -70,7 +72,8 @@ CREATE POLICY mg_p ON mg.m FOR SELECT TO regress_mg_r USING (id > 1);
 INSERT INTO mg.m VALUES (1, 'one'), (2, 'two');
 SELECT length(dolt_commit('-Am', 'm')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
--- (main's default privileges, which the branch hasn't, apply as well)
+-- (main's default privileges, which the branch hasn't, give it nothing:
+-- its making gives it no grants)
 ALTER DEFAULT PRIVILEGES IN SCHEMA mg GRANT UPDATE ON TABLES TO regress_mg_w;
 CREATE TABLE mg.o (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'o')::text) AS committed;
@@ -196,8 +199,8 @@ SELECT (dolt_merge('mg_k'))[2:2] AS fast_forward;
 SELECT relkind, pg_temp.grants('mg.k') FROM pg_class WHERE oid = 'mg.k'::regclass;
 SELECT pg_temp.grants('mg.k2');
 
--- The table's maker keeps its own privileges, a grant to it from the
--- merging role, which owns the table here.
+-- The table is its maker's, the owner its commit records, not the
+-- merging role's; the source branch's grants are given as its.
 CREATE ROLE regress_mg_alice;
 CREATE ROLE regress_mg_bob;
 SELECT current_database() AS mg_db \gset

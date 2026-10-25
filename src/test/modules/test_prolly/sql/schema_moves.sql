@@ -143,7 +143,14 @@ CREATE TABLE sm7.i (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
 INSERT INTO sm7.i (v) VALUES ('a');
 SELECT (dolt_commit('-Am', 'sm7 feature'))[1] AS sm7_feature \gset
 SELECT dolt_checkout('main');
+-- (sm7.p, dropped and made again on the feature, is another table there:
+-- a table identity conflict, resolved with the feature's)
+BEGIN;
 SELECT (dolt_merge('sm7_feature'))[2:4];
+SELECT table_name FROM dolt_identity_conflicts();
+SELECT dolt_conflicts_resolve('--theirs', 'sm7.p');
+SELECT length(dolt_commit('-m', 'sm7 feature merged')::text) AS committed;
+COMMIT;
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
 SELECT * FROM sm7.a;
 SELECT * FROM sm7.p;
@@ -153,6 +160,9 @@ SELECT count(*) AS identity_sequences FROM pg_class
 WHERE relnamespace = 'sm7'::regnamespace AND relname LIKE 'i_id_seq%';
 SELECT sm7.f(3);
 SELECT dolt_reset('--hard');
+-- (the base's sm7.p is another table: dropped here first, the reset makes
+-- it again)
+DROP TABLE sm7.p;
 SELECT dolt_reset('--hard', :'sm7_base');
 SELECT test_fold_root() = prolly_root_hash(:'sm7_base') AS same_root;
 SELECT * FROM sm7.a;
@@ -338,6 +348,9 @@ WHERE confrelid = 'sm12.kp'::regclass ORDER BY conrelid::regclass::text;
 SELECT to_regclass('sm12.kd') AS kd, (SELECT count(*) FROM sm12.kr) AS kr,
 	(SELECT count(*) FROM sm12.kf) AS kf, to_regclass('sm12.kq2') AS kq2,
 	(SELECT count(*) FROM sm12.kq) AS kq;
+-- (main's sm12.kr, dropped and made again there, is another table: dropped
+-- here first, the reset makes main's)
+DROP TABLE sm12.kr;
 SELECT dolt_reset('--hard', :'sm12_main');
 SELECT format_type(atttypid, atttypmod) FROM pg_attribute
 WHERE attrelid = 'sm12.p'::regclass AND attname = 'id';
@@ -467,18 +480,21 @@ DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
 
--- Two tables' names swapped: a move back to the head puts each back (the
--- NOT NULL of a key going after the key, whatever their names' order),
--- by a hard reset, and by a merge's abort.
+-- Two tables' names swapped: a hard reset back to the head, which matches
+-- tables by name, would put each table's version into the other's
+-- relation; discarding the branch's own changes, it makes each its own
+-- relation again instead, by its OID, as a merge's abort does.
 CREATE SCHEMA sw VERSIONED;
 CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
 CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
 INSERT INTO sw.a VALUES (1, 'a'); INSERT INTO sw.b VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
+SELECT 'sw.a'::regclass::oid AS sw_a, 'sw.b'::regclass::oid AS sw_b \gset
 ALTER TABLE sw.a RENAME TO tmp;
 ALTER TABLE sw.b RENAME TO a;
 ALTER TABLE sw.tmp RENAME TO b;
 SELECT dolt_reset('--hard');
+SELECT 'sw.a'::regclass::oid = :sw_a AS a_again, 'sw.b'::regclass::oid = :sw_b AS b_again;
 SELECT * FROM sw.a;
 SELECT * FROM sw.b;
 SELECT count(*) AS changed FROM dolt_status;
@@ -495,6 +511,7 @@ ALTER TABLE sw.a RENAME TO tmp;
 ALTER TABLE sw.b RENAME TO a;
 ALTER TABLE sw.tmp RENAME TO b;
 SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+SELECT 'sw.a'::regclass::oid = :sw_a AS a_again, 'sw.b'::regclass::oid = :sw_b AS b_again;
 SELECT * FROM sw.a;
 SELECT * FROM sw.b;
 SELECT count(*) AS changed FROM dolt_status;
