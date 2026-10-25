@@ -476,7 +476,9 @@ only while the branch's head is that record's commit: one of the name
 made since, uncommitted (another relation, perhaps of another kind),
 gives nothing, nor does a branch whose head moved without a commit (a
 fast-forward, a reset).  A branch made from another starts with its
-record, as with its relations, of the same OIDs.  dolt_integrate()
+record, as with its relations, of the same OIDs; a history read on it so
+takes the head's version of a table for the table here as one on its
+start point does (recorded_relation()), from the start.  dolt_integrate()
 merges so too.  A cherry-pick of one ref that names a branch (so picks
 its head) takes that branch's privileges alone; one of a commit named
 otherwise (a hash, HEAD~n, several refs) takes none, since the commit
@@ -485,8 +487,11 @@ another made since, and no one branch is its source.  A revert takes
 none: what it makes again, its commit dropped.  A relation merged from
 a remote's ref (a fetch, a pull), a tag or a commit arrives with only
 those its making gives it, as does one a reset makes.  A merge,
-cherry-pick or revert can't run inside another (from a function the
-rows the first writes call): it is refused.  Row security and policies are held in commits, so they arrive
+cherry-pick, revert or stash apply runs between prolly_move_begin()
+and prolly_move_end(); inside it (from a function the rows it writes
+call), nothing that moves a head or the working set runs: another of
+them, a reset, a checkout, a commit (prolly_check_not_moving(), which
+prolly_check_head_move() calls too) is refused.  Row security and policies are held in commits, so they arrive
 with the relation whatever its source.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and

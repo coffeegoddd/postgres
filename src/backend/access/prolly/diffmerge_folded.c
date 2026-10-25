@@ -12956,25 +12956,6 @@ picked_sources(const char *const *refs, int nrefs)
 	return source != NULL ? list_make1((char *) source) : NIL;
 }
 
-/*
- * How many merges, cherry-picks and reverts this backend is running: one
- * can't run inside another (as from a function the rows the first writes
- * call), whose working set, merge state and privileges it would change
- * under it.
- */
-static int	moves_running = 0;
-
-static void
-move_enter(void)
-{
-	if (moves_running > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a merge, cherry-pick or revert can't run inside another"),
-				 errdetail("It was called while another was moving the branch, as from a function the rows it wrote called.")));
-	moves_running++;
-}
-
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
@@ -12984,18 +12965,22 @@ folded_merge(const char *branch, const char *message, int flags,
 	const char *source = merged_branch(branch);
 	CarriedPrivileges carried;
 	volatile int result;
+	volatile bool begun = false;
 
-	move_enter();
+	prolly_check_not_moving();
 	/* (one merged as a remote's ref, a tag or a commit has none to give) */
 	carry_begin(&carried, source ? list_make1((char *) source) : NIL);
 	PG_TRY();
 	{
+		prolly_move_begin();
+		begun = true;
 		result = merge_held(branch, message, flags, commit_id);
 	}
 	PG_FINALLY();
 	{
+		if (begun)
+			prolly_move_end();
 		carry_stop(&carried);
-		moves_running--;
 	}
 	PG_END_TRY();
 	carry_end(&carried);
@@ -13555,17 +13540,21 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	CarriedPrivileges carried;
 	volatile int result;
+	volatile bool begun = false;
 
-	move_enter();
+	prolly_check_not_moving();
 	carry_begin(&carried, picked_sources(refs, nrefs));
 	PG_TRY();
 	{
+		prolly_move_begin();
+		begun = true;
 		result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
 	}
 	PG_FINALLY();
 	{
+		if (begun)
+			prolly_move_end();
 		carry_stop(&carried);
-		moves_running--;
 	}
 	PG_END_TRY();
 	carry_end(&carried);
@@ -13586,14 +13575,14 @@ folded_apply(const char *ref, const char *fn)
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	ProllyHash	ignored;
 
-	move_enter();
+	prolly_move_begin();
 	PG_TRY();
 	{
 		(void) pick_held(&ref, 1, true, &ignored, fn);
 	}
 	PG_FINALLY();
 	{
-		moves_running--;
+		prolly_move_end();
 	}
 	PG_END_TRY();
 	if (pushed)
@@ -13607,14 +13596,14 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	volatile int result;
 
-	move_enter();
+	prolly_move_begin();
 	PG_TRY();
 	{
 		result = revert_held(refs, nrefs, series_head, commit_id);
 	}
 	PG_FINALLY();
 	{
-		moves_running--;
+		prolly_move_end();
 	}
 	PG_END_TRY();
 	if (pushed)

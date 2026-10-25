@@ -4553,6 +4553,13 @@ copies_recorded_relation(Oid relid, ProllyHash *at)
 	return found;
 }
 
+/*
+ * The record's lines name each relation as table_names() writes it: the
+ * schema's and the relation's names as they are, unquoted, joined by a
+ * dot, so name is matched so, whole.  A record that wrote names another
+ * way (quoted, escaped) would need name written the same way here, or
+ * nothing would match: nothing carried, silently.
+ */
 static bool
 copies_recorded_relid(const char *branch, const char *name, Oid *relid,
 					  ProllyHash *at)
@@ -4966,7 +4973,12 @@ copies_branch_create(const char *name, const char *start_point)
 				 errmsg("branch or commit \"%s\" does not exist", from)));
 	branch_set_head(name, &id);
 	branch_set_baseline(name, NULL, NULL);
-	/* (and its start point's record of its relations, of that head) */
+	/*
+	 * (and its start point's record of its relations, of that head: so a
+	 * history read on it vouches for the head's tables as one on its start
+	 * point does, and its relations' privileges carry as the start
+	 * point's)
+	 */
 	if (from_exists)
 		copy_head_names(from, name, &id);
 }

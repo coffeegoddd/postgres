@@ -118,6 +118,7 @@ tests += {
       'redefined_merges',
       'retyped_merges',
       'merge_grants',
+      'nested_moves',
       'merge_conversions',
       'matview_merges',
       'matview_status',

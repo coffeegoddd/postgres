@@ -263,38 +263,40 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('mg_y2'))[2:2] AS fast_forward;
 SELECT pg_temp.grants('mg.y');
 
--- A pick inside a merge (a check constraint's function the merge's rows
--- call) is refused, as is any move inside another.
-CREATE FUNCTION mg.pick_in(x int) RETURNS bool LANGUAGE plpgsql AS $$
+-- An object access hook installed while a merge runs (a library loaded
+-- from a function its rows call) stays installed after it, and later
+-- merges still carry.
+CREATE FUNCTION mg.load_in(x int) RETURNS bool LANGUAGE plpgsql AS $$
 BEGIN
-	IF coalesce(current_setting('mg.pick', true), '') <> '' THEN
-		PERFORM set_config('mg.pick', '', false);
-		PERFORM dolt_cherry_pick(current_setting('mg.pick_ref'));
+	IF coalesce(current_setting('mg.load', true), '') <> '' THEN
+		PERFORM set_config('mg.load', '', false);
+		EXECUTE 'LOAD ' || quote_literal('test_oat_hooks');
 	END IF;
 	RETURN true;
 END $$;
-CREATE TABLE mg.ck (id int PRIMARY KEY, x int CHECK (mg.pick_in(x)));
+CREATE TABLE mg.ck (id int PRIMARY KEY, x int CHECK (mg.load_in(x)));
 SELECT length(dolt_commit('-Am', 'ck')::text) AS committed;
-SELECT dolt_checkout('-b', 'mg_p') IS NOT NULL AS on_p;
-CREATE TABLE mg.picked (id int PRIMARY KEY);
-GRANT SELECT ON mg.picked TO regress_mg_w;
-SELECT length(dolt_commit('-Am', 'p')::text) AS committed;
-SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_checkout('-b', 'mg_mm') IS NOT NULL AS on_mm;
 INSERT INTO mg.ck VALUES (1, 1);
 CREATE TABLE mg.made (id int PRIMARY KEY);
 GRANT SELECT ON mg.made TO regress_mg_r;
 SELECT length(dolt_commit('-Am', 'mm')::text) AS committed;
+SELECT dolt_checkout('-b', 'mg_mm2') IS NOT NULL AS on_mm2;
+CREATE TABLE mg.made2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.made2 TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'mm2')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 INSERT INTO mg.ck VALUES (2, 2);
 SELECT length(dolt_commit('-Am', 'main moves')::text) AS committed;
-SET mg.pick_ref = 'mg_p';
-SET mg.pick = 'on';
+SET mg.load = 'on';
 SELECT (dolt_merge('mg_mm', '-m', 'mm in'))[2:2] AS fast_forward;
-RESET mg.pick;
--- (alone, it merges, and carries)
-SELECT (dolt_merge('mg_mm', '-m', 'mm in'))[2:2] AS fast_forward;
-SELECT pg_temp.grants('mg.made'), to_regclass('mg.picked') AS picked;
+SELECT pg_temp.grants('mg.made');
+-- (the library's hook audits)
+SET test_oat_hooks.audit = on;
+CREATE TABLE mg.audited (id int PRIMARY KEY);
+RESET test_oat_hooks.audit;
+SELECT (dolt_merge('mg_mm2', '-m', 'mm2 in'))[2:2] AS fast_forward;
+SELECT pg_temp.grants('mg.made2');
 
 SELECT dolt_branch('-D', 'mg_ff');
 SELECT dolt_branch('-D', 'mg_m');
@@ -313,7 +315,7 @@ SELECT dolt_branch('-D', 'mg_w');
 SELECT dolt_branch('-D', 'mg_w2');
 SELECT dolt_branch('-D', 'mg_y');
 SELECT dolt_branch('-D', 'mg_y2');
-SELECT dolt_branch('-D', 'mg_p');
+SELECT dolt_branch('-D', 'mg_mm2');
 SELECT dolt_branch('-D', 'mg_mm');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
