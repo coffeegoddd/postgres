@@ -581,7 +581,8 @@ CREATE FUNCTION test_chunk_put_leaf(vals bytea[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- A hash pointer naming a root (a leaf made by test_chunk_put_leaf) as a
+-- A hash pointer naming a root (a tree made by test_chunk_put_leaf or
+-- test_chunk_items_tree) as a
 -- JSON tree; and the memory this backend's last whole read of a JSON tree
 -- took (its working memory and the document).
 CREATE FUNCTION test_json_tree_pointer(root text)

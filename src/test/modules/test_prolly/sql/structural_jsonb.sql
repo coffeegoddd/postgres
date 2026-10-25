@@ -237,6 +237,17 @@ SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'good'), test_json_tree_
 SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'bad'), test_json_tree_pointer(:'good'));
 SELECT * FROM prolly_jsonb_diff(test_json_tree_pointer(:'good'), test_json_tree_pointer(:'headless'));
 SELECT test_json_tree_pointer(:'bad')::text;
+-- a tree of no items, and one whose item is at the empty path: no
+-- document's, for every reader
+SELECT test_chunk_put_leaf(ARRAY[]::bytea[]) AS empty \gset
+SELECT test_chunk_items_tree(ARRAY[''], ARRAY['n']) AS one_item \gset
+SELECT prolly_jsonb_get(test_json_tree_pointer(:'empty'), '{d}');
+SELECT prolly_jsonb_set(test_json_tree_pointer(:'empty'), '{d}', '1');
+SELECT test_json_tree_pointer(:'empty')::text;
+SELECT prolly_jsonb_get(test_json_tree_pointer(:'one_item'), '{d}');
+SELECT prolly_jsonb_get(test_json_tree_pointer(:'one_item'), '{0}');
+SELECT prolly_jsonb_set(test_json_tree_pointer(:'one_item'), '{d}', '1');
+SELECT test_json_tree_pointer(:'one_item')::text;
 
 -- A whole read takes a bounded multiple of the document's jsonb size,
 -- however many containers it has: here 50 paths 1000 arrays deep.

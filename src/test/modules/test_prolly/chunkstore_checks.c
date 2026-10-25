@@ -2255,6 +2255,8 @@ Datum
 test_json_read_memory(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64((int64) prolly_jsontree_read_memory);
+}
+
 /*
  * A tree of the items keys[i] -> vals[i] (keys in byte order), declaring
  * no references; its root's hash.

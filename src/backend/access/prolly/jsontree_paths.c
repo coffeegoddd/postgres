@@ -427,22 +427,29 @@ walk_jsonb(Walk *w, Jsonb *jb)
  */
 
 /*
- * A document being read is kept as its children's records, in arrays for
- * the whole read, and their keys' and values' bytes, in one arena in the
- * order the items come: so it takes a bounded multiple of the document's
- * jsonb size, however many containers it has.  A container's children are
- * a list of records; a child that is a container of items of its own
- * names its container's record.
+ * A document being read is kept as its children's records, for the whole
+ * read, and their keys' and values' bytes, in one arena in the order the
+ * items come (a child's key, then its value).  Records are allocated in
+ * blocks, so what is allocated is what is used, and each is small: a
+ * child's 16 bytes against the 4 at least it takes in the document, a
+ * container's 24 against 8.  So a read takes at most about 4 times the
+ * document's jsonb size in records, plus the arena (at most its size) and
+ * the document laid out; and assemble_bound() stops a tree whose document
+ * would pass what jsonb holds (JENTRY_OFFLENMASK), so no read takes more
+ * than about 1.5 GB.  (PostgreSQL's own jsonb functions hold a document of
+ * nulls as JsonbValues, of 40 bytes each.)  A container's children are a
+ * list of records; a child that is a container of items of its own names
+ * its container's record.
  */
 typedef struct LayChild
 {
-	uint32		key_off;		/* in the arena */
-	uint32		key_len;
-	uint32		val_off;
-	uint32		val_len;		/* its bytes, without padding */
-	uint32		sub;			/* its container's record + 1, or 0 */
+	uint32		off;			/* its key's bytes in the arena, then its value's */
 	uint32		next;			/* the next child's record + 1, or 0 */
+	uint32		len;			/* its value's bytes, without padding; or
+								 * (sub) its container's record */
+	uint16		key_len;
 	uint8		type;			/* its entry's type */
+	bool		sub;			/* a container of items of its own */
 } LayChild;
 
 typedef struct LayCont
@@ -455,15 +462,19 @@ typedef struct LayCont
 	bool		object;
 } LayCont;
 
+#define REC_SHIFT		12		/* records a block: 4096 */
+#define REC_BLOCK		(1 << REC_SHIFT)
+#define REC_MASK		(REC_BLOCK - 1)
+
 typedef struct Assemble
 {
 	int			strip;			/* the bytes of the path read under */
 	bool		any;
 	StringInfoData arena;
-	LayChild   *children;
+	LayChild  **children;		/* blocks of records */
 	uint32		nchildren;
-	uint32		maxchildren;
-	LayCont    *conts;
+	uint32		maxchildren;	/* (the blocks') */
+	LayCont   **conts;
 	uint32		nconts;
 	uint32		maxconts;
 	uint32	   *open;			/* the open containers' records, outermost first */
@@ -480,15 +491,27 @@ assemble_init(Assemble *as, int strip)
 	memset(as, 0, sizeof(*as));
 	as->strip = strip;
 	initStringInfo(&as->arena);
-	as->maxchildren = 64;
-	as->children = palloc(sizeof(LayChild) * as->maxchildren);
+	as->maxchildren = 16;
+	as->children = palloc(sizeof(LayChild *) * as->maxchildren);
 	as->maxconts = 16;
-	as->conts = palloc(sizeof(LayCont) * as->maxconts);
+	as->conts = palloc(sizeof(LayCont *) * as->maxconts);
 	as->maxdepth = 16;
 	as->open = palloc(sizeof(uint32) * as->maxdepth);
 	steps_init(&as->steps);
 	steps_init(&as->prev_steps);
 	initStringInfo(&as->prev);
+}
+
+static inline LayChild *
+child_at(Assemble *as, uint32 k)
+{
+	return &as->children[k >> REC_SHIFT][k & REC_MASK];
+}
+
+static inline LayCont *
+cont_at(Assemble *as, uint32 k)
+{
+	return &as->conts[k >> REC_SHIFT][k & REC_MASK];
 }
 
 /*
@@ -517,17 +540,21 @@ cont_open(Assemble *as, uint8 tag)
 {
 	LayCont    *c;
 
-	if (as->nconts == as->maxconts)
+	if ((as->nconts & REC_MASK) == 0)
 	{
-		as->maxconts *= 2;
-		as->conts = repalloc_huge(as->conts, sizeof(LayCont) * as->maxconts);
+		if ((as->nconts >> REC_SHIFT) == as->maxconts)
+		{
+			as->maxconts *= 2;
+			as->conts = repalloc(as->conts, sizeof(LayCont *) * as->maxconts);
+		}
+		as->conts[as->nconts >> REC_SHIFT] = palloc(sizeof(LayCont) * REC_BLOCK);
 	}
 	if (as->depth == as->maxdepth)
 	{
 		as->maxdepth *= 2;
 		as->open = repalloc(as->open, sizeof(uint32) * as->maxdepth);
 	}
-	c = &as->conts[as->nconts];
+	c = cont_at(as, as->nconts);
 	memset(c, 0, sizeof(*c));
 	c->object = (tag == STEP_KEY);
 	as->open[as->depth++] = as->nconts;
@@ -538,30 +565,36 @@ cont_open(Assemble *as, uint8 tag)
 static LayChild *
 cont_child(Assemble *as, uint32 ci, const Step *s, const uint8 *key)
 {
-	LayCont    *c = &as->conts[ci];
+	LayCont    *c = cont_at(as, ci);
 	LayChild   *ch;
 
 	if (c->object != (s->tag == STEP_KEY))
 		bad_tree("an object's key and an array's index in one container");
 	if (!c->object && s->n != c->n)
 		bad_tree("an array's indexes with a gap");
-	if (as->nchildren == as->maxchildren)
+	if ((as->nchildren & REC_MASK) == 0)
 	{
-		as->maxchildren *= 2;
-		as->children = repalloc_huge(as->children, sizeof(LayChild) * as->maxchildren);
+		if ((as->nchildren >> REC_SHIFT) == as->maxchildren)
+		{
+			as->maxchildren *= 2;
+			as->children = repalloc(as->children, sizeof(LayChild *) * as->maxchildren);
+		}
+		as->children[as->nchildren >> REC_SHIFT] = palloc(sizeof(LayChild) * REC_BLOCK);
 	}
-	ch = &as->children[as->nchildren];
+	ch = child_at(as, as->nchildren);
 	memset(ch, 0, sizeof(*ch));
+	ch->off = (uint32) as->arena.len;
 	if (c->object)
 	{
-		ch->key_off = (uint32) as->arena.len;
-		ch->key_len = s->n;
+		if (s->n > PG_UINT16_MAX)
+			bad_tree("an object key longer than a key holds");
+		ch->key_len = (uint16) s->n;
 		appendBinaryStringInfo(&as->arena, (const char *) key + s->off + STEP_HEADER,
 							   (int) s->n);
 		c->keys += s->n;
 	}
 	if (c->last)
-		as->children[c->last - 1].next = as->nchildren + 1;
+		child_at(as, c->last - 1)->next = as->nchildren + 1;
 	else
 		c->first = as->nchildren + 1;
 	c->last = ++as->nchildren;
@@ -580,6 +613,7 @@ child_value(Assemble *as, LayChild *ch, const uint8 *val, int len)
 	uint32		type;
 	int			start = as->arena.len;
 
+	Assert((uint32) start == ch->off + ch->key_len);
 	if (len < 1)
 		bad_tree("an item without a value");
 	switch (val[0])
@@ -619,8 +653,7 @@ child_value(Assemble *as, LayChild *ch, const uint8 *val, int len)
 			type = 0;			/* keep compiler quiet */
 	}
 	ch->type = (uint8) (type >> 28);
-	ch->val_off = (uint32) start;
-	ch->val_len = (uint32) (as->arena.len - start);
+	ch->len = (uint32) (as->arena.len - start);
 	assemble_bound(as);
 }
 
@@ -645,20 +678,20 @@ padded(uint32 type)
 static inline uint32
 child_length(Assemble *as, const LayChild *ch)
 {
-	return ch->sub ? as->conts[ch->sub - 1].laid : ch->val_len;
+	return ch->sub ? cont_at(as, ch->len)->laid : ch->len;
 }
 
 /* Container ci's length laid out, its containers' laid already. */
 static uint32
 cont_length(Assemble *as, uint32 ci)
 {
-	LayCont    *c = &as->conts[ci];
+	LayCont    *c = cont_at(as, ci);
 	uint64		rel = sizeof(uint32) +
 		(uint64) (c->object ? c->n * 2 : c->n) * sizeof(JEntry) + c->keys;
 
-	for (uint32 k = c->first; k; k = as->children[k - 1].next)
+	for (uint32 k = c->first; k; k = child_at(as, k - 1)->next)
 	{
-		LayChild   *ch = &as->children[k - 1];
+		LayChild   *ch = child_at(as, k - 1);
 
 		if (padded((uint32) ch->type << 28))
 			rel = INTALIGN(rel);
@@ -676,7 +709,7 @@ cont_length(Assemble *as, uint32 ci)
 static void
 cont_layout(Assemble *as, uint32 ci, StringInfo dst)
 {
-	LayCont    *c = &as->conts[ci];
+	LayCont    *c = cont_at(as, ci);
 	int			start = dst->len;
 	uint32		header = c->n | (c->object ? JB_FOBJECT : JB_FARRAY);
 	uint32		nentries = c->object ? c->n * 2 : c->n;
@@ -692,12 +725,12 @@ cont_layout(Assemble *as, uint32 ci, StringInfo dst)
 	dst->len += nentries * sizeof(JEntry);
 
 	i = 0;
-	for (uint32 k = c->first; c->object && k; k = as->children[k - 1].next, i++)
+	for (uint32 k = c->first; c->object && k; k = child_at(as, k - 1)->next, i++)
 	{
-		LayChild   *ch = &as->children[k - 1];
+		LayChild   *ch = child_at(as, k - 1);
 		JEntry		meta;
 
-		memcpy(dst->data + dst->len, as->arena.data + ch->key_off, ch->key_len);
+		memcpy(dst->data + dst->len, as->arena.data + ch->off, ch->key_len);
 		dst->len += ch->key_len;
 		total += ch->key_len;
 		meta = JENTRY_ISSTRING | ((i % JB_OFFSET_STRIDE) == 0 ?
@@ -705,9 +738,9 @@ cont_layout(Assemble *as, uint32 ci, StringInfo dst)
 		memcpy(entries + i * sizeof(JEntry), &meta, sizeof(meta));
 	}
 	i = 0;
-	for (uint32 k = c->first; k; k = as->children[k - 1].next, i++)
+	for (uint32 k = c->first; k; k = child_at(as, k - 1)->next, i++)
 	{
-		LayChild   *ch = &as->children[k - 1];
+		LayChild   *ch = child_at(as, k - 1);
 		uint32		type = (uint32) ch->type << 28;
 		uint32		len = 0;
 		uint32		index = c->object ? c->n + i : i;
@@ -723,11 +756,12 @@ cont_layout(Assemble *as, uint32 ci, StringInfo dst)
 			len = pad;
 		}
 		if (ch->sub)
-			cont_layout(as, ch->sub - 1, dst);
+			cont_layout(as, ch->len, dst);
 		else
 		{
-			memcpy(dst->data + dst->len, as->arena.data + ch->val_off, ch->val_len);
-			dst->len += ch->val_len;
+			memcpy(dst->data + dst->len, as->arena.data + ch->off + ch->key_len,
+				   ch->len);
+			dst->len += ch->len;
 		}
 		len += child_length(as, ch);
 		total += len;
@@ -744,14 +778,15 @@ static void
 cont_close(Assemble *as, bool checked)
 {
 	uint32		ci = as->open[--as->depth];
-	LayCont    *parent = &as->conts[as->open[as->depth - 1]];
-	LayChild   *ch = &as->children[parent->last - 1];
+	LayCont    *parent = cont_at(as, as->open[as->depth - 1]);
+	LayChild   *ch = child_at(as, parent->last - 1);
 
-	as->conts[ci].laid = cont_length(as, ci);
-	if (checked && as->conts[ci].laid <= PROLLY_JSON_PACK_MAX)
+	cont_at(as, ci)->laid = cont_length(as, ci);
+	if (checked && cont_at(as, ci)->laid <= PROLLY_JSON_PACK_MAX)
 		bad_tree("a container short enough to be one item, as items");
 	ch->type = (uint8) (JENTRY_ISCONTAINER >> 28);
-	ch->sub = ci + 1;
+	ch->sub = true;
+	ch->len = ci;
 }
 
 static void
@@ -825,7 +860,7 @@ assemble_finish(Assemble *as, MemoryContext cxt, uint32 limit, bool checked)
 		return NULL;
 	while (as->depth > 1)
 		cont_close(as, checked);
-	root = &as->conts[as->open[0]];
+	root = cont_at(as, as->open[0]);
 	root->laid = cont_length(as, as->open[0]);
 	if (limit > 0 && root->laid > limit)
 		return NULL;
@@ -1166,6 +1201,11 @@ paths_get(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	initStringInfo(&item);
 	*result = NULL;
 	kind = path_kind(c, &p, NULL);
+	/* (a tree's document is a container of items: none, or one at the
+	 * empty path, is no tree's) */
+	if (kind != PATH_OBJECT && kind != PATH_ARRAY)
+		bad_tree(kind == PATH_NONE ? "a document of no items" :
+				 "an item where its container is");
 	for (int i = 0; i < npath; i++)
 	{
 		Descent		d = descend(kind, path[i], &p);
@@ -1519,6 +1559,11 @@ paths_set(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	initStringInfo(&p);
 	initStringInfo(&item);
 	kind = path_kind(c, &p, NULL);
+	/* (a tree's document is a container of items: none, or one at the
+	 * empty path, is no tree's) */
+	if (kind != PATH_OBJECT && kind != PATH_ARRAY)
+		bad_tree(kind == PATH_NONE ? "a document of no items" :
+				 "an item where its container is");
 	for (int i = 0; i < npath; i++)
 	{
 		bool		last = (i == npath - 1);
