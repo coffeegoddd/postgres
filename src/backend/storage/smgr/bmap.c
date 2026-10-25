@@ -530,6 +530,7 @@ typedef struct BmapShared
 
 	/* the page stores whose syncs are followed (also the mutex's) */
 	int			nsyncs_followed;
+	bool		syncs_overflowed;	/* a flush found no slot */
 	BmapStoreSync syncs_followed[BMAP_SYNCS_FOLLOWED];
 } BmapShared;
 
@@ -635,6 +636,7 @@ BmapShmemInit(void *arg)
 		bmap_shared->next_token = (uint64) GetCurrentTimestamp() << 16;
 	bmap_shared->watch_clock = 0;
 	bmap_shared->nsyncs_followed = 0;
+	bmap_shared->syncs_overflowed = false;
 	for (int i = 0; i < BMAP_WATCHED_MAX; i++)
 	{
 		pg_atomic_init_u64(&bmap_shared->watch_key[i], 0);
@@ -906,6 +908,7 @@ static void sync_store(RelFileLocator rel);
 static void store_flush_begin(RelFileLocator rel);
 static void store_flush_end(RelFileLocator rel);
 static bool store_durable(RelFileLocator rel);
+static bool store_written_out(RelFileLocator rel);
 
 static SMgrRelation
 store_smgr(RelFileLocator rel)
@@ -5168,6 +5171,7 @@ share_changes(SMgrRelation src, SMgrRelation dst)
 		return;
 	xlrec.src = srel;
 	xlrec.dst = drel;
+	xlrec.flags = 0;
 	mdcreate(dst, BMAP_CHANGES_FORKNUM, false);
 
 	/* the header, of no entries yet */
@@ -5766,7 +5770,13 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
  * synced by bmapsyncshares(), at the latest when the transaction commits.
  * Neither is needed when src has no block of its own (every one is held by
  * another map or snapshot already) and the store is durable already
- * (store_durable()): then the blocks are on disk as they are.
+ * (store_durable()): then the blocks are on disk as they are.  At a WAL
+ * level for backups (XLogIsNeeded()), the store isn't synced at all: the
+ * own blocks' images (tree_preserve()) make them durable, as WAL makes any
+ * page, the checkpointer syncing the blocks once they are written out (see
+ * "Durability through WAL" in the prolly README).  Their write is still
+ * needed, but for no own block only while another share's is in flight
+ * (store_written_out()): a relation made of the share reads the blocks.
  *
  * The caller keeps src from changing meanwhile (a lock that waits for its
  * writers): a change made to one of src's buffers before the epochs are
@@ -5789,6 +5799,9 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	XLogRecPtr	lsn;
 	LOCKTAG		sweeptag;
 	BlockList	own = {0};
+
+	/* (tree_preserve() logs images of the own blocks, then) */
+	bool		preserved = XLogIsNeeded();
 
 	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
 		elog(ERROR, "block-mapped relation %s can't share the blocks of %s, in another page store",
@@ -5840,6 +5853,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 		PageGetBmapHeader(BufferGetPage(sheader))->fold_epoch;
 	xlrec.src = srel;
 	xlrec.dst = drel;
+	xlrec.flags = preserved ? BMAP_PRESERVE_LOGGED : 0;
 
 	START_CRIT_SECTION();
 	apply_header_delta(BufferGetPage(sheader), &sdelta);
@@ -5897,19 +5911,27 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 * sync.  What the sync would also have written, other relations' pages
 	 * the kernel holds unwritten, is WAL's to protect and the checkpointer's
 	 * to sync, as any page's.
+	 *
+	 * With the own blocks logged as images (XLogIsNeeded()), the sync isn't
+	 * needed at all, and the record says so, for redo: recovery from a
+	 * checkpoint before an image replays it to the block, and one after
+	 * found the block written and synced by that checkpoint (a page written
+	 * out registers its segment for the checkpointer's sync, and one dirty
+	 * as the checkpoint began is written by it).  WAL holding an image is
+	 * let go of only past such a checkpoint, and a commit relying on the
+	 * share flushes WAL past the images first.
 	 */
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
 	if (own.n == 0)
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
-	if (own.n == 0 && store_durable(srel))
+	if (own.n > 0 || !(preserved ? store_written_out(srel) : store_durable(srel)))
+		FlushRelationsAllBuffers(&src, 1);
+	if (own.n > 0)
+		store_flush_end(srel);
+	if (preserved || (own.n == 0 && store_durable(srel)))
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, 1);
 	else
-	{
-		FlushRelationsAllBuffers(&src, 1);
-		if (own.n > 0)
-			store_flush_end(srel);
 		sync_store_later(srel);
-	}
 	if (own.blocks)
 		pfree(own.blocks);
 }
@@ -6001,6 +6023,8 @@ store_flush_begin(RelFileLocator rel)
 	slot = store_sync_slot(rel, true);
 	if (slot)
 		slot->flushing++;
+	else
+		bmap_shared->syncs_overflowed = true;
 	SpinLockRelease(&bmap_shared->mutex);
 	/* (a store with no slot is never durable: nothing to follow) */
 	if (slot)
@@ -6051,6 +6075,28 @@ store_durable(RelFileLocator rel)
 	durable = slot && slot->flushing == 0 && slot->synced == slot->written;
 	SpinLockRelease(&bmap_shared->mutex);
 	return durable;
+}
+
+/*
+ * Is every block a share of a relation of rel's page store, holding no
+ * block of its own, holds written out already, though perhaps not synced?
+ * As for store_durable(), each was written by the share or snapshot that
+ * first shared it: so when none of those flushes is in flight.  A store
+ * with no slot had none since the server began, unless one found no slot.
+ * Enough where WAL makes the blocks durable (bmapshare()): a relation made
+ * of the share reads the blocks, which must hold the pages by then.
+ */
+static bool
+store_written_out(RelFileLocator rel)
+{
+	BmapStoreSync *slot;
+	bool		written;
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	slot = store_sync_slot(rel, false);
+	written = slot ? slot->flushing == 0 : !bmap_shared->syncs_overflowed;
+	SpinLockRelease(&bmap_shared->mutex);
+	return written;
 }
 
 /*
@@ -6265,7 +6311,9 @@ snapshot_reclaim(SMgrRelation reln)
  * snapshot with no block of its own holds only blocks an earlier share or
  * snapshot wrote out, unchanged since; if every such write was synced
  * already (store_durable()), the sync is skipped, as it would make nothing
- * the snapshot holds durable that isn't (see bmapshare()).
+ * the snapshot holds durable that isn't (see bmapshare()).  At a WAL level
+ * for backups the store isn't synced at all: the own blocks' images, logged
+ * before the snapshot's record, make them durable (see bmapshare()).
  *
  * Only the snapshot's own blocks can hold a page that is only in its
  * buffer: one changed since the relation's last snapshot or share was
@@ -6292,7 +6340,8 @@ bmap_snapshot_take(SMgrRelation reln)
 		store_flush_end(reln->smgr_rlocator.locator);
 	else
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
-	if (own.n == 0 && store_durable(reln->smgr_rlocator.locator))
+	if (XLogIsNeeded() ||
+		(own.n == 0 && store_durable(reln->smgr_rlocator.locator)))
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, 1);
 	else
 		sync_store(reln->smgr_rlocator.locator);
@@ -6345,7 +6394,8 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 	 */
 	for (int i = 0; i < n; i++)
 	{
-		if (own[i].n == 0 && store_durable(rels[i]->smgr_rlocator.locator))
+		if (XLogIsNeeded() ||
+			(own[i].n == 0 && store_durable(rels[i]->smgr_rlocator.locator)))
 			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, 1);
 		else
 			sync_store_later(rels[i]->smgr_rlocator.locator);
@@ -6449,7 +6499,8 @@ snapshot_take_slot(SMgrRelation reln, BlockList *own)
 	}
 	xlrec.locator = rel;
 	xlrec.op = BMAP_TREE_SNAPSHOT;
-	xlrec.flags = 0;
+	/* (tree_preserve() logged images of the own blocks, at this level) */
+	xlrec.flags = XLogIsNeeded() ? BMAP_TREE_PRESERVE_LOGGED : 0;
 	xlrec.node = xlrec.from = InvalidBlockNumber;
 	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
 
@@ -12423,6 +12474,7 @@ bmap_redo(XLogReaderState *record)
 				bool		kept = xlrec->op == BMAP_TREE_SNAPSHOT &&
 					XLogRecHasBlockRef(record, 1);
 				bool		walked = false;
+				bool		preserved = (xlrec->flags & BMAP_TREE_PRESERVE_LOGGED) != 0;
 				const char *why = NULL;
 
 				/* the store reaches a node made, which its image makes */
@@ -12439,13 +12491,17 @@ bmap_redo(XLogReaderState *record)
 					if (data == NULL || len != sizeof(sdelta))
 						elog(PANIC, "block map snapshot record without its slot's delta");
 					memcpy(&sdelta, data, sizeof(sdelta));
-					if (!DataChecksumsNeedVerify())
-						why = "data checksums are off, so a page it would read could be torn";
-					else if (!redo_own_blocks(xlrec->locator, &sdelta.snap,
-											  record->ReadRecPtr, &own))
-						why = "a page of its map or counts read is newer than the replay, unverified, or not the node named";
-					else
-						walked = true;
+					/* (with images logged, nothing is written: below) */
+					if (!preserved)
+					{
+						if (!DataChecksumsNeedVerify())
+							why = "data checksums are off, so a page it would read could be torn";
+						else if (!redo_own_blocks(xlrec->locator, &sdelta.snap,
+												  record->ReadRecPtr, &own))
+							why = "a page of its map or counts read is newer than the replay, unverified, or not the node named";
+						else
+							walked = true;
+					}
 				}
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
@@ -12466,8 +12522,17 @@ bmap_redo(XLogReaderState *record)
 				 * with data checksums off, or once it reads a page newer
 				 * than the replay, one not verified, or one not the node
 				 * the pointer to it names (redo_own_blocks()).
+				 *
+				 * With the own blocks logged as images just before the
+				 * record (at a WAL level for backups), nothing is written:
+				 * redo of each image wrote it to its block, as a page
+				 * written out, which the checkpointer (a restartpoint)
+				 * syncs, and a crash before that replays the image again.
 				 */
-				if (kept)
+				if (kept && preserved)
+					elog(DEBUG1, "redo of a snapshot of %s writes nothing: its own pages were logged as images",
+						 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
+				else if (kept)
 				{
 					SMgrRelation reln = smgropen(xlrec->locator,
 												 INVALID_PROC_NUMBER);
@@ -12623,10 +12688,17 @@ bmap_redo(XLogReaderState *record)
 
 				/*
 				 * As the primary did: the shared blocks get the source's
-				 * pages as of this record, durably.
+				 * pages as of this record, durably.  With the source's own
+				 * blocks logged as images, their redo wrote each to its
+				 * block, as a page written out, which the checkpointer (a
+				 * restartpoint) syncs; the blocks shared already were
+				 * written when they were first shared.
 				 */
-				FlushRelationsAllBuffers(&src, 1);
-				mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
+				if (!(xlrec->flags & BMAP_PRESERVE_LOGGED))
+				{
+					FlushRelationsAllBuffers(&src, 1);
+					mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
+				}
 				break;
 			}
 		default:

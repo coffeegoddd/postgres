@@ -418,6 +418,8 @@ tests += {
       't/412_standby_holder_keeps.pl',
       't/441_store_sync_skipped.pl',
       't/442_store_sync_skip_crash.pl',
+      't/443_wal_durable_shares.pl',
+      't/444_wal_durable_standby.pl',
     ],
   },
 }

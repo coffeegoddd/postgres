@@ -273,7 +273,7 @@ told apart: map work, rows written back, and catalog work.
 | `bmap_refcount_reads` | reference-count pages read to look blocks' counts up: a share's or snapshot's walk reads each page once for the blocks of a map page |
 | `bmap_store_syncs_asked` | shares and snapshots whose blocks a sync of their page store was to make durable |
 | `bmap_store_syncs_asked_no_own` | of those, the ones with no block of their own (every block held elsewhere already) |
-| `bmap_store_syncs_skipped` | of those, the ones that needed no sync, the store durable already |
+| `bmap_store_syncs_skipped` | of those, the ones that needed no sync: all of them at `wal_level` replica or above (WAL makes their blocks durable), and at minimal those with no block of their own once the store is durable |
 | `bmap_store_syncs` | syncs of a whole page store run for shares and snapshots |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
 | `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
