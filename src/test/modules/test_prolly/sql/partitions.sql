@@ -141,9 +141,15 @@ CREATE FUNCTION pg_temp.shape() RETURNS SETOF text LANGUAGE sql AS $$
 $$;
 SELECT * FROM pg_temp.shape();
 SELECT dolt_checkout('pc_cases');
+-- (pt.r, made again on main, is another table there: refused, then
+-- dropped here, with the foreign key into it, for the reset to make
+-- main's; and so back)
+SELECT dolt_reset('--hard', 'main');
+DROP TABLE pt.r CASCADE;
 SELECT dolt_reset('--hard', 'main');
 SELECT * FROM dolt_status;
 SELECT * FROM pg_temp.shape();
+DROP TABLE pt.r CASCADE;
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT * FROM dolt_status;
 SELECT * FROM pg_temp.shape();

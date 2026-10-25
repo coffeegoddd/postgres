@@ -133,6 +133,7 @@ extern void RelationAssumeNewRelfilelocator(Relation relation);
  * Routines for flushing/rebuilding relcache entries in various scenarios
  */
 extern void RelationForgetRelation(Oid rid);
+extern bool RelationForgetForNewRelation(Oid rid);
 
 extern void RelationCacheInvalidateEntry(Oid relationId);
 

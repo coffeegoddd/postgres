@@ -608,12 +608,16 @@ SELECT c.relname::text, 'constraint ' || conname, conislocal, coninhcount
 ORDER BY 1, 2;
 SET test.nsp = 'inh';
 SELECT * INTO TEMP made FROM localities;
+-- (inh.c3, dropped and made again, is another table at each commit:
+-- dropped here first, each reset makes the commit's)
+DROP TABLE inh.c3;
 SELECT dolt_reset('--hard', :'parents');
  dolt_reset 
 ------------
  {0}
 (1 row)
 
+DROP TABLE inh.c3;
 SELECT dolt_reset('--hard', :'children');
  dolt_reset 
 ------------

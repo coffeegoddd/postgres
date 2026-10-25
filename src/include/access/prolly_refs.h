@@ -79,6 +79,22 @@ typedef struct ProllyCommitInfo
 } ProllyCommitInfo;
 
 /*
+ * A table in a merge's table identity conflict: the merge kept it as the
+ * branch has it, as theirs, under the name, is another relation (another
+ * table, made apart from it: dropped and made again, or made on both
+ * sides), or it is in an inheritance or partition tree with one that is.
+ */
+typedef struct ProllyIdentityConflict
+{
+	char	   *name;			/* here (qualified) */
+	char	   *their_name;		/* in theirs */
+	Oid			relid;			/* the relation here (InvalidOid: none) */
+	Oid			their_relid;	/* theirs (InvalidOid: none, or unrecorded) */
+	int			tree;			/* the tree it is kept with: the members of
+								 * one are resolved together */
+} ProllyIdentityConflict;
+
+/*
  * A merge (or cherry-pick) in progress on a branch: it stopped with
  * conflicts in tables, which must be resolved before its commit is made.
  */
@@ -96,6 +112,11 @@ typedef struct ProllyMergeState
 								 * has them (names, qualified; palloc'd) */
 	char	  **schema_base_tables; /* each one's name in the base */
 	char	  **schema_their_tables;	/* and in theirs */
+	int			nidentity;
+	ProllyIdentityConflict *identity;	/* in table identity conflicts
+										 * (palloc'd) */
+	char	   *identity_source;	/* the local branch theirs was the head
+									 * of, or NULL */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -770,23 +791,14 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Optional: the relations commit was made from, as this database made
-	 * it: *relations, a ProllyCommitRelation for each prolly table
-	 * (palloc'd); false for a commit made elsewhere (fetched, cloned,
-	 * pushed here) or before they were kept.  A history read takes a
+	 * it: *relations, a ProllyCommitRelation for each prolly table and
+	 * partitioned table (palloc'd); false for a commit made elsewhere
+	 * (fetched, cloned, pushed here) or before they were kept.  A history read takes a
 	 * version for the session's table only along commits made from the
 	 * table's relation.
 	 */
 	bool		(*commit_relations) (const ProllyHash *commit,
 									 List **relations);
-
-	/*
-	 * Optional: relation relid's equivalence class, the relation it is the
-	 * same table as (relid itself, if none is recorded), and setting it: a
-	 * relation a move made again of a table, or a merge of the other
-	 * side's, is the same table as the one it comes from.
-	 */
-	Oid			(*relation_class) (Oid relid);
-	void		(*set_relation_class) (Oid relid, Oid cls);
 
 	/*
 	 * Optional, together: each maker the refs record (a branch's, a tag's,
@@ -853,7 +865,7 @@ extern PGDLLIMPORT List *prolly_commit_local_tables;
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
-	"commit_relations", "relation_class", "set_relation_class", \
+	"commit_relations", \
 	"made_object", "stash_set_maker"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK stash_set_maker

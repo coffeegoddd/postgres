@@ -32,7 +32,14 @@ INSERT INTO app.u VALUES (6, 'six');
 CREATE TABLE app.same (k int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'main rows')::text) AS committed;
 
+-- (app.same, made on both sides, is two tables: a table identity
+-- conflict, resolved with the feature's, which main then has)
+BEGIN;
 SELECT (dolt_merge('feature'))[2:4];
+SELECT table_name FROM dolt_identity_conflicts();
+SELECT dolt_conflicts_resolve('--theirs', 'app.same');
+SELECT length(dolt_commit('-m', 'Merge branch ''feature'' into main')::text) AS committed;
+COMMIT;
 SELECT dolt_hashof('HEAD^2') = dolt_hashof('feature') AS merge_commit;
 SELECT * FROM dolt_status();
 SELECT * FROM app.t ORDER BY id;
@@ -119,7 +126,9 @@ SELECT length(dolt_commit('-Am', 'mr main')::text) AS committed;
 SELECT (dolt_merge('mr_side'))[2:4];
 SELECT * FROM mr.t ORDER BY id;
 
--- A table both sides made alike merges its rows three-way.
+-- A table both sides made alike is two tables, each made apart: a table
+-- identity conflict, its rows not merged; resolved with theirs, the
+-- table is the side's, its rows the side's.
 SELECT dolt_branch('-D', 'mr_side');
 SELECT dolt_branch('mr_side');
 SELECT dolt_checkout('mr_side') IS NOT NULL AS on_side;
@@ -130,8 +139,14 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 CREATE TABLE mr.both (k int PRIMARY KEY);
 INSERT INTO mr.both VALUES (1);
 SELECT length(dolt_commit('-Am', 'main makes both')::text) AS committed;
+BEGIN;
 SELECT (dolt_merge('mr_side'))[2:4];
+SELECT table_name FROM dolt_identity_conflicts();
 SELECT * FROM mr.both ORDER BY k;
+SELECT dolt_conflicts_resolve('--theirs', 'mr.both');
+SELECT * FROM mr.both ORDER BY k;
+SELECT length(dolt_commit('-m', 'both merged')::text) AS committed;
+COMMIT;
 
 -- A column one side narrows, where the other side changed the table too, is
 -- a schema conflict, as in Dolt: ours narrows it, theirs adds a row too

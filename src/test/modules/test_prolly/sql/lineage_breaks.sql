@@ -10,6 +10,24 @@
 CREATE DATABASE regress_lineage_breaks;
 \c regress_lineage_breaks
 CREATE EXTENSION test_prolly;
+-- (a merge whose other side has another relation of a table's name stops
+-- on a table identity conflict: here kept as the branch has it, and the
+-- merge committed; the tables kept, as their names)
+CREATE FUNCTION pg_temp.merge_ours(branch text, message text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	kept text;
+BEGIN
+	PERFORM set_config('dolt.allow_commit_conflicts', 'on', true);
+	PERFORM dolt_merge('--no-ff', '-m', message, branch);
+	SELECT string_agg(table_name, ', ' ORDER BY table_name) INTO kept
+	  FROM dolt_identity_conflicts();
+	IF kept IS NOT NULL THEN
+		PERFORM dolt_conflicts_resolve('--ours', '.');
+		PERFORM dolt_commit('-m', message);
+	END IF;
+	RETURN kept;
+END $$;
 CREATE SCHEMA ln VERSIONED;
 CREATE TABLE ln.t (id int PRIMARY KEY, note text);
 INSERT INTO ln.t VALUES (1, 'old secret');
@@ -58,8 +76,11 @@ SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
 SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
--- a merge of a branch that still has the old table
-SELECT (dolt_merge('--no-ff', '-m', 'merged keeps_old', 'keeps_old'))[3] AS conflicts;
+-- a merge of a branch that still has the old table: another table there,
+-- a table identity conflict, kept as the branch has it (its rows not
+-- merged); the merge's other parent holds the old table, no version of
+-- this one
+SELECT pg_temp.merge_ours('keeps_old', 'merged keeps_old') AS kept;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.t) ORDER BY id;
@@ -142,20 +163,17 @@ SELECT dolt_checkout('main');
 SELECT dolt_hashof('main') AS before_k \gset
 SELECT dolt_branch('k3', dolt_hashof('keeps_old')) IS NOT NULL AS made;
 SELECT dolt_checkout('k3') IS NOT NULL AS on_k3;
-SELECT (dolt_merge('-m', 'main into k3', 'main'))[3] AS conflicts;
+SELECT pg_temp.merge_ours('main', 'main into k3') AS kept;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-SELECT (dolt_merge('--no-ff', '-m', 'k3 in', 'k3'))[3] AS conflicts;
+SELECT pg_temp.merge_ours('k3', 'k3 in') AS kept;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^2^1', NULL::ln.t);
 SELECT count(*) AS rows_now FROM ln.t;
--- (k3's merge of main made its table again, a relation of its own, and
--- main's merge of k3 brought in k3's version whole, so it made main's
--- table again, of k3's table's class: k3's merge reads, as main's table
--- holds its rows; main's history before it is another relation's now, and
--- is refused)
+-- (each merge kept its branch's table: main's history reads, k3's is
+-- the old table's, refused)
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
@@ -171,7 +189,7 @@ SELECT dolt_checkout('late2') IS NOT NULL AS on_late2;
 INSERT INTO ln.t VALUES (3, 'late2 row');
 SELECT length(dolt_commit('-am', 'late2 row')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-SELECT (dolt_merge('--no-ff', '-m', 'late2 in', 'late2'))[3] AS conflicts;
+SELECT pg_temp.merge_ours('late2', 'late2 in') AS kept;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
@@ -208,15 +226,15 @@ SELECT format('CREATE TABLE ln.%I (id int PRIMARY KEY)',
 :forge;
 SELECT length(dolt_commit('-Am', 'forged')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-SELECT (dolt_merge('--no-ff', '-m', 'forger in', 'forger'))[3] AS conflicts;
+SELECT pg_temp.merge_ours('forger', 'forger in') AS kept;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t);
 SELECT * FROM dolt_at('forger', NULL::ln.t);
 RESET ROLE;
 -- (the forging table's own history is its own, its name read back as it
--- was: merged in, it is of the class of the relation forger's record lists
--- under that name)
+-- was: merged in, it is the relation forger's record lists under that
+-- name, its OID kept)
 SELECT E'a\n' || :'new_relid' || E' ln.t\nb' AS forge_name \gset
 SELECT format('GRANT SELECT ON ln.%I TO regress_lb_reader', :'forge_name') AS grant_forge \gset
 :grant_forge;
@@ -228,9 +246,8 @@ RESET ROLE;
 SELECT dolt_reset('--hard', :'before_f') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
--- a table made on a branch and merged in is a relation made here, of the
--- class of the branch's relation it was made from: its branch's history
--- is its grantee's
+-- a table made on a branch and merged in is the branch's relation, made
+-- here of its OID: its branch's history is its grantee's
 SELECT dolt_branch('feature') IS NOT NULL AS made;
 SELECT dolt_checkout('feature') IS NOT NULL AS on_feature;
 CREATE TABLE ln.f (id int PRIMARY KEY);
@@ -275,7 +292,7 @@ BEGIN
 		INSERT INTO ln.t VALUES (100 + i, 'old chain');
 		PERFORM dolt_commit('-am', 'chain ' || i);
 		IF i % 4 = 0 THEN
-			PERFORM dolt_merge('-m', 'main into chain', 'main');
+			PERFORM pg_temp.merge_ours('main', 'main into chain');
 		END IF;
 	END LOOP;
 END $$;
@@ -290,21 +307,20 @@ SELECT pg_stat_force_next_flush();
 SELECT value - :read_before <= 3 * :chain_commits AS linear
 FROM pg_stat_prolly WHERE name = 'commits_read';
 
--- the old table's branch merging main in, then merged back (a
--- fast-forward): the merge is of the old table's relation, so the head is
--- no version of this one's
+-- the old table's branch merging main in, then merged back (no
+-- fast-forward: the table is another there, a conflict kept): the merge is
+-- of the old table's relation, so its head is no version of this one's
 SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
-SELECT (dolt_merge('-m', 'main into old', 'main'))[3] AS conflicts;
+SELECT pg_temp.merge_ours('main', 'main into old') AS kept;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
-SELECT (dolt_merge('keeps_old'))[2] AS fast_forward;
+SELECT pg_temp.merge_ours('keeps_old', 'old in') AS kept;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old~', NULL::ln.t);
 SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
--- (and the head, of the old table's relation, cuts the table's own
--- history off from the working set: it fails closed)
+-- (and the head, the branch's own merge, keeps the table's own history)
 SELECT * FROM dolt_at(:'new_commit', NULL::ln.t);
 RESET ROLE;
 
@@ -351,6 +367,9 @@ SET ROLE regress_lb_reader;
 SELECT * FROM lb_snap.sm;
 RESET ROLE;
 SELECT prolly_unmount('lb_snap');
+-- (the table made again, uncommitted, is another than the head's: dropped
+-- for the reset to make the head's again; so after each)
+DROP TABLE ln.sm;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
@@ -359,6 +378,7 @@ SELECT (dolt_cherry_pick(:'to_pick'))[1] IS NOT NULL AS picked;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
 RESET ROLE;
+DROP TABLE ln.sp;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
@@ -367,6 +387,7 @@ SELECT (dolt_revert(:'to_revert'))[1] IS NOT NULL AS reverted;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
 RESET ROLE;
+DROP TABLE ln.sr;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
@@ -400,6 +421,7 @@ SET ROLE regress_lb_reader;
 SELECT * FROM lb_snap2.sm;
 RESET ROLE;
 SELECT prolly_unmount('lb_snap2');
+DROP TABLE ln.sm;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
@@ -408,6 +430,7 @@ SELECT (dolt_cherry_pick(:'alter_pick'))[1] IS NOT NULL AS picked;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
 RESET ROLE;
+DROP TABLE ln.sp;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
@@ -416,6 +439,7 @@ SELECT (dolt_revert(:'alter_revert'))[1] IS NOT NULL AS reverted;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
 RESET ROLE;
+DROP TABLE ln.sr;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
@@ -435,11 +459,13 @@ RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
--- a class is no branch's entry: a branch named as a relation's class is
--- keyed, its merge's conflicted names written and dropped, leaves it
+-- a table a branch's first use makes again (its copy redefined back) keeps
+-- its relation, so its commits read; a branch named as that relation's OID
+-- is keyed, its merge's conflicted names written and dropped, leaving it
 CREATE TABLE ln.c (id int PRIMARY KEY, a int, note text);
 GRANT SELECT ON ln.c TO regress_lb_reader;
 SELECT length(dolt_commit('-Am', 'c')::text) AS committed;
+SELECT 'ln.c'::regclass::oid AS c_oid \gset
 SELECT dolt_branch('c_late') IS NOT NULL AS made;
 ALTER TABLE ln.c DROP COLUMN a;
 SELECT length(dolt_commit('-am', 'c without a')::text) AS committed;
@@ -447,7 +473,7 @@ SELECT dolt_checkout('c_late') IS NOT NULL AS on_late;
 INSERT INTO ln.c VALUES (1, 1, 'late c');
 SELECT length(dolt_commit('-am', 'late c row')::text) AS committed;
 SELECT lpad('ln.c'::regclass::oid::text, 10, '0') AS c_relid \gset
-SELECT test_refs_value('J' || :'c_relid') IS NOT NULL AS classed;
+SELECT 'ln.c'::regclass::oid = :c_oid AS same_relation;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SET ROLE regress_lb_reader;
 SELECT id, note FROM dolt_at('c_late', NULL::ln.c);
@@ -514,7 +540,8 @@ SELECT prolly_unmount('lb_mnt');
 
 -- uncommitted changes set aside for a move that changes definitions, and
 -- put back after it, are the branch's own: a table made again in the
--- working set doesn't join the class of the other side's table of its name
+-- working set stays its own relation, not the other side's table of its
+-- name
 CREATE TABLE ln.p (id int PRIMARY KEY, note text);
 CREATE TABLE ln.pu (id int PRIMARY KEY);
 INSERT INTO ln.p VALUES (1, 'old secret p');
@@ -532,17 +559,17 @@ SELECT dolt_hashof('HEAD') AS p_ralter \gset
 DROP TABLE ln.p;
 SELECT length(dolt_commit('-Am', 'dropped p')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS p_dropped \gset
--- (a cherry-pick: the table made again has no class of another's)
+-- (a cherry-pick: the table made again stays its own relation)
 CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+SELECT 'ln.p'::regclass::oid AS p_made \gset
 SELECT (dolt_cherry_pick(:'p_alter'))[1] IS NOT NULL AS picked;
-SELECT test_refs_value('J' || lpad('ln.p'::regclass::oid::text, 10, '0')) IS NULL
-	AS own_class;
+SELECT 'ln.p'::regclass::oid = :p_made AS own_relation;
 SELECT dolt_reset('--hard', :'p_dropped') IS NOT NULL AS back;
 -- (a revert, of a commit whose parent has the old table: the same)
 CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+SELECT 'ln.p'::regclass::oid AS p_made \gset
 SELECT (dolt_revert(:'p_ralter'))[1] IS NOT NULL AS reverted;
-SELECT test_refs_value('J' || lpad('ln.p'::regclass::oid::text, 10, '0')) IS NULL
-	AS own_class;
+SELECT 'ln.p'::regclass::oid = :p_made AS own_relation;
 SELECT dolt_reset('--hard', :'p_dropped') IS NOT NULL AS back;
 -- (a merge, then the side merged again: the side's commits, and the old
 -- table's, stay another table's)

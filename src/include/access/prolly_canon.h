@@ -540,6 +540,13 @@ typedef struct ProllyCanonRoutine
 	 * in the server's encoding), in root's order, from its items alone.
 	 */
 	List	   *(*table_names) (const ProllyNodeRef *root, const char *schema);
+
+	/*
+	 * Optional: the tables (qualified and quoted, in the server's encoding)
+	 * a table as description describes it inherits from, or is a partition
+	 * of: its parents, whose rows a read of them reads with its own.
+	 */
+	List	   *(*table_parents) (const ProllyValue *description);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -551,17 +558,38 @@ typedef struct ProllyCanonRoutine
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects", "table_metadata", \
-	"table_names"
+	"table_names", "table_parents"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK table_names
+#define PROLLY_CANON_LAST_CALLBACK table_parents
 
 /*
  * While set, the commits (ProllyHash *) a move takes its versions from: a
- * table the move makes joins the equivalence class of the relation a
- * commit of them was made from for its name (refs' relation_class()); one
- * it makes again of a table stays in that table's class.
+ * table the move makes is the relation (by OID) a commit of them was made
+ * from for its name, as its record says; one it makes again stays the
+ * relation it was (prolly_move_kept_relid()).
  */
 extern PGDLLIMPORT List *prolly_move_provenance;
+
+/*
+ * The OID a table the session's move makes now (named relname, in schema
+ * relnamespace) is to have, if the branch has no relation of it: the
+ * relation its version is of, or the one it was, before it was made again
+ * (InvalidOid: a new one).  heap_create_with_catalog() asks it.
+ */
+extern Oid	prolly_move_kept_relid(const char *relname, Oid relnamespace);
+
+/*
+ * While set, the relations (ProllyKeptRelation *) tables a move makes are
+ * to be, by name, before any prolly_move_provenance records: a merge's
+ * conflict resolution making the other side's relation the branch's.
+ */
+typedef struct ProllyKeptRelation
+{
+	char	   *name;			/* qualified, quoted as roots name tables */
+	Oid			relid;
+} ProllyKeptRelation;
+
+extern PGDLLIMPORT List *prolly_move_kept;
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,
