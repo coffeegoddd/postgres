@@ -122,25 +122,33 @@ extern void prolly_check_branch_rename(const char *newname);
 /*
  * Whether a move bringing versions from the commits provenance
  * (nprovenance of them) may bring a table here another table's version:
- * false, and prolly_remake_foreign_versions() would make nothing again.
+ * false, and prolly_refuse_foreign_versions() would refuse nothing.
  */
 extern bool prolly_versions_may_be_foreign(const ProllyHash *provenance,
 										   int nprovenance);
 
 /*
- * After a move from before (the branch folded then) bringing versions from
- * the commits provenance (nprovenance of them): the tables whose versions
- * it changed to another table's (by the records of those commits, under
- * the table's name) made again, relations of their own, of the class of
- * the relation whose version they hold (and made, a commit the move made
- * of them, if not NULL, recorded made from the new relations).  owner
- * InvalidOid: made as the session's role, refused with a clear error if it
- * can't; else as each table's owner, then given to owner.
+ * Refuse a move from before (the branch folded before it) of versions from
+ * the commits provenance (nprovenance of them; bases, nbases of them: a
+ * merge's base, a pick's parent, a reverted commit) that put into a table
+ * here another table's version: one that a commit of them made here
+ * records, under the table's name, as made from a relation of another
+ * class.  Called after the move, before its transaction can commit: the
+ * error undoes all it wrote.  A table the branch hadn't is made by the
+ * move, a relation of its own.  kind: the move, for the error's hint.
  */
-extern void prolly_remake_foreign_versions(const ProllyNodeRef *before,
+typedef enum ProllyForeignMove
+{
+	PROLLY_FOREIGN_MOVE,		/* a reset, merge, pick, revert, ... */
+	PROLLY_FOREIGN_FIRST_USE,	/* a branch's first use */
+	PROLLY_FOREIGN_PUSH,		/* a push's move of a branch */
+} ProllyForeignMove;
+
+extern void prolly_refuse_foreign_versions(const ProllyNodeRef *before,
 										   const ProllyHash *provenance,
 										   int nprovenance,
-										   const ProllyHash *made, Oid owner);
+										   const ProllyHash *bases, int nbases,
+										   ProllyForeignMove kind);
 
 /*
  * The branches, tags and stashes roles made, as the role commands see them:

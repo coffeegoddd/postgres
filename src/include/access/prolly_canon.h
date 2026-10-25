@@ -564,14 +564,6 @@ typedef struct ProllyCanonRoutine
 extern PGDLLIMPORT List *prolly_move_provenance;
 
 /*
- * While set, the tables (qualified names) move_schema() makes again, as
- * new relations (each a class of its own), though the move changes neither
- * their definitions nor their rows: a version of another relation's, which
- * a move brought into the table's (see prolly_remake_foreign_versions()).
- */
-extern PGDLLIMPORT List *prolly_move_remade;
-
-/*
  * The tree environment of folded canonical trees: the chunk store's,
  * ordered by bytes.
  */

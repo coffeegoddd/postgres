@@ -2455,19 +2455,18 @@ typedef struct MoveSettled
 
 /*
  * The branch's copies moved to the commit (move_settled()), the tables it
- * makes in the classes of the relations the commit was made from, and then
- * its tables whose versions are of another table than the commit was made
- * from made again, relations of their own, the mover's
- * (prolly_remake_foreign_versions()), as a hard reset's are.
+ * makes in the classes of the relations the commit was made from; refused,
+ * the error undoing it, if it put into a table another table's version
+ * (prolly_refuse_foreign_versions()), as a hard reset is.
  */
 static void
-move_settled_remade(void *arg)
+move_settled_checked(void *arg)
 {
 	MoveSettled *ms = arg;
 	ProllyNodeRef before;
-	bool		had;
+	bool		folded;
 
-	had = prolly_versions_may_be_foreign(&ms->head, 1) &&
+	folded = prolly_versions_may_be_foreign(&ms->head, 1) &&
 		copies_working_set(NULL, &before);
 	prolly_move_provenance = list_make1(&ms->head);
 	PG_TRY();
@@ -2479,8 +2478,9 @@ move_settled_remade(void *arg)
 		prolly_move_provenance = NIL;
 	}
 	PG_END_TRY();
-	if (had)
-		prolly_remake_foreign_versions(&before, &ms->head, 1, NULL, InvalidOid);
+	if (folded)
+		prolly_refuse_foreign_versions(&before, &ms->head, 1, NULL, 0,
+									   PROLLY_FOREIGN_PUSH);
 }
 
 /*
@@ -3327,14 +3327,13 @@ copies_hold_unseen(void)
 }
 
 /* A first use's move: to target, from copies of source's (NULL: none). */
-static void move_copies_remade(void *arg);
+static void move_copies_checked(void *arg);
 
 typedef struct MoveCopies
 {
 	const ProllyCommitInfo *commit;
 	const KnownSource *source;
 	ProllyHash	head;			/* the commit moved to */
-	Oid			owner;			/* the branch's owner */
 } MoveCopies;
 
 /*
@@ -3883,10 +3882,9 @@ materialize(const char *name)
 		/* (the tables it makes take their classes from the head's record) */
 		prolly_move_provenance = list_make1(&head);
 		mc.head = head;
-		mc.owner = prolly_branch_owner(name);
 		PG_TRY(_provenance);
 		{
-			branch_ops()->run_on(name, move_copies_remade, &mc);
+			branch_ops()->run_on(name, move_copies_checked, &mc);
 		}
 		PG_FINALLY(_provenance);
 		{
@@ -3905,26 +3903,24 @@ done:
 }
 
 /*
- * A first use's move (move_copies()), then its tables whose copies are of
- * another table than its head was made from made again, relations of their
- * own (prolly_remake_foreign_versions()): the copies are of the nearest
- * source's relations, whatever commit they are moved to.  Made as each
- * table's owner, the least role that may (whoever first uses the branch,
- * and whatever its owner may), and given to the branch's owner, whose
- * branch it is.
+ * A first use's move (move_copies()), refused, the error undoing it, if a
+ * table's copy took another table's version
+ * (prolly_refuse_foreign_versions()): the copies are of the nearest
+ * source's relations, whatever commit they are moved to.
  */
 static void
-move_copies_remade(void *arg)
+move_copies_checked(void *arg)
 {
 	MoveCopies *mc = arg;
 	ProllyNodeRef before;
-	bool		had;
+	bool		folded;
 
-	had = prolly_versions_may_be_foreign(&mc->head, 1) &&
+	folded = prolly_versions_may_be_foreign(&mc->head, 1) &&
 		copies_working_set(NULL, &before);
 	move_copies(arg);
-	if (had)
-		prolly_remake_foreign_versions(&before, &mc->head, 1, NULL, mc->owner);
+	if (folded)
+		prolly_refuse_foreign_versions(&before, &mc->head, 1, NULL, 0,
+									   PROLLY_FOREIGN_FIRST_USE);
 }
 
 static void
@@ -4775,22 +4771,6 @@ note_relations(const ProllyHash *commit, const char *lines)
 	refs_put(key.data, key.len, &v);
 	pfree(key.data);
 	pfree(v.data);
-}
-
-/* Record commit as made from relations (ProllyCommitRelation *). */
-static void
-copies_set_commit_relations(const ProllyHash *commit, List *relations)
-{
-	StringInfoData lines;
-	ListCell   *lc;
-
-	refs_init();
-	initStringInfo(&lines);
-	foreach(lc, relations)
-		relation_line(&lines, ((ProllyCommitRelation *) lfirst(lc))->relid,
-					  ((ProllyCommitRelation *) lfirst(lc))->name);
-	note_relations(commit, lines.data);
-	pfree(lines.data);
 }
 
 /*
@@ -7843,9 +7823,9 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 				MoveSettled ms = {&info, *head};
 
 				if (strcmp(name, branch_ops()->current()) == 0)
-					move_settled_remade(&ms);
+					move_settled_checked(&ms);
 				else
-					branch_ops()->run_on(name, move_settled_remade, &ms);
+					branch_ops()->run_on(name, move_settled_checked, &ms);
 			}
 		}
 		PG_FINALLY();
@@ -8681,7 +8661,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.stash_maker = copies_stash_maker,
 	.commit_relations = copies_commit_relations,
 	.relation_class = copies_relation_class,
-	.set_commit_relations = copies_set_commit_relations,
 	.set_relation_class = copies_set_relation_class,
 	.made_object = copies_made_object,
 	.stash_set_maker = copies_stash_set_maker,

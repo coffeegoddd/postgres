@@ -1176,61 +1176,85 @@ typedef struct VersionMove
 {
 	const ProllyHash *from;		/* the commits it takes versions from */
 	int			n;
+	const ProllyHash *bases;	/* and their bases */
+	int			nbases;
 	bool		folded;			/* before is the branch folded before it */
 	ProllyNodeRef before;
-	bool		had_head;
-	ProllyHash	head;			/* the head before it */
 } VersionMove;
 
+/*
+ * Before the move: the branch folded, if a table here may take another
+ * table's version from the commits or their bases, as their records alone
+ * tell (cheaply: else nothing is folded, nor checked after).
+ */
 static void
-version_move_begin(VersionMove *vm, const ProllyHash *from, int n)
+version_move_begin(VersionMove *vm, const ProllyHash *from, int n,
+				   const ProllyHash *bases, int nbases)
 {
 	vm->from = from;
 	vm->n = n;
-	vm->had_head = PROLLY_CALL(refs(), resolve, "HEAD", &vm->head);
-	vm->folded = n > 0 && prolly_versions_may_be_foreign(from, n) &&
+	vm->bases = bases;
+	vm->nbases = nbases;
+	vm->folded = n > 0 &&
+		(prolly_versions_may_be_foreign(from, n) ||
+		 (nbases > 0 && prolly_versions_may_be_foreign(bases, nbases))) &&
 		PROLLY_CALL(refs(), working_set, NULL, &vm->before);
 }
 
 /*
- * After the move: its tables whose versions came from another table's
- * commits made again, relations of their own
- * (prolly_remake_foreign_versions()), as the session's role; and the
- * commit it made, if it made one (the head moved, not to a commit of
- * those), recorded made from them.
+ * After it: refused, before the transaction can commit (the error undoes
+ * what it wrote), if it put into a table here another table's version
+ * (prolly_refuse_foreign_versions()).
  */
 static void
 version_move_end(VersionMove *vm)
 {
-	ProllyHash	now;
-	bool		made;
+	if (vm->folded)
+		prolly_refuse_foreign_versions(&vm->before, vm->from, vm->n, vm->bases,
+									   vm->nbases, PROLLY_FOREIGN_MOVE);
+}
 
-	if (!vm->folded)
-		return;
-	made = PROLLY_CALL(refs(), resolve, "HEAD", &now) &&
-		!(vm->had_head && same_hash(&now, &vm->head));
-	for (int i = 0; made && i < vm->n; i++)
-		if (same_hash(&now, &vm->from[i]))
-			made = false;
-	BRANCH_WRITES_HUSHED(prolly_remake_foreign_versions(&vm->before, vm->from,
-														vm->n, made ? &now : NULL,
-														InvalidOid));
+/* The merge base of the session's head and commit (len 0: none). */
+static ProllyHash
+base_with_head(const ProllyHash *commit)
+{
+	ProllyHash	head;
+	ProllyHash	base = {0};
+
+	if (commit->len > 0 && PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+		!PROLLY_CALL(refs(), merge_base, &head, commit, &base))
+		memset(&base, 0, sizeof(base));
+	return base;
+}
+
+/* The first parent of commit (into *parent); false if it has none. */
+static bool
+first_parent(const ProllyHash *commit, ProllyHash *parent)
+{
+	ProllyCommitInfo info;
+
+	if (commit->len == 0 || !PROLLY_CALL(refs(), commit_get, commit, &info) ||
+		info.nparents == 0)
+		return false;
+	*parent = info.parents[0];
+	return true;
 }
 
 /*
  * Every move that brings a commit's table versions into the session's
  * branch (a reset, a merge, a pick, a revert, a table's checkout, a
- * stash's apply, a conflict's resolution) runs as VERSION_MOVE(), with the
- * commits it takes them from (from_, n_ of them): its writes hushed, its
- * tables' classes taken from those commits' records (WITH_PROVENANCE()),
- * and, where one of those records says a table's new version is another
- * table's, the table made again after it (version_move_end()).  A branch's
- * first use, and a push's move of a branch, do the same in the refs.
+ * stash's apply, a conflict's resolution, an abort) runs as
+ * VERSION_MOVE(), with the commits it takes them from (from_, n_ of them)
+ * and their bases (bases_, nbases_): its writes hushed, its tables'
+ * classes taken from those commits' records (WITH_PROVENANCE()), and
+ * refused if it put into a table here another table's version
+ * (version_move_end()).  A branch's first use, and a push's move of a
+ * branch, are checked so in the refs.
  */
-#define VERSION_MOVE(from_, n_, ...) \
+#define VERSION_MOVE(from_, n_, bases_, nbases_, ...) \
 	do { \
 		VersionMove vm_; \
-		version_move_begin(&vm_, (from_), (n_)); \
+		version_move_begin(&vm_, (from_), (n_), (bases_), (nbases_)); \
 		WITH_PROVENANCE(from_, n_, BRANCH_WRITES_HUSHED(__VA_ARGS__)); \
 		version_move_end(&vm_); \
 	} while (0)
@@ -1988,7 +2012,8 @@ checkout_tables(const char *ref, char **names, int nnames)
 	 * it; the branch may be its head's again, its changes all put back)
 	 */
 	branch_note_write(MyBranch);
-	VERSION_MOVE(&commit, 1, PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	VERSION_MOVE(&commit, 1, NULL, 0,
+				 PROLLY_CALL(diff_merge(), move_to, &target, &working));
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
@@ -2517,7 +2542,8 @@ abort_in_progress(const char *what)
 
 	branch_note_write(MyBranch);
 	(void) PROLLY_CALL(refs(), resolve, "HEAD", &head);
-	VERSION_MOVE(&head, head.len > 0 ? 1 : 0, PROLLY_CALL(refs(), reset, "HEAD"));
+	VERSION_MOVE(&head, head.len > 0 ? 1 : 0, NULL, 0,
+				 PROLLY_CALL(refs(), reset, "HEAD"));
 	settled();
 }
 
@@ -2697,7 +2723,9 @@ dolt_merge(PG_FUNCTION_ARGS)
 	date_given = dated;
 	PG_TRY();
 	{
-		VERSION_MOVE(&theirs, theirs.len > 0 ? 1 : 0,
+		ProllyHash	base = base_with_head(&theirs);
+
+		VERSION_MOVE(&theirs, theirs.len > 0 ? 1 : 0, &base, base.len > 0 ? 1 : 0,
 					 conflicts = PROLLY_CALL(diff_merge(), merge, branch, message,
 											 flags, &id));
 	}
@@ -3327,8 +3355,13 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	/* (the tables it makes take their classes from mine's head's record) */
-	VERSION_MOVE(&mine_head, mine_head.len > 0 ? 1 : 0,
-				 conflicts = PROLLY_CALL(diff_merge(), merge, mine, message, 0, &id));
+	{
+		ProllyHash	base = base_with_head(&mine_head);
+
+		VERSION_MOVE(&mine_head, mine_head.len > 0 ? 1 : 0, &base,
+					 base.len > 0 ? 1 : 0,
+					 conflicts = PROLLY_CALL(diff_merge(), merge, mine, message, 0, &id));
+	}
 	if (conflicts > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3342,8 +3375,12 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	/* and the branch, fast-forwarded to target's new head */
 	checkout_branch(mine);
 	note_integration();
-	VERSION_MOVE(&id, id.len > 0 ? 1 : 0,
-				 (void) PROLLY_CALL(diff_merge(), merge, target, NULL, 0, &ignored));
+	{
+		ProllyHash	base = base_with_head(&id);
+
+		VERSION_MOVE(&id, id.len > 0 ? 1 : 0, &base, base.len > 0 ? 1 : 0,
+					 (void) PROLLY_CALL(diff_merge(), merge, target, NULL, 0, &ignored));
+	}
 	settled();
 
 	branch_return_done(returning);
@@ -3492,7 +3529,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 		ProllyHash	target = {0};
 
 		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
-		VERSION_MOVE(&target, target.len > 0 ? 1 : 0,
+		VERSION_MOVE(&target, target.len > 0 ? 1 : 0, NULL, 0,
 					 PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	}
 	settled();
@@ -3650,7 +3687,7 @@ dolt_stash(PG_FUNCTION_ARGS)
 			ProllyHash	at = {0};
 
 			(void) PROLLY_CALL(refs(), resolve, "HEAD", &at);
-			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
+			VERSION_MOVE(&at, at.len > 0 ? 1 : 0, NULL, 0,
 						 PROLLY_CALL(refs(), reset, "HEAD"));
 		}
 		settled();
@@ -3676,8 +3713,14 @@ dolt_stash(PG_FUNCTION_ARGS)
 		 * refuses it, and the branch is left with its changes)
 		 */
 		branch_note_write(MyBranch);
-		VERSION_MOVE(&stash, 1,
-					 PROLLY_CALL(diff_merge(), apply, hash_hex(&stash), "dolt_stash"));
+		{
+			ProllyHash	stash_base = {0};
+			bool		based = first_parent(&stash, &stash_base);
+
+			VERSION_MOVE(&stash, 1, &stash_base, based ? 1 : 0,
+						 PROLLY_CALL(diff_merge(), apply, hash_hex(&stash),
+									 "dolt_stash"));
+		}
 		if (strcmp(cmd, "pop") == 0)
 			(void) PROLLY_CALL(refs(), stash_drop, name, n);
 	}
@@ -4105,8 +4148,12 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	picked = {0};
 
+		ProllyHash	parent = {0};
+		bool		has_parent;
+
 		(void) PROLLY_CALL(refs(), resolve, ref, &picked);
-		VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0,
+		has_parent = first_parent(&picked, &parent);
+		VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0, &parent, has_parent ? 1 : 0,
 					 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
 											 allow_empty, &id));
 	}
@@ -4147,6 +4194,7 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 	{
 		ProllyHash *from = palloc0(sizeof(ProllyHash) * Max(n, 1));
 		int			nfrom = 0;
+		ProllyHash *reverted = palloc0(sizeof(ProllyHash) * Max(n, 1));
 
 		/* (a revert brings back what each commit's parent had) */
 		for (int i = 0; i < n; i++)
@@ -4156,9 +4204,12 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 
 			if (PROLLY_CALL(refs(), resolve, ids[i], &c) &&
 				PROLLY_CALL(refs(), commit_get, &c, &info) && info.nparents > 0)
+			{
+				reverted[nfrom] = c;
 				from[nfrom++] = info.parents[0];
+			}
 		}
-		VERSION_MOVE(from, nfrom,
+		VERSION_MOVE(from, nfrom, reverted, nfrom,
 					 stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
 										   series_head, &id));
 	}
@@ -4244,7 +4295,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 			note_integration();
 			if (abort_revert)
 			{
-				VERSION_MOVE(&ms.series_head, 1,
+				VERSION_MOVE(&ms.series_head, 1, NULL, 0,
 							 PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
 				settled();
 			}
@@ -4982,8 +5033,13 @@ rebase_continue(const char **result)
 		{
 			ProllyHash	picked = {0};
 
+			ProllyHash	parent = {0};
+			bool		has_parent;
+
 			(void) PROLLY_CALL(r, resolve, ref, &picked);
-			VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0,
+			has_parent = first_parent(&picked, &parent);
+			VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0, &parent,
+						 has_parent ? 1 : 0,
 						 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
 												 true, &id));
 		}
@@ -9266,6 +9322,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		bool		merging = PROLLY_CALL(refs(), merge_state, &theirs);
 
 		VERSION_MOVE(&theirs.theirs, merging && theirs.theirs.len > 0 ? 1 : 0,
+					 &theirs.base, merging && theirs.base.len > 0 ? 1 : 0,
 					 foreach(lc, tables)
 						 PROLLY_CALL(diff_merge(), resolve, lfirst_oid(lc), side == 2));
 	}
@@ -10898,7 +10955,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 			ProllyHash	at = {0};
 
 			(void) PROLLY_CALL(refs(), resolve, tracking, &at);
-			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
+			VERSION_MOVE(&at, at.len > 0 ? 1 : 0, NULL, 0,
 						 PROLLY_CALL(remote_refs(), reset, tracking));
 		}
 		else

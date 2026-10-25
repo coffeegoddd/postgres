@@ -101,9 +101,6 @@
 #include "catalog/partition.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_namespace.h"
-#include "commands/tablecmds.h"
-#include "utils/acl.h"
 #include "commands/sequence.h"
 #include "common/hashfn.h"
 #include "common/int.h"
@@ -4823,298 +4820,102 @@ prolly_versions_may_be_foreign(const ProllyHash *provenance, int n)
 	return false;
 }
 
-/* Relation relid's owner. */
-static Oid
-relation_owner(Oid relid)
+/* Table name of tables (NULL: none). */
+static Table *
+version_named(const Tables *tables, const char *name)
 {
-	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	Oid			owner;
+	ListCell   *lc;
 
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for relation %u", relid);
-	owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
-	ReleaseSysCache(tup);
-	return owner;
+	foreach(lc, tables->tables)
+		if (strcmp(((Table *) lfirst(lc))->name, name) == 0)
+			return lfirst(lc);
+	return NULL;
 }
 
-/*
- * Does table t (as the move left it) hold the one commit of provenance's
- * version of it, as that commit has it: the move put that version in
- * whole (a reset, a table's checkout, a first use), not a mix of it and
- * the branch's (a merge, a pick)?
- */
+/* Do two versions of a table differ, in rows or definition? */
 static bool
-held_whole(const ProllyHash *provenance, int n, const Table *t)
+versions_differ(const Table *a, const Table *b)
 {
-	ProllyNodeRef root;
-	Tables		p = {NIL};
-	ListCell   *lc;
-
-	if (n != 1 ||
-		!PROLLY_CALL(components().refs, commit_working_set, &provenance[0], &root))
-		return false;
-	read_tables(&root, &p);
-	foreach(lc, p.tables)
-	{
-		Table	   *f = lfirst(lc);
-
-		if (strcmp(f->name, t->name) == 0)
-			return same_hash(&f->data.hash, &t->data.hash) &&
-				f->textlen == t->textlen &&
-				memcmp(f->text, t->text, t->textlen) == 0;
-	}
-	return false;
-}
-
-/* A table prolly_remake_foreign_versions() makes again. */
-typedef struct Remade
-{
-	char	   *name;
-	Oid			old_relid;
-	Oid			owner;			/* the table's owner */
-	Oid			from;			/* the class of the version it holds */
-} Remade;
-
-/*
- * Make the tables of remade again whose owner is owner, as move_schema()
- * makes a table again (prolly_move_remade), the working set as it is.
- */
-static void
-remake_tables(List *remade, Oid owner)
-{
-	ProllyDatabaseComponents dc = components();
-	ProllyNodeRef now;
-	List	   *names = NIL;
-	ListCell   *lc;
-
-	foreach(lc, remade)
-	{
-		Remade	   *rm = lfirst(lc);
-
-		if (rm->owner == owner)
-			names = lappend(names, rm->name);
-	}
-	if (names == NIL)
-		return;
-	(void) PROLLY_CALL(dc.refs, working_set, NULL, &now);
-	prolly_move_remade = names;
-	PG_TRY();
-	{
-		PROLLY_CALL(dc.canonicalizer, move_schema, &now, &now, move_rows,
-					NULL, (void *) &now, true);
-	}
-	PG_FINALLY();
-	{
-		prolly_move_remade = NIL;
-	}
-	PG_END_TRY();
+	return !same_hash(&a->data.hash, &b->data.hash) || a->textlen != b->textlen ||
+		memcmp(a->text, b->text, a->textlen) != 0;
 }
 
 /*
- * Refuse a move that would make table name (relation relid) again, as the
- * role it acts as, if the role can't: what dropping and making it takes,
- * the table's ownership and CREATE on its schema.
- */
-static void
-check_may_remake(const char *name, Oid relid)
-{
-	Oid			nsp = get_rel_namespace(relid);
-
-	if (object_ownercheck(RelationRelationId, relid, GetUserId()) &&
-		object_aclcheck(NamespaceRelationId, nsp, GetUserId(),
-						ACL_CREATE) == ACLCHECK_OK)
-		return;
-	ereport(ERROR,
-			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("permission denied to move table \"%s\" to another table's version",
-					name),
-			 errdetail("The version this moves to is of a table of that name dropped and made again since, another relation, so the move makes the table again, a relation of its own, without the table's grants."),
-			 errhint("Making the table again takes its ownership and CREATE on schema \"%s\": the table's owner can make the move.",
-					 get_namespace_name(nsp))));
-}
-
-/*
- * After a move from before (the branch folded then) that brought versions
- * from the commits provenance (the commit moved to, a merge's other side,
- * the commit a pick takes or a revert goes back to, a stash's, a merge's
- * other side resolved): each table whose version the move changed, and
- * whose version under its name a commit of them made here was made from a
- * relation of another class (foreign_version()), is made again, a relation
- * of its own (a new OID, no grants), its rows as the move left them.  The
- * relation's grants, which covered the rows its own history holds, don't
- * cover those another table's version brought.  A new relation that holds
- * the version whole (held_whole(): a reset's, a table's checkout's, a first
- * use's) is of the class of the relation the version is of, the same table
- * as that one: so a later move to that version (a reset that discards
- * changes) keeps it.  One that holds a mix (a merge's, a pick's) is a class
- * of its own.
- *
- * owner InvalidOid: the tables are made again as the session's role,
- * whose they are, refused if it can't (check_may_remake()).  Else (a
- * branch's first use): as each table's owner, the least role that may,
- * restricted, the new table then given to owner.  A commit made elsewhere
- * (fetched, cloned, pushed here: no record) can't be told so, and keeps
- * the relation; its versions stay refused to history reads.  A table the
- * branch's merge has conflicts in is told of its new relation.
+ * Refuse a move that put into a table here another table's version (see
+ * prolly_config.h), raised before the transaction that made it can
+ * commit, so that nothing it wrote is kept: the tables whose version the
+ * move changed from before's (the branch folded before it) or that hold
+ * the merge's conflicts, and whose version under their name a commit of
+ * provenance or of bases made here was made from a relation of another
+ * class (foreign_version()).  Compared as the move left the tables, under
+ * the names it left them (a merge matches tables by identity, a rename
+ * followed).  Every member of an inheritance or partition tree is a table
+ * of its own here, so another table's version of any one of them refuses
+ * the whole move.
  */
 void
-prolly_remake_foreign_versions(const ProllyNodeRef *before,
+prolly_refuse_foreign_versions(const ProllyNodeRef *before,
 							   const ProllyHash *provenance, int nprovenance,
-							   const ProllyHash *made, Oid owner)
+							   const ProllyHash *bases, int nbases,
+							   ProllyForeignMove kind)
 {
 	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef after;
 	Tables		b = {NIL};
 	Tables		a = {NIL};
-	List	   *relations;
-	List	   *remade = NIL;
-	List	   *owners = NIL;
+	List	   *conflicted = NIL;
+	ProllyMergeState ms;
+	StringInfoData names;
+	int			nforeign = 0;
+	char	   *first = NULL;
 	ListCell   *lc;
 
-	if (!PROLLY_CALL(dc.refs, working_set, NULL, &after) ||
-		same_hash(&before->hash, &after.hash))
+	if (!PROLLY_HAS(dc.refs, relation_class) ||
+		!PROLLY_CALL(dc.refs, working_set, NULL, &after))
+		return;
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		for (int i = 0; i < ms.ntables; i++)
+			conflicted = lappend_oid(conflicted, ms.tables[i]);
+	if (same_hash(&before->hash, &after.hash) && conflicted == NIL)
 		return;
 	read_tables(before, &b);
 	read_tables(&after, &a);
+	initStringInfo(&names);
 	foreach(lc, a.tables)
 	{
 		Table	   *t = lfirst(lc);
-		Table	   *f = NULL;
-		Oid			relid;
+		Table	   *f = version_named(&b, t->name);
+		Oid			relid = rel_named(t->name, true);
+		Oid			cls;
 		Oid			from;
-		ListCell   *bc;
-		Remade	   *rm;
 
-		foreach(bc, b.tables)
-			if (strcmp(((Table *) lfirst(bc))->name, t->name) == 0)
-				f = lfirst(bc);
-		/* (a table the move made is a relation of its own already) */
-		if (f == NULL ||
-			(same_hash(&f->data.hash, &t->data.hash) && f->textlen == t->textlen &&
-			 memcmp(f->text, t->text, t->textlen) == 0))
+		/* (a table the move made is a relation of its own) */
+		if (f == NULL || !OidIsValid(relid) ||
+			get_rel_relkind(relid) != RELKIND_RELATION ||
+			(!versions_differ(f, t) && !list_member_oid(conflicted, relid)))
 			continue;
-		relid = rel_named(t->name, true);
-		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
-			!foreign_version(provenance, nprovenance, t->name, relid,
-							 PROLLY_CALL(dc.refs, relation_class, relid), &from))
+		cls = PROLLY_CALL(dc.refs, relation_class, relid);
+		if (!foreign_version(provenance, nprovenance, t->name, relid, cls, &from) &&
+			!foreign_version(bases, nbases, t->name, relid, cls, &from))
 			continue;
-		if (!OidIsValid(owner))
-			check_may_remake(t->name, relid);
-		rm = palloc(sizeof(Remade));
-		rm->name = pstrdup(t->name);
-		rm->old_relid = relid;
-		rm->owner = relation_owner(relid);
-		rm->from = held_whole(provenance, nprovenance, t) ? from : InvalidOid;
-		remade = lappend(remade, rm);
-		owners = list_append_unique_oid(owners, rm->owner);
+		if (nforeign++ > 0)
+			appendStringInfoString(&names, ", ");
+		appendStringInfo(&names, "\"%s\"", t->name);
+		if (first == NULL)
+			first = t->name;
 	}
-	if (remade == NIL)
+	if (nforeign == 0)
 		return;
-	if (!OidIsValid(owner))
-	{
-		/* (as the session's role, every table at once) */
-		foreach(lc, remade)
-			((Remade *) lfirst(lc))->owner = InvalidOid;
-		remake_tables(remade, InvalidOid);
-	}
-	else
-	{
-		foreach(lc, owners)
-		{
-			Oid			save_user;
-			int			save_sec;
-
-			GetUserIdAndSecContext(&save_user, &save_sec);
-			SetUserIdAndSecContext(lfirst_oid(lc),
-								   save_sec | SECURITY_LOCAL_USERID_CHANGE |
-								   SECURITY_RESTRICTED_OPERATION);
-			PG_TRY();
-			{
-				remake_tables(remade, lfirst_oid(lc));
-			}
-			PG_FINALLY();
-			{
-				SetUserIdAndSecContext(save_user, save_sec);
-			}
-			PG_END_TRY();
-		}
-	}
-	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_WRITTEN, list_length(remade));
-
-	/*
-	 * (each the class of the version it holds, the given owner's, and the
-	 * merge's conflicts in it of the new relation)
-	 */
-	{
-		ProllyMergeState ms;
-		bool		have_ms = PROLLY_CALL(dc.refs, merge_state, &ms);
-		bool		ms_changed = false;
-
-		foreach(lc, remade)
-		{
-			Remade	   *rm = lfirst(lc);
-			Oid			now = rel_named(rm->name, true);
-
-			if (!OidIsValid(now))
-				continue;
-			if (OidIsValid(rm->from) && PROLLY_HAS(dc.refs, set_relation_class))
-				PROLLY_CALL(dc.refs, set_relation_class, now, rm->from);
-			if (OidIsValid(owner) && relation_owner(now) != owner)
-				ATExecChangeOwner(now, owner, true, AccessExclusiveLock);
-			for (int i = 0; have_ms && i < ms.ntables; i++)
-				if (ms.tables[i] == rm->old_relid)
-				{
-					ms.tables[i] = now;
-					ms_changed = true;
-				}
-		}
-		if (ms_changed)
-			PROLLY_CALL(dc.refs, set_merge_state, &ms);
-	}
-
-	/*
-	 * (a commit the move made of them is made from the new relations: its
-	 * record says so, each remade table's line of its old relation now of
-	 * its new)
-	 */
-	if (made != NULL && PROLLY_HAS(dc.refs, commit_relations) &&
-		PROLLY_HAS(dc.refs, set_commit_relations) &&
-		PROLLY_CALL(dc.refs, commit_relations, made, &relations))
-	{
-		List	   *out = NIL;
-		ListCell   *rc;
-
-		foreach(rc, relations)
-		{
-			ProllyCommitRelation *r = lfirst(rc);
-			bool		replaced = false;
-			ListCell   *mc;
-
-			foreach(mc, remade)
-			{
-				Remade	   *rm = lfirst(mc);
-
-				if (r->relid == rm->old_relid)
-				{
-					Oid			now = rel_named(rm->name, true);
-
-					if (OidIsValid(now))
-					{
-						ProllyCommitRelation *n = palloc(sizeof(ProllyCommitRelation));
-
-						n->relid = now;
-						n->name = rm->name;
-						out = lappend(out, n);
-					}
-					replaced = true;
-					break;
-				}
-			}
-			if (!replaced)
-				out = lappend(out, r);
-		}
-		PROLLY_CALL(dc.refs, set_commit_relations, made, out);
-	}
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg_plural("cannot move table %s to a version that belongs to a different table",
+						   "cannot move tables %s to versions that belong to different tables",
+						   nforeign, names.data),
+			 errdetail("The version of \"%s\" this moves to was made here from another relation of that name, a table dropped and made again since: another relation's lineage, which this table's isn't.",
+					   first),
+			 kind == PROLLY_FOREIGN_FIRST_USE ?
+			 errhint("Start the branch from a commit or branch whose tables are of this lineage.") :
+			 errhint("Drop the table on this branch first: the move then makes it a new relation, with no grants.")));
 }
 
 /*

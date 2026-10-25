@@ -7954,7 +7954,6 @@ partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
 }
 
 List	   *prolly_move_provenance = NIL;
-List	   *prolly_move_remade = NIL;
 
 /*
  * A table a move makes a relation of again, or makes: its name, and the
@@ -7988,9 +7987,7 @@ move_classes_before(List *from, List *to, List *remade)
 		MoveClass  *mc;
 		Oid			relid;
 
-		/* (one made again as a relation of its own starts a class of its own) */
-		if (find_item(to, 't', lfirst(lc)) == NULL ||
-			list_has_string(prolly_move_remade, lfirst(lc)))
+		if (find_item(to, 't', lfirst(lc)) == NULL)
 			continue;
 		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(lc), NULL)),
 								 NoLock, true);
@@ -8234,8 +8231,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			from_names = lappend(from_names, first_field(lfirst(lc)));
 		foreach(lc, to->columns)
 			to_names = lappend(to_names, first_field(lfirst(lc)));
-		remake = table_remade(from, to) ||
-			list_has_string(prolly_move_remade, name);
+		remake = table_remade(from, to);
 	}
 	if (from != NULL && (from->partition_of == NULL) != (to->partition_of == NULL))
 		ereport(ERROR,
@@ -10389,12 +10385,6 @@ inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 	List	   *cons = NIL;
 	ListCell   *lc;
 
-	/* (a table, or a table it inherits from, made again as one of its own) */
-	if (list_has_string(prolly_move_remade, name))
-		return false;
-	foreach(lc, td->inherits)
-		if (list_has_string(prolly_move_remade, lfirst(lc)))
-			return false;
 	foreach(lc, td->inherits)
 	{
 		MoveItem   *pf = find_item(from, 't', lfirst(lc));
@@ -11013,8 +11003,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (f->kind != 't' ||
 			(t && strcmp(t->def, f->def) == 0 &&
 			 !list_has_string(tm.tables, f->name) &&
-			 !list_has_string(tm.detached, f->name) &&
-			 !list_has_string(prolly_move_remade, f->name)))
+			 !list_has_string(tm.detached, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
 		/* type_moves() detaches it first; move_table() restores to's link. */
@@ -11336,8 +11325,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * if any changes, or a view or a type they may use does: all of them,
 	 * each after those it uses (one going takes no other with it).
 	 */
-	matviews_change = tm.any || view_drops != NIL || foreign_remade ||
-		prolly_move_remade != NIL;
+	matviews_change = tm.any || view_drops != NIL || foreign_remade;
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);

@@ -801,14 +801,6 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*made_object) (Oid classId, Oid id, StringInfo name, int *n);
 	void		(*stash_set_maker) (const char *name, int n, Oid role);
-
-	/*
-	 * Optional: record commit as made from relations (as
-	 * commit_relations() gives them): a move that made a commit and then
-	 * made one of its tables again, a relation of its own, says so.
-	 */
-	void		(*set_commit_relations) (const ProllyHash *commit,
-										 List *relations);
 } ProllyRefsRoutine;
 
 /*
@@ -862,9 +854,9 @@ extern PGDLLIMPORT List *prolly_commit_local_tables;
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", "relation_class", "set_relation_class", \
-	"made_object", "stash_set_maker", "set_commit_relations"
+	"made_object", "stash_set_maker"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK set_commit_relations
+#define PROLLY_REFS_LAST_CALLBACK stash_set_maker
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
