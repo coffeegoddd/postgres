@@ -1,0 +1,253 @@
+-- A hard reset to a commit whose kept pages are gone, from a working set
+-- with many changes, gives each table the pages kept as of the head first
+-- (O(1), as a reset to the head does), then writes only the rows the head
+-- and the commit differ by: not those and every row changed since the
+-- head.  A branch reset back and forth between two commits keeps losing
+-- one's pages (each restore gives a table new storage, and the snapshot
+-- the other commit was kept by goes with the old storage), so this is the
+-- reset that case takes.
+SELECT current_database() AS home \gset
+CREATE DATABASE kept_head_restore;
+\c kept_head_restore
+SET client_min_messages = warning;
+CREATE EXTENSION amcheck;
+RESET client_min_messages;
+-- (the counters a move counts, read once the session's are flushed)
+CREATE FUNCTION counted() RETURNS TABLE (name text, value bigint)
+LANGUAGE sql AS $$
+	SELECT n, coalesce((SELECT p.value FROM pg_stat_prolly p WHERE p.name = n), -1)
+	FROM unnest('{apply_rows,relations_restored}'::text[]) n
+$$;
+CREATE FUNCTION since(before jsonb) RETURNS jsonb LANGUAGE sql AS $$
+	SELECT jsonb_object_agg(c.name, c.value - (before ->> c.name)::bigint)
+	FROM counted() c
+$$;
+CREATE FUNCTION now_counted() RETURNS jsonb LANGUAGE sql AS $$
+	SELECT jsonb_object_agg(name, value) FROM counted()
+$$;
+CREATE SCHEMA kh VERSIONED;
+CREATE TABLE kh.t (id bigint PRIMARY KEY, v int NOT NULL, w text NOT NULL);
+CREATE INDEX t_v ON kh.t (v);
+INSERT INTO kh.t SELECT g, 0, 'w' || g FROM generate_series(1, 5000) g;
+CREATE FUNCTION indexes_valid() RETURNS bool LANGUAGE sql AS $$
+	SELECT bool_and(bt_index_check(i.indexrelid, true) IS NOT NULL)
+	FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+	JOIN pg_am a ON a.oid = c.relam AND a.amname = 'btree'
+	WHERE i.indrelid IN (SELECT oid FROM pg_class
+						 WHERE relnamespace = 'kh'::regnamespace)
+$$;
+CREATE FUNCTION rows_digest() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(t::text, ',' ORDER BY id)) FROM kh.t
+$$;
+CREATE FUNCTION clean() RETURNS bool LANGUAGE sql AS
+$$SELECT NOT EXISTS (SELECT FROM dolt_status)$$;
+SELECT (dolt_commit('-Am', 'a'))[1] AS a \gset
+SELECT rows_digest() AS at_a \gset
+-- b: 50 rows changed
+UPDATE kh.t SET v = 1 WHERE id % 100 = 0;
+SELECT (dolt_commit('-am', 'b'))[1] AS b \gset
+SELECT rows_digest() AS at_b \gset
+-- Back and forth: to a (its pages given back), to b (b's went with the
+-- storage a's restore replaced: its 50 rows written), to a again (given
+-- back), so b's pages are gone and a's, the head's, are kept.
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT rows_digest() = :'at_a' AS at_a, clean();
+ at_a | clean 
+------+-------
+ t    | t
+(1 row)
+
+-- 1,000 rows changed in the working set, then a hard reset to b: the
+-- head's pages given back, and only b's 50 rows written
+UPDATE kh.t SET v = 2, w = w || 'x' WHERE id % 5 = 1;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
+	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
+ applied | restored 
+---------+----------
+      50 | t
+(1 row)
+
+SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
+ at_b | clean | indexes_valid 
+------+-------+---------------
+ t    | t     | t
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) AS at_v1 FROM kh.t WHERE v = 1;
+ at_v1 
+-------
+    50
+(1 row)
+
+SELECT count(*) AS at_v2 FROM kh.t WHERE v = 2;
+ at_v2 
+-------
+     0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- A working set a few rows from the commit (fewer than
+-- prolly.restore_min_changes): the head's pages aren't given back, the
+-- few rows written as they are
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+UPDATE kh.t SET v = 1 WHERE id = 100;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (since(:'before') ->> 'relations_restored')::int AS restored;
+ restored 
+----------
+        0
+(1 row)
+
+SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
+ at_b | clean | indexes_valid 
+------+-------+---------------
+ t    | t     | t
+(1 row)
+
+-- A table a kept checkout has as the target is given that checkout's
+-- storage when writing the rows that differ costs more (move_tables_shared).
+-- Telling that needs only whether more rows differ than the share costs:
+-- the count stops once it knows, reading a few nodes for each change past
+-- the share's cost, not the whole diff (here about 2,700 nodes read in all,
+-- against 5,100 when the whole diff was counted).  (Kept pages out of the
+-- way: none restored, so the share decides.)
+SET prolly.kept_commits = 0;
+CREATE TABLE kh.wide (id int PRIMARY KEY, pad text NOT NULL);
+INSERT INTO kh.wide SELECT g, repeat(md5(g::text), 6) FROM generate_series(1, 50000) g;
+SELECT (dolt_commit('-Am', 'wide'))[1] AS wide \gset
+CREATE FUNCTION wide_digest() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(w::text, ',' ORDER BY id)) FROM kh.wide w
+$$;
+SELECT dolt_checkout(:'wide') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT wide_digest() AS at_wide \gset
+SELECT dolt_checkout('main') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+UPDATE kh.wide SET pad = pad || 'x' WHERE id % 4 = 0;
+SELECT length(dolt_commit('-am', 'wide changed')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+INSERT INTO seen SELECT name, value FROM pg_stat_prolly
+	WHERE name IN ('nodes_read', 'move_tables_shared');
+SELECT dolt_reset('--hard', :'wide') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT p.name, CASE WHEN p.name = 'nodes_read' THEN (p.value - s.n < 4000)::int
+	ELSE p.value - s.n END AS grew
+FROM pg_stat_prolly p JOIN seen s USING (name) ORDER BY 1;
+        name        | grew 
+--------------------+------
+ move_tables_shared |    1
+ nodes_read         |    1
+(2 rows)
+
+SELECT wide_digest() = :'at_wide' AS as_wide, clean(), indexes_valid();
+ as_wide | clean | indexes_valid 
+---------+-------+---------------
+ t       | t     | t
+(1 row)
+
+RESET prolly.kept_commits;
+\c :home
+DROP DATABASE kept_head_restore;

@@ -228,6 +228,7 @@ tests += {
       'bmap_tree_share',
       'bmap_tree_snapshots',
       'kept_pages',
+      'kept_head_restore',
       'first_use_kept',
       'branch_catalog_index',
       'kept_commit_shares',

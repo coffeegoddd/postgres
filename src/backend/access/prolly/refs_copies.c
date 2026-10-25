@@ -1963,6 +1963,13 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 #define SHARE_RELATION_USEC	300
 #define SHARE_BLOCKS_PER_USEC	64
 
+/*
+ * Nodes the count of a table's changes reads, at most, for each change
+ * sharing must beat: a change makes a node or two differ at each level of
+ * each tree, so more nodes than this differing means more changes.
+ */
+#define SHARE_NODES_PER_CHANGE	16
+
 /* A root's table, as tables() visits it. */
 typedef struct NamedTree
 {
@@ -2006,6 +2013,26 @@ count_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	(*(uint64 *) arg)++;
+}
+
+/*
+ * Do more than past keys differ between from and to?  Only that is asked,
+ * so the count stops reading once it is known: by the tree's estimate,
+ * which reads no more than SHARE_NODES_PER_CHANGE nodes for each of the
+ * past changes and is never below the count (so at most past means at most
+ * past), and is cut short, past it, only where that many nodes differ.
+ */
+static bool
+changes_past(const ProllyTreeEnv *denv, const ProllyNodeRef *from,
+			 const ProllyNodeRef *to, uint64 past)
+{
+	uint64		changes = 0;
+
+	if (PROLLY_HAS(tree, diff_estimate))
+		return PROLLY_CALL(tree, diff_estimate, denv, from, to,
+						   (past + 1) * SHARE_NODES_PER_CHANGE) > past;
+	PROLLY_CALL(tree, diff, denv, from, to, count_change, &changes);
+	return changes > past;
 }
 
 /*
@@ -2290,7 +2317,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
 		ShareSource *s;
-		uint64		changes = 0;
 		uint64		blocks;
 		Oid			relid;
 		List	   *relids;
@@ -2306,11 +2332,11 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
-		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
-					&changes);
-		if ((double) changes * MOVE_ROW_USEC <=
-			(double) list_length(relids) * SHARE_RELATION_USEC +
-			(double) blocks / SHARE_BLOCKS_PER_USEC)
+		/* (shared if the rows that differ cost more to write) */
+		if (!changes_past(&denv, &o->data, &t->data,
+						  (uint64) (((double) list_length(relids) * SHARE_RELATION_USEC +
+									 (double) blocks / SHARE_BLOCKS_PER_USEC) /
+									MOVE_ROW_USEC)))
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
@@ -3049,41 +3075,33 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 }
 
 /*
- * Before a move of the session's branch to commit: if its pages are kept
- * as of the commit, each table's given back (those that changed since,
- * O(1) each), and its baseline entry made the kept one's.  A table not on
- * the branch as it was then (another name, other relations, storage
- * replaced since), or not restored (a lock not free, its snapshot gone),
- * is left for the move to write, as is one with so few rows changed that
- * writing them costs less (few_changes()).
+ * Give the session branch's tables back the pages kept as of commit
+ * (was, in the branch's list kept), but those named in skip: each that
+ * changed since (O(1) each), whose baseline entry is then the kept one's.
+ * A table not on the branch as it was then (another name, other
+ * relations, storage replaced since), or not restored (a lock not free,
+ * its snapshot gone), is left for the move to write, as is one with so few
+ * rows changed that writing them costs less (few_changes()), or, with
+ * moving_to, one that few rows of the working set changed from as that
+ * commit holds it: the move writes those few.  The tables
+ * restored are added to *restored, and *baseline spliced with the kept
+ * one's entries for them; *kept is the branch's list with the commit kept
+ * anew (by the restored tables' new storage), to be put once the restores
+ * are done.
  */
 static void
-restore_pages(const ProllyCommitInfo *commit)
+restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
+			 KeptCommit *was, List **kept, List *skip,
+			 const ProllyNodeRef *moving_to, ProllyNodeRef *baseline,
+			 List **restored)
 {
-	ProllyDatabaseComponents dc;
-	char	   *name;
-	List	   *kept;
 	KeptCommit *kc;
-	KeptCommit *was;
-	List	   *restored = NIL;
 	List	   *tables = NIL;
 	List	   *readable = NIL;
-	ProllyNodeRef baseline;
+	List	   *targets = NIL;
+	List	   *now = NIL;
 	ProllyNodeRef from;
 	ProllyNodeRef spliced;
-
-	if (prolly_kept_commits <= 0 || branch_ops()->restore == NULL ||
-		RecoveryInProgress())
-		return;
-	prolly_database_components(&dc);
-	if (dc.canonicalizer->splice_baseline == NULL)
-		return;
-	name = branch_ops()->current();
-	kept = kept_get(name);
-	was = kept_find(kept, &commit->id);
-	if (was == NULL || was->baseline.len == 0 ||
-		!branch_baseline(name, &baseline))
-		return;
 
 	/*
 	 * (the commit kept anew, the restored tables by their new storage's
@@ -3106,30 +3124,49 @@ restore_pages(const ProllyCommitInfo *commit)
 	 * (only tables whose rows the commit holds as this database can read
 	 * them: the move refuses the others, as reading their rows would)
 	 */
-	PROLLY_CALL(dc.canonicalizer, tables, &commit->root, NULL, note_table,
+	PROLLY_CALL(dc->canonicalizer, tables, &commit->root, NULL, note_table,
 				&tables);
 	foreach_ptr(NamedTree, t, tables)
 	{
 		if (t->readable)
 			readable = lappend(readable, t);
 	}
+	if (moving_to != NULL)
+		PROLLY_CALL(dc->canonicalizer, tables, moving_to, NULL, note_table,
+					&targets);
 	for (int t = 0; t < kc->ntables; t++)
 	{
 		KeptTable  *kt = &kc->tables[t];
-		Oid			relid = table_named(kt->name);
+		Oid			relid;
 		NamedTree  *target = NULL;
+		NamedTree  *moved = NULL;
 		BranchKeptRelation *renewed;
 		bool		any = false;
+		bool		skipped = false;
 
+		foreach_ptr(char, n, skip)
+		{
+			if (strcmp(n, kt->name) == 0)
+				skipped = true;
+		}
+		if (skipped)
+			continue;
+		relid = table_named(kt->name);
 		foreach_ptr(NamedTree, r, readable)
 		{
 			if (strcmp(r->name, kt->name) == 0)
 				target = r;
 		}
+		foreach_ptr(NamedTree, r, targets)
+		{
+			if (strcmp(r->name, kt->name) == 0)
+				moved = r;
+		}
 		if (target == NULL ||
 			!OidIsValid(relid) || relid != kt->rels[0].relid ||
 			!same_relations(kept_relations(relid), kt) || !may_restore(relid) ||
-			few_changes(&dc, &baseline, relid, &target->data))
+			few_changes(dc, baseline, relid, &target->data) ||
+			(moved != NULL && few_changes(dc, baseline, relid, &moved->data)))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
 		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed,
@@ -3140,19 +3177,69 @@ restore_pages(const ProllyCommitInfo *commit)
 		if (!any)
 			continue;
 		memcpy(kt->rels, renewed, sizeof(BranchKeptRelation) * kt->nrels);
-		restored = lappend(restored, kt->name);
+		now = lappend(now, kt->name);
 	}
-	if (restored == NIL)
+	if (now == NIL)
 		return;
 
 	/* (the restored tables' snapshots of their new storage kept at once) */
 	was->retired = GetTopFullTransactionId();
-	kept = lcons(kc, kept);
-	kept_put(name, kept);
+	*kept = lcons(kc, *kept);
 	ref_of(&kc->baseline, &from);
-	PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &from, restored,
+	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,
 				&spliced);
-	branch_set_baseline(name, &spliced, NULL);
+	*baseline = spliced;
+	*restored = list_concat(*restored, now);
+}
+
+/*
+ * Before a move of the session's branch to commit: if its pages are kept
+ * as of the commit, each table's given back (restore_kept()).  The tables
+ * that aren't (the commit isn't kept, or a table's kept pages are gone: a
+ * restore of another commit since gave the table new storage, and its
+ * old storage, where the commit's snapshot was, went with it) are given
+ * the pages kept as of the branch's head, if those are kept: so the move
+ * discards the working set's changes in O(1), as a hard reset to the head
+ * does, and writes only the rows the head and the commit differ by, not
+ * those and every row changed since the head.  (A move always ends at the
+ * commit's rows, so whatever the working set held is the move's to
+ * discard.)
+ */
+static void
+restore_pages(const ProllyCommitInfo *commit)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name;
+	List	   *kept;
+	KeptCommit *was;
+	List	   *restored = NIL;
+	ProllyNodeRef baseline;
+	ProllyHash	head;
+	ProllyCommitInfo at_head;
+
+	if (prolly_kept_commits <= 0 || branch_ops()->restore == NULL ||
+		RecoveryInProgress())
+		return;
+	prolly_database_components(&dc);
+	if (dc.canonicalizer->splice_baseline == NULL)
+		return;
+	name = branch_ops()->current();
+	kept = kept_get(name);
+	if (kept == NIL || !branch_baseline(name, &baseline))
+		return;
+	was = kept_find(kept, &commit->id);
+	if (was != NULL && was->baseline.len > 0)
+		restore_kept(&dc, commit, was, &kept, NIL, NULL, &baseline,
+					 &restored);
+	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
+		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
+		copies_commit_get(&head, &at_head))
+		restore_kept(&dc, &at_head, was, &kept, restored, &commit->root,
+					 &baseline, &restored);
+	if (restored == NIL)
+		return;
+	kept_put(name, kept);
+	branch_set_baseline(name, &baseline, NULL);
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
