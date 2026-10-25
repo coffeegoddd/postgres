@@ -8906,6 +8906,39 @@ move_guard_refuse(Oid classId, Oid objectId, int subId, Oid owner,
 		 GetUserNameFromId(move_guard_role, false), move_guard_sql);
 }
 
+/*
+ * Whether routine proc, run by role, is an extension's as installed: owned
+ * by the extension's owner, which is the bootstrap superuser, or has the
+ * privileges of role (so running it as role gives its code nothing).  An
+ * extension another role made (a trusted one) holds that role's code, and
+ * a routine it added (ALTER EXTENSION ... ADD FUNCTION) is as much its own,
+ * so membership alone exempts nothing.
+ */
+static bool
+installed_routine(Oid proc, Oid role)
+{
+	Oid			ext = getExtensionOfObject(ProcedureRelationId, proc);
+	HeapTuple	tup;
+	Oid			ext_owner = InvalidOid;
+	Oid			owner;
+
+	if (!OidIsValid(ext))
+		return false;
+	tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(ext));
+	if (HeapTupleIsValid(tup))
+	{
+		ext_owner = ((Form_pg_extension) GETSTRUCT(tup))->extowner;
+		ReleaseSysCache(tup);
+	}
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(proc));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	owner = ((Form_pg_proc) GETSTRUCT(tup))->proowner;
+	ReleaseSysCache(tup);
+	return OidIsValid(ext_owner) && owner == ext_owner &&
+		(ext_owner == BOOTSTRAP_SUPERUSERID || has_privs_of_role(ext_owner, role));
+}
+
 static void
 move_guard_hook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 				void *arg)
@@ -8933,8 +8966,7 @@ move_guard_hook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 			break;
 		case OAT_FUNCTION_EXECUTE:
 			what = "run";
-			/* (an extension's routines are its installer's, as installed) */
-			if (OidIsValid(getExtensionOfObject(ProcedureRelationId, objectId)))
+			if (installed_routine(objectId, move_guard_role))
 				return;
 			break;
 		default:
@@ -8951,6 +8983,20 @@ move_guard_hook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
 		if (OidIsValid(owner) && owner != move_guard_role)
 			move_guard_refuse(classId, objectId, subId, owner, "make");
 	}
+}
+
+/*
+ * Refuse a statement nothing said the maker of, in a move that has
+ * makers: what it would touch can't be told from its text, so the move
+ * fails closed rather than run it as the role moving beside objects other
+ * roles' makers make.  (Every statement a move makes says whose it is;
+ * this is an internal error.)
+ */
+static void
+unattributed_statement(const char *sql)
+{
+	elog(ERROR, "a move's statement has no maker, while the move makes objects as their owners: \"%s\"",
+		 sql);
 }
 
 /*
@@ -8971,6 +9017,8 @@ execute_statement(const char *sql)
 	const char *was = move_guard_sql;
 
 	as_role(statement_maker(sql, &attributed), &sw);
+	if (!attributed && move_makers != NIL)
+		unattributed_statement(sql);
 	if (attributed && !sw.switched && move_guard_depth == 0)
 		return SPI_execute(sql, false, 0);
 	PG_TRY();
@@ -9006,6 +9054,201 @@ execute_statement(const char *sql)
 	}
 	PG_END_TRY();
 	return rc;
+}
+
+/*
+ * While a move runs (prolly_move_calls_begin() to its end), each routine
+ * it calls that isn't the system's (an OID below FirstNormalObjectId) runs
+ * as its owner, under SECURITY_RESTRICTED_OPERATION, as a SECURITY DEFINER
+ * routine runs, wherever the call comes from: a statement the move runs as
+ * a maker or as itself, a check, default or index expression of the rows
+ * it writes, a domain's check of a conversion, a materialized view's
+ * query, another routine.  So no role's code ever runs with the authority
+ * of the role moving, or of another maker, whatever path reaches it.  The
+ * function manager's hooks do it (needs_fmgr_hook, fmgr_hook, as sepgsql
+ * uses them): a routine the hook is needed for is never inlined by the
+ * planner either, so an SQL routine's body can't run unseen inside the
+ * expression that calls it.
+ *
+ * A routine whose owner has the privileges of the role calling it (its
+ * own, a superuser's, the bootstrap superuser's, an extension's installed
+ * by one) runs as that caller, as in PostgreSQL: its code gains nothing by
+ * it, while running it as its owner would give the caller the owner's
+ * authority.  A SECURITY DEFINER routine runs as its owner already.  A
+ * routine's own search_path setting is kept; any other runs with
+ * pg_catalog, then pg_temp (RestrictSearchPath()).  The routine still
+ * needs EXECUTE for its caller, checked before the call.
+ *
+ * Domain checks the type cache planned before the move (and so may have
+ * inlined an SQL routine in) are planned again; and no query or index
+ * build of the move runs in parallel workers, which the hooks don't reach.
+ */
+static int	move_calls_depth = 0;
+static bool move_calls_installed = false;
+static needs_fmgr_hook_type move_calls_next_needs = NULL;
+static fmgr_hook_type move_calls_next = NULL;
+
+/* What a hooked call's routine is, worked out on its first call */
+typedef struct MoveCallee
+{
+	Oid			owner;
+	bool		definer;		/* (SECURITY DEFINER: its owner already) */
+	bool		configured;		/* (settings of its own: a GUC level) */
+	bool		own_path;		/* (search_path among them) */
+	Datum		next_private;	/* (the next hook's) */
+} MoveCallee;
+
+/* A call's role switch, undone as it ends (innermost last) */
+typedef struct MoveCallSwitch
+{
+	bool		switched;
+	Oid			user;
+	int			sec;
+	int			nest;			/* (0: none of its own) */
+} MoveCallSwitch;
+
+static MoveCallSwitch *move_call_switches = NULL;
+static int	move_call_depth = 0;
+static int	move_call_max = 0;
+
+static bool
+move_calls_needed(Oid fn_oid)
+{
+	if (move_calls_next_needs && move_calls_next_needs(fn_oid))
+		return true;
+	return move_calls_depth > 0 && fn_oid >= FirstNormalObjectId;
+}
+
+static MoveCallee *
+move_callee(FmgrInfo *flinfo, Datum *private)
+{
+	MoveCallee *c = (MoveCallee *) DatumGetPointer(*private);
+	HeapTuple	tup;
+	Form_pg_proc p;
+	Datum		config;
+	bool		isnull;
+
+	if (c != NULL)
+		return c;
+	c = MemoryContextAllocZero(flinfo->fn_mcxt, sizeof(MoveCallee));
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(flinfo->fn_oid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", flinfo->fn_oid);
+	p = (Form_pg_proc) GETSTRUCT(tup);
+	c->owner = p->proowner;
+	c->definer = p->prosecdef;
+	config = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_proconfig, &isnull);
+	if (!isnull)
+	{
+		List	   *names;
+		List	   *values;
+
+		c->configured = true;
+		TransformGUCArray(DatumGetArrayTypeP(config), &names, &values);
+		foreach_ptr(char, name, names)
+			if (pg_strcasecmp(name, "search_path") == 0)
+				c->own_path = true;
+	}
+	ReleaseSysCache(tup);
+	*private = PointerGetDatum(c);
+	return c;
+}
+
+static void
+move_calls_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
+{
+	MoveCallee *c = move_callee(flinfo, private);
+
+	if (event == FHET_START)
+	{
+		MoveCallSwitch sw = {0};
+		Oid			caller = GetUserId();
+
+		/*
+		 * (the next hook's first, and nothing after the switch is kept that
+		 * can fail: a start that fails hears no end)
+		 */
+		if (move_calls_next)
+			move_calls_next(event, flinfo, &c->next_private);
+
+		if (move_call_depth == move_call_max)
+		{
+			int			max = Max(16, move_call_max * 2);
+
+			move_call_switches = move_call_switches == NULL ?
+				MemoryContextAlloc(TopMemoryContext, sizeof(MoveCallSwitch) * max) :
+				repalloc(move_call_switches, sizeof(MoveCallSwitch) * max);
+			move_call_max = max;
+		}
+		if (move_calls_depth > 0 && flinfo->fn_oid >= FirstNormalObjectId &&
+			!c->definer && c->owner != caller &&
+			!has_privs_of_role(c->owner, caller))
+		{
+			GetUserIdAndSecContext(&sw.user, &sw.sec);
+			SetUserIdAndSecContext(c->owner, sw.sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+			sw.switched = true;
+			/*
+			 * (a routine with settings of its own has its GUC level, which
+			 * the function manager ends before this hook hears the end)
+			 */
+			if (!c->configured)
+				sw.nest = NewGUCNestLevel();
+			if (!c->own_path)
+				RestrictSearchPath();
+		}
+		move_call_switches[move_call_depth++] = sw;
+		return;
+	}
+	if (move_call_depth > 0)
+	{
+		MoveCallSwitch sw = move_call_switches[--move_call_depth];
+
+		if (sw.switched)
+		{
+			if (sw.nest > 0)
+				AtEOXact_GUC(event == FHET_END, sw.nest);
+			SetUserIdAndSecContext(sw.user, sw.sec);
+		}
+	}
+	if (move_calls_next)
+		move_calls_next(event, flinfo, &c->next_private);
+}
+
+int
+prolly_move_calls_begin(void)
+{
+	int			nest = 0;
+
+	if (!move_calls_installed)
+	{
+		move_calls_next_needs = needs_fmgr_hook;
+		needs_fmgr_hook = move_calls_needed;
+		move_calls_next = fmgr_hook;
+		fmgr_hook = move_calls_hook;
+		move_calls_installed = true;
+	}
+	if (move_calls_depth++ == 0)
+	{
+		nest = NewGUCNestLevel();
+		(void) set_config_option("max_parallel_workers_per_gather", "0",
+								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
+								 true, 0, false);
+		(void) set_config_option("max_parallel_maintenance_workers", "0",
+								 PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE,
+								 true, 0, false);
+		/* (the type cache's domain checks, planned again) */
+		CallSyscacheCallbacks(CONSTROID, 0);
+	}
+	return nest;
+}
+
+void
+prolly_move_calls_end(int nest, bool done)
+{
+	Assert(move_calls_depth > 0);
+	if (--move_calls_depth == 0 && nest > 0)
+		AtEOXact_GUC(done, nest);
 }
 
 /* Set a catalog row's ACL column to NULL (no grants), as owner's. */
@@ -11623,41 +11866,6 @@ in_partition_key(Oid relid, AttrNumber attnum)
 }
 
 /*
- * Refuse to convert column-using table rel (relid) to a moved type mt where
- * the type's owner isn't the table's and hasn't the table owner's
- * privileges.  The conversion (ALTER COLUMN ... TYPE ... USING) runs as the
- * table's owner, and runs the type's code over every row: its input from
- * text, a domain's checks.  So the type's owner's code would run with the
- * table owner's authority, more than its own.  PostgreSQL never does that
- * for a type change: ALTER DOMAIN validates other roles' rows as the
- * domain's owner.  A move can't split the conversion between the two
- * roles, so it fails closed.
- */
-static void
-refuse_crossed_conversion(const MovedType *mt, Oid relid, const char *rel)
-{
-	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(mt->typid));
-	Oid			type_owner;
-	Oid			table_owner = relation_owner_of(relid);
-
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for type %u", mt->typid);
-	type_owner = ((Form_pg_type) GETSTRUCT(tup))->typowner;
-	ReleaseSysCache(tup);
-	if (!OidIsValid(table_owner) || type_owner == table_owner ||
-		has_privs_of_role(type_owner, table_owner))
-		return;
-	ereport(ERROR,
-			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
-					mt->from->name),
-			 errdetail("Table %s, owned by role \"%s\", uses it, and the type's owner, role \"%s\", hasn't that role's privileges: converting the table's rows would run the type's code as the table's owner.",
-					   rel, GetUserNameFromId(table_owner, false),
-					   GetUserNameFromId(type_owner, false)),
-			 errhint("Have the table's owner own the type, or change the type where the table doesn't use it.")));
-}
-
-/*
  * The statements that make the types to defines otherwise than from, under
  * their names, and those that use them, in turn: each renamed aside, made
  * anew, the columns of versioned tables using it (or arrays of it)
@@ -11671,6 +11879,13 @@ refuse_crossed_conversion(const MovedType *mt, Oid relid, const char *rel)
  * schema's table, an operator) can't be moved with it: refused.  Views and
  * materialized views using them go and come back with the others
  * (folded_move_schema()).
+ *
+ * A column's conversion runs as its table's maker, whoever owns the type:
+ * each routine the type's checks or casts call runs as its own owner
+ * (prolly_move_calls_begin()), so no type owner's routine gets the table
+ * owner's authority.  A domain's check expression otherwise runs as it
+ * does for every row the table's owner writes, which PostgreSQL runs as
+ * the writer too.
  */
 static TypeMoves
 type_moves(List *from, List *to)
@@ -11838,7 +12053,6 @@ type_moves(List *from, List *to)
 							char	   *fn = psprintf("%s.prolly_moving_%u_array",
 													  schema_of(mt->to->name), mt->typid);
 
-							refuse_crossed_conversion(mt, d->objid, rel);
 							tm.converts = lappend(tm.converts,
 												  psprintf("CREATE FUNCTION %s(a %s[]) RETURNS %s[] "
 														   "LANGUAGE sql AS $f$ SELECT COALESCE(pg_catalog.array_agg(%s ORDER BY i), '{}') "
@@ -11856,7 +12070,6 @@ type_moves(List *from, List *to)
 						}
 						else if (!inherited)
 						{
-							refuse_crossed_conversion(mt, d->objid, rel);
 							tm.converts = lappend(tm.converts,
 												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
 														   rel, col, mt->to->name,
@@ -12570,8 +12783,10 @@ run_policy_statements(List *stmts)
 		/* (a policy of a table the move makes or changes as its maker) */
 		bool		attributed;
 
-		if (OidIsValid(statement_maker(ps->sql, &attributed)))
+		if (OidIsValid(statement_maker(ps->sql, &attributed)) ||
+			(!attributed && move_makers != NIL))
 		{
+			/* (execute_statement() refuses one nothing was said of) */
 			rc = execute_statement(ps->sql);
 			if (rc < 0)
 				elog(ERROR, "could not run \"%s\": %s", ps->sql,
@@ -13594,9 +13809,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		}
 		else if (t->kind == 'y' && f == NULL)
 		{
+			ListMark	m = list_mark(tm.unvalidated);
+
 			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def,
 															 &tm.unvalidated));
 			made_as_item(llast(tm.creates), t->name, 'y');
+			/* (its NOT VALID checks too) */
+			made_as_since(tm.unvalidated, m, t->name, 'y');
 		}
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 		{
@@ -14052,10 +14271,13 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				   bool rewritten)
 {
 	bool		held = prolly_writing_held_rows(true);
+	int			calls = prolly_move_calls_begin();
+	bool		done = false;
 
 	PG_TRY();
 	{
 		move_schema(from_root, to_root, rows, breaking, arg, rewritten);
+		done = true;
 	}
 	PG_FINALLY();
 	{
@@ -14063,8 +14285,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		reset_makers();
 		move_kept_relids = NIL;
 		prolly_writing_held_rows(held);
-		move_kept_relids = NIL;
-		reset_makers();
+		prolly_move_calls_end(calls, done);
 	}
 	PG_END_TRY();
 }

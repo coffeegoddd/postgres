@@ -1063,11 +1063,10 @@ SELECT pg_get_indexdef('rm."i ON rm.bt"'::regclass) AS made_again, x FROM rm.it;
  CREATE INDEX "i ON rm.bt" ON rm.it USING btree (id) WHERE (x <> 'a'::rm.e4) | bb
 (1 row)
 
--- a type move converts each table using the type as the table's owner,
--- which runs the type's code (its input, a domain's checks) over the
--- table's rows: refused where the type's owner isn't the table's and
--- hasn't that role's privileges (alice's enum, the writer's table, in a
--- superuser's merge)
+-- a type move converts each table using the type as the table's owner;
+-- any routine the conversion runs runs as its own owner (move_calls), so
+-- alice's enum changed, used by the writer's table, merges in a
+-- superuser's merge
 SET ROLE regress_rm_alice;
 CREATE TYPE rm.e5 AS ENUM ('a', 'b');
 RESET ROLE;
@@ -1108,14 +1107,16 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  t
 (1 row)
 
-SELECT dolt_merge('ty6', '-m', 'merged ty6');
-ERROR:  the branch can't be moved to a commit that defines type rm.e5 otherwise
-DETAIL:  Table rm.pt, owned by role "regress_rm_w", uses it, and the type's owner, role "regress_rm_alice", hasn't that role's privileges: converting the table's rows would run the type's code as the table's owner.
-HINT:  Have the table's owner own the type, or change the type where the table doesn't use it.
+SELECT (dolt_merge('ty6', '-m', 'merged ty6'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
 SELECT x FROM rm.pt;
- x 
----
- b
+ x  
+----
+ bb
 (1 row)
 
 -- a cast is made as the owner of one of its types, as CREATE CAST
