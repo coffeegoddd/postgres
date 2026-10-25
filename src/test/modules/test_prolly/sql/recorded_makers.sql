@@ -104,7 +104,7 @@ GRANT USAGE ON SCHEMA rm_pub TO regress_rm_alice;
 GRANT INSERT ON rm_pub.log TO regress_rm_alice;
 CREATE FUNCTION rm_pub.f(int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
-	INSERT INTO rm_pub.log VALUES (current_user, 'checked');
+	INSERT INTO rm_pub.log VALUES (current_user, 'checked, search_path ' || current_setting('search_path'));
 	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
 		EXECUTE 'ALTER ROLE regress_rm_alice SUPERUSER';
 	END IF;

@@ -226,7 +226,7 @@ GRANT USAGE ON SCHEMA rm_pub TO regress_rm_alice;
 GRANT INSERT ON rm_pub.log TO regress_rm_alice;
 CREATE FUNCTION rm_pub.f(int) RETURNS int LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
-	INSERT INTO rm_pub.log VALUES (current_user, 'checked');
+	INSERT INTO rm_pub.log VALUES (current_user, 'checked, search_path ' || current_setting('search_path'));
 	IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
 		EXECUTE 'ALTER ROLE regress_rm_alice SUPERUSER';
 	END IF;
@@ -272,9 +272,9 @@ SELECT rolsuper AS owner_superuser FROM pg_roles WHERE rolname = 'regress_rm_ali
 (1 row)
 
 SELECT DISTINCT who, what FROM rm_pub.log ORDER BY 1, 2;
-       who        |       what        
-------------------+-------------------
- regress_rm_alice | checked
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_rm_alice | checked, search_path pg_catalog, pg_temp
  regress_rm_alice | mover_only denied
 (2 rows)
 
@@ -675,9 +675,9 @@ SELECT (dolt_merge('main', '-m', 'merged main'))[2:2] AS fast_forward;
 (1 row)
 
 SELECT DISTINCT who, what FROM rm_pub.log ORDER BY 1, 2;
-       who        |       what        
-------------------+-------------------
- regress_rm_alice | checked
+       who        |                   what                   
+------------------+------------------------------------------
+ regress_rm_alice | checked, search_path pg_catalog, pg_temp
  regress_rm_alice | mover_only denied
 (2 rows)
 
