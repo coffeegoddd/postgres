@@ -151,9 +151,11 @@ SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^2^1', NULL::ln.t);
 SELECT count(*) AS rows_now FROM ln.t;
--- (the merge brought in versions of the old table's relation, so it made
--- the table again, a relation of its own: main's history before it is
--- another relation's now, and is refused)
+-- (k3's merge of main made its table again, a relation of its own, and
+-- main's merge of k3 brought in k3's version whole, so it made main's
+-- table again, of k3's table's class: k3's merge reads, as main's table
+-- holds its rows; main's history before it is another relation's now, and
+-- is refused)
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;

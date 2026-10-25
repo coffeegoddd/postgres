@@ -430,6 +430,600 @@ SELECT * FROM rv.t ORDER BY id;
 (2 rows)
 
 RESET ROLE;
+-- every route that brings a commit's version into the table: a table's
+-- checkout from a commit, a rebase, an integration, a stash's pop
+CREATE TABLE rv.c (id int PRIMARY KEY, note text);
+INSERT INTO rv.c VALUES (1, 'old secret c');
+SELECT length(dolt_commit('-Am', 'old c')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS old_c \gset
+-- (branches of the old table, used before it went)
+SELECT dolt_branch('c_rebased') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('c_integrated') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('c_rebased') IS NOT NULL AS on_rebased;
+ on_rebased 
+------------
+ t
+(1 row)
+
+INSERT INTO rv.c VALUES (2, 'old secret c, rebased');
+SELECT length(dolt_commit('-am', 'c rebased row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('c_integrated') IS NOT NULL AS on_integrated;
+ on_integrated 
+---------------
+ t
+(1 row)
+
+INSERT INTO rv.c VALUES (3, 'old secret c, integrated');
+SELECT length(dolt_commit('-am', 'c integrated row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+DROP TABLE rv.c;
+SELECT length(dolt_commit('-Am', 'dropped c')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE rv.c (id int PRIMARY KEY, note text);
+INSERT INTO rv.c VALUES (10, 'public c');
+GRANT SELECT ON rv.c TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'new c')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS new_c \gset
+-- (a table checked out of the old commit)
+SELECT dolt_checkout(:'old_c', 'rv.c') IS NOT NULL AS checked_out;
+ checked_out 
+-------------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made_again('rv.c');
+ mover | grants 
+-------+--------
+ t     | f
+(1 row)
+
+SELECT * FROM rv.c ORDER BY id;
+ id |     note     
+----+--------------
+  1 | old secret c
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.c;
+ERROR:  permission denied for table c
+RESET ROLE;
+SELECT dolt_reset('--hard', :'new_c') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+GRANT SELECT ON rv.c TO regress_rv_reader;
+SELECT length(dolt_commit('--allow-empty', '-m', 'c granted')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS new_c \gset
+-- (a rebase of the old table's branch onto main, then main fast-forwarded
+-- to it)
+SELECT dolt_checkout('c_rebased') IS NOT NULL AS on_rebased;
+ on_rebased 
+------------
+ t
+(1 row)
+
+SELECT dolt_rebase('main') IS NOT NULL AS rebased;
+ rebased 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('c_rebased'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM pg_temp.made_again('rv.c');
+ mover | grants 
+-------+--------
+ t     | f
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.c;
+ERROR:  permission denied for table c
+RESET ROLE;
+SELECT dolt_reset('--hard', :'new_c') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+GRANT SELECT ON rv.c TO regress_rv_reader;
+SELECT length(dolt_commit('--allow-empty', '-m', 'c granted again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- (the old table's branch integrated into main)
+SELECT dolt_checkout('c_integrated') IS NOT NULL AS on_integrated;
+ on_integrated 
+---------------
+ t
+(1 row)
+
+SELECT dolt_integrate('main', '-m', 'c integrated') IS NOT NULL AS integrated;
+ integrated 
+------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made_again('rv.c');
+ mover | grants 
+-------+--------
+ t     | f
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.c;
+ERROR:  permission denied for table c
+RESET ROLE;
+-- (a stash of the old table's rows popped over the new one)
+CREATE TABLE rv.s (id int PRIMARY KEY, note text);
+SELECT length(dolt_commit('-Am', 'old s')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+INSERT INTO rv.s VALUES (1, 'old secret s, stashed');
+SELECT dolt_stash('push', 's1') IS NOT NULL AS stashed;
+ stashed 
+---------
+ t
+(1 row)
+
+DROP TABLE rv.s;
+CREATE TABLE rv.s (id int PRIMARY KEY, note text);
+INSERT INTO rv.s VALUES (10, 'public s');
+GRANT SELECT ON rv.s TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'new s')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_stash('pop', 's1') IS NOT NULL AS popped;
+ popped 
+--------
+ t
+(1 row)
+
+SELECT * FROM pg_temp.made_again('rv.s');
+ mover | grants 
+-------+--------
+ t     | f
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.s;
+ERROR:  permission denied for table s
+RESET ROLE;
+SELECT dolt_reset('--hard') IS NOT NULL AS discarded;
+ discarded 
+-----------
+ t
+(1 row)
+
+-- a merge, pick or revert stopped on conflicts: resolving a conflict with
+-- the other side's rows brings its version in, and makes the table again
+CREATE TABLE rv.k (id int PRIMARY KEY, note text);
+INSERT INTO rv.k VALUES (1, 'old secret k');
+SELECT length(dolt_commit('-Am', 'old k')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('k_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('k_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE rv.k SET note = 'old secret k, side';
+SELECT length(dolt_commit('-am', 'k side')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS k_pick \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE rv.k SET note = 'old secret k, updated';
+SELECT length(dolt_commit('-am', 'k updated')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS k_updated \gset
+DROP TABLE rv.k;
+SELECT length(dolt_commit('-Am', 'dropped k')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE rv.k (id int PRIMARY KEY, note text);
+INSERT INTO rv.k VALUES (1, 'public k');
+GRANT SELECT ON rv.k TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'new k')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT 'rv.k'::regclass::oid AS k_oid \gset
+-- (a merge)
+BEGIN;
+SELECT (dolt_merge('k_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT 'rv.k'::regclass::oid = :k_oid AS same_relation;
+ same_relation 
+---------------
+ t
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rv.k') IS NOT NULL AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+SELECT 'rv.k'::regclass::oid <> :k_oid AS another_relation, * FROM pg_temp.made_again('rv.k');
+ another_relation | mover | grants 
+------------------+-------+--------
+ t                | t     | f
+(1 row)
+
+SELECT length(dolt_commit('-am', 'k merged')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ROLLBACK;
+-- (a cherry-pick)
+BEGIN;
+SELECT (dolt_cherry_pick(:'k_pick'))[2] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rv.k') IS NOT NULL AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+SELECT 'rv.k'::regclass::oid <> :k_oid AS another_relation, * FROM pg_temp.made_again('rv.k');
+ another_relation | mover | grants 
+------------------+-------+--------
+ t                | t     | f
+(1 row)
+
+ROLLBACK;
+-- (a revert)
+BEGIN;
+SELECT (dolt_revert(:'k_updated'))[2] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rv.k') IS NOT NULL AS resolved;
+ resolved 
+----------
+ t
+(1 row)
+
+SELECT 'rv.k'::regclass::oid <> :k_oid AS another_relation, * FROM pg_temp.made_again('rv.k');
+ another_relation | mover | grants 
+------------------+-------+--------
+ t                | t     | f
+(1 row)
+
+ROLLBACK;
+-- a version is another table's by the record's line under its own name: a
+-- table dropped and another renamed into its name
+CREATE TABLE rv.a (id int PRIMARY KEY, note text);
+CREATE TABLE rv.b (id int PRIMARY KEY, note text);
+INSERT INTO rv.a VALUES (1, 'a secret');
+INSERT INTO rv.b VALUES (2, 'b public');
+SELECT length(dolt_commit('-Am', 'a and b')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c_ab \gset
+DROP TABLE rv.a;
+ALTER TABLE rv.b RENAME TO a;
+GRANT SELECT ON rv.a TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'b renamed to a')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS renamed \gset
+SELECT 'rv.a'::regclass::oid AS y \gset
+SELECT dolt_reset('--hard', :'c_ab') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT 'rv.a'::regclass::oid <> :y AS another_relation, * FROM pg_temp.made_again('rv.a');
+ another_relation | mover | grants 
+------------------+-------+--------
+ t                | t     | f
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.a;
+ERROR:  permission denied for table a
+RESET ROLE;
+SELECT dolt_reset('--hard', :'renamed') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+-- (two tables' names swapped: a reset back puts each version, by its
+-- name, into the other's relation, so both are made again)
+CREATE TABLE rv.x (id int PRIMARY KEY, note text);
+CREATE TABLE rv.y (id int PRIMARY KEY, note text);
+INSERT INTO rv.x VALUES (1, 'x secret');
+INSERT INTO rv.y VALUES (2, 'y public');
+SELECT length(dolt_commit('-Am', 'x and y')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c_xy \gset
+SELECT 'rv.x'::regclass::oid AS x_oid, 'rv.y'::regclass::oid AS y_oid \gset
+ALTER TABLE rv.x RENAME TO tmp;
+ALTER TABLE rv.y RENAME TO x;
+ALTER TABLE rv.tmp RENAME TO y;
+GRANT SELECT ON rv.x TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'x and y swapped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_reset('--hard', :'c_xy') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT 'rv.x'::regclass::oid NOT IN (:x_oid, :y_oid) AS x_again,
+	'rv.y'::regclass::oid NOT IN (:x_oid, :y_oid) AS y_again;
+ x_again | y_again 
+---------+---------
+ t       | t
+(1 row)
+
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.x;
+ERROR:  permission denied for table x
+SELECT * FROM rv.y;
+ERROR:  permission denied for table y
+RESET ROLE;
+-- made again by a reset to the old table's commit, the table is of the
+-- old table's class: a later move to the same version (a reset or a
+-- stash that discards changes) keeps it, and its grants
+CREATE TABLE rv.r (id int PRIMARY KEY, note text);
+INSERT INTO rv.r VALUES (1, 'old secret r');
+SELECT length(dolt_commit('-Am', 'old r')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS old_r \gset
+DROP TABLE rv.r;
+SELECT length(dolt_commit('-Am', 'dropped r')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE rv.r (id int PRIMARY KEY, note text);
+INSERT INTO rv.r VALUES (10, 'public r');
+GRANT SELECT ON rv.r TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'new r')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS new_r \gset
+SELECT dolt_reset('--hard', :'old_r') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT 'rv.r'::regclass::oid AS z \gset
+GRANT SELECT ON rv.r TO regress_rv_reader;
+INSERT INTO rv.r VALUES (5, 'uncommitted');
+SELECT dolt_reset('--hard') IS NOT NULL AS discarded;
+ discarded 
+-----------
+ t
+(1 row)
+
+SELECT 'rv.r'::regclass::oid = :z AS same_relation, * FROM pg_temp.made_again('rv.r');
+ same_relation | mover | grants 
+---------------+-------+--------
+ t             | t     | t
+(1 row)
+
+INSERT INTO rv.r VALUES (6, 'uncommitted');
+SELECT dolt_stash('push', 's2') IS NOT NULL AS stashed;
+ stashed 
+---------
+ t
+(1 row)
+
+SELECT 'rv.r'::regclass::oid = :z AS same_relation, * FROM pg_temp.made_again('rv.r');
+ same_relation | mover | grants 
+---------------+-------+--------
+ t             | t     | t
+(1 row)
+
+SELECT dolt_stash('drop', 's2') IS NOT NULL AS dropped;
+ dropped 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'new_r') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+GRANT SELECT ON rv.r TO regress_rv_reader;
+-- a branch's first use makes its copy again as the table's owner, and
+-- gives it to the branch's owner: a branch made at the old commit by a
+-- role that may make branches but owns no table
+CREATE ROLE regress_rv_maker;
+SELECT format('GRANT CREATE ON DATABASE %I TO regress_rv_maker', current_database()) \gexec
+GRANT CREATE ON DATABASE regress_remade_versions TO regress_rv_maker
+GRANT USAGE ON SCHEMA rv TO regress_rv_maker;
+SET ROLE regress_rv_maker;
+SELECT dolt_branch('maker_old', :'old_r') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT dolt_checkout('maker_old') IS NOT NULL AS on_maker_old;
+ on_maker_old 
+--------------
+ t
+(1 row)
+
+SELECT relowner::regrole AS owner, relacl IS NOT NULL AS grants
+FROM pg_class WHERE oid = 'rv.r'::regclass;
+      owner       | grants 
+------------------+--------
+ regress_rv_maker | f
+(1 row)
+
+SELECT * FROM rv.r;
+ id |     note     
+----+--------------
+  1 | old secret r
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- a mover that can't make the table again is refused, saying why
+CREATE ROLE regress_rv_writer IN ROLE pg_prolly_write;
+GRANT USAGE ON SCHEMA rv TO regress_rv_writer;
+GRANT SELECT, INSERT, UPDATE, DELETE ON rv.r TO regress_rv_writer;
+SET ROLE regress_rv_writer;
+SELECT dolt_reset('--hard', :'old_r');
+ERROR:  permission denied to move table "rv.r" to another table's version
+DETAIL:  The version this moves to is of a table of that name dropped and made again since, another relation, so the move makes the table again, a relation of its own, without the table's grants.
+HINT:  Making the table again takes its ownership and CREATE on schema "rv": the table's owner can make the move.
+RESET ROLE;
+SET ROLE regress_rv_reader;
+SELECT * FROM rv.r;
+ id |   note   
+----+----------
+ 10 | public r
+(1 row)
+
+RESET ROLE;
 \c contrib_regression
 DROP DATABASE regress_remade_versions;
-DROP ROLE regress_rv_reader;
+DROP ROLE regress_rv_reader, regress_rv_maker, regress_rv_writer;

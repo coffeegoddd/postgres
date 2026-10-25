@@ -129,15 +129,18 @@ extern bool prolly_versions_may_be_foreign(const ProllyHash *provenance,
 
 /*
  * After a move from before (the branch folded then) bringing versions from
- * the commits provenance (nprovenance of them): the tables whose versions it changed that provenance
- * wasn't made from the table's relation made again, relations of their own
- * (and made, a commit the move made of them, if not NULL, recorded made
- * from the new relations).
+ * the commits provenance (nprovenance of them): the tables whose versions
+ * it changed to another table's (by the records of those commits, under
+ * the table's name) made again, relations of their own, of the class of
+ * the relation whose version they hold (and made, a commit the move made
+ * of them, if not NULL, recorded made from the new relations).  owner
+ * InvalidOid: made as the session's role, refused with a clear error if it
+ * can't; else as each table's owner, then given to owner.
  */
 extern void prolly_remake_foreign_versions(const ProllyNodeRef *before,
 										   const ProllyHash *provenance,
 										   int nprovenance,
-										   const ProllyHash *made);
+										   const ProllyHash *made, Oid owner);
 
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);
