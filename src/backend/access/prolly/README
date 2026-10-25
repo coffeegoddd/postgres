@@ -1179,6 +1179,24 @@ log entries since its baseline) makes every status a fold, and
 status_reused never moves.  A materialized view written since the mark
 (refreshed concurrently) is asked again as the full comparison asks it.
 debug_prolly_verify_fold_caches reads them all again and compares.
+A status in any backend takes the last fold of the branch known first,
+once writers have ended since (the refs' last_fold(); while it is still
+known, nobody writing, it is the working set, and a status whose version
+has that root compares no table at all).  The branch's shared entry keeps
+that fold's root with the generation it was known at, so the working set
+is that root but for the relations written since (written_since() of that
+mark), while the baseline is the one it folded from, nothing it left out,
+and no catalog change or collection since.  Its sequences' values are read
+again (the canonicalizer's sequences_now()), and the version's root and it
+are diffed (objects_diffed()): the tables whose items differ are compared
+as the known working set's are, rows and all, those written since as the
+definitions read without rows compare them (their change finders), and
+the other objects as objects() would visit them.  So a status right after
+a commit, or a backend's first one, costs the tables written since and
+what the diff holds, describes nothing and reads no catalog through
+(pg_stat_prolly's status_from_fold).  A type or materialized view the diff
+holds, a materialized view written, or a table's rows that can't be told
+so leave it to the comparison above.
 
 
 Remotes

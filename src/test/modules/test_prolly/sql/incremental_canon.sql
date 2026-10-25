@@ -205,14 +205,17 @@ SELECT length(dolt_commit('-am', 'forced')::text) > 0 AS committed;
 SELECT scans, incremental FROM work();
 RESET debug_prolly_force_full_fold;
 
--- A status reads definitions without rows: the last read's are taken
--- while nothing they're of changed (definitions_reused), no catalog read
--- through, only sequences read again; rows written since don't change
--- them.  It leaves the folds' own items be: the commit after it still
--- works out only what was written.  (verify on: each taken is read again
--- and compared.)
+-- A status after a commit takes the last fold known, as the commit left
+-- it (status_from_fold): the working set but for the tables written since,
+-- which alone are compared again, and its sequences' values read again.
+-- No definitions read, no catalog read through.  It leaves the folds' own
+-- items be: the commit after it still works out only what was written.
+-- (verify on: each answer is compared with a fold's.)
 CREATE FUNCTION reused() RETURNS bigint LANGUAGE sql AS $$
 	SELECT value FROM pg_stat_prolly WHERE name = 'definitions_reused'
+$$;
+CREATE FUNCTION from_fold() RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE name = 'status_from_fold'
 $$;
 UPDATE many.hot SET v = v + 1;
 SELECT length(dolt_commit('-am', 'before statuses')::text) > 0 AS committed;
@@ -228,7 +231,7 @@ SET debug_prolly_verify_fold_caches = off;
 SELECT * FROM dolt_status ORDER BY 1;
 RESET debug_prolly_verify_fold_caches;
 :flush
-SELECT 'statuses' AS read, scans, reused() FROM work();
+SELECT 'statuses' AS read, scans, reused(), from_fold() FROM work();
 -- (each table's changes asked of its baseline entry alone, not the whole
 -- baseline read again for each table: ~890 nodes here, ~1200 that way)
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
@@ -290,6 +293,78 @@ DELETE FROM many.t21;
 SELECT * FROM dolt_status ORDER BY 1;
 SELECT length(dolt_commit('-am', 'after reused statuses')::text) > 0 AS committed;
 SELECT * FROM dolt_status ORDER BY 1;
+
+-- A status in a backend that hasn't answered one, after a commit and a
+-- write by another: the last fold known, the commit's, and only the table
+-- written compared again, a few nodes read, nothing described, whatever
+-- the other tables.  (verify off where work is counted.)
+UPDATE many.hot SET v = v + 1;
+SELECT length(dolt_commit('-am', 'before another backend')::text) > 0 AS committed;
+UPDATE many.t30 SET v = 'thirty' WHERE id = 30;
+INSERT INTO many.t30 VALUES (30, 'thirty');
+\c incremental_canon
+SET debug_prolly_verify_fold_caches = off;
+:reset
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	AS status_nodes \gset
+SELECT 'first status here' AS read, scans, objects, reused(), from_fold(),
+	CASE WHEN :status_nodes <= 100 THEN 'at most 100' ELSE :status_nodes::text END
+	AS status_nodes
+FROM work();
+-- what it answers: a row written back as it was isn't a change; another
+-- table's, a sequence's value, a row rolled back
+DELETE FROM many.t30;
+SELECT * FROM dolt_status ORDER BY 1;
+INSERT INTO many.t31 VALUES (31, 'thirty-one');
+SELECT nextval('many.seq') > 0 AS moved;
+SELECT * FROM dolt_status ORDER BY 1;
+BEGIN;
+INSERT INTO many.t32 VALUES (32, 'thirty-two');
+SELECT * FROM dolt_status ORDER BY 1;
+ROLLBACK;
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT from_fold() AS answered_from_fold;
+RESET debug_prolly_verify_fold_caches;
+-- (the same, each answer compared with a fold's)
+DELETE FROM many.t31;
+SELECT * FROM dolt_status ORDER BY 1;
+SELECT length(dolt_commit('-am', 'after the other backend')::text) > 0 AS committed;
+-- (clean: the working set known is the head's root, so nothing differs
+-- but what it left out, and no table is compared)
+:flush
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	AS status_nodes \gset
+SELECT CASE WHEN :status_nodes <= 40 THEN 'at most 40' ELSE :status_nodes::text END
+	AS clean_status_nodes;
+
+-- Where the relations written since it aren't known (more than the refs
+-- keep, written one after another), a status reads the definitions
+-- without rows instead: the last read's taken while nothing they're of
+-- changed (definitions_reused), no catalog read through, only sequences
+-- read again.  (verify off: a fold would publish the working set.)
+SET debug_prolly_verify_fold_caches = off;
+DO $$ BEGIN
+	FOR i IN 40..79 LOOP
+		EXECUTE format('INSERT INTO many.t%s VALUES (%s, ''w'')', i, i);
+		COMMIT;
+	END LOOP;
+END $$;
+SELECT count(*) AS changes FROM dolt_status;
+:reset
+SELECT count(*) AS changes FROM dolt_status;
+SELECT count(*) AS changes FROM dolt_status;
+:flush
+SELECT 'statuses, written unknown' AS read, scans, reused(), from_fold()
+FROM work();
+RESET debug_prolly_verify_fold_caches;
+SELECT length(dolt_commit('-am', 'many written')::text) > 0 AS committed;
 
 -- (a definition changed: read again)
 ALTER TABLE many.t13 ADD COLUMN w int;
