@@ -24,6 +24,7 @@
 #define BRANCH_OPS_H
 
 #include "common/relpath.h"
+#include "datatype/timestamp.h"
 
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
@@ -128,9 +129,16 @@ typedef struct BranchOpsRoutine
 	 * kept).
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
+	 *
+	 * A lock held by a page sweep (bmap_compaction_let_go()) is waited
+	 * for, here and in restore() and share_kept(), the sweep asked to let
+	 * go: within lock_timeout of *wait_start, the operation's (0 until one
+	 * of its tries first waits, which sets it), so that lock_timeout bounds
+	 * the waits of all the calls one operation makes.
 	 */
 	bool		(*share) (Oid source, List *relids,
-						  bool (*unchanged) (void *arg), void *arg);
+						  bool (*unchanged) (void *arg), void *arg,
+						  TimestampTz *wait_start);
 
 	/*
 	 * Optional: keep the pages of the session branch's relations relids as
@@ -174,7 +182,8 @@ typedef struct BranchOpsRoutine
 	 * the restored storage once it commits.
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
-							BranchKeptRelation *renewed);
+							BranchKeptRelation *renewed,
+							TimestampTz *wait_start);
 
 	/*
 	 * Optional: let go of a snapshot keep() or restore() took, if its
@@ -215,7 +224,7 @@ typedef struct BranchOpsRoutine
 	 * so the caller gives only pages kept before every snapshot there is.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
-							   int nkept);
+							   int nkept, TimestampTz *wait_start);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

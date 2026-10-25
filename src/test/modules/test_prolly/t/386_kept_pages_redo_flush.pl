@@ -105,6 +105,7 @@ sql(q{SELECT dolt_commit('-am', 'block 1100')});
 $at = sql($bigdigest);
 sql(qq{UPDATE app.big SET v = 3 WHERE id = $ids[2]});
 $now = sql($bigdigest);
+my $bigpath = sql(q{SELECT pg_relation_filepath('app.big')});
 
 $log_offset = -s $node->logfile;
 $node->append_conf('postgresql.conf', 'log_min_messages = debug1');
@@ -114,6 +115,14 @@ is(sql($bigdigest), $now, 'after a crash, app.big as it was');
 ok( !$node->log_contains(
 		'redo of a snapshot of .* writes out every buffer of it', $log_offset),
 	"redo wrote out app.big's own pages, visiting no buffer");
+
+# the walk read the copied node and the leaf under it, and passed over the
+# rest: the first subtree, and the node's first leaf, still shared
+my ($pages, $nodes) = slurp_file($node->logfile, $log_offset) =~
+  /redo of a snapshot of \Q$bigpath\E writes out its own pages: (\d+), found reading (\d+) nodes of its map/;
+ok(defined $nodes, "redo walked app.big's snapshot");
+is($nodes, 2, 'reading two of its four nodes');
+cmp_ok($pages, '<', 20, 'and found a few own pages, not its 1200');
 $node->append_conf('postgresql.conf', 'log_min_messages = warning');
 $node->reload;
 $restored = counted('relations_restored');

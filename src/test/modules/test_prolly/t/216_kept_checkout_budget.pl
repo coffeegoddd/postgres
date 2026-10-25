@@ -128,7 +128,7 @@ $node->safe_psql('other', qq{GRANT USAGE ON SCHEMA o TO reader2;
 	REVOKE USAGE ON SCHEMA o FROM reader2});
 my ($ret, $stdout, $stderr) = $node->psql('postgres', q{DROP ROLE reader2});
 like($stderr, qr/1 object in database other/, 'another database\'s kept checkout keeps the role');
-like($stderr, qr/HINT:  A database's kept detached checkouts/, 'with a hint');
+like($stderr, qr/HINT:  In a database named, .*kept detached checkouts \(prolly.kept_checkouts\) may hold copies/, 'with a hint');
 $node->safe_psql('other', q{SET prolly.kept_checkouts = 0;
 	DO $$BEGIN PERFORM dolt_checkout('main'); END$$});
 sql(q{DROP ROLE reader2});

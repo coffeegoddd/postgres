@@ -1316,8 +1316,8 @@ DropRole(DropRoleStmt *stmt)
 							NameStr(roleform->rolname)),
 					 errdetail_internal("%s", detail),
 					 errdetail_log("%s", detail_log),
-					 prolly_kept_states_named(detail) ?
-					 errhint("A database's kept detached checkouts (prolly.kept_checkouts) hold copies of its objects: in a database named, set prolly.kept_checkouts to 0 and check out a branch to let them go.") : 0));
+					 prolly_drop_role_hint(detail) ?
+					 errhint("%s", prolly_drop_role_hint(detail)) : 0));
 
 		/*
 		 * Remove the role from the pg_authid table

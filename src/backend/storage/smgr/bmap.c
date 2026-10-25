@@ -202,6 +202,7 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 bool		debug_block_mapped_heap = false;
 int			block_map_replay_entries = 65536;
@@ -529,6 +530,30 @@ typedef struct BmapAhead
 
 static HTAB *bmap_ahead = NULL;
 
+/*
+ * What each backend's page sweep holds (a compaction's, compact_store(), or
+ * a lowering of shared_below's, sweep_shared_below()), in its slot: the
+ * relation and its branch, held against their drop, the hold's generation
+ * (raised as each hold begins and ends), and whether another session asked
+ * it to let go of them.  A session that only tries its locks (a restore of
+ * kept pages, a branch's deletion) isn't in the lock's queue, which is all
+ * LockHasWaiters() sees, so it asks here instead (bmap_compaction_let_go()),
+ * and waits for the generation it asked of to pass.  The mutex protects
+ * the slot but 'asked', which a compaction reads at each move.
+ */
+typedef struct BmapCompacting
+{
+	slock_t		mutex;
+	bool		holding;
+	bool		branch_held;
+	uint64		generation;
+	LOCKTAG		rel;
+	LOCKTAG		branch;
+	pg_atomic_uint32 asked;
+} BmapCompacting;
+
+static BmapCompacting *bmap_compacting = NULL;
+
 static void
 BmapShmemRequest(void *arg)
 {
@@ -542,6 +567,10 @@ BmapShmemRequest(void *arg)
 					 .hash_info.keysize = sizeof(BmapAheadKey),
 					 .hash_info.entrysize = sizeof(BmapAhead),
 					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE,
+		);
+	ShmemRequestStruct(.name = "block map compactions",
+					   .size = mul_size(MaxBackends, sizeof(BmapCompacting)),
+					   .ptr = (void **) &bmap_compacting,
 		);
 }
 
@@ -558,6 +587,13 @@ BmapShmemInit(void *arg)
 					 LWLockNewTrancheId("block map replay"));
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
 	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
+	for (int i = 0; i < MaxBackends; i++)
+	{
+		SpinLockInit(&bmap_compacting[i].mutex);
+		bmap_compacting[i].holding = false;
+		bmap_compacting[i].generation = 0;
+		pg_atomic_init_u32(&bmap_compacting[i].asked, 0);
+	}
 	for (int i = 0; i < BMAP_QUEUE_HINTS; i++)
 	{
 		pg_atomic_init_u64(&bmap_shared->queue_empty_key[i], 0);
@@ -5361,6 +5397,9 @@ redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
 	return true;
 }
 
+/* the nodes redo's walk of a snapshot read (redo_own_blocks()) */
+static uint32 redo_walk_nodes = 0;
+
 static bool
 redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			  BlockNumber first, BlockNumber nblocks, uint32 epoch,
@@ -5385,6 +5424,7 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 		PageGetLSN(page.data) > lsn ||
 		!tree_node_is(page.data, level, first, ptr->since))
 		return false;
+	redo_walk_nodes++;
 	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	memcpy(entries, PageGetBmapEntries(page.data),
 		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
@@ -5436,6 +5476,8 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 
 	/* (the map's epoch before the snapshot raised it) */
 	uint32		epoch = snap->epoch - 1;
+
+	redo_walk_nodes = 0;
 
 	for (int k = 0; k < BMAP_TREE_TOPS && first < snap->nblocks; k++)
 	{
@@ -8609,7 +8651,180 @@ typedef struct HeldRelation
 	LOCKTAG		rel;
 	LOCKTAG		branch;
 	bool		branch_held;
+	struct BmapCompacting *slot;	/* a compaction's, asked to let go */
 } HeldRelation;
+
+static void let_go_relation(HeldRelation *held);
+
+/* the longest wait between looks at a compaction asked to let go, in ms */
+#define COMPACTION_LET_GO_MAX_DELAY_MS	10
+
+static bool compacting_cleared_at_exit = false;
+
+/*
+ * What this backend's sweep was asked to let go of (a branch, or a relation
+ * of none): passed over for the rest of the sweep, so that one asking for a
+ * branch waits for one hold, not for a hold of each of its relations in
+ * turn.  Past the most remembered, a hold asked for is only let go of.
+ */
+#define SWEEP_YIELDED_MAX	64
+
+static LOCKTAG sweep_yielded[SWEEP_YIELDED_MAX];
+static int	sweep_nyielded = 0;
+
+/*
+ * This backend's sweep holds nothing now (see BmapCompacting): whether the
+ * hold was asked to let go, read with its end, so that an ask either comes
+ * before (and is answered) or finds nothing held.
+ */
+static bool
+compacting_stop(void)
+{
+	BmapCompacting *c;
+	bool		asked;
+
+	if (MyProcNumber == INVALID_PROC_NUMBER || MyProcNumber >= MaxBackends)
+		return false;
+	c = &bmap_compacting[MyProcNumber];
+	SpinLockAcquire(&c->mutex);
+	asked = c->holding && pg_atomic_read_u32(&c->asked) != 0;
+	if (c->holding)
+		c->generation++;
+	c->holding = false;
+	pg_atomic_write_u32(&c->asked, 0);
+	SpinLockRelease(&c->mutex);
+	return asked;
+}
+
+static void
+compacting_end(int code, Datum arg)
+{
+	(void) compacting_stop();
+}
+
+/*
+ * This backend's slot cleared as it exits.  (Registered before a sweep's
+ * error cleanup is, which must be the latest when it ends.)
+ */
+static void
+compacting_clear_at_exit(void)
+{
+	if (!compacting_cleared_at_exit)
+	{
+		before_shmem_exit(compacting_end, 0);
+		compacting_cleared_at_exit = true;
+	}
+}
+
+/*
+ * This backend's compaction holds 'held' from now on, until
+ * compacting_end(): its slot, whose 'asked' it reads before each move, or
+ * NULL if it has none (an auxiliary process, which compacts nothing).
+ */
+static BmapCompacting *
+compacting_begin(const HeldRelation *held)
+{
+	BmapCompacting *c;
+
+	if (MyProcNumber == INVALID_PROC_NUMBER || MyProcNumber >= MaxBackends)
+		return NULL;
+	compacting_clear_at_exit();
+	c = &bmap_compacting[MyProcNumber];
+	pg_atomic_write_u32(&c->asked, 0);
+	SpinLockAcquire(&c->mutex);
+	c->rel = held->rel;
+	c->branch = held->branch;
+	c->branch_held = held->branch_held;
+	c->holding = true;
+	c->generation++;
+	SpinLockRelease(&c->mutex);
+	return c;
+}
+
+static inline bool
+locktag_equal(const LOCKTAG *a, const LOCKTAG *b)
+{
+	return a->locktag_field1 == b->locktag_field1 &&
+		a->locktag_field2 == b->locktag_field2 &&
+		a->locktag_field3 == b->locktag_field3 &&
+		a->locktag_field4 == b->locktag_field4 &&
+		a->locktag_type == b->locktag_type &&
+		a->locktag_lockmethodid == b->locktag_lockmethodid;
+}
+
+bool
+bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start)
+{
+	long		delay = 1;
+	bool		let_go = false;
+	int			nasked = 0;
+	int		   *asked = palloc_array(int, MaxBackends);
+	uint64	   *generations = palloc_array(uint64, MaxBackends);
+
+	/* the holds of 'tag' now, each asked to let go */
+	for (int i = 0; i < MaxBackends; i++)
+	{
+		BmapCompacting *c = &bmap_compacting[i];
+
+		/* (a slot holding nothing is passed over without its lock) */
+		if (!c->holding)
+			continue;
+		SpinLockAcquire(&c->mutex);
+		if (c->holding &&
+			(locktag_equal(&c->rel, tag) ||
+			 (c->branch_held && locktag_equal(&c->branch, tag))))
+		{
+			pg_atomic_write_u32(&c->asked, 1);
+			asked[nasked] = i;
+			generations[nasked++] = c->generation;
+		}
+		SpinLockRelease(&c->mutex);
+	}
+	if (nasked == 0)
+	{
+		pfree(asked);
+		pfree(generations);
+		return false;
+	}
+
+	/*
+	 * ... until each has ended.  Another hold of the tag begun since (the
+	 * next relation of a branch) isn't waited for: asked, a sweep passes
+	 * over what it was asked for from then on (hold_relation()).
+	 */
+	if (*start == 0)
+		*start = GetCurrentTimestamp();
+	for (;;)
+	{
+		bool		ended = true;
+
+		for (int k = 0; k < nasked && ended; k++)
+		{
+			BmapCompacting *c = &bmap_compacting[asked[k]];
+
+			SpinLockAcquire(&c->mutex);
+			ended = c->generation != generations[k];
+			SpinLockRelease(&c->mutex);
+		}
+		if (ended)
+		{
+			let_go = true;
+			break;
+		}
+		if (LockTimeout > 0 &&
+			TimestampDifferenceExceeds(*start, GetCurrentTimestamp(),
+									   LockTimeout))
+			break;
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 delay, WAIT_EVENT_BMAP_COMPACTION_LET_GO);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		delay = Min(delay * 2, COMPACTION_LET_GO_MAX_DELAY_MS);
+	}
+	pfree(asked);
+	pfree(generations);
+	return let_go;
+}
 
 static bool
 class_row_of(RelFileLocator rel, Oid *relid, Oid *branch)
@@ -8650,37 +8865,56 @@ class_row_of(RelFileLocator rel, Oid *relid, Oid *branch)
 }
 
 static bool
-hold_relation(RelFileLocator rel, HeldRelation *held)
+hold_relation(RelFileLocator rel, HeldRelation *held, bool compacting)
 {
 	Oid			relid;
 	Oid			branch;
 	Oid			again_relid;
 	Oid			again_branch;
 
+	held->slot = NULL;
 	if (rel.dbOid != MyDatabaseId || !IsTransactionState() ||
 		!class_row_of(rel, &relid, &branch))
 		return false;
 	SET_LOCKTAG_BRANCH_RELATION(held->rel, MyDatabaseId, relid, branch);
-	if (LockAcquire(&held->rel, AccessShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
-		return false;
 	held->branch_held = OidIsValid(branch);
 	if (held->branch_held)
-	{
 		branch_locktag(&held->branch, branch);
-		if (LockAcquire(&held->branch, AccessShareLock, false, true) ==
-			LOCKACQUIRE_NOT_AVAIL)
-		{
-			LockRelease(&held->rel, AccessShareLock, false);
-			return false;
-		}
+	if (compacting)
+	{
+		const LOCKTAG *own = held->branch_held ? &held->branch : &held->rel;
+
+		for (int i = 0; i < sweep_nyielded; i++)
+			if (locktag_equal(&sweep_yielded[i], own))
+				return false;
+	}
+
+	/*
+	 * (a compaction's hold shown before it is taken: one who tries a lock
+	 * the hold has just taken finds whom to ask)
+	 */
+	if (compacting)
+		held->slot = compacting_begin(held);
+	if (LockAcquire(&held->rel, AccessShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+	{
+		if (held->slot)
+			compacting_end(0, 0);
+		return false;
+	}
+	if (held->branch_held &&
+		LockAcquire(&held->branch, AccessShareLock, false, true) ==
+		LOCKACQUIRE_NOT_AVAIL)
+	{
+		LockRelease(&held->rel, AccessShareLock, false);
+		if (held->slot)
+			compacting_end(0, 0);
+		return false;
 	}
 	AcceptInvalidationMessages();
 	if (!class_row_of(rel, &again_relid, &again_branch) ||
 		again_relid != relid || again_branch != branch)
 	{
-		if (held->branch_held)
-			LockRelease(&held->branch, AccessShareLock, false);
-		LockRelease(&held->rel, AccessShareLock, false);
+		let_go_relation(held);
 		return false;
 	}
 	return true;
@@ -8692,6 +8926,10 @@ let_go_relation(HeldRelation *held)
 	if (held->branch_held)
 		LockRelease(&held->branch, AccessShareLock, false);
 	LockRelease(&held->rel, AccessShareLock, false);
+	if (held->slot && compacting_stop() &&
+		sweep_nyielded < SWEEP_YIELDED_MAX)
+		sweep_yielded[sweep_nyielded++] =
+			held->branch_held ? held->branch : held->rel;
 }
 
 /*
@@ -8728,8 +8966,9 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	 * before it, and a header dirtied then would be written to a fork
 	 * unlinked)
 	 */
-	if (!hold_relation(rel, &held))
+	if (!hold_relation(rel, &held, true))
 		return;
+	INJECTION_POINT("bmap-shared-below-held", NULL);
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
@@ -9252,13 +9491,14 @@ cmp_move_desc(const void *a, const void *b)
  * Move one relation's blocks from 'target' on, the highest first; the old
  * blocks go back to the allocator.  With 'held' (the relation held against
  * its drop), the moves stop once another waits for that hold, so a DDL
- * waits for no more than a move.  Those that only try their locks (a move
- * of the branch restoring its tables, a branch's deletion) aren't waiting,
- * and still find the relation held until its moves end.
+ * waits for no more than a move.  Those that only try their locks (a
+ * restore of a branch's kept pages, a branch's deletion) aren't waiting,
+ * and ask through the compaction's slot instead (bmap_compaction_let_go()):
+ * the moves stop as well once it is asked.
  */
 static uint64
 compact_relation(SMgrRelation reln, BlockNumber target,
-				 const LOCKTAG *held)
+				 const LOCKTAG *held, BmapCompacting *slot)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	CompactWalk cw = {target, 0, NULL, 0, 0};
@@ -9287,7 +9527,9 @@ compact_relation(SMgrRelation reln, BlockNumber target,
 	{
 		const CompactMove *m = &cw.moves[i];
 
-		if (held != NULL && i > 0 && LockHasWaiters(held, AccessShareLock, false))
+		if (held != NULL && i > 0 &&
+			((slot != NULL && pg_atomic_read_u32(&slot->asked) != 0) ||
+			 LockHasWaiters(held, AccessShareLock, false)))
 			break;
 		if (compact_page(reln, m->blkno, m->phys))
 		{
@@ -9312,6 +9554,7 @@ typedef struct CompactRead
 {
 	BlockNumber target;
 	const LOCKTAG *held;
+	BmapCompacting *slot;
 	uint64		moved;
 } CompactRead;
 
@@ -9320,7 +9563,7 @@ compact_read(SMgrRelation reln, void *arg)
 {
 	CompactRead *cr = arg;
 
-	cr->moved = compact_relation(reln, cr->target, cr->held);
+	cr->moved = compact_relation(reln, cr->target, cr->held, cr->slot);
 }
 
 /*
@@ -9378,12 +9621,13 @@ compact_store(RelFileLocator rel, const char *path)
 		MemoryContextSwitchTo(oldcxt);
 		PG_TRY();
 		{
-			CompactRead cr = {target, NULL, 0};
+			CompactRead cr = {target, NULL, NULL, 0};
 			HeldRelation held;
 
-			if (hold_relation(reln->smgr_rlocator.locator, &held))
+			if (hold_relation(reln->smgr_rlocator.locator, &held, true))
 			{
 				cr.held = &held.rel;
+				cr.slot = held.slot;
 				read_maybe_dropped(reln, compact_read, &cr);
 				let_go_relation(&held);
 			}
@@ -9400,6 +9644,8 @@ compact_store(RelFileLocator rel, const char *path)
 			edata = CopyErrorData();
 			FlushErrorState();
 			RollbackAndReleaseCurrentSubTransaction();
+			/* (shown held until the subtransaction let go of the hold) */
+			compacting_end(0, 0);
 			MemoryContextSwitchTo(oldcxt);
 			CurrentResourceOwner = oldowner;
 			ereport(DEBUG1,
@@ -9457,6 +9703,17 @@ reclaim_store_snapshots(RelFileLocator rel, const char *path)
 	return n;
 }
 
+/*
+ * A sweep's counting failed: as sweep_done(), and a hold of a lowering of
+ * shared_below (sweep_shared_below()) shown let go of with it.
+ */
+static void
+sweep_failed(int code, Datum arg)
+{
+	compacting_end(code, 0);
+	sweep_done(code, arg);
+}
+
 void
 bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 {
@@ -9484,11 +9741,13 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	INJECTION_POINT("bmap-sweep-drained", NULL);
 	swept_note(rel, true, &released);
 	sweep_note(rel, true);
-	PG_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
+	sweep_nyielded = 0;
+	compacting_clear_at_exit();
+	PG_ENSURE_ERROR_CLEANUP(sweep_failed, PointerGetDatum(&rel));
 	{
 		sweep_store(rel, path, result);
 	}
-	PG_END_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
+	PG_END_ENSURE_ERROR_CLEANUP(sweep_failed, PointerGetDatum(&rel));
 	sweep_done(0, PointerGetDatum(&rel));
 	result->moved = compact_store(rel, path);
 	result->truncated = sweep_shrink(rel);
@@ -11834,8 +12093,13 @@ bmap_redo(XLogReaderState *record)
 												 INVALID_PROC_NUMBER);
 
 					if (walked)
+					{
+						elog(DEBUG1, "redo of a snapshot of %s writes out its own pages: %u, found reading %u nodes of its map",
+							 relpathperm(xlrec->locator, MAIN_FORKNUM).str,
+							 own.n, redo_walk_nodes);
 						FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks,
 											own.n);
+					}
 					else
 					{
 						elog(DEBUG1, "redo of a snapshot of %s writes out every buffer of it: %s",
