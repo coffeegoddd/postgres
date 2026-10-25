@@ -51,7 +51,11 @@
  * WRITTEN_RELATIONS of them, and the generation since which every one is
  * there.  A canonicalizer that marked a fold (branch_fold_mark()) asks
  * later which relations were written since (branch_written_since()), and
- * works out again only those.  Anything that changes a fold otherwise
+ * works out again only those.  The last fold known stays with the branch
+ * once a writer ends too, with the generation it was known at
+ * (branch_fold_last()): any backend can take it as the working set but
+ * for the relations written since, while its baseline is the branch's and
+ * the epoch hasn't moved.  Anything that changes a fold otherwise
  * moves what the mark took: a catalog change or collection the epoch, a
  * writer of every branch or a prepared transaction's end the overflow, a
  * writer of too many relations or an eviction the generation since which
@@ -82,6 +86,7 @@
 #include "utils/timestamp.h"
 
 #define BRANCH_GENERATIONS	1024
+#define HEAD_RESTORES		64
 #define ENDED_WRITERS		8
 #define WRITTEN_RELATIONS	32
 
@@ -116,6 +121,8 @@ typedef struct BranchGeneration
 	uint64		overflow;
 	ProllyHash	baseline;		/* folded from (len 0: none) */
 	ProllyHash	root;
+	bool		last;			/* the fold below was known, at generation */
+	uint64		last_generation;	/* (kept as writers end: see below) */
 	uint64		seen;			/* the generation the fold worker last saw */
 	/* what the writers that ended since then did: rows, when, how late */
 	uint64		rows;
@@ -132,6 +139,17 @@ typedef struct BranchGeneration
 	WrittenRelation rels[WRITTEN_RELATIONS];
 } BranchGeneration;
 
+/*
+ * A branch whose tables a move gave the pages kept as of its head, and the
+ * transaction that did: see branch_note_head_restore().
+ */
+typedef struct HeadRestore
+{
+	Oid			database;
+	Oid			branch;			/* InvalidOid: a free entry */
+	FullTransactionId xid;
+} HeadRestore;
+
 typedef struct BranchGenerations
 {
 	LWLock		lock;
@@ -144,6 +162,10 @@ typedef struct BranchGenerations
 	FullTransactionId overflow_ended;	/* the latest of them that ended */
 	int			hand;			/* the next entry to evict, if it can be */
 	BranchGeneration entries[BRANCH_GENERATIONS];
+	/* (head restores: the latest of those let go of stands for them all) */
+	int			restores_hand;
+	FullTransactionId restores_evicted;
+	HeadRestore restores[HEAD_RESTORES];
 } BranchGenerations;
 
 static BranchGenerations *gens = NULL;
@@ -225,6 +247,93 @@ later(FullTransactionId a, FullTransactionId b)
 		(FullTransactionIdIsValid(b) && FullTransactionIdFollows(b, a)))
 		return b;
 	return a;
+}
+
+/*
+ * The transaction gave branch's tables the pages kept as of its head (a
+ * move to a commit whose own pages are gone): a snapshot taken before it
+ * commits that reads them after would read the head's rows, a state the
+ * branch never had.  Sessions on the branch are asked of before (their
+ * snapshots hold the move back); one that comes to the branch later in a
+ * transaction whose snapshot can't move asks branch_head_restore_unseen()
+ * first.  Remembered by the last HEAD_RESTORES branches, the latest of the
+ * others' standing for all of them (so a branch let go of is asked of as
+ * if restored as late as any was).  Nothing survives a restart, nor needs
+ * to: no snapshot after one is older than a restore before it.
+ */
+void
+branch_note_head_restore(Oid branch)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId xid = GetTopFullTransactionId();
+	HeadRestore *slot = NULL;
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < HEAD_RESTORES && slot == NULL; i++)
+	{
+		HeadRestore *r = &g->restores[i];
+
+		if (r->branch == branch && r->database == MyDatabaseId)
+			slot = r;
+	}
+	for (int i = 0; i < HEAD_RESTORES && slot == NULL; i++)
+	{
+		if (!OidIsValid(g->restores[i].branch))
+			slot = &g->restores[i];
+	}
+	if (slot == NULL)
+	{
+		slot = &g->restores[g->restores_hand];
+		g->restores_hand = (g->restores_hand + 1) % HEAD_RESTORES;
+		g->restores_evicted = later(g->restores_evicted, slot->xid);
+	}
+	if (slot->branch == branch && slot->database == MyDatabaseId)
+		slot->xid = later(slot->xid, xid);
+	else
+		slot->xid = xid;
+	slot->database = MyDatabaseId;
+	slot->branch = branch;
+	LWLockRelease(&g->lock);
+}
+
+/*
+ * Did a transaction snap doesn't see give branch's tables the pages kept
+ * as of its head (branch_note_head_restore())?  One that didn't commit
+ * counts too, while snap can't tell it from one running.
+ */
+bool
+branch_head_restore_unseen(Oid branch, Snapshot snap)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId xid = InvalidFullTransactionId;
+	bool		found = false;
+	FullTransactionId xmin;
+
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC)
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	for (int i = 0; i < HEAD_RESTORES && !found; i++)
+	{
+		HeadRestore *r = &g->restores[i];
+
+		if (r->branch == branch && r->database == MyDatabaseId)
+		{
+			xid = r->xid;
+			found = true;
+		}
+	}
+	if (!found)
+		xid = g->restores_evicted;
+	LWLockRelease(&g->lock);
+	if (!FullTransactionIdIsValid(xid) ||
+		TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(xid)))
+		return false;
+	xmin = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											snap->xmin);
+	return !FullTransactionIdPrecedes(xid, xmin) &&
+		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
 }
 
 /* Remember a writer that ended (the lock held exclusively). */
@@ -701,6 +810,8 @@ make_known(BranchGenerations *g, const PendingFold *pf)
 	e->overflow = pf->overflow;
 	e->baseline = pf->baseline;
 	e->root = pf->root;
+	e->last = true;
+	e->last_generation = e->generation;
 }
 
 /*
@@ -831,6 +942,41 @@ branch_fold_known_at(Oid branch, Snapshot snap, const ProllyHash *baseline,
 			at->overflow = g->overflow;
 			at->epoch = e->epoch;
 		}
+		found = true;
+	}
+	LWLockRelease(&g->lock);
+	return found;
+}
+
+bool
+branch_fold_last(Oid branch, Snapshot snap, const ProllyHash *baseline,
+				 ProllyHash *root, ProllyFoldMark *mark)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	ProllyHash	none = {0};
+	bool		found = false;
+
+	if (!markable(snap))
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, branch);
+
+	/*
+	 * (one still known, nobody writing, is branch_fold_known()'s: taken as
+	 * the working set, rows and all)
+	 */
+	if (e != NULL && e->last && e->complete && !(e->known && e->writers == 0) &&
+		e->overflow == g->overflow &&
+		e->epoch == pg_atomic_read_u64(&g->epoch) &&
+		same_hash(&e->baseline, baseline ? baseline : &none) &&
+		sees_writers(g, e, snap))
+	{
+		*root = e->root;
+		mark->branch = branch;
+		mark->generation = e->last_generation;
+		mark->overflow = e->overflow;
+		mark->epoch = e->epoch;
 		found = true;
 	}
 	LWLockRelease(&g->lock);

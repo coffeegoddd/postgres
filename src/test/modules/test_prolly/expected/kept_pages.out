@@ -246,8 +246,8 @@ SELECT rows_digest() = :'at_load' AS as_loaded, clean(), indexes_valid();
 (1 row)
 
 -- and back to the commit made after the reset: kept too (the last two
--- are), but the reset just made gave kp.t new storage, which its
--- snapshots of that commit went with; kp.t's rows are written
+-- are), and though the reset just made gave kp.t new storage, its
+-- snapshots of that commit were carried into it: no row written
 SELECT pg_stat_force_next_flush();
  pg_stat_force_next_flush 
 --------------------------
@@ -270,7 +270,7 @@ SELECT pg_stat_force_next_flush();
 SELECT since(:'before') ->> 'apply_rows' AS applied;
  applied 
 ---------
- 2
+ 0
 (1 row)
 
 SELECT rows_digest() = :'at_second' AS as_second, clean(), indexes_valid();

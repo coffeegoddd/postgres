@@ -104,6 +104,7 @@ extern void CallRelSyncCallbacks(Oid relid);
 
 extern void InvalidateSystemCaches(void);
 extern void InvalidateSystemCachesExtended(bool debug_discard);
+extern void InvalidateBranchCaches(void);
 
 extern void LogLogicalInvalidations(void);
 #endif							/* INVAL_H */

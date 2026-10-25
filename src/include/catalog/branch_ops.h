@@ -45,6 +45,22 @@ typedef struct BranchKeptRelation
 	MultiXactId minmxid;
 } BranchKeptRelation;
 
+/*
+ * What is left of a relation's kept pages (kept_status()): restorable, as
+ * restore() and share_kept() require; held, its snapshot still in the
+ * storage that kept it but the pages not to be given back (its rows'
+ * transaction ids older than the database still knows); or gone, that
+ * storage or its snapshot no longer there, or the relation on other
+ * storage now, its old storage going with the change, so nothing is left
+ * to give back or let go of.
+ */
+typedef enum BranchKeptStatus
+{
+	BRANCH_KEPT_RESTORABLE,
+	BRANCH_KEPT_HELD,
+	BRANCH_KEPT_GONE,
+} BranchKeptStatus;
+
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
 {
@@ -106,6 +122,13 @@ typedef struct BranchOpsRoutine
 
 	/* Visit every branch. */
 	void		(*branches) (BranchVisit visit, void *arg);
+
+	/*
+	 * Visit the branches whose names begin with prefix, in name order: the
+	 * work is in those, however many other branches there are.
+	 */
+	void		(*branches_named) (const char *prefix, BranchVisit visit,
+								   void *arg);
 
 	/*
 	 * Run fn with the session on branch name, back on its own branch after,
@@ -178,11 +201,20 @@ typedef struct BranchOpsRoutine
 	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
 	 * refuses, while the session itself has it open or an AFTER trigger's
 	 * event queued on it; the locks taken are kept).
+	 * The storage a relation is given replaces the storage that kept its
+	 * pages, which goes as the transaction commits, and with it every
+	 * other snapshot there: so each of carry[] (ncarry of them, other
+	 * commits' kept pages of the same relations) that is a snapshot of a
+	 * replaced storage is kept by the new storage too, O(1) each, and
+	 * carried[] (one for each, in order) names it there; one not carried
+	 * (not of a replaced storage, gone, or no room) is copied as it is.
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the restored storage once it commits.
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
 							BranchKeptRelation *renewed,
+							const BranchKeptRelation *carry, int ncarry,
+							BranchKeptRelation *carried,
 							TimestampTz *wait_start);
 
 	/*
@@ -190,6 +222,13 @@ typedef struct BranchOpsRoutine
 	 * storage still has it (a dropped relation's went with it).
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: what is left of the pages keep() or restore() kept of the
+	 * session branch's relation kept, as the transaction sees the branch
+	 * (a relation it gave new storage is gone from its old storage's).
+	 */
+	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch
@@ -222,9 +261,15 @@ typedef struct BranchOpsRoutine
 	 * snapshot taken before the keeping transaction ended could read
 	 * versions source made and deleted, rows never the session branch's,
 	 * so the caller gives only pages kept before every snapshot there is.
+	 * With source the session's own branch, carry[] is carried into the
+	 * new storage as restore() carries it, carried[] naming each there
+	 * (every one of them, the snapshot shared included, none being taken
+	 * after); with another's, carried[] is carry[] as it is.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
-							   int nkept, TimestampTz *wait_start);
+							   int nkept, const BranchKeptRelation *carry,
+							   int ncarry, BranchKeptRelation *carried,
+							   TimestampTz *wait_start);
 
 	/*
 	 * Optional: add to each of the session branch's relations relids the

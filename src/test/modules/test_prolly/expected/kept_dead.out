@@ -1,0 +1,326 @@
+-- A commit whose kept pages are gone is no longer kept: its table's
+-- storage replaced, with its snapshot there, by a rewrite or a TRUNCATE,
+-- or the table dropped.  (A restore of another commit gives the table new
+-- storage too, but carries the other commits' snapshots into it.)  Such a
+-- commit is dropped from the branch's kept commits by the same
+-- transaction, so it no longer counts toward prolly.kept_commits, keeps
+-- its commit and baseline from collection, or is offered to a move; one
+-- with a snapshot left but no table restorable is retired.  A commit some
+-- table of which can still be given its pages stays kept, whatever else
+-- happens to the table, and one made gone by a change rolled back is kept
+-- as it was, its snapshots too.
+SELECT current_database() AS home \gset
+CREATE DATABASE kept_dead;
+ALTER DATABASE kept_dead SET prolly.restore_min_changes = 0;
+ALTER DATABASE kept_dead SET prolly.kept_commits = 3;
+\c kept_dead
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION restored() RETURNS bigint LANGUAGE sql AS $$
+	SELECT coalesce((SELECT value FROM pg_stat_prolly
+					 WHERE name = 'relations_restored'), 0)
+$$;
+-- the commits kept, as names given below
+CREATE TABLE names (id text PRIMARY KEY, name text);
+CREATE FUNCTION kept() RETURNS text LANGUAGE sql AS $$
+	SELECT string_agg(coalesce(n.name, '?'), ' ' ORDER BY k.ord)
+	FROM test_kept_commits('main') WITH ORDINALITY k(id, ord)
+	LEFT JOIN names n ON n.id = k.id
+$$;
+CREATE FUNCTION named(name text) RETURNS text LANGUAGE sql AS $$
+	SELECT id FROM names n WHERE n.name = named.name
+$$;
+CREATE SCHEMA kd VERSIONED;
+CREATE TABLE kd.t (id int PRIMARY KEY, v int NOT NULL);
+CREATE INDEX t_v ON kd.t (v);
+INSERT INTO kd.t SELECT g, 0 FROM generate_series(1, 2000) g;
+INSERT INTO names SELECT (dolt_commit('-Am', 'a'))[1], 'a';
+UPDATE kd.t SET v = 1 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'b'))[1], 'b';
+UPDATE kd.t SET v = 2 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'c'))[1], 'c';
+SELECT kept();
+ kept  
+-------
+ c b a
+(1 row)
+
+-- a hard reset to b restores kd.t: c's and a's snapshots were in the
+-- storage it replaced, and are carried into the new storage, still kept
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT restored() AS before \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT restored() > :before AS restored;
+ restored 
+----------
+ t
+(1 row)
+
+SELECT kept();
+ kept  
+-------
+ b c a
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
+ at_b 
+------
+  100
+(1 row)
+
+-- so the next commits keep them, as many as are kept
+UPDATE kd.t SET v = 3 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'd'))[1], 'd';
+SELECT kept();
+ kept  
+-------
+ d b a
+(1 row)
+
+-- and a reset back to b is O(1) again: its pages given back
+SELECT restored() AS before \gset
+SELECT dolt_reset('--hard', named('b'));
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT restored() > :before AS restored, kept();
+ restored | kept  
+----------+-------
+ t        | b d a
+(1 row)
+
+-- a commit whose table TRUNCATE gave new storage is retired (its change
+-- log still holds a snapshot, let go of by a later keep), but one with a
+-- table it left still kept
+CREATE TABLE kd.u (id int PRIMARY KEY);
+INSERT INTO kd.u SELECT generate_series(1, 10);
+INSERT INTO names SELECT (dolt_commit('-Am', 'e'))[1], 'e';
+SELECT kept();
+ kept  
+-------
+ e b a
+(1 row)
+
+TRUNCATE kd.t;
+INSERT INTO kd.t VALUES (1, 1);
+INSERT INTO names SELECT (dolt_commit('-am', 'f'))[1], 'f';
+SELECT kept();
+ kept 
+------
+ f e
+(1 row)
+
+TRUNCATE kd.u;
+INSERT INTO names SELECT (dolt_commit('-am', 'g'))[1], 'g';
+SELECT kept();
+ kept 
+------
+ g f
+(1 row)
+
+-- what leaves a table on its storage leaves its commits kept
+INSERT INTO names SELECT (dolt_commit('--allow-empty', '-m', 'h'))[1], 'h';
+SELECT kept();
+ kept  
+-------
+ h g f
+(1 row)
+
+VACUUM kd.t;
+VACUUM (FREEZE) kd.u;
+ANALYZE kd.t;
+ALTER TABLE kd.t ADD COLUMN w int;
+INSERT INTO names SELECT (dolt_commit('-am', 'i'))[1], 'i';
+SELECT kept();
+ kept  
+-------
+ i h g
+(1 row)
+
+CREATE INDEX t_w ON kd.t (w);
+INSERT INTO names SELECT (dolt_commit('-am', 'j'))[1], 'j';
+SELECT kept();
+ kept  
+-------
+ j i h
+(1 row)
+
+-- a TRUNCATE rolled back to a savepoint, with a commit after it: kept as
+-- it was
+BEGIN;
+SAVEPOINT s;
+TRUNCATE kd.t, kd.u;
+INSERT INTO names SELECT (dolt_commit('-am', 'k'))[1], 'k';
+ROLLBACK TO s;
+COMMIT;
+SELECT kept();
+ kept  
+-------
+ j i h
+(1 row)
+
+-- a commit made gone by a change that rolls back still has every
+-- snapshot it had, though a commit let go of shared one with it: kr.t's
+-- relations, unchanged since m, are kept by m's snapshots for n and o too
+SET prolly.kept_commits = 2;
+CREATE SCHEMA kr VERSIONED;
+CREATE TABLE kr.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO kr.t SELECT g, 0 FROM generate_series(1, 2000) g;
+CREATE TABLE kr.u (id int PRIMARY KEY, v int);
+INSERT INTO kr.u SELECT g, 0 FROM generate_series(1, 2000) g;
+INSERT INTO names SELECT (dolt_commit('-Am', 'm'))[1], 'm';
+UPDATE kr.u SET v = 1 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'n'))[1], 'n';
+UPDATE kr.u SET v = 2 WHERE id <= 100;
+INSERT INTO names SELECT (dolt_commit('-am', 'o'))[1], 'o';
+SELECT kept();
+ kept 
+------
+ o n
+(1 row)
+
+CREATE TABLE kr.w (id int PRIMARY KEY);
+BEGIN;
+DROP TABLE kd.t, kd.u, kr.t, kr.u;
+SELECT dolt_commit('-Am', 'gone') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT kept();
+ kept 
+------
+ o n
+(1 row)
+
+UPDATE kr.u SET v = 3 WHERE id <= 100;
+UPDATE kr.t SET v = 3 WHERE id <= 100;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT restored() AS before \gset
+SELECT dolt_reset('--hard', named('n'));
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+-- (kr.t's and kr.u's: each heap, index, change log and its index)
+SELECT restored() - :before AS restored;
+ restored 
+----------
+        8
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 1) AS at_n FROM kr.u;
+ at_n 
+------
+  100
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 0) AS at_n FROM kr.t;
+ at_n 
+------
+ 2000
+(1 row)
+
+RESET prolly.kept_commits;
+-- a commit only the kept record names, its tables dropped: dropped from
+-- the record, so collected
+\c :home
+CREATE DATABASE kept_dead_gc;
+ALTER DATABASE kept_dead_gc SET prolly.restore_min_changes = 0;
+\c kept_dead_gc
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA kg VERSIONED;
+CREATE TABLE kg.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO kg.t SELECT g, 0 FROM generate_series(1, 2000) g;
+SELECT dolt_commit('-Am', 'p') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE kg.t SET v = 1 WHERE id <= 100;
+SELECT (dolt_commit('-am', 'q'))[1] AS q \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS kept FROM test_kept_commits('main') k WHERE k.commit_id = :'q';
+ kept 
+------
+    1
+(1 row)
+
+DROP TABLE kg.t;
+CREATE TABLE kg.z (id int PRIMARY KEY);
+SELECT dolt_commit('-Am', 'r') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS kept FROM test_kept_commits('main') k WHERE k.commit_id = :'q';
+ kept 
+------
+    0
+(1 row)
+
+SET client_min_messages = error;
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+ kept 
+------
+ t
+(1 row)
+
+RESET client_min_messages;
+SELECT test_chunk_has(:'q') AS q_stored;
+ q_stored 
+----------
+ f
+(1 row)
+
+\c :home
+DROP DATABASE kept_dead;
+DROP DATABASE kept_dead_gc;

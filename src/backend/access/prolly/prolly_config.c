@@ -37,6 +37,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",
 	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_VALUE_MEMO] = "shared",
+	[PROLLY_IFACE_NODE_CACHE] = "shared",
 	[PROLLY_IFACE_CHANGE_FINDER] = "log",
 	[PROLLY_IFACE_CHANGE_LOG] = "relation",
 };
@@ -53,6 +54,7 @@ static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_RECLAMATION] = "copying",
 	[PROLLY_IFACE_WRITERS] = "modes",
 	[PROLLY_IFACE_MATERIALIZATION_CACHE] = "branches",
+	[PROLLY_IFACE_COMMIT_CACHE] = "shared",
 };
 
 static const ProllyImplInfo *
@@ -109,6 +111,13 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 				 errmsg("\"%s\" is not a prolly table",
 						RelationGetRelationName(rel))));
 	prolly_history_components(components);
+}
+
+const ProllyNodeCacheRoutine *
+prolly_node_cache(void)
+{
+	return (const ProllyNodeCacheRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_NODE_CACHE);
 }
 
 void
@@ -414,6 +423,8 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(copies_profile, PROLLY_IFACE_WRITERS);
 	components->matcache = (const ProllyMatCacheRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_MATERIALIZATION_CACHE);
+	components->commit_cache = (const ProllyCommitCacheRoutine *)
+		profile_impl(copies_profile, PROLLY_IFACE_COMMIT_CACHE);
 }
 
 /* A data tree value's references: its row's. */

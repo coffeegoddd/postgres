@@ -441,12 +441,17 @@ typedef struct KeepSet
 	ProllyHash	hashes[KEEP_MAX];
 } KeepSet;
 
-/* a transaction that told keep() of a chunk (xid invalid: none) */
+/*
+ * A transaction that told keep() of a chunk (xid invalid: none), or one
+ * begun on a hot standby that did, which has no xid: held is its local
+ * transaction id (invalid: none).
+ */
 typedef struct KeepTouch
 {
 	Oid			dboid;
 	Oid			spcoid;
 	TransactionId xid;
+	LocalTransactionId held;
 } KeepTouch;
 
 /* shared by every backend */
@@ -465,6 +470,14 @@ typedef struct JournalShared
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
 	pg_atomic_uint64 keeps_begun;	/* keep sets begun */
+
+	/*
+	 * The store whose collection's swap is being replayed (dboid invalid:
+	 * none), under mutex, and broadcast once it has been.
+	 */
+	Oid			swap_dboid;
+	Oid			swap_spcoid;
+	ConditionVariable swapped;
 
 	/*
 	 * A sync request the checkpointer's queue refused: the next checkpoint
@@ -640,6 +653,7 @@ typedef void (*DatabaseDirFn) (const char *dir, Oid dboid, Oid spcoid);
 static void each_database_dir(DatabaseDirFn fn);
 static void retire_files(Oid dboid, Oid spcoid, const Manifest *before,
 						 const Manifest *after);
+static void keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t);
 static void standby_readers_note(Oid dboid);
 static void standby_readers_resolve(Oid dboid);
 static void check_dropped(ProllyChunkStore *s, const ProllyHash *root);
@@ -671,244 +685,87 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
 }
 
 /*
- * Decoded chunks the session's store read from its files, kept by hash for
- * the backend's later reads, least recently used dropped past
- * prolly_chunk_cache_size kB.  A chunk is named by its content, so one kept
- * is the chunk whatever happens to the store after; but not that the
- * store still has it: a collection may remove it.  So the cache is of a
- * collection's generation (the manifest's gc_generation), and let go of
- * whole once a read sees another, as the store's own reads then find
- * nothing of what was removed.  Those read from the files, and the
- * chunks a transaction appends as it commits (pending_cached()): not while
- * pending or transient, which an abort takes back, nor one read through a
- * source.
- *
- * A chunk is kept the second time it is read from the files, not the
- * first: the hashes of those read once are remembered (as many as the
- * cache holds chunks), so a read of many chunks once each, as a fold of
- * many rows reads leaves, neither churns the cache nor pays to fill it,
- * while the nodes reads keep coming back to (upper levels, rows read
- * again) are kept from their second read on.
+ * Decoded chunks the session's store read from its files, kept by hash in
+ * the node cache (prolly_nodecache.h) for every backend's later reads.  A
+ * chunk is named by its content, so one kept is the chunk whatever happens
+ * to the store after; but not that the store still has it: a collection
+ * may remove it.  So what is kept is of the store as of a collection's
+ * generation (the manifest's gc_generation), and a read finds only what
+ * was kept in the generation it reads in: one after a collection finds
+ * nothing of what was removed, as the store's own reads then do.  Offered:
+ * those read from the files (checked as they are read), which the cache
+ * keeps once read again lately, so a read of many chunks once each, as a
+ * scan or a fold of many rows reads leaves, neither churns it nor pays to
+ * fill it; and the chunks a transaction appends as it commits
+ * (pending_cached()), kept at once, once it has.  Not while pending or
+ * transient, which an abort takes back, nor one read through a source.
  */
-int			prolly_chunk_cache_size = 16384;
-
-typedef struct CachedChunk
+static const ProllyNodeCacheRoutine *
+node_cache(void)
 {
-	ProllyHash	key;			/* hash_key()'s */
-	char	   *data;
-	uint32		len;
-	dlist_node	lru;			/* most recent first */
-} CachedChunk;
+	static const ProllyNodeCacheRoutine *nc = NULL;
+	static bool looked = false;
 
-static HTAB *chunk_cache = NULL;
-static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
-static Size chunk_cache_bytes = 0;
-static MemoryContext chunk_cache_cxt = NULL;
-static uint32 chunk_cache_generation = 0;	/* what it holds is of */
-
-/*
- * Hashes read once, oldest first: a ring, and a set of what it holds, each
- * with its slot (a key found is let go of from the set, not the ring: its
- * slot, reached again, lets go of the key only if it's still that slot's).
- */
-typedef struct SeenChunk
-{
-	ProllyHash	key;
-	int			slot;
-} SeenChunk;
-
-static HTAB *chunk_seen = NULL;
-static ProllyHash *chunk_seen_ring = NULL;
-static int	chunk_seen_size = 0;
-static int	chunk_seen_next = 0;
-
-/* (about as many as the cache holds chunks of a node's target size) */
-#define CHUNK_SEEN_SIZE(limit) ((int) Min(Max((limit) / 4096, 64), 1 << 20))
-
-/*
- * Has key been read from the files once already, lately?  If not, it is
- * remembered as read once.
- */
-static bool
-chunk_seen_before(const ProllyHash *key, Size limit)
-{
-	bool		found;
-	int			want = CHUNK_SEEN_SIZE(limit);
-
-	if (chunk_seen == NULL || chunk_seen_size != want)
+	if (!looked)
 	{
-		HASHCTL		ctl;
-
-		if (chunk_seen != NULL)
-		{
-			hash_destroy(chunk_seen);
-			pfree(chunk_seen_ring);
-		}
-		ctl.keysize = sizeof(ProllyHash);
-		ctl.hash = chunk_hash_key_hash;
-		ctl.entrysize = sizeof(SeenChunk);
-		ctl.hcxt = chunk_cache_cxt;
-		chunk_seen = hash_create("prolly chunks read once", want, &ctl,
-								 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
-		chunk_seen_ring = MemoryContextAllocZero(chunk_cache_cxt,
-												 want * sizeof(ProllyHash));
-		chunk_seen_size = want;
-		chunk_seen_next = 0;
+		nc = prolly_node_cache();
+		/* (one off, its size 0, is none: no lookup, nor a miss counted) */
+		if (nc != NULL &&
+			(!PROLLY_HAS(nc, lookup) || !PROLLY_HAS(nc, insert) ||
+			 !PROLLY_HAS(nc, capacity) || nc->capacity() == 0))
+			nc = NULL;
+		looked = true;
 	}
-	(void) hash_search(chunk_seen, key, HASH_FIND, &found);
-	if (found)
+	return nc;
+}
+
+static void
+cache_scope(const ProllyChunkStore *s, uint32 generation,
+			ProllyNodeCacheScope *scope)
+{
+	scope->dboid = s->dboid;
+	scope->spcoid = s->spcoid;
+	scope->generation = generation;
+}
+
+static bool
+chunk_cache_take(const ProllyChunkStore *s, const ProllyHash *key,
+				 StringInfo out, uint32 generation)
+{
+	const ProllyNodeCacheRoutine *nc = node_cache();
+	ProllyNodeCacheScope scope;
+
+	if (nc == NULL)
+		return false;
+	cache_scope(s, generation, &scope);
+	if (nc->lookup(&scope, key, out))
 	{
-		(void) hash_search(chunk_seen, key, HASH_REMOVE, NULL);
+		pgstat_count_prolly(PGSTAT_PROLLY_NODE_CACHE_HITS, 1);
 		return true;
 	}
-	/* (the oldest let go of, if the ring is full and the set still has it) */
-	if (chunk_seen_ring[chunk_seen_next].len != 0)
-	{
-		SeenChunk  *old = hash_search(chunk_seen,
-									  &chunk_seen_ring[chunk_seen_next],
-									  HASH_FIND, NULL);
-
-		if (old != NULL && old->slot == chunk_seen_next)
-			(void) hash_search(chunk_seen, &old->key, HASH_REMOVE, NULL);
-	}
-	chunk_seen_ring[chunk_seen_next] = *key;
-	((SeenChunk *) hash_search(chunk_seen, key, HASH_ENTER, NULL))->slot =
-		chunk_seen_next;
-	chunk_seen_next = (chunk_seen_next + 1) % chunk_seen_size;
+	pgstat_count_prolly(PGSTAT_PROLLY_NODE_CACHE_MISSES, 1);
 	return false;
+}
+
+static void
+chunk_cache_put(const ProllyChunkStore *s, const ProllyHash *key,
+				const char *data, uint32 len, uint32 generation, bool at_once)
+{
+	const ProllyNodeCacheRoutine *nc = node_cache();
+	ProllyNodeCacheScope scope;
+
+	if (nc == NULL)
+		return;
+	cache_scope(s, generation, &scope);
+	nc->insert(&scope, key, data, len, at_once);
 }
 
 static Size
 chunk_cache_limit(void)
 {
-	return (Size) prolly_chunk_cache_size * 1024;
-}
+	const ProllyNodeCacheRoutine *nc = node_cache();
 
-static void chunk_cache_evict(Size limit);
-
-/*
- * The cache and the chunks read once let go of, if they're of another
- * collection's generation than the store's now.
- */
-static void
-chunk_cache_of(uint32 generation)
-{
-	if (generation == chunk_cache_generation)
-		return;
-	chunk_cache_generation = generation;
-	if (chunk_cache != NULL)
-		chunk_cache_evict(0);
-	if (chunk_seen != NULL)
-	{
-		hash_destroy(chunk_seen);
-		pfree(chunk_seen_ring);
-		chunk_seen = NULL;
-		chunk_seen_ring = NULL;
-		chunk_seen_size = 0;
-		chunk_seen_next = 0;
-	}
-}
-
-static bool
-chunk_cache_take(const ProllyHash *key, StringInfo out, uint32 generation)
-{
-	CachedChunk *c;
-
-	chunk_cache_of(generation);
-	if (chunk_cache == NULL)
-		return false;
-	/* (the setting lowered: what it no longer holds let go of first) */
-	if (chunk_cache_bytes > chunk_cache_limit())
-		chunk_cache_evict(chunk_cache_limit());
-	c = hash_search(chunk_cache, key, HASH_FIND, NULL);
-	if (c == NULL)
-		return false;
-	dlist_move_head(&chunk_cache_lru, &c->lru);
-	appendBinaryStringInfo(out, c->data, c->len);
-	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_CACHE_HITS, 1);
-	return true;
-}
-
-static void
-chunk_cache_evict(Size limit)
-{
-	while (chunk_cache_bytes > limit && !dlist_is_empty(&chunk_cache_lru))
-	{
-		CachedChunk *c = dlist_container(CachedChunk, lru,
-										 dlist_tail_node(&chunk_cache_lru));
-
-		dlist_delete(&c->lru);
-		chunk_cache_bytes -= c->len + sizeof(CachedChunk);
-		pfree(c->data);
-		(void) hash_search(chunk_cache, &c->key, HASH_REMOVE, NULL);
-	}
-}
-
-static void chunk_cache_insert(const ProllyHash *key, const char *data,
-							   uint32 len, uint32 generation, bool admit);
-
-static void
-chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
-				uint32 generation)
-{
-	chunk_cache_insert(key, data, len, generation, false);
-}
-
-/*
- * A chunk into the cache: one read from the files only once seen before
- * (one read once isn't let in), or, admit, at once (the transaction's own,
- * stored as it commits).
- */
-static void
-chunk_cache_insert(const ProllyHash *key, const char *data, uint32 len,
-				   uint32 generation, bool admit)
-{
-	Size		limit = chunk_cache_limit();
-	CachedChunk *c;
-	char	   *copy;
-	bool		found;
-
-	chunk_cache_of(generation);
-
-	/* (none past an eighth of the cache: one chunk mustn't empty it) */
-	if (limit == 0 || (Size) len + sizeof(CachedChunk) > limit / 8)
-	{
-		if (chunk_cache != NULL)
-			chunk_cache_evict(limit);
-		return;
-	}
-	if (chunk_cache_cxt == NULL)
-		chunk_cache_cxt = AllocSetContextCreate(TopMemoryContext,
-												"prolly chunk cache",
-												ALLOCSET_DEFAULT_SIZES);
-	if (!admit && !chunk_seen_before(key, limit))
-		return;
-	if (chunk_cache == NULL)
-	{
-		HASHCTL		ctl;
-
-		ctl.keysize = sizeof(ProllyHash);
-		ctl.hash = chunk_hash_key_hash;
-		ctl.entrysize = sizeof(CachedChunk);
-		ctl.hcxt = chunk_cache_cxt;
-		chunk_cache = hash_create("prolly chunk cache", 1024, &ctl,
-								  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
-	}
-	/* (copied first: an entry is made only once it can be filled) */
-	copy = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
-	memcpy(copy, data, len);
-	c = hash_search(chunk_cache, key, HASH_ENTER, &found);
-	if (found)
-	{
-		pfree(copy);
-		dlist_move_head(&chunk_cache_lru, &c->lru);
-		return;
-	}
-	c->data = copy;
-	c->len = len;
-	dlist_push_head(&chunk_cache_lru, &c->lru);
-	chunk_cache_bytes += len + sizeof(CachedChunk);
-	chunk_cache_evict(limit);
+	return nc != NULL ? nc->capacity() : 0;
 }
 
 /*
@@ -1670,13 +1527,22 @@ touches(JournalShared *js)
  * collection holds from before it last reads its keep set until its
  * swap, so a chunk isn't added once it has been read for the last time.
  * A swap before then may have dropped the chunk: the transaction fails.
+ *
+ * A transaction of a hot standby can't be given an xid, and the
+ * collections that drop chunks run on the primary, which knows nothing of
+ * it.  It is noted as holding pointers instead (keep_held()), so that the
+ * replay of a swap cancels it before the store stops naming what it holds.
+ * One begun on a standby promoted since stays noted so: a collection on
+ * the new primary waits for it, and keeps what it is told of now.
  */
 static void
 journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 {
 	JournalShared *js = shared();
 	KeepTouch  *t = &touches(js)[MyProcNumber];
-	TransactionId xid = GetTopTransactionId();
+	bool		recovery = RecoveryInProgress();
+	bool		standby = recovery || TransactionStartedDuringRecovery();
+	TransactionId xid = standby ? InvalidTransactionId : GetTopTransactionId();
 	uint64		begun = pg_atomic_read_u64(&js->keeps_begun);
 	ProllyHash	key;
 	bool		found;
@@ -1707,27 +1573,41 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 	if (found)
 		return;
 
-	jindex_append_lock(s->ix, false);
-	SpinLockAcquire(&js->mutex);
-	if (!TransactionIdIsValid(t->xid))
+	if (standby)
 	{
-		t->dboid = s->dboid;
-		t->spcoid = s->spcoid;
-		t->xid = xid;
-	}
-	for (int i = 0; i < KEEP_COLLECTIONS; i++)
-	{
-		KeepSet    *k = &js->keeps[i];
+		keep_held(s, js, t);
 
-		if (!k->active || k->dboid != s->dboid || k->spcoid != s->spcoid)
-			continue;
-		if (k->n < KEEP_MAX)
-			k->hashes[k->n++] = *hash;
-		else
-			k->overflow = true;
+		/*
+		 * (read again once noted: a collection begins only after recovery
+		 * has ended, so either it sees this transaction noted, or this
+		 * sees recovery over and adds the chunk to its keep set)
+		 */
+		recovery = RecoveryInProgress();
 	}
-	SpinLockRelease(&js->mutex);
-	jindex_append_unlock(s->ix);
+	if (!recovery)
+	{
+		jindex_append_lock(s->ix, false);
+		SpinLockAcquire(&js->mutex);
+		if (TransactionIdIsValid(xid) && !TransactionIdIsValid(t->xid))
+		{
+			t->dboid = s->dboid;
+			t->spcoid = s->spcoid;
+			t->xid = xid;
+		}
+		for (int i = 0; i < KEEP_COLLECTIONS; i++)
+		{
+			KeepSet    *k = &js->keeps[i];
+
+			if (!k->active || k->dboid != s->dboid || k->spcoid != s->spcoid)
+				continue;
+			if (k->n < KEEP_MAX)
+				k->hashes[k->n++] = *hash;
+			else
+				k->overflow = true;
+		}
+		SpinLockRelease(&js->mutex);
+		jindex_append_unlock(s->ix);
+	}
 	if (!journal_has(s, hash))
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -1735,6 +1615,93 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 				 errdetail("A value stored by content was collected meanwhile."),
 				 errhint("The transaction might succeed if retried.")));
 	(void) hash_search(kept_here, &key, HASH_ENTER, NULL);
+}
+
+/*
+ * This transaction of a hot standby (or begun as one) holds pointers: its
+ * local id noted, for a swap's replay to resolve a recovery conflict with
+ * before the store stops naming what it may read, and for a collection
+ * after a promotion to wait for.  Not while a swap of the store is being
+ * replayed: the conflict is being resolved with the holders noted before,
+ * so a transaction not among them waits for the swap and then finds
+ * whether its chunk survived.  One among them doesn't wait (the replay
+ * waits for it): it is cancelled, or ends, before the swap stops naming
+ * what it keeps now.  Never in a parallel worker: its local id isn't its
+ * leader's, so it would wait for a replay that waits for the leader.
+ */
+static void
+keep_held(ProllyChunkStore *s, JournalShared *js, KeepTouch *t)
+{
+	Assert(!IsParallelWorker());
+
+	for (;;)
+	{
+		bool		replaying;
+
+		SpinLockAcquire(&js->mutex);
+		replaying = js->swap_dboid == s->dboid &&
+			js->swap_spcoid == s->spcoid && t->held != MyProc->vxid.lxid;
+		if (!replaying && t->held != MyProc->vxid.lxid)
+		{
+			t->dboid = s->dboid;
+			t->spcoid = s->spcoid;
+			t->held = MyProc->vxid.lxid;
+		}
+		SpinLockRelease(&js->mutex);
+		if (!replaying)
+			break;
+		ConditionVariableSleep(&js->swapped, WAIT_EVENT_PROLLY_SWAP_REPLAY);
+	}
+	ConditionVariableCancelSleep();
+}
+
+/*
+ * A swap of a store is being replayed: the standby's transactions noted as
+ * holding its pointers are cancelled, after max_standby_streaming_delay,
+ * before the new manifest stops naming what they hold.  A transaction
+ * that tells keep() of a chunk meanwhile waits for swap_replayed().
+ */
+static void
+swap_holders_resolve(Oid dboid, Oid spcoid)
+{
+	JournalShared *js = shared();
+	KeepTouch  *ts = touches(js);
+	VirtualTransactionId *holders =
+		palloc(sizeof(VirtualTransactionId) * (js->nranges + 1));
+	int			n = 0;
+
+	SpinLockAcquire(&js->mutex);
+	js->swap_dboid = dboid;
+	js->swap_spcoid = spcoid;
+	for (int i = 0; i < js->nranges; i++)
+	{
+		KeepTouch  *t = &ts[i];
+
+		if (t->held != InvalidLocalTransactionId && t->dboid == dboid &&
+			t->spcoid == spcoid)
+		{
+			holders[n].procNumber = i;
+			holders[n].localTransactionId = t->held;
+			n++;
+		}
+	}
+	SpinLockRelease(&js->mutex);
+	SetInvalidVirtualTransactionId(holders[n]);
+	ResolveRecoveryConflictWithFileReaders(holders);
+	pfree(holders);
+}
+
+/* The swap has been replayed: keep() is told of chunks again. */
+static void
+swap_replayed(void)
+{
+	JournalShared *js = shared();
+
+	SpinLockAcquire(&js->mutex);
+	js->swap_dboid = InvalidOid;
+	js->swap_spcoid = InvalidOid;
+	SpinLockRelease(&js->mutex);
+	ConditionVariableBroadcast(&js->swapped);
 }
 
 /*
@@ -1752,26 +1719,33 @@ keep_touch_end(void)
 		return;
 	js = journal_shared;
 	t = &touches(js)[MyProcNumber];
-	if (!TransactionIdIsValid(t->xid))
+	if (!TransactionIdIsValid(t->xid) && t->held == InvalidLocalTransactionId)
 		return;
 	SpinLockAcquire(&js->mutex);
 	t->xid = InvalidTransactionId;
+	t->held = InvalidLocalTransactionId;
 	SpinLockRelease(&js->mutex);
 }
 
 /*
  * A collection begins keeping what keep() is told of, and will wait for
  * the transactions told of one before: its keep set, or -1 if none is free
- * (it then keeps every chunk).
+ * (it then keeps every chunk).  Those with an xid are added to *xids; those
+ * begun on this server as a hot standby, before a promotion, to *held
+ * (*nheld of them).
  */
 static int
-keep_begin(ProllyChunkStore *s, List **xids)
+keep_begin(ProllyChunkStore *s, List **xids, VirtualTransactionId **held,
+		   int *nheld)
 {
 	JournalShared *js = shared();
 	KeepTouch  *ts = touches(js);
 	TransactionId *found = palloc(sizeof(TransactionId) * js->nranges);
 	int			nfound = 0;
 	int			slot = -1;
+
+	*held = palloc(sizeof(VirtualTransactionId) * js->nranges);
+	*nheld = 0;
 
 	SpinLockAcquire(&js->mutex);
 	for (int i = 0; i < KEEP_COLLECTIONS && slot < 0; i++)
@@ -1790,9 +1764,16 @@ keep_begin(ProllyChunkStore *s, List **xids)
 	{
 		KeepTouch  *t = &ts[i];
 
-		if (TransactionIdIsValid(t->xid) && t->dboid == s->dboid &&
-			t->spcoid == s->spcoid)
+		if (t->dboid != s->dboid || t->spcoid != s->spcoid)
+			continue;
+		if (TransactionIdIsValid(t->xid))
 			found[nfound++] = t->xid;
+		if (t->held != InvalidLocalTransactionId)
+		{
+			(*held)[*nheld].procNumber = i;
+			(*held)[*nheld].localTransactionId = t->held;
+			(*nheld)++;
+		}
 	}
 	SpinLockRelease(&js->mutex);
 	for (int i = 0; i < nfound; i++)
@@ -2606,29 +2587,44 @@ check_root(ProllyChunkStore *s)
  * aborted subtransaction's gone from them), let into the cache: a backend
  * writing a little at a time (dolt.transaction_commit) reads first, in its
  * next transaction, what this one wrote last, the refs' and the trees'
- * upper nodes, each once before it is replaced, which the cache would
- * never keep (it lets in a chunk read from the files only on its second
- * read).  Only a small transaction's: none appended before (no flush), at
- * most an eighth of the cache's bytes, so a large one doesn't churn it;
+ * upper nodes, each once before it is replaced.  Only a small
+ * transaction's: none appended before (no flush), at most
+ * PENDING_CACHED_MAX bytes and an eighth of the cache's, so a large one
+ * doesn't push out what every backend reads, nor copy much as it commits;
  * and only if no collection swapped the store since the transaction began
- * (one dropped as stored already may be in a segment the swap removed).
- * Let in before the commit record, where allocating may fail, and let go
- * of again if the transaction aborts after all (provisional), so the cache
- * holds only what the store has.
+ * (one dropped as stored already may be in a segment the swap removed).  Decoded before
+ * the commit record, where allocating may fail, into the backend's memory,
+ * and let into the shared cache once the transaction has committed
+ * (pending_cached_end()), where nothing may fail and the cache's inserts
+ * don't; so others never read from the cache a chunk the store may yet not
+ * have.
  */
-static ProllyHash *provisional = NULL;
-static int	nprovisional = 0;
+typedef struct StagedChunk
+{
+	ProllyHash	hash;
+	Size		offset;			/* in staged */
+	uint32		len;
+} StagedChunk;
+
+/* (enough for the refs' and a few trees' upper nodes a commit rewrites) */
+#define PENDING_CACHED_MAX	(256 * 1024)
+
+static StringInfo staged = NULL;	/* the chunks' bytes */
+static StagedChunk *staged_chunks = NULL;
+static int	nstaged = 0;
+static uint32 staged_generation = 0;
 
 static void
 pending_cached(ProllyChunkStore *s)
 {
 	HASH_SEQ_STATUS status;
 	IndexEntry *e;
-	Size		budget = chunk_cache_limit() / 8;
+	Size		budget = Min(chunk_cache_limit() / 8, PENDING_CACHED_MAX);
 	Size		total = 0;
 	long		n;
+	MemoryContext old;
 
-	nprovisional = 0;
+	nstaged = 0;
 	if (s != session_store || budget == 0 ||
 		MyProc->vxid.lxid != s->xact_lxid || s->flushes != s->xact_flushes ||
 		s->gc_generation != s->xact_generation)
@@ -2636,12 +2632,18 @@ pending_cached(ProllyChunkStore *s)
 	n = hash_get_num_entries(s->pending_index);
 	hash_seq_init(&status, s->pending_index);
 	while ((e = hash_seq_search(&status)) != NULL)
-		total += e->raw_len + sizeof(CachedChunk);
+		total += e->raw_len;
 	if (n == 0 || total > budget)
 		return;
-	if (provisional != NULL)
-		pfree(provisional);
-	provisional = MemoryContextAlloc(TopMemoryContext, n * sizeof(ProllyHash));
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	if (staged == NULL)
+		staged = makeStringInfo();
+	resetStringInfo(staged);
+	if (staged_chunks != NULL)
+		pfree(staged_chunks);
+	staged_chunks = palloc(n * sizeof(StagedChunk));
+	MemoryContextSwitchTo(old);
+	staged_generation = s->gc_generation;
 	hash_seq_init(&status, s->pending_index);
 	while ((e = hash_seq_search(&status)) != NULL)
 	{
@@ -2655,32 +2657,32 @@ pending_cached(ProllyChunkStore *s)
 			chunk = record_chunk(rec, e->len, after, chunk_scratch(), &chunk_len);
 		if (chunk == NULL)
 			continue;
-		chunk_cache_insert(&e->hash, chunk, (uint32) chunk_len,
-						   s->gc_generation, true);
-		provisional[nprovisional++] = e->hash;
+		staged_chunks[nstaged].hash = e->hash;
+		staged_chunks[nstaged].offset = staged->len;
+		staged_chunks[nstaged].len = (uint32) chunk_len;
+		appendBinaryStringInfo(staged, chunk, chunk_len);
+		nstaged++;
 	}
 }
 
-/* The transaction ended: what it let in kept (committed) or let go of. */
+/* The transaction ended: what it staged let into the cache if it committed. */
 static void
 pending_cached_end(bool commit)
 {
-	if (!commit && chunk_cache != NULL)
+	if (commit && session_store != NULL)
 	{
-		for (int i = 0; i < nprovisional; i++)
-		{
-			CachedChunk *c = hash_search(chunk_cache, &provisional[i],
-										 HASH_FIND, NULL);
-
-			if (c == NULL)
-				continue;
-			dlist_delete(&c->lru);
-			chunk_cache_bytes -= c->len + sizeof(CachedChunk);
-			pfree(c->data);
-			(void) hash_search(chunk_cache, &provisional[i], HASH_REMOVE, NULL);
-		}
+		for (int i = 0; i < nstaged; i++)
+			chunk_cache_put(session_store, &staged_chunks[i].hash,
+							staged->data + staged_chunks[i].offset,
+							staged_chunks[i].len, staged_generation, true);
 	}
-	nprovisional = 0;
+	nstaged = 0;
+	/* (a large one's memory let go of) */
+	if (staged != NULL && staged->maxlen > CHUNK_SCRATCH_KEEP)
+	{
+		destroyStringInfo(staged);
+		staged = NULL;
+	}
 }
 
 /*
@@ -5056,7 +5058,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	{
 		refresh_segments(s);
 		start = out->len;
-		if (chunk_cache_take(&key, out, s->gc_generation))
+		if (chunk_cache_take(s, &key, out, s->gc_generation))
 		{
 			xact_note(s);
 			trust_named(s, out->data + start, out->len - start,
@@ -5087,8 +5089,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		{
 			if (!stored && s == session_store)
 			{
-				chunk_cache_put(&key, out->data + start, out->len - start,
-								s->gc_generation);
+				chunk_cache_put(s, &key, out->data + start, out->len - start,
+								s->gc_generation, false);
 				trust_named(s, out->data + start, out->len - start,
 							s->gc_generation);
 			}
@@ -5102,8 +5104,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			{
 				if (!stored && s == session_store)
 				{
-					chunk_cache_put(&key, out->data + start, out->len - start,
-									s->gc_generation);
+					chunk_cache_put(s, &key, out->data + start, out->len - start,
+									s->gc_generation, false);
 					trust_named(s, out->data + start, out->len - start,
 								s->gc_generation);
 				}
@@ -5153,8 +5155,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		chunk_bytes_of(g->path, rec, len, &key, out);
 		if (s == session_store)
 		{
-			chunk_cache_put(&key, out->data + start, out->len - start,
-							s->gc_generation);
+			chunk_cache_put(s, &key, out->data + start, out->len - start,
+							s->gc_generation, false);
 			trust_named(s, out->data + start, out->len - start,
 						s->gc_generation);
 		}
@@ -5217,6 +5219,14 @@ journal_root_free(ProllyChunkStore *s)
 		return false;
 	LockRelease(&tag, ExclusiveLock, false);
 	return true;
+}
+
+/* The GC generation of the manifest now (read again if it changed). */
+static uint32
+journal_generation(ProllyChunkStore *s)
+{
+	refresh_segments(s);
+	return s->gc_generation;
 }
 
 static bool
@@ -5887,6 +5897,7 @@ table_files_redo(XLogReaderState *record)
 		 */
 		if (info == XLOG_CHUNKS_SWAP)
 		{
+			swap_holders_resolve(xlrec.dboid, xlrec.spcoid);
 			standby_readers_note(xlrec.dboid);
 			/* (and a logical slot being created starts after it) */
 			ReplicationSlotsCollectionReplayed(record->EndRecPtr);
@@ -5909,6 +5920,8 @@ table_files_redo(XLogReaderState *record)
 		pfree(temp);
 		pfree(path);
 		manifests_changed();
+		if (info == XLOG_CHUNKS_SWAP)
+			swap_replayed();
 		if (info == XLOG_CHUNKS_RETIRE)
 		{
 			XLogFlush(record->EndRecPtr);
@@ -6104,6 +6117,8 @@ journal_drop_database(Oid dboid)
 	}
 
 	jindex_forget(dboid);
+	if (node_cache() != NULL && PROLLY_HAS(node_cache(), forget_database))
+		node_cache()->forget_database(dboid);
 	SpinLockAcquire(&js->mutex);
 	for (int i = 0; i < CHECKED_ENDS; i++)
 	{
@@ -6386,8 +6401,30 @@ received_id(const char *key)
 }
 
 /*
+ * A received file that couldn't be stat'ed or opened (errno says why),
+ * closed: raised, unless it is missing.
+ */
+static void
+received_open_failed(TableFile *t)
+{
+	int			save_errno = errno;
+	char	   *path = pstrdup(t->path);
+
+	close_table(t);
+	errno = save_errno;
+	if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+	pfree(path);
+}
+
+/*
  * The received file id of database directory dir, opened in cxt: NULL if
- * it isn't there whole (missing, or cut short).
+ * it isn't there whole (missing, or cut short: the format finds no whole
+ * file in its bytes).  Any other error (a file that can't be opened or
+ * read, running out of memory, a cancel) is raised, the file closed: it
+ * says nothing of whether the file is whole.
  */
 static TableFile *
 open_received(const char *dir, uint64 id, MemoryContext cxt)
@@ -6402,28 +6439,27 @@ open_received(const char *dir, uint64 id, MemoryContext cxt)
 	MemoryContextSwitchTo(old);
 	if (stat(t->path, &st) != 0)
 	{
-		close_table(t);
+		received_open_failed(t);
 		return NULL;
 	}
 	t->size = st.st_size;
 	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
 	if (t->file < 0)
 	{
-		close_table(t);
+		received_open_failed(t);
 		return NULL;
 	}
-	/* (a format raising an error on a damaged file: not whole, either) */
-	old = CurrentMemoryContext;
 	PG_TRY();
 	{
+		INJECTION_POINT("prolly-received-open", NULL);
 		t->tf = PROLLY_CALL(table_format(), open, table_file_read,
 							table_file_map, t, t->size, cxt);
 	}
 	PG_CATCH();
 	{
-		MemoryContextSwitchTo(old);
-		FlushErrorState();
 		t->tf = NULL;
+		close_table(t);
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (t->tf == NULL)
@@ -6474,25 +6510,37 @@ received_tables(ProllyChunkStore *s)
 {
 	char	   *dir;
 	List	   *ids;
+	List	   *volatile opened = NIL;
 
 	if (s->received_open)
 		return s->received;
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	ids = received_ids(dir);
-	foreach_ptr(uint64, id, ids)
+	/* (listed only once all are opened: an error leaves none listed) */
+	PG_TRY();
 	{
-		TableFile  *t = open_received(dir, *id, TopMemoryContext);
-
-		if (t)
+		foreach_ptr(uint64, id, ids)
 		{
-			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+			TableFile  *t = open_received(dir, *id, TopMemoryContext);
 
-			s->received = lappend(s->received, t);
-			MemoryContextSwitchTo(old);
+			if (t)
+			{
+				MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+				opened = lappend(opened, t);
+				MemoryContextSwitchTo(old);
+			}
 		}
 	}
+	PG_CATCH();
+	{
+		close_tables(opened);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	list_free_deep(ids);
 	pfree(dir);
+	s->received = opened;
 	s->received_open = true;
 	return s->received;
 }
@@ -7324,6 +7372,8 @@ struct ProllyChunkGc
 	uint8		hash_len;
 	List	   *xids;			/* TransactionId: appended to the sealed
 								 * segments, in progress at the seal */
+	VirtualTransactionId *held; /* begun as a standby's, holding pointers */
+	int			nheld;
 	bool		waited;
 	Segment    *appended;		/* the segment appended to from the seal */
 	int			keep;			/* its KeepSet, -1 once let go */
@@ -7842,7 +7892,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 	 * transaction that named a chunk since is waited for), its set let go
 	 * by gc_abort() if the collection fails.
 	 */
-	gc->keep = keep_begin(s, &gc->xids);
+	gc->keep = keep_begin(s, &gc->xids, &gc->held, &gc->nheld);
 	gc->keep_all = (gc->keep < 0);
 	s->gc = gc;
 
@@ -8151,6 +8201,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			if (wait_unprepared(lfirst_xid(lc)))
 				prepared = lappend_xid(prepared, lfirst_xid(lc));
 		}
+		wait_for_readers(gc->held, gc->nheld);
 		gc->waited = true;
 		if (prepared != NIL)
 			gc_prepared(gc, prepared, visit, arg);
@@ -8902,6 +8953,7 @@ journal_shmem_init(void *area)
 	pg_atomic_init_u32(&js->sync_all, 0);
 	SpinLockInit(&js->mutex);
 	ConditionVariableInit(&js->written);
+	ConditionVariableInit(&js->swapped);
 	js->nranges = append_ranges();
 }
 
@@ -9166,4 +9218,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.other_bytes = journal_other_bytes,
 	.try_hold_root = journal_try_hold_root,
 	.root_free = journal_root_free,
+	.generation = journal_generation,
 };

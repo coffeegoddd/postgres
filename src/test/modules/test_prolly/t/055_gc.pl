@@ -264,7 +264,7 @@ sql('SELECT test_chunk_gc(false)');
 $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 $standby->wait_for_log(qr/conflict with recovery/, $log_location);
 ok($standby->poll_query_until('gcdb',
-	q{SELECT confl_snapshot > 0 FROM pg_stat_database_conflicts WHERE datname = 'gcdb'}),
+	q{SELECT confl_chunk_store > 0 FROM pg_stat_database_conflicts WHERE datname = 'gcdb'}),
 	'a standby query running at the swap is cancelled at the retire');
 eval { $s->quit; };	# (the conflict ended its session)
 is($standby->safe_psql('gcdb', $reads), '20', 'and a new one reads the new files');

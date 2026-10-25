@@ -92,11 +92,20 @@ typedef struct xl_bmap_rel
 	RelFileLocator locator;
 } xl_bmap_rel;
 
-/* SHARE's and SHARED's main data: the relation shared and its copy. */
+/*
+ * SHARE's and SHARED's main data: the relation shared and its copy.  With
+ * BMAP_PRESERVE_LOGGED (SHARED), the source's own blocks were logged as
+ * PRESERVE images before the record, whose redo wrote them to their
+ * blocks: redo of the share syncs nothing (it writes the source's buffers
+ * out, for a page changed in place after its image).
+ */
+#define BMAP_PRESERVE_LOGGED	0x01
+
 typedef struct xl_bmap_share
 {
 	RelFileLocator src;
 	RelFileLocator dst;
+	uint8		flags;
 } xl_bmap_share;
 
 /*
@@ -199,7 +208,10 @@ typedef struct xl_bmap_extend
  *						the root page, whose slot changes, then (when kept)
  *						the header (its epoch raised) and the
  *						reference-count pages of the subtrees, each a holder
- *						more
+ *						more; a snapshot carried from the storage a restore
+ *						replaces (BMAP_TREE_CARRIED) has no header (the
+ *						count pages are block 1 on) and nothing of its own
+ *						to write out
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -209,6 +221,9 @@ typedef struct xl_bmap_extend
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
+/* a snapshot kept whose own blocks were logged as PRESERVE images first */
+#define BMAP_TREE_PRESERVE_LOGGED	0x04
+#define BMAP_TREE_CARRIED		0x08
 
 typedef struct xl_bmap_tree
 {

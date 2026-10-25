@@ -28,6 +28,8 @@ typedef struct BranchFoldStamp
 extern Size branch_generations_shmem_size(void);
 extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
+extern void branch_note_head_restore(Oid branch);
+extern bool branch_head_restore_unseen(Oid branch, Snapshot snap);
 extern void branch_generations_note_relation(Oid branch, Oid relid,
 											 int nrows);
 
@@ -64,6 +66,19 @@ extern bool branch_fold_known_at(Oid branch, Snapshot snap,
 								 const ProllyHash *baseline, bool complete,
 								 ProllyHash *root, BranchFoldStamp *at);
 extern bool branch_fold_unchanged(const BranchFoldStamp *at);
+
+/*
+ * The last fold of branch known, writers having ended or writing since
+ * (one still known, nobody writing, is branch_fold_known()'s): its root, if
+ * it left nothing out, was folded from baseline (NULL: none), and nothing
+ * it was folded at has moved since but the generation (its writers), into
+ * *root, and a mark as of when it was known into *mark (false: none).  The
+ * working set is that root but for the relations written since the mark
+ * (branch_written_since(), which may still say it can't tell).
+ */
+extern bool branch_fold_last(Oid branch, Snapshot snap,
+							 const ProllyHash *baseline, ProllyHash *root,
+							 ProllyFoldMark *mark);
 
 /*
  * Do branch's pages hold only what snap sees and the transaction's own
