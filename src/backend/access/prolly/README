@@ -432,7 +432,15 @@ another's table, under its grants:
   first.  A recorded owner that no longer exists, or whose OID now names
   another role or a renamed one (the OID counter wrapped), refuses the
   move.  A commit with no record (fetched, cloned or pushed here) makes
-  its tables as the mover, as before.
+  its tables as the mover, as before.  So, too, a relation the branch
+  has (a table, materialized view, view or sequence) that a move changes
+  in place, drops, or makes again (a table whose definition ALTER can't
+  change in place, a materialized view or view made again as what it
+  uses changes) is changed and made as its owner here, restricted, its
+  rows written and checked so; one made again keeps its owner and gets
+  its grants back (its own, its columns' and its sequences').  Owner-run
+  statements, rows and checks use search_path pg_catalog, pg_temp
+  (RestrictSearchPath()), as REFRESH does.
 - A hard reset, a table's checkout from a commit and a push's or forced
   move of a branch (dolt_serve_move_head, dolt_branch -f) that would put
   into a table here a version

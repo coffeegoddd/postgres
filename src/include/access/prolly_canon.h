@@ -613,6 +613,7 @@ typedef struct ProllyMakerSwitch
 	bool		switched;
 	Oid			user;
 	int			sec;
+	int			nest;			/* (the GUC level its search_path is set at) */
 } ProllyMakerSwitch;
 
 /*

@@ -7995,20 +7995,46 @@ typedef struct MoveRelid
 } MoveRelid;
 
 /*
- * A relation the running move makes from a commit, as the role its record
- * names (prolly_move_maker()): a table, a materialized view (kind 'm') or a
- * sequence such a table owns ('S'), by name, and its OID once made.
+ * A relation the running move makes, re-makes or changes, as the role that
+ * owns it (prolly_move_maker()): one it makes from a commit, as the owner
+ * the commit's record names (made), and one the branch has, as its owner
+ * here (not made): a table ('t'), a materialized view ('m'), a view ('v')
+ * or a sequence ('S' one a table made so owns, 's' one the branch has), by
+ * name, and its OID once looked up.  One the branch has keeps its grants
+ * where the move makes it again (saved: its ACLs, each a SavedAcl *).
  */
 typedef struct MoveMaker
 {
 	char	   *name;
 	char		kind;
 	Oid			owner;
+	bool		made;
 	Oid			relid;			/* (InvalidOid: not yet looked up) */
+	List	   *saved;
 } MoveMaker;
+
+/* An ACL a relation (name) or one of its columns (attname) had */
+typedef struct SavedAcl
+{
+	char	   *name;
+	char	   *attname;		/* (NULL: the relation's own) */
+	Acl		   *acl;
+} SavedAcl;
 
 /* The relations the running move makes as their makers (MoveMaker *) */
 static List *move_makers = NIL;
+
+/* ... by kind and name: "k name" -> MoveMaker * */
+typedef struct MakerEntry
+{
+	char		key[2 * (2 * NAMEDATALEN + 2) + 4];
+	MoveMaker  *mm;
+} MakerEntry;
+
+static HTAB *makers_by_name = NULL;
+
+/* ... by OID, tables and materialized views (MakerRelid) */
+static HTAB *makers_by_relid = NULL;
 
 /* The statements of theirs it runs as their makers: char * -> Oid */
 typedef struct MakerStatement
@@ -8044,28 +8070,69 @@ prolly_recorded_owner(const char *name, Oid owner, const char *owner_name)
 	return owner;
 }
 
+static void
+maker_key(char *key, const char *name, char kind)
+{
+	snprintf(key, sizeof(((MakerEntry *) NULL)->key), "%c %s", kind, name);
+}
+
 /* The maker the running move makes relation name (of kind) as, if any. */
 static MoveMaker *
 maker_named(const char *name, char kind)
 {
-	foreach_ptr(MoveMaker, mm, move_makers)
-		if (mm->kind == kind && strcmp(mm->name, name) == 0)
-			return mm;
-	return NULL;
+	char		key[sizeof(((MakerEntry *) NULL)->key)];
+	MakerEntry *e;
+
+	if (makers_by_name == NULL)
+		return NULL;
+	maker_key(key, name, kind);
+	e = hash_search(makers_by_name, key, HASH_FIND, NULL);
+	return e ? e->mm : NULL;
 }
 
-static void
-add_maker(const char *name, char kind, Oid owner)
+static MoveMaker *
+add_maker(const char *name, char kind, Oid owner, bool made)
 {
+	char		key[sizeof(((MakerEntry *) NULL)->key)];
+	MakerEntry *e;
+	bool		found;
 	MoveMaker  *mm;
 
-	if (!OidIsValid(owner) || maker_named(name, kind) != NULL)
-		return;
+	if (!OidIsValid(owner) ||
+		strlen(name) + 3 > sizeof(((MakerEntry *) NULL)->key))
+		return NULL;
+	if (makers_by_name == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(((MakerEntry *) NULL)->key);
+		ctl.entrysize = sizeof(MakerEntry);
+		ctl.hcxt = CurrentMemoryContext;
+		makers_by_name = hash_create("prolly move makers by name", 64, &ctl,
+									 HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+	maker_key(key, name, kind);
+	e = hash_search(makers_by_name, key, HASH_ENTER, &found);
+	if (found)
+		return e->mm;
 	mm = palloc0(sizeof(MoveMaker));
 	mm->name = pstrdup(name);
 	mm->kind = kind;
 	mm->owner = owner;
+	mm->made = made;
+	e->mm = mm;
 	move_makers = lappend(move_makers, mm);
+	return mm;
+}
+
+/* Forget the running move's makers and their statements. */
+static void
+reset_makers(void)
+{
+	move_makers = NIL;
+	makers_by_name = NULL;
+	maker_statements = NULL;
+	makers_by_relid = NULL;
 }
 
 /* Run statement sql, when the move runs it, as owner (if valid). */
@@ -8103,6 +8170,41 @@ made_as_from(List *stmts, int n, const char *name, char kind)
 		made_as(list_nth(stmts, i), mm->owner);
 }
 
+/* A list's length and first cell, before statements are added to it. */
+typedef struct ListMark
+{
+	int			n;
+	void	   *first;
+} ListMark;
+
+static ListMark
+list_mark(List *l)
+{
+	ListMark	m = {list_length(l), l != NIL ? linitial(l) : NULL};
+
+	return m;
+}
+
+/*
+ * Run each statement added to stmts since m (prepended, lcons(), or
+ * appended) as relation name's maker.
+ */
+static void
+made_as_since(List *stmts, ListMark m, const char *name, char kind)
+{
+	MoveMaker  *mm = maker_named(name, kind);
+	int			front = 0;
+
+	if (mm == NULL)
+		return;
+	if (m.n > 0)
+		while (front < list_length(stmts) && list_nth(stmts, front) != m.first)
+			front++;
+	for (int i = 0; i < list_length(stmts); i++)
+		if (i < front || i >= front + m.n)
+			made_as(list_nth(stmts, i), mm->owner);
+}
+
 /* The role statement sql is run as (made_as()); InvalidOid: the move's. */
 static Oid
 statement_maker(const char *sql)
@@ -8115,6 +8217,11 @@ statement_maker(const char *sql)
 	return ms ? ms->owner : InvalidOid;
 }
 
+/*
+ * Run as role, restricted, as REFRESH runs a materialized view's owner's
+ * query: search_path too (RestrictSearchPath(): pg_catalog, then pg_temp,
+ * so that the mover's temporary objects are never found first).
+ */
 static void
 as_role(Oid role, ProllyMakerSwitch *sw)
 {
@@ -8124,21 +8231,68 @@ as_role(Oid role, ProllyMakerSwitch *sw)
 	GetUserIdAndSecContext(&sw->user, &sw->sec);
 	SetUserIdAndSecContext(role, sw->sec | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_RESTRICTED_OPERATION);
+	sw->nest = NewGUCNestLevel();
+	RestrictSearchPath();
 	sw->switched = true;
 }
+
+/* The running move's makers of tables and materialized views, by OID */
+typedef struct MakerRelid
+{
+	Oid			relid;
+	Oid			owner;
+} MakerRelid;
+
 
 Oid
 prolly_move_maker(Oid relid)
 {
+	MakerRelid *e;
+	bool		missed;
+
+	if (move_makers == NIL || !OidIsValid(relid))
+		return InvalidOid;
+	if (makers_by_relid == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(MakerRelid);
+		ctl.hcxt = GetMemoryChunkContext(move_makers);
+		makers_by_relid = hash_create("prolly move makers by relid", 64, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		foreach_ptr(MoveMaker, mm, move_makers)
+			mm->relid = InvalidOid;
+	}
+	e = hash_search(makers_by_relid, &relid, HASH_FIND, NULL);
+	if (e)
+		return e->owner;
+
+	/*
+	 * (one not yet looked up, or made since it was: a materialized view
+	 * made after the tables' rows)
+	 */
+	missed = false;
 	foreach_ptr(MoveMaker, mm, move_makers)
 	{
+		MakerRelid *n;
+		bool		found;
+
+		if (OidIsValid(mm->relid) || (mm->kind != 't' && mm->kind != 'm'))
+			continue;
+		mm->relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mm->name, NULL)),
+									 NoLock, true);
 		if (!OidIsValid(mm->relid))
-			mm->relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mm->name, NULL)),
-										 NoLock, true);
-		if (mm->relid == relid && OidIsValid(relid))
-			return mm->owner;
+			continue;
+		n = hash_search(makers_by_relid, &mm->relid, HASH_ENTER, &found);
+		n->owner = mm->owner;
+		if (mm->relid == relid)
+			missed = true;
 	}
-	return InvalidOid;
+	if (!missed)
+		return InvalidOid;
+	e = hash_search(makers_by_relid, &relid, HASH_FIND, NULL);
+	return e ? e->owner : InvalidOid;
 }
 
 void
@@ -8151,7 +8305,10 @@ void
 prolly_as_maker_end(ProllyMakerSwitch *sw)
 {
 	if (sw->switched)
+	{
+		AtEOXact_GUC(true, sw->nest);
 		SetUserIdAndSecContext(sw->user, sw->sec);
+	}
 	sw->switched = false;
 }
 
@@ -8319,6 +8476,208 @@ table_sequences(const char *name, const TableDef *td)
 	return out;
 }
 
+static Oid	item_owner(const MoveItem *it, bool *known);
+
+/* relid's owner (InvalidOid: no such relation) */
+static Oid
+relation_owner_of(Oid relid)
+{
+	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Oid			owner;
+
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
+	ReleaseSysCache(tup);
+	return owner;
+}
+
+/*
+ * The ACLs relation relid has (its own and its columns'), and, a table's,
+ * those of the sequences it owns, to put back once a move made it again
+ * (restore_saved_acls()), each by name: SavedAcl *.
+ */
+static List *
+saved_acls(Oid relid)
+{
+	List	   *out = NIL;
+	List	   *relids = list_make1_oid(relid);
+	Relation	depend = table_open(DependRelationId, AccessShareLock);
+	Relation	pg_attribute = table_open(AttributeRelationId, AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(depend, DependReferenceIndexId, true, NULL, 2, key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (d->classid == RelationRelationId &&
+			(d->deptype == DEPENDENCY_AUTO || d->deptype == DEPENDENCY_INTERNAL) &&
+			get_rel_relkind(d->objid) == RELKIND_SEQUENCE)
+			relids = list_append_unique_oid(relids, d->objid);
+	}
+	systable_endscan(scan);
+	table_close(depend, AccessShareLock);
+	foreach_oid(r, relids)
+	{
+		HeapTuple	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(r));
+		Form_pg_class c;
+		char	   *name;
+		bool		isnull;
+		Datum		acl;
+		ScanKeyData akey;
+		SysScanDesc ascan;
+		HeapTuple	atup;
+
+		if (!HeapTupleIsValid(ctup))
+			continue;
+		c = (Form_pg_class) GETSTRUCT(ctup);
+		name = quote_qualified_identifier(get_namespace_name(c->relnamespace),
+										  NameStr(c->relname));
+		acl = SysCacheGetAttr(RELOID, ctup, Anum_pg_class_relacl, &isnull);
+		if (!isnull)
+		{
+			SavedAcl   *sa = palloc0(sizeof(SavedAcl));
+
+			sa->name = name;
+			sa->acl = DatumGetAclPCopy(acl);
+			out = lappend(out, sa);
+		}
+		ReleaseSysCache(ctup);
+		ScanKeyInit(&akey, Anum_pg_attribute_attrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(r));
+		ascan = systable_beginscan(pg_attribute, AttributeRelidNumIndexId, true,
+								   NULL, 1, &akey);
+		while ((atup = systable_getnext(ascan)) != NULL)
+		{
+			Form_pg_attribute a = (Form_pg_attribute) GETSTRUCT(atup);
+			SavedAcl   *sa;
+
+			if (a->attnum <= 0 || a->attisdropped)
+				continue;
+			acl = heap_getattr(atup, Anum_pg_attribute_attacl,
+							   RelationGetDescr(pg_attribute), &isnull);
+			if (isnull)
+				continue;
+			sa = palloc0(sizeof(SavedAcl));
+			sa->name = name;
+			sa->attname = pstrdup(NameStr(a->attname));
+			sa->acl = DatumGetAclPCopy(acl);
+			out = lappend(out, sa);
+		}
+		systable_endscan(ascan);
+	}
+	table_close(pg_attribute, AccessShareLock);
+	return out;
+}
+
+/*
+ * Put saved_acls()'s ACLs back on the relations (and columns) of their
+ * names, made again by the move as their owner: the same grants, from the
+ * same owner.
+ */
+static void
+restore_saved_acls(List *saved)
+{
+	Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	Relation	pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
+
+	CommandCounterIncrement();
+	foreach_ptr(SavedAcl, sa, saved)
+	{
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(sa->name, NULL)),
+											 NoLock, true);
+		Relation	catalog = sa->attname ? pg_attribute : pg_class;
+		AttrNumber	aclattr = sa->attname ? Anum_pg_attribute_attacl : Anum_pg_class_relacl;
+		HeapTuple	tup;
+		HeapTuple	newtup;
+		Datum		old;
+		bool		isnull;
+		Oid		   *oldmembers = NULL;
+		int			noldmembers = 0;
+		Oid		   *newmembers;
+		int			nnewmembers;
+		Datum	   *values;
+		bool	   *nulls;
+		bool	   *replaces;
+		AttrNumber	attnum = 0;
+
+		if (!OidIsValid(relid))
+			continue;
+		tup = sa->attname ? SearchSysCacheCopyAttName(relid, sa->attname) :
+			SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tup))
+			continue;
+		if (sa->attname)
+			attnum = ((Form_pg_attribute) GETSTRUCT(tup))->attnum;
+		old = heap_getattr(tup, aclattr, RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+			noldmembers = aclmembers(DatumGetAclP(old), &oldmembers);
+		nnewmembers = aclmembers(sa->acl, &newmembers);
+		values = palloc0_array(Datum, RelationGetDescr(catalog)->natts);
+		nulls = palloc0_array(bool, RelationGetDescr(catalog)->natts);
+		replaces = palloc0_array(bool, RelationGetDescr(catalog)->natts);
+		values[aclattr - 1] = PointerGetDatum(sa->acl);
+		replaces[aclattr - 1] = true;
+		newtup = heap_modify_tuple(tup, RelationGetDescr(catalog), values, nulls,
+								   replaces);
+		CatalogTupleUpdate(catalog, &newtup->t_self, newtup);
+		updateAclDependencies(RelationRelationId, relid, attnum,
+							  relation_owner_of(relid),
+							  noldmembers, oldmembers, nnewmembers, newmembers);
+	}
+	table_close(pg_attribute, RowExclusiveLock);
+	table_close(pg_class, RowExclusiveLock);
+	CommandCounterIncrement();
+}
+
+/*
+ * The makers of the relations the branch has (from's items) that a move
+ * changes or makes again: each its owner here.  Before the move's
+ * statements are made (move_makers_before() adds those it makes from a
+ * commit).
+ */
+static void
+move_owners_before(List *from)
+{
+	reset_makers();
+	foreach_ptr(MoveItem, f, from)
+	{
+		bool		known;
+		Oid			owner;
+
+		if (f->kind != 't' && f->kind != 'm' && f->kind != 'v' && f->kind != 's')
+			continue;
+		owner = item_owner(f, &known);
+		if (known && OidIsValid(owner))
+			(void) add_maker(f->name, f->kind, owner, false);
+	}
+}
+
+/*
+ * Save the grants of a relation the branch has (name, of kind) that the
+ * move makes again, as its owner, to put back after (restore_saved_acls()).
+ */
+static void
+save_remade(const char *name, char kind)
+{
+	MoveMaker  *mm = maker_named(name, kind);
+	Oid			relid;
+
+	if (mm == NULL || mm->made || mm->saved != NIL)
+		return;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (OidIsValid(relid))
+		mm->saved = saved_acls(relid);
+}
+
 /*
  * The relations the tables a move makes are to be: a table it makes again
  * (move_table()'s remade) is the relation it was; one it makes is the
@@ -8414,8 +8773,6 @@ move_makers_before(List *from, List *to, List *relids)
 {
 	ProllyDatabaseComponents dc;
 
-	move_makers = NIL;
-	maker_statements = NULL;
 	foreach_ptr(MoveRelid, mr, relids)
 	{
 		MoveItem   *t;
@@ -8424,11 +8781,30 @@ move_makers_before(List *from, List *to, List *relids)
 		if (!OidIsValid(mr->owner) || find_item(from, 't', mr->name) != NULL ||
 			(t = find_item(to, 't', mr->name)) == NULL)
 			continue;
-		add_maker(mr->name, 't', mr->owner);
+		add_maker(mr->name, 't', mr->owner, true);
 		parse_table_def(t->def, &td);
 		foreach_ptr(char, seq, table_sequences(mr->name, &td))
 			if (find_item(to, 's', seq) != NULL && find_item(from, 's', seq) == NULL)
-				add_maker(seq, 'S', mr->owner);
+				add_maker(seq, 'S', mr->owner, true);
+	}
+	/*
+	 * (the sequences a table the branch has, defined otherwise, comes to
+	 * own: an identity column added, or the table made again, makes its
+	 * sequence as the table's owner)
+	 */
+	foreach_ptr(MoveItem, t, to)
+	{
+		MoveItem   *f;
+		MoveMaker  *mm;
+		TableDef	td;
+
+		if (t->kind != 't' || (f = find_item(from, 't', t->name)) == NULL ||
+			strcmp(f->def, t->def) == 0 || (mm = maker_named(t->name, 't')) == NULL)
+			continue;
+		parse_table_def(t->def, &td);
+		foreach_ptr(char, seq, table_sequences(t->name, &td))
+			if (find_item(to, 's', seq) != NULL)
+				add_maker(seq, 'S', mm->owner, false);
 	}
 	prolly_database_components(&dc);
 	if (prolly_move_provenance == NIL || !PROLLY_HAS(dc.refs, commit_relations))
@@ -8450,7 +8826,7 @@ move_makers_before(List *from, List *to, List *relids)
 			if (of == NULL)
 				continue;
 			add_maker(t->name, 'm',
-					  prolly_recorded_owner(t->name, of->owner, of->owner_name));
+					  prolly_recorded_owner(t->name, of->owner, of->owner_name), true);
 			break;
 		}
 	}
@@ -10683,6 +11059,8 @@ restore_index_places(List *places)
 		Oid			idx = OidIsValid(nsp) ? get_relname_relid(p->index, nsp) : InvalidOid;
 		char	   *spc;
 		char		kind;
+		Oid			owner;
+		char	   *sql;
 
 		if (!OidIsValid(idx))
 			continue;			/* the move dropped it */
@@ -10693,8 +11071,11 @@ restore_index_places(List *places)
 		spc = get_tablespace_name(p->tablespace);
 		if (spc == NULL)
 			continue;
+		/* (as its table's owner, restricted, where the move runs as one) */
+		owner = move_makers != NIL ? relation_owner_of(idx) : InvalidOid;
 		if (p->tablespace != MyDatabaseTableSpace &&
-			object_aclcheck(TableSpaceRelationId, p->tablespace, GetUserId(),
+			object_aclcheck(TableSpaceRelationId, p->tablespace,
+							OidIsValid(owner) ? owner : GetUserId(),
 							ACL_CREATE) != ACLCHECK_OK)
 		{
 			ereport(WARNING,
@@ -10704,9 +11085,11 @@ restore_index_places(List *places)
 							   spc)));
 			continue;
 		}
-		run_statements(list_make1(psprintf("ALTER INDEX %s SET TABLESPACE %s",
-										   quote_qualified_identifier(p->schema, p->index),
-										   quote_identifier(spc))));
+		sql = psprintf("ALTER INDEX %s SET TABLESPACE %s",
+					   quote_qualified_identifier(p->schema, p->index),
+					   quote_identifier(spc));
+		made_as(sql, owner);
+		run_statements(list_make1(sql));
 	}
 }
 
@@ -11364,6 +11747,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	from = move_items(&cn, from_root);
 	base = writer_base_items(&cn, &base_root);
 	to = move_items(&cn, to_root);
+	/* (each relation the branch has, changed or made again, as its owner) */
+	move_owners_before(from);
 	as_base = base != NIL && definitions_of_base(from, to, base);
 	if (as_base)
 	{
@@ -11407,6 +11792,9 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		{
 			view_drops = lappend(view_drops,
 								 psprintf("DROP VIEW IF EXISTS %s", f->name));
+			made_as_from(view_drops, list_length(view_drops) - 1, f->name, 'v');
+			if (t)
+				save_remade(f->name, 'v');
 			continue;
 		}
 
@@ -11415,9 +11803,12 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		 * come again with the rows the commit holds.
 		 */
 		if (f->kind == 'm')
+		{
 			matview_drops = lappend(matview_drops,
 									psprintf("DROP MATERIALIZED VIEW IF EXISTS %s",
 											 f->name));
+			made_as_from(matview_drops, list_length(matview_drops) - 1, f->name, 'm');
+		}
 		if (t && strcmp(t->def, f->def) == 0)
 			continue;
 		switch (f->kind)
@@ -11510,8 +11901,31 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			fd.of = NULL;
 		if (t)
 			parse_table_def(t->def, &td);
-		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
-			remade = lappend(remade, f->name);
+		{
+			/* (what changes it, makes it again or drops it: as its owner) */
+			ListMark	m_before = list_mark(sm.before);
+			ListMark	m_changes = list_mark(sm.changes);
+			ListMark	m_after = list_mark(sm.after);
+			ListMark	m_validations = list_mark(sm.validations);
+			ListMark	m_foreign_keys = list_mark(sm.foreign_keys);
+			ListMark	m_fk_validations = list_mark(sm.fk_validations);
+			ListMark	m_fk_drops = list_mark(sm.fk_drops);
+			bool		again = move_table(&sm, f->name, &fd, t ? &td : NULL);
+
+			made_as_since(sm.before, m_before, f->name, 't');
+			made_as_since(sm.changes, m_changes, f->name, 't');
+			made_as_since(sm.after, m_after, f->name, 't');
+			made_as_since(sm.validations, m_validations, f->name, 't');
+			made_as_since(sm.foreign_keys, m_foreign_keys, f->name, 't');
+			made_as_since(sm.fk_validations, m_fk_validations, f->name, 't');
+			made_as_since(sm.fk_drops, m_fk_drops, f->name, 't');
+			if (again)
+			{
+				remade = lappend(remade, f->name);
+				if (t)
+					save_remade(f->name, 't');
+			}
+		}
 	}
 	move_kept_relids = move_relids_before(from, to, remade);
 	move_makers_before(from, to, move_kept_relids);
@@ -11566,11 +11980,16 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				sm.fk_drops = lappend(sm.fk_drops,
 									  psprintf("ALTER TABLE %s DROP CONSTRAINT %s",
 											   f->name, first_field(line)));
+				made_as_from(sm.fk_drops, list_length(sm.fk_drops) - 1, f->name, 't');
 				if (t)
+				{
 					sm.foreign_keys = lappend(sm.foreign_keys,
 											  psprintf("ALTER TABLE %s ADD CONSTRAINT %s %s",
 													   f->name, first_field(line),
 													   constraint_def(line)));
+					made_as_from(sm.foreign_keys, list_length(sm.foreign_keys) - 1,
+								 f->name, 't');
+				}
 				break;
 			}
 		}
@@ -11593,8 +12012,11 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (fd.inherits == NIL || inheritance_kept(from, to, f->name, &fd, tm.tables))
 			continue;
 		foreach(c, fd.inherits)
+		{
 			unlinks = lappend(unlinks, psprintf("ALTER TABLE %s NO INHERIT %s",
 												f->name, (char *) lfirst(c)));
+			made_as_from(unlinks, list_length(unlinks) - 1, f->name, 't');
+		}
 	}
 	foreach(lc, to)
 	{
@@ -11613,8 +12035,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		{
 			links = lappend(links, psprintf("ALTER TABLE %s INHERIT %s",
 											t->name, (char *) lfirst(c)));
-			if (find_item(from, 't', t->name) == NULL)
-				made_as_from(links, list_length(links) - 1, t->name, 't');
+			made_as_from(links, list_length(links) - 1, t->name, 't');
 		}
 	}
 
@@ -11632,7 +12053,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			if (f->kind == 'y')
 				type_drops = lappend(type_drops, psprintf("DROP TYPE %s", f->name));
 			else if (f->kind == 's')
+			{
 				late = lappend(late, psprintf("DROP SEQUENCE IF EXISTS %s", f->name));
+				made_as_from(late, list_length(late) - 1, f->name, 's');
+			}
 		}
 	}
 	/* Schemas going: last, what was in them gone already. */
@@ -11681,6 +12105,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
 										sequence_options_sql(t->def)));
 			made_as_from(sm.after, list_length(sm.after) - 1, t->name, 'S');
+			made_as_from(sm.after, list_length(sm.after) - 1, t->name, 's');
 		}
 		else if (t->kind == 'y' || t->kind == 'm')
 			;					/* changed types first, materialized views last */
@@ -11689,8 +12114,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
 										 t->name, sequence_options_sql(t->def)));
-			if (f == NULL)
-				made_as_from(sm.before, list_length(sm.before) - 1, t->name, 'S');
+			made_as_from(sm.before, list_length(sm.before) - 1, t->name,
+						 f == NULL ? 'S' : 's');
 		}
 		else if (t->kind == 'r')
 		{
@@ -11873,10 +12298,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'v')
+		{
 			views = lappend(views,
 							psprintf(strncmp(t->def, "WITH (", 6) == 0 ?
 									 "CREATE VIEW %s %s" : "CREATE VIEW %s AS %s",
 									 t->name, t->def));
+			made_as_from(views, list_length(views) - 1, t->name, 'v');
+		}
 		/*
 		 * materialized views made again once the rows are in; their rows,
 		 * as to holds them, written after (those of the others are written
@@ -11888,6 +12316,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 			views = list_concat(views, make_matview_sql(t->name, t->def));
 			made_as_from(views, n, t->name, 'm');
+			save_remade(t->name, 'm');
 			matviews_made = true;
 		}
 	}
@@ -11908,11 +12337,17 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			continue;
 		parse_table_def(f->def, &td);
 		foreach(pc, td.policies)
-			policy_drops = lappend(policy_drops,
-								   policy_statement(psprintf("DROP POLICY IF EXISTS %s ON %s",
-															 object_name(lfirst(pc), "CREATE POLICY "),
-															 f->name),
-													f->name, from, to, base));
+		{
+			PolicyStatement *ps = policy_statement(psprintf("DROP POLICY IF EXISTS %s ON %s",
+															object_name(lfirst(pc), "CREATE POLICY "),
+															f->name),
+												   f->name, from, to, base);
+			MoveMaker  *mm = maker_named(f->name, 't');
+
+			if (mm != NULL)
+				made_as(ps->sql, mm->owner);
+			policy_drops = lappend(policy_drops, ps);
+		}
 	}
 	foreach(lc, to)
 	{
@@ -12040,20 +12475,27 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MemoryContextSwitchTo(spi);
 	}
 	move_kept_relids = NIL;
-	/* (what its making gave them, from its maker's default privileges: none) */
+	/*
+	 * (what its making gave those made from a commit, from its maker's
+	 * default privileges: none; those the branch had, made again, their
+	 * grants back)
+	 */
 	foreach_ptr(MoveMaker, mm, move_makers)
 	{
 		Oid			relid;
 
-		if (mm->kind == 'S')
-			continue;			/* (its table's) */
+		if (mm->kind == 'S' || mm->kind == 's' || (!mm->made && mm->saved == NIL))
+			continue;			/* (a table's, or unchanged) */
 		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mm->name, NULL)),
 								 NoLock, true);
-		if (OidIsValid(relid))
+		if (!OidIsValid(relid))
+			continue;
+		if (mm->made)
 			clear_made_privileges(relid);
+		else
+			restore_saved_acls(mm->saved);
 	}
-	move_makers = NIL;
-	maker_statements = NULL;
+	reset_makers();
 	SPI_finish();
 	AtEOXact_GUC(true, save_nestlevel);
 	return;
@@ -12085,8 +12527,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	{
 		prolly_writing_held_rows(held);
 		move_kept_relids = NIL;
-		move_makers = NIL;
-		maker_statements = NULL;
+		reset_makers();
 	}
 	PG_END_TRY();
 }
