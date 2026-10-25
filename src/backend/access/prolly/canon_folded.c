@@ -17268,7 +17268,7 @@ index_columns(const char *what, const ProllyComponents *c, List *stale,
 
 /*
  * The routines and types of the session's branch a commit's record lists
- * (prolly_owned_objects()), kept from one commit to the next: a commit
+ * (prolly_owned_routines()), kept from one commit to the next: a commit
  * lists them all, so that a move finds any one's owner, but works out
  * again only those changed since.  Each is kept with its catalog row's
  * place and inserting transaction, which any change to the row (an ALTER,

@@ -83,7 +83,13 @@
  *				   relkind, then a space), its owner's name (escaped as
  *				   the name is, and a space as a backslash and 's'; a
  *				   space after), and its qualified name (a backslash in it
- *				   written as two, a newline as a backslash and 'n')
+ *				   written as two, a newline as a backslash and 'n'); the
+ *				   routines and types last, by reference: a line of '@'
+ *				   and the hex SHA-256 of their lines (none if there are
+ *				   none), held under 'J'
+ *	'J' hash	-> the lines of a record's routines and types (as 'L'
+ *				   lines are, sorted), under their content's hash in hex,
+ *				   written once and named by every record listing them
  *	'D' name	-> the branch's merge's table identity conflicts: tables the
  *				   merge kept as the branch has them, as theirs is another
  *				   relation of the name: the local branch merged, if
