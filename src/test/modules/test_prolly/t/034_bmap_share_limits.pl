@@ -101,11 +101,14 @@ SKIP:
 $node->stop;
 
 # With WAL skipped for new relations, committing a copy doesn't log or
-# write its shared pages again: the share itself is logged and synced.
+# write its shared pages again: the share itself is logged and synced.  The
+# fold worker is off: its fold of the new rows would log WAL of its own
+# while the commit's is measured.
 my $min = PostgreSQL::Test::Cluster->new('share_minimal');
 $min->init;
 $min->append_conf('postgresql.conf', qq{
 autovacuum = off
+prolly_fold_worker = off
 wal_level = minimal
 max_wal_senders = 0
 });
@@ -135,10 +138,20 @@ is(msql(qq{SELECT count(*) FROM test_bmap_map($copy) c JOIN test_bmap_map($t) s
 	USING (blkno, phys)}),
 	$pages, 'the copy still shares every page');
 
-my $digest = msql(qq{SELECT test_bmap_digest($t)});
+# The rows survive a crash, in the copy and in the source.  The pages are
+# compared as rows, without hint bits: a reader (a fold, a scan) may set
+# HEAP_XMIN_COMMITTED on the shared pages in their buffers after the share
+# wrote them, and a crash may lose that, as it may any hint, with no row
+# changed.
+my $rows = msql(qq{SELECT test_bmap_rows_digest($t)});
+my $source_rows = msql(q{SELECT md5(string_agg(t::text, ',' ORDER BY a)) FROM cow.t});
 $min->stop('immediate');
 $min->start;
-is(msql(qq{SELECT test_bmap_digest($copy)}), $digest, 'and survives a crash');
+is(msql(qq{SELECT test_bmap_rows_digest($copy)}), $rows, 'and survives a crash');
+is(msql(qq{SELECT test_bmap_rows_digest($t)}), $rows,
+	'as does the source\'s storage');
+is(msql(q{SELECT md5(string_agg(t::text, ',' ORDER BY a)) FROM cow.t}),
+	$source_rows, 'and its rows');
 
 $min->stop;
 done_testing();
