@@ -9,6 +9,8 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 DROP ROLE IF EXISTS regress_mg_r;
 DROP ROLE IF EXISTS regress_mg_w;
+DROP ROLE IF EXISTS regress_mg_alice;
+DROP ROLE IF EXISTS regress_mg_bob;
 RESET client_min_messages;
 CREATE ROLE regress_mg_r;
 CREATE ROLE regress_mg_w;
@@ -173,6 +175,68 @@ SELECT length(dolt_cherry_pick('mg_origin/mg_far2')::text) > 0 AS picked;
 SELECT pg_temp.grants('mg.far2');
 SELECT dolt_remote('remove', 'mg_origin');
 
+-- The source's relation must be the one the merged commit's was made
+-- from: one of the name made since, uncommitted, gives nothing.  Here a
+-- sequence in a committed table's place (its USAGE no table's privilege):
+SELECT dolt_checkout('-b', 'mg_k') IS NOT NULL AS on_k;
+CREATE TABLE mg.k (id int PRIMARY KEY, secret text);
+CREATE TABLE mg.k2 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'k')::text) AS committed;
+DROP TABLE mg.k;
+CREATE SEQUENCE mg.k;
+GRANT USAGE, SELECT, UPDATE ON SEQUENCE mg.k TO regress_mg_r;
+-- and a private committed table made again, granted to everyone:
+DROP TABLE mg.k2;
+CREATE TABLE mg.k2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.k2 TO PUBLIC;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('mg_k'))[2:2] AS fast_forward;
+SELECT relkind, pg_temp.grants('mg.k') FROM pg_class WHERE oid = 'mg.k'::regclass;
+SELECT pg_temp.grants('mg.k2');
+
+-- The table's maker keeps its own privileges, a grant to it from the
+-- merging role, which owns the table here.
+CREATE ROLE regress_mg_alice;
+CREATE ROLE regress_mg_bob;
+SELECT current_database() AS mg_db \gset
+GRANT CREATE ON DATABASE :"mg_db" TO regress_mg_alice, regress_mg_bob;
+GRANT USAGE, CREATE ON SCHEMA mg TO regress_mg_alice, regress_mg_bob;
+SET ROLE regress_mg_alice;
+SELECT dolt_checkout('-b', 'mg_al') IS NOT NULL AS on_al;
+CREATE TABLE mg.al (id int PRIMARY KEY);
+GRANT SELECT ON mg.al TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'al')::text) AS committed;
+RESET ROLE;
+SET ROLE regress_mg_bob;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('mg_al'))[2:2] AS fast_forward;
+RESET ROLE;
+SELECT c.relowner::regrole,
+	   (SELECT string_agg(a.privilege_type, ',' ORDER BY a.privilege_type)
+		FROM aclexplode(c.relacl) a
+		WHERE a.grantee = 'regress_mg_alice'::regrole) AS maker_privileges,
+	   has_table_privilege('regress_mg_r', c.oid, 'SELECT') AS grantee_reads
+FROM pg_class c WHERE c.oid = 'mg.al'::regclass;
+SET ROLE regress_mg_alice;
+SELECT count(*) FROM mg.al;
+RESET ROLE;
+
+-- A branch named as another's full ref name is the one merged, and the
+-- one whose privileges come.
+SELECT dolt_checkout('-b', 'mg_x') IS NOT NULL AS on_x;
+CREATE TABLE mg.x (id int PRIMARY KEY);
+GRANT SELECT ON mg.x TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'x')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('refs/heads/mg_x') AS named;
+SELECT dolt_checkout('refs/heads/mg_x') IS NOT NULL AS on_full;
+CREATE TABLE mg.x (id int PRIMARY KEY);
+GRANT SELECT ON mg.x TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'x too')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('refs/heads/mg_x'))[2:2] AS fast_forward;
+SELECT pg_temp.grants('mg.x');
+
 SELECT dolt_branch('-D', 'mg_ff');
 SELECT dolt_branch('-D', 'mg_m');
 SELECT dolt_branch('-D', 'mg_noff');
@@ -182,7 +246,14 @@ SELECT dolt_branch('-D', 'mg_cp');
 SELECT dolt_branch('-D', 'mg_cp2');
 SELECT dolt_branch('-D', 'mg_rv');
 SELECT dolt_branch('-D', 'mg_rv2');
+SELECT dolt_branch('-D', 'mg_k');
+SELECT dolt_branch('-D', 'mg_al');
+SELECT dolt_branch('-D', 'mg_x');
+SELECT dolt_branch('-D', 'refs/heads/mg_x');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
 DROP ROLE regress_mg_r;
 DROP ROLE regress_mg_w;
+REVOKE CREATE ON DATABASE :"mg_db" FROM regress_mg_alice, regress_mg_bob;
+DROP ROLE regress_mg_alice;
+DROP ROLE regress_mg_bob;

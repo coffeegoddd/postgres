@@ -219,16 +219,18 @@ typedef struct BranchOpsRoutine
 
 	/*
 	 * Optional: add to each of the session branch's relations relids the
-	 * privileges its namesake on branch source has (the relation called as
-	 * it is, in the schema called as it is), the relation's and each
-	 * column's (by name), as the relation's owner here, keeping those it
-	 * has: for a relation a merge of source, or a pick or revert of a
-	 * commit source's history has, made here, whose commits hold no
-	 * privileges.  Called for several sources, it adds each one's.  None
-	 * for one source hasn't, nor where source is no branch with copies
-	 * (a remote's ref, a tag, a commit, a branch never used).
+	 * privileges of the relation of branch source at the same place in
+	 * fromids, the one the object a move brought was made from: the
+	 * relation's and each column's (by name), as the relation's owner here
+	 * gives them, and the source relation's owner's own a grant to it.
+	 * For a relation a merge of source, or a pick or revert of a commit
+	 * source's history has, made here, whose commits hold no privileges.
+	 * Called for several sources, it adds each one's.  None for one source
+	 * hasn't, or has now of another kind or name, nor where source is no
+	 * branch with copies.
 	 */
-	void		(*carry_privileges) (const char *source, List *relids);
+	void		(*carry_privileges) (const char *source, List *relids,
+									 List *fromids);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

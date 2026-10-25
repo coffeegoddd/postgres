@@ -746,6 +746,17 @@ typedef struct ProllyRefsRoutine
 	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
 
 	/*
+	 * Optional: the relation (*relid) that branch's own record of its
+	 * relations, made by its last commit, lists under the qualified name
+	 * name, and that commit (*at); false if it lists none so, or there is
+	 * no record.  A relation of the branch now of that name and another
+	 * OID was made since: it isn't the one the commit's object was made
+	 * from.
+	 */
+	bool		(*recorded_relid) (const char *branch, const char *name,
+								   Oid *relid, ProllyHash *at);
+
+	/*
 	 * Optional: the role that made branch name, which owns it; false if
 	 * none is recorded (main, the database owner's, never has one).
 	 */
@@ -812,7 +823,8 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
+	"pin_set", "pin_get", "pins", "recorded_relation", "recorded_relid", \
+	"branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK tag_set_creator

@@ -459,19 +459,29 @@ objects it doesn't own.
 Commits hold no privileges, so a relation a move makes has only the ones
 its making gives it.  A merge (or fast-forward) of a branch of this
 database, though, gives each relation it makes on the target, one new to
-it (of a name and an OID the branch didn't have: not one renamed, nor
-one made again in another's place), the privileges the source branch's
-relation of its schema's and its own name has: the relation's, and each
-column's by name, as the new relation's owner gives them, with their
-shared dependencies (branch_ops' carry_privileges), added to those its
-making gave it (the target's default privileges).  The merging role
-approves them as it approves the table.  dolt_integrate() merges so too,
-and a cherry-pick or a revert takes them from each other branch of this
-database whose history has a commit it picks or reverts.  A relation
-merged from a remote's ref (a fetch, a pull), a tag or a commit, or
-picked from a commit no other branch here has, arrives with only those
-its making gives it, as does one a reset makes.  Row security and policies are held in
-commits, so they arrive with the relation whatever its source.
+it (not one made again in the place of one of its name the move dropped),
+the privileges of the source branch's relation it was made from: the
+relation's, and each column's by name, as the new relation's owner (the
+merging role) gives them, with their shared dependencies (branch_ops'
+carry_privileges), added to those its making gave it (the target's
+default privileges).  The source relation's owner keeps its own, as a
+grant to it from the new owner.  The merging role approves them as it
+approves the table.  The relations the move makes and drops are found by
+the object access hook as it runs, so this costs only as much as the move
+changes.
+
+The source's relation is the one the branch's record of its relations
+('N' in the refs, made by each full commit) lists under the name, and
+only while the branch's head is that record's commit: one of the name
+made since, uncommitted (another relation, perhaps of another kind),
+gives nothing, nor does a branch whose head moved without a commit.
+dolt_integrate() merges so too, and a cherry-pick or a revert takes them
+from each other branch of this database whose history has a commit it
+picks or reverts.  A relation merged from a remote's ref (a fetch, a
+pull), a tag or a commit, or picked from a commit no other branch here
+has, arrives with only those its making gives it, as does one a reset
+makes.  Row security and policies are held in commits, so they arrive
+with the relation whatever its source.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag

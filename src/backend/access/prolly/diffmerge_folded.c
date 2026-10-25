@@ -94,6 +94,7 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_operator.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
@@ -12728,24 +12729,6 @@ merge_held(const char *branch, const char *message, int flags,
 	return 0;
 }
 
-/* A relation of the session's branch, as named before a merge. */
-typedef struct NamedRelation
-{
-	char		name[2 * NAMEDATALEN + 2];	/* schema, a dot, relation */
-	Oid			relid;
-} NamedRelation;
-
-/* the hash key of relation rel (pg_class row): its schema's name and its own */
-static void
-relation_key(Form_pg_class rel, char *key)
-{
-	char	   *nsp = get_namespace_name(rel->relnamespace);
-
-	memset(key, 0, 2 * NAMEDATALEN + 2);
-	snprintf(key, 2 * NAMEDATALEN + 2, "%s.%s", nsp ? nsp : "",
-			 NameStr(rel->relname));
-}
-
 /* Does a relation of this kind have privileges of its own? */
 static bool
 has_privileges(char relkind)
@@ -12755,138 +12738,168 @@ has_privileges(char relkind)
 		relkind == RELKIND_SEQUENCE || relkind == RELKIND_FOREIGN_TABLE;
 }
 
-/* The session branch's relations with privileges of their own: a scan. */
-static SysScanDesc
-branch_relations_begin(Relation pg_class)
+/* relation relid's qualified name, "schema.relation" (NULL: none) */
+static char *
+qualified_relation(Oid relid)
 {
-	return catalog_branch_beginscan(pg_class, MyBranch);
-}
+	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	char	   *name = NULL;
 
-static Form_pg_class
-branch_relations_next(SysScanDesc scan)
-{
-	HeapTuple	tup;
-
-	while ((tup = systable_getnext(scan)) != NULL)
+	if (HeapTupleIsValid(tup))
 	{
 		Form_pg_class rel = (Form_pg_class) GETSTRUCT(tup);
+		char	   *nsp = get_namespace_name(rel->relnamespace);
 
-		if (has_privileges(rel->relkind))
-			return rel;
+		if (nsp != NULL)
+			name = psprintf("%s.%s", nsp, NameStr(rel->relname));
+		ReleaseSysCache(tup);
 	}
-	return NULL;
+	return name;
 }
 
 /*
- * The session branch's relations with privileges (its versioned schemas'),
- * before a merge: by name (returned) and by id (*relids).
- */
-static HTAB *
-relations_before(HTAB **relids)
-{
-	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = branch_relations_begin(pg_class);
-	Form_pg_class rel;
-	HASHCTL		ctl;
-	HTAB	   *names;
-
-	ctl.keysize = 2 * NAMEDATALEN + 2;
-	ctl.entrysize = sizeof(NamedRelation);
-	ctl.hcxt = CurrentMemoryContext;
-	names = hash_create("merge's relations by name", 64, &ctl,
-						HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(Oid);
-	*relids = hash_create("merge's relations by id", 64, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	while ((rel = branch_relations_next(scan)) != NULL)
-	{
-		char		key[2 * NAMEDATALEN + 2];
-		NamedRelation *n;
-
-		relation_key(rel, key);
-		n = hash_search(names, key, HASH_ENTER, NULL);
-		n->relid = rel->oid;
-		(void) hash_search(*relids, &rel->oid, HASH_ENTER, NULL);
-	}
-	systable_endscan(scan);
-	table_close(pg_class, AccessShareLock);
-	return names;
-}
-
-/*
- * The session branch's relations with privileges made since
- * relations_before() found names and relids: those of a name and an id it
- * didn't find (not one renamed, nor one made again in another's place).
- */
-static List *
-relations_made(HTAB *names, HTAB *relids)
-{
-	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = branch_relations_begin(pg_class);
-	Form_pg_class rel;
-	List	   *made = NIL;
-
-	while ((rel = branch_relations_next(scan)) != NULL)
-	{
-		char		key[2 * NAMEDATALEN + 2];
-		bool		found;
-
-		relation_key(rel, key);
-		(void) hash_search(names, key, HASH_FIND, &found);
-		if (found)
-			continue;
-		(void) hash_search(relids, &rel->oid, HASH_FIND, &found);
-		if (!found)
-			made = lappend_oid(made, rel->oid);
-	}
-	systable_endscan(scan);
-	table_close(pg_class, AccessShareLock);
-	return made;
-}
-
-/*
- * The relations a move is about to make, found before it: those of the
- * session branch's versioned schemas, by name and by id, and the local
- * branches whose relations' privileges the ones it makes take.
+ * The relations a move makes, as it makes them, and the names of those it
+ * drops, for the privileges of the local branches its objects come from:
+ * found by the object access hook, so only as much as the move changes.
  */
 typedef struct CarriedPrivileges
 {
 	List	   *sources;		/* branches' names */
-	HTAB	   *names;
-	HTAB	   *relids;
+	List	   *made;			/* relations' OIDs */
+	List	   *dropped;		/* relations' qualified names */
+	MemoryContext cxt;
+	object_access_hook_type prev;
+	struct CarriedPrivileges *outer;
 } CarriedPrivileges;
 
-/*
- * Before a move whose relations come from branches sources (NIL: none of
- * this database), the relations the session's branch has.
- */
+static CarriedPrivileges *carrying = NULL;
+
 static void
-carry_begin(CarriedPrivileges *carried, List *sources)
+carry_access(ObjectAccessType access, Oid classId, Oid objectId, int subId,
+			 void *arg)
 {
-	carried->sources = branch_ops()->carry_privileges != NULL ? sources : NIL;
-	carried->names = NULL;
-	carried->relids = NULL;
-	if (carried->sources != NIL)
-		carried->names = relations_before(&carried->relids);
+	CarriedPrivileges *c = carrying;
+
+	if (c->prev)
+		c->prev(access, classId, objectId, subId, arg);
+	if (classId != RelationRelationId || subId != 0)
+		return;
+	if (access == OAT_POST_CREATE)
+	{
+		MemoryContext old = MemoryContextSwitchTo(c->cxt);
+
+		c->made = lappend_oid(c->made, objectId);
+		MemoryContextSwitchTo(old);
+	}
+	else if (access == OAT_DROP)
+	{
+		MemoryContext old = MemoryContextSwitchTo(c->cxt);
+		char	   *name = qualified_relation(objectId);
+
+		if (name != NULL)
+			c->dropped = lappend(c->dropped, name);
+		MemoryContextSwitchTo(old);
+	}
 }
 
 /*
- * After it, each relation it made, new to the branch, has too the
- * privileges of each source branch's relation of its name (several
- * sources' together): its commits hold none, and a branch of this database
- * has them.
+ * Before a move whose objects come from branches sources (NIL: none of
+ * this database), watch what relations it makes and drops; carry_stop()
+ * after it, whether it fails or not.
  */
 static void
-carry_end(CarriedPrivileges *carried)
+carry_begin(CarriedPrivileges *c, List *sources)
 {
-	List	   *made;
+	c->sources = branch_ops()->carry_privileges != NULL ? sources : NIL;
+	c->made = NIL;
+	c->dropped = NIL;
+	c->cxt = CurrentMemoryContext;
+	c->prev = object_access_hook;
+	c->outer = carrying;
+	if (c->sources != NIL)
+	{
+		carrying = c;
+		object_access_hook = carry_access;
+	}
+}
 
-	if (carried->names == NULL)
+static void
+carry_stop(CarriedPrivileges *c)
+{
+	if (c->sources != NIL)
+	{
+		object_access_hook = c->prev;
+		carrying = c->outer;
+	}
+}
+
+/*
+ * After it, each relation it made, new to the branch (not one made in the
+ * place of one of its name it dropped), has too the privileges of each
+ * source branch's relation it was made from: the one the branch's record
+ * of its relations, made by the commit that is its head, lists under its
+ * name.  None from a branch whose head isn't the commit of its record, or
+ * whose relation of the name was made since: they may not be the ones the
+ * move's objects came from.  Its commits hold no privileges; a branch of
+ * this database has them.
+ */
+static void
+carry_end(CarriedPrivileges *c)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *names = NIL;
+	List	   *relids = NIL;
+
+	if (c->sources == NIL || c->made == NIL ||
+		!PROLLY_HAS(dc.refs, recorded_relid))
 		return;
-	made = relations_made(carried->names, carried->relids);
-	foreach_ptr(char, source, carried->sources)
-		branch_ops()->carry_privileges(source, made);
+	foreach_oid(relid, c->made)
+	{
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+		bool		carried;
+		char	   *name;
+
+		if (!HeapTupleIsValid(tup))
+			continue;			/* (made and dropped again) */
+		carried = has_privileges(((Form_pg_class) GETSTRUCT(tup))->relkind);
+		ReleaseSysCache(tup);
+		if (!carried || (name = qualified_relation(relid)) == NULL)
+			continue;
+		foreach_ptr(char, d, c->dropped)
+			if (strcmp(d, name) == 0)
+				carried = false;
+		if (carried)
+		{
+			names = lappend(names, name);
+			relids = lappend_oid(relids, relid);
+		}
+	}
+	foreach_ptr(char, source, c->sources)
+	{
+		ProllyHash	head;
+		List	   *mine = NIL;
+		List	   *theirs = NIL;
+		ListCell   *ln;
+		ListCell   *lr;
+
+		if (!PROLLY_CALL(dc.refs, resolve, psprintf("refs/heads/%s", source),
+						 &head))
+			continue;
+		forboth(ln, names, lr, relids)
+		{
+			Oid			fromid;
+			ProllyHash	at;
+
+			if (PROLLY_CALL(dc.refs, recorded_relid, source, lfirst(ln),
+							&fromid, &at) && same_hash(&at, &head))
+			{
+				mine = lappend_oid(mine, lfirst_oid(lr));
+				theirs = lappend_oid(theirs, fromid);
+			}
+		}
+		if (mine != NIL)
+			branch_ops()->carry_privileges(source, mine, theirs);
+	}
 }
 
 /* The local branches a pick's commits come from, as they are found. */
@@ -12947,23 +12960,43 @@ picked_sources(const char *const *refs, int nrefs)
 	return ps.names;
 }
 
+/*
+ * The branch of this database ref names, as resolving it finds one first
+ * (a branch named so itself, else by its full ref name), or NULL.
+ */
+static const char *
+merged_branch(const char *ref)
+{
+	if (pg_strcasecmp(ref, "HEAD") == 0 &&
+		!SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)))
+		return NULL;
+	if (strncmp(ref, "refs/heads/", 11) == 0 && ref[11] != '\0' &&
+		!SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)))
+		ref += 11;
+	return SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(ref)) ? ref : NULL;
+}
+
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
 {
 	/* the heads read under the refs held, as they are */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	const char *source = branch;
+	const char *source = merged_branch(branch);
 	CarriedPrivileges carried;
-	int			result;
+	volatile int result;
 
 	/* (one merged as a remote's ref, a tag or a commit has none to give) */
-	if (strncmp(source, "refs/heads/", 11) == 0)
-		source += 11;
-	carry_begin(&carried,
-				SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(source)) ?
-				list_make1((char *) source) : NIL);
-	result = merge_held(branch, message, flags, commit_id);
+	carry_begin(&carried, source ? list_make1((char *) source) : NIL);
+	PG_TRY();
+	{
+		result = merge_held(branch, message, flags, commit_id);
+	}
+	PG_FINALLY();
+	{
+		carry_stop(&carried);
+	}
+	PG_END_TRY();
 	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
@@ -13520,10 +13553,18 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	CarriedPrivileges carried;
-	int			result;
+	volatile int result;
 
 	carry_begin(&carried, picked_sources(refs, nrefs));
-	result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	PG_TRY();
+	{
+		result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	}
+	PG_FINALLY();
+	{
+		carry_stop(&carried);
+	}
+	PG_END_TRY();
 	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
@@ -13553,10 +13594,18 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 {
 	bool		pushed = PROLLY_CALL(components().refs, hold);
 	CarriedPrivileges carried;
-	int			result;
+	volatile int result;
 
 	carry_begin(&carried, picked_sources(refs, nrefs));
-	result = revert_held(refs, nrefs, series_head, commit_id);
+	PG_TRY();
+	{
+		result = revert_held(refs, nrefs, series_head, commit_id);
+	}
+	PG_FINALLY();
+	{
+		carry_stop(&carried);
+	}
+	PG_END_TRY();
 	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();

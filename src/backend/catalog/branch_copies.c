@@ -81,6 +81,7 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -1963,60 +1964,6 @@ copies_let_go(const BranchKeptRelation *kept)
 }
 
 /*
- * Branch's row of the relation called relname in the schema called nspname
- * (copies, found by name: a relation made on one branch has another OID
- * on the next), or NULL if branch has none.
- */
-static HeapTuple
-class_row_named(Oid branch, const char *nspname, const char *relname)
-{
-	Relation	pg_namespace = table_open(NamespaceRelationId, AccessShareLock);
-	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-	ScanKeyData key[3];
-	SysScanDesc scan;
-	HeapTuple	tup;
-	HeapTuple	result = NULL;
-
-	CatalogAllBranches = true;
-	PG_TRY();
-	{
-		Oid			nsp = InvalidOid;
-
-		ScanKeyInit(&key[0], Anum_pg_namespace_nspname, BTEqualStrategyNumber,
-					F_NAMEEQ, CStringGetDatum(nspname));
-		ScanKeyInit(&key[1], Anum_pg_namespace_nspbranch, BTEqualStrategyNumber,
-					F_OIDEQ, ObjectIdGetDatum(branch));
-		scan = systable_beginscan(pg_namespace, NamespaceNameIndexId, true,
-								  NULL, 2, key);
-		if ((tup = systable_getnext(scan)) != NULL)
-			nsp = ((Form_pg_namespace) GETSTRUCT(tup))->oid;
-		systable_endscan(scan);
-		if (OidIsValid(nsp))
-		{
-			ScanKeyInit(&key[0], Anum_pg_class_relname, BTEqualStrategyNumber,
-						F_NAMEEQ, CStringGetDatum(relname));
-			ScanKeyInit(&key[1], Anum_pg_class_relnamespace,
-						BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(nsp));
-			ScanKeyInit(&key[2], Anum_pg_class_relbranch, BTEqualStrategyNumber,
-						F_OIDEQ, ObjectIdGetDatum(branch));
-			scan = systable_beginscan(pg_class, ClassNameNspIndexId, true,
-									  NULL, 3, key);
-			if ((tup = systable_getnext(scan)) != NULL)
-				result = heap_copytuple(tup);
-			systable_endscan(scan);
-		}
-	}
-	PG_FINALLY();
-	{
-		CatalogAllBranches = false;
-	}
-	PG_END_TRY();
-	table_close(pg_class, AccessShareLock);
-	table_close(pg_namespace, AccessShareLock);
-	return result;
-}
-
-/*
  * Add acl to the privileges of relation relid's row in catalog (pg_class,
  * or its column attnum's pg_attribute row: tup, a modifiable copy), as
  * owner's, recording its grantees' shared dependencies.  The privileges
@@ -2052,49 +1999,112 @@ set_privileges(Relation catalog, HeapTuple tup, AttrNumber aclattr,
 	heap_freetuple(newtup);
 }
 
+/* Branch's row of the object of catalog (by its OID index) with OID oid. */
+static HeapTuple
+branch_row(Oid catalog, Oid index, AttrNumber oidattr, Oid oid, Oid branch)
+{
+	List	   *rows = branch_rows(catalog, index, oidattr, oid, branch);
+
+	return rows != NIL ? linitial(rows) : NULL;
+}
+
 /*
- * Add to each of the session branch's relations relids the privileges its
- * namesake on branch source has (the relation of its schema's and its own
- * name there), the relation's and each column's (by the column's name),
- * as the relation's owner here gives them.  Nothing for one source hasn't,
- * nor where source is no branch here (one never used has no copies).
+ * acl, of a relation owner fromowner had, as owner's: the grants
+ * fromowner made, owner's, and fromowner's own privileges (all of them,
+ * with acl NULL: the default, of a relation of kind relkind) a grant to it
+ * from owner, so the role that made the relation keeps what it had.
+ */
+static Acl *
+carried_acl(Acl *acl, char relkind, Oid fromowner, Oid owner)
+{
+	Acl		   *result;
+	AclItem    *items;
+
+	if (acl == NULL)
+	{
+		if (fromowner == owner)
+			return NULL;
+		acl = acldefault(relkind == RELKIND_SEQUENCE ? OBJECT_SEQUENCE :
+						 OBJECT_TABLE, fromowner);
+	}
+	result = aclnewowner(acl, fromowner, owner);
+	if (fromowner == owner)
+		return result;
+	items = ACL_DAT(acl);
+	for (int i = 0; i < ACL_NUM(acl); i++)
+	{
+		AclItem		item;
+
+		if (items[i].ai_grantee != fromowner || items[i].ai_grantor != fromowner)
+			continue;
+		item.ai_grantee = fromowner;
+		item.ai_grantor = owner;
+		ACLITEM_SET_PRIVS_GOPTIONS(item, ACLITEM_GET_PRIVS(items[i]),
+								   ACL_NO_RIGHTS);
+		result = aclupdate(result, &item, ACL_MODECHG_ADD, owner, DROP_RESTRICT);
+	}
+	return result;
+}
+
+/*
+ * Add to each of the session branch's relations relids the privileges of
+ * the relation of branch source of the same place in fromids, the
+ * relation's and each column's (by the column's name), as the relation's
+ * owner here gives them.  Nothing from one source hasn't, nor one of
+ * another kind or another name now (made, or renamed, since the commit
+ * that was found to hold it), nor where source is no branch here.
  */
 static void
-copies_carry_privileges(const char *source, List *relids)
+copies_carry_privileges(const char *source, List *relids, List *fromids)
 {
 	Oid			src = branch_oid(source, true);
 	Relation	pg_class;
 	Relation	pg_attribute;
+	ListCell   *lr;
+	ListCell   *lf;
 
 	if (!OidIsValid(src) || src == MyBranch || relids == NIL)
 		return;
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 	pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
-	foreach_oid(relid, relids)
+	forboth(lr, relids, lf, fromids)
 	{
+		Oid			relid = lfirst_oid(lr);
+		Oid			fromid = lfirst_oid(lf);
 		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 		Form_pg_class rel;
 		char	   *nspname;
 		HeapTuple	from;
+		HeapTuple	fromnsp;
 		Form_pg_class fromrel;
 		Datum		acl;
 		bool		isnull;
+		Acl		   *carried;
 
 		if (!HeapTupleIsValid(tup))
 			continue;
 		rel = (Form_pg_class) GETSTRUCT(tup);
 		nspname = get_namespace_name(rel->relnamespace);
-		from = nspname ? class_row_named(src, nspname, NameStr(rel->relname)) : NULL;
-		if (from == NULL)
+		from = branch_row(RelationRelationId, ClassOidIndexId,
+						  Anum_pg_class_oid, fromid, src);
+		if (from == NULL || nspname == NULL)
 			continue;
 		fromrel = (Form_pg_class) GETSTRUCT(from);
+		fromnsp = branch_row(NamespaceRelationId, NamespaceOidIndexId,
+							 Anum_pg_namespace_oid, fromrel->relnamespace, src);
+		if (fromrel->relkind != rel->relkind ||
+			strcmp(NameStr(fromrel->relname), NameStr(rel->relname)) != 0 ||
+			fromnsp == NULL ||
+			strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(fromnsp))->nspname),
+				   nspname) != 0)
+			continue;
 		acl = heap_getattr(from, Anum_pg_class_relacl,
 						   RelationGetDescr(pg_class), &isnull);
-		if (!isnull)
+		carried = carried_acl(isnull ? NULL : DatumGetAclP(acl), rel->relkind,
+							  fromrel->relowner, rel->relowner);
+		if (carried != NULL)
 			set_privileges(pg_class, tup, Anum_pg_class_relacl, relid, 0,
-						   rel->relowner,
-						   aclnewowner(DatumGetAclP(acl), fromrel->relowner,
-									   rel->relowner));
+						   rel->relowner, carried);
 		foreach_ptr(HeapTupleData, att,
 					branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
 								Anum_pg_attribute_attrelid, fromrel->oid, src))
@@ -2114,8 +2124,8 @@ copies_carry_privileges(const char *source, List *relids)
 			set_privileges(pg_attribute, mine, Anum_pg_attribute_attacl, relid,
 						   ((Form_pg_attribute) GETSTRUCT(mine))->attnum,
 						   rel->relowner,
-						   aclnewowner(DatumGetAclP(acl), fromrel->relowner,
-									   rel->relowner));
+						   carried_acl(DatumGetAclP(acl), rel->relkind,
+									   fromrel->relowner, rel->relowner));
 			heap_freetuple(mine);
 		}
 		heap_freetuple(from);

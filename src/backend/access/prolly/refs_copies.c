@@ -36,9 +36,11 @@
  *				   as noted before)
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
- *	'N' name	-> the head's tables, as the commit that made it of the
- *				   working set named them: the head's hash, then a line
- *				   per table (its OID, then its qualified name)
+ *	'N' name	-> the head's tables, and its other relations with
+ *				   privileges of their own (views, sequences and so on),
+ *				   as the commit that made it of the working set named
+ *				   them: the head's hash, then a line per relation (its
+ *				   OID, then its qualified name)
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
  *				   merge recorded them: each table's OID, then its name's
  *				   length (a varint) and bytes; and the tables in schema
@@ -4384,8 +4386,9 @@ line_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
- * The session's prolly tables, each "relid name" on a line, by relid: as
- * the branch's catalog names them now.
+ * The session's prolly tables, and its other relations with privileges of
+ * their own, each "relid name" on a line, by relid: as the branch's
+ * catalog names them now.
  */
 static void
 table_names(StringInfo out)
@@ -4400,7 +4403,11 @@ table_names(StringInfo out)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
+		if ((c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION) ||
+			c->relkind == RELKIND_PARTITIONED_TABLE ||
+			c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
+			c->relkind == RELKIND_SEQUENCE ||
+			c->relkind == RELKIND_FOREIGN_TABLE)
 			lines = lappend(lines, psprintf("%010u %s.%s", c->oid,
 											get_namespace_name(c->relnamespace),
 											NameStr(c->relname)));
@@ -4543,6 +4550,43 @@ copies_recorded_relation(Oid relid, ProllyHash *at)
 		}
 	}
 	pfree(lines);
+	return found;
+}
+
+static bool
+copies_recorded_relid(const char *branch, const char *name, Oid *relid,
+					  ProllyHash *at)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *nl;
+	bool		found = false;
+	size_t		len = strlen(name);
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, branch);
+	if (refs_get(key.data, key.len, &v) && (nl = strchr(v.data, '\n')) != NULL &&
+		prolly_hash_from_hex(v.data, nl - v.data, at))
+	{
+		/* (each line "%010u name": the OID, a space, the name) */
+		for (char *p = nl + 1; *p != '\0' && !found;)
+		{
+			char	   *end = strchr(p, '\n');
+			size_t		linelen = end ? (size_t) (end - p) : strlen(p);
+
+			if (linelen == 11 + len && p[10] == ' ' &&
+				strncmp(p + 11, name, len) == 0)
+			{
+				*relid = (Oid) strtoul(p, NULL, 10);
+				found = true;
+			}
+			p += end ? linelen + 1 : linelen;
+		}
+	}
+	pfree(key.data);
+	pfree(v.data);
 	return found;
 }
 
@@ -8101,6 +8145,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
 	.recorded_relation = copies_recorded_relation,
+	.recorded_relid = copies_recorded_relid,
 	.branch_creator = copies_branch_creator,
 	.branch_set_creator = copies_branch_set_creator,
 	.tag_creator = copies_tag_creator,
