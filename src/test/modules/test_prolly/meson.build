@@ -163,6 +163,7 @@ tests += {
       'stat_prolly',
       'stat_prolly_moves',
       'node_cache',
+      'commit_cache',
       'store_sizes',
       'storage_breakdown',
       'get_many',
@@ -424,6 +425,7 @@ tests += {
       't/426_autofold_trim_own_snapshot.pl',
       't/447_node_cache.pl',
       't/453_branch_switch_caches.pl',
+      't/454_commit_cache.pl',
     ],
   },
 }
