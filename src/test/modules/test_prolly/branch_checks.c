@@ -115,6 +115,13 @@ test_branches_written(PG_FUNCTION_ARGS)
  * virtual transaction (AnyLockHasWaiters(), which a paced fold asks before
  * each nap).
  */
+PG_FUNCTION_INFO_V1(test_any_lock_has_waiters);
+Datum
+test_any_lock_has_waiters(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(AnyLockHasWaiters());
+}
+
 /*
  * The engine's work counters as this backend alone has counted them, since
  * it began (pgstat_prolly_session_counts()): one (name, value) row each.
@@ -138,11 +145,4 @@ test_prolly_session_stats(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;
-}
-
-PG_FUNCTION_INFO_V1(test_any_lock_has_waiters);
-Datum
-test_any_lock_has_waiters(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BOOL(AnyLockHasWaiters());
 }

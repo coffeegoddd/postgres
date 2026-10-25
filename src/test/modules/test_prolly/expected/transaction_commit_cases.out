@@ -518,23 +518,28 @@ SELECT length(dolt_commit('-Am', 'tcc cost')::text) AS committed;
 SET dolt.transaction_commit = on;
 -- (Each is measured as what this backend counted over its statement: work
 -- other processes do for the database meanwhile, under load, counts in the
--- database's counters, not here.  Measured three times, the least taken.)
-CREATE TEMP TABLE cost (k text, name text, value bigint);
+-- database's counters, not here.  The nodes are the tables' trees' alone,
+-- not the refs' and commits' (refs_nodes_read and refs_nodes_written),
+-- whose leaves hold hashes and dates: where their chunks split moves from
+-- commit to commit.  Measured three times: the least of the nodes, which
+-- also vary with the row each changes, and the most of the folds, so that
+-- one commit that folds is seen.)
+CREATE TEMP TABLE cost (k text, i int, name text, value bigint);
 CREATE TEMP TABLE snap (name text, value bigint);
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 10;
-INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+INSERT INTO cost SELECT 'clean', 1, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 13;
-INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+INSERT INTO cost SELECT 'clean', 2, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 14;
-INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+INSERT INTO cost SELECT 'clean', 3, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
 SET dolt.transaction_commit = off;
 INSERT INTO tcc.o SELECT g, 'outside' || g FROM generate_series(1, 20000) g;
@@ -543,22 +548,28 @@ SET dolt.transaction_commit = on;
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 11;
-INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+INSERT INTO cost SELECT 'busy', 4, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 15;
-INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+INSERT INTO cost SELECT 'busy', 5, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
 DELETE FROM snap;
 INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 16;
-INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+INSERT INTO cost SELECT 'busy', 6, s.name, s.value - p.value
   FROM test_prolly_session_stats() s JOIN snap p USING (name);
+UPDATE cost c SET value = c.value - r.value
+  FROM cost r
+ WHERE r.k = c.k AND r.i = c.i AND r.name = 'refs_' || c.name
+   AND c.name IN ('nodes_read', 'nodes_written');
 SELECT c.name, c.value = b.value AS same,
 	CASE WHEN c.name NOT LIKE 'fold\_%' THEN c.value > 0 END AS counted
-  FROM (SELECT name, min(value) AS value FROM cost WHERE k = 'clean' GROUP BY name) c
-  JOIN (SELECT name, min(value) AS value FROM cost WHERE k = 'busy' GROUP BY name) b
+  FROM (SELECT name, CASE WHEN name LIKE 'fold\_%' THEN max(value) ELSE min(value) END AS value
+		  FROM cost WHERE k = 'clean' GROUP BY name) c
+  JOIN (SELECT name, CASE WHEN name LIKE 'fold\_%' THEN max(value) ELSE min(value) END AS value
+		  FROM cost WHERE k = 'busy' GROUP BY name) b
  USING (name)
  WHERE c.name IN ('nodes_read', 'nodes_written', 'commits', 'fold_rows_read',
 				  'fold_pages', 'fold_candidates', 'fold_full_tables')
