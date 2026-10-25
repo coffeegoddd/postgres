@@ -174,7 +174,7 @@ FROM key_sets s JOIN plain h USING (id);
 -- kind: the documents they give, or (shown below) their errors.
 CREATE TEMP TABLE edit_values (n int, v jsonb);
 INSERT INTO edit_values VALUES (0, '"put"'), (1, 'null'), (2, '{"n": [1, 2.50]}'), (3, '[]'),
-	(4, to_jsonb(repeat('grown ', 300))), (5, '-0.000');
+	(4, to_jsonb(repeat('grown ', 300))), (5, '-0.000'), (6, '1.00'), (7, '1e2'), (8, '-0');
 CREATE FUNCTION do_edit(op text, j jsonb, path text[], v jsonb) RETURNS jsonb
 LANGUAGE sql AS $$
 	SELECT CASE op
@@ -195,7 +195,7 @@ EXCEPTION WHEN OTHERS THEN
 	RETURN 'error: ' || SQLERRM;
 END $$;
 CREATE TEMP TABLE edit_cases AS
-SELECT p.id, p.path, (random() * 5)::int AS n,
+SELECT p.id, p.path, (random() * 8)::int AS n,
 	   (ARRAY['#-', 'insert', 'insert after', 'lax', 'lax delete_key', 'lax return_target',
 			  'lax use_json_null', 'lax raise_exception'])[1 + (random() * 7)::int] AS op
 FROM paths p WHERE random() < 0.4;
@@ -243,7 +243,7 @@ BEGIN
 						 WHERE path IS NOT NULL AND array_position(path, NULL) IS NULL
 							   AND cardinality(path) > 0
 						 ORDER BY random() LIMIT 250) p) s
-				  JOIN edit_values v ON v.n = s.k % 6
+				  JOIN edit_values v ON v.n = s.k % 9
 			 ORDER BY s.k LOOP
 		SELECT string_agg(format('[%L]', s), '') INTO subs FROM unnest(e.path) s;
 		upd := CASE e.op
@@ -261,7 +261,7 @@ BEGIN
 		SELECT prolly_jsonb_tree_root(j) INTO r1 FROM vt.docs WHERE id = e.id;
 		SELECT prolly_jsonb_tree_root(j) INTO r2 FROM vt.docs WHERE id = 100;
 		INSERT INTO edit_results
-		SELECT k, e.op, d.j = h.j, r1 IS NOT DISTINCT FROM r2
+		SELECT k, e.op, d.j::text = h.j::text, r1 IS NOT DISTINCT FROM r2
 		FROM vt.docs d JOIN plain h USING (id) WHERE id = e.id;
 	END LOOP;
 	DELETE FROM vt.docs WHERE id = 100;
@@ -269,8 +269,37 @@ END $$;
 SELECT op, count(*) > 10 AS steps, count(*) FILTER (WHERE NOT (same AND same_root)) AS differ
 FROM edit_results GROUP BY op ORDER BY op;
 -- (the documents, all edited, as the heap's)
-SELECT count(*) FILTER (WHERE d.j = h.j) AS same, count(*) AS docs
+SELECT count(*) FILTER (WHERE d.j::text = h.j::text) AS same, count(*) AS docs
 FROM vt.docs d JOIN plain h USING (id);
+
+-- Values equal as numbers but not as text (1, 1.0 and 1.00; 0 and -0;
+-- 100 and 1e2), equal strings and containers: an edit to one is an edit,
+-- as jsonb's own gives it, and an insert before an array's last element
+-- equal to it is no append.
+CREATE TABLE vt.eq (id int PRIMARY KEY, j jsonb);
+INSERT INTO vt.eq
+SELECT 1, jsonb_build_object('a', 1.0, 'z', 0, 'h', 100, 's', 'same', 'o', '{"p": [1.0]}'::jsonb,
+							 'n', jsonb_build_object('b', jsonb_build_object('c', 1.0)),
+							 'arr', (SELECT jsonb_agg(md5(g::text)) FROM generate_series(1, 100) g) || '[1.0]'::jsonb,
+							 'long', (SELECT jsonb_agg(md5(g::text)) FROM generate_series(1, 100) g));
+CREATE TABLE eq_plain AS SELECT * FROM vt.eq;
+CREATE TEMP TABLE eq_edits (k int, e text);
+INSERT INTO eq_edits VALUES
+	(1, $$SET j['a'] = '1.00'$$), (2, $$SET j['a'] = '1'$$), (3, $$SET j['z'] = '-0'$$),
+	(4, $$SET j['z'] = '0.0'$$), (5, $$SET j['h'] = '1e2'$$), (6, $$SET j['n']['b']['c'] = '1.00'$$),
+	(7, $$SET j['s'] = '"same"'$$), (8, $$SET j['o'] = '{"p": [1.00]}'$$),
+	(9, $$SET j['arr'][-1] = '1.00'$$),
+	(10, $$SET j = jsonb_insert(j, '{arr,-1}', '1.00')$$),
+	(11, $$SET j = jsonb_insert(j, '{arr,-1}', '1.0', true)$$),
+	(12, $$SET j = jsonb_insert(j, '{arr,-1}', '1', false)$$),
+	(13, $$SET j = jsonb_set_lax(j, '{n,b,c}', '1.000')$$),
+	(14, $$SET j = jsonb_set(j, '{a}', '1.0000')$$);
+SELECT format('UPDATE vt.eq %s WHERE id = 1; UPDATE eq_plain %s WHERE id = 1', e, e)
+FROM eq_edits ORDER BY k \gexec
+SELECT d.j::text = h.j::text AS same_text, d.j -> 'a' AS a, d.j -> 'z' AS z, d.j -> 'h' AS h,
+	   d.j #> '{n,b,c}' AS c, d.j -> 'o' AS o, d.j -> 'arr' -> -4 AS arr_4, d.j -> 'arr' -> -3 AS arr_3,
+	   d.j -> 'arr' -> -2 AS arr_2, d.j -> 'arr' -> -1 AS arr_1, (test_toast_pointer(d.j)).form AS form
+FROM vt.eq d JOIN eq_plain h USING (id);
 
 -- Each reads the nodes on its path, not the document's: fewer than a
 -- tenth of the nodes a whole read reads, and so does each edit by UPDATE.
@@ -327,7 +356,7 @@ UPDATE big_plain SET j = jsonb_insert(j, '{arr,-1}', '"appended"', true) WHERE i
 UPDATE big_plain SET j = jsonb_set_lax(j, '{items,k79}', NULL, true, 'delete_key') WHERE id = 1;
 UPDATE big_plain SET j = jsonb_set_lax(j, '{items,k80,name}', '"lax"') WHERE id = 1;
 UPDATE big_plain SET j = j #- '{-1}' WHERE id = 2;
-SELECT d.id, d.j = h.j AS same, (test_toast_pointer(d.j)).form AS form
+SELECT d.id, d.j::text = h.j::text AS same, (test_toast_pointer(d.j)).form AS form
 FROM vt.big d JOIN big_plain h USING (id) ORDER BY 1;
 
 -- An edit that empties a long container, or the document: the container
@@ -340,7 +369,7 @@ UPDATE vt.one SET j = j #- '{only,inner}' WHERE id = 1;
 UPDATE one_plain SET j = j #- '{only,inner}' WHERE id = 1;
 UPDATE vt.one SET j = j #- '{only}' WHERE id = 2;
 UPDATE one_plain SET j = j #- '{only}' WHERE id = 2;
-SELECT d.id, d.j, d.j = h.j AS same, (test_toast_pointer(d.j)).form AS form
+SELECT d.id, d.j, d.j::text = h.j::text AS same, (test_toast_pointer(d.j)).form AS form
 FROM vt.one d JOIN one_plain h USING (id) ORDER BY 1;
 
 -- No tree edit where its nodes wouldn't outlive the result, or can't be

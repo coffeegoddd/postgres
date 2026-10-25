@@ -1718,7 +1718,11 @@ paths_exists(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **keys,
 	StringInfoData p;
 	PathKind	kind;
 	bool	   *found = palloc0(sizeof(bool) * Max(nkeys, 1));
+	uint32	   *keylens = palloc(sizeof(uint32) * Max(nkeys, 1));
 	int			nfound = 0;
+
+	for (int i = 0; i < nkeys; i++)
+		keylens[i] = strlen(keys[i]);
 
 	doc_env(env, &denv);
 	c = PROLLY_CALL(tree, cursor_open, &denv, root, CurrentMemoryContext);
@@ -1764,19 +1768,31 @@ paths_exists(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **keys,
 			index = get_u32(k.data + 1);
 			if (k.len == STEP_HEADER)
 			{
-				Jsonb	   *e = value_doc(v.data, (int) v.len);
-
+				/*
+				 * (compared in place, as a whole read would find it: a
+				 * string checked as UTF-8 first, a value of no kind
+				 * refused; what another scalar or a packed container
+				 * holds isn't compared, so isn't read)
+				 */
+				if (v.len < 1)
+					bad_tree("an item without a value");
 				if (v.data[0] == VAL_STRING)
 				{
+					if (!pg_verify_mbstr(PG_UTF8, (const char *) v.data + 1,
+										 v.len - 1, true))
+						bad_tree("a string that isn't UTF-8");
 					for (int i = 0; i < nkeys; i++)
-						if (!found[i] && strlen(keys[i]) == v.len - 1 &&
+						if (!found[i] && keylens[i] == v.len - 1 &&
 							memcmp(keys[i], v.data + 1, v.len - 1) == 0)
 						{
 							found[i] = true;
 							nfound++;
 						}
 				}
-				pfree(e);
+				else if (v.data[0] != VAL_NULL && v.data[0] != VAL_FALSE &&
+						 v.data[0] != VAL_TRUE && v.data[0] != VAL_NUMERIC &&
+						 v.data[0] != VAL_CONTAINER)
+					bad_tree("a value of no kind");
 				more = PROLLY_CALL(tree, cursor_next, c, &k, &v);
 			}
 			else
@@ -1873,12 +1889,18 @@ unwrap(Jsonb *jb, PathKind kind, const char *key, int *n, Jsonb **first,
 	return true;
 }
 
+/*
+ * Whether a and b are the same document, byte for byte: jsonb's equality
+ * compares numerics by value (1.0 = 1.00), which would take a value set
+ * to another of a different scale for no change.
+ */
 static bool
 same_doc(Jsonb *a, Jsonb *b)
 {
 	if (a == NULL || b == NULL)
 		return a == b;
-	return compareJsonbContainers(&a->root, &b->root) == 0;
+	return VARSIZE(a) == VARSIZE(b) &&
+		memcmp(VARDATA(a), VARDATA(b), VARSIZE(a) - VARHDRSZ) == 0;
 }
 
 /*

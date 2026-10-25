@@ -198,7 +198,7 @@ FROM key_sets s JOIN plain h USING (id);
 -- kind: the documents they give, or (shown below) their errors.
 CREATE TEMP TABLE edit_values (n int, v jsonb);
 INSERT INTO edit_values VALUES (0, '"put"'), (1, 'null'), (2, '{"n": [1, 2.50]}'), (3, '[]'),
-	(4, to_jsonb(repeat('grown ', 300))), (5, '-0.000');
+	(4, to_jsonb(repeat('grown ', 300))), (5, '-0.000'), (6, '1.00'), (7, '1e2'), (8, '-0');
 CREATE FUNCTION do_edit(op text, j jsonb, path text[], v jsonb) RETURNS jsonb
 LANGUAGE sql AS $$
 	SELECT CASE op
@@ -219,7 +219,7 @@ EXCEPTION WHEN OTHERS THEN
 	RETURN 'error: ' || SQLERRM;
 END $$;
 CREATE TEMP TABLE edit_cases AS
-SELECT p.id, p.path, (random() * 5)::int AS n,
+SELECT p.id, p.path, (random() * 8)::int AS n,
 	   (ARRAY['#-', 'insert', 'insert after', 'lax', 'lax delete_key', 'lax return_target',
 			  'lax use_json_null', 'lax raise_exception'])[1 + (random() * 7)::int] AS op
 FROM paths p WHERE random() < 0.4;
@@ -254,7 +254,14 @@ FROM (SELECT DISTINCT ON (op, err) * FROM edit_cases WHERE err IS NOT NULL AND n
 	  ORDER BY op, err, id, path::text, n) e
 	 JOIN edit_values v USING (n)
 ORDER BY e.op, e.err, e.id \gexec
-SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{long,missing}', '0.000') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 1 is null' AS heap; SELECT do_edit('#-', j, '{NULL}', '1.00') FROM vt.docs WHERE id = 8
+                   heap                    
+-------------------------------------------
+ error: path element at position 1 is null
+(1 row)
+
+ERROR:  path element at position 1 is null
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{long,missing}', '0') FROM vt.docs WHERE id = 4
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 2 is not an integer: "missing"
@@ -268,42 +275,42 @@ SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('#-',
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "k1"' AS heap; SELECT do_edit('#-', j, '{k14,k16,k1}', 'null') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 3 is not an integer: "k1"' AS heap; SELECT do_edit('#-', j, '{k14,k16,k1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 4
                            heap                            
 -----------------------------------------------------------
  error: path element at position 3 is not an integer: "k1"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "k1"
-SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{40,1,missing}', '[]') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{40,1,missing}', '0.000') FROM vt.docs WHERE id = 5
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 3 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "missing"
-SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('#-', j, '{k26,k17,x1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('#-', j, '{k26,k17,x1}', '[]') FROM vt.docs WHERE id = 5
                            heap                            
 -----------------------------------------------------------
  error: path element at position 3 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "x1"
-SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('#-', j, '{40,2,NULL}', '0.000') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('#-', j, '{k9,3,NULL}', '100') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 3 is null
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('#-', j, '{k1,2,3,k1}', '[]') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('#-', j, '{k1,2,3,k1}', '1.00') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "k1"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "k1"
-SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{31,k3,k29,missing}', '0.000') FROM vt.docs WHERE id = 3
+SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('#-', j, '{31,k3,k29,missing}', '100') FROM vt.docs WHERE id = 3
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 4 is not an integer: "missing"
@@ -317,7 +324,7 @@ SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('#-',
 (1 row)
 
 ERROR:  path element at position 4 is null
-SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert', j, '{24,k7}', '0.000') FROM vt.docs WHERE id = 1
+SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert', j, '{24,k7}', '100') FROM vt.docs WHERE id = 1
                 heap                
 ------------------------------------
  error: cannot replace existing key
@@ -325,70 +332,70 @@ SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert', j,
 
 ERROR:  cannot replace existing key
 HINT:  Try using the function jsonb_set to replace key value.
-SELECT 'error: path element at position 1 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{missing}', '[]') FROM vt.docs WHERE id = 3
-                              heap                              
-----------------------------------------------------------------
- error: path element at position 1 is not an integer: "missing"
+SELECT 'error: path element at position 1 is null' AS heap; SELECT do_edit('insert', j, '{NULL}', '100') FROM vt.docs WHERE id = 4
+                   heap                    
+-------------------------------------------
+ error: path element at position 1 is null
 (1 row)
 
-ERROR:  path element at position 1 is not an integer: "missing"
-SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{long,missing}', '[]') FROM vt.docs WHERE id = 1
+ERROR:  path element at position 1 is null
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{long,missing}', '0.000') FROM vt.docs WHERE id = 1
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 2 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "missing"
-SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{long,x1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{long,x1}', '[]') FROM vt.docs WHERE id = 5
                            heap                            
 -----------------------------------------------------------
  error: path element at position 2 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "x1"
-SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('insert', j, '{k34,NULL}', '[]') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('insert', j, '{long,NULL}', '[]') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 2 is null
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{k9,9,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{k9,9,missing}', '[]') FROM vt.docs WHERE id = 4
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 3 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "missing"
-SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{k31,0,x1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{k31,0,x1}', '[]') FROM vt.docs WHERE id = 2
                            heap                            
 -----------------------------------------------------------
  error: path element at position 3 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "x1"
-SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('insert', j, '{k14,k30,NULL}', '0.000') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('insert', j, '{k14,k30,NULL}', '0') FROM vt.docs WHERE id = 2
                    heap                    
 -------------------------------------------
  error: path element at position 3 is null
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('insert', j, '{k38,1,k30,k1}', '"put"') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('insert', j, '{k38,1,k30,k1}', 'null') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "k1"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "k1"
-SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{4,4,k28,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('insert', j, '{4,4,k28,missing}', '[]') FROM vt.docs WHERE id = 5
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 4 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "missing"
-SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{k33,2,k40,x1}', 'null') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('insert', j, '{k33,2,k40,x1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "x1"
@@ -402,7 +409,7 @@ SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('inse
 (1 row)
 
 ERROR:  path element at position 4 is null
-SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert after', j, '{k10}', '[]') FROM vt.docs WHERE id = 4
+SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert after', j, '{27,6,k13}', '100') FROM vt.docs WHERE id = 3
                 heap                
 ------------------------------------
  error: cannot replace existing key
@@ -410,28 +417,28 @@ SELECT 'error: cannot replace existing key' AS heap; SELECT do_edit('insert afte
 
 ERROR:  cannot replace existing key
 HINT:  Try using the function jsonb_set to replace key value.
-SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{long,missing}', '[]') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{long,missing}', '0.000') FROM vt.docs WHERE id = 5
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 2 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "missing"
-SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('insert after', j, '{long,x1}', '0.000') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('insert after', j, '{long,x1}', '100') FROM vt.docs WHERE id = 4
                            heap                            
 -----------------------------------------------------------
  error: path element at position 2 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "x1"
-SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('insert after', j, '{4,NULL}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('insert after', j, '{32,NULL}', '1.00') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 2 is null
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{k23,2,missing}', 'null') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{k33,0,missing}', '1.00') FROM vt.docs WHERE id = 4
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 3 is not an integer: "missing"
@@ -445,49 +452,56 @@ SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELE
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "x1"
-SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('insert after', j, '{k2,2,NULL}', '0.000') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('insert after', j, '{k2,2,NULL}', '100') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 3 is null
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{k9,9,3,missing}', '[]') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('insert after', j, '{k33,2,k10,missing}', '1.00') FROM vt.docs WHERE id = 1
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 4 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "missing"
-SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('insert after', j, '{k38,0,k2,x1}', '[]') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('insert after', j, '{k38,1,k19,x1}', 'null') FROM vt.docs WHERE id = 5
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "x1"
-SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('insert after', j, '{k31,0,0,NULL}', '[]') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('insert after', j, '{k5,2,4,NULL}', '0') FROM vt.docs WHERE id = 2
                    heap                    
 -------------------------------------------
  error: path element at position 4 is null
 (1 row)
 
 ERROR:  path element at position 4 is null
-SELECT 'error: path element at position 1 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 9
+SELECT 'error: path element at position 1 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{missing}', '[]') FROM vt.docs WHERE id = 9
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 1 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 1 is not an integer: "missing"
-SELECT 'error: path element at position 1 is null' AS heap; SELECT do_edit('lax', j, '{NULL}', '0.000') FROM vt.docs WHERE id = 9
+SELECT 'error: path element at position 1 is null' AS heap; SELECT do_edit('lax', j, '{NULL}', '0') FROM vt.docs WHERE id = 9
                    heap                    
 -------------------------------------------
  error: path element at position 1 is null
 (1 row)
 
 ERROR:  path element at position 1 is null
-SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('lax', j, '{long,x1}', '0.000') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{long,missing}', '1.00') FROM vt.docs WHERE id = 8
+                              heap                              
+----------------------------------------------------------------
+ error: path element at position 2 is not an integer: "missing"
+(1 row)
+
+ERROR:  path element at position 2 is not an integer: "missing"
+SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('lax', j, '{long,x1}', '0') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 2 is not an integer: "x1"
@@ -501,14 +515,14 @@ SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('lax'
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "k1"' AS heap; SELECT do_edit('lax', j, '{k1,2,k1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 3 is not an integer: "k1"' AS heap; SELECT do_edit('lax', j, '{k1,2,k1}', '[]') FROM vt.docs WHERE id = 4
                            heap                            
 -----------------------------------------------------------
  error: path element at position 3 is not an integer: "k1"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "k1"
-SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{4,1,missing}', '"put"') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{4,1,missing}', 'null') FROM vt.docs WHERE id = 5
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 3 is not an integer: "missing"
@@ -522,42 +536,42 @@ SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELE
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "x1"
-SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('lax', j, '{k15,0,NULL}', 'null') FROM vt.docs WHERE id = 5
+SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('lax', j, '{k18,1,NULL}', '1.00') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 3 is null
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('lax', j, '{k38,0,k2,k1}', 'null') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('lax', j, '{k38,0,k2,k1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 2
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "k1"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "k1"
-SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{k1,3,0,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('lax', j, '{4,4,k34,missing}', '1.00') FROM vt.docs WHERE id = 1
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 4 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "missing"
-SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax', j, '{k1,3,5,x1}', '[]') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax', j, '{k11,1,k15,x1}', '0.000') FROM vt.docs WHERE id = 4
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "x1"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "x1"
-SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('lax', j, '{k1,3,0,NULL}', 'null') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('lax', j, '{4,3,k21,NULL}', '1.00') FROM vt.docs WHERE id = 1
                    heap                    
 -------------------------------------------
  error: path element at position 4 is null
 (1 row)
 
 ERROR:  path element at position 4 is null
-SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{long,missing}', '"put"') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{long,missing}', 'null') FROM vt.docs WHERE id = 2
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 2 is not an integer: "missing"
@@ -571,21 +585,21 @@ SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELE
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "x1"
-SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('lax delete_key', j, '{long,NULL}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('lax delete_key', j, '{long,NULL}', '[]') FROM vt.docs WHERE id = 2
                    heap                    
 -------------------------------------------
  error: path element at position 2 is null
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{38,9,missing}', 'null') FROM vt.docs WHERE id = 6
+SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{38,9,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 6
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 3 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "missing"
-SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('lax delete_key', j, '{k1,2,x1}', '[]') FROM vt.docs WHERE id = 4
+SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELECT do_edit('lax delete_key', j, '{k1,2,x1}', '0.000') FROM vt.docs WHERE id = 4
                            heap                            
 -----------------------------------------------------------
  error: path element at position 3 is not an integer: "x1"
@@ -599,21 +613,14 @@ SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('lax 
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('lax delete_key', j, '{k26,k17,4,k1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 5
-                           heap                            
------------------------------------------------------------
- error: path element at position 4 is not an integer: "k1"
-(1 row)
-
-ERROR:  path element at position 4 is not an integer: "k1"
-SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{28,k23,k8,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 6
+SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap; SELECT do_edit('lax delete_key', j, '{k11,1,k32,missing}', '100') FROM vt.docs WHERE id = 2
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 4 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "missing"
-SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax delete_key', j, '{k23,0,k0,x1}', '"put"') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax delete_key', j, '{k23,0,k0,x1}', 'null') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "x1"
@@ -627,7 +634,7 @@ SELECT 'error: path element at position 4 is null' AS heap; SELECT do_edit('lax 
 (1 row)
 
 ERROR:  path element at position 4 is null
-SELECT 'error: JSON value must not be null' AS heap; SELECT do_edit('lax raise_exception', j, '{12,k24,-4}', 'null') FROM vt.docs WHERE id = 1
+SELECT 'error: JSON value must not be null' AS heap; SELECT do_edit('lax raise_exception', j, '{12,k24,-4}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 1
                 heap                
 ------------------------------------
  error: JSON value must not be null
@@ -636,14 +643,21 @@ SELECT 'error: JSON value must not be null' AS heap; SELECT do_edit('lax raise_e
 ERROR:  JSON value must not be null
 DETAIL:  Exception was raised because null_value_treatment is "raise_exception".
 HINT:  To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.
-SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('lax use_json_null', j, '{long,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 7
+SELECT 'error: path element at position 1 is null' AS heap; SELECT do_edit('lax use_json_null', j, '{NULL}', '1.00') FROM vt.docs WHERE id = 3
+                   heap                    
+-------------------------------------------
+ error: path element at position 1 is null
+(1 row)
+
+ERROR:  path element at position 1 is null
+SELECT 'error: path element at position 2 is not an integer: "missing"' AS heap; SELECT do_edit('lax use_json_null', j, '{k11,missing}', '1.00') FROM vt.docs WHERE id = 2
                               heap                              
 ----------------------------------------------------------------
  error: path element at position 2 is not an integer: "missing"
 (1 row)
 
 ERROR:  path element at position 2 is not an integer: "missing"
-SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('lax use_json_null', j, '{long,x1}', 'null') FROM vt.docs WHERE id = 8
+SELECT 'error: path element at position 2 is not an integer: "x1"' AS heap; SELECT do_edit('lax use_json_null', j, '{32,x1}', '1.00') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 2 is not an integer: "x1"
@@ -657,13 +671,6 @@ SELECT 'error: path element at position 2 is null' AS heap; SELECT do_edit('lax 
 (1 row)
 
 ERROR:  path element at position 2 is null
-SELECT 'error: path element at position 3 is not an integer: "k1"' AS heap; SELECT do_edit('lax use_json_null', j, '{k14,k30,k1}', '[]') FROM vt.docs WHERE id = 4
-                           heap                            
------------------------------------------------------------
- error: path element at position 3 is not an integer: "k1"
-(1 row)
-
-ERROR:  path element at position 3 is not an integer: "k1"
 SELECT 'error: path element at position 3 is not an integer: "missing"' AS heap; SELECT do_edit('lax use_json_null', j, '{k26,k17,missing}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 4
                               heap                              
 ----------------------------------------------------------------
@@ -678,14 +685,14 @@ SELECT 'error: path element at position 3 is not an integer: "x1"' AS heap; SELE
 (1 row)
 
 ERROR:  path element at position 3 is not an integer: "x1"
-SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('lax use_json_null', j, '{k2,2,NULL}', '[]') FROM vt.docs WHERE id = 2
+SELECT 'error: path element at position 3 is null' AS heap; SELECT do_edit('lax use_json_null', j, '{k2,2,NULL}', '0.000') FROM vt.docs WHERE id = 2
                    heap                    
 -------------------------------------------
  error: path element at position 3 is null
 (1 row)
 
 ERROR:  path element at position 3 is null
-SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('lax use_json_null', j, '{12,k24,12,k1}', '{"n": [1, 2.50]}') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "k1"' AS heap; SELECT do_edit('lax use_json_null', j, '{18,7,k27,k1}', 'null') FROM vt.docs WHERE id = 9
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "k1"
@@ -699,7 +706,7 @@ SELECT 'error: path element at position 4 is not an integer: "missing"' AS heap;
 (1 row)
 
 ERROR:  path element at position 4 is not an integer: "missing"
-SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax use_json_null', j, '{k18,1,k17,x1}', '[]') FROM vt.docs WHERE id = 1
+SELECT 'error: path element at position 4 is not an integer: "x1"' AS heap; SELECT do_edit('lax use_json_null', j, '{k18,1,k17,x1}', '0.000') FROM vt.docs WHERE id = 1
                            heap                            
 -----------------------------------------------------------
  error: path element at position 4 is not an integer: "x1"
@@ -734,7 +741,7 @@ BEGIN
 						 WHERE path IS NOT NULL AND array_position(path, NULL) IS NULL
 							   AND cardinality(path) > 0
 						 ORDER BY random() LIMIT 250) p) s
-				  JOIN edit_values v ON v.n = s.k % 6
+				  JOIN edit_values v ON v.n = s.k % 9
 			 ORDER BY s.k LOOP
 		SELECT string_agg(format('[%L]', s), '') INTO subs FROM unnest(e.path) s;
 		upd := CASE e.op
@@ -752,7 +759,7 @@ BEGIN
 		SELECT prolly_jsonb_tree_root(j) INTO r1 FROM vt.docs WHERE id = e.id;
 		SELECT prolly_jsonb_tree_root(j) INTO r2 FROM vt.docs WHERE id = 100;
 		INSERT INTO edit_results
-		SELECT k, e.op, d.j = h.j, r1 IS NOT DISTINCT FROM r2
+		SELECT k, e.op, d.j::text = h.j::text, r1 IS NOT DISTINCT FROM r2
 		FROM vt.docs d JOIN plain h USING (id) WHERE id = e.id;
 	END LOOP;
 	DELETE FROM vt.docs WHERE id = 100;
@@ -769,11 +776,58 @@ FROM edit_results GROUP BY op ORDER BY op;
 (5 rows)
 
 -- (the documents, all edited, as the heap's)
-SELECT count(*) FILTER (WHERE d.j = h.j) AS same, count(*) AS docs
+SELECT count(*) FILTER (WHERE d.j::text = h.j::text) AS same, count(*) AS docs
 FROM vt.docs d JOIN plain h USING (id);
  same | docs 
 ------+------
     9 |    9
+(1 row)
+
+-- Values equal as numbers but not as text (1, 1.0 and 1.00; 0 and -0;
+-- 100 and 1e2), equal strings and containers: an edit to one is an edit,
+-- as jsonb's own gives it, and an insert before an array's last element
+-- equal to it is no append.
+CREATE TABLE vt.eq (id int PRIMARY KEY, j jsonb);
+INSERT INTO vt.eq
+SELECT 1, jsonb_build_object('a', 1.0, 'z', 0, 'h', 100, 's', 'same', 'o', '{"p": [1.0]}'::jsonb,
+							 'n', jsonb_build_object('b', jsonb_build_object('c', 1.0)),
+							 'arr', (SELECT jsonb_agg(md5(g::text)) FROM generate_series(1, 100) g) || '[1.0]'::jsonb,
+							 'long', (SELECT jsonb_agg(md5(g::text)) FROM generate_series(1, 100) g));
+CREATE TABLE eq_plain AS SELECT * FROM vt.eq;
+CREATE TEMP TABLE eq_edits (k int, e text);
+INSERT INTO eq_edits VALUES
+	(1, $$SET j['a'] = '1.00'$$), (2, $$SET j['a'] = '1'$$), (3, $$SET j['z'] = '-0'$$),
+	(4, $$SET j['z'] = '0.0'$$), (5, $$SET j['h'] = '1e2'$$), (6, $$SET j['n']['b']['c'] = '1.00'$$),
+	(7, $$SET j['s'] = '"same"'$$), (8, $$SET j['o'] = '{"p": [1.00]}'$$),
+	(9, $$SET j['arr'][-1] = '1.00'$$),
+	(10, $$SET j = jsonb_insert(j, '{arr,-1}', '1.00')$$),
+	(11, $$SET j = jsonb_insert(j, '{arr,-1}', '1.0', true)$$),
+	(12, $$SET j = jsonb_insert(j, '{arr,-1}', '1', false)$$),
+	(13, $$SET j = jsonb_set_lax(j, '{n,b,c}', '1.000')$$),
+	(14, $$SET j = jsonb_set(j, '{a}', '1.0000')$$);
+SELECT format('UPDATE vt.eq %s WHERE id = 1; UPDATE eq_plain %s WHERE id = 1', e, e)
+FROM eq_edits ORDER BY k \gexec
+UPDATE vt.eq SET j['a'] = '1.00' WHERE id = 1; UPDATE eq_plain SET j['a'] = '1.00' WHERE id = 1
+UPDATE vt.eq SET j['a'] = '1' WHERE id = 1; UPDATE eq_plain SET j['a'] = '1' WHERE id = 1
+UPDATE vt.eq SET j['z'] = '-0' WHERE id = 1; UPDATE eq_plain SET j['z'] = '-0' WHERE id = 1
+UPDATE vt.eq SET j['z'] = '0.0' WHERE id = 1; UPDATE eq_plain SET j['z'] = '0.0' WHERE id = 1
+UPDATE vt.eq SET j['h'] = '1e2' WHERE id = 1; UPDATE eq_plain SET j['h'] = '1e2' WHERE id = 1
+UPDATE vt.eq SET j['n']['b']['c'] = '1.00' WHERE id = 1; UPDATE eq_plain SET j['n']['b']['c'] = '1.00' WHERE id = 1
+UPDATE vt.eq SET j['s'] = '"same"' WHERE id = 1; UPDATE eq_plain SET j['s'] = '"same"' WHERE id = 1
+UPDATE vt.eq SET j['o'] = '{"p": [1.00]}' WHERE id = 1; UPDATE eq_plain SET j['o'] = '{"p": [1.00]}' WHERE id = 1
+UPDATE vt.eq SET j['arr'][-1] = '1.00' WHERE id = 1; UPDATE eq_plain SET j['arr'][-1] = '1.00' WHERE id = 1
+UPDATE vt.eq SET j = jsonb_insert(j, '{arr,-1}', '1.00') WHERE id = 1; UPDATE eq_plain SET j = jsonb_insert(j, '{arr,-1}', '1.00') WHERE id = 1
+UPDATE vt.eq SET j = jsonb_insert(j, '{arr,-1}', '1.0', true) WHERE id = 1; UPDATE eq_plain SET j = jsonb_insert(j, '{arr,-1}', '1.0', true) WHERE id = 1
+UPDATE vt.eq SET j = jsonb_insert(j, '{arr,-1}', '1', false) WHERE id = 1; UPDATE eq_plain SET j = jsonb_insert(j, '{arr,-1}', '1', false) WHERE id = 1
+UPDATE vt.eq SET j = jsonb_set_lax(j, '{n,b,c}', '1.000') WHERE id = 1; UPDATE eq_plain SET j = jsonb_set_lax(j, '{n,b,c}', '1.000') WHERE id = 1
+UPDATE vt.eq SET j = jsonb_set(j, '{a}', '1.0000') WHERE id = 1; UPDATE eq_plain SET j = jsonb_set(j, '{a}', '1.0000') WHERE id = 1
+SELECT d.j::text = h.j::text AS same_text, d.j -> 'a' AS a, d.j -> 'z' AS z, d.j -> 'h' AS h,
+	   d.j #> '{n,b,c}' AS c, d.j -> 'o' AS o, d.j -> 'arr' -> -4 AS arr_4, d.j -> 'arr' -> -3 AS arr_3,
+	   d.j -> 'arr' -> -2 AS arr_2, d.j -> 'arr' -> -1 AS arr_1, (test_toast_pointer(d.j)).form AS form
+FROM vt.eq d JOIN eq_plain h USING (id);
+ same_text |   a    |  z  |  h  |   c   |       o       | arr_4 | arr_3 | arr_2 | arr_1 | form 
+-----------+--------+-----+-----+-------+---------------+-------+-------+-------+-------+------
+ t         | 1.0000 | 0.0 | 100 | 1.000 | {"p": [1.00]} | 1.00  | 1.00  | 1     | 1.0   |    3
 (1 row)
 
 -- Each reads the nodes on its path, not the document's: fewer than a
@@ -867,7 +921,7 @@ UPDATE big_plain SET j = jsonb_insert(j, '{arr,-1}', '"appended"', true) WHERE i
 UPDATE big_plain SET j = jsonb_set_lax(j, '{items,k79}', NULL, true, 'delete_key') WHERE id = 1;
 UPDATE big_plain SET j = jsonb_set_lax(j, '{items,k80,name}', '"lax"') WHERE id = 1;
 UPDATE big_plain SET j = j #- '{-1}' WHERE id = 2;
-SELECT d.id, d.j = h.j AS same, (test_toast_pointer(d.j)).form AS form
+SELECT d.id, d.j::text = h.j::text AS same, (test_toast_pointer(d.j)).form AS form
 FROM vt.big d JOIN big_plain h USING (id) ORDER BY 1;
  id | same | form 
 ----+------+------
@@ -885,7 +939,7 @@ UPDATE vt.one SET j = j #- '{only,inner}' WHERE id = 1;
 UPDATE one_plain SET j = j #- '{only,inner}' WHERE id = 1;
 UPDATE vt.one SET j = j #- '{only}' WHERE id = 2;
 UPDATE one_plain SET j = j #- '{only}' WHERE id = 2;
-SELECT d.id, d.j, d.j = h.j AS same, (test_toast_pointer(d.j)).form AS form
+SELECT d.id, d.j, d.j::text = h.j::text AS same, (test_toast_pointer(d.j)).form AS form
 FROM vt.one d JOIN one_plain h USING (id) ORDER BY 1;
  id |          j           | same | form 
 ----+----------------------+------+------
