@@ -1664,9 +1664,17 @@ static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 					   const ProllyNodeRef *root,
 					   Snapshot snap);
 
+/*
+ * When the move under way first waited for a page sweep holding one of its
+ * relations (branch operations' share(), restore() and share_kept()): one
+ * lock_timeout bounds the waits of every table it restores or shares.
+ */
+static TimestampTz move_wait_start = 0;
+
 static void
 settle(const ProllyCommitInfo *commit, const KnownSource *source)
 {
+	move_wait_start = 0;
 	if (source == NULL)
 		restore_pages(commit);
 	settle_rows(&commit->root, source);
@@ -2221,10 +2229,12 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		{
 			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
 
-			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels);
+			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
+											&move_wait_start);
 		}
 		else
-			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s);
+			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
+									   &move_wait_start);
 		if (done)
 		{
 			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
@@ -3013,7 +3023,8 @@ restore_pages(const ProllyCommitInfo *commit)
 			few_changes(&dc, &baseline, relid, &target->data))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
-		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed))
+		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed,
+								   &move_wait_start))
 			continue;
 		for (int r = 0; r < kt->nrels; r++)
 			any |= renewed[r].relfilenumber != kt->rels[r].relfilenumber;

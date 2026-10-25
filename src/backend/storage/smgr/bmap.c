@@ -8514,21 +8514,34 @@ static bool compacting_cleared_at_exit = false;
 static LOCKTAG sweep_yielded[SWEEP_YIELDED_MAX];
 static int	sweep_nyielded = 0;
 
-/* This backend's compaction holds nothing now (see BmapCompacting). */
-static void
-compacting_end(int code, Datum arg)
+/*
+ * This backend's sweep holds nothing now (see BmapCompacting): whether the
+ * hold was asked to let go, read with its end, so that an ask either comes
+ * before (and is answered) or finds nothing held.
+ */
+static bool
+compacting_stop(void)
 {
 	BmapCompacting *c;
+	bool		asked;
 
 	if (MyProcNumber == INVALID_PROC_NUMBER || MyProcNumber >= MaxBackends)
-		return;
+		return false;
 	c = &bmap_compacting[MyProcNumber];
 	SpinLockAcquire(&c->mutex);
+	asked = c->holding && pg_atomic_read_u32(&c->asked) != 0;
 	if (c->holding)
 		c->generation++;
 	c->holding = false;
-	SpinLockRelease(&c->mutex);
 	pg_atomic_write_u32(&c->asked, 0);
+	SpinLockRelease(&c->mutex);
+	return asked;
+}
+
+static void
+compacting_end(int code, Datum arg)
+{
+	(void) compacting_stop();
 }
 
 /*
@@ -8587,8 +8600,8 @@ bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start)
 	long		delay = 1;
 	bool		let_go = false;
 	int			nasked = 0;
-	int		   *asked = NULL;
-	uint64	   *generations = NULL;
+	int		   *asked = palloc_array(int, MaxBackends);
+	uint64	   *generations = palloc_array(uint64, MaxBackends);
 
 	/* the holds of 'tag' now, each asked to let go */
 	for (int i = 0; i < MaxBackends; i++)
@@ -8603,11 +8616,6 @@ bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start)
 			(locktag_equal(&c->rel, tag) ||
 			 (c->branch_held && locktag_equal(&c->branch, tag))))
 		{
-			if (asked == NULL)
-			{
-				asked = palloc_array(int, MaxBackends);
-				generations = palloc_array(uint64, MaxBackends);
-			}
 			pg_atomic_write_u32(&c->asked, 1);
 			asked[nasked] = i;
 			generations[nasked++] = c->generation;
@@ -8615,7 +8623,11 @@ bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start)
 		SpinLockRelease(&c->mutex);
 	}
 	if (nasked == 0)
+	{
+		pfree(asked);
+		pfree(generations);
 		return false;
+	}
 
 	/*
 	 * ... until each has ended.  Another hold of the tag begun since (the
@@ -8756,14 +8768,10 @@ let_go_relation(HeldRelation *held)
 	if (held->branch_held)
 		LockRelease(&held->branch, AccessShareLock, false);
 	LockRelease(&held->rel, AccessShareLock, false);
-	if (held->slot)
-	{
-		if (pg_atomic_read_u32(&held->slot->asked) != 0 &&
-			sweep_nyielded < SWEEP_YIELDED_MAX)
-			sweep_yielded[sweep_nyielded++] =
-				held->branch_held ? held->branch : held->rel;
-		compacting_end(0, 0);
-	}
+	if (held->slot && compacting_stop() &&
+		sweep_nyielded < SWEEP_YIELDED_MAX)
+		sweep_yielded[sweep_nyielded++] =
+			held->branch_held ? held->branch : held->rel;
 }
 
 /*

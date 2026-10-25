@@ -244,5 +244,65 @@ is(counted('apply_rows'), $applied, 'writing no row');
 is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
 	'kp.t reads as committed');
 
+
+# lock_timeout bounds one operation's waits, not a statement's: a
+# procedure committing between two resets gives the second its own, so it
+# still waits for a compaction long after the first one waited
+sql(q{CREATE PROCEDURE two_resets() LANGUAGE plpgsql AS $$
+	BEGIN
+		SET lock_timeout = '2s';
+		PERFORM dolt_reset('--hard');
+		COMMIT;
+		SET lock_timeout = 0;
+		PERFORM pg_advisory_lock(42);
+		PERFORM pg_advisory_unlock(42);
+		PERFORM pg_sleep(2.5);
+		SET lock_timeout = '2s';
+		PERFORM dolt_reset('--hard');
+		COMMIT;
+	END $$});
+interleave();
+($sweep, $sweeper) = start_sweep();
+my $gate = $node->background_psql('postgres');
+$gate->query_safe(q{SELECT pg_advisory_lock(42)});
+my $proc = $node->background_psql('postgres');
+my $procpid = $proc->query_safe(q{SELECT pg_backend_pid()});
+$proc->query_until(qr/started/, q{
+	\echo started
+	CALL two_resets();
+	SELECT pg_stat_force_next_flush();
+	\echo done
+});
+ok( $node->poll_query_until(
+		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+		FROM pg_stat_activity WHERE pid = $procpid}),
+	"the procedure's first reset waits for the compaction");
+sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
+$node->poll_query_until('postgres', qq{SELECT wait_event_type = 'Lock'
+	FROM pg_stat_activity WHERE pid = $procpid})
+  or die 'the procedure did not reach its gate';
+wake_sweep($sweep);
+interleave();
+($sweep, $sweeper) = start_sweep();
+$restored = counted('relations_restored');
+$applied = counted('apply_rows');
+$gate->query_safe(q{SELECT pg_advisory_unlock(42)});
+$gate->quit;
+$node->poll_query_until('postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+	OR state = 'idle' FROM pg_stat_activity WHERE pid = $procpid})
+  or die 'the procedure neither waited nor ended';
+is(sql(qq{SELECT wait_event FROM pg_stat_activity WHERE pid = $procpid}),
+	'BmapCompactionLetGo',
+	'its second reset, past the first one\'s lock_timeout, still waits');
+sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
+$proc->query_until(qr/done/, '');
+$proc->quit;
+wake_sweep($sweep);
+cmp_ok(counted('relations_restored'), '>', $restored,
+	'and gives back the kept pages');
+is(counted('apply_rows'), $applied, 'writing no row');
+is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
+	'kp.t reads as committed');
+
 $node->stop;
 done_testing();
