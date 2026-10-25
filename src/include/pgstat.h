@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD04
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD05
 
 typedef struct PgStat_ArchiverStats
 {
@@ -692,8 +692,10 @@ typedef enum PgStat_ProllyCounter
 										 * many at once */
 	PGSTAT_PROLLY_APPLY_LOADS,	/* tables it filled from nothing, their
 								 * indexes built after the rows */
-	PGSTAT_PROLLY_CHUNK_CACHE_HITS,	/* chunks read from the backend's cache
-									 * instead of the store's files */
+	PGSTAT_PROLLY_NODE_CACHE_HITS,	/* chunks read from the shared node
+									 * cache instead of the store's files */
+	PGSTAT_PROLLY_NODE_CACHE_MISSES,	/* reads that looked there and found
+										 * nothing */
 	PGSTAT_PROLLY_FOLD_ROWS_LOCATED,	/* rows a fold read where the change
 										 * log said, not by their key */
 	PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED,	/* map pages a share of a

@@ -37,6 +37,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",
 	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_VALUE_MEMO] = "shared",
+	[PROLLY_IFACE_NODE_CACHE] = "shared",
 	[PROLLY_IFACE_CHANGE_FINDER] = "log",
 	[PROLLY_IFACE_CHANGE_LOG] = "relation",
 };
@@ -109,6 +110,13 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 				 errmsg("\"%s\" is not a prolly table",
 						RelationGetRelationName(rel))));
 	prolly_history_components(components);
+}
+
+const ProllyNodeCacheRoutine *
+prolly_node_cache(void)
+{
+	return (const ProllyNodeCacheRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_NODE_CACHE);
 }
 
 void

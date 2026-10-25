@@ -53,12 +53,13 @@ JOIN wanted w ON w.name = CASE WHEN g.i % 2 = 1 THEN 'j1' ELSE 't1' END;
 SELECT count(*) FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY i) FROM wanted));
 :flush
 SELECT counted('chunk_file_reads') BETWEEN 1 AND 6 AS few_reads;
--- One at a time, a read each.
+-- One at a time, a read each: of the files, or of the shared cache, which
+-- the reads before filled.
 \c many_db
 :reset
 SELECT count(test_chunk_get(hash)) FROM wanted;
 :flush
-SELECT counted('chunk_file_reads') >= 70 AS a_read_each;
+SELECT counted('chunk_file_reads') + counted('node_cache_hits') >= 70 AS a_read_each;
 
 -- The transaction's own chunks, still pending, too.
 BEGIN;

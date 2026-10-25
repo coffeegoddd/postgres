@@ -161,7 +161,7 @@ tests += {
       'statistics_casts',
       'stat_prolly',
       'stat_prolly_moves',
-      'chunk_cache',
+      'node_cache',
       'store_sizes',
       'storage_breakdown',
       'get_many',

@@ -95,7 +95,8 @@ SELECT counted('chunk_file_reads') BETWEEN 1 AND 6 AS few_reads;
  t
 (1 row)
 
--- One at a time, a read each.
+-- One at a time, a read each: of the files, or of the shared cache, which
+-- the reads before filled.
 \c many_db
 :reset
  pg_stat_force_next_flush 
@@ -120,7 +121,7 @@ SELECT count(test_chunk_get(hash)) FROM wanted;
  
 (1 row)
 
-SELECT counted('chunk_file_reads') >= 70 AS a_read_each;
+SELECT counted('chunk_file_reads') + counted('node_cache_hits') >= 70 AS a_read_each;
  a_read_each 
 -------------
  t
