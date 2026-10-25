@@ -45,6 +45,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
+#include "catalog/dependency.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
@@ -959,7 +960,12 @@ database_owner_role(void)
 	return owner;
 }
 
-/* Does role exist (a role dropped leaves its OID where it was recorded)? */
+/*
+ * Does role exist?  A writer branch's role is recorded by OID alone: a role
+ * dropped leaves it where it was recorded.  (It grants nothing alone: a
+ * writer's integration also moves its writer branch's head, which takes
+ * the branch's owner, its maker, a shared dependency of the role.)
+ */
 static bool
 role_exists(Oid role)
 {
@@ -968,9 +974,9 @@ role_exists(Oid role)
 }
 
 /*
- * The role that owns branch name: the role that made it, or, for main, a
- * branch whose maker isn't recorded, or one whose maker was dropped, the
- * database's owner.
+ * The role that owns branch name: the role that made it, or, for main or a
+ * branch whose maker isn't recorded, the database's owner.  A maker is a
+ * shared dependency of its role, so it is never a dropped role's.
  */
 Oid
 prolly_branch_owner(const char *name)
@@ -978,10 +984,114 @@ prolly_branch_owner(const char *name)
 	Oid			creator;
 
 	if (strcmp(name, "main") != 0 && PROLLY_HAS(refs(), branch_creator) &&
-		PROLLY_CALL(refs(), branch_creator, name, &creator) &&
-		role_exists(creator))
+		PROLLY_CALL(refs(), branch_creator, name, &creator))
 		return creator;
 	return database_owner_role();
+}
+
+/*
+ * The branch, tag or stash of kind classId whose maker record has id, by
+ * its name (a stash's list's) and a stash's place in its list; false if
+ * the refs have none.  To change the object found (lock), the refs are
+ * held first, until the transaction ends: a name or a place found without
+ * them can be another's by the time the change holds them (a stash pushed
+ * onto its list, the branch renamed).
+ */
+static bool
+made_object(Oid classId, Oid id, StringInfo name, int *n, bool lock)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (!PROLLY_HAS(r, made_object))
+		return false;
+	if (lock)
+		PROLLY_CALL(r, lock);
+	return PROLLY_CALL(r, made_object, classId, id, name, n);
+}
+
+bool
+prolly_made_object_identity(Oid classId, Oid id, char **name, int *n)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	*n = 0;
+	if (!made_object(classId, id, &buf, n, false))
+	{
+		pfree(buf.data);
+		return false;
+	}
+	*name = buf.data;
+	return true;
+}
+
+void
+prolly_describe_made_object(StringInfo buf, Oid classId, Oid id)
+{
+	StringInfoData name;
+	int			n = 0;
+
+	initStringInfo(&name);
+	if (!made_object(classId, id, &name, &n, false))
+		appendStringInfo(buf, _("%s %u, no longer in the refs"),
+						 classId == RefsBranchClassId ? "branch" :
+						 classId == RefsTagClassId ? "tag" : "stash", id);
+	else if (classId == RefsBranchClassId)
+		appendStringInfo(buf, _("branch \"%s\""), name.data);
+	else if (classId == RefsTagClassId)
+		appendStringInfo(buf, _("tag \"%s\""), name.data);
+	else
+		appendStringInfo(buf, _("stash stash@{%d} of \"%s\""), n, name.data);
+	pfree(name.data);
+}
+
+/*
+ * REASSIGN OWNED: newrole is the object's maker, its dependency moved with
+ * the record.
+ */
+void
+prolly_reassign_made_object(Oid classId, Oid id, Oid newrole)
+{
+	const ProllyRefsRoutine *r = refs();
+	StringInfoData name;
+	int			n = 0;
+
+	initStringInfo(&name);
+	if (!made_object(classId, id, &name, &n, true))
+		changeDependencyOnOwner(classId, id, newrole);
+	else if (classId == RefsBranchClassId)
+		PROLLY_CALL(r, branch_set_creator, name.data, newrole);
+	else if (classId == RefsTagClassId)
+		PROLLY_CALL(r, tag_set_creator, name.data, newrole);
+	else
+		PROLLY_CALL(r, stash_set_maker, name.data, n, newrole);
+	pfree(name.data);
+}
+
+/*
+ * DROP OWNED: a tag or stash the role made is deleted, as an object it owns
+ * is.  A branch is given to the database's owner (its maker no longer
+ * recorded, as main's isn't) rather than deleted: deleting it would lose
+ * its commits that no other branch has, and its working set, which every
+ * session on it shares, for a command about one role's objects.
+ */
+void
+prolly_drop_made_object(Oid classId, Oid id)
+{
+	const ProllyRefsRoutine *r = refs();
+	StringInfoData name;
+	int			n = 0;
+
+	initStringInfo(&name);
+	if (!made_object(classId, id, &name, &n, true))
+		deleteSharedDependencyRecordsFor(classId, id, 0);
+	else if (classId == RefsBranchClassId)
+		PROLLY_CALL(r, branch_set_creator, name.data, InvalidOid);
+	else if (classId == RefsTagClassId)
+		(void) PROLLY_CALL(r, tag_set, name.data, NULL, NULL);
+	else
+		(void) PROLLY_CALL(r, stash_drop, name.data, n);
+	pfree(name.data);
 }
 
 /*
@@ -1652,15 +1762,21 @@ prolly_let_go_of_kept_states(void)
 }
 
 /*
- * (objects of other databases, which may be their kept states', or of a
- * commit's hidden branch here, one a session is on)
+ * Objects of other databases may be branches, tags and stashes the role
+ * made there, which only that database's DROP OWNED or REASSIGN OWNED
+ * changes, or copies its kept states hold; a commit's hidden branch here
+ * is one a session is on.
  */
-bool
-prolly_kept_states_named(const char *detail)
+const char *
+prolly_drop_role_hint(const char *detail)
 {
-	return detail != NULL &&
-		(strstr(detail, " in database ") != NULL ||
-		 strstr(detail, "branch \"" PROLLY_DETACHED_PREFIX) != NULL);
+	if (detail == NULL)
+		return NULL;
+	if (strstr(detail, " in database ") != NULL)
+		return _("In a database named, REASSIGN OWNED or DROP OWNED there changes the branches, tags and stashes the role made; its kept detached checkouts (prolly.kept_checkouts) may hold copies of its objects too: set prolly.kept_checkouts to 0 there and check out a branch to let them go.");
+	if (strstr(detail, "branch \"" PROLLY_DETACHED_PREFIX) != NULL)
+		return _("A database's kept detached checkouts (prolly.kept_checkouts) hold copies of its objects: set prolly.kept_checkouts to 0 and check out a branch to let them go.");
+	return NULL;
 }
 
 
@@ -3334,7 +3450,7 @@ may_drop_stash(const char *name, int n)
 	return prolly_writes_refs() ||
 		(PROLLY_HAS(refs(), stash_maker) &&
 		 PROLLY_CALL(refs(), stash_maker, name, n, &maker) &&
-		 role_exists(maker) && has_privs_of_role(GetUserId(), maker));
+		 has_privs_of_role(GetUserId(), maker));
 }
 
 static void
@@ -3665,7 +3781,7 @@ dolt_tag_change(char **names, int nnames, bool delete, const char *message,
 			if (!prolly_writes_refs() &&
 				!(PROLLY_HAS(tag_refs(), tag_creator) &&
 				  PROLLY_CALL(tag_refs(), tag_creator, names[i], &creator) &&
-				  role_exists(creator) && has_privs_of_role(GetUserId(), creator)))
+				  has_privs_of_role(GetUserId(), creator)))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("permission denied to delete tag \"%s\"", names[i]),

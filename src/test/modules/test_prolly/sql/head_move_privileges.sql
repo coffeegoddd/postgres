@@ -160,7 +160,7 @@ SET ROLE regress_hm_owner;
 SELECT try($$SELECT dolt_branch('-D', 'mine3')$$) AS delete_others;
 RESET ROLE;
 
--- a branch whose maker was dropped is the database owner's
+-- a branch whose maker's objects were dropped is the database owner's
 CREATE ROLE regress_hm_gone;
 GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_gone;
 SET ROLE regress_hm_gone;
@@ -169,6 +169,7 @@ RESET ROLE;
 SELECT name, creator = 'regress_hm_gone' AS by_gone FROM dolt_branches
 WHERE name = 'orphan';
 REVOKE CREATE ON DATABASE regress_head_moves FROM regress_hm_gone;
+DROP OWNED BY regress_hm_gone;
 DROP ROLE regress_hm_gone;
 SELECT name, creator = current_user AS database_owners FROM dolt_branches
 WHERE name = 'orphan';
@@ -317,6 +318,26 @@ SELECT dolt_checkout('main');
 SELECT (dolt_merge('-m', 'plain in', 'writer/plain/main'))[3] AS conflicts;
 SELECT id, v FROM hm.w ORDER BY id;
 SELECT id, v FROM hm.v ORDER BY id;
+-- a writer branch's maker is a shared dependency: reassigned to another
+-- role, the writer no longer integrates it alone, and reassigned back, it
+-- does again
+CREATE ROLE regress_hm_heir;
+SET ROLE regress_hm_inserter;
+INSERT INTO hm.w VALUES (4, 'reassigned');
+SELECT active_branch();
+SELECT length(dolt_commit('-am', 'plain row 4')::text) AS committed;
+RESET ROLE;
+REASSIGN OWNED BY regress_hm_inserter TO regress_hm_heir;
+SET ROLE regress_hm_inserter;
+\set VERBOSITY terse
+SELECT dolt_integrate('-m', 'four in');
+\set VERBOSITY default
+RESET ROLE;
+REASSIGN OWNED BY regress_hm_heir TO regress_hm_inserter;
+SET ROLE regress_hm_inserter;
+SELECT (dolt_integrate('-m', 'four in'))[1] = dolt_hashof('main') AS integrated;
+RESET ROLE;
+SELECT dolt_checkout('main');
 RESET dolt.writer;
 SELECT dolt_writer_mode('shared');
 
@@ -332,4 +353,4 @@ SELECT count(*) AS not_inserted FROM hm.t WHERE a = 100;
 DROP DATABASE regress_head_moves;
 DROP DATABASE regress_head_moves_empty;
 DROP ROLE regress_hm_reader, regress_hm_inserter, regress_hm_writer,
-	regress_hm_creator, regress_hm_owner, regress_hm_dml;
+	regress_hm_creator, regress_hm_owner, regress_hm_dml, regress_hm_heir;
