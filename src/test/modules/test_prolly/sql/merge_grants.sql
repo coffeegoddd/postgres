@@ -298,6 +298,21 @@ RESET test_oat_hooks.audit;
 SELECT (dolt_merge('mg_mm2', '-m', 'mm2 in'))[2:2] AS fast_forward;
 SELECT pg_temp.grants('mg.made2');
 
+-- A name of any characters (spaces, quotes, a backslash, a newline) is
+-- found in the source's records as written there: a table's and a view's.
+SELECT dolt_checkout('-b', 'mg_odd') IS NOT NULL AS on_odd;
+SELECT E'odd "name"\\ \nx' AS odd, E'odd "view"\\ \nx' AS odd_v \gset
+CREATE TABLE mg.:"odd" (id int PRIMARY KEY);
+GRANT SELECT ON mg.:"odd" TO regress_mg_r;
+CREATE VIEW mg.:"odd_v" AS SELECT id FROM mg.:"odd";
+GRANT SELECT ON mg.:"odd_v" TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'odd')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('mg_odd'))[2:2] AS fast_forward;
+SELECT relkind, pg_temp.grants(c.oid) FROM pg_class c
+WHERE relnamespace = 'mg'::regnamespace AND relname LIKE 'odd %' AND relkind <> 'i'
+ORDER BY relkind;
+
 SELECT dolt_branch('-D', 'mg_ff');
 SELECT dolt_branch('-D', 'mg_m');
 SELECT dolt_branch('-D', 'mg_noff');
@@ -316,6 +331,7 @@ SELECT dolt_branch('-D', 'mg_w2');
 SELECT dolt_branch('-D', 'mg_y');
 SELECT dolt_branch('-D', 'mg_y2');
 SELECT dolt_branch('-D', 'mg_mm2');
+SELECT dolt_branch('-D', 'mg_odd');
 SELECT dolt_branch('-D', 'mg_mm');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;

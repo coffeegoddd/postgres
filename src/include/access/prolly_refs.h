@@ -232,6 +232,16 @@ typedef struct ProllyMovedBranch
 } ProllyMovedBranch;
 
 /*
+ * A relation a commit was made from (refs' commit_relations()): its OID,
+ * and the table's qualified name then (quoted as needed).
+ */
+typedef struct ProllyCommitRelation
+{
+	Oid			relid;
+	char	   *name;
+} ProllyCommitRelation;
+
+/*
  * A commit a branch's pages are kept as of: each table's relations as
  * branch operations' keep() kept them (the table's own first), the
  * branch's baseline then (len 0: none), and the transaction that kept
@@ -734,24 +744,13 @@ typedef struct ProllyRefsRoutine
 	void		(*pins) (ProllyPinVisit visit, void *arg);
 
 	/*
-	 * Optional: the commit (*at) whose tables the session branch's own
-	 * record of them lists relation relid among, the record made by the
-	 * branch's last commit; false if it doesn't (a table made, or dropped
-	 * and made again, since that commit), or there is no record.  The
-	 * branch's head may have moved since without a commit (a reset, a
-	 * fast-forward): the record is still of the commit that made it.  A
-	 * history read takes a version of a table for the table here only
-	 * through this, as a commit holds tables by name and identity alone.
-	 */
-	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
-
-	/*
-	 * Optional: the relation (*relid) that branch's own record of its
-	 * relations, made by its last commit, lists under the qualified name
-	 * name, and that commit (*at); false if it lists none so, or there is
-	 * no record.  A relation of the branch now of that name and another
-	 * OID was made since: it isn't the one the commit's object was made
-	 * from.
+	 * Optional: the relation (*relid) that branch's records of its head's
+	 * relations (its tables, and its other relations with privileges of
+	 * their own), made by its last commit, list under the qualified name
+	 * name (quote_qualified_identifier()'s), and that commit (*at); false
+	 * if they list none so, or there is none.  A relation of the branch
+	 * now of that name and another OID was made since: it isn't the one
+	 * the commit's object was made from.
 	 */
 	bool		(*recorded_relid) (const char *branch, const char *name,
 								   Oid *relid, ProllyHash *at);
@@ -769,8 +768,8 @@ typedef struct ProllyRefsRoutine
 	void		(*branch_set_creator) (const char *name, Oid role);
 
 	/*
-	 * Optional: the role that made tag name here (false: none recorded), and the role that pushed name's nth stash
-	 * (false: it has none).
+	 * Optional: the role that made tag name here (false: none recorded),
+	 * and the role that pushed name's nth stash (false: it has none).
 	 */
 	bool		(*tag_creator) (const char *name, Oid *role);
 	bool		(*stash_maker) (const char *name, int n, Oid *role);
@@ -780,6 +779,26 @@ typedef struct ProllyRefsRoutine
 	 * records none: a tag fetched or pushed is no one's).
 	 */
 	void		(*tag_set_creator) (const char *name, Oid role);
+
+	/*
+	 * Optional: the relations commit was made from, as this database made
+	 * it: *relations, a ProllyCommitRelation for each prolly table
+	 * (palloc'd); false for a commit made elsewhere (fetched, cloned,
+	 * pushed here) or before they were kept.  A history read takes a
+	 * version for the session's table only along commits made from the
+	 * table's relation.
+	 */
+	bool		(*commit_relations) (const ProllyHash *commit,
+									 List **relations);
+
+	/*
+	 * Optional: relation relid's equivalence class, the relation it is the
+	 * same table as (relid itself, if none is recorded), and setting it: a
+	 * relation a move made again of a table, or a merge of the other
+	 * side's, is the same table as the one it comes from.
+	 */
+	Oid			(*relation_class) (Oid relid);
+	void		(*set_relation_class) (Oid relid, Oid cls);
 
 	/*
 	 * Optional, together: each maker the refs record (a branch's, a tag's,
@@ -819,6 +838,13 @@ extern PGDLLIMPORT int prolly_kept_commits;
  */
 extern PGDLLIMPORT int prolly_restore_min_changes;
 
+/*
+ * While set, the tables (qualified names) a commit being made changed in the
+ * working set before the move it commits: recorded made only from a
+ * relation of the class its first parent's record lists.
+ */
+extern PGDLLIMPORT List *prolly_commit_local_tables;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -837,9 +863,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "recorded_relation", "recorded_relid", \
-	"branch_creator", \
+	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
+	"commit_relations", "relation_class", "set_relation_class", \
 	"made_object", "stash_set_maker"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK stash_set_maker

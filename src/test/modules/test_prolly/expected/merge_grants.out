@@ -895,6 +895,46 @@ SELECT pg_temp.grants('mg.made2');
  regress_mg_w SELECT
 (1 row)
 
+-- A name of any characters (spaces, quotes, a backslash, a newline) is
+-- found in the source's records as written there: a table's and a view's.
+SELECT dolt_checkout('-b', 'mg_odd') IS NOT NULL AS on_odd;
+ on_odd 
+--------
+ t
+(1 row)
+
+SELECT E'odd "name"\\ \nx' AS odd, E'odd "view"\\ \nx' AS odd_v \gset
+CREATE TABLE mg.:"odd" (id int PRIMARY KEY);
+GRANT SELECT ON mg.:"odd" TO regress_mg_r;
+CREATE VIEW mg.:"odd_v" AS SELECT id FROM mg.:"odd";
+GRANT SELECT ON mg.:"odd_v" TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'odd')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('mg_odd'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {1}
+(1 row)
+
+SELECT relkind, pg_temp.grants(c.oid) FROM pg_class c
+WHERE relnamespace = 'mg'::regnamespace AND relname LIKE 'odd %' AND relkind <> 'i'
+ORDER BY relkind;
+ relkind |       grants        
+---------+---------------------
+ r       | regress_mg_r SELECT
+ v       | regress_mg_w SELECT
+(2 rows)
+
 SELECT dolt_branch('-D', 'mg_ff');
  dolt_branch 
 -------------
@@ -1003,6 +1043,12 @@ SELECT dolt_branch('-D', 'mg_mm2');
  {0}
 (1 row)
 
+SELECT dolt_branch('-D', 'mg_odd');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 SELECT dolt_branch('-D', 'mg_mm');
  dolt_branch 
 -------------
@@ -1010,7 +1056,7 @@ SELECT dolt_branch('-D', 'mg_mm');
 (1 row)
 
 DROP SCHEMA mg CASCADE;
-NOTICE:  drop cascades to 23 other objects
+NOTICE:  drop cascades to 25 other objects
 DETAIL:  drop cascades to table mg.t
 drop cascades to table mg.n
 drop cascades to table mg.o
@@ -1033,7 +1079,11 @@ drop cascades to function mg.load_in(integer)
 drop cascades to table mg.ck
 drop cascades to table mg.made
 drop cascades to table mg.made2
+drop cascades to table mg."odd ""name""\ 
+x"
 drop cascades to table mg.audited
+drop cascades to view mg."odd ""view""\ 
+x"
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
  committed 
 -----------
