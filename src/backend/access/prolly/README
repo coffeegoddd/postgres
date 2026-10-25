@@ -334,7 +334,10 @@ own, and since format 16 quoted as with quote_all_identifiers off in any
 session, as commits name tables; read strictly, a damaged record
 refused; a record isn't a reference a collection follows, so after each
 collection, as a step of its own, the records of the commits the store
-no longer has are forgotten: refs' forget_records()), and a version is the
+no longer has are forgotten, with the shared entries of routines and
+types ('J') no record left names: refs' forget_records(); a transaction
+whose commit found such an entry stored, and so didn't write it, puts it
+back when it publishes over a root moved since), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as

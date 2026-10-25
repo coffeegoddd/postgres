@@ -430,6 +430,7 @@ tests += {
       't/447_node_cache.pl',
       't/453_branch_switch_caches.pl',
       't/459_record_owners_sessions.pl',
+      't/477_forget_owned_concurrent.pl',
     ],
   },
 }

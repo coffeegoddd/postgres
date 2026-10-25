@@ -365,6 +365,11 @@ CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Delete the refs' entry key, moving the store's root (false if it moved).
+CREATE FUNCTION test_refs_delete(key text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- How many nodes the refs' walk visits, one node (by hash) declined.
 CREATE FUNCTION test_refs_walk_count(declined text)
 RETURNS int8

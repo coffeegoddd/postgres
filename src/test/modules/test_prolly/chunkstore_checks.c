@@ -1147,6 +1147,36 @@ test_refs_value(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(out);
 }
 
+/*
+ * test_refs_delete(key): delete the refs' entry key, moving the chunk
+ * store's root to refs without it, as a collection's step forgetting it
+ * does; false if the root moved meanwhile, or there are no refs.
+ */
+PG_FUNCTION_INFO_V1(test_refs_delete);
+Datum
+test_refs_delete(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef refs;
+	ProllyNodeRef next;
+	text	   *key = PG_GETARG_TEXT_PP(0);
+	ProllyEdit	e;
+
+	prolly_folded_tree_env(&env);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	if (refs.hash.len == 0)
+		PG_RETURN_BOOL(false);
+	e.key.data = (const uint8 *) VARDATA_ANY(key);
+	e.key.len = VARSIZE_ANY_EXHDR(key);
+	e.is_delete = true;
+	e.value.data = NULL;
+	e.value.len = 0;
+	PROLLY_CALL(tree, apply, &env, &refs, &e, 1, &next);
+	PG_RETURN_BOOL(PROLLY_CALL(cs(), move_root, store(), &refs.hash, &next.hash));
+}
+
 /* len bytes at data, as a bytea */
 static bytea *
 bytes_bytea(const char *data, Size len)

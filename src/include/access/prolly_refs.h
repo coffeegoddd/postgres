@@ -852,9 +852,10 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Optional: forget the relation records of commits the chunk store no
-	 * longer has, as a step after a collection (true if any was).  A record
-	 * isn't a reference the collection follows, so it would outlive its
-	 * commit.
+	 * longer has, as a step after a collection (true if any was), and the
+	 * entries records share (their routines and types) that no record left
+	 * names.  A record isn't a reference the collection follows, so it
+	 * would outlive its commit.
 	 */
 	bool		(*forget_records) (void);
 } ProllyRefsRoutine;
