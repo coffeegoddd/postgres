@@ -618,6 +618,17 @@ CREATE FUNCTION test_walk_new_count(from_commit text, to_commit text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The GC generation of this database's chunk store now.
+CREATE FUNCTION test_chunk_generation()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Whether the shared commit cache has commit id (hex) of database dboid in
+-- GC generation generation (a lookup: counted as a hit or miss).
+CREATE FUNCTION test_commit_cache_has(dboid oid, generation int8, id text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- What the value memo's lookups found since the last reset.
 CREATE FUNCTION test_memo_counters(reset bool DEFAULT false, OUT hits int8,
 	OUT misses int8)

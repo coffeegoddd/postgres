@@ -420,6 +420,7 @@ tests += {
       't/412_standby_holder_keeps.pl',
       't/425_fold_worker_trim_own_snapshot.pl',
       't/426_autofold_trim_own_snapshot.pl',
+      't/454_commit_cache.pl',
     ],
   },
 }

@@ -23,7 +23,7 @@
  * first free or matching one there, else the one used longest ago.  An
  * entry of another GC generation than the store's now is never matched,
  * and is taken first.  Dropping a database walks the whole table (under
- * the spinlock: a few thousand slots).  Nothing outlives a restart.
+ * the spinlock, a batch of slots at a time).  Nothing outlives a restart.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/commitcache_shared.c
@@ -43,6 +43,7 @@
 
 #define CACHE_PROBE		8
 #define PENDING_MAX		8192	/* a transaction's entries, at most */
+#define FORGET_BATCH	256		/* slots a forget looks at under the lock */
 
 /* (zeroed before it's filled: hashed and compared as bytes) */
 typedef struct CommitKey
@@ -82,7 +83,6 @@ static CacheShared *cache = NULL;
 static HTAB *pending = NULL;	/* by key; NULL if none */
 static SubTransactionId pending_newest; /* no subxid of theirs is later */
 static bool callbacks_registered = false;
-static ProllyCommitCacheCounters counts;
 
 static CacheShared *
 shared(void)
@@ -139,16 +139,8 @@ same_key(const CommitKey *a, const CommitKey *b)
 static void
 count(bool hit)
 {
-	if (hit)
-	{
-		counts.hits++;
-		pgstat_count_prolly(PGSTAT_PROLLY_COMMIT_CACHE_HITS, 1);
-	}
-	else
-	{
-		counts.misses++;
-		pgstat_count_prolly(PGSTAT_PROLLY_COMMIT_CACHE_MISSES, 1);
-	}
+	pgstat_count_prolly(hit ? PGSTAT_PROLLY_COMMIT_CACHE_HITS :
+						PGSTAT_PROLLY_COMMIT_CACHE_MISSES, 1);
 }
 
 static bool
@@ -158,7 +150,10 @@ shared_lookup(Oid dboid, uint32 generation, const ProllyHash *id,
 	CommitKey	key;
 	bool		found = false;
 
-	if (prolly_commit_cache_entries == 0 || id->len == 0)
+	/* (no cache: no lookup, and nothing counted) */
+	if (prolly_commit_cache_entries == 0)
+		return false;
+	if (id->len == 0)
 	{
 		count(false);
 		return false;
@@ -355,19 +350,22 @@ shared_forget_database(Oid dboid)
 	if (prolly_commit_cache_entries == 0)
 		return;
 	c = shared();
-	SpinLockAcquire(&c->mutex);
-	for (int i = 0; i < c->nentries; i++)
-		if (c->entries[i].used != 0 && c->entries[i].key.dboid == dboid)
-			c->entries[i].used = 0;
-	SpinLockRelease(&c->mutex);
-}
 
-static void
-shared_counters(ProllyCommitCacheCounters *out, bool reset)
-{
-	*out = counts;
-	if (reset)
-		memset(&counts, 0, sizeof(counts));
+	/*
+	 * (FORGET_BATCH slots at a time, so lookups wait at most that long: no
+	 * entry of the database is made meanwhile, since nothing is connected
+	 * to a database being dropped)
+	 */
+	for (int start = 0; start < c->nentries; start += FORGET_BATCH)
+	{
+		int			end = Min(start + FORGET_BATCH, c->nentries);
+
+		SpinLockAcquire(&c->mutex);
+		for (int i = start; i < end; i++)
+			if (c->entries[i].used != 0 && c->entries[i].key.dboid == dboid)
+				c->entries[i].used = 0;
+		SpinLockRelease(&c->mutex);
+	}
 }
 
 const ProllyCommitCacheRoutine prolly_commitcache_shared = {
@@ -384,5 +382,4 @@ const ProllyCommitCacheRoutine prolly_commitcache_shared = {
 	.lookup = shared_lookup,
 	.remember = shared_remember,
 	.forget_database = shared_forget_database,
-	.counters = shared_counters,
 };

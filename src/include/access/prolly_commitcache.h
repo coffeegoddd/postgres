@@ -33,7 +33,8 @@
  * - forget_database() forgets every entry of database dboid, everyone's
  *   (its store is being dropped).
  * - A cache may forget anything at any time: a miss is only slower.
- * - counters() gives the lookups that hit and missed since the last reset.
+ *   pg_stat_prolly counts lookups that hit and missed (commit_cache_hits,
+ *   commit_cache_misses); a cache that holds nothing counts none.
  *
  * Provisional (v0).
  *
@@ -57,13 +58,6 @@ typedef struct ProllyCommitLinks
 	int64		height;			/* 0 if the commit records none */
 } ProllyCommitLinks;
 
-/* What a cache's lookups found. */
-typedef struct ProllyCommitCacheCounters
-{
-	uint64		hits;
-	uint64		misses;
-} ProllyCommitCacheCounters;
-
 typedef struct ProllyCommitCacheRoutine
 {
 	ProllyImplInfo info;
@@ -77,15 +71,12 @@ typedef struct ProllyCommitCacheRoutine
 	void		(*remember) (Oid dboid, uint32 generation, const ProllyHash *id,
 							 const ProllyCommitLinks *links);
 	void		(*forget_database) (Oid dboid);
-
-	void		(*counters) (ProllyCommitCacheCounters *out, bool reset);
 } ProllyCommitCacheRoutine;
 
 #define PROLLY_COMMITCACHE_CALLBACK_NAMES \
-	"shmem_size", "shmem_init", "lookup", "remember", "forget_database", \
-	"counters"
+	"shmem_size", "shmem_init", "lookup", "remember", "forget_database"
 #define PROLLY_COMMITCACHE_FIRST_CALLBACK shmem_size
-#define PROLLY_COMMITCACHE_LAST_CALLBACK counters
+#define PROLLY_COMMITCACHE_LAST_CALLBACK forget_database
 
 static inline const ProllyCommitCacheRoutine *
 prolly_commitcache_lookup(const char *name)

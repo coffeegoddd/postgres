@@ -283,7 +283,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  commit_cache  | shared         | identity                       | pass
  commit_cache  | shared         | complete                       | pass
  commit_cache  | stub           | identity                       | pass
- commit_cache  | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ commit_cache  | stub           | complete                       | not implemented (5 of 5 callbacks missing)
 (216 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
