@@ -875,6 +875,7 @@ with_relnumber(RelFileLocator rel, RelFileNumber relnumber)
 }
 
 static void sync_store_later(RelFileLocator rel);
+static void sync_store(RelFileLocator rel);
 
 static SMgrRelation
 store_smgr(RelFileLocator rel)
@@ -5754,6 +5755,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	xl_bmap_share xlrec;
 	XLogRecPtr	lsn;
 	LOCKTAG		sweeptag;
+	BlockList	own = {0};
 
 	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
 		elog(ERROR, "block-mapped relation %s can't share the blocks of %s, in another page store",
@@ -5781,7 +5783,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 
 	/* src's own blocks preserved, its subtrees a holder more */
-	tree_preserve(src, nblocks, epoch, NULL);
+	tree_preserve(src, nblocks, epoch, &own);
 	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
@@ -5846,6 +5848,11 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 * be durable by the time dst is, at commit (bmapsyncshares()).
 	 */
 	FlushRelationsAllBuffers(&src, 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
+	if (own.n == 0)
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
+	if (own.blocks)
+		pfree(own.blocks);
 	sync_store_later(srel);
 }
 
@@ -5876,6 +5883,18 @@ sync_store_later(RelFileLocator rel)
 	unsynced_stores[n_unsynced_stores++] = rel;
 }
 
+bool		bmap_debug_skip_store_sync = false;
+
+/* Sync rel's page store for the shares and snapshots that need it. */
+static void
+sync_store(RelFileLocator rel)
+{
+	if (bmap_debug_skip_store_sync)
+		return;
+	mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS, 1);
+}
+
 /*
  * Sync the page stores this transaction's shares wrote blocks of (or, at
  * abort, forget them: the copies are dropped, their blocks src's alone).
@@ -5887,8 +5906,7 @@ bmapsyncshares(bool isCommit)
 		while (n_unsynced_stores > 0)
 		{
 			INJECTION_POINT("bmap-sync-shares", NULL);
-			mdimmedsync(store_smgr(unsynced_stores[n_unsynced_stores - 1]),
-						MAIN_FORKNUM);
+			sync_store(unsynced_stores[n_unsynced_stores - 1]);
 			n_unsynced_stores--;
 		}
 	n_unsynced_stores = 0;
@@ -6072,9 +6090,12 @@ bmap_snapshot_take(SMgrRelation reln)
 
 	MarkBufferedPagesShared();
 	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
+	if (own.n == 0)
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
 	if (own.blocks)
 		pfree(own.blocks);
-	mdimmedsync(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM);
+	sync_store(reln->smgr_rlocator.locator);
 	INJECTION_POINT("bmap-snapshot-taken", NULL);
 	return id;
 }
@@ -6105,6 +6126,9 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 	for (int i = 0; i < n; i++)
 	{
 		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED, 1);
+		if (own[i].n == 0)
+			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN, 1);
 		if (own[i].blocks)
 			pfree(own[i].blocks);
 		sync_store_later(rels[i]->smgr_rlocator.locator);
