@@ -1,14 +1,15 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # At wal_level minimal, a share or a snapshot of block-mapped storage (a
-# branch's copy, a kept commit) syncs the page store rather than logging
-# its own blocks as images.  Redo of the records that gave those blocks to
-# the relation zeroes them again, and the records that made the pages are
-# skipped once the relation was dropped or gave the block up: the copies
-# must still read the pages after a crash.  Each case writes after a
-# checkpoint, so that recovery replays the blocks' allocations, then crashes
-# and reads every page of a table, its index, its change log and the log's
-# index, as of the head and of an earlier commit.
+# branch's copy, a kept commit) logs its own blocks as images, as at the
+# levels for backups; a sync of the page store would not survive the
+# replay.  Redo of the records that gave those blocks to the relation
+# zeroes them again, and the records that made the pages are skipped once
+# the relation was dropped or gave the block up: only the images, replayed
+# after them, give the copies their pages after a crash.  Each case writes
+# after a checkpoint, so that recovery replays the blocks' allocations,
+# then crashes and reads every page of a table, its index, its change log
+# and the log's index, as of the head and of an earlier commit.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;

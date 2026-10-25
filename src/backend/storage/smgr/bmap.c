@@ -9964,8 +9964,8 @@ static void sweep_store(RelFileLocator rel, const char *path,
  *
  * A tree's nodes stay where they are: a node moved would get a new pointer,
  * and recovery skips the records of every page under a pointer newer than
- * them (tree_find()), which only a share's flushing and syncing of those
- * pages makes safe; so does anything shared, a snapshot's, on a changes
+ * them (tree_find()), which only a share's images of those pages (and
+ * their write) make safe; so does anything shared, a snapshot's, on a changes
  * list, or busy (a pinned buffer).  A node in the tail ends what the store
  * can be shortened by.  A crash between a move and the freeing of
  * its old block leaves that block allocated and held by nothing, for the
@@ -12832,7 +12832,6 @@ bmap_redo(XLogReaderState *record)
 					!(xlrec->flags & BMAP_TREE_CARRIED) &&
 					XLogRecHasBlockRef(record, 1);
 				bool		walked = false;
-				bool		preserved = (xlrec->flags & BMAP_TREE_PRESERVE_LOGGED) != 0;
 				const char *why = NULL;
 
 				/* the store reaches a node made, which its image makes */
@@ -12849,6 +12848,10 @@ bmap_redo(XLogReaderState *record)
 					if (data == NULL || len != sizeof(sdelta))
 						elog(PANIC, "block map snapshot record without its slot's delta");
 					memcpy(&sdelta, data, sizeof(sdelta));
+					/* (every snapshot kept logs its own blocks as images) */
+					if (!(xlrec->flags & BMAP_TREE_PRESERVE_LOGGED))
+						elog(PANIC, "block map snapshot record of %s without its own blocks' images",
+							 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
 					if (!DataChecksumsNeedVerify())
 						why = "data checksums are off, so a page it would read could be torn";
 					else if (!redo_own_blocks(xlrec->locator, &sdelta.snap,
@@ -12865,11 +12868,8 @@ bmap_redo(XLogReaderState *record)
 				 * leaves; and not one carried, whose blocks are another
 				 * snapshot's, made durable when that was kept): as the
 				 * primary did, the relation's pages as of this record
-				 * written to the blocks the snapshot holds, and durably.  Without online backups no image of them is
-				 * logged, and the pages redo made of the records before
-				 * this go elsewhere once a remap moves the relation off
-				 * them: the snapshot's blocks would keep what they had
-				 * when redo began.  The pages written are those of the
+				 * written to the blocks the snapshot holds.  The pages
+				 * written are those of the
 				 * snapshot's own blocks (redo_own_blocks()), each looked up
 				 * in the buffers, as bmap_snapshot_take() writes them: as
 				 * many as changed since the last snapshot.  Every buffer is
@@ -12878,12 +12878,12 @@ bmap_redo(XLogReaderState *record)
 				 * than the replay, one not verified, or one not the node
 				 * the pointer to it names (redo_own_blocks()).
 				 *
-				 * With the own blocks logged as images just before the
-				 * record (as every share and snapshot logs them), they are still
-				 * written out: a page may have changed in place after its
-				 * image and before the record (a row lock, a prune), whose
-				 * redo went to the relation's buffer only.  Only the sync is
-				 * left out then: redo of each image wrote it to its block,
+				 * The own blocks were logged as images just before the
+				 * record, yet they are still written out: a page may have
+				 * changed in place after its image and before the record
+				 * (a row lock, a prune), whose redo went to the relation's
+				 * buffer only.  Nothing is synced: redo of each image wrote
+				 * it to its block,
 				 * as a page written out, which the checkpointer (a
 				 * restartpoint) syncs, as it syncs these writes, and a crash
 				 * before that replays the images and the changes again.
@@ -12909,11 +12909,8 @@ bmap_redo(XLogReaderState *record)
 					}
 					if (own.blocks)
 						pfree(own.blocks);
-					if (preserved)
-						elog(DEBUG1, "redo of a snapshot of %s syncs nothing: its own pages were logged as images",
-							 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
-					else
-						mdimmedsync(store_smgr(xlrec->locator), MAIN_FORKNUM);
+					elog(DEBUG1, "redo of a snapshot of %s syncs nothing: its own pages were logged as images",
+						 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
 				}
 				break;
 			}
@@ -13044,6 +13041,10 @@ bmap_redo(XLogReaderState *record)
 				xl_bmap_share *xlrec = (xl_bmap_share *) XLogRecGetData(record);
 				SMgrRelation src = smgropen(xlrec->src, INVALID_PROC_NUMBER);
 
+				/* (every share logs its source's own blocks as images) */
+				if (!(xlrec->flags & BMAP_PRESERVE_LOGGED))
+					elog(PANIC, "block map share record of %s without its own blocks' images",
+						 relpathperm(xlrec->src, MAIN_FORKNUM).str);
 				redo_block(record, 0);
 				redo_block(record, 1);
 				forget_cached_size(xlrec->dst);
@@ -13051,8 +13052,8 @@ bmap_redo(XLogReaderState *record)
 				/*
 				 * As the primary did: the shared blocks get the source's
 				 * pages as of this record, durably.  The source's buffers
-				 * are written out even with its own blocks logged as images,
-				 * whose redo wrote each to its block: a page found the
+				 * are written out though its own blocks were logged as
+				 * images, whose redo wrote each to its block: a page found the
 				 * source's own before the share may have changed in place
 				 * after its image and before this record (a row lock, a
 				 * prune, which don't ask the map), and the change's redo
@@ -13062,11 +13063,8 @@ bmap_redo(XLogReaderState *record)
 				 * when they were first shared.
 				 */
 				FlushRelationsAllBuffers(&src, 1);
-				if (xlrec->flags & BMAP_PRESERVE_LOGGED)
-					elog(DEBUG1, "redo of a share of %s syncs nothing: its own pages were logged as images",
-						 relpathperm(xlrec->src, MAIN_FORKNUM).str);
-				else
-					mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
+				elog(DEBUG1, "redo of a share of %s syncs nothing: its own pages were logged as images",
+					 relpathperm(xlrec->src, MAIN_FORKNUM).str);
 				break;
 			}
 		default:
