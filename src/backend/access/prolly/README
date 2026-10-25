@@ -928,8 +928,16 @@ snapshot, O(1), its pg_class row repointed with its oldest transaction ids
 then, as TRUNCATE gives a relation new storage, and the old storage dropped
 at commit; the baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
-of its rows.  Whatever still differs (definitions, sequences, a table not
-restored) the move writes as before.  A table isn't restored if its
+of its rows.  A move to a commit whose pages aren't kept, or whose kept
+pages for a table are gone, gives that table the pages kept as of the
+branch's head instead, if those are: that discards the working set's
+changes in O(1), as a reset to the head does, and the move then writes
+only the rows the head and the commit differ by, not those and every row
+changed since the head.  A branch reset back and forth between two
+commits takes this path: each restore gives a table new storage, and the
+other commit's snapshot goes with the old storage.  Whatever still differs
+(definitions, sequences, a table not restored) the move writes as before.
+A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
