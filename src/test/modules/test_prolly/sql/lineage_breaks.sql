@@ -218,7 +218,8 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 -- holds a newline and the new table's line, made on the old table's
 -- branch, leaves that branch's commits the old table's
 SELECT dolt_hashof('main') AS before_f \gset
-SELECT lpad('ln.t'::regclass::oid::text, 10, '0') AS new_relid \gset
+SELECT lpad('ln.t'::regclass::oid::text, 10, '0') || ' ' ||
+	lpad((SELECT relowner FROM pg_class WHERE oid = 'ln.t'::regclass)::text, 10, '0') AS new_relid \gset
 SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
 SELECT dolt_checkout('-b', 'forger') IS NOT NULL AS made;
 SELECT format('CREATE TABLE ln.%I (id int PRIMARY KEY)',

@@ -117,6 +117,10 @@ typedef struct ProllyMergeState
 										 * (palloc'd) */
 	char	   *identity_source;	/* the local branch theirs was the head
 									 * of, or NULL */
+	char	   *identity_saved; /* the privileges of the branch's relations
+								 * --theirs dropped, for an abort to give
+								 * back (prolly_save_privileges()'s), or
+								 * NULL */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -254,11 +258,12 @@ typedef struct ProllyMovedBranch
 
 /*
  * A relation a commit was made from (refs' commit_relations()): its OID,
- * and the table's qualified name then (quoted as needed).
+ * its owner's, and the table's qualified name then (quoted as needed).
  */
 typedef struct ProllyCommitRelation
 {
 	Oid			relid;
+	Oid			owner;			/* its owner then */
 	char	   *name;
 } ProllyCommitRelation;
 
@@ -765,6 +770,18 @@ typedef struct ProllyRefsRoutine
 	void		(*pins) (ProllyPinVisit visit, void *arg);
 
 	/*
+	 * Optional: the relation (*relid) that branch's records of its head's
+	 * relations (its tables, and its other relations with privileges of
+	 * their own), made by its last commit, list under the qualified name
+	 * name (prolly_record_relation_name()'s), and that commit (*at); false
+	 * if they list none so, or there is none.  A relation of the branch
+	 * now of that name and another OID was made since: it isn't the one
+	 * the commit's object was made from.
+	 */
+	bool		(*recorded_relid) (const char *branch, const char *name,
+								   Oid *relid, ProllyHash *at);
+
+	/*
 	 * Optional: the role that made branch name, which owns it; false if
 	 * none is recorded (main, the database owner's, never has one).
 	 */
@@ -853,6 +870,13 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
  */
 extern PGDLLIMPORT List *prolly_commit_local_tables;
 
+/*
+ * A relation's qualified name as the refs' records of relations write it:
+ * quoted as needed with quote_all_identifiers off, in any session.
+ */
+extern char *prolly_record_relation_name(const char *nspname,
+										 const char *relname);
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -871,7 +895,7 @@ extern PGDLLIMPORT List *prolly_commit_local_tables;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "branch_creator", \
+	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "forget_records"

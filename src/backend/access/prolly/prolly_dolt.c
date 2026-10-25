@@ -34,6 +34,8 @@
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_snapshot.h"
+#include "access/prolly_toast.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -1109,9 +1111,43 @@ prolly_may_move_head(const char *name)
 		has_privs_of_role(GetUserId(), prolly_branch_owner(name));
 }
 
+/*
+ * How many moves of the branch (merges, cherry-picks, reverts, stash
+ * applies) this backend is running.  Nothing else that moves a head or
+ * the working set (a reset, a checkout, a commit, another move) runs
+ * inside one, as from a function the rows it writes call: it would change
+ * the working set, merge state and privileges under it.
+ */
+static int	moves_running = 0;
+
+void
+prolly_check_not_moving(void)
+{
+	if (moves_running > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a branch can't be moved inside a merge, cherry-pick, revert or stash apply"),
+				 errdetail("It was called while one was running, as from a function the rows it wrote called.")));
+}
+
+void
+prolly_move_begin(void)
+{
+	prolly_check_not_moving();
+	moves_running++;
+}
+
+void
+prolly_move_end(void)
+{
+	Assert(moves_running > 0);
+	moves_running--;
+}
+
 void
 prolly_check_head_move(const char *name)
 {
+	prolly_check_not_moving();
 	if (!prolly_may_move_head(name))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -1230,6 +1266,26 @@ version_move_end(VersionMove *vm)
 		version_move_begin(&vm_, (from_), (n_)); \
 		WITH_PROVENANCE(from_, n_, BRANCH_WRITES_HUSHED(__VA_ARGS__)); \
 		version_move_end(&vm_); \
+	} while (0)
+
+/*
+ * A VERSION_MOVE() that restores the commits' versions (a reset, a table's
+ * checkout, an abort, a stash's push): each table it makes is the
+ * commit's, its recorded owner's with no grants (prolly_move_recorded_owners),
+ * not the mover's.
+ */
+#define RESTORING_MOVE(from_, n_, ...) \
+	do { \
+		prolly_move_recorded_owners = true; \
+		PG_TRY(_restoring); \
+		{ \
+			VERSION_MOVE(from_, n_, __VA_ARGS__); \
+		} \
+		PG_FINALLY(_restoring); \
+		{ \
+			prolly_move_recorded_owners = false; \
+		} \
+		PG_END_TRY(_restoring); \
 	} while (0)
 
 /*
@@ -1985,8 +2041,8 @@ checkout_tables(const char *ref, char **names, int nnames)
 	 * it; the branch may be its head's again, its changes all put back)
 	 */
 	branch_note_write(MyBranch);
-	VERSION_MOVE(&commit, 1,
-				 PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	RESTORING_MOVE(&commit, 1,
+				   PROLLY_CALL(diff_merge(), move_to, &target, &working));
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
@@ -2027,6 +2083,8 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	bool		is_branch = false;	/* names[0] is a branch */
 	bool		is_table = false;	/* names[0] is a table (or ".") */
 
+	/* (it changes the working set, or the branch's, a move's under it) */
+	prolly_check_not_moving();
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];
@@ -2512,7 +2570,12 @@ static void
 abort_in_progress(const char *what)
 {
 	ProllyHash	head = {0};
+	ProllyMergeState ms;
+	char	   *saved = NULL;
 
+	/* (the privileges a resolution with theirs took from the branch's) */
+	if (PROLLY_CALL(refs(), merge_state, &ms))
+		saved = ms.identity_saved;
 	branch_note_write(MyBranch);
 	(void) PROLLY_CALL(refs(), resolve, "HEAD", &head);
 	/* (a table its resolution made theirs: the head's relation again) */
@@ -2520,8 +2583,9 @@ abort_in_progress(const char *what)
 		BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
 														   psprintf("abort the %s", what),
 														   true));
-	VERSION_MOVE(&head, head.len > 0 ? 1 : 0,
-				 PROLLY_CALL(refs(), reset, "HEAD"));
+	RESTORING_MOVE(&head, head.len > 0 ? 1 : 0,
+				   PROLLY_CALL(refs(), reset, "HEAD"));
+	BRANCH_WRITES_HUSHED(prolly_restore_privileges(saved, false));
 	settled();
 }
 
@@ -3505,9 +3569,22 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	target = {0};
 
+		ProllyHash	head = {0};
+
 		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
-		VERSION_MOVE(&target, target.len > 0 ? 1 : 0,
-					 PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+
+		/*
+		 * (to the head: discarding the branch's own work, a table made
+		 * again since its commit is the head's relation again, as a
+		 * stash's push makes it)
+		 */
+		if (target.len > 0 && PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			same_hash(&head, &target))
+			BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&head,
+															   "reset the branch",
+															   true));
+		RESTORING_MOVE(&target, target.len > 0 ? 1 : 0,
+					   PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	}
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
@@ -3669,8 +3746,8 @@ dolt_stash(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&at,
 																   "stash the changes",
 																   true));
-			VERSION_MOVE(&at, at.len > 0 ? 1 : 0,
-						 PROLLY_CALL(refs(), reset, "HEAD"));
+			RESTORING_MOVE(&at, at.len > 0 ? 1 : 0,
+						   PROLLY_CALL(refs(), reset, "HEAD"));
 		}
 		settled();
 	}
@@ -4275,8 +4352,9 @@ dolt_revert(PG_FUNCTION_ARGS)
 				BRANCH_WRITES_HUSHED(prolly_drop_mismatched_tables(&ms.series_head,
 																   "abort the revert",
 																   true));
-				VERSION_MOVE(&ms.series_head, 1,
-							 PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
+				RESTORING_MOVE(&ms.series_head, 1,
+							   PROLLY_CALL(refs(), reset, hash_hex(&ms.series_head)));
+				BRANCH_WRITES_HUSHED(prolly_restore_privileges(ms.identity_saved, false));
 				settled();
 			}
 			else if (ms.ntables > 0 || ms.nidentity > 0 ||
@@ -6812,14 +6890,25 @@ rows_end(Rows *r)
  * The row a tree value holds, as a composite datum of its own (the slot
  * is reused for the next value); and its copies.
  */
-static Datum
-rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+/*
+ * A version's row decoded into r->slot, its long values as the trees they
+ * are where a hash pointer can name them (read only as a composite datum
+ * of the row is made).
+ */
+static void
+rows_slot(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
 	rows_parse(r, value, &row, count);
 	ExecClearTuple(r->slot);
 	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
+}
+
+static Datum
+rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
+{
+	rows_slot(r, value, count);
 	return ExecFetchSlotHeapTupleDatum(r->slot);
 }
 
@@ -8027,7 +8116,13 @@ at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (after == NULL)
 		return;
 	old = rows_next(&s->rows);
-	row = rows_value(&s->rows, s->json, after, &copies);
+	if (s->history)
+		row = rows_value(&s->rows, s->json, after, &copies);
+	else
+	{
+		rows_slot(&s->rows, after, &copies);
+		row = (Datum) 0;
+	}
 	if (!s->rows.keyless)
 		copies = 1;
 	for (uint64 i = 0; i < copies; i++)

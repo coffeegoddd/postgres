@@ -482,8 +482,8 @@ DROP SCHEMA app CASCADE;
 
 -- Two tables' names swapped: a hard reset back to the head, which matches
 -- tables by name, would put each table's version into the other's
--- relation, and is refused; with the tables dropped it makes each its own
--- relation again.  A merge's abort does that itself.
+-- relation; discarding the branch's own changes, it makes each its own
+-- relation again instead, by its OID, as a merge's abort does.
 CREATE SCHEMA sw VERSIONED;
 CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
 CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
@@ -493,8 +493,6 @@ SELECT 'sw.a'::regclass::oid AS sw_a, 'sw.b'::regclass::oid AS sw_b \gset
 ALTER TABLE sw.a RENAME TO tmp;
 ALTER TABLE sw.b RENAME TO a;
 ALTER TABLE sw.tmp RENAME TO b;
-SELECT dolt_reset('--hard');
-DROP TABLE sw.a, sw.b;
 SELECT dolt_reset('--hard');
 SELECT 'sw.a'::regclass::oid = :sw_a AS a_again, 'sw.b'::regclass::oid = :sw_b AS b_again;
 SELECT * FROM sw.a;

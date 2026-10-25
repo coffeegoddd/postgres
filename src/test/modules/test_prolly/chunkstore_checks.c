@@ -49,6 +49,8 @@
 #include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 #include "miscadmin.h"
+#include "access/prolly_jsontree.h"
+#include "access/prolly_toast.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -1574,6 +1576,88 @@ test_root_without_format(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&out.hash));
 }
 
+static bool
+tree_read_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	(*(int64 *) arg)++;
+	return true;
+}
+
+static void
+tree_read_change(ProllyDiffKind kind, const ProllyKey *key,
+				 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	(*(int64 *) arg)++;
+}
+
+/*
+ * test_tree_read(root, how): read the tree at root (nodes made by hand,
+ * perhaps) as one reader does: 'scan' (a cursor), 'walk', 'diff',
+ * 'diff_nodes', 'diff_unordered' and 'diff_estimate' (against the empty
+ * tree), 'rank' or 'apply' (an edit); what it counted.
+ */
+PG_FUNCTION_INFO_V1(test_tree_read);
+Datum
+test_tree_read(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	char	   *how = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ProllyTreeEnv env;
+	ProllyNodeRef root;
+	ProllyNodeRef empty;
+	ProllyTreeBuilder *b;
+	int64		n = 0;
+
+	prolly_folded_tree_env(&env);
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tree, build_finish, b, &empty);
+	if (strcmp(how, "scan") == 0)
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(tree, cursor_open, &env, &root,
+										  CurrentMemoryContext);
+		ProllyKey	k;
+		ProllyValue v;
+
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+			n++;
+		PROLLY_CALL(tree, cursor_close, c);
+	}
+	else if (strcmp(how, "walk") == 0)
+		(void) PROLLY_CALL(tree, walk, &env, &root, tree_read_node, &n);
+	else if (strcmp(how, "diff") == 0)
+		PROLLY_CALL(tree, diff, &env, &empty, &root, tree_read_change, &n);
+	else if (strcmp(how, "diff_nodes") == 0)
+		PROLLY_CALL(tree, diff_nodes, &env, &empty, &root, tree_read_node, &n);
+	else if (strcmp(how, "diff_unordered") == 0)
+		PROLLY_CALL(tree, diff_unordered, &env, &empty, &root, tree_read_change, &n);
+	else if (strcmp(how, "diff_estimate") == 0)
+		n = (int64) PROLLY_CALL(tree, diff_estimate, &env, &empty, &root, 1000);
+	else if (strcmp(how, "rank") == 0)
+	{
+		ProllyKey	k = {(const uint8 *) "k000000", 7};
+
+		n = (int64) PROLLY_CALL(tree, rank, &env, &root, &k);
+	}
+	else if (strcmp(how, "apply") == 0)
+	{
+		ProllyEdit	e;
+		ProllyNodeRef out;
+
+		memset(&e, 0, sizeof(e));
+		e.key.data = (const uint8 *) "k000000";
+		e.key.len = 7;
+		e.value.data = (const uint8 *) "x";
+		e.value.len = 1;
+		PROLLY_CALL(tree, apply, &env, &root, &e, 1, &out);
+		n = 1;
+	}
+	else
+		elog(ERROR, "no tree read \"%s\"", how);
+	PG_RETURN_INT64(n);
+}
+
 /*
  * test_root_with_format(root, format): a folded root with its "!:format"
  * item set to format: what a build of that format committed.
@@ -2147,6 +2231,30 @@ test_chunk_declaring_tree(PG_FUNCTION_ARGS)
 		pfree(got.data);
 	}
 	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
+PG_FUNCTION_INFO_V1(test_json_tree_pointer);
+PG_FUNCTION_INFO_V1(test_json_read_memory);
+
+/*
+ * A hash pointer naming root as a JSON tree, as a row from another server
+ * would decode to: for trees made by hand.
+ */
+Datum
+test_json_tree_pointer(PG_FUNCTION_ARGS)
+{
+	ProllyNodeRef root;
+
+	memset(&root, 0, sizeof(root));
+	text_hash(PG_GETARG_TEXT_PP(0), &root.hash);
+	PG_RETURN_POINTER(prolly_toast_json_pointer(&root, 0));
+}
+
+/* The memory this backend's last whole read of a JSON tree took. */
+Datum
+test_json_read_memory(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) prolly_jsontree_read_memory);
 }
 
 /*

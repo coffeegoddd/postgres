@@ -855,7 +855,8 @@ class V10(VWorkload):
 
     The history shares storage every way it can: a table with a primary
     key, a secondary and a composite index, one with values out of line
-    (TOAST and hash pointers), and a keyless one; commits kept
+    (TOAST and hash pointers), one of long jsonb documents (JSON trees,
+    edited by path across commits), and a keyless one; commits kept
     (prolly.kept_commits) and a kept detached checkout; a branch used and
     deleted whose commit a snapshot mount still reads, and another that
     nothing reads (what a collection frees); a table dropped, and one
@@ -868,7 +869,9 @@ class V10(VWorkload):
     scans of the current tables; dolt_at, the mounts and the history mount
     at older commits, filtered; dolt_diff and dolt_log; a checkout of a
     kept commit, of the side branch and of a branch it resets hard to a
-    kept commit, each read after; and the heap tables' same reads.  The
+    kept commit, each read after; the documents read whole and by path,
+    and diffed between versions (prolly_jsonb_get, prolly_jsonb_diff);
+    and the heap tables' same reads.  The
     current tables' digests must equal the heap tables'.
 
     Phase 1 reads Q R times ("reps"), after a warm-up pass (cache "warm")
@@ -921,8 +924,8 @@ class V10(VWorkload):
     MUST_FREE = (("gc_full", "gc_chunks_freed"), ("release_queue", "bmap_release_blocks_freed"))
 
     # the current tables' reads the heap tables repeat
-    HEAP_READS = ("point", "range", "full", "toast", "keyless", "remade", "index",
-                  "composite", "index_only")
+    HEAP_READS = ("point", "range", "full", "toast", "doc", "doc_get", "keyless", "remade",
+                  "index", "composite", "index_only")
 
     def variants(self, params):
         # (one session's reads: never with a background workload)
@@ -937,7 +940,7 @@ class V10(VWorkload):
         return int(ctx.params.get("reps", 5))
 
     def tables(self, ctx):
-        return ["v10_t", "v10_big", "v10_bag", "v10_remade"]
+        return ["v10_t", "v10_big", "v10_doc", "v10_bag", "v10_remade"]
 
     def _sql(self, ctx, sql: str) -> str:
         return ctx.cluster.sql(sql, dbname=ctx.dbname, options=ctx.session_options()).stdout
@@ -966,6 +969,7 @@ class V10(VWorkload):
             CREATE INDEX v10_t_gk ON v10_t (g, k);
             CREATE TABLE v10_big (id int PRIMARY KEY, body text NOT NULL);
             ALTER TABLE v10_big ALTER COLUMN body SET STORAGE EXTERNAL;
+            CREATE TABLE v10_doc (id int PRIMARY KEY, j jsonb NOT NULL);
             CREATE TABLE v10_bag (a int, b text);
             CREATE TABLE v10_dropped (id int PRIMARY KEY, v text);
             CREATE TABLE v10_remade (id int PRIMARY KEY, v text);
@@ -973,6 +977,9 @@ class V10(VWorkload):
                 FROM generate_series(1, {n}) g;
             INSERT INTO v10_big SELECT g, repeat(md5(g::text), 150)
                 FROM generate_series(1, {z['big']}) g;
+            INSERT INTO v10_doc SELECT d, jsonb_object_agg('k' || g, jsonb_build_object(
+                    'id', g, 'name', md5((d * 1000 + g)::text), 'tags', jsonb_build_array(g, 'x')))
+                FROM generate_series(1, 6) d, generate_series(1, 500) g GROUP BY d;
             INSERT INTO v10_bag SELECT g % 40, 'b' || (g % 40) FROM generate_series(1, {z['bag']}) g;
             INSERT INTO v10_dropped SELECT g, 'd' || g FROM generate_series(1, {z['small']}) g;
             INSERT INTO v10_remade SELECT g, 'old' || g FROM generate_series(1, {z['small']}) g;
@@ -983,6 +990,7 @@ class V10(VWorkload):
             UPDATE v10_t SET k = k + 1, v = 'c2' WHERE id % 10 = 0;
             DELETE FROM v10_t WHERE id % 50 = 1;
             UPDATE v10_big SET body = repeat(md5(id::text || 'c2'), 150) WHERE id <= 10;
+            UPDATE v10_doc SET j = prolly_jsonb_set(j, '{{k5,name}}', '"c2"') WHERE id <= 3;
             DELETE FROM v10_bag WHERE a = 3;
             SELECT dolt_commit('-am', 'v10 c2');
         """)
@@ -1012,6 +1020,7 @@ class V10(VWorkload):
             UPDATE v10_t SET v = 'side' WHERE id % 10 = 5;
             INSERT INTO v10_big SELECT g, repeat(md5(g::text || 'side'), 150)
                 FROM generate_series({big + 21}, {big + 30}) g;
+            UPDATE v10_doc SET j = prolly_jsonb_set(j, '{{k7,tags,1}}', '"side"') WHERE id = 2;
             SELECT dolt_commit('-am', 'v10 on side');
             SELECT dolt_checkout('main');
 
@@ -1031,6 +1040,7 @@ class V10(VWorkload):
             UPDATE v10_t SET v = 'dirty' WHERE id <= 40;
             DELETE FROM v10_t WHERE id BETWEEN {n // 2} AND {n // 2 + 100};
             INSERT INTO v10_big VALUES (1000000, repeat('dirty', 2000));
+            UPDATE v10_doc SET j = prolly_jsonb_set(j, '{{k9,name}}', '"dirty"') WHERE id = 1;
             SELECT dolt_checkout('v10_side');
             UPDATE v10_t SET v = 'side dirty' WHERE id BETWEEN 500 AND 520;
             INSERT INTO v10_big SELECT 2000000, string_agg(md5(g::text || 'side'), '')
@@ -1045,6 +1055,8 @@ class V10(VWorkload):
             CREATE TABLE public.v10h_big USING heap AS SELECT * FROM v10_big;
             ALTER TABLE public.v10h_big ADD PRIMARY KEY (id);
             ALTER TABLE public.v10h_big ALTER COLUMN body SET STORAGE EXTERNAL;
+            CREATE TABLE public.v10h_doc USING heap AS SELECT * FROM v10_doc;
+            ALTER TABLE public.v10h_doc ADD PRIMARY KEY (id);
             CREATE TABLE public.v10h_bag USING heap AS SELECT * FROM v10_bag;
             CREATE TABLE public.v10h_remade USING heap AS SELECT * FROM v10_remade;
             ALTER TABLE public.v10h_remade ADD PRIMARY KEY (id);
@@ -1060,6 +1072,8 @@ class V10(VWorkload):
             "range": f"SELECT * FROM {{t}} WHERE id BETWEEN 100 AND {100 + n // 10}",
             "full": "SELECT * FROM {t}",
             "toast": "SELECT id, md5(body), length(body) FROM {big}",
+            "doc": "SELECT id, md5(j::text) FROM {doc}",
+            "doc_get": "SELECT id, prolly_jsonb_get(j, '{{k5,name}}'), j -> 'k9' FROM {doc}",
             "keyless": "SELECT * FROM {bag}",
             "remade": "SELECT * FROM {remade}",
         }
@@ -1072,10 +1086,10 @@ class V10(VWorkload):
                        ("", "set", "SET enable_bitmapscan = off")]
         index_reset = [("", "set", "RESET enable_seqscan"), ("", "set", "RESET enable_bitmapscan")]
         out: list[tuple[str, str, str]] = []
-        for prefix, names in (("", {"t": "v10_t", "big": "v10_big", "bag": "v10_bag",
-                                    "remade": "v10_remade"}),
+        for prefix, names in (("", {"t": "v10_t", "big": "v10_big", "doc": "v10_doc",
+                                    "bag": "v10_bag", "remade": "v10_remade"}),
                               ("heap_", {"t": "public.v10h_t", "big": "public.v10h_big",
-                                         "bag": "public.v10h_bag",
+                                         "doc": "public.v10h_doc", "bag": "public.v10h_bag",
                                          "remade": "public.v10h_remade"})):
             out += [(prefix + q, "read", sql.format(**names)) for q, sql in current.items()]
             out += index_scans
@@ -1086,8 +1100,17 @@ class V10(VWorkload):
                               f"WHERE id BETWEEN 10 AND {10 + n // 5}"),
             ("at_c2_big", "read", f"SELECT id, md5(body) FROM dolt_at('{c2}', NULL::v10_big)"),
             ("at_side", "read", "SELECT * FROM dolt_at('v10_side', NULL::v10_t) WHERE id % 10 = 5"),
+            ("at_c1_doc", "read", f"SELECT id, md5(j::text) FROM dolt_at('{c1}', NULL::v10_doc)"),
+            ("doc_diff", "read", f"SELECT * FROM prolly_jsonb_diff("
+                                 f"(SELECT j FROM dolt_at('{c1}', NULL::v10_doc) WHERE id = 2), "
+                                 f"(SELECT j FROM dolt_at('v10_side', NULL::v10_doc) WHERE id = 2))"),
+            ("doc_diff_working", "read", "SELECT * FROM prolly_jsonb_diff("
+                                         "(SELECT j FROM dolt_at('HEAD', NULL::v10_doc) WHERE id = 1), "
+                                         "(SELECT j FROM v10_doc WHERE id = 1))"),
             ("mount_t", "read", f"SELECT * FROM v10_m1.v10_t WHERE id BETWEEN 50 AND {50 + n // 15}"),
             ("mount_big", "read", "SELECT id, md5(body) FROM v10_m1.v10_big"),
+            ("mount_doc", "read", "SELECT id, md5(j::text), prolly_jsonb_get(j, '{k5,name}') "
+                                  "FROM v10_m1.v10_doc"),
             ("mount_dropped", "read", "SELECT * FROM v10_m1.v10_dropped"),
             ("mount_remade", "read", "SELECT * FROM v10_m1.v10_remade"),
             ("mount_gone", "read", "SELECT * FROM v10_gm.v10_t WHERE v = 'gone'"),
@@ -1109,6 +1132,7 @@ class V10(VWorkload):
             ("checkout_side", "op", "SELECT dolt_checkout('v10_side')"),
             ("side_t", "read", "SELECT * FROM v10_t"),
             ("side_big", "read", "SELECT id, md5(body) FROM v10_big"),
+            ("side_doc", "read", "SELECT id, md5(j::text) FROM v10_doc"),
             ("checkout_scratch", "op", "SELECT dolt_checkout('v10_scratch')"),
             ("scratch_change", "op", "UPDATE v10_t SET v = 'scratch' WHERE id <= 100"),
             ("reset_kept", "op", f"SELECT dolt_reset('--hard', '{c2}')"),

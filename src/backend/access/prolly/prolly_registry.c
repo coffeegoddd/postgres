@@ -68,6 +68,7 @@ static const char *const writers_callbacks[] = {PROLLY_WRITERS_CALLBACK_NAMES};
 static const char *const changelog_callbacks[] = {PROLLY_CHANGELOG_CALLBACK_NAMES};
 static const char *const moveplan_callbacks[] = {PROLLY_MOVEPLAN_CALLBACK_NAMES};
 static const char *const matcache_callbacks[] = {PROLLY_MATCACHE_CALLBACK_NAMES};
+static const char *const jsontree_callbacks[] = {PROLLY_JSONTREE_CALLBACK_NAMES};
 
 /*
  * A routine's callbacks follow its info, one per name, in the names' order:
@@ -103,6 +104,7 @@ CHECK_ROUTINE(ProllyWritersRoutine, PROLLY_WRITERS_FIRST_CALLBACK, PROLLY_WRITER
 CHECK_ROUTINE(ProllyChangeLogRoutine, PROLLY_CHANGELOG_FIRST_CALLBACK, PROLLY_CHANGELOG_LAST_CALLBACK, changelog_callbacks);
 CHECK_ROUTINE(ProllyMovePlannerRoutine, PROLLY_MOVEPLAN_FIRST_CALLBACK, PROLLY_MOVEPLAN_LAST_CALLBACK, moveplan_callbacks);
 CHECK_ROUTINE(ProllyMatCacheRoutine, PROLLY_MATCACHE_FIRST_CALLBACK, PROLLY_MATCACHE_LAST_CALLBACK, matcache_callbacks);
+CHECK_ROUTINE(ProllyJsonTreeRoutine, PROLLY_JSONTREE_FIRST_CALLBACK, PROLLY_JSONTREE_LAST_CALLBACK, jsontree_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -152,6 +154,8 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("move_planner", ProllyMovePlannerRoutine, PROLLY_MOVEPLAN_FIRST_CALLBACK, moveplan_callbacks),
 	[PROLLY_IFACE_MATERIALIZATION_CACHE] =
 	IFACE("matcache", ProllyMatCacheRoutine, PROLLY_MATCACHE_FIRST_CALLBACK, matcache_callbacks),
+	[PROLLY_IFACE_JSON_TREE] =
+	IFACE("json_tree", ProllyJsonTreeRoutine, PROLLY_JSONTREE_FIRST_CALLBACK, jsontree_callbacks),
 };
 
 static const ProllyInterfaceDesc *

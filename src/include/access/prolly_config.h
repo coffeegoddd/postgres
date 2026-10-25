@@ -22,6 +22,7 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_jsontree.h"
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
 #include "access/prolly_matcache.h"
@@ -117,6 +118,16 @@ extern bool prolly_writes_refs(void);
 extern Oid	prolly_branch_owner(const char *name);
 extern bool prolly_may_move_head(const char *name);
 extern void prolly_check_head_move(const char *name);
+
+/*
+ * A merge, cherry-pick, revert or stash apply runs between
+ * prolly_move_begin() and prolly_move_end() (the end in a PG_FINALLY);
+ * inside it, prolly_check_not_moving() refuses a head move, a checkout or
+ * another move (prolly_check_head_move() refuses too).
+ */
+extern void prolly_move_begin(void);
+extern void prolly_move_end(void);
+extern void prolly_check_not_moving(void);
 extern void prolly_check_branch_rename(const char *newname);
 
 /*
@@ -144,7 +155,7 @@ typedef enum ProllyMismatchedMove
 {
 	PROLLY_MISMATCH_MOVE,		/* a reset, a table's checkout, ... */
 	PROLLY_MISMATCH_FIRST_USE,	/* a branch's first use */
-	PROLLY_MISMATCH_PUSH,		/* a push's move of a branch */
+	PROLLY_MISMATCH_PUSH,		/* a push's or forced move of a branch */
 } ProllyMismatchedMove;
 
 extern void prolly_refuse_mismatched_versions(const ProllyNodeRef *before,
@@ -164,6 +175,13 @@ extern void prolly_refuse_mismatched_versions(const ProllyNodeRef *before,
  */
 extern void prolly_drop_mismatched_tables(const ProllyHash *head,
 										  const char *why, bool owned);
+
+/*
+ * Give back privileges a merge's resolution saved (the merge in progress's
+ * identity_saved) to the relations of those names now: only views', or
+ * all (an abort's).
+ */
+extern void prolly_restore_privileges(const char *saved, bool views);
 
 /*
  * While set, a branch's move to a commit (refs' branch_move()) replaces

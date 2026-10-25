@@ -408,8 +408,9 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V8 --config sr
 
 `configs/v_cleanup.toml` runs V10: storage cleanup must free only what no
 read needs.  A history that shares storage every way it can (a keyed
-table with a secondary and a composite index, values out of line, a
-keyless table; kept commits, `prolly.kept_commits` 4, and a kept detached
+table with a secondary and a composite index, values out of line, long
+jsonb documents (JSON trees, edited by `prolly_jsonb_set` across commits
+and branches), a keyless table; kept commits, `prolly.kept_commits` 4, and a kept detached
 checkout; a branch used and deleted whose commit a snapshot mount still
 reads, and another nothing reads; a table dropped, and one dropped and
 made again; a merge; a snapshot mount of the first commit and a history
@@ -418,7 +419,9 @@ query set Q: point, range, index, index-only, composite-index and full
 scans of the current tables; `dolt_at`, the mounts and the history mount
 at older commits, filtered; `dolt_diff` and `dolt_log`; checkouts of a
 kept commit and of the side branch, and a hard reset to a kept commit,
-each read after.  Heap tables beside it, in `public`, hold main's rows as
+each read after; the documents read whole and by path
+(`prolly_jsonb_get`), at older commits and through a mount, and diffed
+between versions (`prolly_jsonb_diff`).  Heap tables beside it, in `public`, hold main's rows as
 they are, with the same indexes, and are read the same way: their digests
 must equal prolly's, and their latencies show what the cleanups cost a
 table without version control.

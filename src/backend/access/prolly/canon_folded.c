@@ -253,13 +253,15 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "21", whose definitions (defaults,
- * checks, generated columns, index expressions, views, policies) are
- * described with the settings values' text forms are written under fixed
- * (describing_settings()), so a constant in one prints alike in any
- * session; "20" printed them under the committer's DateStyle,
- * IntervalStyle, TimeZone and the rest, and was the first whose text
- * forms of values (a type without binary I/O's, or one its receive
+ * The format a folded root is in: "22", whose rows may hold a long jsonb
+ * document as a JSON tree (valenc_canonical.c); "21" held every long value
+ * as a value tree of its bytes, and was the first whose definitions
+ * (defaults, checks, generated columns, index expressions, views,
+ * policies) are described with the settings values' text forms are
+ * written under fixed (describing_settings()), so a constant in one prints
+ * alike in any session; "20" printed them under the committer's
+ * DateStyle, IntervalStyle, TimeZone and the rest, and was the first whose
+ * text forms of values (a type without binary I/O's, or one its receive
  * refuses) are written with times in UTC, hex bytea and the C locale's
  * money, numbers and dates (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
  * bytea_output, and was the first whose
@@ -301,12 +303,13 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"21"
+#define FOLDED_FORMAT	"22"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
  * The format versions of the encoders FOLDED_FORMAT's trees are written
- * with: the key encoder's, the value encoder's and the keying's.  A tree's
+ * with: the key encoder's, the value encoder's, the keying's and the JSON
+ * trees' (which long jsonb documents are).  A tree's
  * bytes are theirs, so one changed alone would read trees of the format
  * as its own, with phantom changes in every status, diff and commit, and
  * spurious conflicts in merges.  Changing one means changing
@@ -314,8 +317,9 @@ typedef struct BaseTable BaseTable;
  * agree (folded_encoders_checked()).
  */
 #define FOLDED_KEY_ENCODER		7
-#define FOLDED_VALUE_ENCODER	7
+#define FOLDED_VALUE_ENCODER	8
 #define FOLDED_KEYING			1
+#define FOLDED_JSON_TREE		2
 
 /*
  * What a canonical tree or baseline built here was folded at, for a later
@@ -528,14 +532,16 @@ static void
 folded_encoders_checked(void)
 {
 	static bool checked = false;
-	const ProllyImplInfo *impls[3];
-	const int	pinned[3] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING};
+	const ProllyImplInfo *impls[4];
+	const int	pinned[4] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING,
+	FOLDED_JSON_TREE};
 
 	if (checked)
 		return;
 	impls[0] = prolly_get_impl(PROLLY_IFACE_KEY_ENCODER, "ordered");
 	impls[1] = prolly_get_impl(PROLLY_IFACE_VALUE_ENCODER, "canonical");
 	impls[2] = prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_prefix");
+	impls[3] = prolly_get_impl(PROLLY_IFACE_JSON_TREE, "paths");
 	for (int i = 0; i < lengthof(impls); i++)
 		if (impls[i] && impls[i]->format_version != pinned[i])
 			elog(ERROR, "prolly %s \"%s\" is at format version %u, but folded format %s pins %d: change FOLDED_FORMAT with it",
@@ -7983,10 +7989,86 @@ typedef struct MoveRelid
 {
 	char	   *name;
 	Oid			relid;
+	Oid			owner;			/* the role it is made as (InvalidOid: the
+								 * move's) */
 } MoveRelid;
+
+bool		prolly_move_recorded_owners = false;
+
+/* The tables a move makes as their recorded owners, once made (MoveRelid *) */
+static List *move_owned_tables = NIL;
 
 /* While a move's statements run, the relations its tables are to be. */
 static List *move_kept_relids = NIL;
+
+/*
+ * The role table name is made as by a move that restores it from a commit
+ * (prolly_move_recorded_owners): owner, the one the commit records, which
+ * must still exist.
+ */
+static Oid
+recorded_owner(const char *name, Oid owner)
+{
+	if (!OidIsValid(owner) ||
+		!SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(owner)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("cannot make table %s as the commit has it: the role that owned it there no longer exists",
+						name),
+				 errdetail("A table a move makes from a commit is its recorded owner's, with no grants."),
+				 errhint("Move to a commit whose tables' owners exist, or drop the table at the commit first.")));
+	return owner;
+}
+
+/*
+ * Give each table of owned (MoveRelid *, by name) the move made to its
+ * recorded owner, with no grants: what made it (the move's role, its
+ * default privileges) gains nothing by it.  After the move's statements
+ * and rows, which ran as they do for any move.
+ */
+static void
+give_made_tables(List *owned)
+{
+	foreach_ptr(MoveRelid, mr, owned)
+	{
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(mr->name, NULL)),
+											 NoLock, true);
+		Relation	pg_class;
+		HeapTuple	tup;
+		bool		isnull;
+		Datum		acl;
+
+		if (!OidIsValid(relid))
+			continue;
+		ATExecChangeOwner(relid, mr->owner, true, AccessExclusiveLock);
+		CommandCounterIncrement();
+		pg_class = table_open(RelationRelationId, RowExclusiveLock);
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", relid);
+		acl = heap_getattr(tup, Anum_pg_class_relacl, RelationGetDescr(pg_class),
+						   &isnull);
+		if (!isnull)
+		{
+			Datum		values[Natts_pg_class] = {0};
+			bool		nulls[Natts_pg_class] = {0};
+			bool		replaces[Natts_pg_class] = {0};
+			Oid		   *members;
+			int			nmembers = aclmembers(DatumGetAclP(acl), &members);
+			HeapTuple	newtup;
+
+			nulls[Anum_pg_class_relacl - 1] = true;
+			replaces[Anum_pg_class_relacl - 1] = true;
+			newtup = heap_modify_tuple(tup, RelationGetDescr(pg_class), values,
+									   nulls, replaces);
+			CatalogTupleUpdate(pg_class, &newtup->t_self, newtup);
+			updateAclDependencies(RelationRelationId, relid, 0, mr->owner,
+								  nmembers, members, 0, NULL);
+		}
+		table_close(pg_class, RowExclusiveLock);
+		CommandCounterIncrement();
+	}
+}
 
 /*
  * The relations the tables a move makes are to be: a table it makes again
@@ -8018,7 +8100,7 @@ move_relids_before(List *from, List *to, List *remade)
 								 NoLock, true);
 		if (!OidIsValid(relid))
 			continue;
-		mr = palloc(sizeof(MoveRelid));
+		mr = palloc0(sizeof(MoveRelid));
 		mr->name = lfirst(lc);
 		mr->relid = relid;
 		out = lappend(out, mr);
@@ -8034,10 +8116,11 @@ move_relids_before(List *from, List *to, List *remade)
 		foreach_ptr(ProllyKeptRelation, k, prolly_move_kept)
 			if (!given && strcmp(k->name, t->name) == 0)
 			{
-				MoveRelid  *mr = palloc(sizeof(MoveRelid));
+				MoveRelid  *mr = palloc0(sizeof(MoveRelid));
 
 				mr->name = t->name;
 				mr->relid = k->relid;
+				mr->owner = k->owner;
 				out = lappend(out, mr);
 				given = true;
 			}
@@ -8057,9 +8140,11 @@ move_relids_before(List *from, List *to, List *remade)
 					of = lfirst(rc);
 			if (of == NULL)
 				continue;
-			mr = palloc(sizeof(MoveRelid));
+			mr = palloc0(sizeof(MoveRelid));
 			mr->name = t->name;
 			mr->relid = of->relid;
+			if (prolly_move_recorded_owners)
+				mr->owner = recorded_owner(t->name, of->owner);
 			out = lappend(out, mr);
 			break;
 		}
@@ -11070,6 +11155,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			remade = lappend(remade, f->name);
 	}
 	move_kept_relids = move_relids_before(from, to, remade);
+	move_owned_tables = NIL;
+	foreach_ptr(MoveRelid, mr, move_kept_relids)
+		if (OidIsValid(mr->owner))
+			move_owned_tables = lappend(move_owned_tables, mr);
 
 	/*
 	 * Tables whose columns change type in turn (type_moves()) are emptied
@@ -11559,6 +11648,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MemoryContextSwitchTo(spi);
 	}
 	move_kept_relids = NIL;
+	give_made_tables(move_owned_tables);
+	move_owned_tables = NIL;
 	SPI_finish();
 	AtEOXact_GUC(true, save_nestlevel);
 	return;

@@ -587,7 +587,17 @@ typedef struct ProllyKeptRelation
 {
 	char	   *name;			/* qualified, quoted as roots name tables */
 	Oid			relid;
+	Oid			owner;			/* the role it is made as (InvalidOid: the
+								 * move's) */
 } ProllyKeptRelation;
+
+/*
+ * While set, a move restores tables from the commits it takes versions
+ * from (a reset, a table's checkout, a first use, an abort): each table
+ * it makes is its recorded owner's (the commit's record of relations
+ * names it), with no grants, refused if that role no longer exists.
+ */
+extern PGDLLIMPORT bool prolly_move_recorded_owners;
 
 extern PGDLLIMPORT List *prolly_move_kept;
 

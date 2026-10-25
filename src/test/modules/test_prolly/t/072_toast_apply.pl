@@ -5,8 +5,9 @@
 # a row in place or inserts it (a table with another unique index), and
 # the chunk store doesn't grow for values that didn't change.  In another
 # encoding text is read (its size is only known converted back); bytea
-# isn't.  jsonb is read, so a document from history is checked; so is a
-# keyless table's row, matched by its values.
+# isn't.  A long jsonb document is a JSON tree, written back unread too
+# (it is checked as it is read); a keyless table's row is read, matched by
+# its values.
 
 use strict;
 use warnings FATAL => 'all';
@@ -98,16 +99,15 @@ for my $db ('postgres', 'latin1')
 							FROM generate_series(1, 3000) i)) AND n = id}), '3',
 		"$db: the values read back");
 
-	# jsonb, and a keyless table's rows, are read.
+	# jsonb's trees aren't read; a keyless table's rows are.
 	$sql->(q{
 		UPDATE a.jdocs SET j = j || '{"x": 1}';
 		SELECT length(dolt_commit('-am', 'jsonb')::text);
 	});
-	is(unread($db, q{SELECT FROM dolt_reset('--hard', 'HEAD~1')}), 'read',
-		"$db: a reset reads jsonb");
-	$sql->(q{SELECT FROM dolt_reset('--hard', 'HEAD~1')});
+	is(unread($db, q{SELECT FROM dolt_reset('--hard', 'HEAD~1')}), 'unread',
+		"$db: a reset writes jsonb's trees back unread");
 	is($sql->(q{SELECT count(*) FROM a.jdocs WHERE NOT j ? 'x'}), '3',
-		"$db: and writes it back");
+		"$db: and writes them back");
 	$sql->(q{
 		UPDATE a.keyless SET b = b || 'x';
 		SELECT length(dolt_commit('-am', 'keyless')::text);
