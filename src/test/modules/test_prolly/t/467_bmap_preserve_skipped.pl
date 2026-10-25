@@ -2,10 +2,10 @@
 
 # A page a share's first walk logged, changed in place (a row lock, a
 # prune) while the share has let go of the map's header to wait for another
-# page, and then skipped by the walk again: its image in the WAL is the page
-# as it was, which the change's own record follows.  The source and the
-# copy have the changed page on the primary, a standby, a base backup taken
-# across the share, and after a crash.
+# page: the walk again logs it again (redo of the share takes the images for
+# the pages as of the share), and skips the page logged and unchanged.  The
+# source and the copy have the changed page on the primary, a standby, a
+# base backup taken across the share, and after a crash.
 
 use strict;
 use warnings FATAL => 'all';
@@ -100,8 +100,9 @@ my $made = $op->query_safe(q{SELECT :'made'});
 $reader->quit;
 $locker->query_safe('COMMIT');
 $locker->quit;
-ok($node->poll_query_until('postgres', q{SELECT value = 3 FROM pg_stat_prolly
-	WHERE name = 'bmap_pages_preserved'}), 'page 0 not logged again');
+# (page 0 logged again, as changed since its image; page 1 skipped)
+ok($node->poll_query_until('postgres', q{SELECT value = 4 FROM pg_stat_prolly
+	WHERE name = 'bmap_pages_preserved'}), 'page 0 logged again, page 1 not');
 
 my $src = sql(qq{SELECT test_bmap_rows_digest($k)});
 my $cp = sql(qq{SELECT test_bmap_rows_digest($made)});

@@ -5386,13 +5386,34 @@ typedef struct PreserveWalk
 	Buffer		held;
 	HTAB	   *logged;			/* PreserveLogged, by physical block */
 	BlockNumber record_below;	/* recording 'logged' up to it, if valid */
+	XLogRecPtr	began;			/* the WAL's insert position as this walk began */
 } PreserveWalk;
 
 typedef struct PreserveLogged
 {
 	BlockNumber phys;			/* hash key */
 	BlockNumber blkno;
+	XLogRecPtr	since;			/* logged by a walk begun here */
 } PreserveLogged;
+
+/*
+ * The LSN of page 'blkno' of 'rel', without its content lock (the walk's
+ * held one if it holds it): a pin, and the buffer header's.
+ */
+static XLogRecPtr
+preserve_page_lsn(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk)
+{
+	Buffer		buf;
+	XLogRecPtr	lsn;
+
+	if (walk->held_block == blkno)
+		return PageGetLSN(BufferGetPage(walk->held));
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	lsn = BufferGetLSNAtomic(buf);
+	ReleaseBuffer(buf);
+	return lsn;
+}
 
 /* let go of the page the walk holds, if it does */
 static void
@@ -5475,6 +5496,7 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 			return false;
 		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
 		logged->blkno = blkno;
+		logged->since = walk->began;
 		return true;
 	}
 
@@ -5486,23 +5508,25 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 		return true;
 
 	/*
-	 * Logged by an earlier walk, and still named by the same entry: not
-	 * logged again.  Its image is in the WAL before the share's record, and
-	 * the block has kept the page since: the relation's writers are kept
-	 * out, so only a change of no row or a row lock's (a prune, a hint, a
-	 * SELECT FOR UPDATE) can have reached it in place, as one may reach a
-	 * page this walk logs before the share's record; those hold for the copy
-	 * too, or concern the source alone.  A change that moves the page (a
-	 * copy, a compaction's move) gives it another block, which is logged.
-	 * The block can't have held another page meanwhile: the map or changes
-	 * list naming it held it all along.  So recovery, a standby or a base
-	 * backup's redo gets the block the copy shares from the earlier image as
-	 * from a new one.
+	 * Logged by an earlier walk, still named by the same entry, and not
+	 * changed since: not logged again.  Its image is in the WAL before the
+	 * share's record, and is the page as it is: the relation's writers are
+	 * kept out, and a change that reached the page in place since (a prune,
+	 * a SELECT FOR UPDATE's lock, a hint logged) set its LSN past the
+	 * walk's beginning, so the page is logged again, as redo of the share
+	 * takes the images for the pages as of the share and writes nothing
+	 * else to the blocks.  A change that moves the page (a copy, a
+	 * compaction's move) gives it another block, which is logged.  The
+	 * block can't have held another page meanwhile: the map or changes list
+	 * naming it held it all along.  So recovery, a standby or a base
+	 * backup's redo gets the block the copy shares from the earlier image
+	 * as from a new one.
 	 */
 	if (walk->logged)
 	{
 		logged = hash_search(walk->logged, &phys, HASH_FIND, NULL);
-		if (logged && logged->blkno == blkno)
+		if (logged && logged->blkno == blkno &&
+			preserve_page_lsn(rel, blkno, walk) < logged->since)
 		{
 			if (walk->held_block == blkno)
 				preserve_release_held(walk);
@@ -5525,6 +5549,7 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	{
 		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
 		logged->blkno = blkno;
+		logged->since = walk->began;
 	}
 	return true;
 }
@@ -5693,6 +5718,7 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 		if (own)
 			own->n = 0;
 		walk.busy = InvalidBlockNumber;
+		walk.began = GetXLogInsertRecPtr();
 		done = tree_preserve(src, header->nblocks, header->epoch, &walk);
 		/* (a page held that the walk found no longer the relation's own) */
 		preserve_release_held(&walk);
