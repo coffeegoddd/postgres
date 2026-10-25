@@ -955,6 +955,7 @@ extern struct ProllyNodeCounters *pgstat_prolly_tree_counters(void);
 extern const char *pgstat_prolly_counter_name(PgStat_ProllyCounter c);
 extern void AtEOXact_PgStat_Prolly(void);
 extern PgStat_ProllyStats *pgstat_fetch_stat_prolly(Oid dboid);
+extern void pgstat_prolly_session_counts(PgStat_Counter *counts);
 
 /*
  * Functions in pgstat_database.c

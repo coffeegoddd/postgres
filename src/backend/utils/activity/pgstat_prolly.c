@@ -41,6 +41,9 @@ PgStat_Counter PendingProllyStats[PGSTAT_PROLLY_NUM_COUNTERS];
 /* what trees whose environments count here count */
 static ProllyNodeCounters PendingProllyTree;
 
+/* what this backend has flushed, since it began */
+static PgStat_Counter SessionProllyStats[PGSTAT_PROLLY_NUM_COUNTERS];
+
 static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_NODES_READ] = "nodes_read",
 	[PGSTAT_PROLLY_NODES_WRITTEN] = "nodes_written",
@@ -230,11 +233,30 @@ pgstat_prolly_flush_cb(bool nowait)
 	absorb_tree_counts();
 	shstats = (PgStatShared_Prolly *) entry_ref->shared_stats;
 	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+	{
 		shstats->stats.counts[i] += PendingProllyStats[i];
+		SessionProllyStats[i] += PendingProllyStats[i];
+	}
 	pgstat_unlock_entry(entry_ref);
 
 	memset(PendingProllyStats, 0, sizeof(PendingProllyStats));
 	return false;
+}
+
+/*
+ * What this backend has counted since it began, flushed or not, into
+ * counts[] (one for each counter): its own work alone, which other
+ * backends' doesn't move, for a caller measuring its own statements.
+ */
+void
+pgstat_prolly_session_counts(PgStat_Counter *counts)
+{
+	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+		counts[i] = SessionProllyStats[i] + PendingProllyStats[i];
+	counts[PGSTAT_PROLLY_NODES_READ] += PendingProllyTree.nodes_read;
+	counts[PGSTAT_PROLLY_NODES_WRITTEN] += PendingProllyTree.nodes_written;
+	counts[PGSTAT_PROLLY_VALUE_NODES_WRITTEN] +=
+		PendingProllyTree.value_nodes_written;
 }
 
 void

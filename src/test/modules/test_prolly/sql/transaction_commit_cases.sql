@@ -239,44 +239,45 @@ SET dolt.transaction_commit = off;
 INSERT INTO tcc.w SELECT g, 'v' || g FROM generate_series(1, 2000) g;
 SELECT length(dolt_commit('-Am', 'tcc cost')::text) AS committed;
 SET dolt.transaction_commit = on;
--- (Each is measured three times, and the least of each counter taken: the
--- counters are the database's, and what another process does for it
--- meanwhile, under load, only adds.)
+-- (Each is measured as what this backend counted over its statement: work
+-- other processes do for the database meanwhile, under load, counts in the
+-- database's counters, not here.  Measured three times, the least taken.)
 CREATE TEMP TABLE cost (k text, name text, value bigint);
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+CREATE TEMP TABLE snap (name text, value bigint);
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 10;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 13;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'clean' WHERE id = 14;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'clean', name, value FROM pg_stat_prolly;
+INSERT INTO cost SELECT 'clean', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
 SET dolt.transaction_commit = off;
 INSERT INTO tcc.o SELECT g, 'outside' || g FROM generate_series(1, 20000) g;
 UPDATE tcc.w SET v = 'outside' WHERE id > 1000;
 SET dolt.transaction_commit = on;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 11;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 15;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-SELECT pg_stat_reset_shared('prolly') IS NULL AS reset;
+INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
+DELETE FROM snap;
+INSERT INTO snap SELECT name, value FROM test_prolly_session_stats();
 UPDATE tcc.w SET v = 'busy' WHERE id = 16;
-SELECT pg_stat_force_next_flush() IS NULL AS flushed;
-INSERT INTO cost SELECT 'busy', name, value FROM pg_stat_prolly;
+INSERT INTO cost SELECT 'busy', s.name, s.value - p.value
+  FROM test_prolly_session_stats() s JOIN snap p USING (name);
 SELECT c.name, c.value = b.value AS same,
 	CASE WHEN c.name NOT LIKE 'fold\_%' THEN c.value > 0 END AS counted
   FROM (SELECT name, min(value) AS value FROM cost WHERE k = 'clean' GROUP BY name) c

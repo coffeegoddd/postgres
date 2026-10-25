@@ -21,10 +21,13 @@
 #include "catalog/branch.h"
 #include "catalog/pg_branch.h"
 #include "fmgr.h"
+#include "funcapi.h"
+#include "pgstat.h"
 #include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 /*
  * test_branch_switch(name): make the pg_branch row called name the session's
@@ -112,6 +115,31 @@ test_branches_written(PG_FUNCTION_ARGS)
  * virtual transaction (AnyLockHasWaiters(), which a paced fold asks before
  * each nap).
  */
+/*
+ * The engine's work counters as this backend alone has counted them, since
+ * it began (pgstat_prolly_session_counts()): one (name, value) row each.
+ */
+PG_FUNCTION_INFO_V1(test_prolly_session_stats);
+Datum
+test_prolly_session_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	PgStat_Counter counts[PGSTAT_PROLLY_NUM_COUNTERS];
+
+	InitMaterializedSRF(fcinfo, 0);
+	pgstat_prolly_session_counts(counts);
+	for (int i = 0; i < PGSTAT_PROLLY_NUM_COUNTERS; i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+
+		values[0] = CStringGetTextDatum(pgstat_prolly_counter_name(i));
+		values[1] = Int64GetDatum(counts[i]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
 PG_FUNCTION_INFO_V1(test_any_lock_has_waiters);
 Datum
 test_any_lock_has_waiters(PG_FUNCTION_ARGS)
