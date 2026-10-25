@@ -74,7 +74,11 @@
  *	'L' commit	-> the relations the commit was made from, as this database
  *				   made it (commits fetched, cloned or pushed here have
  *				   none): a line for each prolly table, partitioned
- *				   table and materialized view: its OID and its owner's
+ *				   table and materialized view, and for each other object
+ *				   a commit may hold (the canonicalizer's
+ *				   prolly_owned_objects(): views, sequences, foreign
+ *				   tables, routines, types, schemas, collations, each
+ *				   named as commits' items name it): its OID and its owner's
  *				   (10 digits each, a space after each), its kind (its
  *				   relkind, then a space), its owner's name (escaped as
  *				   the name is, and a space as a backslash and 's'; a
@@ -4728,11 +4732,7 @@ relation_lines(const char *data)
 			goto bad;
 		r->owner = (Oid) strtoul(p + 11, NULL, 10);
 		r->relkind = p[22];
-		if ((r->relkind != RELKIND_RELATION &&
-			 r->relkind != RELKIND_PARTITIONED_TABLE &&
-			 r->relkind != RELKIND_MATVIEW && r->relkind != RELKIND_VIEW &&
-			 r->relkind != RELKIND_SEQUENCE &&
-			 r->relkind != RELKIND_FOREIGN_TABLE) ||
+		if (strchr("rpmvSfPTNC", r->relkind) == NULL || r->relkind == '\0' ||
 			p[23] != ' ')
 			goto bad;
 		c = p + 24;
@@ -4782,9 +4782,23 @@ prolly_record_relation_name(const char *nspname, const char *relname)
 	return name;
 }
 
+/* A line of table_names() for another object (prolly_owned_objects()) */
+static void
+owned_object_line(Oid oid, Oid owner, char kind, const char *name, void *arg)
+{
+	List	  **lines = arg;
+	StringInfoData line;
+
+	initStringInfo(&line);
+	relation_line(&line, oid, owner, kind, name);
+	*lines = lappend(*lines, line.data);
+}
+
 /*
- * The session's prolly tables and partitioned tables, each a
- * relation_line(), by relid: as the branch's catalog names them now.
+ * The session's prolly tables, partitioned tables and materialized views,
+ * each a relation_line(), by relid: as the branch's catalog names them now;
+ * and each other object a commit may hold (prolly_owned_objects()), so that
+ * a move making one from a commit made of them finds its owner.
  */
 static void
 table_names(StringInfo out)
@@ -4814,6 +4828,7 @@ table_names(StringInfo out)
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	prolly_owned_objects(owned_object_line, &lines);
 	list_sort(lines, line_cmp);
 	foreach(lc, lines)
 		appendStringInfoString(out, lfirst(lc));
