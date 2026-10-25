@@ -6386,8 +6386,30 @@ received_id(const char *key)
 }
 
 /*
+ * A received file that couldn't be stat'ed or opened (errno says why),
+ * closed: raised, unless it is missing.
+ */
+static void
+received_open_failed(TableFile *t)
+{
+	int			save_errno = errno;
+	char	   *path = pstrdup(t->path);
+
+	close_table(t);
+	errno = save_errno;
+	if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+	pfree(path);
+}
+
+/*
  * The received file id of database directory dir, opened in cxt: NULL if
- * it isn't there whole (missing, or cut short).
+ * it isn't there whole (missing, or cut short: the format finds no whole
+ * file in its bytes).  Any other error (a file that can't be opened or
+ * read, running out of memory, a cancel) is raised, the file closed: it
+ * says nothing of whether the file is whole.
  */
 static TableFile *
 open_received(const char *dir, uint64 id, MemoryContext cxt)
@@ -6402,28 +6424,27 @@ open_received(const char *dir, uint64 id, MemoryContext cxt)
 	MemoryContextSwitchTo(old);
 	if (stat(t->path, &st) != 0)
 	{
-		close_table(t);
+		received_open_failed(t);
 		return NULL;
 	}
 	t->size = st.st_size;
 	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
 	if (t->file < 0)
 	{
-		close_table(t);
+		received_open_failed(t);
 		return NULL;
 	}
-	/* (a format raising an error on a damaged file: not whole, either) */
-	old = CurrentMemoryContext;
 	PG_TRY();
 	{
+		INJECTION_POINT("prolly-received-open", NULL);
 		t->tf = PROLLY_CALL(table_format(), open, table_file_read,
 							table_file_map, t, t->size, cxt);
 	}
 	PG_CATCH();
 	{
-		MemoryContextSwitchTo(old);
-		FlushErrorState();
 		t->tf = NULL;
+		close_table(t);
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (t->tf == NULL)
@@ -6474,25 +6495,37 @@ received_tables(ProllyChunkStore *s)
 {
 	char	   *dir;
 	List	   *ids;
+	List	   *volatile opened = NIL;
 
 	if (s->received_open)
 		return s->received;
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	ids = received_ids(dir);
-	foreach_ptr(uint64, id, ids)
+	/* (listed only once all are opened: an error leaves none listed) */
+	PG_TRY();
 	{
-		TableFile  *t = open_received(dir, *id, TopMemoryContext);
-
-		if (t)
+		foreach_ptr(uint64, id, ids)
 		{
-			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+			TableFile  *t = open_received(dir, *id, TopMemoryContext);
 
-			s->received = lappend(s->received, t);
-			MemoryContextSwitchTo(old);
+			if (t)
+			{
+				MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+				opened = lappend(opened, t);
+				MemoryContextSwitchTo(old);
+			}
 		}
 	}
+	PG_CATCH();
+	{
+		close_tables(opened);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	list_free_deep(ids);
 	pfree(dir);
+	s->received = opened;
 	s->received_open = true;
 	return s->received;
 }

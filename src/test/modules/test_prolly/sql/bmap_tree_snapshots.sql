@@ -90,6 +90,26 @@ SELECT count(*) FROM test_bmap_snapshots(:small);
 DROP TABLE small, big;
 SELECT * FROM prolly_page_sweep();
 
+-- A snapshot after one page changed walks the own nodes of the path copied
+-- for it, a node of every leaf of the relation among them: their counts are
+-- read a count page at a time, not a page read for each child.
+CREATE TABLE wide (a int, b text) WITH (fillfactor = 10);
+INSERT INTO wide SELECT g, repeat('w', 200) FROM generate_series(1, 30000) g;
+SELECT pg_relation_filenode('wide') AS wide \gset
+SELECT count(*) FILTER (WHERE level = 0) > 16 AS many_leaves,
+	max(level) AS levels
+FROM test_bmap_tree(:wide);
+SELECT test_bmap_snapshot_take(:wide) AS w1 \gset
+UPDATE wide SET b = 'x' WHERE a = 29000;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT test_bmap_snapshot_take(:wide) AS w2 \gset
+SELECT pg_stat_force_next_flush();
+SELECT value BETWEEN 1 AND 6 AS counts_read_by_page
+FROM pg_stat_prolly WHERE name = 'bmap_refcount_reads';
+DROP TABLE wide;
+SELECT freed, recounted FROM prolly_page_sweep();
+
 -- at most 16
 CREATE TABLE many (a int);
 INSERT INTO many VALUES (1);
