@@ -1643,29 +1643,24 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	pfree(v.data);
 }
 
-typedef struct FindBranch
-{
-	const char *name;
-	Oid			branch;
-} FindBranch;
-
-static void
-find_branch(const char *name, Oid branch, void *arg)
-{
-	FindBranch *fb = arg;
-
-	if (strcmp(name, fb->name) == 0)
-		fb->branch = branch;
-}
-
-/* The id of the branch called name; InvalidOid if there's none. */
+/*
+ * The id of the branch called name; InvalidOid if there's none (its
+ * pg_branch row found by its name, as the session sees the catalog).
+ */
 static Oid
 branch_oid(const char *name)
 {
-	FindBranch	fb = {name, InvalidOid};
+	HeapTuple	tup;
+	Oid			oid;
 
-	branch_ops()->branches(find_branch, &fb);
-	return fb.branch;
+	if (strlen(name) >= NAMEDATALEN)
+		return InvalidOid;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	oid = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+	return oid;
 }
 
 /*
@@ -3889,31 +3884,53 @@ note_made(const char *name, Oid branch, void *arg)
 	(void) hash_search((HTAB *) arg, name, HASH_ENTER, NULL);
 }
 
-/* Visit the branches that have only a head (not yet copies). */
+/*
+ * Visit the branches that have only a head (not yet copies); with prefix,
+ * only those named with it, the refs' branch entries read from the first
+ * such on (they are in name order), and each asked of the catalog alone.
+ */
 static void
-visit_head_only(void (*visit) (const char *name, void *arg), void *arg)
+visit_head_only(const char *prefix,
+				void (*visit) (const char *name, void *arg), void *arg)
 {
 	ProllyNodeRef root;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
-	ProllyKey	start = {(const uint8 *) "B", 1};
+	StringInfoData from;
+	ProllyKey	start;
 	List	   *names = NIL;
 	ListCell   *lc;
 
 	if (!refs_root(&root))
 		return;
+	initStringInfo(&from);
+	appendStringInfoChar(&from, TAG_BRANCH);
+	if (prefix != NULL)
+		appendStringInfoString(&from, prefix);
+	start.data = (const uint8 *) from.data;
+	start.len = from.len;
 	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, c, &start, ForwardScanDirection);
 	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
-		if (k.len < 1 || k.data[0] != TAG_BRANCH)
+		if (k.len < from.len || memcmp(k.data, from.data, from.len) != 0)
 			break;
 		names = lappend(names, pnstrdup((const char *) k.data + 1, k.len - 1));
 	}
 	PROLLY_CALL(tree, cursor_close, c);
+	pfree(from.data);
 	if (names == NIL)
 		return;
+	if (prefix != NULL)
+	{
+		foreach(lc, names)
+		{
+			if (!OidIsValid(branch_oid(lfirst(lc))))
+				visit(lfirst(lc), arg);
+		}
+		return;
+	}
 
 	/* (the branches with copies, read once) */
 	{
@@ -6256,7 +6273,18 @@ copies_branches(ProllyBranchVisit visit, void *arg)
 
 	refs_init();
 	branch_ops()->branches(visit_branch, &vb);
-	visit_head_only(visit_head_only_branch, &vb);
+	visit_head_only(NULL, visit_head_only_branch, &vb);
+}
+
+/* The same, of the branches named with prefix alone. */
+static void
+copies_branches_named(const char *prefix, ProllyBranchVisit visit, void *arg)
+{
+	VisitBranches vb = {visit, arg};
+
+	refs_init();
+	branch_ops()->branches_named(prefix, visit_branch, &vb);
+	visit_head_only(prefix, visit_head_only_branch, &vb);
 }
 
 /* A branch's versioned schemas as they are, folded: its working set. */
@@ -8877,6 +8905,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_identity = copies_working_identity,
 	.anchor_identity = copies_anchor_identity,
 	.branches = copies_branches,
+	.branches_named = copies_branches_named,
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,
 	.read_definitions = copies_read_definitions,

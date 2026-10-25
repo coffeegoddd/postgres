@@ -108,6 +108,13 @@ typedef struct BranchOpsRoutine
 	void		(*branches) (BranchVisit visit, void *arg);
 
 	/*
+	 * Visit the branches whose names begin with prefix, in name order: the
+	 * work is in those, however many other branches there are.
+	 */
+	void		(*branches_named) (const char *prefix, BranchVisit visit,
+								   void *arg);
+
+	/*
 	 * Run fn with the session on branch name, back on its own branch after,
 	 * whatever happens.
 	 */

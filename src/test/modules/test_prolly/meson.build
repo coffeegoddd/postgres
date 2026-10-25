@@ -111,6 +111,7 @@ tests += {
       'share_layouts',
       'checkout_table_work',
       'branch_switch_caches',
+      'checkout_branch_count',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',

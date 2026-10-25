@@ -826,6 +826,14 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*last_fold) (Snapshot snap, ProllyNodeRef *root,
 							  ProllyFoldMark *mark);
+
+	/*
+	 * Optional: visit the branches whose names begin with prefix, as
+	 * branches() visits them: the work is in those, however many other
+	 * branches there are.
+	 */
+	void		(*branches_named) (const char *prefix, ProllyBranchVisit visit,
+								   void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -886,9 +894,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", "relation_class", "set_relation_class", \
-	"made_object", "stash_set_maker", "last_fold"
+	"made_object", "stash_set_maker", "last_fold", "branches_named"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK last_fold
+#define PROLLY_REFS_LAST_CALLBACK branches_named
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
