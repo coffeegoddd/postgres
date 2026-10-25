@@ -12560,6 +12560,66 @@ forget_cached_size(RelFileLocator rel)
 	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 }
 
+/*
+ * The page stores whose shrinks crash recovery replayed: each truncated
+ * once the replay is done, to its high-water mark then (see the replay of
+ * XLOG_BMAP_SHRINK).  The startup process's alone.
+ */
+static List *shrink_deferred = NIL;
+
+static void
+shrink_deferred_add(RelFileLocator rel)
+{
+	RelFileLocator *r;
+	MemoryContext old;
+
+	rel.relNumber = InvalidRelFileNumber;
+	foreach_ptr(RelFileLocator, d, shrink_deferred)
+	{
+		if (RelFileLocatorEquals(*d, rel))
+			return;
+	}
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	r = palloc(sizeof(RelFileLocator));
+	*r = rel;
+	shrink_deferred = lappend(shrink_deferred, r);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * At the end of the replay: each page store a replayed shrink shortened is
+ * cut to its high-water mark as the replay left it.  Every block from
+ * there on is free, whatever the shrink and the extensions after it gave
+ * out between them; one below it that a later extension took again keeps
+ * what it holds.  A store gone since (its database dropped) is passed over.
+ */
+void
+bmap_xlog_cleanup(void)
+{
+	foreach_ptr(RelFileLocator, d, shrink_deferred)
+	{
+		RelFileLocator rel = *d;
+		SMgrRelation store = store_smgr(rel);
+		Buffer		metabuf;
+		BlockNumber hw;
+		BlockNumber nblocks;
+
+		if (!smgrexists(store, MAIN_FORKNUM) || !alloc_exists(rel))
+			continue;
+		metabuf = alloc_read(rel, 0);
+		LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+		hw = PageGetBmapMeta(BufferGetPage(metabuf))->hw;
+		UnlockReleaseBuffer(metabuf);
+		nblocks = smgrnblocks(store, MAIN_FORKNUM);
+		if (nblocks > hw)
+			smgrtruncate(store, &(ForkNumber) {MAIN_FORKNUM}, 1,
+						 &nblocks, &hw);
+	}
+	list_free_deep(shrink_deferred);
+	shrink_deferred = NIL;
+}
+
 void
 bmap_redo(XLogReaderState *record)
 {
@@ -12622,6 +12682,26 @@ bmap_redo(XLogReaderState *record)
 				SMgrRelation store = store_smgr(xlrec->locator);
 
 				redo_block(record, 0);
+
+				/*
+				 * In crash recovery the truncation waits for the end of the
+				 * replay (bmap_xlog_cleanup()).  The blocks cut off may have
+				 * been handed out again after the shrink, holding pages
+				 * that no record writes: those of a relation whose writes
+				 * skip WAL (always given blocks from the high-water mark,
+				 * synced at commit), and at wal_level minimal those a share
+				 * or snapshot syncs rather than logs, whose making the
+				 * replay skips once their relation was dropped.  Cut here,
+				 * the later extension's replay would find them past the
+				 * file and extend it with zeroes.  A standby replays WAL
+				 * written for one, which logs every such page, and
+				 * truncates as the primary did.
+				 */
+				if (!StandbyMode)
+				{
+					shrink_deferred_add(xlrec->locator);
+					break;
+				}
 
 				/*
 				 * The minimum recovery point past the record first, as

@@ -123,7 +123,8 @@ typedef struct xl_bmap_unref
 /*
  * SHRINK's main data: the page store, its high-water mark before and after
  * (the blocks between free).  The metapage's delta comes as block 0; redo
- * truncates the store too.
+ * truncates the store too: a standby's at once, crash recovery's once the
+ * replay is done (bmap_xlog_cleanup()).
  */
 typedef struct xl_bmap_shrink
 {
@@ -478,6 +479,7 @@ typedef struct BmapChange
 } BmapChange;
 
 extern void bmap_redo(XLogReaderState *record);
+extern void bmap_xlog_cleanup(void);
 extern void bmap_desc(StringInfo buf, XLogReaderState *record);
 extern const char *bmap_identify(uint8 info);
 extern void bmap_mask(char *pagedata, BlockNumber blkno);

@@ -48,5 +48,5 @@ PG_RMGR(RM_REPLORIGIN_ID, "ReplicationOrigin", replorigin_redo, replorigin_desc,
 PG_RMGR(RM_GENERIC_ID, "Generic", generic_redo, generic_desc, generic_identify, NULL, NULL, generic_mask, NULL)
 PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, logicalmsg_identify, NULL, NULL, NULL, logicalmsg_decode)
 PG_RMGR(RM_XLOG2_ID, "XLOG2", xlog2_redo, xlog2_desc, xlog2_identify, NULL, NULL, NULL, xlog2_decode)
-PG_RMGR(RM_BMAP_ID, "BlockMap", bmap_redo, bmap_desc, bmap_identify, NULL, NULL, bmap_mask, NULL)
+PG_RMGR(RM_BMAP_ID, "BlockMap", bmap_redo, bmap_desc, bmap_identify, NULL, bmap_xlog_cleanup, bmap_mask, NULL)
 PG_RMGR(RM_PROLLY_CHUNKS_ID, "ProllyChunks", prolly_chunks_redo, prolly_chunks_desc, prolly_chunks_identify, NULL, NULL, NULL, NULL)
