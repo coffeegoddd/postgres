@@ -9216,7 +9216,15 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 
 	if (!compact_has_room(rel, phys))
 		return false;
-	INJECTION_POINT("bmap-compact-room", NULL);
+#ifdef USE_INJECTION_POINTS
+	{
+		/* (the relation's file number, for a test to stop at one only) */
+		char		relnumber[16];
+
+		snprintf(relnumber, sizeof(relnumber), "%u", rel.relNumber);
+		INJECTION_POINT("bmap-compact-room", relnumber);
+	}
+#endif
 
 	/*
 	 * Asked first without the page: preparing its buffer for the change
