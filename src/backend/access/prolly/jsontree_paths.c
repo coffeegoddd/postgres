@@ -1105,19 +1105,55 @@ path_index(const char *s, int *index)
 	return end != s && *end == '\0' && errno == 0;
 }
 
+/*
+ * The number of elements of the array at path (of kind PATH_ARRAY), from
+ * its last element's key: one backward seek.
+ */
+static int64
+array_size(ProllyTreeCursor *c, const StringInfo path)
+{
+	const ProllyTreeRoutine *tree = doc_tree();
+	StringInfoData last;
+	ProllyKey	seek;
+	ProllyKey	k;
+	ProllyValue v;
+	int64		size = -1;
+
+	/* (no index is this large: a jsonb array has fewer than 2^28) */
+	initStringInfo(&last);
+	appendBinaryStringInfo(&last, path->data, path->len);
+	put_index_step(&last, PG_UINT32_MAX);
+	seek.data = (const uint8 *) last.data;
+	seek.len = (uint32) last.len;
+	PROLLY_CALL(tree, cursor_seek, c, &seek, BackwardScanDirection);
+	if (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		(int) k.len >= path->len + STEP_HEADER &&
+		memcmp(k.data, path->data, path->len) == 0 &&
+		k.data[path->len] == STEP_INDEX)
+		size = (int64) get_u32(k.data + path->len + 1) + 1;
+	pfree(last.data);
+	if (size <= 0)
+		bad_tree("an array of no elements of its own");
+	return size;
+}
+
 /* What descending a path step found. */
 typedef enum Descent
 {
 	DESCENT_FOUND,				/* path names a step */
-	DESCENT_NOT_HANDLED,		/* a step only a whole read handles */
+	DESCENT_NONE,				/* an index before an array's start */
 	DESCENT_NOT_INTEGER,		/* an array's step that isn't an integer */
 } Descent;
 
-/* The step for elem from the container at path (of kind), onto path. */
+/*
+ * The step for elem from the container at path (of kind), onto path; a
+ * negative index counts from the array's end, as #> counts it.
+ */
 static Descent
-descend(PathKind kind, const char *elem, StringInfo path)
+descend(ProllyTreeCursor *c, PathKind kind, const char *elem, StringInfo path)
 {
 	int			index;
+	int64		at;
 
 	if (kind == PATH_OBJECT)
 	{
@@ -1127,9 +1163,14 @@ descend(PathKind kind, const char *elem, StringInfo path)
 	Assert(kind == PATH_ARRAY);
 	if (!path_index(elem, &index))
 		return DESCENT_NOT_INTEGER;
-	if (index < 0)
-		return DESCENT_NOT_HANDLED;
-	put_index_step(path, (uint32) index);
+	at = index;
+	if (at < 0)
+	{
+		at += array_size(c, path);
+		if (at < 0)
+			return DESCENT_NONE;
+	}
+	put_index_step(path, (uint32) at);
 	return DESCENT_FOUND;
 }
 
@@ -1193,7 +1234,6 @@ paths_get(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	StringInfoData p;
 	StringInfoData item;
 	PathKind	kind;
-	bool		handled = true;
 
 	doc_env(env, &denv);
 	c = PROLLY_CALL(tree, cursor_open, &denv, root, CurrentMemoryContext);
@@ -1208,13 +1248,8 @@ paths_get(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 				 "an item where its container is");
 	for (int i = 0; i < npath; i++)
 	{
-		Descent		d = descend(kind, path[i], &p);
-
-		if (d != DESCENT_FOUND)
-		{
-			handled = (d != DESCENT_NOT_HANDLED);
+		if (descend(c, kind, path[i], &p) != DESCENT_FOUND)
 			break;
-		}
 		kind = path_kind(c, &p, &item);
 		if (kind == PATH_NONE)
 			break;
@@ -1246,7 +1281,28 @@ paths_get(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	PROLLY_CALL(tree, cursor_close, c);
 	pfree(p.data);
 	pfree(item.data);
-	return handled;
+	return true;
+}
+
+static enum jbvType
+paths_kind(const ProllyTreeEnv *env, const ProllyNodeRef *root)
+{
+	const ProllyTreeRoutine *tree = doc_tree();
+	ProllyTreeEnv denv;
+	ProllyTreeCursor *c;
+	StringInfoData p;
+	PathKind	kind;
+
+	doc_env(env, &denv);
+	c = PROLLY_CALL(tree, cursor_open, &denv, root, CurrentMemoryContext);
+	initStringInfo(&p);
+	kind = path_kind(c, &p, NULL);
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(p.data);
+	if (kind != PATH_OBJECT && kind != PATH_ARRAY)
+		bad_tree(kind == PATH_NONE ? "a document of no items" :
+				 "an item where its container is");
+	return kind == PATH_OBJECT ? jbvObject : jbvArray;
 }
 
 /* ------------------------------------------------------------------------
@@ -1568,16 +1624,17 @@ paths_set(const ProllyTreeEnv *env, const ProllyNodeRef *root, char **path,
 	{
 		bool		last = (i == npath - 1);
 
-		if (kind == PATH_ARRAY)
+		/* only an element that is there is replaced here */
+		if (kind == PATH_ARRAY && !path_index(path[i], &index))
 		{
-			/* only an element that is there is replaced here */
-			if (!path_index(path[i], &index) || index < 0)
-			{
-				PROLLY_CALL(tree, cursor_close, c);
-				return false;
-			}
+			PROLLY_CALL(tree, cursor_close, c);
+			return false;
 		}
-		(void) descend(kind, path[i], &p);
+		if (descend(c, kind, path[i], &p) != DESCENT_FOUND)
+		{
+			PROLLY_CALL(tree, cursor_close, c);
+			return false;
+		}
 		if (path_kind(c, &p, &item) == PATH_NONE)
 		{
 			/* past an array's end: only a whole edit appends */
@@ -1822,6 +1879,7 @@ const ProllyJsonTreeRoutine prolly_jsontree_paths = {
 	.build = paths_build,
 	.read = paths_read,
 	.get = paths_get,
+	.kind = paths_kind,
 	.set = paths_set,
 	.diff = paths_diff,
 	.diff_documents = paths_diff_documents,

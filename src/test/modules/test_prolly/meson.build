@@ -206,6 +206,7 @@ tests += {
       'table_settings',
       'jsonb_canonical',
       'structural_jsonb',
+      'jsonb_tree_operators',
       'float_canonical',
       'send_canonical',
       'receive_refusals',
