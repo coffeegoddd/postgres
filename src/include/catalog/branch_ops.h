@@ -153,11 +153,15 @@ typedef struct BranchOpsRoutine
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 *
-	 * A lock held by a page sweep (bmap_compaction_let_go()) is waited
-	 * for, here and in restore() and share_kept(), the sweep asked to let
-	 * go: within lock_timeout of *wait_start, the operation's (0 until one
-	 * of its tries first waits, which sets it), so that lock_timeout bounds
-	 * the waits of all the calls one operation makes.
+	 * A lock not free at once is waited for, here and in restore() and
+	 * share_kept(), its holder asked to let go if it is a page sweep
+	 * (bmap_compaction_let_go()) or to cancel if it is an autovacuum
+	 * worker, but never queued for: within lock_timeout of *wait_start,
+	 * the operation's (0 until one of its tries first waits, which sets
+	 * it), or deadlock_timeout if lock_timeout is 0 (a sweep is waited out
+	 * then), so that one bound covers the waits of all the calls one
+	 * operation makes.  In those three, a lock taken "without waiting" is
+	 * one not queued for, tried until that bound.
 	 */
 	bool		(*share) (Oid source, List *relids,
 						  bool (*unchanged) (void *arg), void *arg,

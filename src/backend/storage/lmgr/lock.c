@@ -3409,6 +3409,60 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 }
 
 /*
+ * CancelAutoVacuumHolders
+ *		Ask each autovacuum worker holding a lock that conflicts with
+ *		lockmode on locktag to cancel its task, as ProcSleep() asks one
+ *		that blocks a lock waiter, but for a caller that only tries the
+ *		lock: it isn't in the lock's queue, so the deadlock check that would
+ *		find the worker never runs.  A worker vacuuming to prevent
+ *		wraparound is left alone.  Returns how many were asked; the caller
+ *		tries the lock again once they have let go.
+ */
+int
+CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode)
+{
+	VirtualTransactionId *holders;
+	int			nholders;
+	int			nasked = 0;
+
+	holders = GetLockConflicts(locktag, lockmode, &nholders);
+	for (int i = 0; i < nholders; i++)
+	{
+		PGPROC	   *proc = ProcNumberGetProc(holders[i].procNumber);
+		int			pid = 0;
+
+		if (proc == NULL)
+			continue;
+
+		/* (still the transaction found holding it, and an autovacuum's) */
+		LWLockAcquire(ProcArrayLock, LW_SHARED);
+		if (proc->vxid.lxid == holders[i].localTransactionId)
+		{
+			uint8		statusFlags = ProcGlobal->statusFlags[proc->pgxactoff];
+
+			if ((statusFlags & PROC_IS_AUTOVACUUM) &&
+				!(statusFlags & PROC_VACUUM_FOR_WRAPAROUND))
+				pid = proc->pid;
+		}
+		LWLockRelease(ProcArrayLock);
+		if (pid == 0)
+			continue;
+
+		ereport(DEBUG1,
+				(errmsg_internal("sending cancel to autovacuum PID %d holding a lock process %d tries for",
+								 pid, MyProcPid)));
+		/* (one gone meanwhile isn't complained of, as in ProcSleep()) */
+		if (kill(pid, SIGINT) < 0 && errno != ESRCH)
+			ereport(WARNING,
+					(errmsg("could not send signal to process %d: %m", pid)));
+		nasked++;
+	}
+	if (!InHotStandby)
+		pfree(holders);
+	return nasked;
+}
+
+/*
  * Find a lock in the shared lock table and release it.  It is the caller's
  * responsibility to verify that this is a sane thing to do.  (For example, it
  * would be bad to release a lock here if there might still be a LOCALLOCK
