@@ -1178,6 +1178,87 @@ test_refs_value(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(out);
 }
 
+/* hex of n bytes */
+static char *
+bytes_hex(const uint8 *p, int n)
+{
+	StringInfoData s;
+
+	initStringInfo(&s);
+	for (int i = 0; i < n; i++)
+		appendStringInfo(&s, "%02x", p[i]);
+	return s.data;
+}
+
+/*
+ * test_refs_index(): the refs' index entries, from the chunk store's root
+ * (what committed): each one's tag; the branch it names; what it is keyed
+ * by, in hex (the hashes, length first, and a root's kind byte), or for
+ * the case-folded names the name folded; and its value, in hex.
+ */
+PG_FUNCTION_INFO_V1(test_refs_index);
+Datum
+test_refs_index(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef refs;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	prolly_folded_tree_env(&env);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	if (refs.hash.len == 0)
+		return (Datum) 0;
+	c = PROLLY_CALL(tree, cursor_open, &env, &refs, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+		char		tag = k.len > 0 ? (char) k.data[0] : 0;
+		const uint8 *p = k.data + 1;
+		const uint8 *end = k.data + k.len;
+		int			skip = 0;
+		char	   *keyed;
+
+		if (tag == 'k' || tag == 'r')
+			skip = 1;
+		else if (tag == 's')
+			skip = 2;
+		else if (tag != 'h' && tag != 'f')
+			continue;
+		for (int i = 0; i < skip && p < end; i++)
+			p += 1 + p[0];
+		if (tag == 'r')
+			p++;
+		if (tag == 'f')
+		{
+			const uint8 *nul = memchr(p, '\0', end - p);
+
+			if (nul == NULL)
+				continue;
+			keyed = pnstrdup((const char *) p, nul - p);
+			p = nul + 1;
+		}
+		else
+			keyed = bytes_hex(k.data + 1, p - (k.data + 1));
+		if (p > end)
+			continue;
+		values[0] = CStringGetTextDatum(pnstrdup(&tag, 1));
+		values[1] = PointerGetDatum(cstring_to_text_with_len((const char *) p, end - p));
+		values[2] = CStringGetTextDatum(keyed);
+		values[3] = CStringGetTextDatum(bytes_hex(v.data, v.len));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	return (Datum) 0;
+}
+
 /*
  * test_transaction_bytes(): the memory the transaction's context and its
  * children hold now, in bytes.

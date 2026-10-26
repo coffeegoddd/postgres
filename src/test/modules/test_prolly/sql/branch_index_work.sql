@@ -1,0 +1,222 @@
+-- A branch's making, a first use (of kept pages, of the nearest branch, or
+-- of the branch the move planner estimates cheapest) and a move that
+-- shares other branches' pages find the branches they need through the
+-- refs' indexes (of kept commits by commit and by table, of branches by
+-- their heads' and baselines' roots, of names case folded) and the
+-- generation table, not by listing every branch: so branches_listed (the
+-- branches listings visit) is the same with 200 branches as with 2, and
+-- the estimator lists only its candidates, in name order.  The indexes
+-- change with what they index: they move with a branch's rename, go with
+-- its delete, and roll back with the transaction.
+-- (In a database of its own: other tests' branches would be listed too.)
+
+SELECT current_database() AS home \gset
+CREATE DATABASE branch_index_work;
+\c branch_index_work
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE TEMP TABLE runs (branches int, what text, listed int8);
+CREATE FUNCTION pg_temp.used(int, int) RETURNS int8 LANGUAGE sql AS $$
+	SELECT count(dolt_branch('bix_' || lpad(g::text, 4, '0'))) +
+		   count(dolt_checkout('bix_' || lpad(g::text, 4, '0')))
+	FROM generate_series($1, $2) g
+$$;
+
+CREATE SCHEMA bix VERSIONED;
+CREATE TABLE bix.t (id int PRIMARY KEY, v int);
+INSERT INTO bix.t SELECT g, g FROM generate_series(1, 200) g;
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+SELECT pg_temp.used(1, 2) > 0 AS made;
+SELECT (dolt_checkout('main'))[1];
+
+-- Each operation, with n branches: a branch's making; its first use at
+-- main's head, made of the pages main keeps as of it; with no pages kept,
+-- a first use at a root main's working set is at (the nearest branch); a
+-- first use at a commit no branch is at (the estimator's candidates); and
+-- a fast-forward merge, whose move shares pages where it can.
+CREATE FUNCTION pg_temp.measure(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	UPDATE bix.t SET v = v + 1 WHERE id = 1;
+	PERFORM dolt_commit('-am', 'c1 ' || n);
+	UPDATE bix.t SET v = v + 1 WHERE id = 2;
+	PERFORM dolt_commit('-am', 'c2 ' || n);
+END $$;
+CREATE FUNCTION pg_temp.record(n int, what text) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO runs SELECT n, what, pg_temp.since('branches_listed')
+$$;
+
+\set n 2
+-- (n branches)
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT dolt_branch('bix_new_' || :n) IS NOT NULL AS made;
+:flush
+SELECT pg_temp.record(:n, 'create');
+SELECT (dolt_checkout('bix_new_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use kept');
+SELECT (dolt_checkout('main'))[1];
+SET prolly.kept_commits = 0;
+SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_checkout('bix_near_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use nearest');
+SELECT (dolt_checkout('main'))[1];
+SELECT pg_temp.measure(:n);
+SELECT dolt_branch('bix_old_' || :n, 'HEAD~1') IS NOT NULL AS made;
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_checkout('bix_old_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use estimated');
+SELECT (dolt_checkout('main'))[1];
+RESET prolly.kept_commits;
+SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
+SELECT (dolt_checkout('bix_ff_' || :n))[1];
+UPDATE bix.t SET v = v + 1 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'ff ' || :n)::text) > 0 AS committed;
+SELECT (dolt_checkout('main'))[1];
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_merge('bix_ff_' || :n))[2] AS fast_forward;
+:flush
+SELECT pg_temp.record(:n, 'fast-forward merge');
+SELECT pg_temp.used(3, 200) > 0 AS made;
+SELECT (dolt_checkout('main'))[1];
+\set n 200
+-- (n branches)
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT dolt_branch('bix_new_' || :n) IS NOT NULL AS made;
+:flush
+SELECT pg_temp.record(:n, 'create');
+SELECT (dolt_checkout('bix_new_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use kept');
+SELECT (dolt_checkout('main'))[1];
+SET prolly.kept_commits = 0;
+SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_checkout('bix_near_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use nearest');
+SELECT (dolt_checkout('main'))[1];
+SELECT pg_temp.measure(:n);
+SELECT dolt_branch('bix_old_' || :n, 'HEAD~1') IS NOT NULL AS made;
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_checkout('bix_old_' || :n))[1];
+:flush
+SELECT pg_temp.record(:n, 'first use estimated');
+SELECT (dolt_checkout('main'))[1];
+RESET prolly.kept_commits;
+SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
+SELECT (dolt_checkout('bix_ff_' || :n))[1];
+UPDATE bix.t SET v = v + 1 WHERE id = 4;
+SELECT length(dolt_commit('-am', 'ff ' || :n)::text) > 0 AS committed;
+SELECT (dolt_checkout('main'))[1];
+:flush
+SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
+SELECT (dolt_merge('bix_ff_' || :n))[2] AS fast_forward;
+:flush
+SELECT pg_temp.record(:n, 'fast-forward merge');
+
+SELECT what, a.listed AS with_2, b.listed AS with_200,
+	CASE WHEN what = 'first use estimated' THEN b.listed <= 17 + 2
+		 ELSE a.listed = b.listed END AS bounded
+FROM runs a JOIN runs b USING (what)
+WHERE a.branches = 2 AND b.branches = 200
+ORDER BY what;
+
+-- A name that differs from a branch's only by case is still refused.
+SELECT dolt_branch('BIX_0002');
+SELECT dolt_branch('-m', 'bix_0003', 'Bix_0002');
+
+-- The indexes, as committed, against what they index: each branch with a
+-- head has its head's root ('h', and 'r' kind 'h' under that root) and
+-- its name folded ('f'); each kept commit its 'k' entry.
+CREATE FUNCTION pg_temp.ix() RETURNS TABLE (tag text, branch text, keyed text,
+	value text) LANGUAGE sql AS $$ SELECT * FROM test_refs_index() $$;
+CREATE FUNCTION pg_temp.check_ix() RETURNS TABLE (problem text, n int8)
+LANGUAGE sql AS $$
+	WITH b AS (SELECT name FROM dolt_branches() WHERE hash IS NOT NULL)
+	SELECT 'head root not indexed', count(*) FROM b
+	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'h' AND i.branch = b.name
+		AND i.value = '14' || prolly_root_hash(b.name))
+	UNION ALL
+	SELECT 'root index without its head', count(*) FROM pg_temp.ix() r
+	WHERE r.tag = 'r' AND right(r.keyed, 2) = '68' AND NOT EXISTS (
+		SELECT FROM pg_temp.ix() h WHERE h.tag = 'h' AND h.branch = r.branch
+		AND r.keyed = h.value || '68')
+	UNION ALL
+	SELECT 'name not folded', count(*) FROM b
+	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'f' AND i.branch = b.name
+		AND i.keyed = lower(b.name))
+	UNION ALL
+	SELECT 'index of no branch', count(*) FROM pg_temp.ix() i
+	WHERE i.tag IN ('h', 'f', 'r') AND NOT EXISTS (SELECT FROM b WHERE b.name = i.branch)
+		AND i.branch NOT LIKE 'detached/%'
+	UNION ALL
+	SELECT 'kept commit not indexed', count(*)
+	FROM b, LATERAL test_kept_commits(b.name) kc
+	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'k' AND i.branch = b.name
+		AND i.keyed = '14' || kc.commit_id)
+	ORDER BY 1
+$$;
+SELECT * FROM pg_temp.check_ix();
+SELECT count(*) FILTER (WHERE tag = 'k') > 0 AS kept_indexed,
+	count(*) FILTER (WHERE tag = 's') > 0 AS tables_indexed,
+	count(*) FILTER (WHERE tag = 'r' AND right(keyed, 2) = '77') > 0 AS baselines_indexed
+FROM pg_temp.ix();
+
+-- bix_0001 committed on (pages kept), then renamed: its entries move to
+-- the new name, as they were; renamed back in a transaction rolled back,
+-- nothing changes.
+SELECT (dolt_checkout('bix_0001'))[1];
+UPDATE bix.t SET v = -1 WHERE id = 3;
+SELECT length(dolt_commit('-am', 'on 0001')::text) > 0 AS committed;
+SELECT (dolt_checkout('main'))[1];
+CREATE TEMP TABLE before AS SELECT * FROM pg_temp.ix() WHERE branch = 'bix_0001';
+SELECT count(DISTINCT tag) AS tags_of_0001 FROM before;
+SELECT dolt_branch('-m', 'bix_0001', 'bix_moved') IS NOT NULL AS renamed;
+SELECT count(*) AS left_under_old FROM pg_temp.ix() WHERE branch = 'bix_0001';
+SELECT (SELECT count(*) FROM (
+	SELECT tag, keyed, value FROM before
+	EXCEPT SELECT tag, CASE WHEN tag = 'f' THEN 'bix_0001' ELSE keyed END, value
+		FROM pg_temp.ix() WHERE branch = 'bix_moved') d) AS missing,
+	(SELECT count(*) FROM pg_temp.ix() WHERE branch = 'bix_moved') =
+	(SELECT count(*) FROM before) AS same_count,
+	(SELECT keyed FROM pg_temp.ix() WHERE branch = 'bix_moved' AND tag = 'f') AS folded;
+SELECT * FROM pg_temp.check_ix();
+CREATE TEMP TABLE all_before AS SELECT * FROM pg_temp.ix();
+BEGIN;
+SELECT dolt_branch('-m', 'bix_moved', 'bix_0001') IS NOT NULL AS renamed;
+SELECT dolt_branch('-D', 'bix_0002') IS NOT NULL AS deleted;
+ROLLBACK;
+SELECT (SELECT count(*) FROM (SELECT * FROM all_before EXCEPT SELECT * FROM pg_temp.ix()) a) +
+	(SELECT count(*) FROM (SELECT * FROM pg_temp.ix() EXCEPT SELECT * FROM all_before) b)
+	AS changed_by_rollback;
+
+-- Deleted: its entries go with it, and a branch made again of the name
+-- finds nothing of the old one's.
+SELECT dolt_branch('-D', 'bix_moved') IS NOT NULL AS deleted;
+SELECT count(*) AS left_of_deleted FROM pg_temp.ix() WHERE branch = 'bix_moved';
+SELECT dolt_branch('bix_moved') IS NOT NULL AS made_again;
+SELECT tag, keyed = lower(branch) AS folded FROM pg_temp.ix()
+WHERE branch = 'bix_moved' AND tag IN ('f', 'k', 's') ORDER BY tag;
+SELECT * FROM pg_temp.check_ix();
+
+\c :home
+DROP DATABASE branch_index_work;
