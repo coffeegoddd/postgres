@@ -3877,15 +3877,15 @@ fewer_since(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
  * - the baseline holds other rows (a fold since the head, the fold
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
- * A count the change finder can't give counts as large.  Neither count is
- * needed whole, only against a bound, so each diff is counted only as far
- * as the bound it is compared with (count_diff_upto()), the bound doubled
+ * A count the change finder can't give counts as large.  B, and H where
+ * the baseline holds the head's rows, are needed only against a bound, so
+ * each is counted only as far as it (count_diff_upto()), the bound doubled
  * while the change finder says L is at least as large: with the fold
  * worker's baseline, B is as large as the rows changed since the head was
- * folded, while L, then, is few.  And not while another backend on the branch holds a snapshot (other_snapshots(): an
- * open REPEATABLE READ transaction, a statement running): a restore isn't
- * MVCC-safe, and
- * such a snapshot, taken before the move commits, would read the head's
+ * folded, while L, then, is few.  And not while another backend on the
+ * branch holds a snapshot (other_snapshots(): an open REPEATABLE READ
+ * transaction, a statement running): a restore isn't MVCC-safe, and such
+ * a snapshot, taken before the move commits, would read the head's
  * rows, neither its own nor the commit's, where writing the rows keeps it
  * safe.  (One that read the table holds a lock the restore would find
  * taken, and no restore is made; one that hasn't would be read through.)
