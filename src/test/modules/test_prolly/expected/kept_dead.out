@@ -46,6 +46,7 @@ SELECT kept();
  c b a
 (1 row)
 
+SELECT octet_length(test_refs_value('Kmain')) AS record_of_three \gset
 -- a hard reset to b restores kd.t: c's and a's snapshots were in the
 -- storage it replaced, and are carried into the new storage, still kept
 SELECT pg_stat_force_next_flush();
@@ -77,6 +78,17 @@ SELECT kept();
  kept  
 -------
  b c a
+(1 row)
+
+-- the entry b was kept by before, its storage replaced, is dropped from
+-- the record, not left there retired: the record holds b's entry from the
+-- restore, retired again by the keep after the move, besides b, c and a:
+-- four entries the size of those three, not five
+SELECT 3 * octet_length(test_refs_value('Kmain')) = 4 * :record_of_three
+	AS gone_entry_dropped;
+ gone_entry_dropped 
+--------------------
+ t
 (1 row)
 
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;

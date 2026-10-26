@@ -44,6 +44,7 @@ INSERT INTO names SELECT (dolt_commit('-am', 'b'))[1], 'b';
 UPDATE kd.t SET v = 2 WHERE id <= 100;
 INSERT INTO names SELECT (dolt_commit('-am', 'c'))[1], 'c';
 SELECT kept();
+SELECT octet_length(test_refs_value('Kmain')) AS record_of_three \gset
 
 -- a hard reset to b restores kd.t: c's and a's snapshots were in the
 -- storage it replaced, and are carried into the new storage, still kept
@@ -53,6 +54,12 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT pg_stat_force_next_flush();
 SELECT restored() > :before AS restored;
 SELECT kept();
+-- the entry b was kept by before, its storage replaced, is dropped from
+-- the record, not left there retired: the record holds b's entry from the
+-- restore, retired again by the keep after the move, besides b, c and a:
+-- four entries the size of those three, not five
+SELECT 3 * octet_length(test_refs_value('Kmain')) = 4 * :record_of_three
+	AS gone_entry_dropped;
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
 
 -- so the next commits keep them, as many as are kept

@@ -1286,7 +1286,10 @@ than prolly.kept_commits and the one a restore keeps again: a retired
 commit is neither counted nor offered whatever is left of its pages, and
 the retired pile up within a transaction (each of its commits retires
 one) until it ends, so asking them too would make each commit of a
-transaction ask of every one before it.  One with nothing left at all (every
+transaction ask of every one before it.  So a retired commit whose
+storage goes later stays in the record, keeping its commit and baseline
+from collection, until a later keep lets go of it or the branch is
+deleted.  One with nothing left at all (every
 relation's storage, or its snapshot there, gone, as the transaction sees
 it) is dropped from the list at once, with nothing to let go of, and its
 commit and baseline are no longer kept from collection.  One none of
