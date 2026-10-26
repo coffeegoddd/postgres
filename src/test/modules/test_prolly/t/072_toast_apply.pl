@@ -86,7 +86,10 @@ for my $db ('postgres', 'latin1')
 			"$db: the rows it updates hold history's trees");
 		is($sql->(sprintf($roots, 'a.unique2')), $unique2,
 			"$db: and those it inserts");
-		ok($sql->($journal) - $before < 10,
+		# (the chunks a reset writes are its refs' and canonical nodes:
+		# the heads, baselines and their indexes; a value tree written
+		# again would be dozens more)
+		ok($sql->($journal) - $before < 16,
 			"$db: the chunk store didn't grow for them");
 	}
 	else
