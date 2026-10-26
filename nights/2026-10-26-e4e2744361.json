@@ -1,0 +1,2405 @@
+{
+ "base": "3fbfee5333104905b5282d43cf65670b4254f452",
+ "candidate": "e4e2744361797ff1f03cda5414d4335ec27cecb3",
+ "commits": {
+  "base": "3fbfee5333104905b5282d43cf65670b4254f452",
+  "candidate": "e4e2744361797ff1f03cda5414d4335ec27cecb3"
+ },
+ "comparison": [
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 0.9936566052415029,
+   "low": 0.9822806933849092,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9911878622204792,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0200016094211992,
+   "low": 1.0099512906181163,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.020001609421199,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 1.0,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.05825954889316,
+   "low": 0.9801437511224451,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.002132558429957,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9516951530106198,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9611657480580813,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181163,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0151536193107764,
+   "low": 0.9838285961207082,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9995102742466538,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0301519418674958,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9611657480580813,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0109401960377664,
+   "low": 0.985907570220035,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9945314040173967,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0200016094211997,
+   "low": 0.9803906099397729,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0200016094211997,
+   "low": 0.9238395952400503,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9707305877491856,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.037538210635106,
+   "low": 0.9814452996229407,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.033505764343337,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 0.9901467618185568,
+   "low": 0.9611657480580813,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9707305877491863,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0,
+   "low": 0.9611657480580813,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9803906099397736,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0378126006209012,
+   "low": 0.983852056500424,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0221252193225716,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0301519418674958,
+   "low": 0.9611657480580812,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9901467618185568,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0507566386532192,
+   "low": 0.9057236642639069,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0448007384288969,
+   "low": 0.9864904124652635,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9983200934399374,
+   "reason": "",
+   "result": "same",
+   "workload": "S4"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.017426320541432,
+   "low": 0.9814137966561693,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9932783830587739,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0301519418674967,
+   "low": 0.9803906099397736,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9803906099397736,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0032472839280555,
+   "low": 0.9893320976521696,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9935976943155094,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0543984068853882,
+   "low": 1.0076838326172164,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.018471770047337,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0099512906181152,
+   "low": 0.9707305877491879,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.990146761818558,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0932106567219513,
+   "low": 0.5686899782533075,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9147367836667035,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0039800467325855,
+   "low": 0.9570588566964757,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9951814257432943,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0507566386532206,
+   "low": 0.9901467618185567,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181163,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9901467618185567,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0314954414407278,
+   "low": 0.9661237734655566,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9865386357942469,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0507566386532192,
+   "low": 0.9901467618185567,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0404032832218364,
+   "low": 0.9901467618185555,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0099512906181176,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.013263078696985,
+   "low": 0.9630769665360507,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9810825777496989,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/bulk_insert"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 0.9984432810608573,
+   "low": 0.9743379285907968,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9792296558930544,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/bulk_insert"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.005791548846092,
+   "low": 0.9713473606467578,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9841172077905739,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0301519418674958,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0507566386532199,
+   "low": 1.0,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0404032832218364,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0218475556284357,
+   "low": 0.941657596736514,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9897331215778216,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.160129386160163,
+   "low": 0.9707305877491863,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0200016094211992,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0301519418674958,
+   "low": 0.9423178739918803,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9611657480580812,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0225411597156573,
+   "low": 0.9729275645532214,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0008017614819424,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.0099512906181165,
+   "low": 0.9803906099397736,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 0.9901467618185567,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9611657480580814,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0341779311945234,
+   "low": 0.9893874938693734,
+   "metric": "throughput",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0010322097949087,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.0,
+   "low": 0.9803906099397736,
+   "metric": "latency_p50_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "heap",
+   "high": 1.020001609421199,
+   "low": 0.9803906099397736,
+   "metric": "latency_p99_ms",
+   "over_heap": {},
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0102679757537891,
+   "low": 0.9823027866618412,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.8080931879186192,
+    "candidate": 0.8193525277919355
+   },
+   "problems": [],
+   "ratio": 1.0002571108596612,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0612130233333728,
+   "low": 0.9423178739918808,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.8080931879186192,
+    "candidate": 0.8193525277919355
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.2808866897642732,
+   "low": 0.6663193587329497,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.8080931879186192,
+    "candidate": 0.8193525277919355
+   },
+   "problems": [],
+   "ratio": 0.9330329915368076,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 0.996686764250508,
+   "low": 0.9896000833984516,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.7222079342641093,
+    "candidate": 0.7265682830113684
+   },
+   "problems": [],
+   "ratio": 0.9950783331800468,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.020001609421199,
+   "low": 1.0099512906181163,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.7222079342641093,
+    "candidate": 0.7265682830113684
+   },
+   "problems": [],
+   "ratio": 1.020001609421199,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0099512906181165,
+   "low": 1.0,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.7222079342641093,
+    "candidate": 0.7265682830113684
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S1"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0528137011905965,
+   "low": 0.9974700200200954,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9851726779766324,
+    "candidate": 0.995200277739886
+   },
+   "problems": [],
+   "ratio": 1.0049211295432217,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 0.9516951530106197,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9851726779766324,
+    "candidate": 0.995200277739886
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 0.9423178739918804,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9851726779766324,
+    "candidate": 0.995200277739886
+   },
+   "problems": [],
+   "ratio": 0.9803906099397736,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.037347097005724,
+   "low": 0.9812776245410693,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9219327831625854,
+    "candidate": 0.9176032711123354
+   },
+   "problems": [],
+   "ratio": 0.9845498645186374,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0099512906181165,
+   "low": 0.9611657480580813,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9219327831625854,
+    "candidate": 0.9176032711123354
+   },
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0200016094211999,
+   "low": 0.9707305877491856,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9219327831625854,
+    "candidate": 0.9176032711123354
+   },
+   "problems": [],
+   "ratio": 1.020001609421199,
+   "reason": "",
+   "result": "same",
+   "workload": "S2"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0392528275885247,
+   "low": 0.9853413854175718,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 1.0121102323145232,
+    "candidate": 1.0108428418053839
+   },
+   "problems": [],
+   "ratio": 1.0181245250304205,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 0.961165748058081,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 1.0121102323145232,
+    "candidate": 1.0108428418053839
+   },
+   "problems": [],
+   "ratio": 0.9803906099397736,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 0.9611657480580813,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 1.0121102323145232,
+    "candidate": 1.0108428418053839
+   },
+   "problems": [],
+   "ratio": 0.9707305877491864,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0015669172898882,
+   "low": 0.972536483642612,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9997058425737234,
+    "candidate": 0.9602183768831769
+   },
+   "problems": [],
+   "ratio": 0.9933694049536529,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0301519418674958,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9997058425737234,
+    "candidate": 0.9602183768831769
+   },
+   "problems": [],
+   "ratio": 1.0099512906181163,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.020001609421199,
+   "low": 0.9803906099397734,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9997058425737234,
+    "candidate": 0.9602183768831769
+   },
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S3/range100"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0591856753625772,
+   "low": 1.0036457060290978,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.8002005541521633,
+    "candidate": 0.8443269009704392
+   },
+   "problems": [],
+   "ratio": 1.0131054417766,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S4"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0152130828959203,
+   "low": 0.9766546379576951,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.5191767811534691,
+    "candidate": 0.5218404032129523
+   },
+   "problems": [],
+   "ratio": 1.012459534797509,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.020001609421199,
+   "low": 0.9707305877491865,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.5191767811534691,
+    "candidate": 0.5218404032129523
+   },
+   "problems": [],
+   "ratio": 0.9803906099397734,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 0.9707305877491865,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.5191767811534691,
+    "candidate": 0.5218404032129523
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S5"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0172041624295374,
+   "low": 0.9544190115320277,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.8134472436247483,
+    "candidate": 0.8096150088755528
+   },
+   "problems": [],
+   "ratio": 0.9971597423111158,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.030151941867496,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.8134472436247483,
+    "candidate": 0.8096150088755528
+   },
+   "problems": [],
+   "ratio": 1.0099512906181165,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.004242975938975,
+   "low": 0.9736991136476129,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.5123684265858661,
+    "candidate": 0.49310612847945745
+   },
+   "problems": [],
+   "ratio": 0.995618628297938,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.020001609421199,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.5123684265858661,
+    "candidate": 0.49310612847945745
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S8/pct1"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0400490715211015,
+   "low": 0.9775227103820977,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9054672249439061,
+    "candidate": 0.9185386869520238
+   },
+   "problems": [],
+   "ratio": 0.9990704887612804,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0301519418674956,
+   "low": 0.9516951530106197,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9054672249439061,
+    "candidate": 0.9185386869520238
+   },
+   "problems": [],
+   "ratio": 0.9901467618185567,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0200016094211992,
+   "low": 0.9803906099397725,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9054672249439061,
+    "candidate": 0.9185386869520238
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0169103731770892,
+   "low": 0.9734970776779979,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.8184110104478517,
+    "candidate": 0.8246569941577834
+   },
+   "problems": [],
+   "ratio": 0.9944240941580793,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0099512906181165,
+   "low": 0.9707305877491864,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.8184110104478517,
+    "candidate": 0.8246569941577834
+   },
+   "problems": [],
+   "ratio": 1.0099512906181163,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0404032832218364,
+   "low": 0.9516951530106196,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.8184110104478517,
+    "candidate": 0.8246569941577834
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S9"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 0.9985828632637616,
+   "low": 0.9659543269509969,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.7196249323477426,
+    "candidate": 0.7131607142485556
+   },
+   "problems": [],
+   "ratio": 0.9724682039022009,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/bulk_insert"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0285718412048326,
+   "low": 0.9736718583021605,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.6352580320975832,
+    "candidate": 0.6509110215818636
+   },
+   "problems": [],
+   "ratio": 1.0013533784338593,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/bulk_insert"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0273937056581683,
+   "low": 0.9820128711223463,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9897296944652467,
+    "candidate": 0.999498848413446
+   },
+   "problems": [],
+   "ratio": 0.9989402084138375,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9897296944652467,
+    "candidate": 0.999498848413446
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0404032832218364,
+   "low": 0.9803906099397736,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9897296944652467,
+    "candidate": 0.999498848413446
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0421694007947024,
+   "low": 0.9537336115934422,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9496229382762469,
+    "candidate": 0.9569988739971388
+   },
+   "problems": [],
+   "ratio": 0.9947144972757277,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0301519418674958,
+   "low": 0.9707305877491864,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9496229382762469,
+    "candidate": 0.9569988739971388
+   },
+   "problems": [],
+   "ratio": 0.9901467618185567,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.1150766292927947,
+   "low": 0.9707305877491864,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9496229382762469,
+    "candidate": 0.9569988739971388
+   },
+   "problems": [],
+   "ratio": 1.071773462536293,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_point_select"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0086193467988993,
+   "low": 0.941896331218497,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9499885955750832,
+    "candidate": 0.9420204943024882
+   },
+   "problems": [],
+   "ratio": 0.991480097154579,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0717734625362942,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9499885955750832,
+    "candidate": 0.9420204943024882
+   },
+   "problems": [],
+   "ratio": 1.0200016094211992,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "inconclusive"
+   ],
+   "clients": 1,
+   "engine": "prolly",
+   "high": 1.0612130233333725,
+   "low": 0.9803906099397736,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9499885955750832,
+    "candidate": 0.9420204943024882
+   },
+   "problems": [],
+   "ratio": 1.0,
+   "reason": "",
+   "result": "inconclusive",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 0.9985760931898243,
+   "low": 0.955254174739367,
+   "metric": "throughput",
+   "over_heap": {
+    "base": 0.9048491952791566,
+    "candidate": 0.8831981151259739
+   },
+   "problems": [],
+   "ratio": 0.9914162583387449,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.020001609421199,
+   "low": 1.0,
+   "metric": "latency_p50_ms",
+   "over_heap": {
+    "base": 0.9048491952791566,
+    "candidate": 0.8831981151259739
+   },
+   "problems": [],
+   "ratio": 1.020001609421199,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  },
+  {
+   "attempts": [
+    "same"
+   ],
+   "clients": 8,
+   "engine": "prolly",
+   "high": 1.0404032832218364,
+   "low": 1.020001609421199,
+   "metric": "latency_p99_ms",
+   "over_heap": {
+    "base": 0.9048491952791566,
+    "candidate": 0.8831981151259739
+   },
+   "problems": [],
+   "ratio": 1.020001609421199,
+   "reason": "",
+   "result": "same",
+   "workload": "S10/oltp_read_write"
+  }
+ ],
+ "confirmed": [],
+ "date": "2026-10-26",
+ "instructions": {
+  "S1 heap": 1029200.235,
+  "S1 prolly": 1740646.185,
+  "S2 heap": 327947.914,
+  "S2 prolly": 330323.424,
+  "S7 heap": 894248.96,
+  "S7 prolly": 1288244.45
+ },
+ "schema": 1,
+ "sets": [
+  {
+   "build": "base",
+   "cells": [
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.27986192812081917,
+     "latency_p99_ms": 0.3620386719675124,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 3387.536902,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.6558139851593078,
+     "latency_p99_ms": 1.2359704804589238,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 11816.367633,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 466671.76019079064,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 973948.4048913466,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.03712414035712521,
+     "latency_p99_ms": 0.055166260559806564,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 25557.93,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07424828071425042,
+     "latency_p99_ms": 0.1792357093508615,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 105599.77,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.1532012348337737,
+     "latency_p99_ms": 1.4481546878700495,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 833.01,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 2.783833367740866,
+     "latency_p99_ms": 5.298721445736425,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2839.47,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.038243505279054006,
+     "latency_p99_ms": 0.05912573409536326,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 24139.812317,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07066172887512401,
+     "latency_p99_ms": 0.19789226717017352,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 99083.805192,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.09323871023961554,
+     "latency_p99_ms": 0.13317162025239504,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 9883.587356,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.2295806344379762,
+     "latency_p99_ms": 0.570919234197911,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 33652.459927,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 992484.3487501615,
+     "variant": "",
+     "workload": "S4"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.09605003841056071,
+     "latency_p99_ms": 0.26112041201182695,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 71815.470456,
+     "variant": "",
+     "workload": "S5"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 43.66790549392259,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 22.063944,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 137.72477414155492,
+     "latency_p99_ms": 578.8608829450155,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 51.791355,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.6634929077375695,
+     "latency_p99_ms": 6.147202458275886,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 537.9891922731672,
+     "variant": "",
+     "workload": "S9"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 4.261491848076641,
+     "latency_p99_ms": 19.19670961498454,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 1260.0772696639754,
+     "variant": "",
+     "workload": "S9"
+    }
+   ],
+   "engine": "heap",
+   "identity": "863f0ae04c7146567d6763518e82ced9087badaf30181cce7833e84f043c13e9",
+   "label": "base-B0",
+   "problems": []
+  },
+  {
+   "build": "base",
+   "cells": [
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.3479791709676083,
+     "latency_p99_ms": 0.9460117455258121,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2740.074912,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.7760468820533236,
+     "latency_p99_ms": 3.1662762747227737,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 8578.492723,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 336131.79180267296,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 623130.8667212329,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.03712414035712521,
+     "latency_p99_ms": 0.05739515860949405,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 25338.1,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07801687386908643,
+     "latency_p99_ms": 0.17057775583563511,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 100787.73,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.187972491428006,
+     "latency_p99_ms": 1.614803448044694,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 791.35,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 3.04331630415247,
+     "latency_p99_ms": 6.588408463617958,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2563.37,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.038243505279054006,
+     "latency_p99_ms": 0.0615146078757172,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 23803.166222,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.0772481550286827,
+     "latency_p99_ms": 0.19020726900952936,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 91512.104001,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.09141035600181449,
+     "latency_p99_ms": 0.13317162025239504,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 10083.879767,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.22731852176501194,
+     "latency_p99_ms": 0.5766006174168868,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 33553.689206,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 796402.3143448798,
+     "variant": "",
+     "workload": "S4"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.1774696572160075,
+     "latency_p99_ms": 0.6179852402294619,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 37248.766711,
+     "variant": "",
+     "workload": "S5"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 53.231773047602225,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 17.811222,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 270.0481506489132,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 26.418667,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.8185481741200968,
+     "latency_p99_ms": 6.720187236414566,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 487.48037372393054,
+     "variant": "",
+     "workload": "S9"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 5.246511881274462,
+     "latency_p99_ms": 22.49228882092532,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 1035.4374465674966,
+     "variant": "",
+     "workload": "S9"
+    }
+   ],
+   "engine": "prolly",
+   "identity": "863f0ae04c7146567d6763518e82ced9087badaf30181cce7833e84f043c13e9",
+   "label": "base-prolly",
+   "problems": []
+  },
+  {
+   "build": "candidate",
+   "cells": [
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.2854596170989555,
+     "latency_p99_ms": 0.36564142400725796,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 3353.150953,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.6558139851593078,
+     "latency_p99_ms": 1.2482699819053835,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 11854.99736,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 459636.5770446052,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 958616.7354814864,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.03712414035712521,
+     "latency_p99_ms": 0.05739515860949405,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 25421.45,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07573336582529241,
+     "latency_p99_ms": 0.17227522465694162,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 105061.9,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.1532012348337737,
+     "latency_p99_ms": 1.4481546878700495,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 832.87,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 2.783833367740866,
+     "latency_p99_ms": 5.298721445736425,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2852.18,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.038243505279054006,
+     "latency_p99_ms": 0.05912573409536326,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 24087.372078,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07136490427473892,
+     "latency_p99_ms": 0.19210007682112143,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 98141.441887,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.08961785467543075,
+     "latency_p99_ms": 0.13056020600591348,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 10221.739939,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.22507869822700766,
+     "latency_p99_ms": 0.5652938310009917,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 34125.84806,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 993206.2566542595,
+     "variant": "",
+     "workload": "S4"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.09510363450476468,
+     "latency_p99_ms": 0.26112041201182695,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 72255.624516,
+     "variant": "",
+     "workload": "S5"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 44.102457512177054,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 21.828568,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 136.36773913845252,
+     "latency_p99_ms": 561.9179651262286,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 52.854586,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.7479262161578006,
+     "latency_p99_ms": 6.208375056426589,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 514.8873212720179,
+     "variant": "",
+     "workload": "S9"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 4.3467285435734935,
+     "latency_p99_ms": 19.387741651274847,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 1243.1149106096377,
+     "variant": "",
+     "workload": "S9"
+    }
+   ],
+   "engine": "heap",
+   "identity": "863f0ae04c7146567d6763518e82ced9087badaf30181cce7833e84f043c13e9",
+   "label": "candidate-B0",
+   "problems": []
+  },
+  {
+   "build": "candidate",
+   "cells": [
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.3479791709676083,
+     "latency_p99_ms": 0.8826601689569057,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2751.139713,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.7915690686806934,
+     "latency_p99_ms": 3.1662762747227737,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 8536.27224,
+     "variant": "",
+     "workload": "S1"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 330556.82711235376,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 623974.1985977255,
+     "variant": "bulk_insert",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.03712414035712521,
+     "latency_p99_ms": 0.05739515860949405,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 25308.32,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.0772481550286827,
+     "latency_p99_ms": 0.18647742047923108,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 99822.01,
+     "variant": "oltp_point_select",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.211733853204678,
+     "latency_p99_ms": 1.6471021159044894,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 780.55,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 3.04331630415247,
+     "latency_p99_ms": 6.8546017967546575,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 2526.74,
+     "variant": "oltp_read_write",
+     "workload": "S10"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.038243505279054006,
+     "latency_p99_ms": 0.06030834393548038,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 23891.385477,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.07801687386908643,
+     "latency_p99_ms": 0.19210007682112143,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 90361.092353,
+     "variant": "",
+     "workload": "S2"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 0.08961785467543075,
+     "latency_p99_ms": 0.1292737651991189,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 10298.579363,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.2295806344379762,
+     "latency_p99_ms": 0.5823385377313877,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 33253.288307,
+     "variant": "range100",
+     "workload": "S3"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": null,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 838590.7607053416,
+     "variant": "",
+     "workload": "S4"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 0.17572100641347907,
+     "latency_p99_ms": 0.6118960844648645,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 37681.030513,
+     "variant": "",
+     "workload": "S5"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 53.76149789131653,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 17.595891,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 270.0481506489132,
+     "latency_p99_ms": null,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 25.955977,
+     "variant": "pct1",
+     "workload": "S8"
+    },
+    {
+     "clients": 1,
+     "latency_p50_ms": 1.8733809329494064,
+     "latency_p99_ms": 6.787061772612285,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 477.64582728482804,
+     "variant": "",
+     "workload": "S9"
+    },
+    {
+     "clients": 8,
+     "latency_p50_ms": 5.298721445736425,
+     "latency_p99_ms": 22.49228882092532,
+     "n": 5,
+     "size": "nightly",
+     "throughput": 1030.1321098512128,
+     "variant": "",
+     "workload": "S9"
+    }
+   ],
+   "engine": "prolly",
+   "identity": "863f0ae04c7146567d6763518e82ced9087badaf30181cce7833e84f043c13e9",
+   "label": "candidate-prolly",
+   "problems": []
+  }
+ ]
+}
