@@ -140,6 +140,9 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     ("txn_commit", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
     ("soft_reset", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
     ("hard_reset", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("merge", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("ff_merge", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("branch_delete", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
 }
 
 

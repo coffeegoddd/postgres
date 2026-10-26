@@ -85,3 +85,23 @@ counter = "refs_nodes_read"
 current = "linear"
 issue = "#1016"
 reason = "and the branches with only a head are read from the refs for it"
+
+# A fast-forward merge moves main's working set to the merged head, and
+# that move looks for other branches whose pages it can share: by listing
+# every branch for a known fold, and through the materialization cache's
+# visit, which lists them too and reads each one's kept commits.
+[[known]]
+check = "ff_merge"
+sweep = "branches"
+counter = "branches_listed"
+current = "linear"
+issue = "#1016"
+reason = "a move's search for pages to share lists every branch, twice"
+
+[[known]]
+check = "ff_merge"
+sweep = "branches"
+counter = "refs_nodes_read"
+current = "linear"
+issue = "#1016"
+reason = "and reads each branch's baseline and kept commits from the refs"

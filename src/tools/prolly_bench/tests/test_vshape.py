@@ -211,6 +211,16 @@ class V9Test(unittest.TestCase):
         self.assertLess(sql.index("dolt_commit"), sql.index("dolt_branch('v9_other')"))
         self.assertTrue(sql.rstrip().endswith("SELECT dolt_checkout('main');"))
 
+    def test_every_target_counter_has_growth_metrics(self):
+        # (V9 writes a _growth metric for each of these lists' counters)
+        import inspect
+        self.assertIn("vshape.WORK + vshape.CATALOG + vshape.BRANCHES",
+                      inspect.getsource(V9.operations))
+        emitted = set(vshape.WORK + vshape.CATALOG + vshape.BRANCHES)
+        for (check, sweep), counters in vshape.TARGETS.items():
+            if sweep in ("catalog", "branches"):
+                self.assertLessEqual(set(counters) - set(vshape.REFS), emitted, (check, sweep))
+
     def test_other_branches(self):
         sql = V9.branches(128)
         # K branches made at a commit before the table's, each used once

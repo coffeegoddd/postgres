@@ -746,7 +746,7 @@ class V9(VWorkload):
                 # (a counter the server doesn't report is missing, not 0)
                 names = set.intersection(*(set(c[label]) for c in counted))
                 checks[label] = {name: [c[label][name] for c in counted] for name in sorted(names)}
-                for name in vshape.WORK + vshape.CATALOG:
+                for name in vshape.WORK + vshape.CATALOG + vshape.BRANCHES:
                     if name in checks[label]:
                         b = vshape.growth(levels, checks[label][name], vshape.FLOORS[name])
                         metrics[f"{label}_{sweep}_{name}_growth"] = b

@@ -4599,6 +4599,8 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	const ProllyKeptCommit *kc;
 	const char *source;
 	bool		other;
+	ProllyNodeRef thought;
+	ProllyMovePlan plan;
 	BranchKeptTable *tables;
 	bool	   *used;
 	List	   *names = NIL;
@@ -4624,18 +4626,13 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	 * tables not kept: those to begin empty; the source's alone looked up)
 	 */
 	other = strcmp(source, branch_ops()->current()) != 0;
+	if (thought_root(source, ks.state->branch, GetActiveSnapshot(), &thought))
 	{
-		ProllyMovePlan plan;
-		ProllyNodeRef thought;
 		PlanOn		po = {planner, &thought, &commit->root, INFINITY, &plan};
 
-		if (thought_root(source, ks.state->branch, GetActiveSnapshot(),
-						 &thought))
-		{
-			branch_ops()->run_on(source, plan_here, &po);
-			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
-			reloaded_tables(&plan, &emptied);
-		}
+		branch_ops()->run_on(source, plan_here, &po);
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+		reloaded_tables(&plan, &emptied);
 	}
 	tables = palloc_array(BranchKeptTable, Max(kc->ntables, 1));
 	used = palloc0_array(bool, Max(kc->ntables, 1));
