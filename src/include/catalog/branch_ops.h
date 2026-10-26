@@ -320,16 +320,29 @@ typedef struct BranchOpsRoutine
 	/*
 	 * Optional: give each of the session branch's tables relids that has no
 	 * statistics yet the planner statistics of the table of branch source
-	 * at the same place in fromids, as carry_privileges() pairs them: its
-	 * columns' pg_statistic rows (by the column's name, for a column of the
-	 * same type), and its row and page counts if the table has none.  For
-	 * a table a merge of source, or a pick of its head, made here from
+	 * at the same place in fromids, as carry_privileges() pairs them, for a
+	 * table a merge of source, or a pick of its head, made here from
 	 * source's rows: until autovacuum analyzes it, the planner would
-	 * otherwise guess.  The rows are source's working set's, which may
-	 * have changed since its head: the statistics are an estimate, as an
-	 * analyze's are.  None for a table source hasn't, or has now of another
-	 * kind or name, one source never analyzed, nor where source is no
-	 * branch with copies.
+	 * otherwise guess.  Carried: its columns' pg_statistic rows (a
+	 * partitioned table's inherited ones too), each to the column of the
+	 * same name and collation and a type the same by identity (the same
+	 * shared type; or a versioned one the move made again, an enum of the
+	 * same name and labels in the same order, its values' label OIDs
+	 * mapped, or a domain of the same name over the same shared base
+	 * type); its expression indexes' rows, from source's index of the same
+	 * name, columns and expressions; its extended statistics objects'
+	 * data, from source's of the same name, kinds and columns; and its row
+	 * and page counts if it has none.  Not carried: a column of another
+	 * versioned type (a composite, a range, an array of a versioned type,
+	 * whose values hold source's OIDs), an extended statistics object on
+	 * expressions or over a column of a versioned type, and anything of a
+	 * table whose live columns source's working set has changed since its
+	 * head (renamed, retyped, added or dropped: its statistics may describe
+	 * other columns than this table's of their names).  Source's rows may
+	 * have changed since its head too: the statistics are an estimate, as
+	 * an analyze's are.  None for a table source hasn't, or has now of
+	 * another kind or name, one source never analyzed, nor where source is
+	 * no branch with copies.
 	 */
 	void		(*carry_statistics) (const char *source, List *relids,
 									 List *fromids);

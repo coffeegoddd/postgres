@@ -837,11 +837,23 @@ loaded from rows, its index builds counting them and no column analyzed:
 until autovacuum analyzes it, the planner guesses, and joins of such tables
 can get nested-loop plans that run for minutes.  So each table such a move
 makes, as above, takes the source relation's statistics (branch_ops'
-carry_statistics): its columns' pg_statistic rows, by name for a column of
-the same type and collation, and its row and page counts if it has none.
-They describe the source's rows as its last analyze sampled them, which
-the move loaded (its working set may have changed since its head, as
-statistics lag anyway); a table the source never analyzed takes none.  A
+carry_statistics): its columns' pg_statistic rows (a partitioned table's
+inherited ones too), its expression indexes' (from the source's index of
+the same name and expressions), its extended statistics objects' data (from
+the source's of the same name, kinds and columns), and its row and page
+counts if it has none.  A column's are carried to the column of the same
+name and collation whose type is the same by identity: the same shared
+type, or a versioned one the move made again with another OID, an enum of
+the same name and labels in the same order (its values, label OIDs, mapped
+label to label) or a domain of the same name over the same shared base
+type.  Other versioned types (composites, ranges, arrays of versioned
+types) hold the source's OIDs in their values and aren't carried, nor are
+extended statistics on expressions or over columns of versioned types.
+Nothing is carried for a table whose live columns the source's working set
+has renamed, retyped, added or dropped since its head: its statistics could
+describe other columns than the ones of their names here.  Its rows may have
+changed since its head too, so the statistics are an estimate, as they lag
+anyway; a table the source never analyzed takes none.  A
 table a reset, a checkout of a commit or a pull makes has no relation of a
 branch known to hold its rows, and waits for autovacuum.
 

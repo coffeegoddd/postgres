@@ -7,6 +7,9 @@
 # planner guesses at the new table (its index builds count its rows, but no
 # column has statistics) until autovacuum analyzes it, and joins of such
 # tables can be planned as nested loops over millions of pairs of rows.
+# Its expression indexes', extended statistics' and inherited statistics
+# come too, and columns of an enum or domain the move made again; a
+# source that renamed the table's columns since its head gives none.
 #
 # Autovacuum is on but never wakes here, so no worker can analyze a table.
 
@@ -108,6 +111,108 @@ on('b', q{
 	SELECT dolt_commit('-Am', 'raw')});
 on('main', q{SELECT dolt_merge('b')});
 is(stats('main', 'raw'), '700 0', 'one never analyzed has none to take');
+
+# What else a table's statistics are: its expression indexes', its
+# extended statistics' data, a partitioned table's inherited rows, and its
+# columns' of versioned types the move makes again (other OIDs): an enum's
+# (its values label OIDs, mapped label to label) and a domain's.
+sql(q{
+	CREATE TYPE s.e AS ENUM ('a', 'b');
+	SELECT dolt_commit('-Am', 'enum');
+	SELECT dolt_checkout('b');
+	SELECT dolt_merge('main');
+	ALTER TYPE s.e ADD VALUE 'z';
+	CREATE DOMAIN s.d AS int CHECK (VALUE > 0);
+	CREATE TABLE s.ex (id int PRIMARY KEY, k text, x s.e, dd s.d, a int, b int);
+	INSERT INTO s.ex
+		SELECT g, 'k' || (g % 13),
+			CASE WHEN g % 7 = 0 THEN 'z'::s.e WHEN g % 2 = 0 THEN 'a' ELSE 'b' END,
+			g % 5 + 1, g % 3, g % 3
+		FROM generate_series(1, 7000) g;
+	CREATE INDEX ex_lower ON s.ex (lower(k));
+	CREATE STATISTICS s.ex_ab (ndistinct) ON a, b FROM s.ex;
+	CREATE TABLE s.part (id int, v int) PARTITION BY RANGE (id);
+	CREATE TABLE s.part1 PARTITION OF s.part FOR VALUES FROM (0) TO (5000);
+	CREATE TABLE s.part2 PARTITION OF s.part FOR VALUES FROM (5000) TO (10000);
+	INSERT INTO s.part SELECT g, g % 7 FROM generate_series(1, 9000) g;
+	ANALYZE s.ex;
+	ANALYZE s.part;
+	SELECT dolt_commit('-Am', 'kinds');
+});
+isnt(on('b', q{SELECT 's.e'::regtype::oid}),
+	on('main', q{SELECT dolt_merge('b'); SELECT 's.e'::regtype::oid}),
+	'the merge made the enum again');
+sub plan_rows
+{
+	my ($query) = @_;
+	my ($rows) =
+	  sql(qq{SELECT dolt_checkout('main'); EXPLAIN $query}) =~ /rows=(\d+)/;
+	return $rows;
+}
+cmp_ok(plan_rows(q{SELECT * FROM s.ex WHERE x = 'z'}), '>', 700,
+	"an enum column's statistics are carried, its labels mapped");
+cmp_ok(plan_rows(q{SELECT * FROM s.ex WHERE dd = 2}), '>', 1000,
+	"a domain column's are");
+cmp_ok(plan_rows(q{SELECT * FROM s.ex WHERE lower(k) = 'k3'}), '>', 400,
+	"an expression index's are");
+is( on('main', q{SELECT n_distinct FROM pg_stats_ext
+		WHERE statistics_name = 'ex_ab'}),
+	'[{"attributes": [5, 6], "ndistinct": 3}]',
+	"an extended statistics object's data is");
+is( on('main', q{SELECT count(*) FROM pg_stats
+		WHERE tablename = 'part' AND inherited}),
+	'2', "a partitioned table's inherited rows are");
+
+# A source whose working set renamed its columns since its head: its
+# statistics describe other columns than the ones of the same name the
+# move made, and none are carried.
+sql(q{
+	SELECT dolt_checkout('b');
+	CREATE TABLE s.sw (id int PRIMARY KEY, a int, b int);
+	INSERT INTO s.sw SELECT g, g % 7, g % 100 FROM generate_series(1, 7000) g;
+	ANALYZE s.sw;
+	SELECT dolt_commit('-Am', 'sw');
+	ALTER TABLE s.sw RENAME a TO tmp;
+	ALTER TABLE s.sw RENAME b TO a;
+	ALTER TABLE s.sw RENAME tmp TO b;
+	ANALYZE s.sw;
+});
+on('main', q{SELECT dolt_merge('b')});
+is(stats('main', 'sw'), '7000 0',
+	"columns renamed since the source's head carry nothing");
+
+# A table identity conflict resolved with --theirs makes their relation
+# here, which takes their statistics.
+sql(q{
+	SELECT dolt_checkout('main');
+	CREATE TABLE s.ic (id int PRIMARY KEY, v int);
+	SELECT dolt_commit('-Am', 'ic');
+	SELECT dolt_branch('old');
+	SELECT dolt_checkout('old');
+	INSERT INTO s.ic SELECT g, g % 7 FROM generate_series(1, 7000) g;
+	ANALYZE s.ic;
+	SELECT dolt_commit('-Am', 'old rows');
+	SELECT dolt_checkout('main');
+	DROP TABLE s.ic;
+	SELECT dolt_commit('-Am', 'dropped');
+	CREATE TABLE s.ic (id int PRIMARY KEY, v int);
+	INSERT INTO s.ic VALUES (1, 1);
+	SELECT dolt_commit('-Am', 'made again');
+});
+my @resolved = split /\n/, sql(q{
+	SELECT dolt_checkout('main');
+	BEGIN;
+	SELECT count(*) FROM dolt_merge('old') m;
+	SELECT count(*) FROM dolt_identity_conflicts();
+	SELECT dolt_conflicts_resolve('--theirs', 's.ic') IS NOT NULL;
+	SELECT count(*) || ' ' || (SELECT count(*) FROM pg_stats
+		WHERE schemaname = 's' AND tablename = 'ic') FROM s.ic;
+	SELECT dolt_commit('-m', 'took theirs') IS NOT NULL;
+	COMMIT;
+});
+is($resolved[2], '1', 'the merge stops on a table identity conflict');
+is($resolved[4], '7000 2',
+	'the table --theirs makes takes their statistics');
 
 $node->stop;
 done_testing();
