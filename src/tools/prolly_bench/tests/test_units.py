@@ -131,6 +131,62 @@ Latency (ms):
         self.assertAlmostEqual(h.percentile(100), 9910, delta=100)
 
 
+class SysbenchDoltScriptsTest(unittest.TestCase):
+    def _ctx(self, test, scripts="/scripts"):
+        cluster = SimpleNamespace(client_env=lambda options=None: {"PGHOST": "/tmp/s", "PGPORT": "5432"})
+        return SimpleNamespace(params={"test": test}, size_params={"sysbench_tables": 4,
+                                                                   "sysbench_table_size": 500},
+                               key=SimpleNamespace(clients=2), cluster=cluster, dbname="bench",
+                               tools={"sysbench_lua_scripts": scripts})
+
+    def test_dolt_is_every_test_dolt_runs(self):
+        from pbench.workloads.sysbench import DOLT_SCRIPTS, S10
+        tests = [name for name, _ in S10().variants({"tests": "dolt"})]
+        self.assertEqual(len(tests), 19)
+        self.assertIn("select_random_points", tests)
+        self.assertLessEqual(set(DOLT_SCRIPTS), set(tests))
+
+    def test_a_script_runs_from_the_checkout_with_its_own_tables(self):
+        from pbench.workloads.sysbench import S10
+        w, ctx = S10(), self._ctx("index_join")
+        args = w._args(ctx, "run", [])
+        self.assertEqual(args[1], "/scripts/index_join_postgres.lua")
+        self.assertFalse(any(a.startswith("--tables=") for a in args))
+        self.assertIn("--table-size=500", args)
+        self.assertEqual(w.tables(ctx), ["sbtest1", "sbtest2"])
+        builtin = self._ctx("oltp_read_write")
+        self.assertEqual(w._args(builtin, "run", [])[1], "oltp_read_write")
+        self.assertIn("--tables=4", w._args(builtin, "run", []))
+
+    def test_dolt_options_run_sysbench_as_dolt_does(self):
+        from pbench.workloads.sysbench import S10
+        ctx = self._ctx("oltp_read_write")
+        self.assertNotIn("--rand-type=uniform", S10()._args(ctx, "run", []))
+        ctx.params["dolt_options"] = True
+        args = S10()._args(ctx, "run", [])
+        self.assertIn("--db-ps-mode=disable", args)
+        self.assertIn("--rand-type=uniform", args)
+        self.assertEqual(args[-1], "run")
+
+    def test_a_script_without_the_checkout_is_unavailable(self):
+        from pbench.core.interfaces import Unavailable
+        from pbench.workloads.sysbench import S10
+        with patch("shutil.which", return_value="/usr/bin/sysbench"), \
+                self.assertRaises(Unavailable):
+            S10().check(self._ctx("table_scan", scripts="/nonexistent"))
+
+    def test_config_takes_dolt_or_known_tests(self):
+        path = HERE / "configs" / "smoke.toml"
+        config.load(path, {"workloads": {"S10": {"tests": "dolt"}}})
+        config.load(path, {"workloads": {"S10": {"tests": ["index_scan", "oltp_insert"]}}})
+        for tests in ("all", ["oltp_nope"]):
+            with self.assertRaises(config.ConfigError):
+                config.load(path, {"workloads": {"S10": {"tests": tests}}})
+        config.load(path, {"workloads": {"S10": {"dolt_options": True}}})
+        with self.assertRaises(config.ConfigError):
+            config.load(path, {"workloads": {"S10": {"dolt_options": "yes"}}})
+
+
 class SqlErrorTest(unittest.TestCase):
     def test_classify(self):
         err = 'psql:<stdin>:1: ERROR:  0A000: refs implementation "stub" does not implement commit\n'

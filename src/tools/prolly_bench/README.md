@@ -116,6 +116,45 @@ reported as `failed_transactions`: this BenchBase revision classifies
 them as unexpected errors rather than retrying them. Other unexpected
 SQL errors still fail the cell.
 
+## Dolt's sysbench tests
+
+S10 runs sysbench's own OLTP scripts. Dolt's benchmarks run 19 tests:
+sysbench's ten, and nine scripts of their own from
+[dolthub/sysbench-lua-scripts](https://github.com/dolthub/sysbench-lua-scripts)
+(`covering_index_scan`, `groupby_scan`, `index_join`, `index_join_scan`,
+`index_scan`, `table_scan`, `types_table_scan`, `oltp_delete_insert`,
+`types_delete_insert`). Given a checkout of that repository, S10 runs
+those too, from its `*_postgres.lua` scripts:
+
+```toml
+[workloads.S10]
+tests = "dolt"            # all 19; or name any of them in a list
+
+[tools]
+sysbench_lua_scripts = "~/cursor_src/sysbench-lua-scripts"
+```
+
+```sh
+git clone https://github.com/dolthub/sysbench-lua-scripts ~/cursor_src/sysbench-lua-scripts
+```
+
+The checkout's commit is recorded with the run's environment. A script
+test without the checkout is reported unavailable. The scripts make their
+own tables (`sbtest1`, and `sbtest2` for the scans and joins) of
+`sysbench_table_size` rows, except `oltp_delete_insert`, which always has
+10,000; `sysbench_tables` doesn't apply to them.
+
+Dolt runs sysbench with `--db-ps-mode=disable --rand-type=uniform`: no
+prepared statements, and uniformly random keys rather than sysbench's
+default skewed ("special") distribution. `dolt_options = true` runs S10
+the same way, for any of its tests:
+
+```toml
+[workloads.S10]
+tests = "dolt"
+dolt_options = true
+```
+
 ## The C suite
 
 ```sh
@@ -271,10 +310,6 @@ told apart: map work, rows written back, and catalog work.
 | `bmap_release_refcount_updates` | reference counts the drain set |
 | `bmap_pages_preserved` | page images logged of the blocks a relation alone held as a share (a branch's first use) or a snapshot begins to share them |
 | `bmap_refcount_reads` | reference-count pages read to look blocks' counts up: a share's or snapshot's walk reads each page once for the blocks of a map page |
-| `bmap_store_syncs_asked` | shares and snapshots whose blocks a sync of their page store was to make durable |
-| `bmap_store_syncs_asked_no_own` | of those, the ones with no block of their own (every block held elsewhere already) |
-| `bmap_store_syncs_skipped` | of those, the ones that needed no sync: all of them at `wal_level` replica or above (WAL makes their blocks durable), and at minimal those with no block of their own once the store is durable |
-| `bmap_store_syncs` | syncs of a whole page store run for shares and snapshots |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
 | `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
 | `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |

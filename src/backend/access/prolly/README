@@ -1119,14 +1119,13 @@ since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
 finds), never visiting the buffers.  Redo of one writes the same pages,
 walking the snapshot's own leaves as the record names them, and syncs
-nothing when the record says those pages were logged as images (a WAL
-level for backups, below).
+nothing: those pages were logged as images (below).
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
 change in place again, and recovery that finds a newer map skips the
-records of a page from before it moved off them.  At a WAL level for
-backups (wal_level replica or logical), WAL makes them so: each own block
+records of a page from before it moved off them.  WAL makes them so, at
+every wal_level: each own block
 is logged as an image (PRESERVE) before the share's or snapshot's record,
 which says so, and its write (still needed: a relation made of the share
 reads the blocks) registers the block's segment for the checkpointer's
@@ -1150,36 +1149,33 @@ which nothing else would write to the block before a restartpoint.
 Redo goes by the record's flag, not the current wal_level, which can
 change only across a restart, whose shutdown checkpoint syncs everything.
 
-At wal_level minimal no image is logged, and a share or snapshot syncs the
-database's page store, a whole-file fsync that writes back every page the
-kernel holds unwritten for the store, whoever wrote it: a hard reset's
-discarded working set, another branch's dirty pages.  One that holds no
-block of its own (a table just restored or shared, or unchanged since its
-last snapshot: every block held by another map or snapshot already) skips
-its flush and the sync when the store is durable already.  Its blocks were
-each written out by the share or snapshot that first shared them (their
-own blocks then) and can't change in place since (a change copies a
-shared page first, and only a hint reaches its buffer).  Shared memory
+Syncing the page store instead, at wal_level minimal, isn't enough: a
+crash's replay may write the block again after the sync made it durable.
+The record that gave the block to its relation zeroes it again (its
+extension), an earlier holder's images and records put their pages there
+(one dropped after the redo point), a shrink of the store cuts it, and the
+relation's own records that made the page are skipped once its map was
+dropped (a hard reset replacing its storage) or the page moved off the
+block.  Only an image logged after them all restores it.  For the same
+reason block-mapped storage made in a transaction at minimal, whose
+writes skip WAL, has its pages logged as images at commit whatever its
+size, never only synced (see "Skipping WAL for New RelFileLocator" in
+access/transam/README): a sync before a crash doesn't survive the replay
+of the block's earlier records.
+
+A share with no block of its own (a table just restored or shared, or
+unchanged since its last snapshot: every block held by another map or
+snapshot already) skips its flush when no flush is in flight.  Its blocks
+were each written out by the share or snapshot that first shared them
+(their own blocks then) and can't change in place since (a change copies
+a shared page first, and only a hint reaches its buffer).  Shared memory
 follows each store's flushes of own blocks: begun before the blocks'
 counts are raised (under the relation's header, so whoever finds them
-shared finds the flush in flight or written), written, and synced by a
-sync that began after the write.  With none in flight and every one
-written synced since, the blocks are on disk, and the sync would add
-nothing the share or snapshot needs: the other pages it would write are
-WAL's to protect and the checkpointer's to sync, as any page's.  (At the
-other levels, a share with no block of its own skips its flush when no
-flush is in flight.)  A flush written whose transaction ends unsynced (an
-abort) leaves the store not durable until the next sync; one given up
+shared finds the flush in flight or written), and written.  One given up
 before its write was done (an error part way) may have left its pages in
-their buffers alone, which no sync writes, and leaves the store not
-durable (nor, at the other levels, written out) until a checkpoint begun
-after it completes.  A store isn't known durable until its first sync
-after the server (or its shared memory, after a crash) starts, which
-covers writes from before.  At most 64 stores are followed at once: past
-that, the least recently used idle one is let go of, and reads as not
-durable until its next sync.
-prolly.debug_skip_store_sync (superuser, unsafe) skips every such sync, to
-measure what they cost.
+their buffers alone, and leaves the store not written out until a
+checkpoint begun after it completes.  At most 64 stores are followed at
+once: past that, the least recently used idle one is let go of.
 
 Redo of a snapshot visits every buffer
 of the relation instead when it can't trust a page the walk reads: with
@@ -1216,7 +1212,24 @@ before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
 snapshot, O(1), its pg_class row repointed with its oldest transaction ids
 then, as TRUNCATE gives a relation new storage, and the old storage dropped
-at commit; the baseline takes the table's entry from the kept baseline,
+at commit.  The branch's other kept commits' snapshots of the relation were
+in the old storage: each is carried into the new one (bmap_snapshot_carry(),
+a slot holding the same subtrees, each a holder more, O(1)), and their
+entries renamed, so those commits stay kept and resets back and forth
+between kept commits restore every time.  A carry's record (a snapshot
+record flagged BMAP_TREE_CARRIED, without the header) is redone writing
+and syncing nothing: its blocks are the original snapshot's, written out
+when that was kept.  An abort or a crash before the commit drops or
+orphans the new storage, slots and all; the old one is untouched.  A
+move that gives a table the pages another of the branch's own kept
+commits holds of the target's rows (share_kept(), from a commit with the
+same data: an empty commit's, an amend's) carries them the same way.  A
+move that gives a table another branch's storage (share(), or
+share_kept() of another branch's kept pages) replaces the table's storage
+too but carries nothing: the other storage's epochs say nothing of this
+branch's snapshots, so the branch's kept commits of that table are
+dropped (kept_drop_dead()), and a reset back to one writes its rows.  The
+baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
 of its rows.  A move to a commit whose pages aren't kept, or whose kept
 pages for a table are gone, may give that table the pages kept as of the

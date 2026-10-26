@@ -200,6 +200,18 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 	{
 		Assert(procNumber == INVALID_PROC_NUMBER);
 		AddPendingSync(&rlocator);
+
+		/*
+		 * Block-mapped storage's pages are logged at commit, whatever their
+		 * size, never only synced: its page store is one file that many
+		 * relations' blocks share, freed and handed out again, and redo of
+		 * earlier holders' records (a block's extension, its images, a
+		 * shrink of the store) can overwrite or cut a block that a sync
+		 * alone made durable.  Images logged at commit, after all of them,
+		 * restore it.
+		 */
+		if (smgr_which == SMGR_BMAP)
+			RelFileLocatorForceWALAtCommit(rlocator);
 	}
 
 	return srel;
@@ -263,8 +275,8 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 
 	/*
 	 * No pending sync, even when WAL is skipped for new relations: the share
-	 * is logged and synced, and syncing the new relation at commit could
-	 * log and write every page it shares.
+	 * is logged (its source's own blocks as images), and syncing or logging
+	 * the new relation at commit could write every page it shares.
 	 */
 	return srel;
 }
@@ -328,8 +340,8 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 	}
 
 	/*
-	 * No pending sync: the snapshot's blocks were written out and synced
-	 * when it was taken, and the share is logged.
+	 * No pending sync: the snapshot's own blocks were logged as images when
+	 * it was taken, and the share is logged.
 	 */
 	return srel;
 }

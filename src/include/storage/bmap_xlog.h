@@ -162,11 +162,11 @@ typedef struct xl_bmap_remap
 /*
  * EXTEND's main data: the relation, the page store's high-water mark before
  * and after, and the reused physical blocks (below the old mark).  Redo
- * zeroes the reused blocks again and extends the page store, unless the
- * relation's data skips WAL (BMAP_EXTEND_SKIP_ZERO): then its pages were
- * written and synced at commit, and zeroing them would lose them.
+ * zeroes the reused blocks and the new ones again and extends the page
+ * store.  A relation whose data skips WAL (made in the transaction at
+ * wal_level minimal) has its pages logged as images at commit, which redo
+ * restores after.  No flags yet.
  */
-#define BMAP_EXTEND_SKIP_ZERO	0x01
 
 typedef struct xl_bmap_extend
 {
@@ -208,7 +208,10 @@ typedef struct xl_bmap_extend
  *						the root page, whose slot changes, then (when kept)
  *						the header (its epoch raised) and the
  *						reference-count pages of the subtrees, each a holder
- *						more
+ *						more; a snapshot carried from the storage a restore
+ *						replaces (BMAP_TREE_CARRIED) has no header (the
+ *						count pages are block 1 on) and nothing of its own
+ *						to write out
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -220,6 +223,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_OF_SNAPSHOT	0x02
 /* a snapshot kept whose own blocks were logged as PRESERVE images first */
 #define BMAP_TREE_PRESERVE_LOGGED	0x04
+#define BMAP_TREE_CARRIED		0x08
 
 typedef struct xl_bmap_tree
 {

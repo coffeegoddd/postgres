@@ -805,18 +805,6 @@ typedef enum PgStat_ProllyCounter
 										 * cache, not read */
 	PGSTAT_PROLLY_COMMIT_CACHE_MISSES,	/* and those looked for there and
 										 * read */
-	PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED,	/* shares and snapshots whose
-											 * blocks a sync of their page
-											 * store was to make durable */
-	PGSTAT_PROLLY_BMAP_STORE_SYNCS_ASKED_NO_OWN,	/* of those, with no
-													 * block of their own:
-													 * every one held
-													 * elsewhere already */
-	PGSTAT_PROLLY_BMAP_STORE_SYNCS_SKIPPED, /* of those, that needed no
-											 * sync: the store durable
-											 * already */
-	PGSTAT_PROLLY_BMAP_STORE_SYNCS, /* page-store syncs run for shares and
-									 * snapshots */
 	PGSTAT_PROLLY_RECORDS_FORGOTTEN,	/* relation records of collected
 										 * commits forgotten after a
 										 * collection */

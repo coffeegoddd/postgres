@@ -2402,6 +2402,13 @@ source_of(List *sources, const NamedTree *t)
 	return NULL;
 }
 
+struct KeptCommit;
+static List *kept_get(const char *name);
+static void kept_put(const char *name, List *kept);
+static int	kept_carried(List *kept, const struct KeptCommit *was,
+						 const char *name, BranchKeptRelation **carry,
+						 BranchKeptRelation ***into);
+
 /*
  * The tables of the session's branch whose rows differ from target's made
  * the copies another state has where that costs less (true: some were);
@@ -2425,6 +2432,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	ListCell   *c;
 	char	   *current = branch_ops()->current();
 	int			nshared = 0;
+	List	   *kept = NIL;		/* the branch's kept commits, if shared from */
+	bool		renamed = false;
 
 	prolly_database_components(&dc);
 	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
@@ -2496,9 +2505,29 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		if (s->kept_commit != NULL)
 		{
 			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
+			BranchKeptRelation *carry;
+			BranchKeptRelation *carried;
+			BranchKeptRelation **into;
+			int			ncarry = 0;
 
+			/*
+			 * (the session's own kept pages: the branch's kept commits'
+			 * snapshots of the table carried into its new storage, as a
+			 * restore carries them, and their entries renamed)
+			 */
+			if (s->branch == MyBranch && kept == NIL)
+				kept = kept_get(current);
+			if (s->branch == MyBranch)
+				ncarry = kept_carried(kept, NULL, table, &carry, &into);
+			else
+				carry = NULL;
+			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
+											carry, ncarry, carried,
 											&move_wait_start);
+			for (int j = 0; done && j < ncarry; j++)
+				*into[j] = carried[j];
+			renamed |= done && ncarry > 0;
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
@@ -2509,6 +2538,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			nshared++;
 		}
 	}
+	if (renamed)
+		kept_put(current, kept);
 	if (nshared == 0)
 		return false;
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
@@ -3385,6 +3416,49 @@ count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
 }
 
 /*
+ * The relations of table name as the other commits of kept (but was, and
+ * those retired) keep them: copies into *carry, and where each is into
+ * *into, for a restore of the table to carry their snapshots into the
+ * storage it gives it (restore()'s carry[]), which would otherwise go with
+ * the storage it replaces.  How many.
+ */
+static int
+kept_carried(List *kept, const struct KeptCommit *was, const char *name,
+			 BranchKeptRelation **carry, BranchKeptRelation ***into)
+{
+	int			n = 0;
+
+	foreach_ptr(KeptCommit, o, kept)
+	{
+		if (o == was || FullTransactionIdIsValid(o->retired))
+			continue;
+		for (int t = 0; t < o->ntables; t++)
+			if (strcmp(o->tables[t].name, name) == 0)
+				n += o->tables[t].nrels;
+	}
+	*carry = palloc_array(BranchKeptRelation, Max(n, 1));
+	*into = palloc_array(BranchKeptRelation *, Max(n, 1));
+	n = 0;
+	foreach_ptr(KeptCommit, o, kept)
+	{
+		if (o == was || FullTransactionIdIsValid(o->retired))
+			continue;
+		for (int t = 0; t < o->ntables; t++)
+		{
+			if (strcmp(o->tables[t].name, name) != 0)
+				continue;
+			for (int r = 0; r < o->tables[t].nrels; r++)
+			{
+				(*carry)[n] = o->tables[t].rels[r];
+				(*into)[n] = &o->tables[t].rels[r];
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
+/*
  * Would giving table relid the pages kept as of the head (its rows there,
  * head) and then writing the rows the head and the move's commit (target)
  * differ by cost less than writing the rows the working set and the
@@ -3507,6 +3581,10 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		NamedTree  *target = NULL;
 		NamedTree  *moved = NULL;
 		BranchKeptRelation *renewed;
+		BranchKeptRelation *carry;
+		BranchKeptRelation *carried;
+		BranchKeptRelation **into;
+		int			ncarry;
 		bool		any = false;
 		bool		skipped = false;
 
@@ -3537,9 +3615,13 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 			  !head_pages_pay(dc, baseline, relid, &target->data, &moved->data))))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
-		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed,
-								   &move_wait_start))
+		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
+		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
+		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
+								   carried, &move_wait_start))
 			continue;
+		for (int j = 0; j < ncarry; j++)
+			*into[j] = carried[j];
 		for (int r = 0; r < kt->nrels; r++)
 			any |= renewed[r].relfilenumber != kt->rels[r].relfilenumber;
 		if (!any)

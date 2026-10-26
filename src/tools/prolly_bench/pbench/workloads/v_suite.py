@@ -1036,7 +1036,9 @@ class V10(VWorkload):
             SELECT dolt_checkout('main');
             SELECT prolly_mount('{c1}', '{schema}', 'v10_m1', NULL);
             SELECT prolly_mount('HEAD', '{schema}', 'v10_hm', NULL, false, true);
-            SELECT dolt_branch('v10_scratch');
+            -- (from c2, which its reset goes back to: a hard reset refuses to
+            -- put the remade table's old relation in place of the new one)
+            SELECT dolt_branch('v10_scratch', '{c2}');
             UPDATE v10_t SET v = 'dirty' WHERE id <= 40;
             DELETE FROM v10_t WHERE id BETWEEN {n // 2} AND {n // 2 + 100};
             INSERT INTO v10_big VALUES (1000000, repeat('dirty', 2000));

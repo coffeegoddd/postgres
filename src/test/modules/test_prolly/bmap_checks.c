@@ -229,9 +229,9 @@ test_bmap_free_blocks(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_bmap_store_sync(): the slot following the page store's syncs, as
- * bmap_inspect_store_sync() reads it (written, synced and flushing NULL
- * if it has none)
+ * test_bmap_store_sync(): the slot following the page store's flushes for
+ * shares and snapshots, as bmap_inspect_store_sync() reads it (written and
+ * flushing NULL if it has none)
  */
 PG_FUNCTION_INFO_V1(test_bmap_store_sync);
 
@@ -239,23 +239,21 @@ Datum
 test_bmap_store_sync(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
 	uint64		written;
-	uint64		synced;
 	uint32		flushing;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	if (bmap_inspect_store_sync(locator_of(InvalidRelFileNumber), &written,
-								&synced, &flushing))
+								&flushing))
 	{
 		values[0] = Int64GetDatum((int64) written);
-		values[1] = Int64GetDatum((int64) synced);
-		values[2] = Int32GetDatum((int32) flushing);
+		values[1] = Int32GetDatum((int32) flushing);
 	}
 	else
-		nulls[0] = nulls[1] = nulls[2] = true;
+		nulls[0] = nulls[1] = true;
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
