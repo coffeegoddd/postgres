@@ -84,6 +84,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "common/hashfn.h"
@@ -3616,15 +3618,69 @@ estimate_item_cmp(const void *a, const void *b)
 }
 
 /*
+ * What one side of diff_estimate() left unread, or expanded at a level:
+ * how many nodes, and the items (rows) they hold.
+ */
+typedef struct EstimateLevel
+{
+	uint64		nodes;
+	uint64		rows;
+} EstimateLevel;
+
+/*
+ * The keys changed that would leave lv's nodes, of a side holding total
+ * rows, differing from the other side's, if the changed keys were spread
+ * over the side's rows at random: each node at the level holding as many
+ * rows as lv's do on average, a node differing once any of its rows
+ * changed, so k changes leave 1 - (1 - 1/N)^k of the N nodes differing.
+ * False where lv's nodes hold every row (so many changes that every node
+ * took one, or the trees unrelated: no number is told).
+ */
+static bool
+estimate_spread(const EstimateLevel *lv, uint64 total, double *changes)
+{
+	double		share;
+	double		nodes;
+
+	*changes = 0;
+	if (lv->nodes == 0)
+		return true;
+	if (lv->rows >= total)
+		return false;
+	share = (double) lv->rows / total;
+	nodes = (double) total * lv->nodes / lv->rows;
+	if (nodes <= 1)
+		return false;
+	*changes = log1p(-share) / log1p(-1.0 / nodes);
+	return true;
+}
+
+/*
  * How many keys diff() would report between from and to, estimated
  * reading at most max_nodes nodes (with diff_unordered()'s walk: by the
  * nodes' hashes, from the top level down, a node both trees hold dropped
  * unread).  Where the nodes that differ fit in max_nodes, their leaf items
  * are matched by their bytes' hashes, which gives diff's count (keys equal
- * by the tree's order but not as bytes, or a hash collision, aside).  The
- * nodes left unread once max_nodes are read count every item they hold as
- * changed, so the estimate is then above the count, never below it: a key
- * that changed is under a node one side holds and the other lacks.
+ * by the tree's order but not as bytes, or a hash collision, aside).
+ *
+ * Where they don't, the walk stops before the first level whose nodes
+ * that differ don't fit what is left of max_nodes, and the changes under
+ * the nodes left unread are estimated from how many of them there are and
+ * what they hold.  Counting every row they hold as changed overstates a
+ * few changes spread over a large table by orders of magnitude: a
+ * thousand keys updated across a million rows leave a thousand of its
+ * leaves differing, and the levels above nearly every node, so a walk
+ * bounded below the thousand leaves would count most of the table.  So
+ * the estimate takes the changes spread at random over the rows
+ * (estimate_spread()), from the share of the side's rows under the nodes
+ * left unread, on the side that gives more.  Changes bunched together (a
+ * range of keys rewritten) leave far fewer nodes differing than spread
+ * ones would, so the spread figure understates them; that shows in the
+ * level above, whose nodes that differ (the unread ones' parents) then
+ * imply far fewer changes than the unread level does, and then, or where
+ * every row is under a node unread (every node took a change, or the
+ * trees are unrelated), every row under the nodes unread counts as
+ * changed, an estimate above the count.
  */
 static uint64
 cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
@@ -3633,6 +3689,8 @@ cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	MemoryContext cxt;
 	MemoryContext old;
 	EstimateSide sides[2] = {0};
+	uint64		total[2] = {0, 0};
+	EstimateLevel above[2] = {{0, 0}, {0, 0}};
 	uint64		read = 0;
 	uint64		changes = 0;
 	bool		over = false;
@@ -3660,14 +3718,19 @@ cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		}
 		estimate_add_node(&sides[side], side == 0 ? from : to, root.level,
 						  count);
+		total[side] = count;
 		node_release(&root);
 		read++;
 	}
 
-	/* the highest level's nodes, those not both trees', read, till leaves */
+	/*
+	 * the highest level's nodes, those not both trees', read, till leaves,
+	 * a level only if all of its nodes that differ fit
+	 */
 	while (!over)
 	{
 		int			top = -1;
+		EstimateLevel here[2] = {{0, 0}, {0, 0}};
 
 		CHECK_FOR_INTERRUPTS();
 		for (int side = 0; side < 2; side++)
@@ -3697,20 +3760,61 @@ cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			{
 				if (sides[side].levels[i] == LOOSE_GONE)
 					estimate_drop_node(&sides[side], i);
-				else if (sides[side].levels[i] == top && read >= max_nodes)
-					over = true;
 				else if (sides[side].levels[i] == top)
+				{
+					here[side].nodes++;
+					here[side].rows += sides[side].counts[i];
+				}
+			}
+		if (read + here[0].nodes + here[1].nodes > max_nodes)
+		{
+			over = true;
+			break;
+		}
+		for (int side = 0; side < 2; side++)
+		{
+			for (int i = sides[side].n - 1; i >= 0; i--)
+			{
+				if (sides[side].levels[i] == top)
 				{
 					estimate_expand(env, &sides[side], i);
 					read++;
 				}
 			}
+			if (here[side].nodes > 0)
+				above[side] = here[side];
+		}
 	}
 
-	/* (the nodes left unread: all they hold) */
-	for (int side = 0; side < 2; side++)
-		for (int i = 0; i < sides[side].n; i++)
-			changes += sides[side].counts[i];
+	/* (the nodes left unread: their changes estimated, as above) */
+	if (over)
+	{
+		EstimateLevel unread[2] = {{0, 0}, {0, 0}};
+		double		spread = 0;
+		bool		bunched = false;
+
+		for (int side = 0; side < 2; side++)
+		{
+			double		k;
+			double		parents;
+
+			for (int i = 0; i < sides[side].n; i++)
+			{
+				unread[side].nodes++;
+				unread[side].rows += sides[side].counts[i];
+			}
+			if (!estimate_spread(&unread[side], total[side], &k) ||
+				(above[side].nodes > 0 &&
+				 estimate_spread(&above[side], total[side], &parents) &&
+				 parents < k / 2))
+				bunched = true;
+			spread = Max(spread, k);
+		}
+		if (bunched || spread >= (double) (unread[0].rows + unread[1].rows))
+			changes += unread[0].rows + unread[1].rows;
+		else
+			changes += (uint64) ceil(spread);
+	}
 
 	/* the items read: those on one side, and those whose values differ */
 	for (int side = 0; side < 2; side++)

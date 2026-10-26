@@ -1096,7 +1096,15 @@ costs moving each branch's copies there, from the root its working set is
 known or thought to be: each table's rows that differ, estimated from its
 trees by diff_estimate() in a bounded number of nodes, and the tables
 redefined, made or dropped (materialized views' rows as tables'), each
-planned on its own branch.  The session's branch and at most 16 others are
+planned on its own branch.  Where the nodes that differ don't fit the
+bound, the estimate takes the changes under those it leaves unread as
+spread over the table (a thousand rows updated across a million leave a
+thousand leaves differing, and nearly every node above them), from the
+share of the rows those nodes hold; unless the level above shows them
+bunched together, where it counts every row they hold.  (Counting every
+row under the nodes unread for any diff that doesn't fit would take a few
+changes spread over a large table for most of it, and reload the table,
+every row written and then folded in full, instead of moving its few.)  The session's branch and at most 16 others are
 weighed, each stopped once it costs more than the best yet; the cheapest is
 copied, the session's on a tie.  Another branch is copied only if none of
 its writers is in the middle of a change (make()'s nowait): waiting for one,
