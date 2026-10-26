@@ -187,6 +187,9 @@ the maximum configured distance and is recorded in every sample.
 | `diff_history` | Full count of old hash versus current hash |
 | `diff_working_history` | Full count of old hash versus dirty WORKING |
 | `resolve_ancestor` | Resolve `HEAD~D` without a diff |
+| `branch_delete`, D=0 or D>0 | Delete (`-D`) a branch made at HEAD or an older saved hash and never checked out |
+| `branch_delete_used`, D=0 or D>0 | The same, for a branch checked out once (and left) before the timed delete, so the engine has made what a session on it needs |
+| `drop_table` | `DROP TABLE bench_rows` on the scratch branch, clean or with a dirty working set; a hard reset to HEAD brings it back, untimed |
 
 ### Dirty working sets: xsmall, small, medium, large
 
@@ -195,6 +198,8 @@ and with four sizes of **pending, uncommitted version-control changes**. SQL
 transactions have committed their UPDATEs, but no `dolt_commit` has been made.
 These cases run at D=0 and every configured historical distance, on every table
 size and historical change count K, in the latency and memory passes.
+`drop_table` also runs with each dirty size, at D=0 only. The branch deletions
+run clean: the dirty rows would be the session branch's, not the deleted one's.
 
 A dirty `reset_hard` at D>0 times both costs at once: discarding the Q dirty
 rows and moving the branch back D commits. To tell them apart, read the dirty

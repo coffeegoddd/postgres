@@ -8,6 +8,8 @@ ENGINE_NAMES = ("Dolt", "Doltgres", "PostgreSQL prolly")
 OPERATIONS = {
     "round_trip": "SQL round trip",
     "branch": "Create branch",
+    "branch_delete": "Delete branch",
+    "branch_delete_used": "Delete checked-out branch",
     "checkout": "Checkout",
     "reset_soft": "Soft reset",
     "reset_hard": "Hard reset",
@@ -16,6 +18,7 @@ OPERATIONS = {
     "diff_history": "Diff old → HEAD",
     "diff_working_history": "Diff old → working",
     "resolve_ancestor": "Resolve ancestor",
+    "drop_table": "Drop table",
 }
 
 

@@ -68,6 +68,12 @@ class Engine:
         """The predicate that the benchmark table's id is one of ids."""
         return "id IN (" + ",".join(str(int(i)) for i in ids) + ")"
 
+    def table_count_sql(self):
+        """How many benchmark tables the session's database has: 1, or 0
+        once dropped."""
+        return ("SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema=current_schema() AND table_name='bench_rows'")
+
     def create_table(self, sql, ddl):
         """Make the benchmark table from its column DDL."""
         sql.query(ddl)
@@ -161,6 +167,11 @@ class Dolt(GoEngine):
 
     def vc_sql(self, op, args):
         return f"CALL dolt_{op}({','.join(literal(a) for a in args)})"
+
+    def table_count_sql(self):
+        # (a MySQL server's information schema lists every database's tables)
+        return ("SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema=database() AND table_name='bench_rows'")
 
 
 class Doltgres(GoEngine):

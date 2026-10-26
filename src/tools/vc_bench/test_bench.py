@@ -60,6 +60,9 @@ class FakeVersionedSQL:
     def ids_in(self, ids):
         return 'id IN (' + ','.join(map(str, ids)) + ')'
 
+    def table_count_sql(self):
+        return 'TABLES bench_rows'
+
     def counters(self):
         # (work counted: every statement so far, and the UPDATEs apart)
         return {'statements': len(self.statements),
@@ -75,6 +78,7 @@ class FakeVersionedSQL:
         if q.startswith('VC '):
             op, *args = json.loads(q[3:])
             if op == 'branch' and args[0] == '-D':
+                assert args[1] != self.current, 'deleting the session branch'
                 del self.branches[args[1]]
             elif op == 'branch':
                 i = self.commits.index(args[1])
@@ -85,7 +89,7 @@ class FakeVersionedSQL:
             elif op == 'reset':
                 b = self.branches[self.current]
                 b[0] = self.commits.index(args[1])
-                if args[0] == '--hard' and not self.keep_dirty:
+                if args[0] == '--hard' and (not self.keep_dirty or b[1] is None):
                     b[1] = self.rows(b[0])
         elif q.startswith('HASH '):
             ref = q[5:]
@@ -98,6 +102,13 @@ class FakeVersionedSQL:
         elif q.startswith('DIFF '):
             a, b = (self.state(r) for r in json.loads(q[5:]))
             out = [[str(sum(a.get(i, 0) != b.get(i, 0) for i in set(a) | set(b)))]]
+        elif q == 'DROP TABLE bench_rows':
+            assert self.branches[self.current][1] is not None, 'no table to drop'
+            self.branches[self.current][1] = None
+        elif q.startswith('SELECT count(*) FROM dolt_branches WHERE name='):
+            out = [[str(int(q.split('=', 1)[1].strip("'") in self.branches))]]
+        elif q == 'TABLES bench_rows':
+            out = [[str(int(self.branches[self.current][1] is not None))]]
         elif q.startswith('UPDATE'):
             rev, ids = re.match(r'UPDATE bench_rows SET revision=(\d+) WHERE id IN \(([\d,]+)\)', q).groups()
             for i in ids.split(','):
@@ -351,6 +362,34 @@ class BenchTests(unittest.TestCase):
         run_cell(None, c, engine, n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
                  out, random.Random(7))
         return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_branch_delete_and_drop_table_cases(self):
+        plan = cases({'history_depths': [1, 4], 'dirty_sizes': {'small': {'rows': 3}}})
+        keys = {(case['operation'], case['distance'], case['working_set']) for case in plan}
+        for d in (0, 1, 4):
+            self.assertIn(('branch_delete', d, 'clean'), keys)
+            self.assertIn(('branch_delete_used', d, 'clean'), keys)
+        self.assertIn(('drop_table', 0, 'clean'), keys)
+        self.assertIn(('drop_table', 0, 'small'), keys)
+        self.assertFalse(any(op == 'drop_table' and d for op, d, _ in keys))
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        records = self._run_cell(sql, n, k, commits, warmups=0)
+        ran = {(r['operation'], r['distance'], r['working_set']) for r in records}
+        for op in ('branch_delete', 'branch_delete_used'):
+            for d in (0, 1, 3):
+                self.assertIn((op, d, 'clean'), ran)
+        for ws in ('clean', 'small', 'half'):
+            self.assertIn(('drop_table', 0, ws), ran)
+        self.assertTrue(all(r['status'] == 'ok' for r in records))
+        timed = {r['sql'] for r in records if r['operation'] == 'drop_table'}
+        self.assertEqual(timed, {'DROP TABLE bench_rows'})
+        # (the used branch is checked out before the timed delete; the other never)
+        checkouts = [q for q in sql.statements if q.startswith('VC ["checkout", "new_')]
+        self.assertEqual(len(checkouts), 3 + 6)
+        # every temporary branch is gone at the end, and the table is back
+        self.assertEqual(set(sql.branches), {'fixture'})
+        self.assertIsNotNone(sql.branches['fixture'][1])
 
     def test_counters_pass_counts_the_operation_alone(self):
         # The model counts every statement: the operation's deltas are the
