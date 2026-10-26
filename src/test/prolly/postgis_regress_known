@@ -3,9 +3,9 @@
 #
 #	TEST MODE ISSUE KIND DIFF REASON...
 #
-# TEST as run_test.pl names it (regress/core/affine), MODE one of prolly,
-# prolly_txn or prolly_dump, ISSUE the issue that decided or will fix the
-# difference, KIND intended (postgres_semantics: decided, documented) or
+# TEST as run_test.pl names it (regress/core/affine), MODE a prolly mode
+# (prolly, prolly_txn, prolly_dump, prolly_all or prolly_all_txn), ISSUE
+# the issue that decided or will fix the difference, KIND intended (postgres_semantics: decided, documented) or
 # bug (known_bug: reported, not yet fixed), DIFF the md5 of the test's diff
 # on that mode as the summary prints it.  Only that diff is listed: a test
 # whose diff changes is a regression again, and so is a listed test that

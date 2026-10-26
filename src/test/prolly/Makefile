@@ -63,7 +63,7 @@ bmap.conf: FORCE
 	@{ echo "debug_block_mapped_heap = on"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
-EXTRA_INSTALL = contrib/btree_gist src/test/modules/injection_points
+EXTRA_INSTALL = contrib/btree_gist src/test/modules/injection_points src/test/modules/test_prolly
 
 # (TAP tests that stop a fold in its middle need injection points)
 export enable_injection_points

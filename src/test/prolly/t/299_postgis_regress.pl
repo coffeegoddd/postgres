@@ -12,20 +12,28 @@
 #	prolly_txn     the same, every transaction ending in a Dolt commit
 #	               (dolt.transaction_commit), so what each test writes is
 #	               folded as it goes
+#	prolly_all     public versioned, and every schema made after it too
+#	               (test_prolly.version_new_schemas): the schemas the
+#	               tests and topology's CreateTopology make, and the one
+#	               CREATE EXTENSION postgis_topology makes for topology, so
+#	               every table a test makes but a temporary one is checked
+#	               to be a prolly table
+#	prolly_all_txn the same, every transaction ending in a Dolt commit
 #	heap_dump, prolly_dump  run_test.pl --dumprestore: once PostGIS is
 #	               installed, before any test, the database is dumped and
 #	               restored (so pg_dump and restore of a versioned public
 #	               holding PostGIS's extensions), and the tests run in the
 #	               restored database
 #
-# Schemas a suite makes itself (topology's, from CreateTopology, and a few
-# tests' own) are ordinary schemas, so their tables are heap tables beside
-# the versioned public: topology runs beside prolly more than on it.  The
-# summary reports, per suite and mode, how many of the tables the tests
+# In prolly and prolly_txn, schemas a suite makes itself (topology's, from
+# CreateTopology, and a few tests' own) are ordinary schemas, so their
+# tables are heap tables beside the versioned public: topology runs beside
+# prolly more than on it.  The prolly_all modes version those schemas too.
+# The summary reports, per suite and mode, how many of the tables the tests
 # made were prolly tables, and how many were made elsewhere.
 #
-# A prolly mode's tests are compared with its baseline's (heap for prolly
-# and prolly_txn, heap_dump for prolly_dump), by outcome and, for a test
+# A prolly mode's tests are compared with its baseline's (heap for prolly,
+# prolly_txn and the prolly_all modes, heap_dump for prolly_dump), by outcome and, for a test
 # that failed in both, by what it printed (run_test.pl's obtained output,
 # the run's database name aside):
 #	agree               the same outcome, and the same output if both failed
@@ -43,7 +51,8 @@
 # POSTGIS_BUILD is a build of the pinned PostGIS (the Makefile's
 # check-postgis-regress installs it into the temporary installation);
 # POSTGIS_REGRESS_SUITES (core raster topology, and sfcgal when built)
-# and POSTGIS_REGRESS_MODES (all five) choose what runs.
+# and POSTGIS_REGRESS_MODES (heap prolly prolly_txn heap_dump prolly_dump
+# by default; prolly_all and prolly_all_txn when named) choose what runs.
 
 use strict;
 use warnings FATAL => 'all';
@@ -69,7 +78,8 @@ my $default_suites = 'core raster topology'
 my @suites = split ' ', ($ENV{POSTGIS_REGRESS_SUITES} // $default_suites);
 my @modes = split ' ',
   ($ENV{POSTGIS_REGRESS_MODES} // 'heap prolly prolly_txn heap_dump prolly_dump');
-my %baseline = (prolly => 'heap', prolly_txn => 'heap', prolly_dump => 'heap_dump');
+my %baseline = (prolly => 'heap', prolly_txn => 'heap', prolly_dump => 'heap_dump',
+	prolly_all => 'heap', prolly_all_txn => 'heap');
 my $timeout = $ENV{POSTGIS_REGRESS_TIMEOUT} // 3600;
 
 for my $s (@suites)
@@ -79,7 +89,7 @@ for my $s (@suites)
 for my $m (@modes)
 {
 	BAIL_OUT("unknown mode $m")
-	  unless $m =~ /\A(?:heap|prolly|prolly_txn|heap_dump|prolly_dump)\z/;
+	  unless $m =~ /\A(?:heap|prolly|prolly_txn|heap_dump|prolly_dump|prolly_all|prolly_all_txn)\z/;
 	BAIL_OUT("mode $m needs its baseline $baseline{$m} too")
 	  if $baseline{$m} && !grep { $_ eq $baseline{$m} } @modes;
 }
@@ -105,9 +115,12 @@ for my $line (split /\n/, slurp_file("$here/postgis_regress_known"))
 
 my $node = PostgreSQL::Test::Cluster->new('postgis_regress');
 $node->init;
+# (test_prolly for its test_prolly.version_new_schemas, which the
+# prolly_all modes turn on in their databases only)
 $node->append_conf('postgresql.conf', qq(
 max_prepared_transactions = 10
 lc_messages = 'C'
+shared_preload_libraries = 'test_prolly'
 ));
 $node->start;
 
@@ -115,6 +128,7 @@ $node->start;
 my $versioned = "$out/versioned_public.sql";
 my $txn_commit = "$out/txn_commit.sql";
 my $watch = "$out/watch_tables.sql";
+my $all_schemas = "$out/version_new_schemas.sql";
 PostgreSQL::Test::Utils::append_to_file($versioned, q{
 DROP SCHEMA public;
 CREATE SCHEMA public VERSIONED;
@@ -123,6 +137,13 @@ GRANT ALL ON SCHEMA public TO PUBLIC;
 PostgreSQL::Test::Utils::append_to_file($txn_commit, q{
 DO $$ BEGIN
 	EXECUTE format('ALTER DATABASE %I SET dolt.transaction_commit = on', current_database());
+END $$;
+});
+# (the database's sessions from then on: after the watch script, so its
+# schema stays an ordinary one, out of what the tests version and commit)
+PostgreSQL::Test::Utils::append_to_file($all_schemas, q{
+DO $$ BEGIN
+	EXECUTE format('ALTER DATABASE %I SET test_prolly.version_new_schemas = on', current_database());
 END $$;
 });
 # Every table a test makes is recorded as it is made, by an event trigger
@@ -152,10 +173,13 @@ CREATE EVENT TRIGGER pgis_prolly_check ON ddl_command_end
 });
 
 # After each test, in a prolly mode: what it made is written to the run's
-# coverage directory, and a heap table in public fails the run.
+# coverage directory, and a table not on prolly fails the run if it is in
+# public, or, in a prolly_all mode, anywhere but a temporary schema.
 sub after_test_script
 {
-	my ($dir) = @_;
+	my ($dir, $all) = @_;
+	my $where = $all ? q{nsp !~ '^pg_temp_\d+$'} : q{nsp = 'public'};
+	my $what = $all ? 'tables' : 'tables in public';
 	my $path = "$out/after_test_" . ($dir =~ s{.*/}{}r) . ".sql";
 	PostgreSQL::Test::Utils::append_to_file($path, qq{
 DO \$\$
@@ -164,10 +188,10 @@ BEGIN
 	EXECUTE format('COPY pgis_prolly_check.made TO %L',
 		'$dir/' || nextval('pgis_prolly_check.tests'));
 	SELECT string_agg(rel || ' on ' || am, ', ') INTO wrong FROM pgis_prolly_check.made
-	WHERE nsp = 'public' AND am <> 'prolly';
+	WHERE $where AND am <> 'prolly';
 	DELETE FROM pgis_prolly_check.made;
 	IF wrong IS NOT NULL THEN
-		RAISE EXCEPTION 'tables in public not on prolly: %', wrong;
+		RAISE EXCEPTION '$what not on prolly: %', wrong;
 	END IF;
 END \$\$;
 });
@@ -243,7 +267,7 @@ sub diff_md5
 }
 
 # The tables a run's tests made, from its coverage directory: the number
-# on prolly in public, and the others by schema and access method.
+# on prolly, and the others by schema and access method.
 sub coverage
 {
 	my ($dir) = @_;
@@ -256,7 +280,7 @@ sub coverage
 			my ($nsp, $rel, $am) = split /\t/, $row;
 			# (temporary tables, which can't be versioned, counted as one)
 			$nsp = 'temporary schemas' if $nsp =~ /^pg_temp_\d+$/;
-			if ($nsp eq 'public' && $am eq 'prolly') { $prolly++ }
+			if ($am eq 'prolly') { $prolly++ }
 			else { $elsewhere{"$nsp on $am"}++ }
 		}
 	}
@@ -286,8 +310,9 @@ for my $suite (@suites)
 			make_path($covdir);
 			chmod 0777, $covdir;
 			$flags .= " --after-create-db-script $versioned --after-create-db-script $watch";
-			$flags .= " --after-create-db-script $txn_commit" if $mode eq 'prolly_txn';
-			$flags .= " --after-test-script " . after_test_script($covdir);
+			$flags .= " --after-create-db-script $txn_commit" if $mode =~ /_txn\z/;
+			$flags .= " --after-create-db-script $all_schemas" if $mode =~ /\Aprolly_all/;
+			$flags .= " --after-test-script " . after_test_script($covdir, $mode =~ /\Aprolly_all/);
 		}
 		(my $cmd = $base) =~ s/--extensions/$flags/;
 		my $tmp = "$out/tmp_${suite}_$mode";
@@ -307,7 +332,7 @@ for my $suite (@suites)
 		    ($rc >> 8) == 124 ? 'timeout'
 		  : $server =~ /was terminated by signal|server process .* exited with exit code [^0]/ ? 'crashed'
 		  : ($text . (-f "$tmp/regress_log.tmp" ? slurp_file("$tmp/regress_log.tmp") : ''))
-			=~ /tables in public not on prolly: (.*)/ ? "not on prolly: $1"
+			=~ /tables (?:in public )?not on prolly: (.*)/ ? "not on prolly: $1"
 		  : $text =~ /^Run tests: \d+/m ? 'finished'
 		  : 'aborted';
 		my ($prolly, $elsewhere) = $mode =~ /\Aprolly/ ? coverage($covdir) : (0, {});
@@ -334,7 +359,7 @@ for my $mode (grep { $baseline{$_} } @modes)
 		my %elsewhere = %{ $r->{elsewhere} };
 		my $others = 0;
 		$others += $_ for values %elsewhere;
-		push @coverage, sprintf("%s %s: %d tables made on prolly in public, %d elsewhere%s",
+		push @coverage, sprintf("%s %s: %d tables made on prolly, %d elsewhere%s",
 			$mode, $suite, $r->{prolly}, $others,
 			$others ? ' (' . join(', ', map { "$_: $elsewhere{$_}" } sort keys %elsewhere) . ')' : '');
 		if ($r->{status} ne 'finished')
