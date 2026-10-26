@@ -11,7 +11,7 @@ CREATE DATABASE stat_prolly;
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
 CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
-SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
+SELECT length(dolt_commit('-Am', 'tables', '--date', '2026-01-01 00:00:01+00')::text) > 0 AS committed;
 -- (what this session counted so far is flushed before the reset)
 SELECT pg_stat_force_next_flush();
 SELECT pg_stat_reset_shared('prolly');
@@ -19,7 +19,7 @@ SELECT name, value FROM pg_stat_prolly WHERE value <> 0;
 
 -- A commit of 1000 new rows: the fold reads and writes each.
 INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
-SELECT length(dolt_commit('-m', '1000 rows')::text) > 0 AS committed;
+SELECT length(dolt_commit('-m', '1000 rows', '--date', '2026-01-01 00:00:02+00')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 -- (the block map's bytes in blocks, whatever the block size; the journal's
 -- bytes depend on whether the server compresses its chunks, below)
@@ -42,7 +42,7 @@ SELECT ((SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') 
 -- writes it.  No page is kept as the last fold saw it, so none is copied.
 SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
-SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
+SELECT length(dolt_commit('-m', 'one row', '--date', '2026-01-01 00:00:03+00')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 SELECT name, value FROM pg_stat_prolly
 WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
@@ -50,23 +50,25 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
 			   'page_copies_fold', 'page_copies_shared');
 
 -- The same commit again, in a database just like it: the same counts.
--- (but the journal's bytes: compressed, a commit's, which holds its time,
--- may take a byte more or less)
+-- (each commit is dated, so its id is the same, and so are the places of
+-- the refs' entries keyed by it; but the journal's bytes: compressed, the
+-- refs' values, which hold transaction ids, may take a byte more or less)
 SELECT json_object_agg(name, value) AS first FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned') \gset
+SELECT dolt_hashof('HEAD') AS first_head \gset
 \c :home
 CREATE DATABASE stat_prolly_again;
 \c stat_prolly_again
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 CREATE SCHEMA sp VERSIONED;
 CREATE TABLE sp.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
-SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
+SELECT length(dolt_commit('-Am', 'tables', '--date', '2026-01-01 00:00:01+00')::text) > 0 AS committed;
 INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
-SELECT length(dolt_commit('-m', '1000 rows')::text) > 0 AS committed;
+SELECT length(dolt_commit('-m', '1000 rows', '--date', '2026-01-01 00:00:02+00')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
-SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
+SELECT length(dolt_commit('-m', 'one row', '--date', '2026-01-01 00:00:03+00')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 -- (any that differ, with both counts; not the journal's bytes, which
 -- depend on how its chunks compress, as commit ids and times differ)
@@ -74,6 +76,9 @@ SELECT name, value, (:'first'::json ->> name)::bigint AS first
 FROM pg_stat_prolly
 WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
 	AND name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
+-- (each commit dated, so the same commits: the refs' index keys, at
+-- places their ids pick, are where the first database's were)
+SELECT dolt_hashof('HEAD') = :'first_head' AS same_commit;
 
 -- Per database: the other's work isn't counted here.
 \c stat_prolly
