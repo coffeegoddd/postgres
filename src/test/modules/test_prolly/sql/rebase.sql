@@ -274,9 +274,10 @@ SELECT dolt_rebase('main');
 SELECT pk, name, b FROM rb.s ORDER BY pk;
 SELECT indexname FROM pg_indexes WHERE schemaname = 'rb' AND tablename = 's' ORDER BY 1;
 SELECT message FROM dolt_log LIMIT 5;
--- reordered so a pick's definitions conflict with the head's: an error,
--- which rolls the --continue back, the rebase left at its plan to change
--- or abort (Dolt aborts it)
+-- reordered so a pick's definitions conflict with the head's: the
+-- rebase aborted, as Dolt aborts it, and status 1 with Dolt's message
+-- (an error would roll the abort back with the --continue); a notice
+-- says what conflicted
 SELECT dolt_branch('schemas2', 'HEAD~4');
 SELECT dolt_checkout('schemas2') IS NOT NULL AS on_schemas2;
 INSERT INTO rb.s VALUES (4, 'four');
@@ -287,14 +288,221 @@ ALTER TABLE rb.s ALTER COLUMN c DROP NOT NULL;
 SELECT dolt_commit('-am', 'altering c') IS NOT NULL AS committed;
 SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
 UPDATE dolt_rebase SET rebase_order = 3.1 WHERE rebase_order = 2;
-\set VERBOSITY terse
+SELECT r[1], r[2] LIKE 'schema conflict detected while rebasing commit %. the rebase has been automatically aborted' AS aborted
+	FROM dolt_rebase('--continue') r;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_schemas2') AS left;
+SELECT * FROM dolt_rebase;
+SELECT dolt_rebase('--abort');
+SELECT message FROM dolt_log LIMIT 1;
+-- (gone: the branch's next rebase starts, where a rebase left in progress
+-- would find its branch there)
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+SELECT dolt_rebase('--abort');
+-- a data conflict at --continue, outside a transaction block: with
+-- dolt.allow_commit_conflicts, the rebase stops there, its conflicts kept
+-- past the statement (status 1: Dolt's error would roll them back); the
+-- branch's commits refused until they are resolved, as Dolt's
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE rb.c (pk int PRIMARY KEY, v int);
+INSERT INTO rb.c SELECT g, 0 FROM generate_series(1, 4) g;
+SELECT dolt_commit('-Am', 'creating table c') IS NOT NULL AS committed;
+SELECT dolt_branch('dev');
+UPDATE rb.c SET v = 1 WHERE pk <= 3;
+SELECT dolt_commit('-am', 'main moves') IS NOT NULL AS committed;
+SELECT dolt_checkout('dev') IS NOT NULL AS on_dev;
+UPDATE rb.c SET v = 2 WHERE pk <= 2;
+SELECT dolt_commit('-am', 'dev change') IS NOT NULL AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+SELECT r[1], r[2] LIKE 'data conflict detected while rebasing commit % (dev change). %' AS conflict
+	FROM dolt_rebase('--continue') r;
+SELECT active_branch();
+SELECT * FROM dolt_conflicts;
+SELECT dolt_commit('-am', 'not yet');
 SELECT dolt_rebase('--continue');
-\set VERBOSITY default
+SELECT dolt_conflicts_resolve('--theirs', 'rb.c');
+SELECT dolt_rebase('--continue');
+SELECT active_branch();
+SELECT pk, v FROM rb.c ORDER BY pk;
+SELECT message FROM dolt_log LIMIT 2;
+RESET dolt.allow_commit_conflicts;
+
+-- without it, the conflicts can't be kept: the rebase aborted, as Dolt
+-- aborts it, with status 1 and Dolt's message (an error would roll the
+-- abort back, leaving the rebase as it was)
+SELECT dolt_checkout('-b', 'dev2', 'main~1') IS NOT NULL AS on_dev2;
+UPDATE rb.c SET v = 3 WHERE pk = 1;
+SELECT dolt_commit('-am', 'dev2 change') IS NOT NULL AS committed;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+SELECT r[1], r[2] LIKE 'data conflicts from rebase, but session settings do not allow preserving conflicts, so they cannot be resolved. The rebase has been aborted. %' AS aborted
+	FROM dolt_rebase('--continue') r;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_dev2') AS left;
+SELECT count(*) FROM dolt_conflicts;
+SELECT pk, v FROM rb.c ORDER BY pk;
+SELECT dolt_rebase('--continue');
+
+-- begun by the same statement, a schema conflict is an error: rolled
+-- back, the rebase never began, which is what Dolt's abort leaves
+SELECT dolt_checkout('-b', 'sc', 'main') IS NOT NULL AS on_sc;
+ALTER TABLE rb.c ADD COLUMN x text;
+SELECT dolt_commit('-am', 'sc adds x') IS NOT NULL AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ALTER TABLE rb.c ADD COLUMN x int;
+SELECT dolt_commit('-am', 'main adds x') IS NOT NULL AS committed;
+SELECT dolt_checkout('sc') IS NOT NULL AS on_sc;
+DO $$
+BEGIN
+	PERFORM dolt_rebase('main');
+EXCEPTION WHEN serialization_failure THEN
+	RAISE NOTICE 'failed as Dolt: %', SQLERRM LIKE
+		'schema conflict detected while rebasing commit %. the rebase has been automatically aborted';
+END $$;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc') AS left;
+
+-- a schema conflict at --continue in a transaction block: aborted
+-- there too, the abort the block's to commit
+SELECT dolt_checkout('-b', 'sc3', 'main') IS NOT NULL AS on_sc3;
+ALTER TABLE rb.c ADD COLUMN y text NOT NULL DEFAULT '';
+SELECT dolt_commit('-am', 'adding y') IS NOT NULL AS committed;
+ALTER TABLE rb.c ALTER COLUMN y DROP NOT NULL;
+SELECT dolt_commit('-am', 'altering y') IS NOT NULL AS committed;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT r[1], r[2] LIKE 'schema conflict detected while rebasing commit %. the rebase has been automatically aborted' AS aborted
+	FROM dolt_rebase('--continue') r;
+COMMIT;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+SELECT message FROM dolt_log LIMIT 1;
+
+-- rolled back, an abort leaves the rebase as it was, the session on its
+-- branch: at --continue's abort, or --abort's, by the block or a savepoint
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+ROLLBACK;
 SELECT active_branch();
 SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+COMMIT;
+BEGIN;
 SELECT dolt_rebase('--abort');
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_rebase('--abort');
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+COMMIT;
+-- (a rebase done, rolled back, as well)
+UPDATE dolt_rebase SET rebase_order = 1 WHERE rebase_order = 2.1;
+UPDATE dolt_rebase SET action = 'drop' WHERE rebase_order = 2;
+BEGIN;
+SELECT dolt_rebase('--continue');
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+SELECT dolt_rebase('--abort');
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+
+-- a rebase begun and finished in the transaction, rolled back: the
+-- session back on the branch rebased, the rebase's branch gone with it
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK TO s;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+COMMIT;
+
+-- a chain of branches made in the transaction, rolled back: the session
+-- on a branch that is there, not on one undone with it (by the block, or
+-- to a savepoint; plainly, or through a rebase of a branch made there)
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK;
 SELECT active_branch();
-SELECT message FROM dolt_log LIMIT 1;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK TO s;
+SELECT active_branch();
+COMMIT;
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK TO s;
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK TO s;
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+
+-- the merge's limits on reading an enum's labels across its changes are
+-- schema conflicts too, as Dolt's incompatible enum changes are: a
+-- rebase begun by the statement fails with Dolt's message, and 40001
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TYPE rb.e AS ENUM ('a', 'b');
+CREATE TABLE rb.en (id int PRIMARY KEY, v rb.e);
+INSERT INTO rb.en VALUES (1, 'a');
+SELECT dolt_commit('-Am', 'creating en') IS NOT NULL AS committed;
+SELECT dolt_branch('en1');
+ALTER TYPE rb.e RENAME VALUE 'a' TO 'x';
+ALTER TYPE rb.e ADD VALUE 'z' BEFORE 'b';
+SELECT dolt_commit('-am', 'relabeling e') IS NOT NULL AS committed;
+SELECT dolt_checkout('en1') IS NOT NULL AS on_en1;
+INSERT INTO rb.en VALUES (2, 'b');
+UPDATE rb.en SET v = 'b' WHERE id = 1;
+SELECT dolt_commit('-am', 'en1 rows') IS NOT NULL AS committed;
+DO $$
+DECLARE
+	detail text;
+BEGIN
+	PERFORM dolt_rebase('main');
+EXCEPTION WHEN serialization_failure THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RAISE NOTICE 'failed as Dolt: %, %', SQLERRM LIKE
+		'schema conflict detected while rebasing commit %. the rebase has been automatically aborted',
+		detail;
+END $$;
+SELECT active_branch();
 
 \c postgres
 DROP DATABASE regress_rebase;
