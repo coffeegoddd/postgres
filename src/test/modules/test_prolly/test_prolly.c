@@ -193,6 +193,8 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_TREE, "diff_reads_changed_paths",
 	"build_begin build_add build_finish apply walk diff",
 	tree_diff_reads_changed_paths},
+	{PROLLY_IFACE_TREE, "diff_stops",
+	"build_begin build_add build_finish apply walk diff", tree_diff_stops},
 	{PROLLY_IFACE_TREE, "diff_across_heights",
 	"build_begin build_add build_finish walk diff", tree_diff_across_heights},
 	{PROLLY_IFACE_TREE, "diff_unordered_matches",

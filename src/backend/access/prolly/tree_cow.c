@@ -3122,15 +3122,17 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			else if (rest == &b)
 			{
 				side_leaf_item(&b, &kb, &vb, &fb);
-				visit(PROLLY_DIFF_ADDED, &kb, NULL, reported(env, &vb, fb, &bufb),
-					  arg);
+				if (!visit(PROLLY_DIFF_ADDED, &kb, NULL,
+						   reported(env, &vb, fb, &bufb), arg))
+					break;
 				side_advance(&b);
 			}
 			else
 			{
 				side_leaf_item(&a, &ka, &va, &fa);
-				visit(PROLLY_DIFF_REMOVED, &ka, reported(env, &va, fa, &bufa),
-					  NULL, arg);
+				if (!visit(PROLLY_DIFF_REMOVED, &ka,
+						   reported(env, &va, fa, &bufa), NULL, arg))
+					break;
 				side_advance(&a);
 			}
 			continue;
@@ -3177,14 +3179,16 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		r = cmp_keys(env, &ka, &kb);
 		if (r < 0)
 		{
-			visit(PROLLY_DIFF_REMOVED, &ka, reported(env, &va, fa, &bufa), NULL,
-				  arg);
+			if (!visit(PROLLY_DIFF_REMOVED, &ka, reported(env, &va, fa, &bufa),
+					   NULL, arg))
+				break;
 			side_advance(&a);
 		}
 		else if (r > 0)
 		{
-			visit(PROLLY_DIFF_ADDED, &kb, NULL, reported(env, &vb, fb, &bufb),
-				  arg);
+			if (!visit(PROLLY_DIFF_ADDED, &kb, NULL,
+					   reported(env, &vb, fb, &bufb), arg))
+				break;
 			side_advance(&b);
 		}
 		else
@@ -3193,10 +3197,12 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			 * Equal keys can be written differently; that is a change too.
 			 * Values out of line are equal exactly when their references are.
 			 */
-			if (fa != fb || va.len != vb.len || memcmp(va.data, vb.data, va.len) != 0 ||
-				ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0)
-				visit(PROLLY_DIFF_MODIFIED, &kb, reported(env, &va, fa, &bufa),
-					  reported(env, &vb, fb, &bufb), arg);
+			if ((fa != fb || va.len != vb.len ||
+				 memcmp(va.data, vb.data, va.len) != 0 ||
+				 ka.len != kb.len || memcmp(ka.data, kb.data, ka.len) != 0) &&
+				!visit(PROLLY_DIFF_MODIFIED, &kb, reported(env, &va, fa, &bufa),
+					   reported(env, &vb, fb, &bufb), arg))
+				break;
 			side_advance(&a);
 			side_advance(&b);
 		}
@@ -3448,23 +3454,27 @@ cow_diff_unordered(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			vb = b->value;
 		if (r < 0)
 		{
-			visit(PROLLY_DIFF_REMOVED, &a->key, reported(env, &va, a->flags, &bufa),
-				  NULL, arg);
+			if (!visit(PROLLY_DIFF_REMOVED, &a->key,
+					   reported(env, &va, a->flags, &bufa), NULL, arg))
+				break;
 			ia++;
 		}
 		else if (r > 0)
 		{
-			visit(PROLLY_DIFF_ADDED, &b->key, NULL, reported(env, &vb, b->flags, &bufb),
-				  arg);
+			if (!visit(PROLLY_DIFF_ADDED, &b->key, NULL,
+					   reported(env, &vb, b->flags, &bufb), arg))
+				break;
 			ib++;
 		}
 		else
 		{
 			/* (values out of line are equal exactly when their references are) */
-			if (a->flags != b->flags || va.len != vb.len ||
-				memcmp(va.data, vb.data, va.len) != 0)
-				visit(PROLLY_DIFF_MODIFIED, &b->key, reported(env, &va, a->flags, &bufa),
-					  reported(env, &vb, b->flags, &bufb), arg);
+			if ((a->flags != b->flags || va.len != vb.len ||
+				 memcmp(va.data, vb.data, va.len) != 0) &&
+				!visit(PROLLY_DIFF_MODIFIED, &b->key,
+					   reported(env, &va, a->flags, &bufa),
+					   reported(env, &vb, b->flags, &bufb), arg))
+				break;
 			ia++;
 			ib++;
 		}

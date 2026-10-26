@@ -166,8 +166,13 @@ typedef bool (*ProllyRowChangeVisit) (ProllyDiffKind kind,
 									  const ProllyValue *after,	/* NULL if removed */
 									  void *arg);
 
-/* Called for each key that differs between two trees (diff). */
-typedef void (*ProllyTreeVisitChange) (ProllyDiffKind kind,
+/*
+ * Called for each key that differs between two trees (diff); returns
+ * whether to go on.  False stops the diff there: it reports nothing more
+ * and reads no more nodes, so a caller that needs only some of the changes
+ * (whether there are more than n) reads only the nodes that hold them.
+ */
+typedef bool (*ProllyTreeVisitChange) (ProllyDiffKind kind,
 									   const ProllyKey *key,
 									   const ProllyValue *before,	/* NULL if added */
 									   const ProllyValue *after,	/* NULL if removed */
@@ -227,7 +232,9 @@ typedef struct ProllyTreeRoutine
 	 * once, in key order; a key equal in both by the tree's order but
 	 * written differently is modified (reported as to writes it).  Subtrees
 	 * with the same hash are skipped without being read, so with d changed
-	 * keys it reads O((d + 1) log n) nodes, not every leaf.
+	 * keys it reads O((d + 1) log n) nodes, not every leaf.  It ends where
+	 * the visitor returns false, having read only the nodes that hold the
+	 * changes reported up to there.
 	 */
 	void		(*diff) (const ProllyTreeEnv *env, const ProllyNodeRef *from,
 						 const ProllyNodeRef *to, ProllyTreeVisitChange visit,
@@ -293,7 +300,8 @@ typedef struct ProllyTreeRoutine
 	 * session has none): the same changes, found by the nodes' hashes and
 	 * matched by the keys' bytes (keys equal only by the tree's order, not
 	 * as bytes, are a removal and an addition), reported in the order of
-	 * those bytes.  It reads O((d + 1) log n) nodes too.
+	 * those bytes.  It reads O((d + 1) log n) nodes too, all of them
+	 * before the first change is reported; a visitor's false ends it there.
 	 */
 	void		(*diff_unordered) (const ProllyTreeEnv *env,
 								   const ProllyNodeRef *from,

@@ -887,7 +887,7 @@ keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 	return PROLLY_CALL(rd->kr, compare, rd->k, a, b);
 }
 
-static void
+static bool
 row_change(ProllyDiffKind kind, const ProllyKey *key,
 		   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -920,6 +920,7 @@ row_change(ProllyDiffKind kind, const ProllyKey *key,
 		pfree(b.data);
 	if (after && rd->to_shown)
 		pfree(a.data);
+	return true;
 }
 
 /* Refuse to read the rows of a version of a table that can't be read here. */
@@ -1089,7 +1090,7 @@ typedef struct MergeWorking
 	int64		i;
 } MergeWorking;
 
-static void
+static bool
 merge_working_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -1104,7 +1105,7 @@ merge_working_change(ProllyDiffKind kind, const ProllyKey *key,
 	if (mc->i >= bc->n || keying_compare(&bc->c[mc->i].key, key, mc->rd) != 0)
 	{
 		row_change(kind, key, before, after, mc->rd);
-		return;
+		return true;
 	}
 
 	/* (changed both ways: from the first version's row to the working set's) */
@@ -1112,7 +1113,7 @@ merge_working_change(ProllyDiffKind kind, const ProllyKey *key,
 	b = before;
 	a = c->after.data ? &c->after : NULL;
 	if (b == NULL && a == NULL)
-		return;
+		return true;
 	if (b == NULL)
 		row_change(PROLLY_DIFF_ADDED, &c->key, NULL, a, mc->rd);
 	else if (a == NULL)
@@ -1121,6 +1122,7 @@ merge_working_change(ProllyDiffKind kind, const ProllyKey *key,
 			 key->len != c->key.len ||
 			 memcmp(key->data, c->key.data, key->len) != 0)
 		row_change(PROLLY_DIFF_MODIFIED, &c->key, b, a, mc->rd);
+	return true;
 }
 
 /*
@@ -4477,7 +4479,7 @@ copies_of(Changes *c, const ProllyValue *value, ProllyValue *row)
 	return count;
 }
 
-static void
+static bool
 apply_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -4488,20 +4490,20 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	uint64		na = copies_of(&ap->c, after, &arow);
 
 	if (ap->stuck)
-		return;
+		return true;
 
 	/* a keyed row that changed, updated in place, while inserting */
 	if (ap->in_place && nb == 1 && na == 1)
 	{
 		if (!ap->inserting)
-			return;
+			return true;
 		batch_flush(ap);
 		decode_update(&ap->c, ap->rel, ap->pk, &brow, &arow, ap->old,
 					  ap->slot, ap->kept, ap->unread);
 		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept,
 						 ap->old, ap->unread, NULL))
 			row_missing(ap->rel, ROWS_MOVED);
-		return;
+		return true;
 	}
 
 	/* a keyless row's copies change in number, a keyed row whole */
@@ -4543,7 +4545,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		{
 			for (uint64 i = 0; i < na; i++)
 				batch_add(ap, ap->slot);
-			return;
+			return true;
 		}
 		for (uint64 i = 0; i < na; i++)
 			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL,
@@ -4570,6 +4572,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 			}
 		}
 	}
+	return true;
 }
 
 /* The removals, then the inserts, and the last batch written. */
@@ -6315,7 +6318,7 @@ typedef struct HeldWalk
 	KeyWriteVisit visit;
 } HeldWalk;
 
-static void
+static bool
 held_change(ProllyDiffKind kind, const ProllyKey *key,
 			const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -6345,6 +6348,7 @@ held_change(ProllyDiffKind kind, const ProllyKey *key,
 	}
 	hw->visit(hw->kw, &w);
 	MemoryContextSwitchTo(old);
+	return true;
 }
 
 static void
@@ -6627,7 +6631,7 @@ merge_unsure_row(MergeWalk *mw)
  * Theirs' change at key: after base's unsure rows before it, walked
  * (merge_key()), copied out of the tree first, as ours' row is read.
  */
-static void
+static bool
 merge_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -6665,6 +6669,7 @@ merge_change(ProllyDiffKind kind, const ProllyKey *key,
 	/* (its columns, read with it, are good until the next is read) */
 	if (unsure_key)
 		unsure_next(mw->unsure);
+	return true;
 }
 
 /*
@@ -9366,7 +9371,7 @@ decode_version_row(LostChanges *lc, VersionReader *vr, const ProllyValue *v)
 	slot_getallattrs(vr->slot);
 }
 
-static void
+static bool
 check_lost_change(ProllyDiffKind kind, const ProllyKey *key,
 				  const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -9376,7 +9381,7 @@ check_lost_change(ProllyDiffKind kind, const ProllyKey *key,
 
 	/* (a row side added or deleted loses the column as every row does) */
 	if (before == NULL || after == NULL)
-		return;
+		return true;
 	old = MemoryContextSwitchTo(lc->rowcxt);
 	decode_version_row(lc, &lc->br, before);
 	decode_version_row(lc, &lc->sr, after);
@@ -9407,6 +9412,7 @@ check_lost_change(ProllyDiffKind kind, const ProllyKey *key,
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(lc->rowcxt);
 	CHECK_FOR_INTERRUPTS();
+	return true;
 }
 
 /*
@@ -12578,7 +12584,7 @@ same_matview_query(const ProllyValue *a, const ProllyValue *b)
 		memcmp(a->data + ha, b->data + hb, a->len - ha) == 0;
 }
 
-static void
+static bool
 local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		   const ProllyValue *after, void *arg)
 {
@@ -12587,7 +12593,7 @@ local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 	uint8	   *k;
 
 	if (item_kind(key, "c:"))
-		return;
+		return true;
 	k = palloc(Max(key->len, 1));
 	memcpy(k, key->data, key->len);
 	for (int i = 0; i < 2; i++)
@@ -12621,6 +12627,7 @@ local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		l->matviews = lappend(l->matviews, item_name(key));
 	else
 		l->definitions = true;
+	return true;
 }
 
 /* Root's item key, into out; false if it has none. */
@@ -12991,14 +12998,14 @@ typedef struct PutBack
 	List	   *types;			/* char *: the types the merge changed */
 } PutBack;
 
-static void
+static bool
 put_back_item(ProllyDiffKind kind, const ProllyKey *key,
 			  const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	PutBack    *pb = arg;
 
 	if (item_kind(key, "c:"))
-		return;
+		return true;
 	if (item_kind(key, "y:"))
 		pb->types = lappend(pb->types, item_server_name(key));
 	while (pb->next < list_length(pb->local) &&
@@ -13014,6 +13021,7 @@ put_back_item(ProllyDiffKind kind, const ProllyKey *key,
 				 errdetail("%s \"%s\" has uncommitted changes, and the %s changes it too.",
 						   item_label(key), item_server_name(key), pb->what),
 				 errhint("Commit the changes, or reset the branch, first.")));
+	return true;
 }
 
 /* Does type use (is, is over, holds) one of the types named? */
