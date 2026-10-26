@@ -2995,6 +2995,8 @@ kept_commit_status(const KeptCommit *kc)
 		{
 			BranchKeptStatus s = branch_ops()->kept_status(&kc->tables[t].rels[r]);
 
+			pgstat_count_prolly(PGSTAT_PROLLY_KEPT_STATUS_CHECKS, 1);
+
 			if (s != BRANCH_KEPT_RESTORABLE)
 				all = false;
 			if (s != BRANCH_KEPT_GONE)
@@ -3022,6 +3024,14 @@ kept_commit_status(const KeptCommit *kc)
  * go of.  (A TRUNCATE leaves a table's change log on its storage: its
  * commits are retired, not dropped.)  but: an entry left as it is (NULL:
  * none).
+ *
+ * Only the commits still kept are asked, no more of them than
+ * prolly.kept_commits (and one a restore keeps again): a retired one is
+ * neither counted nor offered whatever is left of its pages, and a later
+ * keep lets go of what is (let go of, gone storage is passed over).  The
+ * retired pile up within a transaction, each of its commits retiring one,
+ * till it ends: were they asked too, a transaction's commits would each
+ * ask of all the ones before.
  */
 static List *
 kept_drop_dead(List *kept, const KeptCommit *but)
@@ -3030,8 +3040,8 @@ kept_drop_dead(List *kept, const KeptCommit *but)
 
 	foreach_ptr(KeptCommit, o, kept)
 	{
-		BranchKeptStatus s = o == but ? BRANCH_KEPT_RESTORABLE :
-			kept_commit_status(o);
+		BranchKeptStatus s = o == but || FullTransactionIdIsValid(o->retired) ?
+			BRANCH_KEPT_RESTORABLE : kept_commit_status(o);
 
 		if (s == BRANCH_KEPT_GONE)
 			continue;
@@ -3512,8 +3522,8 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	 * the other commits whose pages were in the storage replaced dropped
 	 * with it)
 	 */
-	was->retired = GetTopFullTransactionId();
 	*kept = kept_drop_dead(lcons(kc, *kept), kc);
+	was->retired = GetTopFullTransactionId();
 	ref_of(&kc->baseline, &from);
 	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,
 				&spliced);

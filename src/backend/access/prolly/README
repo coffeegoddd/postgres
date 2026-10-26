@@ -1291,7 +1291,16 @@ A restore gives each table it restores new storage, and the storage it
 replaces, where every other kept commit's snapshot of the table was, goes
 with it at commit; so does a rewrite's, or a dropped table's.  Each keep
 and each restore asks what is left of each kept commit's pages (branch
-operations' kept_status()).  One with nothing left at all (every
+operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
+relations asked of).  Only the commits still kept are asked, never more
+than prolly.kept_commits and the one a restore keeps again: a retired
+commit is neither counted nor offered whatever is left of its pages, and
+the retired pile up within a transaction (each of its commits retires
+one) until it ends, so asking them too would make each commit of a
+transaction ask of every one before it.  So a retired commit whose
+storage goes later stays in the record, keeping its commit and baseline
+from collection, until a later keep lets go of it or the branch is
+deleted.  One with nothing left at all (every
 relation's storage, or its snapshot there, gone, as the transaction sees
 it) is dropped from the list at once, with nothing to let go of, and its
 commit and baseline are no longer kept from collection.  One none of
