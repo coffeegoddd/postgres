@@ -26,6 +26,7 @@
 
 #include "access/prolly_xact.h"
 
+#include "access/prolly_revision.h"
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_proc.h"
@@ -3523,6 +3524,14 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 					 */
 					transformLockingClause(pstate, rte->subquery,
 										   allrels, true);
+					break;
+				case RTE_FUNCTION:
+					/* (another revision's rows can't be locked from here) */
+					if (prolly_revision_rte(rte))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("%s cannot be applied to a table of another revision",
+										LCS_asString(lc->strength))));
 					break;
 				default:
 					/* ignore all other RTE kinds */

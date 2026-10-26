@@ -19,6 +19,7 @@
 #include <math.h>
 
 #include "access/sysattr.h"
+#include "access/prolly_revision.h"
 #include "access/tsmapi.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
@@ -472,7 +473,10 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				set_subquery_pathlist(root, rel, rti, rte);
 				break;
 			case RTE_FUNCTION:
-				set_function_size_estimates(root, rel);
+				if (prolly_revision_rte(rte))
+					prolly_revision_set_size(root, rel, rte);	/* a revision's table */
+				else
+					set_function_size_estimates(root, rel);
 				break;
 			case RTE_TABLEFUNC:
 				set_tablefunc_size_estimates(root, rel);
@@ -555,7 +559,10 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				break;
 			case RTE_FUNCTION:
 				/* RangeFunction */
-				set_function_pathlist(root, rel, rte);
+				if (prolly_revision_rte(rte))
+					prolly_revision_set_paths(root, rel, rte);
+				else
+					set_function_pathlist(root, rel, rte);
 				break;
 			case RTE_TABLEFUNC:
 				/* Table Function */

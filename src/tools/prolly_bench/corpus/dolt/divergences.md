@@ -772,3 +772,41 @@ OF` are built in D18's shapes.
 - **Port:** ports run as a superuser; none is affected. A script that
   commits as a role with table privileges alone grants it
   `pg_prolly_write` (or `CREATE` on the database).
+
+## D28. A revision-qualified table name only reads, with the branch's grants
+
+- **Dolt:** `` `mydb/b1`.t `` (Doltgres: `"mydb/b1".public.t`) names a
+  table of revision database `mydb/b1` anywhere a table name can be: a
+  branch's working set, a tag's or commit's state (with ancestry such as
+  `tag1~2`), read and, for a branch, written. The revision's name is
+  matched case-insensitively, a branch's before a tag's. Privileges are
+  on the database and tables by name, the same on every revision.
+- **Prolly:** `"db/ref".schema.table` in a FROM clause reads the table as
+  the revision has it, a branch's or tag's name matched the same way
+  (an exact match first; two that differ only by case are ambiguous). A
+  used branch's table is its copy, read under the query's snapshot, its
+  columns the branch's; it takes the branch's grants on its copy (SELECT
+  on it, or on each column read, as a session checked out there needs),
+  and is refused where the copy's row security applies to the reader. A
+  table with inheritance children on the branch is read only with
+  `ONLY` (the copy alone); without it, it is refused. A
+  branch with only its head, a tag and a commit are read from the
+  commit's tree as `dolt_at()` reads them: the table here of the name,
+  its columns as defined here, with D26's privileges (Dolt reads a
+  commit's table by the commit's own definition; matching it is
+  [#1063](https://github.com/coffeegoddd/postgres/issues/1063)). The name of the
+  session's own branch is an ordinary table name. Any other use (INSERT,
+  UPDATE, DELETE, DDL, LOCK, COPY) is refused: change another branch's
+  tables by checking it out ([#1064](https://github.com/coffeegoddd/postgres/issues/1064)
+  tracks writes). A view reading such a name checks its owner's
+  privileges and row security, unless it is `security_invoker`, as for a
+  relation; a `SECURITY DEFINER` function reads as its owner.
+- **Why:** privileges here are per branch, on each branch's catalog rows,
+  so the branch's own grants are the ones that say who may read its
+  copy, and reading it with them gives no access a checkout doesn't. A
+  commit holds no grants (D26). Writes to another branch need its
+  writers' bookkeeping (its change log, writer modes, folds) run for a
+  branch the session isn't on; they are left for later.
+- **Port:** Dolt's "database revision specs: Ancestor references" reads
+  are in test_prolly's `revision_names` test (by FROM-clause names; `USE`
+  has no equivalent, D11); writes through a revision name are not ported.

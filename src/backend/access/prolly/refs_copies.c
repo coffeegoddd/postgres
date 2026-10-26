@@ -7821,6 +7821,53 @@ refuse_other_case(const char *name, const char *ignore)
 				 errdetail("Branch names that differ only by case name one branch.")));
 }
 
+/* A visit of the branches a folded name's index entries name. */
+typedef struct FoldedVisit
+{
+	ProllyBranchVisit visit;
+	void	   *arg;
+	bool		main;			/* main visited */
+} FoldedVisit;
+
+static void
+visit_folded(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	FoldedVisit *fv = arg;
+	const char *sep = memchr(k->data, '\0', k->len);
+	ProllyHash	none = {0};
+
+	if (sep != NULL)
+	{
+		char	   *name = pnstrdup(sep + 1, (const char *) k->data + k->len - (sep + 1));
+
+		fv->main |= strcmp(name, "main") == 0;
+		fv->visit(name, &none, fv->arg);
+	}
+}
+
+/*
+ * Visit the branches whose names are name but for case, by the
+ * case-folded name index: the work is in those, however many branches
+ * there are.  Their heads aren't read (each visited with an empty one).
+ */
+static void
+copies_branches_folded(const char *name, ProllyBranchVisit visit, void *arg)
+{
+	FoldedVisit fv = {visit, arg, false};
+	StringInfoData prefix;
+	ProllyHash	none = {0};
+
+	refs_init();
+	initStringInfo(&prefix);
+	folded_key(&prefix, name);
+	prefix.len -= strlen(name);
+	visit_prefix(prefix.data, prefix.len, visit_folded, &fv);
+	pfree(prefix.data);
+	/* (main, which no path makes, is in the index only once it has a head) */
+	if (!fv.main && pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
+		visit("main", &none, arg);
+}
+
 /*
  * Refuse a new branch name that is a commit's id (in any case, as ids are
  * read): a branch so named would hide the commit wherever refs are read,
@@ -8229,6 +8276,22 @@ check_head_restore_seen(const char *name, Oid oid)
 				 errmsg("could not serialize access: branch \"%s\" was given its head's kept pages since this transaction's snapshot",
 						name),
 				 errhint("The transaction might succeed if retried.")));
+}
+
+/*
+ * A read of branch name's copies (oid) without checking it out, refused
+ * where a checkout would be (copies_checkout()).
+ */
+static void
+copies_check_copies_read(const char *name, Oid oid)
+{
+	if (IsolationUsesXactSnapshot() && branch_made_unseen(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+	check_head_restore_seen(name, oid);
 }
 
 /*
@@ -11455,4 +11518,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.stash_set_maker = copies_stash_set_maker,
 	.last_fold = copies_last_fold,
 	.forget_records = copies_forget_records,
+	.check_copies_read = copies_check_copies_read,
+	.branches_folded = copies_branches_folded,
 };

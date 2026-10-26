@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/prolly_revision.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
@@ -666,6 +667,9 @@ setRuleCheckAsUser_Query(Query *qry, Oid userid)
 
 		if (rte->rtekind == RTE_SUBQUERY)
 			setRuleCheckAsUser_Query(rte->subquery, userid);
+		/* (a revision's table checks its privileges as the role too) */
+		else if (rte->rtekind == RTE_FUNCTION)
+			prolly_revision_set_check_as(rte, userid);
 	}
 
 	/* Recurse into subquery-in-WITH */

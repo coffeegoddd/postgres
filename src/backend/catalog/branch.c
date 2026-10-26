@@ -137,6 +137,7 @@ typedef struct BranchWriteCallbackItem
 
 static List *write_callbacks = NIL;
 bool		CatalogAllBranches = false;
+Oid			CatalogReadBranch = InvalidOid;
 
 static const CatalogBranchInfo branch_catalogs[] = {
 	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch, NamespaceBranchIndexId},
@@ -218,7 +219,8 @@ catalog_tuple_on_branch(HeapTuple tup)
 	if (info == NULL || CatalogAllBranches)
 		return true;
 	branch = catalog_row_branch(info, tup);
-	return branch == InvalidOid || branch == MyBranch;
+	return branch == InvalidOid ||
+		branch == (OidIsValid(CatalogReadBranch) ? CatalogReadBranch : MyBranch);
 }
 
 SysScanDesc
