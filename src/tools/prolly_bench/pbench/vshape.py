@@ -58,10 +58,15 @@ REFS = ("bmap_refcount_reads",)
 # What an operation reads of the catalogs: block fetches of every system
 # catalog and index (not a pg_stat_prolly counter; V9 reads it with them).
 CATALOG = ("catalog_blocks_read",)
+# What an operation reads of the branches: the branches listings of every
+# branch visit, and the refs' nodes read (its lookups' descents of the
+# refs, which hold each branch's entries).
+BRANCHES = ("branches_listed", "refs_nodes_read")
 
 # Below these, a counter's values are noise to a fit.
 FLOORS = {name: 8.0 for name in WORK + REFS}
 FLOORS["catalog_blocks_read"] = 64.0
+FLOORS.update({"branches_listed": 8.0, "refs_nodes_read": 32.0})
 FLOORS.update({"nodes_read": 32.0, "bmap_refcount_updates": 64.0, "bmap_blocks_freed": 64.0,
                "page_copies_shared": 64.0, "bmap_pages_preserved": 64.0})
 
@@ -71,7 +76,8 @@ def _all(shape: str, names=WORK) -> dict[str, str]:
 
 
 # (check, sweep) -> {counter: the shape it may not exceed}.  rows: N grows,
-# Δ fixed; delta: Δ grows, N fixed.
+# Δ fixed; delta: Δ grows, N fixed; catalog: unrelated objects grow;
+# branches: other branches with copies grow.
 TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # a refs entry: nothing grows with the table or its working set
     ("create_branch", "rows"): _all("flat"),
@@ -125,6 +131,15 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     ("first_use", "catalog"): {**_all("flat", CATALOG), "catalog_rows_copied": "flat"},
     ("commit", "catalog"): _all("flat", CATALOG),
     ("branch_delete", "catalog"): _all("flat", CATALOG),
+    # as other branches are added: no operation lists them, and each finds
+    # the branches it names by a descent of the refs and the catalogs
+    ("create_branch", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("checkout_used", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("first_use", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("commit", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("txn_commit", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("soft_reset", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
+    ("hard_reset", "branches"): {"branches_listed": "flat", "refs_nodes_read": "log"},
 }
 
 

@@ -98,7 +98,7 @@ def series(checks=None):
     """A V9 cell's series: the rows sweep's checks, every counter of every
     target 0 but those given."""
     out = {}
-    for sweep in ("rows", "delta", "catalog"):
+    for sweep in ("rows", "delta", "catalog", "branches"):
         cs = {}
         for (check, sw), counters in vshape.TARGETS.items():
             if sw == sweep:
@@ -211,6 +211,14 @@ class V9Test(unittest.TestCase):
         self.assertLess(sql.index("dolt_commit"), sql.index("dolt_branch('v9_other')"))
         self.assertTrue(sql.rstrip().endswith("SELECT dolt_checkout('main');"))
 
+    def test_other_branches(self):
+        sql = V9.branches(128)
+        # K branches made at a commit before the table's, each used once
+        self.assertIn("generate_series(1, 128)", sql)
+        self.assertLess(sql.index("dolt_commit"), sql.index("dolt_branch"))
+        self.assertLess(sql.index("dolt_branch"), sql.index("dolt_checkout('v9_k'"))
+        self.assertTrue(sql.rstrip().endswith("SELECT dolt_checkout('main');"))
+
     def test_catalog_reading_reads_no_catalog(self):
         # (pg_stat_get_blocks_fetched over every OID a system catalog can
         # have: no catalog scanned, so the reading doesn't grow with them)
@@ -229,13 +237,15 @@ class V9Test(unittest.TestCase):
             params = {}
         self.assertEqual([p[0] for p in V9().sweeps(Ctx)["rows"]], LEVELS)
         self.assertEqual([p[2] for p in V9().sweeps(Ctx)["catalog"]], [32, 128, 512, 2048])
+        self.assertEqual([p[2] for p in V9().sweeps(Ctx)["branches"]], [8, 32, 128, 512])
         # (the rows and delta sweeps add no unrelated objects)
         self.assertEqual({p[2] for p in V9().sweeps(Ctx)["rows"] + V9().sweeps(Ctx)["delta"]}, {0})
         for bad in ({"rows": [100, 200, 400, 800], "delta": 100},
                     {"rows": [1000, 2000, 4000]},
                     {"deltas": [10, 20, 40, 80, 64000]},
                     {"others": [0, 10, 100, 1000]},
-                    {"others": [10, 20, 40, 60]}):
+                    {"others": [10, 20, 40, 60]},
+                    {"branches": [10, 20, 40, 60]}):
             Ctx.params = bad
             with self.assertRaises(ValueError, msg=bad):
                 V9().sweeps(Ctx)
