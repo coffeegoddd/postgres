@@ -2461,8 +2461,9 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
  * the move made again (another OID) that is the same by identity, an enum
  * of the same name and labels in the same order (its values, label OIDs,
  * mapped label to label) or a domain of the same name over the same
- * shared base type.  Other versioned types (composites, ranges, arrays of
- * versioned types) aren't: their values hold OIDs of source's own.
+ * shared base type, or an array of either.  Other versioned types
+ * (composites and table row types, ranges, arrays of those) aren't: their
+ * values hold OIDs of source's own.
  */
 typedef struct CarriedType
 {
@@ -2471,6 +2472,15 @@ typedef struct CarriedType
 	int			nlabels;		/* an enum's: source's label OIDs ... */
 	Oid		   *theirs;
 	Oid		   *mine;			/* ... and ours, in the same order */
+
+	/*
+	 * An array of a versioned enum or domain: the element types (source's,
+	 * ours), the enum's labels above, and the array type's alignment.
+	 */
+	bool		array;
+	Oid			theirelem;
+	Oid			ourelem;
+	char		typalign;
 } CarriedType;
 
 /* Do two types' rows name the same type: the same name, in like schemas? */
@@ -2575,57 +2585,51 @@ carried_type(Oid theirs, Oid src, Oid ours, CarriedType *ct)
 			ct->nlabels = n;
 			ct->enumtype = true;
 		}
+		else if (o->typtype == TYPTYPE_BASE && IsTrueArrayType(o) &&
+				 IsTrueArrayType(t))
+		{
+			CarriedType elem;
+
+			/* (an array of one of the above: its elements' carried so) */
+			alike = carried_type(t->typelem, src, o->typelem, &elem);
+			if (alike)
+			{
+				*ct = elem;
+				ct->ours = ours;
+				ct->array = true;
+				ct->theirelem = t->typelem;
+				ct->ourelem = o->typelem;
+				ct->typalign = o->typalign;
+			}
+		}
 	}
 	ReleaseSysCache(ot);
 	return alike;
 }
 
 /*
- * A pg_statistic slot's values (an array) of source's column of type
- * theirs, as the session branch's column of ct->ours takes them.  A slot of
- * another type than the column's (an array column's elements, a range's
- * lengths, a tsvector's lexemes) is copied as it is if that type is
- * shared, and the column isn't carried (*ok false) if it is a versioned
- * type of source's.  A slot of the column's type is copied as it is for a
- * shared type, made one of ct->ours for a domain (the same base type: the
- * same bytes), and for an enum its label OIDs mapped to ours (*ok false if
- * one isn't found).  Values are only ever read as the array's own element
- * type.
+ * Array a of source's versioned enum or domain values made one of newelem,
+ * ours: an enum's label OIDs mapped to ours (NULL if one isn't found), a
+ * domain's values (of the same shared base type: the same bytes) as they
+ * are.  Read only as the array's own element type.
  */
-static Datum
-carried_values(Datum values, Oid theirs, Oid src, const CarriedType *ct,
-			   bool *ok)
+static ArrayType *
+carried_elements(ArrayType *a, Oid newelem, const CarriedType *ct)
 {
-	ArrayType  *a = DatumGetArrayTypeP(values);
-	Oid			elem = ARR_ELEMTYPE(a);
 	ArrayType  *copy;
 	Datum	   *elems;
 	bool	   *nulls;
 	int			n;
 
-	*ok = true;
-	if (elem != theirs)
-	{
-		HeapTuple	versioned = branch_row(TypeRelationId, TypeOidIndexId,
-										   Anum_pg_type_oid, elem, src);
-
-		if (versioned != NULL)
-		{
-			heap_freetuple(versioned);
-			*ok = false;
-		}
-		return values;
-	}
-	if (theirs == ct->ours && !ct->enumtype)
-		return values;
 	if (!ct->enumtype)
 	{
-		copy = DatumGetArrayTypePCopy(values);
-		ARR_ELEMTYPE(copy) = ct->ours;
-		return PointerGetDatum(copy);
+		copy = (ArrayType *) palloc(VARSIZE(a));
+		memcpy(copy, a, VARSIZE(a));
+		ARR_ELEMTYPE(copy) = newelem;
+		return copy;
 	}
 	/* (an enum's values: OIDs, by value) */
-	deconstruct_array(a, elem, sizeof(Oid), true, TYPALIGN_INT,
+	deconstruct_array(a, ARR_ELEMTYPE(a), sizeof(Oid), true, TYPALIGN_INT,
 					  &elems, &nulls, &n);
 	for (int i = 0; i < n; i++)
 	{
@@ -2637,16 +2641,90 @@ carried_values(Datum values, Oid theirs, Oid src, const CarriedType *ct,
 			if (ct->theirs[k] == DatumGetObjectId(elems[i]))
 				break;
 		if (k == ct->nlabels)
-		{
-			*ok = false;
-			return values;
-		}
+			return NULL;
 		elems[i] = ObjectIdGetDatum(ct->mine[k]);
 	}
-	return PointerGetDatum(construct_md_array(elems, nulls, ARR_NDIM(a),
-											  ARR_DIMS(a), ARR_LBOUND(a),
-											  ct->ours, sizeof(Oid), true,
-											  TYPALIGN_INT));
+	return construct_md_array(elems, nulls, ARR_NDIM(a), ARR_DIMS(a),
+							  ARR_LBOUND(a), newelem, sizeof(Oid), true,
+							  TYPALIGN_INT);
+}
+
+/*
+ * A pg_statistic slot's values (an array) of source's column of type
+ * theirs, as the session branch's column of ct->ours takes them.
+ *
+ * - A slot of the column's type: copied as it is for a shared type; for a
+ *   versioned enum or domain, carried_elements()'s; for an array of one,
+ *   each element array carried so (the slot an array of arrays).
+ * - For an array of a versioned enum or domain, a slot of its element type
+ *   (its most common elements): carried_elements()'s.
+ * - A slot of another type (an array column's element counts, a range's
+ *   lengths, a tsvector's lexemes): copied as it is if that type is
+ *   shared; the column isn't carried (*ok false) if it is a versioned type
+ *   of source's.
+ *
+ * *ok is false too if an enum's label isn't found.  Values are only ever
+ * read as the array's own element type.
+ */
+static Datum
+carried_values(Datum values, Oid theirs, Oid src, const CarriedType *ct,
+			   bool *ok)
+{
+	ArrayType  *a = DatumGetArrayTypeP(values);
+	Oid			elem = ARR_ELEMTYPE(a);
+	ArrayType  *carried = NULL;
+
+	*ok = true;
+	if (elem == theirs && theirs == ct->ours && !ct->enumtype && !ct->array)
+		return values;
+	if (elem == theirs && !ct->array)
+		carried = carried_elements(a, ct->ours, ct);
+	else if (ct->array && elem == ct->theirelem)
+		carried = carried_elements(a, ct->ourelem, ct);
+	else if (ct->array && elem == theirs)
+	{
+		Datum	   *inner;
+		bool	   *nulls;
+		int			n;
+
+		deconstruct_array(a, elem, -1, false, ct->typalign,
+						  &inner, &nulls, &n);
+		for (int i = 0; i < n; i++)
+		{
+			ArrayType  *e;
+
+			if (nulls[i])
+				continue;
+			e = carried_elements(DatumGetArrayTypeP(inner[i]), ct->ourelem, ct);
+			if (e == NULL)
+			{
+				*ok = false;
+				return values;
+			}
+			inner[i] = PointerGetDatum(e);
+		}
+		carried = construct_md_array(inner, nulls, ARR_NDIM(a), ARR_DIMS(a),
+									 ARR_LBOUND(a), ct->ours, -1, false,
+									 ct->typalign);
+	}
+	else
+	{
+		HeapTuple	versioned = branch_row(TypeRelationId, TypeOidIndexId,
+										   Anum_pg_type_oid, elem, src);
+
+		if (versioned != NULL)
+		{
+			heap_freetuple(versioned);
+			*ok = false;
+		}
+		return values;
+	}
+	if (carried == NULL)
+	{
+		*ok = false;
+		return values;
+	}
+	return PointerGetDatum(carried);
 }
 
 /*

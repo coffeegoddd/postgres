@@ -165,16 +165,23 @@ is( on('main', q{SELECT count(*) FROM pg_stats
 
 # Statistics whose values are of another type than the column's: an array
 # column's elements and their counts, a tsvector's lexemes, a range's
-# lengths, copied as they are; a column of an array of a versioned type
-# (the enum's) takes none, and the table's other columns still do.
+# lengths, copied as they are.  Arrays of the enum and of the domain the
+# move made again are carried as their elements are, an enum array's labels
+# mapped in its most common elements and in its whole arrays; a column of
+# a composite type the move made again takes none, and the table's other
+# columns still do.
 sql(q{
 	SELECT dolt_checkout('b');
+	CREATE TYPE s.c AS (x int, y text);
 	CREATE TABLE s.arr (id int PRIMARY KEY, ia int[], tv tsvector,
-		r int4range, ee s.e[]);
+		r int4range, ee s.e[], dda s.d[], cc s.c);
 	INSERT INTO s.arr
 		SELECT g, ARRAY[g % 10, g % 7], to_tsvector('simple', 'w' || (g % 11)),
 			int4range(g % 50, g % 50 + g % 9 + 1),
-			ARRAY[CASE WHEN g % 2 = 0 THEN 'a' ELSE 'z' END]::s.e[]
+			ARRAY[CASE WHEN g % 3 = 0 THEN 'z' WHEN g % 3 = 1 THEN 'a'
+				  ELSE 'b' END]::s.e[],
+			ARRAY[g % 4 + 1, g % 6 + 1]::s.d[],
+			ROW(g % 5, 'c' || (g % 5))::s.c
 		FROM generate_series(1, 5000) g;
 	ANALYZE s.arr;
 	SELECT dolt_commit('-Am', 'arr');
@@ -186,8 +193,19 @@ is( on('main', q{
 			 range_length_histogram IS NOT NULL OR histogram_bounds IS NOT NULL),
 			',' ORDER BY attname)
 		FROM pg_stats WHERE schemaname = 's' AND tablename = 'arr'}),
-	'ia:true,id:true,r:true,tv:true',
-	"array, tsvector and range columns' statistics are carried and read");
+	'dda:true,ee:true,ia:true,id:true,r:true,tv:true',
+	"array, tsvector, range and versioned arrays' statistics are carried and read");
+is( on('main', q{SELECT most_common_elems::text || ' ' || most_common_vals::text
+		FROM pg_stats WHERE tablename = 'arr' AND attname = 'ee'}),
+	on('b', q{SELECT most_common_elems::text || ' ' || most_common_vals::text
+		FROM pg_stats WHERE tablename = 'arr' AND attname = 'ee'}),
+	"an enum array's statistics read as the source's");
+cmp_ok(plan_rows(q{SELECT * FROM s.arr WHERE ee @> ARRAY['z'::s.e]}), '>', 1000,
+	"an enum array's elements are estimated from them, labels mapped");
+cmp_ok(plan_rows(q{SELECT * FROM s.arr WHERE ee = ARRAY['a'::s.e]}), '>', 1000,
+	"and its whole arrays");
+cmp_ok(plan_rows(q{SELECT * FROM s.arr WHERE dda @> ARRAY[2]::s.d[]}), '>', 1000,
+	"a domain array's elements are");
 like(
 	on('main', q{SELECT most_common_elems::text FROM pg_stats
 		WHERE tablename = 'arr' AND attname = 'ia'}),
