@@ -1256,9 +1256,12 @@ couldn't write its rows, or one of its relations is in use: its rows are
 written.  Its locks are tried, not queued for, so as not to hold up the
 writers behind them.  A page sweep holding one is asked to let go, an
 autovacuum worker asked to cancel its task (as Postgres cancels one that
-blocks a lock waiter), and any other holder waited for, tried again a
-little later each time, for lock_timeout, or deadlock_timeout if that is
-0: the deadlock detector doesn't see the wait, so it is bounded.  A
+blocks a lock waiter) and waited for, for deadlock_timeout, and any other
+holder waited for, tried again a little later each time, for
+prolly.restore_lock_wait (100 ms): a statement lets go within a moment, a
+transaction left open won't soon, and the rows written instead often cost
+little.  lock_timeout, if set, caps both waits; the deadlock detector
+doesn't see them, so they are bounded.  A
 restore or share given up so is counted in pg_stat_prolly's
 restores_lock_busy.  Nor is one whose baseline
 holds the commit's rows with fewer than prolly.restore_min_changes (2) of

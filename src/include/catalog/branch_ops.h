@@ -68,6 +68,14 @@ typedef struct BranchKeptTable
 	const BranchKeptRelation *rels;
 } BranchKeptTable;
 
+/*
+ * prolly.restore_lock_wait: how long, in milliseconds, share(), restore()
+ * and share_kept() wait for a holder of a lock they need that isn't a page
+ * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
+ * caps it).
+ */
+extern PGDLLIMPORT int prolly_restore_lock_wait;
+
 typedef struct BranchOpsRoutine
 {
 	const char *name;
@@ -156,11 +164,13 @@ typedef struct BranchOpsRoutine
 	 * A lock not free at once is waited for, here and in restore() and
 	 * share_kept(), its holder asked to let go if it is a page sweep
 	 * (bmap_compaction_let_go()) or to cancel if it is an autovacuum
-	 * worker, but never queued for: within lock_timeout of *wait_start,
-	 * the operation's (0 until one of its tries first waits, which sets
-	 * it), or deadlock_timeout if lock_timeout is 0 (a sweep is waited out
-	 * then), so that one bound covers the waits of all the calls one
-	 * operation makes.  In those three, a lock taken "without waiting" is
+	 * worker, but never queued for: a sweep within lock_timeout of
+	 * *wait_start, the operation's (0 until one of its tries first waits,
+	 * which sets it), or for as long as it takes if lock_timeout is 0; a
+	 * worker asked to cancel for deadlock_timeout from when it was asked;
+	 * any other holder within prolly.restore_lock_wait of *wait_start,
+	 * lock_timeout capping both, so that one bound covers the waits of all
+	 * the calls one operation makes.  In those three, a lock taken "without waiting" is
 	 * one not queued for, tried until that bound.
 	 */
 	bool		(*share) (Oid source, List *relids,

@@ -6,11 +6,13 @@
 # once (the reset then writing the dirty rows back instead):
 #
 # - an autovacuum worker vacuuming the branch's copy is asked to cancel, as
-#   Postgres cancels one that blocks a lock waiter, and the reset restores;
-# - another holder is waited for, for lock_timeout: the reset restores once
-#   it lets go;
+#   Postgres cancels one that blocks a lock waiter, and waited for however
+#   short prolly.restore_lock_wait is (even 0): the reset restores;
+# - another holder is waited for, for prolly.restore_lock_wait: the reset
+#   restores once it lets go;
 # - one still there after that is given up on, the restore counted in
-#   restores_lock_busy, and the reset writes the rows.
+#   restores_lock_busy, and the reset writes the rows; lock_timeout caps
+#   the wait, and doesn't lengthen it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -120,7 +122,7 @@ ok( sql(qq{SELECT count(*) > 0 FROM pg_locks WHERE pid = $worker
 
 my $restored = counted('relations_restored');
 my $busy = counted('restores_lock_busy');
-my ($reset) = start_reset('');
+my ($reset) = start_reset(q{SET prolly.restore_lock_wait = 0});
 like(finish_reset($reset), qr/reset t/, 'the reset with autovacuum holding finished');
 ok(counted('relations_restored') > $restored,
 	'the reset restored the table the autovacuum held');
@@ -133,14 +135,14 @@ ok(at_head(), 'the scratch branch holds its head\'s rows');
 sql(q{SELECT injection_points_detach('vacuum-relation-held')});
 
 # 2. Another session on the scratch branch holding kp.t, letting go while
-# the reset waits for it (lock_timeout well past that)
+# the reset waits for it (prolly.restore_lock_wait well past that)
 dirty();
 my $holder = $node->background_psql('postgres');
 $holder->query_safe(q{SELECT dolt_checkout('scratch'); BEGIN;
 	LOCK TABLE kp.t IN SHARE UPDATE EXCLUSIVE MODE});
 $restored = counted('relations_restored');
 my $resetter;
-($reset, $resetter) = start_reset(q{SET lock_timeout = '3min'});
+($reset, $resetter) = start_reset(q{SET prolly.restore_lock_wait = '3min'});
 ok( $node->poll_query_until(
 		'postgres', qq{SELECT wait_event = 'BranchKeptLock'
 		FROM pg_stat_activity WHERE pid = $resetter}),
@@ -151,24 +153,37 @@ ok(counted('relations_restored') > $restored,
 	'the reset restored the table once the holder let go');
 ok(at_head(), 'the scratch branch holds its head\'s rows again');
 
-# 3. A holder that doesn't let go: given up on after lock_timeout, the
-# restore counted, and the rows written instead
-dirty();
-$holder->query_safe(q{BEGIN; LOCK TABLE kp.t IN SHARE UPDATE EXCLUSIVE MODE});
-$restored = counted('relations_restored');
-$busy = counted('restores_lock_busy');
-my $applied = counted('apply_rows');
-my $began = time();
-($reset) = start_reset(q{SET lock_timeout = '300ms'});
-like(finish_reset($reset), qr/reset t/, 'the reset with the lock held finished');
-my $took = time() - $began;
-ok($took >= 0.3, "the reset waited out lock_timeout ($took s)");
-is(counted('relations_restored'), $restored, 'nothing restored past lock_timeout');
-ok(counted('restores_lock_busy') > $busy, 'the restore given up on is counted');
-ok(counted('apply_rows') > $applied, 'the reset wrote the rows instead');
-$holder->query_safe(q{COMMIT});
+# 3. A holder that doesn't let go: given up on after the wait, the restore
+# counted, and the rows written instead.  The wait is the smaller of
+# prolly.restore_lock_wait and lock_timeout.
+sub given_up
+{
+	my ($settings, $at_least, $under, $what) = @_;
+	dirty();
+	$holder->query_safe(q{BEGIN; LOCK TABLE kp.t IN SHARE UPDATE EXCLUSIVE MODE});
+	my $restored = counted('relations_restored');
+	my $busy = counted('restores_lock_busy');
+	my $applied = counted('apply_rows');
+	my $began = time();
+	my ($reset) = start_reset($settings);
+	like(finish_reset($reset), qr/reset t/, "$what: the reset finished");
+	my $took = time() - $began;
+	ok($took >= $at_least && $took < $under,
+		"$what: the reset waited $at_least s and less than $under s ($took s)");
+	is(counted('relations_restored'), $restored, "$what: nothing restored");
+	ok(counted('restores_lock_busy') > $busy, "$what: the restore given up on is counted");
+	ok(counted('apply_rows') > $applied, "$what: the reset wrote the rows instead");
+	$holder->query_safe(q{COMMIT});
+	ok(at_head(), "$what: the scratch branch holds its head's rows");
+}
+
+given_up(q{SET prolly.restore_lock_wait = '300ms'}, 0.3, 10,
+	'prolly.restore_lock_wait alone');
+given_up(q{SET prolly.restore_lock_wait = '20s'; SET lock_timeout = '300ms'}, 0.3, 10,
+	'lock_timeout below prolly.restore_lock_wait');
+given_up(q{SET prolly.restore_lock_wait = '300ms'; SET lock_timeout = '20s'}, 0.3, 10,
+	'lock_timeout above prolly.restore_lock_wait');
 $holder->quit;
-ok(at_head(), 'the scratch branch holds its head\'s rows a third time');
 
 $node->stop;
 done_testing();

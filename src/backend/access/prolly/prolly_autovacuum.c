@@ -53,6 +53,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/branch_ops.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
@@ -210,6 +211,14 @@ prolly_autovacuum_init(void)
 							2, 0, INT_MAX,
 							PGC_USERSET,
 							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.restore_lock_wait",
+							"How long a move giving a table its kept or shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
+							"An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.",
+							&prolly_restore_lock_wait,
+							100, 0, INT_MAX,
+							PGC_USERSET,
+							GUC_UNIT_MS,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.log_full_folds",
 							"Logs each fold that reads its table in full, with why, once it reads at least this many rows.",

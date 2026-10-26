@@ -205,6 +205,9 @@ copy_storage(Form_pg_class c)
 /* the longest wait between tries at a lock a move restores under */
 #define KEPT_LOCK_MAX_DELAY_MS	10
 
+/* prolly.restore_lock_wait: how long a lock's other holders are waited for */
+int			prolly_restore_lock_wait = 100;
+
 /*
  * Try 'mode' on tag, the lock of relation relid on the branch it names
  * (taken as ConditionalLockRelationOid() takes it), or, for InvalidOid,
@@ -216,31 +219,38 @@ copy_storage(Form_pg_class c)
  *   queue, and waited out;
  * - an autovacuum worker is asked to cancel its task
  *   (CancelAutoVacuumHolders()), as Postgres asks one blocking a lock
- *   waiter, and waited for: it gives up its vacuum at once and comes back
- *   to the relation later;
+ *   waiter, and waited for, for deadlock_timeout from when it was asked:
+ *   it gives up its vacuum at its next check for interrupts, and comes
+ *   back to the relation later;
  * - any other holder is waited for, tried again a little later each time,
- *   for lock_timeout, or deadlock_timeout if lock_timeout is 0.
+ *   for prolly.restore_lock_wait.
  *
- * The wait is bounded, never as long as it takes, because the deadlock
- * detector doesn't see it: the caller holds the locks it has taken (the
- * relations restored before, and pg_class), and a holder waiting for one
- * of them would wait for as long as this does.  deadlock_timeout is the
- * time Postgres lets a lock wait go before it looks for a deadlock, and
- * before it cancels a blocking autovacuum; a holder still there after it
- * costs the move only the rows it then writes instead.  The deadline runs
- * from *start, the operation's (see BranchOpsRoutine's share()), so one
- * bound covers all of an operation's tries; a worker asked to cancel is
- * given the bound from when it was asked, too, so a later table's try
- * still waits for its worker to go.  False if the holder is still there
- * after it, counted in restores_lock_busy.
+ * lock_timeout, if set, caps both.  The waits are short, and never as long
+ * as it takes, because giving up costs only the rows the move then writes
+ * instead, and because the deadlock detector doesn't see them: the caller
+ * holds the locks it has taken (the relations restored before, and
+ * pg_class), and a holder waiting for one of them waits for as long as
+ * this does.  A statement holding the lock lets go within a moment, a
+ * transaction left open won't soon; a worker asked to cancel is given
+ * longer, as its going is certain.  The other holders' deadline runs from
+ * *start, the operation's (see BranchOpsRoutine's share()), so one bound
+ * covers all of an operation's tries; a worker's, from when it was asked,
+ * so a later table's try still waits for its worker to go.  False if the
+ * holder is still there after them, counted in restores_lock_busy.
  */
 static bool
 try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, TimestampTz *start)
 {
-	int			bound = LockTimeout > 0 ? LockTimeout : DeadlockTimeout;
+	int			bound = prolly_restore_lock_wait;
+	int			cancel_bound = DeadlockTimeout;
 	TimestampTz asked = 0;
 	long		delay = 1;
 
+	if (LockTimeout > 0)
+	{
+		bound = Min(bound, LockTimeout);
+		cancel_bound = Min(cancel_bound, LockTimeout);
+	}
 	for (;;)
 	{
 		TimestampTz now;
@@ -256,7 +266,8 @@ try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, TimestampTz *start)
 		if (*start == 0)
 			*start = now;
 		if (TimestampDifferenceExceeds(*start, now, bound) &&
-			(asked == 0 || TimestampDifferenceExceeds(asked, now, bound)))
+			(asked == 0 ||
+			 TimestampDifferenceExceeds(asked, now, cancel_bound)))
 		{
 			pgstat_count_prolly(PGSTAT_PROLLY_RESTORES_LOCK_BUSY, 1);
 			return false;
