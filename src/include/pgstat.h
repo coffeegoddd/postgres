@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD0C
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD0E
 
 typedef struct PgStat_ArchiverStats
 {
@@ -805,9 +805,12 @@ typedef enum PgStat_ProllyCounter
 										 * cache, not read */
 	PGSTAT_PROLLY_COMMIT_CACHE_MISSES,	/* and those looked for there and
 										 * read */
+	PGSTAT_PROLLY_KEPT_STATUS_CHECKS,	/* kept relations asked what is left
+										 * of their pages, to drop or
+										 * retire their commits */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_COMMIT_CACHE_MISSES + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_STATUS_CHECKS + 1)
 
 typedef struct PgStat_ProllyStats
 {

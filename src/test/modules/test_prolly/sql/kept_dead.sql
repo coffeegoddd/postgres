@@ -163,6 +163,31 @@ SELECT kept > 0 AS kept FROM test_chunk_gc(true);
 RESET client_min_messages;
 SELECT test_chunk_has(:'q') AS q_stored;
 
+-- Only the commits still kept are asked what is left of their pages, not
+-- the retired: those pile up within a transaction, each of its commits
+-- retiring one, so asking them too would make each commit ask of every
+-- one before it.  Forty commits in one transaction ask four times what ten
+-- do, no more.
+CREATE FUNCTION checks() RETURNS bigint LANGUAGE sql AS $$
+	SELECT coalesce((SELECT value FROM pg_stat_prolly
+					 WHERE name = 'kept_status_checks'), 0)
+$$;
+CREATE FUNCTION commits(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		PERFORM dolt_commit('--allow-empty', '-m', 'e' || i);
+	END LOOP;
+END $$;
+SELECT commits(3);
+SELECT pg_stat_force_next_flush();
+SELECT checks() AS c0 \gset
+SELECT commits(10);
+SELECT pg_stat_force_next_flush();
+SELECT checks() - :c0 AS c10, checks() AS c0 \gset
+SELECT commits(40);
+SELECT pg_stat_force_next_flush();
+SELECT :c10 > 0 AS asked, checks() - :c0 <= 4 * :c10 AS each_commit_the_same;
+
 \c :home
 DROP DATABASE kept_dead;
 DROP DATABASE kept_dead_gc;
