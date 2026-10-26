@@ -456,7 +456,13 @@ transaction ID" for all serializable transactions as assumed in the
 Cahill thesis, we track the oldest snapshot xmin among serializable
 transactions, and a count of how many active transactions use that
 xmin. When the count hits zero we find the new oldest xmin and run a
-clean-up based on that.
+clean-up based on that.  A backend whose transactions are never
+serializable can ask to be passed over (PredicateLockingPassOverBackend):
+its running xids are then left out of the xmins serializable transactions
+are registered with, so a long transaction of its doesn't hold back the
+clean-up.  The bound still holds: a serializable transaction running as
+another's snapshot is taken either has its xid then, which is counted, or
+is given one no lower than that snapshot's xmax.
 
     * Because reads in a subtransaction may cause that subtransaction
 to roll back, thereby affecting what is written by the top level

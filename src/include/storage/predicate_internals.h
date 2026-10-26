@@ -141,6 +141,13 @@ typedef struct SERIALIZABLEXACT
  */
 #define SXACT_FLAG_PARTIALLY_RELEASED	0x00000800
 
+/*
+ * The most transactions of backends passed over by predicate locking that
+ * can be left out of serializable transactions' xmins at once.  One more is
+ * counted in them as any other transaction is.
+ */
+#define MAX_PASSED_OVER_XIDS	64
+
 typedef struct PredXactListData
 {
 	dlist_head	availableList;
@@ -170,6 +177,16 @@ typedef struct PredXactListData
 	SerCommitSeqNo HavePartialClearedThrough;	/* have cleared through this
 												 * seq no */
 	SERIALIZABLEXACT *OldCommittedSxact;	/* shared copy of dummy sxact */
+
+	/*
+	 * The xids of transactions running in backends that never run
+	 * serializable ones (see PredicateLockingPassOverBackend()), left out of
+	 * the xmin a serializable transaction is registered with;
+	 * InvalidTransactionId marks a free slot.  Protected by
+	 * SerializableXactHashLock.
+	 */
+	int			passedOverXidCount;
+	TransactionId passedOverXids[MAX_PASSED_OVER_XIDS];
 
 	SERIALIZABLEXACT *element;
 }			PredXactListData;

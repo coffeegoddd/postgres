@@ -74,6 +74,7 @@
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
+#include "storage/predicate.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -734,6 +735,18 @@ ProllyFolderWorkerMain(Datum main_arg)
 	 * back for nothing.
 	 */
 	SetConfigOption("lock_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
+
+	/*
+	 * A fold's transactions are never serializable, as autovacuum's aren't:
+	 * its reads of every table it folds would conflict with each serializable
+	 * writer of them.  And they are passed over by predicate locking: a fold
+	 * writes for as long as it reads, and its xid, running, would otherwise
+	 * hold back the cleanup of every serializable transaction that commits
+	 * meanwhile (see PredicateLockingPassOverBackend()).
+	 */
+	SetConfigOption("default_transaction_isolation", "read committed",
+					PGC_SUSET, PGC_S_OVERRIDE);
+	PredicateLockingPassOverBackend();
 	prolly_database_components(&dc);
 	if (!PROLLY_HAS(dc.refs, moved_branches))
 		proc_exit(0);
