@@ -18,6 +18,9 @@
 
 #include "access/prolly_config.h"
 
+/* schema_versioning.c: test_prolly.version_new_schemas */
+extern void schema_versioning_init(void);
+
 /* foundation_checks.c */
 extern void chunker_deterministic(const ProllyImplInfo *impl);
 extern void chunker_forced_split(const ProllyImplInfo *impl);

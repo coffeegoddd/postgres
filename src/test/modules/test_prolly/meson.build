@@ -8,6 +8,7 @@ test_prolly_sources = files(
   'catalog_checks.c',
   'foundation_checks.c',
   'keying_checks.c',
+  'schema_versioning.c',
   'tree_checks.c',
   'test_prolly.c',
 )
@@ -253,6 +254,7 @@ tests += {
       'move_calls',
       'scoped_refs',
       'revision_names',
+      'version_new_schemas',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

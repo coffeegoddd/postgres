@@ -406,6 +406,7 @@ _PG_init(void)
 {
 	prolly_register_impl(&test_fnv_hash.info);
 	prolly_register_impl(&test_broken_hash.info);
+	schema_versioning_init();
 }
 
 /* ------------------------------------------------------------------------
