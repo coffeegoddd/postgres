@@ -7740,6 +7740,7 @@ check_enum_layout(Oid type, const Table *from, const Table *to, List *seen)
 	if (before && after && strcmp(before->definition, after->definition) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errschemaconflict(),
 				 errmsg("schema conflict: cannot map historical enum labels through redefined type %s", name),
 				 errhint("Merge row changes before changing the enclosing type.")));
 	if (get_typtype(type) == TYPTYPE_DOMAIN)
@@ -7762,6 +7763,7 @@ check_enum_layout(Oid type, const Table *from, const Table *to, List *seen)
 	else if (type_is_range(type) || type_is_multirange(type))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errschemaconflict(),
 				 errmsg("schema conflict: cannot map historical enum labels inside %s", name),
 				 errhint("Merge row changes before changing the range's enum labels.")));
 }
@@ -9465,6 +9467,7 @@ refuse_lost_changes(Relation rel, const Table *base, const Table *side,
 	if (!same_table_enums(base, now) || !same_table_enums(side, now))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errschemaconflict(),
 				 errmsg("schema conflict: cannot merge dropped columns with changed enum labels"),
 				 errhint("Merge row changes before dropping columns or changing enum labels.")));
 	require_readable(base);
@@ -10249,6 +10252,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 		if (mr->schema_conflicts != NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errschemaconflict(),
 					 errmsg("schema conflict: %s was changed differently on both sides, and the other side's objects use its version of it",
 							(char *) linitial(mr->schema_conflicts)),
 					 errdetail("Kept as the branch has it, the table doesn't fit the other side's objects: %s",
@@ -10256,6 +10260,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 					 errhint("Make the definitions agree on one side, and merge again.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errschemaconflict(),
 				 errmsg("schema conflict: the merged definitions don't fit together"),
 				 errdetail("Merged, one side's objects use what the other dropped: %s",
 						   ed->message)));
@@ -10689,6 +10694,7 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 					strcmp(r->table, kept) == 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errschemaconflict(),
 							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
 									kept),
 							 errdetail("The table can't be kept as the branch names it.")));

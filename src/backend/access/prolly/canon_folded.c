@@ -11366,6 +11366,8 @@ try_statement(const char *sql, MemoryContext mcxt, ResourceOwner owner,
 		CurrentResourceOwner = owner;
 		if (!waits_on_another(ed))
 			ReThrowError(ed);
+		/* (a schema conflict swallowed here isn't the caller's: prolly_merge.h) */
+		prolly_schema_conflict_raised = false;
 		if (failure)
 			*failure = ed;
 		else
@@ -14759,6 +14761,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 				!string_change_merges(type[0], type[side]))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errschemaconflict(),
 						 errmsg("schema conflict: column %s of %s changed type from %s to %s on one side, and the other side changed the table",
 								col, name, type[0], type[side]),
 						 errdetail("A change of type merges with the other side's changes only as a string type made no shorter.")));
@@ -14844,6 +14847,7 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
 				if (list_has_string(seen, psprintf("t:%s", parent)))
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errschemaconflict(),
 							 errmsg("schema conflict: %s inherits from %s on one side, and the other side dropped %s",
 									name, parent, parent),
 							 errdetail("A table can't inherit from a table that isn't there.")));
@@ -14858,6 +14862,7 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
 			if (!columns_cover(&td, names, coltypes, false))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errschemaconflict(),
 						 errmsg("schema conflict: %s inherits from %s, whose columns the merge doesn't give it",
 								name, parent),
 						 errdetail("One side changed the inheritance, and the other the columns of either table; a table inheriting from another must have each of its columns, of the same type.")));
@@ -14871,6 +14876,7 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
 				if (list_has_string(seen, psprintf("y:%s", td.of)))
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errschemaconflict(),
 							 errmsg("schema conflict: %s is of type %s on one side, and the other side dropped %s",
 									name, td.of, td.of),
 							 errdetail("A typed table's type must be there.")));
@@ -14881,6 +14887,7 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
 							   composite_attribute_types(list_nth(type_defs, at)), true))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errschemaconflict(),
 						 errmsg("schema conflict: %s is of type %s, whose attributes the merge doesn't give it as its columns",
 								name, td.of),
 						 errdetail("One side made the table typed, and the other changed its columns or the type's attributes; a typed table's columns are exactly its type's.")));
@@ -15011,6 +15018,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errschemaconflict(),
 					 errmsg("schema conflict: %s was changed differently on both sides",
 							from_utf8(least->data + 2, least->len - 2)),
 					 errdetail("Both branches made, dropped or redefined it since their common ancestor.")));
@@ -15072,6 +15080,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			if (schema && list_has_string(dropped, schema))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errschemaconflict(),
 						 errmsg("schema conflict: schema %s was dropped on one side and given %s on the other",
 								schema, (char *) lfirst(lc)),
 						 errdetail("Dropping it would drop what the other side made in it.")));
@@ -16609,11 +16618,13 @@ merged_name(MergedObject *m, const char *table)
 		if (table)
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errschemaconflict(),
 					 errmsg("schema conflict: column %s of %s is renamed %s on one side and %s on the other",
 							quote_identifier(was), table, quote_identifier(o),
 							quote_identifier(t))));
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errschemaconflict(),
 				 errmsg("schema conflict: table %s is renamed %s on one side and %s on the other",
 						was, o, t)));
 	}
@@ -16671,6 +16682,7 @@ settle_merged_names(List *objs, const char *table)
 				if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errschemaconflict(),
 							 table ?
 							 errmsg("schema conflict: the merge would give two columns of %s the name %s",
 									table, quote_identifier(m->id.name)) :
@@ -16773,6 +16785,7 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 			if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errschemaconflict(),
 						 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
 								(char *) lfirst(nc)),
 						 errdetail("Kept as the branch names it, %s, it would share that name with another table the merge keeps.",

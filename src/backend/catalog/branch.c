@@ -1304,8 +1304,12 @@ branch_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			undo_new_branches(InvalidSubTransactionId);
+			/*
+			 * (returns first: one to a branch the transaction made goes on
+			 * back from it, as it goes)
+			 */
 			undo_returns(InvalidSubTransactionId);
+			undo_new_branches(InvalidSubTransactionId);
 			release_left_branches();
 			forget_written(InvalidSubTransactionId);
 			break;
@@ -1336,8 +1340,8 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	switch (event)
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
-			undo_new_branches(mySubid);
 			undo_returns(mySubid);
+			undo_new_branches(mySubid);
 			forget_written(mySubid);
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:
@@ -1466,11 +1470,21 @@ check_out_branch(Oid branch)
 	if (!SearchSysCacheExists1(BRANCHOID, ObjectIdGetDatum(branch)))
 		return false;
 
+	/*
+	 * (the way back from a new branch is the branch last left for it, but
+	 * not one made after it: that goes first if both are undone, and the
+	 * session would be left on a branch no longer there)
+	 */
 	foreach(lc, new_branches)
 	{
 		NewBranch  *nb = lfirst(lc);
+		bool		from_newer = false;
 
-		if (nb->branch == branch && MyBranch != branch)
+		if (nb->branch != branch || MyBranch == branch)
+			continue;
+		for (int i = foreach_current_index(lc) + 1; i < list_length(new_branches); i++)
+			from_newer |= ((NewBranch *) list_nth(new_branches, i))->branch == MyBranch;
+		if (!from_newer)
 		{
 			nb->left = MyBranch;
 			nb->left_read_only = MyBranchReadOnly;

@@ -173,15 +173,34 @@ adapts.
   commits. `WORKING` in `dolt_status` and
   `dolt_diff` is the branch's working set as the current transaction
   sees it, its own uncommitted writes included, as a Dolt session's
-  working root includes its own (#501). A rebase whose step conflicts
-  stops there, in a transaction block (or with
-  `dolt.allow_commit_conflicts`), returning `{1, message}` rather than
-  Dolt's error, which here would roll the stop back. Outside a block it
-  is an error, and the statement rolls back: a rebase the statement
-  began is gone, as Dolt aborts it, but one begun before (an
-  interactive rebase's `--continue`) stays as it was before the
-  statement, its plan to change or abort, where Dolt aborts it. A
-  schema conflict is such an error, in a block or not.
+  working root includes its own (#501). Dolt's rebase fails every
+  conflicting step with an error, having first kept what the step leaves
+  (`dolt_rebase.go` at the pinned revision: `handleRebaseCherryPick`,
+  lines 990–1062, and `validateConflictsCanBeResolved`, 1122–1144;
+  `doltRebase`, 181–187, returns the error without the row): a data
+  conflict that the session can keep (`@@autocommit` off, or
+  `@@dolt_allow_commit_conflicts` on) stops the rebase with its
+  conflicts recorded ("data conflict detected while rebasing commit …");
+  one it can't, or a schema conflict, aborts the rebase ("data conflicts
+  from rebase, but session settings do not allow preserving conflicts,
+  …", "schema conflict detected while rebasing commit … the rebase has
+  been automatically aborted"). A Postgres error would roll back what
+  the step kept, so prolly keeps it and returns `{1, message}` with
+  Dolt's message instead: a data conflict stops the rebase in a
+  transaction block or with `dolt.allow_commit_conflicts`, its conflicts
+  in `dolt_conflicts` and the branch's commits refused until they're
+  resolved, as Dolt's; outside a block without it, and on a schema
+  conflict, the rebase is aborted, back on the branch rebased (a notice
+  says why). A client checks the status as it would Dolt's error. The
+  abort is the transaction's: rolled back, by the block or to a
+  savepoint, it leaves the rebase in progress and the session on its
+  branch, as `--abort`'s and a finished rebase's do. Where the statement
+  began the rebase itself (`dolt_rebase('main')`, not `--continue`),
+  conflicts it can't keep and schema conflicts are errors (40001; a
+  schema conflict's with Dolt's message): outside a block, rolling the
+  statement back leaves what Dolt's abort does, the rebase never begun;
+  in one, the error aborts the whole transaction, as any error does,
+  where Dolt's leaves its transaction going.
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
