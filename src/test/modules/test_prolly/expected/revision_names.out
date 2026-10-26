@@ -422,6 +422,46 @@ SELECT count(*) FROM "regress_revisions/b1".rn.t;
     10
 (1 row)
 
+-- a grant taken away on the branch is seen at the next read
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+ALTER TABLE rn.t DISABLE ROW LEVEL SECURITY;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ count 
+-------
+    10
+(1 row)
+
+RESET ROLE;
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+REVOKE SELECT ON rn.t FROM regress_revisions_reader;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ERROR:  permission denied for table t of revision "b1"
+DETAIL:  Reading another branch's table takes the branch's grants on it.
+RESET ROLE;
 -- a commit's table: dolt_at()'s privileges, the table here
 REVOKE SELECT ON rn.t FROM regress_revisions_reader;
 SET ROLE regress_revisions_reader;

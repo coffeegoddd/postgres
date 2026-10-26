@@ -94,6 +94,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
@@ -303,12 +304,97 @@ prolly_check_catalog_name(const char *catalogname, const char *qualified)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * What reading another branch's catalogs found, kept for the next query:
+ * a table's OID by its name there, and that a role may read all of it (with
+ * no row security).  Catalog rows read for another branch aren't kept in
+ * the catalog caches, so each lookup is a catalog scan; these are flushed
+ * by any change to a relation's, schema's or role's rows (on any branch:
+ * invalidations name no branch), which every change that could alter what
+ * they hold sends.  A table's OID found here is checked against its entry
+ * once locked, as a lookup's is.
+ */
+typedef struct BranchNameKey
+{
+	Oid			branch;
+	NameData	schema;
+	NameData	relname;
+} BranchNameKey;
+
+typedef struct BranchNameEnt
+{
+	BranchNameKey key;
+	Oid			relid;
+} BranchNameEnt;
+
+typedef struct BranchGrantKey
+{
+	Oid			branch;
+	Oid			relid;
+	Oid			role;
+} BranchGrantKey;
+
+static HTAB *branch_names = NULL;
+static HTAB *branch_grants = NULL;
+
+static void
+branch_lookups_flush(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
+{
+	HASH_SEQ_STATUS status;
+	void	   *ent;
+
+	if (branch_names != NULL)
+	{
+		hash_seq_init(&status, branch_names);
+		while ((ent = hash_seq_search(&status)) != NULL)
+			hash_search(branch_names, ent, HASH_REMOVE, NULL);
+	}
+	if (branch_grants != NULL)
+	{
+		hash_seq_init(&status, branch_grants);
+		while ((ent = hash_seq_search(&status)) != NULL)
+			hash_search(branch_grants, ent, HASH_REMOVE, NULL);
+	}
+}
+
+static void
+branch_lookups_init(void)
+{
+	HASHCTL		ctl;
+
+	if (branch_names != NULL)
+		return;
+	ctl.keysize = sizeof(BranchNameKey);
+	ctl.entrysize = sizeof(BranchNameEnt);
+	ctl.hcxt = CacheMemoryContext;
+	branch_names = hash_create("revision table names", 64, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ctl.keysize = sizeof(BranchGrantKey);
+	ctl.entrysize = sizeof(BranchGrantKey);
+	branch_grants = hash_create("revision table grants", 64, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	CacheRegisterSyscacheCallback(RELOID, branch_lookups_flush, (Datum) 0);
+	CacheRegisterSyscacheCallback(NAMESPACEOID, branch_lookups_flush, (Datum) 0);
+	CacheRegisterSyscacheCallback(AUTHOID, branch_lookups_flush, (Datum) 0);
+	CacheRegisterSyscacheCallback(AUTHMEMMEMROLE, branch_lookups_flush, (Datum) 0);
+}
+
 /* schema.relname's OID on branch (InvalidOid: none) */
 static Oid
 branch_relid(Oid branch, const char *schema, const char *relname)
 {
 	Oid			relid = InvalidOid;
+	BranchNameKey key;
+	BranchNameEnt *ent;
 
+	branch_lookups_init();
+	memset(&key, 0, sizeof(key));
+	key.branch = branch;
+	namestrcpy(&key.schema, schema);
+	namestrcpy(&key.relname, relname);
+	ent = hash_search(branch_names, &key, HASH_FIND, NULL);
+	if (ent != NULL)
+		return ent->relid;
 	CATALOG_READ_ON_BRANCH(branch,
 						   {
 							   Oid			nsp = get_namespace_oid(schema, true);
@@ -316,6 +402,11 @@ branch_relid(Oid branch, const char *schema, const char *relname)
 							   if (OidIsValid(nsp))
 								   relid = get_relname_relid(relname, nsp);
 						   });
+	if (OidIsValid(relid))
+	{
+		ent = hash_search(branch_names, &key, HASH_ENTER, NULL);
+		ent->relid = relid;
+	}
 	return relid;
 }
 
@@ -587,11 +678,21 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 	Oid			relid = RelationGetRelid(rr->heap);
 	Oid			user = GetUserId();
 	bool		allowed = true;
-	int			rls;
+	int			rls = RLS_NONE;
+	BranchGrantKey key;
 
+	branch_lookups_init();
+	key.branch = rr->rev.branch;
+	key.relid = relid;
+	key.role = user;
+	if (hash_search(branch_grants, &key, HASH_FIND, NULL) != NULL)
+		return;
 	CATALOG_READ_ON_BRANCH(rr->rev.branch,
 						   {
-							   if (pg_class_aclcheck(relid, user, ACL_SELECT) != ACLCHECK_OK)
+							   bool		table_ok;
+
+							   table_ok = pg_class_aclcheck(relid, user, ACL_SELECT) == ACLCHECK_OK;
+							   if (!table_ok)
 							   {
 								   bool		any = false;
 
@@ -609,7 +710,10 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 																 ACLMASK_ANY) != ACLCHECK_OK)
 									   allowed = false;
 							   }
-							   rls = check_enable_rls(relid, InvalidOid, true);
+							   if (rr->heap->rd_rel->relrowsecurity)
+								   rls = check_enable_rls(relid, InvalidOid, true);
+							   else if (table_ok)
+								   (void) hash_search(branch_grants, &key, HASH_ENTER, NULL);
 						   });
 	if (!allowed)
 		ereport(ERROR,

@@ -132,6 +132,19 @@ SET ROLE regress_revisions_reader;
 SELECT count(*) FROM "regress_revisions/b1".rn.t;
 RESET ROLE;
 SELECT count(*) FROM "regress_revisions/b1".rn.t;
+-- a grant taken away on the branch is seen at the next read
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ALTER TABLE rn.t DISABLE ROW LEVEL SECURITY;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+RESET ROLE;
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+REVOKE SELECT ON rn.t FROM regress_revisions_reader;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+RESET ROLE;
 -- a commit's table: dolt_at()'s privileges, the table here
 REVOKE SELECT ON rn.t FROM regress_revisions_reader;
 SET ROLE regress_revisions_reader;
