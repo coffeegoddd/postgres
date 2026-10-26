@@ -238,7 +238,7 @@ def validate(cfg: dict, suite: str) -> None:
             "V6": {"background", "branches", "changes"}, "V7": {"background", "commit_modes", "commits"},
             "V8": {"background", "commits", "update_percent"},
             "V9": {"background", "rows", "delta", "delta_rows", "deltas", "others",
-                   "others_rows"},
+                   "others_rows", "branches"},
             "V10": {"background", "caches", "reps"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})
     keys.update({f"S{i}": set() for i in (1, 2, 4, 6, 7)})
