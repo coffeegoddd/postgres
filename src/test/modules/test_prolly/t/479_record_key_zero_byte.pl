@@ -71,10 +71,10 @@ is(sql(qq{SELECT test_chunk_has('$commit')}), 'f', 'the collection took the comm
 # still had, and its publish, rebuilt on the collection's root, puts it
 # back.
 $maker->query_until(qr/started/, "\\echo started\n" . make_sql($date) . ";\n\\echo made\n");
-$node->poll_query_until('zb', q{SELECT count(*) > 0 FROM pg_stat_activity
+ok($node->poll_query_until('zb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE state = 'active' AND wait_event_type = 'Lock'
-	AND backend_type = 'client backend' AND pid <> pg_backend_pid()})
-  or diag('the commit did not wait');
+	AND backend_type = 'client backend' AND pid <> pg_backend_pid()}),
+	'the commit made again waits for the collection');
 $gc->query_safe(q{COMMIT});
 $maker->query_until(qr/made/, '');
 $maker->quit;
