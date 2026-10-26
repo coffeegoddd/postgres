@@ -17,6 +17,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_merge.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
@@ -152,6 +153,7 @@ enum_targets(ProllyEnumMapping *m)
 	if (m->targets == NIL && m->before != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errschemaconflict(),
 				 errmsg("schema conflict: cannot map historical labels of enum %s",
 						format_type_be(m->type)),
 				 errdetail("Labels are read across commits that rename labels in place or add labels keeping the others in order, not across one that does both or reuses a label."),
@@ -211,6 +213,7 @@ historical_enum_label(ProllyDatumCodec *c, const char *label)
 			if (target == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errschemaconflict(),
 						 errmsg("schema conflict: enum label \"%s\" of %s has no label to read as",
 								label, format_type_be(c->type)),
 						 errdetail("It was added where the enum it's read as doesn't have it.")));

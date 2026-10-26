@@ -190,12 +190,17 @@ adapts.
   transaction block or with `dolt.allow_commit_conflicts`, its conflicts
   in `dolt_conflicts` and the branch's commits refused until they're
   resolved, as Dolt's; outside a block without it, and on a schema
-  conflict, the rebase is aborted, back on the branch rebased. A client
-  checks the status as it would Dolt's error. Where the statement began
-  the rebase itself (`dolt_rebase('main')`, not `--continue`), rolling
-  it back leaves what Dolt's abort does, so conflicts it can't keep and
-  schema conflicts are errors there (40001; a schema conflict's with
-  Dolt's message), and the rebase never began.
+  conflict, the rebase is aborted, back on the branch rebased (a notice
+  says why). A client checks the status as it would Dolt's error. The
+  abort is the transaction's: rolled back, by the block or to a
+  savepoint, it leaves the rebase in progress and the session on its
+  branch, as `--abort`'s and a finished rebase's do. Where the statement
+  began the rebase itself (`dolt_rebase('main')`, not `--continue`),
+  conflicts it can't keep and schema conflicts are errors (40001; a
+  schema conflict's with Dolt's message): outside a block, rolling the
+  statement back leaves what Dolt's abort does, the rebase never begun;
+  in one, the error aborts the whole transaction, as any error does,
+  where Dolt's leaves its transaction going.
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is

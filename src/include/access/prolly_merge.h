@@ -71,6 +71,12 @@
  *   as a pick's conflicts do, recording in the merge state the head before
  *   the series (series_head; NULL: the head now), for an abort to go back
  *   to, and the commits still to revert.
+ * - A merge's, pick's or revert's definitions that don't merge (a schema
+ *   conflict, the merge's limits on reading history across a type's
+ *   changes too) fail with errschemaconflict() among the error's
+ *   arguments, which callers that stop on schema conflicts (a rebase)
+ *   tell the error apart by: prolly_schema_conflict_raised is set as it
+ *   is raised, for the caller to clear before and read once caught.
  *
  * Provisional (v0).
  *
@@ -177,5 +183,9 @@ typedef struct ProllyMergeRoutine
 	"move_to", "cherry_pick", "verify", "revert", "apply", "row_count"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 #define PROLLY_MERGE_LAST_CALLBACK row_count
+
+/* a schema conflict's error: see above */
+extern PGDLLIMPORT bool prolly_schema_conflict_raised;
+extern int	errschemaconflict(void);
 
 #endif							/* PROLLY_MERGE_H */

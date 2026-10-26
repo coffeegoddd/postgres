@@ -1639,11 +1639,16 @@ state.  A step that conflicts stops the rebase as a pick in progress, in
 a transaction block or with dolt.allow_commit_conflicts, and --continue
 commits its resolution.  Where Dolt aborts the rebase (conflicts the
 session can't keep, or a pick whose definitions conflict: a schema
-conflict), --continue picks in a subtransaction, rolls it back and
+conflict, which the merge's error marks with errschemaconflict()),
+--continue runs its steps in one subtransaction, rolls it back and
 aborts the rebase, returning status 1 with Dolt's message, since an
-error would roll the abort back with the statement; a rebase the
-statement began itself is rolled back by an error instead.  Conflict
-stops return status 1 where Dolt errors, for the same reason.  The last
+error would roll the abort back with the statement; any other error
+fails the statement, the rebase left as it was.  A rebase the statement
+began itself is rolled back by an error instead.  Conflict stops return
+status 1 where Dolt errors, for the same reason.  An abort, or the end
+of a rebase, that is rolled back puts the session back on the rebase's
+branch, whose deletion is undone (branch_return_on_abort()); a plain
+checkout stays the session's, as Dolt's does.  The last
 step done, the rebased branch is moved to the rebase's head (refused if
 it moved meanwhile), and the rebase's branch deleted.  An edit's stop
 may amend the commit it stopped at: dolt_commit('--amend') replaces the

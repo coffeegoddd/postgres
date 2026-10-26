@@ -362,5 +362,58 @@ END $$;
 SELECT active_branch(),
 	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc') AS left;
 
+-- a schema conflict at --continue in a transaction block: aborted
+-- there too, the abort the block's to commit
+SELECT dolt_checkout('-b', 'sc3', 'main') IS NOT NULL AS on_sc3;
+ALTER TABLE rb.c ADD COLUMN y text NOT NULL DEFAULT '';
+SELECT dolt_commit('-am', 'adding y') IS NOT NULL AS committed;
+ALTER TABLE rb.c ALTER COLUMN y DROP NOT NULL;
+SELECT dolt_commit('-am', 'altering y') IS NOT NULL AS committed;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT r[1], r[2] LIKE 'schema conflict detected while rebasing commit %. the rebase has been automatically aborted' AS aborted
+	FROM dolt_rebase('--continue') r;
+COMMIT;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+SELECT message FROM dolt_log LIMIT 1;
+
+-- rolled back, an abort leaves the rebase as it was, the session on its
+-- branch: at --continue's abort, or --abort's, by the block or a savepoint
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+ROLLBACK;
+SELECT active_branch();
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+COMMIT;
+BEGIN;
+SELECT dolt_rebase('--abort');
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_rebase('--abort');
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+COMMIT;
+-- (a rebase done, rolled back, as well)
+UPDATE dolt_rebase SET rebase_order = 1 WHERE rebase_order = 2.1;
+UPDATE dolt_rebase SET action = 'drop' WHERE rebase_order = 2;
+BEGIN;
+SELECT dolt_rebase('--continue');
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+SELECT dolt_rebase('--abort');
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+
 \c postgres
 DROP DATABASE regress_rebase;

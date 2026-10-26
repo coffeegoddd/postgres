@@ -1202,6 +1202,9 @@ SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
 
 SELECT r[1], r[2] LIKE 'data conflicts from rebase, but session settings do not allow preserving conflicts, so they cannot be resolved. The rebase has been aborted. %' AS aborted
 	FROM dolt_rebase('--continue') r;
+NOTICE:  rebase conflict detected, rebase aborted
+DETAIL:  1 row was changed differently on both sides.
+HINT:  Rebase in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
  r | aborted 
 ---+---------
  1 | t
@@ -1278,6 +1281,169 @@ SELECT active_branch(),
  active_branch | left 
 ---------------+------
  sc            |    0
+(1 row)
+
+-- a schema conflict at --continue in a transaction block: aborted
+-- there too, the abort the block's to commit
+SELECT dolt_checkout('-b', 'sc3', 'main') IS NOT NULL AS on_sc3;
+ on_sc3 
+--------
+ t
+(1 row)
+
+ALTER TABLE rb.c ADD COLUMN y text NOT NULL DEFAULT '';
+SELECT dolt_commit('-am', 'adding y') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE rb.c ALTER COLUMN y DROP NOT NULL;
+SELECT dolt_commit('-am', 'altering y') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT r[1], r[2] LIKE 'schema conflict detected while rebasing commit %. the rebase has been automatically aborted' AS aborted
+	FROM dolt_rebase('--continue') r;
+NOTICE:  schema conflict: rb.c was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ r | aborted 
+---+---------
+ 1 | t
+(1 row)
+
+COMMIT;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+ active_branch | left 
+---------------+------
+ sc3           |    0
+(1 row)
+
+SELECT message FROM dolt_log LIMIT 1;
+  message   
+------------
+ altering y
+(1 row)
+
+-- rolled back, an abort leaves the rebase as it was, the session on its
+-- branch: at --continue's abort, or --abort's, by the block or a savepoint
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+UPDATE dolt_rebase SET rebase_order = 2.1 WHERE rebase_order = 1;
+BEGIN;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+NOTICE:  schema conflict: rb.c was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ aborted 
+---------
+ 1
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+  active_branch  
+-----------------
+ dolt_rebase_sc3
+(1 row)
+
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+ rebase_order | action | commit_message 
+--------------+--------+----------------
+         2.00 | pick   | altering y
+         2.10 | pick   | adding y
+(2 rows)
+
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('--continue'))[1] AS aborted;
+NOTICE:  schema conflict: rb.c was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ aborted 
+---------
+ 1
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+  active_branch  | steps 
+-----------------+-------
+ dolt_rebase_sc3 |     2
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+  active_branch  | steps 
+-----------------+-------
+ dolt_rebase_sc3 |     2
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+  active_branch  | steps 
+-----------------+-------
+ dolt_rebase_sc3 |     2
+(1 row)
+
+COMMIT;
+-- (a rebase done, rolled back, as well)
+UPDATE dolt_rebase SET rebase_order = 1 WHERE rebase_order = 2.1;
+UPDATE dolt_rebase SET action = 'drop' WHERE rebase_order = 2;
+BEGIN;
+SELECT dolt_rebase('--continue');
+                      dolt_rebase                      
+-------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/sc3"}
+(1 row)
+
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_rebase) AS steps;
+  active_branch  | steps 
+-----------------+-------
+ dolt_rebase_sc3 |     2
+(1 row)
+
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+ active_branch | left 
+---------------+------
+ sc3           |    0
 (1 row)
 
 \c postgres
