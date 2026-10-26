@@ -59,7 +59,7 @@ $gc->quit;
 
 is(sql(q{SELECT dolt_hashof('second')}), $commit, 'the commit made again has the same id');
 is(sql(qq{SELECT test_chunk_has('$commit')}), 't', 'it is stored');
-is(sql(qq{SELECT test_refs_value('L' || '$commit') IS NOT NULL}), 't',
+is(sql(qq{SELECT test_refs_record('$commit') IS NOT NULL}), 't',
 	'its record survives the collection that forgot it before');
 
 $node->stop;

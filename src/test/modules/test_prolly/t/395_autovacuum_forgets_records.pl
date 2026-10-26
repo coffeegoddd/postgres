@@ -37,7 +37,7 @@ my $abandoned = sql(q{SELECT dolt_checkout('abandon') IS NULL;
 	SELECT dolt_hashof('HEAD')});
 $abandoned = (split /\n/, $abandoned)[-1];
 sql(q{SELECT dolt_branch('-D', 'abandon')});
-is(sql(qq{SELECT test_refs_value('L' || '$abandoned') IS NOT NULL}),
+is(sql(qq{SELECT test_refs_record('$abandoned') IS NOT NULL}),
 	't', 'the abandoned commit is recorded');
 
 # Past the threshold: an automatic collection takes the abandoned commit,
@@ -47,9 +47,9 @@ sql(q{SELECT count(test_chunk_put(test_noise(g::text, 100000)))
 	FROM generate_series(1, 20) g});
 ok( $node->poll_query_until(
 		'av', qq{SELECT NOT test_chunk_has('$abandoned')
-		AND test_refs_value('L' || '$abandoned') IS NULL}),
+		AND test_refs_record('$abandoned') IS NULL}),
 	"an automatic collection's step after it forgets the collected commit's record");
-is(sql(qq{SELECT test_refs_value('L' || '$live') IS NOT NULL}),
+is(sql(qq{SELECT test_refs_record('$live') IS NOT NULL}),
 	't', "a live commit's record stays");
 is(sql(q{SELECT count(*) FROM s.t}), '1', 'the table reads');
 

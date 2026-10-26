@@ -1179,6 +1179,51 @@ test_refs_value(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_refs_record(commit): the record of the relations commit (an id in
+ * hex) was made from, from the records' tree the refs' 'F' entry names;
+ * NULL if there is none.
+ */
+PG_FUNCTION_INFO_V1(test_refs_record);
+Datum
+test_refs_record(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeRef refs;
+	ProllyNodeRef records;
+	text	   *hex = PG_GETARG_TEXT_PP(0);
+	ProllyHash	commit;
+	char		tag = 'F';
+	ProllyKey	fk = {(const uint8 *) &tag, 1};
+	ProllyKey	k;
+	StringInfoData v;
+	bytea	   *out;
+
+	if (!prolly_hash_from_hex(VARDATA_ANY(hex), VARSIZE_ANY_EXHDR(hex), &commit))
+		PG_RETURN_NULL();
+	prolly_folded_tree_env(&env);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	initStringInfo(&v);
+	if (refs.hash.len == 0 || !PROLLY_CALL(tree, get, &env, &refs, &fk, &v) ||
+		v.len < 1 || (uint8) v.data[0] > PROLLY_HASH_MAX_LEN ||
+		v.len != 1 + (uint8) v.data[0])
+		PG_RETURN_NULL();
+	memset(&records, 0, sizeof(records));
+	records.hash.len = (uint8) v.data[0];
+	memcpy(records.hash.bytes, v.data + 1, records.hash.len);
+	k.data = commit.bytes;
+	k.len = commit.len;
+	resetStringInfo(&v);
+	if (!PROLLY_CALL(tree, get, &env, &records, &k, &v))
+		PG_RETURN_NULL();
+	out = palloc(VARHDRSZ + v.len);
+	SET_VARSIZE(out, VARHDRSZ + v.len);
+	memcpy(VARDATA(out), v.data, v.len);
+	PG_RETURN_BYTEA_P(out);
+}
+
+/*
  * test_refs_delete(key): delete the refs' entry key, moving the chunk
  * store's root to refs without it, as a collection's step forgetting it
  * does; false if the root moved meanwhile, or there are no refs.

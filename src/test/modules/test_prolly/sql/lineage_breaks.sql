@@ -620,12 +620,12 @@ SELECT length(dolt_commit('-am', 'to abandon')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS abandoned \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'abandon') IS NOT NULL AS deleted;
-SELECT test_refs_value('L' || :'abandoned') IS NOT NULL AS recorded;
+SELECT test_refs_record(:'abandoned') IS NOT NULL AS recorded;
 SELECT dolt_gc() IS NOT NULL AS collected;
 SELECT test_refs_walk_reaches(:'abandoned') AS reached,
 	test_chunk_has(:'abandoned') AS stored,
-	test_refs_value('L' || :'abandoned') IS NULL AS forgotten,
-	test_refs_value('L' || :'live_commit') IS NOT NULL AS kept;
+	test_refs_record(:'abandoned') IS NULL AS forgotten,
+	test_refs_record(:'live_commit') IS NOT NULL AS kept;
 SET ROLE regress_lb_reader;
 SELECT count(*) AS rows_live FROM dolt_at('HEAD', NULL::ln.p);
 RESET ROLE;
@@ -662,10 +662,10 @@ SELECT dolt_branch('abandon_routine') IS NOT NULL AS made;
 SELECT dolt_checkout('abandon_routine') IS NOT NULL AS on_abandon;
 CREATE FUNCTION ln.abandoned_routine() RETURNS int LANGUAGE sql AS 'SELECT 2';
 SELECT length(dolt_commit('-Am', 'routine to abandon')::text) AS committed;
-SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
 	FROM '@([0-9a-f]{64})\n$') AS gone_owned \gset
 SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
-SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
 	FROM '@([0-9a-f]{64})\n$') AS live_owned \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'abandon_routine') IS NOT NULL AS deleted;

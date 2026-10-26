@@ -38,12 +38,12 @@
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
  *				   working set named them: the head's hash, then a line
- *				   per table (its OID, owner and qualified name, as 'L'
+ *				   per table (its OID, owner and qualified name, as a record's
  *				   lines are)
  *	'H' name	-> the head's other relations with privileges of their own
  *				   (views, materialized views, sequences and foreign
  *				   tables), as 'N' has its tables: the head's hash,
- *				   then a line for each (as 'L' lines are), none written
+ *				   then a line for each (as a record's lines are), none written
  *				   when there are none; a merge of the branch, or a pick
  *				   of its head, takes their privileges
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
@@ -71,9 +71,11 @@
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
- *	'L' commit	-> the relations the commit was made from, as this database
- *				   made it (commits fetched, cloned or pushed here have
- *				   none): a line for each prolly table, partitioned
+ *	'F'			-> the records' tree's root (hash length, hash): a tree,
+ *				   apart from the refs, of the relations each commit was
+ *				   made from, under the commit's id (its hash's bytes), as
+ *				   this database made it (commits fetched, cloned or pushed
+ *				   here have none): a line for each prolly table, partitioned
  *				   table and materialized view, and for each other object
  *				   a commit may hold (the canonicalizer's
  *				   prolly_owned_objects(): views, sequences, foreign
@@ -87,7 +89,7 @@
  *				   routines and types last, by reference: a line of '@'
  *				   and the hex SHA-256 of their lines (none if there are
  *				   none), held under 'J'
- *	'J' hash	-> the lines of a record's routines and types (as 'L'
+ *	'J' hash	-> the lines of a record's routines and types (as a record's
  *				   lines are, sorted), under their content's hash in hex,
  *				   written once and named by every record listing them
  *	'D' name	-> the branch's merge's table identity conflicts: tables the
@@ -281,7 +283,7 @@
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
-#define TAG_LINEAGE		'L'	/* the relations a commit was made from */
+#define TAG_RECORDS		'F'	/* the relations commits were made from: a tree's root */
 #define TAG_OWNED		'J'	/* routines and types such records list */
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
@@ -301,7 +303,7 @@
  * record's relations' owners, partitioned tables in commits' records, and
  * no classes (a move keeps a table's relation, by OID).
  */
-#define REFS_FORMAT		"17"
+#define REFS_FORMAT		"18"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -324,6 +326,8 @@ static bool ready = false;
  * subtransaction that changes them saves them first (ScopedSave), so its
  * abort restores them.
  */
+struct ScopedPending;
+
 typedef struct ScopedSave
 {
 	int			level;
@@ -331,6 +335,7 @@ typedef struct ScopedSave
 	bool		whole;
 	ProllyHash	base;
 	ProllyHash	mine;
+	List	   *pending;		/* (scoped_pending's copy) */
 	int			nrecords;		/* of scoped_records */
 } ScopedSave;
 
@@ -342,15 +347,71 @@ static bool published = false;
 static List *scoped_saved = NIL;	/* ScopedSave *, innermost last */
 
 /*
- * The keys of the relation records the scoped changes put (in
- * TopTransactionContext), put again whenever they are rebuilt on a root
- * another moved: a record equal to one the base had is no change of the
- * base's, and a step after a collection that forgot it meanwhile (its
+ * The scoped changes' puts and deletes not yet applied to scoped_mine (in
+ * TopTransactionContext): applied together, in one edit of the tree, when
+ * the tree is next read whole (refs_root()), rebuilt, saved for a
+ * subtransaction or published.  A commit puts several entries (its head,
+ * its record, its names, its movers); applied one at a time each would
+ * write its own path from the root down, a path that grows with the refs
+ * (every commit's record is in them), so a commit's work would grow with
+ * the commits before it.  refs_get() reads an entry pending first.
+ */
+typedef struct ScopedPending
+{
+	char	   *key;
+	int			keylen;
+	char	   *value;			/* (NULL: a delete) */
+	int			len;
+} ScopedPending;
+
+static List *scoped_pending = NIL;	/* ScopedPending *, by key */
+static void flush_scoped(void);
+
+/* A copy of pending scoped changes, in the current memory context */
+static List *
+pending_copy(List *pending)
+{
+	List	   *out = NIL;
+
+	foreach_ptr(ScopedPending, sp, pending)
+	{
+		ScopedPending *c = palloc(sizeof(ScopedPending));
+
+		c->key = palloc(Max(sp->keylen, 1));
+		memcpy(c->key, sp->key, sp->keylen);
+		c->keylen = sp->keylen;
+		c->value = NULL;
+		if (sp->value)
+		{
+			c->value = palloc(Max(sp->len, 1));
+			memcpy(c->value, sp->value, sp->len);
+		}
+		c->len = sp->len;
+		out = lappend(out, c);
+	}
+	return out;
+}
+
+/*
+ * The commits (ProllyHash *, in TopTransactionContext) whose relation
+ * records the scoped changes put, put again whenever they are rebuilt on a
+ * root another moved: a record equal to one the base had is no change of
+ * the base's, and a step after a collection that forgot it meanwhile (its
  * commit gone, then made again) would otherwise take it with it.
  */
+typedef struct ScopedEdits ScopedEdits;
+
 static List *scoped_records = NIL;
 
-typedef struct ScopedEdits ScopedEdits;
+/* The records' tree's environment: its values name no chunks. */
+static ProllyTreeEnv records_env;
+
+static void records_under(const ProllyNodeRef *refs, ProllyNodeRef *records,
+						  bool *any);
+static void empty_records(ProllyNodeRef *records);
+static void records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
+						   const ProllyHash *cur, ScopedEdits *se);
+
 static void put_records_again(const ProllyNodeRef *mine, ScopedEdits *se);
 
 /*
@@ -519,6 +580,7 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 	{
 		case TAG_BRANCH:
 		case TAG_TRACKING:
+		case TAG_RECORDS:
 			(void) declare_hashes(p, end, 1, refs);
 			break;
 		case TAG_BASELINE:
@@ -606,6 +668,7 @@ refs_init(void)
 	/* (counted apart too: see pgstat_prolly_refs_tree_counters()) */
 	env.counters = pgstat_prolly_refs_tree_counters();
 	commit_env = env;
+	records_env = env;
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
@@ -821,6 +884,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			published = false;
 			scoped_saved = NIL;
 			scoped_records = NIL;
+			scoped_pending = NIL;
 			break;
 		default:
 			break;
@@ -917,6 +981,12 @@ scoped_save(void)
 	save->whole = whole;
 	save->base = scoped_base;
 	save->mine = scoped_mine;
+	/*
+	 * (what is pending is the parent's, saved as it is: applied in the
+	 * subtransaction, the nodes written would go with it, were it rolled
+	 * back)
+	 */
+	save->pending = pending_copy(scoped_pending);
 	save->nrecords = list_length(scoped_records);
 	scoped_saved = lappend(scoped_saved, save);
 	MemoryContextSwitchTo(old);
@@ -941,6 +1011,7 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		whole = last->whole;
 		scoped_base = last->base;
 		scoped_mine = last->mine;
+		scoped_pending = last->pending;
 		scoped_records = list_truncate(scoped_records, last->nrecords);
 		scoped_saved = list_delete_last(scoped_saved);
 	}
@@ -1012,10 +1083,13 @@ rebase_scoped(const ProllyHash *cur)
 
 	if (same_hash(cur, &scoped_base))
 		return;
+	/* (what is pending applies to mine: rebuilt with it) */
+	flush_scoped();
 	scoped_save();
 	ref_of(&scoped_base, &from);
 	ref_of(&scoped_mine, &to);
 	PROLLY_CALL(tree, diff, &env, &from, &to, collect_edit, &se);
+	records_rebase(&from, &to, cur, &se);
 	put_records_again(&to, &se);
 	if (se.n == 0)
 		scoped_mine = *cur;
@@ -1098,26 +1172,19 @@ put_again(const ProllyNodeRef *mine, ScopedEdits *se, const char *key, int len)
 static bool owned_reference(const char *value, int len, char *hash);
 
 /*
- * The relation records the scoped changes put (scoped_records), as mine
- * has them, added to the edits rebuilt on another root where the diff
- * hasn't them (equal to the base's), in key order; and the routines' and
- * types' entry (TAG_OWNED) each record put names, where the diff hasn't
- * it: one found stored already wasn't put, and a collection since may
- * have forgotten it, no record then naming it.
+ * The routines' and types' entry (TAG_OWNED) each record of a branch's
+ * head's tables the scoped changes put names, added to the edits rebuilt
+ * on another root where the diff hasn't it: one found stored already
+ * wasn't put, and a collection since may have forgotten it, no record then
+ * naming it (records_rebase() does the same for commits' records); the
+ * edits in key order.
  */
 static void
 put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
 {
-	ListCell   *lc;
 	bool		added = false;
 	int			n;
 
-	foreach(lc, scoped_records)
-	{
-		const char *key = lfirst(lc);
-
-		added |= put_again(mine, se, key, strlen(key));
-	}
 	n = se->n;
 	for (int i = 0; i < n; i++)
 	{
@@ -1126,7 +1193,7 @@ put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
 		char		key[1 + 2 * PG_SHA256_DIGEST_LENGTH + 1];
 
 		if (e->is_delete || e->key.len < 1 ||
-			(e->key.data[0] != TAG_LINEAGE && e->key.data[0] != TAG_NAMES) ||
+			e->key.data[0] != TAG_NAMES ||
 			!owned_reference((const char *) e->value.data, e->value.len, hash))
 			continue;
 		snprintf(key, sizeof(key), "%c%s", TAG_OWNED, hash);
@@ -1134,6 +1201,123 @@ put_records_again(const ProllyNodeRef *mine, ScopedEdits *se)
 	}
 	if (added)
 		qsort(se->edits, se->n, sizeof(ProllyEdit), edit_cmp);
+}
+
+/*
+ * Rebuilt on cur, the commits' records the scoped changes made (the records
+ * tree's changes from the base's to mine's), with those of scoped_records
+ * mine has put again where they aren't changes, made on cur's records: its
+ * root in se in place of mine's (TAG_RECORDS is every commit's, changed by
+ * others' commits meanwhile, unlike a branch's entries); and the routines'
+ * and types' entry each record put names, as put_records_again() does.
+ */
+static void
+records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
+			   const ProllyHash *cur, ScopedEdits *se)
+{
+	char		tag = TAG_RECORDS;
+	ScopedEdits re = {NULL, 0, 0};
+	ProllyNodeRef onto;
+	ProllyNodeRef base_records;
+	ProllyNodeRef mine_records;
+	ProllyNodeRef cur_records;
+	ProllyNodeRef merged;
+	bool		any;
+	bool		cur_any;
+	int			at = -1;
+	StringInfoData v;
+
+	for (int i = 0; i < se->n; i++)
+		if (se->edits[i].key.len == 1 && se->edits[i].key.data[0] == TAG_RECORDS)
+			at = i;
+	if (at < 0 && scoped_records == NIL)
+		return;
+	records_under(from, &base_records, &any);
+	records_under(to, &mine_records, &any);
+	if (!any)
+		return;
+	ref_of(cur, &onto);
+	records_under(&onto, &cur_records, &cur_any);
+	PROLLY_CALL(tree, diff, &records_env, &base_records, &mine_records,
+				collect_edit, &re);
+	foreach_ptr(ProllyHash, commit, scoped_records)
+	{
+		ProllyKey	k = {commit->bytes, commit->len};
+		bool		have = false;
+
+		for (int i = 0; i < re.n && !have; i++)
+			have = re.edits[i].key.len == commit->len &&
+				memcmp(re.edits[i].key.data, commit->bytes, commit->len) == 0;
+		if (!have)
+		{
+			StringInfoData rv;
+			ProllyEdit *e;
+
+			initStringInfo(&rv);
+			if (!PROLLY_CALL(tree, get, &records_env, &mine_records, &k, &rv))
+			{
+				pfree(rv.data);
+				continue;
+			}
+			if (re.n == re.max)
+			{
+				re.max = Max(8, re.max * 2);
+				re.edits = re.edits ? repalloc_array(re.edits, ProllyEdit, re.max) :
+					palloc_array(ProllyEdit, re.max);
+			}
+			e = &re.edits[re.n++];
+			e->key.data = (const uint8 *) pnstrdup((const char *) commit->bytes, commit->len);
+			e->key.len = commit->len;
+			e->is_delete = false;
+			e->value.data = (const uint8 *) rv.data;
+			e->value.len = rv.len;
+		}
+	}
+	if (re.n == 0)
+	{
+		/* (nothing of mine: cur's records stand) */
+		if (at >= 0)
+		{
+			se->edits[at] = se->edits[--se->n];
+			qsort(se->edits, se->n, sizeof(ProllyEdit), edit_cmp);
+		}
+		return;
+	}
+	qsort(re.edits, re.n, sizeof(ProllyEdit), edit_cmp);
+	if (!cur_any)
+		empty_records(&cur_records);
+	PROLLY_CALL(tree, apply, &records_env, &cur_records, re.edits, re.n, &merged);
+	initStringInfo(&v);
+	put_hash(&v, &merged.hash);
+	if (at < 0)
+	{
+		if (se->n == se->max)
+		{
+			se->max = Max(8, se->max * 2);
+			se->edits = se->edits ? repalloc_array(se->edits, ProllyEdit, se->max) :
+				palloc_array(ProllyEdit, se->max);
+		}
+		at = se->n++;
+		se->edits[at].key.data = (const uint8 *) pnstrdup(&tag, 1);
+		se->edits[at].key.len = 1;
+		se->edits[at].is_delete = false;
+	}
+	se->edits[at].value.data = (const uint8 *) v.data;
+	se->edits[at].value.len = v.len;
+	/* (the entries the records name, as put_records_again()'s) */
+	for (int i = 0; i < re.n; i++)
+	{
+		char		hash[2 * PG_SHA256_DIGEST_LENGTH + 1];
+		char		key[1 + 2 * PG_SHA256_DIGEST_LENGTH + 1];
+
+		if (re.edits[i].is_delete ||
+			!owned_reference((const char *) re.edits[i].value.data,
+							 re.edits[i].value.len, hash))
+			continue;
+		snprintf(key, sizeof(key), "%c%s", TAG_OWNED, hash);
+		(void) put_again(to, se, key, strlen(key));
+	}
+	qsort(se->edits, se->n, sizeof(ProllyEdit), edit_cmp);
 }
 
 /*
@@ -1147,6 +1331,7 @@ publish_scoped(void)
 	if (!scoped)
 		return;
 	scoped_save();
+	flush_scoped();
 	for (;;)
 	{
 		ProllyHash	cur;
@@ -1160,13 +1345,14 @@ publish_scoped(void)
 	scoped = false;
 }
 
-/* The refs tree's root, as the transaction sees it; false if none yet. */
+/*
+ * ... but for the scoped changes pending (refs_get() reads those first).
+ */
 static bool
-refs_root(ProllyNodeRef *root)
+refs_root_unflushed(ProllyNodeRef *root)
 {
 	ProllyHash	h;
 
-	refs_init();
 	PROLLY_CALL(env.chunk_store, root, env.chunks, &h);
 	if (scoped)
 	{
@@ -1178,6 +1364,65 @@ refs_root(ProllyNodeRef *root)
 	ref_of(&h, root);
 	check_refs_format(root);
 	return true;
+}
+
+/* The pending scoped change of key (len bytes), if any. */
+static ScopedPending *
+pending_of(const char *key, int keylen)
+{
+	foreach_ptr(ScopedPending, sp, scoped_pending)
+		if (sp->keylen == keylen && memcmp(sp->key, key, keylen) == 0)
+			return sp;
+	return NULL;
+}
+
+static int
+pending_cmp(const ListCell *a, const ListCell *b)
+{
+	const ScopedPending *x = lfirst(a);
+	const ScopedPending *y = lfirst(b);
+	int			c = memcmp(x->key, y->key, Min(x->keylen, y->keylen));
+
+	return c != 0 ? c : (x->keylen > y->keylen) - (x->keylen < y->keylen);
+}
+
+/* Apply the pending scoped changes to scoped_mine, in one edit. */
+static void
+flush_scoped(void)
+{
+	ProllyEdit *edits;
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+	int			n = 0;
+
+	if (scoped_pending == NIL)
+		return;
+	Assert(scoped);
+	list_sort(scoped_pending, pending_cmp);
+	edits = palloc_array(ProllyEdit, list_length(scoped_pending));
+	foreach_ptr(ScopedPending, sp, scoped_pending)
+	{
+		edits[n].key.data = (const uint8 *) sp->key;
+		edits[n].key.len = sp->keylen;
+		edits[n].is_delete = (sp->value == NULL);
+		edits[n].value.data = (const uint8 *) sp->value;
+		edits[n].value.len = sp->len;
+		n++;
+	}
+	ref_of(&scoped_mine, &root);
+	PROLLY_CALL(tree, apply, &env, &root, edits, n, &new_root);
+	scoped_mine = new_root.hash;
+	pfree(edits);
+	scoped_pending = NIL;
+}
+
+/* The refs tree's root, as the transaction sees it; false if none yet. */
+static bool
+refs_root(ProllyNodeRef *root)
+{
+	refs_init();
+	flush_scoped();
+	return refs_root_unflushed(root);
 }
 
 static void
@@ -1342,7 +1587,8 @@ scoped_key(const char *key, int keylen)
 {
 	if (published || whole)
 		return false;
-	if (keylen > 1 && (key[0] == TAG_LINEAGE || key[0] == TAG_OWNED))
+	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
+		(keylen > 1 && key[0] == TAG_OWNED))
 		return true;
 	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
 }
@@ -1352,8 +1598,18 @@ refs_get(const char *key, int keylen, StringInfo value)
 {
 	ProllyNodeRef root;
 	ProllyKey	k = {(const uint8 *) key, keylen};
+	ScopedPending *sp;
 
-	if (!refs_root(&root))
+	refs_init();
+	if (scoped && (sp = pending_of(key, keylen)) != NULL)
+	{
+		if (sp->value == NULL)
+			return false;
+		resetStringInfo(value);
+		appendBinaryStringInfo(value, sp->value, sp->len);
+		return true;
+	}
+	if (!refs_root_unflushed(&root))
 		return false;
 	return PROLLY_CALL(tree, get, &env, &root, &k, value);
 }
@@ -1389,14 +1645,27 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 				scoped_mine = cur;
 				scoped = true;
 			}
-			ref_of(&scoped_mine, &root);
-			PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
-			scoped_mine = new_root.hash;
-			if (key[0] == TAG_LINEAGE && value != NULL)
 			{
 				MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+				ScopedPending *sp = pending_of(key, keylen);
 
-				scoped_records = lappend(scoped_records, pnstrdup(key, keylen));
+				if (sp == NULL)
+				{
+					sp = palloc(sizeof(ScopedPending));
+					sp->key = palloc(Max(keylen, 1));
+					memcpy(sp->key, key, keylen);
+					sp->keylen = keylen;
+					scoped_pending = lappend(scoped_pending, sp);
+				}
+				else if (sp->value)
+					pfree(sp->value);
+				sp->value = NULL;
+				if (value)
+				{
+					sp->value = palloc(Max(value->len, 1));
+					memcpy(sp->value, value->data, value->len);
+				}
+				sp->len = value ? value->len : 0;
 				MemoryContextSwitchTo(old);
 			}
 			return;
@@ -5602,38 +5871,113 @@ names_key(StringInfo key, const char *name)
 List	   *prolly_commit_local_tables = NIL;
 
 /*
- * The relations a commit was made from: TAG_LINEAGE and its id in hex ->
- * a line for each of the session's prolly tables, its OID (10 digits), a
- * space, and its qualified name (quoted as needed).  Every commit this
- * database makes of a branch records them, so a history read can tell a
- * version of the session's table from another table's of its name, which
- * the commit's names and identities can't (a table made again keeps its
- * name's identity).
+ * The relations a commit was made from: in the records' tree, under the
+ * commit's id (its hash's bytes), a line for each of the session's prolly
+ * tables, as table_names() lists them.  Every commit this database makes of
+ * a branch records them, so a history read can tell a version of the
+ * session's table from another table's of its name, which the commit's
+ * names and identities can't (a table made again keeps its name's
+ * identity).  The tree's root is the refs' TAG_RECORDS entry: the records
+ * grow with every commit, so kept apart from the refs, whose few entries a
+ * commit changes stay as small, and as cheap to change, however many
+ * commits there are; a commit adds its record to the records' tree, one
+ * path of it, and changes the one refs entry naming its root.
  */
 static void
-relations_key(StringInfo key, const ProllyHash *commit)
+empty_records(ProllyNodeRef *records)
 {
-	char	   *hex = prolly_hash_hex(commit);
+	ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &records_env,
+									   CurrentMemoryContext);
 
-	appendStringInfoChar(key, TAG_LINEAGE);
-	appendStringInfoString(key, hex);
-	pfree(hex);
+	PROLLY_CALL(tree, build_finish, b, records);
+}
+
+/* The records' tree of refs root refs (*any false: it has none yet). */
+static void
+records_under(const ProllyNodeRef *refs, ProllyNodeRef *records, bool *any)
+{
+	char		tag = TAG_RECORDS;
+	ProllyKey	k = {(const uint8 *) &tag, 1};
+	StringInfoData v;
+
+	memset(records, 0, sizeof(*records));
+	*any = false;
+	initStringInfo(&v);
+	if (refs->hash.len > 0 && PROLLY_CALL(tree, get, &env, refs, &k, &v))
+	{
+		ProllyHash	h;
+
+		(void) get_hash(v.data, v.data + v.len, &h);
+		ref_of(&h, records);
+		*any = true;
+	}
+	pfree(v.data);
+}
+
+/* ... as the transaction sees them, its changes not yet applied too */
+static bool
+records_now(ProllyNodeRef *records)
+{
+	char		tag = TAG_RECORDS;
+	StringInfoData v;
+	bool		any;
+
+	memset(records, 0, sizeof(*records));
+	initStringInfo(&v);
+	any = refs_get(&tag, 1, &v);
+	if (any)
+	{
+		ProllyHash	h;
+
+		(void) get_hash(v.data, v.data + v.len, &h);
+		ref_of(&h, records);
+	}
+	pfree(v.data);
+	return any;
+}
+
+/* commit's record, into value (false: unrecorded) */
+static bool
+record_of_commit(const ProllyHash *commit, StringInfo value)
+{
+	ProllyNodeRef records;
+	ProllyKey	k = {commit->bytes, commit->len};
+
+	return records_now(&records) &&
+		PROLLY_CALL(tree, get, &records_env, &records, &k, value);
 }
 
 /* Record commit as made from the tables lines lists (table_names()'s). */
 static void
 note_relations(const ProllyHash *commit, const char *lines)
 {
-	StringInfoData key;
+	char		tag = TAG_RECORDS;
+	ProllyNodeRef records;
+	ProllyNodeRef next;
+	ProllyEdit	e;
 	StringInfoData v;
 
-	initStringInfo(&key);
+	if (!records_now(&records))
+		empty_records(&records);
+	e.key.data = commit->bytes;
+	e.key.len = commit->len;
+	e.is_delete = false;
+	e.value.data = (const uint8 *) lines;
+	e.value.len = strlen(lines);
+	PROLLY_CALL(tree, apply, &records_env, &records, &e, 1, &next);
 	initStringInfo(&v);
-	appendStringInfoString(&v, lines);
-	relations_key(&key, commit);
-	refs_put(key.data, key.len, &v);
-	pfree(key.data);
+	put_hash(&v, &next.hash);
+	refs_put(&tag, 1, &v);
 	pfree(v.data);
+	if (scoped)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		ProllyHash *c = palloc(sizeof(ProllyHash));
+
+		*c = *commit;
+		scoped_records = lappend(scoped_records, c);
+		MemoryContextSwitchTo(old);
+	}
 }
 
 /*
@@ -5643,18 +5987,14 @@ note_relations(const ProllyHash *commit, const char *lines)
 static bool
 copies_commit_relations(const ProllyHash *commit, List **relations)
 {
-	StringInfoData key;
 	StringInfoData v;
 	bool		found;
 
 	refs_init();
-	initStringInfo(&key);
 	initStringInfo(&v);
-	relations_key(&key, commit);
-	found = refs_get(key.data, key.len, &v);
+	found = record_of_commit(commit, &v);
 	if (found)
 		*relations = relation_lines(v.data);
-	pfree(key.data);
 	pfree(v.data);
 	return found;
 }
@@ -5674,6 +6014,7 @@ refs_tree_held(ProllyNodeRef *root)
 	ProllyKey	k = {(const uint8 *) "!", 1};
 	bool		held;
 
+	flush_scoped();
 	PROLLY_CALL(env.chunk_store, root, env.chunks, &h);
 	if (scoped)
 	{
@@ -5700,29 +6041,33 @@ refs_tree_held(ProllyNodeRef *root)
 }
 
 /*
- * The keys of the relation records under root whose commits the store
- * doesn't have, in key order.
+ * The commits (ProllyHash *) whose records the records' tree records holds
+ * that the store doesn't have, in key order.
  */
 static List *
-records_gone(const ProllyNodeRef *root)
+records_gone(const ProllyNodeRef *records)
 {
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
-	char		tag = TAG_LINEAGE;
-	ProllyKey	from = {(const uint8 *) &tag, 1};
 	List	   *gone = NIL;
 
-	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
-	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
-		   k.len >= 1 && k.data[0] == TAG_LINEAGE)
+	c = PROLLY_CALL(tree, cursor_open, &records_env, records, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
-		ProllyHash	commit;
+		ProllyHash *commit = palloc0(sizeof(ProllyHash));
 
-		if (!prolly_hash_from_hex((const char *) k.data + 1, k.len - 1, &commit) ||
-			!PROLLY_CALL(env.chunk_store, has, env.chunks, &commit))
-			gone = lappend(gone, pnstrdup((const char *) k.data, k.len));
+		if (k.len > PROLLY_HASH_MAX_LEN)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold a damaged record of relations")));
+		commit->len = k.len;
+		memcpy(commit->bytes, k.data, k.len);
+		if (!PROLLY_CALL(env.chunk_store, has, env.chunks, commit))
+			gone = lappend(gone, commit);
+		else
+			pfree(commit);
 	}
 	PROLLY_CALL(tree, cursor_close, c);
 	return gone;
@@ -5742,56 +6087,65 @@ string_set(const char *what, int keysize)
 
 /*
  * The keys of the routines' and types' entries (TAG_OWNED) under root that
- * no record (TAG_LINEAGE, TAG_NAMES) names, but through those of gone (the
- * keys of records to be forgotten), in key order.
+ * no record (a commit's, in the records' tree records; a branch head's,
+ * TAG_NAMES) names, but through those of the commits gone, in key order.
  */
 static List *
-owned_unreached(const ProllyNodeRef *root, List *gone)
+owned_unreached(const ProllyNodeRef *root, const ProllyNodeRef *records,
+				List *gone)
 {
 	const int	hlen = 2 * PG_SHA256_DIGEST_LENGTH;
-	HTAB	   *forgetting = string_set("prolly records forgotten", 2 * hlen + 4);
 	HTAB	   *reached = string_set("prolly owned reached", hlen + 1);
-	const char	tags[] = {TAG_LINEAGE, TAG_NAMES};
+	HTAB	   *forgetting;
+	HASHCTL		ctl;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
-	char		tag = TAG_OWNED;
-	ProllyKey	from = {(const uint8 *) &tag, 1};
+	char		tag = TAG_NAMES;
+	ProllyKey	at = {(const uint8 *) &tag, 1};
+	char		otag = TAG_OWNED;
+	ProllyKey	from = {(const uint8 *) &otag, 1};
+	char		hash[2 * PG_SHA256_DIGEST_LENGTH + 1];
 	List	   *out = NIL;
 
-	foreach_ptr(char, key, gone)
-		if (strlen(key) < 2 * hlen + 4)
-			(void) hash_search(forgetting, key, HASH_ENTER, NULL);
-	for (int t = 0; t < lengthof(tags); t++)
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	forgetting = hash_create("prolly records forgotten", 64, &ctl,
+							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	foreach_ptr(ProllyHash, commit, gone)
+		(void) hash_search(forgetting, commit, HASH_ENTER, NULL);
+	c = PROLLY_CALL(tree, cursor_open, &records_env, records, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
-		ProllyKey	at = {(const uint8 *) &tags[t], 1};
+		ProllyHash	commit;
 
-		c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
-		PROLLY_CALL(tree, cursor_seek, c, &at, ForwardScanDirection);
-		while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
-			   k.len >= 1 && k.data[0] == tags[t])
-		{
-			char		hash[2 * PG_SHA256_DIGEST_LENGTH + 1];
-			char	   *key = pnstrdup((const char *) k.data, k.len);
-			bool		skip = k.len < 2 * hlen + 4 &&
-				hash_search(forgetting, key, HASH_FIND, NULL) != NULL;
-
-			if (!skip && owned_reference((const char *) v.data, v.len, hash))
-				(void) hash_search(reached, hash, HASH_ENTER, NULL);
-			pfree(key);
-		}
-		PROLLY_CALL(tree, cursor_close, c);
+		memset(&commit, 0, sizeof(commit));
+		commit.len = Min(k.len, PROLLY_HASH_MAX_LEN);
+		memcpy(commit.bytes, k.data, commit.len);
+		if (hash_search(forgetting, &commit, HASH_FIND, NULL) == NULL &&
+			owned_reference((const char *) v.data, v.len, hash))
+			(void) hash_search(reached, hash, HASH_ENTER, NULL);
 	}
+	PROLLY_CALL(tree, cursor_close, c);
+	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &at, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == TAG_NAMES)
+		if (owned_reference((const char *) v.data, v.len, hash))
+			(void) hash_search(reached, hash, HASH_ENTER, NULL);
+	PROLLY_CALL(tree, cursor_close, c);
 	c = PROLLY_CALL(tree, cursor_open, &env, root, CurrentMemoryContext);
 	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
 		   k.len >= 1 && k.data[0] == TAG_OWNED)
 	{
-		char	   *hash = pnstrdup((const char *) k.data + 1, k.len - 1);
+		char	   *h = pnstrdup((const char *) k.data + 1, k.len - 1);
 
-		if (k.len - 1 != hlen || hash_search(reached, hash, HASH_FIND, NULL) == NULL)
+		if (k.len - 1 != hlen || hash_search(reached, h, HASH_FIND, NULL) == NULL)
 			out = lappend(out, pnstrdup((const char *) k.data, k.len));
-		pfree(hash);
+		pfree(h);
 	}
 	PROLLY_CALL(tree, cursor_close, c);
 	hash_destroy(forgetting);
@@ -5811,40 +6165,72 @@ owned_unreached(const ProllyNodeRef *root, List *gone)
  * root then, so that a commit made again meanwhile (the same id) by a
  * transaction that published since keeps its record, and one publishing
  * after waits for this one and puts its record back over it, with the
- * entries it names (put_records_again()); all are deleted in one edit of
- * the tree.  True if any was forgotten.
+ * entries it names (records_rebase()); all are changed in one edit of the
+ * records' tree and one of the refs.  True if any was forgotten.
  */
 static bool
 copies_forget_records(void)
 {
 	ProllyNodeRef root;
 	ProllyNodeRef new_root;
+	ProllyNodeRef records;
 	List	   *gone;
 	List	   *unreached;
 	ProllyEdit *edits;
 	int			n = 0;
-	ListCell   *lc;
+	bool		any;
+	char		tag = TAG_RECORDS;
+	StringInfoData rv;
 
 	refs_init();
 	if (!refs_tree_held(&root))
 		return false;
-	gone = records_gone(&root);
-	if (gone == NIL && owned_unreached(&root, NIL) == NIL)
+	records_under(&root, &records, &any);
+	if (!any)
+		return false;
+	gone = records_gone(&records);
+	if (gone == NIL && owned_unreached(&root, &records, NIL) == NIL)
 		return false;
 	lock_refs();
 	if (!refs_root(&root))
 		return false;
-	gone = records_gone(&root);
-	unreached = owned_unreached(&root, gone);
+	records_under(&root, &records, &any);
+	if (!any)
+		return false;
+	gone = records_gone(&records);
+	unreached = owned_unreached(&root, &records, gone);
 	INJECTION_POINT("prolly-forget-records-locked", NULL);
 	if (gone == NIL && unreached == NIL)
 		return false;
-	/* (in key order: TAG_OWNED's before TAG_LINEAGE's) */
-	edits = palloc0(sizeof(ProllyEdit) * (list_length(gone) + list_length(unreached)));
-	foreach(lc, list_concat(unreached, gone))
+	/* (TAG_RECORDS's entry first, in key order, then TAG_OWNED's) */
+	edits = palloc0(sizeof(ProllyEdit) * (1 + list_length(unreached)));
+	initStringInfo(&rv);
+	if (gone != NIL)
 	{
-		edits[n].key.data = (const uint8 *) lfirst(lc);
-		edits[n].key.len = strlen(lfirst(lc));
+		ProllyEdit *re = palloc0(sizeof(ProllyEdit) * list_length(gone));
+		ProllyNodeRef next;
+		int			m = 0;
+
+		foreach_ptr(ProllyHash, commit, gone)
+		{
+			re[m].key.data = commit->bytes;
+			re[m].key.len = commit->len;
+			re[m].is_delete = true;
+			m++;
+		}
+		PROLLY_CALL(tree, apply, &records_env, &records, re, m, &next);
+		put_hash(&rv, &next.hash);
+		edits[n].key.data = (const uint8 *) &tag;
+		edits[n].key.len = 1;
+		edits[n].is_delete = false;
+		edits[n].value.data = (const uint8 *) rv.data;
+		edits[n].value.len = rv.len;
+		n++;
+	}
+	foreach_ptr(char, key, unreached)
+	{
+		edits[n].key.data = (const uint8 *) key;
+		edits[n].key.len = strlen(key);
 		edits[n].is_delete = true;
 		n++;
 	}
@@ -5868,21 +6254,17 @@ static char *
 relations_kept(const ProllyHash *parent, const char *had, const char *now,
 			   List *local)
 {
-	StringInfoData key;
 	StringInfoData v;
 	StringInfoData out;
 	bool		have;
 	List	   *before = NIL;
 	ListCell   *lc;
 
-	initStringInfo(&key);
 	initStringInfo(&v);
 	initStringInfo(&out);
 	if (had != NULL)
 		appendStringInfoString(&v, had);
-	else
-		relations_key(&key, parent);
-	have = had != NULL || refs_get(key.data, key.len, &v);
+	have = had != NULL || record_of_commit(parent, &v);
 	if (have)
 		before = relation_lines(v.data);
 	foreach(lc, relation_lines(now))
@@ -5914,7 +6296,6 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 		if (keep)
 			relation_line(&out, r->relid, r->owner, r->relkind, r->name);
 	}
-	pfree(key.data);
 	pfree(v.data);
 	return out.data;
 }

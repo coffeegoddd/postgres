@@ -110,7 +110,7 @@ SELECT pg_temp.note('gc 3') AS _n \gset
 -- (Which files it keeps, by name: the mostly live ones kept whole, none
 -- rewritten, the one wholly garbage gone.)
 SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
-SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 7 FROM test_chunk_table_files()
+SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 8 FROM test_chunk_table_files()
 	WHERE name = 'prolly_table_000000000000000a'), true) AS diverged \gset
 SELECT freed > 0 AS freed FROM test_chunk_gc(true);
 SELECT pg_stat_force_next_flush() AS _f \gset

@@ -376,6 +376,11 @@ CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The record of the relations a commit (in hex) was made from.
+CREATE FUNCTION test_refs_record(commit_id text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Delete the refs' entry key, moving the store's root (false if it moved).
 CREATE FUNCTION test_refs_delete(key text)
 RETURNS bool

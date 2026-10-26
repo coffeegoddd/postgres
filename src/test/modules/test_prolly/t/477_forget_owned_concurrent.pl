@@ -52,7 +52,7 @@ $maker->query_safe(
 	q{CREATE FUNCTION s.f2() RETURNS int LANGUAGE sql AS 'SELECT 2'});
 $maker->query_safe(q{SELECT dolt_commit('-Am', 'f2')});
 my $f2 = sql(q{SELECT dolt_hashof('x')});
-my $entry = owned_entry("test_refs_value('L' || '$f2')");
+my $entry = owned_entry("test_refs_record('$f2')");
 isnt($entry, '', 'the commit names its routines by an entry');
 $maker->query_safe(q{SELECT dolt_reset('--soft', 'HEAD~1')});
 # (x's record of its head's tables names the entry too, until x's next
@@ -91,9 +91,9 @@ $maker->query_until(qr/made/, '');
 $gc->quit;
 
 my $x = sql(q{SELECT dolt_hashof('x')});
-is(owned_entry("test_refs_value('L' || '$x')"), $entry,
+is(owned_entry("test_refs_record('$x')"), $entry,
 	"x's commit names the entry");
-is(sql(qq{SELECT test_refs_value('L' || '$f2') IS NULL}), 't',
+is(sql(qq{SELECT test_refs_record('$f2') IS NULL}), 't',
 	"the collected commit's record is forgotten");
 is(sql(qq{SELECT test_refs_value('J' || '$entry') IS NOT NULL}),
 	't', 'the entry survives: the publish put it back');

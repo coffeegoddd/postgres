@@ -1764,7 +1764,7 @@ SELECT dolt_branch('-D', 'abandon') IS NOT NULL AS deleted;
  t
 (1 row)
 
-SELECT test_refs_value('L' || :'abandoned') IS NOT NULL AS recorded;
+SELECT test_refs_record(:'abandoned') IS NOT NULL AS recorded;
  recorded 
 ----------
  t
@@ -1778,8 +1778,8 @@ SELECT dolt_gc() IS NOT NULL AS collected;
 
 SELECT test_refs_walk_reaches(:'abandoned') AS reached,
 	test_chunk_has(:'abandoned') AS stored,
-	test_refs_value('L' || :'abandoned') IS NULL AS forgotten,
-	test_refs_value('L' || :'live_commit') IS NOT NULL AS kept;
+	test_refs_record(:'abandoned') IS NULL AS forgotten,
+	test_refs_record(:'live_commit') IS NOT NULL AS kept;
  reached | stored | forgotten | kept 
 ---------+--------+-----------+------
  f       | f      | t         | t
@@ -1901,7 +1901,7 @@ SELECT length(dolt_commit('-Am', 'routine to abandon')::text) AS committed;
         42
 (1 row)
 
-SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
 	FROM '@([0-9a-f]{64})\n$') AS gone_owned \gset
 SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
  on_routines 
@@ -1909,7 +1909,7 @@ SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
  t
 (1 row)
 
-SELECT substring(convert_from(test_refs_value('L' || dolt_hashof('HEAD')), 'UTF8')
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
 	FROM '@([0-9a-f]{64})\n$') AS live_owned \gset
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  on_main 
