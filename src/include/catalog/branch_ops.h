@@ -337,14 +337,16 @@ typedef struct BranchOpsRoutine
 	 * shared type; or a versioned one the move made again, an enum of the
 	 * same name and labels in the same order, its values' label OIDs
 	 * mapped, or a domain of the same name over the same shared base
-	 * type, or an array of either, its elements carried so); its expression indexes' rows, from source's index of the same
-	 * name, columns and expressions; its extended statistics objects'
+	 * type, or an array of either, its elements carried so); its
+	 * expression indexes' rows, from source's index of the same name,
+	 * columns and expressions; its extended statistics objects'
 	 * data, from source's of the same name and kinds over the same columns
 	 * by number (none where a dropped column puts them at other numbers on
 	 * one side); and its row
 	 * and page counts if it has none.  Not carried: a column of another
 	 * versioned type (a composite or table row type, a range, an array of
-	 * one, whose values hold source's OIDs: only that column), a slot whose
+	 * one, or a domain over an array of a versioned type, whose values
+	 * hold source's OIDs: only that column), a slot whose
 	 * values are of such a type, an extended statistics object on
 	 * expressions or over a column of a versioned type, and anything of a
 	 * table whose live columns source's working set has changed since its
