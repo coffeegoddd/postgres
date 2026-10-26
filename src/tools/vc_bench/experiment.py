@@ -12,7 +12,11 @@ import uuid
 
 from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, engine_passes, log, server, sha256,
                   write_json)
+from engines import literal
 from memory import Sampler
+
+# (the same in every engine: Dolt's and prolly's dolt_branches)
+BRANCH_COUNT_SQL = "SELECT count(*) FROM dolt_branches WHERE name={}"
 
 
 def changed_ids(n, k):
@@ -171,10 +175,15 @@ def cases(c):
             result.append({"operation": op, "distance": d})
     for case in result:
         case['working_set'] = 'diff' if case['operation'] in ('diff_working', 'diff_working_history') else 'clean'
+    for d in [0, *sorted(set(c["history_depths"]))]:
+        for op in ("branch_delete", "branch_delete_used"):
+            result.append({"operation": op, "distance": d, "working_set": "clean"})
+    result.append({"operation": "drop_table", "distance": 0, "working_set": "clean"})
     for label in c.get('dirty_sizes', default_dirty_sizes()):
         for d in [0, *sorted(set(c['history_depths']))]:
             for op in ('branch', 'checkout', 'reset_soft', 'reset_hard'):
                 result.append({'operation': op, 'distance': d, 'working_set': label})
+        result.append({'operation': 'drop_table', 'distance': 0, 'working_set': label})
     return result
 
 
@@ -208,8 +217,21 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         # Point reads confirm pending values without invoking a VC
                         # diff that could materialize/fold the dirty tree before timing.
                         probe(sql, n, count, h+1)
+                    if op.startswith("branch_delete"):
+                        # A branch at the old commit; the used one checked out
+                        # once first, so the engine has made what a session on
+                        # it needs (prolly: its copies of the tables).
+                        sql.vc("branch", tmpbranch, old)
+                        if op == "branch_delete_used":
+                            sql.vc("checkout", tmpbranch)
+                            probe(sql, n, k, h-d)
+                            sql.vc("checkout", scratch)
                     if op == "round_trip":
                         query = "SELECT 1"
+                    elif op.startswith("branch_delete"):
+                        query = sql.vc_sql("branch", "-D", tmpbranch)
+                    elif op == "drop_table":
+                        query = "DROP TABLE bench_rows"
                     elif op == "branch":
                         query = sql.vc_sql("branch", tmpbranch, old)
                     elif op == "checkout":
@@ -301,12 +323,22 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             if d:
                                 sql.vc("reset", "--hard", latest)
                             probe(sql, n, k, h)
+                        elif op.startswith("branch_delete"):
+                            expect(int(sql.scalar(BRANCH_COUNT_SQL.format(literal(tmpbranch)))), 0,
+                                   "deleted branch")
+                            expect(sql.hash(), latest, "branch deletion preserves the session's HEAD")
+                        elif op == "drop_table":
+                            expect(int(sql.scalar(sql.table_count_sql())), 0, "dropped table")
+                            # (the hard reset brings the table back, and
+                            # discards any dirty rows with it)
+                            sql.vc("reset", "--hard", latest)
+                            probe(sql, n, k, h)
                         elif op == "resolve_ancestor":
                             expect(result["rows"][0][0], old, "ancestor resolution")
                         elif op.startswith("diff_"):
                             expect(int(result["rows"][0][0]), 0 if op == "diff_equal" else k, "diff cardinality")
                             record["diff_rows"] = int(result["rows"][0][0])
-                        if dirty and op != "reset_hard":
+                        if dirty and op not in ("reset_hard", "drop_table"):
                             sql.vc("reset", "--hard", latest)
                             probe(sql, n, k, h)
                         record["status"] = "ok"
