@@ -7,9 +7,9 @@
  * Each table both roots hold with the same definition and rows is left
  * out.  One whose rows differ costs the rows its diff would write, an
  * estimate from the tree's diff_estimate(), bounded in the nodes it reads,
- * so a diff too large to walk cheaply is estimated rather than walked: a
- * few changes spread over a large table as the few they are, changes
- * bunched together as every row under the nodes they changed.
+ * so a diff too large to walk cheaply is estimated rather than walked,
+ * from a sample of the key ranges it changed: a few changes spread over a
+ * large table as the few they are, changes in runs as the many they are.
  * A row written costs its heap work and an entry in each index; a row
  * loaded into a table that is new (a table made by the move, which the
  * row applier fills before building its indexes) costs much less, its

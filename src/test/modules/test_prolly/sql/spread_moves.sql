@@ -5,8 +5,8 @@
 -- by row, only the rows that differ written.  It isn't emptied and loaded
 -- whole, and so isn't folded in full after: a table loaded with more rows
 -- than its change log notes in a transaction has a log that says to read
--- it in full.  Changes bunched together, past an eighth of the rows,
--- still reload.
+-- it in full.  Changes bunched together, or in runs, past an eighth of
+-- the rows, still reload.
 CREATE DATABASE regress_spread_moves;
 -- (the move planner's sources, not pages kept as of the head, which come
 -- before them and move nothing: first_use_kept tests those)
@@ -80,5 +80,75 @@ SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
 SELECT count(*) FILTER (WHERE v = 1) AS as_spread FROM sm.t;
 SELECT dolt_checkout('main');
 
+-- And in runs, half the table changed in every other run of a few rows
+-- (thirty), then of many (a thousand: tens of leaves each): runs that
+-- leave every leaf, or every node above the leaves, differing, as many
+-- as spread changes would.  A branch at the commit before each, first used
+-- from main (the branch before it gone): emptied and loaded both times.
+SELECT dolt_branch('-D', 'back2');
+SELECT dolt_branch('runs30');
+UPDATE sm.t SET v = 3 WHERE (id / 30) % 2 = 0;
+SELECT length(dolt_commit('-am', 'runs of 30')::text) > 0 AS committed;
+BEGIN;
+SELECT dolt_checkout('runs30');
+SELECT ins = 70000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'runs30');
+SELECT dolt_branch('runs1000');
+UPDATE sm.t SET v = 4 WHERE (id / 1000) % 2 = 0;
+SELECT length(dolt_commit('-am', 'runs of 1000')::text) > 0 AS committed;
+BEGIN;
+SELECT dolt_checkout('runs1000');
+SELECT ins = 70000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT count(*) FILTER (WHERE v = 3) AS as_runs30 FROM sm.t;
+SELECT dolt_checkout('main');
+
 \c contrib_regression
 DROP DATABASE regress_spread_moves;
+
+-- Another branch is taken as the source only where its move costs clearly
+-- less than the session's (a fifth): estimates past the planner's bound
+-- are a sample's, and a near tie, as between the session's branch and
+-- another as far from the head, goes to the session's.  Here near is 90
+-- rows from the head, main 100: main's copies are moved, its 100 rows
+-- written.
+CREATE DATABASE regress_source_margin;
+ALTER DATABASE regress_source_margin SET prolly.kept_commits = 0;
+\c regress_source_margin
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA sm VERSIONED;
+CREATE TABLE sm.n (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO sm.n SELECT g, 0 FROM generate_series(1, 4000) g;
+SELECT length(dolt_commit('-Am', 'head')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS head \gset
+SELECT dolt_branch('near');
+SELECT dolt_checkout('near');
+UPDATE sm.n SET v = 1 WHERE id <= 90;
+SELECT length(dolt_commit('-am', 'near')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+UPDATE sm.n SET v = 1 WHERE id <= 100;
+SELECT length(dolt_commit('-am', 'main')::text) > 0 AS committed;
+SELECT dolt_branch('tgt', :'head');
+SELECT pg_stat_force_next_flush();
+SELECT pg_temp.since('apply_rows') >= 0 AS counting;
+SELECT dolt_checkout('tgt');
+SELECT pg_stat_force_next_flush();
+SELECT pg_temp.since('apply_rows') AS rows_written;
+SELECT count(*) FILTER (WHERE v = 0) AS as_head FROM sm.n;
+SELECT dolt_checkout('main');
+
+\c contrib_regression
+DROP DATABASE regress_source_margin;

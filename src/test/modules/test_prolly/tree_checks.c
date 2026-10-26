@@ -1325,14 +1325,13 @@ changed_keys(const Ref *a, const Ref *b)
 
 /*
  * The estimate of a and b's diff: exact given every node it needs; given
- * fewer, reading no more than it was given, and, where least is set, no
- * fewer changes than there are (bunched together, or every key changed:
- * the rows under the nodes it left unread all counted).
+ * fewer, reading no more than it was given, and, where near is set, within
+ * a factor of two of the count.
  */
 static void
 check_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 			   const ProllyNodeRef *a, const ProllyNodeRef *b, int want,
-			   bool least, const char *what)
+			   bool near, const char *what)
 {
 	ProllyNodeCounters cnt = {0};
 	uint64		got;
@@ -1347,8 +1346,8 @@ check_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 		env->counters = &cnt;
 		got = PROLLY_CALL(tr, diff_estimate, env, a, b, budget);
 		env->counters = NULL;
-		if (least && got < (uint64) want)
-			elog(ERROR, "diff estimate of %s in %llu nodes gave %llu changes, fewer than %d",
+		if (near && (got < (uint64) want / 2 || got > (uint64) want * 2))
+			elog(ERROR, "diff estimate of %s in %llu nodes gave %llu changes, not near %d",
 				 what, (unsigned long long) budget, (unsigned long long) got, want);
 		if (cnt.nodes_read > Max(budget, 2))
 			elog(ERROR, "diff estimate of %s in %llu nodes read %llu", what,
@@ -1358,62 +1357,74 @@ check_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 }
 
 /*
- * The estimate of a diff of changes spread over the tree, given too few
- * nodes to read the leaves they changed, against the count: near it, not
- * the rows under the leaves left unread (most of the tree).  Given the
- * same few nodes, changes as many but bunched together are estimated no
- * fewer than there are.
+ * The estimate of changed's diff from from, given too few nodes to read
+ * the leaves the changes are under (checked), within a factor of two of
+ * the count: not the rows under the leaves left unread, nor the count of
+ * leaves that differ.
  */
 static void
-check_spread_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
-					  const Ref *from, const ProllyNodeRef *rfrom)
+check_estimate_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+							const Ref *from, const ProllyNodeRef *rfrom,
+							const Ref *changed, const char *what)
 {
-	Ref		   *spread = palloc(sizeof(Ref));
-	Ref		   *bunched = palloc(sizeof(Ref));
-	ProllyNodeRef rspread;
-	ProllyNodeRef rbunched;
+	ProllyNodeRef rchanged;
 	ProllyNodeCounters cnt = {0};
-	int			want;
-	int			bwant;
+	int			want = changed_keys(from, changed);
 	uint64		got;
 	uint64		budget = 64;
 
-	memcpy(spread, from, sizeof(Ref));
-	memcpy(bunched, from, sizeof(Ref));
-	for (int k = 0; k < MAX_KEY; k += 200)
-		spread->version[k] = 2;
-	want = changed_keys(from, spread);
-	for (int k = MAX_KEY / 4; k < MAX_KEY / 4 + 2000; k++)
-		bunched->version[k] = 2;
-	bwant = changed_keys(from, bunched);
-	build_ref(tr, env, spread, &rspread);
-	build_ref(tr, env, bunched, &rbunched);
-
-	/* (the leaves that differ don't fit the budget) */
+	build_ref(tr, env, changed, &rchanged);
 	env->counters = &cnt;
-	(void) PROLLY_CALL(tr, diff_estimate, env, rfrom, &rspread, UINT64_MAX);
+	(void) PROLLY_CALL(tr, diff_estimate, env, rfrom, &rchanged, UINT64_MAX);
 	env->counters = NULL;
 	if (cnt.nodes_read <= budget * 2)
-		elog(ERROR, "a spread diff read only %llu nodes",
+		elog(ERROR, "the diff of %s read only %llu nodes", what,
 			 (unsigned long long) cnt.nodes_read);
-
-	got = PROLLY_CALL(tr, diff_estimate, env, rfrom, &rspread, budget);
+	got = PROLLY_CALL(tr, diff_estimate, env, rfrom, &rchanged, budget);
 	if (got < (uint64) want / 2 || got > (uint64) want * 2)
-		elog(ERROR, "diff estimate of %d changes spread over the tree in %llu nodes gave %llu",
-			 want, (unsigned long long) budget, (unsigned long long) got);
-	got = PROLLY_CALL(tr, diff_estimate, env, rfrom, &rbunched, budget);
-	if (got < (uint64) bwant)
-		elog(ERROR, "diff estimate of %d changes bunched together in %llu nodes gave %llu",
-			 bwant, (unsigned long long) budget, (unsigned long long) got);
+		elog(ERROR, "diff estimate of %d changes, %s, in %llu nodes gave %llu",
+			 want, what, (unsigned long long) budget, (unsigned long long) got);
+}
+
+/*
+ * Changes spread over the tree, one in two hundred keys; in runs under
+ * parents that all differ, every other run of fifty keys (a leaf's worth
+ * or so, two hundred runs); and bunched, a run of two thousand keys: each
+ * estimated near its count in a budget that doesn't reach their leaves.
+ */
+static void
+check_estimates_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+							 const Ref *from, const ProllyNodeRef *rfrom)
+{
+	Ref		   *changed = palloc(sizeof(Ref));
+
+	memcpy(changed, from, sizeof(Ref));
+	for (int k = 0; k < MAX_KEY; k += 200)
+		changed->version[k] = 2;
+	check_estimate_under_budget(tr, env, from, rfrom, changed,
+								"spread over the tree");
+
+	memcpy(changed, from, sizeof(Ref));
+	for (int k = 0; k < MAX_KEY; k++)
+		if ((k / 50) % 2 == 0)
+			changed->version[k] = 2;
+	check_estimate_under_budget(tr, env, from, rfrom, changed,
+								"in every other run of fifty");
+
+	memcpy(changed, from, sizeof(Ref));
+	for (int k = MAX_KEY / 4; k < MAX_KEY / 4 + 2000; k++)
+		changed->version[k] = 2;
+	check_estimate_under_budget(tr, env, from, rfrom, changed,
+								"bunched together");
+	pfree(changed);
 }
 
 /*
  * diff_estimate() gives diff's count where the nodes that differ fit
  * (after random edits, across heights, of unrelated trees), nothing and no
  * read for a tree with itself; and given fewer nodes than that, reads no
- * more than it was given, estimates changes spread over the tree near
- * their count, and changes bunched together, or of unrelated trees, no
- * fewer than there are.
+ * more than it was given, and estimates changes spread over the tree,
+ * bunched together or in runs, or of unrelated trees, near their count.
  */
 void
 tree_diff_estimate_bounds(const ProllyImplInfo *impl)
@@ -1475,10 +1486,10 @@ tree_diff_estimate_bounds(const ProllyImplInfo *impl)
 	check_estimate(tr, &env, &rfrom, &rodd, changed_keys(from, odd), true,
 				   "unrelated trees");
 
-	/* spread and bunched, over every key */
+	/* spread, bunched and in runs, over every key */
 	fill_ref(whole, 1, 1);
 	build_ref(tr, &env, whole, &rwhole);
-	check_spread_estimate(tr, &env, whole, &rwhole);
+	check_estimates_under_budget(tr, &env, whole, &rwhole);
 }
 
 /*
