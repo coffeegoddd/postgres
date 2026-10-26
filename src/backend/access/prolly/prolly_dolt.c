@@ -39,6 +39,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/tableam.h"
@@ -49,6 +50,7 @@
 #include "catalog/pg_authid_d.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_branch.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
@@ -56,6 +58,7 @@
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
+#include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -67,8 +70,10 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "parser/parse_node.h"
 #include "parser/parse_type.h"
 #include "pgstat.h"
+#include "postmaster/autovacuum.h"
 #include "storage/bmap.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -1298,6 +1303,100 @@ hold_unmoved(const char *what)
 }
 
 /*
+ * dolt_commit() analyzes the tables of the commit it made that were never
+ * vacuumed or analyzed (reltuples -1).  Until autovacuum first analyzes a
+ * table, the planner guesses its rows from its width and the selectivity of
+ * its joins from default distinct counts, so tables loaded, committed and
+ * joined at once can be planned as nested loops over hundreds of millions
+ * of pairs of rows, which then run for many minutes however soon the
+ * statistics come.  A bulk load usually becomes a branch's by such a first
+ * commit, which has just read every row to fold it; an analyze reads only a
+ * sample.  Tables autovacuum wouldn't analyze are left alone: an empty one
+ * (the commit's count, read from its data tree's root), one whose autovacuum
+ * is off (or the server's), and one the user may not maintain.  So is one
+ * another vacuum or analyze holds now (SKIP_LOCKED), which counts it.
+ */
+typedef struct CommittedTables
+{
+	const ProllyTreeRoutine *tree;
+	ProllyTreeEnv env;
+	List	   *rels;			/* of VacuumRelation, to analyze */
+} CommittedTables;
+
+static void
+analyze_committed_table(const char *name, const ProllyNodeRef *data,
+						const ProllyValue *description, const char *unreadable,
+						void *arg)
+{
+	CommittedTables *ct = arg;
+	Oid			relid;
+	HeapTuple	tuple;
+	Form_pg_class form;
+	bool		never;
+
+	if (unreadable != NULL)
+		return;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid))
+		return;
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		return;
+	form = (Form_pg_class) GETSTRUCT(tuple);
+	never = form->relkind == RELKIND_RELATION && form->reltuples < 0;
+	if (never)
+	{
+		bool		isnull;
+		Datum		options = SysCacheGetAttr(RELOID, tuple,
+											  Anum_pg_class_reloptions, &isnull);
+
+		if (!isnull)
+		{
+			StdRdOptions *opts = (StdRdOptions *)
+				heap_reloptions(RELKIND_RELATION, options, false);
+
+			if (opts != NULL && opts->autovacuum.enabled == PG_TERNARY_FALSE)
+				never = false;
+		}
+	}
+	if (never &&
+		pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) == ACLCHECK_OK &&
+		PROLLY_CALL(ct->tree, count, &ct->env, data) > 0)
+		ct->rels = lappend(ct->rels,
+						makeVacuumRelation(makeRangeVar(get_namespace_name(form->relnamespace),
+														pstrdup(NameStr(form->relname)), -1),
+										   relid, NIL));
+	ReleaseSysCache(tuple);
+}
+
+static void
+analyze_committed_tables(const ProllyHash *id)
+{
+	ProllyCommitInfo info;
+	CommittedTables ct;
+	VacuumStmt *stmt;
+
+	if (!AutoVacuumingActive() || IsBinaryUpgrade)
+		return;
+	memset(&info, 0, sizeof(info));
+	if (!PROLLY_CALL(refs(), commit_get, id, &info))
+		return;
+	ct.tree = prolly_tree_lookup("cow");
+	prolly_folded_tree_env(&ct.env);
+	ct.rels = NIL;
+	PROLLY_CALL(canonicalizer(), tables, &info.root, NULL,
+				analyze_committed_table, &ct);
+	if (ct.rels == NIL)
+		return;
+	stmt = makeNode(VacuumStmt);
+	stmt->options = list_make1(makeDefElem("skip_locked", (Node *) makeBoolean(true), -1));
+	stmt->rels = ct.rels;
+	stmt->is_vacuumcmd = false;
+	ExecVacuum(make_parsestate(NULL), stmt, false);
+}
+
+/*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
  * -m/--message message (required, not empty), --author "Name <email>" (or
@@ -1461,6 +1560,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 				 errmsg("nothing to commit"),
 				 errhint("Pass --allow-empty to commit anyway.")));
 	settled();
+	analyze_committed_tables(&id);
 	result[0] = hash_hex(&id);
 	PG_RETURN_DATUM(text_array(1, result));
 }

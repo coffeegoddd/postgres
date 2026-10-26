@@ -901,6 +901,17 @@ are not a reason: they are sorted, spilling to disk, and applied a part at
 a time in key order, so the fold's work stays that of the rows changed
 (pg_stat_prolly's fold_changes_spilled).  A transaction commit's own
 changes past it commit the working set instead.
+
+dolt_commit() analyzes every table it commits that was never vacuumed or
+analyzed (reltuples -1).  Without statistics the planner guesses a table's
+rows from its width and its joins' selectivity from default distinct
+counts, so tables loaded, committed and joined right away (before
+autovacuum's first analyze) can get nested-loop plans that run for many
+minutes.  It leaves alone an empty table (the commit's count, from the
+data tree's root), one with autovacuum off (for the table or the server),
+one the user may not maintain, and one another vacuum or analyze holds
+(SKIP_LOCKED).  A table analyzed once is left to autovacuum after that.
+
 The refs ("copies", refs_copies.c) keep branch heads, baselines, tags, remotes and
 merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
