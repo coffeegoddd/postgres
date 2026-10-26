@@ -95,6 +95,22 @@ is($r->query_safe(q{SELECT count(*) FROM "postgres/h1".s.t}), '10',
 
 $r->quit;
 
+# With every cache discarded at each chance (debug_discard_caches), a read
+# of b1's copy still finishes: its build isn't started over at each reset.
+SKIP:
+{
+	skip 'debug_discard_caches needs an assert-enabled build', 1
+	  unless $node->safe_psql('postgres', 'SHOW debug_assertions') eq 'on';
+	is( $node->safe_psql(
+			'postgres', q{
+		SET statement_timeout = '120s';
+		SET debug_discard_caches = 1;
+		SELECT count(*) FROM "postgres/b1".s.t;
+	}),
+		'10',
+		'a read of another branch finishes while caches are discarded');
+}
+
 # Caches reset while b1's catalogs are being read (as a reset of the shared
 # invalidation queue would reset them, at an injection point inside the
 # read of b1's copy): the session's own entries, of a table it has open,

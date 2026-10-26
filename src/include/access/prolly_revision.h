@@ -6,8 +6,8 @@
  *	  query, as Doltgres's revision databases are.
  *
  * The parser turns such a name in a FROM clause into a range table entry
- * of the function prolly_revision_table(ref, schema, table, check_as), its
- * columns
+ * of the function prolly_revision_table(ref, schema, table, check_as,
+ * inherit), its columns
  * those the revision gives the table; the planner reads it with a custom
  * scan of its own, never through the function.  A name of the session's
  * own branch is an ordinary table name.

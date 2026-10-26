@@ -4569,6 +4569,15 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	 */
 	if (rte->rtekind == RTE_RELATION)
 		colinfo->printaliases = changed_any;
+	/*
+	 * A revision's table is printed as its name, which is parsed to the
+	 * columns the revision has then, read by name: a list of every column
+	 * (by position) would rename whichever the table has then.  Only the
+	 * aliases the user wrote, or names changed here, are printed.
+	 */
+	else if (prolly_revision_rte(rte))
+		colinfo->printaliases = changed_any ||
+			(rte->alias && rte->alias->colnames != NIL);
 	else if (rte->rtekind == RTE_FUNCTION)
 		colinfo->printaliases = true;
 	else if (rte->rtekind == RTE_TABLEFUNC)

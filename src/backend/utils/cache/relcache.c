@@ -2311,14 +2311,19 @@ branch_relation_drop(BranchRelEnt *ent)
 	RelationDestroyRelation(rel, false);
 }
 
-/* Invalidate the branch entries of relid (InvalidOid: every one). */
+/*
+ * Invalidate the branch entries of relid (InvalidOid: every one); and,
+ * unless the reset only discards caches to test (debug_discard_caches,
+ * which would otherwise make every build start over, for ever, as
+ * RelationBuildDesc()'s own builds aren't), the entry being built.
+ */
 static void
-branch_relations_invalidate(Oid relid)
+branch_relations_invalidate(Oid relid, bool debug_discard)
 {
 	HASH_SEQ_STATUS status;
 	BranchRelEnt *ent;
 
-	if (OidIsValid(branch_build_relid) &&
+	if (!debug_discard && OidIsValid(branch_build_relid) &&
 		(!OidIsValid(relid) || relid == branch_build_relid))
 		branch_build_invalidated = true;
 	if (BranchRelationCache == NULL)
@@ -2381,8 +2386,14 @@ RelationIdGetBranchRelation(Oid relid, Oid branch)
 	Assert(!OidIsValid(branch_build_relid));
 	PG_TRY();
 	{
+		int			attempts = 0;
+
 		do
 		{
+			/* (a relation changed again and again as it is read: give up) */
+			if (++attempts > 1000)
+				elog(ERROR, "relation %u of branch %u kept changing while its entry was built",
+					 relid, branch);
 			branch_build_relid = relid;
 			branch_build_invalidated = false;
 			rel = NULL;
@@ -3195,7 +3206,7 @@ RelationCacheInvalidateEntry(Oid relationId)
 				in_progress_list[i].invalidated = true;
 	}
 	/* (and other branches' copies of it) */
-	branch_relations_invalidate(relationId);
+	branch_relations_invalidate(relationId, false);
 }
 
 /*
@@ -3425,7 +3436,7 @@ relation_cache_invalidate(bool debug_discard, bool branch_switch)
 	if (!branch_switch)
 	{
 		RelationMapInvalidateAll();
-		branch_relations_invalidate(InvalidOid);
+		branch_relations_invalidate(InvalidOid, debug_discard);
 	}
 
 	/* Phase 1 */

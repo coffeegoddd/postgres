@@ -84,15 +84,17 @@ SELECT * FROM "regress_revisions/b1".rn.t FOR UPDATE;
 SELECT * FROM "regress_revisions/b1".rn.t FOR SHARE;
 -- a name too long to be sure of (cut to an identifier's length)
 SELECT * FROM "regress_revisions/a_branch_name_long_enough_to_be_cut_short_by_the_parser".rn.t;
+-- (cut at a character's boundary, a little short of an identifier's length)
+SELECT * FROM "regress_revisions/ééééééééééééééééééééééééééééééééééééééé".rn.t;
 -- the function is the parser's alone: a call written as one, whatever role
 -- it names, is refused
-SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
-SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 0) AS x(id int, v int);
+SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 10, true) AS x(id int, v int);
+SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 0, true) AS x(id int, v int);
 CREATE VIEW rn_by_call AS
-  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
+  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10, true) AS x(id int, v int);
 PREPARE by_call AS
-  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
-SELECT prolly_revision_table('b1', 'rn', 't', 10);
+  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10, true) AS x(id int, v int);
+SELECT prolly_revision_table('b1', 'rn', 't', 10, true);
 
 -- the branch's own definitions: a table only it has, a column it added
 SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
@@ -219,13 +221,72 @@ SELECT count(*) FROM "regress_revisions/b1".rn.t;
 SELECT has_table_privilege('regress_revisions_reader', 'rn.t', 'SELECT') AS main_grants;
 SELECT attname FROM pg_attribute WHERE attrelid = 'rn.t'::regclass AND attnum > 0 ORDER BY attnum;
 
+-- main by any case, from another branch (main in the folded index once
+-- it has commits)
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+SELECT count(*) FROM "regress_revisions/MAIN".rn.t;
+SELECT count(*) FROM "regress_revisions/Main".rn.t;
+SELECT count(*) FROM "regress_revisions/main".rn.t;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT count(*) FROM "regress_revisions/MAIN".rn.t;
+
+-- an inheritance parent on the branch: read with ONLY, or refused
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+CREATE TABLE rn.p (a int);
+CREATE TABLE rn.c () INHERITS (rn.p);
+INSERT INTO rn.p VALUES (1);
+INSERT INTO rn.c VALUES (2);
+CREATE TABLE rn.lone (a int);
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT count(*) FROM "regress_revisions/b1".rn.p;
+SELECT count(*) FROM ONLY "regress_revisions/b1".rn.p;
+CREATE VIEW rn_lone AS SELECT a FROM "regress_revisions/b1".rn.lone;
+CREATE VIEW rn_only AS SELECT a FROM ONLY "regress_revisions/b1".rn.p;
+SELECT pg_get_viewdef('rn_only');
+-- (a child added since the view was made: refused as it is read)
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+CREATE TABLE rn.lone_child () INHERITS (rn.lone);
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT count(*) FROM rn_lone;
+SELECT count(*) FROM rn_only;
+DROP VIEW rn_lone, rn_only;
+
+-- a view's definition names the revision's columns, so parsed again it
+-- reads them by name, however the branch's table has changed since
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+CREATE TABLE rn.secret (id int, pw text);
+INSERT INTO rn.secret VALUES (1, 'hunter2');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE VIEW rn_pw AS SELECT pw FROM "regress_revisions/b1".rn.secret;
+SELECT pg_get_viewdef('rn_pw');
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ALTER TABLE rn.secret ADD COLUMN note text DEFAULT 'n';
+ALTER TABLE rn.secret DROP COLUMN id;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM rn_pw;
+SELECT 'CREATE VIEW rn_pw_again AS ' || pg_get_viewdef('rn_pw') \gexec
+SELECT * FROM rn_pw_again;
+DROP VIEW rn_pw, rn_pw_again;
+
 -- names that differ only by case: an exact one is taken, else ambiguous
 SELECT dolt_tag('Mixed', 'HEAD') IS NOT NULL, dolt_tag('MIXED', 'HEAD~1') IS NOT NULL;
 SELECT sum(v) FROM "regress_revisions/Mixed".rn.t;
 SELECT sum(v) FROM "regress_revisions/MIXED".rn.t;
 SELECT sum(v) FROM "regress_revisions/mixed".rn.t;
 
+-- main by any case in a database without commits (main not yet folded)
+CREATE DATABASE regress_revisions_fresh;
+\c regress_revisions_fresh
+CREATE SCHEMA f VERSIONED;
+CREATE TABLE f.t (k int);
+INSERT INTO f.t VALUES (1);
+SELECT dolt_branch('other');
+SELECT dolt_checkout('other') IS NOT NULL AS on_other;
+SELECT count(*) FROM "regress_revisions_fresh/MAIN".f.t;
+SELECT count(*) FROM "regress_revisions_fresh/main".f.t;
+
 \c contrib_regression
+DROP DATABASE regress_revisions_fresh;
 DROP DATABASE regress_revisions;
 DROP ROLE regress_revisions_reader;
 DROP ROLE regress_revisions_owner;

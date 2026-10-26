@@ -7826,6 +7826,7 @@ typedef struct FoldedVisit
 {
 	ProllyBranchVisit visit;
 	void	   *arg;
+	bool		main;			/* main visited */
 } FoldedVisit;
 
 static void
@@ -7836,8 +7837,12 @@ visit_folded(const ProllyKey *k, const ProllyValue *v, void *arg)
 	ProllyHash	none = {0};
 
 	if (sep != NULL)
-		fv->visit(pnstrdup(sep + 1, (const char *) k->data + k->len - (sep + 1)),
-				  &none, fv->arg);
+	{
+		char	   *name = pnstrdup(sep + 1, (const char *) k->data + k->len - (sep + 1));
+
+		fv->main |= strcmp(name, "main") == 0;
+		fv->visit(name, &none, fv->arg);
+	}
 }
 
 /*
@@ -7848,7 +7853,7 @@ visit_folded(const ProllyKey *k, const ProllyValue *v, void *arg)
 static void
 copies_branches_folded(const char *name, ProllyBranchVisit visit, void *arg)
 {
-	FoldedVisit fv = {visit, arg};
+	FoldedVisit fv = {visit, arg, false};
 	StringInfoData prefix;
 	ProllyHash	none = {0};
 
@@ -7858,8 +7863,8 @@ copies_branches_folded(const char *name, ProllyBranchVisit visit, void *arg)
 	prefix.len -= strlen(name);
 	visit_prefix(prefix.data, prefix.len, visit_folded, &fv);
 	pfree(prefix.data);
-	/* (main, which no path makes, isn't in the index) */
-	if (pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
+	/* (main, which no path makes, is in the index only once it has a head) */
+	if (!fv.main && pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
 		visit("main", &none, arg);
 }
 

@@ -788,6 +788,8 @@ OF` are built in D18's shapes.
   columns the branch's; it takes the branch's grants on its copy (SELECT
   on it, or on each column read, as a session checked out there needs),
   and is refused where the copy's row security applies to the reader. A
+  table with inheritance children on the branch is read only with
+  `ONLY` (the copy alone); without it, it is refused. A
   branch with only its head, a tag and a commit are read from the
   commit's tree as `dolt_at()` reads them: the table here of the name,
   its columns as defined here, with D26's privileges (Dolt reads a
