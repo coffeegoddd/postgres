@@ -311,9 +311,16 @@ typedef struct ProllyTreeRoutine
 	/*
 	 * Optional: how many keys diff() would report, estimated reading at
 	 * most max_nodes nodes, for a caller choosing whether a diff is worth
-	 * walking.  Exact where the nodes that differ fit in max_nodes; past
-	 * it, never less than diff's count (each node left unread counted as
-	 * if every item it holds changed).
+	 * walking.  Exact where the nodes that differ fit in half of
+	 * max_nodes; past it, the walk stops above them, and the changes under
+	 * the nodes it left are estimated from a sample of the key ranges they
+	 * cover, taken in proportion to their rows and each walked down: the
+	 * changes found for each row sampled, times the rows of the ranges not
+	 * taken (never fewer than the rows one side holds there and the other
+	 * doesn't).  So changes spread over the tree, bunched in runs, and
+	 * ranges appended or deleted are all estimated near their count.  With
+	 * nothing sampled (the budget too small), every row under the nodes
+	 * left counts as changed: never less than diff's count.
 	 */
 	uint64		(*diff_estimate) (const ProllyTreeEnv *env,
 								  const ProllyNodeRef *from,

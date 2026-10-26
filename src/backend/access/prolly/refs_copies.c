@@ -4502,7 +4502,8 @@ find_kept_commit(const ProllyKeptState *state, void *arg)
  * set is known or thought to be (its working set known, else its
  * baseline's fold, else its head; one changed since is only a hint, the
  * move folding the copies as they are).  The session's branch is planned
- * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
+ * first and kept on a tie or near one (SOURCE_COST_MARGIN); at most
+ * SOURCE_CANDIDATES others are planned
  * after it, each stopped once it costs more than the best yet, each planned
  * on its own branch (its tables' indexes are its own).  NULL if
  * none is cheaper than the session's branch.  A kept materialization is a
@@ -4521,6 +4522,15 @@ find_kept_commit(const ProllyKeptState *state, void *arg)
  * busy.
  */
 #define SOURCE_CANDIDATES	16
+
+/*
+ * A candidate is taken over the best yet only where it costs clearly less:
+ * a diff past the planner's node bound is estimated from a sample, off
+ * by up to a tenth or so either way, so two candidates as far from the head (the
+ * session's branch and another at the same commit, say) can cost a little
+ * apart, and the session's branch, which wins a tie, must win those too.
+ */
+#define SOURCE_COST_MARGIN	0.8
 
 /* Is branch name a kept materialization (the materialization cache's)? */
 static bool
@@ -4704,17 +4714,18 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
 		/*
-		 * (with tables to share, not bounded by the best's cost: one past it
-		 * may cost less once they are shared)
+		 * (bounded by what it would have to cost less than, the best's less
+		 * the margin; with tables to share, not bounded: one past it may
+		 * cost less once they are shared)
 		 */
 		PlanOn		po = {planner, list_nth(sc.roots, i), target,
-		shareable ? INFINITY : best_cost, &plan};
+		shareable ? INFINITY : best_cost * SOURCE_COST_MARGIN, &plan};
 		double		cost;
 
 		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 		cost = cost_with_shares(&plan, shareable);
-		if (!plan.over && cost < best_cost)
+		if (!plan.over && cost < best_cost * SOURCE_COST_MARGIN)
 		{
 			best = plan;
 			best_cost = cost;
