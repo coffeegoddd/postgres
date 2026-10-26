@@ -120,9 +120,13 @@ DROP SCHEMA public;
 CREATE SCHEMA public VERSIONED;
 GRANT ALL ON SCHEMA public TO PUBLIC;
 });
+# (each transaction's commit moves main's head, which takes the database's
+# CREATE among the privileges that may, as a deployment turning on
+# transaction commits would grant: the tests' own roles make tables too)
 PostgreSQL::Test::Utils::append_to_file($txn_commit, q{
 DO $$ BEGIN
 	EXECUTE format('ALTER DATABASE %I SET dolt.transaction_commit = on', current_database());
+	EXECUTE format('GRANT CREATE ON DATABASE %I TO PUBLIC', current_database());
 END $$;
 });
 # Every table a test makes is recorded as it is made, by an event trigger
