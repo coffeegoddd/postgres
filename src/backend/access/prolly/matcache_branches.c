@@ -135,35 +135,18 @@ made_seen(Oid branch, Snapshot snap)
 	return seen;
 }
 
-typedef struct VisitKept
-{
-	Snapshot	snap;
-	ProllyKeptVisit visit;
-	void	   *arg;
-	List	   *states;			/* ProllyKeptState *, visited after the scan */
-	List	   *branches;		/* ProllyKeptState *: the other branches,
-								 * their kept commits read after it */
-} VisitKept;
-
+/* The kept checkouts found, visited after the scan of their names. */
 static void
 note_kept(const char *name, Oid branch, void *arg)
 {
-	VisitKept  *vk = arg;
+	List	  **states = arg;
 	ProllyKeptState *s;
 
 	s = palloc0(sizeof(ProllyKeptState));
+	s->kind = PROLLY_KEPT_CHECKOUT;
 	s->name = pstrdup(name);
 	s->branch = branch;
-	if (detached_name(name))
-	{
-		s->kind = PROLLY_KEPT_CHECKOUT;
-		vk->states = lappend(vk->states, s);
-	}
-	else
-	{
-		s->kind = PROLLY_KEPT_COMMIT;
-		vk->branches = lappend(vk->branches, s);
-	}
+	*states = lappend(*states, s);
 }
 
 /* Does snap see the transaction that kept a commit's pages committed? */
@@ -222,38 +205,117 @@ note_kept_commit(const ProllyKeptCommit *kc, void *arg)
 	k->states = lappend(k->states, s);
 }
 
+/* A branch keeping pages as of commits the filter asks for. */
+typedef struct KeptHolder
+{
+	char	   *name;
+	List	   *commits;		/* ProllyHash * */
+} KeptHolder;
+
+static void
+note_holder(const char *name, const ProllyHash *commit, void *arg)
+{
+	List	  **holders = arg;
+	ProllyHash *c = palloc(sizeof(ProllyHash));
+	KeptHolder *h;
+
+	*c = *commit;
+	foreach_ptr(KeptHolder, x, *holders)
+	{
+		if (strcmp(x->name, name) == 0)
+		{
+			x->commits = lappend(x->commits, c);
+			return;
+		}
+	}
+	h = palloc(sizeof(KeptHolder));
+	h->name = pstrdup(name);
+	h->commits = list_make1(c);
+	*holders = lappend(*holders, h);
+}
+
+static int
+holder_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((const KeptHolder *) lfirst(a))->name,
+				  ((const KeptHolder *) lfirst(b))->name);
+}
+
+static bool
+hash_equal(const ProllyHash *a, const ProllyHash *b)
+{
+	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+static bool
+hash_listed(List *hashes, const ProllyHash *h)
+{
+	foreach_ptr(ProllyHash, x, hashes)
+		if (hash_equal(x, h))
+			return true;
+	return false;
+}
+
 /*
- * The kept branches the snapshot sees made, then the kept commits whose
- * keeping it sees committed (every branch's but the kept branches', whose
- * own pages serve as the branch), whose commits' ordering dependencies
- * match the installed extensions: each with its commit and that commit's
- * root.  (Visited once the branches are listed: a visit may read catalogs
- * of its own.)
+ * The kept branches the snapshot sees made (the hidden branches' prefix
+ * of the names alone), then the kept commits the filter asks for (an
+ * index's, in the refs) whose keeping it sees committed (every branch's
+ * but the kept branches', whose own pages serve as the branch), whose
+ * commits' ordering dependencies match the installed extensions: each
+ * with its commit and that commit's root.  (Visited once the branches are
+ * found: a visit may read catalogs of its own.)
  */
 static void
-branches_visit(Snapshot snap, ProllyKeptVisit visit, void *arg)
+branches_visit(Snapshot snap, const ProllyKeptFilter *filter,
+			   ProllyKeptVisit visit, void *arg)
 {
 	ProllyDatabaseComponents dc;
-	VisitKept	vk = {snap, visit, arg, NIL, NIL};
+	List	   *checkouts = NIL;
 	List	   *commits = NIL;
+	List	   *holders = NIL;
 
 	prolly_database_components(&dc);
-	branch_ops()->branches(note_kept, &vk);
-	foreach_ptr(ProllyKeptState, s, vk.states)
+	branch_ops()->branches_named(PROLLY_DETACHED_PREFIX, note_kept, &checkouts);
+	foreach_ptr(ProllyKeptState, s, checkouts)
 	{
 		if (s->branch == MyBranch || !made_seen(s->branch, snap) ||
-			!PROLLY_CALL(dc.refs, resolve, s->name, &s->commit))
+			!PROLLY_CALL(dc.refs, resolve, s->name, &s->commit) ||
+			(filter->commit != NULL && !hash_equal(&s->commit, filter->commit)))
 			continue;
 		commits = lappend(commits, s);
 	}
-	if (PROLLY_HAS(dc.refs, kept_commits) && prolly_kept_commits > 0)
-		foreach_ptr(ProllyKeptState, b, vk.branches)
-		{
-			KeptCommits k = {b, snap, NIL};
+	if (PROLLY_HAS(dc.refs, kept_commits) && PROLLY_HAS(dc.refs, kept_holders) &&
+		prolly_kept_commits > 0)
+	{
+		if (filter->commit != NULL)
+			PROLLY_CALL(dc.refs, kept_holders, filter->commit, NULL,
+						note_holder, &holders);
+		for (int t = 0; t < filter->ntables; t++)
+			PROLLY_CALL(dc.refs, kept_holders, NULL, &filter->tables[t],
+						note_holder, &holders);
+	}
+	/* (in the branches' name order, as a listing of them would have them) */
+	list_sort(holders, holder_cmp);
+	foreach_ptr(KeptHolder, h, holders)
+	{
+		const char *name = h->name;
+		ProllyKeptState of = {PROLLY_KEPT_COMMIT, name, InvalidOid};
+		KeptCommits k = {&of, snap, NIL};
+		HeapTuple	tup;
 
-			PROLLY_CALL(dc.refs, kept_commits, b->name, note_kept_commit, &k);
-			commits = list_concat(commits, k.states);
-		}
+		/* (a branch with copies, not a kept one: its own pages serve as it) */
+		if (detached_name(name) || strlen(name) >= NAMEDATALEN)
+			continue;
+		tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(name));
+		if (!HeapTupleIsValid(tup))
+			continue;
+		of.branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+		ReleaseSysCache(tup);
+		PROLLY_CALL(dc.refs, kept_commits, name, note_kept_commit, &k);
+		foreach_ptr(ProllyKeptState, s, k.states)
+			if (hash_listed(h->commits, &s->commit))
+				commits = lappend(commits, s);
+	}
 	foreach_ptr(ProllyKeptState, s, commits)
 	{
 		ProllyCommitInfo info;

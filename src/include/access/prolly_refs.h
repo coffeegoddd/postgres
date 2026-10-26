@@ -295,6 +295,9 @@ typedef struct ProllyKeptCommit
 } ProllyKeptCommit;
 
 typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
+/* A branch keeping pages as of commit (kept_holders()). */
+typedef void (*ProllyKeptHolderVisit) (const char *name, const ProllyHash *commit,
+									   void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -757,6 +760,16 @@ typedef struct ProllyRefsRoutine
 								 void *arg);
 
 	/*
+	 * Optional: visit the branches keeping pages as of commit (data NULL),
+	 * or as of a commit one of whose kept tables has the data tree data,
+	 * each with that commit (retired ones too: kept_commits()
+	 * says which still are).  A seek of an index: the work is in those,
+	 * however many branches there are.
+	 */
+	void		(*kept_holders) (const ProllyHash *commit, const ProllyHash *data,
+								 ProllyKeptHolderVisit visit, void *arg);
+
+	/*
 	 * Optional, together: pins.  A pin keeps a commit, and everything it
 	 * reaches, from collection under a name, for a reader outside the refs
 	 * that names the commit (a snapshot mount), with the nkeep trees keep
@@ -922,7 +935,7 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", "kept_holders", \
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \

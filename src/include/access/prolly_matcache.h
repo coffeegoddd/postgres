@@ -28,7 +28,10 @@
  *   (branch operations' share_kept(), or a first use's make_kept()).
  *
  * Contract:
- * - visit() visits the kept states whose making the snapshot sees
+ * - visit() visits the kept states filter asks for (ProllyKeptFilter):
+ *   by an index of the kept commits and the kept checkouts alone, so the
+ *   work is in those, however many branches there are.  Of them, it
+ *   visits those whose making the snapshot sees
  *   committed (a kept checkout's branch, a kept commit's keeping
  *   transaction: so every tuple their pages hold is one the snapshot sees
  *   as committed or aborted) and whose commit's ordering dependencies
@@ -83,12 +86,27 @@ typedef struct ProllyKeptState
 
 typedef void (*ProllyKeptVisit) (const ProllyKeptState *state, void *arg);
 
+/*
+ * The kept states visit() visits: with commit, the kept checkouts at it
+ * and the kept commits of it (a first use there is made of their pages);
+ * else every kept checkout (they are few: prolly.kept_checkouts), and the
+ * kept commits one of whose tables has one of the data trees tables[]
+ * (ntables of them: a move's target's, whose tables could be shared).
+ */
+typedef struct ProllyKeptFilter
+{
+	const ProllyHash *commit;
+	const ProllyHash *tables;
+	int			ntables;
+} ProllyKeptFilter;
+
 typedef struct ProllyMatCacheRoutine
 {
 	ProllyImplInfo info;
 
 	bool		(*kept) (const char *name);
-	void		(*visit) (Snapshot snap, ProllyKeptVisit visit, void *arg);
+	void		(*visit) (Snapshot snap, const ProllyKeptFilter *filter,
+						  ProllyKeptVisit visit, void *arg);
 	void		(*note_use) (const char *name);
 	void		(*evict) (List *names, bool (*drop) (const char *name, void *arg),
 						  void *arg);

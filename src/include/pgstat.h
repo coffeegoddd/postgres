@@ -817,7 +817,7 @@ typedef enum PgStat_ProllyCounter
 										 * commits forgotten after a
 										 * collection */
 	PGSTAT_PROLLY_BRANCHES_LISTED,	/* branches visited by listings of
-									 * every branch with copies */
+									 * the branches with copies */
 } PgStat_ProllyCounter;
 
 #define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BRANCHES_LISTED + 1)
