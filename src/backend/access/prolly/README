@@ -1716,6 +1716,45 @@ estimated by the mounted one's height).  prolly_mounts() shows which
 mounts are history mounts.  The dolt_history_table() functions still read
 every commit.
 
+Revision-qualified table names (prolly_revision.c) read a table as
+another revision has it, as Doltgres's revision databases do:
+"db/ref".schema.table in any FROM clause, db the current database and
+ref a branch, a tag, a commit or ancestry of one, matched as Dolt matches
+a revision's name (a branch's or tag's name exactly, else the one that
+differs from it only by case; two such are ambiguous).  The parser
+(transformTableEntry()) makes the name a range table entry of
+prolly_revision_table(ref, schema, table), its columns the revision's,
+and the planner scans it with a custom scan of its own, never through
+the function.  The name of the session's own branch is an ordinary
+table name, and a table outside the versioned schemas is the same on
+every revision.  Any other use of such a name (a write, DDL, LOCK) is
+refused (namespace.c's catalog-name checks).  A used branch's table is
+its copy, read through heap's code under the query's snapshot, so one
+query reading several branches reads each as of one moment, and a
+branch's uncommitted rows are not seen while its committed working set
+is.  The copy's relation entry is built from the rows that branch has
+(RelationIdGetBranchRelation(): CATALOG_READ_ON_BRANCH() makes catalog
+scans see another branch's rows, and catalog cache lookups of
+branch-aware catalogs read the catalog and keep nothing meanwhile), kept
+apart from the session's entries by OID and branch, and invalidated with
+them; so are its btree indexes', which the scan seeks for equalities and
+a range known before it reads (constants, parameters, a correlated
+subquery's outer values), all its quals kept as its filter too.  The
+scan locks the copy as a session on the branch does, holds the branch
+against deletion as such a session does (pin_branch()), and is refused
+where checking the branch out would be (the refs' check_copies_read():
+a snapshot that can't move and doesn't see the branch's first use, or a
+move that gave it its head's kept pages).  It takes the branch's grants
+on the copy, and refuses a table whose row security applies to the
+reader.  A table's OID by its name on a branch, and that a role may read
+all of it, are kept per backend, flushed by any change to a relation's,
+schema's or role's catalog rows.  A branch with only its head, a tag and
+a commit are read from the commit's tree as dolt_at() reads them, the
+table here of the name.  Each scan looks the revision up again as it
+begins and matches the plan's columns by name, so a view or a kept plan
+reads the revision as it is then (a column it reads gone, or retyped,
+is an error).
+
 
 Core hooks
 ----------
