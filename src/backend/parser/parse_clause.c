@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/prolly_revision.h"
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "access/tsmapi.h"
@@ -396,6 +397,12 @@ transformJoinOnClause(ParseState *pstate, JoinExpr *j, List *namespace)
 static ParseNamespaceItem *
 transformTableEntry(ParseState *pstate, RangeVar *r)
 {
+	const char *ref;
+
+	/* a revision's table: "db/ref".schema.table */
+	if (r->catalogname && prolly_revision_catalog(r->catalogname, &ref))
+		return prolly_revision_range(pstate, r, ref);
+
 	/* addRangeTableEntry does all the work */
 	return addRangeTableEntry(pstate, r, r->alias, r->inh, true);
 }

@@ -214,6 +214,37 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 }
 
 /*
+ *		LockRelationOidOnBranch
+ *
+ * As LockRelationOid(), for branch's copy of a versioned relation, which
+ * may be another branch's than the session's: a query reading that copy
+ * locks it as a session on the branch would.
+ */
+void
+LockRelationOidOnBranch(Oid relid, Oid branch, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
+	LockAcquireResult res;
+
+	SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, branch);
+	res = LockAcquireExtended(&tag, lockmode, false, RelationLocksNoWait,
+							  true, &locallock, false);
+	if (res == LOCKACQUIRE_NOT_AVAIL)
+	{
+		RelationLockRefused = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("could not obtain lock on relation %u", relid)));
+	}
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
+		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
+}
+
+/*
  *		ConditionalLockRelationOid
  *
  * As above, but only lock if we can get the lock without blocking.

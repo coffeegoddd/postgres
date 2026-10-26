@@ -2259,6 +2259,170 @@ RelationCloseCleanup(Relation relation)
 #endif
 }
 
+/* ----------------------------------------------------------------
+ *		Entries of other branches' copies
+ *
+ * A versioned relation has a copy on each branch that has used it, each
+ * with catalog rows of its own under the same OID.  The cache's entries
+ * (RelationIdCache) are the session branch's.  A query can read another
+ * branch's copy without checking that branch out: its entry is built from
+ * the rows that branch has (CATALOG_READ_ON_BRANCH()), and kept apart from
+ * the others, by OID and branch.  A relcache invalidation of the OID, or
+ * of everything, invalidates the copies' entries too: one not in use is
+ * dropped at once, one in use when it is next opened unused.  Their index
+ * lists are read when they are built, as that branch has them.
+ * ----------------------------------------------------------------
+ */
+typedef struct BranchRelKey
+{
+	Oid			relid;
+	Oid			branch;
+} BranchRelKey;
+
+typedef struct BranchRelEnt
+{
+	BranchRelKey key;
+	Relation	reldesc;
+} BranchRelEnt;
+
+static HTAB *BranchRelationCache = NULL;
+
+/* the relation a branch entry is being built of, and whether it was invalidated */
+static Oid	branch_build_relid = InvalidOid;
+static bool branch_build_invalidated = false;
+
+static void
+branch_relation_drop(BranchRelEnt *ent)
+{
+	Relation	rel = ent->reldesc;
+
+	Assert(RelationHasReferenceCountZero(rel));
+	hash_search(BranchRelationCache, &ent->key, HASH_REMOVE, NULL);
+	RelationDestroyRelation(rel, false);
+}
+
+/* Invalidate the branch entries of relid (InvalidOid: every one). */
+static void
+branch_relations_invalidate(Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	BranchRelEnt *ent;
+
+	if (OidIsValid(branch_build_relid) &&
+		(!OidIsValid(relid) || relid == branch_build_relid))
+		branch_build_invalidated = true;
+	if (BranchRelationCache == NULL)
+		return;
+	hash_seq_init(&status, BranchRelationCache);
+	while ((ent = hash_seq_search(&status)) != NULL)
+	{
+		if (OidIsValid(relid) && ent->key.relid != relid)
+			continue;
+		ent->reldesc->rd_isvalid = false;
+		if (RelationHasReferenceCountZero(ent->reldesc))
+			branch_relation_drop(ent);
+	}
+}
+
+/*
+ * RelationIdGetBranchRelation
+ *		The entry of branch's copy of relation relid, with its reference
+ *		count incremented; NULL if branch has no such relation.  The caller
+ *		holds a lock on that copy, and closes the entry with
+ *		RelationCloseBranchRelation().  A relation that isn't versioned
+ *		(every branch's: branch 0) is found too, as branch has it.
+ */
+Relation
+RelationIdGetBranchRelation(Oid relid, Oid branch)
+{
+	BranchRelKey key;
+	BranchRelEnt *ent;
+	Relation	rel;
+	bool		found;
+
+	AssertCouldGetRelation();
+	Assert(OidIsValid(branch));
+	if (BranchRelationCache == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(BranchRelKey);
+		ctl.entrysize = sizeof(BranchRelEnt);
+		ctl.hcxt = CacheMemoryContext;
+		BranchRelationCache = hash_create("Relcache of other branches' copies",
+										  16, &ctl,
+										  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	key.relid = relid;
+	key.branch = branch;
+	ent = hash_search(BranchRelationCache, &key, HASH_FIND, NULL);
+	if (ent != NULL)
+	{
+		rel = ent->reldesc;
+		if (rel->rd_isvalid || !RelationHasReferenceCountZero(rel))
+		{
+			RelationIncrementReferenceCount(rel);
+			return rel;
+		}
+		branch_relation_drop(ent);
+	}
+
+	/* (no nesting: a copy's entry is built from catalog rows alone) */
+	Assert(!OidIsValid(branch_build_relid));
+	PG_TRY();
+	{
+		do
+		{
+			branch_build_relid = relid;
+			branch_build_invalidated = false;
+			rel = NULL;
+			CATALOG_READ_ON_BRANCH(branch,
+								   rel = RelationBuildDesc(relid, false);
+								   if (rel != NULL &&
+									   (rel->rd_rel->relkind == RELKIND_RELATION ||
+										rel->rd_rel->relkind == RELKIND_MATVIEW))
+									   (void) RelationGetIndexList(rel));
+			if (rel != NULL && branch_build_invalidated)
+			{
+				RelationDestroyRelation(rel, false);
+				rel = NULL;
+				continue;
+			}
+		} while (branch_build_invalidated);
+	}
+	PG_FINALLY();
+	{
+		branch_build_relid = InvalidOid;
+	}
+	PG_END_TRY();
+	if (rel == NULL)
+		return NULL;
+
+	ent = hash_search(BranchRelationCache, &key, HASH_ENTER, &found);
+	Assert(!found);
+	ent->reldesc = rel;
+	RelationIncrementReferenceCount(rel);
+	return rel;
+}
+
+/* Close an entry RelationIdGetBranchRelation() gave (its lock is kept). */
+void
+RelationCloseBranchRelation(Relation relation)
+{
+	RelationDecrementReferenceCount(relation);
+	if (!relation->rd_isvalid && RelationHasReferenceCountZero(relation))
+	{
+		BranchRelKey key;
+		BranchRelEnt *ent;
+
+		key.relid = RelationGetRelid(relation);
+		key.branch = relation->rd_rel->relbranch;
+		ent = hash_search(BranchRelationCache, &key, HASH_FIND, NULL);
+		if (ent != NULL && ent->reldesc == relation)
+			branch_relation_drop(ent);
+	}
+}
+
 /*
  * RelationReloadIndexInfo - reload minimal information for an open index
  *
@@ -3013,6 +3177,8 @@ RelationCacheInvalidateEntry(Oid relationId)
 			if (in_progress_list[i].reloid == relationId)
 				in_progress_list[i].invalidated = true;
 	}
+	/* (and other branches' copies of it) */
+	branch_relations_invalidate(relationId);
 }
 
 /*
@@ -3237,9 +3403,13 @@ relation_cache_invalidate(bool debug_discard, bool branch_switch)
 
 	/*
 	 * Reload relation mapping data before starting to reconstruct cache.
+	 * Other branches' copies are no session branch's: a switch keeps them.
 	 */
 	if (!branch_switch)
+	{
 		RelationMapInvalidateAll();
+		branch_relations_invalidate(InvalidOid);
+	}
 
 	/* Phase 1 */
 	hash_seq_init(&status, RelationIdCache);

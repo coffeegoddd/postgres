@@ -7508,6 +7508,22 @@ check_head_restore_seen(const char *name, Oid oid)
 }
 
 /*
+ * A read of branch name's copies (oid) without checking it out, refused
+ * where a checkout would be (copies_checkout()).
+ */
+static void
+copies_check_copies_read(const char *name, Oid oid)
+{
+	if (IsolationUsesXactSnapshot() && branch_made_unseen(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
+	check_head_restore_seen(name, oid);
+}
+
+/*
  * Leaving a branch leaves its changes in its copies, unfolded: its next
  * fold (a commit, a status, another session's read) reads them from its
  * change finder's record, as it would have had the session stayed.  Only a
@@ -10730,4 +10746,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.stash_set_maker = copies_stash_set_maker,
 	.last_fold = copies_last_fold,
 	.forget_records = copies_forget_records,
+	.check_copies_read = copies_check_copies_read,
 };

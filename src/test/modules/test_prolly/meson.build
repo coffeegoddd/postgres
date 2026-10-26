@@ -251,6 +251,7 @@ tests += {
       'recorded_makers',
       'move_calls',
       'scoped_refs',
+      'revision_names',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

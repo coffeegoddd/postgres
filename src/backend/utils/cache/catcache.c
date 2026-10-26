@@ -94,7 +94,8 @@ static pg_noinline HeapTuple SearchCatCacheMiss(CatCache *cache,
 												uint32 hashValue,
 												Index hashIndex,
 												Datum v1, Datum v2,
-												Datum v3, Datum v4);
+												Datum v3, Datum v4,
+												bool keep);
 
 static uint32 CatalogCacheComputeHashValue(CatCache *cache, int nkeys,
 										   Datum v1, Datum v2, Datum v3, Datum v4);
@@ -1493,6 +1494,16 @@ SearchCatCacheInternal(CatCache *cache,
 	hashIndex = HASH_INDEX(hashValue, cache->cc_nbuckets);
 
 	/*
+	 * Read as another branch has it (CatalogReadBranch): this cache's
+	 * entries are the session branch's, so the catalog is read, and what is
+	 * found isn't kept.
+	 */
+	if (unlikely(OidIsValid(CatalogReadBranch)) &&
+		catalog_branch_info(cache->cc_reloid) != NULL)
+		return SearchCatCacheMiss(cache, nkeys, hashValue, hashIndex,
+								  v1, v2, v3, v4, false);
+
+	/*
 	 * scan the hash bucket until we find a match or exhaust our tuples
 	 *
 	 * Note: it's okay to use dlist_foreach here, even though we modify the
@@ -1552,7 +1563,8 @@ SearchCatCacheInternal(CatCache *cache,
 		}
 	}
 
-	return SearchCatCacheMiss(cache, nkeys, hashValue, hashIndex, v1, v2, v3, v4);
+	return SearchCatCacheMiss(cache, nkeys, hashValue, hashIndex, v1, v2, v3, v4,
+							  true);
 }
 
 /*
@@ -1570,7 +1582,8 @@ SearchCatCacheMiss(CatCache *cache,
 				   Datum v1,
 				   Datum v2,
 				   Datum v3,
-				   Datum v4)
+				   Datum v4,
+				   bool keep)
 {
 	ScanKeyData cur_skey[CATCACHE_MAXKEYS];
 	Relation	relation;
@@ -1641,6 +1654,9 @@ SearchCatCacheMiss(CatCache *cache,
 				stale = true;
 				break;
 			}
+			/* (not kept: no search finds it, and its release frees it) */
+			if (!keep)
+				ct->dead = true;
 			/* immediately set the refcount to 1 */
 			ResourceOwnerEnlarge(CurrentResourceOwner);
 			ct->refcount++;
@@ -1665,7 +1681,7 @@ SearchCatCacheMiss(CatCache *cache,
 	 */
 	if (ct == NULL)
 	{
-		if (IsBootstrapProcessingMode())
+		if (IsBootstrapProcessingMode() || !keep)
 			return NULL;
 
 		ct = CatalogCacheCreateEntry(cache, NULL, arguments,
@@ -1813,6 +1829,12 @@ SearchCatCacheList(CatCache *cache,
 	ConditionalCatalogCacheInitializeCache(cache);
 
 	Assert(nkeys > 0 && nkeys < cache->cc_nkeys);
+
+	/* (a list is kept as a whole: none is made of another branch's rows) */
+	if (unlikely(OidIsValid(CatalogReadBranch)) &&
+		catalog_branch_info(cache->cc_reloid) != NULL)
+		elog(ERROR, "catalog cache list of %s read on another branch",
+			 cache->cc_relname);
 
 #ifdef CATCACHE_STATS
 	cache->cc_lsearches++;

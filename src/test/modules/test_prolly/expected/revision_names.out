@@ -1,0 +1,477 @@
+-- Revision-qualified table names, as Doltgres's: "db/ref".schema.table
+-- reads the table as a branch's working set (uncommitted changes
+-- included), a tag or a commit has it, anywhere a query names a table.
+CREATE DATABASE regress_revisions;
+\c regress_revisions
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA rn VERSIONED;
+CREATE TABLE rn.t (id int PRIMARY KEY, v int);
+INSERT INTO rn.t SELECT g, 1 FROM generate_series(1, 10) g;
+CREATE TABLE public.plain (n int);
+INSERT INTO public.plain VALUES (42);
+SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c1 \gset
+SELECT dolt_branch('b1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+UPDATE rn.t SET v = 2 WHERE id = 1;		-- uncommitted on b1
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- the issue's probe: b1's working set holds 11, its head 10
+SELECT sum(v) FROM dolt_at('b1', NULL::rn.t);
+ sum 
+-----
+  10
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/b1".rn.t;
+ sum 
+-----
+  11
+(1 row)
+
+-- the branch's name in any case, as Dolt matches it
+SELECT sum(v) FROM "regress_revisions/B1".rn.t;
+ sum 
+-----
+  11
+(1 row)
+
+-- in joins with the session's tables, aggregates and subqueries
+SELECT m.id, m.v AS main_v, b.v AS b1_v
+  FROM rn.t m JOIN "regress_revisions/b1".rn.t b USING (id)
+ WHERE m.v <> b.v;
+ id | main_v | b1_v 
+----+--------+------
+  1 |      1 |    2
+(1 row)
+
+SELECT count(*) FROM (SELECT id FROM "regress_revisions/b1".rn.t
+                      EXCEPT SELECT id FROM rn.t) d;
+ count 
+-------
+     0
+(1 row)
+
+SELECT id, (SELECT v FROM "regress_revisions/b1".rn.t b WHERE b.id = m.id) AS b1_v
+  FROM rn.t m WHERE id <= 2 ORDER BY id;
+ id | b1_v 
+----+------
+  1 |    2
+  2 |    1
+(2 rows)
+
+SELECT x FROM "regress_revisions/b1".rn.t x WHERE id = 1;
+   x   
+-------
+ (1,2)
+(1 row)
+
+-- an equality or range on the copy's index is a seek in it
+EXPLAIN (COSTS OFF) SELECT v FROM "regress_revisions/b1".rn.t WHERE id = 3;
+         QUERY PLAN         
+----------------------------
+ Custom Scan (RevisionScan)
+   Filter: (id = 3)
+   Revision: b1
+   Table: rn.t
+   Index: t_pkey
+   Index Cond: (id = 3)
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT (SELECT v FROM "regress_revisions/b1".rn.t b WHERE b.id = m.id) FROM rn.t m;
+             QUERY PLAN             
+------------------------------------
+ Seq Scan on t m
+   SubPlan expr_1
+     ->  Custom Scan (RevisionScan)
+           Filter: (id = m.id)
+           Revision: b1
+           Table: rn.t
+           Index: t_pkey
+           Index Cond: (id = m.id)
+(8 rows)
+
+SELECT v FROM "regress_revisions/b1".rn.t WHERE id = 1;
+ v 
+---
+ 2
+(1 row)
+
+SELECT count(*) FROM "regress_revisions/b1".rn.t WHERE id BETWEEN 2 AND 4;
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM "regress_revisions/b1".rn.t WHERE id = NULL::int;
+ count 
+-------
+     0
+(1 row)
+
+-- the session's own branch: an ordinary table name, writable
+EXPLAIN (COSTS OFF) SELECT * FROM "regress_revisions/main".rn.t;
+  QUERY PLAN   
+---------------
+ Seq Scan on t
+(1 row)
+
+UPDATE "regress_revisions/main".rn.t SET v = 1 WHERE id = 10;
+-- a table outside the versioned schemas: every revision's
+SELECT n FROM "regress_revisions/b1".public.plain;
+ n  
+----
+ 42
+(1 row)
+
+-- commits, tags, and ancestry: read from the commit's tree
+UPDATE rn.t SET v = 3 WHERE id = 2;
+SELECT length(dolt_commit('-am', 'second')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_tag('tag1', 'HEAD') IS NOT NULL AS tagged;
+ tagged 
+--------
+ t
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/tag1".rn.t;
+ sum 
+-----
+  12
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/TAG1".rn.t;
+ sum 
+-----
+  12
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/tag1~1".rn.t;
+ sum 
+-----
+  10
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/main~1".rn.t;
+ sum 
+-----
+  10
+(1 row)
+
+SELECT 'regress_revisions/' || :'c1' AS at_c1 \gset
+SELECT sum(v) FROM :"at_c1".rn.t;
+ sum 
+-----
+  10
+(1 row)
+
+-- a branch with only its head: its working set is its head commit
+SELECT dolt_branch('h1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT EXISTS (SELECT FROM pg_branch WHERE brname = 'h1') AS h1_used;
+ h1_used 
+---------
+ f
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/h1".rn.t;
+ sum 
+-----
+  12
+(1 row)
+
+SELECT EXISTS (SELECT FROM pg_branch WHERE brname = 'h1') AS h1_used;
+ h1_used 
+---------
+ f
+(1 row)
+
+-- what isn't there
+SELECT * FROM "regress_revisions/nope".rn.t;
+ERROR:  database "regress_revisions/nope" does not exist
+LINE 1: SELECT * FROM "regress_revisions/nope".rn.t;
+                      ^
+DETAIL:  No branch, tag or commit is named "nope".
+SELECT * FROM "regress_revisions/tag1~5".rn.t;
+ERROR:  database "regress_revisions/tag1~5" does not exist
+LINE 1: SELECT * FROM "regress_revisions/tag1~5".rn.t;
+                      ^
+DETAIL:  No branch, tag or commit is named "tag1~5".
+SELECT * FROM "regress_revisions/b1".rn.nope;
+ERROR:  relation "rn.nope" does not exist in revision "b1"
+LINE 1: SELECT * FROM "regress_revisions/b1".rn.nope;
+                      ^
+SELECT * FROM "regress_revisions/b1".nope.t;
+ERROR:  relation "nope.t" does not exist in revision "b1"
+LINE 1: SELECT * FROM "regress_revisions/b1".nope.t;
+                      ^
+SELECT * FROM "other_db/b1".rn.t;
+ERROR:  cross-database references are not implemented: "other_db/b1.rn.t"
+LINE 1: SELECT * FROM "other_db/b1".rn.t;
+                      ^
+CREATE TABLE rn.later (k int PRIMARY KEY);
+SELECT * FROM "regress_revisions/tag1".rn.later;
+ERROR:  relation "rn.later" does not exist in revision "tag1"
+DROP TABLE rn.later;
+-- only reads: writes, DDL and locks are refused
+UPDATE "regress_revisions/b1".rn.t SET v = 0;
+ERROR:  tables of revision "regress_revisions/b1" can only be read: "regress_revisions/b1.rn.t"
+LINE 1: UPDATE "regress_revisions/b1".rn.t SET v = 0;
+               ^
+DETAIL:  Another branch's, a tag's or a commit's table can be named in a query's FROM clause.
+HINT:  Check out the branch to change its tables.
+INSERT INTO "regress_revisions/b1".rn.t VALUES (99, 0);
+ERROR:  tables of revision "regress_revisions/b1" can only be read: "regress_revisions/b1.rn.t"
+LINE 1: INSERT INTO "regress_revisions/b1".rn.t VALUES (99, 0);
+                    ^
+DETAIL:  Another branch's, a tag's or a commit's table can be named in a query's FROM clause.
+HINT:  Check out the branch to change its tables.
+ALTER TABLE "regress_revisions/b1".rn.t ADD COLUMN z int;
+ERROR:  tables of revision "regress_revisions/b1" can only be read: "regress_revisions/b1.rn.t"
+DETAIL:  Another branch's, a tag's or a commit's table can be named in a query's FROM clause.
+HINT:  Check out the branch to change its tables.
+BEGIN;
+LOCK TABLE "regress_revisions/b1".rn.t;
+ERROR:  tables of revision "regress_revisions/b1" can only be read: "regress_revisions/b1.rn.t"
+DETAIL:  Another branch's, a tag's or a commit's table can be named in a query's FROM clause.
+HINT:  Check out the branch to change its tables.
+ROLLBACK;
+-- the branch's own definitions: a table only it has, a column it added
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+CREATE TABLE rn.only_b1 (k text PRIMARY KEY, n int);
+INSERT INTO rn.only_b1 VALUES ('a', 1), ('b', 2);
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT * FROM "regress_revisions/b1".rn.only_b1 ORDER BY k;
+ k | n 
+---+---
+ a | 1
+ b | 2
+(2 rows)
+
+CREATE VIEW rn_b1 AS SELECT id, v FROM "regress_revisions/b1".rn.t;
+PREPARE b1_v(int) AS SELECT v FROM "regress_revisions/b1".rn.t WHERE id = $1;
+EXECUTE b1_v(1);
+ v 
+---
+ 2
+(1 row)
+
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+ALTER TABLE rn.t ADD COLUMN w int DEFAULT 7;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- (the session's own definition of the table is as it was)
+SELECT * FROM rn.t WHERE id = 1;
+ id | v 
+----+---
+  1 | 1
+(1 row)
+
+SELECT * FROM "regress_revisions/b1".rn.t WHERE id = 1;
+ id | v | w 
+----+---+---
+  1 | 2 | 7
+(1 row)
+
+-- a view and a plan made before read the revision as it is now
+SELECT sum(v) FROM rn_b1;
+ sum 
+-----
+  11
+(1 row)
+
+EXECUTE b1_v(1);
+ v 
+---
+ 2
+(1 row)
+
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+ALTER TABLE rn.t DROP COLUMN v;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+EXECUTE b1_v(1);
+ERROR:  column "v" does not exist
+SELECT sum(v) FROM rn_b1;
+ERROR:  table "rn.t" of revision "b1" changed since the query was planned
+DETAIL:  It has no column "v" now.
+DEALLOCATE b1_v;
+DROP VIEW rn_b1;
+-- privileges: the branch's grants on its copy, as a session there has them
+CREATE ROLE regress_revisions_reader;
+GRANT USAGE ON SCHEMA rn TO regress_revisions_reader;
+GRANT SELECT ON rn.t TO regress_revisions_reader;
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM rn.t;
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ERROR:  permission denied for table t of revision "b1"
+DETAIL:  Reading another branch's table takes the branch's grants on it.
+RESET ROLE;
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+GRANT USAGE ON SCHEMA rn TO regress_revisions_reader;
+GRANT SELECT (id) ON rn.t TO regress_revisions_reader;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_revisions_reader;
+SELECT count(id) FROM "regress_revisions/b1".rn.t;
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(w) FROM "regress_revisions/b1".rn.t;
+ERROR:  permission denied for table t of revision "b1"
+DETAIL:  Reading another branch's table takes the branch's grants on it.
+RESET ROLE;
+-- row security on the copy that applies to the reader: refused
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+GRANT SELECT ON rn.t TO regress_revisions_reader;
+ALTER TABLE rn.t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY few ON rn.t USING (id < 3);
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ERROR:  table t of revision "b1" has row security that applies to the reader
+DETAIL:  Another branch's table is read only where its row security doesn't apply.
+RESET ROLE;
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ count 
+-------
+    10
+(1 row)
+
+-- a commit's table: dolt_at()'s privileges, the table here
+REVOKE SELECT ON rn.t FROM regress_revisions_reader;
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/tag1".rn.t;
+ERROR:  permission denied for table t
+RESET ROLE;
+-- what was read of b1's catalogs isn't kept as the session's: in a new
+-- session, reading b1's copy leaves main's grants on it as they are
+\c regress_revisions
+SELECT count(*) FROM "regress_revisions/b1".rn.t;
+ count 
+-------
+    10
+(1 row)
+
+SELECT has_table_privilege('regress_revisions_reader', 'rn.t', 'SELECT') AS main_grants;
+ main_grants 
+-------------
+ f
+(1 row)
+
+SELECT attname FROM pg_attribute WHERE attrelid = 'rn.t'::regclass AND attnum > 0 ORDER BY attnum;
+ attname 
+---------
+ id
+ v
+(2 rows)
+
+-- names that differ only by case: an exact one is taken, else ambiguous
+SELECT dolt_tag('Mixed', 'HEAD') IS NOT NULL, dolt_tag('MIXED', 'HEAD~1') IS NOT NULL;
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/Mixed".rn.t;
+ sum 
+-----
+  12
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/MIXED".rn.t;
+ sum 
+-----
+  10
+(1 row)
+
+SELECT sum(v) FROM "regress_revisions/mixed".rn.t;
+ERROR:  revision name "mixed" is ambiguous
+DETAIL:  More than one branch or tag has the name, but for its case.
+\c contrib_regression
+DROP DATABASE regress_revisions;
+DROP ROLE regress_revisions_reader;

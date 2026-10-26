@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_revision.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
 #include "access/prolly_canon.h"
@@ -8198,6 +8199,48 @@ dolt_at(PG_FUNCTION_ARGS)
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
 	return (Datum) 0;
+}
+
+/*
+ * relid's table's rows as ref has them, read as dolt_at(ref, NULL::t) reads
+ * them (refused as it refuses them, decoded as the table is defined here),
+ * put to store as rows of the table's descriptor.
+ */
+void
+prolly_read_at(const char *ref, Oid relid, Tuplestorestate *store)
+{
+	Relation	rel;
+	AtSink		s;
+	ReturnSetInfo rsinfo;
+	List	   *lineages = NIL;
+
+	rel = open_row_type_table(relid, "a revision's table", ACL_SELECT);
+	{
+		List	   *rows = NIL;
+		SummaryRow *r;
+		char	   *name = qualified_name(relid);
+
+		PROLLY_CALL(diff_merge(), summary, NULL, ref, false, collect_change,
+					&rows);
+		r = named_table(rows, name);
+		if (r == NULL || r->to_item == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("relation \"%s\" does not exist in revision \"%s\"",
+							name, ref)));
+	}
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	rsinfo.type = T_ReturnSetInfo;
+	rsinfo.setResult = store;
+	rsinfo.setDesc = RelationGetDescr(rel);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = &rsinfo;
+	check_typed_at(relid, ref, &lineages, "a revision's table");
+	rows_begin(&s.rows, rel);
+	PROLLY_CALL(diff_merge(), diff, NULL, ref, relid, &s.sink);
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
 }
 
 /*
