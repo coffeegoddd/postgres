@@ -1110,6 +1110,121 @@ tree_diff_reads_changed_paths(const ProllyImplInfo *impl)
 	env.counters = NULL;
 }
 
+/* check_change(), and stop once stop_after changes are seen. */
+typedef struct StopSeen
+{
+	DiffSeen	seen;
+	int			stop_after;
+} StopSeen;
+
+static bool
+stop_change(ProllyDiffKind kind, const ProllyKey *key,
+			const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	StopSeen   *s = arg;
+
+	check_change(kind, key, before, after, &s->seen);
+	if (s->seen.changes > s->stop_after)
+		elog(ERROR, "diff reported change %d after its visitor stopped it at %d",
+			 s->seen.changes, s->stop_after);
+	return s->seen.changes < s->stop_after;
+}
+
+/*
+ * A diff stops where its visitor returns false: no change reported after
+ * it, and only the nodes up to it read.  Against the empty tree, where
+ * every key is a change, a diff stopped after a few reads a path to them,
+ * not the tree, both ways; one of modified keys spread over the tree
+ * stops in the same way; and diff_unordered(), where there is one, stops
+ * reporting.
+ */
+void
+tree_diff_stops(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *from = palloc(sizeof(Ref));
+	Ref		   *to = palloc(sizeof(Ref));
+	Ref		   *none = palloc(sizeof(Ref));
+	ProllyNodeRef rfrom;
+	ProllyNodeRef rto;
+	ProllyNodeRef rempty;
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+	int			keys[16];
+	int			versions[16];
+
+	make_env(&env);
+	fill_ref(from, 1, 1);
+	build_ref(tr, &env, from, &rfrom);
+	PROLLY_CALL(tr, walk, &env, &rfrom, collect_node, &nodes);
+	if (nodes.levels < 3 || nodes.n < 200)
+		elog(ERROR, "test tree has only %d nodes in %d levels", nodes.n, nodes.levels);
+	fill_ref(none, 1, ABSENT);
+	build_ref(tr, &env, none, &rempty);
+
+	for (int way = 0; way < 2; way++)
+		for (int stop = 1; stop <= 64; stop *= 4)
+		{
+			StopSeen	ss = {{way == 0 ? none : from, way == 0 ? from : none, -1, 0},
+			stop};
+			uint64		bound = 1 + 2 * nodes.levels + stop;
+
+			memset(&cnt, 0, sizeof(cnt));
+			env.counters = &cnt;
+			PROLLY_CALL(tr, diff, &env, way == 0 ? &rempty : &rfrom,
+						way == 0 ? &rfrom : &rempty, stop_change, &ss);
+			env.counters = NULL;
+			if (ss.seen.changes != stop)
+				elog(ERROR, "diff stopped at change %d reported %d", stop,
+					 ss.seen.changes);
+			if (cnt.nodes_read > bound)
+				elog(ERROR, "diff stopped at change %d of a tree of %d nodes read %llu nodes, more than %llu",
+					 stop, nodes.n, (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) bound);
+		}
+
+	/* modified keys spread over the tree: stopped at the second */
+	memcpy(to, from, sizeof(Ref));
+	rto = rfrom;
+	for (int i = 0; i < lengthof(keys); i++)
+	{
+		keys[i] = i * (MAX_KEY / lengthof(keys)) + 17;
+		versions[i] = 5;
+	}
+	apply_batch(tr, &env, to, keys, versions, lengthof(keys), &rto);
+	{
+		StopSeen	whole = {{from, to, -1, 0}, INT_MAX};
+		StopSeen	ss = {{from, to, -1, 0}, 2};
+		uint64		whole_read;
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &whole);
+		whole_read = cnt.nodes_read;
+		memset(&cnt, 0, sizeof(cnt));
+		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &ss);
+		env.counters = NULL;
+		if (whole.seen.changes != lengthof(keys) || ss.seen.changes != 2)
+			elog(ERROR, "diff of %d modified keys reported %d, and %d stopped at 2",
+				 (int) lengthof(keys), whole.seen.changes, ss.seen.changes);
+		if (cnt.nodes_read * 2 > whole_read)
+			elog(ERROR, "diff stopped at 2 of %d changes read %llu nodes, the whole diff %llu",
+				 (int) lengthof(keys), (unsigned long long) cnt.nodes_read,
+				 (unsigned long long) whole_read);
+	}
+
+	if (PROLLY_HAS(tr, diff_unordered))
+	{
+		StopSeen	ss = {{from, to, -1, 0}, 3};
+
+		PROLLY_CALL(tr, diff_unordered, &env, &rfrom, &rto, stop_change, &ss);
+		if (ss.seen.changes != 3)
+			elog(ERROR, "unordered diff stopped at change 3 reported %d",
+				 ss.seen.changes);
+	}
+}
+
 /*
  * Diff of trees that share nothing, and of trees whose heights differ: a
  * small tree against a large one, both ways, against a reference merge.
