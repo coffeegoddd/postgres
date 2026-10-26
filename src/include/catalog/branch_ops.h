@@ -30,6 +30,9 @@
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
 
+/* The same, until it returns false. */
+typedef bool (*BranchVisitWhile) (const char *name, Oid branch, void *arg);
+
 /*
  * A relation's pages as keep() kept them, for restore() to give back: the
  * storage that keeps them (its tablespace, 0 for the database's, and file
@@ -155,6 +158,11 @@ typedef struct BranchOpsRoutine
 	 */
 	void		(*branches_named) (const char *prefix, BranchVisit visit,
 								   void *arg);
+	/*
+	 * Optional: visit the branches in name order, until visit returns
+	 * false: the work is in those visited, however many others there are.
+	 */
+	void		(*branches_while) (BranchVisitWhile visit, void *arg);
 
 	/*
 	 * Run fn with the session on branch name, back on its own branch after,

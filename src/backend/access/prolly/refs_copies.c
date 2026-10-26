@@ -8,7 +8,8 @@
  * The branches are branch_ops' own; these refs give them head commits.
  * The chunk store's root is a tree keyed by memcmp:
  *
- *	'B' name	-> the branch's head commit (hash length, hash)
+ *	'B' name	-> the branch's head commit, then its root, if it was
+ *				   known when the head was set (hash length, hash each)
  *	'W' name	-> the branch's baseline: what its last fold for a commit
  *				   or a working-set checkpoint left, for the next fold to
  *				   start from (the canonicalizer's tree; hash length, hash),
@@ -66,11 +67,25 @@
  *				   same), its id and the branch's
  *				   baseline then (hash length, hash each), the count of
  *				   tables (a varint), and for each its qualified name (a
- *				   varint length, then the bytes), the count of its
+ *				   varint length, then the bytes), its data tree at the
+ *				   commit (hash length, hash), the count of its
  *				   relations (a varint) and each relation's OID,
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
+ *	'k' commit name -> nothing: branch name keeps pages as of the commit
+ *				   (hash length, hash), an entry of its 'K' not retired
+ *	's' data commit name -> nothing: and that commit's kept table has the
+ *				   data tree data (hash length, hash, each)
+ *	'r' root kind name -> nothing: the branch's head's root (kind 'h', as
+ *				   'B' has it) or its baseline's fold's (kind 'w', as 'W'
+ *				   has it) is root
+ *				   (hash length, hash), for a first use's nearest branch
+ *	'f' folded NUL name -> nothing: the branch's name case folded
+ *				   (ASCII) is folded (with a head or not), for a new name
+ *				   that differs from it only by case to be refused
+ * Each index is changed with the entries it indexes, in the same
+ * transaction, so it commits or rolls back with them.
  *	'F'			-> the records' tree's root (hash length, hash): a tree,
  *				   apart from the refs, of the relations each commit was
  *				   made from, under the commit's id (its hash's bytes), as
@@ -287,6 +302,15 @@
 #define TAG_OWNED		'J'	/* routines and types such records list */
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
+/*
+ * Indexes of other entries, each kept with them, so that a lookup by what
+ * they hold is a seek of the refs, not a read of every branch's entries;
+ * each key ends with the branch's name.
+ */
+#define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
+#define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
+#define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
+#define TAG_FOLDED		'f'	/* a branch's name, case folded */
 
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
@@ -301,9 +325,12 @@
  * every record's relation names quoted as with quote_all_identifiers off;
  * 17: a merge's table identity conflicts under their own tag, each
  * record's relations' owners, partitioned tables in commits' records, and
- * no classes (a move keeps a table's relation, by OID).
+ * no classes (a move keeps a table's relation, by OID); 19: each kept
+ * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
+ * of branches by their heads' and baselines' roots, and of branches' names
+ * case folded.
  */
-#define REFS_FORMAT		"18"
+#define REFS_FORMAT		"19"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -436,6 +463,7 @@ static void put_records_again(const ProllyNodeRef *mine, ScopedEdits *se);
 static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
+static void forget_read_caches(void);
 static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
@@ -593,11 +621,11 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 		return;
 	switch (key->data[0])
 	{
-		case TAG_BRANCH:
 		case TAG_TRACKING:
 		case TAG_RECORDS:
 			(void) declare_hashes(p, end, 1, refs);
 			break;
+		case TAG_BRANCH:			/* (the head, and its root if recorded) */
 		case TAG_BASELINE:
 		case TAG_TAG:
 			(void) declare_hashes(p, end, 2, refs);
@@ -887,6 +915,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			scoped_records = NIL;
 			scoped_pending = NIL;
 			pending_cxt = NULL; /* (TopTransactionContext's: gone) */
+			forget_read_caches();
 			break;
 		default:
 			break;
@@ -925,6 +954,87 @@ static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+/*
+ * The branch kept_get() read last, and the index entries of its kept
+ * commits then (in kept_read_cxt): kept_put() of it after takes them,
+ * the caller having changed the list read in place.  Forgotten by every
+ * kept_put(), so a write in between makes it read the entry again.
+ */
+static MemoryContext kept_read_cxt = NULL;
+static char *kept_read_name = NULL;
+static List *kept_read_keys = NIL;
+
+/*
+ * The branch branch_set_baseline() wrote, or a read of its 'W' found, last,
+ * while the transaction held the branch (so no other session changed it
+ * since), and the root of its baseline's fold then (have_root false: none):
+ * the next baseline set of it changes the root's index from there, without
+ * reading 'W' again.  In TopMemoryContext.
+ */
+static char *baseline_seen_name = NULL;
+static bool baseline_seen_have;
+static ProllyNodeRef baseline_seen_root;
+
+/*
+ * Forget what was read of the refs, as a transaction ends or a
+ * subtransaction rolls back: another session may change them before this
+ * one reads them next, or the rollback undid what was written.
+ */
+static bool branch_held(const char *name, int len);
+
+static void
+baseline_seen_set(const char *name, bool have_root, const ProllyHash *root)
+{
+	if (baseline_seen_name == NULL || strcmp(baseline_seen_name, name) != 0)
+	{
+		if (baseline_seen_name != NULL)
+			pfree(baseline_seen_name);
+		baseline_seen_name = MemoryContextStrdup(TopMemoryContext, name);
+	}
+	baseline_seen_have = have_root;
+	if (have_root)
+		ref_of(root, &baseline_seen_root);
+}
+
+/*
+ * A 'W' value's fold root, noted as seen (the entry found or not): only
+ * while the transaction holds the branch, so that no other session
+ * changes it before the next baseline set reads it from here (a read
+ * without the lock, in one READ COMMITTED statement, may be older than
+ * the next statement's).
+ */
+static void
+baseline_seen_value(const char *name, const StringInfoData *v, bool found)
+{
+	ProllyHash	h;
+	const char *p;
+
+	if (!branch_held(name, strlen(name)))
+		return;
+	if (!found)
+	{
+		baseline_seen_set(name, false, NULL);
+		return;
+	}
+	p = get_hash(v->data, v->data + v->len, &h);
+	if (p < v->data + v->len)
+	{
+		get_hash(p, v->data + v->len, &h);
+		baseline_seen_set(name, h.len > 0, &h);
+	}
+	else
+		baseline_seen_set(name, false, NULL);
+}
+
+static void
+forget_read_caches(void)
+{
+	kept_read_name = NULL;
+	if (baseline_seen_name != NULL)
+		pfree(baseline_seen_name);
+	baseline_seen_name = NULL;
 }
 
 /* ------------------------------------------------------------------------
@@ -1009,6 +1119,9 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	int			level = GetCurrentTransactionNestLevel();
 	ScopedSave *last;
 
+	/* (what a rolled-back subtransaction read or wrote is no longer so) */
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		forget_read_caches();
 	if (scoped_saved == NIL)
 		return;
 	last = llast(scoped_saved);
@@ -1612,13 +1725,62 @@ try_hold_refs(const char *name)
 	return true;
 }
 
-/* Is key one of a branch's own entries?  Its name then follows the tag. */
-static bool
-branch_entry(const char *key, int keylen)
+/*
+ * The name of the branch key is one of the entries of (*len bytes), or
+ * NULL if it is none of a branch's: after the tag, or for an index, after
+ * what it is keyed by.
+ */
+static bool branch_entry_tag(char tag);
+
+static const char *
+entry_branch(const char *key, int keylen, int *len)
 {
+	const char *p = key + 1;
+	const char *end = key + keylen;
+	int			skip = 0;
+
 	if (keylen < 2)
-		return false;
+		return NULL;
 	switch (key[0])
+	{
+		case TAG_KEPT_OF:
+		case TAG_ROOT_OF:
+			skip = 1;
+			break;
+		case TAG_KEPT_TABLE:
+			skip = 2;
+			break;
+		case TAG_FOLDED:
+			p = memchr(p, '\0', end - p);
+			if (p == NULL)
+				return NULL;
+			p++;
+			break;
+		default:
+			if (!branch_entry_tag(key[0]))
+				return NULL;
+			break;
+	}
+	for (int i = 0; i < skip; i++)
+	{
+		if (p >= end || end - p < 1 + (uint8) p[0])
+			return NULL;
+		p += 1 + (uint8) p[0];
+	}
+	/* (a root's index has the kind, head or baseline, before the name) */
+	if (key[0] == TAG_ROOT_OF)
+		p++;
+	if (p >= end)
+		return NULL;
+	*len = end - p;
+	return p;
+}
+
+/* Is tag that of an entry keyed by a branch's name alone, after the tag? */
+static bool
+branch_entry_tag(char tag)
+{
+	switch (tag)
 	{
 		case TAG_BRANCH:
 		case TAG_MOVER:
@@ -1649,12 +1811,16 @@ branch_entry(const char *key, int keylen)
 static bool
 scoped_key(const char *key, int keylen)
 {
+	const char *name;
+	int			len;
+
 	if (published || whole)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
 		(keylen > 1 && key[0] == TAG_OWNED))
 		return true;
-	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
+	name = entry_branch(key, keylen, &len);
+	return name != NULL && branch_held(name, len);
 }
 
 static bool
@@ -1738,12 +1904,17 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 	lock_refs();
 
 	/* (a branch's entries are changed only by a holder of its lock) */
-	if (branch_entry(key, keylen) && !branch_held(key + 1, keylen - 1))
 	{
-		char	   *name = pnstrdup(key + 1, keylen - 1);
+		int			len;
+		const char *name = entry_branch(key, keylen, &len);
 
-		lock_branch(name);
-		pfree(name);
+		if (name != NULL && !branch_held(name, len))
+		{
+			char	   *n = pnstrdup(name, len);
+
+			lock_branch(n);
+			pfree(n);
+		}
 	}
 	if (!refs_root(&root))
 		elog(ERROR, "prolly refs have no root");
@@ -1892,6 +2063,189 @@ maker_get(char tag, const char *name, Oid *role)
 	return true;
 }
 
+static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+static bool branch_baseline_root(const char *name, ProllyNodeRef *root);
+
+/*
+ * The commit this backend wrote last, and its root: a head moved to it
+ * (a commit's) is indexed by its root without reading it back.  An id
+ * names its content, so what it holds never changes.
+ */
+static ProllyHash last_written_commit;
+static ProllyHash last_written_root;
+static ProllyHash prior_written_commit;	/* and the one before it */
+static ProllyHash prior_written_root;
+
+/* The root of commit, if it is one this backend wrote last or before. */
+static bool
+written_root(const ProllyHash *commit, ProllyHash *root)
+{
+	if (commit->len > 0 && same_hash(commit, &last_written_commit))
+		*root = last_written_root;
+	else if (commit->len > 0 && same_hash(commit, &prior_written_commit))
+		*root = prior_written_root;
+	else
+		return false;
+	return true;
+}
+
+/* The root of commit head (false: no such commit). */
+static bool
+head_commit_root(const ProllyHash *head, ProllyHash *root)
+{
+	ProllyCommitInfo info;
+
+	if (written_root(head, root))
+		return true;
+	if (!copies_commit_get(head, &info))
+		return false;
+	*root = info.root.hash;
+	return true;
+}
+
+/* An empty value, for an index's entries. */
+static const StringInfoData index_value = {"", 0, 1, 0};
+
+/* A root's index key: the root, the kind ('h' head, 'w' baseline), name. */
+static void
+root_of_key(StringInfo key, const ProllyHash *root, char kind, const char *name)
+{
+	appendStringInfoChar(key, TAG_ROOT_OF);
+	put_hash(key, root);
+	appendStringInfoChar(key, kind);
+	appendStringInfoString(key, name);
+}
+
+/* The case-folded name index's key of branch name. */
+static void
+folded_key(StringInfo key, const char *name)
+{
+	appendStringInfoChar(key, TAG_FOLDED);
+	for (const char *c = name; *c; c++)
+		appendStringInfoChar(key, pg_ascii_tolower((unsigned char) *c));
+	appendStringInfoChar(key, '\0');
+	appendStringInfoString(key, name);
+}
+
+/* Put (value NULL: delete) index entry key, as one of its branch's. */
+static void
+index_put(const StringInfoData *key, bool present)
+{
+	refs_put(key->data, key->len, present ? &index_value : NULL);
+}
+
+/* The root of the head a 'B' value names, if it records one. */
+static bool
+head_value_root(const StringInfoData *v, ProllyHash *root)
+{
+	ProllyHash	head;
+	const char *p = get_hash(v->data, v->data + v->len, &head);
+
+	if (p >= v->data + v->len)
+		return false;
+	(void) get_hash(p, v->data + v->len, root);
+	return root->len > 0;
+}
+
+/* The root branch name's head is at, as its 'B' entry records it. */
+static bool
+head_root_get(const char *name, ProllyHash *root)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	branch_key(name, &key);
+	found = refs_get(key.data, key.len, &v) && head_value_root(&v, root);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * Fold branch name's name into the case-folded index (present) or take it
+ * out: as the branch is made (with a head or not), renamed and deleted.
+ */
+static void
+folded_index_set(const char *name, bool present)
+{
+	StringInfoData key;
+
+	initStringInfo(&key);
+	folded_key(&key, name);
+	index_put(&key, present);
+	pfree(key.data);
+}
+
+/* The same, put only if it isn't there. */
+static void
+folded_index_note(const char *name)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	folded_key(&key, name);
+	if (!refs_get(key.data, key.len, &v))
+		index_put(&key, true);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
+ * Index branch name's head by its root: was the root its head had (NULL:
+ * none recorded), root the one it has now (NULL: none), the entries
+ * changed only if they change.
+ */
+static void
+head_index_set(const char *name, const ProllyHash *was, const ProllyHash *root)
+{
+	StringInfoData key;
+
+	if (was != NULL && root != NULL && same_hash(was, root))
+		return;
+	initStringInfo(&key);
+	if (was != NULL)
+	{
+		root_of_key(&key, was, 'h', name);
+		index_put(&key, false);
+	}
+	if (root != NULL)
+	{
+		resetStringInfo(&key);
+		root_of_key(&key, root, 'h', name);
+		index_put(&key, true);
+	}
+	pfree(key.data);
+}
+
+/* Index branch name's baseline's fold's root (NULL: none), was was. */
+static void
+baseline_index_set(const char *name, const ProllyNodeRef *was,
+				   const ProllyNodeRef *root)
+{
+	StringInfoData key;
+
+	if (was != NULL && root != NULL && same_hash(&was->hash, &root->hash))
+		return;
+	initStringInfo(&key);
+	if (was != NULL)
+	{
+		root_of_key(&key, &was->hash, 'w', name);
+		index_put(&key, false);
+	}
+	if (root != NULL)
+	{
+		resetStringInfo(&key);
+		root_of_key(&key, &root->hash, 'w', name);
+		index_put(&key, true);
+	}
+	pfree(key.data);
+}
+
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
  * that moved it (head_moved_unseen()).  A branch that gets its first head
@@ -1906,17 +2260,36 @@ branch_set_head(const char *name, const ProllyHash *head)
 	FullTransactionId xid = head ? GetTopFullTransactionId() :
 		InvalidFullTransactionId;
 	Oid			role;
+	ProllyHash	was;
+	ProllyHash	root;
+	bool		found;
+	bool		had_root;
+	bool		have_root;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
 	branch_key(name, &key);
-	if (head && strcmp(name, "main") != 0 && !refs_get(key.data, key.len, &v) &&
+	/* (the entry it had: its head's root, for the index of roots) */
+	found = refs_get(key.data, key.len, &v);
+	had_root = found && head_value_root(&v, &was);
+	if (head && strcmp(name, "main") != 0 && !found &&
 		!maker_get(TAG_CREATOR, name, &role))
 		maker_put(TAG_CREATOR, name, GetUserId());
+	have_root = head != NULL && head_commit_root(head, &root);
 	resetStringInfo(&v);
 	if (head)
 		put_hash(&v, head);
+	if (have_root)
+		put_hash(&v, &root);
 	refs_put(key.data, key.len, head ? &v : NULL);
+	head_index_set(name, had_root ? &was : NULL, have_root ? &root : NULL);
+
+	/*
+	 * (a branch first given a head here, by a fetch, a clone or a push,
+	 * may have been made by none of the paths that fold its name)
+	 */
+	if (head != NULL && !found)
+		folded_index_note(name);
 
 	resetStringInfo(&key);
 	resetStringInfo(&v);
@@ -2051,8 +2424,9 @@ branch_baseline(const char *name, ProllyNodeRef *baseline)
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
 	appendStringInfoString(&key, name);
-	found = refs_get(key.data, key.len, &v) &&
-		get_hash(v.data, v.data + v.len, &h) && h.len > 0;
+	found = refs_get(key.data, key.len, &v);
+	baseline_seen_value(name, &v, found);
+	found = found && get_hash(v.data, v.data + v.len, &h) && h.len > 0;
 	if (found)
 		ref_of(&h, baseline);
 	pfree(key.data);
@@ -2083,6 +2457,7 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 	{
 		const char *p = get_hash(v.data, v.data + v.len, &h);
 
+		baseline_seen_value(name, &v, true);
 		if (p < v.data + v.len)
 		{
 			get_hash(p, v.data + v.len, &h);
@@ -2091,6 +2466,8 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 				ref_of(&h, root);
 		}
 	}
+	else
+		baseline_seen_value(name, &v, false);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -2108,6 +2485,8 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	StringInfoData key;
 	StringInfoData v;
 	FullTransactionId xid;
+	ProllyNodeRef was;
+	bool		had;
 
 	if (compared_branch(name))
 	{
@@ -2120,6 +2499,15 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 		return;
 	}
 	xid = baseline ? GetTopFullTransactionId() : InvalidFullTransactionId;
+	/* (the fold root it had, as last read or written in the transaction) */
+	if (baseline_seen_name != NULL && strcmp(baseline_seen_name, name) == 0)
+	{
+		had = baseline_seen_have;
+		was = baseline_seen_root;
+	}
+	else
+		had = branch_baseline_root(name, &was);
+	baseline_index_set(name, had ? &was : NULL, baseline != NULL ? root : NULL);
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -2129,6 +2517,10 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	if (baseline && root)
 		put_hash(&v, &root->hash);
 	refs_put(key.data, key.len, baseline ? &v : NULL);
+	/* (what it is now, noted once the branch is held: refs_put() holds it) */
+	if (branch_held(name, strlen(name)))
+		baseline_seen_set(name, baseline != NULL && root != NULL,
+						  baseline != NULL && root != NULL ? &root->hash : NULL);
 
 	resetStringInfo(&key);
 	resetStringInfo(&v);
@@ -2177,6 +2569,49 @@ branch_name_of(Oid branch)
 	name = pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
 	ReleaseSysCache(tup);
 	return name;
+}
+
+/* A branch with copies, by name and id. */
+typedef struct NamedBranch
+{
+	char	   *name;
+	Oid			branch;
+} NamedBranch;
+
+static int
+named_branch_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((const NamedBranch *) lfirst(a))->name,
+				  ((const NamedBranch *) lfirst(b))->name);
+}
+
+/*
+ * The branches with copies a fold of is known (the generation table's,
+ * of a fixed size), in name order, as a listing of every branch would
+ * visit them: the work is in those, however many branches there are.
+ */
+static List *
+known_fold_branches(void)
+{
+	Oid		   *oids = palloc_array(Oid, BRANCH_FOLD_KNOWN_MAX);
+	int			n = branch_fold_known_branches(oids, BRANCH_FOLD_KNOWN_MAX);
+	List	   *out = NIL;
+
+	for (int i = 0; i < n; i++)
+	{
+		char	   *name = branch_name_of(oids[i]);
+		NamedBranch *nb;
+
+		if (name == NULL)
+			continue;
+		nb = palloc(sizeof(NamedBranch));
+		nb->name = name;
+		nb->branch = oids[i];
+		out = lappend(out, nb);
+	}
+	pfree(oids);
+	list_sort(out, named_branch_cmp);
+	return out;
 }
 
 /*
@@ -2680,6 +3115,25 @@ find_kept_source(const ProllyKeptState *state, void *arg)
 	ss->sources = lappend(ss->sources, s);
 }
 
+/*
+ * The kept states that could give one of tables (NamedTree *, a target's)
+ * its pages: those holding its data tree (the materialization cache's
+ * filter of them).
+ */
+static void
+kept_filter_of_tables(List *tables, ProllyKeptFilter *filter)
+{
+	ProllyHash *hashes = palloc_array(ProllyHash, Max(list_length(tables), 1));
+	int			n = 0;
+
+	foreach_ptr(NamedTree, t, tables)
+		if (t->readable)
+			hashes[n++] = t->data.hash;
+	filter->commit = NULL;
+	filter->tables = hashes;
+	filter->ntables = n;
+}
+
 /* A kept commit's table called name, or NULL. */
 static const ProllyKeptTable *
 kept_table(const ProllyKeptCommit *kc, const char *name)
@@ -2802,6 +3256,8 @@ source_of(List *sources, const NamedTree *t)
 struct KeptCommit;
 static List *kept_get(const char *name);
 static void kept_put(const char *name, List *kept);
+static List *kept_index_keys(const char *name, List *kept);
+
 static int	kept_carried(List *kept, const struct KeptCommit *was,
 						 const char *name, BranchKeptRelation **carry,
 						 BranchKeptRelation ***into);
@@ -2836,16 +3292,22 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		!fold_caches_usable() || !branch_baseline(current, &baseline))
 		return false;
 	ss.snap = fold_snapshot();
-	branch_ops()->branches(find_known_source, &ss);
+	foreach_ptr(NamedBranch, nb, known_fold_branches())
+		find_known_source(nb->name, nb->branch, &ss);
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (dc.matcache && PROLLY_HAS(dc.matcache, visit))
-		PROLLY_CALL(dc.matcache, visit, ss.snap, find_kept_source, &ss);
+	{
+		ProllyKeptFilter filter;
+
+		kept_filter_of_tables(theirs, &filter);
+		PROLLY_CALL(dc.matcache, visit, ss.snap, &filter, find_kept_source, &ss);
+	}
 	if (ss.sources == NIL ||
 		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
 		return false;
 
 	/* the tables whose rows differ, where a source has them and sharing costs less */
 	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
-	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
 		return false;
 	forboth(a, ours, b, theirs)
@@ -3148,6 +3610,7 @@ int			prolly_restore_min_changes = 2;
 typedef struct KeptTable
 {
 	char	   *name;			/* qualified, as tables() names it */
+	ProllyHash	data;			/* its data tree at the commit */
 	int			nrels;
 	BranchKeptRelation *rels;	/* the table's first */
 } KeptTable;
@@ -3189,6 +3652,7 @@ kept_encode(StringInfo v, List *kept)
 
 			prolly_put_varint(v, strlen(kt->name));
 			appendStringInfoString(v, kt->name);
+			put_hash(v, &kt->data);
 			prolly_put_varint(v, kt->nrels);
 			for (int r = 0; r < kt->nrels; r++)
 			{
@@ -3244,6 +3708,7 @@ kept_decode(const char *p, const char *end)
 			kt->name = get_short_text(&p, end);
 			if (kt->name == NULL)
 				kept_corrupt();
+			p = get_hash(p, end, &kt->data);
 			n = prolly_get_varint(&p, end);
 			if (n == 0 || n > (uint64) (end - p) / KEPT_RELATION_SIZE)
 				kept_corrupt();
@@ -3276,7 +3741,58 @@ kept_declare(const char *p, const char *end, StringInfo refs)
 		PROLLY_CALL(tree, value_reference, &kc->commit, 0, refs);
 		if (kc->baseline.len > 0)
 			PROLLY_CALL(tree, value_reference, &kc->baseline, 0, refs);
+		/* (each table's data tree, which the commit's root holds too) */
+		for (int t = 0; t < kc->ntables; t++)
+			if (kc->tables[t].data.len > 0)
+				PROLLY_CALL(tree, value_reference, &kc->tables[t].data, 0, refs);
 	}
+}
+
+/*
+ * The index entries of branch name's kept commits kept, but those retired
+ * (which no reader takes, and which pile up until their retiring
+ * transaction is known to have committed): each commit's ('k'), and each
+ * of its tables' data trees' ('s').  So they are a few for each branch,
+ * however many commits the transaction makes.
+ */
+static List *
+kept_index_keys(const char *name, List *kept)
+{
+	List	   *keys = NIL;
+
+	foreach_ptr(KeptCommit, kc, kept)
+	{
+		StringInfo	k;
+
+		if (FullTransactionIdIsValid(kc->retired))
+			continue;
+		k = makeStringInfo();
+		appendStringInfoChar(k, TAG_KEPT_OF);
+		put_hash(k, &kc->commit);
+		appendStringInfoString(k, name);
+		keys = lappend(keys, k);
+		for (int t = 0; t < kc->ntables; t++)
+		{
+			if (kc->tables[t].data.len == 0)
+				continue;
+			k = makeStringInfo();
+			appendStringInfoChar(k, TAG_KEPT_TABLE);
+			put_hash(k, &kc->tables[t].data);
+			put_hash(k, &kc->commit);
+			appendStringInfoString(k, name);
+			keys = lappend(keys, k);
+		}
+	}
+	return keys;
+}
+
+static bool
+key_listed(List *keys, const StringInfoData *key)
+{
+	foreach_ptr(StringInfoData, k, keys)
+		if (k->len == key->len && memcmp(k->data, key->data, k->len) == 0)
+			return true;
+	return false;
 }
 
 /* The commits branch name's pages are kept as of, newest first. */
@@ -3286,6 +3802,7 @@ kept_get(const char *name)
 	StringInfoData key;
 	StringInfoData v;
 	List	   *kept = NIL;
+	MemoryContext old;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -3294,6 +3811,17 @@ kept_get(const char *name)
 		kept = kept_decode(v.data, v.data + v.len);
 	pfree(key.data);
 	pfree(v.data);
+
+	/* (its index entries now, for the kept_put() that follows) */
+	if (kept_read_cxt == NULL)
+		kept_read_cxt = AllocSetContextCreate(TopMemoryContext,
+											  "prolly kept index entries read",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(kept_read_cxt);
+	old = MemoryContextSwitchTo(kept_read_cxt);
+	kept_read_name = pstrdup(name);
+	kept_read_keys = kept_index_keys(name, kept);
+	MemoryContextSwitchTo(old);
 	return kept;
 }
 
@@ -3302,6 +3830,25 @@ kept_put(const char *name, List *kept)
 {
 	StringInfoData key;
 	StringInfoData v;
+	List	   *was;
+	List	   *now = kept_index_keys(name, kept);
+
+	/*
+	 * (the entries as the last kept_get() found them, if it read this
+	 * branch's and no kept_put() came since: the caller changes the list it
+	 * read in place; else read again)
+	 */
+	if (kept_read_name == NULL || strcmp(kept_read_name, name) != 0)
+		(void) kept_get(name);
+	was = kept_read_keys;
+
+	/* (the indexes first: those no longer true gone, the new ones put) */
+	foreach_ptr(StringInfoData, k, was)
+		if (!key_listed(now, k))
+			index_put(k, false);
+	foreach_ptr(StringInfoData, k, now)
+		if (!key_listed(was, k))
+			index_put(k, true);
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -3310,6 +3857,7 @@ kept_put(const char *name, List *kept)
 	refs_put(key.data, key.len, kept != NIL ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
+	kept_read_name = NULL;
 }
 
 static KeptCommit *
@@ -3322,6 +3870,52 @@ kept_find(List *kept, const ProllyHash *commit)
 			return kc;
 	}
 	return NULL;
+}
+
+static void visit_prefix(const char *prefix, int prefixlen,
+						 void (*visit) (const ProllyKey *k, const ProllyValue *v,
+										void *arg),
+						 void *arg);
+
+typedef struct KeptHolder
+{
+	char	   *name;
+	ProllyHash	commit;
+} KeptHolder;
+
+/* An index entry of kept_holders()'s prefix: its commit (if keyed by data) and name. */
+static void
+note_kept_holder(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	List	  **out = arg;
+	const char *p = (const char *) k->data + 1;
+	const char *end = (const char *) k->data + k->len;
+	KeptHolder *h = palloc0(sizeof(KeptHolder));
+	ProllyHash	skipped;
+
+	if (k->data[0] == TAG_KEPT_TABLE)
+		p = get_hash(p, end, &skipped);
+	p = get_hash(p, end, &h->commit);
+	h->name = pnstrdup(p, end - p);
+	*out = lappend(*out, h);
+}
+
+static void
+copies_kept_holders(const ProllyHash *commit, const ProllyHash *data,
+					ProllyKeptHolderVisit visit, void *arg)
+{
+	StringInfoData prefix;
+	List	   *holders = NIL;
+
+	refs_init();
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, data != NULL ? TAG_KEPT_TABLE : TAG_KEPT_OF);
+	put_hash(&prefix, data != NULL ? data : commit);
+	/* (read whole first: a visit may read the refs of its own) */
+	visit_prefix(prefix.data, prefix.len, note_kept_holder, &holders);
+	pfree(prefix.data);
+	foreach_ptr(KeptHolder, h, holders)
+		visit(h->name, &h->commit, arg);
 }
 
 /* Visit the commits branch name's pages are kept as of, but those retired. */
@@ -3640,7 +4234,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 			(g = kept_relations(relid)) == NIL)
 			continue;
 		groups = lappend(groups, g);
-		names = lappend(names, t->name);
+		names = lappend(names, t);
 		relids = list_concat(relids, g);
 	}
 
@@ -3707,7 +4301,8 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	{
 		KeptTable  *kt = &kc->tables[foreach_current_index(a)];
 
-		kt->name = lfirst(b);
+		kt->name = ((NamedTree *) lfirst(b))->name;
+		kt->data = ((NamedTree *) lfirst(b))->data.hash;
 		kt->nrels = list_length(lfirst(a));
 		kt->rels = &out[at];
 		at += kt->nrels;
@@ -4473,6 +5068,60 @@ rank_source(const char *name, Oid branch, void *arg)
 	}
 }
 
+static void
+note_root_of(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	List	  **names = arg;
+	int			len;
+	const char *name = entry_branch((const char *) k->data, k->len, &len);
+
+	if (name != NULL)
+		*names = lappend(*names, pnstrdup(name, len));
+}
+
+/*
+ * The branches with copies that could be nearest root (rank_source()):
+ * those a fold of is known, and those whose head's or baseline's fold's
+ * root it is (the refs' index of roots), each once, in name order, as a
+ * listing of every branch would visit them.  Any other ranks 0.
+ */
+static List *
+root_candidates(const ProllyHash *root)
+{
+	List	   *out = known_fold_branches();
+	List	   *names = NIL;
+	StringInfoData prefix;
+
+	initStringInfo(&prefix);
+	for (int kind = 0; kind < 2; kind++)
+	{
+		resetStringInfo(&prefix);
+		appendStringInfoChar(&prefix, TAG_ROOT_OF);
+		put_hash(&prefix, root);
+		appendStringInfoChar(&prefix, kind == 0 ? 'w' : 'h');
+		visit_prefix(prefix.data, prefix.len, note_root_of, &names);
+	}
+	pfree(prefix.data);
+	foreach_ptr(char, name, names)
+	{
+		bool		listed = false;
+		NamedBranch *nb;
+		Oid			branch;
+
+		foreach_ptr(NamedBranch, x, out)
+			if (strcmp(x->name, name) == 0)
+				listed = true;
+		if (listed || !OidIsValid(branch = branch_oid(name)))
+			continue;
+		nb = palloc(sizeof(NamedBranch));
+		nb->name = name;
+		nb->branch = branch;
+		out = lappend(out, nb);
+	}
+	list_sort(out, named_branch_cmp);
+	return out;
+}
+
 /*
  * The kept commit a first use is made of (the materialization cache's,
  * whose kept commits the move's shares and the planner's costs take too):
@@ -4599,6 +5248,16 @@ note_candidate(const char *name, Oid branch, void *arg)
 	sc->roots = lappend(sc->roots, root);
 }
 
+/* note_candidate(), until enough are noted. */
+static bool
+note_candidate_while(const char *name, Oid branch, void *arg)
+{
+	SourceCandidates *sc = arg;
+
+	note_candidate(name, branch, arg);
+	return list_length(sc->names) <= SOURCE_CANDIDATES;
+}
+
 /* The tables of a plan whose copies begin empty, added to *emptied. */
 static void
 reloaded_tables(const ProllyMovePlan *plan, List **emptied)
@@ -4647,16 +5306,18 @@ kept_shareable(const ProllyNodeRef *target, Snapshot snap, List **seen)
 	ShareSources ss = {snap, NIL};
 	List	   *theirs = NIL;
 	List	   *names = NIL;
+	ProllyKeptFilter filter;
 
 	prolly_database_components(&dc);
 	if (dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return NIL;
-	PROLLY_CALL(dc.matcache, visit, snap, find_kept_source, &ss);
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	kept_filter_of_tables(theirs, &filter);
+	PROLLY_CALL(dc.matcache, visit, snap, &filter, find_kept_source, &ss);
 	foreach_ptr(ShareSource, s, ss.sources)
 		*seen = lappend_oid(*seen, s->branch);
 	if (ss.sources == NIL)
 		return NIL;
-	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	foreach_ptr(NamedTree, t, theirs)
 		if (source_of(ss.sources, t) != NULL)
 			names = lappend(names, makeString(t->name));
@@ -4699,13 +5360,16 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 	char	   *source = NULL;
 	List	   *shareable;
 
-	/* (the session's branch first, then the others) */
-	branch_ops()->branches(note_candidate, &sc);
+	/* (the session's branch first, then the others, in name order) */
+	note_candidate(branch_ops()->current(), MyBranch, &sc);
 	if (sc.names == NIL)
 		return NULL;
 	shareable = kept_shareable(target, snap, &sc.kept_seen);
 	sc.others = true;
-	branch_ops()->branches(note_candidate, &sc);
+	if (branch_ops()->branches_while != NULL)
+		branch_ops()->branches_while(note_candidate_while, &sc);
+	else
+		branch_ops()->branches(note_candidate, &sc);
 	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
 				INFINITY, &best);
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
@@ -4761,6 +5425,7 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	List	   *emptied = NIL;
 	ProllyDatabaseComponents dc;
 	KeptSource	ks = {&commit->id, NULL};
+	ProllyKeptFilter filter;
 	const ProllyKeptCommit *kc;
 	const char *source;
 	bool		other;
@@ -4778,7 +5443,11 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 		dc.canonicalizer->splice_baseline == NULL ||
 		dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return false;
-	PROLLY_CALL(dc.matcache, visit, GetActiveSnapshot(), find_kept_commit, &ks);
+	filter.commit = &commit->id;
+	filter.tables = NULL;
+	filter.ntables = 0;
+	PROLLY_CALL(dc.matcache, visit, GetActiveSnapshot(), &filter,
+				find_kept_commit, &ks);
 	if (ks.state == NULL)
 		return false;
 	kc = ks.state->kept;
@@ -4896,7 +5565,8 @@ materialize(const char *name)
 		mc.source = NULL;
 		if (!make_of_kept(name, &info))
 		{
-			branch_ops()->branches(rank_source, &ns);
+			foreach_ptr(NamedBranch, nb, root_candidates(ns.root))
+				rank_source(nb->name, nb->branch, &ns);
 			if (ns.rank == 0)
 				ns.name = estimated_source(&info.root, ns.snap, &emptied,
 										   &own_emptied);
@@ -5192,6 +5862,10 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	add_item(b, "time", &v);
 	PROLLY_CALL(tree, build_finish, b, &ref);
 	*id = ref.hash;
+	prior_written_commit = last_written_commit;
+	prior_written_root = last_written_root;
+	last_written_commit = *id;
+	last_written_root = *root;
 	pfree(v.data);
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
 }
@@ -7095,14 +7769,19 @@ typedef struct OtherCase
 } OtherCase;
 
 static void
-find_other_case(const char *name, const ProllyHash *head, void *arg)
+find_other_case(const ProllyKey *k, const ProllyValue *v, void *arg)
 {
 	OtherCase  *oc = arg;
+	const char *sep = memchr(k->data, '\0', k->len);
+	char	   *name;
 
+	if (sep == NULL)
+		return;
+	name = pnstrdup(sep + 1, (const char *) k->data + k->len - (sep + 1));
 	if (oc->found == NULL && strcmp(name, oc->name) != 0 &&
 		(oc->ignore == NULL || strcmp(name, oc->ignore) != 0) &&
 		pg_strcasecmp(name, oc->name) == 0)
-		oc->found = pstrdup(name);
+		oc->found = name;
 }
 
 static void copies_branches(ProllyBranchVisit visit, void *arg);
@@ -7112,22 +7791,76 @@ static void copies_branches(ProllyBranchVisit visit, void *arg);
  * ignore's (a branch being renamed), only by case, as Dolt does: on a
  * case-insensitive file system (or to a user) they're one.  Names are
  * ASCII, folded as such.  (The hidden branches of sessions checked out at
- * commits, named for them, aren't checked: no user names them.)  Every
- * branch is visited: a create's cost grows with the branches there are.
+ * commits, named for them, aren't checked: no user names them.)  Only the
+ * branches of the same name folded are read, from the index of names
+ * folded, so a create's cost doesn't grow with the branches there are.
  */
 static void
 refuse_other_case(const char *name, const char *ignore)
 {
 	OtherCase	oc = {name, ignore, NULL};
+	StringInfoData prefix;
 
 	if (strncmp(name, PROLLY_DETACHED_PREFIX, strlen(PROLLY_DETACHED_PREFIX)) == 0)
 		return;
-	copies_branches(find_other_case, &oc);
+	initStringInfo(&prefix);
+	folded_key(&prefix, name);
+	/* (the folded name and its NUL: every branch's of that name folded) */
+	prefix.len -= strlen(name);
+	visit_prefix(prefix.data, prefix.len, find_other_case, &oc);
+	pfree(prefix.data);
+	/* (main, which no path makes, is there from the database's start) */
+	if (oc.found == NULL && strcmp(name, "main") != 0 &&
+		(ignore == NULL || strcmp(ignore, "main") != 0) &&
+		pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
+		oc.found = pstrdup("main");
 	if (oc.found)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", oc.found),
 				 errdetail("Branch names that differ only by case name one branch.")));
+}
+
+/* A visit of the branches a folded name's index entries name. */
+typedef struct FoldedVisit
+{
+	ProllyBranchVisit visit;
+	void	   *arg;
+} FoldedVisit;
+
+static void
+visit_folded(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	FoldedVisit *fv = arg;
+	const char *sep = memchr(k->data, '\0', k->len);
+	ProllyHash	none = {0};
+
+	if (sep != NULL)
+		fv->visit(pnstrdup(sep + 1, (const char *) k->data + k->len - (sep + 1)),
+				  &none, fv->arg);
+}
+
+/*
+ * Visit the branches whose names are name but for case, by the
+ * case-folded name index: the work is in those, however many branches
+ * there are.  Their heads aren't read (each visited with an empty one).
+ */
+static void
+copies_branches_folded(const char *name, ProllyBranchVisit visit, void *arg)
+{
+	FoldedVisit fv = {visit, arg};
+	StringInfoData prefix;
+	ProllyHash	none = {0};
+
+	refs_init();
+	initStringInfo(&prefix);
+	folded_key(&prefix, name);
+	prefix.len -= strlen(name);
+	visit_prefix(prefix.data, prefix.len, visit_folded, &fv);
+	pfree(prefix.data);
+	/* (main, which no path makes, isn't in the index) */
+	if (pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
+		visit("main", &none, arg);
 }
 
 /*
@@ -7187,6 +7920,7 @@ copies_branch_create(const char *name, const char *start_point)
 			branch_ops()->create(name, from);
 			branch_set_baseline(name, branch_baseline(from, &baseline) ?
 								&baseline : NULL, NULL);
+			folded_index_set(name, true);
 			return;
 		}
 		ereport(ERROR,
@@ -7197,7 +7931,7 @@ copies_branch_create(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch or commit \"%s\" does not exist", from)));
-	branch_set_head(name, &id);
+	branch_set_head(name, &id);	/* (its name folded with its head) */
 	branch_set_baseline(name, NULL, NULL);
 	/* (and its start point's records of its relations, of that head) */
 	if (from_exists)
@@ -7271,8 +8005,15 @@ copies_branch_delete(const char *name, bool force)
 		pfree(key.data);
 	}
 	maker_put(TAG_CREATOR, name, InvalidOid);
-	/* (and the commits its pages were kept as of: they went with them) */
+	/*
+	 * (and the commits its pages were kept as of: they went with them, the
+	 * entry read first, for the indexes of what it holds now; and its name
+	 * folded)
+	 */
+	(void) kept_get(name);
 	kept_put(name, NIL);
+	folded_index_set(name, false);
+	forget_read_caches();
 }
 
 /*
@@ -7285,9 +8026,14 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES, TAG_PRIVILEGED, TAG_IDENTITY, TAG_REBASE, TAG_KEPT, TAG_CREATOR,
+	TAG_NAMES, TAG_PRIVILEGED, TAG_IDENTITY, TAG_REBASE, TAG_CREATOR,
 	TAG_IDENTITY_CONFLICTS};
 	ListCell   *lc;
+	List	   *kept;
+	ProllyNodeRef root;
+	ProllyHash	head_root;
+	bool		had_root;
+	bool		had_head_root;
 
 	lock_branch(name);
 	lock_branch(newname);
@@ -7328,6 +8074,20 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	 */
 	violations_clear(newname);
 	violations_move(name, newname);
+
+	/*
+	 * (the kept commits, and the indexes keyed by the branch's name, moved
+	 * as their entries are: let go of under the old name, made again under
+	 * the new)
+	 */
+	kept = kept_get(name);
+	had_root = branch_baseline_root(name, &root);
+	had_head_root = head_root_get(name, &head_root);
+	kept_put(name, NIL);
+	head_index_set(name, had_head_root ? &head_root : NULL, NULL);
+	baseline_index_set(name, had_root ? &root : NULL, NULL);
+	folded_index_set(name, false);
+	forget_read_caches();
 	for (int i = 0; i < lengthof(tags); i++)
 	{
 		StringInfoData key;
@@ -7360,6 +8120,12 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		pfree(key.data);
 		pfree(v.data);
 	}
+	kept_put(newname, kept);
+	if (had_head_root)
+		head_index_set(newname, NULL, &head_root);
+	if (had_root)
+		baseline_index_set(newname, NULL, &root);
+	folded_index_set(newname, true);
 	/* (a merge state the transaction set is checked under the new name) */
 	foreach(lc, merge_changed)
 	{
@@ -10735,6 +11501,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
+	.kept_holders = copies_kept_holders,
 	.recorded_relid = copies_recorded_relid,
 	.branch_creator = copies_branch_creator,
 	.branch_set_creator = copies_branch_set_creator,
@@ -10747,4 +11514,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.last_fold = copies_last_fold,
 	.forget_records = copies_forget_records,
 	.check_copies_read = copies_check_copies_read,
+	.branches_folded = copies_branches_folded,
 };

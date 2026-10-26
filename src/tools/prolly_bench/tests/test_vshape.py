@@ -110,6 +110,44 @@ def series(checks=None):
     return out
 
 
+class RepetitionsTest(unittest.TestCase):
+    @staticmethod
+    def cell(values, counter="nodes_read"):
+        return {"delta": {"levels": LEVELS, "checks": {"soft_reset": {counter: values}}}}
+
+    def test_median_of_repetitions(self):
+        reps = [self.cell([23, 23, 45, 23]), self.cell([23, 24, 23, 23]), self.cell([23, 23, 23, 30])]
+        out = vshape.median_of(reps)
+        # (a spike in one repetition at a point is dropped, not the least taken)
+        self.assertEqual(out["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 23, 23])
+        # (the inputs are left as they were)
+        self.assertEqual(reps[0]["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 45, 23])
+
+    def test_median_of_takes_no_dip(self):
+        # (a one-off dip, as a refs-read count of 98, 98, 85, isn't the work)
+        reps = [self.cell([98, 98, 98, 98], "catalog_blocks_read"),
+                self.cell([98, 98, 98, 98], "catalog_blocks_read"),
+                self.cell([85, 98, 98, 98], "catalog_blocks_read")]
+        out = vshape.median_of(reps)
+        self.assertEqual(out["delta"]["checks"]["soft_reset"]["catalog_blocks_read"], [98, 98, 98, 98])
+
+    def test_series_of_takes_a_cells_repetitions_as_one(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            lines = []
+            for rep, values in ((1, [23, 23, 45, 23]), (2, [23, 23, 23, 23]), (3, [23, 23, 23, 23])):
+                raw = root / f"raw{rep}"
+                raw.mkdir()
+                (raw / "v9-series.json").write_text(json.dumps(self.cell(values)))
+                lines.append(json.dumps({"key": {"workload": "V9", "variant": "bgnone", "rep": rep},
+                                         "status": "ok", "raw_dir": f"raw{rep}"}))
+            (root / "results.jsonl").write_text("\n".join(lines) + "\n")
+            cells = vshape.series_of(root)
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(cells[0]["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 23, 23])
+
+
 class GateTest(unittest.TestCase):
     def test_all_zero_meets_every_target(self):
         findings = vshape.gate([series()], [])

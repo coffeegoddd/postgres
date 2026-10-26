@@ -376,6 +376,14 @@ CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The refs' index entries as committed: each one's tag, the branch it
+-- names, what it is keyed by (hashes in hex, or a name case folded) and
+-- its value (hex).
+CREATE FUNCTION test_refs_index(OUT tag text, OUT branch text, OUT keyed text,
+	OUT value text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The memory the transaction's context holds now, in bytes.
 CREATE FUNCTION test_transaction_bytes()
 RETURNS int8

@@ -295,6 +295,9 @@ typedef struct ProllyKeptCommit
 } ProllyKeptCommit;
 
 typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
+/* A branch keeping pages as of commit (kept_holders()). */
+typedef void (*ProllyKeptHolderVisit) (const char *name, const ProllyHash *commit,
+									   void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -757,6 +760,15 @@ typedef struct ProllyRefsRoutine
 								 void *arg);
 
 	/*
+	 * Optional: visit the branches keeping pages as of commit (data NULL),
+	 * or as of a commit one of whose kept tables has the data tree data,
+	 * each with that commit (none retired).  A seek of an index: the work
+	 * is in those, however many branches there are.
+	 */
+	void		(*kept_holders) (const ProllyHash *commit, const ProllyHash *data,
+								 ProllyKeptHolderVisit visit, void *arg);
+
+	/*
 	 * Optional, together: pins.  A pin keeps a commit, and everything it
 	 * reaches, from collection under a name, for a reader outside the refs
 	 * that names the commit (a snapshot mount), with the nkeep trees keep
@@ -876,6 +888,15 @@ typedef struct ProllyRefsRoutine
 	 * gave its tables the pages kept as of its head.
 	 */
 	void		(*check_copies_read) (const char *name, Oid branch);
+
+	/*
+	 * Optional: visit the branches whose names are name but for case
+	 * (ASCII), name itself too if it is one, as branches() visits them but
+	 * with an empty head: the work is in those, however many branches there
+	 * are.
+	 */
+	void		(*branches_folded) (const char *name, ProllyBranchVisit visit,
+									void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -932,14 +953,14 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", "kept_holders", \
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
-	"forget_records", "check_copies_read"
+	"forget_records", "check_copies_read", "branches_folded"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK check_copies_read
+#define PROLLY_REFS_LAST_CALLBACK branches_folded
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

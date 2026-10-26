@@ -188,8 +188,9 @@ match_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
  * The branch or tag name names, as Dolt matches a revision's name: a
  * branch or tag of exactly that name (a branch's first), else the one
  * branch or tag whose name differs from it only by case; more than one
- * such is an error.  NULL if none.  Only a name no branch or tag has
- * exactly visits them all.
+ * such is an error.  NULL if none.  Branches are found by the refs'
+ * case-folded index; only a name no branch or tag has exactly visits the
+ * tags.
  */
 static char *
 ref_name(const char *name, bool *branch)
@@ -209,7 +210,10 @@ ref_name(const char *name, bool *branch)
 		*branch = false;
 		return pstrdup(name);
 	}
-	PROLLY_CALL(r, branches, match_branch, &m);
+	if (PROLLY_HAS(r, branches_folded))
+		PROLLY_CALL(r, branches_folded, name, match_branch, &m);
+	else
+		PROLLY_CALL(r, branches, match_branch, &m);
 	if (PROLLY_HAS(r, tags))
 		PROLLY_CALL(r, tags, match_tag, &m);
 	if (m.nfound > 1)

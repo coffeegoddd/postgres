@@ -1091,6 +1091,20 @@ and the tables and materialized views whose rows it wrote
 (move_tables_written): a checkout's work,
 table by table.
 
+None of these lists every branch, so their cost doesn't grow with the
+number of branches.  The refs keep indexes, changed in the same
+transactions as the entries they index: of kept commits by commit and by
+each kept table's data tree, of branches by their heads' roots and their
+baselines' folds' roots, and of branches' names case folded.  A move's
+known sources are the branches the generation table knows a fold of (a
+table of fixed size); its kept sources are the kept checkouts (the hidden
+branches' prefix of pg_branch's name index) and the kept commits holding
+one of the target's data trees.  A first use's nearest branch is ranked
+among the branches at the head's root by those indexes and the known
+folds; the planner's candidates are listed in name order only until
+enough are found; branch making checks the name folded with one seek.
+pg_stat_prolly's branches_listed counts the branches listings visit.
+
 With no branch at its head, the move planner (moveplan_costs.c)
 costs moving each branch's copies there, from the root its working set is
 known or thought to be: each table's rows that differ, estimated from its
@@ -1342,7 +1356,8 @@ change that made it gone may roll back.
 
 Kept commits are kept states of the materialization cache
 (prolly_matcache.h), beside kept checkouts: the cache's visit() gives
-each branch's kept commits (the refs' kept_commits(), each recording the
+the kept commits its filter asks for, of a commit or holding a data tree
+(the refs' kept_holders(), then kept_commits(), each recording the
 transaction that kept it, which a snapshot must see committed: refs
 format 9) with their commits' roots, and every user of kept states takes both kinds.  A
 first use at a kept commit is made of its pages, found through the cache.
