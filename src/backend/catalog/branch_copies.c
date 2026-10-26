@@ -1203,6 +1203,28 @@ copies_branches(BranchVisit visit, void *arg)
 	table_close(brel, AccessShareLock);
 }
 
+static void
+copies_branches_while(BranchVisitWhile visit, void *arg)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	Relation	irel = index_open(BranchNameIndexId, AccessShareLock);
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	scan = systable_beginscan_ordered(brel, irel, NULL, 0, NULL);
+	while ((tup = systable_getnext_ordered(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_branch b = (Form_pg_branch) GETSTRUCT(tup);
+
+		pgstat_count_prolly(PGSTAT_PROLLY_BRANCHES_LISTED, 1);
+		if (!visit(NameStr(b->brname), b->oid, arg))
+			break;
+	}
+	systable_endscan_ordered(scan);
+	index_close(irel, AccessShareLock);
+	table_close(brel, AccessShareLock);
+}
+
 /*
  * The branches named with prefix: an ordered scan of the name index from
  * prefix, until a name doesn't begin with it (names compare as bytes, as
@@ -2980,6 +3002,7 @@ static const BranchOpsRoutine branch_copies = {
 	.current = copies_current,
 	.branches = copies_branches,
 	.branches_named = copies_branches_named,
+	.branches_while = copies_branches_while,
 	.run_on = copies_run_on,
 	.share = copies_share,
 	.keep = copies_keep,

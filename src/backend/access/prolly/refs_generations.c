@@ -1042,6 +1042,36 @@ branch_generations_moved_databases(Oid *databases, int max)
 }
 
 /*
+ * The current database's branches with a fold known (whether it still
+ * holds is branch_fold_known_at()'s to say), into branches (at most max);
+ * their count.  The entries are few and fixed in number, so the work
+ * doesn't grow with the number of branches.  Without shared memory, none.
+ */
+/* (a caller's array of BRANCH_FOLD_KNOWN_MAX holds every entry's) */
+StaticAssertDecl(BRANCH_FOLD_KNOWN_MAX >= BRANCH_GENERATIONS,
+				 "BRANCH_FOLD_KNOWN_MAX must cover the generation table");
+
+int
+branch_fold_known_branches(Oid *branches, int max)
+{
+	BranchGenerations *g = shared();
+	int			n = 0;
+
+	if (g == NULL)
+		return 0;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	for (int i = 0; i < BRANCH_GENERATIONS && n < max; i++)
+	{
+		BranchGeneration *e = &g->entries[i];
+
+		if (OidIsValid(e->branch) && e->database == MyDatabaseId && e->known)
+			branches[n++] = e->branch;
+	}
+	LWLockRelease(&g->lock);
+	return n;
+}
+
+/*
  * The current database's branches whose generation moved since the fold
  * worker last saw it, each with its generation now and what its writers
  * did since, into branches (at most max); their count.  What each is given
