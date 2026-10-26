@@ -44,6 +44,7 @@ INSERT INTO names SELECT (dolt_commit('-am', 'b'))[1], 'b';
 UPDATE kd.t SET v = 2 WHERE id <= 100;
 INSERT INTO names SELECT (dolt_commit('-am', 'c'))[1], 'c';
 SELECT kept();
+SELECT octet_length(test_refs_value('Kmain')) AS record_of_three \gset
 
 -- a hard reset to b restores kd.t: c's and a's snapshots were in the
 -- storage it replaced, and are carried into the new storage, still kept
@@ -53,6 +54,12 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT pg_stat_force_next_flush();
 SELECT restored() > :before AS restored;
 SELECT kept();
+-- the entry b was kept by before, its storage replaced, is dropped from
+-- the record, not left there retired: the record holds b's entry from the
+-- restore, retired again by the keep after the move, besides b, c and a:
+-- four entries the size of those three, not five
+SELECT 3 * octet_length(test_refs_value('Kmain')) = 4 * :record_of_three
+	AS gone_entry_dropped;
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
 
 -- so the next commits keep them, as many as are kept
@@ -162,6 +169,31 @@ SET client_min_messages = error;
 SELECT kept > 0 AS kept FROM test_chunk_gc(true);
 RESET client_min_messages;
 SELECT test_chunk_has(:'q') AS q_stored;
+
+-- Only the commits still kept are asked what is left of their pages, not
+-- the retired: those pile up within a transaction, each of its commits
+-- retiring one, so asking them too would make each commit ask of every
+-- one before it.  Forty commits in one transaction ask four times what ten
+-- do, no more.
+CREATE FUNCTION checks() RETURNS bigint LANGUAGE sql AS $$
+	SELECT coalesce((SELECT value FROM pg_stat_prolly
+					 WHERE name = 'kept_status_checks'), 0)
+$$;
+CREATE FUNCTION commits(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		PERFORM dolt_commit('--allow-empty', '-m', 'e' || i);
+	END LOOP;
+END $$;
+SELECT commits(3);
+SELECT pg_stat_force_next_flush();
+SELECT checks() AS c0 \gset
+SELECT commits(10);
+SELECT pg_stat_force_next_flush();
+SELECT checks() - :c0 AS c10, checks() AS c0 \gset
+SELECT commits(40);
+SELECT pg_stat_force_next_flush();
+SELECT :c10 > 0 AS asked, checks() - :c0 <= 4 * :c10 AS each_commit_the_same;
 
 \c :home
 DROP DATABASE kept_dead;
