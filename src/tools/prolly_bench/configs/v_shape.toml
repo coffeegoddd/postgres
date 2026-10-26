@@ -8,8 +8,9 @@
 
 [run]
 quality = "smoke"
-# (three, the least of each count taken: an index keyed at hash-random
-# places splits a refs node now and then, doubling one point's nodes)
+# (three, the median of each count taken: an index keyed at hash-random
+# places splits a refs node now and then, doubling one point's nodes, and
+# catalog reads, cache misses and journal bytes move a little run to run)
 repetitions = 3
 clients = [1]
 warmup_seconds = 0

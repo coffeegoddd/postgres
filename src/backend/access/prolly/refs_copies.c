@@ -968,8 +968,9 @@ static List *kept_read_keys = NIL;
 
 /*
  * The branch branch_set_baseline() wrote, or a read of its 'W' found, last,
- * and the root of its baseline's fold then (have_root false: none): the
- * next baseline set of it changes the root's index from there, without
+ * while the transaction held the branch (so no other session changed it
+ * since), and the root of its baseline's fold then (have_root false: none):
+ * the next baseline set of it changes the root's index from there, without
  * reading 'W' again.  In TopMemoryContext.
  */
 static char *baseline_seen_name = NULL;
@@ -981,6 +982,8 @@ static ProllyNodeRef baseline_seen_root;
  * subtransaction rolls back: another session may change them before this
  * one reads them next, or the rollback undid what was written.
  */
+static bool branch_held(const char *name, int len);
+
 static void
 baseline_seen_set(const char *name, bool have_root, const ProllyHash *root)
 {
@@ -995,13 +998,21 @@ baseline_seen_set(const char *name, bool have_root, const ProllyHash *root)
 		ref_of(root, &baseline_seen_root);
 }
 
-/* A 'W' value's fold root, noted as seen (the entry found or not). */
+/*
+ * A 'W' value's fold root, noted as seen (the entry found or not): only
+ * while the transaction holds the branch, so that no other session
+ * changes it before the next baseline set reads it from here (a read
+ * without the lock, in one READ COMMITTED statement, may be older than
+ * the next statement's).
+ */
 static void
 baseline_seen_value(const char *name, const StringInfoData *v, bool found)
 {
 	ProllyHash	h;
 	const char *p;
 
+	if (!branch_held(name, strlen(name)))
+		return;
 	if (!found)
 	{
 		baseline_seen_set(name, false, NULL);
@@ -2497,8 +2508,6 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	else
 		had = branch_baseline_root(name, &was);
 	baseline_index_set(name, had ? &was : NULL, baseline != NULL ? root : NULL);
-	baseline_seen_set(name, baseline != NULL && root != NULL,
-					  baseline != NULL && root != NULL ? &root->hash : NULL);
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -2508,6 +2517,10 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 	if (baseline && root)
 		put_hash(&v, &root->hash);
 	refs_put(key.data, key.len, baseline ? &v : NULL);
+	/* (what it is now, noted once the branch is held: refs_put() holds it) */
+	if (branch_held(name, strlen(name)))
+		baseline_seen_set(name, baseline != NULL && root != NULL,
+						  baseline != NULL && root != NULL ? &root->hash : NULL);
 
 	resetStringInfo(&key);
 	resetStringInfo(&v);
