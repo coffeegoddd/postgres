@@ -182,53 +182,23 @@
     {
       "id": "assert-3",
       "session": "a",
-      "op": "exec",
+      "op": "query",
       "requires": [
         "vc.rebase"
       ],
-      "sql": "SELECT dolt_rebase('--continue')",
+      "sql": "SELECT r[1], r[2] LIKE 'data conflicts from rebase, but session settings do not allow preserving conflicts, so they cannot be resolved. The rebase has been aborted. %' FROM dolt_rebase('--continue') r",
       "expect": {
-        "sqlstate": "40001"
+        "rows": [
+          [
+            "1",
+            "t"
+          ]
+        ],
+        "order": "ordered"
       }
     },
     {
       "id": "assert-4",
-      "session": "a",
-      "op": "query",
-      "requires": [
-        "vc.core",
-        "vc.rebase"
-      ],
-      "sql": "SELECT active_branch(), (SELECT count(*) FROM dolt_rebase)",
-      "expect": {
-        "rows": [
-          [
-            "dolt_rebase_branch1",
-            "2"
-          ]
-        ],
-        "order": "ordered"
-      }
-    },
-    {
-      "id": "assert-5",
-      "session": "a",
-      "op": "query",
-      "requires": [
-        "vc.rebase"
-      ],
-      "sql": "SELECT dolt_rebase('--abort')",
-      "expect": {
-        "rows": [
-          [
-            "{0,\"Interactive rebase aborted\"}"
-          ]
-        ],
-        "order": "ordered"
-      }
-    },
-    {
-      "id": "assert-6",
       "session": "a",
       "op": "query",
       "requires": [
@@ -245,7 +215,7 @@
       }
     },
     {
-      "id": "assert-7",
+      "id": "assert-5",
       "session": "a",
       "op": "query",
       "requires": [
@@ -265,7 +235,7 @@
       }
     },
     {
-      "id": "assert-8",
+      "id": "assert-6",
       "session": "a",
       "op": "exec",
       "requires": [
@@ -277,7 +247,7 @@
       }
     },
     {
-      "id": "assert-9",
+      "id": "assert-7",
       "session": "a",
       "op": "query",
       "requires": [

@@ -87,6 +87,7 @@
 #include "utils/varlena.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -2604,41 +2605,55 @@ abort_in_progress(const char *what)
 }
 
 /*
+ * A merge's, pick's or revert's conflicts (or violations) the session
+ * can't keep, said at elevel: what they are, and how to keep them.  An
+ * ERROR rolls back the transaction; a NOTICE is for a rebase aborted
+ * instead.  between: what the rows were changed on ("branches", "sides").
+ */
+static void
+unkept_conflicts(const char *what, const char *What, const char *between,
+				 int conflicts, int nviolations, int elevel)
+{
+	ProllyMergeState ms;
+	const char *outcome = elevel >= ERROR ? "transaction rolled back" : "rebase aborted";
+
+	/* (a table that is another table on the other side: kept, not merged) */
+	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.nidentity > 0)
+		ereport(elevel,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflict detected, %s", what, outcome),
+				 errdetail("Table %s is another table on the other side, a relation of its own of that name: a table identity conflict.",
+						   ms.identity[0].name),
+				 errhint("%s in a transaction block to resolve it with dolt_conflicts_resolve('--ours') or ('--theirs') before committing, or set dolt.allow_commit_conflicts to keep it.", What)));
+	else if (conflicts > 0)
+		ereport(elevel,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s conflict detected, %s", what, outcome),
+				 errdetail_plural("%d row was changed differently on both %s.",
+								  "%d rows were changed differently on both %s.",
+								  conflicts, conflicts, between),
+				 errhint("%s in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+	else
+		ereport(elevel,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("%s constraint violations detected, %s", what, outcome),
+				 errdetail_plural("%d row violates a constraint.",
+								  "%d rows violate constraints.",
+								  nviolations, nviolations),
+				 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+}
+
+/*
  * A merge's, pick's or revert's conflicts (or violations), found outside a
- * transaction block: an error unless they may be kept.  between: what the
- * rows were changed on ("branches", "sides").
+ * transaction block: an error unless they may be kept.
  */
 static void
 stopped_outside_block(const char *what, const char *What, const char *between,
 					  int conflicts, int nviolations)
 {
-	ProllyMergeState ms;
-
 	if (IsTransactionBlock() || prolly_allow_commit_conflicts())
 		return;
-	/* (a table that is another table on the other side: kept, not merged) */
-	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.nidentity > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("%s conflict detected, transaction rolled back", what),
-				 errdetail("Table %s is another table on the other side, a relation of its own of that name: a table identity conflict.",
-						   ms.identity[0].name),
-				 errhint("%s in a transaction block to resolve it with dolt_conflicts_resolve('--ours') or ('--theirs') before committing, or set dolt.allow_commit_conflicts to keep it.", What)));
-	if (conflicts > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("%s conflict detected, transaction rolled back", what),
-				 errdetail_plural("%d row was changed differently on both %s.",
-								  "%d rows were changed differently on both %s.",
-								  conflicts, conflicts, between),
-				 errhint("%s in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
-	ereport(ERROR,
-			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-			 errmsg("%s constraint violations detected, transaction rolled back", what),
-			 errdetail_plural("%d row violates a constraint.",
-							  "%d rows violate constraints.",
-							  nviolations, nviolations),
-			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
+	unkept_conflicts(what, What, between, conflicts, nviolations, ERROR);
 }
 
 static void
@@ -4985,15 +5000,246 @@ rebase_commit_stopped(const ProllyRebaseState *rs, const ProllyRebaseStep *s)
 	settled();
 }
 
+static void rebase_abort(void);
+
+/* set by errschemaconflict(), for a rebase to tell a schema conflict apart */
+bool		prolly_schema_conflict_raised = false;
+
+/*
+ * Among an error's ereport() arguments: the error is a schema conflict
+ * (prolly_merge.h).
+ */
+int
+errschemaconflict(void)
+{
+	prolly_schema_conflict_raised = true;
+	return 0;
+}
+
+/*
+ * Whether a caught error is a schema conflict: marked so as it was raised
+ * (errschemaconflict()), and of a code those errors have, so that a mark
+ * left by one swallowed on the way isn't taken for another error's.
+ */
+static bool
+caught_schema_conflict(const ErrorData *ed)
+{
+	return prolly_schema_conflict_raised &&
+		(ed->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+		 ed->sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED);
+}
+
+/* How a rebase's steps ended: rebase_steps(). */
+typedef enum RebaseSteps
+{
+	REBASE_STEPS_DONE,			/* every step done */
+	REBASE_STEPS_STOPPED,		/* stopped at a step: a conflict, an edit */
+	REBASE_STEPS_UNKEPT,		/* conflicts the session can't keep */
+} RebaseSteps;
+
+/*
+ * The plan's steps after the last begun, each picked onto the rebase's
+ * branch and made what its action says.  A step that conflicts, or an
+ * edit, stops them (result: the status and why).  Conflicts the session
+ * can't keep (keep false: outside a transaction block, without
+ * dolt.allow_commit_conflicts) are said at unkept_elevel, what they are
+ * (an ERROR, or a NOTICE for the caller to abort the rebase).
+ */
+static RebaseSteps
+rebase_steps(ProllyRebaseState *rs, const char **result, bool keep,
+			 int unkept_elevel)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+
+	for (int i = 0; i < rs->nsteps; i++)
+	{
+		ProllyRebaseStep *s = &rs->steps[i];
+		ProllyHash	prev;
+		ProllyHash	id;
+		ProllyHash	picked = {0};
+		const char *ref = hash_hex(&s->commit);
+		int			conflicts;
+
+		CHECK_FOR_INTERRUPTS();
+		if (rs->last_step != NULL && rebase_order_cmp(s->order, rs->last_step) <= 0)
+			continue;
+		rs->last_step = s->order;
+		PROLLY_CALL(r, set_rebase_state, rs);
+		if (strcmp(s->action, "drop") == 0)
+			continue;
+		if (!PROLLY_CALL(r, resolve, "HEAD", &prev))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the rebase branch has no head")));
+		INJECTION_POINT("prolly-rebase-step", NULL);
+		note_integration();
+		(void) PROLLY_CALL(r, resolve, ref, &picked);
+		VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0,
+					 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
+											 true, &id));
+		if (conflicts > 0)
+		{
+			int			nviolations = list_length(PROLLY_CALL(r, violations));
+
+			if (!keep)
+			{
+				unkept_conflicts("rebase", "Rebase", "sides",
+								 conflicts - nviolations, nviolations,
+								 unkept_elevel);
+				return REBASE_STEPS_UNKEPT;
+			}
+			result[0] = "1";
+			result[1] = psprintf("data conflict detected while rebasing commit %s (%s). \n\n"
+								 "Resolve the conflicts and remove them from the dolt_conflicts table, "
+								 "then continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return REBASE_STEPS_STOPPED;
+		}
+		rebase_after_pick(rs, s, &prev);
+		settled();
+		if (strcmp(s->action, "edit") == 0)
+		{
+			result[0] = "0";
+			result[1] = psprintf("edit action paused at commit %s (%s). \n\n"
+								 "You can now modify the working directory and stage changes. "
+								 "When ready, continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return REBASE_STEPS_STOPPED;
+		}
+	}
+	return REBASE_STEPS_DONE;
+}
+
+/* Dolt's message for a schema conflict at a rebase's step */
+static char *
+rebase_schema_conflict_message(const ProllyRebaseState *rs)
+{
+	const char *ref = "";
+
+	for (int i = 0; i < rs->nsteps; i++)
+		if (rs->last_step != NULL &&
+			rebase_order_cmp(rs->steps[i].order, rs->last_step) == 0)
+			ref = hash_hex(&rs->steps[i].commit);
+	return psprintf("schema conflict detected while rebasing commit %s. "
+					"the rebase has been automatically aborted", ref);
+}
+
+/*
+ * Run the rebase's steps where Dolt aborts it as a step fails it: a
+ * schema conflict, or conflicts the session can't keep.
+ *
+ * A rebase the statement began (begun_here) is rolled back by an error,
+ * which leaves what Dolt's abort does: a schema conflict fails with
+ * Dolt's message, conflicts not kept with what they are.  For one begun
+ * before, an error would roll the statement back to the rebase as it was
+ * before it, so the steps run in a subtransaction, rolled back for the
+ * rebase to be aborted, which the statement then commits: result is
+ * status 1 and Dolt's message, and false is returned.  (One subtransaction
+ * for every step: the abort drops them all anyway.)  Any other error is
+ * the statement's, the rebase left as it was.
+ */
+static bool
+rebase_steps_or_abort(ProllyRebaseState *rs, const char **result, bool begun_here)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	volatile RebaseSteps done = REBASE_STEPS_DONE;
+	ErrorData  *volatile schema_conflict = NULL;
+
+	/* (asked first: in the subtransaction, every statement is in a block) */
+	bool		keep = IsTransactionBlock() || prolly_allow_commit_conflicts();
+
+	prolly_schema_conflict_raised = false;
+	if (begun_here)
+	{
+		PG_TRY();
+		{
+			done = rebase_steps(rs, result, keep, ERROR);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *ed;
+
+			MemoryContextSwitchTo(cxt);
+			ed = CopyErrorData();
+			if (!caught_schema_conflict(ed))
+				PG_RE_THROW();
+			prolly_schema_conflict_raised = false;
+			FlushErrorState();
+			/* (40001, as Dolt's merge.SchemaConflict is: the enum limits' too) */
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg_internal("%s", rebase_schema_conflict_message(rs)),
+					 errdetail_internal("%s", ed->message)));
+		}
+		PG_END_TRY();
+		return done != REBASE_STEPS_DONE;
+	}
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		done = rebase_steps(rs, result, keep, NOTICE);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+		bool		schema;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		schema = caught_schema_conflict(ed);
+		prolly_schema_conflict_raised = false;
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (!schema)
+			ReThrowError(ed);
+		schema_conflict = ed;
+	}
+	PG_END_TRY();
+	if (schema_conflict == NULL)
+	{
+		if (done == REBASE_STEPS_UNKEPT)
+			RollbackAndReleaseCurrentSubTransaction();
+		else
+			ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (done != REBASE_STEPS_UNKEPT)
+			return done != REBASE_STEPS_DONE;
+	}
+	result[0] = "1";
+	if (schema_conflict != NULL)
+		result[1] = rebase_schema_conflict_message(rs);
+	else
+		result[1] = "data conflicts from rebase, but session settings do not allow preserving conflicts, "
+			"so they cannot be resolved. The rebase has been aborted. "
+			"Run the rebase in a transaction block or set dolt.allow_commit_conflicts to on, "
+			"and try the rebase again to resolve the conflicts.";
+	rebase_abort();
+	/* (Dolt's message doesn't say which; the notice does) */
+	if (schema_conflict != NULL)
+		ereport(NOTICE,
+				(errmsg_internal("%s", schema_conflict->message),
+				 schema_conflict->detail ?
+				 errdetail_internal("%s", schema_conflict->detail) : 0));
+	return true;
+}
+
 /*
  * Go on with the plan from the step after the last begun: each picked
  * onto the rebase's branch and made what its action says.  A step that
  * conflicts, or an edit, stops it (result: the status and why); the last
  * done, the rebased branch is moved to the rebase's head, checked out, and
- * the rebase's branch deleted.
+ * the rebase's branch deleted.  Where Dolt aborts it, a rebase this
+ * statement didn't begin (begun_here false) is aborted, and one it began
+ * fails: see rebase_steps_or_abort().
  */
 static void
-rebase_continue(const char **result)
+rebase_continue(const char **result, bool begun_here)
 {
 	const ProllyRefsRoutine *r = rebase_refs();
 	ProllyRebaseState rs;
@@ -5088,59 +5334,8 @@ rebase_continue(const char **result)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot start a rebase with uncommitted changes")));
 
-	for (int i = 0; i < rs.nsteps; i++)
-	{
-		ProllyRebaseStep *s = &rs.steps[i];
-		ProllyHash	prev;
-		ProllyHash	id;
-		const char *ref = hash_hex(&s->commit);
-		int			conflicts;
-
-		CHECK_FOR_INTERRUPTS();
-		if (rs.last_step != NULL && rebase_order_cmp(s->order, rs.last_step) <= 0)
-			continue;
-		rs.last_step = s->order;
-		PROLLY_CALL(r, set_rebase_state, &rs);
-		if (strcmp(s->action, "drop") == 0)
-			continue;
-		if (!PROLLY_CALL(r, resolve, "HEAD", &prev))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("the rebase branch has no head")));
-		note_integration();
-		{
-			ProllyHash	picked = {0};
-
-			(void) PROLLY_CALL(r, resolve, ref, &picked);
-			VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0,
-						 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
-												 true, &id));
-		}
-		if (conflicts > 0)
-		{
-			int			nviolations = list_length(PROLLY_CALL(r, violations));
-
-			stopped_outside_block("rebase", "Rebase", "sides",
-								  conflicts - nviolations, nviolations);
-			result[0] = "1";
-			result[1] = psprintf("data conflict detected while rebasing commit %s (%s). \n\n"
-								 "Resolve the conflicts and remove them from the dolt_conflicts table, "
-								 "then continue the rebase by calling dolt_rebase('--continue')",
-								 ref, s->message);
-			return;
-		}
-		rebase_after_pick(&rs, s, &prev);
-		settled();
-		if (strcmp(s->action, "edit") == 0)
-		{
-			result[0] = "0";
-			result[1] = psprintf("edit action paused at commit %s (%s). \n\n"
-								 "You can now modify the working directory and stage changes. "
-								 "When ready, continue the rebase by calling dolt_rebase('--continue')",
-								 ref, s->message);
-			return;
-		}
-	}
+	if (rebase_steps_or_abort(&rs, result, begun_here))
+		return;
 
 	/*
 	 * every step done: the rebased branch, if it hasn't changed, moved here.
@@ -5174,6 +5369,8 @@ rebase_continue(const char **result)
 		prolly_move_replaces = false;
 	}
 	PG_END_TRY();
+	/* (rolled back, the session is back on the rebase's branch, as it is) */
+	branch_return_on_abort();
 	checkout_branch(rs.branch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
 	settled();
@@ -5194,6 +5391,11 @@ rebase_abort(void)
 	PreventCommandIfReadOnly("dolt_rebase()");
 	prolly_check_head_move(rs.branch);
 	working = pstrdup(branch_ops()->current());
+	/*
+	 * (rolled back, the rebase's branch is back, its state with it: so is
+	 * the session, on it)
+	 */
+	branch_return_on_abort();
 	checkout_branch(rs.branch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
 	settled();
@@ -5274,7 +5476,7 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	{
 		bool		pushed = hold_unmoved("dolt_rebase('--continue')");
 
-		rebase_continue(result);
+		rebase_continue(result, false);
 		if (pushed)
 			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
@@ -5294,7 +5496,7 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	{
 		bool		pushed = hold_unmoved("dolt_rebase()");
 
-		rebase_continue(result);
+		rebase_continue(result, true);
 		if (pushed)
 			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
