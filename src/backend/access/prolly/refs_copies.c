@@ -73,7 +73,7 @@
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
  *	'k' commit name -> nothing: branch name keeps pages as of the commit
- *				   (hash length, hash), an entry of its 'K', retired or not
+ *				   (hash length, hash), an entry of its 'K' not retired
  *	's' data commit name -> nothing: and that commit's kept table has the
  *				   data tree data (hash length, hash, each)
  *	'r' root kind name -> nothing: the branch's head's root (kind 'h') or
@@ -3109,6 +3109,17 @@ source_of(List *sources, const NamedTree *t)
 struct KeptCommit;
 static List *kept_get(const char *name);
 static void kept_put(const char *name, List *kept);
+static List *kept_index_keys(const char *name, List *kept);
+
+/*
+ * The branch kept_get() read last, and the index entries of its kept
+ * commits then (in kept_read_cxt): kept_put() of it after takes them,
+ * the caller having changed the list read in place.  Forgotten by every
+ * kept_put(), so a write in between makes it read the entry again.
+ */
+static MemoryContext kept_read_cxt = NULL;
+static char *kept_read_name = NULL;
+static List *kept_read_keys = NIL;
 static int	kept_carried(List *kept, const struct KeptCommit *was,
 						 const char *name, BranchKeptRelation **carry,
 						 BranchKeptRelation ***into);
@@ -3600,8 +3611,11 @@ kept_declare(const char *p, const char *end, StringInfo refs)
 }
 
 /*
- * The index entries of branch name's kept commits kept: each commit's
- * ('k'), and each of its tables' data trees' ('s').
+ * The index entries of branch name's kept commits kept, but those retired
+ * (which no reader takes, and which pile up until their retiring
+ * transaction is known to have committed): each commit's ('k'), and each
+ * of its tables' data trees' ('s').  So they are a few for each branch,
+ * however many commits the transaction makes.
  */
 static List *
 kept_index_keys(const char *name, List *kept)
@@ -3610,8 +3624,11 @@ kept_index_keys(const char *name, List *kept)
 
 	foreach_ptr(KeptCommit, kc, kept)
 	{
-		StringInfo	k = makeStringInfo();
+		StringInfo	k;
 
+		if (FullTransactionIdIsValid(kc->retired))
+			continue;
+		k = makeStringInfo();
 		appendStringInfoChar(k, TAG_KEPT_OF);
 		put_hash(k, &kc->commit);
 		appendStringInfoString(k, name);
@@ -3647,6 +3664,7 @@ kept_get(const char *name)
 	StringInfoData key;
 	StringInfoData v;
 	List	   *kept = NIL;
+	MemoryContext old;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -3655,6 +3673,17 @@ kept_get(const char *name)
 		kept = kept_decode(v.data, v.data + v.len);
 	pfree(key.data);
 	pfree(v.data);
+
+	/* (its index entries now, for the kept_put() that follows) */
+	if (kept_read_cxt == NULL)
+		kept_read_cxt = AllocSetContextCreate(TopMemoryContext,
+											  "prolly kept index entries read",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(kept_read_cxt);
+	old = MemoryContextSwitchTo(kept_read_cxt);
+	kept_read_name = pstrdup(name);
+	kept_read_keys = kept_index_keys(name, kept);
+	MemoryContextSwitchTo(old);
 	return kept;
 }
 
@@ -3663,8 +3692,17 @@ kept_put(const char *name, List *kept)
 {
 	StringInfoData key;
 	StringInfoData v;
-	List	   *was = kept_index_keys(name, kept_get(name));
+	List	   *was;
 	List	   *now = kept_index_keys(name, kept);
+
+	/*
+	 * (the entries as the last kept_get() found them, if it read this
+	 * branch's and no kept_put() came since: the caller changes the list it
+	 * read in place; else read again)
+	 */
+	if (kept_read_name == NULL || strcmp(kept_read_name, name) != 0)
+		(void) kept_get(name);
+	was = kept_read_keys;
 
 	/* (the indexes first: those no longer true gone, the new ones put) */
 	foreach_ptr(StringInfoData, k, was)
@@ -3681,6 +3719,7 @@ kept_put(const char *name, List *kept)
 	refs_put(key.data, key.len, kept != NIL ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
+	kept_read_name = NULL;
 }
 
 static KeptCommit *
