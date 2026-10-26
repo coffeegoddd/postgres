@@ -45,6 +45,9 @@ extern ParseNamespaceItem *prolly_revision_range(ParseState *pstate,
 /* Is rte a revision's table (prolly_revision_range()'s)? */
 extern bool prolly_revision_rte(RangeTblEntry *rte);
 
+/* rte's name, "db/ref".schema.table, as a view's definition prints it */
+extern char *prolly_revision_rte_name(RangeTblEntry *rte);
+
 /* rte's privileges are checked as userid (setRuleCheckAsUser()'s) */
 extern void prolly_revision_set_check_as(RangeTblEntry *rte, Oid userid);
 

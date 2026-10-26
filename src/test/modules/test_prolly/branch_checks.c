@@ -29,6 +29,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
+#include "utils/inval.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
@@ -209,6 +210,28 @@ test_cache_resets(PG_FUNCTION_ARGS)
 	nreset_catalogs = 0;
 	system_entries_reset = 0;
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * An injection point callback, attached with injection_points_attach(name,
+ * 'test_prolly', 'test_invalidate_caches_once', NULL): the first time it
+ * runs in a backend, every cache is reset there, as a reset of the shared
+ * invalidation queue resets them.
+ */
+extern PGDLLEXPORT void test_invalidate_caches_once(const char *name,
+													const void *private_data,
+													void *arg);
+
+void
+test_invalidate_caches_once(const char *name, const void *private_data,
+							void *arg)
+{
+	static bool done = false;
+
+	if (done)
+		return;
+	done = true;
+	InvalidateSystemCaches();
 }
 
 /* test_syscache_catalog(relid): whether a catalog cache is of relid */

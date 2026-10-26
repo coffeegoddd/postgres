@@ -80,6 +80,20 @@ BEGIN;
 LOCK TABLE "regress_revisions/b1".rn.t;
 ROLLBACK;
 
+SELECT * FROM "regress_revisions/b1".rn.t FOR UPDATE;
+SELECT * FROM "regress_revisions/b1".rn.t FOR SHARE;
+-- a name too long to be sure of (cut to an identifier's length)
+SELECT * FROM "regress_revisions/a_branch_name_long_enough_to_be_cut_short_by_the_parser".rn.t;
+-- the function is the parser's alone: a call written as one, whatever role
+-- it names, is refused
+SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
+SELECT count(*) FROM prolly_revision_table('b1', 'rn', 't', 0) AS x(id int, v int);
+CREATE VIEW rn_by_call AS
+  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
+PREPARE by_call AS
+  SELECT * FROM prolly_revision_table('b1', 'rn', 't', 10) AS x(id int, v int);
+SELECT prolly_revision_table('b1', 'rn', 't', 10);
+
 -- the branch's own definitions: a table only it has, a column it added
 SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
 CREATE TABLE rn.only_b1 (k text PRIMARY KEY, n int);
@@ -87,6 +101,8 @@ INSERT INTO rn.only_b1 VALUES ('a', 1), ('b', 2);
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT * FROM "regress_revisions/b1".rn.only_b1 ORDER BY k;
 CREATE VIEW rn_b1 AS SELECT id, v FROM "regress_revisions/b1".rn.t;
+-- (its definition names the revision, as it was written)
+SELECT pg_get_viewdef('rn_b1');
 PREPARE b1_v(int) AS SELECT v FROM "regress_revisions/b1".rn.t WHERE id = $1;
 EXECUTE b1_v(1);
 SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
@@ -145,6 +161,16 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SET ROLE regress_revisions_reader;
 SELECT count(*) FROM "regress_revisions/b1".rn.t;
 RESET ROLE;
+-- naming a table on the branch takes USAGE on its schema there
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+CREATE SCHEMA hid VERSIONED;
+CREATE TABLE hid.x (k int);
+GRANT SELECT ON hid.x TO regress_revisions_reader;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_revisions_reader;
+SELECT count(*) FROM "regress_revisions/b1".hid.x;
+RESET ROLE;
+
 -- a view checks as its owner (unless security_invoker), as for a
 -- relation; a SECURITY DEFINER function reads as its owner
 CREATE ROLE regress_revisions_owner;

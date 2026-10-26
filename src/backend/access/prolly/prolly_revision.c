@@ -73,6 +73,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/explain_format.h"
@@ -412,6 +413,33 @@ branch_relid(Oid branch, const char *schema, const char *relname)
 }
 
 /*
+ * Is schema.relname on branch a table outside the versioned schemas (every
+ * branch's, its catalog row shared), and so to be read as the session's
+ * own, its locks unversioned?  False if it is versioned or not there.
+ */
+static bool
+branch_table_shared(Oid branch, const char *schema, const char *relname)
+{
+	Oid			relid = branch_relid(branch, schema, relname);
+	bool		shared = false;
+
+	if (!OidIsValid(relid))
+		return false;
+	CATALOG_READ_ON_BRANCH(branch,
+						   {
+							   HeapTuple	tup = SearchSysCache1(RELOID,
+																  ObjectIdGetDatum(relid));
+
+							   if (HeapTupleIsValid(tup))
+							   {
+								   shared = !OidIsValid(((Form_pg_class) GETSTRUCT(tup))->relbranch);
+								   ReleaseSysCache(tup);
+							   }
+						   });
+	return shared;
+}
+
+/*
  * Branch rev's copy of schema.relname, locked as a session on the branch
  * locks it to read it, the branch held against deletion: its entry, which
  * the caller closes with RelationCloseBranchRelation().  An error if the
@@ -426,8 +454,9 @@ open_branch_table(const Revision *rev, const char *schema, const char *relname,
 
 	if (!pin_branch(rev->branch))
 		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_DATABASE),
-				 errmsg("branch \"%s\" is being deleted", rev->ref)));
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch \"%s\" can't be read now", rev->ref),
+				 errdetail("It is gone, or being deleted or renamed.")));
 	if (PROLLY_HAS(refs(), check_copies_read))
 		PROLLY_CALL(refs(), check_copies_read, rev->ref, rev->branch);
 
@@ -526,19 +555,28 @@ prolly_revision_range(ParseState *pstate, RangeVar *rv, const char *ref)
 	RangeFunction *rf;
 	bool		plain = false;
 
+	/* (an identifier this long may have been cut short: refused) */
+	if (strlen(rv->catalogname) >= NAMEDATALEN - 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("revision-qualified name \"%s\" is too long", rv->catalogname),
+				 errdetail("A database's name, \"/\" and a revision's name are at most %d bytes together.",
+						   NAMEDATALEN - 2),
+				 parser_errposition(pstate, rv->location)));
 	if (!resolve_revision(ref, &rev))
 		revision_missing(rv->catalogname, ref, rv->location, pstate);
 	if (rev.kind == REVISION_BRANCH && rev.branch == MyBranch)
 		plain = true;
+	else if (rev.kind == REVISION_BRANCH &&
+			 branch_table_shared(rev.branch, rv->schemaname, rv->relname))
+		plain = true;			/* (outside the versioned schemas: every branch's) */
 	else if (rev.kind == REVISION_BRANCH)
 	{
 		Relation	rel = open_branch_table(&rev, rv->schemaname, rv->relname,
 											rv->location, pstate);
 
-		/* (a table outside the versioned schemas is every branch's) */
-		plain = !OidIsValid(rel->rd_rel->relbranch);
-		defs = plain ? NIL : column_defs(RelationGetDescr(rel), ref,
-										 rv->relname, rv->location, pstate);
+		defs = column_defs(RelationGetDescr(rel), ref, rv->relname,
+						   rv->location, pstate);
 		RelationCloseBranchRelation(rel);
 	}
 	else
@@ -573,7 +611,7 @@ prolly_revision_range(ParseState *pstate, RangeVar *rv, const char *ref)
 									makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
 											  ObjectIdGetDatum(InvalidOid),
 											  false, true)),
-						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+						 InvalidOid, InvalidOid, COERCE_SQL_SYNTAX);
 	fexpr->funcretset = true;
 	fexpr->location = rv->location;
 	rf = makeNode(RangeFunction);
@@ -683,6 +721,7 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 	Oid			relid = RelationGetRelid(rr->heap);
 	Oid			user = OidIsValid(rr->check_as) ? rr->check_as : GetUserId();
 	bool		allowed = true;
+	bool		usage = true;
 	int			rls = RLS_NONE;
 	BranchGrantKey key;
 
@@ -696,6 +735,11 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 						   {
 							   bool		table_ok;
 
+							   /* (its schema's USAGE, as naming it on the branch takes) */
+							   if (object_aclcheck(NamespaceRelationId,
+												   rr->heap->rd_rel->relnamespace,
+												   user, ACL_USAGE) != ACLCHECK_OK)
+								   usage = false;
 							   table_ok = pg_class_aclcheck(relid, user, ACL_SELECT) == ACLCHECK_OK;
 							   if (!table_ok)
 							   {
@@ -717,9 +761,15 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 							   }
 							   if (rr->heap->rd_rel->relrowsecurity)
 								   rls = check_enable_rls(relid, rr->check_as, true);
-							   else if (table_ok)
+							   else if (table_ok && usage)
 								   (void) hash_search(branch_grants, &key, HASH_ENTER, NULL);
 						   });
+	if (!usage)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for schema %s of revision \"%s\"",
+						rr->schema, rr->rev.ref),
+				 errdetail("Reading another branch's table takes the branch's grants on it.")));
 	if (!allowed)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -958,6 +1008,22 @@ rte_args(RangeTblEntry *rte, char **ref, char **schema, char **relname,
 		*check_as = DatumGetObjectId(((Const *) lfourth(args))->constvalue);
 }
 
+/* rte's name as written, "db/ref".schema.table, the current database's */
+char *
+prolly_revision_rte_name(RangeTblEntry *rte)
+{
+	char	   *ref;
+	char	   *schema;
+	char	   *relname;
+
+	rte_args(rte, &ref, &schema, &relname, NULL);
+	return psprintf("%s.%s.%s",
+					quote_identifier(psprintf("%s/%s",
+											  get_database_name(MyDatabaseId),
+											  ref)),
+					quote_identifier(schema), quote_identifier(relname));
+}
+
 /*
  * A view's (or rule's) revision read checks its privileges as userid, as
  * setRuleCheckAsUser() makes its relations' be checked: the role is the
@@ -990,7 +1056,9 @@ prolly_revision_rte(RangeTblEntry *rte)
 	if (!IsA(rtfunc->funcexpr, FuncExpr))
 		return false;
 	f = (FuncExpr *) rtfunc->funcexpr;
-	if (f->funcid != F_PROLLY_REVISION_TABLE || list_length(f->args) != 4)
+	/* (the parser's own call: no other is accepted, see revision_call()) */
+	if (f->funcid != F_PROLLY_REVISION_TABLE || list_length(f->args) != 4 ||
+		f->funcformat != COERCE_SQL_SYNTAX)
 		return false;
 	foreach(lc, f->args)
 	{
@@ -1670,6 +1738,18 @@ prolly_revision_table(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	int			n = 0;
 
+	/*
+	 * Only the parser's call of a revision's name: one written as a call
+	 * (refused as it is parsed, but a plan can be made otherwise) could name
+	 * the role it is checked as.
+	 */
+	if (fcinfo->flinfo->fn_expr == NULL ||
+		!IsA(fcinfo->flinfo->fn_expr, FuncExpr) ||
+		((FuncExpr *) fcinfo->flinfo->fn_expr)->funcformat != COERCE_SQL_SYNTAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("prolly_revision_table() can't be called directly"),
+				 errhint("Name the table as \"database/revision\".schema.table.")));
 	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 	desc = rsinfo->setDesc;
 	memset(&rr, 0, sizeof(rr));

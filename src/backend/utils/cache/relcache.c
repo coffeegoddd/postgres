@@ -2102,6 +2102,16 @@ RelationIdGetRelation(Oid relationId)
 {
 	Relation	rd;
 
+	/*
+	 * The session's entries are built from the session branch's rows, even
+	 * while another branch's catalogs are being read.
+	 */
+	if (unlikely(OidIsValid(CatalogReadBranch)))
+	{
+		CATALOG_READ_ON_BRANCH(InvalidOid, rd = RelationIdGetRelation(relationId));
+		return rd;
+	}
+
 	AssertCouldGetRelation();
 
 	/*
@@ -2377,6 +2387,7 @@ RelationIdGetBranchRelation(Oid relid, Oid branch)
 			branch_build_invalidated = false;
 			rel = NULL;
 			CATALOG_READ_ON_BRANCH(branch,
+								   INJECTION_POINT("branch-relation-build", NULL);
 								   rel = RelationBuildDesc(relid, false);
 								   if (rel != NULL &&
 									   (rel->rd_rel->relkind == RELKIND_RELATION ||
@@ -2412,14 +2423,20 @@ RelationCloseBranchRelation(Relation relation)
 	RelationDecrementReferenceCount(relation);
 	if (!relation->rd_isvalid && RelationHasReferenceCountZero(relation))
 	{
-		BranchRelKey key;
+		HASH_SEQ_STATUS status;
 		BranchRelEnt *ent;
 
-		key.relid = RelationGetRelid(relation);
-		key.branch = relation->rd_rel->relbranch;
-		ent = hash_search(BranchRelationCache, &key, HASH_FIND, NULL);
-		if (ent != NULL && ent->reldesc == relation)
-			branch_relation_drop(ent);
+		/* (found by the entry: a shared relation's row has no branch) */
+		hash_seq_init(&status, BranchRelationCache);
+		while ((ent = hash_seq_search(&status)) != NULL)
+		{
+			if (ent->reldesc == relation)
+			{
+				hash_seq_term(&status);
+				branch_relation_drop(ent);
+				break;
+			}
+		}
 	}
 }
 

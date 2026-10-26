@@ -21,6 +21,7 @@
 
 #include "access/amapi.h"
 #include "access/htup_details.h"
+#include "access/prolly_revision.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -12648,6 +12649,12 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				appendStringInfoChar(buf, ')');
 				break;
 			case RTE_FUNCTION:
+				/* a revision's table: its name, which is parsed to the call */
+				if (prolly_revision_rte(rte))
+				{
+					appendStringInfoString(buf, prolly_revision_rte_name(rte));
+					break;
+				}
 				/* Function RTE */
 				rtfunc1 = (RangeTblFunction *) linitial(rte->functions);
 

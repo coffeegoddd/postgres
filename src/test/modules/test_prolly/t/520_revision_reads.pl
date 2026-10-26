@@ -94,5 +94,40 @@ is($r->query_safe(q{SELECT count(*) FROM "postgres/h1".s.t}), '10',
 	'and read by the next transaction');
 
 $r->quit;
+
+# Caches reset while b1's catalogs are being read (as a reset of the shared
+# invalidation queue would reset them, at an injection point inside the
+# read of b1's copy): the session's own entries, of a table it has open,
+# are rebuilt from its own branch's rows, not b1's.
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  unless $ENV{enable_injection_points} eq 'yes';
+	$node->safe_psql('postgres/b1', q{
+		UPDATE s.t SET v = 100;
+		ALTER TABLE s.t ADD COLUMN extra text DEFAULT 'b1only';
+	});
+	my $out = $node->safe_psql('postgres', q{
+		CREATE EXTENSION IF NOT EXISTS injection_points;
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('branch-relation-build', 'test_prolly',
+			'test_invalidate_caches_once', NULL);
+		BEGIN;
+		DECLARE c CURSOR FOR SELECT id, v FROM s.t ORDER BY id;
+		FETCH 1 FROM c;
+		SELECT sum(v) FROM "postgres/b1".s.t;
+		SELECT sum(v) FROM s.t;
+		SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
+		WHERE attrelid = 's.t'::regclass AND attnum > 0 AND NOT attisdropped;
+		SELECT * FROM s.t WHERE id = 1;
+		COMMIT;
+		SELECT sum(v) FROM s.t;
+	});
+	my @l = split /\n/, $out;
+	is(join(' ', @l[-5 .. -1]), '1000 10 id,v 1|1 10',
+		'b1 read while caches are reset');
+	is($l[-6], '1|1', 'main\'s cursor read main\'s row');
+}
+
 $node->stop;
 done_testing();
