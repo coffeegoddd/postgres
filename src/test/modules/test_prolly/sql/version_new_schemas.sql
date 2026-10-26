@@ -1,7 +1,10 @@
 -- test_prolly.version_new_schemas (testing only): every schema made while
 -- it is on is versioned, however the CREATE SCHEMA runs, and so is the
--- schema CREATE EXTENSION makes for its control file.
+-- schema CREATE EXTENSION makes for its control file.  (In a database of
+-- its own: no other branch, as when a suite starts.)
 
+CREATE DATABASE regress_vns;
+\c regress_vns
 LOAD 'test_prolly';
 CREATE SCHEMA vns_off;
 SET test_prolly.version_new_schemas = on;
@@ -31,6 +34,12 @@ SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 -- the schema isn't the extension's, as without the setting
 DROP EXTENSION test_prolly_fixed;
 SELECT nspversioned FROM pg_namespace WHERE nspname = 'prolly_fixed';
+-- with another branch, the schema made versioned is only this branch's,
+-- and an extension in a versioned schema needs every branch to have it
+DROP SCHEMA prolly_fixed;
+SELECT dolt_branch('vns_other') IS NOT NULL AS made;
+CREATE EXTENSION test_prolly_fixed;
+SELECT count(*) FROM pg_namespace WHERE nspname = 'prolly_fixed';
 
 -- off again: plain schemas
 RESET test_prolly.version_new_schemas;
@@ -42,7 +51,6 @@ SET ROLE regress_vns_user;
 SET test_prolly.version_new_schemas = on;
 RESET ROLE;
 
-DROP FUNCTION vns_make(name), vns_static();
-DROP SCHEMA vns_off, vns_typed, vns_already, vns_elts, vns_executed,
-  vns_function, vns_static, vns_reset, prolly_fixed CASCADE;
+\c contrib_regression
+DROP DATABASE regress_vns;
 DROP ROLE regress_vns_user;

@@ -11,6 +11,11 @@
  * for stock Postgres, which makes schemas of its own, run with all its
  * tables versioned without rewriting it.
  *
+ * An extension is shared by every branch, so CREATE EXTENSION refuses a
+ * versioned schema some branch doesn't have: with the setting on, an
+ * extension whose schema is made for it installs only while the database
+ * has no other branch (as when a suite starts).
+ *
  * It is a ProcessUtility hook, so it takes effect in backends that have
  * loaded test_prolly: from shared_preload_libraries for a whole server, or
  * after LOAD in one session.  It is a testing aid only: Postgres has no
