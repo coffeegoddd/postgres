@@ -2229,7 +2229,7 @@ item_scalars(const ProllyKey *key, const ProllyValue *v, KeyList *kl)
 	keylist_add(kl, key->data, (int) key->len, v->data, (int) v->len);
 }
 
-static void
+static bool
 diff_change(ProllyDiffKind kind, const ProllyKey *key,
 			const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -2239,6 +2239,7 @@ diff_change(ProllyDiffKind kind, const ProllyKey *key,
 		item_scalars(key, before, &ds->from);
 	if (after)
 		item_scalars(key, after, &ds->to);
+	return true;
 }
 
 static void

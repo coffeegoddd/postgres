@@ -170,6 +170,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | cow            | counts_nodes                   | pass
  tree          | cow            | ranks                          | pass
  tree          | cow            | diff_reads_changed_paths       | pass
+ tree          | cow            | diff_stops                     | pass
  tree          | cow            | diff_across_heights            | pass
  tree          | cow            | diff_unordered_matches         | pass
  tree          | cow            | diff_estimate_bounds           | pass
@@ -193,6 +194,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | counts_nodes                   | not implemented (missing build_begin, build_add, build_finish, walk)
  tree          | stub           | ranks                          | not implemented (missing build_begin, build_add, build_finish, apply, get, count, rank)
  tree          | stub           | diff_reads_changed_paths       | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
+ tree          | stub           | diff_stops                     | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
  tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree          | stub           | diff_unordered_matches         | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff_unordered)
  tree          | stub           | diff_estimate_bounds           | not implemented (missing build_begin, build_add, build_finish, apply, diff_estimate)
@@ -290,7 +292,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  commit_cache  | shared         | complete                       | pass
  commit_cache  | stub           | identity                       | pass
  commit_cache  | stub           | complete                       | not implemented (5 of 5 callbacks missing)
-(220 rows)
+(222 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -310,6 +312,7 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | counts_nodes              | pass
  tree      | cow            | ranks                     | pass
  tree      | cow            | diff_reads_changed_paths  | pass
+ tree      | cow            | diff_stops                | pass
  tree      | cow            | diff_across_heights       | pass
  tree      | cow            | diff_unordered_matches    | pass
  tree      | cow            | diff_estimate_bounds      | pass
@@ -320,7 +323,7 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | held_references           | pass
  tree      | cow            | value_splices             | pass
  tree      | cow            | complete                  | pass
-(23 rows)
+(24 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

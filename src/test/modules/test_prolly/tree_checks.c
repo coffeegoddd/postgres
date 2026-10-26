@@ -694,7 +694,7 @@ typedef struct DiffSeen
 	int			changes;
 } DiffSeen;
 
-static void
+static bool
 check_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 			 const ProllyValue *after, void *arg)
 {
@@ -727,6 +727,7 @@ check_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 			elog(ERROR, "diff: key %d reported as not covered", k);
 			break;
 	}
+	return true;
 }
 
 void
@@ -775,7 +776,7 @@ tree_diff_reports_changes(const ProllyImplInfo *impl)
 }
 
 /* Counts changes and checks their order (diffs of unrelated trees). */
-static void
+static bool
 count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 			 const ProllyValue *after, void *arg)
 {
@@ -786,6 +787,7 @@ count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 		elog(ERROR, "diff reported key %d after key %d", k, s->last);
 	s->last = k;
 	s->changes++;
+	return true;
 }
 
 /*
@@ -1106,6 +1108,161 @@ tree_diff_reads_changed_paths(const ProllyImplInfo *impl)
 				 (unsigned long long) cnt.nodes_read, nodes.n + 1);
 	}
 	env.counters = NULL;
+}
+
+/* check_change(), and stop once stop_after changes are seen. */
+typedef struct StopSeen
+{
+	DiffSeen	seen;
+	int			stop_after;
+} StopSeen;
+
+static bool
+stop_change(ProllyDiffKind kind, const ProllyKey *key,
+			const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	StopSeen   *s = arg;
+
+	check_change(kind, key, before, after, &s->seen);
+	if (s->seen.changes > s->stop_after)
+		elog(ERROR, "diff reported change %d after its visitor stopped it at %d",
+			 s->seen.changes, s->stop_after);
+	return s->seen.changes < s->stop_after;
+}
+
+/*
+ * A diff stops where its visitor returns false: no change reported after
+ * it, and only the nodes up to it read.  Against the empty tree, where
+ * every key is a change, a diff stopped after a few reads a path to them,
+ * not the tree, both ways; one of modified keys spread over the tree
+ * stops in the same way; and diff_unordered(), where there is one, stops
+ * reporting.
+ */
+void
+tree_diff_stops(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *from = palloc(sizeof(Ref));
+	Ref		   *to = palloc(sizeof(Ref));
+	Ref		   *none = palloc(sizeof(Ref));
+	ProllyNodeRef rfrom;
+	ProllyNodeRef rto;
+	ProllyNodeRef rempty;
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+	int			keys[16];
+	int			versions[16];
+
+	make_env(&env);
+	fill_ref(from, 1, 1);
+	build_ref(tr, &env, from, &rfrom);
+	PROLLY_CALL(tr, walk, &env, &rfrom, collect_node, &nodes);
+	if (nodes.levels < 3 || nodes.n < 200)
+		elog(ERROR, "test tree has only %d nodes in %d levels", nodes.n, nodes.levels);
+	fill_ref(none, 1, ABSENT);
+	build_ref(tr, &env, none, &rempty);
+
+	for (int way = 0; way < 2; way++)
+		for (int stop = 1; stop <= 64; stop *= 4)
+		{
+			StopSeen	ss = {{way == 0 ? none : from, way == 0 ? from : none, -1, 0},
+			stop};
+			uint64		bound = 1 + 2 * nodes.levels + stop;
+
+			memset(&cnt, 0, sizeof(cnt));
+			env.counters = &cnt;
+			PROLLY_CALL(tr, diff, &env, way == 0 ? &rempty : &rfrom,
+						way == 0 ? &rfrom : &rempty, stop_change, &ss);
+			env.counters = NULL;
+			if (ss.seen.changes != stop)
+				elog(ERROR, "diff stopped at change %d reported %d", stop,
+					 ss.seen.changes);
+			if (cnt.nodes_read > bound)
+				elog(ERROR, "diff stopped at change %d of a tree of %d nodes read %llu nodes, more than %llu",
+					 stop, nodes.n, (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) bound);
+		}
+
+	/*
+	 * stopped at the last change, where the stop and the end meet: every
+	 * key reported, the whole tree read, as without a stop
+	 */
+	for (int way = 0; way < 2; way++)
+	{
+		StopSeen	ss = {{way == 0 ? none : from, way == 0 ? from : none, -1, 0},
+		MAX_KEY};
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		PROLLY_CALL(tr, diff, &env, way == 0 ? &rempty : &rfrom,
+					way == 0 ? &rfrom : &rempty, stop_change, &ss);
+		env.counters = NULL;
+		if (ss.seen.changes != MAX_KEY || cnt.nodes_read != (uint64) nodes.n + 1)
+			elog(ERROR, "diff stopped at its last change reported %d and read %llu nodes, expected %d and %d",
+				 ss.seen.changes, (unsigned long long) cnt.nodes_read, MAX_KEY,
+				 nodes.n + 1);
+	}
+
+	/*
+	 * modified keys spread over the tree, where both sides are read: stopped
+	 * at several of them, the last too, each reading no more than the whole
+	 * diff and fewer nodes the earlier it stops
+	 */
+	memcpy(to, from, sizeof(Ref));
+	rto = rfrom;
+	for (int i = 0; i < lengthof(keys); i++)
+	{
+		keys[i] = i * (MAX_KEY / lengthof(keys)) + 17;
+		versions[i] = 5;
+	}
+	apply_batch(tr, &env, to, keys, versions, lengthof(keys), &rto);
+	{
+		StopSeen	whole = {{from, to, -1, 0}, INT_MAX};
+		int			stops[] = {1, 2, 5, 8, 11, 15, lengthof(keys)};
+		uint64		whole_read;
+		uint64		last_read = 0;
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &whole);
+		whole_read = cnt.nodes_read;
+		if (whole.seen.changes != lengthof(keys))
+			elog(ERROR, "diff of %d modified keys reported %d",
+				 (int) lengthof(keys), whole.seen.changes);
+		for (int i = 0; i < lengthof(stops); i++)
+		{
+			StopSeen	ss = {{from, to, -1, 0}, stops[i]};
+
+			memset(&cnt, 0, sizeof(cnt));
+			PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &ss);
+			if (ss.seen.changes != stops[i])
+				elog(ERROR, "diff of %d modified keys stopped at %d reported %d",
+					 (int) lengthof(keys), stops[i], ss.seen.changes);
+			if (cnt.nodes_read > whole_read || cnt.nodes_read < last_read)
+				elog(ERROR, "diff stopped at %d of %d changes read %llu nodes (%llu stopped earlier, the whole diff %llu)",
+					 stops[i], (int) lengthof(keys),
+					 (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) last_read,
+					 (unsigned long long) whole_read);
+			if (stops[i] == 2 && cnt.nodes_read * 2 > whole_read)
+				elog(ERROR, "diff stopped at 2 of %d changes read %llu nodes, the whole diff %llu",
+					 (int) lengthof(keys), (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) whole_read);
+			last_read = cnt.nodes_read;
+		}
+		env.counters = NULL;
+	}
+
+	if (PROLLY_HAS(tr, diff_unordered))
+	{
+		StopSeen	ss = {{from, to, -1, 0}, 3};
+
+		PROLLY_CALL(tr, diff_unordered, &env, &rfrom, &rto, stop_change, &ss);
+		if (ss.seen.changes != 3)
+			elog(ERROR, "unordered diff stopped at change 3 reported %d",
+				 ss.seen.changes);
+	}
 }
 
 /*
@@ -1465,7 +1622,7 @@ typedef struct SpelledDiff
 	bool		right;
 } SpelledDiff;
 
-static void
+static bool
 check_spelled_change(ProllyDiffKind kind, const ProllyKey *key,
 					 const ProllyValue *before, const ProllyValue *after,
 					 void *arg)
@@ -1475,6 +1632,7 @@ check_spelled_change(ProllyDiffKind kind, const ProllyKey *key,
 	s->changes++;
 	s->right = kind == PROLLY_DIFF_MODIFIED && key->len == 5 &&
 		key->data[3] == 77 && key->data[4] == 1;
+	return true;
 }
 
 /*
@@ -1611,7 +1769,7 @@ typedef struct BigDiff
 	bool		values_ok;
 } BigDiff;
 
-static void
+static bool
 big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 			   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -1628,6 +1786,7 @@ big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->values_ok &= after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+	return true;
 }
 
 /* Whether reading [offset, offset + len) of ref fails as corrupted. */
@@ -2146,7 +2305,7 @@ typedef struct HeldDiff
 	bool		ok;
 } HeldDiff;
 
-static void
+static bool
 held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 				const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -2162,6 +2321,7 @@ held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->ok &= after && after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+	return true;
 }
 
 /* A prefetch hint: the chunks heard, into a HashSet. */
