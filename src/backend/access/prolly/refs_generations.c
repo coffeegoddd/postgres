@@ -1047,6 +1047,10 @@ branch_generations_moved_databases(Oid *databases, int max)
  * their count.  The entries are few and fixed in number, so the work
  * doesn't grow with the number of branches.  Without shared memory, none.
  */
+/* (a caller's array of BRANCH_FOLD_KNOWN_MAX holds every entry's) */
+StaticAssertDecl(BRANCH_FOLD_KNOWN_MAX >= BRANCH_GENERATIONS,
+				 "BRANCH_FOLD_KNOWN_MAX must cover the generation table");
+
 int
 branch_fold_known_branches(Oid *branches, int max)
 {

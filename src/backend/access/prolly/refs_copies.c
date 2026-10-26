@@ -464,6 +464,7 @@ static void put_records_again(const ProllyNodeRef *mine, ScopedEdits *se);
 static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
+static void forget_read_caches(void);
 static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
@@ -916,6 +917,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			scoped_records = NIL;
 			scoped_pending = NIL;
 			pending_cxt = NULL; /* (TopTransactionContext's: gone) */
+			forget_read_caches();
 			break;
 		default:
 			break;
@@ -954,6 +956,76 @@ static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+/*
+ * The branch kept_get() read last, and the index entries of its kept
+ * commits then (in kept_read_cxt): kept_put() of it after takes them,
+ * the caller having changed the list read in place.  Forgotten by every
+ * kept_put(), so a write in between makes it read the entry again.
+ */
+static MemoryContext kept_read_cxt = NULL;
+static char *kept_read_name = NULL;
+static List *kept_read_keys = NIL;
+
+/*
+ * The branch branch_set_baseline() wrote, or a read of its 'W' found, last,
+ * and the root of its baseline's fold then (have_root false: none): the
+ * next baseline set of it changes the root's index from there, without
+ * reading 'W' again.  In TopMemoryContext.
+ */
+static char *baseline_seen_name = NULL;
+static bool baseline_seen_have;
+static ProllyNodeRef baseline_seen_root;
+
+/*
+ * Forget what was read of the refs, as a transaction ends or a
+ * subtransaction rolls back: another session may change them before this
+ * one reads them next, or the rollback undid what was written.
+ */
+static void
+baseline_seen_set(const char *name, bool have_root, const ProllyHash *root)
+{
+	if (baseline_seen_name == NULL || strcmp(baseline_seen_name, name) != 0)
+	{
+		if (baseline_seen_name != NULL)
+			pfree(baseline_seen_name);
+		baseline_seen_name = MemoryContextStrdup(TopMemoryContext, name);
+	}
+	baseline_seen_have = have_root;
+	if (have_root)
+		ref_of(root, &baseline_seen_root);
+}
+
+/* A 'W' value's fold root, noted as seen (the entry found or not). */
+static void
+baseline_seen_value(const char *name, const StringInfoData *v, bool found)
+{
+	ProllyHash	h;
+	const char *p;
+
+	if (!found)
+	{
+		baseline_seen_set(name, false, NULL);
+		return;
+	}
+	p = get_hash(v->data, v->data + v->len, &h);
+	if (p < v->data + v->len)
+	{
+		get_hash(p, v->data + v->len, &h);
+		baseline_seen_set(name, h.len > 0, &h);
+	}
+	else
+		baseline_seen_set(name, false, NULL);
+}
+
+static void
+forget_read_caches(void)
+{
+	kept_read_name = NULL;
+	if (baseline_seen_name != NULL)
+		pfree(baseline_seen_name);
+	baseline_seen_name = NULL;
 }
 
 /* ------------------------------------------------------------------------
@@ -1038,6 +1110,9 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	int			level = GetCurrentTransactionNestLevel();
 	ScopedSave *last;
 
+	/* (what a rolled-back subtransaction read or wrote is no longer so) */
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		forget_read_caches();
 	if (scoped_saved == NIL)
 		return;
 	last = llast(scoped_saved);
@@ -2060,8 +2135,39 @@ head_root_get(const char *name, ProllyHash *root)
 }
 
 /*
- * Index branch name's head (NULL: none) by its root, and its name case
- * folded while it has one: its entries changed only if they change.
+ * Fold branch name's name into the case-folded index (present) or take it
+ * out: as the branch is made (with a head or not), renamed and deleted.
+ */
+static void
+folded_index_set(const char *name, bool present)
+{
+	StringInfoData key;
+
+	initStringInfo(&key);
+	folded_key(&key, name);
+	index_put(&key, present);
+	pfree(key.data);
+}
+
+/* The same, put only if it isn't there. */
+static void
+folded_index_note(const char *name)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	folded_key(&key, name);
+	if (!refs_get(key.data, key.len, &v))
+		index_put(&key, true);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
+ * Index branch name's head (NULL: none) by its root: its entries changed
+ * only if they change.
  */
 static void
 head_index_set(const char *name, const ProllyHash *head)
@@ -2098,12 +2204,13 @@ head_index_set(const char *name, const ProllyHash *head)
 		appendStringInfoString(&key, name);
 		refs_put(key.data, key.len, NULL);
 	}
-	resetStringInfo(&key);
-	folded_key(&key, name);
-	if (head == NULL)
-		index_put(&key, false);
-	else if (!refs_get(key.data, key.len, &v))
-		index_put(&key, true);
+	/*
+	 * (a branch first given a head here, by a fetch, a clone or a push,
+	 * may have been made by none of the paths that fold its name: one with
+	 * a head already has it)
+	 */
+	if (head != NULL && !had)
+		folded_index_note(name);
 	pfree(key.data);
 	pfree(v.data);
 }
@@ -2292,8 +2399,9 @@ branch_baseline(const char *name, ProllyNodeRef *baseline)
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
 	appendStringInfoString(&key, name);
-	found = refs_get(key.data, key.len, &v) &&
-		get_hash(v.data, v.data + v.len, &h) && h.len > 0;
+	found = refs_get(key.data, key.len, &v);
+	baseline_seen_value(name, &v, found);
+	found = found && get_hash(v.data, v.data + v.len, &h) && h.len > 0;
 	if (found)
 		ref_of(&h, baseline);
 	pfree(key.data);
@@ -2324,6 +2432,7 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 	{
 		const char *p = get_hash(v.data, v.data + v.len, &h);
 
+		baseline_seen_value(name, &v, true);
 		if (p < v.data + v.len)
 		{
 			get_hash(p, v.data + v.len, &h);
@@ -2332,6 +2441,8 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 				ref_of(&h, root);
 		}
 	}
+	else
+		baseline_seen_value(name, &v, false);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -2363,8 +2474,17 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 		return;
 	}
 	xid = baseline ? GetTopFullTransactionId() : InvalidFullTransactionId;
-	had = branch_baseline_root(name, &was);
+	/* (the fold root it had, as last read or written in the transaction) */
+	if (baseline_seen_name != NULL && strcmp(baseline_seen_name, name) == 0)
+	{
+		had = baseline_seen_have;
+		was = baseline_seen_root;
+	}
+	else
+		had = branch_baseline_root(name, &was);
 	baseline_index_set(name, had ? &was : NULL, baseline != NULL ? root : NULL);
+	baseline_seen_set(name, baseline != NULL && root != NULL,
+					  baseline != NULL && root != NULL ? &root->hash : NULL);
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -3111,15 +3231,6 @@ static List *kept_get(const char *name);
 static void kept_put(const char *name, List *kept);
 static List *kept_index_keys(const char *name, List *kept);
 
-/*
- * The branch kept_get() read last, and the index entries of its kept
- * commits then (in kept_read_cxt): kept_put() of it after takes them,
- * the caller having changed the list read in place.  Forgotten by every
- * kept_put(), so a write in between makes it read the entry again.
- */
-static MemoryContext kept_read_cxt = NULL;
-static char *kept_read_name = NULL;
-static List *kept_read_keys = NIL;
 static int	kept_carried(List *kept, const struct KeptCommit *was,
 						 const char *name, BranchKeptRelation **carry,
 						 BranchKeptRelation ***into);
@@ -7669,6 +7780,11 @@ refuse_other_case(const char *name, const char *ignore)
 	prefix.len -= strlen(name);
 	visit_prefix(prefix.data, prefix.len, find_other_case, &oc);
 	pfree(prefix.data);
+	/* (main, which no path makes, is there from the database's start) */
+	if (oc.found == NULL && strcmp(name, "main") != 0 &&
+		(ignore == NULL || strcmp(ignore, "main") != 0) &&
+		pg_strcasecmp(name, "main") == 0 && branch_exists("main"))
+		oc.found = pstrdup("main");
 	if (oc.found)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -7733,6 +7849,7 @@ copies_branch_create(const char *name, const char *start_point)
 			branch_ops()->create(name, from);
 			branch_set_baseline(name, branch_baseline(from, &baseline) ?
 								&baseline : NULL, NULL);
+			folded_index_set(name, true);
 			return;
 		}
 		ereport(ERROR,
@@ -7743,7 +7860,7 @@ copies_branch_create(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("branch or commit \"%s\" does not exist", from)));
-	branch_set_head(name, &id);
+	branch_set_head(name, &id);	/* (its name folded with its head) */
 	branch_set_baseline(name, NULL, NULL);
 	/* (and its start point's records of its relations, of that head) */
 	if (from_exists)
@@ -7817,8 +7934,15 @@ copies_branch_delete(const char *name, bool force)
 		pfree(key.data);
 	}
 	maker_put(TAG_CREATOR, name, InvalidOid);
-	/* (and the commits its pages were kept as of: they went with them) */
+	/*
+	 * (and the commits its pages were kept as of: they went with them, the
+	 * entry read first, for the indexes of what it holds now; and its name
+	 * folded)
+	 */
+	(void) kept_get(name);
 	kept_put(name, NIL);
+	folded_index_set(name, false);
+	forget_read_caches();
 }
 
 /*
@@ -7889,6 +8013,8 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	kept_put(name, NIL);
 	head_index_set(name, NULL);
 	baseline_index_set(name, had_root ? &root : NULL, NULL);
+	folded_index_set(name, false);
+	forget_read_caches();
 	for (int i = 0; i < lengthof(tags); i++)
 	{
 		StringInfoData key;
@@ -7926,6 +8052,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		head_index_set(newname, &head);
 	if (had_root)
 		baseline_index_set(newname, NULL, &root);
+	folded_index_set(newname, true);
 	/* (a merge state the transaction set is checked under the new name) */
 	foreach(lc, merge_changed)
 	{

@@ -151,28 +151,43 @@ CREATE FUNCTION pg_temp.ix() RETURNS TABLE (tag text, branch text, keyed text,
 	value text) LANGUAGE sql AS $$ SELECT * FROM test_refs_index() $$;
 CREATE FUNCTION pg_temp.check_ix() RETURNS TABLE (problem text, n int8)
 LANGUAGE sql AS $$
-	WITH b AS (SELECT name FROM dolt_branches() WHERE hash IS NOT NULL)
+	WITH b AS (SELECT name FROM dolt_branches() WHERE hash IS NOT NULL),
+	ix AS (SELECT * FROM test_refs_index()),
+	w AS (SELECT b.name, encode(substring(v FROM 23 FOR 20), 'hex') AS root
+		  FROM b, LATERAL test_refs_value('W' || b.name) v WHERE length(v) >= 42),
+	live AS (SELECT b.name, kc.commit_id FROM b, LATERAL test_kept_commits(b.name) kc)
 	SELECT 'head root not indexed', count(*) FROM b
-	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'h' AND i.branch = b.name
+	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'h' AND i.branch = b.name
 		AND i.value = '14' || prolly_root_hash(b.name))
 	UNION ALL
-	SELECT 'root index without its head', count(*) FROM pg_temp.ix() r
+	SELECT 'root index without its head', count(*) FROM ix r
 	WHERE r.tag = 'r' AND right(r.keyed, 2) = '68' AND NOT EXISTS (
-		SELECT FROM pg_temp.ix() h WHERE h.tag = 'h' AND h.branch = r.branch
+		SELECT FROM ix h WHERE h.tag = 'h' AND h.branch = r.branch
 		AND r.keyed = h.value || '68')
 	UNION ALL
+	SELECT 'baseline root not indexed', count(*) FROM w
+	WHERE NOT EXISTS (SELECT FROM ix r WHERE r.tag = 'r' AND r.branch = w.name
+		AND r.keyed = '14' || w.root || '77')
+	UNION ALL
+	SELECT 'root index without its baseline', count(*) FROM ix r
+	WHERE r.tag = 'r' AND right(r.keyed, 2) = '77' AND NOT EXISTS (
+		SELECT FROM w WHERE w.name = r.branch AND r.keyed = '14' || w.root || '77')
+	UNION ALL
 	SELECT 'name not folded', count(*) FROM b
-	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'f' AND i.branch = b.name
+	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'f' AND i.branch = b.name
 		AND i.keyed = lower(b.name))
 	UNION ALL
-	SELECT 'index of no branch', count(*) FROM pg_temp.ix() i
-	WHERE i.tag IN ('h', 'f', 'r') AND NOT EXISTS (SELECT FROM b WHERE b.name = i.branch)
+	SELECT 'index of no branch', count(*) FROM ix i
+	WHERE NOT EXISTS (SELECT FROM b WHERE b.name = i.branch)
 		AND i.branch NOT LIKE 'detached/%'
 	UNION ALL
-	SELECT 'kept commit not indexed', count(*)
-	FROM b, LATERAL test_kept_commits(b.name) kc
-	WHERE NOT EXISTS (SELECT FROM pg_temp.ix() i WHERE i.tag = 'k' AND i.branch = b.name
-		AND i.keyed = '14' || kc.commit_id)
+	SELECT 'kept commit not indexed', count(*) FROM live
+	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'k' AND i.branch = live.name
+		AND i.keyed = '14' || live.commit_id)
+	UNION ALL
+	SELECT 'kept index of no live kept commit', count(*) FROM ix i
+	WHERE i.tag IN ('k', 's') AND NOT EXISTS (SELECT FROM live
+		WHERE live.name = i.branch AND right(i.keyed, 40) = live.commit_id)
 	ORDER BY 1
 $$;
 SELECT * FROM pg_temp.check_ix();
@@ -218,6 +233,27 @@ SELECT tag, keyed = lower(branch) AS folded FROM pg_temp.ix()
 WHERE branch = 'bix_moved' AND tag IN ('f', 'k', 's') ORDER BY tag;
 SELECT * FROM pg_temp.check_ix();
 
+-- A kept commit read in a transaction that rolls back, then the branch
+-- deleted: the delete reads the branch's kept commits again (what was
+-- read is forgotten as the transaction ends), so none of their index
+-- entries is left for a branch made again of the name.
+SELECT dolt_branch('bix_kc') IS NOT NULL AS made;
+SELECT (dolt_checkout('bix_kc'))[1];
+UPDATE bix.t SET v = v + 1 WHERE id = 5;
+SELECT length(dolt_commit('-am', 'kc')::text) > 0 AS committed;
+SELECT (dolt_checkout('main'))[1];
+BEGIN;
+SELECT (dolt_checkout('bix_kc'))[1];
+UPDATE bix.t SET v = v + 1 WHERE id = 6;
+SELECT length(dolt_commit('-am', 'kc rolled back')::text) > 0 AS committed;
+SELECT count(*) > 0 AS kept FROM test_kept_commits('bix_kc');
+SELECT (dolt_checkout('main'))[1];
+ROLLBACK;
+SELECT count(*) > 0 AS kept_indexed FROM pg_temp.ix() WHERE branch = 'bix_kc' AND tag = 'k';
+SELECT dolt_branch('-D', 'bix_kc') IS NOT NULL AS deleted;
+SELECT count(*) AS left_of_deleted FROM pg_temp.ix() WHERE branch = 'bix_kc';
+SELECT * FROM pg_temp.check_ix();
+
 -- Many commits in one transaction: the kept commits each retires pile up
 -- in the branch's 'K' entry until a later transaction lets go of them,
 -- but only the live ones are indexed, so each commit's upkeep of the
@@ -242,5 +278,22 @@ SELECT count(*) AS main_kept_indexed FROM pg_temp.ix() WHERE tag = 'k' AND branc
 SELECT :per_commit_400 <= 1.5 * :per_commit_100 AS written_flat;
 SELECT * FROM pg_temp.check_ix();
 
+-- The case check sees branches without a head too: in a database with
+-- no commits, a branch is made with copies alone, and main has no head.
+-- A rename moves the folded name, and a delete takes it out.
 \c :home
 DROP DATABASE branch_index_work;
+CREATE DATABASE branch_index_case;
+\c branch_index_case
+SELECT dolt_branch('feat') IS NOT NULL AS made;
+SELECT dolt_branch('FEAT');
+SELECT dolt_branch('MAIN');
+SELECT dolt_branch('-m', 'feat', 'Main');
+SELECT dolt_branch('-m', 'feat', 'feat2') IS NOT NULL AS renamed;
+SELECT dolt_branch('FEAT') IS NOT NULL AS made_after_rename;
+SELECT dolt_branch('Feat2');
+SELECT dolt_branch('-D', 'feat2') IS NOT NULL AS deleted;
+SELECT dolt_branch('FEAT2') IS NOT NULL AS made_after_delete;
+SELECT name FROM dolt_branches() ORDER BY name;
+\c :home
+DROP DATABASE branch_index_case;
