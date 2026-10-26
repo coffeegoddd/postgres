@@ -66,6 +66,7 @@ OBJS = \
 	prolly_table.o \
 	prolly_dolt.o \
 	prolly_snapshot.o \
+	prolly_revision.o \
 	prolly_vcs.o \
 	prolly_autovacuum.o \
 	reclaim_copying.o \

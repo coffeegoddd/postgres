@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/prolly_revision.h"
 #include "access/parallel.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -459,11 +460,9 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	if (relation->catalogname)
 	{
 		if (strcmp(relation->catalogname, get_database_name(MyDatabaseId)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
-							relation->catalogname, relation->schemaname,
-							relation->relname)));
+			prolly_check_catalog_name(relation->catalogname,
+									  psprintf("\"%s.%s.%s\"", relation->catalogname,
+											   relation->schemaname, relation->relname));
 	}
 
 	/*
@@ -663,11 +662,9 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
 	if (newRelation->catalogname)
 	{
 		if (strcmp(newRelation->catalogname, get_database_name(MyDatabaseId)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
-							newRelation->catalogname, newRelation->schemaname,
-							newRelation->relname)));
+			prolly_check_catalog_name(newRelation->catalogname,
+									  psprintf("\"%s.%s.%s\"", newRelation->catalogname,
+											   newRelation->schemaname, newRelation->relname));
 	}
 
 	if (newRelation->schemaname)
@@ -755,11 +752,9 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 	if (relation->catalogname)
 	{
 		if (strcmp(relation->catalogname, get_database_name(MyDatabaseId)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
-							relation->catalogname, relation->schemaname,
-							relation->relname)));
+			prolly_check_catalog_name(relation->catalogname,
+									  psprintf("\"%s.%s.%s\"", relation->catalogname,
+											   relation->schemaname, relation->relname));
 	}
 
 	/*
@@ -3397,10 +3392,7 @@ DeconstructQualifiedName(const List *names,
 			 * We check the catalog name and then ignore it.
 			 */
 			if (strcmp(catalogname, get_database_name(MyDatabaseId)) != 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cross-database references are not implemented: %s",
-								NameListToString(names))));
+				prolly_check_catalog_name(catalogname, NameListToString(names));
 			break;
 		default:
 			ereport(ERROR,

@@ -31,6 +31,7 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -787,6 +788,18 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	/* if it returns a set, check that's OK */
 	if (retset)
 		check_srf_call_placement(pstate, last_srf, location);
+
+	/*
+	 * A revision's table is read only through its name, which the parser
+	 * makes a call of its own: a call written so would choose the role its
+	 * privileges are checked as.
+	 */
+	if (funcid == F_PROLLY_REVISION_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("prolly_revision_table() can't be called directly"),
+				 errhint("Name the table as \"database/revision\".schema.table."),
+				 parser_errposition(pstate, location)));
 
 	/* build the appropriate output structure */
 	if (fdresult == FUNCDETAIL_NORMAL || fdresult == FUNCDETAIL_PROCEDURE)

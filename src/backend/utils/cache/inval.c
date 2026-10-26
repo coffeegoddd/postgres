@@ -117,6 +117,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
@@ -796,6 +797,13 @@ static void call_all_invalidation_callbacks(void);
 void
 InvalidateSystemCachesExtended(bool debug_discard)
 {
+	/* (the session's entries rebuilt from its own branch's rows) */
+	if (unlikely(OidIsValid(CatalogReadBranch)))
+	{
+		CATALOG_READ_ON_BRANCH(InvalidOid,
+							   InvalidateSystemCachesExtended(debug_discard));
+		return;
+	}
 	InvalidateCatalogSnapshot();
 	ResetCatalogCachesExt(debug_discard);
 	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
@@ -973,6 +981,17 @@ InvalidateSystemCaches(void)
 void
 AcceptInvalidationMessages(void)
 {
+	/*
+	 * While another branch's catalogs are being read, the messages are still
+	 * the session's: the entries they rebuild are rebuilt from the session
+	 * branch's rows.
+	 */
+	if (unlikely(OidIsValid(CatalogReadBranch)))
+	{
+		CATALOG_READ_ON_BRANCH(InvalidOid, AcceptInvalidationMessages());
+		return;
+	}
+
 #ifdef USE_ASSERT_CHECKING
 	/* message handlers shall access catalogs only during transactions */
 	if (IsTransactionState())

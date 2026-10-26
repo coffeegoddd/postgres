@@ -21,6 +21,7 @@
 
 #include "access/amapi.h"
 #include "access/htup_details.h"
+#include "access/prolly_revision.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -4568,6 +4569,16 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	 */
 	if (rte->rtekind == RTE_RELATION)
 		colinfo->printaliases = changed_any;
+	/*
+	 * A revision's table is printed as its name, which is parsed to the
+	 * columns the revision has then, read by name: a list of every column
+	 * (by position) would rename whichever the table has then.  Where the
+	 * user wrote aliases, or names are changed here, get_from_clause_item()
+	 * renames each column by its name in a subquery instead.
+	 */
+	else if (prolly_revision_rte(rte))
+		colinfo->printaliases = changed_any ||
+			(rte->alias && rte->alias->colnames != NIL);
 	else if (rte->rtekind == RTE_FUNCTION)
 		colinfo->printaliases = true;
 	else if (rte->rtekind == RTE_TABLEFUNC)
@@ -12624,6 +12635,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		RangeTblEntry *rte = rt_fetch(varno, query->rtable);
 		deparse_columns *colinfo = deparse_columns_fetch(varno, dpns);
 		RangeTblFunction *rtfunc1 = NULL;
+		bool		revision_renamed = false;
 
 		if (rte->lateral)
 			appendStringInfoString(buf, "LATERAL ");
@@ -12648,6 +12660,46 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				appendStringInfoChar(buf, ')');
 				break;
 			case RTE_FUNCTION:
+				/* a revision's table: its name, which is parsed to the call */
+				if (prolly_revision_rte(rte))
+				{
+					RangeTblFunction *rtf = linitial(rte->functions);
+					ListCell   *lc;
+					int			i = 0;
+
+					if (!colinfo->printaliases)
+					{
+						appendStringInfoString(buf, prolly_revision_rte_name(rte));
+						break;
+					}
+
+					/*
+					 * Its columns renamed: a list of names would be applied
+					 * by position to the columns the table has when parsed
+					 * again, which the branch may have changed, so each is
+					 * renamed by its name in a subquery instead.
+					 */
+					appendStringInfoString(buf, "(SELECT ");
+					foreach(lc, rtf->funccolnames)
+					{
+						char	   *real = strVal(lfirst(lc));
+						char	   *shown = i < colinfo->num_cols && colinfo->colnames[i] ?
+							colinfo->colnames[i] : real;
+
+						if (i > 0)
+							appendStringInfoString(buf, ", ");
+						appendStringInfoString(buf, quote_identifier(real));
+						if (strcmp(real, shown) != 0)
+							appendStringInfo(buf, " AS %s", quote_identifier(shown));
+						i++;
+					}
+					appendStringInfo(buf, " FROM %s)", prolly_revision_rte_name(rte));
+					/* (the subquery's alias is needed; no column list after it) */
+					appendStringInfo(buf, " %s",
+									 quote_identifier(get_rtable_name(varno, context)));
+					revision_renamed = true;
+					break;
+				}
 				/* Function RTE */
 				rtfunc1 = (RangeTblFunction *) linitial(rte->functions);
 
@@ -12760,10 +12812,13 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		}
 
 		/* Print the relation alias, if needed */
-		get_rte_alias(rte, varno, false, context);
+		if (!revision_renamed)
+			get_rte_alias(rte, varno, false, context);
 
 		/* Print the column definitions or aliases, if needed */
-		if (rtfunc1 && rtfunc1->funccolnames != NIL)
+		if (revision_renamed)
+			;					/* (named in its subquery) */
+		else if (rtfunc1 && rtfunc1->funccolnames != NIL)
 		{
 			/* Reconstruct the columndef list, which is also the aliases */
 			get_from_clause_coldeflist(rtfunc1, colinfo, context);

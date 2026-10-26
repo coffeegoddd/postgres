@@ -48,6 +48,10 @@ AssertCouldGetRelation(void)
 extern Relation RelationIdGetRelation(Oid relationId);
 extern void RelationClose(Relation relation);
 
+/* another branch's copy of a versioned relation */
+extern Relation RelationIdGetBranchRelation(Oid relid, Oid branch);
+extern void RelationCloseBranchRelation(Relation relation);
+
 /*
  * Routines to compute/retrieve additional cached information
  */

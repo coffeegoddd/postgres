@@ -58,6 +58,31 @@ extern PGDLLIMPORT bool BranchCreateOnBehalf;
 extern PGDLLIMPORT bool CatalogAllBranches;
 
 /*
+ * While valid, a versioned object's catalog rows are read as this branch has
+ * them rather than as the session's does: to describe another branch's copy
+ * of a relation, which a query reads without checking the branch out.  The
+ * catalog caches of branch-aware catalogs hold the session branch's rows, so
+ * a lookup in one meanwhile reads the catalog and keeps nothing; a list
+ * lookup in one is refused.  Set it only with CATALOG_READ_ON_BRANCH().
+ */
+extern PGDLLIMPORT Oid CatalogReadBranch;
+
+#define CATALOG_READ_ON_BRANCH(branch, ...) \
+	do { \
+		Oid			read_saved_ = CatalogReadBranch; \
+		CatalogReadBranch = (branch); \
+		PG_TRY(_onbranch); \
+		{ \
+			__VA_ARGS__; \
+		} \
+		PG_FINALLY(_onbranch); \
+		{ \
+			CatalogReadBranch = read_saved_; \
+		} \
+		PG_END_TRY(_onbranch); \
+	} while (0)
+
+/*
  * Writes to a branch's versioned objects: rows of a versioned table or
  * sequence, or a versioned object's catalog rows.  The first write of each
  * branch in a transaction is noted (and again after a subtransaction that

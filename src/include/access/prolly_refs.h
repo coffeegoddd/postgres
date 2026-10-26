@@ -878,6 +878,25 @@ typedef struct ProllyRefsRoutine
 	 * would outlive its commit.
 	 */
 	bool		(*forget_records) (void);
+
+	/*
+	 * Optional: the transaction is to read branch name's copies (branch, its
+	 * OID) as its snapshot has them, without checking the branch out (a
+	 * query naming the branch's tables).  Refused, with a serialization
+	 * failure, where checking it out would be: the transaction's snapshot
+	 * can't move, and doesn't see the branch's first use, or a move that
+	 * gave its tables the pages kept as of its head.
+	 */
+	void		(*check_copies_read) (const char *name, Oid branch);
+
+	/*
+	 * Optional: visit the branches whose names are name but for case
+	 * (ASCII), name itself too if it is one, as branches() visits them but
+	 * with an empty head: the work is in those, however many branches there
+	 * are.
+	 */
+	void		(*branches_folded) (const char *name, ProllyBranchVisit visit,
+									void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -939,9 +958,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
-	"forget_records"
+	"forget_records", "check_copies_read", "branches_folded"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK forget_records
+#define PROLLY_REFS_LAST_CALLBACK branches_folded
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
