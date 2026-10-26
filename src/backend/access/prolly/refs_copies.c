@@ -1057,7 +1057,7 @@ struct ScopedEdits
 	int			max;
 };
 
-static void
+static bool
 collect_edit(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -1087,6 +1087,7 @@ collect_edit(ProllyDiffKind kind, const ProllyKey *key,
 		e->value.data = v;
 		e->value.len = after->len;
 	}
+	return true;
 }
 
 /*
@@ -2498,11 +2499,56 @@ same_table(const NamedTree *a, const NamedTree *b)
 		memcmp(a->description, b->description, a->description_len) == 0;
 }
 
-static void
+/* A count of a diff's changes, which stops the diff at max of them. */
+typedef struct ChangeCount
+{
+	uint64		n;
+	uint64		max;
+} ChangeCount;
+
+static bool
 count_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
-	(*(uint64 *) arg)++;
+	ChangeCount *c = arg;
+
+	return ++c->n < c->max;
+}
+
+/*
+ * How many keys from and to differ by, but no more than max: the diff
+ * stops at the max'th change, having read only the nodes up to it, so a
+ * caller that compares the count with a bound reads O((bound + 1) log n)
+ * nodes however far apart the trees are.
+ */
+static uint64
+count_diff_upto(const ProllyNodeRef *from, const ProllyNodeRef *to,
+				uint64 max)
+{
+	ProllyTreeEnv denv;
+	ChangeCount c = {0, max};
+
+	if (max == 0 || same_hash(&from->hash, &to->hash))
+		return 0;
+	prolly_folded_tree_env(&denv);
+	PROLLY_CALL(tree, diff, &denv, from, to, count_change, &c);
+	return c.n;
+}
+
+/* The fewest rows whose writing (MOVE_ROW_USEC each) costs more than usec. */
+static uint64
+rows_costing_more(double usec)
+{
+	uint64		n;
+
+	if (!(usec < (double) PG_INT64_MAX / MOVE_ROW_USEC))
+		return PG_UINT64_MAX;
+	n = usec > 0 ? (uint64) (usec / MOVE_ROW_USEC) : 0;
+	while (n > 0 && (double) (n - 1) * MOVE_ROW_USEC > usec)
+		n--;
+	while ((double) n * MOVE_ROW_USEC <= usec)
+		n++;
+	return n;
 }
 
 /*
@@ -2762,7 +2808,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	List	   *chosen = NIL;	/* NamedTree *, then each one's relations */
 	List	   *relations = NIL;
 	List	   *from = NIL;		/* and its source */
-	ProllyTreeEnv denv;
 	ProllyNodeRef baseline;
 	ProllyNodeRef next;
 	ListCell   *a;
@@ -2790,14 +2835,14 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
 		return false;
-	prolly_folded_tree_env(&denv);
 	forboth(a, ours, b, theirs)
 	{
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
 		ShareSource *s;
-		uint64		changes = 0;
+		uint64		changes;
 		uint64		blocks;
+		double		share_usec;
 		Oid			relid;
 		List	   *relids;
 
@@ -2812,11 +2857,12 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
-		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
-					&changes);
-		if ((double) changes * MOVE_ROW_USEC <=
-			(double) list_length(relids) * SHARE_RELATION_USEC +
-			(double) blocks / SHARE_BLOCKS_PER_USEC)
+		share_usec = (double) list_length(relids) * SHARE_RELATION_USEC +
+			(double) blocks / SHARE_BLOCKS_PER_USEC;
+		/* (counted only as far as the rows that cost more than sharing) */
+		changes = count_diff_upto(&o->data, &t->data,
+								  rows_costing_more(share_usec));
+		if ((double) changes * MOVE_ROW_USEC <= share_usec)
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
@@ -3750,19 +3796,6 @@ other_snapshots(void)
 	return found;
 }
 
-static uint64
-count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
-{
-	ProllyTreeEnv denv;
-	uint64		changes = 0;
-
-	if (same_hash(&from->hash, &to->hash))
-		return 0;
-	prolly_folded_tree_env(&denv);
-	PROLLY_CALL(tree, diff, &denv, from, to, count_change, &changes);
-	return changes;
-}
-
 /*
  * The relations of table name as the other commits of kept (but was, and
  * those retired) keep them: copies into *carry, and where each is into
@@ -3807,6 +3840,90 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
 }
 
 /*
+ * The first count at which head_pages_pay() asks the change finder about
+ * L: the rows a head and the commit a move goes to differ by are often a
+ * few thousand, counted before it asks.
+ */
+#define HEAD_PAGES_FIRST_BOUND	4096
+
+/* a + b, or the largest count if that overflows. */
+static uint64
+add_upto(uint64 a, uint64 b)
+{
+	return b > PG_UINT64_MAX - a ? PG_UINT64_MAX : a + b;
+}
+
+/*
+ * Whether fewer than limit of table relid's rows changed since baseline,
+ * as the change finder tells (false where it can't); a limit past what it
+ * takes is its largest.
+ */
+static bool
+fewer_since(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
+			Oid relid, uint64 limit)
+{
+	ProllyNodeRef data;
+
+	return dc->canonicalizer->table_fewer_changes(baseline, relid,
+												  (int) Min(limit, PG_INT32_MAX),
+												  &data);
+}
+
+/*
+ * A count of a diff for head_pages_pay(), in one walk: at each bound past
+ * offset (H for B, none for H) it asks the change finder whether L is
+ * fewer than the bound (twice it and one more for H), stopping the diff
+ * where that settles the decision, or doubles the bound.  So the diff is
+ * read once, never further than counted whole, and the finder's record no
+ * further than about twice the last bound.
+ */
+typedef struct HeadPagesCount
+{
+	const ProllyDatabaseComponents *dc;
+	const ProllyNodeRef *baseline;
+	Oid			relid;
+	uint64		offset;
+	bool		twice;
+	uint64		bound;
+	uint64		n;				/* the changes counted */
+	bool		settled;		/* the finder said fewer: the diff stopped */
+} HeadPagesCount;
+
+static bool
+head_pages_change(ProllyDiffKind kind, const ProllyKey *key,
+				  const ProllyValue *before, const ProllyValue *after,
+				  void *arg)
+{
+	HeadPagesCount *c = arg;
+
+	if (++c->n < add_upto(c->offset, c->bound))
+		return true;
+	if (fewer_since(c->dc, c->baseline, c->relid,
+					c->twice ? add_upto(2 * c->bound, 1) : c->bound))
+	{
+		c->settled = true;
+		return false;
+	}
+	c->bound = add_upto(c->bound, c->bound);
+	return true;
+}
+
+static void
+head_pages_count(HeadPagesCount *c, const ProllyNodeRef *from,
+				 const ProllyNodeRef *to)
+{
+	ProllyTreeEnv denv;
+
+	c->bound = HEAD_PAGES_FIRST_BOUND;
+	c->n = 0;
+	c->settled = false;
+	if (same_hash(&from->hash, &to->hash))
+		return;
+	prolly_folded_tree_env(&denv);
+	PROLLY_CALL(tree, diff, &denv, from, to, head_pages_change, c);
+}
+
+/*
  * Would giving table relid the pages kept as of the head (its rows there,
  * head) and then writing the rows the head and the move's commit (target)
  * differ by cost less than writing the rows the working set and the
@@ -3820,11 +3937,15 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
  * - the baseline holds other rows (a fold since the head, the fold
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
- * A count the change finder can't give counts as large.  And not while
- * another backend on the branch holds a snapshot (other_snapshots(): an
- * open REPEATABLE READ transaction, a statement running): a restore isn't
- * MVCC-safe, and
- * such a snapshot, taken before the move commits, would read the head's
+ * A count the change finder can't give counts as large.  B, and H where
+ * the baseline holds the head's rows, are needed only against L, so each
+ * is counted in one walk that stops where the change finder's answer
+ * settles it (head_pages_count()): with the fold worker's baseline, B is
+ * as large as the rows changed since the head was folded, while L, then,
+ * is few.  And not while another backend on the
+ * branch holds a snapshot (other_snapshots(): an open REPEATABLE READ
+ * transaction, a statement running): a restore isn't MVCC-safe, and such
+ * a snapshot, taken before the move commits, would read the head's
  * rows, neither its own nor the commit's, where writing the rows keeps it
  * safe.  (One that read the table holds a lock the restore would find
  * taken, and no restore is made; one that hasn't would be read through.)
@@ -3836,7 +3957,7 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 	ProllyNodeRef base;
 	bool		none;
 	uint64		h;
-	uint64		b;
+	HeadPagesCount hc;
 
 	if (other_snapshots())
 		return false;
@@ -3850,16 +3971,36 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 	none = dc->canonicalizer->table_fewer_changes(baseline, relid, 1, &base);
 	if (base.hash.len == 0)
 		return false;
+
+	/*
+	 * (L >= 2H + 1: H counted, the finder asked at each bound whether L is
+	 * fewer than twice it and one more, which, past it, means it isn't)
+	 */
+	hc.dc = dc;
+	hc.baseline = baseline;
+	hc.relid = relid;
 	if (same_hash(&base.hash, &head->hash))
-		return !none &&
-			!dc->canonicalizer->table_fewer_changes(baseline, relid,
-													2 * count_diff(head, target) + 1,
-													&base);
-	h = count_diff(head, target);
-	b = count_diff(&base, target);
-	return b > h &&
-		(none ||
-		 dc->canonicalizer->table_fewer_changes(baseline, relid, b - h, &base));
+	{
+		if (none)
+			return false;
+		hc.offset = 0;
+		hc.twice = true;
+		head_pages_count(&hc, head, target);
+		return !hc.settled && !fewer_since(dc, baseline, relid, 2 * hc.n + 1);
+	}
+
+	/*
+	 * (B > H + L: B counted, the finder asked at each bound past H whether
+	 * L is fewer than the bound, which, with B past it, means it is)
+	 */
+	h = count_diff_upto(head, target, PG_UINT64_MAX);
+	if (none)
+		return count_diff_upto(&base, target, add_upto(h, 1)) > h;
+	hc.offset = h;
+	hc.twice = false;
+	head_pages_count(&hc, &base, target);
+	return hc.settled ||
+		(hc.n > h && fewer_since(dc, baseline, relid, hc.n - h));
 }
 
 /*

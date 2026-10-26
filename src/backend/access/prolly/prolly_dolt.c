@@ -6676,11 +6676,12 @@ table_item_data(const char *item, int len, ProllyNodeRef *data)
 }
 
 /* The kinds of row changes a diff of a table's trees finds (bits by kind). */
-static void
+static bool
 note_change_kind(ProllyDiffKind kind, const ProllyKey *key,
 				 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	*(int *) arg |= 1 << kind;
+	return true;
 }
 
 /* A table an integration changes rows of, and the privileges it needs. */
@@ -7830,11 +7831,12 @@ rows_begin_named(Rows *r, const char *item, int len, const char *name,
 }
 
 /* A change an unordered diff finds, to a RowDiffSink. */
-static void
+static bool
 row_tree_change(ProllyDiffKind kind, const ProllyKey *key,
 				const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	row_change(arg, InvalidOid, kind, key, before, after);
+	return true;
 }
 
 /*
@@ -8295,11 +8297,12 @@ dolt_history_table(PG_FUNCTION_ARGS)
 }
 
 /* A change an unordered diff finds, to an AtSink. */
-static void
+static bool
 at_tree_change(ProllyDiffKind kind, const ProllyKey *key,
 			   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	at_change(arg, InvalidOid, kind, key, before, after);
+	return true;
 }
 
 /*
@@ -8519,11 +8522,12 @@ table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed
 }
 
 /* A change an unordered diff finds, to the sink. */
-static void
+static bool
 stat_tree_change(ProllyDiffKind kind, const ProllyKey *key,
 				 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	stat_change(arg, InvalidOid, kind, key, before, after);
+	return true;
 }
 
 /*

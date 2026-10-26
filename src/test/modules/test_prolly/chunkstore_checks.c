@@ -1700,11 +1700,12 @@ tree_read_node(const ProllyNodeRef *node, uint16 level, void *arg)
 	return true;
 }
 
-static void
+static bool
 tree_read_change(ProllyDiffKind kind, const ProllyKey *key,
 				 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	(*(int64 *) arg)++;
+	return true;
 }
 
 /*
