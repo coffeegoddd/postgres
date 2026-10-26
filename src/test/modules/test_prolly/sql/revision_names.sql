@@ -145,6 +145,41 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SET ROLE regress_revisions_reader;
 SELECT count(*) FROM "regress_revisions/b1".rn.t;
 RESET ROLE;
+-- a view checks as its owner (unless security_invoker), as for a
+-- relation; a SECURITY DEFINER function reads as its owner
+CREATE ROLE regress_revisions_owner;
+GRANT CREATE, USAGE ON SCHEMA public TO regress_revisions_owner;
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+GRANT USAGE ON SCHEMA rn TO regress_revisions_owner;
+GRANT SELECT ON rn.t TO regress_revisions_owner;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_revisions_owner;
+CREATE VIEW public.b1_count AS SELECT count(*) FROM "regress_revisions/b1".rn.t;
+CREATE VIEW public.b1_count_invoker WITH (security_invoker = true)
+  AS SELECT count(*) FROM "regress_revisions/b1".rn.t;
+CREATE FUNCTION public.b1_count_definer() RETURNS bigint SECURITY DEFINER
+  LANGUAGE sql AS $$ SELECT count(*) FROM "regress_revisions/b1".rn.t $$;
+CREATE FUNCTION public.b1_count_invoker() RETURNS bigint
+  LANGUAGE sql AS $$ SELECT count(*) FROM "regress_revisions/b1".rn.t $$;
+GRANT SELECT ON public.b1_count, public.b1_count_invoker TO regress_revisions_reader;
+RESET ROLE;
+SET ROLE regress_revisions_reader;
+SELECT * FROM public.b1_count;
+SELECT * FROM public.b1_count_invoker;
+SELECT public.b1_count_definer();
+SELECT public.b1_count_invoker();
+RESET ROLE;
+-- the owner's grant taken away on the branch: the view is refused too
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+REVOKE SELECT ON rn.t FROM regress_revisions_owner;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_revisions_reader;
+SELECT * FROM public.b1_count;
+RESET ROLE;
+DROP VIEW public.b1_count, public.b1_count_invoker;
+DROP FUNCTION public.b1_count_definer(), public.b1_count_invoker();
+REVOKE CREATE, USAGE ON SCHEMA public FROM regress_revisions_owner;
+
 -- a commit's table: dolt_at()'s privileges, the table here
 REVOKE SELECT ON rn.t FROM regress_revisions_reader;
 SET ROLE regress_revisions_reader;
@@ -167,3 +202,4 @@ SELECT sum(v) FROM "regress_revisions/mixed".rn.t;
 \c contrib_regression
 DROP DATABASE regress_revisions;
 DROP ROLE regress_revisions_reader;
+DROP ROLE regress_revisions_owner;

@@ -33,7 +33,9 @@
  * snapshot can't see the branch as it is (the refs' check_copies_read()).
  * Privileges and row security are the branch's: SELECT on its copy (or on
  * each column read), as a session on the branch would need, and a table
- * whose row security applies to the reader is refused.  The values a row
+ * whose row security applies to the reader is refused.  The reader is the
+ * role the plan checks the entry as: a view's owner (unless the view is
+ * security_invoker), else the user, as for a relation.  The values a row
  * holds out of line are hash pointers to the chunk store, the same on
  * every branch.
  *
@@ -46,8 +48,7 @@
  * The revision is looked up again as each scan begins, its columns
  * matched by name, so a plan or a view made earlier reads the revision as
  * it is then; a column the plan reads that the table no longer has (or
- * has with another type) is an error.  Privileges are the reader's, in a
- * view too.
+ * has with another type) is an error.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_revision.c
@@ -567,8 +568,11 @@ prolly_revision_range(ParseState *pstate, RangeVar *rv, const char *ref)
 	}
 
 	fexpr = makeFuncExpr(F_PROLLY_REVISION_TABLE, RECORDOID,
-						 list_make3(text_const(ref), text_const(rv->schemaname),
-									text_const(rv->relname)),
+						 list_make4(text_const(ref), text_const(rv->schemaname),
+									text_const(rv->relname),
+									makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+											  ObjectIdGetDatum(InvalidOid),
+											  false, true)),
 						 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 	fexpr->funcretset = true;
 	fexpr->location = rv->location;
@@ -605,6 +609,7 @@ typedef struct RevisionReader
 	char	   *schema;
 	char	   *relname;
 	Snapshot	snapshot;
+	Oid			check_as;		/* whose privileges (InvalidOid: the user's) */
 
 	/* the query's columns: names and types, in its order */
 	int			ncols;
@@ -676,7 +681,7 @@ static void
 check_branch_privileges(RevisionReader *rr, const bool *used)
 {
 	Oid			relid = RelationGetRelid(rr->heap);
-	Oid			user = GetUserId();
+	Oid			user = OidIsValid(rr->check_as) ? rr->check_as : GetUserId();
 	bool		allowed = true;
 	int			rls = RLS_NONE;
 	BranchGrantKey key;
@@ -711,7 +716,7 @@ check_branch_privileges(RevisionReader *rr, const bool *used)
 									   allowed = false;
 							   }
 							   if (rr->heap->rd_rel->relrowsecurity)
-								   rls = check_enable_rls(relid, InvalidOid, true);
+								   rls = check_enable_rls(relid, rr->check_as, true);
 							   else if (table_ok)
 								   (void) hash_search(branch_grants, &key, HASH_ENTER, NULL);
 						   });
@@ -787,6 +792,35 @@ reader_set_keys(RevisionReader *rr, ExprContext *econtext)
 	rr->keys_ready = true;
 }
 
+/*
+ * A commit's rows, read with the privileges of the role the plan checks
+ * them as (a view's owner), as its history functions check the user's.
+ */
+static void
+read_at_as(RevisionReader *rr)
+{
+	Oid			saved_user;
+	int			saved_context;
+
+	if (!OidIsValid(rr->check_as) || rr->check_as == GetUserId())
+	{
+		prolly_read_at(rr->rev.ref, rr->relid, rr->store);
+		return;
+	}
+	GetUserIdAndSecContext(&saved_user, &saved_context);
+	SetUserIdAndSecContext(rr->check_as,
+						   saved_context | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		prolly_read_at(rr->rev.ref, rr->relid, rr->store);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(saved_user, saved_context);
+	}
+	PG_END_TRY();
+}
+
 /* The next row into rr->slot; false at the end. */
 static bool
 reader_next(RevisionReader *rr, ExprContext *econtext)
@@ -796,7 +830,7 @@ reader_next(RevisionReader *rr, ExprContext *econtext)
 		if (rr->store == NULL)
 		{
 			rr->store = tuplestore_begin_heap(false, false, work_mem);
-			prolly_read_at(rr->rev.ref, rr->relid, rr->store);
+			read_at_as(rr);
 		}
 		return tuplestore_gettupleslot(rr->store, true, false, rr->slot);
 	}
@@ -911,7 +945,8 @@ typedef struct RevisionPlan
 
 /* the call's arguments */
 static void
-rte_args(RangeTblEntry *rte, char **ref, char **schema, char **relname)
+rte_args(RangeTblEntry *rte, char **ref, char **schema, char **relname,
+		 Oid *check_as)
 {
 	RangeTblFunction *rtfunc = linitial(rte->functions);
 	List	   *args = ((FuncExpr *) rtfunc->funcexpr)->args;
@@ -919,6 +954,26 @@ rte_args(RangeTblEntry *rte, char **ref, char **schema, char **relname)
 	*ref = TextDatumGetCString(((Const *) linitial(args))->constvalue);
 	*schema = TextDatumGetCString(((Const *) lsecond(args))->constvalue);
 	*relname = TextDatumGetCString(((Const *) lthird(args))->constvalue);
+	if (check_as)
+		*check_as = DatumGetObjectId(((Const *) lfourth(args))->constvalue);
+}
+
+/*
+ * A view's (or rule's) revision read checks its privileges as userid, as
+ * setRuleCheckAsUser() makes its relations' be checked: the role is the
+ * call's last argument (InvalidOid: the user's).
+ */
+void
+prolly_revision_set_check_as(RangeTblEntry *rte, Oid userid)
+{
+	RangeTblFunction *rtfunc;
+	Const	   *c;
+
+	if (!prolly_revision_rte(rte))
+		return;
+	rtfunc = linitial(rte->functions);
+	c = (Const *) lfourth(((FuncExpr *) rtfunc->funcexpr)->args);
+	c->constvalue = ObjectIdGetDatum(userid);
 }
 
 bool
@@ -935,7 +990,7 @@ prolly_revision_rte(RangeTblEntry *rte)
 	if (!IsA(rtfunc->funcexpr, FuncExpr))
 		return false;
 	f = (FuncExpr *) rtfunc->funcexpr;
-	if (f->funcid != F_PROLLY_REVISION_TABLE || list_length(f->args) != 3)
+	if (f->funcid != F_PROLLY_REVISION_TABLE || list_length(f->args) != 4)
 		return false;
 	foreach(lc, f->args)
 	{
@@ -1007,7 +1062,7 @@ prolly_revision_set_size(PlannerInfo *root, RelOptInfo *rel,
 	double		allvisfrac = 0;
 	int			ncols = list_length(rtfunc->funccolnames);
 
-	rte_args(rte, &ref, &rp->schema, &rp->relname);
+	rte_args(rte, &ref, &rp->schema, &rp->relname, NULL);
 	rp->heapattno = palloc0_array(AttrNumber, ncols);
 	if (!resolve_revision(ref, &rp->rev))
 		revision_missing(psprintf("%s/%s", get_database_name(MyDatabaseId), ref),
@@ -1255,6 +1310,7 @@ revision_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	char	   *ref;
 	char	   *schema;
 	char	   *relname;
+	Oid			check_as;
 	int			ncols = list_length(rtfunc->funccolnames);
 	ListCell   *lc;
 	int			i;
@@ -1333,7 +1389,7 @@ revision_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 											 list_length(scan_tlist) + 1,
 											 NULL, false));
 
-	rte_args(rte, &ref, &schema, &relname);
+	rte_args(rte, &ref, &schema, &relname, &check_as);
 	cs->scan.plan.targetlist = tlist;
 	cs->scan.plan.qual = quals;
 	cs->scan.scanrelid = 0;
@@ -1342,9 +1398,10 @@ revision_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->custom_exprs = keyclauses;
 	cs->custom_scan_tlist = scan_tlist;
 	cs->custom_relids = bms_copy(rel->relids);
-	cs->custom_private = list_make5(list_make3(makeString(ref),
+	cs->custom_private = list_make5(list_make4(makeString(ref),
 											   makeString(schema),
-											   makeString(relname)),
+											   makeString(relname),
+											   makeInteger((int) check_as)),
 									list_make4(copyObject(rtfunc->funccolnames),
 											   list_copy(rtfunc->funccoltypes),
 											   list_copy(rtfunc->funccoltypmods),
@@ -1491,6 +1548,7 @@ revision_begin(CustomScanState *node, EState *estate, int eflags)
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 	rr->snapshot = estate->es_snapshot;
+	rr->check_as = (Oid) intVal(lfourth(names));
 	reader_open(rr, strVal(linitial(names)), strVal(lsecond(names)),
 				strVal(lthird(names)), used,
 				rr->nkeys > 0 ? (Oid) intVal(linitial(index)) : InvalidOid);
@@ -1631,6 +1689,7 @@ prolly_revision_table(PG_FUNCTION_ARGS)
 	for (int i = 0; i < n; i++)
 		used[i] = true;
 	rr.snapshot = GetActiveSnapshot();
+	rr.check_as = PG_ARGISNULL(3) ? InvalidOid : PG_GETARG_OID(3);
 	reader_open(&rr, text_to_cstring(PG_GETARG_TEXT_PP(0)),
 				text_to_cstring(PG_GETARG_TEXT_PP(1)),
 				text_to_cstring(PG_GETARG_TEXT_PP(2)), used, InvalidOid);

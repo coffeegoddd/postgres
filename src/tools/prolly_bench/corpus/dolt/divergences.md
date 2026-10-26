@@ -771,11 +771,15 @@ OF` are built in D18's shapes.
   and is refused where the copy's row security applies to the reader. A
   branch with only its head, a tag and a commit are read from the
   commit's tree as `dolt_at()` reads them: the table here of the name,
-  its columns as defined here, with D26's privileges. The name of the
+  its columns as defined here, with D26's privileges (Dolt reads a
+  commit's table by the commit's own definition; matching it is
+  [#1063](https://github.com/coffeegoddd/postgres/issues/1063)). The name of the
   session's own branch is an ordinary table name. Any other use (INSERT,
   UPDATE, DELETE, DDL, LOCK, COPY) is refused: change another branch's
-  tables by checking it out. A view reading such a name checks the
-  reader's privileges, not the view owner's.
+  tables by checking it out ([#1064](https://github.com/coffeegoddd/postgres/issues/1064)
+  tracks writes). A view reading such a name checks its owner's
+  privileges and row security, unless it is `security_invoker`, as for a
+  relation; a `SECURITY DEFINER` function reads as its owner.
 - **Why:** privileges here are per branch, on each branch's catalog rows,
   so the branch's own grants are the ones that say who may read its
   copy, and reading it with them gives no access a checkout doesn't. A

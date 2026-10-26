@@ -1746,7 +1746,9 @@ where checking the branch out would be (the refs' check_copies_read():
 a snapshot that can't move and doesn't see the branch's first use, or a
 move that gave it its head's kept pages).  It takes the branch's grants
 on the copy, and refuses a table whose row security applies to the
-reader.  A table's OID by its name on a branch, and that a role may read
+reader: the role the plan checks it as, a view's owner unless the view
+is security_invoker (setRuleCheckAsUser() sets the call's last argument,
+as it sets a relation's checkAsUser), else the user.  A table's OID by its name on a branch, and that a role may read
 all of it, are kept per backend, flushed by any change to a relation's,
 schema's or role's catalog rows.  A branch with only its head, a tag and
 a commit are read from the commit's tree as dolt_at() reads them, the
