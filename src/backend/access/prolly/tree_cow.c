@@ -90,6 +90,7 @@
 #include "access/prolly_datum.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -3794,6 +3795,21 @@ estimate_part_cmp(const void *a, const void *b)
 #define ESTIMATE_SAMPLE_PARTS	64
 
 /*
+ * A part's size, for the rate of the parts of its size: its rows' power of
+ * two.  A part not taken takes the changes for each row of the parts taken
+ * nearest its size, not of all of them: one large part (a range appended,
+ * deleted or rewritten), taken first, changes nearly every row, and the
+ * many small ones about it, a few.
+ */
+#define ESTIMATE_SIZES		64
+
+static int
+estimate_size(uint64 rows)
+{
+	return rows == 0 ? 0 : pg_leftmost_one_pos64(rows);
+}
+
+/*
  * The changes under the nodes the walk left unread (sides'), from a sample
  * of its parts, walked down while they fit in max_nodes with *read.
  *
@@ -3807,7 +3823,8 @@ estimate_part_cmp(const void *a, const void *b)
  * one that doesn't fit is estimated the same way from its own parts, a
  * level down, with the rest (or passed over, if not even a level fits).
  * The changes of a part not taken are the changes for each row the parts
- * taken hold (their mean, each weighed as sampled), times its rows; but
+ * taken of its size hold (their mean, each weighed as sampled; the nearest
+ * size taken, if none of its own: estimate_size()), times its rows; but
  * never fewer than the rows one side holds there and the other doesn't.
  * Where every part is taken, the estimate is diff's count; with none, every
  * row under the nodes unread counts as changed, above it.
@@ -3822,7 +3839,8 @@ estimate_sampled(const ProllyTreeEnv *env, EstimateSide *sides, uint64 *read,
 	int			nseq = 0;
 	int			nparts = 0;
 	int			ntaken = 0;
-	double		rates = 0;
+	double		rates[ESTIMATE_SIZES] = {0};
+	int			nrates[ESTIMATE_SIZES] = {0};
 	double		changes = 0;
 
 	for (int side = 0; side < 2; side++)
@@ -3909,7 +3927,8 @@ estimate_sampled(const ProllyTreeEnv *env, EstimateSide *sides, uint64 *read,
 		taken[p] = true;
 		ntaken++;
 		changes += c;
-		rates += c / rows;
+		rates[estimate_size(rows)] += c / rows;
+		nrates[estimate_size(rows)]++;
 	}
 	for (int p = 0; p < nparts; p++)
 	{
@@ -3921,7 +3940,24 @@ estimate_sampled(const ProllyTreeEnv *env, EstimateSide *sides, uint64 *read,
 
 		if (taken[p])
 			continue;
-		c = ntaken > 0 ? rates / ntaken * rows : (double) rows;
+		c = (double) rows;
+		if (ntaken > 0)
+		{
+			int			size = estimate_size(rows);
+
+			/* (the nearest size taken, the smaller on a tie) */
+			for (int d = 0; d < ESTIMATE_SIZES; d++)
+			{
+				int			k = size - d >= 0 && nrates[size - d] > 0 ? size - d :
+					size + d < ESTIMATE_SIZES && nrates[size + d] > 0 ? size + d : -1;
+
+				if (k >= 0)
+				{
+					c = rates[k] / nrates[k] * rows;
+					break;
+				}
+			}
+		}
 		changes += Min(Max(c, (double) alone), (double) rows);
 	}
 	return changes;
