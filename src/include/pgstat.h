@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD11
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD12
 
 typedef struct PgStat_ArchiverStats
 {
@@ -816,9 +816,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_RECORDS_FORGOTTEN,	/* relation records of collected
 										 * commits forgotten after a
 										 * collection */
+	PGSTAT_PROLLY_BRANCHES_LISTED,	/* branches visited by listings of
+									 * every branch with copies */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RECORDS_FORGOTTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BRANCHES_LISTED + 1)
 
 typedef struct PgStat_ProllyStats
 {

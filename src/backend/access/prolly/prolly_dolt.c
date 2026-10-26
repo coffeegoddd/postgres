@@ -76,6 +76,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/regproc.h"
@@ -1863,19 +1864,31 @@ sweep_detached(char *current, bool kept_only)
 	XactReadOnly = sw.was_read_only;
 }
 
-/* Does the database have a commit's hidden branch?  (Read without the refs.) */
+/*
+ * Does the database have a commit's hidden branch?  (Read without the
+ * refs.)  The first name from the hidden branches' prefix on, in the name
+ * index's order, answers it: one probe, however many branches there are.
+ */
 static bool
 has_detached_branches(void)
 {
 	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	Relation	irel = index_open(BranchNameIndexId, AccessShareLock);
+	ScanKeyData key;
 	SysScanDesc scan;
 	HeapTuple	tup;
-	bool		found = false;
+	NameData	start;
+	bool		found;
 
-	scan = systable_beginscan(brel, InvalidOid, false, NULL, 0, NULL);
-	while (!found && (tup = systable_getnext(scan)) != NULL)
-		found = detached_branch(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
-	systable_endscan(scan);
+	namestrcpy(&start, PROLLY_DETACHED_PREFIX);
+	ScanKeyInit(&key, Anum_pg_branch_brname, BTGreaterEqualStrategyNumber,
+				F_NAMEGE, NameGetDatum(&start));
+	scan = systable_beginscan_ordered(brel, irel, NULL, 1, &key);
+	tup = systable_getnext_ordered(scan, ForwardScanDirection);
+	found = tup != NULL &&
+		detached_branch(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	systable_endscan_ordered(scan);
+	index_close(irel, AccessShareLock);
 	table_close(brel, AccessShareLock);
 	return found;
 }

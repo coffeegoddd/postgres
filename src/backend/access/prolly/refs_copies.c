@@ -445,6 +445,7 @@ static void merge_tables_left(const char *branch, ProllyMergeState *state,
 static List *violations_left(const char *branch, List *violations,
 							 char **name);
 static Oid	branch_oid(const char *name);
+static char *branch_name_of(Oid branch);
 static void merge_key(StringInfo key, const char *branch);
 static void merge_names_put(const char *branch, const ProllyMergeState *state);
 static void merge_names_get(const char *branch, ProllyMergeState *state);
@@ -770,21 +771,6 @@ tables_exist_on(const char *branch, int n, const Oid *relids, bool *exists,
 	}
 }
 
-typedef struct NameBranch
-{
-	Oid			branch;
-	char	   *name;
-} NameBranch;
-
-static void
-name_branch(const char *name, Oid branch, void *arg)
-{
-	NameBranch *nb = arg;
-
-	if (branch == nb->branch)
-		nb->name = pstrdup(name);
-}
-
 /*
  * The branches whose unresolved conflicts or violations the transaction
  * can't commit: those whose merge states it set, and those it wrote, as
@@ -799,14 +785,15 @@ branches_to_check(void)
 
 	foreach(lc, branches_written())
 	{
-		NameBranch	nb = {lfirst_oid(lc), NULL};
+		Oid			branch = lfirst_oid(lc);
+		char	   *name;
 
-		if (nb.branch == MyBranch)
-			nb.name = branch_ops()->current();
+		if (branch == MyBranch)
+			name = branch_ops()->current();
 		else
-			branch_ops()->branches(name_branch, &nb);
-		if (nb.name != NULL && !name_listed(names, nb.name))
-			names = lappend(names, nb.name);
+			name = branch_name_of(branch);
+		if (name != NULL && !name_listed(names, name))
+			names = lappend(names, name);
 	}
 	return names;
 }
@@ -2157,6 +2144,25 @@ branch_oid(const char *name)
 	oid = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 	ReleaseSysCache(tup);
 	return oid;
+}
+
+/*
+ * The name of the branch whose id is branch (palloc'd); NULL if there's
+ * none.  Its pg_branch row found by its id, so the work doesn't grow with
+ * the number of branches.
+ */
+static char *
+branch_name_of(Oid branch)
+{
+	HeapTuple	tup;
+	char	   *name;
+
+	tup = SearchSysCache1(BRANCHOID, ObjectIdGetDatum(branch));
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	name = pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	ReleaseSysCache(tup);
+	return name;
 }
 
 /*
@@ -4384,25 +4390,20 @@ typedef struct SourceCandidates
 	List	   *roots;			/* ProllyNodeRef *, what each is thought to be */
 } SourceCandidates;
 
-static void
-note_candidate(const char *name, Oid branch, void *arg)
+/*
+ * What branch name's working set is thought to be, as snap would see it:
+ * known, else its baseline's fold, else its head (false: none of them).
+ */
+static bool
+thought_root(const char *name, Oid branch, Snapshot snap, ProllyNodeRef *root)
 {
-	SourceCandidates *sc = arg;
-	ProllyNodeRef *root = palloc(sizeof(ProllyNodeRef));
 	ProllyNodeRef baseline;
 	ProllyHash	h;
 	ProllyCommitInfo info;
 	BranchFoldStamp at;
 
-	if ((branch != MyBranch) != sc->others ||
-		list_length(sc->names) > SOURCE_CANDIDATES)
-		return;
-	/* (one the snapshot doesn't see made holds rows it can't see) */
-	if (sc->others && !list_member_oid(sc->kept_seen, branch) &&
-		branch_kept(name))
-		return;
 	if (fold_caches_usable() &&
-		branch_fold_known_at(branch, sc->snap,
+		branch_fold_known_at(branch, snap,
 							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
 							 false, &h, &at))
 		ref_of(&h, root);
@@ -4411,6 +4412,24 @@ note_candidate(const char *name, Oid branch, void *arg)
 	else if (branch_head(name, &h) && copies_commit_get(&h, &info))
 		*root = info.root;
 	else
+		return false;
+	return true;
+}
+
+static void
+note_candidate(const char *name, Oid branch, void *arg)
+{
+	SourceCandidates *sc = arg;
+	ProllyNodeRef *root = palloc(sizeof(ProllyNodeRef));
+
+	if ((branch != MyBranch) != sc->others ||
+		list_length(sc->names) > SOURCE_CANDIDATES)
+		return;
+	/* (one the snapshot doesn't see made holds rows it can't see) */
+	if (sc->others && !list_member_oid(sc->kept_seen, branch) &&
+		branch_kept(name))
+		return;
+	if (!thought_root(name, branch, sc->snap, root))
 		return;
 	sc->names = lappend(sc->names, pstrdup(name));
 	sc->roots = lappend(sc->roots, root);
@@ -4574,12 +4593,12 @@ static bool
 make_of_kept(const char *name, const ProllyCommitInfo *commit)
 {
 	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
-	SourceCandidates sc = {GetActiveSnapshot(), false, NIL, NIL, NIL};
 	List	   *emptied = NIL;
 	ProllyDatabaseComponents dc;
 	KeptSource	ks = {&commit->id, NULL};
 	const ProllyKeptCommit *kc;
 	const char *source;
+	bool		other;
 	BranchKeptTable *tables;
 	bool	   *used;
 	List	   *names = NIL;
@@ -4592,7 +4611,7 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 		dc.canonicalizer->splice_baseline == NULL ||
 		dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return false;
-	PROLLY_CALL(dc.matcache, visit, sc.snap, find_kept_commit, &ks);
+	PROLLY_CALL(dc.matcache, visit, GetActiveSnapshot(), find_kept_commit, &ks);
 	if (ks.state == NULL)
 		return false;
 	kc = ks.state->kept;
@@ -4602,24 +4621,20 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 
 	/*
 	 * (the plan of the move from what the source is thought to be, for the
-	 * tables not kept: those to begin empty)
+	 * tables not kept: those to begin empty; the source's alone looked up)
 	 */
-	sc.others = strcmp(source, branch_ops()->current()) != 0;
-	branch_ops()->branches(note_candidate, &sc);
-	if (sc.names != NIL)
+	other = strcmp(source, branch_ops()->current()) != 0;
 	{
 		ProllyMovePlan plan;
-		PlanOn		po = {planner, NULL, &commit->root, INFINITY, &plan};
+		ProllyNodeRef thought;
+		PlanOn		po = {planner, &thought, &commit->root, INFINITY, &plan};
 
-		for (int i = 0; i < list_length(sc.names); i++)
+		if (thought_root(source, ks.state->branch, GetActiveSnapshot(),
+						 &thought))
 		{
-			if (strcmp(list_nth(sc.names, i), source) != 0)
-				continue;
-			po.from = list_nth(sc.roots, i);
 			branch_ops()->run_on(source, plan_here, &po);
 			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 			reloaded_tables(&plan, &emptied);
-			break;
 		}
 	}
 	tables = palloc_array(BranchKeptTable, Max(kc->ntables, 1));
@@ -4630,7 +4645,7 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 		tables[t].rels = kc->tables[t].rels;
 	}
 	if (!OidIsValid(branch_ops()->make_kept(name, source, tables, kc->ntables,
-											used, emptied, sc.others)))
+											used, emptied, other)))
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
 		return false;
