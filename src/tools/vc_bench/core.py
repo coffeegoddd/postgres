@@ -275,6 +275,9 @@ class SQL:
     def ids_in(self, ids):
         return self.adapter.ids_in(ids)
 
+    def table_count_sql(self):
+        return self.adapter.table_count_sql()
+
     def counters(self):
         return self.adapter.counters(self)
 
