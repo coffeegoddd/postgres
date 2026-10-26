@@ -1110,9 +1110,23 @@ costs moving each branch's copies there, from the root its working set is
 known or thought to be: each table's rows that differ, estimated from its
 trees by diff_estimate() in a bounded number of nodes, and the tables
 redefined, made or dropped (materialized views' rows as tables'), each
-planned on its own branch.  The session's branch and at most 16 others are
+planned on its own branch.  Where the nodes that differ don't fit the
+bound, the estimate's walk stops above them and walks a sample of the key
+ranges they cover down (64 at most, taken in proportion to their rows, so
+a range appended, deleted or rewritten whole among many small ones is
+taken), scaling the changes it finds for each row sampled to the rows of
+the ranges not taken, and never counting fewer there than the rows one
+side holds and the other doesn't.  How many nodes differ can't
+tell a few changes spread over a table from as many runs of rows
+rewritten (a thousand rows updated across a million leave a thousand
+leaves differing, and nearly every node above them, as a thousand runs
+of a leaf's worth would); the changes a sampled range holds for each of
+its rows can.  (Counting every row under the nodes unread, as it once
+did, took a few spread changes for most of the table, and reloaded it,
+every row written and then folded in full, instead of moving its few.)  The session's branch and at most 16 others are
 weighed, each stopped once it costs more than the best yet; the cheapest is
-copied, the session's on a tie.  Another branch is copied only if none of
+copied, the session's on a tie or near one (another must cost a fifth less,
+the estimates being a sample's).  Another branch is copied only if none of
 its writers is in the middle of a change (make()'s nowait): waiting for one,
 with the refs held, would hold up the session's branch's commits for as long
 as that writer's transaction lasts.  Else the session's branch is copied,

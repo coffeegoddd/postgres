@@ -84,10 +84,13 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -3482,9 +3485,21 @@ cow_diff_unordered(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 }
 
 /*
+ * A bound of a node's keys in diff_estimate(): an internal item's key is
+ * the largest of its child's, so a child holds the keys above the one
+ * before it (its parent's lower bound, for the first) up to its own.
+ * Unbounded: no key below (a lower bound), or none above (an upper one).
+ */
+typedef struct EstimateBound
+{
+	ProllyKey	key;
+	bool		unbounded;
+} EstimateBound;
+
+/*
  * A side of diff_estimate(): the nodes not yet matched or read, each with
- * its level and item count, and the hashes of its leaf items read (the
- * key's, then the item's whole).
+ * its level, item count and the bounds of its keys, and the hashes of its
+ * leaf items read (the key's, then the item's whole).
  */
 typedef struct EstimateItem
 {
@@ -3492,11 +3507,18 @@ typedef struct EstimateItem
 	uint64		whole;
 } EstimateItem;
 
+typedef struct EstimateNode
+{
+	ProllyNodeRef ref;
+	uint16		level;
+	uint64		count;
+	EstimateBound lo;			/* the keys above lo */
+	EstimateBound hi;			/* up to hi */
+} EstimateNode;
+
 typedef struct EstimateSide
 {
-	ProllyNodeRef *nodes;
-	uint16	   *levels;
-	uint64	   *counts;
+	EstimateNode *nodes;
 	int			n;
 	int			max;
 	EstimateItem *items;
@@ -3505,38 +3527,22 @@ typedef struct EstimateSide
 } EstimateSide;
 
 static void
-estimate_add_node(EstimateSide *s, const ProllyNodeRef *ref, uint16 level,
-				  uint64 count)
+estimate_add_node(EstimateSide *s, const EstimateNode *node)
 {
 	if (s->n == s->max)
 	{
 		s->max = Max(16, s->max * 2);
-		s->nodes = s->nodes ? repalloc_array(s->nodes, ProllyNodeRef, s->max) :
-			palloc_array(ProllyNodeRef, s->max);
-		s->levels = s->levels ? repalloc_array(s->levels, uint16, s->max) :
-			palloc_array(uint16, s->max);
-		s->counts = s->counts ? repalloc_array(s->counts, uint64, s->max) :
-			palloc_array(uint64, s->max);
+		s->nodes = s->nodes ? repalloc_array(s->nodes, EstimateNode, s->max) :
+			palloc_array(EstimateNode, s->max);
 	}
-	s->nodes[s->n] = *ref;
-	s->levels[s->n] = level;
-	s->counts[s->n++] = count;
+	s->nodes[s->n++] = *node;
 }
 
 static void
 estimate_drop_node(EstimateSide *s, int i)
 {
 	s->nodes[i] = s->nodes[--s->n];
-	s->levels[i] = s->levels[s->n];
-	s->counts[i] = s->counts[s->n];
 }
-
-typedef struct EstimateNode
-{
-	ProllyNodeRef ref;
-	uint16		level;
-	uint64		count;
-} EstimateNode;
 
 static int
 estimate_node_cmp(const void *a, const void *b)
@@ -3545,29 +3551,26 @@ estimate_node_cmp(const void *a, const void *b)
 						  &((const EstimateNode *) b)->ref);
 }
 
-/* s's nodes in order of their hashes, their levels and counts with them. */
+/* s's nodes in order of their hashes. */
 static void
 estimate_sort(EstimateSide *s)
 {
-	EstimateNode *p;
+	if (s->n > 1)
+		qsort(s->nodes, s->n, sizeof(EstimateNode), estimate_node_cmp);
+}
 
-	if (s->n < 2)
-		return;
-	p = palloc_array(EstimateNode, s->n);
-	for (int i = 0; i < s->n; i++)
-	{
-		p[i].ref = s->nodes[i];
-		p[i].level = s->levels[i];
-		p[i].count = s->counts[i];
-	}
-	qsort(p, s->n, sizeof(EstimateNode), estimate_node_cmp);
-	for (int i = 0; i < s->n; i++)
-	{
-		s->nodes[i] = p[i].ref;
-		s->levels[i] = p[i].level;
-		s->counts[i] = p[i].count;
-	}
-	pfree(p);
+/* A key's copy, for a bound that outlives the node it was read from. */
+static EstimateBound
+estimate_bound(const ProllyKey *key)
+{
+	EstimateBound b;
+	uint8	   *data = palloc(Max(key->len, 1));
+
+	memcpy(data, key->data, key->len);
+	b.key.data = data;
+	b.key.len = key->len;
+	b.unbounded = false;
+	return b;
 }
 
 /* Read node i of s: its children become s's nodes, or its items' hashes its items. */
@@ -3575,26 +3578,33 @@ static void
 estimate_expand(const ProllyTreeEnv *env, EstimateSide *s, int i)
 {
 	TNode		node;
-	ProllyNodeRef ref = s->nodes[i];
-	uint16		level = s->levels[i];
+	EstimateNode parent = s->nodes[i];
+	EstimateBound lo = parent.lo;
 
 	estimate_drop_node(s, i);
-	node_read_level(env, &ref, &node, CurrentMemoryContext, false, level);
+	node_read_level(env, &parent.ref, &node, CurrentMemoryContext, false,
+					parent.level);
 	for (int j = 0; j < node.nitems; j++)
 	{
+		ProllyKey	k;
+		ProllyValue v;
+		uint8		flags;
+
+		node_item(env, &node, j, &k, &v, &flags);
 		if (node.level > 0)
 		{
-			ProllyNodeRef child;
-			uint64		count;
+			EstimateNode child;
 
-			node_child(env, &node, j, &child, &count);
-			estimate_add_node(s, &child, node.level - 1, count);
+			memset(&child.ref, 0, sizeof(child.ref));
+			decode_child(&v, &child.ref.hash, &child.count);
+			child.level = node.level - 1;
+			child.lo = lo;
+			child.hi = j == node.nitems - 1 ? parent.hi : estimate_bound(&k);
+			lo = child.hi;
+			estimate_add_node(s, &child);
 		}
 		else
 		{
-			ProllyKey	k;
-			ProllyValue v;
-			uint8		flags;
 			uint64		key;
 
 			if (s->nitems == s->maxitems)
@@ -3604,7 +3614,6 @@ estimate_expand(const ProllyTreeEnv *env, EstimateSide *s, int i)
 					repalloc_array(s->items, EstimateItem, s->maxitems) :
 					palloc_array(EstimateItem, s->maxitems);
 			}
-			node_item(env, &node, j, &k, &v, &flags);
 			key = hash_bytes_extended(k.data, k.len, 0);
 			s->items[s->nitems].key = key;
 			s->items[s->nitems++].whole =
@@ -3626,74 +3635,39 @@ estimate_item_cmp(const void *a, const void *b)
 }
 
 /*
- * How many keys diff() would report between from and to, estimated
- * reading at most max_nodes nodes (with diff_unordered()'s walk: by the
- * nodes' hashes, from the top level down, a node both trees hold dropped
- * unread).  Where the nodes that differ fit in max_nodes, their leaf items
- * are matched by their bytes' hashes, which gives diff's count (keys equal
- * by the tree's order but not as bytes, or a hash collision, aside).  The
- * nodes left unread once max_nodes are read count every item they hold as
- * changed, so the estimate is then above the count, never below it: a key
- * that changed is under a node one side holds and the other lacks.
+ * Walk sides down (diff_unordered()'s walk: by the nodes' hashes, from the
+ * top level down, a node both trees hold dropped unread), a level only if
+ * its nodes that differ fit in limit with the *read already: true once
+ * every node that differs is read, false where the walk stopped before a
+ * level, the nodes left those that differ at it (and below, of a side
+ * lower there).
  */
-static uint64
-cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
-				  const ProllyNodeRef *to, uint64 max_nodes)
+static bool
+estimate_walk(const ProllyTreeEnv *env, EstimateSide *sides, uint64 *read,
+			  uint64 limit)
 {
-	MemoryContext cxt;
-	MemoryContext old;
-	EstimateSide sides[2] = {0};
-	uint64		read = 0;
-	uint64		changes = 0;
-	bool		over = false;
-
-	if (same_hash(&from->hash, &to->hash))
-		return 0;
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly diff estimate",
-								ALLOCSET_DEFAULT_SIZES);
-	old = MemoryContextSwitchTo(cxt);
-	for (int side = 0; side < 2; side++)
-	{
-		TNode		root;
-
-		uint64		count = 0;
-
-		node_read(env, side == 0 ? from : to, &root);
-		for (int i = 0; i < root.nitems; i++)
-		{
-			ProllyNodeRef child;
-			uint64		n = 1;
-
-			if (root.level > 0)
-				node_child(env, &root, i, &child, &n);
-			count += n;
-		}
-		estimate_add_node(&sides[side], side == 0 ? from : to, root.level,
-						  count);
-		node_release(&root);
-		read++;
-	}
-
-	/* the highest level's nodes, those not both trees', read, till leaves */
-	while (!over)
+	for (;;)
 	{
 		int			top = -1;
+		uint64		here = 0;
 
 		CHECK_FOR_INTERRUPTS();
 		for (int side = 0; side < 2; side++)
 			for (int i = 0; i < sides[side].n; i++)
-				top = Max(top, sides[side].levels[i]);
+				top = Max(top, sides[side].nodes[i].level);
 		if (top < 0)
-			break;
+			return true;
 		for (int side = 0; side < 2; side++)
 			estimate_sort(&sides[side]);
 		for (int i = 0, j = 0; i < sides[0].n && j < sides[1].n;)
 		{
-			int			r = loose_node_cmp(&sides[0].nodes[i], &sides[1].nodes[j]);
+			EstimateNode *a = &sides[0].nodes[i];
+			EstimateNode *b = &sides[1].nodes[j];
+			int			r = loose_node_cmp(&a->ref, &b->ref);
 
-			if (r == 0 && sides[0].levels[i] == top && sides[1].levels[j] == top)
+			if (r == 0 && a->level == top && b->level == top)
 			{
-				sides[0].levels[i] = sides[1].levels[j] = LOOSE_GONE;
+				a->level = b->level = LOOSE_GONE;
 				i++;
 				j++;
 			}
@@ -3705,24 +3679,31 @@ cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 		for (int side = 0; side < 2; side++)
 			for (int i = sides[side].n - 1; i >= 0; i--)
 			{
-				if (sides[side].levels[i] == LOOSE_GONE)
+				if (sides[side].nodes[i].level == LOOSE_GONE)
 					estimate_drop_node(&sides[side], i);
-				else if (sides[side].levels[i] == top && read >= max_nodes)
-					over = true;
-				else if (sides[side].levels[i] == top)
+				else if (sides[side].nodes[i].level == top)
+					here++;
+			}
+		if (*read + here > limit)
+			return false;
+		for (int side = 0; side < 2; side++)
+			for (int i = sides[side].n - 1; i >= 0; i--)
+			{
+				if (sides[side].nodes[i].level == top)
 				{
 					estimate_expand(env, &sides[side], i);
-					read++;
+					(*read)++;
 				}
 			}
 	}
+}
 
-	/* (the nodes left unread: all they hold) */
-	for (int side = 0; side < 2; side++)
-		for (int i = 0; i < sides[side].n; i++)
-			changes += sides[side].counts[i];
+/* The items sides read: those on one side, and those whose values differ. */
+static uint64
+estimate_items(EstimateSide *sides)
+{
+	uint64		changes = 0;
 
-	/* the items read: those on one side, and those whose values differ */
 	for (int side = 0; side < 2; side++)
 		if (sides[side].nitems > 1)
 			qsort(sides[side].items, sides[side].nitems, sizeof(EstimateItem),
@@ -3749,6 +3730,316 @@ cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 			i++;
 			j++;
 		}
+	}
+	return changes;
+}
+
+/* Bounds compared, each as the lower or the upper one it is. */
+static int
+estimate_bound_cmp(const ProllyTreeEnv *env, const EstimateBound *a, bool a_hi,
+				   const EstimateBound *b, bool b_hi)
+{
+	if (a->unbounded || b->unbounded)
+	{
+		int			ra = a->unbounded ? (a_hi ? 1 : -1) : 0;
+		int			rb = b->unbounded ? (b_hi ? 1 : -1) : 0;
+
+		return (ra > rb) - (ra < rb);
+	}
+	return cmp_keys(env, &a->key, &b->key);
+}
+
+static int
+estimate_hi_cmp(const void *a, const void *b, void *arg)
+{
+	return estimate_bound_cmp(arg, &((const EstimateNode *) a)->hi, true,
+							  &((const EstimateNode *) b)->hi, true);
+}
+
+/*
+ * A part of the key space the walk left unread: the nodes of both sides
+ * whose keys overlap, chained (each side's nodes cover the keys apart, so
+ * the nodes that hold a key, on each side, are in one part).  Its changes
+ * are those its own nodes' walk finds: a key both sides hold differently,
+ * or one holds and the other doesn't, is under a node of each part's that
+ * holds it.
+ */
+typedef struct EstimatePart
+{
+	int			first;			/* in the parts' nodes */
+	int			n;
+	uint64		rows[2];		/* items its nodes hold, on each side */
+	double		order;			/* its place in the sample (see below) */
+} EstimatePart;
+
+typedef struct EstimatePartNode
+{
+	int			side;
+	EstimateNode node;
+} EstimatePartNode;
+
+static int
+estimate_part_cmp(const void *a, const void *b)
+{
+	double		x = ((const EstimatePart *) a)->order;
+	double		y = ((const EstimatePart *) b)->order;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * The parts a sample walks at most: enough to tell how many changes a row
+ * holds to within a few tens of percent, the rest of the budget left
+ * unread (a move plans every candidate's tables).
+ */
+#define ESTIMATE_SAMPLE_PARTS	64
+
+/*
+ * A part's size, for the rate of the parts of its size: its rows' power of
+ * two.  A part not taken takes the changes for each row of the parts taken
+ * nearest its size, not of all of them: one large part (a range appended,
+ * deleted or rewritten), taken first, changes nearly every row, and the
+ * many small ones about it, a few.
+ */
+#define ESTIMATE_SIZES		64
+
+static int
+estimate_size(uint64 rows)
+{
+	return rows == 0 ? 0 : pg_leftmost_one_pos64(rows);
+}
+
+/*
+ * The changes under the nodes the walk left unread (sides'), from a sample
+ * of its parts, walked down while they fit in max_nodes with *read.
+ *
+ * Parts are taken in proportion to the rows they hold (each its first
+ * node's hash a uniform u, in order of -ln(u) / rows: a weighted sample
+ * without replacement), at most ESTIMATE_SAMPLE_PARTS, so a large part,
+ * a range of keys one side holds alone (rows appended, or deleted) or one
+ * rewritten whole, is taken first, not passed over among many small ones.
+ * Each is walked down from the nodes that differ, so it reads only the
+ * nodes that differ under it, given half of what is left of max_nodes;
+ * one that doesn't fit is estimated the same way from its own parts, a
+ * level down, with the rest (or passed over, if not even a level fits).
+ * The changes of a part not taken are the changes for each row the parts
+ * taken of its size hold (their mean, each weighed as sampled; the nearest
+ * size taken, if none of its own: estimate_size()), times its rows; but
+ * never fewer than the rows one side holds there and the other doesn't.
+ * Where every part is taken, the estimate is diff's count; with none, every
+ * row under the nodes unread counts as changed, above it.
+ */
+static double
+estimate_sampled(const ProllyTreeEnv *env, EstimateSide *sides, uint64 *read,
+				 uint64 max_nodes)
+{
+	EstimatePartNode *seq;
+	EstimatePart *parts;
+	bool	   *taken;
+	int			nseq = 0;
+	int			nparts = 0;
+	int			ntaken = 0;
+	double		rates[ESTIMATE_SIZES] = {0};
+	int			nrates[ESTIMATE_SIZES] = {0};
+	double		changes = 0;
+
+	for (int side = 0; side < 2; side++)
+		if (sides[side].n > 1)
+			qsort_arg(sides[side].nodes, sides[side].n, sizeof(EstimateNode),
+					  estimate_hi_cmp, (void *) env);
+	seq = palloc_array(EstimatePartNode, Max(sides[0].n + sides[1].n, 1));
+	parts = palloc_array(EstimatePart, Max(sides[0].n + sides[1].n, 1));
+
+	/*
+	 * (each side's nodes in key order, taken lowest first; a part ends where
+	 * the next node's keys begin at or past the highest it holds)
+	 */
+	{
+		int			i = 0;
+		int			j = 0;
+		const EstimateBound *top = NULL;
+		uint64		first = 0;
+
+		while (i < sides[0].n || j < sides[1].n)
+		{
+			int			side;
+			EstimateNode *next;
+
+			if (j >= sides[1].n)
+				side = 0;
+			else if (i >= sides[0].n)
+				side = 1;
+			else
+				side = estimate_bound_cmp(env, &sides[0].nodes[i].lo, false,
+										  &sides[1].nodes[j].lo, false) <= 0 ? 0 : 1;
+			next = side == 0 ? &sides[0].nodes[i++] : &sides[1].nodes[j++];
+			if (nparts == 0 ||
+				estimate_bound_cmp(env, &next->lo, false, top, true) >= 0)
+			{
+				EstimatePart *p = &parts[nparts++];
+
+				p->first = nseq;
+				p->n = 0;
+				p->rows[0] = p->rows[1] = 0;
+				first = 0;
+				memcpy(&first, next->ref.hash.bytes,
+					   Min(sizeof(first), next->ref.hash.len));
+				p->order = ((double) (first >> 11) + 1) / 9007199254740992.0;
+				top = &next->hi;
+			}
+			else if (estimate_bound_cmp(env, &next->hi, true, top, true) > 0)
+				top = &next->hi;
+			seq[nseq].side = side;
+			seq[nseq++].node = *next;
+			parts[nparts - 1].n++;
+			parts[nparts - 1].rows[side] += next->count;
+		}
+	}
+	for (int p = 0; p < nparts; p++)
+	{
+		uint64		rows = parts[p].rows[0] + parts[p].rows[1];
+
+		parts[p].order = rows == 0 ? HUGE_VAL : -log(parts[p].order) / rows;
+	}
+	if (nparts > 1)
+		qsort(parts, nparts, sizeof(EstimatePart), estimate_part_cmp);
+
+	taken = palloc0_array(bool, Max(nparts, 1));
+	for (int p = 0; p < nparts && ntaken < ESTIMATE_SAMPLE_PARTS &&
+		 *read < max_nodes; p++)
+	{
+		EstimateSide part[2] = {0};
+		uint64		rows = parts[p].rows[0] + parts[p].rows[1];
+		uint64		before = *read;
+		double		c;
+
+		if (rows == 0)
+			continue;
+		for (int k = 0; k < parts[p].n; k++)
+			estimate_add_node(&part[seq[parts[p].first + k].side],
+							  &seq[parts[p].first + k].node);
+		if (estimate_walk(env, part, read, *read + (max_nodes - *read) / 2))
+			c = (double) estimate_items(part);
+		else if (*read > before)
+			c = estimate_sampled(env, part, read, max_nodes);
+		else
+			continue;
+		taken[p] = true;
+		ntaken++;
+		changes += c;
+		rates[estimate_size(rows)] += c / rows;
+		nrates[estimate_size(rows)]++;
+	}
+	for (int p = 0; p < nparts; p++)
+	{
+		uint64		rows = parts[p].rows[0] + parts[p].rows[1];
+		uint64		alone = parts[p].rows[0] > parts[p].rows[1] ?
+			parts[p].rows[0] - parts[p].rows[1] :
+			parts[p].rows[1] - parts[p].rows[0];
+		double		c;
+
+		if (taken[p])
+			continue;
+		c = (double) rows;
+		if (ntaken > 0)
+		{
+			int			size = estimate_size(rows);
+
+			/* (the nearest size taken, the smaller on a tie) */
+			for (int d = 0; d < ESTIMATE_SIZES; d++)
+			{
+				int			k = size - d >= 0 && nrates[size - d] > 0 ? size - d :
+					size + d < ESTIMATE_SIZES && nrates[size + d] > 0 ? size + d : -1;
+
+				if (k >= 0)
+				{
+					c = rates[k] / nrates[k] * rows;
+					break;
+				}
+			}
+		}
+		changes += Min(Max(c, (double) alone), (double) rows);
+	}
+	return changes;
+}
+
+/*
+ * How many keys diff() would report between from and to, estimated
+ * reading at most max_nodes nodes.  The trees are walked from the top
+ * level down (estimate_walk()), a node both hold dropped unread; where
+ * every node that differs is read, their leaf items are matched by their
+ * bytes' hashes, which gives diff's count (keys equal by the tree's order
+ * but not as bytes, or a hash collision, aside).
+ *
+ * Where they don't fit in half of max_nodes, the walk stops before the
+ * first level whose nodes that differ don't, and the rest is spent on a
+ * sample of the parts of the key space it left unread (estimate_sampled()),
+ * taken in proportion to their rows and walked down to their changes:
+ * those the parts taken hold for each row under them, times the rows of
+ * those not taken, each no fewer than the rows one side holds there alone.
+ * Counting every row
+ * under the nodes unread overstates a few changes spread over a large
+ * table by orders of magnitude: a thousand keys updated across a million
+ * rows leave a thousand of its leaves differing, and the levels above
+ * nearly every node.  How many nodes differ can't tell those apart from as
+ * many runs of keys rewritten either, a leaf's worth or more each; the
+ * changes a part holds for each of its rows can, whatever the levels above
+ * show.  Where the sample is every part, the estimate is diff's count;
+ * where not even one part fits, every row under the nodes unread counts as
+ * changed, above it.  (It is never more than the rows under them.)
+ */
+static uint64
+cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
+				  const ProllyNodeRef *to, uint64 max_nodes)
+{
+	MemoryContext cxt;
+	MemoryContext old;
+	EstimateSide sides[2] = {0};
+	uint64		read = 0;
+	uint64		changes;
+
+	if (same_hash(&from->hash, &to->hash))
+		return 0;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly diff estimate",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	for (int side = 0; side < 2; side++)
+	{
+		TNode		root;
+		EstimateNode n;
+
+		node_read(env, side == 0 ? from : to, &root);
+		n.ref = *(side == 0 ? from : to);
+		n.level = root.level;
+		n.count = 0;
+		n.lo.unbounded = n.hi.unbounded = true;
+		n.lo.key.data = n.hi.key.data = NULL;
+		n.lo.key.len = n.hi.key.len = 0;
+		for (int i = 0; i < root.nitems; i++)
+		{
+			ProllyNodeRef child;
+			uint64		c = 1;
+
+			if (root.level > 0)
+				node_child(env, &root, i, &child, &c);
+			n.count += c;
+		}
+		estimate_add_node(&sides[side], &n);
+		node_release(&root);
+		read++;
+	}
+	if (estimate_walk(env, sides, &read, max_nodes / 2))
+		changes = estimate_items(sides);
+	else
+	{
+		double		estimate = ceil(estimate_sampled(env, sides, &read,
+													 max_nodes));
+		uint64		unread = 0;
+
+		for (int side = 0; side < 2; side++)
+			for (int i = 0; i < sides[side].n; i++)
+				unread += sides[side].nodes[i].count;
+		changes = estimate >= (double) unread ? unread : (uint64) estimate;
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cxt);

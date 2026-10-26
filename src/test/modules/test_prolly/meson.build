@@ -187,6 +187,7 @@ tests += {
       'nearest_source',
       'near_sources',
       'reload_moves',
+      'spread_moves',
       'discarded_storage',
       'keyless_toast_folds',
       'vacuum_shared',
@@ -457,6 +458,7 @@ tests += {
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',
+      't/479_record_key_zero_byte.pl',
     ],
   },
 }
