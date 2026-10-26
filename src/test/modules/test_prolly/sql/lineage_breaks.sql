@@ -610,6 +610,72 @@ SELECT * FROM dolt_at('HEAD', NULL::ln.p) ORDER BY id;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.p) ORDER BY id;
 RESET ROLE;
 
+-- a collected commit's record goes after the collection; a live one's
+-- stays
+SELECT dolt_hashof('HEAD') AS live_commit \gset
+SELECT dolt_branch('abandon') IS NOT NULL AS made;
+SELECT dolt_checkout('abandon') IS NOT NULL AS on_abandon;
+INSERT INTO ln.p VALUES (90, 'abandoned');
+SELECT length(dolt_commit('-am', 'to abandon')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS abandoned \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'abandon') IS NOT NULL AS deleted;
+SELECT test_refs_record(:'abandoned') IS NOT NULL AS recorded;
+SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT test_refs_walk_reaches(:'abandoned') AS reached,
+	test_chunk_has(:'abandoned') AS stored,
+	test_refs_record(:'abandoned') IS NULL AS forgotten,
+	test_refs_record(:'live_commit') IS NOT NULL AS kept;
+SET ROLE regress_lb_reader;
+SELECT count(*) AS rows_live FROM dolt_at('HEAD', NULL::ln.p);
+RESET ROLE;
+-- (many at once are forgotten in one edit of the refs: what it appends
+-- doesn't grow a tree path per record)
+SELECT dolt_branch('abandon_many') IS NOT NULL AS made;
+SELECT dolt_checkout('abandon_many') IS NOT NULL AS on_many;
+DO $$
+BEGIN
+	FOR i IN 1..40 LOOP
+		INSERT INTO ln.p VALUES (100 + i, 'abandoned');
+		PERFORM dolt_commit('-am', 'to abandon ' || i);
+	END LOOP;
+END $$;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'abandon_many') IS NOT NULL AS deleted;
+SELECT pg_stat_force_next_flush();
+SELECT value AS forgotten_before FROM pg_stat_prolly WHERE name = 'records_forgotten' \gset
+SELECT value AS journal_before FROM pg_stat_prolly WHERE name = 'journal_bytes_written' \gset
+SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT pg_stat_force_next_flush();
+SELECT value - :forgotten_before AS forgotten
+FROM pg_stat_prolly WHERE name = 'records_forgotten';
+SELECT value - :journal_before < 20000 AS one_edit
+FROM pg_stat_prolly WHERE name = 'journal_bytes_written';
+-- a record names its routines and types through an entry records share:
+-- one only a collected commit's record named goes with it; one a live
+-- record names stays
+SELECT dolt_branch('routines') IS NOT NULL AS made;
+SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
+CREATE FUNCTION ln.kept_routine() RETURNS int LANGUAGE sql AS 'SELECT 1';
+SELECT length(dolt_commit('-Am', 'kept routine')::text) AS committed;
+SELECT dolt_branch('abandon_routine') IS NOT NULL AS made;
+SELECT dolt_checkout('abandon_routine') IS NOT NULL AS on_abandon;
+CREATE FUNCTION ln.abandoned_routine() RETURNS int LANGUAGE sql AS 'SELECT 2';
+SELECT length(dolt_commit('-Am', 'routine to abandon')::text) AS committed;
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
+	FROM '@([0-9a-f]{64})\n$') AS gone_owned \gset
+SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
+	FROM '@([0-9a-f]{64})\n$') AS live_owned \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'abandon_routine') IS NOT NULL AS deleted;
+SELECT :'gone_owned' <> :'live_owned' AS another_entry,
+	test_refs_value('J' || :'gone_owned') IS NOT NULL AS stored;
+SELECT dolt_gc() IS NOT NULL AS collected;
+SELECT test_refs_value('J' || :'gone_owned') IS NULL AS forgotten,
+	test_refs_value('J' || :'live_owned') IS NOT NULL AS kept;
+SELECT dolt_branch('-D', 'routines') IS NOT NULL AS deleted;
+
 -- commits made elsewhere (cloned) have no records: their versions are
 -- read by full readers only, and stay so under a commit made here
 \getenv abs_builddir PG_ABS_BUILDDIR

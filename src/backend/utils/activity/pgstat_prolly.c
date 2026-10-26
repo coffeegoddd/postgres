@@ -168,6 +168,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_COMMIT_CACHE_MISSES] = "commit_cache_misses",
 	[PGSTAT_PROLLY_KEPT_STATUS_CHECKS] = "kept_status_checks",
 	[PGSTAT_PROLLY_RESTORES_LOCK_BUSY] = "restores_lock_busy",
+	[PGSTAT_PROLLY_RECORDS_FORGOTTEN] = "records_forgotten",
 };
 
 /*

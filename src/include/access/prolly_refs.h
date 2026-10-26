@@ -857,6 +857,15 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*branches_named) (const char *prefix, ProllyBranchVisit visit,
 								   void *arg);
+
+	/*
+	 * Optional: forget the relation records of commits the chunk store no
+	 * longer has, as a step after a collection (true if any was), and the
+	 * entries records share (their routines and types) that no record left
+	 * names.  A record isn't a reference the collection follows, so it
+	 * would outlive its commit.
+	 */
+	bool		(*forget_records) (void);
 } ProllyRefsRoutine;
 
 /*
@@ -917,9 +926,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"pin_set", "pin_get", "pins", "recorded_relid", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
-	"made_object", "stash_set_maker", "last_fold", "branches_named"
+	"made_object", "stash_set_maker", "last_fold", "branches_named", \
+	"forget_records"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branches_named
+#define PROLLY_REFS_LAST_CALLBACK forget_records
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

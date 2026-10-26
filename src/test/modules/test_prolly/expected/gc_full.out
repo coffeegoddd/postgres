@@ -206,12 +206,12 @@ SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
              name              | chunks | settled 
 -------------------------------+--------+---------
  prolly_table_0000000000000004 |      1 | t
- prolly_table_0000000000000006 |      6 | t
- prolly_table_0000000000000008 |    163 | t
- prolly_table_000000000000000a |      7 | t
+ prolly_table_0000000000000006 |      7 | t
+ prolly_table_0000000000000008 |    164 | t
+ prolly_table_000000000000000a |      8 | t
 (4 rows)
 
-SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 7 FROM test_chunk_table_files()
+SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 8 FROM test_chunk_table_files()
 	WHERE name = 'prolly_table_000000000000000a'), true) AS diverged \gset
 SELECT freed > 0 AS freed FROM test_chunk_gc(true);
  freed 
@@ -231,9 +231,9 @@ WHERE name = :'live_file';
 SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
              name              | chunks | settled 
 -------------------------------+--------+---------
- prolly_table_0000000000000006 |      6 | t
- prolly_table_0000000000000008 |    163 | t
- prolly_table_000000000000000a |      7 | t
+ prolly_table_0000000000000006 |      7 | t
+ prolly_table_0000000000000008 |    164 | t
+ prolly_table_000000000000000a |      8 | t
 (3 rows)
 
 SELECT count(*) AS rows FROM app.t;

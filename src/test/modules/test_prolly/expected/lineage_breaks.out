@@ -1729,6 +1729,226 @@ SELECT * FROM dolt_at('HEAD~', NULL::ln.p) ORDER BY id;
 (1 row)
 
 RESET ROLE;
+-- a collected commit's record goes after the collection; a live one's
+-- stays
+SELECT dolt_hashof('HEAD') AS live_commit \gset
+SELECT dolt_branch('abandon') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('abandon') IS NOT NULL AS on_abandon;
+ on_abandon 
+------------
+ t
+(1 row)
+
+INSERT INTO ln.p VALUES (90, 'abandoned');
+SELECT length(dolt_commit('-am', 'to abandon')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS abandoned \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'abandon') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT test_refs_record(:'abandoned') IS NOT NULL AS recorded;
+ recorded 
+----------
+ t
+(1 row)
+
+SELECT dolt_gc() IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_refs_walk_reaches(:'abandoned') AS reached,
+	test_chunk_has(:'abandoned') AS stored,
+	test_refs_record(:'abandoned') IS NULL AS forgotten,
+	test_refs_record(:'live_commit') IS NOT NULL AS kept;
+ reached | stored | forgotten | kept 
+---------+--------+-----------+------
+ f       | f      | t         | t
+(1 row)
+
+SET ROLE regress_lb_reader;
+SELECT count(*) AS rows_live FROM dolt_at('HEAD', NULL::ln.p);
+ rows_live 
+-----------
+         2
+(1 row)
+
+RESET ROLE;
+-- (many at once are forgotten in one edit of the refs: what it appends
+-- doesn't grow a tree path per record)
+SELECT dolt_branch('abandon_many') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('abandon_many') IS NOT NULL AS on_many;
+ on_many 
+---------
+ t
+(1 row)
+
+DO $$
+BEGIN
+	FOR i IN 1..40 LOOP
+		INSERT INTO ln.p VALUES (100 + i, 'abandoned');
+		PERFORM dolt_commit('-am', 'to abandon ' || i);
+	END LOOP;
+END $$;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'abandon_many') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS forgotten_before FROM pg_stat_prolly WHERE name = 'records_forgotten' \gset
+SELECT value AS journal_before FROM pg_stat_prolly WHERE name = 'journal_bytes_written' \gset
+SELECT dolt_gc() IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value - :forgotten_before AS forgotten
+FROM pg_stat_prolly WHERE name = 'records_forgotten';
+ forgotten 
+-----------
+        40
+(1 row)
+
+SELECT value - :journal_before < 20000 AS one_edit
+FROM pg_stat_prolly WHERE name = 'journal_bytes_written';
+ one_edit 
+----------
+ t
+(1 row)
+
+-- a record names its routines and types through an entry records share:
+-- one only a collected commit's record named goes with it; one a live
+-- record names stays
+SELECT dolt_branch('routines') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
+ on_routines 
+-------------
+ t
+(1 row)
+
+CREATE FUNCTION ln.kept_routine() RETURNS int LANGUAGE sql AS 'SELECT 1';
+SELECT length(dolt_commit('-Am', 'kept routine')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('abandon_routine') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('abandon_routine') IS NOT NULL AS on_abandon;
+ on_abandon 
+------------
+ t
+(1 row)
+
+CREATE FUNCTION ln.abandoned_routine() RETURNS int LANGUAGE sql AS 'SELECT 2';
+SELECT length(dolt_commit('-Am', 'routine to abandon')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
+	FROM '@([0-9a-f]{64})\n$') AS gone_owned \gset
+SELECT dolt_checkout('routines') IS NOT NULL AS on_routines;
+ on_routines 
+-------------
+ t
+(1 row)
+
+SELECT substring(convert_from(test_refs_record(dolt_hashof('HEAD')), 'UTF8')
+	FROM '@([0-9a-f]{64})\n$') AS live_owned \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'abandon_routine') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT :'gone_owned' <> :'live_owned' AS another_entry,
+	test_refs_value('J' || :'gone_owned') IS NOT NULL AS stored;
+ another_entry | stored 
+---------------+--------
+ t             | t
+(1 row)
+
+SELECT dolt_gc() IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_refs_value('J' || :'gone_owned') IS NULL AS forgotten,
+	test_refs_value('J' || :'live_owned') IS NOT NULL AS kept;
+ forgotten | kept 
+-----------+------
+ t         | t
+(1 row)
+
+SELECT dolt_branch('-D', 'routines') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
 -- commits made elsewhere (cloned) have no records: their versions are
 -- read by full readers only, and stay so under a commit made here
 \getenv abs_builddir PG_ABS_BUILDDIR

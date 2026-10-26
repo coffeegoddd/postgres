@@ -331,14 +331,24 @@ A history read of a table's rows (dolt_at, dolt_history_table, dolt_diff,
 dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
-a branch records the relations its working set's tables were ('L', refs
-format 17: each table's, partitioned table's and materialized view's
+a branch records the relations its working set's tables were (refs
+format 18: in a tree of records apart from the refs, under each
+commit's id, its root the refs' 'F' entry, so that the refs a commit
+changes stay as small, and a commit's work as flat, however many commits
+came before it, and the entries a commit changes are applied to the refs
+in one edit as it publishes; each table's, partitioned table's and
+materialized view's
 OID, owner's OID, kind, owner's name and qualified name, a line each,
 the names'
 backslashes and newlines escaped so that no name makes a line of its
 own, and since format 16 quoted as with quote_all_identifiers off in any
 session, as commits name tables; read strictly, a damaged record
-refused), and a version is the
+refused; a record isn't a reference a collection follows, so after each
+collection, as a step of its own, the records of the commits the store
+no longer has are forgotten, with the shared entries of routines and
+types ('J') no record left names: refs' forget_records(); a transaction
+whose commit found such an entry stored, and so didn't write it, puts it
+back when it publishes over a root moved since), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as
@@ -821,8 +831,8 @@ the object access hook as it runs, so this costs only as much as the move
 changes.
 
 The source's relation is the one the branch's records of its head's
-relations list under the name (quoted and escaped as 'L' records write
-names): its tables' ('N', the record its commits' 'L' records are made
+relations list under the name (quoted and escaped as commits' records write
+names): its tables' ('N', the record its commits' records are made
 from) and its other relations' with privileges of their own ('H': views,
 sequences, partitioned and foreign tables), both written by each of its
 commits, and only while the branch's head is their commit.  One of the
@@ -830,7 +840,7 @@ name made since, uncommitted (another relation, perhaps of another
 kind), gives nothing, nor does a branch whose head moved without a
 commit (a fast-forward, a reset).  A branch made from another starts
 with both records, as with its relations, of the same OIDs: its first
-commit's 'L' record so keeps what its start point's had, as a later
+commit's record so keeps what its start point's had, as a later
 commit's keeps its parent's.  dolt_integrate()
 merges so too.  A cherry-pick of one ref that names a branch (so picks
 its head) takes that branch's privileges alone; one of a commit named

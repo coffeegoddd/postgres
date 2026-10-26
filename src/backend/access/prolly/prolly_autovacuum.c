@@ -330,6 +330,9 @@ collect(void)
 								 get_database_name(MyDatabaseId))));
 		return;
 	}
+	/* (then, a step of its own, the records of the commits it took) */
+	if (PROLLY_HAS(dc.refs, forget_records))
+		(void) PROLLY_CALL(dc.refs, forget_records);
 	ereport(DEBUG1,
 			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 get_database_name(MyDatabaseId),

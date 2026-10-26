@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD10
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD11
 
 typedef struct PgStat_ArchiverStats
 {
@@ -813,9 +813,12 @@ typedef enum PgStat_ProllyCounter
 										 * up on, its lock held past the
 										 * wait for it: its rows written
 										 * instead */
+	PGSTAT_PROLLY_RECORDS_FORGOTTEN,	/* relation records of collected
+										 * commits forgotten after a
+										 * collection */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RESTORES_LOCK_BUSY + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RECORDS_FORGOTTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {
