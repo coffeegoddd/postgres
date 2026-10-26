@@ -68,6 +68,13 @@ extern bool branch_fold_known_at(Oid branch, Snapshot snap,
 extern bool branch_fold_unchanged(const BranchFoldStamp *at);
 
 /*
+ * The current database's branches with a fold known, at most max of them:
+ * from a table of fixed size, not a listing of the branches.
+ */
+#define BRANCH_FOLD_KNOWN_MAX	1024
+extern int	branch_fold_known_branches(Oid *branches, int max);
+
+/*
  * The last fold of branch known, writers having ended or writing since
  * (one still known, nobody writing, is branch_fold_known()'s): its root, if
  * it left nothing out, was folded from baseline (NULL: none), and nothing

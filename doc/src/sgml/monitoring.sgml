@@ -5740,8 +5740,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>commits</literal> (commits written),
        <literal>head_moves</literal> (branch heads set),
        <literal>branches_listed</literal> (branches visited by listings of
-       every branch with copies, which an operation whose work is not to
-       grow with the number of branches makes none of),
+       the branches with copies: of every one, which an operation whose work
+       is not to grow with the number of branches makes none of, or in name
+       order until enough are found),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>
        (lookups of the value memo),
        <literal>page_copies_fold</literal> and

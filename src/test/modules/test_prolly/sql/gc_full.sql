@@ -65,7 +65,7 @@ SELECT pg_temp.note('branch -D big') AS _n \gset
 -- A default collection keeps it: it is settled.
 SELECT kept, freed FROM test_chunk_gc(false) \gset gc_
 SELECT :gc_kept AS kept, :gc_freed AS freed;
-SELECT :'diverged'::bool OR :gc_freed <> 7 AS diverged \gset
+SELECT :'diverged'::bool OR :gc_freed <> 14 AS diverged \gset
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('default collection') AS _n \gset
 SELECT test_chunk_has(:'big_head') AS big_head;

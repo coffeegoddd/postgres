@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 import sys
 import tomllib
 from dataclasses import asdict, dataclass
@@ -287,9 +288,31 @@ EXPLAIN = {
 }
 
 
+def median_of(reps: list[dict]) -> dict:
+    """One cell's repetitions as one series: each counter's median at each
+    point (the lower of the middle two of an even count).  The counters
+    vary a little from run to run: the refs' index keys sit at hash-random
+    places, so an edit splits a node now and then, doubling one point's
+    nodes, and catalog reads, cache misses and journal bytes move with
+    what else ran.  The median of three drops a one-off spike or dip at a
+    point without taking any repetition's outlier as the work."""
+    out = json.loads(json.dumps(reps[0]))
+    for sweep, sw in out.items():
+        for check, counters in sw["checks"].items():
+            for counter, values in counters.items():
+                runs = [values]
+                for r in reps[1:]:
+                    other = r.get(sweep, {}).get("checks", {}).get(check, {}).get(counter)
+                    if other is not None and len(other) == len(values):
+                        runs.append(other)
+                values[:] = [statistics.median_low(point) for point in zip(*runs)]
+    return out
+
+
 def series_of(run_dir: Path) -> list[dict]:
-    """Each V9 cell's series, from its raw directory."""
-    out = []
+    """Each V9 cell's series, from its raw directory: a cell's repetitions
+    taken as one (median_of())."""
+    cells: dict[str, list[dict]] = {}
     for line in (run_dir / "results.jsonl").read_text().splitlines():
         if not line.strip():
             continue
@@ -298,8 +321,10 @@ def series_of(run_dir: Path) -> list[dict]:
             continue
         if r.get("status") not in (None, "ok"):
             raise SystemExit(f"V9 cell {r['key']} did not complete: {r.get('status')}")
-        out.append(json.loads((run_dir / r["raw_dir"] / "v9-series.json").read_text()))
-    return out
+        key = json.dumps({k: v for k, v in r["key"].items() if k != "rep"}, sort_keys=True)
+        cells.setdefault(key, []).append(
+            json.loads((run_dir / r["raw_dir"] / "v9-series.json").read_text()))
+    return [median_of(reps) for reps in cells.values()]
 
 
 def table(findings: list[Finding]) -> str:

@@ -113,6 +113,7 @@ tests += {
       'branch_switch_caches',
       'checkout_branch_count',
       'branch_count_work',
+      'branch_index_work',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',
