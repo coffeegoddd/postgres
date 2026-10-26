@@ -42020,7 +42020,7 @@
       "index": 12,
       "name": "dolt_rebase errors: data conflicts when @@autocommit is enabled",
       "source_sha256": "028308a9527093249b1b2fba958091147b3d81da436a62a94dcc319b4840498e",
-      "scenario_sha256": "1a59abd11b3bf02f20c36fce0f7ed36d8a1c9a9cb8e9750d0e7454ec9356744a",
+      "scenario_sha256": "6ab649eec033de98c6b5888f9a2a4bf51624c5f98db8a78f93fdde659f4ad4ac",
       "setup": [
         {
           "index": 0,
@@ -42119,37 +42119,35 @@
         {
           "index": 3,
           "steps": [
-            "assert-3",
-            "assert-4",
-            "assert-5"
+            "assert-3"
           ],
-          "note": "Dolt's ErrRebaseDataConflictsCantBeResolved: outside a transaction block the conflicts fail the statement, 40001 (D4), and its error rolls it back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseDataConflictsCantBeResolved, its message checked: outside a transaction block, without dolt.allow_commit_conflicts (Dolt's @@autocommit and @@dolt_allow_commit_conflicts), the conflicts can't be kept, and the rebase is aborted as Dolt aborts it, the abort kept: status 1 with Dolt's message where Dolt errors, as an error would roll the abort back. (D5)"
         },
         {
           "index": 4,
           "steps": [
-            "assert-6"
+            "assert-4"
           ],
           "note": "Preserved expected rows; active_branch() as a function call."
         },
         {
           "index": 5,
           "steps": [
-            "assert-7"
+            "assert-5"
           ],
           "note": "Preserved expected rows, compared as a bag."
         },
         {
           "index": 6,
           "steps": [
-            "assert-8"
+            "assert-6"
           ],
           "note": "Expected error checked as its SQLSTATE: the plan is there only during a rebase, 42P01 as Dolt's missing table. (D4)"
         },
         {
           "index": 7,
           "steps": [
-            "assert-9"
+            "assert-7"
           ],
           "note": "Preserved expected rows."
         }
@@ -42160,7 +42158,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "A conflict outside a transaction block fails --continue, which rolls back: the rebase stays as it was before it, where Dolt aborts it. (D5)"
+        "Conflicts that can't be kept at --continue abort the rebase and return status 1 with Dolt's message, where Dolt errors: an error would roll the abort back. (D5)"
       ]
     },
     {
@@ -43469,7 +43467,7 @@
       "index": 24,
       "name": "dolt_rebase: schema conflicts",
       "source_sha256": "f9f2656196884cae0f67e5c0b547e8941eced7bcd816a9f92959be4c1cdd6136",
-      "scenario_sha256": "02d3454ad14c299fddbd33915fecc91bf8054bedebff3566ef76c4a778d62689",
+      "scenario_sha256": "f334dec86cc365ea894b6e485fe0259a2f1134a6e6616751dd4441df7630b095",
       "setup": [
         {
           "index": 0,
@@ -43583,33 +43581,30 @@
         {
           "index": 3,
           "steps": [
-            "assert-3",
-            "assert-4",
-            "assert-4-schema",
-            "assert-5"
+            "assert-3"
           ],
-          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), and the failed pick kept no schema conflicts (checked: dolt_schema_conflicts is empty), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseSchemaConflict, its message checked: the rebase is aborted as Dolt aborts it, and the abort kept, so status 1 with Dolt's message where Dolt errors; an error would roll the abort back with the --continue. (D5)"
         },
         {
           "index": 4,
           "steps": [
-            "assert-6"
+            "assert-4"
           ],
           "note": "Expected error checked as its SQLSTATE: no rebase in progress, 55000. (D4)"
         },
         {
           "index": 5,
           "steps": [
-            "assert-7"
+            "assert-5"
           ],
           "note": "Preserved expected rows; active_branch() as a function call."
         },
         {
           "index": 6,
           "steps": [
-            "assert-8"
+            "assert-6"
           ],
-          "note": "Preserved expected rows: none. In prolly that is because the failed --continue rolled itself back and kept nothing (checked before the abort too), not because the rebase aborted; a pick keeps no schema conflicts, so no rebase state holds any for an abort to leave behind. (D5)"
+          "note": "Preserved expected rows: none, the rebase aborted."
         }
       ],
       "adaptations": [
@@ -43618,7 +43613,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "A schema conflict fails --continue, which rolls back: the rebase stays as it was before it, where Dolt aborts it. (D5)"
+        "A schema conflict at --continue aborts the rebase and returns status 1 with Dolt's message, where Dolt errors: an error would roll the abort back. (D5)"
       ]
     },
     {

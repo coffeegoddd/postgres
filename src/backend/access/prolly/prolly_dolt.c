@@ -4984,15 +4984,146 @@ rebase_commit_stopped(const ProllyRebaseState *rs, const ProllyRebaseStep *s)
 	settled();
 }
 
+static void rebase_abort(void);
+
+/*
+ * Whether an error is a merge's schema conflict, which says so first
+ * (matched untranslated).
+ */
+static bool
+is_schema_conflict(const ErrorData *ed)
+{
+	return ed->message_id != NULL &&
+		strncmp(ed->message_id, "schema conflict", strlen("schema conflict")) == 0;
+}
+
+/*
+ * A schema conflict at a rebase's step, failed with Dolt's message (the
+ * conflict's own message its detail).
+ */
+static void
+rebase_schema_conflict(const char *ref, const ErrorData *ed)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("schema conflict detected while rebasing commit %s. "
+					"the rebase has been automatically aborted", ref),
+			 errdetail_internal("%s", ed->message)));
+}
+
+/*
+ * A step's pick: the conflicts it left, or -1 where Dolt aborts the
+ * rebase as it fails it (*why: Dolt's message).  That is a schema
+ * conflict, or conflicts the session can't keep (outside a transaction
+ * block, without dolt.allow_commit_conflicts).
+ *
+ * A rebase the statement began (begun_here) is rolled back by an error,
+ * which leaves what Dolt's abort does: a schema conflict fails with
+ * Dolt's message, conflicts not kept as the caller says.  For one begun
+ * before, an error would roll the statement back to the rebase as it was
+ * before it, so the pick runs in a subtransaction of its own, rolled
+ * back for the rebase to be aborted, which the statement then commits.
+ */
+static int
+rebase_pick_or_abort(const char *ref, ProllyHash *picked, ProllyHash *id,
+					 bool begun_here, const char **why)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int			conflicts = 0;
+	ErrorData  *schema_conflict = NULL;
+
+	/* (asked first: in the subtransaction, every statement is in a block) */
+	bool		keep = IsTransactionBlock() || prolly_allow_commit_conflicts();
+
+	if (begun_here)
+	{
+		PG_TRY();
+		{
+			VERSION_MOVE(picked, picked->len > 0 ? 1 : 0,
+						 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
+												 true, id));
+		}
+		PG_CATCH();
+		{
+			ErrorData  *ed;
+
+			MemoryContextSwitchTo(cxt);
+			ed = CopyErrorData();
+			if (!is_schema_conflict(ed))
+				PG_RE_THROW();
+			FlushErrorState();
+			rebase_schema_conflict(ref, ed);
+		}
+		PG_END_TRY();
+		return conflicts;
+	}
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		VERSION_MOVE(picked, picked->len > 0 ? 1 : 0,
+					 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
+											 true, id));
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (!is_schema_conflict(ed))
+			ReThrowError(ed);
+		schema_conflict = ed;
+	}
+	PG_END_TRY();
+	if (schema_conflict == NULL)
+	{
+		if (conflicts > 0 && !keep)
+			RollbackAndReleaseCurrentSubTransaction();
+		else
+			ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (conflicts == 0 || keep)
+			return conflicts;
+	}
+	rebase_abort();
+	if (schema_conflict != NULL)
+	{
+		/* (Dolt's message doesn't say which; the notice does) */
+		ereport(NOTICE,
+				(errmsg_internal("%s", schema_conflict->message),
+				 schema_conflict->detail ?
+				 errdetail_internal("%s", schema_conflict->detail) : 0));
+		FreeErrorData(schema_conflict);
+		*why = psprintf("schema conflict detected while rebasing commit %s. "
+						"the rebase has been automatically aborted", ref);
+	}
+	else
+		*why = "data conflicts from rebase, but session settings do not allow preserving conflicts, "
+			"so they cannot be resolved. The rebase has been aborted. "
+			"Run the rebase in a transaction block or set dolt.allow_commit_conflicts to on, "
+			"and try the rebase again to resolve the conflicts.";
+	return -1;
+}
+
 /*
  * Go on with the plan from the step after the last begun: each picked
  * onto the rebase's branch and made what its action says.  A step that
  * conflicts, or an edit, stops it (result: the status and why); the last
  * done, the rebased branch is moved to the rebase's head, checked out, and
- * the rebase's branch deleted.
+ * the rebase's branch deleted.  Where Dolt aborts it, a rebase this
+ * statement didn't begin (begun_here false) is aborted, and one it began
+ * fails: see rebase_pick_or_abort().
  */
 static void
-rebase_continue(const char **result)
+rebase_continue(const char **result, bool begun_here)
 {
 	const ProllyRefsRoutine *r = rebase_refs();
 	ProllyRebaseState rs;
@@ -5111,9 +5242,12 @@ rebase_continue(const char **result)
 			ProllyHash	picked = {0};
 
 			(void) PROLLY_CALL(r, resolve, ref, &picked);
-			VERSION_MOVE(&picked, picked.len > 0 ? 1 : 0,
-						 conflicts = PROLLY_CALL(diff_merge(), cherry_pick, &ref, 1,
-												 true, &id));
+			if ((conflicts = rebase_pick_or_abort(ref, &picked, &id, begun_here,
+												  &result[1])) < 0)
+			{
+				result[0] = "1";
+				return;
+			}
 		}
 		if (conflicts > 0)
 		{
@@ -5273,7 +5407,7 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	{
 		bool		pushed = hold_unmoved("dolt_rebase('--continue')");
 
-		rebase_continue(result);
+		rebase_continue(result, false);
 		if (pushed)
 			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
@@ -5293,7 +5427,7 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	{
 		bool		pushed = hold_unmoved("dolt_rebase()");
 
-		rebase_continue(result);
+		rebase_continue(result, true);
 		if (pushed)
 			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
