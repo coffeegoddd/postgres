@@ -51,3 +51,6 @@ deltas = [700, 2800, 11200, 44800]
 # branch beside the table, at others_rows rows
 others = [32, 128, 512, 2048]
 others_rows = 4000
+# K for the branches sweep (64x): K other branches, each used once (with
+# copies), beside the table, at others_rows rows
+branches = [8, 32, 128, 512]

@@ -528,7 +528,8 @@ class V9(VWorkload):
     pg_stat_prolly, at four or more table sizes N (the "rows" sweep, Δ
     fixed), four or more change sizes Δ (the "delta" sweep, N fixed) and
     four or more counts K of unrelated objects (the "catalog" sweep, N and
-    Δ fixed), each point on a fresh database.  vshape fits each counter's
+    Δ fixed) and four or more counts K of other branches with copies (the
+    "branches" sweep, N and Δ fixed), each point on a fresh database.  vshape fits each counter's
     growth and gates it against the operation's target (vshape.TARGETS).
 
     The catalog sweep's unrelated objects are K shared tables in a plain
@@ -579,18 +580,20 @@ class V9(VWorkload):
         others = [int(k) for k in p.get("others", [32, 128, 512, 2048])]
         delta, fixed = int(p.get("delta", 10)), int(p.get("delta_rows", 64000))
         others_rows = int(p.get("others_rows", 4000))
+        branches = [int(k) for k in p.get("branches", [8, 32, 128, 512])]
         for n in rows + [others_rows]:
             if delta >= n:
                 raise ValueError(f"V9's delta {delta} must be fewer than its rows {n}")
         for d in deltas:
             if d >= fixed:
                 raise ValueError(f"V9's delta {d} must be fewer than delta_rows {fixed}")
-        for levels in (rows, deltas, others):
+        for levels in (rows, deltas, others, branches):
             if len(levels) < 4 or min(levels) <= 0 or max(levels) / min(levels) < 8:
                 raise ValueError("each V9 sweep needs four levels or more spanning 8x")
         return {"rows": [(n, delta, 0) for n in rows],
                 "delta": [(fixed, d, 0) for d in deltas],
-                "catalog": [(others_rows, delta, k) for k in others]}
+                "catalog": [(others_rows, delta, k) for k in others],
+                "branches": [(others_rows, delta, k) for k in branches]}
 
     # (the catalogs' block fetches summed over every OID they can have, so
     # that the reading reads no catalog itself)
@@ -620,6 +623,19 @@ class V9(VWorkload):
                 EXECUTE format('CREATE TABLE v9_o%s {table}', g);
                 IF g % 100 = 0 THEN COMMIT; END IF;
             END LOOP; END $$;
+            SELECT dolt_checkout('main');
+        """
+
+    @staticmethod
+    def branches(k: int) -> str:
+        """K branches beside main, each used (made at a commit before the
+        table's, and checked out once, so that each has copies, which a
+        listing of the branches visits)."""
+        return f"""
+            CREATE TABLE v9_first (id int PRIMARY KEY);
+            {VC_SQL.commit('v9 start')};
+            SELECT count(dolt_branch('v9_k' || g)) FROM generate_series(1, {k}) g;
+            SELECT count(dolt_checkout('v9_k' || g)) FROM generate_series(1, {k}) g;
             SELECT dolt_checkout('main');
         """
 
@@ -681,7 +697,8 @@ class V9(VWorkload):
             if setup:
                 ctx.cluster.sql(setup, dbname=db)
             if k:
-                ctx.cluster.sql(self.unrelated(k), dbname=db, options=ctx.session_options())
+                setup_k = self.branches(k) if sweep == "branches" else self.unrelated(k)
+                ctx.cluster.sql(setup_k, dbname=db, options=ctx.session_options())
             ctx.cluster.sql(f"""
                 CREATE TABLE v9 (id bigint PRIMARY KEY, v int NOT NULL, payload text NOT NULL)
                     WITH (fillfactor = 10, autovacuum_enabled = off);
@@ -720,7 +737,8 @@ class V9(VWorkload):
         metrics: dict = {}
         points = 0
         for sweep, pts in self.sweeps(ctx).items():
-            levels = [{"rows": n, "delta": d, "catalog": k}[sweep] for n, d, k in pts]
+            levels = [{"rows": n, "delta": d, "catalog": k, "branches": k}[sweep]
+                      for n, d, k in pts]
             counted = [self.point(ctx, sweep, n, d, k) for n, d, k in pts]
             points += len(pts)
             checks: dict = {}
@@ -728,7 +746,7 @@ class V9(VWorkload):
                 # (a counter the server doesn't report is missing, not 0)
                 names = set.intersection(*(set(c[label]) for c in counted))
                 checks[label] = {name: [c[label][name] for c in counted] for name in sorted(names)}
-                for name in vshape.WORK + vshape.CATALOG:
+                for name in vshape.WORK + vshape.CATALOG + vshape.BRANCHES:
                     if name in checks[label]:
                         b = vshape.growth(levels, checks[label][name], vshape.FLOORS[name])
                         metrics[f"{label}_{sweep}_{name}_growth"] = b

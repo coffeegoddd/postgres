@@ -1191,6 +1191,7 @@ copies_branches(BranchVisit visit, void *arg)
 	{
 		Form_pg_branch b = (Form_pg_branch) GETSTRUCT(tup);
 
+		pgstat_count_prolly(PGSTAT_PROLLY_BRANCHES_LISTED, 1);
 		visit(NameStr(b->brname), b->oid, arg);
 	}
 	systable_endscan(scan);
