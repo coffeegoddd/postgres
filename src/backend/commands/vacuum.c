@@ -2410,6 +2410,17 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		INJECTION_POINT("vacuum-index-cleanup-disabled", NULL);
 	else if (params.index_cleanup == VACOPTVALUE_ENABLED)
 		INJECTION_POINT("vacuum-index-cleanup-enabled", NULL);
+
+	/*
+	 * (the relation held, told its file number: a branch's copy is told
+	 * apart from another branch's that way)
+	 */
+	{
+		char		filenode[16];
+
+		snprintf(filenode, sizeof(filenode), "%u", rel->rd_locator.relNumber);
+		INJECTION_POINT("vacuum-relation-held", filenode);
+	}
 #endif
 
 	/*

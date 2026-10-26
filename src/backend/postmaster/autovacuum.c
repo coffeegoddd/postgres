@@ -2632,6 +2632,7 @@ do_autovacuum(void)
 				errcontext("automatic analyze of table \"%s.%s.%s\"",
 						   tab->at_datname, tab->at_nspname, tab->at_relname);
 			EmitErrorReport();
+			INJECTION_POINT("autovacuum-table-error", NULL);
 
 			/* this resets ProcGlobal->statusFlags[i] too */
 			AbortOutOfAnyTransaction();

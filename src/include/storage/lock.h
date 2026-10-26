@@ -410,6 +410,9 @@ extern bool LockHasWaiters(const LOCKTAG *locktag,
 extern bool AnyLockHasWaiters(void);
 extern VirtualTransactionId *GetLockConflicts(const LOCKTAG *locktag,
 											  LOCKMODE lockmode, int *countp);
+extern int	CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
+									VirtualTransactionId *asked, int *nasked,
+									int maxasked);
 extern void AtPrepare_Locks(void);
 extern void PostPrepare_Locks(FullTransactionId fxid);
 extern bool LockCheckConflicts(LockMethod lockMethodTable,

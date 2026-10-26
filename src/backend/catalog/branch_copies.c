@@ -202,27 +202,106 @@ copy_storage(Form_pg_class c)
 	return relnumber;
 }
 
+/* the longest wait between tries at a lock a move restores under */
+#define KEPT_LOCK_MAX_DELAY_MS	10
+
+/* prolly.restore_lock_wait: how long a lock's other holders are waited for */
+int			prolly_restore_lock_wait = 100;
+
 /*
- * Try 'mode' on relation relid, as ConditionalLockRelationOid() does, but
- * waiting out a page sweep that holds it: asked, it lets go after the move
- * under way (bmap_compaction_let_go()), as it does for a waiter in the
- * lock's queue, so a hold of a moment doesn't turn the try away.  Any
- * other holder does.  *start is the operation's (see BranchOpsRoutine's
- * share()).
+ * Try 'mode' on tag, the lock of relation relid on the branch it names
+ * (taken as ConditionalLockRelationOid() takes it), or, for InvalidOid,
+ * on a lock of another branch's relation, as LockAcquire() tries it.  A
+ * holder that would turn the try away is dealt with first:
+ *
+ * - a page sweep is asked to let go after the move under way
+ *   (bmap_compaction_let_go()), as it does for a waiter in the lock's
+ *   queue, and waited out;
+ * - an autovacuum worker is asked to cancel its task
+ *   (CancelAutoVacuumHolders()), once, as Postgres asks one blocking a
+ *   lock waiter, and waited for: it gives up its vacuum at its next check
+ *   for interrupts, and comes back to the relation later;
+ * - any other holder is waited for, tried again a little later each time.
+ *
+ * The waits are short, and never as long as it takes, because giving up
+ * costs only the rows the move then writes instead, and because the
+ * deadlock detector doesn't see them: the caller holds the locks it has
+ * taken (the relations restored before, and pg_class), and a holder
+ * waiting for one of them waits for as long as this does.  A statement
+ * holding the lock lets go within a moment, a transaction left open won't
+ * soon: other holders are waited for until prolly.restore_lock_wait after
+ * the operation's first wait.  A worker asked to cancel is sure to go, so
+ * workers are waited for longer, until deadlock_timeout after the
+ * operation first asked one (Postgres's own wait before it cancels one);
+ * once both waits are spent, none is asked.
+ * lock_timeout, if set, caps both.  Both run from *wait, the operation's,
+ * so they bound all its tries together, however many relations it locks.
+ * False if the holder is still there after them, counted in
+ * restores_lock_busy.
  */
 static bool
-try_lock_relation(Oid relid, LOCKMODE mode, TimestampTz *start)
+try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, BranchLockWait *wait)
+{
+	int			bound = prolly_restore_lock_wait;
+	int			cancel_bound = DeadlockTimeout;
+	long		delay = 1;
+
+	if (LockTimeout > 0)
+	{
+		bound = Min(bound, LockTimeout);
+		cancel_bound = Min(cancel_bound, LockTimeout);
+	}
+	for (;;)
+	{
+		TimestampTz now;
+		bool		others_done;
+
+		CHECK_FOR_INTERRUPTS();
+		if (OidIsValid(relid) ? ConditionalLockRelationOid(relid, mode) :
+			LockAcquire(tag, mode, false, true) != LOCKACQUIRE_NOT_AVAIL)
+			return true;
+		if (bmap_compaction_let_go(tag, &wait->start))
+			continue;
+		now = GetCurrentTimestamp();
+		if (wait->start == 0)
+			wait->start = now;
+		others_done = TimestampDifferenceExceeds(wait->start, now, bound);
+
+		/*
+		 * (a worker is asked only while one asked could still be waited
+		 * for: once the workers' wait is spent too, the move writes the
+		 * rows anyway, and a cancel would only cost the worker its vacuum)
+		 */
+		if (!(others_done && wait->asked != 0 &&
+			  TimestampDifferenceExceeds(wait->asked, now, cancel_bound)) &&
+			CancelAutoVacuumHolders(tag, mode, wait->asked_xacts,
+									&wait->nasked,
+									BRANCH_LOCK_WAIT_MAX_ASKED) > 0 &&
+			wait->asked == 0)
+			wait->asked = now;
+		if (others_done &&
+			(wait->asked == 0 ||
+			 TimestampDifferenceExceeds(wait->asked, now, cancel_bound)))
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_RESTORES_LOCK_BUSY, 1);
+			return false;
+		}
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 delay, WAIT_EVENT_BRANCH_KEPT_LOCK);
+		ResetLatch(MyLatch);
+		delay = Min(delay * 2, KEPT_LOCK_MAX_DELAY_MS);
+	}
+}
+
+/* try_lock() on relation relid of the session's branch */
+static bool
+try_lock_relation(Oid relid, LOCKMODE mode, BranchLockWait *wait)
 {
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid,
 								relation_lock_branch(relid));
-	while (!ConditionalLockRelationOid(relid, mode))
-	{
-		if (!bmap_compaction_let_go(&tag, start))
-			return ConditionalLockRelationOid(relid, mode);
-	}
-	return true;
+	return try_lock(&tag, relid, mode, wait);
 }
 
 /* the longest wait between tries at the copy's locks, in milliseconds */
@@ -1347,7 +1426,7 @@ stored_alike(Oid relid, Oid source, Form_pg_class oc, Form_pg_class tc)
  */
 static bool
 copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
-			 void *arg, TimestampTz *wait_start)
+			 void *arg, BranchLockWait *wait)
 {
 	Relation	pg_class;
 	List	   *ours = NIL;
@@ -1365,10 +1444,10 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	{
 		LOCKTAG		tag;
 
-		if (!try_lock_relation(relid, AccessExclusiveLock, wait_start))
+		if (!try_lock_relation(relid, AccessExclusiveLock, wait))
 			return false;
 		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, source);
-		if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		if (!try_lock(&tag, InvalidOid, ShareLock, wait))
 			return false;
 	}
 	AcceptInvalidationMessages();
@@ -1893,7 +1972,7 @@ static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
 			   BranchKeptRelation *renewed, const BranchKeptRelation *carry,
 			   int ncarry, BranchKeptRelation *carried,
-			   TimestampTz *wait_start)
+			   BranchLockWait *wait)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -1930,7 +2009,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
 		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock,
-							   wait_start))
+							   wait))
 			ok = false;
 		changed[i] = true;
 	}
@@ -2015,7 +2094,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 static bool
 copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 				  const BranchKeptRelation *carry, int ncarry,
-				  BranchKeptRelation *carried, TimestampTz *wait_start)
+				  BranchKeptRelation *carried, BranchLockWait *wait)
 {
 	bool		other = source != MyBranch;
 	Relation	pg_class;
@@ -2038,13 +2117,13 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		LOCKTAG		tag;
 
 		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock,
-							   wait_start))
+							   wait))
 			return false;
 		if (!other)
 			continue;
 		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, kept[i].relid, source);
-		if (LockAcquire(&tag, ShareUpdateExclusiveLock, false, true) ==
-			LOCKACQUIRE_NOT_AVAIL)
+		if (!try_lock(&tag, InvalidOid, ShareUpdateExclusiveLock,
+					  wait))
 			return false;
 	}
 	AcceptInvalidationMessages();
