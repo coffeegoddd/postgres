@@ -33023,7 +33023,7 @@
       "index": 17,
       "name": "popping stash with added table with PK on current head with the exact same table is added already",
       "source_sha256": "1f06133d0a2010a07744b83be21f68c3ce85d1958296456f0cafe3260d402ca0",
-      "scenario_sha256": "41ea86fa353871a6687d8f8b9ffff3dad05002909136ead87d01f627def73238",
+      "scenario_sha256": "41a3b44cd4f73b9d79c99438d054825c1b99577c072d92ce148289622ebd5586",
       "setup": [
         {
           "index": 0,
@@ -33124,7 +33124,7 @@
           "steps": [
             "assert-2"
           ],
-          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+          "note": "The pop stops on a table identity conflict (40001): branch2's new_test, made apart from the stash's, is another relation, and a stash's apply refuses it, where Dolt matches the tables by name. (D26)"
         },
         {
           "index": 3,
@@ -33137,7 +33137,8 @@
       "adaptations": [
         "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
-        "DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)"
+        "DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "A table made apart on each branch is another relation, so the pop stops on a table identity conflict instead of succeeding; status then shows nothing, the stash kept. (D26)"
       ]
     },
     {

@@ -38,11 +38,11 @@
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
  *				   working set named them: the head's hash, then a line
- *				   per table (its OID, then its qualified name, as 'L'
+ *				   per table (its OID, owner and qualified name, as 'L'
  *				   lines are)
  *	'H' name	-> the head's other relations with privileges of their own
- *				   (views, materialized views, sequences, partitioned and
- *				   foreign tables), as 'N' has its tables: the head's hash,
+ *				   (views, materialized views, sequences and foreign
+ *				   tables), as 'N' has its tables: the head's hash,
  *				   then a line for each (as 'L' lines are), none written
  *				   when there are none; a merge of the branch, or a pick
  *				   of its head, takes their privileges
@@ -73,13 +73,34 @@
  *				   each but the snapshot, native byte order)
  *	'L' commit	-> the relations the commit was made from, as this database
  *				   made it (commits fetched, cloned or pushed here have
- *				   none): a line for each prolly table, its OID (10 digits),
- *				   a space, and its qualified name (a backslash in it
- *				   written as two, a newline as a backslash and 'n')
- *	'J' relid	-> the relation (its OID, 10 digits) relation relid (the
- *				   same) is the same table as, its class's: a relation a
- *				   move made again of a table, or a merge made of the
- *				   other side's, is its; one without an entry is its own
+ *				   none): a line for each prolly table, partitioned
+ *				   table and materialized view, and for each other object
+ *				   a commit may hold (the canonicalizer's
+ *				   prolly_owned_objects(): views, sequences, foreign
+ *				   tables, routines, types, schemas, collations, each
+ *				   named as commits' items name it): its OID and its owner's
+ *				   (10 digits each, a space after each), its kind (its
+ *				   relkind, then a space), its owner's name (escaped as
+ *				   the name is, and a space as a backslash and 's'; a
+ *				   space after), and its qualified name (a backslash in it
+ *				   written as two, a newline as a backslash and 'n'); the
+ *				   routines and types last, by reference: a line of '@'
+ *				   and the hex SHA-256 of their lines (none if there are
+ *				   none), held under 'J'
+ *	'J' hash	-> the lines of a record's routines and types (as 'L'
+ *				   lines are, sorted), under their content's hash in hex,
+ *				   written once and named by every record listing them
+ *	'D' name	-> the branch's merge's table identity conflicts: tables the
+ *				   merge kept as the branch has them, as theirs is another
+ *				   relation of the name: the local branch merged, if
+ *				   theirs was one's head (a varint length, then the bytes;
+ *				   0: none), the privileges of the branch's relations a
+ *				   resolution with theirs dropped (the same: lines of
+ *				   kind, name, column and ACL), then each table's relation here and theirs
+ *				   (OIDs, 4 bytes each, big-endian), the inheritance or
+ *				   partition tree it was kept with (a varint), its name
+ *				   here and in theirs (a varint length, then the bytes,
+ *				   each)
  *	'A' name	-> the maker record of the role that made the branch,
  *				   which owns it: the role's OID, then the id its shared
  *				   dependency (pg_shdepend, RefsBranchClassId) names the
@@ -213,7 +234,9 @@
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "commands/trigger.h"
+#include "common/cryptohash.h"
 #include "common/hashfn.h"
+#include "common/sha2.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "refs_generations.h"
@@ -258,7 +281,8 @@
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_LINEAGE		'L'	/* the relations a commit was made from */
-#define TAG_CLASS		'J'	/* the relation a relation is the same table as */
+#define TAG_OWNED		'J'	/* routines and types such records list */
+#define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
@@ -271,9 +295,12 @@
  * dependency id, after its role; 15: the relations commits were made from
  * (names escaped), and relations' equivalence classes under their own tag;
  * 16: a branch's head's other relations with privileges of their own, and
- * every record's relation names quoted as with quote_all_identifiers off.
+ * every record's relation names quoted as with quote_all_identifiers off;
+ * 17: a merge's table identity conflicts under their own tag, each
+ * record's relations' owners, partitioned tables in commits' records, and
+ * no classes (a move keeps a table's relation, by OID).
  */
-#define REFS_FORMAT		"16"
+#define REFS_FORMAT		"17"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -332,6 +359,10 @@ static Oid	branch_oid(const char *name);
 static void merge_key(StringInfo key, const char *branch);
 static void merge_names_put(const char *branch, const ProllyMergeState *state);
 static void merge_names_get(const char *branch, ProllyMergeState *state);
+static void identity_conflicts_put(const char *branch,
+								   const ProllyMergeState *state);
+static void identity_conflicts_get(const char *branch,
+								   ProllyMergeState *state);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
@@ -724,6 +755,13 @@ check_merge_conflicts(const char *what)
 					 errdetail("Table %s has a schema conflict on branch \"%s\".",
 							   ms.schema_tables[0], branch),
 					 errhint("Abort the merge, make the definitions agree on one side, and merge again; or set dolt.allow_commit_conflicts to keep them.")));
+		if (ms.nidentity > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
+					 errdetail("Table %s has a table identity conflict on branch \"%s\".",
+							   ms.identity[0].name, branch),
+					 errhint("Resolve it with dolt_conflicts_resolve('--ours') or ('--theirs') first, or set dolt.allow_commit_conflicts to keep it.")));
 		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
 		{
@@ -1163,6 +1201,7 @@ branch_entry(const char *key, int keylen)
 		case TAG_PRIVILEGED:
 		case TAG_MERGE:
 		case TAG_MERGE_NAMES:
+		case TAG_IDENTITY_CONFLICTS:
 		case TAG_VIOLATIONS:
 		case TAG_IDENTITY:
 		case TAG_REBASE:
@@ -1176,17 +1215,16 @@ branch_entry(const char *key, int keylen)
 
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
- * transaction holds, the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), or the class of a
- * relation it makes (keyed by the relation, which no other transaction
- * has), not having held every ref nor begun to commit?
+ * transaction holds, or the relation record of a commit it makes (keyed by
+ * the commit, which no other transaction writes), not having held every
+ * ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
 {
 	if (published || whole)
 		return false;
-	if (keylen > 1 && (key[0] == TAG_LINEAGE || key[0] == TAG_CLASS))
+	if (keylen > 1 && (key[0] == TAG_LINEAGE || key[0] == TAG_OWNED))
 		return true;
 	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
 }
@@ -2494,6 +2532,53 @@ move_settled(void *arg)
 	settle(arg, NULL);
 }
 
+/* A branch's copies moved to a commit (copies_branch_move()). */
+typedef struct MoveSettled
+{
+	ProllyCommitInfo *info;
+	ProllyHash	head;			/* the commit moved to */
+} MoveSettled;
+
+/*
+ * The branch's copies moved to the commit (move_settled()), the tables it
+ * makes the relations the commit was made from; refused, the error undoing
+ * it, if it put into a table a version of another relation
+ * (prolly_refuse_mismatched_versions()), as a hard reset is, unless the
+ * branch is replaced (prolly_move_replaces): its tables that are other
+ * relations are dropped first, and the move makes the head's.
+ */
+bool		prolly_move_replaces = false;
+
+static void
+move_settled_checked(void *arg)
+{
+	MoveSettled *ms = arg;
+	ProllyNodeRef before;
+	List	   *relids = NIL;
+	bool		folded;
+
+	/* (replaced, its tables other relations than the head's: dropped) */
+	if (prolly_move_replaces && prolly_versions_may_mismatch(&ms->head, 1))
+		prolly_drop_mismatched_tables(&ms->head, "move the branch", false);
+	folded = prolly_versions_may_mismatch(&ms->head, 1) &&
+		copies_working_set(NULL, &before);
+	if (folded)
+		relids = prolly_relations_of(&before);
+	prolly_move_provenance = list_make1(&ms->head);
+	PG_TRY();
+	{
+		move_settled(ms->info);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_provenance = NIL;
+	}
+	PG_END_TRY();
+	if (folded)
+		prolly_refuse_mismatched_versions(&before, relids, &ms->head, 1,
+										  PROLLY_MISMATCH_PUSH);
+}
+
 /*
  * Kept pages (#767).  When a branch's working set is known to be a commit's
  * root (a commit's fold made it; a move settled there), the pages of its
@@ -3659,10 +3744,13 @@ copies_hold_unseen(void)
 }
 
 /* A first use's move: to target, from copies of source's (NULL: none). */
+static void move_copies_checked(void *arg);
+
 typedef struct MoveCopies
 {
 	const ProllyCommitInfo *commit;
 	const KnownSource *source;
+	ProllyHash	head;			/* the commit moved to */
 } MoveCopies;
 
 /*
@@ -4208,11 +4296,12 @@ materialize(const char *name)
 		 * (moved to the head, unless the copies are there already: those of
 		 * a branch whose working set is, if it still is)
 		 */
-		/* (the tables it makes take their classes from the head's record) */
+		/* (the tables it makes are the relations the head's record names) */
 		prolly_move_provenance = list_make1(&head);
+		mc.head = head;
 		PG_TRY(_provenance);
 		{
-			branch_ops()->run_on(name, move_copies, &mc);
+			branch_ops()->run_on(name, move_copies_checked, &mc);
 		}
 		PG_FINALLY(_provenance);
 		{
@@ -4228,6 +4317,39 @@ done:
 		XactReadOnly = was_read_only;
 	}
 	PG_END_TRY();
+}
+
+/*
+ * A first use's move (move_copies()): the copies are of the nearest
+ * source's relations, whatever commit they are moved to, so a copy of
+ * another relation than the one the head records under its name is
+ * dropped first, and the move makes the head's relation; refused, the
+ * error undoing it, if a table's copy still took a version of another
+ * relation (prolly_refuse_mismatched_versions()).
+ */
+static void
+move_copies_checked(void *arg)
+{
+	MoveCopies *mc = arg;
+	ProllyNodeRef before;
+	List	   *relids = NIL;
+	bool		folded;
+
+	/*
+	 * (a copy of another relation than the head's of its name: the
+	 * source's table made again since the branch was made, say.  Not the
+	 * branch's table: dropped, so the move makes the head's relation)
+	 */
+	if (prolly_versions_may_mismatch(&mc->head, 1))
+		prolly_drop_mismatched_tables(&mc->head, "use the branch", false);
+	folded = prolly_versions_may_mismatch(&mc->head, 1) &&
+		copies_working_set(NULL, &before);
+	if (folded)
+		relids = prolly_relations_of(&before);
+	move_copies(arg);
+	if (folded)
+		prolly_refuse_mismatched_versions(&before, relids, &mc->head, 1,
+										  PROLLY_MISMATCH_FIRST_USE);
 }
 
 static void
@@ -4937,25 +5059,79 @@ line_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
- * A relation's line in a record of tables: its OID (10 digits), a space,
- * and its qualified name, each backslash in it written as two and each
- * newline as a backslash and 'n', so that no name, whatever it holds,
- * makes a line of its own; then a newline.
+ * A name in a relation's line: each backslash in it written as two, each
+ * newline as a backslash and 'n' and, where it is followed by another
+ * field (spaces), each space as a backslash and 's', so that no name,
+ * whatever it holds, makes a line or a field of its own.
  */
 static void
-relation_line(StringInfo out, Oid relid, const char *name)
+line_name(StringInfo out, const char *name, bool spaces)
 {
-	appendStringInfo(out, "%010u ", relid);
 	for (const char *c = name; *c; c++)
 	{
 		if (*c == '\\')
 			appendStringInfoString(out, "\\\\");
 		else if (*c == '\n')
 			appendStringInfoString(out, "\\n");
+		else if (*c == ' ' && spaces)
+			appendStringInfoString(out, "\\s");
 		else
 			appendStringInfoChar(out, *c);
 	}
+}
+
+/*
+ * A relation's line in a record of tables: its OID (10 digits), a space,
+ * its owner's OID (10 digits), a space, its kind (relkind), a space, its
+ * owner's name (line_name(), spaces escaped), a space, and its qualified
+ * name (line_name()); then a newline.  The owner's name is kept with its
+ * OID so that a role made later with the OID, once the counter wraps, is
+ * told from the one that owned the relation.
+ */
+static void
+relation_line(StringInfo out, Oid relid, Oid owner, char relkind,
+			  const char *name)
+{
+	char	   *owner_name = GetUserNameFromId(owner, true);
+
+	appendStringInfo(out, "%010u %010u %c ", relid, owner, relkind);
+	line_name(out, owner_name ? owner_name : "", true);
+	appendStringInfoChar(out, ' ');
+	line_name(out, name, false);
 	appendStringInfoChar(out, '\n');
+}
+
+/*
+ * A name of a relation's line (line_name()'s), from *c on to the end of
+ * the field (a space, if spaces, else the line's end), unescaped into out;
+ * false if malformed.  *c is left at the field's end.
+ */
+static bool
+read_line_name(const char **c, StringInfo out, bool spaces)
+{
+	const char *p = *c;
+
+	for (; *p && *p != '\n' && !(spaces && *p == ' '); p++)
+	{
+		if (*p != '\\')
+			appendStringInfoChar(out, *p);
+		else if (p[1] == '\\')
+			appendStringInfoChar(out, *++p);
+		else if (p[1] == 'n')
+		{
+			appendStringInfoChar(out, '\n');
+			p++;
+		}
+		else if (p[1] == 's' && spaces)
+		{
+			appendStringInfoChar(out, ' ');
+			p++;
+		}
+		else
+			return false;
+	}
+	*c = p;
+	return true;
 }
 
 /*
@@ -4963,16 +5139,63 @@ relation_line(StringInfo out, Oid relid, const char *name)
  * data on), each a ProllyCommitRelation: a line of any other form is
  * refused, as a damaged record, never read in part.
  */
+typedef enum RelationLines
+{
+	LINES_OWNED,				/* a record, with its routines and types */
+	LINES_RELATIONS,			/* a record, without them */
+	LINES_ROUTINES				/* the routines and types a record names */
+} RelationLines;
+
+static List *relation_lines_of(const char *data, RelationLines what);
+
 static List *
 relation_lines(const char *data)
+{
+	return relation_lines_of(data, LINES_OWNED);
+}
+
+/*
+ * ... with or without the lines of the routines and types its last line
+ * may name, by their hash (table_names()).
+ */
+static List *
+relation_lines_of(const char *data, RelationLines what)
 {
 	List	   *out = NIL;
 
 	for (const char *p = data; *p;)
 	{
-		ProllyCommitRelation *r = palloc(sizeof(ProllyCommitRelation));
+		ProllyCommitRelation *r;
+		StringInfoData owner;
 		StringInfoData name;
-		const char *c = p + 11;
+		const char *c;
+
+		if (*p == '@')
+		{
+			const char *nl = strchr(p, '\n');
+			StringInfoData key;
+			StringInfoData v;
+
+			if (what == LINES_ROUTINES || nl == NULL ||
+				nl - p != 1 + 2 * PG_SHA256_DIGEST_LENGTH || nl[1] != '\0')
+				goto bad;
+			for (const char *h = p + 1; h < nl; h++)
+				if (!isxdigit((unsigned char) *h))
+					goto bad;
+			if (what == LINES_RELATIONS)
+				break;
+			initStringInfo(&key);
+			initStringInfo(&v);
+			appendStringInfoChar(&key, TAG_OWNED);
+			appendBinaryStringInfo(&key, p + 1, nl - p - 1);
+			if (!refs_get(key.data, key.len, &v))
+				goto bad;
+			out = list_concat(out, relation_lines_of(v.data, LINES_ROUTINES));
+			pfree(key.data);
+			pfree(v.data);
+			break;
+		}
+		r = palloc(sizeof(ProllyCommitRelation));
 
 		for (int i = 0; i < 10; i++)
 			if (!isdigit((unsigned char) p[i]))
@@ -4980,23 +5203,25 @@ relation_lines(const char *data)
 		if (p[10] != ' ')
 			goto bad;
 		r->relid = (Oid) strtoul(p, NULL, 10);
-		initStringInfo(&name);
-		for (; *c && *c != '\n'; c++)
-		{
-			if (*c != '\\')
-				appendStringInfoChar(&name, *c);
-			else if (c[1] == '\\')
-				appendStringInfoChar(&name, *++c);
-			else if (c[1] == 'n')
-			{
-				appendStringInfoChar(&name, '\n');
-				c++;
-			}
-			else
+		for (int i = 11; i < 21; i++)
+			if (!isdigit((unsigned char) p[i]))
 				goto bad;
-		}
-		if (*c != '\n' || name.len == 0)
+		if (p[21] != ' ')
 			goto bad;
+		r->owner = (Oid) strtoul(p + 11, NULL, 10);
+		r->relkind = p[22];
+		if (strchr("rpmvSfPTNC", r->relkind) == NULL || r->relkind == '\0' ||
+			p[23] != ' ')
+			goto bad;
+		c = p + 24;
+		initStringInfo(&owner);
+		if (!read_line_name(&c, &owner, true) || *c != ' ')
+			goto bad;
+		c++;
+		initStringInfo(&name);
+		if (!read_line_name(&c, &name, false) || *c != '\n' || name.len == 0)
+			goto bad;
+		r->owner_name = owner.data;
 		r->name = name.data;
 		out = lappend(out, r);
 		p = c + 1;
@@ -5035,10 +5260,114 @@ prolly_record_relation_name(const char *nspname, const char *relname)
 	return name;
 }
 
+/* A line of table_names() for another object (prolly_owned_objects()) */
+static void
+owned_object_line(Oid oid, Oid owner, char kind, const char *name, void *arg)
+{
+	List	  **lines = arg;
+	StringInfoData line;
+
+	initStringInfo(&line);
+	relation_line(&line, oid, owner, kind, name);
+	*lines = lappend(*lines, line.data);
+}
+
 /*
- * The session's prolly tables, each a relation_line(), by relid: as the
- * branch's catalog names them now.
+ * The session's prolly tables, partitioned tables and materialized views,
+ * each a relation_line(), by relid: as the branch's catalog names them now;
+ * and each other object a commit may hold (prolly_owned_objects()), so that
+ * a move making one from a commit made of them finds its owner.
  */
+/*
+ * The branch's routines and types, as a record of relations lists them:
+ * their lines (relation_line()'s, sorted) are stored apart, once, under
+ * their content's hash (TAG_OWNED), and the record names them by it, in a
+ * last line of '@' and the hash in hex.  A commit whose routines and types
+ * are those its parent's record named (as most are) names the same lines,
+ * which are neither written nor worked out again: the canonicalizer keeps
+ * its listing from one commit to the next (prolly_owned_routines()), and
+ * the session the lines and hash it made of it, until the listing changes
+ * or a role is renamed (whose name a line holds).  A commit that changed
+ * one routine writes a new entry, but not the whole listing again: a long
+ * value is held out of line in a value tree cut by its content, so the new
+ * one shares every chunk but those around the changed line with the last
+ * (the lines are sorted by OID, a new routine's last).
+ */
+static uint64 owned_generation = 0;
+static char *owned_hash = NULL;	/* (NULL: none listed) */
+static char *owned_text = NULL;
+static bool owned_callback = false;
+
+static void
+owned_role_renamed(Datum arg, int cacheid, uint32 hashvalue)
+{
+	owned_generation = 0;
+}
+
+static void
+owned_names(StringInfo out)
+{
+	List	   *lines = NIL;
+	StringInfoData key;
+	StringInfoData v;
+	uint64		generation = owned_generation;
+
+	if (!owned_callback)
+	{
+		CacheRegisterSyscacheCallback(AUTHOID, owned_role_renamed, (Datum) 0);
+		owned_callback = true;
+	}
+	if (prolly_owned_routines(&generation, owned_object_line, &lines))
+	{
+		StringInfoData text;
+		pg_cryptohash_ctx *ctx;
+		uint8		digest[PG_SHA256_DIGEST_LENGTH];
+
+		initStringInfo(&text);
+		list_sort(lines, line_cmp);
+		foreach_ptr(char, line, lines)
+			appendStringInfoString(&text, line);
+		owned_generation = 0;
+		if (owned_text)
+			pfree(owned_text);
+		if (owned_hash)
+			pfree(owned_hash);
+		owned_text = MemoryContextStrdup(TopMemoryContext, text.data);
+		owned_hash = NULL;
+		if (text.len > 0)
+		{
+			ctx = pg_cryptohash_create(PG_SHA256);
+			if (ctx == NULL || pg_cryptohash_init(ctx) < 0 ||
+				pg_cryptohash_update(ctx, (const uint8 *) text.data, text.len) < 0 ||
+				pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
+				elog(ERROR, "could not hash the routines and types of a record of relations");
+			pg_cryptohash_free(ctx);
+			owned_hash = MemoryContextAllocZero(TopMemoryContext,
+												2 * PG_SHA256_DIGEST_LENGTH + 1);
+			hex_encode((const char *) digest, sizeof(digest), owned_hash);
+		}
+		pfree(text.data);
+		/* (known only once its lines and hash are) */
+		owned_generation = generation;
+	}
+	if (owned_hash == NULL)
+		return;
+	/* (stored once: a transaction that aborted may have stored it alone) */
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_OWNED);
+	appendStringInfoString(&key, owned_hash);
+	if (!refs_get(key.data, key.len, &v))
+	{
+		resetStringInfo(&v);
+		appendStringInfoString(&v, owned_text);
+		refs_put(key.data, key.len, &v);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	appendStringInfo(out, "@%s\n", owned_hash);
+}
+
 static void
 table_names(StringInfo out)
 {
@@ -5052,12 +5381,14 @@ table_names(StringInfo out)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
+		if ((c->relam == PROLLY_TABLE_AM_OID &&
+			 (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW)) ||
+			c->relkind == RELKIND_PARTITIONED_TABLE)
 		{
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid,
+			relation_line(&line, c->oid, c->relowner, c->relkind,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -5065,14 +5396,16 @@ table_names(StringInfo out)
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	prolly_owned_objects(owned_object_line, &lines);
 	list_sort(lines, line_cmp);
 	foreach(lc, lines)
 		appendStringInfoString(out, lfirst(lc));
+	owned_names(out);
 }
 
 /*
  * The session's relations with privileges of their own other than its
- * prolly tables (views, materialized views, sequences, partitioned and
+ * prolly and partitioned tables (views, materialized views, sequences and
  * foreign tables), each a relation_line(), by relid: as table_names().
  */
 static void
@@ -5088,15 +5421,14 @@ privileged_names(StringInfo out)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relkind == RELKIND_PARTITIONED_TABLE ||
-			c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
+		if (c->relkind == RELKIND_VIEW || c->relkind == RELKIND_MATVIEW ||
 			c->relkind == RELKIND_SEQUENCE ||
 			c->relkind == RELKIND_FOREIGN_TABLE)
 		{
 			StringInfoData line;
 
 			initStringInfo(&line);
-			relation_line(&line, c->oid,
+			relation_line(&line, c->oid, c->relowner, c->relkind,
 						  prolly_record_relation_name(get_namespace_name(c->relnamespace),
 													  NameStr(c->relname)));
 			lines = lappend(lines, line.data);
@@ -5121,59 +5453,6 @@ names_key(StringInfo key, const char *name)
 {
 	appendStringInfoChar(key, TAG_NAMES);
 	appendStringInfoString(key, name);
-}
-
-/*
- * Relations' equivalence classes (TAG_CLASS): a table's relation made again
- * by a move (a definition it can't alter in place), or made by a merge of
- * the other side's table, is the same table as the one it replaces or comes
- * from, though its OID is new; its class is that one's.  A relation without
- * an entry is its own class.
- */
-static void
-class_key(StringInfo key, Oid relid)
-{
-	appendStringInfo(key, "%c%010u", TAG_CLASS, relid);
-}
-
-static Oid
-relation_class(Oid relid)
-{
-	StringInfoData key;
-	StringInfoData v;
-	Oid			cls = relid;
-
-	initStringInfo(&key);
-	initStringInfo(&v);
-	class_key(&key, relid);
-	if (refs_get(key.data, key.len, &v) && v.len == 10)
-		cls = (Oid) strtoul(v.data, NULL, 10);
-	pfree(key.data);
-	pfree(v.data);
-	return cls;
-}
-
-static Oid
-copies_relation_class(Oid relid)
-{
-	refs_init();
-	return relation_class(relid);
-}
-
-static void
-copies_set_relation_class(Oid relid, Oid cls)
-{
-	StringInfoData key;
-	StringInfoData v;
-
-	refs_init();
-	initStringInfo(&key);
-	initStringInfo(&v);
-	class_key(&key, relid);
-	appendStringInfo(&v, "%010u", cls);
-	refs_put(key.data, key.len, cls == relid ? NULL : &v);
-	pfree(key.data);
-	pfree(v.data);
 }
 
 /*
@@ -5289,30 +5568,17 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 		if (local != NIL && !changed)
 			keep = true;
 
-		/*
-		 * (else as the parent had it: the same relation, or the same table,
-		 * by its class, asked only when the relation isn't there)
-		 */
+		/* (else as the parent had it: the same relation) */
 		else if (have)
 		{
 			ListCell   *bc;
-			Oid			cls = InvalidOid;
 
 			foreach(bc, before)
 				if (((ProllyCommitRelation *) lfirst(bc))->relid == r->relid)
 					keep = true;
-			if (!keep)
-				cls = relation_class(r->relid);
-			foreach(bc, before)
-			{
-				if (keep)
-					break;
-				if (relation_class(((ProllyCommitRelation *) lfirst(bc))->relid) == cls)
-					keep = true;
-			}
 		}
 		if (keep)
-			relation_line(&out, r->relid, r->name);
+			relation_line(&out, r->relid, r->owner, r->relkind, r->name);
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -5363,7 +5629,7 @@ note_head_privileged(const char *name, const ProllyHash *head,
 			foreach_ptr(ProllyCommitRelation, b, before)
 				if (b->relid == r->relid && strcmp(b->name, r->name) == 0)
 				{
-					relation_line(&kept, r->relid, r->name);
+					relation_line(&kept, r->relid, r->owner, r->relkind, r->name);
 					break;
 				}
 		lines = kept.data;
@@ -6054,7 +6320,8 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES, TAG_PRIVILEGED, TAG_IDENTITY, TAG_REBASE, TAG_KEPT, TAG_CREATOR};
+	TAG_NAMES, TAG_PRIVILEGED, TAG_IDENTITY, TAG_REBASE, TAG_KEPT, TAG_CREATOR,
+	TAG_IDENTITY_CONFLICTS};
 	ListCell   *lc;
 
 	lock_branch(name);
@@ -6399,6 +6666,13 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 					 errmsg("cannot commit with unresolved merge conflicts"),
 					 errdetail("Table %s has a schema conflict.", ms.schema_tables[0]),
 					 errhint("Abort the merge, make the definitions agree on one side, and merge again.")));
+		if (ms.nidentity > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit with unresolved merge conflicts"),
+					 errdetail("Table %s has a table identity conflict.",
+							   ms.identity[0].name),
+					 errhint("Resolve it with dolt_conflicts_resolve('--ours') or ('--theirs'), or abort the merge.")));
 		if (!ms.pick)
 			parents[nparents++] = ms.theirs;
 	}
@@ -7061,6 +7335,126 @@ merge_names_put(const char *branch, const ProllyMergeState *state)
 			refs_put(key.data, key.len, any ? &v : NULL);
 		pfree(had.data);
 	}
+	identity_conflicts_put(branch, state);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
+ * A branch's merge's table identity conflicts (TAG_IDENTITY_CONFLICTS):
+ * the local branch theirs was, then each table's relations, tree and
+ * names.  None: no entry.
+ */
+static void
+identity_conflicts_put(const char *branch, const ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	StringInfoData had;
+	bool		any = state != NULL &&
+		(state->nidentity > 0 ||
+		 (state->identity_saved != NULL && state->identity_saved[0] != '\0'));
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	initStringInfo(&had);
+	appendStringInfoChar(&key, TAG_IDENTITY_CONFLICTS);
+	appendStringInfoString(&key, branch);
+	if (any)
+	{
+		const char *source = state->identity_source ? state->identity_source : "";
+
+		const char *saved = state->identity_saved ? state->identity_saved : "";
+
+		prolly_put_varint(&v, strlen(source));
+		appendStringInfoString(&v, source);
+		prolly_put_varint(&v, strlen(saved));
+		appendStringInfoString(&v, saved);
+		for (int i = 0; i < state->nidentity; i++)
+		{
+			const ProllyIdentityConflict *c = &state->identity[i];
+
+			put_be32(&v, c->relid);
+			put_be32(&v, c->their_relid);
+			prolly_put_varint(&v, c->tree);
+			prolly_put_varint(&v, strlen(c->name));
+			appendStringInfoString(&v, c->name);
+			prolly_put_varint(&v, strlen(c->their_name));
+			appendStringInfoString(&v, c->their_name);
+		}
+	}
+	if (any || refs_get(key.data, key.len, &had))
+		refs_put(key.data, key.len, any ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+	pfree(had.data);
+}
+
+/* A varint length, then that many bytes, from *p (end: the value's end). */
+static char *
+identity_conflicts_string(const char **p, const char *end)
+{
+	uint64		len = prolly_get_varint(p, end);
+	char	   *out;
+
+	if (len > (uint64) (end - *p))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly refs hold an invalid merge state")));
+	out = pnstrdup(*p, len);
+	*p += len;
+	return out;
+}
+
+/* state's identity conflicts, from identity_conflicts_put()'s entry */
+static void
+identity_conflicts_get(const char *branch, ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_IDENTITY_CONFLICTS);
+	appendStringInfoString(&key, branch);
+	state->nidentity = 0;
+	state->identity = NULL;
+	state->identity_source = NULL;
+	state->identity_saved = NULL;
+	if (refs_get(key.data, key.len, &v))
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+		int			cap = 4;
+
+		state->identity_source = identity_conflicts_string(&p, end);
+		if (state->identity_source[0] == '\0')
+			state->identity_source = NULL;
+		state->identity_saved = identity_conflicts_string(&p, end);
+		state->identity = palloc(sizeof(ProllyIdentityConflict) * cap);
+		while (p < end)
+		{
+			ProllyIdentityConflict *c;
+
+			if (end - p < 8)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly refs hold an invalid merge state")));
+			if (state->nidentity == cap)
+			{
+				cap *= 2;
+				state->identity = repalloc(state->identity,
+										   sizeof(ProllyIdentityConflict) * cap);
+			}
+			c = &state->identity[state->nidentity++];
+			c->relid = get_be32(p);
+			c->their_relid = get_be32(p + 4);
+			p += 8;
+			c->tree = (int) prolly_get_varint(&p, end);
+			c->name = identity_conflicts_string(&p, end);
+			c->their_name = identity_conflicts_string(&p, end);
+		}
+	}
 	pfree(key.data);
 	pfree(v.data);
 }
@@ -7203,7 +7597,10 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 			state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
 	if (found)
+	{
 		merge_names_get(branch, state);
+		identity_conflicts_get(branch, state);
+	}
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -8520,10 +8917,15 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 			}
 			if (head == NULL)
 				;
-			else if (strcmp(name, branch_ops()->current()) == 0)
-				move_settled(&info);
 			else
-				branch_ops()->run_on(name, move_settled, &info);
+			{
+				MoveSettled ms = {&info, *head};
+
+				if (strcmp(name, branch_ops()->current()) == 0)
+					move_settled_checked(&ms);
+				else
+					branch_ops()->run_on(name, move_settled_checked, &ms);
+			}
 		}
 		PG_FINALLY();
 		{
@@ -9082,6 +9484,15 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 		write_commit(&root->hash, &head, 1, prolly_commit_author(),
 					 psprintf("WIP on %s", branch), &identity, stash);
 	}
+	/* (made of the working set, its relations: a pop tells them apart) */
+	{
+		StringInfoData lines;
+
+		initStringInfo(&lines);
+		table_names(&lines);
+		note_relations(stash, lines.data);
+		pfree(lines.data);
+	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
 	e->maker.role = e->maker.id = InvalidOid;
@@ -9350,8 +9761,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
 	.commit_relations = copies_commit_relations,
-	.relation_class = copies_relation_class,
-	.set_relation_class = copies_set_relation_class,
 	.made_object = copies_made_object,
 	.stash_set_maker = copies_stash_set_maker,
 	.last_fold = copies_last_fold,

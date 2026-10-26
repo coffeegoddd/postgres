@@ -63,7 +63,9 @@ SELECT length(dolt_commit('-Am', 'without it')::text) > 0 AS committed;
 CREATE ROLE regress_kr_owner;
 CREATE ROLE regress_kr_user;
 CREATE SCHEMA ko VERSIONED;
-GRANT USAGE ON SCHEMA ko TO regress_kr_owner;
+-- (a move changes or makes again a routine as its owner, who needs CREATE
+-- on its schema to, as CREATE OR REPLACE FUNCTION does)
+GRANT USAGE, CREATE ON SCHEMA ko TO regress_kr_owner;
 CREATE TABLE ko.t (id int PRIMARY KEY, a int);
 INSERT INTO ko.t VALUES (1, 10), (2, 20);
 GRANT SELECT ON ko.t TO regress_kr_owner;
@@ -98,24 +100,18 @@ SELECT * FROM dolt_status();
 SELECT dolt_reset('--hard');
 
 -- A table made again (a column added before those it keeps) takes with it
--- what reads it: a routine reading it, one grouping by its key.
-CREATE TABLE ko.r (id int PRIMARY KEY, a int);
-INSERT INTO ko.r VALUES (1, 5);
-CREATE FUNCTION ko.reads() RETURNS SETOF int LANGUAGE sql
-	BEGIN ATOMIC SELECT a FROM ko.r; END;
-CREATE FUNCTION ko.groups() RETURNS SETOF int LANGUAGE sql
-	BEGIN ATOMIC SELECT a FROM ko.r GROUP BY id; END;
-SELECT (dolt_commit('-Am', 'r'))[1] AS r1 \gset
-DROP FUNCTION ko.reads();
-DROP FUNCTION ko.groups();
-DROP TABLE ko.r;
+-- what reads it: a routine reading it, one grouping by its key.  (The
+-- same relation throughout: a move puts no other relation's version into
+-- a table.)
 CREATE TABLE ko.r (z int, id int PRIMARY KEY, a int);
 INSERT INTO ko.r VALUES (0, 1, 5);
 CREATE FUNCTION ko.reads() RETURNS SETOF int LANGUAGE sql
 	BEGIN ATOMIC SELECT a FROM ko.r; END;
 CREATE FUNCTION ko.groups() RETURNS SETOF int LANGUAGE sql
 	BEGIN ATOMIC SELECT a FROM ko.r GROUP BY id; END;
-SELECT (dolt_commit('-Am', 'r made again'))[1] AS r2 \gset
+SELECT (dolt_commit('-Am', 'r'))[1] AS r1 \gset
+ALTER TABLE ko.r DROP COLUMN z;
+SELECT (dolt_commit('-Am', 'r without z'))[1] AS r2 \gset
 SELECT dolt_reset('--hard', :'r1');
 SELECT attname FROM pg_attribute WHERE attrelid = 'ko.r'::regclass AND attnum > 0
 	AND NOT attisdropped ORDER BY attnum;
@@ -140,27 +136,23 @@ INSERT INTO kv.t VALUES (1, 10), (2, 20);
 CREATE VIEW kv.v AS SELECT id, a FROM kv.t;
 CREATE FUNCTION kv.lk(x int) RETURNS int LANGUAGE sql IMMUTABLE STRICT LEAKPROOF
 	BEGIN ATOMIC SELECT t.a FROM kv.t JOIN kv.v USING (id) WHERE t.id = x GROUP BY t.id; END;
-CREATE TABLE kv.u (x int CHECK (kv.lk(x) IS NOT NULL),
-	y int GENERATED ALWAYS AS (kv.lk(x)) STORED);
-CREATE INDEX ON kv.u ((kv.lk(x)));
-INSERT INTO kv.u VALUES (1), (2);
-SELECT (dolt_commit('-Am', 'v1'))[1] AS v1 \gset
-ALTER TABLE kv.t RENAME CONSTRAINT t_pkey TO t_key;
-CREATE OR REPLACE VIEW kv.v AS SELECT id, a, 1 AS one FROM kv.t;
-ALTER TABLE kv.u RENAME TO u_old;
+-- (u made again: z added before the columns it keeps, the same relation)
 CREATE TABLE kv.u (z int, x int CHECK (kv.lk(x) IS NOT NULL),
 	y int GENERATED ALWAYS AS (kv.lk(x)) STORED);
 CREATE INDEX ON kv.u ((kv.lk(x)));
-INSERT INTO kv.u (z, x) SELECT 0, x FROM kv.u_old;
-DROP TABLE kv.u_old;
+INSERT INTO kv.u (z, x) VALUES (0, 1), (0, 2);
+SELECT (dolt_commit('-Am', 'v1'))[1] AS v1 \gset
+ALTER TABLE kv.t RENAME CONSTRAINT t_pkey TO t_key;
+CREATE OR REPLACE VIEW kv.v AS SELECT id, a, 1 AS one FROM kv.t;
+ALTER TABLE kv.u DROP COLUMN z;
 SELECT (dolt_commit('-Am', 'v2'))[1] AS v2 \gset
 SELECT dolt_reset('--hard', :'v1');
 SELECT dolt_hashof('HEAD') = :'v1' AS at_v1, provolatile, proisstrict, proleakproof
 	FROM pg_proc WHERE oid = 'kv.lk(int)'::regprocedure;
-SELECT x, y FROM kv.u ORDER BY x;
+SELECT z, x, y FROM kv.u ORDER BY x;
 SELECT dolt_reset('--hard', :'v2');
 SELECT dolt_hashof('HEAD') = :'v2' AS at_v2;
-SELECT z, x, y FROM kv.u ORDER BY x;
+SELECT x, y FROM kv.u ORDER BY x;
 SELECT * FROM dolt_status();
 DROP SCHEMA kv CASCADE;
 SELECT length(dolt_commit('-Am', 'without kv')::text) > 0 AS committed;
@@ -170,7 +162,7 @@ SELECT length(dolt_commit('-Am', 'without kv')::text) > 0 AS committed;
 -- privileges and comment given back; one with a SQL-standard body and one
 -- in PL/pgSQL.
 CREATE SCHEMA kt VERSIONED;
-GRANT USAGE ON SCHEMA kt TO regress_kr_owner;
+GRANT USAGE, CREATE ON SCHEMA kt TO regress_kr_owner;
 CREATE TABLE kt.t (z int, id int PRIMARY KEY, a int);
 INSERT INTO kt.t VALUES (0, 1, 10);
 CREATE FUNCTION kt.rows() RETURNS SETOF kt.t LANGUAGE sql BEGIN ATOMIC SELECT * FROM kt.t; END;

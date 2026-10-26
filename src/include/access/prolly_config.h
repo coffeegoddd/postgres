@@ -137,6 +137,68 @@ extern void prolly_check_not_moving(void);
 extern void prolly_check_branch_rename(const char *newname);
 
 /*
+ * A table is its relation (by OID) and its name together.  Whether a move
+ * bringing versions from the commits (n of them) may put into a table here
+ * a version of another relation of its name: false, and
+ * prolly_refuse_mismatched_versions() would refuse nothing.
+ */
+extern bool prolly_versions_may_mismatch(const ProllyHash *commits, int n);
+
+/* The relations of root's tables on the session's branch (OIDs). */
+extern List *prolly_relations_of(const ProllyNodeRef *root);
+
+/*
+ * Refuse a move from before (the branch folded before it, its tables then
+ * the relations relids) of versions from the commits provenance
+ * (nprovenance of them) that put into a table here a version of another
+ * relation: one that a commit of them made here records, under the
+ * table's name, as made from another relation.  Called after the move,
+ * before its transaction can commit: the error undoes all it wrote.  A
+ * table the move made is its version's relation (or a new one).  kind: the
+ * move, for the error's hint.
+ */
+typedef enum ProllyMismatchedMove
+{
+	PROLLY_MISMATCH_MOVE,		/* a reset, a table's checkout, ... */
+	PROLLY_MISMATCH_FIRST_USE,	/* a branch's first use */
+	PROLLY_MISMATCH_PUSH,		/* a push's or forced move of a branch */
+} ProllyMismatchedMove;
+
+extern void prolly_refuse_mismatched_versions(const ProllyNodeRef *before,
+											  List *relids,
+											  const ProllyHash *provenance,
+											  int nprovenance,
+											  ProllyMismatchedMove kind);
+
+/*
+ * Before a move back to head's commit (an abort's, a stash's), or a
+ * branch's first use, which moves copies of another branch's relations to
+ * it: drop the tables here whose relation isn't the one the commit
+ * records under their name, so that the move makes each its version's
+ * relation again.  why: what moves, for an error; owned: the session's
+ * role must own them (not for a first use's copies, the branch's
+ * nobody's yet).
+ */
+extern void prolly_drop_mismatched_tables(const ProllyHash *head,
+										  const char *why, bool owned);
+
+/*
+ * Give back privileges a merge's resolution saved (the merge in progress's
+ * identity_saved) to the relations of those names now: only views', or
+ * all (an abort's).
+ */
+extern void prolly_restore_privileges(const char *saved, bool views);
+
+/*
+ * While set, a branch's move to a commit (refs' branch_move()) replaces
+ * the branch: its tables that are other relations than the commit's of
+ * their names are dropped, and the move makes the commit's (a rebase's
+ * end, the rebased commits being the branch's now).  Else such a move is
+ * refused, as a hard reset is.
+ */
+extern PGDLLIMPORT bool prolly_move_replaces;
+
+/*
  * The branches, tags and stashes roles made, as the role commands see them:
  * each maker recorded in the refs is a shared dependency of its role
  * (classId RefsBranchClassId, RefsTagClassId or RefsStashClassId, objid the

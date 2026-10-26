@@ -246,7 +246,11 @@ SELECT c.relname::text, 'constraint ' || conname, conislocal, coninhcount
 ORDER BY 1, 2;
 SET test.nsp = 'inh';
 SELECT * INTO TEMP made FROM localities;
+-- (inh.c3, dropped and made again, is another table at each commit:
+-- dropped here first, each reset makes the commit's)
+DROP TABLE inh.c3;
 SELECT dolt_reset('--hard', :'parents');
+DROP TABLE inh.c3;
 SELECT dolt_reset('--hard', :'children');
 SELECT test_fold_root() = prolly_root_hash(:'children') AS same_root;
 SELECT * FROM dolt_status();

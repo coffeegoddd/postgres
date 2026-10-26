@@ -244,6 +244,9 @@ tests += {
       'key_routines',
       'role_makers',
       'writer_definitions',
+      'identity_conflicts',
+      'recorded_makers',
+      'move_calls',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -444,6 +447,7 @@ tests += {
       't/467_bmap_preserve_skipped.pl',
       't/471_kept_carried_crash.pl',
       't/472_kept_carried_standby.pl',
+      't/459_record_owners_sessions.pl',
     ],
   },
 }

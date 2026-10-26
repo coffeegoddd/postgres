@@ -275,8 +275,8 @@ SELECT dolt_branch('-D', 'cr_other');
 DROP SCHEMA cr CASCADE;
 NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table cr.t
-drop cascades to table cr.b
 drop cascades to table cr.a
+drop cascades to table cr.b
 SELECT length(dolt_commit('-Am', 'without cr')::text) AS committed;
  committed 
 -----------

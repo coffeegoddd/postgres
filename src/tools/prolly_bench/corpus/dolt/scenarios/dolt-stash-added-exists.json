@@ -165,12 +165,7 @@
       ],
       "sql": "SELECT dolt_stash('pop', 'myStash')",
       "expect": {
-        "rows": [
-          [
-            "{0}"
-          ]
-        ],
-        "order": "ordered"
+        "sqlstate": "40001"
       }
     },
     {

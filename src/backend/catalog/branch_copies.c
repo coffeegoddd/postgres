@@ -2322,6 +2322,25 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 	CommandCounterIncrement();
 }
 
+/* The owner of branch's relation relid (InvalidOid: none). */
+static Oid
+copies_relation_owner(const char *branch, Oid relid)
+{
+	Oid			b = branch_oid(branch, true);
+	HeapTuple	tup;
+	Oid			owner;
+
+	if (!OidIsValid(b))
+		return InvalidOid;
+	tup = branch_row(RelationRelationId, ClassOidIndexId, Anum_pg_class_oid,
+					 relid, b);
+	if (tup == NULL)
+		return InvalidOid;
+	owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
+	heap_freetuple(tup);
+	return owner;
+}
+
 static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
@@ -2344,6 +2363,7 @@ static const BranchOpsRoutine branch_copies = {
 	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
+	.relation_owner = copies_relation_owner,
 };
 
 const BranchOpsRoutine *

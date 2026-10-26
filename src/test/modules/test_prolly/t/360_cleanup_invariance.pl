@@ -232,6 +232,9 @@ my @q = (
 	[ side_big => 'SELECT id, md5(body) FROM ci.big' ],
 	[ checkout => "SELECT dolt_checkout('scratch')" ],
 	[ change => "UPDATE ci.t SET v = 'scratch' WHERE id <= 100" ],
+	# (c2's ci.remade is the table before it was dropped and made again,
+	# another relation: dropped here for the reset to make it)
+	[ change => 'DROP TABLE ci.remade' ],
 	[ reset => "SELECT dolt_reset('--hard', '$c2')" ],
 	[ reset_t => 'SELECT * FROM ci.t' ],
 	[ reset_big => 'SELECT id, md5(body) FROM ci.big' ],

@@ -80,6 +80,8 @@
 #include "utils/typcache.h"
 #include "utils/tuplesort.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/dependency.h"
+#include "catalog/objectaccess.h"
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -87,6 +89,7 @@
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/json.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -4595,8 +4598,37 @@ apply_passes(void *arg)
  * if it removes rows and a violation is recorded
  * (refuse_keyless_violations()).
  */
+static void apply_rows_as_mover(Oid relid, const Table *from, const Table *to);
+
+/*
+ * (as relid's maker, if the move makes it from a commit: the canonicalizer's
+ * prolly_move_maker(), so that what writing them runs, an index's
+ * expressions, runs as its owner's, restricted, not the mover's; and each
+ * routine that runs, as its own owner: prolly_move_calls_begin())
+ */
 static void
 apply_rows(Oid relid, const Table *from, const Table *to)
+{
+	ProllyMakerSwitch sw = {0};
+	int			calls = prolly_move_calls_begin();
+	bool		done = false;
+
+	PG_TRY();
+	{
+		prolly_as_maker(relid, &sw);
+		apply_rows_as_mover(relid, from, to);
+		done = true;
+	}
+	PG_FINALLY();
+	{
+		prolly_as_maker_end(&sw);
+		prolly_move_calls_end(calls, done);
+	}
+	PG_END_TRY();
+}
+
+static void
+apply_rows_as_mover(Oid relid, const Table *from, const Table *to)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	MemoryContext cxt = CurrentMemoryContext;
@@ -4928,6 +4960,202 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 	else
 		PROLLY_CALL(dc.canonicalizer, move_schema, &working, target, move_rows,
 					NULL, (void *) target, true);
+}
+
+/*
+ * The relation commit (made here) records under name; InvalidOid if it
+ * records none of the name, or has no record (made elsewhere: fetched,
+ * cloned, pushed here).
+ */
+static Oid
+recorded_relid(const ProllyHash *commit, const char *name)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *relations;
+	ListCell   *lc;
+
+	if (commit == NULL || commit->len == 0 ||
+		!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, commit, &relations))
+		return InvalidOid;
+	foreach(lc, relations)
+	{
+		ProllyCommitRelation *r = lfirst(lc);
+
+		if (strcmp(r->name, name) == 0 &&
+			(r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE))
+			return r->relid;
+	}
+	return InvalidOid;
+}
+
+/* Whether a record's line is a table's (or partitioned table's) */
+static bool
+record_is_table(const ProllyCommitRelation *r)
+{
+	return r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE;
+}
+
+/*
+ * A table (or partitioned table) of the session's branch named name
+ * (InvalidOid: none), as commits' records list them.
+ */
+static Oid
+prolly_table_named(const char *name)
+{
+	Oid			relid = rel_named(name, true);
+	char		kind = OidIsValid(relid) ? get_rel_relkind(relid) : '\0';
+
+	if (kind != RELKIND_RELATION && kind != RELKIND_PARTITIONED_TABLE)
+		return InvalidOid;
+	return relid;
+}
+
+/*
+ * Whether a move bringing versions from the commits (n of them) may put a
+ * version of another relation into a table here: a commit of them made
+ * here records, under the name of a table here, another relation than the
+ * table's.  Asked before the move, of their records and the catalog alone,
+ * so that a move that can't folds nothing more.
+ */
+bool
+prolly_versions_may_mismatch(const ProllyHash *commits, int n)
+{
+	ProllyDatabaseComponents dc = components();
+
+	if (!PROLLY_HAS(dc.refs, commit_relations))
+		return false;
+	for (int i = 0; i < n; i++)
+	{
+		List	   *relations;
+		ListCell   *lc;
+
+		if (!PROLLY_CALL(dc.refs, commit_relations, &commits[i], &relations))
+			continue;
+		foreach(lc, relations)
+		{
+			ProllyCommitRelation *r = lfirst(lc);
+			Oid			here;
+
+			if (!record_is_table(r))
+				continue;
+			here = prolly_table_named(r->name);
+
+			if (OidIsValid(here) && here != r->relid)
+				return true;
+		}
+	}
+	return false;
+}
+
+/* The relations of root's tables here, before a move (OIDs). */
+List *
+prolly_relations_of(const ProllyNodeRef *root)
+{
+	Tables		ts = {NIL};
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	read_tables(root, &ts);
+	foreach(lc, ts.tables)
+	{
+		Oid			relid = prolly_table_named(((Table *) lfirst(lc))->name);
+
+		if (OidIsValid(relid))
+			out = lappend_oid(out, relid);
+	}
+	return out;
+}
+
+/* Table name of tables (NULL: none). */
+static Table *
+version_named(const Tables *tables, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, tables->tables)
+		if (strcmp(((Table *) lfirst(lc))->name, name) == 0)
+			return lfirst(lc);
+	return NULL;
+}
+
+/* Do two versions of a table differ, in rows or definition? */
+static bool
+versions_differ(const Table *a, const Table *b)
+{
+	return !same_hash(&a->data.hash, &b->data.hash) || a->textlen != b->textlen ||
+		memcmp(a->text, b->text, a->textlen) != 0;
+}
+
+/*
+ * Refuse a move that put into a table here a version of another relation
+ * (see prolly_config.h), raised before the transaction that made it can
+ * commit, so that nothing it wrote is kept: a table of before's relations
+ * (relids: the move didn't make it) whose version the move changed from
+ * before's (the branch folded before it), and whose version under its
+ * name a commit of provenance records made from another relation, by OID.
+ * A table is its relation and its name together: the version of a table
+ * dropped and made again, or of one renamed into the name, is another
+ * table's.  Compared as the move left the tables, under the names it left
+ * them (a move matches tables by identity, a rename followed).  Every
+ * member of an inheritance or partition tree is a table of its own here,
+ * so another table's version of any one of them refuses the whole move.
+ */
+void
+prolly_refuse_mismatched_versions(const ProllyNodeRef *before, List *relids,
+								  const ProllyHash *provenance, int nprovenance,
+								  ProllyMismatchedMove kind)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef after;
+	Tables		b = {NIL};
+	Tables		a = {NIL};
+	StringInfoData names;
+	int			nmismatched = 0;
+	char	   *first = NULL;
+	ListCell   *lc;
+
+	if (!PROLLY_CALL(dc.refs, working_set, NULL, &after) ||
+		same_hash(&before->hash, &after.hash))
+		return;
+	read_tables(before, &b);
+	read_tables(&after, &a);
+	initStringInfo(&names);
+	foreach(lc, a.tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *f = version_named(&b, t->name);
+		Oid			relid = prolly_table_named(t->name);
+		Oid			version = InvalidOid;
+
+		/* (a table the move made is its version's relation, or a new one) */
+		if (!OidIsValid(relid) || !list_member_oid(relids, relid) ||
+			(f != NULL && !versions_differ(f, t)))
+			continue;
+		for (int i = 0; i < nprovenance && !OidIsValid(version); i++)
+			version = recorded_relid(&provenance[i], t->name);
+		if (!OidIsValid(version) || version == relid)
+			continue;
+		if (nmismatched++ > 0)
+			appendStringInfoString(&names, ", ");
+		appendStringInfoString(&names, t->name);
+		if (first == NULL)
+			first = t->name;
+	}
+	if (nmismatched == 0)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg_plural("cannot move table %s to a version of another table",
+						   "cannot move tables %s to versions of other tables",
+						   nmismatched, names.data),
+			 errdetail("The version of %s this moves to was made from another relation of that name: a table dropped and made again since, or made apart from the one here.",
+					   first),
+			 kind == PROLLY_MISMATCH_FIRST_USE ?
+			 errhint("Start the branch from a commit or branch whose tables are this branch's relations.") :
+			 kind == PROLLY_MISMATCH_PUSH ?
+			 errhint("Move the branch to a head whose tables are its relations, or drop the table on the branch first.") :
+			 errhint("Drop the table on this branch first: the move then makes the version's own relation again.")));
 }
 
 /*
@@ -10159,6 +10387,211 @@ align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 	return true;
 }
 
+/*
+ * Table identity conflicts.  A table is its relation (by OID) and its name
+ * together: two relations of one name are two tables, one dropped and made
+ * again, or each made apart (on both sides, or on one since the base), and
+ * their rows don't merge.  So a merge (a pick, a revert, a stash's apply)
+ * whose other side brings, under the name of a table here, a version made
+ * from another relation (its commit's record says so) keeps the table as
+ * the branch has it, with its whole inheritance or partition tree, and
+ * records the conflict instead: the branch's relation and theirs, never
+ * rows.  dolt_conflicts_resolve() keeps ours, or makes theirs the
+ * branch's (prolly_take_their_tables()).
+ */
+
+/* The last merge's identity conflicts (ProllyIdentityConflict *). */
+static List *identity_conflicted = NIL;
+
+/*
+ * Whether a merge refuses identity conflicts rather than keeping them: a
+ * stash's apply, which has no merge in progress to resolve.
+ */
+static bool identity_conflicts_refused = false;
+
+/* The local branch a merge's other side is the head of (NULL: none). */
+static const char *identity_source = NULL;
+
+/* Name of names (NULL: not there). */
+static bool
+names_have(List *names, const char *name)
+{
+	foreach_ptr(char, n, names)
+		if (strcmp(n, name) == 0)
+			return true;
+	return false;
+}
+
+/* The tables a table as described (t) inherits from or is a partition of */
+static List *
+version_parents(const Table *t)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyValue d = {(const uint8 *) t->text, t->textlen};
+
+	if (!PROLLY_HAS(dc.canonicalizer, table_parents))
+		return NIL;
+	return PROLLY_CALL(dc.canonicalizer, table_parents, &d);
+}
+
+/*
+ * The trees of seeds: each seed with every table of the roots' tables
+ * (ts, n of them) linked to it, a parent or child of one, through any
+ * root's definitions, each tree in a list of its own (names).
+ */
+static List *
+inheritance_trees(List *seeds, Tables *ts, int n)
+{
+	List	   *edges = NIL;	/* (child, parent) pairs, flattened */
+	List	   *trees = NIL;
+	List	   *placed = NIL;
+
+	for (int i = 0; i < n; i++)
+		foreach_ptr(Table, t, ts[i].tables)
+			foreach_ptr(char, parent, version_parents(t))
+			{
+				edges = lappend(edges, t->name);
+				edges = lappend(edges, parent);
+			}
+	foreach_ptr(char, seed, seeds)
+	{
+		List	   *tree;
+		bool		grew = true;
+
+		if (names_have(placed, seed))
+			continue;
+		tree = list_make1(seed);
+		while (grew)
+		{
+			grew = false;
+			for (int i = 0; i + 1 < list_length(edges); i += 2)
+			{
+				char	   *child = list_nth(edges, i);
+				char	   *parent = list_nth(edges, i + 1);
+
+				if (names_have(tree, child) != names_have(tree, parent))
+				{
+					tree = lappend(tree, names_have(tree, child) ? parent : child);
+					grew = true;
+				}
+			}
+		}
+		placed = list_concat(placed, tree);
+		trees = lappend(trees, tree);
+	}
+	return trees;
+}
+
+/*
+ * The identity conflicts of a merge of aligned roots (base, ours, theirs,
+ * named alike; ours the branch as it is) of commits: each table here
+ * whose version theirs changed since base (or made), where theirs' commit
+ * records it made from another relation than the table's here, or than
+ * base's (another table's rows would merge with base's).  Then every
+ * table of their trees.  Unrecorded commits (made elsewhere) bring none.
+ */
+static List *
+identity_conflicts(const ProllyNodeRef *aligned, const MergeCommits *commits)
+{
+	ProllyDatabaseComponents dc = components();
+	Tables		ts[3] = {{NIL}, {NIL}, {NIL}};
+	List	   *relations;
+	List	   *seeds = NIL;
+	List	   *out = NIL;
+	int			tree = 0;
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, &commits->ids[2], &relations))
+		return NIL;
+	for (int i = 0; i < 3; i++)
+		read_tables(&aligned[i], &ts[i]);
+	foreach_ptr(Table, t, ts[2].tables)
+	{
+		Oid			here = prolly_table_named(t->name);
+		Oid			theirs = recorded_relid(&commits->ids[2], side_name(2, t->name));
+		Oid			base;
+		Table	   *b;
+
+		if (!OidIsValid(here) || !OidIsValid(theirs))
+			continue;
+		b = version_named(&ts[0], t->name);
+		if (b != NULL && !versions_differ(b, t))
+			continue;
+		base = recorded_relid(&commits->ids[0], side_name(0, t->name));
+		if (here != theirs || (OidIsValid(base) && base != theirs))
+			seeds = lappend(seeds, t->name);
+	}
+	if (seeds == NIL)
+		return NIL;
+	foreach_ptr(List, members, inheritance_trees(seeds, ts, 3))
+	{
+		foreach_ptr(char, name, members)
+		{
+			ProllyIdentityConflict *c = palloc0(sizeof(ProllyIdentityConflict));
+
+			c->name = name;
+			c->their_name = side_name(2, name);
+			c->relid = rel_named(name, true);
+			c->their_relid = recorded_relid(&commits->ids[2], c->their_name);
+			c->tree = tree;
+			out = lappend(out, c);
+		}
+		tree++;
+	}
+	return out;
+}
+
+/* The names of conflicts (ProllyIdentityConflict *). */
+static List *
+identity_names(List *conflicts)
+{
+	List	   *names = NIL;
+
+	foreach_ptr(ProllyIdentityConflict, c, conflicts)
+		names = lappend(names, c->name);
+	return names;
+}
+
+/* Refuse a merge's identity conflicts: what (a merge of branch name, ...) */
+static void
+refuse_identity_conflicts(List *conflicts, const char *what, const char *name)
+{
+	ProllyIdentityConflict *c = linitial(conflicts);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("%s has a table identity conflict in table %s",
+					op_label(what, name), c->name),
+			 errdetail("The other side's version of the table was made from another relation of that name: a table dropped and made again, or each made apart from the other.  Their rows don't merge."),
+			 errhint("Drop the table on one side first; or merge so that conflicts are kept, and resolve it with dolt_conflicts_resolve('--ours') or ('--theirs').")));
+}
+
+/*
+ * Keep the tables of conflicts as the branch has them: base and theirs
+ * (aligned[0], aligned[2]) taking them as ours (aligned[1]) has them, or
+ * leaving them out where ours hasn't them.  The merge then changes
+ * nothing in them.
+ */
+static void
+keep_ours_tables(ProllyNodeRef *aligned, List *conflicts)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *names = identity_names(conflicts);
+
+	if (!PROLLY_HAS(dc.canonicalizer, splice))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's canonical form can't keep a table as the branch has it")));
+	for (int i = 0; i < 3; i += 2)
+	{
+		ProllyNodeRef kept;
+
+		PROLLY_CALL(dc.canonicalizer, splice, &aligned[i], &aligned[1], names,
+					&kept);
+		aligned[i] = kept;
+	}
+}
+
 static int	merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 						  bool fail_on_conflict, const char *what,
 						  const char *name, List **conflicted);
@@ -10170,7 +10603,9 @@ static int	merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits
  * conflicted gets the tables with conflicts.  Returns how many keys
  * conflict.  commits are the roots'.  The roots' objects are matched by
  * identity (align_merge()), and the branch's identity anchor is then the
- * merge's.
+ * merge's.  A table theirs brings another relation's version of is kept as
+ * the branch has it, a table identity conflict (identity_conflicts()),
+ * counted as a conflict.
  */
 static int
 merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
@@ -10186,8 +10621,17 @@ merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 	for (int i = 0; i < 3; i++)
 		merge_renames_made[i] = NIL;
 	renamed = align_merge(roots, commits, fail_on_conflict, aligned, &identity);
+	identity_conflicted = identity_conflicts(aligned, commits);
+	if (identity_conflicted != NIL)
+	{
+		if (fail_on_conflict || identity_conflicts_refused)
+			refuse_identity_conflicts(identity_conflicted, what, name);
+		keep_ours_tables(aligned, identity_conflicted);
+	}
 	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
 							  conflicted);
+	/* (each table kept in an identity conflict counts as a conflict) */
+	conflicts += list_length(identity_conflicted);
 	if (renamed || identity.len > 0)
 	{
 		ProllyValue v = {(const uint8 *) identity.data, identity.len};
@@ -10769,9 +11213,32 @@ run_check(const char *sql, const CheckQuery *q, bool removing,
  * key's own checks see them.  A keyed query is made and run a batch of its
  * keys at a time.  Removing: the queries delete the rows they return.
  */
+static void violating_rows_run(List *queries, const char *type, bool removing,
+							   ViolationFound found, void *arg);
+
+/* (each routine the checks run, as its owner: prolly_move_calls_begin()) */
 static void
 violating_rows(List *queries, const char *type, bool removing,
 			   ViolationFound found, void *arg)
+{
+	int			calls = prolly_move_calls_begin();
+	bool		done = false;
+
+	PG_TRY();
+	{
+		violating_rows_run(queries, type, removing, found, arg);
+		done = true;
+	}
+	PG_FINALLY();
+	{
+		prolly_move_calls_end(calls, done);
+	}
+	PG_END_TRY();
+}
+
+static void
+violating_rows_run(List *queries, const char *type, bool removing,
+				   ViolationFound found, void *arg)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	MemoryContext batch_cxt;
@@ -10797,29 +11264,40 @@ violating_rows(List *queries, const char *type, bool removing,
 	foreach_ptr(CheckQuery, q, queries)
 	{
 		MemoryContext old = MemoryContextSwitchTo(batch_cxt);
+		ProllyMakerSwitch sw;
 
-		if (q->keys == NIL)
-			run_check(q->sql, q, removing, &fr);
-		else
+		/* (a table the move makes: checked as its maker, restricted) */
+		prolly_as_maker(q->relid, &sw);
+		PG_TRY();
 		{
-			KeyBatches kb;
-			StringInfoData literal;
-			StringInfoData sql;
-
-			memset(&kb, 0, sizeof(kb));
-			kb.spools = q->keys;
-			initStringInfo(&kb.key);
-			initStringInfo(&literal);
-			initStringInfo(&sql);
-			while (key_batches_next(&kb, &literal))
+			if (q->keys == NIL)
+				run_check(q->sql, q, removing, &fr);
+			else
 			{
-				resetStringInfo(&sql);
-				appendStringInfo(&sql, "%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
-								 q->sql, q->cols, literal.data, q->defs);
-				run_check(sql.data, q, removing, &fr);
-				CHECK_FOR_INTERRUPTS();
+				KeyBatches kb;
+				StringInfoData literal;
+				StringInfoData sql;
+
+				memset(&kb, 0, sizeof(kb));
+				kb.spools = q->keys;
+				initStringInfo(&kb.key);
+				initStringInfo(&literal);
+				initStringInfo(&sql);
+				while (key_batches_next(&kb, &literal))
+				{
+					resetStringInfo(&sql);
+					appendStringInfo(&sql, "%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
+									 q->sql, q->cols, literal.data, q->defs);
+					run_check(sql.data, q, removing, &fr);
+					CHECK_FOR_INTERRUPTS();
+				}
 			}
 		}
+		PG_FINALLY();
+		{
+			prolly_as_maker_end(&sw);
+		}
+		PG_END_TRY();
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(batch_cxt);
 	}
@@ -12069,6 +12547,8 @@ typedef struct Local
 	List	   *matviews;		/* char * */
 	bool		definitions;	/* something other than tables and sequences */
 	bool		aside;			/* moved off the branch (set_aside()) */
+	List	   *kept;			/* ProllyKeptRelation *: the relations of
+								 * tables they changed, when set aside */
 } Local;
 
 /* Does item key, of kind ("t:", say), name an object of that kind? */
@@ -12442,6 +12922,22 @@ own_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 static void
 set_aside(Local *l)
 {
+	/* (each table they changed is put back as the relation it is) */
+	l->kept = NIL;
+	foreach_ptr(char, name, l->tables)
+	{
+		Oid			relid = prolly_table_named(name);
+
+		if (OidIsValid(relid))
+		{
+			ProllyKeptRelation *k = palloc0(sizeof(ProllyKeptRelation));
+
+			k->name = name;
+			k->relid = relid;
+			k->owner = rel_owner(relid);
+			l->kept = lappend(l->kept, k);
+		}
+	}
 	own_move_to(&l->head, &l->working);
 	l->aside = true;
 }
@@ -12603,14 +13099,17 @@ put_back(const Local *l, const char *what)
 				put_back_item, &pb);
 	with_items(&merged, l->after, &target);
 
+	prolly_move_kept = l->kept;
 	PG_TRY();
 	{
 		own_move_to(&target, &merged);
+		prolly_move_kept = NIL;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *ed;
 
+		prolly_move_kept = NIL;
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
 		switch (ed->sqlerrcode)
@@ -12784,6 +13283,12 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	}
 	ms->pick = pick_message != NULL;
 	ms->message = unconstify(char *, pick_message);
+	ms->nidentity = list_length(identity_conflicted);
+	ms->identity = palloc(sizeof(ProllyIdentityConflict) * Max(ms->nidentity, 1));
+	i = 0;
+	foreach_ptr(ProllyIdentityConflict, c, identity_conflicted)
+		ms->identity[i++] = *c;
+	ms->identity_source = ms->nidentity > 0 ? unconstify(char *, identity_source) : NULL;
 }
 
 /* Record such a merge in progress (fill_merge_state()). */
@@ -12795,6 +13300,65 @@ record_merge_state(const ProllyHash *theirs, const ProllyHash *base,
 
 	fill_merge_state(&ms, theirs, base, conflicted, pick_message);
 	PROLLY_CALL(components().refs, set_merge_state, &ms);
+}
+
+/*
+ * ref, if it names a local branch whose head is commit: the branch's name
+ * (NULL: it doesn't).
+ */
+static const char *
+local_branch_at(const char *ref, const ProllyHash *commit)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyBranchId id;
+	ProllyHash	head;
+
+	if (ref == NULL || !PROLLY_CALL(dc.refs, branch_lookup, ref, &id) ||
+		!PROLLY_CALL(dc.refs, resolve, ref, &head) || !same_hash(&head, commit))
+		return NULL;
+	return pstrdup(ref);
+}
+
+/*
+ * Whether theirs (its commit, and root; base's root) may bring a table here
+ * another relation's version, by the names alone: a table it changed since
+ * base (or made) whose relation its record names otherwise than the
+ * table here.  A fast-forward isn't made then: the three-way merge finds
+ * the conflicts, renames followed.
+ */
+static bool
+identities_may_conflict(const ProllyHash *theirs, const ProllyNodeRef *base_root,
+						const ProllyNodeRef *their_root)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *relations;
+	Tables		b = {NIL};
+	Tables		t = {NIL};
+	bool		read = false;
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, theirs, &relations))
+		return false;
+	foreach_ptr(ProllyCommitRelation, r, relations)
+	{
+		Oid			here = record_is_table(r) ? prolly_table_named(r->name) : InvalidOid;
+		Table	   *bt;
+		Table	   *tt;
+
+		if (!OidIsValid(here) || here == r->relid)
+			continue;
+		if (!read)
+		{
+			read_tables(base_root, &b);
+			read_tables(their_root, &t);
+			read = true;
+		}
+		bt = version_named(&b, r->name);
+		tt = version_named(&t, r->name);
+		if (tt != NULL && (bt == NULL || versions_differ(bt, tt)))
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -12856,6 +13420,8 @@ merge_held(const char *branch, const char *message, int flags,
 		*commit_id = ours;
 		return 0;
 	}
+	identity_conflicted = NIL;
+	identity_source = local_branch_at(branch, &theirs);
 	/* (what their changes since the base bring in) */
 	check_needs(&theirs, &base, "merge");
 	commit_root(&base, &roots[0]);
@@ -12864,7 +13430,12 @@ merge_held(const char *branch, const char *message, int flags,
 	local_changes(&ours, &local);
 	if (check_local(&local, &roots[0], &roots[1], &roots[2], "merge", NULL))
 		set_aside(&local);
-	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
+	/*
+	 * (not when theirs may bring a table here another relation's version:
+	 * three-way, which keeps the table, an identity conflict)
+	 */
+	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF) &&
+		!identities_may_conflict(&theirs, &roots[0], &roots[2]))
 	{
 		if (has_local_changes(&local) && !local.aside)
 			fast_forward_local(&local, &theirs,
@@ -13372,8 +13943,20 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		commits.ids[1] = ours;
 		commits.ids[2] = picked[i];
 		commits.ours_exact = i == 0;
-		conflicts = merge_recording(roots, &commits, false, fn, NULL,
-									&conflicted, &nviolations);
+		identity_conflicted = NIL;
+		identity_source = nrefs == 1 ? local_branch_at(refs[0], &picked[0]) : NULL;
+		/* (an apply has no pick in progress to resolve them in) */
+		identity_conflicts_refused = apply_fn != NULL;
+		PG_TRY();
+		{
+			conflicts = merge_recording(roots, &commits, false, fn, NULL,
+										&conflicted, &nviolations);
+		}
+		PG_FINALLY();
+		{
+			identity_conflicts_refused = false;
+		}
+		PG_END_TRY();
 
 		/* (applied without a commit: no pick in progress to resolve) */
 		if (apply_fn && conflicts + nviolations > 0)
@@ -13501,6 +14084,8 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 		commits.ids[1] = ours;
 		commits.ids[2] = info[i].parents[0];
 		commits.ours_exact = i == 0;
+		identity_conflicted = NIL;
+		identity_source = NULL;
 		conflicts = merge_recording(roots, &commits, false, fn, NULL,
 									&conflicted, &nviolations);
 		if (conflicts + nviolations > 0 && has_local_changes(&local))
@@ -13764,12 +14349,635 @@ folded_conflicts(Oid relid, ProllyConflictSink *sink)
 	walk_conflicts(relid, &ms, WALK_LIST, sink);
 }
 
+/*
+ * While a move drops tables to make other relations of them
+ * (drop_for_move()): the tables, and the first object the drop takes with
+ * them that the move can't make again.
+ */
+typedef struct DropWatch
+{
+	List	   *relids;
+	bool		owned;			/* the session's role drops what it owns:
+								 * not a first use's copies */
+	MemoryContext cxt;
+	char	   *refused;		/* its description, or NULL */
+	StringInfo	others;			/* objects other roles own it would take */
+	StringInfo	saved;			/* their privileges (save_privileges()) */
+} DropWatch;
+
+static DropWatch *drop_watch = NULL;
+static object_access_hook_type drop_watch_next = NULL;
+
+/* A name for a line of saved privileges: tabs, newlines and \ escaped. */
+static void
+saved_field(StringInfo out, const char *s)
+{
+	for (; *s; s++)
+	{
+		if (*s == '\\')
+			appendStringInfoString(out, "\\\\");
+		else if (*s == '\t')
+			appendStringInfoString(out, "\\t");
+		else if (*s == '\n')
+			appendStringInfoString(out, "\\n");
+		else
+			appendStringInfoChar(out, *s);
+	}
+}
+
+/*
+ * An ACL's items, each as saved_acl_line() appends them: its grantee's OID
+ * and name (0 and '' for PUBLIC), its grantor's OID and name, and its
+ * privileges (ai_privs, in hex), a tab before each.  Roles are kept by OID
+ * and name both, so that a restore gives each grant back to the role it
+ * was of, and to no other role that took its name or its OID since.
+ */
+static void
+saved_acl(StringInfo out, const Acl *acl)
+{
+	const AclItem *items = ACL_DAT(acl);
+
+	for (int i = 0; i < ACL_NUM(acl); i++)
+	{
+		char	   *grantee = items[i].ai_grantee == ACL_ID_PUBLIC ? "" :
+			GetUserNameFromId(items[i].ai_grantee, true);
+		char	   *grantor = GetUserNameFromId(items[i].ai_grantor, true);
+
+		appendStringInfo(out, "\t%u\t", items[i].ai_grantee);
+		saved_field(out, grantee ? grantee : "");
+		appendStringInfo(out, "\t%u\t", items[i].ai_grantor);
+		saved_field(out, grantor ? grantor : "");
+		appendStringInfo(out, "\t%x", (unsigned int) items[i].ai_privs);
+	}
+}
+
+/*
+ * Append to out the privileges relation relid has (its own and each
+ * column's), a line each: its kind, qualified name and column ('' for the
+ * relation's own), tab between, then its ACL's items (saved_acl()).
+ * Nothing for privileges at their defaults.
+ */
+static void
+save_privileges(StringInfo out, Oid relid)
+{
+	HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Form_pg_class c;
+	char	   *name;
+	bool		isnull;
+	Datum		acl;
+	Relation	attrel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	att;
+
+	if (!HeapTupleIsValid(tup))
+		return;
+	c = (Form_pg_class) GETSTRUCT(tup);
+	name = quote_qualified_identifier(get_namespace_name(c->relnamespace),
+									  NameStr(c->relname));
+	acl = SysCacheGetAttr(RELOID, tup, Anum_pg_class_relacl, &isnull);
+	if (!isnull)
+	{
+		appendStringInfo(out, "%c\t", c->relkind);
+		saved_field(out, name);
+		appendStringInfoChar(out, '\t');
+		saved_acl(out, DatumGetAclP(acl));
+		appendStringInfoChar(out, '\n');
+	}
+	ReleaseSysCache(tup);
+	attrel = table_open(AttributeRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_attribute_attrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(attrel, AttributeRelidNumIndexId, true, NULL, 1, &key);
+	while ((att = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_attribute a = (Form_pg_attribute) GETSTRUCT(att);
+
+		if (a->attnum <= 0 || a->attisdropped)
+			continue;
+		acl = heap_getattr(att, Anum_pg_attribute_attacl, RelationGetDescr(attrel),
+						   &isnull);
+		if (isnull)
+			continue;
+		appendStringInfoString(out, "c\t");
+		saved_field(out, name);
+		appendStringInfoChar(out, '\t');
+		saved_field(out, NameStr(a->attname));
+		saved_acl(out, DatumGetAclP(acl));
+		appendStringInfoChar(out, '\n');
+	}
+	systable_endscan(scan);
+	table_close(attrel, AccessShareLock);
+}
+
+/*
+ * Each object a drop_for_move() drop takes: one of the tables, or a
+ * versioned object the move makes again as the root it moves to defines
+ * it (a view, a foreign key or policy of another versioned table, an
+ * index, a sequence, a routine).  Anything else is refused: an object
+ * outside the versioned schemas, another table or a column of one.  So
+ * is, where the session's role drops what it owns (owned), a materialized
+ * view (making one again runs its query as the mover) and an object of
+ * another role's (made again, it would be the mover's): each is listed.
+ * The privileges of each relation it takes are saved.
+ */
+static void
+drop_watch_hook(ObjectAccessType access, Oid classId, Oid objectId, int subId,
+				void *arg)
+{
+	if (drop_watch_next)
+		drop_watch_next(access, classId, objectId, subId, arg);
+	if (access != OAT_DROP || drop_watch == NULL || drop_watch->refused != NULL)
+		return;
+	if (classId == RelationRelationId)
+	{
+		char		kind;
+
+		if (list_member_oid(drop_watch->relids, objectId))
+			return;
+		kind = get_rel_relkind(objectId);
+		if (kind == RELKIND_TOASTVALUE || kind == RELKIND_INDEX ||
+			kind == RELKIND_PARTITIONED_INDEX)
+			return;
+		if (subId != 0 || kind == RELKIND_RELATION ||
+			kind == RELKIND_PARTITIONED_TABLE || kind == RELKIND_FOREIGN_TABLE ||
+			(drop_watch->owned && kind == RELKIND_MATVIEW))
+			goto refused;
+		if (drop_watch->owned && rel_owner(objectId) != GetUserId())
+		{
+			ObjectAddress object;
+			char	   *what;
+			MemoryContext old = MemoryContextSwitchTo(drop_watch->cxt);
+
+			ObjectAddressSet(object, classId, objectId);
+			what = getObjectDescription(&object, true);
+			appendStringInfo(drop_watch->others, "%s%s (%s)",
+							 drop_watch->others->len ? ", " : "",
+							 what ? what : "an object",
+							 GetUserNameFromId(rel_owner(objectId), false));
+			MemoryContextSwitchTo(old);
+			return;
+		}
+		if (drop_watch->saved)
+		{
+			MemoryContext old = MemoryContextSwitchTo(drop_watch->cxt);
+
+			save_privileges(drop_watch->saved, objectId);
+			MemoryContextSwitchTo(old);
+		}
+	}
+	{
+		ObjectAddress object;
+
+		ObjectAddressSubSet(object, classId, objectId, subId);
+		if (object_is_versioned(&object))
+			return;
+	}
+refused:
+	{
+		ObjectAddress object;
+		char	   *what;
+
+		/* (described now: it is gone once the drop is done) */
+		ObjectAddressSubSet(object, classId, objectId, subId);
+		what = getObjectDescription(&object, true);
+		drop_watch->refused = MemoryContextStrdup(drop_watch->cxt,
+												  what ? what : "an object");
+	}
+}
+
+/*
+ * Drop the tables relids (the session's branch's: one already gone is
+ * passed over), and what depends on them that the move to follow makes
+ * again, as the root it moves to defines it: refused, naming it, where
+ * the drop would take anything else with them (drop_watch_hook()).  why:
+ * what drops them, for the error; owned: the session's role drops what it
+ * owns (the caller checks the privileges that takes), so other roles'
+ * objects and materialized views are refused too.  saved (if not NULL)
+ * gets the privileges of the tables and of each relation the drop takes.
+ * Run hushed, as a move's statements.
+ */
+static void
+drop_for_move(List *relids, const char *why, bool owned, StringInfo saved)
+{
+	DropWatch	watch = {0};
+	ObjectAddresses *objects = new_object_addresses();
+	StringInfoData others;
+
+	initStringInfo(&others);
+	watch.others = &others;
+	watch.owned = owned;
+	watch.saved = saved;
+	foreach_oid(relid, relids)
+	{
+		ObjectAddress object;
+
+		if (get_rel_name(relid) == NULL)
+			continue;
+		ObjectAddressSet(object, RelationRelationId, relid);
+		add_exact_object_address(&object, objects);
+		watch.relids = lappend_oid(watch.relids, relid);
+		if (saved)
+			save_privileges(saved, relid);
+	}
+	if (watch.relids == NIL)
+		return;
+	watch.cxt = CurrentMemoryContext;
+	drop_watch_next = object_access_hook;
+	object_access_hook = drop_watch_hook;
+	drop_watch = &watch;
+	PG_TRY();
+	{
+		performMultipleDeletions(objects, DROP_CASCADE,
+								 PERFORM_DELETION_INTERNAL |
+								 PERFORM_DELETION_QUIETLY);
+	}
+	PG_FINALLY();
+	{
+		drop_watch = NULL;
+		object_access_hook = drop_watch_next;
+	}
+	PG_END_TRY();
+	if (watch.refused != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot %s: %s depends on the table here", why,
+						watch.refused),
+				 errdetail("Dropping the branch's table would take it too, and nothing would make it again."),
+				 errhint("Drop it on this branch first.")));
+	if (others.len > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot %s: objects of other roles depend on the table here", why),
+				 errdetail("Dropping the branch's table would take them, and they would be made again as the session's role's: %s.",
+						   others.data),
+				 errhint("Their owners can drop them on this branch first.")));
+	CommandCounterIncrement();
+}
+
+/*
+ * Give back the privileges saved (save_privileges()'s lines) to the
+ * relations of their names the branch has now, of the same kind, and to
+ * their columns of those names: a line only views' (views), or all.  Each
+ * grant is given back only if its grantee and grantor are the roles they
+ * were (the same OID and the same name): one of a role dropped or renamed
+ * since is passed over, with a notice, and the line's others given back.
+ */
+void
+prolly_restore_privileges(const char *saved, bool views)
+{
+	char	   *copy;
+	char	   *line;
+	char	   *next;
+	Relation	pg_class;
+	Relation	pg_attribute;
+
+	if (saved == NULL || saved[0] == '\0')
+		return;
+	copy = pstrdup(saved);
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	pg_attribute = table_open(AttributeRelationId, RowExclusiveLock);
+	for (line = copy; line && *line; line = next)
+	{
+		List	   *f = NIL;
+		int			nf;
+		const char *p = line;
+		Oid			relid;
+		Acl		   *acl;
+		AclItem    *items;
+		int			nitems = 0;
+		HeapTuple	tup;
+		Relation	catalog;
+		AttrNumber	aclattr;
+		AttrNumber	attnum = 0;
+		Datum		old;
+		bool		isnull;
+		Oid			owner;
+		Oid		   *oldmembers = NULL;
+		Oid		   *newmembers;
+		int			noldmembers = 0;
+		int			nnewmembers;
+		char		kind;
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		/* (its fields, unescaped) */
+		{
+			StringInfoData field;
+
+			initStringInfo(&field);
+			for (;; p++)
+			{
+				if (*p == '\\' && p[1])
+				{
+					p++;
+					appendStringInfoChar(&field, *p == 't' ? '\t' : *p == 'n' ? '\n' : *p);
+				}
+				else if (*p == '\t' || *p == '\0')
+				{
+					f = lappend(f, pstrdup(field.data));
+					resetStringInfo(&field);
+					if (*p == '\0')
+						break;
+				}
+				else
+					appendStringInfoChar(&field, *p);
+			}
+		}
+		nf = list_length(f);
+		if (nf < 3 || (nf - 3) % 5 != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold a damaged record of saved privileges")));
+		kind = ((char *) linitial(f))[0];
+		if (views && kind != RELKIND_VIEW)
+			continue;
+		relid = rel_named(lsecond(f), true);
+		if (!OidIsValid(relid) ||
+			(kind != 'c' && get_rel_relkind(relid) != kind))
+			continue;
+		acl = (Acl *) palloc0(ACL_N_SIZE((nf - 3) / 5));
+		acl->ndim = 1;
+		acl->dataoffset = 0;
+		acl->elemtype = ACLITEMOID;
+		ARR_LBOUND(acl)[0] = 1;
+		items = ACL_DAT(acl);
+		for (int i = 3; i < nf; i += 5)
+		{
+			Oid			grantee = (Oid) strtoul(list_nth(f, i), NULL, 10);
+			const char *grantee_name = list_nth(f, i + 1);
+			Oid			grantor = (Oid) strtoul(list_nth(f, i + 2), NULL, 10);
+			const char *grantor_name = list_nth(f, i + 3);
+			char	   *grantee_now = grantee == ACL_ID_PUBLIC ? "" :
+				GetUserNameFromId(grantee, true);
+			char	   *grantor_now = GetUserNameFromId(grantor, true);
+
+			if (grantee_now == NULL || strcmp(grantee_now, grantee_name) != 0 ||
+				grantor_now == NULL || strcmp(grantor_now, grantor_name) != 0)
+			{
+				bool		grantee_gone = grantee_now == NULL ||
+					strcmp(grantee_now, grantee_name) != 0;
+
+				ereport(NOTICE,
+						(errmsg("privileges of role \"%s\" on %s%s%s not given back",
+								grantee == ACL_ID_PUBLIC ? "public" : grantee_name,
+								(char *) lsecond(f), kind == 'c' ? " column " : "",
+								kind == 'c' ? (char *) lthird(f) : ""),
+						 errdetail("Role \"%s\", which %s, was dropped or renamed since they were saved.",
+								   grantee_gone ? grantee_name : grantor_name,
+								   grantee_gone ? "held them" : "granted them")));
+				continue;
+			}
+			items[nitems].ai_grantee = grantee;
+			items[nitems].ai_grantor = grantor;
+			items[nitems].ai_privs = (AclMode) strtoul(list_nth(f, i + 4), NULL, 16);
+			nitems++;
+		}
+		if (nitems == 0)
+			continue;
+		ARR_DIMS(acl)[0] = nitems;
+		SET_VARSIZE(acl, ACL_N_SIZE(nitems));
+		owner = rel_owner(relid);
+		if (kind == 'c')
+		{
+			tup = SearchSysCacheCopyAttName(relid, lthird(f));
+			catalog = pg_attribute;
+			aclattr = Anum_pg_attribute_attacl;
+			if (HeapTupleIsValid(tup))
+				attnum = ((Form_pg_attribute) GETSTRUCT(tup))->attnum;
+		}
+		else
+		{
+			tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+			catalog = pg_class;
+			aclattr = Anum_pg_class_relacl;
+		}
+		if (!HeapTupleIsValid(tup))
+			continue;
+		old = heap_getattr(tup, aclattr, RelationGetDescr(catalog), &isnull);
+		if (!isnull)
+			noldmembers = aclmembers(DatumGetAclP(old), &oldmembers);
+		nnewmembers = aclmembers(acl, &newmembers);
+		{
+			Datum	   *values = palloc0_array(Datum, RelationGetDescr(catalog)->natts);
+			bool	   *nulls = palloc0_array(bool, RelationGetDescr(catalog)->natts);
+			bool	   *replaces = palloc0_array(bool, RelationGetDescr(catalog)->natts);
+			HeapTuple	newtup;
+
+			values[aclattr - 1] = PointerGetDatum(acl);
+			replaces[aclattr - 1] = true;
+			newtup = heap_modify_tuple(tup, RelationGetDescr(catalog), values,
+									   nulls, replaces);
+			CatalogTupleUpdate(catalog, &newtup->t_self, newtup);
+		}
+		updateAclDependencies(RelationRelationId, relid, attnum, owner,
+							  noldmembers, oldmembers, nnewmembers, newmembers);
+	}
+	table_close(pg_attribute, RowExclusiveLock);
+	table_close(pg_class, RowExclusiveLock);
+	CommandCounterIncrement();
+}
+
+/*
+ * The role a table (name here) of commit's relation relid is made by: the
+ * owner commit's record of relations names (InvalidOid: it has no record,
+ * or none of relid).
+ */
+static Oid
+recorded_maker(const ProllyHash *commit, const char *name, Oid relid)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *relations;
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, commit, &relations))
+		return InvalidOid;
+	foreach_ptr(ProllyCommitRelation, r, relations)
+		if (r->relid == relid &&
+			(r->relkind == RELKIND_RELATION || r->relkind == RELKIND_PARTITIONED_TABLE))
+			return prolly_recorded_owner(name, r->owner, r->owner_name);
+	return InvalidOid;
+}
+
+/*
+ * Make the tables of a merge's identity conflicts conflicts (one tree's)
+ * theirs, as the merge state ms's other side has them: the branch's
+ * relations dropped (refused unless the session's role owns each, or
+ * with what depends on them that the move can't make again:
+ * drop_for_move()), and their relations made, of their OIDs (each the
+ * relation theirs' commit records under its name, if the branch hasn't
+ * one of that OID), definitions and rows, as the session's role, then
+ * given the privileges the local branch they came from (if any) has on
+ * them, as a merge of it gives a table it makes.  The table is then
+ * theirs: another relation, its grants not the branch's table's.  The
+ * privileges of the branch's tables, and of the views the drop took, are
+ * saved in the merge in progress (ms->identity_saved): the views, made
+ * again over theirs, get theirs back now, and an abort gives the tables
+ * theirs back (prolly_restore_privileges()).
+ */
+static void
+take_their_tables(ProllyMergeState *ms, List *conflicts)
+{
+	StringInfoData saved;
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef their_root;
+	ProllyNodeRef working;
+	ProllyNodeRef target;
+	ProllyNodeRef dropped;
+	List	   *renames = NIL;
+	List	   *names = identity_names(conflicts);
+	List	   *ours = NIL;
+	List	   *made = NIL;
+	List	   *from = NIL;
+
+	foreach_ptr(ProllyIdentityConflict, c, conflicts)
+	{
+		Oid			relid = rel_named(c->name, true);
+
+		if (!OidIsValid(relid))
+			continue;
+		if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be owner of table %s to resolve its table identity conflict with --theirs",
+							c->name),
+					 errdetail("Taking theirs drops the branch's table, its rows and grants, and makes the other side's relation the branch's table.")));
+		ours = lappend_oid(ours, relid);
+	}
+	commit_root(&ms->theirs, &their_root);
+	foreach_ptr(ProllyIdentityConflict, c, conflicts)
+		if (strcmp(c->name, c->their_name) != 0)
+		{
+			ProllyRename *r = palloc0(sizeof(ProllyRename));
+
+			r->table = c->their_name;
+			r->to = c->name;
+			renames = lappend(renames, r);
+		}
+	if (renames != NIL)
+	{
+		ProllyNodeRef renamed;
+
+		PROLLY_CALL(dc.canonicalizer, rename_root, &their_root, renames, &renamed);
+		their_root = renamed;
+	}
+	(void) PROLLY_CALL(dc.refs, working_set, NULL, &working);
+	PROLLY_CALL(dc.canonicalizer, splice, &working, &their_root, names, &target);
+	initStringInfo(&saved);
+	if (ms->identity_saved)
+		appendStringInfoString(&saved, ms->identity_saved);
+	drop_for_move(ours, "resolve the table identity conflict with --theirs",
+				  true, &saved);
+	(void) PROLLY_CALL(dc.refs, working_set, NULL, &dropped);
+	foreach_ptr(ProllyIdentityConflict, c, conflicts)
+		if (OidIsValid(c->their_relid))
+		{
+			ProllyKeptRelation *k = palloc0(sizeof(ProllyKeptRelation));
+
+			k->name = c->name;
+			k->relid = c->their_relid;
+			k->owner = recorded_maker(&ms->theirs, c->name, c->their_relid);
+			prolly_move_kept = lappend(prolly_move_kept, k);
+		}
+	PG_TRY();
+	{
+		folded_move_to(&target, &dropped);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_kept = NIL;
+	}
+	PG_END_TRY();
+	foreach_ptr(ProllyIdentityConflict, c, conflicts)
+	{
+		Oid			relid = rel_named(c->name, true);
+
+		if (OidIsValid(relid) && OidIsValid(c->their_relid))
+		{
+			made = lappend_oid(made, relid);
+			from = lappend_oid(from, c->their_relid);
+		}
+	}
+	/* (the views it made again over them: theirs, their grants kept) */
+	prolly_restore_privileges(saved.data, true);
+	ms->identity_saved = saved.data;
+	if (ms->identity_source != NULL && made != NIL &&
+		branch_ops()->carry_privileges != NULL)
+		branch_ops()->carry_privileges(ms->identity_source, made, from);
+}
+
+/*
+ * Resolve the identity conflicts of relid's tree in the merge in progress
+ * (ms): theirs, or the branch's kept.  False if relid has none.
+ */
+static bool
+resolve_identity(Oid relid, ProllyMergeState *ms, bool theirs)
+{
+	int			tree = -1;
+	List	   *conflicts = NIL;
+	int			n = 0;
+
+	for (int i = 0; i < ms->nidentity; i++)
+		if (ms->identity[i].relid == relid)
+			tree = ms->identity[i].tree;
+	if (tree < 0)
+		return false;
+	for (int i = 0; i < ms->nidentity; i++)
+		if (ms->identity[i].tree == tree)
+			conflicts = lappend(conflicts, &ms->identity[i]);
+	if (theirs)
+		take_their_tables(ms, conflicts);
+	for (int i = 0; i < ms->nidentity; i++)
+		if (ms->identity[i].tree != tree)
+			ms->identity[n++] = ms->identity[i];
+	ms->nidentity = n;
+	PROLLY_CALL(components().refs, set_merge_state, ms);
+	return true;
+}
+
+/*
+ * Make again, as their own relations, the tables here whose relation isn't
+ * the one head's commit records under their names: before a move back to
+ * the head (an abort's, a stash's), which then makes each the relation
+ * its version is of (a table a merge's conflict resolution made theirs,
+ * one dropped and made again since).  Dropped first (drop_for_move()), the
+ * session's role their owner, if owned (and so of what the drop takes).
+ */
+void
+prolly_drop_mismatched_tables(const ProllyHash *head, const char *why,
+							  bool owned)
+{
+	ProllyDatabaseComponents dc = components();
+	List	   *relations;
+	List	   *drop = NIL;
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_CALL(dc.refs, commit_relations, head, &relations))
+		return;
+	foreach_ptr(ProllyCommitRelation, r, relations)
+	{
+		Oid			here = record_is_table(r) ? prolly_table_named(r->name) : InvalidOid;
+
+		if (OidIsValid(here) && here != r->relid)
+		{
+			if (owned && !object_ownercheck(RelationRelationId, here, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, get_rel_name(here));
+			drop = lappend_oid(drop, here);
+		}
+	}
+	if (drop != NIL)
+		drop_for_move(drop, why, owned, NULL);
+}
+
 static void
 folded_resolve(Oid relid, bool theirs)
 {
-	ProllyMergeState ms;
+	ProllyMergeState ms = {0};
 	int			i = conflicted_table(relid, &ms);
 
+	if (i < 0 && ms.nidentity > 0 && resolve_identity(relid, &ms, theirs))
+		return;
 	if (i < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
