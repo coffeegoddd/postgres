@@ -155,7 +155,7 @@ change counts to an existing root and run `prepare` again.
 | Table size N | `sizes_gb` or explicit `rows` | 0.01, 0.1, 1, 10 GB |
 | Changed rows K | `changes` | 1,000 |
 | Pending dirty rows Q | `dirty_sizes` | xsmall 0.001%, small 0.01%, medium 1%, large 10% of N |
-| Distance D from current HEAD | `history_depths` | 1, 4, 16, 32 commits |
+| Distance D from current HEAD | `history_depths` | 32, 100, 500 commits (smoke: 1, 4) |
 | Repetitions | `repetitions`, `warmups` | 1 measured per pass; no discarded warmups (set `warmups` to run some first) |
 | Memory sampling | `sample_interval_ms` | 10 ms |
 

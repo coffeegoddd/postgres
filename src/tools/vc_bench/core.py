@@ -96,7 +96,7 @@ def init(root, smoke):
         "sizes_gb": [] if smoke else [0.01, 0.1, 1, 10],
         "changes": [8] if smoke else [1000],
         "dirty_sizes": default_dirty_sizes(),
-        "history_depths": [1, 4] if smoke else [1, 4, 16, 32],
+        "history_depths": [1, 4] if smoke else [32, 100, 500],
         "repetitions": 2 if smoke else 1, "warmups": 0,
         "passes": list(PASSES), "sample_interval_ms": 10,
         "batch_rows": 1000, "timeout_seconds": 3600, "seed": 20261021,
