@@ -1304,8 +1304,12 @@ branch_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			undo_new_branches(InvalidSubTransactionId);
+			/*
+			 * (returns first: one to a branch the transaction made goes on
+			 * back from it, as it goes)
+			 */
 			undo_returns(InvalidSubTransactionId);
+			undo_new_branches(InvalidSubTransactionId);
 			release_left_branches();
 			forget_written(InvalidSubTransactionId);
 			break;
@@ -1336,8 +1340,8 @@ branch_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	switch (event)
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
-			undo_new_branches(mySubid);
 			undo_returns(mySubid);
+			undo_new_branches(mySubid);
 			forget_written(mySubid);
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:

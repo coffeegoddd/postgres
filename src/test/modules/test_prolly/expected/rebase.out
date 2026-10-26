@@ -1446,5 +1446,39 @@ SELECT active_branch(),
  sc3           |    0
 (1 row)
 
+-- a rebase begun and finished in the transaction, rolled back: the
+-- session back on the branch rebased, the rebase's branch gone with it
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS done;
+ done 
+------
+ 0
+(1 row)
+
+ROLLBACK;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+ active_branch | left 
+---------------+------
+ sc3           |    0
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ done 
+------
+ 0
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+ active_branch | left 
+---------------+------
+ sc3           |    0
+(1 row)
+
+COMMIT;
 \c postgres
 DROP DATABASE regress_rebase;

@@ -415,5 +415,20 @@ SELECT dolt_rebase('--abort');
 SELECT active_branch(),
 	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
 
+-- a rebase begun and finished in the transaction, rolled back: the
+-- session back on the branch rebased, the rebase's branch gone with it
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+BEGIN;
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK TO s;
+SELECT active_branch(),
+	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
+COMMIT;
+
 \c postgres
 DROP DATABASE regress_rebase;
