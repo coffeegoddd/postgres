@@ -1514,10 +1514,10 @@ check_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 }
 
 /*
- * The estimate of changed's diff from from, given too few nodes to read
- * the leaves the changes are under (checked), within a factor of two of
- * the count: not the rows under the leaves left unread, nor the count of
- * leaves that differ.
+ * The estimate of changed's diff from from (rfrom, or built if NULL),
+ * given too few nodes to read the leaves the changes are under (checked),
+ * within a factor of two of the count: not the rows under the leaves left
+ * unread, nor the count of leaves that differ.
  */
 static void
 check_estimate_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
@@ -1525,11 +1525,17 @@ check_estimate_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 							const Ref *changed, const char *what)
 {
 	ProllyNodeRef rchanged;
+	ProllyNodeRef rbuilt;
 	ProllyNodeCounters cnt = {0};
 	int			want = changed_keys(from, changed);
 	uint64		got;
 	uint64		budget = 64;
 
+	if (rfrom == NULL)
+	{
+		build_ref(tr, env, from, &rbuilt);
+		rfrom = &rbuilt;
+	}
 	build_ref(tr, env, changed, &rchanged);
 	env->counters = &cnt;
 	(void) PROLLY_CALL(tr, diff_estimate, env, rfrom, &rchanged, UINT64_MAX);
@@ -1546,8 +1552,10 @@ check_estimate_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 /*
  * Changes spread over the tree, one in two hundred keys; in runs under
  * parents that all differ, every other run of fifty keys (a leaf's worth
- * or so, two hundred runs); and bunched, a run of two thousand keys: each
- * estimated near its count in a budget that doesn't reach their leaves.
+ * or so, two hundred runs); bunched, a run of two thousand keys; and
+ * spread with a run of five thousand keys deleted, added or rewritten (one
+ * large part of the keys among many small ones): each estimated near its
+ * count in a budget that doesn't reach their leaves.
  */
 static void
 check_estimates_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
@@ -1573,6 +1581,24 @@ check_estimates_under_budget(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 		changed->version[k] = 2;
 	check_estimate_under_budget(tr, env, from, rfrom, changed,
 								"bunched together");
+
+	memcpy(changed, from, sizeof(Ref));
+	for (int k = 0; k < MAX_KEY; k += 200)
+		changed->version[k] = 2;
+	for (int k = MAX_KEY / 2; k < MAX_KEY / 2 + 5000; k++)
+		changed->version[k] = ABSENT;
+	check_estimate_under_budget(tr, env, from, rfrom, changed,
+								"spread, and a run of keys deleted");
+	check_estimate_under_budget(tr, env, changed, NULL, from,
+								"spread, and a run of keys added");
+
+	memcpy(changed, from, sizeof(Ref));
+	for (int k = 0; k < MAX_KEY; k += 200)
+		changed->version[k] = 2;
+	for (int k = MAX_KEY / 2; k < MAX_KEY / 2 + 5000; k++)
+		changed->version[k] = 3;
+	check_estimate_under_budget(tr, env, from, rfrom, changed,
+								"spread, and a run of keys rewritten");
 	pfree(changed);
 }
 

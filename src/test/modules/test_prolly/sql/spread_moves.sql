@@ -5,8 +5,8 @@
 -- by row, only the rows that differ written.  It isn't emptied and loaded
 -- whole, and so isn't folded in full after: a table loaded with more rows
 -- than its change log notes in a transaction has a log that says to read
--- it in full.  Changes bunched together, or in runs, past an eighth of
--- the rows, still reload.
+-- it in full.  Changes bunched together, in runs, or with a range only
+-- one side holds, past an eighth of the rows, still reload.
 CREATE DATABASE regress_spread_moves;
 -- (the move planner's sources, not pages kept as of the head, which come
 -- before them and move nothing: first_use_kept tests those)
@@ -105,6 +105,35 @@ SELECT ins = 70000 AND del = 0 AS emptied FROM pg_temp.written();
 COMMIT;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
 SELECT count(*) FILTER (WHERE v = 3) AS as_runs30 FROM sm.t;
+SELECT dolt_checkout('main');
+
+-- And a thousand spread changes with a range only one side holds:
+-- twenty-four thousand rows appended on main (the branch's head lacks
+-- them), then those deleted again (its head has them).  Each is one large
+-- part of the key space among a thousand small ones, which the sample
+-- takes in proportion to its rows: emptied and loaded both times.
+SELECT dolt_branch('-D', 'runs1000');
+SELECT dolt_branch('appended');
+UPDATE sm.t SET v = 5 WHERE id % 70 = 1;
+INSERT INTO sm.t SELECT g, 0, repeat(md5(g::text), 3) FROM generate_series(70001, 94000) g;
+SELECT length(dolt_commit('-am', 'appended')::text) > 0 AS committed;
+BEGIN;
+SELECT dolt_checkout('appended');
+SELECT ins = 70000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'appended');
+SELECT dolt_branch('deleted');
+UPDATE sm.t SET v = 6 WHERE id % 70 = 2;
+DELETE FROM sm.t WHERE id > 70000;
+SELECT length(dolt_commit('-am', 'deleted')::text) > 0 AS committed;
+BEGIN;
+SELECT dolt_checkout('deleted');
+SELECT ins = 94000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT count(*) AS rows FROM sm.t;
 SELECT dolt_checkout('main');
 
 \c contrib_regression

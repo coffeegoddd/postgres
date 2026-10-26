@@ -4682,11 +4682,12 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
 		/*
-		 * (with tables to share, not bounded by the best's cost: one past it
-		 * may cost less once they are shared)
+		 * (bounded by what it would have to cost less than, the best's less
+		 * the margin; with tables to share, not bounded: one past it may
+		 * cost less once they are shared)
 		 */
 		PlanOn		po = {planner, list_nth(sc.roots, i), target,
-		shareable ? INFINITY : best_cost, &plan};
+		shareable ? INFINITY : best_cost * SOURCE_COST_MARGIN, &plan};
 		double		cost;
 
 		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
