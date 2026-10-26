@@ -137,18 +137,24 @@ CREATE TABLE ci.grow (id int PRIMARY KEY, v int);
 INSERT INTO ci.grow SELECT g, g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-Am', 'small')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush() \gset
-SELECT pg_temp.since('nodes_read') >= 0 AS counting;
+-- (the data trees' nodes alone: a mount pins its commit in the refs, whose
+-- nodes read vary with where the commit's id puts its entries)
+SELECT pg_temp.since('nodes_read') >= 0 AS counting,
+	pg_temp.since('refs_nodes_read') >= 0 AS counting;
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'small', ARRAY['grow']);
 SELECT pg_stat_force_next_flush() \gset
-SELECT pg_temp.since('nodes_read') AS small_mount_nodes \gset
+SELECT pg_temp.since('nodes_read') - pg_temp.since('refs_nodes_read')
+	AS small_mount_nodes \gset
 INSERT INTO ci.grow SELECT g, g FROM generate_series(1001, 100000) g;
 SELECT length(dolt_commit('-Am', 'large')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush() \gset
-SELECT pg_temp.since('nodes_read') >= 0 AS counting;
+SELECT pg_temp.since('nodes_read') >= 0 AS counting,
+	pg_temp.since('refs_nodes_read') >= 0 AS counting;
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'large', ARRAY['grow']);
 SELECT pg_stat_force_next_flush() \gset
 -- (the root's items and the table's description: flat in the rows)
-SELECT pg_temp.since('nodes_read') <= :small_mount_nodes + 2 AS mount_flat_in_rows;
+SELECT pg_temp.since('nodes_read') - pg_temp.since('refs_nodes_read')
+	<= :small_mount_nodes + 2 AS mount_flat_in_rows;
 SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
 SELECT v FROM small.grow WHERE id = 500;
