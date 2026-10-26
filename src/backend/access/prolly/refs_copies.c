@@ -1159,6 +1159,19 @@ edit_of(ScopedEdits *se, const char *key, int len, ProllyValue *value)
 }
 
 /*
+ * A copy of a key of len bytes, as it is: binary (a commit's id may hold a
+ * zero byte), never cut at one as pnstrdup() would cut it.
+ */
+static char *
+key_copy(const char *key, int len)
+{
+	char	   *k = palloc(Max(len, 1));
+
+	memcpy(k, key, len);
+	return k;
+}
+
+/*
  * Add to se a put of key (len bytes) as mine has it, unless se has an edit
  * of it already or mine hasn't it: true if added.
  */
@@ -1184,7 +1197,7 @@ put_again(const ProllyNodeRef *mine, ScopedEdits *se, const char *key, int len)
 			palloc_array(ProllyEdit, se->max);
 	}
 	e = &se->edits[se->n++];
-	e->key.data = (const uint8 *) pnstrdup(key, len);
+	e->key.data = (const uint8 *) key_copy(key, len);
 	e->key.len = len;
 	e->is_delete = false;
 	e->value.data = (const uint8 *) v.data;
@@ -1313,7 +1326,7 @@ records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
 					palloc_array(ProllyEdit, re.max);
 			}
 			e = &re.edits[re.n++];
-			e->key.data = (const uint8 *) pnstrdup((const char *) commit->bytes, commit->len);
+			e->key.data = (const uint8 *) key_copy((const char *) commit->bytes, commit->len);
 			e->key.len = commit->len;
 			e->is_delete = false;
 			e->value.data = (const uint8 *) rv.data;

@@ -48,10 +48,10 @@ is(sql(qq{SELECT test_chunk_has('$commit')}), 'f', 'the collection took the comm
 $maker->query_until(qr/started/, "\\echo started\n$make;\n\\echo made\n");
 # (it waits on the refs the collecting transaction holds; were they not
 # held, it would publish at once)
-$node->poll_query_until('fr', q{SELECT count(*) > 0 FROM pg_stat_activity
+ok($node->poll_query_until('fr', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE state = 'active' AND wait_event_type = 'Lock'
-	AND backend_type = 'client backend' AND pid <> pg_backend_pid()})
-  or diag('the second commit did not wait');
+	AND backend_type = 'client backend' AND pid <> pg_backend_pid()}),
+	'the commit made again waits for the collection');
 $gc->query_safe(q{COMMIT});
 $maker->query_until(qr/made/, '');
 $maker->quit;
