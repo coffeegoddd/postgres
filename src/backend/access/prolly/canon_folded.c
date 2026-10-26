@@ -11366,6 +11366,8 @@ try_statement(const char *sql, MemoryContext mcxt, ResourceOwner owner,
 		CurrentResourceOwner = owner;
 		if (!waits_on_another(ed))
 			ReThrowError(ed);
+		/* (a schema conflict swallowed here isn't the caller's: prolly_merge.h) */
+		prolly_schema_conflict_raised = false;
 		if (failure)
 			*failure = ed;
 		else

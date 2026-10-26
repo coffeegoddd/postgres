@@ -1480,5 +1480,228 @@ SELECT active_branch(),
 (1 row)
 
 COMMIT;
+-- a chain of branches made in the transaction, rolled back: the session
+-- on a branch that is there, not on one undone with it (by the block, or
+-- to a savepoint; plainly, or through a rebase of a branch made there)
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+ on_p2 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+ on_p2 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+ on_p2 
+-------
+ t
+(1 row)
+
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ on_p1 
+-------
+ t
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch();
+ active_branch 
+---------------
+ p1
+(1 row)
+
+ROLLBACK;
+SELECT active_branch();
+ active_branch 
+---------------
+ main
+(1 row)
+
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+ on_xd1 
+--------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_rebase('main'))[1] AS done;
+ done 
+------
+ 0
+(1 row)
+
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+ active_branch | left 
+---------------+------
+ main          |    0
+(1 row)
+
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+ on_xd1 
+--------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ done 
+------
+ 0
+(1 row)
+
+ROLLBACK TO s;
+SELECT active_branch();
+ active_branch 
+---------------
+ xd1
+(1 row)
+
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+ active_branch | left 
+---------------+------
+ main          |    0
+(1 row)
+
+-- the merge's limits on reading an enum's labels across its changes are
+-- schema conflicts too, as Dolt's incompatible enum changes are: a
+-- rebase begun by the statement fails with Dolt's message, and 40001
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TYPE rb.e AS ENUM ('a', 'b');
+CREATE TABLE rb.en (id int PRIMARY KEY, v rb.e);
+INSERT INTO rb.en VALUES (1, 'a');
+SELECT dolt_commit('-Am', 'creating en') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('en1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE rb.e RENAME VALUE 'a' TO 'x';
+ALTER TYPE rb.e ADD VALUE 'z' BEFORE 'b';
+SELECT dolt_commit('-am', 'relabeling e') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('en1') IS NOT NULL AS on_en1;
+ on_en1 
+--------
+ t
+(1 row)
+
+INSERT INTO rb.en VALUES (2, 'b');
+UPDATE rb.en SET v = 'b' WHERE id = 1;
+SELECT dolt_commit('-am', 'en1 rows') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DO $$
+DECLARE
+	detail text;
+BEGIN
+	PERFORM dolt_rebase('main');
+EXCEPTION WHEN serialization_failure THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RAISE NOTICE 'failed as Dolt: %, %', SQLERRM LIKE
+		'schema conflict detected while rebasing commit %. the rebase has been automatically aborted',
+		detail;
+END $$;
+NOTICE:  failed as Dolt: t, schema conflict: cannot map historical labels of enum rb.e
+SELECT active_branch();
+ active_branch 
+---------------
+ en1
+(1 row)
+
 \c postgres
 DROP DATABASE regress_rebase;

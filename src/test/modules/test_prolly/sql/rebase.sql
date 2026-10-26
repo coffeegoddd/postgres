@@ -430,5 +430,79 @@ SELECT active_branch(),
 	(SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_sc3') AS left;
 COMMIT;
 
+-- a chain of branches made in the transaction, rolled back: the session
+-- on a branch that is there, not on one undone with it (by the block, or
+-- to a savepoint; plainly, or through a rebase of a branch made there)
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK;
+SELECT active_branch();
+BEGIN;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK TO s;
+SELECT active_branch();
+COMMIT;
+BEGIN;
+SELECT dolt_checkout('-b', 'p1') IS NOT NULL AS on_p1;
+SAVEPOINT s;
+SELECT dolt_checkout('-b', 'p2') IS NOT NULL AS on_p2;
+SELECT dolt_checkout('p1') IS NOT NULL AS on_p1;
+ROLLBACK TO s;
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch();
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+BEGIN;
+SELECT dolt_checkout('-b', 'xd1', 'main~1') IS NOT NULL AS on_xd1;
+INSERT INTO rb.t VALUES (90, 'xd1');
+SELECT dolt_commit('-am', 'xd1 row 90') IS NOT NULL AS committed;
+SAVEPOINT s;
+SELECT (dolt_rebase('main'))[1] AS done;
+ROLLBACK TO s;
+SELECT active_branch();
+ROLLBACK;
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name LIKE '%xd1') AS left;
+
+-- the merge's limits on reading an enum's labels across its changes are
+-- schema conflicts too, as Dolt's incompatible enum changes are: a
+-- rebase begun by the statement fails with Dolt's message, and 40001
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TYPE rb.e AS ENUM ('a', 'b');
+CREATE TABLE rb.en (id int PRIMARY KEY, v rb.e);
+INSERT INTO rb.en VALUES (1, 'a');
+SELECT dolt_commit('-Am', 'creating en') IS NOT NULL AS committed;
+SELECT dolt_branch('en1');
+ALTER TYPE rb.e RENAME VALUE 'a' TO 'x';
+ALTER TYPE rb.e ADD VALUE 'z' BEFORE 'b';
+SELECT dolt_commit('-am', 'relabeling e') IS NOT NULL AS committed;
+SELECT dolt_checkout('en1') IS NOT NULL AS on_en1;
+INSERT INTO rb.en VALUES (2, 'b');
+UPDATE rb.en SET v = 'b' WHERE id = 1;
+SELECT dolt_commit('-am', 'en1 rows') IS NOT NULL AS committed;
+DO $$
+DECLARE
+	detail text;
+BEGIN
+	PERFORM dolt_rebase('main');
+EXCEPTION WHEN serialization_failure THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RAISE NOTICE 'failed as Dolt: %, %', SQLERRM LIKE
+		'schema conflict detected while rebasing commit %. the rebase has been automatically aborted',
+		detail;
+END $$;
+SELECT active_branch();
+
 \c postgres
 DROP DATABASE regress_rebase;

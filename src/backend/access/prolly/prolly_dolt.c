@@ -5015,6 +5015,19 @@ errschemaconflict(void)
 	return 0;
 }
 
+/*
+ * Whether a caught error is a schema conflict: marked so as it was raised
+ * (errschemaconflict()), and of a code those errors have, so that a mark
+ * left by one swallowed on the way isn't taken for another error's.
+ */
+static bool
+caught_schema_conflict(const ErrorData *ed)
+{
+	return prolly_schema_conflict_raised &&
+		(ed->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+		 ed->sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED);
+}
+
 /* How a rebase's steps ended: rebase_steps(). */
 typedef enum RebaseSteps
 {
@@ -5146,14 +5159,15 @@ rebase_steps_or_abort(ProllyRebaseState *rs, const char **result, bool begun_her
 		{
 			ErrorData  *ed;
 
-			if (!prolly_schema_conflict_raised)
-				PG_RE_THROW();
-			prolly_schema_conflict_raised = false;
 			MemoryContextSwitchTo(cxt);
 			ed = CopyErrorData();
+			if (!caught_schema_conflict(ed))
+				PG_RE_THROW();
+			prolly_schema_conflict_raised = false;
 			FlushErrorState();
+			/* (40001, as Dolt's merge.SchemaConflict is: the enum limits' too) */
 			ereport(ERROR,
-					(errcode(ed->sqlerrcode),
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg_internal("%s", rebase_schema_conflict_message(rs)),
 					 errdetail_internal("%s", ed->message)));
 		}
@@ -5170,11 +5184,12 @@ rebase_steps_or_abort(ProllyRebaseState *rs, const char **result, bool begun_her
 	PG_CATCH();
 	{
 		ErrorData  *ed;
-		bool		schema = prolly_schema_conflict_raised;
+		bool		schema;
 
-		prolly_schema_conflict_raised = false;
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
+		schema = caught_schema_conflict(ed);
+		prolly_schema_conflict_raised = false;
 		FlushErrorState();
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);

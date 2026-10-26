@@ -1470,11 +1470,21 @@ check_out_branch(Oid branch)
 	if (!SearchSysCacheExists1(BRANCHOID, ObjectIdGetDatum(branch)))
 		return false;
 
+	/*
+	 * (the way back from a new branch is the branch last left for it, but
+	 * not one made after it: that goes first if both are undone, and the
+	 * session would be left on a branch no longer there)
+	 */
 	foreach(lc, new_branches)
 	{
 		NewBranch  *nb = lfirst(lc);
+		bool		from_newer = false;
 
-		if (nb->branch == branch && MyBranch != branch)
+		if (nb->branch != branch || MyBranch == branch)
+			continue;
+		for (int i = foreach_current_index(lc) + 1; i < list_length(new_branches); i++)
+			from_newer |= ((NewBranch *) list_nth(new_branches, i))->branch == MyBranch;
+		if (!from_newer)
 		{
 			nb->left = MyBranch;
 			nb->left_read_only = MyBranchReadOnly;
