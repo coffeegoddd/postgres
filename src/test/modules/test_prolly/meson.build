@@ -444,6 +444,7 @@ tests += {
       't/445_store_sync_slots.pl',
       't/483_minimal_reset_crash.pl',
       't/484_minimal_shrink_crash.pl',
+      't/491_restore_lock_autovacuum.pl',
       't/468_bmap_shared_redo_changes.pl',
       't/465_bmap_preserve_waits.pl',
       't/466_bmap_preserve_moved.pl',

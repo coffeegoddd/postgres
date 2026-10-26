@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BD0D
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD11
 
 typedef struct PgStat_ArchiverStats
 {
@@ -805,6 +805,14 @@ typedef enum PgStat_ProllyCounter
 										 * cache, not read */
 	PGSTAT_PROLLY_COMMIT_CACHE_MISSES,	/* and those looked for there and
 										 * read */
+	PGSTAT_PROLLY_KEPT_STATUS_CHECKS,	/* kept relations asked what is left
+										 * of their pages, to drop or
+										 * retire their commits */
+	PGSTAT_PROLLY_RESTORES_LOCK_BUSY,	/* restores and shares of a
+										 * relation's storage a move gave
+										 * up on, its lock held past the
+										 * wait for it: its rows written
+										 * instead */
 	PGSTAT_PROLLY_RECORDS_FORGOTTEN,	/* relation records of collected
 										 * commits forgotten after a
 										 * collection */

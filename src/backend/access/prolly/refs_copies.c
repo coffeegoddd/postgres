@@ -2265,16 +2265,16 @@ static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 					   Snapshot snap);
 
 /*
- * When the move under way first waited for a page sweep holding one of its
- * relations (branch operations' share(), restore() and share_kept()): one
- * lock_timeout bounds the waits of every table it restores or shares.
+ * The move under way's waits for holders of its relations' locks (branch
+ * operations' share(), restore() and share_kept()): one set of bounds
+ * covers the waits of every table it restores or shares.
  */
-static TimestampTz move_wait_start = 0;
+static BranchLockWait move_wait;
 
 static void
 settle(const ProllyCommitInfo *commit, const KnownSource *source)
 {
-	move_wait_start = 0;
+	memset(&move_wait, 0, sizeof(move_wait));
 	if (source == NULL)
 		restore_pages(commit);
 	settle_rows(&commit->root, source);
@@ -2856,14 +2856,14 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
 											carry, ncarry, carried,
-											&move_wait_start);
+											&move_wait);
 			for (int j = 0; done && j < ncarry; j++)
 				*into[j] = carried[j];
 			renamed |= done && ncarry > 0;
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
-									   &move_wait_start);
+									   &move_wait);
 		if (done)
 		{
 			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
@@ -3452,6 +3452,8 @@ kept_commit_status(const KeptCommit *kc)
 		{
 			BranchKeptStatus s = branch_ops()->kept_status(&kc->tables[t].rels[r]);
 
+			pgstat_count_prolly(PGSTAT_PROLLY_KEPT_STATUS_CHECKS, 1);
+
 			if (s != BRANCH_KEPT_RESTORABLE)
 				all = false;
 			if (s != BRANCH_KEPT_GONE)
@@ -3479,6 +3481,14 @@ kept_commit_status(const KeptCommit *kc)
  * go of.  (A TRUNCATE leaves a table's change log on its storage: its
  * commits are retired, not dropped.)  but: an entry left as it is (NULL:
  * none).
+ *
+ * Only the commits still kept are asked, no more of them than
+ * prolly.kept_commits (and one a restore keeps again): a retired one is
+ * neither counted nor offered whatever is left of its pages, and a later
+ * keep lets go of what is (let go of, gone storage is passed over).  The
+ * retired pile up within a transaction, each of its commits retiring one,
+ * till it ends: were they asked too, a transaction's commits would each
+ * ask of all the ones before.
  */
 static List *
 kept_drop_dead(List *kept, const KeptCommit *but)
@@ -3487,8 +3497,8 @@ kept_drop_dead(List *kept, const KeptCommit *but)
 
 	foreach_ptr(KeptCommit, o, kept)
 	{
-		BranchKeptStatus s = o == but ? BRANCH_KEPT_RESTORABLE :
-			kept_commit_status(o);
+		BranchKeptStatus s = o == but || FullTransactionIdIsValid(o->retired) ?
+			BRANCH_KEPT_RESTORABLE : kept_commit_status(o);
 
 		if (s == BRANCH_KEPT_GONE)
 			continue;
@@ -3950,7 +3960,7 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
 		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
-								   carried, &move_wait_start))
+								   carried, &move_wait))
 			continue;
 		for (int j = 0; j < ncarry; j++)
 			*into[j] = carried[j];
@@ -3969,8 +3979,8 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	 * the other commits whose pages were in the storage replaced dropped
 	 * with it)
 	 */
-	was->retired = GetTopFullTransactionId();
 	*kept = kept_drop_dead(lcons(kc, *kept), kc);
+	was->retired = GetTopFullTransactionId();
 	ref_of(&kc->baseline, &from);
 	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,
 				&spliced);

@@ -3409,6 +3409,77 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 }
 
 /*
+ * CancelAutoVacuumHolders
+ *		Ask each autovacuum worker holding a lock that conflicts with
+ *		lockmode on locktag to cancel its task, as ProcSleep() asks one
+ *		that blocks a lock waiter, but for a caller that only tries the
+ *		lock: it isn't in the lock's queue, so the deadlock check that would
+ *		find the worker never runs.  A worker vacuuming to prevent
+ *		wraparound is left alone.
+ *
+ *		Each is asked once, as ProcSleep() asks once per wait: asked[] (of
+ *		*nasked, room for maxasked) holds the transactions asked already,
+ *		passed over, and those asked now are added.  A worker asked again
+ *		while it aborts the task (the lock still held, its transaction the
+ *		same) would take the second cancel after its error handling, outside
+ *		it, and exit, leaving the rest of its tables.  One there is no room
+ *		to note isn't asked.  Returns how many were asked now; the caller
+ *		tries the lock again once they have let go.
+ */
+int
+CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
+						VirtualTransactionId *asked, int *nasked,
+						int maxasked)
+{
+	VirtualTransactionId *holders;
+	int			nholders;
+	int			nnew = 0;
+
+	holders = GetLockConflicts(locktag, lockmode, &nholders);
+	for (int i = 0; i < nholders; i++)
+	{
+		PGPROC	   *proc;
+		int			pid = 0;
+		bool		seen = false;
+
+		for (int j = 0; j < *nasked && !seen; j++)
+			seen = VirtualTransactionIdEquals(asked[j], holders[i]);
+		if (seen || *nasked >= maxasked)
+			continue;
+		proc = ProcNumberGetProc(holders[i].procNumber);
+		if (proc == NULL)
+			continue;
+
+		/* (still the transaction found holding it, and an autovacuum's) */
+		LWLockAcquire(ProcArrayLock, LW_SHARED);
+		if (proc->vxid.lxid == holders[i].localTransactionId)
+		{
+			uint8		statusFlags = ProcGlobal->statusFlags[proc->pgxactoff];
+
+			if ((statusFlags & PROC_IS_AUTOVACUUM) &&
+				!(statusFlags & PROC_VACUUM_FOR_WRAPAROUND))
+				pid = proc->pid;
+		}
+		LWLockRelease(ProcArrayLock);
+		if (pid == 0)
+			continue;
+
+		asked[(*nasked)++] = holders[i];
+		ereport(DEBUG1,
+				(errmsg_internal("sending cancel to autovacuum PID %d holding a lock process %d tries for",
+								 pid, MyProcPid)));
+		/* (one gone meanwhile isn't complained of, as in ProcSleep()) */
+		if (kill(pid, SIGINT) < 0 && errno != ESRCH)
+			ereport(WARNING,
+					(errmsg("could not send signal to process %d: %m", pid)));
+		nnew++;
+	}
+	if (!InHotStandby)
+		pfree(holders);
+	return nnew;
+}
+
+/*
  * Find a lock in the shared lock table and release it.  It is the caller's
  * responsibility to verify that this is a sane thing to do.  (For example, it
  * would be bad to release a lock here if there might still be a LOCALLOCK

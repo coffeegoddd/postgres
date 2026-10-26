@@ -1262,8 +1262,19 @@ A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
-couldn't write its rows, or one of its relations is in use (its locks are
-tried, not waited for): its rows are written.  Nor is one whose baseline
+couldn't write its rows, or one of its relations is in use: its rows are
+written.  Its locks are tried, not queued for, so as not to hold up the
+writers behind them.  A page sweep holding one is asked to let go, an
+autovacuum worker asked, once, to cancel its task (as Postgres cancels
+one that blocks a lock waiter) and waited for, until deadlock_timeout
+after the move first asked one, and any other holder waited for, tried
+again a little later each time, until prolly.restore_lock_wait (100 ms)
+after the move first waited: a statement lets go within a moment, a
+transaction left open won't soon, and the rows written instead often cost
+little.  lock_timeout, if set, caps both; the deadlock detector doesn't
+see these waits, so they are bounded, for the whole move.  A
+restore or share given up so is counted in pg_stat_prolly's
+restores_lock_busy.  Nor is one whose baseline
 holds the commit's rows with fewer than prolly.restore_min_changes (2) of
 them changed since, as its change finder tells from no more than that many
 of its records (the log's entries, none read as a fold reads them):
@@ -1290,7 +1301,16 @@ A restore gives each table it restores new storage, and the storage it
 replaces, where every other kept commit's snapshot of the table was, goes
 with it at commit; so does a rewrite's, or a dropped table's.  Each keep
 and each restore asks what is left of each kept commit's pages (branch
-operations' kept_status()).  One with nothing left at all (every
+operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
+relations asked of).  Only the commits still kept are asked, never more
+than prolly.kept_commits and the one a restore keeps again: a retired
+commit is neither counted nor offered whatever is left of its pages, and
+the retired pile up within a transaction (each of its commits retires
+one) until it ends, so asking them too would make each commit of a
+transaction ask of every one before it.  So a retired commit whose
+storage goes later stays in the record, keeping its commit and baseline
+from collection, until a later keep lets go of it or the branch is
+deleted.  One with nothing left at all (every
 relation's storage, or its snapshot there, gone, as the transaction sees
 it) is dropped from the list at once, with nothing to let go of, and its
 commit and baseline are no longer kept from collection.  One none of

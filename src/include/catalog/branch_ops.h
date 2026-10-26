@@ -25,6 +25,7 @@
 
 #include "common/relpath.h"
 #include "datatype/timestamp.h"
+#include "storage/lock.h"
 
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
@@ -67,6 +68,31 @@ typedef struct BranchKeptTable
 	int			nrels;
 	const BranchKeptRelation *rels;
 } BranchKeptTable;
+
+/* the autovacuum workers' transactions one operation asks to cancel, at most */
+#define BRANCH_LOCK_WAIT_MAX_ASKED	16
+
+/*
+ * One operation's waits for the locks its share(), restore() and
+ * share_kept() calls try, so that one bound covers them all: zeroed when
+ * the operation begins.
+ */
+typedef struct BranchLockWait
+{
+	TimestampTz start;			/* when one of its tries first waited */
+	TimestampTz asked;			/* when it first asked an autovacuum worker
+								 * to cancel */
+	int			nasked;			/* the workers' transactions asked */
+	VirtualTransactionId asked_xacts[BRANCH_LOCK_WAIT_MAX_ASKED];
+} BranchLockWait;
+
+/*
+ * prolly.restore_lock_wait: how long, in milliseconds, share(), restore()
+ * and share_kept() wait for a holder of a lock they need that isn't a page
+ * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
+ * caps it).
+ */
+extern PGDLLIMPORT int prolly_restore_lock_wait;
 
 typedef struct BranchOpsRoutine
 {
@@ -153,15 +179,21 @@ typedef struct BranchOpsRoutine
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 *
-	 * A lock held by a page sweep (bmap_compaction_let_go()) is waited
-	 * for, here and in restore() and share_kept(), the sweep asked to let
-	 * go: within lock_timeout of *wait_start, the operation's (0 until one
-	 * of its tries first waits, which sets it), so that lock_timeout bounds
-	 * the waits of all the calls one operation makes.
+	 * A lock not free at once is waited for, here and in restore() and
+	 * share_kept(), but never queued for, within the bounds of *wait, the
+	 * operation's (zeroed as it begins): a page sweep holding it is asked
+	 * to let go (bmap_compaction_let_go()) and waited out, within
+	 * lock_timeout of the operation's first wait (for as long as it takes
+	 * if lock_timeout is 0); an autovacuum worker is asked once to cancel,
+	 * and waited for until deadlock_timeout after the operation first
+	 * asked one (and none is asked once that and the next bound have
+	 * passed); any other holder within prolly.restore_lock_wait of the
+	 * first wait.  lock_timeout caps the last two.  In those three, a lock
+	 * taken "without waiting" is one not queued for, tried until then.
 	 */
 	bool		(*share) (Oid source, List *relids,
 						  bool (*unchanged) (void *arg), void *arg,
-						  TimestampTz *wait_start);
+						  BranchLockWait *wait);
 
 	/*
 	 * Optional: keep the pages of the session branch's relations relids as
@@ -215,7 +247,7 @@ typedef struct BranchOpsRoutine
 							BranchKeptRelation *renewed,
 							const BranchKeptRelation *carry, int ncarry,
 							BranchKeptRelation *carried,
-							TimestampTz *wait_start);
+							BranchLockWait *wait);
 
 	/*
 	 * Optional: let go of a snapshot keep() or restore() took, if its
@@ -269,7 +301,7 @@ typedef struct BranchOpsRoutine
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept, const BranchKeptRelation *carry,
 							   int ncarry, BranchKeptRelation *carried,
-							   TimestampTz *wait_start);
+							   BranchLockWait *wait);
 
 	/*
 	 * Optional: add to each of the session branch's relations relids the
