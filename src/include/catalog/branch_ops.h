@@ -339,10 +339,13 @@ typedef struct BranchOpsRoutine
 	 * mapped, or a domain of the same name over the same shared base
 	 * type); its expression indexes' rows, from source's index of the same
 	 * name, columns and expressions; its extended statistics objects'
-	 * data, from source's of the same name, kinds and columns; and its row
+	 * data, from source's of the same name and kinds over the same columns
+	 * by number (none where a dropped column puts them at other numbers on
+	 * one side); and its row
 	 * and page counts if it has none.  Not carried: a column of another
 	 * versioned type (a composite, a range, an array of a versioned type,
-	 * whose values hold source's OIDs), an extended statistics object on
+	 * whose values hold source's OIDs: only that column), a slot whose
+	 * values are of such a type, an extended statistics object on
 	 * expressions or over a column of a versioned type, and anything of a
 	 * table whose live columns source's working set has changed since its
 	 * head (renamed, retyped, added or dropped: its statistics may describe

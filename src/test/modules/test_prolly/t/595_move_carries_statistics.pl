@@ -163,6 +163,46 @@ is( on('main', q{SELECT count(*) FROM pg_stats
 		WHERE tablename = 'part' AND inherited}),
 	'2', "a partitioned table's inherited rows are");
 
+# Statistics whose values are of another type than the column's: an array
+# column's elements and their counts, a tsvector's lexemes, a range's
+# lengths, copied as they are; a column of an array of a versioned type
+# (the enum's) takes none, and the table's other columns still do.
+sql(q{
+	SELECT dolt_checkout('b');
+	CREATE TABLE s.arr (id int PRIMARY KEY, ia int[], tv tsvector,
+		r int4range, ee s.e[]);
+	INSERT INTO s.arr
+		SELECT g, ARRAY[g % 10, g % 7], to_tsvector('simple', 'w' || (g % 11)),
+			int4range(g % 50, g % 50 + g % 9 + 1),
+			ARRAY[CASE WHEN g % 2 = 0 THEN 'a' ELSE 'z' END]::s.e[]
+		FROM generate_series(1, 5000) g;
+	ANALYZE s.arr;
+	SELECT dolt_commit('-Am', 'arr');
+});
+on('main', q{SELECT dolt_merge('b')});
+is( on('main', q{
+		SELECT string_agg(attname || ':' ||
+			(most_common_vals IS NOT NULL OR most_common_elems IS NOT NULL OR
+			 range_length_histogram IS NOT NULL OR histogram_bounds IS NOT NULL),
+			',' ORDER BY attname)
+		FROM pg_stats WHERE schemaname = 's' AND tablename = 'arr'}),
+	'ia:true,id:true,r:true,tv:true',
+	"array, tsvector and range columns' statistics are carried and read");
+like(
+	on('main', q{SELECT most_common_elems::text FROM pg_stats
+		WHERE tablename = 'arr' AND attname = 'ia'}),
+	qr/^\{0,1,2,3,4,5,6,7,8,9\}$/,
+	"an array column's elements read as the source has them");
+cmp_ok(plan_rows(q{SELECT * FROM s.arr WHERE ia @> ARRAY[3]}), '>', 500,
+	'@> is estimated from them');
+cmp_ok(plan_rows(q{SELECT * FROM s.arr WHERE r && int4range(10, 12)}), '>', 50,
+	'&& is estimated from them');
+is( on('main', q{SELECT count(*) FROM s.arr WHERE ia @> ARRAY[3]
+		AND tv @@ 'w3'::tsquery AND r && int4range(0, 100)}),
+	on('b', q{SELECT count(*) FROM s.arr WHERE ia @> ARRAY[3]
+		AND tv @@ 'w3'::tsquery AND r && int4range(0, 100)}),
+	'and the table reads as the source does');
+
 # A source whose working set renamed its columns since its head: its
 # statistics describe other columns than the ones of the same name the
 # move made, and none are carried.

@@ -840,14 +840,18 @@ makes, as above, takes the source relation's statistics (branch_ops'
 carry_statistics): its columns' pg_statistic rows (a partitioned table's
 inherited ones too), its expression indexes' (from the source's index of
 the same name and expressions), its extended statistics objects' data (from
-the source's of the same name, kinds and columns), and its row and page
-counts if it has none.  A column's are carried to the column of the same
+the source's of the same name and kinds over the same columns by number:
+not where a dropped column puts them at other numbers on one side), and its
+row and page counts if it has none.  A column's are carried to the column of the same
 name and collation whose type is the same by identity: the same shared
 type, or a versioned one the move made again with another OID, an enum of
 the same name and labels in the same order (its values, label OIDs, mapped
 label to label) or a domain of the same name over the same shared base
-type.  Other versioned types (composites, ranges, arrays of versioned
-types) hold the source's OIDs in their values and aren't carried, nor are
+type.  A statistic whose values are of another type than
+the column's (an array column's elements, a range's lengths) is copied as
+it is when that type is shared.  Columns of other versioned types
+(composites, ranges, arrays of versioned types) hold the source's OIDs in
+their values and aren't carried (the table's other columns are), nor are
 extended statistics on expressions or over columns of versioned types.
 Nothing is carried for a table whose live columns the source's working set
 has renamed, retyped, added or dropped since its head: its statistics could

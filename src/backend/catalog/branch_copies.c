@@ -2467,9 +2467,7 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 typedef struct CarriedType
 {
 	Oid			ours;			/* the column's type here */
-	int16		typlen;
-	bool		typbyval;
-	char		typalign;
+	bool		enumtype;		/* a versioned enum's, its labels mapped */
 	int			nlabels;		/* an enum's: source's label OIDs ... */
 	Oid		   *theirs;
 	Oid		   *mine;			/* ... and ours, in the same order */
@@ -2546,9 +2544,6 @@ carried_type(Oid theirs, Oid src, Oid ours, CarriedType *ct)
 	if (!HeapTupleIsValid(ot))
 		return false;
 	o = (Form_pg_type) GETSTRUCT(ot);
-	ct->typlen = o->typlen;
-	ct->typbyval = o->typbyval;
-	ct->typalign = o->typalign;
 	if (tt == NULL)
 		/* (source's is shared: so must ours be, the same one) */
 		alike = theirs == ours && !OidIsValid(o->typbranch);
@@ -2578,6 +2573,7 @@ carried_type(Oid theirs, Oid src, Oid ours, CarriedType *ct)
 			for (int i = 0; alike && i < n; i++)
 				alike = strcmp(tnames[i], onames[i]) == 0;
 			ct->nlabels = n;
+			ct->enumtype = true;
 		}
 	}
 	ReleaseSysCache(ot);
@@ -2585,40 +2581,72 @@ carried_type(Oid theirs, Oid src, Oid ours, CarriedType *ct)
 }
 
 /*
- * A pg_statistic slot's values, an array of source's type, made one of
- * ours: the same values, an enum's labels mapped.  NULL if a label isn't
- * found.
+ * A pg_statistic slot's values (an array) of source's column of type
+ * theirs, as the session branch's column of ct->ours takes them.  A slot of
+ * another type than the column's (an array column's elements, a range's
+ * lengths, a tsvector's lexemes) is copied as it is if that type is
+ * shared, and the column isn't carried (*ok false) if it is a versioned
+ * type of source's.  A slot of the column's type is copied as it is for a
+ * shared type, made one of ct->ours for a domain (the same base type: the
+ * same bytes), and for an enum its label OIDs mapped to ours (*ok false if
+ * one isn't found).  Values are only ever read as the array's own element
+ * type.
  */
 static Datum
-carried_values(Datum values, const CarriedType *ct, bool *ok)
+carried_values(Datum values, Oid theirs, Oid src, const CarriedType *ct,
+			   bool *ok)
 {
 	ArrayType  *a = DatumGetArrayTypeP(values);
+	Oid			elem = ARR_ELEMTYPE(a);
+	ArrayType  *copy;
 	Datum	   *elems;
 	bool	   *nulls;
 	int			n;
 
 	*ok = true;
-	if (ARR_ELEMTYPE(a) == ct->ours && ct->nlabels == 0)
+	if (elem != theirs)
+	{
+		HeapTuple	versioned = branch_row(TypeRelationId, TypeOidIndexId,
+										   Anum_pg_type_oid, elem, src);
+
+		if (versioned != NULL)
+		{
+			heap_freetuple(versioned);
+			*ok = false;
+		}
 		return values;
-	deconstruct_array(a, ARR_ELEMTYPE(a), ct->typlen, ct->typbyval,
-					  ct->typalign, &elems, &nulls, &n);
-	for (int i = 0; i < n && ct->nlabels > 0; i++)
+	}
+	if (theirs == ct->ours && !ct->enumtype)
+		return values;
+	if (!ct->enumtype)
+	{
+		copy = DatumGetArrayTypePCopy(values);
+		ARR_ELEMTYPE(copy) = ct->ours;
+		return PointerGetDatum(copy);
+	}
+	/* (an enum's values: OIDs, by value) */
+	deconstruct_array(a, elem, sizeof(Oid), true, TYPALIGN_INT,
+					  &elems, &nulls, &n);
+	for (int i = 0; i < n; i++)
 	{
 		int			k;
 
+		if (nulls[i])
+			continue;
 		for (k = 0; k < ct->nlabels; k++)
 			if (ct->theirs[k] == DatumGetObjectId(elems[i]))
 				break;
 		if (k == ct->nlabels)
 		{
 			*ok = false;
-			return (Datum) 0;
+			return values;
 		}
 		elems[i] = ObjectIdGetDatum(ct->mine[k]);
 	}
-	*ok = true;
-	return PointerGetDatum(construct_array(elems, n, ct->ours, ct->typlen,
-										   ct->typbyval, ct->typalign));
+	return PointerGetDatum(construct_md_array(elems, nulls, ARR_NDIM(a),
+											  ARR_DIMS(a), ARR_LBOUND(a),
+											  ct->ours, sizeof(Oid), true,
+											  TYPALIGN_INT));
 }
 
 /*
@@ -2683,7 +2711,7 @@ carry_statistic_rows(Relation pg_statistic, Oid src, Oid fromid, Oid relid,
 			else if (!isnull)
 			{
 				values[Anum_pg_statistic_stavalues1 + k - 1] =
-					carried_values(v, &ct, &ok);
+					carried_values(v, fromatt->atttypid, src, &ct, &ok);
 				replaces[Anum_pg_statistic_stavalues1 + k - 1] = true;
 			}
 		}
@@ -2701,10 +2729,36 @@ carry_statistic_rows(Relation pg_statistic, Oid src, Oid fromid, Oid relid,
 }
 
 /*
+ * Is source's type theirs the session branch's ours: the same OID, or each
+ * a versioned type of the same name (one the move made again)?  Whether a
+ * column's statistics can be carried is carried_type()'s to say.
+ */
+static bool
+same_type_identity(Oid theirs, Oid src, Oid ours)
+{
+	HeapTuple	tt;
+	HeapTuple	ot;
+	bool		same;
+
+	if (theirs == ours)
+		return true;
+	tt = branch_row(TypeRelationId, TypeOidIndexId, Anum_pg_type_oid,
+					theirs, src);
+	ot = SearchSysCache1(TYPEOID, ObjectIdGetDatum(ours));
+	same = tt != NULL && HeapTupleIsValid(ot) &&
+		OidIsValid(((Form_pg_type) GETSTRUCT(ot))->typbranch) &&
+		same_type_name((Form_pg_type) GETSTRUCT(tt), src,
+					   (Form_pg_type) GETSTRUCT(ot), MyBranch);
+	if (HeapTupleIsValid(ot))
+		ReleaseSysCache(ot);
+	return same;
+}
+
+/*
  * Are the live columns of source's relation fromid (on branch src) now the
  * ones of the session branch's relid, made from source's head: the same
- * names, in the same order, of the same types by identity and the same
- * collations?  If source's working set renamed, retyped, added or dropped
+ * names, in the same order, of the same types (same_type_identity()) and
+ * the same collations?  If source's working set renamed, retyped, added or dropped
  * columns since its head, its statistics may describe other columns than
  * the ones of the same name here, and none are carried.
  */
@@ -2722,7 +2776,6 @@ columns_as_committed(Oid relid, Oid fromid, Oid src)
 	{
 		Form_pg_attribute o = NULL;
 		Form_pg_attribute t = NULL;
-		CarriedType ct;
 
 		for (; a != NULL; a = lnext(ours, a))
 		{
@@ -2743,8 +2796,7 @@ columns_as_committed(Oid relid, Oid fromid, Oid src)
 		if (strcmp(NameStr(o->attname), NameStr(t->attname)) != 0 ||
 			o->atttypmod != t->atttypmod ||
 			o->attcollation != t->attcollation ||
-			(o->atttypid != t->atttypid &&
-			 !carried_type(t->atttypid, src, o->atttypid, &ct)))
+			!same_type_identity(t->atttypid, src, o->atttypid))
 			return false;
 		a = lnext(ours, a);
 		b = lnext(theirs, b);
@@ -2825,8 +2877,10 @@ keys_named_alike(Form_pg_statistic_ext m, Oid fromid, Oid src)
 
 /*
  * The data of relid's extended statistics objects, each from source's
- * object on fromid of the same name, kinds and columns (by number:
- * columns_as_committed() said they are the same).  Not one on expressions,
+ * object on fromid of the same name and kinds over the same columns by
+ * number, each of the same name on both (keys_named_alike()): the data
+ * names its columns by number, so an object whose columns' numbers differ
+ * (a column dropped before them on one side) isn't carried.  Not one on expressions,
  * whose data holds pg_statistic rows of source's, nor one over a column of
  * a type the move made again: the data holds the types' OIDs.
  */
