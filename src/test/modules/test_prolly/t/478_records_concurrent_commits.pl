@@ -57,5 +57,26 @@ is(sql(q{SELECT dolt_checkout('b') IS NULL;
 	SELECT count(*) FROM dolt_history_table(NULL::s.t)}), "f\n2",
 	"b's history reads through its commit's record");
 
+# The same in a new database, before any commit is recorded: the second
+# to publish rebuilds from a base with no records' tree at all.
+$node->safe_psql('postgres', 'CREATE DATABASE rc2');
+$node->safe_psql('rc2', 'CREATE EXTENSION test_prolly');
+$node->safe_psql('rc2', q{SELECT dolt_branch('b')});
+my @n = map { $node->background_psql('rc2') } (0, 1);
+$n[1]->query_safe(q{SELECT dolt_checkout('b')});
+$n[0]->query_safe(q{BEGIN});
+$n[0]->query_safe(q{SELECT dolt_commit('--allow-empty', '-m', 'on main')});
+$n[1]->query_safe(q{SELECT dolt_commit('--allow-empty', '-m', 'on b')});
+$n[0]->query_safe(q{COMMIT});
+is($n[0]->{stderr}, '', 'the second commit, from a base with no records, publishes');
+$_->quit for @n;
+for my $br ('main', 'b')
+{
+	is( $node->safe_psql(
+			'rc2', qq{SELECT test_refs_record(dolt_hashof('$br')) IS NOT NULL}),
+		't',
+		"${br}'s commit keeps its record");
+}
+
 $node->stop;
 done_testing();

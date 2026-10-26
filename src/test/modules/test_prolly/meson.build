@@ -247,6 +247,7 @@ tests += {
       'identity_conflicts',
       'recorded_makers',
       'move_calls',
+      'scoped_refs',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

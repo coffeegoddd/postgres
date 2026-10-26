@@ -1179,6 +1179,17 @@ test_refs_value(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_transaction_bytes(): the memory the transaction's context and its
+ * children hold now, in bytes.
+ */
+PG_FUNCTION_INFO_V1(test_transaction_bytes);
+Datum
+test_transaction_bytes(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) MemoryContextMemAllocated(TopTransactionContext, true));
+}
+
+/*
  * test_refs_record(commit): the record of the relations commit (an id in
  * hex) was made from, from the records' tree the refs' 'F' entry names;
  * NULL if there is none.

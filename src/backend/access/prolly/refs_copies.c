@@ -336,6 +336,7 @@ typedef struct ScopedSave
 	ProllyHash	base;
 	ProllyHash	mine;
 	List	   *pending;		/* (scoped_pending's copy) */
+	MemoryContext cxt;			/* (the save's, its copy's too) */
 	int			nrecords;		/* of scoped_records */
 } ScopedSave;
 
@@ -365,7 +366,20 @@ typedef struct ScopedPending
 } ScopedPending;
 
 static List *scoped_pending = NIL;	/* ScopedPending *, by key */
+static MemoryContext pending_cxt = NULL;	/* (its entries', emptied as
+											 * they are applied) */
 static void flush_scoped(void);
+
+/* The context pending scoped changes are kept in, under the transaction's */
+static MemoryContext
+pending_context(void)
+{
+	if (pending_cxt == NULL)
+		pending_cxt = AllocSetContextCreate(TopTransactionContext,
+											"prolly scoped refs pending",
+											ALLOCSET_SMALL_SIZES);
+	return pending_cxt;
+}
 
 /* A copy of pending scoped changes, in the current memory context */
 static List *
@@ -885,6 +899,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			scoped_saved = NIL;
 			scoped_records = NIL;
 			scoped_pending = NIL;
+			pending_cxt = NULL; /* (TopTransactionContext's: gone) */
 			break;
 		default:
 			break;
@@ -974,8 +989,15 @@ scoped_save(void)
 	if (level <= 1 ||
 		(scoped_saved != NIL && ((ScopedSave *) llast(scoped_saved))->level >= level))
 		return;
-	old = MemoryContextSwitchTo(TopTransactionContext);
-	save = palloc(sizeof(ScopedSave));
+	{
+		MemoryContext cxt = AllocSetContextCreate(TopTransactionContext,
+												  "prolly scoped refs saved",
+												  ALLOCSET_SMALL_SIZES);
+
+		old = MemoryContextSwitchTo(cxt);
+		save = palloc(sizeof(ScopedSave));
+		save->cxt = cxt;
+	}
 	save->level = level;
 	save->scoped = scoped;
 	save->whole = whole;
@@ -988,6 +1010,7 @@ scoped_save(void)
 	 */
 	save->pending = pending_copy(scoped_pending);
 	save->nrecords = list_length(scoped_records);
+	MemoryContextSwitchTo(TopTransactionContext);
 	scoped_saved = lappend(scoped_saved, save);
 	MemoryContextSwitchTo(old);
 }
@@ -1011,9 +1034,18 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		whole = last->whole;
 		scoped_base = last->base;
 		scoped_mine = last->mine;
-		scoped_pending = last->pending;
+		/* (the saved copy, as the pending changes now) */
+		if (pending_cxt != NULL)
+			MemoryContextReset(pending_cxt);
+		{
+			MemoryContext old = MemoryContextSwitchTo(pending_context());
+
+			scoped_pending = pending_copy(last->pending);
+			MemoryContextSwitchTo(old);
+		}
 		scoped_records = list_truncate(scoped_records, last->nrecords);
 		scoped_saved = list_delete_last(scoped_saved);
+		MemoryContextDelete(last->cxt);
 	}
 	else if (event == SUBXACT_EVENT_COMMIT_SUB)
 	{
@@ -1022,7 +1054,10 @@ refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			(list_length(scoped_saved) > 1 &&
 			 ((ScopedSave *) list_nth(scoped_saved,
 									  list_length(scoped_saved) - 2))->level == level - 1))
+		{
 			scoped_saved = list_delete_last(scoped_saved);
+			MemoryContextDelete(last->cxt);
+		}
 		else
 			last->level = level - 1;
 	}
@@ -1083,9 +1118,9 @@ rebase_scoped(const ProllyHash *cur)
 
 	if (same_hash(cur, &scoped_base))
 		return;
+	scoped_save();
 	/* (what is pending applies to mine: rebuilt with it) */
 	flush_scoped();
-	scoped_save();
 	ref_of(&scoped_base, &from);
 	ref_of(&scoped_mine, &to);
 	PROLLY_CALL(tree, diff, &env, &from, &to, collect_edit, &se);
@@ -1223,7 +1258,9 @@ records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	ProllyNodeRef cur_records;
 	ProllyNodeRef merged;
 	bool		any;
+	bool		base_any;
 	bool		cur_any;
+	HTAB	   *changed;
 	int			at = -1;
 	StringInfoData v;
 
@@ -1232,23 +1269,45 @@ records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			at = i;
 	if (at < 0 && scoped_records == NIL)
 		return;
-	records_under(from, &base_records, &any);
+	records_under(from, &base_records, &base_any);
 	records_under(to, &mine_records, &any);
 	if (!any)
 		return;
+	/* (a base before the first record: its records the empty tree) */
+	if (!base_any)
+		empty_records(&base_records);
 	ref_of(cur, &onto);
 	records_under(&onto, &cur_records, &cur_any);
 	PROLLY_CALL(tree, diff, &records_env, &base_records, &mine_records,
 				collect_edit, &re);
+	/* (the commits whose records the diff has, by id) */
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = CurrentMemoryContext;
+		changed = hash_create("prolly records rebuilt", Max(re.n, 16), &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		for (int i = 0; i < re.n; i++)
+		{
+			ProllyHash	h;
+
+			memset(&h, 0, sizeof(h));
+			h.len = Min(re.edits[i].key.len, PROLLY_HASH_MAX_LEN);
+			memcpy(h.bytes, re.edits[i].key.data, h.len);
+			(void) hash_search(changed, &h, HASH_ENTER, NULL);
+		}
+	}
 	foreach_ptr(ProllyHash, commit, scoped_records)
 	{
 		ProllyKey	k = {commit->bytes, commit->len};
-		bool		have = false;
+		ProllyHash	h;
 
-		for (int i = 0; i < re.n && !have; i++)
-			have = re.edits[i].key.len == commit->len &&
-				memcmp(re.edits[i].key.data, commit->bytes, commit->len) == 0;
-		if (!have)
+		memset(&h, 0, sizeof(h));
+		h.len = commit->len;
+		memcpy(h.bytes, commit->bytes, commit->len);
+		if (hash_search(changed, &h, HASH_FIND, NULL) == NULL)
 		{
 			StringInfoData rv;
 			ProllyEdit *e;
@@ -1273,6 +1332,7 @@ records_rebase(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			e->value.len = rv.len;
 		}
 	}
+	hash_destroy(changed);
 	if (re.n == 0)
 	{
 		/* (nothing of mine: cur's records stand) */
@@ -1398,6 +1458,8 @@ flush_scoped(void)
 	if (scoped_pending == NIL)
 		return;
 	Assert(scoped);
+	/* (the subtransaction's change of mine, undone if it is rolled back) */
+	scoped_save();
 	list_sort(scoped_pending, pending_cmp);
 	edits = palloc_array(ProllyEdit, list_length(scoped_pending));
 	foreach_ptr(ScopedPending, sp, scoped_pending)
@@ -1414,6 +1476,7 @@ flush_scoped(void)
 	scoped_mine = new_root.hash;
 	pfree(edits);
 	scoped_pending = NIL;
+	MemoryContextReset(pending_cxt);
 }
 
 /* The refs tree's root, as the transaction sees it; false if none yet. */
@@ -1646,7 +1709,7 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 				scoped = true;
 			}
 			{
-				MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+				MemoryContext old = MemoryContextSwitchTo(pending_context());
 				ScopedPending *sp = pending_of(key, keylen);
 
 				if (sp == NULL)
