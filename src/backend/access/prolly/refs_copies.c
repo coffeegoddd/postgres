@@ -3834,9 +3834,9 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
 }
 
 /*
- * The first bound head_pages_pay() counts a diff to: the rows a head and
- * the commit a move goes to differ by are often a few thousand, counted at
- * once.
+ * The first count at which head_pages_pay() asks the change finder about
+ * L: the rows a head and the commit a move goes to differ by are often a
+ * few thousand, counted before it asks.
  */
 #define HEAD_PAGES_FIRST_BOUND	4096
 
@@ -3864,6 +3864,60 @@ fewer_since(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 }
 
 /*
+ * A count of a diff for head_pages_pay(), in one walk: at each bound past
+ * offset (H for B, none for H) it asks the change finder whether L is
+ * fewer than the bound (twice it and one more for H), stopping the diff
+ * where that settles the decision, or doubles the bound.  So the diff is
+ * read once, never further than counted whole, and the finder's record no
+ * further than about twice the last bound.
+ */
+typedef struct HeadPagesCount
+{
+	const ProllyDatabaseComponents *dc;
+	const ProllyNodeRef *baseline;
+	Oid			relid;
+	uint64		offset;
+	bool		twice;
+	uint64		bound;
+	uint64		n;				/* the changes counted */
+	bool		settled;		/* the finder said fewer: the diff stopped */
+} HeadPagesCount;
+
+static bool
+head_pages_change(ProllyDiffKind kind, const ProllyKey *key,
+				  const ProllyValue *before, const ProllyValue *after,
+				  void *arg)
+{
+	HeadPagesCount *c = arg;
+
+	if (++c->n < add_upto(c->offset, c->bound))
+		return true;
+	if (fewer_since(c->dc, c->baseline, c->relid,
+					c->twice ? add_upto(2 * c->bound, 1) : c->bound))
+	{
+		c->settled = true;
+		return false;
+	}
+	c->bound = add_upto(c->bound, c->bound);
+	return true;
+}
+
+static void
+head_pages_count(HeadPagesCount *c, const ProllyNodeRef *from,
+				 const ProllyNodeRef *to)
+{
+	ProllyTreeEnv denv;
+
+	c->bound = HEAD_PAGES_FIRST_BOUND;
+	c->n = 0;
+	c->settled = false;
+	if (same_hash(&from->hash, &to->hash))
+		return;
+	prolly_folded_tree_env(&denv);
+	PROLLY_CALL(tree, diff, &denv, from, to, head_pages_change, c);
+}
+
+/*
  * Would giving table relid the pages kept as of the head (its rows there,
  * head) and then writing the rows the head and the move's commit (target)
  * differ by cost less than writing the rows the working set and the
@@ -3878,11 +3932,11 @@ fewer_since(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
  * A count the change finder can't give counts as large.  B, and H where
- * the baseline holds the head's rows, are needed only against a bound, so
- * each is counted only as far as it (count_diff_upto()), the bound doubled
- * while the change finder says L is at least as large: with the fold
- * worker's baseline, B is as large as the rows changed since the head was
- * folded, while L, then, is few.  And not while another backend on the
+ * the baseline holds the head's rows, are needed only against L, so each
+ * is counted in one walk that stops where the change finder's answer
+ * settles it (head_pages_count()): with the fold worker's baseline, B is
+ * as large as the rows changed since the head was folded, while L, then,
+ * is few.  And not while another backend on the
  * branch holds a snapshot (other_snapshots(): an open REPEATABLE READ
  * transaction, a statement running): a restore isn't MVCC-safe, and such
  * a snapshot, taken before the move commits, would read the head's
@@ -3897,6 +3951,7 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 	ProllyNodeRef base;
 	bool		none;
 	uint64		h;
+	HeadPagesCount hc;
 
 	if (other_snapshots())
 		return false;
@@ -3912,40 +3967,34 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 		return false;
 
 	/*
-	 * (L >= 2H + 1, H counted to a bound: past it, the finder's answer
-	 * whether L is fewer than twice the bound settles it, or the bound
-	 * doubles)
+	 * (L >= 2H + 1: H counted, the finder asked at each bound whether L is
+	 * fewer than twice it and one more, which, past it, means it isn't)
 	 */
+	hc.dc = dc;
+	hc.baseline = baseline;
+	hc.relid = relid;
 	if (same_hash(&base.hash, &head->hash))
 	{
 		if (none)
 			return false;
-		for (uint64 bound = HEAD_PAGES_FIRST_BOUND;; bound *= 2)
-		{
-			h = count_diff_upto(head, target, bound);
-			if (h < bound)
-				return !fewer_since(dc, baseline, relid, 2 * h + 1);
-			if (fewer_since(dc, baseline, relid, 2 * bound + 1))
-				return false;
-		}
+		hc.offset = 0;
+		hc.twice = true;
+		head_pages_count(&hc, head, target);
+		return !hc.settled && !fewer_since(dc, baseline, relid, 2 * hc.n + 1);
 	}
 
 	/*
-	 * (B > H + L, B counted to H and a bound: past it, the finder's answer
-	 * whether L is fewer than the bound settles it, or the bound doubles)
+	 * (B > H + L: B counted, the finder asked at each bound past H whether
+	 * L is fewer than the bound, which, with B past it, means it is)
 	 */
 	h = count_diff_upto(head, target, PG_UINT64_MAX);
 	if (none)
 		return count_diff_upto(&base, target, add_upto(h, 1)) > h;
-	for (uint64 bound = HEAD_PAGES_FIRST_BOUND;; bound *= 2)
-	{
-		uint64		b = count_diff_upto(&base, target, add_upto(h, bound));
-
-		if (b < add_upto(h, bound))
-			return b > h && fewer_since(dc, baseline, relid, b - h);
-		if (fewer_since(dc, baseline, relid, bound))
-			return true;
-	}
+	hc.offset = h;
+	hc.twice = false;
+	head_pages_count(&hc, &base, target);
+	return hc.settled ||
+		(hc.n > h && fewer_since(dc, baseline, relid, hc.n - h));
 }
 
 /*

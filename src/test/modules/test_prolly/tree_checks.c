@@ -1184,7 +1184,31 @@ tree_diff_stops(const ProllyImplInfo *impl)
 					 (unsigned long long) bound);
 		}
 
-	/* modified keys spread over the tree: stopped at the second */
+	/*
+	 * stopped at the last change, where the stop and the end meet: every
+	 * key reported, the whole tree read, as without a stop
+	 */
+	for (int way = 0; way < 2; way++)
+	{
+		StopSeen	ss = {{way == 0 ? none : from, way == 0 ? from : none, -1, 0},
+		MAX_KEY};
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		PROLLY_CALL(tr, diff, &env, way == 0 ? &rempty : &rfrom,
+					way == 0 ? &rfrom : &rempty, stop_change, &ss);
+		env.counters = NULL;
+		if (ss.seen.changes != MAX_KEY || cnt.nodes_read != (uint64) nodes.n + 1)
+			elog(ERROR, "diff stopped at its last change reported %d and read %llu nodes, expected %d and %d",
+				 ss.seen.changes, (unsigned long long) cnt.nodes_read, MAX_KEY,
+				 nodes.n + 1);
+	}
+
+	/*
+	 * modified keys spread over the tree, where both sides are read: stopped
+	 * at several of them, the last too, each reading no more than the whole
+	 * diff and fewer nodes the earlier it stops
+	 */
 	memcpy(to, from, sizeof(Ref));
 	rto = rfrom;
 	for (int i = 0; i < lengthof(keys); i++)
@@ -1195,23 +1219,39 @@ tree_diff_stops(const ProllyImplInfo *impl)
 	apply_batch(tr, &env, to, keys, versions, lengthof(keys), &rto);
 	{
 		StopSeen	whole = {{from, to, -1, 0}, INT_MAX};
-		StopSeen	ss = {{from, to, -1, 0}, 2};
+		int			stops[] = {1, 2, 5, 8, 11, 15, lengthof(keys)};
 		uint64		whole_read;
+		uint64		last_read = 0;
 
 		memset(&cnt, 0, sizeof(cnt));
 		env.counters = &cnt;
 		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &whole);
 		whole_read = cnt.nodes_read;
-		memset(&cnt, 0, sizeof(cnt));
-		PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &ss);
+		if (whole.seen.changes != lengthof(keys))
+			elog(ERROR, "diff of %d modified keys reported %d",
+				 (int) lengthof(keys), whole.seen.changes);
+		for (int i = 0; i < lengthof(stops); i++)
+		{
+			StopSeen	ss = {{from, to, -1, 0}, stops[i]};
+
+			memset(&cnt, 0, sizeof(cnt));
+			PROLLY_CALL(tr, diff, &env, &rfrom, &rto, stop_change, &ss);
+			if (ss.seen.changes != stops[i])
+				elog(ERROR, "diff of %d modified keys stopped at %d reported %d",
+					 (int) lengthof(keys), stops[i], ss.seen.changes);
+			if (cnt.nodes_read > whole_read || cnt.nodes_read < last_read)
+				elog(ERROR, "diff stopped at %d of %d changes read %llu nodes (%llu stopped earlier, the whole diff %llu)",
+					 stops[i], (int) lengthof(keys),
+					 (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) last_read,
+					 (unsigned long long) whole_read);
+			if (stops[i] == 2 && cnt.nodes_read * 2 > whole_read)
+				elog(ERROR, "diff stopped at 2 of %d changes read %llu nodes, the whole diff %llu",
+					 (int) lengthof(keys), (unsigned long long) cnt.nodes_read,
+					 (unsigned long long) whole_read);
+			last_read = cnt.nodes_read;
+		}
 		env.counters = NULL;
-		if (whole.seen.changes != lengthof(keys) || ss.seen.changes != 2)
-			elog(ERROR, "diff of %d modified keys reported %d, and %d stopped at 2",
-				 (int) lengthof(keys), whole.seen.changes, ss.seen.changes);
-		if (cnt.nodes_read * 2 > whole_read)
-			elog(ERROR, "diff stopped at 2 of %d changes read %llu nodes, the whole diff %llu",
-				 (int) lengthof(keys), (unsigned long long) cnt.nodes_read,
-				 (unsigned long long) whole_read);
 	}
 
 	if (PROLLY_HAS(tr, diff_unordered))

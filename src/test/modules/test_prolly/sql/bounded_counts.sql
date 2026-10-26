@@ -87,6 +87,40 @@ SELECT t_digest() = :'at_b' AS at_b, clean();
 DROP TABLE bc.t;
 SELECT dolt_commit('-Am', 't dropped') IS NOT NULL AS committed;
 
+-- A reset that doesn't pay, where L is at least B - H and both are large:
+-- the head 20,000 rows from y, 60,000 more rows folded, and 61,000 changed
+-- since.  B is counted in one walk, asking the change finder at each
+-- bound past H, so it reads about what counting B and H whole does
+-- (about 22,300 nodes, mostly writing the rows), not B's first H rows
+-- again at each bound (about 30,500).
+CREATE TABLE bc.l (id int PRIMARY KEY, v int NOT NULL, w text NOT NULL);
+INSERT INTO bc.l SELECT g, 0, repeat(md5(g::text), 3)
+FROM generate_series(1, 100000) g;
+CREATE FUNCTION l_digest() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(l::text, ',' ORDER BY id)) FROM bc.l l
+$$;
+SELECT (dolt_commit('-Am', 'l x'))[1] AS lx \gset
+UPDATE bc.l SET v = 1 WHERE id <= 20000;
+SELECT (dolt_commit('-am', 'l y'))[1] AS ly \gset
+SELECT l_digest() AS at_ly \gset
+SELECT dolt_reset('--hard', :'lx') IS NOT NULL AS reset;
+SELECT dolt_reset('--hard', :'ly') IS NOT NULL AS reset;
+SELECT dolt_reset('--hard', :'lx') IS NOT NULL AS reset;
+UPDATE bc.l SET v = 2 WHERE id > 40000;
+SELECT prolly_checkpoint() IS NOT NULL AS folded;
+UPDATE bc.l SET v = 3 WHERE id > 20000 AND id <= 81000;
+:flush
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'ly') IS NOT NULL AS reset;
+:flush
+SELECT since(:'before') AS moved \gset
+SELECT (:'moved'::jsonb ->> 'relations_restored')::int AS restored,
+	   (:'moved'::jsonb ->> 'apply_rows')::int AS applied,
+	   (:'moved'::jsonb ->> 'nodes_read')::int < 26000 AS few_nodes_read;
+SELECT l_digest() = :'at_ly' AS at_ly, clean();
+DROP TABLE bc.l;
+SELECT dolt_commit('-Am', 'l dropped') IS NOT NULL AS committed;
+
 -- The decision, case by case, on a table of 20,000 rows.  Each case makes
 -- a commit y from the head x, resets to x, y and x again (y no longer
 -- kept, x kept), changes the working set, and resets to y.
