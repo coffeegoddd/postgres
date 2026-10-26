@@ -6274,7 +6274,7 @@ typedef struct ChangedTree
 	ProllyNodeRef after;
 } ChangedTree;
 
-static void
+static bool
 note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
 				  const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -6283,15 +6283,16 @@ note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
 	ProllyValue def;
 
 	if (after == NULL)
-		return;
+		return true;
 	c = palloc0(sizeof(ChangedTree));
 	if (!tree_item(key, after, &c->after, &def))
 	{
 		pfree(c);
-		return;
+		return true;
 	}
 	c->was = before != NULL && tree_item(key, before, &c->before, &def);
 	*changed = lappend(*changed, c);
+	return true;
 }
 
 /*
@@ -6930,7 +6931,7 @@ typedef struct DiffedWalk
 	ProllyCanonObjectVisit table;
 } DiffedWalk;
 
-static void
+static bool
 diffed_change(ProllyDiffKind kind, const ProllyKey *key,
 			  const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -6940,20 +6941,21 @@ diffed_change(ProllyDiffKind kind, const ProllyKey *key,
 	/* (what next_item() skips: the format, ordering, collations) */
 	if (key->len < 2 || key->data[1] != ':' || key->data[0] == '!' ||
 		key->data[0] == 'c')
-		return;
+		return true;
 	if (key->data[0] == PROLLY_OBJECT_TABLE)
 	{
 		if (dw->table == NULL)
-			return;
+			return true;
 		name = from_utf8(key->data + 2, key->len - 2);
 		dw->table(name, before == NULL ? PROLLY_DIFF_ADDED :
 				  after == NULL ? PROLLY_DIFF_REMOVED : PROLLY_DIFF_MODIFIED,
 				  PROLLY_OBJECT_TABLE, dw->w.arg);
 		pfree(name);
-		return;
+		return true;
 	}
 	(void) object_pair(before ? key : NULL, before, after ? key : NULL, after,
 					   &dw->w);
+	return true;
 }
 
 /*
@@ -7149,7 +7151,7 @@ holds_data(const ProllyKey *key, const ProllyValue *item)
 	return any;
 }
 
-static void
+static bool
 note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 			const ProllyValue *after, void *arg)
 {
@@ -7160,7 +7162,7 @@ note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 	/* (the format, and collations, aren't objects) */
 	if (key->len < 2 || key->data[1] != ':' || key->data[0] == '!' ||
 		key->data[0] == 'c')
-		return;
+		return true;
 	c = palloc0(sizeof(Changed));
 	c->object = (char) key->data[0];
 	name = from_utf8(key->data + 2, key->len - 2);
@@ -7203,7 +7205,7 @@ note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 		if (!c->data_change && !c->schema_change)
 		{
 			pfree(c);
-			return;
+			return true;
 		}
 	}
 	else
@@ -7217,6 +7219,7 @@ note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 										 (uint64) c->object);
 	}
 	w->changed = lappend(w->changed, c);
+	return true;
 }
 
 static int

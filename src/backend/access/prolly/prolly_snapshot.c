@@ -665,7 +665,7 @@ add_edit(DiffEdits *d, const ProllyEdit *e)
 	d->edits[d->n++] = *e;
 }
 
-static void
+static bool
 diff_entry(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		   const ProllyValue *after, void *arg)
 {
@@ -684,6 +684,7 @@ diff_entry(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		index_entry(d->ib, key, after, &e);
 		add_edit(d, &e);
 	}
+	return true;
 }
 
 /*

@@ -1070,7 +1070,7 @@ struct ScopedEdits
 	int			max;
 };
 
-static void
+static bool
 collect_edit(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -1100,6 +1100,7 @@ collect_edit(ProllyDiffKind kind, const ProllyKey *key,
 		e->value.data = v;
 		e->value.len = after->len;
 	}
+	return true;
 }
 
 /*
@@ -2492,11 +2493,56 @@ same_table(const NamedTree *a, const NamedTree *b)
 		memcmp(a->description, b->description, a->description_len) == 0;
 }
 
-static void
+/* A count of a diff's changes, which stops the diff at max of them. */
+typedef struct ChangeCount
+{
+	uint64		n;
+	uint64		max;
+} ChangeCount;
+
+static bool
 count_change(ProllyDiffKind kind, const ProllyKey *key,
 			 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
-	(*(uint64 *) arg)++;
+	ChangeCount *c = arg;
+
+	return ++c->n < c->max;
+}
+
+/*
+ * How many keys from and to differ by, but no more than max: the diff
+ * stops at the max'th change, having read only the nodes up to it, so a
+ * caller that compares the count with a bound reads O((bound + 1) log n)
+ * nodes however far apart the trees are.
+ */
+static uint64
+count_diff_upto(const ProllyNodeRef *from, const ProllyNodeRef *to,
+				uint64 max)
+{
+	ProllyTreeEnv denv;
+	ChangeCount c = {0, max};
+
+	if (max == 0 || same_hash(&from->hash, &to->hash))
+		return 0;
+	prolly_folded_tree_env(&denv);
+	PROLLY_CALL(tree, diff, &denv, from, to, count_change, &c);
+	return c.n;
+}
+
+/* The fewest rows whose writing (MOVE_ROW_USEC each) costs more than usec. */
+static uint64
+rows_costing_more(double usec)
+{
+	uint64		n;
+
+	if (!(usec < (double) PG_INT64_MAX / MOVE_ROW_USEC))
+		return PG_UINT64_MAX;
+	n = usec > 0 ? (uint64) (usec / MOVE_ROW_USEC) : 0;
+	while (n > 0 && (double) (n - 1) * MOVE_ROW_USEC > usec)
+		n--;
+	while ((double) n * MOVE_ROW_USEC <= usec)
+		n++;
+	return n;
 }
 
 /*
@@ -2756,7 +2802,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	List	   *chosen = NIL;	/* NamedTree *, then each one's relations */
 	List	   *relations = NIL;
 	List	   *from = NIL;		/* and its source */
-	ProllyTreeEnv denv;
 	ProllyNodeRef baseline;
 	ProllyNodeRef next;
 	ListCell   *a;
@@ -2784,14 +2829,14 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
 		return false;
-	prolly_folded_tree_env(&denv);
 	forboth(a, ours, b, theirs)
 	{
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
 		ShareSource *s;
-		uint64		changes = 0;
+		uint64		changes;
 		uint64		blocks;
+		double		share_usec;
 		Oid			relid;
 		List	   *relids;
 
@@ -2806,11 +2851,12 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
-		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
-					&changes);
-		if ((double) changes * MOVE_ROW_USEC <=
-			(double) list_length(relids) * SHARE_RELATION_USEC +
-			(double) blocks / SHARE_BLOCKS_PER_USEC)
+		share_usec = (double) list_length(relids) * SHARE_RELATION_USEC +
+			(double) blocks / SHARE_BLOCKS_PER_USEC;
+		/* (counted only as far as the rows that cost more than sharing) */
+		changes = count_diff_upto(&o->data, &t->data,
+								  rows_costing_more(share_usec));
+		if ((double) changes * MOVE_ROW_USEC <= share_usec)
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
@@ -3744,19 +3790,6 @@ other_snapshots(void)
 	return found;
 }
 
-static uint64
-count_diff(const ProllyNodeRef *from, const ProllyNodeRef *to)
-{
-	ProllyTreeEnv denv;
-	uint64		changes = 0;
-
-	if (same_hash(&from->hash, &to->hash))
-		return 0;
-	prolly_folded_tree_env(&denv);
-	PROLLY_CALL(tree, diff, &denv, from, to, count_change, &changes);
-	return changes;
-}
-
 /*
  * The relations of table name as the other commits of kept (but was, and
  * those retired) keep them: copies into *carry, and where each is into
@@ -3801,6 +3834,36 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
 }
 
 /*
+ * The first bound head_pages_pay() counts a diff to: the rows a head and
+ * the commit a move goes to differ by are often a few thousand, counted at
+ * once.
+ */
+#define HEAD_PAGES_FIRST_BOUND	4096
+
+/* a + b, or the largest count if that overflows. */
+static uint64
+add_upto(uint64 a, uint64 b)
+{
+	return b > PG_UINT64_MAX - a ? PG_UINT64_MAX : a + b;
+}
+
+/*
+ * Whether fewer than limit of table relid's rows changed since baseline,
+ * as the change finder tells (false where it can't); a limit past what it
+ * takes is its largest.
+ */
+static bool
+fewer_since(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
+			Oid relid, uint64 limit)
+{
+	ProllyNodeRef data;
+
+	return dc->canonicalizer->table_fewer_changes(baseline, relid,
+												  (int) Min(limit, PG_INT32_MAX),
+												  &data);
+}
+
+/*
  * Would giving table relid the pages kept as of the head (its rows there,
  * head) and then writing the rows the head and the move's commit (target)
  * differ by cost less than writing the rows the working set and the
@@ -3814,8 +3877,12 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
  * - the baseline holds other rows (a fold since the head, the fold
  *   worker's): it is B rows from the commit, and the working set at least
  *   B - L.  They pay if B - L > H.
- * A count the change finder can't give counts as large.  And not while
- * another backend on the branch holds a snapshot (other_snapshots(): an
+ * A count the change finder can't give counts as large.  Neither count is
+ * needed whole, only against a bound, so each diff is counted only as far
+ * as the bound it is compared with (count_diff_upto()), the bound doubled
+ * while the change finder says L is at least as large: with the fold
+ * worker's baseline, B is as large as the rows changed since the head was
+ * folded, while L, then, is few.  And not while another backend on the branch holds a snapshot (other_snapshots(): an
  * open REPEATABLE READ transaction, a statement running): a restore isn't
  * MVCC-safe, and
  * such a snapshot, taken before the move commits, would read the head's
@@ -3830,7 +3897,6 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 	ProllyNodeRef base;
 	bool		none;
 	uint64		h;
-	uint64		b;
 
 	if (other_snapshots())
 		return false;
@@ -3844,16 +3910,42 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
 	none = dc->canonicalizer->table_fewer_changes(baseline, relid, 1, &base);
 	if (base.hash.len == 0)
 		return false;
+
+	/*
+	 * (L >= 2H + 1, H counted to a bound: past it, the finder's answer
+	 * whether L is fewer than twice the bound settles it, or the bound
+	 * doubles)
+	 */
 	if (same_hash(&base.hash, &head->hash))
-		return !none &&
-			!dc->canonicalizer->table_fewer_changes(baseline, relid,
-													2 * count_diff(head, target) + 1,
-													&base);
-	h = count_diff(head, target);
-	b = count_diff(&base, target);
-	return b > h &&
-		(none ||
-		 dc->canonicalizer->table_fewer_changes(baseline, relid, b - h, &base));
+	{
+		if (none)
+			return false;
+		for (uint64 bound = HEAD_PAGES_FIRST_BOUND;; bound *= 2)
+		{
+			h = count_diff_upto(head, target, bound);
+			if (h < bound)
+				return !fewer_since(dc, baseline, relid, 2 * h + 1);
+			if (fewer_since(dc, baseline, relid, 2 * bound + 1))
+				return false;
+		}
+	}
+
+	/*
+	 * (B > H + L, B counted to H and a bound: past it, the finder's answer
+	 * whether L is fewer than the bound settles it, or the bound doubles)
+	 */
+	h = count_diff_upto(head, target, PG_UINT64_MAX);
+	if (none)
+		return count_diff_upto(&base, target, add_upto(h, 1)) > h;
+	for (uint64 bound = HEAD_PAGES_FIRST_BOUND;; bound *= 2)
+	{
+		uint64		b = count_diff_upto(&base, target, add_upto(h, bound));
+
+		if (b < add_upto(h, bound))
+			return b > h && fewer_since(dc, baseline, relid, b - h);
+		if (fewer_since(dc, baseline, relid, bound))
+			return true;
+	}
 }
 
 /*

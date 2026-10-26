@@ -694,7 +694,7 @@ typedef struct DiffSeen
 	int			changes;
 } DiffSeen;
 
-static void
+static bool
 check_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 			 const ProllyValue *after, void *arg)
 {
@@ -727,6 +727,7 @@ check_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 			elog(ERROR, "diff: key %d reported as not covered", k);
 			break;
 	}
+	return true;
 }
 
 void
@@ -775,7 +776,7 @@ tree_diff_reports_changes(const ProllyImplInfo *impl)
 }
 
 /* Counts changes and checks their order (diffs of unrelated trees). */
-static void
+static bool
 count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 			 const ProllyValue *after, void *arg)
 {
@@ -786,6 +787,7 @@ count_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *befor
 		elog(ERROR, "diff reported key %d after key %d", k, s->last);
 	s->last = k;
 	s->changes++;
+	return true;
 }
 
 /*
@@ -1465,7 +1467,7 @@ typedef struct SpelledDiff
 	bool		right;
 } SpelledDiff;
 
-static void
+static bool
 check_spelled_change(ProllyDiffKind kind, const ProllyKey *key,
 					 const ProllyValue *before, const ProllyValue *after,
 					 void *arg)
@@ -1475,6 +1477,7 @@ check_spelled_change(ProllyDiffKind kind, const ProllyKey *key,
 	s->changes++;
 	s->right = kind == PROLLY_DIFF_MODIFIED && key->len == 5 &&
 		key->data[3] == 77 && key->data[4] == 1;
+	return true;
 }
 
 /*
@@ -1611,7 +1614,7 @@ typedef struct BigDiff
 	bool		values_ok;
 } BigDiff;
 
-static void
+static bool
 big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 			   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -1628,6 +1631,7 @@ big_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->values_ok &= after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+	return true;
 }
 
 /* Whether reading [offset, offset + len) of ref fails as corrupted. */
@@ -2146,7 +2150,7 @@ typedef struct HeldDiff
 	bool		ok;
 } HeldDiff;
 
-static void
+static bool
 held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 				const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -2162,6 +2166,7 @@ held_diff_visit(ProllyDiffKind kind, const ProllyKey *key,
 	d->ok &= after && after->len == want.len &&
 		memcmp(after->data, want.data, want.len) == 0;
 	pfree(want.data);
+	return true;
 }
 
 /* A prefetch hint: the chunks heard, into a HashSet. */
