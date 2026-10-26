@@ -318,6 +318,23 @@ typedef struct BranchOpsRoutine
 									 List *fromids);
 
 	/*
+	 * Optional: give each of the session branch's tables relids that has no
+	 * statistics yet the planner statistics of the table of branch source
+	 * at the same place in fromids, as carry_privileges() pairs them: its
+	 * columns' pg_statistic rows (by the column's name, for a column of the
+	 * same type), and its row and page counts if the table has none.  For
+	 * a table a merge of source, or a pick of its head, made here from
+	 * source's rows: until autovacuum analyzes it, the planner would
+	 * otherwise guess.  The rows are source's working set's, which may
+	 * have changed since its head: the statistics are an estimate, as an
+	 * analyze's are.  None for a table source hasn't, or has now of another
+	 * kind or name, one source never analyzed, nor where source is no
+	 * branch with copies.
+	 */
+	void		(*carry_statistics) (const char *source, List *relids,
+									 List *fromids);
+
+	/*
 	 * Optional: the owner of branch's relation relid (InvalidOid: branch
 	 * hasn't it, or is no branch with copies).
 	 */

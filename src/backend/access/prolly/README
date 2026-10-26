@@ -830,6 +830,21 @@ approves the table.  The relations the move makes and drops are found by
 the object access hook as it runs, so this costs only as much as the move
 changes.
 
+Commits hold no planner statistics either.  A branch's first use copies its
+source's relations with theirs, and a reset or restore keeps a table's own,
+but a table a merge or a pick of a branch's head makes on the target is
+loaded from rows, its index builds counting them and no column analyzed:
+until autovacuum analyzes it, the planner guesses, and joins of such tables
+can get nested-loop plans that run for minutes.  So each table such a move
+makes, as above, takes the source relation's statistics (branch_ops'
+carry_statistics): its columns' pg_statistic rows, by name for a column of
+the same type and collation, and its row and page counts if it has none.
+They describe the source's rows as its last analyze sampled them, which
+the move loaded (its working set may have changed since its head, as
+statistics lag anyway); a table the source never analyzed takes none.  A
+table a reset, a checkout of a commit or a pull makes has no relation of a
+branch known to hold its rows, and waits for autovacuum.
+
 The source's relation is the one the branch's records of its head's
 relations list under the name (quoted and escaped as commits' records write
 names): its tables' ('N', the record its commits' records are made

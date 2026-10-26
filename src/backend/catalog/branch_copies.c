@@ -65,6 +65,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_statistic.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/trigger.h"
@@ -2313,6 +2314,41 @@ carried_acl(Acl *acl, char relkind, Oid fromowner, Oid owner)
 }
 
 /*
+ * Branch src's row of relation fromid, if it is still the one relation rel
+ * of the session's branch was made from: of the same kind and name, in a
+ * schema of the same name.  NULL if it isn't (made, or renamed, since the
+ * commit that was found to hold it), or src hasn't it.
+ */
+static HeapTuple
+carried_from(Oid src, Form_pg_class rel, Oid fromid)
+{
+	char	   *nspname = get_namespace_name(rel->relnamespace);
+	HeapTuple	from;
+	HeapTuple	fromnsp;
+	Form_pg_class fromrel;
+
+	if (nspname == NULL)
+		return NULL;
+	from = branch_row(RelationRelationId, ClassOidIndexId, Anum_pg_class_oid,
+					  fromid, src);
+	if (from == NULL)
+		return NULL;
+	fromrel = (Form_pg_class) GETSTRUCT(from);
+	fromnsp = branch_row(NamespaceRelationId, NamespaceOidIndexId,
+						 Anum_pg_namespace_oid, fromrel->relnamespace, src);
+	if (fromrel->relkind != rel->relkind ||
+		strcmp(NameStr(fromrel->relname), NameStr(rel->relname)) != 0 ||
+		fromnsp == NULL ||
+		strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(fromnsp))->nspname),
+			   nspname) != 0)
+	{
+		heap_freetuple(from);
+		return NULL;
+	}
+	return from;
+}
+
+/*
  * Add to each of the session branch's relations relids the privileges of
  * the relation of branch source of the same place in fromids, the
  * relation's and each column's (by the column's name), as the relation's
@@ -2339,9 +2375,7 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		Oid			fromid = lfirst_oid(lf);
 		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 		Form_pg_class rel;
-		char	   *nspname;
 		HeapTuple	from;
-		HeapTuple	fromnsp;
 		Form_pg_class fromrel;
 		Datum		acl;
 		bool		isnull;
@@ -2350,20 +2384,10 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		if (!HeapTupleIsValid(tup))
 			continue;
 		rel = (Form_pg_class) GETSTRUCT(tup);
-		nspname = get_namespace_name(rel->relnamespace);
-		from = branch_row(RelationRelationId, ClassOidIndexId,
-						  Anum_pg_class_oid, fromid, src);
-		if (from == NULL || nspname == NULL)
+		from = carried_from(src, rel, fromid);
+		if (from == NULL)
 			continue;
 		fromrel = (Form_pg_class) GETSTRUCT(from);
-		fromnsp = branch_row(NamespaceRelationId, NamespaceOidIndexId,
-							 Anum_pg_namespace_oid, fromrel->relnamespace, src);
-		if (fromrel->relkind != rel->relkind ||
-			strcmp(NameStr(fromrel->relname), NameStr(rel->relname)) != 0 ||
-			fromnsp == NULL ||
-			strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(fromnsp))->nspname),
-				   nspname) != 0)
-			continue;
 		acl = heap_getattr(from, Anum_pg_class_relacl,
 						   RelationGetDescr(pg_class), &isnull);
 		carried = carried_acl(isnull ? NULL : DatumGetAclP(acl), rel->relkind,
@@ -2398,6 +2422,109 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		heap_freetuple(tup);
 	}
 	table_close(pg_attribute, RowExclusiveLock);
+	table_close(pg_class, RowExclusiveLock);
+	CommandCounterIncrement();
+}
+
+/*
+ * Give each of the session branch's tables relids that has no statistics
+ * the planner statistics of the table of branch source of the same place
+ * in fromids (see branch_ops.h): each column's pg_statistic row, as the
+ * column of its name and type here, and the row and page counts if the
+ * table has none.  A move that made the table loaded it from source's
+ * rows (and its index builds counted them); source's statistics describe
+ * those rows as its last analyze sampled them.
+ */
+static void
+copies_carry_statistics(const char *source, List *relids, List *fromids)
+{
+	Oid			src = branch_oid(source, true);
+	Relation	pg_class;
+	Relation	pg_statistic;
+	TupleDesc	desc;
+	ListCell   *lr;
+	ListCell   *lf;
+
+	if (!OidIsValid(src) || src == MyBranch || relids == NIL)
+		return;
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	pg_statistic = table_open(StatisticRelationId, RowExclusiveLock);
+	desc = RelationGetDescr(pg_statistic);
+	forboth(lr, relids, lf, fromids)
+	{
+		Oid			relid = lfirst_oid(lr);
+		Oid			fromid = lfirst_oid(lf);
+		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		Form_pg_class rel;
+		HeapTuple	from;
+		Form_pg_class fromrel;
+		List	   *fromatts;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		rel = (Form_pg_class) GETSTRUCT(tup);
+		if ((rel->relkind != RELKIND_RELATION &&
+			 rel->relkind != RELKIND_MATVIEW) ||
+			branch_rows(StatisticRelationId, StatisticRelidAttnumInhIndexId,
+						Anum_pg_statistic_starelid, relid, MyBranch) != NIL ||
+			(from = carried_from(src, rel, fromid)) == NULL)
+		{
+			heap_freetuple(tup);
+			continue;
+		}
+		fromrel = (Form_pg_class) GETSTRUCT(from);
+		fromatts = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+							   Anum_pg_attribute_attrelid, fromid, src);
+		foreach_ptr(HeapTupleData, stat,
+					branch_rows(StatisticRelationId,
+								StatisticRelidAttnumInhIndexId,
+								Anum_pg_statistic_starelid, fromid, src))
+		{
+			Form_pg_statistic st = (Form_pg_statistic) GETSTRUCT(stat);
+			Form_pg_attribute fromatt = NULL;
+			HeapTuple	mine;
+			Form_pg_attribute att;
+			Datum		values[Natts_pg_statistic] = {0};
+			bool		nulls[Natts_pg_statistic] = {0};
+			bool		replaces[Natts_pg_statistic] = {0};
+			HeapTuple	carried;
+
+			foreach_ptr(HeapTupleData, a, fromatts)
+				if (((Form_pg_attribute) GETSTRUCT(a))->attnum == st->staattnum)
+					fromatt = (Form_pg_attribute) GETSTRUCT(a);
+			if (fromatt == NULL || fromatt->attisdropped)
+				continue;
+			mine = SearchSysCacheAttName(relid, NameStr(fromatt->attname));
+			if (!HeapTupleIsValid(mine))
+				continue;
+			att = (Form_pg_attribute) GETSTRUCT(mine);
+			if (att->atttypid != fromatt->atttypid ||
+				att->attcollation != fromatt->attcollation)
+			{
+				ReleaseSysCache(mine);
+				continue;
+			}
+			values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(relid);
+			replaces[Anum_pg_statistic_starelid - 1] = true;
+			values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(att->attnum);
+			replaces[Anum_pg_statistic_staattnum - 1] = true;
+			values[Anum_pg_statistic_stabranch - 1] = ObjectIdGetDatum(MyBranch);
+			replaces[Anum_pg_statistic_stabranch - 1] = true;
+			ReleaseSysCache(mine);
+			carried = heap_modify_tuple(stat, desc, values, nulls, replaces);
+			CatalogTupleInsert(pg_statistic, carried);
+			heap_freetuple(carried);
+		}
+		if (rel->reltuples < 0 && fromrel->reltuples >= 0)
+		{
+			rel->reltuples = fromrel->reltuples;
+			rel->relpages = fromrel->relpages;
+			CatalogTupleUpdate(pg_class, &tup->t_self, tup);
+		}
+		heap_freetuple(from);
+		heap_freetuple(tup);
+	}
+	table_close(pg_statistic, RowExclusiveLock);
 	table_close(pg_class, RowExclusiveLock);
 	CommandCounterIncrement();
 }
@@ -2443,6 +2570,7 @@ static const BranchOpsRoutine branch_copies = {
 	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
+	.carry_statistics = copies_carry_statistics,
 	.relation_owner = copies_relation_owner,
 };
 
