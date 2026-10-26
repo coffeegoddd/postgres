@@ -505,9 +505,10 @@ open_branch_table(const Revision *rev, const char *schema, const char *relname,
 }
 
 /*
- * A branch's copy read without ONLY must have no inheritance children
- * there: the scan reads the copy alone, and a session on the branch would
- * read the children's rows too.
+ * A table read without ONLY must have no inheritance children on branch
+ * (InvalidOid: the session's, for a commit's table, which is the table
+ * here): the scan reads the table alone, and a session on the revision
+ * would read the children's rows too.
  */
 static void
 refuse_children(Relation rel, Oid branch, const char *ref, bool inh,
@@ -638,6 +639,12 @@ prolly_revision_range(ParseState *pstate, RangeVar *rv, const char *ref)
 					 errmsg("\"%s.%s\" of revision \"%s\" is not a table",
 							rv->schemaname, rv->relname, ref),
 					 parser_errposition(pstate, rv->location)));
+		/*
+		 * (a commit's table is read as dolt_at() reads it: the table here,
+		 * so its children are the table's here, read without ONLY refused)
+		 */
+		if (!plain)
+			refuse_children(rel, InvalidOid, ref, rv->inh, rv->location, pstate);
 		defs = plain ? NIL : column_defs(RelationGetDescr(rel), ref,
 										 rv->relname, rv->location, pstate);
 		table_close(rel, NoLock);
@@ -867,6 +874,7 @@ reader_open(RevisionReader *rr, const char *ref, const char *schema,
 
 		rr->relid = commit_table(schema, relname, -1, NULL);
 		rel = table_open(rr->relid, NoLock);
+		refuse_children(rel, InvalidOid, rr->rev.ref, rr->inh, -1, NULL);
 		reader_map(rr, RelationGetDescr(rel), used);
 		rr->slot = MakeSingleTupleTableSlot(CreateTupleDescCopy(RelationGetDescr(rel)),
 											&TTSOpsMinimalTuple);

@@ -274,6 +274,43 @@ SELECT sum(v) FROM "regress_revisions/Mixed".rn.t;
 SELECT sum(v) FROM "regress_revisions/MIXED".rn.t;
 SELECT sum(v) FROM "regress_revisions/mixed".rn.t;
 
+-- column aliases the user wrote: printed as renames by name, so parsed
+-- again they rename the same columns however the branch's table changed
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+CREATE TABLE rn.d (id int, x int, y int, z text);
+INSERT INTO rn.d VALUES (1, 10, 20, 'z1'), (2, 11, 21, 'z2');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE VIEW rn_q AS SELECT q.yy FROM "regress_revisions/b1".rn.d q(i, xx, yy);
+SELECT pg_get_viewdef('rn_q');
+-- (columns dropped and added again, so in another order)
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ALTER TABLE rn.d DROP COLUMN x;
+ALTER TABLE rn.d ADD COLUMN x int;
+UPDATE rn.d SET x = id;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM rn_q ORDER BY 1;
+SELECT 'CREATE VIEW rn_q_again AS ' || pg_get_viewdef('rn_q') \gexec
+SELECT * FROM rn_q_again ORDER BY 1;
+-- (a column renamed: parsed again, the definition is refused, not misread)
+SELECT dolt_checkout('b1') IS NOT NULL AS on_b1;
+ALTER TABLE rn.d RENAME z TO zz;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM rn_q ORDER BY 1;
+SELECT 'CREATE VIEW rn_q_renamed AS ' || pg_get_viewdef('rn_q') \gexec
+DROP VIEW rn_q, rn_q_again;
+
+-- an inheritance parent read at a commit (as the table here has it):
+-- read with ONLY, or refused
+CREATE TABLE rn.mp (a int);
+CREATE TABLE rn.mc () INHERITS (rn.mp);
+INSERT INTO rn.mp VALUES (1);
+INSERT INTO rn.mc VALUES (2);
+SELECT length(dolt_commit('-Am', 'inheritance')::text) AS committed;
+SELECT dolt_tag('tinh', 'HEAD') IS NOT NULL AS tagged;
+SELECT count(*) FROM rn.mp;
+SELECT count(*) FROM "regress_revisions/tinh".rn.mp;
+SELECT count(*) FROM ONLY "regress_revisions/tinh".rn.mp;
+
 -- main by any case in a database without commits (main not yet folded)
 CREATE DATABASE regress_revisions_fresh;
 \c regress_revisions_fresh

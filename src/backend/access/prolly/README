@@ -1784,7 +1784,8 @@ table here of the name.  Each scan looks the revision up again as it
 begins and matches the plan's columns by name, so a view or a kept plan
 reads the revision as it is then (a column it reads gone, or retyped,
 is an error); a view's definition prints the name without a positional
-column list, so parsed again it reads the columns by name too.  A copy
+column list (a column renamed by an alias is renamed by name in a
+subquery), so parsed again it reads the columns by name too.  A copy
 with inheritance children on the branch is read only with ONLY, the copy
 alone; without it, it is refused.
 
