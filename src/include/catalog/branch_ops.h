@@ -326,6 +326,41 @@ typedef struct BranchOpsRoutine
 									 List *fromids);
 
 	/*
+	 * Optional: give each of the session branch's tables relids that has no
+	 * statistics yet the planner statistics of the table of branch source
+	 * at the same place in fromids, as carry_privileges() pairs them, for a
+	 * table a merge of source, or a pick of its head, made here from
+	 * source's rows: until autovacuum analyzes it, the planner would
+	 * otherwise guess.  Carried: its columns' pg_statistic rows (a
+	 * partitioned table's inherited ones too), each to the column of the
+	 * same name and collation and a type the same by identity (the same
+	 * shared type; or a versioned one the move made again, an enum of the
+	 * same name and labels in the same order, its values' label OIDs
+	 * mapped, or a domain of the same name over the same shared base
+	 * type, or an array of either, its elements carried so); its
+	 * expression indexes' rows, from source's index of the same name,
+	 * columns and expressions; its extended statistics objects'
+	 * data, from source's of the same name and kinds over the same columns
+	 * by number (none where a dropped column puts them at other numbers on
+	 * one side); and its row
+	 * and page counts if it has none.  Not carried: a column of another
+	 * versioned type (a composite or table row type, a range, an array of
+	 * one, or a domain over an array of a versioned type, whose values
+	 * hold source's OIDs: only that column), a slot whose
+	 * values are of such a type, an extended statistics object on
+	 * expressions or over a column of a versioned type, and anything of a
+	 * table whose live columns source's working set has changed since its
+	 * head (renamed, retyped, added or dropped: its statistics may describe
+	 * other columns than this table's of their names).  Source's rows may
+	 * have changed since its head too: the statistics are an estimate, as
+	 * an analyze's are.  None for a table source hasn't, or has now of
+	 * another kind or name, one source never analyzed, nor where source is
+	 * no branch with copies.
+	 */
+	void		(*carry_statistics) (const char *source, List *relids,
+									 List *fromids);
+
+	/*
 	 * Optional: the owner of branch's relation relid (InvalidOid: branch
 	 * hasn't it, or is no branch with copies).
 	 */

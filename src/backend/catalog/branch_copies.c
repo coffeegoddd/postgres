@@ -65,6 +65,11 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_enum.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_statistic_ext_data.h"
+#include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/trigger.h"
@@ -2335,6 +2340,41 @@ carried_acl(Acl *acl, char relkind, Oid fromowner, Oid owner)
 }
 
 /*
+ * Branch src's row of relation fromid, if it is still the one relation rel
+ * of the session's branch was made from: of the same kind and name, in a
+ * schema of the same name.  NULL if it isn't (made, or renamed, since the
+ * commit that was found to hold it), or src hasn't it.
+ */
+static HeapTuple
+carried_from(Oid src, Form_pg_class rel, Oid fromid)
+{
+	char	   *nspname = get_namespace_name(rel->relnamespace);
+	HeapTuple	from;
+	HeapTuple	fromnsp;
+	Form_pg_class fromrel;
+
+	if (nspname == NULL)
+		return NULL;
+	from = branch_row(RelationRelationId, ClassOidIndexId, Anum_pg_class_oid,
+					  fromid, src);
+	if (from == NULL)
+		return NULL;
+	fromrel = (Form_pg_class) GETSTRUCT(from);
+	fromnsp = branch_row(NamespaceRelationId, NamespaceOidIndexId,
+						 Anum_pg_namespace_oid, fromrel->relnamespace, src);
+	if (fromrel->relkind != rel->relkind ||
+		strcmp(NameStr(fromrel->relname), NameStr(rel->relname)) != 0 ||
+		fromnsp == NULL ||
+		strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(fromnsp))->nspname),
+			   nspname) != 0)
+	{
+		heap_freetuple(from);
+		return NULL;
+	}
+	return from;
+}
+
+/*
  * Add to each of the session branch's relations relids the privileges of
  * the relation of branch source of the same place in fromids, the
  * relation's and each column's (by the column's name), as the relation's
@@ -2361,9 +2401,7 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		Oid			fromid = lfirst_oid(lf);
 		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 		Form_pg_class rel;
-		char	   *nspname;
 		HeapTuple	from;
-		HeapTuple	fromnsp;
 		Form_pg_class fromrel;
 		Datum		acl;
 		bool		isnull;
@@ -2372,20 +2410,10 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		if (!HeapTupleIsValid(tup))
 			continue;
 		rel = (Form_pg_class) GETSTRUCT(tup);
-		nspname = get_namespace_name(rel->relnamespace);
-		from = branch_row(RelationRelationId, ClassOidIndexId,
-						  Anum_pg_class_oid, fromid, src);
-		if (from == NULL || nspname == NULL)
+		from = carried_from(src, rel, fromid);
+		if (from == NULL)
 			continue;
 		fromrel = (Form_pg_class) GETSTRUCT(from);
-		fromnsp = branch_row(NamespaceRelationId, NamespaceOidIndexId,
-							 Anum_pg_namespace_oid, fromrel->relnamespace, src);
-		if (fromrel->relkind != rel->relkind ||
-			strcmp(NameStr(fromrel->relname), NameStr(rel->relname)) != 0 ||
-			fromnsp == NULL ||
-			strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(fromnsp))->nspname),
-				   nspname) != 0)
-			continue;
 		acl = heap_getattr(from, Anum_pg_class_relacl,
 						   RelationGetDescr(pg_class), &isnull);
 		carried = carried_acl(isnull ? NULL : DatumGetAclP(acl), rel->relkind,
@@ -2420,6 +2448,656 @@ copies_carry_privileges(const char *source, List *relids, List *fromids)
 		heap_freetuple(tup);
 	}
 	table_close(pg_attribute, RowExclusiveLock);
+	table_close(pg_class, RowExclusiveLock);
+	CommandCounterIncrement();
+}
+
+/*
+ * Carrying planner statistics (carry_statistics()).  A table a move made
+ * from source's rows takes source's statistics of them: its columns', its
+ * expression indexes' and its extended statistics' data.  A statistic's
+ * values are of the column's type, so a column is carried only where the
+ * types are one: the same type, shared by every branch, or a versioned one
+ * the move made again (another OID) that is the same by identity, an enum
+ * of the same name and labels in the same order (its values, label OIDs,
+ * mapped label to label) or a domain of the same name over the same
+ * shared base type, or an array of either.  Other versioned types
+ * (composites and table row types, ranges, arrays of those) aren't: their
+ * values hold OIDs of source's own.
+ */
+typedef struct CarriedType
+{
+	Oid			ours;			/* the column's type here */
+	bool		enumtype;		/* a versioned enum's, its labels mapped */
+	int			nlabels;		/* an enum's: source's label OIDs ... */
+	Oid		   *theirs;
+	Oid		   *mine;			/* ... and ours, in the same order */
+
+	/*
+	 * An array of a versioned enum or domain: the element types (source's,
+	 * ours), the enum's labels above, and the array type's alignment.
+	 */
+	bool		array;
+	Oid			theirelem;
+	Oid			ourelem;
+	char		typalign;
+} CarriedType;
+
+/* Do two types' rows name the same type: the same name, in like schemas? */
+static bool
+same_type_name(Form_pg_type a, Oid abranch, Form_pg_type b, Oid bbranch)
+{
+	HeapTuple	an = branch_row(NamespaceRelationId, NamespaceOidIndexId,
+								Anum_pg_namespace_oid, a->typnamespace, abranch);
+	HeapTuple	bn = branch_row(NamespaceRelationId, NamespaceOidIndexId,
+								Anum_pg_namespace_oid, b->typnamespace, bbranch);
+
+	return an != NULL && bn != NULL &&
+		strcmp(NameStr(a->typname), NameStr(b->typname)) == 0 &&
+		strcmp(NameStr(((Form_pg_namespace) GETSTRUCT(an))->nspname),
+			   NameStr(((Form_pg_namespace) GETSTRUCT(bn))->nspname)) == 0;
+}
+
+/* An enum's labels on branch, in their order, as names and OIDs. */
+static int
+enum_labels(Oid typid, Oid branch, char ***names, Oid **oids)
+{
+	List	   *rows = branch_rows(EnumRelationId, EnumTypIdLabelIndexId,
+								   Anum_pg_enum_enumtypid, typid, branch);
+	int			n = list_length(rows);
+	HeapTuple  *sorted = palloc_array(HeapTuple, Max(n, 1));
+	int			i = 0;
+
+	foreach_ptr(HeapTupleData, row, rows)
+	{
+		int			j = i++;
+
+		/* (insertion sort by enumsortorder: an enum has few labels) */
+		while (j > 0 &&
+			   ((Form_pg_enum) GETSTRUCT(sorted[j - 1]))->enumsortorder >
+			   ((Form_pg_enum) GETSTRUCT(row))->enumsortorder)
+		{
+			sorted[j] = sorted[j - 1];
+			j--;
+		}
+		sorted[j] = row;
+	}
+	*names = palloc_array(char *, Max(n, 1));
+	*oids = palloc_array(Oid, Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		Form_pg_enum e = (Form_pg_enum) GETSTRUCT(sorted[i]);
+
+		(*names)[i] = pstrdup(NameStr(e->enumlabel));
+		(*oids)[i] = e->oid;
+	}
+	return n;
+}
+
+/*
+ * Is source's column type theirs (on branch src) the session branch's ours
+ * by identity (see above)?  If so, *ct says how to carry its values.
+ */
+static bool
+carried_type(Oid theirs, Oid src, Oid ours, CarriedType *ct)
+{
+	/* (NULL for a shared type: branch_row() finds only branch's own) */
+	HeapTuple	tt = branch_row(TypeRelationId, TypeOidIndexId,
+								Anum_pg_type_oid, theirs, src);
+	HeapTuple	ot = SearchSysCache1(TYPEOID, ObjectIdGetDatum(ours));
+	Form_pg_type o;
+	Form_pg_type t;
+	bool		alike = false;
+
+	memset(ct, 0, sizeof(*ct));
+	ct->ours = ours;
+	if (!HeapTupleIsValid(ot))
+		return false;
+	o = (Form_pg_type) GETSTRUCT(ot);
+	if (tt == NULL)
+		/* (source's is shared: so must ours be, the same one) */
+		alike = theirs == ours && !OidIsValid(o->typbranch);
+	else if (OidIsValid(o->typbranch) &&
+			 same_type_name((t = (Form_pg_type) GETSTRUCT(tt)), src, o,
+							MyBranch) &&
+			 t->typtype == o->typtype)
+	{
+		if (o->typtype == TYPTYPE_DOMAIN)
+		{
+			HeapTuple	bt = SearchSysCache1(TYPEOID,
+											 ObjectIdGetDatum(o->typbasetype));
+
+			alike = t->typbasetype == o->typbasetype &&
+				t->typtypmod == o->typtypmod && HeapTupleIsValid(bt) &&
+				!OidIsValid(((Form_pg_type) GETSTRUCT(bt))->typbranch);
+			if (HeapTupleIsValid(bt))
+				ReleaseSysCache(bt);
+		}
+		else if (o->typtype == TYPTYPE_ENUM)
+		{
+			char	  **tnames;
+			char	  **onames;
+			int			n = enum_labels(theirs, src, &tnames, &ct->theirs);
+
+			alike = enum_labels(ours, MyBranch, &onames, &ct->mine) == n;
+			for (int i = 0; alike && i < n; i++)
+				alike = strcmp(tnames[i], onames[i]) == 0;
+			ct->nlabels = n;
+			ct->enumtype = true;
+		}
+		else if (o->typtype == TYPTYPE_BASE && IsTrueArrayType(o) &&
+				 IsTrueArrayType(t))
+		{
+			CarriedType elem;
+
+			/* (an array of one of the above: its elements' carried so) */
+			alike = carried_type(t->typelem, src, o->typelem, &elem);
+			if (alike)
+			{
+				*ct = elem;
+				ct->ours = ours;
+				ct->array = true;
+				ct->theirelem = t->typelem;
+				ct->ourelem = o->typelem;
+				ct->typalign = o->typalign;
+			}
+		}
+	}
+	ReleaseSysCache(ot);
+	return alike;
+}
+
+/*
+ * Array a of source's versioned enum or domain values made one of newelem,
+ * ours: an enum's label OIDs mapped to ours (NULL if one isn't found), a
+ * domain's values (of the same shared base type: the same bytes) as they
+ * are.  Read only as the array's own element type.
+ */
+static ArrayType *
+carried_elements(ArrayType *a, Oid newelem, const CarriedType *ct)
+{
+	ArrayType  *copy;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+
+	if (!ct->enumtype)
+	{
+		copy = (ArrayType *) palloc(VARSIZE(a));
+		memcpy(copy, a, VARSIZE(a));
+		ARR_ELEMTYPE(copy) = newelem;
+		return copy;
+	}
+	/* (an enum's values: OIDs, by value) */
+	deconstruct_array(a, ARR_ELEMTYPE(a), sizeof(Oid), true, TYPALIGN_INT,
+					  &elems, &nulls, &n);
+	for (int i = 0; i < n; i++)
+	{
+		int			k;
+
+		if (nulls[i])
+			continue;
+		for (k = 0; k < ct->nlabels; k++)
+			if (ct->theirs[k] == DatumGetObjectId(elems[i]))
+				break;
+		if (k == ct->nlabels)
+			return NULL;
+		elems[i] = ObjectIdGetDatum(ct->mine[k]);
+	}
+	return construct_md_array(elems, nulls, ARR_NDIM(a), ARR_DIMS(a),
+							  ARR_LBOUND(a), newelem, sizeof(Oid), true,
+							  TYPALIGN_INT);
+}
+
+/*
+ * A pg_statistic slot's values (an array) of source's column of type
+ * theirs, as the session branch's column of ct->ours takes them.
+ *
+ * - A slot of the column's type: copied as it is for a shared type; for a
+ *   versioned enum or domain, carried_elements()'s; for an array of one,
+ *   each element array carried so (the slot an array of arrays).
+ * - For an array of a versioned enum or domain, a slot of its element type
+ *   (its most common elements): carried_elements()'s.
+ * - A slot of another type (an array column's element counts, a range's
+ *   lengths, a tsvector's lexemes): copied as it is if that type is
+ *   shared; the column isn't carried (*ok false) if it is a versioned type
+ *   of source's.
+ *
+ * *ok is false too if an enum's label isn't found.  Values are only ever
+ * read as the array's own element type.
+ */
+static Datum
+carried_values(Datum values, Oid theirs, Oid src, const CarriedType *ct,
+			   bool *ok)
+{
+	ArrayType  *a = DatumGetArrayTypeP(values);
+	Oid			elem = ARR_ELEMTYPE(a);
+	ArrayType  *carried = NULL;
+
+	*ok = true;
+	if (elem == theirs && theirs == ct->ours && !ct->enumtype && !ct->array)
+		return values;
+	if (elem == theirs && !ct->array)
+		carried = carried_elements(a, ct->ours, ct);
+	else if (ct->array && elem == ct->theirelem)
+		carried = carried_elements(a, ct->ourelem, ct);
+	else if (ct->array && elem == theirs)
+	{
+		Datum	   *inner;
+		bool	   *nulls;
+		int			n;
+
+		deconstruct_array(a, elem, -1, false, ct->typalign,
+						  &inner, &nulls, &n);
+		for (int i = 0; i < n; i++)
+		{
+			ArrayType  *e;
+
+			if (nulls[i])
+				continue;
+			e = carried_elements(DatumGetArrayTypeP(inner[i]), ct->ourelem, ct);
+			if (e == NULL)
+			{
+				*ok = false;
+				return values;
+			}
+			inner[i] = PointerGetDatum(e);
+		}
+		carried = construct_md_array(inner, nulls, ARR_NDIM(a), ARR_DIMS(a),
+									 ARR_LBOUND(a), ct->ours, -1, false,
+									 ct->typalign);
+	}
+	else
+	{
+		HeapTuple	versioned = branch_row(TypeRelationId, TypeOidIndexId,
+										   Anum_pg_type_oid, elem, src);
+
+		if (versioned != NULL)
+		{
+			heap_freetuple(versioned);
+			*ok = false;
+		}
+		return values;
+	}
+	if (carried == NULL)
+	{
+		*ok = false;
+		return values;
+	}
+	return PointerGetDatum(carried);
+}
+
+/*
+ * Copy source's pg_statistic rows of its relation fromid (on branch src)
+ * to the session branch's relid: each attribute's to the attribute of the
+ * same name here (byname: a table's columns) or the same number (an
+ * index's), of a type carried_type() takes, its values made ours, and its
+ * operators and collations ones this branch has.
+ */
+static void
+carry_statistic_rows(Relation pg_statistic, Oid src, Oid fromid, Oid relid,
+					 bool byname)
+{
+	TupleDesc	desc = RelationGetDescr(pg_statistic);
+	List	   *fromatts = branch_rows(AttributeRelationId,
+									   AttributeRelidNumIndexId,
+									   Anum_pg_attribute_attrelid, fromid, src);
+
+	foreach_ptr(HeapTupleData, stat,
+				branch_rows(StatisticRelationId, StatisticRelidAttnumInhIndexId,
+							Anum_pg_statistic_starelid, fromid, src))
+	{
+		Form_pg_statistic st = (Form_pg_statistic) GETSTRUCT(stat);
+		Form_pg_attribute fromatt = NULL;
+		HeapTuple	mine;
+		Form_pg_attribute att;
+		Datum		values[Natts_pg_statistic] = {0};
+		bool		nulls[Natts_pg_statistic] = {0};
+		bool		replaces[Natts_pg_statistic] = {0};
+		CarriedType ct;
+		bool		ok = true;
+		HeapTuple	carried;
+
+		foreach_ptr(HeapTupleData, a, fromatts)
+			if (((Form_pg_attribute) GETSTRUCT(a))->attnum == st->staattnum)
+				fromatt = (Form_pg_attribute) GETSTRUCT(a);
+		if (fromatt == NULL || fromatt->attisdropped)
+			continue;
+		mine = byname ? SearchSysCacheAttName(relid, NameStr(fromatt->attname)) :
+			SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+							Int16GetDatum(fromatt->attnum));
+		if (!HeapTupleIsValid(mine))
+			continue;
+		att = (Form_pg_attribute) GETSTRUCT(mine);
+		ok = !att->attisdropped && att->attcollation == fromatt->attcollation &&
+			carried_type(fromatt->atttypid, src, att->atttypid, &ct);
+		values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(att->attnum);
+		ReleaseSysCache(mine);
+		for (int k = 0; ok && k < STATISTIC_NUM_SLOTS; k++)
+		{
+			Oid			op = (&st->staop1)[k];
+			Oid			coll = (&st->stacoll1)[k];
+			bool		isnull;
+			Datum		v = heap_getattr(stat, Anum_pg_statistic_stavalues1 + k,
+										 desc, &isnull);
+
+			if ((OidIsValid(op) &&
+				 !SearchSysCacheExists1(OPEROID, ObjectIdGetDatum(op))) ||
+				(OidIsValid(coll) &&
+				 !SearchSysCacheExists1(COLLOID, ObjectIdGetDatum(coll))))
+				ok = false;
+			else if (!isnull)
+			{
+				values[Anum_pg_statistic_stavalues1 + k - 1] =
+					carried_values(v, fromatt->atttypid, src, &ct, &ok);
+				replaces[Anum_pg_statistic_stavalues1 + k - 1] = true;
+			}
+		}
+		if (!ok)
+			continue;
+		values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(relid);
+		replaces[Anum_pg_statistic_starelid - 1] = true;
+		replaces[Anum_pg_statistic_staattnum - 1] = true;
+		values[Anum_pg_statistic_stabranch - 1] = ObjectIdGetDatum(MyBranch);
+		replaces[Anum_pg_statistic_stabranch - 1] = true;
+		carried = heap_modify_tuple(stat, desc, values, nulls, replaces);
+		CatalogTupleInsert(pg_statistic, carried);
+		heap_freetuple(carried);
+	}
+}
+
+/*
+ * Is source's type theirs the session branch's ours: the same OID, or each
+ * a versioned type of the same name (one the move made again)?  Whether a
+ * column's statistics can be carried is carried_type()'s to say.
+ */
+static bool
+same_type_identity(Oid theirs, Oid src, Oid ours)
+{
+	HeapTuple	tt;
+	HeapTuple	ot;
+	bool		same;
+
+	if (theirs == ours)
+		return true;
+	tt = branch_row(TypeRelationId, TypeOidIndexId, Anum_pg_type_oid,
+					theirs, src);
+	ot = SearchSysCache1(TYPEOID, ObjectIdGetDatum(ours));
+	same = tt != NULL && HeapTupleIsValid(ot) &&
+		OidIsValid(((Form_pg_type) GETSTRUCT(ot))->typbranch) &&
+		same_type_name((Form_pg_type) GETSTRUCT(tt), src,
+					   (Form_pg_type) GETSTRUCT(ot), MyBranch);
+	if (HeapTupleIsValid(ot))
+		ReleaseSysCache(ot);
+	return same;
+}
+
+/*
+ * Are the live columns of source's relation fromid (on branch src) now the
+ * ones of the session branch's relid, made from source's head: the same
+ * names, in the same order, of the same types (same_type_identity()) and
+ * the same collations?  If source's working set renamed, retyped, added or dropped
+ * columns since its head, its statistics may describe other columns than
+ * the ones of the same name here, and none are carried.
+ */
+static bool
+columns_as_committed(Oid relid, Oid fromid, Oid src)
+{
+	List	   *ours = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+								   Anum_pg_attribute_attrelid, relid, MyBranch);
+	List	   *theirs = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+									 Anum_pg_attribute_attrelid, fromid, src);
+	ListCell   *a = list_head(ours);
+	ListCell   *b = list_head(theirs);
+
+	for (;;)
+	{
+		Form_pg_attribute o = NULL;
+		Form_pg_attribute t = NULL;
+
+		for (; a != NULL; a = lnext(ours, a))
+		{
+			o = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(a));
+			if (o->attnum > 0 && !o->attisdropped)
+				break;
+			o = NULL;
+		}
+		for (; b != NULL; b = lnext(theirs, b))
+		{
+			t = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(b));
+			if (t->attnum > 0 && !t->attisdropped)
+				break;
+			t = NULL;
+		}
+		if (o == NULL || t == NULL)
+			return o == NULL && t == NULL;
+		if (strcmp(NameStr(o->attname), NameStr(t->attname)) != 0 ||
+			o->atttypmod != t->atttypmod ||
+			o->attcollation != t->attcollation ||
+			!same_type_identity(t->atttypid, src, o->atttypid))
+			return false;
+		a = lnext(ours, a);
+		b = lnext(theirs, b);
+	}
+}
+
+/* The name of branch's relation relid (NULL: none). */
+static char *
+branch_relname(Oid relid, Oid branch)
+{
+	HeapTuple	t = branch_row(RelationRelationId, ClassOidIndexId,
+							   Anum_pg_class_oid, relid, branch);
+
+	return t != NULL ? pstrdup(NameStr(((Form_pg_class) GETSTRUCT(t))->relname)) : NULL;
+}
+
+/*
+ * The statistics of relid's expression indexes, each from source's index
+ * of fromid of the same name and expressions (an index's statistics are
+ * of its expressions' values, by column number).
+ */
+static void
+carry_index_statistics(Relation pg_statistic, Oid src, Oid fromid, Oid relid)
+{
+	List	   *theirs = branch_rows(IndexRelationId, IndexIndrelidIndexId,
+									 Anum_pg_index_indrelid, fromid, src);
+
+	foreach_ptr(HeapTupleData, mine,
+				branch_rows(IndexRelationId, IndexIndrelidIndexId,
+							Anum_pg_index_indrelid, relid, MyBranch))
+	{
+		Oid			ours = ((Form_pg_index) GETSTRUCT(mine))->indexrelid;
+		char	   *name;
+
+		if (heap_attisnull(mine, Anum_pg_index_indexprs, NULL) ||
+			(name = branch_relname(ours, MyBranch)) == NULL)
+			continue;
+		foreach_ptr(HeapTupleData, their, theirs)
+		{
+			Oid			from = ((Form_pg_index) GETSTRUCT(their))->indexrelid;
+			char	   *fromname = branch_relname(from, src);
+
+			if (fromname != NULL && strcmp(fromname, name) == 0 &&
+				same_column(IndexRelationId, mine, their,
+							Anum_pg_index_indexprs) &&
+				same_column(IndexRelationId, mine, their,
+							Anum_pg_index_indkey))
+				carry_statistic_rows(pg_statistic, src, from, ours, false);
+		}
+	}
+}
+
+/* Is each column of m's keys named here as on source's fromid? */
+static bool
+keys_named_alike(Form_pg_statistic_ext m, Oid fromid, Oid src)
+{
+	List	   *theirs = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+									 Anum_pg_attribute_attrelid, fromid, src);
+
+	for (int i = 0; i < m->stxkeys.dim1; i++)
+	{
+		char	   *mine = get_attname(m->stxrelid, m->stxkeys.values[i], true);
+		bool		found = false;
+
+		foreach_ptr(HeapTupleData, a, theirs)
+		{
+			Form_pg_attribute t = (Form_pg_attribute) GETSTRUCT(a);
+
+			if (t->attnum == m->stxkeys.values[i])
+				found = mine != NULL && !t->attisdropped &&
+					strcmp(NameStr(t->attname), mine) == 0;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The data of relid's extended statistics objects, each from source's
+ * object on fromid of the same name and kinds over the same columns by
+ * number, each of the same name on both (keys_named_alike()): the data
+ * names its columns by number, so an object whose columns' numbers differ
+ * (a column dropped before them on one side) isn't carried.  Not one on expressions,
+ * whose data holds pg_statistic rows of source's, nor one over a column of
+ * a type the move made again: the data holds the types' OIDs.
+ */
+static void
+carry_extended_statistics(Oid src, Oid fromid, Oid relid)
+{
+	Relation	data = table_open(StatisticExtDataRelationId, RowExclusiveLock);
+	TupleDesc	desc = RelationGetDescr(data);
+	List	   *theirs = branch_rows(StatisticExtRelationId,
+									 StatisticExtRelidIndexId,
+									 Anum_pg_statistic_ext_stxrelid, fromid, src);
+
+	foreach_ptr(HeapTupleData, mine,
+				branch_rows(StatisticExtRelationId, StatisticExtRelidIndexId,
+							Anum_pg_statistic_ext_stxrelid, relid, MyBranch))
+	{
+		Form_pg_statistic_ext m = (Form_pg_statistic_ext) GETSTRUCT(mine);
+		bool		types_shared = true;
+
+		if (!heap_attisnull(mine, Anum_pg_statistic_ext_stxexprs, NULL) ||
+			branch_rows(StatisticExtDataRelationId,
+						StatisticExtDataStxoidInhIndexId,
+						Anum_pg_statistic_ext_data_stxoid, m->oid,
+						MyBranch) != NIL)
+			continue;
+		for (int i = 0; i < m->stxkeys.dim1 && types_shared; i++)
+		{
+			HeapTuple	att = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+											  Int16GetDatum(m->stxkeys.values[i]));
+			HeapTuple	typ;
+
+			types_shared = false;
+			if (!HeapTupleIsValid(att))
+				break;
+			typ = SearchSysCache1(TYPEOID, ObjectIdGetDatum(((Form_pg_attribute) GETSTRUCT(att))->atttypid));
+			types_shared = HeapTupleIsValid(typ) &&
+				!OidIsValid(((Form_pg_type) GETSTRUCT(typ))->typbranch);
+			if (HeapTupleIsValid(typ))
+				ReleaseSysCache(typ);
+			ReleaseSysCache(att);
+		}
+		if (!types_shared)
+			continue;
+		foreach_ptr(HeapTupleData, their, theirs)
+		{
+			Form_pg_statistic_ext t = (Form_pg_statistic_ext) GETSTRUCT(their);
+
+			if (strcmp(NameStr(t->stxname), NameStr(m->stxname)) != 0 ||
+				!keys_named_alike(m, fromid, src) ||
+				!heap_attisnull(their, Anum_pg_statistic_ext_stxexprs, NULL) ||
+				!same_column(StatisticExtRelationId, mine, their,
+							 Anum_pg_statistic_ext_stxkeys) ||
+				!same_column(StatisticExtRelationId, mine, their,
+							 Anum_pg_statistic_ext_stxkind))
+				continue;
+			foreach_ptr(HeapTupleData, row,
+						branch_rows(StatisticExtDataRelationId,
+									StatisticExtDataStxoidInhIndexId,
+									Anum_pg_statistic_ext_data_stxoid, t->oid,
+									src))
+			{
+				Datum		values[Natts_pg_statistic_ext_data] = {0};
+				bool		nulls[Natts_pg_statistic_ext_data] = {0};
+				bool		replaces[Natts_pg_statistic_ext_data] = {0};
+				HeapTuple	carried;
+
+				values[Anum_pg_statistic_ext_data_stxoid - 1] = ObjectIdGetDatum(m->oid);
+				replaces[Anum_pg_statistic_ext_data_stxoid - 1] = true;
+				values[Anum_pg_statistic_ext_data_stxdbranch - 1] = ObjectIdGetDatum(MyBranch);
+				replaces[Anum_pg_statistic_ext_data_stxdbranch - 1] = true;
+				carried = heap_modify_tuple(row, desc, values, nulls, replaces);
+				CatalogTupleInsert(data, carried);
+				heap_freetuple(carried);
+			}
+			break;
+		}
+	}
+	table_close(data, RowExclusiveLock);
+}
+
+/*
+ * Give each of the session branch's tables relids that has no statistics
+ * the planner statistics of the table of branch source of the same place
+ * in fromids (see branch_ops.h).  A move that made the table loaded it
+ * from source's head (and its index builds counted the rows); source's
+ * statistics describe source's rows as its last analyze sampled them.
+ */
+static void
+copies_carry_statistics(const char *source, List *relids, List *fromids)
+{
+	Oid			src = branch_oid(source, true);
+	Relation	pg_class;
+	Relation	pg_statistic;
+	ListCell   *lr;
+	ListCell   *lf;
+
+	if (!OidIsValid(src) || src == MyBranch || relids == NIL)
+		return;
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	pg_statistic = table_open(StatisticRelationId, RowExclusiveLock);
+	forboth(lr, relids, lf, fromids)
+	{
+		Oid			relid = lfirst_oid(lr);
+		Oid			fromid = lfirst_oid(lf);
+		HeapTuple	tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		Form_pg_class rel;
+		HeapTuple	from = NULL;
+		Form_pg_class fromrel;
+
+		if (!HeapTupleIsValid(tup))
+			continue;
+		rel = (Form_pg_class) GETSTRUCT(tup);
+		if ((rel->relkind != RELKIND_RELATION &&
+			 rel->relkind != RELKIND_MATVIEW &&
+			 rel->relkind != RELKIND_PARTITIONED_TABLE) ||
+			branch_rows(StatisticRelationId, StatisticRelidAttnumInhIndexId,
+						Anum_pg_statistic_starelid, relid, MyBranch) != NIL ||
+			(from = carried_from(src, rel, fromid)) == NULL ||
+			!columns_as_committed(relid, fromid, src))
+		{
+			if (from != NULL)
+				heap_freetuple(from);
+			heap_freetuple(tup);
+			continue;
+		}
+		fromrel = (Form_pg_class) GETSTRUCT(from);
+		carry_statistic_rows(pg_statistic, src, fromid, relid, true);
+		carry_index_statistics(pg_statistic, src, fromid, relid);
+		carry_extended_statistics(src, fromid, relid);
+		if (rel->reltuples < 0 && fromrel->reltuples >= 0)
+		{
+			rel->reltuples = fromrel->reltuples;
+			rel->relpages = fromrel->relpages;
+			CatalogTupleUpdate(pg_class, &tup->t_self, tup);
+		}
+		heap_freetuple(from);
+		heap_freetuple(tup);
+	}
+	table_close(pg_statistic, RowExclusiveLock);
 	table_close(pg_class, RowExclusiveLock);
 	CommandCounterIncrement();
 }
@@ -2466,6 +3144,7 @@ static const BranchOpsRoutine branch_copies = {
 	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
+	.carry_statistics = copies_carry_statistics,
 	.relation_owner = copies_relation_owner,
 };
 

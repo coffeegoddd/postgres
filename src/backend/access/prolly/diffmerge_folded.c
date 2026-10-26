@@ -13700,7 +13700,9 @@ carry_stop(CarriedPrivileges *c)
  * name.  None from a branch whose head isn't the commit of its record, or
  * whose relation of the name was made since: they may not be the ones the
  * move's objects came from.  Its commits hold no privileges; a branch of
- * this database has them.
+ * this database has them.  A table made so takes that relation's planner
+ * statistics too: the move loaded it from the same rows, and until
+ * autovacuum analyzes it the planner would guess at them.
  */
 static void
 carry_end(CarriedPrivileges *c)
@@ -13757,7 +13759,11 @@ carry_end(CarriedPrivileges *c)
 			}
 		}
 		if (mine != NIL)
+		{
 			branch_ops()->carry_privileges(source, mine, theirs);
+			if (branch_ops()->carry_statistics != NULL)
+				branch_ops()->carry_statistics(source, mine, theirs);
+		}
 	}
 }
 
@@ -14919,6 +14925,9 @@ take_their_tables(ProllyMergeState *ms, List *conflicts)
 	if (ms->identity_source != NULL && made != NIL &&
 		branch_ops()->carry_privileges != NULL)
 		branch_ops()->carry_privileges(ms->identity_source, made, from);
+	if (ms->identity_source != NULL && made != NIL &&
+		branch_ops()->carry_statistics != NULL)
+		branch_ops()->carry_statistics(ms->identity_source, made, from);
 }
 
 /*
