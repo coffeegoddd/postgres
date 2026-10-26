@@ -53,6 +53,14 @@ sql(q{
 		WITH (autovacuum_vacuum_threshold = 0,
 			  autovacuum_vacuum_scale_factor = 0);
 	INSERT INTO kp.t SELECT g, 'r' || g FROM generate_series(1, 4000) g;
+	CREATE TABLE kp.u (a int PRIMARY KEY, b text)
+		WITH (autovacuum_vacuum_threshold = 0,
+			  autovacuum_vacuum_scale_factor = 0,
+			  autovacuum_vacuum_cost_delay = 100,
+			  autovacuum_vacuum_cost_limit = 1,
+			  autovacuum_vacuum_insert_threshold = -1,
+			  autovacuum_analyze_threshold = 1000000000);
+	INSERT INTO kp.u SELECT g, 'r' || g FROM generate_series(1, 4000) g;
 	SELECT dolt_commit('-Am', 'load');
 	SELECT dolt_branch('scratch');
 });
@@ -181,6 +189,41 @@ my $cancels = () = slurp_file($node->logfile) =~
   /autovacuum worker\[$worker\] ERROR:  canceling autovacuum task/g;
 is($cancels, 1, 'the worker was cancelled once');
 ok(at_head(), 'the scratch branch holds its head\'s rows after it');
+
+# 1c. Once a move's waits for workers are spent, a worker it finds on a
+# later table isn't asked to cancel: the move writes that table's rows
+# anyway, and the cancel would only cost the worker its vacuum.  kp.u's
+# vacuum crawls (its cost options), holding it; kp.t's worker is stopped
+# holding it.  Whichever table the reset tries first, its worker is asked
+# and stops in its error handling, still holding the table, until the
+# workers' wait (deadlock_timeout) is spent; the other table's worker is
+# then left alone.
+my $u_at_head = on_scratch(q{SELECT md5(string_agg(u::text, ',' ORDER BY a)) FROM kp.u});
+on_scratch(q{UPDATE kp.u SET b = b || 'x' WHERE a % 20 = 0});
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) > 0 FROM pg_stat_progress_vacuum
+		WHERE relid = 'kp.u'::regclass}),
+	'an autovacuum worker vacuums the scratch copy of kp.u');
+$filenode = on_scratch(q{SELECT pg_relation_filenode('kp.t')});
+sql(qq{SELECT injection_points_attach('vacuum-relation-held', 'wait', '$filenode');
+	SELECT injection_points_attach('autovacuum-table-error', 'wait')});
+dirty();
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE backend_type = 'autovacuum worker'
+		  AND wait_event = 'vacuum-relation-held'}),
+	'another autovacuum worker holds the scratch copy of kp.t');
+($reset) = start_reset(q{SET prolly.restore_lock_wait = 0; SET deadlock_timeout = '200ms'});
+like(finish_reset($reset), qr/reset t/, 'the reset with two workers holding finished');
+is( sql(q{SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'autovacuum worker'
+		  AND wait_event = 'autovacuum-table-error'}),
+	'1', 'only the first worker found was asked to cancel');
+release('vacuum-relation-held');
+release('autovacuum-table-error');
+ok(at_head(), 'the scratch branch holds its head\'s rows of kp.t');
+is(on_scratch(q{SELECT md5(string_agg(u::text, ',' ORDER BY a)) FROM kp.u}),
+	$u_at_head, 'and of kp.u');
 
 # 2. Another session on the scratch branch holding kp.t, letting go while
 # the reset waits for it (prolly.restore_lock_wait well past that)

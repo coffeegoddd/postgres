@@ -186,7 +186,8 @@ typedef struct BranchOpsRoutine
 	 * lock_timeout of the operation's first wait (for as long as it takes
 	 * if lock_timeout is 0); an autovacuum worker is asked once to cancel,
 	 * and waited for until deadlock_timeout after the operation first
-	 * asked one; any other holder within prolly.restore_lock_wait of the
+	 * asked one (and none is asked once that and the next bound have
+	 * passed); any other holder within prolly.restore_lock_wait of the
 	 * first wait.  lock_timeout caps the last two.  In those three, a lock
 	 * taken "without waiting" is one not queued for, tried until then.
 	 */

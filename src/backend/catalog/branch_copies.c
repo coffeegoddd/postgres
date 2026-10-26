@@ -232,7 +232,8 @@ int			prolly_restore_lock_wait = 100;
  * soon: other holders are waited for until prolly.restore_lock_wait after
  * the operation's first wait.  A worker asked to cancel is sure to go, so
  * workers are waited for longer, until deadlock_timeout after the
- * operation first asked one (Postgres's own wait before it cancels one).
+ * operation first asked one (Postgres's own wait before it cancels one);
+ * once both waits are spent, none is asked.
  * lock_timeout, if set, caps both.  Both run from *wait, the operation's,
  * so they bound all its tries together, however many relations it locks.
  * False if the holder is still there after them, counted in
@@ -253,6 +254,7 @@ try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, BranchLockWait *wait)
 	for (;;)
 	{
 		TimestampTz now;
+		bool		others_done;
 
 		CHECK_FOR_INTERRUPTS();
 		if (OidIsValid(relid) ? ConditionalLockRelationOid(relid, mode) :
@@ -260,15 +262,24 @@ try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, BranchLockWait *wait)
 			return true;
 		if (bmap_compaction_let_go(tag, &wait->start))
 			continue;
-		if (CancelAutoVacuumHolders(tag, mode, wait->asked_xacts,
-									&wait->nasked,
-									BRANCH_LOCK_WAIT_MAX_ASKED) > 0 &&
-			wait->asked == 0)
-			wait->asked = GetCurrentTimestamp();
 		now = GetCurrentTimestamp();
 		if (wait->start == 0)
 			wait->start = now;
-		if (TimestampDifferenceExceeds(wait->start, now, bound) &&
+		others_done = TimestampDifferenceExceeds(wait->start, now, bound);
+
+		/*
+		 * (a worker is asked only while one asked could still be waited
+		 * for: once the workers' wait is spent too, the move writes the
+		 * rows anyway, and a cancel would only cost the worker its vacuum)
+		 */
+		if (!(others_done && wait->asked != 0 &&
+			  TimestampDifferenceExceeds(wait->asked, now, cancel_bound)) &&
+			CancelAutoVacuumHolders(tag, mode, wait->asked_xacts,
+									&wait->nasked,
+									BRANCH_LOCK_WAIT_MAX_ASKED) > 0 &&
+			wait->asked == 0)
+			wait->asked = now;
+		if (others_done &&
 			(wait->asked == 0 ||
 			 TimestampDifferenceExceeds(wait->asked, now, cancel_bound)))
 		{
