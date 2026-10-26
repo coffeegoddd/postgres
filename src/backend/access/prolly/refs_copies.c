@@ -1808,16 +1808,16 @@ static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 					   Snapshot snap);
 
 /*
- * When the move under way first waited for a page sweep holding one of its
- * relations (branch operations' share(), restore() and share_kept()): one
- * lock_timeout bounds the waits of every table it restores or shares.
+ * The move under way's waits for holders of its relations' locks (branch
+ * operations' share(), restore() and share_kept()): one set of bounds
+ * covers the waits of every table it restores or shares.
  */
-static TimestampTz move_wait_start = 0;
+static BranchLockWait move_wait;
 
 static void
 settle(const ProllyCommitInfo *commit, const KnownSource *source)
 {
-	move_wait_start = 0;
+	memset(&move_wait, 0, sizeof(move_wait));
 	if (source == NULL)
 		restore_pages(commit);
 	settle_rows(&commit->root, source);
@@ -2399,14 +2399,14 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
 											carry, ncarry, carried,
-											&move_wait_start);
+											&move_wait);
 			for (int j = 0; done && j < ncarry; j++)
 				*into[j] = carried[j];
 			renamed |= done && ncarry > 0;
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
-									   &move_wait_start);
+									   &move_wait);
 		if (done)
 		{
 			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
@@ -3493,7 +3493,7 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
 		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
-								   carried, &move_wait_start))
+								   carried, &move_wait))
 			continue;
 		for (int j = 0; j < ncarry; j++)
 			*into[j] = carried[j];

@@ -3415,22 +3415,38 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
  *		that blocks a lock waiter, but for a caller that only tries the
  *		lock: it isn't in the lock's queue, so the deadlock check that would
  *		find the worker never runs.  A worker vacuuming to prevent
- *		wraparound is left alone.  Returns how many were asked; the caller
+ *		wraparound is left alone.
+ *
+ *		Each is asked once, as ProcSleep() asks once per wait: asked[] (of
+ *		*nasked, room for maxasked) holds the transactions asked already,
+ *		passed over, and those asked now are added.  A worker asked again
+ *		while it aborts the task (the lock still held, its transaction the
+ *		same) would take the second cancel after its error handling, outside
+ *		it, and exit, leaving the rest of its tables.  One there is no room
+ *		to note isn't asked.  Returns how many were asked now; the caller
  *		tries the lock again once they have let go.
  */
 int
-CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode)
+CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
+						VirtualTransactionId *asked, int *nasked,
+						int maxasked)
 {
 	VirtualTransactionId *holders;
 	int			nholders;
-	int			nasked = 0;
+	int			nnew = 0;
 
 	holders = GetLockConflicts(locktag, lockmode, &nholders);
 	for (int i = 0; i < nholders; i++)
 	{
-		PGPROC	   *proc = ProcNumberGetProc(holders[i].procNumber);
+		PGPROC	   *proc;
 		int			pid = 0;
+		bool		seen = false;
 
+		for (int j = 0; j < *nasked && !seen; j++)
+			seen = VirtualTransactionIdEquals(asked[j], holders[i]);
+		if (seen || *nasked >= maxasked)
+			continue;
+		proc = ProcNumberGetProc(holders[i].procNumber);
 		if (proc == NULL)
 			continue;
 
@@ -3448,6 +3464,7 @@ CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode)
 		if (pid == 0)
 			continue;
 
+		asked[(*nasked)++] = holders[i];
 		ereport(DEBUG1,
 				(errmsg_internal("sending cancel to autovacuum PID %d holding a lock process %d tries for",
 								 pid, MyProcPid)));
@@ -3455,11 +3472,11 @@ CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode)
 		if (kill(pid, SIGINT) < 0 && errno != ESRCH)
 			ereport(WARNING,
 					(errmsg("could not send signal to process %d: %m", pid)));
-		nasked++;
+		nnew++;
 	}
 	if (!InHotStandby)
 		pfree(holders);
-	return nasked;
+	return nnew;
 }
 
 /*
