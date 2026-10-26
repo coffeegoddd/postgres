@@ -1230,7 +1230,7 @@ test_refs_index(PG_FUNCTION_ARGS)
 			skip = 1;
 		else if (tag == 's')
 			skip = 2;
-		else if (tag != 'h' && tag != 'f')
+		else if (tag != 'f')
 			continue;
 		for (int i = 0; i < skip && p < end; i++)
 			p += 1 + p[0];

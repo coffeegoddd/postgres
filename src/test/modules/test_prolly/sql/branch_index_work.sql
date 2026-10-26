@@ -144,9 +144,10 @@ ORDER BY what;
 SELECT dolt_branch('BIX_0002');
 SELECT dolt_branch('-m', 'bix_0003', 'Bix_0002');
 
--- The indexes, as committed, against what they index: each branch with a
--- head has its head's root ('h', and 'r' kind 'h' under that root) and
--- its name folded ('f'); each kept commit its 'k' entry.
+-- The indexes, as committed, against what they index, each way: each
+-- branch with a head is under its head's root ('r' kind 'h') and its
+-- baseline's fold's ('r' kind 'w'), with its name folded ('f'); each
+-- live kept commit has its 'k' and 's' entries, and no others are left.
 CREATE FUNCTION pg_temp.ix() RETURNS TABLE (tag text, branch text, keyed text,
 	value text) LANGUAGE sql AS $$ SELECT * FROM test_refs_index() $$;
 CREATE FUNCTION pg_temp.check_ix() RETURNS TABLE (problem text, n int8)
@@ -157,13 +158,13 @@ LANGUAGE sql AS $$
 		  FROM b, LATERAL test_refs_value('W' || b.name) v WHERE length(v) >= 42),
 	live AS (SELECT b.name, kc.commit_id FROM b, LATERAL test_kept_commits(b.name) kc)
 	SELECT 'head root not indexed', count(*) FROM b
-	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'h' AND i.branch = b.name
-		AND i.value = '14' || prolly_root_hash(b.name))
+	WHERE NOT EXISTS (SELECT FROM ix r WHERE r.tag = 'r' AND r.branch = b.name
+		AND r.keyed = '14' || prolly_root_hash(b.name) || '68')
 	UNION ALL
 	SELECT 'root index without its head', count(*) FROM ix r
 	WHERE r.tag = 'r' AND right(r.keyed, 2) = '68' AND NOT EXISTS (
-		SELECT FROM ix h WHERE h.tag = 'h' AND h.branch = r.branch
-		AND r.keyed = h.value || '68')
+		SELECT FROM b WHERE b.name = r.branch
+		AND r.keyed = '14' || prolly_root_hash(b.name) || '68')
 	UNION ALL
 	SELECT 'baseline root not indexed', count(*) FROM w
 	WHERE NOT EXISTS (SELECT FROM ix r WHERE r.tag = 'r' AND r.branch = w.name

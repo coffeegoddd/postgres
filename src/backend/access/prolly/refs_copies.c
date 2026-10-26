@@ -8,7 +8,8 @@
  * The branches are branch_ops' own; these refs give them head commits.
  * The chunk store's root is a tree keyed by memcmp:
  *
- *	'B' name	-> the branch's head commit (hash length, hash)
+ *	'B' name	-> the branch's head commit, then its root, if it was
+ *				   known when the head was set (hash length, hash each)
  *	'W' name	-> the branch's baseline: what its last fold for a commit
  *				   or a working-set checkpoint left, for the next fold to
  *				   start from (the canonicalizer's tree; hash length, hash),
@@ -76,14 +77,13 @@
  *				   (hash length, hash), an entry of its 'K' not retired
  *	's' data commit name -> nothing: and that commit's kept table has the
  *				   data tree data (hash length, hash, each)
- *	'r' root kind name -> nothing: the branch's head's root (kind 'h') or
- *				   its baseline's fold's (kind 'w', as 'W' has it) is root
+ *	'r' root kind name -> nothing: the branch's head's root (kind 'h', as
+ *				   'B' has it) or its baseline's fold's (kind 'w', as 'W'
+ *				   has it) is root
  *				   (hash length, hash), for a first use's nearest branch
- *	'h' name	-> the branch's head's root (hash length, hash), as 'r'
- *				   has it under kind 'h'
- *	'f' folded NUL name -> nothing: the branch has a head, and its name
- *				   case folded (ASCII) is folded, for a new name that
- *				   differs from it only by case to be refused
+ *	'f' folded NUL name -> nothing: the branch's name case folded
+ *				   (ASCII) is folded (with a head or not), for a new name
+ *				   that differs from it only by case to be refused
  * Each index is changed with the entries it indexes, in the same
  * transaction, so it commits or rolls back with them.
  *	'F'			-> the records' tree's root (hash length, hash): a tree,
@@ -310,7 +310,6 @@
 #define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
 #define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
 #define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
-#define TAG_HEAD_ROOT	'h'	/* a branch's head's root, for the above */
 #define TAG_FOLDED		'f'	/* a branch's name, case folded */
 
 /*
@@ -327,7 +326,7 @@
  * 17: a merge's table identity conflicts under their own tag, each
  * record's relations' owners, partitioned tables in commits' records, and
  * no classes (a move keeps a table's relation, by OID); 19: each kept
- * table's data tree, and the indexes of kept commits by commit and table,
+ * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
  * case folded.
  */
@@ -622,12 +621,11 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 		return;
 	switch (key->data[0])
 	{
-		case TAG_BRANCH:
 		case TAG_TRACKING:
 		case TAG_RECORDS:
-		case TAG_HEAD_ROOT:
 			(void) declare_hashes(p, end, 1, refs);
 			break;
+		case TAG_BRANCH:			/* (the head, and its root if recorded) */
 		case TAG_BASELINE:
 		case TAG_TAG:
 			(void) declare_hashes(p, end, 2, refs);
@@ -1787,7 +1785,6 @@ branch_entry_tag(char tag)
 		case TAG_REBASE:
 		case TAG_KEPT:
 		case TAG_CREATOR:
-		case TAG_HEAD_ROOT:
 			return true;
 		default:
 			return false;
@@ -2065,6 +2062,21 @@ static bool branch_baseline_root(const char *name, ProllyNodeRef *root);
  */
 static ProllyHash last_written_commit;
 static ProllyHash last_written_root;
+static ProllyHash prior_written_commit;	/* and the one before it */
+static ProllyHash prior_written_root;
+
+/* The root of commit, if it is one this backend wrote last or before. */
+static bool
+written_root(const ProllyHash *commit, ProllyHash *root)
+{
+	if (commit->len > 0 && same_hash(commit, &last_written_commit))
+		*root = last_written_root;
+	else if (commit->len > 0 && same_hash(commit, &prior_written_commit))
+		*root = prior_written_root;
+	else
+		return false;
+	return true;
+}
 
 /* The root of commit head (false: no such commit). */
 static bool
@@ -2072,11 +2084,8 @@ head_commit_root(const ProllyHash *head, ProllyHash *root)
 {
 	ProllyCommitInfo info;
 
-	if (head->len > 0 && same_hash(head, &last_written_commit))
-	{
-		*root = last_written_root;
+	if (written_root(head, root))
 		return true;
-	}
 	if (!copies_commit_get(head, &info))
 		return false;
 	*root = info.root.hash;
@@ -2114,7 +2123,20 @@ index_put(const StringInfoData *key, bool present)
 	refs_put(key->data, key->len, present ? &index_value : NULL);
 }
 
-/* The root branch name's head is at, as its 'h' entry has it. */
+/* The root of the head a 'B' value names, if it records one. */
+static bool
+head_value_root(const StringInfoData *v, ProllyHash *root)
+{
+	ProllyHash	head;
+	const char *p = get_hash(v->data, v->data + v->len, &head);
+
+	if (p >= v->data + v->len)
+		return false;
+	(void) get_hash(p, v->data + v->len, root);
+	return root->len > 0;
+}
+
+/* The root branch name's head is at, as its 'B' entry records it. */
 static bool
 head_root_get(const char *name, ProllyHash *root)
 {
@@ -2124,11 +2146,8 @@ head_root_get(const char *name, ProllyHash *root)
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_HEAD_ROOT);
-	appendStringInfoString(&key, name);
-	found = refs_get(key.data, key.len, &v);
-	if (found)
-		(void) get_hash(v.data, v.data + v.len, root);
+	branch_key(name, &key);
+	found = refs_get(key.data, key.len, &v) && head_value_root(&v, root);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -2166,53 +2185,30 @@ folded_index_note(const char *name)
 }
 
 /*
- * Index branch name's head (NULL: none) by its root: its entries changed
- * only if they change.
+ * Index branch name's head by its root: was the root its head had (NULL:
+ * none recorded), root the one it has now (NULL: none), the entries
+ * changed only if they change.
  */
 static void
-head_index_set(const char *name, const ProllyHash *head)
+head_index_set(const char *name, const ProllyHash *was, const ProllyHash *root)
 {
 	StringInfoData key;
-	StringInfoData v;
-	ProllyHash	was;
-	bool		had = head_root_get(name, &was);
-	ProllyHash	root;
-	bool		have = head != NULL && head_commit_root(head, &root);
 
+	if (was != NULL && root != NULL && same_hash(was, root))
+		return;
 	initStringInfo(&key);
-	initStringInfo(&v);
-	if (had && !(have && same_hash(&was, &root)))
+	if (was != NULL)
 	{
-		root_of_key(&key, &was, 'h', name);
+		root_of_key(&key, was, 'h', name);
 		index_put(&key, false);
 	}
-	if (have && !(had && same_hash(&was, &root)))
+	if (root != NULL)
 	{
 		resetStringInfo(&key);
-		root_of_key(&key, &root, 'h', name);
+		root_of_key(&key, root, 'h', name);
 		index_put(&key, true);
-		resetStringInfo(&key);
-		appendStringInfoChar(&key, TAG_HEAD_ROOT);
-		appendStringInfoString(&key, name);
-		put_hash(&v, &root);
-		refs_put(key.data, key.len, &v);
 	}
-	else if (had && !have)
-	{
-		resetStringInfo(&key);
-		appendStringInfoChar(&key, TAG_HEAD_ROOT);
-		appendStringInfoString(&key, name);
-		refs_put(key.data, key.len, NULL);
-	}
-	/*
-	 * (a branch first given a head here, by a fetch, a clone or a push,
-	 * may have been made by none of the paths that fold its name: one with
-	 * a head already has it)
-	 */
-	if (head != NULL && !had)
-		folded_index_note(name);
 	pfree(key.data);
-	pfree(v.data);
 }
 
 /* Index branch name's baseline's fold's root (NULL: none), was was. */
@@ -2253,18 +2249,36 @@ branch_set_head(const char *name, const ProllyHash *head)
 	FullTransactionId xid = head ? GetTopFullTransactionId() :
 		InvalidFullTransactionId;
 	Oid			role;
+	ProllyHash	was;
+	ProllyHash	root;
+	bool		found;
+	bool		had_root;
+	bool		have_root;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
 	branch_key(name, &key);
-	if (head && strcmp(name, "main") != 0 && !refs_get(key.data, key.len, &v) &&
+	/* (the entry it had: its head's root, for the index of roots) */
+	found = refs_get(key.data, key.len, &v);
+	had_root = found && head_value_root(&v, &was);
+	if (head && strcmp(name, "main") != 0 && !found &&
 		!maker_get(TAG_CREATOR, name, &role))
 		maker_put(TAG_CREATOR, name, GetUserId());
+	have_root = head != NULL && head_commit_root(head, &root);
 	resetStringInfo(&v);
 	if (head)
 		put_hash(&v, head);
+	if (have_root)
+		put_hash(&v, &root);
 	refs_put(key.data, key.len, head ? &v : NULL);
-	head_index_set(name, head);
+	head_index_set(name, had_root ? &was : NULL, have_root ? &root : NULL);
+
+	/*
+	 * (a branch first given a head here, by a fetch, a clone or a push,
+	 * may have been made by none of the paths that fold its name)
+	 */
+	if (head != NULL && !found)
+		folded_index_note(name);
 
 	resetStringInfo(&key);
 	resetStringInfo(&v);
@@ -5835,6 +5849,8 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	add_item(b, "time", &v);
 	PROLLY_CALL(tree, build_finish, b, &ref);
 	*id = ref.hash;
+	prior_written_commit = last_written_commit;
+	prior_written_root = last_written_root;
 	last_written_commit = *id;
 	last_written_root = *root;
 	pfree(v.data);
@@ -7960,8 +7976,9 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	ListCell   *lc;
 	List	   *kept;
 	ProllyNodeRef root;
-	ProllyHash	head;
+	ProllyHash	head_root;
 	bool		had_root;
+	bool		had_head_root;
 
 	lock_branch(name);
 	lock_branch(newname);
@@ -8010,8 +8027,9 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	 */
 	kept = kept_get(name);
 	had_root = branch_baseline_root(name, &root);
+	had_head_root = head_root_get(name, &head_root);
 	kept_put(name, NIL);
-	head_index_set(name, NULL);
+	head_index_set(name, had_head_root ? &head_root : NULL, NULL);
 	baseline_index_set(name, had_root ? &root : NULL, NULL);
 	folded_index_set(name, false);
 	forget_read_caches();
@@ -8048,8 +8066,8 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		pfree(v.data);
 	}
 	kept_put(newname, kept);
-	if (branch_head(newname, &head))
-		head_index_set(newname, &head);
+	if (had_head_root)
+		head_index_set(newname, NULL, &head_root);
 	if (had_root)
 		baseline_index_set(newname, NULL, &root);
 	folded_index_set(newname, true);

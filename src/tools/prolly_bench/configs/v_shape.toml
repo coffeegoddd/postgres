@@ -8,7 +8,9 @@
 
 [run]
 quality = "smoke"
-repetitions = 1
+# (three, the least of each count taken: an index keyed at hash-random
+# places splits a refs node now and then, doubling one point's nodes)
+repetitions = 3
 clients = [1]
 warmup_seconds = 0
 measure_seconds = 1            # (unused: the work is fixed)

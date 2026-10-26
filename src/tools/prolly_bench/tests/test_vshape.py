@@ -110,6 +110,33 @@ def series(checks=None):
     return out
 
 
+class RepetitionsTest(unittest.TestCase):
+    def test_least_of_repetitions(self):
+        a = {"delta": {"levels": LEVELS, "checks": {"soft_reset": {"nodes_read": [23, 23, 45, 23]}}}}
+        b = {"delta": {"levels": LEVELS, "checks": {"soft_reset": {"nodes_read": [23, 24, 23, 23]}}}}
+        out = vshape.least_of([a, b])
+        self.assertEqual(out["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 23, 23])
+        # (the inputs are left as they were)
+        self.assertEqual(a["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 45, 23])
+
+    def test_series_of_takes_a_cells_repetitions_as_one(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            lines = []
+            for rep, values in ((1, [23, 23, 45, 23]), (2, [23, 23, 23, 23])):
+                raw = root / f"raw{rep}"
+                raw.mkdir()
+                (raw / "v9-series.json").write_text(json.dumps(
+                    {"delta": {"levels": LEVELS, "checks": {"soft_reset": {"nodes_read": values}}}}))
+                lines.append(json.dumps({"key": {"workload": "V9", "variant": "bgnone", "rep": rep},
+                                         "status": "ok", "raw_dir": f"raw{rep}"}))
+            (root / "results.jsonl").write_text("\n".join(lines) + "\n")
+            cells = vshape.series_of(root)
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(cells[0]["delta"]["checks"]["soft_reset"]["nodes_read"], [23, 23, 23, 23])
+
+
 class GateTest(unittest.TestCase):
     def test_all_zero_meets_every_target(self):
         findings = vshape.gate([series()], [])

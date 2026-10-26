@@ -287,9 +287,28 @@ EXPLAIN = {
 }
 
 
+def least_of(reps: list[dict]) -> dict:
+    """One cell's repetitions as one series: each counter's least value at
+    each point.  Counters are deterministic but for the refs' nodes: keys
+    at hash-random places (an index keyed by a root) split a node now and
+    then, doubling one operation's nodes at one point; the least of a few
+    repetitions is the operation's own work."""
+    out = json.loads(json.dumps(reps[0]))
+    for sweep, sw in out.items():
+        for check, counters in sw["checks"].items():
+            for counter, values in counters.items():
+                for r in reps[1:]:
+                    other = r.get(sweep, {}).get("checks", {}).get(check, {}).get(counter)
+                    if other is None or len(other) != len(values):
+                        continue
+                    values[:] = [min(a, b) for a, b in zip(values, other)]
+    return out
+
+
 def series_of(run_dir: Path) -> list[dict]:
-    """Each V9 cell's series, from its raw directory."""
-    out = []
+    """Each V9 cell's series, from its raw directory: a cell's repetitions
+    taken as one (least_of())."""
+    cells: dict[str, list[dict]] = {}
     for line in (run_dir / "results.jsonl").read_text().splitlines():
         if not line.strip():
             continue
@@ -298,8 +317,10 @@ def series_of(run_dir: Path) -> list[dict]:
             continue
         if r.get("status") not in (None, "ok"):
             raise SystemExit(f"V9 cell {r['key']} did not complete: {r.get('status')}")
-        out.append(json.loads((run_dir / r["raw_dir"] / "v9-series.json").read_text()))
-    return out
+        key = json.dumps({k: v for k, v in r["key"].items() if k != "rep"}, sort_keys=True)
+        cells.setdefault(key, []).append(
+            json.loads((run_dir / r["raw_dir"] / "v9-series.json").read_text()))
+    return [least_of(reps) for reps in cells.values()]
 
 
 def table(findings: list[Finding]) -> str:
