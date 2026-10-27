@@ -41,7 +41,8 @@
  *				   holds them), then each such move's date (the first's 8
  *				   bytes big-endian, each after it a varint of the time
  *				   since the one before) and commit (its hash's length and
- *				   the hash's bytes complemented)
+ *				   the hash's bytes complemented), but the last move's,
+ *				   the head's
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
@@ -483,8 +484,8 @@ static void forget_read_caches(void);
 static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
-static void head_log_note(const char *name, const ProllyHash *head,
-						  StringInfo mover);
+static void head_log_note(const char *name, const ProllyHash *was,
+						  const ProllyHash *head, StringInfo mover);
 static void tracking_log_note(const char *remote, const char *branch,
 							  const ProllyHash *commit);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
@@ -2289,6 +2290,7 @@ branch_set_head(const char *name, const ProllyHash *head)
 		InvalidFullTransactionId;
 	Oid			role;
 	ProllyHash	was;
+	ProllyHash	was_head;
 	ProllyHash	root;
 	bool		found;
 	bool		had_root;
@@ -2300,6 +2302,9 @@ branch_set_head(const char *name, const ProllyHash *head)
 	/* (the entry it had: its head's root, for the index of roots) */
 	found = refs_get(key.data, key.len, &v);
 	had_root = found && head_value_root(&v, &was);
+	memset(&was_head, 0, sizeof(was_head));
+	if (found)
+		(void) get_hash(v.data, v.data + v.len, &was_head);
 	if (head && strcmp(name, "main") != 0 && !found &&
 		!maker_get(TAG_CREATOR, name, &role))
 		maker_put(TAG_CREATOR, name, GetUserId());
@@ -2325,7 +2330,7 @@ branch_set_head(const char *name, const ProllyHash *head)
 	appendStringInfoString(&key, name);
 	appendBinaryStringInfo(&v, &xid, sizeof(xid));
 	if (head)
-		head_log_note(name, head, &v);
+		head_log_note(name, &was_head, head, &v);
 	refs_put(key.data, key.len, head ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
@@ -11641,11 +11646,13 @@ get_log_state(const char *p, const char *end, LogState *ls)
 
 /*
  * The head log a branch's mover entry holds (value v): its tree's state
- * (*ls) and its tail, at most HEAD_LOG_TAIL moves.  0, the log empty, if
- * it holds none.
+ * (*ls) and its tail, at most HEAD_LOG_TAIL moves, the last of them to
+ * head (the branch's head when the entry was written, which it doesn't
+ * repeat).  0, the log empty, if it holds none.
  */
 static int
-tail_moves(const StringInfoData *v, LogMove *moves, LogState *ls)
+tail_moves(const StringInfoData *v, const ProllyHash *head, LogMove *moves,
+		   LogState *ls)
 {
 	const char *p;
 	const char *end = v->data + v->len;
@@ -11678,18 +11685,32 @@ tail_moves(const StringInfoData *v, LogMove *moves, LogState *ls)
 		else
 			moves[i].at = moves[i - 1].at +
 				(TimestampTz) prolly_get_varint(&p, end);
-		p = get_log_id(p, end, &moves[i].commit);
+		if (i < n - 1)
+			p = get_log_id(p, end, &moves[i].commit);
+		else
+			moves[i].commit = *head;
 	}
 	return n;
 }
 
+/*
+ * Branch name's head log's tail and state, its mover entry's; head, if
+ * not NULL, the head the entry was written at (else the branch's now).
+ */
 static bool
-branch_tail(const char *name, LogMove *moves, int *n, LogState *ls)
+branch_tail(const char *name, const ProllyHash *head, LogMove *moves, int *n,
+			LogState *ls)
 {
 	StringInfoData key;
 	StringInfoData v;
 	bool		found;
+	ProllyHash	now;
 
+	if (head == NULL)
+	{
+		(void) branch_head(name, &now);
+		head = &now;
+	}
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_MOVER);
@@ -11697,30 +11718,32 @@ branch_tail(const char *name, LogMove *moves, int *n, LogState *ls)
 	found = refs_get(key.data, key.len, &v);
 	*n = 0;
 	if (found)
-		*n = tail_moves(&v, moves, ls);
+		*n = tail_moves(&v, head, moves, ls);
 	else
-		(void) tail_moves(&v, moves, ls);
+		(void) tail_moves(&v, head, moves, ls);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
 }
 
 /*
- * Branch name's head moved to head: the move is added to the log's tail,
- * which goes into the log's tree once full; the log (the tree's state,
- * then the tail left) is put in mover, its mover entry's value, after the
- * transaction that moved it.  The mover entry is written by every move
- * anyway, so the log costs a move no more of the refs' paths.
+ * Branch name's head moved from was (len 0: none) to head: the move is
+ * added to the log's tail, which goes into the log's tree once full; the
+ * log (the tree's state, then the tail left) is put in mover, its mover
+ * entry's value, after the transaction that moved it.  The mover entry is
+ * written by every move anyway, so the log costs a move no more of the
+ * refs' paths; and the tail's last move, to the head, doesn't repeat it.
  */
 static void
-head_log_note(const char *name, const ProllyHash *head, StringInfo mover)
+head_log_note(const char *name, const ProllyHash *was, const ProllyHash *head,
+			  StringInfo mover)
 {
 	LogMove		tail[HEAD_LOG_TAIL + 1];
 	int			n;
 	LogState	ls;
 	TimestampTz at = GetCurrentTimestamp();
 
-	(void) branch_tail(name, tail, &n, &ls);
+	(void) branch_tail(name, was, tail, &n, &ls);
 	/* (dates only rise along a log, whatever the clock does) */
 	if (n > 0)
 		at = Max(at, tail[n - 1].at);
@@ -11744,7 +11767,8 @@ head_log_note(const char *name, const ProllyHash *head, StringInfo mover)
 			put_uint64(mover, (uint64) tail[i].at);
 		else
 			prolly_put_varint(mover, (uint64) (tail[i].at - tail[i - 1].at));
-		put_log_id(mover, &tail[i].commit);
+		if (i < n - 1)
+			put_log_id(mover, &tail[i].commit);
 	}
 }
 
@@ -11795,7 +11819,7 @@ log_moves(const char *name, const char *branch, TimestampTz from,
 	initStringInfo(&key);
 	log_key(&key, true, name, branch);
 	if (branch == NULL)
-		(void) branch_tail(name, tail, &n, &ls);
+		(void) branch_tail(name, NULL, tail, &n, &ls);
 	else
 		log_state(&key, &ls);
 	if (ls.root.len > 0 && from <= to)
@@ -11868,7 +11892,7 @@ copies_head_at(const char *name, const char *branch, TimestampTz at,
 	initStringInfo(&key);
 	log_key(&key, true, name, branch);
 	if (branch == NULL)
-		(void) branch_tail(name, tail, &n, &ls);
+		(void) branch_tail(name, NULL, tail, &n, &ls);
 	else
 		log_state(&key, &ls);
 	for (int i = n - 1; i >= 0 && !found; i--)
