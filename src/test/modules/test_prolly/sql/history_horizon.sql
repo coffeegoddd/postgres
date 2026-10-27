@@ -126,6 +126,10 @@ SELECT hh_name(dolt_hashof('main~3')) AS main_3,
 	   hh_name(dolt_hashof('main~4')) AS main_4;
 -- (a severed commit beneath the fragment's tops, named by its id)
 SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c2')) AS at_beneath;
+-- (the commit that made hh.t, still live: its data is severed too, and
+-- only its commit object kept, as every one is)
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c1')) AS at_maker,
+	   prolly_root_hash(:'c1') IS NOT NULL AS maker_listed;
 
 -- A push of history past the horizon to a remote that hasn't it says so.
 SELECT dolt_remote('add', 'empty', :'url_empty');
