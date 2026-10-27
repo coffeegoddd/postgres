@@ -1793,8 +1793,12 @@ is the horizon moved, the fragment's location the archive's URL; with no
 archive, nothing is severed and a warning says so.  The archive is opened
 as the role severing (the owner), so its checks are the owner's, and the
 archive's own permissions to push protect its history/... heads after:
-whoever may move heads there may let the history archived go.  Deleted,
-the horizon records the fragment and nothing is sent.
+whoever may move heads there may let the history archived go.  A replan
+that changed the fragment leaves the earlier one's heads in the archive,
+pinning its chunks there; harmless, but they add up.  The archive is given
+prolly.history_archive_timeout (ten minutes where unset) to take the
+history and give it back; past it the sever is given up, nothing
+severed.  Deleted, the horizon records the fragment and nothing is sent.
 
 Autovacuum's visit of a database severs its window in the background
 (the history window's maintain(), as the database's settings say), as

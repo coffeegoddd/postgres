@@ -32,6 +32,9 @@
 #include "access/prolly_config.h"
 #include "access/prolly_remote.h"
 #include "access/xact.h"
+#include "utils/wait_event.h"
+#include "storage/latch.h"
+#include "miscadmin.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -513,12 +516,56 @@ static const ProllyRemoteRoutine test_liar_remote = {
 	.has_many = liar_has_many,
 };
 
+/*
+ * A remote that never answers, test only: "stall://..." opens by waiting,
+ * interruptibly, for ever.  For a sever's time limit on its archive.
+ */
+static void
+stall_check_url(const char *url)
+{
+	if (strncmp(url, "stall://", 8) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a stall remote's URL", url)));
+}
+
+static ProllyRemote *
+stall_open(const char *url, bool create)
+{
+	for (;;)
+	{
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 100, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	return NULL;
+}
+
+static void
+stall_close(ProllyRemote *r)
+{
+}
+
+static const ProllyRemoteRoutine test_stall_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9004,
+		.name = "stall",
+		.description = "test only: a remote that never answers",
+	},
+	.check_url = stall_check_url,
+	.open = stall_open,
+	.close = stall_close,
+};
+
 void
 _PG_init(void)
 {
 	prolly_register_impl(&test_fnv_hash.info);
 	prolly_register_impl(&test_broken_hash.info);
 	prolly_register_impl(&test_liar_remote.info);
+	prolly_register_impl(&test_stall_remote.info);
 }
 
 /* ------------------------------------------------------------------------

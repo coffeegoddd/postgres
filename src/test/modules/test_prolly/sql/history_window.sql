@@ -105,6 +105,18 @@ ALTER DATABASE regress_history_window SET prolly.history_archive = :'liar_url';
 SELECT hw_err('SELECT * FROM dolt_history_sever()') AS lying_archive;
 SELECT count(*) AS fragments FROM prolly_history_horizon();
 
+-- An archive that doesn't answer: the sever gives up at the database's
+-- time limit, nothing severed.
+ALTER DATABASE regress_history_window SET prolly.history_archive = 'stall:///nowhere';
+ALTER DATABASE regress_history_window SET prolly.history_archive_timeout = '1 second';
+\c regress_history_window
+LOAD 'test_prolly';
+SELECT hw_err('SELECT * FROM dolt_history_sever()') AS stalled;
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+ALTER DATABASE regress_history_window RESET prolly.history_archive_timeout;
+\c regress_history_window
+LOAD 'test_prolly';
+
 -- Archived: sent to the archive, read back whole from it, then severed.
 -- A remote of the archive's name, moved by anyone, changes nothing.
 ALTER DATABASE regress_history_window SET prolly.history_archive = :'url';

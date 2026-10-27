@@ -83,6 +83,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 
 #define SPACE_HORIZON	'h'
@@ -548,6 +549,7 @@ static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
 static char *cold_batch_setting = NULL;
 static char *collect_interval_setting = NULL;
+static char *archive_timeout_setting = NULL;
 static char *archive_setting = NULL;
 
 static const struct config_enum_entry action_options[] = {
@@ -675,6 +677,11 @@ prolly_window_init(void)
 							   "The least time between the full collections that free severed history in the background (empty: an hour).",
 							   "Read as the database has it; fragments severed meanwhile share the next one.",
 							   &collect_interval_setting, "", PGC_USERSET, 0,
+							   check_span, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_archive_timeout",
+							   "How long a sever waits for its archive to take the history severed and give it back (empty: ten minutes).",
+							   "Read as the database has it; past it, nothing is severed.",
+							   &archive_timeout_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_cold_batch",
 							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
@@ -1137,13 +1144,15 @@ note_merge_bases(Plan *plan)
 												lookup_commit, NULL, &bases);
 
 			/*
-			 * (a ref's commit on the branch's history is its own merge
-			 * base: no path to keep for a merge of it)
+			 * (a ref's commit on the branch's history, but a tag's, is the
+			 * branch's lineage: no window, nor path, of its own; a tag's
+			 * keeps the path to it)
 			 */
 			if (b->name == NULL && nbases == 1 && same_id(&bases[0], &b->head))
 			{
 				b->on_lineage = true;
-				continue;
+				if (!b->standalone)
+					continue;
 			}
 			for (int k = 0; k < nbases; k++)
 			{
@@ -1608,6 +1617,50 @@ check_may_sever(const char *what)
 				 errdetail("Only the database's owner or a superuser may.")));
 }
 
+/*
+ * The archive's time to answer: what a sever sends it, and reads back,
+ * within prolly.history_archive_timeout (ten minutes where unset), else
+ * the sever is given up, nothing severed, so an archive that hangs doesn't
+ * hold the sever (nor, in the background, a worker) for ever.
+ */
+#define DEFAULT_ARCHIVE_TIMEOUT	(10 * USECS_PER_MINUTE)
+
+static int	archive_timeout_id = -1;
+static volatile sig_atomic_t archive_timed_out = false;
+
+static int64
+archive_timeout(void)
+{
+	int64		usec = database_span("prolly.history_archive_timeout");
+
+	return usec > 0 ? usec : DEFAULT_ARCHIVE_TIMEOUT;
+}
+
+static void
+archive_timeout_handler(void)
+{
+	archive_timed_out = true;
+	InterruptPending = true;
+	QueryCancelPending = true;
+	SetLatch(MyLatch);
+}
+
+/* Raise the error caught again, or, the archive's time up, say so. */
+static void
+archive_rethrow(const char *url, int64 limit)
+{
+	if (!archive_timed_out)
+		PG_RE_THROW();
+	archive_timed_out = false;
+	FlushErrorState();
+	ereport(ERROR,
+			(errcode(ERRCODE_CONNECTION_FAILURE),
+			 errmsg("the archive at %s didn't answer within %lld seconds",
+					url, (long long) (limit / USECS_PER_SEC)),
+			 errdetail("Nothing is severed."),
+			 errhint("Set prolly.history_archive_timeout for the database to wait longer.")));
+}
+
 typedef struct ReadBack
 {
 	const ProllyHashRoutine *hash;
@@ -1686,8 +1739,25 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 				 List *chunk_list)
 {
 	int64		sent = 0;
-	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
-	ProllyRemote *remote = PROLLY_CALL(rr, open, url, true);
+	const ProllyRemoteRoutine *rr;
+	ProllyRemote *remote = NULL;
+	int64		limit = archive_timeout();
+
+	archive_timed_out = false;
+	if (archive_timeout_id < 0)
+		archive_timeout_id = RegisterTimeout(USER_TIMEOUT, archive_timeout_handler);
+	enable_timeout_after(archive_timeout_id, (int) Min(limit / 1000, INT_MAX));
+	PG_TRY();
+	{
+		rr = prolly_remote_for_url(url);
+		remote = PROLLY_CALL(rr, open, url, true);
+	}
+	PG_CATCH();
+	{
+		disable_timeout(archive_timeout_id, false);
+		archive_rethrow(url, limit);
+	}
+	PG_END_TRY();
 
 	PG_TRY();
 	{
@@ -1759,11 +1829,15 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 							   prolly_hash_hex(missing))));
 		}
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
+		disable_timeout(archive_timeout_id, false);
 		PROLLY_CALL(rr, close, remote);
+		archive_rethrow(url, limit);
 	}
 	PG_END_TRY();
+	disable_timeout(archive_timeout_id, false);
+	PROLLY_CALL(rr, close, remote);
 	return sent;
 }
 
