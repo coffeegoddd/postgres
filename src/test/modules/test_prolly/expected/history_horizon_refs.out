@@ -312,8 +312,16 @@ SELECT hr_readable('xa', 'xb') AS both_bases_kept;
  xa=true xb=true
 (1 row)
 
--- A detached checkout's old commit keeps it, too, kept once left.
-SELECT (dolt_checkout((SELECT hash FROM hr_names WHERE name = 'old4')))[1] AS detached;
+-- A detached checkout's old commit keeps it, too, kept once left.  (The
+-- boundary's: old4's data is severed now, and its root, on severed
+-- history, is out of every window, so it can't be checked out.)
+SELECT hr_err(format('SELECT dolt_checkout(%L)', (SELECT hash FROM hr_names WHERE name = 'old4'))) AS severed_checkout;
+             severed_checkout              
+-------------------------------------------
+ commit <hash> is past the history horizon
+(1 row)
+
+SELECT (dolt_checkout((SELECT hash FROM hr_names WHERE name = 'old5')))[1] AS detached;
  detached 
 ----------
  0
@@ -343,10 +351,10 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
  t
 (1 row)
 
-SELECT hr_readable('old4') AS detached_kept;
+SELECT hr_readable('old5') AS detached_kept;
  detached_kept 
 ---------------
- old4=true
+ old5=true
 (1 row)
 
 -- The tag, the merge's and the stash's lineages merge and diff still.
