@@ -1676,7 +1676,13 @@ seek and then its apply), so it opens a tree keep_nodes() scope: each node
 above the leaves, and each root, is read from the chunk store once (up to
 maintenance_work_mem of them), and a
 3-row commit reads about its rows' paths.  An apply keeps them so on its
-own too, as each level's pass starts from the root.
+own too, as each level's pass starts from the root.  A change finder that
+looks each changed key up in a tree and then applies its edits to it (the
+log finder's fold from the baseline, and its apply of a transaction's own
+rows) does both in a keep_leaves() scope, which keeps the leaves read too
+(within the same maintenance_work_mem): the apply finds each leaf the
+lookups read, so a fold of rows spread over a table reads each changed
+leaf once, not twice.
 
 A fold isn't made again while nothing it reads has changed: the refs
 (refs_generations.c) keep in shared memory each branch's generation,
