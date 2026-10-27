@@ -3708,6 +3708,7 @@ typedef struct KeptCommit
 #define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
 
 static bool commit_height(const ProllyHash *id, int64 *height);
+static bool commit_number(const ProllyHash *id, const char *item, int64 *n);
 
 /*
  * The freezing of a keep's roots as it captures them, if the root freezer
@@ -6263,6 +6264,25 @@ parents_height(const ProllyHash *parents, int nparents)
 }
 
 /*
+ * The commits a commit with these parents reaches, itself included
+ * (prolly_history_commits()); for one parent, read from its "commits"
+ * item alone.  False if that can't be known.
+ */
+static bool
+parents_commits(const ProllyHash *parents, int nparents, int64 *commits)
+{
+	int64		first;
+
+	if (nparents != 1)
+		return prolly_history_commits(parents, nparents, copies_lookup_commit,
+									  NULL, commits);
+	if (!commit_number(&parents[0], "commits", &first))
+		return false;
+	*commits = first + 1;
+	return true;
+}
+
+/*
  * Write a commit's tree of root and dependencies (what its versioned
  * objects need from outside); its id is the root's hash.  It is dated now,
  * as Dolt's are, not at the transaction's start, so a parent another
@@ -6312,8 +6332,7 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	{
 		int64		commits;
 
-		if (prolly_history_commits(parents, nparents, copies_lookup_commit,
-								   NULL, &commits))
+		if (parents_commits(parents, nparents, &commits))
 		{
 			put_uint64(&v, (uint64) commits);
 			add_item(b, "commits", &v);
@@ -6403,7 +6422,7 @@ get_time(const StringInfoData *v, TimestampTz *at)
 }
 
 /* The most items a commit has (write_commit's). */
-#define COMMIT_ITEMS	8
+#define COMMIT_ITEMS	9
 
 /* Is a commit's item k the one named name? */
 static bool
@@ -6603,9 +6622,12 @@ commit_time(const ProllyHash *id, TimestampTz *at)
 	return found;
 }
 
-/* Just the height commit id records, which is read only for it. */
+/*
+ * Just a count commit id records (its "height" or "commits" item), which
+ * is read only for it.
+ */
 static bool
-commit_height(const ProllyHash *id, int64 *height)
+commit_number(const ProllyHash *id, const char *item, int64 *n)
 {
 	ProllyNodeRef ref;
 	StringInfoData v;
@@ -6617,12 +6639,18 @@ commit_height(const ProllyHash *id, int64 *height)
 		return false;
 	ref_of(id, &ref);
 	initStringInfo(&v);
-	found = read_item(&ref, "height", &v) && get_uint64(&v, &h) &&
+	found = read_item(&ref, item, &v) && get_uint64(&v, &h) &&
 		h > 0 && h <= PG_INT64_MAX;
 	pfree(v.data);
 	if (found)
-		*height = (int64) h;
+		*n = (int64) h;
 	return found;
+}
+
+static bool
+commit_height(const ProllyHash *id, int64 *height)
+{
+	return commit_number(id, "height", height);
 }
 
 /* A commit id in hex; false if refname isn't one. */

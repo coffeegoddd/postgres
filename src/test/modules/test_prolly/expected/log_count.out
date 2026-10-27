@@ -62,7 +62,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM dolt_log WHERE message LIKE 'c1%';
                 QUERY PLAN                
 ------------------------------------------
  Aggregate
-   ->  Function Scan on dolt_log
+   ->  Custom Scan (LogScan)
          Filter: (message ~~ 'c1%'::text)
 (3 rows)
 
@@ -71,21 +71,21 @@ EXPLAIN (COSTS OFF) SELECT committer, count(*) FROM dolt_log GROUP BY committer;
 ---------------------------------
  HashAggregate
    Group Key: dolt_log.committer
-   ->  Function Scan on dolt_log
+   ->  Custom Scan (LogScan)
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), max(date) FROM dolt_log;
-           QUERY PLAN            
----------------------------------
+         QUERY PLAN          
+-----------------------------
  Aggregate
-   ->  Function Scan on dolt_log
+   ->  Custom Scan (LogScan)
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(message) FROM dolt_log;
-           QUERY PLAN            
----------------------------------
+         QUERY PLAN          
+-----------------------------
  Aggregate
-   ->  Function Scan on dolt_log
+   ->  Custom Scan (LogScan)
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM dolt_log l, dolt_log m
@@ -95,9 +95,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM dolt_log l, dolt_log m
  Aggregate
    ->  Hash Join
          Hash Cond: (dolt_log.commit_hash = dolt_log_1.commit_hash)
-         ->  Function Scan on dolt_log
+         ->  Custom Scan (LogScan)
          ->  Hash
-               ->  Function Scan on dolt_log dolt_log_1
+               ->  Custom Scan (LogScan)
 (6 rows)
 
 SELECT counts('HEAD') AS head, counts('main~10') AS ancestor;
@@ -144,6 +144,15 @@ SELECT count(*) AS none FROM dolt_log(NULL);
 
 SELECT count(*) FROM dolt_log('no_such_ref');
 ERROR:  prolly ref "no_such_ref" does not exist
+-- the count is dolt_log's: one who can't execute it can't count it
+CREATE ROLE regress_log_count_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_log(text) FROM PUBLIC;
+SET ROLE regress_log_count_nobody;
+SELECT count(*) FROM dolt_log;
+ERROR:  permission denied for function dolt_log
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_log(text) TO PUBLIC;
+DROP ROLE regress_log_count_nobody;
 -- the count reads the head's commit, not the history
 :flush
 SELECT commits_read() AS before \gset

@@ -59,6 +59,15 @@ FROM (VALUES ('main'), ('main~1'), ('main~39')) v(r) ORDER BY r;
 SELECT count(*) AS none FROM dolt_log(NULL);
 SELECT count(*) FROM dolt_log('no_such_ref');
 
+-- the count is dolt_log's: one who can't execute it can't count it
+CREATE ROLE regress_log_count_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_log(text) FROM PUBLIC;
+SET ROLE regress_log_count_nobody;
+SELECT count(*) FROM dolt_log;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_log(text) TO PUBLIC;
+DROP ROLE regress_log_count_nobody;
+
 -- the count reads the head's commit, not the history
 :flush
 SELECT commits_read() AS before \gset
