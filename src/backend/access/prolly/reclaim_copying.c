@@ -63,7 +63,9 @@
  * within prolly.gc_retire_budget of their files' bytes; and the
  * generation a sever just let go of the newest commits of (its tops),
  * whatever its estimate, if it fits the budget, so what a fragment's
- * newest commits alone reached goes at once.  A file kept whole
+ * newest commits alone reached goes at once: the run goes on past
+ * generations not due to reach it, or, if the budget runs out first,
+ * begins at it instead.  A file kept whole
  * has its garbage as found recorded, so it isn't chosen again until a
  * sever or another retire notes more: an old file is read again only once
  * it is half garbage, which bounds what reading it costs by twice what it
@@ -866,6 +868,7 @@ copying_choose(uint64 budget, uint32 max_hi, uint32 want, uint32 *lo,
 	Units		us = {0};
 	int			n = 0;
 	int			first = -1;
+	int			wanted_at = -1;
 	uint64		bytes = 0;
 
 	if (!PROLLY_HAS(cs, generations) || !PROLLY_HAS(cs, gc_begin_retire))
@@ -890,25 +893,55 @@ copying_choose(uint64 budget, uint32 max_hi, uint32 want, uint32 *lo,
 		}
 		us.units[n++] = us.units[i];
 	}
+	/* the generation wanted, if any may be taken: its unit */
+	for (int i = 0; i < n && want > 0 && us.units[i].hi <= max_hi; i++)
+	{
+		if (us.units[i].lo <= want && want <= us.units[i].hi &&
+			us.units[i].size <= budget)
+			wanted_at = i;
+	}
 	for (int i = 0; i < n; i++)
 	{
 		Unit	   *u = &us.units[i];
-		bool		wanted = want > 0 && u->lo <= want && want <= u->hi &&
-			u->size <= budget;
 
 		if (u->hi > max_hi)
 			break;
 		if (first < 0)
 		{
-			if (!unit_due(u) && !wanted)
+			if (!unit_due(u) && i != wanted_at)
 				continue;
 			first = i;
 			*lo = u->lo;
 		}
-		else if ((!unit_due(u) && !wanted) || bytes + u->size > budget)
+		/* (one not due ends the run, unless the wanted one lies past it) */
+		else if ((!unit_due(u) && i > wanted_at) ||
+				 bytes + u->size > budget)
 			break;
 		*hi = u->hi;
 		bytes += u->size;
+	}
+
+	/*
+	 * The wanted one out of reach within the budget (the run from an older
+	 * one due is too long): the run begins at it instead, as what only it
+	 * holds is what the retire is for; the older ones wait for the next.
+	 */
+	if (wanted_at >= 0 && (first < 0 || first > wanted_at ||
+						   *hi < us.units[wanted_at].lo))
+	{
+		first = wanted_at;
+		*lo = us.units[wanted_at].lo;
+		*hi = us.units[wanted_at].hi;
+		bytes = us.units[wanted_at].size;
+		for (int i = wanted_at + 1; i < n; i++)
+		{
+			Unit	   *u = &us.units[i];
+
+			if (u->hi > max_hi || !unit_due(u) || bytes + u->size > budget)
+				break;
+			*hi = u->hi;
+			bytes += u->size;
+		}
 	}
 	pfree(us.units);
 	return first >= 0;

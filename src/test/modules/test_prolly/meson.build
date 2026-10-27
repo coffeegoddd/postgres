@@ -429,6 +429,7 @@ tests += {
       't/811_sweep_shrink_concurrent.pl',
       't/812_compact_frees_moved.pl',
       't/813_compact_frees_moved_reuse.pl',
+      't/814_gen_window_scheduling.pl',
       't/341_fold_trim_no_wait.pl',
       't/342_fold_worker_drop.pl',
       't/343_autofold_drop.pl',

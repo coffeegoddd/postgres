@@ -114,6 +114,13 @@
 #include "access/prolly_registry.h"
 #include "datatype/timestamp.h"
 
+/*
+ * The history horizon's locks: object locks in the database, of this
+ * class; object id 0 is the horizon's, 1 the severs' turn (a sever or a
+ * repair holds it to its transaction's end).
+ */
+#define PROLLY_HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
+
 /* What is done with history past the window (history_window_action). */
 typedef enum ProllyWindowAction
 {
