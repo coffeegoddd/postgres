@@ -64,7 +64,7 @@ ok($node->start(fail_ok => 1), 'recovery completes');
 ok( !$node->log_contains('invalid page in block', $log_offset),
 	'reading no page through a buffer that fails verification');
 ok( $node->log_contains(
-		'redo of a snapshot of .* writes out every buffer of it: a page of its map or counts read is newer than the replay, unverified, or not the node named',
+		'redo of a capture of .* writes out every buffer of it: a page of its map or counts read is newer than the replay, unverified, or not the node named',
 		$log_offset),
 	'a snapshot whose leaf is gone written out by every buffer');
 is(sql($digest), $now, 'the rows as they were');
@@ -94,9 +94,9 @@ $log_offset = -s $plain->logfile;
 $plain->stop('immediate');
 $plain->start;
 ok( $plain->log_contains(
-		'redo of a snapshot of .* writes out every buffer of it: data checksums are off',
+		'redo of a capture of .* writes out every buffer of it: data checksums are off',
 		$log_offset),
-	'without data checksums, redo of a snapshot writes out every buffer');
+	'without data checksums, redo of a capture writes out every buffer');
 is($plain->safe_psql('postgres', q{SELECT count(*) FROM app.t WHERE v = 1}), '1',
 	'the rows as they were');
 $plain->stop;

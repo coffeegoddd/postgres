@@ -35,12 +35,6 @@ extern SMgrRelation RelationCreateStorageWith(RelFileLocator rlocator,
 extern SMgrRelation RelationCreateStorageShared(RelFileLocator rlocator,
 												SMgrRelation src,
 												bool register_delete);
-extern SMgrRelation RelationCreateStorageFromSnapshot(RelFileLocator rlocator,
-													  SMgrRelation src,
-													  uint64 snapshot,
-													  bool with_maps,
-													  bool replacing,
-													  bool register_delete);
 extern SMgrRelation RelationCreateStorageFromRoot(RelFileLocator rlocator,
 												  uint64 root,
 												  SMgrRelation maps_from,

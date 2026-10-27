@@ -337,5 +337,60 @@ SELECT * FROM prolly_page_sweep();
      0 |         0 |         0 |     0
 (1 row)
 
+-- A capture after one page changed walks the own nodes of the path copied
+-- for it, a node of every leaf of the relation among them: their counts are
+-- read a count page at a time, not a page read for each child.
+CREATE TABLE wide (a int, b text) WITH (fillfactor = 10);
+INSERT INTO wide SELECT g, repeat('w', 200) FROM generate_series(1, 30000) g;
+SELECT pg_relation_filenode('wide') AS wide \gset
+SELECT count(*) FILTER (WHERE level = 0) > 16 AS many_leaves,
+	max(level) AS levels
+FROM test_bmap_tree(:wide);
+ many_leaves | levels 
+-------------+--------
+ t           |      1
+(1 row)
+
+SELECT test_bmap_root_capture(:wide) AS w1 \gset
+UPDATE wide SET b = 'x' WHERE a = 29000;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_root_capture(:wide) AS w2 \gset
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value BETWEEN 1 AND 6 AS counts_read_by_page
+FROM pg_stat_prolly WHERE name = 'bmap_refcount_reads';
+ counts_read_by_page 
+---------------------
+ t
+(1 row)
+
+SELECT test_bmap_root_release(:w1) AND test_bmap_root_release(:w2) AS let_go;
+ let_go 
+--------
+ t
+(1 row)
+
+DROP TABLE wide;
+SELECT count(*) FROM prolly_page_sweep();
+ count 
+-------
+     1
+(1 row)
+
 \c :home
 DROP DATABASE bmap_captured_roots;

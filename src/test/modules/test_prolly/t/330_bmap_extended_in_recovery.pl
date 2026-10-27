@@ -1,10 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Pages a standby's redo adds to a relation stay cached across promotion.
-# Recovery raises no generation of sharing as it replays a snapshot of the
+# Recovery raises no generation of sharing as it replays a capture of the
 # relation, so a page loaded or extended in recovery is settled at none:
 # its first change after promotion is checked, and a page the replayed
-# snapshot keeps is copied, not changed in place under the snapshot.
+# root keeps is copied, not changed in place under the root.
 
 use strict;
 use warnings FATAL => 'all';
@@ -38,10 +38,10 @@ sql(q{
 my $rel = sql(q{SELECT pg_relation_filenode('t')});
 $primary->wait_for_replay_catchup($standby);
 
-# pages the standby extends the relation by in redo, then a snapshot
+# pages the standby extends the relation by in redo, then a capture
 sql(q{INSERT INTO t SELECT g, 0 FROM generate_series(21, 400) g});
 my $rows = sql(qq{SELECT test_bmap_rows_digest($rel)});
-my $snap = sql(qq{SELECT test_bmap_snapshot_take($rel)});
+my $snap = sql(qq{SELECT test_bmap_root_capture($rel)});
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($rel)}),
 	$rows, 'the standby replayed both');
@@ -54,11 +54,11 @@ $standby->safe_psql('postgres', 'CHECKPOINT');
 isnt($standby->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($rel)}),
 	$rows, 'the relation changed');
 
-# copied first: the snapshot keeps the rows it had
+# copied first: the root keeps the rows it had
 my $then = $standby->safe_psql('postgres',
-	qq{SELECT test_bmap_share_snapshot($rel, $snap)});
+	qq{SELECT test_bmap_share_root($snap)});
 is($standby->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($then)}),
-	$rows, 'the snapshot keeps its rows');
+	$rows, 'the root keeps its rows');
 
 $standby->stop;
 done_testing();

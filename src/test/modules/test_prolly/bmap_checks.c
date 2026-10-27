@@ -242,7 +242,7 @@ test_bmap_free_blocks(PG_FUNCTION_ARGS)
 
 /*
  * test_bmap_store_sync(): the slot following the page store's flushes for
- * shares and snapshots, as bmap_inspect_store_sync() reads it (written and
+ * shares and captures, as bmap_inspect_store_sync() reads it (written and
  * flushing NULL if it has none)
  */
 PG_FUNCTION_INFO_V1(test_bmap_store_sync);
@@ -604,72 +604,6 @@ test_bmap_tree(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	bmap_inspect_tree(bmap_smgr(PG_GETARG_OID(0)), tree_row, rsinfo);
 	return (Datum) 0;
-}
-
-/* test_bmap_snapshot_take(relnumber): a snapshot kept; its id */
-PG_FUNCTION_INFO_V1(test_bmap_snapshot_take);
-
-Datum
-test_bmap_snapshot_take(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) bmap_snapshot_take(bmap_smgr(PG_GETARG_OID(0))));
-}
-
-/* test_bmap_snapshot_release(relnumber, id): let go of it */
-PG_FUNCTION_INFO_V1(test_bmap_snapshot_release);
-
-Datum
-test_bmap_snapshot_release(PG_FUNCTION_ARGS)
-{
-	bool		released;
-
-	released = bmap_snapshot_release(bmap_smgr(PG_GETARG_OID(0)),
-									 (uint64) PG_GETARG_INT64(1));
-	XLogFlush(XactLastRecEnd);
-	PG_RETURN_BOOL(released);
-}
-
-/* test_bmap_snapshots(relnumber): the snapshots kept */
-PG_FUNCTION_INFO_V1(test_bmap_snapshots);
-
-Datum
-test_bmap_snapshots(PG_FUNCTION_ARGS)
-{
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
-	int			n;
-
-	InitMaterializedSRF(fcinfo, 0);
-	n = bmap_snapshot_list(bmap_smgr(PG_GETARG_OID(0)), snaps,
-						   BMAP_SNAPSHOTS_MAX);
-	for (int i = 0; i < Min(n, BMAP_SNAPSHOTS_MAX); i++)
-	{
-		Datum		values[2];
-		bool		nulls[2] = {0};
-
-		values[0] = Int64GetDatum((int64) snaps[i].id);
-		values[1] = Int64GetDatum(snaps[i].nblocks);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-	}
-	return (Datum) 0;
-}
-
-/*
- * test_bmap_share_snapshot(relnumber, id): a new relation file number whose
- * storage is the snapshot's, which test_bmap_unlink() drops.
- */
-PG_FUNCTION_INFO_V1(test_bmap_share_snapshot);
-
-Datum
-test_bmap_share_snapshot(PG_FUNCTION_ARGS)
-{
-	SMgrRelation src = bmap_smgr(PG_GETARG_OID(0));
-	RelFileNumber copy = GetNewRelFileNumber(MyDatabaseTableSpace, NULL,
-											 RELPERSISTENCE_PERMANENT);
-	SMgrRelation dst = smgropen(locator_of(copy), INVALID_PROC_NUMBER);
-
-	bmap_share_snapshot(src, (uint64) PG_GETARG_INT64(1), dst, false);
-	PG_RETURN_OID(copy);
 }
 
 /* test_bmap_root_capture(relnumber): a root captured; its id */
