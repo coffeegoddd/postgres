@@ -4124,7 +4124,10 @@ copies_kept_commits(const char *name, ProllyKeptCommitVisit visit, void *arg)
 	}
 }
 
-/* Does one of kept's commits keep relation k's pages by k's snapshot? */
+/*
+ * Does one of kept's commits keep relation k's pages by k's root (or, for
+ * k naming storage a restore replaced, BRANCH_KEPT_STORAGE, that storage)?
+ */
 static bool
 kept_holds(List *kept, const BranchKeptRelation *k)
 {
@@ -4136,9 +4139,15 @@ kept_holds(List *kept, const BranchKeptRelation *k)
 			{
 				const BranchKeptRelation *o = &kc->tables[t].rels[r];
 
-				/* (a root's id names it in its tablespace's store) */
+				/*
+				 * (a root's id names it in its tablespace's store; every
+				 * replaced storage's entry has the same one, so its file
+				 * number names it)
+				 */
 				if (o->snapshot == k->snapshot &&
-					o->tablespace == k->tablespace)
+					o->tablespace == k->tablespace &&
+					(k->snapshot != BRANCH_KEPT_STORAGE ||
+					 o->relfilenumber == k->relfilenumber))
 					return true;
 			}
 		}
