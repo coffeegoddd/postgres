@@ -255,6 +255,21 @@ typedef enum ProllyGcScope
 } ProllyGcScope;
 
 /*
+ * Visits what a settled file's section lists: a chunk its chunks name in
+ * an older generation (epoch), with the leaf naming it (NULL: not a leaf).
+ */
+typedef void (*ProllyChunkListedVisit) (const ProllyHash *target,
+										const ProllyHash *source,
+										uint32 epoch, void *arg);
+
+/*
+ * settle()'s question of a chunk named that isn't here: the generation to
+ * list it by, proposed (0: none to list).
+ */
+typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
+									  uint32 proposed);
+
+/*
  * Visits a table file or segment: its name, its chunk count, its size in
  * bytes, and whether it is settled (a table file closed under what its
  * chunks name).
@@ -492,9 +507,38 @@ typedef struct ProllyChunkStoreRoutine
 	 * For chunks only a settled file's chunks name (history a repair
 	 * reattached below a boundary commit): a default collection, which
 	 * keeps settled files whole without reading them, never frees them.
+	 * Each root goes to generation epochs[i] (0: the one the settled
+	 * files list it by); absent() is asked the generation of a chunk the
+	 * chunks settled name that isn't here (a severed fragment's top), to
+	 * list it by, proposing one (0: it isn't one).
+	 *
+	 * epoch_of(), optional: the first generation of the settled file that
+	 * holds a chunk, the oldest if several do (0: none does).
 	 */
 	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
-						   int nroots);
+						   const uint32 *epochs, int nroots,
+						   ProllySettleAbsent absent, void *arg);
+
+	/*
+	 * Optional: check the settled files' generations, an error if one is
+	 * wrong: whatever a settled file's chunks name, if here, is in a
+	 * settled file of the same generations or of older ones, and then
+	 * listed in its section.  Returns the chunks checked.  Reads every
+	 * settled chunk: for tests.
+	 */
+	int64		(*verify_generations) (ProllyChunkStore *store);
+	uint32		(*epoch_of) (ProllyChunkStore *store, const ProllyHash *hash);
+
+	/*
+	 * Optional: what the section of collected file 'file' (as gc_files()
+	 * numbers them) lists; and the slot of a chunk's copy in a collected
+	 * file of generation epoch (-1: none).  A file kept whole keeps what
+	 * it lists: the copy of the generation listed, not another.
+	 */
+	void		(*gc_listed) (ProllyChunkGc *gc, int file,
+							  ProllyChunkListedVisit visit, void *arg);
+	int64		(*gc_find_in) (ProllyChunkGc *gc, const ProllyHash *hash,
+							   uint32 epoch);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -510,9 +554,9 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle"
+	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK settle
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_find_in
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -526,6 +570,17 @@ prolly_chunkstore_lookup(const char *name)
  * checkpoints and redo call (prolly_chunkstore.c).
  */
 extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
+
+/*
+ * Whether each collection checks the settled files' generations after
+ * (verify_generations()): on in assert-enabled builds.
+ */
+#ifdef USE_ASSERT_CHECKING
+#define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS true
+#else
+#define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS false
+#endif
+extern PGDLLIMPORT bool debug_prolly_verify_generations;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
@@ -581,6 +636,7 @@ extern void prolly_chunk_add_stored(const ProllyChunkStoreRoutine *cs,
 									ProllyChunkNext next, void *arg);
 
 /* The chunks a chunk names, as the server's trees lay their nodes out. */
+extern bool prolly_chunk_is_leaf(const void *data, Size len);
 extern void prolly_chunk_references(const void *data, Size len,
 									ProllyChunkRefVisit visit, void *arg);
 

@@ -99,7 +99,7 @@
 #define KEY_FRAGMENT	'f'
 #define KEY_NEXT		'n'
 
-#define FRAGMENT_VERSION	2
+#define FRAGMENT_VERSION	3
 #define FRAGMENT_DELETED	0x01
 
 /* The horizon's lock: an object lock in the database, of this class. */
@@ -260,7 +260,7 @@ set_add(HTAB *set, const ProllyHash *id)
 /* A fragment's record, encoded. */
 static void
 fragment_encode(StringInfo out, const ProllyWindowFragment *f, uint32 generation,
-				int nstops, const ProllyHash *stops)
+				int nstops, const ProllyHash *stops, const uint32 *top_epochs)
 {
 	appendStringInfoChar(out, FRAGMENT_VERSION);
 	appendStringInfoChar(out, f->deleted ? FRAGMENT_DELETED : 0);
@@ -282,6 +282,14 @@ fragment_encode(StringInfo out, const ProllyWindowFragment *f, uint32 generation
 	prolly_put_varint(out, nstops);
 	for (int i = 0; i < nstops; i++)
 		put_value_id(out, &stops[i]);
+	/* (each top's generation in the chunk store, to repair it back to) */
+	for (int i = 0; i < f->ntops; i++)
+	{
+		uint32		e = top_epochs ? top_epochs[i] : 0;
+
+		for (int b = 3; b >= 0; b--)
+			appendStringInfoChar(out, (char) (e >> (b * 8)));
+	}
 }
 
 typedef struct FragmentRecord
@@ -290,6 +298,8 @@ typedef struct FragmentRecord
 	uint32		generation;
 	int			nstops;
 	ProllyHash *stops;
+	uint32	   *top_epochs;		/* each top's chunk store generation, to
+								 * put it back in (0: not known yet) */
 } FragmentRecord;
 
 static void
@@ -335,6 +345,40 @@ fragment_decode(const char *p, Size len, int64 number, FragmentRecord *r)
 	for (uint64 i = 0; i < n; i++)
 		p = get_value_id(p, end, &r->stops[i]);
 	r->nstops = (int) n;
+	if (end - p != (ptrdiff_t) r->f.ntops * 4)
+		horizon_corrupt();
+	r->top_epochs = palloc0_array(uint32, Max(r->f.ntops, 1));
+	for (int i = 0; i < r->f.ntops; i++)
+	{
+		r->top_epochs[i] = ((uint32) (uint8) p[0] << 24) |
+			((uint32) (uint8) p[1] << 16) | ((uint32) (uint8) p[2] << 8) |
+			(uint32) (uint8) p[3];
+		p += 4;
+	}
+}
+
+/* Write a fragment's record again (its tops' generations known since). */
+static void
+fragment_rewrite(const FragmentRecord *r)
+{
+	StringInfoData k;
+	StringInfoData v;
+	ProllyKey	key;
+	ProllyValue value;
+
+	initStringInfo(&k);
+	initStringInfo(&v);
+	appendStringInfoChar(&k, KEY_FRAGMENT);
+	put_be64(&k, (uint64) r->f.number);
+	fragment_encode(&v, &r->f, r->generation, r->nstops, r->stops,
+					r->top_epochs);
+	key.data = (const uint8 *) k.data;
+	key.len = k.len;
+	value.data = (const uint8 *) v.data;
+	value.len = v.len;
+	PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+	pfree(k.data);
+	pfree(v.data);
 }
 
 static void
@@ -3069,11 +3113,21 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	initStringInfo(&k);
 	initStringInfo(&v);
 	number_key(&k, KEY_FRAGMENT, f.number);
-	fragment_encode(&v, &f,
-					PROLLY_HAS(tree_env.chunk_store, generation) ?
-					PROLLY_CALL(tree_env.chunk_store, generation,
-								tree_env.chunks) : 0,
-					nstops, stops);
+	{
+		/* (the generation each top is in now: a repair puts it back there) */
+		uint32	   *epochs = palloc0_array(uint32, Max(f.ntops, 1));
+
+		for (int i = 0; i < f.ntops; i++)
+			if (PROLLY_HAS(tree_env.chunk_store, epoch_of))
+				epochs[i] = PROLLY_CALL(tree_env.chunk_store, epoch_of,
+										tree_env.chunks, &f.tops[i]);
+		fragment_encode(&v, &f,
+						PROLLY_HAS(tree_env.chunk_store, generation) ?
+						PROLLY_CALL(tree_env.chunk_store, generation,
+									tree_env.chunks) : 0,
+						nstops, stops, epochs);
+		pfree(epochs);
+	}
 	{
 		ProllyKey	key = {(const uint8 *) k.data, k.len};
 		ProllyValue value = {(const uint8 *) v.data, v.len};
@@ -3763,6 +3817,43 @@ collect_delta_key(const ProllyKey *key, const ProllyValue *value, void *arg)
 	return true;
 }
 
+/* settle()'s question of what a repair's chunks name that isn't here */
+typedef struct SettleAbsent
+{
+	List	   *records;		/* FragmentRecord *: the horizon's */
+	FragmentRecord *repairing;
+} SettleAbsent;
+
+/*
+ * A chunk a fragment being repaired names, not here: if it is another
+ * fragment's top (an older one, still severed), the generation that one
+ * goes back to when repaired, the proposed one if it has none yet (kept in
+ * its record, so its repair puts it there).
+ */
+static uint32
+settle_absent(void *arg, const ProllyHash *hash, uint32 proposed)
+{
+	SettleAbsent *sa = arg;
+
+	foreach_ptr(FragmentRecord, r, sa->records)
+	{
+		if (r == sa->repairing)
+			continue;
+		for (int i = 0; i < r->f.ntops; i++)
+		{
+			if (!same_hash(&r->f.tops[i], hash))
+				continue;
+			if (r->top_epochs[i] == 0 && proposed > 0)
+			{
+				r->top_epochs[i] = proposed;
+				fragment_rewrite(r);
+			}
+			return r->top_epochs[i];
+		}
+	}
+	return 0;
+}
+
 /*
  * Repair the newest nfragments of the horizon's fragments (all, if < 0),
  * newest first: each one's chunks received from source (a remote's name
@@ -3881,8 +3972,13 @@ archive_repair(const char *source, int nfragments)
 		 * settled files.
 		 */
 		if (PROLLY_HAS(tree_env.chunk_store, settle))
+		{
+			SettleAbsent sa = {records, r};
+
 			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
-						r->f.tops, r->f.ntops);
+						r->f.tops, r->top_epochs, r->f.ntops,
+						settle_absent, &sa);
+		}
 
 		/*
 		 * (its edges and record let go of: the boundary keeps its parents;

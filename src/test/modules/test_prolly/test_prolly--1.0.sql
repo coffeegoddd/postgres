@@ -386,6 +386,13 @@ CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Check the settled files' generations: whatever their chunks name is in
+-- the same generations or older ones, and then listed in the file's
+-- section (an error if not).  Returns the chunks checked.
+CREATE FUNCTION test_chunk_verify_generations()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The collections that settled chunks the settled files still hold.
 CREATE FUNCTION test_chunk_epochs(OUT epoch bigint, OUT ended timestamptz)
 RETURNS SETOF record
