@@ -612,31 +612,6 @@ check_span(char **newval, void **extra, GucSource source)
 	return true;
 }
 
-/*
- * The warm window holds the hot one (prolly.history_hot, the page roots'
- * window, where that is set): warm is refused shorter than hot.
- */
-static bool
-check_warm(char **newval, void **extra, GucSource source)
-{
-	int64		warm;
-	int64		hot;
-	const char *hot_text;
-
-	if (!check_span(newval, extra, source))
-		return false;
-	(void) parse_span(*newval, &warm);
-	hot_text = GetConfigOption("prolly.history_hot", true, false);
-	if (warm > 0 && hot_text != NULL && parse_span(hot_text, &hot) &&
-		hot > 0 && warm < hot)
-	{
-		GUC_check_errdetail("prolly.history_warm can't be shorter than prolly.history_hot (%s).",
-							hot_text);
-		return false;
-	}
-	return true;
-}
-
 /* The archive is a remote's URL (not a remote's name, which others may move). */
 static bool
 check_archive(char **newval, void **extra, GucSource source)
@@ -680,7 +655,7 @@ prolly_window_init(void)
 							   "How long each branch's history is kept here (empty: all of it).",
 							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
 							   &warm_setting, "", PGC_USERSET, 0,
-							   check_warm, NULL, NULL);
+							   check_span, NULL, NULL);
 	DefineCustomIntVariable("prolly.history_min_commits",
 							"How many of each branch's newest commits are kept here, however old.",
 							"Read as the database has it; a branch may keep its own.",
@@ -788,6 +763,26 @@ branch_setting(const char *name, const char *setting)
 	return found;
 }
 
+/*
+ * The warm window holds the hot one (prolly.history_hot, the page roots'
+ * window, as the database has it, where that is set): a warm window
+ * shorter is taken as hot, with a notice.
+ */
+static void
+hold_hot(const char *name, ProllyWindowPolicy *p)
+{
+	int64		hot = database_span("prolly.history_hot");
+
+	if (p->keep_time > 0 && hot > p->keep_time)
+	{
+		ereport(NOTICE,
+				(errmsg("the history window of %s%s%s is taken as prolly.history_hot, which it can't be shorter than",
+						name ? "branch \"" : "database \"",
+						name ? name : get_database_name(MyDatabaseId), "\"")));
+		p->keep_time = hot;
+	}
+}
+
 static void
 archive_policy(const char *name, ProllyWindowPolicy *p)
 {
@@ -813,13 +808,17 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	v = database_setting("prolly.history_archive");
 	p->archive = (v && *v) ? v : NULL;
 	if (name == NULL)
+	{
+		hold_hot(NULL, p);
 		return;
+	}
 	if ((v = branch_setting(name, "warm")) != NULL)
 		(void) parse_span(v, &p->keep_time);
 	if ((v = branch_setting(name, "cold_batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
+	hold_hot(name, p);
 }
 
 /* A branch lineage's own setting (value NULL: the database's again). */
@@ -900,6 +899,8 @@ typedef struct Head
 	int64		floor;			/* keeps every commit at least this high */
 	TimestampTz cut;			/* and every commit dated at or after it */
 	int64		min_commits;	/* and its newest this many */
+	bool		standalone;		/* a tag's: kept itself, on a lineage too */
+	bool		on_lineage;		/* another ref's, on a branch's history */
 } Head;
 
 typedef struct Plan
@@ -1026,6 +1027,22 @@ read_refs_node(const ProllyNodeRef *node, uint16 level, void *arg)
  * whatever kind of ref it is, a kind made later too.
  */
 static void
+note_lineage(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **names = arg;
+
+	if (strncmp(name, PROLLY_DETACHED_PREFIX,
+				strlen(PROLLY_DETACHED_PREFIX)) != 0)
+		*names = lappend(*names, pstrdup(name));
+}
+
+static void
+note_kept(const ProllyKeptCommit *k, void *arg)
+{
+	(void) set_add((HTAB *) arg, &k->commit);
+}
+
+static void
 note_refs(Plan *plan)
 {
 	ProllyHash	root;
@@ -1034,27 +1051,49 @@ note_refs(Plan *plan)
 	RefsNamed	rn = {&named};
 	ListCell   *lc;
 
+	HTAB	   *kept = id_set("prolly kept commits", sizeof(ProllyHash));
+
 	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &root);
 	if (root.len == 0)
 		return;
 	ref.hash = root;
 	initStringInfo(&rn.buf);
 	(void) PROLLY_CALL(tree, walk, &tree_env, &ref, read_refs_node, &rn);
+
+	/*
+	 * (the commits a branch's pages are kept as of are its lineage's, its
+	 * window's to keep or cut: no window of their own)
+	 */
+	if (PROLLY_HAS(dc.refs, kept_commits))
+	{
+		List	   *names = NIL;
+
+		PROLLY_CALL(dc.refs, branches, note_lineage, &names);
+		foreach_ptr(char, name, names)
+			PROLLY_CALL(dc.refs, kept_commits, name, note_kept, kept);
+	}
 	foreach(lc, named)
 	{
 		ProllyHash *h = lfirst(lc);
 		ProllyCommitInfo info;
 		ProllyTagInfo tag;
 
-		if (!PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, h))
+		if (set_has(kept, h) ||
+			!PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, h))
 			continue;
 		if (PROLLY_CALL(dc.refs, commit_get, h, &info))
 			add_head(plan, NULL, h);
 		else if (PROLLY_HAS(dc.refs, tag_get) &&
 				 PROLLY_CALL(dc.refs, tag_get, h, &tag))
+		{
 			add_head(plan, NULL, &tag.commit);
+			foreach_ptr(Head, th, plan->heads)
+				if (same_id(&th->head, &tag.commit))
+					th->standalone = true;
+		}
 	}
 	pfree(rn.buf.data);
+	hash_destroy(kept);
 }
 
 /*
@@ -1086,6 +1125,16 @@ note_merge_bases(Plan *plan)
 				continue;		/* (each pair of branches once) */
 			nbases = prolly_history_merge_bases(&a->head, &b->head,
 												lookup_commit, NULL, &bases);
+
+			/*
+			 * (a ref's commit on the branch's history is its own merge
+			 * base: no path to keep for a merge of it)
+			 */
+			if (b->name == NULL && nbases == 1 && same_id(&bases[0], &b->head))
+			{
+				b->on_lineage = true;
+				continue;
+			}
 			for (int k = 0; k < nbases; k++)
 			{
 				PlanCommit *pc = plan_commit(plan, &bases[k]);
@@ -1095,6 +1144,17 @@ note_merge_bases(Plan *plan)
 			}
 		}
 	}
+
+	/*
+	 * A ref's commit on a branch's history, but a tag's, has no window of
+	 * its own: the commits a branch's pages are kept as of, a reader's pin,
+	 * a remote-tracking branch are the branch's lineage, its window's to
+	 * keep or cut (what a ref names a collection keeps whatever the
+	 * horizon says, until the ref lets go of it).  A tag keeps itself.
+	 */
+	foreach_ptr(Head, h, plan->heads)
+		if (h->on_lineage && !h->standalone)
+			plan->heads = foreach_delete_current(plan->heads, h);
 }
 
 static void
@@ -1184,13 +1244,15 @@ head_windows(Plan *plan, const TimestampTz *before)
 		archive_policy(h->name, &p);
 		h->min_commits = p.keep_commits;
 		/*
-		 * (another ref's commit keeps the database's window: with none,
-		 * itself alone, so a branch's own window may cut its lineage)
+		 * (another ref's commit, a tag's, a stash's, a branch's page roots'
+		 * or log's, keeps itself and the database's min_commits: what is
+		 * on a branch's history is that branch's window's to keep, so a
+		 * branch's window narrower than the database's cuts it)
 		 */
-		if (h->name == NULL && p.keep_time == 0 && p.keep_commits == 0)
+		if (h->name == NULL)
 		{
 			h->cut = DT_NOEND;
-			h->min_commits = 1;
+			h->min_commits = Max(p.keep_commits, 1);
 			continue;
 		}
 		if (p.keep_time > 0)
@@ -1593,8 +1655,9 @@ note_head_at(const char *branch, const ProllyHash *commit, void *arg)
 }
 
 /*
- * Send fragment f's chunks to the archive at url (those it lacks), then
- * read every one back from it and re-hash it, before the horizon is moved:
+ * Send fragment f's chunks to the archive at url (those it lacks), name
+ * its tops heads of the archive's, then read every chunk back from it and
+ * re-hash it, before the horizon is moved:
  * an archive that says it has a chunk it doesn't, or holds other bytes
  * under its hash, is found out, and nothing is severed.  Its tops are
  * heads of the archive's (archive_head_name()), so the archive names what
@@ -1620,6 +1683,30 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 
 		sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
 								   f->ntops);
+		/*
+		 * (named first, so the archive keeps what it was sent, its own
+		 * collections too, while it is read back)
+		 */
+		initStringInfo(&format);
+		PROLLY_CALL(dc.canonicalizer, format, &format);
+		for (int t = 0; t < f->ntops; t++)
+		{
+			HeadAt		ha = {archive_head_name(f, t)};
+			ProllyHash	none = {0};
+
+			/* (named already, by a sever of the same fragment rolled back) */
+			PROLLY_CALL(rr, heads, remote, note_head_at, &ha);
+			if (ha.found && ha.commit.len == f->tops[t].len &&
+				memcmp(ha.commit.bytes, f->tops[t].bytes, ha.commit.len) == 0)
+				continue;
+			if (!PROLLY_CALL(rr, move_head, remote, ha.name,
+							 ha.found ? &ha.commit : &none, &f->tops[t],
+							 format.data, true))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not name the history severed in the archive at %s",
+								url)));
+		}
 		rb.hash = prolly_content_hash();
 		rb.wanted = id_set("prolly archive read-back", sizeof(ProllyHash));
 		initStringInfo(&rb.chunk);
@@ -1655,26 +1742,6 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 					 errdetail("Chunk %s, for one, isn't there, or isn't what its hash says.  Nothing is severed.",
 							   prolly_hash_hex(missing))));
 		}
-		initStringInfo(&format);
-		PROLLY_CALL(dc.canonicalizer, format, &format);
-		for (i = 0; i < f->ntops; i++)
-		{
-			HeadAt		ha = {archive_head_name(f, i)};
-			ProllyHash	none = {0};
-
-			/* (named already, by a sever of the same fragment rolled back) */
-			PROLLY_CALL(rr, heads, remote, note_head_at, &ha);
-			if (ha.found && ha.commit.len == f->tops[i].len &&
-				memcmp(ha.commit.bytes, f->tops[i].bytes, ha.commit.len) == 0)
-				continue;
-			if (!PROLLY_CALL(rr, move_head, remote, ha.name,
-							 ha.found ? &ha.commit : &none, &f->tops[i],
-							 format.data, true))
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("could not name the history severed in the archive at %s",
-								url)));
-		}
 	}
 	PG_FINALLY();
 	{
@@ -1682,6 +1749,84 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 	}
 	PG_END_TRY();
 	return sent;
+}
+
+/* How many times a sever plans and archives again, the refs moved. */
+#define SEVER_TRIES		3
+
+/*
+ * Fragment f of plan's severed commits: its dates, identity, digest and
+ * chunks (chunk_list, if wanted), tops and stops.
+ */
+static void
+build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
+			   ProllyWindowFragment *f, List **ids, List **chunk_list,
+			   int *nstops, ProllyHash **stops)
+{
+	ListCell   *lc;
+	ProllyHash *tops;
+	int			ntops = 0;
+	int			i = 0;
+
+	*ids = NIL;
+	*chunk_list = NIL;
+	memset(f, 0, sizeof(*f));
+	f->deleted = (action == PROLLY_WINDOW_DELETE);
+	f->severed_at = GetCurrentTimestamp();
+	f->oldest = DT_NOEND;
+	f->newest = DT_NOBEGIN;
+	foreach(lc, plan->severed)
+	{
+		PlanCommit *pc = lfirst(lc);
+
+		*ids = lappend(*ids, &pc->id);
+		f->oldest = Min(f->oldest, pc->e.committed_at);
+		f->newest = Max(f->newest, pc->e.committed_at);
+	}
+	f->commits = list_length(plan->severed);
+	fragment_root(plan->severed, &f->root);
+	fragment_closure(*ids, &f->digest, &f->chunks, &f->bytes,
+					 want_chunks ? chunk_list : NULL);
+
+	/* its tops: each parent the boundary keeps no more, once */
+	tops = palloc_array(ProllyHash, Max(list_length(plan->edges), 1));
+	{
+		HTAB	   *seen = id_set("prolly fragment tops", sizeof(ProllyHash));
+
+		foreach(lc, plan->edges)
+		{
+			ProllyHash *pair = lfirst(lc);
+
+			if (set_add(seen, &pair[1]))
+				tops[ntops++] = pair[1];
+		}
+		hash_destroy(seen);
+	}
+	f->ntops = ntops;
+	f->tops = tops;
+	*nstops = list_length(plan->stops);
+	*stops = palloc_array(ProllyHash, Max(*nstops, 1));
+	foreach(lc, plan->stops)
+		(*stops)[i++] = *(ProllyHash *) lfirst(lc);
+}
+
+/* Whether two plans' boundary edges are the same. */
+static bool
+same_edges(Plan *a, Plan *b)
+{
+	HTAB	   *seen;
+	bool		same = true;
+
+	if (list_length(a->edges) != list_length(b->edges))
+		return false;
+	seen = id_set("prolly plan edges", 2 * sizeof(ProllyHash));
+	foreach_ptr(ProllyHash, pair, a->edges)
+		(void) set_add(seen, pair);
+	foreach_ptr(ProllyHash, pair, b->edges)
+		if (!set_has(seen, pair))
+			same = false;
+	hash_destroy(seen);
+	return same;
 }
 
 static void
@@ -1692,18 +1837,14 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	ListCell   *lc;
 	List	   *ids = NIL;
 	ProllyWindowFragment f;
-	ProllyHash *tops;
 	ProllyHash *stops;
-	int			ntops;
 	int			nstops;
-	int			i;
 	StringInfoData k;
 	StringInfoData v;
 
 	List	   *chunk_list = NIL;
 	char	   *archive_url = NULL;
 	ProllyWindowPolicy policy;
-	bool		held_refs = false;
 
 	ProllyHash	planned;
 	ProllyHash	held;
@@ -1723,96 +1864,77 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	 * horizon (an archive takes longer, and collections would wait).
 	 */
 	sever_slot_lock();
-	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
-	make_plan(&plan, before);
-	if (plan.severed == NIL)
-		return;
-
-	/* (archive mode with nowhere to archive to: nothing is severed) */
-	if (action == PROLLY_WINDOW_ARCHIVE)
+	for (int tries = 1;; tries++)
 	{
-		if (policy.archive == NULL)
-		{
-			ereport(WARNING,
-					(errmsg("history of database \"%s\" is past its window, but isn't severed: it has no archive",
-							get_database_name(MyDatabaseId)),
-					 errdetail("%d commits are past the window.",
-							   list_length(plan.severed)),
-					 errhint("Set prolly.history_archive for the database (ALTER DATABASE ... SET), or set prolly.history_window_action to delete or none.")));
+		ProllyHash	now;
+
+		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
+		make_plan(&plan, before);
+		if (plan.severed == NIL)
 			return;
-		}
-		archive_url = policy.archive;
-	}
 
-replan:
-	ids = NIL;
-	chunk_list = NIL;
-	memset(&f, 0, sizeof(f));
-	f.deleted = (action == PROLLY_WINDOW_DELETE);
-	f.severed_at = GetCurrentTimestamp();
-	f.oldest = DT_NOEND;
-	f.newest = DT_NOBEGIN;
-	foreach(lc, plan.severed)
-	{
-		PlanCommit *pc = lfirst(lc);
-
-		ids = lappend(ids, &pc->id);
-		f.oldest = Min(f.oldest, pc->e.committed_at);
-		f.newest = Max(f.newest, pc->e.committed_at);
-	}
-	f.commits = list_length(plan.severed);
-	fragment_root(plan.severed, &f.root);
-	fragment_closure(ids, &f.digest, &f.chunks, &f.bytes,
-					 archive_url ? &chunk_list : NULL);
-
-	/* its tops: each parent the boundary keeps no more, once */
-	tops = palloc_array(ProllyHash, Max(list_length(plan.edges), 1));
-	ntops = 0;
-	{
-		HTAB	   *seen = id_set("prolly fragment tops", sizeof(ProllyHash));
-
-		foreach(lc, plan.edges)
+		/* (archive mode with nowhere to archive to: nothing is severed) */
+		if (action == PROLLY_WINDOW_ARCHIVE && archive_url == NULL)
 		{
-			ProllyHash *pair = lfirst(lc);
-
-			if (set_add(seen, &pair[1]))
-				tops[ntops++] = pair[1];
+			if (policy.archive == NULL)
+			{
+				ereport(WARNING,
+						(errmsg("history of database \"%s\" is past its window, but isn't severed: it has no archive",
+								get_database_name(MyDatabaseId)),
+						 errdetail("%d commits are past the window.",
+								   list_length(plan.severed)),
+						 errhint("Set prolly.history_archive for the database (ALTER DATABASE ... SET), or set prolly.history_window_action to delete or none.")));
+				return;
+			}
+			archive_url = policy.archive;
 		}
-		hash_destroy(seen);
-	}
-	f.ntops = ntops;
-	f.tops = tops;
-	nstops = list_length(plan.stops);
-	stops = palloc_array(ProllyHash, Max(nstops, 1));
-	i = 0;
-	foreach(lc, plan.stops)
-		stops[i++] = *(ProllyHash *) lfirst(lc);
+		build_fragment(&plan, action, archive_url != NULL, &f, &ids,
+					   &chunk_list, &nstops, &stops);
+		if (archive_url)
+		{
+			result->sent += archive_fragment(archive_url, &f, chunk_list);
+			f.location = archive_url;
+		}
+		INJECTION_POINT("prolly-sever-planned", NULL);
 
-	if (archive_url)
-	{
-		result->sent += archive_fragment(archive_url, &f, chunk_list);
-		f.location = archive_url;
+		/*
+		 * (the refs moved meanwhile: planned and archived again, still
+		 * holding nothing, a few times; the same fragment's names in the
+		 * archive are the same)
+		 */
+		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &now);
+		if (!same_id(&planned, &now) && tries < SEVER_TRIES)
+			continue;
+		break;
 	}
 
 	/*
-	 * Then the horizon and the refs held, the plan made again if the refs
-	 * moved meanwhile (archived again then: its names are by its content,
-	 * so the same fragment's are the same).
+	 * Then the horizon and the refs held, only to check the plan and
+	 * record it: if the refs moved since it was made, planned again (a
+	 * walk, not the fragment's chunks), and the fragment must be the one
+	 * archived.
 	 */
-	if (!held_refs)
+	horizon_lock(ExclusiveLock);
+	PROLLY_CALL(dc.refs, lock);
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &held);
+	if (!same_id(&planned, &held))
 	{
-		horizon_lock(ExclusiveLock);
-		INJECTION_POINT("prolly-sever-planned", NULL);
-		PROLLY_CALL(dc.refs, lock);
-		held_refs = true;
-		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &held);
-		if (!same_id(&planned, &held))
-		{
-			make_plan(&plan, before);
-			if (plan.severed == NIL)
-				return;
-			goto replan;
-		}
+		Plan		again;
+		ProllyHash	root;
+
+		make_plan(&again, before);
+		if (again.severed == NIL)
+			return;
+		fragment_root(again.severed, &root);
+		if (!same_id(&root, &f.root) || !same_edges(&again, &plan))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("the history of database \"%s\" moved while it was severed",
+							get_database_name(MyDatabaseId)),
+					 errdetail("Its commits past the window changed %d times while it was planned and archived.  Nothing is severed.",
+							   SEVER_TRIES),
+					 errhint("Sever again.")));
+		plan = again;
 	}
 	f.number = next_number();
 	initStringInfo(&k);

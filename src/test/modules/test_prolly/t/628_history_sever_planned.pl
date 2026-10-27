@@ -1,8 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A sever plans holding no ref: a commit on another branch while it plans
-# doesn't wait for it.  Holding the refs, it plans again if they moved
-# meanwhile, so what the commit made is kept.
+# A sever plans, and archives, holding no ref: a commit while it does
+# doesn't wait for it.  The refs moved meanwhile, it plans (and archives)
+# again, still holding none; then, holding them, it only checks the plan
+# and records it, so what the commit made is kept.
 
 use strict;
 use warnings FATAL => 'all';
@@ -63,5 +64,49 @@ is(sql(q{SELECT count(*) FROM prolly_history_horizon()}), '0',
 is(sql(q{SET client_min_messages = warning;
 	SELECT count(*) FROM dolt_log('side')}), '2',
 	'side keeps its history');
+
+# Archived: a commit on main while the sever is between its archive and
+# its locks doesn't wait for it either.  The refs moved, so the sever
+# plans and archives again, holding nothing still, and then records the
+# fragment, the same one (its names in the archive by its content).
+my $arch = PostgreSQL::Test::Utils::tempdir() . '/archive';
+sql(qq{SELECT dolt_branch('-D', 'side');
+	ALTER DATABASE sp SET prolly.history_warm = '1 day';
+	ALTER DATABASE sp SET prolly.history_archive = 'file://$arch'});
+$sever = $node->background_psql('sp', on_error_stop => 0);
+$sever->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-sever-planned', 'wait')});
+$sever->query_until(qr/started/, q{\echo started
+SELECT fragment > 0 AS archived FROM dolt_history_sever();
+\echo severed
+});
+$node->poll_query_until('sp', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-sever-planned'})
+  or die 'the sever did not stop after archiving';
+$c = sql(q{SET statement_timeout = '10s';
+	UPDATE sp.t SET v = 'main now' WHERE id = 2;
+	SELECT trim(both '{}' from dolt_commit('-am', 'main now')::text)});
+$c = (split /\n/, $c)[-1];
+like($c, qr/^[0-9a-f]{40}$/, 'a commit while the sever archives goes through');
+# (woken, it stops there again after archiving again; woken again, on)
+sql(q{SELECT injection_points_wakeup('prolly-sever-planned')});
+$node->poll_query_until('sp', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-sever-planned'})
+  or die 'the sever did not plan and archive again';
+pass('the refs moved: planned and archived again, holding nothing');
+for (1 .. 20)
+{
+	last if sql(q{SELECT count(*) FROM pg_stat_activity
+		WHERE wait_event = 'prolly-sever-planned'}) eq '0';
+	sql(q{SELECT injection_points_wakeup('prolly-sever-planned')});
+	sleep(1);
+}
+$sever->query_until(qr/severed/, '');
+$sever->quit;
+is(sql(q{SELECT count(*) FROM prolly_history_horizon() WHERE state = 'archived'}), '1',
+	'archived and severed, planned again past the commit');
+is(sql(q{SET client_min_messages = warning;
+	SELECT count(*) FROM dolt_log('main') WHERE message = 'main now'}), '1',
+	'the commit is kept');
 
 done_testing();

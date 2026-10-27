@@ -203,6 +203,36 @@ SELECT kind, count(*) FROM prolly_history_plan(NULL) GROUP BY kind ORDER BY kind
 \c regress_history_window
 DROP DATABASE regress_history_window_c;
 
+-- A branch's window narrower than the database's cuts the branch's own
+-- history: what else names its commits (its page roots, its log, a
+-- tracking branch) keeps only those, not the database's window.  And the
+-- warm window is never shorter than prolly.history_hot.
+CREATE DATABASE regress_history_window_d;
+\c regress_history_window_d
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'a10');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a8';
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a1';
+SELECT length(dolt_commit('-am', 'a1', '--date', (now() - interval '1 day')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a0';
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_d SET prolly.history_warm = '9 days';
+SELECT dolt_history_window('main', 'warm', '3 days');
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+ORDER BY 1, 2;
+ALTER DATABASE regress_history_window_d SET prolly.history_hot = '9 days';
+\c regress_history_window_d
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+ORDER BY 1, 2;
+SELECT warm FROM prolly_history_policy('main');
+\c regress_history_window
+DROP DATABASE regress_history_window_d;
+
 \c :home
 DROP DATABASE regress_history_window;
 DROP ROLE regress_hw_other;
