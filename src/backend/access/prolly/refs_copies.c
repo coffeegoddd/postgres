@@ -3979,9 +3979,13 @@ static bool kept_storage_unneeded(const KeptCommit *kc);
  * waits out.  The refs change with their transactions: a retiring the refs
  * show is one that committed, or this transaction's own (or one of its
  * subtransactions', whose ids follow its own).  So no transaction's status
- * is asked, which, long ago, may be gone.  Storage a restore replaced
- * (kept_is_storage()) is let go of only once no snapshot is older than
- * the move too (kept_storage_unneeded()).
+ * is asked, which, long ago, may be gone.  One this transaction both
+ * kept and retired (an earlier commit of the transaction's own) no other
+ * ever saw, so it is let go of at once: otherwise a transaction making
+ * many commits would fill its relations' snapshot slots with them, and
+ * its last commit, the head a reset gives back, couldn't be kept.
+ * Storage a restore replaced (kept_is_storage()) is let go of only once
+ * no snapshot is older than the move too (kept_storage_unneeded()).
  */
 static bool
 kept_releasable(const KeptCommit *kc)
@@ -3990,7 +3994,9 @@ kept_releasable(const KeptCommit *kc)
 
 	return FullTransactionIdIsValid(kc->retired) &&
 		(!FullTransactionIdIsValid(top) ||
-		 FullTransactionIdPrecedes(kc->retired, top)) &&
+		 FullTransactionIdPrecedes(kc->retired, top) ||
+		 (FullTransactionIdEquals(kc->retired, top) &&
+		  FullTransactionIdEquals(kc->kept_by, top))) &&
 		(!kept_is_storage(kc) || kept_storage_unneeded(kc));
 }
 

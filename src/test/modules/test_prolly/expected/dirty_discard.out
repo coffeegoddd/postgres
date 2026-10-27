@@ -208,5 +208,53 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
  t        |       0 |      0 | t       | t
 (1 row)
 
+-- The head made by a transaction of many commits (more than a relation
+-- keeps snapshots: those the transaction's own commits kept and retired
+-- are let go of as it goes, nobody else having seen them): kept all the
+-- same, so a reset of a dirty working set to it gives its pages back.
+CREATE FUNCTION history(n int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+	FOR r IN 1..n LOOP
+		UPDATE dd.t SET v = r WHERE id % 400 = 0;
+		PERFORM dolt_commit('-am', 'h' || r);
+	END LOOP;
+	RETURN n;
+END
+$$;
+SELECT history(20) AS commits;
+ commits 
+---------
+      20
+(1 row)
+
+SELECT t_digest() AS at_head \gset
+UPDATE dd.t SET v = -3 WHERE id % 3 = 0;
+:flush
+ flushed 
+---------
+ f
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+:flush
+ flushed 
+---------
+ f
+(1 row)
+
+SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
+	   (since(:'before') ->> 'apply_rows')::int AS applied,
+	   t_digest() = :'at_head' AS at_head, clean();
+ restored | applied | at_head | clean 
+----------+---------+---------+-------
+ t        |       0 | t       | t
+(1 row)
+
 \c :home
 DROP DATABASE dirty_discard;
