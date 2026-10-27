@@ -6,6 +6,7 @@
 \getenv abs_builddir PG_ABS_BUILDDIR
 \set dir :abs_builddir '/tmp_check/history_window'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+SELECT 'liar://' || :'dir' || '/' || txid_current() || '_liar' AS liar_url \gset
 SELECT current_database() AS home \gset
 \set VERBOSITY terse
 CREATE DATABASE regress_history_window;
@@ -16,7 +17,7 @@ BEGIN
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
 	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
-						  'file://[^ ]*', '<url>', 'g');
+						  '(file|liar)://[^ ]*', '<url>', 'g');
 END $$;
 CREATE SCHEMA hw VERSIONED;
 CREATE TABLE hw.t (id int PRIMARY KEY, v text);
@@ -182,27 +183,64 @@ SELECT count(*) AS fragments FROM prolly_history_horizon();
          0
 (1 row)
 
--- Archived: sent to the archive, found whole there, then severed.
-SELECT dolt_remote('add', 'archive', :'url');
+-- The archive is a URL: a remote's name, which others may move, isn't.
+SELECT hw_err($$ALTER DATABASE regress_history_window SET prolly.history_archive = 'archive'$$) AS not_a_url;
+                            not_a_url                            
+-----------------------------------------------------------------
+ invalid value for parameter "prolly.history_archive": "archive"
+(1 row)
+
+-- An archive that says it has what it was sent, and keeps none of it, is
+-- found out by reading it back: nothing is severed.
+LOAD 'test_prolly';
+ALTER DATABASE regress_history_window SET prolly.history_archive = :'liar_url';
+SELECT hw_err('SELECT * FROM dolt_history_sever()') AS lying_archive;
+                                  lying_archive                                  
+---------------------------------------------------------------------------------
+ the archive at <url> doesn't give back 4 of the 4 chunks of the history severed
+(1 row)
+
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+ fragments 
+-----------
+         0
+(1 row)
+
+-- Archived: sent to the archive, read back whole from it, then severed.
+-- A remote of the archive's name, moved by anyone, changes nothing.
+ALTER DATABASE regress_history_window SET prolly.history_archive = :'url';
+GRANT pg_prolly_write TO regress_hw_other;
+SET ROLE regress_hw_other;
+SELECT dolt_remote('add', 'archive', 'file:///elsewhere');
  dolt_remote 
 -------------
  {0}
 (1 row)
 
-ALTER DATABASE regress_history_window SET prolly.history_archive = 'archive';
+RESET ROLE;
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
  collected 
 -----------
  t
 (1 row)
 
+-- (a sever rolled back leaves names in the archive; made again, it names
+-- the same fragment the same)
+BEGIN;
+SELECT fragment, commits FROM dolt_history_sever();
+ fragment | commits 
+----------+---------
+        1 |       1
+(1 row)
+
+ROLLBACK;
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent > 0 AS sent
+	   sent AS sent_again
 FROM dolt_history_sever();
- action  | fragment | commits | boundary | sent 
----------+----------+---------+----------+------
- archive |        1 |       1 | {a8}     | t
+ action  | fragment | commits | boundary | sent_again 
+---------+----------+---------+----------+------------
+ archive |        1 |       1 | {a8}     |          0
 (1 row)
 
 SELECT fragment, state, commits, location = :'url' AS archived_there,
@@ -305,6 +343,49 @@ WHERE id = 1;
  a8
 (1 row)
 
+-- Another database archiving to the same archive names its own.
+CREATE DATABASE regress_history_window_b;
+\c regress_history_window_b
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'b');
+SELECT length(dolt_commit('-Am', 'b1', '--date', '2020-01-01')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'b2';
+SELECT length(dolt_commit('-am', 'b2', '--date', '2020-01-02')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'b3';
+SELECT length(dolt_commit('-am', 'b3', '--date', '2020-01-03')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'b4';
+SELECT length(dolt_commit('-am', 'b4', '--date', '2020-01-04')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER DATABASE regress_history_window_b SET prolly.history_warm = '1 hour';
+ALTER DATABASE regress_history_window_b SET prolly.history_archive = :'url';
+SELECT action, fragment > 0 AS archived, commits FROM dolt_history_sever();
+ action  | archived | commits 
+---------+----------+---------
+ archive | t        |       1
+(1 row)
+
+\c regress_history_window
+DROP DATABASE regress_history_window_b;
 -- Deleted, as the database says: nothing archived, the horizon notes it.
 ALTER DATABASE regress_history_window SET prolly.history_window_action = delete;
 SELECT action, fragment, commits,
@@ -339,6 +420,71 @@ SELECT action, fragment, commits FROM dolt_history_sever();
  none   |          |       0
 (1 row)
 
+-- A branch's own window, with none for the database, cuts its lineage
+-- (a branch's own commits are above its merge bases with the others, which
+-- keep the paths to them: what a branch's window cuts is what every
+-- lineage that reaches it lets go of).
+CREATE DATABASE regress_history_window_c;
+\c regress_history_window_c
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'c');
+SELECT length(dolt_commit('-Am', 'c1', '--date', '2020-01-01')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'c2';
+SELECT length(dolt_commit('-am', 'c2', '--date', '2020-01-02')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'c3';
+SELECT length(dolt_commit('-am', 'c3', '--date', '2020-01-03')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'c4';
+SELECT length(dolt_commit('-am', 'c4', '--date', '2020-01-04')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'c5';
+SELECT length(dolt_commit('-am', 'c5', '--date', '2020-01-05')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS planned_without FROM prolly_history_plan(NULL);
+ planned_without 
+-----------------
+               0
+(1 row)
+
+SELECT dolt_history_window('main', 'warm', '1 hour');
+ dolt_history_window 
+---------------------
+ 
+(1 row)
+
+SELECT kind, count(*) FROM prolly_history_plan(NULL) GROUP BY kind ORDER BY kind;
+   kind   | count 
+----------+-------
+ boundary |     1
+ pinned   |     2
+ severed  |     2
+(3 rows)
+
+\c regress_history_window
+DROP DATABASE regress_history_window_c;
 \c :home
 DROP DATABASE regress_history_window;
 DROP ROLE regress_hw_other;
