@@ -211,6 +211,7 @@ tests += {
       'generations_retire',
       'generations_retire_guard',
       'generations_retire_sever',
+      'generations_retire_roots',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

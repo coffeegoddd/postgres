@@ -1,9 +1,9 @@
--- A repair settles a fragment's top only in a generation its boundary
--- commits' files can name it from: as new as theirs, or listed by theirs.
--- A retire relies on it (it reads only the sections of the files it
--- doesn't collect, and every chunk of the files a repair wrote).  Here the
--- older of two fragments is repaired, on purpose, into a generation newer
--- than the file of the boundary commit naming its top: refused.
+-- A repair settles a severed commit's data only in a generation the
+-- commit's file can name it from: as new as its own, or listed by it.  A
+-- retire relies on it (it reads only the sections of the files it doesn't
+-- collect, and every chunk of the files a repair wrote).  Here the older
+-- of two fragments is repaired, on purpose, into a generation newer than
+-- the files of the commits naming its data: refused.
 \getenv abs_builddir PG_ABS_BUILDDIR
 \set dir :abs_builddir '/tmp_check/generations_retire_guard'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
@@ -115,13 +115,13 @@ SELECT dolt_history_repair('origin', 1) AS repaired;
 (1 row)
 
 -- The older fragment repaired into a new generation, as a wrong settle
--- would: refused, nothing settled, as the boundary commit naming its top
--- is older.  (The check of generations off, as outside assert builds.)
+-- would: refused, nothing settled, as the commit naming its data is
+-- older.  (The check of generations off, as outside assert builds.)
 SET debug_prolly_verify_generations = off;
 SELECT test_chunk_generation() + 5 AS wrong \gset
 SET debug_prolly_settle_epoch = :wrong;
 SELECT dolt_history_repair('origin') AS repaired;
-ERROR:  chunk 688d000cc320e36107933a0131353efd10525261 would be settled in generations 8 to 8, which chunk 879756319c4d5db86becdc063e215b0ec06d624e naming it, of generations 1 to 1, doesn't list it by
+ERROR:  chunk f3040220054968fc7999b415f8048eb9f94e0085 would be settled in generations 8 to 8, which chunk 688d000cc320e36107933a0131353efd10525261 naming it, of generations 1 to 1, doesn't list it by
 RESET debug_prolly_settle_epoch;
 SELECT count(*) AS fragments FROM prolly_history_horizon();
  fragments 
@@ -136,10 +136,9 @@ SELECT kept >= 0 AS retired FROM test_chunk_retire(:wrong, :wrong);
 (1 row)
 
 SELECT count(*) AS commits FROM dolt_log('main');
-NOTICE:  history stops at the history horizon
  commits 
 ---------
-       4
+       6
 (1 row)
 
 -- Then repaired as it should be, and its generations retired, and every

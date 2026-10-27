@@ -382,7 +382,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- generations (or not settled) its chunks name.
 CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
 	OUT settled boolean, OUT epoch_lo bigint, OUT epoch_hi bigint,
-	OUT garbage bigint, OUT xrefs bigint)
+	OUT garbage bigint, OUT xrefs bigint, OUT repaired boolean)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 

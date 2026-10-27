@@ -302,6 +302,8 @@ typedef struct ProllyChunkGeneration
 	uint32		epoch_hi;
 	uint32		garbage;
 	int64		xrefs;
+	bool		repaired;		/* of history a repair put back, not yet
+								 * rewritten by a collection */
 } ProllyChunkGeneration;
 
 typedef void (*ProllyChunkGenerationVisit) (const ProllyChunkGeneration *g,

@@ -4177,28 +4177,23 @@ typedef struct SettleAbsent
 {
 	List	   *records;		/* FragmentRecord *: the horizon's */
 	FragmentRecord *repairing;
-	List	   *edges;			/* StringInfo: its edges' keys */
+	int			nroots;
+	ProllyHash *roots;			/* its commits' data: the roots settled */
+	ProllyHash *commits;		/* and the commit naming each */
 } SettleAbsent;
 
-/* The boundary commits naming a fragment's top (its edges' parent). */
+/* The commits naming a severed commit's data (its tree or dependencies). */
 static int
 settle_named_by(void *arg, const ProllyHash *root, ProllyHash **by)
 {
 	SettleAbsent *sa = arg;
 	int			n = 0;
 
-	*by = palloc_array(ProllyHash, Max(list_length(sa->edges), 1));
-	foreach_ptr(StringInfoData, ek, sa->edges)
+	*by = palloc_array(ProllyHash, Max(sa->nroots, 1));
+	for (int i = 0; i < sa->nroots; i++)
 	{
-		ProllyHash	parent;
-		ProllyHash	boundary;
-		const char *p = ek->data + 1;
-		const char *end = ek->data + ek->len;
-
-		p = get_id(p, end, &parent);
-		(void) get_id(p, end, &boundary);
-		if (same_hash(&parent, root))
-			(*by)[n++] = boundary;
+		if (same_hash(&sa->roots[i], root))
+			(*by)[n++] = sa->commits[i];
 	}
 	return n;
 }
@@ -4363,33 +4358,46 @@ archive_repair(const char *source, int nfragments)
 							   prolly_hash_hex(&r->f.digest))));
 
 		/* (its commits' data back) */
-		foreach_ptr(PlanCommit, pc, commits)
 		{
-			ProllyCommitInfo info;
+			int			max = 2 * Max(list_length(commits), 1);
+			ProllyHash *data_roots = palloc_array(ProllyHash, max);
+			ProllyHash *namers = palloc_array(ProllyHash, max);
+			int			ndata = 0;
 
-			if (PROLLY_CALL(dc.refs, commit_get, &pc->id, &info))
+			foreach_ptr(PlanCommit, pc, commits)
+			{
+				ProllyCommitInfo info;
+
+				if (!PROLLY_CALL(dc.refs, commit_get, &pc->id, &info))
+					continue;
 				severed_drop(&pc->id, &info);
+				data_roots[ndata] = info.root.hash;
+				namers[ndata++] = pc->id;
+				if (info.has_dependencies)
+				{
+					data_roots[ndata] = info.dependencies.hash;
+					namers[ndata++] = pc->id;
+				}
+			}
+
+			/*
+			 * Verified, settled: the commits, kept in settled files, name
+			 * the data received, and a default collection doesn't read
+			 * settled files.  Each tree goes back to the generation its
+			 * commit's file lists it by.
+			 */
+			if (PROLLY_HAS(tree_env.chunk_store, settle))
+			{
+				SettleAbsent sa = {records, r, ndata, data_roots, namers};
+
+				PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
+							data_roots, NULL, ndata,
+							settle_absent, settle_named_by, &sa);
+			}
+			pfree(data_roots);
+			pfree(namers);
 		}
 
-		/*
-		 * Verified, settled: the boundary commits, in settled files, name
-		 * what was received, and a default collection doesn't read
-		 * settled files.
-		 */
-		if (PROLLY_HAS(tree_env.chunk_store, settle))
-		{
-			EdgesOf		se = {r->f.number, NIL};
-			char		se_key = KEY_EDGE;
-			ProllyKey	se_from = {(const uint8 *) &se_key, 1};
-			SettleAbsent sa = {records, r, NIL};
-
-			PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &se_from,
-						ForwardScanDirection, collect_edge_of, &se);
-			sa.edges = se.keys;
-			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
-						r->f.tops, r->top_epochs, r->f.ntops,
-						settle_absent, settle_named_by, &sa);
-		}
 
 		/*
 		 * (its edges and record let go of: the boundary keeps its parents;

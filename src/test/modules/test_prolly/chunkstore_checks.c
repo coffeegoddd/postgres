@@ -549,8 +549,8 @@ static void
 generation_row(const ProllyChunkGeneration *g, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[7];
-	bool		nulls[7] = {0};
+	Datum		values[8];
+	bool		nulls[8] = {0};
 
 	values[0] = CStringGetTextDatum(g->name);
 	values[1] = Int32GetDatum((int32) g->nchunks);
@@ -559,6 +559,7 @@ generation_row(const ProllyChunkGeneration *g, void *arg)
 	values[4] = Int64GetDatum((int64) g->epoch_hi);
 	values[5] = Int64GetDatum((int64) g->garbage);
 	values[6] = Int64GetDatum(g->xrefs);
+	values[7] = BoolGetDatum(g->repaired);
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 

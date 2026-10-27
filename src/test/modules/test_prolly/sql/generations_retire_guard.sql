@@ -1,9 +1,9 @@
--- A repair settles a fragment's top only in a generation its boundary
--- commits' files can name it from: as new as theirs, or listed by theirs.
--- A retire relies on it (it reads only the sections of the files it
--- doesn't collect, and every chunk of the files a repair wrote).  Here the
--- older of two fragments is repaired, on purpose, into a generation newer
--- than the file of the boundary commit naming its top: refused.
+-- A repair settles a severed commit's data only in a generation the
+-- commit's file can name it from: as new as its own, or listed by it.  A
+-- retire relies on it (it reads only the sections of the files it doesn't
+-- collect, and every chunk of the files a repair wrote).  Here the older
+-- of two fragments is repaired, on purpose, into a generation newer than
+-- the files of the commits naming its data: refused.
 \getenv abs_builddir PG_ABS_BUILDDIR
 \set dir :abs_builddir '/tmp_check/generations_retire_guard'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
@@ -41,8 +41,8 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT dolt_history_repair('origin', 1) AS repaired;
 
 -- The older fragment repaired into a new generation, as a wrong settle
--- would: refused, nothing settled, as the boundary commit naming its top
--- is older.  (The check of generations off, as outside assert builds.)
+-- would: refused, nothing settled, as the commit naming its data is
+-- older.  (The check of generations off, as outside assert builds.)
 SET debug_prolly_verify_generations = off;
 SELECT test_chunk_generation() + 5 AS wrong \gset
 SET debug_prolly_settle_epoch = :wrong;

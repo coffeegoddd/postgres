@@ -170,6 +170,12 @@ SELECT test_chunk_verify_generations() > 0 AS generations;
  t
 (1 row)
 
+SELECT count(*) > 0 AS repaired_files FROM test_chunk_generations() WHERE repaired;
+ repaired_files 
+----------------
+ t
+(1 row)
+
 SELECT count(*) AS commits FROM dolt_log('main');
  commits 
 ---------
@@ -198,6 +204,13 @@ SELECT test_chunk_verify_generations() > 0 AS generations;
  generations 
 -------------
  t
+(1 row)
+
+-- (rewritten by the full collection: no longer read whole by a retire)
+SELECT count(*) AS repaired_files FROM test_chunk_generations() WHERE repaired;
+ repaired_files 
+----------------
+              0
 (1 row)
 
 SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
