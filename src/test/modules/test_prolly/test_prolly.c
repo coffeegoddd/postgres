@@ -517,6 +517,86 @@ static const ProllyRemoteRoutine test_liar_remote = {
 };
 
 /*
+ * A slow remote, test only: "slow://path" is the file remote at path, but
+ * each chunk it takes takes four tenths of a second.  For a sever's
+ * time limit, which is one without progress, not one in all.
+ */
+static ProllyRemote *
+slow_open(const char *url, bool create)
+{
+	if (strncmp(url, "slow://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a slow remote's URL", url)));
+	return liar_file()->open(psprintf("file://%s", url + 7), create);
+}
+
+static void
+slow_check_url(const char *url)
+{
+	if (strncmp(url, "slow://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a slow remote's URL", url)));
+}
+
+typedef struct SlowNext
+{
+	ProllyChunkNext next;
+	void	   *arg;
+} SlowNext;
+
+static bool
+slow_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	SlowNext   *sn = arg;
+
+	pg_usleep(400000);
+	CHECK_FOR_INTERRUPTS();
+	return sn->next(sn->arg, hash, data);
+}
+
+static void
+slow_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	SlowNext	sn = {next, arg};
+
+	liar_file()->add_chunks(r, slow_next, &sn);
+}
+
+static bool
+slow_has(ProllyRemote *r, const ProllyHash *hash)
+{
+	return liar_file()->has(r, hash);
+}
+
+static void
+slow_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	liar_file()->has_many(r, hashes, n, has);
+}
+
+static const ProllyRemoteRoutine test_slow_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9005,
+		.name = "slow",
+		.description = "test only: a file remote four tenths of a second a chunk",
+	},
+	.check_url = slow_check_url,
+	.open = slow_open,
+	.close = liar_close,
+	.format = liar_format,
+	.heads = liar_heads,
+	.get = liar_get,
+	.has = slow_has,
+	.add_chunks = slow_add_chunks,
+	.move_head = liar_move_head,
+	.get_many = liar_get_many,
+	.has_many = slow_has_many,
+};
+
+/*
  * A remote that never answers, test only: "stall://..." opens by waiting,
  * interruptibly, for ever.  For a sever's time limit on its archive.
  */
@@ -566,6 +646,7 @@ _PG_init(void)
 	prolly_register_impl(&test_broken_hash.info);
 	prolly_register_impl(&test_liar_remote.info);
 	prolly_register_impl(&test_stall_remote.info);
+	prolly_register_impl(&test_slow_remote.info);
 }
 
 /* ------------------------------------------------------------------------
