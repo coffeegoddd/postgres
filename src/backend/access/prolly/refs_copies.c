@@ -6171,29 +6171,24 @@ kept_serves_move(const KeptCommit *kc)
 	return true;
 }
 
-static bool heads_at(const char *name, const ProllyHash *commit, bool all,
-					 List **names);
 
 /*
- * Does a branch but name whose head is at commit keep its pages, frozen
- * so that a move can be given them (kept_serves_move()), held against its
- * own keeps and passes until the transaction ends?  Each branch the index
- * of heads' roots names at commit is tried (a seek of its entries by the
- * commit's height), never waited for (one in a keeping transaction now is
- * passed over: its pass may be letting go of its own), and its entry read
- * again once held.  So two branches' passes
+ * Does a branch but name keep commit's pages, frozen so that a move can
+ * be given them (kept_serves_move()), held against its own keeps and
+ * passes until the transaction ends?  Each branch keeping any is tried (a
+ * seek of its entries by the commit's height; asked only of a root out of
+ * its window that another branch's head is at), never waited for (one in
+ * a keeping transaction now is passed over: its pass may be letting go of
+ * its own), and its entry read again once held.  So two branches' passes
  * can't each let go of their root on the strength of the other's: the
  * second waits for the first's branch, and finds its entry retired.
  */
 static bool
 kept_by_other(const char *name, const ProllyHash *commit)
 {
-	List	   *others = NIL;
-
-	(void) heads_at(name, commit, true, &others);
-	foreach_ptr(char, other, others)
+	foreach_ptr(char, other, kept_branches())
 	{
-		if (!try_lock_branch(other, true))
+		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
 			continue;
 		if (kept_serves_move(kept_lookup(other, commit, false)))
 		{
@@ -6211,8 +6206,6 @@ typedef struct HeadAt
 	const ProllyHash *commit;
 	int			prefix_len;
 	bool		found;
-	bool		all;			/* every one, into names */
-	List	   *names;
 } HeadAt;
 
 static bool
@@ -6226,27 +6219,22 @@ note_head_at(const ProllyKey *k, const ProllyValue *v, void *arg)
 
 	if (strcmp(other, ha->name) != 0 && branch_head(other, &head) &&
 		same_hash(&head, ha->commit))
-	{
 		ha->found = true;
-		if (ha->all)
-			ha->names = lappend(ha->names, pstrdup(other));
-	}
 	pfree(other);
-	return ha->all || !ha->found;
+	return !ha->found;
 }
 
 /*
- * The branches but name (NULL: none passed over) whose heads are at commit
- * (all: every one, into *names; else whether any is).  A seek of the index
- * of heads' roots, at commit's root: only the branches whose heads have
- * that root are read.
+ * Is another branch than name's head at commit?  A seek of the index of
+ * heads' roots, at commit's root: only the branches whose heads have that
+ * root are read.
  */
 static bool
-heads_at(const char *name, const ProllyHash *commit, bool all, List **names)
+head_elsewhere(const char *name, const ProllyHash *commit)
 {
 	StringInfoData prefix;
 	ProllyHash	root;
-	HeadAt		ha = {name ? name : "", commit, 0, false, all, NIL};
+	HeadAt		ha = {name, commit, 0, false};
 
 	if (!head_commit_root(commit, &root))
 		return false;
@@ -6257,16 +6245,7 @@ heads_at(const char *name, const ProllyHash *commit, bool all, List **names)
 	ha.prefix_len = prefix.len;
 	visit_prefix_while(prefix.data, prefix.len, false, note_head_at, &ha);
 	pfree(prefix.data);
-	if (names)
-		*names = ha.names;
 	return ha.found;
-}
-
-/* Is another branch than name's head at commit? */
-static bool
-head_elsewhere(const char *name, const ProllyHash *commit)
-{
-	return heads_at(name, commit, false, NULL);
 }
 
 /* Does a tag name commit (a seek of the tags' index)? */
