@@ -30,6 +30,7 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "access/prolly_remote.h"
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -401,11 +402,123 @@ static const ProllyHashRoutine test_broken_hash = {
 	.finish = fnv_finish,
 };
 
+/*
+ * A remote that lies, test only: "liar://path" is the file remote at path,
+ * but it says it has every chunk, and keeps none it is sent.  Its heads
+ * and what it already held are the file remote's.  For an archive's
+ * check that it gives back what it was sent.
+ */
+static const ProllyRemoteRoutine *
+liar_file(void)
+{
+	return prolly_remote_for_url("file:///");
+}
+
+static void
+liar_check_url(const char *url)
+{
+	if (strncmp(url, "liar://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a liar remote's URL", url)));
+}
+
+static ProllyRemote *
+liar_open(const char *url, bool create)
+{
+	liar_check_url(url);
+	return liar_file()->open(psprintf("file://%s", url + 7), create);
+}
+
+static void
+liar_close(ProllyRemote *r)
+{
+	liar_file()->close(r);
+}
+
+static void
+liar_format(ProllyRemote *r, StringInfo out)
+{
+	liar_file()->format(r, out);
+}
+
+static void
+liar_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
+{
+	liar_file()->heads(r, visit, arg);
+}
+
+static bool
+liar_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
+{
+	return liar_file()->get(r, hash, out);
+}
+
+static bool
+liar_has(ProllyRemote *r, const ProllyHash *hash)
+{
+	return true;
+}
+
+static void
+liar_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	for (int i = 0; i < n; i++)
+		has[i] = true;
+}
+
+static void
+liar_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	ProllyHash	h;
+	StringInfoData data;
+
+	initStringInfo(&data);
+	while (next(arg, &h, &data))
+		resetStringInfo(&data);
+	pfree(data.data);
+}
+
+static bool
+liar_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
+			   const ProllyHash *head, const char *format, bool force)
+{
+	return liar_file()->move_head(r, branch, expected, head, format, force);
+}
+
+static void
+liar_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
+			  ProllyRemoteChunkVisit visit, void *arg)
+{
+	liar_file()->get_many(r, hashes, n, visit, arg);
+}
+
+static const ProllyRemoteRoutine test_liar_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9003,
+		.name = "liar",
+		.description = "test only: a file remote that says it has every chunk and keeps none",
+	},
+	.check_url = liar_check_url,
+	.open = liar_open,
+	.close = liar_close,
+	.format = liar_format,
+	.heads = liar_heads,
+	.get = liar_get,
+	.has = liar_has,
+	.add_chunks = liar_add_chunks,
+	.move_head = liar_move_head,
+	.get_many = liar_get_many,
+	.has_many = liar_has_many,
+};
+
 void
 _PG_init(void)
 {
 	prolly_register_impl(&test_fnv_hash.info);
 	prolly_register_impl(&test_broken_hash.info);
+	prolly_register_impl(&test_liar_remote.info);
 }
 
 /* ------------------------------------------------------------------------
