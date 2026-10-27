@@ -77,6 +77,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -1246,6 +1247,28 @@ make_plan(Plan *plan, const TimestampTz *before)
 	hash_destroy(fragment);
 }
 
+/*
+ * A plan made holding no ref (it walks the windows and searches the merge
+ * bases, which take a while, and commits on every branch would wait),
+ * then every ref held: made again only if the refs moved meanwhile (the
+ * store's root, which every change of them moves).  The caller holds the
+ * horizon's lock, so the horizon doesn't move.
+ */
+static void
+plan_then_hold(Plan *plan, const TimestampTz *before)
+{
+	ProllyHash	planned;
+	ProllyHash	held;
+
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
+	make_plan(plan, before);
+	INJECTION_POINT("prolly-sever-planned", NULL);
+	PROLLY_CALL(dc.refs, lock);
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &held);
+	if (!same_id(&planned, &held))
+		make_plan(plan, before);
+}
+
 static void
 archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 {
@@ -1559,8 +1582,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	PreventCommandIfReadOnly("severing history");
 	archive_policy(NULL, &policy);
 	horizon_lock(ExclusiveLock);
-	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, before);
+	plan_then_hold(&plan, before);
 	if (plan.severed == NIL)
 		return;
 
@@ -1875,11 +1897,15 @@ archive_repair(const char *source, int nfragments)
 	PreventCommandIfReadOnly("repairing history");
 
 	/*
-	 * Received first, holding nothing (a transfer may take long), each
-	 * fragment down to its stops: an older fragment's tops are not
-	 * received, so a source that has only this one serves it, and the
-	 * horizon goes on cutting there.
+	 * Received first, holding the horizon's lock but not the refs (a
+	 * transfer may take long; the horizon's lock blocks only collections
+	 * and severs), each fragment down to its stops: an older fragment's
+	 * tops are not received, so a source that has only this one serves
+	 * it, and the horizon goes on cutting there.  The horizon's lock comes
+	 * first, before the chunk store's that a receive takes to the end of
+	 * the transaction, as a collection takes them.
 	 */
+	horizon_lock(ExclusiveLock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, r, records)
 	{
@@ -1916,8 +1942,8 @@ archive_repair(const char *source, int nfragments)
 		urls = lappend(urls, url);
 	}
 
-	/* then verified, and let go of, holding the horizon and the refs */
-	horizon_lock(ExclusiveLock);
+	/* then verified, and let go of, holding the refs too */
+	INJECTION_POINT("prolly-repair-received", NULL);
 	PROLLY_CALL(dc.refs, lock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, c, chosen)
