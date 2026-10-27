@@ -68,7 +68,8 @@ SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL) AS indexes_valid
 FROM pg_index WHERE indrelid IN ('fk.t'::regclass, 'fk.s'::regclass);
 
 -- a table made since the commit, and one whose storage was replaced
--- since: copied as before, then moved to the head
+-- since: copied as before, then moved to the head, the one replaced given
+-- the pages another branch (b1) kept as of the head, no row written
 CREATE TABLE fk.n (id int PRIMARY KEY);
 TRUNCATE fk.k;
 SELECT dolt_branch('b2');

@@ -229,10 +229,11 @@ int			block_map_replay_entries = 65536;
  * the page store, whose snapshots didn't say who took them; version 3's
  * release queue entries didn't say which drop's transaction they wait for;
  * version 4's headers didn't say which entries may be shared with another
- * map.  This server reads only version 5 and refuses anything older
- * (refuse_version()).
+ * map; version 5's root pages didn't name the map, or the captured root it
+ * was made a copy of.  This server reads only version 6 and refuses
+ * anything older (refuse_version()).
  */
-#define BMAP_VERSION		5
+#define BMAP_VERSION		6
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -244,6 +245,8 @@ int			block_map_replay_entries = 65536;
 #define BMAP_PAGE_TREE		9		/* a tree's node, in the page store */
 #define BMAP_PAGE_QUEUE_META	10	/* the release queue's metapage */
 #define BMAP_PAGE_QUEUE		11		/* and its pages of entries */
+#define BMAP_PAGE_ROOTS_META	12	/* the captured roots' metapage */
+#define BMAP_PAGE_ROOTS		13		/* and their pages of slots */
 
 typedef struct BmapPageOpaqueData
 {
@@ -400,6 +403,8 @@ typedef struct BmapRoot
 {
 	BmapEntry	top[BMAP_TREE_TOPS];
 	xl_bmap_snapshot snap[BMAP_TREE_SNAPSHOTS];
+	uint64		map_id;			/* the map's identity: where its record began */
+	uint64		made_of;		/* the captured root it was made a copy of */
 } BmapRoot;
 
 StaticAssertDecl(sizeof(xl_bmap_top) == sizeof(BmapEntry),
@@ -1418,6 +1423,7 @@ apply_root_delta(Page page, const xl_bmap_root_delta *delta)
 		root->top[k].epoch = delta->tops[k].epoch;
 		root->top[k].since = delta->tops[k].since;
 	}
+	root->made_of = delta->made_of;
 }
 
 static void
@@ -5901,7 +5907,7 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 static void
 tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 				const xl_bmap_header_delta *hdelta, Buffer sheader,
-				const xl_bmap_header_delta *shdelta)
+				const xl_bmap_header_delta *shdelta, uint64 made_of)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
@@ -5928,6 +5934,7 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	rdelta.kind = BMAP_DELTA_ROOT;
 	rdelta.flags = BMAP_DELTA_INIT;
 	rdelta.ntops = BMAP_TREE_TOPS;
+	rdelta.made_of = made_of;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.tops[k].block = root.top[k].block;
@@ -5992,6 +5999,8 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 		XLogRegisterBufData(id, shdelta, sizeof(*shdelta));
 	}
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	/* (the new map's identity: where its record began) */
+	PageGetBmapRoot(BufferGetPage(buf))->map_id = ProcLastRecPtr;
 	PageSetLSN(BufferGetPage(buf), lsn);
 	if (hdelta)
 		PageSetLSN(BufferGetPage(headerbuf), lsn);
@@ -6072,7 +6081,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 	if (own.n > 0)
 		store_flush_begin(srel);
-	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
+	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL, 0);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
 	/* the copy has the same changes since src's last fold */
@@ -6945,7 +6954,7 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
 	tree_share_root(src, dst, snapshot_tops(&root.snap[slot]), &hdelta,
 					!replacing &&
 					shdelta.shared_below != PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below ?
-					headerbuf : InvalidBuffer, &shdelta);
+					headerbuf : InvalidBuffer, &shdelta, 0);
 	UnlockReleaseBuffer(headerbuf);
 	LockRelease(&sweeptag, ShareLock, false);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
@@ -9054,6 +9063,1307 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 }
 
 /* ----------------------------------------------------------------
+ * Captured roots
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * A page store's captured roots (BMAP_ROOTS_RELNUMBER): block 0 is a
+ * metapage (BmapRootsMeta), and blocks 1 on hold slots of roots
+ * (xl_bmap_root), BMAP_ROOTS_PER_PAGE a page.  A root holds its subtrees
+ * as a snapshot does, but the store keeps it rather than the relation's
+ * root page: there may be any number of them, and dropping the relation,
+ * or giving it new storage, leaves them as they are.  A root's id is its
+ * slot and a sequence number the metapage hands out, so a slot reused
+ * names another root.
+ *
+ * Holding is transactional both ways.  A slot names the (sub)transaction
+ * that captured it: until that commits the root holds nothing, and if it
+ * doesn't, the slot is reclaimed (its subtrees let go of).  Letting go of
+ * a root names the (sub)transaction that does so in the slot and pushes
+ * its subtrees onto the release queue as entries naming that transaction
+ * too: if it commits, the queue lets go of them and the slot is free; if
+ * it doesn't, the entries are popped with nothing let go of and the slot
+ * holds as before.  So a root's holders change with the commit that
+ * stops naming it, whatever crashes in between.
+ *
+ * Locks: the metapage exclusively while a slot is chosen and set (a
+ * capture holds its relation's header, then the metapage, then the slot's
+ * page, then the reference-count pages); a slot's page alone to let go of
+ * it.  Nothing holding a roots page waits for a map's header.
+ */
+typedef struct BmapRootsMeta
+{
+	uint32		version;
+	uint32		npages;			/* pages of slots after the metapage */
+	uint32		hint;			/* the first that may have a free slot */
+	uint32		unused;
+	uint64		seq;			/* the last root's sequence number */
+} BmapRootsMeta;
+
+#define BMAP_ROOTS_PER_PAGE \
+	((uint32) (BMAP_CONTENT_SIZE / sizeof(xl_bmap_root)))
+#define PageGetBmapRootsMeta(page)	((BmapRootsMeta *) PageGetContents(page))
+#define PageGetBmapRoots(page)	((xl_bmap_root *) PageGetContents(page))
+
+/* a root's id: its slot in the high bits, its sequence number below */
+#define ROOT_SEQ_BITS		40
+#define ROOT_ID(slot, seq) \
+	(((uint64) (slot) << ROOT_SEQ_BITS) | ((seq) & ((UINT64CONST(1) << ROOT_SEQ_BITS) - 1)))
+#define ROOT_SLOT(id)		((uint32) ((id) >> ROOT_SEQ_BITS))
+#define ROOT_PAGE(slot)		((BlockNumber) (1 + (slot) / BMAP_ROOTS_PER_PAGE))
+#define ROOT_INDEX(slot)	((uint32) ((slot) % BMAP_ROOTS_PER_PAGE))
+
+static SMgrRelation
+roots_smgr(RelFileLocator rel)
+{
+	return smgropen(with_relnumber(rel, BMAP_ROOTS_RELNUMBER),
+					INVALID_PROC_NUMBER);
+}
+
+static Buffer
+roots_read(RelFileLocator rel, BlockNumber blkno)
+{
+	check_may_read();
+	return ReadBufferWithoutRelcache(with_relnumber(rel, BMAP_ROOTS_RELNUMBER),
+									 MAIN_FORKNUM, blkno, RBM_NORMAL, NULL,
+									 true);
+}
+
+/* does rel's store keep roots (a file with its metapage, at least)? */
+static bool
+roots_exist(RelFileLocator rel)
+{
+	SMgrRelation rsrel = roots_smgr(rel);
+
+	return smgrexists(rsrel, MAIN_FORKNUM) && smgrnblocks(rsrel, MAIN_FORKNUM) > 0;
+}
+
+/*
+ * Give rel's store its roots file, as ensure_queue() its queue: the file is
+ * logged as made, its pages initialized by the records that first set
+ * them, all zeroes until then.
+ */
+static void
+ensure_roots(RelFileLocator rel)
+{
+	SMgrRelation rsrel = roots_smgr(rel);
+	LOCKTAG		tag;
+
+	if (roots_exist(rel))
+		return;
+	SET_LOCKTAG_RELATION(tag, rel.dbOid, BMAP_ROOTS_RELNUMBER);
+	(void) LockAcquire(&tag, AccessExclusiveLock, false, false);
+	if (!smgrexists(rsrel, MAIN_FORKNUM))
+	{
+		RelFileLocator rloc = with_relnumber(rel, BMAP_ROOTS_RELNUMBER);
+
+		smgrcreate(rsrel, MAIN_FORKNUM, false);
+		log_smgrcreate(&rloc, MAIN_FORKNUM);
+	}
+	check_may_read();
+	if (smgrnblocks(rsrel, MAIN_FORKNUM) == 0)
+		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
+										  MAIN_FORKNUM, NULL,
+										  EB_SKIP_EXTENSION_LOCK, 1,
+										  RBM_NORMAL));
+	LockRelease(&tag, AccessExclusiveLock, false);
+}
+
+/* the roots file has 'need' pages; under the metapage's exclusive lock */
+static void
+roots_cover(RelFileLocator rel, BlockNumber need)
+{
+	SMgrRelation rsrel = roots_smgr(rel);
+
+	check_may_read();
+	if (smgrnblocks(rsrel, MAIN_FORKNUM) < need)
+		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
+										  MAIN_FORKNUM, NULL,
+										  EB_SKIP_EXTENSION_LOCK, need,
+										  RBM_NORMAL));
+}
+
+static void
+apply_roots_meta_delta(Page page, const xl_bmap_roots_meta_delta *delta)
+{
+	BmapRootsMeta *meta;
+
+	if (delta->flags & BMAP_DELTA_INIT)
+	{
+		init_page(page, BMAP_PAGE_ROOTS_META);
+		PageGetBmapRootsMeta(page)->version = BMAP_VERSION;
+	}
+	meta = PageGetBmapRootsMeta(page);
+	meta->npages = delta->npages;
+	meta->hint = delta->hint;
+	meta->seq = delta->seq;
+}
+
+static void
+apply_roots_delta(Page page, const xl_bmap_roots_delta *delta)
+{
+	if (delta->flags & BMAP_DELTA_INIT)
+		init_page(page, BMAP_PAGE_ROOTS);
+	Assert(delta->index < BMAP_ROOTS_PER_PAGE);
+	PageGetBmapRoots(page)[delta->index] = delta->root;
+}
+
+/* the metapage locked exclusively, its contents (zeroes if new) into *meta */
+static Buffer
+roots_lock_meta(RelFileLocator rel, BmapRootsMeta *meta, bool *isnew)
+{
+	Buffer		buf = roots_read(rel, 0);
+	Page		page = BufferGetPage(buf);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	*isnew = PageIsNew(page);
+	if (*isnew)
+		memset(meta, 0, sizeof(*meta));
+	else
+	{
+		check_page(page, BMAP_PAGE_ROOTS_META,
+				   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 0);
+		*meta = *PageGetBmapRootsMeta(page);
+		if (meta->version != BMAP_VERSION)
+			refuse_version(meta->version,
+						   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM);
+	}
+	return buf;
+}
+
+/*
+ * What a slot holds by its capturer and its releaser (owner_state()).
+ * ROOT_FREE: nothing (no root, or one let go of by a committed releaser,
+ * or one too old to say of, taken as let go of, as the queue takes its
+ * entries); ROOT_HELD: its subtrees; ROOT_PENDING: nothing yet, or
+ * nothing any more once a releaser commits, either way its slot not to be
+ * reused; ROOT_ABANDONED: its capturer ended without committing, so its
+ * subtrees' holders it gained are to be let go of.
+ */
+typedef enum RootState
+{
+	ROOT_FREE,
+	ROOT_HELD,
+	ROOT_PENDING,
+	ROOT_ABANDONED,
+} RootState;
+
+static RootState
+root_state(const xl_bmap_root *r)
+{
+	OwnerState	state;
+
+	if (r->snap.id == 0)
+		return ROOT_FREE;
+	/* (in recovery no transaction is judged: one let go of is taken as so) */
+	if (RecoveryInProgress())
+		return r->released_by != 0 ? ROOT_FREE : ROOT_HELD;
+	state = owner_state(FullTransactionIdFromU64(r->snap.owner));
+	if (state == OWNER_ENDED)
+		return ROOT_ABANDONED;
+	if (state == OWNER_RUNNING)
+		return ROOT_PENDING;
+	if (r->released_by == 0)
+		return ROOT_HELD;
+	state = owner_state(FullTransactionIdFromU64(r->released_by));
+	if (state == OWNER_RUNNING)
+		return ROOT_PENDING;
+	if (state == OWNER_ENDED)
+		return ROOT_HELD;
+	return ROOT_FREE;
+}
+
+/*
+ * Change a root's slot (its page held exclusively in 'buf') to *r: one
+ * record of the page alone.  The metapage, which a capture locks before a
+ * slot's page, isn't locked under it.
+ */
+static void
+roots_set_slot(RelFileLocator rel, Buffer buf, uint32 slot,
+			   const xl_bmap_root *r)
+{
+	xl_bmap_roots_delta delta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+
+	memset(&delta, 0, sizeof(delta));
+	delta.kind = BMAP_DELTA_ROOTS;
+	delta.index = ROOT_INDEX(slot);
+	delta.root = *r;
+	xlrec.locator = with_relnumber(rel, BMAP_ROOTS_RELNUMBER);
+	xlrec.op = BMAP_TREE_ROOT_SLOT;
+	xlrec.flags = 0;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	START_CRIT_SECTION();
+	apply_roots_delta(BufferGetPage(buf), &delta);
+	MarkBufferDirty(buf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &delta, sizeof(delta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(buf), lsn);
+	END_CRIT_SECTION();
+}
+
+/*
+ * The metapage's hint lowered to page 'p' of slots (0-based), which may
+ * have a free slot soon: as a hint, not logged.  A crash may lose it,
+ * leaving free slots below the hint unused until a sweep lowers it again.
+ */
+static void
+roots_lower_hint(RelFileLocator rel, uint32 p)
+{
+	Buffer		buf = roots_read(rel, 0);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (!PageIsNew(BufferGetPage(buf)) &&
+		PageGetBmapRootsMeta(BufferGetPage(buf))->hint > p)
+	{
+		PageGetBmapRootsMeta(BufferGetPage(buf))->hint = p;
+		MarkBufferDirtyHint(buf, true);
+	}
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Settle slot 'slot' of the store, *r, held or let go of, on its page held
+ * exclusively in 'buf': its capturer, if committed, named no more, and its
+ * releaser, if it didn't commit, either; cleared if let go of by a
+ * committed releaser (its subtrees queued already): true then.  One still
+ * running is left as it is: VACUUM took its horizon first, which a
+ * transaction running now is newer than.  (bmap_roots_reclaim(), under
+ * the sweep lock.)
+ */
+static bool
+root_settle(RelFileLocator store, Buffer buf, uint32 slot,
+			const xl_bmap_root *r)
+{
+	xl_bmap_root settled = *r;
+	OwnerState	cap = owner_state(FullTransactionIdFromU64(r->snap.owner));
+	OwnerState	rel = r->released_by != 0 ?
+		owner_state(FullTransactionIdFromU64(r->released_by)) : OWNER_NONE;
+	bool		cleared = false;
+
+	if (cap == OWNER_RUNNING || rel == OWNER_RUNNING)
+		return false;
+	if (rel == OWNER_COMMITTED || rel == OWNER_UNKNOWN)
+	{
+		memset(&settled, 0, sizeof(settled));
+		cleared = true;
+	}
+	else
+	{
+		settled.snap.owner = 0;
+		settled.released_by = 0;
+	}
+	if (memcmp(&settled, r, sizeof(settled)) != 0)
+		roots_set_slot(store, buf, slot, &settled);
+	return cleared;
+}
+
+/*
+ * Reclaim the slots of rel's store whose capturers ended without
+ * committing: each cleared, then its subtrees let go of (queued).  A crash
+ * between the two leaves their counts a holder too high, for a sweep.
+ * Slots let go of by a committed releaser need nothing: their subtrees
+ * were queued, and a capture reuses the slot as it is.  How many were
+ * reclaimed.  Not in recovery; under no map page's lock.
+ *
+ * With 'settle', every slot is made to need the commit log no more, before
+ * the log forgets its transactions (VACUUM does this before the database's
+ * oldest transaction id may advance, vac_update_datfrozenxid()): one held
+ * names no capturer (a committed one's slot is as if captured before every
+ * transaction the log knows), nor a releaser that didn't commit; one let
+ * go of by a committed releaser is cleared.  Else a capture whose
+ * capturer a crash ended, never reclaimed, would be held for good once the
+ * log can't say it didn't commit.
+ */
+uint32
+bmap_roots_reclaim(RelFileLocator store, bool settle)
+{
+	BmapRootsMeta meta;
+	bool		isnew;
+	Buffer		metabuf;
+	uint32		n = 0;
+	LOCKTAG		sweeptag;
+
+	if (RecoveryInProgress() || !roots_exist(store))
+		return 0;
+	ensure_queue(store);
+	metabuf = roots_lock_meta(store, &meta, &isnew);
+	UnlockReleaseBuffer(metabuf);
+	if (isnew)
+		return 0;
+	/* not while a sweep counts: the slot and the queue change apart */
+	SET_LOCKTAG_OBJECT(sweeptag, store.dbOid, BMAP_SWEEP_CLASSID, store.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	for (uint32 p = 0; p < meta.npages; p++)
+	{
+		Buffer		buf = roots_read(store, 1 + p);
+		xl_bmap_root abandoned[BMAP_ROOTS_PER_PAGE];
+		uint32		nabandoned = 0;
+		bool		freed = false;
+
+		/* (each page once: its abandoned slots cleared, then let go of) */
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
+				   with_relnumber(store, BMAP_ROOTS_RELNUMBER),
+				   MAIN_FORKNUM, 1 + p);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			xl_bmap_root r = PageGetBmapRoots(BufferGetPage(buf))[i];
+			uint32		slot = p * BMAP_ROOTS_PER_PAGE + i;
+
+			if (r.snap.id == 0)
+				continue;
+			if (root_state(&r) == ROOT_ABANDONED)
+			{
+				xl_bmap_root cleared;
+
+				memset(&cleared, 0, sizeof(cleared));
+				roots_set_slot(store, buf, slot, &cleared);
+				abandoned[nabandoned++] = r;
+			}
+			else if (settle)
+				freed |= root_settle(store, buf, slot, &r);
+		}
+		UnlockReleaseBuffer(buf);
+		for (uint32 a = 0; a < nabandoned; a++)
+		{
+			BmapQueued	items[BMAP_TREE_TOPS];
+			uint32		nq = queued_tops(snapshot_tops(&abandoned[a].snap), items);
+
+			(void) queue_push(store, items, nq);
+		}
+		if (nabandoned > 0 || freed)
+			roots_lower_hint(store, p);
+		n += nabandoned;
+	}
+	LockRelease(&sweeptag, ShareLock, false);
+	return n;
+}
+
+/*
+ * A free slot of rel's store's roots (one never used, or let go of by a
+ * committed releaser), from the first page that may have one, else the
+ * first of a page more: its page locked exclusively in *slotbuf (*slotnew
+ * if the page is to be initialized), the metapage locked exclusively and
+ * returned, its contents in *meta as the slot's record is to set them
+ * (*isnew if it is to be initialized).
+ */
+static Buffer
+roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
+				Buffer *slotbufp, bool *slotnewp, uint32 *slotp)
+{
+	Buffer		rootsmeta;
+	BmapRootsMeta meta;
+	bool		isnew;
+	Buffer		slotbuf = InvalidBuffer;
+	bool		slotnew = false;
+	uint32		slot = 0;
+	bool		found = false;
+
+	rootsmeta = roots_lock_meta(rel, &meta, &isnew);
+	for (uint32 p = meta.hint; p < meta.npages && !found; p++)
+	{
+		slotbuf = roots_read(rel, 1 + p);
+		LockBuffer(slotbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(slotbuf), BMAP_PAGE_ROOTS,
+				   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 1 + p);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			if (root_state(&PageGetBmapRoots(BufferGetPage(slotbuf))[i]) == ROOT_FREE)
+			{
+				slot = p * BMAP_ROOTS_PER_PAGE + i;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			UnlockReleaseBuffer(slotbuf);
+			slotbuf = InvalidBuffer;
+			meta.hint = p + 1;
+		}
+	}
+	if (!found)
+	{
+		/* a page more, its first slot */
+		if ((uint64) (meta.npages + 1) * BMAP_ROOTS_PER_PAGE >= (UINT64CONST(1) << (64 - ROOT_SEQ_BITS)))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("page store of database %u keeps too many captured roots",
+							rel.dbOid)));
+		roots_cover(rel, 1 + meta.npages + 1);
+		slotbuf = roots_read(rel, 1 + meta.npages);
+		LockBuffer(slotbuf, BUFFER_LOCK_EXCLUSIVE);
+		slotnew = PageIsNew(BufferGetPage(slotbuf));
+		if (!slotnew)
+			memset(BufferGetPage(slotbuf), 0, BLCKSZ);
+		slotnew = true;
+		slot = meta.npages * BMAP_ROOTS_PER_PAGE;
+		meta.hint = meta.npages;
+		meta.npages++;
+	}
+	*metap = meta;
+	*isnewp = isnew;
+	*slotbufp = slotbuf;
+	*slotnewp = slotnew;
+	*slotp = slot;
+	return rootsmeta;
+}
+
+/*
+ * A root of reln captured into its store's roots: a free slot (one never
+ * used, or let go of by a committed releaser) set to the subtrees reln has
+ * now, its length and last fold's epoch, each subtree gaining a holder, and
+ * the map's epoch raised, as by a snapshot (snapshot_take_slot(), whose
+ * walk this one makes: its own blocks go into 'own', logged as images).
+ * The slot names the capturing (sub)transaction.  Returns the root's id.
+ */
+static BmapRootId
+root_capture_slot(SMgrRelation reln, BlockList *own)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	LOCKTAG		sweeptag;
+	Buffer		metabuf;
+	Buffer		headerbuf;
+	Buffer		rootsmeta;
+	Buffer		slotbuf = InvalidBuffer;
+	Buffer		rootbuf;
+	BmapHeader *header;
+	BmapRoot	root;
+	BmapRootsMeta meta;
+	bool		isnew;
+	bool		slotnew = false;
+	BlockNumber tops[BMAP_TREE_TOPS];
+	uint32		ntops = 0;
+	uint32		slot = 0;
+	RefsPages	rp;
+	xl_bmap_header_delta hdelta;
+	xl_bmap_roots_delta rdelta;
+	xl_bmap_roots_meta_delta mdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+	BmapRootId	id;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot capture a root of a relation during recovery")));
+	ensure_roots(rel);
+
+	/* not while a sweep counts what the maps hold */
+	SET_LOCKTAG_OBJECT(sweeptag, rel.dbOid, BMAP_SWEEP_CLASSID, rel.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	metabuf = alloc_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	refs_cover(rel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
+	UnlockReleaseBuffer(metabuf);
+
+	headerbuf = preserve_header_lock(reln, own);
+	header = PageGetBmapHeader(BufferGetPage(headerbuf));
+	if (own->n > 0)
+		store_flush_begin(rel);
+
+	/* the root page's pointers, which the root takes */
+	rootbuf = map_read(rel, 1);
+	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(rootbuf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(rootbuf));
+	UnlockReleaseBuffer(rootbuf);
+
+	/* a free slot, from the first page that may have one */
+	rootsmeta = roots_take_slot(rel, &meta, &isnew, &slotbuf, &slotnew, &slot);
+
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		if (BlockNumberIsValid(root.top[k].block))
+			tops[ntops++] = root.top[k].block;
+	qsort(tops, ntops, sizeof(BlockNumber), cmp_block);
+	rp.n = 0;
+	if (ntops > 0 && refs_lock(rel, tops, ntops, &rp) != ntops)
+		elog(ERROR, "the subtrees of \"%s\" span too many count pages",
+			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+	refs_add_holders(&rp, tops, ntops);
+
+	hdelta.kind = BMAP_DELTA_HEADER;
+	hdelta.flags = 0;
+	hdelta.nblocks = header->nblocks;
+	hdelta.epoch = header->epoch + 1;
+	hdelta.fold_epoch = header->fold_epoch;
+	hdelta.shared_below = 0;
+	memset(&rdelta, 0, sizeof(rdelta));
+	rdelta.kind = BMAP_DELTA_ROOTS;
+	rdelta.flags = slotnew ? BMAP_DELTA_INIT : 0;
+	rdelta.index = ROOT_INDEX(slot);
+	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
+	rdelta.root.snap.nblocks = header->nblocks;
+	rdelta.root.snap.fold_epoch = header->fold_epoch;
+	rdelta.root.snap.epoch = hdelta.epoch;
+	rdelta.root.relnumber = rel.relNumber;
+	rdelta.root.map_id = root.map_id;
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		rdelta.root.snap.tops[k].block = root.top[k].block;
+		rdelta.root.snap.tops[k].epoch = root.top[k].epoch;
+		rdelta.root.snap.tops[k].since = root.top[k].since;
+	}
+	memset(&mdelta, 0, sizeof(mdelta));
+	mdelta.kind = BMAP_DELTA_ROOTS_META;
+	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
+	mdelta.npages = meta.npages;
+	mdelta.hint = meta.hint;
+	mdelta.seq = meta.seq + 1;
+	id = rdelta.root.snap.id = ROOT_ID(slot, mdelta.seq);
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_CAPTURE;
+	/* (tree_preserve() logged images of the own blocks) */
+	xlrec.flags = BMAP_TREE_PRESERVE_LOGGED;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	XLogEnsureRecordSpace(3 + BMAP_TREE_TOPS, 4 + BMAP_TREE_TOPS);
+	START_CRIT_SECTION();
+	apply_roots_delta(BufferGetPage(slotbuf), &rdelta);
+	MarkBufferDirty(slotbuf);
+	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
+	MarkBufferDirty(headerbuf);
+	apply_roots_meta_delta(BufferGetPage(rootsmeta), &mdelta);
+	MarkBufferDirty(rootsmeta);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	/* (the slot's delta kept with an image too: redo walks what it names) */
+	XLogRegisterBuffer(0, slotbuf, REGBUF_STANDARD | REGBUF_KEEP_DATA |
+					   (slotnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(0, &rdelta, sizeof(rdelta));
+	XLogRegisterBuffer(1, headerbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(1, &hdelta, sizeof(hdelta));
+	XLogRegisterBuffer(2, rootsmeta, REGBUF_STANDARD |
+					   (isnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(2, &mdelta, sizeof(mdelta));
+	refs_apply_register(&rp, 3);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(slotbuf), lsn);
+	PageSetLSN(BufferGetPage(headerbuf), lsn);
+	PageSetLSN(BufferGetPage(rootsmeta), lsn);
+	refs_set_lsn(&rp, lsn);
+	END_CRIT_SECTION();
+
+	refs_release(&rp);
+	UnlockReleaseBuffer(slotbuf);
+	UnlockReleaseBuffer(rootsmeta);
+	UnlockReleaseBuffer(headerbuf);
+	LockRelease(&sweeptag, ShareLock, false);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_CAPTURED, 1);
+	return id;
+}
+
+/*
+ * Capture a root of reln: its pages as they are, kept by its page store
+ * until bmap_root_release() (see bmap.h).  As for a snapshot, the caller
+ * keeps reln from changing meanwhile, and its own pages are written out
+ * before this returns, their images logged first; nothing is synced.
+ */
+BmapRootId
+bmap_root_capture(SMgrRelation reln)
+{
+	BmapRootId	id;
+
+	bmap_root_capture_many(&reln, 1, &id);
+	return id;
+}
+
+/*
+ * bmap_root_capture() of each of rels[] (n of them), their ids into ids[],
+ * the generation of sharing raised once for them all.  Each id is set as
+ * its root is captured (the others 0), so that, if one fails, the caller
+ * knows of those captured already, which an abort lets go of.
+ */
+void
+bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
+{
+	BlockList  *own = palloc0_array(BlockList, Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+		ids[i] = 0;
+	for (int i = 0; i < n; i++)
+	{
+		ids[i] = root_capture_slot(rels[i], &own[i]);
+		INJECTION_POINT("bmap-root-slot-captured", NULL);
+	}
+	MarkBufferedPagesShared();
+	for (int i = 0; i < n; i++)
+	{
+		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
+		if (own[i].n > 0)
+			store_flush_end(rels[i]->smgr_rlocator.locator, false);
+		if (own[i].blocks)
+			pfree(own[i].blocks);
+	}
+	pfree(own);
+	if (n > 0)
+		INJECTION_POINT("bmap-roots-captured", NULL);
+}
+
+/*
+ * Root 'id' of the store's slot, read under its page's lock, which stays
+ * held in *buf in 'mode' (BUFFER_LOCK_SHARE or _EXCLUSIVE; with -1, a share
+ * lock let go of): false, *buf invalid, if the slot holds another root, or
+ * none.
+ */
+static bool
+root_read(RelFileLocator store, BmapRootId id, int mode,
+		  Buffer *buf, xl_bmap_root *r)
+{
+	uint32		slot = ROOT_SLOT(id);
+	BmapRootsMeta meta;
+	Buffer		metabuf;
+	bool		isnew;
+
+	*buf = InvalidBuffer;
+	if (id == 0 || !roots_exist(store))
+		return false;
+	metabuf = roots_read(store, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	isnew = PageIsNew(BufferGetPage(metabuf));
+	if (!isnew)
+	{
+		check_page(BufferGetPage(metabuf), BMAP_PAGE_ROOTS_META,
+				   with_relnumber(store, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 0);
+		meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	}
+	UnlockReleaseBuffer(metabuf);
+	if (isnew || ROOT_PAGE(slot) > meta.npages)
+		return false;
+	*buf = roots_read(store, ROOT_PAGE(slot));
+	LockBuffer(*buf, mode < 0 ? BUFFER_LOCK_SHARE : mode);
+	check_page(BufferGetPage(*buf), BMAP_PAGE_ROOTS,
+			   with_relnumber(store, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM,
+			   ROOT_PAGE(slot));
+	*r = PageGetBmapRoots(BufferGetPage(*buf))[ROOT_INDEX(slot)];
+	if (r->snap.id != id)
+	{
+		UnlockReleaseBuffer(*buf);
+		*buf = InvalidBuffer;
+		return false;
+	}
+	if (mode < 0)
+	{
+		UnlockReleaseBuffer(*buf);
+		*buf = InvalidBuffer;
+	}
+	return true;
+}
+
+/*
+ * Is the root in slot *r held as this (sub)transaction sees it: captured by
+ * a committed transaction or this one, and let go of by nobody that
+ * committed, nor by this transaction?
+ */
+static bool
+root_held_as_seen(const xl_bmap_root *r)
+{
+	OwnerState	cap = owner_state(FullTransactionIdFromU64(r->snap.owner));
+
+	if (cap == OWNER_ENDED ||
+		(cap == OWNER_RUNNING &&
+		 !TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r->snap.owner)))))
+		return false;
+	if (r->released_by != 0)
+	{
+		OwnerState	rel = owner_state(FullTransactionIdFromU64(r->released_by));
+
+		if (rel != OWNER_ENDED &&
+			(rel != OWNER_RUNNING ||
+			 TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r->released_by)))))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * May the root in slot *r, read under its page's lock, gain a holder (be
+ * shared, or copied): held as this transaction sees it, and named by no
+ * releaser that may yet commit.  A releaser names a root under the page's
+ * exclusive lock and then queues its subtrees, so one not named while the
+ * lock is held can't let go of them before the holders are added; one
+ * named may commit meanwhile, and the drain then free what the copy is
+ * to hold.
+ */
+static bool
+root_may_hold(const xl_bmap_root *r)
+{
+	return root_held_as_seen(r) &&
+		(r->released_by == 0 ||
+		 owner_state(FullTransactionIdFromU64(r->released_by)) == OWNER_ENDED);
+}
+
+/*
+ * Root 'id' of the store held again, by a root of its own: a free slot set
+ * to the same subtrees, each gaining a holder, naming the current
+ * (sub)transaction as its capturer, so that it is held from that one's
+ * commit and let go of on its own, and naming the map of holder (the
+ * relation it is held for) as the one it was captured of: that map's own,
+ * as a root captured of it would be (own_root_tops()).  O(1), nothing
+ * written out: the blocks are the root's, durable since it was captured.
+ * Its id, or 0 if the store holds no such root.
+ */
+BmapRootId
+bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
+{
+	uint64		holder_map;
+	LOCKTAG		sweeptag;
+	Buffer		buf;
+	Buffer		rootsmeta;
+	Buffer		slotbuf;
+	BmapRootsMeta meta;
+	bool		isnew;
+	bool		slotnew;
+	uint32		slot;
+	xl_bmap_root r;
+	BlockNumber tops[BMAP_TREE_TOPS];
+	uint32		ntops = 0;
+	RefsPages	rp;
+	Buffer		metabuf;
+	xl_bmap_roots_delta rdelta;
+	xl_bmap_roots_meta_delta mdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+	BmapRootId	copy;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot capture a root of a relation during recovery")));
+	if (!bmap_root_held(store, id, NULL) ||
+		!root_read(store, id, -1, &buf, &r))
+		return 0;
+	buf = map_read(holder, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, holder, BMAP_FORKNUM, 1);
+	holder_map = PageGetBmapRoot(BufferGetPage(buf))->map_id;
+	UnlockReleaseBuffer(buf);
+
+	/* not while a sweep counts what the maps hold */
+	SET_LOCKTAG_OBJECT(sweeptag, store.dbOid, BMAP_SWEEP_CLASSID, store.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	metabuf = alloc_read(store, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, store, MAIN_FORKNUM, 0);
+	refs_cover(store, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
+	UnlockReleaseBuffer(metabuf);
+
+	/*
+	 * (the root read again under its slot page's lock, which keeps a
+	 * releaser from naming it until the holders are added: one named since
+	 * the first look may commit, and its subtrees be let go of, meanwhile.
+	 * The slot taken may be on the same page, locked already.)
+	 */
+	rootsmeta = roots_take_slot(store, &meta, &isnew, &slotbuf, &slotnew, &slot);
+	buf = InvalidBuffer;
+	if (ROOT_PAGE(ROOT_SLOT(id)) == ROOT_PAGE(slot))
+		r = PageGetBmapRoots(BufferGetPage(slotbuf))[ROOT_INDEX(ROOT_SLOT(id))];
+	else
+	{
+		/* (not by root_read(), which locks the metapage, held here) */
+		buf = roots_read(store, ROOT_PAGE(ROOT_SLOT(id)));
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
+				   with_relnumber(store, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM,
+				   ROOT_PAGE(ROOT_SLOT(id)));
+		r = PageGetBmapRoots(BufferGetPage(buf))[ROOT_INDEX(ROOT_SLOT(id))];
+	}
+	if (r.snap.id != id || !root_may_hold(&r))
+	{
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		UnlockReleaseBuffer(slotbuf);
+		UnlockReleaseBuffer(rootsmeta);
+		LockRelease(&sweeptag, ShareLock, false);
+		return 0;
+	}
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		if (BlockNumberIsValid(r.snap.tops[k].block))
+			tops[ntops++] = r.snap.tops[k].block;
+	qsort(tops, ntops, sizeof(BlockNumber), cmp_block);
+	rp.n = 0;
+	if (ntops > 0 && refs_lock(store, tops, ntops, &rp) != ntops)
+		elog(ERROR, "the subtrees of a captured root span too many count pages");
+	refs_add_holders(&rp, tops, ntops);
+
+	memset(&rdelta, 0, sizeof(rdelta));
+	rdelta.kind = BMAP_DELTA_ROOTS;
+	rdelta.flags = slotnew ? BMAP_DELTA_INIT : 0;
+	rdelta.index = ROOT_INDEX(slot);
+	rdelta.root.snap = r.snap;
+	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
+	rdelta.root.relnumber = holder.relNumber;
+	rdelta.root.map_id = holder_map;
+	memset(&mdelta, 0, sizeof(mdelta));
+	mdelta.kind = BMAP_DELTA_ROOTS_META;
+	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
+	mdelta.npages = meta.npages;
+	mdelta.hint = meta.hint;
+	mdelta.seq = meta.seq + 1;
+	copy = rdelta.root.snap.id = ROOT_ID(slot, mdelta.seq);
+	xlrec.locator = with_relnumber(store, BMAP_ROOTS_RELNUMBER);
+	xlrec.op = BMAP_TREE_ROOT_SLOT;
+	xlrec.flags = 0;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	XLogEnsureRecordSpace(2 + BMAP_TREE_TOPS, 3 + BMAP_TREE_TOPS);
+	START_CRIT_SECTION();
+	apply_roots_delta(BufferGetPage(slotbuf), &rdelta);
+	MarkBufferDirty(slotbuf);
+	apply_roots_meta_delta(BufferGetPage(rootsmeta), &mdelta);
+	MarkBufferDirty(rootsmeta);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, slotbuf, REGBUF_STANDARD |
+					   (slotnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(0, &rdelta, sizeof(rdelta));
+	XLogRegisterBuffer(1, rootsmeta, REGBUF_STANDARD |
+					   (isnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(1, &mdelta, sizeof(mdelta));
+	refs_apply_register(&rp, 2);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(slotbuf), lsn);
+	PageSetLSN(BufferGetPage(rootsmeta), lsn);
+	refs_set_lsn(&rp, lsn);
+	END_CRIT_SECTION();
+
+	refs_release(&rp);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(slotbuf);
+	UnlockReleaseBuffer(rootsmeta);
+	LockRelease(&sweeptag, ShareLock, false);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_CAPTURED, 1);
+	return copy;
+}
+
+
+/*
+ * Is root 'id' held, as this (sub)transaction sees it: captured by a
+ * committed transaction or this one, and let go of by nobody that
+ * committed, nor by this transaction?  Its length into *nblocks, if so.
+ */
+bool
+bmap_root_held(RelFileLocator store, BmapRootId id, BlockNumber *nblocks)
+{
+	Buffer		buf;
+	xl_bmap_root r;
+
+	if (!root_read(store, id, -1, &buf, &r) || !root_held_as_seen(&r))
+		return false;
+	if (nblocks)
+		*nblocks = r.snap.nblocks;
+	return true;
+}
+
+/*
+ * Let go of root 'id' as the current (sub)transaction commits: its slot
+ * names it, and its subtrees are pushed onto the release queue as entries
+ * naming it (see "Captured roots").  False if the store has no such root,
+ * or it is let go of already.  One a releaser that didn't commit named is
+ * named again.
+ */
+bool
+bmap_root_release(RelFileLocator store, BmapRootId id)
+{
+	Buffer		buf;
+	xl_bmap_root r;
+	FullTransactionId me;
+	BmapQueued	items[BMAP_TREE_TOPS];
+	uint32		n;
+	LOCKTAG		sweeptag;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot let go of a captured root during recovery")));
+	/* (a store dropped with its tablespace holds nothing) */
+	if (id == 0 || !roots_exist(store))
+		return false;
+	/* (a queue to make takes a lock, not to be waited for under a page) */
+	ensure_queue(store);
+	/* not while a sweep counts: the slot and the queue change apart */
+	SET_LOCKTAG_OBJECT(sweeptag, store.dbOid, BMAP_SWEEP_CLASSID, store.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	if (!root_read(store, id, BUFFER_LOCK_EXCLUSIVE, &buf, &r))
+	{
+		LockRelease(&sweeptag, ShareLock, false);
+		return false;
+	}
+	if ((r.released_by != 0 &&
+		 owner_state(FullTransactionIdFromU64(r.released_by)) != OWNER_ENDED) ||
+		root_state(&r) == ROOT_ABANDONED)
+	{
+		UnlockReleaseBuffer(buf);
+		LockRelease(&sweeptag, ShareLock, false);
+		return false;
+	}
+	me = GetCurrentFullTransactionId();
+	r.released_by = U64FromFullTransactionId(me);
+	roots_set_slot(store, buf, ROOT_SLOT(id), &r);
+	UnlockReleaseBuffer(buf);
+
+	/*
+	 * A crash before the push leaves the slot naming a releaser that never
+	 * committed: it holds as before.
+	 */
+	n = queued_tops(snapshot_tops(&r.snap), items);
+	for (uint32 i = 0; i < n; i++)
+		queued_set_owner(&items[i], me);
+	(void) queue_push(store, items, n);
+	LockRelease(&sweeptag, ShareLock, false);
+	roots_lower_hint(store, ROOT_PAGE(ROOT_SLOT(id)) - 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_RELEASED, 1);
+	return true;
+}
+
+/*
+ * Are reln's pages still those of root 'id': its root page pointing to the
+ * subtrees the root holds, and its length the root's?  O(1), as
+ * bmap_snapshot_unchanged().  False if the store holds no such root.
+ */
+bool
+bmap_root_unchanged(SMgrRelation reln, BmapRootId id)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		rootbuf;
+	Buffer		buf;
+	BmapRoot	root;
+	xl_bmap_root r;
+	BlockNumber nblocks;
+	bool		same;
+
+	if (!root_read(rel, id, -1, &buf, &r))
+		return false;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	rootbuf = map_read(rel, 1);
+	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(rootbuf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(rootbuf));
+	UnlockReleaseBuffer(rootbuf);
+	UnlockReleaseBuffer(headerbuf);
+	same = r.snap.nblocks == nblocks;
+	for (int k = 0; same && k < BMAP_TREE_TOPS; k++)
+	{
+		const BmapEntry *top = &snapshot_tops(&r.snap)[k];
+
+		same = root.top[k].block == top->block &&
+			(!BlockNumberIsValid(top->block) || root.top[k].since == top->since);
+	}
+	return same;
+}
+
+/*
+ * Make 'dst', a new relation file number, a copy of root 'id' of its page
+ * store: its root page gets the root's subtrees, each gaining a holder, and
+ * its header the root's length, in one record, as bmap_share_snapshot()
+ * makes one of a snapshot.  O(1) in the relation's size; the root's blocks
+ * were made durable when it was captured.  The copy has never been folded.
+ * With 'replacing' (the storage dst takes the place of, dropped as the
+ * transaction commits: a restore), dst's entries may be shared with
+ * another map only where replacing's might.  Otherwise every entry of dst
+ * may be; and with 'sharer', a relation still holding the root's pages
+ * (the storage of another branch's table the root was kept of), so may
+ * those of sharer, which its header's shared_below then says (in the same
+ * record), so that its VACUUM leaves them.  Only the main fork.  The
+ * root's slot is read under its page's lock, which keeps a releaser from
+ * naming it meanwhile; a header held is locked first, as a capture locks
+ * it.
+ */
+void
+bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
+				SMgrRelation sharer)
+{
+	RelFileLocator drel = dst->smgr_rlocator.locator;
+	LOCKTAG		sweeptag;
+	Buffer		buf;
+	Buffer		sheader = InvalidBuffer;
+	xl_bmap_root r;
+	xl_bmap_header_delta hdelta;
+	xl_bmap_header_delta shdelta;
+	uint32		shared_below = 0;
+
+	smgrusewhich(dst, SMGR_BMAP);
+	SET_LOCKTAG_OBJECT(sweeptag, drel.dbOid, BMAP_SWEEP_CLASSID, drel.spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	if (!bmap_root_held(drel, id, NULL) ||
+		!root_read(drel, id, -1, &buf, &r))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("page store of database %u holds no captured root %llu",
+						drel.dbOid, (unsigned long long) id)));
+
+	INJECTION_POINT("bmap-root-share-checked", NULL);
+
+	/* the header of the storage replaced, or of the one captured of */
+	if (replacing != NULL)
+	{
+		RelFileLocator srel = replacing->smgr_rlocator.locator;
+		Buffer		h = map_read(srel, 0);
+
+		LockBuffer(h, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(h), BMAP_PAGE_HEADER, srel, BMAP_FORKNUM, 0);
+		shared_below = PageGetBmapHeader(BufferGetPage(h))->shared_below;
+		UnlockReleaseBuffer(h);
+	}
+	else if (sharer != NULL)
+	{
+		RelFileLocator srel = sharer->smgr_rlocator.locator;
+
+		sheader = map_read(srel, 0);
+		LockBuffer(sheader, BUFFER_LOCK_EXCLUSIVE);
+		if (PageIsNew(BufferGetPage(sheader)))
+		{
+			UnlockReleaseBuffer(sheader);
+			sheader = InvalidBuffer;
+		}
+		else
+		{
+			BmapHeader *sh = PageGetBmapHeader(BufferGetPage(sheader));
+
+			check_page(BufferGetPage(sheader), BMAP_PAGE_HEADER, srel,
+					   BMAP_FORKNUM, 0);
+			shdelta.kind = BMAP_DELTA_HEADER;
+			shdelta.flags = BMAP_DELTA_SHARED_BELOW;
+			shdelta.nblocks = sh->nblocks;
+			shdelta.epoch = sh->epoch;
+			shdelta.fold_epoch = sh->fold_epoch;
+			shdelta.shared_below = Max(sh->shared_below, r.snap.epoch);
+			if (shdelta.shared_below == sh->shared_below)
+			{
+				UnlockReleaseBuffer(sheader);
+				sheader = InvalidBuffer;
+			}
+		}
+	}
+
+	/*
+	 * (held still, under the slot page's lock, which keeps a releaser from
+	 * naming it until the holders are added: one named since the first
+	 * look may commit, and its subtrees be let go of, meanwhile)
+	 */
+	if (!root_read(drel, id, BUFFER_LOCK_SHARE, &buf, &r) || !root_may_hold(&r))
+	{
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		if (BufferIsValid(sheader))
+			UnlockReleaseBuffer(sheader);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("page store of database %u holds no captured root %llu",
+						drel.dbOid, (unsigned long long) id)));
+	}
+	create_map(dst);
+	hdelta.kind = BMAP_DELTA_HEADER;
+	hdelta.flags = BMAP_DELTA_SHARED_BELOW;
+	hdelta.nblocks = r.snap.nblocks;
+	hdelta.epoch = r.snap.epoch;
+	hdelta.fold_epoch = 0;
+	hdelta.shared_below = replacing != NULL ?
+		Min(shared_below, hdelta.epoch) : hdelta.epoch;
+	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, sheader,
+					&shdelta, id);
+	UnlockReleaseBuffer(buf);
+	if (BufferIsValid(sheader))
+		UnlockReleaseBuffer(sheader);
+	LockRelease(&sweeptag, ShareLock, false);
+	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_SHARED, 1);
+	INJECTION_POINT("bmap-root-shared", NULL);
+}
+
+/*
+ * A sweep counts what the roots hold, as it counts a map: each root whose
+ * slot isn't free (root_state()) a holder of its subtrees.  One pending (its
+ * capturer or its releaser yet to commit) holds what it names until then:
+ * a capture's holders were added with it, and a releaser's queue entries
+ * hold nothing until it commits.  An abandoned one holds until it is
+ * reclaimed, whose queue entries then hold in its place.
+ */
+static void
+sweep_roots(RelFileLocator rel, TreeNodeVisit visit_node,
+			TreeEntryVisit visit_entry, void *arg)
+{
+	BmapRootsMeta meta;
+	Buffer		metabuf;
+	SMgrRelation store = store_smgr(rel);
+
+	if (!roots_exist(rel))
+		return;
+	metabuf = roots_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(metabuf)))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return;
+	}
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_ROOTS_META,
+			   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 0);
+	meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	UnlockReleaseBuffer(metabuf);
+	for (uint32 p = 0; p < meta.npages; p++)
+	{
+		xl_bmap_root page[BMAP_ROOTS_PER_PAGE];
+		Buffer		buf = roots_read(rel, 1 + p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
+				   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 1 + p);
+		memcpy(page, PageGetBmapRoots(BufferGetPage(buf)), sizeof(page));
+		UnlockReleaseBuffer(buf);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			RootState	state = root_state(&page[i]);
+			uint64		first = 0;
+
+			/* (an abandoned one until it is reclaimed, as its queue entries) */
+			if (state == ROOT_FREE)
+				continue;
+			for (int k = 0; k < BMAP_TREE_TOPS; k++)
+			{
+				const BmapEntry *tops = snapshot_tops(&page[i].snap);
+
+				if (BlockNumberIsValid(tops[k].block))
+					tree_walk_node(store, &tops[k], k, (BlockNumber) first,
+								   true, visit_node, visit_entry, arg);
+				first += tree_span(k);
+			}
+		}
+	}
+}
+
+/*
+ * The subtrees of rel's own roots that its store still counts (not free),
+ * BMAP_TREE_TOPS for each, into *tops: how many roots.  Its own are those
+ * captured of its map (by the map's identity, whatever file number a map
+ * had before it), and the root it was made a copy of: a relation restored
+ * of a root holds it as its branch's commit, as one captured of it.  As a
+ * relation's own snapshots, they share its pages with no other map.  Under
+ * rel's header, which a capture locks first.
+ */
+static int
+own_root_tops(RelFileLocator rel, BmapEntry **tops)
+{
+	BmapRootsMeta meta;
+	Buffer		metabuf;
+	Buffer		rootbuf;
+	uint64		map_id;
+	uint64		made_of;
+	int			n = 0;
+	int			cap = 0;
+
+	*tops = NULL;
+	if (!roots_exist(rel))
+		return 0;
+	rootbuf = map_read(rel, 1);
+	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(rootbuf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	map_id = PageGetBmapRoot(BufferGetPage(rootbuf))->map_id;
+	made_of = PageGetBmapRoot(BufferGetPage(rootbuf))->made_of;
+	UnlockReleaseBuffer(rootbuf);
+	metabuf = roots_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(metabuf)))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return 0;
+	}
+	meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	UnlockReleaseBuffer(metabuf);
+	for (uint32 p = 0; p < meta.npages; p++)
+	{
+		Buffer		buf = roots_read(rel, 1 + p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			const xl_bmap_root *r = &PageGetBmapRoots(BufferGetPage(buf))[i];
+
+			if ((r->map_id != map_id &&
+				 (made_of == 0 || r->snap.id != made_of)) ||
+				root_state(r) == ROOT_FREE)
+				continue;
+			if (n == cap)
+			{
+				cap = Max(cap * 2, 8);
+				*tops = *tops ? repalloc_array(*tops, BmapEntry, cap * BMAP_TREE_TOPS) :
+					palloc_array(BmapEntry, cap * BMAP_TREE_TOPS);
+			}
+			memcpy(*tops + n * BMAP_TREE_TOPS, snapshot_tops(&r->snap),
+				   sizeof(BmapEntry) * BMAP_TREE_TOPS);
+			n++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	return n;
+}
+
+/*
+ * How many roots the store holds (root_state()), of relation file number
+ * store.relNumber if valid (captured of it), and the store's slots; and
+ * into *naming if not NULL, how many of the slots in use name a
+ * transaction (a capturer or releaser, not settled).
+ */
+void
+bmap_inspect_roots(RelFileLocator store, uint64 *held, uint64 *slots,
+				   uint64 *naming)
+{
+	BmapRootsMeta meta;
+	Buffer		metabuf;
+
+	*held = *slots = 0;
+	if (naming)
+		*naming = 0;
+	if (!roots_exist(store))
+		return;
+	metabuf = roots_read(store, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(metabuf)))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return;
+	}
+	meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	UnlockReleaseBuffer(metabuf);
+	*slots = (uint64) meta.npages * BMAP_ROOTS_PER_PAGE;
+	for (uint32 p = 0; p < meta.npages; p++)
+	{
+		Buffer		buf = roots_read(store, 1 + p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			const xl_bmap_root *r = &PageGetBmapRoots(BufferGetPage(buf))[i];
+			RootState	state = root_state(r);
+
+			if ((state == ROOT_HELD || state == ROOT_PENDING) &&
+				(!RelFileNumberIsValid(store.relNumber) ||
+				 r->relnumber == store.relNumber))
+				(*held)++;
+			if (naming && r->snap.id != 0 &&
+				(r->snap.owner != 0 || r->released_by != 0))
+				(*naming)++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/* ----------------------------------------------------------------
  * The sweep
  * ----------------------------------------------------------------
  */
@@ -9212,6 +10522,8 @@ typedef struct OwnHolders
 	uint32		below;			/* how far shared_below goes down */
 	uint32		shared_below;	/* as it was */
 	uint64		entries;		/* the tree's entries walked */
+	BmapEntry  *root_tops;		/* the roots captured of it, as its own */
+	int			nroots;
 } OwnHolders;
 
 static OwnHolder *
@@ -9356,6 +10668,20 @@ shared_walk(SMgrRelation reln, OwnHolders *oh)
 
 		if (root.snap[s].id == 0)
 			continue;
+		first = 0;
+		for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		{
+			memset(oh->elsewhere, 0, sizeof(oh->elsewhere));
+			if (BlockNumberIsValid(tops[k].block))
+				tree_walk_node(reln, &tops[k], k, (BlockNumber) first, true,
+							   shared_node, shared_entry, oh);
+			first += tree_span(k);
+		}
+	}
+	for (int i = 0; i < oh->nroots; i++)
+	{
+		const BmapEntry *tops = oh->root_tops + i * BMAP_TREE_TOPS;
+
 		first = 0;
 		for (int k = 0; k < BMAP_TREE_TOPS; k++)
 		{
@@ -9747,7 +11073,30 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	oh.hw = hw;
 	oh.shared_below = header->shared_below;
 	tree_walk(reln, own_node, own_entry, &oh);
+	{
+		/* (and the roots captured of it, as its own snapshots) */
+		BmapEntry  *tops;
+		int			nroots = own_root_tops(rel, &tops);
+
+		for (int i = 0; i < nroots; i++)
+		{
+			uint64		first = 0;
+
+			for (int k = 0; k < BMAP_TREE_TOPS; k++)
+			{
+				if (BlockNumberIsValid(tops[i * BMAP_TREE_TOPS + k].block))
+					tree_walk_node(reln, &tops[i * BMAP_TREE_TOPS + k], k,
+								   (BlockNumber) first, true, own_node,
+								   own_entry, &oh);
+				first += tree_span(k);
+			}
+		}
+		oh.root_tops = tops;
+		oh.nroots = nroots;
+	}
 	shared_walk(reln, &oh);
+	if (oh.root_tops)
+		pfree(oh.root_tops);
 	hash_destroy(oh.own);
 
 	/* (a tree of no entries, as a dropped map's is: nothing to change) */
@@ -10920,7 +12269,9 @@ bmap_sizes(Oid spcOid, Oid dbOid, BmapRelationVisit visit, void *arg,
 		if (relnumber == BMAP_STORE_RELNUMBER)
 			sizes->store_bytes += st.st_size;
 		else if (relnumber == BMAP_ALLOC_RELNUMBER ||
-				 relnumber == BMAP_REFS_RELNUMBER)
+				 relnumber == BMAP_REFS_RELNUMBER ||
+				 relnumber == BMAP_QUEUE_RELNUMBER ||
+				 relnumber == BMAP_ROOTS_RELNUMBER)
 			sizes->alloc_bytes += st.st_size;
 		else if (bsearch(&relnumber, maps, nmaps, sizeof(RelFileNumber),
 						 cmp_relnumber) == NULL)
@@ -10988,6 +12339,8 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	BlockNumber nrefpages;
 	uint64		stuck_held;
 
+	/* the roots whose capturers never committed let go of first, the rest settled */
+	(void) bmap_roots_reclaim(rel, true);
 	SET_LOCKTAG_OBJECT(tag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 	stuck_held = pg_atomic_read_u64(&bmap_shared->stuck_held);
@@ -11038,10 +12391,11 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	}
 	FreeDir(dir);
 
-	/* and what the release queue holds, read after them */
+	/* and what the captured roots and the release queue hold, read after them */
 	{
 		SweepHolders sh = {holders, reached, hw};
 
+		sweep_roots(rel, sweep_node, sweep_entry, &sh);
 		sweep_queue(rel, sweep_node, sweep_entry, &sh);
 	}
 
@@ -11136,7 +12490,7 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 	char		suffix[16];
 	size_t		suffixlen;
 	RelFileLocator rel;
-	SMgrRelation srels[4];
+	SMgrRelation srels[5];
 
 	snprintf(suffix, sizeof(suffix), "_%s", forkNames[BMAP_FORKNUM]);
 	suffixlen = strlen(suffix);
@@ -11165,13 +12519,15 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 	srels[1] = store_smgr(rel);
 	srels[2] = refs_smgr(rel);
 	srels[3] = queue_smgr(rel);
+	srels[4] = roots_smgr(rel);
 	if (!smgrexists(srels[0], MAIN_FORKNUM) &&
 		!smgrexists(srels[1], MAIN_FORKNUM) &&
 		!smgrexists(srels[2], MAIN_FORKNUM) &&
-		!smgrexists(srels[3], MAIN_FORKNUM))
+		!smgrexists(srels[3], MAIN_FORKNUM) &&
+		!smgrexists(srels[4], MAIN_FORKNUM))
 		return;
 	/* at once, as in redo: nothing may use the tablespace any more */
-	smgrdounlinkall(srels, 4, true);
+	smgrdounlinkall(srels, 5, true);
 	store_unwatch(rel);
 }
 
@@ -11432,6 +12788,8 @@ create_map(SMgrRelation reln)
 	XLogRegisterBuffer(1, rootbuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
 	XLogRegisterBufData(1, &rdelta, sizeof(rdelta));
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_CREATE);
+	/* (the map's identity: where its record began, which no other did) */
+	PageGetBmapRoot(BufferGetPage(rootbuf))->map_id = ProcLastRecPtr;
 	PageSetLSN(page, lsn);
 	PageSetLSN(BufferGetPage(rootbuf), lsn);
 	END_CRIT_SECTION();
@@ -12704,6 +14062,7 @@ redo_block(XLogReaderState *record, uint8 block_id)
 				break;
 			case BMAP_DELTA_ROOT:
 				apply_root_delta(page, (xl_bmap_root_delta *) copy);
+				PageGetBmapRoot(page)->map_id = record->ReadRecPtr;
 				break;
 			case BMAP_DELTA_SNAPSHOT:
 				apply_snapshot_delta(page, (xl_bmap_snapshot_delta *) copy);
@@ -12728,6 +14087,12 @@ redo_block(XLogReaderState *record, uint8 block_id)
 				break;
 			case BMAP_DELTA_QUEUE:
 				apply_queue_delta(page, (xl_bmap_queue_delta *) copy);
+				break;
+			case BMAP_DELTA_ROOTS:
+				apply_roots_delta(page, (xl_bmap_roots_delta *) copy);
+				break;
+			case BMAP_DELTA_ROOTS_META:
+				apply_roots_meta_delta(page, (xl_bmap_roots_meta_delta *) copy);
 				break;
 			default:
 				elog(PANIC, "unknown block map delta %u", kind);
@@ -12828,9 +14193,10 @@ bmap_redo(XLogReaderState *record)
 				xl_bmap_tree *xlrec = (xl_bmap_tree *) XLogRecGetData(record);
 
 				BlockList	own = {0};
-				bool		kept = xlrec->op == BMAP_TREE_SNAPSHOT &&
-					!(xlrec->flags & BMAP_TREE_CARRIED) &&
-					XLogRecHasBlockRef(record, 1);
+				bool		kept = (xlrec->op == BMAP_TREE_SNAPSHOT &&
+									!(xlrec->flags & BMAP_TREE_CARRIED) &&
+									XLogRecHasBlockRef(record, 1)) ||
+					xlrec->op == BMAP_TREE_CAPTURE;
 				bool		walked = false;
 				const char *why = NULL;
 
@@ -12845,9 +14211,21 @@ bmap_redo(XLogReaderState *record)
 					char	   *data = XLogRecGetBlockData(record, 0, &len);
 
 					/* (the root's delta comes with its image too) */
-					if (data == NULL || len != sizeof(sdelta))
-						elog(PANIC, "block map snapshot record without its slot's delta");
-					memcpy(&sdelta, data, sizeof(sdelta));
+					if (xlrec->op == BMAP_TREE_CAPTURE)
+					{
+						xl_bmap_roots_delta rdelta;
+
+						if (data == NULL || len != sizeof(rdelta))
+							elog(PANIC, "block map capture record without its slot's delta");
+						memcpy(&rdelta, data, sizeof(rdelta));
+						sdelta.snap = rdelta.root.snap;
+					}
+					else
+					{
+						if (data == NULL || len != sizeof(sdelta))
+							elog(PANIC, "block map snapshot record without its slot's delta");
+						memcpy(&sdelta, data, sizeof(sdelta));
+					}
 					/* (every snapshot kept logs its own blocks as images) */
 					if (!(xlrec->flags & BMAP_TREE_PRESERVE_LOGGED))
 						elog(PANIC, "block map snapshot record of %s without its own blocks' images",
@@ -13076,4 +14454,11 @@ void
 bmap_mask(char *pagedata, BlockNumber blkno)
 {
 	mask_page_lsn_and_checksum(pagedata);
+
+	/*
+	 * A map's identity is where the record that made it began, set once it
+	 * is inserted (a record's image of the page is taken before)
+	 */
+	if (map_page_is((const PGIOAlignedBlock *) pagedata, BMAP_PAGE_ROOT))
+		PageGetBmapRoot((Page) pagedata)->map_id = 0;
 }

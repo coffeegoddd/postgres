@@ -63,9 +63,9 @@ $$;
 -- the working set is the head's
 CREATE FUNCTION clean() RETURNS bool LANGUAGE sql AS
 $$SELECT NOT EXISTS (SELECT FROM dolt_status)$$;
--- the snapshots a table's storage keeps
+-- the roots captured of a table's storage, held
 CREATE FUNCTION kept(rel regclass) RETURNS bigint LANGUAGE sql AS
-$$SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode(rel))$$;
+$$SELECT test_bmap_roots_of(pg_relation_filenode(rel))$$;
 
 SELECT dolt_commit('-Am', 'load') IS NOT NULL AS committed;
 SELECT rows_digest() AS at_load \gset

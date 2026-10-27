@@ -10,14 +10,16 @@ quadratic one's last mean is about 9 times its first at V7's sizes.  A
 counter fails when its last mean over its first passes the bound and the
 last mean is above its floor (work too small to count either way passes).
 
-configs/v_growth_accept.toml lists growth that is known and has an issue
-to fix it, one [[accept]] entry each (workload "V7/<variant>", engine,
-counter, reason), in perf_accept.toml's format.  Unlike perf_accept.toml's
-entries, these stand until removed: the fix that ends the growth removes
-its entries.  An accepted counter that no longer grows fails, as does an
-entry that names no counter of the run, so a stale entry can't go on
-accepting a later regression.  Counters that count autovacuum's work too
-are reported, not gated, in the variants that run it.
+Work done once every so many transactions (a root captured each interval)
+makes a counter's series periodic: a few transactions cost many times the
+rest.  A tenth then holds one more or one fewer of them by where they fall,
+and its mean says so, not growth.  So where a series has such events (at
+least MIN_EVENTS transactions, and no more than MAX_EVENT_SHARE of them,
+above EVENT_FACTOR times its median), it is judged twice, and grows if
+either does: its baseline (the series without the events) by its tenths,
+as any other series; and the events' cost per transaction (their mean
+size over their mean spacing) over the first fifth of them against the
+last, so that events growing larger or coming more often both show.
 """
 
 from __future__ import annotations
@@ -87,12 +89,60 @@ def growth_metrics(series: dict[str, Optional[list[float]]],
     return out
 
 
-def means(series: list[float], fraction: float = 0.1) -> tuple[float, float]:
-    """The mean of a per-transaction series' first and last fraction."""
+# A transaction costing this many times the series' median is a periodic
+# event's (see the module's docstring), if there are this many of them,
+# and they are no more than this share of the series (more are no events,
+# but the work it does).
+EVENT_FACTOR = 10.0
+MIN_EVENTS = 3
+MAX_EVENT_SHARE = 0.05
+
+
+def events(series: list[float]) -> list[int]:
+    """The indexes of a series' periodic events: none if it has fewer than
+    MIN_EVENTS or more than MAX_EVENT_SHARE of it, or its median is 0."""
+    ordered = sorted(series)
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return []
+    at = [i for i, v in enumerate(series) if v > EVENT_FACTOR * median]
+    if len(at) < MIN_EVENTS or len(at) > MAX_EVENT_SHARE * len(series):
+        return []
+    return at
+
+
+def tenths(series: list[float], fraction: float = 0.1) -> tuple[float, float]:
+    """The mean of a series' first and last fraction."""
     k = max(1, int(len(series) * fraction))
     if len(series) < 2 * k:
         raise ValueError("a series needs at least two tenths that don't overlap")
     return sum(series[:k]) / k, sum(series[-k:]) / k
+
+
+def event_costs(series: list[float], at: list[int]) -> tuple[float, float]:
+    """The events' cost per transaction, mean size over mean spacing, over
+    their first fifth and their last (each at least two events)."""
+    m = max(2, len(at) // 5)
+    first, last = at[:m], at[-m:]
+
+    def cost(group):
+        size = sum(series[i] for i in group) / len(group)
+        spacing = (group[-1] - group[0]) / (len(group) - 1)
+        return size / max(spacing, 1.0)
+    return cost(first), cost(last)
+
+
+def means(series: list[float], fraction: float = 0.1) -> tuple[float, float]:
+    """A per-transaction series' first and last means: its tenths'; or, for
+    a periodic one, its baseline's tenths' or its events' costs, whichever
+    grows more."""
+    at = events(series)
+    if not at:
+        return tenths(series, fraction)
+    skip = set(at)
+    base = tenths([v for i, v in enumerate(series) if i not in skip], fraction)
+    ev = event_costs(series, at)
+    return max(base, ev, key=lambda p: ratio(*p))
 
 
 @dataclass
