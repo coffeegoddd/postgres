@@ -894,6 +894,7 @@ typedef struct PlanCommit
 	ProllyHash	id;				/* key */
 	PlanEntry	e;
 	TimestampTz young_cut;		/* young() as of this cut (DT_NOBEGIN: none) */
+	TimestampTz arrived;		/* dated past now: when first seen here */
 	bool		young;
 	bool		kept;
 	bool		pinned;			/* kept as a ref's commit, not a window's */
@@ -928,6 +929,7 @@ typedef struct Plan
 	List	   *stops;			/* ProllyHash *, outside it, its commits name */
 	HTAB	   *archived;		/* the horizon's parents now */
 	HTAB	   *heights;		/* of commits recording none */
+	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
 } Plan;
 
 static bool
@@ -953,6 +955,7 @@ plan_commit(Plan *plan, const ProllyHash *id)
 		pc->by_base = false;
 		pc->young_cut = DT_NOBEGIN;
 		pc->young = false;
+		pc->arrived = DT_NOBEGIN;
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1187,10 +1190,94 @@ note_merge_bases(Plan *plan)
  * is past.)  Found once for each commit and cut, walking down only past
  * commits older than the cut: O(what a sever walks anyway).
  */
+/*
+ * A sever's clock: fixed when it begins, so the plans it makes again (the
+ * refs moved meanwhile) cut where the first did, and only take in the
+ * commits made since above the cut.  DT_NOBEGIN: no sever's, now.
+ */
+static TimestampTz sever_clock = DT_NOBEGIN;
+
+static TimestampTz
+plan_now(void)
+{
+	return sever_clock != DT_NOBEGIN ? sever_clock : GetCurrentTimestamp();
+}
+
+#define KEY_ARRIVED		'a'
+
+/*
+ * A commit dated past now ages from when it arrived here: when a sever's
+ * plan first saw it (kept beside the horizon, 'a'), or now if none has.
+ * So one --date in the future, or a pull of a clock skewed ahead, keeps
+ * the history above it no longer than any other; a warning says so, once.
+ */
+static TimestampTz
+age_date(Plan *plan, PlanCommit *pc)
+{
+	StringInfoData k;
+	StringInfoData v;
+	ProllyKey	key;
+
+	/* (ahead of the clock as it is, not as a sever fixed it) */
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (pc->e.committed_at <= now)
+		return pc->e.committed_at;
+	if (pc->arrived != DT_NOBEGIN)
+		return pc->arrived;
+	initStringInfo(&k);
+	initStringInfo(&v);
+	appendStringInfoChar(&k, KEY_ARRIVED);
+	put_id(&k, &pc->id);
+	key.data = (const uint8 *) k.data;
+	key.len = k.len;
+	if (PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v) && v.len == 8)
+		pc->arrived = (TimestampTz) get_be64(v.data);
+	else
+	{
+		pc->arrived = now;
+		plan->arrivals = lappend(plan->arrivals, pc);
+		ereport(WARNING,
+				(errmsg("commit %s is dated %s, after it arrived here",
+						prolly_hash_hex(&pc->id),
+						timestamptz_to_str(pc->e.committed_at)),
+				 errdetail("It ages from %s instead.",
+						   timestamptz_to_str(now))));
+	}
+	pfree(k.data);
+	pfree(v.data);
+	return pc->arrived;
+}
+
+/* Keep the arrivals a sever's plan saw first.  The caller holds the refs. */
+static void
+record_arrivals(Plan *plan)
+{
+	foreach_ptr(PlanCommit, pc, plan->arrivals)
+	{
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		ProllyValue value;
+
+		initStringInfo(&k);
+		initStringInfo(&v);
+		appendStringInfoChar(&k, KEY_ARRIVED);
+		put_id(&k, &pc->id);
+		put_be64(&v, (uint64) pc->arrived);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		value.data = (const uint8 *) v.data;
+		value.len = v.len;
+		PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+		pfree(k.data);
+		pfree(v.data);
+	}
+}
+
 static bool
 young(Plan *plan, PlanCommit *pc, TimestampTz cut)
 {
-	TimestampTz now = GetCurrentTimestamp();
 	List	   *stack;
 
 	if (pc->young_cut == cut && cut != DT_NOBEGIN)
@@ -1200,7 +1287,7 @@ young(Plan *plan, PlanCommit *pc, TimestampTz cut)
 	{
 		PlanCommit *top = llast(stack);
 		bool		pending = false;
-		bool		result = Min(top->e.committed_at, now) >= cut;
+		bool		result = age_date(plan, top) >= cut;
 
 		if (top->young_cut == cut && cut != DT_NOBEGIN)
 		{
@@ -1302,7 +1389,7 @@ add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
 static bool
 head_windows(Plan *plan, const TimestampTz *before)
 {
-	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz now = plan_now();
 	int64		hot = database_span("prolly.history_hot");
 
 	/* (what is younger than hot is kept, whatever cut is given) */
@@ -1456,6 +1543,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 	Plan		plan;
 	ListCell   *lc;
 
+	sever_clock = DT_NOBEGIN;
 	window_init();
 	/* (read as the refs stand: no ref is held, nothing written) */
 	make_plan(&plan, before);
@@ -2170,6 +2258,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	 * horizon (an archive takes longer, and collections would wait).
 	 */
 	sever_slot_lock();
+	sever_clock = GetCurrentTimestamp();
 	for (int tries = 1;; tries++)
 	{
 		ProllyHash	now;
@@ -2177,7 +2266,15 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
 		make_plan(&plan, before);
 		if (plan.severed == NIL)
+		{
+			/* (nothing to sever, but commits dated ahead seen first) */
+			if (plan.arrivals != NIL)
+			{
+				PROLLY_CALL(dc.refs, lock);
+				record_arrivals(&plan);
+			}
 			return;
+		}
 
 		/* (archive mode with nowhere to archive to: nothing is severed) */
 		if (action == PROLLY_WINDOW_ARCHIVE && archive_url == NULL)
@@ -2243,6 +2340,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 					 errhint("Sever again.")));
 		plan = again;
 	}
+	record_arrivals(&plan);
 	f.number = next_number();
 	initStringInfo(&k);
 	initStringInfo(&v);

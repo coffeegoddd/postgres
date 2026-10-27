@@ -273,6 +273,8 @@ DROP DATABASE regress_history_window_d;
 -- them; one dated in the future keeps itself and what is above it until
 -- its date; history merged in with old dates of its own ages by them.
 CREATE DATABASE regress_history_window_f;
+-- (its commits' hashes vary with now(): a warning naming one kept out)
+ALTER DATABASE regress_history_window_f SET client_min_messages = error;
 \c regress_history_window_f
 CREATE SCHEMA hw VERSIONED;
 CREATE TABLE hw.t (id int PRIMARY KEY, v text);
@@ -310,6 +312,32 @@ SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
 WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
 \c regress_history_window
 DROP DATABASE regress_history_window_f;
+
+-- A commit dated far ahead ages from when a sever first saw it here, with
+-- a warning: once the window is past that, it is severed like any other.
+CREATE DATABASE regress_history_window_g;
+\c regress_history_window_g
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'start');
+SELECT length(dolt_commit('-Am', 'start', '--date', '2020-01-01')::text) > 0 AS committed;
+UPDATE hw.t SET v = 'ahead';
+SELECT length(dolt_commit('-am', 'ahead', '--date', '2099-01-01')::text) > 0 AS committed;
+UPDATE hw.t SET v = 'now';
+SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_g SET prolly.history_warm = '1 second';
+ALTER DATABASE regress_history_window_g SET prolly.history_window_action = delete;
+\c regress_history_window_g
+\set VERBOSITY terse
+SELECT fragment, commits FROM dolt_history_sever();
+SELECT pg_sleep(1.5);
+UPDATE hw.t SET v = 'later';
+SELECT length(dolt_commit('-am', 'later')::text) > 0 AS committed;
+SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
+	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+\c regress_history_window
+DROP DATABASE regress_history_window_g;
 
 \c :home
 DROP DATABASE regress_history_window;
