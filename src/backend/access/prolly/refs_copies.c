@@ -333,7 +333,8 @@
 #define TAG_IDENTITY	'I'	/* the working set's identity anchor */
 #define TAG_TAG			'T'	/* a tag, by name */
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
-#define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
+#define TAG_KEPT		'~'	/* the commits a branch's pages are kept as of
+								 * (last of the tags: see kept_prefix()) */
 #define TAG_KEPT_SUMMARY 'L'	/* and a summary of them */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
@@ -350,8 +351,6 @@
  * they hold is a seek of the refs, not a read of every branch's entries;
  * each key ends with the branch's name.
  */
-#define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
-#define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
 #define TAG_KEPT_UNFROZEN 'u'	/* a branch's kept commits to be frozen */
 #define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
 #define TAG_FOLDED		'f'	/* a branch's name, case folded */
@@ -390,7 +389,7 @@
  * number), with counts of the entries naming each root and a summary of
  * the branch's; and an index of tags by commit.
  */
-#define REFS_FORMAT		"26"
+#define REFS_FORMAT		"27"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -1860,12 +1859,8 @@ entry_branch(const char *key, int keylen, int *len)
 		return NULL;
 	switch (key[0])
 	{
-		case TAG_KEPT_OF:
 		case TAG_ROOT_OF:
 			skip = 1;
-			break;
-		case TAG_KEPT_TABLE:
-			skip = 2;
 			break;
 		case TAG_FOLDED:
 			p = memchr(p, '\0', end - p);
@@ -4069,7 +4064,8 @@ root_due(const char *name, const KeptSummary *s, const ProllyHash *commit_id)
  */
 #define KEPT_LIVE		'l'
 #define KEPT_RETIRED	'r'
-#define KEPT_HOLDS		'h'
+#define KEPT_HOLDS		'x'
+#define KEPT_DATA		'y'
 
 
 static void put_be32(StringInfo out, uint32 v);
@@ -4394,32 +4390,28 @@ kept_declare(const ProllyKey *key, const char *p, const char *end,
 }
 
 /*
- * The index entries of a live kept commit: the commit's ('k'), and each
- * of its tables' data trees' ('s').  None for one retired, which no reader
- * takes.
+ * The index entries of a live kept commit: each of its tables' data trees'
+ * (KEPT_DATA, under the branch's prefix).  None for one retired, which no
+ * reader takes.  A commit's own entry is found by its height, so it needs
+ * none.
  */
 static List *
 kept_index_keys(const char *name, const KeptCommit *kc)
 {
 	List	   *keys = NIL;
-	StringInfo	k;
 
 	if (FullTransactionIdIsValid(kc->retired))
 		return NIL;
-	k = makeStringInfo();
-	appendStringInfoChar(k, TAG_KEPT_OF);
-	put_hash(k, &kc->commit);
-	appendStringInfoString(k, name);
-	keys = lappend(keys, k);
 	for (int t = 0; t < kc->ntables; t++)
 	{
+		StringInfo	k;
+
 		if (kc->tables[t].data.len == 0)
 			continue;
 		k = makeStringInfo();
-		appendStringInfoChar(k, TAG_KEPT_TABLE);
+		kept_prefix(k, name, KEPT_DATA);
 		put_hash(k, &kc->tables[t].data);
 		put_hash(k, &kc->commit);
-		appendStringInfoString(k, name);
 		keys = lappend(keys, k);
 	}
 	return keys;
@@ -4969,37 +4961,88 @@ typedef struct KeptHolder
 	ProllyHash	commit;
 } KeptHolder;
 
-/* An index entry of kept_holders()'s prefix: its commit (if keyed by data) and name. */
 static void
-note_kept_holder(const ProllyKey *k, const ProllyValue *v, void *arg)
+note_kept_branch(const ProllyKey *k, const ProllyValue *v, void *arg)
 {
-	List	  **out = arg;
-	const char *p = (const char *) k->data + 1;
-	const char *end = (const char *) k->data + k->len;
-	KeptHolder *h = palloc0(sizeof(KeptHolder));
-	ProllyHash	skipped;
+	List	  **names = arg;
 
-	if (k->data[0] == TAG_KEPT_TABLE)
-		p = get_hash(p, end, &skipped);
-	p = get_hash(p, end, &h->commit);
-	h->name = pnstrdup(p, end - p);
-	*out = lappend(*out, h);
+	*names = lappend(*names, pnstrdup((const char *) k->data + 1, k->len - 1));
 }
 
+/*
+ * The branches keeping any commit's pages (those with a summary): a scan
+ * of the summaries, one entry for each branch.
+ */
+static List *
+kept_branches(void)
+{
+	char		prefix = TAG_KEPT_SUMMARY;
+	List	   *names = NIL;
+
+	visit_prefix(&prefix, 1, note_kept_branch, &names);
+	return names;
+}
+
+/* A data index entry of a branch's prefix: its commit, after the data. */
+typedef struct DataHolders
+{
+	const char *name;
+	int			prefix_len;
+	List	   *holders;
+} DataHolders;
+
+static void
+note_data_holder(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	DataHolders *dh = arg;
+	KeptHolder *h = palloc0(sizeof(KeptHolder));
+
+	(void) get_hash((const char *) k->data + dh->prefix_len,
+					(const char *) k->data + k->len, &h->commit);
+	h->name = pstrdup(dh->name);
+	dh->holders = lappend(dh->holders, h);
+}
+
+/*
+ * The refs' kept_holders(): each branch keeping pages is asked, a seek of
+ * its own entries (by the commit's height, or its index of data trees),
+ * so the work is in the branches that keep any, not in what they keep.
+ */
 static void
 copies_kept_holders(const ProllyHash *commit, const ProllyHash *data,
 					ProllyKeptHolderVisit visit, void *arg)
 {
-	StringInfoData prefix;
 	List	   *holders = NIL;
 
 	refs_init();
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, data != NULL ? TAG_KEPT_TABLE : TAG_KEPT_OF);
-	put_hash(&prefix, data != NULL ? data : commit);
 	/* (read whole first: a visit may read the refs of its own) */
-	visit_prefix(prefix.data, prefix.len, note_kept_holder, &holders);
-	pfree(prefix.data);
+	foreach_ptr(char, name, kept_branches())
+	{
+		if (data == NULL)
+		{
+			KeptHolder *h;
+
+			if (kept_lookup(name, commit, false) == NULL)
+				continue;
+			h = palloc0(sizeof(KeptHolder));
+			h->name = name;
+			h->commit = *commit;
+			holders = lappend(holders, h);
+		}
+		else
+		{
+			StringInfoData prefix;
+			DataHolders dh = {name, 0, NIL};
+
+			initStringInfo(&prefix);
+			kept_prefix(&prefix, name, KEPT_DATA);
+			put_hash(&prefix, data);
+			dh.prefix_len = prefix.len;
+			visit_prefix(prefix.data, prefix.len, note_data_holder, &dh);
+			pfree(prefix.data);
+			holders = list_concat(holders, dh.holders);
+		}
+	}
 	foreach_ptr(KeptHolder, h, holders)
 		visit(h->name, &h->commit, arg);
 }
@@ -5925,11 +5968,6 @@ kept_orphans(const char *name, List *entries, int *n)
 	return out;
 }
 
-typedef struct KeptOf
-{
-	List	   *names;
-} KeptOf;
-
 /*
  * Could kept commit kc (NULL: none), another branch's, give a move its
  * pages?  Only once its roots are frozen: one captured among writers is
@@ -5947,32 +5985,29 @@ kept_serves_move(const KeptCommit *kc)
 	return true;
 }
 
-static bool note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg);
+static bool heads_at(const char *name, const ProllyHash *commit, bool all,
+					 List **names);
 
 /*
- * Does a branch but name keep commit's pages, frozen so that a move can
- * be given them (kept_serves_move()), held against its own keeps and
- * passes until the transaction ends?  Each branch the index of
- * kept commits names is tried, never waited for (one in a keeping
- * transaction now is passed over: its pass may be letting go of its
- * own), and its entry read again once held.  So two branches' passes
+ * Does a branch but name whose head is at commit keep its pages, frozen
+ * so that a move can be given them (kept_serves_move()), held against its
+ * own keeps and passes until the transaction ends?  Each branch the index
+ * of heads' roots names at commit is tried (a seek of its entries by the
+ * commit's height), never waited for (one in a keeping transaction now is
+ * passed over: its pass may be letting go of its own), and its entry read
+ * again once held.  So two branches' passes
  * can't each let go of their root on the strength of the other's: the
  * second waits for the first's branch, and finds its entry retired.
  */
 static bool
 kept_by_other(const char *name, const ProllyHash *commit)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
+	List	   *others = NIL;
 
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, other, ko.names)
+	(void) heads_at(name, commit, true, &others);
+	foreach_ptr(char, other, others)
 	{
-		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
+		if (!try_lock_branch(other, true))
 			continue;
 		if (kept_serves_move(kept_lookup(other, commit, false)))
 		{
@@ -5990,6 +6025,8 @@ typedef struct HeadAt
 	const ProllyHash *commit;
 	int			prefix_len;
 	bool		found;
+	bool		all;			/* every one, into names */
+	List	   *names;
 } HeadAt;
 
 static bool
@@ -6003,22 +6040,27 @@ note_head_at(const ProllyKey *k, const ProllyValue *v, void *arg)
 
 	if (strcmp(other, ha->name) != 0 && branch_head(other, &head) &&
 		same_hash(&head, ha->commit))
+	{
 		ha->found = true;
+		if (ha->all)
+			ha->names = lappend(ha->names, pstrdup(other));
+	}
 	pfree(other);
-	return !ha->found;
+	return ha->all || !ha->found;
 }
 
 /*
- * Is another branch than name's head at commit?  A seek of the index of
- * heads' roots, at commit's root: only the branches whose heads have that
- * root are read.
+ * The branches but name (NULL: none passed over) whose heads are at commit
+ * (all: every one, into *names; else whether any is).  A seek of the index
+ * of heads' roots, at commit's root: only the branches whose heads have
+ * that root are read.
  */
 static bool
-head_elsewhere(const char *name, const ProllyHash *commit)
+heads_at(const char *name, const ProllyHash *commit, bool all, List **names)
 {
 	StringInfoData prefix;
 	ProllyHash	root;
-	HeadAt		ha = {name, commit, 0, false};
+	HeadAt		ha = {name ? name : "", commit, 0, false, all, NIL};
 
 	if (!head_commit_root(commit, &root))
 		return false;
@@ -6029,7 +6071,16 @@ head_elsewhere(const char *name, const ProllyHash *commit)
 	ha.prefix_len = prefix.len;
 	visit_prefix_while(prefix.data, prefix.len, false, note_head_at, &ha);
 	pfree(prefix.data);
+	if (names)
+		*names = ha.names;
 	return ha.found;
+}
+
+/* Is another branch than name's head at commit? */
+static bool
+head_elsewhere(const char *name, const ProllyHash *commit)
+{
+	return heads_at(name, commit, false, NULL);
 }
 
 /* Does a tag name commit (a seek of the tags' index)? */
@@ -6399,49 +6450,35 @@ retain_kept_branches(void)
 	}
 }
 
-static bool
-note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
-{
-	KeptOf	   *ko = arg;
-	const char *p = (const char *) k->data + 1;
-	const char *end = (const char *) k->data + k->len;
-	ProllyHash	commit;
-
-	p = get_hash(p, end, &commit);
-	ko->names = lappend(ko->names, pnstrdup(p, end - p));
-	return true;
-}
-
 /*
  * The commits commit reaches, as a branch's kept commit of it records
- * them (a seek of the index of kept commits); false if none keeps it with
- * a count.
+ * them: the session's branch's first, then each other keeping any (a seek
+ * of each one's entries by the commit's height); false if none keeps it
+ * with a count.
  */
 static bool
 kept_count_get(const ProllyHash *commit, int64 *n)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
-	bool		found = false;
+	const char *current = branch_ops()->current();
+	List	   *names = kept_branches();
 
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, name, ko.names)
+	if (current != NULL)
+		names = lcons((char *) current, names);
+	foreach_ptr(char, name, names)
 	{
-		KeptCommit *kc = kept_lookup(name, commit, false);
+		KeptCommit *kc;
 
+		if (current != NULL && foreach_current_index(name) > 0 &&
+			strcmp(name, current) == 0)
+			continue;
+		kc = kept_lookup(name, commit, false);
 		if (kc != NULL && kc->commits > 0)
 		{
 			*n = kc->commits;
-			found = true;
-			break;
+			return true;
 		}
 	}
-	list_free_deep(ko.names);
-	return found;
+	return false;
 }
 
 /* A count known of commit: from known (live entries), else any branch's. */
@@ -6534,16 +6571,8 @@ copies_commit_count(const ProllyHash *commit, int64 *count)
 static void
 copies_forget_kept(const ProllyHash *commit)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
-
 	refs_init();
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, name, ko.names)
+	foreach_ptr(char, name, kept_branches())
 	{
 		KeptCommit *kc;
 
