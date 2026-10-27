@@ -2,6 +2,10 @@
 from collections import defaultdict
 from html import escape
 
+# (the path counters a latency cell names, where they moved)
+PATH_NOTED = ("moves_root_kept", "moves_root_nearest", "moves_root_missing", "move_tables_written",
+              "restores_lock_busy", "severed_refusals")
+
 
 ENGINES = ("dolt", "doltgres", "prolly")
 ENGINE_NAMES = ("Dolt", "Doltgres", "PostgreSQL prolly")
@@ -18,6 +22,7 @@ OPERATIONS = {
     "diff_history": "Diff old → HEAD",
     "diff_working_history": "Diff old → working",
     "resolve_ancestor": "Resolve ancestor",
+    "at_history": "Read rows as of old (dolt_at)",
     "drop_table": "Drop table",
 }
 
@@ -171,11 +176,17 @@ def render(path, manifest, summaries, fits, drift=()):
     for row in summaries:
         fixture = (row['rows'], row['changed_rows'], row['history_commits'],
                    row.get('working_set', 'clean'), row.get('dirty_rows', 0))
-        case = (row['operation'], row['distance'])
+        case = (row['operation'], row['distance'], row.get('window', 'in'))
         fixtures[fixture][(row['pass'], case)][row['engine']] = row
 
     def case_order(case):
-        return (list(OPERATIONS).index(case[0]) if case[0] in OPERATIONS else 99, case)
+        return (case[2] != 'in', list(OPERATIONS).index(case[0]) if case[0] in OPERATIONS else 99, case)
+
+    def op_name(case):
+        """The operation, and if its target is past the history window, so
+        labelled: those are measured apart, never with the window's."""
+        name = OPERATIONS.get(case[0], case[0])
+        return name if case[2] == 'in' else f"{name} [past the history window]"
 
     def fixture_title(fixture):
         n, k, h, working_set, dirty = fixture
@@ -203,27 +214,69 @@ def render(path, manifest, summaries, fits, drift=()):
             rows = []
             for case in selected:
                 engines = cases[(mode, case)]
-                rows.append([OPERATIONS.get(case[0], case[0]), case[1],
+                rows.append([op_name(case), case[1],
                              *[formatter(engines[e]) if e in engines else '—' for e in ENGINES]])
             doc.table(['Operation', 'Distance (commits)', *ENGINE_NAMES], rows)
         if not found:
             doc.paragraph("This pass was not measured.")
 
+    def window_section():
+        doc.heading(2, 'History window')
+        doc.paragraph('Version-control operations are measured inside the history window, where each commit '
+                      'keeps a root of its pages. PostgreSQL prolly\'s window is set to hold all the history a '
+                      'run builds, at every size; Dolt and Doltgres keep all history locally. A target outside '
+                      'the window would be measured apart, labelled [past the history window], never in the '
+                      'window\'s medians. Root counts are the commits the fixture branch keeps roots of, at the '
+                      'cell\'s start and end.')
+        windows = manifest.get('windows', {})
+        rows = []
+        for engine in sorted(windows):
+            for cell, state in sorted(windows[engine].items()):
+                before, after = state.get('before'), state.get('after')
+                if not before:
+                    continue
+                roots = lambda s: ', '.join(f"{count(v)}" for v in (s or {}).get('roots', {}).values()) or '—'
+                rows.append([dict(zip(ENGINES, ENGINE_NAMES)).get(engine, engine), cell,
+                             before.get('time_window', '—'), count(before.get('min_commits', 0)),
+                             f"{before.get('prolly.root_interval', '—')} ms / "
+                             f"{before.get('prolly.root_interval_commits', '—')} commits",
+                             roots(before), roots(after)])
+        if rows:
+            doc.table(['Engine', 'Cell', 'Time window', 'Min commits', 'Root interval', 'Roots (start)',
+                       'Roots (end)'], rows)
+        else:
+            doc.paragraph('No engine with a history window was measured.')
+
     cell_fields = ('engine', 'operation', 'rows', 'changed_rows', 'history_commits',
-                   'working_set', 'dirty_rows', 'distance', 'pass')
+                   'working_set', 'dirty_rows', 'distance', 'window', 'pass')
     drifting = {tuple(f.get(k) for k in cell_fields) + (f['metric'],): f for f in drift}
 
     def drift_mark(row, metric):
         flag = drifting.get(tuple(row.get(k) for k in cell_fields) + (metric,))
         return f" [drift {'↑' if flag['direction'] == 'rising' else '↓'}]" if flag else ''
 
+    def path_note(r):
+        """The root the target was checked to have and the path counters'
+        medians (an engine without a history window has none)."""
+        if 'target_root' not in r:
+            return ''
+        root = r['target_root'] + (f" {r['root_distance']} back" if r.get('root_distance') else '')
+        moved = ', '.join(f"{name} {count(r['median_path_' + name])}" for name in PATH_NOTED
+                          if r.get('median_path_' + name))
+        return f"; root {root}" + (f"; {moved}" if moved else '')
+
+    window_section()
     comparisons('Latency',
                 'Each cell: median milliseconds [minimum–maximum]; n = measured repetitions. '
                 'The range describes observed variation, not a confidence interval. Distance 0 is the current root '
                 '(checkout switches branches with the same root). [drift ↑] or [drift ↓] marks a cell whose '
-                'repetitions rise or fall with run order (see Run-order drift).',
+                'repetitions rise or fall with run order (see Run-order drift). For PostgreSQL prolly, each '
+                'cell also gives the root its target was checked to have before every repetition (kept: its '
+                'own; nearest: one on a commit before it, within the root interval) and the medians of the '
+                'path counters the operation moved (pg_stat_prolly, checked after every repetition: no rows '
+                'written for want of a root, no restore given up, nothing refused past the horizon).',
                 'timing', lambda r: f"{number(r['median_ms'])} ms [{number(r['min_ms'])}–{number(r['max_ms'])}]; "
-                                    f"n={r['repetitions']}{drift_mark(r, 'elapsed_ns')}")
+                                    f"n={r['repetitions']}{drift_mark(r, 'elapsed_ns')}{path_note(r)}")
 
     doc.heading(2, 'Run-order drift')
     doc.paragraph('A series drifts when its samples, taken in run order, rise or fall together more than chance '
@@ -299,7 +352,7 @@ def render(path, manifest, summaries, fits, drift=()):
                 engines = measured_in(cases, case, metric, pass_)
                 if engines is None:
                     continue
-                rows.append([OPERATIONS.get(case[0], case[0]), case[1], label,
+                rows.append([op_name(case), case[1], label,
                              *[resource_cell(engines[e], metric, unit, scale)
                                if e in engines else '—' for e in ENGINES]])
         if not rows:
@@ -333,7 +386,7 @@ def render(path, manifest, summaries, fits, drift=()):
             names = sorted({k[len('median_counter_'):] for r in engines.values() for k in r
                             if k.startswith('median_counter_')})
             for name in names:
-                rows.append([OPERATIONS.get(case[0], case[0]), case[1], name,
+                rows.append([op_name(case), case[1], name,
                              *[counter_cell(engines[e], name) if e in engines else '—' for e in ENGINES]])
         if not rows:
             continue

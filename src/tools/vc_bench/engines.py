@@ -92,6 +92,43 @@ class Engine:
         for an engine that keeps none."""
         return None
 
+    # -- history window -----------------------------------------------------
+
+    def window_settings(self, c):
+        """The database settings (name: value) that make the engine's
+        history window hold all the history a run builds (window.settings());
+        {} for an engine that keeps all its history locally."""
+        return {}
+
+    def apply_window(self, admin, db, c):
+        """Set the window on database db, from an administrative session,
+        before the fixture's history is built and before a run's session
+        connects."""
+        for name, value in self.window_settings(c).items():
+            admin.query(f"ALTER DATABASE {db} SET {name} = {literal(value)}")
+
+    def window_state(self, sql, branches):
+        """The window as the database has it, and the roots each of branches
+        keeps: recorded with a run.  None for an engine without a window."""
+        return None
+
+    def target(self, sql, chain, index, c):
+        """Where chain[index] is measured (window.classify()), asked of the
+        engine before each operation."""
+        import window
+        return window.local_target()
+
+    def path_counters(self, sql):
+        """The counters an operation's path is told by
+        (window.PATH_COUNTERS), as counters() reads them; None for an
+        engine without a window."""
+        return None
+
+    def at_sql(self, commit, ids):
+        """The benchmark rows id IN ids, as commit has them, ordered by id."""
+        return (f"SELECT id,revision FROM bench_rows AS OF {literal(commit)} "
+                f"WHERE {self.ids_in(ids)} ORDER BY id")
+
 
 def literal(value):
     return "'" + str(value).replace("'", "''") + "'"
@@ -291,6 +328,47 @@ class Prolly(Engine):
     def settings(self, sql):
         names = ",".join(literal(s) for s in self.SETTINGS)
         return sql.query(f"SELECT name,setting FROM pg_settings WHERE name IN ({names})")["rows"]
+
+    def window_settings(self, c):
+        import window
+        return window.settings(c)
+
+    def window_state(self, sql, branches):
+        policy = sql.query("SELECT action,time_window::text,min_commits,max_size "
+                           f"FROM prolly_history_policy({literal(branches[0])})")["rows"][0]
+        intervals = sql.query("SELECT name,setting FROM pg_settings WHERE name IN "
+                              "('prolly.root_interval','prolly.root_interval_commits',"
+                              "'prolly.history_root_max_size')")["rows"]
+        roots = {b: int(sql.scalar(f"SELECT count(*) FROM prolly_history_roots({literal(b)}, NULL)"))
+                 for b in branches}
+        return {"action": policy[0], "time_window": policy[1], "min_commits": int(policy[2]),
+                "max_size": policy[3], **{name: value for name, value in intervals}, "roots": roots}
+
+    def target(self, sql, chain, index, c):
+        import window
+        interval = int(window.settings(c)["prolly.root_interval_commits"])
+        return window.classify(
+            chain, index,
+            lambda commit: sql.scalar(f"SELECT prolly_history_in_window(NULL, {literal(commit)})") in ("t", "true"),
+            lambda commit: int(sql.scalar("SELECT count(*) FROM prolly_history_roots(NULL, "
+                                          f"{literal(commit)})")) > 0,
+            interval, c.get("history_window", {}).get("allow_past", False))
+
+    def path_counters(self, sql):
+        import window
+        names = ",".join(literal(n) for n in window.PATH_COUNTERS)
+        sql.query("SELECT pg_stat_force_next_flush()")
+        got = {name: int(value) for name, value in
+               sql.query(f"SELECT name, value FROM pg_stat_prolly WHERE name IN ({names})")["rows"]}
+        missing = set(window.PATH_COUNTERS) - set(got)
+        if missing:
+            raise RuntimeError("pg_stat_prolly lacks the path counters " + ", ".join(sorted(missing)) +
+                               "; the server predates them")
+        return got
+
+    def at_sql(self, commit, ids):
+        return (f"SELECT id,revision FROM dolt_at({literal(commit)}, NULL::bench_rows) "
+                f"WHERE {self.ids_in(ids)} ORDER BY id")
 
 
 ENGINES = {e.name: e for e in (Dolt(), Doltgres(), Prolly())}

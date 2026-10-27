@@ -6,6 +6,8 @@
 # the operation's target; known exceptions, each owned by an issue, are in
 # v_shape_known.toml.  Counts, not timings: they repeat on any machine.
 
+# V9 counts each operation's work in the default history window, which
+# holds every commit of a point; it sets no window of its own.
 [run]
 quality = "smoke"
 # (three, the median of each count taken: an index keyed at hash-random

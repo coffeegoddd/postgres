@@ -87,18 +87,24 @@ tests = ["oltp_read_write", "oltp_read_only", "oltp_write_only",
 modes = ["serial", "throughput"]
 
 [workloads.V1]
+# (measured inside the history window: one far longer than the run, so every
+# commit it makes keeps a root)
+history_window = "100 years"
 iterations = 20
 
 [workloads.V2]
+history_window = "100 years"
 changes = [1, 100, 10000, 1000000]
 iterations = 10
 
 [workloads.V3]
+history_window = "100 years"
 changes = [100, 10000]
 locality = ["clustered", "scattered"]
 conflict_percent = [0]
 
 [workloads.V4]
+history_window = "100 years"
 
 [workloads.V6]
 branches = [20]

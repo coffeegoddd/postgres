@@ -6,6 +6,17 @@ Every V workload has a "background" variant dimension: "none", or "S1" to
 run pgbench TPC-B alongside the version-control operations, measuring how
 each affects the other.  With background S1 the client count is the number
 of background pgbench clients; without it, only one client count is run.
+
+The latency workloads (V1 to V6) measure inside the history window, where
+every commit keeps a root of its pages: each sets the window on its
+database before it builds any history (WINDOW_SETTINGS, the workload's
+"history_window" parameter overriding the span), and checks after its
+operations that they took the root path (pg_stat_prolly's path counters:
+no move without a root, no restore given up, nothing refused past the
+horizon; a check failed fails the run), reporting the counters and the
+window beside the latencies.  V7 to V10 are counter, storage and cleanup
+gates: they set no window, the default (a month) holding every commit they
+make, so their counts stay comparable run to run.
 """
 
 from __future__ import annotations
@@ -53,9 +64,74 @@ class _DoltSQL:
 # The version-control statements every V workload uses.
 VC_SQL = _DoltSQL()
 
+# The history window a latency workload measures in, as its database has it:
+# a span far longer than any run, and a root at every commit.
+WINDOW_SETTINGS = {"prolly.history_window": "100 years",
+                   "prolly.root_interval": "0",
+                   "prolly.root_interval_commits": "1"}
+
+# pg_stat_prolly's counters an operation's path is told by.
+PATH_COUNTERS = ("moves_root_kept", "moves_root_nearest", "moves_root_missing",
+                 "move_tables_written", "restores_lock_busy", "severed_refusals")
+
+
+def window_sql(dbname: str, settings: dict[str, str]) -> str:
+    """The window's settings, set on database dbname."""
+    return "\n".join(f"ALTER DATABASE {dbname} SET {name} = '{value}';"
+                      for name, value in settings.items())
+
+
+def path_failures(deltas: dict[str, int], rows_written_ok: bool) -> list[str]:
+    """Why operations whose path counters grew by deltas didn't take the
+    root path (none: they did).  rows_written_ok: operations that may write
+    rows other than by a move (a merge's)."""
+    out = []
+    if deltas.get("severed_refusals"):
+        out.append("refused, or left rows out, as history past the horizon")
+    if deltas.get("restores_lock_busy"):
+        out.append("gave up a restore for a lock and wrote rows instead")
+    if deltas.get("moves_root_missing"):
+        out.append("moved to a commit without a root")
+    if not rows_written_ok and deltas.get("move_tables_written"):
+        out.append(f"wrote rows ({deltas['move_tables_written']} tables) instead of giving back a root's pages")
+    return out
+
 
 class VWorkload(Workload):
     suite = "V"
+    # (a latency workload: measured inside the history window)
+    in_window = False
+    # (its operations may write rows other than by a move: a merge's)
+    rows_written_ok = False
+
+    def window_settings(self, ctx) -> dict[str, str]:
+        out = dict(WINDOW_SETTINGS)
+        if ctx.params.get("history_window"):
+            out["prolly.history_window"] = str(ctx.params["history_window"])
+        return out
+
+    def set_window(self, ctx) -> None:
+        """Set the window before the workload builds any history: a root
+        let go of, its commit outside the window, isn't kept again."""
+        if self.in_window:
+            ctx.cluster.sql(window_sql(ctx.dbname, self.window_settings(ctx)))
+
+    def path_counters(self, ctx) -> dict[str, int]:
+        names = ",".join(f"'{n}'" for n in PATH_COUNTERS)
+        out = ctx.cluster.sql("SELECT pg_stat_force_next_flush();\n"
+                              f"SELECT name || '=' || value FROM pg_stat_prolly WHERE name IN ({names})",
+                              dbname=ctx.dbname).stdout.split()
+        got = {k: int(v) for k, v in (line.split("=", 1) for line in out if "=" in line)}
+        missing = set(PATH_COUNTERS) - set(got)
+        if missing:
+            raise RuntimeError("pg_stat_prolly lacks the path counters " + ", ".join(sorted(missing)))
+        return got
+
+    def window_notes(self, ctx) -> list[str]:
+        roots = ctx.cluster.scalar("SELECT count(*) FROM prolly_history_roots('main', NULL)",
+                                   dbname=ctx.dbname)
+        return ["history window: " + ", ".join(f"{k} = {v}" for k, v in self.window_settings(ctx).items())
+                + f"; roots kept on main: {roots}"]
 
     def check(self, ctx):
         if ctx.table_am not in targets.VERSIONED_HISTORY:
@@ -102,6 +178,7 @@ class VWorkload(Workload):
         return int(ctx.size_params.get("v_rows", 100000))
 
     def prepare(self, ctx: Context) -> None:
+        self.set_window(ctx)
         n = self.rows(ctx)
         ctx.cluster.sql(f"""
             CREATE TABLE vc_data (id bigint PRIMARY KEY, payload text NOT NULL);
@@ -119,11 +196,22 @@ class VWorkload(Workload):
         return nullcontext()
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
+        # (read outside the measured window, before and after it)
+        before = self.path_counters(ctx) if self.in_window else None
         with self.background(ctx) as bg:
             with window:
                 outcome = self.operations(ctx)
         if bg is not None:
             outcome.metrics["background_tps"] = bg.tps()
+        if before is not None:
+            after = self.path_counters(ctx)
+            deltas = {n: after[n] - before[n] for n in PATH_COUNTERS}
+            failures = path_failures(deltas, self.rows_written_ok)
+            if failures:
+                raise RuntimeError(f"{self.id}: operations in the history window left the root path: "
+                                   + "; ".join(failures) + f" (path counters {deltas})")
+            outcome.metrics.update({"path_" + n: float(v) for n, v in deltas.items()})
+            outcome.notes += self.window_notes(ctx)
         return outcome
 
     def operations(self, ctx: Context) -> Outcome:
@@ -140,6 +228,7 @@ class VWorkload(Workload):
 @registry.workloads.register("V1")
 class V1(VWorkload):
     id, title = "V1", "Branch create and checkout"
+    in_window = True
 
     def operations(self, ctx):
         vc = VC_SQL
@@ -157,6 +246,7 @@ class V1(VWorkload):
 @registry.workloads.register("V2")
 class V2(VWorkload):
     id, title = "V2", "Commit after N row changes"
+    in_window = True
 
     def own_variants(self, params):
         return [(f"n{n}", {"changes": int(n)})
@@ -192,6 +282,8 @@ class V3(VWorkload):
     size, locality (clustered or scattered ids) and conflicting rows."""
 
     id, title = "V3", "Diff and merge"
+    in_window = True
+    rows_written_ok = True
 
     def own_variants(self, params):
         out = []
@@ -256,6 +348,7 @@ class V6(VWorkload):
     take (dolt_gc)."""
 
     id, title = "V6", "Space and collection after deleting branches"
+    in_window = True
 
     # the chunk store's files, in bytes
     SPACE = ("SELECT sum((pg_stat_file(d || '/' || f)).size) FROM "
@@ -319,12 +412,14 @@ class V4(VWorkload):
     its own, so a background workload's writes on main don't refuse it)."""
 
     id, title = "V4", "Clone, fetch and push between two instances"
+    in_window = True
 
     def own_variants(self, params):
         return [(f"n{n}", {"changes": int(n)})
                 for n in params.get("changes", [1000])]
 
     def prepare(self, ctx):
+        self.set_window(ctx)
         # Only the V data is committed: what a clone copies is the same with
         # or without a background workload (whose tables stay uncommitted).
         ctx.cluster.sql(f"""

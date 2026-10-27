@@ -14,6 +14,7 @@ from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, engi
                   write_json)
 from engines import literal
 from memory import Sampler
+import window
 
 # (the same in every engine: Dolt's and prolly's dolt_branches)
 BRANCH_COUNT_SQL = "SELECT count(*) FROM dolt_branches WHERE name={}"
@@ -71,9 +72,14 @@ def integer(value):
     return int(number)
 
 
-def probe(sql, n, k, revision):
+def probe_ids(n, k):
+    """Three of the changed rows: the first, middle and last."""
     ids = changed_ids(n, k)
-    picks = sorted({ids[0], ids[len(ids)//2], ids[-1]})
+    return sorted({ids[0], ids[len(ids)//2], ids[-1]})
+
+
+def probe(sql, n, k, revision):
+    picks = probe_ids(n, k)
     rows = sql.query("SELECT id,revision FROM bench_rows WHERE " +
                      sql.ids_in(picks) + " ORDER BY id")["rows"]
     expect(rows, [[str(i), str(revision)] for i in picks], "working rows")
@@ -102,6 +108,15 @@ def prepare(root, c, engines):
                     write_json(path, state)
                     if db not in databases:
                         admin.query(f"CREATE DATABASE {db}")
+                    # (before any history is built: a root let go of, its
+                    # commit outside the window, isn't kept again)
+                    ENGINES[engine].apply_window(admin, db, c)
+                    settings = ENGINES[engine].window_settings(c)
+                    if state.get("window_settings", settings) != settings:
+                        raise RuntimeError(f"{engine}/{db}: its history was built under other window settings "
+                                           f"({state['window_settings']}); prepare into a new root")
+                    state["window_settings"] = settings
+                    write_json(path, state)
                 with SQL(root, c, engine, db) as sql:
                     if "base" not in state:
                         ENGINES[engine].create_table(sql, "CREATE TABLE IF NOT EXISTS bench_rows (id BIGINT PRIMARY KEY, "
@@ -173,6 +188,8 @@ def cases(c):
         for op in ("branch", "checkout", "reset_soft", "reset_hard", "diff_history",
                    "diff_working_history", "resolve_ancestor"):
             result.append({"operation": op, "distance": d})
+    for d in [0, *sorted(set(c["history_depths"]))]:
+        result.append({"operation": "at_history", "distance": d})
     for case in result:
         case['working_set'] = 'diff' if case['operation'] in ('diff_working', 'diff_working_history') else 'clean'
     for d in [0, *sorted(set(c["history_depths"]))]:
@@ -208,6 +225,9 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                 for case in order:
                     op, d = case["operation"], case["distance"]
                     old = fixture["commits"][h-d]
+                    # (asked first: the target in the window, kept with a
+                    # root, or measured apart; never a slow sample)
+                    target = sql.target(fixture["commits"], h-d, c)
                     profile = case['working_set']
                     dirty = profile != 'clean'
                     count = (k if profile == 'diff' else
@@ -242,6 +262,8 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         query = sql.vc_sql("reset", "--hard", old)
                     elif op == "resolve_ancestor":
                         query = sql.hash_sql(f"HEAD~{d}")
+                    elif op == "at_history":
+                        query = sql.at_sql(old, probe_ids(n, k))
                     elif op == "diff_equal":
                         query = sql.diff_sql(latest, latest)
                     elif op == "diff_working":
@@ -254,6 +276,8 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                               "changed_rows": k, "history_commits": h, **case,
                               "dirty_rows": count, "dirty_row_logical_bytes": count*(c['payload_bytes']+16),
                               "pass": mode, "repetition": rep, "warmup": rep < 0,
+                              "window": target["window"], "target_root": target["root"],
+                              "root_distance": target["root_distance"],
                               "sql": query, "status": "started"}
                     # (only the memory pass samples while the operation runs)
                     sampler = (Sampler(pid, c["sample_interval_ms"] if mode == "memory" else None)
@@ -263,6 +287,8 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         # (read after the setup, so its work isn't the operation's,
                         # and again before validation, whose isn't either)
                         before = sql.counters() if mode == "counters" else None
+                        # (the counters pass's read has them already)
+                        path_before = sql.path_counters() if mode != "counters" else None
                         if sampler:
                             sampler.start()
                         try:
@@ -273,6 +299,14 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         record["elapsed_ns"] = result["elapsed_ns"]
                         if mode == "counters":
                             record["counters"] = counter_deltas(before, sql.counters())
+                            if before is not None and path_before is None and \
+                                    set(window.PATH_COUNTERS) <= set(before):
+                                record["path"] = {name: record["counters"].get(name, 0)
+                                                  for name in window.PATH_COUNTERS}
+                        if path_before is not None:
+                            after = sql.path_counters()
+                            record["path"] = {name: after[name] - path_before[name] for name in window.PATH_COUNTERS}
+                        window.check_path(op, d, target, record.get("path", {}))
                         # Validation and restoration are deliberately outside timing
                         # AND memory sampling. Mutations must demonstrate their effect.
                         if op == "branch":
@@ -335,6 +369,9 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             probe(sql, n, k, h)
                         elif op == "resolve_ancestor":
                             expect(result["rows"][0][0], old, "ancestor resolution")
+                        elif op == "at_history":
+                            expect(result["rows"], [[str(i), str(h-d)] for i in probe_ids(n, k)],
+                                   "rows as of the commit")
                         elif op.startswith("diff_"):
                             expect(int(result["rows"][0][0]), 0 if op == "diff_equal" else k, "diff cardinality")
                             record["diff_rows"] = int(result["rows"][0][0])
@@ -399,6 +436,8 @@ def run(root, c, engines):
                         state = json.loads(fixture_path(root, engine, n).read_text())
                         expect(state["signature"], signature(c, n), "fixture configuration")
                         write_json(out / f"{engine}-n{n}-fixture.json", state)
+                        with SQL(root, c, engine) as admin:
+                            ENGINES[engine].apply_window(admin, f"bench_n{n}", c)
                         with SQL(root, c, engine, f"bench_n{n}") as sql:
                             settings = ENGINES[engine].settings(sql)
                             if settings is not None:
@@ -408,7 +447,13 @@ def run(root, c, engines):
                                 if not f.get("ready"):
                                     raise ValueError("Fixture is incomplete; run prepare")
                                 log(f"Measuring {engine}/n={n:,}/k={k:,}")
+                                windows = manifest.setdefault("windows", {}).setdefault(engine, {})
+                                cell = windows.setdefault(f"n{n}_k{k}", {})
+                                cell["before"] = sql.window_state([f["branch"]])
+                                write_json(out / "manifest.json", manifest)
                                 run_cell(root, c, engine, n, k, sql, pid, f, output, rng)
+                                cell["after"] = sql.window_state([f["branch"]])
+                                write_json(out / "manifest.json", manifest)
             shutil.copyfile(root / engine / "server.log", out / (engine + "-server.log"))
             manifest["binaries"][engine]["data_directory_size"] = disk_size(root / engine / "data")
         manifest["status"] = "complete"
