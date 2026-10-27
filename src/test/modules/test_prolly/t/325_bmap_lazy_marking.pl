@@ -1,7 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A capture marks no buffer: it raises the generation of sharing, and a
-# page settled at an older one is checked again before it next changes.  A
+# A capture marks no buffer: it raises its relation's generation of
+# sharing, and a page of the relation settled at an older one is checked
+# again before it next changes.  A
 # check that began before a capture and ends after it leaves the page
 # unsettled, since its answer ("not shared") predates the sharing: here a
 # hint's check is held between the storage manager's answer and settling
@@ -38,10 +39,7 @@ sql(q{
 	CREATE EXTENSION injection_points;
 	CREATE EXTENSION test_prolly;
 	SET debug_block_mapped_heap = on;
-	CREATE TABLE u (a int);
-	INSERT INTO u VALUES (1);
 });
-my $u = sql(q{SELECT pg_relation_filenode('u')});
 
 for my $round (1 .. 2)
 {
@@ -53,8 +51,9 @@ for my $round (1 .. 2)
 	sql(q{CHECKPOINT});
 	my $t = sql(qq{SELECT pg_relation_filenode('t$round')});
 
-	# (a root captured of another relation: every page is to be checked again)
-	sql(qq{SELECT test_bmap_root_capture($u)});
+	# (the relation's generation raised, none of its pages shared: the page
+	# is to be checked again)
+	sql(qq{SELECT test_bmap_mark_shared($t)});
 
 	# a scan setting the page's hints asks whether it is shared: not yet
 	my $scan = $node->background_psql('postgres');

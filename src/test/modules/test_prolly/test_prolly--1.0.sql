@@ -209,6 +209,12 @@ CREATE FUNCTION test_bmap_drop_buffer(relnumber oid, blkno int)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Each of a relation's cached pages checked again before it next changes,
+-- as when its pages begin to be shared.
+CREATE FUNCTION test_bmap_mark_shared(relnumber oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Folds: begin one (its changes list's lineage, its epoch, the length
 -- then); what changed since one began; let go of what changed before one
 -- began; a page as a fold kept it.
