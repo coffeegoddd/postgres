@@ -841,9 +841,17 @@ typedef enum PgStat_ProllyCounter
 											 * read */
 	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries
 										 * read, a commit's or a fragment's */
+	PGSTAT_PROLLY_BMAP_PAGES_STAMPED,	/* pages a capture logged, unchanged
+										 * since, stamped with its record's
+										 * position */
+	PGSTAT_PROLLY_BMAP_COPIES_IMAGELESS,	/* copies of shared pages logged
+											 * without the page's image */
+	PGSTAT_PROLLY_BMAP_COPY_IMAGES_LATE,	/* and of those, the ones whose
+											 * image followed, a checkpoint
+											 * having begun meanwhile */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_HORIZON_ENTRIES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_COPY_IMAGES_LATE + 1)
 
 typedef struct PgStat_ProllyStats
 {

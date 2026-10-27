@@ -7293,6 +7293,26 @@ ConditionalLockBufferShared(Buffer buffer)
 }
 
 /*
+ * ConditionalLockBufferShareExclusive -- the content lock in share-exclusive
+ * mode, but only if we don't have to wait.
+ *
+ * Share-exclusive excludes a write of the page and every change, so the
+ * holder may set what a hint may set (the page's LSN too, to a position in
+ * WAL already), as BufferBeginSetHintBits() allows.  The page isn't prepared
+ * for a change, so a storage manager's own caller, holding its map, may
+ * take it.
+ */
+bool
+ConditionalLockBufferShareExclusive(Buffer buffer)
+{
+	Assert(BufferIsPinned(buffer));
+	if (BufferIsLocal(buffer))
+		return true;			/* act as though we got it */
+	return BufferLockConditional(buffer, GetBufferDescriptor(buffer - 1),
+								 BUFFER_LOCK_SHARE_EXCLUSIVE);
+}
+
+/*
  * Acquire the content_lock for the buffer, but only if we don't have to wait.
  *
  * This assumes the caller wants BUFFER_LOCK_EXCLUSIVE mode.

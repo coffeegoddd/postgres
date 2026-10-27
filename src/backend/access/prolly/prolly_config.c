@@ -42,6 +42,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_NODE_CACHE] = "shared",
 	[PROLLY_IFACE_CHANGE_FINDER] = "log",
 	[PROLLY_IFACE_CHANGE_LOG] = "relation",
+	[PROLLY_IFACE_COW_IMAGE] = "after_redo",
 };
 
 /*
@@ -141,6 +142,31 @@ prolly_node_cache(void)
 {
 	return (const ProllyNodeCacheRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_NODE_CACHE);
+}
+
+/* (empty: the profile's) */
+char	   *debug_prolly_cow_image = NULL;
+
+bool
+check_debug_prolly_cow_image(char **newval, void **extra, GucSource source)
+{
+	if (**newval == '\0' ||
+		prolly_lookup_impl(PROLLY_IFACE_COW_IMAGE, *newval) != NULL ||
+		!process_shared_preload_libraries_done)
+		return true;
+	GUC_check_errdetail("There is no copy-on-write image policy named \"%s\".",
+						*newval);
+	return false;
+}
+
+const ProllyCowImageRoutine *
+prolly_cow_image(void)
+{
+	if (debug_prolly_cow_image != NULL && *debug_prolly_cow_image != '\0')
+		return (const ProllyCowImageRoutine *)
+			prolly_lookup_impl(PROLLY_IFACE_COW_IMAGE, debug_prolly_cow_image);
+	return (const ProllyCowImageRoutine *)
+		profile_impl(history_profile, PROLLY_IFACE_COW_IMAGE);
 }
 
 void

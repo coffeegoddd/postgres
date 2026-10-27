@@ -2504,3 +2504,33 @@ test_tablefile_basic_index(PG_FUNCTION_ARGS)
 	}
 	PG_RETURN_BOOL(true);
 }
+
+/*
+ * A copy-on-write image policy leaves out a copy's image only where redo
+ * has the old block: the page unchanged since the map's last capture
+ * stamped it (its LSN the capture's), and the capture's walk past the redo
+ * pointer.  Every other case keeps the image, whatever the policy.
+ */
+void
+cowimage_keeps_needed_images(const ProllyImplInfo *impl)
+{
+	const ProllyCowImageRoutine *r = (const ProllyCowImageRoutine *) impl;
+	const XLogRecPtr stamp = 0x2000000;
+	const XLogRecPtr since = 0x1F00000;
+	struct
+	{
+		const char *what;
+		ProllyCowImageCase c;
+	}			needed[] = {
+		{"no capture", {stamp, InvalidXLogRecPtr, InvalidXLogRecPtr, 0x100}},
+		{"a page changed since its capture", {stamp + 0x100, stamp, since, 0x100}},
+		{"a page last changed before its capture", {since - 0x10, stamp, since, 0x100}},
+		{"a capture before the redo pointer", {stamp, stamp, since, since}},
+		{"a capture whose walk began before the redo pointer", {stamp, stamp, since, since + 0x10}},
+		{"a checkpoint past the capture", {stamp, stamp, since, stamp + 0x10}},
+	};
+
+	for (int i = 0; i < lengthof(needed); i++)
+		if (r->skip_image(&needed[i].c))
+			elog(ERROR, "a copy leaves out its image for %s", needed[i].what);
+}

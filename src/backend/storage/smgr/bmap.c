@@ -165,7 +165,11 @@
 #include <unistd.h>
 
 #include "access/bufmask.h"
+#include "access/prolly_config.h"
 #include "access/genam.h"
+#include "access/heapam_xlog.h"
+#include "access/nbtree.h"
+#include "access/nbtxlog.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -230,10 +234,12 @@ int			block_map_replay_entries = 65536;
  * was made a copy of; version 6's captured roots didn't say of whose pages
  * they hold frozen copies; version 8's roots' metapages didn't say which
  * pages of slots may name a transaction; version 9's root pages kept
- * snapshots of the relation's tree.  This server reads only version 10 and
- * refuses anything older (refuse_version()).
+ * snapshots of the relation's tree; version 10's headers didn't say where
+ * the last capture was, which copies of its pages log no image by.  This
+ * server reads only version 11 and refuses anything older
+ * (refuse_version()).
  */
-#define BMAP_VERSION		10
+#define BMAP_VERSION		11
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -274,6 +280,19 @@ typedef struct BmapHeader
 	uint32		shared_below;	/* entries born before it may be shared
 								 * with another map; those born since, only
 								 * with the roots captured of the map */
+
+	/*
+	 * The relation's last capture (root_capture_slot()): where its record
+	 * ends, which each page it logged and that hadn't changed since has for
+	 * its LSN, and where the walk that logged them began.  A copy of such a
+	 * page may log no image (prolly_cowimage.h).  Set on the primary alone,
+	 * after the record: redo leaves them as they are (they only ever lead
+	 * to an image being logged where it needn't be), and a capture's record
+	 * replayed from an image of the header, or a stale pair, is passed
+	 * over once the redo pointer passes shared_since.
+	 */
+	XLogRecPtr	shared_lsn;
+	XLogRecPtr	shared_since;
 } BmapHeader;
 
 /*
@@ -5409,6 +5428,34 @@ block_list_add(BlockList *l, BlockNumber b)
 }
 
 /*
+ * The pages a capture's walk logged, each with its image's position: those
+ * still at it once the capture's record is in are stamped with the
+ * record's (preserve_stamp()).
+ */
+typedef struct PreserveStamps
+{
+	BlockNumber *blknos;
+	XLogRecPtr *lsns;
+	uint32		n;
+	uint32		cap;
+} PreserveStamps;
+
+static void
+stamps_add(PreserveStamps *s, BlockNumber blkno, XLogRecPtr lsn)
+{
+	if (s->n == s->cap)
+	{
+		s->cap = Max(s->cap * 2, 256);
+		s->blknos = s->blknos ? repalloc_huge(s->blknos, s->cap * sizeof(BlockNumber)) :
+			MemoryContextAllocHuge(CurrentMemoryContext, s->cap * sizeof(BlockNumber));
+		s->lsns = s->lsns ? repalloc_huge(s->lsns, s->cap * sizeof(XLogRecPtr)) :
+			MemoryContextAllocHuge(CurrentMemoryContext, s->cap * sizeof(XLogRecPtr));
+	}
+	s->blknos[s->n] = blkno;
+	s->lsns[s->n++] = lsn;
+}
+
+/*
  * A walk preserving a relation's own blocks (tree_preserve()).  It holds
  * the relation's header exclusively, so it never waits for a page's content
  * lock: a backend holding a page exclusively may be preparing it for a
@@ -5434,6 +5481,7 @@ typedef struct PreserveWalk
 	BlockNumber record_below;	/* recording 'logged' up to it, if valid */
 	XLogRecPtr	began;			/* the WAL's insert position as this walk began */
 	bool		concurrent;		/* writers at work: a page logged checked too */
+	PreserveStamps *stamps;		/* the pages this walk logged, if kept */
 } PreserveWalk;
 
 typedef struct PreserveLogged
@@ -5620,6 +5668,10 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, 1);
 
+	/* (the page's LSN as it was imaged: unchanged since, if still so) */
+	if (walk->stamps)
+		stamps_add(walk->stamps, blkno, PageGetLSN((Page) copy.data));
+
 	if (walk->logged)
 	{
 		logged = hash_search(walk->logged, &phys, HASH_ENTER, &found);
@@ -5769,12 +5821,14 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
  * once unless it moved, and only one page held at a time.
  */
 static Buffer preserve_header_lock_ext(SMgrRelation src, BlockList *own,
-										bool concurrent);
+										bool concurrent,
+										PreserveStamps *stamps,
+										XLogRecPtr *began);
 
 static Buffer
 preserve_header_lock(SMgrRelation src, BlockList *own)
 {
-	return preserve_header_lock_ext(src, own, false);
+	return preserve_header_lock_ext(src, own, false, NULL, NULL);
 }
 
 /*
@@ -5795,11 +5849,15 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
  * as a B-tree page's split, is made under all their locks).  The walks
  * given up are bounded (PRESERVE_CONCURRENT_WALKS): InvalidBuffer, the
  * header not held, if they run out.
+ *
+ * With 'stamps', the pages the last walk logged go into it, each with its
+ * LSN as imaged, and where that walk began into *began.
  */
 #define PRESERVE_CONCURRENT_WALKS	32
 
 static Buffer
-preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
+preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent,
+						 PreserveStamps *stamps, XLogRecPtr *began)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	Buffer		headerbuf = map_read(rel, 0);
@@ -5810,6 +5868,7 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
 	walk.held_block = InvalidBlockNumber;
 	walk.record_below = InvalidBlockNumber;
 	walk.concurrent = concurrent;
+	walk.stamps = stamps;
 	for (;;)
 	{
 		BmapHeader *header;
@@ -5823,13 +5882,19 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
 		header = PageGetBmapHeader(BufferGetPage(headerbuf));
 		if (own)
 			own->n = 0;
+		if (stamps)
+			stamps->n = 0;
 		walk.busy = InvalidBlockNumber;
 		walk.began = GetXLogInsertRecPtr();
 		done = tree_preserve(src, header->nblocks, header->epoch, &walk);
 		/* (a page held that the walk found no longer the relation's own) */
 		preserve_release_held(&walk);
 		if (done)
+		{
+			if (began)
+				*began = walk.began;
 			break;
+		}
 
 		/* the first walk given up: the blocks it logged, recorded */
 		if (walk.logged == NULL)
@@ -5864,6 +5929,51 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
 	if (walk.logged)
 		hash_destroy(walk.logged);
 	return headerbuf;
+}
+
+/*
+ * Redo of a copy logged without its image (BMAP_REMAP_FROM_OLD): the page,
+ * block 'block_id' of the record, made from the old block as it is in the
+ * page store's file.  The relation's last capture logged that block's
+ * image after the redo pointer the record was made under, and its redo
+ * wrote it there; nothing writes the block between the two, as it is
+ * shared, so the file has the page as the primary copied it, but for
+ * hints only its buffer had.  Never the relation's buffer of the page: a
+ * map newer than the replay may have sent its records nowhere.
+ *
+ * A checkpoint begun as the record was made gave it the page's image (full-
+ * page writes on: then this isn't called), or follows it with one
+ * (XLOG_FPI): a replay from that checkpoint may find the old block torn, or
+ * holding another relation's page by now, which the image replaces before
+ * anything reads it.  So what the file holds is taken as it is, unverified,
+ * and a block past its end as zeroes.  As for an image, a map newer than
+ * the replay sends the buffer nowhere.
+ */
+static void
+redo_copy_from_old(XLogReaderState *record, uint8 block_id,
+				   const xl_bmap_remap *xlrec)
+{
+	SMgrRelation ssrel = store_smgr(xlrec->locator);
+	PGIOAlignedBlock old;
+	void	   *page = old.data;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	Buffer		buf;
+
+	if (smgrexists(ssrel, MAIN_FORKNUM) &&
+		xlrec->old_block < mdnblocks(ssrel, MAIN_FORKNUM))
+		mdreadv(ssrel, MAIN_FORKNUM, xlrec->old_block, &page, 1);
+	else
+		memset(old.data, 0, BLCKSZ);
+	/* (the whole page replaced, as an image's restore does) */
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	buf = XLogReadBufferExtended(rlocator, forknum, blkno, RBM_ZERO_AND_LOCK,
+								 InvalidBuffer);
+	memcpy(BufferGetPage(buf), old.data, BLCKSZ);
+	PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
 }
 
 /*
@@ -6681,6 +6791,68 @@ bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
 }
 
 /*
+ * The kind of a relation's page, as far as a copy of it logged without its
+ * image goes: one whose hints bmap_mask() masks as its kind's records do
+ * (a heap page, which has no special space; a B-tree page, whose cycle id
+ * no other access method's page id can be), or another, which is copied
+ * with its image.
+ */
+typedef enum CopyPageKind
+{
+	COPY_PAGE_HEAP,
+	COPY_PAGE_BTREE,
+	COPY_PAGE_OTHER,
+} CopyPageKind;
+
+static CopyPageKind
+copy_page_kind(Page page)
+{
+	PageHeader	ph = (PageHeader) page;
+
+	if (PageIsNew(page) || ph->pd_lower < SizeOfPageHeaderData ||
+		ph->pd_lower > ph->pd_upper || ph->pd_upper > ph->pd_special ||
+		ph->pd_special > BLCKSZ)
+		return COPY_PAGE_OTHER;
+	if (PageGetSpecialSize(page) == 0)
+		return COPY_PAGE_HEAP;
+	if (PageGetSpecialSize(page) == MAXALIGN(sizeof(BTPageOpaqueData)) &&
+		BTPageGetOpaque(page)->btpo_cycleid <= MAX_BT_CYCLE_ID)
+		return COPY_PAGE_BTREE;
+	return COPY_PAGE_OTHER;
+}
+
+/*
+ * May a copy of a shared page (the case 'c') leave out the page's image?
+ * As the copy-on-write image policy says (prolly_cow_image()), looked up
+ * once a backend's setting changes; none known, never.  Asked in a
+ * critical section too, so it neither errors nor allocates.
+ */
+static const ProllyCowImageRoutine *cow_policy = NULL;
+static char *cow_policy_for = NULL;
+
+static void
+cow_policy_load(void)
+{
+	const char *name = debug_prolly_cow_image ? debug_prolly_cow_image : "";
+
+	if (cow_policy_for != NULL && strcmp(cow_policy_for, name) == 0)
+		return;
+	cow_policy = prolly_cow_image();
+	if (cow_policy_for)
+		pfree(cow_policy_for);
+	cow_policy_for = MemoryContextStrdup(TopMemoryContext, name);
+}
+
+static bool
+cow_skip_image(const ProllyCowImageCase *c)
+{
+	if (CritSectionCount == 0)
+		cow_policy_load();
+	return cow_policy != NULL && PROLLY_HAS(cow_policy, skip_image) &&
+		cow_policy->skip_image(c);
+}
+
+/*
  * Prepare logical block 'blkno', locked exclusively in 'buffer', for a
  * change.  An entry born in the map's epoch is the map's own.  An older one
  * may be shared: if no other map holds its block any more, it is claimed
@@ -6824,6 +6996,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		bool		zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
 		bool		reused;
 		ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
+		ProllyCowImageCase cc;
+		bool		from_old;
 
 		/*
 		 * This record restores the page before the caller's change.  If
@@ -6891,9 +7065,33 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xlrec.new_block = new_block;
 		xlrec.old_hw = alloc.old_hw;
 		xlrec.new_hw = alloc.new_hw;
+		/*
+		 * A shared page the relation's last capture logged after the redo
+		 * pointer, unchanged since, is copied without its image: redo copies
+		 * the old block, which every replay reaching this record has just
+		 * written from that image (prolly_cowimage.h).  Never a page of
+		 * zeroes (which redo zeroes), nor one no other map holds (whose old
+		 * block redo restores from the image), nor one of a kind whose hints
+		 * bmap_mask() can't mask.
+		 */
+		from_old = false;
+		if (!zeroed && count > 0 && copy_page_kind(page) != COPY_PAGE_OTHER)
+		{
+			BmapHeader *h = PageGetBmapHeader(BufferGetPage(headerbuf));
+			bool		fpw;
+
+			cc.page_lsn = PageGetLSN(page);
+			cc.shared_lsn = h->shared_lsn;
+			cc.shared_since = h->shared_since;
+			GetFullPageWriteInfo(&cc.redo, &fpw);
+			from_old = cow_skip_image(&cc);
+		}
 		xlrec.flags = (zeroed ? BMAP_REMAP_ZERO : 0) |
 			(listed ? BMAP_REMAP_LISTED : 0) |
-			(listed && count == 0 ? BMAP_REMAP_OWN : 0);
+			(listed && count == 0 ? BMAP_REMAP_OWN : 0) |
+			(from_old ? BMAP_REMAP_FROM_OLD : 0);
+		if (from_old)
+			INJECTION_POINT("bmap-copy-from-old", NULL);
 
 		XLogEnsureRecordSpace(5 + BMAP_ALLOC_MAX_PAGES, 0);
 		ndelta->since = GetXLogInsertRecPtr();
@@ -6919,6 +7117,23 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			id = changes_append_register(&ca, id);
 		if (zeroed)
 			XLogRegisterBuffer(id, buffer, REGBUF_WILL_INIT);
+		else if (from_old)
+		{
+			/*
+			 * The page registered with its LSN taken back to where the
+			 * capture's walk began, for the record's assembly alone (the page
+			 * is locked exclusively, in a critical section): the image is
+			 * left out as a full-page write's is, only while that is past
+			 * the redo pointer, which the insert checks again under its
+			 * insertion lock, assembling the record anew with the image if
+			 * a checkpoint moved it.  With full-page writes off nothing is
+			 * imaged that way; the check after the insert, below, logs the
+			 * image then.
+			 */
+			PageSetLSN(page, cc.shared_since);
+			XLogRegisterBuffer(id, buffer,
+							   page_hole_is_zero(page) ? REGBUF_STANDARD : 0);
+		}
 		else
 			XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE |
 							   (page_hole_is_zero(page) ? REGBUF_STANDARD : 0));
@@ -6930,6 +7145,29 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		/* a page of zeroes stays one: a new page has no LSN */
 		if (!zeroed)
 			PageSetLSN(page, lsn);
+
+		/*
+		 * A checkpoint begun as the record was made, its redo pointer past
+		 * the capture's walk: a replay from it would copy an old block it
+		 * never wrote, unless the insert took the page's image (full-page
+		 * writes on).  The page's image follows, so that it has the page
+		 * all the same.  The redo pointer read here is the one the insert
+		 * saw or a later one: a checkpoint sets it holding every insertion
+		 * lock, which the insert took after.  (One begun after the insert
+		 * replays from past the record, and needs nothing.)
+		 */
+		if (from_old)
+		{
+			bool		fpw;
+
+			GetFullPageWriteInfo(&cc.redo, &fpw);
+			if (!cow_skip_image(&cc))
+			{
+				log_newpage_buffer(buffer, page_hole_is_zero(page));
+				pgstat_count_prolly(PGSTAT_PROLLY_BMAP_COPY_IMAGES_LATE, 1);
+			}
+			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_COPIES_IMAGELESS, 1);
+		}
 		END_CRIT_SECTION();
 		if (listed)
 			changes_append_finish(&ca, lsn);
@@ -8993,6 +9231,49 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
 }
 
 /*
+ * Stamp each page the capture's walk logged (stamps) that is still as it
+ * was imaged, its LSN unchanged, with the capture record's end, 'lsn', the
+ * header's shared_lsn: a copy of it may then log no image
+ * (prolly_cowimage.h).  The header is held exclusively, so no change of
+ * the relation's pages is prepared meanwhile; a page whose lock isn't free
+ * at once (a writer that locked it before, which will copy it, or a write
+ * of it) is left unstamped, and its copy logs its image.  The LSN is set as a hint is, under the page's
+ * share-exclusive lock, which keeps a write of the page out; the record is
+ * in WAL, so a write after flushes WAL past it first.  The page isn't
+ * dirtied for it: if its buffer goes, so does the stamp.
+ */
+static void
+preserve_stamp(RelFileLocator rel, PreserveStamps *stamps, XLogRecPtr lsn)
+{
+	for (uint32 i = 0; i < stamps->n; i++)
+	{
+		Buffer		buf;
+
+		/* (read as the walk reads it: preserve_page_lsn()) */
+		buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, stamps->blknos[i],
+										RBM_NORMAL, NULL, true);
+		if (ConditionalLockBufferShareExclusive(buf))
+		{
+			Page		page = BufferGetPage(buf);
+
+			if (PageGetLSN(page) == stamps->lsns[i])
+			{
+				PageSetLSN(page, lsn);
+				pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PAGES_STAMPED, 1);
+			}
+			UnlockReleaseBuffer(buf);
+		}
+		else
+			ReleaseBuffer(buf);
+	}
+	if (stamps->blknos)
+	{
+		pfree(stamps->blknos);
+		pfree(stamps->lsns);
+	}
+}
+
+/*
  * A root of reln captured into its store's roots: a free slot (one never
  * used, or let go of by a committed releaser) set to the subtrees reln has
  * now, its length and last fold's epoch, each subtree gaining a holder, and
@@ -9026,6 +9307,8 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	xl_bmap_tree xlrec;
 	XLogRecPtr	lsn;
 	BmapRootId	id;
+	PreserveStamps stamps = {0};
+	XLogRecPtr	began = InvalidXLogRecPtr;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -9042,7 +9325,13 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	refs_cover(rel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	headerbuf = preserve_header_lock_ext(reln, own, concurrent);
+	/*
+	 * (a relation whose data skips WAL changes without its LSN moving: its
+	 * pages are never stamped)
+	 */
+	headerbuf = preserve_header_lock_ext(reln, own, concurrent,
+										 RelFileLocatorSkippingWAL(rel) ? NULL : &stamps,
+										 &began);
 	if (!BufferIsValid(headerbuf))
 	{
 		LockRelease(&sweeptag, ShareLock, false);
@@ -9133,10 +9422,15 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	refs_apply_register(&rp, 3);
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
 	PageSetLSN(BufferGetPage(slotbuf), lsn);
+	/* (after the record's image of the header: see BmapHeader) */
+	header->shared_lsn = stamps.n > 0 ? lsn : InvalidXLogRecPtr;
+	header->shared_since = stamps.n > 0 ? began : InvalidXLogRecPtr;
 	PageSetLSN(BufferGetPage(headerbuf), lsn);
 	PageSetLSN(BufferGetPage(rootsmeta), lsn);
 	refs_set_lsn(&rp, lsn);
 	END_CRIT_SECTION();
+
+	preserve_stamp(rel, &stamps, lsn);
 
 	refs_release(&rp);
 	UnlockReleaseBuffer(slotbuf);
@@ -14154,6 +14448,7 @@ bmap_redo(XLogReaderState *record)
 				uint8		last = XLogRecMaxBlockId(record);
 
 				bool		zeroed = (xlrec->flags & BMAP_REMAP_ZERO) != 0;
+				bool		from_old = (xlrec->flags & BMAP_REMAP_FROM_OLD) != 0;
 
 				/*
 				 * The page store reaches the new block; the page itself is
@@ -14193,6 +14488,8 @@ bmap_redo(XLogReaderState *record)
 					}
 					UnlockReleaseBuffer(buf);
 				}
+				else if (from_old && !XLogRecBlockImageApply(record, last))
+					redo_copy_from_old(record, last, xlrec);
 				else
 					redo_block(record, last);
 
@@ -14300,6 +14597,22 @@ bmap_redo(XLogReaderState *record)
 void
 bmap_mask(char *pagedata, BlockNumber blkno)
 {
+	/*
+	 * A copy logged without its image (BMAP_REMAP_FROM_OLD) is the old
+	 * block in redo, without the hints the primary's buffer had: masked as
+	 * its own kind's records mask it
+	 */
+	switch (copy_page_kind((Page) pagedata))
+	{
+		case COPY_PAGE_HEAP:
+			heap_mask(pagedata, blkno);
+			return;
+		case COPY_PAGE_BTREE:
+			btree_mask(pagedata, blkno);
+			return;
+		case COPY_PAGE_OTHER:
+			break;
+	}
 	mask_page_lsn_and_checksum(pagedata);
 
 	/*
@@ -14308,4 +14621,11 @@ bmap_mask(char *pagedata, BlockNumber blkno)
 	 */
 	if (map_page_is((const PGIOAlignedBlock *) pagedata, BMAP_PAGE_ROOT))
 		PageGetBmapRoot((Page) pagedata)->map_id = 0;
+
+	/* (the last capture's, set on the primary after its record: BmapHeader) */
+	if (map_page_is((const PGIOAlignedBlock *) pagedata, BMAP_PAGE_HEADER))
+	{
+		PageGetBmapHeader((Page) pagedata)->shared_lsn = InvalidXLogRecPtr;
+		PageGetBmapHeader((Page) pagedata)->shared_since = InvalidXLogRecPtr;
+	}
 }

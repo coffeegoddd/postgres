@@ -223,6 +223,8 @@ static const ConformanceCase cases[] = {
 	tree_held_references},
 	{PROLLY_IFACE_TREE, "value_splices",
 	"value_write value_read value_root value_splice", tree_value_splices},
+	{PROLLY_IFACE_COW_IMAGE, "keeps_needed_images",
+	"skip_image", cowimage_keeps_needed_images},
 };
 
 /* ------------------------------------------------------------------------

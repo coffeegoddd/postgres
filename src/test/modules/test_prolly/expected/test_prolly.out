@@ -72,7 +72,10 @@ FROM prolly_implementations();
  root_freezer   | stub         |       0 |              0
  root_retention | window       |       1 |              1
  root_retention | stub         |       0 |              0
-(63 rows)
+ cow_image      | always       |       1 |              1
+ cow_image      | after_redo   |       2 |              1
+ cow_image      | stub         |       0 |              0
+(66 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -325,7 +328,16 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  root_retention | window         | complete                       | pass
  root_retention | stub           | identity                       | pass
  root_retention | stub           | complete                       | not implemented (5 of 5 callbacks missing)
-(245 rows)
+ cow_image      | always         | identity                       | pass
+ cow_image      | always         | keeps_needed_images            | pass
+ cow_image      | always         | complete                       | pass
+ cow_image      | after_redo     | identity                       | pass
+ cow_image      | after_redo     | keeps_needed_images            | pass
+ cow_image      | after_redo     | complete                       | pass
+ cow_image      | stub           | identity                       | pass
+ cow_image      | stub           | keeps_needed_images            | not implemented (missing skip_image)
+ cow_image      | stub           | complete                       | not implemented (1 of 1 callbacks missing)
+(254 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

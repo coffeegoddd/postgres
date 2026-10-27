@@ -181,6 +181,9 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_BUFFER_REL_GENERATIONS] = "buffer_rel_generations",
 	[PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ] = "bmap_roots_pages_read",
 	[PGSTAT_PROLLY_HORIZON_ENTRIES_READ] = "horizon_entries_read",
+	[PGSTAT_PROLLY_BMAP_PAGES_STAMPED] = "bmap_pages_stamped",
+	[PGSTAT_PROLLY_BMAP_COPIES_IMAGELESS] = "bmap_copies_imageless",
+	[PGSTAT_PROLLY_BMAP_COPY_IMAGES_LATE] = "bmap_copy_images_late",
 };
 
 /*

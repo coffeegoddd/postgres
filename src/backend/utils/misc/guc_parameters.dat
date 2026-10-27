@@ -748,6 +748,15 @@
   check_hook => 'check_debug_prolly_change_finder',
 },
 
+{ name => 'debug_prolly_cow_image', type => 'string', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Names the copy-on-write image policy block-mapped pages are copied under instead of the profile\'s, for testing.',
+  long_desc => 'An empty string means the profile\'s.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_cow_image',
+  boot_val => '""',
+  check_hook => 'check_debug_prolly_cow_image',
+},
+
 { name => 'debug_prolly_force_full_fold', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Makes every prolly fold read its table in full, for testing that incremental folds match.',
   flags => 'GUC_NOT_IN_SAMPLE',

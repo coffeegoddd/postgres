@@ -85,6 +85,9 @@ OBJS = \
 	rootfreeze_lazy.o \
 	rootfreeze_stub.o \
 	rootretain_stub.o \
+	cowimage_always.o \
+	cowimage_after_redo.o \
+	cowimage_stub.o \
 	rootretain_window.o \
 	transfer_chunks.o \
 	transfer_stub.o \

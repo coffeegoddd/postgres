@@ -147,6 +147,16 @@ typedef struct xl_bmap_shrink
 #define BMAP_REMAP_ZERO		0x01
 #define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */
 #define BMAP_REMAP_OWN		0x04	/* and no other map holds it */
+/*
+ * The page comes with no image: redo copies it from the old block, which
+ * every replay reaching the record has just written whole (the relation's
+ * last capture logged its image after the redo pointer, and nothing has
+ * changed the page since; prolly_cowimage.h).  Only for a block another
+ * map shares.  If a checkpoint began as the record was made, the record
+ * has the page's image after all (full-page writes on), and an XLOG_FPI of
+ * the page follows it.
+ */
+#define BMAP_REMAP_FROM_OLD	0x08
 
 typedef struct xl_bmap_remap
 {

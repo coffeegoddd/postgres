@@ -345,6 +345,7 @@ LockBuffer(Buffer buffer, BufferLockMode mode)
 
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern bool ConditionalLockBufferShared(Buffer buffer);
+extern bool ConditionalLockBufferShareExclusive(Buffer buffer);
 extern void MarkBufferedPagesShared(void);
 extern void MarkRelationPagesShared(RelFileLocator rel);
 extern void FlushRelationBlocks(SMgrRelation reln, ForkNumber forknum,

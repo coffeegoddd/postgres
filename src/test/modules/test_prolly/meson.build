@@ -190,6 +190,7 @@ tests += {
       'compared_folds',
       'fold_on_commit',
       'fold_leaf_reads',
+      'cow_images',
       'row_locations',
       'describe_caches',
       'nearest_source',

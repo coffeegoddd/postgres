@@ -22,6 +22,7 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_commitcache.h"
+#include "access/prolly_cowimage.h"
 #include "access/prolly_window.h"
 #include "access/prolly_rootfreeze.h"
 #include "access/prolly_rootretain.h"
@@ -84,6 +85,14 @@ extern const ProllyHashRoutine *prolly_content_hash(void);
 
 /* The cache of decoded chunks the chunk stores read through (NULL: none). */
 extern const ProllyNodeCacheRoutine *prolly_node_cache(void);
+
+/*
+ * Whether a copy of a shared block-mapped page logs its image: the
+ * profile's, unless the developer setting names another.  NULL if the one
+ * named isn't registered (every copy logs its image then).
+ */
+extern PGDLLIMPORT char *debug_prolly_cow_image;
+extern const ProllyCowImageRoutine *prolly_cow_image(void);
 
 /*
  * The components a table's committed versions are written with, without

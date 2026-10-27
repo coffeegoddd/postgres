@@ -52,6 +52,10 @@ PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_capture)
 PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_lazy)
 PG_PROLLY_IMPL(ProllyRootRetentionRoutine, prolly_rootretain_window)
 
+/* block-mapped storage */
+PG_PROLLY_IMPL(ProllyCowImageRoutine, prolly_cowimage_always)
+PG_PROLLY_IMPL(ProllyCowImageRoutine, prolly_cowimage_after_redo)
+
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_stub)
@@ -81,3 +85,4 @@ PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_stub)
 PG_PROLLY_IMPL(ProllyWindowRoutine, prolly_window_stub)
 PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_stub)
 PG_PROLLY_IMPL(ProllyRootRetentionRoutine, prolly_rootretain_stub)
+PG_PROLLY_IMPL(ProllyCowImageRoutine, prolly_cowimage_stub)
