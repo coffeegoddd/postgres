@@ -37,7 +37,8 @@ UPDATE gw.t SET v = 'w3' WHERE id % 2 = 1;
 SELECT gw_commit('w3', '1 day') AS committed;
 SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
 
--- No window yet: no limit, nothing due.
+-- The default window, archiving, nothing archived yet: nothing due, and no
+-- retire may take any generation (none is known archived whole).
 SELECT * FROM test_window_retire_due();
 
 -- The first sever archives: a retire may take what was settled by then.
