@@ -101,6 +101,10 @@ static void check_may_sever(const char *what);
 static void sever_cut(ProllyWindowAction action, const TimestampTz *before,
 					  TimestampTz size_cut, ProllyWindowResult *result);
 static char *source_url(const char *source);
+static int64 config_int(const char *name, int64 dflt);
+
+/* The size limit's last cut, the background's (a setting in the refs). */
+#define SIZE_CUT_SETTING	"history_window.size_cut"
 
 /* ------------------------------------------------------------------------
  * Components and encodings
@@ -553,10 +557,10 @@ archive_fragments(ProllyWindowFragmentVisit visit, void *arg)
  */
 
 static int	action_setting = PROLLY_WINDOW_ARCHIVE;
-static char *warm_setting = NULL;
+static char *window_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
-static char *cold_batch_setting = NULL;
+static char *batch_setting = NULL;
 static char *collect_interval_setting = NULL;
 static char *archive_timeout_setting = NULL;
 static char *archive_setting = NULL;
@@ -667,10 +671,10 @@ prolly_window_init(void)
 							 &action_setting, PROLLY_WINDOW_ARCHIVE,
 							 action_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_warm",
+	DefineCustomStringVariable("prolly.history_window",
 							   "How long each branch's history is kept here (empty: all of it).",
 							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
-							   &warm_setting, "", PGC_USERSET, 0,
+							   &window_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomIntVariable("prolly.history_min_commits",
 							"How many of each branch's newest commits are kept here, however old.",
@@ -692,10 +696,10 @@ prolly_window_init(void)
 							   "Read as the database has it; past it, nothing is severed.",
 							   &archive_timeout_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_cold_batch",
+	DefineCustomStringVariable("prolly.history_batch",
 							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
 							   "Read as the database has it; a branch may keep its own.",
-							   &cold_batch_setting, "", PGC_USERSET, 0,
+							   &batch_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_archive",
 							   "Where history past the window is archived: a remote's URL.",
@@ -791,8 +795,8 @@ database_span(const char *name)
 	return usec;
 }
 
-static const char *const branch_settings[] = {"warm", "min_commits",
-"cold_batch"};
+static const char *const branch_settings[] = {"window", "min_commits",
+"batch"};
 
 static void
 branch_setting_key(StringInfo key, const char *name, const char *setting)
@@ -818,31 +822,6 @@ branch_setting(const char *name, const char *setting)
 	return found;
 }
 
-/*
- * The warm window holds the hot one (prolly.history_hot, the page roots'
- * window, as the database has it, where that is set): a warm window
- * shorter is taken as hot, with a notice.
- */
-static void
-hold_hot(const char *name, ProllyWindowPolicy *p)
-{
-	int64		hot = database_span("prolly.history_hot");
-
-	/*
-	 * (any window, by time, by count or by size: what is younger than hot
-	 * is kept)
-	 */
-	if (hot > p->keep_time &&
-		(p->keep_time > 0 || p->keep_commits > 0 || p->max_bytes > 0))
-	{
-		ereport(NOTICE,
-				(errmsg("the history window of %s%s%s is taken as prolly.history_hot, which it can't be shorter than",
-						name ? "branch \"" : "database \"",
-						name ? name : get_database_name(MyDatabaseId), "\"")));
-		p->keep_time = hot;
-	}
-}
-
 static void
 archive_policy(const char *name, ProllyWindowPolicy *p)
 {
@@ -858,8 +837,8 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 			if (pg_strcasecmp(v, action_options[i].name) == 0)
 				p->action = action_options[i].val;
 	}
-	p->keep_time = database_span("prolly.history_warm");
-	p->batch = database_span("prolly.history_cold_batch");
+	p->keep_time = database_span("prolly.history_window");
+	p->batch = database_span("prolly.history_batch");
 	if ((v = database_setting("prolly.history_min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
 	if ((v = database_setting("prolly.history_max_size")) != NULL &&
@@ -868,17 +847,13 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	v = database_setting("prolly.history_archive");
 	p->archive = (v && *v) ? v : NULL;
 	if (name == NULL)
-	{
-		hold_hot(NULL, p);
 		return;
-	}
-	if ((v = branch_setting(name, "warm")) != NULL)
+	if ((v = branch_setting(name, "window")) != NULL)
 		(void) parse_span(v, &p->keep_time);
-	if ((v = branch_setting(name, "cold_batch")) != NULL)
+	if ((v = branch_setting(name, "batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
-	hold_hot(name, p);
 }
 
 /* A branch lineage's own setting (value NULL: the database's again). */
@@ -896,7 +871,7 @@ archive_set_policy(const char *name, const char *setting, const char *value)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a branch's history window has no setting \"%s\"", setting),
-				 errhint("A branch keeps its own warm, min_commits or cold_batch; the rest are the database's.")));
+				 errhint("A branch keeps its own window, min_commits or batch; the rest are the database's.")));
 	if (value != NULL)
 	{
 		int64		n;
@@ -965,7 +940,6 @@ typedef struct Head
 	bool		standalone;		/* a tag's: kept itself, on a lineage too */
 	bool		on_lineage;		/* another ref's, on a branch's history */
 	int64		height_cut;		/* > 0: kept by height, not the cut's date */
-	TimestampTz hot_cut;		/* then what is younger than this, too */
 } Head;
 
 typedef struct Plan
@@ -1457,8 +1431,7 @@ walk_window(Plan *plan, Head *h)
 		CHECK_FOR_INTERRUPTS();
 		pc = plan_commit(plan, id);
 		if (same_id(id, &h->head) ||
-			(h->height_cut > 0 ? pc->e.height >= h->height_cut ||
-			 (h->hot_cut != DT_NOEND && young(plan, pc, h->hot_cut)) :
+			(h->height_cut > 0 ? pc->e.height >= h->height_cut :
 			 young(plan, pc, h->cut)) ||
 			(h->min_commits > 0 && head_height - pc->e.height < h->min_commits))
 		{
@@ -1505,10 +1478,6 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 			 int64 size_height)
 {
 	TimestampTz now = plan_now();
-	int64		hot = database_span("prolly.history_hot");
-
-	/* (what is younger than hot is kept, whatever cut is given) */
-	TimestampTz hot_cut = hot > 0 ? now - hot : DT_NOEND;
 	bool		any = false;
 
 	foreach_ptr(Head, h, plan->heads)
@@ -1517,7 +1486,7 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 
 		if (before != NULL)
 		{
-			h->cut = Min(*before, hot_cut);
+			h->cut = *before;
 			h->min_commits = 0;
 			any = true;
 			continue;
@@ -1550,11 +1519,7 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		}
 		else
 			h->cut = DT_NOBEGIN;	/* (it keeps everything) */
-		/*
-		 * (a size limit cuts later, the count still keeping its own, and
-		 * hot what is younger)
-		 */
-		size_cut = Min(size_cut, hot_cut);
+		/* (a size limit cuts later, the count still keeping its own) */
 		if (size_cut > h->cut)
 		{
 			h->cut = size_cut;
@@ -1564,7 +1529,6 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		if (size_height > 0)
 		{
 			h->height_cut = size_height;
-			h->hot_cut = hot_cut;
 			any = true;
 		}
 	}
@@ -1668,6 +1632,76 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		hash_destroy(stops);
 	}
 	hash_destroy(fragment);
+}
+
+/*
+ * The commits in the window now (branch: its lineage's only), as a sever
+ * would keep them for their age or count: each lineage's head walked by
+ * its policy, with no merge base's floor and no other ref's keeping.
+ */
+static HTAB *
+window_commits(const char *branch)
+{
+	Plan		plan;
+	HTAB	   *in = id_set("prolly window", sizeof(ProllyHash));
+	ProllyWindowPolicy db;
+
+	window_init();
+	sever_clock = DT_NOBEGIN;
+	memset(&plan, 0, sizeof(plan));
+	plan.commits = id_set("prolly window plan", sizeof(PlanCommit));
+	plan.head_ids = id_set("prolly window heads", sizeof(ProllyHash));
+	plan.archived = archived_parents();
+	PROLLY_CALL(dc.refs, branches, note_branch, &plan);
+	note_refs(&plan);
+	/*
+	 * (the cut taken once, now, for every head; under a size limit, no
+	 * earlier than the last the background cut for size)
+	 */
+	archive_policy(NULL, &db);
+	(void) head_windows(&plan, NULL,
+						db.max_bytes > 0 ?
+						config_int(SIZE_CUT_SETTING, DT_NOBEGIN) : DT_NOBEGIN,
+						0);
+	foreach_ptr(Head, h, plan.heads)
+	{
+		if (h->name == NULL || (branch != NULL && strcmp(h->name, branch) != 0))
+			continue;
+		walk_window(&plan, h);
+	}
+	foreach_ptr(PlanCommit, pc, plan.kept)
+		if (!pc->by_base)
+			(void) set_add(in, &pc->id);
+	hash_destroy(plan.commits);
+	hash_destroy(plan.head_ids);
+	return in;
+}
+
+static void
+archive_window(const char *branch, ProllyWindowCommitVisit visit, void *arg)
+{
+	HTAB	   *in = window_commits(branch);
+	HASH_SEQ_STATUS seq;
+	ProllyHash *id;
+
+	hash_seq_init(&seq, in);
+	while ((id = hash_seq_search(&seq)) != NULL)
+		if (!visit(id, arg))
+		{
+			hash_seq_term(&seq);
+			break;
+		}
+	hash_destroy(in);
+}
+
+static bool
+archive_in_window(const char *branch, const ProllyHash *commit)
+{
+	HTAB	   *in = window_commits(branch);
+	bool		found = set_has(in, commit);
+
+	hash_destroy(in);
+	return found;
 }
 
 static void
@@ -2621,7 +2655,6 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 
 /* The background's state, the database's settings in the refs. */
 #define LAST_CUT_SETTING	"history_window.last_cut"	/* :branch, a branch's */
-#define SIZE_CUT_SETTING	"history_window.size_cut"
 #define SIZE_PENDING_SETTING "history_window.size_pending"
 #define SIZE_RETRY_SETTING	"history_window.size_retry_at"
 #define MEASURED_SETTING	"history_window.measured"
@@ -2752,7 +2785,7 @@ typedef struct LineageCut
 
 /*
  * The cuts that moved since each was last tried: every branch's, by its
- * lineage's policy (its own warm, min_commits and cold_batch over the
+ * lineage's policy (its own window, min_commits and batch over the
  * database's), and the database's, for the other refs.  So a branch's own
  * window is severed in the background, at its own batch, with none for
  * the database.  *any: some lineage has a window.
@@ -3421,4 +3454,6 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.maintain = archive_maintain,
 	.collect_due = archive_collect_due,
 	.collected = archive_collected,
+	.window = archive_window,
+	.in_window = archive_in_window,
 };

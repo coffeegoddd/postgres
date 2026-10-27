@@ -1752,20 +1752,22 @@ settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
 
-The window is the database's.  prolly.history_warm (how long each
+The window is the database's.  prolly.history_window (how long each
 branch's history is kept here), prolly.history_min_commits (how many of a
-branch's newest commits are kept however old), prolly.history_cold_batch
+branch's newest commits are kept however old), prolly.history_batch
 (a cut rounded down to whole hours or days, so fragments are whole ones),
 prolly.history_max_size, prolly.history_window_action (archive, delete or
 none) and prolly.history_archive (a remote's URL, not a name) are read as the
 database has them (ALTER DATABASE ... SET: its owner's or a
 superuser's), never as a session has them, so no session severs more or
 sends history elsewhere by a SET of its own.  A branch's lineage may keep
-its own warm, min_commits or cold_batch (dolt_history_window(), the
+its own window, min_commits or batch (dolt_history_window(), the
 owner's, kept in the refs' settings); prolly_history_policy() shows what
-a branch keeps.  With no window, everything is kept.  A warm window is
-never shorter than prolly.history_hot (the page roots' window, as the
-database has it): a shorter one is taken as hot, with a notice.  What a
+a branch keeps.  With no window, everything is kept.  There is one
+window: the page roots a branch keeps for constant-time moves are kept
+inside it, and ask it (the history window's window() and in_window(),
+prolly_history_in_window() in SQL) what is in it, by the clock a sever
+ages commits by, so the two never disagree.  What a
 branch's history keeps is the branch's window's: another ref's commit on
 it (a commit the branch's pages are kept as of, a reader's pin, a
 remote-tracking branch) has no window of its own, though a collection
@@ -1806,7 +1808,7 @@ the database's owner (with SECURITY_RESTRICTED_OPERATION), so an
 archive's checks are the owner's, as at dolt_history_sever(): a file
 archive needs the owner's pg_write_server_files.  It plans only once some
 lineage's cut has moved past the last one tried: each branch's, by its
-own window over the database's, rounded down to its own cold_batch (an
+own window over the database's, rounded down to its own batch (an
 hour if none is set), and the database's, for the other refs (the refs'
 settings history_window.last_cut and history_window.last_cut:<branch>).
 So a branch's own window is severed in the background with none for the
@@ -1829,7 +1831,15 @@ snapshot) isn't cut a batch a visit.  In delete mode two measurements in
 a row must say the store is over.  Nothing severed, the size cut isn't
 moved, and it isn't tried again before the next interval.  The store's
 files over the limit but the last measurement under asks for a full
-collection to measure again.  The size limit is a background one:
+collection to measure again.  Where the size limit's dates cut nothing (a
+commit dated old above history dated new), it cuts by height instead: a
+sixteenth of the heights kept, at least one, above the lowest.  The
+background writes nothing in the refs before its sever is done (a refs
+write holds the branch's lock to the transaction's end, and commits would
+wait on the worker through the archive's transfer), and only tries the
+severs' turn, never waiting for it.  A failure that passes by itself (the
+history moved, a lock waiter's cancel) is tried again at the next visit,
+at most five times in a row, then waited out as any other.  The size limit is a background one:
 dolt_history_sever() cuts by the time and count windows alone.
 
 dolt_history_repair(source, fragments) reattaches fragments, newest

@@ -37,8 +37,8 @@ for my $ago (reverse 4 .. 10)
 			(now() - interval '$ago days')::text)});
 }
 my $slow = 'slow://' . PostgreSQL::Test::Utils::tempdir() . '/slow';
-sql(qq{ALTER DATABASE ac SET prolly.history_warm = '3 days';
-	ALTER DATABASE ac SET prolly.history_cold_batch = '1 second';
+sql(qq{ALTER DATABASE ac SET prolly.history_window = '3 days';
+	ALTER DATABASE ac SET prolly.history_batch = '1 second';
 	ALTER DATABASE ac SET prolly.history_collect_interval = '1 second';
 	ALTER DATABASE ac SET prolly.history_archive = '$slow'});
 

@@ -65,8 +65,8 @@ is(sql($logged), '10', 'ten commits');
 
 # A window of three days, archived (the default) with no archive: nothing
 # severed, though a non-owner's session says delete and commits past it.
-sql(q{ALTER DATABASE hw SET prolly.history_warm = '3 days';
-	ALTER DATABASE hw SET prolly.history_cold_batch = '1 second';
+sql(q{ALTER DATABASE hw SET prolly.history_window = '3 days';
+	ALTER DATABASE hw SET prolly.history_batch = '1 second';
 	ALTER DATABASE hw SET prolly.history_collect_interval = '1 second';
 	CREATE ROLE other LOGIN;
 	GRANT ALL ON SCHEMA hw TO other;
@@ -96,9 +96,9 @@ like($node->safe_psql('hw', q{SELECT state FROM prolly_history_horizon() LIMIT 1
 	qr/deleted/, 'deleted');
 
 # Under the size limit, as measured: nothing more severed.
-sql(q{ALTER DATABASE hw SET prolly.history_warm = '';
+sql(q{ALTER DATABASE hw SET prolly.history_window = '';
 	ALTER DATABASE hw SET prolly.history_min_commits = 3;
-	ALTER DATABASE hw SET prolly.history_cold_batch = '1 day';
+	ALTER DATABASE hw SET prolly.history_batch = '1 day';
 	ALTER DATABASE hw SET prolly.history_max_size = '1GB';});
 my $fragments = q{SELECT count(*) FROM prolly_history_horizon()};
 my $before = sql($fragments);
@@ -135,9 +135,9 @@ for my $ago (reverse 1 .. 5)
 			(now() - interval '$ago days')::text)});
 }
 bsql(q{ALTER DATABASE hb SET prolly.history_window_action = delete;
-	ALTER DATABASE hb SET prolly.history_cold_batch = '1 second';
+	ALTER DATABASE hb SET prolly.history_batch = '1 second';
 	ALTER DATABASE hb SET prolly.history_collect_interval = '1 second';
-	SELECT dolt_history_window('main', 'warm', '2 days');});
+	SELECT dolt_history_window('main', 'window', '2 days');});
 $node->poll_query_until('hb', q{SELECT count(*) > 0 FROM prolly_history_horizon()})
   or die 'the branch\'s window severed nothing';
 pass('a branch\'s own window is severed in the background');
@@ -165,7 +165,7 @@ ssql(q{UPDATE hs.t SET v = 'old' WHERE id = 7;
 	SELECT dolt_commit('-am', 'top');
 	ALTER DATABASE hs SET client_min_messages = warning;
 	ALTER DATABASE hs SET prolly.history_window_action = delete;
-	ALTER DATABASE hs SET prolly.history_cold_batch = '1 day';
+	ALTER DATABASE hs SET prolly.history_batch = '1 day';
 	ALTER DATABASE hs SET prolly.history_collect_interval = '1 second';
 	ALTER DATABASE hs SET prolly.history_max_size = '1kB';});
 my $severed = 0;
@@ -197,8 +197,8 @@ for my $ago (reverse 1 .. 5)
 			(now() - interval '$ago days')::text)});
 }
 my $logpos = -s $node->logfile;
-osql(qq{ALTER DATABASE ho SET prolly.history_warm = '2 days';
-	ALTER DATABASE ho SET prolly.history_cold_batch = '1 second';
+osql(qq{ALTER DATABASE ho SET prolly.history_window = '2 days';
+	ALTER DATABASE ho SET prolly.history_batch = '1 second';
 	ALTER DATABASE ho SET prolly.history_archive = 'file://$arch'});
 $node->wait_for_log(qr/background severing of history of database "ho" failed: permission denied/, $logpos);
 ok(!-e $arch, 'the owner\'s archive in the server\'s files isn\'t made');
