@@ -647,6 +647,16 @@ CREATE FUNCTION test_commit_height(commit_id text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A commit after parent recording commits as those it reaches, right or not.
+CREATE FUNCTION test_commit_with_commits(parent text, commits int8)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The commits a commit records it reaches; NULL if it records none.
+CREATE FUNCTION test_commit_commits(commit_id text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A commit's height as the history walk finds it, and the commits it read.
 CREATE FUNCTION test_history_height(commit_id text,
 	OUT height int8, OUT reads int)

@@ -173,6 +173,11 @@
  * commit content has the same id in every database:
  *
  *	"author"	-> the author
+ *	"commits"	-> the commits it reaches, itself included
+ *				   (prolly_history_commits()), 8 bytes big-endian: what
+ *				   count(*) of its dolt_log() gives while no history is
+ *				   severed; a commit without it (its first parent records
+ *				   none, or its history couldn't be read) has them counted
  *	"dependencies" -> what the versioned objects needed from outside
  *				   the versioned schemas (length byte, hash of the
  *				   canonicalizer's tree of them); a commit without it
@@ -6276,13 +6281,24 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
-	 * Keys in order: author, dependencies, height, identity (if any),
-	 * message, parents, root, time.
+	 * Keys in order: author, commits (if known), dependencies, height,
+	 * identity (if any), message, parents, root, time.
 	 */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
 	resetStringInfo(&v);
+	{
+		int64		commits;
+
+		if (prolly_history_commits(parents, nparents, copies_lookup_commit,
+								   NULL, &commits))
+		{
+			put_uint64(&v, (uint64) commits);
+			add_item(b, "commits", &v);
+			resetStringInfo(&v);
+		}
+	}
 	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
@@ -6459,18 +6475,26 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 			ref_of(&deps, &info->dependencies);
 			info->has_dependencies = true;
 		}
-		else if (item_is(&k, "height") || item_is(&k, "time"))
+		else if (item_is(&k, "height") || item_is(&k, "time") ||
+				 item_is(&k, "commits"))
 		{
 			StringInfoData n = {unconstify(char *, p), v.len, v.len, 0};
-			uint64		height;
+			uint64		count;
 
 			if (item_is(&k, "time"))
 				(void) get_time(&n, &info->committed_at);
-			else if (get_uint64(&n, &height) && height > 0 &&
-					 height <= PG_INT64_MAX)
+			else if (!get_uint64(&n, &count) || count == 0 ||
+					 count > PG_INT64_MAX)
+				;
+			else if (item_is(&k, "height"))
 			{
-				info->height = (int64) height;
+				info->height = (int64) count;
 				info->has_height = true;
+			}
+			else
+			{
+				info->commits = (int64) count;
+				info->has_commits = true;
 			}
 		}
 		else if (item_is(&k, "identity") && v.len > 0)

@@ -70,6 +70,15 @@ typedef struct ProllyCommitInfo
 	int64		height;
 
 	/*
+	 * The commits it reaches, itself included (prolly_history_commits()):
+	 * the rows dolt_log() gives for it while no history is severed;
+	 * has_commits false for a commit that doesn't record them (one made
+	 * before commits recorded them, or whose history couldn't be read).
+	 */
+	bool		has_commits;
+	int64		commits;
+
+	/*
 	 * The identity of its root's tables and columns, which their renames
 	 * keep (the canonicalizer's identify()): an identity record, palloc'd,
 	 * or NULL where every object has its own name's (nothing in its
@@ -1074,6 +1083,17 @@ extern int	prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
  * each commit's height is found once however many are asked for, and
  * lookup is asked once for each commit it finds one of.
  */
+/*
+ * The commits a commit with these parents reaches, itself included: one
+ * more than its first parent's records, and for a merge, more by those
+ * its other parents reach that the first doesn't, found by heights.
+ * False if that can't be known: the first parent records none, or a
+ * commit the walk needs can't be read or records no height.
+ */
+extern bool prolly_history_commits(const ProllyHash *parents, int nparents,
+								   ProllyCommitLookup lookup, void *lookup_arg,
+								   int64 *commits);
+
 extern struct HTAB *prolly_history_heights(void);
 extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,
 								   ProllyCommitLookup lookup, void *lookup_arg);

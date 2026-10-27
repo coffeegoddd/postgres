@@ -33,12 +33,14 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_log_count.h"
 #include "access/prolly_revision.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_window.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -4648,6 +4650,27 @@ log_entries(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	}
 	return log_walk(list_make1(&start));
+}
+
+int64
+prolly_log_count(const char *ref)
+{
+	ProllyHash	start;
+	ProllyCommitInfo info;
+
+	if (!PROLLY_CALL(refs(), resolve, ref, &start))
+	{
+		if (pg_strcasecmp(ref, "HEAD") == 0)
+			return 0;			/* nothing committed yet */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	}
+	/* (the count recorded, while the log reaches every commit counted) */
+	if (PROLLY_CALL(refs(), commit_get, &start, &info) && info.has_commits &&
+		!prolly_window_severed())
+		return info.commits;
+	return list_length(log_walk(list_make1(&start)));
 }
 
 static void

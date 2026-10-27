@@ -2383,6 +2383,79 @@ test_commit_height(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(info.height);
 }
 
+/*
+ * test_commit_with_commits(parent, commits): a commit after parent, naming
+ * parent's root, at the height after parent's, that records commits as
+ * the commits it reaches, right or not: as a commit made elsewhere might.
+ * Its id.
+ */
+PG_FUNCTION_INFO_V1(test_commit_with_commits);
+Datum
+test_commit_with_commits(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyDatabaseComponents dc;
+	ProllyCommitInfo info;
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	ProllyHash	parent;
+	uint64		commits = (uint64) PG_GETARG_INT64(1);
+	uint64		height;
+	char		hashed[1 + PROLLY_HASH_MAX_LEN];
+	char		parents[1 + PROLLY_HASH_MAX_LEN];
+	char		c[8];
+	char		h[8];
+	char		time[8] = {0};
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &parent);
+	if (!PROLLY_CALL(dc.refs, commit_get, &parent, &info) || !info.has_height)
+		elog(ERROR, "no such commit, or one recording no height");
+	height = (uint64) info.height + 1;
+	for (int i = 0; i < 8; i++)
+	{
+		c[i] = (char) (commits >> (56 - 8 * i));
+		h[i] = (char) (height >> (56 - 8 * i));
+	}
+	prolly_folded_tree_env(&env);
+	hashed[0] = (char) info.root.hash.len;
+	memcpy(hashed + 1, info.root.hash.bytes, info.root.hash.len);
+	parents[0] = (char) parent.len;
+	memcpy(parents + 1, parent.bytes, parent.len);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	commit_item(tree, b, "author", "test", 4);
+	commit_item(tree, b, "commits", c, 8);
+	commit_item(tree, b, "height", h, 8);
+	commit_item(tree, b, "message", "with commits", 12);
+	commit_item(tree, b, "parents", parents, 1 + parent.len);
+	commit_item(tree, b, "root", hashed, 1 + info.root.hash.len);
+	commit_item(tree, b, "time", time, 8);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
+/*
+ * test_commit_commits(commit): the commits the commit records it reaches;
+ * NULL if it records none.
+ */
+PG_FUNCTION_INFO_V1(test_commit_commits);
+Datum
+test_commit_commits(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	if (!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+		elog(ERROR, "no such commit");
+	if (!info.has_commits)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64(info.commits);
+}
+
 /* The refs' commits, counted as prolly_history_height() reads them. */
 typedef struct CountedLookup
 {
