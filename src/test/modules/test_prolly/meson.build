@@ -205,6 +205,8 @@ tests += {
       'gc',
       'gc_full',
       'generations',
+      'generations_repair',
+      'generations_sever',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

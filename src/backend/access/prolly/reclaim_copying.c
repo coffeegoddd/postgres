@@ -64,6 +64,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_config.h"
@@ -525,6 +526,18 @@ count_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 	(*(int *) arg)++;
 }
 
+/*
+ * The size below which a settled file with garbage is rewritten, not kept
+ * whole (prolly.gc_rewrite_below; -1: a quarter of prolly.gc_file_size).
+ */
+static uint64
+rewrite_below(void)
+{
+	if (prolly_gc_rewrite_below < 0)
+		return (uint64) prolly_gc_file_size * 1024 / 4;
+	return (uint64) prolly_gc_rewrite_below * 1024;
+}
+
 /* a full collection's choice of the files it keeps whole */
 typedef struct Keep
 {
@@ -543,8 +556,18 @@ choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 
 	if (k->keep[file] || !settled || nslots == 0)
 		return;
+
 	for (uint64 slot = first; slot < first + nslots; slot++)
 		live += (k->mk->marks[slot / 8] >> (slot % 8)) & 1;
+
+	/*
+	 * A small one with garbage is rewritten whatever its share: it costs
+	 * little, and kept whole it would keep its garbage, and what that
+	 * names, as long as it is kept (a generation's file of a few chunks,
+	 * of history severed and of what stays).
+	 */
+	if (live < nslots && size < rewrite_below())
+		return;
 	if ((double) (nslots - live) <= REWRITE_GARBAGE * nslots)
 	{
 		k->keep[file] = true;
