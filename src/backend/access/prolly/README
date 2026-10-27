@@ -1273,9 +1273,24 @@ them.
 
 Each kept commit is an entry of its own in the refs, keyed by the
 branch, its commit's height and its id (a retired one by a number), with
-a count of the entries naming each root and a summary of the branch's
-(what its roots hold, how many, the oldest's height, the last keep), so
-a keep reads the newest few and the retired, and writes what it changes.
+a count of the entries naming each root, an index of their tables' data
+trees and a summary of the branch's (what its roots hold, how many, the
+oldest's height, the last keep), so a keep reads the newest few and the
+retired, and writes what it changes.  A branch's entries, counts and
+index are one region of the refs, under a tag that sorts after every
+other: what a window holds doesn't sit between the branch's few small
+entries (its head, mover, baseline, summary), which share leaves, and a
+commit's own entry and counts land at the region's right end.  A
+commit's entry is found by its height (a seek); another branch's keep of
+it through the index of heads' roots, for a retention pass, or by a seek
+of each branch keeping any, for a move's or a first use's source.  A
+transaction's refs reads see its changes pending without applying them
+first, so it writes its refs once, as it publishes them.  So a one-row
+commit writes a few refs nodes whatever the window: about 4 under a
+window of the newest commit, 6 to 9 under a month or a century (the
+region's right end, the small entries' leaf, the data-tree index's, and
+the levels above them), about 4 KB each once the tree is full; more
+history in the window adds a level only per hundredfold or so.
 A retention pass runs as a transaction that kept a branch's commit
 commits (its head where the transaction leaves it), once the branch has
 kept half as many commits again as it keeps, or the roots hold more than
@@ -1439,7 +1454,7 @@ by saw every writer of the branch that ended and nobody else is writing
 it; otherwise nothing is kept.  At a transaction's own commit
 (dolt.transaction_commit) only when a root is due (prolly.root_interval).  The refs
 record each kept commit with the branch's baseline then and each table's
-relations and roots ('K').
+relations and roots ('~').
 A root's slot names the transaction that captured it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is held by nobody: the store's next reclaim, or a page sweep,
