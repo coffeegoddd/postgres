@@ -22,10 +22,12 @@
  *   (never a session's); set_policy() sets a branch's own setting (value
  *   NULL: the database's again), the database owner's.
  * - plan() works out what a sever would cut (before not NULL: every commit
- *   dated before it, whatever the policy), without changing anything: the commits it would sever, the boundary edges,
- *   and the commits kept past the window (pinned).  A commit any ref
- *   names is kept; so is every commit on the way from a branch head to
- *   its merge base with each other branch head.  It holds every ref.
+ *   dated before it, whatever the policy), without changing anything:
+ *   the commits it would sever, the boundary edges, and the commits kept
+ *   past the window (pinned).  A commit any ref names keeps its data; so
+ *   does each merge base of a branch head with each other ref, by
+ *   itself, not the path to it (every commit object is kept, so the
+ *   search for it goes across the horizon).  It holds no ref.
  * - sever() severs what plan() finds, as action says: archive (the
  *   fragment sent to the policy's archive, and found whole there, before
  *   the horizon records it; with no archive, nothing is severed, with a
@@ -62,8 +64,10 @@
  *   cut taken once for the whole evaluation.  Not the commits kept only
  *   because a ref names them or for a merge base.  A lineage with no
  *   window keeps all its history here, so all of it is in the window.
- *   in_window() says whether commit is among them: a sever never severs a
- *   commit in_window() says is in the window.  Both read the refs as they
+ *   in_window() says whether commit is among them: a sever by the policy
+ *   never severs a commit in_window() says is in the window (it takes the
+ *   background's last cut for size; an explicit cut, before, and the size
+ *   limit's next cut may go further).  Both read the refs as they
  *   stand, holding none.
  * - repair() reattaches the newest nfragments of them (< 0: all), newest
  *   first, from source (a remote's name or URL; NULL: each fragment's
@@ -239,27 +243,22 @@ extern void prolly_window_check_absent(const ProllyHash *id);
  */
 extern bool prolly_window_severed(void);
 
-/* Is commit id past the history horizon? */
+/* Is commit id past the history horizon (its data severed)? */
 extern bool prolly_window_archived(const ProllyHash *id);
 
 /*
- * For readers that list history (a log, a history table): is parent past
- * the horizon, so the listing stops there?  A notice says so, once a
- * transaction.
+ * For a reader that found a tree missing from the store: an error, if it
+ * is a severed commit's root or dependencies' tree, that the commit is
+ * past the history horizon, saying how to repair it; nothing otherwise.
  */
-extern bool prolly_window_stops_at(const ProllyHash *parent);
+extern void prolly_window_check_root(const ProllyHash *tree);
 
 /*
- * The horizon as it stands now, held: a copy of the commits past it (a
- * set, in CurrentMemoryContext), for a reader that lists history a little
- * at a time (a cursor's log) and must stop where it would have stopped
- * when it began, whatever severs or rollbacks come meanwhile.  NULL when
- * the window keeps none (its listing asks prolly_window_stops_at()).
+ * For readers of every commit's rows (a history table, history mounts):
+ * is commit id's data severed, so it has none to read?  A notice says so,
+ * once a transaction.  Its commit, and the history past it, are listed
+ * still.
  */
-extern struct HTAB *prolly_window_horizon(void);
-
-/* As prolly_window_stops_at(), against a horizon held. */
-extern bool prolly_window_held_stops_at(struct HTAB *horizon,
-										const ProllyHash *parent);
+extern bool prolly_window_rows_severed(const ProllyHash *id);
 
 #endif							/* PROLLY_WINDOW_H */

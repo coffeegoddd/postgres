@@ -93,7 +93,8 @@ SELECT dolt_push('empty', 'main') AS pushed_unrelated;
 \c regress_history_repair
 DROP DATABASE regress_history_repair_other;
 SELECT dolt_remote('add', 'empty', :'url_empty');
-SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+-- (no collection before: one would settle the history in a file the
+-- severed data is too little of to rewrite, and it would stay)
 SELECT fragment, commits FROM dolt_history_drop('2020-01-04 00:00+00');
 SELECT fragment, commits FROM dolt_history_drop('2020-01-05 12:00+00');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
@@ -113,13 +114,14 @@ RESET ROLE;
 
 -- The newest fragment alone: the log reaches its commits, and stops at
 -- the older one's.
--- The older fragment's tops aren't received (the source has them), so a
--- collection after keeps the newest's commits and frees the older's.
+-- The older fragment's data isn't received (the source has it), so a
+-- collection after keeps the newest's and frees the older's; every
+-- commit object is kept.
 SELECT tops[1] AS older_top FROM prolly_history_horizon() ORDER BY fragment LIMIT 1 \gset
 SELECT dolt_history_repair('origin', 1) AS repaired;
 SELECT fragment, commits FROM prolly_history_horizon();
 SELECT count(*) AS logged FROM dolt_log('main');
-SELECT hr_err(format('SELECT prolly_root_hash(%L)', :'older_top')) AS older_not_received;
+SELECT hr_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hr.t)', :'older_top')) AS older_not_received;
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT count(*) AS logged_after_collection FROM dolt_log('main');
 

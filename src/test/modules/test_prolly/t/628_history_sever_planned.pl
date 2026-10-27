@@ -53,14 +53,18 @@ my $c = sql(q{SET statement_timeout = '10s';
 $c = (split /\n/, $c)[-1];
 like($c, qr/^[0-9a-f]{40}$/, 'a commit while the sever plans goes through');
 
-sql(q{SELECT injection_points_wakeup('prolly-sever-planned')});
+sql(q{SELECT injection_points_detach('prolly-sever-planned');
+	SELECT injection_points_wakeup('prolly-sever-planned')});
 $sever->query_until(qr/severed/, '');
 $sever->quit;
 
 # The refs moved: planned again, with side, whose merge base with main
-# is the oldest commit, so nothing is severed.
-is(sql(q{SELECT count(*) FROM prolly_history_horizon()}), '0',
+# is the oldest commit: its data kept, by itself, and the two above it
+# severed.
+is(sql(q{SELECT commits FROM prolly_history_horizon()}), '2',
 	'planned again: the new branch\'s base is kept');
+is(sql(q{SELECT count(*) FROM dolt_at('HEAD~3', NULL::sp.t)}), '100',
+	'the base\'s data is here');
 is(sql(q{SET client_min_messages = warning;
 	SELECT count(*) FROM dolt_log('side')}), '2',
 	'side keeps its history');

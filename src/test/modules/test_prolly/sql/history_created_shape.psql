@@ -128,12 +128,14 @@ UPDATE hc.t SET v = 'later' WHERE id = 3;
 SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
 \c regress_history_created
 SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
--- (the horizon told of the amend's edge to its severed parent by a sever
--- that cuts nothing, so a collection frees that parent)
+-- (the amend's severed parent stays severed: its rows aren't listed.  A
+-- collection frees its data unless a settled file it is too little of is
+-- kept whole)
 SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
 SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
-SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+SELECT count(*) AS parent_rows FROM dolt_history_table(NULL::hc.t) h
+WHERE h.commit_hash = :'severed_top';
 \endif
 SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);

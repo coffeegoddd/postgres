@@ -1891,8 +1891,8 @@ root of a tree of its commits keyed by date then id, the same wherever the
 same commits are severed) and a digest over the sorted hashes of the
 chunks born in it: what each of its commits makes that its first parent
 lacks (the canonicalizer's walk_changes() between the two roots, the
-tree's diff_nodes() between their dependencies, and the commit's own
-nodes), found by the commits alone, so a chunk resurrected or
+tree's diff_nodes() between their dependencies; the commit objects are
+kept, so they aren't the fragment's), found by the commits alone, so a chunk resurrected or
 deduplicated counts where a commit has it and its parent doesn't.  What
 a boundary commit makes over the parent a sever cuts is kept beside the
 horizon ('D'), since that parent is gone once collected and the boundary
@@ -1946,8 +1946,9 @@ remote-tracking branch) has no window of its own, though a collection
 keeps what the ref names until the ref lets go of it, and no path to it
 is kept as for a merge (it is its own merge base).  A tag keeps its own
 commit and the database's min_commits; a ref's commit on no branch's
-history keeps itself, and the paths to its merge bases with the
-branches.
+history keeps itself.  A merge base of a branch and a ref keeps its own
+data, not the path to it: every commit object is kept, so the search for
+a base goes across the horizon, and a merge reads only the base's rows.
 
 dolt_history_sever() severs what is past the window, as the action says.
 It plans, and archives, holding no ref and not the horizon's lock (only
@@ -2025,12 +2026,18 @@ the database owner's and holds the horizon's lock exclusively.  The
 history then reads as it did: the same commits, hashes, roots, rows and
 diffs.
 
-Listings stop at the horizon, as a shallow clone's do: dolt_log, the
-history tables and history mounts list the commits kept, with a notice
-once a transaction; history walks (a merge base's, HEAD~n) don't go past
-it.  Reading a severed commit once it is freed (dolt_at, a diff, a merge
-whose base is past it) is an error saying it is past the horizon and how
-to repair it.
+A sever keeps every commit object and severs only the data: each
+severed commit is recorded beside the horizon ('c': its fragment, its
+root and its dependencies' tree, and 'r', each tree back to its commit),
+and a full collection follows a severed commit to its parents but not to
+its trees.  So the history's graph is whole: dolt_log, the history
+tables and mounts list every commit, ancestry, HEAD~n and the search for
+a merge base go across the horizon as before, and a merge across it never
+takes the histories as unrelated.  Reading a severed commit's data once
+it is freed (dolt_at, a diff, a merge whose base's rows are past it, a
+history table's rows) is an error saying the commit is past the horizon
+and how to repair it.  A repair receives the trees of its commits (the
+transfer's receive_trees()), their commit objects being here.
 
 dolt_log(ref) gives the commits as it finds them: a heap of those found,
 the greatest given next (the highest height, then the newest, then by

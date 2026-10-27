@@ -826,23 +826,25 @@ OF` are built in D18's shapes.
   it has, and an operation that needs a missing commit fails.
 - **Prolly:** history can be severed past a window
   ([#1070](https://github.com/coffeegoddd/postgres/issues/1070)). The
-  window is set per database (`prolly.history_warm`,
-  `prolly.history_min_commits`, `prolly.history_cold_batch`,
-  `prolly.history_max_size`), with branch-lineage overrides from
+  window, one for history and page roots alike, is set per database
+  (`prolly.history_window`, `prolly.history_min_commits`,
+  `prolly.history_batch`, `prolly.history_max_size`), with
+  branch-lineage overrides from
   `dolt_history_window()`. What's past it is archived to a remote
   (`prolly.history_archive`, the default action), deleted, or kept
   (`prolly.history_window_action`), in the background or by
   `dolt_history_sever()`; `dolt_history_drop(before)` deletes once.
-  - No commit is rewritten: hashes stay, and the oldest commits kept
-    still name their parents. A horizon in the refs records where history
-    was cut.
-  - Every commit a ref names is kept, and so is everything down to the
-    merge base of any two branch heads.
-  - As in a shallow clone, `dolt_log`, history tables and history mounts
-    list what is kept and stop at the horizon with a notice.
-  - Reading a severed commit's content (`dolt_at`, a diff, a merge whose
-    base was severed, which pinned bases prevent between live branches)
-    is an error that names `dolt_history_repair()`.
+  - No commit is rewritten: hashes stay. Only the data is severed:
+    every commit object (id, parents, metadata) is kept, and a horizon in
+    the refs records which commits' data was cut.
+  - So, unlike a shallow clone, `dolt_log`, ancestry (`HEAD~n`) and the
+    search for a merge base go across the horizon. History tables and
+    history mounts list no rows for a severed commit, with a notice.
+  - The data of every commit a ref names is kept, and so is the data of
+    each merge base between a branch and a ref; not the paths to them.
+  - Reading a severed commit's data (`dolt_at`, a diff, a merge whose
+    base's data was severed) is an error that names
+    `dolt_history_repair()`.
   - `dolt_history_repair()` brings the history back, verified, from the
     archive or from any remote or clone that has it. Afterwards it reads
     bit for bit as before.
