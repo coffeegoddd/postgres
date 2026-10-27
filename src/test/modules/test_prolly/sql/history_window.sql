@@ -66,6 +66,8 @@ SELECT dolt_history_window('long', 'warm', '10 days');
 SELECT action, warm, min_commits FROM prolly_history_policy(NULL);
 SELECT action, warm FROM prolly_history_policy('long');
 SELECT hw_err($$SELECT dolt_history_window('long', 'archive', 'x')$$) AS not_a_branch_setting;
+SELECT hw_err($$SELECT dolt_history_window(NULL, 'warm', '1 day')$$) AS null_branch,
+	   hw_err($$SELECT dolt_history_window('long', NULL, '1 day')$$) AS null_setting;
 SELECT kind, hw_name(commit_hash) AS commit, hw_name(parent_hash) AS parent, why
 FROM prolly_history_plan(NULL) ORDER BY kind, commit, parent;
 
