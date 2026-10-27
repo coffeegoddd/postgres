@@ -106,15 +106,20 @@ SELECT hw_err($$SELECT dolt_history_window('long', 'archive', 'x')$$) AS not_a_b
  a branch's history window has no setting "archive"
 (1 row)
 
+SELECT hw_err($$SELECT dolt_history_window(NULL, 'warm', '1 day')$$) AS null_branch,
+	   hw_err($$SELECT dolt_history_window('long', NULL, '1 day')$$) AS null_setting;
+            null_branch            |           null_setting            
+-----------------------------------+-----------------------------------
+ a branch and a setting are needed | a branch and a setting are needed
+(1 row)
+
 SELECT kind, hw_name(commit_hash) AS commit, hw_name(parent_hash) AS parent, why
 FROM prolly_history_plan(NULL) ORDER BY kind, commit, parent;
-   kind   | commit | parent |    why     
-----------+--------+--------+------------
- boundary | a8     | a10    | 
- pinned   | a4     |        | merge base
- pinned   | a6     |        | merge base
- severed  | a10    |        | 
-(4 rows)
+  kind  | commit | parent |    why     
+--------+--------+--------+------------
+ pinned | a4     |        | merge base
+ pinned | a6     |        | merge base
+(2 rows)
 
 -- A session's settings don't count: not the action, not the window, not
 -- the archive.  Archive mode with no archive severs nothing, and says so.
@@ -128,7 +133,6 @@ SELECT action, warm, archive FROM prolly_history_policy(NULL);
 (1 row)
 
 SELECT action, fragment, commits FROM dolt_history_sever();
-WARNING:  history of database "regress_history_window" is past its window, but isn't severed: it has no archive
  action  | fragment | commits 
 ---------+----------+---------
  archive |          |       0
@@ -194,25 +198,23 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action  | fragment | commits | boundary | sent 
 ---------+----------+---------+----------+------
- archive |        1 |       1 | {a8}     | t
+ archive |          |       0 | {}       | f
 (1 row)
 
 SELECT fragment, state, commits, location = :'url' AS archived_there,
 	   array(SELECT hw_name(t) FROM unnest(tops) t ORDER BY 1) AS tops
 FROM prolly_history_horizon();
- fragment |  state   | commits | archived_there | tops  
-----------+----------+---------+----------------+-------
-        1 | archived |       1 | t              | {a10}
-(1 row)
+ fragment | state | commits | archived_there | tops 
+----------+-------+---------+----------------+------
+(0 rows)
 
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
  freed 
 -------
- t
+ f
 (1 row)
 
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
-NOTICE:  history stops at the history horizon
  commit 
 --------
  a0
@@ -221,7 +223,8 @@ NOTICE:  history stops at the history horizon
  a4
  a6
  a8
-(6 rows)
+ a10
+(7 rows)
 
 -- A window by count: at least three commits, however old, for main; the
 -- cut in whole days (cold_batch).  With long gone, its merge base pins
@@ -248,7 +251,7 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action  | fragment | commits | boundary | sent_only_new 
 ---------+----------+---------+----------+---------------
- archive |        2 |       3 | {a2}     | t
+ archive |        1 |       4 | {a2}     | f
 (1 row)
 
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
@@ -270,7 +273,7 @@ NOTICE:  history stops at the history horizon
 SELECT dolt_history_repair() AS repaired;
  repaired 
 ----------
-        2
+        1
 (1 row)
 
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
@@ -299,13 +302,13 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action | fragment | commits | boundary 
 --------+----------+---------+----------
- delete |        3 |       4 | {a2}
+ delete |        2 |       4 | {a2}
 (1 row)
 
 SELECT fragment, state, location FROM prolly_history_horizon() ORDER BY fragment DESC;
  fragment |  state  | location 
 ----------+---------+----------
-        3 | deleted | 
+        2 | deleted | 
 (1 row)
 
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;

@@ -300,6 +300,20 @@ NOTICE:  history stops at the history horizon
  c5
 (4 rows)
 
+-- Nulls: no date severs nothing; a null date plans by the database's
+-- window, which keeps everything.
+SELECT * FROM dolt_history_drop(NULL);
+ fragment | commits | boundary | chunks | bytes 
+----------+---------+----------+--------+-------
+          |         |          |        |      
+(1 row)
+
+SELECT count(*) AS planned FROM prolly_history_plan(NULL);
+ planned 
+---------
+       0
+(1 row)
+
 \c :home
 DROP DATABASE regress_history_horizon;
 DROP ROLE regress_hh_other;
