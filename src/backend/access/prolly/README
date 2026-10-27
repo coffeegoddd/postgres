@@ -1549,11 +1549,12 @@ has a root is always restored, however few of its rows changed: a move
 to a commit kept writes no rows (but where a lock, a privilege or the
 session's own use of the table stands in the way); only a commit with no
 root writes the rows between it and the nearest root before.
-pg_stat_prolly counts each move by the path it took: moves_root_kept
-(the commit's own pages given back), moves_root_nearest (the nearest
-kept commit's before it, and the rows between written) and
-moves_root_missing (neither: the rows written, from the head's pages if
-those are kept).  prolly_history_roots(branch, commit_hash) lists the
+pg_stat_prolly counts each move by the root it found: moves_root_kept
+(the pages kept as of its commit, given back to each table that needs
+them), moves_root_nearest (those of the nearest kept commit before it,
+and the rows between written) and moves_root_missing (neither: the rows
+written, from the head's pages if those are kept).  A table a move can't
+give a root's pages is written, as move_tables_written counts.  prolly_history_roots(branch, commit_hash) lists the
 commits whose pages are kept, by the branches keeping them, so a caller
 can tell before a move which path it will take.
 

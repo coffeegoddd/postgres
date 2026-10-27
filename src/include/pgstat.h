@@ -841,9 +841,10 @@ typedef enum PgStat_ProllyCounter
 											 * read */
 	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries
 										 * read, a commit's or a fragment's */
-	PGSTAT_PROLLY_MOVES_ROOT_KEPT,	/* moves of a branch that gave back the
-									 * pages kept as of their commit */
-	PGSTAT_PROLLY_MOVES_ROOT_NEAREST,	/* moves that gave back those of the
+	PGSTAT_PROLLY_MOVES_ROOT_KEPT,	/* moves of a branch that found the
+									 * pages kept as of their commit, to
+									 * give back */
+	PGSTAT_PROLLY_MOVES_ROOT_NEAREST,	/* moves that found those of the
 										 * nearest kept commit before
 										 * theirs, and wrote the rows
 										 * between */

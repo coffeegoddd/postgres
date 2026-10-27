@@ -73,6 +73,17 @@ SELECT pg_stat_force_next_flush();
 SELECT * FROM path();
 SELECT count(*) FILTER (WHERE v = 2) AS at_c2 FROM mr.t;
 
+-- A branch's first use at c0, kept: its tables made of c0's pages, so
+-- the move's restore has none left to give back and writes no rows; it
+-- counts as kept, not as a move without a root.
+SELECT dolt_branch('at_c0', :'c0');
+SELECT pg_stat_reset_shared('prolly');
+SELECT dolt_checkout('at_c0');
+SELECT pg_stat_force_next_flush();
+SELECT * FROM path();
+SELECT count(*) FILTER (WHERE v = 0) AS at_c0 FROM mr.t;
+SELECT dolt_checkout('main');
+
 -- Roots capped at a byte: the oldest let go of, so a move to c1 has
 -- neither its own nor one before it, and writes its rows.
 \c :home

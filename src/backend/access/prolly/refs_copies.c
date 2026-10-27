@@ -7064,6 +7064,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyHash	head;
 	ProllyCommitInfo at_head;
 	Oid			source = MyBranch;
+	bool		kept_found;
 
 	if (!debug_prolly_page_roots || !debug_prolly_restore_roots ||
 		branch_ops()->restore == NULL ||
@@ -7076,17 +7077,22 @@ restore_pages(const ProllyCommitInfo *commit)
 	kept_forget_name(name);
 	kept = kept_get(name);
 	if (!branch_baseline(name, &baseline))
-	{
-		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_MISSING, 1);
 		return;
-	}
 	was = kept_usable(name, &kept, kept_anywhere(kept, &commit->id, &source),
 					  source);
+
+	/*
+	 * (the path counted by the root found, not by the tables it gave back:
+	 * a table that has the pages already, as a first use leaves it, needs
+	 * none, and one it can't give back is written, as move_tables_written
+	 * counts)
+	 */
+	kept_found = was != NULL;
+	if (kept_found)
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_KEPT, 1);
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
-	if (restored != NIL)
-		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_KEPT, 1);
 
 	/*
 	 * (another branch's roots of the commit, of a schema the session's
@@ -7097,29 +7103,32 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (was == NULL &&
 		(was = kept_usable(name, &kept,
 						   nearest_kept(kept, commit, &at_head, &source),
-						   source)) != NULL &&
-		!(branch_head(name, &head) && same_hash(&head, &at_head.id)))
+						   source)) != NULL)
 	{
-		int			before = list_length(restored);
-
-		/*
-		 * (as the head's below: the rows between written after, so a
-		 * snapshot older than the move must not read the pages meanwhile)
-		 */
-		restore_kept(&dc, &at_head, was, source, &kept, restored,
-					 &commit->root, &baseline, &restored);
-		if (list_length(restored) > before)
-		{
-			branch_note_head_restore(MyBranch);
+		if (!kept_found)
 			pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_NEAREST, 1);
+		if (!(branch_head(name, &head) && same_hash(&head, &at_head.id)))
+		{
+			int			before = list_length(restored);
+
+			/*
+			 * (as the head's below: the rows between written after, so a
+			 * snapshot older than the move must not read the pages
+			 * meanwhile)
+			 */
+			restore_kept(&dc, &at_head, was, source, &kept, restored,
+						 &commit->root, &baseline, &restored);
+			if (list_length(restored) > before)
+				branch_note_head_restore(MyBranch);
 		}
 	}
+
 	/*
-	 * (a move neither its commit's pages nor the nearest kept before it
-	 * gave any table writes its rows: from the head's pages, below, if
-	 * those are kept)
+	 * (neither the commit's pages nor those of a kept commit before it:
+	 * the move writes its rows, from the head's pages, below, if those are
+	 * kept)
 	 */
-	if (restored == NIL)
+	if (was == NULL && !kept_found)
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_MISSING, 1);
 
 	/*
