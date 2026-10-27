@@ -83,7 +83,6 @@ my $conf = q{
 autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
-prolly.restore_min_changes = 0
 };
 
 # streaming, every record's redo checked on the primary and a standby, and

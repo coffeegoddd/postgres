@@ -18,8 +18,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('wal_durable_shares');
 $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf',
-	"autovacuum = off\ncheckpoint_timeout = 1h\nwal_compression = off\n"
-	  . "prolly.restore_min_changes = 0");
+	"autovacuum = off\ncheckpoint_timeout = 1h\nwal_compression = off\n");
 # (roots sharing the relations' pages as they are: frozen ones share none)
 $node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;

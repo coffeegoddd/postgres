@@ -5,7 +5,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_changed_pages;
-ALTER DATABASE root_changed_pages SET prolly.restore_min_changes = 0;
 \c root_changed_pages
 
 CREATE FUNCTION nodes_read() RETURNS bigint LANGUAGE sql AS $$

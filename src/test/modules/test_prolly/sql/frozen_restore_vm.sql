@@ -8,7 +8,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE frozen_restore_vm;
-ALTER DATABASE frozen_restore_vm SET prolly.restore_min_changes = 0;
 \c frozen_restore_vm
 SET client_min_messages = warning;
 CREATE EXTENSION pg_visibility;

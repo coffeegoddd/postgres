@@ -7,7 +7,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_carried;
-ALTER DATABASE kept_carried SET prolly.restore_min_changes = 0;
 \c kept_carried
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;

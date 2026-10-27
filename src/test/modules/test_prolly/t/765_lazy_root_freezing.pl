@@ -24,7 +24,6 @@ prolly_fold_worker = off
 prolly_fold_worker_naptime = 100
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
-prolly.restore_min_changes = 0
 });
 $node->start;
 $node->backup('base');

@@ -2847,10 +2847,21 @@ static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
  */
 static BranchLockWait move_wait;
 
+/*
+ * The waits a hard reset began before it held the refs
+ * (lock_for_restore()), for the next settle() to go on from rather than
+ * begin anew: a table given up on there isn't waited for again.
+ */
+static const BranchLockWait *move_wait_begun = NULL;
+
 static void
 settle(const ProllyCommitInfo *commit, const KnownSource *source)
 {
-	memset(&move_wait, 0, sizeof(move_wait));
+	if (move_wait_begun != NULL)
+		move_wait = *move_wait_begun;
+	else
+		memset(&move_wait, 0, sizeof(move_wait));
+	move_wait_begun = NULL;
 	if (source == NULL)
 		restore_pages(commit);
 	settle_rows(&commit->root, source);
@@ -3741,7 +3752,7 @@ move_settled_checked(void *arg)
  * the change is known to commit.
  */
 bool		debug_prolly_page_roots = true;
-int			prolly_restore_min_changes = 2;
+bool		debug_prolly_restore_roots = true;
 int			prolly_root_interval = -1;
 int			prolly_root_interval_commits = 1;
 bool		prolly_freeze_roots = true;
@@ -6152,37 +6163,6 @@ kept_total_bytes(void)
 }
 
 /*
- * Giving a table its kept pages back costs a constant (new storage for
- * each of its relations, its catalog row and caches), while writing its
- * rows back costs each row its pages, which the commit's pages kept again
- * after the move then sync: at 1M rows, with fsync on, ~11 ms restored
- * against ~7 ms for one row written, ~11 ms for four and ~20 ms for eight.
- * So fewer than prolly.restore_min_changes changed since a baseline
- * holding the commit's rows are written instead.
- */
-
-/*
- * Would writing table relid's rows back to the commit's (data) cost less
- * than restoring its pages: its baseline holds the commit's rows, and
- * fewer than prolly.restore_min_changes of them changed since, as its
- * change finder tells from no more than that many of its records?
- */
-static bool
-few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
-			Oid relid, const ProllyNodeRef *data)
-{
-	ProllyNodeRef base;
-
-	if (prolly_restore_min_changes <= 0 ||
-		!PROLLY_HAS(dc->canonicalizer, table_fewer_changes) ||
-		!dc->canonicalizer->table_fewer_changes(baseline, relid,
-												prolly_restore_min_changes,
-												&base))
-		return false;
-	return same_hash(&base.hash, &data->hash);
-}
-
-/*
  * The relations of table name as the other commits of kept (but was, and
  * those retired) keep them: copies into *carry, and where each is into
  * *into, for a restore of the table to carry their snapshots into the
@@ -6229,8 +6209,7 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
  * Would restore_kept() give table kt (of a kept commit whose readable
  * tables are readable) its kept pages, its relation *relid: it is on the
  * branch as it was then (other: kept by another branch, whose pages it
- * may share), the user may write it, more than a few of its rows
- * changed since baseline (few_changes()), and, for the head's pages
+ * may share), the user may write it, and, for the head's pages
  * (moving: targets the move's commit's tables), the move's commit holds
  * it?  Asked by the restore, and before a hard reset holds the refs, of
  * the tables it will lock for it (lock_for_restore()).
@@ -6263,7 +6242,6 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
 		 same_relation_set(kept_relations(*relid), kt->rels, kt->nrels) :
 		 same_relations(kept_relations(*relid), kt)) &&
 		may_restore(*relid) &&
-		!few_changes(dc, baseline, *relid, &target->data) &&
 		!(moving && moved == NULL);
 }
 
@@ -6273,9 +6251,8 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
  * changed since (O(1) each), whose baseline entry is then the kept one's.
  * A table not on the branch as it was then (another name, other
  * relations, storage replaced since), or not restored (its snapshot gone,
- * the session itself using it), is left for the move to write, as is one
- * with so few rows changed that writing them costs less (few_changes()),
- * or, with moving_to (the move's commit, when commit is the head), one the
+ * the session itself using it), is left for the move to write, as is,
+ * with moving_to (the move's commit, when commit is the head), one the
  * move's commit doesn't hold (the move drops it).  With moving_to, every
  * other table that changed since the head is given the head's pages
  * whatever the working set holds: discarding its changes so is O(1),
@@ -6658,7 +6635,8 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyCommitInfo at_head;
 	Oid			source = MyBranch;
 
-	if (!debug_prolly_page_roots || branch_ops()->restore == NULL ||
+	if (!debug_prolly_page_roots || !debug_prolly_restore_roots ||
+		branch_ops()->restore == NULL ||
 		RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
@@ -11005,11 +10983,15 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
  * Make the commit ref names the session branch's head, and move the branch
  * there: its rows written as the commit has them.
  */
-/* The tables of kept commit kc a restore would give its pages, planned. */
+/*
+ * The tables of kept commit kc a restore would give its pages, planned:
+ * each one's name added to *planned, and the relations to lock for it
+ * (its ancestors' first, then its own) as a list to *locks.
+ */
 static void
 plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
 			 const ProllyNodeRef *root, const ProllyNodeRef *moving_to,
-			 const ProllyNodeRef *baseline, List **planned, List **relids)
+			 const ProllyNodeRef *baseline, List **planned, List **locks)
 {
 	List	   *tables = NIL;
 	List	   *readable = NIL;
@@ -11029,6 +11011,7 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
 		const KeptTable *kt = &kc->tables[t];
 		Oid			relid;
 		bool		skipped = false;
+		List	   *relids = NIL;
 
 		foreach_ptr(char, n, *planned)
 		{
@@ -11051,12 +11034,39 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
 			List	   *ancestors = get_partition_ancestors(relid);
 
 			for (int a = list_length(ancestors) - 1; a >= 0; a--)
-				*relids = list_append_unique_oid(*relids,
-												 list_nth_oid(ancestors, a));
+				relids = list_append_unique_oid(relids,
+												list_nth_oid(ancestors, a));
 		}
 		for (int r = 0; r < kt->nrels; r++)
-			*relids = list_append_unique_oid(*relids, kt->rels[r].relid);
+			relids = list_append_unique_oid(relids, kt->rels[r].relid);
+		*locks = lappend(*locks, relids);
 	}
+}
+
+/*
+ * The relations of the tables' locks, each once, in order, but those of a
+ * table locked for any of given_up.
+ */
+static List *
+restore_relids(List *locks, List *given_up)
+{
+	List	   *relids = NIL;
+
+	foreach_ptr(List, l, locks)
+	{
+		bool		left = false;
+
+		foreach_oid(relid, given_up)
+		{
+			if (list_member_oid(l, relid))
+				left = true;
+		}
+		if (left)
+			continue;
+		foreach_oid(relid, l)
+			relids = list_append_unique_oid(relids, relid);
+	}
+	return relids;
 }
 
 /*
@@ -11064,20 +11074,33 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
  * operation waits for): the tables a restore will give the pages kept as
  * of the commit ref names, or of the head, locked as TRUNCATE locks them
  * (planned as restore_pages() plans: only those it gives pages, not those
- * whose rows it writes, which take a writer's locks).  So a transaction
- * that read one and is still open (on main, which sessions don't lock,
- * any) holds up the reset alone, and the restore finds the locks held.
+ * whose rows it writes, which take a writer's locks), so the restore
+ * finds the locks held.  A lock that isn't free is tried, never queued
+ * for, within the bounds of *wait (zeroed here; the move's, for its
+ * restores to go on from), as share() tries it: a page sweep asked to let
+ * go, an autovacuum worker asked to cancel and waited for until
+ * deadlock_timeout, any other holder (a transaction that read the table
+ * and is still open: on main, which sessions don't lock, any) until
+ * prolly.restore_lock_wait after the reset first waited, lock_timeout
+ * capping both.  A table whose lock is still held after that is given up
+ * on: its restore tries the lock once more, the bounds spent, and its
+ * rows are written instead, which takes only a writer's locks.  So a
+ * reader never holds the reset up past those bounds, and, as the reset
+ * never waits in a lock's queue, never has readers after it queue behind
+ * the reset.
  *
  * The lock order, against every other operation's (the branch's refs,
  * then the root, then the relations it reads or writes):
  * - the tables' locks all or none: those free taken, and the first one
- *   that isn't queued for with nothing else held, then all tried again
+ *   that isn't free tried for with nothing else held, then all tried again
  *   (as lmgr.c's callers of ConditionalLockRelationOid() take sets), so
  *   the reset never holds one table while it waits for another;
  * - then the branch's refs and the root, only tried: if either is held,
  *   every table's lock is given back, and the reset waits for each in its
  *   queue, holding nothing (taking it and letting go of it at once), and
- *   begins again.
+ *   begins again, the tables given up on tried anew within fresh bounds
+ *   (the holder of the refs, another reset, may have been what held
+ *   them).
  * The planning itself takes no lock it keeps (may_restore() and
  * kept_relations() let go of what they take to read a relation), so two
  * resets of one branch at once don't each hold a table the other waits
@@ -11089,12 +11112,14 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
  * for no relation lock here: its restores try theirs).
  */
 static void
-lock_for_restore(const char *ref)
+lock_for_restore(const char *ref, BranchLockWait *wait)
 {
 	ProllyDatabaseComponents dc;
 	char	   *name;
 	List	   *planned = NIL;
-	List	   *relids = NIL;
+	List	   *locks = NIL;
+	List	   *given_up = NIL;
+	List	   *relids;
 	ProllyHash	head;
 	ProllyHash	target;
 	ProllyCommitInfo info;
@@ -11103,8 +11128,10 @@ lock_for_restore(const char *ref)
 	KeptCommit *was;
 	Oid			waited = InvalidOid;
 
-	if (whole || !debug_prolly_page_roots ||
-		branch_ops()->changed_since_kept == NULL || RecoveryInProgress())
+	memset(wait, 0, sizeof(*wait));
+	if (whole || !debug_prolly_page_roots || !debug_prolly_restore_roots ||
+		branch_ops()->changed_since_kept == NULL ||
+		branch_ops()->try_lock == NULL || RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
 	name = branch_ops()->current();
@@ -11114,20 +11141,22 @@ lock_for_restore(const char *ref)
 	/* (each a seek; read again once the refs are held) */
 	was = kept_lookup(name, &target, false);
 	if (was != NULL && was->baseline.len > 0)
-		plan_restore(&dc, was, &info.root, NULL, &baseline, &planned, &relids);
+		plan_restore(&dc, was, &info.root, NULL, &baseline, &planned, &locks);
 	if (branch_head(name, &head) && !same_hash(&head, &target) &&
 		(was = kept_lookup(name, &head, false)) != NULL &&
 		was->baseline.len > 0 && copies_commit_get(&head, &at_head))
 		plan_restore(&dc, was, &at_head.root, &info.root, &baseline,
-					 &planned, &relids);
-	if (relids == NIL)
+					 &planned, &locks);
+	if (locks == NIL)
 		return;
+	relids = restore_relids(locks, NIL);
 
 	for (;;)
 	{
 		bool		all = true;
 		ListCell   *lc;
 		int			ntaken = 0;
+		Oid			busy;
 
 		CHECK_FOR_INTERRUPTS();
 		foreach(lc, relids)
@@ -11155,7 +11184,7 @@ lock_for_restore(const char *ref)
 			/*
 			 * (the refs held: everything given back, and each waited for
 			 * in its queue, holding nothing, as the deadlock detector and
-			 * lock_timeout see, then let go of, to try again)
+			 * lock_timeout see, then let go of, to begin again)
 			 */
 			foreach(lc, relids)
 				UnlockRelationOid(lfirst_oid(lc), AccessExclusiveLock);
@@ -11163,13 +11192,23 @@ lock_for_restore(const char *ref)
 			release_branch(name);
 			if (PROLLY_HAS(env.chunk_store, wait_root_free))
 				env.chunk_store->wait_root_free(env.chunks);
+			memset(wait, 0, sizeof(*wait));
+			given_up = NIL;
+			relids = restore_relids(locks, NIL);
 			continue;
 		}
-		/* (those taken given back, and the busy one queued for alone) */
+		/* (those taken given back, and the busy one tried for alone) */
 		for (int i = 0; i < ntaken; i++)
 			UnlockRelationOid(list_nth_oid(relids, i), AccessExclusiveLock);
-		waited = list_nth_oid(relids, ntaken);
-		LockRelationOid(waited, AccessExclusiveLock);
+		busy = list_nth_oid(relids, ntaken);
+		if (branch_ops()->try_lock(busy, AccessExclusiveLock, wait))
+		{
+			waited = busy;
+			continue;
+		}
+		/* (still held: the tables it is locked for given up on) */
+		given_up = lappend_oid(given_up, busy);
+		relids = restore_relids(locks, given_up);
 	}
 	AcceptInvalidationMessages();
 }
@@ -11180,8 +11219,9 @@ copies_reset(const char *ref)
 	ProllyHash	target;
 	ProllyCommitInfo info;
 	bool		pushed;
+	BranchLockWait wait;
 
-	lock_for_restore(ref);
+	lock_for_restore(ref, &wait);
 	lock_refs();
 	if (!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
 		ereport(ERROR,
@@ -11189,6 +11229,7 @@ copies_reset(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
+	move_wait_begun = &wait;
 	move_settled(&info);
 	if (pushed)
 		PopActiveSnapshot();

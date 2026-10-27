@@ -6,7 +6,6 @@
 -- hash, bloom (generic WAL) and btree.
 SELECT current_database() AS home \gset
 CREATE DATABASE root_index_ams;
-ALTER DATABASE root_index_ams SET prolly.restore_min_changes = 0;
 \c root_index_ams
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

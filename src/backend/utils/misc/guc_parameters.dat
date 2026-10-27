@@ -762,6 +762,13 @@
   boot_val => 'true',
 },
 
+{ name => 'debug_prolly_restore_roots', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Has prolly moves give tables the pages of their commits\' roots; off, moves write rows while commits still keep roots, for testing.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_restore_roots',
+  boot_val => 'true',
+},
+
 { name => 'debug_prolly_verify_fold_caches', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Folds again each prolly working set taken from an earlier fold, and works out again what a fold takes from its caches, and reports an error if they differ, for testing.',
   flags => 'GUC_NOT_IN_SAMPLE',

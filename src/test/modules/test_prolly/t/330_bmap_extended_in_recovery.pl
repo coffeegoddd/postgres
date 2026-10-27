@@ -20,7 +20,6 @@ wal_keep_size = 1GB
 autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
-prolly.restore_min_changes = 0
 });
 $primary->start;
 $primary->backup('b');

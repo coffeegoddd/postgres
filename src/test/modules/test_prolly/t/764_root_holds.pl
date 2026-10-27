@@ -28,7 +28,6 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
-prolly.restore_min_changes = 0
 });
 $node->start;
 $node->safe_psql('postgres',
