@@ -37,6 +37,10 @@ sub use_db
 {
 	$db = $_[0];
 	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	# (a window of the newest two commits: the roots of commits past it
+	# are let go of, as junk's must be for a shrink)
+	$node->safe_psql('postgres',
+		"ALTER DATABASE $db SET prolly.history_min_commits = 2");
 	sql(q{CREATE EXTENSION amcheck; CREATE SCHEMA app VERSIONED});
 }
 
