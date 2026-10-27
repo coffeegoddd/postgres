@@ -75,10 +75,10 @@ $$;
 SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
 FROM prolly_history_plan('2020-01-06 00:00+00')
 ORDER BY kind, commit, parent;
-   kind   | commit | parent | why 
-----------+--------+--------+-----
+   kind   | commit | parent |    why     
+----------+--------+--------+------------
  boundary | c4     | c3     | 
- pinned   | c4     |        | ref
+ pinned   | c4     |        | merge base
  severed  | c1     |        | 
  severed  | c2     |        | 
  severed  | c3     |        | 
@@ -278,7 +278,7 @@ SELECT id, v FROM hh.t ORDER BY id;
 
 -- A second sever builds on the horizon: its fragment stops at the first's.
 -- (feature merged and gone, its merge base pins nothing; the commits the
--- branch's pages are kept as of are refs' commits, pinned)
+-- branch's pages are kept as of are main's lineage, its window's to cut)
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
@@ -291,10 +291,10 @@ WHERE kind <> 'pinned' OR hh_name(commit_hash) ~ '^[cf][0-9]$'
 ORDER BY kind, commit, parent;
    kind   | commit | parent | why 
 ----------+--------+--------+-----
- boundary | c5     | c4     | 
+ boundary | c6     | c5     | 
  boundary | f1     | c4     | 
- pinned   | c5     |        | ref
  severed  | c4     |        | 
+ severed  | c5     |        | 
 (4 rows)
 
 SELECT fragment, commits,
@@ -302,15 +302,15 @@ SELECT fragment, commits,
 FROM dolt_history_drop('2020-01-07 00:00+00');
  fragment | commits | boundary 
 ----------+---------+----------
-        2 |       1 | {c5,f1}
+        2 |       2 | {c6,f1}
 (1 row)
 
 SELECT fragment, commits,
 	   array(SELECT hh_name(t) FROM unnest(tops) t ORDER BY 1) AS tops
 FROM prolly_history_horizon();
- fragment | commits | tops 
-----------+---------+------
-        2 |       1 | {c4}
+ fragment | commits |  tops   
+----------+---------+---------
+        2 |       2 | {c4,c5}
         1 |       3 | {c3}
 (2 rows)
 
@@ -321,8 +321,7 @@ NOTICE:  history stops at the history horizon
  merge
  c6
  f1
- c5
-(4 rows)
+(3 rows)
 
 -- Nulls: no date severs nothing; a null date plans by the database's
 -- window, which keeps everything.

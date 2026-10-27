@@ -38,7 +38,7 @@ FROM prolly_implementations();
  chunk_format   | basic        |       1 |              2
  row_applier    | replication  |       1 |              1
  row_applier    | stub         |       0 |              0
- table_file     | basic        |       1 |              3
+ table_file     | basic        |       1 |              4
  table_file     | stub         |       0 |              0
  change_finder  | pages        |       1 |              8
  change_finder  | log          |       2 |              3
@@ -46,6 +46,9 @@ FROM prolly_implementations();
  remote         | file         |       1 |              2
  remote         | postgresql   |       2 |              1
  remote         | postgres     |       3 |              1
+ remote         | liar         |    9003 |              0
+ remote         | stall        |    9004 |              0
+ remote         | slow         |    9005 |              0
  value_memo     | shared       |       1 |              1
  value_memo     | stub         |       0 |              0
  writers        | modes        |       1 |              1
@@ -66,7 +69,7 @@ FROM prolly_implementations();
  history_window | stub         |       0 |              0
  root_freezer   | capture      |       1 |              1
  root_freezer   | stub         |       0 |              0
-(57 rows)
+(60 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -248,7 +251,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_file     | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
  table_file     | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
  table_file     | stub           | shared_prefixes                | not implemented (missing write_begin, write_add, write_finish, open, find, decode, close)
- table_file     | stub           | complete                       | not implemented (13 of 13 callbacks missing)
+ table_file     | stub           | complete                       | not implemented (15 of 15 callbacks missing)
  change_finder  | pages          | identity                       | pass
  change_finder  | pages          | complete                       | pass
  change_finder  | log            | identity                       | pass
@@ -264,6 +267,15 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  remote         | postgres       | identity                       | pass
  remote         | postgres       | heads_and_chunks               | no checks yet
  remote         | postgres       | complete                       | pass
+ remote         | liar           | identity                       | pass
+ remote         | liar           | heads_and_chunks               | no checks yet
+ remote         | liar           | complete                       | not implemented (7 of 18 callbacks missing)
+ remote         | stall          | identity                       | pass
+ remote         | stall          | heads_and_chunks               | not implemented (missing format, heads, get, has, add_chunks, move_head)
+ remote         | stall          | complete                       | not implemented (15 of 18 callbacks missing)
+ remote         | slow           | identity                       | pass
+ remote         | slow           | heads_and_chunks               | no checks yet
+ remote         | slow           | complete                       | not implemented (7 of 18 callbacks missing)
  value_memo     | shared         | identity                       | pass
  value_memo     | shared         | complete                       | pass
  value_memo     | stub           | identity                       | pass
@@ -299,12 +311,12 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | identity                       | pass
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
- history_window | stub           | complete                       | not implemented (7 of 7 callbacks missing)
+ history_window | stub           | complete                       | not implemented (14 of 14 callbacks missing)
  root_freezer   | capture        | identity                       | pass
  root_freezer   | capture        | complete                       | pass
  root_freezer   | stub           | identity                       | pass
  root_freezer   | stub           | complete                       | not implemented (2 of 2 callbacks missing)
-(230 rows)
+(239 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

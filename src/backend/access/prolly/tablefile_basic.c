@@ -19,9 +19,12 @@
  *				(the suffix); then a blocked Bloom filter of the hashes,
  *				FILTER_BITS bits a chunk in blocks of FILTER_BLOCK bits
  *				(one cache line), each hash's FILTER_PROBES bits in one
+ *		section	the bytes the file's writer gave write_section(), opaque
+ *				to the format (none: no bytes)
  *		footer	uint64 offset of the index, uint32 chunk count, uint8 hash
  *				length, three zero bytes, uint32 CRC-32C of the index,
- *				uint32 version (3), "PRLYTBL1"
+ *				uint32 length of the section, uint32 CRC-32C of the section,
+ *				eight zero bytes, uint32 version (4), "PRLYTBL1"
  *
  * integers little-endian, but the prefixes.  A chunk is compressed with LZ4
  * when the server is built with it and that makes the chunk smaller; a
@@ -52,9 +55,12 @@
 #include "port/pg_crc32c.h"
 #include "utils/memutils.h"
 
-#define FORMAT_VERSION	3
+#define FORMAT_VERSION	4
 #define MAGIC			"PRLYTBL1"
-#define FOOTER_SIZE		32
+#define FOOTER_SIZE		48
+#define FOOTER_VERSION	(FOOTER_SIZE - 12)	/* the version, then the magic */
+#define FOOTER_MAGIC	(FOOTER_SIZE - 8)
+#define TAIL_SIZE		12		/* the version and magic, every version's last */
 #define CHUNK_HEADER	5		/* codec, length */
 #define CHUNK_OVERHEAD	(CHUNK_HEADER + 4)
 #define PREFIX_LEN		8		/* a hash's bytes in its prefix */
@@ -82,6 +88,8 @@ struct ProllyTableFileWriter
 	int			max;
 	uint64		offset;			/* the file's length so far */
 	uint8		hash_len;
+	char	   *section;		/* write_section()'s bytes (NULL: none) */
+	uint32		section_len;
 };
 
 /* the index's sections, where they are: mapped, or in copy */
@@ -97,6 +105,9 @@ struct ProllyTableFile
 	const char *filter;
 	uint64		filter_bits;
 	char	   *copy;			/* the index, if read rather than mapped */
+	uint64		section_offset;
+	uint32		section_len;
+	uint32		section_crc;
 };
 
 static void
@@ -369,13 +380,48 @@ basic_write_finish(ProllyTableFileWriter *w, StringInfo out)
 	put_u32(footer + 8, (uint32) w->n);
 	footer[12] = (char) w->hash_len;
 	put_u32(footer + 16, crc);
-	put_u32(footer + 20, FORMAT_VERSION);
-	memcpy(footer + 24, MAGIC, 8);
+	if (w->section_len > 0)
+	{
+		appendBinaryStringInfo(out, w->section, w->section_len);
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, w->section, w->section_len);
+		FIN_CRC32C(crc);
+		put_u32(footer + 20, w->section_len);
+		put_u32(footer + 24, crc);
+	}
+	put_u32(footer + FOOTER_VERSION, FORMAT_VERSION);
+	memcpy(footer + FOOTER_MAGIC, MAGIC, 8);
 	appendBinaryStringInfo(out, footer, sizeof(footer));
 
 	if (w->entries)
 		pfree(w->entries);
+	if (w->section)
+		pfree(w->section);
 	pfree(w);
+}
+
+/* Bytes the file holds for its writer, after its index (a copy taken). */
+static void
+basic_write_section(ProllyTableFileWriter *w, const char *data, uint32 len)
+{
+	if (w->section)
+		pfree(w->section);
+	w->section = NULL;
+	w->section_len = len;
+	if (len > 0)
+	{
+		w->section = MemoryContextAllocHuge(w->cxt, len);
+		memcpy(w->section, data, len);
+	}
+}
+
+/* Where a file's section is, and its CRC-32C (len 0: it has none). */
+static void
+basic_section(ProllyTableFile *tf, uint64 *offset, uint32 *len, uint32 *crc)
+{
+	*offset = tf->section_offset;
+	*len = tf->section_len;
+	*crc = tf->section_crc;
 }
 
 static void
@@ -440,12 +486,12 @@ chunk_at(ProllyTableFile *tf, uint32 ord, uint64 *offset, uint32 *len)
 static uint32
 basic_version(ProllyTableFileRead read, void *arg, uint64 size)
 {
-	char		footer[FOOTER_SIZE];
+	char		tail[TAIL_SIZE];
 
-	if (size < FOOTER_SIZE || !read(arg, size - FOOTER_SIZE, footer, FOOTER_SIZE) ||
-		memcmp(footer + 24, MAGIC, 8) != 0)
+	if (size < TAIL_SIZE || !read(arg, size - TAIL_SIZE, tail, TAIL_SIZE) ||
+		memcmp(tail + 4, MAGIC, 8) != 0)
 		return 0;
-	return get_u32(footer + 20);
+	return get_u32(tail);
 }
 
 static ProllyTableFile *
@@ -466,13 +512,18 @@ basic_open(ProllyTableFileRead read, ProllyTableFileMap map, void *arg,
 	uint8	   *seen;
 	uint64		prev_end = 0;
 
+	uint32		section_len;
+
 	if (size < FOOTER_SIZE || !read(arg, size - FOOTER_SIZE, footer, FOOTER_SIZE) ||
-		memcmp(footer + 24, MAGIC, 8) != 0 ||
-		get_u32(footer + 20) != FORMAT_VERSION)
+		memcmp(footer + FOOTER_MAGIC, MAGIC, 8) != 0 ||
+		get_u32(footer + FOOTER_VERSION) != FORMAT_VERSION)
 		return NULL;
 	index_offset = get_u64(footer);
 	n = get_u32(footer + 8);
 	hash_len = (uint8) footer[12];
+	section_len = get_u32(footer + 20);
+	if (section_len > size - FOOTER_SIZE)
+		return NULL;
 	/* (a file of no chunks has no hash length) */
 	if ((hash_len == 0) != (n == 0) || hash_len > PROLLY_HASH_MAX_LEN ||
 		n > (uint32) PG_INT32_MAX)
@@ -480,8 +531,8 @@ basic_open(ProllyTableFileRead read, ProllyTableFileMap map, void *arg,
 	suffix_len = Max(hash_len - PREFIX_LEN, 0);
 	nbits = filter_size(n);
 	index_len = (Size) n * (PREFIX_ENTRY + 8 + suffix_len) + nbits / 8;
-	if (index_offset > size - FOOTER_SIZE ||
-		size - FOOTER_SIZE - index_offset != index_len)
+	if (index_offset > size - FOOTER_SIZE - section_len ||
+		size - FOOTER_SIZE - section_len - index_offset != index_len)
 		return NULL;
 	index = map ? map(arg, index_offset, index_len) : NULL;
 	if (index == NULL)
@@ -515,6 +566,9 @@ basic_open(ProllyTableFileRead read, ProllyTableFileMap map, void *arg,
 	tf->filter = tf->suffixes + (Size) n * suffix_len;
 	tf->filter_bits = nbits;
 	tf->copy = copy;
+	tf->section_offset = index_offset + index_len;
+	tf->section_len = section_len;
+	tf->section_crc = get_u32(footer + 24);
 
 	/* each ordinal once, the chunks one after another, the hashes in order */
 	seen = palloc_extended(Max(n / 8 + 1, 1), MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
@@ -773,4 +827,6 @@ const ProllyTableFileRoutine prolly_tablefile_basic = {
 	.write_add_stored = basic_write_add_stored,
 	.close = basic_close,
 	.version = basic_version,
+	.write_section = basic_write_section,
+	.section = basic_section,
 };

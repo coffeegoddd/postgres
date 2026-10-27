@@ -250,6 +250,31 @@ typedef enum ProllyGcScope
 typedef void (*ProllyChunkFileVisit) (const char *name, int nchunks,
 									  uint64 size, bool settled, void *arg);
 
+/*
+ * A table file as generations() visits it: a settled file's chunks were
+ * born in the collections epoch_lo to epoch_hi (0: not settled); garbage
+ * is how many of them are thought garbage, at least; xrefs how many
+ * chunks of older generations, or not settled, its chunks name.
+ */
+typedef struct ProllyChunkGeneration
+{
+	const char *name;
+	uint32		nchunks;
+	uint64		size;
+	bool		settled;
+	uint32		epoch_lo;
+	uint32		epoch_hi;
+	uint32		garbage;
+	int64		xrefs;
+} ProllyChunkGeneration;
+
+typedef void (*ProllyChunkGenerationVisit) (const ProllyChunkGeneration *g,
+											void *arg);
+
+/* A collection that settled chunks: its generation, and when it ended. */
+typedef void (*ProllyChunkEpochVisit) (uint32 epoch, TimestampTz ended,
+									   void *arg);
+
 typedef struct ProllyChunkStoreRoutine
 {
 	ProllyImplInfo info;
@@ -440,6 +465,15 @@ typedef struct ProllyChunkStoreRoutine
 	uint32		(*generation) (ProllyChunkStore *store);
 
 	/*
+	 * Optional: the table files with their generations, and the
+	 * generations the settled ones hold, oldest first.
+	 */
+	void		(*generations) (ProllyChunkStore *store,
+								ProllyChunkGenerationVisit visit, void *arg);
+	void		(*epochs) (ProllyChunkStore *store, ProllyChunkEpochVisit visit,
+						   void *arg);
+
+	/*
 	 * Optional: settle what roots reach, in the transaction: each chunk
 	 * they reach that no settled file holds (down to those one does)
 	 * written to a settled table file, as add_table_file() writes one.
@@ -463,7 +497,8 @@ typedef struct ProllyChunkStoreRoutine
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
-	"root_free", "wait_root_free", "generation", "settle"
+	"root_free", "wait_root_free", "generation", "generations", "epochs", \
+	"settle"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK settle
 
