@@ -430,6 +430,8 @@ BEGIN
 							(timestamptz '2020-01-01' + make_interval(hours => i))::text);
 	END LOOP;
 END $$;
+UPDATE hw.t SET v = 'mid';
+SELECT length(dolt_commit('-am', 'mid', '--date', '2020-01-25')::text) > 0 AS committed;
 UPDATE hw.t SET v = 'later';
 SELECT length(dolt_commit('-am', 'later', '--date', '2020-02-01')::text) > 0 AS committed;
 UPDATE hw.t SET v = 'now';
@@ -444,7 +446,16 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 $$;
 SELECT fragment, commits FROM dolt_history_drop('2020-01-20');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
--- (a second sever, of one commit, finds the first's data freed)
+-- (a second sever, of one commit, finds the first's data freed: their
+-- trees each noted, should one be written again, which the collection
+-- after reads once)
+SELECT fragment, commits FROM dolt_history_drop('2020-01-26');
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('horizon_entries_read') >= 0 AS counting;
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('horizon_entries_read') BETWEEN 121 AND 121 + 10 AS reads_trees_noted;
+-- (a third lets go of those still freed: a collection reads few again)
 SELECT fragment, commits FROM dolt_history_drop('2020-02-02');
 SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('horizon_entries_read') >= 0 AS counting;
@@ -457,6 +468,44 @@ SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('horizon_entries_read') < 10 AS plan_and_read_few;
 \c regress_history_window
 DROP DATABASE regress_history_window_n;
+
+-- A severed commit's pending record let go of, its root freed, and the
+-- same tree written again later (a commit of the same rows), then let go
+-- of by every live commit: a full collection frees it, not following it
+-- from the severed commit as a pending record wouldn't either.
+CREATE DATABASE regress_history_window_q;
+ALTER DATABASE regress_history_window_q SET prolly.root_interval = '1h';
+\c regress_history_window_q
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'start');
+SELECT length(dolt_commit('-Am', 'start', '--date', '2020-01-01')::text) > 0 AS committed;
+SELECT prolly_root_hash(dolt_hashof('HEAD')) AS start_root \gset
+UPDATE hw.t SET v = 'b';
+SELECT length(dolt_commit('-am', 'b', '--date', '2020-01-02')::text) > 0 AS committed;
+UPDATE hw.t SET v = 'c';
+SELECT length(dolt_commit('-am', 'c', '--date', '2020-01-03')::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_q SET prolly.history_window_action = delete;
+\c regress_history_window_q
+SELECT fragment, commits FROM dolt_history_drop('2020-01-02');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT test_chunk_has(:'start_root') AS start_root_kept;
+-- (the next sever finds start's root freed: its pending record let go of)
+SELECT fragment, commits FROM dolt_history_drop('2020-01-03');
+UPDATE hw.t SET v = 'start';
+SELECT length(dolt_commit('-am', 'again', '--date', '2020-01-04')::text) > 0 AS committed;
+SELECT prolly_root_hash(dolt_hashof('HEAD')) = :'start_root' AS same_root;
+UPDATE hw.t SET v = 'now';
+SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
+SELECT fragment, commits FROM dolt_history_drop('2020-01-05');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT test_chunk_has(:'start_root') AS start_root_kept;
+SELECT count(*) FROM dolt_at('HEAD', NULL::hw.t);
+\c regress_history_window
+DROP DATABASE regress_history_window_q;
 
 -- Delete mode with many tags: each keeps only its own commit's data, so
 -- what is outside the window and untagged is severed.
