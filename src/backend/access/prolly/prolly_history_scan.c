@@ -261,6 +261,12 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		have_in = false;
 	CustomPath *cp;
 
+	/*
+	 * (a query using the entry's row whole, h or row_to_json(h), gets the
+	 * function scan: the scan's tuple is the function's columns alone)
+	 */
+	if (!bms_is_empty(rel->attr_needed[0 - rel->min_attr]))
+		return;
 	if (!history_key(relid, &key))
 		return;
 	for (int c = 0; c < key.ncolumns; c++)
@@ -293,7 +299,10 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 				continue;
 			else
 				lo = true;
-			keys = lappend(keys, list_make3_int(c, strategy, in));
+			keys = lappend(keys, list_make5_int(c, strategy, in,
+												(int) key.opfamilies[c],
+												(int) key.opcintypes[c]));
+			llast(keys) = lappend_int(llast(keys), (int) key.collations[c]);
 			clauses = lappend(clauses, clause);
 		}
 		/* (the ranges' column ends the bounds; so does a column unbounded) */
@@ -350,7 +359,9 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
  * The plan: no scan relation (the entry is a function's), its scan tuple
  * the function's columns (custom_scan_tlist); the bounding clauses in
  * custom_exprs, so that their values are fixed up as any expression's.
- * custom_private: the table, then each clause's column and strategy.
+ * custom_private: the table, then each clause's column, strategy, whether
+ * it is an IN list, and its key column's operator family, type and
+ * collation.
  */
 static Plan *
 history_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -399,7 +410,9 @@ typedef struct HistoryScanState
 {
 	CustomScanState css;
 	Oid			relid;
-	List	   *keys;			/* each clause's column, strategy, IN */
+	List	   *keys;			/* each clause's column, strategy, IN, and the
+								 * key column's operator family, type and
+								 * collation */
 	List	   *values;			/* each clause's value (ExprState) */
 	Tuplestorestate *store;
 	bool		read;
@@ -424,9 +437,51 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 	}
 }
 
+/* values[] sorted by the key column's btree order, for distinct_values() */
+typedef struct ValueOrder
+{
+	FmgrInfo	cmp;
+	Oid			collation;
+} ValueOrder;
+
+static int
+value_cmp(const void *a, const void *b, void *arg)
+{
+	ValueOrder *vo = arg;
+
+	return DatumGetInt32(FunctionCall2Coll(&vo->cmp, vo->collation,
+										   *(const Datum *) a,
+										   *(const Datum *) b));
+}
+
+/*
+ * values[] (n of them) sorted by the key column's btree order (its
+ * operator family's comparison of type, with its collation), each set of
+ * equal ones made one: two values equal as the key compares them (5 and 5,
+ * 1.0 and 1.00, citext's 'abc' and 'ABC') bound the same keys, which read
+ * twice would give their rows twice.  How many are left.
+ */
+static int
+distinct_values(Datum *values, int n, Oid opfamily, Oid type, Oid collation)
+{
+	ValueOrder	vo;
+	int			kept = 0;
+
+	if (n <= 1)
+		return n;
+	fmgr_info(get_opfamily_proc(opfamily, type, type, BTORDER_PROC), &vo.cmp);
+	vo.collation = collation;
+	qsort_arg(values, n, sizeof(Datum), value_cmp, &vo);
+	for (int i = 0; i < n; i++)
+		if (kept == 0 || value_cmp(&values[kept - 1], &values[i], &vo) != 0)
+			values[kept++] = values[i];
+	return kept;
+}
+
 /*
  * The bounds the clauses' values make, into *bounds (how many returned):
- * each IN list's value an equality bound of its own; none if a value is
+ * each IN list's distinct value an equality bound of its own (so no two
+ * bounds overlap: they differ in that column's value); none if a value is
  * NULL (no key equals or is bounded by it).
  */
 static int
@@ -476,6 +531,9 @@ history_bounds(HistoryScanState *hs, ExprContext *econtext,
 				if (!nulls[i])
 					in_values[nin++] = elems[i];
 			in_column = c;
+			nin = distinct_values(in_values, nin, (Oid) list_nth_int(k, 3),
+								  (Oid) list_nth_int(k, 4),
+								  (Oid) list_nth_int(k, 5));
 			continue;
 		}
 		if (strategy == BTEqualStrategyNumber)
