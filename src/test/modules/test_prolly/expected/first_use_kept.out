@@ -80,7 +80,7 @@ SELECT * FROM since(:'before');
          name          | value 
 -----------------------+-------
  apply_rows            |     0
- bmap_map_pages_copied |    18
+ bmap_map_pages_copied |    27
  first_use_tables_kept |     3
 (3 rows)
 
@@ -130,7 +130,8 @@ FROM pg_index WHERE indrelid IN ('fk.t'::regclass, 'fk.s'::regclass);
 (1 row)
 
 -- a table made since the commit, and one whose storage was replaced
--- since: copied as before, then moved to the head
+-- since: copied as before, then moved to the head, the one replaced given
+-- the pages another branch (b1) kept as of the head, no row written
 CREATE TABLE fk.n (id int PRIMARY KEY);
 TRUNCATE fk.k;
 SELECT dolt_branch('b2');
@@ -161,7 +162,7 @@ SELECT pg_stat_force_next_flush();
 SELECT name, value > 0 AS some FROM since(:'before');
          name          | some 
 -----------------------+------
- apply_rows            | t
+ apply_rows            | f
  bmap_map_pages_copied | t
  first_use_tables_kept | t
 (3 rows)

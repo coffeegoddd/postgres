@@ -984,6 +984,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  * back rather than write rows.
  */
 extern PGDLLIMPORT int prolly_kept_commits;
+extern PGDLLIMPORT int prolly_root_interval;
+extern PGDLLIMPORT int prolly_root_interval_commits;
+extern PGDLLIMPORT bool prolly_freeze_roots;
 
 /*
  * prolly.restore_min_changes: how many of a table's rows must differ from
