@@ -1023,12 +1023,6 @@ extern PGDLLIMPORT int prolly_root_interval;
 extern PGDLLIMPORT int prolly_root_interval_commits;
 extern PGDLLIMPORT bool prolly_freeze_roots;
 
-/*
- * prolly.restore_min_changes: how many of a table's rows must differ from
- * a kept commit's, since a baseline holding them, before a move back to it
- * gives the table its pages back rather than write those rows (0: always).
- */
-extern PGDLLIMPORT int prolly_restore_min_changes;
 
 /*
  * While set, the tables (qualified names) a commit being made changed in the

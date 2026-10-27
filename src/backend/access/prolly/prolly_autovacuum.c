@@ -222,14 +222,6 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
-	DefineCustomIntVariable("prolly.restore_min_changes",
-							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
-							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
-							&prolly_restore_min_changes,
-							2, 0, INT_MAX,
-							PGC_USERSET,
-							0,
-							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_lock_wait",
 							"How long a move giving a table shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
 							"An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.  A restore of the branch's own kept pages queues for its locks instead, as TRUNCATE does.",

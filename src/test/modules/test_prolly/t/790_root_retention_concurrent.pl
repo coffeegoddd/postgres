@@ -29,8 +29,7 @@ $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
-sql(q{CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points;
-	ALTER DATABASE postgres SET prolly.restore_min_changes = 0});
+sql(q{CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points});
 sql(q{CREATE SCHEMA rc VERSIONED;
 	CREATE TABLE rc.t (id int PRIMARY KEY, v int NOT NULL);
 	INSERT INTO rc.t SELECT g, 0 FROM generate_series(1, 4000) g});

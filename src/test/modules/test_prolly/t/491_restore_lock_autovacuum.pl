@@ -60,7 +60,6 @@ sub on_scratch
 
 sql(q{
 	CREATE EXTENSION injection_points;
-	ALTER DATABASE postgres SET prolly.restore_min_changes = 0;
 	CREATE SCHEMA kp VERSIONED;
 	CREATE TABLE kp.t (a int PRIMARY KEY, b text)
 		WITH (autovacuum_vacuum_threshold = 0,
@@ -389,7 +388,7 @@ my $oreader = $node->background_psql('postgres');
 $oreader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
 $applied = counted('apply_rows');
 my ($oret, $oout, $oerr) = $node->psql('postgres', q{
-	SET prolly.restore_min_changes = 2; SET lock_timeout = '2s';
+	SET lock_timeout = '2s';
 	SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
 	SELECT pg_stat_force_next_flush()});
 like($oout, qr/reset t/, 'a one-row reset beside a reader finishes at once');

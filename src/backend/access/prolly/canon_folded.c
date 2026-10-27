@@ -6108,15 +6108,6 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	return table_changes_asked(baseline, relid, data, &ask);
 }
 
-static bool
-folded_table_fewer_changes(const ProllyNodeRef *baseline, Oid relid,
-						   int limit, ProllyNodeRef *data)
-{
-	TableChangesAsk ask = {NULL, NULL, Max(limit, 1)};
-
-	return table_changes_asked(baseline, relid, data, &ask);
-}
-
 /*
  * A baseline's tree, its tables' data trees and the finders' states.  Each
  * state is walked by every change finder, not the one configured now: the
@@ -18385,7 +18376,6 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.read_definitions = folded_read_definitions,
 	.table_changes = folded_table_changes,
-	.table_fewer_changes = folded_table_fewer_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,

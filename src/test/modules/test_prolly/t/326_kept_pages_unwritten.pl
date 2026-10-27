@@ -23,7 +23,6 @@ autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
 bgwriter_lru_maxpages = 0
-prolly.restore_min_changes = 0
 });
 $node->start;
 

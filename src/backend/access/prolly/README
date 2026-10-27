@@ -1504,14 +1504,11 @@ statement lets go within a moment, a transaction left open won't soon,
 and the rows written instead.  lock_timeout, if set, caps both; the
 deadlock detector doesn't see these waits, so they are bounded, for the
 whole move.  A restore or share given up so is counted in
-pg_stat_prolly's restores_lock_busy.  Nor is a table
-restored whose baseline
-holds the commit's rows with fewer than prolly.restore_min_changes (2) of
-them changed since, as its change finder tells from no more than that many
-of its records (the log's entries, none read as a fold reads them):
-restoring a table costs about as much as writing a few rows back and
-syncing their pages as the commit's are kept again, so a reset of a row
-writes it.
+pg_stat_prolly's restores_lock_busy.  A table whose commit
+has a root is always restored, however few of its rows changed: a move
+to a commit kept writes no rows (but where a lock, a privilege or the
+session's own use of the table stands in the way); only a commit with no
+root writes the rows between it and the nearest root before.
 
 A restore is MVCC-safe where TRUNCATE isn't: the storage it replaces
 isn't dropped at commit but kept, a retired entry of the branch's kept

@@ -3731,7 +3731,6 @@ move_settled_checked(void *arg)
  * the change is known to commit.
  */
 bool		debug_prolly_page_roots = true;
-int			prolly_restore_min_changes = 2;
 int			prolly_root_interval = -1;
 int			prolly_root_interval_commits = 1;
 bool		prolly_freeze_roots = true;
@@ -6142,37 +6141,6 @@ kept_total_bytes(void)
 }
 
 /*
- * Giving a table its kept pages back costs a constant (new storage for
- * each of its relations, its catalog row and caches), while writing its
- * rows back costs each row its pages, which the commit's pages kept again
- * after the move then sync: at 1M rows, with fsync on, ~11 ms restored
- * against ~7 ms for one row written, ~11 ms for four and ~20 ms for eight.
- * So fewer than prolly.restore_min_changes changed since a baseline
- * holding the commit's rows are written instead.
- */
-
-/*
- * Would writing table relid's rows back to the commit's (data) cost less
- * than restoring its pages: its baseline holds the commit's rows, and
- * fewer than prolly.restore_min_changes of them changed since, as its
- * change finder tells from no more than that many of its records?
- */
-static bool
-few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
-			Oid relid, const ProllyNodeRef *data)
-{
-	ProllyNodeRef base;
-
-	if (prolly_restore_min_changes <= 0 ||
-		!PROLLY_HAS(dc->canonicalizer, table_fewer_changes) ||
-		!dc->canonicalizer->table_fewer_changes(baseline, relid,
-												prolly_restore_min_changes,
-												&base))
-		return false;
-	return same_hash(&base.hash, &data->hash);
-}
-
-/*
  * The relations of table name as the other commits of kept (but was, and
  * those retired) keep them: copies into *carry, and where each is into
  * *into, for a restore of the table to carry their snapshots into the
@@ -6219,8 +6187,7 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
  * Would restore_kept() give table kt (of a kept commit whose readable
  * tables are readable) its kept pages, its relation *relid: it is on the
  * branch as it was then (other: kept by another branch, whose pages it
- * may share), the user may write it, more than a few of its rows
- * changed since baseline (few_changes()), and, for the head's pages
+ * may share), the user may write it, and, for the head's pages
  * (moving: targets the move's commit's tables), the move's commit holds
  * it?  Asked by the restore, and before a hard reset holds the refs, of
  * the tables it will lock for it (lock_for_restore()).
@@ -6253,7 +6220,6 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
 		 same_relation_set(kept_relations(*relid), kt->rels, kt->nrels) :
 		 same_relations(kept_relations(*relid), kt)) &&
 		may_restore(*relid) &&
-		!few_changes(dc, baseline, *relid, &target->data) &&
 		!(moving && moved == NULL);
 }
 
@@ -6263,9 +6229,8 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
  * changed since (O(1) each), whose baseline entry is then the kept one's.
  * A table not on the branch as it was then (another name, other
  * relations, storage replaced since), or not restored (its snapshot gone,
- * the session itself using it), is left for the move to write, as is one
- * with so few rows changed that writing them costs less (few_changes()),
- * or, with moving_to (the move's commit, when commit is the head), one the
+ * the session itself using it), is left for the move to write, as is,
+ * with moving_to (the move's commit, when commit is the head), one the
  * move's commit doesn't hold (the move drops it).  With moving_to, every
  * other table that changed since the head is given the head's pages
  * whatever the working set holds: discarding its changes so is O(1),
