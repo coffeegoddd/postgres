@@ -828,9 +828,11 @@ typedef enum PgStat_ProllyCounter
 											 * the first since it began */
 	PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ,	/* map nodes read to find the
 											 * pages changed since an epoch */
+	PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ,	/* pages of captured roots' slots
+											 * read */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ + 1)
 
 typedef struct PgStat_ProllyStats
 {
