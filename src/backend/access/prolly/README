@@ -1917,6 +1917,8 @@ commits times the trees' depth, not their rows.  A version keyed
 otherwise, or described otherwise than the table is now, is read whole,
 as is every commit of a keyless table (never bounded).  The quals stay
 the scan's filter, and EXPLAIN shows those it bounds by ("History Key").
+The scan gives the entry's whole row too (h, row_to_json(h), h IS NOT
+NULL in a filter), made of its columns when the plan reads it.
 dolt_history_table() by name reads every row of every commit.
 
 Revision-qualified table names (prolly_revision.c) read a table as

@@ -157,10 +157,23 @@ SELECT count(*) AS whole FROM (SELECT * FROM dolt_history_table(NULL::hk.t) OFFS
 WHERE (row).id = ANY ('{5,6,5}');
 RESET plan_cache_mode;
 
--- The entry's row used whole: the function's scan, the same rows.
+-- The entry's row used whole, made of the scan's columns: in the target
+-- list, or only in the scan's own filters; the function's rows.
 EXPLAIN (COSTS OFF) SELECT h FROM dolt_history_table(NULL::hk.t) h WHERE (row).id = 5;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM dolt_history_table(NULL::hk.t) h
+WHERE (row).id = 5 AND h IS NOT NULL;
 SELECT count(h) AS whole_rows FROM dolt_history_table(NULL::hk.t) h WHERE (row).id = 5;
-SELECT count(row_to_json(h)) AS as_json FROM dolt_history_table(NULL::hk.t) h WHERE (row).id = 5;
+SELECT same($$SELECT h FROM dolt_history_table(NULL::hk.t) h WHERE (row).id = 5$$,
+			$$SELECT h FROM (SELECT * FROM dolt_history_table(NULL::hk.t) OFFSET 0) h WHERE (row).id = 5$$) AS whole;
+SELECT same($$SELECT row_to_json(h)::text FROM dolt_history_table(NULL::hk.t) h WHERE (row).id = 5$$,
+			$$SELECT row_to_json(h)::text FROM (SELECT * FROM dolt_history_table(NULL::hk.t) OFFSET 0) h WHERE (row).id = 5$$) AS as_json;
+SELECT bounded_whole('hk.t|(row).id = 5 AND h IS NOT NULL') AS is_not_null;
+SELECT bounded_whole($$hk.t|(row).id = 5 AND row_to_json(h)::text LIKE '%"id":5%'$$) AS json_like;
+SELECT bounded_whole('hk.t|(row).id = 5 AND num_nonnulls(h) > 0') AS nonnulls;
+SELECT EXISTS (SELECT 1 FROM dolt_history_table(NULL::hk.t) h
+	WHERE (row).id = 5 AND h IS NOT NULL) AS exists_whole;
+SELECT count(*) AS joined FROM generate_series(5, 6) k(id)
+	JOIN dolt_history_table(NULL::hk.t) h ON (h.row).id = 5 AND h IS NOT NULL;
 
 -- A keyless table: nothing to seek by.
 CREATE TABLE hk.k (id int, v text);
