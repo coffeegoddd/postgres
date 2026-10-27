@@ -1781,6 +1781,11 @@ reads about n commits however long the history, and the whole log no
 more than before (no sort).  The scan's rows come in commit_order and
 then date descending, which its path says (pathkeys), so ORDER BY
 commit_order DESC ... LIMIT n doesn't read the history to sort it.
+Since an open stream (a cursor's) reads commits after it began, its start
+is kept from collection for its transaction (the chunk store's keep()):
+a history drop and a full collection in another session meanwhile don't
+free what it has yet to read.  The scan gives the entry's whole row too
+(dolt_log l ... count(l), l IS NOT NULL), made of its columns.
 
 Remotes
 -------

@@ -45,6 +45,19 @@ EXPLAIN (COSTS OFF) SELECT * FROM dolt_log LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC LIMIT 1;
 EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC, date DESC LIMIT 1;
 
+-- the entry's row whole, made of the scan's columns
+EXPLAIN (COSTS OFF) SELECT count(l) FROM dolt_log l;
+SELECT count(l) AS whole_rows FROM dolt_log l;
+SELECT count(*) AS not_null FROM dolt_log l WHERE l IS NOT NULL;
+SELECT row_to_json(l)->>'message' AS message FROM dolt_log l LIMIT 1;
+SELECT (l).message, (l).commit_order FROM dolt_log l LIMIT 1;
+SELECT count(*) AS like_json FROM dolt_log l
+	WHERE row_to_json(l)::text LIKE '%"message":"c1"%';
+SELECT count(*) AS nonnull FROM dolt_log l WHERE num_nonnulls(l) > 0;
+SELECT EXISTS (SELECT 1 FROM dolt_log l WHERE l IS NOT NULL) AS exists_whole;
+SELECT count(*) AS joined FROM dolt_log l JOIN dolt_log m
+	ON l IS NOT NULL AND l.commit_hash = m.commit_hash;
+
 -- a limited log reads about as many commits as it gives
 :flush
 SELECT commits_read() AS before \gset

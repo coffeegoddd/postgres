@@ -5688,7 +5688,9 @@ dolt_rebase_plan_change(PG_FUNCTION_ARGS)
 
 /*
  * A stream of dolt_log(ref)'s rows (see prolly_log.h), the commits read as
- * they are given; NULL for HEAD before a first commit.
+ * they are given; NULL for HEAD before a first commit.  The ref's commit is
+ * kept from collection while the transaction runs (the chunk store's
+ * keep()), and with it every commit it reaches.
  */
 ProllyLogStream *
 prolly_log_begin(const char *ref)
@@ -5702,6 +5704,17 @@ prolly_log_begin(const char *ref)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	}
+	/*
+	 * (the start kept from collection for the transaction: a stream reads
+	 * its commits as it goes, after a collection that began meanwhile, a
+	 * history drop's, would otherwise have freed them)
+	 */
+	{
+		ProllyTreeEnv env;
+
+		prolly_folded_tree_env(&env);
+		PROLLY_CALL(env.chunk_store, keep, env.chunks, &start);
 	}
 	return log_stream_begin(list_make1(&start));
 }

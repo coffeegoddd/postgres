@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/prolly_log.h"
+#include "access/htup_details.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "nodes/extensible.h"
@@ -167,8 +168,13 @@ log_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 															  att->atttypmod,
 															  att->attcollation,
 															  0),
-											 i, NULL, false));
+											 i, pstrdup(NameStr(att->attname)),
+											 false));
 	}
+	/* (and the row whole, made of them: l, row_to_json(l), l IS NOT NULL) */
+	scan_tlist = lappend(scan_tlist,
+						 makeTargetEntry((Expr *) makeWholeRowVar(rte, rel->relid, 0, false),
+										 desc->natts + 1, NULL, false));
 	cs->scan.plan.targetlist = tlist;
 	cs->scan.plan.qual = extract_actual_clauses(clauses, false);
 	cs->scan.scanrelid = 0;
@@ -195,6 +201,7 @@ static const CustomPathMethods log_path_methods = {
 typedef struct LogScanState
 {
 	CustomScanState css;
+	TupleDesc	rowdesc;		/* the row's whole: the function's columns */
 	ExprState  *ref;
 	MemoryContext cxt;			/* the stream's, gone with a rescan */
 	ProllyLogStream *stream;
@@ -207,6 +214,14 @@ log_begin(CustomScanState *node, EState *estate, int eflags)
 	LogScanState *ls = (LogScanState *) node;
 	CustomScan *cs = (CustomScan *) node->ss.ps.plan;
 
+	TupleDesc	scan = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	TupleDesc	row = CreateTemplateTupleDesc(LOG_COLUMNS);
+
+	/* (the scan's tuple: the function's columns, then the row whole) */
+	for (int i = 0; i < LOG_COLUMNS; i++)
+		TupleDescCopyEntry(row, i + 1, scan, i + 1);
+	TupleDescFinalize(row);
+	ls->rowdesc = BlessTupleDesc(row);
 	ls->ref = ExecInitExpr(linitial(cs->custom_exprs), &node->ss.ps);
 	ls->cxt = AllocSetContextCreate(estate->es_query_cxt, "dolt_log scan",
 									ALLOCSET_DEFAULT_SIZES);
@@ -234,7 +249,13 @@ log_next(ScanState *node)
 	}
 	if (ls->stream != NULL &&
 		prolly_log_next(ls->stream, slot->tts_values, slot->tts_isnull))
+	{
+		slot->tts_values[LOG_COLUMNS] =
+			HeapTupleGetDatum(heap_form_tuple(ls->rowdesc, slot->tts_values,
+											  slot->tts_isnull));
+		slot->tts_isnull[LOG_COLUMNS] = false;
 		ExecStoreVirtualTuple(slot);
+	}
 	MemoryContextSwitchTo(old);
 	return slot;
 }
