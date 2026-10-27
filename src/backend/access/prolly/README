@@ -1770,6 +1770,16 @@ it.  Reading a severed commit once it is freed (dolt_at, a diff, a merge
 whose base is past it) is an error saying it is past the horizon and how
 to repair it.
 
+dolt_log(ref) gives the commits as it finds them: a heap of those found,
+the greatest given next (the highest height, then the newest, then by
+hash: a commit is always above its parents, so none not yet found can
+come before it), each read with its parents as it is given
+(prolly_log_begin()).  Planned, dolt_log is scanned by a custom scan
+that pulls its rows from that stream (prolly_log_scan.c), not by a
+function scan, which would keep them all first: dolt_log ... LIMIT n
+reads about n commits however long the history, and the whole log no
+more than before (no sort).
+
 Remotes
 -------
 

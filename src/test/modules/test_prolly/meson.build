@@ -241,6 +241,7 @@ tests += {
       'kept_head_restore',
       'bounded_counts',
       'dirty_discard',
+      'log_stream',
       'first_use_kept',
       'branch_catalog_index',
       'kept_commit_shares',
