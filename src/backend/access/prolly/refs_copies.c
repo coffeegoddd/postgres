@@ -4784,6 +4784,8 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 		!PROLLY_HAS(dc.root_freezer, freeze_page))
 		return NULL;
 	LockDatabaseFrozenIds(ShareLock);
+	/* (the database's frozen horizon read as it is now: kept_status()) */
+	AcceptInvalidationMessages();
 	kept_snapshot(kc, &snap, &as_of);
 
 	/* (the bases: every frozen root the list keeps) */
