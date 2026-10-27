@@ -1096,6 +1096,7 @@ typedef struct Plan
 								 * with (an amend of a boundary commit) */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
 	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
+	bool		quiet;			/* the window evaluated: no warnings */
 } Plan;
 
 static void
@@ -1569,12 +1570,13 @@ age_date(Plan *plan, PlanCommit *pc)
 		a = hash_search(plan->moved, &hk, HASH_FIND, NULL);
 		pc->arrived = a != NULL ? Min(a->at, now) : now;
 		plan->arrivals = lappend(plan->arrivals, pc);
-		ereport(WARNING,
-				(errmsg("commit %s is dated %s, after it arrived here",
-						prolly_hash_hex(&pc->id),
-						timestamptz_to_str(pc->e.committed_at)),
-				 errdetail("It ages from %s instead.",
-						   timestamptz_to_str(pc->arrived))));
+		if (!plan->quiet)
+			ereport(WARNING,
+					(errmsg("commit %s is dated %s, after it arrived here",
+							prolly_hash_hex(&pc->id),
+							timestamptz_to_str(pc->e.committed_at)),
+					 errdetail("It ages from %s instead.",
+							   timestamptz_to_str(pc->arrived))));
 	}
 	pfree(k.data);
 	pfree(v.data);
@@ -1892,17 +1894,45 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
  * The commits in the window now (branch: its lineage's only), as a sever
  * would keep them for their age or count: each lineage's head walked by
  * its policy, with no merge base's floor and no other ref's keeping.
+ * Quietly (no warning of a commit dated ahead: plan() and sever() give
+ * that), and kept for the transaction while the refs stand as they did,
+ * so a caller asking of each commit pays one walk.
  */
+static MemoryContext window_cxt = NULL;
+static HTAB *window_cache = NULL;
+static char *window_branch = NULL;
+static ProllyHash window_root;
+static LocalTransactionId window_lxid = InvalidLocalTransactionId;
+
 static HTAB *
 window_commits(const char *branch)
 {
 	Plan		plan;
-	HTAB	   *in = id_set("prolly window", sizeof(ProllyHash));
+	HTAB	   *in;
+	ProllyHash	root;
+	MemoryContext old;
 	ProllyWindowPolicy db;
 
 	window_init();
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &root);
+	if (window_cache != NULL && window_lxid == MyProc->vxid.lxid &&
+		same_id(&root, &window_root) &&
+		(branch == NULL ? window_branch == NULL :
+		 window_branch != NULL && strcmp(branch, window_branch) == 0))
+		return window_cache;
+	if (window_cxt == NULL)
+		window_cxt = AllocSetContextCreate(TopMemoryContext,
+										   "prolly window evaluated",
+										   ALLOCSET_DEFAULT_SIZES);
+	window_cache = NULL;
+	MemoryContextReset(window_cxt);
+	old = MemoryContextSwitchTo(window_cxt);
+	in = id_set("prolly window", sizeof(ProllyHash));
+	window_branch = branch ? pstrdup(branch) : NULL;
+	MemoryContextSwitchTo(old);
 	sever_clock = DT_NOBEGIN;
 	memset(&plan, 0, sizeof(plan));
+	plan.quiet = true;
 	plan.commits = id_set("prolly window plan", sizeof(PlanCommit));
 	plan.head_ids = id_set("prolly window heads", sizeof(ProllyHash));
 	plan.archived = archived_parents();
@@ -1928,6 +1958,9 @@ window_commits(const char *branch)
 			(void) set_add(in, &pc->id);
 	hash_destroy(plan.commits);
 	hash_destroy(plan.head_ids);
+	window_cache = in;
+	window_root = root;
+	window_lxid = MyProc->vxid.lxid;
 	return in;
 }
 
@@ -1945,17 +1978,12 @@ archive_window(const char *branch, ProllyWindowCommitVisit visit, void *arg)
 			hash_seq_term(&seq);
 			break;
 		}
-	hash_destroy(in);
 }
 
 static bool
 archive_in_window(const char *branch, const ProllyHash *commit)
 {
-	HTAB	   *in = window_commits(branch);
-	bool		found = set_has(in, commit);
-
-	hash_destroy(in);
-	return found;
+	return set_has(window_commits(branch), commit);
 }
 
 static void

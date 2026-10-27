@@ -204,6 +204,7 @@ tests += {
       'journal_compression',
       'gc',
       'gc_full',
+      'generations',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

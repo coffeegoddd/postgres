@@ -2334,7 +2334,8 @@ le64_put(char *p, uint64 v)
  * offsets, then the suffixes, then the filter; the footer: the index's
  * offset (uint64),
  * n (uint32), the hash's length, three zero bytes, the index's CRC-32C,
- * the version (uint32), the magic.
+ * the section's length and CRC-32C, eight zero bytes, the version
+ * (uint32), the magic.
  */
 static bool
 basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uint32 n,
@@ -2342,7 +2343,7 @@ basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uin
 {
 	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
 	char	   *copy = palloc(file->len);
-	char	   *footer = copy + file->len - 32;
+	char	   *footer = copy + file->len - 48;
 	uint64		index_offset;
 	uint32		n;
 	pg_crc32c	crc;
@@ -2411,7 +2412,14 @@ change_hash_order(char *index, uint32 n, char *footer)
 static void
 change_version(char *index, uint32 n, char *footer)
 {
-	le32_put(footer + 20, 1);
+	le32_put(footer + 36, 1);
+}
+
+/* A section longer than the file has room for. */
+static void
+change_section_length(char *index, uint32 n, char *footer)
+{
+	le32_put(footer + 20, 1u << 30);
 }
 
 /*
@@ -2435,6 +2443,7 @@ test_tablefile_basic_index(PG_FUNCTION_ARGS)
 		{"lengths not adding up to the index's offset", change_lengths_sum},
 		{"hashes out of order", change_hash_order},
 		{"another version", change_version},
+		{"a section past the index", change_section_length},
 	};
 	StringInfoData file;
 	MemFile		mf;
@@ -2457,5 +2466,41 @@ test_tablefile_basic_index(PG_FUNCTION_ARGS)
 	file.data[file.len - 1] ^= 1;	/* (the magic) */
 	if (tf->version(memfile_read, &mf, file.len) != 0)
 		elog(ERROR, "bytes that aren't a table file have a version");
+
+	/* a writer's section: after the index, where section() says */
+	{
+		ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin,
+											   CurrentMemoryContext);
+		StringInfoData chunk;
+		ProllyHash	hash;
+		ProllyTableFile *f;
+		uint64		offset;
+		uint32		len;
+		uint32		crc;
+		pg_crc32c	want;
+
+		initStringInfo(&chunk);
+		resetStringInfo(&file);
+		tablefile_chunk(0, &chunk, &hash);
+		PROLLY_CALL(tf, write_add, w, &hash, chunk.data, chunk.len, &file);
+		PROLLY_CALL(tf, write_section, w, "section", 7);
+		PROLLY_CALL(tf, write_finish, w, &file);
+		mf.data = file.data;
+		mf.len = file.len;
+		f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, file.len,
+						CurrentMemoryContext);
+		if (f == NULL)
+			elog(ERROR, "a table file with a section doesn't open");
+		PROLLY_CALL(tf, section, f, &offset, &len, &crc);
+		INIT_CRC32C(want);
+		COMP_CRC32C(want, "section", 7);
+		FIN_CRC32C(want);
+		if (len != 7 || offset + 7 + 48 != (uint64) file.len ||
+			memcmp(file.data + offset, "section", 7) != 0 || crc != want)
+			elog(ERROR, "a table file's section isn't where it says");
+		if (!PROLLY_CALL(tf, find, f, &hash, &offset, &len))
+			elog(ERROR, "a table file with a section lost its chunk");
+		PROLLY_CALL(tf, close, f);
+	}
 	PG_RETURN_BOOL(true);
 }
