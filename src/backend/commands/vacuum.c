@@ -1727,6 +1727,14 @@ vac_update_datfrozenxid(void)
 	newFrozenXid = GetOldestNonRemovableTransactionId(NULL);
 
 	/*
+	 * The page stores' captured roots name the transactions that captured
+	 * and let go of them: settled against the horizon just taken, so that
+	 * none of those older is asked of the commit log, which may forget it
+	 * once datfrozenxid advances (every one older than it has ended by now).
+	 */
+	prolly_settle_page_stores();
+
+	/*
 	 * Similarly, initialize the MultiXact "min" with the value that would be
 	 * used on pg_class for new tables.  See AddNewRelationTuple().
 	 */

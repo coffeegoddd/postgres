@@ -96,11 +96,9 @@ INSERT INTO trips VALUES (6, counted('relations_restored') > :r,
 						  rows_digest() = :'at_b', indexes_valid());
 SELECT * FROM trips ORDER BY n;
 
--- each relation keeps a snapshot for each commit kept, no more
-SELECT count(*) AS t_snapshots
-FROM test_bmap_snapshots(pg_relation_filenode('kc.t'));
-SELECT count(*) AS t_v_snapshots
-FROM test_bmap_snapshots(pg_relation_filenode('kc.t_v'));
+-- the store holds roots for the commits kept, no more: the restores made
+-- new storage of them and captured nothing
+SELECT held AS roots_held FROM test_bmap_roots();
 SELECT count(*) AS kept FROM test_kept_commits('main');
 
 -- found by the indexes as the rows are

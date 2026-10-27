@@ -24,8 +24,11 @@
  *	BMAP_QUEUE_RELNUMBER	the release queue: subtrees and blocks of dropped
  *							maps, each holding what it names until a
  *							background pass lets go of it
+ *	BMAP_ROOTS_RELNUMBER	captured roots: trees of relations as they were
+ *							at a moment, each holding its subtrees until it
+ *							is let go of, whatever becomes of the relation
  *
- * The four relation file numbers are reserved: below FirstGenbkiObjectId and
+ * The five relation file numbers are reserved: below FirstGenbkiObjectId and
  * used by no catalog object.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -42,5 +45,6 @@
 #define BMAP_STORE_RELNUMBER	9421
 #define BMAP_REFS_RELNUMBER		9419
 #define BMAP_QUEUE_RELNUMBER	9441
+#define BMAP_ROOTS_RELNUMBER	9442
 
 #endif							/* BMAP_FILES_H */

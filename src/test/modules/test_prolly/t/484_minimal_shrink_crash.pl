@@ -56,6 +56,10 @@ sub junk
 		INSERT INTO app.junk SELECT g, repeat('x', 500) FROM generate_series(1, 20000) g;
 		SELECT dolt_commit('-Am', 'junk')});
 	sql(q{DROP TABLE app.junk; SELECT dolt_commit('-Am', 'no junk')});
+	# (the roots junk's commit kept, retired by the next commit, let go of
+	# by the one after)
+	sql(q{SELECT dolt_commit('--allow-empty', '-m', 'after junk')});
+	sql(q{SELECT dolt_commit('--allow-empty', '-m', 'junk let go of')});
 }
 
 # Every page of table $t, its index, its change log and the log's index,

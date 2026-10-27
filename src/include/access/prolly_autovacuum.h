@@ -47,5 +47,6 @@ extern void prolly_release_page_stores(BmapRelease *total);
 
 /* The current database's page stores swept (due_only: those due). */
 extern void prolly_sweep_page_stores(bool due_only, BmapSweep *total);
+extern void prolly_settle_page_stores(void);
 
 #endif							/* PROLLY_AUTOVACUUM_H */

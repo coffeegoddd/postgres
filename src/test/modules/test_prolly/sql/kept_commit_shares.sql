@@ -76,8 +76,9 @@ SELECT digest() = :'at_c1' AS at_c1;
 SELECT dolt_checkout('main');
 
 -- a commit main keeps no pages of (prolly.kept_commits = 0 as it commits):
--- the reset to it, with the setting back, writes the rows; main's kept c1
--- is visited, but doesn't hold the commit's table
+-- the reset to it, with the setting back, writes the rows, after giving
+-- the table the pages of the nearest root before it (c1's, main's); main's
+-- kept c1 is visited, but doesn't hold the commit's table
 SELECT dolt_reset('--hard');
 SELECT pg_stat_force_next_flush();
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'pages_kept') AS kept_before \gset

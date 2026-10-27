@@ -31,8 +31,8 @@ sql(q{
 	INSERT INTO kv.z SELECT g, repeat('z', 100) FROM generate_series(1, 3000) g;
 	SELECT dolt_commit('-Am', 'z');
 });
-is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('kv.z'))}),
-	'1', 'the commit keeps the table by a snapshot');
+is(sql(q{SELECT test_bmap_roots_of(pg_relation_filenode('kv.z'))}),
+	'1', 'the commit keeps the table by a root');
 my $pages = sql(q{SELECT pg_relation_size('kv.z') / 8192});
 my $visible = q{SELECT relallvisible || '/' || relpages FROM pg_class
 	WHERE oid = 'kv.z'::regclass};

@@ -151,7 +151,36 @@ extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
 extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
 								  SMgrRelation dst);
 
+/*
+ * Captured roots: a relation's tree as it was at a moment, kept by its
+ * page store (not by the relation), so any number of them, each outliving
+ * the relation's storage until it is let go of.  Capturing one is a
+ * snapshot's work (O(1) in the relation's size, but for the pages changed
+ * since its last capture or snapshot, logged as images and written out),
+ * and a relation can be made of one in O(1) (bmap_share_root()).  A root
+ * is held once its capturing (sub)transaction commits, and let go of once
+ * the (sub)transaction that lets go of it commits: one whose capturer
+ * aborted, or was ended by a crash, holds nothing, and neither does one
+ * whose releaser committed; the page store's next captures or sweep reuse
+ * their slots.  A root is named by an id (0: none) unique in its store.
+ */
+typedef uint64 BmapRootId;
+
+extern BmapRootId bmap_root_capture(SMgrRelation reln);
+extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids);
+extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
+								 RelFileLocator holder);
+extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
+extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
+						   BlockNumber *nblocks);
+extern bool bmap_root_unchanged(SMgrRelation reln, BmapRootId id);
+extern void bmap_share_root(BmapRootId id, SMgrRelation dst,
+							SMgrRelation replacing, SMgrRelation sharer);
+extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
+
 /* inspection, for tests */
+extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
+							   uint64 *slots, uint64 *naming);
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
@@ -266,7 +295,8 @@ typedef struct BmapSizes
 	uint64		mapped_blocks;	/* held by a map under its length */
 	uint64		listed_blocks;	/* held otherwise, not mapped */
 	uint64		map_bytes;		/* the maps' and changes lists' files */
-	uint64		alloc_bytes;	/* the allocator's and the counts' files */
+	uint64		alloc_bytes;	/* the allocator's, the counts', the release
+								 * queue's and the captured roots' files */
 	uint64		vm_bytes;		/* the relations' other forks (md.c) */
 	uint64		fsm_bytes;
 } BmapSizes;
