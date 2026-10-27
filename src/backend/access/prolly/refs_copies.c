@@ -3445,8 +3445,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 				carry = NULL;
 			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
-											carry, ncarry, carried,
-											&move_wait);
+											carry, ncarry, carried, NULL,
+											NULL, &move_wait);
 			for (int j = 0; done && j < ncarry; j++)
 				*into[j] = carried[j];
 			renamed |= done && ncarry > 0;
@@ -4899,16 +4899,20 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		if (!restore_planned(dc, kt, readable, targets, moving_to != NULL,
 							 baseline, other ? was : NULL, &relid))
 			continue;
+		renewed = palloc_array(BranchKeptRelation, kt->nrels);
+		replaced = palloc_array(BranchKeptRelation, kt->nrels);
+
 		/*
 		 * (another branch's kept pages: shared, as a move shares them,
 		 * that branch's list left as it is, and the session's kept commits
-		 * of the table, of another lineage, carried nowhere)
+		 * of the table, of another lineage, carried nowhere; the storage
+		 * replaced kept for the snapshots older than the move, as a
+		 * restore's is)
 		 */
 		if (other)
 		{
 			BranchKeptRelation *held;
 			bool		all = branch_ops()->hold != NULL;
-
 			int			nheld = 0;
 
 			/*
@@ -4918,12 +4922,22 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 			 */
 			ncarry = kept_carried(*kept, NULL, kt->name, &carry, &into);
 			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
-			if (!branch_ops()->share_kept(source, kt->rels, kt->nrels, carry,
-										  ncarry, carried, &move_wait))
+			if (!branch_replaced_reserve(kt->nrels))
 				continue;
+			if (!branch_ops()->share_kept(source, kt->rels, kt->nrels, carry,
+										  ncarry, carried, renewed, replaced,
+										  &move_wait))
+			{
+				branch_replaced_release_unused();
+				continue;
+			}
 			for (int j = 0; j < ncarry; j++)
 				*into[j] = carried[j];
 			now = lappend(now, kt->name);
+			storage = lappend(storage,
+							  replaced_entry(kc, kt, renewed, replaced));
+			branch_replaced_release_unused();
+			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, 1);
 
 			/*
 			 * (the pages held for the session's list too, by roots of its
@@ -4949,8 +4963,6 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 					branch_ops()->let_go(&held[r]);
 			continue;
 		}
-		renewed = palloc_array(BranchKeptRelation, kt->nrels);
-		replaced = palloc_array(BranchKeptRelation, kt->nrels);
 		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
 		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 		/*

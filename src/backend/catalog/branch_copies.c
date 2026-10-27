@@ -2109,7 +2109,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 static bool
 copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 				  const BranchKeptRelation *carry, int ncarry,
-				  BranchKeptRelation *carried, BranchLockWait *wait)
+				  BranchKeptRelation *carried, BranchKeptRelation *renewed,
+				  BranchKeptRelation *replaced, BranchLockWait *wait)
 {
 	bool		other = source != MyBranch;
 	Relation	pg_class;
@@ -2208,6 +2209,12 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 											 k->snapshot, NULL, NULL,
 											 other ? smgropen(sources[i], INVALID_PROC_NUMBER) : NULL,
 											 true);
+		if (renewed != NULL)
+		{
+			renewed[i] = *k;
+			renewed[i].tablespace = oc->reltablespace;
+			renewed[i].relfilenumber = relnumber;
+		}
 
 		/*
 		 * (the session's own kept roots carried, as restore() carries
@@ -2216,7 +2223,19 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		 */
 		carry_kept(k->relid, class_locator(oc, oc->relfilenode),
 				   class_locator(oc, relnumber), carry, ncarry, carried);
-		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
+		if (replaced != NULL)
+		{
+			/*
+			 * (the storage replaced kept, not dropped, as restore() keeps
+			 * it: a snapshot older than the move goes on reading it)
+			 */
+			replaced[i] = *k;
+			replaced[i].snapshot = BRANCH_KEPT_STORAGE;
+			replaced[i].relfilenumber = oc->relfilenode;
+			replaced[i].tablespace = oc->reltablespace;
+		}
+		else
+			RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
 			oc->relfrozenxid = k->frozenxid;
@@ -2225,7 +2244,9 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		oc->relallvisible = 0;
 		oc->relallfrozen = 0;
 		CatalogTupleUpdate(pg_class, &o->t_self, o);
-		pgstat_count_prolly(PGSTAT_PROLLY_RELATIONS_RESTORED, 1);
+		/* (another branch's pages: counted as the tables a move shares) */
+		if (!other)
+			pgstat_count_prolly(PGSTAT_PROLLY_RELATIONS_RESTORED, 1);
 	}
 	if (ok)
 		CommandCounterIncrement();
