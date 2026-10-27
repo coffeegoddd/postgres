@@ -978,6 +978,7 @@ typedef struct Plan
 	HTAB	   *archived;		/* the horizon's parents now */
 	HTAB	   *heights;		/* of commits recording none */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
+	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
 } Plan;
 
 static bool
@@ -1253,11 +1254,65 @@ plan_now(void)
 
 #define KEY_ARRIVED		'a'
 
+/* A commit a head log names: the first move to it, by its date. */
+typedef struct HeadArrival
+{
+	ProllyHash	id;				/* key */
+	TimestampTz at;
+} HeadArrival;
+
+static void
+note_any_branch(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pstrdup(name));
+}
+
+static bool
+note_move(const ProllyHeadMove *move, void *arg)
+{
+	HTAB	   *moved = arg;
+	ProllyHash	k = hash_key(&move->commit);
+	HeadArrival *a;
+	bool		found;
+
+	a = hash_search(moved, &k, HASH_ENTER, &found);
+	if (!found || move->moved_at < a->at)
+		a->at = move->moved_at;
+	return true;
+}
+
 /*
- * A commit dated past now ages from when it arrived here: when a sever's
- * plan first saw it (kept beside the horizon, 'a'), or now if none has.
+ * Every branch's head log read once, for the first move to each commit.
+ * Only a plan meeting a commit dated past now that no sever has recorded
+ * reads them (each such commit's arrival is then recorded), so the read,
+ * as long as the logs are, is paid once for it, not by every plan.
+ */
+static HTAB *
+head_arrivals(void)
+{
+	HTAB	   *moved = id_set("prolly head arrivals", sizeof(HeadArrival));
+	List	   *names = NIL;
+
+	if (!PROLLY_HAS(dc.refs, head_moves))
+		return moved;
+	PROLLY_CALL(dc.refs, branches, note_any_branch, &names);
+	foreach_ptr(char, name, names)
+		PROLLY_CALL(dc.refs, head_moves, name, NULL, DT_NOBEGIN, DT_NOEND,
+					ForwardScanDirection, note_move, moved);
+	list_free_deep(names);
+	return moved;
+}
+
+/*
+ * A commit dated past now ages from when it arrived here: the first move
+ * of a branch's head to it, as the head log dates it (when it was made
+ * here, or reset, merged or fast-forwarded to); where no log names it (it
+ * came in beneath another), when a sever's plan first saw it; now if none
+ * has.  Kept beside the horizon ('a') by the sever that first finds it.
  * So one --date in the future, or a pull of a clock skewed ahead, keeps
- * the history above it no longer than any other; a warning says so, once.
+ * the history above it no longer than any other, and a warning says so.
  */
 static TimestampTz
 age_date(Plan *plan, PlanCommit *pc)
@@ -1283,14 +1338,20 @@ age_date(Plan *plan, PlanCommit *pc)
 		pc->arrived = (TimestampTz) get_be64(v.data);
 	else
 	{
-		pc->arrived = now;
+		ProllyHash	hk = hash_key(&pc->id);
+		HeadArrival *a;
+
+		if (plan->moved == NULL)
+			plan->moved = head_arrivals();
+		a = hash_search(plan->moved, &hk, HASH_FIND, NULL);
+		pc->arrived = a != NULL ? Min(a->at, now) : now;
 		plan->arrivals = lappend(plan->arrivals, pc);
 		ereport(WARNING,
 				(errmsg("commit %s is dated %s, after it arrived here",
 						prolly_hash_hex(&pc->id),
 						timestamptz_to_str(pc->e.committed_at)),
 				 errdetail("It ages from %s instead.",
-						   timestamptz_to_str(now))));
+						   timestamptz_to_str(pc->arrived))));
 	}
 	pfree(k.data);
 	pfree(v.data);
