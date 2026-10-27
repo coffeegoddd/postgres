@@ -6220,8 +6220,13 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 		return true;
 	if (tracking_head(refname, commit_id))
 		return true;
-	return parse_commit_id(refname, commit_id) &&
-		commit_links(commit_id, &links);
+	if (!parse_commit_id(refname, commit_id))
+		return false;
+	if (commit_links(commit_id, &links))
+		return true;
+	/* (a commit named by its id, not here: past the horizon, maybe) */
+	prolly_window_check_absent(commit_id);
+	return false;
 }
 
 static bool
@@ -10448,10 +10453,24 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		 * visited.
 		 */
 		if (!PROLLY_CALL(env.chunk_store, has, env.chunks, next))
+		{
+			/*
+			 * (one past the history horizon: whole where the visitor
+			 * already has it, as a remote it is sent to may; else the
+			 * walk can't go on)
+			 */
+			if (prolly_window_archived(next))
+			{
+				ref_of(next, &ref);
+				if (!ws->visit(&ref, 0, ws->arg))
+					continue;
+				prolly_window_check_missing(next);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(next))));
+		}
 		if (!copies_commit_get(next, &info))
 		{
 			ProllyTagInfo tag;
