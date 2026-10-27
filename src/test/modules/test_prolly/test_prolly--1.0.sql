@@ -404,13 +404,26 @@ RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- How many nodes the refs' walk visits, one node (by hash) declined.
+CREATE FUNCTION test_refs_walk_count(declined text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The nodes the refs' walk visits (what a collection keeps), each as often
+-- as it is visited.
 CREATE FUNCTION test_refs_walk_nodes()
 RETURNS SETOF text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_refs_walk_count(declined text)
-RETURNS int8
+-- The chunks the refs' root and the tables reach, found apart from a
+-- collection's marks.
+CREATE FUNCTION test_chunk_reachable()
+RETURNS SETOF text
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The hashes of the chunks a table file holds.
+CREATE FUNCTION test_chunk_file_hashes(name text)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Each table's data tree in the session branch's working set, folded
 -- once: its qualified name, the tree's hash, and why its tree can't be
