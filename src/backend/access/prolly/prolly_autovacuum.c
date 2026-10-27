@@ -368,6 +368,9 @@ static bool full_due = false;
  */
 static bool retire_wanted = false;
 static uint32 retire_max_hi = PG_UINT32_MAX;
+static uint32 retire_want = 0;
+static uint32 retire_max_hi_seen = 0;	/* (0: none may be taken now; the
+										 * retire asked for waits) */
 static bool seal_wanted = false;
 static bool retire_refused = false;	/* another collection ran meanwhile */
 
@@ -379,6 +382,7 @@ sever(void)
 	full_due = false;
 	retire_wanted = false;
 	retire_max_hi = PG_UINT32_MAX;
+	retire_want = 0;
 	seal_wanted = false;
 	prolly_database_components(&dc);
 	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, maintain))
@@ -389,7 +393,7 @@ sever(void)
 		PROLLY_CALL(dc.history_window, collect_due);
 	if (PROLLY_HAS(dc.history_window, retire_due))
 		retire_wanted = PROLLY_CALL(dc.history_window, retire_due,
-									&retire_max_hi);
+									&retire_max_hi, &retire_want);
 	seal_wanted = PROLLY_HAS(dc.history_window, seal_due) &&
 		PROLLY_CALL(dc.history_window, seal_due);
 }
@@ -405,16 +409,19 @@ retire(const ProllyDatabaseComponents *dc)
 {
 	ProllyGcResult r;
 	uint32		max_hi = retire_max_hi;
+	uint32		want = retire_want;
 	uint32		lo;
 	uint32		hi;
 	bool		ran;
 
 	retire_max_hi = PG_UINT32_MAX;
+	retire_want = 0;
 	if (!PROLLY_HAS(dc->reclamation, retire) ||
 		!PROLLY_HAS(dc->reclamation, choose))
 		return false;
 	if (!PROLLY_CALL(dc->reclamation, choose,
-					 (uint64) prolly_gc_retire_budget * 1024, max_hi, &lo, &hi))
+					 (uint64) prolly_gc_retire_budget * 1024, max_hi, want,
+					 &lo, &hi))
 		return false;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
@@ -451,11 +458,13 @@ collect(void)
 	ProllyDatabaseComponents dc;
 	bool		wanted = retire_wanted;
 
+	retire_max_hi_seen = retire_max_hi;
 	retire_wanted = false;
 	retire_refused = false;
 	collect_now();
 	prolly_database_components(&dc);
-	if (wanted && !retire_refused && PROLLY_HAS(dc.history_window, retired))
+	if (wanted && !retire_refused && retire_max_hi_seen > 0 &&
+		PROLLY_HAS(dc.history_window, retired))
 		PROLLY_CALL(dc.history_window, retired);
 }
 

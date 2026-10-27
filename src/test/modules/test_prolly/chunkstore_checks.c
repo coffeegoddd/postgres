@@ -2880,6 +2880,8 @@ test_chunk_retire_choose(PG_FUNCTION_ARGS)
 		(uint64) prolly_gc_retire_budget * 1024 : (uint64) PG_GETARG_INT64(0);
 	uint32		max_hi = PG_NARGS() < 2 || PG_ARGISNULL(1) ? PG_UINT32_MAX :
 		(uint32) Min(Max(PG_GETARG_INT64(1), 0), PG_UINT32_MAX);
+	uint32		want = PG_NARGS() < 3 || PG_ARGISNULL(2) ? 0 :
+		(uint32) Min(Max(PG_GETARG_INT64(2), 0), PG_UINT32_MAX);
 	uint32		lo = 0;
 	uint32		hi = 0;
 	TupleDesc	desc;
@@ -2889,7 +2891,7 @@ test_chunk_retire_choose(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	prolly_database_components(&dc);
-	if (!PROLLY_CALL(dc.reclamation, choose, budget, max_hi, &lo, &hi))
+	if (!PROLLY_CALL(dc.reclamation, choose, budget, max_hi, want, &lo, &hi))
 		nulls[0] = nulls[1] = true;
 	values[0] = Int64GetDatum((int64) lo);
 	values[1] = Int64GetDatum((int64) hi);
@@ -2929,17 +2931,20 @@ test_window_retire_due(PG_FUNCTION_ARGS)
 {
 	ProllyDatabaseComponents dc;
 	uint32		max_hi = PG_UINT32_MAX;
+	uint32		want = 0;
 	TupleDesc	desc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	prolly_database_components(&dc);
-	values[0] = BoolGetDatum(PROLLY_CALL(dc.history_window, retire_due, &max_hi));
+	values[0] = BoolGetDatum(PROLLY_CALL(dc.history_window, retire_due,
+										 &max_hi, &want));
 	values[1] = Int64GetDatum((int64) max_hi);
 	nulls[1] = (max_hi == PG_UINT32_MAX);
-	values[2] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
+	values[2] = Int64GetDatum((int64) want);
+	values[3] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

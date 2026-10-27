@@ -53,7 +53,11 @@
  *   (archive mode, while some lineage has a window: the store's generation
  *   when the newest fragment archived, and found whole there, was severed,
  *   so that no retire frees what a fragment not yet archived holds; 0 if
- *   none was; otherwise no limit).  seal_due() says whether a batch
+ *   none was; otherwise no limit), and in *want the newest generation
+ *   holding a top of the fragments made since (0: none, or not settled),
+ *   for the retire to take.  While another backend severs, neither a
+ *   retire (*max_hi 0) nor a seal is due: a collection would wait for the
+ *   sever's transaction, which then gives way.  seal_due() says whether a batch
  *   boundary has passed since the store's newest generation ended, so a
  *   collection is to settle what came since in a generation of its own:
  *   generations then follow the batches fragments are cut at, and a
@@ -211,7 +215,7 @@ typedef struct ProllyWindowRoutine
 	void		(*window) (const char *branch, ProllyWindowCommitVisit visit,
 						   void *arg);
 	bool		(*in_window) (const char *branch, const ProllyHash *commit);
-	bool		(*retire_due) (uint32 *max_hi);
+	bool		(*retire_due) (uint32 *max_hi, uint32 *want);
 	void		(*retired) (void);
 	bool		(*seal_due) (void);
 } ProllyWindowRoutine;

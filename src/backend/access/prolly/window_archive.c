@@ -150,6 +150,9 @@ static int64 config_int(const char *name, int64 dflt);
  */
 
 static ProllyDatabaseComponents dc;
+
+/* The newest generation holding a top of the last fragment made (0: none). */
+static uint32 last_top_epoch = 0;
 static bool dc_ready = false;
 static ProllyTreeEnv tree_env;
 static const ProllyTreeRoutine *tree;
@@ -3702,10 +3705,14 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 		/* (the generation each top is in now: a repair puts it back there) */
 		uint32	   *epochs = palloc0_array(uint32, Max(f.ntops, 1));
 
+		last_top_epoch = 0;
 		for (int i = 0; i < f.ntops; i++)
+		{
 			if (PROLLY_HAS(tree_env.chunk_store, epoch_of))
 				epochs[i] = PROLLY_CALL(tree_env.chunk_store, epoch_of,
 										tree_env.chunks, &f.tops[i]);
+			last_top_epoch = Max(last_top_epoch, epochs[i]);
+		}
 		fragment_encode(&v, &f,
 						PROLLY_HAS(tree_env.chunk_store, generation) ?
 						PROLLY_CALL(tree_env.chunk_store, generation,
@@ -4110,6 +4117,7 @@ maintain_as_owner(const ProllyWindowPolicy *db, List *moved,
 
 static bool retires(void);
 
+
 /*
  * The history window severed in the background (autovacuum's visit), as
  * the database's owner, so an archive's checks are the owner's, as at
@@ -4222,7 +4230,9 @@ archive_maintain(void)
 	 * is the whole store's)
 	 */
 	if (r.fragment > 0 && retires())
-		config_int_set(RETIRE_WANTED_SETTING, 1, false);
+		config_int_set(RETIRE_WANTED_SETTING,
+					   Max(config_int(RETIRE_WANTED_SETTING, 0),
+						   (int64) last_top_epoch + 1), false);
 	else if (r.fragment > 0)
 		config_int_set(FULL_WANTED_SETTING, 1, false);
 	if (want_full)
@@ -4240,6 +4250,22 @@ archive_maintain(void)
 		config_int_set(OVER_COUNT_SETTING, 0, false);
 	}
 	return r.fragment > 0;
+}
+
+/*
+ * Is another backend severing (the severs' turn taken)?  A collection
+ * begun now would wait for its transaction, an archive's transfer long,
+ * and a background sever waited for gives way.
+ */
+static bool
+sever_running(void)
+{
+	LOCKTAG		tag;
+	int			n = 0;
+
+	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, HORIZON_LOCK_CLASSID, 1, 0);
+	(void) GetLockConflicts(&tag, ExclusiveLock, &n);
+	return n > 0;
 }
 
 /* Does the database's reclamation retire generations, as it chooses them? */
@@ -4278,14 +4304,22 @@ note_archived_generation(const ProllyKey *key, const ProllyValue *value,
  * whatever a retire's marking finds.)
  */
 static bool
-archive_retire_due(uint32 *max_hi)
+archive_retire_due(uint32 *max_hi, uint32 *want)
 {
 	ProllyWindowPolicy db;
 	bool		any;
+	int64		wanted;
 
 	window_init();
 	archive_policy(NULL, &db);
 	*max_hi = PG_UINT32_MAX;
+	wanted = config_int(RETIRE_WANTED_SETTING, 0);
+	*want = wanted > 0 ? (uint32) (wanted - 1) : 0;
+	if (sever_running())
+	{
+		*max_hi = 0;
+		return wanted > 0;
+	}
 	(void) moved_cuts(GetCurrentTimestamp(), &any);
 	if (db.action == PROLLY_WINDOW_ARCHIVE && any)
 	{
@@ -4301,7 +4335,7 @@ archive_retire_due(uint32 *max_hi)
 					BackwardScanDirection, note_archived_generation, max_hi);
 		pfree(k.data);
 	}
-	return config_int(RETIRE_WANTED_SETTING, 0) != 0;
+	return wanted > 0;
 }
 
 /*
@@ -4352,7 +4386,7 @@ archive_seal_due(void)
 	bool		any;
 
 	window_init();
-	if (!PROLLY_HAS(tree_env.chunk_store, epochs))
+	if (!PROLLY_HAS(tree_env.chunk_store, epochs) || sever_running())
 		return false;
 	(void) moved_cuts(now, &any);
 	if (!any)

@@ -68,9 +68,9 @@ SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
 
 -- No window yet: no limit, nothing due.
 SELECT * FROM test_window_retire_due();
- due | max_hi | seal_due 
------+--------+----------
- f   |        | f
+ due | max_hi | want | seal_due 
+-----+--------+------+----------
+ f   |        |    0 | f
 (1 row)
 
 -- The first sever archives: a retire may take what was settled by then.
