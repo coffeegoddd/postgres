@@ -1243,12 +1243,24 @@ a root for every commit kept within the history window, the one window
 the history window settings define (prolly.history_window,
 prolly.history_min_commits, prolly.history_max_size and each branch's own,
 as the database has them), and none outside it: that history is cold,
-for a sever.  A commit is kept while any branch lineage's window holds
-it, so a branch's head another branch was reset or committed away from
-keeps its root; one no branch has any more (reset or amended away from)
-is in no window.  A branch with no window of its own keeps every root,
-as by default.  A tag keeps its commit's root while it names it, and a
-branch's newest root is never let go of.  prolly.history_root_max_size
+for a sever.  Every branch has a window (prolly.history_window, a month
+by default; it can't be unset), so what a branch keeps, and the refs'
+entries for it, are bounded by it.  A branch's root is in its window if
+its commit is dated within it, or was kept or left within it (a commit
+the head is reset or amended away from has its entry dated again as the
+move commits, so it keeps its root, and a move back to it is O(1), until
+the move away is older than the window, however long the head was at
+it), or is among the newest min_commits kept on the head's first parents
+(a reset-away commit takes no place of theirs); never one on severed
+history (a parent past the horizon).  Another branch's commits
+are judged by seeks, not a walk of every branch: a root outside the
+branch's window is kept while another branch's head is at its commit and
+that branch keeps no frozen root of it (one it keeps frozen serves it;
+one captured among writers and not yet frozen can't be given to a move),
+and let go of otherwise.  (So a commit inside another lineage's longer window of its
+own that no head is at, and that lineage doesn't keep, is let go of: the
+lineage's own keep of it serves it.)  A tag keeps its commit's root while
+it names it, and a branch's newest root is never let go of.  prolly.history_root_max_size
 (unset by default), as the database has it, caps what the roots of every
 branch hold: past it, the oldest roots in the window are let go of first,
 so history is never lost, only moves to those commits cost the rows
@@ -1267,12 +1279,14 @@ a keep reads the newest few and the retired, and writes what it changes.
 A retention pass runs as a transaction that kept a branch's commit
 commits (its head where the transaction leaves it), once the branch has
 kept half as many commits again as it keeps, or the roots hold more than
-the cap: it reads the windows once (their walk spread over those keeps),
-then the branch's live entries from the oldest, retiring each outside
-every window and passing over another lineage's and a tag's, until one in
-the branch's own window (past the cap, until the cap is met), then from
-the newest the same way for what a branch was reset away from.  So a
-pass reads the entries it retires and passes over, not every root.
+the cap: it ranks the branch's live entries on the head's first parents
+as far as min_commits asks (none by default), then reads them from the oldest,
+retiring each outside the window and passing over a tag's and one another
+branch's head is at, until one in the branch's window (past the cap,
+until the cap is met), then from the newest the same way for what a
+branch was reset away from.  So a pass reads the entries it retires and
+passes over, not every root, and no other branch but by seeks.  A kept
+commit records the commits it reaches too, for count(*) of its log.
 
 Roots are captured no more often than prolly.root_interval (by default
 every commit made by hand, and a second under dolt.transaction_commit,
@@ -1941,8 +1955,13 @@ superuser's), never as a session has them, so no session severs more or
 sends history elsewhere by a SET of its own.  A branch's lineage may keep
 its own window, min_commits or batch (dolt_history_window(), the
 owner's, kept in the refs' settings); prolly_history_policy() shows what
-a branch keeps.  With no window, everything is kept.  There is one
-window: the page roots a branch keeps for constant-time moves are kept
+a branch keeps.  Every branch has a window: prolly.history_window
+defaults to a month, and can't be unset, empty or zero, nor a branch's
+own (NULL gives a branch the database's again).  With the default action,
+archive, and no archive set, nothing is severed (history stays here, and
+the background says nothing of it under the default window; a database
+that sets a window of its own is told), while page roots past the window
+are let go of.  There is one window: the page roots a branch keeps for constant-time moves are kept
 inside it, and ask it (the history window's window() and in_window(),
 prolly_history_in_window() in SQL) what is in it, by the clock a sever
 ages commits by, so the two never disagree.  What a
@@ -2065,19 +2084,20 @@ a history drop and a full collection in another session meanwhile don't
 free what it has yet to read.  The scan gives the entry's whole row too
 (dolt_log l ... count(l), l IS NOT NULL), made of its columns.
 
-The refs keep, for each commit a head moves to, the commits it reaches,
-itself included (the side space PROLLY_REFS_SPACE_COMMITS, keyed by commit
-id, prolly_history_commits()), as Dolt's commit closure counts them: one
-more than its first parent's, and for a merge, more by those its other
-parents reach that the first doesn't, found by heights highest first.
-They are derived, not part of the commit (its id is its content's, as
-before), and transfers don't send them: a head moved to a commit whose
-first parents have none (history made before, or received) keeps them
-down to one that has, once.  So count(*) of dolt_log(ref) alone (no
-quals, GROUP BY or HAVING) is planned as a scan giving that count
-(prolly_log_count.c), reading no history.  A commit the refs keep none
-for, or a history horizon, which the log stops at, has the log counted
-as it gives its rows.
+A branch's kept commit (Root retention, above) records the commits it
+reaches, itself included (prolly_history_commits(); the refs'
+commit_count()), as Dolt's commit closure counts them: the nearest kept
+count down its first parents (the branch's previous keep, so the commits
+made since, the root interval's, are walked) and one more for each commit
+between, and for a merge, more by those its other parents reach that the first
+doesn't, found by heights highest first.  They are derived, not part of
+the commit (its id is its content's, as before), and transfers don't send
+them.  So count(*) of dolt_log(ref) alone (no quals, GROUP BY or HAVING)
+is planned as a scan giving that count (prolly_log_count.c), reading no
+history.  A commit no branch keeps with a count (one made within the
+root interval, or let go of) is counted the same way, from the nearest
+kept count below it (or a root, as the log would be); a history horizon,
+which the log stops at, has the log counted as it gives its rows.
 
 Remotes
 -------

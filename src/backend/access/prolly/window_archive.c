@@ -947,6 +947,27 @@ parse_size(const char *value, int64 *bytes)
 	return *bytes >= 0;
 }
 
+/*
+ * Every branch's history has a window: prolly.history_window can't be
+ * unset, empty or nothing long.  Its default, a database that sets none
+ * has.
+ */
+#define DEFAULT_WINDOW		"1 month"
+
+static bool
+check_window(char **newval, void **extra, GucSource source)
+{
+	int64		usec;
+
+	if (*newval == NULL || **newval == '\0' || !parse_span(*newval, &usec) ||
+		usec <= 0)
+	{
+		GUC_check_errdetail("Give a positive interval, such as \"1 month\": every branch's history has a window.");
+		return false;
+	}
+	return true;
+}
+
 static bool
 check_span(char **newval, void **extra, GucSource source)
 {
@@ -1000,10 +1021,10 @@ prolly_window_init(void)
 							 action_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_window",
-							   "How long each branch's history is kept here (empty: all of it).",
-							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
-							   &window_setting, "", PGC_USERSET, 0,
-							   check_span, NULL, NULL);
+							   "How long each branch's history is kept here, its page roots too (past it, history is archived or deleted as prolly.history_window_action says, and roots let go of).",
+							   "Read as the database has it (default 1 month); a branch may keep its own (dolt_history_window()), but not none.",
+							   &window_setting, DEFAULT_WINDOW, PGC_USERSET, 0,
+							   check_window, NULL, NULL);
 	DefineCustomIntVariable("prolly.history_min_commits",
 							"How many of each branch's newest commits are kept here, however old.",
 							"Read as the database has it; a branch may keep its own.",
@@ -1185,6 +1206,8 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 				p->action = action_options[i].val;
 	}
 	p->keep_time = database_span("prolly.history_window");
+	if (p->keep_time <= 0)
+		(void) parse_span(DEFAULT_WINDOW, &p->keep_time);
 	p->batch = database_span("prolly.history_batch");
 	if ((v = database_setting("prolly.history_min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
@@ -1196,7 +1219,12 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	if (name == NULL)
 		return;
 	if ((v = branch_setting(name, "window")) != NULL)
-		(void) parse_span(v, &p->keep_time);
+	{
+		int64		own;
+
+		if (parse_span(v, &own) && own > 0)
+			p->keep_time = own;
+	}
 	if ((v = branch_setting(name, "batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
@@ -1237,6 +1265,11 @@ archive_set_policy(const char *name, const char *setting, const char *value)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("%s must be an interval, not \"%s\"", setting, value)));
+		else if (strcmp(setting, "window") == 0 && n <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a branch's window must be a positive interval, not \"%s\"", value),
+					 errhint("Every branch's history has a window; NULL gives the branch the database's again.")));
 	}
 	initStringInfo(&key);
 	branch_setting_key(&key, name, setting);
@@ -2151,20 +2184,11 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 			h->min_commits = Max(p.keep_commits, 1);
 			continue;
 		}
-		if (p.keep_time > 0)
-		{
-			h->cut = now - p.keep_time;
-			if (p.batch > 0)
-				h->cut -= ((h->cut % p.batch) + p.batch) % p.batch;
-			any = true;
-		}
-		else if (p.keep_commits > 0)
-		{
-			h->cut = DT_NOEND;	/* (only the count keeps) */
-			any = true;
-		}
-		else
-			h->cut = DT_NOBEGIN;	/* (it keeps everything) */
+		/* (every lineage has a window: archive_policy()) */
+		h->cut = now - p.keep_time;
+		if (p.batch > 0)
+			h->cut -= ((h->cut % p.batch) + p.batch) % p.batch;
+		any = true;
 		/* (a size limit cuts later, the count still keeping its own) */
 		if (size_cut > h->cut)
 		{
@@ -4004,11 +4028,9 @@ moved_cuts(TimestampTz now, bool *any)
 		char	   *key;
 
 		archive_policy(name, &p);
-		if (p.keep_time == 0 && p.keep_commits == 0)
-			continue;
 		*any = true;
 		batch = p.batch > 0 ? p.batch : DEFAULT_BACKGROUND_BATCH;
-		cut = p.keep_time > 0 ? now - p.keep_time : now;
+		cut = now - p.keep_time;
 		cut -= ((cut % batch) + batch) % batch;
 		key = last_cut_key(name);
 		if (cut > config_int(key, DT_NOBEGIN))
@@ -4134,6 +4156,15 @@ archive_maintain(void)
 	window_init();
 	archive_policy(NULL, &db);
 	if (db.action == PROLLY_WINDOW_NONE)
+		return false;
+	/*
+	 * (archiving with nowhere to archive to, under the default window:
+	 * history stays here, nothing severed, and the background says nothing
+	 * of it; roots past the window are let go of all the same, by root
+	 * retention.  A database that sets a window of its own is told.)
+	 */
+	if (db.action == PROLLY_WINDOW_ARCHIVE && db.archive == NULL &&
+		database_setting("prolly.history_window") == NULL)
 		return false;
 	if (now < config_int(RETRY_SETTING, DT_NOBEGIN))
 		return false;

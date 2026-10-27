@@ -2491,8 +2491,9 @@ test_commit_height(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_commit_commits(commit): the commits the refs keep that the commit
- * reaches (PROLLY_REFS_SPACE_COMMITS); NULL if they keep none for it.
+ * test_commit_commits(commit): the commits the commit reaches, as a
+ * branch's kept commit of it records them (the refs' commit_count());
+ * NULL if none does.
  */
 PG_FUNCTION_INFO_V1(test_commit_commits);
 Datum
@@ -2500,42 +2501,14 @@ test_commit_commits(PG_FUNCTION_ARGS)
 {
 	ProllyDatabaseComponents dc;
 	ProllyHash	id;
-	ProllyKey	k;
-	StringInfoData v;
-	uint64		n = 0;
+	int64		n;
 
 	prolly_database_components(&dc);
 	text_hash(PG_GETARG_TEXT_PP(0), &id);
-	k.data = (const uint8 *) id.bytes;
-	k.len = id.len;
-	initStringInfo(&v);
-	if (!PROLLY_CALL(dc.refs, side_get, PROLLY_REFS_SPACE_COMMITS, &k, &v) ||
-		v.len != 8)
+	if (!PROLLY_HAS(dc.refs, commit_count) ||
+		!PROLLY_CALL(dc.refs, commit_count, &id, &n))
 		PG_RETURN_NULL();
-	for (int i = 0; i < 8; i++)
-		n = (n << 8) | (uint8) v.data[i];
-	PG_RETURN_INT64((int64) n);
-}
-
-/*
- * test_commit_commits_forget(commit): the refs keep the commits it reaches
- * no more, as for history made before they were kept.
- */
-PG_FUNCTION_INFO_V1(test_commit_commits_forget);
-Datum
-test_commit_commits_forget(PG_FUNCTION_ARGS)
-{
-	ProllyDatabaseComponents dc;
-	ProllyHash	id;
-	ProllyKey	k;
-
-	prolly_database_components(&dc);
-	text_hash(PG_GETARG_TEXT_PP(0), &id);
-	k.data = (const uint8 *) id.bytes;
-	k.len = id.len;
-	PROLLY_CALL(dc.refs, lock);
-	PROLLY_CALL(dc.refs, side_put, PROLLY_REFS_SPACE_COMMITS, &k, NULL);
-	PG_RETURN_VOID();
+	PG_RETURN_INT64(n);
 }
 
 /* The refs' commits, counted as prolly_history_height() reads them. */

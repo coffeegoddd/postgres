@@ -12,7 +12,11 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_dead;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_dead SET prolly.history_window = '1000 years';
 ALTER DATABASE kept_dead SET prolly.history_min_commits = 3;
+ALTER DATABASE kept_dead SET prolly.history_window = '1 microsecond';
 \c kept_dead
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -107,6 +111,7 @@ SELECT kept();
 -- snapshot it had, though a commit let go of shared one with it: kr.t's
 -- relations, unchanged since m, are kept by m's snapshots for n and o too
 ALTER DATABASE kept_dead SET prolly.history_min_commits = 2;
+ALTER DATABASE kept_dead SET prolly.history_window = '1 microsecond';
 CREATE SCHEMA kr VERSIONED;
 CREATE TABLE kr.t (id int PRIMARY KEY, v int NOT NULL);
 INSERT INTO kr.t SELECT g, 0 FROM generate_series(1, 2000) g;
@@ -135,11 +140,15 @@ SELECT restored() - :before AS restored;
 SELECT count(*) FILTER (WHERE v = 1) AS at_n FROM kr.u;
 SELECT count(*) FILTER (WHERE v = 0) AS at_n FROM kr.t;
 ALTER DATABASE kept_dead RESET prolly.history_min_commits;
+ALTER DATABASE kept_dead SET prolly.history_window = '1000 years';
 
 -- a commit only the kept record names, its tables dropped: dropped from
 -- the record, so collected
 \c :home
 CREATE DATABASE kept_dead_gc;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_dead_gc SET prolly.history_window = '1000 years';
 \c kept_dead_gc
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

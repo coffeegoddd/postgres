@@ -12,6 +12,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE branch_index_work;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE branch_index_work SET prolly.history_window = '1000 years';
 \c branch_index_work
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -286,6 +289,9 @@ SELECT * FROM pg_temp.check_ix();
 \c :home
 DROP DATABASE branch_index_work;
 CREATE DATABASE branch_index_case;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE branch_index_case SET prolly.history_window = '1000 years';
 \c branch_index_case
 SELECT dolt_branch('feat') IS NOT NULL AS made;
 SELECT dolt_branch('FEAT');

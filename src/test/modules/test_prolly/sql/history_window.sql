@@ -57,9 +57,13 @@ INSERT INTO hw.t VALUES (500, 'long');
 INSERT INTO hw_names VALUES (hw_commit('l7', 7), 'l7');
 SELECT dolt_checkout('main');
 
--- No window: everything is kept, whatever the action.
+-- Every branch's history has a window: a month, unless the database
+-- sets another.  It can't be unset, empty or nothing long, nor a branch's.
 SELECT * FROM prolly_history_policy(NULL);
 SELECT count(*) AS planned FROM prolly_history_plan(NULL);
+SELECT hw_err($$SET prolly.history_window = ''$$) AS empty_refused,
+	   hw_err($$SET prolly.history_window = '0'$$) AS zero_refused;
+SELECT hw_err($$ALTER DATABASE regress_history_window SET prolly.history_window = ''$$) AS database_empty_refused;
 
 -- A window of three days, as the database has it; the long branch keeps
 -- ten of its own; the first sever severs only what both are past.
@@ -68,6 +72,7 @@ SELECT dolt_history_window('long', 'window', '10 days');
 SELECT action, time_window, min_commits FROM prolly_history_policy(NULL);
 SELECT action, time_window FROM prolly_history_policy('long');
 SELECT hw_err($$SELECT dolt_history_window('long', 'archive', 'x')$$) AS not_a_branch_setting;
+SELECT hw_err($$SELECT dolt_history_window('long', 'window', '0 seconds')$$) AS branch_none_refused;
 SELECT hw_err($$SELECT dolt_history_window(NULL, 'window', '1 day')$$) AS null_branch,
 	   hw_err($$SELECT dolt_history_window('long', NULL, '1 day')$$) AS null_setting;
 SELECT kind, hw_name(commit_hash) AS commit, hw_name(parent_hash) AS parent, why
@@ -217,11 +222,12 @@ SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_orde
 ALTER DATABASE regress_history_window SET prolly.history_window_action = none;
 SELECT action, fragment, commits FROM dolt_history_sever();
 
--- A branch's own window, with none for the database, cuts its lineage
--- (a branch's own commits are above its merge bases with the others, which
--- keep the paths to them: what a branch's window cuts is what every
--- lineage that reaches it lets go of).
+-- A branch's own window, narrower than the database's (a long one here),
+-- cuts its lineage (a branch's own commits are above its merge bases with
+-- the others, which keep the paths to them: what a branch's window cuts is
+-- what every lineage that reaches it lets go of).
 CREATE DATABASE regress_history_window_c;
+ALTER DATABASE regress_history_window_c SET prolly.history_window = '1000 years';
 \c regress_history_window_c
 CREATE SCHEMA hw VERSIONED;
 CREATE TABLE hw.t (id int PRIMARY KEY, v text);

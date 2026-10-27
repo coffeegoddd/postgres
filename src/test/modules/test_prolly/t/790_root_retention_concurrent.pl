@@ -52,8 +52,10 @@ for my $i (1 .. 3)
 	sql(qq{UPDATE rc.t SET v = 20 + $i WHERE id % 10 = $i;
 		SELECT dolt_commit('-am', 'm$i')});
 }
-# (no window till now, so every root kept: then a window of two commits)
-sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 2});
+# (the default window till now, which holds every root kept: then a
+# window of two commits)
+sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 2;
+	ALTER DATABASE postgres SET prolly.history_window = '1 microsecond'});
 my $keepers = qq{SELECT
 	(SELECT count(*) FROM test_kept_commits('main') WHERE commit_id = '$c03') +
 	(SELECT count(*) FROM test_kept_commits('bb') WHERE commit_id = '$c03')};

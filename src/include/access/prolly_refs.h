@@ -1021,6 +1021,15 @@ typedef struct ProllyRefsRoutine
 	void		(*in_progress) (ProllyInProgressVisit visit, void *arg);
 
 	/*
+	 * Optional: the commits commit reaches, itself included
+	 * (prolly_history_commits()), as a branch's kept commit of it records
+	 * them (a seek); false if no branch keeps it, or its entry records
+	 * none.  What count(*) of the commit's dolt_log() gives while no
+	 * history is severed.
+	 */
+	bool		(*commit_count) (const ProllyHash *commit, int64 *count);
+
+	/*
 	 * Optional: walk_commit(), but past the history horizon only the
 	 * commit objects: a severed commit's data (its root's and its
 	 * dependencies' trees, archived elsewhere or deleted) isn't visited,
@@ -1096,7 +1105,7 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
 	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept", \
-	"in_progress", "walk_commit_kept"
+	"in_progress", "commit_count", "walk_commit_kept"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK walk_commit_kept
 
@@ -1151,15 +1160,6 @@ extern bool prolly_history_commits(const ProllyHash *parents, int nparents,
 								   ProllyCommitLookup lookup, void *lookup_arg,
 								   int64 *commits);
 
-/*
- * The refs' side space (side_get()) of the commits each commit reaches,
- * itself included (prolly_history_commits()), keyed by the commit id's
- * bytes, 8 bytes big-endian: what count(*) of its dolt_log() gives while
- * no history is severed.  Derived, not part of any commit: the refs fill
- * it as a head moves to a commit (from its parents', or down its first
- * parents to one they have), and a commit missing has its log counted.
- */
-#define PROLLY_REFS_SPACE_COMMITS	'n'
 
 extern struct HTAB *prolly_history_heights(void);
 extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,

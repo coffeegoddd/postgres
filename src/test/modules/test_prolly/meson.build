@@ -142,6 +142,8 @@ tests += {
       'remote_serve',
       'commit_heights',
       'log_count',
+      'refs_per_commit',
+      'kept_departures',
       'dependencies',
       'dependency_moves',
       'extension_ordering',

@@ -13,10 +13,11 @@
 #include "nodes/pathnodes.h"
 
 /*
- * The rows dolt_log(ref) gives: the commits ref's commit reaches, as the
- * refs keep them (PROLLY_REFS_SPACE_COMMITS), while no history is
- * severed; counted by a walk of the log otherwise (a commit they keep none
- * for, a history horizon).  0 for HEAD before a first commit.
+ * The rows dolt_log(ref) gives: the commits ref's commit reaches, as a
+ * branch's kept commit of it records them (the refs' commit_count()),
+ * while no history is severed; counted by a walk of the log otherwise (a
+ * commit kept with none, a history horizon).  0 for HEAD before a first
+ * commit.
  */
 extern int64 prolly_log_count(const char *ref);
 

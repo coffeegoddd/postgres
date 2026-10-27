@@ -28,6 +28,8 @@ $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 # (a window of one commit: only the head keeps its root)
 sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 1});
+# (the newest commits only: a window that holds no other)
+sql(q{ALTER DATABASE postgres SET prolly.history_window = '1 microsecond'});
 
 sql(q{CREATE EXTENSION test_prolly;
 	CREATE SCHEMA q VERSIONED;

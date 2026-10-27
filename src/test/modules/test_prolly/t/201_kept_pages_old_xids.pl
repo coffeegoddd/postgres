@@ -27,6 +27,8 @@ $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION xid_wraparound; CREATE EXTENSION test_prolly');
 # (a window of two commits: the third's keep retires the first's roots)
 $node->safe_psql('postgres', 'ALTER DATABASE postgres SET prolly.history_min_commits = 2');
+# (the newest commits only: a window that holds no other)
+$node->safe_psql('postgres', q{ALTER DATABASE postgres SET prolly.history_window = '1 microsecond'});
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
