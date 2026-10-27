@@ -121,9 +121,8 @@ FROM prolly_history_plan(NULL) ORDER BY kind, commit, parent;
  boundary | a8     | a10    | 
  pinned   | a4     |        | merge base
  pinned   | a6     |        | merge base
- pinned   | a8     |        | ref
  severed  | a10    |        | 
-(5 rows)
+(4 rows)
 
 -- A session's settings don't count: not the action, not the window, not
 -- the archive.  Archive mode with no archive severs nothing, and says so.
@@ -294,7 +293,7 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action  | fragment | commits | boundary | sent_only_new 
 ---------+----------+---------+----------+---------------
- archive |        2 |       1 | {a6}     | t
+ archive |        2 |       3 | {a2}     | t
 (1 row)
 
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
@@ -310,9 +309,7 @@ NOTICE:  history stops at the history horizon
  a0
  a1
  a2
- a4
- a6
-(5 rows)
+(3 rows)
 
 -- Repair from the archive, every fragment: the history reads again.
 SELECT dolt_history_repair() AS repaired;
@@ -378,7 +375,7 @@ ALTER DATABASE regress_history_window_b SET prolly.history_archive = :'url';
 SELECT action, fragment > 0 AS archived, commits FROM dolt_history_sever();
  action  | archived | commits 
 ---------+----------+---------
- archive | t        |       1
+ archive | t        |       3
 (1 row)
 
 \c regress_history_window
@@ -390,7 +387,7 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action | fragment | commits | boundary 
 --------+----------+---------+----------
- delete |        3 |       2 | {a6}
+ delete |        3 |       4 | {a2}
 (1 row)
 
 SELECT fragment, state, location FROM prolly_history_horizon() ORDER BY fragment DESC;
@@ -406,9 +403,7 @@ NOTICE:  history stops at the history horizon
  a0
  a1
  a2
- a4
- a6
-(5 rows)
+(3 rows)
 
 ALTER DATABASE regress_history_window SET prolly.history_window_action = none;
 SELECT action, fragment, commits FROM dolt_history_sever();
@@ -476,12 +471,85 @@ SELECT kind, count(*) FROM prolly_history_plan(NULL) GROUP BY kind ORDER BY kind
    kind   | count 
 ----------+-------
  boundary |     1
- pinned   |     2
- severed  |     2
-(3 rows)
+ severed  |     4
+(2 rows)
 
 \c regress_history_window
 DROP DATABASE regress_history_window_c;
+-- A branch's window narrower than the database's cuts the branch's own
+-- history: what else names its commits (its page roots, its log, a
+-- tracking branch) keeps only those, not the database's window.  And the
+-- warm window is never shorter than prolly.history_hot.
+CREATE DATABASE regress_history_window_d;
+\c regress_history_window_d
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'a10');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'a8';
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'a1';
+SELECT length(dolt_commit('-am', 'a1', '--date', (now() - interval '1 day')::text)::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'a0';
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER DATABASE regress_history_window_d SET prolly.history_warm = '9 days';
+SELECT dolt_history_window('main', 'warm', '3 days');
+ dolt_history_window 
+---------------------
+ 
+(1 row)
+
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+ORDER BY 1, 2;
+   kind   | message 
+----------+---------
+ boundary | a1
+ severed  | a10
+ severed  | a8
+(3 rows)
+
+ALTER DATABASE regress_history_window_d SET prolly.history_hot = '9 days';
+\c regress_history_window_d
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+ORDER BY 1, 2;
+NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
+   kind   | message 
+----------+---------
+ boundary | a8
+ severed  | a10
+(2 rows)
+
+SELECT warm FROM prolly_history_policy('main');
+NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
+    warm     
+-------------
+ @ 216 hours
+(1 row)
+
+\c regress_history_window
+DROP DATABASE regress_history_window_d;
 \c :home
 DROP DATABASE regress_history_window;
 DROP ROLE regress_hw_other;

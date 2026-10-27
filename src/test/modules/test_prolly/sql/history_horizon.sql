@@ -139,7 +139,7 @@ SELECT id, v FROM hh.t ORDER BY id;
 
 -- A second sever builds on the horizon: its fragment stops at the first's.
 -- (feature merged and gone, its merge base pins nothing; the commits the
--- branch's pages are kept as of are refs' commits, pinned)
+-- branch's pages are kept as of are main's lineage, its window's to cut)
 SELECT dolt_branch('-D', 'feature');
 SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
 FROM prolly_history_plan('2020-01-07 00:00+00')

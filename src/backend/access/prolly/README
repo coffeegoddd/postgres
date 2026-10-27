@@ -1757,23 +1757,44 @@ branch's history is kept here), prolly.history_min_commits (how many of a
 branch's newest commits are kept however old), prolly.history_cold_batch
 (a cut rounded down to whole hours or days, so fragments are whole ones),
 prolly.history_max_size, prolly.history_window_action (archive, delete or
-none) and prolly.history_archive (a remote's name or URL) are read as the
+none) and prolly.history_archive (a remote's URL, not a name) are read as the
 database has them (ALTER DATABASE ... SET: its owner's or a
 superuser's), never as a session has them, so no session severs more or
 sends history elsewhere by a SET of its own.  A branch's lineage may keep
 its own warm, min_commits or cold_batch (dolt_history_window(), the
 owner's, kept in the refs' settings); prolly_history_policy() shows what
-a branch keeps.  With no window, everything is kept.
+a branch keeps.  With no window, everything is kept.  A warm window is
+never shorter than prolly.history_hot (the page roots' window, as the
+database has it): a shorter one is taken as hot, with a notice.  What a
+branch's history keeps is the branch's window's: another ref's commit on
+it (a commit the branch's pages are kept as of, a reader's pin, a
+remote-tracking branch) has no window of its own, though a collection
+keeps what the ref names until the ref lets go of it, and no path to it
+is kept as for a merge (it is its own merge base).  A tag keeps its own
+commit and the database's min_commits; a ref's commit on no branch's
+history keeps itself, and the paths to its merge bases with the
+branches.
 
 dolt_history_sever() severs what is past the window, as the action says.
+It plans, and archives, holding no ref and not the horizon's lock (only
+a lock severs and repairs take turns by); the refs moved meanwhile, it
+plans and archives again, a few times, still holding none.  Then it holds
+the horizon and the refs only to check the plan (planned again if the
+refs moved since, which must give the fragment archived) and record it.
 Archived, the fragment's tops are sent to the archive (the transfer
 sends what it lacks; a walk past the horizon goes on where the remote has
-what is severed already, so fragments archive beside one another), every
-chunk of the fragment is checked to be there, the tops are made heads of
-the archive's (history/fragment-N-i), and only then is the horizon moved,
-the fragment's location the archive's URL; with no archive, nothing is
-severed and a warning says so.  Deleted, the horizon records the fragment
-and nothing is sent.
+what is severed already, so fragments archive beside one another), the
+tops are made heads of the archive's, named by the database (the
+cluster's system identifier and its OID) and the fragment's identity, so
+the same fragment is named the same however often it is archived, then
+every chunk the fragment made is read back from the archive and re-hashed
+(an archive that says it has one it doesn't is found out), and only then
+is the horizon moved, the fragment's location the archive's URL; with no
+archive, nothing is severed and a warning says so.  The archive is opened
+as the role severing (the owner), so its checks are the owner's, and the
+archive's own permissions to push protect its history/... heads after:
+whoever may move heads there may let the history archived go.  Deleted,
+the horizon records the fragment and nothing is sent.
 
 Autovacuum's visit of a database severs its window in the background
 (the history window's maintain(), as the database's settings say), as
