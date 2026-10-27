@@ -241,11 +241,10 @@ SELECT dolt_branch('-m', 'side', 'side2');
  {0}
 (1 row)
 
-SELECT count(*) AS renamed_moves, (SELECT count(*) FROM prolly_head_log('side')) AS old_name
-FROM prolly_head_log('side2');
- renamed_moves | old_name 
----------------+----------
-             2 |        0
+SELECT count(*) AS renamed_moves FROM prolly_head_log('side2');
+ renamed_moves 
+---------------
+             2
 (1 row)
 
 SELECT dolt_branch('-D', 'side2');
@@ -295,6 +294,61 @@ SELECT hl_logged('remotes/origin/main');
                          hl_logged                          
 ------------------------------------------------------------
  2 moves, numbered in order, dated rising, ends at the head
+(1 row)
+
+-- A remote removed takes its tracking branches' logs with it: added again,
+-- its branch has none.
+SELECT dolt_remote('remove', 'origin');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT count(*) AS moves_after_readd,
+	   prolly_head_at('remotes/origin/main', now()) IS NULL AS at_none
+FROM prolly_head_log('remotes/origin/main');
+ moves_after_readd | at_none 
+-------------------+---------
+                 0 | t
+(1 row)
+
+SELECT dolt_fetch('origin') AS fetched;
+ fetched 
+---------
+ {0}
+(1 row)
+
+-- An unknown branch or remote is an error; a null ref too, and a null
+-- bound or direction is none.
+CREATE FUNCTION hl_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLERRM;
+END $$;
+SELECT hl_err($$SELECT * FROM prolly_head_log('nobranch')$$) AS unknown_branch,
+	   hl_err($$SELECT prolly_head_at('nobranch', now())$$) AS unknown_at,
+	   hl_err($$SELECT * FROM prolly_head_log('remotes/noremote/main')$$) AS unknown_remote;
+          unknown_branch          |            unknown_at            |                unknown_remote                 
+----------------------------------+----------------------------------+-----------------------------------------------
+ branch "nobranch" does not exist | branch "nobranch" does not exist | no remote is named by "remotes/noremote/main"
+(1 row)
+
+SELECT hl_err($$SELECT * FROM prolly_head_log(NULL, NULL, NULL, NULL)$$) AS null_ref,
+	   (SELECT count(*) FROM prolly_head_log(NULL::text)) AS strict_ref,
+	   (SELECT count(*) FROM prolly_head_at(NULL, now())) AS strict_at,
+	   (SELECT count(*) = (SELECT count(*) FROM prolly_head_log('main'))
+		FROM prolly_head_log('main', NULL, NULL, NULL)) AS null_bounds;
+            null_ref            | strict_ref | strict_at | null_bounds 
+--------------------------------+------------+-----------+-------------
+ a head log's ref can't be null |          0 |         1 | t
 (1 row)
 
 -- A clone's heads, and a pull fast-forwarded to commits made elsewhere:
