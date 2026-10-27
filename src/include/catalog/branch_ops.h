@@ -314,6 +314,17 @@ typedef struct BranchOpsRoutine
 							   BranchLockWait *wait);
 
 	/*
+	 * Optional: hold the pages kept (keep()'s, of any branch) again, for
+	 * the session branch's relation kept->relid as it is stored now, into
+	 * *held: the same pages, held on their own (let_go() lets go of either
+	 * without the other), named as of the relation's storage now; O(1).
+	 * Held once the transaction commits.  False, nothing held, if they are
+	 * no longer kept or the relation isn't on the branch.
+	 */
+	bool		(*hold) (const BranchKeptRelation *kept,
+						 BranchKeptRelation *held);
+
+	/*
 	 * Optional: add to each of the session branch's relations relids the
 	 * privileges of the relation of branch source at the same place in
 	 * fromids, the one the object a move brought was made from: the

@@ -165,18 +165,27 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
-SELECT name, CASE WHEN name = 'apply_rows' THEN value ELSE (value > 0)::int END
-FROM since(:'before') WHERE name <> 'pages_kept';
+-- (the pages held by the branch's own roots too: its keep after the move
+-- finds them unchanged, and captures none)
+SELECT name, CASE WHEN name = 'pages_kept' THEN value ELSE (value > 0)::int END
+FROM since(:'before');
         name        | case 
 --------------------+------
  apply_rows         |    0
+ pages_kept         |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
  at_c12 
 --------
  t
+(1 row)
+
+SELECT count(*) AS scratch_kept FROM test_kept_commits('scratch');
+ scratch_kept 
+--------------
+            1
 (1 row)
 
 SELECT dolt_checkout('main');

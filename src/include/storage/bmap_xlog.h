@@ -51,7 +51,8 @@
  *						pages, the old block's reference-count page if its
  *						count changes, the changes list's header and page if
  *						the old block is listed (BMAP_REMAP_LISTED), and last
- *						the page itself, as an image
+ *						the page itself, as an image (or, a page another map
+ *						holds, with none: BMAP_REMAP_FROM_OLD)
  * XLOG_BMAP_FOLD		a fold begins: block 0 is the map's header (its epoch
  *						raised), block 1 the changes list's header
  * XLOG_BMAP_CHANGES	the changes list rewritten: its pages, then its header
@@ -143,10 +144,18 @@ typedef struct xl_bmap_shrink
  * from the block.  One another map shares keeps what it has: the primary
  * doesn't write there (the image may have hints only this map's buffer
  * had).
+ *
+ * A page another map holds (a share's, a root's) needs no image either
+ * (BMAP_REMAP_FROM_OLD): the old block holds it durably, as the share or
+ * capture made it (logged as an image then), and nothing writes it in
+ * place since, so redo copies it from there to the new block and the
+ * page's buffer.  Hints the buffer had and the block hadn't are lost, as
+ * a hint may be.
  */
 #define BMAP_REMAP_ZERO		0x01
 #define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */
 #define BMAP_REMAP_OWN		0x04	/* and no other map holds it */
+#define BMAP_REMAP_FROM_OLD	0x08	/* no image: the old block's page */
 
 typedef struct xl_bmap_remap
 {
@@ -219,10 +228,13 @@ typedef struct xl_bmap_extend
  *						raised), block 2 the roots' metapage, then the
  *						reference-count pages of the subtrees, each a holder
  *						more; always with BMAP_TREE_PRESERVE_LOGGED
- * BMAP_TREE_ROOT_SLOT	a captured root's slot changes without holders
- *						gained: named as let go of by a (sub)transaction,
- *						or cleared; block 0 is the roots page, block 1 the
- *						roots' metapage.  'locator' is the roots file
+ * BMAP_TREE_ROOT_SLOT	a captured root's slot changes: named as let go of
+ *						by a (sub)transaction, or cleared (block 0, the
+ *						roots page, alone); or set to another root's
+ *						subtrees (block 0 the roots page, block 1 the roots'
+ *						metapage, then the reference-count pages of the
+ *						subtrees, each a holder more).  'locator' is the
+ *						roots file
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3

@@ -79,9 +79,12 @@ SELECT pg_stat_force_next_flush();
 SELECT counted() AS before \gset
 SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log WHERE message = 'c12'));
 SELECT pg_stat_force_next_flush();
-SELECT name, CASE WHEN name = 'apply_rows' THEN value ELSE (value > 0)::int END
-FROM since(:'before') WHERE name <> 'pages_kept';
+-- (the pages held by the branch's own roots too: its keep after the move
+-- finds them unchanged, and captures none)
+SELECT name, CASE WHEN name = 'pages_kept' THEN value ELSE (value > 0)::int END
+FROM since(:'before');
 SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
+SELECT count(*) AS scratch_kept FROM test_kept_commits('scratch');
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'scratch');
 -- (deleted, the branch's roots are let go of: the store keeps no more than

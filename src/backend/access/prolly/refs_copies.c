@@ -4799,6 +4799,7 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	List	   *readable = NIL;
 	List	   *targets = NIL;
 	List	   *now = NIL;
+	List	   *own = NIL;		/* tables another branch's pages were held of */
 	ProllyNodeRef from;
 	ProllyNodeRef spliced;
 
@@ -4901,9 +4902,27 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		 */
 		if (other)
 		{
-			if (branch_ops()->share_kept(source, kt->rels, kt->nrels, NULL, 0,
-										 NULL, &move_wait))
-				now = lappend(now, kt->name);
+			BranchKeptRelation *held;
+			bool		all = branch_ops()->hold != NULL;
+
+			if (!branch_ops()->share_kept(source, kt->rels, kt->nrels, NULL, 0,
+										  NULL, &move_wait))
+				continue;
+			now = lappend(now, kt->name);
+
+			/*
+			 * (the pages held for the session's list too, by roots of its
+			 * own, so that its next keep finds them unchanged and a later
+			 * move restores them as its own)
+			 */
+			held = palloc_array(BranchKeptRelation, kt->nrels);
+			for (int r = 0; r < kt->nrels && all; r++)
+				all = branch_ops()->hold(&kt->rels[r], &held[r]);
+			if (all)
+			{
+				memcpy(kt->rels, held, sizeof(BranchKeptRelation) * kt->nrels);
+				own = lappend(own, kt);
+			}
 			continue;
 		}
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
@@ -4933,6 +4952,16 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	{
 		*kept = kept_drop_dead(lcons(kc, *kept), kc);
 		was->retired = GetTopFullTransactionId();
+	}
+	else if (own != NIL)
+	{
+		/* (kept anew by the session's branch: only the tables it holds) */
+		int			t = 0;
+
+		kc->ntables = list_length(own);
+		foreach_ptr(KeptTable, kt, own)
+			kc->tables[t++] = *kt;
+		*kept = lcons(kc, *kept);
 	}
 	ref_of(&kc->baseline, &from);
 	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,

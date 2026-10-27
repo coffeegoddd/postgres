@@ -2197,6 +2197,37 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	return ok;
 }
 
+/*
+ * Hold the pages kept again, for the session branch's relation as stored
+ * now (see branch_ops.h): another root of the same subtrees.
+ */
+static bool
+copies_hold(const BranchKeptRelation *kept, BranchKeptRelation *held)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	HeapTuple	t = class_row(pg_class, kept->relid, MyBranch);
+	bool		ok = false;
+
+	if (t != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(t);
+		uint64		root = bmap_root_copy(kept_locator(kept), kept->snapshot);
+
+		if (root != 0)
+		{
+			*held = *kept;
+			held->tablespace = c->reltablespace;
+			held->relfilenumber = c->relfilenode;
+			held->snapshot = root;
+			note_taken(kept_locator(held), root);
+			ok = true;
+		}
+		heap_freetuple(t);
+	}
+	table_close(pg_class, AccessShareLock);
+	return ok;
+}
+
 static void
 copies_let_go(const BranchKeptRelation *kept)
 {
@@ -3110,6 +3141,7 @@ static const BranchOpsRoutine branch_copies = {
 	.let_go = copies_let_go,
 	.kept_status = copies_kept_status,
 	.share_kept = copies_share_kept,
+	.hold = copies_hold,
 	.carry_privileges = copies_carry_privileges,
 	.carry_statistics = copies_carry_statistics,
 	.relation_owner = copies_relation_owner,

@@ -168,6 +168,7 @@ typedef uint64 BmapRootId;
 
 extern BmapRootId bmap_root_capture(SMgrRelation reln);
 extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids);
+extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id);
 extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
 extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
 						   BlockNumber *nblocks);
