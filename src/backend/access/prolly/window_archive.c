@@ -1494,6 +1494,17 @@ archive_repair(const char *source, int nfragments)
 		urls = lappend(urls, url);
 	}
 
+	/*
+	 * Settled: the boundary commits, in settled files, name what was
+	 * received, and a default collection doesn't read settled files.
+	 */
+	foreach_ptr(FragmentRecord, r, chosen)
+	{
+		if (PROLLY_HAS(tree_env.chunk_store, settle))
+			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
+						r->f.tops, r->f.ntops);
+	}
+
 	/* then verified, and let go of, holding the refs too */
 	INJECTION_POINT("prolly-repair-received", NULL);
 	PROLLY_CALL(dc.refs, lock);
