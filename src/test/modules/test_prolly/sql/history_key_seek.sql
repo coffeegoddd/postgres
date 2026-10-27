@@ -175,6 +175,20 @@ SELECT EXISTS (SELECT 1 FROM dolt_history_table(NULL::hk.t) h
 SELECT count(*) AS joined FROM generate_series(5, 6) k(id)
 	JOIN dolt_history_table(NULL::hk.t) h ON (h.row).id = 5 AND h IS NOT NULL;
 
+-- The scan is dolt_history_table's: one who can't execute it can't
+-- read it, though the table is granted.
+CREATE ROLE regress_history_key_nobody;
+GRANT USAGE ON SCHEMA hk TO regress_history_key_nobody;
+GRANT SELECT ON hk.t TO regress_history_key_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_history_table(anyelement) FROM PUBLIC;
+SET ROLE regress_history_key_nobody;
+SELECT count(*) FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_history_table(anyelement) TO PUBLIC;
+REVOKE ALL ON hk.t FROM regress_history_key_nobody;
+REVOKE ALL ON SCHEMA hk FROM regress_history_key_nobody;
+DROP ROLE regress_history_key_nobody;
+
 -- A keyless table: nothing to seek by.
 CREATE TABLE hk.k (id int, v text);
 INSERT INTO hk.k VALUES (1, 'a'), (1, 'a'), (2, 'b');
