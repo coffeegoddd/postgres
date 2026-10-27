@@ -241,6 +241,7 @@ tests += {
       'bmap_captured_roots',
       'root_moves',
       'root_holds',
+      'root_retention',
       'root_freezing',
       'root_changed_pages',
       'kept_pages',

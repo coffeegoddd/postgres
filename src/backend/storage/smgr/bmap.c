@@ -9768,7 +9768,7 @@ bmap_root_capture(SMgrRelation reln)
 {
 	BmapRootId	id;
 
-	bmap_root_capture_many(&reln, 1, &id);
+	bmap_root_capture_many(&reln, 1, &id, NULL);
 	return id;
 }
 
@@ -9776,10 +9776,14 @@ bmap_root_capture(SMgrRelation reln)
  * bmap_root_capture() of each of rels[] (n of them), their ids into ids[],
  * the generation of sharing raised once for them all.  Each id is set as
  * its root is captured (the others 0), so that, if one fails, the caller
- * knows of those captured already, which an abort lets go of.
+ * knows of those captured already, which an abort lets go of.  owned (if
+ * not NULL) gets each one's own pages then, those no root held before
+ * (changed since the last capture, or new): what a later change of them
+ * keeps for the root alone.
  */
 void
-bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
+bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
+					   uint32 *owned)
 {
 	BlockList  *own = palloc0_array(BlockList, Max(n, 1));
 
@@ -9789,6 +9793,8 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 	{
 		ids[i] = root_capture_slot(rels[i], &own[i], false,
 								   InvalidRelFileNumber, 0);
+		if (owned)
+			owned[i] = own[i].n;
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
 	}
 	MarkBufferedPagesShared();

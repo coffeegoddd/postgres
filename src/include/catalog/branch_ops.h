@@ -246,13 +246,17 @@ typedef struct BranchOpsRoutine
 	 * changed since the relation's root in prior[], made into a root whose
 	 * unchanged pages are that root's), and its kept frozenxid is
 	 * FrozenTransactionId: it never goes stale; one unchanged since keeps
-	 * that root.  The others are kept as they are.
+	 * that root.  The others are kept as they are.  *pages is how many
+	 * pages the roots captured hold that no root before them did (those
+	 * copied, or a root's pages changed since the last capture): what
+	 * the new roots alone keep once the relations change again.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
 						 const BranchKeptRelation *release, int nrelease,
 						 bool (*settled) (void *arg), void *arg,
-						 BranchFreezePage freeze, Snapshot snapshot);
+						 BranchFreezePage freeze, Snapshot snapshot,
+						 uint64 *pages);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,

@@ -28,7 +28,6 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
-prolly.kept_commits = 1000
 prolly.restore_min_changes = 0
 });
 $node->start;
@@ -89,7 +88,7 @@ is($standby->safe_psql('postgres', q{SELECT held FROM test_bmap_roots()}),
 
 # main lets go of c0's roots (the branch deleted would; here its list kept
 # to its newest), side moves to c2 and back: by its own
-sql(q{SET prolly.kept_commits = 1;
+sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 1;
 	UPDATE rh.t SET v = 3 WHERE id % 10 = 3; SELECT dolt_commit('-am', 'c3');
 	UPDATE rh.t SET v = 4 WHERE id % 10 = 4; SELECT dolt_commit('-am', 'c4')});
 

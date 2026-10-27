@@ -120,7 +120,7 @@ SELECT (dolt_checkout('main'))[1];
  0
 (1 row)
 
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
  made 
 ------
@@ -211,7 +211,7 @@ SELECT (dolt_checkout('main'))[1];
  0
 (1 row)
 
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
  made 
 ------
@@ -335,7 +335,7 @@ SELECT (dolt_checkout('main'))[1];
  0
 (1 row)
 
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
  made 
 ------
@@ -426,7 +426,7 @@ SELECT (dolt_checkout('main'))[1];
  0
 (1 row)
 
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
  made 
 ------

@@ -5,7 +5,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_holds;
-ALTER DATABASE root_holds SET prolly.kept_commits = 1000;
 ALTER DATABASE root_holds SET prolly.restore_min_changes = 0;
 \c root_holds
 SET client_min_messages = warning;
@@ -44,12 +43,13 @@ WHERE k.commit_id = :'c3';
 
 -- main keeps only its newest from now on: its roots of c3 let go of
 SELECT dolt_checkout('main');
-SET prolly.kept_commits = 1;
+ALTER DATABASE root_holds SET prolly.history_min_commits = 1;
 DO $$ BEGIN FOR i IN 11..14 LOOP
 	UPDATE rh.t SET v = i WHERE id % 50 = i;
 	PERFORM dolt_commit('-am', 'c' || i);
 END LOOP; END $$;
-RESET prolly.kept_commits;
+SELECT test_retain_roots('main');
+ALTER DATABASE root_holds RESET prolly.history_min_commits;
 SELECT count(*) AS main_kept FROM test_kept_commits('main');
 
 -- side moves back to c3 again: by its own roots

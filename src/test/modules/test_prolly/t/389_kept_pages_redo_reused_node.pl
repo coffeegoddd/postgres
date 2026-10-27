@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Redo of a snapshot walks the nodes its record names, which by the end of
-# the WAL may be gone: the snapshot let go of (prolly.kept_commits), its
+# the WAL may be gone: the snapshot let go of (out of the history window), its
 # leaf freed, and the block taken as a relation's page and written out
 # before a crash.  A relation's page is checksummed as its logical block,
 # so read through a buffer as the page store's block it fails

@@ -846,6 +846,18 @@ test_kept_commits(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* A retention pass of branch name's kept commits, now. */
+PG_FUNCTION_INFO_V1(test_retain_roots);
+Datum
+test_retain_roots(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, retain_roots, text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	PG_RETURN_VOID();
+}
+
 static void
 tree_row(const char *name, const ProllyNodeRef *data,
 		 const ProllyValue *description, const char *unreadable, void *arg)

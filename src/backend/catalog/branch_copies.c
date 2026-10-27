@@ -1781,14 +1781,15 @@ taking_add(Taking *t, RelFileLocator loc, BranchKeptRelation *k)
 }
 
 static void
-taking_end(Taking *t)
+taking_end(Taking *t, uint64 *pages)
 {
 	uint64	   *ids = palloc0_array(uint64, Max(t->n, 1));
+	uint32	   *owned = palloc0_array(uint32, Max(t->n, 1));
 
 	/* (those taken noted even if a later one fails: to be let go of) */
 	PG_TRY();
 	{
-		bmap_root_capture_many(t->rels, t->n, ids);
+		bmap_root_capture_many(t->rels, t->n, ids, owned);
 	}
 	PG_FINALLY();
 	{
@@ -1800,7 +1801,11 @@ taking_end(Taking *t)
 	}
 	PG_END_TRY();
 	for (int i = 0; i < t->n; i++)
+	{
 		t->into[i]->snapshot = ids[i];
+		*pages += owned[i];
+	}
+	pfree(owned);
 	pfree(ids);
 	pfree(t->rels);
 	pfree(t->into);
@@ -1839,7 +1844,7 @@ heap_format(Form_pg_class c)
 static void
 keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 			const BranchKeptRelation *prior, int nprior,
-			BranchFreezePage freeze, Snapshot snapshot)
+			BranchFreezePage freeze, Snapshot snapshot, uint64 *pages)
 {
 	RelFileLocator live = class_locator(c, c->relfilenode);
 	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
@@ -1911,6 +1916,7 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 										  RBM_ZERO_ON_ERROR));
 
 	/* each page changed: frozen, and the copy's (a new block of its own) */
+	*pages += n;
 	for (uint32 i = 0; i < n; i++)
 	{
 		Buffer		buf;
@@ -1970,7 +1976,7 @@ static bool
 copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			BranchKeptRelation *kept, const BranchKeptRelation *release,
 			int nrelease, bool (*settled) (void *arg), void *arg,
-			BranchFreezePage freeze, Snapshot snapshot)
+			BranchFreezePage freeze, Snapshot snapshot, uint64 *pages)
 {
 	Relation	pg_class;
 	List	   *rows = NIL;
@@ -1978,6 +1984,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 	int			i = 0;
 	Taking		taking;
 
+	*pages = 0;
 	let_go_of_abandoned();
 	if (relids == NIL)
 		return true;
@@ -2019,7 +2026,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			if (freeze && heap_format(c))
 			{
 				k->relid = c->oid;
-				keep_frozen(c, k, prior, nprior, freeze, snapshot);
+				keep_frozen(c, k, prior, nprior, freeze, snapshot, pages);
 				continue;
 			}
 			for (int p = 0; p < nprior && !again; p++)
@@ -2039,7 +2046,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 				keep_now(c, k, &taking);
 		}
 		if (ok)
-			taking_end(&taking);
+			taking_end(&taking, pages);
 
 		/*
 		 * (let go of with the relations held against a copy made of kept

@@ -19,9 +19,9 @@
  *
  * A branch's pages are kept as of the last commits it was at, as the refs
  * record (their kept_commits()): those are kept states too, a table's
- * relations by snapshots of their storage, as immutable as a kept
- * checkout's however the branch moves on.  Their budget is
- * prolly.kept_commits, which the refs keep to.
+ * relations by roots of their storage, as immutable as a kept
+ * checkout's however the branch moves on.  Which commits keep them is
+ * the root retention's.
  *
  * The checkout sweep lets go of the kept branches past the budget, least
  * recently checked out first.  Recency is kept in shared memory, a slot
@@ -284,8 +284,8 @@ branches_visit(Snapshot snap, const ProllyKeptFilter *filter,
 			continue;
 		commits = lappend(commits, s);
 	}
-	if (PROLLY_HAS(dc.refs, kept_commits) && PROLLY_HAS(dc.refs, kept_holders) &&
-		prolly_kept_commits > 0)
+	if (PROLLY_HAS(dc.refs, kept_commit) && PROLLY_HAS(dc.refs, kept_holders) &&
+		debug_prolly_page_roots)
 	{
 		if (filter->commit != NULL)
 			PROLLY_CALL(dc.refs, kept_holders, filter->commit, NULL,
@@ -311,10 +311,21 @@ branches_visit(Snapshot snap, const ProllyKeptFilter *filter,
 			continue;
 		of.branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 		ReleaseSysCache(tup);
-		PROLLY_CALL(dc.refs, kept_commits, name, note_kept_commit, &k);
+		/* (each once, a seek: a branch may keep thousands) */
+		{
+			List	   *asked = NIL;
+
+			foreach_ptr(ProllyHash, c, h->commits)
+			{
+				if (hash_listed(asked, c))
+					continue;
+				asked = lappend(asked, c);
+				PROLLY_CALL(dc.refs, kept_commit, name, c, note_kept_commit,
+							&k);
+			}
+		}
 		foreach_ptr(ProllyKeptState, s, k.states)
-			if (hash_listed(h->commits, &s->commit))
-				commits = lappend(commits, s);
+			commits = lappend(commits, s);
 	}
 	foreach_ptr(ProllyKeptState, s, commits)
 	{

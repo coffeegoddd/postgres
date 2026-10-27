@@ -3,7 +3,7 @@
 -- (O(1), as a reset to the head does), then writes only the rows the head
 -- and the commit differ by: not those and every row changed since the
 -- head.  That is the reset a commit no longer kept takes: here, with only
--- the head kept (prolly.kept_commits = 1), every commit reset away from.
+-- the head kept (a window of one commit), every commit reset away from.
 -- (A restore carries the other kept commits' snapshots into the storage it
 -- gives a table, so with more kept they stay kept.)
 SELECT current_database() AS home \gset
@@ -25,7 +25,7 @@ $$;
 CREATE FUNCTION now_counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM counted()
 $$;
-SET prolly.kept_commits = 1;
+ALTER DATABASE kept_head_restore SET prolly.history_min_commits = 1;
 CREATE SCHEMA kh VERSIONED;
 CREATE TABLE kh.t (id bigint PRIMARY KEY, v int NOT NULL, w text NOT NULL);
 CREATE INDEX t_v ON kh.t (v);
@@ -301,7 +301,7 @@ FROM kh.n n;
 -- With two commits kept: a reset to b, not kept, given the head's pages,
 -- keeps b and the head (a's snapshot carried, or kept anew); a reset back
 -- to a then gives a's pages back, writing no row.
-SET prolly.kept_commits = 2;
+ALTER DATABASE kept_head_restore SET prolly.history_min_commits = 2;
 DROP TABLE kh.n;
 SELECT dolt_commit('-am', 'n dropped') IS NOT NULL AS committed;
  committed 
@@ -387,6 +387,6 @@ SELECT rows_digest() = :'at_a' AS at_a, clean(), indexes_valid();
  t    | t     | t
 (1 row)
 
-RESET prolly.kept_commits;
+ALTER DATABASE kept_head_restore RESET prolly.history_min_commits;
 \c :home
 DROP DATABASE kept_head_restore;

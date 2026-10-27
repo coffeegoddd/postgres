@@ -207,6 +207,12 @@ extern void prolly_window_check_missing(const ProllyHash *id);
 extern void prolly_window_init(void);
 
 /*
+ * The size setting name (prolly.history_*) as the database has it (ALTER
+ * DATABASE ... SET, never a session's), in bytes: 0 if it has none.
+ */
+extern int64 prolly_window_database_size(const char *name);
+
+/*
  * As prolly_window_check_missing(), and if the horizon holds any fragment,
  * an error that commit id, named but not in the store, may be past it:
  * for a commit named by its id, which the horizon's tops don't cover when

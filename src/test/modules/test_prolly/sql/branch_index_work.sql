@@ -65,7 +65,7 @@ SELECT (dolt_checkout('bix_new_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use kept');
 SELECT (dolt_checkout('main'))[1];
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
 :flush
 SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
@@ -81,7 +81,7 @@ SELECT (dolt_checkout('bix_old_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use estimated');
 SELECT (dolt_checkout('main'))[1];
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
 SELECT (dolt_checkout('bix_ff_' || :n))[1];
 UPDATE bix.t SET v = v + 1 WHERE id = 4;
@@ -105,7 +105,7 @@ SELECT (dolt_checkout('bix_new_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use kept');
 SELECT (dolt_checkout('main'))[1];
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
 :flush
 SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
@@ -121,7 +121,7 @@ SELECT (dolt_checkout('bix_old_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use estimated');
 SELECT (dolt_checkout('main'))[1];
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
 SELECT (dolt_checkout('bix_ff_' || :n))[1];
 UPDATE bix.t SET v = v + 1 WHERE id = 4;

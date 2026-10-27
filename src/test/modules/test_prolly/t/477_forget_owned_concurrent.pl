@@ -21,7 +21,7 @@ if ($ENV{enable_injection_points} ne 'yes')
 my $node = PostgreSQL::Test::Cluster->new('forget_owned_concurrent');
 $node->init;
 # (no branch's pages kept as of a commit, which would keep the commit)
-$node->append_conf('postgresql.conf', 'prolly.kept_commits = 0');
+$node->append_conf('postgresql.conf', 'debug_prolly_page_roots = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE DATABASE fo');
 $node->safe_psql('fo', 'CREATE EXTENSION test_prolly');

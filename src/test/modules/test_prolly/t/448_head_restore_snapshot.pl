@@ -23,10 +23,11 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 prolly_fold_worker = off
-prolly.kept_commits = 1
 });
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+# (a window of one commit: only the head keeps its root)
+sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 1});
 
 sql(q{CREATE EXTENSION test_prolly;
 	CREATE SCHEMA q VERSIONED;

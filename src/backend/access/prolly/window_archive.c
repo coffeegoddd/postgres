@@ -543,6 +543,7 @@ static int	action_setting = PROLLY_WINDOW_ARCHIVE;
 static char *warm_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
+static char *root_max_size_setting = NULL;
 static char *cold_batch_setting = NULL;
 static char *archive_timeout_setting = NULL;
 static char *archive_setting = NULL;
@@ -668,6 +669,11 @@ prolly_window_init(void)
 							   "Read as the database has it.",
 							   &max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_root_max_size",
+							   "The most the page roots of every branch's commits may hold (empty: no limit).",
+							   "Read as the database has it.  Past it, the oldest roots in the window are let go of first (never a tag's, nor a branch's newest); a move to a commit without one restores the nearest before it and writes the rows they differ by.",
+							   &root_max_size_setting, "", PGC_USERSET, 0,
+							   check_size, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_archive_timeout",
 							   "How long a sever waits for its archive to take the history severed and give it back (empty: ten minutes).",
 							   "Read as the database has it; past it, nothing is severed.",
@@ -741,6 +747,20 @@ database_span(const char *name)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("the database's %s isn't an interval: \"%s\"", name, v)));
 	return usec;
+}
+
+/* A size setting as the database has it (0: none, or not a size). */
+int64
+prolly_window_database_size(const char *name)
+{
+	char	   *v;
+	int64		bytes = 0;
+
+	window_init();
+	v = database_setting(name);
+	if (v == NULL || !parse_size(v, &bytes))
+		return 0;
+	return bytes;
 }
 
 static const char *const branch_settings[] = {"warm", "min_commits",

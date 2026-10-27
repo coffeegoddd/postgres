@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A commit's pages kept by a snapshot (prolly.kept_commits) are marked
+# A commit's pages kept by a snapshot (a root) are marked
 # shared in the buffers and written out as it's taken, one look at the
 # buffers for all its relations: each block looked up when they're few
 # beside the buffers, else a pass over them.  Both ways, a page changed

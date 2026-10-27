@@ -21,7 +21,7 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 prolly_fold_worker = off
-prolly.kept_commits = 0
+debug_prolly_page_roots = off
 });
 $node->start;
 

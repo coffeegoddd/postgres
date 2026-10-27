@@ -415,6 +415,12 @@ CREATE FUNCTION test_kept_commits(branch text)
 RETURNS TABLE (commit_id text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A retention pass of the branch's kept commits now, as a commit's keep
+-- runs one when it is due.
+CREATE FUNCTION test_retain_roots(branch text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The value of the refs' entry key (a tag, then a name).
 CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea

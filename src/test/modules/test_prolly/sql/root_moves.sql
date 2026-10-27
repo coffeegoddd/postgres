@@ -7,7 +7,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_moves;
-ALTER DATABASE root_moves SET prolly.kept_commits = 1000;
 ALTER DATABASE root_moves SET prolly.restore_min_changes = 0;
 \c root_moves
 SET client_min_messages = warning;
@@ -178,7 +177,7 @@ RESET prolly.root_interval_commits;
 
 -- a move to a commit older than any the branch keeps looks no further
 -- back than the oldest it keeps: a few commits read, not the history
-SET prolly.kept_commits = 2;
+ALTER DATABASE root_moves SET prolly.history_min_commits = 2;
 DO $$
 BEGIN
 	FOR i IN 1..20 LOOP
@@ -198,7 +197,7 @@ SELECT dolt_reset('--hard', dolt_hashof('HEAD~10'));
 SELECT pg_stat_force_next_flush();
 SELECT reads() - :reads_before < 40 AS few_commits_read;
 SELECT digest() = (SELECT d FROM digests WHERE n = 310) AS at_k10;
-RESET prolly.kept_commits;
+ALTER DATABASE root_moves RESET prolly.history_min_commits;
 
 \c :home
 DROP DATABASE root_moves;
