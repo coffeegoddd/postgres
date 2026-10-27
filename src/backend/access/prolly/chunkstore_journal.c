@@ -6588,6 +6588,232 @@ add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg,
 	pfree(keep);
 }
 
+/* a settle()'s queue of chunks to visit: an array, grown as needed */
+typedef struct RefQueue
+{
+	ProllyHash **queue;
+	int		   *tail;
+	int		   *max;
+} RefQueue;
+
+static void
+queue_ref(const ProllyHash *ref, void *arg)
+{
+	RefQueue   *rq = arg;
+
+	if (*rq->tail == *rq->max)
+	{
+		*rq->max *= 2;
+		*rq->queue = repalloc_huge(*rq->queue, sizeof(ProllyHash) * *rq->max);
+	}
+	(*rq->queue)[(*rq->tail)++] = *ref;
+}
+
+/* a settle()'s chunks, in the order found */
+typedef struct SettleSource
+{
+	ProllyChunkStore *s;
+	List	   *hashes;			/* ProllyHash * */
+	ListCell   *cur;
+} SettleSource;
+
+static bool
+settle_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	SettleSource *ss = arg;
+
+	while (ss->cur != NULL)
+	{
+		ProllyHash *h = lfirst(ss->cur);
+
+		ss->cur = lnext(ss->hashes, ss->cur);
+		resetStringInfo(data);
+		if (!journal_get(ss->s, h, data))
+			continue;
+		*hash = *h;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Is the chunk (key) the store's but in no settled file: in the journal,
+ * or a table file not settled?  (One in both is too: settling it again
+ * costs a copy, never a chunk.)
+ */
+static bool
+unsettled_has(ProllyChunkStore *s, const ProllyHash *key)
+{
+	ListCell   *lc;
+
+	if (jindex_has(s->ix, key) ||
+		hash_search(s->pending_index, key, HASH_FIND, NULL) != NULL)
+		return true;
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (!t->settled &&
+			PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The settled table file of m's (by its place in m) that has the chunk
+ * (key), or -1 if none has.
+ */
+static int
+settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
+{
+	ListCell   *lc;
+
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (!t->settled ||
+			!PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			continue;
+		for (int i = 0; i < m->nfiles; i++)
+		{
+			if (m->files[i].id == t->id)
+				return i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Settle what roots reach: every chunk they reach that no settled file
+ * holds, down to those one does (and what isn't here: a severed parent),
+ * written to a settled table file.  For chunks that only a settled file's
+ * chunks may name: a fragment of history a repair received, which the
+ * boundary commits name.  A default collection doesn't read settled
+ * files, so it would never find them otherwise, and would free them.
+ * Costs what it settles: a chunk is looked up in the journal's index and
+ * the few files not settled; only where the walk stops, at a settled
+ * chunk, are the settled files asked which has it.
+ */
+static void
+journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
+{
+	Manifest	m;
+	bool	   *keep;
+	SettleSource ss = {s, NIL, NULL};
+	ProllyHash *queue;
+	int			head = 0;
+	int			tail = 0;
+	int			max = Max(nroots, 64);
+	HASHCTL		ctl;
+	HTAB	   *seen;
+	StringInfoData data;
+	int			newest = -1;	/* the settled file of the newest
+								 * generations what is settled names */
+	uint32		epoch_lo;
+	uint32		epoch_hi;
+
+	xact_note(s);
+	lock_manifest(s, &m);
+	if (m.gc_generation != s->xact_generation)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("the chunk store was collected while the transaction ran"),
+				 errhint("Try the transaction again.")));
+	load_tables(s, true);
+	scan_journal(s);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly settle", 1024, &ctl,
+					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	initStringInfo(&data);
+	queue = MemoryContextAllocHuge(CurrentMemoryContext,
+								   sizeof(ProllyHash) * max);
+	for (int i = 0; i < nroots; i++)
+		queue[tail++] = roots[i];
+	while (head < tail)
+	{
+		ProllyHash	h = queue[head++];
+		ProllyHash	key;
+		bool		found;
+		RefQueue	rq;
+
+		CHECK_FOR_INTERRUPTS();
+		if (h.len == 0)
+			continue;
+		hash_key(&key, &h);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+		if (!unsettled_has(s, &key))
+		{
+			/* (settled, or not here at all: the walk stops) */
+			int			f = settled_file(s, &m, &key);
+
+			if (f >= 0 &&
+				(newest < 0 || m.files[f].epoch_lo > m.files[newest].epoch_lo))
+				newest = f;
+			continue;
+		}
+		resetStringInfo(&data);
+		if (!journal_get(s, &h, &data))
+			continue;
+		ss.hashes = lappend(ss.hashes, memcpy(palloc(sizeof(ProllyHash)), &h,
+											  sizeof(ProllyHash)));
+		/* (the queue's room reused once half of it is taken) */
+		if (head > max / 2)
+		{
+			memmove(queue, queue + head, sizeof(ProllyHash) * (tail - head));
+			tail -= head;
+			head = 0;
+		}
+		rq.queue = &queue;
+		rq.tail = &tail;
+		rq.max = &max;
+		prolly_chunk_references(data.data, data.len, queue_ref, &rq);
+	}
+
+	/*
+	 * Its generations: the newest of the settled chunks it names, so that
+	 * what names it (a boundary commit, which names those too) is of the
+	 * same or newer ones; else the oldest a settled file has; else the
+	 * next collection's.
+	 */
+	if (newest < 0)
+	{
+		for (int i = 0; i < m.nfiles; i++)
+		{
+			if (m.files[i].epoch_lo > 0 &&
+				(newest < 0 || m.files[i].epoch_lo < m.files[newest].epoch_lo))
+				newest = i;
+		}
+	}
+	if (newest >= 0)
+	{
+		epoch_lo = m.files[newest].epoch_lo;
+		epoch_hi = m.files[newest].epoch_hi;
+	}
+	else
+		epoch_lo = epoch_hi = m.gc_generation + 1;
+	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
+	for (int i = 0; i < m.nfiles; i++)
+		keep[i] = true;
+	ss.cur = list_head(ss.hashes);
+	write_table_file(s, &m, keep, MANIFEST_FILE_SETTLED, epoch_lo, epoch_hi,
+					 settle_next, &ss, false, NULL, false, 0);
+	pfree(keep);
+	pfree(queue);
+	pfree(data.data);
+	hash_destroy(seen);
+}
+
 static void
 journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
 {
@@ -7649,6 +7875,9 @@ struct ProllyChunkGc
 	int			nretained;		/* sealed segments not collected: a logical */
 	uint64	   *retained;		/* slot may still decode what was appended */
 	XLogRecPtr *retained_at;	/* to them (their sealed_at) */
+	HTAB	   *retained_chunks;	/* their chunks (ProllyHash), as
+									 * gc_retained() visited them */
+	bool		names_retained; /* a chunk copied names one of them */
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
@@ -8343,6 +8572,19 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 {
 	ProllyChunkStore *s = gc->s;
 
+	if (gc->nretained > 0 && gc->retained_chunks == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = gc->cxt;
+		gc->retained_chunks = hash_create("prolly collection retained chunks",
+										  1024, &ctl,
+										  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	}
+
 	for (int i = 0; i < gc->nretained; i++)
 	{
 		Segment		g;
@@ -8376,6 +8618,10 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 				record_hash_xid(rec, len, &h, &after, &xid) &&
 				!(TransactionIdIsValid(xid) && TransactionIdDidAbort(xid)))
 			{
+				ProllyHash	key;
+
+				hash_key(&key, &h);
+				(void) hash_search(gc->retained_chunks, &key, HASH_ENTER, NULL);
 				chunk = decoded_chunk(rec, len, after, g.path, &chunk_len);
 				visit(&h, chunk, chunk_len, arg);
 			}
@@ -8708,6 +8954,25 @@ gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
 	gcc->from.bytes = bytes;
 }
 
+/*
+ * A chunk a collection copies names ref: one of the segments it keeps as
+ * they are, for a logical slot, has it?  Then what it writes isn't
+ * settled: a later collection, of those segments too, must still find
+ * what the chunks it writes name.
+ */
+static void
+note_retained(const ProllyHash *ref, void *arg)
+{
+	ProllyChunkGc *gc = arg;
+	ProllyHash	key;
+
+	if (gc->names_retained || ref->len == 0)
+		return;
+	hash_key(&key, ref);
+	if (hash_search(gc->retained_chunks, &key, HASH_FIND, NULL) != NULL)
+		gc->names_retained = true;
+}
+
 static bool
 gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 {
@@ -8746,6 +9011,9 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("chunk in file \"%s\" doesn't match its hash",
 							f->path)));
+		if (gc->retained_chunks != NULL && !gc->names_retained)
+			prolly_chunk_references(gcc->chunk.data, gcc->chunk.len,
+									note_retained, gc);
 		return true;
 	}
 	return false;
@@ -8983,6 +9251,12 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	{
 		ManifestFile *f = lfirst(lc);
 
+		/* (naming what a logical slot keeps the segments of: not settled) */
+		if (gc->names_retained)
+		{
+			f->flags &= ~MANIFEST_FILE_SETTLED;
+			f->epoch_lo = f->epoch_hi = 0;
+		}
 		nm.files[nm.nfiles++] = *f;
 		written_bytes += f->size;
 	}
@@ -9496,6 +9770,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.table_files = journal_table_files,
 	.generations = journal_generations,
 	.epochs = journal_epochs,
+	.settle = journal_settle,
 	.shmem_size = journal_shmem_size,
 	.shmem_init = journal_shmem_init,
 	.copy_database = journal_copy_database,

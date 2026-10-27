@@ -467,6 +467,7 @@ tests += {
       't/484_minimal_shrink_crash.pl',
       't/491_restore_lock_autovacuum.pl',
       't/595_move_carries_statistics.pl',
+      't/605_gc_settled_closure.pl',
       't/610_ssi_fold_worker_xid.pl',
       't/625_history_window_auto.pl',
       't/629_history_auto_commits.pl',
