@@ -332,6 +332,20 @@ collection_due(void)
 		collected > s.settled * prolly_gc_growth_scale_factor;
 }
 
+/* Has anything been written since the last collection? */
+static bool
+anything_to_collect(void)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	Sizes		s = {0, 0, 0};
+
+	PROLLY_CALL(cs, segments, store, false, journal_segment, &s);
+	PROLLY_CALL(cs, table_files, store, settled_file, &s);
+	return s.segments + s.unsettled > 0;
+}
+
 /*
  * A collection is refused while another of the store runs (its lock tried,
  * never waited for): several workers find the same store due at once.
@@ -347,12 +361,31 @@ collection_due(void)
 /* The history window wants this visit's collection a full one. */
 static bool full_due = false;
 
+/*
+ * And a retire (after a fragment made), none of generations newer than
+ * retire_max_hi; and a seal (a batch boundary passed since the store's
+ * newest generation ended).
+ */
+static bool retire_wanted = false;
+static uint32 retire_max_hi = PG_UINT32_MAX;
+static uint32 retire_want = 0;
+static uint32 retire_max_hi_seen = 0;	/* (0: none may be taken now; the
+										 * retire asked for waits) */
+static bool seal_wanted = false;
+static bool retire_refused = false;	/* another collection ran meanwhile */
+static bool retire_errored = false; /* the retire raised an error */
+static bool retire_ran = false;	/* a retire ran, and swapped */
+
 static void
 sever(void)
 {
 	ProllyDatabaseComponents dc;
 
 	full_due = false;
+	retire_wanted = false;
+	retire_max_hi = PG_UINT32_MAX;
+	retire_want = 0;
+	seal_wanted = false;
 	prolly_database_components(&dc);
 	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, maintain))
 		return;
@@ -360,22 +393,156 @@ sever(void)
 	/* (asked here: a collection runs in a transaction that hasn't read) */
 	full_due = PROLLY_HAS(dc.history_window, collect_due) &&
 		PROLLY_CALL(dc.history_window, collect_due);
+	if (PROLLY_HAS(dc.history_window, retire_due))
+		retire_wanted = PROLLY_CALL(dc.history_window, retire_due,
+									&retire_max_hi, &retire_want);
+	seal_wanted = PROLLY_HAS(dc.history_window, seal_due) &&
+		PROLLY_CALL(dc.history_window, seal_due);
 }
 
+/*
+ * A retire, if one is worth running: the generations the reclamation
+ * chooses by the store's estimates of their garbage, within
+ * prolly.gc_retire_budget, none newer than the history window allows; true
+ * if it ran (it collects what a default collection would, too).
+ */
+static bool
+retire(const ProllyDatabaseComponents *dc)
+{
+	ProllyGcResult r;
+	uint32		max_hi = retire_max_hi;
+	uint32		want = retire_want;
+	uint32		lo;
+	uint32		hi;
+	bool		ran;
+
+	retire_max_hi = PG_UINT32_MAX;
+	retire_want = 0;
+	if (!PROLLY_HAS(dc->reclamation, retire) ||
+		!PROLLY_HAS(dc->reclamation, choose))
+		return false;
+	if (!PROLLY_CALL(dc->reclamation, choose,
+					 (uint64) prolly_gc_retire_budget * 1024, max_hi, want,
+					 &lo, &hi))
+		return false;
+	VacuumUpdateCosts();
+	VacuumCostBalance = 0;
+
+	/*
+	 * (in a subtransaction: one that fails is reported, the default
+	 * collection runs all the same, and the window waits before the next,
+	 * then falls back to a full collection, so a retire that keeps failing
+	 * never stops the store's collections)
+	 */
+	{
+		MemoryContext cxt = CurrentMemoryContext;
+		ResourceOwner owner = CurrentResourceOwner;
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
+		{
+			ran = PROLLY_CALL(dc->reclamation, retire, lo, hi, true, &r);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(cxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+			ereport(WARNING,
+					(errcode(edata->sqlerrcode),
+					 errmsg("automatic retire of generations %u to %u of database \"%s\" failed: %s",
+							lo, hi, get_database_name(MyDatabaseId),
+							edata->message),
+					 errhint("A default collection runs instead; the retire is tried again after a wait, and a full collection runs after several failures in a row.")));
+			FreeErrorData(edata);
+			retire_errored = true;
+			return false;
+		}
+		PG_END_TRY();
+	}
+	if (!ran)
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		retire_refused = true;
+		return true;			/* (another collection runs: it collects) */
+	}
+	retire_ran = true;
+	if (PROLLY_HAS(dc->refs, forget_records))
+		(void) PROLLY_CALL(dc->refs, forget_records);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic retire of generations %u to %u of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed",
+							 lo, hi, get_database_name(MyDatabaseId),
+							 (unsigned long long) r.chunks_kept,
+							 (unsigned long long) r.chunks_freed,
+							 (unsigned long long) r.bytes_freed)));
+	return true;
+}
+
+static void collect_now(void);
+
+/*
+ * The window's retire after a fragment is noted done once this visit's
+ * collection is, even when no retire was worth it: what the fragment left
+ * is spread too thin for one to pay, and waits until more is.  (Last: the
+ * note writes the refs, and a collection runs in a transaction that
+ * hasn't used the store.)
+ */
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
+	bool		wanted = retire_wanted;
+
+	retire_max_hi_seen = retire_max_hi;
+	retire_wanted = false;
+	retire_refused = false;
+	retire_errored = false;
+	retire_ran = false;
+	collect_now();
+	prolly_database_components(&dc);
+	if (dc.history_window == NULL)
+		return;
+	if (retire_errored)
+	{
+		if (PROLLY_HAS(dc.history_window, retire_failed))
+			PROLLY_CALL(dc.history_window, retire_failed);
+		return;
+	}
+	if (((wanted && !retire_refused && retire_max_hi_seen > 0) || retire_ran) &&
+		PROLLY_HAS(dc.history_window, retired))
+		PROLLY_CALL(dc.history_window, retired);
+}
+
+static void
+collect_now(void)
+{
+	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
 	bool		full = full_due;
+	bool		seal;
 
 	/*
 	 * (full where the history window wants severed history freed, no
-	 * oftener than it allows)
+	 * oftener than it allows, and the reclamation can't retire it; else a
+	 * retire, if the estimates say one is worth it)
 	 */
 	full_due = false;
 	prolly_database_components(&dc);
-	if (!full && !collection_due())
+	if (!full && retire(&dc))
+		return;
+	/* (a batch boundary passed: what came since settled on its own) */
+	seal = !full && seal_wanted && anything_to_collect();
+	seal_wanted = false;
+	if (!full && !seal && !retire_errored && !collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
@@ -393,7 +560,8 @@ collect(void)
 	if (PROLLY_HAS(dc.refs, forget_records))
 		(void) PROLLY_CALL(dc.refs, forget_records);
 	ereport(DEBUG1,
-			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+			(errmsg_internal("automatic %scollection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+							 full ? "full " : "",
 							 get_database_name(MyDatabaseId),
 							 (unsigned long long) r.chunks_kept,
 							 (unsigned long long) r.chunks_freed,

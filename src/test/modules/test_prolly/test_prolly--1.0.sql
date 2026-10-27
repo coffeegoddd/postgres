@@ -754,9 +754,10 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The generations the reclamation would retire now: the oldest thought at
 -- least half garbage, and those after it as much within budget bytes of
--- their files (NULL: prolly.gc_retire_budget's); NULLs if none.
+-- their files (NULL: prolly.gc_retire_budget's), none newer than max_hi
+-- (NULL: no limit), generation want taken as if due; NULLs if none.
 CREATE FUNCTION test_chunk_retire_choose(budget int8 DEFAULT NULL,
-	OUT lo int8, OUT hi int8)
+	max_hi int8 DEFAULT NULL, want int8 DEFAULT NULL, OUT lo int8, OUT hi int8)
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Note chunks as garbage, as a sever does: counted against the oldest
@@ -764,6 +765,15 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_chunk_note_garbage(hashes text[])
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The history window's answer for the background's next collection: a
+-- retire due (a fragment made since the last), the newest generation a
+-- retire may take now (NULL: no limit), the generation it is for (its
+-- fragments' tops'), and a seal due (a batch boundary
+-- passed since the newest generation ended).
+CREATE FUNCTION test_window_retire_due(OUT due boolean, OUT max_hi int8,
+	OUT want int8, OUT seal_due boolean)
+AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The oldest position a logical slot of the current database, or one of a
 -- standby's as its feedback said, may decode from (NULL: none): what a

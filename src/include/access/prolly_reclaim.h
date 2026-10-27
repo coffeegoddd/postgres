@@ -71,10 +71,12 @@ typedef struct ProllyReclaimRoutine
 	 * least half garbage (the store's estimates), with the next ones as
 	 * garbage after them while their files' bytes stay within budget (the
 	 * first taken whatever its size), none newer than max_hi.  Generations
-	 * whose files a conjoin merged go together.
+	 * whose files a conjoin merged go together.  want (0: none), the
+	 * generation of what a sever just let go of, is taken as if it were
+	 * thought half garbage, if its files fit the budget.
 	 */
-	bool		(*choose) (uint64 budget, uint32 max_hi, uint32 *lo,
-						   uint32 *hi);
+	bool		(*choose) (uint64 budget, uint32 max_hi, uint32 want,
+						   uint32 *lo, uint32 *hi);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \

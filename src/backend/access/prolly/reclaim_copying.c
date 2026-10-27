@@ -60,7 +60,10 @@
  * A retire collects only some generations' settled files.  choose() picks
  * them by the store's estimates of their garbage: the oldest generation
  * thought at least REWRITE_GARBAGE garbage, then those after it as much,
- * within prolly.gc_retire_budget of their files' bytes.  A file kept whole
+ * within prolly.gc_retire_budget of their files' bytes; and the
+ * generation a sever just let go of the newest commits of (its tops),
+ * whatever its estimate, if it fits the budget, so what a fragment's
+ * newest commits alone reached goes at once.  A file kept whole
  * has its garbage as found recorded, so it isn't chosen again until a
  * sever or another retire notes more: an old file is read again only once
  * it is half garbage, which bounds what reading it costs by twice what it
@@ -788,6 +791,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 static bool
 copying_retire(uint32 lo, uint32 hi, bool if_free, ProllyGcResult *result)
 {
+	INJECTION_POINT("prolly-gc-retire-begin", NULL);
 	return collect_scoped(PROLLY_GC_RETIRE, lo, hi, if_free, result);
 }
 
@@ -854,7 +858,8 @@ unit_due(const Unit *u)
  * within budget.  Cost: the manifest, and each file's section's head.
  */
 static bool
-copying_choose(uint64 budget, uint32 max_hi, uint32 *lo, uint32 *hi)
+copying_choose(uint64 budget, uint32 max_hi, uint32 want, uint32 *lo,
+			   uint32 *hi)
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store;
@@ -888,17 +893,19 @@ copying_choose(uint64 budget, uint32 max_hi, uint32 *lo, uint32 *hi)
 	for (int i = 0; i < n; i++)
 	{
 		Unit	   *u = &us.units[i];
+		bool		wanted = want > 0 && u->lo <= want && want <= u->hi &&
+			u->size <= budget;
 
 		if (u->hi > max_hi)
 			break;
 		if (first < 0)
 		{
-			if (!unit_due(u))
+			if (!unit_due(u) && !wanted)
 				continue;
 			first = i;
 			*lo = u->lo;
 		}
-		else if (!unit_due(u) || bytes + u->size > budget)
+		else if ((!unit_due(u) && !wanted) || bytes + u->size > budget)
 			break;
 		*hi = u->hi;
 		bytes += u->size;
