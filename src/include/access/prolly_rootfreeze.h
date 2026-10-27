@@ -31,7 +31,10 @@
  *   left, with xmin frozen, xmax invalid and no update chain; the others
  *   are dead line pointers, but for a HOT chain's root, which redirects to
  *   the version left.  Line pointers are never made unused, nor moved.
- *   The page's all-visible flag and prune hint are cleared.  Returns
+ *   The page's prune hint is cleared, and its all-visible flag set if no
+ *   dead line pointer is left (every version left is frozen, so the page
+ *   is all-visible and all-frozen: a restore of the root sets its
+ *   visibility map bits from the flag), cleared otherwise.  Returns
  *   whether any version was left.
  *
  * Provisional (v0).
