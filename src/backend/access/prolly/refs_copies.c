@@ -10256,9 +10256,14 @@ copies_remote_set(const char *name, const char *url)
 		char		tag = TAG_UPSTREAM;
 		ListCell   *lc;
 
-		/* its remote-tracking branches and the upstreams naming it go too */
+		/*
+		 * its remote-tracking branches, their head logs, and the upstreams
+		 * naming it go too
+		 */
 		initStringInfo(&prefix);
 		tracking_key(&prefix, name, NULL);
+		visit_prefix(prefix.data, prefix.len, collect_key, &keys);
+		prefix.data[0] = TAG_TRACKING_LOG;
 		visit_prefix(prefix.data, prefix.len, collect_key, &keys);
 		visit_prefix(&tag, 1, collect_upstream_of, &u);
 		keys = list_concat(keys, u.keys);
