@@ -27,7 +27,9 @@
  *   then those left, newest first (from_newest), the same way: a commit
  *   a branch was reset or amended away from is above what it has now.
  *   It never retires the newest root, nor a tagged commit's: a tag keeps
- *   its commit's root while it names it.  The work of a pass is in the
+ *   its commit's root while it names it.  A commit in another lineage's
+ *   window only is that lineage's to keep a root of (kept_elsewhere: it
+ *   does).  The work of a pass is in the
  *   commits it retires and passes over.
  *
  * Provisional (v0).
@@ -53,6 +55,7 @@ typedef struct ProllyRetainedRoot
 	TimestampTz kept_at;
 	bool		newest;			/* the branch's newest: never retired */
 	bool		tagged;			/* a tag names its commit: never retired */
+	bool		kept_elsewhere; /* another branch keeps its own root of it */
 	bool		from_newest;	/* judged in the pass from the newest */
 } ProllyRetainedRoot;
 

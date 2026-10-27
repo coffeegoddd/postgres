@@ -59,7 +59,6 @@ my $rr = $node->background_psql('postgres', on_error_stop => 0);
 $rr->query_safe(
 	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
 my $before = sql($counts);
-my $record = sql(q{SELECT octet_length(test_refs_value('Kmain'))});
 my $old = sql(q{SELECT pg_relation_filenode('q.t')});
 sql("SELECT dolt_reset('--hard', '$a')");
 cmp_ok(sql($counts), '>', $before,
@@ -85,13 +84,12 @@ is($rr->query_safe('SELECT sum(v) FROM q.t'), '1',
 	'a later transaction reads the commit\'s rows (and e\'s)');
 $rr->quit;
 # (the storage replaced is let go of by the next keep, no snapshot older
-# than the reset left: the record keeps it until then)
-cmp_ok(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), '>', $record,
+# than the reset left: the branch's entry for it keeps it until then)
+is(sql(qq{SELECT test_bmap_exists($old)}), 't',
 	'the storage replaced is kept by the branch');
 sql(q{UPDATE q.t SET v = 1 WHERE id = 1; SELECT dolt_commit('-am', 'd')});
-is(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), $record,
+is(sql(qq{SELECT test_bmap_exists($old)}), 'f',
 	'and let go of by the next keep, no snapshot older than the reset left');
-is(sql(qq{SELECT test_bmap_exists($old)}), 'f', 'its storage dropped');
 sql("SELECT dolt_reset('--hard', '$a')");
 
 # With no older snapshot, the head's pages are given back.

@@ -94,7 +94,7 @@ ALTER DATABASE root_holds RESET prolly.history_min_commits;
 SELECT count(*) AS main_kept FROM test_kept_commits('main');
  main_kept 
 -----------
-         2
+         1
 (1 row)
 
 -- side moves back to c3 again: by its own roots

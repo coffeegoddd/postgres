@@ -143,8 +143,10 @@ window_judge(void *pass, const ProllyRetainedRoot *root)
 
 	if (!any)
 		return kept ? PROLLY_ROOT_PASS : PROLLY_ROOT_RETIRE;
+	/* (another lineage's: its own root of it serves it, if it keeps one) */
 	if (!own)
-		return PROLLY_ROOT_PASS;
+		return root->kept_elsewhere && !kept ? PROLLY_ROOT_RETIRE :
+			PROLLY_ROOT_PASS;
 	/* (from the newest, only what is out of the window: a cap thins the oldest) */
 	if (root->from_newest || wp->excess <= 0)
 		return PROLLY_ROOT_STOP;

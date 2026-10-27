@@ -3732,6 +3732,8 @@ typedef struct KeptCommit
 								 * retired (0: not given one yet) */
 	char	   *owner;			/* the branch whose entry it was read as
 								 * (NULL: none yet) */
+	bool		severed;		/* retired for a sever: its commit and
+								 * trees no longer kept from collection */
 	int			ntables;
 	KeptTable  *tables;
 } KeptCommit;
@@ -4017,6 +4019,7 @@ kept_encode(StringInfo v, const KeptCommit *kc)
 	appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
 	appendBinaryStringInfo(v, &kc->height, sizeof(int64));
 	appendBinaryStringInfo(v, &kc->pages, sizeof(int64));
+	appendStringInfoChar(v, kc->severed ? 1 : 0);
 	put_hash(v, &kc->commit);
 	put_hash(v, &kc->baseline);
 	prolly_put_varint(v, kc->ntables);
@@ -4059,7 +4062,7 @@ kept_decode(const char *kp, int klen, const char *p, const char *end)
 		kc->seq = get_be64_at(nul + 2);
 	}
 	if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId) +
-							   sizeof(TimestampTz) + 2 * sizeof(int64)))
+							   sizeof(TimestampTz) + 2 * sizeof(int64) + 1))
 		kept_corrupt();
 	memcpy(&kc->retired, p, sizeof(FullTransactionId));
 	p += sizeof(FullTransactionId);
@@ -4071,6 +4074,7 @@ kept_decode(const char *kp, int klen, const char *p, const char *end)
 	p += sizeof(int64);
 	memcpy(&kc->pages, p, sizeof(int64));
 	p += sizeof(int64);
+	kc->severed = *p++ != 0;
 	p = get_hash(p, end, &kc->commit);
 	p = get_hash(p, end, &kc->baseline);
 	n = prolly_get_varint(&p, end);
@@ -4123,6 +4127,9 @@ kept_declare(const ProllyKey *key, const char *p, const char *end,
 		(nul[1] != KEPT_LIVE && nul[1] != KEPT_RETIRED))
 		return;
 	kc = kept_decode(kp, key->len, p, end);
+	/* (one retired for a sever keeps nothing: its history is cold) */
+	if (kc->severed)
+		return;
 	PROLLY_CALL(tree, value_reference, &kc->commit, 0, refs);
 	if (kc->baseline.len > 0)
 		PROLLY_CALL(tree, value_reference, &kc->baseline, 0, refs);
@@ -5364,6 +5371,45 @@ kept_orphans(const char *name, List *entries, int *n)
 	return out;
 }
 
+typedef struct OtherKeeper
+{
+	const char *name;
+	bool		found;
+} OtherKeeper;
+
+static bool
+note_other_keeper(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	OtherKeeper *ok = arg;
+	const char *p = (const char *) k->data + 1;
+	const char *end = (const char *) k->data + k->len;
+	ProllyHash	commit;
+	size_t		len = strlen(ok->name);
+
+	p = get_hash(p, end, &commit);
+	if ((size_t) (end - p) != len || memcmp(p, ok->name, len) != 0)
+	{
+		ok->found = true;
+		return false;
+	}
+	return true;
+}
+
+/* Does a branch but name keep commit's pages (a seek of their index)? */
+static bool
+kept_by_other(const char *name, const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	OtherKeeper ok = {name, false};
+
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_KEPT_OF);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_other_keeper, &ok);
+	pfree(prefix.data);
+	return ok.found;
+}
+
 /* Does a tag name commit (a seek of the tags' index)? */
 static bool
 commit_tagged(const ProllyHash *commit)
@@ -5416,6 +5462,7 @@ retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
 	r.newest = rs->left <= 1 ||
 		(rs->kept_now != NULL && same_hash(&o->commit, rs->kept_now));
 	r.tagged = commit_tagged(&o->commit);
+	r.kept_elsewhere = kept_by_other(rs->name, &o->commit);
 	r.from_newest = rs->from_newest;
 	switch (rs->rr->judge(rs->pass, &r))
 	{
@@ -5518,6 +5565,60 @@ retain_kept_branches(void)
 			continue;
 		kept_summary_get(name, &s);
 		retain_roots(name, &s, NULL, false);
+	}
+}
+
+typedef struct KeptOf
+{
+	List	   *names;
+} KeptOf;
+
+static bool
+note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	KeptOf	   *ko = arg;
+	const char *p = (const char *) k->data + 1;
+	const char *end = (const char *) k->data + k->len;
+	ProllyHash	commit;
+
+	p = get_hash(p, end, &commit);
+	ko->names = lappend(ko->names, pnstrdup(p, end - p));
+	return true;
+}
+
+/*
+ * Retire every branch's kept commit commit, severed: its history is past
+ * the horizon, cold, so its root is let go of by the branch's next keep,
+ * and its commit and trees no longer kept from collection meanwhile.
+ * The caller holds every ref.  A seek of the index of kept commits.
+ */
+static void
+copies_forget_kept(const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	KeptOf		ko = {NIL};
+
+	refs_init();
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_KEPT_OF);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
+	pfree(prefix.data);
+	foreach_ptr(char, name, ko.names)
+	{
+		KeptCommit *kc;
+
+		kept_forget_name(name);
+		if ((kc = kept_lookup(name, commit, true)) == NULL)
+			continue;
+		kc->retired = GetTopFullTransactionId();
+		kc->severed = true;
+		/* (naming none of the history: only its roots, to let go of) */
+		memset(&kc->commit, 0, sizeof(kc->commit));
+		memset(&kc->baseline, 0, sizeof(kc->baseline));
+		for (int t = 0; t < kc->ntables; t++)
+			memset(&kc->tables[t].data, 0, sizeof(kc->tables[t].data));
+		kept_put(name, list_make1(kc), NULL);
 	}
 }
 
@@ -13877,6 +13978,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.kept_commits = copies_kept_commits,
 	.retain_roots = copies_retain_roots,
 	.kept_commit = copies_kept_commit,
+	.forget_kept = copies_forget_kept,
 	.kept_holders = copies_kept_holders,
 	.recorded_relid = copies_recorded_relid,
 	.branch_creator = copies_branch_creator,

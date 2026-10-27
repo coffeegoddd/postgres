@@ -30,6 +30,8 @@ $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 is(sql('SHOW data_checksums'), 'on', 'data checksums are on');
+# (a window of two commits)
+sql('ALTER DATABASE postgres SET prolly.history_min_commits = 2');
 
 sql(q{
 	CREATE EXTENSION pg_buffercache;
@@ -44,7 +46,7 @@ sql(q{UPDATE app.t SET v = 1 WHERE id = 100});
 sql('CHECKPOINT');
 sql(q{SELECT dolt_commit('-am', 'c1')});
 
-# c1 let go of (two commits kept), its leaf freed, and taken as data pages
+# c1 let go of (out of the window), its leaf freed, and taken as data pages
 for my $r (2 .. 4)
 {
 	sql(qq{UPDATE app.t SET v = $r WHERE id = $r * 100});

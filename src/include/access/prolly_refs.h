@@ -982,6 +982,14 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*kept_commit) (const char *name, const ProllyHash *commit,
 								ProllyKeptCommitVisit visit, void *arg);
+
+	/*
+	 * Optional: commit is severed (past the history horizon): every
+	 * branch's kept commit of it retired, its root let go of by the
+	 * branch's next keep, and its commit and trees no longer kept from
+	 * collection.  The caller holds every ref.
+	 */
+	void		(*forget_kept) (const ProllyHash *commit);
 } ProllyRefsRoutine;
 
 /*
@@ -1047,9 +1055,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", "retain_roots", \
-	"kept_commit"
+	"kept_commit", "forget_kept"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK kept_commit
+#define PROLLY_REFS_LAST_CALLBACK forget_kept
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

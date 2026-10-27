@@ -3113,6 +3113,10 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	}
 
 	horizon_changed();
+	/* (outside the window no commit keeps its page root) */
+	if (PROLLY_HAS(dc.refs, forget_kept))
+		foreach(lc, plan.severed)
+			PROLLY_CALL(dc.refs, forget_kept, &((PlanCommit *) lfirst(lc))->id);
 
 	result->commits = f.commits;
 	result->edges = list_length(plan.edges);
