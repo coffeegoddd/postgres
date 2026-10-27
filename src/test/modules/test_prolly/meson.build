@@ -478,6 +478,7 @@ tests += {
       't/760_root_keep_retries.pl',
       't/763_root_share_released.pl',
       't/764_root_holds.pl',
+      't/765_root_retention_concurrent.pl',
       't/780_root_index_ams_writers.pl',
       't/781_root_vector_indexes.pl',
       't/762_root_freezing_redo.pl',

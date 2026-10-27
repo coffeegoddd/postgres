@@ -1786,13 +1786,20 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
  * its policy, with no merge base's floor and no other ref's keeping.
  * Quietly (no warning of a commit dated ahead: plan() and sever() give
  * that), and kept for the transaction while the refs stand as they did,
- * so a caller asking of each commit pays one walk.
+ * so a caller asking of each commit pays one walk: every lineage's window
+ * and the last branch's are kept apart, so a caller asking of both (root
+ * retention: a branch's own and every lineage's) walks each once.
  */
-static MemoryContext window_cxt = NULL;
-static HTAB *window_cache = NULL;
-static char *window_branch = NULL;
-static ProllyHash window_root;
-static LocalTransactionId window_lxid = InvalidLocalTransactionId;
+typedef struct WindowCache
+{
+	MemoryContext cxt;
+	HTAB	   *in;
+	char	   *branch;
+	ProllyHash	root;
+	LocalTransactionId lxid;
+} WindowCache;
+
+static WindowCache window_caches[2];	/* every lineage's, a branch's */
 
 static HTAB *
 window_commits(const char *branch)
@@ -1803,22 +1810,23 @@ window_commits(const char *branch)
 	MemoryContext old;
 	ProllyWindowPolicy db;
 
+	WindowCache *wc = &window_caches[branch == NULL ? 0 : 1];
+
 	window_init();
 	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &root);
-	if (window_cache != NULL && window_lxid == MyProc->vxid.lxid &&
-		same_id(&root, &window_root) &&
-		(branch == NULL ? window_branch == NULL :
-		 window_branch != NULL && strcmp(branch, window_branch) == 0))
-		return window_cache;
-	if (window_cxt == NULL)
-		window_cxt = AllocSetContextCreate(TopMemoryContext,
-										   "prolly window evaluated",
-										   ALLOCSET_DEFAULT_SIZES);
-	window_cache = NULL;
-	MemoryContextReset(window_cxt);
-	old = MemoryContextSwitchTo(window_cxt);
+	if (wc->in != NULL && wc->lxid == MyProc->vxid.lxid &&
+		same_id(&root, &wc->root) &&
+		(branch == NULL || strcmp(branch, wc->branch) == 0))
+		return wc->in;
+	if (wc->cxt == NULL)
+		wc->cxt = AllocSetContextCreate(TopMemoryContext,
+										"prolly window evaluated",
+										ALLOCSET_DEFAULT_SIZES);
+	wc->in = NULL;
+	MemoryContextReset(wc->cxt);
+	old = MemoryContextSwitchTo(wc->cxt);
 	in = id_set("prolly window", sizeof(ProllyHash));
-	window_branch = branch ? pstrdup(branch) : NULL;
+	wc->branch = branch ? pstrdup(branch) : NULL;
 	MemoryContextSwitchTo(old);
 	sever_clock = DT_NOBEGIN;
 	memset(&plan, 0, sizeof(plan));
@@ -1848,9 +1856,9 @@ window_commits(const char *branch)
 			(void) set_add(in, &pc->id);
 	hash_destroy(plan.commits);
 	hash_destroy(plan.head_ids);
-	window_cache = in;
-	window_root = root;
-	window_lxid = MyProc->vxid.lxid;
+	wc->in = in;
+	wc->root = root;
+	wc->lxid = MyProc->vxid.lxid;
 	return in;
 }
 

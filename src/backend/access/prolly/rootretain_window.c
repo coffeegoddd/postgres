@@ -114,7 +114,7 @@ window_has(HTAB *set, const ProllyHash *commit)
  * back to a commit it was reset away from is O(1) too.
  */
 static void *
-window_begin(const char *branch, int64 excess)
+window_begin(const char *branch, int64 excess, bool windows)
 {
 	ProllyDatabaseComponents dc;
 	WindowPass *wp = palloc0(sizeof(WindowPass));
@@ -122,7 +122,7 @@ window_begin(const char *branch, int64 excess)
 
 	wp->excess = excess;
 	prolly_database_components(&dc);
-	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, window) ||
+	if (!windows || dc.history_window == NULL || !PROLLY_HAS(dc.history_window, window) ||
 		!PROLLY_HAS(dc.history_window, policy))
 		return wp;
 	PROLLY_CALL(dc.history_window, policy, branch, &p);
@@ -145,8 +145,7 @@ window_judge(void *pass, const ProllyRetainedRoot *root)
 		return kept ? PROLLY_ROOT_PASS : PROLLY_ROOT_RETIRE;
 	/* (another lineage's: its own root of it serves it, if it keeps one) */
 	if (!own)
-		return root->kept_elsewhere && !kept ? PROLLY_ROOT_RETIRE :
-			PROLLY_ROOT_PASS;
+		return kept ? PROLLY_ROOT_PASS : PROLLY_ROOT_RETIRE_IF_KEPT;
 	/* (from the newest, only what is out of the window: a cap thins the oldest) */
 	if (root->from_newest || wp->excess <= 0)
 		return PROLLY_ROOT_STOP;
@@ -156,16 +155,18 @@ window_judge(void *pass, const ProllyRetainedRoot *root)
 	return PROLLY_ROOT_RETIRE;
 }
 
-static void
+static int64
 window_end(void *pass)
 {
 	WindowPass *wp = pass;
+	int64		left = wp->excess;
 
 	if (wp->own)
 		hash_destroy(wp->own);
 	if (wp->any)
 		hash_destroy(wp->any);
 	pfree(wp);
+	return left;
 }
 
 const ProllyRootRetentionRoutine prolly_rootretain_window = {

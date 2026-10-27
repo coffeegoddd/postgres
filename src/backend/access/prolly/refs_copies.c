@@ -3751,9 +3751,11 @@ typedef struct KeptSummary
 	int64		keeps;			/* keeps since the last retention pass */
 	TimestampTz last_at;		/* the last keep's time (0: none) */
 	int64		last_height;	/* and its commit's height */
+	int64		stuck;			/* bytes held when a pass for the cap last
+								 * found nothing more to retire (-1: none) */
 } KeptSummary;
 
-#define KEPT_SUMMARY_FIELDS	7
+#define KEPT_SUMMARY_FIELDS	8
 
 static bool commit_height(const ProllyHash *id, int64 *height);
 
@@ -3928,6 +3930,7 @@ kept_summary_get(const char *name, KeptSummary *s)
 	memset(s, 0, sizeof(*s));
 	s->next_seq = 1;
 	s->lowest = -1;
+	s->stuck = -1;
 	initStringInfo(&key);
 	initStringInfo(&v);
 	kept_summary_key(&key, name);
@@ -3946,6 +3949,7 @@ kept_summary_get(const char *name, KeptSummary *s)
 		s->keeps = (int64) f[4];
 		s->last_at = (TimestampTz) f[5];
 		s->last_height = (int64) f[6];
+		s->stuck = (int64) f[7];
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -3967,6 +3971,7 @@ kept_summary_put(const char *name, const KeptSummary *s)
 	put_be64(&v, (uint64) s->keeps);
 	put_be64(&v, (uint64) s->last_at);
 	put_be64(&v, (uint64) s->last_height);
+	put_be64(&v, (uint64) s->stuck);
 	refs_put(key.data, key.len, &v);
 	pfree(key.data);
 	pfree(v.data);
@@ -5371,43 +5376,44 @@ kept_orphans(const char *name, List *entries, int *n)
 	return out;
 }
 
-typedef struct OtherKeeper
+typedef struct KeptOf
 {
-	const char *name;
-	bool		found;
-} OtherKeeper;
+	List	   *names;
+} KeptOf;
 
-static bool
-note_other_keeper(const ProllyKey *k, const ProllyValue *v, void *arg)
-{
-	OtherKeeper *ok = arg;
-	const char *p = (const char *) k->data + 1;
-	const char *end = (const char *) k->data + k->len;
-	ProllyHash	commit;
-	size_t		len = strlen(ok->name);
+static bool note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg);
 
-	p = get_hash(p, end, &commit);
-	if ((size_t) (end - p) != len || memcmp(p, ok->name, len) != 0)
-	{
-		ok->found = true;
-		return false;
-	}
-	return true;
-}
-
-/* Does a branch but name keep commit's pages (a seek of their index)? */
+/*
+ * Does a branch but name keep commit's pages, held against its own
+ * keeps and passes until the transaction ends?  Each branch the index of
+ * kept commits names is tried, never waited for (one in a keeping
+ * transaction now is passed over: its pass may be letting go of its
+ * own), and its entry read again once held.  So two branches' passes
+ * can't each let go of their root on the strength of the other's: the
+ * second waits for the first's branch, and finds its entry retired.
+ */
 static bool
 kept_by_other(const char *name, const ProllyHash *commit)
 {
 	StringInfoData prefix;
-	OtherKeeper ok = {name, false};
+	KeptOf		ko = {NIL};
 
 	initStringInfo(&prefix);
 	appendStringInfoChar(&prefix, TAG_KEPT_OF);
 	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_other_keeper, &ok);
+	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
 	pfree(prefix.data);
-	return ok.found;
+	foreach_ptr(char, other, ko.names)
+	{
+		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
+			continue;
+		if (kept_lookup(other, commit, false) != NULL)
+		{
+			INJECTION_POINT("prolly-root-kept-elsewhere", NULL);
+			return true;
+		}
+	}
+	return false;
 }
 
 /* Does a tag name commit (a seek of the tags' index)? */
@@ -5447,6 +5453,7 @@ retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
 								(const char *) v->data,
 								(const char *) v->data + v->len);
 	ProllyRetainedRoot r;
+	ProllyRootVerdict verdict;
 
 	/*
 	 * (commits of the same height, as one amended or made again after a
@@ -5462,9 +5469,12 @@ retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
 	r.newest = rs->left <= 1 ||
 		(rs->kept_now != NULL && same_hash(&o->commit, rs->kept_now));
 	r.tagged = commit_tagged(&o->commit);
-	r.kept_elsewhere = kept_by_other(rs->name, &o->commit);
 	r.from_newest = rs->from_newest;
-	switch (rs->rr->judge(rs->pass, &r))
+	verdict = rs->rr->judge(rs->pass, &r);
+	if (verdict == PROLLY_ROOT_RETIRE_IF_KEPT)
+		verdict = kept_by_other(rs->name, &o->commit) ? PROLLY_ROOT_RETIRE :
+			PROLLY_ROOT_PASS;
+	switch (verdict)
 	{
 		case PROLLY_ROOT_RETIRE:
 			if (r.newest || r.tagged)
@@ -5503,24 +5513,33 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	StringInfoData prefix;
 	int64		excess = 0;
 	int64		cap;
+	int64		left;
+	bool		due;
 
 	prolly_database_components(&dc);
 	if (dc.root_retention == NULL || !PROLLY_HAS(dc.root_retention, judge) ||
 		s->nlive <= 1)
 		return;
+	due = force || dc.root_retention->due(name, s->nlive, s->keeps);
+
+	/*
+	 * (past the cap, a pass thins without the windows' walk; one that found
+	 * nothing more to thin isn't tried again till what the branch holds
+	 * changes)
+	 */
 	cap = dc.root_retention->max_bytes();
-	if (cap > 0)
+	if (cap > 0 && (due || s->stuck != s->bytes))
 		excess = kept_total_bytes() - cap;
-	if (!force && excess <= 0 &&
-		!dc.root_retention->due(name, s->nlive, s->keeps))
+	if (!due && excess <= 0)
 		return;
 	memset(&rs, 0, sizeof(rs));
 	rs.rr = dc.root_retention;
 	rs.name = name;
 	rs.kept_now = kept_now;
 	rs.left = s->nlive;
-	rs.pass = rs.rr->begin(name, excess);
-	s->keeps = 0;
+	rs.pass = rs.rr->begin(name, excess, due);
+	if (due)
+		s->keeps = 0;
 	initStringInfo(&prefix);
 	kept_prefix(&prefix, name, KEPT_LIVE);
 
@@ -5539,9 +5558,14 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	rs.stopping = false;
 	kept_forget_name(name);
 	visit_prefix_while(prefix.data, prefix.len, true, retain_one, &rs);
+	left = rs.rr->end(rs.pass);
 	kept_put(name, rs.retire, s);
 	pfree(prefix.data);
-	rs.rr->end(rs.pass);
+	if ((excess > 0 && left > 0 ? s->bytes : -1) != s->stuck)
+	{
+		s->stuck = excess > 0 && left > 0 ? s->bytes : -1;
+		kept_summary_put(name, s);
+	}
 }
 
 /* The passes due of the branches the transaction kept commits of. */
@@ -5567,11 +5591,6 @@ retain_kept_branches(void)
 		retain_roots(name, &s, NULL, false);
 	}
 }
-
-typedef struct KeptOf
-{
-	List	   *names;
-} KeptOf;
 
 static bool
 note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
