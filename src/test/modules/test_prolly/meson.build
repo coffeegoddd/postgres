@@ -168,6 +168,7 @@ tests += {
       'node_cache',
       'commit_cache',
       'head_log',
+      'history_horizon',
       'store_sizes',
       'storage_breakdown',
       'get_many',

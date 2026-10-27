@@ -137,6 +137,10 @@
  *				   it and the date of its last (8 bytes big-endian each)
  *	'l' remote NUL branch
  *				-> a remote-tracking branch's head log, as a branch's
+ *	'S' space key
+ *				-> an entry another component keeps here (side_put()), in
+ *				   its space (a byte): the history window's horizon; none
+ *				   names a chunk
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
@@ -313,6 +317,7 @@
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 #define TAG_HEAD_LOG	'L'	/* a branch's head log: its tree */
 #define TAG_TRACKING_LOG 'l'	/* a remote-tracking branch's */
+#define TAG_SIDE		'S'	/* another component's entries, by space */
 /*
  * Indexes of other entries, each kept with them, so that a lookup by what
  * they hold is a seek of the refs, not a read of every branch's entries;
@@ -340,9 +345,10 @@
  * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
  * case folded; 20: head logs, and a head's moves not yet in its log
- * after the transaction that moved it.
+ * after the transaction that moved it; 21: other components' entries
+ * (the history horizon).
  */
-#define REFS_FORMAT		"20"
+#define REFS_FORMAT		"21"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -5986,8 +5992,14 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 	int			nitems = 0;
 
 	refs_init();
-	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+	if (id->len == 0)
 		return false;
+	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+	{
+		/* (one past the history horizon: said so, with how to repair it) */
+		prolly_window_check_missing(id);
+		return false;
+	}
 	ref_of(id, &ref);
 	memset(info, 0, sizeof(*info));
 	info->id = *id;
@@ -11448,6 +11460,224 @@ copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
 }
 
 /* ------------------------------------------------------------------------
+ * Other components' entries
+ * ------------------------------------------------------------------------
+ */
+
+static void
+side_key(StringInfo out, char space, const ProllyKey *key)
+{
+	appendStringInfoChar(out, TAG_SIDE);
+	appendStringInfoChar(out, space);
+	if (key)
+		appendBinaryStringInfo(out, (const char *) key->data, key->len);
+}
+
+static bool
+copies_side_get(char space, const ProllyKey *key, StringInfo value)
+{
+	StringInfoData k;
+	bool		found;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	found = refs_get(k.data, k.len, value);
+	pfree(k.data);
+	return found;
+}
+
+static void
+copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
+{
+	StringInfoData k;
+	StringInfoData v;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	if (value)
+	{
+		v.data = (char *) value->data;
+		v.len = value->len;
+		v.maxlen = value->len + 1;
+		v.cursor = 0;
+	}
+	refs_put(k.data, k.len, value ? &v : NULL);
+	pfree(k.data);
+}
+
+typedef bool (*SideVisit) (const ProllyKey *key, const ProllyValue *value,
+						   void *arg);
+
+/* A side scan of the refs tree root, its nodes read through renv. */
+static void
+scan_side(const ProllyNodeRef *rootp, const ProllyTreeEnv *renv, char space,
+		  const ProllyKey *from, ScanDirection direction, SideVisit visit,
+		  void *arg)
+{
+	ProllyNodeRef root = *rootp;
+	ProllyTreeCursor *c;
+	StringInfoData start;
+	char		prefix[2] = {TAG_SIDE, space};
+	ProllyKey	k;
+	ProllyValue v;
+
+	initStringInfo(&start);
+	side_key(&start, space, from);
+	/*
+	 * (backward from none: from the space's end, past every key of it: its
+	 * prefix then more 0xff bytes than any key has, whatever the space's
+	 * byte is)
+	 */
+	if (from == NULL && ScanDirectionIsBackward(direction))
+	{
+		Size		max = PROLLY_CALL(tree, key_max, env.chunk_format,
+									  env.hash);
+
+		for (Size i = 0; i <= max; i++)
+			appendStringInfoChar(&start, (char) 0xff);
+	}
+	c = PROLLY_CALL(tree, cursor_open, renv, &root, CurrentMemoryContext);
+	{
+		ProllyKey	seek = {(const uint8 *) start.data, start.len};
+
+		PROLLY_CALL(tree, cursor_seek, c, &seek, direction);
+	}
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		ProllyKey	own;
+
+		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
+			break;
+		own.data = k.data + 2;
+		own.len = k.len - 2;
+		if (!visit(&own, &v, arg))
+			break;
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(start.data);
+}
+
+static void
+copies_side_scan(char space, const ProllyKey *from, ScanDirection direction,
+				 SideVisit visit, void *arg)
+{
+	ProllyNodeRef root;
+
+	if (refs_root(&root))
+		scan_side(&root, &env, space, from, direction, visit, arg);
+}
+
+/* A store of nothing but a reader's chunks: what side_scan_at() reads. */
+typedef struct ReaderStore
+{
+	ProllyChunkRead read;
+	void	   *arg;
+} ReaderStore;
+
+static bool
+reader_get(ProllyChunkStore *store, const ProllyHash *hash, StringInfo out)
+{
+	ReaderStore *rs = (ReaderStore *) store;
+
+	return rs->read(rs->arg, hash, out);
+}
+
+static bool
+reader_has(ProllyChunkStore *store, const ProllyHash *hash)
+{
+	StringInfoData data;
+	bool		found;
+
+	initStringInfo(&data);
+	found = reader_get(store, hash, &data);
+	pfree(data.data);
+	return found;
+}
+
+static const ProllyChunkStoreRoutine reader_store = {
+	.info = {
+		.iface = PROLLY_IFACE_CHUNK_STORE,
+		.name = "reader",
+		.description = "the chunks a reader gives",
+	},
+	.get = reader_get,
+	.has = reader_has,
+};
+
+static void
+first_child(const ProllyHash *ref, void *arg)
+{
+	ProllyHash *first = arg;
+
+	if (first->len == 0)
+		*first = *ref;
+}
+
+/*
+ * Is root a refs tree of this format, as the reader has it?  Its leftmost
+ * path read, each node one of the format's, down to the first key, the
+ * format's entry.  (A store's root may be something else in a test of the
+ * store alone.)
+ */
+static bool
+reader_refs_root(ReaderStore *rs, const ProllyHash *root)
+{
+	ProllyHash	at = *root;
+	StringInfoData data;
+	bool		ok = false;
+
+	initStringInfo(&data);
+	for (int depth = 0; depth < 64; depth++)
+	{
+		ProllyChunkNode node;
+
+		resetStringInfo(&data);
+		if (!rs->read(rs->arg, &at, &data) ||
+			!PROLLY_CALL(env.chunk_format, open, (const uint8 *) data.data,
+						 data.len, &node) || node.nitems == 0)
+			break;
+		if (node.level == 0)
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+
+			PROLLY_CALL(env.chunk_format, item_get, &node, 0, &k, &v, &flags);
+			ok = k.len == 1 && k.data[0] == TAG_FORMAT &&
+				v.len == strlen(REFS_FORMAT) &&
+				memcmp(v.data, REFS_FORMAT, v.len) == 0;
+			break;
+		}
+		memset(&at, 0, sizeof(at));
+		prolly_chunk_references(data.data, data.len, first_child, &at);
+		if (at.len == 0)
+			break;
+	}
+	pfree(data.data);
+	return ok;
+}
+
+static void
+copies_side_scan_at(const ProllyHash *root, ProllyChunkRead read,
+					void *read_arg, char space, const ProllyKey *from,
+					ScanDirection direction, SideVisit visit, void *arg)
+{
+	ReaderStore rs = {read, read_arg};
+	ProllyTreeEnv renv;
+	ProllyNodeRef r;
+
+	refs_init();
+	if (root->len == 0 || !reader_refs_root(&rs, root))
+		return;
+	renv = env;
+	renv.chunk_store = &reader_store;
+	renv.chunks = (ProllyChunkStore *) &rs;
+	renv.counters = NULL;
+	r.hash = *root;
+	scan_side(&r, &renv, space, from, direction, visit, arg);
+}
+
+/* ------------------------------------------------------------------------
  * Head logs
  *
  * Each branch's head log is its head's moves in order, each with its date
@@ -12025,4 +12255,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches_folded = copies_branches_folded,
 	.head_at = copies_head_at,
 	.head_moves = copies_head_moves,
+	.side_get = copies_side_get,
+	.side_put = copies_side_put,
+	.side_scan = copies_side_scan,
+	.side_scan_at = copies_side_scan_at,
 };

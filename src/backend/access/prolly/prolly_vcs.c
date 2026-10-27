@@ -372,3 +372,151 @@ prolly_head_at(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(hash_to_text(&m.commit));
 }
+
+static const ProllyWindowRoutine *
+database_window(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (dc.history_window == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this database's configuration has no history window")));
+	return dc.history_window;
+}
+
+static Datum
+hashes_datum(const ProllyHash *hashes, int n)
+{
+	Datum	   *d = palloc_array(Datum, Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+		d[i] = PointerGetDatum(hash_to_text(&hashes[i]));
+	return PointerGetDatum(construct_array_builtin(d, n, TEXTOID));
+}
+
+/*
+ * dolt_history_drop(before timestamptz)
+ *	returns record (fragment bigint, commits bigint, boundary text[],
+ *					chunks bigint, bytes bigint)
+ *
+ * Sever the history before before and let it go, archiving none of it:
+ * every branch keeps its commits dated at or after it, its head, and the
+ * commits down to its merge bases with the other branches; every commit a
+ * ref names is kept.  Hashes don't change: the boundary commits still name
+ * the parents severed, and the horizon records the fragment, deleted.  The
+ * next collection frees what only the fragment reached; repair can bring
+ * it back from any remote or clone that has it.  The database owner's.
+ */
+Datum
+dolt_history_drop(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	TimestampTz before = PG_GETARG_TIMESTAMPTZ(0);
+	ProllyWindowResult r;
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(w, sever, PROLLY_WINDOW_DELETE, &before, &r);
+	values[2] = hashes_datum(r.boundary, r.nboundary);
+	values[0] = Int64GetDatum(r.fragment);
+	nulls[0] = r.fragment == 0;
+	values[1] = Int64GetDatum(r.commits);
+	values[3] = Int64GetDatum(r.chunks);
+	values[4] = Int64GetDatum(r.bytes);
+	tuple = heap_form_tuple(BlessTupleDesc(tupdesc), values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+static void
+horizon_row(const ProllyWindowFragment *f, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[12];
+	bool		nulls[12] = {0};
+
+	values[0] = Int64GetDatum(f->number);
+	values[1] = CStringGetTextDatum(f->deleted ? "deleted" : "archived");
+	values[2] = TimestampTzGetDatum(f->severed_at);
+	values[3] = TimestampTzGetDatum(f->oldest);
+	values[4] = TimestampTzGetDatum(f->newest);
+	values[5] = Int64GetDatum(f->commits);
+	values[6] = Int64GetDatum(f->chunks);
+	values[7] = Int64GetDatum(f->bytes);
+	values[8] = PointerGetDatum(hash_to_text(&f->root));
+	values[9] = PointerGetDatum(hash_to_text(&f->digest));
+	if (f->location)
+		values[10] = CStringGetTextDatum(f->location);
+	else
+		nulls[10] = true;
+	values[11] = hashes_datum(f->tops, f->ntops);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * prolly_history_horizon()
+ *	returns setof (fragment bigint, state text, severed_at timestamptz,
+ *				   oldest timestamptz, newest timestamptz, commits bigint,
+ *				   chunks bigint, bytes bigint, root text, digest text,
+ *				   location text, tops text[])
+ *
+ * The history horizon's fragments, newest first.
+ */
+Datum
+prolly_history_horizon(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyWindowRoutine *w = database_window();
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(w, fragments, horizon_row, rsinfo);
+	return (Datum) 0;
+}
+
+static void
+plan_row(ProllyWindowItemKind kind, const ProllyHash *commit,
+		 const ProllyHash *other, const char *why, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+	static const char *const kinds[] = {"severed", "boundary", "pinned"};
+
+	values[0] = CStringGetTextDatum(kinds[kind]);
+	values[1] = PointerGetDatum(hash_to_text(commit));
+	if (other)
+		values[2] = PointerGetDatum(hash_to_text(other));
+	else
+		nulls[2] = true;
+	if (why)
+		values[3] = CStringGetTextDatum(why);
+	else
+		nulls[3] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * prolly_history_plan(before timestamptz)
+ *	returns setof (kind text, commit_hash text, parent_hash text, why text)
+ *
+ * What a sever before before would do, doing none of it: each commit it
+ * would sever, each boundary commit with the parent it would no longer
+ * keep, and each commit kept past the window and why (a ref's, a merge
+ * base's).
+ */
+Datum
+prolly_history_plan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyWindowRoutine *w = database_window();
+	TimestampTz before = PG_GETARG_TIMESTAMPTZ(0);
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(w, plan, &before, plan_row, rsinfo);
+	return (Datum) 0;
+}

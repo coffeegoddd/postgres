@@ -1,0 +1,145 @@
+-- The history horizon: history before a date severed without rewriting a
+-- commit.  The boundary commits still name their parents; the horizon
+-- records the fragment beyond them, and a collection frees what only it
+-- reached.  Listings (dolt_log, history tables) stop at the horizon; a read
+-- of a severed commit's content says it is past it and how to repair it.
+-- Every commit a ref names (a tag's) is kept, and so is every commit down
+-- to the merge base of two branches.
+
+SELECT current_database() AS home \gset
+-- (a database of its own: its history is only this test's)
+CREATE DATABASE regress_history_horizon;
+\c regress_history_horizon
+
+-- err(q): q's error, hashes masked
+CREATE FUNCTION hh_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+
+CREATE SCHEMA hh VERSIONED;
+CREATE TABLE hh.t (id int PRIMARY KEY, v text);
+-- main: c1 .. c6, a commit a day; feature from c4; tag v1 at c2
+CREATE FUNCTION hh_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+INSERT INTO hh.t VALUES (1, 'c1');
+SELECT hh_commit('c1', 1) AS c1 \gset
+UPDATE hh.t SET v = 'c2';
+SELECT hh_commit('c2', 2) AS c2 \gset
+SELECT dolt_tag('v1', :'c2');
+UPDATE hh.t SET v = 'c3';
+INSERT INTO hh.t SELECT g, repeat('x', 200) FROM generate_series(100, 600) g;
+SELECT hh_commit('c3', 3) AS c3 \gset
+UPDATE hh.t SET v = 'c4';
+DELETE FROM hh.t WHERE id >= 100;
+SELECT hh_commit('c4', 4) AS c4 \gset
+SELECT dolt_branch('feature');
+UPDATE hh.t SET v = 'c5';
+SELECT hh_commit('c5', 5) AS c5 \gset
+UPDATE hh.t SET v = 'c6';
+SELECT hh_commit('c6', 6) AS c6 \gset
+SELECT dolt_checkout('feature');
+INSERT INTO hh.t VALUES (2, 'f1');
+SELECT hh_commit('f1', 7) AS f1 \gset
+SELECT dolt_checkout('main');
+
+-- names(): the commits' names, for showing hashes
+CREATE TABLE hh_names (hash text PRIMARY KEY, name text);
+INSERT INTO hh_names VALUES (:'c1', 'c1'), (:'c2', 'c2'), (:'c3', 'c3'),
+	(:'c4', 'c4'), (:'c5', 'c5'), (:'c6', 'c6'), (:'f1', 'f1');
+CREATE FUNCTION hh_name(h text) RETURNS text LANGUAGE sql AS $$
+	SELECT coalesce((SELECT name FROM hh_names WHERE hash = h), h)
+$$;
+
+-- The plan before the sixth day: main keeps c6, and c5 and c4 down to its
+-- merge base with feature (c4); the tag keeps c2.  c3 and c1 are severed.
+SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
+FROM prolly_history_plan('2020-01-06 00:00+00')
+ORDER BY kind, commit, parent;
+
+-- Nothing severed yet: planning changes nothing.
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+
+-- A sever rolled back leaves no horizon.
+BEGIN;
+SELECT fragment, commits FROM dolt_history_drop('2020-01-06 00:00+00');
+ROLLBACK;
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+
+-- Only the database's owner severs.
+CREATE ROLE regress_hh_other;
+GRANT ALL ON SCHEMA public TO regress_hh_other;
+SET ROLE regress_hh_other;
+SELECT hh_err($$SELECT dolt_history_drop('2020-01-06 00:00+00')$$) AS other;
+RESET ROLE;
+
+-- A collection first, so that what the next frees is the fragment's.
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+
+SELECT fragment, commits,
+	   array(SELECT hh_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
+	   chunks > 0 AS has_chunks
+FROM dolt_history_drop('2020-01-06 00:00+00');
+-- (and not in the transaction that severed)
+BEGIN;
+SELECT fragment FROM dolt_history_drop('2020-01-05 00:00+00');
+SELECT hh_err('SELECT prolly_gc(true)') AS same_transaction;
+ROLLBACK;
+
+SELECT fragment, state, oldest, newest, commits, location,
+	   array(SELECT hh_name(t) FROM unnest(tops) t ORDER BY 1) AS tops,
+	   length(root) AS root_len, length(digest) AS digest_len
+FROM prolly_history_horizon();
+
+-- Hashes are unchanged; the log stops at the horizon, with a notice.
+SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
+SELECT hh_name(commit_hash) AS commit FROM dolt_log('v1');
+SELECT hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent
+FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c2')
+ORDER BY 1, 2;
+SELECT count(*) AS history_rows FROM dolt_history_table(NULL::hh.t) h
+WHERE (h.row).id = 1;
+
+-- The collection frees what only the fragment reached.
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+
+-- A read of a severed commit says it is past the horizon.
+SELECT hh_err(format('SELECT prolly_root_hash(%L)', :'c3')) AS root_c3;
+SELECT hh_err($$SELECT count(*) FROM dolt_diff('main~3', 'main', NULL::hh.t)$$) AS diff_past;
+-- (c3's id is c4's to give; what c3 names is past)
+SELECT hh_name(dolt_hashof('main~3')) AS main_3,
+	   hh_err($$SELECT dolt_hashof('main~4')$$) AS hashof_past;
+
+-- What is kept still reads: the tag's commit, the window's.
+SELECT v FROM dolt_at('v1', NULL::hh.t) WHERE id = 1;
+SELECT v FROM dolt_at(:'c4', NULL::hh.t) WHERE id = 1;
+
+-- A merge of the branches finds its base, kept.
+SELECT (dolt_merge('feature', '-m', 'merged'))[4] AS merged;
+INSERT INTO hh_names VALUES (dolt_hashof('main'), 'merge');
+SELECT id, v FROM hh.t ORDER BY id;
+
+-- A second sever builds on the horizon: its fragment stops at the first's.
+-- (feature merged and gone, its merge base pins nothing; the commits the
+-- branch's pages are kept as of are refs' commits, pinned)
+SELECT dolt_branch('-D', 'feature');
+SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
+FROM prolly_history_plan('2020-01-07 00:00+00')
+WHERE kind <> 'pinned' OR hh_name(commit_hash) ~ '^[cf][0-9]$'
+ORDER BY kind, commit, parent;
+SELECT fragment, commits,
+	   array(SELECT hh_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary
+FROM dolt_history_drop('2020-01-07 00:00+00');
+SELECT fragment, commits,
+	   array(SELECT hh_name(t) FROM unnest(tops) t ORDER BY 1) AS tops
+FROM prolly_history_horizon();
+SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
+
+\c :home
+DROP DATABASE regress_history_horizon;
+DROP ROLE regress_hh_other;

@@ -4606,6 +4606,9 @@ log_walk(List *starts)
 		{
 			LogEntry   *p;
 
+			/* (a listing stops at the history horizon) */
+			if (prolly_window_stops_at(&e->info.parents[i]))
+				continue;
 			key = prolly_hash_key(&e->info.parents[i]);
 			p = hash_search(seen, &key, HASH_ENTER, &found);
 			if (!found)

@@ -65,6 +65,7 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/prolly_chunkformat.h"
 #include "access/prolly_config.h"
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
@@ -95,7 +96,32 @@ typedef struct Mark
 	uint64		spill_written;	/* and written */
 	uint8		hash_len;
 	StringInfoData buf;
+	HTAB	   *cut;			/* CutChunk, by hash: a boundary commit's
+								 * chunks, with the parents not followed */
+	HTAB	   *cut_slots;		/* CutSlot, by slot: the same, collected */
 } Mark;
+
+/*
+ * A chunk of a boundary commit of the history horizon (prolly_window.h):
+ * what it names but the parents the horizon severed is marked.
+ */
+typedef struct CutChunk
+{
+	ProllyHash	hash;			/* key */
+	List	   *parents;		/* ProllyHash *, not followed */
+} CutChunk;
+
+typedef struct CutSlot
+{
+	uint64		slot;			/* key */
+	CutChunk   *chunk;
+} CutSlot;
+
+typedef struct CutMark
+{
+	struct Mark *mk;
+	List	   *parents;
+} CutMark;
 
 static void
 mark_slot(Mark *mk, uint64 slot)
@@ -265,6 +291,178 @@ mark_named(Mark *mk, const char *data, Size len)
 #endif
 }
 
+static bool
+same_hash(const ProllyHash *a, const ProllyHash *b)
+{
+	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+static void
+mark_ref_uncut(const ProllyHash *hash, void *arg)
+{
+	CutMark    *cm = arg;
+	ListCell   *lc;
+
+	foreach(lc, cm->parents)
+		if (same_hash(lfirst(lc), hash))
+			return;
+	mark_ref(hash, cm->mk);
+}
+
+/*
+ * Mark what data declares, a boundary commit's chunk (cut) leaving out
+ * the parents the horizon severed.
+ */
+static void
+mark_named_cut(Mark *mk, const char *data, Size len, CutChunk *cut)
+{
+	CutMark		cm;
+
+	if (cut == NULL)
+	{
+		mark_named(mk, data, len);
+		return;
+	}
+	cm.mk = mk;
+	cm.parents = cut->parents;
+	prolly_chunk_references(data, len, mark_ref_uncut, &cm);
+}
+
+/* Is this chunk (by its hash, or slot) one of a boundary commit's? */
+static CutChunk *
+cut_of_hash(Mark *mk, const ProllyHash *hash)
+{
+	ProllyHash	key;
+
+	if (mk->cut == NULL)
+		return NULL;
+	memset(&key, 0, sizeof(key));
+	key.len = hash->len;
+	memcpy(key.bytes, hash->bytes, hash->len);
+	return hash_search(mk->cut, &key, HASH_FIND, NULL);
+}
+
+static CutChunk *
+cut_of_slot(Mark *mk, uint64 slot)
+{
+	CutSlot    *cs;
+
+	if (mk->cut_slots == NULL)
+		return NULL;
+	cs = hash_search(mk->cut_slots, &slot, HASH_FIND, NULL);
+	return cs ? cs->chunk : NULL;
+}
+
+typedef struct CutBuild
+{
+	Mark	   *mk;
+	List	   *children;
+} CutBuild;
+
+/*
+ * A chunk collected, read as the collection reads (by its slot): what the
+ * horizon's edges are read through, a collection reading nothing its
+ * transaction would note as used.  False for one not collected.
+ */
+static bool
+collected_read(void *arg, const ProllyHash *hash, StringInfo out)
+{
+	Mark	   *mk = arg;
+	int64		slot = PROLLY_CALL(mk->cs, gc_find, mk->gc, hash);
+
+	if (slot < 0)
+		return false;
+	PROLLY_CALL(mk->cs, gc_read, mk->gc, (uint64) slot, out);
+	return true;
+}
+
+static void
+note_child(const ProllyHash *ref, void *arg)
+{
+	CutBuild   *cb = arg;
+
+	cb->children = lappend(cb->children,
+						   memcpy(palloc(sizeof(ProllyHash)), ref,
+								  sizeof(ProllyHash)));
+}
+
+/*
+ * Note a horizon edge: each chunk of the boundary commit's tree (its
+ * root's, and down an inner node to its children) is a cut chunk, not to
+ * follow to the parent.
+ */
+static void
+note_cut(const ProllyHash *boundary, const ProllyHash *parent, void *arg)
+{
+	CutBuild   *cb = arg;
+	Mark	   *mk = cb->mk;
+	const ProllyChunkFormatRoutine *format = prolly_chunkformat_lookup("basic");
+	List	   *todo = list_make1(memcpy(palloc(sizeof(ProllyHash)), boundary,
+										 sizeof(ProllyHash)));
+	StringInfoData data;
+
+	if (mk->cut == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(CutChunk);
+		ctl.hcxt = CurrentMemoryContext;
+		mk->cut = hash_create("prolly collection cut chunks", 16, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		ctl.keysize = sizeof(uint64);
+		ctl.entrysize = sizeof(CutSlot);
+		mk->cut_slots = hash_create("prolly collection cut slots", 16, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	initStringInfo(&data);
+	while (todo != NIL)
+	{
+		ProllyHash *h = llast(todo);
+		ProllyChunkNode node;
+		ProllyHash	key;
+		CutChunk   *cc;
+		bool		found;
+
+		todo = list_delete_last(todo);
+		resetStringInfo(&data);
+		/* (a boundary commit gone already names nothing) */
+		if (!collected_read(mk, h, &data) ||
+			!PROLLY_CALL(format, open, (const uint8 *) data.data, data.len,
+						 &node))
+			continue;
+		if (node.level > 0)
+		{
+			cb->children = NIL;
+			prolly_chunk_references(data.data, data.len, note_child, cb);
+			todo = list_concat(todo, cb->children);
+			continue;
+		}
+		memset(&key, 0, sizeof(key));
+		key.len = h->len;
+		memcpy(key.bytes, h->bytes, h->len);
+		cc = hash_search(mk->cut, &key, HASH_ENTER, &found);
+		if (!found)
+		{
+			int64		slot = PROLLY_CALL(mk->cs, gc_find, mk->gc, h);
+
+			cc->parents = NIL;
+			if (slot >= 0)
+			{
+				uint64		s = (uint64) slot;
+				CutSlot    *cs = hash_search(mk->cut_slots, &s, HASH_ENTER,
+											 NULL);
+
+				cs->chunk = cc;
+			}
+		}
+		cc->parents = lappend(cc->parents,
+							  memcpy(palloc(sizeof(ProllyHash)), parent,
+									 sizeof(ProllyHash)));
+	}
+	pfree(data.data);
+}
+
 /*
  * A root outside the refs.  (The first may come before any chunk told how
  * long the store's hashes are: a store with no root yet.)
@@ -297,7 +495,7 @@ drain(Mark *mk)
 	{
 		resetStringInfo(&mk->buf);
 		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
-		mark_named(mk, mk->buf.data, mk->buf.len);
+		mark_named_cut(mk, mk->buf.data, mk->buf.len, cut_of_slot(mk, slot));
 
 		/* (a chunk read costs as a page missed, where a delay is active) */
 		if (VacuumCostActive)
@@ -317,7 +515,7 @@ mark_new(const ProllyHash *hash, const char *data, Size len, void *arg)
 	if (data == NULL)
 		mark_hash(mk, hash);
 	else
-		mark_named(mk, data, len);
+		mark_named_cut(mk, data, len, cut_of_hash(mk, hash));
 }
 
 static void
@@ -406,6 +604,27 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	initStringInfo(&mk.buf);
 	PROLLY_CALL(cs, gc_files, mk.gc, count_file, &nfiles);
 	keep = palloc0(sizeof(bool) * Max(nfiles, 1));
+
+	/*
+	 * The history horizon's edges, as the root at the seal has them: its
+	 * boundary commits' parents aren't followed from them (they are
+	 * archived, or were let go of).  Only a full collection, which
+	 * collects every file, reads them: a default one keeps what the
+	 * boundary reaches, as its settled files keep what they reach.
+	 */
+	if (full && root.len > 0)
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		if (dc.history_window != NULL && PROLLY_HAS(dc.history_window, edges))
+		{
+			CutBuild	cb = {&mk, NIL};
+
+			PROLLY_CALL(dc.history_window, edges, &root, collected_read, &mk,
+						note_cut, &cb);
+		}
+	}
 
 	/* what the root as of the seal reaches */
 	if (root.len > 0)
