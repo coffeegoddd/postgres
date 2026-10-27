@@ -1731,7 +1731,18 @@ commits beyond the edges, down to an earlier fragment's, with its tops,
 the commits outside it its commits name (its stops), its identity (the
 root of a tree of its commits keyed by date then id, the same wherever the
 same commits are severed) and a digest over the sorted hashes of the
-chunks its commits reach.
+chunks born in it: what each of its commits makes that its first parent
+lacks (the canonicalizer's walk_changes() between the two roots, the
+tree's diff_nodes() between their dependencies, and the commit's own
+nodes), found by the commits alone, so a chunk resurrected or
+deduplicated counts where a commit has it and its parent doesn't.  What
+a boundary commit makes over the parent a sever cuts is kept beside the
+horizon ('D'), since that parent is gone once collected and the boundary
+commit may fall in a later fragment.  So a sever's fragment, its digest,
+what it sends to the archive and what a repair checks cost what its
+commits changed, not the database, but the first fragment's, whose
+oldest commit makes its whole tree.  Freeing what a sever cut is still a
+full collection's, which marks what is live: O(the database).
 
 What is kept: every commit a ref names (a branch's head, a tag's, a
 remote-tracking branch's, a stash's, a merge's or rebase's in progress, a

@@ -119,7 +119,7 @@ ALTER DATABASE regress_history_window SET prolly.history_cold_batch = '1 day';
 SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent < chunks AS sent_only_new
+	   sent = chunks AS sent_what_was_born
 FROM dolt_history_sever();
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;

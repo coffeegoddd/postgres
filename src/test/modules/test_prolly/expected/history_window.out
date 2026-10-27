@@ -252,10 +252,10 @@ SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
 
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent < chunks AS sent_only_new
+	   sent = chunks AS sent_what_was_born
 FROM dolt_history_sever();
- action  | fragment | commits | boundary | sent_only_new 
----------+----------+---------+----------+---------------
+ action  | fragment | commits | boundary | sent_what_was_born 
+---------+----------+---------+----------+--------------------
  archive |        2 |       1 | {a6}     | t
 (1 row)
 

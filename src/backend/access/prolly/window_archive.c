@@ -13,18 +13,21 @@
  *	'f' number			-> a fragment (8 bytes big-endian; see
  *						   fragment_encode())
  *	'n'					-> the next fragment's number
+ *	'D' boundary piece	-> what a boundary commit makes over its first
+ *						   parent, severed (see fragment_closure()): a
+ *						   piece (4 bytes big-endian) of it, each hash an
+ *						   id with its bytes complemented
  *
  * None names a chunk: a collection asks edges() which parents not to
  * follow from which commits, and keeps nothing for a fragment.
  *
- * What is kept.  Every commit the refs name is kept (a branch's head, a
- * tag's, a remote-tracking branch's, a stash's, a merge's or rebase's in
- * progress, a pin's, a kept commit's).  From each branch head (but a
- * session's detached one, which is a ref only) a walk keeps the commits
- * its window does (dated at or after the cut), and every commit on the
- * way to its merge base with each other branch head (one at least as high
- * as the lowest of those bases): merging two live branches never needs a
- * severed commit.  The commits kept are the window; an edge from one to a
+ * What is kept.  From every commit the refs name (a branch's head, a
+ * tag's, a remote-tracking branch's, a session's detached head, a
+ * stash's, a merge's or rebase's in progress, a pin's, a kept commit's) a
+ * walk keeps the commits its window does (dated at or after the cut), and
+ * every commit on the way to every merge base of a branch with each other
+ * ref (one at least as high as the lowest of those bases): merging never
+ * needs a severed commit.  The commits kept are the window; an edge from one to a
  * parent outside it is a boundary edge, and the parent a top of the
  * fragment, which is every commit the tops reach outside the window and
  * the horizon there was already.
@@ -32,10 +35,13 @@
  * A fragment's identity (its root) is the root hash of a tree of its
  * commits' index entries, keyed by date then id, built as any tree is:
  * the same commits give the same root wherever they are severed.  Its
- * digest is a hash over the sorted hashes of the chunks its commits reach
- * (their own trees, their roots' and dependencies'), which repair
+ * digest is a hash over the sorted hashes of the chunks born in it (what
+ * each of its commits makes that its first parent lacks), which repair
  * recomputes, from the same tops down to the same stops (the commits
- * outside the fragment its commits name), once the chunks are back.
+ * outside the fragment its commits name), once the chunks are back.  A
+ * sever and an archive cost what the fragment's commits changed, not the
+ * database, but for the first fragment, whose oldest commit made its
+ * whole tree.  A full collection still marks what is live to free it.
  *
  * Severing changes no commit: hashes stay, and the boundary commits still
  * name their parents.  Readers that list history (dolt_log, history
@@ -87,7 +93,7 @@
 #define KEY_FRAGMENT	'f'
 #define KEY_NEXT		'n'
 
-#define FRAGMENT_VERSION	1
+#define FRAGMENT_VERSION	2
 #define FRAGMENT_DELETED	0x01
 
 /* The horizon's lock: an object lock in the database, of this class. */
@@ -1318,22 +1324,6 @@ typedef struct Closure
 	StringInfoData buf;
 } Closure;
 
-static bool
-closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
-{
-	Closure    *c = arg;
-
-	if (!set_add(c->seen, &node->hash))
-		return false;
-	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)),
-										  &node->hash, sizeof(ProllyHash)));
-	resetStringInfo(&c->buf);
-	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, &node->hash,
-					&c->buf))
-		c->bytes += c->buf.len;
-	return true;
-}
-
 static int
 hash_cmp(const ListCell *a, const ListCell *b)
 {
@@ -1345,10 +1335,156 @@ hash_cmp(const ListCell *a, const ListCell *b)
 	return memcmp(x->bytes, y->bytes, x->len);
 }
 
+#define KEY_DELTA		'D'
+#define DELTA_PIECE		128		/* hashes a delta entry holds */
+
+/* A visit of what a commit makes: noted once each, never descended past. */
+static bool
+note_node(Closure *c, const ProllyHash *h)
+{
+	if (!set_add(c->seen, h))
+		return false;
+	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)), h,
+										  sizeof(ProllyHash)));
+	resetStringInfo(&c->buf);
+	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, h, &c->buf))
+		c->bytes += c->buf.len;
+	return true;
+}
+
+static bool
+closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	return note_node(arg, &node->hash);
+}
+
 /*
- * What a fragment's commits reach, without crossing to other commits:
- * each one's own tree, its root's (the canonicalizer's walk) and its
- * dependencies'.  The digest is a hash over their hashes, sorted.
+ * What commit c (info) makes that its first parent (pinfo; NULL: it has
+ * none, or none here) lacks: its own tree's nodes, then its root's and its
+ * dependencies' as they differ from the parent's (the canonicalizer's
+ * walk_changes(), the tree's diff_nodes()), or all of them for a commit
+ * with no parent.  The nodes born at c, by its history: whatever the store
+ * held, a node c has and its parent lacks is c's, so what is resurrected
+ * or deduplicated counts, and the set is a function of the two commits
+ * alone.  (A merge's is against its first parent: more, never less.)
+ */
+static void
+commit_created(Closure *c, const ProllyHash *id, const ProllyCommitInfo *info,
+			   const ProllyCommitInfo *pinfo)
+{
+	ProllyNodeRef ref;
+
+	ref.hash = *id;
+	(void) PROLLY_CALL(tree, walk, &tree_env, &ref, closure_visit, c);
+	PROLLY_CALL(dc.canonicalizer, walk_changes, pinfo ? &pinfo->root : NULL,
+				&info->root, closure_visit, c);
+	if (info->has_dependencies)
+		PROLLY_CALL(tree, diff_nodes, &tree_env,
+					pinfo && pinfo->has_dependencies ? &pinfo->dependencies : NULL,
+					&info->dependencies, closure_visit, c);
+}
+
+static void
+delta_key(StringInfo k, const ProllyHash *id, uint32 piece)
+{
+	appendStringInfoChar(k, KEY_DELTA);
+	put_id(k, id);
+	put_be64(k, piece);
+}
+
+/*
+ * Keep what boundary commit b makes that its parent (pinfo) lacks, beside
+ * the horizon: its parent is severed now, and gone once collected, so a
+ * later sever, or a repair's check, of the fragment b falls in finds b's
+ * born nodes here.  Kept in pieces, each hash complemented.
+ */
+static void
+keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
+		   const ProllyCommitInfo *pinfo)
+{
+	Closure		c = {0};
+	StringInfoData k;
+	StringInfoData v;
+	uint32		piece = 0;
+	int			n = 0;
+
+	c.seen = id_set("prolly boundary delta", sizeof(ProllyHash));
+	initStringInfo(&c.buf);
+	commit_created(&c, b, binfo, pinfo);
+	initStringInfo(&k);
+	initStringInfo(&v);
+	foreach_ptr(ProllyHash, h, c.chunks)
+	{
+		put_value_id(&v, h);
+		if (++n == DELTA_PIECE || foreach_current_index(h) == list_length(c.chunks) - 1)
+		{
+			ProllyKey	key;
+			ProllyValue value;
+
+			resetStringInfo(&k);
+			delta_key(&k, b, piece++);
+			key.data = (const uint8 *) k.data;
+			key.len = k.len;
+			value.data = (const uint8 *) v.data;
+			value.len = v.len;
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+			resetStringInfo(&v);
+			n = 0;
+		}
+	}
+	pfree(k.data);
+	pfree(v.data);
+	pfree(c.buf.data);
+	hash_destroy(c.seen);
+}
+
+/* A boundary commit's kept delta, noted into c; false if none is kept. */
+static bool
+kept_delta(Closure *c, const ProllyHash *id)
+{
+	bool		found = false;
+
+	for (uint32 piece = 0;; piece++)
+	{
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		const char *p;
+		const char *end;
+
+		initStringInfo(&k);
+		initStringInfo(&v);
+		delta_key(&k, id, piece);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		if (!PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v))
+			break;
+		found = true;
+		p = v.data;
+		end = v.data + v.len;
+		while (p < end)
+		{
+			ProllyHash	h;
+
+			p = get_value_id(p, end, &h);
+			(void) note_node(c, &h);
+		}
+		pfree(k.data);
+		pfree(v.data);
+	}
+	return found;
+}
+
+/*
+ * What a fragment's commits make: each one's nodes that its first parent
+ * lacks (commit_created()), its first parent read here, or past the
+ * horizon its delta kept when the parent was severed (a commit with
+ * neither: all it reaches).  Every chunk the fragment holds that history
+ * before it doesn't, born in it: O(what it changed), not O(the database),
+ * but for the first fragment, whose oldest commit makes its whole tree.
+ * The digest is a hash over their hashes, sorted.  (Chunks are found by
+ * the commit that made them, so a fragment's are those born in it, by the
+ * generation they were born in.)
  */
 static void
 fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
@@ -1364,7 +1500,8 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 	{
 		ProllyHash *id = lfirst(lc);
 		ProllyCommitInfo info;
-		ProllyNodeRef ref;
+		ProllyCommitInfo pinfo;
+		bool		parent_here;
 
 		CHECK_FOR_INTERRUPTS();
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
@@ -1375,13 +1512,14 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(id))));
 		}
-		ref.hash = *id;
-		if (!PROLLY_CALL(tree, walk, &tree_env, &ref, closure_visit, &c))
-			continue;
-		PROLLY_CALL(dc.canonicalizer, walk, &info.root, closure_visit, &c);
-		if (info.has_dependencies)
-			(void) PROLLY_CALL(tree, walk, &tree_env, &info.dependencies,
-							   closure_visit, &c);
+		parent_here = info.nparents > 0 &&
+			PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+						&info.parents[0]) &&
+			PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo);
+		if (parent_here || info.nparents == 0)
+			commit_created(&c, id, &info, parent_here ? &pinfo : NULL);
+		else if (!kept_delta(&c, id))
+			commit_created(&c, id, &info, NULL);
 	}
 	list_sort(c.chunks, hash_cmp);
 	ctx = PROLLY_CALL(tree_env.hash, begin, CurrentMemoryContext);
@@ -1682,6 +1820,23 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 		ProllyValue value = {(const uint8 *) v.data, v.len};
 
 		PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+	}
+	/*
+	 * (what each boundary commit makes over its first parent, severed
+	 * now, kept for when it falls in a fragment itself)
+	 */
+	foreach(lc, plan.edges)
+	{
+		ProllyHash *pair = lfirst(lc);
+		ProllyCommitInfo binfo;
+		ProllyCommitInfo pinfo;
+
+		if (PROLLY_CALL(dc.refs, commit_get, &pair[0], &binfo) &&
+			binfo.nparents > 0 &&
+			binfo.parents[0].len == pair[1].len &&
+			memcmp(binfo.parents[0].bytes, pair[1].bytes, pair[1].len) == 0 &&
+			PROLLY_CALL(dc.refs, commit_get, &pair[1], &pinfo))
+			keep_delta(&pair[0], &binfo, &pinfo);
 	}
 	foreach(lc, plan.edges)
 	{
@@ -2029,6 +2184,20 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
+static bool
+collect_delta_key(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	List	  **keys = arg;
+	StringInfo	k;
+
+	if (key->len < 1 || key->data[0] != KEY_DELTA)
+		return false;
+	k = makeStringInfo();
+	appendBinaryStringInfo(k, (const char *) key->data, key->len);
+	*keys = lappend(*keys, k);
+	return true;
+}
+
 /*
  * Repair the newest nfragments of the horizon's fragments (all, if < 0),
  * newest first: each one's chunks received from source (a remote's name
@@ -2165,6 +2334,22 @@ archive_repair(const char *source, int nfragments)
 						(long long) r->f.commits,
 						timestamptz_to_str(r->f.oldest),
 						timestamptz_to_str(r->f.newest), url)));
+	}
+	/* (the horizon empty, no boundary's delta is wanted any more) */
+	if (repaired > 0 && fragment_records() == NIL)
+	{
+		char		d = KEY_DELTA;
+		ProllyKey	from = {(const uint8 *) &d, 1};
+		List	   *keys = NIL;
+
+		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+					ForwardScanDirection, collect_delta_key, &keys);
+		foreach_ptr(StringInfoData, dk, keys)
+		{
+			ProllyKey	key = {(const uint8 *) dk->data, dk->len};
+
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		}
 	}
 	return repaired;
 }
