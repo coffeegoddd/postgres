@@ -34,12 +34,14 @@
  *	'U' name	-> the branch's upstream: a remote, NUL, its branch
  *	'X' name	-> the transaction that last moved the branch's head (its
  *				   FullTransactionId, native byte order), then its head
- *				   log (see "Head logs"): its tree's root, count of moves
- *				   and last move's date, as a remote-tracking branch's
- *				   log's entry holds them, the count of moves not yet in
- *				   the tree (a byte), then each such move's date (8 bytes
- *				   big-endian) and commit (its hash's length and the
- *				   hash's bytes complemented)
+ *				   log (see "Head logs"): the count of moves not yet in
+ *				   its tree (a byte, its high bit set if the tree has
+ *				   any), the tree's root, count of moves and last move's
+ *				   date if so (as a remote-tracking branch's log's entry
+ *				   holds them), then each such move's date (the first's 8
+ *				   bytes big-endian, each after it a varint of the time
+ *				   since the one before) and commit (its hash's length and
+ *				   the hash's bytes complemented)
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
@@ -318,6 +320,7 @@
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 #define TAG_TRACKING_LOG 'l'	/* a remote-tracking branch's head log */
 #define TAG_SIDE		'S'	/* another component's entries, by space */
+#define TAIL_TREE		0x80	/* in a mover entry: its head log's tree follows */
 /*
  * Indexes of other entries, each kept with them, so that a lookup by what
  * they hold is a seek of the refs, not a read of every branch's entries;
@@ -650,8 +653,9 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			(void) declare_hashes(p, end, 1, refs);
 			break;
 		case TAG_MOVER:			/* (after the transaction, its head log's tree) */
-			if (end - p > sizeof(FullTransactionId))
-				(void) declare_hashes(p + sizeof(FullTransactionId), end, 1,
+			if (end - p > sizeof(FullTransactionId) &&
+				(p[sizeof(FullTransactionId)] & TAIL_TREE))
+				(void) declare_hashes(p + sizeof(FullTransactionId) + 1, end, 1,
 									  refs);
 			break;
 		case TAG_BRANCH:			/* (the head, and its root if recorded) */
@@ -11876,24 +11880,30 @@ tail_moves(const StringInfoData *v, LogMove *moves, LogState *ls)
 	ls->last = DT_NOBEGIN;
 	if (v->len <= sizeof(FullTransactionId))
 		return 0;
-	p = get_log_state(v->data + sizeof(FullTransactionId), end, ls);
-	if (p >= end)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("a prolly head log is corrupt")));
+	p = v->data + sizeof(FullTransactionId);
 	n = (uint8) *p++;
+	if (n & TAIL_TREE)
+		p = get_log_state(p, end, ls);
+	n &= ~TAIL_TREE;
 	if (n > HEAD_LOG_TAIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("a prolly head log is corrupt")));
 	for (int i = 0; i < n; i++)
 	{
-		if (end - p < 8)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("a prolly head log is corrupt")));
-		moves[i].at = (TimestampTz) get_be64_at(p);
-		p = get_log_id(p + 8, end, &moves[i].commit);
+		if (i == 0)
+		{
+			if (end - p < 8)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a prolly head log is corrupt")));
+			moves[i].at = (TimestampTz) get_be64_at(p);
+			p += 8;
+		}
+		else
+			moves[i].at = moves[i - 1].at +
+				(TimestampTz) prolly_get_varint(&p, end);
+		p = get_log_id(p, end, &moves[i].commit);
 	}
 	return n;
 }
@@ -11950,11 +11960,15 @@ head_log_note(const char *name, const ProllyHash *head, StringInfo mover)
 		tree_append(&ls, tail, n);
 		n = 0;
 	}
-	put_log_state(mover, &ls);
-	appendStringInfoChar(mover, (char) n);
+	appendStringInfoChar(mover, (char) (n | (ls.root.len > 0 ? TAIL_TREE : 0)));
+	if (ls.root.len > 0)
+		put_log_state(mover, &ls);
 	for (int i = 0; i < n; i++)
 	{
-		put_uint64(mover, (uint64) tail[i].at);
+		if (i == 0)
+			put_uint64(mover, (uint64) tail[i].at);
+		else
+			prolly_put_varint(mover, (uint64) (tail[i].at - tail[i - 1].at));
 		put_log_id(mover, &tail[i].commit);
 	}
 }
