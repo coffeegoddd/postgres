@@ -5010,12 +5010,15 @@ void
 prolly_window_check_missing(const ProllyHash *id)
 {
 	if (prolly_window_archived(id))
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_SEVERED_REFUSALS, 1);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("commit %s is past the history horizon",
 						prolly_hash_hex(id)),
 				 errdetail("History before it was severed from this database: archived, or deleted."),
 				 errhint("Run dolt_history_repair() to reattach it.")));
+	}
 }
 
 /* Does the horizon hold any fragment? */
@@ -5057,12 +5060,15 @@ prolly_window_check_absent(const ProllyHash *id)
 		return;
 	window_init();
 	if (horizon_any())
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_SEVERED_REFUSALS, 1);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("commit %s isn't in this database: it may be past the history horizon",
 						prolly_hash_hex(id)),
 				 errdetail("History before the horizon was severed from this database: archived, or deleted."),
 				 errhint("Run dolt_history_repair() to reattach it.")));
+	}
 }
 
 typedef struct RootOf
@@ -5111,12 +5117,15 @@ prolly_window_check_root(const ProllyHash *tree_id)
 				root_of, &ro);
 	pfree(ro.prefix.data);
 	if (ro.found)
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_SEVERED_REFUSALS, 1);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("commit %s is past the history horizon",
 						prolly_hash_hex(&ro.commit)),
 				 errdetail("Its data was severed from this database: archived, or deleted.  Its history is kept."),
 				 errhint("Run dolt_history_repair() to reattach it.")));
+	}
 }
 
 bool
@@ -5126,6 +5135,7 @@ prolly_window_rows_severed(const ProllyHash *id)
 
 	if (!prolly_window_archived(id))
 		return false;
+	pgstat_count_prolly(PGSTAT_PROLLY_SEVERED_REFUSALS, 1);
 	if (told != MyProc->vxid.lxid)
 	{
 		told = MyProc->vxid.lxid;

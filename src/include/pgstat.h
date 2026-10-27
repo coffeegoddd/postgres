@@ -841,9 +841,22 @@ typedef enum PgStat_ProllyCounter
 											 * read */
 	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries
 										 * read, a commit's or a fragment's */
+	PGSTAT_PROLLY_MOVES_ROOT_KEPT,	/* moves of a branch that gave back the
+									 * pages kept as of their commit */
+	PGSTAT_PROLLY_MOVES_ROOT_NEAREST,	/* moves that gave back those of the
+										 * nearest kept commit before
+										 * theirs, and wrote the rows
+										 * between */
+	PGSTAT_PROLLY_MOVES_ROOT_MISSING,	/* moves to a commit neither was
+										 * kept for: their rows written
+										 * (from the head's pages, if
+										 * kept) */
+	PGSTAT_PROLLY_SEVERED_REFUSALS, /* reads and moves refused, or rows left
+									 * out, as their commit was past the
+									 * history horizon */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_HORIZON_ENTRIES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_SEVERED_REFUSALS + 1)
 
 typedef struct PgStat_ProllyStats
 {

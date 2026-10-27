@@ -7076,12 +7076,17 @@ restore_pages(const ProllyCommitInfo *commit)
 	kept_forget_name(name);
 	kept = kept_get(name);
 	if (!branch_baseline(name, &baseline))
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_MISSING, 1);
 		return;
+	}
 	was = kept_usable(name, &kept, kept_anywhere(kept, &commit->id, &source),
 					  source);
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
+	if (restored != NIL)
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_KEPT, 1);
 
 	/*
 	 * (another branch's roots of the commit, of a schema the session's
@@ -7104,8 +7109,19 @@ restore_pages(const ProllyCommitInfo *commit)
 		restore_kept(&dc, &at_head, was, source, &kept, restored,
 					 &commit->root, &baseline, &restored);
 		if (list_length(restored) > before)
+		{
 			branch_note_head_restore(MyBranch);
+			pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_NEAREST, 1);
+		}
 	}
+	/*
+	 * (a move neither its commit's pages nor the nearest kept before it
+	 * gave any table writes its rows: from the head's pages, below, if
+	 * those are kept)
+	 */
+	if (restored == NIL)
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_MISSING, 1);
+
 	/*
 	 * (the head's roots frozen for it only if a table is left that they
 	 * could give back)

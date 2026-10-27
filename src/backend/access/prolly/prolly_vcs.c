@@ -666,6 +666,82 @@ prolly_history_in_window(PG_FUNCTION_ARGS)
 }
 
 /*
+ * prolly_history_roots(branch text, commit_hash text)
+ *	returns setof (kept_by text, kept_commit text)
+ *
+ * The commits whose pages are kept, a root of each relation, so a move to
+ * them gives the pages back rather than writing rows: of commit_hash, the
+ * branches keeping its pages (a seek of the refs' index, NULL commit_hash
+ * none), those of branch only if branch isn't NULL; of branch alone, every
+ * commit it keeps pages as of, newest first.  Those let go of aren't.
+ */
+typedef struct RootRows
+{
+	ReturnSetInfo *rsinfo;
+	const char *branch;			/* (NULL: any) */
+} RootRows;
+
+static void
+root_row(RootRows *rr, const char *branch, const ProllyHash *commit)
+{
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (rr->branch != NULL && strcmp(rr->branch, branch) != 0)
+		return;
+	values[0] = PointerGetDatum(cstring_to_text(branch));
+	values[1] = PointerGetDatum(hash_to_text(commit));
+	tuplestore_putvalues(rr->rsinfo->setResult, rr->rsinfo->setDesc, values,
+						 nulls);
+}
+
+static void
+holder_row(const char *name, const ProllyHash *commit, void *arg)
+{
+	root_row(arg, name, commit);
+}
+
+static void
+kept_row(const ProllyKeptCommit *kept, void *arg)
+{
+	RootRows   *rr = arg;
+
+	root_row(rr, rr->branch, &kept->commit);
+}
+
+Datum
+prolly_history_roots(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	RootRows	rr;
+
+	if (PG_ARGISNULL(0) && PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a branch or a commit is needed")));
+	InitMaterializedSRF(fcinfo, 0);
+	prolly_database_components(&dc);
+	rr.rsinfo = rsinfo;
+	rr.branch = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(0));
+	if (!PG_ARGISNULL(1))
+	{
+		char	   *hex = text_to_cstring(PG_GETARG_TEXT_PP(1));
+		ProllyHash	commit;
+
+		if (!prolly_hash_from_hex(hex, strlen(hex), &commit))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("\"%s\" isn't a commit hash", hex)));
+		if (PROLLY_HAS(dc.refs, kept_holders))
+			PROLLY_CALL(dc.refs, kept_holders, &commit, NULL, holder_row, &rr);
+	}
+	else if (PROLLY_HAS(dc.refs, kept_commits))
+		PROLLY_CALL(dc.refs, kept_commits, rr.branch, kept_row, &rr);
+	return (Datum) 0;
+}
+
+/*
  * prolly_history_policy(branch text)
  *	returns record (action text, time_window interval, min_commits bigint,
  *					batch interval, max_size bigint, archive text)
