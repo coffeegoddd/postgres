@@ -62,7 +62,9 @@ FROM prolly_implementations();
  node_cache    | stub         |       0 |              0
  commit_cache  | shared       |       1 |              1
  commit_cache  | stub         |       0 |              0
-(53 rows)
+ root_freezer  | capture      |       1 |              1
+ root_freezer  | stub         |       0 |              0
+(55 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -292,7 +294,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  commit_cache  | shared         | complete                       | pass
  commit_cache  | stub           | identity                       | pass
  commit_cache  | stub           | complete                       | not implemented (5 of 5 callbacks missing)
-(222 rows)
+ root_freezer  | capture        | identity                       | pass
+ root_freezer  | capture        | complete                       | pass
+ root_freezer  | stub           | identity                       | pass
+ root_freezer  | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+(226 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

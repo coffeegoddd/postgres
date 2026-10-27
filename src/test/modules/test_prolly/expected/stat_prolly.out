@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written                 |    12
  value_nodes_written           |     0
  chunks_appended               |    12
- chunk_bytes_appended          | 26613
- bytes_hashed                  | 26702
+ chunk_bytes_appended          | 26612
+ bytes_hashed                  | 26701
  fold_rows_read                |  1000
  fold_rows_written             |  1000
  fold_pages                    |     0
@@ -101,7 +101,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  gc_bytes_copied               |     0
  conjoin_bytes_copied          |     0
  bmap_store_bytes_written      |     2
- bmap_extend_bytes_written     |    14
+ bmap_extend_bytes_written     |    23
  bmap_bulk_bytes_written       |     0
  journal_scans                 |     1
  gc_collections                |     0
@@ -229,7 +229,7 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
  commits            |     1
  head_moves         |     1
  page_copies_fold   |     0
- page_copies_shared |     5
+ page_copies_shared |     7
 (8 rows)
 
 -- The same commit again, in a database just like it: the same counts.

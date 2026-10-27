@@ -585,8 +585,13 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	 * held against VACUUM no bit is set meanwhile, while a writer only
 	 * clears one, of a page whose kept version had it)
 	 */
-	/* (a frozen root's pages are copies, of which the source's maps say nothing) */
-	if (k->frozenxid != FrozenTransactionId && kept_unchanged(src, k))
+	/*
+	 * (a frozen root's pages are copies of the source's as of the commit:
+	 * a source page unchanged since that its map calls all-visible holds
+	 * only versions every snapshot sees, which the copy holds frozen, so
+	 * the bit is as true of the copy)
+	 */
+	if (kept_unchanged(src, k))
 	{
 		(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
 											 k->snapshot, src, NULL, src, true);

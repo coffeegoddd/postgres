@@ -164,5 +164,49 @@ SELECT count(*) AS not_visible FROM pg_check_visible('rf.t');
            0
 (1 row)
 
+-- a page found unchanged since a root, then given a hint (which asks
+-- whether it is shared, settling it), then changed: the change still
+-- marks it changed since, so the next commit's root has it
+CREATE TABLE rf.h (id int PRIMARY KEY, v int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO rf.h SELECT g, 0 FROM generate_series(1, 100) g;
+SELECT dolt_commit('-Am', 'h0') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT count(*) FROM rf.h;
+ count 
+-------
+   100
+(1 row)
+
+UPDATE rf.h SET v = 1 WHERE id <= 10;
+SELECT md5(string_agg(h::text, ',' ORDER BY id)) AS at_h1 FROM rf.h h \gset
+SELECT dolt_commit('-am', 'h1') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE rf.h SET v = 2;
+SELECT dolt_commit('-am', 'h2') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT md5(string_agg(h::text, ',' ORDER BY id)) = :'at_h1' AS at_h1 FROM rf.h h;
+ at_h1 
+-------
+ t
+(1 row)
+
 \c :home
 DROP DATABASE root_freezing;
