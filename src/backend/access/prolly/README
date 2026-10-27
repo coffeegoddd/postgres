@@ -1716,7 +1716,20 @@ chunk of the fragment is checked to be there, the tops are made heads of
 the archive's (history/fragment-N-i), and only then is the horizon moved,
 the fragment's location the archive's URL; with no archive, nothing is
 severed and a warning says so.  Deleted, the horizon records the fragment
-and nothing is sent.  prolly.history_max_size isn't enforced yet.
+and nothing is sent.
+
+Autovacuum's visit of a database severs its window in the background
+(the history window's maintain(), as the database's settings say), then
+collects the chunk store in full if a fragment was made, freeing it.  It
+plans only once the cut, rounded down to a whole cold_batch (an hour if
+none is set), has moved past the last cut tried (the refs' setting
+history_window.last_cut), so a window is walked at most once a batch.
+Past prolly.history_max_size (the chunk store's journal and table files),
+each visit cuts a batch later than the last, from the oldest history kept
+on (history_window.size_cut), each branch still keeping its newest
+prolly.history_min_commits, until the store fits.  The size limit is a
+background one: dolt_history_sever() cuts by the time and count windows
+alone.
 
 dolt_history_repair(source, fragments) reattaches fragments, newest
 first (all, or the newest few), from a remote or clone that has their

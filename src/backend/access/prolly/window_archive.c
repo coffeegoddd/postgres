@@ -93,6 +93,8 @@
 #define HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
 
 static void check_may_sever(const char *what);
+static void sever_cut(ProllyWindowAction action, const TimestampTz *before,
+					  TimestampTz size_cut, ProllyWindowResult *result);
 static char *source_url(const char *source);
 
 /* ------------------------------------------------------------------------
@@ -599,8 +601,8 @@ prolly_window_init(void)
 							&min_commits_setting, 0, 0, INT_MAX,
 							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_max_size",
-							   "The most history kept here (empty: no limit).",
-							   "Read as the database has it.",
+							   "The most the chunk store may hold (empty: no limit); past it, background severing cuts a batch more each visit.",
+							   "Read as the database has it; each branch still keeps its newest prolly.history_min_commits.",
 							   &max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_cold_batch",
@@ -1055,7 +1057,7 @@ add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
  * batch.  False if no head's window cuts anything.
  */
 static bool
-head_windows(Plan *plan, const TimestampTz *before)
+head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
 {
 	TimestampTz now = GetCurrentTimestamp();
 	bool		any = false;
@@ -1087,6 +1089,12 @@ head_windows(Plan *plan, const TimestampTz *before)
 		}
 		else
 			h->cut = DT_NOBEGIN;	/* (it keeps everything) */
+		/* (a size limit cuts later, the count still keeping its own) */
+		if (size_cut > h->cut)
+		{
+			h->cut = size_cut;
+			any = true;
+		}
 	}
 	return any;
 }
@@ -1097,7 +1105,7 @@ head_windows(Plan *plan, const TimestampTz *before)
  * beyond them.  The caller holds every ref.
  */
 static void
-make_plan(Plan *plan, const TimestampTz *before)
+make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
 {
 	ListCell   *lc;
 	HTAB	   *fragment;
@@ -1107,7 +1115,7 @@ make_plan(Plan *plan, const TimestampTz *before)
 	plan->commits = id_set("prolly window plan", sizeof(PlanCommit));
 	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
-	if (!head_windows(plan, before))
+	if (!head_windows(plan, before, size_cut))
 		return;					/* (every head keeps its whole history) */
 	note_pins(plan);
 	note_merge_bases(plan);
@@ -1194,7 +1202,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 
 	window_init();
 	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, before);
+	make_plan(&plan, before, DT_NOBEGIN);
 	foreach(lc, plan.severed)
 		visit(PROLLY_WINDOW_SEVERED, &((PlanCommit *) lfirst(lc))->id, NULL,
 			  NULL, arg);
@@ -1474,6 +1482,18 @@ static void
 archive_sever(ProllyWindowAction action, const TimestampTz *before,
 			  ProllyWindowResult *result)
 {
+	sever_cut(action, before, DT_NOBEGIN, result);
+}
+
+/*
+ * A sever (as archive_sever()), each head's window cut no earlier than
+ * size_cut (DT_NOBEGIN: no limit), its count kept whatever: what a size
+ * limit severs.
+ */
+static void
+sever_cut(ProllyWindowAction action, const TimestampTz *before,
+		  TimestampTz size_cut, ProllyWindowResult *result)
+{
 	Plan		plan;
 	ListCell   *lc;
 	List	   *ids = NIL;
@@ -1500,7 +1520,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	archive_policy(NULL, &policy);
 	horizon_lock(ExclusiveLock);
 	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, before);
+	make_plan(&plan, before, size_cut);
 	if (plan.severed == NIL)
 		return;
 
@@ -1645,6 +1665,140 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	}
 	pfree(k.data);
 	pfree(v.data);
+}
+
+/* ------------------------------------------------------------------------
+ * Background severing
+ * ------------------------------------------------------------------------
+ */
+
+/* Background severing cuts at whole hours where the window names no batch. */
+#define DEFAULT_BACKGROUND_BATCH	USECS_PER_HOUR
+
+#define LAST_CUT_SETTING	"history_window.last_cut"
+#define SIZE_CUT_SETTING	"history_window.size_cut"
+
+static void
+size_part(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	*(uint64 *) arg += size;
+}
+
+/* What the database's chunk store holds, its journal and table files. */
+static uint64
+store_bytes(void)
+{
+	uint64		bytes = 0;
+
+	PROLLY_CALL(tree_env.chunk_store, segments, tree_env.chunks, false,
+				size_part, &bytes);
+	PROLLY_CALL(tree_env.chunk_store, table_files, tree_env.chunks,
+				size_part, &bytes);
+	return bytes;
+}
+
+static void
+oldest_of(const char *name, const ProllyHash *head, void *arg)
+{
+	void	  **a = arg;
+	HTAB	   *seen = a[0];
+	TimestampTz *oldest = a[1];
+	List	   *todo;
+
+	if (head->len == 0 || !set_add(seen, head))
+		return;
+	todo = list_make1(memcpy(palloc(sizeof(ProllyHash)), head, sizeof(ProllyHash)));
+	while (todo != NIL)
+	{
+		ProllyHash *id = llast(todo);
+		ProllyCommitInfo info;
+
+		todo = list_delete_last(todo);
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			continue;
+		*oldest = Min(*oldest, info.committed_at);
+		for (int i = 0; i < info.nparents; i++)
+			if (!set_has(archived_parents(), &info.parents[i]) &&
+				set_add(seen, &info.parents[i]))
+				todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)),
+											&info.parents[i], sizeof(ProllyHash)));
+	}
+}
+
+/* The oldest date of the history kept here, every branch's. */
+static TimestampTz
+oldest_kept(void)
+{
+	TimestampTz oldest = DT_NOEND;
+	void	   *a[2];
+
+	a[0] = id_set("prolly oldest commit", sizeof(ProllyHash));
+	a[1] = &oldest;
+	PROLLY_CALL(dc.refs, branches, oldest_of, a);
+	hash_destroy(a[0]);
+	return oldest;
+}
+
+/*
+ * The database's window, severed in the background (autovacuum's visit):
+ * only once a cut, rounded down to a whole batch, has moved past the last
+ * one tried, so a plan is worked out at most once a batch, not at every
+ * visit.  Over prolly.history_max_size, each visit severs a batch more,
+ * from the oldest history kept on (each branch still keeping its newest
+ * min_commits), until the store fits.  True if a fragment was made: what
+ * only it reached is a full collection's to free.
+ */
+static bool
+archive_maintain(void)
+{
+	ProllyWindowPolicy p;
+	ProllyWindowResult r;
+	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz cut = DT_NOBEGIN;
+	TimestampTz size_cut = DT_NOBEGIN;
+	int64		batch;
+	StringInfoData v;
+	TimestampTz last = DT_NOBEGIN;
+	bool		over = false;
+
+	window_init();
+	archive_policy(NULL, &p);
+	if (p.action == PROLLY_WINDOW_NONE ||
+		(p.keep_time == 0 && p.keep_commits == 0 && p.max_bytes == 0))
+		return false;
+	batch = p.batch > 0 ? p.batch : DEFAULT_BACKGROUND_BATCH;
+	initStringInfo(&v);
+	if (p.keep_time > 0 || p.keep_commits > 0)
+	{
+		cut = p.keep_time > 0 ? now - p.keep_time : now;
+		cut -= ((cut % batch) + batch) % batch;
+		if (PROLLY_CALL(dc.refs, config_get, LAST_CUT_SETTING, &v))
+			last = (TimestampTz) strtoll(v.data, NULL, 10);
+	}
+	if (p.max_bytes > 0 && store_bytes() > (uint64) p.max_bytes)
+	{
+		over = true;
+		resetStringInfo(&v);
+		if (PROLLY_CALL(dc.refs, config_get, SIZE_CUT_SETTING, &v))
+			size_cut = (TimestampTz) strtoll(v.data, NULL, 10);
+		else
+			size_cut = oldest_kept();
+		size_cut = Min(size_cut + batch, now);
+		resetStringInfo(&v);
+		appendStringInfo(&v, INT64_FORMAT, (int64) size_cut);
+		PROLLY_CALL(dc.refs, config_set, SIZE_CUT_SETTING, v.data);
+	}
+	if (!over && cut <= last)
+		return false;
+	if (cut > last)
+	{
+		resetStringInfo(&v);
+		appendStringInfo(&v, INT64_FORMAT, (int64) cut);
+		PROLLY_CALL(dc.refs, config_set, LAST_CUT_SETTING, v.data);
+	}
+	sever_cut(p.action, NULL, size_cut, &r);
+	return r.fragment > 0;
 }
 
 /* ------------------------------------------------------------------------
@@ -1961,4 +2115,5 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.repair = archive_repair,
 	.policy = archive_policy,
 	.set_policy = archive_set_policy,
+	.maintain = archive_maintain,
 };

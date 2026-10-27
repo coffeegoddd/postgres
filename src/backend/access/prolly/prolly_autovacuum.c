@@ -3,8 +3,10 @@
  * prolly_autovacuum.c
  *	  Prolly's stores reclaimed by autovacuum.
  *
- * After its tables, a database's autovacuum worker collects the chunk
- * store when what a default collection would collect (the journal segment
+ * After its tables, a database's autovacuum worker severs the history
+ * past the database's window (the history window's maintain(): as the
+ * database's settings say), then collects the chunk store, in full if it
+ * severed some, else when what a default collection would collect (the journal segment
  * appends go to, written since the last collection, and the table files
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
@@ -311,18 +313,40 @@ collection_due(void)
  * counted (auto_collections_skipped), rather than each reporting the
  * refusal as an error; dolt_gc() still reports it.
  */
+/* A fragment severed this visit: the collection after it is a full one. */
+static bool severed = false;
+
+/*
+ * History past the database's window severed (the history window's
+ * maintain()), before the collection: as the database's settings say,
+ * never a session's.
+ */
+static void
+sever(void)
+{
+	ProllyDatabaseComponents dc;
+
+	severed = false;
+	prolly_database_components(&dc);
+	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, maintain))
+		return;
+	severed = PROLLY_CALL(dc.history_window, maintain);
+}
+
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
+	bool		full = severed;
 
-	if (!collection_due())
+	severed = false;
+	if (!full && !collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	prolly_database_components(&dc);
-	if (!PROLLY_CALL(dc.reclamation, collect, false, true, &r))
+	if (!PROLLY_CALL(dc.reclamation, collect, full, true, &r))
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 		ereport(DEBUG1,
@@ -652,8 +676,8 @@ verify(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {autofold, collect, move, conjoin, release,
-	sweep, verify};
+	void		(*steps[]) (void) = {autofold, sever, collect, move, conjoin,
+	release, sweep, verify};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{
