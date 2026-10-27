@@ -130,6 +130,10 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT h.what, h.n FROM hr_history() h FULL JOIN hr_seen s USING (what, n)
 WHERE h.got IS DISTINCT FROM s.got;
 SELECT hr_err('SELECT dolt_history_repair()') AS nothing_left;
+-- (nulls are none: every fragment, from each one's archive; a negative
+-- count is refused)
+SELECT dolt_history_repair(NULL, NULL) AS null_args;
+SELECT hr_err($$SELECT dolt_history_repair(NULL, -1)$$) AS negative;
 
 \c :home
 DROP DATABASE regress_history_repair;
