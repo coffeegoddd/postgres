@@ -43,26 +43,24 @@ sql(q{
 	CREATE EXTENSION test_prolly;
 	CREATE EXTENSION injection_points;
 	CREATE SCHEMA cow VERSIONED;
-	CREATE TABLE cow.scratch (a int);
-	INSERT INTO cow.scratch VALUES (1);
 });
-my $scratch = sql(q{SELECT pg_relation_filenode('cow.scratch')});
 
 # 'op' (a share or a capture) stopped at the first page it logs, holding
 # the header; then 'go', in a session 'prep' set up before (its scan or
 # plan made, as those read the relation's length from the header), which
-# locks a page exclusively and waits for the header.  The op let go, both
-# are to finish within the timeout, the op having walked again.  With
-# 'released', that is run while the op has let go of the header, before it
-# waits for the page.  The op's result, or undef if it deadlocked.
+# locks a page of relation 'rel' exclusively and waits for the header.  The
+# op let go, both are to finish within the timeout, the op having walked
+# again.  With 'released', that is run while the op has let go of the
+# header, before it waits for the page.  The op's result, or undef if it
+# deadlocked.
 sub check_no_deadlock
 {
-	my ($name, $prep, $go, $op, $released) = @_;
+	my ($name, $prep, $go, $op, $rel, $released) = @_;
 	my $reader = $node->background_psql('postgres', on_error_stop => 0);
 
 	$reader->query_safe($prep);
-	# every cached page checked again before it next changes
-	sql(qq{SELECT test_bmap_share($scratch)});
+	# every cached page of the relation checked again before it next changes
+	sql(qq{SELECT test_bmap_mark_shared($rel)});
 	sql(q{SELECT pg_stat_reset_shared('prolly')});
 
 	my $opsess = $node->background_psql('postgres', on_error_stop => 0);
@@ -127,7 +125,7 @@ my $p = sql(q{SELECT pg_relation_filenode('cow.p')});
 my $pcopy = check_no_deadlock('prune and share',
 	q{BEGIN; DECLARE c CURSOR FOR SELECT a FROM cow.p; FETCH 1 FROM c},
 	'FETCH 150 FROM c; COMMIT',
-	"test_bmap_share($p)");
+	"test_bmap_share($p)", $p);
 is(sql(q{SELECT count(*), count(*) FILTER (WHERE b LIKE 'y%') FROM cow.p}),
 	'400|250', 'the rows');
 my $pdigest = sql(qq{SELECT test_bmap_rows_digest($p)});
@@ -149,7 +147,7 @@ my $lock = sub {
 		BEGIN; EXECUTE l; COMMIT};
 };
 my $mcopy = check_no_deadlock('row lock and share', $lock->('cow.m', 100),
-	'BEGIN; EXECUTE l; COMMIT', "test_bmap_share($m)");
+	'BEGIN; EXECUTE l; COMMIT', "test_bmap_share($m)", $m);
 is(counter('bmap_pages_preserved'), $mpages,
 	'each of its pages logged once, though the walk began again');
 # (the rows as shared, before a later lock changes them)
@@ -169,7 +167,7 @@ sql(q{CREATE TABLE cow.u (a int PRIMARY KEY);
 	INSERT INTO cow.u SELECT generate_series(1, 10)});
 my $u = sql(q{SELECT pg_relation_filenode('cow.u')});
 check_no_deadlock('row lock and capture', $lock->('cow.u', 5),
-	'BEGIN; EXECUTE l; COMMIT', "test_bmap_root_capture($u)");
+	'BEGIN; EXECUTE l; COMMIT', "test_bmap_root_capture($u)", $u);
 is(sql(q{SELECT count(*) FROM cow.u}), '10', 'the rows locked');
 
 # A page copied while the header is let go: as of a fold, the row lock's
@@ -180,7 +178,8 @@ my $c = sql(q{SELECT pg_relation_filenode('cow.c')});
 sql(qq{SELECT test_bmap_fold_begin($c)});
 my $cmap = sql(qq{SELECT string_agg(phys::text, ',' ORDER BY blkno) FROM test_bmap_map($c)});
 my $ccopy = check_no_deadlock('row lock copying a page and share',
-	$lock->('cow.c', 100), 'BEGIN; EXECUTE l; COMMIT', "test_bmap_share($c)");
+	$lock->('cow.c', 100), 'BEGIN; EXECUTE l; COMMIT', "test_bmap_share($c)",
+	$c);
 isnt(sql(qq{SELECT string_agg(phys::text, ',' ORDER BY blkno) FROM test_bmap_map($c)}),
 	$cmap, 'the lock copied the page');
 is(counter('bmap_pages_preserved'), '3', 'which is logged at its new block');
