@@ -60,10 +60,22 @@ typedef struct ProllyTransferRoutine
 	bool		(*clone) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 						  const ProllyHash *commits, int ncommits,
 						  uint64 *count);
+
+	/*
+	 * Optional: receive() of what the commits reach down to the stops (not
+	 * received, nor walked past: commits the store needn't have, as a
+	 * history horizon's tops older than what is received).  Only what the
+	 * walk reaches is added, so a stop's chunks never are.
+	 */
+	uint64		(*receive_until) (const ProllyRemoteRoutine *rr,
+								  ProllyRemote *remote,
+								  const ProllyHash *commits, int ncommits,
+								  const ProllyHash *stops, int nstops);
 } ProllyTransferRoutine;
 
-#define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send", "clone"
+#define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send", "clone", \
+	"receive_until"
 #define PROLLY_TRANSFER_FIRST_CALLBACK receive
-#define PROLLY_TRANSFER_LAST_CALLBACK clone
+#define PROLLY_TRANSFER_LAST_CALLBACK receive_until
 
 #endif							/* PROLLY_TRANSFER_H */

@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/prolly_refs.h"
+#include "access/prolly_window.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
@@ -62,6 +63,8 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 	{
 		bool		known;
 
+		if (prolly_window_archived(&starts[i]))
+			continue;
 		queue[tail] = prolly_hash_key(&starts[i]);
 		(void) hash_search(seen, &queue[tail], HASH_ENTER, &known);
 		if (!known)
@@ -88,6 +91,9 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 			ProllyHash	key;
 			bool		known;
 
+			/* (what is past the history horizon is no part of the walk) */
+			if (prolly_window_archived(&info.parents[i]))
+				continue;
 			key = prolly_hash_key(&info.parents[i]);
 			(void) hash_search(seen, &key, HASH_ENTER, &known);
 			if (known)
@@ -473,6 +479,12 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 
 			if ((pf->flags | down) == pf->flags)
 				continue;
+			/*
+			 * (beneath a merge base found, the walk only marks what is
+			 * beneath it: past the history horizon there is nothing to)
+			 */
+			if ((down & PAINT_BENEATH) && prolly_window_archived(&e.parents[p]))
+				continue;
 			paint_mark(&q, pf, down);
 			if (!lookup(&e.parents[p], &pinfo, lookup_arg) || !pinfo.has_height ||
 				pinfo.height >= e.height)
@@ -585,6 +597,28 @@ walked_common(const ProllyHash *a, const ProllyHash *b,
 	n = first_common(b, ofa, lookup, lookup_arg, common);
 	hash_destroy(ofa);
 	return n;
+}
+
+/*
+ * Every maximal common ancestor of a and b (the candidates a merge base is
+ * chosen from: several where histories cross), into *bases (palloc'd);
+ * the count.  Where heights aren't recorded, the commits a walk finds
+ * common first, which may hold some beneath others.
+ */
+int
+prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
+						   ProllyCommitLookup lookup, void *lookup_arg,
+						   ProllyHash **bases)
+{
+	int64	   *heights;
+	int			n;
+
+	if (paint_common(a, b, lookup, lookup_arg, bases, &heights, &n))
+	{
+		pfree(heights);
+		return n;
+	}
+	return walked_common(a, b, lookup, lookup_arg, bases);
 }
 
 bool

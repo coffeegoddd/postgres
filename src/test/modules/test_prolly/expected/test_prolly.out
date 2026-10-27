@@ -7,292 +7,298 @@ CREATE EXTENSION test_prolly;
 -- Every implementation of every interface.
 SELECT interface, name, impl_id, format_version
 FROM prolly_implementations();
-   interface   |     name     | impl_id | format_version 
----------------+--------------+---------+----------------
- chunker       | bytes        |       2 |              1
- chunker       | stub         |       0 |              0
- content_hash  | sha256       |       1 |              1
- content_hash  | blake3       |       2 |              1
- content_hash  | stub         |       0 |              0
- content_hash  | test_fnv     |    9001 |              0
- content_hash  | test_broken  |    9002 |              0
- key_encoder   | ordered      |       1 |              7
- key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              8
- value_encoder | stub         |       0 |              0
- reclamation   | copying      |       1 |              1
- reclamation   | stub         |       0 |              0
- refs          | copies       |       2 |              3
- refs          | stub         |       0 |              0
- transfer      | chunks       |       1 |              1
- transfer      | stub         |       0 |              0
- diff_merge    | folded       |       3 |              1
- diff_merge    | stub         |       0 |              0
- tree          | cow          |       1 |              3
- tree          | stub         |       0 |              0
- table_keying  | pk_or_prefix |       2 |              1
- table_keying  | stub         |       0 |              0
- canonicalizer | folded       |       2 |              3
- canonicalizer | stub         |       0 |              0
- chunk_store   | journal      |       1 |              4
- chunk_format  | basic        |       1 |              2
- row_applier   | replication  |       1 |              1
- row_applier   | stub         |       0 |              0
- table_file    | basic        |       1 |              3
- table_file    | stub         |       0 |              0
- change_finder | pages        |       1 |              8
- change_finder | log          |       2 |              3
- change_finder | stub         |       0 |              0
- remote        | file         |       1 |              2
- remote        | postgresql   |       2 |              1
- remote        | postgres     |       3 |              1
- value_memo    | shared       |       1 |              1
- value_memo    | stub         |       0 |              0
- writers       | modes        |       1 |              1
- writers       | stub         |       0 |              0
- change_log    | relation     |       1 |              2
- change_log    | stub         |       0 |              0
- move_planner  | costs        |       1 |              1
- move_planner  | stub         |       0 |              0
- matcache      | branches     |       1 |              1
- matcache      | stub         |       0 |              0
- json_tree     | paths        |       1 |              2
- json_tree     | stub         |       0 |              0
- node_cache    | shared       |       1 |              1
- node_cache    | stub         |       0 |              0
- commit_cache  | shared       |       1 |              1
- commit_cache  | stub         |       0 |              0
-(53 rows)
+   interface    |     name     | impl_id | format_version 
+----------------+--------------+---------+----------------
+ chunker        | bytes        |       2 |              1
+ chunker        | stub         |       0 |              0
+ content_hash   | sha256       |       1 |              1
+ content_hash   | blake3       |       2 |              1
+ content_hash   | stub         |       0 |              0
+ content_hash   | test_fnv     |    9001 |              0
+ content_hash   | test_broken  |    9002 |              0
+ key_encoder    | ordered      |       1 |              7
+ key_encoder    | stub         |       0 |              0
+ value_encoder  | canonical    |       2 |              8
+ value_encoder  | stub         |       0 |              0
+ reclamation    | copying      |       1 |              1
+ reclamation    | stub         |       0 |              0
+ refs           | copies       |       2 |              3
+ refs           | stub         |       0 |              0
+ transfer       | chunks       |       1 |              1
+ transfer       | stub         |       0 |              0
+ diff_merge     | folded       |       3 |              1
+ diff_merge     | stub         |       0 |              0
+ tree           | cow          |       1 |              3
+ tree           | stub         |       0 |              0
+ table_keying   | pk_or_prefix |       2 |              1
+ table_keying   | stub         |       0 |              0
+ canonicalizer  | folded       |       2 |              3
+ canonicalizer  | stub         |       0 |              0
+ chunk_store    | journal      |       1 |              4
+ chunk_format   | basic        |       1 |              2
+ row_applier    | replication  |       1 |              1
+ row_applier    | stub         |       0 |              0
+ table_file     | basic        |       1 |              3
+ table_file     | stub         |       0 |              0
+ change_finder  | pages        |       1 |              8
+ change_finder  | log          |       2 |              3
+ change_finder  | stub         |       0 |              0
+ remote         | file         |       1 |              2
+ remote         | postgresql   |       2 |              1
+ remote         | postgres     |       3 |              1
+ value_memo     | shared       |       1 |              1
+ value_memo     | stub         |       0 |              0
+ writers        | modes        |       1 |              1
+ writers        | stub         |       0 |              0
+ change_log     | relation     |       1 |              2
+ change_log     | stub         |       0 |              0
+ move_planner   | costs        |       1 |              1
+ move_planner   | stub         |       0 |              0
+ matcache       | branches     |       1 |              1
+ matcache       | stub         |       0 |              0
+ json_tree      | paths        |       1 |              2
+ json_tree      | stub         |       0 |              0
+ node_cache     | shared       |       1 |              1
+ node_cache     | stub         |       0 |              0
+ commit_cache   | shared       |       1 |              1
+ commit_cache   | stub         |       0 |              0
+ history_window | archive      |       1 |              1
+ history_window | stub         |       0 |              0
+(55 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
 -- "identity".
 SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
-   interface   | implementation |              test              |                                                                                              result                                                                                               
----------------+----------------+--------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- chunker       | bytes          | identity                       | pass
- chunker       | bytes          | deterministic                  | pass
- chunker       | bytes          | forced_split_respects_capacity | pass
- chunker       | bytes          | complete                       | pass
- chunker       | stub           | identity                       | pass
- chunker       | stub           | deterministic                  | not implemented (missing begin, add, end)
- chunker       | stub           | forced_split_respects_capacity | not implemented (missing begin, add, end)
- chunker       | stub           | complete                       | not implemented (3 of 3 callbacks missing)
- content_hash  | sha256         | identity                       | pass
- content_hash  | sha256         | deterministic                  | pass
- content_hash  | sha256         | incremental_equals_one_shot    | pass
- content_hash  | sha256         | buckets_spread                 | pass
- content_hash  | sha256         | complete                       | pass
- content_hash  | blake3         | identity                       | pass
- content_hash  | blake3         | deterministic                  | pass
- content_hash  | blake3         | incremental_equals_one_shot    | pass
- content_hash  | blake3         | buckets_spread                 | pass
- content_hash  | blake3         | complete                       | pass
- content_hash  | stub           | identity                       | pass
- content_hash  | stub           | deterministic                  | not implemented (missing begin, update, finish)
- content_hash  | stub           | incremental_equals_one_shot    | not implemented (missing begin, update, finish)
- content_hash  | stub           | buckets_spread                 | not implemented (missing begin, update, finish)
- content_hash  | stub           | complete                       | not implemented (3 of 3 callbacks missing)
- key_encoder   | ordered        | identity                       | pass
- key_encoder   | ordered        | order_matches_opclass          | pass
- key_encoder   | ordered        | desc_and_nulls_ordering        | pass
- key_encoder   | ordered        | complete                       | pass
- key_encoder   | stub           | identity                       | pass
- key_encoder   | stub           | order_matches_opclass          | not implemented (missing supports, begin, encode, compare, end)
- key_encoder   | stub           | desc_and_nulls_ordering        | not implemented (missing supports, begin, encode, compare, end)
- key_encoder   | stub           | complete                       | not implemented (6 of 6 callbacks missing)
- value_encoder | canonical      | identity                       | pass
- value_encoder | canonical      | round_trip                     | pass
- value_encoder | canonical      | platform_independent           | pass
- value_encoder | canonical      | independent_of_history         | pass
- value_encoder | canonical      | independent_of_session         | pass
- value_encoder | canonical      | missing_values                 | pass
- value_encoder | canonical      | decodes_earlier_layouts        | pass
- value_encoder | canonical      | long_values                    | pass
- value_encoder | canonical      | kept_values                    | pass
- value_encoder | canonical      | selected_columns               | pass
- value_encoder | canonical      | assembled_rows                 | pass
- value_encoder | canonical      | complete                       | pass
- value_encoder | stub           | identity                       | pass
- value_encoder | stub           | round_trip                     | not implemented (missing begin, encode, decode, end)
- value_encoder | stub           | platform_independent           | not implemented (missing begin, encode, end)
- value_encoder | stub           | independent_of_history         | not implemented (missing begin, encode, end)
- value_encoder | stub           | independent_of_session         | not implemented (missing begin, encode, end)
- value_encoder | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
- value_encoder | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
- value_encoder | stub           | long_values                    | not implemented (missing begin, encode, decode, end, set_values, refs)
- value_encoder | stub           | kept_values                    | not implemented (missing begin, encode, end, set_values, decode_kept, encode_kept)
- value_encoder | stub           | selected_columns               | not implemented (missing begin, encode, decode, end, set_values, refs, fields, decode_field, fields_alike, field_compatible, decode_columns, project)
- value_encoder | stub           | assembled_rows                 | not implemented (missing begin, encode, decode, end, set_values, fields, encode_fields)
- value_encoder | stub           | complete                       | not implemented (17 of 17 callbacks missing)
- reclamation   | copying        | identity                       | pass
- reclamation   | copying        | live_chunks_never_freed        | no checks yet
- reclamation   | copying        | keeps_what_writers_reference   | no checks yet
- reclamation   | copying        | complete                       | pass
- reclamation   | stub           | identity                       | pass
- reclamation   | stub           | live_chunks_never_freed        | not implemented (missing collect)
- reclamation   | stub           | keeps_what_writers_reference   | not implemented (missing collect)
- reclamation   | stub           | complete                       | not implemented (2 of 2 callbacks missing)
- refs          | copies         | identity                       | pass
- refs          | copies         | branch_lifecycle               | no checks yet
- refs          | copies         | commit_then_resolve            | no checks yet
- refs          | copies         | merge_base                     | no checks yet
- refs          | copies         | complete                       | pass
- refs          | stub           | identity                       | pass
- refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
- refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
- refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (93 of 93 callbacks missing)
- transfer      | chunks         | identity                       | pass
- transfer      | chunks         | receive_then_send              | no checks yet
- transfer      | chunks         | complete                       | pass
- transfer      | stub           | identity                       | pass
- transfer      | stub           | receive_then_send              | not implemented (missing receive, send)
- transfer      | stub           | complete                       | not implemented (3 of 3 callbacks missing)
- diff_merge    | folded         | identity                       | pass
- diff_merge    | folded         | diff_reports_each_change_once  | no checks yet
- diff_merge    | folded         | merge                          | no checks yet
- diff_merge    | folded         | complete                       | pass
- diff_merge    | stub           | identity                       | pass
- diff_merge    | stub           | diff_reports_each_change_once  | not implemented (missing diff)
- diff_merge    | stub           | merge                          | not implemented (missing merge)
- diff_merge    | stub           | complete                       | not implemented (12 of 12 callbacks missing)
- tree          | cow            | identity                       | pass
- tree          | cow            | build_and_get                  | pass
- tree          | cow            | large_keys                     | pass
- tree          | cow            | cursor_scans                   | pass
- tree          | cow            | apply_matches_reference        | pass
- tree          | cow            | apply_past_the_end             | pass
- tree          | cow            | history_independent            | pass
- tree          | cow            | edits_share_nodes              | pass
- tree          | cow            | diff_reports_changes           | pass
- tree          | cow            | equal_keys_take_new_bytes      | pass
- tree          | cow            | counts_nodes                   | pass
- tree          | cow            | ranks                          | pass
- tree          | cow            | diff_reads_changed_paths       | pass
- tree          | cow            | diff_stops                     | pass
- tree          | cow            | diff_across_heights            | pass
- tree          | cow            | diff_unordered_matches         | pass
- tree          | cow            | diff_estimate_bounds           | pass
- tree          | cow            | seeks_in_order                 | pass
- tree          | cow            | apply_reads_paths_once         | pass
- tree          | cow            | nodes_are_valid                | pass
- tree          | cow            | large_values                   | pass
- tree          | cow            | held_references                | pass
- tree          | cow            | value_splices                  | pass
- tree          | cow            | complete                       | pass
- tree          | stub           | identity                       | pass
- tree          | stub           | build_and_get                  | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree          | stub           | large_keys                     | not implemented (missing build_begin, build_add, build_finish, apply, get, count, key_max)
- tree          | stub           | cursor_scans                   | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree          | stub           | apply_matches_reference        | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree          | stub           | apply_past_the_end             | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree          | stub           | history_independent            | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
- tree          | stub           | edits_share_nodes              | not implemented (missing build_begin, build_add, build_finish, apply, walk)
- tree          | stub           | diff_reports_changes           | not implemented (missing build_begin, build_add, build_finish, apply, diff)
- tree          | stub           | equal_keys_take_new_bytes      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, diff)
- tree          | stub           | counts_nodes                   | not implemented (missing build_begin, build_add, build_finish, walk)
- tree          | stub           | ranks                          | not implemented (missing build_begin, build_add, build_finish, apply, get, count, rank)
- tree          | stub           | diff_reads_changed_paths       | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
- tree          | stub           | diff_stops                     | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
- tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
- tree          | stub           | diff_unordered_matches         | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff_unordered)
- tree          | stub           | diff_estimate_bounds           | not implemented (missing build_begin, build_add, build_finish, apply, diff_estimate)
- tree          | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
- tree          | stub           | apply_reads_paths_once         | not implemented (missing build_begin, build_add, build_finish, apply, get, walk)
- tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
- tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
- tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
- tree          | stub           | value_splices                  | not implemented (missing value_write, value_read, value_root, value_splice)
- tree          | stub           | complete                       | not implemented (25 of 25 callbacks missing)
- table_keying  | pk_or_prefix   | identity                       | pass
- table_keying  | pk_or_prefix   | round_trip                     | pass
- table_keying  | pk_or_prefix   | keys_and_content               | pass
- table_keying  | pk_or_prefix   | owns_its_memory                | pass
- table_keying  | pk_or_prefix   | row_shapes                     | pass
- table_keying  | pk_or_prefix   | old_shapes                     | pass
- table_keying  | pk_or_prefix   | assembled_rows                 | pass
- table_keying  | pk_or_prefix   | complete                       | pass
- table_keying  | stub           | identity                       | pass
- table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
- table_keying  | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close, encode_key)
- table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
- table_keying  | stub           | row_shapes                     | not implemented (missing open, close, row_shape, shape_extends)
- table_keying  | stub           | old_shapes                     | not implemented (missing open, encode_row, decode_row, close, row_shape, open_shape)
- table_keying  | stub           | assembled_rows                 | not implemented (missing open, encode_row, close, row_fields, encode_row_fields)
- table_keying  | stub           | complete                       | not implemented (27 of 27 callbacks missing)
- canonicalizer | folded         | identity                       | pass
- canonicalizer | folded         | complete                       | pass
- canonicalizer | stub           | identity                       | pass
- canonicalizer | stub           | complete                       | not implemented (42 of 42 callbacks missing)
- chunk_store   | journal        | identity                       | pass
- chunk_store   | journal        | complete                       | pass
- chunk_format  | basic          | identity                       | pass
- chunk_format  | basic          | items_round_trip               | pass
- chunk_format  | basic          | rejects_other_bytes            | pass
- chunk_format  | basic          | complete                       | pass
- row_applier   | replication    | identity                       | pass
- row_applier   | replication    | complete                       | pass
- row_applier   | stub           | identity                       | pass
- row_applier   | stub           | complete                       | not implemented (8 of 8 callbacks missing)
- table_file    | basic          | identity                       | pass
- table_file    | basic          | round_trip                     | pass
- table_file    | basic          | rejects_other_bytes            | pass
- table_file    | basic          | shared_prefixes                | pass
- table_file    | basic          | complete                       | pass
- table_file    | stub           | identity                       | pass
- table_file    | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
- table_file    | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
- table_file    | stub           | shared_prefixes                | not implemented (missing write_begin, write_add, write_finish, open, find, decode, close)
- table_file    | stub           | complete                       | not implemented (13 of 13 callbacks missing)
- change_finder | pages          | identity                       | pass
- change_finder | pages          | complete                       | pass
- change_finder | log            | identity                       | pass
- change_finder | log            | complete                       | pass
- change_finder | stub           | identity                       | pass
- change_finder | stub           | complete                       | not implemented (11 of 11 callbacks missing)
- remote        | file           | identity                       | pass
- remote        | file           | heads_and_chunks               | no checks yet
- remote        | file           | complete                       | pass
- remote        | postgresql     | identity                       | pass
- remote        | postgresql     | heads_and_chunks               | no checks yet
- remote        | postgresql     | complete                       | pass
- remote        | postgres       | identity                       | pass
- remote        | postgres       | heads_and_chunks               | no checks yet
- remote        | postgres       | complete                       | pass
- value_memo    | shared         | identity                       | pass
- value_memo    | shared         | complete                       | pass
- value_memo    | stub           | identity                       | pass
- value_memo    | stub           | complete                       | not implemented (5 of 5 callbacks missing)
- writers       | modes          | identity                       | pass
- writers       | modes          | complete                       | pass
- writers       | stub           | identity                       | pass
- writers       | stub           | complete                       | not implemented (10 of 10 callbacks missing)
- change_log    | relation       | identity                       | pass
- change_log    | relation       | complete                       | pass
- change_log    | stub           | identity                       | pass
- change_log    | stub           | complete                       | not implemented (15 of 15 callbacks missing)
- move_planner  | costs          | identity                       | pass
- move_planner  | costs          | complete                       | pass
- move_planner  | stub           | identity                       | pass
- move_planner  | stub           | complete                       | not implemented (1 of 1 callbacks missing)
- matcache      | branches       | identity                       | pass
- matcache      | branches       | complete                       | pass
- matcache      | stub           | identity                       | pass
- matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
- json_tree     | paths          | identity                       | pass
- json_tree     | paths          | complete                       | pass
- json_tree     | stub           | identity                       | pass
- json_tree     | stub           | complete                       | not implemented (9 of 9 callbacks missing)
- node_cache    | shared         | identity                       | pass
- node_cache    | shared         | complete                       | pass
- node_cache    | stub           | identity                       | pass
- node_cache    | stub           | complete                       | not implemented (6 of 6 callbacks missing)
- commit_cache  | shared         | identity                       | pass
- commit_cache  | shared         | complete                       | pass
- commit_cache  | stub           | identity                       | pass
- commit_cache  | stub           | complete                       | not implemented (5 of 5 callbacks missing)
-(222 rows)
+   interface    | implementation |              test              |                                                                                              result                                                                                               
+----------------+----------------+--------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ chunker        | bytes          | identity                       | pass
+ chunker        | bytes          | deterministic                  | pass
+ chunker        | bytes          | forced_split_respects_capacity | pass
+ chunker        | bytes          | complete                       | pass
+ chunker        | stub           | identity                       | pass
+ chunker        | stub           | deterministic                  | not implemented (missing begin, add, end)
+ chunker        | stub           | forced_split_respects_capacity | not implemented (missing begin, add, end)
+ chunker        | stub           | complete                       | not implemented (3 of 3 callbacks missing)
+ content_hash   | sha256         | identity                       | pass
+ content_hash   | sha256         | deterministic                  | pass
+ content_hash   | sha256         | incremental_equals_one_shot    | pass
+ content_hash   | sha256         | buckets_spread                 | pass
+ content_hash   | sha256         | complete                       | pass
+ content_hash   | blake3         | identity                       | pass
+ content_hash   | blake3         | deterministic                  | pass
+ content_hash   | blake3         | incremental_equals_one_shot    | pass
+ content_hash   | blake3         | buckets_spread                 | pass
+ content_hash   | blake3         | complete                       | pass
+ content_hash   | stub           | identity                       | pass
+ content_hash   | stub           | deterministic                  | not implemented (missing begin, update, finish)
+ content_hash   | stub           | incremental_equals_one_shot    | not implemented (missing begin, update, finish)
+ content_hash   | stub           | buckets_spread                 | not implemented (missing begin, update, finish)
+ content_hash   | stub           | complete                       | not implemented (3 of 3 callbacks missing)
+ key_encoder    | ordered        | identity                       | pass
+ key_encoder    | ordered        | order_matches_opclass          | pass
+ key_encoder    | ordered        | desc_and_nulls_ordering        | pass
+ key_encoder    | ordered        | complete                       | pass
+ key_encoder    | stub           | identity                       | pass
+ key_encoder    | stub           | order_matches_opclass          | not implemented (missing supports, begin, encode, compare, end)
+ key_encoder    | stub           | desc_and_nulls_ordering        | not implemented (missing supports, begin, encode, compare, end)
+ key_encoder    | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ value_encoder  | canonical      | identity                       | pass
+ value_encoder  | canonical      | round_trip                     | pass
+ value_encoder  | canonical      | platform_independent           | pass
+ value_encoder  | canonical      | independent_of_history         | pass
+ value_encoder  | canonical      | independent_of_session         | pass
+ value_encoder  | canonical      | missing_values                 | pass
+ value_encoder  | canonical      | decodes_earlier_layouts        | pass
+ value_encoder  | canonical      | long_values                    | pass
+ value_encoder  | canonical      | kept_values                    | pass
+ value_encoder  | canonical      | selected_columns               | pass
+ value_encoder  | canonical      | assembled_rows                 | pass
+ value_encoder  | canonical      | complete                       | pass
+ value_encoder  | stub           | identity                       | pass
+ value_encoder  | stub           | round_trip                     | not implemented (missing begin, encode, decode, end)
+ value_encoder  | stub           | platform_independent           | not implemented (missing begin, encode, end)
+ value_encoder  | stub           | independent_of_history         | not implemented (missing begin, encode, end)
+ value_encoder  | stub           | independent_of_session         | not implemented (missing begin, encode, end)
+ value_encoder  | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
+ value_encoder  | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
+ value_encoder  | stub           | long_values                    | not implemented (missing begin, encode, decode, end, set_values, refs)
+ value_encoder  | stub           | kept_values                    | not implemented (missing begin, encode, end, set_values, decode_kept, encode_kept)
+ value_encoder  | stub           | selected_columns               | not implemented (missing begin, encode, decode, end, set_values, refs, fields, decode_field, fields_alike, field_compatible, decode_columns, project)
+ value_encoder  | stub           | assembled_rows                 | not implemented (missing begin, encode, decode, end, set_values, fields, encode_fields)
+ value_encoder  | stub           | complete                       | not implemented (17 of 17 callbacks missing)
+ reclamation    | copying        | identity                       | pass
+ reclamation    | copying        | live_chunks_never_freed        | no checks yet
+ reclamation    | copying        | keeps_what_writers_reference   | no checks yet
+ reclamation    | copying        | complete                       | pass
+ reclamation    | stub           | identity                       | pass
+ reclamation    | stub           | live_chunks_never_freed        | not implemented (missing collect)
+ reclamation    | stub           | keeps_what_writers_reference   | not implemented (missing collect)
+ reclamation    | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+ refs           | copies         | identity                       | pass
+ refs           | copies         | branch_lifecycle               | no checks yet
+ refs           | copies         | commit_then_resolve            | no checks yet
+ refs           | copies         | merge_base                     | no checks yet
+ refs           | copies         | complete                       | pass
+ refs           | stub           | identity                       | pass
+ refs           | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
+ refs           | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
+ refs           | stub           | merge_base                     | not implemented (missing commit, merge_base)
+ refs           | stub           | complete                       | not implemented (97 of 97 callbacks missing)
+ transfer       | chunks         | identity                       | pass
+ transfer       | chunks         | receive_then_send              | no checks yet
+ transfer       | chunks         | complete                       | pass
+ transfer       | stub           | identity                       | pass
+ transfer       | stub           | receive_then_send              | not implemented (missing receive, send)
+ transfer       | stub           | complete                       | not implemented (4 of 4 callbacks missing)
+ diff_merge     | folded         | identity                       | pass
+ diff_merge     | folded         | diff_reports_each_change_once  | no checks yet
+ diff_merge     | folded         | merge                          | no checks yet
+ diff_merge     | folded         | complete                       | pass
+ diff_merge     | stub           | identity                       | pass
+ diff_merge     | stub           | diff_reports_each_change_once  | not implemented (missing diff)
+ diff_merge     | stub           | merge                          | not implemented (missing merge)
+ diff_merge     | stub           | complete                       | not implemented (12 of 12 callbacks missing)
+ tree           | cow            | identity                       | pass
+ tree           | cow            | build_and_get                  | pass
+ tree           | cow            | large_keys                     | pass
+ tree           | cow            | cursor_scans                   | pass
+ tree           | cow            | apply_matches_reference        | pass
+ tree           | cow            | apply_past_the_end             | pass
+ tree           | cow            | history_independent            | pass
+ tree           | cow            | edits_share_nodes              | pass
+ tree           | cow            | diff_reports_changes           | pass
+ tree           | cow            | equal_keys_take_new_bytes      | pass
+ tree           | cow            | counts_nodes                   | pass
+ tree           | cow            | ranks                          | pass
+ tree           | cow            | diff_reads_changed_paths       | pass
+ tree           | cow            | diff_stops                     | pass
+ tree           | cow            | diff_across_heights            | pass
+ tree           | cow            | diff_unordered_matches         | pass
+ tree           | cow            | diff_estimate_bounds           | pass
+ tree           | cow            | seeks_in_order                 | pass
+ tree           | cow            | apply_reads_paths_once         | pass
+ tree           | cow            | nodes_are_valid                | pass
+ tree           | cow            | large_values                   | pass
+ tree           | cow            | held_references                | pass
+ tree           | cow            | value_splices                  | pass
+ tree           | cow            | complete                       | pass
+ tree           | stub           | identity                       | pass
+ tree           | stub           | build_and_get                  | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree           | stub           | large_keys                     | not implemented (missing build_begin, build_add, build_finish, apply, get, count, key_max)
+ tree           | stub           | cursor_scans                   | not implemented (missing build_begin, build_add, build_finish, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree           | stub           | apply_matches_reference        | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree           | stub           | apply_past_the_end             | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree           | stub           | history_independent            | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, count)
+ tree           | stub           | edits_share_nodes              | not implemented (missing build_begin, build_add, build_finish, apply, walk)
+ tree           | stub           | diff_reports_changes           | not implemented (missing build_begin, build_add, build_finish, apply, diff)
+ tree           | stub           | equal_keys_take_new_bytes      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, diff)
+ tree           | stub           | counts_nodes                   | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree           | stub           | ranks                          | not implemented (missing build_begin, build_add, build_finish, apply, get, count, rank)
+ tree           | stub           | diff_reads_changed_paths       | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
+ tree           | stub           | diff_stops                     | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
+ tree           | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
+ tree           | stub           | diff_unordered_matches         | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff_unordered)
+ tree           | stub           | diff_estimate_bounds           | not implemented (missing build_begin, build_add, build_finish, apply, diff_estimate)
+ tree           | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
+ tree           | stub           | apply_reads_paths_once         | not implemented (missing build_begin, build_add, build_finish, apply, get, walk)
+ tree           | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree           | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
+ tree           | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
+ tree           | stub           | value_splices                  | not implemented (missing value_write, value_read, value_root, value_splice)
+ tree           | stub           | complete                       | not implemented (25 of 25 callbacks missing)
+ table_keying   | pk_or_prefix   | identity                       | pass
+ table_keying   | pk_or_prefix   | round_trip                     | pass
+ table_keying   | pk_or_prefix   | keys_and_content               | pass
+ table_keying   | pk_or_prefix   | owns_its_memory                | pass
+ table_keying   | pk_or_prefix   | row_shapes                     | pass
+ table_keying   | pk_or_prefix   | old_shapes                     | pass
+ table_keying   | pk_or_prefix   | assembled_rows                 | pass
+ table_keying   | pk_or_prefix   | complete                       | pass
+ table_keying   | stub           | identity                       | pass
+ table_keying   | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
+ table_keying   | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close, encode_key)
+ table_keying   | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
+ table_keying   | stub           | row_shapes                     | not implemented (missing open, close, row_shape, shape_extends)
+ table_keying   | stub           | old_shapes                     | not implemented (missing open, encode_row, decode_row, close, row_shape, open_shape)
+ table_keying   | stub           | assembled_rows                 | not implemented (missing open, encode_row, close, row_fields, encode_row_fields)
+ table_keying   | stub           | complete                       | not implemented (27 of 27 callbacks missing)
+ canonicalizer  | folded         | identity                       | pass
+ canonicalizer  | folded         | complete                       | pass
+ canonicalizer  | stub           | identity                       | pass
+ canonicalizer  | stub           | complete                       | not implemented (42 of 42 callbacks missing)
+ chunk_store    | journal        | identity                       | pass
+ chunk_store    | journal        | complete                       | pass
+ chunk_format   | basic          | identity                       | pass
+ chunk_format   | basic          | items_round_trip               | pass
+ chunk_format   | basic          | rejects_other_bytes            | pass
+ chunk_format   | basic          | complete                       | pass
+ row_applier    | replication    | identity                       | pass
+ row_applier    | replication    | complete                       | pass
+ row_applier    | stub           | identity                       | pass
+ row_applier    | stub           | complete                       | not implemented (8 of 8 callbacks missing)
+ table_file     | basic          | identity                       | pass
+ table_file     | basic          | round_trip                     | pass
+ table_file     | basic          | rejects_other_bytes            | pass
+ table_file     | basic          | shared_prefixes                | pass
+ table_file     | basic          | complete                       | pass
+ table_file     | stub           | identity                       | pass
+ table_file     | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
+ table_file     | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
+ table_file     | stub           | shared_prefixes                | not implemented (missing write_begin, write_add, write_finish, open, find, decode, close)
+ table_file     | stub           | complete                       | not implemented (13 of 13 callbacks missing)
+ change_finder  | pages          | identity                       | pass
+ change_finder  | pages          | complete                       | pass
+ change_finder  | log            | identity                       | pass
+ change_finder  | log            | complete                       | pass
+ change_finder  | stub           | identity                       | pass
+ change_finder  | stub           | complete                       | not implemented (11 of 11 callbacks missing)
+ remote         | file           | identity                       | pass
+ remote         | file           | heads_and_chunks               | no checks yet
+ remote         | file           | complete                       | pass
+ remote         | postgresql     | identity                       | pass
+ remote         | postgresql     | heads_and_chunks               | no checks yet
+ remote         | postgresql     | complete                       | pass
+ remote         | postgres       | identity                       | pass
+ remote         | postgres       | heads_and_chunks               | no checks yet
+ remote         | postgres       | complete                       | pass
+ value_memo     | shared         | identity                       | pass
+ value_memo     | shared         | complete                       | pass
+ value_memo     | stub           | identity                       | pass
+ value_memo     | stub           | complete                       | not implemented (5 of 5 callbacks missing)
+ writers        | modes          | identity                       | pass
+ writers        | modes          | complete                       | pass
+ writers        | stub           | identity                       | pass
+ writers        | stub           | complete                       | not implemented (10 of 10 callbacks missing)
+ change_log     | relation       | identity                       | pass
+ change_log     | relation       | complete                       | pass
+ change_log     | stub           | identity                       | pass
+ change_log     | stub           | complete                       | not implemented (15 of 15 callbacks missing)
+ move_planner   | costs          | identity                       | pass
+ move_planner   | costs          | complete                       | pass
+ move_planner   | stub           | identity                       | pass
+ move_planner   | stub           | complete                       | not implemented (1 of 1 callbacks missing)
+ matcache       | branches       | identity                       | pass
+ matcache       | branches       | complete                       | pass
+ matcache       | stub           | identity                       | pass
+ matcache       | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ json_tree      | paths          | identity                       | pass
+ json_tree      | paths          | complete                       | pass
+ json_tree      | stub           | identity                       | pass
+ json_tree      | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ node_cache     | shared         | identity                       | pass
+ node_cache     | shared         | complete                       | pass
+ node_cache     | stub           | identity                       | pass
+ node_cache     | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+ commit_cache   | shared         | identity                       | pass
+ commit_cache   | shared         | complete                       | pass
+ commit_cache   | stub           | identity                       | pass
+ commit_cache   | stub           | complete                       | not implemented (5 of 5 callbacks missing)
+ history_window | archive        | identity                       | pass
+ history_window | archive        | complete                       | pass
+ history_window | stub           | identity                       | pass
+ history_window | stub           | complete                       | not implemented (7 of 7 callbacks missing)
+(226 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

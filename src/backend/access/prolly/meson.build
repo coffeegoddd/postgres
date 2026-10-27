@@ -75,6 +75,8 @@ backend_sources += files(
   'tree_stub.c',
   'valenc_canonical.c',
   'valenc_stub.c',
+  'window_archive.c',
+  'window_stub.c',
   'writers_modes.c',
   'writers_stub.c',
 )

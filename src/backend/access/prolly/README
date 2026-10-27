@@ -81,6 +81,7 @@ Changes to this design are tracked in GitHub issues:
 	json_tree         prolly_jsontree.h       paths, stub
 	node_cache        prolly_nodecache.h      shared, stub
 	commit_cache      prolly_commitcache.h    shared, stub
+	history_window    prolly_window.h         archive, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -1742,6 +1743,57 @@ what the diff holds, describes nothing and reads no catalog through
 holds, a materialized view written, or a table's rows that can't be told
 so leave it to the comparison above.
 
+
+History horizon
+---------------
+
+History is severed, never rewritten, to keep only a window of it here
+("archive", window_archive.c).  The oldest commits kept (the boundary) still
+name their parents, so no commit's hash changes; the horizon, entries of
+the refs (their side entries, space 'h'), records each boundary edge (a
+boundary commit and the parent it no longer keeps) and each fragment: the
+commits beyond the edges, down to an earlier fragment's, with its tops,
+the commits outside it its commits name (its stops), its identity (the
+root of a tree of its commits keyed by date then id, the same wherever the
+same commits are severed) and a digest over the sorted hashes of the
+chunks its commits reach.
+
+What is kept: every commit a ref names (a branch's head, a tag's, a
+remote-tracking branch's, a stash's, a merge's or rebase's in progress, a
+pin's, a commit a branch's pages are kept as of), each branch head's
+commits dated at or after the cut, and every commit on the way from a
+branch head to its merge base with each other one, so merging two live
+branches never needs a severed commit.  dolt_history_drop(before) severs
+what is older and lets it go (a fragment deleted); prolly_history_plan()
+says what a sever would do, and prolly_history_horizon() lists the
+fragments.  A sever is the database owner's, holds every ref, and takes
+the horizon's lock exclusively.
+
+A full collection reads the horizon as the root at its seal has it,
+through its own reads (the refs' side_scan_at()), and doesn't follow a
+boundary commit's chunks to the parents the horizon names: what only the
+fragment reached is freed.  A default collection follows them (as its
+settled files keep what they reach), and none runs in the transaction that
+changed the horizon, which might yet roll back.  A collection holds the
+horizon's lock shared, so no sever or repair moves the horizon meanwhile.
+
+dolt_history_repair(source, fragments) reattaches fragments, newest
+first (all, or the newest few), from a remote or clone that has their
+history (source, by name or URL) or, archived, from where they were
+archived: the transfer receives the tops and what they reach that the
+store lacks, re-hashing each chunk, and the fragment's commits, from its
+tops to its stops, must give its identity and digest again before its
+edges and record are let go of; otherwise nothing changes.  A repair is
+the database owner's and holds the horizon's lock exclusively.  The
+history then reads as it did: the same commits, hashes, roots, rows and
+diffs.
+
+Listings stop at the horizon, as a shallow clone's do: dolt_log, the
+history tables and history mounts list the commits kept, with a notice
+once a transaction; history walks (a merge base's, HEAD~n) don't go past
+it.  Reading a severed commit once it is freed (dolt_at, a diff, a merge
+whose base is past it) is an error saying it is past the horizon and how
+to repair it.
 
 Remotes
 -------

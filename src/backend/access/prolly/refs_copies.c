@@ -38,11 +38,10 @@
  *				   its tree (a byte, its high bit set if the tree has
  *				   any), the tree's root, count of moves and last move's
  *				   date if so (as a remote-tracking branch's log's entry
- *				   holds them), then each such move's date (the first's 8
- *				   bytes big-endian, each after it a varint of the time
- *				   since the one before) and commit (its hash's length and
- *				   the hash's bytes complemented), but the last move's,
- *				   the head's
+ *				   holds them), then each such move's date (8 bytes
+ *				   big-endian: so many bytes whatever the time between
+ *				   moves) and commit (its hash's length and the hash's
+ *				   bytes complemented), but the last move's, the head's
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
@@ -145,6 +144,10 @@
  *				   its tree's root (hash length, hash; 0: none yet), the
  *				   count of moves in it and the date of its last (8 bytes
  *				   big-endian each)
+ *	'S' space key
+ *				-> an entry another component keeps here (side_put()), in
+ *				   its space (a byte): the history window's horizon; none
+ *				   names a chunk
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
@@ -322,6 +325,7 @@
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 #define TAG_TRACKING_LOG 'l'	/* a remote-tracking branch's head log */
+#define TAG_SIDE		'S'	/* another component's entries, by space */
 #define TAIL_TREE		0x80	/* in a mover entry: its head log's tree follows */
 /*
  * Indexes of other entries, each kept with them, so that a lookup by what
@@ -353,11 +357,11 @@
  * after the transaction that moved it; 21: a branch's kept list may name
  * the storage a restore replaced (a retired entry whose relations'
  * snapshot is BRANCH_KEPT_STORAGE), dropped once no snapshot is older than
- * it.
- * 22: kept relations' pages by roots their page stores keep (not
+ * it; 22: other components' entries (the history horizon).
+ * 23: kept relations' pages by roots their page stores keep (not
  * snapshots their storage keeps), and each kept commit's time.
  */
-#define REFS_FORMAT		"22"
+#define REFS_FORMAT		"23"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -6336,8 +6340,14 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 	int			nitems = 0;
 
 	refs_init();
-	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+	if (id->len == 0)
 		return false;
+	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+	{
+		/* (one past the history horizon: said so, with how to repair it) */
+		prolly_window_check_missing(id);
+		return false;
+	}
 	ref_of(id, &ref);
 	memset(info, 0, sizeof(*info));
 	info->id = *id;
@@ -6549,8 +6559,13 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 		return true;
 	if (tracking_head(refname, commit_id))
 		return true;
-	return parse_commit_id(refname, commit_id) &&
-		commit_links(commit_id, &links);
+	if (!parse_commit_id(refname, commit_id))
+		return false;
+	if (commit_links(commit_id, &links))
+		return true;
+	/* (a commit named by its id, not here: past the horizon, maybe) */
+	prolly_window_check_absent(commit_id);
+	return false;
 }
 
 static bool
@@ -10969,10 +10984,24 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		 * visited.
 		 */
 		if (!PROLLY_CALL(env.chunk_store, has, env.chunks, next))
+		{
+			/*
+			 * (one past the history horizon: whole where the visitor
+			 * already has it, as a remote it is sent to may; else the
+			 * walk can't go on)
+			 */
+			if (prolly_window_archived(next))
+			{
+				ref_of(next, &ref);
+				if (!ws->visit(&ref, 0, ws->arg))
+					continue;
+				prolly_window_check_missing(next);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(next))));
+		}
 		if (!copies_commit_get(next, &info))
 		{
 			ProllyTagInfo tag;
@@ -11995,6 +12024,224 @@ copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
 }
 
 /* ------------------------------------------------------------------------
+ * Other components' entries
+ * ------------------------------------------------------------------------
+ */
+
+static void
+side_key(StringInfo out, char space, const ProllyKey *key)
+{
+	appendStringInfoChar(out, TAG_SIDE);
+	appendStringInfoChar(out, space);
+	if (key)
+		appendBinaryStringInfo(out, (const char *) key->data, key->len);
+}
+
+static bool
+copies_side_get(char space, const ProllyKey *key, StringInfo value)
+{
+	StringInfoData k;
+	bool		found;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	found = refs_get(k.data, k.len, value);
+	pfree(k.data);
+	return found;
+}
+
+static void
+copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
+{
+	StringInfoData k;
+	StringInfoData v;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	if (value)
+	{
+		v.data = (char *) value->data;
+		v.len = value->len;
+		v.maxlen = value->len + 1;
+		v.cursor = 0;
+	}
+	refs_put(k.data, k.len, value ? &v : NULL);
+	pfree(k.data);
+}
+
+typedef bool (*SideVisit) (const ProllyKey *key, const ProllyValue *value,
+						   void *arg);
+
+/* A side scan of the refs tree root, its nodes read through renv. */
+static void
+scan_side(const ProllyNodeRef *rootp, const ProllyTreeEnv *renv, char space,
+		  const ProllyKey *from, ScanDirection direction, SideVisit visit,
+		  void *arg)
+{
+	ProllyNodeRef root = *rootp;
+	ProllyTreeCursor *c;
+	StringInfoData start;
+	char		prefix[2] = {TAG_SIDE, space};
+	ProllyKey	k;
+	ProllyValue v;
+
+	initStringInfo(&start);
+	side_key(&start, space, from);
+	/*
+	 * (backward from none: from the space's end, past every key of it: its
+	 * prefix then more 0xff bytes than any key has, whatever the space's
+	 * byte is)
+	 */
+	if (from == NULL && ScanDirectionIsBackward(direction))
+	{
+		Size		max = PROLLY_CALL(tree, key_max, env.chunk_format,
+									  env.hash);
+
+		for (Size i = 0; i <= max; i++)
+			appendStringInfoChar(&start, (char) 0xff);
+	}
+	c = PROLLY_CALL(tree, cursor_open, renv, &root, CurrentMemoryContext);
+	{
+		ProllyKey	seek = {(const uint8 *) start.data, start.len};
+
+		PROLLY_CALL(tree, cursor_seek, c, &seek, direction);
+	}
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		ProllyKey	own;
+
+		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
+			break;
+		own.data = k.data + 2;
+		own.len = k.len - 2;
+		if (!visit(&own, &v, arg))
+			break;
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(start.data);
+}
+
+static void
+copies_side_scan(char space, const ProllyKey *from, ScanDirection direction,
+				 SideVisit visit, void *arg)
+{
+	ProllyNodeRef root;
+
+	if (refs_root(&root))
+		scan_side(&root, &env, space, from, direction, visit, arg);
+}
+
+/* A store of nothing but a reader's chunks: what side_scan_at() reads. */
+typedef struct ReaderStore
+{
+	ProllyChunkRead read;
+	void	   *arg;
+} ReaderStore;
+
+static bool
+reader_get(ProllyChunkStore *store, const ProllyHash *hash, StringInfo out)
+{
+	ReaderStore *rs = (ReaderStore *) store;
+
+	return rs->read(rs->arg, hash, out);
+}
+
+static bool
+reader_has(ProllyChunkStore *store, const ProllyHash *hash)
+{
+	StringInfoData data;
+	bool		found;
+
+	initStringInfo(&data);
+	found = reader_get(store, hash, &data);
+	pfree(data.data);
+	return found;
+}
+
+static const ProllyChunkStoreRoutine reader_store = {
+	.info = {
+		.iface = PROLLY_IFACE_CHUNK_STORE,
+		.name = "reader",
+		.description = "the chunks a reader gives",
+	},
+	.get = reader_get,
+	.has = reader_has,
+};
+
+static void
+first_child(const ProllyHash *ref, void *arg)
+{
+	ProllyHash *first = arg;
+
+	if (first->len == 0)
+		*first = *ref;
+}
+
+/*
+ * Is root a refs tree of this format, as the reader has it?  Its leftmost
+ * path read, each node one of the format's, down to the first key, the
+ * format's entry.  (A store's root may be something else in a test of the
+ * store alone.)
+ */
+static bool
+reader_refs_root(ReaderStore *rs, const ProllyHash *root)
+{
+	ProllyHash	at = *root;
+	StringInfoData data;
+	bool		ok = false;
+
+	initStringInfo(&data);
+	for (int depth = 0; depth < 64; depth++)
+	{
+		ProllyChunkNode node;
+
+		resetStringInfo(&data);
+		if (!rs->read(rs->arg, &at, &data) ||
+			!PROLLY_CALL(env.chunk_format, open, (const uint8 *) data.data,
+						 data.len, &node) || node.nitems == 0)
+			break;
+		if (node.level == 0)
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+
+			PROLLY_CALL(env.chunk_format, item_get, &node, 0, &k, &v, &flags);
+			ok = k.len == 1 && k.data[0] == TAG_FORMAT &&
+				v.len == strlen(REFS_FORMAT) &&
+				memcmp(v.data, REFS_FORMAT, v.len) == 0;
+			break;
+		}
+		memset(&at, 0, sizeof(at));
+		prolly_chunk_references(data.data, data.len, first_child, &at);
+		if (at.len == 0)
+			break;
+	}
+	pfree(data.data);
+	return ok;
+}
+
+static void
+copies_side_scan_at(const ProllyHash *root, ProllyChunkRead read,
+					void *read_arg, char space, const ProllyKey *from,
+					ScanDirection direction, SideVisit visit, void *arg)
+{
+	ReaderStore rs = {read, read_arg};
+	ProllyTreeEnv renv;
+	ProllyNodeRef r;
+
+	refs_init();
+	if (root->len == 0 || !reader_refs_root(&rs, root))
+		return;
+	renv = env;
+	renv.chunk_store = &reader_store;
+	renv.chunks = (ProllyChunkStore *) &rs;
+	renv.counters = NULL;
+	r.hash = *root;
+	scan_side(&r, &renv, space, from, direction, visit, arg);
+}
+
+/* ------------------------------------------------------------------------
  * Head logs
  *
  * Each branch's head log is its head's moves in order, each with its date
@@ -12206,18 +12453,12 @@ tail_moves(const StringInfoData *v, const ProllyHash *head, LogMove *moves,
 				 errmsg("a prolly head log is corrupt")));
 	for (int i = 0; i < n; i++)
 	{
-		if (i == 0)
-		{
-			if (end - p < 8)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("a prolly head log is corrupt")));
-			moves[i].at = (TimestampTz) get_be64_at(p);
-			p += 8;
-		}
-		else
-			moves[i].at = moves[i - 1].at +
-				(TimestampTz) prolly_get_varint(&p, end);
+		if (end - p < 8)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly head log is corrupt")));
+		moves[i].at = (TimestampTz) get_be64_at(p);
+		p += 8;
 		if (i < n - 1)
 			p = get_log_id(p, end, &moves[i].commit);
 		else
@@ -12296,10 +12537,7 @@ head_log_note(const char *name, const ProllyHash *was, const ProllyHash *head,
 		put_log_state(mover, &ls);
 	for (int i = 0; i < n; i++)
 	{
-		if (i == 0)
-			put_uint64(mover, (uint64) tail[i].at);
-		else
-			prolly_put_varint(mover, (uint64) (tail[i].at - tail[i - 1].at));
+		put_uint64(mover, (uint64) tail[i].at);
 		if (i < n - 1)
 			put_log_id(mover, &tail[i].commit);
 	}
@@ -12591,4 +12829,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches_folded = copies_branches_folded,
 	.head_at = copies_head_at,
 	.head_moves = copies_head_moves,
+	.side_get = copies_side_get,
+	.side_put = copies_side_put,
+	.side_scan = copies_side_scan,
+	.side_scan_at = copies_side_scan_at,
 };
