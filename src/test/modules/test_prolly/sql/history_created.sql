@@ -22,3 +22,5 @@ SELECT current_database() AS home \gset
 \i :shape_file
 \set shape create_drop
 \i :shape_file
+\set shape amend
+\i :shape_file

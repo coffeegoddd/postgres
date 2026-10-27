@@ -932,7 +932,116 @@ typedef struct Plan
 	List	   *stops;			/* ProllyHash *, outside it, its commits name */
 	HTAB	   *archived;		/* the horizon's parents now */
 	HTAB	   *heights;		/* of commits recording none */
+	List	   *orphans;		/* ProllyHash *, pairs: a kept commit and a
+								 * parent past the horizon no edge names it
+								 * with (an amend of a boundary commit) */
 } Plan;
+
+static void
+edge_key(StringInfo k, const ProllyHash *parent, const ProllyHash *child)
+{
+	appendStringInfoChar(k, KEY_EDGE);
+	put_id(k, parent);
+	put_id(k, child);
+}
+
+/* Whether the horizon has edge child -> parent. */
+static bool
+edge_known(const ProllyHash *child, const ProllyHash *parent)
+{
+	StringInfoData k;
+	StringInfoData v;
+	ProllyKey	key;
+	bool		found;
+
+	initStringInfo(&k);
+	initStringInfo(&v);
+	edge_key(&k, parent, child);
+	key.data = (const uint8 *) k.data;
+	key.len = k.len;
+	found = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v);
+	pfree(k.data);
+	pfree(v.data);
+	return found;
+}
+
+typedef struct ParentFragment
+{
+	StringInfoData prefix;
+	int64		number;
+} ParentFragment;
+
+static bool
+note_parent_fragment(const ProllyKey *key, const ProllyValue *value,
+					 void *arg)
+{
+	ParentFragment *pf = arg;
+
+	if (key->len < (Size) pf->prefix.len ||
+		memcmp(key->data, pf->prefix.data, pf->prefix.len) != 0)
+		return false;
+	if (value->len == 8)
+		pf->number = (int64) get_be64((const char *) value->data);
+	return false;
+}
+
+/* The fragment a parent past the horizon is a top of (0: none). */
+static int64
+parent_fragment(const ProllyHash *parent)
+{
+	ParentFragment pf;
+	ProllyKey	from;
+
+	initStringInfo(&pf.prefix);
+	appendStringInfoChar(&pf.prefix, KEY_EDGE);
+	put_id(&pf.prefix, parent);
+	pf.number = 0;
+	from.data = (const uint8 *) pf.prefix.data;
+	from.len = pf.prefix.len;
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+				ForwardScanDirection, note_parent_fragment, &pf);
+	pfree(pf.prefix.data);
+	return pf.number;
+}
+
+/*
+ * Record each kept commit naming a parent past the horizon by no edge
+ * (made since: an amend, a commit after a reset to a boundary commit), an
+ * edge of the parent's fragment's: a collection then doesn't follow it,
+ * and a repair of that fragment lets go of it.  The caller holds the
+ * horizon and the refs.
+ */
+static bool
+record_orphans(Plan *plan)
+{
+	bool		any = false;
+
+	foreach_ptr(ProllyHash, pair, plan->orphans)
+	{
+		int64		n;
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		ProllyValue value;
+
+		if (edge_known(&pair[0], &pair[1]) ||
+			(n = parent_fragment(&pair[1])) == 0)
+			continue;
+		initStringInfo(&k);
+		initStringInfo(&v);
+		edge_key(&k, &pair[1], &pair[0]);
+		put_be64(&v, (uint64) n);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		value.data = (const uint8 *) v.data;
+		value.len = v.len;
+		PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+		pfree(k.data);
+		pfree(v.data);
+		any = true;
+	}
+	return any;
+}
 
 static bool
 lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
@@ -1184,6 +1293,16 @@ keep(Plan *plan, PlanCommit *pc)
 	plan->kept = lappend(plan->kept, pc);
 }
 
+static void
+add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
+{
+	ProllyHash *pair = palloc_array(ProllyHash, 2);
+
+	pair[0] = *a;
+	pair[1] = *b;
+	*list = lappend(*list, pair);
+}
+
 /* A branch head's window: walked from it down to what it doesn't keep. */
 static void
 walk_window(Plan *plan, Head *h)
@@ -1219,7 +1338,13 @@ walk_window(Plan *plan, Head *h)
 		{
 			ProllyHash *p = &pc->e.parents[i];
 
-			if (set_has(plan->archived, p) || !set_add(seen, p))
+			if (set_has(plan->archived, p))
+			{
+				if (!edge_known(&pc->id, p))
+					add_pair(&plan->orphans, &pc->id, p);
+				continue;
+			}
+			if (!set_add(seen, p))
 				continue;
 			todo = lappend(todo, p);
 		}
@@ -1227,15 +1352,6 @@ walk_window(Plan *plan, Head *h)
 	hash_destroy(seen);
 }
 
-static void
-add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
-{
-	ProllyHash *pair = palloc_array(ProllyHash, 2);
-
-	pair[0] = *a;
-	pair[1] = *b;
-	*list = lappend(*list, pair);
-}
 
 /*
  * Each head's window: its commits dated before before (if given) cut;
@@ -1428,6 +1544,13 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
  * ------------------------------------------------------------------------
  */
 
+/* A commit's delta, to keep: what it makes over its first parent. */
+typedef struct Delta
+{
+	ProllyHash	id;
+	List	   *hashes;			/* ProllyHash * */
+} Delta;
+
 typedef struct Closure
 {
 	bool		prune;			/* every walk whole: decline what is noted */
@@ -1524,25 +1647,21 @@ delta_key(StringInfo k, const ProllyHash *id, uint32 piece)
  * later sever, or a repair's check, of the fragment b falls in finds b's
  * born nodes here.  Kept in pieces, each hash complemented.
  */
+/* Keep hashes, what boundary commit b makes over its first parent. */
 static void
-keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
-		   const ProllyCommitInfo *pinfo)
+write_delta(const ProllyHash *b, List *hashes)
 {
-	Closure		c = {0};
 	StringInfoData k;
 	StringInfoData v;
 	uint32		piece = 0;
 	int			n = 0;
 
-	c.seen = id_set("prolly boundary delta", sizeof(ProllyHash));
-	initStringInfo(&c.buf);
-	commit_created(&c, b, binfo, pinfo);
 	initStringInfo(&k);
 	initStringInfo(&v);
-	foreach_ptr(ProllyHash, h, c.chunks)
+	foreach_ptr(ProllyHash, h, hashes)
 	{
 		put_value_id(&v, h);
-		if (++n == DELTA_PIECE || foreach_current_index(h) == list_length(c.chunks) - 1)
+		if (++n == DELTA_PIECE || foreach_current_index(h) == list_length(hashes) - 1)
 		{
 			ProllyKey	key;
 			ProllyValue value;
@@ -1560,6 +1679,25 @@ keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
 	}
 	pfree(k.data);
 	pfree(v.data);
+}
+
+/*
+ * Keep what boundary commit b makes that its parent (pinfo; NULL: it is
+ * gone) lacks, beside the horizon: its parent is severed now, and gone
+ * once collected, so a later sever, or a repair's check, of the fragment b
+ * falls in finds b's born nodes here.  Kept in pieces, each hash
+ * complemented.
+ */
+static void
+keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
+		   const ProllyCommitInfo *pinfo)
+{
+	Closure		c = {0};
+
+	c.seen = id_set("prolly boundary delta", sizeof(ProllyHash));
+	initStringInfo(&c.buf);
+	commit_created(&c, b, binfo, pinfo);
+	write_delta(b, c.chunks);
 	pfree(c.buf.data);
 	hash_destroy(c.seen);
 }
@@ -1640,14 +1778,19 @@ kept_delta(Closure *c, const ProllyHash *id)
  */
 static void
 fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
-				 int64 *bytes, List **chunk_list)
+				 int64 *bytes, List **chunk_list, List **deltas)
 {
 	Closure		c = {0};
 	ListCell   *lc;
 	ProllyHashCtx *ctx;
+	HTAB	   *in = id_set("prolly fragment commits", sizeof(ProllyHash));
 
 	c.seen = id_set("prolly fragment chunks", sizeof(ProllyHash));
 	initStringInfo(&c.buf);
+	foreach(lc, commits)
+		(void) set_add(in, lfirst(lc));
+	if (deltas)
+		*deltas = NIL;
 	foreach(lc, commits)
 	{
 		ProllyHash *id = lfirst(lc);
@@ -1664,14 +1807,44 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(id))));
 		}
-		parent_here = info.nparents > 0 &&
-			PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
-						&info.parents[0]) &&
-			PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo);
-		if (parent_here || info.nparents == 0)
-			commit_created(&c, id, &info, parent_here ? &pinfo : NULL);
-		else if (!kept_delta(&c, id))
+		if (info.nparents == 0)
+		{
 			commit_created(&c, id, &info, NULL);
+			continue;
+		}
+		parent_here = PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+								  &info.parents[0]) &&
+			PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo);
+
+		/*
+		 * (by the fragment, not by what the store holds: a first parent in
+		 * it is walked against, here whenever the fragment is; one outside
+		 * it, from the delta kept, which a sever keeps, as found then, for
+		 * a commit that has none yet, so its repair finds the same)
+		 */
+		if (set_has(in, &info.parents[0]) && parent_here)
+			commit_created(&c, id, &info, &pinfo);
+		else if (!kept_delta(&c, id))
+		{
+			if (deltas)
+			{
+				Closure		one = {0};
+				Delta	   *d = palloc(sizeof(Delta));
+
+				one.seen = id_set("prolly commit delta", sizeof(ProllyHash));
+				initStringInfo(&one.buf);
+				commit_created(&one, id, &info, parent_here ? &pinfo : NULL);
+				foreach_ptr(ProllyHash, h, one.chunks)
+					(void) note_node(&c, h);
+				d->id = *id;
+				d->hashes = one.chunks;
+				*deltas = lappend(*deltas, d);
+				pfree(one.buf.data);
+				hash_destroy(one.seen);
+			}
+			else
+				commit_created(&c, id, &info, parent_here ? &pinfo : NULL);
+		}
 	}
 	list_sort(c.chunks, hash_cmp);
 	ctx = PROLLY_CALL(tree_env.hash, begin, CurrentMemoryContext);
@@ -1689,6 +1862,7 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 		*chunk_list = c.chunks;
 	pfree(c.buf.data);
 	hash_destroy(c.seen);
+	hash_destroy(in);
 }
 
 /*
@@ -2039,7 +2213,7 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 static void
 build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
 			   ProllyWindowFragment *f, List **ids, List **chunk_list,
-			   int *nstops, ProllyHash **stops)
+			   int *nstops, ProllyHash **stops, List **deltas)
 {
 	ListCell   *lc;
 	ProllyHash *tops;
@@ -2064,7 +2238,7 @@ build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
 	f->commits = list_length(plan->severed);
 	fragment_root(plan->severed, &f->root);
 	fragment_closure(*ids, &f->digest, &f->chunks, &f->bytes,
-					 want_chunks ? chunk_list : NULL);
+					 want_chunks ? chunk_list : NULL, deltas);
 
 	/* its tops: each parent the boundary keeps no more, once */
 	tops = palloc_array(ProllyHash, Max(list_length(plan->edges), 1));
@@ -2133,6 +2307,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	StringInfoData v;
 
 	List	   *chunk_list = NIL;
+	List	   *deltas = NIL;
 	char	   *archive_url = NULL;
 	ProllyWindowPolicy policy;
 
@@ -2161,7 +2336,17 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
 		make_plan(&plan, before, size_cut);
 		if (plan.severed == NIL)
+		{
+			/* (nothing to sever, but the horizon told of new edges) */
+			if (plan.orphans != NIL)
+			{
+				horizon_lock(ExclusiveLock);
+				PROLLY_CALL(dc.refs, lock);
+				if (record_orphans(&plan))
+					horizon_changed();
+			}
 			return;
+		}
 
 		/* (archive mode with nowhere to archive to: nothing is severed) */
 		if (action == PROLLY_WINDOW_ARCHIVE && archive_url == NULL)
@@ -2179,7 +2364,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 			archive_url = policy.archive;
 		}
 		build_fragment(&plan, action, archive_url != NULL, &f, &ids,
-					   &chunk_list, &nstops, &stops);
+					   &chunk_list, &nstops, &stops, &deltas);
 		if (archive_url)
 		{
 			const char *elsewhere = archived_elsewhere(archive_url);
@@ -2249,6 +2434,10 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	 * (what each boundary commit makes over its first parent, severed
 	 * now, kept for when it falls in a fragment itself)
 	 */
+	(void) record_orphans(&plan);
+	/* (the fragment's commits' deltas over parents outside it, as found) */
+	foreach_ptr(Delta, d, deltas)
+		write_delta(&d->id, d->hashes);
 	foreach(lc, plan.edges)
 	{
 		ProllyHash *pair = lfirst(lc);
@@ -2978,7 +3167,7 @@ archive_repair(const char *source, int nfragments)
 		foreach_ptr(PlanCommit, pc, commits)
 			ids = lappend(ids, &pc->id);
 		fragment_root(commits, &root);
-		fragment_closure(ids, &digest, &chunks, &bytes, NULL);
+		fragment_closure(ids, &digest, &chunks, &bytes, NULL, NULL);
 		if (list_length(commits) != r->f.commits || !same_hash(&root, &r->f.root) ||
 			!same_hash(&digest, &r->f.digest))
 			ereport(ERROR,
