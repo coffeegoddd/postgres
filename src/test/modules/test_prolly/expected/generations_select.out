@@ -470,6 +470,21 @@ SELECT garbage AS p0_noted FROM test_chunk_generations()
         2
 (1 row)
 
+-- (conjoined, the files carry the estimates of those they merge)
+SELECT sum(garbage) AS noted FROM test_chunk_generations() WHERE settled \gset
+SELECT test_chunk_conjoin();
+ test_chunk_conjoin 
+--------------------
+ 
+(1 row)
+
+SELECT count(*) AS settled_files, sum(garbage) = :noted AS estimates_carried
+	FROM test_chunk_generations() WHERE settled;
+ settled_files | estimates_carried 
+---------------+-------------------
+             1 | t
+(1 row)
+
 \c postgres
 DROP DATABASE generations_select_probes;
 -- Archived, retired as chosen, then repaired: the history reads again,

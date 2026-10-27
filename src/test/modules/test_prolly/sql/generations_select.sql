@@ -172,6 +172,11 @@ SELECT test_chunk_note_garbage(ARRAY[repeat('ab', 20)]) AS probes_absent;
 SELECT garbage AS p0_noted FROM test_chunk_generations()
 	WHERE epoch_lo = (SELECT min(epoch_lo) FROM test_chunk_generations()
 					  WHERE settled);
+-- (conjoined, the files carry the estimates of those they merge)
+SELECT sum(garbage) AS noted FROM test_chunk_generations() WHERE settled \gset
+SELECT test_chunk_conjoin();
+SELECT count(*) AS settled_files, sum(garbage) = :noted AS estimates_carried
+	FROM test_chunk_generations() WHERE settled;
 \c postgres
 DROP DATABASE generations_select_probes;
 
