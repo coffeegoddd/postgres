@@ -460,6 +460,7 @@ tests += {
       't/595_move_carries_statistics.pl',
       't/610_ssi_fold_worker_xid.pl',
       't/625_history_window_auto.pl',
+      't/629_history_auto_commits.pl',
       't/626_history_horizon_standby.pl',
       't/627_history_repair_collect.pl',
       't/628_history_sever_planned.pl',

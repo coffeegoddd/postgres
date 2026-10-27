@@ -54,6 +54,17 @@
  *   collection, as before the refs' for a sever or repair), refusing a
  *   transaction that changed the horizon.
  * - plan() reads the refs as they stand, holding none.
+ * - window() visits the commits in the window now (branch not NULL: in
+ *   that branch's lineage's; NULL: in any branch's), each once, until
+ *   visit returns false: those its lineage's policy keeps for their age
+ *   or count, by the clock a sever ages them by (no commit older than one
+ *   beneath it; a commit dated past now aged from its arrival here), the
+ *   cut taken once for the whole evaluation.  Not the commits kept only
+ *   because a ref names them or for a merge base.  A lineage with no
+ *   window keeps all its history here, so all of it is in the window.
+ *   in_window() says whether commit is among them: a sever never severs a
+ *   commit in_window() says is in the window.  Both read the refs as they
+ *   stand, holding none.
  * - repair() reattaches the newest nfragments of them (< 0: all), newest
  *   first, from source (a remote's name or URL; NULL: each fragment's
  *   archive), and lets go of the horizon's record of each only once its
@@ -150,6 +161,9 @@ typedef struct ProllyWindowFragment
 	const ProllyHash *tops;
 } ProllyWindowFragment;
 
+/* A commit in the window; false stops the visit. */
+typedef bool (*ProllyWindowCommitVisit) (const ProllyHash *commit, void *arg);
+
 typedef void (*ProllyWindowFragmentVisit) (const ProllyWindowFragment *f,
 										   void *arg);
 typedef void (*ProllyWindowEdgeVisit) (const ProllyHash *boundary,
@@ -176,13 +190,17 @@ typedef struct ProllyWindowRoutine
 	bool		(*maintain) (void);
 	bool		(*collect_due) (void);
 	void		(*collected) (void);
+	void		(*window) (const char *branch, ProllyWindowCommitVisit visit,
+						   void *arg);
+	bool		(*in_window) (const char *branch, const ProllyHash *commit);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
-	"policy", "set_policy", "maintain", "collect_due", "collected"
+	"policy", "set_policy", "maintain", "collect_due", "collected", \
+	"window", "in_window"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK collected
+#define PROLLY_WINDOW_LAST_CALLBACK in_window
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)
