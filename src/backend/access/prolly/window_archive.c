@@ -4177,7 +4177,26 @@ typedef struct SettleAbsent
 {
 	List	   *records;		/* FragmentRecord *: the horizon's */
 	FragmentRecord *repairing;
+	int			nroots;
+	ProllyHash *roots;			/* its commits' data: the roots settled */
+	ProllyHash *commits;		/* and the commit naming each */
 } SettleAbsent;
+
+/* The commits naming a severed commit's data (its tree or dependencies). */
+static int
+settle_named_by(void *arg, const ProllyHash *root, ProllyHash **by)
+{
+	SettleAbsent *sa = arg;
+	int			n = 0;
+
+	*by = palloc_array(ProllyHash, Max(sa->nroots, 1));
+	for (int i = 0; i < sa->nroots; i++)
+	{
+		if (same_hash(&sa->roots[i], root))
+			(*by)[n++] = sa->commits[i];
+	}
+	return n;
+}
 
 /*
  * A chunk a fragment being repaired names, not here: if it is another
@@ -4339,26 +4358,46 @@ archive_repair(const char *source, int nfragments)
 							   prolly_hash_hex(&r->f.digest))));
 
 		/* (its commits' data back) */
-		foreach_ptr(PlanCommit, pc, commits)
 		{
-			ProllyCommitInfo info;
+			int			max = 2 * Max(list_length(commits), 1);
+			ProllyHash *data_roots = palloc_array(ProllyHash, max);
+			ProllyHash *namers = palloc_array(ProllyHash, max);
+			int			ndata = 0;
 
-			if (PROLLY_CALL(dc.refs, commit_get, &pc->id, &info))
+			foreach_ptr(PlanCommit, pc, commits)
+			{
+				ProllyCommitInfo info;
+
+				if (!PROLLY_CALL(dc.refs, commit_get, &pc->id, &info))
+					continue;
 				severed_drop(&pc->id, &info);
-		}
+				data_roots[ndata] = info.root.hash;
+				namers[ndata++] = pc->id;
+				if (info.has_dependencies)
+				{
+					data_roots[ndata] = info.dependencies.hash;
+					namers[ndata++] = pc->id;
+				}
+			}
 
-		/*
-		 * Verified, settled: the boundary commits, in settled files, name
-		 * what was received, and a default collection doesn't read
-		 * settled files.
-		 */
-		if (PROLLY_HAS(tree_env.chunk_store, settle))
-		{
-			SettleAbsent sa = {records, r};
+			/*
+			 * Verified, settled: the commits, kept in settled files, name
+			 * the data received, and a default collection doesn't read
+			 * settled files.  Walking from the fragment's tops would stop
+			 * at once, since they are those commits, still here.  Each
+			 * tree goes back to the generation its commit's file lists it
+			 * by, or the file's own.
+			 */
+			if (PROLLY_HAS(tree_env.chunk_store, settle))
+			{
+				SettleAbsent sa = {records, r, ndata, data_roots, namers};
 
-			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
-						r->f.tops, r->top_epochs, r->f.ntops,
-						settle_absent, &sa);
+				PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
+							data_roots, NULL, ndata,
+							settle_absent, settle_named_by, &sa);
+			}
+			pfree(data_roots);
+			pfree(namers);
 		}
 
 		/*

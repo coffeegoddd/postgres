@@ -263,6 +263,14 @@ typedef void (*ProllyChunkListedVisit) (const ProllyHash *target,
 										uint32 epoch, void *arg);
 
 /*
+ * settle()'s question of a root: the commits that name it from outside
+ * what is settled (a fragment's boundary commits), as many as returned,
+ * in *by (palloc'd).
+ */
+typedef int (*ProllySettleNamedBy) (void *arg, const ProllyHash *root,
+									ProllyHash **by);
+
+/*
  * settle()'s question of a chunk named that isn't here: the generation to
  * list it by, proposed (0: none to list).
  */
@@ -510,14 +518,20 @@ typedef struct ProllyChunkStoreRoutine
 	 * Each root goes to generation epochs[i] (0: the one the settled
 	 * files list it by); absent() is asked the generation of a chunk the
 	 * chunks settled name that isn't here (a severed fragment's top), to
-	 * list it by, proposing one (0: it isn't one).
+	 * list it by, proposing one (0: it isn't one).  named_by() gives the
+	 * chunks that name a root from outside: a root goes back to the
+	 * generation the settled file of one lists it by, and one in a file
+	 * older than its root's generation, or listing it by another, is an
+	 * error (nothing settled): what names a chunk must be as new as it is,
+	 * and list it right.
 	 *
 	 * epoch_of(), optional: the first generation of the settled file that
 	 * holds a chunk, the oldest if several do (0: none does).
 	 */
 	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
 						   const uint32 *epochs, int nroots,
-						   ProllySettleAbsent absent, void *arg);
+						   ProllySettleAbsent absent,
+						   ProllySettleNamedBy named_by, void *arg);
 
 	/*
 	 * Optional: check the settled files' generations, an error if one is
