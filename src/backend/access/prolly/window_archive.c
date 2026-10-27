@@ -879,6 +879,28 @@ make_plan(Plan *plan, TimestampTz cut)
 	hash_destroy(fragment);
 }
 
+/*
+ * A plan made holding no ref (it walks the windows and searches the merge
+ * bases, which take a while, and commits on every branch would wait),
+ * then every ref held: made again only if the refs moved meanwhile (the
+ * store's root, which every change of them moves).  The caller holds the
+ * horizon's lock, so the horizon doesn't move.
+ */
+static void
+plan_then_hold(Plan *plan, const TimestampTz *before)
+{
+	ProllyHash	planned;
+	ProllyHash	held;
+
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
+	make_plan(plan, *before);
+	INJECTION_POINT("prolly-sever-planned", NULL);
+	PROLLY_CALL(dc.refs, lock);
+	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &held);
+	if (!same_id(&planned, &held))
+		make_plan(plan, *before);
+}
+
 static void
 archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 {
@@ -1134,8 +1156,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	check_may_sever("sever");
 	PreventCommandIfReadOnly("severing history");
 	horizon_lock(ExclusiveLock);
-	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, *before);
+	plan_then_hold(&plan, before);
 	if (plan.severed == NIL)
 		return;
 
