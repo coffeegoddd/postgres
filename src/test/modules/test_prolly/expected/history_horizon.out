@@ -5,6 +5,8 @@
 -- of a severed commit's content says it is past it and how to repair it.
 -- Every commit a ref names (a tag's) is kept, and so is every commit down
 -- to the merge base of two branches.
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/history_horizon/' || txid_current() AS url_empty \gset
 SELECT current_database() AS home \gset
 -- (notices without their details, which name commits by hash)
 \set VERBOSITY terse
@@ -30,12 +32,6 @@ INSERT INTO hh.t VALUES (1, 'c1');
 SELECT hh_commit('c1', 1) AS c1 \gset
 UPDATE hh.t SET v = 'c2';
 SELECT hh_commit('c2', 2) AS c2 \gset
-SELECT dolt_tag('v1', :'c2');
- dolt_tag 
-----------
- {0}
-(1 row)
-
 UPDATE hh.t SET v = 'c3';
 INSERT INTO hh.t SELECT g, repeat('x', 200) FROM generate_series(100, 600) g;
 SELECT hh_commit('c3', 3) AS c3 \gset
@@ -74,20 +70,28 @@ CREATE FUNCTION hh_name(h text) RETURNS text LANGUAGE sql AS $$
 	SELECT coalesce((SELECT name FROM hh_names WHERE hash = h), h)
 $$;
 -- The plan before the sixth day: main keeps c6, and c5 and c4 down to its
--- merge base with feature (c4); the tag keeps c2.  c3 and c1 are severed.
+-- merge base with feature (c4).  c3, c2 and c1 are severed.  (Planning
+-- reads the refs as they stand: a read-only transaction may, and anyone.)
 SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
 FROM prolly_history_plan('2020-01-06 00:00+00')
 ORDER BY kind, commit, parent;
-   kind   | commit | parent |    why     
-----------+--------+--------+------------
- boundary | c2     | c1     | 
+   kind   | commit | parent | why 
+----------+--------+--------+-----
  boundary | c4     | c3     | 
- pinned   | c2     |        | ref
- pinned   | c4     |        | merge base
+ pinned   | c4     |        | ref
  severed  | c1     |        | 
+ severed  | c2     |        | 
  severed  | c3     |        | 
-(6 rows)
+(5 rows)
 
+BEGIN READ ONLY;
+SELECT count(*) AS read_only_plan FROM prolly_history_plan('2020-01-06 00:00+00');
+ read_only_plan 
+----------------
+              5
+(1 row)
+
+COMMIT;
 -- Nothing severed yet: planning changes nothing.
 SELECT count(*) AS fragments FROM prolly_history_horizon();
  fragments 
@@ -100,7 +104,7 @@ BEGIN;
 SELECT fragment, commits FROM dolt_history_drop('2020-01-06 00:00+00');
  fragment | commits 
 ----------+---------
-        1 |       2
+        1 |       3
 (1 row)
 
 ROLLBACK;
@@ -120,6 +124,12 @@ SELECT hh_err($$SELECT dolt_history_drop('2020-01-06 00:00+00')$$) AS other;
  permission denied to sever history of database "regress_history_horizon"
 (1 row)
 
+SELECT count(*) AS others_plan FROM prolly_history_plan('2020-01-06 00:00+00');
+ others_plan 
+-------------
+           5
+(1 row)
+
 RESET ROLE;
 -- A collection first, so that what the next frees is the fragment's.
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
@@ -134,7 +144,7 @@ SELECT fragment, commits,
 FROM dolt_history_drop('2020-01-06 00:00+00');
  fragment | commits | boundary | has_chunks 
 ----------+---------+----------+------------
-        1 |       2 | {c2,c4}  | t
+        1 |       3 | {c4}     | t
 (1 row)
 
 -- (and not in the transaction that severed)
@@ -156,9 +166,9 @@ SELECT fragment, state, oldest, newest, commits, location,
 	   array(SELECT hh_name(t) FROM unnest(tops) t ORDER BY 1) AS tops,
 	   length(root) AS root_len, length(digest) AS digest_len
 FROM prolly_history_horizon();
- fragment |  state  |            oldest            |            newest            | commits | location |  tops   | root_len | digest_len 
-----------+---------+------------------------------+------------------------------+---------+----------+---------+----------+------------
-        1 | deleted | Wed Jan 01 16:00:00 2020 PST | Fri Jan 03 16:00:00 2020 PST |       2 |          | {c1,c3} |       40 |         40
+ fragment |  state  |            oldest            |            newest            | commits | location | tops | root_len | digest_len 
+----------+---------+------------------------------+------------------------------+---------+----------+------+----------+------------
+        1 | deleted | Wed Jan 01 16:00:00 2020 PST | Fri Jan 03 16:00:00 2020 PST |       3 |          | {c3} |       40 |         40
 (1 row)
 
 -- Hashes are unchanged; the log stops at the horizon, with a notice.
@@ -171,15 +181,16 @@ NOTICE:  history stops at the history horizon
  c4
 (3 rows)
 
-SELECT hh_name(commit_hash) AS commit FROM dolt_log('v1');
+SELECT hh_name(commit_hash) AS commit FROM dolt_log('feature') ORDER BY commit_order DESC;
 NOTICE:  history stops at the history horizon
  commit 
 --------
- c2
-(1 row)
+ f1
+ c4
+(2 rows)
 
 SELECT hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent
-FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c2')
+FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c3')
 ORDER BY 1, 2;
 NOTICE:  history stops at the history horizon
  commit | parent 
@@ -223,13 +234,27 @@ SELECT hh_name(dolt_hashof('main~3')) AS main_3,
  c3     | commit <hash> is past the history horizon
 (1 row)
 
--- What is kept still reads: the tag's commit, the window's.
-SELECT v FROM dolt_at('v1', NULL::hh.t) WHERE id = 1;
- v  
-----
- c2
+-- (a severed commit beneath the fragment's tops, named by its id)
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c2')) AS at_beneath;
+                                at_beneath                                
+--------------------------------------------------------------------------
+ commit <hash> isn't in this database: it may be past the history horizon
 (1 row)
 
+-- A push of history past the horizon to a remote that hasn't it says so.
+SELECT dolt_remote('add', 'empty', :'url_empty');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT hh_err($$SELECT dolt_push('empty', 'main')$$) AS push_past;
+                 push_past                 
+-------------------------------------------
+ commit <hash> is past the history horizon
+(1 row)
+
+-- What is kept still reads.
 SELECT v FROM dolt_at(:'c4', NULL::hh.t) WHERE id = 1;
  v  
 ----
@@ -268,10 +293,9 @@ ORDER BY kind, commit, parent;
 ----------+--------+--------+-----
  boundary | c5     | c4     | 
  boundary | f1     | c4     | 
- pinned   | c2     |        | ref
  pinned   | c5     |        | ref
  severed  | c4     |        | 
-(5 rows)
+(4 rows)
 
 SELECT fragment, commits,
 	   array(SELECT hh_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary
@@ -284,10 +308,10 @@ FROM dolt_history_drop('2020-01-07 00:00+00');
 SELECT fragment, commits,
 	   array(SELECT hh_name(t) FROM unnest(tops) t ORDER BY 1) AS tops
 FROM prolly_history_horizon();
- fragment | commits |  tops   
-----------+---------+---------
+ fragment | commits | tops 
+----------+---------+------
         2 |       1 | {c4}
-        1 |       2 | {c1,c3}
+        1 |       3 | {c3}
 (2 rows)
 
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;

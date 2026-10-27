@@ -232,6 +232,9 @@ SELECT hr_err($$SELECT dolt_history_repair('origin')$$) AS other;
 RESET ROLE;
 -- The newest fragment alone: the log reaches its commits, and stops at
 -- the older one's.
+-- The older fragment's tops aren't received (the source has them), so a
+-- collection after keeps the newest's commits and frees the older's.
+SELECT tops[1] AS older_top FROM prolly_history_horizon() ORDER BY fragment LIMIT 1 \gset
 SELECT dolt_history_repair('origin', 1) AS repaired;
  repaired 
 ----------
@@ -249,6 +252,25 @@ NOTICE:  history stops at the history horizon
  logged 
 --------
       5
+(1 row)
+
+SELECT hr_err(format('SELECT prolly_root_hash(%L)', :'older_top')) AS older_not_received;
+            older_not_received             
+-------------------------------------------
+ commit <hash> is past the history horizon
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS logged_after_collection FROM dolt_log('main');
+NOTICE:  history stops at the history horizon
+ logged_after_collection 
+-------------------------
+                       5
 (1 row)
 
 -- The rest, by URL: the history is as it was.

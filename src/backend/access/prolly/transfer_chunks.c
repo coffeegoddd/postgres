@@ -96,6 +96,8 @@ typedef struct Receiving
 	uint64		next;			/* the table file's: the next header */
 	uint64		visited;		/* chunks the walk visited */
 	bool		hinting;		/* receive_hint() asking the store */
+	const ProllyHash *stops;	/* commits not received, nor walked past */
+	int			nstops;
 } Receiving;
 
 /* A hash, zero-padded, as a hash table's key. */
@@ -308,6 +310,12 @@ receive_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 	Received	r;
 	SpoolHeader head;
 	off_t		at;
+
+	/* (a stop is declined: not taken, nor anything it reaches) */
+	for (int i = 0; i < rv->nstops; i++)
+		if (rv->stops[i].len == node->hash.len &&
+			memcmp(rv->stops[i].bytes, node->hash.bytes, node->hash.len) == 0)
+			return false;
 
 	/* (a chunk is read, so received, before it is visited) */
 	if (!prolly_seen_find(rv->received, &node->hash, &r))
@@ -525,8 +533,9 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 }
 
 static uint64
-chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
-			   const ProllyHash *commits, int ncommits)
+receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+			  const ProllyHash *commits, int ncommits,
+			  const ProllyHash *stops, int nstops)
 {
 	ProllyDatabaseComponents dc;
 	Receiving	rv;
@@ -534,6 +543,8 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	bool	   *walk;
 
 	memset(&rv, 0, sizeof(rv));
+	rv.stops = stops;
+	rv.nstops = nstops;
 	rv.rr = rr;
 	rv.remote = remote;
 	rv.cs = prolly_chunk_store();
@@ -593,6 +604,21 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	BufFileClose(rv.spool);
 	prolly_seen_destroy(rv.received);
 	return count;
+}
+
+static uint64
+chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+			   const ProllyHash *commits, int ncommits)
+{
+	return receive_until(rr, remote, commits, ncommits, NULL, 0);
+}
+
+static uint64
+chunks_receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+					 const ProllyHash *commits, int ncommits,
+					 const ProllyHash *stops, int nstops)
+{
+	return receive_until(rr, remote, commits, ncommits, stops, nstops);
 }
 
 /* Cloning */
@@ -1029,5 +1055,6 @@ const ProllyTransferRoutine prolly_transfer_chunks = {
 	},
 	.receive = chunks_receive,
 	.clone = chunks_clone,
+	.receive_until = chunks_receive_until,
 	.send = chunks_send,
 };

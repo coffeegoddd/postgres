@@ -150,7 +150,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  transfer       | chunks         | complete                       | pass
  transfer       | stub           | identity                       | pass
  transfer       | stub           | receive_then_send              | not implemented (missing receive, send)
- transfer       | stub           | complete                       | not implemented (3 of 3 callbacks missing)
+ transfer       | stub           | complete                       | not implemented (4 of 4 callbacks missing)
  diff_merge     | folded         | identity                       | pass
  diff_merge     | folded         | diff_reports_each_change_once  | no checks yet
  diff_merge     | folded         | merge                          | no checks yet
@@ -297,7 +297,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | identity                       | pass
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
- history_window | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ history_window | stub           | complete                       | not implemented (10 of 10 callbacks missing)
 (226 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes

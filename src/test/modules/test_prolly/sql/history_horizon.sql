@@ -6,6 +6,8 @@
 -- Every commit a ref names (a tag's) is kept, and so is every commit down
 -- to the merge base of two branches.
 
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/history_horizon/' || txid_current() AS url_empty \gset
 SELECT current_database() AS home \gset
 -- (notices without their details, which name commits by hash)
 \set VERBOSITY terse
@@ -33,7 +35,6 @@ INSERT INTO hh.t VALUES (1, 'c1');
 SELECT hh_commit('c1', 1) AS c1 \gset
 UPDATE hh.t SET v = 'c2';
 SELECT hh_commit('c2', 2) AS c2 \gset
-SELECT dolt_tag('v1', :'c2');
 UPDATE hh.t SET v = 'c3';
 INSERT INTO hh.t SELECT g, repeat('x', 200) FROM generate_series(100, 600) g;
 SELECT hh_commit('c3', 3) AS c3 \gset
@@ -59,10 +60,14 @@ CREATE FUNCTION hh_name(h text) RETURNS text LANGUAGE sql AS $$
 $$;
 
 -- The plan before the sixth day: main keeps c6, and c5 and c4 down to its
--- merge base with feature (c4); the tag keeps c2.  c3 and c1 are severed.
+-- merge base with feature (c4).  c3, c2 and c1 are severed.  (Planning
+-- reads the refs as they stand: a read-only transaction may, and anyone.)
 SELECT kind, hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent, why
 FROM prolly_history_plan('2020-01-06 00:00+00')
 ORDER BY kind, commit, parent;
+BEGIN READ ONLY;
+SELECT count(*) AS read_only_plan FROM prolly_history_plan('2020-01-06 00:00+00');
+COMMIT;
 
 -- Nothing severed yet: planning changes nothing.
 SELECT count(*) AS fragments FROM prolly_history_horizon();
@@ -78,6 +83,7 @@ CREATE ROLE regress_hh_other;
 GRANT ALL ON SCHEMA public TO regress_hh_other;
 SET ROLE regress_hh_other;
 SELECT hh_err($$SELECT dolt_history_drop('2020-01-06 00:00+00')$$) AS other;
+SELECT count(*) AS others_plan FROM prolly_history_plan('2020-01-06 00:00+00');
 RESET ROLE;
 
 -- A collection first, so that what the next frees is the fragment's.
@@ -100,9 +106,9 @@ FROM prolly_history_horizon();
 
 -- Hashes are unchanged; the log stops at the horizon, with a notice.
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
-SELECT hh_name(commit_hash) AS commit FROM dolt_log('v1');
+SELECT hh_name(commit_hash) AS commit FROM dolt_log('feature') ORDER BY commit_order DESC;
 SELECT hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent
-FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c2')
+FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c3')
 ORDER BY 1, 2;
 SELECT count(*) AS history_rows FROM dolt_history_table(NULL::hh.t) h
 WHERE (h.row).id = 1;
@@ -116,9 +122,14 @@ SELECT hh_err($$SELECT count(*) FROM dolt_diff('main~3', 'main', NULL::hh.t)$$) 
 -- (c3's id is c4's to give; what c3 names is past)
 SELECT hh_name(dolt_hashof('main~3')) AS main_3,
 	   hh_err($$SELECT dolt_hashof('main~4')$$) AS hashof_past;
+-- (a severed commit beneath the fragment's tops, named by its id)
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c2')) AS at_beneath;
 
--- What is kept still reads: the tag's commit, the window's.
-SELECT v FROM dolt_at('v1', NULL::hh.t) WHERE id = 1;
+-- A push of history past the horizon to a remote that hasn't it says so.
+SELECT dolt_remote('add', 'empty', :'url_empty');
+SELECT hh_err($$SELECT dolt_push('empty', 'main')$$) AS push_past;
+
+-- What is kept still reads.
 SELECT v FROM dolt_at(:'c4', NULL::hh.t) WHERE id = 1;
 
 -- A merge of the branches finds its base, kept.
