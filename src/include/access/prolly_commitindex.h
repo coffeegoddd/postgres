@@ -19,6 +19,8 @@
  *   them.  Branch heads are noted as they move (by a commit, a merge, a
  *   reset, a fetch or a clone); every commit a branch head reached is
  *   indexed.  Changes are with the transaction, as the refs' are.
+ *   known, if not NULL, is head's own entry as its writer made it (its
+ *   height found as the commit records it), so head isn't read for it.
  * - lookup() gives commit id's entry; false if it isn't indexed.
  * - scan() visits the entries dated from..to (both included), in date
  *   order (then id) forward or backward, until visit returns false.
@@ -58,7 +60,8 @@ typedef struct ProllyCommitIndexRoutine
 {
 	ProllyImplInfo info;
 
-	void		(*note_head) (const ProllyHash *head);
+	void		(*note_head) (const ProllyHash *head,
+							  const ProllyCommitIndexEntry *known);
 	bool		(*lookup) (const ProllyHash *id, ProllyCommitIndexEntry *entry);
 	void		(*scan) (TimestampTz from, TimestampTz to,
 						 ScanDirection direction,

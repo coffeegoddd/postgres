@@ -13,7 +13,10 @@
  * microseconds since the Postgres epoch, 8 bytes big-endian with the sign
  * bit flipped, so that dates sort as their bytes do.  An entry is the
  * date (8 bytes, as in the key), the height (8 bytes big-endian), the
- * count of parents (a byte) and each parent's id.
+ * count of parents (a byte) and each parent's id, its hash's bytes
+ * complemented: an entry names no chunk, and no bytes of it spell a
+ * reference as a value that names one does (a hash's length, then the
+ * hash), so nothing reads one there.
  *
  * The refs' tree is content-defined: the entries of a range of dates are
  * the same bytes, and sort into the same nodes, however they were added.
@@ -107,6 +110,24 @@ get_id(const uint8 *p, const uint8 *end, ProllyHash *id)
 	return p + 1 + id->len;
 }
 
+/* An id in an entry's value: its bytes complemented. */
+static void
+put_value_id(StringInfo out, const ProllyHash *id)
+{
+	appendStringInfoChar(out, (char) id->len);
+	for (int i = 0; i < id->len; i++)
+		appendStringInfoChar(out, (char) ~id->bytes[i]);
+}
+
+static const uint8 *
+get_value_id(const uint8 *p, const uint8 *end, ProllyHash *id)
+{
+	if ((p = get_id(p, end, id)) != NULL)
+		for (int i = 0; i < id->len; i++)
+			id->bytes[i] = (uint8) ~id->bytes[i];
+	return p;
+}
+
 static void
 entry_encode(StringInfo out, const ProllyCommitIndexEntry *e)
 {
@@ -114,7 +135,7 @@ entry_encode(StringInfo out, const ProllyCommitIndexEntry *e)
 	put_be64(out, (uint64) e->height);
 	appendStringInfoChar(out, (char) e->nparents);
 	for (int i = 0; i < e->nparents; i++)
-		put_id(out, &e->parents[i]);
+		put_value_id(out, &e->parents[i]);
 }
 
 static void
@@ -143,7 +164,7 @@ entry_decode(const uint8 *p, Size len, const ProllyHash *id,
 		entry_corrupt(id);
 	p += 2 * DATE_LEN + 1;
 	for (int i = 0; i < e->nparents; i++)
-		if ((p = get_id(p, end, &e->parents[i])) == NULL)
+		if ((p = get_value_id(p, end, &e->parents[i])) == NULL)
 			entry_corrupt(id);
 }
 
@@ -239,7 +260,8 @@ note_item(HTAB *items, const ProllyHash *id)
 }
 
 static void
-refs_index_note_head(const ProllyHash *head)
+refs_index_note_head(const ProllyHash *head,
+					 const ProllyCommitIndexEntry *known)
 {
 	const ProllyRefsRoutine *refs = index_refs();
 	MemoryContext cxt;
@@ -253,6 +275,20 @@ refs_index_note_head(const ProllyHash *head)
 	/* (the commit a head is at is indexed already, unless it is new) */
 	if (head->len == 0 || refs_index_lookup(head, NULL))
 		return;
+
+	/* (a commit just made, on parents indexed: its entry as made) */
+	if (known != NULL)
+	{
+		bool		parents_indexed = true;
+
+		for (int i = 0; i < known->nparents && parents_indexed; i++)
+			parents_indexed = refs_index_lookup(&known->parents[i], NULL);
+		if (parents_indexed)
+		{
+			entry_put(known);
+			return;
+		}
+	}
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit index",
 								ALLOCSET_DEFAULT_SIZES);

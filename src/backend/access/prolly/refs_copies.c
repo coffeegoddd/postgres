@@ -474,6 +474,9 @@ static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
 static void note_indexed(const ProllyHash *head);
+
+/* the commit copies_commit_root() wrote last, as the commit index has it */
+static ProllyCommitIndexEntry written_entry;
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_tables_left(const char *branch, ProllyMergeState *state,
 							  char **name);
@@ -5852,7 +5855,8 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
-	put_uint64(&v, (uint64) parents_height(parents, nparents));
+	written_entry.height = parents_height(parents, nparents);
+	put_uint64(&v, (uint64) written_entry.height);
 	add_item(b, "height", &v);
 	resetStringInfo(&v);
 	if (identity && identity->len > 0)
@@ -5875,6 +5879,12 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	prior_written_root = last_written_root;
 	last_written_commit = *id;
 	last_written_root = *root;
+	/* (what the commit index notes of it, as its head is set) */
+	written_entry.id = *id;
+	written_entry.committed_at = at;
+	written_entry.nparents = nparents;
+	for (int i = 0; i < nparents; i++)
+		written_entry.parents[i] = parents[i];
 	pfree(v.data);
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
 }
@@ -11541,7 +11551,10 @@ commit_index(void)
 	return ci;
 }
 
-/* A branch's head moved to head (NULL: it has none now): index it. */
+/*
+ * A branch's head moved to head (NULL: it has none now): index it, with
+ * what is known of it if the transaction wrote it last.
+ */
 static void
 note_indexed(const ProllyHash *head)
 {
@@ -11549,7 +11562,8 @@ note_indexed(const ProllyHash *head)
 
 	if (head == NULL || head->len == 0 || (ci = commit_index()) == NULL)
 		return;
-	PROLLY_CALL(ci, note_head, head);
+	PROLLY_CALL(ci, note_head, head,
+				same_hash(head, &written_entry.id) ? &written_entry : NULL);
 }
 
 const ProllyRefsRoutine prolly_refs_copies = {

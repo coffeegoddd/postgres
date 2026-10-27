@@ -6,6 +6,10 @@
 \getenv abs_builddir PG_ABS_BUILDDIR
 \set dir :abs_builddir '/tmp_check/commit_index'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+SELECT current_database() AS home \gset
+-- (a database of its own: its history is only this test's)
+CREATE DATABASE regress_commit_index;
+\c regress_commit_index
 SELECT current_database() AS db \gset
 CREATE SCHEMA ci VERSIONED;
 CREATE TABLE ci.t (id int PRIMARY KEY, v int);
@@ -258,10 +262,10 @@ SELECT dolt_push('origin', 'main') AS pushed;
 \c :db
 DROP DATABASE regress_commit_index_clone;
 SELECT count(*) AS entries FROM prolly_commit_index() \gset
-SELECT (dolt_pull('origin', 'main'))[1:2] AS pulled;
-                    pulled                    
-----------------------------------------------
- {179402abf3c066c153897563540528af7b087cbc,1}
+SELECT (dolt_pull('origin', 'main'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
 (1 row)
 
 SELECT count(*) - :entries AS pulled_entries FROM prolly_commit_index();
@@ -276,12 +280,5 @@ SELECT ci_indexed();
  6 logged, 0 unindexed, 0 misdated, 0 misparented
 (1 row)
 
-DROP FUNCTION ci_indexed;
-DROP SCHEMA ci CASCADE;
-NOTICE:  drop cascades to table ci.t
-SELECT length(dolt_commit('-Am', 'ci done')::text) AS committed;
- committed 
------------
-        42
-(1 row)
-
+\c :home
+DROP DATABASE regress_commit_index;
