@@ -594,6 +594,25 @@ typedef struct ProllyChunkStoreRoutine
 	 * apart (a retire reads the live refs tree instead of that list).
 	 */
 	void		(*gc_refs_node) (ProllyChunkGc *gc, uint64 slot);
+
+	/*
+	 * Optional: chunks thought garbage now (what a sever let go of), n of
+	 * them, each counted in the estimate of every settled file holding it
+	 * (generations()' garbage, at most its chunks).  An estimate, not a
+	 * promise: a retire measures a file it reads, and a sever's
+	 * transaction that aborts after leaves it as noted.  It waits for a
+	 * collection's swap, which keeps what was noted before.
+	 */
+	void		(*note_garbage) (ProllyChunkStore *store,
+								 const ProllyHash *hashes, int n);
+
+	/*
+	 * Optional: what a collection found of collected settled file 'file'
+	 * (as gc_files() numbers them) that it keeps whole: garbage of its
+	 * chunks nothing marked when it chose to keep it, which the swap
+	 * records as the file's estimate, in place of what was noted.
+	 */
+	void		(*gc_measured) (ProllyChunkGc *gc, int file, uint64 garbage);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -610,9 +629,10 @@ typedef struct ProllyChunkStoreRoutine
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
 	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in", \
-	"gc_begin_retire", "gc_inbound", "gc_read_any", "gc_refs_node"
+	"gc_begin_retire", "gc_inbound", "gc_read_any", "gc_refs_node", \
+	"note_garbage", "gc_measured"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_refs_node
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_measured
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

@@ -1,0 +1,528 @@
+-- Choosing what to retire by the store's estimates of its files' garbage:
+-- a sever counts what it leaves garbage against the files holding it, a
+-- retire what it leaves unnamed in older generations, and the oldest
+-- generation thought at least half garbage is chosen, with those after it
+-- as much, within a budget.  A base load's file is read again only once
+-- updates have made it half garbage; until then the retires chosen leave
+-- it as it is.  A retire frees a severed commit's tree, whatever newer
+-- file names it from the commit, and keeps the commit; and a repair after
+-- a retire reattaches the history, its generations checking out.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+\set VERBOSITY terse
+CREATE DATABASE generations_select_db;
+\c generations_select_db
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gs VERSIONED;
+CREATE TABLE gs.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION gs_commit(msg text, day int) RETURNS boolean LANGUAGE sql AS $$
+	SELECT length(dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text) > 0
+$$;
+CREATE FUNCTION gs_day(day int) RETURNS timestamptz LANGUAGE sql AS $$
+	SELECT timestamptz '2020-01-01 00:00+00' + make_interval(days => day)
+$$;
+INSERT INTO gs.t SELECT g, repeat('v', 40) || g FROM generate_series(1, 4000) g;
+SELECT gs_commit('base', 0) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_generation() AS base \gset
+SELECT garbage AS base_garbage FROM test_chunk_generations() WHERE epoch_lo = :base;
+ base_garbage 
+--------------
+            0
+(1 row)
+
+-- Each cycle updates a tenth of the rows, a range of them, commits,
+-- collects, severs what came before (the base load first), and retires
+-- what is chosen.  The base load's file is chosen only once its estimate
+-- reaches half its chunks.
+CREATE TABLE gs_cycles (cycle int, base_due boolean, chose_base boolean,
+	base_file_same boolean, chose_any boolean);
+CREATE TABLE gs_base AS
+	SELECT name, epoch_lo FROM test_chunk_generations() WHERE epoch_lo = :base;
+CREATE FUNCTION gs_note(i int) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO gs_cycles
+	SELECT i, coalesce((SELECT garbage * 2 >= chunks FROM test_chunk_generations()
+						WHERE epoch_lo = b.epoch_lo), false),
+		   coalesce(c.lo <= b.epoch_lo AND c.hi >= b.epoch_lo, false),
+		   EXISTS (SELECT FROM test_chunk_generations() g WHERE g.name = b.name),
+		   c.lo IS NOT NULL
+	FROM test_chunk_retire_choose() c, gs_base b
+$$;
+SELECT format($$UPDATE gs.t SET v = 'c%s_' || id WHERE id > %s AND id <= %s$$,
+			  i, (i - 1) * 400, i * 400),
+	   format('SELECT gs_commit(%L, %s)', 'c' || i, i),
+	   'SELECT test_chunk_gc(false)',
+	   format('SELECT dolt_history_drop(gs_day(%s))', i),
+	   format('SELECT gs_note(%s)', i),
+	   'SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL'
+FROM generate_series(1, 6) i \o /dev/null \gexec
+UPDATE gs.t SET v = 'c1_' || id WHERE id > 0 AND id <= 400
+SELECT gs_commit('c1', 1)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(1))
+SELECT gs_note(1)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+UPDATE gs.t SET v = 'c2_' || id WHERE id > 400 AND id <= 800
+SELECT gs_commit('c2', 2)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(2))
+SELECT gs_note(2)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+UPDATE gs.t SET v = 'c3_' || id WHERE id > 800 AND id <= 1200
+SELECT gs_commit('c3', 3)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(3))
+SELECT gs_note(3)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+UPDATE gs.t SET v = 'c4_' || id WHERE id > 1200 AND id <= 1600
+SELECT gs_commit('c4', 4)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(4))
+SELECT gs_note(4)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+UPDATE gs.t SET v = 'c5_' || id WHERE id > 1600 AND id <= 2000
+SELECT gs_commit('c5', 5)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(5))
+SELECT gs_note(5)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+UPDATE gs.t SET v = 'c6_' || id WHERE id > 2000 AND id <= 2400
+SELECT gs_commit('c6', 6)
+SELECT test_chunk_gc(false)
+SELECT dolt_history_drop(gs_day(6))
+SELECT gs_note(6)
+SELECT test_chunk_retire(lo, hi) FROM test_chunk_retire_choose() WHERE lo IS NOT NULL
+\o
+SELECT * FROM gs_cycles ORDER BY cycle;
+ cycle | base_due | chose_base | base_file_same | chose_any 
+-------+----------+------------+----------------+-----------
+     1 | f        | f          | t              | f
+     2 | f        | f          | t              | f
+     3 | f        | f          | t              | f
+     4 | f        | f          | t              | f
+     5 | f        | f          | t              | f
+     6 | t        | t          | t              | t
+(6 rows)
+
+-- (the base load's file rewritten once, then thought garbage free)
+SELECT count(*) AS base_file_left FROM test_chunk_generations()
+	WHERE name = (SELECT name FROM gs_base);
+ base_file_left 
+----------------
+              0
+(1 row)
+
+SELECT garbage * 2 < chunks AS base_not_due FROM test_chunk_generations()
+	WHERE epoch_lo = :base;
+ base_not_due 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS rows, count(*) FILTER (WHERE v LIKE 'c%') AS updated
+	FROM gs.t;
+ rows | updated 
+------+---------
+ 4000 |    2400
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+-- A file thought half garbage that isn't (rows updated and then put back,
+-- so the sever counts what the boundary has again): the retire chosen for
+-- it keeps it whole, and its estimate is what the retire found, so it
+-- isn't chosen again until more is noted.
+SET prolly.gc_rewrite_below = 0;
+CREATE SCHEMA gb VERSIONED;
+CREATE TABLE gb.t (id int PRIMARY KEY, v text);
+INSERT INTO gb.t SELECT g, repeat('w', 40) || g FROM generate_series(1, 4000) g;
+SELECT gs_commit('b0', 7) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_generation() AS b0_gen \gset
+SELECT name AS b0_file FROM test_chunk_generations() WHERE epoch_lo = :b0_gen \gset
+UPDATE gb.t SET v = 'b1';
+SELECT gs_commit('b1', 8) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE gb.t SET v = repeat('w', 40) || id;
+SELECT gs_commit('b2', 9) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT commits FROM dolt_history_drop(gs_day(9));
+ commits 
+---------
+       3
+(1 row)
+
+SELECT garbage * 2 >= chunks AS b0_thought_due FROM test_chunk_generations()
+	WHERE epoch_lo = :b0_gen;
+ b0_thought_due 
+----------------
+ t
+(1 row)
+
+SELECT freed >= 0 AS retired FROM test_chunk_retire(:b0_gen, :b0_gen);
+ retired 
+---------
+ t
+(1 row)
+
+SELECT name = :'b0_file' AS b0_kept_whole, garbage * 2 < chunks AS b0_not_due
+	FROM test_chunk_generations() WHERE epoch_lo = :b0_gen;
+ b0_kept_whole | b0_not_due 
+---------------+------------
+ t             | t
+(1 row)
+
+SELECT coalesce(lo > :b0_gen OR hi < :b0_gen, true) AS b0_not_chosen
+	FROM test_chunk_retire_choose();
+ b0_not_chosen 
+---------------
+ t
+(1 row)
+
+SELECT count(*) AS rows FROM gb.t WHERE v = repeat('w', 40) || id;
+ rows 
+------
+ 4000
+(1 row)
+
+RESET prolly.gc_rewrite_below;
+-- A severed commit's tree, named from a newer file (an empty commit's,
+-- whose root is its parent's): the retire of the tree's generation frees
+-- it, the horizon cutting what the commit names, and keeps both commits.
+CREATE SCHEMA gc VERSIONED;
+CREATE TABLE gc.t (id int PRIMARY KEY, v text);
+INSERT INTO gc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT gs_commit('e1', 10) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_generation() AS e1_gen \gset
+SELECT length(dolt_commit('--allow-empty', '-m', 'e2', '--date',
+	gs_day(11)::text)::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE gc.t SET v = 'e3';
+SELECT gs_commit('e3', 12) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT root AS e1_root FROM test_commit_roots('main~2') \gset
+SELECT root = :'e1_root' AS e2_names_e1_root FROM test_commit_roots('main~1');
+ e2_names_e1_root 
+------------------
+ t
+(1 row)
+
+SELECT commit_hash AS e1 FROM dolt_log('main') WHERE message = 'e1' \gset
+SELECT commit_hash AS e2 FROM dolt_log('main') WHERE message = 'e2' \gset
+SELECT commits FROM dolt_history_drop(gs_day(12));
+ commits 
+---------
+       3
+(1 row)
+
+SELECT freed > 0 AS freed FROM test_chunk_retire(:e1_gen, :e1_gen);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT test_chunk_has(:'e1_root') AS e1_root_kept,
+	   test_chunk_has(:'e1') AS e1_kept, test_chunk_has(:'e2') AS e2_kept;
+ e1_root_kept | e1_kept | e2_kept 
+--------------+---------+---------
+ f            | t       | t
+(1 row)
+
+SELECT count(*) AS commits FROM dolt_log('main') WHERE message LIKE 'e%';
+ commits 
+---------
+       3
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+-- A retire's own estimate: what the files it drops named in an older
+-- generation, and nothing else lists, counts against that one's file.
+CREATE SCHEMA gl VERSIONED;
+CREATE TABLE gl.t (id int PRIMARY KEY, v text);
+INSERT INTO gl.t SELECT g, repeat('l', 40) || g FROM generate_series(1, 4000) g;
+SELECT gs_commit('l0', 13) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_generation() AS l0_gen \gset
+UPDATE gl.t SET v = 'l1' WHERE id <= 400;
+SELECT gs_commit('l1', 14) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_generation() AS l1_gen \gset
+UPDATE gl.t SET v = 'l2' WHERE id <= 400;
+SELECT gs_commit('l2', 15) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT commits > 0 AS severed FROM dolt_history_drop(gs_day(15));
+ severed 
+---------
+ t
+(1 row)
+
+SELECT garbage AS l0_noted FROM test_chunk_generations()
+	WHERE epoch_lo = :l0_gen \gset
+SELECT freed > 0 AS freed FROM test_chunk_retire(:l1_gen, :l1_gen);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT garbage > :l0_noted AS l0_lost_named,
+	   garbage * 2 < chunks AS l0_not_due
+	FROM test_chunk_generations() WHERE epoch_lo = :l0_gen;
+ l0_lost_named | l0_not_due 
+---------------+------------
+ t             | t
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+\c postgres
+DROP DATABASE generations_select_db;
+-- Archived, retired as chosen, then repaired: the history reads again,
+-- and the generations check out, through a retire after.
+\getenv abs_builddir PG_ABS_BUILDDIR
+\set dir :abs_builddir '/tmp_check/generations_select'
+SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+CREATE DATABASE generations_select_repair;
+\c generations_select_repair
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gr VERSIONED;
+CREATE TABLE gr.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION gr_commit(msg text, ago int) RETURNS boolean LANGUAGE sql AS $$
+	SELECT length(dolt_commit('-Am', msg, '--date',
+		(date_trunc('day', now()) - make_interval(days => ago) +
+		 interval '1 hour')::text)::text) > 0
+$$;
+INSERT INTO gr.t SELECT g, 'v' || g FROM generate_series(1, 2000) g;
+SELECT gr_commit('r1', 10) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE gr.t SET v = 'r2' WHERE id % 2 = 0;
+SELECT gr_commit('r2', 8) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE gr.t SET v = 'r3' WHERE id % 2 = 1;
+SELECT gr_commit('r3', 1) AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS r1_r2 FROM dolt_diff('main~2', 'main~1', NULL::gr.t);
+ r1_r2 
+-------
+  1000
+(1 row)
+
+SELECT root AS r1_root FROM test_commit_roots('main~2') \gset
+SELECT test_chunk_generation() AS r3_gen \gset
+ALTER DATABASE generations_select_repair SET prolly.history_archive = :'url';
+ALTER DATABASE generations_select_repair SET prolly.history_window = '3 days';
+\c generations_select_repair
+SELECT action, commits FROM dolt_history_sever();
+ action  | commits 
+---------+---------
+ archive |       2
+(1 row)
+
+SELECT lo, hi < :r3_gen AS before_the_boundary FROM test_chunk_retire_choose();
+ lo | before_the_boundary 
+----+---------------------
+  1 | t
+(1 row)
+
+SELECT freed > 0 AS freed
+	FROM test_chunk_retire_choose() c, test_chunk_retire(c.lo, c.hi);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT test_chunk_has(:'r1_root') AS r1_root_kept;
+ r1_root_kept 
+--------------
+ f
+(1 row)
+
+SELECT dolt_history_repair() AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+SELECT test_chunk_has(:'r1_root') AS r1_root_back;
+ r1_root_back 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS r1_r2 FROM dolt_diff('main~2', 'main~1', NULL::gr.t);
+ r1_r2 
+-------
+  1000
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT freed >= 0 AS retired FROM test_chunk_retire(1, :r3_gen);
+ retired 
+---------
+ t
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+SELECT count(*) AS r1_r2 FROM dolt_diff('main~2', 'main~1', NULL::gr.t);
+ r1_r2 
+-------
+  1000
+(1 row)
+
+\c postgres
+DROP DATABASE generations_select_repair;

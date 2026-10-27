@@ -57,6 +57,15 @@
  * it the store's closure: whatever its chunks name, live or not, is marked
  * (and copied from the files rewritten).
  *
+ * A retire collects only some generations' settled files.  choose() picks
+ * them by the store's estimates of their garbage: the oldest generation
+ * thought at least REWRITE_GARBAGE garbage, then those after it as much,
+ * within prolly.gc_retire_budget of their files' bytes.  A file kept whole
+ * has its garbage as found recorded, so it isn't chosen again until a
+ * sever or another retire notes more: an old file is read again only once
+ * it is half garbage, which bounds what reading it costs by twice what it
+ * frees.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/reclaim_copying.c
  *
@@ -576,6 +585,12 @@ choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 	{
 		k->keep[file] = true;
 		k->changed = true;
+		/*
+		 * (its garbage as found, its estimate from here on: below the
+		 * share a retire is chosen for, until more is noted)
+		 */
+		if (PROLLY_HAS(k->mk->cs, gc_measured))
+			PROLLY_CALL(k->mk->cs, gc_measured, k->mk->gc, file, nslots - live);
 	}
 }
 
@@ -774,6 +789,122 @@ static bool
 copying_retire(uint32 lo, uint32 hi, bool if_free, ProllyGcResult *result)
 {
 	return collect_scoped(PROLLY_GC_RETIRE, lo, hi, if_free, result);
+}
+
+/* generations a choice may take: the settled files of an interval */
+typedef struct Unit
+{
+	uint32		lo;
+	uint32		hi;
+	uint64		nchunks;
+	uint64		garbage;
+	uint64		size;
+} Unit;
+
+typedef struct Units
+{
+	Unit	   *units;
+	int			n;
+	int			max;
+} Units;
+
+static void
+note_unit(const ProllyChunkGeneration *g, void *arg)
+{
+	Units	   *us = arg;
+
+	if (!g->settled || g->epoch_lo == 0)
+		return;
+	if (us->n == us->max)
+	{
+		us->max = Max(16, us->max * 2);
+		us->units = us->units ? repalloc(us->units, sizeof(Unit) * us->max) :
+			palloc(sizeof(Unit) * us->max);
+	}
+	us->units[us->n].lo = g->epoch_lo;
+	us->units[us->n].hi = g->epoch_hi;
+	us->units[us->n].nchunks = g->nchunks;
+	us->units[us->n].garbage = g->garbage;
+	us->units[us->n].size = g->size;
+	us->n++;
+}
+
+static int
+unit_cmp(const void *a, const void *b)
+{
+	const Unit *x = a;
+	const Unit *y = b;
+
+	if (x->lo != y->lo)
+		return x->lo < y->lo ? -1 : 1;
+	return x->hi < y->hi ? -1 : (x->hi > y->hi ? 1 : 0);
+}
+
+/* Is a unit thought garbage enough to be retired? */
+static bool
+unit_due(const Unit *u)
+{
+	return u->nchunks > 0 && (double) u->garbage >= REWRITE_GARBAGE * u->nchunks;
+}
+
+/*
+ * The settled files by generation, those of overlapping intervals one
+ * unit (a retire takes a file whole), oldest first; then the oldest unit
+ * thought at least REWRITE_GARBAGE garbage, and those after it as much,
+ * within budget.  Cost: the manifest, and each file's section's head.
+ */
+static bool
+copying_choose(uint64 budget, uint32 max_hi, uint32 *lo, uint32 *hi)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store;
+	Units		us = {0};
+	int			n = 0;
+	int			first = -1;
+	uint64		bytes = 0;
+
+	if (!PROLLY_HAS(cs, generations) || !PROLLY_HAS(cs, gc_begin_retire))
+		return false;
+	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
+	PROLLY_CALL(cs, generations, store, note_unit, &us);
+	if (us.n == 0)
+		return false;
+	qsort(us.units, us.n, sizeof(Unit), unit_cmp);
+	/* (overlapping intervals merged) */
+	for (int i = 0; i < us.n; i++)
+	{
+		if (n > 0 && us.units[i].lo <= us.units[n - 1].hi)
+		{
+			Unit	   *u = &us.units[n - 1];
+
+			u->hi = Max(u->hi, us.units[i].hi);
+			u->nchunks += us.units[i].nchunks;
+			u->garbage += us.units[i].garbage;
+			u->size += us.units[i].size;
+			continue;
+		}
+		us.units[n++] = us.units[i];
+	}
+	for (int i = 0; i < n; i++)
+	{
+		Unit	   *u = &us.units[i];
+
+		if (u->hi > max_hi)
+			break;
+		if (first < 0)
+		{
+			if (!unit_due(u))
+				continue;
+			first = i;
+			*lo = u->lo;
+		}
+		else if (!unit_due(u) || bytes + u->size > budget)
+			break;
+		*hi = u->hi;
+		bytes += u->size;
+	}
+	pfree(us.units);
+	return first >= 0;
 }
 
 static bool
@@ -1013,4 +1144,5 @@ const ProllyReclaimRoutine prolly_reclaim_copying = {
 	.collect = copying_collect,
 	.move = copying_move,
 	.retire = copying_retire,
+	.choose = copying_choose,
 };

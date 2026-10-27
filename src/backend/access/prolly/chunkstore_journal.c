@@ -133,6 +133,16 @@
  * one after leaves files retiring, removed by the next collection once
  * nobody who may read them is left.
  *
+ * Garbage estimates.  Each settled file's entry counts the chunks thought
+ * garbage in it, which a reclaimer chooses the generations to retire by:
+ * a sever notes what it leaves garbage (note_garbage(), counted against
+ * every settled file holding each chunk); a retire's swap sets a file it
+ * keeps whole to what it found (gc_measured()), and adds, to an older
+ * file outside it, each chunk that file holds which the files it drops
+ * listed and nothing it wrote, nor any newer file's section, lists.  A
+ * file it rewrites starts at none.  The counts are estimates: one too
+ * high costs a retire that reads the file and corrects it.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/chunkstore_journal.c
  *
@@ -4732,22 +4742,70 @@ listed_epoch(TableFile *t, HTAB **listed, MemoryContext cxt,
 	return lt->epoch;
 }
 
-/* How many targets file f's section lists (-1: the file is gone). */
+/*
+ * How many targets a table file's section lists, by its head alone (its
+ * directory of epochs and counts, not its hashes).
+ */
 static int64
-file_xrefs(const char *dir, const ManifestFile *f)
+section_count(TableFile *t)
 {
-	TableFile  *t = open_table(dir, f, CurrentMemoryContext);
-	XrefSection x;
+	uint64		offset;
+	uint32		len;
+	uint32		crc;
+	char		head[XREF_HEAD];
 	int64		n = 0;
+	int			nepochs;
+	char	   *dir;
 
+	PROLLY_CALL(table_format(), section, t->tf, &offset, &len, &crc);
+	if (len < XREF_HEAD)
+		return 0;
+	if (!table_file_read(t, offset, head, XREF_HEAD))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read %d bytes at %llu in file \"%s\": %m",
+						XREF_HEAD, (unsigned long long) offset, t->path)));
+	nepochs = (int) read_le(head + 2, 4);
+	if (nepochs < 0 || (len - XREF_HEAD) / XREF_EPOCH_ENTRY < (Size) nepochs)
+		xref_corrupt(t->path);
+	dir = palloc((Size) Max(nepochs, 1) * XREF_EPOCH_ENTRY);
+	if (nepochs > 0 &&
+		!table_file_read(t, offset + XREF_HEAD, dir,
+						 (Size) nepochs * XREF_EPOCH_ENTRY))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read %d bytes at %llu in file \"%s\": %m",
+						nepochs * XREF_EPOCH_ENTRY,
+						(unsigned long long) offset + XREF_HEAD, t->path)));
+	for (int i = 0; i < nepochs; i++)
+	{
+		const char *e = dir + (Size) i * XREF_EPOCH_ENTRY;
+
+		n += read_le(e + 4, 4) + read_le(e + 8, 4) + read_le(e + 12, 4);
+	}
+	pfree(dir);
+	return n;
+}
+
+/*
+ * How many targets file f's section lists (-1: the file is gone): of the
+ * table files s has open, or opened for this.
+ */
+static int64
+file_xrefs(ProllyChunkStore *s, const char *dir, const ManifestFile *f)
+{
+	TableFile  *t = NULL;
+	int64		n;
+
+	foreach_ptr(TableFile, open, s->tables)
+		if (open->id == f->id && open->tf != NULL)
+			t = open;
+	if (t != NULL)
+		return section_count(t);
+	t = open_table(dir, f, CurrentMemoryContext);
 	if (t == NULL)
 		return -1;
-	if (xrefs_read(t, &x))
-	{
-		for (int i = 0; i < x.nepochs; i++)
-			n += x.nplain[i] + x.npairs[i] + x.nrefs[i];
-		xrefs_free(&x);
-	}
+	n = section_count(t);
 	close_table(t);
 	return n;
 }
@@ -8753,6 +8811,7 @@ journal_generations(ProllyChunkStore *s, ProllyChunkGenerationVisit visit,
 	Manifest	m;
 
 	(void) read_manifest(dir, &m);
+	load_tables(s, false);
 	for (int i = 0; i < m.nfiles; i++)
 	{
 		ProllyChunkGeneration g = {0};
@@ -8764,7 +8823,7 @@ journal_generations(ProllyChunkStore *s, ProllyChunkGenerationVisit visit,
 		g.epoch_lo = m.files[i].epoch_lo;
 		g.epoch_hi = m.files[i].epoch_hi;
 		g.garbage = m.files[i].garbage;
-		g.xrefs = file_xrefs(dir, &m.files[i]);
+		g.xrefs = file_xrefs(s, dir, &m.files[i]);
 		g.repaired = (m.files[i].flags & MANIFEST_FILE_REPAIRED) != 0;
 		visit(&g, arg);
 		pfree((char *) g.name);
@@ -9037,6 +9096,71 @@ journal_epoch_of(ProllyChunkStore *s, const ProllyHash *hash)
 			epoch = t->epoch_lo;
 	}
 	return epoch;
+}
+
+/*
+ * Chunks thought garbage, each counted against every settled file holding
+ * it, under the writers' lock (a collection holds it from its waits to its
+ * swap, and keeps what was noted before: it reads the manifest again after
+ * its waits); the manifest replaced once, if any count changed.
+ */
+static void
+journal_note_garbage(ProllyChunkStore *s, const ProllyHash *hashes, int n)
+{
+	Manifest	m;
+	uint64	   *counts;
+	bool		any = false;
+	int			nt;
+	int			i;
+	ListCell   *lc;
+
+	if (n <= 0)
+		return;
+	lock_manifest(s, &m);
+	load_tables(s, false);
+	nt = list_length(s->tables);
+	counts = palloc0(sizeof(uint64) * Max(nt, 1));
+	for (int h = 0; h < n; h++)
+	{
+		ProllyHash	key;
+
+		CHECK_FOR_INTERRUPTS();
+		hash_key(&key, &hashes[h]);
+		i = 0;
+		foreach(lc, s->tables)
+		{
+			TableFile  *t = lfirst(lc);
+			uint64		offset;
+			uint32		len;
+
+			if (t->settled &&
+				PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+				counts[i]++;
+			i++;
+		}
+	}
+	i = 0;
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+
+		for (int k = 0; k < m.nfiles && counts[i] > 0; k++)
+		{
+			ManifestFile *f = &m.files[k];
+			uint32		g;
+
+			if (f->id != t->id)
+				continue;
+			g = (uint32) Min((uint64) f->garbage + counts[i], f->nchunks);
+			any |= g != f->garbage;
+			f->garbage = g;
+		}
+		i++;
+	}
+	if (any)
+		replace_manifest(s, &m, XLOG_CHUNKS_MANIFEST);
+	unlock_manifest(s);
+	pfree(counts);
 }
 
 /*
@@ -9357,6 +9481,15 @@ struct ProllyChunkGc
 	List	   *others_repaired;	/* (of others: those repaired) */
 	uint32		retire_lo;		/* a retire's generations (0: none) */
 	uint32		retire_hi;
+	uint64	   *measured;		/* each collected file kept whole: its
+								 * garbage as found (NULL, or
+								 * PG_UINT64_MAX: not said) */
+	HTAB	   *listed_older;	/* what the newer files' sections list in
+								 * generations older than a retire's, as
+								 * gc_inbound() read them (ProllyHash) */
+	uint32	   *lost;			/* each settled file not collected: the
+								 * chunks a retire left it unnamed (NULL:
+								 * none), as gc->others are numbered */
 	List	   *written;		/* ManifestFile *, the new files */
 	bool		window;
 	instr_time	window_began;	/* (a monotonic clock) */
@@ -9927,6 +10060,37 @@ static void journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out);
  * generations it does, as their sections list it (only a newer file's
  * can).
  */
+/* a chunk a retired file's section listed, and the generation it was in */
+typedef struct LostRef
+{
+	ProllyHash	target;			/* key */
+	uint32		epoch;
+} LostRef;
+
+static void
+note_lost_ref(const ProllyHash *target, const ProllyHash *source,
+			  uint32 epoch, void *arg)
+{
+	HTAB	   *lost = arg;
+	ProllyHash	key;
+	LostRef    *lr;
+
+	hash_key(&key, target);
+	lr = hash_search(lost, &key, HASH_ENTER, NULL);
+	lr->epoch = epoch;
+}
+
+static void
+drop_lost_ref(const ProllyHash *target, const ProllyHash *source,
+			  uint32 epoch, void *arg)
+{
+	HTAB	   *lost = arg;
+	ProllyHash	key;
+
+	hash_key(&key, target);
+	(void) hash_search(lost, &key, HASH_REMOVE, NULL);
+}
+
 /* gc_inbound()'s visit of what a repaired file's chunks name */
 typedef struct RepairedNames
 {
@@ -9960,6 +10124,29 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 		/* (what the refs tree names, the retire reads from the live one) */
 		x.skip_refs = true;
 		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
+
+		/*
+		 * (and what it lists older, read already: not lost when what the
+		 * retire drops named it too)
+		 */
+		if (gc->retire_lo > 1)
+		{
+			if (gc->listed_older == NULL)
+			{
+				HASHCTL		ctl;
+
+				ctl.keysize = sizeof(ProllyHash);
+				ctl.hash = chunk_hash_key_hash;
+				ctl.entrysize = sizeof(LostRef);
+				ctl.hcxt = gc->cxt;
+				gc->listed_older = hash_create("prolly retire listed older",
+											   256, &ctl,
+											   HASH_ELEM | HASH_FUNCTION |
+											   HASH_CONTEXT);
+			}
+			xrefs_visit(&x, 1, gc->retire_lo - 1, note_lost_ref,
+						gc->listed_older);
+		}
 		xrefs_free(&x);
 	}
 
@@ -11051,11 +11238,14 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 		pfree(xb.items);
 }
 
+static void retire_lost_refs(ProllyChunkGc *gc, const bool *keep);
+
 /* The live chunks written, before the window. */
 static void
 journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 {
 	gc_write(gc, marks, keep, true);
+	retire_lost_refs(gc, keep);
 	INJECTION_POINT("prolly-gc-copied", NULL);
 }
 
@@ -11098,6 +11288,111 @@ swap_epochs(ProllyChunkGc *gc, Manifest *nm)
 		nm->epochs[nm->nepochs].ended = GetCurrentTimestamp();
 		nm->nepochs++;
 	}
+}
+
+static void
+journal_gc_measured(ProllyChunkGc *gc, int file, uint64 garbage)
+{
+	if (file < 0 || file >= gc->nfiles)
+		return;
+	if (gc->measured == NULL)
+	{
+		gc->measured = MemoryContextAlloc(gc->cxt,
+										  sizeof(uint64) * Max(gc->nfiles, 1));
+		for (int i = 0; i < gc->nfiles; i++)
+			gc->measured[i] = PG_UINT64_MAX;
+	}
+	gc->measured[file] = garbage;
+}
+
+/*
+ * A retire's estimate of what it leaves garbage in older generations: each
+ * chunk the files it doesn't keep whole list there, and that neither the
+ * files it wrote before the window nor the newer settled files (as
+ * gc_inbound() read their sections) list, loses its last chunk naming it
+ * that the retire knows of, so it counts
+ * once against the file of the generation listed that holds it
+ * (gc->lost, which the swap adds to the estimates).  What else names it
+ * isn't known here: the next retire of that file measures it.  Before the
+ * window, so appends aren't held off for it.
+ */
+static void
+retire_lost_refs(ProllyChunkGc *gc, const bool *keep)
+{
+	HASHCTL		ctl;
+	HTAB	   *lost;
+	HASH_SEQ_STATUS seq;
+	LostRef    *lr;
+	char	   *dir;
+
+	if (gc->retire_lo <= 1 || gc->nothers == 0)
+		return;
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
+	ctl.entrysize = sizeof(LostRef);
+	ctl.hcxt = CurrentMemoryContext;
+	lost = hash_create("prolly retire lost references", 256, &ctl,
+					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	for (int j = 0; j < gc->nfiles; j++)
+	{
+		XrefSection x;
+
+		if (keep[j] || gc->files[j].segment || !gc->files[j].settled ||
+			gc->files[j].t == NULL || !xrefs_read(gc->files[j].t, &x))
+			continue;
+		xrefs_visit(&x, 1, gc->retire_lo - 1, note_lost_ref, lost);
+		xrefs_free(&x);
+	}
+	if (gc->listed_older != NULL)
+	{
+		HASH_SEQ_STATUS still;
+
+		hash_seq_init(&still, gc->listed_older);
+		while ((lr = hash_seq_search(&still)) != NULL)
+			(void) hash_search(lost, &lr->target, HASH_REMOVE, NULL);
+	}
+	if (hash_get_num_entries(lost) == 0)
+	{
+		hash_destroy(lost);
+		return;
+	}
+	dir = GetDatabasePath(gc->s->dboid, gc->s->spcoid);
+	foreach_ptr(ManifestFile, f, gc->written)
+	{
+		TableFile  *t;
+		XrefSection x;
+
+		if (!(f->flags & MANIFEST_FILE_SETTLED) ||
+			(t = open_table(dir, f, CurrentMemoryContext)) == NULL)
+			continue;
+		if (xrefs_read(t, &x))
+		{
+			xrefs_visit(&x, 1, gc->retire_lo - 1, drop_lost_ref, lost);
+			xrefs_free(&x);
+		}
+		close_table(t);
+	}
+	pfree(dir);
+	hash_seq_init(&seq, lost);
+	while ((lr = hash_seq_search(&seq)) != NULL)
+	{
+		for (int i = 0; i < gc->nothers; i++)
+		{
+			uint64		offset;
+			uint32		len;
+
+			if (lr->epoch < gc->others_lo[i] || lr->epoch > gc->others_hi[i] ||
+				!PROLLY_CALL(table_format(), find, gc->others[i]->tf,
+							 &lr->target, &offset, &len))
+				continue;
+			if (gc->lost == NULL)
+				gc->lost = MemoryContextAllocZero(gc->cxt,
+												  sizeof(uint32) * gc->nothers);
+			gc->lost[i]++;
+			break;
+		}
+	}
+	hash_destroy(lost);
 }
 
 /*
@@ -11158,7 +11453,17 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 			}
 		}
 		if (!collected || kept)
-			nm.files[nm.nfiles++] = gc->m.files[i];
+		{
+			nm.files[nm.nfiles] = gc->m.files[i];
+			/* (a file kept whole: its garbage as the collection found it) */
+			for (int j = 0; j < gc->nfiles && kept && gc->measured; j++)
+				if (!gc->files[j].segment &&
+					gc->files[j].id == gc->m.files[i].id &&
+					gc->measured[j] != PG_UINT64_MAX)
+					nm.files[nm.nfiles].garbage =
+						(uint32) Min(gc->measured[j], gc->m.files[i].nchunks);
+			nm.nfiles++;
+		}
 	}
 	foreach(lc, gc->written)
 	{
@@ -11180,6 +11485,12 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 		nm.retiring[nm.nretiring++] = gc->files[j].id;
 		freed_bytes += gc->files[j].size;
 	}
+	for (int i = 0; i < gc->nothers && gc->lost; i++)
+		for (int k = 0; k < nm.nfiles; k++)
+			if (nm.files[k].id == gc->others[i]->id)
+				nm.files[k].garbage = (uint32)
+					Min((uint64) nm.files[k].garbage + gc->lost[i],
+						nm.files[k].nchunks);
 	nm.nsegments = gc->nretained + 1;
 	nm.segments = palloc(sizeof(uint64) * nm.nsegments);
 	nm.sealed_at = palloc0(sizeof(XLogRecPtr) * nm.nsegments);
@@ -11641,6 +11952,8 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.gc_inbound = journal_gc_inbound,
 	.gc_read_any = journal_gc_read_any,
 	.gc_refs_node = journal_gc_refs_node,
+	.note_garbage = journal_note_garbage,
+	.gc_measured = journal_gc_measured,
 	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,

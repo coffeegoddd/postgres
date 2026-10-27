@@ -2783,6 +2783,86 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 	hash_destroy(in);
 }
 
+/* What a sever leaves garbage, found: each node once. */
+typedef struct Removed
+{
+	HTAB	   *seen;
+	List	   *hashes;			/* ProllyHash * */
+} Removed;
+
+static bool
+removed_visit(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Removed    *r = arg;
+
+	if (set_add(r->seen, &node->hash))
+		r->hashes = lappend(r->hashes, memcpy(palloc(sizeof(ProllyHash)),
+											  &node->hash, sizeof(ProllyHash)));
+	return true;
+}
+
+/* The nodes parent (pinfo) has that commit info lacks, into r. */
+static void
+commit_removed(Removed *r, const ProllyCommitInfo *info,
+			   const ProllyCommitInfo *pinfo)
+{
+	PROLLY_CALL(dc.canonicalizer, walk_changes, &info->root, &pinfo->root,
+				removed_visit, r);
+	if (pinfo->has_dependencies)
+		PROLLY_CALL(tree, diff_nodes, &tree_env,
+					info->has_dependencies ? &info->dependencies : NULL,
+					&pinfo->dependencies, removed_visit, r);
+}
+
+/* Commit id's nodes that each of its parents here has and it lacks. */
+static void
+removed_by(Removed *r, const ProllyHash *id, const ProllyHash *only)
+{
+	ProllyCommitInfo info;
+
+	if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+		return;
+	for (int i = 0; i < info.nparents; i++)
+	{
+		ProllyCommitInfo pinfo;
+
+		CHECK_FOR_INTERRUPTS();
+		/* (a parent severed before: what it lacks was counted then) */
+		if ((only != NULL && !same_id(only, &info.parents[i])) ||
+			is_severed(&info.parents[i]) ||
+			!PROLLY_CALL(dc.refs, commit_get, &info.parents[i], &pinfo) ||
+			!PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+						 &pinfo.root.hash))
+			continue;
+		commit_removed(r, &info, &pinfo);
+	}
+}
+
+/*
+ * What a sever leaves garbage, as the chunk store's estimate wants it:
+ * each node of a commit's parent that the commit no longer has, for each
+ * commit severed and each boundary commit (against the parent severed).
+ * Along a line of history, a node reached from the fragment and not from
+ * the boundary was replaced by one of those commits, so it is among them;
+ * one a ref or a resurrection keeps is counted too, which only makes a
+ * retire read a file it frees less of.  The created sets' diffs the other
+ * way: O(what the fragment changed).  A parent past the horizon already
+ * was counted when it was severed (as a boundary commit's), so not again.
+ */
+static List *
+fragment_removed(Plan *plan)
+{
+	Removed		r = {0};
+
+	r.seen = id_set("prolly fragment removed", sizeof(ProllyHash));
+	foreach_ptr(PlanCommit, pc, plan->severed)
+		removed_by(&r, &pc->id, NULL);
+	foreach_ptr(ProllyHash, pair, plan->edges)
+		removed_by(&r, &pair[0], &pair[1]);
+	hash_destroy(r.seen);
+	return r.hashes;
+}
+
 /*
  * Every chunk a fragment's commits reach: each one's whole tree, the
  * chunks born before the fragment too.  What a repair of it from an
@@ -3478,6 +3558,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 
 	List	   *chunk_list = NIL;
 	List	   *deltas = NIL;
+	List	   *removed = NIL;
 	HTAB	   *verified = id_set("prolly archive verified", sizeof(ProllyHash));
 	char	   *archive_url = NULL;
 	ProllyWindowPolicy policy;
@@ -3579,6 +3660,10 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 			continue;
 		break;
 	}
+
+	/* (what it leaves garbage, found before anything is held) */
+	removed = PROLLY_HAS(tree_env.chunk_store, note_garbage) ?
+		fragment_removed(&plan) : NIL;
 
 	/*
 	 * Then the horizon and the refs held, only to check the plan and
@@ -3688,6 +3773,22 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	}
 
 	horizon_changed();
+
+	/*
+	 * (the store's estimate of its files' garbage: the files the fragment
+	 * leaves most garbage in are the ones a retire chooses)
+	 */
+	if (removed != NIL)
+	{
+		ProllyHash *hashes = palloc_array(ProllyHash, list_length(removed));
+		int			n = 0;
+
+		foreach_ptr(ProllyHash, h, removed)
+			hashes[n++] = *h;
+		PROLLY_CALL(tree_env.chunk_store, note_garbage, tree_env.chunks,
+					hashes, n);
+		pfree(hashes);
+	}
 	/* (outside the window no commit keeps its page root) */
 	if (PROLLY_HAS(dc.refs, forget_kept))
 		foreach(lc, plan.severed)
