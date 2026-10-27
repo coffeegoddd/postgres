@@ -6220,8 +6220,13 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 		return true;
 	if (tracking_head(refname, commit_id))
 		return true;
-	return parse_commit_id(refname, commit_id) &&
-		commit_links(commit_id, &links);
+	if (!parse_commit_id(refname, commit_id))
+		return false;
+	if (commit_links(commit_id, &links))
+		return true;
+	/* (a commit named by its id, not here: past the horizon, maybe) */
+	prolly_window_check_absent(commit_id);
+	return false;
 }
 
 static bool

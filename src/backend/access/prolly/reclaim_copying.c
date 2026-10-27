@@ -589,6 +589,21 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	XLogRecPtr	horizon;
 	XLogRecPtr	wanted;
 
+	/*
+	 * (a full collection reads the history horizon at its seal: its lock
+	 * is taken first, as a sever or repair takes it before what it locks,
+	 * and held until the transaction ends, so the horizon read is the one
+	 * committed and stays so)
+	 */
+	if (full)
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		if (dc.history_window != NULL && PROLLY_HAS(dc.history_window, hold))
+			PROLLY_CALL(dc.history_window, hold);
+	}
+
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
 	mk.gc = PROLLY_CALL(cs, gc_begin, store,
