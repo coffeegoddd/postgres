@@ -411,6 +411,7 @@ typedef struct TableFile
 	File		file;
 	uint64		size;
 	bool		settled;
+	uint32		epoch_lo;		/* its first generation (0: not settled) */
 	ProllyTableFile *tf;
 	void	   *mapped;			/* its index, mapped (NULL: read) */
 	Size		mapped_len;
@@ -3872,6 +3873,7 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 	t->path = table_file_path(dir, t->id);
 	t->size = f->size;
 	t->settled = (f->flags & MANIFEST_FILE_SETTLED) != 0;
+	t->epoch_lo = f->epoch_lo;
 	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
 	MemoryContextSwitchTo(old);
 	if (t->file < 0)
@@ -8487,6 +8489,34 @@ journal_verify_generations(ProllyChunkStore *s)
 }
 
 /*
+ * The first generation of the settled file holding a chunk, the oldest if
+ * several do; 0 if none does (the journal's, or a file not settled, or
+ * not here).
+ */
+static uint32
+journal_epoch_of(ProllyChunkStore *s, const ProllyHash *hash)
+{
+	ProllyHash	key;
+	uint32		epoch = 0;
+	ListCell   *lc;
+
+	hash_key(&key, hash);
+	refresh_segments(s);
+	load_tables(s, false);
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (t->settled && (epoch == 0 || t->epoch_lo < epoch) &&
+			PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			epoch = t->epoch_lo;
+	}
+	return epoch;
+}
+
+/*
  * Seal the segment appends go to: a new one is made (its header written)
  * and a manifest names it after the others, under the append lock, so
  * every append from here on goes to it.  The manifest's lock is held; m is
@@ -11064,6 +11094,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.gc_begin_retire = journal_gc_begin_retire,
 	.gc_inbound = journal_gc_inbound,
 	.gc_read_any = journal_gc_read_any,
+	.epoch_of = journal_epoch_of,
 	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,

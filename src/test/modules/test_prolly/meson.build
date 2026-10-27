@@ -207,6 +207,7 @@ tests += {
       'generations',
       'generations_repair',
       'generations_retire',
+      'generations_toast',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

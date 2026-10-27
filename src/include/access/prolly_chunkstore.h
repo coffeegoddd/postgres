@@ -530,6 +530,13 @@ typedef struct ProllyChunkStoreRoutine
 							   void *arg);
 	bool		(*gc_read_any) (ProllyChunkGc *gc, const ProllyHash *hash,
 								StringInfo out);
+
+	/*
+	 * Optional: the first generation of the settled file that holds a
+	 * chunk, the oldest if several do (0: none does), as the store's files
+	 * are now.
+	 */
+	uint32		(*epoch_of) (ProllyChunkStore *store, const ProllyHash *hash);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -546,9 +553,9 @@ typedef struct ProllyChunkStoreRoutine
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
 	"settle", "verify_generations", "gc_listed", "gc_find_in", \
-	"gc_begin_retire", "gc_inbound", "gc_read_any"
+	"gc_begin_retire", "gc_inbound", "gc_read_any", "epoch_of"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_read_any
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK epoch_of
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

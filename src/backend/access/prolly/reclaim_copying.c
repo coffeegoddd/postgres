@@ -64,6 +64,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_config.h"
@@ -543,6 +544,9 @@ choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 
 	if (k->keep[file] || !settled || nslots == 0)
 		return;
+	/* (a small one is rewritten whatever its garbage: it costs little) */
+	if (size < (uint64) prolly_gc_file_size * 1024 / 4)
+		return;
 	for (uint64 slot = first; slot < first + nslots; slot++)
 		live += (k->mk->marks[slot / 8] >> (slot % 8)) & 1;
 	if ((double) (nslots - live) <= REWRITE_GARBAGE * nslots)
@@ -749,7 +753,10 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 	}
 
 	/* what tables name, once those who named a tree before have ended */
-	prolly_toast_roots(mark_root, &mk);
+	if (retire)
+		prolly_toast_roots_in(lo, hi, mark_root, &mk);
+	else
+		prolly_toast_roots(mark_root, &mk);
 
 	/*
 	 * What a logical slot, here or a standby's, may still decode: read as
