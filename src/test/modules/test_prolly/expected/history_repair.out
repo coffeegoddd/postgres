@@ -296,6 +296,20 @@ SELECT hr_err('SELECT dolt_history_repair()') AS nothing_left;
  no error
 (1 row)
 
+-- (nulls are none: every fragment, from each one's archive; a negative
+-- count is refused)
+SELECT dolt_history_repair(NULL, NULL) AS null_args;
+ null_args 
+-----------
+         0
+(1 row)
+
+SELECT hr_err($$SELECT dolt_history_repair(NULL, -1)$$) AS negative;
+            negative            
+--------------------------------
+ fragments must not be negative
+(1 row)
+
 \c :home
 DROP DATABASE regress_history_repair;
 DROP ROLE regress_hr_other;
