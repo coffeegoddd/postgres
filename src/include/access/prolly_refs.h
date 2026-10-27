@@ -28,6 +28,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "access/sdir.h"
 #include "access/transam.h"
 #include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
@@ -295,6 +296,17 @@ typedef struct ProllyKeptCommit
 } ProllyKeptCommit;
 
 typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
+
+/* A move of a head log: its number in the log, its date, its commit. */
+typedef struct ProllyHeadMove
+{
+	int64		seq;
+	TimestampTz moved_at;
+	ProllyHash	commit;
+} ProllyHeadMove;
+
+/* Visits a move; false stops the visit. */
+typedef bool (*ProllyHeadMoveVisit) (const ProllyHeadMove *move, void *arg);
 /* A branch keeping pages as of commit (kept_holders()). */
 typedef void (*ProllyKeptHolderVisit) (const char *name, const ProllyHash *commit,
 									   void *arg);
@@ -897,6 +909,26 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*branches_folded) (const char *name, ProllyBranchVisit visit,
 									void *arg);
+
+	/*
+	 * Optional, together: head logs.  Each branch's head moves are logged
+	 * in order, each with its date (when it was made in its transaction,
+	 * not when that committed; never before the move before it) and the
+	 * commit it moved to, with the transaction; and a
+	 * remote-tracking branch's (branch not NULL: name is its remote's), as
+	 * fetches move it.  head_at() finds the move last made at or before at
+	 * (false: none was), a seek however long the log is, whatever dates
+	 * the commits record.  head_moves() visits the moves dated from..to
+	 * (both included) in order, forward or backward, until visit returns
+	 * false.  A log goes with its branch.  "The nearest commit at or
+	 * before commit C" is no question of a log: walk C's parents.
+	 */
+	bool		(*head_at) (const char *name, const char *branch,
+							TimestampTz at, ProllyHeadMove *move);
+	void		(*head_moves) (const char *name, const char *branch,
+							   TimestampTz from, TimestampTz to,
+							   ScanDirection direction,
+							   ProllyHeadMoveVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -958,9 +990,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
-	"forget_records", "check_copies_read", "branches_folded"
+	"forget_records", "check_copies_read", "branches_folded", \
+	"head_at", "head_moves"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branches_folded
+#define PROLLY_REFS_LAST_CALLBACK head_moves
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
