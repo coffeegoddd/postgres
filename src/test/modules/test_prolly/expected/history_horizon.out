@@ -6,6 +6,8 @@
 -- Every commit a ref names (a tag's) is kept, and so is every commit down
 -- to the merge base of two branches.
 SELECT current_database() AS home \gset
+-- (notices without their details, which name commits by hash)
+\set VERBOSITY terse
 -- (a database of its own: its history is only this test's)
 CREATE DATABASE regress_history_horizon;
 \c regress_history_horizon
@@ -162,8 +164,6 @@ FROM prolly_history_horizon();
 -- Hashes are unchanged; the log stops at the horizon, with a notice.
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
 NOTICE:  history stops at the history horizon
-DETAIL:  Commit 0940f5552a25669da840be16b969b9468f179d8c and the history before it were severed from this database.
-HINT:  Run dolt_history_repair() to reattach it.
  commit 
 --------
  c6
@@ -173,8 +173,6 @@ HINT:  Run dolt_history_repair() to reattach it.
 
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('v1');
 NOTICE:  history stops at the history horizon
-DETAIL:  Commit 0023989ff5c896f98c90199ae0022f8a88a9db24 and the history before it were severed from this database.
-HINT:  Run dolt_history_repair() to reattach it.
  commit 
 --------
  c2
@@ -184,8 +182,6 @@ SELECT hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent
 FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c2')
 ORDER BY 1, 2;
 NOTICE:  history stops at the history horizon
-DETAIL:  Commit 0940f5552a25669da840be16b969b9468f179d8c and the history before it were severed from this database.
-HINT:  Run dolt_history_repair() to reattach it.
  commit | parent 
 --------+--------
  c4     | c3
@@ -194,8 +190,6 @@ HINT:  Run dolt_history_repair() to reattach it.
 SELECT count(*) AS history_rows FROM dolt_history_table(NULL::hh.t) h
 WHERE (h.row).id = 1;
 NOTICE:  history stops at the history horizon
-DETAIL:  Commit 0940f5552a25669da840be16b969b9468f179d8c and the history before it were severed from this database.
-HINT:  Run dolt_history_repair() to reattach it.
  history_rows 
 --------------
             3
@@ -298,8 +292,6 @@ FROM prolly_history_horizon();
 
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
 NOTICE:  history stops at the history horizon
-DETAIL:  Commit bef4daea722bb323b99a829a58c4876d8b312683 and the history before it were severed from this database.
-HINT:  Run dolt_history_repair() to reattach it.
  commit 
 --------
  merge
