@@ -1190,18 +1190,23 @@ head hasn't begins empty too, so the move drops it without its pages
 having been shared (and, for pages no other map held, logged) first.  A
 table whose definition differs keeps its pages: the move may keep its rows.
 
-A branch's pages are kept as of the last commits it was at
-(prolly.kept_commits, 2 by default): when a commit's fold, or a move
-settled, leaves the working set known to be a commit's root, each
+A commit's pages are kept by page-tree roots, captured at commits as
+often as the root interval allows (below): when a commit's fold, or a
+move settled, leaves the working set known to be a commit's root, each
 block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
 change logs) is kept by a root of its storage captured into its page store
 (bmap_root_capture(), through branch operations' keep()), O(1) in its
 size, a relation unchanged since one of the newest kept commits reusing
-that one's.  A root is the store's, not the relation's: any number of them
-are kept, and each outlives the relation's storage (a restore, a drop)
-until the commit keeping it is let go of, which lets go of it as its
-transaction commits.  A capture writes out only the relation's pages
-changed since its last capture (those its map walk finds), never visiting
+that one's.  A root is the store's, not the relation's or the branch's:
+any number of them are kept, each outlives the relation's storage (a
+restore, a drop) until the commit keeping it is let go of, which lets go
+of it as its transaction commits, and a move of any branch to the commit
+is given it (below).  A branch's list keeps the newest
+prolly.kept_commits (2 by default) of its kept commits; retention over
+the history window is to replace that cap, a commit whose root it let
+go of moved to as one no root was captured at.  A capture writes out
+only the relation's pages changed since its last capture (those its map
+walk finds), never visiting
 the buffers.  Redo of one writes the same pages, walking the root's own
 leaves as the record names them, and syncs nothing: those pages were
 logged as images (below).
@@ -1221,9 +1226,10 @@ commits writes about twice master's WAL.  That is accepted for that mode
 for now; a capture that syncs the pages a full-page write doesn't need,
 and a copy-on-write that logs no image redo can do without, are to bring
 it down.  A move to a commit no root was captured at
-restores the nearest kept commit before it (by first parents, no further
-back than the oldest commit any branch's list keeps) and writes the
-rows the two differ by: an interval's, and what a merge between brought
+restores the nearest kept commit before it (by first parents, at most
+1,024 back and no further than the oldest commit any branch's list
+keeps) and writes the rows the two differ by: an interval's, and what a
+merge between brought
 in.  A commit's
 pages are the commit's, whichever branch kept them: a move restores them
 from another branch's kept commit too (share_kept()), so a branch made at
@@ -1340,8 +1346,8 @@ the newest entry another map still holds, so VACUUM treats those pages
 as unshared again.  It holds each such relation's branch meanwhile, as a
 session on it does, so a branch's deletion or rename tried then fails as
 if a session were on it (its detail says either may be).  A
-move back to one of them (dolt_reset('--hard') to the head or the commit
-before, a merge's abort, a stash) first gives each table that changed
+move to a kept commit (dolt_reset('--hard') to the head or an earlier
+commit, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
 root, O(1), its pg_class row repointed with its oldest transaction ids
 then, as TRUNCATE gives a relation new storage, and the old storage kept
@@ -1358,7 +1364,12 @@ way.  A move that gives a table another branch's storage (share(), or
 share_kept() of another branch's kept pages) replaces the table's storage
 too but carries nothing: those pages are of another lineage, so the
 branch's kept commits of that table are dropped (kept_drop_dead()), and
-a reset back to one shares another kept root or writes its rows.  The
+a reset back to one shares another kept root or writes its rows.  A
+move that restores another branch's kept commit holds its roots for the
+session's branch too (hold(): another root of the same subtrees, O(1),
+frozen if the source's was) and lists the commit as the branch's own,
+so the keep after the move captures nothing and a move back restores
+it from the branch's own list.  The
 baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
 of its rows.  A move to a commit whose pages aren't kept, or whose kept
@@ -1387,9 +1398,10 @@ commit's snapshot goes with the old storage.  Whatever still differs
 (definitions, sequences, a table not restored) the move writes as before.
 A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
-dropped, it was renamed, its rows' transaction ids are older than the
-database still knows, its rows in the commit can't be read here, the user
-couldn't write its rows, or the session itself is using one of its
+dropped, it was renamed, its root isn't frozen and its rows' transaction
+ids are older than the database still knows, its rows in the commit
+can't be read here, the user couldn't write its rows, or the session
+itself is using one of its
 relations (a scan of it open, an AFTER trigger's event queued): its rows
 are written.  A hard reset takes its restores' locks, as TRUNCATE takes
 them, waiting for them, before it holds the refs (lock_for_restore():
@@ -1469,8 +1481,9 @@ older than it reads the shared pages, as after a TRUNCATE.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
-relations share the snapshots, O(1), and the source's writers are not
-locked out (the source's relations are held with ShareUpdateExclusiveLock,
+relations are made of the commit's roots, O(1), and the source's
+writers are not locked out (the source's relations are held with
+ShareUpdateExclusiveLock,
 tried and never queued for, which only definition changes, VACUUM and
 letting go of kept pages wait for); only relations not kept (a table made
 or whose storage was replaced since, a sequence) are copied as before,
@@ -1479,10 +1492,12 @@ tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
 
-A restore gives each table it restores new storage, and the storage it
-replaces, where every other kept commit's snapshot of the table was, goes
-with it at commit; so does a rewrite's, or a dropped table's.  Each keep
-and each restore asks what is left of each kept commit's pages (branch
+A restore gives each table it restores new storage and carries the
+other kept commits' roots of it there (above); a rewrite or a truncation
+gives it storage no root was captured of, and a drop takes it, so its
+kept commits' roots are then gone for it, let go of by a later keep.
+Each keep and each restore asks what is left of each kept commit's
+pages (branch
 operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
 relations asked of).  Only the commits still kept are asked, never more
 than prolly.kept_commits and the one a restore keeps again: a retired
@@ -1493,18 +1508,19 @@ transaction ask of every one before it.  So a retired commit whose
 storage goes later stays in the record, keeping its commit and baseline
 from collection, until a later keep lets go of it or the branch is
 deleted.  One with nothing left at all (every
-relation's storage, or its snapshot there, gone, as the transaction sees
+relation's storage, or its root, gone, as the transaction sees
 it) is dropped from the list at once, with nothing to let go of, and its
 commit and baseline are no longer kept from collection.  One none of
-whose tables can be given its pages any more, but with a snapshot still
+whose tables can be given its pages any more, but with a root still
 left (a TRUNCATE gives a table and its indexes new storage, but not its
-change log; its rows' transaction ids are older than the database still
-knows), is retired, as above: it stays in the record, keeping its commit
+change log; an unfrozen root's rows' transaction ids are older than the
+database still knows), is retired, as above: it stays in the record,
+keeping its commit
 and baseline from collection, until a later keep lets go of its
-snapshots.  Neither counts toward prolly.kept_commits or is offered to a
+roots.  Neither counts toward prolly.kept_commits or is offered to a
 move or a first use.  A commit with a table whose relations are all still
 on the storage that kept them stays kept (restore_pages() may still pass
-the table over, renamed or with other relations since).  Snapshots that a
+the table over, renamed or with other relations since).  Roots that a
 dropped commit shares with one let go of are kept until a later keep: the
 change that made it gone may roll back.
 
@@ -1519,7 +1535,7 @@ A move of any branch (a reset, a checkout's move, a first use's) gives a
 table whose rows differ from the target's, where a kept commit of any
 branch holds the target's table and sharing costs less than writing the
 rows, and the transaction that kept it precedes every snapshot in the
-cluster, storage made of that commit's snapshots (branch operations'
+cluster, storage made of that commit's roots (branch operations'
 share_kept(): O(1) each, the source branch held against deletion and its
 relations against letting go of the pages, each relation stored alike on
 both and the source's still on the storage that kept it), its baseline
