@@ -223,8 +223,8 @@ prolly_autovacuum_init(void)
 							 0,
 							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_lock_wait",
-							"How long a move giving a table shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
-							"An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.  A restore of the branch's own kept pages queues for its locks instead, as TRUNCATE does.",
+							"How long a move giving a table kept or shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
+							"The lock is tried, never queued for, so readers after the move don't wait behind it.  An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.",
 							&prolly_restore_lock_wait,
 							100, 0, INT_MAX,
 							PGC_USERSET,

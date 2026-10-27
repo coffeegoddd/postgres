@@ -260,7 +260,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_finder  | log            | identity                       | pass
  change_finder  | log            | complete                       | pass
  change_finder  | stub           | identity                       | pass
- change_finder  | stub           | complete                       | not implemented (11 of 11 callbacks missing)
+ change_finder  | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  remote         | file           | identity                       | pass
  remote         | file           | heads_and_chunks               | no checks yet
  remote         | file           | complete                       | pass

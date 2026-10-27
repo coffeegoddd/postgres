@@ -1782,43 +1782,6 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 }
 
 /*
- * Fewer than limit rows differ from the baseline's: log_changes()'s
- * checks, and fewer than limit log entries since the baseline (each
- * changes a row at most: the rows that differ are fewer still).  Only the
- * entries' count is read, stopping at limit; no candidate is made.
- */
-static bool
-log_fewer_changes(Relation rel, const ProllyTableFold *baseline, int limit)
-{
-	Snapshot	snap = GetActiveSnapshot();
-	ProllyComponents c;
-	ProllyFullFoldReason reason;
-	uint64		identity = 0;
-	State		st;
-	EntryCount	count = {0, Max(limit, 1), false};
-	ProllyLogPosition pos;
-
-	prolly_components_for_relation(rel, &c);
-	if (c.change_log)
-		identity = PROLLY_CALL(c.change_log, identity, rel);
-	if (prolly_full_fold_wanted(&reason) || identity == 0 ||
-		!parse_state(&baseline->state, &st) || st.log != identity ||
-		!sees_fold(snap, &st) || (st.flags & STATE_UNSETTLED) ||
-		storage_unseen(rel, snap))
-		return false;
-	pos = (ProllyLogPosition) {st.fxmax, st.fown, st.nxip, st.fxip};
-
-	/*
-	 * (false from the read: the count reached limit, a visit stopping it,
-	 * or an entry says to read the table in full, which says nothing of
-	 * how many rows changed)
-	 */
-	return PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
-					   &count) &&
-		!count.unknown && count.n < count.limit;
-}
-
-/*
  * Why log_fold() from baseline would read rel in full, from the checks it
  * makes before reading the log (the log's entries can say so too: a
  * truncation, a rewrite, more rows than the table holds; those aren't
@@ -2004,5 +1967,4 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.full_reason = log_full_reason,
 	.fold_on_leave = log_fold_on_leave,
 	.changes = log_changes,
-	.fewer_changes = log_fewer_changes,
 };

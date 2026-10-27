@@ -1501,37 +1501,35 @@ can't be read here, the user couldn't write its rows, or the session
 itself is using one of its
 relations (a scan of it open, an AFTER trigger's event queued): its rows
 are written.  A hard reset takes its restores' locks, as TRUNCATE takes
-them, waiting for them, before it holds the refs (lock_for_restore():
-the tables restore_pages() will give pages, planned as it plans them, so
-not one whose rows it writes, as a reset of a few rows does): giving up
-would leave it every row the working set changed to write back, however
-many, and waiting while it held the refs would hold up every other
-branch's operation behind a reader of one table.  Every other operation
-takes the branch's refs, then the root, then the relations it reads or
-writes; so the reset takes its tables' locks all or none, waiting for
-the first busy one with nothing else held and then trying all again,
-and then only tries the refs and the root: if either is held, it gives
-every table's lock back and waits in each one's queue, holding nothing
-(taking it and letting go of it at once, so the deadlock detector and
-lock_timeout see the wait), and begins again.  Planning takes no lock it
-keeps (what it opens to read, it lets go of), so two resets of one branch
-at once never each hold a table the other waits for.  It never holds a lock another operation waits for
-while it waits for one that operation holds.  A page sweep holding a
-table's lock lets go of it for a waiter, an autovacuum worker is
-cancelled after deadlock_timeout (as for any waiter), the deadlock
-detector sees the wait, and lock_timeout bounds it, failing the reset.
-Any other restore's locks (another move's, a reset's in a transaction
-holding the refs already), and a share's, are tried, not queued for, so
-as not to hold up the writers and operations behind them: a page sweep holding one is
+them, before it holds the refs (lock_for_restore(): the tables
+restore_pages() will give pages, planned as it plans them), so that
+waiting for one never holds up every other branch's operation behind a
+reader of one table.  It tries each, never waiting in a lock's queue, so
+readers after it never queue behind it: a page sweep holding one is
 asked to let go, an autovacuum worker asked, once, to cancel its task (as
 Postgres cancels one that blocks a lock waiter) and waited for, until
-deadlock_timeout after the move first asked one, and any other holder
-waited for, tried again a little later each time, until
-prolly.restore_lock_wait (100 ms) after the move first waited: a
-statement lets go within a moment, a transaction left open won't soon,
-and the rows written instead.  lock_timeout, if set, caps both; the
-deadlock detector doesn't see these waits, so they are bounded, for the
-whole move.  A restore or share given up so is counted in
+deadlock_timeout after the reset first asked one, and any other holder (a
+transaction that read the table and is still open) waited for, tried
+again a little later each time, until prolly.restore_lock_wait (100 ms)
+after the reset first waited; lock_timeout, if set, caps both.  A table
+still held after that is given up on, and the reset writes its rows
+instead, which takes only a writer's locks, so a reader holds a reset up
+for those bounds at most.  Every other operation takes the branch's refs,
+then the root, then the relations it reads or writes; so the reset takes
+its tables' locks all or none, trying for the first busy one with nothing
+else held and then trying all again, and then only tries the refs and the
+root: if either is held, it gives every table's lock back and waits in
+each one's queue, holding nothing (taking it and letting go of it at
+once, so the deadlock detector and lock_timeout see the wait), and begins
+again, the tables given up on tried anew.  Planning takes no lock it
+keeps (what it opens to read, it lets go of), so two resets of one branch
+at once never each hold a table the other waits for.  It never holds a
+lock another operation waits for while it waits for one that operation
+holds.  Any other restore's locks (another move's, a reset's in a
+transaction holding the refs already), and a share's, are tried the same
+way, within the same bounds for the whole move, and the rows written
+instead once they pass.  The deadlock detector doesn't see these waits,
+which is why they are bounded.  A restore or share given up so is counted in
 pg_stat_prolly's restores_lock_busy.  A table whose commit
 has a root is always restored, however few of its rows changed: a move
 to a commit kept writes no rows (but where a lock, a privilege or the

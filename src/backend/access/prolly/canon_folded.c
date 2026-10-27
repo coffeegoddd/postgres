@@ -5948,15 +5948,11 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 		*left_out = list_concat(*left_out, l);
 }
 
-/*
- * What table_changes() and table_fewer_changes() ask of the change finder:
- * the changes visited, or (limit > 0) whether fewer than limit changed.
- */
+/* What table_changes() asks of the change finder: the changes visited. */
 typedef struct TableChangesAsk
 {
 	ProllyRowChangeVisit visit;
 	void	   *arg;
-	int			limit;
 } TableChangesAsk;
 
 /* A change finder's walk of one table's changes. */
@@ -5974,10 +5970,8 @@ changes_run(void *arg)
 {
 	ChangesRun *run = arg;
 
-	run->ok = run->ask->limit > 0 ?
-		run->cn->finder->fewer_changes(run->rel, &run->tf, run->ask->limit) :
-		run->cn->finder->changes(run->rel, &run->cn->env, &run->tf,
-								 run->ask->visit, run->ask->arg);
+	run->ok = run->cn->finder->changes(run->rel, &run->cn->env, &run->tf,
+									   run->ask->visit, run->ask->arg);
 }
 
 /*
@@ -6000,8 +5994,7 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 	cn.reading = true;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
-	if (ask->limit > 0 ? !PROLLY_HAS(cn.finder, fewer_changes) :
-		!PROLLY_HAS(cn.finder, changes))
+	if (!PROLLY_HAS(cn.finder, changes))
 		return false;
 
 	/* (the fold's snapshot: the transaction's writes, this statement's too) */
@@ -6103,7 +6096,7 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
 					 void *arg)
 {
-	TableChangesAsk ask = {visit, arg, 0};
+	TableChangesAsk ask = {visit, arg};
 
 	return table_changes_asked(baseline, relid, data, &ask);
 }

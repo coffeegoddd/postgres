@@ -1,23 +1,23 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A hard reset gives a table back its kept pages under the table's locks,
-# queued for as TRUNCATE queues them: a holder holds the reset up rather
-# than turning the restore away, as giving up would leave the reset every
-# row the working set changed to write back, however many:
+# taken as TRUNCATE takes them, before it holds the refs, but tried, never
+# queued for, so that no reader after it waits behind it:
 #
-# - an autovacuum worker vacuuming the branch's copy is cancelled after
-#   deadlock_timeout, as Postgres cancels one blocking a lock waiter, and
-#   the reset restores;
-# - another holder is waited for, however long it holds the lock: the
-#   reset restores once it lets go, writing no row back;
-# - lock_timeout bounds the wait: the reset then fails, the working set
-#   left as it was, and still writes no row;
-# - the reset queues before it holds the refs, so a checkout of another
-#   branch doesn't wait behind it.
+# - an autovacuum worker vacuuming the branch's copy is asked to cancel,
+#   and the reset restores;
+# - another holder is waited for until prolly.restore_lock_wait: the
+#   reset restores if it lets go by then, and readers meanwhile aren't
+#   held up;
+# - a holder that doesn't let go by then (or by lock_timeout, if smaller)
+#   is given up on, and the reset writes the table's rows instead, at
+#   once for a one-row reset beside an open reader;
+# - the reset waits before it holds the refs, so a checkout of another
+#   branch doesn't wait behind it, and two resets of a branch at once
+#   never deadlock.
 #
 # A reset in a transaction that holds the refs already (a branch made
-# first) can't queue for its locks without holding up every other
-# branch's operation, so it tries them, as a share does, within bounds:
+# first) tries its locks the same way, once it holds them:
 #
 # - an autovacuum worker is asked to cancel once, and waited for until
 #   deadlock_timeout;
@@ -179,8 +179,10 @@ my $cancels = () = slurp_file($node->logfile) =~
 is($cancels, 1, 'the worker was cancelled once');
 ok(at_head(), 'the scratch branch holds its head\'s rows');
 
-# 2. Another session on the scratch branch holding kp.t, as long as it
-# likes: the reset waits in the lock's queue, and restores once it lets go.
+# 2. Another session on the scratch branch holding kp.t, letting go
+# within prolly.restore_lock_wait: the reset tries the lock until then,
+# never in its queue, so a reader meanwhile isn't held up, and restores
+# once it lets go.
 dirty();
 my $holder = $node->background_psql('postgres');
 $holder->query_safe(q{SELECT dolt_checkout('scratch'); BEGIN;
@@ -189,16 +191,18 @@ $restored = counted('relations_restored');
 $applied = counted('apply_rows');
 my $busy = counted('restores_lock_busy');
 my $resetter;
-($reset, $resetter) = start_reset(q{SET prolly.restore_lock_wait = 0});
+($reset, $resetter) = start_reset(q{SET prolly.restore_lock_wait = '60s'});
 ok( $node->poll_query_until(
-		'postgres', qq{SELECT wait_event_type = 'Lock'
+		'postgres', qq{SELECT wait_event = 'BranchKeptLock'
 		FROM pg_stat_activity WHERE pid = $resetter}),
-	'the reset waits in the queue of the holder\'s lock');
-# (well past prolly.restore_lock_wait, which bounds only a share's tries)
-sleep(1);
-ok( sql(qq{SELECT wait_event_type = 'Lock' FROM pg_stat_activity
-		WHERE pid = $resetter}),
-	'and goes on waiting');
+	'the reset tries the holder\'s lock');
+is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $resetter
+	AND (NOT granted OR locktype = 'relation')}), '0',
+	'holding no relation\'s lock, nor in any lock\'s queue');
+my ($sret, $sout, $serr) = $node->psql('postgres', q{
+	SELECT dolt_checkout('scratch'); SET lock_timeout = '1s';
+	SELECT 'read ' || count(*) FROM kp.t});
+like($sout, qr/read 4000/, 'a reader meanwhile isn\'t held up');
 $holder->query_safe(q{COMMIT});
 like(finish_reset($reset), qr/reset t/, 'the reset finished once the holder let go');
 ok(counted('relations_restored') > $restored,
@@ -207,29 +211,13 @@ is(counted('apply_rows'), $applied, 'writing no row back');
 is(counted('restores_lock_busy'), $busy, 'no restore was given up on');
 ok(at_head(), 'the scratch branch holds its head\'s rows again');
 
-# 3. lock_timeout bounds the wait: the reset fails, and its working set is
-# as it was; once the holder lets go, the reset restores.
-dirty();
-my $dirty = on_scratch(q{SELECT md5(string_agg(t::text, ',' ORDER BY a)) FROM kp.t});
-$holder->query_safe(q{BEGIN; LOCK TABLE kp.t IN SHARE UPDATE EXCLUSIVE MODE});
-$applied = counted('apply_rows');
-my $began = time();
-my ($ret, $out, $err) = $node->psql('postgres',
-	q{SELECT dolt_checkout('scratch'); SET lock_timeout = '300ms';
-	  SELECT dolt_reset('--hard')});
-my $took = time() - $began;
-like($err, qr/canceling statement due to lock timeout/,
-	'with lock_timeout, the reset fails once it passes');
-ok($took >= 0.3 && $took < 10, "after lock_timeout ($took s)");
-is(counted('apply_rows'), $applied, 'having written no row');
-is(on_scratch(q{SELECT md5(string_agg(t::text, ',' ORDER BY a)) FROM kp.t}),
-	$dirty, 'the working set is as it was');
-$holder->query_safe(q{COMMIT});
+# 3. A holder that doesn't let go: given up on after
+# prolly.restore_lock_wait (or lock_timeout, if smaller), the reset writes
+# the table's rows instead; it never fails for it.
+given_up(q{}, 0.1, 5, 'default prolly.restore_lock_wait', 0);
+given_up(q{SET prolly.restore_lock_wait = '20s'; SET lock_timeout = '300ms'},
+	0.3, 10, 'lock_timeout below prolly.restore_lock_wait', 0);
 $holder->quit;
-$restored = counted('relations_restored');
-on_scratch(q{SELECT dolt_reset('--hard'); SELECT pg_stat_force_next_flush()});
-ok(counted('relations_restored') > $restored, 'the reset then restores');
-ok(at_head(), 'the scratch branch holds its head\'s rows at last');
 
 # 4. A reader of main's copy left in an open transaction, and a reset of
 # main waiting for it: a checkout of another branch, which waits for the
@@ -239,7 +227,8 @@ my $reader = $node->background_psql('postgres');
 $reader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
 $restored = counted('relations_restored');
 my $mreset = $node->background_psql('postgres');
-my $mresetter = $mreset->query_safe(q{SELECT pg_backend_pid()});
+my $mresetter = $mreset->query_safe(q{SELECT pg_backend_pid();
+	SET prolly.restore_lock_wait = '60s'});
 $mreset->query_until(qr/started/, q{
 	\echo started
 	SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
@@ -247,13 +236,16 @@ $mreset->query_until(qr/started/, q{
 	\echo done
 });
 ok( $node->poll_query_until(
-		'postgres', qq{SELECT wait_event_type = 'Lock' AND wait_event = 'relation'
+		'postgres', qq{SELECT wait_event = 'BranchKeptLock'
 		FROM pg_stat_activity WHERE pid = $mresetter}),
 	'a reset of main waits for the reader');
-$began = time();
+my ($cret, $cout, $cerr) = $node->psql('postgres', q{
+	SET lock_timeout = '1s'; SELECT 'read ' || count(*) FROM kp.t});
+like($cout, qr/read 4000/, 'another reader of main\'s table isn\'t held up');
+my $began = time();
 is(on_scratch(q{SELECT count(*) FROM kp.t}), '4000',
 	'a checkout of another branch meanwhile');
-$took = time() - $began;
+my $took = time() - $began;
 ok($took < 5, "doesn't wait behind the reset ($took s)");
 is(sql(q{SELECT dolt_branch('meanwhile') IS NOT NULL}), 't',
 	'nor does making a branch');
@@ -273,13 +265,14 @@ sub main_reset_waiting
 	my $reader = $node->background_psql('postgres');
 	$reader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
 	my $r = $node->background_psql('postgres', on_error_stop => 0);
-	my $rpid = $r->query_safe(q{SELECT pg_backend_pid()});
+	my $rpid = $r->query_safe(q{SELECT pg_backend_pid();
+		SET prolly.restore_lock_wait = '60s'});
 	$r->query_until(qr/started/, q{
 		\echo started
 		SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
 		\echo done
 	});
-	$node->poll_query_until('postgres', qq{SELECT wait_event = 'relation'
+	$node->poll_query_until('postgres', qq{SELECT wait_event = 'BranchKeptLock'
 		FROM pg_stat_activity WHERE pid = $rpid})
 	  or die 'the reset did not wait for the reader';
 	return ($reader, $r, $rpid);
@@ -310,8 +303,8 @@ my ($mreader, $mr, $mrpid) = main_reset_waiting();
 is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $mrpid
 	AND locktype = 'relation' AND granted}), '0',
 	'a reset waiting for a reader holds no relation\'s lock');
-is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $mrpid AND NOT granted}), '1',
-	'and waits for one alone');
+is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $mrpid AND NOT granted}), '0',
+	'nor waits in any lock\'s queue');
 $mreader->query_safe(q{COMMIT});
 $mreader->quit;
 like($mr->query_until(qr/done/, ''), qr/reset t/, 'and finishes once the reader ends');
@@ -347,6 +340,47 @@ for my $round (1 .. 15)
 is($deadlocks, 0, 'two resets of a branch at once never deadlock');
 is($finished, 30, 'and every one finishes');
 
+# 4a''. Two resets of main at once, both tables dirty, beside a reader of
+# kp.t that ends while they try its lock: neither holds a table the
+# other tries for, so both finish, with no deadlock.
+sql(q{UPDATE kp.t SET b = b || 'q' WHERE a % 20 = 0;
+	UPDATE kp.u SET b = b || 'q' WHERE a % 20 = 0});
+my $qreader = $node->background_psql('postgres');
+$qreader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
+my @qrs;
+my @qpids;
+for my $i (1 .. 2)
+{
+	my $r = $node->background_psql('postgres', on_error_stop => 0);
+	push @qpids, $r->query_safe(q{SELECT pg_backend_pid();
+		SET prolly.restore_lock_wait = '60s'});
+	$r->query_until(qr/started/, q{
+		\echo started
+		SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
+		\echo done
+	});
+	push @qrs, $r;
+}
+my $qpids = join(',', @qpids);
+ok( $node->poll_query_until(
+		'postgres', qq{SELECT count(*) = 2 FROM pg_stat_activity
+		WHERE pid IN ($qpids) AND wait_event_type IS NOT NULL
+		  AND state = 'active'}),
+	'two resets of main wait beside a reader');
+$qreader->query_safe(q{COMMIT});
+$qreader->quit;
+$deadlocks = 0;
+$finished = 0;
+for my $r (@qrs)
+{
+	my $out = $r->query_until(qr/done/, '');
+	$finished++ if $out =~ /reset t/;
+	$deadlocks++ if $r->{stderr} =~ /deadlock/;
+	$r->quit;
+}
+is($deadlocks, 0, 'two resets beside a reader never deadlock');
+is($finished, 2, 'and both finish once it ends');
+
 # 4b. Another session of main commits a table the reset will restore,
 # its commit then reading kp.t, which the reset waits for: once the
 # reader ends, neither waits for the other (the reset holds no table
@@ -381,22 +415,38 @@ unlike($mr->{stderr} . $checkout->{stderr}, qr/deadlock/, 'with no deadlock');
 $checkout->quit;
 $mr->quit;
 
-# 4d. A reset that writes its row rather than restore the table (rows, with
-# debug_prolly_restore_roots off: a restore waits for a reader, as TRUNCATE
-# does) takes no lock a reader holds: it neither waits for nor blocks one.
+# 4d. A one-row reset beside a reader left in an open transaction
+# finishes at once: it gives up on the table after
+# prolly.restore_lock_wait and writes its row, which takes no lock the
+# reader holds.  With no reader, the same reset restores the table,
+# writing no row.
 sql(q{UPDATE kp.t SET b = b || 'o' WHERE a = 1});
 my $oreader = $node->background_psql('postgres');
 $oreader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
 $applied = counted('apply_rows');
+$restored = counted('relations_restored');
+$busy = counted('restores_lock_busy');
+$began = time();
 my ($oret, $oout, $oerr) = $node->psql('postgres', q{
-	SET lock_timeout = '2s'; SET debug_prolly_restore_roots = off;
+	SET lock_timeout = '10s';
 	SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
 	SELECT pg_stat_force_next_flush()});
-like($oout, qr/reset t/, 'a one-row reset beside a reader finishes at once');
-unlike($oerr, qr/lock timeout/, 'without waiting for the reader');
-ok(counted('apply_rows') > $applied, 'writing the row');
+$took = time() - $began;
+like($oout, qr/reset t/, 'a one-row reset beside a reader finishes');
+ok($took < 3, "at once ($took s)");
+unlike($oerr, qr/lock timeout/, 'without waiting out lock_timeout');
+ok(counted('restores_lock_busy') > $busy, 'giving up on the table');
+is(counted('relations_restored'), $restored, 'restoring nothing');
+is(counted('apply_rows') - $applied, 1, 'and writing the row');
 $oreader->query_safe(q{COMMIT});
 $oreader->quit;
+sql(q{UPDATE kp.t SET b = b || 'o' WHERE a = 1});
+$applied = counted('apply_rows');
+$restored = counted('relations_restored');
+sql(q{SELECT dolt_reset('--hard'); SELECT pg_stat_force_next_flush()});
+ok(counted('relations_restored') > $restored,
+	'with no reader, a one-row reset restores the table');
+is(counted('apply_rows'), $applied, 'writing no row');
 
 # 5. In a transaction holding the refs already: a worker asked to cancel
 # is asked once.  Stopped in its error handling, the lock still held, it
@@ -484,14 +534,14 @@ $holder->query_safe(q{SELECT dolt_checkout('scratch')});
 on_scratch(q{SELECT dolt_reset('--hard')});
 sub given_up
 {
-	my ($settings, $at_least, $under, $what) = @_;
+	my ($settings, $at_least, $under, $what, $in_refs) = @_;
 	dirty();
 	$holder->query_safe(q{BEGIN; LOCK TABLE kp.t IN SHARE UPDATE EXCLUSIVE MODE});
 	my $restored = counted('relations_restored');
 	my $busy = counted('restores_lock_busy');
 	my $applied = counted('apply_rows');
 	my $began = time();
-	my ($reset) = start_reset($settings, 1);
+	my ($reset) = start_reset($settings, $in_refs // 1);
 	like(finish_reset($reset), qr/reset t/, "$what: the reset finished");
 	my $took = time() - $began;
 	ok($took >= $at_least && $took < $under,
