@@ -597,13 +597,15 @@ typedef struct ProllyChunkStoreRoutine
 
 	/*
 	 * Optional: chunks thought garbage now (what a sever let go of), n of
-	 * them, each counted in the estimate of every settled file holding it
-	 * (generations()' garbage, at most its chunks).  An estimate, not a
-	 * promise: a retire measures a file it reads, and a sever's
-	 * transaction that aborts after leaves it as noted.  It waits for a
-	 * collection's swap, which keeps what was noted before.
+	 * them, each counted in the estimate of the settled file of the oldest
+	 * generation holding it (generations()' garbage, at most its chunks).
+	 * An estimate, not a promise: a retire measures a file it reads, and a
+	 * sever's transaction that aborts after leaves it as noted.  The
+	 * chunks are looked up before the writers' lock is taken; adding the
+	 * counts waits for a collection's swap, which keeps what was noted
+	 * before.  Returns the files' indexes probed.
 	 */
-	void		(*note_garbage) (ProllyChunkStore *store,
+	int64		(*note_garbage) (ProllyChunkStore *store,
 								 const ProllyHash *hashes, int n);
 
 	/*

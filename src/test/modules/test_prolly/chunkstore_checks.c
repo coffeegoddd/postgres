@@ -2895,6 +2895,27 @@ test_chunk_retire_choose(PG_FUNCTION_ARGS)
 													  values, nulls)));
 }
 
+/*
+ * Note chunks as garbage, as a sever does (the chunk store's
+ * note_garbage()): the files' indexes probed.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_note_garbage);
+Datum
+test_chunk_note_garbage(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	ProllyHash *hashes;
+
+	deconstruct_array_builtin(arr, TEXTOID, &elems, &nulls, &n);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
+	PG_RETURN_INT64(PROLLY_CALL(cs(), note_garbage, store(), hashes, n));
+}
+
 PG_FUNCTION_INFO_V1(test_logical_horizon);
 Datum
 test_logical_horizon(PG_FUNCTION_ARGS)

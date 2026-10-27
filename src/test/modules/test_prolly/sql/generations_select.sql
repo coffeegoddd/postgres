@@ -147,6 +147,34 @@ SELECT test_chunk_verify_generations() > 0 AS generations;
 \c postgres
 DROP DATABASE generations_select_db;
 
+-- A sever's estimate looks each chunk up in the settled files oldest
+-- first, stopping at the first that holds it, before the writers' lock:
+-- a chunk of the oldest file costs one probe however many files there
+-- are, one in none a probe a file.
+CREATE DATABASE generations_select_probes;
+\c generations_select_probes
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gp VERSIONED;
+CREATE TABLE gp.t (id int PRIMARY KEY, v text);
+INSERT INTO gp.t SELECT g, 'p' || g FROM generate_series(1, 300) g;
+SELECT length(dolt_commit('-Am', 'p0')::text) > 0 AS committed;
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+SELECT root AS p0_root FROM test_commit_roots('main') \gset
+SELECT test_chunk_note_garbage(ARRAY[:'p0_root']) AS probes_one_file;
+SELECT format($$UPDATE gp.t SET v = 'q%s' WHERE id = %s$$, i, i),
+	   format('SELECT dolt_commit(%L, %L)', '-Am', 'p' || i),
+	   'SELECT test_chunk_gc(false)'
+FROM generate_series(1, 8) i \o /dev/null \gexec
+\o
+SELECT count(*) AS settled_files FROM test_chunk_generations() WHERE settled;
+SELECT test_chunk_note_garbage(ARRAY[:'p0_root']) AS probes_nine_files;
+SELECT test_chunk_note_garbage(ARRAY[repeat('ab', 20)]) AS probes_absent;
+SELECT garbage AS p0_noted FROM test_chunk_generations()
+	WHERE epoch_lo = (SELECT min(epoch_lo) FROM test_chunk_generations()
+					  WHERE settled);
+\c postgres
+DROP DATABASE generations_select_probes;
+
 -- Archived, retired as chosen, then repaired: the history reads again,
 -- and the generations check out, through a retire after.
 \getenv abs_builddir PG_ABS_BUILDDIR

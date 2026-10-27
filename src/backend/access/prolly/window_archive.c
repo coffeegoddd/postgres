@@ -3785,8 +3785,8 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 
 		foreach_ptr(ProllyHash, h, removed)
 			hashes[n++] = *h;
-		PROLLY_CALL(tree_env.chunk_store, note_garbage, tree_env.chunks,
-					hashes, n);
+		(void) PROLLY_CALL(tree_env.chunk_store, note_garbage,
+						   tree_env.chunks, hashes, n);
 		pfree(hashes);
 	}
 	/* (outside the window no commit keeps its page root) */

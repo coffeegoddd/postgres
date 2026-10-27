@@ -136,11 +136,12 @@
  * Garbage estimates.  Each settled file's entry counts the chunks thought
  * garbage in it, which a reclaimer chooses the generations to retire by:
  * a sever notes what it leaves garbage (note_garbage(), counted against
- * every settled file holding each chunk); a retire's swap sets a file it
+ * the oldest settled file holding each chunk); a retire's swap sets a file it
  * keeps whole to what it found (gc_measured()), and adds, to an older
  * file outside it, each chunk that file holds which the files it drops
  * listed and nothing it wrote, nor any newer file's section, lists.  A
- * file it rewrites starts at none.  The counts are estimates: one too
+ * file it rewrites starts at none; a conjoin's files carry what the files
+ * they merge had.  The counts are estimates: one too
  * high costs a retire that reads the file and corrects it.
  *
  * IDENTIFICATION
@@ -5011,6 +5012,7 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 	Manifest	nm;
 	bool		full;
 	int			max = 4;
+	uint64		carried = 0;	/* the estimates of the files conjoined */
 
 	nm = *m;
 	nm.nfiles = 0;
@@ -5019,6 +5021,8 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 	{
 		if (keep[i])
 			nm.files[nm.nfiles++] = m->files[i];
+		else if (copies)
+			carried += m->files[i].garbage;
 	}
 	/* (with a limit, as many files as it takes, each begun as the last fills) */
 	do
@@ -5040,7 +5044,12 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 		nm.files[nm.nfiles].flags = flags;
 		nm.files[nm.nfiles].epoch_lo = epoch_lo;
 		nm.files[nm.nfiles].epoch_hi = epoch_hi;
-		nm.files[nm.nfiles].garbage = 0;
+		/*
+		 * (a conjoin's files carry the estimates of those they merge: the
+		 * garbage is still there, as many chunks of it)
+		 */
+		nm.files[nm.nfiles].garbage = (uint32) Min(carried, nchunks);
+		carried -= Min(carried, nchunks);
 		nm.nfiles++;
 		nm.last_id = id++;
 	} while (full);
@@ -9098,69 +9107,97 @@ journal_epoch_of(ProllyChunkStore *s, const ProllyHash *hash)
 	return epoch;
 }
 
+static int
+table_age_cmp(const void *a, const void *b)
+{
+	const TableFile *x = *(TableFile *const *) a;
+	const TableFile *y = *(TableFile *const *) b;
+
+	if (x->epoch_lo != y->epoch_lo)
+		return x->epoch_lo < y->epoch_lo ? -1 : 1;
+	return x->id < y->id ? -1 : (x->id > y->id ? 1 : 0);
+}
+
 /*
- * Chunks thought garbage, each counted against every settled file holding
- * it, under the writers' lock (a collection holds it from its waits to its
- * swap, and keeps what was noted before: it reads the manifest again after
- * its waits); the manifest replaced once, if any count changed.
+ * Chunks thought garbage, each counted against the settled file of the
+ * oldest generation holding it (the copy a retire keeps, the others
+ * duplicates): the files probed oldest first, each chunk's probing
+ * stopped at the first that has it, before the writers' lock is taken,
+ * so writers never wait for it.  Then, under the lock (a collection holds
+ * it from its waits to its swap, and keeps what was noted before: it
+ * reads the manifest again after its waits), the counts added to the
+ * files still named, the manifest replaced once if any changed.  The
+ * files' indexes probed, returned: a chunk of the oldest file costs one,
+ * one in no settled file one a file, which a store's number of files
+ * (prolly.conjoin_max_files) bounds.
  */
-static void
+static int64
 journal_note_garbage(ProllyChunkStore *s, const ProllyHash *hashes, int n)
 {
 	Manifest	m;
+	TableFile **ts;
 	uint64	   *counts;
+	uint64	   *ids;
+	int			nt = 0;
+	int64		probes = 0;
 	bool		any = false;
-	int			nt;
-	int			i;
-	ListCell   *lc;
 
 	if (n <= 0)
-		return;
-	lock_manifest(s, &m);
+		return 0;
+	refresh_segments(s);
 	load_tables(s, false);
-	nt = list_length(s->tables);
+	ts = palloc(sizeof(TableFile *) * Max(list_length(s->tables), 1));
+	foreach_ptr(TableFile, t, s->tables)
+		if (t->settled)
+			ts[nt++] = t;
+	qsort(ts, nt, sizeof(TableFile *), table_age_cmp);
 	counts = palloc0(sizeof(uint64) * Max(nt, 1));
+	ids = palloc(sizeof(uint64) * Max(nt, 1));
+	for (int i = 0; i < nt; i++)
+		ids[i] = ts[i]->id;
 	for (int h = 0; h < n; h++)
 	{
 		ProllyHash	key;
 
 		CHECK_FOR_INTERRUPTS();
 		hash_key(&key, &hashes[h]);
-		i = 0;
-		foreach(lc, s->tables)
+		for (int i = 0; i < nt; i++)
 		{
-			TableFile  *t = lfirst(lc);
 			uint64		offset;
 			uint32		len;
 
-			if (t->settled &&
-				PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			probes++;
+			if (PROLLY_CALL(table_format(), find, ts[i]->tf, &key, &offset,
+							&len))
+			{
 				counts[i]++;
-			i++;
+				break;
+			}
 		}
 	}
-	i = 0;
-	foreach(lc, s->tables)
-	{
-		TableFile  *t = lfirst(lc);
+	pfree(ts);
 
+	lock_manifest(s, &m);
+	for (int i = 0; i < nt; i++)
+	{
 		for (int k = 0; k < m.nfiles && counts[i] > 0; k++)
 		{
 			ManifestFile *f = &m.files[k];
 			uint32		g;
 
-			if (f->id != t->id)
+			if (f->id != ids[i])
 				continue;
 			g = (uint32) Min((uint64) f->garbage + counts[i], f->nchunks);
 			any |= g != f->garbage;
 			f->garbage = g;
 		}
-		i++;
 	}
 	if (any)
 		replace_manifest(s, &m, XLOG_CHUNKS_MANIFEST);
 	unlock_manifest(s);
 	pfree(counts);
+	pfree(ids);
+	return probes;
 }
 
 /*

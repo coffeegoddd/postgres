@@ -757,6 +757,12 @@ CREATE FUNCTION test_chunk_retire_choose(budget int8 DEFAULT NULL,
 	OUT lo int8, OUT hi int8)
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Note chunks as garbage, as a sever does: counted against the oldest
+-- settled file holding each.  Returns the files' indexes probed.
+CREATE FUNCTION test_chunk_note_garbage(hashes text[])
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The oldest position a logical slot of the current database, or one of a
 -- standby's as its feedback said, may decode from (NULL: none): what a
 -- collection keeps the values the WAL names from.
