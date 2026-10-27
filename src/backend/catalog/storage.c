@@ -347,6 +347,71 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 }
 
 /*
+ * RelationCreateStorageFromRoot
+ *		Create a permanent relation's storage as a copy of a root captured
+ *		into its page store (bmap_root_capture()).
+ *
+ * As RelationCreateStorageFromSnapshot(): the main fork shares the root's
+ * pages until it changes one (bmap_share_root()), O(1) in the relation's
+ * size.  It gets no free space map or visibility map, so the relation
+ * claims no page all-visible and knows of no free space until vacuumed,
+ * unless maps_from: then they are copies of that relation's (the caller
+ * knows its pages are the root's still, and VACUUM kept from setting a bit
+ * meanwhile).  With replacing, the storage made takes that storage's place
+ * (dropped as the transaction commits: a restore), and shares the pages
+ * with no other relation for that; with sharer, a relation that still
+ * holds the root's pages is told it shares them (bmap_share_root()).  The
+ * storage is deleted if the
+ * transaction aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
+							  SMgrRelation maps_from, SMgrRelation replacing,
+							  SMgrRelation sharer, bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/* (registered first, as for a share) */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	bmap_share_root(root, srel, replacing, sharer);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+	if (maps_from)
+	{
+		FlushRelationsAllBuffers(&maps_from, 1);
+		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+		{
+			if (!smgrexists(maps_from, fork))
+				continue;
+			smgrcreate(srel, fork, false);
+			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+			RelationCopyStorage(maps_from, srel, fork, RELPERSISTENCE_PERMANENT);
+		}
+	}
+
+	/*
+	 * No pending sync: the root's own blocks were logged as images when it
+	 * was captured, and the share is logged.
+	 */
+	return srel;
+}
+
+/*
  * Perform XLogInsert of an XLOG_SMGR_CREATE record to WAL.
  */
 void
@@ -631,6 +696,40 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 */
 	if (need_fsm_vacuum)
 		FreeSpaceMapVacuumRange(rel, nblocks, InvalidBlockNumber);
+}
+
+/*
+ * RelationTruncateStorage
+ *		Truncate storage no relation is open on (srel, permanent and
+ *		WAL-logged) to nblocks blocks of its main fork, as RelationTruncate()
+ *		does a relation's: logged first, then cut.  Its other forks, if any,
+ *		are left as they are.
+ */
+void
+RelationTruncateStorage(SMgrRelation srel, BlockNumber nblocks)
+{
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber old_nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	xl_smgr_truncate xlrec;
+	XLogRecPtr	lsn;
+
+	if (old_nblocks <= nblocks)
+		return;
+	smgrpretruncate(srel, &fork, 1);
+	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
+	START_CRIT_SECTION();
+	xlrec.blkno = nblocks;
+	xlrec.rlocator = srel->smgr_rlocator.locator;
+	xlrec.flags = SMGR_TRUNCATE_HEAP;
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+	XLogFlush(lsn);
+	smgrtruncate(srel, &fork, 1, &old_nblocks, &nblocks);
+	END_CRIT_SECTION();
+	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
+	smgrposttruncate(srel, &fork, 1);
 }
 
 /*

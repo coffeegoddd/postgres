@@ -1,12 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A restore carries the other kept commits' snapshots of a table into the
-# storage it gives the table (one record each, on the new storage, that
-# redo applies without writing pages out).  After a crash past the
-# restore's commit, both commits are still restorable.  A restore that
-# fails part way through, or that a crash ends before its commit, leaves
-# the old storage and every snapshot in it as they were: the next reset
-# restores from them.  Redo is checked page by page throughout
+# A restore gives a table storage made of a kept commit's roots, and the
+# other kept commits' roots, which the page store keeps, are named as of
+# that storage (carried).  After a crash past the restore's commit, both
+# commits are still restorable.  A restore that fails part way through, or
+# that a crash ends before its commit, leaves the old storage and every
+# root as they were: the next reset restores from them.  Redo is checked page by page throughout
 # (wal_consistency_checking).
 
 use strict;
@@ -53,7 +52,7 @@ sql(q{UPDATE app.t SET v = 1 WHERE id <= 300;
 my $b = sql(q{SELECT (dolt_commit('-am', 'b'))[1]});
 my $at_b = sql($digest);
 
-# reset to a, which carries b's snapshots; a crash once it commits
+# reset to a, which carries b's roots; a crash once it commits
 sql(q{UPDATE app.t SET v = 2 WHERE id % 5 = 0});
 my $restored = counted('relations_restored');
 sql(qq{SELECT dolt_reset('--hard', '$a')});
@@ -69,15 +68,15 @@ cmp_ok(counted('relations_restored'), '>', $restored, 'b, carried, restored afte
 is(counted('apply_rows') - $applied, 0, 'no row written');
 is(sql($digest), $at_b, 'b\'s rows');
 
-# a carry that fails: the restore rolls back, a still kept where it was
+# a restore that fails part way: it rolls back, a still kept as it was
 sql(q{UPDATE app.t SET v = 3 WHERE id % 5 = 1});
 my $dirty = sql($digest);
 my ($ret, $out, $err) = $node->psql('postgres', qq{
 	SELECT injection_points_set_local();
-	SELECT injection_points_attach('bmap-snapshot-carried', 'error');
+	SELECT injection_points_attach('bmap-root-shared', 'error');
 	SELECT dolt_reset('--hard', '$a');
 });
-like($err, qr/bmap-snapshot-carried/, 'the carry failed');
+like($err, qr/bmap-root-shared/, 'the restore failed part way');
 is(sql($digest), $dirty, 'the working set as it was');
 $restored = counted('relations_restored');
 sql(qq{SELECT dolt_reset('--hard', '$a')});
@@ -87,12 +86,12 @@ is(sql($digest), $at_a, 'a\'s rows');
 # a crash in the middle of a restore, before its commit
 sql(q{UPDATE app.t SET v = 4 WHERE id % 5 = 2});
 $dirty = sql($digest);
-sql(q{SELECT injection_points_attach('bmap-snapshot-carried', 'wait')});
+sql(q{SELECT injection_points_attach('bmap-root-shared', 'wait')});
 my $bg = $node->background_psql('postgres', on_error_stop => 0);
 $bg->query_until(qr/start/, qq{\\echo start
 	SELECT dolt_reset('--hard', '$b');
 });
-$node->wait_for_event('client backend', 'bmap-snapshot-carried');
+$node->wait_for_event('client backend', 'bmap-root-shared');
 $node->stop('immediate');
 # (its backend gone with the crash: ended without writing to it, as a
 # write to the closed pipe would kill the test)

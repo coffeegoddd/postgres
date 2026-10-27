@@ -33,6 +33,8 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_history.h"
+#include "access/prolly_log.h"
 #include "access/prolly_revision.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
@@ -61,6 +63,7 @@
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
+#include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
@@ -4518,116 +4521,142 @@ typedef struct LogEntry
 	ProllyHash	key;			/* hash key: info.id as prolly_hash_key() makes it */
 	ProllyCommitInfo info;
 	int64		order;			/* its height: 1 + the most of its parents' */
+	pairingheap_node node;		/* (in a LogStream's heap until given) */
 } LogEntry;
 
-static LogEntry *
-log_find(HTAB *entries, const ProllyHash *id)
-{
-	ProllyHash	k = prolly_hash_key(id);
-
-	return hash_search(entries, &k, HASH_FIND, NULL);
-}
-
 /*
- * Highest order first, then newest, as Dolt's log goes by height and then
- * date: a commit is always above its parents.
+ * A walk of the commits some starts reach, given one at a time in the log's
+ * order: highest height first, then newest, then by id, as Dolt's log goes
+ * by height and then date.  A
+ * commit is always above its parents, so a commit not yet found is below
+ * every one found and not yet given (each is a parent's parent of one of
+ * them): the next to give is always the greatest of those found, kept in a
+ * heap, and each one given is read with its parents, those then found.  So
+ * the first n commits cost about n commits read, their parents with them,
+ * however long the history.  A listing stops at the history horizon.
  */
+struct ProllyLogStream
+{
+	HTAB	   *seen;			/* of LogEntry, by key */
+	HTAB	   *heights;		/* those reckoned of commits without one */
+	pairingheap *heap;			/* those found, not given */
+	HTAB	   *horizon;		/* the history horizon as it began (NULL:
+								 * the window's, asked) */
+};
+typedef ProllyLogStream LogStream;
+
 static int
-log_cmp(const ListCell *a, const ListCell *b)
+log_heap_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	LogEntry   *x = lfirst(a);
-	LogEntry   *y = lfirst(b);
+	const LogEntry *x = pairingheap_const_container(LogEntry, node, a);
+	const LogEntry *y = pairingheap_const_container(LogEntry, node, b);
 
+	/* (the heap gives its greatest first: the log's first) */
 	if (x->order != y->order)
-		return x->order > y->order ? -1 : 1;
+		return x->order > y->order ? 1 : -1;
 	if (x->info.committed_at != y->info.committed_at)
-		return x->info.committed_at > y->info.committed_at ? -1 : 1;
-	return memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
+		return x->info.committed_at > y->info.committed_at ? 1 : -1;
+	return -memcmp(x->info.id.bytes, y->info.id.bytes, x->info.id.len);
 }
 
-/*
- * A commit of the log, for prolly_history_height(): read already, so none
- * is read twice.
- */
+/* A commit of the stream, for prolly_history_height(): read as found. */
 static bool
-log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+log_stream_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 {
-	LogEntry   *e = log_find(arg, id);
+	LogStream  *ls = arg;
+	ProllyHash	k = prolly_hash_key(id);
+	LogEntry   *e = hash_search(ls->seen, &k, HASH_FIND, NULL);
 
-	if (e == NULL)
-		return false;
-	*info = e->info;
-	return true;
+	/* (one found already, read: entered before it is read, so asked) */
+	if (e != NULL && e->info.id.len > 0)
+	{
+		*info = e->info;
+		return true;
+	}
+	return PROLLY_CALL(refs(), commit_get, id, info);
 }
 
-/*
- * Every commit the starts (ProllyHash *) reach (LogEntry *), each once,
- * highest commit order (height) first, then newest.
- */
-static List *
-log_walk(List *starts)
+/* Find commit id: read, with its height, and put in the heap; once. */
+static void
+log_stream_find(LogStream *ls, const ProllyHash *id)
 {
-	HTAB	   *seen;
-	HASHCTL		ctl = {0};
-	HTAB	   *heights;
-	List	   *entries = NIL;
-	ListCell   *lc;
-	ProllyHash	key;
+	ProllyHash	key = prolly_hash_key(id);
+	LogEntry   *e;
 	bool		found;
+
+	e = hash_search(ls->seen, &key, HASH_ENTER, &found);
+	if (found)
+		return;
+	memset(&e->info, 0, sizeof(e->info));
+	if (!PROLLY_CALL(refs(), commit_get, id, &e->info))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit %s is missing", hash_hex(id))));
+	if (e->info.has_height && e->info.height > 0)
+		e->order = e->info.height;
+	else
+	{
+		if (ls->heights == NULL)
+			ls->heights = prolly_history_heights();
+		e->order = prolly_history_height(&e->info.id, ls->heights,
+										 log_stream_lookup, ls);
+	}
+	pairingheap_add(ls->heap, &e->node);
+}
+
+/* A stream of the commits the starts (ProllyHash *) reach. */
+static LogStream *
+log_stream_begin(List *starts)
+{
+	LogStream  *ls = palloc0(sizeof(LogStream));
+	HASHCTL		ctl = {0};
 
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(LogEntry);
 	ctl.hcxt = CurrentMemoryContext;
-	seen = hash_create("dolt_log commits", 256, &ctl,
-					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ls->seen = hash_create("dolt_log commits", 256, &ctl,
+						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ls->heap = pairingheap_allocate(log_heap_cmp, NULL);
+	/* (held: a sever or a rollback meanwhile doesn't move where it stops) */
+	ls->horizon = prolly_window_horizon();
+	foreach_ptr(ProllyHash, start, starts)
+		log_stream_find(ls, start);
+	return ls;
+}
 
-	/*
-	 * Every commit from the starts, each entered once, as it is found:
-	 * entries is the queue too, walked by an index as it grows.
-	 */
-	foreach(lc, starts)
+/* The stream's next commit; NULL once every one is given. */
+static LogEntry *
+log_stream_next(LogStream *ls)
+{
+	LogEntry   *e;
+
+	CHECK_FOR_INTERRUPTS();
+	if (pairingheap_is_empty(ls->heap))
+		return NULL;
+	e = pairingheap_container(LogEntry, node, pairingheap_remove_first(ls->heap));
+	for (int i = 0; i < e->info.nparents; i++)
 	{
-		LogEntry   *e;
-
-		key = prolly_hash_key(lfirst(lc));
-		e = hash_search(seen, &key, HASH_ENTER, &found);
-		if (!found)
-			entries = lappend(entries, e);
+		/* (a listing stops at the history horizon) */
+		if (prolly_window_held_stops_at(ls->horizon, &e->info.parents[i]))
+			continue;
+		log_stream_find(ls, &e->info.parents[i]);
 	}
-	for (int n = 0; n < list_length(entries); n++)
-	{
-		LogEntry   *e = list_nth(entries, n);
-		ProllyHash	id = e->key;
+	return e;
+}
 
-		CHECK_FOR_INTERRUPTS();
-		memset(&e->info, 0, sizeof(e->info));
-		e->order = 0;
-		if (!PROLLY_CALL(refs(), commit_get, &id, &e->info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit %s is missing", hash_hex(&id))));
-		for (int i = 0; i < e->info.nparents; i++)
-		{
-			LogEntry   *p;
+/*
+ * Every commit the starts (ProllyHash *) reach (LogEntry *), each once,
+ * highest commit order (height) first, then newest: the stream drained.
+ */
+static List *
+log_walk(List *starts)
+{
+	LogStream  *ls = log_stream_begin(starts);
+	List	   *entries = NIL;
+	LogEntry   *e;
 
-			/* (a listing stops at the history horizon) */
-			if (prolly_window_stops_at(&e->info.parents[i]))
-				continue;
-			key = prolly_hash_key(&e->info.parents[i]);
-			p = hash_search(seen, &key, HASH_ENTER, &found);
-			if (!found)
-				entries = lappend(entries, p);
-		}
-	}
-	heights = prolly_history_heights();
-	foreach(lc, entries)
-	{
-		LogEntry   *e = lfirst(lc);
-
-		e->order = prolly_history_height(&e->info.id, heights, log_lookup, seen);
-	}
-	hash_destroy(heights);
-	list_sort(entries, log_cmp);
+	while ((e = log_stream_next(ls)) != NULL)
+		entries = lappend(entries, e);
 	return entries;
 }
 
@@ -5664,38 +5693,82 @@ dolt_rebase_plan_change(PG_FUNCTION_ARGS)
 }
 
 /*
+ * A stream of dolt_log(ref)'s rows (see prolly_log.h), the commits read as
+ * they are given; NULL for HEAD before a first commit.  The ref's commit is
+ * kept from collection while the transaction runs (the chunk store's
+ * keep()), and with it every commit it reaches.
+ */
+ProllyLogStream *
+prolly_log_begin(const char *ref)
+{
+	ProllyHash	start;
+
+	if (!PROLLY_CALL(refs(), resolve, ref, &start))
+	{
+		if (pg_strcasecmp(ref, "HEAD") == 0)
+			return NULL;		/* nothing committed yet */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	}
+	/*
+	 * (the start kept from collection for the transaction: a stream reads
+	 * its commits as it goes, after a collection that began meanwhile, a
+	 * history drop's, would otherwise have freed them)
+	 */
+	{
+		ProllyTreeEnv env;
+
+		prolly_folded_tree_env(&env);
+		PROLLY_CALL(env.chunk_store, keep, env.chunks, &start);
+	}
+	return log_stream_begin(list_make1(&start));
+}
+
+/* dolt_log's next row into values (6 of them); false at the end. */
+bool
+prolly_log_next(ProllyLogStream *stream, Datum *values, bool *nulls)
+{
+	LogEntry   *e = stream ? log_stream_next(stream) : NULL;
+	char	   *name;
+	char	   *email;
+
+	if (e == NULL)
+		return false;
+	split_author(e->info.author, &name, &email);
+	memset(nulls, 0, sizeof(bool) * 6);
+	values[0] = CStringGetTextDatum(hash_hex(&e->info.id));
+	values[1] = CStringGetTextDatum(name);
+	values[2] = CStringGetTextDatum(email);
+	values[3] = TimestampTzGetDatum(e->info.committed_at);
+	values[4] = CStringGetTextDatum(e->info.message);
+	values[5] = Int64GetDatum(e->order);
+	return true;
+}
+
+/*
  * dolt_log(ref text, OUT commit_hash text, OUT committer text,
  *			OUT email text, OUT date timestamptz, OUT message text,
  *			OUT commit_order int8) returns setof record
  *
  * Every commit ref reaches, highest commit order (height) first, then
- * newest.
+ * newest.  (Planned, it is read by a scan of its own that gives each row as
+ * it is found, so a LIMIT reads no more commits than it gives:
+ * prolly_log_scan.c.)
  */
 Datum
 dolt_log(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	ListCell   *lc;
+	ProllyLogStream *stream;
+	Datum		values[6];
+	bool		nulls[6];
 
 	InitMaterializedSRF(fcinfo, 0);
-	foreach(lc, log_entries(ref))
-	{
-		LogEntry   *e = lfirst(lc);
-		Datum		values[6];
-		bool		nulls[6] = {0};
-		char	   *name;
-		char	   *email;
-
-		split_author(e->info.author, &name, &email);
-		values[0] = CStringGetTextDatum(hash_hex(&e->info.id));
-		values[1] = CStringGetTextDatum(name);
-		values[2] = CStringGetTextDatum(email);
-		values[3] = TimestampTzGetDatum(e->info.committed_at);
-		values[4] = CStringGetTextDatum(e->info.message);
-		values[5] = Int64GetDatum(e->order);
+	stream = prolly_log_begin(ref);
+	while (prolly_log_next(stream, values, nulls))
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-	}
 	return (Datum) 0;
 }
 
@@ -8506,45 +8579,150 @@ dolt_at_support(PG_FUNCTION_ARGS)
 }
 
 /*
- * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
- *					  text, OUT committer text, OUT commit_date timestamptz)
- *	  returns setof record
- *
- * tbl's table's rows at each commit the head reaches (that has the table),
- * with the commit, as Dolt's dolt_history_<table>: each read from the
- * commit's tree, as dolt_at() reads it.
+ * The rows a bounded history read found at the commit it read last, kept
+ * for the commits after it whose table is the same tree: each key and row
+ * as the sink was given them.
  */
-Datum
-dolt_history_table(PG_FUNCTION_ARGS)
+typedef struct HistoryKept
 {
-	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
-	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	ProllyDiffSink sink;		/* must be first */
+	AtSink	   *to;
+	MemoryContext cxt;
+	List	   *rows;			/* of HistoryRow */
+} HistoryKept;
+
+typedef struct HistoryRow
+{
+	ProllyKey	key;
+	ProllyValue value;
+} HistoryRow;
+
+static void
+history_keep(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+			 const ProllyKey *key, const ProllyValue *before,
+			 const ProllyValue *after)
+{
+	HistoryKept *hk = (HistoryKept *) self;
+	MemoryContext old = MemoryContextSwitchTo(hk->cxt);
+	HistoryRow *r = palloc(sizeof(HistoryRow));
+	uint8	   *k = palloc(Max(key->len, 1));
+	uint8	   *v = palloc(Max(after->len, 1));
+
+	memcpy(k, key->data, key->len);
+	memcpy(v, after->data, after->len);
+	r->key.data = k;
+	r->key.len = key->len;
+	r->value.data = v;
+	r->value.len = after->len;
+	hk->rows = lappend(hk->rows, r);
+	MemoryContextSwitchTo(old);
+	at_change(&hk->to->sink, relid, kind, key, before, after);
+}
+
+/*
+ * relid's table's rows at each commit the head reaches (that has the
+ * table), with the commit, into rsinfo's store, as dolt_history_table()
+ * gives them.  With bounds (nbounds of them: the rows whose primary keys
+ * any bounds), only those: a commit whose version is keyed and defined as
+ * the table is now is read by seeking its data tree for each bound
+ * (O(depth) a bound), and one whose table is the tree the commit read
+ * before it had is given that commit's rows again, reading nothing; any
+ * other is read whole, the caller's filter keeping what the bounds would.
+ */
+void
+prolly_history_rows(Oid relid, const ProllyKeyBounds *bounds, int nbounds,
+					ReturnSetInfo *rsinfo)
+{
+	const ProllyMergeRoutine *dm = diff_merge();
 	Relation	rel;
 	AtSink		s;
+	HistoryKept hk;
+	ProllyHash	data;
 	ListCell   *lc;
 	List	   *lineages = NIL;
 
 	rel = open_row_type_table(relid, "dolt_history_table", ACL_SELECT);
-	InitMaterializedSRF(fcinfo, 0);
 	memset(&s, 0, sizeof(s));
 	s.sink.change = at_change;
-	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.rsinfo = rsinfo;
 	s.history = true;
+	memset(&hk, 0, sizeof(hk));
+	hk.sink.change = history_keep;
+	hk.to = &s;
+	hk.cxt = AllocSetContextCreate(CurrentMemoryContext, "history rows kept",
+								   ALLOCSET_DEFAULT_SIZES);
+	data.len = 0;
+	if (nbounds > 0 && !PROLLY_HAS(dm, bounded_rows))
+		nbounds = 0;
 	rows_begin(&s.rows, rel);
 	foreach(lc, log_entries("HEAD"))
 	{
 		LogEntry   *e = lfirst(lc);
 		char	   *email;
+		ProllyBoundedRead read = PROLLY_BOUNDED_NO;
 
 		CHECK_FOR_INTERRUPTS();
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
 		check_typed_at(relid, s.hash, &lineages, "dolt_history_table");
-		PROLLY_CALL(diff_merge(), diff, NULL, s.hash, relid, &s.sink);
+		if (nbounds > 0)
+		{
+			/* (what this read finds kept apart from what the last one kept) */
+			MemoryContext kept_cxt = hk.cxt;
+			List	   *kept = hk.rows;
+
+			hk.cxt = AllocSetContextCreate(CurrentMemoryContext,
+										   "history rows kept",
+										   ALLOCSET_DEFAULT_SIZES);
+			hk.rows = NIL;
+			read = dm->bounded_rows(s.hash, &e->info.root, relid, bounds,
+									nbounds, &data, &hk.sink);
+			if (read == PROLLY_BOUNDED_SAME)
+			{
+				/* (the same tree: the rows kept, given with this commit) */
+				MemoryContextDelete(hk.cxt);
+				hk.cxt = kept_cxt;
+				hk.rows = kept;
+				foreach_ptr(HistoryRow, r, hk.rows)
+					at_change(&s.sink, relid, PROLLY_DIFF_ADDED, &r->key, NULL,
+							  &r->value);
+				continue;
+			}
+			MemoryContextDelete(kept_cxt);
+			if (read == PROLLY_BOUNDED_READ)
+				continue;
+		}
+		/* (read whole: nothing kept for the commits after it) */
+		data.len = 0;
+		MemoryContextReset(hk.cxt);
+		hk.rows = NIL;
+		PROLLY_CALL(dm, diff, NULL, s.hash, relid, &s.sink);
 	}
 	rows_end(&s.rows);
+	MemoryContextDelete(hk.cxt);
 	table_close(rel, AccessShareLock);
+}
+
+/*
+ * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
+ *					  text, OUT committer text, OUT commit_date timestamptz)
+ *	  returns setof record
+ *
+ * tbl's table's rows at each commit the head reaches (that has the table),
+ * with the commit, as Dolt's dolt_history_<table>: each read from the
+ * commit's tree, as dolt_at() reads it.  (Planned with quals on the
+ * primary key, it is read by a scan of its own that seeks each commit:
+ * prolly_history_scan.c.)
+ */
+Datum
+dolt_history_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+
+	InitMaterializedSRF(fcinfo, 0);
+	prolly_history_rows(relid, NULL, 0, (ReturnSetInfo *) fcinfo->resultinfo);
 	return (Datum) 0;
 }
 

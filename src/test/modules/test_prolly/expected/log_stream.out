@@ -1,0 +1,317 @@
+-- dolt_log gives each commit as it is found: a heap of the commits found,
+-- the greatest given next (highest height, then newest, then by hash),
+-- each read with its parents as it is given.  So dolt_log ... LIMIT n
+-- reads about n commits, not the whole history, and the order is the
+-- log's: by height, then date, then hash, through merges and commits made
+-- at the same moment.  A listing stops at the history horizon.
+SELECT current_database() AS home \gset
+\set VERBOSITY terse
+CREATE DATABASE regress_log_stream;
+\c regress_log_stream
+-- (the commits a statement reads, its counts flushed)
+CREATE FUNCTION commits_read() RETURNS bigint LANGUAGE sql AS $$
+	SELECT coalesce((SELECT value FROM pg_stat_prolly WHERE name = 'commits_read'), 0)
+$$;
+\set flush 'SELECT pg_stat_force_next_flush() IS NULL AS flushed \\gset'
+-- (the log in the order it gives, and in the order it must give)
+CREATE FUNCTION log_in_order(ref text) RETURNS bool LANGUAGE sql AS $$
+	SELECT (SELECT array_agg(commit_hash) FROM dolt_log(ref)) =
+		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash)
+		 FROM dolt_log(ref))
+$$;
+CREATE SCHEMA ls VERSIONED;
+CREATE TABLE ls.t (id int PRIMARY KEY, v int);
+INSERT INTO ls.t VALUES (1, 0);
+CREATE FUNCTION mk(n int, at text, k int DEFAULT 1) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1..n LOOP
+		UPDATE ls.t SET v = v + 1 WHERE id = k;
+		IF at IS NULL THEN
+			PERFORM dolt_commit('-Am', 'c' || i);
+		ELSE
+			PERFORM dolt_commit('-Am', 'c' || i, '--date', at);
+		END IF;
+	END LOOP;
+	RETURN n;
+END $$;
+SELECT mk(200, NULL) AS commits;
+ commits 
+---------
+     200
+(1 row)
+
+-- the plan: a scan of its own, which a LIMIT stops
+EXPLAIN (COSTS OFF) SELECT * FROM dolt_log LIMIT 10;
+         QUERY PLAN          
+-----------------------------
+ Limit
+   ->  Custom Scan (LogScan)
+(2 rows)
+
+-- (in the log's order: ORDER BY commit_order DESC, date DESC sorts nothing)
+EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC LIMIT 1;
+         QUERY PLAN          
+-----------------------------
+ Limit
+   ->  Custom Scan (LogScan)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC, date DESC LIMIT 1;
+         QUERY PLAN          
+-----------------------------
+ Limit
+   ->  Custom Scan (LogScan)
+(2 rows)
+
+-- the entry's row whole, made of the scan's columns
+EXPLAIN (COSTS OFF) SELECT count(l) FROM dolt_log l;
+         QUERY PLAN          
+-----------------------------
+ Aggregate
+   ->  Custom Scan (LogScan)
+(2 rows)
+
+SELECT count(l) AS whole_rows FROM dolt_log l;
+ whole_rows 
+------------
+        200
+(1 row)
+
+SELECT count(*) AS not_null FROM dolt_log l WHERE l IS NOT NULL;
+ not_null 
+----------
+      200
+(1 row)
+
+SELECT row_to_json(l)->>'message' AS message FROM dolt_log l LIMIT 1;
+ message 
+---------
+ c200
+(1 row)
+
+SELECT (l).message, (l).commit_order FROM dolt_log l LIMIT 1;
+ message | commit_order 
+---------+--------------
+ c200    |          200
+(1 row)
+
+SELECT count(*) AS like_json FROM dolt_log l
+	WHERE row_to_json(l)::text LIKE '%"message":"c1"%';
+ like_json 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS nonnull FROM dolt_log l WHERE num_nonnulls(l) > 0;
+ nonnull 
+---------
+     200
+(1 row)
+
+SELECT EXISTS (SELECT 1 FROM dolt_log l WHERE l IS NOT NULL) AS exists_whole;
+ exists_whole 
+--------------
+ t
+(1 row)
+
+SELECT count(*) AS joined FROM dolt_log l JOIN dolt_log m
+	ON l IS NOT NULL AND l.commit_hash = m.commit_hash;
+ joined 
+--------
+    200
+(1 row)
+
+-- the scan is dolt_log's: one who can't execute it can't read it
+CREATE ROLE regress_log_stream_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_log(text) FROM PUBLIC;
+SET ROLE regress_log_stream_nobody;
+SELECT message FROM dolt_log LIMIT 1;
+ERROR:  permission denied for function dolt_log
+SELECT count(l) FROM dolt_log l;
+ERROR:  permission denied for function dolt_log
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_log(text) TO PUBLIC;
+DROP ROLE regress_log_stream_nobody;
+-- a limited log reads about as many commits as it gives
+:flush
+SELECT commits_read() AS before \gset
+SELECT count(*) AS given FROM (SELECT * FROM dolt_log LIMIT 10) l;
+ given 
+-------
+    10
+(1 row)
+
+:flush
+SELECT commits_read() - :before <= 12 AS read_about_ten;
+ read_about_ten 
+----------------
+ t
+(1 row)
+
+SELECT commits_read() AS before \gset
+SELECT count(*) AS given FROM dolt_log;
+ given 
+-------
+   200
+(1 row)
+
+:flush
+SELECT commits_read() - :before >= 200 AS whole_reads_all;
+ whole_reads_all 
+-----------------
+ t
+(1 row)
+
+-- Branches merged, their commits made at one moment (the same date: the
+-- order goes to the hash), and the log's order through them.
+SELECT dolt_branch('a');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('a');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'a'"}
+(1 row)
+
+INSERT INTO ls.t VALUES (2, 0);
+SELECT mk(5, '2030-01-01 00:00+00', 2) AS commits_a;
+ commits_a 
+-----------
+         5
+(1 row)
+
+SELECT dolt_checkout('b');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'b'"}
+(1 row)
+
+INSERT INTO ls.t VALUES (3, 0);
+SELECT mk(7, '2030-01-01 00:00+00', 3) AS commits_b;
+ commits_b 
+-----------
+         7
+(1 row)
+
+SELECT dolt_checkout('a');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'a'"}
+(1 row)
+
+SELECT dolt_merge('b', '-m', 'merge b') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT mk(3, NULL) AS commits_after;
+ commits_after 
+---------------
+             3
+(1 row)
+
+SELECT log_in_order('HEAD') AS in_order, log_in_order('b') AS b_in_order,
+	log_in_order('HEAD~2') AS ancestor_in_order;
+ in_order | b_in_order | ancestor_in_order 
+----------+------------+-------------------
+ t        | t          | t
+(1 row)
+
+SELECT count(*) AS commits FROM dolt_log;
+ commits 
+---------
+     216
+(1 row)
+
+-- each commit once, every one the head reaches
+SELECT count(DISTINCT commit_hash) = count(*) AS once FROM dolt_log;
+ once 
+------
+ t
+(1 row)
+
+-- (the first rows the same whatever the limit)
+SELECT (SELECT array_agg(commit_hash) FROM (SELECT commit_hash FROM dolt_log LIMIT 4) l) =
+	(SELECT (array_agg(commit_hash))[1:4] FROM dolt_log) AS prefix;
+ prefix 
+--------
+ t
+(1 row)
+
+-- (a ref the scan can't compute first: the function's rows)
+SELECT r, (SELECT count(*) FROM dolt_log(r)) AS commits
+FROM (VALUES ('HEAD'), ('b')) v(r) ORDER BY r;
+  r   | commits 
+------+---------
+ b    |     207
+ HEAD |     216
+(2 rows)
+
+SELECT count(*) AS none FROM dolt_log(NULL);
+ none 
+------
+    0
+(1 row)
+
+\c :home
+DROP DATABASE regress_log_stream;
+-- The history horizon: the log stops there, in order still.
+CREATE DATABASE regress_log_stream_horizon;
+\c regress_log_stream_horizon
+CREATE FUNCTION log_in_order(ref text) RETURNS bool LANGUAGE sql AS $$
+	SELECT (SELECT array_agg(commit_hash) FROM dolt_log(ref)) =
+		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash)
+		 FROM dolt_log(ref))
+$$;
+CREATE SCHEMA hz VERSIONED;
+CREATE TABLE hz.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hz_commits(n int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+	FOR d IN 1..n LOOP
+		INSERT INTO hz.t VALUES (d, 'c' || d);
+		PERFORM dolt_commit('-Am', 'c' || d, '--date',
+			(timestamptz '2020-01-01 00:00+00' + make_interval(days => d))::text);
+	END LOOP;
+	RETURN n;
+END $$;
+SELECT hz_commits(6) AS commits;
+ commits 
+---------
+       6
+(1 row)
+
+SELECT count(*) > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ severed 
+---------
+ t
+(1 row)
+
+SELECT message FROM dolt_log;
+NOTICE:  history stops at the history horizon
+ message 
+---------
+ c6
+ c5
+ c4
+ c3
+(4 rows)
+
+SELECT log_in_order('HEAD') AS in_order;
+NOTICE:  history stops at the history horizon
+ in_order 
+----------
+ t
+(1 row)
+
+\c :home
+DROP DATABASE regress_log_stream_horizon;
