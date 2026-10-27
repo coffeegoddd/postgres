@@ -613,6 +613,7 @@ edge_of_severed(const Severed *sv, void *arg)
 	ProllyWindowEdgeVisit visit = ((void **) arg)[0];
 	void	   *varg = ((void **) arg)[1];
 
+	elog(WARNING, "ZDBG edge %s root %s", prolly_hash_hex(&sv->id), prolly_hash_hex(&sv->root));
 	visit(&sv->id, &sv->root, varg);
 	if (sv->dependencies.len > 0)
 		visit(&sv->id, &sv->dependencies, varg);
@@ -2050,9 +2051,10 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 			commit_created(&c, id, &info, NULL);
 			continue;
 		}
-		parent_here = PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
-								  &info.parents[0]) &&
-			PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo);
+		/* (its data here: commit objects are kept, a severed one's data not) */
+		parent_here = PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo) &&
+			PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+						&pinfo.root.hash);
 
 		/*
 		 * (by the fragment, not by what the store holds: a first parent in

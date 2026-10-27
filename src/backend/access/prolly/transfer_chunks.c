@@ -544,6 +544,8 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	Receiving	rv;
 	uint64		count;
 	bool	   *walk;
+	bool	   *walk_roots;
+	bool	   *walk_trees;
 
 	memset(&rv, 0, sizeof(rv));
 	rv.stops = stops;
@@ -562,6 +564,12 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	walk = palloc0(sizeof(bool) * Max(ncommits, 1));
 	for (int i = 0; i < ncommits; i++)
 		walk[i] = !PROLLY_CALL(rv.cs, has, rv.store, &commits[i]);
+	walk_roots = palloc0(sizeof(bool) * Max(nroots, 1));
+	for (int i = 0; i < nroots; i++)
+		walk_roots[i] = !PROLLY_CALL(rv.cs, has, rv.store, &roots[i]);
+	walk_trees = palloc0(sizeof(bool) * Max(ntrees, 1));
+	for (int i = 0; i < ntrees; i++)
+		walk_trees[i] = !PROLLY_CALL(rv.cs, has, rv.store, &trees[i]);
 
 	/*
 	 * A remote that runs this code is told the heads this database has, and
@@ -602,7 +610,7 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			ProllyNodeRef ref = {0};
 
 			ref.hash = roots[i];
-			if (!PROLLY_CALL(rv.cs, has, rv.store, &roots[i]))
+			if (walk_roots[i])
 				PROLLY_CALL(dc.canonicalizer, walk, &ref, receive_visit, &rv);
 		}
 		if (ntrees > 0)
@@ -621,7 +629,7 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 				ProllyNodeRef ref = {0};
 
 				ref.hash = trees[i];
-				if (!PROLLY_CALL(rv.cs, has, rv.store, &trees[i]))
+				if (walk_trees[i])
 					(void) PROLLY_CALL(tree, walk, &env, &ref, receive_visit, &rv);
 			}
 		}
