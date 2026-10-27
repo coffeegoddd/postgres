@@ -146,6 +146,14 @@ $node->start;
 like($stderr, qr/is a chunk store manifest of version 3, not \d+/,
 	'a manifest of an older version is refused');
 
+# Version 5, the last before table files had generations, is refused too.
+$node->stop;
+patch_manifest($manifest, 8, pack('V', 5));
+$node->start;
+($ret, $stdout, $stderr) = $node->psql('manifested', $read);
+like($stderr, qr/is a chunk store manifest of version 5, not 6/,
+	'a manifest without generations is refused');
+
 # An older version's manifest smaller than this version's least: refused
 # as that version, not as no manifest.
 $node->stop;

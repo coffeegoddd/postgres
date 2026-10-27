@@ -37,6 +37,10 @@
  *   and the hash's length alone, not on the file's other chunks, so a
  *   store's redo can make a chunk's bytes again from its frame; and a frame
  *   read_stored() gave, added so, gives back the bytes it was read from.
+ * - write_section() gives the file bytes of its writer's own, opaque to the
+ *   format, before write_finish(); section() says where an open file holds
+ *   them, and their CRC-32C, for the caller to read and check (len 0: the
+ *   file has none).  Both required.
  *
  * Provisional (v0).
  *
@@ -91,14 +95,20 @@ typedef struct ProllyTableFileRoutine
 	void		(*write_add_stored) (ProllyTableFileWriter *w,
 									 const ProllyHash *hash, const char *frame,
 									 Size len, StringInfo out);
+
+	/* The writer's own bytes, after the index. */
+	void		(*write_section) (ProllyTableFileWriter *w, const char *data,
+								  uint32 len);
+	void		(*section) (ProllyTableFile *tf, uint64 *offset, uint32 *len,
+							uint32 *crc);
 } ProllyTableFileRoutine;
 
 #define PROLLY_TABLEFILE_CALLBACK_NAMES \
 	"write_begin", "write_add", "write_finish", "open", "find", "decode", \
 	"count", "entry", "close", "locate", "version", "read_stored", \
-	"write_add_stored"
+	"write_add_stored", "write_section", "section"
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
-#define PROLLY_TABLEFILE_LAST_CALLBACK write_add_stored
+#define PROLLY_TABLEFILE_LAST_CALLBACK section
 
 /*
  * A chunk as a format's file holds it (bytes, len, as find() locates them),

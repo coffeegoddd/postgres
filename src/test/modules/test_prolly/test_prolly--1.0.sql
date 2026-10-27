@@ -376,6 +376,21 @@ CREATE FUNCTION test_chunk_table_files(OUT name text, OUT chunks int,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- The table files with their generations: a settled file's chunks were
+-- born in the collections epoch_lo to epoch_hi (0: not settled); garbage
+-- is how many are thought garbage; xrefs how many chunks of older
+-- generations (or not settled) its chunks name.
+CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
+	OUT settled boolean, OUT epoch_lo bigint, OUT epoch_hi bigint,
+	OUT garbage bigint, OUT xrefs bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The collections that settled chunks the settled files still hold.
+CREATE FUNCTION test_chunk_epochs(OUT epoch bigint, OUT ended timestamptz)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The journal's segments, oldest first (settled is always false).
 CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
 	OUT bytes bigint, OUT settled boolean)
