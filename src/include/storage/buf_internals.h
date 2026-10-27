@@ -431,6 +431,15 @@ typedef struct WritebackContext
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT pg_atomic_uint64 *BufferSmgrGeneration;
+
+/*
+ * Generations of sharing of each relation's pages, by a hash of its
+ * locator (relations sharing a slot share its raises): a buffer's
+ * generation is the sum of the global one and its relation's slot's, so
+ * that a raise of one relation's has only its pages checked again.
+ */
+#define BUFFER_SMGR_REL_GENERATIONS	1024
+extern PGDLLIMPORT pg_atomic_uint64 *BufferSmgrRelGenerations;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 
 /* in localbuf.c */

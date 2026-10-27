@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written                 |    12
  value_nodes_written           |     0
  chunks_appended               |    12
- chunk_bytes_appended          | 26626
- bytes_hashed                  | 26715
+ chunk_bytes_appended          | 26688
+ bytes_hashed                  | 26777
  fold_rows_read                |  1000
  fold_rows_written             |  1000
  fold_pages                    |     0
@@ -175,8 +175,12 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  bmap_roots_shared             |     0
  bmap_map_pages_stamped        |     0
  bmap_changed_nodes_read       |     0
+ roots_capture_busy            |     0
+ roots_frozen_later            |     0
+ buffer_generations            |     0
+ buffer_rel_generations        |     6
  bmap_roots_pages_read         |     0
-(120 rows)
+(124 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
