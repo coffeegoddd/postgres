@@ -805,6 +805,22 @@ drop_gone_buffers(SMgrRelation reln)
 typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
 
 /*
+ * Has reln's map gone, or is it going: its file unlinked, or emptied, as
+ * md.c empties a fork's file just before unlinking it?  A map is never
+ * empty otherwise, except as it is made, before its first pages.
+ */
+static bool
+map_going(SMgrRelation reln)
+{
+	RelPathStr	path = relpathperm(reln->smgr_rlocator.locator, BMAP_FORKNUM);
+	struct stat st;
+
+	if (stat(path.str, &st) < 0)
+		return errno == ENOENT;
+	return st.st_size == 0;
+}
+
+/*
  * Read reln's map, which may be a dropped relation's, by read(): every map
  * of a page store is read so (a sweep's, a compaction's, a size
  * count's), a dropped relation's too until its files
@@ -812,11 +828,18 @@ typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
  * its pins are let go of and, if the relation is gone by then, none of its
  * pages stays in shared buffers, where a relation given its file number
  * later would find them.  (One read before the unlink, the files still
- * there as it ends, is the drop's to drop: smgrdounlinkall().)  A read
- * that fails because the files went (the drop's invalidation closing
- * them, say) fails as before, its pages dropped first.
+ * there as it ends, is the drop's to drop: smgrdounlinkall().)
+ *
+ * A read that fails because the files went meanwhile (emptied, then
+ * unlinked, as the drop's commit removes them, or closed by its
+ * invalidation and gone when opened again) is passed over: false, and what
+ * read() left in *arg is as far as it got.  A dropped relation's map is
+ * passed over by every reader once it is gone: what it held was queued
+ * for release before its files went, so a sweep counts it from the queue.
+ * Any other failure, and a cancel, a shutdown or running out of memory or
+ * disk whatever the map's state, is thrown again.
  */
-static void
+static bool
 read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
@@ -843,8 +866,20 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 	}
 	PG_END_TRY();
 	drop_gone_buffers(reln);
-	if (edata != NULL)
-		ReThrowError(edata);
+	if (edata == NULL)
+		return true;
+	if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_OPERATOR_INTERVENTION &&
+		ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_INSUFFICIENT_RESOURCES &&
+		map_going(reln))
+	{
+		ereport(DEBUG1,
+				(errmsg_internal("map of relation %u passed over, dropped as it was read: %s",
+								 reln->smgr_rlocator.locator.relNumber,
+								 edata->message)));
+		FreeErrorData(edata);
+		return false;
+	}
+	ReThrowError(edata);
 }
 
 /* rel's page store's entry among those swept, or NULL; the mutex held */
@@ -1779,12 +1814,17 @@ read_entries(SMgrRelation reln, bool node, BlockNumber blk, bool for_write,
 
 	if (for_write || cached_only)
 	{
-		PrefetchBufferResult r = PrefetchSharedBuffer(fsrel, fork, blk);
+		/*
+		 * (looked up only: a hint's lookup comes after the writes it hints
+		 * at, by when the relation may be dropped and its map's file gone,
+		 * and a page not cached is read, if at all, at once)
+		 */
+		Buffer		recent = LookupSharedBuffer(floc, fork, blk);
 
-		if (BufferIsValid(r.recent_buffer) &&
-			ReadRecentBuffer(floc, fork, blk, r.recent_buffer))
+		if (BufferIsValid(recent) &&
+			ReadRecentBuffer(floc, fork, blk, recent))
 		{
-			buf = r.recent_buffer;
+			buf = recent;
 			/* a change keeping the page locked (map_lock()) can't be waited for */
 			if (BufferIsLockedByMe(buf))
 			{
@@ -10383,6 +10423,15 @@ sweep_relation_read(SMgrRelation reln, void *arg)
 	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
 	if (mapnblocks == 0)
 		return;
+#ifdef USE_INJECTION_POINTS
+	{
+		/* (the relation's file number, for a test to stop at one only) */
+		char		relnumber[16];
+
+		snprintf(relnumber, sizeof(relnumber), "%u", rel.relNumber);
+		INJECTION_POINT("bmap-sweep-relation", relnumber);
+	}
+#endif
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
@@ -10410,7 +10459,13 @@ sweep_relation_read(SMgrRelation reln, void *arg)
 /*
  * sweep_relation_read(), the relation perhaps dropped while it is read (its
  * buffers dropped before these were read): none of its pages stays in
- * shared buffers (read_maybe_dropped()).
+ * shared buffers (read_maybe_dropped()).  One whose files go as it is read
+ * is passed over, what it held counted from the release queue.  What was
+ * counted of it before its read failed stays counted, which only holds a
+ * block more: of its map's own fork only the header and the root page are
+ * read before the tree's nodes, which are the page store's, and its
+ * changes list only after them, so no node is marked reached with its
+ * children left uncounted.
  */
 static void
 sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
@@ -13152,7 +13207,9 @@ bmapwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		/*
 		 * Writeback is a hint; blocks without an entry, or whose map page
-		 * isn't cached, are skipped.
+		 * isn't cached, are skipped.  So are a relation's dropped since its
+		 * pages were written: its map's buffers went with it, and its
+		 * map's file isn't opened (read_entries()).
 		 */
 		if (!BlockNumberIsValid(phys))
 			return;
