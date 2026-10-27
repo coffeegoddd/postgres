@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written                 |    12
  value_nodes_written           |     0
  chunks_appended               |    12
- chunk_bytes_appended          | 26612
- bytes_hashed                  | 26701
+ chunk_bytes_appended          | 26613
+ bytes_hashed                  | 26702
  fold_rows_read                |  1000
  fold_rows_written             |  1000
  fold_pages                    |     0
