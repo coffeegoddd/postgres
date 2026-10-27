@@ -95,6 +95,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -2011,7 +2012,8 @@ pages_to_freeze(BlockNumber *blknos, uint32 n, const BranchKeptRelation *base,
  * root base_root (0: an empty one) nblocks long, temporary storage dropped
  * as the transaction ends, made a root of, as of c's storage, its pages
  * changed since told by live_epoch.  Each page copied is logged as an
- * image once.  Those whose freezing was undecided are recorded in k.
+ * image once, by the capture.  Those whose freezing was undecided are
+ * recorded in k.
  */
 static void
 freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos,
@@ -2036,6 +2038,7 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 	else
 		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
 										  SMGR_BMAP);
+	INJECTION_POINT("branch-keep-frozen-copy-made", NULL);
 	if (smgrnblocks(tsrel, MAIN_FORKNUM) > nblocks)
 		RelationTruncateStorage(tsrel, nblocks);
 	else if (smgrnblocks(tsrel, MAIN_FORKNUM) < nblocks)
@@ -2044,7 +2047,12 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 										  EB_SKIP_EXTENSION_LOCK | EB_CLEAR_SIZE_CACHE, nblocks,
 										  RBM_ZERO_ON_ERROR));
 
-	/* each page: frozen, and the copy's (a new block of its own) */
+	/*
+	 * each page changed: frozen, and the copy's (a new block of its own),
+	 * logged by the capture, as images of the blocks the root holds: the
+	 * copy's map may be gone when its records are replayed
+	 * (bmap_root_capture_of())
+	 */
 	for (uint32 i = 0; i < n; i++)
 	{
 		Buffer		buf;
@@ -2065,19 +2073,15 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 		}
 		buf = ReadBufferWithoutRelcache(tloc, MAIN_FORKNUM, blknos[i],
 										RBM_ZERO_AND_LOCK, NULL, true);
-		START_CRIT_SECTION();
 		memcpy(BufferGetPage(buf), copy.data, BLCKSZ);
 		MarkBufferDirty(buf);
-		if (!PageIsNew(BufferGetPage(buf)))
-			log_newpage_buffer(buf, true);
-		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
-	k->snapshot = bmap_root_capture_logged(tsrel, c->relfilenode, live_epoch);
+	k->snapshot = bmap_root_capture_of(tsrel, c->relfilenode, live_epoch);
 	note_taken(live, k->snapshot);
 	k->frozenxid = FrozenTransactionId;
 	k->minmxid = InvalidMultiXactId;

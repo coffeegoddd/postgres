@@ -66,7 +66,10 @@ typedef struct BranchKeptRelation
  * table's other relations kept as captured with it, keep CONCURRENT: the
  * relation's pages unchanged since are still not the commit's (a writer
  * the commit didn't see may have changed them before), so a restore
- * always gives it new storage, with no visibility map.
+ * always gives it new storage; a frozen root's gets the visibility map a
+ * frozen root's restore makes (its storage's for the pages unchanged
+ * since, but for those its freezing left undecided, and each other page's
+ * frozen copy's).
  */
 #define BRANCH_KEPT_UNFROZEN	0x01
 #define BRANCH_KEPT_CONCURRENT	0x02
