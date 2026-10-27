@@ -75,7 +75,7 @@ SELECT count(*) AS given FROM (SELECT * FROM dolt_log LIMIT 10) l;
 :flush
 SELECT commits_read() - :before <= 12 AS read_about_ten;
 SELECT commits_read() AS before \gset
-SELECT count(*) AS given FROM dolt_log;
+SELECT count(*) AS given FROM (SELECT * FROM dolt_log OFFSET 0) l;
 :flush
 SELECT commits_read() - :before >= 200 AS whole_reads_all;
 

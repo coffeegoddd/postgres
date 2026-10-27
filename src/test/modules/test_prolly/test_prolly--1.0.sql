@@ -430,6 +430,18 @@ CREATE FUNCTION test_kept_commits(branch text)
 RETURNS TABLE (commit_id text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A retention pass of the branch's kept commits now, as a commit's keep
+-- runs one when it is due.
+-- Freeze the session branch's kept commits whose roots were captured
+-- among writers, as the fold worker does: how many were.
+CREATE FUNCTION test_freeze_kept()
+RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_retain_roots(branch text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The value of the refs' entry key (a tag, then a name).
 CREATE FUNCTION test_refs_value(key text)
 RETURNS bytea
@@ -660,6 +672,16 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- The height a commit records; NULL if it records none.
 CREATE FUNCTION test_commit_height(commit_id text)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The commits the refs keep a commit reaches; NULL if they keep none.
+CREATE FUNCTION test_commit_commits(commit_id text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The refs keep the commits a commit reaches no more.
+CREATE FUNCTION test_commit_commits_forget(commit_id text)
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- A commit's height as the history walk finds it, and the commits it read.

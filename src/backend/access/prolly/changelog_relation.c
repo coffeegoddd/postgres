@@ -424,12 +424,17 @@ typedef struct BufEntry
 								 * written as is, after key.data's bytes */
 } BufEntry;
 
-/* Where a key's entry says its version is (NULL: not known). */
+/*
+ * Where a key's entry says its version is, copied into *tid (the entry
+ * holds it unaligned, after its key's bytes): tid, or NULL if not known.
+ */
 static inline const ItemPointerData *
-entry_tid(const BufEntry *be)
+entry_tid(const BufEntry *be, ItemPointerData *tid)
 {
-	return be->has_tid ? (const ItemPointerData *) (be->key.data + be->key.len) :
-		NULL;
+	if (!be->has_tid)
+		return NULL;
+	memcpy(tid, be->key.data + be->key.len, sizeof(*tid));
+	return tid;
 }
 
 typedef struct BufTag
@@ -582,11 +587,12 @@ buffer_merge(LogBuffer *dst, const LogBuffer *src)
 {
 	HASH_SEQ_STATUS seq;
 	BufEntry   *be;
+	ItemPointerData tid;
 
 	hash_seq_init(&seq, src->entries);
 	while ((be = hash_seq_search(&seq)) != NULL)
 		(void) buffer_add(dst, be->key.data, be->key.len, be->delta, be->row,
-						  entry_tid(be));
+						  entry_tid(be, &tid));
 	dst->full = dst->full || src->full;
 	dst->emptied = dst->emptied || src->emptied;
 }
@@ -948,12 +954,18 @@ buffer_entries(Entries *e)
 			 */
 			uint32		len = image->t_len - IMAGE_SKIP;
 			char	   *bytes = palloc(len);
-			HeapTupleHeader h;
+			char	   *im2 = bytes + offsetof(HeapTupleHeaderData, t_infomask2) - IMAGE_SKIP;
+			char	   *im = bytes + offsetof(HeapTupleHeaderData, t_infomask) - IMAGE_SKIP;
+			uint16		bits;
 
+			/* (the bytes as an entry holds them, unaligned: no header read) */
 			memcpy(bytes, (const char *) image->t_data + IMAGE_SKIP, len);
-			h = (HeapTupleHeader) (bytes - IMAGE_SKIP);
-			h->t_infomask2 &= ~HEAP2_XACT_MASK;
-			h->t_infomask &= ~HEAP_XACT_MASK;
+			memcpy(&bits, im2, sizeof(bits));
+			bits &= ~HEAP2_XACT_MASK;
+			memcpy(im2, &bits, sizeof(bits));
+			memcpy(&bits, im, sizeof(bits));
+			bits &= ~HEAP_XACT_MASK;
+			memcpy(im, &bits, sizeof(bits));
 			/* (a key's version, where it is: see TID_FLAG) */
 			if (buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0,
 						   e->deltas[i] == 0 && len + ENTRY_TID_LEN <= MAX_IMAGE_LEN ?
@@ -1048,6 +1060,7 @@ flush_buffer(LogBuffer *b)
 	StringInfoData packed;
 	HASH_SEQ_STATUS seq;
 	BufEntry   *be;
+	ItemPointerData tid;
 	SubTransactionId current = GetCurrentSubTransactionId();
 	BufTag		tag = b->tag;
 
@@ -1077,7 +1090,7 @@ flush_buffer(LogBuffer *b)
 			if (be->row && be->delta == 0)
 				continue;
 			pack_entry(log, index, ii, &packed, be->delta, be->key.len,
-					   be->key.data, be->row ? NULL : entry_tid(be));
+					   be->key.data, be->row ? NULL : entry_tid(be, &tid));
 		}
 		if (packed.len > 0)
 			insert_row_packed(log, index, ii, &packed);

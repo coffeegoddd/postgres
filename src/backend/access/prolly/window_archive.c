@@ -740,6 +740,7 @@ static int	action_setting = PROLLY_WINDOW_ARCHIVE;
 static char *window_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
+static char *root_max_size_setting = NULL;
 static char *batch_setting = NULL;
 static char *collect_interval_setting = NULL;
 static char *archive_timeout_setting = NULL;
@@ -866,6 +867,11 @@ prolly_window_init(void)
 							   "Read as the database has it; each branch still keeps its newest prolly.history_min_commits.",
 							   &max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_root_max_size",
+							   "The most the page roots of every branch's commits may hold (empty: no limit).",
+							   "Read as the database has it.  Past it, the oldest roots in the window are let go of first (never a tag's, nor a branch's newest); a move to a commit without one restores the nearest before it and writes the rows they differ by.",
+							   &root_max_size_setting, "", PGC_USERSET, 0,
+							   check_size, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_collect_interval",
 							   "The least time between the full collections that free severed history in the background (empty: an hour).",
 							   "Read as the database has it; fragments severed meanwhile share the next one.",
@@ -973,6 +979,20 @@ database_span(const char *name)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("the database's %s isn't an interval: \"%s\"", name, v)));
 	return usec;
+}
+
+/* A size setting as the database has it (0: none, or not a size). */
+int64
+prolly_window_database_size(const char *name)
+{
+	char	   *v;
+	int64		bytes = 0;
+
+	window_init();
+	v = database_setting(name);
+	if (v == NULL || !parse_size(v, &bytes))
+		return 0;
+	return bytes;
 }
 
 static const char *const branch_settings[] = {"window", "min_commits",
@@ -2119,13 +2139,20 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
  * its policy, with no other ref's keeping and no merge base's.
  * Quietly (no warning of a commit dated ahead: plan() and sever() give
  * that), and kept for the transaction while the refs stand as they did,
- * so a caller asking of each commit pays one walk.
+ * so a caller asking of each commit pays one walk: every lineage's window
+ * and the last branch's are kept apart, so a caller asking of both (root
+ * retention: a branch's own and every lineage's) walks each once.
  */
-static MemoryContext window_cxt = NULL;
-static HTAB *window_cache = NULL;
-static char *window_branch = NULL;
-static ProllyHash window_root;
-static LocalTransactionId window_lxid = InvalidLocalTransactionId;
+typedef struct WindowCache
+{
+	MemoryContext cxt;
+	HTAB	   *in;
+	char	   *branch;
+	ProllyHash	root;
+	LocalTransactionId lxid;
+} WindowCache;
+
+static WindowCache window_caches[2];	/* every lineage's, a branch's */
 
 static HTAB *
 window_commits(const char *branch)
@@ -2136,22 +2163,23 @@ window_commits(const char *branch)
 	MemoryContext old;
 	ProllyWindowPolicy db;
 
+	WindowCache *wc = &window_caches[branch == NULL ? 0 : 1];
+
 	window_init();
 	PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &root);
-	if (window_cache != NULL && window_lxid == MyProc->vxid.lxid &&
-		same_id(&root, &window_root) &&
-		(branch == NULL ? window_branch == NULL :
-		 window_branch != NULL && strcmp(branch, window_branch) == 0))
-		return window_cache;
-	if (window_cxt == NULL)
-		window_cxt = AllocSetContextCreate(TopMemoryContext,
-										   "prolly window evaluated",
-										   ALLOCSET_DEFAULT_SIZES);
-	window_cache = NULL;
-	MemoryContextReset(window_cxt);
-	old = MemoryContextSwitchTo(window_cxt);
+	if (wc->in != NULL && wc->lxid == MyProc->vxid.lxid &&
+		same_id(&root, &wc->root) &&
+		(branch == NULL || strcmp(branch, wc->branch) == 0))
+		return wc->in;
+	if (wc->cxt == NULL)
+		wc->cxt = AllocSetContextCreate(TopMemoryContext,
+										"prolly window evaluated",
+										ALLOCSET_DEFAULT_SIZES);
+	wc->in = NULL;
+	MemoryContextReset(wc->cxt);
+	old = MemoryContextSwitchTo(wc->cxt);
 	in = id_set("prolly window", sizeof(ProllyHash));
-	window_branch = branch ? pstrdup(branch) : NULL;
+	wc->branch = branch ? pstrdup(branch) : NULL;
 	MemoryContextSwitchTo(old);
 	sever_clock = DT_NOBEGIN;
 	memset(&plan, 0, sizeof(plan));
@@ -2180,9 +2208,9 @@ window_commits(const char *branch)
 			(void) set_add(in, &pc->id);
 	hash_destroy(plan.commits);
 	hash_destroy(plan.head_ids);
-	window_cache = in;
-	window_root = root;
-	window_lxid = MyProc->vxid.lxid;
+	wc->in = in;
+	wc->root = root;
+	wc->lxid = MyProc->vxid.lxid;
 	return in;
 }
 
@@ -3448,6 +3476,10 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	}
 
 	horizon_changed();
+	/* (outside the window no commit keeps its page root) */
+	if (PROLLY_HAS(dc.refs, forget_kept))
+		foreach(lc, plan.severed)
+			PROLLY_CALL(dc.refs, forget_kept, &((PlanCommit *) lfirst(lc))->id);
 
 	result->commits = f.commits;
 	result->edges = list_length(plan.edges);
@@ -4306,6 +4338,25 @@ prolly_window_archived(const ProllyHash *id)
 	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, archived))
 		return false;
 	return PROLLY_CALL(c.history_window, archived, id);
+}
+
+static void
+note_fragment(const ProllyWindowFragment *f, void *arg)
+{
+	*(bool *) arg = true;
+}
+
+bool
+prolly_window_severed(void)
+{
+	ProllyDatabaseComponents c;
+	bool		any = false;
+
+	prolly_database_components(&c);
+	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, fragments))
+		return false;
+	PROLLY_CALL(c.history_window, fragments, note_fragment, &any);
+	return any;
 }
 
 void

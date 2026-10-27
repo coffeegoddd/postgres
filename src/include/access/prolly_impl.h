@@ -59,10 +59,11 @@ typedef enum ProllyInterface
 	PROLLY_IFACE_COMMIT_CACHE = 35,
 	PROLLY_IFACE_HISTORY_WINDOW = 36,
 	PROLLY_IFACE_ROOT_FREEZER = 38,
+	PROLLY_IFACE_ROOT_RETENTION = 40,
 } ProllyInterface;
 
 #define PROLLY_IFACE_FIRST	PROLLY_IFACE_CHUNKER
-#define PROLLY_IFACE_LAST	PROLLY_IFACE_ROOT_FREEZER
+#define PROLLY_IFACE_LAST	PROLLY_IFACE_ROOT_RETENTION
 
 /*
  * Identity of an implementation.  The first member of every routine struct.

@@ -33,18 +33,23 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_function_scan.h"
 #include "access/prolly_history.h"
 #include "access/prolly_log.h"
+#include "access/prolly_log_count.h"
 #include "access/prolly_revision.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_window.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/tableam.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_proc.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
@@ -4671,6 +4676,54 @@ log_entries(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	}
 	return log_walk(list_make1(&start));
+}
+
+int64
+prolly_log_count(const char *ref)
+{
+	ProllyHash	start;
+
+	if (!PROLLY_CALL(refs(), resolve, ref, &start))
+	{
+		if (pg_strcasecmp(ref, "HEAD") == 0)
+			return 0;			/* nothing committed yet */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	}
+	/* (the count the refs keep, while the log reaches every commit counted) */
+	if (PROLLY_HAS(refs(), side_get) && !prolly_window_severed())
+	{
+		ProllyKey	k = {(const uint8 *) start.bytes, start.len};
+		StringInfoData v;
+		bool		kept;
+
+		initStringInfo(&v);
+		kept = PROLLY_CALL(refs(), side_get, PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
+			v.len == 8;
+		if (kept)
+		{
+			uint64		n = 0;
+
+			for (int i = 0; i < 8; i++)
+				n = (n << 8) | (uint8) v.data[i];
+			pfree(v.data);
+			return (int64) n;
+		}
+		pfree(v.data);
+	}
+	return list_length(log_walk(list_make1(&start)));
+}
+
+void
+prolly_function_scan_check(Oid funcid)
+{
+	AclResult	aclresult = object_aclcheck(ProcedureRelationId, funcid,
+											GetUserId(), ACL_EXECUTE);
+
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
+	InvokeFunctionExecuteHook(funcid);
 }
 
 static void

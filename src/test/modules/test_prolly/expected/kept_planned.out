@@ -8,7 +8,7 @@ RESET client_min_messages;
 -- (the move planner's sources and the kept materializations' shares, not
 -- pages kept as of the head, which come before them and move nothing:
 -- first_use_kept tests those)
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 \set flush 'SELECT pg_stat_force_next_flush();'
 CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
 CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$

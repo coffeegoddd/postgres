@@ -343,7 +343,7 @@ SELECT dolt_reset('--hard');
 -- branch), reading nothing: the move's entries were consumed.  The next
 -- commit holds exactly the rows written after.
 -- (rows written, not pages given back: kept_pages tests those)
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
 SET debug_prolly_verify_fold_caches = off;
 :flush

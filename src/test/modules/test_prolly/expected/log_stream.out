@@ -149,7 +149,7 @@ SELECT commits_read() - :before <= 12 AS read_about_ten;
 (1 row)
 
 SELECT commits_read() AS before \gset
-SELECT count(*) AS given FROM dolt_log;
+SELECT count(*) AS given FROM (SELECT * FROM dolt_log OFFSET 0) l;
  given 
 -------
    200

@@ -20,7 +20,6 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
 prolly.restore_min_changes = 0
-prolly.kept_commits = 8
 });
 $node->start;
 $node->backup('base');

@@ -828,6 +828,15 @@ typedef enum PgStat_ProllyCounter
 											 * the first since it began */
 	PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ,	/* map nodes read to find the
 											 * pages changed since an epoch */
+	PGSTAT_PROLLY_ROOTS_CAPTURE_BUSY,	/* keeps among writers given up: a
+										 * relation never left unchanged
+										 * for a moment */
+	PGSTAT_PROLLY_ROOTS_FROZEN_LATER,	/* kept commits whose roots,
+										 * captured among writers, were
+										 * frozen after */
+	PGSTAT_PROLLY_BUFFER_GENERATIONS,	/* raises of every cached page's
+										 * generation of sharing */
+	PGSTAT_PROLLY_BUFFER_REL_GENERATIONS,	/* and of one relation's */
 	PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ,	/* pages of captured roots' slots
 											 * read */
 	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries

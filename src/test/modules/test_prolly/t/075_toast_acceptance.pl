@@ -66,8 +66,10 @@ my $digest = q{SELECT md5(string_agg(md5(b), ',' ORDER BY id)) FROM a.big};
 my $value1 = sql(q{SELECT md5(b) FROM a.big WHERE id = 1});
 
 # A query whose snapshot still sees a deleted row (so VACUUM can't prune
-# it) reads its value after a collection swapped the store's files; the
-# collection waits for it before removing them.
+# it) reads its value while a collection runs: the value's chunks are kept
+# (the row's pointers are on its page), whether or not the collection
+# waits for the query (it waits only for transactions that have used the
+# store), and the swap's files retire once it ends.
 SKIP:
 {
 	skip 'injection points not supported by this build', 3
@@ -87,17 +89,18 @@ SKIP:
 		\echo collected
 	});
 	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE wait_event = 'prolly-gc-swapped'})
-	  or die 'the collection did not swap';
+		WHERE wait_event IN ('virtualxid', 'prolly-gc-swapped')
+		AND query LIKE '%test_chunk_gc%'})
+	  or die 'the collection did not run';
 	is($reader->query_safe('SELECT md5(b) FROM a.big WHERE id = 1'), $value1,
-		'and reads the deleted row\'s value after a collection swapped');
-	sql(q{SELECT injection_points_wakeup('prolly-gc-swapped')});
-	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE wait_event = 'virtualxid' AND query LIKE '%test_chunk_gc%'})
-	  or die 'the collection did not wait for the reader';
-	pass('the collection waits for the query before removing the files');
+		'and reads the deleted row\'s value while a collection runs');
 	$reader->query_safe('COMMIT');
 	$reader->quit;
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-gc-swapped'})
+	  or die 'the collection did not swap';
+	pass('the collection swaps');
+	sql(q{SELECT injection_points_wakeup('prolly-gc-swapped')});
 	$gc->query_until(qr/collected/, '');
 	$gc->quit;
 }

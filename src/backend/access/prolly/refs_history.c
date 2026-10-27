@@ -17,10 +17,12 @@
 
 #include "access/prolly_refs.h"
 #include "access/prolly_window.h"
+#include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
 #include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 static HTAB *
 id_set(const char *name)
@@ -658,4 +660,138 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 	}
 #endif
 	return found;
+}
+
+/*
+ * The commits a commit with these parents reaches, itself included: one
+ * more than its first parent's, and for a merge, more by those its other
+ * parents reach that the first doesn't.
+ * Those are found by heights, highest first, each commit painted with the
+ * sides that reach it (the first parent's, the others'): a commit's
+ * children are all higher, so its sides are known once it is taken, and
+ * the walk ends once no commit queued is the others' alone, beneath which
+ * every commit is reached by the first parent too.  So a merge reads the
+ * commits above the history the two sides share, not that history.
+ */
+#define SIDE_FIRST	1
+#define SIDE_OTHER	2
+
+typedef struct Painted
+{
+	ProllyHash	id;				/* (the key) */
+	pairingheap_node node;
+	int64		height;
+	int			sides;
+	bool		taken;
+} Painted;
+
+static int
+painted_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	const Painted *x = pairingheap_const_container(Painted, node, a);
+	const Painted *y = pairingheap_const_container(Painted, node, b);
+
+	return (x->height > y->height) - (x->height < y->height);
+}
+
+/*
+ * Paint id with sides (queuing it, its height read, if new); false if it
+ * can't be read or records no height.  others counts the commits queued
+ * that the other side alone reaches.
+ */
+static bool
+paint(HTAB *painted, pairingheap *queue, const ProllyHash *id, int sides,
+	  int64 *others, ProllyCommitLookup lookup, void *lookup_arg)
+{
+	bool		found;
+	Painted    *p = hash_search(painted, id, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		ProllyCommitInfo info;
+
+		if (!lookup(id, &info, lookup_arg) || !info.has_height)
+		{
+			hash_search(painted, id, HASH_REMOVE, NULL);
+			return false;
+		}
+		p->height = info.height;
+		p->sides = sides;
+		p->taken = false;
+		pairingheap_add(queue, &p->node);
+		if (sides == SIDE_OTHER)
+			(*others)++;
+	}
+	else if (!p->taken && (p->sides | sides) != p->sides)
+	{
+		if (p->sides == SIDE_OTHER)
+			(*others)--;
+		p->sides |= sides;
+	}
+	return true;
+}
+
+bool
+prolly_history_commits(const ProllyHash *parents, int nparents,
+					   int64 first_commits,
+					   ProllyCommitLookup lookup, void *lookup_arg,
+					   int64 *commits)
+{
+	MemoryContext cxt;
+	MemoryContext old;
+	HASHCTL		ctl;
+	HTAB	   *painted;
+	pairingheap *queue;
+	int64		others = 0;
+	int64		theirs = 0;
+	bool		known = true;
+
+	if (nparents == 0)
+	{
+		*commits = 1;
+		return true;
+	}
+	*commits = first_commits + 1;
+	if (nparents == 1)
+		return true;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit count",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(Painted);
+	ctl.hcxt = cxt;
+	painted = hash_create("prolly painted commits", 256, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	queue = pairingheap_allocate(painted_cmp, NULL);
+	for (int i = 0; i < nparents && known; i++)
+		known = paint(painted, queue, &parents[i],
+					  i == 0 ? SIDE_FIRST : SIDE_OTHER, &others, lookup,
+					  lookup_arg);
+	while (known && others > 0)
+	{
+		Painted    *p = pairingheap_container(Painted, node,
+											  pairingheap_remove_first(queue));
+		ProllyCommitInfo pinfo;
+
+		CHECK_FOR_INTERRUPTS();
+		p->taken = true;
+		if (p->sides == SIDE_OTHER)
+		{
+			others--;
+			theirs++;
+		}
+		if (!lookup(&p->id, &pinfo, lookup_arg))
+		{
+			known = false;
+			break;
+		}
+		for (int i = 0; i < pinfo.nparents && known; i++)
+			known = paint(painted, queue, &pinfo.parents[i], p->sides,
+						  &others, lookup, lookup_arg);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	*commits += theirs;
+	return known;
 }

@@ -12,7 +12,7 @@
 -- asked (flushed first too).
 CREATE DATABASE regress_nearest_source;
 -- (another branch's storage shared, not pages given back: kept_pages tests those)
-ALTER DATABASE regress_nearest_source SET prolly.kept_commits = 0;
+ALTER DATABASE regress_nearest_source SET debug_prolly_page_roots = off;
 \c regress_nearest_source
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
