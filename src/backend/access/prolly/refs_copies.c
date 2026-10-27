@@ -11698,7 +11698,7 @@ copies_side_scan_at(const ProllyHash *root, ProllyChunkRead read,
  * ------------------------------------------------------------------------
  */
 
-#define HEAD_LOG_TAIL	32
+#define HEAD_LOG_TAIL	16
 
 typedef struct LogState
 {
