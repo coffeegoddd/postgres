@@ -1735,6 +1735,9 @@ typedef struct RefsScan
 	StringInfoData ov;
 } RefsScan;
 
+/* the changes pending past which a scan applies them first */
+#define SCAN_PENDING_MAX	512
+
 static int
 refs_key_cmp(const char *a, int alen, const char *b, int blen)
 {
@@ -1760,6 +1763,13 @@ refs_scan_open(const ProllyKey *from, bool backward)
 	ProllyNodeRef root;
 
 	refs_init();
+	/*
+	 * (a transaction with very many changes pending, as one of many
+	 * commits is, applies them now and then, so that each scan and each
+	 * put isn't the work of all of them)
+	 */
+	if (list_length(scoped_pending) > SCAN_PENDING_MAX)
+		flush_scoped();
 	rs->backward = backward;
 	initStringInfo(&rs->tk);
 	initStringInfo(&rs->tv);
