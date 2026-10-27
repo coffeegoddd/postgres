@@ -68,4 +68,28 @@ cmp_ok(sql(q{SET client_min_messages = warning;
 	SELECT count(*) FROM dolt_log}), '<',
 	scalar(split(/,/, $all)), 'the history dropped');
 
+# The horizon a cursor stops at is the one it began with: a history drop
+# committed meanwhile in another session, and a rollback to a savepoint in
+# the cursor's transaction (which reads the horizon again), don't cut the
+# rest short.
+for my $d (7 .. 8)
+{
+	sql(qq{UPDATE lc.t SET v = 'd$d' WHERE id % 7 = 1;
+		SELECT dolt_commit('-Am', 'd$d', '--date', '2020-01-0$d')});
+}
+my $held = sql(q{SET client_min_messages = warning;
+	SELECT string_agg(message, ',') FROM dolt_log});
+$reader = $node->background_psql('lc', on_error_stop => 0);
+$reader->query_safe(q{BEGIN;
+	DECLARE c CURSOR FOR SELECT message FROM dolt_log;});
+like($reader->query_safe(q{FETCH 2 FROM c}), qr/d8\nd7/, 'two rows read again');
+sql(q{SET client_min_messages = warning;
+	SELECT count(*) > 0 FROM dolt_history_drop('2020-01-06')});
+$reader->query_safe(q{SAVEPOINT s; SELECT 1; ROLLBACK TO SAVEPOINT s;});
+$rest = $reader->query_safe(q{SET client_min_messages = warning; FETCH ALL FROM c});
+is(join(',', 'd8', 'd7', split(/\n/, $rest)), $held,
+	'the cursor stops at the horizon it began with');
+$reader->query_safe(q{COMMIT});
+$reader->quit;
+
 done_testing();

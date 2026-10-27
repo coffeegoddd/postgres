@@ -4538,6 +4538,8 @@ struct ProllyLogStream
 	HTAB	   *seen;			/* of LogEntry, by key */
 	HTAB	   *heights;		/* those reckoned of commits without one */
 	pairingheap *heap;			/* those found, not given */
+	HTAB	   *horizon;		/* the history horizon as it began (NULL:
+								 * the window's, asked) */
 };
 typedef ProllyLogStream LogStream;
 
@@ -4613,6 +4615,8 @@ log_stream_begin(List *starts)
 	ls->seen = hash_create("dolt_log commits", 256, &ctl,
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	ls->heap = pairingheap_allocate(log_heap_cmp, NULL);
+	/* (held: a sever or a rollback meanwhile doesn't move where it stops) */
+	ls->horizon = prolly_window_horizon();
 	foreach_ptr(ProllyHash, start, starts)
 		log_stream_find(ls, start);
 	return ls;
@@ -4631,7 +4635,7 @@ log_stream_next(LogStream *ls)
 	for (int i = 0; i < e->info.nparents; i++)
 	{
 		/* (a listing stops at the history horizon) */
-		if (prolly_window_stops_at(&e->info.parents[i]))
+		if (prolly_window_held_stops_at(ls->horizon, &e->info.parents[i]))
 			continue;
 		log_stream_find(ls, &e->info.parents[i]);
 	}
