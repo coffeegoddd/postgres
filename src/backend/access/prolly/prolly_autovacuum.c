@@ -373,6 +373,8 @@ static uint32 retire_max_hi_seen = 0;	/* (0: none may be taken now; the
 										 * retire asked for waits) */
 static bool seal_wanted = false;
 static bool retire_refused = false;	/* another collection ran meanwhile */
+static bool retire_errored = false; /* the retire raised an error */
+static bool retire_ran = false;	/* a retire ran, and swapped */
 
 static void
 sever(void)
@@ -425,13 +427,55 @@ retire(const ProllyDatabaseComponents *dc)
 		return false;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	ran = PROLLY_CALL(dc->reclamation, retire, lo, hi, true, &r);
+
+	/*
+	 * (in a subtransaction: one that fails is reported, the default
+	 * collection runs all the same, and the window waits before the next,
+	 * then falls back to a full collection, so a retire that keeps failing
+	 * never stops the store's collections)
+	 */
+	{
+		MemoryContext cxt = CurrentMemoryContext;
+		ResourceOwner owner = CurrentResourceOwner;
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
+		{
+			ran = PROLLY_CALL(dc->reclamation, retire, lo, hi, true, &r);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(cxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+			ereport(WARNING,
+					(errcode(edata->sqlerrcode),
+					 errmsg("automatic retire of generations %u to %u of database \"%s\" failed: %s",
+							lo, hi, get_database_name(MyDatabaseId),
+							edata->message),
+					 errhint("A default collection runs instead; the retire is tried again after a wait, and a full collection runs after several failures in a row.")));
+			FreeErrorData(edata);
+			retire_errored = true;
+			return false;
+		}
+		PG_END_TRY();
+	}
 	if (!ran)
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 		retire_refused = true;
 		return true;			/* (another collection runs: it collects) */
 	}
+	retire_ran = true;
 	if (PROLLY_HAS(dc->refs, forget_records))
 		(void) PROLLY_CALL(dc->refs, forget_records);
 	ereport(DEBUG1,
@@ -461,9 +505,19 @@ collect(void)
 	retire_max_hi_seen = retire_max_hi;
 	retire_wanted = false;
 	retire_refused = false;
+	retire_errored = false;
+	retire_ran = false;
 	collect_now();
 	prolly_database_components(&dc);
-	if (wanted && !retire_refused && retire_max_hi_seen > 0 &&
+	if (dc.history_window == NULL)
+		return;
+	if (retire_errored)
+	{
+		if (PROLLY_HAS(dc.history_window, retire_failed))
+			PROLLY_CALL(dc.history_window, retire_failed);
+		return;
+	}
+	if (((wanted && !retire_refused && retire_max_hi_seen > 0) || retire_ran) &&
 		PROLLY_HAS(dc.history_window, retired))
 		PROLLY_CALL(dc.history_window, retired);
 }
@@ -488,7 +542,7 @@ collect_now(void)
 	/* (a batch boundary passed: what came since settled on its own) */
 	seal = !full && seal_wanted && anything_to_collect();
 	seal_wanted = false;
-	if (!full && !seal && !collection_due())
+	if (!full && !seal && !retire_errored && !collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
@@ -506,7 +560,8 @@ collect_now(void)
 	if (PROLLY_HAS(dc.refs, forget_records))
 		(void) PROLLY_CALL(dc.refs, forget_records);
 	ereport(DEBUG1,
-			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+			(errmsg_internal("automatic %scollection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+							 full ? "full " : "",
 							 get_database_name(MyDatabaseId),
 							 (unsigned long long) r.chunks_kept,
 							 (unsigned long long) r.chunks_freed,

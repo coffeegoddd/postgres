@@ -55,7 +55,13 @@
  *   so that no retire frees what a fragment not yet archived holds; 0 if
  *   none was; otherwise no limit), and in *want the newest generation
  *   holding a top of the fragments made since (0: none, or not settled),
- *   for the retire to take.  While another backend severs, neither a
+ *   for the retire to take.  retire_failed() notes a background retire
+ *   that raised an error: no retire is due again for a wait that grows
+ *   with each failure in a row (from prolly.history_collect_interval, to
+ *   a day), and after
+ *   RETIRE_FAILURES_MOST in a row collect_due() asks for a full collection
+ *   instead, as it does when the reclamation can't retire; a retire, or a
+ *   full collection, that succeeds ends the run.  While another backend severs, neither a
  *   retire (*max_hi 0) nor a seal is due: a collection would wait for the
  *   sever's transaction, which then gives way.  seal_due() says whether a batch
  *   boundary has passed since the store's newest generation ended, so a
@@ -217,13 +223,15 @@ typedef struct ProllyWindowRoutine
 	bool		(*in_window) (const char *branch, const ProllyHash *commit);
 	bool		(*retire_due) (uint32 *max_hi, uint32 *want);
 	void		(*retired) (void);
+	void		(*retire_failed) (void);
 	bool		(*seal_due) (void);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
 	"policy", "set_policy", "maintain", "collect_due", "collected", \
-	"window", "in_window", "retire_due", "retired", "seal_due"
+	"window", "in_window", "retire_due", "retired", "retire_failed", \
+	"seal_due"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
 #define PROLLY_WINDOW_LAST_CALLBACK seal_due
 

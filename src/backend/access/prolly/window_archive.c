@@ -3866,6 +3866,11 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 #define OVER_COUNT_SETTING	"history_window.over_count"
 #define FULL_WANTED_SETTING	"history_window.full_wanted"
 #define RETIRE_WANTED_SETTING "history_window.retire_wanted"
+#define RETIRE_FAILURES_SETTING "history_window.retire_failures"
+#define RETIRE_RETRY_SETTING "history_window.retire_retry_at"
+
+/* Background retires that fail this many times in a row: a full collection. */
+#define RETIRE_FAILURES_MOST	3
 #define LAST_FULL_SETTING	"history_window.last_full"
 #define FAILURES_SETTING	"history_window.failures"
 #define RETRY_SETTING		"history_window.retry_at"
@@ -4315,7 +4320,10 @@ archive_retire_due(uint32 *max_hi, uint32 *want)
 	*max_hi = PG_UINT32_MAX;
 	wanted = config_int(RETIRE_WANTED_SETTING, 0);
 	*want = wanted > 0 ? (uint32) (wanted - 1) : 0;
-	if (sever_running())
+	/* (failing: not again until the wait is over, nor once full is wanted) */
+	if (sever_running() ||
+		GetCurrentTimestamp() < config_int(RETIRE_RETRY_SETTING, DT_NOBEGIN) ||
+		config_int(RETIRE_FAILURES_SETTING, 0) >= RETIRE_FAILURES_MOST)
 	{
 		*max_hi = 0;
 		return wanted > 0;
@@ -4353,6 +4361,8 @@ archive_retired(void)
 	archive_policy(NULL, &db);
 	bytes = store_bytes();
 	config_int_set(RETIRE_WANTED_SETTING, 0, true);
+	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
+	config_int_set(RETIRE_RETRY_SETTING, 0, true);
 	config_int_set(MEASURED_SETTING, (int64) bytes, false);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
@@ -4360,6 +4370,30 @@ archive_retired(void)
 					   config_int(OVER_COUNT_SETTING, 0) + 1, false);
 	else
 		config_int_set(OVER_COUNT_SETTING, 0, true);
+}
+
+/*
+ * A background retire failed: tried again after a wait that doubles with
+ * each failure in a row, from prolly.history_collect_interval (an hour
+ * where unset: full collections are no oftener) to a day; after RETIRE_FAILURES_MOST of them, a full
+ * collection is wanted instead (collect_due()), which ends the run.
+ */
+static void
+archive_retire_failed(void)
+{
+	int64		failures;
+	int64		wait;
+
+	window_init();
+	wait = collect_interval();
+	failures = config_int(RETIRE_FAILURES_SETTING, 0) + 1;
+	for (int64 i = 1; i < failures && wait < BACKOFF_MOST; i++)
+		wait *= 2;
+	config_int_set(RETIRE_FAILURES_SETTING, failures, false);
+	config_int_set(RETIRE_RETRY_SETTING, GetCurrentTimestamp() + Min(wait, BACKOFF_MOST),
+				   false);
+	if (failures >= RETIRE_FAILURES_MOST)
+		config_int_set(FULL_WANTED_SETTING, 1, false);
 }
 
 static void
@@ -4433,6 +4467,10 @@ archive_collected(void)
 	config_int_set(LAST_FULL_SETTING, GetCurrentTimestamp(), false);
 	config_int_set(MEASURED_SETTING, (int64) bytes, false);
 	config_int_set(FULL_WANTED_SETTING, 0, true);
+	/* (and what retires failed to free) */
+	config_int_set(RETIRE_WANTED_SETTING, 0, true);
+	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
+	config_int_set(RETIRE_RETRY_SETTING, 0, true);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
 		config_int_set(OVER_COUNT_SETTING,
@@ -5093,5 +5131,6 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.in_window = archive_in_window,
 	.retire_due = archive_retire_due,
 	.retired = archive_retired,
+	.retire_failed = archive_retire_failed,
 	.seal_due = archive_seal_due,
 };

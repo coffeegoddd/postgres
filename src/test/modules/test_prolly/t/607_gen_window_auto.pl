@@ -8,7 +8,8 @@
 # for hash pointers (none changed since the last scan: the cached roots
 # are read by generation).  A batch boundary passed since the newest
 # generation ended has the visit settle what came since in a generation
-# of its own, however little it is.
+# of its own, however little it is.  A retire that keeps failing never
+# stops the store's collections.
 
 use strict;
 use warnings FATAL => 'all';
@@ -83,7 +84,7 @@ autovacuum_visited();
 is(sql(q{SELECT count(*) FROM prolly_history_horizon()}), '1', 'severed');
 ok($node->log_contains(qr/automatic retire of generations \d+ to \d+ of database "gw"/,
 	$offset), 'retired in the background');
-ok(!$node->log_contains(qr/automatic collection of database "gw"/, $offset),
+ok(!$node->log_contains(qr/automatic (full )?collection of database "gw"/, $offset),
 	'no collection but the retire');
 is(sql($pages), $pages_before, 'no page-store block read for hash pointers');
 is(sql(q{SELECT test_chunk_has(} . "'$old_root'" . q{)}), 'f',
@@ -104,6 +105,43 @@ autovacuum_visited();
 ok($node->log_contains(qr/automatic (collection|retire)[^\n]* "gw"/, $offset),
 	'collected at the boundary');
 ok(sql($epochs) > $epochs_before, 'in a generation of its own');
+
+# A retire that keeps failing doesn't stop the store's collections: each
+# visit's default collection runs all the same, the retire is tried again
+# after a wait, and after three failures in a row a full collection runs
+# instead.  (Batches of a day, so no seal collects meanwhile.)
+SKIP:
+{
+	skip 'injection points not supported by this build', 6
+	  if ($ENV{enable_injection_points} ne 'yes');
+	sql(q{CREATE EXTENSION injection_points});
+	sql(q{ALTER DATABASE gw SET prolly.history_batch = '1 day';
+		ALTER DATABASE gw SET prolly.history_collect_interval = '1 second'});
+	my $due = q{SELECT test_chunk_note_garbage(array(SELECT test_chunk_file_hashes(name)))
+		FROM test_chunk_generations() WHERE settled ORDER BY epoch_lo DESC LIMIT 1};
+	sql(q{UPDATE gw.t SET v = 'fail' WHERE id = 2; SELECT dolt_commit('-Am', 'fail')});
+	sql($due);
+	$offset = -s $node->logfile;
+	sql(q{SELECT injection_points_attach('prolly-gc-retire-begin', 'error')});
+	# (the visits come on their own, a second apart: the log read as it grows)
+	my $log = sub { return substr(slurp_file($node->logfile), $offset); };
+	my $full = qr/automatic full collection of database "gw"/;
+	my $waited = 0;
+	until ($log->() =~ $full || $waited++ > 120) { sleep(1); }
+	my $text = $log->();
+	my ($before) = split($full, $text, 2);
+	my @failed = ($before =~ /worker\[(\d+)\] WARNING:  automatic retire of generations \d+ to \d+ of database "gw" failed/g);
+	cmp_ok(scalar(@failed), '>=', 3, 'the retire failed, visit after visit');
+	ok($before =~ /worker\[$failed[0]\] DEBUG:  automatic collection of database "gw"/,
+		'the default collection ran after the first failure');
+	ok($text =~ $full, 'a full collection after three failures');
+	cmp_ok(scalar(@failed), '<=', 3, 'no more retires tried before it');
+	sql(q{SELECT injection_points_detach('prolly-gc-retire-begin')});
+	is(sql(q{SELECT count(*) FROM gw.t WHERE length(v) = 3200 OR id IN (1, 2)}),
+		'200', 'the values read');
+	ok(sql(q{SELECT test_chunk_verify_generations() > 0}) eq 't',
+		'generations check out');
+}
 
 $node->stop;
 done_testing();

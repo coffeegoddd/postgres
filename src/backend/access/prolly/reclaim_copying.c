@@ -791,6 +791,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 static bool
 copying_retire(uint32 lo, uint32 hi, bool if_free, ProllyGcResult *result)
 {
+	INJECTION_POINT("prolly-gc-retire-begin", NULL);
 	return collect_scoped(PROLLY_GC_RETIRE, lo, hi, if_free, result);
 }
 
