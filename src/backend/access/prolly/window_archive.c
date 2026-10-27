@@ -1400,16 +1400,21 @@ pin_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
 /*
  * The commits a ref names for a reader, each of which keeps its own data
  * whatever the window: a remote-tracking branch's, a reader's pin's, a
- * stash's, and a merge's or rebase's in progress.  (Not a branch's log, nor
+ * stash's, and every branch's merge's or rebase's in progress, whichever
+ * session began it.  (Not a branch's log, nor
  * the commits its pages are kept as of: those are its history, the
  * window's.  A tag keeps itself as a ref of its own.)
  */
+static void
+pin_in_progress(const char *branch, const ProllyHash *commit, void *arg)
+{
+	(void) set_add((HTAB *) arg, commit);
+}
+
 static HTAB *
 ref_commits(void)
 {
 	HTAB	   *set = id_set("prolly ref commits", sizeof(ProllyHash));
-	ProllyMergeState ms;
-	ProllyRebaseState rs;
 
 	if (PROLLY_HAS(dc.refs, trackings))
 		PROLLY_CALL(dc.refs, trackings, NULL, pin_tracking, set);
@@ -1417,18 +1422,8 @@ ref_commits(void)
 		PROLLY_CALL(dc.refs, pins, pin_pin, set);
 	if (PROLLY_HAS(dc.refs, stashes))
 		PROLLY_CALL(dc.refs, stashes, pin_stash, set);
-	if (PROLLY_HAS(dc.refs, merge_state) &&
-		PROLLY_CALL(dc.refs, merge_state, &ms))
-	{
-		(void) set_add(set, &ms.theirs);
-		(void) set_add(set, &ms.base);
-	}
-	if (PROLLY_HAS(dc.refs, rebase_state) &&
-		PROLLY_CALL(dc.refs, rebase_state, &rs))
-	{
-		(void) set_add(set, &rs.head);
-		(void) set_add(set, &rs.onto);
-	}
+	if (PROLLY_HAS(dc.refs, in_progress))
+		PROLLY_CALL(dc.refs, in_progress, pin_in_progress, set);
 	return set;
 }
 
@@ -1617,18 +1612,22 @@ note_merge_bases(Plan *plan)
 	 * history behind it is the window's.
 	 */
 	{
+		HASH_SEQ_STATUS seq;
+		ProllyHash *r;
 		HTAB	   *readers = ref_commits();
 
 		foreach_ptr(Head, h, plan->heads)
 			if (h->on_lineage && !h->standalone)
-			{
-				if (set_has(readers, &h->head))
-					plan->ref_pins = lappend(plan->ref_pins,
-											 memcpy(palloc(sizeof(ProllyHash)),
-													&h->head,
-													sizeof(ProllyHash)));
 				plan->heads = foreach_delete_current(plan->heads, h);
-			}
+		/*
+		 * (each kept by itself, whether the refs' entries name it as a
+		 * chunk or not: a merge's state names its commits by id)
+		 */
+		hash_seq_init(&seq, readers);
+		while ((r = hash_seq_search(&seq)) != NULL)
+			plan->ref_pins = lappend(plan->ref_pins,
+									 memcpy(palloc(sizeof(ProllyHash)), r,
+											sizeof(ProllyHash)));
 		hash_destroy(readers);
 	}
 }
@@ -2021,9 +2020,14 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 	/* (and each commit a ref names on a branch's history, by itself) */
 	foreach_ptr(ProllyHash, r, plan->ref_pins)
 	{
-		PlanCommit *pc = plan_commit(plan, r);
+		PlanCommit *pc;
+		ProllyCommitInfo info;
 
-		if (is_severed(r) || pc->kept)
+		if (r->len == 0 || is_severed(r) ||
+			!PROLLY_CALL(dc.refs, commit_get, r, &info))
+			continue;
+		pc = plan_commit(plan, r);
+		if (pc->kept)
 			continue;
 		pc->pinned = true;
 		keep(plan, pc);

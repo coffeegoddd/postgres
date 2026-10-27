@@ -367,6 +367,51 @@ SELECT v FROM old.t;
 \c regress_history_window
 DROP DATABASE regress_history_window_o;
 
+-- A merge in progress on another branch, begun by another session, keeps
+-- its other side's data and its base's past a sever and a full
+-- collection made from this one: the merge resolves with the right rows.
+CREATE DATABASE regress_history_window_m;
+\c regress_history_window_m
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'a'), (2, 'a');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+SELECT dolt_branch('feat') IS NOT NULL AS branched;
+UPDATE hw.t SET v = 'm' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'm0' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+SELECT dolt_checkout('feat') IS NOT NULL AS checked_out;
+UPDATE hw.t SET v = 'f' WHERE id IN (1, 2);
+SELECT length(dolt_commit('-am', 'f9', '--date', (now() - interval '9 days')::text)::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS f9 \gset
+INSERT INTO hw.t VALUES (3, 'f1');
+SELECT length(dolt_commit('-am', 'f1', '--date', (now() - interval '1 hour')::text)::text) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
+SELECT dolt_branch('work') IS NOT NULL AS branched;
+SELECT dolt_checkout('work') IS NOT NULL AS checked_out;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge(:'f9'))[3] AS conflicts;
+-- (this session leaves the merge in progress; another severs)
+\c regress_history_window_m
+ALTER DATABASE regress_history_window_m SET prolly.history_window = '3 days';
+ALTER DATABASE regress_history_window_m SET prolly.history_window_action = delete;
+\c regress_history_window_m
+SELECT p.kind, p.why, p.commit_hash = :'f9' AS is_f9 FROM prolly_history_plan(NULL) p
+WHERE p.kind = 'pinned' ORDER BY 1, 2, 3;
+SELECT fragment > 0 AS severed FROM dolt_history_sever();
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+\c regress_history_window_m
+SELECT dolt_checkout('work') IS NOT NULL AS checked_out;
+SET dolt.allow_commit_conflicts = on;
+SELECT (their_row).id, (their_row).v, (base_row).v AS base_v
+FROM dolt_conflicts(NULL::hw.t) ORDER BY 1;
+SELECT dolt_conflicts_resolve('--theirs', 'hw.t');
+SELECT length(dolt_commit('-am', 'merged')::text) > 0 AS committed;
+SELECT id, v FROM hw.t ORDER BY id;
+\c regress_history_window
+DROP DATABASE regress_history_window_m;
+
 -- What a reader and a collection read of the horizon doesn't grow with
 -- the commits ever severed: a commit's severing is a point lookup, and a
 -- full collection reads only the severed commits whose data may be here

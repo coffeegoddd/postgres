@@ -197,6 +197,14 @@ typedef struct ProllyRebaseState
 	ProllyRebaseStep *steps;	/* (palloc'd) */
 } ProllyRebaseState;
 
+/*
+ * Visits a commit a branch's merge or rebase in progress names: the
+ * branch, and the commit (theirs or the base of a merge; the head as it
+ * began or onto of a rebase).
+ */
+typedef void (*ProllyInProgressVisit) (const char *branch,
+									   const ProllyHash *commit, void *arg);
+
 /* Visits a pin: its name, its commit and the record kept beside it. */
 typedef void (*ProllyPinVisit) (const char *name, const ProllyHash *commit,
 								const ProllyValue *info, void *arg);
@@ -967,6 +975,14 @@ typedef struct ProllyRefsRoutine
 												const ProllyValue *value,
 												void *arg),
 								 void *arg);
+
+	/*
+	 * Optional: visit the commits every branch's merge or rebase in
+	 * progress names, whichever session began it (merge_state() and
+	 * rebase_state() give only the session's branch's): for the history
+	 * window, which keeps their data.
+	 */
+	void		(*in_progress) (ProllyInProgressVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -1032,9 +1048,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
-	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at"
+	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
+	"in_progress"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK side_scan_at
+#define PROLLY_REFS_LAST_CALLBACK in_progress
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

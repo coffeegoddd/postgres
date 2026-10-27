@@ -11875,6 +11875,57 @@ copies_rebase_state(ProllyRebaseState *state)
 }
 
 static void
+note_branch_name(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pstrdup(name));
+}
+
+/*
+ * The commits every branch's merge or rebase in progress names, whichever
+ * session began it: each branch's 'M' and 'E' entries, as merge_state()
+ * and rebase_state() read the session's own.
+ */
+static void
+copies_in_progress(ProllyInProgressVisit visit, void *arg)
+{
+	List	   *names = NIL;
+
+	refs_init();
+	copies_branches(note_branch_name, &names);
+	foreach_ptr(char, name, names)
+	{
+		ProllyMergeState ms;
+		StringInfoData key;
+		StringInfoData v;
+		ProllyRebaseState rs;
+
+		if (merge_state_of(name, &ms))
+		{
+			visit(name, &ms.theirs, arg);
+			if (ms.base.len > 0)
+				visit(name, &ms.base, arg);
+		}
+		initStringInfo(&key);
+		initStringInfo(&v);
+		rebase_key(&key, name);
+		if (refs_get(key.data, key.len, &v))
+		{
+			if (!rebase_decode(v.data, v.data + v.len, &rs))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("corrupt prolly rebase state")));
+			visit(name, &rs.head, arg);
+			visit(name, &rs.onto, arg);
+		}
+		pfree(key.data);
+		pfree(v.data);
+	}
+	list_free_deep(names);
+}
+
+static void
 copies_set_rebase_state(const ProllyRebaseState *state)
 {
 	StringInfoData key;
@@ -13014,4 +13065,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.side_put = copies_side_put,
 	.side_scan = copies_side_scan,
 	.side_scan_at = copies_side_scan_at,
+	.in_progress = copies_in_progress,
 };
