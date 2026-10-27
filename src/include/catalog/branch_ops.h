@@ -51,7 +51,25 @@ typedef struct BranchKeptRelation
 	uint64		snapshot;
 	TransactionId frozenxid;
 	MultiXactId minmxid;
+	uint32		flags;			/* BRANCH_KEPT_UNFROZEN, _CONCURRENT */
+	uint32		nundecided;
+	BlockNumber *undecided;		/* a frozen root's pages that depend on
+								 * transactions its snapshot didn't see */
 } BranchKeptRelation;
+
+/*
+ * A root captured while writers were at work (keep() with concurrent):
+ * its pages hold versions of transactions the commit didn't see, so it is
+ * not the commit's as it is.  UNFROZEN: not frozen yet, never given back
+ * (restore() and share_kept() refuse it) until freeze_kept() has made a
+ * frozen root of it, as of the commit's snapshot; that one, and the
+ * table's other relations kept as captured with it, keep CONCURRENT: the
+ * relation's pages unchanged since are still not the commit's (a writer
+ * the commit didn't see may have changed them before), so a restore
+ * always gives it new storage, with no visibility map.
+ */
+#define BRANCH_KEPT_UNFROZEN	0x01
+#define BRANCH_KEPT_CONCURRENT	0x02
 
 /*
  * What is left of a relation's kept pages (kept_status()): restorable, as
@@ -82,11 +100,13 @@ typedef enum BranchKeptStatus
 #define BRANCH_KEPT_STORAGE		PG_UINT64_MAX
 
 /*
- * Freeze a copy of block blkno of a heap-format relation as of snapshot,
- * in place (the root freezer's freeze_page()).
+ * Freeze a copy of block blkno of a heap-format relation as of as_of, in
+ * place (the root freezer's freeze_page()).
  */
+struct ProllyRootSnapshot;
 typedef bool (*BranchFreezePage) (Page page, BlockNumber blkno,
-								  Snapshot snapshot);
+								  const struct ProllyRootSnapshot *as_of,
+								  bool *undecided);
 
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
@@ -247,13 +267,43 @@ typedef struct BranchOpsRoutine
 	 * changed since the relation's root in prior[], made into a root whose
 	 * unchanged pages are that root's), and its kept frozenxid is
 	 * FrozenTransactionId: it never goes stale; one unchanged since keeps
-	 * that root.  The others are kept as they are.
+	 * that root.  The others are kept as they are.  With concurrent,
+	 * writers aren't locked out: the relations are locked only against
+	 * VACUUM and definitions (ShareUpdateExclusiveLock, without waiting),
+	 * indexes captured before the tables they index (so each entry of an
+	 * index's root names a row its table's root holds), each root at a
+	 * moment no writer is changing one of its pages
+	 * (bmap_root_capture_concurrent()); each relation kept is
+	 * BRANCH_KEPT_UNFROZEN and _CONCURRENT, for freeze_kept() to freeze
+	 * as of the commit's snapshot (freeze is NULL then).
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
 						 const BranchKeptRelation *release, int nrelease,
 						 bool (*settled) (void *arg), void *arg,
-						 BranchFreezePage freeze, Snapshot snapshot);
+						 BranchFreezePage freeze,
+						 const struct ProllyRootSnapshot *as_of,
+						 bool concurrent);
+
+	/*
+	 * Optional: freeze the roots keep() captured concurrently of the
+	 * session branch's relations kept[] (nkept of them, whole tables),
+	 * into frozen[] (one for each, in order): each heap-format relation's
+	 * root made a frozen root as of as_of (freeze() of a copy of each page
+	 * changed since the nearest frozen root before it among prior[], and
+	 * of each page that root's freezing left undecided, written into a
+	 * copy of that root), the others kept as captured; none
+	 * BRANCH_KEPT_UNFROZEN any more.  The relations are locked against
+	 * VACUUM and definitions, without waiting, while it is done.  False,
+	 * nothing frozen (those made let go of as the transaction aborts or
+	 * commits), if a lock isn't free, or one is no longer on the storage
+	 * or root kept.
+	 */
+	bool		(*freeze_kept) (const BranchKeptRelation *kept, int nkept,
+								BranchKeptRelation *frozen,
+								const BranchKeptRelation *prior, int nprior,
+								BranchFreezePage freeze,
+								const struct ProllyRootSnapshot *as_of);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,

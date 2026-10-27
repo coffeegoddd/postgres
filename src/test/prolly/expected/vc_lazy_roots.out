@@ -1,0 +1,67 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_flush s1_mark s2_begin s2_write s1_write s1_flush s1_kept s2_end s1_reset s1_flush s1_how s1_index
+step s1_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step s1_mark: 
+	SELECT set_config('vlr.kept', vlr_counted('pages_kept')::text, false) IS NOT NULL AS marked,
+		set_config('vlr.frozen', vlr_counted('roots_frozen_later')::text, false) IS NOT NULL AS too,
+		set_config('vlr.restored', vlr_counted('relations_restored')::text, false) IS NOT NULL AS also;
+
+marked|too|also
+------+---+----
+t     |t  |t   
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO vlr.t VALUES (1000, 'late');
+step s1_write: UPDATE vlr.t SET v = 'c1' WHERE id = 1;
+step s1_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step s1_kept: 
+	SELECT vlr_counted('pages_kept') > current_setting('vlr.kept')::bigint AS kept;
+
+kept
+----
+t   
+(1 row)
+
+step s2_end: COMMIT;
+step s1_reset: SELECT dolt_reset('--hard', 'HEAD~1') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step s1_how: 
+	SELECT vlr_counted('roots_frozen_later') > current_setting('vlr.frozen')::bigint AS frozen_then,
+		vlr_counted('relations_restored') > current_setting('vlr.restored')::bigint AS pages_given_back,
+		(SELECT count(*) FROM vlr.t WHERE id = 1000) AS late_row,
+		(SELECT v FROM vlr.t WHERE id = 1) AS c1_row,
+		(SELECT count(*) FROM vlr.t) AS rows_now;
+
+frozen_then|pages_given_back|late_row|c1_row|rows_now
+-----------+----------------+--------+------+--------
+t          |t               |       0|c1    |     200
+(1 row)
+
+step s1_index: SET enable_seqscan = off; SELECT count(*) AS by_index FROM vlr.t WHERE v = 'late';
+by_index
+--------
+       0
+(1 row)
+

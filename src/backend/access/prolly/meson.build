@@ -69,6 +69,7 @@ backend_sources += files(
   'refs_history.c',
   'refs_stub.c',
   'rootfreeze_capture.c',
+  'rootfreeze_lazy.c',
   'rootfreeze_stub.c',
   'transfer_chunks.c',
   'transfer_stub.c',
