@@ -67,8 +67,11 @@
  *	'I' name	-> the working set's identity anchor (the canonicalizer's
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
- *	'K' name NUL kind ... -> a commit the branch's pages are kept as of
- *				   (see "Kept pages"): kind 'l' and its commit's height
+ *	'~' name NUL kind ... -> a commit the branch's pages are kept as of
+ *				   (see "Kept pages"; the tag sorts after every other, so
+ *				   what a branch keeps, which its window bounds, is one
+ *				   region after every other entry, a commit's own at its
+ *				   right end): kind 'l' and its commit's height
  *				   (8 bytes, big-endian) and id (hash length, hash) for one
  *				   kept, 'r' and a number (8 bytes, big-endian) for one
  *				   retired; each the transaction that retired it (a
@@ -93,7 +96,7 @@
  *				   (4 bytes each but the root, native byte order), then
  *				   its frozen root's undecided pages (a varint count, then
  *				   4 bytes each)
- *	'K' name NUL 'h' root -> how many of the branch's entries (kept or
+ *	'~' name NUL 'x' root -> how many of the branch's entries (kept or
  *				   retired) name the root: its tablespace (4 bytes) and id
  *				   (8 bytes, big-endian; for storage a restore replaced,
  *				   its file number after, 4 bytes), the count 8 bytes
@@ -101,10 +104,11 @@
  *	'u' name	-> nothing: branch name keeps a commit whose roots are to
  *				   be frozen (KEPT_UNFROZEN), not retired
  *	't' commit name -> nothing: tag name names the commit
- *	'k' commit name -> nothing: branch name keeps pages as of the commit
- *				   (hash length, hash), an entry of its 'K' not retired
- *	's' data commit name -> nothing: and that commit's kept table has the
- *				   data tree data (hash length, hash, each)
+ *	'~' name NUL 'y' data commit -> nothing: the branch's kept commit
+ *				   (an entry of its 'l', hash length, hash) has a table
+ *				   whose data tree is data (the same); a commit's own entry
+ *				   is found by its height, and another branch's through
+ *				   the heads' roots ('r') or the branches with a summary
  *	'r' root kind name -> nothing: the branch's head's root (kind 'h', as
  *				   'B' has it) or its baseline's fold's (kind 'w', as 'W'
  *				   has it) is root
@@ -6738,7 +6742,7 @@ copies_commit_count(const ProllyHash *commit, int64 *count)
  * Retire every branch's kept commit commit, severed: its history is past
  * the horizon, cold, so its root is let go of by the branch's next keep,
  * and its commit and trees no longer kept from collection meanwhile.
- * The caller holds every ref.  A seek of the index of kept commits.
+ * The caller holds every ref.  A seek of each keeping branch's entries.
  */
 static void
 copies_forget_kept(const ProllyHash *commit)
@@ -7148,7 +7152,7 @@ note_other_kept(const char *name, const ProllyHash *commit, void *arg)
 
 /*
  * Commit id's kept pages, which the session branch's list (kept) has, or
- * else another branch's (found by the refs' index of kept commits): the
+ * else another branch's (found by a seek of each keeping branch's): the
  * entry, and in *source the branch keeping it.  NULL if none does.  A
  * commit's pages are the commit's whichever branch kept them.
  */

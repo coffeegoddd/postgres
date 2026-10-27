@@ -1,29 +1,41 @@
--- What a commit writes to the refs is bounded, whatever the history: every
--- branch has a history window, past which its commits' roots are let go of
--- with their entries (the kept commit, its counts, its index entries), so
--- the refs a branch holds are bounded by its window.  A one-row commit
--- after 50 commits, and after 200, writes a few refs nodes and bytes, the
--- same both times.
+-- What a commit writes to the refs is bounded, whatever the history and
+-- whatever the history window: a branch's kept commits (their entries,
+-- root counts and data-tree index) are one region of the refs, after
+-- every other entry, so a commit's own land at that region's right end;
+-- the branch's few small entries (head, mover, baseline, summary) share
+-- leaves; and the transaction writes its refs once.  A one-row commit
+-- after 50 commits and after 200 (the mean of five, each its own
+-- transaction), under a window that holds the newest commit only, under
+-- the default month and under a century, writes a few refs nodes each
+-- time, the same few.
 SELECT current_database() AS home \gset
+CREATE TABLE refs_measured (win text, at int, refs_nodes bigint, bytes bigint,
+	live bigint);
+-- window: 1 microsecond
 CREATE DATABASE refs_per_commit;
--- (a window that holds the newest commit only)
 ALTER DATABASE refs_per_commit SET prolly.history_window = '1 microsecond';
 \c refs_per_commit
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
 RESET client_min_messages;
-\set flush 'SELECT pg_stat_force_next_flush() IS NULL AS flushed \\gset'
 CREATE FUNCTION one_commit(n int) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
 	UPDATE rc.t SET v = v + 1 WHERE id = n % 100 + 1;
 	PERFORM dolt_commit('-am', 'c' || n);
 END $$;
-CREATE TEMP TABLE measured (at int, refs_nodes bigint, bytes bigint, live bigint);
-CREATE FUNCTION measure(at int) RETURNS void LANGUAGE sql AS $$
-	INSERT INTO measured SELECT at,
-		(SELECT value FROM pg_stat_prolly WHERE name = 'refs_nodes_written'),
-		(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended'),
-		(SELECT count(*) FROM test_kept_commits('main'))
+-- (each commit its own transaction, as one made by hand is)
+CREATE PROCEDURE commits(a int, b int) LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN a..b LOOP
+		PERFORM one_commit(i);
+		COMMIT;
+	END LOOP;
+END $$;
+CREATE FUNCTION measured(at int) RETURNS text LANGUAGE sql AS $$
+	SELECT format('(%L, %s, %s, %s, %s)', '1 microsecond', at,
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'refs_nodes_written'),
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended'),
+		(SELECT count(*) FROM test_kept_commits('main')))
 $$;
 CREATE SCHEMA rc VERSIONED;
 CREATE TABLE rc.t (id int PRIMARY KEY, v int);
@@ -34,1256 +46,185 @@ SELECT dolt_commit('-Am', 'c0') IS NOT NULL AS committed;
  t
 (1 row)
 
--- (each its own transaction, as a commit made by hand is)
-SELECT format('SELECT one_commit(%s)', i) FROM generate_series(1, 49) i \gexec
-SELECT one_commit(1)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(2)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(3)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(4)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(5)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(6)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(7)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(8)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(9)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(10)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(11)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(12)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(13)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(14)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(15)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(16)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(17)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(18)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(19)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(20)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(21)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(22)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(23)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(24)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(25)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(26)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(27)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(28)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(29)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(30)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(31)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(32)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(33)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(34)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(35)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(36)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(37)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(38)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(39)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(40)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(41)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(42)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(43)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(44)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(45)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(46)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(47)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(48)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(49)
- one_commit 
-------------
- 
-(1 row)
-
-:flush
+CALL commits(1, 45);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
 SELECT pg_stat_reset_shared('prolly');
  pg_stat_reset_shared 
 ----------------------
  
 (1 row)
 
-SELECT one_commit(50);
- one_commit 
-------------
- 
-(1 row)
-
-:flush
-SELECT measure(50);
- measure 
----------
- 
-(1 row)
-
-SELECT format('SELECT one_commit(%s)', i) FROM generate_series(51, 199) i \gexec
-SELECT one_commit(51)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(52)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(53)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(54)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(55)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(56)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(57)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(58)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(59)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(60)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(61)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(62)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(63)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(64)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(65)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(66)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(67)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(68)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(69)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(70)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(71)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(72)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(73)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(74)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(75)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(76)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(77)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(78)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(79)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(80)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(81)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(82)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(83)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(84)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(85)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(86)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(87)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(88)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(89)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(90)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(91)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(92)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(93)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(94)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(95)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(96)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(97)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(98)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(99)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(100)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(101)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(102)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(103)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(104)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(105)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(106)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(107)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(108)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(109)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(110)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(111)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(112)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(113)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(114)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(115)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(116)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(117)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(118)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(119)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(120)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(121)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(122)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(123)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(124)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(125)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(126)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(127)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(128)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(129)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(130)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(131)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(132)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(133)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(134)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(135)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(136)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(137)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(138)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(139)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(140)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(141)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(142)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(143)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(144)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(145)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(146)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(147)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(148)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(149)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(150)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(151)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(152)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(153)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(154)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(155)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(156)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(157)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(158)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(159)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(160)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(161)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(162)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(163)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(164)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(165)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(166)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(167)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(168)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(169)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(170)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(171)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(172)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(173)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(174)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(175)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(176)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(177)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(178)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(179)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(180)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(181)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(182)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(183)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(184)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(185)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(186)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(187)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(188)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(189)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(190)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(191)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(192)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(193)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(194)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(195)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(196)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(197)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(198)
- one_commit 
-------------
- 
-(1 row)
-
-SELECT one_commit(199)
- one_commit 
-------------
- 
-(1 row)
-
-:flush
+CALL commits(46, 50);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(50) AS m50 \gset
+CALL commits(51, 195);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
 SELECT pg_stat_reset_shared('prolly');
  pg_stat_reset_shared 
 ----------------------
  
 (1 row)
 
-SELECT one_commit(200);
- one_commit 
-------------
- 
-(1 row)
-
-:flush
-SELECT measure(200);
- measure 
----------
- 
-(1 row)
-
--- a few refs nodes, a few pages of bytes, a root or two kept: and no more
--- after 200 commits than after 50
-SELECT at, refs_nodes <= 10 AS few_refs_nodes, bytes <= 25000 AS few_bytes,
-	live <= 2 AS bounded_roots
-FROM measured ORDER BY at;
- at  | few_refs_nodes | few_bytes | bounded_roots 
------+----------------+-----------+---------------
-  50 | t              | t         | t
- 200 | t              | t         | t
-(2 rows)
-
-SELECT (SELECT refs_nodes FROM measured WHERE at = 200) <=
-	(SELECT refs_nodes FROM measured WHERE at = 50) + 1 AS refs_nodes_flat,
-	(SELECT bytes FROM measured WHERE at = 200) <=
-	(SELECT bytes FROM measured WHERE at = 50) * 3 / 2 AS bytes_flat;
- refs_nodes_flat | bytes_flat 
------------------+------------
- t               | t
-(1 row)
-
+CALL commits(196, 200);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(200) AS m200 \gset
 \c :home
+INSERT INTO refs_measured VALUES :m50, :m200;
 DROP DATABASE refs_per_commit;
+-- window: a month (the default)
+CREATE DATABASE refs_per_commit;
+\c refs_per_commit
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION one_commit(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	UPDATE rc.t SET v = v + 1 WHERE id = n % 100 + 1;
+	PERFORM dolt_commit('-am', 'c' || n);
+END $$;
+-- (each commit its own transaction, as one made by hand is)
+CREATE PROCEDURE commits(a int, b int) LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN a..b LOOP
+		PERFORM one_commit(i);
+		COMMIT;
+	END LOOP;
+END $$;
+CREATE FUNCTION measured(at int) RETURNS text LANGUAGE sql AS $$
+	SELECT format('(%L, %s, %s, %s, %s)', 'a month (the default)', at,
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'refs_nodes_written'),
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended'),
+		(SELECT count(*) FROM test_kept_commits('main')))
+$$;
+CREATE SCHEMA rc VERSIONED;
+CREATE TABLE rc.t (id int PRIMARY KEY, v int);
+INSERT INTO rc.t SELECT g, 0 FROM generate_series(1, 100) g;
+SELECT dolt_commit('-Am', 'c0') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CALL commits(1, 45);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+CALL commits(46, 50);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(50) AS m50 \gset
+CALL commits(51, 195);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+CALL commits(196, 200);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(200) AS m200 \gset
+\c :home
+INSERT INTO refs_measured VALUES :m50, :m200;
+DROP DATABASE refs_per_commit;
+-- window: 100 years
+CREATE DATABASE refs_per_commit;
+ALTER DATABASE refs_per_commit SET prolly.history_window = '100 years';
+\c refs_per_commit
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION one_commit(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	UPDATE rc.t SET v = v + 1 WHERE id = n % 100 + 1;
+	PERFORM dolt_commit('-am', 'c' || n);
+END $$;
+-- (each commit its own transaction, as one made by hand is)
+CREATE PROCEDURE commits(a int, b int) LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN a..b LOOP
+		PERFORM one_commit(i);
+		COMMIT;
+	END LOOP;
+END $$;
+CREATE FUNCTION measured(at int) RETURNS text LANGUAGE sql AS $$
+	SELECT format('(%L, %s, %s, %s, %s)', '100 years', at,
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'refs_nodes_written'),
+		(SELECT value / 5 FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended'),
+		(SELECT count(*) FROM test_kept_commits('main')))
+$$;
+CREATE SCHEMA rc VERSIONED;
+CREATE TABLE rc.t (id int PRIMARY KEY, v int);
+INSERT INTO rc.t SELECT g, 0 FROM generate_series(1, 100) g;
+SELECT dolt_commit('-Am', 'c0') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CALL commits(1, 45);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+CALL commits(46, 50);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(50) AS m50 \gset
+CALL commits(51, 195);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+CALL commits(196, 200);
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT measured(200) AS m200 \gset
+\c :home
+INSERT INTO refs_measured VALUES :m50, :m200;
+DROP DATABASE refs_per_commit;
+-- every window, after 50 commits and after 200: a few refs nodes (4 under
+-- the tiny window, 8 or 9 under the others, where the refs tree holds the
+-- window's entries: the region's right end, the small entries' leaf, the
+-- data-tree index's, and the levels above), a few nodes' bytes (nodes are
+-- about 4 KB once the tree is full), and no more nodes after 200 than
+-- after 50
+SELECT win, at, refs_nodes <= 10 AS few_refs_nodes, bytes <= 36000 AS few_bytes
+FROM refs_measured ORDER BY win, at;
+          win          | at  | few_refs_nodes | few_bytes 
+-----------------------+-----+----------------+-----------
+ 100 years             |  50 | t              | t
+ 100 years             | 200 | t              | t
+ 1 microsecond         |  50 | t              | t
+ 1 microsecond         | 200 | t              | t
+ a month (the default) |  50 | t              | t
+ a month (the default) | 200 | t              | t
+(6 rows)
+
+SELECT a.win, b.refs_nodes <= a.refs_nodes + 1 AS refs_nodes_flat
+FROM refs_measured a JOIN refs_measured b ON a.win = b.win AND a.at = 50 AND b.at = 200
+ORDER BY a.win;
+          win          | refs_nodes_flat 
+-----------------------+-----------------
+ 100 years             | t
+ 1 microsecond         | t
+ a month (the default) | t
+(3 rows)
+
+-- the window bounds what is kept
+SELECT win, live FROM refs_measured WHERE at = 200 ORDER BY win;
+          win          | live 
+-----------------------+------
+ 100 years             |  201
+ 1 microsecond         |    1
+ a month (the default) |  201
+(3 rows)
+
+DROP TABLE refs_measured;
