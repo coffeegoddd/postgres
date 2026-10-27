@@ -123,5 +123,27 @@ SELECT dolt_commit('-am', 'h2') IS NOT NULL AS committed;
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT md5(string_agg(h::text, ',' ORDER BY id)) = :'at_h1' AS at_h1 FROM rf.h h;
 
+-- a relation restored from a root kept as captured (prolly.freeze_roots
+-- off) is made of unfrozen pages: the next frozen root is never made of
+-- that root (only a frozen one, or a copy of one, is a base), so every
+-- page it holds is frozen
+CREATE TABLE rf.m (id int PRIMARY KEY, w text NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO rf.m SELECT g, 'a' FROM generate_series(1, 2000) g;
+SET prolly.freeze_roots = off;
+SELECT dolt_commit('-Am', 'm1') IS NOT NULL AS committed;
+UPDATE rf.m SET w = 'b' WHERE id <= 5;
+SELECT dolt_commit('-am', 'm2') IS NOT NULL AS committed;
+SELECT dolt_reset('--hard', 'HEAD~1');
+RESET prolly.freeze_roots;
+UPDATE rf.m SET w = 'c' WHERE id = 2000;
+SELECT dolt_commit('-am', 'm3') IS NOT NULL AS committed;
+UPDATE rf.m SET w = 'd' WHERE id = 1000;
+SELECT dolt_commit('-am', 'm4') IS NOT NULL AS committed;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT count(*) FILTER (WHERE lp_flags = 1 AND (t_infomask & 768) <> 768) AS not_frozen,
+	count(*) FILTER (WHERE lp_flags = 1) AS versions
+FROM generate_series(0, pg_relation_size('rf.m') / 8192 - 1) b,
+	LATERAL heap_page_items(get_raw_page('rf.m', b::int));
+
 \c :home
 DROP DATABASE root_freezing;

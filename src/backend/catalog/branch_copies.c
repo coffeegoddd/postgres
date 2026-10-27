@@ -542,8 +542,8 @@ emptied_relations(List *emptied, List **relids)
  * Are the pages of storage reln still those root k keeps of it?  A root
  * holding them as they were shares reln's subtrees until one changes
  * (bmap_root_unchanged()); a frozen one holds copies, so reln's pages
- * changed since are looked for (bmap_changed_pages(), which reads the
- * map's leaves).
+ * changed since are looked for (bmap_changed_pages(), which reads only
+ * the map's nodes set since: none if nothing changed).
  */
 static bool
 kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
@@ -2739,8 +2739,7 @@ copies_changed_since_kept(const BranchKeptRelation *kept, int nkept)
 		RelFileLocator loc = kept_locator(&kept[i]);
 
 		if (bmap_relation_exists(loc) &&
-			!bmap_root_unchanged(smgropen(loc, INVALID_PROC_NUMBER),
-								 kept[i].snapshot))
+			!kept_unchanged(smgropen(loc, INVALID_PROC_NUMBER), &kept[i]))
 			return true;
 	}
 	return false;

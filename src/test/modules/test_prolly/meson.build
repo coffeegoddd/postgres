@@ -241,6 +241,7 @@ tests += {
       'root_moves',
       'root_holds',
       'root_freezing',
+      'root_changed_pages',
       'kept_pages',
       'kept_head_restore',
       'bounded_counts',

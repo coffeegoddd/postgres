@@ -229,6 +229,10 @@ typedef struct xl_bmap_extend
  *						roots file
  * BMAP_TREE_EPOCH		the map's epoch raised, so that each page's next change
  *						claims or copies it: block 0 is its header
+ * BMAP_TREE_STAMP		a pointer to the relation's own node 'node' set in the
+ *						map's epoch, the first change under it in the epoch:
+ *						block 0 is the parent (a node, or the tree's root
+ *						page), its delta
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -238,6 +242,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_CAPTURE		7
 #define BMAP_TREE_ROOT_SLOT		8
 #define BMAP_TREE_EPOCH			9
+#define BMAP_TREE_STAMP			10
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
