@@ -5408,6 +5408,12 @@ retain_kept_branches(void)
 	List	   *names = retain_pending;
 
 	retain_pending = NIL;
+	/*
+	 * (a transaction made read-only after its keep, as a detached
+	 * checkout's is, leaves the pass to the branch's next keep)
+	 */
+	if (XactReadOnly || RecoveryInProgress())
+		return;
 	foreach_ptr(char, name, names)
 	{
 		KeptSummary s;

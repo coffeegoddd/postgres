@@ -434,8 +434,8 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value <= 3 * 100)::int
         name        | value 
 --------------------+-------
  apply_rows         |     1
- move_tables_shared |     0
- relations_restored |     7
+ move_tables_shared |     1
+ relations_restored |     0
 (3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 100) AS at_merge,
@@ -463,6 +463,12 @@ BEGIN
 		INSERT INTO digests VALUES (300 + i, digest());
 	END LOOP;
 END $$;
+SELECT test_retain_roots('main');
+ test_retain_roots 
+-------------------
+ 
+(1 row)
+
 SELECT count(*) AS kept FROM test_kept_commits('main');
  kept 
 ------

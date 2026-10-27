@@ -1201,15 +1201,50 @@ that one's.  A root is the store's, not the relation's or the branch's:
 any number of them are kept, each outlives the relation's storage (a
 restore, a drop) until the commit keeping it is let go of, which lets go
 of it as its transaction commits, and a move of any branch to the commit
-is given it (below).  A branch's list keeps the newest
-prolly.kept_commits (2 by default) of its kept commits; retention over
-the history window is to replace that cap, a commit whose root it let
-go of moved to as one no root was captured at.  A capture writes out
+is given it (below).  Which commits keep their roots is root
+retention's (below); a commit whose root it let go of is moved to as one
+no root was captured at.  A capture writes out
 only the relation's pages changed since its last capture (those its map
 walk finds), never visiting
 the buffers.  Redo of one writes the same pages, walking the root's own
 leaves as the record names them, and syncs nothing: those pages were
 logged as images (below).
+
+Root retention (the root_retention interface; "window" by default) keeps
+a root for every commit kept within the history window, the one window
+the history window settings define (prolly.history_window,
+prolly.history_min_commits, prolly.history_max_size and each branch's own,
+as the database has them), and none outside it: that history is cold,
+for a sever.  A commit is kept while any branch lineage's window holds
+it, so a branch's head another branch was reset or committed away from
+keeps its root; one no branch has any more (reset or amended away from)
+is in no window.  A branch with no window of its own keeps every root,
+as by default.  A tag keeps its commit's root while it names it, and a
+branch's newest root is never let go of.  prolly.history_root_max_size
+(unset by default), as the database has it, caps what the roots of every
+branch hold: past it, the oldest roots in the window are let go of first,
+so history is never lost, only moves to those commits cost the rows
+between them and the nearest root before.  It differs from
+prolly.history_max_size, which caps the chunk store, history included,
+and is met by severing history (cold), where the root cap only thins the
+roots of history kept (warm): what a root holds is its relations' pages
+changed since the root before it, as the capture or the freezing found
+them.
+
+Each kept commit is an entry of its own in the refs, keyed by the
+branch, its commit's height and its id (a retired one by a number), with
+a count of the entries naming each root and a summary of the branch's
+(what its roots hold, how many, the oldest's height, the last keep), so
+a keep reads the newest few and the retired, and writes what it changes.
+A retention pass runs as a transaction that kept a branch's commit
+commits (its head where the transaction leaves it), once the branch has
+kept half as many commits again as it keeps, or the roots hold more than
+the cap: it reads the windows once (their walk spread over those keeps),
+then the branch's live entries from the oldest, retiring each outside
+every window and passing over another lineage's and a tag's, until one in
+the branch's own window (past the cap, until the cap is met), then from
+the newest the same way for what a branch was reset away from.  So a
+pass reads the entries it retires and passes over, not every root.
 
 Roots are captured no more often than prolly.root_interval (by default
 every commit made by hand, and a second under dolt.transaction_commit,
@@ -1500,7 +1535,7 @@ Each keep and each restore asks what is left of each kept commit's
 pages (branch
 operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
 relations asked of).  Only the commits still kept are asked, never more
-than prolly.kept_commits and the one a restore keeps again: a retired
+than the newest few and the one a restore keeps again: a retired
 commit is neither counted nor offered whatever is left of its pages, and
 the retired pile up within a transaction (each of its commits retires
 one) until it ends, so asking them too would make each commit of a
@@ -1517,7 +1552,7 @@ change log; an unfrozen root's rows' transaction ids are older than the
 database still knows), is retired, as above: it stays in the record,
 keeping its commit
 and baseline from collection, until a later keep lets go of its
-roots.  Neither counts toward prolly.kept_commits or is offered to a
+roots.  Neither is offered to a
 move or a first use.  A commit with a table whose relations are all still
 on the storage that kept them stays kept (restore_pages() may still pass
 the table over, renamed or with other relations since).  Roots that a

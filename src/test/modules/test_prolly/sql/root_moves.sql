@@ -186,6 +186,7 @@ BEGIN
 		INSERT INTO digests VALUES (300 + i, digest());
 	END LOOP;
 END $$;
+SELECT test_retain_roots('main');
 SELECT count(*) AS kept FROM test_kept_commits('main');
 CREATE FUNCTION reads() RETURNS bigint LANGUAGE sql AS $$
 	SELECT sum(value)::bigint FROM pg_stat_prolly

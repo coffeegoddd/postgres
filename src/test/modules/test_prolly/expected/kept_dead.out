@@ -74,9 +74,9 @@ SELECT restored() > :before AS restored;
 (1 row)
 
 SELECT kept();
- kept  
--------
- a b c
+ kept 
+------
+ a b
 (1 row)
 
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
@@ -89,9 +89,9 @@ SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
 UPDATE kd.t SET v = 3 WHERE id <= 100;
 INSERT INTO names SELECT (dolt_commit('-am', 'd'))[1], 'd';
 SELECT kept();
-  kept   
----------
- a b c d
+ kept  
+-------
+ a b d
 (1 row)
 
 -- and a reset back to b is O(1) again: its pages given back
@@ -109,9 +109,9 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 SELECT restored() > :before AS restored, kept();
- restored | kept  
-----------+-------
- t        | a b d
+ restored | kept 
+----------+------
+ t        | a b
 (1 row)
 
 -- a commit whose table TRUNCATE gave new storage is retired (its change
@@ -121,9 +121,9 @@ CREATE TABLE kd.u (id int PRIMARY KEY);
 INSERT INTO kd.u SELECT generate_series(1, 10);
 INSERT INTO names SELECT (dolt_commit('-Am', 'e'))[1], 'e';
 SELECT kept();
-  kept   
----------
- a b d e
+ kept  
+-------
+ a b e
 (1 row)
 
 TRUNCATE kd.t;
