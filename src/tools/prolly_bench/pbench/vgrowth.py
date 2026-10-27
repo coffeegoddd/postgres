@@ -10,6 +10,16 @@ quadratic one's last mean is about 9 times its first at V7's sizes.  A
 counter fails when its last mean over its first passes the bound and the
 last mean is above its floor (work too small to count either way passes).
 
+Work done once every so many transactions (a root captured each interval)
+makes a counter's series periodic: a few transactions cost many times the
+rest.  A tenth then holds one more or one fewer of them by where they fall,
+and its mean says so, not growth.  So where a series has such events (at
+least MIN_EVENTS transactions above EVENT_FACTOR times its median), the
+means are taken over whole cycles instead: from the first event to the
+event a fifth of them later, and likewise ending at the last, each window
+holding the same number of cycles.  Growth in the events, or between them,
+still shows; where they fall doesn't.
+
 configs/v_growth_accept.toml lists growth that is known and has an issue
 to fix it, one [[accept]] entry each (workload "V7/<variant>", engine,
 counter, reason), in perf_accept.toml's format.  Unlike perf_accept.toml's
@@ -87,11 +97,36 @@ def growth_metrics(series: dict[str, Optional[list[float]]],
     return out
 
 
+# A transaction costing this many times the series' median is a periodic
+# event's (see the module's docstring), if there are this many of them.
+EVENT_FACTOR = 10.0
+MIN_EVENTS = 3
+
+
+def events(series: list[float]) -> list[int]:
+    """The indexes of a series' periodic events: none if it has fewer than
+    MIN_EVENTS, or its median is 0."""
+    ordered = sorted(series)
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return []
+    at = [i for i, v in enumerate(series) if v > EVENT_FACTOR * median]
+    return at if len(at) >= MIN_EVENTS else []
+
+
 def means(series: list[float], fraction: float = 0.1) -> tuple[float, float]:
-    """The mean of a per-transaction series' first and last fraction."""
+    """The mean of a per-transaction series' first and last fraction, or,
+    for a periodic one, of its first and last whole cycles (a fifth of its
+    events' cycles each, at least one)."""
     k = max(1, int(len(series) * fraction))
     if len(series) < 2 * k:
         raise ValueError("a series needs at least two tenths that don't overlap")
+    at = events(series)
+    if at:
+        m = max(1, (len(at) - 1) // 5)
+        first = series[at[0]:at[m]]
+        last = series[at[-1 - m]:at[-1]]
+        return sum(first) / len(first), sum(last) / len(last)
     return sum(series[:k]) / k, sum(series[-k:]) / k
 
 
