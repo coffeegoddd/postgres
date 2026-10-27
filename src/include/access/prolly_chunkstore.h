@@ -95,8 +95,11 @@
  *   slot's bytes.  gc_new() visits what is new since the seal, or since its
  *   last call: the root, and each chunk appended since; the first call waits
  *   for the transactions that appended to the sealed segments and were in
- *   progress at the seal, and with window true it holds every append off
- *   until gc_swap().  gc_copy() writes the marked slots (but those of files
+ *   progress at the seal, then for every other transaction running then
+ *   (one begun before the seal may name what it read under an older root,
+ *   which the root as of the seal may no longer reach; a collector that
+ *   keeps trees across transactions forgets them before the call), and
+ *   with window true it holds every append off until gc_swap().  gc_copy() writes the marked slots (but those of files
  *   kept whole) to new table files (settled, unless the scope is the
  *   journal), before the window; gc_swap()
  *   writes those marked since, and replaces the manifest: the new files and
@@ -105,7 +108,13 @@
  *   once every transaction running at the swap has ended.  A transaction
  *   running at a swap that then appends a chunk naming one no longer found
  *   fails (a serialization failure), as does one adding a table file
- *   (add_table_file()) whose transaction began before the swap.
+ *   (add_table_file()) whose transaction began before the swap, or while
+ *   a collection runs (it would wait for the swap, and the collection for
+ *   it).  A chunk has() finds while a collection runs, or that put() finds
+ *   stored already, the transaction may name without putting it: one the
+ *   collection collects is kept by it (in its keep set, which gc_kept()
+ *   visits), so a tree that writes a node again (a refs leaf as it was
+ *   before a branch made since was deleted) names one that stays.
  * - keep() is told of a chunk a transaction names from outside the store
  *   (a hash pointer it writes into a table) without appending it: a
  *   collection keeps it if it runs then, or begins before the transaction

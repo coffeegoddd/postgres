@@ -702,6 +702,26 @@ after it, is done whole, unless it is at the array's end (an element
 appended, the last one removed).  Folded format 22 is the first whose rows hold JSON
 trees.
 
+A collection of the chunk store never frees a chunk a running
+transaction may still name.  A transaction may build on the root as it
+read it while other transactions move the root on: a commit's refs
+changes are built on the refs as it last read them, and the trees it
+rebuilds them with name chunks that root reaches, which may be garbage by
+the collection's seal.  So the collection, once it has sealed the journal
+(and forgotten the folds the refs know of), waits for every transaction
+running then to end before it marks what is new; each transaction still
+running read the root as of the seal or a later one.  A transaction that
+finds a chunk stored and doesn't write it again (a tree's node that the
+store has, as a refs leaf is again once a branch made since is deleted;
+a pending chunk the store holds) names it without appending it: while a
+collection runs, the chunk store adds each such chunk the collection
+collects to its keep set, so it is kept.  A transaction adding table files
+(a transfer's) while a collection runs is refused at once (a serialization
+failure, as it would be after the swap) rather than wait for the
+collection, which waits for it.  pg_stat_prolly's gc_collections counts the
+collections; one that waits for a long transaction delays its swap, not
+the transaction.
+
 A hash pointer a read hands out (a long value of history, read or not)
 names chunks a collection may drop: the chunk store's keep() is told of
 it, and a collection keeps the chunk or waits for the transaction, read
