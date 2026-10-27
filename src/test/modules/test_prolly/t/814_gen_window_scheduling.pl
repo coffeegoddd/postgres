@@ -67,19 +67,29 @@ my $b3 = sql(qq{SELECT f.bytes FROM test_chunk_table_files() f
 is($lo, $g3, 'with too small a budget for that run, the wanted one alone');
 ok($g3 <= $hi, 'it is chosen');
 
-# a retire wanted while another backend holds the severs' turn: held off,
-# then, once prolly.history_collect_interval has passed, not
+# a retire wanted while another backend severs (the severs' turn taken,
+# the refs written, as a sever's records write them): held off, the
+# answer given at once, nothing written that would wait for the sever's
+# transaction; then, once prolly.history_collect_interval has passed since
+# the retire was wanted, not held off
 # (delete mode: no archive's confirmation limits what a retire takes)
 sql(q{ALTER DATABASE gw SET prolly.history_window_action = delete;
 	ALTER DATABASE gw SET prolly.history_collect_interval = '1s'});
-sql(qq{SELECT test_window_config_set('history_window.retire_wanted', $g3 + 1)});
+sql(qq{SELECT test_window_config_set('history_window.retire_wanted', $g3 + 1);
+	SELECT test_window_config_set('history_window.retire_wanted_at',
+		(extract(epoch FROM now() - '2000-01-01 00:00:00+00'::timestamptz) * 1000000)::int8)});
 my $sever = $node->background_psql('gw');
-$sever->query_safe(q{BEGIN; SELECT test_hold_sever_turn()});
-is(sql(q{SELECT max_hi FROM test_window_retire_due()}), '0',
-	'a retire is held off while another severs');
+$sever->query_safe(q{BEGIN; SELECT test_hold_sever_turn();
+	SELECT test_window_config_set('history_window.test_sever_wrote', 1)});
+my $due = q{SET statement_timeout = '5s';
+	SELECT coalesce(max_hi::text, 'none') FROM test_window_retire_due()};
+my ($ret, $out, $err) = $node->psql('gw', $due);
+is($ret, 0, 'asked while another severs, the window answers at once') or diag($err);
+is($out, '0', 'a retire is held off while another severs');
 usleep(1_500_000);
-is(sql(q{SELECT coalesce(max_hi::text, 'none') FROM test_window_retire_due()}),
-	'none', 'not past prolly.history_collect_interval');
+($ret, $out, $err) = $node->psql('gw', $due);
+is($ret, 0, 'and again') or diag($err);
+is($out, 'none', 'not past prolly.history_collect_interval');
 $sever->query_safe(q{COMMIT});
 $sever->quit;
 is(sql(q{SELECT coalesce(max_hi::text, 'none') FROM test_window_retire_due()}),
@@ -109,6 +119,7 @@ $node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity
   or die 'autovacuum did not stop';
 sql(q{SELECT injection_points_detach('prolly-gc-retire-begin')});
 my $log = slurp_file($node->logfile, $offset);
+
 unlike($log, qr/automatic retire of generations \d+ to \d+ of database "gw" failed/,
 	'the cancel isn\'t taken for the retire\'s failure');
 like($log, qr/canceling/, 'it ends the visit');

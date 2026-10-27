@@ -3891,7 +3891,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 #define RETIRE_WANTED_SETTING "history_window.retire_wanted"
 #define RETIRE_FAILURES_SETTING "history_window.retire_failures"
 #define RETIRE_RETRY_SETTING "history_window.retire_retry_at"
-#define RETIRE_SEVER_WAIT_SETTING "history_window.retire_sever_wait_since"
+#define RETIRE_WANTED_AT_SETTING "history_window.retire_wanted_at"
 
 /* Background retires that fail this many times in a row: a full collection. */
 #define RETIRE_FAILURES_MOST	3
@@ -4266,9 +4266,15 @@ archive_maintain(void)
 	 * is the whole store's)
 	 */
 	if (r.fragment > 0 && retires())
+	{
 		config_int_set(RETIRE_WANTED_SETTING,
 					   Max(config_int(RETIRE_WANTED_SETTING, 0),
 						   (int64) last_top_epoch + 1), false);
+		/* (since when, for how long another's sever may hold it off) */
+		if (config_int(RETIRE_WANTED_AT_SETTING, 0) == 0)
+			config_int_set(RETIRE_WANTED_AT_SETTING, GetCurrentTimestamp(),
+						   false);
+	}
 	else if (r.fragment > 0)
 		config_int_set(FULL_WANTED_SETTING, 1, false);
 	if (want_full)
@@ -4305,32 +4311,25 @@ sever_running(void)
 }
 
 /*
- * Is a retire held off for another backend's sever?  Only for so long:
- * from the first visit that found one severing, until
- * prolly.history_collect_interval (an hour where unset) has passed, after
- * which the retire runs all the same and waits for the sever's
- * transaction, so severs that keep the turn taken don't hold a wanted
- * retire off for good.  (Asked only while one is wanted: the note is a
- * write.)
+ * Is a retire held off for another backend's sever?  Only for so long: until
+ * prolly.history_collect_interval (an hour where unset) has passed since
+ * the retire was wanted (noted with the want, by the sever that made the
+ * fragment), after which the retire runs all the same and waits for the
+ * sever's transaction, so severs that keep the turn taken don't hold a
+ * wanted retire off for good.  Nothing is written here: a write of the
+ * refs would wait for the running sever's transaction, which holds them
+ * until it commits, an archive's transfer and all.  (A want with no time
+ * noted is held off.)
  */
 static bool
 sever_held_off(void)
 {
-	TimestampTz now = GetCurrentTimestamp();
 	int64		since;
 
 	if (!sever_running())
-	{
-		config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
 		return false;
-	}
-	since = config_int(RETIRE_SEVER_WAIT_SETTING, 0);
-	if (since == 0)
-	{
-		config_int_set(RETIRE_SEVER_WAIT_SETTING, now, false);
-		return true;
-	}
-	return now - since < collect_interval();
+	since = config_int(RETIRE_WANTED_AT_SETTING, 0);
+	return since == 0 || GetCurrentTimestamp() - since < collect_interval();
 }
 
 /* Does the database's reclamation retire generations, as it chooses them? */
@@ -4423,7 +4422,7 @@ archive_retired(void)
 	config_int_set(RETIRE_WANTED_SETTING, 0, true);
 	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
 	config_int_set(RETIRE_RETRY_SETTING, 0, true);
-	config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
+	config_int_set(RETIRE_WANTED_AT_SETTING, 0, true);
 	config_int_set(MEASURED_SETTING, (int64) bytes, false);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
@@ -4532,7 +4531,7 @@ archive_collected(void)
 	config_int_set(RETIRE_WANTED_SETTING, 0, true);
 	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
 	config_int_set(RETIRE_RETRY_SETTING, 0, true);
-	config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
+	config_int_set(RETIRE_WANTED_AT_SETTING, 0, true);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
 		config_int_set(OVER_COUNT_SETTING,
