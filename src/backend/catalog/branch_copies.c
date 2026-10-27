@@ -95,6 +95,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1921,14 +1922,15 @@ taking_add(Taking *t, RelFileLocator loc, BranchKeptRelation *k)
 }
 
 static void
-taking_end(Taking *t)
+taking_end(Taking *t, uint64 *pages)
 {
 	uint64	   *ids = palloc0_array(uint64, Max(t->n, 1));
+	uint32	   *owned = palloc0_array(uint32, Max(t->n, 1));
 
 	/* (those taken noted even if a later one fails: to be let go of) */
 	PG_TRY();
 	{
-		bmap_root_capture_many(t->rels, t->n, ids);
+		bmap_root_capture_many(t->rels, t->n, ids, owned);
 	}
 	PG_FINALLY();
 	{
@@ -1940,7 +1942,11 @@ taking_end(Taking *t)
 	}
 	PG_END_TRY();
 	for (int i = 0; i < t->n; i++)
+	{
 		t->into[i]->snapshot = ids[i];
+		*pages += owned[i];
+	}
+	pfree(owned);
 	pfree(ids);
 	pfree(t->rels);
 	pfree(t->into);
@@ -2011,7 +2017,8 @@ pages_to_freeze(BlockNumber *blknos, uint32 n, const BranchKeptRelation *base,
  * root base_root (0: an empty one) nblocks long, temporary storage dropped
  * as the transaction ends, made a root of, as of c's storage, its pages
  * changed since told by live_epoch.  Each page copied is logged as an
- * image once.  Those whose freezing was undecided are recorded in k.
+ * image once, by the capture.  Those whose freezing was undecided are
+ * recorded in k.
  */
 static void
 freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos,
@@ -2036,6 +2043,7 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 	else
 		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
 										  SMGR_BMAP);
+	INJECTION_POINT("branch-keep-frozen-copy-made", NULL);
 	if (smgrnblocks(tsrel, MAIN_FORKNUM) > nblocks)
 		RelationTruncateStorage(tsrel, nblocks);
 	else if (smgrnblocks(tsrel, MAIN_FORKNUM) < nblocks)
@@ -2044,7 +2052,12 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 										  EB_SKIP_EXTENSION_LOCK | EB_CLEAR_SIZE_CACHE, nblocks,
 										  RBM_ZERO_ON_ERROR));
 
-	/* each page: frozen, and the copy's (a new block of its own) */
+	/*
+	 * each page changed: frozen, and the copy's (a new block of its own),
+	 * logged by the capture, as images of the blocks the root holds: the
+	 * copy's map may be gone when its records are replayed
+	 * (bmap_root_capture_of())
+	 */
 	for (uint32 i = 0; i < n; i++)
 	{
 		Buffer		buf;
@@ -2065,19 +2078,15 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 		}
 		buf = ReadBufferWithoutRelcache(tloc, MAIN_FORKNUM, blknos[i],
 										RBM_ZERO_AND_LOCK, NULL, true);
-		START_CRIT_SECTION();
 		memcpy(BufferGetPage(buf), copy.data, BLCKSZ);
 		MarkBufferDirty(buf);
-		if (!PageIsNew(BufferGetPage(buf)))
-			log_newpage_buffer(buf, true);
-		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
-	k->snapshot = bmap_root_capture_logged(tsrel, c->relfilenode, live_epoch);
+	k->snapshot = bmap_root_capture_of(tsrel, c->relfilenode, live_epoch);
 	note_taken(live, k->snapshot);
 	k->frozenxid = FrozenTransactionId;
 	k->minmxid = InvalidMultiXactId;
@@ -2119,7 +2128,8 @@ frozen_base(Form_pg_class c, SMgrRelation lsrel, const BranchKeptRelation *p,
 static void
 keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 			const BranchKeptRelation *prior, int nprior,
-			BranchFreezePage freeze, const ProllyRootSnapshot *as_of)
+			BranchFreezePage freeze, const ProllyRootSnapshot *as_of,
+			uint64 *pages)
 {
 	RelFileLocator live = class_locator(c, c->relfilenode);
 	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
@@ -2169,6 +2179,7 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 	live_epoch = bmap_raise_epoch(lsrel);
 	freeze_into_root(c, live, all, n, nblocks, base_root, freeze, as_of,
 					 live_epoch, k);
+	*pages += n;
 	pfree(all);
 }
 
@@ -2183,7 +2194,7 @@ static bool
 freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 			   BranchKeptRelation *k, const BranchKeptRelation *prior,
 			   int nprior, BranchFreezePage freeze,
-			   const ProllyRootSnapshot *as_of, bool *made)
+			   const ProllyRootSnapshot *as_of, bool *made, uint64 *pages)
 {
 	RelFileLocator live = class_locator(c, c->relfilenode);
 	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
@@ -2239,6 +2250,7 @@ freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 	{
 		freeze_into_root(c, sloc, all, n, nblocks,
 						 base ? base->snapshot : 0, freeze, as_of, u_epoch, k);
+		*pages += n;
 		*made = true;
 	}
 	k->flags = BRANCH_KEPT_CONCURRENT;
@@ -2320,7 +2332,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			BranchKeptRelation *kept, const BranchKeptRelation *release,
 			int nrelease, bool (*settled) (void *arg), void *arg,
 			BranchFreezePage freeze, const ProllyRootSnapshot *as_of,
-			bool concurrent)
+			bool concurrent, uint64 *pages)
 {
 	Relation	pg_class;
 	List	   *rows = NIL;
@@ -2331,6 +2343,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 	LOCKMODE	mode = concurrent ? ShareUpdateExclusiveLock : ShareLock;
 
 	Assert(!concurrent || freeze == NULL);
+	*pages = 0;
 	let_go_of_abandoned();
 	if (relids == NIL)
 		return true;
@@ -2372,7 +2385,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			k->relid = c->oid;
 			if (freeze && heap_format(c))
 			{
-				keep_frozen(c, k, prior, nprior, freeze, as_of);
+				keep_frozen(c, k, prior, nprior, freeze, as_of, pages);
 				continue;
 			}
 
@@ -2408,7 +2421,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 		if (ok && concurrent)
 			ok = taking_end_concurrent(&taking, is_index);
 		else if (ok)
-			taking_end(&taking);
+			taking_end(&taking, pages);
 
 		/*
 		 * (let go of with the relations held against a copy made of kept
@@ -2436,7 +2449,7 @@ static bool
 copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				   BranchKeptRelation *frozen, const BranchKeptRelation *prior,
 				   int nprior, BranchFreezePage freeze,
-				   const ProllyRootSnapshot *as_of)
+				   const ProllyRootSnapshot *as_of, uint64 *pages)
 {
 	List	   *relids = NIL;
 	Relation	pg_class;
@@ -2472,7 +2485,7 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				ok = false;
 			else if (heap_format(c) && (kept[i].flags & BRANCH_KEPT_UNFROZEN))
 				ok = freeze_root_of(c, &kept[i], &frozen[i], prior, nprior,
-									freeze, as_of, &made[i]);
+									freeze, as_of, &made[i], pages);
 			else
 			{
 				frozen[i] = kept[i];

@@ -10,7 +10,7 @@
 CREATE DATABASE regress_spread_moves;
 -- (the move planner's sources, not pages kept as of the head, which come
 -- before them and move nothing: first_use_kept tests those)
-ALTER DATABASE regress_spread_moves SET prolly.kept_commits = 0;
+ALTER DATABASE regress_spread_moves SET debug_prolly_page_roots = off;
 \c regress_spread_moves
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -146,7 +146,7 @@ DROP DATABASE regress_spread_moves;
 -- rows from the head, main 100: main's copies are moved, its 100 rows
 -- written.
 CREATE DATABASE regress_source_margin;
-ALTER DATABASE regress_source_margin SET prolly.kept_commits = 0;
+ALTER DATABASE regress_source_margin SET debug_prolly_page_roots = off;
 \c regress_source_margin
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

@@ -124,6 +124,21 @@ ok($node->poll_query_until('mv', "SELECT ($files) = 2"),
 is(sql(qq{SELECT count(*) FROM test_chunk_table_files() WHERE name = '$first'}), '1',
 	'the table file moved before isn\'t rewritten');
 
+# A move frees nothing, so it waits for no transaction open as it begins
+# before its swap (a collection would): its chunks move to a table file
+# with one left open (its retire still waits for it, as any does).
+my $moved = sql($files);
+my $open = $node->background_psql('mv');
+$open->query_safe(q{BEGIN; SELECT test_chunk_has('00')});
+reload_settings('autovacuum = off');
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 'o', 100000)))
+	FROM generate_series(1, 20) g});
+reload_settings('autovacuum = on');
+ok($node->poll_query_until('mv', "SELECT ($files) > $moved"),
+	'a move swaps with a transaction left open');
+$open->query_safe('COMMIT');
+$open->quit;
+
 # With the threshold -1, it doesn't move.
 reload_settings('prolly.journal_move_threshold = -1');
 my $before = sql($files);

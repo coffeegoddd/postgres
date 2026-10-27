@@ -768,8 +768,8 @@ typedef struct ProllyRefsRoutine
 								ProllyHash *commit_id);
 
 	/*
-	 * Optional: visit the commits branch name's pages are kept as of (see
-	 * prolly.kept_commits), newest first; not those retired.  What is
+	 * Optional: visit the commits branch name's pages are kept as of (the
+	 * root retention keeps them), newest first; not those retired.  What is
 	 * visited is the refs' as this transaction reads them.
 	 */
 	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
@@ -980,6 +980,29 @@ typedef struct ProllyRefsRoutine
 	void		(*unfrozen_branches) (void (*visit) (const char *name, void *arg),
 									  void *arg);
 	int			(*freeze_kept) (void);
+
+	/*
+	 * Optional: a retention pass of branch name's kept commits now (as a
+	 * commit's keep runs one when the root retention says one is due):
+	 * those the root retention retires, from the oldest, retired.  The
+	 * branch's lock is taken.
+	 */
+	void		(*retain_roots) (const char *name);
+
+	/*
+	 * Optional: visit branch name's kept commit commit, as kept_commits()
+	 * would, if the branch keeps its pages as of it (a seek).
+	 */
+	void		(*kept_commit) (const char *name, const ProllyHash *commit,
+								ProllyKeptCommitVisit visit, void *arg);
+
+	/*
+	 * Optional: commit is severed (past the history horizon): every
+	 * branch's kept commit of it retired, its root let go of by the
+	 * branch's next keep, and its commit and trees no longer kept from
+	 * collection.  The caller holds every ref.
+	 */
+	void		(*forget_kept) (const ProllyHash *commit);
 } ProllyRefsRoutine;
 
 /*
@@ -992,11 +1015,10 @@ typedef void (*ProllyRefsEndHook) (bool prepare);
 extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 
 /*
- * prolly.kept_commits: how many commits each branch's pages are kept as of,
- * the last it was at (0: none), for a move back to one to give the pages
- * back rather than write rows.
+ * debug_prolly_page_roots: whether commits keep their pages by roots at
+ * all (off, for testing the moves that write rows, none are kept).
  */
-extern PGDLLIMPORT int prolly_kept_commits;
+extern PGDLLIMPORT bool debug_prolly_page_roots;
 extern PGDLLIMPORT int prolly_root_interval;
 extern PGDLLIMPORT int prolly_root_interval_commits;
 extern PGDLLIMPORT bool prolly_freeze_roots;
@@ -1046,9 +1068,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
-	"unfrozen_branches", "freeze_kept"
+	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK freeze_kept
+#define PROLLY_REFS_LAST_CALLBACK forget_kept
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

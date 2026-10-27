@@ -34,7 +34,6 @@ teardown
 session s1
 setup
 {
-	SET prolly.kept_commits = 8;
 	SET prolly.restore_min_changes = 0;
 	SET prolly.root_interval = 0;
 	SET dolt.transaction_commit = on;

@@ -9828,8 +9828,8 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
  * The slot names the capturing (sub)transaction.  Returns the root's id.
  */
 static BmapRootId
-root_capture_slot(SMgrRelation reln, BlockList *own, bool logged,
-				  bool concurrent, RelFileNumber of, uint32 live_epoch)
+root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
+				  RelFileNumber of, uint32 live_epoch)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -9869,25 +9869,14 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool logged,
 	refs_cover(rel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	if (logged)
+	headerbuf = preserve_header_lock_ext(reln, own, concurrent);
+	if (!BufferIsValid(headerbuf))
 	{
-		/* (its own pages each logged as an image since their last change) */
-		headerbuf = map_read(rel, 0);
-		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
-		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel,
-				   BMAP_FORKNUM, 0);
-	}
-	else
-	{
-		headerbuf = preserve_header_lock_ext(reln, own, concurrent);
-		if (!BufferIsValid(headerbuf))
-		{
-			LockRelease(&sweeptag, ShareLock, false);
-			return 0;
-		}
+		LockRelease(&sweeptag, ShareLock, false);
+		return 0;
 	}
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
-	if (own->n > 0 || logged)
+	if (own->n > 0)
 		store_flush_begin(rel);
 
 	/* the root page's pointers, which the root takes */
@@ -9995,7 +9984,7 @@ bmap_root_capture(SMgrRelation reln)
 {
 	BmapRootId	id;
 
-	bmap_root_capture_many(&reln, 1, &id);
+	bmap_root_capture_many(&reln, 1, &id, NULL);
 	return id;
 }
 
@@ -10003,10 +9992,14 @@ bmap_root_capture(SMgrRelation reln)
  * bmap_root_capture() of each of rels[] (n of them), their ids into ids[],
  * the generation of sharing raised once for them all.  Each id is set as
  * its root is captured (the others 0), so that, if one fails, the caller
- * knows of those captured already, which an abort lets go of.
+ * knows of those captured already, which an abort lets go of.  owned (if
+ * not NULL) gets each one's own pages then, those no root held before
+ * (changed since the last capture, or new): what a later change of them
+ * keeps for the root alone.
  */
 void
-bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
+bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
+					   uint32 *owned)
 {
 	BlockList  *own = palloc0_array(BlockList, Max(n, 1));
 
@@ -10014,8 +10007,10 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 		ids[i] = 0;
 	for (int i = 0; i < n; i++)
 	{
-		ids[i] = root_capture_slot(rels[i], &own[i], false, false,
+		ids[i] = root_capture_slot(rels[i], &own[i], false,
 								   InvalidRelFileNumber, 0);
+		if (owned)
+			owned[i] = own[i].n;
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
 	}
 	for (int i = 0; i < n; i++)
@@ -10053,7 +10048,7 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
 		ids[i] = 0;
 	for (int i = 0; i < n && ok; i++)
 	{
-		ids[i] = root_capture_slot(rels[i], &own[i], false, true,
+		ids[i] = root_capture_slot(rels[i], &own[i], true,
 								   InvalidRelFileNumber, 0);
 		ok = ids[i] != 0;
 		if (ok)
@@ -10082,21 +10077,30 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
 
 /*
  * A root of reln (a copy of relation 'of' whose pages were frozen into it),
- * capture as bmap_root_capture() does, but its own pages each logged as an
- * image since their last change (log_newpage()), so none again: they are
- * written out, which the record's redo does too.  The root is recorded as
- * of relation 'of', its pages changed since told by epoch 'live_epoch'
- * there (bmap_root_since()).
+ * captured as bmap_root_capture() does, recorded as of relation 'of', its
+ * pages changed since told by epoch 'live_epoch' there (bmap_root_since()).
+ *
+ * The copy is temporary storage, dropped once the root is captured, so its
+ * pages are logged as bmap_root_capture() logs a relation's own (the
+ * preserve walk's images, which name their physical blocks), not as the
+ * copy's logical blocks: crash recovery whose redo begins after the copy
+ * was made, and so finds no map for it, replays its records onto nothing
+ * the root holds, while still zeroing the page store's blocks the copy was
+ * extended by; only an image of the physical block, logged after, restores
+ * them.
  */
 BmapRootId
-bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
+bmap_root_capture_of(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
 {
 	BlockList	own = {0};
-	BmapRootId	id = root_capture_slot(reln, &own, true, false, of, live_epoch);
+	BmapRootId	id = root_capture_slot(reln, &own, false, of, live_epoch);
 
 	MarkRelationPagesShared(reln->smgr_rlocator.locator);
-	FlushRelationsAllBuffers(&reln, 1);
-	store_flush_end(reln->smgr_rlocator.locator, false);
+	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
+	if (own.n > 0)
+		store_flush_end(reln->smgr_rlocator.locator, false);
+	if (own.blocks)
+		pfree(own.blocks);
 	INJECTION_POINT("bmap-roots-captured", NULL);
 	return id;
 }
@@ -10606,9 +10610,9 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
  * relation's pages changed since a root, found by their entries' epochs
  * (bmap_changed_pages()); the map's epoch raised, so each page's next change
  * marks it changed again (bmap_raise_epoch()); and a root captured of a copy
- * whose own pages were each logged as an image since their last change,
- * logging none again (bmap_root_capture_logged()), recorded as of the
- * relation it froze and the epoch its next changes are told by.
+ * holding the frozen pages, its own pages logged as images of their
+ * physical blocks (bmap_root_capture_of()), recorded as of the relation it
+ * froze and the epoch its next changes are told by.
  */
 
 typedef struct ChangedWalk

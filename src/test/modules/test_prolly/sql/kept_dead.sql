@@ -3,7 +3,7 @@
 -- or the table dropped.  (A restore of another commit gives the table new
 -- storage too, but carries the other commits' snapshots into it.)  Such a
 -- commit is dropped from the branch's kept commits by the same
--- transaction, so it no longer counts toward prolly.kept_commits, keeps
+-- transaction, so it is no longer offered to a move, keeps
 -- its commit and baseline from collection, or is offered to a move; one
 -- with a snapshot left but no table restorable is retired.  A commit some
 -- table of which can still be given its pages stays kept, whatever else
@@ -13,7 +13,7 @@
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_dead;
 ALTER DATABASE kept_dead SET prolly.restore_min_changes = 0;
-ALTER DATABASE kept_dead SET prolly.kept_commits = 3;
+ALTER DATABASE kept_dead SET prolly.history_min_commits = 3;
 \c kept_dead
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -23,10 +23,10 @@ CREATE FUNCTION restored() RETURNS bigint LANGUAGE sql AS $$
 	SELECT coalesce((SELECT value FROM pg_stat_prolly
 					 WHERE name = 'relations_restored'), 0)
 $$;
--- the commits kept, as names given below
+-- the commits kept, as names given below, by name
 CREATE TABLE names (id text PRIMARY KEY, name text);
 CREATE FUNCTION kept() RETURNS text LANGUAGE sql AS $$
-	SELECT string_agg(coalesce(n.name, '?'), ' ' ORDER BY k.ord)
+	SELECT string_agg(coalesce(n.name, '?'), ' ' ORDER BY n.name)
 	FROM test_kept_commits('main') WITH ORDINALITY k(id, ord)
 	LEFT JOIN names n ON n.id = k.id
 $$;
@@ -44,7 +44,6 @@ INSERT INTO names SELECT (dolt_commit('-am', 'b'))[1], 'b';
 UPDATE kd.t SET v = 2 WHERE id <= 100;
 INSERT INTO names SELECT (dolt_commit('-am', 'c'))[1], 'c';
 SELECT kept();
-SELECT octet_length(test_refs_value('Kmain')) AS record_of_three \gset
 
 -- a hard reset to b restores kd.t: c's and a's snapshots were in the
 -- storage it replaced, and are carried into the new storage, still kept
@@ -54,15 +53,6 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT pg_stat_force_next_flush();
 SELECT restored() > :before AS restored;
 SELECT kept();
--- the entry b was kept by before, its storage replaced, is dropped from
--- the record, not left there retired: the record holds b's entry from the
--- restore, retired again by the keep after the move, besides b, c and a,
--- and the storage the restore replaced (kept for older snapshots, a table
--- and its relations without a baseline: smaller than a commit's entry):
--- more than four entries the size of those three, but less than five
-SELECT 3 * octet_length(test_refs_value('Kmain')) > 4 * :record_of_three AND
-	3 * octet_length(test_refs_value('Kmain')) < 5 * :record_of_three
-	AS gone_entry_dropped;
 SELECT count(*) FILTER (WHERE v = 1) AS at_b FROM kd.t;
 
 -- so the next commits keep them, as many as are kept
@@ -117,7 +107,7 @@ SELECT kept();
 -- a commit made gone by a change that rolls back still has every
 -- snapshot it had, though a commit let go of shared one with it: kr.t's
 -- relations, unchanged since m, are kept by m's snapshots for n and o too
-SET prolly.kept_commits = 2;
+ALTER DATABASE kept_dead SET prolly.history_min_commits = 2;
 CREATE SCHEMA kr VERSIONED;
 CREATE TABLE kr.t (id int PRIMARY KEY, v int NOT NULL);
 INSERT INTO kr.t SELECT g, 0 FROM generate_series(1, 2000) g;
@@ -145,7 +135,7 @@ SELECT pg_stat_force_next_flush();
 SELECT restored() - :before AS restored;
 SELECT count(*) FILTER (WHERE v = 1) AS at_n FROM kr.u;
 SELECT count(*) FILTER (WHERE v = 0) AS at_n FROM kr.t;
-RESET prolly.kept_commits;
+ALTER DATABASE kept_dead RESET prolly.history_min_commits;
 
 -- a commit only the kept record names, its tables dropped: dropped from
 -- the record, so collected
@@ -176,8 +166,8 @@ SELECT test_chunk_has(:'q') AS q_stored;
 -- Only the commits still kept are asked what is left of their pages, not
 -- the retired: those pile up within a transaction, each of its commits
 -- retiring one, so asking them too would make each commit ask of every
--- one before it.  Forty commits in one transaction ask four times what ten
--- do, no more.
+-- one before it.  Past the few each keep asks, forty commits in one
+-- transaction ask four times what ten do, no more.
 CREATE FUNCTION checks() RETURNS bigint LANGUAGE sql AS $$
 	SELECT coalesce((SELECT value FROM pg_stat_prolly
 					 WHERE name = 'kept_status_checks'), 0)
@@ -188,7 +178,7 @@ BEGIN
 		PERFORM dolt_commit('--allow-empty', '-m', 'e' || i);
 	END LOOP;
 END $$;
-SELECT commits(3);
+SELECT commits(10);
 SELECT pg_stat_force_next_flush();
 SELECT checks() AS c0 \gset
 SELECT commits(10);

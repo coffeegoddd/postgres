@@ -6,7 +6,7 @@ CREATE DATABASE regress_branch_maps;
 -- (a copy of the source's storage, not of pages kept as of the commit:
 -- VACUUM (FREEZE) after it copies the kept pages it freezes, and a copy
 -- of the kept ones has no map true of them; first_use_kept tests those)
-ALTER DATABASE regress_branch_maps SET prolly.kept_commits = 0;
+ALTER DATABASE regress_branch_maps SET debug_prolly_page_roots = off;
 \c regress_branch_maps
 CREATE SCHEMA bm VERSIONED;
 CREATE TABLE bm.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);

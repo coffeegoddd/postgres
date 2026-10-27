@@ -235,11 +235,25 @@ SELECT dolt_commit('--allow-empty', '-m', 'empty') IS NOT NULL AS committed;
  t
 (1 row)
 
--- (a no longer kept: its rows written, then kept with the empty commit)
+-- (c's root let go of once a reset leaves it out of the window, the empty
+-- commit's kept by a tag, and a's and b's in the window, three commits)
+SELECT dolt_tag('empty', 'HEAD');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+ALTER DATABASE kept_carried SET prolly.history_min_commits = 3;
 SELECT dolt_reset('--hard', :'a');
  dolt_reset 
 ------------
  {0}
+(1 row)
+
+SELECT test_retain_roots('main');
+ test_retain_roots 
+-------------------
+ 
 (1 row)
 
 SELECT count(*) AS kept FROM test_kept_commits('main');
@@ -278,7 +292,7 @@ SELECT counted('move_tables_shared') > :sh AS shared,
 SELECT count(*) AS kept FROM test_kept_commits('main');
  kept 
 ------
-    2
+    3
 (1 row)
 
 UPDATE kc.t SET v = v + 10 WHERE id % 7 = 3;
@@ -309,6 +323,7 @@ SELECT counted('relations_restored') > :r AS restored,
  t        |       0 | t    | t
 (1 row)
 
+ALTER DATABASE kept_carried RESET prolly.history_min_commits;
 -- every block the stores hold is held by a map or a snapshot kept
 SELECT dolt_commit('--allow-empty', '-m', 'settled') IS NOT NULL AS committed;
  committed 

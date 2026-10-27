@@ -59,6 +59,7 @@ static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_COMMIT_CACHE] = "shared",
 	[PROLLY_IFACE_HISTORY_WINDOW] = "archive",
 	[PROLLY_IFACE_ROOT_FREEZER] = "capture",
+	[PROLLY_IFACE_ROOT_RETENTION] = "window",
 };
 
 static const ProllyImplInfo *
@@ -450,6 +451,8 @@ prolly_database_components(ProllyDatabaseComponents *components)
 	components->history_window = (const ProllyWindowRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_HISTORY_WINDOW);
 	components->root_freezer = root_freezer();
+	components->root_retention = (const ProllyRootRetentionRoutine *)
+		profile_impl(copies_profile, PROLLY_IFACE_ROOT_RETENTION);
 }
 
 /* A data tree value's references: its row's. */
