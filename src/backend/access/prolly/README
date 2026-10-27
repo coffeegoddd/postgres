@@ -1485,7 +1485,18 @@ RelationLocksNoWait through it; a lock not free at once rolls the fold
 back, to be made again): it keeps its locks on the change logs it
 consumed past its lock on their tables, so a DROP of several tables,
 holding them and waiting for one's log, would deadlock with a fold
-waiting for the next table.  Autovacuum's
+waiting for the next table.  The worker's transactions are read
+committed, whatever default_transaction_isolation says, as autovacuum's
+are, and predicate locking passes them over
+(PredicateLockingPassOverBackend()): a fold writes for as long as it
+reads, and its xid, running all the while, would otherwise hold down the
+xmin of every serializable transaction begun meanwhile, keeping each one
+that commits, its predicate locks and rw-conflicts with it, until the fold
+ends; under a busy serializable workload the rw-conflict pool runs out.
+The launcher, and autovacuum's launcher and workers (whose automatic
+folds, collections and sweeps write in long transactions too), are passed
+over the same way; their transactions are read committed already.
+Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.

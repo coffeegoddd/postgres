@@ -171,6 +171,12 @@ typedef struct PredXactListData
 												 * seq no */
 	SERIALIZABLEXACT *OldCommittedSxact;	/* shared copy of dummy sxact */
 
+	/*
+	 * How many xids the passed-over array holds (see predicate.c).  Protected
+	 * by SerializableXactHashLock.
+	 */
+	int			passedOverXidCount;
+
 	SERIALIZABLEXACT *element;
 }			PredXactListData;
 
