@@ -74,3 +74,61 @@ SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
 
 \c :home
 DROP DATABASE regress_generations_repair;
+
+-- Two fragments severed one after the other, a tree brought back, then
+-- the newer repaired alone, a full collection, and the older: the newer's
+-- chunks name the older's top, which isn't here as they are settled.
+-- They list it by the generation its fragment says it goes back to, and
+-- its repair puts it there.
+SELECT 'file://' || :'dir' || '/' || txid_current() || '_two' AS url2 \gset
+CREATE DATABASE regress_generations_repair2;
+\c regress_generations_repair2
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gr VERSIONED;
+CREATE TABLE gr.t (id int PRIMARY KEY, v text);
+CREATE TABLE gr_snap (id int, v text);
+CREATE FUNCTION gr_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+INSERT INTO gr.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(gr_commit('d1', 1)) AS committed;
+UPDATE gr.t SET v = 'd2' WHERE id % 4 = 0;
+SELECT length(gr_commit('d2', 2)) AS committed;
+INSERT INTO gr_snap SELECT * FROM gr.t;
+UPDATE gr.t SET v = 'd3' WHERE id % 4 = 1;
+SELECT length(gr_commit('d3', 3)) AS committed;
+UPDATE gr.t SET v = 'd4' WHERE id % 4 = 2;
+SELECT length(gr_commit('d4', 4)) AS committed;
+SELECT dolt_remote('add', 'origin', :'url2') IS NOT NULL AS added;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
+UPDATE gr.t SET v = 'd5' WHERE id % 4 = 3;
+SELECT length(gr_commit('d5', 5)) AS committed;
+UPDATE gr.t SET v = 'd6' WHERE id % 5 = 0;
+SELECT length(gr_commit('d6', 6)) AS committed;
+UPDATE gr.t SET v = 'd7' WHERE id % 5 = 1;
+SELECT length(gr_commit('d7', 7)) AS committed;
+UPDATE gr.t SET v = 'd8' WHERE id % 5 = 2;
+SELECT length(gr_commit('d8', 8)) AS committed;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+SELECT commits FROM dolt_history_drop('2020-01-03');
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+SELECT commits FROM dolt_history_drop('2020-01-05');
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+DELETE FROM gr.t;
+INSERT INTO gr.t SELECT * FROM gr_snap;
+SELECT length(gr_commit('back to d2', 9)) AS committed;
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
+SELECT dolt_history_repair('origin', 1) AS repaired;
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+SELECT dolt_history_repair('origin') AS repaired;
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT count(*) AS commits FROM dolt_log('main');
+SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
+
+\c :home
+DROP DATABASE regress_generations_repair2;
