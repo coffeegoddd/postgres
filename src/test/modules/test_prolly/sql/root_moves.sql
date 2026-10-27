@@ -144,10 +144,10 @@ RESET prolly.root_interval;
 RESET dolt.transaction_commit;
 
 -- a merge between the nearest root and the commit, with a dirty working
--- set: the move ends at the merge's rows, its other parent's included,
--- writing no more rows than the commits between changed (a root on the
--- other parent's side, the branch's, is found by the walk only when on
--- the first parents; here none pays, and the rows are written)
+-- set: the nearest root is restored and the move ends at the merge's
+-- rows, its other parent's included, writing no more rows than the
+-- commits between changed (a root on the other parent's side is found by
+-- the walk only when on the first parents)
 SET prolly.root_interval_commits = 100;
 SELECT dolt_branch('side');
 SELECT dolt_checkout('side');

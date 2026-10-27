@@ -595,6 +595,12 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	}
 
 	FirstSnapshotSet = true;
+
+	/*
+	 * (an imported or restored snapshot may be older than a move that gave
+	 * a relation new storage after its entry here was built: found again)
+	 */
+	RelationCacheRecheckReplaced();
 }
 
 /*

@@ -215,6 +215,18 @@ test_bmap_epoch(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(bmap_inspect_epoch(bmap_smgr(PG_GETARG_OID(0))));
 }
 
+/*
+ * test_bmap_exists(relnumber): whether block-mapped storage of that file
+ * number (in the database's tablespace) exists
+ */
+PG_FUNCTION_INFO_V1(test_bmap_exists);
+
+Datum
+test_bmap_exists(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(bmap_relation_exists(locator_of(PG_GETARG_OID(0))));
+}
+
 /* test_bmap_free_blocks(): the page store's count of free blocks */
 PG_FUNCTION_INFO_V1(test_bmap_free_blocks);
 

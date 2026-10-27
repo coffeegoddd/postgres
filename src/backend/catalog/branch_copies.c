@@ -1637,11 +1637,19 @@ note_taken(RelFileLocator locator, uint64 id)
 
 /*
  * Let go of root 'id' of the page store of storage locator, as the
- * transaction commits, if the store still holds it.
+ * transaction commits, if the store still holds it; or, for
+ * BRANCH_KEPT_STORAGE, of the storage itself, one a restore replaced and
+ * kept for older snapshots: dropped as the transaction commits.
  */
 static void
 let_go_of(RelFileLocator locator, uint64 id)
 {
+	if (id == BRANCH_KEPT_STORAGE)
+	{
+		if (bmap_relation_exists(locator))
+			RelationDropStorageByLocator(locator);
+		return;
+	}
 	if (id != 0)
 		(void) bmap_root_release(locator, id);
 }
@@ -1942,7 +1950,13 @@ carry_kept(Oid relid, RelFileLocator old, RelFileLocator dst,
 	{
 		const BranchKeptRelation *c = &carry[j];
 
-		if (c->relid != relid ||
+		/*
+		 * (storage a restore replaced, kept for older snapshots, is never
+		 * carried: it names the storage itself, and is dropped, not
+		 * renamed; a snapshot still reading it needs nothing of the new)
+		 */
+		Assert(c->snapshot != BRANCH_KEPT_STORAGE);
+		if (c->relid != relid || c->snapshot == BRANCH_KEPT_STORAGE ||
 			!RelFileLocatorEquals(kept_locator(c), old))
 			continue;
 		carried[j] = *c;
@@ -1958,7 +1972,7 @@ static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
 			   BranchKeptRelation *renewed, const BranchKeptRelation *carry,
 			   int ncarry, BranchKeptRelation *carried,
-			   BranchLockWait *wait)
+			   BranchKeptRelation *replaced, BranchLockWait *wait)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -1989,13 +2003,32 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	 * TRUNCATE locks it: one whose pages didn't change may still hold, in
 	 * its buffers, hints true of it as it is alone (an index entry dead
 	 * because its row is), which the storage keeping the pages never got.
+	 * A hard reset holds the locks already, queued for before it held the
+	 * refs (so that no other branch's operation waits behind it); any
+	 * other is tried, never queued for while the refs are held.  The rows
+	 * are read again once the locks are held: a writer waited for may have
+	 * changed them.
 	 */
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
-		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock,
-							   wait))
+		if (!CheckRelationOidLockedByMe(kept[i].relid, AccessExclusiveLock,
+										false) &&
+			!try_lock_relation(kept[i].relid, AccessExclusiveLock, wait))
 			ok = false;
 		changed[i] = true;
+	}
+	if (ok && any)
+	{
+		AcceptInvalidationMessages();
+		for (int i = 0; i < nkept && ok; i++)
+		{
+			if (rows[i])
+				heap_freetuple(rows[i]);
+			rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
+			if (rows[i] == NULL ||
+				!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
+				ok = false;
+		}
 	}
 
 	/*
@@ -2021,6 +2054,9 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		RelFileNumber relnumber;
 
 		renewed[i] = *k;
+		replaced[i] = *k;
+		replaced[i].relfilenumber = InvalidRelFileNumber;
+		replaced[i].snapshot = BRANCH_KEPT_STORAGE;
 		if (!changed[i])
 			continue;
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
@@ -2035,7 +2071,14 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		renewed[i].relfilenumber = relnumber;
 		carry_kept(k->relid, class_locator(oc, oc->relfilenode),
 				   class_locator(oc, relnumber), carry, ncarry, carried);
-		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
+
+		/*
+		 * (the storage replaced kept, not dropped: a snapshot older than the
+		 * move goes on reading it, and the caller lets go of it once none is
+		 * left)
+		 */
+		replaced[i].relfilenumber = oc->relfilenode;
+		replaced[i].tablespace = oc->reltablespace;
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
 			oc->relfrozenxid = k->frozenxid;
@@ -2195,6 +2238,22 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	}
 	pfree(rows);
 	return ok;
+}
+
+/* Did one of kept[] change since its root (see branch_ops.h)? */
+static bool
+copies_changed_since_kept(const BranchKeptRelation *kept, int nkept)
+{
+	for (int i = 0; i < nkept; i++)
+	{
+		RelFileLocator loc = kept_locator(&kept[i]);
+
+		if (bmap_relation_exists(loc) &&
+			!bmap_root_unchanged(smgropen(loc, INVALID_PROC_NUMBER),
+								 kept[i].snapshot))
+			return true;
+	}
+	return false;
 }
 
 static void
@@ -3109,6 +3168,7 @@ static const BranchOpsRoutine branch_copies = {
 	.restore = copies_restore,
 	.let_go = copies_let_go,
 	.kept_status = copies_kept_status,
+	.changed_since_kept = copies_changed_since_kept,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
 	.carry_statistics = copies_carry_statistics,
