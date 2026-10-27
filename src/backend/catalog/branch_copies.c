@@ -2105,9 +2105,9 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
-	k->snapshot = bmap_root_capture_of(tsrel, c->relfilenode, live_epoch,
-									   bmap_lineage(smgropen(live,
-															 INVALID_PROC_NUMBER)));
+	k->snapshot = bmap_root_capture_of(tsrel,
+									   smgropen(live, INVALID_PROC_NUMBER),
+									   live_epoch);
 	note_taken(live, k->snapshot);
 	k->frozenxid = FrozenTransactionId;
 	k->minmxid = InvalidMultiXactId;

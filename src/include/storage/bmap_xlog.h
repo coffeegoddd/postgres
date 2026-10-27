@@ -411,6 +411,8 @@ typedef struct xl_bmap_root
 								 * (0: snap.epoch) */
 	uint64		lineage;		/* of the map it was captured of (or of
 								 * relnumber's) */
+	uint64		live_map;		/* a frozen root's: relnumber's map's
+								 * identity (0: none) */
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */

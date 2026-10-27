@@ -48,12 +48,13 @@ SELECT pg_relation_size('big') / 8192 AS big_pages;
 -- transaction id advances)
 VACUUM ids;
 
--- a capture reads one page of slots, whatever the roots
+-- a capture reads a page of slots, or two (the one a full page's hint
+-- names, then the next), whatever the roots
 :flush
 SELECT mark();
 SELECT test_bmap_root_capture(:big) IS NOT NULL AS captured;
 :flush
-SELECT since('bmap_roots_pages_read') AS capture_pages_read;
+SELECT since('bmap_roots_pages_read') BETWEEN 1 AND 2 AS capture_pages_read_few;
 
 -- a release reads one, and its drain lets go of what the root alone held:
 -- the blocks of its page changed and of the tree's path to it, a few
@@ -124,7 +125,7 @@ BEGIN
 		EXECUTE format('INSERT INTO r%s VALUES (1)', i);
 	END LOOP;
 END $$;
-SELECT (slots / 63) AS slot_pages FROM test_bmap_roots() \gset
+SELECT (slots / 60) AS slot_pages FROM test_bmap_roots() \gset
 SELECT mark();
 SELECT freed >= 0 AS swept FROM prolly_page_sweep();
 :flush
