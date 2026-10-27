@@ -891,7 +891,10 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 	}
 
 	/* what tables name, once those who named a tree before have ended */
-	prolly_toast_roots(mark_root, &mk);
+	if (retire)
+		prolly_toast_roots_in(lo, hi, mark_root, &mk);
+	else
+		prolly_toast_roots(mark_root, &mk);
 
 	/*
 	 * What a logical slot, here or a standby's, may still decode: read as

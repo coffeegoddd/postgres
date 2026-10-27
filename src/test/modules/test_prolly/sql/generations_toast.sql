@@ -1,0 +1,34 @@
+-- A retire keeps what hash pointers on pages name in the generations it
+-- retires: a value stored out of line, settled, and named by no commit
+-- yet.  The page stores' roots are kept by generation beside the cached
+-- roots, so a retire reads, of the blocks unchanged since the last scan,
+-- only the roots of the generations it retires.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE DATABASE generations_toast_db;
+\c generations_toast_db
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gt VERSIONED;
+CREATE TABLE gt.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'empty')::text) > 0 AS committed;
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+
+-- The value, settled in a generation of its own, named only by the page.
+INSERT INTO gt.t SELECT 1, (SELECT string_agg(md5(i::text), '')
+	FROM generate_series(1, 200) i);
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+SELECT test_chunk_generation() AS gv \gset
+SELECT chunks > 1 AS value_tree FROM test_chunk_generations() WHERE epoch_lo = :gv;
+
+-- Another generation, then the value's retired: still there.
+INSERT INTO gt.t VALUES (2, 'small');
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+SELECT freed FROM test_chunk_retire(:gv, :gv);
+SELECT id, length(v), md5(v) = md5((SELECT string_agg(md5(i::text), '')
+	FROM generate_series(1, 200) i)) AS same
+	FROM gt.t ORDER BY id;
+SELECT test_chunk_verify_generations() > 0 AS generations;
+
+\c postgres
+DROP DATABASE generations_toast_db;
