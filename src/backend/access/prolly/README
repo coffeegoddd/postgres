@@ -1953,8 +1953,23 @@ commits above it and a join reads each commit once.  The primary key's
 bounds seek in each commit whose key is the version's, and a commit keyed
 otherwise is read whole.  Planning reads no history (the commits are
 estimated by the mounted one's height).  prolly_mounts() shows which
-mounts are history mounts.  The dolt_history_table() functions still read
-every commit.
+mounts are history mounts.
+
+dolt_history_table(NULL::t) with quals on its row's primary key columns
+((row).id = 5, = ANY, a range; equalities on the key's leading columns,
+then a range on the next) is planned as a scan of its own
+(prolly_history_scan.c): the quals' values are computed once, and each
+commit the head reaches is read by seeking its data tree for each bound
+(the diff-merge's bounded_rows()), O(the tree's depth) a bound, a commit
+whose table is the tree the commit read before it had giving that
+commit's rows again, reading nothing.  So a key's history costs the
+commits times the trees' depth, not their rows.  A version keyed
+otherwise, or described otherwise than the table is now, is read whole,
+as is every commit of a keyless table (never bounded).  The quals stay
+the scan's filter, and EXPLAIN shows those it bounds by ("History Key").
+The scan gives the entry's whole row too (h, row_to_json(h), h IS NOT
+NULL in a filter), made of its columns when the plan reads it.
+dolt_history_table() by name reads every row of every commit.
 
 Revision-qualified table names (prolly_revision.c) read a table as
 another revision has it, as Doltgres's revision databases do:
