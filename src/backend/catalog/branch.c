@@ -1072,6 +1072,7 @@ branch_note_write(Oid branch)
 }
 
 BranchTupleHook branch_tuple_hook = NULL;
+BranchStorageHook branch_storage_hook = NULL;
 
 /*
  * A versioned object's catalog row written: the branch's, and noted so.

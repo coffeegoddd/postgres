@@ -423,6 +423,14 @@ typedef struct ProllyChunkStoreRoutine
 	bool		(*root_free) (ProllyChunkStore *store);
 
 	/*
+	 * Optional: wait, in its queue, until no one else holds what
+	 * move_root() takes, taking nothing once it is free (it is taken and let
+	 * go of at once): for a step that holds nothing others wait for while
+	 * it waits, and tries for the root again after.
+	 */
+	void		(*wait_root_free) (ProllyChunkStore *store);
+
+	/*
 	 * Optional: the store's GC generation now.  A chunk found in the store
 	 * stays there until the generation changes (only a collection's swap
 	 * drops chunks, and each swap begins the next generation), so what is
@@ -444,7 +452,7 @@ typedef struct ProllyChunkStoreRoutine
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
-	"root_free", "generation"
+	"root_free", "wait_root_free", "generation"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK generation
 

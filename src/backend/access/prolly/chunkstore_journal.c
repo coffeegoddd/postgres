@@ -5221,6 +5221,22 @@ journal_root_free(ProllyChunkStore *s)
 	return true;
 }
 
+/*
+ * Wait for journal_move_root()'s lock to be free, in its queue, taking
+ * nothing (taken and let go of at once).
+ */
+static void
+journal_wait_root_free(ProllyChunkStore *s)
+{
+	LOCKTAG		tag;
+
+	if (s->moving)
+		return;
+	SET_LOCKTAG_OBJECT(tag, s->dboid, ROOT_LOCK_CLASSID, 0, 0);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	LockRelease(&tag, ExclusiveLock, false);
+}
+
 /* The GC generation of the manifest now (read again if it changed). */
 static uint32
 journal_generation(ProllyChunkStore *s)
@@ -9218,5 +9234,6 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.other_bytes = journal_other_bytes,
 	.try_hold_root = journal_try_hold_root,
 	.root_free = journal_root_free,
+	.wait_root_free = journal_wait_root_free,
 	.generation = journal_generation,
 };

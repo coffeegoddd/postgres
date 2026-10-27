@@ -1,13 +1,16 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A hard reset to a commit whose kept pages are gone may give a table the
-# pages kept as of the head, which isn't MVCC-safe: a snapshot taken
-# before the reset commits would then read the head's rows, neither its
-# own nor the commit's.  So while another backend holds an older snapshot
-# (a REPEATABLE READ transaction here, which hasn't read the table, so
-# holds no lock a restore would find taken), the reset writes the rows
-# instead, and that snapshot keeps reading what it saw.  Once it ends, the head's
-# pages are given back as before.
+# A hard reset to a commit whose kept pages are gone gives a table the
+# pages kept as of the head, discarding the working set in O(1), whatever
+# other snapshots there are.  A restore gives the table new storage, which
+# alone isn't MVCC-safe: a snapshot taken before the reset commits would
+# read the head's rows, neither its own nor the commit's.  So the storage
+# replaced is kept, and a transaction whose snapshot can't move and is
+# older than the reset (a REPEATABLE READ transaction here, which hasn't
+# read the table, so holds no lock the restore would wait for) goes on
+# reading it: what it saw.  It can't change it (a serialization failure,
+# as for a row changed since its snapshot).  The storage is dropped by the
+# first keep once no snapshot is older than the reset.
 
 use strict;
 use warnings FATAL => 'all';
@@ -25,7 +28,8 @@ prolly.kept_commits = 1
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
-sql(q{CREATE SCHEMA q VERSIONED;
+sql(q{CREATE EXTENSION test_prolly;
+	CREATE SCHEMA q VERSIONED;
 	CREATE TABLE q.t (id int PRIMARY KEY, v int);
 	INSERT INTO q.t SELECT g, 0 FROM generate_series(1, 1000) g;
 	CREATE TABLE q.u (id int PRIMARY KEY)});
@@ -48,19 +52,46 @@ cycle();
 sql(q{UPDATE q.t SET v = 5});
 is(sql('SELECT sum(v) FROM q.t'), '5000', 'the working set changed');
 
-my $rr = $node->background_psql('postgres');
+my $rr = $node->background_psql('postgres', on_error_stop => 0);
 # (its snapshot taken reading another table: no lock held on q.t, which
 # the restore would otherwise find taken)
 $rr->query_safe(
 	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
 my $before = sql($counts);
+my $record = sql(q{SELECT octet_length(test_refs_value('Kmain'))});
+my $old = sql(q{SELECT pg_relation_filenode('q.t')});
 sql("SELECT dolt_reset('--hard', '$a')");
-is(sql($counts), $before, 'with an older snapshot held, nothing is restored');
+cmp_ok(sql($counts), '>', $before,
+	'with an older snapshot held, the head\'s pages are given back');
 is(sql('SELECT sum(v) FROM q.t'), '0', 'the reset reached the commit');
 is($rr->query_safe('SELECT sum(v) FROM q.t'),
 	'5000', 'the older snapshot still reads what it saw');
-$rr->query_safe('COMMIT');
+is($rr->query_safe(q{SET enable_seqscan = off; SELECT v FROM q.t WHERE id = 7}),
+	'5', 'through the table\'s index too');
+is(sql(qq{SELECT test_bmap_exists($old)}), 't', 'the storage replaced is kept');
+# (a keep while the older snapshot is held lets go of nothing it reads)
+sql(q{UPDATE q.t SET v = 1 WHERE id = 2; SELECT dolt_commit('-am', 'e')});
+is(sql(qq{SELECT test_bmap_exists($old)}), 't',
+	'and still after a keep made while the older snapshot is held');
+is($rr->query_safe('SELECT sum(v) FROM q.t'), '5000', 'which reads it still');
+$rr->query(q{UPDATE q.t SET v = 6 WHERE id = 1});
+like($rr->{stderr},
+	qr/could not serialize access due to a concurrent move of relation "t"/,
+	'the older snapshot can\'t change it');
+$rr->{stderr} = '';
+$rr->query_safe('ROLLBACK');
+is($rr->query_safe('SELECT sum(v) FROM q.t'), '1',
+	'a later transaction reads the commit\'s rows (and e\'s)');
 $rr->quit;
+# (the storage replaced is let go of by the next keep, no snapshot older
+# than the reset left: the record keeps it until then)
+cmp_ok(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), '>', $record,
+	'the storage replaced is kept by the branch');
+sql(q{UPDATE q.t SET v = 1 WHERE id = 1; SELECT dolt_commit('-am', 'd')});
+is(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), $record,
+	'and let go of by the next keep, no snapshot older than the reset left');
+is(sql(qq{SELECT test_bmap_exists($old)}), 'f', 'its storage dropped');
+sql("SELECT dolt_reset('--hard', '$a')");
 
 # With no older snapshot, the head's pages are given back.
 cycle();
@@ -103,9 +134,10 @@ $side->query_safe(
 	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
 $before = sql($counts);
 on_side("SELECT dolt_reset('--hard', '$a')");
-is(sql($counts), $before, 'a snapshot on the branch does');
+cmp_ok(sql($counts), '>', $before,
+	'nor does a snapshot on the branch');
 is($side->query_safe('SELECT sum(v) FROM q.t'),
-	'5000', 'and it still reads what it saw');
+	'5000', 'which still reads what it saw');
 $side->query_safe('COMMIT');
 $side->quit;
 
@@ -134,6 +166,106 @@ is($late->query_safe('SELECT sum(v) FROM q.t'), '0',
 	'a later one comes to it, and reads the commit\'s rows');
 $late->query_safe('COMMIT');
 $late->quit;
+
+# main dirty again, its head's pages to be given back by a reset to a
+sub dirty_main
+{
+	cycle();
+	sql(q{UPDATE q.t SET v = 5});
+}
+
+# A snapshot imported into a transaction whose backend built the
+# relation's entry after the reset (its storage the new one): it reads
+# what it saw all the same, as does the exporting transaction, and a
+# parallel scan of it.
+dirty_main();
+my $exporter = $node->background_psql('postgres');
+$exporter->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+my $exported = $exporter->query_safe(q{SELECT pg_export_snapshot()});
+sql("SELECT dolt_reset('--hard', '$a')");
+is($exporter->query_safe('SELECT sum(v) FROM q.t'), '5000',
+	'the exporting snapshot reads what it saw');
+my $importer = $node->background_psql('postgres');
+is($importer->query_safe('SELECT sum(v) FROM q.t'), '0',
+	'a backend reads the reset\'s rows, its entry built after it');
+$importer->query_safe(qq{BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SET TRANSACTION SNAPSHOT '$exported'});
+is($importer->query_safe('SELECT sum(v) FROM q.t'), '5000',
+	'the snapshot imported there reads what it saw');
+$importer->query_safe(q{SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0;
+	SET min_parallel_table_scan_size = 0; SET debug_parallel_query = on});
+is($importer->query_safe('SELECT sum(v) FROM q.t'), '5000',
+	'and so does a parallel scan of it');
+$importer->query_safe('COMMIT');
+$importer->quit;
+$exporter->query_safe('COMMIT');
+$exporter->quit;
+
+# A crash with the storage replaced still kept: the first keep after the
+# restart drops it (no snapshot outlives one).
+dirty_main();
+$rr = $node->background_psql('postgres');
+$rr->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+$old = sql(q{SELECT pg_relation_filenode('q.t')});
+sql("SELECT dolt_reset('--hard', '$a')");
+$node->stop('immediate');
+eval { $rr->quit; };
+$node->start;
+is(sql(qq{SELECT test_bmap_exists($old)}), 't',
+	'the storage replaced survives a crash');
+sql(q{UPDATE q.t SET v = 1 WHERE id = 3; SELECT dolt_commit('-am', 'f')});
+is(sql(qq{SELECT test_bmap_exists($old)}), 'f',
+	'and the first keep after it drops it');
+
+# A branch deleted with the storage a reset replaced still kept: dropped
+# with the branch.
+sql(q{SELECT dolt_branch('gone', dolt_hashof('HEAD'))});
+sub on_gone { return sql("SELECT dolt_checkout('gone'); $_[0]"); }
+on_gone("SELECT dolt_reset('--hard', '$c'); SELECT dolt_reset('--hard', '$a');
+	SELECT dolt_reset('--hard', '$c'); UPDATE q.t SET v = 5");
+my $on = $node->background_psql('postgres');
+$on->query_safe(q{SELECT dolt_checkout('gone')});
+$on->query_safe(
+	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+my @out = split /\n/, on_gone(q{SELECT pg_relation_filenode('q.t')});
+$old = $out[-1];
+on_gone("SELECT dolt_reset('--hard', '$a')");
+is(sql(qq{SELECT test_bmap_exists($old)}), 't',
+	'the storage a reset of a branch replaced is kept');
+$on->query_safe(q{COMMIT; SELECT dolt_checkout('main')});
+$on->quit;
+sql(q{SELECT dolt_branch('-D', 'gone')});
+is(sql(qq{SELECT test_bmap_exists($old)}), 'f',
+	'and dropped as the branch is deleted');
+
+# With no entry free to name the storage replaced (as if every one were
+# still needed), the reset doesn't restore, writing the rows instead, so
+# the older snapshot still reads what it saw.
+SKIP:
+{
+	skip 'injection points not supported by this build', 3
+	  unless $ENV{enable_injection_points} eq 'yes';
+	sql(q{CREATE EXTENSION injection_points});
+	# (side, which keeps a's pages, deleted: the reset could otherwise be
+	# given them by a share, which isn't the head path)
+	sql(q{SELECT dolt_branch('-D', 'side')});
+	dirty_main();
+	$rr = $node->background_psql('postgres');
+	$rr->query_safe(
+		q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
+	sql(q{SELECT injection_points_attach('prolly-replaced-storage-full', 'notice')});
+	$before = sql($counts);
+	sql("SELECT dolt_reset('--hard', '$a')");
+	sql(q{SELECT injection_points_detach('prolly-replaced-storage-full')});
+	is(sql($counts), $before, 'with no entry free, nothing is restored');
+	is(sql('SELECT sum(v) FROM q.t'), '0', 'the reset reached the commit');
+	is($rr->query_safe('SELECT sum(v) FROM q.t'), '5000',
+		'and the older snapshot reads what it saw');
+	$rr->query_safe('COMMIT');
+	$rr->quit;
+}
 
 $node->stop;
 done_testing();
