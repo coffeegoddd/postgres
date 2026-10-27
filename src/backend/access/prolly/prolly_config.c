@@ -55,7 +55,6 @@ static const char *const copies_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_WRITERS] = "modes",
 	[PROLLY_IFACE_MATERIALIZATION_CACHE] = "branches",
 	[PROLLY_IFACE_COMMIT_CACHE] = "shared",
-	[PROLLY_IFACE_COMMIT_INDEX] = "refs",
 };
 
 static const ProllyImplInfo *
@@ -426,8 +425,6 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(copies_profile, PROLLY_IFACE_MATERIALIZATION_CACHE);
 	components->commit_cache = (const ProllyCommitCacheRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_COMMIT_CACHE);
-	components->commit_index = (const ProllyCommitIndexRoutine *)
-		profile_impl(copies_profile, PROLLY_IFACE_COMMIT_INDEX);
 }
 
 /* A data tree value's references: its row's. */

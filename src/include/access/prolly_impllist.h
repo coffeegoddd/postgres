@@ -47,7 +47,6 @@ PG_PROLLY_IMPL(ProllyMatCacheRoutine, prolly_matcache_branches)
 PG_PROLLY_IMPL(ProllyJsonTreeRoutine, prolly_jsontree_paths)
 PG_PROLLY_IMPL(ProllyNodeCacheRoutine, prolly_nodecache_shared)
 PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_shared)
-PG_PROLLY_IMPL(ProllyCommitIndexRoutine, prolly_commitindex_refs)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
@@ -75,4 +74,3 @@ PG_PROLLY_IMPL(ProllyMatCacheRoutine, prolly_matcache_stub)
 PG_PROLLY_IMPL(ProllyJsonTreeRoutine, prolly_jsontree_stub)
 PG_PROLLY_IMPL(ProllyNodeCacheRoutine, prolly_nodecache_stub)
 PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_stub)
-PG_PROLLY_IMPL(ProllyCommitIndexRoutine, prolly_commitindex_stub)

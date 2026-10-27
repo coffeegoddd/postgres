@@ -33,8 +33,12 @@
  *				   the remote's branch at (hash length, hash)
  *	'U' name	-> the branch's upstream: a remote, NUL, its branch
  *	'X' name	-> the transaction that last moved the branch's head (its
- *				   FullTransactionId, native byte order; a TransactionId,
- *				   as noted before)
+ *				   FullTransactionId, native byte order), then the moves
+ *				   of its head log not yet in the log's tree: their count
+ *				   (a byte), the tree's count of moves and its last's
+ *				   date, then each move's date (8 bytes big-endian each),
+ *				   and commit (its hash's length and the hash's bytes
+ *				   complemented)
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
@@ -128,11 +132,11 @@
  *				   pushed
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
- *	'S' space key
- *				-> an entry another component keeps here (side_put()), in
- *				   its space (a byte): the commit index's, keyed by
- *				   content, so a commit writes its own as it writes its
- *				   branch's entries; none names a chunk
+ *	'L' name	-> the branch's head log (see "Head logs"): its tree's root
+ *				   (hash length, hash; 0: none yet), the count of moves in
+ *				   it and the date of its last (8 bytes big-endian each)
+ *	'l' remote NUL branch
+ *				-> a remote-tracking branch's head log, as a branch's
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
@@ -307,7 +311,8 @@
 #define TAG_OWNED		'J'	/* routines and types such records list */
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
-#define TAG_SIDE		'S'	/* another component's entries, by space */
+#define TAG_HEAD_LOG	'L'	/* a branch's head log: its tree */
+#define TAG_TRACKING_LOG 'l'	/* a remote-tracking branch's */
 /*
  * Indexes of other entries, each kept with them, so that a lookup by what
  * they hold is a seek of the refs, not a read of every branch's entries;
@@ -334,7 +339,8 @@
  * no classes (a move keeps a table's relation, by OID); 19: each kept
  * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
- * case folded; 20: other components' entries (the commit index).
+ * case folded; 20: head logs, and a head's moves not yet in its log
+ * after the transaction that moved it.
  */
 #define REFS_FORMAT		"20"
 
@@ -452,6 +458,7 @@ static List *scoped_records = NIL;
 
 /* The records' tree's environment: its values name no chunks. */
 static ProllyTreeEnv records_env;
+static ProllyTreeEnv log_env;	/* head logs' trees: naming no chunks */
 
 static void records_under(const ProllyNodeRef *refs, ProllyNodeRef *records,
 						  bool *any);
@@ -473,10 +480,11 @@ static void forget_read_caches(void);
 static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
-static void note_indexed(const ProllyHash *head);
-
-/* the commit copies_commit_root() wrote last, as the commit index has it */
-static ProllyCommitIndexEntry written_entry;
+static void head_log_note(const char *name, const ProllyHash *head,
+						  StringInfo mover);
+static void head_log_drop(const char *name);
+static void tracking_log_note(const char *remote, const char *branch,
+							  const ProllyHash *commit);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_tables_left(const char *branch, ProllyMergeState *state,
 							  char **name);
@@ -633,6 +641,8 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 	{
 		case TAG_TRACKING:
 		case TAG_RECORDS:
+		case TAG_HEAD_LOG:		/* (its tree: whose values name nothing) */
+		case TAG_TRACKING_LOG:
 			(void) declare_hashes(p, end, 1, refs);
 			break;
 		case TAG_BRANCH:			/* (the head, and its root if recorded) */
@@ -722,6 +732,7 @@ refs_init(void)
 	env.counters = pgstat_prolly_refs_tree_counters();
 	commit_env = env;
 	records_env = env;
+	log_env = env;
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
@@ -1806,6 +1817,7 @@ branch_entry_tag(char tag)
 		case TAG_REBASE:
 		case TAG_KEPT:
 		case TAG_CREATOR:
+		case TAG_HEAD_LOG:
 			return true;
 		default:
 			return false;
@@ -1815,9 +1827,8 @@ branch_entry_tag(char tag)
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), or another component's
- * entry (keyed by content, or put holding every ref), not having held
- * every ref nor begun to commit?
+ * the commit, which no other transaction writes), not having held every
+ * ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -1828,7 +1839,7 @@ scoped_key(const char *key, int keylen)
 	if (published || whole)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
-		(keylen > 1 && (key[0] == TAG_OWNED || key[0] == TAG_SIDE)))
+		(keylen > 1 && key[0] == TAG_OWNED))
 		return true;
 	name = entry_branch(key, keylen, &len);
 	return name != NULL && branch_held(name, len);
@@ -2307,12 +2318,15 @@ branch_set_head(const char *name, const ProllyHash *head)
 	appendStringInfoChar(&key, TAG_MOVER);
 	appendStringInfoString(&key, name);
 	appendBinaryStringInfo(&v, &xid, sizeof(xid));
+	if (head)
+		head_log_note(name, head, &v);
+	else
+		head_log_drop(name);
 	refs_put(key.data, key.len, head ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
 	if (head)
 		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
-	note_indexed(head);
 }
 
 /*
@@ -2340,7 +2354,7 @@ moved_unseen(char tag, const char *name)
 		 * past, and seen, though its 32 bits alone would look recent; a
 		 * TransactionId, as heads' were noted before)
 		 */
-		if (v.len == sizeof(FullTransactionId))
+		if (v.len >= sizeof(FullTransactionId))
 		{
 			FullTransactionId fxid;
 			uint64		next = U64FromFullTransactionId(ReadNextFullTransactionId());
@@ -5855,8 +5869,7 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
-	written_entry.height = parents_height(parents, nparents);
-	put_uint64(&v, (uint64) written_entry.height);
+	put_uint64(&v, (uint64) parents_height(parents, nparents));
 	add_item(b, "height", &v);
 	resetStringInfo(&v);
 	if (identity && identity->len > 0)
@@ -5879,12 +5892,6 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	prior_written_root = last_written_root;
 	last_written_commit = *id;
 	last_written_root = *root;
-	/* (what the commit index notes of it, as its head is set) */
-	written_entry.id = *id;
-	written_entry.committed_at = at;
-	written_entry.nparents = nparents;
-	for (int i = 0; i < nparents; i++)
-		written_entry.parents[i] = parents[i];
 	pfree(v.data);
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
 }
@@ -8051,7 +8058,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
 	TAG_NAMES, TAG_PRIVILEGED, TAG_IDENTITY, TAG_REBASE, TAG_CREATOR,
-	TAG_IDENTITY_CONFLICTS};
+	TAG_IDENTITY_CONFLICTS, TAG_HEAD_LOG};
 	ListCell   *lc;
 	List	   *kept;
 	ProllyNodeRef root;
@@ -10177,6 +10184,7 @@ copies_tracking_set(const char *remote, const char *branch,
 	if (commit_id)
 		put_hash(&v, commit_id);
 	refs_put(key.data, key.len, commit_id ? &v : NULL);
+	tracking_log_note(remote, branch, commit_id);
 	pfree(key.data);
 	pfree(v.data);
 }
@@ -11440,130 +11448,479 @@ copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
 }
 
 /* ------------------------------------------------------------------------
- * Other components' entries
+ * Head logs
+ *
+ * Each branch's head log is its head's moves in order, each with its date
+ * (when it was made, never before the move before it) and the commit it
+ * moved to: "the commit branch B was at at time T" is one seek, whatever
+ * dates the commits were given.  A remote-tracking branch has one too,
+ * moved as fetches move it.
+ *
+ * A log is a tree of its own (keys by memcmp: each move's date, 8 bytes
+ * big-endian with the sign bit flipped, then its number in the log, 8
+ * bytes big-endian; its value the commit, its hash's length then the
+ * hash's bytes complemented, so that it names no chunk), whose root the
+ * log's entry names.  Moves come in date order, so each goes at the
+ * tree's right edge.  A branch's latest moves wait in its mover entry,
+ * which every move writes anyway, HEAD_LOG_TAIL of them at most: then
+ * they go into the tree at once, so a move writes the tree's right edge
+ * once every HEAD_LOG_TAIL moves, not each time.
  * ------------------------------------------------------------------------
  */
 
-static void
-side_key(StringInfo out, char space, const ProllyKey *key)
+#define HEAD_LOG_TAIL	32
+
+typedef struct LogState
 {
-	appendStringInfoChar(out, TAG_SIDE);
-	appendStringInfoChar(out, space);
-	if (key)
-		appendBinaryStringInfo(out, (const char *) key->data, key->len);
+	ProllyHash	root;			/* len 0: no tree yet */
+	int64		count;			/* moves in the tree */
+	TimestampTz last;			/* the last move's date (in the tree) */
+} LogState;
+
+static void
+put_log_id(StringInfo out, const ProllyHash *id)
+{
+	appendStringInfoChar(out, (char) id->len);
+	for (int i = 0; i < id->len; i++)
+		appendStringInfoChar(out, (char) ~id->bytes[i]);
+}
+
+static const char *
+get_log_id(const char *p, const char *end, ProllyHash *id)
+{
+	if (p >= end || (uint8) *p > PROLLY_HASH_MAX_LEN ||
+		end - p - 1 < (uint8) *p)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a prolly head log is corrupt")));
+	memset(id, 0, sizeof(*id));
+	id->len = (uint8) *p;
+	for (int i = 0; i < id->len; i++)
+		id->bytes[i] = (uint8) ~p[1 + i];
+	return p + 1 + id->len;
+}
+
+static void
+put_log_date(StringInfo out, TimestampTz at)
+{
+	put_uint64(out, ((uint64) at) ^ ((uint64) 1 << 63));
+}
+
+static TimestampTz
+get_log_date(const char *p)
+{
+	uint64		v = 0;
+
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | (uint8) p[i];
+	return (TimestampTz) (v ^ ((uint64) 1 << 63));
+}
+
+static uint64
+get_be64_at(const char *p)
+{
+	uint64		v = 0;
+
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | (uint8) p[i];
+	return v;
+}
+
+static void
+log_key(StringInfo key, bool tracking, const char *name, const char *branch)
+{
+	appendStringInfoChar(key, tracking ? TAG_TRACKING_LOG : TAG_HEAD_LOG);
+	appendStringInfoString(key, name);
+	if (tracking)
+	{
+		appendStringInfoChar(key, '\0');
+		appendStringInfoString(key, branch);
+	}
+}
+
+static void
+log_state(const StringInfoData *key, LogState *ls)
+{
+	StringInfoData v;
+
+	memset(ls, 0, sizeof(*ls));
+	ls->last = DT_NOBEGIN;
+	initStringInfo(&v);
+	if (refs_get(key->data, key->len, &v))
+	{
+		const char *p = get_hash(v.data, v.data + v.len, &ls->root);
+
+		if (v.data + v.len - p != 16)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly head log is corrupt")));
+		ls->count = (int64) get_be64_at(p);
+		ls->last = (TimestampTz) get_be64_at(p + 8);
+	}
+	pfree(v.data);
+}
+
+/* A move of a log: its number, date and commit. */
+typedef struct LogMove
+{
+	int64		seq;
+	TimestampTz at;
+	ProllyHash	commit;
+} LogMove;
+
+/* Add moves (in order, numbered from the log's count) to its tree. */
+static void
+log_append(const StringInfoData *key, LogState *ls, const LogMove *moves,
+		   int n)
+{
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(n, 1));
+	ProllyNodeRef root;
+	ProllyNodeRef next;
+	StringInfoData v;
+
+	for (int i = 0; i < n; i++)
+	{
+		StringInfoData k;
+		StringInfoData val;
+
+		initStringInfo(&k);
+		put_log_date(&k, moves[i].at);
+		put_uint64(&k, (uint64) moves[i].seq);
+		initStringInfo(&val);
+		put_log_id(&val, &moves[i].commit);
+		edits[i].key.data = (const uint8 *) k.data;
+		edits[i].key.len = k.len;
+		edits[i].value.data = (const uint8 *) val.data;
+		edits[i].value.len = val.len;
+		edits[i].is_delete = false;
+	}
+	if (ls->root.len == 0)
+	{
+		ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &log_env,
+										   CurrentMemoryContext);
+
+		PROLLY_CALL(tree, build_finish, b, &root);
+	}
+	else
+		ref_of(&ls->root, &root);
+	if (n > 0)
+		PROLLY_CALL(tree, apply, &log_env, &root, edits, n, &next);
+	else
+		next = root;
+	ls->root = next.hash;
+	ls->count += n;
+	if (n > 0)
+		ls->last = moves[n - 1].at;
+	initStringInfo(&v);
+	put_hash(&v, &ls->root);
+	put_uint64(&v, (uint64) ls->count);
+	put_uint64(&v, (uint64) ls->last);
+	refs_put(key->data, key->len, &v);
+	pfree(v.data);
+	pfree(edits);
+}
+
+/*
+ * The moves a branch's mover entry holds (value v): at most the tail, and
+ * what it knows of the log's tree (*ls: its count and last date; not its
+ * root, which only the log's entry holds).  False if it holds none (the
+ * log is empty).
+ */
+static int
+tail_moves(const StringInfoData *v, LogMove *moves, LogState *ls)
+{
+	const char *p;
+	const char *end = v->data + v->len;
+	int			n;
+
+	memset(ls, 0, sizeof(*ls));
+	ls->last = DT_NOBEGIN;
+	if (v->len <= sizeof(FullTransactionId))
+		return 0;
+	p = v->data + sizeof(FullTransactionId);
+	if (end - p < 17)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a prolly head log is corrupt")));
+	n = (uint8) *p++;
+	ls->count = (int64) get_be64_at(p);
+	ls->last = (TimestampTz) get_be64_at(p + 8);
+	p += 16;
+	if (n > HEAD_LOG_TAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a prolly head log is corrupt")));
+	for (int i = 0; i < n; i++)
+	{
+		if (end - p < 8)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly head log is corrupt")));
+		moves[i].at = (TimestampTz) get_be64_at(p);
+		p = get_log_id(p + 8, end, &moves[i].commit);
+	}
+	return n;
 }
 
 static bool
-copies_side_get(char space, const ProllyKey *key, StringInfo value)
+branch_tail(const char *name, LogMove *moves, int *n, LogState *ls)
 {
-	StringInfoData k;
+	StringInfoData key;
+	StringInfoData v;
 	bool		found;
 
-	initStringInfo(&k);
-	side_key(&k, space, key);
-	found = refs_get(k.data, k.len, value);
-	pfree(k.data);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_MOVER);
+	appendStringInfoString(&key, name);
+	found = refs_get(key.data, key.len, &v);
+	*n = 0;
+	if (found)
+		*n = tail_moves(&v, moves, ls);
+	else
+		(void) tail_moves(&v, moves, ls);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * Branch name's head moved to the head mover (its mover entry's value, its
+ * transaction so far) names: the move is added to the log's tail, which
+ * goes into the tree once full; the tail left is put after the
+ * transaction in mover.
+ */
+static void
+head_log_note(const char *name, const ProllyHash *head, StringInfo mover)
+{
+	LogMove		tail[HEAD_LOG_TAIL + 1];
+	int			n;
+	StringInfoData key;
+	LogState	ls;
+	TimestampTz at = GetCurrentTimestamp();
+
+	(void) branch_tail(name, tail, &n, &ls);
+	initStringInfo(&key);
+	log_key(&key, false, name, NULL);
+	/* (dates only rise along a log, whatever the clock does) */
+	if (n > 0)
+		at = Max(at, tail[n - 1].at);
+	at = Max(at, ls.last);
+	tail[n].at = at;
+	tail[n].commit = *head;
+	n++;
+	if (n > HEAD_LOG_TAIL)
+	{
+		/* (the tree's root only the log's entry holds) */
+		log_state(&key, &ls);
+		for (int i = 0; i < n; i++)
+			tail[i].seq = ls.count + i;
+		log_append(&key, &ls, tail, n);
+		n = 0;
+	}
+	appendStringInfoChar(mover, (char) n);
+	put_uint64(mover, (uint64) ls.count);
+	put_uint64(mover, (uint64) ls.last);
+	for (int i = 0; i < n; i++)
+	{
+		put_uint64(mover, (uint64) tail[i].at);
+		put_log_id(mover, &tail[i].commit);
+	}
+	pfree(key.data);
+}
+
+/* A branch let go of: its log goes with it. */
+static void
+head_log_drop(const char *name)
+{
+	StringInfoData key;
+
+	initStringInfo(&key);
+	log_key(&key, false, name, NULL);
+	refs_put(key.data, key.len, NULL);
+	pfree(key.data);
+}
+
+/* A remote-tracking branch moved (commit NULL: removed): logged at once. */
+static void
+tracking_log_note(const char *remote, const char *branch,
+				  const ProllyHash *commit)
+{
+	StringInfoData key;
+	LogState	ls;
+	LogMove		m;
+
+	initStringInfo(&key);
+	log_key(&key, true, remote, branch);
+	if (commit == NULL)
+	{
+		refs_put(key.data, key.len, NULL);
+		pfree(key.data);
+		return;
+	}
+	log_state(&key, &ls);
+	m.seq = ls.count;
+	m.at = Max(GetCurrentTimestamp(), ls.last);
+	m.commit = *commit;
+	log_append(&key, &ls, &m, 1);
+	pfree(key.data);
+}
+
+/* A log's moves, its tree's then its tail's: all of them, in order. */
+static List *
+log_moves(const char *name, const char *branch, TimestampTz from,
+		  TimestampTz to)
+{
+	StringInfoData key;
+	LogState	ls;
+	List	   *moves = NIL;
+	LogMove		tail[HEAD_LOG_TAIL + 1];
+	int			n = 0;
+
+	initStringInfo(&key);
+	log_key(&key, branch != NULL, name, branch);
+	log_state(&key, &ls);
+	if (ls.root.len > 0 && from <= to)
+	{
+		ProllyNodeRef root;
+		ProllyTreeCursor *c;
+		StringInfoData seek;
+		ProllyKey	sk;
+		ProllyKey	k;
+		ProllyValue v;
+
+		ref_of(&ls.root, &root);
+		initStringInfo(&seek);
+		put_log_date(&seek, from);
+		sk.data = (const uint8 *) seek.data;
+		sk.len = seek.len;
+		c = PROLLY_CALL(tree, cursor_open, &log_env, &root,
+						CurrentMemoryContext);
+		PROLLY_CALL(tree, cursor_seek, c, &sk, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+		{
+			LogMove    *m;
+
+			if (k.len != 16)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a prolly head log is corrupt")));
+			if (get_log_date((const char *) k.data) > to)
+				break;
+			m = palloc(sizeof(LogMove));
+			m->at = get_log_date((const char *) k.data);
+			m->seq = (int64) get_be64_at((const char *) k.data + 8);
+			(void) get_log_id((const char *) v.data,
+							  (const char *) v.data + v.len, &m->commit);
+			moves = lappend(moves, m);
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+		pfree(seek.data);
+	}
+	if (branch == NULL)
+	{
+		LogState	tl;
+
+		(void) branch_tail(name, tail, &n, &tl);
+	}
+	for (int i = 0; i < n; i++)
+	{
+		LogMove    *m;
+
+		if (tail[i].at < from || tail[i].at > to)
+			continue;
+		m = palloc(sizeof(LogMove));
+		*m = tail[i];
+		m->seq = ls.count + i;
+		moves = lappend(moves, m);
+	}
+	pfree(key.data);
+	return moves;
+}
+
+/*
+ * The move of a log last made at or before at: its tail's newest such,
+ * else a seek of its tree.
+ */
+static bool
+copies_head_at(const char *name, const char *branch, TimestampTz at,
+			   ProllyHeadMove *move)
+{
+	StringInfoData key;
+	LogState	ls;
+	LogMove		tail[HEAD_LOG_TAIL + 1];
+	int			n = 0;
+	bool		found = false;
+
+	refs_init();
+	if (branch == NULL)
+	{
+		LogState	tl;
+
+		(void) branch_tail(name, tail, &n, &tl);
+	}
+	initStringInfo(&key);
+	log_key(&key, branch != NULL, name, branch);
+	log_state(&key, &ls);
+	for (int i = n - 1; i >= 0 && !found; i--)
+		if (tail[i].at <= at)
+		{
+			move->seq = ls.count + i;
+			move->moved_at = tail[i].at;
+			move->commit = tail[i].commit;
+			found = true;
+		}
+	if (!found && ls.root.len > 0)
+	{
+		ProllyNodeRef root;
+		ProllyTreeCursor *c;
+		StringInfoData seek;
+		ProllyKey	sk;
+		ProllyKey	k;
+		ProllyValue v;
+
+		ref_of(&ls.root, &root);
+		initStringInfo(&seek);
+		put_log_date(&seek, at);
+		put_uint64(&seek, PG_UINT64_MAX);
+		sk.data = (const uint8 *) seek.data;
+		sk.len = seek.len;
+		c = PROLLY_CALL(tree, cursor_open, &log_env, &root,
+						CurrentMemoryContext);
+		PROLLY_CALL(tree, cursor_seek, c, &sk, BackwardScanDirection);
+		if (PROLLY_CALL(tree, cursor_next, c, &k, &v) && k.len == 16)
+		{
+			move->moved_at = get_log_date((const char *) k.data);
+			move->seq = (int64) get_be64_at((const char *) k.data + 8);
+			(void) get_log_id((const char *) v.data,
+							  (const char *) v.data + v.len, &move->commit);
+			found = true;
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+		pfree(seek.data);
+	}
+	pfree(key.data);
 	return found;
 }
 
 static void
-copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
+copies_head_moves(const char *name, const char *branch, TimestampTz from,
+				  TimestampTz to, ScanDirection direction,
+				  ProllyHeadMoveVisit visit, void *arg)
 {
-	StringInfoData k;
-	StringInfoData v;
+	List	   *moves;
 
-	initStringInfo(&k);
-	side_key(&k, space, key);
-	if (value)
+	refs_init();
+	moves = log_moves(name, branch, from, to);
+	for (int i = 0; i < list_length(moves); i++)
 	{
-		v.data = (char *) value->data;
-		v.len = value->len;
-		v.maxlen = value->len + 1;
-		v.cursor = 0;
-	}
-	refs_put(k.data, k.len, value ? &v : NULL);
-	pfree(k.data);
-}
+		LogMove    *m = list_nth(moves, ScanDirectionIsBackward(direction) ?
+								 list_length(moves) - 1 - i : i);
+		ProllyHeadMove hm = {m->seq, m->at, m->commit};
 
-static void
-copies_side_scan(char space, const ProllyKey *from, ScanDirection direction,
-				 bool (*visit) (const ProllyKey *key, const ProllyValue *value,
-								void *arg),
-				 void *arg)
-{
-	ProllyNodeRef root;
-	ProllyTreeCursor *c;
-	StringInfoData start;
-	char		prefix[2] = {TAG_SIDE, space};
-	ProllyKey	k;
-	ProllyValue v;
-
-	if (!refs_root(&root))
-		return;
-	initStringInfo(&start);
-	side_key(&start, space, from);
-	/* (backward from none: from the space's end, just past its last key) */
-	if (from == NULL && ScanDirectionIsBackward(direction))
-		start.data[1] = space + 1;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
-	{
-		ProllyKey	seek = {(const uint8 *) start.data, start.len};
-
-		PROLLY_CALL(tree, cursor_seek, c, &seek, direction);
-	}
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
-	{
-		ProllyKey	own;
-
-		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
-		{
-			/* (the space's end, past it backward, from just past it) */
-			if (ScanDirectionIsBackward(direction) && from == NULL &&
-				k.len >= 2 && k.data[0] == TAG_SIDE &&
-				(uint8) k.data[1] == (uint8) (space + 1))
-				continue;
-			break;
-		}
-		own.data = k.data + 2;
-		own.len = k.len - 2;
-		if (!visit(&own, &v, arg))
+		if (!visit(&hm, arg))
 			break;
 	}
-	PROLLY_CALL(tree, cursor_close, c);
-	pfree(start.data);
-}
-
-/* The database's commit index, if its configuration has one. */
-static const ProllyCommitIndexRoutine *
-commit_index(void)
-{
-	static const ProllyCommitIndexRoutine *ci = NULL;
-	static bool looked = false;
-
-	if (!looked)
-	{
-		ProllyDatabaseComponents dc;
-
-		prolly_database_components(&dc);
-		ci = dc.commit_index;
-		looked = true;
-	}
-	return ci;
-}
-
-/*
- * A branch's head moved to head (NULL: it has none now): index it, with
- * what is known of it if the transaction wrote it last.
- */
-static void
-note_indexed(const ProllyHash *head)
-{
-	const ProllyCommitIndexRoutine *ci;
-
-	if (head == NULL || head->len == 0 || (ci = commit_index()) == NULL)
-		return;
-	PROLLY_CALL(ci, note_head, head,
-				same_hash(head, &written_entry.id) ? &written_entry : NULL);
 }
 
 const ProllyRefsRoutine prolly_refs_copies = {
@@ -11666,7 +12023,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.forget_records = copies_forget_records,
 	.check_copies_read = copies_check_copies_read,
 	.branches_folded = copies_branches_folded,
-	.side_get = copies_side_get,
-	.side_put = copies_side_put,
-	.side_scan = copies_side_scan,
+	.head_at = copies_head_at,
+	.head_moves = copies_head_moves,
 };

@@ -244,97 +244,131 @@ prolly_fold_rewritten(Oid relid)
 	return true;
 }
 
-static void
-index_entry_row(ReturnSetInfo *rsinfo, const ProllyCommitIndexEntry *e)
+/* A log's name: a branch, or "remotes/<remote>/<branch>" (its remote's). */
+typedef struct LogName
 {
-	Datum		values[4];
-	bool		nulls[4] = {false, false, false, false};
-	Datum		parents[PROLLY_MAX_PARENTS];
+	const char *ref;
+	char	   *remote;			/* the longest remote ref begins with */
+} LogName;
 
-	values[0] = PointerGetDatum(hash_to_text(&e->id));
-	values[1] = TimestampTzGetDatum(e->committed_at);
-	values[2] = Int64GetDatum(e->height);
-	for (int i = 0; i < e->nparents; i++)
-		parents[i] = PointerGetDatum(hash_to_text(&e->parents[i]));
-	values[3] = PointerGetDatum(construct_array_builtin(parents, e->nparents,
-														TEXTOID));
-	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+static void
+match_remote(const char *name, const char *url, void *arg)
+{
+	LogName    *ln = arg;
+	size_t		len = strlen(name);
+
+	if (strncmp(ln->ref, name, len) == 0 && ln->ref[len] == '/' &&
+		(ln->remote == NULL || strlen(ln->remote) < len))
+		ln->remote = pstrdup(name);
+}
+
+static void
+log_name(const ProllyRefsRoutine *refs, const char *ref, const char **name,
+		 const char **branch)
+{
+	if (!PROLLY_HAS(refs, head_at))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" keeps no head logs",
+						refs->info.name)));
+	*name = ref;
+	*branch = NULL;
+	if (strncmp(ref, "remotes/", 8) == 0)
+	{
+		LogName		ln = {ref + 8, NULL};
+
+		PROLLY_CALL(refs, remotes, match_remote, &ln);
+		if (ln.remote != NULL)
+		{
+			*name = ln.remote;
+			*branch = ref + 8 + strlen(ln.remote) + 1;
+		}
+	}
 }
 
 static bool
-index_visit_row(const ProllyCommitIndexEntry *e, void *arg)
+head_move_row(const ProllyHeadMove *m, void *arg)
 {
-	index_entry_row((ReturnSetInfo *) arg, e);
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	values[0] = Int64GetDatum(m->seq);
+	values[1] = TimestampTzGetDatum(m->moved_at);
+	values[2] = PointerGetDatum(hash_to_text(&m->commit));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	return true;
 }
 
-static const ProllyCommitIndexRoutine *
-database_commit_index(void)
-{
-	ProllyDatabaseComponents dc;
-
-	prolly_database_components(&dc);
-	if (dc.commit_index == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("this database's configuration has no commit index")));
-	return dc.commit_index;
-}
-
-/*
- * prolly_commit_index(from_time timestamptz, to_time timestamptz,
- *					   backward bool)
- *	returns setof (commit_hash text, committed_at timestamptz,
- *				   height bigint, parents text[])
- *
- * The commit index's entries dated from_time..to_time (NULL: unbounded),
- * in date order, or newest first if backward; without arguments, all of
- * them in date order.
- */
-Datum
-prolly_commit_index(PG_FUNCTION_ARGS)
+static Datum
+head_log(FunctionCallInfo fcinfo, TimestampTz from, TimestampTz to,
+		 bool backward)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	const ProllyCommitIndexRoutine *ci = database_commit_index();
-	bool		args = PG_NARGS() == 3;
-	TimestampTz from = !args || PG_ARGISNULL(0) ? DT_NOBEGIN :
-		PG_GETARG_TIMESTAMPTZ(0);
-	TimestampTz to = !args || PG_ARGISNULL(1) ? DT_NOEND :
-		PG_GETARG_TIMESTAMPTZ(1);
-	bool		backward = args && !PG_ARGISNULL(2) && PG_GETARG_BOOL(2);
-
-	InitMaterializedSRF(fcinfo, 0);
-	PROLLY_CALL(ci, scan, from, to,
-				backward ? BackwardScanDirection : ForwardScanDirection,
-				index_visit_row, rsinfo);
-	return (Datum) 0;
-}
-
-/*
- * prolly_commit_indexed(ref text)
- *	returns setof (commit_hash text, committed_at timestamptz,
- *				   height bigint, parents text[])
- *
- * The commit index's entry for the commit ref names (a branch, tag or
- * commit id): one row, or none if it isn't indexed.
- */
-Datum
-prolly_commit_indexed(PG_FUNCTION_ARGS)
-{
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	const ProllyCommitIndexRoutine *ci = database_commit_index();
 	ProllyDatabaseComponents dc;
 	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	ProllyHash	id = {0};
-	ProllyCommitIndexEntry e;
+	const char *name;
+	const char *branch;
 
 	prolly_database_components(&dc);
-	if (!PROLLY_CALL(dc.refs, resolve, ref, &id))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	log_name(dc.refs, ref, &name, &branch);
 	InitMaterializedSRF(fcinfo, 0);
-	if (PROLLY_CALL(ci, lookup, &id, &e))
-		index_entry_row(rsinfo, &e);
+	PROLLY_CALL(dc.refs, head_moves, name, branch, from, to,
+				backward ? BackwardScanDirection : ForwardScanDirection,
+				head_move_row, rsinfo);
 	return (Datum) 0;
+}
+
+/*
+ * prolly_head_log(ref text)
+ *	returns setof (seq bigint, moved_at timestamptz, commit_hash text)
+ *
+ * A branch's head log (ref "remotes/<remote>/<branch>": a remote-tracking
+ * branch's): each move of its head, in order, with when it was made and
+ * the commit it moved to.
+ */
+Datum
+prolly_head_log(PG_FUNCTION_ARGS)
+{
+	return head_log(fcinfo, DT_NOBEGIN, DT_NOEND, false);
+}
+
+/*
+ * prolly_head_log_range(ref text, from_time timestamptz,
+ *						 to_time timestamptz, backward bool)
+ *	returns setof (seq bigint, moved_at timestamptz, commit_hash text)
+ *
+ * The moves of ref's head log dated from_time..to_time (NULL: unbounded),
+ * newest first if backward.
+ */
+Datum
+prolly_head_log_range(PG_FUNCTION_ARGS)
+{
+	return head_log(fcinfo,
+					PG_ARGISNULL(1) ? DT_NOBEGIN : PG_GETARG_TIMESTAMPTZ(1),
+					PG_ARGISNULL(2) ? DT_NOEND : PG_GETARG_TIMESTAMPTZ(2),
+					!PG_ARGISNULL(3) && PG_GETARG_BOOL(3));
+}
+
+/*
+ * prolly_head_at(ref text, at timestamptz) returns text
+ *
+ * The commit ref's head was at at time at (its log's move last made at or
+ * before it); NULL if it had none then.
+ */
+Datum
+prolly_head_at(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	TimestampTz at = PG_GETARG_TIMESTAMPTZ(1);
+	const char *name;
+	const char *branch;
+	ProllyHeadMove m;
+
+	prolly_database_components(&dc);
+	log_name(dc.refs, ref, &name, &branch);
+	if (!PROLLY_CALL(dc.refs, head_at, name, branch, at, &m))
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(hash_to_text(&m.commit));
 }

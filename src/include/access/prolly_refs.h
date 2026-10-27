@@ -296,6 +296,17 @@ typedef struct ProllyKeptCommit
 } ProllyKeptCommit;
 
 typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
+
+/* A move of a head log: its number in the log, its date, its commit. */
+typedef struct ProllyHeadMove
+{
+	int64		seq;
+	TimestampTz moved_at;
+	ProllyHash	commit;
+} ProllyHeadMove;
+
+/* Visits a move; false stops the visit. */
+typedef bool (*ProllyHeadMoveVisit) (const ProllyHeadMove *move, void *arg);
 /* A branch keeping pages as of commit (kept_holders()). */
 typedef void (*ProllyKeptHolderVisit) (const char *name, const ProllyHash *commit,
 									   void *arg);
@@ -900,28 +911,23 @@ typedef struct ProllyRefsRoutine
 									void *arg);
 
 	/*
-	 * Optional, together: entries another component keeps in the refs (the
-	 * commit index's), each in a space of its own named by a byte, changed
-	 * with the transaction as every entry is.  They name no chunks, so they
-	 * keep nothing from a collection, and transfers never send them.
-	 * side_put() (value NULL: delete) of a key made of content (a commit's
-	 * id, its date) that no other transaction writes another value under
-	 * is made as a commit's own entries are, holding only its branch, so
-	 * commits on other branches don't wait for it; a caller putting a key
-	 * others may write too holds every ref first (lock()).  side_scan()
-	 * visits space's entries from key from (NULL: its first, or its last
-	 * backward) in direction until visit returns false; the key visited is
-	 * without the space.
+	 * Optional, together: head logs.  Each branch's head moves are logged
+	 * in order, each with its date (when it was made; never before the move
+	 * before it) and the commit it moved to, with the transaction; and a
+	 * remote-tracking branch's (branch not NULL: name is its remote's), as
+	 * fetches move it.  head_at() finds the move last made at or before at
+	 * (false: none was), a seek however long the log is, whatever dates
+	 * the commits record.  head_moves() visits the moves dated from..to
+	 * (both included) in order, forward or backward, until visit returns
+	 * false.  A log goes with its branch.  "The nearest commit at or
+	 * before commit C" is no question of a log: walk C's parents.
 	 */
-	bool		(*side_get) (char space, const ProllyKey *key, StringInfo value);
-	void		(*side_put) (char space, const ProllyKey *key,
-							 const ProllyValue *value);
-	void		(*side_scan) (char space, const ProllyKey *from,
-							  ScanDirection direction,
-							  bool (*visit) (const ProllyKey *key,
-											 const ProllyValue *value,
-											 void *arg),
-							  void *arg);
+	bool		(*head_at) (const char *name, const char *branch,
+							TimestampTz at, ProllyHeadMove *move);
+	void		(*head_moves) (const char *name, const char *branch,
+							   TimestampTz from, TimestampTz to,
+							   ScanDirection direction,
+							   ProllyHeadMoveVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -984,9 +990,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
-	"side_get", "side_put", "side_scan"
+	"head_at", "head_moves"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK side_scan
+#define PROLLY_REFS_LAST_CALLBACK head_moves
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

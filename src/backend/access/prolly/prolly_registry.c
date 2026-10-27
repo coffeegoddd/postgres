@@ -71,7 +71,6 @@ static const char *const matcache_callbacks[] = {PROLLY_MATCACHE_CALLBACK_NAMES}
 static const char *const jsontree_callbacks[] = {PROLLY_JSONTREE_CALLBACK_NAMES};
 static const char *const nodecache_callbacks[] = {PROLLY_NODECACHE_CALLBACK_NAMES};
 static const char *const commitcache_callbacks[] = {PROLLY_COMMITCACHE_CALLBACK_NAMES};
-static const char *const commitindex_callbacks[] = {PROLLY_COMMITINDEX_CALLBACK_NAMES};
 
 /*
  * A routine's callbacks follow its info, one per name, in the names' order:
@@ -110,7 +109,6 @@ CHECK_ROUTINE(ProllyMatCacheRoutine, PROLLY_MATCACHE_FIRST_CALLBACK, PROLLY_MATC
 CHECK_ROUTINE(ProllyJsonTreeRoutine, PROLLY_JSONTREE_FIRST_CALLBACK, PROLLY_JSONTREE_LAST_CALLBACK, jsontree_callbacks);
 CHECK_ROUTINE(ProllyNodeCacheRoutine, PROLLY_NODECACHE_FIRST_CALLBACK, PROLLY_NODECACHE_LAST_CALLBACK, nodecache_callbacks);
 CHECK_ROUTINE(ProllyCommitCacheRoutine, PROLLY_COMMITCACHE_FIRST_CALLBACK, PROLLY_COMMITCACHE_LAST_CALLBACK, commitcache_callbacks);
-CHECK_ROUTINE(ProllyCommitIndexRoutine, PROLLY_COMMITINDEX_FIRST_CALLBACK, PROLLY_COMMITINDEX_LAST_CALLBACK, commitindex_callbacks);
 
 #define IFACE(name, type, first, names) \
 	{name, offsetof(type, first), lengthof(names), names}
@@ -166,8 +164,6 @@ static const ProllyInterfaceDesc interfaces[PROLLY_IFACE_LAST + 1] = {
 	IFACE("node_cache", ProllyNodeCacheRoutine, PROLLY_NODECACHE_FIRST_CALLBACK, nodecache_callbacks),
 	[PROLLY_IFACE_COMMIT_CACHE] =
 	IFACE("commit_cache", ProllyCommitCacheRoutine, PROLLY_COMMITCACHE_FIRST_CALLBACK, commitcache_callbacks),
-	[PROLLY_IFACE_COMMIT_INDEX] =
-	IFACE("commit_index", ProllyCommitIndexRoutine, PROLLY_COMMITINDEX_FIRST_CALLBACK, commitindex_callbacks),
 };
 
 static const ProllyInterfaceDesc *

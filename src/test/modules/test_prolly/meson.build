@@ -167,7 +167,7 @@ tests += {
       'stat_prolly_moves',
       'node_cache',
       'commit_cache',
-      'commit_index',
+      'head_log',
       'store_sizes',
       'storage_breakdown',
       'get_many',
