@@ -209,14 +209,22 @@ extern void prolly_window_init(void);
  */
 extern void prolly_window_check_absent(const ProllyHash *id);
 
-/* Is commit id past the history horizon? */
+/* Is commit id past the history horizon (its data severed)? */
 extern bool prolly_window_archived(const ProllyHash *id);
 
 /*
- * For readers that list history (a log, a history table): is parent past
- * the horizon, so the listing stops there?  A notice says so, once a
- * transaction.
+ * For a reader that found a tree missing from the store: an error, if it
+ * is a severed commit's root or dependencies' tree, that the commit is
+ * past the history horizon, saying how to repair it; nothing otherwise.
  */
-extern bool prolly_window_stops_at(const ProllyHash *parent);
+extern void prolly_window_check_root(const ProllyHash *tree);
+
+/*
+ * For readers of every commit's rows (a history table, history mounts):
+ * is commit id's data severed, so it has none to read?  A notice says so,
+ * once a transaction.  Its commit, and the history past it, are listed
+ * still.
+ */
+extern bool prolly_window_rows_severed(const ProllyHash *id);
 
 #endif							/* PROLLY_WINDOW_H */

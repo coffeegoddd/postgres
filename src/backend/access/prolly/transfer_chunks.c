@@ -51,6 +51,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_seen.h"
+#include "access/prolly_tree.h"
 #include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "utils/injection_point.h"
@@ -535,7 +536,9 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 static uint64
 receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			  const ProllyHash *commits, int ncommits,
-			  const ProllyHash *stops, int nstops)
+			  const ProllyHash *stops, int nstops,
+			  const ProllyHash *roots, int nroots,
+			  const ProllyHash *trees, int ntrees)
 {
 	ProllyDatabaseComponents dc;
 	Receiving	rv;
@@ -590,7 +593,38 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			if (walk[i])
 				PROLLY_CALL(dc.refs, walk_commit, &commits[i], receive_visit, &rv);
 		}
-		check_formats(&rv, commits, ncommits);
+		if (ncommits > 0)
+			check_formats(&rv, commits, ncommits);
+
+		/* (trees by themselves: a root's, and plain ones) */
+		for (int i = 0; i < nroots; i++)
+		{
+			ProllyNodeRef ref = {0};
+
+			ref.hash = roots[i];
+			if (!PROLLY_CALL(rv.cs, has, rv.store, &roots[i]))
+				PROLLY_CALL(dc.canonicalizer, walk, &ref, receive_visit, &rv);
+		}
+		if (ntrees > 0)
+		{
+			const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+			ProllyTreeEnv env = {0};
+
+			env.chunk_format = prolly_chunkformat_lookup("basic");
+			env.chunker = prolly_chunker_lookup("bytes");
+			env.hash = prolly_content_hash();
+			env.chunk_store = rv.cs;
+			env.chunks = rv.store;
+			env.compare = prolly_bytes_compare;
+			for (int i = 0; i < ntrees; i++)
+			{
+				ProllyNodeRef ref = {0};
+
+				ref.hash = trees[i];
+				if (!PROLLY_CALL(rv.cs, has, rv.store, &trees[i]))
+					(void) PROLLY_CALL(tree, walk, &env, &ref, receive_visit, &rv);
+			}
+		}
 	}
 	PG_FINALLY();
 	{
@@ -610,7 +644,7 @@ static uint64
 chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			   const ProllyHash *commits, int ncommits)
 {
-	return receive_until(rr, remote, commits, ncommits, NULL, 0);
+	return receive_until(rr, remote, commits, ncommits, NULL, 0, NULL, 0, NULL, 0);
 }
 
 static uint64
@@ -618,7 +652,17 @@ chunks_receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 					 const ProllyHash *commits, int ncommits,
 					 const ProllyHash *stops, int nstops)
 {
-	return receive_until(rr, remote, commits, ncommits, stops, nstops);
+	return receive_until(rr, remote, commits, ncommits, stops, nstops,
+						 NULL, 0, NULL, 0);
+}
+
+static uint64
+chunks_receive_trees(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+					 const ProllyHash *roots, int nroots,
+					 const ProllyHash *trees, int ntrees)
+{
+	return receive_until(rr, remote, NULL, 0, NULL, 0, roots, nroots,
+						 trees, ntrees);
 }
 
 /* Cloning */
@@ -1056,5 +1100,6 @@ const ProllyTransferRoutine prolly_transfer_chunks = {
 	.receive = chunks_receive,
 	.clone = chunks_clone,
 	.receive_until = chunks_receive_until,
+	.receive_trees = chunks_receive_trees,
 	.send = chunks_send,
 };

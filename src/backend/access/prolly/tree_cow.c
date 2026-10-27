@@ -88,6 +88,7 @@
 
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_window.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -287,9 +288,13 @@ node_read_level(const ProllyTreeEnv *env, const ProllyNodeRef *ref, TNode *node,
 	else
 	{
 		if (!PROLLY_CALL(env->chunk_store, get, env->chunks, &ref->hash, &data))
+		{
+			/* (a severed commit's tree: past the history horizon) */
+			prolly_window_check_root(&ref->hash);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("prolly tree node missing from its chunk store")));
+		}
 		if (env->counters)
 			env->counters->nodes_read++;
 	}

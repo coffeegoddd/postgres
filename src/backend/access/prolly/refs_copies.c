@@ -10538,6 +10538,37 @@ typedef struct WalkState
  * is walked, then its commit; another chunk that isn't a commit is passed
  * over, nothing of it visited.
  */
+/*
+ * A severed commit's trees: walked where the store has them still (not
+ * collected yet), else offered to the visitor, which must have them.
+ */
+static void
+severed_trees(const ProllyHash *id, const ProllyCommitInfo *info,
+			  WalkState *ws)
+{
+	ProllyNodeRef ref;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	for (int t = 0; t < 2; t++)
+	{
+		const ProllyNodeRef *r = t == 0 ? &info->root : &info->dependencies;
+
+		if (t == 1 && !info->has_dependencies)
+			break;
+		ref = *r;
+		if (PROLLY_CALL(env.chunk_store, has, env.chunks, &r->hash))
+		{
+			if (t == 0)
+				PROLLY_CALL(dc.canonicalizer, walk, &ref, ws->visit, ws->arg);
+			else
+				(void) PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg);
+		}
+		else if (ws->visit(&ref, 0, ws->arg))
+			prolly_window_check_missing(id);
+	}
+}
+
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
 {
@@ -10618,10 +10649,22 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		ref_of(next, &ref);
 		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
 			continue;
+
+		/*
+		 * (past the history horizon, its commit object kept, its data
+		 * severed: whole where the visitor already has it, as a remote it
+		 * is sent to may, else the walk can't go on)
+		 */
+		if (prolly_window_archived(next))
+		{
+			severed_trees(next, &info, ws);
+			goto parents;
+		}
 		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
 		if (info.has_dependencies)
 			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, ws->visit,
 							   ws->arg);
+parents:
 		for (int i = info.nparents - 1; i >= 0; i--)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));

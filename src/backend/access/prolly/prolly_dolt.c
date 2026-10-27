@@ -4610,9 +4610,6 @@ log_walk(List *starts)
 		{
 			LogEntry   *p;
 
-			/* (a listing stops at the history horizon) */
-			if (prolly_window_stops_at(&e->info.parents[i]))
-				continue;
 			key = prolly_hash_key(&e->info.parents[i]);
 			p = hash_search(seen, &key, HASH_ENTER, &found);
 			if (!found)
@@ -8537,6 +8534,8 @@ dolt_history_table(PG_FUNCTION_ARGS)
 		char	   *email;
 
 		CHECK_FOR_INTERRUPTS();
+		if (prolly_window_rows_severed(&e->info.id))
+			continue;
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
@@ -8601,6 +8600,8 @@ dolt_history_table_by_name(PG_FUNCTION_ARGS)
 		ProllyNodeRef data;
 
 		CHECK_FOR_INTERRUPTS();
+		if (prolly_window_rows_severed(&e->info.id))
+			continue;
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
