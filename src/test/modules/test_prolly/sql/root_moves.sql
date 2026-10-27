@@ -125,5 +125,59 @@ SELECT count(*) - :kept_before AS kept_within FROM test_kept_commits('main');
 RESET prolly.root_interval;
 RESET dolt.transaction_commit;
 
+-- a merge between the nearest root and the commit, with a dirty working
+-- set: the move ends at the merge's rows, its other parent's included,
+-- writing no more rows than the commits between changed (a root on the
+-- other parent's side, the branch's, is found by the walk only when on
+-- the first parents; here none pays, and the rows are written)
+SET prolly.root_interval_commits = 100;
+SELECT dolt_branch('side');
+SELECT dolt_checkout('side');
+UPDATE rm.t SET v = 200 WHERE id % 50 = 45;
+SELECT dolt_commit('-am', 'side1') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+UPDATE rm.t SET v = 201 WHERE id % 50 = 46;
+SELECT dolt_commit('-am', 'm1') IS NOT NULL AS committed;
+SELECT dolt_merge('side') IS NOT NULL AS merged;
+SELECT dolt_hashof('HEAD') AS merged_at \gset
+INSERT INTO digests VALUES (100, digest());
+UPDATE rm.t SET v = 202 WHERE id % 50 BETWEEN 10 AND 30;
+SELECT dolt_commit('-am', 'm2') IS NOT NULL AS committed;
+UPDATE rm.t SET v = -3 WHERE id <= 3000;
+SELECT pg_stat_force_next_flush();
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'merged_at');
+SELECT pg_stat_force_next_flush();
+SELECT name, CASE WHEN name = 'apply_rows' THEN (value <= 3 * 100)::int
+	ELSE value END FROM since(:'before') WHERE name <> 'pages_kept';
+SELECT digest() = (SELECT d FROM digests WHERE n = 100) AS at_merge,
+	NOT EXISTS (SELECT FROM dolt_status) AS clean;
+SELECT dolt_branch('-D', 'side');
+RESET prolly.root_interval_commits;
+
+-- a move to a commit older than any the branch keeps looks no further
+-- back than the oldest it keeps: a few commits read, not the history
+SET prolly.kept_commits = 2;
+DO $$
+BEGIN
+	FOR i IN 1..20 LOOP
+		UPDATE rm.t SET v = 300 + i WHERE id % 50 = i;
+		PERFORM dolt_commit('-am', 'k' || i);
+		INSERT INTO digests VALUES (300 + i, digest());
+	END LOOP;
+END $$;
+SELECT count(*) AS kept FROM test_kept_commits('main');
+CREATE FUNCTION reads() RETURNS bigint LANGUAGE sql AS $$
+	SELECT sum(value)::bigint FROM pg_stat_prolly
+	WHERE name IN ('commits_read', 'commit_cache_hits')
+$$;
+SELECT pg_stat_force_next_flush();
+SELECT reads() AS reads_before \gset
+SELECT dolt_reset('--hard', dolt_hashof('HEAD~10'));
+SELECT pg_stat_force_next_flush();
+SELECT reads() - :reads_before < 40 AS few_commits_read;
+SELECT digest() = (SELECT d FROM digests WHERE n = 310) AS at_k10;
+RESET prolly.kept_commits;
+
 \c :home
 DROP DATABASE root_moves;

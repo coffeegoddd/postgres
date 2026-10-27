@@ -150,6 +150,19 @@ typedef struct HeadRestore
 	FullTransactionId xid;
 } HeadRestore;
 
+/*
+ * When a branch's root was last kept, or a keep of it last tried, by any
+ * backend: see branch_root_claim().
+ */
+#define ROOT_TIMES	64
+
+typedef struct RootTime
+{
+	Oid			database;
+	Oid			branch;			/* InvalidOid: a free entry */
+	TimestampTz at;
+} RootTime;
+
 typedef struct BranchGenerations
 {
 	LWLock		lock;
@@ -166,6 +179,8 @@ typedef struct BranchGenerations
 	int			restores_hand;
 	FullTransactionId restores_evicted;
 	HeadRestore restores[HEAD_RESTORES];
+	int			root_times_hand;
+	RootTime	root_times[ROOT_TIMES];
 } BranchGenerations;
 
 static BranchGenerations *gens = NULL;
@@ -1198,4 +1213,85 @@ branch_writers_settled(Oid branch, Snapshot snap)
 		g->overflow_writers == 0 && sees_writers(g, e, snap);
 	LWLockRelease(&g->lock);
 	return settled;
+}
+
+/*
+ * Roots are captured no more often than an interval asks: each branch's
+ * last root time is shared by every backend, so that one of them, not each,
+ * reads the branch's kept commits and tries a keep once the interval has
+ * passed.  The entry of the session's database's branch, made if need be
+ * (the oldest let go of: its branch then counts as never kept, and reads
+ * its kept commits once more).  Under the lock.
+ */
+static RootTime *
+root_time(BranchGenerations *g, Oid branch, bool make)
+{
+	RootTime   *oldest = NULL;
+
+	for (int i = 0; i < ROOT_TIMES; i++)
+	{
+		RootTime   *t = &g->root_times[i];
+
+		if (t->database == MyDatabaseId && t->branch == branch)
+			return t;
+	}
+	if (!make)
+		return NULL;
+	for (int i = 0; i < ROOT_TIMES; i++)
+	{
+		RootTime   *t = &g->root_times[(g->root_times_hand + i) % ROOT_TIMES];
+
+		if (!OidIsValid(t->branch))
+		{
+			oldest = t;
+			break;
+		}
+		if (oldest == NULL || t->at < oldest->at)
+			oldest = t;
+	}
+	oldest->database = MyDatabaseId;
+	oldest->branch = branch;
+	oldest->at = 0;
+	g->root_times_hand = (g->root_times_hand + 1) % ROOT_TIMES;
+	return oldest;
+}
+
+/*
+ * Is branch's last root time, by any backend, less than ms ago?  With
+ * claim, if not, it is made now: the caller reads the branch's kept
+ * commits and tries a keep, and every other backend's commit within the
+ * interval tries none.
+ */
+bool
+branch_root_soon(Oid branch, int ms, bool claim)
+{
+	BranchGenerations *g = shared();
+	TimestampTz now = GetCurrentTimestamp();
+	RootTime   *t;
+	bool		soon;
+
+	LWLockAcquire(&g->lock, claim ? LW_EXCLUSIVE : LW_SHARED);
+	t = root_time(g, branch, claim);
+	soon = t != NULL && !TimestampDifferenceExceeds(t->at, now, ms);
+	if (claim && !soon)
+		t->at = now;
+	LWLockRelease(&g->lock);
+	return soon;
+}
+
+/*
+ * Branch's root was last kept at 'at', or a keep tried then: its last root
+ * time, unless later already.
+ */
+void
+branch_root_note(Oid branch, TimestampTz at)
+{
+	BranchGenerations *g = shared();
+	RootTime   *t;
+
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	t = root_time(g, branch, true);
+	if (at > t->at)
+		t->at = at;
+	LWLockRelease(&g->lock);
 }

@@ -60,7 +60,7 @@ SELECT test_bmap_root_held(:big_root) = pg_relation_size('big') / 8192 AS its_le
 SELECT * FROM test_bmap_roots();
  held | slots 
 ------+-------
-    1 |    72
+    1 |    68
 (1 row)
 
 -- more roots than a relation's root page keeps snapshots: all held
