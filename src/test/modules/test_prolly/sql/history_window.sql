@@ -313,8 +313,9 @@ WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
 \c regress_history_window
 DROP DATABASE regress_history_window_f;
 
--- A commit dated far ahead ages from when a sever first saw it here, with
--- a warning: once the window is past that, it is severed like any other.
+-- A commit dated far ahead ages from when it arrived here, the head log's
+-- first move to it, with a warning: once the window is past that, it is
+-- severed like any other, the first plan to see it included.
 CREATE DATABASE regress_history_window_g;
 \c regress_history_window_g
 CREATE SCHEMA hw VERSIONED;
@@ -327,15 +328,15 @@ UPDATE hw.t SET v = 'now';
 SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
 ALTER DATABASE regress_history_window_g SET prolly.history_warm = '1 second';
 ALTER DATABASE regress_history_window_g SET prolly.history_window_action = delete;
+SELECT pg_sleep(1.5);
 \c regress_history_window_g
 \set VERBOSITY terse
-SELECT fragment, commits FROM dolt_history_sever();
-SELECT pg_sleep(1.5);
-UPDATE hw.t SET v = 'later';
-SELECT length(dolt_commit('-am', 'later')::text) > 0 AS committed;
 SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
 	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
 WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+SELECT fragment, commits FROM dolt_history_sever();
+-- (nothing more past the window)
+SELECT count(*) FROM prolly_history_plan(NULL) WHERE kind = 'severed';
 \c regress_history_window
 DROP DATABASE regress_history_window_g;
 
