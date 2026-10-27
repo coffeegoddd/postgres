@@ -487,6 +487,8 @@ tests += {
       't/780_root_index_ams_writers.pl',
       't/781_root_vector_indexes.pl',
       't/782_root_records_redo.pl',
+      't/783_frozen_root_redo_after_copy.pl',
+      't/784_lazy_frozen_root_redo_after_copy.pl',
       't/762_root_freezing_redo.pl',
       't/765_lazy_root_freezing.pl',
       't/520_revision_reads.pl',
