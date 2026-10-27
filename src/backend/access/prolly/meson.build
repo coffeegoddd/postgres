@@ -53,6 +53,7 @@ backend_sources += files(
   'prolly_shmem.c',
   'prolly_table.c',
   'prolly_dolt.c',
+  'prolly_log_count.c',
   'prolly_snapshot.c',
   'prolly_history_scan.c',
   'prolly_log_scan.c',

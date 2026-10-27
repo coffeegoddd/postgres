@@ -43,6 +43,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_proc.h"
 #include "utils/acl.h"
+#include "access/prolly_function_scan.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -426,20 +427,6 @@ typedef struct HistoryScanState
 	bool		read;
 } HistoryScanState;
 
-/*
- * The function's own check, which a function scan makes as it begins: the
- * scan reads what the function would, so one who can't execute it can't.
- */
-static void
-check_execute(Oid funcid)
-{
-	AclResult	aclresult = object_aclcheck(ProcedureRelationId, funcid,
-											GetUserId(), ACL_EXECUTE);
-
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
-	InvokeFunctionExecuteHook(funcid);
-}
 
 static void
 history_begin(CustomScanState *node, EState *estate, int eflags)
@@ -451,7 +438,7 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 	int			ncolumns = scan->natts - 1;
 	Bitmapset  *used = NULL;
 
-	check_execute(F_DOLT_HISTORY_TABLE_ANYELEMENT);
+	prolly_function_scan_check(F_DOLT_HISTORY_TABLE_ANYELEMENT);
 	/*
 	 * (the scan's tuple: the function's columns, then the row whole, formed
 	 * from them only if the plan reads it)

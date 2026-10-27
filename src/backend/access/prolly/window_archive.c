@@ -1506,10 +1506,10 @@ age_date(Plan *plan, PlanCommit *pc)
 		plan->arrivals = lappend(plan->arrivals, pc);
 		if (!plan->quiet)
 			ereport(WARNING,
-					(errmsg("commit %s is dated %s, after it arrived here",
-							prolly_hash_hex(&pc->id),
+					(errmsg("a commit is dated %s, after it arrived here",
 							timestamptz_to_str(pc->e.committed_at)),
-					 errdetail("It ages from %s instead.",
+					 errdetail("Commit %s ages from %s instead.",
+							   prolly_hash_hex(&pc->id),
 							   timestamptz_to_str(pc->arrived))));
 	}
 	pfree(k.data);
@@ -4083,6 +4083,25 @@ prolly_window_archived(const ProllyHash *id)
 	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, archived))
 		return false;
 	return PROLLY_CALL(c.history_window, archived, id);
+}
+
+static void
+note_fragment(const ProllyWindowFragment *f, void *arg)
+{
+	*(bool *) arg = true;
+}
+
+bool
+prolly_window_severed(void)
+{
+	ProllyDatabaseComponents c;
+	bool		any = false;
+
+	prolly_database_components(&c);
+	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, fragments))
+		return false;
+	PROLLY_CALL(c.history_window, fragments, note_fragment, &any);
+	return any;
 }
 
 void
