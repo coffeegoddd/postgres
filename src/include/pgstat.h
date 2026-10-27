@@ -818,9 +818,14 @@ typedef enum PgStat_ProllyCounter
 										 * collection */
 	PGSTAT_PROLLY_BRANCHES_LISTED,	/* branches visited by listings of
 									 * the branches with copies */
+	PGSTAT_PROLLY_BMAP_ROOTS_CAPTURED,	/* block-mapped relations' roots
+										 * captured into their stores */
+	PGSTAT_PROLLY_BMAP_ROOTS_RELEASED,	/* captured roots let go of */
+	PGSTAT_PROLLY_BMAP_ROOTS_SHARED,	/* relations made of a captured
+										 * root */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BRANCHES_LISTED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_ROOTS_SHARED + 1)
 
 typedef struct PgStat_ProllyStats
 {

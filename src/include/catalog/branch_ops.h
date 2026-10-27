@@ -35,9 +35,11 @@ typedef bool (*BranchVisitWhile) (const char *name, Oid branch, void *arg);
 
 /*
  * A relation's pages as keep() kept them, for restore() to give back: the
- * storage that keeps them (its tablespace, 0 for the database's, and file
- * number), the snapshot's id there, and the relation's oldest unfrozen
- * transaction and multixact ids then (its pages hold none older).
+ * storage they were kept of (its tablespace, 0 for the database's, and
+ * file number: a restore of them since names its new storage), the root
+ * that keeps them in the tablespace's page store ('snapshot', its id
+ * there), and the relation's oldest unfrozen transaction and multixact ids
+ * then (its pages hold none older).
  */
 typedef struct BranchKeptRelation
 {
@@ -51,12 +53,11 @@ typedef struct BranchKeptRelation
 
 /*
  * What is left of a relation's kept pages (kept_status()): restorable, as
- * restore() and share_kept() require; held, its snapshot still in the
- * storage that kept it but the pages not to be given back (its rows'
- * transaction ids older than the database still knows); or gone, that
- * storage or its snapshot no longer there, or the relation on other
- * storage now, its old storage going with the change, so nothing is left
- * to give back or let go of.
+ * restore() and share_kept() require; held, its root still kept but the
+ * pages not to be given back (its rows' transaction ids older than the
+ * database still knows); or gone, its root no longer kept, or the
+ * relation on other storage now than the one kept (or restored since) of
+ * it, so nothing is left to give back.
  */
 typedef enum BranchKeptStatus
 {
@@ -205,20 +206,21 @@ typedef struct BranchOpsRoutine
 
 	/*
 	 * Optional: keep the pages of the session branch's relations relids as
-	 * they are, each in a snapshot of its storage that later changes don't
-	 * touch, into kept[] (one for each, in order): O(1) in each relation's
-	 * size.  A relation whose pages are still those of a snapshot in
-	 * prior[] (nprior of them, of its storage) is kept by that one again;
-	 * only the others take a snapshot.  Every one of relids is locked
-	 * against writers first, without waiting (and let go after); then
-	 * settled(arg), if given, says whether their pages hold exactly what
-	 * the caller found them to.  False, nothing kept, if a lock isn't free,
-	 * settled says no, or one can't be kept (its storage can't, or keeps
-	 * too many snapshots already).  Snapshots taken by a transaction that
-	 * aborts (or a subtransaction) are let go of later.  Once they are
-	 * kept, the snapshots release[] (nrelease of them) are let go of, the
-	 * locks still held: a branch being made of kept pages (make_kept())
-	 * holds the relations against that while it reads them.
+	 * they are, each by a root of its storage captured into its page store,
+	 * which later changes don't touch, into kept[] (one for each, in
+	 * order): O(1) in each relation's size.  A relation whose pages are
+	 * still those of a root in prior[] (nprior of them, of its storage) is
+	 * kept by that one again; only the others capture one.  Every one of
+	 * relids is locked against writers first, without waiting (and let go
+	 * after); then settled(arg), if given, says whether their pages hold
+	 * exactly what the caller found them to.  False, nothing kept, if a
+	 * lock isn't free, settled says no, or one can't be kept (its storage
+	 * can't).  Roots captured by a transaction that aborts (or a
+	 * subtransaction) hold nothing, their slots reclaimed later.  Once they
+	 * are kept, the roots release[] (nrelease of them) are let go of as
+	 * the transaction commits, the locks still held: a branch being made
+	 * of kept pages (make_kept()) holds the relations against that while
+	 * it reads them.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
@@ -229,25 +231,24 @@ typedef struct BranchOpsRoutine
 	 * Optional: give the session branch's relations kept[] (nkept of them,
 	 * a table's together) back the pages keep() kept, the storage they had
 	 * going when the transaction commits, into renewed[] (each one kept as
-	 * it is now, by a snapshot of its new storage or, all unchanged since,
-	 * the same one).  O(1) in each relation's size, and nothing if none
-	 * changed since: if one did, each gets new storage made of its
-	 * snapshot (with no free space or visibility map), its row the oldest
+	 * it is now: by the same root, named as of its new storage).  O(1) in
+	 * each relation's size, and nothing if none changed since: if one did,
+	 * each gets new storage made of its root (with no free space or
+	 * visibility map), its row the oldest
 	 * transaction ids it had then (one unchanged may hold hints, in its
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its
-	 * snapshot is gone, its rows' transaction ids are older than the
+	 * root is gone, its rows' transaction ids are older than the
 	 * database still knows, or one that changed is in use (each is locked
 	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
 	 * refuses, while the session itself has it open or an AFTER trigger's
 	 * event queued on it; the locks taken are kept).
 	 * The storage a relation is given replaces the storage that kept its
-	 * pages, which goes as the transaction commits, and with it every
-	 * other snapshot there: so each of carry[] (ncarry of them, other
-	 * commits' kept pages of the same relations) that is a snapshot of a
-	 * replaced storage is kept by the new storage too, O(1) each, and
-	 * carried[] (one for each, in order) names it there; one not carried
-	 * (not of a replaced storage, gone, or no room) is copied as it is.
+	 * pages, which goes as the transaction commits; the roots stay, so each
+	 * of carry[] (ncarry of them, other commits' kept pages of the same
+	 * relations) kept of a replaced storage is named as of the new storage
+	 * in carried[] (one for each, in order), nothing copied; one not of a
+	 * replaced storage is copied as it is.
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the restored storage once it commits.
 	 */
@@ -258,8 +259,8 @@ typedef struct BranchOpsRoutine
 							BranchLockWait *wait);
 
 	/*
-	 * Optional: let go of a snapshot keep() or restore() took, if its
-	 * storage still has it (a dropped relation's went with it).
+	 * Optional: let go of a root keep() captured, as the transaction
+	 * commits, if its page store still keeps it.
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
 
@@ -291,8 +292,9 @@ typedef struct BranchOpsRoutine
 	 * branch source's (the session's own, or another's), O(1) each, as
 	 * restore() gives them, whatever source's working set is now.  Each
 	 * must be stored alike on both branches, as share() requires, with
-	 * source's still on the storage that kept it, its snapshot there and
-	 * its rows' transaction ids ones the database still knows.  The source
+	 * source's still on the storage that kept it, its root still kept and
+	 * its rows' transaction ids ones the database still knows, and one at
+	 * least no longer of its root here (else false: nothing to give).  The source
 	 * is held against deletion and its relations against letting go of the
 	 * pages (ShareUpdateExclusiveLock), the session's locked as TRUNCATE
 	 * locks them (and refused while the session has one open, as restore()
@@ -303,8 +305,8 @@ typedef struct BranchOpsRoutine
 	 * so the caller gives only pages kept before every snapshot there is.
 	 * With source the session's own branch, carry[] is carried into the
 	 * new storage as restore() carries it, carried[] naming each there
-	 * (every one of them, the snapshot shared included, none being taken
-	 * after); with another's, carried[] is carry[] as it is.
+	 * (every one of them, the root shared included); with another's,
+	 * carried[] is carry[] as it is (carry may then be NULL, ncarry 0).
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept, const BranchKeptRelation *carry,

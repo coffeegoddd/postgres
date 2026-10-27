@@ -85,7 +85,7 @@ SELECT name, value > 0 AS some FROM since(:'before');
 -----------------------+------
  apply_rows            | f
  first_use_tables_kept | f
- move_tables_shared    | t
+ move_tables_shared    | f
  relations_restored    | t
 (4 rows)
 
@@ -301,7 +301,7 @@ SELECT name, value > 0 AS some FROM since(:'before');
 -----------------------+------
  apply_rows            | f
  first_use_tables_kept | f
- move_tables_shared    | t
+ move_tables_shared    | f
  relations_restored    | t
 (4 rows)
 

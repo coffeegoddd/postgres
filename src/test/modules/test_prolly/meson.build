@@ -233,6 +233,8 @@ tests += {
       'rebase',
       'bmap_tree_share',
       'bmap_tree_snapshots',
+      'bmap_captured_roots',
+      'root_moves',
       'kept_pages',
       'kept_head_restore',
       'bounded_counts',

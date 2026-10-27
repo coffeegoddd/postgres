@@ -347,6 +347,66 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 }
 
 /*
+ * RelationCreateStorageFromRoot
+ *		Create a permanent relation's storage as a copy of a root captured
+ *		into its page store (bmap_root_capture()).
+ *
+ * As RelationCreateStorageFromSnapshot(): the main fork shares the root's
+ * pages until it changes one (bmap_share_root()), O(1) in the relation's
+ * size.  It gets no free space map or visibility map, so the relation
+ * claims no page all-visible and knows of no free space until vacuumed,
+ * unless maps_from: then they are copies of that relation's (the caller
+ * knows its pages are the root's still, and VACUUM kept from setting a bit
+ * meanwhile).  The storage is deleted if the transaction aborts when
+ * register_delete.
+ */
+SMgrRelation
+RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
+							  SMgrRelation maps_from, bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/* (registered first, as for a share) */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	bmap_share_root(root, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+	if (maps_from)
+	{
+		FlushRelationsAllBuffers(&maps_from, 1);
+		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+		{
+			if (!smgrexists(maps_from, fork))
+				continue;
+			smgrcreate(srel, fork, false);
+			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+			RelationCopyStorage(maps_from, srel, fork, RELPERSISTENCE_PERMANENT);
+		}
+	}
+
+	/*
+	 * No pending sync: the root's own blocks were logged as images when it
+	 * was captured, and the share is logged.
+	 */
+	return srel;
+}
+
+/*
  * Perform XLogInsert of an XLOG_SMGR_CREATE record to WAL.
  */
 void

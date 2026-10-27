@@ -120,6 +120,10 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 										   "snapshot carried" :
 										   (xlrec->flags & BMAP_TREE_PRESERVE_LOGGED) ?
 										   "snapshot (images logged)" : "snapshot");
+				else if (xlrec->op == BMAP_TREE_CAPTURE)
+					appendStringInfoString(buf, "root captured (images logged)");
+				else if (xlrec->op == BMAP_TREE_ROOT_SLOT)
+					appendStringInfoString(buf, "root slot");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

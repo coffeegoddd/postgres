@@ -64,13 +64,14 @@
  *				   first (see "Kept pages"): each the transaction that
  *				   retired it (a FullTransactionId, native byte order; 0
  *				   while it is kept), the transaction that kept it (the
- *				   same), its id and the branch's
+ *				   same), when it was kept (a TimestampTz, the same), its
+ *				   id and the branch's
  *				   baseline then (hash length, hash each), the count of
  *				   tables (a varint), and for each its qualified name (a
  *				   varint length, then the bytes), its data tree at the
  *				   commit (hash length, hash), the count of its
  *				   relations (a varint) and each relation's OID,
- *				   tablespace, file number, snapshot (8 bytes), and
+ *				   tablespace, file number, captured root (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
  *	'k' commit name -> nothing: branch name keeps pages as of the commit
@@ -275,6 +276,7 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/guc.h"
 #include "utils/timestamp.h"
 
 #define TAG_BRANCH		'B'
@@ -328,9 +330,10 @@
  * no classes (a move keeps a table's relation, by OID); 19: each kept
  * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
- * case folded.
+ * case folded; 20: kept relations' pages by roots their page stores
+ * keep (not snapshots their storage keeps), and each kept commit's time.
  */
-#define REFS_FORMAT		"19"
+#define REFS_FORMAT		"20"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -3176,12 +3179,18 @@ static Oid	table_named(const char *name);
  * horizon), the mover's own among them.
  */
 static bool
-kept_before_every_snapshot(const ProllyKeptCommit *kc)
+kept_before_every_snapshot_xid(FullTransactionId kept_by)
 {
-	TransactionId xid = XidFromFullTransactionId(kc->kept_by);
+	TransactionId xid = XidFromFullTransactionId(kept_by);
 
 	return TransactionIdIsNormal(xid) &&
 		TransactionIdPrecedes(xid, GetOldestNonRemovableTransactionId(NULL));
+}
+
+static bool
+kept_before_every_snapshot(const ProllyKeptCommit *kc)
+{
+	return kept_before_every_snapshot_xid(kc->kept_by);
 }
 
 /*
@@ -3567,14 +3576,15 @@ move_settled_checked(void *arg)
  * Kept pages (#767).  When a branch's working set is known to be a commit's
  * root (a commit's fold made it; a move settled there), the pages of its
  * tables are kept as they are: each block-mapped relation stored with a
- * table (its heap, indexes, TOAST table and change log) by a snapshot of
- * its storage (branch operations' keep()), O(1) in its size, and only
- * those that changed since a commit kept already take a new one.  The
+ * table (its heap, indexes, TOAST table and change log) by a root of its
+ * storage captured into its page store (branch operations' keep()), O(1)
+ * in its size, and only those that changed since a commit kept already
+ * take a new one.  The
  * refs keep, for each branch, the last prolly.kept_commits commits so kept
  * (TAG_KEPT): each with the branch's baseline then, and each table's name
  * and relations.  A move back to one of them (a hard reset to the head, or
  * to one before) gives each table the pages kept (restore()): new storage
- * made of each snapshot, O(1), for each relation that changed since, and
+ * made of each root, O(1), for each relation that changed since, and
  * the baseline takes the table's entry from the kept one (its change log
  * is as it was then too), so its fold reads nothing.  Whatever else differs
  * (definitions, sequences, a table that couldn't be restored) the move then
@@ -3585,8 +3595,8 @@ move_settled_checked(void *arg)
  * snapshot the commit or move went by must have seen every writer of the
  * branch that ended (branch_writers_settled()).  So the pages hold exactly
  * the commit's rows, and the keeping transaction's own, which commit with
- * it.  Not at a transaction's own commit (dolt.transaction_commit): its
- * head moves at every transaction, which would keep pages each time.
+ * it.  At a transaction's own commit (dolt.transaction_commit), whose head
+ * moves at every transaction, only once a root is due (root_due()).
  *
  * A branch's first use at a commit another branch keeps the pages of is
  * made of them (make_of_kept(), branch operations' make_kept(), #489):
@@ -3606,6 +3616,9 @@ move_settled_checked(void *arg)
  */
 int			prolly_kept_commits = 2;
 int			prolly_restore_min_changes = 2;
+int			prolly_root_interval = -1;
+int			prolly_root_interval_commits = 1;
+
 
 typedef struct KeptTable
 {
@@ -3621,6 +3634,7 @@ typedef struct KeptCommit
 								 * (invalid: kept) */
 	FullTransactionId kept_by;	/* who kept them, having seen every writer
 								 * of the pages end */
+	TimestampTz kept_at;		/* when */
 	ProllyHash	commit;
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
 	int			ntables;
@@ -3628,6 +3642,79 @@ typedef struct KeptCommit
 } KeptCommit;
 
 #define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
+
+static bool commit_height(const ProllyHash *id, int64 *height);
+
+/*
+ * Roots are captured at commits, but no more often than the interval asks:
+ * a commit is kept only once prolly.root_interval has passed since the
+ * branch's newest kept commit was kept and prolly.root_interval_commits
+ * commits have been made since it.  By default (-1) the interval is 0
+ * (every commit) for commits made by hand, and a second under
+ * dolt.transaction_commit, whose every transaction is a commit.  A move to
+ * a commit that wasn't kept restores the nearest kept commit before it
+ * and writes the rows the two differ by, at most an interval's.  Each
+ * backend remembers the time its branch was last found kept, so a commit
+ * within the interval asks nothing of the refs.
+ */
+static char last_root_branch[NAMEDATALEN];
+static Oid	last_root_db = InvalidOid;
+static TimestampTz last_root_at = 0;
+
+static int
+root_interval_ms(void)
+{
+	const char *tc;
+
+	if (prolly_root_interval >= 0)
+		return prolly_root_interval;
+	tc = GetConfigOption("dolt.transaction_commit", true, false);
+	return tc != NULL && strcmp(tc, "on") == 0 ? 1000 : 0;
+}
+
+/* Is a commit of branch name too soon after its last root to keep? */
+static bool
+root_soon(const char *name)
+{
+	int			ms = root_interval_ms();
+
+	return ms > 0 && last_root_db == MyDatabaseId &&
+		strcmp(last_root_branch, name) == 0 &&
+		!TimestampDifferenceExceeds(last_root_at, GetCurrentTimestamp(), ms);
+}
+
+static void
+root_note(const char *name, TimestampTz at)
+{
+	strlcpy(last_root_branch, name, sizeof(last_root_branch));
+	last_root_db = MyDatabaseId;
+	last_root_at = at;
+}
+
+/*
+ * Is a root of branch name due at commit_id, its newest kept commit being
+ * newest (NULL: none)?  The interval since it was kept, and the commits
+ * made since (by height), each at least the settings'.
+ */
+static bool
+root_due(const char *name, const KeptCommit *newest, const ProllyHash *commit_id)
+{
+	int			ms = root_interval_ms();
+	int64		h;
+	int64		hn;
+
+	if (newest == NULL)
+		return true;
+	root_note(name, newest->kept_at);
+	if (ms > 0 &&
+		!TimestampDifferenceExceeds(newest->kept_at, GetCurrentTimestamp(), ms))
+		return false;
+	if (prolly_root_interval_commits > 1 &&
+		commit_height(commit_id, &h) && commit_height(&newest->commit, &hn) &&
+		h - hn < prolly_root_interval_commits)
+		return false;
+	return true;
+}
 
 static void
 kept_key(StringInfo key, const char *name)
@@ -3643,6 +3730,7 @@ kept_encode(StringInfo v, List *kept)
 	{
 		appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
 		appendBinaryStringInfo(v, &kc->kept_by, sizeof(FullTransactionId));
+		appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
 		put_hash(v, &kc->commit);
 		put_hash(v, &kc->baseline);
 		prolly_put_varint(v, kc->ntables);
@@ -3688,12 +3776,15 @@ kept_decode(const char *p, const char *end)
 		KeptCommit *kc = palloc0(sizeof(KeptCommit));
 		uint64		n;
 
-		if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId)))
+		if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId) +
+								   sizeof(TimestampTz)))
 			kept_corrupt();
 		memcpy(&kc->retired, p, sizeof(FullTransactionId));
 		p += sizeof(FullTransactionId);
 		memcpy(&kc->kept_by, p, sizeof(FullTransactionId));
 		p += sizeof(FullTransactionId);
+		memcpy(&kc->kept_at, p, sizeof(TimestampTz));
+		p += sizeof(TimestampTz);
 		p = get_hash(p, end, &kc->commit);
 		p = get_hash(p, end, &kc->baseline);
 		n = prolly_get_varint(&p, end);
@@ -3957,8 +4048,8 @@ kept_holds(List *kept, const BranchKeptRelation *k)
 			{
 				const BranchKeptRelation *o = &kc->tables[t].rels[r];
 
+				/* (a root's id names it in its tablespace's store) */
 				if (o->snapshot == k->snapshot &&
-					o->relfilenumber == k->relfilenumber &&
 					o->tablespace == k->tablespace)
 					return true;
 			}
@@ -4149,15 +4240,32 @@ kept_commit_status(const KeptCommit *kc)
  * till it ends: were they asked too, a transaction's commits would each
  * ask of all the ones before.
  */
+/* kept commits kept_drop_dead() asks of at most */
+#define KEPT_ASKED_MAX	8
+
 static List *
 kept_drop_dead(List *kept, const KeptCommit *but)
 {
 	List	   *left = NIL;
+	int			asked = 0;
 
 	foreach_ptr(KeptCommit, o, kept)
 	{
-		BranchKeptStatus s = o == but || FullTransactionIdIsValid(o->retired) ?
-			BRANCH_KEPT_RESTORABLE : kept_commit_status(o);
+		BranchKeptStatus s;
+
+		/*
+		 * (only the newest few: a commit's every table asked costs catalog
+		 * reads, and a branch may keep thousands; one older found gone or
+		 * held when a move asks of it is passed over then)
+		 */
+		if (o == but || FullTransactionIdIsValid(o->retired) ||
+			asked >= KEPT_ASKED_MAX)
+			s = BRANCH_KEPT_RESTORABLE;
+		else
+		{
+			s = kept_commit_status(o);
+			asked++;
+		}
 
 		if (s == BRANCH_KEPT_GONE)
 			continue;
@@ -4223,6 +4331,23 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 		snap == NULL || RecoveryInProgress())
 		return;
 	name = branch_ops()->current();
+	if (root_soon(name))
+		return;
+	kept = kept_get(name);
+	{
+		KeptCommit *newest = NULL;
+
+		foreach_ptr(KeptCommit, o, kept)
+		{
+			if (!FullTransactionIdIsValid(o->retired))
+			{
+				newest = o;
+				break;
+			}
+		}
+		if (!root_due(name, newest, commit_id))
+			return;
+	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, tables, root, NULL, note_table, &tables);
 	foreach_ptr(NamedTree, t, tables)
@@ -4242,7 +4367,6 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	 * (the pages of retired commits now let go of are kept by no commit
 	 * after: those the others hold stay)
 	 */
-	kept = kept_get(name);
 	foreach_ptr(KeptCommit, o, kept)
 	{
 		if (kept_releasable(o))
@@ -4265,8 +4389,16 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	}
 	prior = palloc_array(BranchKeptRelation, Max(nprior, 1));
 	nprior = 0;
+
+	/*
+	 * (a relation unchanged since one of the newest few kept commits
+	 * reuses its root; asking each of thousands would cost a read of every
+	 * root for every relation)
+	 */
 	foreach_ptr(KeptCommit, o, holding)
 	{
+		if (foreach_current_index(o) >= KEPT_ASKED_MAX)
+			break;
 		for (int t = 0; t < o->ntables; t++)
 			for (int r = 0; r < o->tables[t].nrels; r++)
 				prior[nprior++] = o->tables[t].rels[r];
@@ -4292,6 +4424,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 
 	kc = palloc0(sizeof(KeptCommit));
 	kc->kept_by = GetTopFullTransactionId();
+	kc->kept_at = GetCurrentTimestamp();
 	kc->commit = *commit_id;
 	if (branch_baseline(name, &baseline))
 		kc->baseline = baseline.hash;
@@ -4334,6 +4467,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 		}
 	}
 	kept_put(name, next);
+	root_note(name, kc->kept_at);
 }
 
 /*
@@ -4628,10 +4762,12 @@ head_pages_pay(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline
  */
 static void
 restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
-			 KeptCommit *was, List **kept, List *skip,
+			 KeptCommit *was, Oid source, List **kept, List *skip,
 			 const ProllyNodeRef *moving_to, ProllyNodeRef *baseline,
 			 List **restored)
 {
+	bool		other = OidIsValid(source) && source != MyBranch;
+
 	KeptCommit *kc;
 	List	   *tables = NIL;
 	List	   *readable = NIL;
@@ -4705,12 +4841,28 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		}
 		if (target == NULL ||
 			!OidIsValid(relid) || relid != kt->rels[0].relid ||
-			!same_relations(kept_relations(relid), kt) || !may_restore(relid) ||
+			(other ? branch_ops()->share_kept == NULL ||
+			 !kept_before_every_snapshot_xid(was->kept_by) ||
+			 !same_relation_set(kept_relations(relid), kt->rels, kt->nrels) :
+			 !same_relations(kept_relations(relid), kt)) ||
+			!may_restore(relid) ||
 			few_changes(dc, baseline, relid, &target->data) ||
 			(moving_to != NULL &&
 			 (moved == NULL ||
 			  !head_pages_pay(dc, baseline, relid, &target->data, &moved->data))))
 			continue;
+		/*
+		 * (another branch's kept pages: shared, as a move shares them,
+		 * that branch's list left as it is, and the session's kept commits
+		 * of the table, of another lineage, carried nowhere)
+		 */
+		if (other)
+		{
+			if (branch_ops()->share_kept(source, kt->rels, kt->nrels, NULL, 0,
+										 NULL, &move_wait))
+				now = lappend(now, kt->name);
+			continue;
+		}
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
 		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
 		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
@@ -4730,12 +4882,15 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		return;
 
 	/*
-	 * (the restored tables' snapshots of their new storage kept at once;
-	 * the other commits whose pages were in the storage replaced dropped
-	 * with it)
+	 * (the restored tables' roots, which their new storage is of, kept at
+	 * once; the other commits whose pages were in the storage replaced
+	 * dropped with it)
 	 */
-	*kept = kept_drop_dead(lcons(kc, *kept), kc);
-	was->retired = GetTopFullTransactionId();
+	if (!other)
+	{
+		*kept = kept_drop_dead(lcons(kc, *kept), kc);
+		was->retired = GetTopFullTransactionId();
+	}
 	ref_of(&kc->baseline, &from);
 	PROLLY_CALL(dc->canonicalizer, splice_baseline, baseline, &from, now,
 				&spliced);
@@ -4743,9 +4898,90 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	*restored = list_concat(*restored, now);
 }
 
+/* commits before a move's commit that the nearest kept one is looked for in */
+#define NEAREST_KEPT_MAX	1024
+
+/*
+ * The nearest commit before commit (by first parents, as its branch made
+ * them, at most NEAREST_KEPT_MAX back) whose pages kept (the branch's list)
+ * keeps, its commit into *info: NULL if none.
+ */
+typedef struct OtherKept
+{
+	const char *current;
+	char	   *name;			/* the first other branch keeping it */
+} OtherKept;
+
+static void
+note_other_kept(const char *name, const ProllyHash *commit, void *arg)
+{
+	OtherKept  *ok = arg;
+
+	if (ok->name == NULL && strcmp(name, ok->current) != 0 &&
+		strlen(name) < NAMEDATALEN)
+		ok->name = pstrdup(name);
+}
+
+/*
+ * Commit id's kept pages, which the session branch's list (kept) has, or
+ * else another branch's (found by the refs' index of kept commits): the
+ * entry, and in *source the branch keeping it.  NULL if none does.  A
+ * commit's pages are the commit's whichever branch kept them.
+ */
+static KeptCommit *
+kept_anywhere(List *kept, const ProllyHash *id, Oid *source)
+{
+	KeptCommit *kc = kept_find(kept, id);
+	OtherKept	ok = {branch_ops()->current(), NULL};
+	HeapTuple	tup;
+
+	*source = MyBranch;
+	if (kc != NULL && kc->baseline.len > 0)
+		return kc;
+	copies_kept_holders(id, NULL, note_other_kept, &ok);
+	if (ok.name == NULL)
+		return NULL;
+	kc = kept_find(kept_get(ok.name), id);
+	if (kc == NULL || kc->baseline.len == 0)
+		return NULL;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(ok.name));
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	*source = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+	return kc;
+}
+
+static KeptCommit *
+nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
+			 Oid *source)
+{
+	ProllyHash	id;
+
+	if (commit->nparents == 0)
+		return NULL;
+	id = commit->parents[0];
+	for (int n = 0; n < NEAREST_KEPT_MAX; n++)
+	{
+		KeptCommit *kc;
+
+		if (!copies_commit_get(&id, info))
+			return NULL;
+		if ((kc = kept_anywhere(kept, &id, source)) != NULL)
+			return kc;
+		if (info->nparents == 0)
+			return NULL;
+		id = info->parents[0];
+	}
+	return NULL;
+}
+
 /*
  * Before a move of the session's branch to commit: if its pages are kept
- * as of the commit, each table's given back (restore_kept()).  The tables
+ * as of the commit, each table's given back (restore_kept()).  If not
+ * (roots are captured an interval apart), the pages kept as of the
+ * nearest kept commit before it are, where they pay, and the move then
+ * writes the rows the two differ by.  The tables
  * that aren't (the commit isn't kept, or a table's kept pages are gone: a
  * restore of another commit since gave the table new storage, and its
  * old storage, where the commit's snapshot was, went with it) are given
@@ -4767,6 +5003,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyNodeRef baseline;
 	ProllyHash	head;
 	ProllyCommitInfo at_head;
+	Oid			source;
 
 	if (prolly_kept_commits <= 0 || branch_ops()->restore == NULL ||
 		RecoveryInProgress())
@@ -4776,20 +5013,34 @@ restore_pages(const ProllyCommitInfo *commit)
 		return;
 	name = branch_ops()->current();
 	kept = kept_get(name);
-	if (kept == NIL || !branch_baseline(name, &baseline))
+	if (!branch_baseline(name, &baseline))
 		return;
-	was = kept_find(kept, &commit->id);
-	if (was != NULL && was->baseline.len > 0)
-		restore_kept(&dc, commit, was, &kept, NIL, NULL, &baseline,
+	was = kept_anywhere(kept, &commit->id, &source);
+	if (was != NULL)
+		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
+	else if ((was = nearest_kept(kept, commit, &at_head, &source)) != NULL &&
+			 !(branch_head(name, &head) && same_hash(&head, &at_head.id)))
+	{
+		int			before = list_length(restored);
+
+		/*
+		 * (as the head's below: the rows between written after, so a
+		 * snapshot older than the move must not read the pages meanwhile)
+		 */
+		restore_kept(&dc, &at_head, was, source, &kept, restored,
+					 &commit->root, &baseline, &restored);
+		if (list_length(restored) > before)
+			branch_note_head_restore(MyBranch);
+	}
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
 		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
 	{
 		int			before = list_length(restored);
 
-		restore_kept(&dc, &at_head, was, &kept, restored, &commit->root,
-					 &baseline, &restored);
+		restore_kept(&dc, &at_head, was, MyBranch, &kept, restored,
+					 &commit->root, &baseline, &restored);
 		if (list_length(restored) > before)
 			branch_note_head_restore(MyBranch);
 	}
@@ -8516,6 +8767,19 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 			PROLLY_CALL(dc.canonicalizer, advance_baseline, &baseline,
 						&info.root, &root, changes, nchanges, &next))
 			branch_set_baseline(name, &next, NULL);
+	}
+
+	/*
+	 * (the pages kept as of the commit, when a root is due: they hold the
+	 * head's rows and this transaction's, if no other writer of the branch
+	 * is still at work, which keep() checks by a snapshot taken now)
+	 */
+	if (!root_soon(name))
+	{
+		Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+
+		keep_pages(commit_id, &head, &root, snap);
+		UnregisterSnapshot(snap);
 	}
 	return 1;
 }
