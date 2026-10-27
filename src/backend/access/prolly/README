@@ -1483,18 +1483,19 @@ or orphans the new storage, which nothing names: the old one and the
 roots are untouched.  A move that gives a table the pages another of the
 branch's own kept commits holds of the target's rows (share_kept(), from
 a commit with the same data: an empty commit's, an amend's) carries the
-lineage on the same way.  A move that gives a table another branch's
-storage (share()), or another branch's kept pages where they cost less
-than writing the rows (share_kept() from the move's planned shares),
-replaces the table's storage too, but its new storage begins a lineage
-of its own, so the branch's kept commits of that table are gone for it,
-dropped by a later keep (kept_drop_dead()), and a reset back to one
-shares another kept root or writes its rows.  A move that restores
-another branch's kept commit (share_kept() of the commit's every table)
-gives the new storage the session storage's lineage, as a restore does
-(the pages are stored alike on both branches), so the branch's own kept
-commits of the table stay restorable; and it holds the commit's roots
-for the session's branch too (hold(): another root of the same subtrees, O(1),
+lineage on the same way, and so does one that gives a table another
+branch's kept pages (share_kept(): where they cost less than writing the
+rows, or a move that restores another branch's kept commit): those are
+given only where the table is stored alike on both branches (the same
+columns as stored, access method, TOAST table and indexes), so the
+branch's own kept roots read as rightly by the table after as before,
+and its kept commits of the table stay restorable.  A move that gives a
+table another branch's storage (share()) replaces the table's storage
+too, but its new storage begins a lineage of its own, so the branch's
+kept commits of that table are gone for it, dropped by a later keep
+(kept_drop_dead()), and a reset back to one shares another kept root or
+writes its rows.  A move that restores another branch's kept commit
+holds its roots for the session's branch too (hold(): another root of the same subtrees, O(1),
 frozen if the source's was) and lists the commit as the branch's own,
 so the keep after the move captures nothing and a move back restores
 it from the branch's own list.  The
