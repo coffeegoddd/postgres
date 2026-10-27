@@ -126,6 +126,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 					appendStringInfoString(buf, "root slot");
 				else if (xlrec->op == BMAP_TREE_EPOCH)
 					appendStringInfoString(buf, "epoch raised");
+				else if (xlrec->op == BMAP_TREE_STAMP)
+					appendStringInfo(buf, "node %u stamped", xlrec->node);
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

@@ -20,6 +20,7 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
 prolly.restore_min_changes = 0
+prolly.kept_commits = 8
 });
 $node->start;
 $node->backup('base');
@@ -52,14 +53,51 @@ my $at_c1 = sql($digest);
 sql(q{SELECT dolt_commit('-am', 'c1')});
 sql(q{UPDATE rf.t SET w = 'later' WHERE id <= 1500; SELECT dolt_commit('-am', 'c2')});
 
+# The indexes are kept as captured, their pages shared by the roots with
+# the relation's: VACUUM's index pass copies those it changes, a page the
+# roots hold never changed in place, and redo replays the copies.
+my $at_c2 = sql($digest);
+sql(q{DELETE FROM rf.t WHERE id % 19 = 0});
+sql(q{VACUUM rf.t});
+sql(q{SELECT dolt_commit('-am', 'c3')});
+
+# every index checked, heapallindexed: an error fails the test
+sub indexes_valid
+{
+	my ($n, $what) = @_;
+	my ($ret, $out, $err) = $n->psql('postgres',
+		q{SELECT bt_index_check(indexrelid, true)
+		FROM pg_index WHERE indrelid = 'rf.t'::regclass},
+		on_error_stop => 1);
+	is($ret, 0, $what);
+	is($err, '', "$what, with no error") if $ret != 0;
+}
+
+# a base backup taken after the frozen captures, restored: the roots
+# replayed from it
+$node->backup('after_captures');
+my $restored = PostgreSQL::Test::Cluster->new('root_freezing_redo_restored');
+$restored->init_from_backup($node, 'after_captures');
+$restored->start;
+$restored->safe_psql('postgres', q{SELECT dolt_reset('--hard', 'HEAD~2')});
+is($restored->safe_psql('postgres', $digest), $at_c1,
+	'restored from a base backup, a reset gives c1\'s rows');
+is($restored->safe_psql('postgres', $frozen), '0',
+	'restored from a base backup, every version left frozen');
+indexes_valid($restored, 'restored from a base backup, the indexes valid');
+$restored->stop;
+
 # a crash: recovery replays the frozen captures
 $node->stop('immediate');
 $node->start;
+indexes_valid($node, 'after a crash, the vacuumed indexes valid');
+sql(q{SELECT dolt_reset('--hard', 'HEAD~1')});
+is(sql($digest), $at_c2, 'after a crash, a reset gives c2\'s rows, past the vacuum');
+indexes_valid($node, 'after a crash, c2\'s restored indexes valid');
 sql(q{SELECT dolt_reset('--hard', 'HEAD~1')});
 is(sql($digest), $at_c1, 'after a crash, a reset gives c1\'s rows');
 is(sql($frozen), '0', 'every version left frozen');
-is(sql(q{SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL)
-	FROM pg_index WHERE indrelid = 'rf.t'::regclass}), 't', 'the indexes valid');
+indexes_valid($node, 'the indexes valid');
 
 # the standby replayed it all, page by page checked, and reads c1's rows
 $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));

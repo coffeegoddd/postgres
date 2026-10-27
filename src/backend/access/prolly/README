@@ -1245,7 +1245,10 @@ its own pages, unshared, and its epoch raised so that each one's next
 change marks it changed since (bmap_changed_pages()).  A frozen root never
 goes stale: its kept frozenxid is FrozenTransactionId, so it is never held
 past the database's frozen horizon, and any session may be given its
-pages.  Finding the pages changed reads every leaf of the relation's map.
+pages.  Finding the pages changed reads only the map's nodes set since the
+epoch: a page's change sets every pointer above its leaf in the map's
+epoch (once a node for each epoch), so the walk passes over the subtrees
+set before, and a relation unchanged since its root reads no node.
 prolly.freeze_roots off keeps them as captured, sharing the relation's
 pages.  Under dolt.transaction_commit roots are kept as captured: freezing them
 in every transaction's commit would cost too much, and is to move to the

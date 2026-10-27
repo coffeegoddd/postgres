@@ -234,7 +234,7 @@ int			block_map_replay_entries = 65536;
  * they hold frozen copies.  This server reads only version 7 and refuses
  * anything older (refuse_version()).
  */
-#define BMAP_VERSION		7
+#define BMAP_VERSION		8
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -2964,6 +2964,69 @@ tree_node_own(RelFileLocator rel, const BmapEntry *ptr, uint32 epoch,
 }
 
 /*
+ * Set the pointer 'ptr' in 'parent' (the relation's own) to the relation's
+ * own node, set before the map's epoch, in 'epoch' instead: so every node
+ * above a leaf changed in an epoch is pointed to as of that epoch at least,
+ * and the pages changed since an epoch are found by walking only the
+ * subtrees set since (bmap_changed_pages()).  One record, the parent's
+ * delta, made once a node for each epoch: the first change under it.  The
+ * header is held exclusively.  Returns the pointer as set.
+ */
+static BmapEntry
+tree_stamp_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
+				const BmapEntry *ptr)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		parentbuf;
+	xl_bmap_tree xlrec;
+	struct
+	{
+		xl_bmap_node_delta d;
+		xl_bmap_entry_delta e;
+	}			pdelta;
+	BmapEntry	stamped = *ptr;
+	XLogRecPtr	lsn;
+
+	parentbuf = parent_read(reln, parent);
+	map_lock(parentbuf, false);
+	parent_check(reln, parent, BufferGetPage(parentbuf));
+	if (PageGetBmapEntries(BufferGetPage(parentbuf))[parent->slot].block != ptr->block)
+		elog(ERROR, "the pointer to node %u of \"%s\" changed while it was set",
+			 ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_STAMP;
+	xlrec.flags = 0;
+	xlrec.node = ptr->block;
+	xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+	stamped.epoch = epoch;
+	pdelta.d.kind = BMAP_DELTA_NODE;
+	pdelta.d.flags = 0;
+	pdelta.d.nentries = 1;
+	pdelta.d.since = GetXLogInsertRecPtr();
+	pdelta.e.slot = parent->slot;
+	pdelta.e.block = ptr->block;
+	pdelta.e.epoch = epoch;
+
+	START_CRIT_SECTION();
+	apply_node_delta(BufferGetPage(parentbuf), &pdelta.d);
+	MarkBufferDirty(parentbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, parentbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &pdelta, sizeof(pdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(parentbuf), lsn);
+	END_CRIT_SECTION();
+
+	map_unlock(parentbuf);
+	ReleaseBuffer(parentbuf);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_MAP_PAGES_STAMPED, 1);
+	return stamped;
+}
+
+/*
  * The leaf of logical block 'blkno' in reln's tree, into *mp, the nodes on
  * its path made if 'make' and there are none (false if there is none and
  * not 'make'), and, with 'own', those shared copied (tree_copy_node()), from
@@ -3007,6 +3070,8 @@ tree_leaf_for(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
 			if (!tree_node_own(rel, &ptr, epoch, owned))
 				ptr = tree_copy_node(reln, &parent, epoch, level,
 									 path.first[level], &ptr);
+			else if (ptr.epoch < epoch)
+				ptr = tree_stamp_node(reln, &parent, epoch, &ptr);
 			owned = true;
 		}
 		parent.root = false;
@@ -3034,12 +3099,14 @@ tree_leaf_for(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
 
 /*
  * Is the path to logical block 'blkno''s leaf in reln's tree the relation's
- * own, every node on it (see tree_node_own())?  Read under share locks; the
+ * own, every node on it (see tree_node_own())?  With 'stamped', each
+ * pointer on it set in the map's epoch too (tree_leaf_for() stamps one
+ * that isn't), as a change to the leaf needs.  Read under share locks; the
  * caller holds the header, at least shared, so no share or copy of the
  * relation's begins meanwhile.
  */
 static bool
-tree_path_own(SMgrRelation reln, BlockNumber blkno, uint32 epoch)
+tree_path_own(SMgrRelation reln, BlockNumber blkno, uint32 epoch, bool stamped)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	TreePath	path;
@@ -3056,7 +3123,8 @@ tree_path_own(SMgrRelation reln, BlockNumber blkno, uint32 epoch)
 	{
 		if (!BlockNumberIsValid(ptr.block))
 			return true;
-		if (!tree_node_own(rel, &ptr, epoch, true))
+		if (!tree_node_own(rel, &ptr, epoch, true) ||
+			(stamped && ptr.epoch < epoch))
 			return false;
 		if (level == 0)
 			return true;
@@ -7155,7 +7223,7 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		return false;
 	/* (a tree's block is shared too if its leaf is, through any node) */
 	shared = lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0 ||
-		!tree_path_own(reln, blkno, epoch);
+		!tree_path_own(reln, blkno, epoch, false);
 
 	/*
 	 * Its next change prepares it all the same, born before the map's
@@ -7268,7 +7336,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			UnlockReleaseBuffer(headerbuf);
 			return;
 		}
-		if (tree_path_own(reln, blkno, epoch))
+		if (tree_path_own(reln, blkno, epoch, true))
 			break;
 
 		/*
@@ -10259,20 +10327,9 @@ typedef struct ChangedWalk
 	uint32		cap;
 } ChangedWalk;
 
-static bool
-changed_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
-{
-	return first < ((ChangedWalk *) arg)->nblocks;
-}
-
 static void
-changed_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+changed_add(ChangedWalk *cw, BlockNumber blkno)
 {
-	ChangedWalk *cw = arg;
-
-	if (!BlockNumberIsValid(blkno) || blkno >= cw->nblocks ||
-		entry->epoch < cw->since)
-		return;
 	if (cw->n == cw->cap)
 	{
 		cw->cap = Max(cw->cap * 2, 64);
@@ -10283,11 +10340,61 @@ changed_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
 }
 
 /*
+ * The changed pages under node 'ptr', of 'level', mapping from 'first':
+ * only its children set since the walk's epoch are read further (a
+ * pointer set before it has nothing changed since under it: a change
+ * stamps every pointer above its leaf, tree_stamp_node()).
+ */
+static void
+changed_walk_node(SMgrRelation reln, const BmapEntry *ptr, uint16 level,
+				  BlockNumber first, ChangedWalk *cw)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry  *entries;
+	Buffer		buf;
+
+	if (first >= cw->nblocks || ptr->epoch < cw->since)
+		return;
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	buf = tree_read(rel, ptr->block, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ, 1);
+	CHECK_FOR_INTERRUPTS();
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		uint64		child = (uint64) first + (level == 0 ? i :
+											   i * tree_span(level - 1));
+
+		if (!BlockNumberIsValid(entries[i].block) || child >= cw->nblocks)
+			continue;
+		if (level == 0)
+		{
+			if (entries[i].epoch >= cw->since)
+				changed_add(cw, (BlockNumber) child);
+		}
+		else
+			changed_walk_node(reln, &entries[i], level - 1,
+							  (BlockNumber) child, cw);
+	}
+	pfree(entries);
+}
+
+/*
  * The logical blocks of reln under its length whose entries were set in
  * epoch 'since' or after (each changed since: a write after a raise of the
  * epoch claims or copies its page, setting its entry's epoch), into
  * *blknos (palloc'd, ascending): how many.  Its length into *nblocks.  The
- * caller keeps reln from changing.  It reads every leaf of the map.
+ * caller keeps reln from changing.  It reads the map's nodes set since,
+ * which are those above the pages changed: O(changed pages) map pages,
+ * none but its header and root page if nothing changed.
  */
 uint32
 bmap_changed_pages(SMgrRelation reln, uint32 since, BlockNumber **blknos,
@@ -10313,8 +10420,7 @@ bmap_changed_pages(SMgrRelation reln, uint32 since, BlockNumber **blknos,
 	for (int k = 0; k < BMAP_TREE_TOPS && first < cw.nblocks; k++)
 	{
 		if (BlockNumberIsValid(root.top[k].block))
-			tree_walk_node(reln, &root.top[k], k, (BlockNumber) first, false,
-						   changed_node, changed_entry, &cw);
+			changed_walk_node(reln, &root.top[k], k, (BlockNumber) first, &cw);
 		first += tree_span(k);
 	}
 	if (cw.n > 1)
@@ -11680,7 +11786,7 @@ compact_page_movable(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
 		lookup_entry_at(reln, blkno, entry, mp, NULL) &&
 		entry->block == phys &&
 		lookup_ref(rel, phys) == 0 &&
-		tree_path_own(reln, blkno, header->epoch);
+		tree_path_own(reln, blkno, header->epoch, false);
 }
 
 /*
