@@ -228,8 +228,7 @@ DROP DATABASE regress_history_window_c;
 
 -- A branch's window narrower than the database's cuts the branch's own
 -- history: what else names its commits (its page roots, its log, a
--- tracking branch) keeps only those, not the database's window.  And the
--- warm window is never shorter than prolly.history_hot.
+-- tracking branch) keeps only those, not the database's window.
 CREATE DATABASE regress_history_window_d;
 \c regress_history_window_d
 CREATE SCHEMA hw VERSIONED;
@@ -247,24 +246,16 @@ SELECT dolt_history_window('main', 'warm', '3 days');
 SELECT p.kind, l.message
 FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
 ORDER BY 1, 2;
-ALTER DATABASE regress_history_window_d SET prolly.history_hot = '9 days';
-\c regress_history_window_d
-SELECT p.kind, l.message
-FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-ORDER BY 1, 2;
-SELECT warm FROM prolly_history_policy('main');
--- (hot keeps what is younger in every mode: a window by count alone, and
--- a cut given)
-SELECT dolt_history_window('main', 'warm', NULL);
-ALTER DATABASE regress_history_window_d RESET prolly.history_warm;
-ALTER DATABASE regress_history_window_d SET prolly.history_min_commits = 1;
-\c regress_history_window_d
-SELECT p.kind, l.message
-FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
-SELECT p.kind, l.message
-FROM prolly_history_plan(now()) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+-- The window as a sever has it, for others to ask (the page roots' kept
+-- inside it): main's three days hold a1 and a0, not a8, which the
+-- database's nine days would.
+SELECT l.message, prolly_history_in_window('main', l.commit_hash) AS main,
+	prolly_history_in_window(NULL, l.commit_hash) AS any
+FROM dolt_log('main') l ORDER BY l.date;
+-- (a count keeps its newest, whatever their age)
+SELECT dolt_history_window('main', 'min_commits', '3');
+SELECT l.message FROM dolt_log('main') l
+WHERE prolly_history_in_window('main', l.commit_hash) ORDER BY l.date;
 \c regress_history_window
 DROP DATABASE regress_history_window_d;
 

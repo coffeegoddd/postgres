@@ -1813,9 +1813,11 @@ superuser's), never as a session has them, so no session severs more or
 sends history elsewhere by a SET of its own.  A branch's lineage may keep
 its own warm, min_commits or cold_batch (dolt_history_window(), the
 owner's, kept in the refs' settings); prolly_history_policy() shows what
-a branch keeps.  With no window, everything is kept.  A warm window is
-never shorter than prolly.history_hot (the page roots' window, as the
-database has it): a shorter one is taken as hot, with a notice.  What a
+a branch keeps.  With no window, everything is kept.  There is one
+window: the page roots a branch keeps for constant-time moves are kept
+inside it, and ask it (the history window's window() and in_window(),
+prolly_history_in_window() in SQL) what is in it, by the clock a sever
+ages commits by, so the two never disagree.  What a
 branch's history keeps is the branch's window's: another ref's commit on
 it (a commit the branch's pages are kept as of, a reader's pin, a
 remote-tracking branch) has no window of its own, though a collection
