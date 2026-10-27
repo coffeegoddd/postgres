@@ -1297,6 +1297,9 @@ splice_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
 	ProllyHash	top;
 
 	value_env(env, &venv);
+	/* (a deletion inserts nothing, and may name no bytes: copied, none) */
+	if (ilen == 0)
+		insert = (const uint8 *) "";
 	decode_value_ref(ref, &root, &total);
 	if (offset > total)
 		ereport(ERROR,
