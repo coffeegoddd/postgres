@@ -964,6 +964,8 @@ typedef struct Head
 	int64		min_commits;	/* and its newest this many */
 	bool		standalone;		/* a tag's: kept itself, on a lineage too */
 	bool		on_lineage;		/* another ref's, on a branch's history */
+	int64		height_cut;		/* > 0: kept by height, not the cut's date */
+	TimestampTz hot_cut;		/* then what is younger than this, too */
 } Head;
 
 typedef struct Plan
@@ -1454,7 +1456,10 @@ walk_window(Plan *plan, Head *h)
 		todo = list_delete_last(todo);
 		CHECK_FOR_INTERRUPTS();
 		pc = plan_commit(plan, id);
-		if (same_id(id, &h->head) || young(plan, pc, h->cut) ||
+		if (same_id(id, &h->head) ||
+			(h->height_cut > 0 ? pc->e.height >= h->height_cut ||
+			 (h->hot_cut != DT_NOEND && young(plan, pc, h->hot_cut)) :
+			 young(plan, pc, h->cut)) ||
 			(h->min_commits > 0 && head_height - pc->e.height < h->min_commits))
 		{
 			if (pc->kept && pc->by_base)
@@ -1496,7 +1501,8 @@ add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
  * batch.  False if no head's window cuts anything.
  */
 static bool
-head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
+head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
+			 int64 size_height)
 {
 	TimestampTz now = plan_now();
 	int64		hot = database_span("prolly.history_hot");
@@ -1554,6 +1560,13 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
 			h->cut = size_cut;
 			any = true;
 		}
+		/* (or by height, where the size limit's dates cut nothing) */
+		if (size_height > 0)
+		{
+			h->height_cut = size_height;
+			h->hot_cut = hot_cut;
+			any = true;
+		}
 	}
 	return any;
 }
@@ -1564,7 +1577,8 @@ head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
  * beyond them.  The caller holds every ref.
  */
 static void
-make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
+make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
+		  int64 size_height)
 {
 	ListCell   *lc;
 	HTAB	   *fragment;
@@ -1576,7 +1590,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut)
 	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
 	note_refs(plan);
-	if (!head_windows(plan, before, size_cut))
+	if (!head_windows(plan, before, size_cut, size_height))
 		return;					/* (every head keeps its whole history) */
 	note_merge_bases(plan);
 	foreach(lc, plan->heads)
@@ -1665,7 +1679,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 	sever_clock = DT_NOBEGIN;
 	window_init();
 	/* (read as the refs stand: no ref is held, nothing written) */
-	make_plan(&plan, before, DT_NOBEGIN);
+	make_plan(&plan, before, DT_NOBEGIN, 0);
 	foreach(lc, plan.severed)
 		visit(PROLLY_WINDOW_SEVERED, &((PlanCommit *) lfirst(lc))->id, NULL,
 			  NULL, arg);
@@ -2348,6 +2362,31 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	sever_cut(action, before, DT_NOBEGIN, result);
 }
 
+/* A size limit's cut by height: this many parts of what is kept, one cut. */
+#define SIZE_HEIGHT_PARTS	16
+
+/*
+ * The height a size limit cuts below where its dates cut nothing: a
+ * sixteenth of the heights the plan keeps, at least one, above the
+ * lowest.  Heights only grow along history, so it is a prefix of every
+ * path, as the dates' cut is; 0 if nothing but heads is kept.
+ */
+static int64
+height_cut(Plan *plan)
+{
+	int64		lowest = PG_INT64_MAX;
+	int64		highest = 0;
+
+	foreach_ptr(PlanCommit, pc, plan->kept)
+	{
+		lowest = Min(lowest, pc->e.height);
+		highest = Max(highest, pc->e.height);
+	}
+	if (lowest >= highest)
+		return 0;
+	return lowest + Max((highest - lowest) / SIZE_HEIGHT_PARTS, 1);
+}
+
 /*
  * A sever (as archive_sever()), each head's window cut no earlier than
  * size_cut (DT_NOBEGIN: no limit), its count kept whatever: what a size
@@ -2373,6 +2412,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 
 	ProllyHash	planned;
 	ProllyHash	held;
+	int64		size_height = 0;
 
 	window_init();
 	memset(result, 0, sizeof(*result));
@@ -2400,7 +2440,16 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 		ProllyHash	now;
 
 		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
-		make_plan(&plan, before, size_cut);
+		make_plan(&plan, before, size_cut, size_height);
+
+		/*
+		 * (a size limit whose dates cut nothing, a commit dated old above
+		 * history dated new: cut by height instead, a part of what is
+		 * kept here, so the limit still holds)
+		 */
+		if (plan.severed == NIL && size_cut != DT_NOBEGIN && before == NULL &&
+			size_height == 0 && (size_height = height_cut(&plan)) > 0)
+			make_plan(&plan, before, size_cut, size_height);
 		if (plan.severed == NIL)
 		{
 			/* (nothing to sever, but commits dated ahead seen first) */
@@ -2462,7 +2511,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 		Plan		again;
 		ProllyHash	root;
 
-		make_plan(&again, before, size_cut);
+		make_plan(&again, before, size_cut, size_height);
 		if (again.severed == NIL)
 			return;
 		fragment_root(again.severed, &root);
