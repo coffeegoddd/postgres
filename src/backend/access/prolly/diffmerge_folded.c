@@ -15126,6 +15126,139 @@ folded_row_count(const char *ref, Oid relid, double *rows)
 	return true;
 }
 
+/*
+ * One bound's keys, as the table's keying orders them: the least key of its
+ * lower bound and the greatest of its upper, as keys with those values
+ * would sort (encode_key_bound()); false if the keying can't bound keys.
+ */
+static bool
+bound_keys(RowDiff *rd, const ProllyKeyBounds *b, StringInfo lo, StringInfo hi)
+{
+	int			n = b->neq + 1;
+	Datum	   *values = palloc_array(Datum, n);
+	bool	   *isnull = palloc0_array(bool, n);
+
+	memcpy(values, b->eq, sizeof(Datum) * b->neq);
+	/* (strict: the greatest key with the value, so the seek passes them) */
+	if (b->has_lo)
+		values[b->neq] = b->lo;
+	if (!PROLLY_CALL(rd->kr, encode_key_bound, rd->k, values, isnull,
+					 b->neq + (b->has_lo ? 1 : 0), b->has_lo && b->lo_strict,
+					 lo))
+		return false;
+	/* (strict: the least key with the value, every one with it past it) */
+	if (b->has_hi)
+		values[b->neq] = b->hi;
+	return PROLLY_CALL(rd->kr, encode_key_bound, rd->k, values, isnull,
+					   b->neq + (b->has_hi ? 1 : 0), !(b->has_hi && b->hi_strict),
+					   hi);
+}
+
+/*
+ * relid's table's rows at ref within bounds, seeking its data tree (see
+ * prolly_merge.h): only where the version is keyed and defined as the
+ * table is now, so its keys sort and its rows decode as the table's do.
+ */
+static ProllyBoundedRead
+folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
+					int nbounds, ProllyHash *data, ProllyDiffSink *sink)
+{
+	ProllyDatabaseComponents dc = components();
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+	Tables		ts = {NIL};
+	Table	   *t;
+	Table	   *now;
+	char	   *name;
+	bool		keyed;
+	Relation	rel;
+	RowDiff		rd;
+	ProllyBoundedRead result = PROLLY_BOUNDED_READ;
+
+	if (is_working(ref) || !PROLLY_CALL(dc.refs, resolve, ref, &id) ||
+		!PROLLY_CALL(dc.refs, commit_get, &id, &info) ||
+		(name = get_rel_name(relid) ? table_name(relid) : NULL) == NULL)
+		return PROLLY_BOUNDED_NO;
+	/* (the table's tree first, its types unread: the same tree reads nothing) */
+	PROLLY_CALL(dc.canonicalizer, tables, &info.root, name, add_table, &ts);
+	t = find_table(ts.tables, name);
+	if (t == NULL)
+	{
+		data->len = 0;
+		return PROLLY_BOUNDED_READ;
+	}
+	if (data->len > 0 && same_hash(&t->data.hash, data))
+		return PROLLY_BOUNDED_SAME;
+	t = find_table(version_tables(ref, relid, false), name);
+	if (t == NULL)
+		return PROLLY_BOUNDED_NO;
+	require_readable(t);
+	now = find_table(tables_defined_now(relid), name);
+	(void) version_columns(t, &keyed);
+	if (now == NULL || !keyed || !same_description(t, now))
+		return PROLLY_BOUNDED_NO;
+
+	rel = table_open(relid, AccessShareLock);
+	memset(&rd, 0, sizeof(rd));
+	rd.kr = keying_of(rel);
+	if (!PROLLY_HAS(rd.kr, encode_key_bound))
+	{
+		table_close(rel, AccessShareLock);
+		return PROLLY_BOUNDED_NO;
+	}
+	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
+	rd.relid = relid;
+	rd.sink = sink;
+	rd.tree = tree;
+	rd.env = &env;
+	chunk_env(&env);
+	env.compare = keying_compare;
+	env.compare_arg = &rd;
+	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
+	for (int i = 0; i < nbounds && result == PROLLY_BOUNDED_READ; i++)
+	{
+		StringInfoData lo;
+		StringInfoData hi;
+		ProllyKey	lk;
+		ProllyKey	hk;
+		ProllyKey	key;
+		ProllyValue value;
+		ProllyTreeCursor *c;
+
+		initStringInfo(&lo);
+		initStringInfo(&hi);
+		if (!bound_keys(&rd, &bounds[i], &lo, &hi))
+		{
+			result = PROLLY_BOUNDED_NO;
+			break;
+		}
+		lk.data = (const uint8 *) lo.data;
+		lk.len = lo.len;
+		hk.data = (const uint8 *) hi.data;
+		hk.len = hi.len;
+		c = PROLLY_CALL(tree, cursor_open, &env, &t->data, CurrentMemoryContext);
+		PROLLY_CALL(tree, cursor_seek, c, &lk, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &key, &value))
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (keying_compare(&key, &hk, &rd) > 0)
+				break;
+			sink->change(sink, relid, PROLLY_DIFF_ADDED, &key, NULL, &value);
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+		pfree(lo.data);
+		pfree(hi.data);
+	}
+	PROLLY_CALL(rd.kr, close, rd.k);
+	table_close(rel, AccessShareLock);
+	if (result == PROLLY_BOUNDED_READ)
+		*data = t->data.hash;
+	return result;
+}
+
 const ProllyMergeRoutine prolly_merge_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_DIFF_MERGE,
@@ -15146,4 +15279,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.verify = verify_constraints,
 	.apply = folded_apply,
 	.row_count = folded_row_count,
+	.bounded_rows = folded_bounded_rows,
 };

@@ -122,6 +122,32 @@ struct ProllyConflictSink
 typedef void (*ProllyTableChangeVisit) (const char *name, ProllyDiffKind kind,
 										char object, void *arg);
 
+/*
+ * Bounds on a table's rows by its primary key as the table is defined now:
+ * its first neq key columns equal to eq[], then, if has_lo (has_hi), the
+ * next one at least lo (at most hi), strictly if lo_strict (hi_strict).
+ * The values are of the key columns' types.
+ */
+typedef struct ProllyKeyBounds
+{
+	int			neq;
+	Datum	   *eq;
+	bool		has_lo;
+	bool		lo_strict;
+	Datum		lo;
+	bool		has_hi;
+	bool		hi_strict;
+	Datum		hi;
+} ProllyKeyBounds;
+
+/* What a bounded_rows() read did */
+typedef enum ProllyBoundedRead
+{
+	PROLLY_BOUNDED_READ,		/* the rows in bounds given */
+	PROLLY_BOUNDED_SAME,		/* the same tree as *data: none given */
+	PROLLY_BOUNDED_NO,			/* can't read it so: none given */
+} ProllyBoundedRead;
+
 typedef struct ProllyMergeRoutine
 {
 	ProllyImplInfo info;
@@ -176,13 +202,30 @@ typedef struct ProllyMergeRoutine
 	 * however many copies each has.
 	 */
 	bool		(*row_count) (const char *ref, Oid relid, double *rows);
+
+	/*
+	 * Optional: relid's table's rows at ref (a commit) whose keys are within
+	 * any of bounds[] (nbounds of them), to sink as diff() from nothing
+	 * gives them (each added), in key order within each bound, read by
+	 * seeking the commit's data tree: O(its depth) a bound, and the rows
+	 * in it.  *data is the table's data tree there (len 0: none); if it is
+	 * the tree *data named already, nothing is read (PROLLY_BOUNDED_SAME:
+	 * the caller has those rows).  PROLLY_BOUNDED_NO if the version can't
+	 * be read so (keyed otherwise, or defined otherwise than the table is
+	 * now): the caller reads it with diff().
+	 */
+	ProllyBoundedRead (*bounded_rows) (const char *ref, Oid relid,
+									   const ProllyKeyBounds *bounds,
+									   int nbounds, ProllyHash *data,
+									   ProllyDiffSink *sink);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
 	"diff", "merge", "conflicts", "resolve", "tables", "summary", \
-	"move_to", "cherry_pick", "verify", "revert", "apply", "row_count"
+	"move_to", "cherry_pick", "verify", "revert", "apply", "row_count", \
+	"bounded_rows"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
-#define PROLLY_MERGE_LAST_CALLBACK row_count
+#define PROLLY_MERGE_LAST_CALLBACK bounded_rows
 
 /* a schema conflict's error: see above */
 extern PGDLLIMPORT bool prolly_schema_conflict_raised;
