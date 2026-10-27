@@ -305,10 +305,7 @@ mark_ref_uncut(const ProllyHash *hash, void *arg)
 
 	foreach(lc, cm->parents)
 		if (same_hash(lfirst(lc), hash))
-		{
-			elog(WARNING, "ZDBG skipped %s", prolly_hash_hex(hash));
 			return;
-		}
 	mark_ref(hash, cm->mk);
 }
 

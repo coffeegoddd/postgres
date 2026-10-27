@@ -173,34 +173,38 @@ FROM prolly_history_horizon();
 
 -- Hashes are unchanged; the log stops at the horizon, with a notice.
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
-NOTICE:  history stops at the history horizon
  commit 
 --------
  c6
  c5
  c4
-(3 rows)
+ c3
+ c2
+ c1
+(6 rows)
 
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('feature') ORDER BY commit_order DESC;
-NOTICE:  history stops at the history horizon
  commit 
 --------
  f1
  c4
-(2 rows)
+ c3
+ c2
+ c1
+(5 rows)
 
 SELECT hh_name(commit_hash) AS commit, hh_name(parent_hash) AS parent
 FROM dolt_commit_ancestors WHERE hh_name(commit_hash) IN ('c4', 'c3')
 ORDER BY 1, 2;
-NOTICE:  history stops at the history horizon
  commit | parent 
 --------+--------
+ c3     | c2
  c4     | c3
-(1 row)
+(2 rows)
 
 SELECT count(*) AS history_rows FROM dolt_history_table(NULL::hh.t) h
 WHERE (h.row).id = 1;
-NOTICE:  history stops at the history horizon
+NOTICE:  commits past the history horizon have no rows here
  history_rows 
 --------------
             3
@@ -213,11 +217,13 @@ SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
  t
 (1 row)
 
--- A read of a severed commit says it is past the horizon.
-SELECT hh_err(format('SELECT prolly_root_hash(%L)', :'c3')) AS root_c3;
-                  root_c3                  
--------------------------------------------
- commit <hash> is past the history horizon
+-- A read of a severed commit's data says it is past the horizon; its
+-- commit object is kept.
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c3')) AS at_c3,
+	   prolly_root_hash(:'c3') IS NOT NULL AS root_c3;
+                   at_c3                   | root_c3 
+-------------------------------------------+---------
+ commit <hash> is past the history horizon | t
 (1 row)
 
 SELECT hh_err($$SELECT count(*) FROM dolt_diff('main~3', 'main', NULL::hh.t)$$) AS diff_past;
@@ -226,19 +232,19 @@ SELECT hh_err($$SELECT count(*) FROM dolt_diff('main~3', 'main', NULL::hh.t)$$) 
  commit <hash> is past the history horizon
 (1 row)
 
--- (c3's id is c4's to give; what c3 names is past)
+-- (the graph is whole: ancestry goes across the horizon)
 SELECT hh_name(dolt_hashof('main~3')) AS main_3,
-	   hh_err($$SELECT dolt_hashof('main~4')$$) AS hashof_past;
- main_3 |                hashof_past                
---------+-------------------------------------------
- c3     | commit <hash> is past the history horizon
+	   hh_name(dolt_hashof('main~4')) AS main_4;
+ main_3 | main_4 
+--------+--------
+ c3     | c2
 (1 row)
 
 -- (a severed commit beneath the fragment's tops, named by its id)
 SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c2')) AS at_beneath;
-                                at_beneath                                
---------------------------------------------------------------------------
- commit <hash> isn't in this database: it may be past the history horizon
+                at_beneath                 
+-------------------------------------------
+ commit <hash> is past the history horizon
 (1 row)
 
 -- A push of history past the horizon to a remote that hasn't it says so.
@@ -315,13 +321,17 @@ FROM prolly_history_horizon();
 (2 rows)
 
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
-NOTICE:  history stops at the history horizon
  commit 
 --------
  merge
  c6
  f1
-(3 rows)
+ c5
+ c4
+ c3
+ c2
+ c1
+(8 rows)
 
 -- Nulls: no date severs nothing; a null date plans by the database's
 -- window, which keeps everything.

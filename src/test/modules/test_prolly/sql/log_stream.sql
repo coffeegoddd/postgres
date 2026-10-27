@@ -3,7 +3,7 @@
 -- each read with its parents as it is given.  So dolt_log ... LIMIT n
 -- reads about n commits, not the whole history, and the order is the
 -- log's: by height, then date, then hash, through merges and commits made
--- at the same moment.  A listing stops at the history horizon.
+-- at the same moment.  A listing goes across the history horizon.
 
 SELECT current_database() AS home \gset
 \set VERBOSITY terse
@@ -108,7 +108,8 @@ SELECT count(*) AS none FROM dolt_log(NULL);
 \c :home
 DROP DATABASE regress_log_stream;
 
--- The history horizon: the log stops there, in order still.
+-- The history horizon: the log goes across it, every commit object kept,
+-- in order still.
 CREATE DATABASE regress_log_stream_horizon;
 \c regress_log_stream_horizon
 CREATE FUNCTION log_in_order(ref text) RETURNS bool LANGUAGE sql AS $$

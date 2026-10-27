@@ -626,7 +626,6 @@ edge_of_severed(const Severed *sv, void *arg)
 	ProllyWindowEdgeVisit visit = ((void **) arg)[0];
 	void	   *varg = ((void **) arg)[1];
 
-	elog(WARNING, "ZDBG edge %s root %s", prolly_hash_hex(&sv->id), prolly_hash_hex(&sv->root));
 	visit(&sv->id, &sv->root, varg);
 	if (sv->dependencies.len > 0)
 		visit(&sv->id, &sv->dependencies, varg);
@@ -1059,7 +1058,7 @@ typedef struct PlanCommit
 	bool		young;
 	bool		kept;
 	bool		pinned;			/* kept as a ref's commit, not a window's */
-	bool		by_base;		/* kept only on the way to a merge base */
+	bool		by_base;		/* kept only as a merge base, its data */
 } PlanCommit;
 
 /*
@@ -1072,7 +1071,6 @@ typedef struct Head
 {
 	char	   *name;			/* the branch's; NULL: another ref's */
 	ProllyHash	head;
-	int64		floor;			/* keeps every commit at least this high */
 	TimestampTz cut;			/* and every commit dated at or after it */
 	int64		min_commits;	/* and its newest this many */
 	bool		standalone;		/* a tag's: kept itself, on a lineage too */
@@ -1095,6 +1093,7 @@ typedef struct Plan
 								 * parent past the horizon no edge names it
 								 * with (an amend of a boundary commit) */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
+	List	   *bases;			/* ProllyHash *: merge bases, kept */
 	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
 	bool		quiet;			/* the window evaluated: no warnings */
 } Plan;
@@ -1262,7 +1261,6 @@ add_head(Plan *plan, const char *name, const ProllyHash *head)
 	h = palloc0(sizeof(Head));
 	h->name = name ? pstrdup(name) : NULL;
 	h->head = *head;
-	h->floor = PG_INT64_MAX;
 	plan->heads = lappend(plan->heads, h);
 }
 
@@ -1390,11 +1388,13 @@ note_refs(Plan *plan)
 
 /*
  * Each branch head, and each ref's commit it may be merged with, keeps the
- * commits down to every merge base of the two (every maximal common
- * ancestor, where histories cross): a merge into a branch is from another
- * branch, a tag, a remote-tracking branch or any ref's commit, so every
- * pair of a branch and a ref is one.  (Two refs that aren't branches merge
- * only into a branch, which pairs with each.)
+ * data of every merge base of the two (every maximal common ancestor,
+ * where histories cross): a merge into a branch is from another branch, a
+ * tag, a remote-tracking branch or any ref's commit, so every pair of a
+ * branch and a ref is one.  (Two refs that aren't branches merge only into
+ * a branch, which pairs with each.)  Only the bases themselves: every
+ * commit object is kept, so the search for a base goes across the
+ * horizon, and a merge reads only the base's rows.
  */
 static void
 note_merge_bases(Plan *plan)
@@ -1430,12 +1430,9 @@ note_merge_bases(Plan *plan)
 					continue;
 			}
 			for (int k = 0; k < nbases; k++)
-			{
-				PlanCommit *pc = plan_commit(plan, &bases[k]);
-
-				a->floor = Min(a->floor, pc->e.height);
-				b->floor = Min(b->floor, pc->e.height);
-			}
+				plan->bases = lappend(plan->bases,
+									  memcpy(palloc(sizeof(ProllyHash)),
+											 &bases[k], sizeof(ProllyHash)));
 		}
 	}
 
@@ -1697,11 +1694,6 @@ walk_window(Plan *plan, Head *h)
 			if (pc->kept && pc->by_base)
 				pc->by_base = false;
 		}
-		else if (pc->e.height >= h->floor)
-		{
-			if (!pc->kept)
-				pc->by_base = true;
-		}
 		else
 			continue;
 		keep(plan, pc);
@@ -1828,6 +1820,21 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		}
 	}
 
+	/*
+	 * (each merge base its data kept, by itself: the commit objects are
+	 * all kept, so a search for it goes across the horizon, and only what
+	 * a merge reads of it, its rows, need be here)
+	 */
+	foreach_ptr(ProllyHash, b, plan->bases)
+	{
+		PlanCommit *pc = plan_commit(plan, b);
+
+		if (set_has(plan->archived, b) || pc->kept)
+			continue;
+		pc->by_base = true;
+		keep(plan, pc);
+	}
+
 	/* the boundary: each parent of a kept commit that isn't kept */
 	foreach(lc, plan->kept)
 	{
@@ -1893,7 +1900,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 /*
  * The commits in the window now (branch: its lineage's only), as a sever
  * would keep them for their age or count: each lineage's head walked by
- * its policy, with no merge base's floor and no other ref's keeping.
+ * its policy, with no other ref's keeping and no merge base's.
  * Quietly (no warning of a commit dated ahead: plan() and sever() give
  * that), and kept for the transaction while the refs stand as they did,
  * so a caller asking of each commit pays one walk.

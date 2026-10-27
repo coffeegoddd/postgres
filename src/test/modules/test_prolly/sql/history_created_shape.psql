@@ -133,7 +133,7 @@ SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
 SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
 SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
-SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+SELECT hc_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hc.t)', :'severed_top')) AS parent_freed;
 \endif
 SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);

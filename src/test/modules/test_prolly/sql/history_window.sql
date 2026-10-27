@@ -277,6 +277,89 @@ WHERE prolly_history_in_window('main', l.commit_hash) ORDER BY l.date;
 \c regress_history_window
 DROP DATABASE regress_history_window_d;
 
+-- The graph kept: a sever keeps every commit object and severs only the
+-- data, so ancestry goes across the horizon.  A tag on main's history
+-- keeps only its own commit's data, not the path to it; a merge or a
+-- three-dot diff of it finds it as the base.  A branch forked before the
+-- horizon keeps only its merge base's data, and a merge of it across the
+-- severed path finds that base (never no base, the histories unrelated).
+CREATE DATABASE regress_history_window_e;
+\c regress_history_window_e
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hw_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+INSERT INTO hw.t VALUES (1, 'a10'), (2, 'a10');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+SELECT dolt_tag('old', 'HEAD') IS NOT NULL AS tagged;
+UPDATE hw.t SET v = 'a8' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+SELECT dolt_branch('side') IS NOT NULL AS branched;
+UPDATE hw.t SET v = 'a6' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a6', '--date', (now() - interval '6 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a4' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a4', '--date', (now() - interval '4 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a0' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+SELECT dolt_checkout('side') IS NOT NULL AS checked_out;
+UPDATE hw.t SET v = 's1' WHERE id = 2;
+SELECT length(dolt_commit('-am', 's1', '--date', (now() - interval '1 hour')::text)::text) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
+ALTER DATABASE regress_history_window_e SET prolly.history_window_action = delete;
+\c regress_history_window_e
+SELECT p.kind, l.message, p.why
+FROM prolly_history_plan(now() - interval '3 days') p
+	LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'pinned') ORDER BY 1, 2;
+SELECT fragment, commits FROM dolt_history_drop(now() - interval '3 days');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+-- (every commit listed, the severed ones' data gone)
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC;
+SELECT hw_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hw.t)',
+	(SELECT commit_hash FROM dolt_log('main') WHERE message = 'a6'))) AS a6_rows;
+SELECT table_name, rows_modified FROM dolt_diff_stat('old...main');
+SELECT table_name, rows_modified FROM dolt_diff_stat('side...main');
+SELECT (dolt_merge('old'))[2:4] AS merge_of_tag;
+SELECT (dolt_merge('side'))[2:4] AS merge_of_side;
+SELECT id, v FROM hw.t ORDER BY id;
+\c regress_history_window
+DROP DATABASE regress_history_window_e;
+
+-- Delete mode with many tags: each keeps only its own commit's data, so
+-- what is outside the window and untagged is severed.
+CREATE DATABASE regress_history_window_t;
+\c regress_history_window_t
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'start');
+SELECT length(dolt_commit('-Am', 'start', '--date', '2020-01-01')::text) > 0 AS committed;
+DO $$
+BEGIN
+	FOR i IN 1 .. 400 LOOP
+		UPDATE hw.t SET v = 'c' || i;
+		PERFORM dolt_commit('-am', 'c' || i, '--date',
+							(timestamptz '2020-01-01' + make_interval(hours => i))::text);
+		IF i % 2 = 0 THEN
+			PERFORM dolt_tag('t' || i, 'HEAD');
+		END IF;
+	END LOOP;
+END $$;
+UPDATE hw.t SET v = 'now';
+SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_t SET prolly.history_window = '1 day';
+ALTER DATABASE regress_history_window_t SET prolly.history_window_action = delete;
+\c regress_history_window_t
+SELECT kind, why, count(*) FROM prolly_history_plan(NULL) GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT fragment, commits FROM dolt_history_sever();
+SELECT count(*) AS logged FROM dolt_log('main');
+\c regress_history_window
+DROP DATABASE regress_history_window_t;
+
 -- Ages by a clock that only goes forward along history: a commit dated
 -- long ago (--date, a skewed clock) on top of recent ones severs none of
 -- them; one dated in the future keeps itself and what is above it until
