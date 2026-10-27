@@ -1407,8 +1407,10 @@ the new block's own later image (its next capture's) gives it its page.
 The page is registered with its LSN set back to shared_since for the
 record's assembly, so the insert's full-page-write check, made again
 under its insertion lock, takes its image if a checkpoint moved the redo
-pointer past the walk meanwhile; with full_page_writes off, a check after
-the insert logs the page's image (XLOG_FPI) right after the record
+pointer past the walk meanwhile.  So copies log no image only with
+full-page writes on (full_page_writes, or a base backup running); were
+they turned off between the check and the insert, a check after the
+insert logs the page's image (XLOG_FPI) right after the record
 (bmap_copy_images_late).  Hints the primary's buffer had and the old
 block lacks are masked as the page kind's own records mask them, which is
 why other kinds of pages keep their images.  A relation whose data skips

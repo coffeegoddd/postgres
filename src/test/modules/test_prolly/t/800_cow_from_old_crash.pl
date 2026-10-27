@@ -14,7 +14,8 @@
 #   images, so a crash then, the old blocks lost, recovers the working set;
 # - a checkpoint that begins as a copy is made, its redo pointer past the
 #   capture, has the copy's image follow it (bmap_copy_images_late), so a
-#   replay from that checkpoint, the old block lost, has the page.
+#   replay from that checkpoint, the old block lost, has the page;
+# - with full_page_writes off, copies log their images.
 
 use strict;
 use warnings FATAL => 'all';
@@ -73,7 +74,7 @@ sub lose_old_blocks
 
 sub run_case
 {
-	my ($name, $conf, $race) = @_;
+	my ($name, $conf, $race, $fpw) = @_;
 	my $node = PostgreSQL::Test::Cluster->new("cow_$name");
 	$node->init;
 	$node->append_conf('postgresql.conf', qq{
@@ -104,8 +105,16 @@ $conf});
 	my $imageless = counted($node, 'bmap_copies_imageless');
 	$sql->(q{UPDATE app.t SET v = v - 1 WHERE id % 40 = 0});
 	my $now = $sql->($contents);
-	cmp_ok(counted($node, 'bmap_copies_imageless'), '>', $imageless,
-		"$name: the indexes' pages were copied without their images");
+	if ($fpw)
+	{
+		cmp_ok(counted($node, 'bmap_copies_imageless'), '>', $imageless,
+			"$name: the indexes' pages were copied without their images");
+	}
+	else
+	{
+		is(counted($node, 'bmap_copies_imageless'), $imageless,
+			"$name: without full-page writes, copies log their images");
+	}
 	cmp_ok(lose_old_blocks($node, $before), '>', 0,
 		"$name: the old blocks lost before a crash");
 	is($sql->($contents), $now, "$name: recovery has the working set");
@@ -152,7 +161,7 @@ CHECKPOINT;
 		$c->quit;
 		$now = $sql->($contents);
 		cmp_ok(counted($node, 'bmap_copy_images_late'), '>', $late,
-			"$name: a copy made as a checkpoint began logged its image after");
+			"$name: a copy made as a checkpoint began was imaged after all");
 		lose_old_blocks($node, $before);
 		is($sql->($contents), $now,
 			"$name: a replay from that checkpoint, the old blocks lost, has the working set");
@@ -175,7 +184,7 @@ CHECKPOINT;
 	$node->stop;
 }
 
-run_case('replica', '', $ENV{enable_injection_points} eq 'yes');
-run_case('minimal', "wal_level = minimal\nmax_wal_senders = 0\n", 0);
-run_case('fpw_off', "full_page_writes = off\n", 0);
+run_case('replica', '', $ENV{enable_injection_points} eq 'yes', 1);
+run_case('minimal', "wal_level = minimal\nmax_wal_senders = 0\n", 0, 1);
+run_case('fpw_off', "full_page_writes = off\n", 0, 0);
 done_testing();

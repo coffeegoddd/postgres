@@ -7084,7 +7084,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			cc.shared_lsn = h->shared_lsn;
 			cc.shared_since = h->shared_since;
 			GetFullPageWriteInfo(&cc.redo, &fpw);
-			from_old = cow_skip_image(&cc);
+			/* (only with full-page writes, which the insert checks again) */
+			from_old = fpw && cow_skip_image(&cc);
 		}
 		xlrec.flags = (zeroed ? BMAP_REMAP_ZERO : 0) |
 			(listed ? BMAP_REMAP_LISTED : 0) |
@@ -7126,9 +7127,9 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			 * left out as a full-page write's is, only while that is past
 			 * the redo pointer, which the insert checks again under its
 			 * insertion lock, assembling the record anew with the image if
-			 * a checkpoint moved it.  With full-page writes off nothing is
-			 * imaged that way; the check after the insert, below, logs the
-			 * image then.
+			 * a checkpoint moved it.  (Full-page writes turned off since the
+			 * check above image nothing that way; the check after the
+			 * insert, below, logs the image then.)
 			 */
 			PageSetLSN(page, cc.shared_since);
 			XLogRegisterBuffer(id, buffer,
@@ -7150,8 +7151,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 * A checkpoint begun as the record was made, its redo pointer past
 		 * the capture's walk: a replay from it would copy an old block it
 		 * never wrote, unless the insert took the page's image (full-page
-		 * writes on).  The page's image follows, so that it has the page
-		 * all the same.  The redo pointer read here is the one the insert
+		 * writes still on).  The page's image follows, so that it has the
+		 * page all the same.  The redo pointer read here is the one the insert
 		 * saw or a later one: a checkpoint sets it holding every insertion
 		 * lock, which the insert took after.  (One begun after the insert
 		 * replays from past the record, and needs nothing.)
