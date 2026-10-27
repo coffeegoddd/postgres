@@ -1882,7 +1882,9 @@ one, and CheckPointProlly() runs in CheckPointGuts(), and
 ProllyRecoveryConsistent() beside XLogCheckInvalidPages(), as recovery
 becomes consistent; the chunk store asks XLogBackupInProgress() (xlog.c)
 before it removes a file a backup's redo may copy from.  Every batch of
-shared invalidation messages sent calls prolly_forget_folds() (sinval.c).
+shared invalidation messages sent calls prolly_forget_folds() (sinval.c),
+but one of storage managers' messages alone (a storage truncated or
+dropped changes no catalog or row).
 createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly

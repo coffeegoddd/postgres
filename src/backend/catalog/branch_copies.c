@@ -1890,8 +1890,7 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
 										  SMGR_BMAP);
 	if (smgrnblocks(tsrel, MAIN_FORKNUM) > nblocks)
-		smgrtruncate(tsrel, &(ForkNumber) {MAIN_FORKNUM}, 1,
-					 &(BlockNumber) {smgrnblocks(tsrel, MAIN_FORKNUM)}, &nblocks);
+		RelationTruncateStorage(tsrel, nblocks);
 	else if (smgrnblocks(tsrel, MAIN_FORKNUM) < nblocks)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(tsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
