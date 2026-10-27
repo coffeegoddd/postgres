@@ -110,8 +110,7 @@ SELECT length(dolt_commit('-am', 'hl side')::text) AS committed;
 SELECT dolt_checkout('main');
 SELECT count(*) AS side_moves FROM prolly_head_log('side');
 SELECT dolt_branch('-m', 'side', 'side2');
-SELECT count(*) AS renamed_moves, (SELECT count(*) FROM prolly_head_log('side')) AS old_name
-FROM prolly_head_log('side2');
+SELECT count(*) AS renamed_moves FROM prolly_head_log('side2');
 SELECT dolt_branch('-D', 'side2');
 SELECT dolt_branch('side2');
 SELECT count(*) AS remade_moves FROM prolly_head_log('side2');
@@ -122,6 +121,33 @@ SELECT dolt_remote('add', 'origin', :'url');
 SELECT dolt_push('origin', 'main') AS pushed;
 SELECT dolt_fetch('origin') AS fetched;
 SELECT hl_logged('remotes/origin/main');
+
+-- A remote removed takes its tracking branches' logs with it: added again,
+-- its branch has none.
+SELECT dolt_remote('remove', 'origin');
+SELECT dolt_remote('add', 'origin', :'url');
+SELECT count(*) AS moves_after_readd,
+	   prolly_head_at('remotes/origin/main', now()) IS NULL AS at_none
+FROM prolly_head_log('remotes/origin/main');
+SELECT dolt_fetch('origin') AS fetched;
+
+-- An unknown branch or remote is an error; a null ref too, and a null
+-- bound or direction is none.
+CREATE FUNCTION hl_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLERRM;
+END $$;
+SELECT hl_err($$SELECT * FROM prolly_head_log('nobranch')$$) AS unknown_branch,
+	   hl_err($$SELECT prolly_head_at('nobranch', now())$$) AS unknown_at,
+	   hl_err($$SELECT * FROM prolly_head_log('remotes/noremote/main')$$) AS unknown_remote;
+SELECT hl_err($$SELECT * FROM prolly_head_log(NULL, NULL, NULL, NULL)$$) AS null_ref,
+	   (SELECT count(*) FROM prolly_head_log(NULL::text)) AS strict_ref,
+	   (SELECT count(*) FROM prolly_head_at(NULL, now())) AS strict_at,
+	   (SELECT count(*) = (SELECT count(*) FROM prolly_head_log('main'))
+		FROM prolly_head_log('main', NULL, NULL, NULL)) AS null_bounds;
 
 -- A clone's heads, and a pull fast-forwarded to commits made elsewhere:
 -- one move each.
