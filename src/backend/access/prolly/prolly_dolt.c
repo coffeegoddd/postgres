@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_history.h"
 #include "access/prolly_revision.h"
 #include "access/prolly_snapshot.h"
 #include "access/prolly_toast.h"
@@ -8506,45 +8507,150 @@ dolt_at_support(PG_FUNCTION_ARGS)
 }
 
 /*
- * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
- *					  text, OUT committer text, OUT commit_date timestamptz)
- *	  returns setof record
- *
- * tbl's table's rows at each commit the head reaches (that has the table),
- * with the commit, as Dolt's dolt_history_<table>: each read from the
- * commit's tree, as dolt_at() reads it.
+ * The rows a bounded history read found at the commit it read last, kept
+ * for the commits after it whose table is the same tree: each key and row
+ * as the sink was given them.
  */
-Datum
-dolt_history_table(PG_FUNCTION_ARGS)
+typedef struct HistoryKept
 {
-	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
-	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	ProllyDiffSink sink;		/* must be first */
+	AtSink	   *to;
+	MemoryContext cxt;
+	List	   *rows;			/* of HistoryRow */
+} HistoryKept;
+
+typedef struct HistoryRow
+{
+	ProllyKey	key;
+	ProllyValue value;
+} HistoryRow;
+
+static void
+history_keep(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+			 const ProllyKey *key, const ProllyValue *before,
+			 const ProllyValue *after)
+{
+	HistoryKept *hk = (HistoryKept *) self;
+	MemoryContext old = MemoryContextSwitchTo(hk->cxt);
+	HistoryRow *r = palloc(sizeof(HistoryRow));
+	uint8	   *k = palloc(Max(key->len, 1));
+	uint8	   *v = palloc(Max(after->len, 1));
+
+	memcpy(k, key->data, key->len);
+	memcpy(v, after->data, after->len);
+	r->key.data = k;
+	r->key.len = key->len;
+	r->value.data = v;
+	r->value.len = after->len;
+	hk->rows = lappend(hk->rows, r);
+	MemoryContextSwitchTo(old);
+	at_change(&hk->to->sink, relid, kind, key, before, after);
+}
+
+/*
+ * relid's table's rows at each commit the head reaches (that has the
+ * table), with the commit, into rsinfo's store, as dolt_history_table()
+ * gives them.  With bounds (nbounds of them: the rows whose primary keys
+ * any bounds), only those: a commit whose version is keyed and defined as
+ * the table is now is read by seeking its data tree for each bound
+ * (O(depth) a bound), and one whose table is the tree the commit read
+ * before it had is given that commit's rows again, reading nothing; any
+ * other is read whole, the caller's filter keeping what the bounds would.
+ */
+void
+prolly_history_rows(Oid relid, const ProllyKeyBounds *bounds, int nbounds,
+					ReturnSetInfo *rsinfo)
+{
+	const ProllyMergeRoutine *dm = diff_merge();
 	Relation	rel;
 	AtSink		s;
+	HistoryKept hk;
+	ProllyHash	data;
 	ListCell   *lc;
 	List	   *lineages = NIL;
 
 	rel = open_row_type_table(relid, "dolt_history_table", ACL_SELECT);
-	InitMaterializedSRF(fcinfo, 0);
 	memset(&s, 0, sizeof(s));
 	s.sink.change = at_change;
-	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.rsinfo = rsinfo;
 	s.history = true;
+	memset(&hk, 0, sizeof(hk));
+	hk.sink.change = history_keep;
+	hk.to = &s;
+	hk.cxt = AllocSetContextCreate(CurrentMemoryContext, "history rows kept",
+								   ALLOCSET_DEFAULT_SIZES);
+	data.len = 0;
+	if (nbounds > 0 && !PROLLY_HAS(dm, bounded_rows))
+		nbounds = 0;
 	rows_begin(&s.rows, rel);
 	foreach(lc, log_entries("HEAD"))
 	{
 		LogEntry   *e = lfirst(lc);
 		char	   *email;
+		ProllyBoundedRead read = PROLLY_BOUNDED_NO;
 
 		CHECK_FOR_INTERRUPTS();
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
 		check_typed_at(relid, s.hash, &lineages, "dolt_history_table");
-		PROLLY_CALL(diff_merge(), diff, NULL, s.hash, relid, &s.sink);
+		if (nbounds > 0)
+		{
+			/* (what this read finds kept apart from what the last one kept) */
+			MemoryContext kept_cxt = hk.cxt;
+			List	   *kept = hk.rows;
+
+			hk.cxt = AllocSetContextCreate(CurrentMemoryContext,
+										   "history rows kept",
+										   ALLOCSET_DEFAULT_SIZES);
+			hk.rows = NIL;
+			read = dm->bounded_rows(s.hash, &e->info.root, relid, bounds,
+									nbounds, &data, &hk.sink);
+			if (read == PROLLY_BOUNDED_SAME)
+			{
+				/* (the same tree: the rows kept, given with this commit) */
+				MemoryContextDelete(hk.cxt);
+				hk.cxt = kept_cxt;
+				hk.rows = kept;
+				foreach_ptr(HistoryRow, r, hk.rows)
+					at_change(&s.sink, relid, PROLLY_DIFF_ADDED, &r->key, NULL,
+							  &r->value);
+				continue;
+			}
+			MemoryContextDelete(kept_cxt);
+			if (read == PROLLY_BOUNDED_READ)
+				continue;
+		}
+		/* (read whole: nothing kept for the commits after it) */
+		data.len = 0;
+		MemoryContextReset(hk.cxt);
+		hk.rows = NIL;
+		PROLLY_CALL(dm, diff, NULL, s.hash, relid, &s.sink);
 	}
 	rows_end(&s.rows);
+	MemoryContextDelete(hk.cxt);
 	table_close(rel, AccessShareLock);
+}
+
+/*
+ * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
+ *					  text, OUT committer text, OUT commit_date timestamptz)
+ *	  returns setof record
+ *
+ * tbl's table's rows at each commit the head reaches (that has the table),
+ * with the commit, as Dolt's dolt_history_<table>: each read from the
+ * commit's tree, as dolt_at() reads it.  (Planned with quals on the
+ * primary key, it is read by a scan of its own that seeks each commit:
+ * prolly_history_scan.c.)
+ */
+Datum
+dolt_history_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+
+	InitMaterializedSRF(fcinfo, 0);
+	prolly_history_rows(relid, NULL, 0, (ReturnSetInfo *) fcinfo->resultinfo);
 	return (Datum) 0;
 }
 
