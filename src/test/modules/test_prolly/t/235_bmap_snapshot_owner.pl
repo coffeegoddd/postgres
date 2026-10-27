@@ -1,11 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A snapshot's slot names the transaction that took it, so a crash between
-# a keep's snapshots and its commit leaks no slot: the snapshot is listed
-# by nobody after the restart, and a page sweep or the relation's next
-# snapshot lets go of it.  A snapshot is kept while its transaction runs,
-# and one taken by a transaction that rolls back is let go of the same way.
-# A standby replays what is let go of.
+# A captured root's slot names the transaction that captured it, so a crash
+# between a keep's captures and its commit leaks no root: the root is held
+# by nobody after the restart, and a page sweep reclaims its slot.  A root
+# is held while its transaction runs, and one captured by a transaction
+# that rolls back is held by nobody the same way.  A standby replays what
+# is let go of.
 
 use strict;
 use warnings FATAL => 'all';
@@ -45,59 +45,54 @@ sql(q{
 	INSERT INTO ko.t SELECT g, 0 FROM generate_series(1, 200) g;
 	SELECT dolt_commit('-Am', 'c1');
 	CREATE TABLE sub (i int);
-	CREATE FUNCTION slots_free(rel oid) RETURNS int LANGUAGE plpgsql AS $$
-	DECLARE ids int8[] := '{}';
-	BEGIN
-		LOOP
-			BEGIN
-				ids := ids || test_bmap_snapshot_take(rel);
-			EXCEPTION WHEN program_limit_exceeded THEN
-				EXIT;
-			END;
-		END LOOP;
-		PERFORM test_bmap_snapshot_release(rel, id) FROM unnest(ids) id;
-		RETURN cardinality(ids);
-	END $$;
 });
 my $rel = sql(q{SELECT pg_relation_filenode('ko.t')});
 
+# the roots held captured of the table
 sub kept
 {
 	my ($n) = @_;
 	$n //= $node;
-	return $n->safe_psql('postgres',
-		qq{SELECT count(*) FROM test_bmap_snapshots($rel)});
+	return $n->safe_psql('postgres', qq{SELECT test_bmap_roots_of($rel)});
 }
 
-# How many more snapshots the table can keep: taken until it refuses one,
-# then let go of.
-sub free_slots
+# the slots of roots whose capturers never committed, reclaimed
+sub reclaimed
 {
-	return sql(qq{SELECT slots_free($rel)});
+	return sql(q{SELECT test_bmap_roots_reclaim()});
 }
 
-is(kept(), '1', 'c1 is kept by one snapshot');
-is(free_slots(), '15', 'fifteen more slots are free');
+# the holder counts a sweep found wrong (counting every holder, a root's
+# included) and set right, once what is let go of is drained: none, if
+# each root reclaimed let go of exactly the holders it gained
+sub miscounted
+{
+	sql(q{SELECT count(*) FROM test_bmap_release_drain()});
+	return sql(q{SELECT recounted FROM prolly_page_sweep()});
+}
 
-# A keep stopped after its snapshot is taken, before its commit: the
-# snapshot is kept while its transaction runs, a sweep included; then a
-# crash.
+is(kept(), '1', 'c1 is kept by one root');
+is(reclaimed(), '0', 'no slot to reclaim');
+is(miscounted(), '0', 'every holder counted');
+
+# A keep stopped after its roots are captured, before its commit: the root
+# is held while its transaction runs, a sweep included; then a crash.
 sub keep_then_crash
 {
 	my ($msg) = @_;
 	my $s = $node->background_psql('postgres');
 	$s->query_safe(q{SELECT injection_points_set_local();
-		SELECT injection_points_attach('bmap-snapshot-taken', 'wait')});
+		SELECT injection_points_attach('bmap-roots-captured', 'wait')});
 	$s->query_until(qr/keeping/, qq{
 		\\echo keeping
 		UPDATE ko.t SET v = v + 1 WHERE id = 1;
 		SELECT dolt_commit('-am', '$msg');
 	});
-	$node->wait_for_event('client backend', 'bmap-snapshot-taken');
+	$node->wait_for_event('client backend', 'bmap-roots-captured');
 	my $during = kept();
 	sql(q{SELECT freed FROM prolly_page_sweep()});
 	my $swept = kept();
-	# (a commit flushes the snapshot's record)
+	# (a commit flushes the capture's record)
 	sql('SELECT txid_current()');
 	$node->stop('immediate');
 	eval { $s->quit };
@@ -106,61 +101,78 @@ sub keep_then_crash
 }
 
 my ($during, $swept) = keep_then_crash('c2');
-is($during, '2', 'a snapshot is kept while its transaction runs');
+is($during, '2', 'a root is held while its transaction runs');
 is($swept, '2', 'and a sweep meanwhile leaves it');
-is(kept(), '1', 'after the crash, nobody keeps the snapshot of c2');
+is(kept(), '1', 'after the crash, nobody holds the root of c2');
 sql(q{SELECT freed FROM prolly_page_sweep()});
-is(free_slots(), '15', 'a sweep let go of its slot');
+is(reclaimed(), '0', 'a sweep reclaimed its slot');
+is(miscounted(), '0', 'and let go of the holders its root gained');
 
-# The table's next keep lets go of what the crash left, unswept.
+# Not swept, the slot the crash left is reclaimed by the store's reclaim.
 sql(q{UPDATE ko.t SET v = 2 WHERE id = 2; SELECT dolt_commit('-am', 'c3')});
 is(kept(), '2', 'c1 and c3 are kept');
 keep_then_crash('c4');
 sql(q{UPDATE ko.t SET v = 3 WHERE id = 3; SELECT dolt_commit('-am', 'c5')});
 # (c1 is retired by c5's keep, let go of by the next)
 is(kept(), '3', 'c1, c3 and c5 are kept after a crash in c4\'s keep');
-is(free_slots(), '13', 'the next keep let go of the slot the crash left');
+cmp_ok(reclaimed(), '>', 0, 'the slots the crash left (one a relation) are reclaimed');
+is(reclaimed(), '0', 'once');
 sql(q{UPDATE ko.t SET v = 4 WHERE id = 4; SELECT dolt_commit('-am', 'c6')});
 
-# Snapshots taken by a transaction that rolls back, and by a subtransaction
-# rolled back in one that commits, are listed by nobody, and the next
-# snapshot taken lets go of them.
-sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); ROLLBACK;
-	BEGIN; SAVEPOINT s; SELECT test_bmap_snapshot_take($rel);
+# Roots captured by a transaction that rolls back, and by a subtransaction
+# rolled back in one that commits, are held by nobody, and reclaimed.
+sql(qq{BEGIN; SELECT test_bmap_root_capture($rel); ROLLBACK;
+	BEGIN; SAVEPOINT s; SELECT test_bmap_root_capture($rel);
 	ROLLBACK TO s; COMMIT;});
-is(kept(), '3', 'snapshots of transactions rolled back are listed by nobody');
-is(free_slots(), '13', 'and the next snapshot taken let go of them');
+is(kept(), '3', 'roots of transactions rolled back are held by nobody');
+is(reclaimed(), '2', 'and their slots are reclaimed');
+is(miscounted(), '0', 'and the holders their roots gained let go of');
 
-# A prepared transaction's snapshot is kept while it is prepared, a sweep
-# included: kept once it commits, let go of if it is rolled back.
-sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); PREPARE TRANSACTION 'p1'});
-is(kept(), '4', 'a prepared transaction\'s snapshot is kept');
+# A prepared transaction's root is held while it is prepared, a sweep
+# included: held once it commits, by nobody if it is rolled back.
+sql(qq{BEGIN; SELECT test_bmap_root_capture($rel); PREPARE TRANSACTION 'p1'});
+is(kept(), '4', 'a prepared transaction\'s root is held');
 sql(q{SELECT freed FROM prolly_page_sweep()});
 is(kept(), '4', 'and a sweep leaves it');
 sql(q{COMMIT PREPARED 'p1'});
-is(free_slots(), '12', 'committed, it is kept');
-my $prepared = sql(qq{SELECT id FROM test_bmap_snapshots($rel) ORDER BY id DESC LIMIT 1});
-sql(qq{SELECT test_bmap_snapshot_release($rel, $prepared)});
-sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); PREPARE TRANSACTION 'p2'});
+is(kept(), '4', 'committed, it is held');
+is(reclaimed(), '0', 'and not reclaimed');
+sql(qq{BEGIN; SELECT test_bmap_root_capture($rel) AS id \\gset
+	SELECT test_bmap_root_release(:id); COMMIT;});
+sql(qq{BEGIN; SELECT test_bmap_root_capture($rel); PREPARE TRANSACTION 'p2'});
 sql(q{ROLLBACK PREPARED 'p2'});
-is(kept(), '3', 'rolled back, it is listed by nobody');
-is(free_slots(), '13', 'and let go of');
+is(kept(), '4', 'rolled back, it is held by nobody');
+is(reclaimed(), '1', 'and reclaimed');
 
-# A snapshot taken in a subtransaction past the ones a backend keeps track
-# of (its subtransactions overflowed): kept while the transaction runs, a
-# sweep included, and let go of once that subtransaction rolls back.
+# A root captured in a subtransaction past the ones a backend keeps track
+# of (its subtransactions overflowed): held while the transaction runs, a
+# sweep included, and by nobody once that subtransaction rolls back.
 my $s = $node->background_psql('postgres');
 $s->query_safe('BEGIN');
 $s->query_safe(join('', map { "SAVEPOINT s$_; INSERT INTO sub VALUES ($_);" } 1 .. 80));
-$s->query_safe(qq{SELECT test_bmap_snapshot_take($rel)});
-is(kept(), '4', 'a snapshot of an overflowed subtransaction is kept');
+$s->query_safe(qq{SELECT test_bmap_root_capture($rel)});
+is(kept(), '5', 'a root of an overflowed subtransaction is held');
 sql(q{SELECT freed FROM prolly_page_sweep()});
-is(kept(), '4', 'and a sweep leaves it');
+is(kept(), '5', 'and a sweep leaves it');
 $s->query_safe('ROLLBACK TO s40');
-is(kept(), '3', 'rolled back, it is listed by nobody');
+is(kept(), '4', 'rolled back, it is held by nobody');
 $s->query_safe('COMMIT');
 $s->quit;
-is(free_slots(), '13', 'and let go of');
+is(reclaimed(), '1', 'and reclaimed');
+
+# VACUUM settles every slot before the database's oldest transaction id
+# may advance, so that none needs the commit log, which may then forget its
+# transactions: a capture a crash ended, never reclaimed, is reclaimed, and
+# the slots held name no transaction (else, too old for the log to say,
+# that capture would be held for good).
+keep_then_crash('c7');
+cmp_ok(sql(q{SELECT test_bmap_roots_naming()}), '>', 0,
+	'slots name the transactions that captured and let go of them');
+sql('VACUUM');
+is(sql(q{SELECT test_bmap_roots_naming()}), '0', 'VACUUM settles them all');
+is(reclaimed(), '0', 'the slot c7\'s crash left reclaimed by it');
+is(miscounted(), '0', 'with the holders its root gained');
+is(kept(), '4', 'the roots held still held');
 
 # A sweep passes over maps a crash left unfinished: one with no pages, and
 # one whose pages are all zeroes.
@@ -178,11 +190,11 @@ for my $f (["999990_bmap", 0, 'no pages'], ["999991_bmap", 16384, 'zeroed pages'
 	unlink("$dir/$f->[0]");
 }
 
-# the standby lists every slot it has (it judges no transaction): as many
-# as the primary keeps, once it has replayed what was let go of
+# the standby counts every slot it has (it judges no transaction): as many
+# as the primary holds, once it has replayed what was let go of
 $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
-is(kept(), '3', 'c3, c5 and c6 are kept');
-is(kept($standby), '3', 'the standby replayed the slots let go of');
+is(kept(), '4', 'c3, c5, c6 and the prepared transaction\'s are held');
+is(kept($standby), '4', 'the standby replayed the slots let go of');
 is($standby->safe_psql('postgres', 'SELECT count(*) FROM ko.t'), '200',
 	'and reads the table');
 

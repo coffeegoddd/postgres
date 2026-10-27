@@ -255,6 +255,46 @@ CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
 RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Roots captured into the database's page store: captured (an id), let go
+-- of as the transaction commits, asked of (the length it holds, NULL if not
+-- held), copied into a new relation file number (its main fork alone, which
+-- test_bmap_unlink() drops), counted (those held, and the slots), and the
+-- slots of captures that never committed reclaimed; and those held captured
+-- of a relation file number.
+CREATE FUNCTION test_bmap_root_capture(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_release(id int8)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_held(id int8)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_share_root(id int8)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots(OUT held int8, OUT slots int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_of(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The captured roots' slots in use that name a transaction, as capturer
+-- or releaser (VACUUM settles them, so that none needs the commit log).
+CREATE FUNCTION test_bmap_roots_naming()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_reclaim(settle bool DEFAULT false)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Look up every logical block of the storage 'loops' times, as reading its
 -- pages does (from cached map pages): the microseconds it took.
 CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)

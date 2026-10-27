@@ -45,6 +45,8 @@ extern bool branch_fold_mark(Oid branch, Snapshot snap, ProllyFoldMark *mark);
 extern bool branch_written_since(const ProllyFoldMark *mark, Snapshot snap,
 								 Oid **relids, int *nrelids);
 extern void branch_generations_forget(void);
+extern bool branch_root_soon(Oid branch, int ms, bool claim);
+extern void branch_root_note(Oid branch, TimestampTz at);
 extern void branch_generations_prepared_ended(FullTransactionId xid);
 
 /*
