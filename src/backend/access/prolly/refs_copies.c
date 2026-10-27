@@ -1587,6 +1587,7 @@ publish_scoped(void)
 {
 	if (!scoped)
 		return;
+	INJECTION_POINT("prolly-refs-publishing", NULL);
 	scoped_save();
 	flush_scoped();
 	for (;;)
