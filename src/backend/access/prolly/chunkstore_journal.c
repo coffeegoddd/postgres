@@ -7106,7 +7106,8 @@ journal_adopt_received(ProllyChunkStore *s)
 	scan_journal(s);
 	nm.root = s->root;
 	nm.files = palloc(sizeof(ManifestFile) * (m.nfiles + list_length(tables) + 1));
-	memcpy(nm.files, m.files, sizeof(ManifestFile) * m.nfiles);
+	if (m.nfiles > 0)
+		memcpy(nm.files, m.files, sizeof(ManifestFile) * m.nfiles);
 	foreach_ptr(TableFile, t, tables)
 	{
 		bool		named = false;

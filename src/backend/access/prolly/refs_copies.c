@@ -7104,7 +7104,7 @@ static char *owned_text = NULL;
 static bool owned_callback = false;
 
 static void
-owned_role_renamed(Datum arg, int cacheid, uint32 hashvalue)
+owned_role_renamed(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	owned_generation = 0;
 }
