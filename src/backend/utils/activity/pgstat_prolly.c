@@ -175,6 +175,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_BMAP_ROOTS_SHARED] = "bmap_roots_shared",
 	[PGSTAT_PROLLY_BMAP_MAP_PAGES_STAMPED] = "bmap_map_pages_stamped",
 	[PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ] = "bmap_changed_nodes_read",
+	[PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ] = "bmap_roots_pages_read",
 };
 
 /*

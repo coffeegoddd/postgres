@@ -4030,6 +4030,15 @@ archive_repair(const char *source, int nfragments)
 		}
 
 		/*
+		 * Verified, settled: the boundary commits, in settled files, name
+		 * what was received, and a default collection doesn't read
+		 * settled files.
+		 */
+		if (PROLLY_HAS(tree_env.chunk_store, settle))
+			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
+						r->f.tops, r->f.ntops);
+
+		/*
 		 * (its edges and record let go of: the boundary keeps its parents;
 		 * and a boundary's delta over a first parent back here, which a
 		 * walk finds again)

@@ -118,8 +118,13 @@ capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
 	bool		left[MaxHeapTuplesPerPage + 1] = {0};
 	bool		any = false;
 
-	if (PageIsNew(page) || PageIsEmpty(page))
+	if (PageIsNew(page))
 		return false;
+	if (PageIsEmpty(page))
+	{
+		PageSetAllVisible(page);
+		return false;
+	}
 	Assert(maxoff <= MaxHeapTuplesPerPage);
 
 	/* (each version judged before any line pointer changes) */
@@ -179,7 +184,18 @@ capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
 		ItemPointerSet(&tup->t_ctid, blkno, off);
 		any = true;
 	}
-	PageClearAllVisible(page);
+	/*
+	 * (all-visible, and all-frozen, if no dead line pointer is left: every
+	 * version left is frozen, and an index entry may point at a dead one,
+	 * which an index-only scan must not take for a row)
+	 */
+	PageSetAllVisible(page);
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		if (ItemIdIsDead(PageGetItemId(page, off)))
+		{
+			PageClearAllVisible(page);
+			break;
+		}
 	PageClearFull(page);
 	((PageHeader) page)->pd_prune_xid = InvalidTransactionId;
 	return any;
