@@ -3705,24 +3705,9 @@ typedef struct KeptCommit
 static bool commit_height(const ProllyHash *id, int64 *height);
 
 /*
- * Roots are captured at commits, but no more often than the interval asks:
- * a commit is kept only once prolly.root_interval has passed since the
- * branch's newest kept commit was kept and prolly.root_interval_commits
- * commits have been made since it.  By default (-1) the interval is 0
- * (every commit) for commits made by hand, and a second under
- * dolt.transaction_commit, whose every transaction is a commit.  A move to
- * a commit that wasn't kept restores the nearest kept commit before it
- * and writes the rows the two differ by, the rows changed in an interval
- * (and what a merge between brought in).  The time a branch's root was last
- * kept, or a keep of it last tried, is shared by every backend
- * (branch_root_soon()): within the interval, a commit asks nothing of the
- * refs and tries no keep, and once it has passed, one backend's commit
- * claims the next try, not each backend's.
- */
-/*
  * The freezing of a keep's roots as it captures them, if the root freezer
- * does so and prolly.freeze_roots asks (NULL: they are kept as captured).  Not under
- * dolt.transaction_commit, whose every transaction's commit would pay it:
+ * does so and prolly.freeze_roots asks (NULL: they are kept as
+ * captured).  Not under dolt.transaction_commit, whose every transaction's commit would pay it:
  * there the freezer freezes later.
  */
 static BranchFreezePage
@@ -3739,6 +3724,21 @@ freeze_at_keep(const ProllyDatabaseComponents *dc)
 	return dc->root_freezer->freeze_page;
 }
 
+/*
+ * Roots are captured at commits, but no more often than the interval asks:
+ * a commit is kept only once prolly.root_interval has passed since the
+ * branch's newest kept commit was kept and prolly.root_interval_commits
+ * commits have been made since it.  By default (-1) the interval is 0
+ * (every commit) for commits made by hand, and a second under
+ * dolt.transaction_commit, whose every transaction is a commit.  A move to
+ * a commit that wasn't kept restores the nearest kept commit before it
+ * and writes the rows the two differ by, the rows changed in an interval
+ * (and what a merge between brought in).  The time a branch's root was last
+ * kept, or a keep of it last tried, is shared by every backend
+ * (branch_root_soon()): within the interval, a commit asks nothing of the
+ * refs and tries no keep, and once it has passed, one backend's commit
+ * claims the next try, not each backend's.
+ */
 static int
 root_interval_ms(void)
 {
