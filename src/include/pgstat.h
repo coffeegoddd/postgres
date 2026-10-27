@@ -828,9 +828,15 @@ typedef enum PgStat_ProllyCounter
 											 * the first since it began */
 	PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ,	/* map nodes read to find the
 											 * pages changed since an epoch */
+	PGSTAT_PROLLY_ROOTS_CAPTURE_BUSY,	/* keeps among writers given up: a
+										 * relation never left unchanged
+										 * for a moment */
+	PGSTAT_PROLLY_ROOTS_FROZEN_LATER,	/* kept commits whose roots,
+										 * captured among writers, were
+										 * frozen after */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_ROOTS_FROZEN_LATER + 1)
 
 typedef struct PgStat_ProllyStats
 {

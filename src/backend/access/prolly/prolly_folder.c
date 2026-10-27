@@ -58,7 +58,10 @@
 #include "access/prolly_config.h"
 #include "access/prolly_folder.h"
 #include "access/prolly_types.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/tableam.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
@@ -196,12 +199,49 @@ database_usable(Oid dboid)
 	return usable;
 }
 
+/*
+ * Every database a worker could connect to, for the launcher's first
+ * passes: each is started a worker once, whose freezing finds the roots a
+ * crash or a restart left unfrozen (the refs keep them; nothing written
+ * since tells the launcher of them).
+ */
+static List *
+all_databases(void)
+{
+	List	   *dbs = NIL;
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	StartTransactionCommand();
+	rel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_database db = (Form_pg_database) GETSTRUCT(tup);
+
+		if (db->datallowconn && !database_is_invalid_form(db))
+		{
+			MemoryContext old = MemoryContextSwitchTo(cxt);
+
+			dbs = lappend_oid(dbs, db->oid);
+			MemoryContextSwitchTo(old);
+		}
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+	CommitTransactionCommand();
+	return dbs;
+}
+
 void
 ProllyFolderLauncherMain(Datum main_arg)
 {
 	Running		running[FOLDER_MAX_DATABASES];
 	int			nrunning = 0;
 	int			turn = 0;		/* the moved database to start from */
+	List	   *swept = NIL;	/* databases yet to be started once */
 
 	ProllyDatabaseComponents dc;
 
@@ -214,6 +254,8 @@ ProllyFolderLauncherMain(Datum main_arg)
 					PGC_SUSET, PGC_S_OVERRIDE);
 	PredicateLockingPassOverBackend();
 	prolly_database_components(&dc);
+	if (prolly_fold_worker && PROLLY_HAS(dc.refs, freeze_kept))
+		swept = all_databases();
 
 	for (;;)
 	{
@@ -247,6 +289,23 @@ ProllyFolderLauncherMain(Datum main_arg)
 		nrunning = kept;
 		if (!prolly_fold_worker || !PROLLY_HAS(dc.refs, moved_databases))
 			continue;
+
+		/* (the first passes: each database once, for roots left unfrozen) */
+		while (swept != NIL && nrunning < prolly_fold_worker_max_workers)
+		{
+			Oid			dboid = linitial_oid(swept);
+			bool		busy = false;
+			BackgroundWorkerHandle *handle;
+
+			swept = list_delete_first(swept);
+			for (int j = 0; j < nrunning && !busy; j++)
+				busy = running[j].dboid == dboid;
+			if (busy || !start_worker(dboid, &handle))
+				continue;
+			running[nrunning].dboid = dboid;
+			running[nrunning].handle = handle;
+			nrunning++;
+		}
 
 		/* (in turn, a pass starting from the next: none waits for good) */
 		n = dc.refs->moved_databases(databases, lengthof(databases));
@@ -717,6 +776,103 @@ fold_pass(const ProllyRefsRoutine *refs)
 	return any ? PASS_FOLDED : pending ? PASS_PENDING : PASS_IDLE;
 }
 
+/*
+ * Freezing.  Under dolt.transaction_commit a commit's roots are captured
+ * among the writers and kept unfrozen, with the commit's snapshot (the
+ * lazy root freezer); each pass, the worker freezes the oldest such
+ * commit of each branch keeping one, in a transaction of its own (the
+ * refs' freeze_kept()).  A freeze that can't be had now (a lock held) is
+ * tried again next pass; an error is reported and the branch passed over
+ * this pass.  So the roots of a database whose branches are written are
+ * frozen soon after they are captured, before the database forgets the
+ * transaction ids they hold; the launcher also starts a worker in every
+ * database once as it starts, for the roots a crash or a restart left.
+ */
+#define FREEZER_MAX_PER_PASS	8
+
+static void
+note_unfrozen_name(const char *name, void *arg)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pstrdup(name));
+}
+
+/* (run on a branch: its oldest unfrozen commit frozen, into *result) */
+static void
+freeze_branch(void *arg)
+{
+	int		   *result = arg;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	*result = dc.refs->freeze_kept();
+}
+
+static PassResult
+freeze_pass(const ProllyRefsRoutine *refs)
+{
+	List	   *names = NIL;
+	bool		any = false;
+	bool		pending = false;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	if (!PROLLY_HAS(refs, unfrozen_branches) || !PROLLY_HAS(refs, freeze_kept))
+		return PASS_IDLE;
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	{
+		MemoryContext old = MemoryContextSwitchTo(cxt);
+
+		refs->unfrozen_branches(note_unfrozen_name, &names);
+		MemoryContextSwitchTo(old);
+	}
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	foreach_ptr(char, name, names)
+	{
+		for (int n = 0; n < FREEZER_MAX_PER_PASS; n++)
+		{
+			int			result = 0;
+
+			StartTransactionCommand();
+			PG_TRY();
+			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				if (strcmp(name, branch_ops()->current()) == 0)
+					freeze_branch(&result);
+				else
+					branch_ops()->run_on(name, freeze_branch, &result);
+				PopActiveSnapshot();
+				if (result > 0)
+					CommitTransactionCommand();
+				else
+					AbortCurrentTransaction();
+			}
+			PG_CATCH();
+			{
+				HOLD_INTERRUPTS();
+				EmitErrorReport();
+				AbortOutOfAnyTransaction();
+				FlushErrorState();
+				RESUME_INTERRUPTS();
+				result = 0;
+			}
+			PG_END_TRY();
+			if (result > 0)
+				any = true;
+			if (result < 0)
+				pending = true;
+			if (result <= 0)
+				break;
+			pending = true;		/* (perhaps more: asked again next pass) */
+		}
+	}
+	list_free_deep(names);
+	return any ? PASS_FOLDED : pending ? PASS_PENDING : PASS_IDLE;
+}
+
 void
 ProllyFolderWorkerMain(Datum main_arg)
 {
@@ -752,7 +908,8 @@ ProllyFolderWorkerMain(Datum main_arg)
 					PGC_SUSET, PGC_S_OVERRIDE);
 	PredicateLockingPassOverBackend();
 	prolly_database_components(&dc);
-	if (!PROLLY_HAS(dc.refs, moved_branches))
+	if (!PROLLY_HAS(dc.refs, moved_branches) &&
+		!PROLLY_HAS(dc.refs, freeze_kept))
 		proc_exit(0);
 
 	/*
@@ -773,6 +930,8 @@ ProllyFolderWorkerMain(Datum main_arg)
 		if (!prolly_fold_worker)
 			break;
 		r = fold_pass(dc.refs);
+		if (freeze_pass(dc.refs) != PASS_IDLE)
+			r = PASS_PENDING;
 		idle = r == PASS_IDLE ? idle + 1 : 0;
 		pgstat_report_stat(true);
 		if (idle < 2)

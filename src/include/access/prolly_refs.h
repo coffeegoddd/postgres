@@ -967,6 +967,19 @@ typedef struct ProllyRefsRoutine
 												const ProllyValue *value,
 												void *arg),
 								 void *arg);
+
+	/*
+	 * Optional: the fold worker's freezing of roots kept among writers.
+	 * unfrozen_branches() visits, by name, each branch keeping a commit
+	 * whose roots were captured among writers and aren't frozen yet;
+	 * freeze_kept() freezes the session branch's oldest one as of the
+	 * commit's snapshot (the root freezer's freeze_page()), or retires it
+	 * if it is past the database's frozen horizon: 1 if one was, 0 if none
+	 * is left, -1 if it can't be now (a lock held: to be tried again).
+	 */
+	void		(*unfrozen_branches) (void (*visit) (const char *name, void *arg),
+									  void *arg);
+	int			(*freeze_kept) (void);
 } ProllyRefsRoutine;
 
 /*
@@ -1032,9 +1045,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
-	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at"
+	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
+	"unfrozen_branches", "freeze_kept"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK side_scan_at
+#define PROLLY_REFS_LAST_CALLBACK freeze_kept
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

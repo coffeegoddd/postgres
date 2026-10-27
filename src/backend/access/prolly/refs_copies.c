@@ -1861,6 +1861,7 @@ branch_entry_tag(char tag)
 		case TAG_IDENTITY:
 		case TAG_REBASE:
 		case TAG_KEPT:
+		case TAG_KEPT_UNFROZEN:
 		case TAG_CREATOR:
 			return true;
 		default:
@@ -3731,21 +3732,99 @@ static bool commit_height(const ProllyHash *id, int64 *height);
 /*
  * The freezing of a keep's roots as it captures them, if the root freezer
  * does so and prolly.freeze_roots asks (NULL: they are kept as
- * captured).  Not under dolt.transaction_commit, whose every transaction's commit would pay it:
- * there the freezer freezes later.
+ * captured).
  */
 static BranchFreezePage
 freeze_at_keep(const ProllyDatabaseComponents *dc)
 {
-	const char *tc = GetConfigOption("dolt.transaction_commit", true, false);
-
 	if (!prolly_freeze_roots ||
 		dc->root_freezer == NULL || !PROLLY_HAS(dc->root_freezer, at_capture) ||
 		!PROLLY_HAS(dc->root_freezer, freeze_page) ||
-		!dc->root_freezer->at_capture() ||
-		(tc != NULL && strcmp(tc, "on") == 0))
+		!dc->root_freezer->at_capture())
 		return NULL;
 	return dc->root_freezer->freeze_page;
+}
+
+/*
+ * Are a keep's roots captured among the writers, to be frozen later (the
+ * root freezer's freeze_later(), as prolly.freeze_roots asks)?  Else, not
+ * frozen as captured, they are kept only while no writer is at work.
+ */
+static bool
+freeze_later_at_keep(const ProllyDatabaseComponents *dc)
+{
+	return prolly_freeze_roots && dc->root_freezer != NULL &&
+		PROLLY_HAS(dc->root_freezer, freeze_later) &&
+		PROLLY_HAS(dc->root_freezer, freeze_page) &&
+		dc->root_freezer->freeze_later();
+}
+
+/* the most ids a kept commit's snapshot records, of each kind */
+#define KEPT_SNAPSHOT_MAX_XIDS	4096
+
+/*
+ * Record snap in kc, the commit's view of the transactions its roots,
+ * captured among writers, hold the versions of; with the committing
+ * transaction's own ids (its top-level one and its subtransactions'
+ * committed so far: at its commit, all of them), which it sees as
+ * committed.  False if it can't be recorded whole: its subtransactions
+ * overflowed (which ones are running isn't known then without the
+ * subtransaction log, which is gone by the time the roots are frozen), or
+ * too many.
+ */
+static bool
+kept_note_snapshot(KeptCommit *kc, Snapshot snap)
+{
+	TransactionId *children;
+	int			nchildren = xactGetCommittedChildren(&children);
+	TransactionId top = GetTopTransactionIdIfAny();
+
+	if (snap->suboverflowed || snap->takenDuringRecovery ||
+		snap->xcnt > KEPT_SNAPSHOT_MAX_XIDS ||
+		snap->subxcnt > KEPT_SNAPSHOT_MAX_XIDS ||
+		nchildren + 1 > KEPT_SNAPSHOT_MAX_XIDS)
+		return false;
+	kc->unfrozen = true;
+	kc->xmin = snap->xmin;
+	kc->xmax = snap->xmax;
+	kc->nxip = snap->xcnt;
+	kc->xip = snap->xcnt > 0 ? palloc_array(TransactionId, snap->xcnt) : NULL;
+	if (snap->xcnt > 0)
+		memcpy(kc->xip, snap->xip, snap->xcnt * sizeof(TransactionId));
+	kc->nsubxip = snap->subxcnt;
+	kc->subxip = snap->subxcnt > 0 ? palloc_array(TransactionId, snap->subxcnt) : NULL;
+	if (snap->subxcnt > 0)
+		memcpy(kc->subxip, snap->subxip, snap->subxcnt * sizeof(TransactionId));
+	kc->own = palloc_array(TransactionId, nchildren + 1);
+	kc->nown = 0;
+	if (TransactionIdIsValid(top))
+		kc->own[kc->nown++] = top;
+	for (int i = 0; i < nchildren; i++)
+		kc->own[kc->nown++] = children[i];
+	return true;
+}
+
+/*
+ * The snapshot kc's roots are to be frozen as of, into *as_of, its MVCC
+ * snapshot in *snap.
+ */
+static void
+kept_snapshot(const KeptCommit *kc, SnapshotData *snap, ProllyRootSnapshot *as_of)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->snapshot_type = SNAPSHOT_MVCC;
+	snap->xmin = kc->xmin;
+	snap->xmax = kc->xmax;
+	snap->xip = kc->xip;
+	snap->xcnt = kc->nxip;
+	snap->subxip = kc->subxip;
+	snap->subxcnt = kc->nsubxip;
+	snap->suboverflowed = false;
+	snap->takenDuringRecovery = false;
+	snap->curcid = FirstCommandId;
+	as_of->snapshot = snap;
+	as_of->nown = kc->nown;
+	as_of->own = kc->own;
 }
 
 /*
@@ -4480,6 +4559,13 @@ kept_settled(void *arg)
 	return branch_writers_settled(MyBranch, (Snapshot) arg);
 }
 
+/* (among writers: only that snap saw every one of them that committed) */
+static bool
+kept_seen(void *arg)
+{
+	return branch_writers_seen(MyBranch, (Snapshot) arg);
+}
+
 /*
  * What is left of kept commit kc's pages: restorable if some table's
  * relations all are (restore_pages() can give that table its pages back);
@@ -4617,6 +4703,203 @@ kept_replaced(const KeptCommit *o, const ProllyHash *parent)
 		same_hash(&was.parents[0], parent);
 }
 
+/* Does kept commit kc keep the same roots, relation by relation, as o? */
+static bool
+kept_same_roots(const KeptCommit *kc, const KeptCommit *o)
+{
+	if (!same_hash(&kc->commit, &o->commit) || kc->ntables != o->ntables)
+		return false;
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		if (kc->tables[t].nrels != o->tables[t].nrels)
+			return false;
+		for (int r = 0; r < kc->tables[t].nrels; r++)
+			if (kc->tables[t].rels[r].relid != o->tables[t].rels[r].relid ||
+				kc->tables[t].rels[r].snapshot != o->tables[t].rels[r].snapshot)
+				return false;
+	}
+	return true;
+}
+
+/*
+ * Freeze the roots of branch name's kept commit kc (of *kept, the branch's
+ * list), captured among writers (unfrozen), as of its snapshot: each of
+ * its tables still restorable made frozen roots (branch operations'
+ * freeze_kept()), from the nearest frozen roots before them in the list.
+ * The commit is kept anew by them, its unfrozen entry retired (never
+ * changed in place: a first use may be reading it, and its roots stay
+ * until this transaction is known to commit), and the list put.  The
+ * database's frozen ids are held while the roots are read, so that the
+ * transactions they hold stay known (vac_update_datfrozenxid() waits).
+ * With 'locked' the caller holds the branch already, the list as it is
+ * now; else the roots are frozen first, the branch held after, and the
+ * commit found again, kept by the same roots.  Returns the new entry, NULL
+ * if it can't be had now (a lock not free, the commit gone or changed
+ * meanwhile).
+ */
+static KeptCommit *
+kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
+{
+	ProllyDatabaseComponents dc;
+	SnapshotData snap;
+	ProllyRootSnapshot as_of;
+	BranchKeptRelation *prior;
+	int			nprior = 0;
+	KeptCommit *fc;
+	KeptCommit *at = kc;
+
+	prolly_database_components(&dc);
+	if (!kc->unfrozen || branch_ops()->freeze_kept == NULL ||
+		branch_ops()->kept_status == NULL || dc.root_freezer == NULL ||
+		!PROLLY_HAS(dc.root_freezer, freeze_page))
+		return NULL;
+	LockDatabaseFrozenIds(ShareLock);
+	kept_snapshot(kc, &snap, &as_of);
+
+	/* (the bases: every frozen root the list keeps) */
+	foreach_ptr(KeptCommit, o, *kept)
+		if (!FullTransactionIdIsValid(o->retired) && !o->unfrozen)
+			for (int t = 0; t < o->ntables; t++)
+				nprior += o->tables[t].nrels;
+	prior = palloc_array(BranchKeptRelation, Max(nprior, 1));
+	nprior = 0;
+	foreach_ptr(KeptCommit, o, *kept)
+		if (!FullTransactionIdIsValid(o->retired) && !o->unfrozen)
+			for (int t = 0; t < o->ntables; t++)
+				for (int r = 0; r < o->tables[t].nrels; r++)
+					prior[nprior++] = o->tables[t].rels[r];
+
+	fc = palloc(sizeof(KeptCommit));
+	*fc = *kc;
+	fc->unfrozen = false;
+	fc->nxip = fc->nsubxip = fc->nown = 0;
+	fc->xip = fc->subxip = fc->own = NULL;
+	fc->tables = palloc_array(KeptTable, Max(kc->ntables, 1));
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		KeptTable  *kt = &kc->tables[t];
+		bool		restorable = true;
+
+		fc->tables[t] = *kt;
+		fc->tables[t].rels = palloc_array(BranchKeptRelation, kt->nrels);
+		memcpy(fc->tables[t].rels, kt->rels,
+			   sizeof(BranchKeptRelation) * kt->nrels);
+
+		/*
+		 * (a table past the horizon, or gone, stays unfrozen: never given
+		 * back, its commit retired as any held one is)
+		 */
+		for (int r = 0; r < kt->nrels && restorable; r++)
+			restorable = branch_ops()->kept_status(&kt->rels[r]) ==
+				BRANCH_KEPT_RESTORABLE;
+		if (restorable &&
+			!branch_ops()->freeze_kept(kt->rels, kt->nrels, fc->tables[t].rels,
+									   prior, nprior,
+									   dc.root_freezer->freeze_page, &as_of))
+			return NULL;
+	}
+	if (!locked)
+	{
+		lock_branch(name);
+		*kept = kept_get(name);
+		at = NULL;
+		foreach_ptr(KeptCommit, o, *kept)
+			if (at == NULL && !FullTransactionIdIsValid(o->retired) &&
+				o->unfrozen && kept_same_roots(o, kc))
+				at = o;
+		if (at == NULL)
+			return NULL;
+	}
+	at->retired = GetTopFullTransactionId();
+	foreach_ptr(KeptCommit, o, *kept)
+		if (o == at)
+		{
+			*kept = list_insert_nth(*kept, foreach_current_index(o), fc);
+			break;
+		}
+	kept_put(name, *kept);
+	pgstat_count_prolly(PGSTAT_PROLLY_ROOTS_FROZEN_LATER, 1);
+	return fc;
+}
+
+/*
+ * Kept commit kc of branch source, as a move may give its pages back: as it
+ * is if its roots are frozen; if they were captured among writers, frozen
+ * now (the session's own branch's, the root freezer's freeze_now() asking;
+ * the caller holds the branch), or NULL, never given back as captured.
+ */
+static KeptCommit *
+kept_usable(const char *name, List **kept, KeptCommit *kc, Oid source)
+{
+	ProllyDatabaseComponents dc;
+
+	if (kc == NULL || !kc->unfrozen)
+		return kc;
+	prolly_database_components(&dc);
+	if (source != MyBranch || dc.root_freezer == NULL ||
+		!PROLLY_HAS(dc.root_freezer, freeze_now) ||
+		!dc.root_freezer->freeze_now())
+		return NULL;
+	return kept_freeze(name, kept, kc, true);
+}
+
+/*
+ * The fold worker's freezing (the refs' freeze_kept()): the oldest kept
+ * commit of the session's branch whose roots were captured among writers,
+ * frozen (kept_freeze()), or retired if it is past the horizon or gone
+ * (no table of it restorable).  1 if one was, 0 if none is left, -1 if
+ * it can't be now (to be tried again).
+ */
+static int
+copies_freeze_kept(void)
+{
+	char	   *name = branch_ops()->current();
+	List	   *kept = kept_get(name);
+	KeptCommit *oldest = NULL;
+
+	foreach_ptr(KeptCommit, o, kept)
+		if (!FullTransactionIdIsValid(o->retired) && o->unfrozen)
+			oldest = o;
+	if (oldest == NULL)
+		return 0;
+	if (kept_commit_status(oldest) != BRANCH_KEPT_RESTORABLE)
+	{
+		lock_branch(name);
+		kept = kept_get(name);
+		foreach_ptr(KeptCommit, o, kept)
+			if (!FullTransactionIdIsValid(o->retired) && o->unfrozen &&
+				kept_same_roots(o, oldest))
+				o->retired = GetTopFullTransactionId();
+		kept_put(name, kept);
+		return 1;
+	}
+	return kept_freeze(name, &kept, oldest, false) != NULL ? 1 : -1;
+}
+
+/*
+ * The branches with kept commits whose roots are to be frozen (the refs'
+ * unfrozen_branches()): each visited by name.
+ */
+static void
+note_unfrozen(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pnstrdup((const char *) k->data + 1, k->len - 1));
+}
+
+static void
+copies_unfrozen_branches(void (*visit) (const char *name, void *arg), void *arg)
+{
+	char		prefix = TAG_KEPT_UNFROZEN;
+	List	   *names = NIL;
+
+	refs_init();
+	visit_prefix(&prefix, 1, note_unfrozen, &names);
+	foreach_ptr(char, n, names)
+		visit(n, arg);
+}
+
 /* (parent: the commit's first parent, NULL if it has none or isn't known) */
 static void
 keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
@@ -4644,6 +4927,8 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	ProllyNodeRef baseline;
 	ListCell   *a;
 	ListCell   *b;
+	bool		later;
+	ProllyRootSnapshot as_of;
 
 	if (prolly_kept_commits <= 0 || branch_ops()->keep == NULL ||
 		snap == NULL || RecoveryInProgress())
@@ -4742,14 +5027,27 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	 * again within the interval: under dolt.transaction_commit, every
 	 * transaction's commit would try it)
 	 */
-	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
-							kept_settled, snap, freeze_at_keep(&dc), snap))
+	kc = palloc0(sizeof(KeptCommit));
+	later = freeze_later_at_keep(&dc);
+	if (later && !kept_note_snapshot(kc, snap))
+	{
+		root_note(name, GetCurrentTimestamp());
+		return;
+	}
+	as_of.snapshot = snap;
+	as_of.nown = 0;
+	as_of.own = NULL;
+	if (later ?
+		!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
+							kept_seen, snap, NULL, NULL, true) :
+		!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
+							kept_settled, snap, freeze_at_keep(&dc), &as_of,
+							false))
 	{
 		root_note(name, GetCurrentTimestamp());
 		return;
 	}
 
-	kc = palloc0(sizeof(KeptCommit));
 	kc->kept_by = GetTopFullTransactionId();
 	kc->kept_at = GetCurrentTimestamp();
 	kc->commit = *commit_id;
@@ -5263,7 +5561,9 @@ nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
 			return NULL;
 		if (lowest >= 0 && info->has_height && info->height < lowest)
 			return NULL;
-		if ((kc = kept_anywhere(kept, &id, source)) != NULL)
+		/* (another branch's roots not frozen yet: never given back here) */
+		if ((kc = kept_anywhere(kept, &id, source)) != NULL &&
+			(!kc->unfrozen || *source == MyBranch))
 			return kc;
 		if (info->nparents == 0)
 			return NULL;
@@ -5299,7 +5599,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyNodeRef baseline;
 	ProllyHash	head;
 	ProllyCommitInfo at_head;
-	Oid			source;
+	Oid			source = MyBranch;
 
 	if (prolly_kept_commits <= 0 || branch_ops()->restore == NULL ||
 		RecoveryInProgress())
@@ -5311,7 +5611,8 @@ restore_pages(const ProllyCommitInfo *commit)
 	kept = kept_get(name);
 	if (!branch_baseline(name, &baseline))
 		return;
-	was = kept_anywhere(kept, &commit->id, &source);
+	was = kept_usable(name, &kept, kept_anywhere(kept, &commit->id, &source),
+					  source);
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
@@ -5323,8 +5624,10 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (was != NULL && source != MyBranch && restored == NIL)
 		was = NULL;
 	if (was == NULL &&
-		(was = nearest_kept(kept, commit, &at_head, &source)) != NULL &&
-			 !(branch_head(name, &head) && same_hash(&head, &at_head.id)))
+		(was = kept_usable(name, &kept,
+						   nearest_kept(kept, commit, &at_head, &source),
+						   source)) != NULL &&
+		!(branch_head(name, &head) && same_hash(&head, &at_head.id)))
 	{
 		int			before = list_length(restored);
 
@@ -5338,7 +5641,8 @@ restore_pages(const ProllyCommitInfo *commit)
 			branch_note_head_restore(MyBranch);
 	}
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
-		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
+		(was = kept_usable(name, &kept, kept_find(kept, &head),
+						   MyBranch)) != NULL && was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
 	{
 		int			before = list_length(restored);
@@ -13008,4 +13312,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.side_put = copies_side_put,
 	.side_scan = copies_side_scan,
 	.side_scan_at = copies_side_scan_at,
+	.unfrozen_branches = copies_unfrozen_branches,
+	.freeze_kept = copies_freeze_kept,
 };
