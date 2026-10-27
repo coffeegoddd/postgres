@@ -145,7 +145,7 @@ SELECT test_freeze_kept() AS frozen;
 SELECT held() > :h0 AS frozen_roots_counted;
 ALTER DATABASE root_retention SET prolly.history_root_max_size = '1';
 SELECT test_retain_roots('main');
--- (the newest, and c10's, the tag's)
+-- (the head's, c10's, the tag's, and one holding no pages the next doesn't)
 SELECT count(*) AS kept_under_cap FROM test_kept_commits('main');
 ALTER DATABASE root_retention RESET prolly.history_root_max_size;
 

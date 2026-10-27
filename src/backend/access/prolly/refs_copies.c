@@ -984,6 +984,10 @@ typedef struct HeadLeft
 static List *heads_left = NIL;
 static void heads_left_note(const char *name, const ProllyHash *was,
 							const ProllyHash *head);
+
+/* (the parents of a commit being made the head, as its maker gives them) */
+static const ProllyHash *made_parents = NULL;
+static int	made_nparents = -1;
 static void heads_left_date(void);
 
 static void
@@ -2437,6 +2441,28 @@ branch_set_head(const char *name, const ProllyHash *head)
 }
 
 /*
+ * branch_set_head() of a commit just made with these parents: whether the
+ * head moved forward is known without reading the commit.
+ */
+static void
+branch_set_head_made(const char *name, const ProllyHash *head,
+					 const ProllyHash *parents, int nparents)
+{
+	made_parents = parents;
+	made_nparents = nparents;
+	PG_TRY();
+	{
+		branch_set_head(name, head);
+	}
+	PG_FINALLY();
+	{
+		made_parents = NULL;
+		made_nparents = -1;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Did a transaction the active snapshot doesn't see move branch name's
  * head (or, with tag TAG_BASELINE_MOVER, its baseline)?  (A committer that
  * waited for the refs finds the head another moved, while its snapshot,
@@ -3836,7 +3862,10 @@ typedef struct KeptSummary
 #define KEPT_SUMMARY_FIELDS	9
 
 static bool commit_height(const ProllyHash *id, int64 *height);
-static int64 kept_count_new(const ProllyHash *commit, List *known);
+/* first parents a keep's count walks past the commits made since its last */
+#define KEPT_COUNT_SLACK	4
+static int64 kept_count_new(const ProllyHash *commit, List *known,
+							 int64 limit);
 static bool copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info,
 								 void *arg);
 
@@ -5779,7 +5808,15 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	kc->commit = *commit_id;
 	if (!commit_height(commit_id, &kc->height))
 		kc->height = 0;
-	kc->commits = kept_count_new(commit_id, newest);
+	/*
+	 * (counted from the previous keep, the commits made since: a keep after
+	 * a move back in history, below it, walks no further than a few)
+	 */
+	kc->commits = kept_count_new(commit_id, newest,
+								 (kc->height > 0 && s.last_height > 0 &&
+								  kc->height > s.last_height ?
+								  kc->height - s.last_height : 0) +
+								 KEPT_COUNT_SLACK);
 	kc->pages = (int64) pages;
 	if (branch_baseline(name, &baseline))
 		kc->baseline = baseline.hash;
@@ -6287,7 +6324,13 @@ heads_left_note(const char *name, const ProllyHash *was, const ProllyHash *head)
 
 	if (was->len == 0 || same_hash(was, head))
 		return;
-	if (copies_commit_get(head, &info))
+	if (made_nparents >= 0)
+	{
+		for (int i = 0; i < made_nparents; i++)
+			if (same_hash(&made_parents[i], was))
+				return;
+	}
+	else if (copies_commit_get(head, &info))
 		for (int i = 0; i < info.nparents; i++)
 			if (same_hash(&info.parents[i], was))
 				return;
@@ -6422,13 +6465,14 @@ count_known(const ProllyHash *commit, List *known, int64 *n)
  * nearest commit down its first parents with a count known (in known, a
  * list of live entries, or any branch's kept commit of it), or a root,
  * one more for each first parent between (a merge's other parents by
- * prolly_history_commits()'s walk).  For a commit being kept, the nearest
- * is the branch's previous keep, so the walk is the commits made since,
- * the root interval's; a branch moved to history kept nowhere walks it
- * once, and its keeps after count from that one.
+ * prolly_history_commits()'s walk), at most limit first parents down.  For
+ * a commit being kept, the nearest is the branch's previous keep, and the
+ * limit the commits made since (by height), so every keep's count is
+ * exact under any root interval; a keep after a move back in history
+ * walks a few, and records none if none is found.
  */
 static int64
-kept_count_new(const ProllyHash *commit, List *known)
+kept_count_new(const ProllyHash *commit, List *known, int64 limit)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "prolly kept count",
@@ -6440,7 +6484,7 @@ kept_count_new(const ProllyHash *commit, List *known)
 	int64		n = 0;
 	bool		found = false;
 
-	for (;;)
+	for (int64 walked = 0; walked <= limit; walked++)
 	{
 		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
 
@@ -10041,7 +10085,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, &identity, commit_id);
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, parents, nparents);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id, NULL, nparents > 0 ? &parents[0] : NULL);
 	note_anchor(name, commit_id, &anchor);
@@ -10877,7 +10921,7 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 		if (anchor_of(name, &head, &anchor))
 			note_anchor(name, commit_id, &anchor);
 	}
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, &head, 1);
 	carry_head_names(name, &head, commit_id);
 	{
 		ProllyNodeRef baseline;
@@ -10975,7 +11019,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
 				 message, &identity, commit_id);
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, parents, nparents);
 	branch_set_baseline(name, &next, &root);
 	/* (the working set committed, or a move's result over changes of its own) */
 	note_head_names(name, commit_id,
