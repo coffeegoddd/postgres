@@ -172,7 +172,8 @@ extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
 extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
 						   BlockNumber *nblocks);
 extern bool bmap_root_unchanged(SMgrRelation reln, BmapRootId id);
-extern void bmap_share_root(BmapRootId id, SMgrRelation dst);
+extern void bmap_share_root(BmapRootId id, SMgrRelation dst,
+							SMgrRelation replacing, SMgrRelation sharer);
 extern uint32 bmap_roots_reclaim(RelFileLocator store);
 
 /* inspection, for tests */

@@ -9249,8 +9249,9 @@ root_state(const xl_bmap_root *r)
 
 	if (r->snap.id == 0)
 		return ROOT_FREE;
+	/* (in recovery no transaction is judged: one let go of is taken as so) */
 	if (RecoveryInProgress())
-		return ROOT_HELD;
+		return r->released_by != 0 ? ROOT_FREE : ROOT_HELD;
 	state = owner_state(FullTransactionIdFromU64(r->snap.owner));
 	if (state == OWNER_ENDED)
 		return ROOT_ABANDONED;
@@ -9600,7 +9601,10 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 	for (int i = 0; i < n; i++)
 		ids[i] = 0;
 	for (int i = 0; i < n; i++)
+	{
 		ids[i] = root_capture_slot(rels[i], &own[i]);
+		INJECTION_POINT("bmap-root-slot-captured", NULL);
+	}
 	MarkBufferedPagesShared();
 	for (int i = 0; i < n; i++)
 	{
@@ -9804,25 +9808,85 @@ bmap_root_unchanged(SMgrRelation reln, BmapRootId id)
  * store: its root page gets the root's subtrees, each gaining a holder, and
  * its header the root's length, in one record, as bmap_share_snapshot()
  * makes one of a snapshot.  O(1) in the relation's size; the root's blocks
- * were made durable when it was captured.  The copy has never been folded,
- * and every entry of it may be shared with another map.  Only the main
- * fork.  The root's slot is read under its page's lock, which keeps a
- * releaser from naming it meanwhile.
+ * were made durable when it was captured.  The copy has never been folded.
+ * With 'replacing' (the storage dst takes the place of, dropped as the
+ * transaction commits: a restore), dst's entries may be shared with
+ * another map only where replacing's might.  Otherwise every entry of dst
+ * may be; and with 'sharer', a relation still holding the root's pages
+ * (the storage of another branch's table the root was kept of), so may
+ * those of sharer, which its header's shared_below then says (in the same
+ * record), so that its VACUUM leaves them.  Only the main fork.  The
+ * root's slot is read under its page's lock, which keeps a releaser from
+ * naming it meanwhile; a header held is locked first, as a capture locks
+ * it.
  */
 void
-bmap_share_root(BmapRootId id, SMgrRelation dst)
+bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
+				SMgrRelation sharer)
 {
 	RelFileLocator drel = dst->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
 	Buffer		buf;
+	Buffer		sheader = InvalidBuffer;
 	xl_bmap_root r;
 	xl_bmap_header_delta hdelta;
+	xl_bmap_header_delta shdelta;
+	uint32		shared_below = 0;
 
 	smgrusewhich(dst, SMGR_BMAP);
 	SET_LOCKTAG_OBJECT(sweeptag, drel.dbOid, BMAP_SWEEP_CLASSID, drel.spcOid, 0);
 	(void) LockAcquire(&sweeptag, ShareLock, false, false);
 	if (!bmap_root_held(drel, id, NULL) ||
-		!root_read(drel, id, BUFFER_LOCK_SHARE, &buf, &r))
+		!root_read(drel, id, -1, &buf, &r))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("page store of database %u holds no captured root %llu",
+						drel.dbOid, (unsigned long long) id)));
+
+	/* the header of the storage replaced, or of the one captured of */
+	if (replacing != NULL)
+	{
+		RelFileLocator srel = replacing->smgr_rlocator.locator;
+		Buffer		h = map_read(srel, 0);
+
+		LockBuffer(h, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(h), BMAP_PAGE_HEADER, srel, BMAP_FORKNUM, 0);
+		shared_below = PageGetBmapHeader(BufferGetPage(h))->shared_below;
+		UnlockReleaseBuffer(h);
+	}
+	else if (sharer != NULL)
+	{
+		RelFileLocator srel = sharer->smgr_rlocator.locator;
+
+		sheader = map_read(srel, 0);
+		LockBuffer(sheader, BUFFER_LOCK_EXCLUSIVE);
+		if (PageIsNew(BufferGetPage(sheader)))
+		{
+			UnlockReleaseBuffer(sheader);
+			sheader = InvalidBuffer;
+		}
+		else
+		{
+			BmapHeader *sh = PageGetBmapHeader(BufferGetPage(sheader));
+
+			check_page(BufferGetPage(sheader), BMAP_PAGE_HEADER, srel,
+					   BMAP_FORKNUM, 0);
+			shdelta.kind = BMAP_DELTA_HEADER;
+			shdelta.flags = BMAP_DELTA_SHARED_BELOW;
+			shdelta.nblocks = sh->nblocks;
+			shdelta.epoch = sh->epoch;
+			shdelta.fold_epoch = sh->fold_epoch;
+			shdelta.shared_below = Max(sh->shared_below, r.snap.epoch);
+			if (shdelta.shared_below == sh->shared_below)
+			{
+				UnlockReleaseBuffer(sheader);
+				sheader = InvalidBuffer;
+			}
+		}
+	}
+
+	/* (held still: a releaser names it under the slot's page lock) */
+	if (!root_read(drel, id, BUFFER_LOCK_SHARE, &buf, &r))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("page store of database %u holds no captured root %llu",
@@ -9833,13 +9897,17 @@ bmap_share_root(BmapRootId id, SMgrRelation dst)
 	hdelta.nblocks = r.snap.nblocks;
 	hdelta.epoch = r.snap.epoch;
 	hdelta.fold_epoch = 0;
-	hdelta.shared_below = hdelta.epoch;
-	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, InvalidBuffer,
-					NULL);
+	hdelta.shared_below = replacing != NULL ?
+		Min(shared_below, hdelta.epoch) : hdelta.epoch;
+	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, sheader,
+					&shdelta);
 	UnlockReleaseBuffer(buf);
+	if (BufferIsValid(sheader))
+		UnlockReleaseBuffer(sheader);
 	LockRelease(&sweeptag, ShareLock, false);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_SHARED, 1);
+	INJECTION_POINT("bmap-root-shared", NULL);
 }
 
 /*
@@ -9900,6 +9968,58 @@ sweep_roots(RelFileLocator rel, TreeNodeVisit visit_node,
 			}
 		}
 	}
+}
+
+/*
+ * The subtrees of the roots captured of rel (its file number) that its
+ * store still counts (not free), BMAP_TREE_TOPS for each, into *tops:
+ * how many roots.  As a relation's own snapshots, they share its pages
+ * with no other map.  Under rel's header, which a capture locks first.
+ */
+static int
+own_root_tops(RelFileLocator rel, BmapEntry **tops)
+{
+	BmapRootsMeta meta;
+	Buffer		metabuf;
+	int			n = 0;
+	int			cap = 0;
+
+	*tops = NULL;
+	if (!roots_exist(rel))
+		return 0;
+	metabuf = roots_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(metabuf)))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return 0;
+	}
+	meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	UnlockReleaseBuffer(metabuf);
+	for (uint32 p = 0; p < meta.npages; p++)
+	{
+		Buffer		buf = roots_read(rel, 1 + p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+		{
+			const xl_bmap_root *r = &PageGetBmapRoots(BufferGetPage(buf))[i];
+
+			if (r->relnumber != rel.relNumber || root_state(r) == ROOT_FREE)
+				continue;
+			if (n == cap)
+			{
+				cap = Max(cap * 2, 8);
+				*tops = *tops ? repalloc_array(*tops, BmapEntry, cap * BMAP_TREE_TOPS) :
+					palloc_array(BmapEntry, cap * BMAP_TREE_TOPS);
+			}
+			memcpy(*tops + n * BMAP_TREE_TOPS, snapshot_tops(&r->snap),
+				   sizeof(BmapEntry) * BMAP_TREE_TOPS);
+			n++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	return n;
 }
 
 /*
@@ -10103,6 +10223,8 @@ typedef struct OwnHolders
 	uint32		below;			/* how far shared_below goes down */
 	uint32		shared_below;	/* as it was */
 	uint64		entries;		/* the tree's entries walked */
+	BmapEntry  *root_tops;		/* the roots captured of it, as its own */
+	int			nroots;
 } OwnHolders;
 
 static OwnHolder *
@@ -10247,6 +10369,20 @@ shared_walk(SMgrRelation reln, OwnHolders *oh)
 
 		if (root.snap[s].id == 0)
 			continue;
+		first = 0;
+		for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		{
+			memset(oh->elsewhere, 0, sizeof(oh->elsewhere));
+			if (BlockNumberIsValid(tops[k].block))
+				tree_walk_node(reln, &tops[k], k, (BlockNumber) first, true,
+							   shared_node, shared_entry, oh);
+			first += tree_span(k);
+		}
+	}
+	for (int i = 0; i < oh->nroots; i++)
+	{
+		const BmapEntry *tops = oh->root_tops + i * BMAP_TREE_TOPS;
+
 		first = 0;
 		for (int k = 0; k < BMAP_TREE_TOPS; k++)
 		{
@@ -10638,7 +10774,30 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	oh.hw = hw;
 	oh.shared_below = header->shared_below;
 	tree_walk(reln, own_node, own_entry, &oh);
+	{
+		/* (and the roots captured of it, as its own snapshots) */
+		BmapEntry  *tops;
+		int			nroots = own_root_tops(rel, &tops);
+
+		for (int i = 0; i < nroots; i++)
+		{
+			uint64		first = 0;
+
+			for (int k = 0; k < BMAP_TREE_TOPS; k++)
+			{
+				if (BlockNumberIsValid(tops[i * BMAP_TREE_TOPS + k].block))
+					tree_walk_node(reln, &tops[i * BMAP_TREE_TOPS + k], k,
+								   (BlockNumber) first, true, own_node,
+								   own_entry, &oh);
+				first += tree_span(k);
+			}
+		}
+		oh.root_tops = tops;
+		oh.nroots = nroots;
+	}
 	shared_walk(reln, &oh);
+	if (oh.root_tops)
+		pfree(oh.root_tops);
 	hash_destroy(oh.own);
 
 	/* (a tree of no entries, as a dropped map's is: nothing to change) */

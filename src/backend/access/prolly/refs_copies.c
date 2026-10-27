@@ -3654,8 +3654,9 @@ static bool commit_height(const ProllyHash *id, int64 *height);
  * dolt.transaction_commit, whose every transaction is a commit.  A move to
  * a commit that wasn't kept restores the nearest kept commit before it
  * and writes the rows the two differ by, at most an interval's.  Each
- * backend remembers the time its branch was last found kept, so a commit
- * within the interval asks nothing of the refs.
+ * backend remembers the time its branch was last found kept, or a keep of
+ * it last failed, so a commit within the interval asks nothing of the refs
+ * and tries no keep.
  */
 static char last_root_branch[NAMEDATALEN];
 static Oid	last_root_db = InvalidOid;
@@ -4434,9 +4435,17 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 					release[nrelease++] = o->tables[t].rels[r];
 	}
 	out = palloc0_array(BranchKeptRelation, Max(list_length(relids), 1));
+	/*
+	 * (a keep that can't be had now, a writer's lock held, isn't tried
+	 * again within the interval: under dolt.transaction_commit, every
+	 * transaction's commit would try it)
+	 */
 	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
 							kept_settled, snap))
+	{
+		root_note(name, GetCurrentTimestamp());
 		return;
+	}
 
 	kc = palloc0(sizeof(KeptCommit));
 	kc->kept_by = GetTopFullTransactionId();

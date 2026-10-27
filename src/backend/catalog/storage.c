@@ -357,12 +357,17 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
  * claims no page all-visible and knows of no free space until vacuumed,
  * unless maps_from: then they are copies of that relation's (the caller
  * knows its pages are the root's still, and VACUUM kept from setting a bit
- * meanwhile).  The storage is deleted if the transaction aborts when
- * register_delete.
+ * meanwhile).  With replacing, the storage made takes that storage's place
+ * (dropped as the transaction commits: a restore), and shares the pages
+ * with no other relation for that; with sharer, a relation that still
+ * holds the root's pages is told it shares them (bmap_share_root()).  The
+ * storage is deleted if the
+ * transaction aborts when register_delete.
  */
 SMgrRelation
 RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
-							  SMgrRelation maps_from, bool register_delete)
+							  SMgrRelation maps_from, SMgrRelation replacing,
+							  SMgrRelation sharer, bool register_delete)
 {
 	SMgrRelation srel;
 
@@ -384,7 +389,7 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 	}
 
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
-	bmap_share_root(root, srel);
+	bmap_share_root(root, srel, replacing, sharer);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 	if (maps_from)
 	{

@@ -558,11 +558,11 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	if (bmap_root_unchanged(src, k->snapshot))
 	{
 		(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
-											 k->snapshot, src, true);
+											 k->snapshot, src, NULL, src, true);
 		return relnumber;
 	}
 	(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
-										 k->snapshot, NULL, true);
+										 k->snapshot, NULL, NULL, src, true);
 	if (TransactionIdIsNormal(k->frozenxid))
 		c->relfrozenxid = k->frozenxid;
 	if (MultiXactIdIsValid(k->minmxid))
@@ -2026,7 +2026,10 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
 										oc->relpersistence);
 		(void) RelationCreateStorageFromRoot(class_locator(oc, relnumber),
-											 k->snapshot, NULL, true);
+											 k->snapshot, NULL,
+											 smgropen(class_locator(oc, oc->relfilenode),
+													  INVALID_PROC_NUMBER),
+											 NULL, true);
 
 		/* (the root keeps the pages still: the new storage is of it) */
 		renewed[i].relfilenumber = relnumber;
@@ -2068,6 +2071,7 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	bool		other = source != MyBranch;
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
+	RelFileLocator *sources = palloc0_array(RelFileLocator, Max(nkept, 1));
 	bool		ok = true;
 
 	for (int j = 0; j < ncarry; j++)
@@ -2103,6 +2107,9 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		HeapTuple	t = other ? class_row(pg_class, kept[i].relid, source) : NULL;
 
 		rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
+		if (t != NULL)
+			sources[i] = class_locator((Form_pg_class) GETSTRUCT(t),
+									   ((Form_pg_class) GETSTRUCT(t))->relfilenode);
 		if (rows[i] == NULL || (other && t == NULL))
 			ok = false;
 		else if (!other)
@@ -2155,7 +2162,9 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
 										oc->relpersistence);
 		(void) RelationCreateStorageFromRoot(class_locator(oc, relnumber),
-											 k->snapshot, NULL, true);
+											 k->snapshot, NULL, NULL,
+											 other ? smgropen(sources[i], INVALID_PROC_NUMBER) : NULL,
+											 true);
 
 		/*
 		 * (the session's own kept roots carried, as restore() carries

@@ -85,18 +85,18 @@ is(counted('apply_rows'), $applied, 'and wrote no row');
 is(rows($node), $head, 'the head\'s rows');
 standby_agrees('a reset');
 
-# a crash part way through a reset, as it takes the new storage's
-# snapshot: the working set is as it was
+# a crash part way through a reset, as it gives a table storage made of
+# a root: the working set is as it was
 sql(q{UPDATE kr.t SET v = -1 WHERE id <= 500});
 my $dirty = rows($node);
 sql('CHECKPOINT');
 my $w = $node->background_psql('postgres');
 $w->query_safe(q{SELECT injection_points_set_local()});
-$w->query_safe(q{SELECT injection_points_attach('bmap-snapshot-taken', 'wait')});
+$w->query_safe(q{SELECT injection_points_attach('bmap-root-shared', 'wait')});
 $w->query_until(qr/resetting/, q{\echo resetting
 SELECT dolt_reset('--hard');
 });
-$node->wait_for_event('client backend', 'bmap-snapshot-taken');
+$node->wait_for_event('client backend', 'bmap-root-shared');
 sql('CREATE TABLE IF NOT EXISTS flush_wal (); DROP TABLE flush_wal');
 $node->stop('immediate');
 $w->{run}->finish;
