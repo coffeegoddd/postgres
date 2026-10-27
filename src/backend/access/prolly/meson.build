@@ -54,6 +54,7 @@ backend_sources += files(
   'prolly_table.c',
   'prolly_dolt.c',
   'prolly_snapshot.c',
+  'prolly_log_scan.c',
   'prolly_revision.c',
   'prolly_vcs.c',
   'prolly_autovacuum.c',
