@@ -3790,7 +3790,31 @@ typedef struct SettleAbsent
 {
 	List	   *records;		/* FragmentRecord *: the horizon's */
 	FragmentRecord *repairing;
+	List	   *edges;			/* StringInfo: its edges' keys */
 } SettleAbsent;
+
+/* The boundary commits naming a fragment's top (its edges' parent). */
+static int
+settle_named_by(void *arg, const ProllyHash *root, ProllyHash **by)
+{
+	SettleAbsent *sa = arg;
+	int			n = 0;
+
+	*by = palloc_array(ProllyHash, Max(list_length(sa->edges), 1));
+	foreach_ptr(StringInfoData, ek, sa->edges)
+	{
+		ProllyHash	parent;
+		ProllyHash	boundary;
+		const char *p = ek->data + 1;
+		const char *end = ek->data + ek->len;
+
+		p = get_id(p, end, &parent);
+		(void) get_id(p, end, &boundary);
+		if (same_hash(&parent, root))
+			(*by)[n++] = boundary;
+	}
+	return n;
+}
 
 /*
  * A chunk a fragment being repaired names, not here: if it is another
@@ -3941,11 +3965,17 @@ archive_repair(const char *source, int nfragments)
 		 */
 		if (PROLLY_HAS(tree_env.chunk_store, settle))
 		{
-			SettleAbsent sa = {records, r};
+			EdgesOf		se = {r->f.number, NIL};
+			char		se_key = KEY_EDGE;
+			ProllyKey	se_from = {(const uint8 *) &se_key, 1};
+			SettleAbsent sa = {records, r, NIL};
 
+			PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &se_from,
+						ForwardScanDirection, collect_edge_of, &se);
+			sa.edges = se.keys;
 			PROLLY_CALL(tree_env.chunk_store, settle, tree_env.chunks,
 						r->f.tops, r->top_epochs, r->f.ntops,
-						settle_absent, &sa);
+						settle_absent, settle_named_by, &sa);
 		}
 
 		/*

@@ -595,6 +595,12 @@ mark_listed(const ProllyHash *target, const ProllyHash *source, uint32 epoch,
 					return;
 		}
 	}
+	/* (epoch 0: any copy, as a reference marks) */
+	if (epoch == 0)
+	{
+		mark_ref(target, mk);
+		return;
+	}
 	slot = PROLLY_CALL(mk->cs, gc_find_in, mk->gc, target, epoch);
 	if (slot >= 0)
 		mark_slot(mk, (uint64) slot);
@@ -697,6 +703,15 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 							&mk.nslots);
 	if (mk.gc == NULL)
 		return false;			/* (another collection running) */
+
+	/*
+	 * A retire relies on the settled files' generations to mark only what
+	 * it collects: checked first where checking is on, refused if they're
+	 * wrong, so it never frees by a list that is.
+	 */
+	if (retire && debug_prolly_verify_generations &&
+		PROLLY_HAS(cs, verify_generations))
+		(void) PROLLY_CALL(cs, verify_generations, store);
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
 	mk.cap = Max((uint64) maintenance_work_mem * 1024 / sizeof(uint64), 1024);

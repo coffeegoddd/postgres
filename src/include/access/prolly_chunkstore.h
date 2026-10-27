@@ -259,6 +259,14 @@ typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
 									  uint32 proposed);
 
 /*
+ * settle()'s question of a root: the commits that name it from outside
+ * what is settled (a fragment's boundary commits), as many as returned,
+ * in *by (palloc'd).
+ */
+typedef int (*ProllySettleNamedBy) (void *arg, const ProllyHash *root,
+									ProllyHash **by);
+
+/*
  * Visits a table file or segment: its name, its chunk count, its size in
  * bytes, and whether it is settled (a table file closed under what its
  * chunks name).
@@ -499,14 +507,20 @@ typedef struct ProllyChunkStoreRoutine
 	 * Each root goes to generation epochs[i] (0: the one the settled
 	 * files list it by); absent() is asked the generation of a chunk the
 	 * chunks settled name that isn't here (a severed fragment's top), to
-	 * list it by, proposing one (0: it isn't one).
+	 * list it by, proposing one (0: it isn't one).  named_by() gives the
+	 * chunks that name a root from outside: a root goes back to the
+	 * generation the settled file of one lists it by, and one in a file
+	 * older than its root's generation, or listing it by another, is an
+	 * error (nothing settled): what names a chunk must be as new as it is,
+	 * and list it right, or a retire could free it.
 	 *
 	 * epoch_of(), optional: the first generation of the settled file that
 	 * holds a chunk, the oldest if several do (0: none does).
 	 */
 	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
 						   const uint32 *epochs, int nroots,
-						   ProllySettleAbsent absent, void *arg);
+						   ProllySettleAbsent absent,
+						   ProllySettleNamedBy named_by, void *arg);
 
 	/*
 	 * Optional: check the settled files' generations, an error if one is
@@ -589,6 +603,7 @@ extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 #define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS false
 #endif
 extern PGDLLIMPORT bool debug_prolly_verify_generations;
+extern PGDLLIMPORT int debug_prolly_settle_epoch;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);

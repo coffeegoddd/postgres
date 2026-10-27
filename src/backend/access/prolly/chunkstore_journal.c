@@ -357,6 +357,11 @@ typedef struct CopyFrom
 
 /* a table file's flags in the manifest */
 #define MANIFEST_FILE_SETTLED	0x01	/* closed under what its chunks name */
+#define MANIFEST_FILE_REPAIRED	0x02	/* settled, of history a repair put back
+										 * in older generations (or of such a
+										 * file rewritten): its chunks may name
+										 * newer ones *after all*, and a retire
+										 * reads them all, not its section */
 
 /* the manifest: the table files, the journal's segments, and the ids given */
 typedef struct ManifestFile
@@ -3408,6 +3413,8 @@ read_manifest_at(const char *path, Manifest *m)
 		m->files[i].epoch_hi = (uint32) read_le(p + 25, 4);
 		m->files[i].garbage = (uint32) read_le(p + 29, 4);
 		if (m->files[i].epoch_lo > m->files[i].epoch_hi ||
+			((m->files[i].flags & MANIFEST_FILE_REPAIRED) != 0 &&
+			 (m->files[i].flags & MANIFEST_FILE_SETTLED) == 0) ||
 			((m->files[i].flags & MANIFEST_FILE_SETTLED) != 0) !=
 			(m->files[i].epoch_lo > 0))
 			goto corrupt;
@@ -7087,7 +7094,7 @@ settle_root_cmp(const void *a, const void *b)
 static void
 journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 			   const uint32 *epochs, int nroots, ProllySettleAbsent absent,
-			   void *arg)
+			   ProllySettleNamedBy named_by, void *arg)
 {
 	Manifest	m;
 	bool	   *keep;
@@ -7143,6 +7150,51 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 		if (!found)
 			r->epoch = 0;
 		r->given = epochs ? epochs[i] : 0;
+		/* (for testing: as a repair that settled it wrong would) */
+		if (debug_prolly_settle_epoch > 0)
+			r->given = (uint32) debug_prolly_settle_epoch;
+	}
+	if (debug_prolly_settle_epoch > 0)
+		ss.absent = NULL;
+
+	/*
+	 * What names a root from outside lists it by the generation it goes
+	 * back to: taken from there; checked against it below.
+	 */
+	if (named_by != NULL && debug_prolly_settle_epoch == 0)
+	{
+		HASH_SEQ_STATUS status;
+		SettleRoot *r;
+
+		hash_seq_init(&status, listed);
+		while ((r = hash_seq_search(&status)) != NULL)
+		{
+			ProllyHash *by = NULL;
+			int			nby = named_by(arg, &r->hash, &by);
+
+			for (int b = 0; b < nby; b++)
+			{
+				int			f = settled_file(s, &m, &by[b]);
+				TableFile  *t = NULL;
+				HTAB	   *cache = NULL;
+				bool		always = false;
+				uint32		e;
+
+				if (f < 0)
+					continue;
+				foreach(lc, s->tables)
+					if (((TableFile *) lfirst(lc))->id == m.files[f].id)
+						t = lfirst(lc);
+				e = listed_epoch(t, &cache, CurrentMemoryContext, &r->hash,
+								 &always);
+				if (cache)
+					hash_destroy(cache);
+				if (e > 0)
+					r->given = e;
+			}
+			if (by)
+				pfree(by);
+		}
 	}
 	foreach(lc, s->tables)
 	{
@@ -7192,6 +7244,8 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 		int			tail = 0;
 		List	   *group = NIL;
 
+		int			first = g;
+
 		for (; g < nordered && order[g].epoch == epoch; g++)
 			queue[tail++] = order[g].hash;
 
@@ -7204,6 +7258,48 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 				epoch_lo = m.files[i].epoch_lo;
 				epoch_hi = m.files[i].epoch_hi;
 			}
+		}
+
+		/*
+		 * Each chunk naming a root from outside, if settled, as new as the
+		 * root goes back to, and listing it by that generation if newer;
+		 * else nothing is settled: a retire relies on it.
+		 */
+		for (int i = first; i < g && named_by != NULL && epoch > 0; i++)
+		{
+			ProllyHash *by = NULL;
+			int			nby = named_by(arg, &order[i].hash, &by);
+
+			for (int b = 0; b < nby; b++)
+			{
+				int			f = settled_file(s, &m, &by[b]);
+				TableFile  *t = NULL;
+				HTAB	   *cache = NULL;
+				bool		always = false;
+				uint32		e;
+
+				if (f < 0)
+					continue;
+				foreach(lc, s->tables)
+					if (((TableFile *) lfirst(lc))->id == m.files[f].id)
+						t = lfirst(lc);
+				e = listed_epoch(t, &cache, CurrentMemoryContext,
+								 &order[i].hash, &always);
+				if (cache)
+					hash_destroy(cache);
+				if (m.files[f].epoch_hi < epoch_lo ||
+					(m.files[f].epoch_lo > epoch_hi &&
+					 (e < epoch_lo || e > epoch_hi)))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("chunk %s would be settled in generations %u to %u, which chunk %s naming it, of generations %u to %u, doesn't list it by",
+									prolly_hash_hex(&order[i].hash), epoch_lo,
+									epoch_hi, prolly_hash_hex(&by[b]),
+									m.files[f].epoch_lo, m.files[f].epoch_hi),
+							 errdetail("Nothing was settled.")));
+			}
+			if (by)
+				pfree(by);
 		}
 		while (head < tail)
 		{
@@ -7226,7 +7322,8 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 
 				if (f < 0)
 					continue;
-				if (epoch == 0 || m.files[f].epoch_lo <= epoch_hi)
+				if (epoch == 0 || m.files[f].epoch_lo <= epoch_hi ||
+					debug_prolly_settle_epoch > 0)
 				{
 					if (newest < 0 ||
 						m.files[f].epoch_lo > m.files[newest].epoch_lo)
@@ -7297,7 +7394,9 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 			keep[i] = true;
 		if (group != NIL)
 		{
-			write_table_file(s, &m, keep, MANIFEST_FILE_SETTLED, epoch_lo,
+			write_table_file(s, &m, keep,
+							 MANIFEST_FILE_SETTLED | MANIFEST_FILE_REPAIRED,
+							 epoch_lo,
 							 epoch_hi, settle_next, &ss, false, NULL, false, 0,
 							 &xb);
 			/* (the manifest written names the file: the next adds to it) */
@@ -8131,6 +8230,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	char	   *dir;
 	ListCell   *lc;
 	uint8		flags = MANIFEST_FILE_SETTLED;
+	uint8		repaired = 0;
 	uint32		epoch_lo = PG_UINT32_MAX;
 	uint32		epoch_hi = 0;
 	XrefBuild	xb = {0};
@@ -8149,12 +8249,15 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 		if (keep[i])
 			continue;
 		flags &= m.files[i].flags;
+		repaired |= m.files[i].flags & MANIFEST_FILE_REPAIRED;
 		epoch_lo = Min(epoch_lo, m.files[i].epoch_lo);
 		epoch_hi = Max(epoch_hi, m.files[i].epoch_hi);
 	}
 	/* (settled: the generations of those it conjoins, which are settled) */
 	if ((flags & MANIFEST_FILE_SETTLED) == 0)
 		epoch_lo = epoch_hi = 0;
+	else
+		flags |= repaired;
 
 	/* the files as the lock's manifest names them, opened for this */
 	dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -8315,6 +8418,7 @@ journal_epochs(ProllyChunkStore *s, ProllyChunkEpochVisit visit, void *arg)
  */
 
 bool		debug_prolly_verify_generations = DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS;
+int			debug_prolly_settle_epoch = 0;
 
 /* a settled file, as checked */
 typedef struct CheckedFile
@@ -8795,6 +8899,7 @@ typedef struct GcFile
 	uint32		epoch_hi;		/* written in (0: not settled) */
 	int			group;			/* in gc->groups: the files written so */
 	HTAB	   *listed;			/* what its section lists (listed_epoch()) */
+	bool		repaired;		/* MANIFEST_FILE_REPAIRED */
 } GcFile;
 
 /*
@@ -8808,6 +8913,7 @@ typedef struct GcGroup
 	uint32		epoch_hi;
 	uint64	   *order;			/* its slots, file by file in offset order */
 	uint64		n;
+	bool		repaired;		/* a file of it is (so are those written) */
 } GcGroup;
 
 /* a sealed segment's chunk: its slot */
@@ -8858,6 +8964,7 @@ struct ProllyChunkGc
 	TableFile **others;
 	uint32	   *others_lo;		/* (their generations) */
 	uint32	   *others_hi;
+	List	   *others_repaired;	/* (of others: those repaired) */
 	uint32		retire_lo;		/* a retire's generations (0: none) */
 	uint32		retire_hi;
 	List	   *written;		/* ManifestFile *, the new files */
@@ -9361,6 +9468,9 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 				gc->others_hi = palloc(sizeof(uint32) * gc->m.nfiles);
 			}
 			gc->others[gc->nothers] = t;
+			if (gc->m.files[i].flags & MANIFEST_FILE_REPAIRED)
+				gc->others_repaired = lappend_int(gc->others_repaired,
+												  gc->nothers);
 			gc->others_hi[gc->nothers] = gc->m.files[i].epoch_hi;
 			gc->others_lo[gc->nothers++] = gc->m.files[i].epoch_lo;
 			continue;
@@ -9371,6 +9481,7 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 		f->id = gc->m.files[i].id;
 		f->first = slot;
 		f->settled = settled;
+		f->repaired = (gc->m.files[i].flags & MANIFEST_FILE_REPAIRED) != 0;
 		/* (a settled file's chunks keep their generations) */
 		if (settled)
 		{
@@ -9453,6 +9564,24 @@ static void journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out);
  * generations it does, as their sections list it (only a newer file's
  * can).
  */
+/* gc_inbound()'s visit of what a repaired file's chunks name */
+typedef struct RepairedNames
+{
+	ProllyChunkListedVisit visit;
+	void	   *arg;
+	ProllyHash	source;			/* the chunk naming them */
+} RepairedNames;
+
+static void
+repaired_name(const ProllyHash *ref, void *arg)
+{
+	RepairedNames *rn = arg;
+
+	/* (with the chunk naming it, so the horizon's cuts still cut) */
+	if (ref->len > 0)
+		rn->visit(ref, &rn->source, 0, rn->arg);
+}
+
 static void
 journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 {
@@ -9467,6 +9596,46 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 			continue;
 		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
 		xrefs_free(&x);
+	}
+
+	/*
+	 * A repaired file's chunks, every one: what a repair puts back in
+	 * older generations is listed as it names newer ones, but a retire
+	 * that freed a chunk one still names, were that ever missed, would
+	 * lose history; so what they name is a root (epoch 0: any copy).
+	 */
+	foreach_int(i, gc->others_repaired)
+	{
+		TableFile  *t = gc->others[i];
+		const ProllyTableFileRoutine *fmt = table_format();
+		StringInfoData bytes;
+		StringInfoData chunk;
+		RepairedNames rn = {visit, arg, {0}};
+
+		initStringInfo(&bytes);
+		initStringInfo(&chunk);
+		for (int e = 0; e < PROLLY_CALL(fmt, count, t->tf); e++)
+		{
+			ProllyHash	h;
+			uint64		offset;
+			uint32		len;
+
+			CHECK_FOR_INTERRUPTS();
+			PROLLY_CALL(fmt, entry, t->tf, e, &h, &offset, &len);
+			resetStringInfo(&bytes);
+			enlargeStringInfo(&bytes, len);
+			if (!table_file_read(t, offset, bytes.data, len))
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
+								len, (unsigned long long) offset, t->path)));
+			resetStringInfo(&chunk);
+			PROLLY_CALL(fmt, decode, t->tf, bytes.data, len, &chunk);
+			rn.source = h;
+			prolly_chunk_references(chunk.data, chunk.len, repaired_name, &rn);
+		}
+		pfree(bytes.data);
+		pfree(chunk.data);
 	}
 }
 
@@ -10303,6 +10472,8 @@ gc_groups(ProllyChunkGc *gc)
 		}
 		f->group = g;
 	}
+	for (int i = 0; i < gc->nfiles; i++)
+		gc->groups[gc->files[i].group].repaired |= gc->files[i].repaired;
 	counts = palloc0(sizeof(uint64) * Max(gc->ngroups, 1));
 	for (int i = 0; i < gc->nfiles; i++)
 		counts[gc->files[i].group] += gc->files[i].count;
@@ -10376,6 +10547,8 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 				f->nchunks = nchunks;
 				f->size = size;
 				f->flags = xb.lo > 0 ? MANIFEST_FILE_SETTLED : 0;
+				if (xb.lo > 0 && gc->groups[g].repaired)
+					f->flags |= MANIFEST_FILE_REPAIRED;
 				f->epoch_lo = xb.lo;
 				f->epoch_hi = xb.hi;
 				f->garbage = 0;
