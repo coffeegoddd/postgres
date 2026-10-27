@@ -2723,8 +2723,9 @@ static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 
 /*
  * The move under way's waits for holders of its relations' locks (branch
- * operations' share() and share_kept()): one set of bounds covers the
- * waits of every table it shares.  (A restore queues for its locks.)
+ * operations' share(), share_kept() and restore(), for a lock not held
+ * already): one set of bounds covers the waits of every table it restores
+ * or shares.
  */
 static BranchLockWait move_wait;
 
@@ -3981,9 +3982,12 @@ static bool kept_storage_unneeded(const KeptCommit *kc);
  * subtransactions', whose ids follow its own).  So no transaction's status
  * is asked, which, long ago, may be gone.  One this transaction both
  * kept and retired (an earlier commit of the transaction's own) no other
- * ever saw, so it is let go of at once: otherwise a transaction making
- * many commits would fill its relations' snapshot slots with them, and
- * its last commit, the head a reset gives back, couldn't be kept.
+ * ever saw, so it is let go of at once, outside any subtransaction:
+ * otherwise a transaction making many commits would fill its relations'
+ * snapshot slots with them, and its last commit, the head a reset gives
+ * back, couldn't be kept.  (Inside one, the retiring may yet roll back,
+ * bringing the commit back as kept, while a snapshot let go of stays so:
+ * it waits for a keep at the top level, or the transaction's end.)
  * Storage a restore replaced (kept_is_storage()) is let go of only once
  * no snapshot is older than the move too (kept_storage_unneeded()).
  */
@@ -3996,7 +4000,8 @@ kept_releasable(const KeptCommit *kc)
 		(!FullTransactionIdIsValid(top) ||
 		 FullTransactionIdPrecedes(kc->retired, top) ||
 		 (FullTransactionIdEquals(kc->retired, top) &&
-		  FullTransactionIdEquals(kc->kept_by, top))) &&
+		  FullTransactionIdEquals(kc->kept_by, top) &&
+		  GetCurrentTransactionNestLevel() == 1)) &&
 		(!kept_is_storage(kc) || kept_storage_unneeded(kc));
 }
 
@@ -4606,16 +4611,28 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		replaced = palloc_array(BranchKeptRelation, kt->nrels);
 		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
 		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
-		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
-								   carried, replaced))
+		/*
+		 * (an entry for each relation's replaced storage reserved first:
+		 * with none free, nothing is replaced, and the rows are written,
+		 * so no snapshot older than the move reads storage it can't tell)
+		 */
+		if (!branch_replaced_reserve(kt->nrels))
 			continue;
+		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
+								   carried, replaced, &move_wait))
+		{
+			branch_replaced_release_unused();
+			continue;
+		}
 		for (int j = 0; j < ncarry; j++)
 			*into[j] = carried[j];
 		for (int r = 0; r < kt->nrels; r++)
 			any |= renewed[r].relfilenumber != kt->rels[r].relfilenumber;
+		if (any)
+			storage = lappend(storage, replaced_entry(kc, kt, renewed, replaced));
+		branch_replaced_release_unused();
 		if (!any)
 			continue;
-		storage = lappend(storage, replaced_entry(kc, kt, renewed, replaced));
 		memcpy(kt->rels, renewed, sizeof(BranchKeptRelation) * kt->nrels);
 		now = lappend(now, kt->name);
 	}
@@ -8886,6 +8903,48 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
  * Make the commit ref names the session branch's head, and move the branch
  * there: its rows written as the commit has them.
  */
+/*
+ * Before a hard reset holds the refs (which every other branch's
+ * operation waits for): the tables a restore would give the pages kept as
+ * of the commit ref names, or of the head, locked as TRUNCATE locks them,
+ * queued for (branch operations' lock_for_restore()).  A transaction that
+ * read one and is still open (on main, which sessions don't lock, any)
+ * then holds up the reset alone, and the restore finds the locks held.
+ * Read as the refs are now: whatever changes before they are held is
+ * tried for, as without this.  Not once the refs are held already.
+ */
+static void
+lock_for_restore(const char *ref)
+{
+	char	   *name;
+	List	   *kept;
+	ProllyHash	head;
+	ProllyHash	target;
+	bool		have_head;
+	bool		have_target;
+
+	if (whole || prolly_kept_commits <= 0 ||
+		branch_ops()->lock_for_restore == NULL || RecoveryInProgress())
+		return;
+	name = branch_ops()->current();
+	have_head = branch_head(name, &head);
+	have_target = copies_resolve(ref, &target);
+	kept = kept_get(name);
+	foreach_ptr(KeptCommit, kc, kept)
+	{
+		if (FullTransactionIdIsValid(kc->retired) ||
+			!((have_head && same_hash(&kc->commit, &head)) ||
+			  (have_target && same_hash(&kc->commit, &target))))
+			continue;
+		for (int t = 0; t < kc->ntables; t++)
+			branch_ops()->lock_for_restore(kc->tables[t].rels,
+										   kc->tables[t].nrels);
+	}
+	/* (read again once the refs are held) */
+	kept_read_name = NULL;
+	AcceptInvalidationMessages();
+}
+
 static void
 copies_reset(const char *ref)
 {
@@ -8893,6 +8952,7 @@ copies_reset(const char *ref)
 	ProllyCommitInfo info;
 	bool		pushed;
 
+	lock_for_restore(ref);
 	lock_refs();
 	if (!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
 		ereport(ERROR,

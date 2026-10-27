@@ -1327,23 +1327,28 @@ dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
 couldn't write its rows, or the session itself is using one of its
 relations (a scan of it open, an AFTER trigger's event queued): its rows
-are written.  A restore's locks are queued for, as TRUNCATE queues for
-them: giving up would leave the move every row the working set changed
-to write back, however many.  A page sweep holding one lets go of it for
-a waiter, an autovacuum worker is cancelled after deadlock_timeout (as
-for any waiter), the deadlock detector sees the wait, and lock_timeout
-bounds it, failing the move.  A share's locks are tried, not queued for,
-so as not to hold up the writers behind them: a page sweep holding one is
+are written.  A hard reset queues for its restores' locks, as TRUNCATE
+queues for them, before it holds the refs (lock_for_restore(): the
+tables of the head's and the commit's kept pages that changed since):
+giving up would leave it every row the working set changed to write
+back, however many, and waiting while it held the refs would hold up
+every other branch's operation behind a reader of one table.  A page
+sweep holding one lets go of it for a waiter, an autovacuum worker is
+cancelled after deadlock_timeout (as for any waiter), the deadlock
+detector sees the wait, and lock_timeout bounds it, failing the reset.
+Any other restore's locks (another move's, a reset's in a transaction
+holding the refs already), and a share's, are tried, not queued for, so
+as not to hold up the writers and operations behind them: a page sweep holding one is
 asked to let go, an autovacuum worker asked, once, to cancel its task (as
 Postgres cancels one that blocks a lock waiter) and waited for, until
 deadlock_timeout after the move first asked one, and any other holder
 waited for, tried again a little later each time, until
 prolly.restore_lock_wait (100 ms) after the move first waited: a
 statement lets go within a moment, a transaction left open won't soon,
-and the rows written instead cost only those the shared table differs
-by.  lock_timeout, if set, caps both; the deadlock detector doesn't see
-these waits, so they are bounded, for the whole move.  A share given up
-so is counted in pg_stat_prolly's restores_lock_busy.  Nor is a table
+and the rows written instead.  lock_timeout, if set, caps both; the
+deadlock detector doesn't see these waits, so they are bounded, for the
+whole move.  A restore or share given up so is counted in
+pg_stat_prolly's restores_lock_busy.  Nor is a table
 restored whose baseline
 holds the commit's rows with fewer than prolly.restore_min_changes (2) of
 them changed since, as its change finder tells from no more than that many
@@ -1370,10 +1375,22 @@ first keep after every snapshot older than the move has ended (the
 oldest xmin any backend holds is later than the move) lets go of the
 old storage, dropping it as its transaction commits; a crash leaves it
 to the first keep after the restart, and a branch's deletion drops it.
-Shared memory names the last 1024 such storages: once one still needed
-is let go of to make room, a snapshot that may be older than it can't
-tell which storage it reads, and reading a relation of the database
-fails with a serialization failure.
+A snapshot imported into a transaction (or a parallel worker's, restored)
+may be older than a move after which its backend built the relation's
+entry: as it is set, every such entry is found again
+(RelationCacheRecheckReplaced()).  Shared memory names at most 1024 such
+storages, a restore reserving its relations' entries before it replaces
+anything (branch_replaced_reserve()): with none free (that many still
+needed by older snapshots), the table isn't restored and its rows are
+written, MVCC-safe; an entry is never let go of while a snapshot may
+need it.  Only the primary's snapshots are covered: the registry is the
+primary's shared memory, so a hot standby's query whose snapshot is older
+than a reset it replays reads the restored pages, as after a TRUNCATE
+(which its replay also waits for queries holding the table's lock
+for), and the old storage is let go of by the primary's horizon, which
+covers a standby's snapshots only with hot_standby_feedback.  A share of
+another branch's storage or kept pages isn't kept so either: a snapshot
+older than it reads the shared pages, as after a TRUNCATE.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's

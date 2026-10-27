@@ -2010,7 +2010,7 @@ static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
 			   BranchKeptRelation *renewed, const BranchKeptRelation *carry,
 			   int ncarry, BranchKeptRelation *carried,
-			   BranchKeptRelation *replaced)
+			   BranchKeptRelation *replaced, BranchLockWait *wait)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -2040,20 +2040,21 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 
 	/*
 	 * If any changed, every one is given new storage, locked first as
-	 * TRUNCATE locks it, and queued for as TRUNCATE queues: one whose pages
-	 * didn't change may still hold, in its buffers, hints true of it as it
-	 * is alone (an index entry dead because its row is), which the storage
-	 * keeping the pages never got.  Waiting costs nothing the reset
-	 * wouldn't: giving up would leave it the rows to write instead, as
-	 * many as the working set changed.  (A page sweep holding a lock lets
-	 * go of it for a waiter, and an autovacuum worker is cancelled after
-	 * deadlock_timeout, as for any waiter; the deadlock detector sees the
-	 * wait, and lock_timeout bounds it.)  The rows are read again once the
-	 * locks are held: a writer waited for may have changed them.
+	 * TRUNCATE locks it: one whose pages didn't change may still hold, in
+	 * its buffers, hints true of it as it is alone (an index entry dead
+	 * because its row is), which the storage keeping the pages never got.
+	 * A hard reset holds the locks already, queued for before it held the
+	 * refs (so that no other branch's operation waits behind it); any
+	 * other is tried, never queued for while the refs are held.  The rows
+	 * are read again once the locks are held: a writer waited for may have
+	 * changed them.
 	 */
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
-		LockRelationOid(kept[i].relid, AccessExclusiveLock);
+		if (!CheckRelationOidLockedByMe(kept[i].relid, AccessExclusiveLock,
+										false) &&
+			!try_lock_relation(kept[i].relid, AccessExclusiveLock, wait))
+			ok = false;
 		changed[i] = true;
 	}
 	if (ok && any)
@@ -2266,6 +2267,29 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	}
 	pfree(rows);
 	return ok;
+}
+
+/*
+ * Queue for the locks restore() would take of kept[] (see branch_ops.h):
+ * only if one's pages changed since its snapshot, as restore() gives them
+ * new storage only then.
+ */
+static void
+copies_lock_for_restore(const BranchKeptRelation *kept, int nkept)
+{
+	bool		any = false;
+
+	for (int i = 0; i < nkept && !any; i++)
+	{
+		RelFileLocator loc = kept_locator(&kept[i]);
+
+		if (bmap_relation_exists(loc) &&
+			!bmap_snapshot_unchanged(smgropen(loc, INVALID_PROC_NUMBER),
+									 kept[i].snapshot))
+			any = true;
+	}
+	for (int i = 0; i < nkept && any; i++)
+		LockRelationOid(kept[i].relid, AccessExclusiveLock);
 }
 
 static void
@@ -3180,6 +3204,7 @@ static const BranchOpsRoutine branch_copies = {
 	.restore = copies_restore,
 	.let_go = copies_let_go,
 	.kept_status = copies_kept_status,
+	.lock_for_restore = copies_lock_for_restore,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
 	.carry_statistics = copies_carry_statistics,

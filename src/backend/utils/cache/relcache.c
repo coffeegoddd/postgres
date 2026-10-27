@@ -1345,14 +1345,12 @@ static List *replaced_relids = NIL;
  * since gave the relation new storage, kept the storage it replaced for
  * such snapshots (branch_storage_hook), the entry names that one, until
  * the transaction ends (AtEOXact_RelationCache()).  Such an entry is
- * read only (RelationCheckReplacedWrite()).  A snapshot that may be older
- * than a move it can't be told of can't read the relation.
+ * read only (RelationCheckReplacedWrite()).
  */
 static void
 replaced_storage(Relation relation)
 {
 	RelFileNumber rel = relation->rd_locator.relNumber;
-	bool		unsure;
 	MemoryContext old;
 
 	if (relation->rd_id < FirstNormalObjectId || !IsTransactionState() ||
@@ -1360,21 +1358,46 @@ replaced_storage(Relation relation)
 		HistoricSnapshotActive())
 		return;
 	if (!branch_storage_hook(relation->rd_rel->reltablespace, &rel,
-							 GetTransactionSnapshot(), &unsure))
-	{
-		if (unsure)
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("could not serialize access due to a concurrent move of relation \"%s\"",
-							RelationGetRelationName(relation)),
-					 errdetail("The storage this transaction's snapshot would read is no longer known.")));
+							 GetTransactionSnapshot()))
 		return;
-	}
 	relation->rd_locator.relNumber = rel;
 	relation->rd_replaced = true;
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	replaced_relids = list_append_unique_oid(replaced_relids, relation->rd_id);
 	MemoryContextSwitchTo(old);
+}
+
+/*
+ * The transaction's snapshot was set from another (imported, or a
+ * parallel worker's restored): it may be older than a move that gave a
+ * relation new storage after the relation's entry was built here, which
+ * no invalidation would make it find again.  Each such entry is found
+ * again at its next use (replaced_storage()).
+ */
+void
+RelationCacheRecheckReplaced(void)
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+	Snapshot	snap;
+
+	if (branch_storage_hook == NULL || RelationIdCache == NULL ||
+		!IsolationUsesXactSnapshot())
+		return;
+	snap = GetTransactionSnapshot();
+	hash_seq_init(&status, RelationIdCache);
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	rel = idhentry->reldesc;
+		RelFileNumber n = rel->rd_locator.relNumber;
+
+		if (rel->rd_id < FirstNormalObjectId || rel->rd_isnailed ||
+			rel->rd_replaced || !RELKIND_HAS_STORAGE(rel->rd_rel->relkind) ||
+			!rel->rd_rel->relfilenode)
+			continue;
+		if (branch_storage_hook(rel->rd_rel->reltablespace, &n, snap))
+			rel->rd_isvalid = false;
+	}
 }
 
 /*

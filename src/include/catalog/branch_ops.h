@@ -88,8 +88,8 @@ typedef struct BranchKeptTable
 #define BRANCH_LOCK_WAIT_MAX_ASKED	16
 
 /*
- * One operation's waits for the locks its share() and share_kept() calls
- * try, so that one bound covers them all: zeroed when
+ * One operation's waits for the locks its share(), share_kept() and
+ * restore() calls try, so that one bound covers them all: zeroed when
  * the operation begins.
  */
 typedef struct BranchLockWait
@@ -102,8 +102,8 @@ typedef struct BranchLockWait
 } BranchLockWait;
 
 /*
- * prolly.restore_lock_wait: how long, in milliseconds, share() and
- * share_kept() wait for a holder of a lock they need that isn't a page
+ * prolly.restore_lock_wait: how long, in milliseconds, share(),
+ * share_kept() and restore() (for a lock it doesn't hold already) wait for a holder of a lock they need that isn't a page
  * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
  * caps it).
  */
@@ -199,8 +199,8 @@ typedef struct BranchOpsRoutine
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 *
-	 * A lock not free at once is waited for, here and in share_kept(), but
-	 * never queued for, within the bounds of *wait, the
+	 * A lock not free at once is waited for, here and in share_kept() and
+	 * restore(), but never queued for, within the bounds of *wait, the
 	 * operation's (zeroed as it begins): a page sweep holding it is asked
 	 * to let go (bmap_compaction_let_go()) and waited out, within
 	 * lock_timeout of the operation's first wait (for as long as it takes
@@ -249,12 +249,13 @@ typedef struct BranchOpsRoutine
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its
 	 * snapshot is gone, its rows' transaction ids are older than the
-	 * database still knows, or one that changed is in use by the session
+	 * database still knows, one that changed is in use by the session
 	 * itself (refused, as TRUNCATE refuses, while the session has it open
-	 * or an AFTER trigger's event queued on it).  Each that changed is
-	 * locked as TRUNCATE locks it, queued for as TRUNCATE queues (a page
-	 * sweep holding it lets go, an autovacuum worker is cancelled after
-	 * deadlock_timeout, lock_timeout applies), and the locks are kept.
+	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
+	 * Each that changed is locked as TRUNCATE locks it: as it is if the
+	 * session holds that lock already (a hard reset queues for its tables'
+	 * locks before it holds the refs, as TRUNCATE queues), else tried,
+	 * within *wait's bounds, as share() tries; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
 	 * pages, which goes as the transaction commits, and with it every
 	 * other snapshot there: so each of carry[] (ncarry of them, other
@@ -273,7 +274,8 @@ typedef struct BranchOpsRoutine
 							BranchKeptRelation *renewed,
 							const BranchKeptRelation *carry, int ncarry,
 							BranchKeptRelation *carried,
-							BranchKeptRelation *replaced);
+							BranchKeptRelation *replaced,
+							BranchLockWait *wait);
 
 	/*
 	 * Optional: let go of a snapshot keep() or restore() took, if its
@@ -290,6 +292,16 @@ typedef struct BranchOpsRoutine
 	 * (a relation it gave new storage is gone from its old storage's).
 	 */
 	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: take, queued for as TRUNCATE queues, the locks restore()
+	 * would take of the session branch's relations kept[] (nkept of them,
+	 * a table's together), if any of them changed since keep() kept them:
+	 * before the caller holds anything every other branch's operation
+	 * waits for, so that a holder of one (a reader in a transaction left
+	 * open) holds up only this move.  The locks are kept.
+	 */
+	void		(*lock_for_restore) (const BranchKeptRelation *kept, int nkept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch

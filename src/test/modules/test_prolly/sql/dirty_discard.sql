@@ -104,5 +104,31 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 	   (since(:'before') ->> 'apply_rows')::int AS applied,
 	   t_digest() = :'at_head' AS at_head, clean();
 
+-- Commits in a subtransaction rolled back: the earlier commit the
+-- subtransaction's commits retired isn't let go of while the retiring may
+-- yet roll back, so after the rollback it is still kept, the head a reset
+-- gives back.
+SET prolly.kept_commits = 1;
+BEGIN;
+UPDATE dd.t SET v = 31 WHERE id % 400 = 0;
+SELECT dolt_commit('-am', 'c1') IS NOT NULL AS c1;
+SAVEPOINT s;
+UPDATE dd.t SET v = 32 WHERE id % 400 = 0;
+SELECT dolt_commit('-am', 'c2') IS NOT NULL AS c2;
+UPDATE dd.t SET v = 33 WHERE id % 400 = 0;
+SELECT dolt_commit('-am', 'c3') IS NOT NULL AS c3;
+ROLLBACK TO s;
+COMMIT;
+RESET prolly.kept_commits;
+SELECT t_digest() AS at_head \gset
+UPDATE dd.t SET v = -4 WHERE id % 3 = 0;
+:flush
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset;
+:flush
+SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
+	   (since(:'before') ->> 'apply_rows')::int AS applied,
+	   t_digest() = :'at_head' AS at_head, clean();
+
 \c :home
 DROP DATABASE dirty_discard;

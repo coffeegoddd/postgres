@@ -141,6 +141,7 @@ extern bool RelationForgetForNewRelation(Oid rid);
 
 extern void RelationCacheInvalidateEntry(Oid relationId);
 extern void RelationCheckReplacedWrite(Relation relation);
+extern void RelationCacheRecheckReplaced(void);
 
 extern void RelationCacheInvalidate(bool debug_discard);
 extern void RelationCacheInvalidateBranch(void);

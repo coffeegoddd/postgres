@@ -112,13 +112,13 @@ extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
 /*
  * The storage a snapshot reads of a relation whose storage pg_class names
  * *rel (in tablespace, 0 for the database's): one a move replaced but kept
- * for the snapshots that don't see it, into *rel, true if that is another;
- * *unsure if what such a snapshot reads can't be told.  Asked as a
- * relation's storage is found (RelationInitPhysicalAddr()), of the
+ * for the snapshots that don't see it, into *rel, true if that is another.
+ * Asked as a relation's storage is found (RelationInitPhysicalAddr()), and
+ * of every entry as a snapshot is imported or restored, of the
  * transaction's snapshot where it can't move.
  */
 typedef bool (*BranchStorageHook) (Oid tablespace, RelFileNumber *rel,
-								   Snapshot snap, bool *unsure);
+								   Snapshot snap);
 extern PGDLLIMPORT BranchStorageHook branch_storage_hook;
 
 /* (oldtup: the version at oldtid in hand, if the caller has it, else NULL) */
