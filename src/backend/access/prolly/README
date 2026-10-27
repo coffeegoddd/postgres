@@ -1200,7 +1200,7 @@ last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
 nothing of the kept commits.  A move to a commit no root was captured at
 restores the nearest kept commit before it (by first parents, no further
-back than the oldest commit the branch's own list keeps) and writes the
+back than the oldest commit any branch's list keeps) and writes the
 rows the two differ by: an interval's, and what a merge between brought
 in.  A commit's
 pages are the commit's, whichever branch kept them: a move restores them

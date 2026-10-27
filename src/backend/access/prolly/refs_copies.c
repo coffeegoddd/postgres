@@ -4961,12 +4961,12 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
  * them, at most NEAREST_KEPT_MAX back) whose pages kept (the branch's list)
  * keeps, its commit into *info: NULL if none.
  *
- * The walk stops at the height of the oldest commit the branch's own list
- * keeps (its last entry not retired): each step costs a commit's read and a
- * look in the refs' index of every branch's kept commits, and below that
- * height only another branch's roots could be found.  With a list of its
- * own, a branch's moves miss those; with none (a branch made at a commit
- * another branch kept), the walk goes the whole way.  First parents only:
+ * The walk stops below the height of the oldest commit any branch's list
+ * keeps (each list's last entry not retired): each step costs a commit's
+ * read and a look in the refs' index of every branch's kept commits, and
+ * below that height no branch keeps a root.  (A branch made at another's
+ * head, with a list of its own, still finds that branch's roots below its
+ * own.)  First parents only:
  * the rows between are written as a diff of the two commits' trees,
  * whatever lies between, so a merge between costs the rows its other
  * parent brought in, and a root on that side, nearer, is not looked for.
@@ -5017,25 +5017,54 @@ kept_anywhere(List *kept, const ProllyHash *id, Oid *source)
 	return kc;
 }
 
-static KeptCommit *
-nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
-			 Oid *source)
+/*
+ * The lowest height of the oldest commit any branch's list keeps (its last
+ * entry not retired): -1 if none, or one's height isn't known.  (A visit of
+ * the refs' TAG_KEPT entries.)
+ */
+typedef struct LowestKept
 {
-	ProllyHash	id;
-	int64		lowest = -1;
+	int64		lowest;
+	bool		unknown;
+} LowestKept;
 
-	if (commit->nparents == 0)
-		return NULL;
+static void
+note_lowest_kept(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	LowestKept *lk = arg;
+	List	   *kept;
+	int64		h;
+
+	if (k->len == 0 || k->data[0] != TAG_KEPT)
+		return;
+	kept = kept_decode((const char *) v->data, (const char *) v->data + v->len);
 	for (int i = list_length(kept) - 1; i >= 0; i--)
 	{
 		KeptCommit *oldest = list_nth(kept, i);
 
 		if (FullTransactionIdIsValid(oldest->retired))
 			continue;
-		if (!commit_height(&oldest->commit, &lowest))
-			lowest = -1;
+		if (!commit_height(&oldest->commit, &h))
+			lk->unknown = true;
+		else if (lk->lowest < 0 || h < lk->lowest)
+			lk->lowest = h;
 		break;
 	}
+}
+
+static KeptCommit *
+nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
+			 Oid *source)
+{
+	ProllyHash	id;
+	int64		lowest;
+	LowestKept	lk = {-1, false};
+	char		prefix = TAG_KEPT;
+
+	if (commit->nparents == 0)
+		return NULL;
+	visit_prefix(&prefix, 1, note_lowest_kept, &lk);
+	lowest = lk.unknown ? -1 : lk.lowest;
 	id = commit->parents[0];
 	for (int n = 0; n < NEAREST_KEPT_MAX; n++)
 	{
