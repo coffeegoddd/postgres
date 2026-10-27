@@ -67,25 +67,36 @@ is(sql($reads), '20', 'the live ones read');
 is(has($dead), 'f', 'a dead one is gone');
 is(sql($on_disk), sql($named), 'only the files the manifest names are left');
 
-# A writer running at the swap: what it names that was collected is
-# refused; what it appended before the swap is kept.
+# A collection stopped once it has waited for the transactions running as
+# it began (those it waits for before marking what is new, and which keep
+# what they name): a writer begun then runs at its swap.
+sub collect_after_running
+{
+	my $c = $node->background_psql('gcdb');
+	$c->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-gc-running-waited', 'wait')});
+	$c->query_until(qr/started/, q{
+		\echo started
+		SELECT test_chunk_gc(false) IS NOT NULL;
+		\echo done
+	});
+	$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'prolly-gc-running-waited'})
+	  or die 'the collection did not stop';
+	return $c;
+}
+
+# A writer running at the swap, begun after the collection waited for
+# those running before: what it names that was collected is refused; what
+# it appended before the swap is kept.
 sql("SELECT test_chunk_put('orphan')");
 my $orphan = sql(q{SELECT test_content_hash('orphan')});
 my $w = $node->background_psql('gcdb', on_error_stop => 0);
-$w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan')});
-my $g = $node->background_psql('gcdb');
-$g->query_safe(q{SELECT injection_points_set_local();
-	SELECT injection_points_attach('prolly-gc-sealed', 'wait')});
-$g->query_until(qr/started/, q{
-	\echo started
-	SELECT kept || ' ' || freed FROM test_chunk_gc(false);
-	\echo done
-});
-$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
-	WHERE wait_event = 'prolly-gc-sealed'}) or die 'the collection did not stop';
+my $g = collect_after_running();
+$w->query_safe(q{BEGIN; SELECT test_chunk_root() IS NOT NULL});
 my $early = $w->query_safe(qq{SELECT test_chunk_put('written before the swap')});
 $w->query_safe(qq{SELECT test_chunk_put(test_noise('w', 1048576))});
-sql(q{SELECT injection_points_wakeup('prolly-gc-sealed')});
+sql(q{SELECT injection_points_wakeup('prolly-gc-running-waited')});
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
 is(has($orphan), 'f', 'a chunk nothing reached is collected');
@@ -97,23 +108,18 @@ $g->query_until(qr/done/, '');
 $g->quit;
 is(has($early), 't', 'what a writer appended between the seal and the swap is kept');
 
-# The same for a hash a chunk holds otherwise (a commit's parent, a head):
-# found in what the swap dropped.
+# Bytes of a chunk that spell a collected chunk's hash but aren't a
+# reference it declares name nothing (a collection keeps nothing for
+# them): the writer commits.
 sql("SELECT test_chunk_put('orphan 2')");
 my $orphan2 = sql(q{SELECT test_content_hash('orphan 2')});
-$w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan2')});
-$g = $node->background_psql('gcdb');
-$g->query_until(qr/started/, q{
-	\echo started
-	SELECT kept || ' ' || freed FROM test_chunk_gc(false);
-	\echo done
-});
+$g = collect_after_running();
+$w->query_safe(q{BEGIN; SELECT test_chunk_root() IS NOT NULL});
+sql(q{SELECT injection_points_wakeup('prolly-gc-running-waited')});
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
 $w->query(qq{SELECT test_chunk_put('\\x0120'::bytea || '\\x14'::bytea || decode('$orphan2', 'hex')); COMMIT});
-like($w->{stderr}, qr/a chunk it names was collected while the transaction ran/,
-	'a writer naming it in a chunk\'s bytes is refused');
-like($w->{stderr}, qr/40001|serializ|Try the transaction again/i, 'to be retried');
+is($w->{stderr}, '', 'a writer whose chunk\'s bytes spell a collected hash commits');
 $w->{stderr} = '';
 $g->query_until(qr/done/, '');
 $g->quit;
@@ -135,19 +141,14 @@ for my $from ('files', 'cache')
 		# (read twice before: kept by the cache, the third read its)
 		$w->query_safe(qq{SELECT test_chunk_get('$node_hash') IS NOT NULL}) for 1 .. 2;
 	}
+	$g = collect_after_running();
 	$w->query_safe(qq{BEGIN; SELECT test_chunk_put('pending $case');
 		SELECT test_chunk_get('$node_hash') IS NOT NULL});
-	$g = $node->background_psql('gcdb');
-	$g->query_until(qr/started/, q{
-		\echo started
-		SELECT kept || ' ' || freed FROM test_chunk_gc(false);
-		\echo done
-	});
+	sql(q{SELECT injection_points_wakeup('prolly-gc-running-waited')});
 	$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 		WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
 	$w->query(qq{SELECT test_chunk_put_node(1, ARRAY['$child']); COMMIT});
-	# (refused by the probe the trust skipped before the swap, not only by
-	# the dropped hashes' check behind it)
+	# (refused by the probe the trust skipped before the swap)
 	like($w->{stderr}, qr/which it names, is not in the chunk store/,
 		"a writer naming a child it trusted (its node read from the $from) after a swap is refused");
 	$w->{stderr} = '';
@@ -159,13 +160,9 @@ for my $from ('files', 'cache')
 # began dropped, is refused, though the transaction puts nothing.
 sql("SELECT test_chunk_put('orphan root')");
 my $orphan3 = sql(q{SELECT test_content_hash('orphan root')});
-$w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan3')});
-$g = $node->background_psql('gcdb');
-$g->query_until(qr/started/, q{
-	\echo started
-	SELECT kept || ' ' || freed FROM test_chunk_gc(false);
-	\echo done
-});
+$g = collect_after_running();
+$w->query_safe(q{BEGIN; SELECT test_chunk_root() IS NOT NULL});
+sql(q{SELECT injection_points_wakeup('prolly-gc-running-waited')});
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
 $w->query(qq{SELECT test_chunk_move_root('$root', '$orphan3'); COMMIT});
@@ -232,7 +229,9 @@ $g->quit;
 $w->quit;
 
 # A transaction adding a table file (a transfer's) that began before a
-# swap is refused.
+# swap is refused: at once while the collection runs, rather than waiting
+# for the table file writers' lock the collection holds while it waits
+# for the transaction.
 my $t = $node->background_psql('gcdb', on_error_stop => 0);
 $t->query_safe(qq{BEGIN; SELECT test_chunk_has('$root')});
 $g = $node->background_psql('gcdb');
@@ -244,8 +243,8 @@ $g->query_until(qr/started/, q{
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the transfer';
 $t->query(q{SELECT test_chunk_table_file(ARRAY['received'::bytea]); COMMIT});
-like($t->{stderr}, qr/the chunk store was collected while the transaction ran/,
-	'a table file added by a transaction older than the swap is refused');
+like($t->{stderr}, qr/the chunk store is being collected/,
+	'a table file added by a transaction older than the swap is refused, at once');
 $g->query_until(qr/done/, '');
 $g->quit;
 $t->quit;
@@ -290,8 +289,8 @@ for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	is(sql($on_disk), sql($named), "a crash at $point: recovery leaves only what is named");
 	is(sql(q{SELECT count(*) FROM (SELECT 'base/' || oid AS d FROM pg_database
 		WHERE datname = 'gcdb') db, pg_ls_dir(d) f
-		WHERE f LIKE 'prolly\_gc\_dropped\_%' OR f = 'prolly_manifest.tmp'}), '0',
-		"a crash at $point: and no dropped list or manifest written aside");
+		WHERE f = 'prolly_manifest.tmp'}), '0',
+		"a crash at $point: and no manifest written aside");
 	is(sql($reads), '20', "a crash at $point: the live chunks read");
 	is(sql('SELECT test_chunk_root()'), $root, "a crash at $point: the root");
 	sql('SELECT test_chunk_gc(false)');
@@ -300,9 +299,9 @@ for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 }
 
 # A full collection keeps a mostly live settled file whole, garbage and
-# all: a chunk of its garbage isn't on the swap's dropped list, though
-# another copy of it (in a file rewritten) is garbage too, so a writer
-# naming it across the swap commits.
+# all: a chunk of its garbage stays found, though another copy of it (in
+# a file rewritten) is garbage too, so a writer naming it across the swap
+# commits.
 # (A chunk named by one put during a collection, after its seal, is
 # copied with the live ones; once that one is collected, nothing names it.)
 my $x = sql(q{SELECT test_chunk_put('kept x')});

@@ -704,6 +704,34 @@ after it, is done whole, unless it is at the array's end (an element
 appended, the last one removed).  Folded format 22 is the first whose rows hold JSON
 trees.
 
+A collection of the chunk store never frees a chunk a running
+transaction may still name.  A transaction may build on the root as it
+read it while other transactions move the root on: a commit's refs
+changes are built on the refs as it last read them, and the trees it
+rebuilds them with name chunks that root reaches, which may be garbage by
+the collection's seal.  So the collection, once it has sealed the journal
+(and forgotten the folds the refs know of), waits for every transaction
+running then that has used the store to end before it marks what is new
+(each notes so in shared memory at its first use, before it reads the
+root); each transaction still running read the root as of the seal or a
+later one.  A move of the journal frees nothing, and waits for none.  A transaction that
+finds a chunk stored and doesn't write it again (a tree's node that the
+store has, as a refs leaf is again once a branch made since is deleted;
+a pending chunk the store holds) names it without appending it: while a
+collection runs, the chunk store adds each such chunk the collection
+collects to its keep set, so it is kept.  The collection lets the table
+file writers' lock go while it waits, and takes it again after, naming
+beside its own the table files added meanwhile (anything else changed,
+and it fails, to be retried): a transfer begun meanwhile adds its files,
+what it found stored kept as above.  A transaction the collection waits
+for is refused a table file at once (a serialization failure), until the
+swap: what it found stored it found before the collection kept such
+chunks.  A conjoin skips while a collection runs.  pg_stat_prolly's
+gc_collections counts the collections; one that waits for a long
+transaction delays its swap, not the transaction nor other transfers.  A
+keep set that overflows (more chunks found or kept than it holds) has the
+collection keep everything, which it logs.
+
 A hash pointer a read hands out (a long value of history, read or not)
 names chunks a collection may drop: the chunk store's keep() is told of
 it, and a collection keeps the chunk or waits for the transaction, read
