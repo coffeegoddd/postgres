@@ -565,14 +565,25 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
  * written since: a file a store in the chunk store's directory.  A header
  * (ROOTS_MAGIC, ROOTS_VERSION, the scan's token), then a record a range
  * that holds any hash pointer, in order of range: the range, its count of
- * hashes, and the hashes, each once.  The page store's token says whether
- * it still holds.  It is not synced: a crash makes every token stale, and
- * a file that doesn't hold together is discarded, every block read again.
+ * hashes, and the hashes, each once, each with the generation of the
+ * chunk store's settled file holding it (0: none did, as it was found).
+ * The page store's token says whether it still holds.  It is not synced:
+ * a crash makes every token stale, and a file that doesn't hold together
+ * is discarded, every block read again.
+ *
+ * Beside it, a file of the same hashes by generation (EPOCHS_SUFFIX), so a
+ * retire of some generations reads only theirs: a header (EPOCHS_MAGIC,
+ * the version, the same token), the count of generations, then for each,
+ * ascending, the generation and its count of hashes; then the hashes, in
+ * that order.
  */
 #define ROOTS_PREFIX		"prolly_page_roots_"	/* and the tablespace */
 #define ROOTS_MAGIC			0x50524F54	/* "PROT" */
-#define ROOTS_VERSION		1
+#define ROOTS_VERSION		2
 #define ROOTS_HASH_LEN		sizeof(((varatt_external_hash *) NULL)->va_hash)
+#define ROOTS_ENTRY			(ROOTS_HASH_LEN + sizeof(uint32))
+#define EPOCHS_SUFFIX		".epochs"
+#define EPOCHS_MAGIC		0x50524F45	/* "PROE" */
 
 typedef struct RootsHeader
 {
@@ -604,9 +615,18 @@ typedef struct RootScan
 	const char *out_path;
 	uint32		range;
 	bool		reading;
-	uint8	   *found;			/* its hashes, ROOTS_HASH_LEN bytes each */
+	uint8	   *found;			/* its hashes, ROOTS_ENTRY bytes each */
 	uint32		nfound;
 	uint32		maxfound;
+
+	/* every hash written, ROOTS_ENTRY bytes each: the file by generation */
+	uint8	   *all;
+	uint64		nall;
+	uint64		maxall;
+
+	/* a retire's (retire_lo 0: not one): the ranges unchanged not read */
+	uint32		retire_lo;
+	uint32		retire_hi;
 } RootScan;
 
 static void
@@ -673,16 +693,48 @@ roots_check(RootScan *rs)
 			fread(&rec, 1, sizeof(rec), rs->old) != sizeof(rec) ||
 			(last != PG_UINT32_MAX && rec.range <= last) ||
 			rec.range == PG_UINT32_MAX ||
-			(st.st_size - at - (off_t) sizeof(rec)) / ROOTS_HASH_LEN < rec.n)
+			(st.st_size - at - (off_t) sizeof(rec)) / ROOTS_ENTRY < rec.n)
 			return false;
 		last = rec.range;
-		at += sizeof(rec) + (off_t) rec.n * ROOTS_HASH_LEN;
+		at += sizeof(rec) + (off_t) rec.n * ROOTS_ENTRY;
 	}
 	if (fseeko(rs->old, sizeof(RootsHeader), SEEK_SET) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not seek in file \"%s\": %m", rs->old_path)));
 	return true;
+}
+
+/* The generation of the settled file holding a value tree's root (0: none). */
+static uint32
+root_epoch(const uint8 *hash)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyHash	h;
+
+	if (!PROLLY_HAS(cs, epoch_of))
+		return 0;
+	memset(&h, 0, sizeof(h));
+	h.len = ROOTS_HASH_LEN;
+	memcpy(h.bytes, hash, ROOTS_HASH_LEN);
+	return PROLLY_CALL(cs, epoch_of,
+					   PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace),
+					   &h);
+}
+
+/* An entry (a hash and its generation) of this scan's file, noted. */
+static void
+note_all(RootScan *rs, const uint8 *entry)
+{
+	if (rs->nall == rs->maxall)
+	{
+		rs->maxall = Max(64, rs->maxall * 2);
+		rs->all = rs->all ?
+			repalloc_huge(rs->all, (Size) rs->maxall * ROOTS_ENTRY) :
+			MemoryContextAllocHuge(CurrentMemoryContext,
+								   (Size) rs->maxall * ROOTS_ENTRY);
+	}
+	memcpy(rs->all + (Size) rs->nall++ * ROOTS_ENTRY, entry, ROOTS_ENTRY);
 }
 
 /* A hash pointer's hash, found: a root, and one of the range's. */
@@ -700,17 +752,30 @@ root_found(RootScan *rs, const uint8 *hash)
 	{
 		rs->maxfound = Max(64, rs->maxfound * 2);
 		rs->found = rs->found ?
-			repalloc_huge(rs->found, (Size) rs->maxfound * ROOTS_HASH_LEN) :
+			repalloc_huge(rs->found, (Size) rs->maxfound * ROOTS_ENTRY) :
 			MemoryContextAllocHuge(CurrentMemoryContext,
-								   (Size) rs->maxfound * ROOTS_HASH_LEN);
+								   (Size) rs->maxfound * ROOTS_ENTRY);
 	}
-	memcpy(rs->found + (Size) rs->nfound++ * ROOTS_HASH_LEN, hash,
+	memcpy(rs->found + (Size) rs->nfound++ * ROOTS_ENTRY, hash,
 		   ROOTS_HASH_LEN);
 }
 
 static int
 roots_hash_cmp(const void *a, const void *b)
 {
+	return memcmp(a, b, ROOTS_HASH_LEN);
+}
+
+static int
+roots_epoch_cmp(const void *a, const void *b)
+{
+	uint32		x;
+	uint32		y;
+
+	memcpy(&x, (const uint8 *) a + ROOTS_HASH_LEN, sizeof(x));
+	memcpy(&y, (const uint8 *) b + ROOTS_HASH_LEN, sizeof(y));
+	if (x != y)
+		return x < y ? -1 : 1;
 	return memcmp(a, b, ROOTS_HASH_LEN);
 }
 
@@ -723,21 +788,27 @@ range_done(RootScan *rs)
 
 	if (rs->out == NULL || !rs->reading || rs->nfound == 0)
 		return;
-	qsort(rs->found, rs->nfound, ROOTS_HASH_LEN, roots_hash_cmp);
+	qsort(rs->found, rs->nfound, ROOTS_ENTRY, roots_hash_cmp);
 	for (uint32 i = 0; i < rs->nfound; i++)
 	{
-		uint8	   *h = rs->found + (Size) i * ROOTS_HASH_LEN;
+		uint8	   *h = rs->found + (Size) i * ROOTS_ENTRY;
+		uint32		epoch;
 
 		if (n > 0 &&
-			memcmp(rs->found + (Size) (n - 1) * ROOTS_HASH_LEN, h,
+			memcmp(rs->found + (Size) (n - 1) * ROOTS_ENTRY, h,
 				   ROOTS_HASH_LEN) == 0)
 			continue;
-		memmove(rs->found + (Size) n++ * ROOTS_HASH_LEN, h, ROOTS_HASH_LEN);
+		memmove(rs->found + (Size) n * ROOTS_ENTRY, h, ROOTS_HASH_LEN);
+		epoch = root_epoch(h);
+		memcpy(rs->found + (Size) n * ROOTS_ENTRY + ROOTS_HASH_LEN, &epoch,
+			   sizeof(epoch));
+		note_all(rs, rs->found + (Size) n * ROOTS_ENTRY);
+		n++;
 	}
 	rec.range = rs->range;
 	rec.n = n;
 	roots_write(rs, &rec, sizeof(rec));
-	roots_write(rs, rs->found, (Size) n * ROOTS_HASH_LEN);
+	roots_write(rs, rs->found, (Size) n * ROOTS_ENTRY);
 	rs->nfound = 0;
 }
 
@@ -749,18 +820,19 @@ static void
 scan_range(uint32 range, bool changed, void *arg)
 {
 	RootScan   *rs = arg;
-	uint8		hash[ROOTS_HASH_LEN];
+	uint8		entry[ROOTS_ENTRY];
 
 	range_done(rs);
 	rs->range = range;
 	rs->reading = changed;
-	if (changed)
+	/* (a retire's: what the ranges unchanged hold, by the file by generation) */
+	if (changed || rs->retire_lo > 0)
 		return;
 	if (rs->old == NULL)
 		elog(ERROR, "a range of a page store unchanged since a scan whose roots aren't known");
 	while (rs->old_at.range < range)
 	{
-		if (fseeko(rs->old, (off_t) rs->old_at.n * ROOTS_HASH_LEN,
+		if (fseeko(rs->old, (off_t) rs->old_at.n * ROOTS_ENTRY,
 				   SEEK_CUR) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -774,10 +846,22 @@ scan_range(uint32 range, bool changed, void *arg)
 		roots_write(rs, &rs->old_at, sizeof(rs->old_at));
 	for (uint32 i = 0; i < rs->old_at.n; i++)
 	{
-		roots_read(rs, hash, sizeof(hash));
+		uint32		epoch;
+
+		roots_read(rs, entry, sizeof(entry));
+		/* (one no settled file held when found: perhaps one does now) */
+		memcpy(&epoch, entry + ROOTS_HASH_LEN, sizeof(epoch));
+		if (epoch == 0)
+		{
+			epoch = root_epoch(entry);
+			memcpy(entry + ROOTS_HASH_LEN, &epoch, sizeof(epoch));
+		}
 		if (rs->out != NULL)
-			roots_write(rs, hash, sizeof(hash));
-		root_found(rs, hash);
+		{
+			roots_write(rs, entry, sizeof(entry));
+			note_all(rs, entry);
+		}
+		root_found(rs, entry);
 	}
 	rs->old_at.n = 0;
 	roots_next(rs);
@@ -842,6 +926,185 @@ scan_page(const char *page, void *arg)
 	}
 }
 
+/* the file by generation's header, and its entries for each generation */
+typedef struct EpochsHeader
+{
+	uint32		magic;
+	uint32		version;
+	uint64		token;
+	uint32		nepochs;
+} EpochsHeader;
+
+typedef struct EpochsEntry
+{
+	uint32		epoch;
+	uint32		n;
+} EpochsEntry;
+
+/*
+ * Write the file by generation of what this scan wrote (rs->all), with
+ * token, aside then renamed over the old one.
+ */
+static void
+epochs_write(RootScan *rs, const char *path, uint64 token)
+{
+	char	   *tmp = psprintf("%s.tmp", path);
+	FILE	   *f;
+	EpochsHeader h = {EPOCHS_MAGIC, 1, token, 0};
+	EpochsEntry *dir;
+	int			ndir = 0;
+
+	if (rs->nall > 1)
+		qsort(rs->all, rs->nall, ROOTS_ENTRY, roots_epoch_cmp);
+	dir = palloc(sizeof(EpochsEntry) * Max(rs->nall, 1));
+	for (uint64 i = 0; i < rs->nall; i++)
+	{
+		uint32		epoch;
+
+		memcpy(&epoch, rs->all + (Size) i * ROOTS_ENTRY + ROOTS_HASH_LEN,
+			   sizeof(epoch));
+		if (ndir == 0 || dir[ndir - 1].epoch != epoch)
+		{
+			dir[ndir].epoch = epoch;
+			dir[ndir++].n = 0;
+		}
+		dir[ndir - 1].n++;
+	}
+	h.nepochs = ndir;
+	f = AllocateFile(tmp, PG_BINARY_W);
+	if (f == NULL ||
+		fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
+		fwrite(dir, sizeof(EpochsEntry), ndir, f) != (size_t) ndir)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	for (uint64 i = 0; i < rs->nall; i++)
+	{
+		if (fwrite(rs->all + (Size) i * ROOTS_ENTRY, 1, ROOTS_HASH_LEN, f) !=
+			ROOTS_HASH_LEN)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m", tmp)));
+	}
+	if (FreeFile(f) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	if (rename(tmp, path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						tmp, path)));
+	pfree(dir);
+	pfree(tmp);
+	rs->nall = 0;
+}
+
+/*
+ * A retire's: visit the hashes the file by generation lists in generations
+ * lo to hi, and those no settled file held when found (one may since);
+ * false if the file isn't the one of the scan of token.
+ */
+static bool
+epochs_visit(RootScan *rs, const char *path, uint64 token)
+{
+	FILE	   *f = AllocateFile(path, PG_BINARY_R);
+	EpochsHeader h;
+	EpochsEntry *dir;
+	off_t		at;
+	bool		ok;
+
+	if (f == NULL)
+		return false;
+	ok = fread(&h, 1, sizeof(h), f) == sizeof(h) &&
+		h.magic == EPOCHS_MAGIC && h.version == 1 && h.token == token &&
+		h.nepochs < 0x10000000;
+	if (!ok)
+	{
+		FreeFile(f);
+		return false;
+	}
+	dir = palloc(sizeof(EpochsEntry) * Max(h.nepochs, 1));
+	if (fread(dir, sizeof(EpochsEntry), h.nepochs, f) != h.nepochs)
+	{
+		pfree(dir);
+		FreeFile(f);
+		return false;
+	}
+	at = sizeof(h) + (off_t) h.nepochs * sizeof(EpochsEntry);
+	for (uint32 i = 0; i < h.nepochs; i++)
+	{
+		uint8		hash[ROOTS_HASH_LEN];
+
+		if (dir[i].epoch != 0 &&
+			(dir[i].epoch < rs->retire_lo || dir[i].epoch > rs->retire_hi))
+		{
+			at += (off_t) dir[i].n * ROOTS_HASH_LEN;
+			continue;
+		}
+		if (fseeko(f, at, SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in file \"%s\": %m", path)));
+		for (uint32 j = 0; j < dir[i].n; j++)
+		{
+			ProllyHash	ph;
+
+			if (fread(hash, 1, sizeof(hash), f) != sizeof(hash))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("file \"%s\" is corrupt", path)));
+			ph.len = ROOTS_HASH_LEN;
+			memcpy(ph.bytes, hash, ROOTS_HASH_LEN);
+			rs->visit(&ph, rs->arg);
+		}
+		at += (off_t) dir[i].n * ROOTS_HASH_LEN;
+	}
+	pfree(dir);
+	FreeFile(f);
+	return true;
+}
+
+/*
+ * A retire's scan of a page store: what changed since the last scan read,
+ * and of the rest only the hashes of generations lo to hi, from the file
+ * by generation; every block read if that file isn't the last scan's.
+ * Neither file is written: the next scan reads again what this one did.
+ */
+static void
+scan_store_retire(Oid spc, RootScan *rs)
+{
+	char	   *dir = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
+	char	   *path = psprintf("%s/%s%u", dir, ROOTS_PREFIX, spc);
+	char	   *epochs = psprintf("%s%s", path, EPOCHS_SUFFIX);
+	FILE	   *f = AllocateFile(path, PG_BINARY_R);
+	RootsHeader h;
+	uint64		since = 0;
+	uint64		token;
+	uint64		nread;
+
+	if (f != NULL)
+	{
+		if (fread(&h, 1, sizeof(h), f) == sizeof(h) &&
+			h.magic == ROOTS_MAGIC && h.version == ROOTS_VERSION)
+			since = h.token;
+		FreeFile(f);
+	}
+	rs->old = NULL;
+	rs->out = NULL;
+	rs->reading = false;
+	rs->nfound = 0;
+	/* (the hashes of the ranges unchanged first, from the file by generation) */
+	if (since != 0 && !epochs_visit(rs, epochs, since))
+		since = 0;
+	nread = bmap_scan_store(spc, MyDatabaseId, since, &token, scan_range,
+							scan_page, rs);
+	pgstat_count_prolly(PGSTAT_PROLLY_GC_PAGES_SCANNED, nread);
+	pfree(epochs);
+	pfree(path);
+	pfree(dir);
+}
+
 /*
  * The database's page store in tablespace spc: what changed since the last
  * scan read, the rest's hash pointers taken from its file, and the file
@@ -893,6 +1156,7 @@ scan_store(Oid spc, RootScan *rs)
 	roots_write(rs, &h, sizeof(h));
 	rs->reading = false;
 	rs->nfound = 0;
+	rs->nall = 0;
 
 	nread = bmap_scan_store(spc, MyDatabaseId, since, &token, scan_range,
 							scan_page, rs);
@@ -914,6 +1178,18 @@ scan_store(Oid spc, RootScan *rs)
 	if (rs->old != NULL)
 		FreeFile(rs->old);
 	rs->old = NULL;
+	{
+		char	   *epochs = psprintf("%s%s", path, EPOCHS_SUFFIX);
+
+		/* (the file by generation first: it names the token it goes with) */
+		if (token != 0)
+			epochs_write(rs, epochs, token);
+		else if (unlink(epochs) != 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", epochs)));
+		pfree(epochs);
+	}
 	if (token == 0)
 	{
 		/* (no store in the tablespace) */
@@ -936,8 +1212,8 @@ scan_store(Oid spc, RootScan *rs)
 	pfree(dir);
 }
 
-void
-prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
+static void
+roots_scan(uint32 lo, uint32 hi, ProllyChunkRefVisit visit, void *arg)
 {
 	RootScan	rs;
 	Relation	rel;
@@ -950,6 +1226,8 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_BLAKE3);
 	rs.visit = visit;
 	rs.arg = arg;
+	rs.retire_lo = lo;
+	rs.retire_hi = hi;
 
 	/* every page's latest version on disk */
 	FlushDatabaseBuffers(MyDatabaseId);
@@ -966,10 +1244,36 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
 	foreach(lc, spcs)
-		scan_store(lfirst_oid(lc), &rs);
+	{
+		if (lo > 0)
+			scan_store_retire(lfirst_oid(lc), &rs);
+		else
+			scan_store(lfirst_oid(lc), &rs);
+	}
 	list_free(spcs);
 	if (rs.found)
 		pfree(rs.found);
+	if (rs.all)
+		pfree(rs.all);
+}
+
+void
+prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
+{
+	roots_scan(0, 0, visit, arg);
+}
+
+/*
+ * The same for a retire of generations lo to hi: of the blocks not written
+ * since the last scan, only the hashes in those generations (and those no
+ * settled file held when found).
+ */
+void
+prolly_toast_roots_in(uint32 lo, uint32 hi, ProllyChunkRefVisit visit,
+					  void *arg)
+{
+	Assert(lo > 0);
+	roots_scan(lo, hi, visit, arg);
 }
 
 /* Visit what a WAL record's bytes spell as hash pointers. */
