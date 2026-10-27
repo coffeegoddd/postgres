@@ -1054,6 +1054,15 @@ extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 									  ProllyHash *base);
 
 /*
+ * Every maximal common ancestor of a and b, the candidates a merge base is
+ * chosen from (several where histories cross), into *bases (palloc'd); the
+ * count.
+ */
+extern int	prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
+									   ProllyCommitLookup lookup,
+									   void *lookup_arg, ProllyHash **bases);
+
+/*
  * A commit's height: the most commits on a path from it to a root of its
  * history (a root's is 1, and one that isn't found is taken for a root), so
  * each commit's is greater than its parents'.  A commit that records its

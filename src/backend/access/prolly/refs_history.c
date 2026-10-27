@@ -599,6 +599,28 @@ walked_common(const ProllyHash *a, const ProllyHash *b,
 	return n;
 }
 
+/*
+ * Every maximal common ancestor of a and b (the candidates a merge base is
+ * chosen from: several where histories cross), into *bases (palloc'd);
+ * the count.  Where heights aren't recorded, the commits a walk finds
+ * common first, which may hold some beneath others.
+ */
+int
+prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
+						   ProllyCommitLookup lookup, void *lookup_arg,
+						   ProllyHash **bases)
+{
+	int64	   *heights;
+	int			n;
+
+	if (paint_common(a, b, lookup, lookup_arg, bases, &heights, &n))
+	{
+		pfree(heights);
+		return n;
+	}
+	return walked_common(a, b, lookup, lookup_arg, bases);
+}
+
 bool
 prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 						  ProllyCommitLookup lookup, void *lookup_arg,

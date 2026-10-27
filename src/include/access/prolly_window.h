@@ -33,7 +33,12 @@
  *   the refs at refs_root have them, each node read by read(read_arg),
  *   for a collection: it holds the horizon's lock shared until the
  *   transaction ends, and refuses a transaction that changed the horizon.
- *   fragments() visits the horizon's fragments, newest first.
+ *   fragments() visits the horizon's fragments, newest first.  hold()
+ *   takes the horizon's lock shared until the transaction ends, for a
+ *   collection, before it begins (the lock comes before the store's
+ *   collection, as before the refs' for a sever or repair), refusing a
+ *   transaction that changed the horizon.
+ * - plan() reads the refs as they stand, holding none.
  *
  * Provisional (v0).
  *
@@ -121,12 +126,13 @@ typedef struct ProllyWindowRoutine
 						  void *read_arg, ProllyWindowEdgeVisit visit,
 						  void *arg);
 	void		(*fragments) (ProllyWindowFragmentVisit visit, void *arg);
+	void		(*hold) (void);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
-	"plan", "sever", "archived", "edges", "fragments"
+	"plan", "sever", "archived", "edges", "fragments", "hold"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK fragments
+#define PROLLY_WINDOW_LAST_CALLBACK hold
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)
@@ -141,6 +147,14 @@ prolly_window_lookup(const char *name)
  * found a commit missing from the store.
  */
 extern void prolly_window_check_missing(const ProllyHash *id);
+
+/*
+ * As prolly_window_check_missing(), and if the horizon holds any fragment,
+ * an error that commit id, named but not in the store, may be past it:
+ * for a commit named by its id, which the horizon's tops don't cover when
+ * it is beneath them.
+ */
+extern void prolly_window_check_absent(const ProllyHash *id);
 
 /* Is commit id past the history horizon? */
 extern bool prolly_window_archived(const ProllyHash *id);

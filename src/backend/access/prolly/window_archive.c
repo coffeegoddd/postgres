@@ -93,11 +93,15 @@ static bool dc_ready = false;
 static ProllyTreeEnv tree_env;
 static const ProllyTreeRoutine *tree;
 
+static void window_subxact(SubXactEvent event, SubTransactionId mySubid,
+						   SubTransactionId parentSubid, void *arg);
+
 static void
 window_init(void)
 {
 	if (dc_ready)
 		return;
+	RegisterSubXactCallback(window_subxact, NULL);
 	prolly_database_components(&dc);
 	tree = prolly_tree_lookup("cow");
 	memset(&tree_env, 0, sizeof(tree_env));
@@ -389,6 +393,18 @@ archived_parents(void)
 	return archived_set;
 }
 
+/*
+ * A subtransaction rolled back may have changed the horizon (a sever
+ * undone): read it again from here.
+ */
+static void
+window_subxact(SubXactEvent event, SubTransactionId mySubid,
+			   SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		archived_lxid = InvalidLocalTransactionId;
+}
+
 /* The horizon changed in this transaction: read it again from here. */
 static void
 horizon_changed(void)
@@ -415,6 +431,25 @@ horizon_lock(LOCKMODE mode)
 
 	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, HORIZON_LOCK_CLASSID, 0, 0);
 	(void) LockAcquire(&tag, mode, false, false);
+}
+
+/*
+ * The lock order: the horizon's lock first, then the refs' (a sever, a
+ * repair), or the chunk store's collection (a collection): so a
+ * collection, holding it shared from before it begins until its
+ * transaction ends, reads at its seal the horizon as it stands
+ * committed, which no sever or repair moves until the collection is done.
+ */
+static void
+archive_hold(void)
+{
+	window_init();
+	if (changed_lxid == MyProc->vxid.lxid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a collection can't run in the transaction that changed the history horizon"),
+				 errhint("Commit the transaction first.")));
+	horizon_lock(ShareLock);
 }
 
 static void
@@ -487,9 +522,15 @@ typedef struct PlanCommit
 	bool		pinned;			/* kept as a ref's commit, not a window's */
 } PlanCommit;
 
+/*
+ * A commit a ref names, whose window is walked: a branch's head (name
+ * set), or another ref's commit (a tag's, a remote-tracking branch's, a
+ * session's detached head, a stash's, a merge's or rebase's in progress, a
+ * pin's, a kept one's), which keeps the database's window.
+ */
 typedef struct Head
 {
-	char	   *name;
+	char	   *name;			/* the branch's; NULL: another ref's */
 	ProllyHash	head;
 	int64		floor;			/* keeps every commit at least this high */
 } Head;
@@ -499,8 +540,8 @@ typedef struct Plan
 	TimestampTz cut;			/* a branch's window keeps commits dated at
 								 * or after it */
 	HTAB	   *commits;		/* PlanCommit, by id */
-	List	   *heads;			/* Head *, branch heads */
-	List	   *pins;			/* ProllyHash *, the other commits refs name */
+	List	   *heads;			/* Head *, every commit a ref names */
+	HTAB	   *head_ids;		/* their ids, each once */
 	List	   *kept;			/* PlanCommit *, the window */
 	List	   *edges;			/* ProllyHash *, pairs: boundary, parent */
 	List	   *severed;		/* PlanCommit *, the fragment */
@@ -552,28 +593,30 @@ plan_commit(Plan *plan, const ProllyHash *id)
 }
 
 static void
+add_head(Plan *plan, const char *name, const ProllyHash *head)
+{
+	Head	   *h;
+
+	/* (a commit several refs name is walked once, a branch's first) */
+	if (head->len == 0 || !set_add(plan->head_ids, head))
+		return;
+	h = palloc0(sizeof(Head));
+	h->name = name ? pstrdup(name) : NULL;
+	h->head = *head;
+	h->floor = PG_INT64_MAX;
+	plan->heads = lappend(plan->heads, h);
+}
+
+static void
 note_branch(const char *name, const ProllyHash *head, void *arg)
 {
 	Plan	   *plan = arg;
 
-	if (head->len == 0)
-		return;
-	if (strncmp(name, PROLLY_DETACHED_PREFIX,
-				strlen(PROLLY_DETACHED_PREFIX)) == 0)
-	{
-		plan->pins = lappend(plan->pins,
-							 memcpy(palloc(sizeof(ProllyHash)), head,
-									sizeof(ProllyHash)));
-		return;
-	}
-	{
-		Head	   *h = palloc0(sizeof(Head));
-
-		h->name = pstrdup(name);
-		h->head = *head;
-		h->floor = PG_INT64_MAX;
-		plan->heads = lappend(plan->heads, h);
-	}
+	/* (a session's detached head is another ref's commit) */
+	add_head(plan,
+			 strncmp(name, PROLLY_DETACHED_PREFIX,
+					 strlen(PROLLY_DETACHED_PREFIX)) == 0 ? NULL : name,
+			 head);
 }
 
 /* Every chunk the refs' entries name, as a collection reads them. */
@@ -611,11 +654,13 @@ read_refs_node(const ProllyNodeRef *node, uint16 level, void *arg)
 }
 
 /*
- * The commits the refs name that aren't branch heads: each a pin of the
- * window.  A tag's object names its commit.
+ * The commits the refs name that aren't branch heads, each with a window
+ * of its own: every entry's commits, as a collection reads them (a tag's
+ * object names its commit).  So whatever names a commit keeps its window,
+ * whatever kind of ref it is, a kind made later too.
  */
 static void
-note_pins(Plan *plan)
+note_refs(Plan *plan)
 {
 	ProllyHash	root;
 	ProllyNodeRef ref;
@@ -638,17 +683,22 @@ note_pins(Plan *plan)
 		if (!PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, h))
 			continue;
 		if (PROLLY_CALL(dc.refs, commit_get, h, &info))
-			plan->pins = lappend(plan->pins, h);
+			add_head(plan, NULL, h);
 		else if (PROLLY_HAS(dc.refs, tag_get) &&
 				 PROLLY_CALL(dc.refs, tag_get, h, &tag))
-			plan->pins = lappend(plan->pins,
-								 memcpy(palloc(sizeof(ProllyHash)), &tag.commit,
-										sizeof(ProllyHash)));
+			add_head(plan, NULL, &tag.commit);
 	}
 	pfree(rn.buf.data);
 }
 
-/* Each branch head keeps the commits down to its merge bases with others. */
+/*
+ * Each branch head, and each ref's commit it may be merged with, keeps the
+ * commits down to every merge base of the two (every maximal common
+ * ancestor, where histories cross): a merge into a branch is from another
+ * branch, a tag, a remote-tracking branch or any ref's commit, so every
+ * pair of a branch and a ref is one.  (Two refs that aren't branches merge
+ * only into a branch, which pairs with each.)
+ */
 static void
 note_merge_bases(Plan *plan)
 {
@@ -658,18 +708,25 @@ note_merge_bases(Plan *plan)
 	{
 		Head	   *a = list_nth(plan->heads, i);
 
-		for (int j = i + 1; j < n; j++)
+		if (a->name == NULL)
+			continue;
+		for (int j = 0; j < n; j++)
 		{
 			Head	   *b = list_nth(plan->heads, j);
-			ProllyHash	base;
-			PlanCommit *pc;
+			ProllyHash *bases;
+			int			nbases;
 
-			if (!PROLLY_CALL(dc.refs, merge_base, &a->head, &b->head, &base) ||
-				base.len == 0)
-				continue;
-			pc = plan_commit(plan, &base);
-			a->floor = Min(a->floor, pc->e.height);
-			b->floor = Min(b->floor, pc->e.height);
+			if (j == i || (b->name != NULL && j < i))
+				continue;		/* (each pair of branches once) */
+			nbases = prolly_history_merge_bases(&a->head, &b->head,
+												lookup_commit, NULL, &bases);
+			for (int k = 0; k < nbases; k++)
+			{
+				PlanCommit *pc = plan_commit(plan, &bases[k]);
+
+				a->floor = Min(a->floor, pc->e.height);
+				b->floor = Min(b->floor, pc->e.height);
+			}
 		}
 	}
 }
@@ -739,20 +796,23 @@ make_plan(Plan *plan, TimestampTz cut)
 	memset(plan, 0, sizeof(*plan));
 	plan->cut = cut;
 	plan->commits = id_set("prolly window plan", sizeof(PlanCommit));
+	plan->head_ids = id_set("prolly window heads", sizeof(ProllyHash));
 	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
-	note_pins(plan);
+	note_refs(plan);
 	note_merge_bases(plan);
 	foreach(lc, plan->heads)
-		walk_window(plan, lfirst(lc));
-	foreach(lc, plan->pins)
 	{
-		PlanCommit *pc = plan_commit(plan, lfirst(lc));
+		Head	   *h = lfirst(lc);
 
-		if (!pc->kept)
+		walk_window(plan, h);
+		/* (a ref's commit older than its window: kept as the ref's) */
+		if (h->name == NULL)
 		{
-			pc->pinned = true;
-			keep(plan, pc);
+			PlanCommit *pc = plan_commit(plan, &h->head);
+
+			if (pc->e.committed_at < plan->cut)
+				pc->pinned = true;
 		}
 	}
 
@@ -829,7 +889,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a history window needs a date to cut before")));
-	PROLLY_CALL(dc.refs, lock);
+	/* (read as the refs stand: no ref is held, nothing written) */
 	make_plan(&plan, *before);
 	foreach(lc, plan.severed)
 		visit(PROLLY_WINDOW_SEVERED, &((PlanCommit *) lfirst(lc))->id, NULL,
@@ -1226,6 +1286,33 @@ prolly_window_check_missing(const ProllyHash *id)
 				 errhint("Run dolt_history_repair() to reattach it.")));
 }
 
+/* Does the horizon hold any fragment? */
+static bool
+horizon_any(void)
+{
+	return hash_get_num_entries(archived_parents()) > 0;
+}
+
+void
+prolly_window_check_absent(const ProllyHash *id)
+{
+	ProllyDatabaseComponents c;
+
+	prolly_window_check_missing(id);
+	prolly_database_components(&c);
+	if (c.history_window == NULL || c.history_window != &prolly_window_archive ||
+		!IsTransactionState())
+		return;
+	window_init();
+	if (horizon_any())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("commit %s isn't in this database: it may be past the history horizon",
+						prolly_hash_hex(id)),
+				 errdetail("History before the horizon was severed from this database: archived, or deleted."),
+				 errhint("Run dolt_history_repair() to reattach it.")));
+}
+
 bool
 prolly_window_stops_at(const ProllyHash *parent)
 {
@@ -1258,4 +1345,5 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.archived = archive_archived,
 	.edges = archive_edges,
 	.fragments = archive_fragments,
+	.hold = archive_hold,
 };
