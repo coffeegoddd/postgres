@@ -1695,6 +1695,29 @@ settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
 
+The window is the database's.  prolly.history_warm (how long each
+branch's history is kept here), prolly.history_min_commits (how many of a
+branch's newest commits are kept however old), prolly.history_cold_batch
+(a cut rounded down to whole hours or days, so fragments are whole ones),
+prolly.history_max_size, prolly.history_window_action (archive, delete or
+none) and prolly.history_archive (a remote's name or URL) are read as the
+database has them (ALTER DATABASE ... SET: its owner's or a
+superuser's), never as a session has them, so no session severs more or
+sends history elsewhere by a SET of its own.  A branch's lineage may keep
+its own warm, min_commits or cold_batch (dolt_history_window(), the
+owner's, kept in the refs' settings); prolly_history_policy() shows what
+a branch keeps.  With no window, everything is kept.
+
+dolt_history_sever() severs what is past the window, as the action says.
+Archived, the fragment's tops are sent to the archive (the transfer
+sends what it lacks; a walk past the horizon goes on where the remote has
+what is severed already, so fragments archive beside one another), every
+chunk of the fragment is checked to be there, the tops are made heads of
+the archive's (history/fragment-N-i), and only then is the horizon moved,
+the fragment's location the archive's URL; with no archive, nothing is
+severed and a warning says so.  Deleted, the horizon records the fragment
+and nothing is sent.  prolly.history_max_size isn't enforced yet.
+
 dolt_history_repair(source, fragments) reattaches fragments, newest
 first (all, or the newest few), from a remote or clone that has their
 history (source, by name or URL) or, archived, from where they were

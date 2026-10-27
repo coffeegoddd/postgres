@@ -10438,10 +10438,24 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		 * visited.
 		 */
 		if (!PROLLY_CALL(env.chunk_store, has, env.chunks, next))
+		{
+			/*
+			 * (one past the history horizon: whole where the visitor
+			 * already has it, as a remote it is sent to may; else the
+			 * walk can't go on)
+			 */
+			if (prolly_window_archived(next))
+			{
+				ref_of(next, &ref);
+				if (!ws->visit(&ref, 0, ws->arg))
+					continue;
+				prolly_window_check_missing(next);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(next))));
+		}
 		if (!copies_commit_get(next, &info))
 		{
 			ProllyTagInfo tag;

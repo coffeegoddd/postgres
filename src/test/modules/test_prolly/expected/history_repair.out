@@ -209,9 +209,9 @@ SELECT hr_err('SELECT dolt_history_repair()') AS no_source;
 (1 row)
 
 SELECT hr_err($$SELECT dolt_history_repair('empty')$$) AS lacking;
-                    lacking                    
------------------------------------------------
- commit <hash> is missing from the chunk store
+                  lacking                  
+-------------------------------------------
+ commit <hash> is past the history horizon
 (1 row)
 
 SELECT count(*) AS fragments FROM prolly_history_horizon();

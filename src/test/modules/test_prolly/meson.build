@@ -170,6 +170,7 @@ tests += {
       'head_log',
       'history_horizon',
       'history_repair',
+      'history_window',
       'store_sizes',
       'storage_breakdown',
       'get_many',

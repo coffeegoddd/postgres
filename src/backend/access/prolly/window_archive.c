@@ -58,6 +58,15 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_type_d.h"
+#include "utils/array.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "access/prolly_datum.h"
 #include "access/xact.h"
 #include "catalog/pg_database.h"
@@ -82,6 +91,9 @@
 
 /* The horizon's lock: an object lock in the database, of this class. */
 #define HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
+
+static void check_may_sever(const char *what);
+static char *source_url(const char *source);
 
 /* ------------------------------------------------------------------------
  * Components and encodings
@@ -465,6 +477,305 @@ archive_fragments(ProllyWindowFragmentVisit visit, void *arg)
 }
 
 /* ------------------------------------------------------------------------
+ * Settings
+ *
+ * The window is the database's: prolly.history_* settings as the database
+ * has them (ALTER DATABASE ... SET, which only its owner or a superuser
+ * may make), never as a session has them, so no one but those severs more
+ * or sends history elsewhere by a SET of their own.  A branch's lineage
+ * may keep its own window (dolt_history_window()), in the refs' settings.
+ * ------------------------------------------------------------------------
+ */
+
+static int	action_setting = PROLLY_WINDOW_ARCHIVE;
+static char *warm_setting = NULL;
+static int	min_commits_setting = 0;
+static char *max_size_setting = NULL;
+static char *cold_batch_setting = NULL;
+static char *archive_setting = NULL;
+
+static const struct config_enum_entry action_options[] = {
+	{"archive", PROLLY_WINDOW_ARCHIVE, false},
+	{"delete", PROLLY_WINDOW_DELETE, false},
+	{"none", PROLLY_WINDOW_NONE, false},
+	{NULL, 0, false}
+};
+
+/* An interval's microseconds (months as 30 days, as interval_cmp does). */
+static bool
+parse_span(const char *value, int64 *usec)
+{
+	Datum		d;
+	Interval   *iv;
+
+	if (value == NULL || *value == '\0')
+	{
+		*usec = 0;
+		return true;
+	}
+	if (!DirectInputFunctionCallSafe(interval_in, value, InvalidOid, -1, NULL,
+									 &d))
+		return false;
+	iv = DatumGetIntervalP(d);
+	if (INTERVAL_NOT_FINITE(iv))
+		return false;
+	*usec = iv->time + (int64) iv->day * USECS_PER_DAY +
+		(int64) iv->month * DAYS_PER_MONTH * USECS_PER_DAY;
+	return *usec >= 0;
+}
+
+static bool
+parse_size(const char *value, int64 *bytes)
+{
+	Datum		d;
+
+	if (value == NULL || *value == '\0')
+	{
+		*bytes = 0;
+		return true;
+	}
+	PG_TRY();
+	{
+		d = DirectFunctionCall1(pg_size_bytes, CStringGetTextDatum(value));
+		*bytes = DatumGetInt64(d);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		return false;
+	}
+	PG_END_TRY();
+	return *bytes >= 0;
+}
+
+static bool
+check_span(char **newval, void **extra, GucSource source)
+{
+	int64		usec;
+
+	if (!parse_span(*newval, &usec))
+	{
+		GUC_check_errdetail("Give a non-negative interval, such as \"7 days\", or nothing.");
+		return false;
+	}
+	return true;
+}
+
+static bool
+check_size(char **newval, void **extra, GucSource source)
+{
+	int64		bytes;
+
+	if (!parse_size(*newval, &bytes))
+	{
+		GUC_check_errdetail("Give a size, such as \"500 GB\", or nothing.");
+		return false;
+	}
+	return true;
+}
+
+void
+prolly_window_init(void)
+{
+	static bool defined = false;
+
+	if (defined)
+		return;
+	defined = true;
+	DefineCustomEnumVariable("prolly.history_window_action",
+							 "What is done with history past its window: archive, delete or none.",
+							 "Read as the database has it (ALTER DATABASE ... SET), never a session's.",
+							 &action_setting, PROLLY_WINDOW_ARCHIVE,
+							 action_options, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_warm",
+							   "How long each branch's history is kept here (empty: all of it).",
+							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
+							   &warm_setting, "", PGC_USERSET, 0,
+							   check_span, NULL, NULL);
+	DefineCustomIntVariable("prolly.history_min_commits",
+							"How many of each branch's newest commits are kept here, however old.",
+							"Read as the database has it; a branch may keep its own.",
+							&min_commits_setting, 0, 0, INT_MAX,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_max_size",
+							   "The most history kept here (empty: no limit).",
+							   "Read as the database has it.",
+							   &max_size_setting, "", PGC_USERSET, 0,
+							   check_size, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_cold_batch",
+							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
+							   "Read as the database has it; a branch may keep its own.",
+							   &cold_batch_setting, "", PGC_USERSET, 0,
+							   check_span, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_archive",
+							   "Where history past the window is archived: a remote's name or URL.",
+							   "Read as the database has it; with none, archive mode severs nothing.",
+							   &archive_setting, "", PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+}
+
+/* name's value as the database has it (its own, no role's); NULL: none. */
+static char *
+database_setting(const char *name)
+{
+	Relation	rel;
+	ScanKeyData keys[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	char	   *found = NULL;
+
+	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
+	ScanKeyInit(&keys[0], Anum_pg_db_role_setting_setdatabase,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(MyDatabaseId));
+	ScanKeyInit(&keys[1], Anum_pg_db_role_setting_setrole,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(InvalidOid));
+	scan = systable_beginscan(rel, DbRoleSettingDatidRolidIndexId, true,
+							  NULL, 2, keys);
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tuple, Anum_pg_db_role_setting_setconfig,
+									 RelationGetDescr(rel), &isnull);
+
+		if (!isnull)
+		{
+			ArrayType  *a = DatumGetArrayTypeP(d);
+			Datum	   *elems;
+			int			n;
+			size_t		len = strlen(name);
+
+			deconstruct_array_builtin(a, TEXTOID, &elems, NULL, &n);
+			for (int i = 0; i < n; i++)
+			{
+				char	   *s = TextDatumGetCString(elems[i]);
+
+				if (strncmp(s, name, len) == 0 && s[len] == '=')
+					found = pstrdup(s + len + 1);
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+static int64
+database_span(const char *name)
+{
+	char	   *v = database_setting(name);
+	int64		usec = 0;
+
+	if (v && !parse_span(v, &usec))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("the database's %s isn't an interval: \"%s\"", name, v)));
+	return usec;
+}
+
+static const char *const branch_settings[] = {"warm", "min_commits",
+"cold_batch"};
+
+static void
+branch_setting_key(StringInfo key, const char *name, const char *setting)
+{
+	appendStringInfo(key, "history_window.%s:%s", setting, name);
+}
+
+/* A branch lineage's own setting; NULL: none. */
+static char *
+branch_setting(const char *name, const char *setting)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *found = NULL;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	branch_setting_key(&key, name, setting);
+	if (PROLLY_CALL(dc.refs, config_get, key.data, &v))
+		found = pstrdup(v.data);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+static void
+archive_policy(const char *name, ProllyWindowPolicy *p)
+{
+	char	   *v;
+
+	window_init();
+	memset(p, 0, sizeof(*p));
+	v = database_setting("prolly.history_window_action");
+	p->action = PROLLY_WINDOW_ARCHIVE;
+	if (v)
+	{
+		for (int i = 0; action_options[i].name; i++)
+			if (pg_strcasecmp(v, action_options[i].name) == 0)
+				p->action = action_options[i].val;
+	}
+	p->keep_time = database_span("prolly.history_warm");
+	p->batch = database_span("prolly.history_cold_batch");
+	if ((v = database_setting("prolly.history_min_commits")) != NULL)
+		p->keep_commits = strtol(v, NULL, 10);
+	if ((v = database_setting("prolly.history_max_size")) != NULL &&
+		!parse_size(v, &p->max_bytes))
+		p->max_bytes = 0;
+	v = database_setting("prolly.history_archive");
+	p->archive = (v && *v) ? v : NULL;
+	if (name == NULL)
+		return;
+	if ((v = branch_setting(name, "warm")) != NULL)
+		(void) parse_span(v, &p->keep_time);
+	if ((v = branch_setting(name, "cold_batch")) != NULL)
+		(void) parse_span(v, &p->batch);
+	if ((v = branch_setting(name, "min_commits")) != NULL)
+		p->keep_commits = strtol(v, NULL, 10);
+}
+
+/* A branch lineage's own setting (value NULL: the database's again). */
+static void
+archive_set_policy(const char *name, const char *setting, const char *value)
+{
+	StringInfoData key;
+	bool		known = false;
+
+	window_init();
+	check_may_sever("set the window of");
+	for (int i = 0; i < lengthof(branch_settings); i++)
+		known |= strcmp(setting, branch_settings[i]) == 0;
+	if (!known)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a branch's history window has no setting \"%s\"", setting),
+				 errhint("A branch keeps its own warm, min_commits or cold_batch; the rest are the database's.")));
+	if (value != NULL)
+	{
+		int64		n;
+
+		if (strcmp(setting, "min_commits") == 0)
+		{
+			char	   *end;
+
+			n = strtol(value, &end, 10);
+			if (*end != '\0' || n < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("min_commits must be a count, not \"%s\"", value)));
+		}
+		else if (!parse_span(value, &n))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s must be an interval, not \"%s\"", setting, value)));
+	}
+	initStringInfo(&key);
+	branch_setting_key(&key, name, setting);
+	PROLLY_CALL(dc.refs, config_set, key.data, value);
+	pfree(key.data);
+}
+
+/* ------------------------------------------------------------------------
  * Plans
  * ------------------------------------------------------------------------
  */
@@ -485,6 +796,7 @@ typedef struct PlanCommit
 	PlanEntry	e;
 	bool		kept;
 	bool		pinned;			/* kept as a ref's commit, not a window's */
+	bool		by_base;		/* kept only on the way to a merge base */
 } PlanCommit;
 
 typedef struct Head
@@ -492,12 +804,12 @@ typedef struct Head
 	char	   *name;
 	ProllyHash	head;
 	int64		floor;			/* keeps every commit at least this high */
+	TimestampTz cut;			/* and every commit dated at or after it */
+	int64		min_commits;	/* and its newest this many */
 } Head;
 
 typedef struct Plan
 {
-	TimestampTz cut;			/* a branch's window keeps commits dated at
-								 * or after it */
 	HTAB	   *commits;		/* PlanCommit, by id */
 	List	   *heads;			/* Head *, branch heads */
 	List	   *pins;			/* ProllyHash *, the other commits refs name */
@@ -529,6 +841,7 @@ plan_commit(Plan *plan, const ProllyHash *id)
 
 		pc->kept = false;
 		pc->pinned = false;
+		pc->by_base = false;
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -689,6 +1002,7 @@ walk_window(Plan *plan, Head *h)
 {
 	List	   *todo = list_make1(&h->head);
 	HTAB	   *seen = id_set("prolly window walk", sizeof(ProllyHash));
+	int64		head_height = plan_commit(plan, &h->head)->e.height;
 
 	(void) set_add(seen, &h->head);
 	while (todo != NIL)
@@ -699,8 +1013,18 @@ walk_window(Plan *plan, Head *h)
 		todo = list_delete_last(todo);
 		CHECK_FOR_INTERRUPTS();
 		pc = plan_commit(plan, id);
-		if (!(same_id(id, &h->head) || pc->e.committed_at >= plan->cut ||
-			  pc->e.height >= h->floor))
+		if (same_id(id, &h->head) || pc->e.committed_at >= h->cut ||
+			(h->min_commits > 0 && head_height - pc->e.height < h->min_commits))
+		{
+			if (pc->kept && pc->by_base)
+				pc->by_base = false;
+		}
+		else if (pc->e.height >= h->floor)
+		{
+			if (!pc->kept)
+				pc->by_base = true;
+		}
+		else
 			continue;
 		keep(plan, pc);
 		for (int i = 0; i < pc->e.nparents; i++)
@@ -726,21 +1050,65 @@ add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
 }
 
 /*
- * The plan with cut: the window, the boundary edges from it, and the
- * fragment beyond them.  The caller holds every ref.
+ * Each head's window: its commits dated before before (if given) cut;
+ * else its lineage's policy's, as of now, the cut rounded down to a whole
+ * batch.  False if no head's window cuts anything.
+ */
+static bool
+head_windows(Plan *plan, const TimestampTz *before)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	bool		any = false;
+
+	foreach_ptr(Head, h, plan->heads)
+	{
+		ProllyWindowPolicy p;
+
+		if (before != NULL)
+		{
+			h->cut = *before;
+			h->min_commits = 0;
+			any = true;
+			continue;
+		}
+		archive_policy(h->name, &p);
+		h->min_commits = p.keep_commits;
+		if (p.keep_time > 0)
+		{
+			h->cut = now - p.keep_time;
+			if (p.batch > 0)
+				h->cut -= ((h->cut % p.batch) + p.batch) % p.batch;
+			any = true;
+		}
+		else if (p.keep_commits > 0)
+		{
+			h->cut = DT_NOEND;	/* (only the count keeps) */
+			any = true;
+		}
+		else
+			h->cut = DT_NOBEGIN;	/* (it keeps everything) */
+	}
+	return any;
+}
+
+/*
+ * The plan (before: every head's window cut there; NULL: as the policy
+ * has it): the window, the boundary edges from it, and the fragment
+ * beyond them.  The caller holds every ref.
  */
 static void
-make_plan(Plan *plan, TimestampTz cut)
+make_plan(Plan *plan, const TimestampTz *before)
 {
 	ListCell   *lc;
 	HTAB	   *fragment;
 	List	   *todo = NIL;
 
 	memset(plan, 0, sizeof(*plan));
-	plan->cut = cut;
 	plan->commits = id_set("prolly window plan", sizeof(PlanCommit));
 	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
+	if (!head_windows(plan, before))
+		return;					/* (every head keeps its whole history) */
 	note_pins(plan);
 	note_merge_bases(plan);
 	foreach(lc, plan->heads)
@@ -825,12 +1193,8 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 	ListCell   *lc;
 
 	window_init();
-	if (before == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a history window needs a date to cut before")));
 	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, *before);
+	make_plan(&plan, before);
 	foreach(lc, plan.severed)
 		visit(PROLLY_WINDOW_SEVERED, &((PlanCommit *) lfirst(lc))->id, NULL,
 			  NULL, arg);
@@ -844,7 +1208,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 	{
 		PlanCommit *pc = lfirst(lc);
 
-		if (pc->pinned || pc->e.committed_at < plan.cut)
+		if (pc->pinned || pc->by_base)
 			visit(PROLLY_WINDOW_PINNED, &pc->id, NULL,
 				  pc->pinned ? "ref" : "merge base", arg);
 	}
@@ -897,7 +1261,7 @@ hash_cmp(const ListCell *a, const ListCell *b)
  */
 static void
 fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
-				 int64 *bytes)
+				 int64 *bytes, List **chunk_list)
 {
 	Closure		c = {0};
 	ListCell   *lc;
@@ -940,6 +1304,8 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 	PROLLY_CALL(tree_env.hash, finish, ctx, digest);
 	*chunks = list_length(c.chunks);
 	*bytes = c.bytes;
+	if (chunk_list)
+		*chunk_list = c.chunks;
 	pfree(c.buf.data);
 	hash_destroy(c.seen);
 }
@@ -1041,6 +1407,69 @@ check_may_sever(const char *what)
 				 errdetail("Only the database's owner or a superuser may.")));
 }
 
+/*
+ * Send fragment f's chunks to the archive at url (those it lacks), then
+ * check that the archive has every one, before the horizon is moved.  Its
+ * tops are heads of the archive's (history/fragment-N-i), so the archive
+ * names what it keeps.  The count of chunks sent.
+ */
+static int64
+archive_fragment(const char *url, const ProllyWindowFragment *f,
+				 List *chunk_list)
+{
+	int64		sent = 0;
+
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *remote = PROLLY_CALL(rr, open, url, true);
+
+	PG_TRY();
+	{
+		int			n = list_length(chunk_list);
+		ProllyHash *hashes = palloc_array(ProllyHash, Max(n, 1));
+		bool	   *has = palloc_array(bool, Max(n, 1));
+		int			i = 0;
+		StringInfoData format;
+
+		sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
+								   f->ntops);
+		foreach_ptr(ProllyHash, h, chunk_list)
+			hashes[i++] = *h;
+		if (PROLLY_HAS(rr, has_many))
+			PROLLY_CALL(rr, has_many, remote, hashes, n, has);
+		else
+			for (i = 0; i < n; i++)
+				has[i] = PROLLY_CALL(rr, has, remote, &hashes[i]);
+		for (i = 0; i < n; i++)
+			if (!has[i])
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("the archive at %s lacks chunk %s of the history severed",
+								url, prolly_hash_hex(&hashes[i])),
+						 errdetail("Nothing is severed.")));
+		initStringInfo(&format);
+		PROLLY_CALL(dc.canonicalizer, format, &format);
+		for (i = 0; i < f->ntops; i++)
+		{
+			char	   *name = psprintf("history/fragment-%lld-%d",
+										(long long) f->number, i);
+			ProllyHash	none = {0};
+
+			if (!PROLLY_CALL(rr, move_head, remote, name, &none, &f->tops[i],
+							 format.data, true))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not name the history severed in the archive at %s",
+								url)));
+		}
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(rr, close, remote);
+	}
+	PG_END_TRY();
+	return sent;
+}
+
 static void
 archive_sever(ProllyWindowAction action, const TimestampTz *before,
 			  ProllyWindowResult *result)
@@ -1057,26 +1486,39 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	StringInfoData k;
 	StringInfoData v;
 
+	List	   *chunk_list = NIL;
+	char	   *archive_url = NULL;
+	ProllyWindowPolicy policy;
+
 	window_init();
 	memset(result, 0, sizeof(*result));
 	result->action = action;
 	if (action == PROLLY_WINDOW_NONE)
 		return;
-	if (action != PROLLY_WINDOW_DELETE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("history can only be severed by deleting it so far")));
-	if (before == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a history window needs a date to cut before")));
 	check_may_sever("sever");
 	PreventCommandIfReadOnly("severing history");
+	archive_policy(NULL, &policy);
 	horizon_lock(ExclusiveLock);
 	PROLLY_CALL(dc.refs, lock);
-	make_plan(&plan, *before);
+	make_plan(&plan, before);
 	if (plan.severed == NIL)
 		return;
+
+	/* (archive mode with nowhere to archive to: nothing is severed) */
+	if (action == PROLLY_WINDOW_ARCHIVE)
+	{
+		if (policy.archive == NULL)
+		{
+			ereport(WARNING,
+					(errmsg("history of database \"%s\" is past its window, but isn't severed: it has no archive",
+							get_database_name(MyDatabaseId)),
+					 errdetail("%d commits are past the window.",
+							   list_length(plan.severed)),
+					 errhint("Set prolly.history_archive for the database (ALTER DATABASE ... SET), or set prolly.history_window_action to delete or none.")));
+			return;
+		}
+		archive_url = source_url(policy.archive);
+	}
 
 	memset(&f, 0, sizeof(f));
 	f.deleted = (action == PROLLY_WINDOW_DELETE);
@@ -1093,7 +1535,8 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	}
 	f.commits = list_length(plan.severed);
 	fragment_root(plan.severed, &f.root);
-	fragment_closure(ids, &f.digest, &f.chunks, &f.bytes);
+	fragment_closure(ids, &f.digest, &f.chunks, &f.bytes,
+					 archive_url ? &chunk_list : NULL);
 
 	/* its tops: each parent the boundary keeps no more, once */
 	tops = palloc_array(ProllyHash, Max(list_length(plan.edges), 1));
@@ -1119,6 +1562,11 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 		stops[i++] = *(ProllyHash *) lfirst(lc);
 
 	f.number = next_number();
+	if (archive_url)
+	{
+		result->sent = archive_fragment(archive_url, &f, chunk_list);
+		f.location = archive_url;
+	}
 	initStringInfo(&k);
 	initStringInfo(&v);
 	number_key(&k, KEY_FRAGMENT, f.number);
@@ -1408,7 +1856,7 @@ archive_repair(const char *source, int nfragments)
 		foreach_ptr(PlanCommit, pc, commits)
 			ids = lappend(ids, &pc->id);
 		fragment_root(commits, &root);
-		fragment_closure(ids, &digest, &chunks, &bytes);
+		fragment_closure(ids, &digest, &chunks, &bytes, NULL);
 		if (list_length(commits) != r->f.commits || !same_hash(&root, &r->f.root) ||
 			!same_hash(&digest, &r->f.digest))
 			ereport(ERROR,
@@ -1511,4 +1959,6 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.edges = archive_edges,
 	.fragments = archive_fragments,
 	.repair = archive_repair,
+	.policy = archive_policy,
+	.set_policy = archive_set_policy,
 };
