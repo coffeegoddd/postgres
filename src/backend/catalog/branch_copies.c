@@ -2190,7 +2190,7 @@ static bool
 freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 			   BranchKeptRelation *k, const BranchKeptRelation *prior,
 			   int nprior, BranchFreezePage freeze,
-			   const ProllyRootSnapshot *as_of, bool *made)
+			   const ProllyRootSnapshot *as_of, bool *made, uint64 *pages)
 {
 	RelFileLocator live = class_locator(c, c->relfilenode);
 	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
@@ -2246,6 +2246,7 @@ freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 	{
 		freeze_into_root(c, sloc, all, n, nblocks,
 						 base ? base->snapshot : 0, freeze, as_of, u_epoch, k);
+		*pages += n;
 		*made = true;
 	}
 	k->flags = BRANCH_KEPT_CONCURRENT;
@@ -2444,7 +2445,7 @@ static bool
 copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				   BranchKeptRelation *frozen, const BranchKeptRelation *prior,
 				   int nprior, BranchFreezePage freeze,
-				   const ProllyRootSnapshot *as_of)
+				   const ProllyRootSnapshot *as_of, uint64 *pages)
 {
 	List	   *relids = NIL;
 	Relation	pg_class;
@@ -2480,7 +2481,7 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				ok = false;
 			else if (heap_format(c) && (kept[i].flags & BRANCH_KEPT_UNFROZEN))
 				ok = freeze_root_of(c, &kept[i], &frozen[i], prior, nprior,
-									freeze, as_of, &made[i]);
+									freeze, as_of, &made[i], pages);
 			else
 			{
 				frozen[i] = kept[i];

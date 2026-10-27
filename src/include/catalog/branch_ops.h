@@ -302,12 +302,14 @@ typedef struct BranchOpsRoutine
 	 * nothing frozen (those made let go of as the transaction aborts or
 	 * commits), if a lock isn't free, or one is no longer on the storage
 	 * or root kept.
+	 *pages is how many pages the frozen roots copied, as keep()'s.
 	 */
 	bool		(*freeze_kept) (const BranchKeptRelation *kept, int nkept,
 								BranchKeptRelation *frozen,
 								const BranchKeptRelation *prior, int nprior,
 								BranchFreezePage freeze,
-								const struct ProllyRootSnapshot *as_of);
+								const struct ProllyRootSnapshot *as_of,
+								uint64 *pages);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,

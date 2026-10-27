@@ -5426,6 +5426,7 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 	int			nprior = 0;
 	KeptCommit *fc;
 	KeptCommit *at = kc;
+	uint64		pages = 0;
 
 	prolly_database_components(&dc);
 	if (!kc->unfrozen || branch_ops()->freeze_kept == NULL ||
@@ -5476,7 +5477,8 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 		if (restorable &&
 			!branch_ops()->freeze_kept(kt->rels, kt->nrels, fc->tables[t].rels,
 									   prior, nprior,
-									   dc.root_freezer->freeze_page, &as_of))
+									   dc.root_freezer->freeze_page, &as_of,
+									   &pages))
 		{
 			kept_let_go_frozen(fc, kc, t, prior, nprior);
 			return NULL;
@@ -5498,6 +5500,11 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 			return NULL;
 		}
 	}
+	/*
+	 * (what its roots hold, captured among writers, is known once they are
+	 * frozen: the pages the freezing copied)
+	 */
+	fc->pages = kc->pages + (int64) pages;
 	at->retired = GetTopFullTransactionId();
 	foreach_ptr(KeptCommit, o, *kept)
 		if (o == at)
