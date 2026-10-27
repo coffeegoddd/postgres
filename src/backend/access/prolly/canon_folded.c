@@ -6270,6 +6270,11 @@ named_trees(Canon *cn, const ProllyNodeRef *root)
 typedef struct ChangedTree
 {
 	bool		was;
+	bool		gone;			/* the item removed: before alone */
+	bool		taken;			/* removed, and paired with one added */
+	char		kind;			/* the item's kind ('t', 'm') */
+	char	   *def;			/* its definition, after its tree */
+	int			deflen;
 	ProllyNodeRef before;
 	ProllyNodeRef after;
 } ChangedTree;
@@ -6282,17 +6287,69 @@ note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
 	ChangedTree *c;
 	ProllyValue def;
 
-	if (after == NULL)
-		return true;
 	c = palloc0(sizeof(ChangedTree));
-	if (!tree_item(key, after, &c->after, &def))
+	if (after == NULL)
+	{
+		if (before == NULL || !tree_item(key, before, &c->before, &def))
+		{
+			pfree(c);
+			return true;
+		}
+		c->gone = true;
+	}
+	else if (!tree_item(key, after, &c->after, &def))
 	{
 		pfree(c);
 		return true;
 	}
-	c->was = before != NULL && tree_item(key, before, &c->before, &def);
+	else
+		c->was = before != NULL && tree_item(key, before, &c->before,
+											 &(ProllyValue) {0});
+	c->kind = (char) key->data[0];
+	c->def = pnstrdup((const char *) def.data, def.len);
+	c->deflen = def.len;
 	*changed = lappend(*changed, c);
 	return true;
+}
+
+/*
+ * A tree added (a name new in to) diffed against one removed (a name from
+ * had), not walked whole: a table renamed, or moved to another schema, is
+ * the same tree under another name.  Paired with one removed of the same
+ * kind and definition, else any one removed of the same kind, each removed
+ * once, in key order.  Any tree of from's will do for what to's lacks
+ * (what it shares is from's), so the pairing only saves the walk; and it
+ * is the two roots', whatever came before.
+ */
+static void
+pair_renamed(List *changed)
+{
+	for (int pass = 0; pass < 2; pass++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, changed)
+		{
+			ChangedTree *a = lfirst(lc);
+			ListCell   *rc;
+
+			if (a->gone || a->was)
+				continue;
+			foreach(rc, changed)
+			{
+				ChangedTree *r = lfirst(rc);
+
+				if (!r->gone || r->taken || r->kind != a->kind ||
+					(pass == 0 && (r->deflen != a->deflen ||
+								   memcmp(r->def, a->def, a->deflen) != 0)))
+					continue;
+				a->was = true;
+				a->before = r->before;
+				r->taken = true;
+				break;
+			}
+		}
+	}
 }
 
 /*
@@ -6313,7 +6370,10 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	canon_env(&cn);
 	PROLLY_CALL(cn.tree, diff_nodes, &cn.env, from, to, visit, arg);
 	if (from && from->hash.len > 0)
+	{
 		PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_changed_tree, &changed);
+		pair_renamed(changed);
+	}
 	else
 	{
 		foreach(lc, named_trees(&cn, to))
@@ -6328,6 +6388,8 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	{
 		ChangedTree *c = lfirst(lc);
 
+		if (c->gone)
+			continue;
 		PROLLY_CALL(cn.tree, diff_nodes, &cn.env, c->was ? &c->before : NULL,
 					&c->after, visit, arg);
 	}
