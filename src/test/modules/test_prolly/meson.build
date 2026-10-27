@@ -191,6 +191,7 @@ tests += {
       'fold_on_commit',
       'fold_leaf_reads',
       'cow_images',
+      'frozen_compaction',
       'row_locations',
       'describe_caches',
       'nearest_source',

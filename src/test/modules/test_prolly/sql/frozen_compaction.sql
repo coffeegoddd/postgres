@@ -1,0 +1,27 @@
+-- A commit's root holds its changed heap pages frozen, each version the
+-- commit doesn't see a dead line pointer, its bytes let go of: the page
+-- defragmented, as pruning leaves it, so that its image (which leaves out
+-- the page's hole) and the root hold only what is left.  A page whose
+-- rows all moved off is given back nearly empty.
+
+CREATE DATABASE frozen_compaction;
+\c frozen_compaction
+CREATE EXTENSION pageinspect;
+CREATE SCHEMA s VERSIONED;
+CREATE TABLE s.t (id int PRIMARY KEY, pad text NOT NULL);
+INSERT INTO s.t SELECT i, repeat('x', 900) FROM generate_series(1, 64) i;
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+-- every row of block 0 updated: each new version goes to another page
+-- (and block 0 not read again before the commit, which would prune it)
+SELECT count(*) > 1 AS rows_on_block_0 FROM s.t WHERE (ctid::text::point)[0] = 0;
+UPDATE s.t SET pad = repeat('y', 900) WHERE (ctid::text::point)[0] = 0;
+SELECT length(dolt_commit('-am', 'moved')::text) > 0 AS committed;
+-- the working set changed, then reset to the commit: its root's pages back
+DELETE FROM s.t;
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+SELECT count(*) AS rows FROM s.t;
+SELECT upper - lower > 7000 AS block_0_mostly_free
+FROM page_header(get_raw_page('s.t', 0));
+
+\c contrib_regression
+DROP DATABASE frozen_compaction;

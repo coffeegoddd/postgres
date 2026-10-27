@@ -24,7 +24,9 @@
  * VACUUM of a relation made of the root removes both as it would any dead
  * version.  A HOT chain's root version that isn't left, with a version of
  * the chain that is, redirects to it, as pruning would, so that an index
- * entry pointing at the root finds it.
+ * entry pointing at the root finds it.  The page is then defragmented, as
+ * pruning leaves it, so the dead versions' bytes neither stay in the root
+ * nor go into its image.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/rootfreeze_capture.c
@@ -224,6 +226,15 @@ prolly_freeze_heap_page(Page page, BlockNumber blkno,
 		}
 	PageClearFull(page);
 	((PageHeader) page)->pd_prune_xid = InvalidTransactionId;
+
+	/*
+	 * The versions made dead keep no storage (their line pointers are dead,
+	 * as pruning leaves them): the rest moved together, as pruning moves
+	 * them, so that the page's hole, which its image leaves out, is all
+	 * the free space.  A page whose rows all moved off is imaged as little
+	 * more than its line pointers.
+	 */
+	PageRepairFragmentation(page);
 	return any;
 }
 
