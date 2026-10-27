@@ -7,6 +7,7 @@
 \set dir :abs_builddir '/tmp_check/history_window'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
 SELECT 'liar://' || :'dir' || '/' || txid_current() || '_liar' AS liar_url \gset
+SELECT 'slow://' || :'dir' || '/' || txid_current() || '_slow' AS slow_url \gset
 SELECT current_database() AS home \gset
 \set VERBOSITY terse
 CREATE DATABASE regress_history_window;
@@ -214,7 +215,7 @@ LOAD 'test_prolly';
 SELECT hw_err('SELECT * FROM dolt_history_sever()') AS stalled;
                             stalled                             
 ----------------------------------------------------------------
- the archive at stall:///nowhere didn't answer within 1 seconds
+ the archive at stall:///nowhere made no progress for 1 seconds
 (1 row)
 
 SELECT count(*) AS fragments FROM prolly_history_horizon();
@@ -223,6 +224,21 @@ SELECT count(*) AS fragments FROM prolly_history_horizon();
          0
 (1 row)
 
+-- An archive that is slow but goes on: the limit is one without progress,
+-- so it finishes, past the limit in all (four tenths of a second a chunk).
+-- Rolled back, so the archive below is the first.
+ALTER DATABASE regress_history_window SET prolly.history_archive = :'slow_url';
+\c regress_history_window
+LOAD 'test_prolly';
+BEGIN;
+SELECT sent * 0.4 > 1 AS longer_than_the_limit, fragment > 0 AS severed
+FROM dolt_history_sever();
+ longer_than_the_limit | severed 
+-----------------------+---------
+ t                     | t
+(1 row)
+
+ROLLBACK;
 ALTER DATABASE regress_history_window RESET prolly.history_archive_timeout;
 \c regress_history_window
 LOAD 'test_prolly';
@@ -568,6 +584,37 @@ NOTICE:  the history window of branch "main" is taken as prolly.history_hot, whi
 -------------
  @ 216 hours
 (1 row)
+
+-- (hot keeps what is younger in every mode: a window by count alone, and
+-- a cut given)
+SELECT dolt_history_window('main', 'warm', NULL);
+ dolt_history_window 
+---------------------
+ 
+(1 row)
+
+ALTER DATABASE regress_history_window_d RESET prolly.history_warm;
+ALTER DATABASE regress_history_window_d SET prolly.history_min_commits = 1;
+\c regress_history_window_d
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
+NOTICE:  the history window of database "regress_history_window_d" is taken as prolly.history_hot, which it can't be shorter than
+   kind   | message 
+----------+---------
+ boundary | a8
+ severed  | a10
+(2 rows)
+
+SELECT p.kind, l.message
+FROM prolly_history_plan(now()) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+   kind   | message 
+----------+---------
+ boundary | a8
+ severed  | a10
+(2 rows)
 
 \c regress_history_window
 DROP DATABASE regress_history_window_d;

@@ -780,7 +780,12 @@ hold_hot(const char *name, ProllyWindowPolicy *p)
 {
 	int64		hot = database_span("prolly.history_hot");
 
-	if (p->keep_time > 0 && hot > p->keep_time)
+	/*
+	 * (any window, by time, by count or by size: what is younger than hot
+	 * is kept)
+	 */
+	if (hot > p->keep_time &&
+		(p->keep_time > 0 || p->keep_commits > 0 || p->max_bytes > 0))
 	{
 		ereport(NOTICE,
 				(errmsg("the history window of %s%s%s is taken as prolly.history_hot, which it can't be shorter than",
@@ -1298,6 +1303,10 @@ static bool
 head_windows(Plan *plan, const TimestampTz *before)
 {
 	TimestampTz now = GetCurrentTimestamp();
+	int64		hot = database_span("prolly.history_hot");
+
+	/* (what is younger than hot is kept, whatever cut is given) */
+	TimestampTz hot_cut = hot > 0 ? now - hot : DT_NOEND;
 	bool		any = false;
 
 	foreach_ptr(Head, h, plan->heads)
@@ -1306,7 +1315,7 @@ head_windows(Plan *plan, const TimestampTz *before)
 
 		if (before != NULL)
 		{
-			h->cut = *before;
+			h->cut = Min(*before, hot_cut);
 			h->min_commits = 0;
 			any = true;
 			continue;
@@ -1663,14 +1672,17 @@ check_may_sever(const char *what)
 }
 
 /*
- * The archive's time to answer: what a sever sends it, and reads back,
- * within prolly.history_archive_timeout (ten minutes where unset), else
- * the sever is given up, nothing severed, so an archive that hangs doesn't
- * hold the sever (nor, in the background, a worker) for ever.
+ * The archive's time to answer: prolly.history_archive_timeout (ten
+ * minutes where unset) without progress, else the sever is given up,
+ * nothing severed, so an archive that hangs doesn't hold the sever (nor,
+ * in the background, a worker) for ever.  Progress is the archive taking
+ * or giving a chunk, or answering a call: a large fragment that goes on
+ * moving finishes, however long it takes (archive_remote()).
  */
 #define DEFAULT_ARCHIVE_TIMEOUT	(10 * USECS_PER_MINUTE)
 
 static int	archive_timeout_id = -1;
+static int	archive_timeout_ms = 0;
 static volatile sig_atomic_t archive_timed_out = false;
 
 static int64
@@ -1690,6 +1702,152 @@ archive_timeout_handler(void)
 	SetLatch(MyLatch);
 }
 
+/* The time without progress restarts. */
+static void
+archive_progress(void)
+{
+	if (archive_timeout_id >= 0 && archive_timeout_ms > 0)
+		enable_timeout_after(archive_timeout_id, archive_timeout_ms);
+}
+
+/*
+ * The archive's routine as a sever calls it: each call, and each chunk a
+ * call takes or gives, progress.
+ */
+static const ProllyRemoteRoutine *archive_inner;
+static ProllyRemoteRoutine archive_routine;
+
+typedef struct ProgressNext
+{
+	ProllyChunkNext next;
+	void	   *arg;
+} ProgressNext;
+
+static bool
+progress_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	ProgressNext *pn = arg;
+	bool		more = pn->next(pn->arg, hash, data);
+
+	archive_progress();
+	return more;
+}
+
+typedef struct ProgressVisit
+{
+	ProllyRemoteChunkVisit visit;
+	void	   *arg;
+} ProgressVisit;
+
+static void
+progress_visit(const ProllyHash *hash, const char *data, int len, void *arg)
+{
+	ProgressVisit *pv = arg;
+
+	archive_progress();
+	pv->visit(hash, data, len, pv->arg);
+}
+
+static void
+ar_format(ProllyRemote *r, StringInfo out)
+{
+	archive_inner->format(r, out);
+	archive_progress();
+}
+
+static void
+ar_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
+{
+	archive_inner->heads(r, visit, arg);
+	archive_progress();
+}
+
+static bool
+ar_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
+{
+	bool		got = archive_inner->get(r, hash, out);
+
+	archive_progress();
+	return got;
+}
+
+static bool
+ar_has(ProllyRemote *r, const ProllyHash *hash)
+{
+	bool		has = archive_inner->has(r, hash);
+
+	archive_progress();
+	return has;
+}
+
+static void
+ar_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	ProgressNext pn = {next, arg};
+
+	archive_inner->add_chunks(r, progress_next, &pn);
+	archive_progress();
+}
+
+static bool
+ar_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
+			 const ProllyHash *head, const char *format, bool force)
+{
+	bool		moved = archive_inner->move_head(r, branch, expected, head,
+												 format, force);
+
+	archive_progress();
+	return moved;
+}
+
+static void
+ar_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
+			ProllyRemoteChunkVisit visit, void *arg)
+{
+	ProgressVisit pv = {visit, arg};
+
+	archive_inner->get_many(r, hashes, n, progress_visit, &pv);
+	archive_progress();
+}
+
+static void
+ar_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	archive_inner->has_many(r, hashes, n, has);
+	archive_progress();
+}
+
+static void
+ar_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
+			 const ProllyHash *known, int nknown,
+			 ProllyRemoteChunkVisit visit, void *arg)
+{
+	ProgressVisit pv = {visit, arg};
+
+	archive_inner->get_since(r, wanted, nwanted, known, nknown,
+							 progress_visit, &pv);
+	archive_progress();
+}
+
+static const ProllyRemoteRoutine *
+archive_remote(const ProllyRemoteRoutine *rr)
+{
+	archive_inner = rr;
+	archive_routine = *rr;
+#define WRAP(f) archive_routine.f = rr->f ? ar_##f : NULL
+	WRAP(format);
+	WRAP(heads);
+	WRAP(get);
+	WRAP(has);
+	WRAP(add_chunks);
+	WRAP(move_head);
+	WRAP(get_many);
+	WRAP(has_many);
+	WRAP(get_since);
+#undef WRAP
+	return &archive_routine;
+}
+
 /* Raise the error caught again, or, the archive's time up, say so. */
 static void
 archive_rethrow(const char *url, int64 limit)
@@ -1700,7 +1858,7 @@ archive_rethrow(const char *url, int64 limit)
 	FlushErrorState();
 	ereport(ERROR,
 			(errcode(ERRCODE_CONNECTION_FAILURE),
-			 errmsg("the archive at %s didn't answer within %lld seconds",
+			 errmsg("the archive at %s made no progress for %lld seconds",
 					url, (long long) (limit / USECS_PER_SEC)),
 			 errdetail("Nothing is severed."),
 			 errhint("Set prolly.history_archive_timeout for the database to wait longer.")));
@@ -1710,6 +1868,7 @@ typedef struct ReadBack
 {
 	const ProllyHashRoutine *hash;
 	HTAB	   *wanted;			/* ProllyHash: not yet read back whole */
+	HTAB	   *verified;		/* and those read back, this sever's */
 	StringInfoData chunk;
 } ReadBack;
 
@@ -1732,6 +1891,8 @@ read_back(const ProllyHash *hash, const char *data, int len, void *arg)
 		return;
 	key = hash_key(hash);
 	(void) hash_search(rb->wanted, &key, HASH_REMOVE, NULL);
+	if (rb->verified)
+		(void) set_add(rb->verified, hash);
 }
 
 /*
@@ -1781,7 +1942,7 @@ note_head_at(const char *branch, const ProllyHash *commit, void *arg)
  */
 static int64
 archive_fragment(const char *url, const ProllyWindowFragment *f,
-				 List *chunk_list)
+				 List *chunk_list, HTAB *verified)
 {
 	int64		sent = 0;
 	const ProllyRemoteRoutine *rr;
@@ -1791,11 +1952,15 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 	archive_timed_out = false;
 	if (archive_timeout_id < 0)
 		archive_timeout_id = RegisterTimeout(USER_TIMEOUT, archive_timeout_handler);
-	enable_timeout_after(archive_timeout_id, (int) Min(limit / 1000, INT_MAX));
+	archive_timeout_ms = (int) Min(limit / 1000, INT_MAX);
+	archive_progress();
 	PG_TRY();
 	{
-		rr = prolly_remote_for_url(url);
-		remote = PROLLY_CALL(rr, open, url, true);
+		const ProllyRemoteRoutine *inner = prolly_remote_for_url(url);
+
+		remote = PROLLY_CALL(inner, open, url, true);
+		rr = archive_remote(inner);
+		archive_progress();
 	}
 	PG_CATCH();
 	{
@@ -1839,13 +2004,18 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 								url)));
 		}
 		rb.hash = prolly_content_hash();
+		rb.verified = verified;
 		rb.wanted = id_set("prolly archive read-back", sizeof(ProllyHash));
 		initStringInfo(&rb.chunk);
+		/* (what an earlier try of this sever read back isn't again) */
 		foreach_ptr(ProllyHash, h, chunk_list)
 		{
+			if (verified && set_has(verified, h))
+				continue;
 			hashes[i++] = *h;
 			(void) set_add(rb.wanted, h);
 		}
+		n = i;
 		if (PROLLY_HAS(rr, get_many))
 			PROLLY_CALL(rr, get_many, remote, hashes, n, read_back, &rb);
 		else
@@ -1978,6 +2148,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	StringInfoData v;
 
 	List	   *chunk_list = NIL;
+	HTAB	   *verified = id_set("prolly archive verified", sizeof(ProllyHash));
 	char	   *archive_url = NULL;
 	ProllyWindowPolicy policy;
 
@@ -2027,7 +2198,8 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 					   &chunk_list, &nstops, &stops);
 		if (archive_url)
 		{
-			result->sent += archive_fragment(archive_url, &f, chunk_list);
+			result->sent += archive_fragment(archive_url, &f, chunk_list,
+											 verified);
 			f.location = archive_url;
 		}
 		INJECTION_POINT("prolly-sever-planned", NULL);

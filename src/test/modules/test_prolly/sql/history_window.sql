@@ -8,6 +8,7 @@
 \set dir :abs_builddir '/tmp_check/history_window'
 SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
 SELECT 'liar://' || :'dir' || '/' || txid_current() || '_liar' AS liar_url \gset
+SELECT 'slow://' || :'dir' || '/' || txid_current() || '_slow' AS slow_url \gset
 SELECT current_database() AS home \gset
 \set VERBOSITY terse
 CREATE DATABASE regress_history_window;
@@ -113,6 +114,16 @@ ALTER DATABASE regress_history_window SET prolly.history_archive_timeout = '1 se
 LOAD 'test_prolly';
 SELECT hw_err('SELECT * FROM dolt_history_sever()') AS stalled;
 SELECT count(*) AS fragments FROM prolly_history_horizon();
+-- An archive that is slow but goes on: the limit is one without progress,
+-- so it finishes, past the limit in all (four tenths of a second a chunk).
+-- Rolled back, so the archive below is the first.
+ALTER DATABASE regress_history_window SET prolly.history_archive = :'slow_url';
+\c regress_history_window
+LOAD 'test_prolly';
+BEGIN;
+SELECT sent * 0.4 > 1 AS longer_than_the_limit, fragment > 0 AS severed
+FROM dolt_history_sever();
+ROLLBACK;
 ALTER DATABASE regress_history_window RESET prolly.history_archive_timeout;
 \c regress_history_window
 LOAD 'test_prolly';
@@ -242,6 +253,18 @@ SELECT p.kind, l.message
 FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
 ORDER BY 1, 2;
 SELECT warm FROM prolly_history_policy('main');
+-- (hot keeps what is younger in every mode: a window by count alone, and
+-- a cut given)
+SELECT dolt_history_window('main', 'warm', NULL);
+ALTER DATABASE regress_history_window_d RESET prolly.history_warm;
+ALTER DATABASE regress_history_window_d SET prolly.history_min_commits = 1;
+\c regress_history_window_d
+SELECT p.kind, l.message
+FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+SELECT p.kind, l.message
+FROM prolly_history_plan(now()) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
 \c regress_history_window
 DROP DATABASE regress_history_window_d;
 

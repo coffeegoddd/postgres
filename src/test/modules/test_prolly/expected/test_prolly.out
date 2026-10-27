@@ -48,6 +48,7 @@ FROM prolly_implementations();
  remote         | postgres     |       3 |              1
  remote         | liar         |    9003 |              0
  remote         | stall        |    9004 |              0
+ remote         | slow         |    9005 |              0
  value_memo     | shared       |       1 |              1
  value_memo     | stub         |       0 |              0
  writers        | modes        |       1 |              1
@@ -66,7 +67,7 @@ FROM prolly_implementations();
  commit_cache   | stub         |       0 |              0
  history_window | archive      |       1 |              1
  history_window | stub         |       0 |              0
-(57 rows)
+(58 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -270,6 +271,9 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  remote         | stall          | identity                       | pass
  remote         | stall          | heads_and_chunks               | not implemented (missing format, heads, get, has, add_chunks, move_head)
  remote         | stall          | complete                       | not implemented (15 of 18 callbacks missing)
+ remote         | slow           | identity                       | pass
+ remote         | slow           | heads_and_chunks               | no checks yet
+ remote         | slow           | complete                       | not implemented (7 of 18 callbacks missing)
  value_memo     | shared         | identity                       | pass
  value_memo     | shared         | complete                       | pass
  value_memo     | stub           | identity                       | pass
@@ -306,7 +310,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
  history_window | stub           | complete                       | not implemented (9 of 9 callbacks missing)
-(232 rows)
+(235 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
