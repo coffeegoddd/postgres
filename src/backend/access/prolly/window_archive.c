@@ -1096,6 +1096,7 @@ typedef struct Plan
 								 * with (an amend of a boundary commit) */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
 	List	   *bases;			/* ProllyHash *: merge bases, kept */
+	List	   *ref_pins;		/* ProllyHash *: lineage refs' commits, kept */
 	List	   *tops;			/* ProllyHash *: the fragment's, each once */
 	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
 	bool		quiet;			/* the window evaluated: no warnings */
@@ -1330,6 +1331,68 @@ note_lineage(const char *name, const ProllyHash *head, void *arg)
 }
 
 static void
+pin_tracking(const char *remote, const char *branch, const ProllyHash *commit,
+			 void *arg)
+{
+	(void) set_add((HTAB *) arg, commit);
+}
+
+static void
+pin_pin(const char *name, const ProllyHash *commit, const ProllyValue *info,
+		void *arg)
+{
+	(void) set_add((HTAB *) arg, commit);
+}
+
+static void
+pin_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
+		  void *arg)
+{
+	ProllyCommitInfo info;
+
+	(void) set_add((HTAB *) arg, stash);
+	/* (a stash's commit names what it was made on) */
+	if (PROLLY_CALL(dc.refs, commit_get, stash, &info))
+		for (int i = 0; i < info.nparents; i++)
+			(void) set_add((HTAB *) arg, &info.parents[i]);
+}
+
+/*
+ * The commits a ref names for a reader, each of which keeps its own data
+ * whatever the window: a remote-tracking branch's, a reader's pin's, a
+ * stash's, and a merge's or rebase's in progress.  (Not a branch's log, nor
+ * the commits its pages are kept as of: those are its history, the
+ * window's.  A tag keeps itself as a ref of its own.)
+ */
+static HTAB *
+ref_commits(void)
+{
+	HTAB	   *set = id_set("prolly ref commits", sizeof(ProllyHash));
+	ProllyMergeState ms;
+	ProllyRebaseState rs;
+
+	if (PROLLY_HAS(dc.refs, trackings))
+		PROLLY_CALL(dc.refs, trackings, NULL, pin_tracking, set);
+	if (PROLLY_HAS(dc.refs, pins))
+		PROLLY_CALL(dc.refs, pins, pin_pin, set);
+	if (PROLLY_HAS(dc.refs, stashes))
+		PROLLY_CALL(dc.refs, stashes, pin_stash, set);
+	if (PROLLY_HAS(dc.refs, merge_state) &&
+		PROLLY_CALL(dc.refs, merge_state, &ms))
+	{
+		(void) set_add(set, &ms.theirs);
+		(void) set_add(set, &ms.base);
+	}
+	if (PROLLY_HAS(dc.refs, rebase_state) &&
+		PROLLY_CALL(dc.refs, rebase_state, &rs))
+	{
+		(void) set_add(set, &rs.head);
+		(void) set_add(set, &rs.onto);
+	}
+	return set;
+}
+
+static void
 note_kept(const ProllyKeptCommit *k, void *arg)
 {
 	(void) set_add((HTAB *) arg, &k->commit);
@@ -1355,7 +1418,8 @@ note_refs(Plan *plan)
 
 	/*
 	 * (the commits a branch's pages are kept as of are its lineage's, its
-	 * window's to keep or cut: no window of their own)
+	 * window's to keep or cut, and keep no data of their own: they are let
+	 * go of as the branch moves on, forget_kept(), not named for a reader)
 	 */
 	if (PROLLY_HAS(dc.refs, kept_commits))
 	{
@@ -1443,12 +1507,27 @@ note_merge_bases(Plan *plan)
 	 * A ref's commit on a branch's history, but a tag's, has no window of
 	 * its own: the commits a branch's pages are kept as of, a reader's pin,
 	 * a remote-tracking branch are the branch's lineage, its window's to
-	 * keep or cut (what a ref names a collection keeps whatever the
-	 * horizon says, until the ref lets go of it).  A tag keeps itself.
+	 * keep or cut.  A reader's (a remote-tracking branch's, a pin's, a
+	 * stash's, a merge's or rebase's in progress: ref_commits()) keeps its
+	 * own commit's data still, as a tag does (a collection follows no
+	 * severed commit to its data, so only that keeps it): only the
+	 * history behind it is the window's.
 	 */
-	foreach_ptr(Head, h, plan->heads)
-		if (h->on_lineage && !h->standalone)
-			plan->heads = foreach_delete_current(plan->heads, h);
+	{
+		HTAB	   *readers = ref_commits();
+
+		foreach_ptr(Head, h, plan->heads)
+			if (h->on_lineage && !h->standalone)
+			{
+				if (set_has(readers, &h->head))
+					plan->ref_pins = lappend(plan->ref_pins,
+											 memcpy(palloc(sizeof(ProllyHash)),
+													&h->head,
+													sizeof(ProllyHash)));
+				plan->heads = foreach_delete_current(plan->heads, h);
+			}
+		hash_destroy(readers);
+	}
 }
 
 /*
@@ -1835,6 +1914,16 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		if (set_has(plan->archived, b) || pc->kept)
 			continue;
 		pc->by_base = true;
+		keep(plan, pc);
+	}
+	/* (and each commit a ref names on a branch's history, by itself) */
+	foreach_ptr(ProllyHash, r, plan->ref_pins)
+	{
+		PlanCommit *pc = plan_commit(plan, r);
+
+		if (set_has(plan->archived, r) || pc->kept)
+			continue;
+		pc->pinned = true;
 		keep(plan, pc);
 	}
 

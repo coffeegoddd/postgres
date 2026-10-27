@@ -477,6 +477,7 @@ tests += {
       't/627_history_repair_collect.pl',
       't/628_history_sever_planned.pl',
       't/1087_log_stream_collect.pl',
+      't/1136_history_pin_read.pl',
       't/760_root_keep_retries.pl',
       't/763_root_share_released.pl',
       't/764_root_holds.pl',

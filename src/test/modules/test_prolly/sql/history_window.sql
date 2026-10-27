@@ -330,6 +330,43 @@ SELECT id, v FROM hw.t ORDER BY id;
 \c regress_history_window
 DROP DATABASE regress_history_window_e;
 
+-- A commit a reader's ref names keeps its own data past a sever and a
+-- full collection: a remote-tracking branch's (origin/main at an 8-day-old
+-- commit) and a snapshot mount's pin.  Only the history behind them is
+-- severed.
+SELECT :'url' || '_o' AS url_o \gset
+CREATE DATABASE regress_history_window_o;
+\c regress_history_window_o
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'a10');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS a10 \gset
+SELECT mount FROM prolly_mount(:'a10', 'hw', 'old');
+UPDATE hw.t SET v = 'a9';
+SELECT length(dolt_commit('-am', 'a9', '--date', (now() - interval '9 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a8';
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+SELECT dolt_remote('add', 'origin', :'url_o') IS NOT NULL AS added;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+UPDATE hw.t SET v = 'a7';
+SELECT length(dolt_commit('-am', 'a7', '--date', (now() - interval '7 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a0';
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_o SET prolly.history_window = '3 days';
+ALTER DATABASE regress_history_window_o SET prolly.history_window_action = delete;
+\c regress_history_window_o
+SELECT p.kind, l.message, p.why FROM prolly_history_plan(NULL) p
+	LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'pinned') ORDER BY 1, 2;
+SELECT fragment, commits FROM dolt_history_sever();
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT v FROM dolt_at('remotes/origin/main', NULL::hw.t);
+SELECT table_name, rows_modified FROM dolt_diff_stat('remotes/origin/main', 'main');
+SELECT v FROM old.t;
+\c regress_history_window
+DROP DATABASE regress_history_window_o;
+
 -- Delete mode with many tags: each keeps only its own commit's data, so
 -- what is outside the window and untagged is severed.
 CREATE DATABASE regress_history_window_t;
