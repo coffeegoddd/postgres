@@ -128,6 +128,11 @@
  *				   pushed
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
+ *	'S' space key
+ *				-> an entry another component keeps here (side_put()), in
+ *				   its space (a byte): the commit index's, keyed by
+ *				   content, so a commit writes its own as it writes its
+ *				   branch's entries; none names a chunk
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
@@ -302,6 +307,7 @@
 #define TAG_OWNED		'J'	/* routines and types such records list */
 #define TAG_IDENTITY_CONFLICTS 'D'	/* a branch's merge's table identity conflicts */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
+#define TAG_SIDE		'S'	/* another component's entries, by space */
 /*
  * Indexes of other entries, each kept with them, so that a lookup by what
  * they hold is a seek of the refs, not a read of every branch's entries;
@@ -328,9 +334,9 @@
  * no classes (a move keeps a table's relation, by OID); 19: each kept
  * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
- * case folded.
+ * case folded; 20: other components' entries (the commit index).
  */
-#define REFS_FORMAT		"19"
+#define REFS_FORMAT		"20"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -467,6 +473,7 @@ static void forget_read_caches(void);
 static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								  SubTransactionId parentSubid, void *arg);
 static void publish_scoped(void);
+static void note_indexed(const ProllyHash *head);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_tables_left(const char *branch, ProllyMergeState *state,
 							  char **name);
@@ -1805,8 +1812,9 @@ branch_entry_tag(char tag)
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), not having held every
- * ref nor begun to commit?
+ * the commit, which no other transaction writes), or another component's
+ * entry (keyed by content, or put holding every ref), not having held
+ * every ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -1817,7 +1825,7 @@ scoped_key(const char *key, int keylen)
 	if (published || whole)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
-		(keylen > 1 && key[0] == TAG_OWNED))
+		(keylen > 1 && (key[0] == TAG_OWNED || key[0] == TAG_SIDE)))
 		return true;
 	name = entry_branch(key, keylen, &len);
 	return name != NULL && branch_held(name, len);
@@ -2301,6 +2309,7 @@ branch_set_head(const char *name, const ProllyHash *head)
 	pfree(v.data);
 	if (head)
 		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
+	note_indexed(head);
 }
 
 /*
@@ -11420,6 +11429,129 @@ copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
 	return found;
 }
 
+/* ------------------------------------------------------------------------
+ * Other components' entries
+ * ------------------------------------------------------------------------
+ */
+
+static void
+side_key(StringInfo out, char space, const ProllyKey *key)
+{
+	appendStringInfoChar(out, TAG_SIDE);
+	appendStringInfoChar(out, space);
+	if (key)
+		appendBinaryStringInfo(out, (const char *) key->data, key->len);
+}
+
+static bool
+copies_side_get(char space, const ProllyKey *key, StringInfo value)
+{
+	StringInfoData k;
+	bool		found;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	found = refs_get(k.data, k.len, value);
+	pfree(k.data);
+	return found;
+}
+
+static void
+copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
+{
+	StringInfoData k;
+	StringInfoData v;
+
+	initStringInfo(&k);
+	side_key(&k, space, key);
+	if (value)
+	{
+		v.data = (char *) value->data;
+		v.len = value->len;
+		v.maxlen = value->len + 1;
+		v.cursor = 0;
+	}
+	refs_put(k.data, k.len, value ? &v : NULL);
+	pfree(k.data);
+}
+
+static void
+copies_side_scan(char space, const ProllyKey *from, ScanDirection direction,
+				 bool (*visit) (const ProllyKey *key, const ProllyValue *value,
+								void *arg),
+				 void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	StringInfoData start;
+	char		prefix[2] = {TAG_SIDE, space};
+	ProllyKey	k;
+	ProllyValue v;
+
+	if (!refs_root(&root))
+		return;
+	initStringInfo(&start);
+	side_key(&start, space, from);
+	/* (backward from none: from the space's end, just past its last key) */
+	if (from == NULL && ScanDirectionIsBackward(direction))
+		start.data[1] = space + 1;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	{
+		ProllyKey	seek = {(const uint8 *) start.data, start.len};
+
+		PROLLY_CALL(tree, cursor_seek, c, &seek, direction);
+	}
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		ProllyKey	own;
+
+		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
+		{
+			/* (the space's end, past it backward, from just past it) */
+			if (ScanDirectionIsBackward(direction) && from == NULL &&
+				k.len >= 2 && k.data[0] == TAG_SIDE &&
+				(uint8) k.data[1] == (uint8) (space + 1))
+				continue;
+			break;
+		}
+		own.data = k.data + 2;
+		own.len = k.len - 2;
+		if (!visit(&own, &v, arg))
+			break;
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(start.data);
+}
+
+/* The database's commit index, if its configuration has one. */
+static const ProllyCommitIndexRoutine *
+commit_index(void)
+{
+	static const ProllyCommitIndexRoutine *ci = NULL;
+	static bool looked = false;
+
+	if (!looked)
+	{
+		ProllyDatabaseComponents dc;
+
+		prolly_database_components(&dc);
+		ci = dc.commit_index;
+		looked = true;
+	}
+	return ci;
+}
+
+/* A branch's head moved to head (NULL: it has none now): index it. */
+static void
+note_indexed(const ProllyHash *head)
+{
+	const ProllyCommitIndexRoutine *ci;
+
+	if (head == NULL || head->len == 0 || (ci = commit_index()) == NULL)
+		return;
+	PROLLY_CALL(ci, note_head, head);
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -11520,4 +11652,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.forget_records = copies_forget_records,
 	.check_copies_read = copies_check_copies_read,
 	.branches_folded = copies_branches_folded,
+	.side_get = copies_side_get,
+	.side_put = copies_side_put,
+	.side_scan = copies_side_scan,
 };

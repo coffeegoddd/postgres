@@ -28,6 +28,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "access/sdir.h"
 #include "access/transam.h"
 #include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
@@ -897,6 +898,30 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*branches_folded) (const char *name, ProllyBranchVisit visit,
 									void *arg);
+
+	/*
+	 * Optional, together: entries another component keeps in the refs (the
+	 * commit index's), each in a space of its own named by a byte, changed
+	 * with the transaction as every entry is.  They name no chunks, so they
+	 * keep nothing from a collection, and transfers never send them.
+	 * side_put() (value NULL: delete) of a key made of content (a commit's
+	 * id, its date) that no other transaction writes another value under
+	 * is made as a commit's own entries are, holding only its branch, so
+	 * commits on other branches don't wait for it; a caller putting a key
+	 * others may write too holds every ref first (lock()).  side_scan()
+	 * visits space's entries from key from (NULL: its first, or its last
+	 * backward) in direction until visit returns false; the key visited is
+	 * without the space.
+	 */
+	bool		(*side_get) (char space, const ProllyKey *key, StringInfo value);
+	void		(*side_put) (char space, const ProllyKey *key,
+							 const ProllyValue *value);
+	void		(*side_scan) (char space, const ProllyKey *from,
+							  ScanDirection direction,
+							  bool (*visit) (const ProllyKey *key,
+											 const ProllyValue *value,
+											 void *arg),
+							  void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -958,9 +983,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
-	"forget_records", "check_copies_read", "branches_folded"
+	"forget_records", "check_copies_read", "branches_folded", \
+	"side_get", "side_put", "side_scan"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branches_folded
+#define PROLLY_REFS_LAST_CALLBACK side_scan
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

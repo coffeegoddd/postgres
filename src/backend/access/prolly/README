@@ -81,6 +81,7 @@ Changes to this design are tracked in GitHub issues:
 	json_tree         prolly_jsontree.h       paths, stub
 	node_cache        prolly_nodecache.h      shared, stub
 	commit_cache      prolly_commitcache.h    shared, stub
+	commit_index      prolly_commitindex.h    refs, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -960,6 +961,19 @@ is found only in that generation, so a collection's swap lets go of them
 all; dropping a database forgets its entries.  A transaction's entries
 are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
 and commit_cache_misses).
+
+The commit index (prolly_commitindex.h; "refs", commitindex_refs.c)
+finds commits by date: each commit a branch head reached, keyed by its
+date then id and by its id, with its date, height and parents, as entries
+of the refs (their side entries, 'S', refs format 20) that name no chunks.
+A head that moves (a commit, a merge, a transaction's commit, a reset, a
+fetch's or a clone's) indexes its commit and those it reaches that aren't
+indexed yet, parents first, so an indexed commit's ancestors are indexed
+as far as the store has them; a commit's own entries are keyed by its
+content and written as its branch's are, holding only that branch.  So
+the commits of a range of dates, or the newest at or before a date, are a
+seek of the refs (prolly_commit_index(), prolly_commit_indexed()), not a
+walk of history.
 
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed

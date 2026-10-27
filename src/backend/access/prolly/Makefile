@@ -29,6 +29,8 @@ OBJS = \
 	chunkstore_local.o \
 	commitcache_shared.o \
 	commitcache_stub.o \
+	commitindex_refs.o \
+	commitindex_stub.o \
 	diffmerge_folded.o \
 	hash_blake3.o \
 	journal_index.o \

@@ -25,12 +25,15 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "catalog/pg_type_d.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 static text *
@@ -239,4 +242,99 @@ prolly_fold_rewritten(Oid relid)
 	PG_END_TRY();
 	AtEOXact_GUC(true, save_nestlevel);
 	return true;
+}
+
+static void
+index_entry_row(ReturnSetInfo *rsinfo, const ProllyCommitIndexEntry *e)
+{
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	Datum		parents[PROLLY_MAX_PARENTS];
+
+	values[0] = PointerGetDatum(hash_to_text(&e->id));
+	values[1] = TimestampTzGetDatum(e->committed_at);
+	values[2] = Int64GetDatum(e->height);
+	for (int i = 0; i < e->nparents; i++)
+		parents[i] = PointerGetDatum(hash_to_text(&e->parents[i]));
+	values[3] = PointerGetDatum(construct_array_builtin(parents, e->nparents,
+														TEXTOID));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+static bool
+index_visit_row(const ProllyCommitIndexEntry *e, void *arg)
+{
+	index_entry_row((ReturnSetInfo *) arg, e);
+	return true;
+}
+
+static const ProllyCommitIndexRoutine *
+database_commit_index(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (dc.commit_index == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("this database's configuration has no commit index")));
+	return dc.commit_index;
+}
+
+/*
+ * prolly_commit_index(from_time timestamptz, to_time timestamptz,
+ *					   backward bool)
+ *	returns setof (commit_hash text, committed_at timestamptz,
+ *				   height bigint, parents text[])
+ *
+ * The commit index's entries dated from_time..to_time (NULL: unbounded),
+ * in date order, or newest first if backward; without arguments, all of
+ * them in date order.
+ */
+Datum
+prolly_commit_index(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyCommitIndexRoutine *ci = database_commit_index();
+	bool		args = PG_NARGS() == 3;
+	TimestampTz from = !args || PG_ARGISNULL(0) ? DT_NOBEGIN :
+		PG_GETARG_TIMESTAMPTZ(0);
+	TimestampTz to = !args || PG_ARGISNULL(1) ? DT_NOEND :
+		PG_GETARG_TIMESTAMPTZ(1);
+	bool		backward = args && !PG_ARGISNULL(2) && PG_GETARG_BOOL(2);
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(ci, scan, from, to,
+				backward ? BackwardScanDirection : ForwardScanDirection,
+				index_visit_row, rsinfo);
+	return (Datum) 0;
+}
+
+/*
+ * prolly_commit_indexed(ref text)
+ *	returns setof (commit_hash text, committed_at timestamptz,
+ *				   height bigint, parents text[])
+ *
+ * The commit index's entry for the commit ref names (a branch, tag or
+ * commit id): one row, or none if it isn't indexed.
+ */
+Datum
+prolly_commit_indexed(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyCommitIndexRoutine *ci = database_commit_index();
+	ProllyDatabaseComponents dc;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ProllyHash	id = {0};
+	ProllyCommitIndexEntry e;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_CALL(dc.refs, resolve, ref, &id))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_CALL(ci, lookup, &id, &e))
+		index_entry_row(rsinfo, &e);
+	return (Datum) 0;
 }
