@@ -84,6 +84,26 @@ SELECT * FROM path();
 SELECT count(*) FILTER (WHERE v = 0) AS at_c0 FROM mr.t;
 SELECT dolt_checkout('main');
 
+-- Another branch's root of a schema the session's branch no longer has
+-- isn't usable: a branch made at c2 that adds a column, moved to c3, which
+-- only main keeps, counts no kept root, but the nearest before it or none.
+SELECT dolt_branch('reshaped', :'c2');
+SELECT dolt_checkout('reshaped');
+ALTER TABLE mr.t ADD COLUMN w int;
+SELECT length(dolt_commit('-Am', 'reshaped')::text) > 0 AS reshaped_made;
+SELECT count(*) AS reshaped_keeps_c3 FROM prolly_history_roots('reshaped', :'c3');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT dolt_reset('--hard', :'c3');
+SELECT pg_stat_force_next_flush();
+SELECT name, value FROM path() WHERE name LIKE 'moves_root_%';
+SELECT count(*) FILTER (WHERE v = 3) AS at_c3,
+	count(*) FILTER (WHERE id = 1) AS one_row
+FROM mr.t;
+SELECT count(*) AS no_w FROM information_schema.columns
+WHERE table_schema = 'mr' AND table_name = 't' AND column_name = 'w';
+SELECT dolt_checkout('main');
+
 -- Roots capped at a byte: the oldest let go of, so a move to c1 has
 -- neither its own nor one before it, and writes its rows.
 \c :home

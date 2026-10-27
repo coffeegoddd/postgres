@@ -1550,8 +1550,9 @@ to a commit kept writes no rows (but where a lock, a privilege or the
 session's own use of the table stands in the way); only a commit with no
 root writes the rows between it and the nearest root before.
 pg_stat_prolly counts each move by the root it found: moves_root_kept
-(the pages kept as of its commit, given back to each table that needs
-them), moves_root_nearest (those of the nearest kept commit before it,
+(the pages kept as of its commit, usable, given back to each table that
+needs them; another branch's root of a schema the session's branch no
+longer has isn't), moves_root_nearest (those of the nearest kept commit before it,
 and the rows between written) and moves_root_missing (neither: the rows
 written, from the head's pages if those are kept).  A table a move can't
 give a root's pages is written, as move_tables_written counts.  prolly_history_roots(branch, commit_hash) lists the

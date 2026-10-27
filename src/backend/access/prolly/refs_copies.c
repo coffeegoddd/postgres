@@ -6695,6 +6695,25 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
  * tables' new storage) and the storage replaced, to be put once the
  * restores are done.
  */
+/*
+ * Another branch's pages are given back only where the commit defines what
+ * the session branch's head does: its types are another's objects, their
+ * values on the pages read by this branch's, which the move then makes
+ * again.  Does commit?
+ */
+static bool
+head_schema_of(const ProllyDatabaseComponents *dc,
+			   const ProllyCommitInfo *commit)
+{
+	ProllyHash	head;
+	ProllyCommitInfo hi;
+
+	return dc->canonicalizer->same_schema != NULL &&
+		branch_head(branch_ops()->current(), &head) &&
+		copies_commit_get(&head, &hi) &&
+		dc->canonicalizer->same_schema(&hi.root, &commit->root);
+}
+
 static void
 restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 			 KeptCommit *was, Oid source, List **kept, List *skip,
@@ -6714,22 +6733,8 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	ProllyNodeRef from;
 	ProllyNodeRef spliced;
 
-	/*
-	 * (another branch's pages only where the commit defines what the
-	 * branch's head does: its types are another's objects, their values on
-	 * the pages read by this branch's, which the move then makes again)
-	 */
-	if (other)
-	{
-		ProllyHash	head;
-		ProllyCommitInfo hi;
-
-		if (dc->canonicalizer->same_schema == NULL ||
-			!branch_head(branch_ops()->current(), &head) ||
-			!copies_commit_get(&head, &hi) ||
-			!dc->canonicalizer->same_schema(&hi.root, &commit->root))
-			return;
-	}
+	if (other && !head_schema_of(dc, commit))
+		return;
 
 	/*
 	 * (the commit kept anew, the restored tables by their new storage's
@@ -7082,12 +7087,15 @@ restore_pages(const ProllyCommitInfo *commit)
 					  source);
 
 	/*
-	 * (the path counted by the root found, not by the tables it gave back:
-	 * a table that has the pages already, as a first use leaves it, needs
-	 * none, and one it can't give back is written, as move_tables_written
-	 * counts)
+	 * (the path counted by the root found and usable, not by the tables it
+	 * gave back: a table that has the pages already, as a first use leaves
+	 * it, needs none, and one it can't give back is written, as
+	 * move_tables_written counts; another branch's root of a schema the
+	 * session's branch no longer has isn't usable, and the move goes on to
+	 * the nearest before it)
 	 */
-	kept_found = was != NULL;
+	kept_found = was != NULL &&
+		(source == MyBranch || head_schema_of(&dc, commit));
 	if (kept_found)
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVES_ROOT_KEPT, 1);
 	if (was != NULL)

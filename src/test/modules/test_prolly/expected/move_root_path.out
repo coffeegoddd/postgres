@@ -235,6 +235,87 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- Another branch's root of a schema the session's branch no longer has
+-- isn't usable: a branch made at c2 that adds a column, moved to c3, which
+-- only main keeps, counts no kept root, but the nearest before it or none.
+SELECT dolt_branch('reshaped', :'c2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('reshaped');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'reshaped'"}
+(1 row)
+
+ALTER TABLE mr.t ADD COLUMN w int;
+SELECT length(dolt_commit('-Am', 'reshaped')::text) > 0 AS reshaped_made;
+ reshaped_made 
+---------------
+ t
+(1 row)
+
+SELECT count(*) AS reshaped_keeps_c3 FROM prolly_history_roots('reshaped', :'c3');
+ reshaped_keeps_c3 
+-------------------
+                 0
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT dolt_reset('--hard', :'c3');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, value FROM path() WHERE name LIKE 'moves_root_%';
+        name        | value 
+--------------------+-------
+ moves_root_kept    |     0
+ moves_root_missing |     0
+ moves_root_nearest |     1
+(3 rows)
+
+SELECT count(*) FILTER (WHERE v = 3) AS at_c3,
+	count(*) FILTER (WHERE id = 1) AS one_row
+FROM mr.t;
+ at_c3 | one_row 
+-------+---------
+    10 |       1
+(1 row)
+
+SELECT count(*) AS no_w FROM information_schema.columns
+WHERE table_schema = 'mr' AND table_name = 't' AND column_name = 'w';
+ no_w 
+------
+    0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
 -- Roots capped at a byte: the oldest let go of, so a move to c1 has
 -- neither its own nor one before it, and writes its rows.
 \c :home
