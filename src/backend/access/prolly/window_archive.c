@@ -3959,6 +3959,25 @@ prolly_window_archived(const ProllyHash *id)
 	return PROLLY_CALL(c.history_window, archived, id);
 }
 
+static void
+note_fragment(const ProllyWindowFragment *f, void *arg)
+{
+	*(bool *) arg = true;
+}
+
+bool
+prolly_window_severed(void)
+{
+	ProllyDatabaseComponents c;
+	bool		any = false;
+
+	prolly_database_components(&c);
+	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, fragments))
+		return false;
+	PROLLY_CALL(c.history_window, fragments, note_fragment, &any);
+	return any;
+}
+
 void
 prolly_window_check_missing(const ProllyHash *id)
 {
