@@ -596,6 +596,13 @@ test_chunk_epochs(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+PG_FUNCTION_INFO_V1(test_chunk_verify_generations);
+Datum
+test_chunk_verify_generations(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(PROLLY_CALL(cs(), verify_generations, store()));
+}
+
 PG_FUNCTION_INFO_V1(test_chunk_table_files);
 Datum
 test_chunk_table_files(PG_FUNCTION_ARGS)

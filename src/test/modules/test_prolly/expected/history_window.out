@@ -1408,7 +1408,7 @@ FROM dolt_log('main') l ORDER BY l.commit_order;
 SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
 	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
 WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
-WARNING:  commit c0aee0999182f5622cec33089908ea360469b4b9 is dated 2099-01-01 00:00:00-08, after it arrived here
+WARNING:  a commit is dated 2099-01-01 00:00:00-08, after it arrived here
    kind   | message 
 ----------+---------
  boundary | now
@@ -1417,7 +1417,7 @@ WARNING:  commit c0aee0999182f5622cec33089908ea360469b4b9 is dated 2099-01-01 00
 (3 rows)
 
 SELECT fragment, commits FROM dolt_history_sever();
-WARNING:  commit c0aee0999182f5622cec33089908ea360469b4b9 is dated 2099-01-01 00:00:00-08, after it arrived here
+WARNING:  a commit is dated 2099-01-01 00:00:00-08, after it arrived here
  fragment | commits 
 ----------+---------
         1 |       2
