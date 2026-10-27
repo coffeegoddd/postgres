@@ -100,7 +100,7 @@ SELECT dolt_commit('-am', 'renamed') IS NOT NULL AS committed;
 SELECT same($$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5$$,
 			$$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hk.t) WHERE (row).id + 0 = 5$$) AS across_changes;
 SELECT (row).v2, (row).w FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5
-ORDER BY commit_date DESC, (row).v2 LIMIT 3;
+ORDER BY commit_date DESC, (row).v2 COLLATE "C" LIMIT 3;
 
 -- A primary key of two columns: its first, then a range on its second.
 CREATE TABLE hk.p (a int, b int, v text, PRIMARY KEY (a, b));
