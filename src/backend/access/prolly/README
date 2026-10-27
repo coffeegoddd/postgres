@@ -1201,21 +1201,57 @@ that one's.  A root is the store's, not the relation's or the branch's:
 any number of them are kept, each outlives the relation's storage (a
 restore, a drop) until the commit keeping it is let go of, which lets go
 of it as its transaction commits, and a move of any branch to the commit
-is given it (below).  A branch's list keeps the newest
-prolly.kept_commits (2 by default) of its kept commits; retention over
-the history window is to replace that cap, a commit whose root it let
-go of moved to as one no root was captured at.  A capture writes out
+is given it (below).  Which commits keep their roots is root
+retention's (below); a commit whose root it let go of is moved to as one
+no root was captured at.  A capture writes out
 only the relation's pages changed since its last capture (those its map
 walk finds), never visiting
 the buffers.  Redo of one writes the same pages, walking the root's own
 leaves as the record names them, and syncs nothing: those pages were
 logged as images (below).
 
+Root retention (the root_retention interface; "window" by default) keeps
+a root for every commit kept within the history window, the one window
+the history window settings define (prolly.history_window,
+prolly.history_min_commits, prolly.history_max_size and each branch's own,
+as the database has them), and none outside it: that history is cold,
+for a sever.  A commit is kept while any branch lineage's window holds
+it, so a branch's head another branch was reset or committed away from
+keeps its root; one no branch has any more (reset or amended away from)
+is in no window.  A branch with no window of its own keeps every root,
+as by default.  A tag keeps its commit's root while it names it, and a
+branch's newest root is never let go of.  prolly.history_root_max_size
+(unset by default), as the database has it, caps what the roots of every
+branch hold: past it, the oldest roots in the window are let go of first,
+so history is never lost, only moves to those commits cost the rows
+between them and the nearest root before.  It differs from
+prolly.history_max_size, which caps the chunk store, history included,
+and is met by severing history (cold), where the root cap only thins the
+roots of history kept (warm): what a root holds is its relations' pages
+changed since the root before it, as the capture or the freezing found
+them.
+
+Each kept commit is an entry of its own in the refs, keyed by the
+branch, its commit's height and its id (a retired one by a number), with
+a count of the entries naming each root and a summary of the branch's
+(what its roots hold, how many, the oldest's height, the last keep), so
+a keep reads the newest few and the retired, and writes what it changes.
+A retention pass runs as a transaction that kept a branch's commit
+commits (its head where the transaction leaves it), once the branch has
+kept half as many commits again as it keeps, or the roots hold more than
+the cap: it reads the windows once (their walk spread over those keeps),
+then the branch's live entries from the oldest, retiring each outside
+every window and passing over another lineage's and a tag's, until one in
+the branch's own window (past the cap, until the cap is met), then from
+the newest the same way for what a branch was reset away from.  So a
+pass reads the entries it retires and passes over, not every root.
+
 Roots are captured no more often than prolly.root_interval (by default
 every commit made by hand, and a second under dolt.transaction_commit,
 whose transactions each make a commit) and prolly.root_interval_commits
-allow; a transaction's own commit keeps its pages too when one is due and
-no other writer of the branch is at work.  The time a branch's root was
+allow; a transaction's own commit keeps its pages too when one is due,
+captured among the branch's other writers and frozen later (the lazy
+root freezer, below).  The time a branch's root was
 last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
 nothing of the kept commits.  The cost is WAL: after each capture the
@@ -1256,9 +1292,42 @@ epoch: a page's change sets every pointer above its leaf in the map's
 epoch (once a node for each epoch), so the walk passes over the subtrees
 set before, and a relation unchanged since its root reads no node.
 prolly.freeze_roots off keeps them as captured, sharing the relation's
-pages.  Under dolt.transaction_commit roots are kept as captured: freezing them
-in every transaction's commit would cost too much, and is to move to the
-background there.
+pages.
+
+Under dolt.transaction_commit every transaction commits, so another writer
+is nearly always at work: a keep that waited for none would almost never
+keep a root, and one that locked them out would stall them all.  There
+the root freezer is "lazy".  A commit's keep (once a root is due) locks
+the relations against VACUUM and definitions only
+(ShareUpdateExclusiveLock, tried), and captures each relation's root at a
+moment no writer is changing one of its pages: the capture's walk, its
+header held, has every cached page prepared again before it next
+changes, so a writer's next change waits for the header and then copies
+the page, and it gives up a walk on a page a writer holds
+(bmap_root_capture_concurrent()).  Indexes are captured before their
+tables, so every entry of an index's root names a row its table's root
+holds.  Such a root holds the versions of transactions the commit didn't
+see, so it is kept unfrozen (BRANCH_KEPT_UNFROZEN), the commit's
+snapshot recorded with it in the refs (xmin, xmax, the running
+transactions' and their subtransactions' ids, and the committing
+transaction's own; a snapshot whose subtransactions overflowed keeps no
+root), and it is never given back as captured.  The fold worker freezes
+each branch's oldest such commit every pass (the refs' freeze_kept()):
+each heap-format relation's root made a frozen root as of the snapshot,
+from the nearest frozen root of the relation before it (the pages changed
+since, and the pages that root's freezing left undecided: frozen as of a
+snapshot that didn't see a transaction that may yet commit, so a later
+snapshot may freeze them differently); the commit kept anew by the
+frozen roots, its unfrozen entry retired.  The database's frozen ids are
+held meanwhile, so the transactions the roots hold stay known; a commit
+past the horizon before it is frozen is retired, never given back.  A
+move to an unfrozen commit freezes it first (freeze_now()); another
+branch's is passed over for the nearest frozen root.  The fold launcher
+starts a worker in every database once as it starts, for the roots a
+crash or a restart left unfrozen.  A relation's pages unchanged since such
+a root still aren't the commit's (a writer the commit didn't see may have
+changed them before), so a restore always gives it new storage, with no
+visibility map (BRANCH_KEPT_CONCURRENT).
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
@@ -1500,7 +1569,7 @@ Each keep and each restore asks what is left of each kept commit's
 pages (branch
 operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
 relations asked of).  Only the commits still kept are asked, never more
-than prolly.kept_commits and the one a restore keeps again: a retired
+than the newest few and the one a restore keeps again: a retired
 commit is neither counted nor offered whatever is left of its pages, and
 the retired pile up within a transaction (each of its commits retires
 one) until it ends, so asking them too would make each commit of a
@@ -1517,7 +1586,7 @@ change log; an unfrozen root's rows' transaction ids are older than the
 database still knows), is retired, as above: it stays in the record,
 keeping its commit
 and baseline from collection, until a later keep lets go of its
-roots.  Neither counts toward prolly.kept_commits or is offered to a
+roots.  Neither is offered to a
 move or a first use.  A commit with a table whose relations are all still
 on the storage that kept them stays kept (restore_pages() may still pass
 the table over, renamed or with other relations since).  Roots that a
@@ -1797,7 +1866,21 @@ commits beyond the edges, down to an earlier fragment's, with its tops,
 the commits outside it its commits name (its stops), its identity (the
 root of a tree of its commits keyed by date then id, the same wherever the
 same commits are severed) and a digest over the sorted hashes of the
-chunks its commits reach.
+chunks born in it: what each of its commits makes that its first parent
+lacks (the canonicalizer's walk_changes() between the two roots, the
+tree's diff_nodes() between their dependencies, and the commit's own
+nodes), found by the commits alone, so a chunk resurrected or
+deduplicated counts where a commit has it and its parent doesn't.  What
+a boundary commit makes over the parent a sever cuts is kept beside the
+horizon ('D'), since that parent is gone once collected and the boundary
+commit may fall in a later fragment.  So the refs' side space grows by one
+boundary's delta (what one commit changed) for each sever, delete mode
+too, since any later repair wants it; a repair that brings the parent back
+lets it go of.  So a sever's fragment, its digest,
+what it sends to the archive and what a repair checks cost what its
+commits changed, not the database, but the first fragment's, whose
+oldest commit makes its whole tree.  Freeing what a sever cut is still a
+full collection's, which marks what is live: O(the database).
 
 What is kept: every commit a ref names (a branch's head, a tag's, a
 remote-tracking branch's, a stash's, a merge's or rebase's in progress, a
@@ -1817,6 +1900,96 @@ fragment reached is freed.  A default collection follows them (as its
 settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
+
+The window is the database's.  prolly.history_window (how long each
+branch's history is kept here), prolly.history_min_commits (how many of a
+branch's newest commits are kept however old), prolly.history_batch
+(a cut rounded down to whole hours or days, so fragments are whole ones),
+prolly.history_max_size, prolly.history_window_action (archive, delete or
+none) and prolly.history_archive (a remote's URL, not a name) are read as the
+database has them (ALTER DATABASE ... SET: its owner's or a
+superuser's), never as a session has them, so no session severs more or
+sends history elsewhere by a SET of its own.  A branch's lineage may keep
+its own window, min_commits or batch (dolt_history_window(), the
+owner's, kept in the refs' settings); prolly_history_policy() shows what
+a branch keeps.  With no window, everything is kept.  There is one
+window: the page roots a branch keeps for constant-time moves are kept
+inside it, and ask it (the history window's window() and in_window(),
+prolly_history_in_window() in SQL) what is in it, by the clock a sever
+ages commits by, so the two never disagree.  What a
+branch's history keeps is the branch's window's: another ref's commit on
+it (a commit the branch's pages are kept as of, a reader's pin, a
+remote-tracking branch) has no window of its own, though a collection
+keeps what the ref names until the ref lets go of it, and no path to it
+is kept as for a merge (it is its own merge base).  A tag keeps its own
+commit and the database's min_commits; a ref's commit on no branch's
+history keeps itself, and the paths to its merge bases with the
+branches.
+
+dolt_history_sever() severs what is past the window, as the action says.
+It plans, and archives, holding no ref and not the horizon's lock (only
+a lock severs and repairs take turns by); the refs moved meanwhile, it
+plans and archives again, a few times, still holding none.  Then it holds
+the horizon and the refs only to check the plan (planned again if the
+refs moved since, which must give the fragment archived) and record it.
+Archived, the fragment's tops are sent to the archive (the transfer
+sends what it lacks; a walk past the horizon goes on where the remote has
+what is severed already, so fragments archive beside one another), the
+tops are made heads of the archive's, named by the database (the
+cluster's system identifier and its OID) and the fragment's identity, so
+the same fragment is named the same however often it is archived, then
+every chunk the fragment made is read back from the archive and re-hashed
+(an archive that says it has one it doesn't is found out), and only then
+is the horizon moved, the fragment's location the archive's URL; with no
+archive, nothing is severed and a warning says so.  The archive is opened
+as the role severing (the owner), so its checks are the owner's, and the
+archive's own permissions to push protect its history/... heads after:
+whoever may move heads there may let the history archived go.  A replan
+that changed the fragment leaves the earlier one's heads in the archive,
+pinning its chunks there; harmless, but they add up.  The archive is given
+prolly.history_archive_timeout (ten minutes where unset) to take the
+history and give it back; past it the sever is given up, nothing
+severed.  Deleted, the horizon records the fragment and nothing is sent.
+
+Autovacuum's visit of a database severs its window in the background
+(the history window's maintain(), as the database's settings say), as
+the database's owner (with SECURITY_RESTRICTED_OPERATION), so an
+archive's checks are the owner's, as at dolt_history_sever(): a file
+archive needs the owner's pg_write_server_files.  It plans only once some
+lineage's cut has moved past the last one tried: each branch's, by its
+own window over the database's, rounded down to its own batch (an
+hour if none is set), and the database's, for the other refs (the refs'
+settings history_window.last_cut and history_window.last_cut:<branch>).
+So a branch's own window is severed in the background with none for the
+database, and a window is walked at most once a batch.  A try that fails
+(an archive refused or unreachable, a cancel) is reported as a warning
+and tried again after a wait, a minute doubling with each failure in a
+row to a day (history_window.retry_at), not at every visit.
+
+What a sever cut is freed by a full collection, which the visit runs
+once fragments were made since the last, and that ended at least
+prolly.history_collect_interval ago (an hour if unset): fragments made
+meanwhile share one, and full collections never run back to back.
+Past prolly.history_max_size, as measured by the store's files (as the
+manifest has them) at the end of the background's last full collection,
+a visit cuts a batch past the oldest history kept, each branch still
+keeping its newest prolly.history_min_commits; then no more for size
+until a full collection has run and measured again, so a store whose
+freeing lags (unlinks deferred by a base backup, chunks held by a
+snapshot) isn't cut a batch a visit.  In delete mode two measurements in
+a row must say the store is over.  Nothing severed, the size cut isn't
+moved, and it isn't tried again before the next interval.  The store's
+files over the limit but the last measurement under asks for a full
+collection to measure again.  Where the size limit's dates cut nothing (a
+commit dated old above history dated new), it cuts by height instead: a
+sixteenth of the heights kept, at least one, above the lowest.  The
+background writes nothing in the refs before its sever is done (a refs
+write holds the branch's lock to the transaction's end, and commits would
+wait on the worker through the archive's transfer), and only tries the
+severs' turn, never waiting for it.  A failure that passes by itself (the
+history moved, a lock waiter's cancel) is tried again at the next visit,
+at most five times in a row, then waited out as any other.  The size limit is a background one:
+dolt_history_sever() cuts by the time and count windows alone.
 
 dolt_history_repair(source, fragments) reattaches fragments, newest
 first (all, or the newest few), from a remote or clone that has their

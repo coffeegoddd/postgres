@@ -55,8 +55,8 @@ SELECT counted() AS before \gset
 SELECT dolt_reset('--hard', :'target') IS NOT NULL AS reset;
 :flush
 SELECT since(:'before') AS moved \gset
--- the head's pages given back, the head's 50 rows from the commit
--- written, and none of the working set's 10,000 folded or written
+-- the commit's own pages given back (its root kept), and none of the
+-- working set's 10,000 folded or written
 SELECT (:'moved'::jsonb ->> 'relations_restored')::int > 0 AS restored,
 	   (:'moved'::jsonb ->> 'apply_rows')::int AS applied,
 	   (:'moved'::jsonb ->> 'fold_rows_read')::int < 100 AS few_rows_folded,
@@ -108,7 +108,7 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 -- subtransaction's commits retired isn't let go of while the retiring may
 -- yet roll back, so after the rollback it is still kept, the head a reset
 -- gives back.
-SET prolly.kept_commits = 1;
+ALTER DATABASE dirty_discard SET prolly.history_min_commits = 1;
 BEGIN;
 UPDATE dd.t SET v = 31 WHERE id % 400 = 0;
 SELECT dolt_commit('-am', 'c1') IS NOT NULL AS c1;
@@ -119,7 +119,7 @@ UPDATE dd.t SET v = 33 WHERE id % 400 = 0;
 SELECT dolt_commit('-am', 'c3') IS NOT NULL AS c3;
 ROLLBACK TO s;
 COMMIT;
-RESET prolly.kept_commits;
+ALTER DATABASE dirty_discard RESET prolly.history_min_commits;
 SELECT t_digest() AS at_head \gset
 UPDATE dd.t SET v = -4 WHERE id % 3 = 0;
 :flush

@@ -25,9 +25,6 @@ shared_buffers = "256MB"
 autovacuum = "off"
 # (no fold worker: what it folds, and when, would differ between phases)
 prolly_fold_worker = "off"
-# (main's last four commits kept: the commits the queries check out and
-# reset to among them)
-"prolly.kept_commits" = 4
 checkpoint_timeout = "1d"
 max_wal_size = "16GB"
 max_connections = 32

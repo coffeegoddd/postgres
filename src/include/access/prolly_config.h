@@ -24,6 +24,7 @@
 #include "access/prolly_commitcache.h"
 #include "access/prolly_window.h"
 #include "access/prolly_rootfreeze.h"
+#include "access/prolly_rootretain.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_jsontree.h"
 #include "access/prolly_keyenc.h"
@@ -69,6 +70,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyCommitCacheRoutine *commit_cache;
 	const ProllyWindowRoutine *history_window;
 	const ProllyRootFreezerRoutine *root_freezer;
+	const ProllyRootRetentionRoutine *root_retention;
 } ProllyDatabaseComponents;
 
 /* Components for rel: a prolly table, or an index on one (an error otherwise). */

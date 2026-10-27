@@ -450,7 +450,7 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V8 --config sr
 read needs.  A history that shares storage every way it can (a keyed
 table with a secondary and a composite index, values out of line, long
 jsonb documents (JSON trees, edited by `prolly_jsonb_set` across commits
-and branches), a keyless table; kept commits, `prolly.kept_commits` 4, and a kept detached
+and branches), a keyless table; kept commits (their page roots), and a kept detached
 checkout; a branch used and deleted whose commit a snapshot mount still
 reads, and another nothing reads; a table dropped, and one dropped and
 made again; a merge; a snapshot mount of the first commit and a history

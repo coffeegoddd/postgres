@@ -277,6 +277,7 @@ prolly_session_init(const char *branch)
 		branch_storage_hook = branch_replaced_storage;
 		prolly_refs_end_hook = transaction_commit_at_end;
 		prolly_writers_init();
+		prolly_window_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
 		writer_branch_hooks();
 		DefineCustomBoolVariable("prolly.fold_on_commit",

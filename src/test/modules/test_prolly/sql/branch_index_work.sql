@@ -65,7 +65,7 @@ SELECT (dolt_checkout('bix_new_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use kept');
 SELECT (dolt_checkout('main'))[1];
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
 :flush
 SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
@@ -81,7 +81,7 @@ SELECT (dolt_checkout('bix_old_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use estimated');
 SELECT (dolt_checkout('main'))[1];
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
 SELECT (dolt_checkout('bix_ff_' || :n))[1];
 UPDATE bix.t SET v = v + 1 WHERE id = 4;
@@ -105,7 +105,7 @@ SELECT (dolt_checkout('bix_new_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use kept');
 SELECT (dolt_checkout('main'))[1];
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT dolt_branch('bix_near_' || :n) IS NOT NULL AS made;
 :flush
 SELECT pg_temp.since('branches_listed') IS NOT NULL AS counting;
@@ -121,7 +121,7 @@ SELECT (dolt_checkout('bix_old_' || :n))[1];
 :flush
 SELECT pg_temp.record(:n, 'first use estimated');
 SELECT (dolt_checkout('main'))[1];
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 SELECT dolt_branch('bix_ff_' || :n) IS NOT NULL AS made;
 SELECT (dolt_checkout('bix_ff_' || :n))[1];
 UPDATE bix.t SET v = v + 1 WHERE id = 4;
@@ -255,11 +255,10 @@ SELECT dolt_branch('-D', 'bix_kc') IS NOT NULL AS deleted;
 SELECT count(*) AS left_of_deleted FROM pg_temp.ix() WHERE branch = 'bix_kc';
 SELECT * FROM pg_temp.check_ix();
 
--- Many commits in one transaction: the kept commits each retires pile up
--- in the branch's 'K' entry until a later transaction lets go of them,
--- but only the live ones are indexed, so each commit's upkeep of the
--- index is a few entries however many came before it, and the refs nodes
--- a commit writes stay flat.
+-- Many commits in one transaction, each keeping its root: each kept
+-- commit is an entry of its own, indexed while live, so each commit's
+-- upkeep of the entries and the index is a few however many came before
+-- it, and the refs nodes a commit writes stay flat.
 CREATE FUNCTION pg_temp.commits(n int) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
 	FOR i IN 1 .. n LOOP
@@ -271,11 +270,13 @@ SELECT pg_temp.since('refs_nodes_written') IS NOT NULL AS counting;
 SELECT pg_temp.commits(100);
 :flush
 SELECT pg_temp.since('refs_nodes_written') / 100.0 AS per_commit_100 \gset
-SELECT count(*) AS main_kept_indexed FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
+SELECT count(*) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
+FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
 SELECT pg_temp.commits(400);
 :flush
 SELECT pg_temp.since('refs_nodes_written') / 400.0 AS per_commit_400 \gset
-SELECT count(*) AS main_kept_indexed FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
+SELECT count(*) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
+FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
 SELECT :per_commit_400 <= 1.5 * :per_commit_100 AS written_flat;
 SELECT * FROM pg_temp.check_ix();
 

@@ -35,6 +35,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
 #include "access/prolly_chunkstore.h"
+#include "utils/timestamp.h"
 #include "access/prolly_commitcache.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
@@ -544,6 +545,57 @@ file_row(const char *name, int nchunks, uint64 size, bool settled, void *arg)
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
+static void
+generation_row(const ProllyChunkGeneration *g, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[7];
+	bool		nulls[7] = {0};
+
+	values[0] = CStringGetTextDatum(g->name);
+	values[1] = Int32GetDatum((int32) g->nchunks);
+	values[2] = BoolGetDatum(g->settled);
+	values[3] = Int64GetDatum((int64) g->epoch_lo);
+	values[4] = Int64GetDatum((int64) g->epoch_hi);
+	values[5] = Int64GetDatum((int64) g->garbage);
+	values[6] = Int64GetDatum(g->xrefs);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_generations);
+Datum
+test_chunk_generations(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(cs(), generations, store(), generation_row, rsinfo);
+	return (Datum) 0;
+}
+
+static void
+epoch_row(uint32 epoch, TimestampTz ended, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = Int64GetDatum((int64) epoch);
+	values[1] = TimestampTzGetDatum(ended);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_epochs);
+Datum
+test_chunk_epochs(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(cs(), epochs, store(), epoch_row, rsinfo);
+	return (Datum) 0;
+}
+
 PG_FUNCTION_INFO_V1(test_chunk_table_files);
 Datum
 test_chunk_table_files(PG_FUNCTION_ARGS)
@@ -844,6 +896,35 @@ test_kept_commits(PG_FUNCTION_ARGS)
 		PROLLY_CALL(dc.refs, kept_commits, text_to_cstring(PG_GETARG_TEXT_PP(0)),
 					kept_commit_row, rsinfo);
 	return (Datum) 0;
+}
+
+/*
+ * Freeze every kept commit of the session's branch whose roots were
+ * captured among writers, as the fold worker does: how many were.
+ */
+PG_FUNCTION_INFO_V1(test_freeze_kept);
+Datum
+test_freeze_kept(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	int64		n = 0;
+
+	prolly_database_components(&dc);
+	while (PROLLY_CALL(dc.refs, freeze_kept) > 0)
+		n++;
+	PG_RETURN_INT64(n);
+}
+
+/* A retention pass of branch name's kept commits, now. */
+PG_FUNCTION_INFO_V1(test_retain_roots);
+Datum
+test_retain_roots(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, retain_roots, text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	PG_RETURN_VOID();
 }
 
 static void

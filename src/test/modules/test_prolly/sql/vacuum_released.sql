@@ -11,7 +11,7 @@ RESET client_min_messages;
 SELECT current_database() AS home \gset
 CREATE DATABASE vacuum_released;
 -- (pages shared with a branch alone: pages kept as of each commit are shared too, which VACUUM leaves as they are)
-ALTER DATABASE vacuum_released SET prolly.kept_commits = 0;
+ALTER DATABASE vacuum_released SET debug_prolly_page_roots = off;
 \c vacuum_released
 CREATE EXTENSION test_prolly;
 CREATE SCHEMA vr VERSIONED;
