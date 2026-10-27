@@ -4165,10 +4165,94 @@ kept_index_keys(const char *name, const KeptCommit *kc)
 }
 
 /*
+ * A set of refs keys, by their bytes' hash (each bucket the keys of that
+ * hash, compared whole), each with a pointer: a seek, however many.
+ */
+typedef struct KeySetBucket
+{
+	uint32		hash;
+	List	   *items;			/* KeySetItem * */
+} KeySetBucket;
+
+typedef struct KeySetItem
+{
+	StringInfoData key;
+	void	   *value;
+} KeySetItem;
+
+typedef struct KeySet
+{
+	HTAB	   *buckets;
+	MemoryContext cxt;
+} KeySet;
+
+static KeySet *
+keyset_create(const char *what, MemoryContext cxt)
+{
+	HASHCTL		ctl;
+	KeySet	   *set = MemoryContextAlloc(cxt, sizeof(KeySet));
+
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(KeySetBucket);
+	ctl.hcxt = cxt;
+	set->buckets = hash_create(what, 64, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	set->cxt = cxt;
+	return set;
+}
+
+/* The item of key (len bytes) in set; with add, made if none (value NULL). */
+static KeySetItem *
+keyset_find(KeySet *set, const char *key, int len, bool add)
+{
+	uint32		h = hash_bytes((const unsigned char *) key, len);
+	bool		found;
+	KeySetBucket *b = hash_search(set->buckets, &h,
+								  add ? HASH_ENTER : HASH_FIND, &found);
+	KeySetItem *it;
+	MemoryContext old;
+
+	if (b == NULL)
+		return NULL;
+	if (!found)
+		b->items = NIL;
+	foreach_ptr(KeySetItem, i, b->items)
+		if (i->key.len == len && memcmp(i->key.data, key, len) == 0)
+			return i;
+	if (!add)
+		return NULL;
+	old = MemoryContextSwitchTo(set->cxt);
+	it = palloc0(sizeof(KeySetItem));
+	initStringInfo(&it->key);
+	appendBinaryStringInfo(&it->key, key, len);
+	b->items = lappend(b->items, it);
+	MemoryContextSwitchTo(old);
+	return it;
+}
+
+static void
+keyset_remove(KeySet *set, const char *key, int len)
+{
+	uint32		h = hash_bytes((const unsigned char *) key, len);
+	KeySetBucket *b = hash_search(set->buckets, &h, HASH_FIND, NULL);
+
+	if (b == NULL)
+		return;
+	foreach_ptr(KeySetItem, i, b->items)
+		if (i->key.len == len && memcmp(i->key.data, key, len) == 0)
+		{
+			b->items = foreach_delete_current(b->items, i);
+			return;
+		}
+}
+
+/*
  * The entries read since the last kept_put() of each branch (in
- * kept_read_cxt), forgotten as the transaction ends.
+ * kept_read_cxt, their keys in kept_loaded_keys), forgotten as the
+ * transaction ends.
  */
 static List *kept_loaded = NIL;
+static KeySet *kept_loaded_keys = NULL;
 
 static void
 kept_note_loaded(const char *name, const ProllyKey *k, const ProllyValue *v)
@@ -4176,13 +4260,18 @@ kept_note_loaded(const char *name, const ProllyKey *k, const ProllyValue *v)
 	MemoryContext old;
 	KeptLoaded *l;
 
-	foreach_ptr(KeptLoaded, o, kept_loaded)
-		if (o->key.len == k->len && memcmp(o->key.data, k->data, k->len) == 0)
-			return;
 	if (kept_read_cxt == NULL)
 		kept_read_cxt = AllocSetContextCreate(TopMemoryContext,
 											  "prolly kept entries read",
 											  ALLOCSET_SMALL_SIZES);
+	if (kept_loaded_keys == NULL)
+		kept_loaded_keys = keyset_create("prolly kept entries read",
+										 kept_read_cxt);
+	if (keyset_find(kept_loaded_keys, (const char *) k->data, k->len,
+					true)->value != NULL)
+		return;
+	keyset_find(kept_loaded_keys, (const char *) k->data, k->len,
+				false)->value = (void *) 1;
 	old = MemoryContextSwitchTo(kept_read_cxt);
 	l = palloc(sizeof(KeptLoaded));
 	l->name = pstrdup(name);
@@ -4198,6 +4287,7 @@ static void
 kept_forget_loaded(void)
 {
 	kept_loaded = NIL;
+	kept_loaded_keys = NULL;
 	if (kept_read_cxt != NULL)
 		MemoryContextReset(kept_read_cxt);
 }
@@ -4217,8 +4307,12 @@ kept_forget_name(const char *name)
 		return;
 	old = MemoryContextSwitchTo(kept_read_cxt);
 	foreach_ptr(KeptLoaded, l, kept_loaded)
+	{
 		if (strcmp(l->name, name) != 0)
 			keep = lappend(keep, l);
+		else
+			keyset_remove(kept_loaded_keys, l->key.data, l->key.len);
+	}
 	list_free(kept_loaded);
 	kept_loaded = keep;
 	MemoryContextSwitchTo(old);
@@ -4343,24 +4437,24 @@ typedef struct KeptCount
 } KeptCount;
 
 static void
-kept_count_add(List **counts, const char *name, const KeptCommit *kc, int delta)
+kept_count_add(List **counts, KeySet *seen, const char *name,
+			   const KeptCommit *kc, int delta)
 {
 	for (int t = 0; t < kc->ntables; t++)
 		for (int r = 0; r < kc->tables[t].nrels; r++)
 		{
-			KeptCount  *c = NULL;
+			KeySetItem *it;
+			KeptCount  *c;
 			StringInfoData key;
 
 			initStringInfo(&key);
 			kept_holds_key(&key, name, &kc->tables[t].rels[r]);
-			foreach_ptr(KeptCount, o, *counts)
-				if (o->key.len == key.len &&
-					memcmp(o->key.data, key.data, key.len) == 0)
-					c = o;
-			if (c == NULL)
+			it = keyset_find(seen, key.data, key.len, true);
+			if ((c = it->value) == NULL)
 			{
 				c = palloc0(sizeof(KeptCount));
 				c->key = key;
+				it->value = c;
 				*counts = lappend(*counts, c);
 			}
 			else
@@ -4413,6 +4507,8 @@ kept_put(const char *name, List *kept, KeptSummary *given)
 	ListCell   *a;
 	ListCell   *b;
 	bool		live_changed = false;
+	KeySet	   *seen = keyset_create("prolly kept roots counted",
+									 CurrentMemoryContext);
 
 	if (given)
 		s = *given;
@@ -4492,7 +4588,7 @@ kept_put(const char *name, List *kept, KeptSummary *given)
 
 		foreach_ptr(StringInfoData, k, kept_index_keys(name, o))
 			index_put(k, false);
-		kept_count_add(&counts, name, o, -1);
+		kept_count_add(&counts, seen, name, o, -1);
 		if (!FullTransactionIdIsValid(o->retired))
 		{
 			s.bytes -= o->pages * BLCKSZ;
@@ -4505,7 +4601,7 @@ kept_put(const char *name, List *kept, KeptSummary *given)
 	{
 		foreach_ptr(StringInfoData, k, kept_index_keys(name, y->kc))
 			index_put(k, true);
-		kept_count_add(&counts, name, y->kc, 1);
+		kept_count_add(&counts, seen, name, y->kc, 1);
 		if (!FullTransactionIdIsValid(y->kc->retired))
 		{
 			s.bytes += y->kc->pages * BLCKSZ;
