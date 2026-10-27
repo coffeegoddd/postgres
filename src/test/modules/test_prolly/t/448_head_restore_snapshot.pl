@@ -267,5 +267,22 @@ SKIP:
 	$rr->quit;
 }
 
+# Two hard resets of a dirty working set, one after the other, no
+# snapshot older than either: each one's replaced storage is let go of by
+# the keeps after, not one of them left behind (an entry of replaced
+# storage is told from another by its file number, all having the same
+# id).
+sql(q{SELECT dolt_reset('--hard')});
+my $first = sql(q{SELECT pg_relation_filenode('q.t')});
+sql(q{UPDATE q.t SET v = 7; SELECT dolt_reset('--hard')});
+my $second = sql(q{SELECT pg_relation_filenode('q.t')});
+sql(q{UPDATE q.t SET v = 8; SELECT dolt_reset('--hard')});
+sql(q{UPDATE q.t SET v = 1 WHERE id = 4; SELECT dolt_commit('-am', 'g')});
+sql(q{UPDATE q.t SET v = 1 WHERE id = 5; SELECT dolt_commit('-am', 'h')});
+is(sql(qq{SELECT test_bmap_exists($first)}), 'f',
+	'the first reset\'s replaced storage is dropped');
+is(sql(qq{SELECT test_bmap_exists($second)}), 'f',
+	'and the second\'s');
+
 $node->stop;
 done_testing();

@@ -8,17 +8,23 @@
 # then the change that met it removes the entry, and the check is enforced
 # from then on.  An entry naming nothing the run checked fails too.
 
-# A merge keeps its commit's pages (prolly.kept_commits): the snapshot's
-# map work (the paths copied, their subtrees' holders) grows with the
-# table today, as does the merge's own first writes into pages shared with
-# the branch merged.
+# A merge's commit captures a page-tree root of each relation it changed,
+# so its first writes after that, and its writes into pages shared with the
+# branch merged, copy the map paths above them.  A copy of a shared map
+# node holds each of its children: about min(changed rows, leaves) x
+# fanout holder updates, plus one level-1 node's children.  The rows
+# sweep has fewer leaves than changed rows for its first sizes, so it
+# reads as linear, then flat.  Meeting log needs copies that don't count
+# each child (children inheriting a copied node's holders until first
+# written), a change to the counts' invariant that #870 left as a design
+# issue of its own; #870 is closed with these recorded here.
 [[known]]
 check = "merge"
 sweep = "rows"
 counter = "bmap_refcount_updates"
 current = "linear"
 issue = "#870"
-reason = "a merge's kept snapshot and its copies of shared paths update holders in proportion to the table"
+reason = "a merge's copies of shared map paths hold each child: about min(changed rows, leaves) x fanout, linear while the table has fewer leaves than changed rows"
 
 [[known]]
 check = "merge"
@@ -26,18 +32,10 @@ sweep = "rows"
 counter = "bmap_map_pages_copied"
 current = "linear"
 issue = "#870"
-reason = "map pages a merge copies grow with the table"
-
-[[known]]
-check = "ff_merge"
-sweep = "rows"
-counter = "bmap_refcount_updates"
-current = "linear"
-issue = "#870"
-reason = "as merge's"
+reason = "map pages a merge copies after its root capture follow min(changed rows, leaves), linear while the table has fewer leaves than changed rows"
 
 # The count pages a merge reads: a page for the children of each map page
-# its snapshot walks, and one for each page its copies look up.  Those
+# its capture walks, and one for each page its copies look up.  Those
 # follow the map pages it copies (the entry above): the Δ changed rows
 # land in more leaves as the table grows, until there are more leaves than
 # changes (from 64k rows, where the series is log).

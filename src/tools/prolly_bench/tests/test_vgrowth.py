@@ -60,6 +60,74 @@ class GateTest(unittest.TestCase):
         self.assertEqual(f.result, "flat")
         self.assertFalse(f.fails)
 
+    def periodic(self, phase, base=lambda i: 30000.0, spike=lambda i: 6e6,
+                 period=470):
+        # a root captured every period transactions: that one costs spike,
+        # the rest base
+        return [spike(i) if (i + phase) % period == 0 else base(i)
+                for i in range(K)]
+
+    def test_periodic_flat_passes(self):
+        # where the periodic work falls doesn't count, at any phase
+        for phase in range(0, 470, 29):
+            f = self.judge(self.periodic(phase), counter="wal_bytes")
+            self.assertEqual(f.result, "flat", phase)
+            self.assertLess(f.ratio, 1.1)
+
+    def test_periodic_tenths_were_noise(self):
+        # (the tenths' means of the same series differ by the events they
+        # happen to hold: at some phase, past the bound)
+        k = K // 10
+        worst = 0.0
+        for phase in range(470):
+            series = self.periodic(phase)
+            worst = max(worst, (sum(series[-k:]) / k) / (sum(series[:k]) / k))
+        self.assertGreater(worst, vgrowth.DEFAULT_BOUND)
+
+    def test_periodic_growth_fails(self):
+        # the periodic work growing with the commits before it
+        f = self.judge(self.periodic(13, spike=lambda i: 6e6 * (1 + i / 200)),
+                       counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+        # and the work between it
+        f = self.judge(self.periodic(13, base=lambda i: 30000.0 * (1 + i / 400)),
+                       counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+
+    def test_late_step_fails(self):
+        # flat, then 20 times as much for the last fifth: a fifth of the
+        # series is no periodic event
+        f = self.judge([30000.0] * 1600 + [600000.0] * 400, counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+
+    def test_ramp_before_events_fails(self):
+        # the work between events growing fivefold, before the first event
+        s = [30000.0 * (1 + 4 * min(i, 1000) / 1000) for i in range(K)]
+        for i in range(900, K, 470):
+            s[i] = 6e6
+        f = self.judge(s, counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+        self.assertGreater(f.ratio, 3)  # (as its tenths without the events)
+
+    def test_linear_growth_with_events_fails(self):
+        # the work between events growing ninefold, events throughout
+        s = [30000.0 * (1 + 8 * i / K) for i in range(K)]
+        for i in range(13, K, 470):
+            s[i] = 6e6
+        f = self.judge(s, counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+        self.assertGreater(f.ratio, 6)  # (as its tenths without the events)
+
+    def test_events_more_often_fails(self):
+        # events of the same size, coming twice as often by the end
+        s = [30000.0] * K
+        i = 13
+        while i < K:
+            s[i] = 6e6
+            i += 300 if i < K // 2 else 120
+        f = self.judge(s, counter="wal_bytes")
+        self.assertEqual(f.result, "grows")
+
     def test_floor(self):
         # 0 at first and 1 later is more than the bound, but not work
         f = self.judge([0.0] * (K // 2) + [1.0] * (K // 2))

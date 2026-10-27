@@ -270,7 +270,15 @@ adapts.
   working set (locks per branch, #91): a second writer to a row waits
   for the first, then proceeds (read committed) or fails with `40001`
   (repeatable read, serializable). The writer modes ([historical design 11](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/11-pages-and-dolt-snapshots.md), 6.2) can
-  make one writer per working set.
+  make one writer per working set. A hard reset, or another move to a
+  commit whose page-tree roots are kept, gives each table it restores
+  new storage made of the commit's root, as `TRUNCATE` gives a table new
+  storage, but MVCC-safely: a transaction whose snapshot can't move
+  (repeatable read, serializable) and doesn't see the move goes on
+  reading the old storage, and its writes to the table fail with
+  `40001`. A hot standby's query older than the move reads the restored
+  pages, as after a `TRUNCATE`. In Dolt the other session's transaction
+  keeps its own working root and merges at `COMMIT`.
 - **Why:** Postgres's concurrency semantics are what this fork keeps.
 - **Port:** multi-session cases are rederived under Postgres semantics
   (#165): blocking and serialization as isolation specs, sequential

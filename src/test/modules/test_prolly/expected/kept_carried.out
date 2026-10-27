@@ -192,19 +192,12 @@ SELECT * FROM trips ORDER BY n;
  6 | t        |       0 | t         | t
 (6 rows)
 
--- each relation keeps a snapshot for each commit kept, no more
-SELECT count(*) AS t_snapshots
-FROM test_bmap_snapshots(pg_relation_filenode('kc.t'));
- t_snapshots 
--------------
-           2
-(1 row)
-
-SELECT count(*) AS t_v_snapshots
-FROM test_bmap_snapshots(pg_relation_filenode('kc.t_v'));
- t_v_snapshots 
----------------
-             2
+-- the store holds roots for the commits kept, no more: the restores made
+-- new storage of them and captured nothing
+SELECT held AS roots_held FROM test_bmap_roots();
+ roots_held 
+------------
+         12
 (1 row)
 
 SELECT count(*) AS kept FROM test_kept_commits('main');

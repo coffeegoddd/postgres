@@ -126,7 +126,9 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 /*
  * Snapshots of a tree map: a relation's pages as they were, kept by its root
  * page, each a reference to the subtrees it had then, taken and let go of in
- * O(1) of the relation's size; a new relation can be made of one.  The
+ * O(1) of the relation's size; a new relation can be made of one.  At most
+ * BMAP_SNAPSHOTS_MAX of them, gone with the relation's storage: a commit's
+ * pages are kept by captured roots instead (below).  The
  * caller of bmap_snapshot_take() keeps the relation from changing, as for a
  * share.  A snapshot is kept only once the (sub)transaction taking it
  * commits: one whose taker aborted, or was ended by a crash, is listed by
@@ -151,7 +153,50 @@ extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
 extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
 								  SMgrRelation dst);
 
+/*
+ * Captured roots: a relation's tree as it was at a moment, kept by its
+ * page store (not by the relation), so any number of them, each outliving
+ * the relation's storage until it is let go of, and any relation of the
+ * store may be made of it, another branch's included.  Capturing one is a
+ * snapshot's work (O(1) in the relation's size, but for the pages changed
+ * since its last capture or snapshot, logged as images and written out),
+ * and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
+ * root (bmap_root_capture_logged()) is captured of temporary storage
+ * holding frozen copies of a relation's pages changed since its last root,
+ * the rest shared with that root, and records the relation and its epoch
+ * then, so the next one's changed pages are found by their epochs
+ * (bmap_root_base(), bmap_changed_pages()).  bmap_root_copy() holds a root
+ * again by a root of its own, the same subtrees, in O(1).  A root
+ * is held once its capturing (sub)transaction commits, and let go of once
+ * the (sub)transaction that lets go of it commits: one whose capturer
+ * aborted, or was ended by a crash, holds nothing, and neither does one
+ * whose releaser committed; the page store's next captures or sweep reuse
+ * their slots.  A root is named by an id (0: none) unique in its store.
+ */
+typedef uint64 BmapRootId;
+
+extern BmapRootId bmap_root_capture(SMgrRelation reln);
+extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids);
+extern BmapRootId bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of,
+										   uint32 live_epoch);
+extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
+								 RelFileLocator holder);
+extern bool bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since);
+extern BmapRootId bmap_made_of(SMgrRelation reln);
+extern uint32 bmap_changed_pages(SMgrRelation reln, uint32 since,
+								 BlockNumber **blknos, BlockNumber *nblocks);
+extern uint32 bmap_raise_epoch(SMgrRelation reln);
+extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
+extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
+						   BlockNumber *nblocks);
+extern bool bmap_root_unchanged(SMgrRelation reln, BmapRootId id);
+extern void bmap_share_root(BmapRootId id, SMgrRelation dst,
+							SMgrRelation replacing, SMgrRelation sharer);
+extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
+
 /* inspection, for tests */
+extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
+							   uint64 *slots, uint64 *naming);
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
@@ -266,7 +311,8 @@ typedef struct BmapSizes
 	uint64		mapped_blocks;	/* held by a map under its length */
 	uint64		listed_blocks;	/* held otherwise, not mapped */
 	uint64		map_bytes;		/* the maps' and changes lists' files */
-	uint64		alloc_bytes;	/* the allocator's and the counts' files */
+	uint64		alloc_bytes;	/* the allocator's, the counts', the release
+								 * queue's and the captured roots' files */
 	uint64		vm_bytes;		/* the relations' other forks (md.c) */
 	uint64		fsm_bytes;
 } BmapSizes;
