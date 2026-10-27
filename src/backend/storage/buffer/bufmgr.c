@@ -845,6 +845,33 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 }
 
 /*
+ * LookupSharedBuffer -- the buffer a block was in, or InvalidBuffer
+ *
+ * As PrefetchSharedBuffer() finds it, but a block not in shared buffers
+ * starts no read: nothing opens the relation's file.  For a caller that
+ * only uses a block if it is cached, whose relation may have been dropped
+ * meanwhile.  The buffer isn't pinned; ReadRecentBuffer() checks it.
+ */
+Buffer
+LookupSharedBuffer(RelFileLocator rlocator, ForkNumber forkNum,
+				   BlockNumber blockNum)
+{
+	BufferTag	tag;
+	uint32		hash;
+	LWLock	   *partitionLock;
+	int			buf_id;
+
+	Assert(BlockNumberIsValid(blockNum));
+	InitBufferTag(&tag, &rlocator, forkNum, blockNum);
+	hash = BufTableHashCode(&tag);
+	partitionLock = BufMappingPartitionLock(hash);
+	LWLockAcquire(partitionLock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hash);
+	LWLockRelease(partitionLock);
+	return buf_id < 0 ? InvalidBuffer : buf_id + 1;
+}
+
+/*
  * PrefetchBuffer -- initiate asynchronous read of a block of a relation
  *
  * This is named by analogy to ReadBuffer but doesn't actually allocate a
