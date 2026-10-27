@@ -282,82 +282,12 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 }
 
 /*
- * RelationCreateStorageFromSnapshot
- *		Create a permanent relation's storage as a copy of a snapshot that
- *		another's block-mapped storage keeps (bmap_snapshot_take()).
- *
- * Only the snapshot tests use it now: moves give a relation the pages of a
- * root (RelationCreateStorageFromRoot()), not of a snapshot.
- *
- * The new main fork shares the snapshot's pages until it changes one
- * (bmap_share_snapshot()), O(1) in the relation's size.  It gets no free
- * space map or visibility map, unless with_maps: src's describe its pages
- * as they are now, not as the snapshot has them, so the new relation
- * claims no page all-visible and knows of no free space until vacuumed.
- * With with_maps (the caller knows src's pages are the snapshot's still,
- * and VACUUM kept from setting a bit meanwhile), they are copies of src's,
- * as RelationCreateStorageShared() makes them.  With replacing, the copy
- * is to take src's place, src dropped as the transaction commits, so it
- * shares the pages with no other relation for that.  As
- * RelationCreateStorage(), the storage is deleted if the transaction
- * aborts when register_delete.
- */
-SMgrRelation
-RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
-								  uint64 snapshot, bool with_maps,
-								  bool replacing, bool register_delete)
-{
-	SMgrRelation srel;
-
-	Assert(!IsInParallelMode());
-
-	/* (registered first, as for a share) */
-	if (register_delete)
-	{
-		PendingRelDelete *pending;
-
-		pending = (PendingRelDelete *)
-			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
-		pending->rlocator = rlocator;
-		pending->procNumber = INVALID_PROC_NUMBER;
-		pending->atCommit = false;	/* delete if abort */
-		pending->nestLevel = GetCurrentTransactionNestLevel();
-		pending->next = pendingDeletes;
-		pendingDeletes = pending;
-	}
-
-	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
-	bmap_share_snapshot(src, snapshot, srel, replacing);
-	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
-	if (with_maps)
-	{
-		FlushRelationsAllBuffers(&src, 1);
-		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
-		{
-			if (!smgrexists(src, fork))
-				continue;
-			smgrcreate(srel, fork, false);
-			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-			RelationCopyMapFork(src, srel, fork);
-		}
-	}
-
-	/*
-	 * No pending sync: the snapshot's own blocks were logged as images when
-	 * it was taken, and the share is logged, as are the maps' pages
-	 * (RelationCopyMapFork()).
-	 */
-	return srel;
-}
-
-/*
  * RelationCreateStorageFromRoot
  *		Create a permanent relation's storage as a copy of a root captured
  *		into its page store (bmap_root_capture()).
  *
- * As RelationCreateStorageFromSnapshot(): the main fork shares the root's
- * pages until it changes one (bmap_share_root()), O(1) in the relation's
- * size.  It gets no free space map or visibility map, so the relation
+ * The main fork shares the root's pages until it changes one
+ * (bmap_share_root()), O(1) in the relation's size.  It gets no free space map or visibility map, so the relation
  * claims no page all-visible and knows of no free space until vacuumed,
  * unless maps_from: then they are copies of that relation's (the caller
  * knows its pages are the root's still, and VACUUM kept from setting a bit
@@ -424,8 +354,8 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
  *
  * RelationCopyStorage() logs the pages and syncs them, but at
  * wal_level=minimal it does neither, leaving the sync to the pending sync
- * RelationCreateStorage() registers, which storage made from a snapshot or
- * a root has none of: so the pages are logged as images here instead,
+ * RelationCreateStorage() registers, which storage made from a root has
+ * none of: so the pages are logged as images here instead,
  * through shared buffers, which a checkpoint then writes out and syncs.
  * Until then a crash can't lose or tear them: redo writes them again.
  */

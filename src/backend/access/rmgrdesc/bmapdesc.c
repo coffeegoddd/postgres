@@ -112,14 +112,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 									 xlrec->old_hw, xlrec->new_hw);
 				else if (xlrec->op == BMAP_TREE_SHARE)
 					appendStringInfo(buf, "share of %u%s", xlrec->from,
-									 (xlrec->flags & BMAP_TREE_OF_SNAPSHOT) ?
-									 "'s snapshot" : "");
-				else if (xlrec->op == BMAP_TREE_SNAPSHOT)
-					appendStringInfoString(buf,
-										   (xlrec->flags & BMAP_TREE_CARRIED) ?
-										   "snapshot carried" :
-										   (xlrec->flags & BMAP_TREE_PRESERVE_LOGGED) ?
-										   "snapshot (images logged)" : "snapshot");
+									 (xlrec->flags & BMAP_TREE_OF_ROOT) ?
+									 "'s root" : "");
 				else if (xlrec->op == BMAP_TREE_CAPTURE)
 					appendStringInfoString(buf, "root captured (images logged)");
 				else if (xlrec->op == BMAP_TREE_ROOT_SLOT)

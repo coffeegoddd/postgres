@@ -65,11 +65,14 @@ SELECT test_chunk_verify_generations() > 0 AS generations;
 -- through the collections after.
 SELECT dolt_history_repair(:'url') AS repaired;
 SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT count(*) > 0 AS repaired_files FROM test_chunk_generations() WHERE repaired;
 SELECT count(*) AS commits FROM dolt_log('main');
 SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT test_chunk_verify_generations() > 0 AS generations;
+-- (rewritten by the full collection: no longer read whole by a retire)
+SELECT count(*) AS repaired_files FROM test_chunk_generations() WHERE repaired;
 SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
 
 \c :home

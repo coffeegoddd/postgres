@@ -1,12 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A snapshot marks no buffer: it raises the generation of sharing, and a
+# A capture marks no buffer: it raises the generation of sharing, and a
 # page settled at an older one is checked again before it next changes.  A
-# check that began before a snapshot and ends after it leaves the page
+# check that began before a capture and ends after it leaves the page
 # unsettled, since its answer ("not shared") predates the sharing: here a
 # hint's check is held between the storage manager's answer and settling
-# the page while a snapshot of its relation is taken, and the page's next
-# change must still copy it, so that the snapshot keeps the rows it had.
+# the page while a root of its relation is captured, and the page's next
+# change must still copy it, so that the root keeps the rows it had.
 
 use strict;
 use warnings FATAL => 'all';
@@ -53,8 +53,8 @@ for my $round (1 .. 2)
 	sql(q{CHECKPOINT});
 	my $t = sql(qq{SELECT pg_relation_filenode('t$round')});
 
-	# (another relation's snapshot: every page is to be checked again)
-	sql(qq{SELECT test_bmap_snapshot_take($u)});
+	# (a root captured of another relation: every page is to be checked again)
+	sql(qq{SELECT test_bmap_root_capture($u)});
 
 	# a scan setting the page's hints asks whether it is shared: not yet
 	my $scan = $node->background_psql('postgres');
@@ -66,23 +66,23 @@ for my $round (1 .. 2)
 		"\\echo scanning\nSELECT count(*) FROM t$round;\n");
 	$node->wait_for_event('client backend', 'buffer-smgr-checked');
 
-	# a snapshot of the page's relation while the check is held
-	my $snap = sql(qq{SELECT test_bmap_snapshot_take($t)});
+	# a root of the page's relation captured while the check is held
+	my $snap = sql(qq{SELECT test_bmap_root_capture($t)});
 	sql(q{SELECT injection_points_wakeup('buffer-smgr-checked')});
 	$scan->quit;
 	my $rows = sql(qq{SELECT test_bmap_rows_digest($t)});
 
-	# the page changes: copied, so the snapshot keeps the rows it had
+	# the page changes: copied, so the root keeps the rows it had
 	# (and written out, to whatever block it now has)
 	sql(qq{UPDATE t$round SET b = -1 WHERE a = 1});
 	sql(q{CHECKPOINT});
-	my $then = sql(qq{SELECT test_bmap_share_snapshot($t, $snap)});
+	my $then = sql(qq{SELECT test_bmap_share_root($snap)});
 	is(sql(qq{SELECT test_bmap_rows_digest($then)}), $rows,
-		"round $round: the snapshot keeps its rows");
+		"round $round: the root keeps its rows");
 	isnt(sql(qq{SELECT test_bmap_rows_digest($t)}), $rows,
 		"round $round: the relation changed");
 	sql(qq{SELECT test_bmap_unlink($then)});
-	sql(qq{SELECT test_bmap_snapshot_release($t, $snap)});
+	sql(qq{SELECT test_bmap_root_release($snap)});
 }
 
 done_testing();

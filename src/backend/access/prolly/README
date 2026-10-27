@@ -1973,8 +1973,11 @@ plans and archives again, a few times, still holding none.  Then it holds
 the horizon and the refs only to check the plan (planned again if the
 refs moved since, which must give the fragment archived) and record it.
 Archived, the fragment's tops are sent to the archive (the transfer
-sends what it lacks; a walk past the horizon goes on where the remote has
-what is severed already, so fragments archive beside one another), the
+sends what it lacks of what the fragment reaches; past the horizon only
+the commit objects go, never an older fragment's data, which is archived
+where that fragment was or was deleted, and may be freed here: so an
+archive holds the fragments archived to it, and a repair from it
+restores those), the
 tops are made heads of the archive's, named by the database (the
 cluster's system identifier and its OID) and the fragment's identity, so
 the same fragment is named the same however often it is archived, then

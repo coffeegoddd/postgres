@@ -142,7 +142,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  reclamation    | stub           | identity                       | pass
  reclamation    | stub           | live_chunks_never_freed        | not implemented (missing collect)
  reclamation    | stub           | keeps_what_writers_reference   | not implemented (missing collect)
- reclamation    | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+ reclamation    | stub           | complete                       | not implemented (3 of 3 callbacks missing)
  refs           | copies         | identity                       | pass
  refs           | copies         | branch_lifecycle               | no checks yet
  refs           | copies         | commit_then_resolve            | no checks yet
@@ -152,13 +152,13 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs           | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs           | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs           | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs           | stub           | complete                       | not implemented (104 of 104 callbacks missing)
+ refs           | stub           | complete                       | not implemented (105 of 105 callbacks missing)
  transfer       | chunks         | identity                       | pass
  transfer       | chunks         | receive_then_send              | no checks yet
  transfer       | chunks         | complete                       | pass
  transfer       | stub           | identity                       | pass
  transfer       | stub           | receive_then_send              | not implemented (missing receive, send)
- transfer       | stub           | complete                       | not implemented (5 of 5 callbacks missing)
+ transfer       | stub           | complete                       | not implemented (6 of 6 callbacks missing)
  diff_merge     | folded         | identity                       | pass
  diff_merge     | folded         | diff_reports_each_change_once  | no checks yet
  diff_merge     | folded         | merge                          | no checks yet

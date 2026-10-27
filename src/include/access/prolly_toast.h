@@ -96,6 +96,8 @@ extern varlena *prolly_toast_pointer(const ProllyHash *root, uint64 len,
  * names is missed.  A collection's roots outside the refs.
  */
 extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
+extern void prolly_toast_roots_in(uint32 lo, uint32 hi,
+								  ProllyChunkRefVisit visit, void *arg);
 
 /*
  * Visit the root of every value tree a hash pointer in the WAL from 'from'

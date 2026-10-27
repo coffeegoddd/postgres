@@ -136,7 +136,7 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- The slot following the page store's flushes for shares and snapshots.
+-- The slot following the page store's flushes for shares and captures.
 CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT flushing int4)
 RETURNS record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -233,26 +233,6 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_tree(relnumber oid,
 	OUT level int4, OUT first int8, OUT block int8, OUT refs int4)
 RETURNS SETOF record
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
--- A tree map's snapshots: kept (an id), let go of, listed, and copied into a
--- new relation file number (its main fork alone), which test_bmap_unlink()
--- drops.
-CREATE FUNCTION test_bmap_snapshot_take(relnumber oid)
-RETURNS int8
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_snapshot_release(relnumber oid, id int8)
-RETURNS bool
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_snapshots(relnumber oid,
-	OUT id int8, OUT nblocks int8)
-RETURNS SETOF record
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
-RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Roots captured into the database's page store: captured (an id), let go
@@ -382,15 +362,21 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- generations (or not settled) its chunks name.
 CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
 	OUT settled boolean, OUT epoch_lo bigint, OUT epoch_hi bigint,
-	OUT garbage bigint, OUT xrefs bigint)
+	OUT garbage bigint, OUT xrefs bigint, OUT repaired boolean)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Check the settled files' generations: whatever their chunks name is in
 -- the same generations or older ones, and then listed in the file's
 -- section (an error if not).  Returns the chunks checked.
-CREATE FUNCTION test_chunk_verify_generations()
+CREATE FUNCTION test_chunk_verify_generations(cut_edges boolean DEFAULT true)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Whether the history horizon cut the reference from source to target:
+-- source a severed commit, target its root's or dependencies' tree.
+CREATE FUNCTION test_window_cut_edge(source text, target text)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The collections that settled chunks the settled files still hold.
@@ -751,6 +737,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Retire the chunk store's generations lo to hi: a collection of the
+-- journal, the files not settled, and the settled files of those
+-- generations, marking only what it collects.
+CREATE FUNCTION test_chunk_retire(lo int8, hi int8, OUT kept int8,
+	OUT freed int8, OUT bytes_freed int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The oldest position a logical slot of the current database, or one of a

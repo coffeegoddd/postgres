@@ -1,0 +1,145 @@
+-- The check of generations lets a settled file name a chunk only a newer
+-- generation holds, or none settled, only across an edge the history
+-- horizon cut: a severed commit naming its data, which was freed and made
+-- again since.  Any other such reference is an error, as a retire would
+-- free the copy it names.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+\set VERBOSITY terse
+CREATE DATABASE generations_cut_edges_db;
+\c generations_cut_edges_db
+CREATE EXTENSION test_prolly;
+CREATE FUNCTION ge_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
+						  'table file "[^"]*"', 'table file <file>', 'g');
+END $$;
+CREATE SCHEMA ge VERSIONED;
+CREATE TABLE ge.t (id int PRIMARY KEY, v text);
+INSERT INTO ge.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(dolt_commit('-Am', 'd1', '--date', '2020-01-01')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE ge.t SET v = 'd2' WHERE id % 3 = 0;
+SELECT trim(both '{}' from dolt_commit('-Am', 'd2', '--date', '2020-01-02')::text) AS d2 \gset
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE ge.t SET v = 'd3' WHERE id % 3 = 1;
+SELECT trim(both '{}' from dolt_commit('-Am', 'd3', '--date', '2020-01-03')::text) AS d3 \gset
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+UPDATE ge.t SET v = 'd4' WHERE id % 3 = 2;
+SELECT length(dolt_commit('-Am', 'd4', '--date', '2020-01-04')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT root AS d2_root FROM test_commit_roots(:'d2') \gset
+SELECT root AS d3_root FROM test_commit_roots(:'d3') \gset
+-- d1 and d2 severed, their data freed.
+SELECT commits FROM dolt_history_drop('2020-01-03');
+ commits 
+---------
+       2
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT test_chunk_has(:'d2_root') AS d2_root_here;
+ d2_root_here 
+--------------
+ f
+(1 row)
+
+-- Which references the horizon cut: a severed commit's to its root, not
+-- one of a commit kept whole, nor a severed commit's to its parent.
+SELECT test_window_cut_edge(:'d2', :'d2_root') AS severed_root,
+	   test_window_cut_edge(:'d3', :'d3_root') AS kept_root,
+	   test_window_cut_edge(:'d2', (SELECT commit_hash FROM dolt_log('main')
+									WHERE message = 'd1')) AS severed_parent;
+ severed_root | kept_root | severed_parent 
+--------------+-----------+----------------
+ t            | f         | f
+(1 row)
+
+-- d2's rows back, committed: its root made again, in the journal, not
+-- settled, d2's file names it still.  That edge is cut: the generations
+-- check.  Without the horizon's answer, they don't.
+UPDATE ge.t SET v = 'v' || id WHERE id % 3 <> 0;
+SELECT length(dolt_commit('-Am', 'd2 again')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_has(:'d2_root') AS d2_root_here;
+ d2_root_here 
+--------------
+ t
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+SELECT ge_err('SELECT test_chunk_verify_generations(false)') AS uncut;
+                                       uncut                                       
+-----------------------------------------------------------------------------------
+ chunk <hash> of table file <file> names chunk <hash>, which no settled file holds
+(1 row)
+
+-- Collected into a newer generation than d2's file: the same.
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_chunk_verify_generations() > 0 AS generations;
+ generations 
+-------------
+ t
+(1 row)
+
+SELECT ge_err('SELECT test_chunk_verify_generations(false)') AS uncut;
+                                           uncut                                           
+-------------------------------------------------------------------------------------------
+ chunk <hash> of table file <file> names chunk <hash>, which only a newer generation holds
+(1 row)
+
+\c postgres
+DROP DATABASE generations_cut_edges_db;

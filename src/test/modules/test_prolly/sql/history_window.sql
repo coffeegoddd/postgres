@@ -162,7 +162,8 @@ SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_orde
 -- the fragment reaches is sent there whole, made before it too, and the
 -- archive checked for all of it, since a repair of it from there receives
 -- that.  (What is sent is what the archive lacks of all the fragment
--- reaches; what the fragment made, its chunks, may be fewer.)
+-- reaches; what the fragment made, its chunks, may be fewer.)  The first
+-- fragment's data, freed since, isn't: it is archived at the first.
 SELECT dolt_branch('-D', 'long');
 ALTER DATABASE regress_history_window SET prolly.history_window = '1 hour';
 ALTER DATABASE regress_history_window SET prolly.history_min_commits = 3;
@@ -178,6 +179,13 @@ SELECT fragment, location = :'url_second' AS archived_second
 FROM prolly_history_horizon() ORDER BY fragment;
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
+
+-- Repair from the second archive: it holds the second fragment, never
+-- the first's data, so only the second is repaired from it.
+SELECT dolt_history_repair(:'url_second', 1) AS repaired_second;
+SELECT hw_err($$SELECT dolt_history_repair('$$ || :'url_second' || $$')$$) AS first_from_second;
+SELECT fragment, location = :'url' AS archived_first
+FROM prolly_history_horizon() ORDER BY fragment;
 
 -- Repair from the archive, every fragment: the history reads again.
 SELECT dolt_history_repair() AS repaired;

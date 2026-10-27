@@ -67,12 +67,12 @@ my $now = sql($digest);
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $digest), $now, 'the standby replayed them');
 ok( !$standby->log_contains(
-		'redo of a snapshot of .* writes out every buffer of it', $log_offset),
+		'redo of a capture of .* writes out every buffer of it', $log_offset),
 	"redo visited no buffer");
 # (at this WAL level each kept snapshot's own pages were logged as images,
 # whose redo wrote them: redo of the snapshot syncs nothing)
 ok( $standby->log_contains(
-		'redo of a snapshot of .* syncs nothing: its own pages were logged as images',
+		'redo of a capture of .* syncs nothing: its own pages were logged as images',
 		$log_offset),
 	"redo of each snapshot synced nothing, its own pages logged as images");
 

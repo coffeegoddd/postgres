@@ -252,6 +252,7 @@ typedef enum ProllyGcScope
 	PROLLY_GC_DEFAULT,
 	PROLLY_GC_FULL,
 	PROLLY_GC_JOURNAL,
+	PROLLY_GC_RETIRE,			/* gc_begin_retire()'s */
 } ProllyGcScope;
 
 /*
@@ -263,19 +264,27 @@ typedef void (*ProllyChunkListedVisit) (const ProllyHash *target,
 										uint32 epoch, void *arg);
 
 /*
+ * settle()'s question of a chunk named that isn't here: the generation to
+ * list it by, proposed (0: none to list).
+ */
+typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
+									  uint32 proposed);
+
+/*
+ * verify_generations()'s question of a reference: is it an edge the
+ * history horizon cut (a severed commit naming its data), which a newer
+ * generation, or none settled, may hold?
+ */
+typedef bool (*ProllyChunkCutEdge) (void *arg, const ProllyHash *source,
+									const ProllyHash *target);
+
+/*
  * settle()'s question of a root: the commits that name it from outside
  * what is settled (a fragment's boundary commits), as many as returned,
  * in *by (palloc'd).
  */
 typedef int (*ProllySettleNamedBy) (void *arg, const ProllyHash *root,
 									ProllyHash **by);
-
-/*
- * settle()'s question of a chunk named that isn't here: the generation to
- * list it by, proposed (0: none to list).
- */
-typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
-									  uint32 proposed);
 
 /*
  * Visits a table file or segment: its name, its chunk count, its size in
@@ -301,6 +310,8 @@ typedef struct ProllyChunkGeneration
 	uint32		epoch_hi;
 	uint32		garbage;
 	int64		xrefs;
+	bool		repaired;		/* of history a repair put back, not yet
+								 * rewritten by a collection */
 } ProllyChunkGeneration;
 
 typedef void (*ProllyChunkGenerationVisit) (const ProllyChunkGeneration *g,
@@ -523,7 +534,7 @@ typedef struct ProllyChunkStoreRoutine
 	 * generation the settled file of one lists it by, and one in a file
 	 * older than its root's generation, or listing it by another, is an
 	 * error (nothing settled): what names a chunk must be as new as it is,
-	 * and list it right.
+	 * and list it right, or a retire could free it.
 	 *
 	 * epoch_of(), optional: the first generation of the settled file that
 	 * holds a chunk, the oldest if several do (0: none does).
@@ -537,10 +548,14 @@ typedef struct ProllyChunkStoreRoutine
 	 * Optional: check the settled files' generations, an error if one is
 	 * wrong: whatever a settled file's chunks name, if here, is in a
 	 * settled file of the same generations or of older ones, and then
-	 * listed in its section.  Returns the chunks checked.  Reads every
+	 * listed in its section; but where cut() says the horizon cut the
+	 * reference (NULL: none is), the chunk may be in a newer generation
+	 * the section lists it by, or not settled yet: a severed commit's
+	 * data, made again since.  Returns the chunks checked.  Reads every
 	 * settled chunk: for tests.
 	 */
-	int64		(*verify_generations) (ProllyChunkStore *store);
+	int64		(*verify_generations) (ProllyChunkStore *store,
+										   ProllyChunkCutEdge cut, void *arg);
 	uint32		(*epoch_of) (ProllyChunkStore *store, const ProllyHash *hash);
 
 	/*
@@ -553,6 +568,32 @@ typedef struct ProllyChunkStoreRoutine
 							  ProllyChunkListedVisit visit, void *arg);
 	int64		(*gc_find_in) (ProllyChunkGc *gc, const ProllyHash *hash,
 							   uint32 epoch);
+
+	/*
+	 * Optional: a retire, a collection of the journal, the files not
+	 * settled, and the settled files of generations lo to hi (whole: a file
+	 * that holds some of them and others is an error), as gc_begin()
+	 * begins one.  gc_inbound() visits what the settled files it doesn't
+	 * collect name in those generations, as their sections list it:
+	 * roots, for what only they name.  gc_read_any() reads a chunk as
+	 * gc_read() does, collected or in a settled file not (false: in
+	 * neither), without the transaction noting it used the store.
+	 */
+	ProllyChunkGc *(*gc_begin_retire) (ProllyChunkStore *store, uint32 lo,
+									   uint32 hi, bool if_free,
+									   ProllyHash *root, uint64 *nslots);
+	void		(*gc_inbound) (ProllyChunkGc *gc, ProllyChunkListedVisit visit,
+							   void *arg);
+	bool		(*gc_read_any) (ProllyChunkGc *gc, const ProllyHash *hash,
+								StringInfo out);
+
+	/*
+	 * Optional: a collected chunk (by its slot) is a node of the refs tree,
+	 * as the collection read it as of the seal; before gc_copy().  The
+	 * files written list what such a chunk names in older generations
+	 * apart (a retire reads the live refs tree instead of that list).
+	 */
+	void		(*gc_refs_node) (ProllyChunkGc *gc, uint64 slot);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -568,9 +609,10 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in"
+	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in", \
+	"gc_begin_retire", "gc_inbound", "gc_read_any", "gc_refs_node"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_find_in
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_refs_node
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -595,6 +637,7 @@ extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 #define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS false
 #endif
 extern PGDLLIMPORT bool debug_prolly_verify_generations;
+extern PGDLLIMPORT int debug_prolly_settle_epoch;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
