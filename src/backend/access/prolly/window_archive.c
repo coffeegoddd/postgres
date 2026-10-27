@@ -1622,12 +1622,52 @@ prolly_window_check_absent(const ProllyHash *id)
 				 errhint("Run dolt_history_repair() to reattach it.")));
 }
 
+HTAB *
+prolly_window_horizon(void)
+{
+	ProllyDatabaseComponents c;
+	HTAB	   *now;
+	HTAB	   *copy;
+	HASH_SEQ_STATUS seq;
+	ProllyHash *id;
+
+	prolly_database_components(&c);
+	if (c.history_window != &prolly_window_archive || !IsTransactionState())
+		return NULL;
+	window_init();
+	if (!PROLLY_HAS(dc.refs, side_scan))
+		return NULL;
+	now = archived_parents();
+	copy = id_set("prolly horizon held", sizeof(ProllyHash));
+	hash_seq_init(&seq, now);
+	while ((id = hash_seq_search(&seq)) != NULL)
+		(void) hash_search(copy, id, HASH_ENTER, NULL);
+	return copy;
+}
+
+static bool stops_at(bool archived, const ProllyHash *parent);
+
+bool
+prolly_window_held_stops_at(HTAB *horizon, const ProllyHash *parent)
+{
+	if (horizon == NULL)
+		return prolly_window_stops_at(parent);
+	return stops_at(parent->len > 0 && set_has(horizon, parent), parent);
+}
+
 bool
 prolly_window_stops_at(const ProllyHash *parent)
 {
+	return stops_at(prolly_window_archived(parent), parent);
+}
+
+/* (the notice, once a transaction, for a listing stopping at parent) */
+static bool
+stops_at(bool archived, const ProllyHash *parent)
+{
 	static LocalTransactionId told = InvalidLocalTransactionId;
 
-	if (!prolly_window_archived(parent))
+	if (!archived)
 		return false;
 	if (told != MyProc->vxid.lxid)
 	{

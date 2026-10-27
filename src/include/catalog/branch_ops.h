@@ -56,8 +56,9 @@ typedef struct BranchKeptRelation
 /*
  * What is left of a relation's kept pages (kept_status()): restorable, as
  * restore() and share_kept() require; held, its root still kept but the
- * pages not to be given back (its rows' transaction ids older than the
- * database still knows); or gone, its root no longer kept, or the
+ * pages not to be given back (a root not frozen, whose rows' transaction
+ * ids are older than the database still knows: a frozen root is never
+ * held); or gone, its root no longer kept, or the
  * relation on other storage now than the one kept (or restored since) of
  * it, so nothing is left to give back.
  */
@@ -261,13 +262,13 @@ typedef struct BranchOpsRoutine
 	 * it is now: by the same root, named as of its new storage).  O(1) in
 	 * each relation's size, and nothing if none changed since: if one did,
 	 * each gets new storage made of its root (with no free space or
-	 * visibility map), its row the oldest
+	 * visibility map, but for one unchanged since, which takes its own), its row the oldest
 	 * transaction ids it had then (one unchanged may hold hints, in its
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its
-	 * root is gone, its rows' transaction ids are older than the
-	 * database still knows, one that changed is in use by the session
-	 * itself (refused, as TRUNCATE refuses, while the session has it open
+	 * root is gone, its root isn't frozen and its rows' transaction ids
+	 * are older than the database still knows, one that changed is in use
+	 * by the session itself (refused, as TRUNCATE refuses, while the session has it open
 	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
 	 * Each that changed is locked as TRUNCATE locks it: as it is if the
 	 * session holds that lock already (a hard reset takes its restores'
@@ -342,8 +343,8 @@ typedef struct BranchOpsRoutine
 	 * restore() gives them, whatever source's working set is now.  Each
 	 * must be stored alike on both branches, as share() requires, with
 	 * source's still on the storage that kept it, its root still kept and
-	 * its rows' transaction ids ones the database still knows, and one at
-	 * least no longer of its root here (else false: nothing to give).  The source
+	 * frozen or its rows' transaction ids ones the database still knows,
+	 * and one at least no longer of its root here (else false: nothing to give).  The source
 	 * is held against deletion and its relations against letting go of the
 	 * pages (ShareUpdateExclusiveLock), the session's locked as TRUNCATE
 	 * locks them (and refused while the session has one open, as restore()

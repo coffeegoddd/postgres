@@ -20,6 +20,7 @@
 
 #include "access/sysattr.h"
 #include "access/prolly_history.h"
+#include "access/prolly_log.h"
 #include "access/prolly_revision.h"
 #include "access/tsmapi.h"
 #include "catalog/pg_class.h"
@@ -562,7 +563,8 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				/* RangeFunction */
 				if (prolly_revision_rte(rte))
 					prolly_revision_set_paths(root, rel, rte);
-				else
+				else if (!(prolly_log_rte(rte) &&
+						   prolly_log_set_paths(root, rel, rte)))
 				{
 					set_function_pathlist(root, rel, rte);
 					/* (a table's history seeking each commit by its key) */
