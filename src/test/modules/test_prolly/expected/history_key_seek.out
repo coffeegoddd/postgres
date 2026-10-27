@@ -512,7 +512,7 @@ SELECT count(*) > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
 (1 row)
 
 SELECT count(*) AS rows_of_5 FROM dolt_history_table(NULL::hz.t) WHERE (row).id = 5;
-NOTICE:  history stops at the history horizon
+NOTICE:  commits past the history horizon have no rows here
  rows_of_5 
 -----------
          4
@@ -520,7 +520,7 @@ NOTICE:  history stops at the history horizon
 
 SELECT same($$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hz.t) WHERE (row).id = 5$$,
 			$$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hz.t) WHERE (row).id + 0 = 5$$) AS past_horizon;
-NOTICE:  history stops at the history horizon
+NOTICE:  commits past the history horizon have no rows here
  past_horizon 
 --------------
  t

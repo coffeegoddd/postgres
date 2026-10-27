@@ -116,14 +116,20 @@ WHERE (h.row).id = 1;
 -- The collection frees what only the fragment reached.
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
 
--- A read of a severed commit says it is past the horizon.
-SELECT hh_err(format('SELECT prolly_root_hash(%L)', :'c3')) AS root_c3;
+-- A read of a severed commit's data says it is past the horizon; its
+-- commit object is kept.
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c3')) AS at_c3,
+	   prolly_root_hash(:'c3') IS NOT NULL AS root_c3;
 SELECT hh_err($$SELECT count(*) FROM dolt_diff('main~3', 'main', NULL::hh.t)$$) AS diff_past;
--- (c3's id is c4's to give; what c3 names is past)
+-- (the graph is whole: ancestry goes across the horizon)
 SELECT hh_name(dolt_hashof('main~3')) AS main_3,
-	   hh_err($$SELECT dolt_hashof('main~4')$$) AS hashof_past;
+	   hh_name(dolt_hashof('main~4')) AS main_4;
 -- (a severed commit beneath the fragment's tops, named by its id)
 SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c2')) AS at_beneath;
+-- (the commit that made hh.t, still live: its data is severed too, and
+-- only its commit object kept, as every one is)
+SELECT hh_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hh.t)', :'c1')) AS at_maker,
+	   prolly_root_hash(:'c1') IS NOT NULL AS maker_listed;
 
 -- A push of history past the horizon to a remote that hasn't it says so.
 SELECT dolt_remote('add', 'empty', :'url_empty');

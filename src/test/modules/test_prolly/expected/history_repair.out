@@ -162,12 +162,8 @@ SELECT dolt_remote('add', 'empty', :'url_empty');
  {0}
 (1 row)
 
-SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
- collected 
------------
- t
-(1 row)
-
+-- (no collection before: one would settle the history in a file the
+-- severed data is too little of to rewrite, and it would stay)
 SELECT fragment, commits FROM dolt_history_drop('2020-01-04 00:00+00');
  fragment | commits 
 ----------+---------
@@ -194,10 +190,9 @@ SELECT fragment, state, commits FROM prolly_history_horizon();
 (2 rows)
 
 SELECT count(*) AS logged FROM dolt_log('main');
-NOTICE:  history stops at the history horizon
  logged 
 --------
-      3
+      7
 (1 row)
 
 -- A deleted fragment is repaired only from where its history is; one
@@ -209,9 +204,9 @@ SELECT hr_err('SELECT dolt_history_repair()') AS no_source;
 (1 row)
 
 SELECT hr_err($$SELECT dolt_history_repair('empty')$$) AS lacking;
-                  lacking                  
--------------------------------------------
- commit <hash> is past the history horizon
+                      lacking                       
+----------------------------------------------------
+ the remote lacks chunk <hash>, which it references
 (1 row)
 
 SELECT count(*) AS fragments FROM prolly_history_horizon();
@@ -232,8 +227,9 @@ SELECT hr_err($$SELECT dolt_history_repair('origin')$$) AS other;
 RESET ROLE;
 -- The newest fragment alone: the log reaches its commits, and stops at
 -- the older one's.
--- The older fragment's tops aren't received (the source has them), so a
--- collection after keeps the newest's commits and frees the older's.
+-- The older fragment's data isn't received (the source has it), so a
+-- collection after keeps the newest's and frees the older's; every
+-- commit object is kept.
 SELECT tops[1] AS older_top FROM prolly_history_horizon() ORDER BY fragment LIMIT 1 \gset
 SELECT dolt_history_repair('origin', 1) AS repaired;
  repaired 
@@ -248,13 +244,12 @@ SELECT fragment, commits FROM prolly_history_horizon();
 (1 row)
 
 SELECT count(*) AS logged FROM dolt_log('main');
-NOTICE:  history stops at the history horizon
  logged 
 --------
-      5
+      7
 (1 row)
 
-SELECT hr_err(format('SELECT prolly_root_hash(%L)', :'older_top')) AS older_not_received;
+SELECT hr_err(format('SELECT count(*) FROM dolt_at(%L, NULL::hr.t)', :'older_top')) AS older_not_received;
             older_not_received             
 -------------------------------------------
  commit <hash> is past the history horizon
@@ -267,10 +262,9 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 (1 row)
 
 SELECT count(*) AS logged_after_collection FROM dolt_log('main');
-NOTICE:  history stops at the history horizon
  logged_after_collection 
 -------------------------
-                       5
+                       7
 (1 row)
 
 -- The rest, by URL: the history is as it was.

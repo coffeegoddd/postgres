@@ -89,9 +89,12 @@ $node->poll_query_until('hw', q{SELECT count(*) > 0 FROM prolly_history_horizon(
   or die 'nothing severed';
 autovacuum_visited();
 my $top = sql(q{SELECT tops[1] FROM prolly_history_horizon() LIMIT 1});
-my ($ret, $out, $err) = $node->psql('hw', qq{SELECT prolly_root_hash('$top')});
-like($err, qr/is past the history horizon/, 'the severed commit is freed');
-cmp_ok(sql($logged), '<', 11, 'the log is shorter');
+my ($ret, $out, $err) = $node->psql('hw', qq{SELECT count(*) FROM dolt_at('$top', NULL::hw.t)});
+like($err, qr/is past the history horizon/, 'the severed commit\'s data is freed');
+is(sql($logged), '11', 'the log lists every commit: its graph is kept');
+# (the commits whose data is kept here: those logged, but the severed)
+my $kept = q{SELECT (SELECT count(*) FROM dolt_log('main')) -
+	(SELECT coalesce(sum(commits), 0) FROM prolly_history_horizon())};
 like($node->safe_psql('hw', q{SELECT state FROM prolly_history_horizon() LIMIT 1}),
 	qr/deleted/, 'deleted');
 
@@ -110,11 +113,11 @@ is(sql($fragments), $before, 'under the size limit, nothing more is severed');
 # Over it: a batch more for each collection measured, down to the newest
 # three (delete mode: two measurements over in a row for each).
 sql(q{ALTER DATABASE hw SET prolly.history_max_size = '1kB'});
-$node->poll_query_until('hw', qq{SELECT ($logged) <= 3})
+$node->poll_query_until('hw', qq{SELECT ($kept) <= 3})
   or die 'the size limit severed nothing';
 autovacuum_visited();
 autovacuum_visited();
-cmp_ok(sql($logged), '>=', 3, 'the newest three are kept, however large');
+cmp_ok(sql($kept), '>=', 3, 'the newest three are kept, however large');
 sql(q{ALTER DATABASE hw RESET prolly.history_max_size;
 	ALTER DATABASE hw RESET prolly.history_min_commits});
 
