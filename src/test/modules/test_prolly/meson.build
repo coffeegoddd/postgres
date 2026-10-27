@@ -141,6 +141,7 @@ tests += {
       'transfer_spill',
       'remote_serve',
       'commit_heights',
+      'log_count',
       'dependencies',
       'dependency_moves',
       'extension_ordering',

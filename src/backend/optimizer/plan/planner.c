@@ -20,6 +20,7 @@
 
 #include "access/genam.h"
 #include "access/parallel.h"
+#include "access/prolly_log_count.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -4443,6 +4444,9 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("could not implement GROUP BY"),
 				 errdetail("Some of the datatypes only support hashing, while others only support sorting.")));
+
+	/* count(*) of dolt_log(ref) alone: the count its commit records */
+	prolly_log_count_paths(root, input_rel, grouped_rel);
 
 	/*
 	 * If there is an FDW that's responsible for all baserels of the query,
