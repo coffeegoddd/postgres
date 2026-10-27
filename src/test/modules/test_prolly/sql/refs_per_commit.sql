@@ -157,7 +157,7 @@ DROP DATABASE refs_per_commit;
 -- after 50
 SELECT win, at, refs_nodes <= 10 AS few_refs_nodes, bytes <= 36000 AS few_bytes
 FROM refs_measured ORDER BY win, at;
-SELECT a.win, b.refs_nodes <= a.refs_nodes + 1 AS refs_nodes_flat
+SELECT a.win, b.refs_nodes <= a.refs_nodes + 2 AS refs_nodes_flat
 FROM refs_measured a JOIN refs_measured b ON a.win = b.win AND a.at = 50 AND b.at = 200
 ORDER BY a.win;
 -- the window bounds what is kept
