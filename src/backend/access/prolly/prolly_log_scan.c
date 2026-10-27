@@ -32,6 +32,8 @@
 #include "optimizer/restrictinfo.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/typcache.h"
+#include "optimizer/paths.h"
 
 /* the columns dolt_log gives */
 #define LOG_COLUMNS		6
@@ -70,6 +72,39 @@ static const CustomPathMethods log_path_methods;
 static const CustomScanMethods log_scan_methods;
 
 /*
+ * The order the scan gives its rows in, as pathkeys: commit_order
+ * descending, then date descending (then by hash, which the pathkeys
+ * leave out), so ORDER BY commit_order DESC needs no sort.
+ */
+static List *
+log_pathkeys(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	TupleDesc	desc = get_expr_result_tupdesc(((RangeTblFunction *) linitial(rte->functions))->funcexpr,
+											   false);
+	static const AttrNumber order[] = {6, 4};	/* commit_order, date */
+	List	   *pathkeys = NIL;
+
+	for (int i = 0; i < lengthof(order); i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, order[i] - 1);
+		TypeCacheEntry *tc = lookup_type_cache(att->atttypid, TYPECACHE_GT_OPR);
+		Var		   *v;
+		List	   *pk;
+
+		if (!OidIsValid(tc->gt_opr))
+			break;
+		v = makeVar(rel->relid, order[i], att->atttypid, att->atttypmod,
+					att->attcollation, 0);
+		pk = build_expression_pathkey(root, (Expr *) v, tc->gt_opr, rel->relids,
+									  false);
+		if (pk == NIL)
+			break;
+		pathkeys = list_concat_unique_ptr(pathkeys, pk);
+	}
+	return pathkeys;
+}
+
+/*
  * The path, in place of the function scan's (it reads no more commits than
  * the function, and its first rows cost only theirs): the function scan's
  * rows, its cost a row at a time.
@@ -99,7 +134,7 @@ prolly_log_set_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	cp->path.rows = rel->rows;
 	cp->path.startup_cost = qcost.startup;
 	cp->path.total_cost = qcost.startup + per_row * rel->tuples;
-	cp->path.pathkeys = NIL;
+	cp->path.pathkeys = log_pathkeys(root, rel, rte);
 	cp->flags = 0;
 	cp->custom_paths = NIL;
 	cp->custom_private = NIL;

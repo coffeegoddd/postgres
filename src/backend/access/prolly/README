@@ -1778,7 +1778,9 @@ come before it), each read with its parents as it is given
 that pulls its rows from that stream (prolly_log_scan.c), not by a
 function scan, which would keep them all first: dolt_log ... LIMIT n
 reads about n commits however long the history, and the whole log no
-more than before (no sort).
+more than before (no sort).  The scan's rows come in commit_order and
+then date descending, which its path says (pathkeys), so ORDER BY
+commit_order DESC ... LIMIT n doesn't read the history to sort it.
 
 Remotes
 -------

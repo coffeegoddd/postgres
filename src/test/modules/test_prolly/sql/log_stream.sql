@@ -41,6 +41,9 @@ SELECT mk(200, NULL) AS commits;
 
 -- the plan: a scan of its own, which a LIMIT stops
 EXPLAIN (COSTS OFF) SELECT * FROM dolt_log LIMIT 10;
+-- (in the log's order: ORDER BY commit_order DESC, date DESC sorts nothing)
+EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC LIMIT 1;
+EXPLAIN (COSTS OFF) SELECT * FROM dolt_log ORDER BY commit_order DESC, date DESC LIMIT 1;
 
 -- a limited log reads about as many commits as it gives
 :flush
