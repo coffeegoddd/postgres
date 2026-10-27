@@ -93,9 +93,8 @@ SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
 	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
 SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
 
--- A working set a few rows from the commit (fewer than
--- prolly.restore_min_changes): the head's pages aren't given back, the
--- few rows written as they are
+-- A working set a few rows from the commit: the head's pages given back
+-- all the same, no row written (a commit kept is always restored)
 SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
 SELECT dolt_reset('--hard', :'b') IS NOT NULL AS reset;
 SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;

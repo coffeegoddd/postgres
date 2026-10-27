@@ -26,7 +26,6 @@ wal_consistency_checking = all
 autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
-prolly.restore_min_changes = 0
 });
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }

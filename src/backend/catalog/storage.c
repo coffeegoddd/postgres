@@ -286,6 +286,9 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  *		Create a permanent relation's storage as a copy of a snapshot that
  *		another's block-mapped storage keeps (bmap_snapshot_take()).
  *
+ * Only the snapshot tests use it now: moves give a relation the pages of a
+ * root (RelationCreateStorageFromRoot()), not of a snapshot.
+ *
  * The new main fork shares the snapshot's pages until it changes one
  * (bmap_share_snapshot()), O(1) in the relation's size.  It gets no free
  * space map or visibility map, unless with_maps: src's describe its pages
@@ -294,8 +297,8 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * With with_maps (the caller knows src's pages are the snapshot's still,
  * and VACUUM kept from setting a bit meanwhile), they are copies of src's,
  * as RelationCreateStorageShared() makes them.  With replacing, the copy
- * is to take src's place, src dropped as the transaction commits (a
- * restore), so it shares the pages with no other relation for that.  As
+ * is to take src's place, src dropped as the transaction commits, so it
+ * shares the pages with no other relation for that.  As
  * RelationCreateStorage(), the storage is deleted if the transaction
  * aborts when register_delete.
  */

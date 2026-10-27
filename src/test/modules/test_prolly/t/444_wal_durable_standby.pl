@@ -21,7 +21,6 @@ $primary->append_conf('postgresql.conf', qq{
 wal_keep_size = 1GB
 autovacuum = off
 checkpoint_timeout = 1h
-prolly.restore_min_changes = 0
 });
 $primary->start;
 

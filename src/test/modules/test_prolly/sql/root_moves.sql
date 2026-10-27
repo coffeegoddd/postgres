@@ -7,7 +7,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_moves;
-ALTER DATABASE root_moves SET prolly.restore_min_changes = 0;
 \c root_moves
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

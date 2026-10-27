@@ -7,7 +7,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_retention;
-ALTER DATABASE root_retention SET prolly.restore_min_changes = 0;
 \c root_retention
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -142,6 +141,26 @@ SELECT test_retain_roots('main');
 -- (the newest, and c10's, the tag's)
 SELECT count(*) AS kept_under_cap FROM test_kept_commits('main');
 ALTER DATABASE root_retention RESET prolly.history_root_max_size;
+
+-- a reset to any commit in the window, however few rows it differs by,
+-- gives each table its root and writes no row
+CREATE TABLE rr.z (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO rr.z SELECT g, 0 FROM generate_series(1, 1000) g;
+SELECT dolt_commit('-Am', 'z0') IS NOT NULL AS committed;
+UPDATE rr.z SET v = 1 WHERE id = 1;
+SELECT (dolt_commit('-am', 'z1'))[1] AS z1 \gset
+UPDATE rr.z SET v = 2 WHERE id = 2;
+SELECT (dolt_commit('-am', 'z2'))[1] AS z2 \gset
+UPDATE rr.z SET v = 3 WHERE id = 3;
+SELECT dolt_commit('-am', 'z3') IS NOT NULL AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'z2');
+SELECT dolt_reset('--hard', :'z1');
+SELECT pg_stat_force_next_flush();
+SELECT name, CASE WHEN name = 'apply_rows' THEN value ELSE (value > 0)::int END
+FROM since(:'before');
+SELECT sum(v) AS at_z1 FROM rr.z;
 
 \c :home
 DROP DATABASE root_retention;

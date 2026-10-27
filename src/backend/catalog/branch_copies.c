@@ -3865,6 +3865,7 @@ static const BranchOpsRoutine branch_copies = {
 	.let_go = copies_let_go,
 	.kept_status = copies_kept_status,
 	.changed_since_kept = copies_changed_since_kept,
+	.try_lock = try_lock_relation,
 	.share_kept = copies_share_kept,
 	.hold = copies_hold,
 	.carry_privileges = copies_carry_privileges,

@@ -24,7 +24,7 @@ max_wal_senders = 0
 autovacuum = off
 autovacuum_naptime = 1s
 checkpoint_timeout = '1h'
-prolly.restore_min_changes = 100000000
+debug_prolly_restore_roots = off
 });
 $node->start;
 
