@@ -191,6 +191,8 @@ the maximum configured distance and is recorded in every sample.
 | `branch_delete_used`, D=0 or D>0 | The same, for a branch checked out once (and left) before the timed delete, so the engine has made what a session on it needs |
 | `drop_table` | `DROP TABLE bench_rows` on the scratch branch, clean or with a dirty working set; a hard reset to HEAD brings it back, untimed |
 | `at_history`, D=0 or D>0 | Read three changed rows as the saved hash has them (prolly: `dolt_at(hash, NULL::bench_rows)`; Dolt and Doltgres: `bench_rows AS OF hash`), by key |
+| `merge_ff`, D>0 | The scratch branch, hard reset (untimed) to the saved hash, merges the fixture branch: a fast-forward to HEAD |
+| `merge`, D>0 | A branch made at the saved hash, with one commit (untimed) changing rows no fixture commit changes, merged into HEAD: a three-way merge with an in-window base, its merge commit made; hard reset to HEAD after, untimed |
 
 ### The history window
 
@@ -238,8 +240,11 @@ window: their targets are all in it).
   `windows`, the window's settings and the roots the fixture branch keeps
   at each cell's start and end.
 
-This harness has no merge operation; the V suite's V3 measures merges, of
-branch heads made in the run (in its window by construction).
+Merges are held to the same window: their base is the target checked
+before them. They may write rows, but only those the merge changes:
+`apply_rows` at most K for a fast-forward and the side's rows for a
+three-way merge, and no `apply_loads` (a table filled from nothing). More
+is a full table write, and fails the run.
 
 ### Dirty working sets: xsmall, small, medium, large
 

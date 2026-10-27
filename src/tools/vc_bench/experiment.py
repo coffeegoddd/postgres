@@ -78,6 +78,16 @@ def probe_ids(n, k):
     return sorted({ids[0], ids[len(ids)//2], ids[-1]})
 
 
+def side_ids(n, k):
+    """Rows no fixture commit changes, beside three changed ones: what a
+    three-way merge's other side changes."""
+    changed = set(changed_ids(n, k))
+    ids = sorted({i + 1 for i in probe_ids(n, k) if i + 1 <= n and i + 1 not in changed})
+    if not ids:
+        raise ValueError(f"a three-way merge needs rows no commit changes; K={k} changes all {n}")
+    return ids
+
+
 def probe(sql, n, k, revision):
     picks = probe_ids(n, k)
     rows = sql.query("SELECT id,revision FROM bench_rows WHERE " +
@@ -190,6 +200,12 @@ def cases(c):
             result.append({"operation": op, "distance": d})
     for d in [0, *sorted(set(c["history_depths"]))]:
         result.append({"operation": "at_history", "distance": d})
+    # (merges from a base D back: a fast-forward of the scratch branch,
+    # reset to the base, to HEAD; and a three-way merge into HEAD of a
+    # branch made at the base, with a commit of its own)
+    for d in sorted(set(c["history_depths"])):
+        for op in ("merge_ff", "merge"):
+            result.append({"operation": op, "distance": d})
     for case in result:
         case['working_set'] = 'diff' if case['operation'] in ('diff_working', 'diff_working_history') else 'clean'
     for d in [0, *sorted(set(c["history_depths"]))]:
@@ -237,6 +253,18 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         # Point reads confirm pending values without invoking a VC
                         # diff that could materialize/fold the dirty tree before timing.
                         probe(sql, n, count, h+1)
+                    if op == "merge_ff":
+                        sql.vc("reset", "--hard", old)
+                        sql.before_merge()
+                    elif op == "merge":
+                        # (the other side's commit: rows no fixture commit
+                        # changes, at a revision none has)
+                        sql.vc("branch", tmpbranch, old)
+                        sql.vc("checkout", tmpbranch)
+                        sql.query(f"UPDATE bench_rows SET revision={h+2} WHERE " + sql.ids_in(side_ids(n, k)))
+                        sql.vc("commit", "-Am", "vc_bench merge side", "--author", ENGINES[engine].AUTHOR)
+                        sql.vc("checkout", scratch)
+                        sql.before_merge()
                     if op.startswith("branch_delete"):
                         # A branch at the old commit; the used one checked out
                         # once first, so the engine has made what a session on
@@ -264,6 +292,10 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         query = sql.hash_sql(f"HEAD~{d}")
                     elif op == "at_history":
                         query = sql.at_sql(old, probe_ids(n, k))
+                    elif op == "merge_ff":
+                        query = sql.merge_sql(fixture["branch"], "vc_bench merge")
+                    elif op == "merge":
+                        query = sql.merge_sql(tmpbranch, "vc_bench merge")
                     elif op == "diff_equal":
                         query = sql.diff_sql(latest, latest)
                     elif op == "diff_working":
@@ -306,7 +338,10 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         if path_before is not None:
                             after = sql.path_counters()
                             record["path"] = {name: after[name] - path_before[name] for name in window.PATH_COUNTERS}
-                        window.check_path(op, d, target, record.get("path", {}))
+                        # (a merge changes the rows between its base and the
+                        # other side: the history's K, or the side's rows)
+                        bound = {"merge_ff": k, "merge": len(side_ids(n, k)) if op == "merge" else 0}.get(op)
+                        window.check_path(op, d, target, record.get("path", {}), bound)
                         # Validation and restoration are deliberately outside timing
                         # AND memory sampling. Mutations must demonstrate their effect.
                         if op == "branch":
@@ -372,6 +407,26 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         elif op == "at_history":
                             expect(result["rows"], [[str(i), str(h-d)] for i in probe_ids(n, k)],
                                    "rows as of the commit")
+                        elif op == "merge_ff":
+                            expect(sql.hash(), latest, "fast-forward merge HEAD")
+                            probe(sql, n, k, h)
+                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), 0,
+                                   "fast-forward merge leaves no working changes")
+                        elif op == "merge":
+                            merged = sql.hash()
+                            if merged == latest:
+                                raise RuntimeError("three-way merge made no commit")
+                            probe(sql, n, k, h)
+                            rows = sql.query("SELECT id,revision FROM bench_rows WHERE " +
+                                             sql.ids_in(side_ids(n, k)) + " ORDER BY id")["rows"]
+                            expect(rows, [[str(i), str(h+2)] for i in side_ids(n, k)], "merged side rows")
+                            expect(int(sql.scalar(sql.diff_sql(latest, "HEAD"))), len(side_ids(n, k)),
+                                   "three-way merge brings the side's rows alone")
+                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), 0,
+                                   "three-way merge leaves no working changes")
+                            sql.vc("reset", "--hard", latest)
+                            sql.vc("branch", "-D", tmpbranch)
+                            probe(sql, n, k, h)
                         elif op.startswith("diff_"):
                             expect(int(result["rows"][0][0]), 0 if op == "diff_equal" else k, "diff cardinality")
                             record["diff_rows"] = int(result["rows"][0][0])

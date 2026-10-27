@@ -293,6 +293,12 @@ class SQL:
     def at_sql(self, commit, ids):
         return self.adapter.at_sql(commit, ids)
 
+    def merge_sql(self, branch, message):
+        return self.adapter.merge_sql(branch, message)
+
+    def before_merge(self):
+        return self.adapter.before_merge(self)
+
 
 def disk_size(path):
     apparent = allocated = 0

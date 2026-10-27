@@ -4,7 +4,7 @@ from html import escape
 
 # (the path counters a latency cell names, where they moved)
 PATH_NOTED = ("moves_root_kept", "moves_root_nearest", "moves_root_missing", "move_tables_written",
-              "restores_lock_busy", "severed_refusals")
+              "restores_lock_busy", "severed_refusals", "apply_rows", "apply_loads")
 
 
 ENGINES = ("dolt", "doltgres", "prolly")
@@ -23,6 +23,8 @@ OPERATIONS = {
     "diff_working_history": "Diff old → working",
     "resolve_ancestor": "Resolve ancestor",
     "at_history": "Read rows as of old (dolt_at)",
+    "merge_ff": "Fast-forward merge from old",
+    "merge": "Three-way merge, base old",
     "drop_table": "Drop table",
 }
 

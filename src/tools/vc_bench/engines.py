@@ -124,6 +124,17 @@ class Engine:
         engine without a window."""
         return None
 
+    # (the author of every commit the harness makes)
+    AUTHOR = "VC Bench <vc-bench@example.invalid>"
+
+    def merge_sql(self, branch, message):
+        """A merge of branch into the session's, committed as AUTHOR with
+        message if it isn't a fast-forward."""
+        return self.vc_sql("merge", (branch, "-m", message, "--author", self.AUTHOR))
+
+    def before_merge(self, sql):
+        """What the session needs, outside timing, before merge_sql()."""
+
     def at_sql(self, commit, ids):
         """The benchmark rows id IN ids, as commit has them, ordered by id."""
         return (f"SELECT id,revision FROM bench_rows AS OF {literal(commit)} "
@@ -365,6 +376,13 @@ class Prolly(Engine):
             raise RuntimeError("pg_stat_prolly lacks the path counters " + ", ".join(sorted(missing)) +
                                "; the server predates them")
         return got
+
+    def merge_sql(self, branch, message):
+        # (the merge commit's author is the session's dolt.author)
+        return self.vc_sql("merge", (branch, "-m", message))
+
+    def before_merge(self, sql):
+        sql.query(f"SET dolt.author = {literal(self.AUTHOR)}")
 
     def at_sql(self, commit, ids):
         return (f"SELECT id,revision FROM dolt_at({literal(commit)}, NULL::bench_rows) "

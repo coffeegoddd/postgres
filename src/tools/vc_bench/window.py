@@ -24,11 +24,16 @@ DEFAULT_TIME_WINDOW = "100 years"
 
 # pg_stat_prolly's counters an operation's path is told by.
 PATH_COUNTERS = ("moves_root_kept", "moves_root_nearest", "moves_root_missing",
-                 "move_tables_written", "restores_lock_busy", "severed_refusals")
+                 "move_tables_written", "restores_lock_busy", "severed_refusals",
+                 "apply_rows", "apply_loads")
 
 # Operations that move the session's branch to their target (its pages
 # given back from a root), and those that only read history or name it.
 MOVES = ("reset_hard", "checkout")
+
+# Merges, whose base is their target: they may write the rows the merge
+# changes (rows_bound, check_path()), never a table's every row.
+MERGES = ("merge_ff", "merge")
 
 
 class WindowError(RuntimeError):
@@ -91,10 +96,12 @@ def classify(chain, index, in_window, has_root, interval_commits, allow_past=Fal
                       f"{interval_commits - 1} commits before it keep a root")
 
 
-def check_path(operation, distance, target, deltas):
+def check_path(operation, distance, target, deltas, rows_bound=None):
     """Raise PathError unless an operation on target (classify()'s), its
     path counters' growth deltas, took the root path.  A target past the
-    window is measured apart and isn't held to it."""
+    window is measured apart and isn't held to it.  A merge (MERGES) may
+    write rows, at most rows_bound of them (the rows it changes), but never
+    fill a table from nothing."""
     if target is None or target["window"] != "in" or target["root"] is None:
         return
     got = {name: deltas.get(name, 0) for name in PATH_COUNTERS}
@@ -105,6 +112,15 @@ def check_path(operation, distance, target, deltas):
         raise PathError(f"{where}: gave up a restore for a lock and wrote rows instead")
     if got["moves_root_missing"]:
         raise PathError(f"{where}: moved to a commit without a root and wrote its rows")
+    if operation in MERGES:
+        if got["apply_loads"]:
+            raise PathError(f"{where}: filled {got['apply_loads']} tables from nothing: a full table write")
+        if rows_bound is None:
+            raise PathError(f"{where}: a merge's check needs the rows it changes")
+        if got["apply_rows"] > rows_bound:
+            raise PathError(f"{where}: wrote {got['apply_rows']} rows, more than the {rows_bound} "
+                            "the merge changes: a full table write")
+        return
     if operation not in MOVES or target["root"] == "kept":
         if got["move_tables_written"]:
             raise PathError(f"{where}: wrote rows ({got['move_tables_written']} tables) instead of "
