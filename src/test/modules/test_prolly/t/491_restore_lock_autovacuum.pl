@@ -305,11 +305,54 @@ sub behind_reset
 	return $c;
 }
 
+# 4a. While it waits for the reader, the reset holds no lock of a
+# relation: not those its planning read, nor any table of the set.
+my ($mreader, $mr, $mrpid) = main_reset_waiting();
+is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $mrpid
+	AND locktype = 'relation' AND granted}), '0',
+	'a reset waiting for a reader holds no relation\'s lock');
+is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $mrpid AND NOT granted}), '1',
+	'and waits for one alone');
+$mreader->query_safe(q{COMMIT});
+$mreader->quit;
+like($mr->query_until(qr/done/, ''), qr/reset t/, 'and finishes once the reader ends');
+$mr->quit;
+
+# 4a'. Two resets of main at once, both tables dirty: neither holds a
+# table the other waits for, so both finish, round after round.
+my $deadlocks = 0;
+my $finished = 0;
+for my $round (1 .. 15)
+{
+	sql(q{UPDATE kp.t SET b = b || 'r' WHERE a % 20 = 0;
+		UPDATE kp.u SET b = b || 'r' WHERE a % 20 = 0});
+	my @rs;
+	for my $i (1 .. 2)
+	{
+		my $r = $node->background_psql('postgres', on_error_stop => 0);
+		$r->query_until(qr/started/, q{
+			\echo started
+			SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
+			\echo done
+		});
+		push @rs, $r;
+	}
+	for my $r (@rs)
+	{
+		my $out = $r->query_until(qr/done/, '');
+		$finished++ if $out =~ /reset t/;
+		$deadlocks++ if $r->{stderr} =~ /deadlock/;
+		$r->quit;
+	}
+}
+is($deadlocks, 0, 'two resets of a branch at once never deadlock');
+is($finished, 30, 'and every one finishes');
+
 # 4b. Another session of main commits a table the reset will restore,
 # its commit then reading kp.t, which the reset waits for: once the
 # reader ends, neither waits for the other (the reset holds no table
 # while it waits for another), and both finish.
-my ($mreader, $mr) = main_reset_waiting();
+($mreader, $mr) = main_reset_waiting();
 my $committer = behind_reset(q{
 	INSERT INTO kp.u VALUES (100001, 'w');
 	SELECT 'committed ' || (dolt_commit('-am', 'u row') IS NOT NULL);});

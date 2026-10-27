@@ -1338,8 +1338,11 @@ takes the branch's refs, then the root, then the relations it reads or
 writes; so the reset takes its tables' locks all or none, waiting for
 the first busy one with nothing else held and then trying all again,
 and then only tries the refs and the root: if either is held, it gives
-every table's lock back and waits, holding nothing, until they are free,
-and begins again.  It never holds a lock another operation waits for
+every table's lock back and waits in each one's queue, holding nothing
+(taking it and letting go of it at once, so the deadlock detector and
+lock_timeout see the wait), and begins again.  Planning takes no lock it
+keeps (what it opens to read, it lets go of), so two resets of one branch
+at once never each hold a table the other waits for.  It never holds a lock another operation waits for
 while it waits for one that operation holds.  A page sweep holding a
 table's lock lets go of it for a waiter, an autovacuum worker is
 cancelled after deadlock_timeout (as for any waiter), the deadlock

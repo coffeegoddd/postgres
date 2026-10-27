@@ -258,7 +258,6 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "catalog/partition.h"
-#include "utils/wait_event.h"
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -4152,6 +4151,11 @@ may_restore(Oid relid)
 	if (pg_class_aclmask(relid, GetUserId(), write, ACLMASK_ALL) != write ||
 		check_enable_rls(relid, InvalidOid, true) == RLS_ENABLED)
 		return false;
+	/*
+	 * (its lock let go of again, as kept_relations() lets go of its: a
+	 * hard reset asks this before it takes the table's locks, all or none,
+	 * and a lock kept here would be held while it waits for those)
+	 */
 	rel = relation_open(relid, AccessShareLock);
 	td = rel->trigdesc;
 	ok = true;
@@ -4166,7 +4170,7 @@ may_restore(Oid relid)
 							  ACLMASK_ALL) == (ACL_UPDATE | ACL_DELETE) &&
 			check_enable_rls(other, InvalidOid, true) != RLS_ENABLED;
 	}
-	relation_close(rel, NoLock);
+	relation_close(rel, AccessShareLock);
 	return ok;
 }
 
@@ -8988,9 +8992,6 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
 	}
 }
 
-/* the longest nap between looks at whether the refs are free, in ms */
-#define RESET_REFS_MAX_DELAY_MS	10
-
 /*
  * Before a hard reset holds the refs (which every other branch's
  * operation waits for): the tables a restore will give the pages kept as
@@ -9007,8 +9008,13 @@ plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
  *   (as lmgr.c's callers of ConditionalLockRelationOid() take sets), so
  *   the reset never holds one table while it waits for another;
  * - then the branch's refs and the root, only tried: if either is held,
- *   every table's lock is given back, and the reset waits, holding
- *   nothing, until both are free, and begins again.
+ *   every table's lock is given back, and the reset waits for each in its
+ *   queue, holding nothing (taking it and letting go of it at once), and
+ *   begins again.
+ * The planning itself takes no lock it keeps (may_restore() and
+ * kept_relations() let go of what they take to read a relation), so two
+ * resets of one branch at once don't each hold a table the other waits
+ * to lock.
  * So it never holds a lock another operation waits for while it waits
  * for one that operation holds.  Read as the refs are now: whatever
  * changes before they are held the restore tries for, as without this.
@@ -9030,7 +9036,6 @@ lock_for_restore(const char *ref)
 	ProllyNodeRef baseline;
 	KeptCommit *was;
 	Oid			waited = InvalidOid;
-	long		delay = 1;
 
 	if (whole || prolly_kept_commits <= 0 ||
 		branch_ops()->changed_since_kept == NULL || RecoveryInProgress())
@@ -9083,20 +9088,17 @@ lock_for_restore(const char *ref)
 					break;
 				release_branch(name);
 			}
-			/* (the refs held: everything given back, waited for free) */
+			/*
+			 * (the refs held: everything given back, and each waited for
+			 * in its queue, holding nothing, as the deadlock detector and
+			 * lock_timeout see, then let go of, to try again)
+			 */
 			foreach(lc, relids)
 				UnlockRelationOid(lfirst_oid(lc), AccessExclusiveLock);
-			while (!try_lock_branch(name, false) ||
-				   (PROLLY_HAS(env.chunk_store, root_free) &&
-					!env.chunk_store->root_free(env.chunks)))
-			{
-				CHECK_FOR_INTERRUPTS();
-				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT |
-								 WL_EXIT_ON_PM_DEATH, delay,
-								 WAIT_EVENT_BRANCH_KEPT_LOCK);
-				ResetLatch(MyLatch);
-				delay = Min(delay * 2, RESET_REFS_MAX_DELAY_MS);
-			}
+			lock_branch(name);
+			release_branch(name);
+			if (PROLLY_HAS(env.chunk_store, wait_root_free))
+				env.chunk_store->wait_root_free(env.chunks);
 			continue;
 		}
 		/* (those taken given back, and the busy one queued for alone) */
