@@ -210,6 +210,7 @@ tests += {
       'generations_sever',
       'generations_retire',
       'generations_retire_guard',
+      'generations_retire_sever',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

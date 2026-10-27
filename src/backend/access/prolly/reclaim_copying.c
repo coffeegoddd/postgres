@@ -85,6 +85,8 @@ typedef struct Mark
 {
 	const ProllyChunkStoreRoutine *cs;
 	ProllyChunkGc *gc;
+	bool		read_any;		/* the horizon's edges read through any
+								 * settled file (a retire's) */
 	uint64		nslots;
 	uint8	   *marks;			/* a bit a slot */
 	uint64	   *queue;			/* marked, not yet read: a ring, count of
@@ -428,7 +430,8 @@ note_cut(const ProllyHash *boundary, const ProllyHash *parent, void *arg)
 		todo = list_delete_last(todo);
 		resetStringInfo(&data);
 		/* (a boundary commit gone already names nothing) */
-		if (!collected_read(mk, h, &data) ||
+		if (!(mk->read_any ? PROLLY_CALL(mk->cs, gc_read_any, mk->gc, h, &data) :
+			  collected_read(mk, h, &data)) ||
 			!PROLLY_CALL(format, open, (const uint8 *) data.data, data.len,
 						 &node))
 			continue;
@@ -768,6 +771,7 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 		{
 			CutBuild	cb = {&mk, NIL};
 
+			mk.read_any = retire;
 			PROLLY_CALL(dc.history_window, edges, &root,
 						retire ? any_read : collected_read, &mk,
 						note_cut, &cb);
