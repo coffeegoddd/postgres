@@ -68,10 +68,10 @@ my $now = sql($contents);
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $contents), $now, 'the standby replayed them');
 ok( $standby->log_contains(
-		'redo of a snapshot of .* syncs nothing: its own pages were logged as images',
+		'redo of a capture of .* syncs nothing: its own pages were logged as images',
 		$log_offset),
 	'redo of a kept snapshot syncs nothing');
-ok( $standby->log_contains('redo of a snapshot of .* writes out', $log_offset),
+ok( $standby->log_contains('redo of a capture of .* writes out', $log_offset),
 	'but writes out its pages');
 ok( $standby->log_contains(
 		'redo of a share of .* syncs nothing: its own pages were logged as images',

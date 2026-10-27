@@ -124,43 +124,12 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 						  BlockNumber old_block, char *page);
 
 /*
- * Snapshots of a tree map: a relation's pages as they were, kept by its root
- * page, each a reference to the subtrees it had then, taken and let go of in
- * O(1) of the relation's size; a new relation can be made of one.  At most
- * BMAP_SNAPSHOTS_MAX of them, gone with the relation's storage: a commit's
- * pages are kept by captured roots instead (below).  The
- * caller of bmap_snapshot_take() keeps the relation from changing, as for a
- * share.  A snapshot is kept only once the (sub)transaction taking it
- * commits: one whose taker aborted, or was ended by a crash, is listed by
- * nobody and let go of by the relation's next snapshot or its page store's
- * next sweep.
- */
-#define BMAP_SNAPSHOTS_MAX	16
-
-typedef struct BmapSnapshot
-{
-	uint64		id;				/* names it until it is let go of */
-	BlockNumber nblocks;		/* the relation's length then */
-} BmapSnapshot;
-
-extern uint64 bmap_snapshot_take(SMgrRelation reln);
-extern void bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids);
-extern bool bmap_snapshot_release(SMgrRelation reln, uint64 id);
-extern int	bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max);
-extern bool bmap_snapshot_unchanged(SMgrRelation reln, uint64 id);
-extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
-								bool replacing);
-extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
-								  SMgrRelation dst);
-
-/*
  * Captured roots: a relation's tree as it was at a moment, kept by its
  * page store (not by the relation), so any number of them, each outliving
  * the relation's storage until it is let go of, and any relation of the
- * store may be made of it, another branch's included.  Capturing one is a
- * snapshot's work (O(1) in the relation's size, but for the pages changed
- * since its last capture or snapshot, logged as images and written out),
- * and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
+ * store may be made of it, another branch's included.  Capturing one is
+ * O(1) in the relation's size, but for the pages changed since its last
+ * capture, logged as images and written out; and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
  * root (bmap_root_capture_of()) is captured of temporary storage
  * holding frozen copies of a relation's pages changed since its last root,
  * the rest shared with that root, and records the relation and its epoch

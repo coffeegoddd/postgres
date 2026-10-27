@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# At every WAL level, a share or a kept snapshot of block-mapped storage is
+# At every WAL level, a share or a captured root of block-mapped storage is
 # made durable by WAL: each block it shares that was its own is logged as
 # an image first, and its write is synced by the next checkpoint, as any
 # page's.  So it doesn't sync the database's page store, and its record
@@ -108,8 +108,8 @@ is(sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$start', '$end')
 is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'the share reads the source\'s rows');
 is(logged_by(q{UPDATE plain SET a = a + 0 WHERE a % 10 = 1},
-		qq{SELECT test_bmap_snapshot_take($plain)}),
-	't', 'and a snapshot taken on its own logs its images too');
+		qq{SELECT test_bmap_root_capture($plain)}),
+	't', 'and a root captured on its own logs its images too');
 
 # The buffers of relation file number 'rel' written out and evicted: its
 # map with them, so that recovery skips the records of pages from before
@@ -210,8 +210,8 @@ $node->stop('immediate');
 $node->append_conf('postgresql.conf', "wal_level = replica\nmax_wal_senders = 10");
 $node->start;
 is(sql($contents), $c5, 'WAL written at minimal recovers at replica');
-ok($node->log_contains('redo of a snapshot of .* syncs nothing: its own pages were logged as images', $log_offset),
-	'redo of a snapshot logged at minimal syncs nothing');
+ok($node->log_contains('redo of a capture of .* syncs nothing: its own pages were logged as images', $log_offset),
+	'redo of a capture logged at minimal syncs nothing');
 like(sql(q{UPDATE app.t SET v = 0; SELECT dolt_reset('--hard');
 	SELECT count(*), sum(v), sum(length(pad)) FROM app.t}),
 	qr/^\Q$c5\E$/m, 'and a hard reset gives back its kept pages');

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A share or a snapshot of a block-mapped relation, which logs the
+# A share or a capture of a block-mapped relation, which logs the
 # relation's own pages with its map's header held exclusively (at
 # wal_level replica), never waits for a page's content lock meanwhile: a
 # backend holding a page exclusively may be waiting for that header, to
@@ -48,7 +48,7 @@ sql(q{
 });
 my $scratch = sql(q{SELECT pg_relation_filenode('cow.scratch')});
 
-# 'op' (a share or a snapshot) stopped at the first page it logs, holding
+# 'op' (a share or a capture) stopped at the first page it logs, holding
 # the header; then 'go', in a session 'prep' set up before (its scan or
 # plan made, as those read the relation's length from the header), which
 # locks a page exclusively and waits for the header.  The op let go, both
@@ -164,12 +164,12 @@ SKIP:
 		$mdigest, 'a standby\'s copy has the rows');
 }
 
-# The same for a snapshot, of a page of a few rows.
+# The same for a capture, of a page of a few rows.
 sql(q{CREATE TABLE cow.u (a int PRIMARY KEY);
 	INSERT INTO cow.u SELECT generate_series(1, 10)});
 my $u = sql(q{SELECT pg_relation_filenode('cow.u')});
-check_no_deadlock('row lock and snapshot', $lock->('cow.u', 5),
-	'BEGIN; EXECUTE l; COMMIT', "test_bmap_snapshot_take($u)");
+check_no_deadlock('row lock and capture', $lock->('cow.u', 5),
+	'BEGIN; EXECUTE l; COMMIT', "test_bmap_root_capture($u)");
 is(sql(q{SELECT count(*) FROM cow.u}), '10', 'the rows locked');
 
 # A page copied while the header is let go: as of a fold, the row lock's
