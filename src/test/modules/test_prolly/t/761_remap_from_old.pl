@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# The first change of a page a root (or another map) holds copies it to a
-# block of its own.  The copy's record carries no image of the page: the
+# The first change of a heap page a root (or another map) holds copies it
+# to a block of its own.  The copy's record carries no image of the page: the
 # old block holds it durably, logged as an image when it was shared, and
 # nothing writes it in place since, so redo copies it from there.  After
 # a crash that replays such copies, and on a standby, the rows are as
@@ -41,7 +41,8 @@ sql(q{CREATE EXTENSION pg_walinspect; CREATE EXTENSION amcheck;
 my $at_base = sql($contents);
 sql('CHECKPOINT');
 
-# changes of pages the commit's roots hold: copies, logged without images
+# changes of heap pages the commit's roots hold: copies, logged without
+# images (an index's pages are logged with theirs)
 my $start = sql(q{SELECT pg_current_wal_insert_lsn()});
 sql(q{UPDATE app.t SET v = 1 WHERE id % 20 = 0});
 my $end = sql(q{SELECT pg_current_wal_insert_lsn()});
@@ -50,8 +51,9 @@ my ($copies, $with_images) = split(/\|/, sql(qq{
 	SELECT count(DISTINCT start_lsn),
 		count(DISTINCT start_lsn) FILTER (WHERE 'APPLY' = ANY(block_fpi_info))
 	FROM pg_get_wal_block_info('$start', '$end')
-	WHERE resource_manager = 'BlockMap' AND record_type = 'REMAP'}));
-cmp_ok($copies, '>', 0, 'the update copied pages the roots hold');
+	WHERE resource_manager = 'BlockMap' AND record_type = 'REMAP'
+		AND description LIKE '%/' || pg_relation_filenode('app.t') || ';%'}));
+cmp_ok($copies, '>', 0, 'the update copied heap pages the roots hold');
 is($with_images, '0', 'and logged no image of them');
 my $dirty = sql($contents);
 

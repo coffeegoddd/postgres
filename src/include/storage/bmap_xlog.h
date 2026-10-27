@@ -145,12 +145,13 @@ typedef struct xl_bmap_shrink
  * doesn't write there (the image may have hints only this map's buffer
  * had).
  *
- * A page another map holds (a share's, a root's) needs no image either
- * (BMAP_REMAP_FROM_OLD): the old block holds it durably, as the share or
- * capture made it (logged as an image then), and nothing writes it in
- * place since, so redo copies it from there to the new block and the
- * page's buffer.  Hints the buffer had and the block hadn't are lost, as
- * a hint may be.
+ * A heap page (of no special space) another map holds (a share's, a
+ * root's) needs no image either (BMAP_REMAP_FROM_OLD): the old block holds
+ * it durably, as the share or capture made it (logged as an image then),
+ * and nothing writes it since but another holder's buffer with hints set,
+ * so the copy is the block's page, on the primary as in redo, which reads
+ * it there.  Hints differ, as they may; the block map's masking ignores
+ * them, as heap's does.
  */
 #define BMAP_REMAP_ZERO		0x01
 #define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */

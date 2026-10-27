@@ -169,6 +169,7 @@
 
 #include "access/bufmask.h"
 #include "access/genam.h"
+#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -7324,7 +7325,9 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		int			id;
 		Page		page = BufferGetPage(buffer);
 		bool		zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
-		bool		from_old = !zeroed && count > 0;
+		/* (heap pages only: of no special space, their hints masked alike) */
+		bool		from_old = !zeroed && count > 0 &&
+			((PageHeader) page)->pd_special == BLCKSZ;
 		bool		reused;
 		ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
 
@@ -7337,10 +7340,20 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 
 		/*
 		 * A page another map holds is copied from its old block, which
-		 * holds it durably (BMAP_REMAP_FROM_OLD); else the old block gets
-		 * what other maps should read, if only buffered.
+		 * holds it durably (BMAP_REMAP_FROM_OLD), as redo copies it: the
+		 * buffer takes the block's page, the same but for hints set since
+		 * it was written (which redo couldn't know of).  Else the old
+		 * block gets what other maps should read, if only buffered.
 		 */
-		if (!from_old && BufferIsDirty(buffer))
+		if (from_old)
+		{
+			PGIOAlignedBlock old;
+			void	   *pages[1] = {old.data};
+
+			mdreadv(store_smgr(rel), MAIN_FORKNUM, old_block, pages, 1);
+			memcpy(page, old.data, BLCKSZ);
+		}
+		else if (BufferIsDirty(buffer))
 			FlushOneBuffer(buffer);
 
 		alloc_take(rel, 1, &new_block, &alloc);
@@ -14323,5 +14336,19 @@ bmap_redo(XLogReaderState *record)
 void
 bmap_mask(char *pagedata, BlockNumber blkno)
 {
+	Page		page = (Page) pagedata;
+	PageHeader	ph = (PageHeader) page;
+
+	/*
+	 * A relation's page a copy took from its old block (BMAP_REMAP_FROM_OLD)
+	 * has the hints that block has as redo reads it, which another map's
+	 * buffer may have written there since: hints are masked as heap masks
+	 * them (only heap pages, of no special space, are copied so).
+	 */
+	if (!PageIsNew(page) && ph->pd_special == BLCKSZ)
+	{
+		heap_mask(pagedata, blkno);
+		return;
+	}
 	mask_page_lsn_and_checksum(pagedata);
 }
