@@ -1212,7 +1212,14 @@ allow; a transaction's own commit keeps its pages too when one is due and
 no other writer of the branch is at work.  The time a branch's root was
 last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
-nothing of the kept commits.  A move to a commit no root was captured at
+nothing of the kept commits.  The cost is WAL: after each capture the
+first change of every page logs its image (copy-on-write), and the
+capture logs an image of every page changed since the last one, so under
+dolt.transaction_commit with a root each second a workload of one-row
+commits writes about twice master's WAL.  That is accepted for that mode
+for now; a capture that syncs the pages a full-page write doesn't need,
+and a copy-on-write that logs no image redo can do without, are to bring
+it down.  A move to a commit no root was captured at
 restores the nearest kept commit before it (by first parents, no further
 back than the oldest commit any branch's list keeps) and writes the
 rows the two differ by: an interval's, and what a merge between brought
