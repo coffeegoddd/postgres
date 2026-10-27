@@ -1282,14 +1282,17 @@ captured among the branch's other writers and frozen later (the lazy
 root freezer, below).  The time a branch's root was
 last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
-nothing of the kept commits.  The cost is WAL: after each capture the
-first change of every page logs its image (copy-on-write), and the
-capture logs an image of every page changed since the last one, so under
-dolt.transaction_commit with a root each second a workload of one-row
-commits writes about twice master's WAL.  That is accepted for that mode
-for now; a capture that syncs the pages a full-page write doesn't need,
-and a copy-on-write that logs no image redo can do without, are to bring
-it down.  A move to a commit no root was captured at
+nothing of the kept commits.  The cost is WAL: the capture logs an image
+of every page changed since the last one, and each such page's first
+change after copies it to a new block.  The copy logs no image of its own
+when the capture's image can stand for it (the copy-on-write image
+policy, prolly_cowimage.h; "after_redo" by default): see "Copies without
+images" below.  A copy whose page was captured before the redo pointer,
+or changed since its capture, logs its image, so each checkpoint cycle
+images such a page once more.  That is accepted under
+dolt.transaction_commit with a root each second for now; a capture that
+syncs the pages a full-page write doesn't need is to bring it down
+further.  A move to a commit no root was captured at
 restores the nearest kept commit before it (by first parents, at most
 1,024 back and no further than the oldest commit any branch's list
 keeps) and writes the rows the two differ by: an interval's, and what a
@@ -1384,6 +1387,32 @@ ask the map), and that change's redo reaches the relation's buffer only,
 which nothing else would write to the block before a restartpoint.
 Redo goes by the record's flag, not the current wal_level, which can
 change only across a restart, whose shutdown checkpoint syncs everything.
+
+Copies without images.  A capture stamps each page it logged that is
+unchanged since (its LSN still the one its image has) with the capture
+record's end, which the map's header keeps as shared_lsn, with where the
+capture's walk began as shared_since; they are set on the primary after
+the record, never by redo, and masked for wal_consistency_checking.  A
+copy of a heap or B-tree page whose LSN is shared_lsn, while shared_since
+is past the redo pointer, logs no image (BMAP_REMAP_FROM_OLD), and redo
+copies the old block from the page store's file.  Every replay that
+reaches the copy began before the capture's walk, so it replayed the
+capture's image of the block, whose redo wrote it, and nothing in WAL
+writes the block between the two: it is shared, so held, and never
+changes in place.  So a base backup's torn copy of it, its loss before a
+restartpoint, or another relation's page there since (once the root
+holding it was let go of) are all replaced by replay before the copy
+reads it.  A copy skipped for a newer map gets nothing from the old block;
+the new block's own later image (its next capture's) gives it its page.
+The page is registered with its LSN set back to shared_since for the
+record's assembly, so the insert's full-page-write check, made again
+under its insertion lock, takes its image if a checkpoint moved the redo
+pointer past the walk meanwhile; with full_page_writes off, a check after
+the insert logs the page's image (XLOG_FPI) right after the record
+(bmap_copy_images_late).  Hints the primary's buffer had and the old
+block lacks are masked as the page kind's own records mask them, which is
+why other kinds of pages keep their images.  A relation whose data skips
+WAL is never stamped.
 
 Syncing the page store instead, at wal_level minimal, isn't enough: a
 crash's replay may write the block again after the sync made it durable.

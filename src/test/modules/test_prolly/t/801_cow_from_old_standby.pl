@@ -14,6 +14,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $contents = q{SELECT count(*), sum(v), sum(length(pad)) FROM app.t};
 my $checked = q{SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL)
@@ -24,6 +25,10 @@ $primary->init(allows_streaming => 1);
 $primary->append_conf('postgresql.conf', qq{
 wal_keep_size = 1GB
 autovacuum = off
+# (a page's stamp is its buffer's: the pages are to stay cached, and no
+# checkpoint is to come between the cycles)
+shared_buffers = 32MB
+max_wal_size = 1GB
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
 });
@@ -61,8 +66,8 @@ for my $round (1 .. 3)
 		SELECT m.phys FROM pg_index i,
 			test_bmap_map(pg_relation_filenode(i.indexrelid)) m
 		WHERE i.indrelid = 'app.t'::regclass});
-	sql(qq{UPDATE app.t SET v = v - $round WHERE id % 40 = 0;
-		SELECT dolt_commit('-am', 'round $round')});
+	sql(qq{UPDATE app.t SET v = v - $round WHERE id % 40 = 0});
+	sql(qq{SELECT dolt_commit('-am', 'round $round')});
 }
 sql(q{UPDATE app.t SET v = v - 10 WHERE id % 40 = 0});
 cmp_ok(counted($primary, 'bmap_copies_imageless'), '>', $imageless,
@@ -128,9 +133,29 @@ if ($injection)
 SELECT dolt_commit('-am', 'mid');
 });
 	$primary->wait_for_event('client backend', 'bmap-root-preserved');
-	$primary->backup('mid');
+
+	# (the backup's checkpoint may wait for a page the capture holds: it
+	# runs in the background, and the capture is let go once the
+	# checkpoint has set its redo pointer)
+	my $redo = sql(q{SELECT redo_lsn FROM pg_control_checkpoint()});
+	my $dir = $primary->backup_dir . '/mid';
+	my $bb = IPC::Run::start(
+		[ 'pg_basebackup', '--pgdata' => $dir, '--host' => $primary->host,
+		  '--port' => $primary->port, '--checkpoint' => 'fast', '--no-sync' ],
+		'>' => \my $bb_out, '2>' => \my $bb_err);
+	my $began = 0;
+	for (1 .. 300)
+	{
+		$began = sql(qq{SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE backend_type = 'checkpointer' AND wait_event LIKE 'Buffer%')
+			OR (SELECT redo_lsn FROM pg_control_checkpoint()) <> '$redo'}) eq 't';
+		last if $began;
+		usleep(100_000);
+	}
+	ok($began, "the backup's checkpoint began during the capture");
 	sql(q{SELECT injection_points_detach('bmap-root-preserved');
 		SELECT injection_points_wakeup('bmap-root-preserved')});
+	$bb->finish or die "pg_basebackup failed: $bb_err";
 	$w->quit;
 	sql(q{UPDATE app.t SET v = v - 30 WHERE id % 40 = 0});
 	$now = sql($contents);

@@ -21,6 +21,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $contents = q{SELECT count(*), sum(v), sum(length(pad)) FROM app.t};
 my $checked = q{SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL)
@@ -135,11 +136,16 @@ CHECKPOINT;
 });
 		# (the checkpoint's redo pointer is set before it writes buffers:
 		# once it waits for one, or is done, it is past the capture)
-		$node->poll_query_until('postgres', qq{
-			SELECT EXISTS (SELECT FROM pg_stat_activity
+		my $began = 0;
+		for (1 .. 300)
+		{
+			$began = $sql->(qq{SELECT EXISTS (SELECT FROM pg_stat_activity
 				WHERE backend_type = 'checkpointer' AND wait_event LIKE 'Buffer%')
-			OR (SELECT redo_lsn FROM pg_control_checkpoint()) <> '$redo'})
-		  or die 'the checkpoint never began';
+			OR (SELECT redo_lsn FROM pg_control_checkpoint()) <> '$redo'}) eq 't';
+			last if $began;
+			usleep(100_000);
+		}
+		ok($began, "$name: the checkpoint began as the copy waited");
 		$sql->(q{SELECT injection_points_detach('bmap-copy-from-old');
 			SELECT injection_points_wakeup('bmap-copy-from-old')});
 		$w->quit;
