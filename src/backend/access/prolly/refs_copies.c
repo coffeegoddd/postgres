@@ -3726,14 +3726,14 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
 
 			/*
-			 * (of the session's own kept pages, the new storage carries
-			 * the table's lineage on, so the branch's other kept roots of
-			 * it stay its own, with nothing renamed; of another branch's,
-			 * it begins its own)
+			 * (the new storage carries the table's lineage on, so the
+			 * branch's other kept roots of it stay its own, with nothing
+			 * renamed: another branch's pages too, which share_kept() gives
+			 * only where the relations are stored alike on both, so the
+			 * branch's roots read as rightly by the table after as before)
 			 */
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
-											s->branch == MyBranch, NULL,
-											NULL, &move_wait);
+											true, NULL, NULL, &move_wait);
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
