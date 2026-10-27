@@ -22,10 +22,12 @@
  *   (never a session's); set_policy() sets a branch's own setting (value
  *   NULL: the database's again), the database owner's.
  * - plan() works out what a sever would cut (before not NULL: every commit
- *   dated before it, whatever the policy), without changing anything: the commits it would sever, the boundary edges,
- *   and the commits kept past the window (pinned).  A commit any ref
- *   names is kept; so is every commit on the way from a branch head to
- *   its merge base with each other branch head.  It holds every ref.
+ *   dated before it, whatever the policy), without changing anything:
+ *   the commits it would sever, the boundary edges, and the commits kept
+ *   past the window (pinned).  A commit any ref names keeps its data; so
+ *   does each merge base of a branch head with each other ref, by
+ *   itself, not the path to it (every commit object is kept, so the
+ *   search for it goes across the horizon).  It holds no ref.
  * - sever() severs what plan() finds, as action says: archive (the
  *   fragment sent to the policy's archive, and found whole there, before
  *   the horizon records it; with no archive, nothing is severed, with a
@@ -62,8 +64,10 @@
  *   cut taken once for the whole evaluation.  Not the commits kept only
  *   because a ref names them or for a merge base.  A lineage with no
  *   window keeps all its history here, so all of it is in the window.
- *   in_window() says whether commit is among them: a sever never severs a
- *   commit in_window() says is in the window.  Both read the refs as they
+ *   in_window() says whether commit is among them: a sever by the policy
+ *   never severs a commit in_window() says is in the window (it takes the
+ *   background's last cut for size; an explicit cut, before, and the size
+ *   limit's next cut may go further).  Both read the refs as they
  *   stand, holding none.
  * - repair() reattaches the newest nfragments of them (< 0: all), newest
  *   first, from source (a remote's name or URL; NULL: each fragment's

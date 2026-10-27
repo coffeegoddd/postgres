@@ -36,9 +36,10 @@
  * tag's, a remote-tracking branch's, a session's detached head, a
  * stash's, a merge's or rebase's in progress, a pin's, a kept commit's) a
  * walk keeps the commits its window does (dated at or after the cut), and
- * every commit on the way to every merge base of a branch with each other
- * ref (one at least as high as the lowest of those bases): merging never
- * needs a severed commit.  The commits kept are the window; an edge from one to a
+ * every merge base of a branch with each other ref keeps its data (by
+ * itself: the search for it goes across the horizon, every commit object
+ * kept), so merging never needs severed data.  The commits kept are the
+ * window; an edge from one to a
  * parent outside it is a boundary edge, and the parent a top of the
  * fragment, which is every commit the tops reach outside the window and
  * the horizon there was already.
@@ -119,6 +120,7 @@
 #define HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
 
 static void check_may_sever(const char *what);
+static List *fragment_records(void);
 static void sever_cut(ProllyWindowAction action, const TimestampTz *before,
 					  TimestampTz size_cut, ProllyWindowResult *result);
 static char *source_url(const char *source);
@@ -1094,6 +1096,7 @@ typedef struct Plan
 								 * with (an amend of a boundary commit) */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
 	List	   *bases;			/* ProllyHash *: merge bases, kept */
+	List	   *tops;			/* ProllyHash *: the fragment's, each once */
 	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
 	bool		quiet;			/* the window evaluated: no warnings */
 } Plan;
@@ -1856,6 +1859,23 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		}
 	}
 
+	/*
+	 * (and a commit beneath the horizon whose data a merge base or a ref
+	 * kept, a fragment's stop, that nothing keeps now: no walk from a head
+	 * reaches it past the severed commits above it, so it is a top too;
+	 * it was older than its window when they were severed)
+	 */
+	foreach_ptr(FragmentRecord, r, fragment_records())
+		for (int i = 0; i < r->nstops; i++)
+		{
+			ProllyHash *st = &r->stops[i];
+
+			if (set_has(plan->archived, st) || plan_commit(plan, st)->kept)
+				continue;
+			todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)), st,
+										sizeof(ProllyHash)));
+		}
+
 	/* the fragment: what the new tops reach that isn't kept or past */
 	fragment = id_set("prolly window fragment", sizeof(ProllyHash));
 	{
@@ -1867,6 +1887,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		foreach(lc, tops)
 			if (set_add(fragment, lfirst(lc)))
 				todo = lappend(todo, lfirst(lc));
+		plan->tops = list_copy(todo);
 		while (todo != NIL)
 		{
 			ProllyHash *id = llast(todo);
@@ -2378,7 +2399,6 @@ fragment_reach(List *commits)
 	return c.chunks;
 }
 
-static List *fragment_records(void);
 
 /*
  * Whether an older fragment, still severed, was archived anywhere but url
@@ -2948,20 +2968,13 @@ build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
 	fragment_closure(*ids, &f->digest, &f->chunks, &f->bytes,
 					 want_chunks ? chunk_list : NULL, deltas);
 
-	/* its tops: each parent the boundary keeps no more, once */
-	tops = palloc_array(ProllyHash, Max(list_length(plan->edges), 1));
-	{
-		HTAB	   *seen = id_set("prolly fragment tops", sizeof(ProllyHash));
-
-		foreach(lc, plan->edges)
-		{
-			ProllyHash *pair = lfirst(lc);
-
-			if (set_add(seen, &pair[1]))
-				tops[ntops++] = pair[1];
-		}
-		hash_destroy(seen);
-	}
+	/*
+	 * its tops: each parent the boundary keeps no more, and each commit
+	 * beneath the horizon kept no more, once
+	 */
+	tops = palloc_array(ProllyHash, Max(list_length(plan->tops), 1));
+	foreach(lc, plan->tops)
+		tops[ntops++] = *(ProllyHash *) lfirst(lc);
 	f->ntops = ntops;
 	f->tops = tops;
 	*nstops = list_length(plan->stops);

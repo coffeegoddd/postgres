@@ -336,7 +336,7 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action  | fragment | commits | boundary | sent_what_it_reaches 
 ---------+----------+---------+----------+----------------------
- archive |          |       0 | {}       | f
+ archive |        2 |       1 | {}       | t
 (1 row)
 
 SELECT fragment, location = :'url_second' AS archived_second
@@ -344,7 +344,8 @@ FROM prolly_history_horizon() ORDER BY fragment;
  fragment | archived_second 
 ----------+-----------------
         1 | f
-(1 row)
+        2 | t
+(2 rows)
 
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
  freed 
@@ -368,7 +369,7 @@ SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_orde
 SELECT dolt_history_repair() AS repaired;
  repaired 
 ----------
-        1
+        2
 (1 row)
 
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
@@ -440,13 +441,13 @@ SELECT action, fragment, commits,
 FROM dolt_history_sever();
  action | fragment | commits | boundary 
 --------+----------+---------+----------
- delete |        2 |       4 | {a2}
+ delete |        3 |       4 | {a2}
 (1 row)
 
 SELECT fragment, state, location FROM prolly_history_horizon() ORDER BY fragment DESC;
  fragment |  state  | location 
 ----------+---------+----------
-        2 | deleted | 
+        3 | deleted | 
 (1 row)
 
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;

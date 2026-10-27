@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A standby replays a sever: its horizon is the primary's, its log stops
-# there, and once the primary's full collection frees the severed history
+# A standby replays a sever: its horizon is the primary's, its log the
+# primary's (every commit listed), and once the primary's full collection frees the severed history
 # the standby says a severed commit is past the horizon.  A plan reads on
 # the standby, holding nothing.
 
@@ -42,10 +42,10 @@ is(ssql(q{SET client_min_messages = warning;
 	SELECT count(*) FROM dolt_log('main')}),
 	sql(q{SET client_min_messages = warning;
 	SELECT count(*) FROM dolt_log('main')}),
-	'its log stops where the primary\'s does');
+	'its log is the primary\'s');
 cmp_ok(ssql(q{SELECT count(*) FROM prolly_history_plan('2020-01-05')}), '>', 0,
 	'a plan reads on the standby');
-my ($ret, $out, $err) = $standby->psql('hs', qq{SELECT prolly_root_hash('$top')});
+my ($ret, $out, $err) = $standby->psql('hs', qq{SELECT count(*) FROM dolt_at('$top', NULL::hs.t)});
 like($err, qr/is past the history horizon/,
 	'the standby says a severed commit is past the horizon');
 
