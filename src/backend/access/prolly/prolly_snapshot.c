@@ -3114,8 +3114,12 @@ history_next_commit(MountScan *ss)
 			old = MemoryContextSwitchTo(ss->boundcxt);
 			for (int i = 0; i < info.nparents; i++)
 			{
-				ProllyHash *p = palloc0(sizeof(ProllyHash));
+				ProllyHash *p;
 
+				/* (a listing stops at the history horizon) */
+				if (prolly_window_stops_at(&info.parents[i]))
+					continue;
+				p = palloc0(sizeof(ProllyHash));
 				*p = info.parents[i];
 				h->queue = lappend(h->queue, p);
 			}

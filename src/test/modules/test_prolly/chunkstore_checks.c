@@ -35,6 +35,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
 #include "access/prolly_chunkstore.h"
+#include "utils/timestamp.h"
 #include "access/prolly_commitcache.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
@@ -544,6 +545,57 @@ file_row(const char *name, int nchunks, uint64 size, bool settled, void *arg)
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
+static void
+generation_row(const ProllyChunkGeneration *g, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[7];
+	bool		nulls[7] = {0};
+
+	values[0] = CStringGetTextDatum(g->name);
+	values[1] = Int32GetDatum((int32) g->nchunks);
+	values[2] = BoolGetDatum(g->settled);
+	values[3] = Int64GetDatum((int64) g->epoch_lo);
+	values[4] = Int64GetDatum((int64) g->epoch_hi);
+	values[5] = Int64GetDatum((int64) g->garbage);
+	values[6] = Int64GetDatum(g->xrefs);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_generations);
+Datum
+test_chunk_generations(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(cs(), generations, store(), generation_row, rsinfo);
+	return (Datum) 0;
+}
+
+static void
+epoch_row(uint32 epoch, TimestampTz ended, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = Int64GetDatum((int64) epoch);
+	values[1] = TimestampTzGetDatum(ended);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_epochs);
+Datum
+test_chunk_epochs(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(cs(), epochs, store(), epoch_row, rsinfo);
+	return (Datum) 0;
+}
+
 PG_FUNCTION_INFO_V1(test_chunk_table_files);
 Datum
 test_chunk_table_files(PG_FUNCTION_ARGS)
@@ -552,6 +604,106 @@ test_chunk_table_files(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 	PROLLY_CALL(cs(), table_files, store(), file_row, rsinfo);
+	return (Datum) 0;
+}
+
+/* test_chunk_reachable()'s walk: the chunks seen, and those to read */
+typedef struct Reachable
+{
+	HTAB	   *seen;
+	List	   *queue;			/* of ProllyHash * */
+} Reachable;
+
+static void
+reach(const ProllyHash *ref, void *arg)
+{
+	Reachable  *r = arg;
+	char		key[PROLLY_HASH_MAX_LEN + 1] = {0};
+	bool		found;
+
+	if (ref->len == 0)
+		return;
+	key[0] = (char) ref->len;
+	memcpy(key + 1, ref->bytes, ref->len);
+	(void) hash_search(r->seen, key, HASH_ENTER, &found);
+	if (!found)
+	{
+		ProllyHash *h = palloc(sizeof(ProllyHash));
+
+		*h = *ref;
+		r->queue = lappend(r->queue, h);
+	}
+}
+
+/*
+ * The chunks the store holds that the refs' root and the database's tables
+ * (their values out of line, prolly_toast_roots()) reach, by what each
+ * chunk names (prolly_chunk_references()): what a collection must keep,
+ * found apart from its marks.  A chunk named but not in the store isn't
+ * listed.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_reachable);
+Datum
+test_chunk_reachable(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASHCTL		ctl;
+	Reachable	r;
+	ProllyHash	root;
+	StringInfoData data;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = PROLLY_HASH_MAX_LEN + 1;
+	ctl.entrysize = PROLLY_HASH_MAX_LEN + 1;
+	r.seen = hash_create("reachable chunks", 1024, &ctl, HASH_ELEM | HASH_BLOBS);
+	r.queue = NIL;
+	PROLLY_CALL(cs(), root, store(), &root);
+	reach(&root, &r);
+	prolly_toast_roots(reach, &r);
+	initStringInfo(&data);
+	while (r.queue != NIL)
+	{
+		ProllyHash *h = linitial(r.queue);
+		Datum		values[1];
+		bool		nulls[1] = {0};
+
+		r.queue = list_delete_first(r.queue);
+		resetStringInfo(&data);
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(cs(), get, store(), h, &data))
+			continue;
+		values[0] = PointerGetDatum(hash_text(h));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		prolly_chunk_references(data.data, data.len, reach, &r);
+	}
+	hash_destroy(r.seen);
+	return (Datum) 0;
+}
+
+static void
+file_chunk_row(const ProllyHash *hash, const char *frame, Size len, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[1];
+	bool		nulls[1] = {0};
+
+	values[0] = PointerGetDatum(hash_text(hash));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/* The hashes of the chunks table file name holds. */
+PG_FUNCTION_INFO_V1(test_chunk_file_hashes);
+Datum
+test_chunk_file_hashes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	if (!PROLLY_HAS(cs(), file_chunks))
+		elog(ERROR, "the chunk store doesn't list a file's chunks");
+	PROLLY_CALL(cs(), file_chunks, store(), text_to_cstring(PG_GETARG_TEXT_PP(0)),
+				file_chunk_row, rsinfo);
 	return (Datum) 0;
 }
 
@@ -681,6 +833,39 @@ test_refs_walk_count(PG_FUNCTION_ARGS)
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.refs, walk, &refs, count_node, &d);
 	PG_RETURN_INT64(d.visited);
+}
+
+static bool
+node_row(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[1];
+	bool		nulls[1] = {0};
+
+	values[0] = PointerGetDatum(hash_text(&node->hash));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	return true;
+}
+
+/*
+ * The nodes the refs' walk (what reclamation keeps) visits from the chunk
+ * store's root, each as often as it is visited: what a collection keeps
+ * of the chunks it reads.
+ */
+PG_FUNCTION_INFO_V1(test_refs_walk_nodes);
+Datum
+test_refs_walk_nodes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef refs;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk, &refs, node_row, rsinfo);
+	return (Datum) 0;
 }
 
 static void

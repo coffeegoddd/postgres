@@ -28,6 +28,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "access/sdir.h"
 #include "access/transam.h"
 #include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
@@ -295,6 +296,21 @@ typedef struct ProllyKeptCommit
 } ProllyKeptCommit;
 
 typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
+
+/* Reads chunk hash into out, as a store's get() does; false if it can't. */
+typedef bool (*ProllyChunkRead) (void *arg, const ProllyHash *hash,
+								 StringInfo out);
+
+/* A move of a head log: its number in the log, its date, its commit. */
+typedef struct ProllyHeadMove
+{
+	int64		seq;
+	TimestampTz moved_at;
+	ProllyHash	commit;
+} ProllyHeadMove;
+
+/* Visits a move; false stops the visit. */
+typedef bool (*ProllyHeadMoveVisit) (const ProllyHeadMove *move, void *arg);
 /* A branch keeping pages as of commit (kept_holders()). */
 typedef void (*ProllyKeptHolderVisit) (const char *name, const ProllyHash *commit,
 									   void *arg);
@@ -897,6 +913,60 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*branches_folded) (const char *name, ProllyBranchVisit visit,
 									void *arg);
+
+	/*
+	 * Optional, together: head logs.  Each branch's head moves are logged
+	 * in order, each with its date (when it was made in its transaction,
+	 * not when that committed; never before the move before it) and the
+	 * commit it moved to, with the transaction; and a
+	 * remote-tracking branch's (branch not NULL: name is its remote's), as
+	 * fetches move it.  head_at() finds the move last made at or before at
+	 * (false: none was), a seek however long the log is, whatever dates
+	 * the commits record.  head_moves() visits the moves dated from..to
+	 * (both included) in order, forward or backward, until visit returns
+	 * false.  A log goes with its branch.  "The nearest commit at or
+	 * before commit C" is no question of a log: walk C's parents.
+	 */
+	bool		(*head_at) (const char *name, const char *branch,
+							TimestampTz at, ProllyHeadMove *move);
+	void		(*head_moves) (const char *name, const char *branch,
+							   TimestampTz from, TimestampTz to,
+							   ScanDirection direction,
+							   ProllyHeadMoveVisit visit, void *arg);
+
+	/*
+	 * Optional, together: entries another component keeps in the refs (the
+	 * history window's horizon), each in a space of its own named by a
+	 * byte, changed with the transaction as every entry is.  They name no
+	 * chunks, so they keep nothing from a collection, and transfers never
+	 * send them.  A caller putting one holds every ref first (lock()).
+	 * side_scan() visits space's entries from key from (NULL: its first,
+	 * or its last backward) in direction until visit returns false; the key
+	 * visited is without the space.
+	 */
+	bool		(*side_get) (char space, const ProllyKey *key, StringInfo value);
+	void		(*side_put) (char space, const ProllyKey *key,
+							 const ProllyValue *value);
+	void		(*side_scan) (char space, const ProllyKey *from,
+							  ScanDirection direction,
+							  bool (*visit) (const ProllyKey *key,
+											 const ProllyValue *value,
+											 void *arg),
+							  void *arg);
+
+	/*
+	 * Optional: side_scan() of the refs as root (a store's root, perhaps
+	 * an older one) had them, each node read by read(read_arg, ...), not
+	 * from the store: for a collection, which reads only its own way.
+	 */
+	void		(*side_scan_at) (const ProllyHash *root, ProllyChunkRead read,
+								 void *read_arg, char space,
+								 const ProllyKey *from,
+								 ScanDirection direction,
+								 bool (*visit) (const ProllyKey *key,
+												const ProllyValue *value,
+												void *arg),
+								 void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -914,6 +984,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  * back rather than write rows.
  */
 extern PGDLLIMPORT int prolly_kept_commits;
+extern PGDLLIMPORT int prolly_root_interval;
+extern PGDLLIMPORT int prolly_root_interval_commits;
+extern PGDLLIMPORT bool prolly_freeze_roots;
 
 /*
  * prolly.restore_min_changes: how many of a table's rows must differ from
@@ -958,9 +1031,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
 	"commit_relations", \
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
-	"forget_records", "check_copies_read", "branches_folded"
+	"forget_records", "check_copies_read", "branches_folded", \
+	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branches_folded
+#define PROLLY_REFS_LAST_CALLBACK side_scan_at
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
@@ -981,6 +1055,15 @@ typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
 extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 									  ProllyCommitLookup lookup, void *lookup_arg,
 									  ProllyHash *base);
+
+/*
+ * Every maximal common ancestor of a and b, the candidates a merge base is
+ * chosen from (several where histories cross), into *bases (palloc'd); the
+ * count.
+ */
+extern int	prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
+									   ProllyCommitLookup lookup,
+									   void *lookup_arg, ProllyHash **bases);
 
 /*
  * A commit's height: the most commits on a path from it to a root of its

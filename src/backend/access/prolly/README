@@ -81,6 +81,8 @@ Changes to this design are tracked in GitHub issues:
 	json_tree         prolly_jsontree.h       paths, stub
 	node_cache        prolly_nodecache.h      shared, stub
 	commit_cache      prolly_commitcache.h    shared, stub
+	history_window    prolly_window.h         archive, stub
+	root_freezer      prolly_rootfreeze.h     capture, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -981,6 +983,19 @@ all; dropping a database forgets its entries.  A transaction's entries
 are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
 and commit_cache_misses).
 
+Each branch has a head log (the refs' head_at() and head_moves()): its
+head's moves in order, each with when it was made and the commit it moved
+to (a commit, a merge, a reset, a transaction's commit, a pull's
+fast-forward), with the transaction; a remote-tracking branch has one as
+fetches and pushes move it.  "The commit branch B was at at time T" is a
+seek (prolly_head_at(), prolly_head_log()), whatever dates the commits
+were given.  A log is a tree of its own, keyed by each move's date and
+number, so a move goes at its right edge; the latest moves (at most 16)
+wait in the branch's mover entry, which every move writes anyway, and go
+into the tree together, so a commit doesn't rewrite more of the refs for
+its log.  A log goes with its branch (a rename keeps it).  "The nearest
+commit at or before commit C" is no question of a log: walk C's parents.
+
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
@@ -1195,17 +1210,75 @@ head hasn't begins empty too, so the move drops it without its pages
 having been shared (and, for pages no other map held, logged) first.  A
 table whose definition differs keeps its pages: the move may keep its rows.
 
-A branch's pages are kept as of the last commits it was at
-(prolly.kept_commits, 2 by default): when a commit's fold, or a move
-settled, leaves the working set known to be a commit's root, each
+A commit's pages are kept by page-tree roots, captured at commits as
+often as the root interval allows (below): when a commit's fold, or a
+move settled, leaves the working set known to be a commit's root, each
 block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
-change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
-through branch operations' keep()), O(1) in its size, a relation unchanged
-since a commit kept already reusing that one's.  A snapshot writes out only
-the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers.  Redo of one writes the same pages,
-walking the snapshot's own leaves as the record names them, and syncs
-nothing: those pages were logged as images (below).
+change logs) is kept by a root of its storage captured into its page store
+(bmap_root_capture(), through branch operations' keep()), O(1) in its
+size, a relation unchanged since one of the newest kept commits reusing
+that one's.  A root is the store's, not the relation's or the branch's:
+any number of them are kept, each outlives the relation's storage (a
+restore, a drop) until the commit keeping it is let go of, which lets go
+of it as its transaction commits, and a move of any branch to the commit
+is given it (below).  A branch's list keeps the newest
+prolly.kept_commits (2 by default) of its kept commits; retention over
+the history window is to replace that cap, a commit whose root it let
+go of moved to as one no root was captured at.  A capture writes out
+only the relation's pages changed since its last capture (those its map
+walk finds), never visiting
+the buffers.  Redo of one writes the same pages, walking the root's own
+leaves as the record names them, and syncs nothing: those pages were
+logged as images (below).
+
+Roots are captured no more often than prolly.root_interval (by default
+every commit made by hand, and a second under dolt.transaction_commit,
+whose transactions each make a commit) and prolly.root_interval_commits
+allow; a transaction's own commit keeps its pages too when one is due and
+no other writer of the branch is at work.  The time a branch's root was
+last kept, or tried, is in shared memory: once the interval passes, one
+backend's commit claims the next try, and the others' within it read
+nothing of the kept commits.  The cost is WAL: after each capture the
+first change of every page logs its image (copy-on-write), and the
+capture logs an image of every page changed since the last one, so under
+dolt.transaction_commit with a root each second a workload of one-row
+commits writes about twice master's WAL.  That is accepted for that mode
+for now; a capture that syncs the pages a full-page write doesn't need,
+and a copy-on-write that logs no image redo can do without, are to bring
+it down.  A move to a commit no root was captured at
+restores the nearest kept commit before it (by first parents, at most
+1,024 back and no further than the oldest commit any branch's list
+keeps) and writes the rows the two differ by: an interval's, and what a
+merge between brought
+in.  A commit's
+pages are the commit's, whichever branch kept them: a move restores them
+from another branch's kept commit too (share_kept()), so a branch made at
+a commit moves back along its history as the branch that made it would.
+A root's slot names the transactions that captured and let go of it,
+which VACUUM settles (bmap_roots_reclaim()) before the database's oldest
+transaction id advances: no slot then needs the commit log once it
+forgets them, and one a crash left is reclaimed rather than held.
+A commit's roots hold its heap pages (tables', TOAST tables', change
+logs') frozen as of the commit (the root freezer, prolly_rootfreeze.h;
+"capture" freezes them as the commit keeps them): each page changed since
+the relation's last root is copied, frozen as of the commit's snapshot
+(the versions it sees, xmin frozen, xmax cleared; every other version a
+dead line pointer, never an unused one, as the root's index pages, kept
+as they are, may point at it; a HOT chain's root redirecting to the
+version left), and written to a copy of that root, temporary storage made
+a root of (branch operations' keep(), with freeze); the relation keeps
+its own pages, unshared, and its epoch raised so that each one's next
+change marks it changed since (bmap_changed_pages()).  A frozen root never
+goes stale: its kept frozenxid is FrozenTransactionId, so it is never held
+past the database's frozen horizon, and any session may be given its
+pages.  Finding the pages changed reads only the map's nodes set since the
+epoch: a page's change sets every pointer above its leaf in the map's
+epoch (once a node for each epoch), so the walk passes over the subtrees
+set before, and a relation unchanged since its root reads no node.
+prolly.freeze_roots off keeps them as captured, sharing the relation's
+pages.  Under dolt.transaction_commit roots are kept as captured: freezing them
+in every transaction's commit would cost too much, and is to move to the
+background there.
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
@@ -1272,15 +1345,15 @@ names (a node freed since and its block taken as a relation's page).
 Only while nothing else can be on the pages: the relations are locked
 against writers without waiting, and the snapshot the commit or move went
 by saw every writer of the branch that ended and nobody else is writing
-it; otherwise nothing is kept.  Not at a transaction's own commit
-(dolt.transaction_commit), whose head moves every transaction.  The refs
+it; otherwise nothing is kept.  At a transaction's own commit
+(dolt.transaction_commit) only when a root is due (prolly.root_interval).  The refs
 record each kept commit with the branch's baseline then and each table's
-relations and snapshots ('K').
-A snapshot's slot names the transaction that took it, so one whose
+relations and roots ('K').
+A root's slot names the transaction that captured it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
-included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  VACUUM leaves the pages a relation shares only
-with its own snapshots as it leaves any shared page with nothing to
+included) is held by nobody: the store's next reclaim, or a page sweep,
+lets go of it.  VACUUM leaves the pages a relation shares only
+with roots and its own snapshots as it leaves any shared page with nothing to
 reclaim (an aggressive VACUUM still freezes them, copying them).  With
 prolly.vacuum_copy_kept_pages on, it freezes and sets them all-visible,
 copying them (the kept version goes once its commit stops being kept),
@@ -1293,83 +1366,144 @@ the newest entry another map still holds, so VACUUM treats those pages
 as unshared again.  It holds each such relation's branch meanwhile, as a
 session on it does, so a branch's deletion or rename tried then fails as
 if a session were on it (its detail says either may be).  A
-move back to one of them (dolt_reset('--hard') to the head or the commit
-before, a merge's abort, a stash) first gives each table that changed
+move to a kept commit (dolt_reset('--hard') to the head or an earlier
+commit, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
-snapshot, O(1), its pg_class row repointed with its oldest transaction ids
-then, as TRUNCATE gives a relation new storage, and the old storage dropped
-at commit.  The branch's other kept commits' snapshots of the relation were
-in the old storage: each is carried into the new one (bmap_snapshot_carry(),
-a slot holding the same subtrees, each a holder more, O(1)), and their
-entries renamed, so those commits stay kept and resets back and forth
-between kept commits restore every time.  A carry's record (a snapshot
-record flagged BMAP_TREE_CARRIED, without the header) is redone writing
-and syncing nothing: its blocks are the original snapshot's, written out
-when that was kept.  An abort or a crash before the commit drops or
-orphans the new storage, slots and all; the old one is untouched.  A
-move that gives a table the pages another of the branch's own kept
-commits holds of the target's rows (share_kept(), from a commit with the
-same data: an empty commit's, an amend's) carries them the same way.  A
-move that gives a table another branch's storage (share(), or
+root, O(1), its pg_class row repointed with its oldest transaction ids
+then, as TRUNCATE gives a relation new storage, and the old storage kept
+for the snapshots older than the move (below).  The branch's other kept
+commits' roots of the relation are the page store's, not the old
+storage's: their entries are renamed to the new storage (carried),
+nothing copied, so those commits stay kept and resets back and forth
+between kept commits restore every time.  An abort or a crash before the
+commit drops or orphans the new storage; the old one and the roots are
+untouched.  A move that gives a table the pages another of the branch's
+own kept commits holds of the target's rows (share_kept(), from a commit
+with the same data: an empty commit's, an amend's) carries them the same
+way.  A move that gives a table another branch's storage (share(), or
 share_kept() of another branch's kept pages) replaces the table's storage
-too but carries nothing: the other storage's epochs say nothing of this
-branch's snapshots, so the branch's kept commits of that table are
-dropped (kept_drop_dead()), and a reset back to one writes its rows.  The
+too but carries nothing: those pages are of another lineage, so the
+branch's kept commits of that table are dropped (kept_drop_dead()), and
+a reset back to one shares another kept root or writes its rows.  A
+move that restores another branch's kept commit holds its roots for the
+session's branch too (hold(): another root of the same subtrees, O(1),
+frozen if the source's was) and lists the commit as the branch's own,
+so the keep after the move captures nothing and a move back restores
+it from the branch's own list.  The
 baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
 of its rows.  A move to a commit whose pages aren't kept, or whose kept
-pages for a table are gone, may give that table the pages kept as of the
-branch's head instead: that discards the working set's changes in O(1),
-as a reset to the head does, and the move then writes only the rows the
-head and the commit differ by.  It does so only where that costs less
-than writing the rows the working set and the commit differ by, as told
-without folding from the baseline and the change finder's count since it
-(the working set may have been brought near the commit by its own
-writes), and only while no other session on the branch holds a snapshot
-(on main, which sessions don't lock, no other backend of the database):
-such a snapshot would read the head's rows, neither its own nor the
-commit's.  A transaction elsewhere whose snapshot can't move (REPEATABLE
-READ, SERIALIZABLE) may come to the branch later, by a checkout or a read
-of its working set: the move records that it gave the branch its head's
+pages for a table are gone, gives each table that changed since the head
+the pages kept as of the branch's head instead, whatever the working set
+holds: that discards the working set's changes in O(1), as a reset to
+the head does, and the move then writes only the rows the head and the
+commit differ by.  How far the working set is from the commit isn't
+asked: telling it without folding could only bound it (from the
+baseline and the change finder's count since it), and a working set the
+fold worker had folded only part of would be taken for one near the
+commit, and folded and written back, every row of it, where the head's
+pages discard it whatever its size.  A working set brought near the
+commit by its own writes so costs the head's rows from the commit, the
+distance a reset from a clean working set writes too.  Other sessions'
+snapshots don't hold it back either: the storage a restore replaces is
+kept (below), and a snapshot older than the move goes on reading it.  A
+transaction elsewhere whose snapshot can't move (REPEATABLE READ,
+SERIALIZABLE) may come to the branch later, by a checkout or a read of
+its working set: the move records that it gave the branch its head's
 pages (in shared memory: no snapshot outlives a restart), and such a
 transaction, if its snapshot doesn't see the move, fails with a
-serialization failure instead.  A restore of the commit's own kept pages, and a share, aren't
-held back so: a snapshot then reads the commit's rows, as after a
-TRUNCATE, a state the move makes rather than one that never was.  A branch reset back and forth between two commits
+serialization failure instead.  A branch reset back and forth between two commits
 takes this path: each restore gives a table new storage, and the other
 commit's snapshot goes with the old storage.  Whatever still differs
 (definitions, sequences, a table not restored) the move writes as before.
 A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
-dropped, it was renamed, its rows' transaction ids are older than the
-database still knows, its rows in the commit can't be read here, the user
-couldn't write its rows, or one of its relations is in use: its rows are
-written.  Its locks are tried, not queued for, so as not to hold up the
-writers behind them.  A page sweep holding one is asked to let go, an
-autovacuum worker asked, once, to cancel its task (as Postgres cancels
-one that blocks a lock waiter) and waited for, until deadlock_timeout
-after the move first asked one, and any other holder waited for, tried
-again a little later each time, until prolly.restore_lock_wait (100 ms)
-after the move first waited: a statement lets go within a moment, a
-transaction left open won't soon, and the rows written instead often cost
-little.  lock_timeout, if set, caps both; the deadlock detector doesn't
-see these waits, so they are bounded, for the whole move.  A
-restore or share given up so is counted in pg_stat_prolly's
-restores_lock_busy.  Nor is one whose baseline
+dropped, it was renamed, its root isn't frozen and its rows' transaction
+ids are older than the database still knows, its rows in the commit
+can't be read here, the user couldn't write its rows, or the session
+itself is using one of its
+relations (a scan of it open, an AFTER trigger's event queued): its rows
+are written.  A hard reset takes its restores' locks, as TRUNCATE takes
+them, waiting for them, before it holds the refs (lock_for_restore():
+the tables restore_pages() will give pages, planned as it plans them, so
+not one whose rows it writes, as a reset of a few rows does): giving up
+would leave it every row the working set changed to write back, however
+many, and waiting while it held the refs would hold up every other
+branch's operation behind a reader of one table.  Every other operation
+takes the branch's refs, then the root, then the relations it reads or
+writes; so the reset takes its tables' locks all or none, waiting for
+the first busy one with nothing else held and then trying all again,
+and then only tries the refs and the root: if either is held, it gives
+every table's lock back and waits in each one's queue, holding nothing
+(taking it and letting go of it at once, so the deadlock detector and
+lock_timeout see the wait), and begins again.  Planning takes no lock it
+keeps (what it opens to read, it lets go of), so two resets of one branch
+at once never each hold a table the other waits for.  It never holds a lock another operation waits for
+while it waits for one that operation holds.  A page sweep holding a
+table's lock lets go of it for a waiter, an autovacuum worker is
+cancelled after deadlock_timeout (as for any waiter), the deadlock
+detector sees the wait, and lock_timeout bounds it, failing the reset.
+Any other restore's locks (another move's, a reset's in a transaction
+holding the refs already), and a share's, are tried, not queued for, so
+as not to hold up the writers and operations behind them: a page sweep holding one is
+asked to let go, an autovacuum worker asked, once, to cancel its task (as
+Postgres cancels one that blocks a lock waiter) and waited for, until
+deadlock_timeout after the move first asked one, and any other holder
+waited for, tried again a little later each time, until
+prolly.restore_lock_wait (100 ms) after the move first waited: a
+statement lets go within a moment, a transaction left open won't soon,
+and the rows written instead.  lock_timeout, if set, caps both; the
+deadlock detector doesn't see these waits, so they are bounded, for the
+whole move.  A restore or share given up so is counted in
+pg_stat_prolly's restores_lock_busy.  Nor is a table
+restored whose baseline
 holds the commit's rows with fewer than prolly.restore_min_changes (2) of
 them changed since, as its change finder tells from no more than that many
 of its records (the log's entries, none read as a fold reads them):
 restoring a table costs about as much as writing a few rows back and
 syncing their pages as the commit's are kept again, so a reset of a row
-writes it.  Like TRUNCATE, a restore isn't MVCC-safe: a
-snapshot taken before the move commits reads the restored pages after
-it.  So a small reset, its rows written, is MVCC-safe, and a large one,
-restored, isn't, for a snapshot older than the move.
+writes it.
+
+A restore is MVCC-safe where TRUNCATE isn't: the storage it replaces
+isn't dropped at commit but kept, a retired entry of the branch's kept
+list naming the storage itself (its relations' snapshot
+BRANCH_KEPT_STORAGE), and shared memory names each relation's new
+storage's predecessor and the move that replaced it
+(branch_note_replaced()).  A transaction whose snapshot can't move and
+doesn't see the move reads the old storage: the relation cache gives its
+entry the old storage as it finds the relation's (RelationInitPhysicalAddr()
+asks branch_storage_hook), until the transaction ends, so it reads the
+rows it saw, its indexes and TOAST table alike.  It can't change them: a
+write, a row lock or a definition change of such an entry fails with a
+serialization failure, as a REPEATABLE READ write of a row changed since
+its snapshot does.  Statements of other transactions hold the
+relation's locks while they read it, so the move waits for them.  The
+first keep after every snapshot older than the move has ended (the
+oldest xmin any backend holds is later than the move) lets go of the
+old storage, dropping it as its transaction commits; a crash leaves it
+to the first keep after the restart, and a branch's deletion drops it.
+A snapshot imported into a transaction (or a parallel worker's, restored)
+may be older than a move after which its backend built the relation's
+entry: as it is set, every such entry is found again
+(RelationCacheRecheckReplaced()).  Shared memory names at most 1024 such
+storages, a restore reserving its relations' entries before it replaces
+anything (branch_replaced_reserve()): with none free (that many still
+needed by older snapshots), the table isn't restored and its rows are
+written, MVCC-safe; an entry is never let go of while a snapshot may
+need it.  Only the primary's snapshots are covered: the registry is the
+primary's shared memory, so a hot standby's query whose snapshot is older
+than a reset it replays reads the restored pages, as after a TRUNCATE
+(which its replay also waits for queries holding the table's lock
+for), and the old storage is let go of by the primary's horizon, which
+covers a standby's snapshots only with hot_standby_feedback.  A share of
+another branch's storage or kept pages isn't kept so either: a snapshot
+older than it reads the shared pages, as after a TRUNCATE.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
-relations share the snapshots, O(1), and the source's writers are not
-locked out (the source's relations are held with ShareUpdateExclusiveLock,
+relations are made of the commit's roots, O(1), and the source's
+writers are not locked out (the source's relations are held with
+ShareUpdateExclusiveLock,
 tried and never queued for, which only definition changes, VACUUM and
 letting go of kept pages wait for); only relations not kept (a table made
 or whose storage was replaced since, a sequence) are copied as before,
@@ -1378,10 +1512,12 @@ tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
 
-A restore gives each table it restores new storage, and the storage it
-replaces, where every other kept commit's snapshot of the table was, goes
-with it at commit; so does a rewrite's, or a dropped table's.  Each keep
-and each restore asks what is left of each kept commit's pages (branch
+A restore gives each table it restores new storage and carries the
+other kept commits' roots of it there (above); a rewrite or a truncation
+gives it storage no root was captured of, and a drop takes it, so its
+kept commits' roots are then gone for it, let go of by a later keep.
+Each keep and each restore asks what is left of each kept commit's
+pages (branch
 operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
 relations asked of).  Only the commits still kept are asked, never more
 than prolly.kept_commits and the one a restore keeps again: a retired
@@ -1392,18 +1528,19 @@ transaction ask of every one before it.  So a retired commit whose
 storage goes later stays in the record, keeping its commit and baseline
 from collection, until a later keep lets go of it or the branch is
 deleted.  One with nothing left at all (every
-relation's storage, or its snapshot there, gone, as the transaction sees
+relation's storage, or its root, gone, as the transaction sees
 it) is dropped from the list at once, with nothing to let go of, and its
 commit and baseline are no longer kept from collection.  One none of
-whose tables can be given its pages any more, but with a snapshot still
+whose tables can be given its pages any more, but with a root still
 left (a TRUNCATE gives a table and its indexes new storage, but not its
-change log; its rows' transaction ids are older than the database still
-knows), is retired, as above: it stays in the record, keeping its commit
+change log; an unfrozen root's rows' transaction ids are older than the
+database still knows), is retired, as above: it stays in the record,
+keeping its commit
 and baseline from collection, until a later keep lets go of its
-snapshots.  Neither counts toward prolly.kept_commits or is offered to a
+roots.  Neither counts toward prolly.kept_commits or is offered to a
 move or a first use.  A commit with a table whose relations are all still
 on the storage that kept them stays kept (restore_pages() may still pass
-the table over, renamed or with other relations since).  Snapshots that a
+the table over, renamed or with other relations since).  Roots that a
 dropped commit shares with one let go of are kept until a later keep: the
 change that made it gone may roll back.
 
@@ -1418,7 +1555,7 @@ A move of any branch (a reset, a checkout's move, a first use's) gives a
 table whose rows differ from the target's, where a kept commit of any
 branch holds the target's table and sharing costs less than writing the
 rows, and the transaction that kept it precedes every snapshot in the
-cluster, storage made of that commit's snapshots (branch operations'
+cluster, storage made of that commit's roots (branch operations'
 share_kept(): O(1) each, the source branch held against deletion and its
 relations against letting go of the pages, each relation stored alike on
 both and the source's still on the storage that kept it), its baseline
@@ -1505,7 +1642,18 @@ RelationLocksNoWait through it; a lock not free at once rolls the fold
 back, to be made again): it keeps its locks on the change logs it
 consumed past its lock on their tables, so a DROP of several tables,
 holding them and waiting for one's log, would deadlock with a fold
-waiting for the next table.  Autovacuum's
+waiting for the next table.  The worker's transactions are read
+committed, whatever default_transaction_isolation says, as autovacuum's
+are, and predicate locking passes them over
+(PredicateLockingPassOverBackend()): a fold writes for as long as it
+reads, and its xid, running all the while, would otherwise hold down the
+xmin of every serializable transaction begun meanwhile, keeping each one
+that commits, its predicate locks and rw-conflicts with it, until the fold
+ends; under a busy serializable workload the rw-conflict pool runs out.
+The launcher, and autovacuum's launcher and workers (whose automatic
+folds, collections and sweeps write in long transactions too), are passed
+over the same way; their transactions are read committed already.
+Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.
@@ -1657,6 +1805,178 @@ holds, a materialized view written, or a table's rows that can't be told
 so leave it to the comparison above.
 
 
+History horizon
+---------------
+
+History is severed, never rewritten, to keep only a window of it here
+("archive", window_archive.c).  The oldest commits kept (the boundary) still
+name their parents, so no commit's hash changes; the horizon, entries of
+the refs (their side entries, space 'h'), records each boundary edge (a
+boundary commit and the parent it no longer keeps) and each fragment: the
+commits beyond the edges, down to an earlier fragment's, with its tops,
+the commits outside it its commits name (its stops), its identity (the
+root of a tree of its commits keyed by date then id, the same wherever the
+same commits are severed) and a digest over the sorted hashes of the
+chunks born in it: what each of its commits makes that its first parent
+lacks (the canonicalizer's walk_changes() between the two roots, the
+tree's diff_nodes() between their dependencies, and the commit's own
+nodes), found by the commits alone, so a chunk resurrected or
+deduplicated counts where a commit has it and its parent doesn't.  What
+a boundary commit makes over the parent a sever cuts is kept beside the
+horizon ('D'), since that parent is gone once collected and the boundary
+commit may fall in a later fragment.  So the refs' side space grows by one
+boundary's delta (what one commit changed) for each sever, delete mode
+too, since any later repair wants it; a repair that brings the parent back
+lets it go of.  So a sever's fragment, its digest,
+what it sends to the archive and what a repair checks cost what its
+commits changed, not the database, but the first fragment's, whose
+oldest commit makes its whole tree.  Freeing what a sever cut is still a
+full collection's, which marks what is live: O(the database).
+
+What is kept: every commit a ref names (a branch's head, a tag's, a
+remote-tracking branch's, a stash's, a merge's or rebase's in progress, a
+pin's, a commit a branch's pages are kept as of), each branch head's
+commits dated at or after the cut, and every commit on the way from a
+branch head to its merge base with each other one, so merging two live
+branches never needs a severed commit.  dolt_history_drop(before) severs
+what is older and lets it go (a fragment deleted); prolly_history_plan()
+says what a sever would do, and prolly_history_horizon() lists the
+fragments.  A sever is the database owner's, holds every ref, and takes
+the horizon's lock exclusively.
+
+A full collection reads the horizon as the root at its seal has it,
+through its own reads (the refs' side_scan_at()), and doesn't follow a
+boundary commit's chunks to the parents the horizon names: what only the
+fragment reached is freed.  A default collection follows them (as its
+settled files keep what they reach), and none runs in the transaction that
+changed the horizon, which might yet roll back.  A collection holds the
+horizon's lock shared, so no sever or repair moves the horizon meanwhile.
+
+The window is the database's.  prolly.history_window (how long each
+branch's history is kept here), prolly.history_min_commits (how many of a
+branch's newest commits are kept however old), prolly.history_batch
+(a cut rounded down to whole hours or days, so fragments are whole ones),
+prolly.history_max_size, prolly.history_window_action (archive, delete or
+none) and prolly.history_archive (a remote's URL, not a name) are read as the
+database has them (ALTER DATABASE ... SET: its owner's or a
+superuser's), never as a session has them, so no session severs more or
+sends history elsewhere by a SET of its own.  A branch's lineage may keep
+its own window, min_commits or batch (dolt_history_window(), the
+owner's, kept in the refs' settings); prolly_history_policy() shows what
+a branch keeps.  With no window, everything is kept.  There is one
+window: the page roots a branch keeps for constant-time moves are kept
+inside it, and ask it (the history window's window() and in_window(),
+prolly_history_in_window() in SQL) what is in it, by the clock a sever
+ages commits by, so the two never disagree.  What a
+branch's history keeps is the branch's window's: another ref's commit on
+it (a commit the branch's pages are kept as of, a reader's pin, a
+remote-tracking branch) has no window of its own, though a collection
+keeps what the ref names until the ref lets go of it, and no path to it
+is kept as for a merge (it is its own merge base).  A tag keeps its own
+commit and the database's min_commits; a ref's commit on no branch's
+history keeps itself, and the paths to its merge bases with the
+branches.
+
+dolt_history_sever() severs what is past the window, as the action says.
+It plans, and archives, holding no ref and not the horizon's lock (only
+a lock severs and repairs take turns by); the refs moved meanwhile, it
+plans and archives again, a few times, still holding none.  Then it holds
+the horizon and the refs only to check the plan (planned again if the
+refs moved since, which must give the fragment archived) and record it.
+Archived, the fragment's tops are sent to the archive (the transfer
+sends what it lacks; a walk past the horizon goes on where the remote has
+what is severed already, so fragments archive beside one another), the
+tops are made heads of the archive's, named by the database (the
+cluster's system identifier and its OID) and the fragment's identity, so
+the same fragment is named the same however often it is archived, then
+every chunk the fragment made is read back from the archive and re-hashed
+(an archive that says it has one it doesn't is found out), and only then
+is the horizon moved, the fragment's location the archive's URL; with no
+archive, nothing is severed and a warning says so.  The archive is opened
+as the role severing (the owner), so its checks are the owner's, and the
+archive's own permissions to push protect its history/... heads after:
+whoever may move heads there may let the history archived go.  A replan
+that changed the fragment leaves the earlier one's heads in the archive,
+pinning its chunks there; harmless, but they add up.  The archive is given
+prolly.history_archive_timeout (ten minutes where unset) to take the
+history and give it back; past it the sever is given up, nothing
+severed.  Deleted, the horizon records the fragment and nothing is sent.
+
+Autovacuum's visit of a database severs its window in the background
+(the history window's maintain(), as the database's settings say), as
+the database's owner (with SECURITY_RESTRICTED_OPERATION), so an
+archive's checks are the owner's, as at dolt_history_sever(): a file
+archive needs the owner's pg_write_server_files.  It plans only once some
+lineage's cut has moved past the last one tried: each branch's, by its
+own window over the database's, rounded down to its own batch (an
+hour if none is set), and the database's, for the other refs (the refs'
+settings history_window.last_cut and history_window.last_cut:<branch>).
+So a branch's own window is severed in the background with none for the
+database, and a window is walked at most once a batch.  A try that fails
+(an archive refused or unreachable, a cancel) is reported as a warning
+and tried again after a wait, a minute doubling with each failure in a
+row to a day (history_window.retry_at), not at every visit.
+
+What a sever cut is freed by a full collection, which the visit runs
+once fragments were made since the last, and that ended at least
+prolly.history_collect_interval ago (an hour if unset): fragments made
+meanwhile share one, and full collections never run back to back.
+Past prolly.history_max_size, as measured by the store's files (as the
+manifest has them) at the end of the background's last full collection,
+a visit cuts a batch past the oldest history kept, each branch still
+keeping its newest prolly.history_min_commits; then no more for size
+until a full collection has run and measured again, so a store whose
+freeing lags (unlinks deferred by a base backup, chunks held by a
+snapshot) isn't cut a batch a visit.  In delete mode two measurements in
+a row must say the store is over.  Nothing severed, the size cut isn't
+moved, and it isn't tried again before the next interval.  The store's
+files over the limit but the last measurement under asks for a full
+collection to measure again.  Where the size limit's dates cut nothing (a
+commit dated old above history dated new), it cuts by height instead: a
+sixteenth of the heights kept, at least one, above the lowest.  The
+background writes nothing in the refs before its sever is done (a refs
+write holds the branch's lock to the transaction's end, and commits would
+wait on the worker through the archive's transfer), and only tries the
+severs' turn, never waiting for it.  A failure that passes by itself (the
+history moved, a lock waiter's cancel) is tried again at the next visit,
+at most five times in a row, then waited out as any other.  The size limit is a background one:
+dolt_history_sever() cuts by the time and count windows alone.
+
+dolt_history_repair(source, fragments) reattaches fragments, newest
+first (all, or the newest few), from a remote or clone that has their
+history (source, by name or URL) or, archived, from where they were
+archived: the transfer receives the tops and what they reach that the
+store lacks, re-hashing each chunk, and the fragment's commits, from its
+tops to its stops, must give its identity and digest again before its
+edges and record are let go of; otherwise nothing changes.  A repair is
+the database owner's and holds the horizon's lock exclusively.  The
+history then reads as it did: the same commits, hashes, roots, rows and
+diffs.
+
+Listings stop at the horizon, as a shallow clone's do: dolt_log, the
+history tables and history mounts list the commits kept, with a notice
+once a transaction; history walks (a merge base's, HEAD~n) don't go past
+it.  Reading a severed commit once it is freed (dolt_at, a diff, a merge
+whose base is past it) is an error saying it is past the horizon and how
+to repair it.
+
+dolt_log(ref) gives the commits as it finds them: a heap of those found,
+the greatest given next (the highest height, then the newest, then by
+hash: a commit is always above its parents, so none not yet found can
+come before it), each read with its parents as it is given
+(prolly_log_begin()).  Planned, dolt_log is scanned by a custom scan
+that pulls its rows from that stream (prolly_log_scan.c), not by a
+function scan, which would keep them all first: dolt_log ... LIMIT n
+reads about n commits however long the history, and the whole log no
+more than before (no sort).  The scan's rows come in commit_order and
+then date descending, which its path says (pathkeys), so ORDER BY
+commit_order DESC ... LIMIT n doesn't read the history to sort it.
+Since an open stream (a cursor's) reads commits after it began, its start
+is kept from collection for its transaction (the chunk store's keep()):
+a history drop and a full collection in another session meanwhile don't
+free what it has yet to read.  The scan gives the entry's whole row too
+(dolt_log l ... count(l), l IS NOT NULL), made of its columns.
+
 Remotes
 -------
 
@@ -1790,8 +2110,23 @@ commits above it and a join reads each commit once.  The primary key's
 bounds seek in each commit whose key is the version's, and a commit keyed
 otherwise is read whole.  Planning reads no history (the commits are
 estimated by the mounted one's height).  prolly_mounts() shows which
-mounts are history mounts.  The dolt_history_table() functions still read
-every commit.
+mounts are history mounts.
+
+dolt_history_table(NULL::t) with quals on its row's primary key columns
+((row).id = 5, = ANY, a range; equalities on the key's leading columns,
+then a range on the next) is planned as a scan of its own
+(prolly_history_scan.c): the quals' values are computed once, and each
+commit the head reaches is read by seeking its data tree for each bound
+(the diff-merge's bounded_rows()), O(the tree's depth) a bound, a commit
+whose table is the tree the commit read before it had giving that
+commit's rows again, reading nothing.  So a key's history costs the
+commits times the trees' depth, not their rows.  A version keyed
+otherwise, or described otherwise than the table is now, is read whole,
+as is every commit of a keyless table (never bounded).  The quals stay
+the scan's filter, and EXPLAIN shows those it bounds by ("History Key").
+The scan gives the entry's whole row too (h, row_to_json(h), h IS NOT
+NULL in a filter), made of its columns when the plan reads it.
+dolt_history_table() by name reads every row of every commit.
 
 Revision-qualified table names (prolly_revision.c) read a table as
 another revision has it, as Doltgres's revision databases do:
@@ -1852,7 +2187,9 @@ one, and CheckPointProlly() runs in CheckPointGuts(), and
 ProllyRecoveryConsistent() beside XLogCheckInvalidPages(), as recovery
 becomes consistent; the chunk store asks XLogBackupInProgress() (xlog.c)
 before it removes a file a backup's redo may copy from.  Every batch of
-shared invalidation messages sent calls prolly_forget_folds() (sinval.c).
+shared invalidation messages sent calls prolly_forget_folds() (sinval.c),
+but one of storage managers' messages alone (a storage truncated or
+dropped changes no catalog or row).
 createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly

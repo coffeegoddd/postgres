@@ -128,6 +128,10 @@ CREATE FUNCTION test_bmap_epoch(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_bmap_exists(relnumber oid)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -251,6 +255,46 @@ CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
 RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Roots captured into the database's page store: captured (an id), let go
+-- of as the transaction commits, asked of (the length it holds, NULL if not
+-- held), copied into a new relation file number (its main fork alone, which
+-- test_bmap_unlink() drops), counted (those held, and the slots), and the
+-- slots of captures that never committed reclaimed; and those held captured
+-- of a relation file number.
+CREATE FUNCTION test_bmap_root_capture(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_release(id int8)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_held(id int8)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_share_root(id int8)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots(OUT held int8, OUT slots int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_of(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The captured roots' slots in use that name a transaction, as capturer
+-- or releaser (VACUUM settles them, so that none needs the commit log).
+CREATE FUNCTION test_bmap_roots_naming()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_reclaim(settle bool DEFAULT false)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Look up every logical block of the storage 'loops' times, as reading its
 -- pages does (from cached map pages): the microseconds it took.
 CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)
@@ -332,6 +376,21 @@ CREATE FUNCTION test_chunk_table_files(OUT name text, OUT chunks int,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- The table files with their generations: a settled file's chunks were
+-- born in the collections epoch_lo to epoch_hi (0: not settled); garbage
+-- is how many are thought garbage; xrefs how many chunks of older
+-- generations (or not settled) its chunks name.
+CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
+	OUT settled boolean, OUT epoch_lo bigint, OUT epoch_hi bigint,
+	OUT garbage bigint, OUT xrefs bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The collections that settled chunks the settled files still hold.
+CREATE FUNCTION test_chunk_epochs(OUT epoch bigint, OUT ended timestamptz)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The journal's segments, oldest first (settled is always false).
 CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
 	OUT bytes bigint, OUT settled boolean)
@@ -403,6 +462,23 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_refs_walk_count(declined text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The nodes the refs' walk visits (what a collection keeps), each as often
+-- as it is visited.
+CREATE FUNCTION test_refs_walk_nodes()
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The chunks the refs' root and the tables reach, found apart from a
+-- collection's marks.
+CREATE FUNCTION test_chunk_reachable()
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The hashes of the chunks a table file holds.
+CREATE FUNCTION test_chunk_file_hashes(name text)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Each table's data tree in the session branch's working set, folded
 -- once: its qualified name, the tree's hash, and why its tree can't be

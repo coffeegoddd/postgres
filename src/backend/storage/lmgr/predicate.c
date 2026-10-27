@@ -161,6 +161,7 @@
  *		SetSerializableTransactionSnapshot(Snapshot snapshot,
  *										   VirtualTransactionId *sourcevxid)
  *		RegisterPredicateLockingXid(void)
+ *		PredicateLockingPassOverBackend(void)
  *		PredicateLockRelation(Relation relation, Snapshot snapshot)
  *		PredicateLockPage(Relation relation, BlockNumber blkno,
  *						Snapshot snapshot)
@@ -443,6 +444,23 @@ static bool MyXactDidWrite = false;
  */
 static SERIALIZABLEXACT *SavedSerializableXact = InvalidSerializableXact;
 
+/*
+ * The xids of transactions running in backends that never run serializable
+ * ones (see PredicateLockingPassOverBackend()), left out of the xmin a
+ * serializable transaction is registered with: the first
+ * PredXact->passedOverXidCount entries, in no order.  A backend has one top
+ * transaction running at most, so MaxBackends entries always suffice.
+ * Protected by SerializableXactHashLock.
+ */
+static TransactionId *PassedOverXids;
+
+/*
+ * Whether this backend's transactions are passed over by predicate locking,
+ * and the running one's xid, if noted in PassedOverXids.
+ */
+static bool PassedOverBackend = false;
+static TransactionId MyPassedOverXid = InvalidTransactionId;
+
 static int64 max_serializable_xacts;
 
 /* local functions */
@@ -490,6 +508,11 @@ static void PredicateLockAcquire(const PREDICATELOCKTARGETTAG *targettag);
 static void DropAllPredicateLocksFromTable(Relation relation,
 										   bool transfer);
 static void SetNewSxactGlobalXmin(void);
+static TransactionId SerializableXmin(Snapshot snapshot);
+static TransactionId ImportedSerializableXmin(Snapshot snapshot,
+											  VirtualTransactionId *sourcevxid,
+											  SERIALIZABLEXACT *self);
+static void ForgetPassedOverXid(void);
 static void ClearOldPredicateLocks(void);
 static void ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
 									   bool summarize);
@@ -1187,6 +1210,11 @@ PredicateLockShmemRequest(void *arg)
 					   .ptr = (void **) &PredXact,
 		);
 
+	ShmemRequestStruct(.name = "PredicateLockPassedOverXids",
+					   .size = mul_size((Size) MaxBackends, sizeof(TransactionId)),
+					   .ptr = (void **) &PassedOverXids,
+		);
+
 	/*
 	 * Register hash table for SERIALIZABLEXID structs.  This stores per-xid
 	 * information for serializable transactions which have accessed data.
@@ -1275,6 +1303,7 @@ PredicateLockShmemInit(void *arg)
 	PredXact->LastSxactCommitSeqNo = FirstNormalSerCommitSeqNo - 1;
 	PredXact->CanPartialClearThrough = 0;
 	PredXact->HavePartialClearedThrough = 0;
+	PredXact->passedOverXidCount = 0;
 	PredXact->element
 		= (SERIALIZABLEXACT *) ((char *) PredXact + PredXactListDataSize);
 	/* Add all elements to available list, clean. */
@@ -1717,6 +1746,16 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 	Assert(!RecoveryInProgress());
 
 	/*
+	 * A backend passed over by predicate locking has its xids left out of
+	 * other serializable transactions' xmins, which is right only for
+	 * transactions that aren't serializable themselves.
+	 */
+	if (PassedOverBackend)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot use serializable mode in this process")));
+
+	/*
 	 * Since all parts of a serializable transaction must use the same
 	 * snapshot, it is too late to establish one after a parallel operation
 	 * has begun.
@@ -1799,7 +1838,9 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 	dlist_init(&(sxact->possibleUnsafeConflicts));
 	sxact->topXid = GetTopTransactionIdIfAny();
 	sxact->finishedBefore = InvalidTransactionId;
-	sxact->xmin = snapshot->xmin;
+	sxact->xmin = sourcevxid ? ImportedSerializableXmin(snapshot, sourcevxid,
+														 sxact) :
+		SerializableXmin(snapshot);
 	sxact->pid = MyProcPid;
 	sxact->pgprocno = MyProcNumber;
 	dlist_init(&sxact->predicateLocks);
@@ -1853,18 +1894,18 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 	if (!TransactionIdIsValid(PredXact->SxactGlobalXmin))
 	{
 		Assert(PredXact->SxactGlobalXminCount == 0);
-		PredXact->SxactGlobalXmin = snapshot->xmin;
+		PredXact->SxactGlobalXmin = sxact->xmin;
 		PredXact->SxactGlobalXminCount = 1;
-		SerialSetActiveSerXmin(snapshot->xmin);
+		SerialSetActiveSerXmin(sxact->xmin);
 	}
-	else if (TransactionIdEquals(snapshot->xmin, PredXact->SxactGlobalXmin))
+	else if (TransactionIdEquals(sxact->xmin, PredXact->SxactGlobalXmin))
 	{
 		Assert(PredXact->SxactGlobalXminCount > 0);
 		PredXact->SxactGlobalXminCount++;
 	}
 	else
 	{
-		Assert(TransactionIdFollows(snapshot->xmin, PredXact->SxactGlobalXmin));
+		Assert(TransactionIdFollows(sxact->xmin, PredXact->SxactGlobalXmin));
 	}
 
 	MySerializableXact = sxact;
@@ -1905,10 +1946,32 @@ RegisterPredicateLockingXid(TransactionId xid)
 
 	/*
 	 * If we're not tracking predicate lock data for this transaction, we
-	 * should ignore the request and return quickly.
+	 * should ignore the request and return quickly; unless the backend is
+	 * passed over, when its xid is noted to be left out of serializable
+	 * transactions' xmins (a backend passed over never tracks any).
 	 */
 	if (MySerializableXact == InvalidSerializableXact)
+	{
+		if (PassedOverBackend && !IsolationIsSerializable())
+		{
+			/* (one not forgotten is of a transaction that ended) */
+			if (TransactionIdIsValid(MyPassedOverXid))
+				ForgetPassedOverXid();
+			LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
+			/*
+			 * (one per backend fits; were it full, the xid would only be
+			 * counted, as any is)
+			 */
+			Assert(PredXact->passedOverXidCount < MaxBackends);
+			if (PredXact->passedOverXidCount < MaxBackends)
+			{
+				PassedOverXids[PredXact->passedOverXidCount++] = xid;
+				MyPassedOverXid = xid;
+			}
+			LWLockRelease(SerializableXactHashLock);
+		}
 		return;
+	}
 
 	/* We should have a valid XID and be at the top level. */
 	Assert(TransactionIdIsValid(xid));
@@ -1929,6 +1992,130 @@ RegisterPredicateLockingXid(TransactionId xid)
 	/* Initialize the structure. */
 	sxid->myXact = MySerializableXact;
 	LWLockRelease(SerializableXactHashLock);
+}
+
+/*
+ * Pass over this backend's transactions, which must never be serializable:
+ * their xids are left out of the xmins serializable transactions are
+ * registered with.
+ *
+ * A serializable transaction's xmin bounds the serializable transactions
+ * that may have overlapped it: one that finished before every active one's
+ * xmin overlapped none of them, so it is cleaned up (its predicate locks and
+ * rw-conflicts released), and a write no longer conflicts with what it
+ * read.  Any transaction running as the snapshot is taken holds the xmin
+ * down, though only serializable ones need to: a background process that
+ * writes in long transactions keeps every serializable transaction that
+ * commits meanwhile, each conflicting with writes to what it read, until the
+ * pool of rw-conflicts runs out.  Leaving its xids out keeps the bound: a
+ * serializable transaction running as another's snapshot is taken either
+ * has its xid then, which is counted, or is given one no lower than that
+ * snapshot's xmax.
+ *
+ * Called once, before the backend starts a transaction; the backend's
+ * attempts at a serializable one are refused.
+ */
+void
+PredicateLockingPassOverBackend(void)
+{
+	Assert(!IsTransactionState());
+	PassedOverBackend = true;
+}
+
+/* The running transaction's xid, if passed over, no longer is: it ended. */
+static void
+ForgetPassedOverXid(void)
+{
+	int			n;
+	int			i;
+
+	LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
+	n = PredXact->passedOverXidCount;
+	for (i = 0; i < n; i++)
+		if (TransactionIdEquals(PassedOverXids[i], MyPassedOverXid))
+			break;
+	Assert(i < n);
+	if (i < n)
+	{
+		PassedOverXids[i] = PassedOverXids[n - 1];
+		PredXact->passedOverXidCount--;
+	}
+	LWLockRelease(SerializableXactHashLock);
+	MyPassedOverXid = InvalidTransactionId;
+}
+
+/*
+ * The xmin a serializable transaction is registered with: the snapshot's
+ * (the least of its xmax, the running xids it holds, and our own xid), but
+ * for the xids passed over.  The caller holds SerializableXactHashLock, so
+ * they don't change meanwhile.  An xid noted only after the snapshot was
+ * taken is counted, as any is; one forgotten was of a transaction that had
+ * ended, which the snapshot holds only if taken before, and then counts.
+ * Either way the xmin is no lower than the bound needs.
+ */
+static TransactionId
+SerializableXmin(Snapshot snapshot)
+{
+	TransactionId xmin;
+	TransactionId myxid;
+
+	Assert(LWLockHeldByMeInMode(SerializableXactHashLock, LW_EXCLUSIVE));
+	if (PredXact->passedOverXidCount == 0)
+		return snapshot->xmin;
+
+	xmin = snapshot->xmax;
+	myxid = GetTopTransactionIdIfAny();
+	if (TransactionIdIsNormal(myxid) && TransactionIdPrecedes(myxid, xmin))
+		xmin = myxid;
+	for (uint32 i = 0; i < snapshot->xcnt; i++)
+	{
+		TransactionId xid = snapshot->xip[i];
+		bool		passed_over = false;
+
+		if (!TransactionIdPrecedes(xid, xmin))
+			continue;
+		for (int j = 0; j < PredXact->passedOverXidCount && !passed_over; j++)
+			passed_over = TransactionIdEquals(PassedOverXids[j], xid);
+		if (!passed_over)
+			xmin = xid;
+	}
+	Assert(!TransactionIdPrecedes(xmin, snapshot->xmin));
+	return xmin;
+}
+
+/*
+ * The xmin a serializable transaction importing another's snapshot is
+ * registered with.  Its source was registered with SerializableXmin() of
+ * the same snapshot, then, which may pass over an xid since forgotten: the
+ * greater of that and of SerializableXmin() now, either a bound the
+ * snapshot keeps.  It is no lower than SxactGlobalXmin, then, as every new
+ * serializable transaction's must be.  A source not found (one read only
+ * that needed no tracking) gives the snapshot's own, raised to
+ * SxactGlobalXmin if below it, as the global xmin can't go back.
+ */
+static TransactionId
+ImportedSerializableXmin(Snapshot snapshot, VirtualTransactionId *sourcevxid,
+						 SERIALIZABLEXACT *self)
+{
+	TransactionId xmin = SerializableXmin(snapshot);
+	dlist_iter	iter;
+
+	Assert(LWLockHeldByMeInMode(SerializableXactHashLock, LW_EXCLUSIVE));
+	dlist_foreach(iter, &PredXact->activeList)
+	{
+		SERIALIZABLEXACT *source =
+			dlist_container(SERIALIZABLEXACT, xactLink, iter.cur);
+
+		if (source != self &&
+			VirtualTransactionIdEquals(source->vxid, *sourcevxid) &&
+			!SxactIsCommitted(source) &&
+			TransactionIdFollows(source->xmin, xmin))
+			xmin = source->xmin;
+	}
+	if (TransactionIdIsValid(PredXact->SxactGlobalXmin) &&
+		TransactionIdPrecedes(xmin, PredXact->SxactGlobalXmin))
+		xmin = PredXact->SxactGlobalXmin;
+	return xmin;
 }
 
 
@@ -3271,6 +3458,13 @@ ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
 	/* We can't be both committing and releasing early due to RO_SAFE. */
 	Assert(!(isCommit && isReadOnlySafe));
 
+	/*
+	 * A transaction passed over has ended (ProcArrayEndTransaction() has
+	 * run): its xid is forgotten.
+	 */
+	if (TransactionIdIsValid(MyPassedOverXid) && !isReadOnlySafe)
+		ForgetPassedOverXid();
+
 	/* Are we at the end of a transaction, that is, a commit or abort? */
 	if (!isReadOnlySafe)
 	{
@@ -4165,7 +4359,7 @@ CheckTargetForConflictsIn(PREDICATELOCKTARGETTAG *targettag)
 		}
 		else if (!SxactIsDoomed(sxact)
 				 && (!SxactIsCommitted(sxact)
-					 || TransactionIdPrecedes(GetTransactionSnapshot()->xmin,
+					 || TransactionIdPrecedes(MySerializableXact->xmin,
 											  sxact->finishedBefore))
 				 && !RWConflictExists(sxact, MySerializableXact))
 		{
@@ -4178,7 +4372,7 @@ CheckTargetForConflictsIn(PREDICATELOCKTARGETTAG *targettag)
 			 */
 			if (!SxactIsDoomed(sxact)
 				&& (!SxactIsCommitted(sxact)
-					|| TransactionIdPrecedes(GetTransactionSnapshot()->xmin,
+					|| TransactionIdPrecedes(MySerializableXact->xmin,
 											 sxact->finishedBefore))
 				&& !RWConflictExists(sxact, MySerializableXact))
 			{

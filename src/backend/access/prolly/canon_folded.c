@@ -6270,6 +6270,11 @@ named_trees(Canon *cn, const ProllyNodeRef *root)
 typedef struct ChangedTree
 {
 	bool		was;
+	bool		gone;			/* the item removed: before alone */
+	bool		taken;			/* removed, and paired with one added */
+	char		kind;			/* the item's kind ('t', 'm') */
+	char	   *def;			/* its definition, after its tree */
+	int			deflen;
 	ProllyNodeRef before;
 	ProllyNodeRef after;
 } ChangedTree;
@@ -6282,25 +6287,150 @@ note_changed_tree(ProllyDiffKind kind, const ProllyKey *key,
 	ChangedTree *c;
 	ProllyValue def;
 
-	if (after == NULL)
-		return true;
 	c = palloc0(sizeof(ChangedTree));
-	if (!tree_item(key, after, &c->after, &def))
+	if (after == NULL)
+	{
+		if (before == NULL || !tree_item(key, before, &c->before, &def))
+		{
+			pfree(c);
+			return true;
+		}
+		c->gone = true;
+	}
+	else if (!tree_item(key, after, &c->after, &def))
 	{
 		pfree(c);
 		return true;
 	}
-	c->was = before != NULL && tree_item(key, before, &c->before, &def);
+	else
+		c->was = before != NULL && tree_item(key, before, &c->before,
+											 &(ProllyValue) {0});
+	c->kind = (char) key->data[0];
+	c->def = pnstrdup((const char *) def.data, def.len);
+	c->deflen = def.len;
 	*changed = lappend(*changed, c);
 	return true;
 }
 
+/* Removed trees by a key: each key's, in key order, taken from the front. */
+typedef struct RemovedBy
+{
+	uint32		key;			/* hash key */
+	List	   *trees;			/* ChangedTree * */
+} RemovedBy;
+
+static HTAB *
+removed_map(const char *name)
+{
+	HASHCTL		ctl;
+
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(RemovedBy);
+	ctl.hcxt = CurrentMemoryContext;
+	return hash_create(name, 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+removed_add(HTAB *map, uint32 key, ChangedTree *c)
+{
+	bool		found;
+	RemovedBy  *rb = hash_search(map, &key, HASH_ENTER, &found);
+
+	if (!found)
+		rb->trees = NIL;
+	rb->trees = lappend(rb->trees, c);
+}
+
+/* The first one under key not taken that match() accepts, or NULL. */
+static ChangedTree *
+removed_take(HTAB *map, uint32 key, const ChangedTree *a, int how)
+{
+	RemovedBy  *rb = hash_search(map, &key, HASH_FIND, NULL);
+
+	if (rb == NULL)
+		return NULL;
+	/* (those taken from the front let go of: each looked at once) */
+	while (rb->trees != NIL && ((ChangedTree *) linitial(rb->trees))->taken)
+		rb->trees = list_delete_first(rb->trees);
+	foreach_ptr(ChangedTree, r, rb->trees)
+	{
+		if (r->taken || r->kind != a->kind)
+			continue;
+		if (how == 0 && (r->before.hash.len != a->after.hash.len ||
+						 memcmp(r->before.hash.bytes, a->after.hash.bytes,
+								r->before.hash.len) != 0))
+			continue;
+		if (how == 1 && (r->deflen != a->deflen ||
+						 memcmp(r->def, a->def, a->deflen) != 0))
+			continue;
+		r->taken = true;
+		return r;
+	}
+	return NULL;
+}
+
+static uint32
+tree_key(const ProllyNodeRef *ref)
+{
+	return hash_bytes(ref->hash.bytes, ref->hash.len);
+}
+
+static uint32
+def_key(const ChangedTree *c)
+{
+	return hash_combine((uint32) (unsigned char) c->kind,
+						hash_bytes((const unsigned char *) c->def, c->deflen));
+}
+
 /*
- * Visit the nodes of root to (its trees and the data trees it names) that
- * root from (NULL: none) may lack: the roots diffed, and each data tree an
- * item added or changed names diffed against the one it named before, so
- * what changed is visited, not all of to.
+ * A tree added (a name new in to) diffed against one removed (a name from
+ * had), not walked whole: a table renamed, or moved to another schema, is
+ * the same tree under another name.  Paired with one removed of the same
+ * kind, preferring the same tree, then the same definition, then any, each
+ * removed once, in key order; found by hash, not by trying each pair.  Any
+ * tree of from's will do for what to's lacks (what it shares is from's),
+ * so the pairing only saves the walk; and it is the two roots', whatever
+ * came before.
  */
+static void
+pair_renamed(List *changed)
+{
+	HTAB	   *by_tree = removed_map("prolly removed trees");
+	HTAB	   *by_def = removed_map("prolly removed definitions");
+	HTAB	   *by_kind = removed_map("prolly removed kinds");
+	bool		any = false;
+
+	foreach_ptr(ChangedTree, r, changed)
+	{
+		if (!r->gone)
+			continue;
+		removed_add(by_tree, tree_key(&r->before), r);
+		removed_add(by_def, def_key(r), r);
+		removed_add(by_kind, (uint32) (unsigned char) r->kind, r);
+		any = true;
+	}
+	if (any)
+		for (int how = 0; how < 3; how++)
+			foreach_ptr(ChangedTree, a, changed)
+			{
+				ChangedTree *r;
+
+				if (a->gone || a->was)
+					continue;
+				r = removed_take(how == 0 ? by_tree : how == 1 ? by_def : by_kind,
+								 how == 0 ? tree_key(&a->after) :
+								 how == 1 ? def_key(a) :
+								 (uint32) (unsigned char) a->kind, a, how);
+				if (r == NULL)
+					continue;
+				a->was = true;
+				a->before = r->before;
+			}
+	hash_destroy(by_tree);
+	hash_destroy(by_def);
+	hash_destroy(by_kind);
+}
+
 static void
 folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 					ProllyTreeVisitNode visit, void *arg)
@@ -6313,7 +6443,10 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	canon_env(&cn);
 	PROLLY_CALL(cn.tree, diff_nodes, &cn.env, from, to, visit, arg);
 	if (from && from->hash.len > 0)
+	{
 		PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_changed_tree, &changed);
+		pair_renamed(changed);
+	}
 	else
 	{
 		foreach(lc, named_trees(&cn, to))
@@ -6328,6 +6461,8 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	{
 		ChangedTree *c = lfirst(lc);
 
+		if (c->gone)
+			continue;
 		PROLLY_CALL(cn.tree, diff_nodes, &cn.env, c->was ? &c->before : NULL,
 					&c->after, visit, arg);
 	}

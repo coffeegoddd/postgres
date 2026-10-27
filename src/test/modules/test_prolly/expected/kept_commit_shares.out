@@ -86,7 +86,7 @@ SELECT name, value > 0 AS some FROM since(:'before');
  apply_rows            | f
  first_use_tables_kept | f
  move_tables_shared    | t
- relations_restored    | t
+ relations_restored    | f
 (4 rows)
 
 SELECT digest() = :'at_c1' AS at_c1, NOT EXISTS (SELECT FROM dolt_status) AS clean;
@@ -177,8 +177,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 -- a commit main keeps no pages of (prolly.kept_commits = 0 as it commits):
--- the reset to it, with the setting back, writes the rows; main's kept c1
--- is visited, but doesn't hold the commit's table
+-- the reset to it, with the setting back, writes the rows, after giving
+-- the table the pages of the nearest root before it (c1's, main's); main's
+-- kept c1 is visited, but doesn't hold the commit's table
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
@@ -246,7 +247,7 @@ SELECT name, value > 0 AS some FROM since(:'before');
  apply_rows            | t
  first_use_tables_kept | f
  move_tables_shared    | f
- relations_restored    | f
+ relations_restored    | t
 (4 rows)
 
 SELECT dolt_checkout('main');
@@ -302,7 +303,7 @@ SELECT name, value > 0 AS some FROM since(:'before');
  apply_rows            | f
  first_use_tables_kept | f
  move_tables_shared    | t
- relations_restored    | t
+ relations_restored    | f
 (4 rows)
 
 SELECT dolt_checkout('main');

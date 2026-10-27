@@ -215,6 +215,18 @@ test_bmap_epoch(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(bmap_inspect_epoch(bmap_smgr(PG_GETARG_OID(0))));
 }
 
+/*
+ * test_bmap_exists(relnumber): whether block-mapped storage of that file
+ * number (in the database's tablespace) exists
+ */
+PG_FUNCTION_INFO_V1(test_bmap_exists);
+
+Datum
+test_bmap_exists(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(bmap_relation_exists(locator_of(PG_GETARG_OID(0))));
+}
+
 /* test_bmap_free_blocks(): the page store's count of free blocks */
 PG_FUNCTION_INFO_V1(test_bmap_free_blocks);
 
@@ -658,6 +670,113 @@ test_bmap_share_snapshot(PG_FUNCTION_ARGS)
 
 	bmap_share_snapshot(src, (uint64) PG_GETARG_INT64(1), dst, false);
 	PG_RETURN_OID(copy);
+}
+
+/* test_bmap_root_capture(relnumber): a root captured; its id */
+PG_FUNCTION_INFO_V1(test_bmap_root_capture);
+
+Datum
+test_bmap_root_capture(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) bmap_root_capture(bmap_smgr(PG_GETARG_OID(0))));
+}
+
+/* test_bmap_root_release(id): let go of it as the transaction commits */
+PG_FUNCTION_INFO_V1(test_bmap_root_release);
+
+Datum
+test_bmap_root_release(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(bmap_root_release(locator_of(InvalidRelFileNumber),
+									 (BmapRootId) PG_GETARG_INT64(0)));
+}
+
+/* test_bmap_root_held(id): is it held?  Its length, if so (else NULL) */
+PG_FUNCTION_INFO_V1(test_bmap_root_held);
+
+Datum
+test_bmap_root_held(PG_FUNCTION_ARGS)
+{
+	BlockNumber nblocks;
+
+	if (!bmap_root_held(locator_of(InvalidRelFileNumber),
+						(BmapRootId) PG_GETARG_INT64(0), &nblocks))
+		PG_RETURN_NULL();
+	PG_RETURN_INT64(nblocks);
+}
+
+/*
+ * test_bmap_share_root(id): a new relation file number whose storage is the
+ * root's, which test_bmap_unlink() drops.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_share_root);
+
+Datum
+test_bmap_share_root(PG_FUNCTION_ARGS)
+{
+	RelFileNumber copy = GetNewRelFileNumber(MyDatabaseTableSpace, NULL,
+											 RELPERSISTENCE_PERMANENT);
+	SMgrRelation dst = smgropen(locator_of(copy), INVALID_PROC_NUMBER);
+
+	bmap_share_root((BmapRootId) PG_GETARG_INT64(0), dst, NULL, NULL);
+	PG_RETURN_OID(copy);
+}
+
+/* test_bmap_roots(): the roots the database's store holds, and its slots */
+PG_FUNCTION_INFO_V1(test_bmap_roots);
+
+Datum
+test_bmap_roots(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+	uint64		held;
+	uint64		slots;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	bmap_inspect_roots(locator_of(InvalidRelFileNumber), &held, &slots, NULL);
+	values[0] = Int64GetDatum((int64) held);
+	values[1] = Int64GetDatum((int64) slots);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* test_bmap_roots_of(relnumber): the roots held captured of it */
+PG_FUNCTION_INFO_V1(test_bmap_roots_of);
+
+Datum
+test_bmap_roots_of(PG_FUNCTION_ARGS)
+{
+	uint64		held;
+	uint64		slots;
+
+	bmap_inspect_roots(locator_of(PG_GETARG_OID(0)), &held, &slots, NULL);
+	PG_RETURN_INT64((int64) held);
+}
+
+/* test_bmap_roots_naming(): the slots in use that name a transaction */
+PG_FUNCTION_INFO_V1(test_bmap_roots_naming);
+
+Datum
+test_bmap_roots_naming(PG_FUNCTION_ARGS)
+{
+	uint64		held;
+	uint64		slots;
+	uint64		naming;
+
+	bmap_inspect_roots(locator_of(InvalidRelFileNumber), &held, &slots, &naming);
+	PG_RETURN_INT64((int64) naming);
+}
+
+/* test_bmap_roots_reclaim(settle): the abandoned roots reclaimed */
+PG_FUNCTION_INFO_V1(test_bmap_roots_reclaim);
+
+Datum
+test_bmap_roots_reclaim(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32((int32) bmap_roots_reclaim(locator_of(InvalidRelFileNumber),
+												 PG_GETARG_BOOL(0)));
 }
 
 /*

@@ -17,10 +17,12 @@
 #include "access/genam.h"
 #include "access/htup.h"
 #include "access/transam.h"
+#include "common/relpath.h"
 #include "executor/tuptable.h"
 #include "nodes/pg_list.h"
 #include "storage/locktag.h"
 #include "utils/relcache.h"
+#include "utils/snapshot.h"
 
 /* a branch-aware catalog's branch column */
 typedef struct CatalogBranchInfo
@@ -107,6 +109,18 @@ extern bool branch_written(Oid branch);
 typedef void (*BranchTupleHook) (Relation rel, const ItemPointerData *oldtid,
 								 const ItemPointerData *newtid);
 extern PGDLLIMPORT BranchTupleHook branch_tuple_hook;
+/*
+ * The storage a snapshot reads of a relation whose storage pg_class names
+ * *rel (in tablespace, 0 for the database's): one a move replaced but kept
+ * for the snapshots that don't see it, into *rel, true if that is another.
+ * Asked as a relation's storage is found (RelationInitPhysicalAddr()), and
+ * of every entry as a snapshot is imported or restored, of the
+ * transaction's snapshot where it can't move.
+ */
+typedef bool (*BranchStorageHook) (Oid tablespace, RelFileNumber *rel,
+								   Snapshot snap);
+extern PGDLLIMPORT BranchStorageHook branch_storage_hook;
+
 /* (oldtup: the version at oldtid in hand, if the caller has it, else NULL) */
 extern void branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple oldtup, const ItemPointerData *newtid);

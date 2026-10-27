@@ -21,6 +21,8 @@ $node->append_conf(
 autovacuum = off
 prolly_fold_worker = off
 });
+# (roots kept as captured, which keep their rows' transaction ids: frozen ones keep none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION xid_wraparound; CREATE EXTENSION test_prolly');
 
@@ -41,7 +43,7 @@ my $c3 = sql(q{BEGIN;
 	SELECT txid_current();
 	COMMIT});
 $c3 =~ s/.*\n//s;
-is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('ko.t'))}),
+is(sql(q{SELECT test_bmap_roots_of(pg_relation_filenode('ko.t'))}),
 	'2', 'ko.t kept by c1\'s snapshot (retired) and c2\'s (c3 unchanged since)');
 # main changes since, and is frozen; then the database, past those xids
 sql(q{INSERT INTO ko.big VALUES (1001, 1)});
@@ -75,7 +77,7 @@ like($err, qr/^$/, 'without an error') or diag $err;
 	SELECT dolt_commit('-am', 'c4') IS NOT NULL;
 });
 is($ret, 0, 'a commit after the retiring transaction\'s status is gone');
-is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('ko.t'))}),
+is(sql(q{SELECT test_bmap_roots_of(pg_relation_filenode('ko.t'))}),
 	'2', 'c1\'s snapshot let go of, c4 kept by its own');
 like($err, qr/^$/, 'without an error') or diag $err;
 # (c3 and c2, their snapshots still there but their xids frozen past, can

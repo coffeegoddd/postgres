@@ -24,6 +24,8 @@ wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
 # (VACUUM sets kept pages all-visible only with this on)
 prolly.vacuum_copy_kept_pages = on
+# (roots sharing the relations' pages as they are: frozen ones share none)
+prolly.freeze_roots = off
 });
 $node->start;
 $node->backup('base');
@@ -138,6 +140,28 @@ sql(q{SELECT dolt_branch('-D', 'e'); SELECT dolt_branch('-D', 'f')});
 sql(q{SELECT count(*) FROM prolly_page_sweep()});
 sql('VACUUM kv.w; VACUUM kv.x');
 is(visible_of('w'), table_pages('w'), 'e gone: every page of w all-visible');
+
+# a table restored of a commit's root (a hard reset) holds that root as its
+# own, as one captured of it: once the branch that shared it is gone, its
+# pages are vacuumed after a sweep has looked
+sql(q{
+	CREATE TABLE kv.r (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO kv.r SELECT g, repeat('r', 100) FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-Am', 'r1');
+	UPDATE kv.r SET v = 's';
+	SELECT dolt_commit('-am', 'r2');
+	SELECT dolt_reset('--hard', 'HEAD~1');
+});
+is(sql(q{SELECT count(*) FROM kv.r WHERE v = 's'}), '0', 'the reset gives r1\'s rows back');
+sql(q{SELECT dolt_branch('g')});
+is($node->safe_psql('postgres/g', 'SELECT count(*) FROM kv.r'), '3000', 'g is first used');
+sql('VACUUM kv.r');
+cmp_ok(visible_of('r'), '<', table_pages('r') / 2, 'VACUUM leaves the pages g shares');
+sql(q{SELECT dolt_branch('-D', 'g')});
+sql(q{SELECT count(*) FROM prolly_page_sweep()});
+sql('VACUUM kv.r');
+is(visible_of('r'), table_pages('r'),
+	'restored of r1\'s root, held as its own: every page all-visible');
 is(visible_of('x'), table_pages('x'), 'f gone: every page of x all-visible');
 
 $standby->stop;

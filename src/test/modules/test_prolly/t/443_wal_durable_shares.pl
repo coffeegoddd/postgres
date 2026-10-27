@@ -20,6 +20,8 @@ $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf',
 	"autovacuum = off\ncheckpoint_timeout = 1h\nwal_compression = off\n"
 	  . "prolly.restore_min_changes = 0");
+# (roots sharing the relations' pages as they are: frozen ones share none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
@@ -77,7 +79,7 @@ sub blocks_of
 		WHERE $where AND m.blkno = (t.ctid::text::point)[0]});
 }
 
-# A commit keeps snapshots holding blocks of their own: the records say
+# A commit keeps roots holding blocks of their own: the records say
 # their images were logged.
 sql(q{UPDATE app.t SET v = v + 1 WHERE id % 10 = 0});
 my $start = sql(q{SELECT pg_current_wal_insert_lsn()});
@@ -85,8 +87,8 @@ sql(q{SELECT dolt_commit('-am', 'c1')});
 my $end = sql(q{SELECT pg_current_wal_insert_lsn()});
 ok( sql(qq{SELECT count(*) > 0 AND bool_and(description LIKE '%(images logged)%')
 		FROM pg_get_wal_records_info('$start', '$end')
-		WHERE resource_manager = 'BlockMap' AND description LIKE '%snapshot%'}) eq 't',
-	'each kept snapshot\'s record says its own blocks\' images were logged');
+		WHERE resource_manager = 'BlockMap' AND description LIKE '%root captured%'}) eq 't',
+	'each kept root\'s record says its own blocks\' images were logged');
 ok( sql(qq{SELECT count(*) > 0 FROM pg_get_wal_records_info('$start', '$end')
 		WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'}) eq 't',
 	'and the images are there');

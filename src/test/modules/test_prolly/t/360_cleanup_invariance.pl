@@ -31,6 +31,8 @@ autovacuum_naptime = 1
 prolly_fold_worker = off
 prolly.kept_commits = 4
 });
+# (roots sharing the relations' pages as they are: frozen ones share none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 my $log_start = -s $node->logfile;
 

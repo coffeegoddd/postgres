@@ -25,7 +25,9 @@
 
 #include "common/relpath.h"
 #include "datatype/timestamp.h"
+#include "storage/bufpage.h"
 #include "storage/lock.h"
+#include "utils/snapshot.h"
 
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
@@ -35,9 +37,11 @@ typedef bool (*BranchVisitWhile) (const char *name, Oid branch, void *arg);
 
 /*
  * A relation's pages as keep() kept them, for restore() to give back: the
- * storage that keeps them (its tablespace, 0 for the database's, and file
- * number), the snapshot's id there, and the relation's oldest unfrozen
- * transaction and multixact ids then (its pages hold none older).
+ * storage they were kept of (its tablespace, 0 for the database's, and
+ * file number: a restore of them since names its new storage), the root
+ * that keeps them in the tablespace's page store ('snapshot', its id
+ * there), and the relation's oldest unfrozen transaction and multixact ids
+ * then (its pages hold none older).
  */
 typedef struct BranchKeptRelation
 {
@@ -51,12 +55,12 @@ typedef struct BranchKeptRelation
 
 /*
  * What is left of a relation's kept pages (kept_status()): restorable, as
- * restore() and share_kept() require; held, its snapshot still in the
- * storage that kept it but the pages not to be given back (its rows'
- * transaction ids older than the database still knows); or gone, that
- * storage or its snapshot no longer there, or the relation on other
- * storage now, its old storage going with the change, so nothing is left
- * to give back or let go of.
+ * restore() and share_kept() require; held, its root still kept but the
+ * pages not to be given back (a root not frozen, whose rows' transaction
+ * ids are older than the database still knows: a frozen root is never
+ * held); or gone, its root no longer kept, or the
+ * relation on other storage now than the one kept (or restored since) of
+ * it, so nothing is left to give back.
  */
 typedef enum BranchKeptStatus
 {
@@ -64,6 +68,25 @@ typedef enum BranchKeptStatus
 	BRANCH_KEPT_HELD,
 	BRANCH_KEPT_GONE,
 } BranchKeptStatus;
+
+/*
+ * The snapshot id of a BranchKeptRelation that names old storage itself,
+ * not a snapshot in it: the storage a restore replaced (its tablespace and
+ * relfilenumber, no longer the relation's in pg_class), kept whole for the
+ * snapshots older than the move, which read it.  Such an entry is never
+ * restored, shared, carried or checked for its status; letting go of it
+ * (let_go(), keep()'s release[]) drops the storage as the transaction
+ * commits.  The refs keep it as a retired entry of the branch's kept list,
+ * all of whose relations are such entries.
+ */
+#define BRANCH_KEPT_STORAGE		PG_UINT64_MAX
+
+/*
+ * Freeze a copy of block blkno of a heap-format relation as of snapshot,
+ * in place (the root freezer's freeze_page()).
+ */
+typedef bool (*BranchFreezePage) (Page page, BlockNumber blkno,
+								  Snapshot snapshot);
 
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
@@ -76,8 +99,8 @@ typedef struct BranchKeptTable
 #define BRANCH_LOCK_WAIT_MAX_ASKED	16
 
 /*
- * One operation's waits for the locks its share(), restore() and
- * share_kept() calls try, so that one bound covers them all: zeroed when
+ * One operation's waits for the locks its share(), share_kept() and
+ * restore() calls try, so that one bound covers them all: zeroed when
  * the operation begins.
  */
 typedef struct BranchLockWait
@@ -90,8 +113,8 @@ typedef struct BranchLockWait
 } BranchLockWait;
 
 /*
- * prolly.restore_lock_wait: how long, in milliseconds, share(), restore()
- * and share_kept() wait for a holder of a lock they need that isn't a page
+ * prolly.restore_lock_wait: how long, in milliseconds, share(),
+ * share_kept() and restore() (for a lock it doesn't hold already) wait for a holder of a lock they need that isn't a page
  * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
  * caps it).
  */
@@ -187,8 +210,8 @@ typedef struct BranchOpsRoutine
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 *
-	 * A lock not free at once is waited for, here and in restore() and
-	 * share_kept(), but never queued for, within the bounds of *wait, the
+	 * A lock not free at once is waited for, here and in share_kept() and
+	 * restore(), but never queued for, within the bounds of *wait, the
 	 * operation's (zeroed as it begins): a page sweep holding it is asked
 	 * to let go (bmap_compaction_let_go()) and waited out, within
 	 * lock_timeout of the operation's first wait (for as long as it takes
@@ -205,61 +228,81 @@ typedef struct BranchOpsRoutine
 
 	/*
 	 * Optional: keep the pages of the session branch's relations relids as
-	 * they are, each in a snapshot of its storage that later changes don't
-	 * touch, into kept[] (one for each, in order): O(1) in each relation's
-	 * size.  A relation whose pages are still those of a snapshot in
-	 * prior[] (nprior of them, of its storage) is kept by that one again;
-	 * only the others take a snapshot.  Every one of relids is locked
-	 * against writers first, without waiting (and let go after); then
-	 * settled(arg), if given, says whether their pages hold exactly what
-	 * the caller found them to.  False, nothing kept, if a lock isn't free,
-	 * settled says no, or one can't be kept (its storage can't, or keeps
-	 * too many snapshots already).  Snapshots taken by a transaction that
-	 * aborts (or a subtransaction) are let go of later.  Once they are
-	 * kept, the snapshots release[] (nrelease of them) are let go of, the
-	 * locks still held: a branch being made of kept pages (make_kept())
-	 * holds the relations against that while it reads them.
+	 * they are, each by a root of its storage captured into its page store,
+	 * which later changes don't touch, into kept[] (one for each, in
+	 * order): O(1) in each relation's size.  A relation whose pages are
+	 * still those of a root in prior[] (nprior of them, of its storage) is
+	 * kept by that one again; only the others capture one.  Every one of
+	 * relids is locked against writers first, without waiting (and let go
+	 * after); then settled(arg), if given, says whether their pages hold
+	 * exactly what the caller found them to.  False, nothing kept, if a
+	 * lock isn't free, settled says no, or one can't be kept (its storage
+	 * can't).  Roots captured by a transaction that aborts (or a
+	 * subtransaction) hold nothing, their slots reclaimed later.  Once they
+	 * are kept, the roots release[] (nrelease of them) are let go of as
+	 * the transaction commits, the locks still held: a branch being made
+	 * of kept pages (make_kept()) holds the relations against that while
+	 * it reads them.  With freeze, a heap-format relation's root holds its
+	 * pages frozen as of snapshot instead (freeze() of a copy of each page
+	 * changed since the relation's root in prior[], made into a root whose
+	 * unchanged pages are that root's), and its kept frozenxid is
+	 * FrozenTransactionId: it never goes stale; one unchanged since keeps
+	 * that root.  The others are kept as they are.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
 						 const BranchKeptRelation *release, int nrelease,
-						 bool (*settled) (void *arg), void *arg);
+						 bool (*settled) (void *arg), void *arg,
+						 BranchFreezePage freeze, Snapshot snapshot);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,
 	 * a table's together) back the pages keep() kept, the storage they had
 	 * going when the transaction commits, into renewed[] (each one kept as
-	 * it is now, by a snapshot of its new storage or, all unchanged since,
-	 * the same one).  O(1) in each relation's size, and nothing if none
-	 * changed since: if one did, each gets new storage made of its
-	 * snapshot (with no free space or visibility map), its row the oldest
+	 * it is now: by the same root, named as of its new storage).  O(1) in
+	 * each relation's size, and nothing if none changed since: if one did,
+	 * each gets new storage made of its root (with no free space or
+	 * visibility map, but for one unchanged since, which takes its own), its row the oldest
 	 * transaction ids it had then (one unchanged may hold hints, in its
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its
-	 * snapshot is gone, its rows' transaction ids are older than the
-	 * database still knows, or one that changed is in use (each is locked
-	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
-	 * refuses, while the session itself has it open or an AFTER trigger's
-	 * event queued on it; the locks taken are kept).
+	 * root is gone, its root isn't frozen and its rows' transaction ids
+	 * are older than the database still knows, one that changed is in use
+	 * by the session itself (refused, as TRUNCATE refuses, while the session has it open
+	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
+	 * Each that changed is locked as TRUNCATE locks it: as it is if the
+	 * session holds that lock already (a hard reset takes its restores'
+	 * locks before it holds the refs, waiting for a busy one with nothing
+	 * else held, then the refs only if they are free: see refs_copies.c's
+	 * lock_for_restore() for the order), else tried, within *wait's
+	 * bounds, as share() tries, never queued for while the caller holds
+	 * the refs; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
-	 * pages, which goes as the transaction commits, and with it every
-	 * other snapshot there: so each of carry[] (ncarry of them, other
-	 * commits' kept pages of the same relations) that is a snapshot of a
-	 * replaced storage is kept by the new storage too, O(1) each, and
-	 * carried[] (one for each, in order) names it there; one not carried
-	 * (not of a replaced storage, gone, or no room) is copied as it is.
-	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
-	 * the restored storage once it commits.
+	 * pages; the roots stay in the page store, so each of carry[] (ncarry
+	 * of them, other commits' kept pages of the same relations) kept of a
+	 * replaced storage is named as of the new storage in carried[] (one
+	 * for each, in order), nothing copied; one not of a replaced storage
+	 * is copied as it is.
+	 * The storage each relation had isn't dropped: replaced[] (one for
+	 * each, in order) names it (its snapshot BRANCH_KEPT_STORAGE, its
+	 * relfilenumber invalid if the relation kept its storage), for the
+	 * caller to keep for the snapshots older than the move, which go on
+	 * reading it (branch_storage_hook), and to let go of (let_go() or
+	 * keep()'s release[]) once none is left.
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
 							BranchKeptRelation *renewed,
 							const BranchKeptRelation *carry, int ncarry,
 							BranchKeptRelation *carried,
+							BranchKeptRelation *replaced,
 							BranchLockWait *wait);
 
 	/*
-	 * Optional: let go of a snapshot keep() or restore() took, if its
-	 * storage still has it (a dropped relation's went with it).
+	 * Optional: let go of a root keep() captured, as the transaction
+	 * commits, if its page store still keeps it; or, for one naming
+	 * storage a restore replaced (BRANCH_KEPT_STORAGE), drop that storage
+	 * as the transaction commits.  keep()'s release[] is let go of the
+	 * same way.
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
 
@@ -269,6 +312,14 @@ typedef struct BranchOpsRoutine
 	 * (a relation it gave new storage is gone from its old storage's).
 	 */
 	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: did any of the session branch's relations kept[] (nkept of
+	 * them, a table's together) change since keep() kept them, so that
+	 * restore() would give them new storage?  Asked before a hard reset
+	 * holds the refs, of the tables it locks for its restores first.
+	 */
+	bool		(*changed_since_kept) (const BranchKeptRelation *kept, int nkept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch
@@ -291,8 +342,9 @@ typedef struct BranchOpsRoutine
 	 * branch source's (the session's own, or another's), O(1) each, as
 	 * restore() gives them, whatever source's working set is now.  Each
 	 * must be stored alike on both branches, as share() requires, with
-	 * source's still on the storage that kept it, its snapshot there and
-	 * its rows' transaction ids ones the database still knows.  The source
+	 * source's still on the storage that kept it, its root still kept and
+	 * frozen or its rows' transaction ids ones the database still knows,
+	 * and one at least no longer of its root here (else false: nothing to give).  The source
 	 * is held against deletion and its relations against letting go of the
 	 * pages (ShareUpdateExclusiveLock), the session's locked as TRUNCATE
 	 * locks them (and refused while the session has one open, as restore()
@@ -303,13 +355,30 @@ typedef struct BranchOpsRoutine
 	 * so the caller gives only pages kept before every snapshot there is.
 	 * With source the session's own branch, carry[] is carried into the
 	 * new storage as restore() carries it, carried[] naming each there
-	 * (every one of them, the snapshot shared included, none being taken
-	 * after); with another's, carried[] is carry[] as it is.
+	 * (every one of them, the root shared included); with another's,
+	 * carried[] is carry[] as it is (carry may then be NULL, ncarry 0).
+	 * With replaced (and renewed) not NULL, the storage each relation had
+	 * isn't dropped but named in replaced[], each relation's new storage in
+	 * renewed[] (one for each, in order), for the caller to keep for the
+	 * snapshots older than the move, as restore()'s replaced[] are kept.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept, const BranchKeptRelation *carry,
 							   int ncarry, BranchKeptRelation *carried,
+							   BranchKeptRelation *renewed,
+							   BranchKeptRelation *replaced,
 							   BranchLockWait *wait);
+
+	/*
+	 * Optional: hold the pages kept (keep()'s, of any branch) again, for
+	 * the session branch's relation kept->relid as it is stored now, into
+	 * *held: the same pages, held on their own (let_go() lets go of either
+	 * without the other), named as of the relation's storage now; O(1).
+	 * Held once the transaction commits.  False, nothing held, if they are
+	 * no longer kept or the relation isn't on the branch.
+	 */
+	bool		(*hold) (const BranchKeptRelation *kept,
+						 BranchKeptRelation *held);
 
 	/*
 	 * Optional: add to each of the session branch's relations relids the

@@ -212,12 +212,37 @@ typedef struct xl_bmap_extend
  *						replaces (BMAP_TREE_CARRIED) has no header (the
  *						count pages are block 1 on) and nothing of its own
  *						to write out
+ * BMAP_TREE_CAPTURE	a root of the tree captured into its page store's
+ *						roots (BMAP_ROOTS_RELNUMBER): block 0 is the roots
+ *						page whose slot is set (its delta kept with an image
+ *						too), block 1 the relation's header (its epoch
+ *						raised), block 2 the roots' metapage, then the
+ *						reference-count pages of the subtrees, each a holder
+ *						more; always with BMAP_TREE_PRESERVE_LOGGED
+ * BMAP_TREE_ROOT_SLOT	a captured root's slot changes: named as let go of
+ *						by a (sub)transaction, or cleared (block 0, the
+ *						roots page, alone: the metapage's hint is lowered
+ *						as a hint, unlogged); or set to another root's
+ *						subtrees (block 0 the roots page, block 1 the roots'
+ *						metapage, then the reference-count pages of the
+ *						subtrees, each a holder more).  'locator' is the
+ *						roots file
+ * BMAP_TREE_EPOCH		the map's epoch raised, so that each page's next change
+ *						claims or copies it: block 0 is its header
+ * BMAP_TREE_STAMP		a pointer to the relation's own node 'node' set in the
+ *						map's epoch, the first change under it in the epoch:
+ *						block 0 is the parent (a node, or the tree's root
+ *						page), its delta
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
 #define BMAP_TREE_COPY			4
 #define BMAP_TREE_SHARE			5
 #define BMAP_TREE_SNAPSHOT		6
+#define BMAP_TREE_CAPTURE		7
+#define BMAP_TREE_ROOT_SLOT		8
+#define BMAP_TREE_EPOCH			9
+#define BMAP_TREE_STAMP			10
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
@@ -291,6 +316,8 @@ typedef struct BmapQueued
 #define BMAP_DELTA_SNAPSHOT	9
 #define BMAP_DELTA_QUEUE_META	10
 #define BMAP_DELTA_QUEUE	11
+#define BMAP_DELTA_ROOTS	12
+#define BMAP_DELTA_ROOTS_META	13
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
@@ -352,6 +379,7 @@ typedef struct xl_bmap_root_delta
 	uint16		flags;			/* BMAP_DELTA_INIT */
 	uint32		ntops;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+	uint64		made_of;		/* the captured root it is a copy of (0: none) */
 } xl_bmap_root_delta;
 
 /*
@@ -371,6 +399,50 @@ typedef struct xl_bmap_snapshot
 	uint32		unused;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
 } xl_bmap_snapshot;
+
+/*
+ * A root captured into a page store's roots: the tree as a snapshot holds
+ * it (snap.id 0: the slot is free; snap.owner the capturing
+ * (sub)transaction), the (sub)transaction that let go of it (0: none),
+ * and the map it was captured of: its identity (which no other map has,
+ * whatever its file number) and file number (or the relation of whose
+ * pages it holds frozen copies, and the epoch of that relation since which
+ * they changed).  It holds its subtrees
+ * while its capturer has committed (or is too old to say) and nobody who
+ * let go of it has.
+ */
+typedef struct xl_bmap_root
+{
+	xl_bmap_snapshot snap;
+	uint64		released_by;
+	uint64		map_id;			/* of the map it was captured of */
+	uint32		relnumber;
+	uint32		live_epoch;		/* of relnumber, its changes since told by
+								 * (0: snap.epoch) */
+} xl_bmap_root;
+
+/* Block data of a roots page: slot 'index' of the page set. */
+typedef struct xl_bmap_roots_delta
+{
+	uint16		kind;			/* BMAP_DELTA_ROOTS */
+	uint16		flags;			/* BMAP_DELTA_INIT */
+	uint32		index;
+	xl_bmap_root root;
+} xl_bmap_roots_delta;
+
+/*
+ * Block data of the roots' metapage: how many pages of slots follow it,
+ * the first that may have a free slot, and the last root's sequence number.
+ */
+typedef struct xl_bmap_roots_meta_delta
+{
+	uint16		kind;			/* BMAP_DELTA_ROOTS_META */
+	uint16		flags;			/* BMAP_DELTA_INIT */
+	uint32		npages;
+	uint32		hint;
+	uint32		unused;
+	uint64		seq;
+} xl_bmap_roots_meta_delta;
 
 /* Block data of a tree's root page: a snapshot slot set (or cleared). */
 typedef struct xl_bmap_snapshot_delta
