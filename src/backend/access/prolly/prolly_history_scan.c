@@ -29,9 +29,11 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/prolly_history.h"
 #include "access/stratnum.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_index.h"
@@ -261,12 +263,6 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		have_in = false;
 	CustomPath *cp;
 
-	/*
-	 * (a query using the entry's row whole, h or row_to_json(h), gets the
-	 * function scan: the scan's tuple is the function's columns alone)
-	 */
-	if (!bms_is_empty(rel->attr_needed[0 - rel->min_attr]))
-		return;
 	if (!history_key(relid, &key))
 		return;
 	for (int c = 0; c < key.ncolumns; c++)
@@ -380,8 +376,14 @@ history_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 								att->attcollation, 0);
 
 		scan_tlist = lappend(scan_tlist,
-							 makeTargetEntry((Expr *) v, i, NULL, false));
+							 makeTargetEntry((Expr *) v, i,
+											 pstrdup(NameStr(att->attname)),
+											 false));
 	}
+	/* (and the row whole, made of them: h, row_to_json(h), h IS NOT NULL) */
+	scan_tlist = lappend(scan_tlist,
+						 makeTargetEntry((Expr *) makeWholeRowVar(rte, rel->relid, 0, false),
+										 desc->natts + 1, NULL, false));
 	cs->scan.plan.targetlist = tlist;
 	cs->scan.plan.qual = extract_actual_clauses(clauses, false);
 	cs->scan.scanrelid = 0;
@@ -414,6 +416,9 @@ typedef struct HistoryScanState
 								 * key column's operator family, type and
 								 * collation */
 	List	   *values;			/* each clause's value (ExprState) */
+	TupleDesc	rowdesc;		/* the function's columns: the row whole's */
+	TupleTableSlot *row;		/* a row of the store, in rowdesc */
+	bool		whole;			/* is the row whole used? */
 	Tuplestorestate *store;
 	bool		read;
 } HistoryScanState;
@@ -424,6 +429,24 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 	HistoryScanState *hs = (HistoryScanState *) node;
 	CustomScan *cs = (CustomScan *) node->ss.ps.plan;
 
+	TupleDesc	scan = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	int			ncolumns = scan->natts - 1;
+	Bitmapset  *used = NULL;
+
+	/*
+	 * (the scan's tuple: the function's columns, then the row whole, formed
+	 * from them only if the plan reads it)
+	 */
+	hs->rowdesc = CreateTemplateTupleDesc(ncolumns);
+	for (int i = 0; i < ncolumns; i++)
+		TupleDescCopyEntry(hs->rowdesc, i + 1, scan, i + 1);
+	TupleDescFinalize(hs->rowdesc);
+	hs->rowdesc = BlessTupleDesc(hs->rowdesc);
+	hs->row = ExecInitExtraTupleSlot(estate, hs->rowdesc, &TTSOpsMinimalTuple);
+	pull_varattnos((Node *) cs->scan.plan.targetlist, INDEX_VAR, &used);
+	pull_varattnos((Node *) cs->scan.plan.qual, INDEX_VAR, &used);
+	hs->whole = bms_is_member(scan->natts - FirstLowInvalidHeapAttributeNumber,
+							  used);
 	hs->relid = (Oid) intVal(linitial(cs->custom_private));
 	hs->keys = lsecond(cs->custom_private);
 	hs->values = NIL;
@@ -591,14 +614,34 @@ history_next(ScanState *node)
 			memset(&rsinfo, 0, sizeof(rsinfo));
 			rsinfo.type = T_ReturnSetInfo;
 			rsinfo.setResult = hs->store;
-			rsinfo.setDesc = slot->tts_tupleDescriptor;
+			rsinfo.setDesc = hs->rowdesc;
 			prolly_history_rows(hs->relid, bounds, nbounds, &rsinfo);
 		}
 		MemoryContextSwitchTo(old);
 		hs->read = true;
 	}
-	if (!tuplestore_gettupleslot(hs->store, true, false, slot))
-		ExecClearTuple(slot);
+	ExecClearTuple(slot);
+	if (tuplestore_gettupleslot(hs->store, true, false, hs->row))
+	{
+		int			ncolumns = hs->rowdesc->natts;
+
+		slot_getallattrs(hs->row);
+		memcpy(slot->tts_values, hs->row->tts_values, ncolumns * sizeof(Datum));
+		memcpy(slot->tts_isnull, hs->row->tts_isnull, ncolumns * sizeof(bool));
+		slot->tts_isnull[ncolumns] = !hs->whole;
+		slot->tts_values[ncolumns] = (Datum) 0;
+		if (hs->whole)
+		{
+			MemoryContext old =
+				MemoryContextSwitchTo(node->ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+			slot->tts_values[ncolumns] =
+				HeapTupleGetDatum(heap_form_tuple(hs->rowdesc, slot->tts_values,
+												  slot->tts_isnull));
+			MemoryContextSwitchTo(old);
+		}
+		ExecStoreVirtualTuple(slot);
+	}
 	return slot;
 }
 
@@ -660,8 +703,6 @@ history_create_state(CustomScan *cs)
 
 	NodeSetTag(hs, T_CustomScanState);
 	hs->css.methods = &history_exec_methods;
-	/* (rows come from a tuplestore) */
-	hs->css.slotOps = &TTSOpsMinimalTuple;
 	return (Node *) hs;
 }
 
