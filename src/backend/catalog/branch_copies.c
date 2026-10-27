@@ -61,6 +61,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_branch.h"
+#include "catalog/partition.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_index.h"
@@ -2270,9 +2271,9 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 }
 
 /*
- * Queue for the locks restore() would take of kept[] (see branch_ops.h):
- * only if one's pages changed since its snapshot, as restore() gives them
- * new storage only then.
+ * Queue for the locks restore() would take of kept[] (see branch_ops.h),
+ * kept[0] the table: only if one's pages changed since its snapshot, as
+ * restore() gives them new storage only then.
  */
 static void
 copies_lock_for_restore(const BranchKeptRelation *kept, int nkept)
@@ -2288,7 +2289,23 @@ copies_lock_for_restore(const BranchKeptRelation *kept, int nkept)
 									 kept[i].snapshot))
 			any = true;
 	}
-	for (int i = 0; i < nkept && any; i++)
+	if (!any)
+		return;
+
+	/*
+	 * (a partition's ancestors first, top down, as a query on them locks
+	 * them before their partitions and the move locks them: holding a
+	 * partition first, the reset would deadlock with a query waiting behind
+	 * it on a partition)
+	 */
+	if (get_rel_relispartition(kept[0].relid))
+	{
+		List	   *ancestors = get_partition_ancestors(kept[0].relid);
+
+		for (int a = list_length(ancestors) - 1; a >= 0; a--)
+			LockRelationOid(list_nth_oid(ancestors, a), AccessExclusiveLock);
+	}
+	for (int i = 0; i < nkept; i++)
 		LockRelationOid(kept[i].relid, AccessExclusiveLock);
 }
 
