@@ -1462,10 +1462,10 @@ age_date(Plan *plan, PlanCommit *pc)
 		plan->arrivals = lappend(plan->arrivals, pc);
 		if (!plan->quiet)
 			ereport(WARNING,
-					(errmsg("commit %s is dated %s, after it arrived here",
-							prolly_hash_hex(&pc->id),
+					(errmsg("a commit is dated %s, after it arrived here",
 							timestamptz_to_str(pc->e.committed_at)),
-					 errdetail("It ages from %s instead.",
+					 errdetail("Commit %s ages from %s instead.",
+							   prolly_hash_hex(&pc->id),
 							   timestamptz_to_str(pc->arrived))));
 	}
 	pfree(k.data);
