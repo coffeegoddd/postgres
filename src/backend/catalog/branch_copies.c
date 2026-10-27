@@ -625,8 +625,7 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 		pfree(vb);
 		smgrcreate(dsrel, VISIBILITYMAP_FORKNUM, false);
 		log_smgrcreate(&dst, VISIBILITYMAP_FORKNUM);
-		RelationCopyStorage(src, dsrel, VISIBILITYMAP_FORKNUM,
-							RELPERSISTENCE_PERMANENT);
+		RelationCopyMapFork(src, dsrel, VISIBILITYMAP_FORKNUM);
 	}
 
 	/*
@@ -2345,8 +2344,18 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 	Assert(!concurrent || freeze == NULL);
 	*pages = 0;
 	let_go_of_abandoned();
+
+	/*
+	 * (no relation to keep, the branch's last table dropped: what is let
+	 * go of is still let go of, or the caller, which drops its entries,
+	 * would leave their roots held for good)
+	 */
 	if (relids == NIL)
+	{
+		for (int r = 0; r < nrelease; r++)
+			let_go_of(kept_locator(&release[r]), release[r].snapshot);
 		return true;
+	}
 	taking_begin(&taking, list_length(relids));
 	is_index = palloc0_array(bool, Max(list_length(relids), 1));
 	if (OidIsValid(lock_all_or_none(relids, mode)))

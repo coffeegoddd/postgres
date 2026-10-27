@@ -55,6 +55,8 @@ extern void RelationTruncate(Relation rel, BlockNumber nblocks);
 extern void RelationTruncateStorage(SMgrRelation srel, BlockNumber nblocks);
 extern void RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 								ForkNumber forkNum, char relpersistence);
+extern void RelationCopyMapFork(SMgrRelation src, SMgrRelation dst,
+								ForkNumber forkNum);
 extern bool RelFileLocatorSkippingWAL(RelFileLocator rlocator);
 extern void RelFileLocatorForceWALAtCommit(RelFileLocator rlocator);
 extern Size EstimatePendingSyncsSpace(void);
