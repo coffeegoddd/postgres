@@ -75,6 +75,7 @@ double		prolly_gc_growth_scale_factor = 0.2;
 int			prolly_journal_move_threshold = 256;
 int			prolly_conjoin_max_files = 256;
 int			prolly_gc_file_size = 65536;
+int			prolly_gc_rewrite_below = -1;
 bool		prolly_log_copied_bytes = false;
 double		prolly_autofold_threshold = 0.05;
 int			prolly_release_max_per_pass = 1000000;
@@ -148,6 +149,14 @@ prolly_autovacuum_init(void)
 							&prolly_gc_file_size,
 							65536, 1024, MAX_KILOBYTES,
 							PGC_SIGHUP,
+							GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.gc_rewrite_below",
+							"Below what size a full collection or a retire rewrites a settled table file with garbage, rather than keep it whole.",
+							"Above it, a file is kept whole while at most half of it is garbage.  -1 is a quarter of prolly.gc_file_size; 0 keeps every file so.",
+							&prolly_gc_rewrite_below,
+							-1, -1, MAX_KILOBYTES,
+							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.release_max_per_pass",

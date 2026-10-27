@@ -1019,6 +1019,16 @@ typedef struct ProllyRefsRoutine
 	 * window, which keeps their data.
 	 */
 	void		(*in_progress) (ProllyInProgressVisit visit, void *arg);
+
+	/*
+	 * Optional: walk_commit(), but past the history horizon only the
+	 * commit objects: a severed commit's data (its root's and its
+	 * dependencies' trees, archived elsewhere or deleted) isn't visited,
+	 * whether the store still has it or not.  For a sever's archiving,
+	 * which sends only what its own fragment reaches.
+	 */
+	void		(*walk_commit_kept) (const ProllyHash *commit_id,
+									 ProllyTreeVisitNode visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -1086,9 +1096,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
 	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept", \
-	"in_progress"
+	"in_progress", "walk_commit_kept"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK in_progress
+#define PROLLY_REFS_LAST_CALLBACK walk_commit_kept
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

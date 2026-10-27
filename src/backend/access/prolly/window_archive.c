@@ -25,6 +25,14 @@
  *	'r' tree commit		-> (empty) a severed commit's root or dependencies'
  *						   tree, and the commit, for the error a read of it
  *						   gives: several commits may share a tree
+ *	'q' tree			-> (empty) a tree of a severed commit whose pending
+ *						   record the last sever let go of: if the store
+ *						   holds it again (written again since: a revert
+ *						   to it, a repair's), a full collection doesn't
+ *						   follow it from the severed commits 'r' names it
+ *						   under, which would keep it for good.  The next
+ *						   sever lets go of those still not held, so a
+ *						   collection reads only the last sever's
  *	'D' boundary piece	-> what a boundary commit makes over its first
  *						   parent, severed (see fragment_closure()): a
  *						   piece (8 bytes big-endian) of it, each hash an
@@ -118,6 +126,7 @@
 #define KEY_SEVERED		'c'
 #define KEY_PENDING		'p'
 #define KEY_ROOT		'r'
+#define KEY_PRUNED		'q'
 
 #define FRAGMENT_VERSION	3
 #define FRAGMENT_DELETED	0x01
@@ -718,6 +727,99 @@ edge_of_severed(const Severed *sv, void *arg)
 		visit(&sv->id, &sv->dependencies, varg);
 }
 
+static void note_head_deps(const char *name, const ProllyHash *head, void *arg);
+
+/* The trees of 'q' entries, or the commits of 'r' entries under a prefix. */
+typedef struct PrunedScan
+{
+	StringInfoData prefix;		/* 'q', or 'r' and a tree */
+	List	   *ids;			/* ProllyHash *: the trees, or the commits */
+} PrunedScan;
+
+static bool
+collect_pruned(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	PrunedScan *ps = arg;
+	ProllyHash *id;
+
+	if (key->len <= (Size) ps->prefix.len ||
+		memcmp(key->data, ps->prefix.data, ps->prefix.len) != 0)
+		return false;
+	pgstat_count_prolly(PGSTAT_PROLLY_HORIZON_ENTRIES_READ, 1);
+	id = palloc(sizeof(ProllyHash));
+	(void) get_id((const char *) key->data + ps->prefix.len,
+				  (const char *) key->data + key->len, id);
+	ps->ids = lappend(ps->ids, id);
+	return true;
+}
+
+static void
+scan_pruned(const ProllyHash *root, ProllyChunkRead read, void *read_arg,
+			PrunedScan *ps)
+{
+	ProllyKey	from = {(const uint8 *) ps->prefix.data, ps->prefix.len};
+
+	PROLLY_CALL(dc.refs, side_scan_at, root, read, read_arg, SPACE_HORIZON,
+				&from, ForwardScanDirection, collect_pruned, ps);
+}
+
+/*
+ * The trees of severed commits whose pending records were let go of
+ * ('q'), each the store holds again: not followed from those commits
+ * ('r'), as a pending record's aren't.  One read of each such tree, as
+ * the collection has it, and the commits of those it holds.
+ */
+static void
+edges_of_pruned(const ProllyHash *refs_root, ProllyChunkRead read,
+				void *read_arg, ProllyWindowEdgeVisit visit, void *arg)
+{
+	PrunedScan	trees = {{0}, NIL};
+	StringInfoData data;
+	HTAB	   *live_deps = NULL;
+
+	initStringInfo(&data);
+	initStringInfo(&trees.prefix);
+	appendStringInfoChar(&trees.prefix, KEY_PRUNED);
+	scan_pruned(refs_root, read, read_arg, &trees);
+	foreach_ptr(ProllyHash, tree, trees.ids)
+	{
+		PrunedScan	commits = {{0}, NIL};
+
+		/*
+		 * (a dependencies' tree a branch head shares is live by it, not
+		 * to be cut from the many commits severed sharing it too)
+		 */
+		if (live_deps == NULL)
+		{
+			live_deps = id_set("prolly live dependencies", sizeof(ProllyHash));
+			PROLLY_CALL(dc.refs, branches, note_head_deps, live_deps);
+		}
+		if (set_has(live_deps, tree))
+			continue;
+
+		/*
+		 * (read as the collection has it, not asked of the store, whose
+		 * answer would keep it for the collection running)
+		 */
+		resetStringInfo(&data);
+		if (!read(read_arg, tree, &data))
+			continue;
+		initStringInfo(&commits.prefix);
+		appendStringInfoChar(&commits.prefix, KEY_ROOT);
+		put_id(&commits.prefix, tree);
+		scan_pruned(refs_root, read, read_arg, &commits);
+		foreach_ptr(ProllyHash, commit, commits.ids)
+			visit(commit, tree, arg);
+		list_free_deep(commits.ids);
+		pfree(commits.prefix.data);
+	}
+	list_free_deep(trees.ids);
+	pfree(trees.prefix.data);
+	pfree(data.data);
+	if (live_deps)
+		hash_destroy(live_deps);
+}
+
 static void
 archive_edges(const ProllyHash *refs_root, ProllyChunkRead read,
 			  void *read_arg, ProllyWindowEdgeVisit visit, void *arg)
@@ -734,6 +836,7 @@ archive_edges(const ProllyHash *refs_root, ProllyChunkRead read,
 
 		visit_pending(refs_root, read, read_arg, edge_of_severed, args);
 	}
+	edges_of_pruned(refs_root, read, read_arg, visit, arg);
 }
 
 static bool
@@ -1493,7 +1596,7 @@ ref_commits(void)
 
 typedef struct Gone
 {
-	List	   *gone;			/* ProllyHash *, records to let go of */
+	List	   *gone;			/* Severed *, records to let go of */
 	HTAB	   *live_deps;		/* the branch heads' dependencies' trees */
 } Gone;
 
@@ -1518,15 +1621,50 @@ note_gone(const Severed *sv, void *arg)
 		 PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
 					 &sv->dependencies)))
 		return;
-	g->gone = lappend(g->gone, memcpy(palloc(sizeof(ProllyHash)), &sv->id,
-									  sizeof(ProllyHash)));
+	g->gone = lappend(g->gone, memcpy(palloc(sizeof(Severed)), sv,
+									  sizeof(Severed)));
+}
+
+/*
+ * Let go of the 'q' entries an earlier sever made whose trees the store
+ * still doesn't hold: a tree written again before now is held, and keeps
+ * its entry.  The caller holds the refs.
+ */
+static void
+drop_pruned_gone(void)
+{
+	PrunedScan	trees = {{0}, NIL};
+	ProllyKey	from;
+	StringInfoData k;
+
+	initStringInfo(&trees.prefix);
+	appendStringInfoChar(&trees.prefix, KEY_PRUNED);
+	from.data = (const uint8 *) trees.prefix.data;
+	from.len = trees.prefix.len;
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+				ForwardScanDirection, collect_pruned, &trees);
+	initStringInfo(&k);
+	foreach_ptr(ProllyHash, tree, trees.ids)
+	{
+		if (PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, tree))
+			continue;
+		resetStringInfo(&k);
+		appendStringInfoChar(&k, KEY_PRUNED);
+		put_id(&k, tree);
+		drop_entry(&k);
+	}
+	list_free_deep(trees.ids);
+	pfree(trees.prefix.data);
+	pfree(k.data);
 }
 
 /*
  * Let go of the pending records of severed commits whose trees a
  * collection has freed: no collection need cut them any more (a tree
- * written again is live by what wrote it).  So what a collection reads of
- * the horizon is what it may yet free.  A dependencies' tree a branch head
+ * written again is live by what wrote it, and the commits it was let go
+ * of from are cut from it by its 'q' entry).  So what a collection reads
+ * of the horizon is what it may yet free, and the trees the last sever let
+ * go of the records of.  A dependencies' tree a branch head
  * shares is live, so it holds no record back; one it stops sharing later
  * stays, named by the severed commits let go of (a small tree, one for
  * each set of dependencies, until a repair or the commits' own severing
@@ -1538,20 +1676,32 @@ prune_pending(void)
 	Gone		g = {NIL, id_set("prolly live dependencies", sizeof(ProllyHash))};
 	List	   *gone;
 	StringInfoData k;
+	StringInfoData none;
 
+	drop_pruned_gone();
 	PROLLY_CALL(dc.refs, branches, note_head_deps, g.live_deps);
 	visit_pending(NULL, NULL, NULL, note_gone, &g);
 	gone = g.gone;
 	hash_destroy(g.live_deps);
 	initStringInfo(&k);
-	foreach_ptr(ProllyHash, id, gone)
+	initStringInfo(&none);
+	foreach_ptr(Severed, sv, gone)
 	{
 		resetStringInfo(&k);
 		appendStringInfoChar(&k, KEY_PENDING);
-		put_id(&k, id);
+		put_id(&k, &sv->id);
 		drop_entry(&k);
+		/* (its trees, should the store hold one again: see 'q') */
+		for (int t = 0; t < (sv->dependencies.len > 0 ? 2 : 1); t++)
+		{
+			resetStringInfo(&k);
+			appendStringInfoChar(&k, KEY_PRUNED);
+			put_id(&k, t == 0 ? &sv->root : &sv->dependencies);
+			put_entry(&k, &none);
+		}
 	}
 	pfree(k.data);
+	pfree(none.data);
 }
 
 static void
@@ -3084,8 +3234,16 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 		StringInfoData format;
 		ReadBack	rb;
 
-		sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
-								   f->ntops);
+		/*
+		 * (what the fragment reaches, but an older fragment's data: that
+		 * is archived elsewhere, or was deleted, and may be gone here)
+		 */
+		if (PROLLY_HAS(dc.transfer, send_kept))
+			sent = (int64) PROLLY_CALL(dc.transfer, send_kept, rr, remote,
+									   f->tops, f->ntops);
+		else
+			sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
+									   f->ntops);
 		/*
 		 * (named first, so the archive keeps what it was sent, its own
 		 * collections too, while it is read back)
@@ -4383,10 +4541,8 @@ archive_repair(const char *source, int nfragments)
 			/*
 			 * Verified, settled: the commits, kept in settled files, name
 			 * the data received, and a default collection doesn't read
-			 * settled files.  Walking from the fragment's tops would stop
-			 * at once, since they are those commits, still here.  Each
-			 * tree goes back to the generation its commit's file lists it
-			 * by, or the file's own.
+			 * settled files.  Each tree goes back to the generation its
+			 * commit's file lists it by.
 			 */
 			if (PROLLY_HAS(tree_env.chunk_store, settle))
 			{
@@ -4399,6 +4555,7 @@ archive_repair(const char *source, int nfragments)
 			pfree(data_roots);
 			pfree(namers);
 		}
+
 
 		/*
 		 * (its edges and record let go of: the boundary keeps its parents;
@@ -4473,6 +4630,21 @@ prolly_window_archived(const ProllyHash *id)
 	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, archived))
 		return false;
 	return PROLLY_CALL(c.history_window, archived, id);
+}
+
+bool
+prolly_window_cut_edge(void *arg, const ProllyHash *source,
+					   const ProllyHash *target)
+{
+	ProllyDatabaseComponents c;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&c);
+	if (!prolly_window_archived(source) ||
+		!PROLLY_CALL(c.refs, commit_get, source, &info))
+		return false;
+	return same_hash(&info.root.hash, target) ||
+		(info.has_dependencies && same_hash(&info.dependencies.hash, target));
 }
 
 static void

@@ -64,10 +64,12 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_config.h"
 #include "access/prolly_toast.h"
+#include "access/prolly_window.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
@@ -84,6 +86,8 @@ typedef struct Mark
 {
 	const ProllyChunkStoreRoutine *cs;
 	ProllyChunkGc *gc;
+	bool		read_any;		/* the horizon's edges read through any
+								 * settled file (a retire's) */
 	uint64		nslots;
 	uint8	   *marks;			/* a bit a slot */
 	uint64	   *queue;			/* marked, not yet read: a ring, count of
@@ -427,7 +431,8 @@ note_cut(const ProllyHash *boundary, const ProllyHash *parent, void *arg)
 		todo = list_delete_last(todo);
 		resetStringInfo(&data);
 		/* (a boundary commit gone already names nothing) */
-		if (!collected_read(mk, h, &data) ||
+		if (!(mk->read_any ? PROLLY_CALL(mk->cs, gc_read_any, mk->gc, h, &data) :
+			  collected_read(mk, h, &data)) ||
 			!PROLLY_CALL(format, open, (const uint8 *) data.data, data.len,
 						 &node))
 			continue;
@@ -525,6 +530,18 @@ count_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 	(*(int *) arg)++;
 }
 
+/*
+ * The size below which a settled file with garbage is rewritten, not kept
+ * whole (prolly.gc_rewrite_below; -1: a quarter of prolly.gc_file_size).
+ */
+static uint64
+rewrite_below(void)
+{
+	if (prolly_gc_rewrite_below < 0)
+		return (uint64) prolly_gc_file_size * 1024 / 4;
+	return (uint64) prolly_gc_rewrite_below * 1024;
+}
+
 /* a full collection's choice of the files it keeps whole */
 typedef struct Keep
 {
@@ -543,8 +560,18 @@ choose_file(int file, uint64 first, uint64 nslots, bool settled, uint64 size,
 
 	if (k->keep[file] || !settled || nslots == 0)
 		return;
+
 	for (uint64 slot = first; slot < first + nslots; slot++)
 		live += (k->mk->marks[slot / 8] >> (slot % 8)) & 1;
+
+	/*
+	 * A small one with garbage is rewritten whatever its share: it costs
+	 * little, and kept whole it would keep its garbage, and what that
+	 * names, as long as it is kept (a generation's file of a few chunks,
+	 * of history severed and of what stays).
+	 */
+	if (live < nslots && size < rewrite_below())
+		return;
 	if ((double) (nslots - live) <= REWRITE_GARBAGE * nslots)
 	{
 		k->keep[file] = true;
@@ -595,6 +622,12 @@ mark_listed(const ProllyHash *target, const ProllyHash *source, uint32 epoch,
 					return;
 		}
 	}
+	/* (epoch 0: any copy, as a reference marks) */
+	if (epoch == 0)
+	{
+		mark_ref(target, mk);
+		return;
+	}
 	slot = PROLLY_CALL(mk->cs, gc_find_in, mk->gc, target, epoch);
 	if (slot >= 0)
 		mark_slot(mk, (uint64) slot);
@@ -619,9 +652,136 @@ horizon_read_end(int code, Datum arg)
 	WalSndHorizonReadEnd();
 }
 
+/*
+ * A chunk as a retire reads the horizon's edges through: collected, or in
+ * a settled file it doesn't collect (the refs, the boundary commits, may
+ * be in one).
+ */
+static bool
+any_read(void *arg, const ProllyHash *hash, StringInfo out)
+{
+	Mark	   *mk = arg;
+
+	return PROLLY_CALL(mk->cs, gc_read_any, mk->gc, hash, out);
+}
+
+/* The refs tree's walk: the nodes left to read. */
+typedef struct RefsWalk
+{
+	List	   *todo;			/* ProllyHash * */
+} RefsWalk;
+
+static void
+push_refs_node(const ProllyHash *hash, void *arg)
+{
+	RefsWalk   *rw = arg;
+
+	rw->todo = lappend(rw->todo,
+					   memcpy(palloc(sizeof(ProllyHash)), hash, sizeof(ProllyHash)));
+}
+
+/*
+ * The refs tree as of the seal (root): each of its nodes collected told
+ * to the store, which lists what they name in older generations apart
+ * (they change with every commit, and one no longer live, kept in a
+ * settled file a retire doesn't collect, would otherwise keep what it
+ * named), and marked.  A collection that isn't a retire reads only those
+ * collected: what changed since the last collection is all of them, as
+ * a node is written anew whenever one below it is.  A retire, which
+ * reads no node's list, reads every node of the live tree through any
+ * file, and marks what each of its leaves names.  What a node names past
+ * the tree (commits, working sets) is marked as any chunk's references
+ * are.
+ */
+static void
+mark_refs_tree(Mark *mk, const ProllyHash *root, bool retire)
+{
+	RefsWalk	rw = {NIL};
+	HASHCTL		ctl;
+	HTAB	   *seen;
+	StringInfoData data;
+
+	if (root->len == 0 || !PROLLY_HAS(mk->cs, gc_refs_node))
+		return;
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly refs nodes walked", 256, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	initStringInfo(&data);
+	push_refs_node(root, &rw);
+	while (rw.todo != NIL)
+	{
+		ProllyHash *h = llast(rw.todo);
+		ProllyHash	key;
+		int64		slot;
+		bool		found;
+
+		rw.todo = list_delete_last(rw.todo);
+		CHECK_FOR_INTERRUPTS();
+		memset(&key, 0, sizeof(key));
+		key.len = h->len;
+		memcpy(key.bytes, h->bytes, h->len);
+		pfree(h);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+		slot = PROLLY_CALL(mk->cs, gc_find, mk->gc, &key);
+		resetStringInfo(&data);
+		if (slot >= 0)
+		{
+			PROLLY_CALL(mk->cs, gc_refs_node, mk->gc, (uint64) slot);
+			mark_slot(mk, (uint64) slot);
+			PROLLY_CALL(mk->cs, gc_read, mk->gc, (uint64) slot, &data);
+		}
+		else if (!retire ||
+				 !PROLLY_CALL(mk->cs, gc_read_any, mk->gc, &key, &data))
+			continue;
+
+		/*
+		 * (an internal node's children are the tree's nodes; a leaf's
+		 * references, past it, marked: drained, for one collected)
+		 */
+		if (!prolly_chunk_is_leaf(data.data, data.len))
+			prolly_chunk_references(data.data, data.len, push_refs_node, &rw);
+		else if (slot < 0)
+			mark_named(mk, data.data, data.len);
+		drain(mk);
+	}
+	pfree(data.data);
+	hash_destroy(seen);
+}
+
+static bool collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi,
+						   bool if_free, ProllyGcResult *result);
+
 static bool
 copying_collect(bool full, bool if_free, ProllyGcResult *result)
 {
+	return collect_scoped(full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT, 0, 0,
+						  if_free, result);
+}
+
+/*
+ * Retire generations lo to hi: what of their settled files nothing names
+ * is freed, marking only what is collected (the journal, the files not
+ * settled, and theirs), from the roots and what the other settled files'
+ * sections list in them.  A file of theirs with little garbage is kept
+ * whole; one with more rewritten, its chunks keeping their generations;
+ * one all garbage dropped.
+ */
+static bool
+copying_retire(uint32 lo, uint32 hi, bool if_free, ProllyGcResult *result)
+{
+	return collect_scoped(PROLLY_GC_RETIRE, lo, hi, if_free, result);
+}
+
+static bool
+collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
+			   ProllyGcResult *result)
+{
+	bool		full = (scope == PROLLY_GC_FULL);
+	bool		retire = (scope == PROLLY_GC_RETIRE);
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
 										  MyDatabaseTableSpace);
@@ -638,7 +798,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	 * and held until the transaction ends, so the horizon read is the one
 	 * committed and stays so)
 	 */
-	if (full)
+	if (full || retire)
 	{
 		ProllyDatabaseComponents dc;
 
@@ -649,11 +809,24 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
-	mk.gc = PROLLY_CALL(cs, gc_begin, store,
-						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT, if_free,
-						&root, &mk.nslots);
+	if (retire)
+		mk.gc = PROLLY_CALL(cs, gc_begin_retire, store, lo, hi, if_free,
+							&root, &mk.nslots);
+	else
+		mk.gc = PROLLY_CALL(cs, gc_begin, store, scope, if_free, &root,
+							&mk.nslots);
 	if (mk.gc == NULL)
 		return false;			/* (another collection running) */
+
+	/*
+	 * A retire relies on the settled files' generations to mark only what
+	 * it collects: checked first where checking is on, refused if they're
+	 * wrong, so it never frees by a list that is.
+	 */
+	if (retire && debug_prolly_verify_generations &&
+		PROLLY_HAS(cs, verify_generations))
+		(void) PROLLY_CALL(cs, verify_generations, store,
+						   prolly_window_cut_edge, NULL);
 
 	/*
 	 * A fold's tree no ref names may be garbage now: the folds made so far
@@ -678,7 +851,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	 * collects every file, reads them: a default one keeps what the
 	 * boundary reaches, as its settled files keep what they reach.
 	 */
-	if (full && root.len > 0)
+	if ((full || retire) && root.len > 0)
 	{
 		ProllyDatabaseComponents dc;
 
@@ -687,10 +860,15 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 		{
 			CutBuild	cb = {&mk, NIL};
 
-			PROLLY_CALL(dc.history_window, edges, &root, collected_read, &mk,
+			mk.read_any = retire;
+			PROLLY_CALL(dc.history_window, edges, &root,
+						retire ? any_read : collected_read, &mk,
 						note_cut, &cb);
 		}
 	}
+
+	/* the refs tree as of the seal, its nodes told to the store */
+	mark_refs_tree(&mk, &root, retire);
 
 	/* what the root as of the seal reaches */
 	if (root.len > 0)
@@ -704,6 +882,13 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	/* what the store keeps for its own reasons */
 	PROLLY_CALL(cs, gc_retained, mk.gc, mark_new, &mk);
 	drain(&mk);
+
+	/* a retire's: what the settled files it doesn't collect name */
+	if (retire)
+	{
+		PROLLY_CALL(cs, gc_inbound, mk.gc, mark_listed, &mk);
+		drain(&mk);
+	}
 
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
@@ -733,7 +918,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 		drain(&mk);
 
 		/* the settled files kept whole, and what they name */
-		if (full)
+		if (full || retire)
 		{
 			Keep		k = {&mk, keep, true};
 
@@ -769,7 +954,8 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (debug_prolly_verify_generations && PROLLY_HAS(cs, verify_generations))
-		(void) PROLLY_CALL(cs, verify_generations, store);
+		(void) PROLLY_CALL(cs, verify_generations, store,
+						   prolly_window_cut_edge, NULL);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);
 	return true;
@@ -823,4 +1009,5 @@ const ProllyReclaimRoutine prolly_reclaim_copying = {
 	},
 	.collect = copying_collect,
 	.move = copying_move,
+	.retire = copying_retire,
 };
