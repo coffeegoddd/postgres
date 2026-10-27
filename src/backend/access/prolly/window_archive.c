@@ -770,31 +770,6 @@ branch_setting(const char *name, const char *setting)
 	return found;
 }
 
-/*
- * The warm window holds the hot one (prolly.history_hot, the page roots'
- * window, as the database has it, where that is set): a warm window
- * shorter is taken as hot, with a notice.
- */
-static void
-hold_hot(const char *name, ProllyWindowPolicy *p)
-{
-	int64		hot = database_span("prolly.history_hot");
-
-	/*
-	 * (any window, by time, by count or by size: what is younger than hot
-	 * is kept)
-	 */
-	if (hot > p->keep_time &&
-		(p->keep_time > 0 || p->keep_commits > 0 || p->max_bytes > 0))
-	{
-		ereport(NOTICE,
-				(errmsg("the history window of %s%s%s is taken as prolly.history_hot, which it can't be shorter than",
-						name ? "branch \"" : "database \"",
-						name ? name : get_database_name(MyDatabaseId), "\"")));
-		p->keep_time = hot;
-	}
-}
-
 static void
 archive_policy(const char *name, ProllyWindowPolicy *p)
 {
@@ -820,17 +795,13 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	v = database_setting("prolly.history_archive");
 	p->archive = (v && *v) ? v : NULL;
 	if (name == NULL)
-	{
-		hold_hot(NULL, p);
 		return;
-	}
 	if ((v = branch_setting(name, "warm")) != NULL)
 		(void) parse_span(v, &p->keep_time);
 	if ((v = branch_setting(name, "cold_batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
-	hold_hot(name, p);
 }
 
 /* A branch lineage's own setting (value NULL: the database's again). */
@@ -1451,10 +1422,6 @@ static bool
 head_windows(Plan *plan, const TimestampTz *before)
 {
 	TimestampTz now = plan_now();
-	int64		hot = database_span("prolly.history_hot");
-
-	/* (what is younger than hot is kept, whatever cut is given) */
-	TimestampTz hot_cut = hot > 0 ? now - hot : DT_NOEND;
 	bool		any = false;
 
 	foreach_ptr(Head, h, plan->heads)
@@ -1463,7 +1430,7 @@ head_windows(Plan *plan, const TimestampTz *before)
 
 		if (before != NULL)
 		{
-			h->cut = Min(*before, hot_cut);
+			h->cut = *before;
 			h->min_commits = 0;
 			any = true;
 			continue;
@@ -1596,6 +1563,68 @@ make_plan(Plan *plan, const TimestampTz *before)
 		hash_destroy(stops);
 	}
 	hash_destroy(fragment);
+}
+
+/*
+ * The commits in the window now (branch: its lineage's only), as a sever
+ * would keep them for their age or count: each lineage's head walked by
+ * its policy, with no merge base's floor and no other ref's keeping.
+ */
+static HTAB *
+window_commits(const char *branch)
+{
+	Plan		plan;
+	HTAB	   *in = id_set("prolly window", sizeof(ProllyHash));
+
+	window_init();
+	sever_clock = DT_NOBEGIN;
+	memset(&plan, 0, sizeof(plan));
+	plan.commits = id_set("prolly window plan", sizeof(PlanCommit));
+	plan.head_ids = id_set("prolly window heads", sizeof(ProllyHash));
+	plan.archived = archived_parents();
+	PROLLY_CALL(dc.refs, branches, note_branch, &plan);
+	note_refs(&plan);
+	/* (the cut taken once, now, for every head) */
+	(void) head_windows(&plan, NULL);
+	foreach_ptr(Head, h, plan.heads)
+	{
+		if (h->name == NULL || (branch != NULL && strcmp(h->name, branch) != 0))
+			continue;
+		walk_window(&plan, h);
+	}
+	foreach_ptr(PlanCommit, pc, plan.kept)
+		if (!pc->by_base)
+			(void) set_add(in, &pc->id);
+	hash_destroy(plan.commits);
+	hash_destroy(plan.head_ids);
+	return in;
+}
+
+static void
+archive_window(const char *branch, ProllyWindowCommitVisit visit, void *arg)
+{
+	HTAB	   *in = window_commits(branch);
+	HASH_SEQ_STATUS seq;
+	ProllyHash *id;
+
+	hash_seq_init(&seq, in);
+	while ((id = hash_seq_search(&seq)) != NULL)
+		if (!visit(id, arg))
+		{
+			hash_seq_term(&seq);
+			break;
+		}
+	hash_destroy(in);
+}
+
+static bool
+archive_in_window(const char *branch, const ProllyHash *commit)
+{
+	HTAB	   *in = window_commits(branch);
+	bool		found = set_has(in, commit);
+
+	hash_destroy(in);
+	return found;
 }
 
 static void
@@ -2861,4 +2890,6 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.repair = archive_repair,
 	.policy = archive_policy,
 	.set_policy = archive_set_policy,
+	.window = archive_window,
+	.in_window = archive_in_window,
 };

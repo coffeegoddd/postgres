@@ -637,6 +637,35 @@ dolt_history_window(PG_FUNCTION_ARGS)
 }
 
 /*
+ * prolly_history_in_window(branch text, commit_hash text) returns bool
+ *
+ * Whether the commit is in the history window now: in branch's lineage's
+ * (NULL: any branch's), kept for its age or count as a sever would keep
+ * it.  A commit kept only for a ref or a merge base isn't.
+ */
+Datum
+prolly_history_in_window(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	char	   *hex;
+	ProllyHash	commit;
+
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a commit is needed")));
+	hex = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (!prolly_hash_from_hex(hex, strlen(hex), &commit))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a commit hash", hex)));
+	PG_RETURN_BOOL(PROLLY_CALL(w, in_window,
+							   PG_ARGISNULL(0) ? NULL :
+							   text_to_cstring(PG_GETARG_TEXT_PP(0)),
+							   &commit));
+}
+
+/*
  * prolly_history_policy(branch text)
  *	returns record (action text, warm interval, min_commits bigint,
  *					cold_batch interval, max_size bigint, archive text)
