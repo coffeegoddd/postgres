@@ -30,7 +30,7 @@ my $fetches = q{SET enable_seqscan = off; SET enable_bitmapscan = off;
 	SELECT count(id) FROM bm.t WHERE id > 0};
 # (a copy of the source's storage: VACUUM (FREEZE) after the commit
 # copied the pages kept as of it, whose copy then has no map true of them)
-my $branch = q{SET prolly.kept_commits = 0; SELECT dolt_checkout('other');};
+my $branch = q{SET debug_prolly_page_roots = off; SELECT dolt_checkout('other');};
 
 # the branch's first use shares the table, its maps copied; then a crash
 like(sql($branch . $fetches), qr/Heap Fetches: 0/, 'the branch visits no heap page');

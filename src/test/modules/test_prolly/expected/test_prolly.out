@@ -68,8 +68,11 @@ FROM prolly_implementations();
  history_window | archive      |       1 |              1
  history_window | stub         |       0 |              0
  root_freezer   | capture      |       1 |              1
+ root_freezer   | lazy         |       2 |              1
  root_freezer   | stub         |       0 |              0
-(60 rows)
+ root_retention | window       |       1 |              1
+ root_retention | stub         |       0 |              0
+(63 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -149,7 +152,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs           | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs           | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs           | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs           | stub           | complete                       | not implemented (97 of 97 callbacks missing)
+ refs           | stub           | complete                       | not implemented (102 of 102 callbacks missing)
  transfer       | chunks         | identity                       | pass
  transfer       | chunks         | receive_then_send              | no checks yet
  transfer       | chunks         | complete                       | pass
@@ -314,9 +317,15 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | stub           | complete                       | not implemented (14 of 14 callbacks missing)
  root_freezer   | capture        | identity                       | pass
  root_freezer   | capture        | complete                       | pass
+ root_freezer   | lazy           | identity                       | pass
+ root_freezer   | lazy           | complete                       | pass
  root_freezer   | stub           | identity                       | pass
- root_freezer   | stub           | complete                       | not implemented (2 of 2 callbacks missing)
-(239 rows)
+ root_freezer   | stub           | complete                       | not implemented (4 of 4 callbacks missing)
+ root_retention | window         | identity                       | pass
+ root_retention | window         | complete                       | pass
+ root_retention | stub           | identity                       | pass
+ root_retention | stub           | complete                       | not implemented (5 of 5 callbacks missing)
+(245 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

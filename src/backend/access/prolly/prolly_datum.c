@@ -1968,11 +1968,21 @@ check_jsonb_container(const char *doc, uint32 at, uint32 end, bool top)
 					uint32		pad = jsonb_padding(doc, from, data + stop);
 					const char *num = doc + from + pad;
 					uint32		len = stop - start - pad;
+					char	   *copy = NULL;
 
+					/* (a document read from a node may sit unaligned) */
+					if (len >= VARHDRSZ && (uintptr_t) num % sizeof(int32) != 0)
+					{
+						copy = palloc(len);
+						memcpy(copy, num, len);
+						num = copy;
+					}
 					if (len < VARHDRSZ || !VARATT_IS_4B_U(num) ||
 						VARSIZE(num) != len ||
 						!numeric_is_canonical((Numeric) unconstify(char *, num)))
 						bad_value("a jsonb numeric that isn't one numeric builds");
+					if (copy)
+						pfree(copy);
 					break;
 				}
 			case JENTRY_ISBOOL_FALSE:

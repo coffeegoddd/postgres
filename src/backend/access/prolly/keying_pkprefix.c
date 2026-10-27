@@ -477,7 +477,8 @@ parse_shape(const ProllyValue *v, Shape *s)
 static bool
 same_value(const ProllyValue *a, const ProllyValue *b)
 {
-	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+	return a->len == b->len &&
+		(a->len == 0 || memcmp(a->data, b->data, a->len) == 0);
 }
 
 /* Does rel's row shape now parse into now?  (buf holds it.) */

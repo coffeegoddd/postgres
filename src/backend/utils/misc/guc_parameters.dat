@@ -755,6 +755,13 @@
   boot_val => 'false',
 },
 
+{ name => 'debug_prolly_page_roots', type => 'bool', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Has prolly commits keep their pages by page roots; off, none are kept, so moves write rows, for testing.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_page_roots',
+  boot_val => 'true',
+},
+
 { name => 'debug_prolly_settle_epoch', type => 'int', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Settles what a prolly history repair brings back in this generation, whatever its fragment records, and lists nothing it names that is not here, for testing what relies on settling it right (0: off).',
   flags => 'GUC_NOT_IN_SAMPLE',
