@@ -52,6 +52,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "access/xloginsert.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
@@ -536,6 +537,35 @@ emptied_relations(List *emptied, List **relids)
 }
 
 /*
+ * Are the pages of storage reln still those root k keeps of it?  A root
+ * holding them as they were shares reln's subtrees until one changes
+ * (bmap_root_unchanged()); a frozen one holds copies, so reln's pages
+ * changed since are looked for (bmap_changed_pages(), which reads the
+ * map's leaves).
+ */
+static bool
+kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
+{
+	RelFileLocator loc = reln->smgr_rlocator.locator;
+	BlockNumber root_nblocks;
+	BlockNumber nblocks;
+	BlockNumber *blknos;
+	uint32		n;
+
+	uint32		since;
+
+	if (k->frozenxid != FrozenTransactionId)
+		return bmap_root_unchanged(reln, k->snapshot);
+	if (!bmap_root_held(loc, k->snapshot, &root_nblocks) ||
+		!bmap_root_base(reln, k->snapshot, &since))
+		return false;
+	n = bmap_changed_pages(reln, since, &blknos, &nblocks);
+	if (blknos)
+		pfree(blknos);
+	return n == 0 && nblocks == root_nblocks;
+}
+
+/*
  * Storage of a relation's copy made of the pages kept by root k of its
  * storage: O(1).  If the relation changed since, its row takes the
  * oldest transaction ids they hold, and claims no page all-visible (the
@@ -555,7 +585,8 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	 * held against VACUUM no bit is set meanwhile, while a writer only
 	 * clears one, of a page whose kept version had it)
 	 */
-	if (bmap_root_unchanged(src, k->snapshot))
+	/* (a frozen root's pages are copies, of which the source's maps say nothing) */
+	if (k->frozenxid != FrozenTransactionId && kept_unchanged(src, k))
 	{
 		(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
 											 k->snapshot, src, NULL, src, true);
@@ -1774,6 +1805,137 @@ keep_now(Form_pg_class c, BranchKeptRelation *k, Taking *t)
 	pgstat_count_prolly(PGSTAT_PROLLY_PAGES_KEPT, 1);
 }
 
+/* Are relation c's pages heap pages, whose versions a root freezes? */
+static bool
+heap_format(Form_pg_class c)
+{
+	return c->relkind == RELKIND_RELATION || c->relkind == RELKIND_TOASTVALUE ||
+		c->relkind == RELKIND_MATVIEW;
+}
+
+/*
+ * Keep relation c's pages (row k) by a root holding them frozen as of
+ * snapshot (see branch_ops.h's keep()): each page changed since the
+ * relation's root among prior[] (the first of its storage that its store
+ * still holds; none: every page) copied, frozen and written into a copy of
+ * that root (temporary storage, dropped as the transaction ends, made a
+ * root of), each logged as an image once.  The relation's own pages are
+ * left as they are, and its epoch raised so that each one's next change
+ * marks it changed since.  Unchanged since, it keeps that root.
+ */
+static void
+keep_frozen(Form_pg_class c, BranchKeptRelation *k,
+			const BranchKeptRelation *prior, int nprior,
+			BranchFreezePage freeze, Snapshot snapshot)
+{
+	RelFileLocator live = class_locator(c, c->relfilenode);
+	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
+	const BranchKeptRelation *base = NULL;
+	BmapRootId	base_root = 0;
+	BlockNumber base_nblocks = 0;
+	uint32		since = 0;
+	BlockNumber *blknos = NULL;
+	BlockNumber nblocks;
+	uint32		n;
+	RelFileNumber tnumber;
+	RelFileLocator tloc;
+	SMgrRelation tsrel;
+	PGIOAlignedBlock copy;
+	uint32		live_epoch;
+
+	/*
+	 * (a kept commit's root may be one of another storage's pages, named
+	 * as of this one by a restore: only a root captured of this storage,
+	 * or the one it was made a copy of, tells its pages changed since)
+	 */
+	for (int p = 0; p < nprior && base_root == 0; p++)
+	{
+		if (prior[p].relid == c->oid &&
+			prior[p].relfilenumber == c->relfilenode &&
+			prior[p].tablespace == c->reltablespace &&
+			prior[p].frozenxid == FrozenTransactionId &&
+			bmap_root_held(live, prior[p].snapshot, &base_nblocks) &&
+			bmap_root_base(lsrel, prior[p].snapshot, &since))
+		{
+			base = &prior[p];
+			base_root = base->snapshot;
+		}
+	}
+	if (base_root == 0)
+	{
+		BmapRootId	made_of = bmap_made_of(lsrel);
+
+		if (made_of != 0 && bmap_root_held(live, made_of, &base_nblocks) &&
+			bmap_root_base(lsrel, made_of, &since))
+			base_root = made_of;
+		else
+			since = 0;
+	}
+	n = bmap_changed_pages(lsrel, since, &blknos, &nblocks);
+	if (base && n == 0 && nblocks == base_nblocks)
+	{
+		*k = *base;
+		if (blknos)
+			pfree(blknos);
+		return;
+	}
+
+	/* the copy: of the root, or empty; its length the relation's */
+	tnumber = GetNewRelFileNumber(c->reltablespace, NULL, c->relpersistence);
+	tloc = class_locator(c, tnumber);
+	if (base_root != 0)
+		tsrel = RelationCreateStorageFromRoot(tloc, base_root, NULL, NULL,
+											  NULL, true);
+	else
+		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
+										  SMGR_BMAP);
+	if (smgrnblocks(tsrel, MAIN_FORKNUM) > nblocks)
+		smgrtruncate(tsrel, &(ForkNumber) {MAIN_FORKNUM}, 1,
+					 &(BlockNumber) {smgrnblocks(tsrel, MAIN_FORKNUM)}, &nblocks);
+	else if (smgrnblocks(tsrel, MAIN_FORKNUM) < nblocks)
+		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(tsrel, RELPERSISTENCE_PERMANENT),
+										  MAIN_FORKNUM, NULL,
+										  EB_SKIP_EXTENSION_LOCK | EB_CLEAR_SIZE_CACHE, nblocks,
+										  RBM_ZERO_ON_ERROR));
+
+	/* each page changed: frozen, and the copy's (a new block of its own) */
+	for (uint32 i = 0; i < n; i++)
+	{
+		Buffer		buf;
+
+		buf = ReadBufferWithoutRelcache(live, MAIN_FORKNUM, blknos[i],
+										RBM_NORMAL, NULL, true);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
+		if (!PageIsNew((Page) copy.data))
+			(void) freeze((Page) copy.data, blknos[i], snapshot);
+		buf = ReadBufferWithoutRelcache(tloc, MAIN_FORKNUM, blknos[i],
+										RBM_ZERO_AND_LOCK, NULL, true);
+		START_CRIT_SECTION();
+		memcpy(BufferGetPage(buf), copy.data, BLCKSZ);
+		MarkBufferDirty(buf);
+		if (!PageIsNew(BufferGetPage(buf)))
+			log_newpage_buffer(buf, true);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (blknos)
+		pfree(blknos);
+
+	/* the root, of the relation; the relation's next changes told anew */
+	live_epoch = bmap_raise_epoch(lsrel);
+	k->tablespace = c->reltablespace;
+	k->relfilenumber = c->relfilenode;
+	k->snapshot = bmap_root_capture_logged(tsrel, c->relfilenode, live_epoch);
+	note_taken(live, k->snapshot);
+	k->frozenxid = FrozenTransactionId;
+	k->minmxid = InvalidMultiXactId;
+	RelationDropStorageByLocator(tloc);
+	pgstat_count_prolly(PGSTAT_PROLLY_PAGES_KEPT, 1);
+}
+
 /* Can relation c's storage keep its pages, by a root captured? */
 static bool
 can_keep(Form_pg_class c)
@@ -1795,7 +1957,8 @@ can_keep(Form_pg_class c)
 static bool
 copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			BranchKeptRelation *kept, const BranchKeptRelation *release,
-			int nrelease, bool (*settled) (void *arg), void *arg)
+			int nrelease, bool (*settled) (void *arg), void *arg,
+			BranchFreezePage freeze, Snapshot snapshot)
 {
 	Relation	pg_class;
 	List	   *rows = NIL;
@@ -1841,6 +2004,12 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 				break;
 			memset(k, 0, sizeof(*k));
 			k->relid = c->oid;
+			if (freeze && heap_format(c))
+			{
+				k->relid = c->oid;
+				keep_frozen(c, k, prior, nprior, freeze, snapshot);
+				continue;
+			}
 			for (int p = 0; p < nprior && !again; p++)
 			{
 				if (prior[p].relid == c->oid &&
@@ -1978,9 +2147,9 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		if (rows[i] == NULL ||
 			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
 			ok = false;
-		else if (!bmap_root_unchanged(smgropen(kept_locator(&kept[i]),
-											   INVALID_PROC_NUMBER),
-									  kept[i].snapshot))
+		else if (!kept_unchanged(smgropen(kept_locator(&kept[i]),
+										  INVALID_PROC_NUMBER),
+								 &kept[i]))
 			any = true;
 	}
 
@@ -2135,9 +2304,9 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		{
 			Form_pg_class oc = (Form_pg_class) GETSTRUCT(rows[i]);
 
-			any = !bmap_root_unchanged(smgropen(class_locator(oc, oc->relfilenode),
-												INVALID_PROC_NUMBER),
-									   kept[i].snapshot);
+			any = !kept_unchanged(smgropen(class_locator(oc, oc->relfilenode),
+										   INVALID_PROC_NUMBER),
+								  &kept[i]);
 		}
 		ok = any;
 	}

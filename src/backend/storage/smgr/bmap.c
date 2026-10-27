@@ -230,10 +230,11 @@ int			block_map_replay_entries = 65536;
  * release queue entries didn't say which drop's transaction they wait for;
  * version 4's headers didn't say which entries may be shared with another
  * map; version 5's root pages didn't name the map, or the captured root it
- * was made a copy of.  This server reads only version 6 and refuses
+ * was made a copy of; version 6's captured roots didn't say of whose pages
+ * they hold frozen copies.  This server reads only version 7 and refuses
  * anything older (refuse_version()).
  */
-#define BMAP_VERSION		6
+#define BMAP_VERSION		7
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -7126,9 +7127,10 @@ bmappreparesforchanges(SMgrRelation reln, ForkNumber forknum)
 
 /*
  * Is logical block 'blkno''s block held by another map too, so that
- * preparing it for a change copies it?  *copies says whether preparing it
- * copies it, for that reason or because it is as of the relation's last
- * fold.
+ * preparing it for a change copies it?  *copies says whether its next
+ * change is to be prepared at all: to copy it, for that reason or because
+ * it is as of the relation's last fold, or to claim it, its entry born
+ * before the map's epoch.
  */
 bool
 bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
@@ -7148,7 +7150,14 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	/* (a tree's block is shared too if its leaf is, through any node) */
 	shared = lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0 ||
 		!tree_path_own(reln, blkno, epoch);
-	*copies = shared || entry.epoch < changes_fold_epoch(reln);
+
+	/*
+	 * Its next change prepares it all the same, born before the map's
+	 * epoch: shared, it is copied; else claimed, its entry taking the epoch,
+	 * which is how a frozen root's next capture finds the pages changed
+	 * since (bmap_changed_pages())
+	 */
+	*copies = true;
 	return shared;
 }
 
@@ -9526,7 +9535,8 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
  * The slot names the capturing (sub)transaction.  Returns the root's id.
  */
 static BmapRootId
-root_capture_slot(SMgrRelation reln, BlockList *own)
+root_capture_slot(SMgrRelation reln, BlockList *own, bool logged,
+				  RelFileNumber of, uint32 live_epoch)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -9566,9 +9576,18 @@ root_capture_slot(SMgrRelation reln, BlockList *own)
 	refs_cover(rel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	headerbuf = preserve_header_lock(reln, own);
+	if (logged)
+	{
+		/* (its own pages each logged as an image since their last change) */
+		headerbuf = map_read(rel, 0);
+		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel,
+				   BMAP_FORKNUM, 0);
+	}
+	else
+		headerbuf = preserve_header_lock(reln, own);
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
-	if (own->n > 0)
+	if (own->n > 0 || logged)
 		store_flush_begin(rel);
 
 	/* the root page's pointers, which the root takes */
@@ -9605,8 +9624,9 @@ root_capture_slot(SMgrRelation reln, BlockList *own)
 	rdelta.root.snap.nblocks = header->nblocks;
 	rdelta.root.snap.fold_epoch = header->fold_epoch;
 	rdelta.root.snap.epoch = hdelta.epoch;
-	rdelta.root.relnumber = rel.relNumber;
+	rdelta.root.relnumber = RelFileNumberIsValid(of) ? of : rel.relNumber;
 	rdelta.root.map_id = root.map_id;
+	rdelta.root.live_epoch = live_epoch;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.root.snap.tops[k].block = root.top[k].block;
@@ -9693,7 +9713,8 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 		ids[i] = 0;
 	for (int i = 0; i < n; i++)
 	{
-		ids[i] = root_capture_slot(rels[i], &own[i]);
+		ids[i] = root_capture_slot(rels[i], &own[i], false,
+								   InvalidRelFileNumber, 0);
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
 	}
 	MarkBufferedPagesShared();
@@ -9708,6 +9729,27 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 	pfree(own);
 	if (n > 0)
 		INJECTION_POINT("bmap-roots-captured", NULL);
+}
+
+/*
+ * A root of reln (a copy of relation 'of' whose pages were frozen into it),
+ * capture as bmap_root_capture() does, but its own pages each logged as an
+ * image since their last change (log_newpage()), so none again: they are
+ * written out, which the record's redo does too.  The root is recorded as
+ * of relation 'of', its pages changed since told by epoch 'live_epoch'
+ * there (bmap_root_since()).
+ */
+BmapRootId
+bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
+{
+	BlockList	own = {0};
+	BmapRootId	id = root_capture_slot(reln, &own, true, of, live_epoch);
+
+	MarkBufferedPagesShared();
+	FlushRelationsAllBuffers(&reln, 1);
+	store_flush_end(reln->smgr_rlocator.locator, false);
+	INJECTION_POINT("bmap-roots-captured", NULL);
+	return id;
 }
 
 /*
@@ -9896,6 +9938,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
 	rdelta.root.relnumber = r.relnumber;
 	rdelta.root.map_id = r.map_id;
+	rdelta.root.live_epoch = r.live_epoch;
 	memset(&mdelta, 0, sizeof(mdelta));
 	mdelta.kind = BMAP_DELTA_ROOTS_META;
 	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
@@ -10177,6 +10220,183 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_ROOTS_SHARED, 1);
 	INJECTION_POINT("bmap-root-shared", NULL);
+}
+
+/*
+ * Freezing roots (bmap_root_capture() of a copy whose pages are frozen): a
+ * relation's pages changed since a root, found by their entries' epochs
+ * (bmap_changed_pages()); the map's epoch raised, so each page's next change
+ * marks it changed again (bmap_raise_epoch()); and a root captured of a copy
+ * whose own pages were each logged as an image since their last change,
+ * logging none again (bmap_root_capture_logged()), recorded as of the
+ * relation it froze and the epoch its next changes are told by.
+ */
+
+typedef struct ChangedWalk
+{
+	uint32		since;
+	BlockNumber nblocks;
+	BlockNumber *blknos;
+	uint32		n;
+	uint32		cap;
+} ChangedWalk;
+
+static bool
+changed_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	return first < ((ChangedWalk *) arg)->nblocks;
+}
+
+static void
+changed_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	ChangedWalk *cw = arg;
+
+	if (!BlockNumberIsValid(blkno) || blkno >= cw->nblocks ||
+		entry->epoch < cw->since)
+		return;
+	if (cw->n == cw->cap)
+	{
+		cw->cap = Max(cw->cap * 2, 64);
+		cw->blknos = cw->blknos ? repalloc_array(cw->blknos, BlockNumber, cw->cap) :
+			palloc_array(BlockNumber, cw->cap);
+	}
+	cw->blknos[cw->n++] = blkno;
+}
+
+/*
+ * The logical blocks of reln under its length whose entries were set in
+ * epoch 'since' or after (each changed since: a write after a raise of the
+ * epoch claims or copies its page, setting its entry's epoch), into
+ * *blknos (palloc'd, ascending): how many.  Its length into *nblocks.  The
+ * caller keeps reln from changing.  It reads every leaf of the map.
+ */
+uint32
+bmap_changed_pages(SMgrRelation reln, uint32 since, BlockNumber **blknos,
+				   BlockNumber *nblocks)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		buf;
+	BmapRoot	root;
+	ChangedWalk cw = {since, 0, NULL, 0, 0};
+	uint64		first = 0;
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	cw.nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(headerbuf);
+	for (int k = 0; k < BMAP_TREE_TOPS && first < cw.nblocks; k++)
+	{
+		if (BlockNumberIsValid(root.top[k].block))
+			tree_walk_node(reln, &root.top[k], k, (BlockNumber) first, false,
+						   changed_node, changed_entry, &cw);
+		first += tree_span(k);
+	}
+	if (cw.n > 1)
+		qsort(cw.blknos, cw.n, sizeof(BlockNumber), cmp_block);
+	*blknos = cw.blknos;
+	*nblocks = cw.nblocks;
+	return cw.n;
+}
+
+/*
+ * Raise reln's epoch, as a snapshot does, so that each of its pages' next
+ * change claims or copies it, setting its entry's epoch: the new epoch.
+ */
+uint32
+bmap_raise_epoch(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	BmapHeader *header;
+	xl_bmap_header_delta hdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	header = PageGetBmapHeader(BufferGetPage(headerbuf));
+	hdelta.kind = BMAP_DELTA_HEADER;
+	hdelta.flags = 0;
+	hdelta.nblocks = header->nblocks;
+	hdelta.epoch = header->epoch + 1;
+	hdelta.fold_epoch = header->fold_epoch;
+	hdelta.shared_below = 0;
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_EPOCH;
+	xlrec.flags = 0;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	START_CRIT_SECTION();
+	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
+	MarkBufferDirty(headerbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, headerbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &hdelta, sizeof(hdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(headerbuf), lsn);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(headerbuf);
+	MarkBufferedPagesShared();
+	return hdelta.epoch;
+}
+
+/*
+ * May root 'id' be a frozen base of relation 'live' (a root its frozen
+ * roots are made of, the pages changed since it found by their epochs)?
+ * Yes if it was captured of live, frozen (its pages changed since told by
+ * the epoch it recorded of live), or if live was made a copy of it (told
+ * by the root's own epoch, live's when made).  The epoch into *since.
+ */
+bool
+bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)
+{
+	RelFileLocator rel = live->smgr_rlocator.locator;
+	Buffer		buf;
+	xl_bmap_root r;
+	BmapRoot	root;
+
+	if (!root_read(rel, id, -1, &buf, &r) || r.live_epoch == 0)
+		return false;
+	if (r.relnumber == rel.relNumber)
+	{
+		*since = r.live_epoch;
+		return true;
+	}
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	if (root.made_of != id)
+		return false;
+	*since = r.snap.epoch;
+	return true;
+}
+
+/* The captured root reln's tree was made a copy of (0: none). */
+BmapRootId
+bmap_made_of(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf = map_read(rel, 1);
+	BmapRootId	id;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	id = PageGetBmapRoot(BufferGetPage(buf))->made_of;
+	UnlockReleaseBuffer(buf);
+	return id;
 }
 
 /*

@@ -124,6 +124,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 					appendStringInfoString(buf, "root captured (images logged)");
 				else if (xlrec->op == BMAP_TREE_ROOT_SLOT)
 					appendStringInfoString(buf, "root slot");
+				else if (xlrec->op == BMAP_TREE_EPOCH)
+					appendStringInfoString(buf, "epoch raised");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

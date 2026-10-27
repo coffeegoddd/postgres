@@ -227,6 +227,8 @@ typedef struct xl_bmap_extend
  *						metapage, then the reference-count pages of the
  *						subtrees, each a holder more).  'locator' is the
  *						roots file
+ * BMAP_TREE_EPOCH		the map's epoch raised, so that each page's next change
+ *						claims or copies it: block 0 is its header
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -235,6 +237,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_SNAPSHOT		6
 #define BMAP_TREE_CAPTURE		7
 #define BMAP_TREE_ROOT_SLOT		8
+#define BMAP_TREE_EPOCH			9
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
@@ -397,7 +400,9 @@ typedef struct xl_bmap_snapshot
  * it (snap.id 0: the slot is free; snap.owner the capturing
  * (sub)transaction), the (sub)transaction that let go of it (0: none),
  * and the map it was captured of: its identity (which no other map has,
- * whatever its file number) and file number.  It holds its subtrees
+ * whatever its file number) and file number (or the relation of whose
+ * pages it holds frozen copies, and the epoch of that relation since which
+ * they changed).  It holds its subtrees
  * while its capturer has committed (or is too old to say) and nobody who
  * let go of it has.
  */
@@ -407,7 +412,8 @@ typedef struct xl_bmap_root
 	uint64		released_by;
 	uint64		map_id;			/* of the map it was captured of */
 	uint32		relnumber;
-	uint32		unused;
+	uint32		live_epoch;		/* of relnumber, its changes since told by
+								 * (0: snap.epoch) */
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */

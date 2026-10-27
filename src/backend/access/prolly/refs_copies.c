@@ -3660,6 +3660,25 @@ static bool commit_height(const ProllyHash *id, int64 *height);
  * refs and tries no keep, and once it has passed, one backend's commit
  * claims the next try, not each backend's.
  */
+/*
+ * The freezing of a keep's roots as it captures them, if the root freezer
+ * does so (NULL: they are kept as captured).  Not under
+ * dolt.transaction_commit, whose every transaction's commit would pay it:
+ * there the freezer freezes later.
+ */
+static BranchFreezePage
+freeze_at_keep(const ProllyDatabaseComponents *dc)
+{
+	const char *tc = GetConfigOption("dolt.transaction_commit", true, false);
+
+	if (dc->root_freezer == NULL || !PROLLY_HAS(dc->root_freezer, at_capture) ||
+		!PROLLY_HAS(dc->root_freezer, freeze_page) ||
+		!dc->root_freezer->at_capture() ||
+		(tc != NULL && strcmp(tc, "on") == 0))
+		return NULL;
+	return dc->root_freezer->freeze_page;
+}
+
 static int
 root_interval_ms(void)
 {
@@ -4453,7 +4472,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	 * transaction's commit would try it)
 	 */
 	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
-							kept_settled, snap))
+							kept_settled, snap, freeze_at_keep(&dc), snap))
 	{
 		root_note(name, GetCurrentTimestamp());
 		return;
