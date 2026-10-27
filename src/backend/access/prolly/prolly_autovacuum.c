@@ -436,6 +436,28 @@ store_tablespaces(void)
 }
 
 /*
+ * Settle the captured roots of the current database's page stores, in
+ * every tablespace, so that none needs the commit log to say what became
+ * of a transaction older than any running now (bmap_roots_reclaim()):
+ * before the database's oldest transaction id advances, and the log may
+ * forget those.
+ */
+void
+prolly_settle_page_stores(void)
+{
+	List	   *spcs = store_tablespaces();
+	ListCell   *lc;
+
+	foreach(lc, spcs)
+	{
+		RelFileLocator store = {lfirst_oid(lc), MyDatabaseId, InvalidRelFileNumber};
+
+		(void) bmap_roots_reclaim(store, true);
+	}
+	list_free(spcs);
+}
+
+/*
  * Sweep the current database's page stores, in every tablespace that has
  * one (only those bmap_sweep_due() names, with due_only), adding to total.
  */

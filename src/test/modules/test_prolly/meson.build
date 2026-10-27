@@ -455,7 +455,7 @@ tests += {
       't/595_move_carries_statistics.pl',
       't/610_ssi_fold_worker_xid.pl',
       't/760_root_keep_retries.pl',
-      't/761_remap_from_old.pl',
+      't/763_root_share_released.pl',
       't/520_revision_reads.pl',
       't/556_rebase_continue_errors.pl',
       't/468_bmap_shared_redo_changes.pl',

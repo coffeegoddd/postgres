@@ -175,11 +175,11 @@ extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
 extern bool bmap_root_unchanged(SMgrRelation reln, BmapRootId id);
 extern void bmap_share_root(BmapRootId id, SMgrRelation dst,
 							SMgrRelation replacing, SMgrRelation sharer);
-extern uint32 bmap_roots_reclaim(RelFileLocator store);
+extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
 
 /* inspection, for tests */
 extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
-							   uint64 *slots);
+							   uint64 *slots, uint64 *naming);
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);

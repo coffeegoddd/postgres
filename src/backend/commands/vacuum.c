@@ -1718,6 +1718,14 @@ vac_update_datfrozenxid(void)
 	LockDatabaseFrozenIds(ExclusiveLock);
 
 	/*
+	 * The page stores' captured roots name the transactions that captured
+	 * and let go of them: settled first, so that none of those older than
+	 * the horizon taken next is asked of the commit log, which may forget
+	 * it once datfrozenxid advances.
+	 */
+	prolly_settle_page_stores();
+
+	/*
 	 * Initialize the "min" calculation with
 	 * GetOldestNonRemovableTransactionId(), which is a reasonable
 	 * approximation to the minimum relfrozenxid for not-yet-committed

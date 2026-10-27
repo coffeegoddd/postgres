@@ -1195,15 +1195,23 @@ Roots are captured no more often than prolly.root_interval (by default
 every commit made by hand, and a second under dolt.transaction_commit,
 whose transactions each make a commit) and prolly.root_interval_commits
 allow; a transaction's own commit keeps its pages too when one is due and
-no other writer of the branch is at work.  A move to a commit no root was
-captured at restores the nearest kept commit before it (by first parents)
-and writes the rows the two differ by, at most an interval's.  A commit's
+no other writer of the branch is at work.  The time a branch's root was
+last kept, or tried, is in shared memory: once the interval passes, one
+backend's commit claims the next try, and the others' within it read
+nothing of the kept commits.  A move to a commit no root was captured at
+restores the nearest kept commit before it (by first parents, no further
+back than the oldest commit the branch's own list keeps) and writes the
+rows the two differ by: an interval's, and what a merge between brought
+in.  A commit's
 pages are the commit's, whichever branch kept them: a move restores them
 from another branch's kept commit too (share_kept()), so a branch made at
 a commit moves back along its history as the branch that made it would.
 Freezing is still to come: a root keeps the transaction ids of its rows,
 so a kept commit older than the database's frozen horizon is held, not
-restored.  If capture inside the commit costs too much, freezing can move
+restored.  A root's slot names the transactions that captured and let go
+of it, which VACUUM settles (bmap_roots_reclaim()) before the database's
+oldest transaction id advances: no slot then needs the commit log once it
+forgets them, and one a crash left is reclaimed rather than held.  If capture inside the commit costs too much, freezing can move
 to the background, a root not yet frozen staying usable until the horizon
 passes it.
 

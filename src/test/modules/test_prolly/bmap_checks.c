@@ -724,7 +724,7 @@ test_bmap_roots(PG_FUNCTION_ARGS)
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	bmap_inspect_roots(locator_of(InvalidRelFileNumber), &held, &slots);
+	bmap_inspect_roots(locator_of(InvalidRelFileNumber), &held, &slots, NULL);
 	values[0] = Int64GetDatum((int64) held);
 	values[1] = Int64GetDatum((int64) slots);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
@@ -739,17 +739,32 @@ test_bmap_roots_of(PG_FUNCTION_ARGS)
 	uint64		held;
 	uint64		slots;
 
-	bmap_inspect_roots(locator_of(PG_GETARG_OID(0)), &held, &slots);
+	bmap_inspect_roots(locator_of(PG_GETARG_OID(0)), &held, &slots, NULL);
 	PG_RETURN_INT64((int64) held);
 }
 
-/* test_bmap_roots_reclaim(): the abandoned roots reclaimed */
+/* test_bmap_roots_naming(): the slots in use that name a transaction */
+PG_FUNCTION_INFO_V1(test_bmap_roots_naming);
+
+Datum
+test_bmap_roots_naming(PG_FUNCTION_ARGS)
+{
+	uint64		held;
+	uint64		slots;
+	uint64		naming;
+
+	bmap_inspect_roots(locator_of(InvalidRelFileNumber), &held, &slots, &naming);
+	PG_RETURN_INT64((int64) naming);
+}
+
+/* test_bmap_roots_reclaim(settle): the abandoned roots reclaimed */
 PG_FUNCTION_INFO_V1(test_bmap_roots_reclaim);
 
 Datum
 test_bmap_roots_reclaim(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT32((int32) bmap_roots_reclaim(locator_of(InvalidRelFileNumber)));
+	PG_RETURN_INT32((int32) bmap_roots_reclaim(locator_of(InvalidRelFileNumber),
+												 PG_GETARG_BOOL(0)));
 }
 
 /*

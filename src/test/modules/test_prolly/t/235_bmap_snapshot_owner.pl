@@ -62,8 +62,18 @@ sub reclaimed
 	return sql(q{SELECT test_bmap_roots_reclaim()});
 }
 
+# the holder counts a sweep found wrong (counting every holder, a root's
+# included) and set right, once what is let go of is drained: none, if
+# each root reclaimed let go of exactly the holders it gained
+sub miscounted
+{
+	sql(q{SELECT count(*) FROM test_bmap_release_drain()});
+	return sql(q{SELECT recounted FROM prolly_page_sweep()});
+}
+
 is(kept(), '1', 'c1 is kept by one root');
 is(reclaimed(), '0', 'no slot to reclaim');
+is(miscounted(), '0', 'every holder counted');
 
 # A keep stopped after its roots are captured, before its commit: the root
 # is held while its transaction runs, a sweep included; then a crash.
@@ -96,6 +106,7 @@ is($swept, '2', 'and a sweep meanwhile leaves it');
 is(kept(), '1', 'after the crash, nobody holds the root of c2');
 sql(q{SELECT freed FROM prolly_page_sweep()});
 is(reclaimed(), '0', 'a sweep reclaimed its slot');
+is(miscounted(), '0', 'and let go of the holders its root gained');
 
 # Not swept, the slot the crash left is reclaimed by the store's reclaim.
 sql(q{UPDATE ko.t SET v = 2 WHERE id = 2; SELECT dolt_commit('-am', 'c3')});
@@ -115,6 +126,7 @@ sql(qq{BEGIN; SELECT test_bmap_root_capture($rel); ROLLBACK;
 	ROLLBACK TO s; COMMIT;});
 is(kept(), '3', 'roots of transactions rolled back are held by nobody');
 is(reclaimed(), '2', 'and their slots are reclaimed');
+is(miscounted(), '0', 'and the holders their roots gained let go of');
 
 # A prepared transaction's root is held while it is prepared, a sweep
 # included: held once it commits, by nobody if it is rolled back.
@@ -147,6 +159,20 @@ is(kept(), '4', 'rolled back, it is held by nobody');
 $s->query_safe('COMMIT');
 $s->quit;
 is(reclaimed(), '1', 'and reclaimed');
+
+# VACUUM settles every slot before the database's oldest transaction id
+# may advance, so that none needs the commit log, which may then forget its
+# transactions: a capture a crash ended, never reclaimed, is reclaimed, and
+# the slots held name no transaction (else, too old for the log to say,
+# that capture would be held for good).
+keep_then_crash('c7');
+cmp_ok(sql(q{SELECT test_bmap_roots_naming()}), '>', 0,
+	'slots name the transactions that captured and let go of them');
+sql('VACUUM');
+is(sql(q{SELECT test_bmap_roots_naming()}), '0', 'VACUUM settles them all');
+is(reclaimed(), '0', 'the slot c7\'s crash left reclaimed by it');
+is(miscounted(), '0', 'with the holders its root gained');
+is(kept(), '4', 'the roots held still held');
 
 # A sweep passes over maps a crash left unfinished: one with no pages, and
 # one whose pages are all zeroes.

@@ -51,8 +51,7 @@
  *						pages, the old block's reference-count page if its
  *						count changes, the changes list's header and page if
  *						the old block is listed (BMAP_REMAP_LISTED), and last
- *						the page itself, as an image (or, a page another map
- *						holds, with none: BMAP_REMAP_FROM_OLD)
+ *						the page itself, as an image
  * XLOG_BMAP_FOLD		a fold begins: block 0 is the map's header (its epoch
  *						raised), block 1 the changes list's header
  * XLOG_BMAP_CHANGES	the changes list rewritten: its pages, then its header
@@ -144,19 +143,10 @@ typedef struct xl_bmap_shrink
  * from the block.  One another map shares keeps what it has: the primary
  * doesn't write there (the image may have hints only this map's buffer
  * had).
- *
- * A heap page (of no special space) another map holds (a share's, a
- * root's) needs no image either (BMAP_REMAP_FROM_OLD): the old block holds
- * it durably, as the share or capture made it (logged as an image then),
- * and nothing writes it since but another holder's buffer with hints set,
- * so the copy is the block's page, on the primary as in redo, which reads
- * it there.  Hints differ, as they may; the block map's masking ignores
- * them, as heap's does.
  */
 #define BMAP_REMAP_ZERO		0x01
 #define BMAP_REMAP_LISTED	0x02	/* the old block stays, on the list */
 #define BMAP_REMAP_OWN		0x04	/* and no other map holds it */
-#define BMAP_REMAP_FROM_OLD	0x08	/* no image: the old block's page */
 
 typedef struct xl_bmap_remap
 {
@@ -231,7 +221,8 @@ typedef struct xl_bmap_extend
  *						more; always with BMAP_TREE_PRESERVE_LOGGED
  * BMAP_TREE_ROOT_SLOT	a captured root's slot changes: named as let go of
  *						by a (sub)transaction, or cleared (block 0, the
- *						roots page, alone); or set to another root's
+ *						roots page, alone: the metapage's hint is lowered
+ *						as a hint, unlogged); or set to another root's
  *						subtrees (block 0 the roots page, block 1 the roots'
  *						metapage, then the reference-count pages of the
  *						subtrees, each a holder more).  'locator' is the
@@ -380,6 +371,7 @@ typedef struct xl_bmap_root_delta
 	uint16		flags;			/* BMAP_DELTA_INIT */
 	uint32		ntops;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+	uint64		made_of;		/* the captured root it is a copy of (0: none) */
 } xl_bmap_root_delta;
 
 /*
@@ -404,7 +396,8 @@ typedef struct xl_bmap_snapshot
  * A root captured into a page store's roots: the tree as a snapshot holds
  * it (snap.id 0: the slot is free; snap.owner the capturing
  * (sub)transaction), the (sub)transaction that let go of it (0: none),
- * and the relation file number it was captured of.  It holds its subtrees
+ * and the map it was captured of: its identity (which no other map has,
+ * whatever its file number) and file number.  It holds its subtrees
  * while its capturer has committed (or is too old to say) and nobody who
  * let go of it has.
  */
@@ -412,6 +405,7 @@ typedef struct xl_bmap_root
 {
 	xl_bmap_snapshot snap;
 	uint64		released_by;
+	uint64		map_id;			/* of the map it was captured of */
 	uint32		relnumber;
 	uint32		unused;
 } xl_bmap_root;

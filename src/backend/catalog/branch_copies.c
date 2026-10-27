@@ -1690,7 +1690,7 @@ let_go_of_abandoned(void)
 		foreach_ptr(TakenSnapshot, o, abandoned)
 			done |= o->locator.spcOid == t->locator.spcOid;
 		if (!done)
-			(void) bmap_roots_reclaim(t->locator);
+			(void) bmap_roots_reclaim(t->locator, false);
 		pfree(t);
 	}
 }

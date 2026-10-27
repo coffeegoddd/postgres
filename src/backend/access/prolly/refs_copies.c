@@ -3653,15 +3653,13 @@ static bool commit_height(const ProllyHash *id, int64 *height);
  * (every commit) for commits made by hand, and a second under
  * dolt.transaction_commit, whose every transaction is a commit.  A move to
  * a commit that wasn't kept restores the nearest kept commit before it
- * and writes the rows the two differ by, at most an interval's.  Each
- * backend remembers the time its branch was last found kept, or a keep of
- * it last failed, so a commit within the interval asks nothing of the refs
- * and tries no keep.
+ * and writes the rows the two differ by, the rows changed in an interval
+ * (and what a merge between brought in).  The time a branch's root was last
+ * kept, or a keep of it last tried, is shared by every backend
+ * (branch_root_soon()): within the interval, a commit asks nothing of the
+ * refs and tries no keep, and once it has passed, one backend's commit
+ * claims the next try, not each backend's.
  */
-static char last_root_branch[NAMEDATALEN];
-static Oid	last_root_db = InvalidOid;
-static TimestampTz last_root_at = 0;
-
 static int
 root_interval_ms(void)
 {
@@ -3673,23 +3671,36 @@ root_interval_ms(void)
 	return tc != NULL && strcmp(tc, "on") == 0 ? 1000 : 0;
 }
 
-/* Is a commit of branch name too soon after its last root to keep? */
+/*
+ * The session's branch (name, which is current: roots are kept of it
+ * alone).
+ */
+static Oid
+root_branch(const char *name)
+{
+	Assert(strcmp(name, branch_ops()->current()) == 0);
+	return MyBranch;
+}
+
+/*
+ * Is a commit of branch name too soon after its last root to keep?  With
+ * claim, a commit that isn't is the one to try, as no other within the
+ * interval will.
+ */
 static bool
-root_soon(const char *name)
+root_soon(const char *name, bool claim)
 {
 	int			ms = root_interval_ms();
 
-	return ms > 0 && last_root_db == MyDatabaseId &&
-		strcmp(last_root_branch, name) == 0 &&
-		!TimestampDifferenceExceeds(last_root_at, GetCurrentTimestamp(), ms);
+	return ms > 0 && OidIsValid(root_branch(name)) &&
+		branch_root_soon(root_branch(name), ms, claim);
 }
 
 static void
 root_note(const char *name, TimestampTz at)
 {
-	strlcpy(last_root_branch, name, sizeof(last_root_branch));
-	last_root_db = MyDatabaseId;
-	last_root_at = at;
+	if (root_interval_ms() > 0 && OidIsValid(root_branch(name)))
+		branch_root_note(root_branch(name), at);
 }
 
 /*
@@ -4348,8 +4359,9 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 		snap == NULL || RecoveryInProgress())
 		return;
 	name = branch_ops()->current();
-	if (root_soon(name))
+	if (root_soon(name, true))
 		return;
+	INJECTION_POINT("prolly-root-kept-read", NULL);
 	kept = kept_get(name);
 	{
 		KeptCommit *newest = NULL;
@@ -4977,6 +4989,16 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
  * The nearest commit before commit (by first parents, as its branch made
  * them, at most NEAREST_KEPT_MAX back) whose pages kept (the branch's list)
  * keeps, its commit into *info: NULL if none.
+ *
+ * The walk stops at the height of the oldest commit the branch's own list
+ * keeps (its last entry not retired): each step costs a commit's read and a
+ * look in the refs' index of every branch's kept commits, and below that
+ * height only another branch's roots could be found.  With a list of its
+ * own, a branch's moves miss those; with none (a branch made at a commit
+ * another branch kept), the walk goes the whole way.  First parents only:
+ * the rows between are written as a diff of the two commits' trees,
+ * whatever lies between, so a merge between costs the rows its other
+ * parent brought in, and a root on that side, nearer, is not looked for.
  */
 typedef struct OtherKept
 {
@@ -5029,15 +5051,28 @@ nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
 			 Oid *source)
 {
 	ProllyHash	id;
+	int64		lowest = -1;
 
 	if (commit->nparents == 0)
 		return NULL;
+	for (int i = list_length(kept) - 1; i >= 0; i--)
+	{
+		KeptCommit *oldest = list_nth(kept, i);
+
+		if (FullTransactionIdIsValid(oldest->retired))
+			continue;
+		if (!commit_height(&oldest->commit, &lowest))
+			lowest = -1;
+		break;
+	}
 	id = commit->parents[0];
 	for (int n = 0; n < NEAREST_KEPT_MAX; n++)
 	{
 		KeptCommit *kc;
 
 		if (!copies_commit_get(&id, info))
+			return NULL;
+		if (lowest >= 0 && info->has_height && info->height < lowest)
 			return NULL;
 		if ((kc = kept_anywhere(kept, &id, source)) != NULL)
 			return kc;
@@ -5091,7 +5126,15 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
-	else if ((was = nearest_kept(kept, commit, &at_head, &source)) != NULL &&
+
+	/*
+	 * (another branch's roots of the commit, of a schema the session's
+	 * branch no longer has, restore nothing: the nearest before it may)
+	 */
+	if (was != NULL && source != MyBranch && restored == NIL)
+		was = NULL;
+	if (was == NULL &&
+		(was = nearest_kept(kept, commit, &at_head, &source)) != NULL &&
 			 !(branch_head(name, &head) && same_hash(&head, &at_head.id)))
 	{
 		int			before = list_length(restored);
@@ -8851,7 +8894,7 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 	 * head's rows and this transaction's, if no other writer of the branch
 	 * is still at work, which keep() checks by a snapshot taken now)
 	 */
-	if (!root_soon(name))
+	if (!root_soon(name, false))
 	{
 		Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
 

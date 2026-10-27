@@ -169,7 +169,6 @@
 
 #include "access/bufmask.h"
 #include "access/genam.h"
-#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -230,10 +229,11 @@ int			block_map_replay_entries = 65536;
  * the page store, whose snapshots didn't say who took them; version 3's
  * release queue entries didn't say which drop's transaction they wait for;
  * version 4's headers didn't say which entries may be shared with another
- * map.  This server reads only version 5 and refuses anything older
- * (refuse_version()).
+ * map; version 5's root pages didn't name the map, or the captured root it
+ * was made a copy of.  This server reads only version 6 and refuses
+ * anything older (refuse_version()).
  */
-#define BMAP_VERSION		5
+#define BMAP_VERSION		6
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -403,6 +403,8 @@ typedef struct BmapRoot
 {
 	BmapEntry	top[BMAP_TREE_TOPS];
 	xl_bmap_snapshot snap[BMAP_TREE_SNAPSHOTS];
+	uint64		map_id;			/* the map's identity: where its record began */
+	uint64		made_of;		/* the captured root it was made a copy of */
 } BmapRoot;
 
 StaticAssertDecl(sizeof(xl_bmap_top) == sizeof(BmapEntry),
@@ -1421,6 +1423,7 @@ apply_root_delta(Page page, const xl_bmap_root_delta *delta)
 		root->top[k].epoch = delta->tops[k].epoch;
 		root->top[k].since = delta->tops[k].since;
 	}
+	root->made_of = delta->made_of;
 }
 
 static void
@@ -5904,7 +5907,7 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 static void
 tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 				const xl_bmap_header_delta *hdelta, Buffer sheader,
-				const xl_bmap_header_delta *shdelta)
+				const xl_bmap_header_delta *shdelta, uint64 made_of)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
@@ -5931,6 +5934,7 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	rdelta.kind = BMAP_DELTA_ROOT;
 	rdelta.flags = BMAP_DELTA_INIT;
 	rdelta.ntops = BMAP_TREE_TOPS;
+	rdelta.made_of = made_of;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.tops[k].block = root.top[k].block;
@@ -5995,6 +5999,8 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 		XLogRegisterBufData(id, shdelta, sizeof(*shdelta));
 	}
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	/* (the new map's identity: where its record began) */
+	PageGetBmapRoot(BufferGetPage(buf))->map_id = ProcLastRecPtr;
 	PageSetLSN(BufferGetPage(buf), lsn);
 	if (hdelta)
 		PageSetLSN(BufferGetPage(headerbuf), lsn);
@@ -6075,7 +6081,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 	if (own.n > 0)
 		store_flush_begin(srel);
-	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
+	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL, 0);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
 	/* the copy has the same changes since src's last fold */
@@ -6948,7 +6954,7 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
 	tree_share_root(src, dst, snapshot_tops(&root.snap[slot]), &hdelta,
 					!replacing &&
 					shdelta.shared_below != PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below ?
-					headerbuf : InvalidBuffer, &shdelta);
+					headerbuf : InvalidBuffer, &shdelta, 0);
 	UnlockReleaseBuffer(headerbuf);
 	LockRelease(&sweeptag, ShareLock, false);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
@@ -7325,9 +7331,6 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		int			id;
 		Page		page = BufferGetPage(buffer);
 		bool		zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
-		/* (heap pages only: of no special space, their hints masked alike) */
-		bool		from_old = !zeroed && count > 0 &&
-			((PageHeader) page)->pd_special == BLCKSZ;
 		bool		reused;
 		ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
 
@@ -7338,22 +7341,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 */
 		RelFileLocatorForceWALAtCommit(rel);
 
-		/*
-		 * A page another map holds is copied from its old block, which
-		 * holds it durably (BMAP_REMAP_FROM_OLD), as redo copies it: the
-		 * buffer takes the block's page, the same but for hints set since
-		 * it was written (which redo couldn't know of).  Else the old
-		 * block gets what other maps should read, if only buffered.
-		 */
-		if (from_old)
-		{
-			PGIOAlignedBlock old;
-			void	   *pages[1] = {old.data};
-
-			mdreadv(store_smgr(rel), MAIN_FORKNUM, old_block, pages, 1);
-			memcpy(page, old.data, BLCKSZ);
-		}
-		else if (BufferIsDirty(buffer))
+		/* the old block gets what other maps should read, if only buffered */
+		if (BufferIsDirty(buffer))
 			FlushOneBuffer(buffer);
 
 		alloc_take(rel, 1, &new_block, &alloc);
@@ -7413,8 +7402,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xlrec.new_hw = alloc.new_hw;
 		xlrec.flags = (zeroed ? BMAP_REMAP_ZERO : 0) |
 			(listed ? BMAP_REMAP_LISTED : 0) |
-			(listed && count == 0 ? BMAP_REMAP_OWN : 0) |
-			(from_old ? BMAP_REMAP_FROM_OLD : 0);
+			(listed && count == 0 ? BMAP_REMAP_OWN : 0);
 
 		XLogEnsureRecordSpace(5 + BMAP_ALLOC_MAX_PAGES, 0);
 		ndelta->since = GetXLogInsertRecPtr();
@@ -7438,7 +7426,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		}
 		if (listed)
 			id = changes_append_register(&ca, id);
-		if (zeroed || from_old)
+		if (zeroed)
 			XLogRegisterBuffer(id, buffer, REGBUF_WILL_INIT);
 		else
 			XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE |
@@ -9342,15 +9330,65 @@ roots_lower_hint(RelFileLocator rel, uint32 p)
 }
 
 /*
+ * Settle slot 'slot' of the store, *r, held or let go of, on its page held
+ * exclusively in 'buf' (page p of the slots), which this releases: its
+ * capturer, if committed, named no more, and its releaser, if it didn't
+ * commit, either; cleared if let go of by a committed releaser (its
+ * subtrees queued already).  One still running is left as it is: a
+ * transaction running now is newer than the horizon VACUUM goes on to
+ * take.  (bmap_roots_reclaim(), under the sweep lock.)
+ */
+static void
+root_settle(RelFileLocator store, Buffer buf, uint32 slot,
+			const xl_bmap_root *r, uint32 p)
+{
+	xl_bmap_root settled = *r;
+	OwnerState	cap = owner_state(FullTransactionIdFromU64(r->snap.owner));
+	OwnerState	rel = r->released_by != 0 ?
+		owner_state(FullTransactionIdFromU64(r->released_by)) : OWNER_NONE;
+	bool		cleared = false;
+
+	if (cap == OWNER_RUNNING || rel == OWNER_RUNNING)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	if (rel == OWNER_COMMITTED || rel == OWNER_UNKNOWN)
+	{
+		memset(&settled, 0, sizeof(settled));
+		cleared = true;
+	}
+	else
+	{
+		settled.snap.owner = 0;
+		settled.released_by = 0;
+	}
+	if (memcmp(&settled, r, sizeof(settled)) != 0)
+		roots_set_slot(store, buf, slot, &settled);
+	UnlockReleaseBuffer(buf);
+	if (cleared)
+		roots_lower_hint(store, p);
+}
+
+/*
  * Reclaim the slots of rel's store whose capturers ended without
  * committing: each cleared, then its subtrees let go of (queued).  A crash
  * between the two leaves their counts a holder too high, for a sweep.
  * Slots let go of by a committed releaser need nothing: their subtrees
  * were queued, and a capture reuses the slot as it is.  How many were
  * reclaimed.  Not in recovery; under no map page's lock.
+ *
+ * With 'settle', every slot is made to need the commit log no more, before
+ * the log forgets its transactions (VACUUM does this before the database's
+ * oldest transaction id may advance, vac_update_datfrozenxid()): one held
+ * names no capturer (a committed one's slot is as if captured before every
+ * transaction the log knows), nor a releaser that didn't commit; one let
+ * go of by a committed releaser is cleared.  Else a capture whose
+ * capturer a crash ended, never reclaimed, would be held for good once the
+ * log can't say it didn't commit.
  */
 uint32
-bmap_roots_reclaim(RelFileLocator store)
+bmap_roots_reclaim(RelFileLocator store, bool settle)
 {
 	BmapRootsMeta meta;
 	bool		isnew;
@@ -9382,6 +9420,11 @@ bmap_roots_reclaim(RelFileLocator store)
 					   with_relnumber(store, BMAP_ROOTS_RELNUMBER),
 					   MAIN_FORKNUM, 1 + p);
 			r = PageGetBmapRoots(BufferGetPage(buf))[i];
+			if (r.snap.id != 0 && settle && root_state(&r) != ROOT_ABANDONED)
+			{
+				root_settle(store, buf, slot, &r, p);
+				continue;
+			}
 			if (r.snap.id == 0 || root_state(&r) != ROOT_ABANDONED)
 			{
 				UnlockReleaseBuffer(buf);
@@ -9563,6 +9606,7 @@ root_capture_slot(SMgrRelation reln, BlockList *own)
 	rdelta.root.snap.fold_epoch = header->fold_epoch;
 	rdelta.root.snap.epoch = hdelta.epoch;
 	rdelta.root.relnumber = rel.relNumber;
+	rdelta.root.map_id = root.map_id;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.root.snap.tops[k].block = root.top[k].block;
@@ -9717,6 +9761,49 @@ root_read(RelFileLocator store, BmapRootId id, int mode,
 }
 
 /*
+ * Is the root in slot *r held as this (sub)transaction sees it: captured by
+ * a committed transaction or this one, and let go of by nobody that
+ * committed, nor by this transaction?
+ */
+static bool
+root_held_as_seen(const xl_bmap_root *r)
+{
+	OwnerState	cap = owner_state(FullTransactionIdFromU64(r->snap.owner));
+
+	if (cap == OWNER_ENDED ||
+		(cap == OWNER_RUNNING &&
+		 !TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r->snap.owner)))))
+		return false;
+	if (r->released_by != 0)
+	{
+		OwnerState	rel = owner_state(FullTransactionIdFromU64(r->released_by));
+
+		if (rel != OWNER_ENDED &&
+			(rel != OWNER_RUNNING ||
+			 TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r->released_by)))))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * May the root in slot *r, read under its page's lock, gain a holder (be
+ * shared, or copied): held as this transaction sees it, and named by no
+ * releaser that may yet commit.  A releaser names a root under the page's
+ * exclusive lock and then queues its subtrees, so one not named while the
+ * lock is held can't let go of them before the holders are added; one
+ * named may commit meanwhile, and the drain then free what the copy is
+ * to hold.
+ */
+static bool
+root_may_hold(const xl_bmap_root *r)
+{
+	return root_held_as_seen(r) &&
+		(r->released_by == 0 ||
+		 owner_state(FullTransactionIdFromU64(r->released_by)) == OWNER_ENDED);
+}
+
+/*
  * Root 'id' of the store held again, by a root of its own: a free slot set
  * to the same subtrees, each gaining a holder, naming the current
  * (sub)transaction as its capturer, so that it is held from that one's
@@ -9763,16 +9850,35 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	refs_cover(store, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	/* (the root read again under the metapage: held still) */
-	rootsmeta = roots_lock_meta(store, &meta, &isnew);
-	UnlockReleaseBuffer(rootsmeta);
-	if (!root_read(store, id, BUFFER_LOCK_SHARE, &buf, &r))
+	/*
+	 * (the root read again under its slot page's lock, which keeps a
+	 * releaser from naming it until the holders are added: one named since
+	 * the first look may commit, and its subtrees be let go of, meanwhile.
+	 * The slot taken may be on the same page, locked already.)
+	 */
+	rootsmeta = roots_take_slot(store, &meta, &isnew, &slotbuf, &slotnew, &slot);
+	buf = InvalidBuffer;
+	if (ROOT_PAGE(ROOT_SLOT(id)) == ROOT_PAGE(slot))
+		r = PageGetBmapRoots(BufferGetPage(slotbuf))[ROOT_INDEX(ROOT_SLOT(id))];
+	else
 	{
+		/* (not by root_read(), which locks the metapage, held here) */
+		buf = roots_read(store, ROOT_PAGE(ROOT_SLOT(id)));
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
+				   with_relnumber(store, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM,
+				   ROOT_PAGE(ROOT_SLOT(id)));
+		r = PageGetBmapRoots(BufferGetPage(buf))[ROOT_INDEX(ROOT_SLOT(id))];
+	}
+	if (r.snap.id != id || !root_may_hold(&r))
+	{
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		UnlockReleaseBuffer(slotbuf);
+		UnlockReleaseBuffer(rootsmeta);
 		LockRelease(&sweeptag, ShareLock, false);
 		return 0;
 	}
-	UnlockReleaseBuffer(buf);
-	rootsmeta = roots_take_slot(store, &meta, &isnew, &slotbuf, &slotnew, &slot);
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 		if (BlockNumberIsValid(r.snap.tops[k].block))
 			tops[ntops++] = r.snap.tops[k].block;
@@ -9789,6 +9895,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	rdelta.root.snap = r.snap;
 	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
 	rdelta.root.relnumber = r.relnumber;
+	rdelta.root.map_id = r.map_id;
 	memset(&mdelta, 0, sizeof(mdelta));
 	mdelta.kind = BMAP_DELTA_ROOTS_META;
 	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
@@ -9824,6 +9931,8 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	END_CRIT_SECTION();
 
 	refs_release(&rp);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 	UnlockReleaseBuffer(slotbuf);
 	UnlockReleaseBuffer(rootsmeta);
 	LockRelease(&sweeptag, ShareLock, false);
@@ -9842,24 +9951,9 @@ bmap_root_held(RelFileLocator store, BmapRootId id, BlockNumber *nblocks)
 {
 	Buffer		buf;
 	xl_bmap_root r;
-	OwnerState	cap;
 
-	if (!root_read(store, id, -1, &buf, &r))
+	if (!root_read(store, id, -1, &buf, &r) || !root_held_as_seen(&r))
 		return false;
-	cap = owner_state(FullTransactionIdFromU64(r.snap.owner));
-	if (cap == OWNER_ENDED ||
-		(cap == OWNER_RUNNING &&
-		 !TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r.snap.owner)))))
-		return false;
-	if (r.released_by != 0)
-	{
-		OwnerState	rel = owner_state(FullTransactionIdFromU64(r.released_by));
-
-		if (rel != OWNER_ENDED &&
-			(rel != OWNER_RUNNING ||
-			 TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(FullTransactionIdFromU64(r.released_by)))))
-			return false;
-	}
 	if (nblocks)
 		*nblocks = r.snap.nblocks;
 	return true;
@@ -10006,6 +10100,8 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 				 errmsg("page store of database %u holds no captured root %llu",
 						drel.dbOid, (unsigned long long) id)));
 
+	INJECTION_POINT("bmap-root-share-checked", NULL);
+
 	/* the header of the storage replaced, or of the one captured of */
 	if (replacing != NULL)
 	{
@@ -10048,12 +10144,22 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 		}
 	}
 
-	/* (held still: a releaser names it under the slot's page lock) */
-	if (!root_read(drel, id, BUFFER_LOCK_SHARE, &buf, &r))
+	/*
+	 * (held still, under the slot page's lock, which keeps a releaser from
+	 * naming it until the holders are added: one named since the first
+	 * look may commit, and its subtrees be let go of, meanwhile)
+	 */
+	if (!root_read(drel, id, BUFFER_LOCK_SHARE, &buf, &r) || !root_may_hold(&r))
+	{
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		if (BufferIsValid(sheader))
+			UnlockReleaseBuffer(sheader);
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("page store of database %u holds no captured root %llu",
 						drel.dbOid, (unsigned long long) id)));
+	}
 	create_map(dst);
 	hdelta.kind = BMAP_DELTA_HEADER;
 	hdelta.flags = BMAP_DELTA_SHARED_BELOW;
@@ -10063,7 +10169,7 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	hdelta.shared_below = replacing != NULL ?
 		Min(shared_below, hdelta.epoch) : hdelta.epoch;
 	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, sheader,
-					&shdelta);
+					&shdelta, id);
 	UnlockReleaseBuffer(buf);
 	if (BufferIsValid(sheader))
 		UnlockReleaseBuffer(sheader);
@@ -10134,22 +10240,34 @@ sweep_roots(RelFileLocator rel, TreeNodeVisit visit_node,
 }
 
 /*
- * The subtrees of the roots captured of rel (its file number) that its
- * store still counts (not free), BMAP_TREE_TOPS for each, into *tops:
- * how many roots.  As a relation's own snapshots, they share its pages
- * with no other map.  Under rel's header, which a capture locks first.
+ * The subtrees of rel's own roots that its store still counts (not free),
+ * BMAP_TREE_TOPS for each, into *tops: how many roots.  Its own are those
+ * captured of its map (by the map's identity, whatever file number a map
+ * had before it), and the root it was made a copy of: a relation restored
+ * of a root holds it as its branch's commit, as one captured of it.  As a
+ * relation's own snapshots, they share its pages with no other map.  Under
+ * rel's header, which a capture locks first.
  */
 static int
 own_root_tops(RelFileLocator rel, BmapEntry **tops)
 {
 	BmapRootsMeta meta;
 	Buffer		metabuf;
+	Buffer		rootbuf;
+	uint64		map_id;
+	uint64		made_of;
 	int			n = 0;
 	int			cap = 0;
 
 	*tops = NULL;
 	if (!roots_exist(rel))
 		return 0;
+	rootbuf = map_read(rel, 1);
+	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(rootbuf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	map_id = PageGetBmapRoot(BufferGetPage(rootbuf))->map_id;
+	made_of = PageGetBmapRoot(BufferGetPage(rootbuf))->made_of;
+	UnlockReleaseBuffer(rootbuf);
 	metabuf = roots_read(rel, 0);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	if (PageIsNew(BufferGetPage(metabuf)))
@@ -10168,7 +10286,9 @@ own_root_tops(RelFileLocator rel, BmapEntry **tops)
 		{
 			const xl_bmap_root *r = &PageGetBmapRoots(BufferGetPage(buf))[i];
 
-			if (r->relnumber != rel.relNumber || root_state(r) == ROOT_FREE)
+			if ((r->map_id != map_id &&
+				 (made_of == 0 || r->snap.id != made_of)) ||
+				root_state(r) == ROOT_FREE)
 				continue;
 			if (n == cap)
 			{
@@ -10187,15 +10307,20 @@ own_root_tops(RelFileLocator rel, BmapEntry **tops)
 
 /*
  * How many roots the store holds (root_state()), of relation file number
- * store.relNumber if valid (captured of it), and the store's slots.
+ * store.relNumber if valid (captured of it), and the store's slots; and
+ * into *naming if not NULL, how many of the slots in use name a
+ * transaction (a capturer or releaser, not settled).
  */
 void
-bmap_inspect_roots(RelFileLocator store, uint64 *held, uint64 *slots)
+bmap_inspect_roots(RelFileLocator store, uint64 *held, uint64 *slots,
+				   uint64 *naming)
 {
 	BmapRootsMeta meta;
 	Buffer		metabuf;
 
 	*held = *slots = 0;
+	if (naming)
+		*naming = 0;
 	if (!roots_exist(store))
 		return;
 	metabuf = roots_read(store, 0);
@@ -10222,6 +10347,9 @@ bmap_inspect_roots(RelFileLocator store, uint64 *held, uint64 *slots)
 				(!RelFileNumberIsValid(store.relNumber) ||
 				 r->relnumber == store.relNumber))
 				(*held)++;
+			if (naming && r->snap.id != 0 &&
+				(r->snap.owner != 0 || r->released_by != 0))
+				(*naming)++;
 		}
 		UnlockReleaseBuffer(buf);
 	}
@@ -12203,8 +12331,8 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	BlockNumber nrefpages;
 	uint64		stuck_held;
 
-	/* the roots whose capturers never committed let go of first */
-	(void) bmap_roots_reclaim(rel);
+	/* the roots whose capturers never committed let go of first, the rest settled */
+	(void) bmap_roots_reclaim(rel, true);
 	SET_LOCKTAG_OBJECT(tag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 	stuck_held = pg_atomic_read_u64(&bmap_shared->stuck_held);
@@ -12652,6 +12780,8 @@ create_map(SMgrRelation reln)
 	XLogRegisterBuffer(1, rootbuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
 	XLogRegisterBufData(1, &rdelta, sizeof(rdelta));
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_CREATE);
+	/* (the map's identity: where its record began, which no other did) */
+	PageGetBmapRoot(BufferGetPage(rootbuf))->map_id = ProcLastRecPtr;
 	PageSetLSN(page, lsn);
 	PageSetLSN(BufferGetPage(rootbuf), lsn);
 	END_CRIT_SECTION();
@@ -13924,6 +14054,7 @@ redo_block(XLogReaderState *record, uint8 block_id)
 				break;
 			case BMAP_DELTA_ROOT:
 				apply_root_delta(page, (xl_bmap_root_delta *) copy);
+				PageGetBmapRoot(page)->map_id = record->ReadRecPtr;
 				break;
 			case BMAP_DELTA_SNAPSHOT:
 				apply_snapshot_delta(page, (xl_bmap_snapshot_delta *) copy);
@@ -14168,12 +14299,10 @@ bmap_redo(XLogReaderState *record)
 				uint8		last = XLogRecMaxBlockId(record);
 
 				bool		zeroed = (xlrec->flags & BMAP_REMAP_ZERO) != 0;
-
 				/*
 				 * The page store reaches the new block; the page itself is
 				 * the last block, an image, so redo never reads the block,
-				 * or zeroes, which redo writes there, or (a page another
-				 * map holds) the old block's page, read from there.  The old block keeps
+				 * or zeroes, which redo writes there.  The old block keeps
 				 * what it had: shared blocks were made durable when shared
 				 * (logged as images that redo writes, and synced by a
 				 * checkpoint after).
@@ -14206,27 +14335,6 @@ bmap_redo(XLogReaderState *record)
 						memset(BufferGetPage(buf), 0, BLCKSZ);
 						MarkBufferDirty(buf);
 					}
-					UnlockReleaseBuffer(buf);
-				}
-				else if (xlrec->flags & BMAP_REMAP_FROM_OLD)
-				{
-					/*
-					 * the old block's page, which it holds durably (another
-					 * map's, made so by an image when shared), copied to the
-					 * new block and the page's buffer
-					 */
-					PGIOAlignedBlock old;
-					void	   *pages[1] = {old.data};
-					Buffer		buf;
-
-					mdreadv(store_smgr(xlrec->locator), MAIN_FORKNUM,
-							xlrec->old_block, pages, 1);
-					(void) XLogReadBufferForRedoExtended(record, last,
-														 RBM_ZERO_AND_LOCK,
-														 false, &buf);
-					memcpy(BufferGetPage(buf), old.data, BLCKSZ);
-					PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
-					MarkBufferDirty(buf);
 					UnlockReleaseBuffer(buf);
 				}
 				else
@@ -14336,19 +14444,12 @@ bmap_redo(XLogReaderState *record)
 void
 bmap_mask(char *pagedata, BlockNumber blkno)
 {
-	Page		page = (Page) pagedata;
-	PageHeader	ph = (PageHeader) page;
+	mask_page_lsn_and_checksum(pagedata);
 
 	/*
-	 * A relation's page a copy took from its old block (BMAP_REMAP_FROM_OLD)
-	 * has the hints that block has as redo reads it, which another map's
-	 * buffer may have written there since: hints are masked as heap masks
-	 * them (only heap pages, of no special space, are copied so).
+	 * A map's identity is where the record that made it began, set once it
+	 * is inserted (a record's image of the page is taken before)
 	 */
-	if (!PageIsNew(page) && ph->pd_special == BLCKSZ)
-	{
-		heap_mask(pagedata, blkno);
-		return;
-	}
-	mask_page_lsn_and_checksum(pagedata);
+	if (map_page_is((const PGIOAlignedBlock *) pagedata, BMAP_PAGE_ROOT))
+		PageGetBmapRoot((Page) pagedata)->map_id = 0;
 }

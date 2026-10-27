@@ -281,7 +281,13 @@ CREATE FUNCTION test_bmap_roots_of(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_bmap_roots_reclaim()
+-- The captured roots' slots in use that name a transaction, as capturer
+-- or releaser (VACUUM settles them, so that none needs the commit log).
+CREATE FUNCTION test_bmap_roots_naming()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_reclaim(settle bool DEFAULT false)
 RETURNS int4
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
