@@ -8,8 +8,9 @@
 # them, as does crash recovery, every page checked against the primary's
 # (wal_consistency_checking).  Blocks another relation shares stay, a
 # page whose room a concurrent allocation took stays (it isn't moved up),
-# and a crash, or an error, between a move and the freeing of its old
-# block leaves that block for the next sweep.  At wal_level minimal, a
+# a crash between a move and the freeing of its old block leaves that
+# block for the next sweep, and an error after a relation's moves leaves
+# none (each old block is freed with its move).  At wal_level minimal, a
 # relation its transaction hasn't committed (its data skipping WAL) isn't
 # moved.
 
@@ -130,21 +131,21 @@ is(sql($map), $shared_map, 'a sweep moves no block another relation shares');
 is(sql(qq{SELECT test_bmap_rows_digest($copy)}), sql(qq{SELECT test_bmap_rows_digest($srel)}),
 	'the copy reads the same rows');
 
-# An error between the moves and the freeing of the old blocks: they stay
-# allocated, held by nothing, and the next sweep frees them.
+# An error after a relation's moves: each old block was freed with its
+# move, so none is left held by nothing, and the sweep still shortens the
+# store past them.
 interleave('keep4', 'gone4', 100);
 my $want4 = q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM keep4};
 my $want4v = sql($want4);
 sql('DROP TABLE gone4');
 sql(q{SELECT injection_points_attach('bmap-compact-moved', 'error')});
-sql($sweep);
+($freed, $truncated, $nmoved) = split / /, sql($sweep);
 sql(q{SELECT injection_points_detach('bmap-compact-moved')});
-cmp_ok(sql('SELECT test_bmap_free_blocks()'), '>', 0,
-	'an error before the old blocks are freed leaves them');
+cmp_ok($truncated, '>', 0,
+	'an error after the moves: the store is shortened past their old blocks');
 is(sql($want4), $want4v, 'the moved table has its rows');
 ($freed, $truncated, $nmoved) = split / /, sql($sweep);
-cmp_ok($freed, '>', 0, 'the next sweep frees what the moves left');
-cmp_ok($truncated, '>', 0, 'and shortens the store past them');
+is($freed, '0', 'and the next sweep finds nothing the moves left');
 is(sql($want4), $want4v, 'the table still has its rows');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $want4), $want4v, 'on the standby too');
