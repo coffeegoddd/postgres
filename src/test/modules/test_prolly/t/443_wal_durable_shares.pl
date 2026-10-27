@@ -20,6 +20,8 @@ $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf',
 	"autovacuum = off\ncheckpoint_timeout = 1h\nwal_compression = off\n"
 	  . "prolly.restore_min_changes = 0");
+# (roots sharing the relations' pages as they are: frozen ones share none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }

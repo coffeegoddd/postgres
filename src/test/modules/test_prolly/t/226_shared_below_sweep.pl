@@ -24,6 +24,8 @@ wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
 # (VACUUM sets kept pages all-visible only with this on)
 prolly.vacuum_copy_kept_pages = on
+# (roots sharing the relations' pages as they are: frozen ones share none)
+prolly.freeze_roots = off
 });
 $node->start;
 $node->backup('base');
