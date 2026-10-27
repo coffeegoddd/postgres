@@ -1,12 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A page sweep's compaction holds each relation whose blocks it moves, and
-# stops its moves once another waits for that hold.  A hard reset only
-# tries its locks, so it isn't in the lock's queue: it asks the compaction
-# to let go instead, and waits for the move under way, so the reset still
-# gives the table back its kept pages (no row written) rather than falling
-# back to writing the rows.  With lock_timeout, it waits no longer than
-# that.  A branch's deletion asks the same of a compaction holding the
+# stops its moves once another waits for that hold.  A hard reset queues
+# for its locks, as TRUNCATE does: the compaction lets go after the move
+# under way, and the reset gives the table back its kept pages (no row
+# written).  With lock_timeout, it waits no longer than that, and fails.  A branch's deletion asks the same of a compaction holding the
 # branch, and waits for that one hold: asked, the compaction passes over
 # the branch's other relations.  A lowering of shared_below, which holds
 # each relation for a pass over its map, is waited for the same way.
@@ -139,9 +137,9 @@ $reset->query_until(qr/started/, q{
 	\echo done
 });
 ok( $node->poll_query_until(
-		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+		'postgres', qq{SELECT wait_event_type = 'Lock'
 		FROM pg_stat_activity WHERE pid = $resetter}),
-	'the reset waits for the compaction to let go');
+	'the reset waits in the lock\'s queue for the compaction to let go');
 
 # one move let through: asked, the compaction lets go of the relation
 # before the next (which would stop again)
@@ -161,16 +159,19 @@ is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
 is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'the working set is clean');
 
 # with lock_timeout, a reset waits for a compaction no longer than that:
-# it writes the rows instead, as when a writer holds the table
+# it fails, writing no row, as when a writer holds the table
 interleave();
 ($sweep, $sweeper) = start_sweep();
 $restored = counted('relations_restored');
 $applied = counted('apply_rows');
-sql(q{SET lock_timeout = '200ms'; SELECT dolt_reset('--hard');
-	SELECT pg_stat_force_next_flush()});
-is(counted('relations_restored'), $restored, 'a reset held up past lock_timeout restores no pages');
-cmp_ok(counted('apply_rows'), '>', $applied, 'and writes the rows');
+my ($ret, $out, $err) = $node->psql('postgres',
+	q{SET lock_timeout = '200ms'; SELECT dolt_reset('--hard')});
+like($err, qr/canceling statement due to lock timeout/,
+	'a reset held up past lock_timeout fails');
+is(counted('relations_restored'), $restored, 'restoring no pages');
+is(counted('apply_rows'), $applied, 'and writing no row');
 wake_sweep($sweep);
+sql(q{SELECT dolt_reset('--hard')});
 is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
 	'kp.t reads as committed');
 
@@ -235,7 +236,7 @@ $reset->query_until(qr/started/, q{
 	\echo done
 });
 ok( $node->poll_query_until(
-		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+		'postgres', qq{SELECT wait_event_type = 'Lock'
 		FROM pg_stat_activity WHERE pid = $resetter}),
 	'the reset waits for the lowering to let go');
 sql(q{SELECT injection_points_detach('bmap-shared-below-held')});
@@ -251,9 +252,9 @@ is(sql(q{SELECT count(*) FROM kp.t WHERE b = repeat('t', 300)}), '2000',
 	'kp.t reads as committed');
 
 
-# lock_timeout bounds one operation's waits, not a statement's: a
-# procedure committing between two resets gives the second its own, so it
-# still waits for a compaction long after the first one waited
+# lock_timeout bounds each lock's wait, not a statement's: a procedure
+# committing between two resets gives the second its own, so it still
+# waits for a compaction long after the first one waited
 sql(q{CREATE PROCEDURE two_resets() LANGUAGE plpgsql AS $$
 	BEGIN
 		SET lock_timeout = '2s';
@@ -280,11 +281,11 @@ $proc->query_until(qr/started/, q{
 	\echo done
 });
 ok( $node->poll_query_until(
-		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+		'postgres', qq{SELECT wait_event = 'relation'
 		FROM pg_stat_activity WHERE pid = $procpid}),
 	"the procedure's first reset waits for the compaction");
 sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
-$node->poll_query_until('postgres', qq{SELECT wait_event_type = 'Lock'
+$node->poll_query_until('postgres', qq{SELECT wait_event = 'advisory'
 	FROM pg_stat_activity WHERE pid = $procpid})
   or die 'the procedure did not reach its gate';
 wake_sweep($sweep);
@@ -294,11 +295,11 @@ $restored = counted('relations_restored');
 $applied = counted('apply_rows');
 $gate->query_safe(q{SELECT pg_advisory_unlock(42)});
 $gate->quit;
-$node->poll_query_until('postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
+$node->poll_query_until('postgres', qq{SELECT wait_event = 'relation'
 	OR state = 'idle' FROM pg_stat_activity WHERE pid = $procpid})
   or die 'the procedure neither waited nor ended';
 is(sql(qq{SELECT wait_event FROM pg_stat_activity WHERE pid = $procpid}),
-	'BmapCompactionLetGo',
+	'relation',
 	'its second reset, past the first one\'s lock_timeout, still waits');
 sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
 $proc->query_until(qr/done/, '');
