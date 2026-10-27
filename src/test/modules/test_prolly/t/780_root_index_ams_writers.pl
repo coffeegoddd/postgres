@@ -23,7 +23,6 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
 prolly.restore_min_changes = 0
-prolly.kept_commits = 16
 });
 $node->start;
 $node->backup('base');
@@ -63,30 +62,37 @@ sql(q{CREATE EXTENSION amcheck; CREATE EXTENSION bloom;
 # probes: each index's query, answered by its index (bitmap scans, which
 # every access method has), and by a sequential scan
 my @probes = (
-	q{p <@ box '((10,5),(40,30))'},
-	q{r && int4range(1500, 1530)},
-	q{tags @> ARRAY[7]},
-	q{doc @@ to_tsquery('simple', 'w3 & x5')},
-	q{s BETWEEN 1200 AND 1900},
-	q{q <@ box '((10,20),(40,60))'},
-	q{txt ^@ 'k17'},
-	q{v = 13},
-	q{b1 = 21 AND b2 = 30},
-	q{bt BETWEEN 3 AND 5});
+	[ 't_gist_p', q{p <@ box '((10,5),(40,30))'} ],
+	[ 't_gist_r', q{r && int4range(1500, 1530)} ],
+	[ 't_gin_tags', q{tags @> ARRAY[7]} ],
+	[ 't_gin_doc', q{doc @@ to_tsquery('simple', 'w3 & x5')} ],
+	[ 't_brin_s', q{s BETWEEN 1200 AND 1900} ],
+	[ 't_spgist_q', q{q <@ box '((10,20),(40,60))'} ],
+	[ 't_spgist_txt', q{txt ^@ 'k17'} ],
+	[ 't_hash_v', q{v = 13} ],
+	[ 't_bloom', q{b1 = 21 AND b2 = 30} ],
+	[ 't_btree', q{bt BETWEEN 3 AND 5} ]);
 
-# the probes whose index finds other rows than a sequential scan
+# the probes whose index finds other rows than a sequential scan, or
+# whose plan doesn't scan the index
 sub disagree
 {
 	my ($n) = @_;
 	my @bad;
-	foreach my $w (@probes)
+	foreach my $p (@probes)
 	{
+		my ($idx, $w) = @$p;
 		my $q = "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM ri.t WHERE $w";
+		my $byidx = "SET enable_seqscan = off; SET enable_indexscan = off;";
 		my $seq = $n->safe_psql('postgres',
 			"SET enable_indexscan = off; SET enable_bitmapscan = off; $q");
-		my $idx = $n->safe_psql('postgres',
-			"SET enable_seqscan = off; SET enable_indexscan = off; $q");
-		push @bad, $w if $seq ne $idx;
+		my $plan = $n->safe_psql('postgres', "$byidx EXPLAIN (COSTS OFF) $q");
+		if ($plan !~ /Bitmap Index Scan on $idx\b/)
+		{
+			push @bad, "$idx not used: $plan";
+			next;
+		}
+		push @bad, $idx if $seq ne $n->safe_psql('postgres', "$byidx $q");
 	}
 	return join('; ', @bad);
 }
@@ -129,10 +135,12 @@ UPDATE ri.t SET v = v + 1, q = point(q[0], q[1] + 0.25), tags = tags || :k,
 	doc = doc || to_tsvector('simple', 'u' || :k) WHERE id = :g;
 DELETE FROM ri.t WHERE id = :g + 7 AND :k < 3;
 END;
-SELECT pg_sleep(0.005);
+SELECT pg_sleep(0.05);
 };
 close($fh);
 
+my $captured_q = q{SELECT coalesce((SELECT value FROM pg_stat_prolly WHERE name = 'bmap_roots_captured'), 0)};
+my $captured_before = sql($captured_q);
 my ($out, $err) = ('', '');
 my $writers = IPC::Run::start(
 	[ 'pgbench', '-n', '-h', $node->host, '-p', $node->port,
@@ -151,8 +159,7 @@ for my $i (1 .. 8)
 $writers->finish;
 like($out, qr/number of failed transactions: 0/, 'the writers ran with no failure')
 	or diag($err);
-my $captured = sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'bmap_roots_captured'});
-cmp_ok($captured, '>', 0, 'roots captured meanwhile');
+cmp_ok(sql($captured_q), '>', $captured_before, 'roots captured meanwhile');
 cmp_ok(scalar(@commits), '>=', 4, 'commits made meanwhile');
 my $last = sql(q{SELECT (dolt_commit('--allow-empty', '-am', 'last'))[1]});
 push @commits, $last if $last ne '';

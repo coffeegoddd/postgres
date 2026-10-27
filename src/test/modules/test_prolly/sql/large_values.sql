@@ -178,7 +178,7 @@ RESET debug_prolly_change_finder;
 -- another unique index is written as before (removed and inserted, which
 -- a swap of unique values needs), its values stored anew.
 -- (rows written, not pages given back: kept_pages tests those)
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 CREATE TABLE lv.keep (id int PRIMARY KEY, n int, body text);
 ALTER TABLE lv.keep ALTER COLUMN body SET STORAGE EXTERNAL;
 CREATE TABLE lv.unique2 (id int PRIMARY KEY, n int UNIQUE, body text);

@@ -37,7 +37,7 @@ $$;
 -- this branch's working set a fifth of the rows from c, folded.  Writing
 -- them costs more than sharing the other branch's pages, which the count
 -- tells after a few rows.
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SELECT (dolt_commit('-Am', 'a'))[1] AS a \gset
 SELECT dolt_branch('other') IS NOT NULL AS branched;
 SELECT dolt_checkout('other') IS NOT NULL AS checked_out;
@@ -60,7 +60,8 @@ SELECT dolt_branch('-D', 'other') IS NOT NULL AS deleted;
 
 -- The head's pages: the head, now c, as a, and b 50 rows from it, all in
 -- the first leaf.
-SET prolly.kept_commits = 1;
+RESET debug_prolly_page_roots;
+ALTER DATABASE bounded_counts SET prolly.history_min_commits = 1;
 SELECT :'c' AS a \gset
 UPDATE bc.t SET v = 1 WHERE id <= 50;
 SELECT (dolt_commit('-am', 'b'))[1] AS b \gset
@@ -272,7 +273,7 @@ SELECT dolt_reset('--hard', :'y') IS NOT NULL AS reset;
 SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 	   (since(:'before') ->> 'apply_rows')::int AS applied,
 	   d_digest() = :'at_y' AS at_y, clean();
-RESET prolly.kept_commits;
+ALTER DATABASE bounded_counts RESET prolly.history_min_commits;
 
 \c :home
 DROP DATABASE bounded_counts;

@@ -67,23 +67,40 @@
  *	'I' name	-> the working set's identity anchor (the canonicalizer's
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
- *	'K' name	-> the height of the oldest of the commits below not
- *				   retired (an int64, native byte order; -1 if none or not
- *				   known: a move's nearest root is looked for no lower),
- *				   then the commits the branch's pages are kept as of, newest
- *				   first (see "Kept pages"): each the transaction that
- *				   retired it (a FullTransactionId, native byte order; 0
- *				   while it is kept), the transaction that kept it (the
- *				   same), when it was kept (a TimestampTz, the same), its
- *				   id and the branch's
- *				   baseline then (hash length, hash each), the count of
- *				   tables (a varint), and for each its qualified name (a
- *				   varint length, then the bytes), its data tree at the
- *				   commit (hash length, hash), the count of its
- *				   relations (a varint) and each relation's OID,
- *				   tablespace, file number, captured root (8 bytes), and
- *				   oldest unfrozen transaction and multixact ids (4 bytes
- *				   each but the snapshot, native byte order)
+ *	'K' name NUL kind ... -> a commit the branch's pages are kept as of
+ *				   (see "Kept pages"): kind 'l' and its commit's height
+ *				   (8 bytes, big-endian) and id (hash length, hash) for one
+ *				   kept, 'r' and a number (8 bytes, big-endian) for one
+ *				   retired; each the transaction that retired it (a
+ *				   FullTransactionId, native byte order; 0 while it is
+ *				   kept), the transaction that kept it (the same), when it
+ *				   was kept (a TimestampTz, the same), its commit's height
+ *				   and the pages its roots alone hold (an int64 each, the
+ *				   same), a byte (1: retired for a sever), a commit's
+ *				   flags (a byte): with KEPT_UNFROZEN, its roots captured
+ *				   among writers are to be frozen as of its snapshot,
+ *				   which follows: xmin and xmax (4 bytes each), then the
+ *				   running transactions', their subtransactions' and the
+ *				   committing transaction's own ids (each a varint count,
+ *				   then 4 bytes each); its id and the branch's baseline
+ *				   then (hash length, hash each), the count of tables (a
+ *				   varint), and for each its qualified name (a varint
+ *				   length, then the bytes), its data tree at the commit
+ *				   (hash length, hash), the count of its relations (a
+ *				   varint) and each relation's OID, tablespace, file
+ *				   number, captured root (8 bytes), oldest unfrozen
+ *				   transaction and multixact ids, and flags (BRANCH_KEPT_*)
+ *				   (4 bytes each but the root, native byte order), then
+ *				   its frozen root's undecided pages (a varint count, then
+ *				   4 bytes each)
+ *	'K' name NUL 'h' root -> how many of the branch's entries (kept or
+ *				   retired) name the root: its tablespace (4 bytes) and id
+ *				   (8 bytes, big-endian; for storage a restore replaced,
+ *				   its file number after, 4 bytes), the count 8 bytes
+ *	'L' name	-> the summary of the branch's kept commits (KeptSummary)
+ *	'u' name	-> nothing: branch name keeps a commit whose roots are to
+ *				   be frozen (KEPT_UNFROZEN), not retired
+ *	't' commit name -> nothing: tag name names the commit
  *	'k' commit name -> nothing: branch name keeps pages as of the commit
  *				   (hash length, hash), an entry of its 'K' not retired
  *	's' data commit name -> nothing: and that commit's kept table has the
@@ -317,6 +334,7 @@
 #define TAG_TAG			'T'	/* a tag, by name */
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
+#define TAG_KEPT_SUMMARY 'L'	/* and a summary of them */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
@@ -334,8 +352,11 @@
  */
 #define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
 #define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
+#define TAG_KEPT_UNFROZEN 'u'	/* a branch's kept commits to be frozen */
 #define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
 #define TAG_FOLDED		'f'	/* a branch's name, case folded */
+#define TAG_TAGGED		't'	/* a commit's tags (each key ends with the
+								 * tag's name) */
 
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
@@ -360,8 +381,16 @@
  * it; 22: other components' entries (the history horizon).
  * 23: kept relations' pages by roots their page stores keep (not
  * snapshots their storage keeps), and each kept commit's time.
+ * 24: kept relations' flags and frozen roots' undecided pages, kept
+ * commits' flags and the snapshot their roots captured among writers are
+ * to be frozen as of, and branches keeping such roots under their own
+ * tag; and frozen roots' pages all-visible where no dead line pointer is
+ * left (a restore sets its visibility map from them).
+ * 25: each kept commit an entry of its own, by height (retired ones by
+ * number), with counts of the entries naming each root and a summary of
+ * the branch's; and an index of tags by commit.
  */
-#define REFS_FORMAT		"23"
+#define REFS_FORMAT		"25"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -521,7 +550,8 @@ static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
-static void kept_declare(const char *p, const char *end, StringInfo refs);
+static void kept_declare(const ProllyKey *key, const char *p, const char *end,
+						 StringInfo refs);
 static bool tag_entry(const char *name, ProllyHash *tag, ProllyHash *commit);
 static bool copies_tag_get(const ProllyHash *tag, ProllyTagInfo *info);
 static bool upstream_head(const char *branch, ProllyHash *commit_id);
@@ -717,7 +747,7 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			}
 			break;
 		case TAG_KEPT:
-			kept_declare(p, end, refs);
+			kept_declare(key, p, end, refs);
 			break;
 		case TAG_STASH:
 			/* (each entry: its commit, its branch's name, its maker) */
@@ -929,6 +959,15 @@ check_merge_conflicts(const char *what)
 	}
 }
 
+/*
+ * The branches the transaction kept commits of (in TopTransactionContext),
+ * each given a retention pass as the transaction commits, once its head
+ * is where the transaction leaves it: a move keeps its commit's pages
+ * before the head is moved there.
+ */
+static List *retain_pending = NIL;
+static void retain_kept_branches(void);
+
 static void
 refs_xact_callback(XactEvent event, void *arg)
 {
@@ -938,6 +977,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			check_merge_conflicts("commit");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(false);
+			retain_kept_branches();
 			publish_scoped();
 			published = true;
 			break;
@@ -945,6 +985,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			check_merge_conflicts("prepare");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(true);
+			retain_kept_branches();
 			publish_scoped();
 			published = true;
 			break;
@@ -959,6 +1000,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			scoped_records = NIL;
 			scoped_pending = NIL;
 			pending_cxt = NULL; /* (TopTransactionContext's: gone) */
+			retain_pending = NIL;
 			forget_read_caches();
 			break;
 		default:
@@ -1001,14 +1043,11 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 }
 
 /*
- * The branch kept_get() read last, and the index entries of its kept
- * commits then (in kept_read_cxt): kept_put() of it after takes them,
- * the caller having changed the list read in place.  Forgotten by every
- * kept_put(), so a write in between makes it read the entry again.
+ * The kept entries the transaction read and hasn't put since (in
+ * kept_read_cxt), for kept_put() to tell what changed.
  */
 static MemoryContext kept_read_cxt = NULL;
-static char *kept_read_name = NULL;
-static List *kept_read_keys = NIL;
+static void kept_forget_loaded(void);
 
 /*
  * The branch branch_set_baseline() wrote, or a read of its 'W' found, last,
@@ -1075,7 +1114,7 @@ baseline_seen_value(const char *name, const StringInfoData *v, bool found)
 static void
 forget_read_caches(void)
 {
-	kept_read_name = NULL;
+	kept_forget_loaded();
 	if (baseline_seen_name != NULL)
 		pfree(baseline_seen_name);
 	baseline_seen_name = NULL;
@@ -1811,6 +1850,16 @@ entry_branch(const char *key, int keylen, int *len)
 				return NULL;
 			p++;
 			break;
+		case TAG_KEPT:
+			{
+				/* (the name, then '\0' and the entry's kind and key) */
+				const char *nul = memchr(p, '\0', end - p);
+
+				if (nul == NULL || nul == p)
+					return NULL;
+				*len = nul - p;
+				return p;
+			}
 		default:
 			if (!branch_entry_tag(key[0]))
 				return NULL;
@@ -1849,7 +1898,8 @@ branch_entry_tag(char tag)
 		case TAG_VIOLATIONS:
 		case TAG_IDENTITY:
 		case TAG_REBASE:
-		case TAG_KEPT:
+		case TAG_KEPT_SUMMARY:
+		case TAG_KEPT_UNFROZEN:
 		case TAG_CREATOR:
 			return true;
 		default:
@@ -3322,9 +3372,10 @@ source_of(List *sources, const NamedTree *t)
 }
 
 struct KeptCommit;
+typedef struct KeptSummary KeptSummary;
 static List *kept_get(const char *name);
-static void kept_put(const char *name, List *kept);
-static List *kept_index_keys(const char *name, List *kept);
+static void kept_put(const char *name, List *kept, KeptSummary *given);
+static void kept_forget_name(const char *name);
 
 static int	kept_carried(List *kept, const struct KeptCommit *was,
 						 const char *name, BranchKeptRelation **carry,
@@ -3443,7 +3494,10 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			 * restore carries them, and their entries renamed)
 			 */
 			if (s->branch == MyBranch && kept == NIL)
+			{
+				kept_forget_name(current);
 				kept = kept_get(current);
+			}
 			if (s->branch == MyBranch)
 				ncarry = kept_carried(kept, NULL, table, &carry, &into);
 			else
@@ -3466,7 +3520,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		}
 	}
 	if (renamed)
-		kept_put(current, kept);
+		kept_put(current, kept, NULL);
 	if (nshared == 0)
 		return false;
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
@@ -3639,8 +3693,8 @@ move_settled_checked(void *arg)
  * storage captured into its page store (branch operations' keep()), O(1)
  * in its size, and only those that changed since a commit kept already
  * take a new one.  The
- * refs keep, for each branch, the last prolly.kept_commits commits so kept
- * (TAG_KEPT): each with the branch's baseline then, and each table's name
+ * refs keep, for each branch, the commits so kept that root retention
+ * keeps (TAG_KEPT, an entry each): each with the branch's baseline then, and each table's name
  * and relations.  A move back to one of them (a hard reset to the head, or
  * to one before) gives each table the pages kept (restore()): new storage
  * made of each root, O(1), for each relation that changed since, and
@@ -3655,7 +3709,11 @@ move_settled_checked(void *arg)
  * branch that ended (branch_writers_settled()).  So the pages hold exactly
  * the commit's rows, and the keeping transaction's own, which commit with
  * it.  At a transaction's own commit (dolt.transaction_commit), whose head
- * moves at every transaction, only once a root is due (root_due()).
+ * moves at every transaction, only once a root is due (root_due()); and
+ * there, with the lazy root freezer, among the writers: the roots captured
+ * as they are, kept unfrozen with the commit's snapshot (which must have
+ * seen every writer that ended, branch_writers_seen()), frozen as of it
+ * later by the fold worker, or by a move to the commit (kept_freeze()).
  *
  * A branch's first use at a commit another branch keeps the pages of is
  * made of them (make_of_kept(), branch operations' make_kept(), #489):
@@ -3663,7 +3721,7 @@ move_settled_checked(void *arg)
  * source's writers are never locked out for them, the pages being as
  * they were at the commit whatever is written since.
  *
- * So a commit no longer kept (older than the last prolly.kept_commits) may
+ * So a commit no longer kept (retention let go of it) may
  * still be being read by another's first use, which read it from the refs
  * before.  It is retired, not let go of: its entry stays, marked with the
  * transaction retiring it, and a later keep lets go of its pages once that
@@ -3673,7 +3731,7 @@ move_settled_checked(void *arg)
  * retired too, never changed in place, so the pages it keeps stay until
  * the change is known to commit.
  */
-int			prolly_kept_commits = 2;
+bool		debug_prolly_page_roots = true;
 int			prolly_restore_min_changes = 2;
 int			prolly_root_interval = -1;
 int			prolly_root_interval_commits = 1;
@@ -3695,34 +3753,151 @@ typedef struct KeptCommit
 	FullTransactionId kept_by;	/* who kept them, having seen every writer
 								 * of the pages end */
 	TimestampTz kept_at;		/* when */
+	bool		unfrozen;		/* roots captured among writers, to be
+								 * frozen as of the snapshot below */
+	TransactionId xmin;
+	TransactionId xmax;
+	int			nxip;
+	TransactionId *xip;
+	int			nsubxip;
+	TransactionId *subxip;
+	int			nown;
+	TransactionId *own;
 	ProllyHash	commit;
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
+	int64		height;			/* the commit's (0 if not known) */
+	int64		pages;			/* its roots' pages no root before holds */
+	uint64		seq;			/* retired: its number among the branch's
+								 * retired (0: not given one yet) */
+	char	   *owner;			/* the branch whose entry it was read as
+								 * (NULL: none yet) */
+	bool		severed;		/* retired for a sever: its commit and
+								 * trees no longer kept from collection */
 	int			ntables;
 	KeptTable  *tables;
 } KeptCommit;
 
-#define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
+#define KEPT_RELATION_SIZE	(6 * sizeof(uint32) + sizeof(uint64) + 1)
+
+#define KEPT_UNFROZEN	0x01
+
+typedef struct KeptSummary
+{
+	uint64		next_seq;		/* the next retired entry's number */
+	int64		bytes;			/* the live entries' pages (pages, as
+								 * BLCKSZ bytes each) */
+	int64		nlive;
+	int64		lowest;			/* the oldest live entry's height (-1:
+								 * none) */
+	int64		keeps;			/* keeps since the last retention pass */
+	TimestampTz last_at;		/* the last keep's time (0: none) */
+	int64		last_height;	/* and its commit's height */
+	int64		stuck;			/* bytes held when a pass for the cap last
+								 * found nothing more to retire (-1: none) */
+	int64		nunfrozen;		/* live entries whose roots are to be
+								 * frozen ('u' while any) */
+} KeptSummary;
+
+#define KEPT_SUMMARY_FIELDS	9
 
 static bool commit_height(const ProllyHash *id, int64 *height);
 
 /*
  * The freezing of a keep's roots as it captures them, if the root freezer
  * does so and prolly.freeze_roots asks (NULL: they are kept as
- * captured).  Not under dolt.transaction_commit, whose every transaction's commit would pay it:
- * there the freezer freezes later.
+ * captured).
  */
 static BranchFreezePage
 freeze_at_keep(const ProllyDatabaseComponents *dc)
 {
-	const char *tc = GetConfigOption("dolt.transaction_commit", true, false);
-
 	if (!prolly_freeze_roots ||
 		dc->root_freezer == NULL || !PROLLY_HAS(dc->root_freezer, at_capture) ||
 		!PROLLY_HAS(dc->root_freezer, freeze_page) ||
-		!dc->root_freezer->at_capture() ||
-		(tc != NULL && strcmp(tc, "on") == 0))
+		!dc->root_freezer->at_capture())
 		return NULL;
 	return dc->root_freezer->freeze_page;
+}
+
+/*
+ * Are a keep's roots captured among the writers, to be frozen later (the
+ * root freezer's freeze_later(), as prolly.freeze_roots asks)?  Else, not
+ * frozen as captured, they are kept only while no writer is at work.
+ */
+static bool
+freeze_later_at_keep(const ProllyDatabaseComponents *dc)
+{
+	return prolly_freeze_roots && dc->root_freezer != NULL &&
+		PROLLY_HAS(dc->root_freezer, freeze_later) &&
+		PROLLY_HAS(dc->root_freezer, freeze_page) &&
+		dc->root_freezer->freeze_later();
+}
+
+/* the most ids a kept commit's snapshot records, of each kind */
+#define KEPT_SNAPSHOT_MAX_XIDS	4096
+
+/*
+ * Record snap in kc, the commit's view of the transactions its roots,
+ * captured among writers, hold the versions of; with the committing
+ * transaction's own ids (its top-level one and its subtransactions'
+ * committed so far: at its commit, all of them), which it sees as
+ * committed.  False if it can't be recorded whole: its subtransactions
+ * overflowed (which ones are running isn't known then without the
+ * subtransaction log, which is gone by the time the roots are frozen), or
+ * too many.
+ */
+static bool
+kept_note_snapshot(KeptCommit *kc, Snapshot snap)
+{
+	TransactionId *children;
+	int			nchildren = xactGetCommittedChildren(&children);
+	TransactionId top = GetTopTransactionIdIfAny();
+
+	if (snap->suboverflowed || snap->takenDuringRecovery ||
+		snap->xcnt > KEPT_SNAPSHOT_MAX_XIDS ||
+		snap->subxcnt > KEPT_SNAPSHOT_MAX_XIDS ||
+		nchildren + 1 > KEPT_SNAPSHOT_MAX_XIDS)
+		return false;
+	kc->unfrozen = true;
+	kc->xmin = snap->xmin;
+	kc->xmax = snap->xmax;
+	kc->nxip = snap->xcnt;
+	kc->xip = snap->xcnt > 0 ? palloc_array(TransactionId, snap->xcnt) : NULL;
+	if (snap->xcnt > 0)
+		memcpy(kc->xip, snap->xip, snap->xcnt * sizeof(TransactionId));
+	kc->nsubxip = snap->subxcnt;
+	kc->subxip = snap->subxcnt > 0 ? palloc_array(TransactionId, snap->subxcnt) : NULL;
+	if (snap->subxcnt > 0)
+		memcpy(kc->subxip, snap->subxip, snap->subxcnt * sizeof(TransactionId));
+	kc->own = palloc_array(TransactionId, nchildren + 1);
+	kc->nown = 0;
+	if (TransactionIdIsValid(top))
+		kc->own[kc->nown++] = top;
+	for (int i = 0; i < nchildren; i++)
+		kc->own[kc->nown++] = children[i];
+	return true;
+}
+
+/*
+ * The snapshot kc's roots are to be frozen as of, into *as_of, its MVCC
+ * snapshot in *snap.
+ */
+static void
+kept_snapshot(const KeptCommit *kc, SnapshotData *snap, ProllyRootSnapshot *as_of)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->snapshot_type = SNAPSHOT_MVCC;
+	snap->xmin = kc->xmin;
+	snap->xmax = kc->xmax;
+	snap->xip = kc->xip;
+	snap->xcnt = kc->nxip;
+	snap->subxip = kc->subxip;
+	snap->subxcnt = kc->nsubxip;
+	snap->suboverflowed = false;
+	snap->takenDuringRecovery = false;
+	snap->curcid = FirstCommandId;
+	as_of->snapshot = snap;
+	as_of->nown = kc->nown;
+	as_of->own = kc->own;
 }
 
 /*
@@ -3784,81 +3959,79 @@ root_note(const char *name, TimestampTz at)
 }
 
 /*
- * Is a root of branch name due at commit_id, its newest kept commit being
- * newest (NULL: none)?  The interval since it was kept, and the commits
- * made since (by height), each at least the settings'.
+ * Is a root of branch name due at commit_id, the branch's last keep being
+ * s's (none yet: due)?  The interval since it, and the commits made since
+ * (by height), each at least the settings'.
  */
 static bool
-root_due(const char *name, const KeptCommit *newest, const ProllyHash *commit_id)
+root_due(const char *name, const KeptSummary *s, const ProllyHash *commit_id)
 {
 	int			ms = root_interval_ms();
 	int64		h;
-	int64		hn;
 
-	if (newest == NULL)
+	if (s->last_at == 0)
 		return true;
-	root_note(name, newest->kept_at);
+	root_note(name, s->last_at);
 	if (ms > 0 &&
-		!TimestampDifferenceExceeds(newest->kept_at, GetCurrentTimestamp(), ms))
+		!TimestampDifferenceExceeds(s->last_at, GetCurrentTimestamp(), ms))
 		return false;
 	if (prolly_root_interval_commits > 1 &&
-		commit_height(commit_id, &h) && commit_height(&newest->commit, &hn) &&
-		h - hn < prolly_root_interval_commits)
+		commit_height(commit_id, &h) && s->last_height > 0 &&
+		h - s->last_height < prolly_root_interval_commits)
 		return false;
 	return true;
 }
 
+/*
+ * A branch's kept commits are entries of their own, so that a keep reads
+ * and writes only the few it changes, however many the branch keeps:
+ *
+ *	'K' name '\0' 'l' height hash	-> a commit kept (live), by its height
+ *	'K' name '\0' 'r' seq			-> one retired, by its number
+ *	'K' name '\0' 'h' root			-> how many entries (live or retired)
+ *									   name that root (be64)
+ *	'L' name						-> the branch's summary (KeptSummary)
+ *
+ * (height and seq big-endian, so the keys sort by them; a root is its
+ * tablespace and id, and for storage a restore replaced its file number
+ * too.)  The live ones sort oldest first by height, which is the order
+ * history ages in along a branch: a retention pass takes them from the
+ * oldest and stops at the first it keeps.  The count of a root's entries
+ * says, without reading the others, whether letting go of an entry leaves
+ * its roots held by none.
+ */
+#define KEPT_LIVE		'l'
+#define KEPT_RETIRED	'r'
+#define KEPT_HOLDS		'h'
+
+
+static void put_be32(StringInfo out, uint32 v);
+static void put_be64(StringInfo out, uint64 v);
+static uint64 get_be64_at(const char *p);
+
+/* An entry the transaction read, as it read it, for kept_put() to compare. */
+typedef struct KeptLoaded
+{
+	char	   *name;
+	StringInfoData key;
+	StringInfoData enc;
+} KeptLoaded;
+
 static void
-kept_key(StringInfo key, const char *name)
+kept_prefix(StringInfo key, const char *name, char kind)
 {
 	appendStringInfoChar(key, TAG_KEPT);
 	appendStringInfoString(key, name);
+	appendStringInfoChar(key, '\0');
+	if (kind)
+		appendStringInfoChar(key, kind);
 }
 
 static void
-kept_encode(StringInfo v, List *kept)
+kept_summary_key(StringInfo key, const char *name)
 {
-	KeptCommit *oldest = NULL;
-	int64		h = -1;
-
-	/* (the oldest not retired's height first, read alone: kept_lowest()) */
-	foreach_ptr(KeptCommit, kc, kept)
-	{
-		if (!FullTransactionIdIsValid(kc->retired))
-			oldest = kc;
-	}
-	if (oldest != NULL && !commit_height(&oldest->commit, &h))
-		h = -1;
-	appendBinaryStringInfo(v, &h, sizeof(h));
-	foreach_ptr(KeptCommit, kc, kept)
-	{
-		appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
-		appendBinaryStringInfo(v, &kc->kept_by, sizeof(FullTransactionId));
-		appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
-		put_hash(v, &kc->commit);
-		put_hash(v, &kc->baseline);
-		prolly_put_varint(v, kc->ntables);
-		for (int t = 0; t < kc->ntables; t++)
-		{
-			KeptTable  *kt = &kc->tables[t];
-
-			prolly_put_varint(v, strlen(kt->name));
-			appendStringInfoString(v, kt->name);
-			put_hash(v, &kt->data);
-			prolly_put_varint(v, kt->nrels);
-			for (int r = 0; r < kt->nrels; r++)
-			{
-				BranchKeptRelation *k = &kt->rels[r];
-
-				appendBinaryStringInfo(v, &k->relid, sizeof(uint32));
-				appendBinaryStringInfo(v, &k->tablespace, sizeof(uint32));
-				appendBinaryStringInfo(v, &k->relfilenumber, sizeof(uint32));
-				appendBinaryStringInfo(v, &k->snapshot, sizeof(uint64));
-				appendBinaryStringInfo(v, &k->frozenxid, sizeof(uint32));
-				appendBinaryStringInfo(v, &k->minmxid, sizeof(uint32));
-			}
-		}
-	}
+	appendStringInfoChar(key, TAG_KEPT_SUMMARY);
+	appendStringInfoString(key, name);
 }
 
 static void
@@ -3869,196 +4042,832 @@ kept_corrupt(void)
 			 errmsg("prolly refs hold an invalid record of kept pages")));
 }
 
-/* A TAG_KEPT entry's commits, newest first. */
-static List *
-kept_decode(const char *p, const char *end)
+static void
+kept_summary_get(const char *name, KeptSummary *s)
 {
-	List	   *kept = NIL;
+	StringInfoData key;
+	StringInfoData v;
 
-	/* (past the height first: kept_encode()) */
-	if (end - p < (ptrdiff_t) sizeof(int64))
-		kept_corrupt();
-	p += sizeof(int64);
-
-	while (p < end)
+	memset(s, 0, sizeof(*s));
+	s->next_seq = 1;
+	s->lowest = -1;
+	s->stuck = -1;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	kept_summary_key(&key, name);
+	if (refs_get(key.data, key.len, &v))
 	{
-		KeptCommit *kc = palloc0(sizeof(KeptCommit));
-		uint64		n;
+		uint64		f[KEPT_SUMMARY_FIELDS];
 
-		if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId) +
-								   sizeof(TimestampTz)))
+		if (v.len != KEPT_SUMMARY_FIELDS * 8)
 			kept_corrupt();
-		memcpy(&kc->retired, p, sizeof(FullTransactionId));
-		p += sizeof(FullTransactionId);
-		memcpy(&kc->kept_by, p, sizeof(FullTransactionId));
-		p += sizeof(FullTransactionId);
-		memcpy(&kc->kept_at, p, sizeof(TimestampTz));
-		p += sizeof(TimestampTz);
-		p = get_hash(p, end, &kc->commit);
-		p = get_hash(p, end, &kc->baseline);
-		n = prolly_get_varint(&p, end);
-		if (n > (uint64) (end - p))
-			kept_corrupt();
-		kc->ntables = (int) n;
-		kc->tables = palloc0_array(KeptTable, Max(kc->ntables, 1));
-		for (int t = 0; t < kc->ntables; t++)
-		{
-			KeptTable  *kt = &kc->tables[t];
-
-			kt->name = get_short_text(&p, end);
-			if (kt->name == NULL)
-				kept_corrupt();
-			p = get_hash(p, end, &kt->data);
-			n = prolly_get_varint(&p, end);
-			if (n == 0 || n > (uint64) (end - p) / KEPT_RELATION_SIZE)
-				kept_corrupt();
-			kt->nrels = (int) n;
-			kt->rels = palloc0_array(BranchKeptRelation, kt->nrels);
-			for (int r = 0; r < kt->nrels; r++)
-			{
-				BranchKeptRelation *k = &kt->rels[r];
-
-				memcpy(&k->relid, p, sizeof(uint32));
-				memcpy(&k->tablespace, p + 4, sizeof(uint32));
-				memcpy(&k->relfilenumber, p + 8, sizeof(uint32));
-				memcpy(&k->snapshot, p + 12, sizeof(uint64));
-				memcpy(&k->frozenxid, p + 20, sizeof(uint32));
-				memcpy(&k->minmxid, p + 24, sizeof(uint32));
-				p += KEPT_RELATION_SIZE;
-			}
-		}
-		kept = lappend(kept, kc);
+		for (int i = 0; i < KEPT_SUMMARY_FIELDS; i++)
+			f[i] = get_be64_at(v.data + i * 8);
+		s->next_seq = f[0];
+		s->bytes = (int64) f[1];
+		s->nlive = (int64) f[2];
+		s->lowest = (int64) f[3];
+		s->keeps = (int64) f[4];
+		s->last_at = (TimestampTz) f[5];
+		s->last_height = (int64) f[6];
+		s->stuck = (int64) f[7];
+		s->nunfrozen = (int64) f[8];
 	}
-	return kept;
+	pfree(key.data);
+	pfree(v.data);
 }
 
-/* A TAG_KEPT entry's commits and baselines, declared. */
 static void
-kept_declare(const char *p, const char *end, StringInfo refs)
+kept_summary_put(const char *name, const KeptSummary *s)
 {
-	foreach_ptr(KeptCommit, kc, kept_decode(p, end))
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	kept_summary_key(&key, name);
+	put_be64(&v, s->next_seq);
+	put_be64(&v, (uint64) s->bytes);
+	put_be64(&v, (uint64) s->nlive);
+	put_be64(&v, (uint64) s->lowest);
+	put_be64(&v, (uint64) s->keeps);
+	put_be64(&v, (uint64) s->last_at);
+	put_be64(&v, (uint64) s->last_height);
+	put_be64(&v, (uint64) s->stuck);
+	put_be64(&v, (uint64) s->nunfrozen);
+	refs_put(key.data, key.len, &v);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static void
+kept_summary_drop(const char *name)
+{
+	StringInfoData key;
+
+	initStringInfo(&key);
+	kept_summary_key(&key, name);
+	refs_put(key.data, key.len, NULL);
+	pfree(key.data);
+}
+
+/* An entry's key: by its height if live, else by its number. */
+static void
+kept_entry_key(StringInfo key, const char *name, const KeptCommit *kc)
+{
+	if (FullTransactionIdIsValid(kc->retired))
 	{
-		PROLLY_CALL(tree, value_reference, &kc->commit, 0, refs);
-		if (kc->baseline.len > 0)
-			PROLLY_CALL(tree, value_reference, &kc->baseline, 0, refs);
-		/* (each table's data tree, which the commit's root holds too) */
-		for (int t = 0; t < kc->ntables; t++)
-			if (kc->tables[t].data.len > 0)
-				PROLLY_CALL(tree, value_reference, &kc->tables[t].data, 0, refs);
+		kept_prefix(key, name, KEPT_RETIRED);
+		put_be64(key, kc->seq);
 	}
+	else
+	{
+		kept_prefix(key, name, KEPT_LIVE);
+		put_be64(key, (uint64) Max(kc->height, 0));
+		put_hash(key, &kc->commit);
+	}
+}
+
+/* A root's count key: what kept_holds() compares. */
+static void
+kept_holds_key(StringInfo key, const char *name, const BranchKeptRelation *k)
+{
+	kept_prefix(key, name, KEPT_HOLDS);
+	put_be32(key, k->tablespace);
+	put_be64(key, k->snapshot);
+	if (k->snapshot == BRANCH_KEPT_STORAGE)
+		put_be32(key, k->relfilenumber);
+}
+
+/* Ids (or block numbers), a varint count then 4 bytes each. */
+static void
+put_xids(StringInfo v, const uint32 *xids, int n)
+{
+	prolly_put_varint(v, n);
+	if (n > 0)
+		appendBinaryStringInfo(v, xids, n * sizeof(uint32));
+}
+
+
+static const char *
+get_xids(const char *p, const char *end, uint32 **xids, int *n)
+{
+	uint64		count = prolly_get_varint(&p, end);
+
+	if (count > (uint64) (end - p) / sizeof(uint32))
+		kept_corrupt();
+	*n = (int) count;
+	*xids = NULL;
+	if (count > 0)
+	{
+		*xids = palloc_array(uint32, count);
+		memcpy(*xids, p, count * sizeof(uint32));
+		p += count * sizeof(uint32);
+	}
+	return p;
+}
+
+static void
+kept_encode(StringInfo v, const KeptCommit *kc)
+{
+	appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
+	appendBinaryStringInfo(v, &kc->kept_by, sizeof(FullTransactionId));
+	appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
+	appendBinaryStringInfo(v, &kc->height, sizeof(int64));
+	appendBinaryStringInfo(v, &kc->pages, sizeof(int64));
+	appendStringInfoChar(v, kc->severed ? 1 : 0);
+	appendStringInfoChar(v, kc->unfrozen ? KEPT_UNFROZEN : 0);
+	if (kc->unfrozen)
+	{
+		appendBinaryStringInfo(v, &kc->xmin, sizeof(TransactionId));
+		appendBinaryStringInfo(v, &kc->xmax, sizeof(TransactionId));
+		put_xids(v, kc->xip, kc->nxip);
+		put_xids(v, kc->subxip, kc->nsubxip);
+		put_xids(v, kc->own, kc->nown);
+	}
+	put_hash(v, &kc->commit);
+	put_hash(v, &kc->baseline);
+	prolly_put_varint(v, kc->ntables);
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		KeptTable  *kt = &kc->tables[t];
+
+		prolly_put_varint(v, strlen(kt->name));
+		appendStringInfoString(v, kt->name);
+		put_hash(v, &kt->data);
+		prolly_put_varint(v, kt->nrels);
+		for (int r = 0; r < kt->nrels; r++)
+		{
+			BranchKeptRelation *k = &kt->rels[r];
+
+			appendBinaryStringInfo(v, &k->relid, sizeof(uint32));
+			appendBinaryStringInfo(v, &k->tablespace, sizeof(uint32));
+			appendBinaryStringInfo(v, &k->relfilenumber, sizeof(uint32));
+			appendBinaryStringInfo(v, &k->snapshot, sizeof(uint64));
+			appendBinaryStringInfo(v, &k->frozenxid, sizeof(uint32));
+			appendBinaryStringInfo(v, &k->minmxid, sizeof(uint32));
+			appendBinaryStringInfo(v, &k->flags, sizeof(uint32));
+			put_xids(v, k->undecided, k->nundecided);
+		}
+	}
+}
+
+/* An entry (key k, value p..end) of a 'K' entry kind KEPT_LIVE or KEPT_RETIRED. */
+static KeptCommit *
+kept_decode(const char *kp, int klen, const char *p, const char *end)
+{
+	KeptCommit *kc = palloc0(sizeof(KeptCommit));
+	const char *nul = memchr(kp + 1, '\0', klen - 1);
+	uint64		n;
+
+	if (nul == NULL || nul + 1 >= kp + klen)
+		kept_corrupt();
+	if (nul[1] == KEPT_RETIRED)
+	{
+		if (kp + klen - (nul + 2) != 8)
+			kept_corrupt();
+		kc->seq = get_be64_at(nul + 2);
+	}
+	if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId) +
+							   sizeof(TimestampTz) + 2 * sizeof(int64) + 1))
+		kept_corrupt();
+	memcpy(&kc->retired, p, sizeof(FullTransactionId));
+	p += sizeof(FullTransactionId);
+	memcpy(&kc->kept_by, p, sizeof(FullTransactionId));
+	p += sizeof(FullTransactionId);
+	memcpy(&kc->kept_at, p, sizeof(TimestampTz));
+	p += sizeof(TimestampTz);
+	memcpy(&kc->height, p, sizeof(int64));
+	p += sizeof(int64);
+	memcpy(&kc->pages, p, sizeof(int64));
+	p += sizeof(int64);
+	kc->severed = *p++ != 0;
+	if (end - p < 1)
+		kept_corrupt();
+	kc->unfrozen = (*p++ & KEPT_UNFROZEN) != 0;
+	if (kc->unfrozen)
+	{
+		if (end - p < (ptrdiff_t) (2 * sizeof(TransactionId)))
+			kept_corrupt();
+		memcpy(&kc->xmin, p, sizeof(TransactionId));
+		memcpy(&kc->xmax, p + sizeof(TransactionId), sizeof(TransactionId));
+		p += 2 * sizeof(TransactionId);
+		p = get_xids(p, end, &kc->xip, &kc->nxip);
+		p = get_xids(p, end, &kc->subxip, &kc->nsubxip);
+		p = get_xids(p, end, &kc->own, &kc->nown);
+	}
+	p = get_hash(p, end, &kc->commit);
+	p = get_hash(p, end, &kc->baseline);
+	n = prolly_get_varint(&p, end);
+	if (n > (uint64) (end - p))
+		kept_corrupt();
+	kc->ntables = (int) n;
+	kc->tables = palloc0_array(KeptTable, Max(kc->ntables, 1));
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		KeptTable  *kt = &kc->tables[t];
+
+		kt->name = get_short_text(&p, end);
+		if (kt->name == NULL)
+			kept_corrupt();
+		p = get_hash(p, end, &kt->data);
+		n = prolly_get_varint(&p, end);
+		if (n == 0 || n > (uint64) (end - p) / KEPT_RELATION_SIZE)
+			kept_corrupt();
+		kt->nrels = (int) n;
+		kt->rels = palloc0_array(BranchKeptRelation, kt->nrels);
+		for (int r = 0; r < kt->nrels; r++)
+		{
+			BranchKeptRelation *k = &kt->rels[r];
+
+			memcpy(&k->relid, p, sizeof(uint32));
+			memcpy(&k->tablespace, p + 4, sizeof(uint32));
+			memcpy(&k->relfilenumber, p + 8, sizeof(uint32));
+			memcpy(&k->snapshot, p + 12, sizeof(uint64));
+			memcpy(&k->frozenxid, p + 20, sizeof(uint32));
+			memcpy(&k->minmxid, p + 24, sizeof(uint32));
+			memcpy(&k->flags, p + 28, sizeof(uint32));
+			p += KEPT_RELATION_SIZE - 1;
+			p = get_xids(p, end, (TransactionId **) &k->undecided,
+						 (int *) &k->nundecided);
+		}
+	}
+	if (FullTransactionIdIsValid(kc->retired) != (nul[1] == KEPT_RETIRED))
+		kept_corrupt();
+	kc->owner = pnstrdup(kp + 1, nul - (kp + 1));
+	return kc;
+}
+
+/* A 'K' entry's commits and baselines, declared (a count names none). */
+static void
+kept_declare(const ProllyKey *key, const char *p, const char *end,
+			 StringInfo refs)
+{
+	const char *kp = (const char *) key->data;
+	const char *nul = memchr(kp + 1, '\0', key->len - 1);
+	KeptCommit *kc;
+
+	if (nul == NULL || nul + 1 >= kp + key->len ||
+		(nul[1] != KEPT_LIVE && nul[1] != KEPT_RETIRED))
+		return;
+	kc = kept_decode(kp, key->len, p, end);
+	/* (one retired for a sever keeps nothing: its history is cold) */
+	if (kc->severed)
+		return;
+	PROLLY_CALL(tree, value_reference, &kc->commit, 0, refs);
+	if (kc->baseline.len > 0)
+		PROLLY_CALL(tree, value_reference, &kc->baseline, 0, refs);
+	/* (each table's data tree, which the commit's root holds too) */
+	for (int t = 0; t < kc->ntables; t++)
+		if (kc->tables[t].data.len > 0)
+			PROLLY_CALL(tree, value_reference, &kc->tables[t].data, 0, refs);
 }
 
 /*
- * The index entries of branch name's kept commits kept, but those retired
- * (which no reader takes, and which pile up until their retiring
- * transaction is known to have committed): each commit's ('k'), and each
- * of its tables' data trees' ('s').  So they are a few for each branch,
- * however many commits the transaction makes.
+ * The index entries of a live kept commit: the commit's ('k'), and each
+ * of its tables' data trees' ('s').  None for one retired, which no reader
+ * takes.
  */
 static List *
-kept_index_keys(const char *name, List *kept)
+kept_index_keys(const char *name, const KeptCommit *kc)
 {
 	List	   *keys = NIL;
+	StringInfo	k;
 
-	foreach_ptr(KeptCommit, kc, kept)
+	if (FullTransactionIdIsValid(kc->retired))
+		return NIL;
+	k = makeStringInfo();
+	appendStringInfoChar(k, TAG_KEPT_OF);
+	put_hash(k, &kc->commit);
+	appendStringInfoString(k, name);
+	keys = lappend(keys, k);
+	for (int t = 0; t < kc->ntables; t++)
 	{
-		StringInfo	k;
-
-		if (FullTransactionIdIsValid(kc->retired))
+		if (kc->tables[t].data.len == 0)
 			continue;
 		k = makeStringInfo();
-		appendStringInfoChar(k, TAG_KEPT_OF);
+		appendStringInfoChar(k, TAG_KEPT_TABLE);
+		put_hash(k, &kc->tables[t].data);
 		put_hash(k, &kc->commit);
 		appendStringInfoString(k, name);
 		keys = lappend(keys, k);
-		for (int t = 0; t < kc->ntables; t++)
-		{
-			if (kc->tables[t].data.len == 0)
-				continue;
-			k = makeStringInfo();
-			appendStringInfoChar(k, TAG_KEPT_TABLE);
-			put_hash(k, &kc->tables[t].data);
-			put_hash(k, &kc->commit);
-			appendStringInfoString(k, name);
-			keys = lappend(keys, k);
-		}
 	}
 	return keys;
 }
 
-static bool
-key_listed(List *keys, const StringInfoData *key)
+/*
+ * A set of refs keys, by their bytes' hash (each bucket the keys of that
+ * hash, compared whole), each with a pointer: a seek, however many.
+ */
+typedef struct KeySetBucket
 {
-	foreach_ptr(StringInfoData, k, keys)
-		if (k->len == key->len && memcmp(k->data, key->data, k->len) == 0)
-			return true;
-	return false;
-}
+	uint32		hash;
+	List	   *items;			/* KeySetItem * */
+} KeySetBucket;
 
-/* The commits branch name's pages are kept as of, newest first. */
-static List *
-kept_get(const char *name)
+typedef struct KeySetItem
 {
 	StringInfoData key;
-	StringInfoData v;
-	List	   *kept = NIL;
+	void	   *value;
+} KeySetItem;
+
+typedef struct KeySet
+{
+	HTAB	   *buckets;
+	MemoryContext cxt;
+} KeySet;
+
+static KeySet *
+keyset_create(const char *what, MemoryContext cxt)
+{
+	HASHCTL		ctl;
+	KeySet	   *set = MemoryContextAlloc(cxt, sizeof(KeySet));
+
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(KeySetBucket);
+	ctl.hcxt = cxt;
+	set->buckets = hash_create(what, 64, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	set->cxt = cxt;
+	return set;
+}
+
+/* The item of key (len bytes) in set; with add, made if none (value NULL). */
+static KeySetItem *
+keyset_find(KeySet *set, const char *key, int len, bool add)
+{
+	uint32		h = hash_bytes((const unsigned char *) key, len);
+	bool		found;
+	KeySetBucket *b = hash_search(set->buckets, &h,
+								  add ? HASH_ENTER : HASH_FIND, &found);
+	KeySetItem *it;
 	MemoryContext old;
 
-	initStringInfo(&key);
-	initStringInfo(&v);
-	kept_key(&key, name);
-	if (refs_get(key.data, key.len, &v))
-		kept = kept_decode(v.data, v.data + v.len);
-	pfree(key.data);
-	pfree(v.data);
-
-	/* (its index entries now, for the kept_put() that follows) */
-	if (kept_read_cxt == NULL)
-		kept_read_cxt = AllocSetContextCreate(TopMemoryContext,
-											  "prolly kept index entries read",
-											  ALLOCSET_SMALL_SIZES);
-	MemoryContextReset(kept_read_cxt);
-	old = MemoryContextSwitchTo(kept_read_cxt);
-	kept_read_name = pstrdup(name);
-	kept_read_keys = kept_index_keys(name, kept);
+	if (b == NULL)
+		return NULL;
+	if (!found)
+		b->items = NIL;
+	foreach_ptr(KeySetItem, i, b->items)
+		if (i->key.len == len && memcmp(i->key.data, key, len) == 0)
+			return i;
+	if (!add)
+		return NULL;
+	old = MemoryContextSwitchTo(set->cxt);
+	it = palloc0(sizeof(KeySetItem));
+	initStringInfo(&it->key);
+	appendBinaryStringInfo(&it->key, key, len);
+	b->items = lappend(b->items, it);
 	MemoryContextSwitchTo(old);
-	return kept;
+	return it;
 }
 
 static void
-kept_put(const char *name, List *kept)
+keyset_remove(KeySet *set, const char *key, int len)
+{
+	uint32		h = hash_bytes((const unsigned char *) key, len);
+	KeySetBucket *b = hash_search(set->buckets, &h, HASH_FIND, NULL);
+
+	if (b == NULL)
+		return;
+	foreach_ptr(KeySetItem, i, b->items)
+		if (i->key.len == len && memcmp(i->key.data, key, len) == 0)
+		{
+			b->items = foreach_delete_current(b->items, i);
+			return;
+		}
+}
+
+/*
+ * The entries read since the last kept_put() of each branch (in
+ * kept_read_cxt, their keys in kept_loaded_keys), forgotten as the
+ * transaction ends.
+ */
+static List *kept_loaded = NIL;
+static KeySet *kept_loaded_keys = NULL;
+
+static void
+kept_note_loaded(const char *name, const ProllyKey *k, const ProllyValue *v)
+{
+	MemoryContext old;
+	KeptLoaded *l;
+
+	if (kept_read_cxt == NULL)
+		kept_read_cxt = AllocSetContextCreate(TopMemoryContext,
+											  "prolly kept entries read",
+											  ALLOCSET_SMALL_SIZES);
+	if (kept_loaded_keys == NULL)
+		kept_loaded_keys = keyset_create("prolly kept entries read",
+										 kept_read_cxt);
+	if (keyset_find(kept_loaded_keys, (const char *) k->data, k->len,
+					true)->value != NULL)
+		return;
+	keyset_find(kept_loaded_keys, (const char *) k->data, k->len,
+				false)->value = (void *) 1;
+	old = MemoryContextSwitchTo(kept_read_cxt);
+	l = palloc(sizeof(KeptLoaded));
+	l->name = pstrdup(name);
+	initStringInfo(&l->key);
+	appendBinaryStringInfo(&l->key, (const char *) k->data, k->len);
+	initStringInfo(&l->enc);
+	appendBinaryStringInfo(&l->enc, (const char *) v->data, v->len);
+	kept_loaded = lappend(kept_loaded, l);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+kept_forget_loaded(void)
+{
+	kept_loaded = NIL;
+	kept_loaded_keys = NULL;
+	if (kept_read_cxt != NULL)
+		MemoryContextReset(kept_read_cxt);
+}
+
+/*
+ * Forget what was read of branch name's entries: an operation that puts
+ * them begins so, so that what an earlier one read and didn't put (or an
+ * error interrupted) isn't taken for an entry it dropped.
+ */
+static void
+kept_forget_name(const char *name)
+{
+	List	   *keep = NIL;
+	MemoryContext old;
+
+	if (kept_loaded == NIL)
+		return;
+	old = MemoryContextSwitchTo(kept_read_cxt);
+	foreach_ptr(KeptLoaded, l, kept_loaded)
+	{
+		if (strcmp(l->name, name) != 0)
+			keep = lappend(keep, l);
+		else
+			keyset_remove(kept_loaded_keys, l->key.data, l->key.len);
+	}
+	list_free(kept_loaded);
+	kept_loaded = keep;
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Read branch name's entries of kind (KEPT_LIVE or KEPT_RETIRED), from
+ * the oldest (backward: the newest), at most limit of them (< 0: all).
+ */
+static List *
+kept_scan(const char *name, char kind, bool backward, int limit, bool note)
+{
+	StringInfoData prefix;
+	StringInfoData seek;
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	from;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *out = NIL;
+
+	if (limit == 0 || !refs_root(&root))
+		return NIL;
+	initStringInfo(&prefix);
+	kept_prefix(&prefix, name, kind);
+	initStringInfo(&seek);
+	appendBinaryStringInfo(&seek, prefix.data, prefix.len);
+	if (backward)
+		for (int i = 0; i < PROLLY_HASH_MAX_LEN + 16; i++)
+			appendStringInfoChar(&seek, '\377');
+	from.data = (const uint8 *) seek.data;
+	from.len = seek.len;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from,
+				backward ? BackwardScanDirection : ForwardScanDirection);
+	while ((limit < 0 || list_length(out) < limit) &&
+		   PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= prefix.len && memcmp(k.data, prefix.data, prefix.len) == 0)
+	{
+		out = lappend(out, kept_decode((const char *) k.data, k.len,
+									   (const char *) v.data,
+									   (const char *) v.data + v.len));
+		if (note)
+			kept_note_loaded(name, &k, &v);
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(prefix.data);
+	pfree(seek.data);
+	return out;
+}
+
+/* The commits branch name's pages are kept as of: the live newest first, then those retired. */
+static List *
+kept_get(const char *name)
+{
+	return list_concat(kept_scan(name, KEPT_LIVE, true, -1, true),
+					   kept_scan(name, KEPT_RETIRED, false, -1, true));
+}
+
+/* Branch name's live entry for commit, if it has one (a seek). */
+static KeptCommit *
+kept_lookup(const char *name, const ProllyHash *commit, bool note)
 {
 	StringInfoData key;
 	StringInfoData v;
-	List	   *was;
-	List	   *now = kept_index_keys(name, kept);
+	KeptCommit *kc = NULL;
+	int64		h = 0;
 
-	/*
-	 * (the entries as the last kept_get() found them, if it read this
-	 * branch's and no kept_put() came since: the caller changes the list it
-	 * read in place; else read again)
-	 */
-	if (kept_read_name == NULL || strcmp(kept_read_name, name) != 0)
-		(void) kept_get(name);
-	was = kept_read_keys;
+	if (!commit_height(commit, &h))
+		h = 0;
+	initStringInfo(&key);
+	initStringInfo(&v);
+	kept_prefix(&key, name, KEPT_LIVE);
+	put_be64(&key, (uint64) Max(h, 0));
+	put_hash(&key, commit);
+	if (refs_get(key.data, key.len, &v))
+	{
+		ProllyKey	k = {(const uint8 *) key.data, key.len};
+		ProllyValue val = {(const uint8 *) v.data, v.len};
 
-	/* (the indexes first: those no longer true gone, the new ones put) */
-	foreach_ptr(StringInfoData, k, was)
-		if (!key_listed(now, k))
-			index_put(k, false);
-	foreach_ptr(StringInfoData, k, now)
-		if (!key_listed(was, k))
-			index_put(k, true);
+		kc = kept_decode(key.data, key.len, v.data, v.data + v.len);
+		if (note)
+			kept_note_loaded(name, &k, &val);
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return kc;
+}
+
+/* Is there an entry with branch name's prefix of kind? */
+static bool
+kept_any(const char *name, char kind)
+{
+	return kept_scan(name, kind, false, 1, false) != NIL;
+}
+
+typedef struct KeptChange
+{
+	StringInfoData key;
+	StringInfoData enc;
+	const KeptCommit *kc;		/* (added: the entry; removed: NULL) */
+} KeptChange;
+
+static int
+kept_change_cmp(const ListCell *a, const ListCell *b)
+{
+	const KeptChange *x = lfirst(a);
+	const KeptChange *y = lfirst(b);
+	int			c = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+
+	if (c != 0)
+		return c;
+	if (x->key.len != y->key.len)
+		return x->key.len < y->key.len ? -1 : 1;
+	return 0;
+}
+
+typedef struct KeptCount
+{
+	StringInfoData key;
+	int			delta;
+} KeptCount;
+
+static void
+kept_count_add(List **counts, KeySet *seen, const char *name,
+			   const KeptCommit *kc, int delta)
+{
+	for (int t = 0; t < kc->ntables; t++)
+		for (int r = 0; r < kc->tables[t].nrels; r++)
+		{
+			KeySetItem *it;
+			KeptCount  *c;
+			StringInfoData key;
+
+			initStringInfo(&key);
+			kept_holds_key(&key, name, &kc->tables[t].rels[r]);
+			it = keyset_find(seen, key.data, key.len, true);
+			if ((c = it->value) == NULL)
+			{
+				c = palloc0(sizeof(KeptCount));
+				c->key = key;
+				it->value = c;
+				*counts = lappend(*counts, c);
+			}
+			else
+				pfree(key.data);
+			c->delta += delta;
+		}
+}
+
+/* How many of branch name's entries name root k now. */
+static int64
+kept_holders_of(const char *name, const BranchKeptRelation *k)
+{
+	StringInfoData key;
+	StringInfoData v;
+	int64		n = 0;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	kept_key(&key, name);
-	kept_encode(&v, kept);
-	refs_put(key.data, key.len, kept != NIL ? &v : NULL);
-
+	kept_holds_key(&key, name, k);
+	if (refs_get(key.data, key.len, &v))
+	{
+		if (v.len != 8)
+			kept_corrupt();
+		n = (int64) get_be64_at(v.data);
+	}
 	pfree(key.data);
 	pfree(v.data);
-	kept_read_name = NULL;
+	return n;
+}
+
+/*
+ * Branch name's entries made what kept (a list read by kept_scan(), or
+ * made, and changed in place) holds: each read since the last kept_put()
+ * and not in kept as it was is let go of, each in kept not as it was read
+ * put, each one retired since given its number.  So the work is in the
+ * entries changed, and the indexes and counts of their roots with them.
+ * The summary s (NULL: the branch's as it is) is kept with them.  An
+ * entry's roots aren't let go of here: a caller dropping an entry lets go
+ * of those no other entry names (kept_holders_of()).
+ */
+static void
+kept_put(const char *name, List *kept, KeptSummary *given)
+{
+	KeptSummary s;
+	List	   *was = NIL;
+	List	   *now = NIL;
+	List	   *counts = NIL;
+	List	   *removed = NIL;
+	List	   *added = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	bool		live_changed = false;
+	int64		unfrozen_before;
+	KeySet	   *seen = keyset_create("prolly kept roots counted",
+									 CurrentMemoryContext);
+
+	if (given)
+		s = *given;
+	else
+		kept_summary_get(name, &s);
+	unfrozen_before = s.nunfrozen;
+
+	foreach_ptr(KeptLoaded, l, kept_loaded)
+	{
+		KeptChange *c;
+
+		if (strcmp(l->name, name) != 0)
+			continue;
+		c = palloc0(sizeof(KeptChange));
+		c->key = l->key;
+		c->enc = l->enc;
+		was = lappend(was, c);
+	}
+	foreach_ptr(KeptCommit, kc, kept)
+	{
+		KeptChange *c = palloc0(sizeof(KeptChange));
+
+		/* (one retired anew, or read as another branch's, numbered here) */
+		if (FullTransactionIdIsValid(kc->retired) &&
+			(kc->seq == 0 || kc->owner == NULL || strcmp(kc->owner, name) != 0))
+			kc->seq = s.next_seq++;
+		if (!FullTransactionIdIsValid(kc->retired) && kc->height <= 0 &&
+			!commit_height(&kc->commit, &kc->height))
+			kc->height = 0;
+		initStringInfo(&c->key);
+		kept_entry_key(&c->key, name, kc);
+		initStringInfo(&c->enc);
+		kept_encode(&c->enc, kc);
+		c->kc = kc;
+		now = lappend(now, c);
+	}
+	list_sort(was, kept_change_cmp);
+	list_sort(now, kept_change_cmp);
+
+	/* (merged in key order: what is the same is left alone) */
+	a = list_head(was);
+	b = list_head(now);
+	while (a != NULL || b != NULL)
+	{
+		KeptChange *x = a ? lfirst(a) : NULL;
+		KeptChange *y = b ? lfirst(b) : NULL;
+		int			cmp = x == NULL ? 1 : y == NULL ? -1 :
+			kept_change_cmp(a, b);
+
+		if (cmp == 0)
+		{
+			if (x->enc.len != y->enc.len ||
+				memcmp(x->enc.data, y->enc.data, x->enc.len) != 0)
+			{
+				removed = lappend(removed, x);
+				added = lappend(added, y);
+			}
+			a = lnext(was, a);
+			b = lnext(now, b);
+		}
+		else if (cmp < 0)
+		{
+			removed = lappend(removed, x);
+			a = lnext(was, a);
+		}
+		else
+		{
+			added = lappend(added, y);
+			b = lnext(now, b);
+		}
+	}
+
+	/* (what no longer holds first: an index key may be put again) */
+	foreach_ptr(KeptChange, x, removed)
+	{
+		KeptCommit *o = kept_decode(x->key.data, x->key.len, x->enc.data,
+									x->enc.data + x->enc.len);
+
+		foreach_ptr(StringInfoData, k, kept_index_keys(name, o))
+			index_put(k, false);
+		kept_count_add(&counts, seen, name, o, -1);
+		if (!FullTransactionIdIsValid(o->retired))
+		{
+			s.bytes -= o->pages * BLCKSZ;
+			s.nlive--;
+			s.nunfrozen -= o->unfrozen ? 1 : 0;
+			live_changed = true;
+		}
+		refs_put(x->key.data, x->key.len, NULL);
+	}
+	foreach_ptr(KeptChange, y, added)
+	{
+		foreach_ptr(StringInfoData, k, kept_index_keys(name, y->kc))
+			index_put(k, true);
+		kept_count_add(&counts, seen, name, y->kc, 1);
+		if (!FullTransactionIdIsValid(y->kc->retired))
+		{
+			s.bytes += y->kc->pages * BLCKSZ;
+			s.nlive++;
+			s.nunfrozen += y->kc->unfrozen ? 1 : 0;
+			live_changed = true;
+		}
+		refs_put(y->key.data, y->key.len, &y->enc);
+	}
+	foreach_ptr(KeptCount, c, counts)
+	{
+		StringInfoData v;
+		int64		n;
+
+		if (c->delta == 0)
+			continue;
+		initStringInfo(&v);
+		n = 0;
+		if (refs_get(c->key.data, c->key.len, &v))
+		{
+			if (v.len != 8)
+				kept_corrupt();
+			n = (int64) get_be64_at(v.data);
+		}
+		n += c->delta;
+		if (n < 0)
+			kept_corrupt();
+		resetStringInfo(&v);
+		put_be64(&v, (uint64) n);
+		refs_put(c->key.data, c->key.len, n > 0 ? &v : NULL);
+		pfree(v.data);
+	}
+	if (live_changed)
+	{
+		List	   *oldest = kept_scan(name, KEPT_LIVE, false, 1, false);
+
+		s.lowest = oldest != NIL ? ((KeptCommit *) linitial(oldest))->height : -1;
+	}
+	s.nlive = Max(s.nlive, 0);
+	s.bytes = Max(s.bytes, 0);
+	s.nunfrozen = Max(s.nunfrozen, 0);
+	/* (the branch indexed while it keeps any commit to be frozen) */
+	if ((s.nunfrozen > 0) != (unfrozen_before > 0))
+	{
+		StringInfoData uk;
+
+		initStringInfo(&uk);
+		appendStringInfoChar(&uk, TAG_KEPT_UNFROZEN);
+		appendStringInfoString(&uk, name);
+		index_put(&uk, s.nunfrozen > 0);
+		pfree(uk.data);
+	}
+	if (kept == NIL && !kept_any(name, KEPT_LIVE) &&
+		!kept_any(name, KEPT_RETIRED))
+		kept_summary_drop(name);
+	else
+		kept_summary_put(name, &s);
+	/*
+	 * (what is in the refs now noted as read, so that a later put of the
+	 * same list, changed again, tells what changed since)
+	 */
+	kept_forget_name(name);
+	foreach_ptr(KeptChange, c, now)
+	{
+		ProllyKey	k = {(const uint8 *) c->key.data, c->key.len};
+		ProllyValue v = {(const uint8 *) c->enc.data, c->enc.len};
+
+		((KeptCommit *) c->kc)->owner = pstrdup(name);
+		kept_note_loaded(name, &k, &v);
+	}
+	if (given)
+		*given = s;
 }
 
 static KeptCommit *
@@ -4077,6 +4886,12 @@ static void visit_prefix(const char *prefix, int prefixlen,
 						 void (*visit) (const ProllyKey *k, const ProllyValue *v,
 										void *arg),
 						 void *arg);
+static void visit_prefix_while(const char *prefix, int prefixlen,
+							   bool backward,
+							   bool (*visit) (const ProllyKey *k,
+											  const ProllyValue *v, void *arg),
+							   void *arg);
+static bool note_found(const ProllyKey *k, const ProllyValue *v, void *arg);
 
 typedef struct KeptHolder
 {
@@ -4119,11 +4934,11 @@ copies_kept_holders(const ProllyHash *commit, const ProllyHash *data,
 		visit(h->name, &h->commit, arg);
 }
 
-/* Visit the commits branch name's pages are kept as of, but those retired. */
+/* Visit each of kept (those retired passed over). */
 static void
-copies_kept_commits(const char *name, ProllyKeptCommitVisit visit, void *arg)
+visit_kept(List *kept, ProllyKeptCommitVisit visit, void *arg)
 {
-	foreach_ptr(KeptCommit, kc, kept_get(name))
+	foreach_ptr(KeptCommit, kc, kept)
 	{
 		ProllyKeptCommit k;
 		ProllyKeptTable *tables;
@@ -4144,6 +4959,25 @@ copies_kept_commits(const char *name, ProllyKeptCommitVisit visit, void *arg)
 		k.tables = tables;
 		visit(&k, arg);
 	}
+}
+
+/* Visit the commits branch name's pages are kept as of, but those retired. */
+static void
+copies_kept_commits(const char *name, ProllyKeptCommitVisit visit, void *arg)
+{
+	refs_init();
+	visit_kept(kept_scan(name, KEPT_LIVE, true, -1, false), visit, arg);
+}
+
+static void
+copies_kept_commit(const char *name, const ProllyHash *commit,
+				   ProllyKeptCommitVisit visit, void *arg)
+{
+	KeptCommit *kc;
+
+	refs_init();
+	if ((kc = kept_lookup(name, commit, false)) != NULL)
+		visit_kept(list_make1(kc), visit, arg);
 }
 
 /*
@@ -4390,6 +5224,13 @@ kept_settled(void *arg)
 	return branch_writers_settled(MyBranch, (Snapshot) arg);
 }
 
+/* (among writers: only that snap saw every one of them that committed) */
+static bool
+kept_seen(void *arg)
+{
+	return branch_writers_seen(MyBranch, (Snapshot) arg);
+}
+
 /*
  * What is left of kept commit kc's pages: restorable if some table's
  * relations all are (restore_pages() can give that table its pages back);
@@ -4434,8 +5275,8 @@ kept_commit_status(const KeptCommit *kc)
  * it, and those no table can be given its pages of any more retired: a
  * retired one keeps its commit and baseline from collection, as any does,
  * until a later keep lets go of its roots (a first use may be reading
- * it), a dropped one no longer.  Neither counts toward
- * prolly.kept_commits or is offered to a move or a first use.  A commit's
+ * it), a dropped one no longer.  Neither is offered to a move or a
+ * first use.  A commit's
  * pages are gone with the change that replaced its storage (a rewrite, a
  * DROP), so the list changes with the same transaction; one whose pages
  * are gone has nothing for a first use reading the list from before to
@@ -4444,8 +5285,8 @@ kept_commit_status(const KeptCommit *kc)
  * change log on its storage: its commits are retired, not dropped.)  but:
  * an entry left as it is (NULL: none).
  *
- * Only the commits still kept are asked, no more of them than
- * prolly.kept_commits (and one a restore keeps again): a retired one is
+ * Only the newest few commits still kept are asked (and one a restore
+ * keeps again): a retired one is
  * neither counted nor offered whatever is left of its pages, and a later
  * keep lets go of what is (let go of, gone storage is passed over).  The
  * retired pile up within a transaction, each of its commits retiring one,
@@ -4456,7 +5297,7 @@ kept_commit_status(const KeptCommit *kc)
 #define KEPT_ASKED_MAX	8
 
 static List *
-kept_drop_dead(List *kept, const KeptCommit *but)
+kept_drop_dead(List *kept, const KeptCommit *but, List **gone_out)
 {
 	List	   *left = NIL;
 	List	   *gone = NIL;
@@ -4493,9 +5334,12 @@ kept_drop_dead(List *kept, const KeptCommit *but)
 	/*
 	 * (a gone commit's roots, which its page store keeps whatever became of
 	 * the storage, let go of as the transaction commits, but those another
-	 * commit left holds)
+	 * commit left holds; with gone_out, kept is only some of the branch's,
+	 * and the caller lets go of them by their counts)
 	 */
-	if (branch_ops()->let_go)
+	if (gone_out != NULL)
+		*gone_out = gone;
+	else if (branch_ops()->let_go)
 		foreach_ptr(KeptCommit, o, gone)
 			for (int t = 0; t < o->ntables; t++)
 				for (int r = 0; r < o->tables[t].nrels; r++)
@@ -4512,20 +5356,254 @@ kept_drop_dead(List *kept, const KeptCommit *but)
  */
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
 
-/*
- * Was kept commit o replaced by a commit made on parent (NULL: not known),
- * itself made on that parent?  (The parent itself, kept as a commit's
- * usually is, isn't: no commit is read for it.)
- */
-static bool
-kept_replaced(const KeptCommit *o, const ProllyHash *parent)
-{
-	ProllyCommitInfo was;
 
-	return parent != NULL && !same_hash(&o->commit, parent) &&
-		copies_commit_get(&o->commit, &was) && was.nparents > 0 &&
-		same_hash(&was.parents[0], parent);
+/* Does kept commit kc keep the same roots, relation by relation, as o? */
+static bool
+kept_same_roots(const KeptCommit *kc, const KeptCommit *o)
+{
+	if (!same_hash(&kc->commit, &o->commit) || kc->ntables != o->ntables)
+		return false;
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		if (kc->tables[t].nrels != o->tables[t].nrels)
+			return false;
+		for (int r = 0; r < kc->tables[t].nrels; r++)
+			if (kc->tables[t].rels[r].relid != o->tables[t].rels[r].relid ||
+				kc->tables[t].rels[r].snapshot != o->tables[t].rels[r].snapshot)
+				return false;
+	}
+	return true;
 }
+
+/*
+ * Let go of the roots fc's first ntables tables were frozen into, as the
+ * transaction commits: those not kc's own (unfrozen) nor shared with
+ * another frozen root (a base reused as it was).
+ */
+static void
+kept_let_go_frozen(const KeptCommit *fc, const KeptCommit *kc, int ntables,
+				   const BranchKeptRelation *prior, int nprior)
+{
+	if (branch_ops()->let_go == NULL)
+		return;
+	for (int t = 0; t < ntables; t++)
+		for (int r = 0; r < fc->tables[t].nrels; r++)
+		{
+			const BranchKeptRelation *f = &fc->tables[t].rels[r];
+			bool		reused = f->snapshot == kc->tables[t].rels[r].snapshot;
+
+			for (int p = 0; p < nprior && !reused; p++)
+				reused = prior[p].snapshot == f->snapshot &&
+					prior[p].relfilenumber == f->relfilenumber &&
+					prior[p].tablespace == f->tablespace;
+			if (!reused)
+				branch_ops()->let_go(f);
+		}
+}
+
+/*
+ * Freeze the roots of branch name's kept commit kc (of *kept, the branch's
+ * list), captured among writers (unfrozen), as of its snapshot: each of
+ * its tables still restorable made frozen roots (branch operations'
+ * freeze_kept()), from the nearest frozen roots before them in the list.
+ * The commit is kept anew by them, its unfrozen entry retired (never
+ * changed in place: a first use may be reading it, and its roots stay
+ * until this transaction is known to commit), and the list put.  The
+ * database's frozen ids are held while the roots are read, so that the
+ * transactions they hold stay known (vac_update_datfrozenxid() waits).
+ * With 'locked' the caller holds the branch already, the list as it is
+ * now; else the roots are frozen first, the branch held after, and the
+ * commit found again, kept by the same roots.  Returns the new entry, NULL
+ * if it can't be had now (a lock not free, the commit gone or changed
+ * meanwhile).
+ */
+static KeptCommit *
+kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
+{
+	ProllyDatabaseComponents dc;
+	SnapshotData snap;
+	ProllyRootSnapshot as_of;
+	BranchKeptRelation *prior;
+	int			nprior = 0;
+	KeptCommit *fc;
+	KeptCommit *at = kc;
+	uint64		pages = 0;
+
+	prolly_database_components(&dc);
+	if (!kc->unfrozen || branch_ops()->freeze_kept == NULL ||
+		branch_ops()->kept_status == NULL || dc.root_freezer == NULL ||
+		!PROLLY_HAS(dc.root_freezer, freeze_page))
+		return NULL;
+	LockDatabaseFrozenIds(ShareLock);
+	/* (the database's frozen horizon read as it is now: kept_status()) */
+	AcceptInvalidationMessages();
+	kept_snapshot(kc, &snap, &as_of);
+
+	/* (the bases: every frozen root the list keeps) */
+	foreach_ptr(KeptCommit, o, *kept)
+		if (!FullTransactionIdIsValid(o->retired) && !o->unfrozen)
+			for (int t = 0; t < o->ntables; t++)
+				nprior += o->tables[t].nrels;
+	prior = palloc_array(BranchKeptRelation, Max(nprior, 1));
+	nprior = 0;
+	foreach_ptr(KeptCommit, o, *kept)
+		if (!FullTransactionIdIsValid(o->retired) && !o->unfrozen)
+			for (int t = 0; t < o->ntables; t++)
+				for (int r = 0; r < o->tables[t].nrels; r++)
+					prior[nprior++] = o->tables[t].rels[r];
+
+	fc = palloc(sizeof(KeptCommit));
+	*fc = *kc;
+	fc->unfrozen = false;
+	fc->nxip = fc->nsubxip = fc->nown = 0;
+	fc->xip = fc->subxip = fc->own = NULL;
+	fc->tables = palloc_array(KeptTable, Max(kc->ntables, 1));
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		KeptTable  *kt = &kc->tables[t];
+		bool		restorable = true;
+
+		fc->tables[t] = *kt;
+		fc->tables[t].rels = palloc_array(BranchKeptRelation, kt->nrels);
+		memcpy(fc->tables[t].rels, kt->rels,
+			   sizeof(BranchKeptRelation) * kt->nrels);
+
+		/*
+		 * (a table past the horizon, or gone, stays unfrozen: never given
+		 * back, its commit retired as any held one is)
+		 */
+		for (int r = 0; r < kt->nrels && restorable; r++)
+			restorable = branch_ops()->kept_status(&kt->rels[r]) ==
+				BRANCH_KEPT_RESTORABLE;
+		if (restorable &&
+			!branch_ops()->freeze_kept(kt->rels, kt->nrels, fc->tables[t].rels,
+									   prior, nprior,
+									   dc.root_freezer->freeze_page, &as_of,
+									   &pages))
+		{
+			kept_let_go_frozen(fc, kc, t, prior, nprior);
+			return NULL;
+		}
+	}
+	if (!locked)
+	{
+		lock_branch(name);
+		kept_forget_name(name);
+		*kept = kept_get(name);
+		at = NULL;
+		foreach_ptr(KeptCommit, o, *kept)
+			if (at == NULL && !FullTransactionIdIsValid(o->retired) &&
+				o->unfrozen && kept_same_roots(o, kc))
+				at = o;
+		if (at == NULL)
+		{
+			kept_let_go_frozen(fc, kc, kc->ntables, prior, nprior);
+			return NULL;
+		}
+	}
+	/*
+	 * (what its roots hold, captured among writers, is known once they are
+	 * frozen: the pages the freezing copied)
+	 */
+	fc->pages = kc->pages + (int64) pages;
+	at->retired = GetTopFullTransactionId();
+	foreach_ptr(KeptCommit, o, *kept)
+		if (o == at)
+		{
+			*kept = list_insert_nth(*kept, foreach_current_index(o), fc);
+			break;
+		}
+	kept_put(name, *kept, NULL);
+	pgstat_count_prolly(PGSTAT_PROLLY_ROOTS_FROZEN_LATER, 1);
+	return fc;
+}
+
+/*
+ * Kept commit kc of branch source, as a move may give its pages back: as it
+ * is if its roots are frozen; if they were captured among writers, frozen
+ * now (the session's own branch's, the root freezer's freeze_now() asking;
+ * the caller holds the branch), or NULL, never given back as captured.
+ */
+static KeptCommit *
+kept_usable(const char *name, List **kept, KeptCommit *kc, Oid source)
+{
+	ProllyDatabaseComponents dc;
+
+	if (kc == NULL || !kc->unfrozen)
+		return kc;
+	prolly_database_components(&dc);
+	if (source != MyBranch || dc.root_freezer == NULL ||
+		!PROLLY_HAS(dc.root_freezer, freeze_now) ||
+		!dc.root_freezer->freeze_now())
+		return NULL;
+	return kept_freeze(name, kept, kc, true);
+}
+
+/*
+ * The fold worker's freezing (the refs' freeze_kept()): the oldest kept
+ * commit of the session's branch whose roots were captured among writers,
+ * frozen (kept_freeze()), or retired if it is past the horizon or gone
+ * (no table of it restorable).  1 if one was, 0 if none is left, -1 if
+ * it can't be now (to be tried again).
+ */
+static int
+copies_freeze_kept(void)
+{
+	char	   *name = branch_ops()->current();
+	List	   *kept;
+	KeptCommit *oldest = NULL;
+
+	kept_forget_name(name);
+	kept = kept_get(name);
+
+	foreach_ptr(KeptCommit, o, kept)
+		if (!FullTransactionIdIsValid(o->retired) && o->unfrozen)
+			oldest = o;
+	if (oldest == NULL)
+		return 0;
+	if (kept_commit_status(oldest) != BRANCH_KEPT_RESTORABLE)
+	{
+		lock_branch(name);
+		kept_forget_name(name);
+		kept = kept_get(name);
+		foreach_ptr(KeptCommit, o, kept)
+			if (!FullTransactionIdIsValid(o->retired) && o->unfrozen &&
+				kept_same_roots(o, oldest))
+				o->retired = GetTopFullTransactionId();
+		kept_put(name, kept, NULL);
+		return 1;
+	}
+	return kept_freeze(name, &kept, oldest, false) != NULL ? 1 : -1;
+}
+
+/*
+ * The branches with kept commits whose roots are to be frozen (the refs'
+ * unfrozen_branches()): each visited by name.
+ */
+static void
+note_unfrozen(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	List	  **names = arg;
+	*names = lappend(*names, pnstrdup((const char *) k->data + 1, k->len - 1));
+}
+
+static void
+copies_unfrozen_branches(void (*visit) (const char *name, void *arg), void *arg)
+{
+	char		prefix = TAG_KEPT_UNFROZEN;
+	List	   *names = NIL;
+
+	refs_init();
+	visit_prefix(&prefix, 1, note_unfrozen, &names);
+	foreach_ptr(char, n, names)
+		visit(n, arg);
+}
+
+static BranchKeptRelation *kept_orphans(const char *name, List *entries,
+										int *n);
+static void retain_roots(const char *name, KeptSummary *s,
+						 const ProllyHash *kept_now, bool force);
+static int64 kept_total_bytes(void);
 
 /* (parent: the commit's first parent, NULL if it has none or isn't known) */
 static void
@@ -4538,45 +5616,38 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	List	   *relids = NIL;
 	List	   *groups = NIL;	/* each table's relids */
 	List	   *names = NIL;
-	List	   *kept;
+	List	   *newest;
+	List	   *retired;
 	List	   *holding = NIL;
-	List	   *before;
 	List	   *releasing = NIL;
+	List	   *gone = NIL;
 	List	   *next = NIL;
 	BranchKeptRelation *prior;
 	BranchKeptRelation *release;
 	BranchKeptRelation *out;
 	int			nprior = 0;
 	int			nrelease = 0;
-	int			live = 1;
 	int			at = 0;
+	uint64		pages = 0;
 	KeptCommit *kc;
+	KeptSummary s;
 	ProllyNodeRef baseline;
 	ListCell   *a;
 	ListCell   *b;
+	bool		later;
+	ProllyRootSnapshot as_of;
 
-	if (prolly_kept_commits <= 0 || branch_ops()->keep == NULL ||
+	if (!debug_prolly_page_roots || branch_ops()->keep == NULL ||
 		snap == NULL || RecoveryInProgress())
 		return;
 	name = branch_ops()->current();
 	if (root_soon(name, true))
 		return;
 	INJECTION_POINT("prolly-root-kept-read", NULL);
-	kept = kept_get(name);
-	{
-		KeptCommit *newest = NULL;
-
-		foreach_ptr(KeptCommit, o, kept)
-		{
-			if (!FullTransactionIdIsValid(o->retired))
-			{
-				newest = o;
-				break;
-			}
-		}
-		if (!root_due(name, newest, commit_id))
-			return;
-	}
+	kept_forget_name(name);
+	kept_summary_get(name, &s);
+	if (!root_due(name, &s, commit_id))
+		return;
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, tables, root, NULL, note_table, &tables);
 	foreach_ptr(NamedTree, t, tables)
@@ -4593,10 +5664,18 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	}
 
 	/*
-	 * (the pages of retired commits now let go of are kept by no commit
-	 * after: those the others hold stay)
+	 * (only the newest few live entries, and the retired, are read: the
+	 * roots a keep reuses are the newest's, and the others are the
+	 * retention pass's, which reads from the oldest)
 	 */
-	foreach_ptr(KeptCommit, o, kept)
+	newest = kept_scan(name, KEPT_LIVE, true, KEPT_ASKED_MAX, true);
+	retired = kept_scan(name, KEPT_RETIRED, false, -1, true);
+
+	/*
+	 * (the pages of retired commits now let go of are kept by no commit
+	 * after: those another entry names stay)
+	 */
+	foreach_ptr(KeptCommit, o, retired)
 	{
 		if (kept_releasable(o))
 			releasing = lappend(releasing, o);
@@ -4607,11 +5686,10 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	 * (a commit dropped as gone still holds what it shares with one let go
 	 * of now: it is gone as this transaction sees the branch, and the
 	 * change that made it so may yet roll back, bringing it back, while a
-	 * snapshot let go of stays so)
+	 * root let go of stays so)
 	 */
-	before = holding;
-	holding = kept_drop_dead(holding, NULL);
-	foreach_ptr(KeptCommit, o, holding)
+	newest = kept_drop_dead(newest, NULL, &gone);
+	foreach_ptr(KeptCommit, o, newest)
 	{
 		for (int t = 0; t < o->ntables; t++)
 			nprior += o->tables[t].nrels;
@@ -4619,50 +5697,48 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	prior = palloc_array(BranchKeptRelation, Max(nprior, 1));
 	nprior = 0;
 
-	/*
-	 * (a relation unchanged since one of the newest few kept commits
-	 * reuses its root; asking each of thousands would cost a read of every
-	 * root for every relation)
-	 */
-	foreach_ptr(KeptCommit, o, holding)
+	/* (a relation unchanged since one of the newest few reuses its root) */
+	foreach_ptr(KeptCommit, o, newest)
 	{
-		if (foreach_current_index(o) >= KEPT_ASKED_MAX)
-			break;
 		for (int t = 0; t < o->ntables; t++)
 			for (int r = 0; r < o->tables[t].nrels; r++)
 				prior[nprior++] = o->tables[t].rels[r];
 	}
-	foreach_ptr(KeptCommit, o, releasing)
-	{
-		for (int t = 0; t < o->ntables; t++)
-			nrelease += o->tables[t].nrels;
-	}
-	release = palloc_array(BranchKeptRelation, Max(nrelease, 1));
-	nrelease = 0;
-	foreach_ptr(KeptCommit, o, releasing)
-	{
-		for (int t = 0; t < o->ntables; t++)
-			for (int r = 0; r < o->tables[t].nrels; r++)
-				if (!kept_holds(before, &o->tables[t].rels[r]))
-					release[nrelease++] = o->tables[t].rels[r];
-	}
+	release = kept_orphans(name, list_concat(list_copy(releasing), gone),
+						   &nrelease);
 	out = palloc0_array(BranchKeptRelation, Max(list_length(relids), 1));
 	/*
 	 * (a keep that can't be had now, a writer's lock held, isn't tried
 	 * again within the interval: under dolt.transaction_commit, every
 	 * transaction's commit would try it)
 	 */
-	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
-							kept_settled, snap, freeze_at_keep(&dc), snap))
+	kc = palloc0(sizeof(KeptCommit));
+	later = freeze_later_at_keep(&dc);
+	if (later && !kept_note_snapshot(kc, snap))
+	{
+		root_note(name, GetCurrentTimestamp());
+		return;
+	}
+	as_of.snapshot = snap;
+	as_of.nown = 0;
+	as_of.own = NULL;
+	if (later ?
+		!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
+							kept_seen, snap, NULL, NULL, true, &pages) :
+		!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
+							kept_settled, snap, freeze_at_keep(&dc), &as_of,
+							false, &pages))
 	{
 		root_note(name, GetCurrentTimestamp());
 		return;
 	}
 
-	kc = palloc0(sizeof(KeptCommit));
 	kc->kept_by = GetTopFullTransactionId();
 	kc->kept_at = GetCurrentTimestamp();
 	kc->commit = *commit_id;
+	if (!commit_height(commit_id, &kc->height))
+		kc->height = 0;
+	kc->pages = (int64) pages;
 	if (branch_baseline(name, &baseline))
 		kc->baseline = baseline.hash;
 	kc->ntables = list_length(groups);
@@ -4679,32 +5755,391 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	}
 
 	/*
-	 * (the commit first, then the others kept till there are enough; the
-	 * rest retired, let go of by a later keep once this transaction
-	 * commits, as a branch may be being made of them meanwhile.  One the
-	 * commit replaced, made on the same parent, is retired too: amended
-	 * away, or reworded or squashed by a rebase, it is no longer the
-	 * branch's, and kept it would push out the parent a reset goes back to)
+	 * (the commit first, then the others read; the commit's entry before
+	 * retired, never changed in place.  Retired, it is let go of by a later
+	 * keep once this transaction commits, as a branch may be being made of
+	 * it meanwhile.  Which others keep their roots is the retention
+	 * pass's: a commit another made on the same parent replaced, amended
+	 * away or reworded by a rebase, may still be another branch's head)
 	 */
 	next = list_make1(kc);
-	foreach_ptr(KeptCommit, o, holding)
+	foreach_ptr(KeptCommit, o, newest)
 	{
-		if (FullTransactionIdIsValid(o->retired))
-			next = lappend(next, o);
-		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits &&
-				 !kept_replaced(o, parent))
-		{
-			next = lappend(next, o);
-			live++;
-		}
-		else
-		{
+		if (!FullTransactionIdIsValid(o->retired) &&
+			same_hash(&o->commit, commit_id))
 			o->retired = GetTopFullTransactionId();
-			next = lappend(next, o);
+		next = lappend(next, o);
+	}
+	next = list_concat(next, holding);
+	s.keeps++;
+	s.last_at = kc->kept_at;
+	s.last_height = kc->height;
+	kept_put(name, next, &s);
+	root_note(name, kc->kept_at);
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		bool		listed = false;
+
+		foreach_ptr(char, n, retain_pending)
+			listed |= strcmp(n, name) == 0;
+		if (!listed)
+			retain_pending = lappend(retain_pending, pstrdup(name));
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/* Do kept roots a and b name the same root (as kept_holds() compares)? */
+static bool
+same_root(const BranchKeptRelation *a, const BranchKeptRelation *b)
+{
+	return a->snapshot == b->snapshot && a->tablespace == b->tablespace &&
+		(b->snapshot != BRANCH_KEPT_STORAGE ||
+		 a->relfilenumber == b->relfilenumber);
+}
+
+/* How many times entry o names root k (as kept_put() counts them). */
+static int64
+entry_names(const KeptCommit *o, const BranchKeptRelation *k)
+{
+	int64		n = 0;
+
+	for (int t = 0; t < o->ntables; t++)
+		for (int r = 0; r < o->tables[t].nrels; r++)
+			if (same_root(&o->tables[t].rels[r], k))
+				n++;
+	return n;
+}
+
+/*
+ * The roots of entries (being dropped from branch name's) that no other
+ * entry names: each once, for the keep to let go of.
+ */
+static BranchKeptRelation *
+kept_orphans(const char *name, List *entries, int *n)
+{
+	int			total = 0;
+	BranchKeptRelation *out;
+
+	foreach_ptr(KeptCommit, o, entries)
+		for (int t = 0; t < o->ntables; t++)
+			total += o->tables[t].nrels;
+	out = palloc_array(BranchKeptRelation, Max(total, 1));
+	*n = 0;
+	foreach_ptr(KeptCommit, o, entries)
+		for (int t = 0; t < o->ntables; t++)
+			for (int r = 0; r < o->tables[t].nrels; r++)
+			{
+				const BranchKeptRelation *k = &o->tables[t].rels[r];
+				int64		named = 0;
+				bool		listed = false;
+
+				for (int i = 0; i < *n && !listed; i++)
+					listed = same_root(&out[i], k);
+				if (listed)
+					continue;
+				/* (named by none but those dropped) */
+				foreach_ptr(KeptCommit, d, entries)
+					named += entry_names(d, k);
+				if (kept_holders_of(name, k) <= named)
+					out[(*n)++] = *k;
+			}
+	return out;
+}
+
+typedef struct KeptOf
+{
+	List	   *names;
+} KeptOf;
+
+static bool note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg);
+
+/*
+ * Does a branch but name keep commit's pages, held against its own
+ * keeps and passes until the transaction ends?  Each branch the index of
+ * kept commits names is tried, never waited for (one in a keeping
+ * transaction now is passed over: its pass may be letting go of its
+ * own), and its entry read again once held.  So two branches' passes
+ * can't each let go of their root on the strength of the other's: the
+ * second waits for the first's branch, and finds its entry retired.
+ */
+static bool
+kept_by_other(const char *name, const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	KeptOf		ko = {NIL};
+
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_KEPT_OF);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
+	pfree(prefix.data);
+	foreach_ptr(char, other, ko.names)
+	{
+		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
+			continue;
+		if (kept_lookup(other, commit, false) != NULL)
+		{
+			INJECTION_POINT("prolly-root-kept-elsewhere", NULL);
+			return true;
 		}
 	}
-	kept_put(name, next);
-	root_note(name, kc->kept_at);
+	return false;
+}
+
+/* Does a tag name commit (a seek of the tags' index)? */
+static bool
+commit_tagged(const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	bool		found = false;
+
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_TAGGED);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_found, &found);
+	pfree(prefix.data);
+	return found;
+}
+
+typedef struct RetainScan
+{
+	const ProllyRootRetentionRoutine *rr;
+	void	   *pass;
+	const char *name;
+	const ProllyHash *kept_now;
+	int64		left;			/* live entries not retired */
+	bool		from_newest;
+	bool		stopping;		/* kept one the pass ends at: only the
+								 * others of its height are judged */
+	int64		stop_height;
+	List	   *retire;
+} RetainScan;
+
+static bool
+retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	RetainScan *rs = arg;
+	KeptCommit *o = kept_decode((const char *) k->data, k->len,
+								(const char *) v->data,
+								(const char *) v->data + v->len);
+	ProllyRetainedRoot r;
+	ProllyRootVerdict verdict;
+
+	/*
+	 * (commits of the same height, as one amended or made again after a
+	 * reset and the one it replaced, are in no order: each is judged)
+	 */
+	if (rs->stopping && o->height != rs->stop_height)
+		return false;
+	memset(&r, 0, sizeof(r));
+	r.commit = o->commit;
+	r.height = o->height;
+	r.bytes = o->pages * BLCKSZ;
+	r.kept_at = o->kept_at;
+	r.newest = rs->left <= 1 ||
+		(rs->kept_now != NULL && same_hash(&o->commit, rs->kept_now));
+	r.tagged = commit_tagged(&o->commit);
+	r.from_newest = rs->from_newest;
+	verdict = rs->rr->judge(rs->pass, &r);
+	if (verdict == PROLLY_ROOT_RETIRE_IF_KEPT)
+		verdict = kept_by_other(rs->name, &o->commit) ? PROLLY_ROOT_RETIRE :
+			PROLLY_ROOT_PASS;
+	switch (verdict)
+	{
+		case PROLLY_ROOT_RETIRE:
+			if (r.newest || r.tagged)
+				return false;	/* (never: the routine's contract) */
+			kept_note_loaded(rs->name, k, v);
+			o->retired = GetTopFullTransactionId();
+			rs->retire = lappend(rs->retire, o);
+			rs->left--;
+			return true;
+		case PROLLY_ROOT_PASS:
+			return true;
+		case PROLLY_ROOT_STOP:
+		default:
+			rs->stopping = true;
+			rs->stop_height = o->height;
+			return true;
+	}
+}
+
+/*
+ * A retention pass of branch name's roots, if the root retention routine
+ * says one is due (or forced): its live entries from the oldest, each
+ * retired that the routine retires, until it keeps one (it may pass over
+ * a tag's, which it keeps, and go on).  So the pass reads the entries it
+ * retires and the tags' it passes over, not every one the branch keeps;
+ * what the routine reads to judge them (the window) is its own.
+ * kept_now: the commit just kept, never retired (NULL: none).  Retired,
+ * an entry is let go of by a later keep, as any retired is.
+ */
+static void
+retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
+			 bool force)
+{
+	ProllyDatabaseComponents dc;
+	RetainScan	rs;
+	StringInfoData prefix;
+	int64		excess = 0;
+	int64		cap;
+	int64		left;
+	bool		due;
+
+	prolly_database_components(&dc);
+	if (dc.root_retention == NULL || !PROLLY_HAS(dc.root_retention, judge) ||
+		s->nlive <= 1)
+		return;
+	due = force || dc.root_retention->due(name, s->nlive, s->keeps);
+
+	/*
+	 * (past the cap, a pass thins without the windows' walk; one that found
+	 * nothing more to thin isn't tried again till what the branch holds
+	 * changes)
+	 */
+	cap = dc.root_retention->max_bytes();
+	if (cap > 0 && (due || s->stuck != s->bytes))
+		excess = kept_total_bytes() - cap;
+	if (!due && excess <= 0)
+		return;
+	memset(&rs, 0, sizeof(rs));
+	rs.rr = dc.root_retention;
+	rs.name = name;
+	rs.kept_now = kept_now;
+	rs.left = s->nlive;
+	rs.pass = rs.rr->begin(name, excess, due);
+	if (due)
+		s->keeps = 0;
+	initStringInfo(&prefix);
+	kept_prefix(&prefix, name, KEPT_LIVE);
+
+	/* (from the oldest, as history ages) */
+	kept_forget_name(name);
+	visit_prefix_while(prefix.data, prefix.len, false, retain_one, &rs);
+	kept_put(name, rs.retire, s);
+
+	/*
+	 * (then from the newest: a commit reset away from, or amended away, is
+	 * above what the branch has now, and out of every window once no
+	 * other branch has it)
+	 */
+	rs.retire = NIL;
+	rs.from_newest = true;
+	rs.stopping = false;
+	kept_forget_name(name);
+	visit_prefix_while(prefix.data, prefix.len, true, retain_one, &rs);
+	left = rs.rr->end(rs.pass);
+	kept_put(name, rs.retire, s);
+	pfree(prefix.data);
+	if ((excess > 0 && left > 0 ? s->bytes : -1) != s->stuck)
+	{
+		s->stuck = excess > 0 && left > 0 ? s->bytes : -1;
+		kept_summary_put(name, s);
+	}
+}
+
+/* The passes due of the branches the transaction kept commits of. */
+static void
+retain_kept_branches(void)
+{
+	List	   *names = retain_pending;
+
+	retain_pending = NIL;
+	/*
+	 * (a transaction made read-only after its keep, as a detached
+	 * checkout's is, leaves the pass to the branch's next keep)
+	 */
+	if (XactReadOnly || RecoveryInProgress())
+		return;
+	foreach_ptr(char, name, names)
+	{
+		KeptSummary s;
+
+		if (!branch_exists(name))
+			continue;
+		kept_summary_get(name, &s);
+		retain_roots(name, &s, NULL, false);
+	}
+}
+
+static bool
+note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	KeptOf	   *ko = arg;
+	const char *p = (const char *) k->data + 1;
+	const char *end = (const char *) k->data + k->len;
+	ProllyHash	commit;
+
+	p = get_hash(p, end, &commit);
+	ko->names = lappend(ko->names, pnstrdup(p, end - p));
+	return true;
+}
+
+/*
+ * Retire every branch's kept commit commit, severed: its history is past
+ * the horizon, cold, so its root is let go of by the branch's next keep,
+ * and its commit and trees no longer kept from collection meanwhile.
+ * The caller holds every ref.  A seek of the index of kept commits.
+ */
+static void
+copies_forget_kept(const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	KeptOf		ko = {NIL};
+
+	refs_init();
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_KEPT_OF);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
+	pfree(prefix.data);
+	foreach_ptr(char, name, ko.names)
+	{
+		KeptCommit *kc;
+
+		kept_forget_name(name);
+		if ((kc = kept_lookup(name, commit, true)) == NULL)
+			continue;
+		kc->retired = GetTopFullTransactionId();
+		kc->severed = true;
+		/* (naming none of the history: only its roots, to let go of) */
+		memset(&kc->commit, 0, sizeof(kc->commit));
+		memset(&kc->baseline, 0, sizeof(kc->baseline));
+		for (int t = 0; t < kc->ntables; t++)
+			memset(&kc->tables[t].data, 0, sizeof(kc->tables[t].data));
+		kept_put(name, list_make1(kc), NULL);
+	}
+}
+
+static void
+copies_retain_roots(const char *name)
+{
+	KeptSummary s;
+
+	refs_init();
+	lock_branch(name);
+	kept_summary_get(name, &s);
+	retain_roots(name, &s, NULL, true);
+}
+
+static void
+note_summary_bytes(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	int64	   *total = arg;
+
+	if (v->len == KEPT_SUMMARY_FIELDS * 8)
+		*total += (int64) get_be64_at((const char *) v->data + 8);
+}
+
+/* What every branch's live roots hold, by their summaries. */
+static int64
+kept_total_bytes(void)
+{
+	char		prefix = TAG_KEPT_SUMMARY;
+	int64		total = 0;
+
+	visit_prefix(&prefix, 1, note_summary_bytes, &total);
+	return total;
 }
 
 /*
@@ -5035,7 +6470,7 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	 */
 	if (!other)
 	{
-		*kept = kept_drop_dead(lcons(kc, *kept), kc);
+		*kept = kept_drop_dead(lcons(kc, *kept), kc, NULL);
 		was->retired = GetTopFullTransactionId();
 	}
 	else if (own != NIL)
@@ -5103,17 +6538,21 @@ note_other_kept(const char *name, const ProllyHash *commit, void *arg)
 static KeptCommit *
 kept_anywhere(List *kept, const ProllyHash *id, Oid *source)
 {
-	KeptCommit *kc = kept_find(kept, id);
+	KeptCommit *kc = NULL;
 	OtherKept	ok = {branch_ops()->current(), NULL};
 	HeapTuple	tup;
 
+	/* (a seek first: the list is the branch's every kept commit) */
 	*source = MyBranch;
+	if (kept_lookup(ok.current, id, false) != NULL)
+		kc = kept_find(kept, id);
 	if (kc != NULL && kc->baseline.len > 0)
 		return kc;
 	copies_kept_holders(id, NULL, note_other_kept, &ok);
 	if (ok.name == NULL)
 		return NULL;
-	kc = kept_find(kept_get(ok.name), id);
+	/* (another branch's, read as it is, never put) */
+	kc = kept_lookup(ok.name, id, false);
 	if (kc == NULL || kc->baseline.len == 0)
 		return NULL;
 	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(ok.name));
@@ -5125,9 +6564,8 @@ kept_anywhere(List *kept, const ProllyHash *id, Oid *source)
 }
 
 /*
- * The lowest height of the oldest commit any branch's list keeps (its last
- * entry not retired): -1 if none, or one's height isn't known.  (A visit of
- * the refs' TAG_KEPT entries, reading each one's first height alone.)
+ * The lowest height of the oldest commit any branch keeps (not retired):
+ * -1 if none.  (A visit of the branches' summaries.)
  */
 typedef struct LowestKept
 {
@@ -5140,11 +6578,9 @@ note_lowest_kept(const ProllyKey *k, const ProllyValue *v, void *arg)
 	LowestKept *lk = arg;
 	int64		h;
 
-	if (k->len == 0 || k->data[0] != TAG_KEPT)
-		return;
-	if (v->len < sizeof(h))
+	if (v->len != KEPT_SUMMARY_FIELDS * 8)
 		kept_corrupt();
-	memcpy(&h, v->data, sizeof(h));
+	h = (int64) get_be64_at((const char *) v->data + 3 * 8);
 	if (h < 0)
 		return;
 	if (lk->lowest < 0 || h < lk->lowest)
@@ -5158,7 +6594,7 @@ nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
 	ProllyHash	id;
 	int64		lowest;
 	LowestKept	lk = {-1};
-	char		prefix = TAG_KEPT;
+	char		prefix = TAG_KEPT_SUMMARY;
 
 	if (commit->nparents == 0)
 		return NULL;
@@ -5173,7 +6609,9 @@ nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
 			return NULL;
 		if (lowest >= 0 && info->has_height && info->height < lowest)
 			return NULL;
-		if ((kc = kept_anywhere(kept, &id, source)) != NULL)
+		/* (another branch's roots not frozen yet: never given back here) */
+		if ((kc = kept_anywhere(kept, &id, source)) != NULL &&
+			(!kc->unfrozen || *source == MyBranch))
 			return kc;
 		if (info->nparents == 0)
 			return NULL;
@@ -5209,19 +6647,21 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyNodeRef baseline;
 	ProllyHash	head;
 	ProllyCommitInfo at_head;
-	Oid			source;
+	Oid			source = MyBranch;
 
-	if (prolly_kept_commits <= 0 || branch_ops()->restore == NULL ||
+	if (!debug_prolly_page_roots || branch_ops()->restore == NULL ||
 		RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
 	if (dc.canonicalizer->splice_baseline == NULL)
 		return;
 	name = branch_ops()->current();
+	kept_forget_name(name);
 	kept = kept_get(name);
 	if (!branch_baseline(name, &baseline))
 		return;
-	was = kept_anywhere(kept, &commit->id, &source);
+	was = kept_usable(name, &kept, kept_anywhere(kept, &commit->id, &source),
+					  source);
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
 					 &restored);
@@ -5233,8 +6673,10 @@ restore_pages(const ProllyCommitInfo *commit)
 	if (was != NULL && source != MyBranch && restored == NIL)
 		was = NULL;
 	if (was == NULL &&
-		(was = nearest_kept(kept, commit, &at_head, &source)) != NULL &&
-			 !(branch_head(name, &head) && same_hash(&head, &at_head.id)))
+		(was = kept_usable(name, &kept,
+						   nearest_kept(kept, commit, &at_head, &source),
+						   source)) != NULL &&
+		!(branch_head(name, &head) && same_hash(&head, &at_head.id)))
 	{
 		int			before = list_length(restored);
 
@@ -5247,8 +6689,15 @@ restore_pages(const ProllyCommitInfo *commit)
 		if (list_length(restored) > before)
 			branch_note_head_restore(MyBranch);
 	}
+	/*
+	 * (the head's roots frozen for it only if a table is left that they
+	 * could give back)
+	 */
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
-		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
+		(was = kept_find(kept, &head)) != NULL &&
+		!(was->unfrozen && list_length(restored) >= was->ntables) &&
+		(was = kept_usable(name, &kept, was, MyBranch)) != NULL &&
+		was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
 	{
 		int			before = list_length(restored);
@@ -5260,7 +6709,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	}
 	if (restored == NIL)
 		return;
-	kept_put(name, kept);
+	kept_put(name, kept, NULL);
 	branch_set_baseline(name, &baseline, NULL);
 }
 
@@ -5904,7 +7353,7 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	ProllyNodeRef spliced;
 
 	prolly_database_components(&dc);
-	if (prolly_kept_commits <= 0 || branch_ops()->make_kept == NULL ||
+	if (!debug_prolly_page_roots || branch_ops()->make_kept == NULL ||
 		dc.canonicalizer->splice_baseline == NULL ||
 		dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return false;
@@ -8546,12 +9995,17 @@ copies_branch_delete(const char *name, bool force)
 	 * dropped, as no session is on the branch; the entry read first, for
 	 * the indexes of what it holds now; and its name folded)
 	 */
-	if (branch_ops()->let_go)
-		foreach_ptr(KeptCommit, kc, kept_get(name))
-			for (int t = 0; t < kc->ntables; t++)
-				for (int r = 0; r < kc->tables[t].nrels; r++)
-					branch_ops()->let_go(&kc->tables[t].rels[r]);
-	kept_put(name, NIL);
+	kept_forget_name(name);
+	{
+		List	   *all = kept_get(name);
+
+		if (branch_ops()->let_go)
+			foreach_ptr(KeptCommit, kc, all)
+				for (int t = 0; t < kc->ntables; t++)
+					for (int r = 0; r < kc->tables[t].nrels; r++)
+						branch_ops()->let_go(&kc->tables[t].rels[r]);
+		kept_put(name, NIL, NULL);
+	}
 	folded_index_set(name, false);
 	forget_read_caches();
 }
@@ -8574,6 +10028,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	ProllyHash	head_root;
 	bool		had_root;
 	bool		had_head_root;
+	KeptSummary summary;
 
 	lock_branch(name);
 	lock_branch(newname);
@@ -8621,10 +10076,12 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	 * as their entries are: let go of under the old name, made again under
 	 * the new)
 	 */
+	kept_forget_name(name);
+	kept_summary_get(name, &summary);
 	kept = kept_get(name);
 	had_root = branch_baseline_root(name, &root);
 	had_head_root = head_root_get(name, &head_root);
-	kept_put(name, NIL);
+	kept_put(name, NIL, NULL);
 	head_index_set(name, had_head_root ? &head_root : NULL, NULL);
 	baseline_index_set(name, had_root ? &root : NULL, NULL);
 	folded_index_set(name, false);
@@ -8661,7 +10118,13 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		pfree(key.data);
 		pfree(v.data);
 	}
-	kept_put(newname, kept);
+	/* (its times kept; what it holds counted again as its entries are put) */
+	kept_forget_name(newname);
+	summary.bytes = 0;
+	summary.nlive = 0;
+	summary.nunfrozen = 0;
+	summary.next_seq = 1;
+	kept_put(newname, kept, &summary);
 	if (had_head_root)
 		head_index_set(newname, NULL, &head_root);
 	if (had_root)
@@ -9621,7 +11084,6 @@ lock_for_restore(const char *ref)
 {
 	ProllyDatabaseComponents dc;
 	char	   *name;
-	List	   *kept;
 	List	   *planned = NIL;
 	List	   *relids = NIL;
 	ProllyHash	head;
@@ -9632,25 +11094,23 @@ lock_for_restore(const char *ref)
 	KeptCommit *was;
 	Oid			waited = InvalidOid;
 
-	if (whole || prolly_kept_commits <= 0 ||
+	if (whole || !debug_prolly_page_roots ||
 		branch_ops()->changed_since_kept == NULL || RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
 	name = branch_ops()->current();
-	kept = kept_get(name);
-	if (kept == NIL || !branch_baseline(name, &baseline) ||
+	if (!branch_baseline(name, &baseline) ||
 		!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
 		return;
-	was = kept_find(kept, &target);
+	/* (each a seek; read again once the refs are held) */
+	was = kept_lookup(name, &target, false);
 	if (was != NULL && was->baseline.len > 0)
 		plan_restore(&dc, was, &info.root, NULL, &baseline, &planned, &relids);
 	if (branch_head(name, &head) && !same_hash(&head, &target) &&
-		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
-		copies_commit_get(&head, &at_head))
+		(was = kept_lookup(name, &head, false)) != NULL &&
+		was->baseline.len > 0 && copies_commit_get(&head, &at_head))
 		plan_restore(&dc, was, &at_head.root, &info.root, &baseline,
 					 &planned, &relids);
-	/* (read again once the refs are held) */
-	kept_read_name = NULL;
 	if (relids == NIL)
 		return;
 
@@ -10663,6 +12123,52 @@ visit_prefix(const char *prefix, int prefixlen,
 	PROLLY_CALL(tree, cursor_close, c);
 }
 
+/*
+ * As visit_prefix() (backward: in reverse key order), until visit returns
+ * false.
+ */
+static void
+visit_prefix_while(const char *prefix, int prefixlen, bool backward,
+				   bool (*visit) (const ProllyKey *k, const ProllyValue *v,
+								  void *arg),
+				   void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	StringInfoData seek;
+	ProllyKey	from;
+	ProllyKey	k;
+	ProllyValue v;
+
+	if (!refs_root(&root))
+		return;
+	/* (backward, from past every key with the prefix) */
+	initStringInfo(&seek);
+	appendBinaryStringInfo(&seek, prefix, prefixlen);
+	if (backward)
+		for (int i = 0; i < PROLLY_HASH_MAX_LEN + 16; i++)
+			appendStringInfoChar(&seek, '\377');
+	from.data = (const uint8 *) seek.data;
+	from.len = seek.len;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from,
+				backward ? BackwardScanDirection : ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= prefixlen && memcmp(k.data, prefix, prefixlen) == 0 &&
+		   visit(&k, &v, arg))
+		;
+	PROLLY_CALL(tree, cursor_close, c);
+	pfree(seek.data);
+}
+
+/* A visit_prefix_while() visit: found, and stop. */
+static bool
+note_found(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	*(bool *) arg = true;
+	return false;
+}
+
 /* a ref a root named, for copies_root_refs() to sort */
 typedef struct RootRef
 {
@@ -11575,6 +13081,20 @@ copies_tag_lookup(const char *name, ProllyHash *tag)
 	return tag_entry(name, tag, NULL);
 }
 
+/* Index tag name as commit's (present), or no longer. */
+static void
+tagged_index_set(const ProllyHash *commit, const char *name, bool present)
+{
+	StringInfoData key;
+
+	initStringInfo(&key);
+	appendStringInfoChar(&key, TAG_TAGGED);
+	put_hash(&key, commit);
+	appendStringInfoString(&key, name);
+	index_put(&key, present);
+	pfree(key.data);
+}
+
 /*
  * Call name tag (NULL: delete it), if the tag called name is expected's
  * (NULL: whatever it is; an empty hash: there is none).  The refs are held
@@ -11585,6 +13105,7 @@ static bool
 copies_tag_set(const char *name, const ProllyHash *expected,
 			   const ProllyHash *tag)
 {
+	ProllyHash	was_commit;
 	ProllyHash	cur;
 	bool		exists;
 	ProllyTagInfo info;
@@ -11593,7 +13114,7 @@ copies_tag_set(const char *name, const ProllyHash *expected,
 
 	refs_init();
 	lock_refs();
-	exists = tag_entry(name, &cur, NULL);
+	exists = tag_entry(name, &cur, &was_commit);
 	if (expected != NULL &&
 		(expected->len == 0 ? exists : !(exists && same_hash(&cur, expected))))
 		return false;
@@ -11629,6 +13150,11 @@ copies_tag_set(const char *name, const ProllyHash *expected,
 		put_hash(&v, &info.commit);
 	}
 	refs_put(key.data, key.len, tag ? &v : NULL);
+	/* (and the index of tags by commit: a tagged commit keeps its root) */
+	if (exists)
+		tagged_index_set(&was_commit, name, false);
+	if (tag)
+		tagged_index_set(&info.commit, name, true);
 	/* (a tag deleted, made or moved is no one's until its maker is told) */
 	maker_put(TAG_TAG_CREATOR, name, InvalidOid);
 	pfree(key.data);
@@ -12952,6 +14478,11 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
+	.retain_roots = copies_retain_roots,
+	.kept_commit = copies_kept_commit,
+	.forget_kept = copies_forget_kept,
+	.unfrozen_branches = copies_unfrozen_branches,
+	.freeze_kept = copies_freeze_kept,
 	.kept_holders = copies_kept_holders,
 	.recorded_relid = copies_recorded_relid,
 	.branch_creator = copies_branch_creator,

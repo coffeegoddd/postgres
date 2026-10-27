@@ -116,8 +116,12 @@ UPDATE kc.t SET v = 5 WHERE id <= 30;
 SELECT (dolt_commit('-am', 'c'))[1] AS c \gset
 SELECT rows_digest() AS at_c \gset
 SELECT dolt_commit('--allow-empty', '-m', 'empty') IS NOT NULL AS committed;
--- (a no longer kept: its rows written, then kept with the empty commit)
+-- (c's root let go of once a reset leaves it out of the window, the empty
+-- commit's kept by a tag, and a's and b's in the window, three commits)
+SELECT dolt_tag('empty', 'HEAD');
+ALTER DATABASE kept_carried SET prolly.history_min_commits = 3;
 SELECT dolt_reset('--hard', :'a');
+SELECT test_retain_roots('main');
 SELECT count(*) AS kept FROM test_kept_commits('main');
 UPDATE kc.t SET v = v + 10 WHERE id % 7 = 2;
 SELECT pg_stat_force_next_flush();
@@ -135,6 +139,8 @@ SELECT pg_stat_force_next_flush();
 SELECT counted('relations_restored') > :r AS restored,
 	   counted('apply_rows') - :ap AS applied, rows_digest() = :'at_a' AS as_a,
 	   indexes_valid();
+
+ALTER DATABASE kept_carried RESET prolly.history_min_commits;
 
 -- every block the stores hold is held by a map or a snapshot kept
 SELECT dolt_commit('--allow-empty', '-m', 'settled') IS NOT NULL AS committed;

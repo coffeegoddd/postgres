@@ -49,6 +49,8 @@ PG_PROLLY_IMPL(ProllyNodeCacheRoutine, prolly_nodecache_shared)
 PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_shared)
 PG_PROLLY_IMPL(ProllyWindowRoutine, prolly_window_archive)
 PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_capture)
+PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_lazy)
+PG_PROLLY_IMPL(ProllyRootRetentionRoutine, prolly_rootretain_window)
 
 /* row appliers; the stub is the interface's */
 PG_PROLLY_IMPL(ProllyApplierRoutine, prolly_applier_replication)
@@ -78,3 +80,4 @@ PG_PROLLY_IMPL(ProllyNodeCacheRoutine, prolly_nodecache_stub)
 PG_PROLLY_IMPL(ProllyCommitCacheRoutine, prolly_commitcache_stub)
 PG_PROLLY_IMPL(ProllyWindowRoutine, prolly_window_stub)
 PG_PROLLY_IMPL(ProllyRootFreezerRoutine, prolly_rootfreeze_stub)
+PG_PROLLY_IMPL(ProllyRootRetentionRoutine, prolly_rootretain_stub)

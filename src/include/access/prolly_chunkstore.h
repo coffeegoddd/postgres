@@ -484,6 +484,17 @@ typedef struct ProllyChunkStoreRoutine
 								ProllyChunkGenerationVisit visit, void *arg);
 	void		(*epochs) (ProllyChunkStore *store, ProllyChunkEpochVisit visit,
 						   void *arg);
+
+	/*
+	 * Optional: settle what roots reach, in the transaction: each chunk
+	 * they reach that no settled file holds (down to those one does)
+	 * written to a settled table file, as add_table_file() writes one.
+	 * For chunks only a settled file's chunks name (history a repair
+	 * reattached below a boundary commit): a default collection, which
+	 * keeps settled files whole without reading them, never frees them.
+	 */
+	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
+						   int nroots);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -498,9 +509,10 @@ typedef struct ProllyChunkStoreRoutine
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
-	"root_free", "wait_root_free", "generation", "generations", "epochs"
+	"root_free", "wait_root_free", "generation", "generations", "epochs", \
+	"settle"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK epochs
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK settle
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

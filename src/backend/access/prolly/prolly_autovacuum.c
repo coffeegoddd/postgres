@@ -198,14 +198,6 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
-	DefineCustomIntVariable("prolly.kept_commits",
-							"How many of the commits each branch was last at its pages are kept as of.",
-							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",
-							&prolly_kept_commits,
-							2, 0, 1000000,
-							PGC_USERSET,
-							0,
-							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.root_interval",
 							"The least time between the commits a branch's pages are kept as of.",
 							"A move to a commit between them restores the nearest kept one before it and writes the rows they differ by.  -1: every commit, or a second under dolt.transaction_commit.",
@@ -224,7 +216,7 @@ prolly_autovacuum_init(void)
 							NULL, NULL, NULL);
 	DefineCustomBoolVariable("prolly.freeze_roots",
 							 "Freeze the roots a commit captures as the commit keeps them.",
-							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are (as under dolt.transaction_commit, whose roots aren't frozen as captured).",
+							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are.  Under dolt.transaction_commit roots are captured among the writers and frozen later, in the background, or by a move to their commit; off, they are kept only while no other writer is at work.",
 							 &prolly_freeze_roots,
 							 true,
 							 PGC_USERSET,
