@@ -340,6 +340,9 @@ ALTER DATABASE regress_history_window_g SET prolly.history_window_action = delet
 SELECT pg_sleep(1.5);
 \c regress_history_window_g
 \set VERBOSITY terse
+-- (the window evaluated for others, quietly: plan() and sever() warn)
+SELECT l.message, prolly_history_in_window('main', l.commit_hash) AS in_window
+FROM dolt_log('main') l ORDER BY l.commit_order;
 SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
 	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
 WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
