@@ -245,6 +245,36 @@ SELECT warm FROM prolly_history_policy('main');
 \c regress_history_window
 DROP DATABASE regress_history_window_d;
 
+-- A tag on main's history keeps itself, not the path to it: a merge, or
+-- a three-dot diff, of it across the path severed says so; it never finds
+-- no merge base and takes the histories as unrelated.
+CREATE DATABASE regress_history_window_e;
+\c regress_history_window_e
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'a10');
+SELECT length(dolt_commit('-Am', 'a10', '--date', (now() - interval '10 days')::text)::text) > 0 AS committed;
+SELECT dolt_tag('old', 'HEAD') IS NOT NULL AS tagged;
+UPDATE hw.t SET v = 'a8';
+SELECT length(dolt_commit('-am', 'a8', '--date', (now() - interval '8 days')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a1';
+SELECT length(dolt_commit('-am', 'a1', '--date', (now() - interval '1 day')::text)::text) > 0 AS committed;
+UPDATE hw.t SET v = 'a0';
+SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::text)::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_e SET prolly.history_window_action = delete;
+SELECT fragment, commits FROM dolt_history_drop(now() - interval '3 days');
+CREATE FUNCTION hw_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+SELECT hw_err($$SELECT dolt_merge('old')$$) AS merge_of_tag;
+SELECT hw_err($$SELECT count(*) FROM dolt_diff('old...main', NULL::hw.t)$$) AS three_dot_diff;
+\c regress_history_window
+DROP DATABASE regress_history_window_e;
+
 \c :home
 DROP DATABASE regress_history_window;
 DROP ROLE regress_hw_other;
