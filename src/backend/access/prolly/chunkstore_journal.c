@@ -411,6 +411,7 @@ typedef struct TableFile
 	File		file;
 	uint64		size;
 	bool		settled;
+	uint32		epoch_lo;		/* its first generation (0: not settled) */
 	ProllyTableFile *tf;
 	void	   *mapped;			/* its index, mapped (NULL: read) */
 	Size		mapped_len;
@@ -3872,6 +3873,7 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 	t->path = table_file_path(dir, t->id);
 	t->size = f->size;
 	t->settled = (f->flags & MANIFEST_FILE_SETTLED) != 0;
+	t->epoch_lo = f->epoch_lo;
 	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
 	MemoryContextSwitchTo(old);
 	if (t->file < 0)
@@ -6906,6 +6908,9 @@ typedef struct SettleSource
 	ListCell   *cur;
 	HTAB	   *settling;		/* SettledChunk: every group's so far */
 	const Manifest *m;
+	ProllySettleAbsent absent;	/* the caller's, for what isn't here */
+	void	   *absent_arg;
+	uint32		group_lo;		/* the group's first generation */
 } SettleSource;
 
 /* a chunk settle() writes, and the generation of the file it is in */
@@ -6933,7 +6938,22 @@ settle_resolve(void *arg, const ProllyHash *target, bool *always)
 	if (sc != NULL)
 		return sc->epoch;
 	f = settled_file(ss->s, ss->m, &key);
-	return f >= 0 ? ss->m->files[f].epoch_lo : 0;
+	if (f >= 0)
+		return ss->m->files[f].epoch_lo;
+
+	/*
+	 * Not here: a severed fragment's top, which a repair later puts back
+	 * in the generation its fragment says, listed by that one.
+	 */
+	if (ss->absent != NULL && !stored_has(ss->s, &key))
+	{
+		uint32		epoch = ss->absent(ss->absent_arg, target, ss->group_lo);
+
+		if (epoch > 0)
+			*always = true;
+		return epoch;
+	}
+	return 0;
 }
 
 static bool
@@ -6989,7 +7009,9 @@ static int
 settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
 {
 	ListCell   *lc;
+	int			oldest = -1;
 
+	/* (the copy of the oldest generation, if several files hold one) */
 	foreach(lc, s->tables)
 	{
 		TableFile  *t = lfirst(lc);
@@ -6997,15 +7019,16 @@ settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
 		uint32		len;
 
 		if (!t->settled ||
+			(oldest >= 0 && t->epoch_lo >= m->files[oldest].epoch_lo) ||
 			!PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
 			continue;
 		for (int i = 0; i < m->nfiles; i++)
 		{
 			if (m->files[i].id == t->id)
-				return i;
+				oldest = i;
 		}
 	}
-	return -1;
+	return oldest;
 }
 
 /* settle()'s: a root, and the generation the settled files list it by */
@@ -7013,6 +7036,7 @@ typedef struct SettleRoot
 {
 	ProllyHash	hash;			/* key */
 	uint32		epoch;			/* (0: none lists it) */
+	uint32		given;			/* the caller's (0: none) */
 } SettleRoot;
 
 static void
@@ -7061,7 +7085,9 @@ settle_root_cmp(const void *a, const void *b)
  * files asked which has it.  The settled files' sections are read once.
  */
 static void
-journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
+journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
+			   const uint32 *epochs, int nroots, ProllySettleAbsent absent,
+			   void *arg)
 {
 	Manifest	m;
 	bool	   *keep;
@@ -7100,8 +7126,10 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 	listed = hash_create("prolly settle roots", 16, &ctl,
 						 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	ss.m = &m;
+	ss.absent = absent;
+	ss.absent_arg = arg;
 
-	/* the generations the roots are listed by */
+	/* the generations the roots go back to, or are listed by */
 	for (int i = 0; i < nroots; i++)
 	{
 		ProllyHash	key;
@@ -7114,6 +7142,7 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 		r = hash_search(listed, &key, HASH_ENTER, &found);
 		if (!found)
 			r->epoch = 0;
+		r->given = epochs ? epochs[i] : 0;
 	}
 	foreach(lc, s->tables)
 	{
@@ -7134,8 +7163,11 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 		hash_seq_init(&status, listed);
 		while ((r = hash_seq_search(&status)) != NULL)
 		{
-			order[nordered++] = *r;
-			newest_listed = Max(newest_listed, r->epoch);
+			order[nordered] = *r;
+			if (r->given > 0)
+				order[nordered].epoch = r->given;
+			newest_listed = Max(newest_listed, order[nordered].epoch);
+			nordered++;
 		}
 	}
 	for (int i = 0; i < nordered; i++)
@@ -7256,6 +7288,7 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 		}
 		ss.hashes = group;
 		ss.cur = list_head(group);
+		ss.group_lo = epoch_lo;
 		xb.resolve = settle_resolve;
 		xb.arg = &ss;
 		xb.lo = epoch_lo;
@@ -8484,6 +8517,34 @@ journal_verify_generations(ProllyChunkStore *s)
 			break;
 	}
 	return checked;
+}
+
+/*
+ * The first generation of the settled file holding a chunk, the oldest if
+ * several do; 0 if none does (the journal's, or a file not settled, or
+ * not here).
+ */
+static uint32
+journal_epoch_of(ProllyChunkStore *s, const ProllyHash *hash)
+{
+	ProllyHash	key;
+	uint32		epoch = 0;
+	ListCell   *lc;
+
+	hash_key(&key, hash);
+	refresh_segments(s);
+	load_tables(s, false);
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (t->settled && (epoch == 0 || t->epoch_lo < epoch) &&
+			PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			epoch = t->epoch_lo;
+	}
+	return epoch;
 }
 
 /*
@@ -11041,6 +11102,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.epochs = journal_epochs,
 	.settle = journal_settle,
 	.verify_generations = journal_verify_generations,
+	.epoch_of = journal_epoch_of,
 	.gc_listed = journal_gc_listed,
 	.gc_find_in = journal_gc_find_in,
 	.shmem_size = journal_shmem_size,

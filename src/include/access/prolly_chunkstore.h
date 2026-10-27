@@ -252,6 +252,13 @@ typedef void (*ProllyChunkListedVisit) (const ProllyHash *target,
 										uint32 epoch, void *arg);
 
 /*
+ * settle()'s question of a chunk named that isn't here: the generation to
+ * list it by, proposed (0: none to list).
+ */
+typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
+									  uint32 proposed);
+
+/*
  * Visits a table file or segment: its name, its chunk count, its size in
  * bytes, and whether it is settled (a table file closed under what its
  * chunks name).
@@ -489,9 +496,17 @@ typedef struct ProllyChunkStoreRoutine
 	 * For chunks only a settled file's chunks name (history a repair
 	 * reattached below a boundary commit): a default collection, which
 	 * keeps settled files whole without reading them, never frees them.
+	 * Each root goes to generation epochs[i] (0: the one the settled
+	 * files list it by); absent() is asked the generation of a chunk the
+	 * chunks settled name that isn't here (a severed fragment's top), to
+	 * list it by, proposing one (0: it isn't one).
+	 *
+	 * epoch_of(), optional: the first generation of the settled file that
+	 * holds a chunk, the oldest if several do (0: none does).
 	 */
 	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
-						   int nroots);
+						   const uint32 *epochs, int nroots,
+						   ProllySettleAbsent absent, void *arg);
 
 	/*
 	 * Optional: check the settled files' generations, an error if one is
@@ -501,6 +516,7 @@ typedef struct ProllyChunkStoreRoutine
 	 * settled chunk: for tests.
 	 */
 	int64		(*verify_generations) (ProllyChunkStore *store);
+	uint32		(*epoch_of) (ProllyChunkStore *store, const ProllyHash *hash);
 
 	/*
 	 * Optional: what the section of collected file 'file' (as gc_files()
@@ -545,7 +561,7 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle", "verify_generations", "gc_listed", "gc_find_in", \
+	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in", \
 	"gc_begin_retire", "gc_inbound", "gc_read_any"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_read_any
