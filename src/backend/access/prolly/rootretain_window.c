@@ -126,7 +126,7 @@ window_begin(const char *branch, int64 excess)
 		!PROLLY_HAS(dc.history_window, policy))
 		return wp;
 	PROLLY_CALL(dc.history_window, policy, branch, &p);
-	if (p.keep_time <= 0 && p.keep_commits <= 0)
+	if (p.keep_time <= 0 && p.keep_commits <= 0 && p.max_bytes <= 0)
 		return wp;
 	wp->own = window_set(dc.history_window, branch);
 	wp->any = window_set(dc.history_window, NULL);

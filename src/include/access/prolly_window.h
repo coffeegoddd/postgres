@@ -33,6 +33,15 @@
  *   elsewhere), or none (nothing).  It holds every ref and the horizon's lock, and is the
  *   database owner's.  Its result says what was done.  A collection after
  *   the transaction commits frees what only the fragment reached.
+ * - maintain() severs the history window in the background, as sever()
+ *   does with the database's action, as the database's owner, once a
+ *   lineage's cut (rounded down to its batch; an hour where the window
+ *   names none) has moved since the last it tried, or the size limit says
+ *   so; a failure is reported, not raised, and retried after a wait that
+ *   grows; true if it made a fragment.  collect_due() says whether the
+ *   background's collection is to be a full one now (fragments made since
+ *   the last, which ended long enough ago); collected() notes that one
+ *   ran, and the store's size it left.
  * - archived() says whether commit id is past the horizon: a top of a
  *   fragment, named by a boundary commit.  edges() visits the horizon's
  *   boundary edges (a boundary commit and the parent it doesn't keep) as
@@ -178,6 +187,9 @@ typedef struct ProllyWindowRoutine
 	void		(*policy) (const char *name, ProllyWindowPolicy *policy);
 	void		(*set_policy) (const char *name, const char *setting,
 							   const char *value);
+	bool		(*maintain) (void);
+	bool		(*collect_due) (void);
+	void		(*collected) (void);
 	void		(*window) (const char *branch, ProllyWindowCommitVisit visit,
 						   void *arg);
 	bool		(*in_window) (const char *branch, const ProllyHash *commit);
@@ -185,7 +197,8 @@ typedef struct ProllyWindowRoutine
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
-	"policy", "set_policy", "window", "in_window"
+	"policy", "set_policy", "maintain", "collect_due", "collected", \
+	"window", "in_window"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
 #define PROLLY_WINDOW_LAST_CALLBACK in_window
 
@@ -229,5 +242,18 @@ extern bool prolly_window_archived(const ProllyHash *id);
  * transaction.
  */
 extern bool prolly_window_stops_at(const ProllyHash *parent);
+
+/*
+ * The horizon as it stands now, held: a copy of the commits past it (a
+ * set, in CurrentMemoryContext), for a reader that lists history a little
+ * at a time (a cursor's log) and must stop where it would have stopped
+ * when it began, whatever severs or rollbacks come meanwhile.  NULL when
+ * the window keeps none (its listing asks prolly_window_stops_at()).
+ */
+extern struct HTAB *prolly_window_horizon(void);
+
+/* As prolly_window_stops_at(), against a horizon held. */
+extern bool prolly_window_held_stops_at(struct HTAB *horizon,
+										const ProllyHash *parent);
 
 #endif							/* PROLLY_WINDOW_H */

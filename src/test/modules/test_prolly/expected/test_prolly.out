@@ -313,7 +313,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | identity                       | pass
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
- history_window | stub           | complete                       | not implemented (11 of 11 callbacks missing)
+ history_window | stub           | complete                       | not implemented (14 of 14 callbacks missing)
  root_freezer   | capture        | identity                       | pass
  root_freezer   | capture        | complete                       | pass
  root_freezer   | stub           | identity                       | pass

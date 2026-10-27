@@ -126,7 +126,9 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 /*
  * Snapshots of a tree map: a relation's pages as they were, kept by its root
  * page, each a reference to the subtrees it had then, taken and let go of in
- * O(1) of the relation's size; a new relation can be made of one.  The
+ * O(1) of the relation's size; a new relation can be made of one.  At most
+ * BMAP_SNAPSHOTS_MAX of them, gone with the relation's storage: a commit's
+ * pages are kept by captured roots instead (below).  The
  * caller of bmap_snapshot_take() keeps the relation from changing, as for a
  * share.  A snapshot is kept only once the (sub)transaction taking it
  * commits: one whose taker aborted, or was ended by a crash, is listed by
@@ -154,10 +156,17 @@ extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
 /*
  * Captured roots: a relation's tree as it was at a moment, kept by its
  * page store (not by the relation), so any number of them, each outliving
- * the relation's storage until it is let go of.  Capturing one is a
+ * the relation's storage until it is let go of, and any relation of the
+ * store may be made of it, another branch's included.  Capturing one is a
  * snapshot's work (O(1) in the relation's size, but for the pages changed
  * since its last capture or snapshot, logged as images and written out),
- * and a relation can be made of one in O(1) (bmap_share_root()).  A root
+ * and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
+ * root (bmap_root_capture_logged()) is captured of temporary storage
+ * holding frozen copies of a relation's pages changed since its last root,
+ * the rest shared with that root, and records the relation and its epoch
+ * then, so the next one's changed pages are found by their epochs
+ * (bmap_root_base(), bmap_changed_pages()).  bmap_root_copy() holds a root
+ * again by a root of its own, the same subtrees, in O(1).  A root
  * is held once its capturing (sub)transaction commits, and let go of once
  * the (sub)transaction that lets go of it commits: one whose capturer
  * aborted, or was ended by a crash, holds nothing, and neither does one

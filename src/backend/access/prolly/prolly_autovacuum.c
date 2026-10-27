@@ -3,8 +3,10 @@
  * prolly_autovacuum.c
  *	  Prolly's stores reclaimed by autovacuum.
  *
- * After its tables, a database's autovacuum worker collects the chunk
- * store when what a default collection would collect (the journal segment
+ * After its tables, a database's autovacuum worker severs the history
+ * past the database's window (the history window's maintain(): as the
+ * database's settings say), then collects the chunk store, in full if it
+ * severed some, else when what a default collection would collect (the journal segment
  * appends go to, written since the last collection, and the table files
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
@@ -327,18 +329,47 @@ collection_due(void)
  * counted (auto_collections_skipped), rather than each reporting the
  * refusal as an error; dolt_gc() still reports it.
  */
+/*
+ * History past the database's window severed (the history window's
+ * maintain()), before the collection: as the database's settings say,
+ * never a session's.
+ */
+/* The history window wants this visit's collection a full one. */
+static bool full_due = false;
+
+static void
+sever(void)
+{
+	ProllyDatabaseComponents dc;
+
+	full_due = false;
+	prolly_database_components(&dc);
+	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, maintain))
+		return;
+	(void) PROLLY_CALL(dc.history_window, maintain);
+	/* (asked here: a collection runs in a transaction that hasn't read) */
+	full_due = PROLLY_HAS(dc.history_window, collect_due) &&
+		PROLLY_CALL(dc.history_window, collect_due);
+}
+
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
+	bool		full = full_due;
 
-	if (!collection_due())
+	/*
+	 * (full where the history window wants severed history freed, no
+	 * oftener than it allows)
+	 */
+	full_due = false;
+	prolly_database_components(&dc);
+	if (!full && !collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	prolly_database_components(&dc);
-	if (!PROLLY_CALL(dc.reclamation, collect, false, true, &r))
+	if (!PROLLY_CALL(dc.reclamation, collect, full, true, &r))
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 		ereport(DEBUG1,
@@ -346,6 +377,8 @@ collect(void)
 								 get_database_name(MyDatabaseId))));
 		return;
 	}
+	if (full && PROLLY_HAS(dc.history_window, collected))
+		PROLLY_CALL(dc.history_window, collected);
 	/* (then, a step of its own, the records of the commits it took) */
 	if (PROLLY_HAS(dc.refs, forget_records))
 		(void) PROLLY_CALL(dc.refs, forget_records);
@@ -690,8 +723,8 @@ verify(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {autofold, collect, move, conjoin, release,
-	sweep, verify};
+	void		(*steps[]) (void) = {autofold, sever, collect, move, conjoin,
+	release, sweep, verify};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{

@@ -13,18 +13,23 @@
  *	'f' number			-> a fragment (8 bytes big-endian; see
  *						   fragment_encode())
  *	'n'					-> the next fragment's number
+ *	'D' boundary piece	-> what a boundary commit makes over its first
+ *						   parent, severed (see fragment_closure()): a
+ *						   piece (8 bytes big-endian) of it, each hash an
+ *						   id with its bytes complemented; one boundary's
+ *						   per sever, let go of when the parent is
+ *						   repaired
  *
  * None names a chunk: a collection asks edges() which parents not to
  * follow from which commits, and keeps nothing for a fragment.
  *
- * What is kept.  Every commit the refs name is kept (a branch's head, a
- * tag's, a remote-tracking branch's, a stash's, a merge's or rebase's in
- * progress, a pin's, a kept commit's).  From each branch head (but a
- * session's detached one, which is a ref only) a walk keeps the commits
- * its window does (dated at or after the cut), and every commit on the
- * way to its merge base with each other branch head (one at least as high
- * as the lowest of those bases): merging two live branches never needs a
- * severed commit.  The commits kept are the window; an edge from one to a
+ * What is kept.  From every commit the refs name (a branch's head, a
+ * tag's, a remote-tracking branch's, a session's detached head, a
+ * stash's, a merge's or rebase's in progress, a pin's, a kept commit's) a
+ * walk keeps the commits its window does (dated at or after the cut), and
+ * every commit on the way to every merge base of a branch with each other
+ * ref (one at least as high as the lowest of those bases): merging never
+ * needs a severed commit.  The commits kept are the window; an edge from one to a
  * parent outside it is a boundary edge, and the parent a top of the
  * fragment, which is every commit the tops reach outside the window and
  * the horizon there was already.
@@ -32,10 +37,13 @@
  * A fragment's identity (its root) is the root hash of a tree of its
  * commits' index entries, keyed by date then id, built as any tree is:
  * the same commits give the same root wherever they are severed.  Its
- * digest is a hash over the sorted hashes of the chunks its commits reach
- * (their own trees, their roots' and dependencies'), which repair
+ * digest is a hash over the sorted hashes of the chunks born in it (what
+ * each of its commits makes that its first parent lacks), which repair
  * recomputes, from the same tops down to the same stops (the commits
- * outside the fragment its commits name), once the chunks are back.
+ * outside the fragment its commits name), once the chunks are back.  A
+ * sever and an archive cost what the fragment's commits changed, not the
+ * database, but for the first fragment, whose oldest commit made its
+ * whole tree.  A full collection still marks what is live to free it.
  *
  * Severing changes no commit: hashes stay, and the boundary commits still
  * name their parents.  Readers that list history (dolt_log, history
@@ -81,6 +89,8 @@
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "utils/syscache.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
@@ -89,14 +99,20 @@
 #define KEY_FRAGMENT	'f'
 #define KEY_NEXT		'n'
 
-#define FRAGMENT_VERSION	1
+#define FRAGMENT_VERSION	2
 #define FRAGMENT_DELETED	0x01
 
 /* The horizon's lock: an object lock in the database, of this class. */
 #define HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
 
 static void check_may_sever(const char *what);
+static void sever_cut(ProllyWindowAction action, const TimestampTz *before,
+					  TimestampTz size_cut, ProllyWindowResult *result);
 static char *source_url(const char *source);
+static int64 config_int(const char *name, int64 dflt);
+
+/* The size limit's last cut, the background's (a setting in the refs). */
+#define SIZE_CUT_SETTING	"history_window.size_cut"
 
 /* ------------------------------------------------------------------------
  * Components and encodings
@@ -444,13 +460,22 @@ archive_archived(const ProllyHash *id)
  * taken before the horizon's (a sever archives holding only it, so
  * collections go on meanwhile).
  */
-static void
+/* A sever in the background: it takes the severs' turn only if free. */
+static bool sever_in_background = false;
+static bool sever_busy = false;	/* the last sever found the turn taken */
+
+static bool
 sever_slot_lock(void)
 {
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, HORIZON_LOCK_CLASSID, 1, 0);
-	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	/*
+	 * (in the background, never waited for: a worker waiting on another
+	 * gets it cancelled, autovacuum's rule, and the next visit tries again)
+	 */
+	return LockAcquire(&tag, ExclusiveLock, false, sever_in_background) !=
+		LOCKACQUIRE_NOT_AVAIL;
 }
 
 static void
@@ -540,11 +565,12 @@ archive_fragments(ProllyWindowFragmentVisit visit, void *arg)
  */
 
 static int	action_setting = PROLLY_WINDOW_ARCHIVE;
-static char *warm_setting = NULL;
+static char *window_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
 static char *root_max_size_setting = NULL;
-static char *cold_batch_setting = NULL;
+static char *batch_setting = NULL;
+static char *collect_interval_setting = NULL;
 static char *archive_timeout_setting = NULL;
 static char *archive_setting = NULL;
 
@@ -654,10 +680,10 @@ prolly_window_init(void)
 							 &action_setting, PROLLY_WINDOW_ARCHIVE,
 							 action_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_warm",
+	DefineCustomStringVariable("prolly.history_window",
 							   "How long each branch's history is kept here (empty: all of it).",
 							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
-							   &warm_setting, "", PGC_USERSET, 0,
+							   &window_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomIntVariable("prolly.history_min_commits",
 							"How many of each branch's newest commits are kept here, however old.",
@@ -665,8 +691,8 @@ prolly_window_init(void)
 							&min_commits_setting, 0, 0, INT_MAX,
 							PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_max_size",
-							   "The most history kept here (empty: no limit).",
-							   "Read as the database has it.",
+							   "The most the chunk store may hold (empty: no limit); past it, background severing cuts a batch more each visit.",
+							   "Read as the database has it; each branch still keeps its newest prolly.history_min_commits.",
 							   &max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_root_max_size",
@@ -674,15 +700,20 @@ prolly_window_init(void)
 							   "Read as the database has it.  Past it, the oldest roots in the window are let go of first (never a tag's, nor a branch's newest); a move to a commit without one restores the nearest before it and writes the rows they differ by.",
 							   &root_max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_collect_interval",
+							   "The least time between the full collections that free severed history in the background (empty: an hour).",
+							   "Read as the database has it; fragments severed meanwhile share the next one.",
+							   &collect_interval_setting, "", PGC_USERSET, 0,
+							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_archive_timeout",
 							   "How long a sever waits for its archive to take the history severed and give it back (empty: ten minutes).",
 							   "Read as the database has it; past it, nothing is severed.",
 							   &archive_timeout_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_cold_batch",
+	DefineCustomStringVariable("prolly.history_batch",
 							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
 							   "Read as the database has it; a branch may keep its own.",
-							   &cold_batch_setting, "", PGC_USERSET, 0,
+							   &batch_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_archive",
 							   "Where history past the window is archived: a remote's URL.",
@@ -691,16 +722,35 @@ prolly_window_init(void)
 							   check_archive, NULL, NULL);
 }
 
-/* name's value as the database has it (its own, no role's); NULL: none. */
-static char *
-database_setting(const char *name)
+/*
+ * The database's own settings (no role's), read once a command: a visit
+ * evaluates every lineage's policy, a dozen settings each, by one read.
+ */
+static List *db_settings = NIL;
+static MemoryContext db_settings_cxt = NULL;
+static LocalTransactionId db_settings_lxid = InvalidLocalTransactionId;
+static CommandId db_settings_cid = InvalidCommandId;
+
+static List *
+database_settings(void)
 {
 	Relation	rel;
 	ScanKeyData keys[2];
 	SysScanDesc scan;
 	HeapTuple	tuple;
-	char	   *found = NULL;
+	MemoryContext old;
+	CommandId	cid = GetCurrentCommandId(false);
 
+	if (db_settings_cxt != NULL && db_settings_lxid == MyProc->vxid.lxid &&
+		db_settings_cid == cid)
+		return db_settings;
+	if (db_settings_cxt == NULL)
+		db_settings_cxt = AllocSetContextCreate(TopMemoryContext,
+												"prolly history settings",
+												ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(db_settings_cxt);
+	db_settings = NIL;
+	old = MemoryContextSwitchTo(db_settings_cxt);
 	rel = table_open(DbRoleSettingRelationId, AccessShareLock);
 	ScanKeyInit(&keys[0], Anum_pg_db_role_setting_setdatabase,
 				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(MyDatabaseId));
@@ -719,20 +769,30 @@ database_setting(const char *name)
 			ArrayType  *a = DatumGetArrayTypeP(d);
 			Datum	   *elems;
 			int			n;
-			size_t		len = strlen(name);
 
 			deconstruct_array_builtin(a, TEXTOID, &elems, NULL, &n);
 			for (int i = 0; i < n; i++)
-			{
-				char	   *s = TextDatumGetCString(elems[i]);
-
-				if (strncmp(s, name, len) == 0 && s[len] == '=')
-					found = pstrdup(s + len + 1);
-			}
+				db_settings = lappend(db_settings, TextDatumGetCString(elems[i]));
 		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+	MemoryContextSwitchTo(old);
+	db_settings_lxid = MyProc->vxid.lxid;
+	db_settings_cid = cid;
+	return db_settings;
+}
+
+/* name's value as the database has it (its own, no role's); NULL: none. */
+static char *
+database_setting(const char *name)
+{
+	size_t		len = strlen(name);
+	char	   *found = NULL;
+
+	foreach_ptr(char, s, database_settings())
+		if (strncmp(s, name, len) == 0 && s[len] == '=')
+			found = pstrdup(s + len + 1);
 	return found;
 }
 
@@ -763,8 +823,8 @@ prolly_window_database_size(const char *name)
 	return bytes;
 }
 
-static const char *const branch_settings[] = {"warm", "min_commits",
-"cold_batch"};
+static const char *const branch_settings[] = {"window", "min_commits",
+"batch"};
 
 static void
 branch_setting_key(StringInfo key, const char *name, const char *setting)
@@ -805,8 +865,8 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 			if (pg_strcasecmp(v, action_options[i].name) == 0)
 				p->action = action_options[i].val;
 	}
-	p->keep_time = database_span("prolly.history_warm");
-	p->batch = database_span("prolly.history_cold_batch");
+	p->keep_time = database_span("prolly.history_window");
+	p->batch = database_span("prolly.history_batch");
 	if ((v = database_setting("prolly.history_min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
 	if ((v = database_setting("prolly.history_max_size")) != NULL &&
@@ -816,9 +876,9 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	p->archive = (v && *v) ? v : NULL;
 	if (name == NULL)
 		return;
-	if ((v = branch_setting(name, "warm")) != NULL)
+	if ((v = branch_setting(name, "window")) != NULL)
 		(void) parse_span(v, &p->keep_time);
-	if ((v = branch_setting(name, "cold_batch")) != NULL)
+	if ((v = branch_setting(name, "batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
@@ -839,7 +899,7 @@ archive_set_policy(const char *name, const char *setting, const char *value)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a branch's history window has no setting \"%s\"", setting),
-				 errhint("A branch keeps its own warm, min_commits or cold_batch; the rest are the database's.")));
+				 errhint("A branch keeps its own window, min_commits or batch; the rest are the database's.")));
 	if (value != NULL)
 	{
 		int64		n;
@@ -907,6 +967,7 @@ typedef struct Head
 	int64		min_commits;	/* and its newest this many */
 	bool		standalone;		/* a tag's: kept itself, on a lineage too */
 	bool		on_lineage;		/* another ref's, on a branch's history */
+	int64		height_cut;		/* > 0: kept by height, not the cut's date */
 } Head;
 
 typedef struct Plan
@@ -920,9 +981,118 @@ typedef struct Plan
 	List	   *stops;			/* ProllyHash *, outside it, its commits name */
 	HTAB	   *archived;		/* the horizon's parents now */
 	HTAB	   *heights;		/* of commits recording none */
+	List	   *orphans;		/* ProllyHash *, pairs: a kept commit and a
+								 * parent past the horizon no edge names it
+								 * with (an amend of a boundary commit) */
 	List	   *arrivals;		/* PlanCommit *: dated past now, first seen */
 	HTAB	   *moved;			/* HeadArrival: the head logs' first moves */
 } Plan;
+
+static void
+edge_key(StringInfo k, const ProllyHash *parent, const ProllyHash *child)
+{
+	appendStringInfoChar(k, KEY_EDGE);
+	put_id(k, parent);
+	put_id(k, child);
+}
+
+/* Whether the horizon has edge child -> parent. */
+static bool
+edge_known(const ProllyHash *child, const ProllyHash *parent)
+{
+	StringInfoData k;
+	StringInfoData v;
+	ProllyKey	key;
+	bool		found;
+
+	initStringInfo(&k);
+	initStringInfo(&v);
+	edge_key(&k, parent, child);
+	key.data = (const uint8 *) k.data;
+	key.len = k.len;
+	found = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v);
+	pfree(k.data);
+	pfree(v.data);
+	return found;
+}
+
+typedef struct ParentFragment
+{
+	StringInfoData prefix;
+	int64		number;
+} ParentFragment;
+
+static bool
+note_parent_fragment(const ProllyKey *key, const ProllyValue *value,
+					 void *arg)
+{
+	ParentFragment *pf = arg;
+
+	if (key->len < (Size) pf->prefix.len ||
+		memcmp(key->data, pf->prefix.data, pf->prefix.len) != 0)
+		return false;
+	if (value->len == 8)
+		pf->number = (int64) get_be64((const char *) value->data);
+	return false;
+}
+
+/* The fragment a parent past the horizon is a top of (0: none). */
+static int64
+parent_fragment(const ProllyHash *parent)
+{
+	ParentFragment pf;
+	ProllyKey	from;
+
+	initStringInfo(&pf.prefix);
+	appendStringInfoChar(&pf.prefix, KEY_EDGE);
+	put_id(&pf.prefix, parent);
+	pf.number = 0;
+	from.data = (const uint8 *) pf.prefix.data;
+	from.len = pf.prefix.len;
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+				ForwardScanDirection, note_parent_fragment, &pf);
+	pfree(pf.prefix.data);
+	return pf.number;
+}
+
+/*
+ * Record each kept commit naming a parent past the horizon by no edge
+ * (made since: an amend, a commit after a reset to a boundary commit), an
+ * edge of the parent's fragment's: a collection then doesn't follow it,
+ * and a repair of that fragment lets go of it.  The caller holds the
+ * horizon and the refs.
+ */
+static bool
+record_orphans(Plan *plan)
+{
+	bool		any = false;
+
+	foreach_ptr(ProllyHash, pair, plan->orphans)
+	{
+		int64		n;
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		ProllyValue value;
+
+		if (edge_known(&pair[0], &pair[1]) ||
+			(n = parent_fragment(&pair[1])) == 0)
+			continue;
+		initStringInfo(&k);
+		initStringInfo(&v);
+		edge_key(&k, &pair[1], &pair[0]);
+		put_be64(&v, (uint64) n);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		value.data = (const uint8 *) v.data;
+		value.len = v.len;
+		PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+		pfree(k.data);
+		pfree(v.data);
+		any = true;
+	}
+	return any;
+}
 
 static bool
 lookup_commit(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
@@ -1380,6 +1550,16 @@ keep(Plan *plan, PlanCommit *pc)
 	plan->kept = lappend(plan->kept, pc);
 }
 
+static void
+add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
+{
+	ProllyHash *pair = palloc_array(ProllyHash, 2);
+
+	pair[0] = *a;
+	pair[1] = *b;
+	*list = lappend(*list, pair);
+}
+
 /* A branch head's window: walked from it down to what it doesn't keep. */
 static void
 walk_window(Plan *plan, Head *h)
@@ -1397,7 +1577,9 @@ walk_window(Plan *plan, Head *h)
 		todo = list_delete_last(todo);
 		CHECK_FOR_INTERRUPTS();
 		pc = plan_commit(plan, id);
-		if (same_id(id, &h->head) || young(plan, pc, h->cut) ||
+		if (same_id(id, &h->head) ||
+			(h->height_cut > 0 ? pc->e.height >= h->height_cut :
+			 young(plan, pc, h->cut)) ||
 			(h->min_commits > 0 && head_height - pc->e.height < h->min_commits))
 		{
 			if (pc->kept && pc->by_base)
@@ -1415,7 +1597,13 @@ walk_window(Plan *plan, Head *h)
 		{
 			ProllyHash *p = &pc->e.parents[i];
 
-			if (set_has(plan->archived, p) || !set_add(seen, p))
+			if (set_has(plan->archived, p))
+			{
+				if (!edge_known(&pc->id, p))
+					add_pair(&plan->orphans, &pc->id, p);
+				continue;
+			}
+			if (!set_add(seen, p))
 				continue;
 			todo = lappend(todo, p);
 		}
@@ -1423,15 +1611,6 @@ walk_window(Plan *plan, Head *h)
 	hash_destroy(seen);
 }
 
-static void
-add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
-{
-	ProllyHash *pair = palloc_array(ProllyHash, 2);
-
-	pair[0] = *a;
-	pair[1] = *b;
-	*list = lappend(*list, pair);
-}
 
 /*
  * Each head's window: its commits dated before before (if given) cut;
@@ -1439,7 +1618,8 @@ add_pair(List **list, const ProllyHash *a, const ProllyHash *b)
  * batch.  False if no head's window cuts anything.
  */
 static bool
-head_windows(Plan *plan, const TimestampTz *before)
+head_windows(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
+			 int64 size_height)
 {
 	TimestampTz now = plan_now();
 	bool		any = false;
@@ -1483,6 +1663,18 @@ head_windows(Plan *plan, const TimestampTz *before)
 		}
 		else
 			h->cut = DT_NOBEGIN;	/* (it keeps everything) */
+		/* (a size limit cuts later, the count still keeping its own) */
+		if (size_cut > h->cut)
+		{
+			h->cut = size_cut;
+			any = true;
+		}
+		/* (or by height, where the size limit's dates cut nothing) */
+		if (size_height > 0)
+		{
+			h->height_cut = size_height;
+			any = true;
+		}
 	}
 	return any;
 }
@@ -1493,7 +1685,8 @@ head_windows(Plan *plan, const TimestampTz *before)
  * beyond them.  The caller holds every ref.
  */
 static void
-make_plan(Plan *plan, const TimestampTz *before)
+make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
+		  int64 size_height)
 {
 	ListCell   *lc;
 	HTAB	   *fragment;
@@ -1505,7 +1698,7 @@ make_plan(Plan *plan, const TimestampTz *before)
 	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
 	note_refs(plan);
-	if (!head_windows(plan, before))
+	if (!head_windows(plan, before, size_cut, size_height))
 		return;					/* (every head keeps its whole history) */
 	note_merge_bases(plan);
 	foreach(lc, plan->heads)
@@ -1595,6 +1788,7 @@ window_commits(const char *branch)
 {
 	Plan		plan;
 	HTAB	   *in = id_set("prolly window", sizeof(ProllyHash));
+	ProllyWindowPolicy db;
 
 	window_init();
 	sever_clock = DT_NOBEGIN;
@@ -1604,8 +1798,15 @@ window_commits(const char *branch)
 	plan.archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, &plan);
 	note_refs(&plan);
-	/* (the cut taken once, now, for every head) */
-	(void) head_windows(&plan, NULL);
+	/*
+	 * (the cut taken once, now, for every head; under a size limit, no
+	 * earlier than the last the background cut for size)
+	 */
+	archive_policy(NULL, &db);
+	(void) head_windows(&plan, NULL,
+						db.max_bytes > 0 ?
+						config_int(SIZE_CUT_SETTING, DT_NOBEGIN) : DT_NOBEGIN,
+						0);
 	foreach_ptr(Head, h, plan.heads)
 	{
 		if (h->name == NULL || (branch != NULL && strcmp(h->name, branch) != 0))
@@ -1656,7 +1857,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 	sever_clock = DT_NOBEGIN;
 	window_init();
 	/* (read as the refs stand: no ref is held, nothing written) */
-	make_plan(&plan, before);
+	make_plan(&plan, before, DT_NOBEGIN, 0);
 	foreach(lc, plan.severed)
 		visit(PROLLY_WINDOW_SEVERED, &((PlanCommit *) lfirst(lc))->id, NULL,
 			  NULL, arg);
@@ -1681,29 +1882,21 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
  * ------------------------------------------------------------------------
  */
 
+/* A commit's delta, to keep: what it makes over its first parent. */
+typedef struct Delta
+{
+	ProllyHash	id;
+	List	   *hashes;			/* ProllyHash * */
+} Delta;
+
 typedef struct Closure
 {
+	bool		prune;			/* every walk whole: decline what is noted */
 	HTAB	   *seen;
 	List	   *chunks;			/* ProllyHash * */
 	int64		bytes;
 	StringInfoData buf;
 } Closure;
-
-static bool
-closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
-{
-	Closure    *c = arg;
-
-	if (!set_add(c->seen, &node->hash))
-		return false;
-	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)),
-										  &node->hash, sizeof(ProllyHash)));
-	resetStringInfo(&c->buf);
-	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, &node->hash,
-					&c->buf))
-		c->bytes += c->buf.len;
-	return true;
-}
 
 static int
 hash_cmp(const ListCell *a, const ListCell *b)
@@ -1716,26 +1909,232 @@ hash_cmp(const ListCell *a, const ListCell *b)
 	return memcmp(x->bytes, y->bytes, x->len);
 }
 
+#define KEY_DELTA		'D'
+#define DELTA_PIECE		128		/* hashes a delta entry holds */
+
+/* A node a commit makes, noted (once, however often it is visited). */
+static bool
+note_node(Closure *c, const ProllyHash *h)
+{
+	if (!set_add(c->seen, h))
+		return false;
+	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)), h,
+										  sizeof(ProllyHash)));
+	resetStringInfo(&c->buf);
+	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, h, &c->buf))
+		c->bytes += c->buf.len;
+	return true;
+}
+
 /*
- * What a fragment's commits reach, without crossing to other commits:
- * each one's own tree, its root's (the canonicalizer's walk) and its
- * dependencies'.  The digest is a hash over their hashes, sorted.
+ * Every visit descends, a node noted already too: a diff visits a node
+ * and goes down only into the children that differ from the parent's, so
+ * a node noted there may have children noted nowhere yet, which a later
+ * commit's whole walk of it (a table made, whose root a revert brings
+ * back) must reach.  Declining it would make what a commit adds depend on
+ * the commits noted before it; descending, each adds exactly what it
+ * makes, whatever the order, so the set found walking the commits is the
+ * one found from a boundary's kept delta.  (A closure whose every walk is
+ * whole, prune, declines what it noted: all below it is noted too.)
+ */
+static bool
+closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Closure    *c = arg;
+
+	return note_node(c, &node->hash) || !c->prune;
+}
+
+/*
+ * What commit c (info) makes that its first parent (pinfo; NULL: it has
+ * none, or none here) lacks: its own tree's nodes, then its root's and its
+ * dependencies' as they differ from the parent's (the canonicalizer's
+ * walk_changes(), the tree's diff_nodes()), or all of them for a commit
+ * with no parent.  The nodes born at c, by its history: whatever the store
+ * held, a node c has and its parent lacks is c's, so what is resurrected
+ * or deduplicated counts, and the set is a function of the two commits
+ * alone.  (A merge's is against its first parent: more, never less.)
+ */
+static void
+commit_created(Closure *c, const ProllyHash *id, const ProllyCommitInfo *info,
+			   const ProllyCommitInfo *pinfo)
+{
+	ProllyNodeRef ref;
+
+	ref.hash = *id;
+	(void) PROLLY_CALL(tree, walk, &tree_env, &ref, closure_visit, c);
+	PROLLY_CALL(dc.canonicalizer, walk_changes, pinfo ? &pinfo->root : NULL,
+				&info->root, closure_visit, c);
+	if (info->has_dependencies)
+		PROLLY_CALL(tree, diff_nodes, &tree_env,
+					pinfo && pinfo->has_dependencies ? &pinfo->dependencies : NULL,
+					&info->dependencies, closure_visit, c);
+}
+
+static void
+delta_key(StringInfo k, const ProllyHash *id, uint32 piece)
+{
+	appendStringInfoChar(k, KEY_DELTA);
+	put_id(k, id);
+	put_be64(k, piece);
+}
+
+/*
+ * Keep what boundary commit b makes that its parent (pinfo) lacks, beside
+ * the horizon: its parent is severed now, and gone once collected, so a
+ * later sever, or a repair's check, of the fragment b falls in finds b's
+ * born nodes here.  Kept in pieces, each hash complemented.
+ */
+/* Keep hashes, what boundary commit b makes over its first parent. */
+static void
+write_delta(const ProllyHash *b, List *hashes)
+{
+	StringInfoData k;
+	StringInfoData v;
+	uint32		piece = 0;
+	int			n = 0;
+
+	initStringInfo(&k);
+	initStringInfo(&v);
+	foreach_ptr(ProllyHash, h, hashes)
+	{
+		put_value_id(&v, h);
+		if (++n == DELTA_PIECE || foreach_current_index(h) == list_length(hashes) - 1)
+		{
+			ProllyKey	key;
+			ProllyValue value;
+
+			resetStringInfo(&k);
+			delta_key(&k, b, piece++);
+			key.data = (const uint8 *) k.data;
+			key.len = k.len;
+			value.data = (const uint8 *) v.data;
+			value.len = v.len;
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+			resetStringInfo(&v);
+			n = 0;
+		}
+	}
+	pfree(k.data);
+	pfree(v.data);
+}
+
+/*
+ * Keep what boundary commit b makes that its parent (pinfo; NULL: it is
+ * gone) lacks, beside the horizon: its parent is severed now, and gone
+ * once collected, so a later sever, or a repair's check, of the fragment b
+ * falls in finds b's born nodes here.  Kept in pieces, each hash
+ * complemented.
+ */
+static void
+keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
+		   const ProllyCommitInfo *pinfo)
+{
+	Closure		c = {0};
+
+	c.seen = id_set("prolly boundary delta", sizeof(ProllyHash));
+	initStringInfo(&c.buf);
+	commit_created(&c, b, binfo, pinfo);
+	write_delta(b, c.chunks);
+	pfree(c.buf.data);
+	hash_destroy(c.seen);
+}
+
+/* Let go of boundary commit b's kept delta. */
+static void
+drop_delta(const ProllyHash *b)
+{
+	for (uint32 piece = 0;; piece++)
+	{
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		bool		found;
+
+		initStringInfo(&k);
+		initStringInfo(&v);
+		delta_key(&k, b, piece);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		found = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v);
+		if (found)
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		pfree(k.data);
+		pfree(v.data);
+		if (!found)
+			break;
+	}
+}
+
+/* A boundary commit's kept delta, noted into c; false if none is kept. */
+static bool
+kept_delta(Closure *c, const ProllyHash *id)
+{
+	bool		found = false;
+
+	for (uint32 piece = 0;; piece++)
+	{
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		const char *p;
+		const char *end;
+
+		initStringInfo(&k);
+		initStringInfo(&v);
+		delta_key(&k, id, piece);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		if (!PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v))
+			break;
+		found = true;
+		p = v.data;
+		end = v.data + v.len;
+		while (p < end)
+		{
+			ProllyHash	h;
+
+			p = get_value_id(p, end, &h);
+			(void) note_node(c, &h);
+		}
+		pfree(k.data);
+		pfree(v.data);
+	}
+	return found;
+}
+
+/*
+ * What a fragment's commits make: each one's nodes that its first parent
+ * lacks (commit_created()), its first parent read here, or past the
+ * horizon its delta kept when the parent was severed (a commit with
+ * neither: all it reaches).  Every chunk the fragment holds that history
+ * before it doesn't, born in it: O(what it changed), not O(the database),
+ * but for the first fragment, whose oldest commit makes its whole tree.
+ * The digest is a hash over their hashes, sorted.  (Chunks are found by
+ * the commit that made them, so a fragment's are those born in it, by the
+ * generation they were born in.)
  */
 static void
 fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
-				 int64 *bytes, List **chunk_list)
+				 int64 *bytes, List **chunk_list, List **deltas)
 {
 	Closure		c = {0};
 	ListCell   *lc;
 	ProllyHashCtx *ctx;
+	HTAB	   *in = id_set("prolly fragment commits", sizeof(ProllyHash));
 
 	c.seen = id_set("prolly fragment chunks", sizeof(ProllyHash));
 	initStringInfo(&c.buf);
 	foreach(lc, commits)
+		(void) set_add(in, lfirst(lc));
+	if (deltas)
+		*deltas = NIL;
+	foreach(lc, commits)
 	{
 		ProllyHash *id = lfirst(lc);
 		ProllyCommitInfo info;
-		ProllyNodeRef ref;
+		ProllyCommitInfo pinfo;
+		bool		parent_here;
 
 		CHECK_FOR_INTERRUPTS();
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
@@ -1746,13 +2145,44 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(id))));
 		}
-		ref.hash = *id;
-		if (!PROLLY_CALL(tree, walk, &tree_env, &ref, closure_visit, &c))
+		if (info.nparents == 0)
+		{
+			commit_created(&c, id, &info, NULL);
 			continue;
-		PROLLY_CALL(dc.canonicalizer, walk, &info.root, closure_visit, &c);
-		if (info.has_dependencies)
-			(void) PROLLY_CALL(tree, walk, &tree_env, &info.dependencies,
-							   closure_visit, &c);
+		}
+		parent_here = PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+								  &info.parents[0]) &&
+			PROLLY_CALL(dc.refs, commit_get, &info.parents[0], &pinfo);
+
+		/*
+		 * (by the fragment, not by what the store holds: a first parent in
+		 * it is walked against, here whenever the fragment is; one outside
+		 * it, from the delta kept, which a sever keeps, as found then, for
+		 * a commit that has none yet, so its repair finds the same)
+		 */
+		if (set_has(in, &info.parents[0]) && parent_here)
+			commit_created(&c, id, &info, &pinfo);
+		else if (!kept_delta(&c, id))
+		{
+			if (deltas)
+			{
+				Closure		one = {0};
+				Delta	   *d = palloc(sizeof(Delta));
+
+				one.seen = id_set("prolly commit delta", sizeof(ProllyHash));
+				initStringInfo(&one.buf);
+				commit_created(&one, id, &info, parent_here ? &pinfo : NULL);
+				foreach_ptr(ProllyHash, h, one.chunks)
+					(void) note_node(&c, h);
+				d->id = *id;
+				d->hashes = one.chunks;
+				*deltas = lappend(*deltas, d);
+				pfree(one.buf.data);
+				hash_destroy(one.seen);
+			}
+			else
+				commit_created(&c, id, &info, parent_here ? &pinfo : NULL);
+		}
 	}
 	list_sort(c.chunks, hash_cmp);
 	ctx = PROLLY_CALL(tree_env.hash, begin, CurrentMemoryContext);
@@ -1770,6 +2200,55 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 		*chunk_list = c.chunks;
 	pfree(c.buf.data);
 	hash_destroy(c.seen);
+	hash_destroy(in);
+}
+
+/*
+ * Every chunk a fragment's commits reach: each one's whole tree, the
+ * chunks born before the fragment too.  What a repair of it from an
+ * archive needs, where no older fragment's archive is that one.
+ */
+static List *
+fragment_reach(List *commits)
+{
+	Closure		c = {0};
+	ListCell   *lc;
+
+	c.prune = true;
+	c.seen = id_set("prolly fragment reach", sizeof(ProllyHash));
+	initStringInfo(&c.buf);
+	foreach(lc, commits)
+	{
+		ProllyHash *id = lfirst(lc);
+		ProllyCommitInfo info;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("commit %s is missing from the chunk store",
+							prolly_hash_hex(id))));
+		commit_created(&c, id, &info, NULL);
+	}
+	pfree(c.buf.data);
+	hash_destroy(c.seen);
+	return c.chunks;
+}
+
+static List *fragment_records(void);
+
+/*
+ * Whether an older fragment, still severed, was archived anywhere but url
+ * (its chunks a fragment reaches, born before it, are there, not at url).
+ */
+static const char *
+archived_elsewhere(const char *url)
+{
+	foreach_ptr(FragmentRecord, r, fragment_records())
+		if (!r->f.deleted && r->f.location != NULL &&
+			strcmp(r->f.location, url) != 0)
+			return r->f.location;
+	return NULL;
 }
 
 static int
@@ -2140,7 +2619,8 @@ note_head_at(const char *branch, const ProllyHash *commit, void *arg)
  */
 static int64
 archive_fragment(const char *url, const ProllyWindowFragment *f,
-				 List *chunk_list, HTAB *verified)
+				 List *chunk_list, HTAB *verified, List *reach,
+				 const char *elsewhere)
 {
 	int64		sent = 0;
 	const ProllyRemoteRoutine *rr;
@@ -2241,6 +2721,40 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 					 errdetail("Chunk %s, for one, isn't there, or isn't what its hash says.  Nothing is severed.",
 							   prolly_hash_hex(missing))));
 		}
+
+		/*
+		 * (and, an older fragment archived elsewhere, that this archive has
+		 * all the fragment reaches: a repair from it receives that)
+		 */
+		if (reach != NIL)
+		{
+			int			nr = list_length(reach);
+			ProllyHash *rh = palloc_array(ProllyHash, nr);
+			bool	   *has = palloc_array(bool, nr);
+			int			lacking = 0;
+
+			i = 0;
+			foreach_ptr(ProllyHash, h, reach)
+				rh[i++] = *h;
+			if (PROLLY_HAS(rr, has_many))
+				PROLLY_CALL(rr, has_many, remote, rh, nr, has);
+			else
+				for (i = 0; i < nr; i++)
+					has[i] = PROLLY_CALL(rr, has, remote, &rh[i]);
+			for (i = 0; i < nr; i++)
+				if (!has[i])
+					lacking++;
+			if (lacking > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the archive at %s lacks %d of the %d chunks the history severed reaches",
+								url, lacking, nr),
+						 errdetail("They were made before it, and archived at %s.  Nothing is severed.",
+								   elsewhere),
+						 errhint("Repair the history archived there, or archive there.")));
+			pfree(rh);
+			pfree(has);
+		}
 	}
 	PG_CATCH();
 	{
@@ -2264,7 +2778,7 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 static void
 build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
 			   ProllyWindowFragment *f, List **ids, List **chunk_list,
-			   int *nstops, ProllyHash **stops)
+			   int *nstops, ProllyHash **stops, List **deltas)
 {
 	ListCell   *lc;
 	ProllyHash *tops;
@@ -2289,7 +2803,7 @@ build_fragment(Plan *plan, ProllyWindowAction action, bool want_chunks,
 	f->commits = list_length(plan->severed);
 	fragment_root(plan->severed, &f->root);
 	fragment_closure(*ids, &f->digest, &f->chunks, &f->bytes,
-					 want_chunks ? chunk_list : NULL);
+					 want_chunks ? chunk_list : NULL, deltas);
 
 	/* its tops: each parent the boundary keeps no more, once */
 	tops = palloc_array(ProllyHash, Max(list_length(plan->edges), 1));
@@ -2336,6 +2850,43 @@ static void
 archive_sever(ProllyWindowAction action, const TimestampTz *before,
 			  ProllyWindowResult *result)
 {
+	sever_cut(action, before, DT_NOBEGIN, result);
+}
+
+/* A size limit's cut by height: this many parts of what is kept, one cut. */
+#define SIZE_HEIGHT_PARTS	16
+
+/*
+ * The height a size limit cuts below where its dates cut nothing: a
+ * sixteenth of the heights the plan keeps, at least one, above the
+ * lowest.  Heights only grow along history, so it is a prefix of every
+ * path, as the dates' cut is; 0 if nothing but heads is kept.
+ */
+static int64
+height_cut(Plan *plan)
+{
+	int64		lowest = PG_INT64_MAX;
+	int64		highest = 0;
+
+	foreach_ptr(PlanCommit, pc, plan->kept)
+	{
+		lowest = Min(lowest, pc->e.height);
+		highest = Max(highest, pc->e.height);
+	}
+	if (lowest >= highest)
+		return 0;
+	return lowest + Max((highest - lowest) / SIZE_HEIGHT_PARTS, 1);
+}
+
+/*
+ * A sever (as archive_sever()), each head's window cut no earlier than
+ * size_cut (DT_NOBEGIN: no limit), its count kept whatever: what a size
+ * limit severs.
+ */
+static void
+sever_cut(ProllyWindowAction action, const TimestampTz *before,
+		  TimestampTz size_cut, ProllyWindowResult *result)
+{
 	Plan		plan;
 	ListCell   *lc;
 	List	   *ids = NIL;
@@ -2346,12 +2897,14 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	StringInfoData v;
 
 	List	   *chunk_list = NIL;
+	List	   *deltas = NIL;
 	HTAB	   *verified = id_set("prolly archive verified", sizeof(ProllyHash));
 	char	   *archive_url = NULL;
 	ProllyWindowPolicy policy;
 
 	ProllyHash	planned;
 	ProllyHash	held;
+	int64		size_height = 0;
 
 	window_init();
 	memset(result, 0, sizeof(*result));
@@ -2367,20 +2920,41 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 	 * plan takes a while, and commits on every branch would wait), nor the
 	 * horizon (an archive takes longer, and collections would wait).
 	 */
-	sever_slot_lock();
+	sever_busy = false;
+	if (!sever_slot_lock())
+	{
+		sever_busy = true;
+		return;
+	}
 	sever_clock = GetCurrentTimestamp();
 	for (int tries = 1;; tries++)
 	{
 		ProllyHash	now;
 
 		PROLLY_CALL(tree_env.chunk_store, root, tree_env.chunks, &planned);
-		make_plan(&plan, before);
+		make_plan(&plan, before, size_cut, size_height);
+
+		/*
+		 * (a size limit whose dates cut nothing, a commit dated old above
+		 * history dated new: cut by height instead, a part of what is
+		 * kept here, so the limit still holds)
+		 */
+		if (plan.severed == NIL && size_cut != DT_NOBEGIN && before == NULL &&
+			size_height == 0 && (size_height = height_cut(&plan)) > 0)
+			make_plan(&plan, before, size_cut, size_height);
 		if (plan.severed == NIL)
 		{
-			/* (nothing to sever, but commits dated ahead seen first) */
-			if (plan.arrivals != NIL)
+			/*
+			 * (nothing to sever, but the horizon told of new edges, or
+			 * commits dated ahead seen first)
+			 */
+			if (plan.orphans != NIL || plan.arrivals != NIL)
 			{
+				if (plan.orphans != NIL)
+					horizon_lock(ExclusiveLock);
 				PROLLY_CALL(dc.refs, lock);
+				if (plan.orphans != NIL && record_orphans(&plan))
+					horizon_changed();
 				record_arrivals(&plan);
 			}
 			return;
@@ -2402,11 +2976,15 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 			archive_url = policy.archive;
 		}
 		build_fragment(&plan, action, archive_url != NULL, &f, &ids,
-					   &chunk_list, &nstops, &stops);
+					   &chunk_list, &nstops, &stops, &deltas);
 		if (archive_url)
 		{
+			const char *elsewhere = archived_elsewhere(archive_url);
+
 			result->sent += archive_fragment(archive_url, &f, chunk_list,
-											 verified);
+											 verified,
+											 elsewhere ? fragment_reach(ids) : NIL,
+											 elsewhere);
 			f.location = archive_url;
 		}
 		INJECTION_POINT("prolly-sever-planned", NULL);
@@ -2436,7 +3014,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 		Plan		again;
 		ProllyHash	root;
 
-		make_plan(&again, before);
+		make_plan(&again, before, size_cut, size_height);
 		if (again.severed == NIL)
 			return;
 		fragment_root(again.severed, &root);
@@ -2465,6 +3043,27 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 		ProllyValue value = {(const uint8 *) v.data, v.len};
 
 		PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, &value);
+	}
+	/*
+	 * (what each boundary commit makes over its first parent, severed
+	 * now, kept for when it falls in a fragment itself)
+	 */
+	(void) record_orphans(&plan);
+	/* (the fragment's commits' deltas over parents outside it, as found) */
+	foreach_ptr(Delta, d, deltas)
+		write_delta(&d->id, d->hashes);
+	foreach(lc, plan.edges)
+	{
+		ProllyHash *pair = lfirst(lc);
+		ProllyCommitInfo binfo;
+		ProllyCommitInfo pinfo;
+
+		if (PROLLY_CALL(dc.refs, commit_get, &pair[0], &binfo) &&
+			binfo.nparents > 0 &&
+			binfo.parents[0].len == pair[1].len &&
+			memcmp(binfo.parents[0].bytes, pair[1].bytes, pair[1].len) == 0 &&
+			PROLLY_CALL(dc.refs, commit_get, &pair[1], &pinfo))
+			keep_delta(&pair[0], &binfo, &pinfo);
 	}
 	foreach(lc, plan.edges)
 	{
@@ -2523,13 +3122,445 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 						f.deleted ? "deleted" : "archived",
 						(long long) f.commits, timestamptz_to_str(f.oldest),
 						timestamptz_to_str(f.newest), (long long) f.number),
-				 errdetail("The boundary is %s.  The fragment's commits reach %lld chunks (%lld bytes), those no kept commit reaches freed by the next collection.",
+				 errdetail("The boundary is %s.  The fragment's commits made %lld chunks (%lld bytes), those no kept commit reaches freed by the next collection.",
 						   boundary.data, (long long) f.chunks,
 						   (long long) f.bytes)));
 		pfree(boundary.data);
 	}
 	pfree(k.data);
 	pfree(v.data);
+}
+
+/* ------------------------------------------------------------------------
+ * Background severing
+ * ------------------------------------------------------------------------
+ */
+
+/* Background severing cuts at whole hours where the window names no batch. */
+#define DEFAULT_BACKGROUND_BATCH	USECS_PER_HOUR
+
+#define DEFAULT_COLLECT_INTERVAL	USECS_PER_HOUR
+#define BACKOFF_FIRST		USECS_PER_MINUTE
+#define BACKOFF_MOST		USECS_PER_DAY
+
+/* The background's state, the database's settings in the refs. */
+#define LAST_CUT_SETTING	"history_window.last_cut"	/* :branch, a branch's */
+#define SIZE_PENDING_SETTING "history_window.size_pending"
+#define SIZE_RETRY_SETTING	"history_window.size_retry_at"
+#define MEASURED_SETTING	"history_window.measured"
+#define OVER_COUNT_SETTING	"history_window.over_count"
+#define FULL_WANTED_SETTING	"history_window.full_wanted"
+#define LAST_FULL_SETTING	"history_window.last_full"
+#define FAILURES_SETTING	"history_window.failures"
+#define RETRY_SETTING		"history_window.retry_at"
+#define TRANSIENT_SETTING	"history_window.transient"
+
+/* Failures that pass by themselves tried again at once, this many in a row. */
+#define TRANSIENT_MOST		5
+
+static void
+size_part(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	*(uint64 *) arg += size;
+}
+
+/* What the database's chunk store holds, its journal and table files. */
+static uint64
+store_bytes(void)
+{
+	uint64		bytes = 0;
+
+	PROLLY_CALL(tree_env.chunk_store, segments, tree_env.chunks, false,
+				size_part, &bytes);
+	PROLLY_CALL(tree_env.chunk_store, table_files, tree_env.chunks,
+				size_part, &bytes);
+	return bytes;
+}
+
+static void
+oldest_of(const char *name, const ProllyHash *head, void *arg)
+{
+	void	  **a = arg;
+	HTAB	   *seen = a[0];
+	TimestampTz *oldest = a[1];
+	List	   *todo;
+
+	if (head->len == 0 || !set_add(seen, head))
+		return;
+	todo = list_make1(memcpy(palloc(sizeof(ProllyHash)), head, sizeof(ProllyHash)));
+	while (todo != NIL)
+	{
+		ProllyHash *id = llast(todo);
+		ProllyCommitInfo info;
+
+		todo = list_delete_last(todo);
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			continue;
+		*oldest = Min(*oldest, info.committed_at);
+		for (int i = 0; i < info.nparents; i++)
+			if (!set_has(archived_parents(), &info.parents[i]) &&
+				set_add(seen, &info.parents[i]))
+				todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)),
+											&info.parents[i], sizeof(ProllyHash)));
+	}
+}
+
+/* The oldest date of the history kept here, every branch's. */
+static TimestampTz
+oldest_kept(void)
+{
+	TimestampTz oldest = DT_NOEND;
+	void	   *a[2];
+
+	a[0] = id_set("prolly oldest commit", sizeof(ProllyHash));
+	a[1] = &oldest;
+	PROLLY_CALL(dc.refs, branches, oldest_of, a);
+	hash_destroy(a[0]);
+	return oldest;
+}
+
+/* A setting of the background's, a number (dflt if unset). */
+static int64
+config_int(const char *name, int64 dflt)
+{
+	StringInfoData v;
+	int64		n = dflt;
+
+	initStringInfo(&v);
+	if (PROLLY_CALL(dc.refs, config_get, name, &v))
+		n = strtoll(v.data, NULL, 10);
+	pfree(v.data);
+	return n;
+}
+
+/* Set it (unset: none), written only if it changes. */
+static void
+config_int_set(const char *name, int64 n, bool unset)
+{
+	StringInfoData v;
+	bool		had;
+	char		buf[32];
+
+	initStringInfo(&v);
+	had = PROLLY_CALL(dc.refs, config_get, name, &v);
+	snprintf(buf, sizeof(buf), INT64_FORMAT, n);
+	if (unset ? had : (!had || strcmp(v.data, buf) != 0))
+		PROLLY_CALL(dc.refs, config_set, name, unset ? NULL : buf);
+	pfree(v.data);
+}
+
+static char *
+last_cut_key(const char *branch)
+{
+	return branch ? psprintf("%s:%s", LAST_CUT_SETTING, branch) :
+		pstrdup(LAST_CUT_SETTING);
+}
+
+/* The least time between the background's full collections. */
+static int64
+collect_interval(void)
+{
+	int64		usec = database_span("prolly.history_collect_interval");
+
+	return usec > 0 ? usec : DEFAULT_COLLECT_INTERVAL;
+}
+
+typedef struct LineageCut
+{
+	char	   *key;			/* its last cut's setting */
+	TimestampTz cut;
+} LineageCut;
+
+
+/*
+ * The cuts that moved since each was last tried: every branch's, by its
+ * lineage's policy (its own window, min_commits and batch over the
+ * database's), and the database's, for the other refs.  So a branch's own
+ * window is severed in the background, at its own batch, with none for
+ * the database.  *any: some lineage has a window.
+ */
+static List *
+moved_cuts(TimestampTz now, bool *any)
+{
+	List	   *names = list_make1(NULL);
+	List	   *moved = NIL;
+
+	*any = false;
+	PROLLY_CALL(dc.refs, branches, note_lineage, &names);
+	foreach_ptr(char, name, names)
+	{
+		ProllyWindowPolicy p;
+		int64		batch;
+		TimestampTz cut;
+		char	   *key;
+
+		archive_policy(name, &p);
+		if (p.keep_time == 0 && p.keep_commits == 0)
+			continue;
+		*any = true;
+		batch = p.batch > 0 ? p.batch : DEFAULT_BACKGROUND_BATCH;
+		cut = p.keep_time > 0 ? now - p.keep_time : now;
+		cut -= ((cut % batch) + batch) % batch;
+		key = last_cut_key(name);
+		if (cut > config_int(key, DT_NOBEGIN))
+		{
+			LineageCut *lc = palloc(sizeof(LineageCut));
+
+			lc->key = key;
+			lc->cut = cut;
+			moved = lappend(moved, lc);
+		}
+	}
+	return moved;
+}
+
+/*
+ * Over prolly.history_max_size: the cut a batch past the oldest history
+ * kept (and past the last cut for size), if the store is over by
+ * what the last full collection the background ran left (the chunks it
+ * kept, the unlinks it deferred not counted: the store's files as its
+ * manifest has them), and no sever for size has been made since.  So a
+ * batch at most for each collection that ran and was measured, never more
+ * because freeing lags; in delete mode, only once two measurements in a
+ * row say so.  A measurement wanted (none yet, or the store's files over
+ * though the last was under) asks for a full collection; DT_NOBEGIN: no
+ * cut for size.
+ */
+static TimestampTz
+size_cut_due(const ProllyWindowPolicy *db, TimestampTz now, bool *want_full)
+{
+	int64		measured;
+	int64		batch = db->batch > 0 ? db->batch : DEFAULT_BACKGROUND_BATCH;
+	TimestampTz cut;
+
+	if (db->max_bytes <= 0)
+		return DT_NOBEGIN;
+	if (config_int(SIZE_PENDING_SETTING, 0) != 0 ||
+		now < config_int(SIZE_RETRY_SETTING, DT_NOBEGIN))
+		return DT_NOBEGIN;
+	measured = config_int(MEASURED_SETTING, -1);
+	if (measured < 0 || measured <= db->max_bytes)
+	{
+		if (store_bytes() > (uint64) db->max_bytes)
+			*want_full = true;
+		return DT_NOBEGIN;
+	}
+	if (config_int(OVER_COUNT_SETTING, 0) <
+		(db->action == PROLLY_WINDOW_DELETE ? 2 : 1))
+	{
+		*want_full = true;
+		return DT_NOBEGIN;
+	}
+	/* (a batch past the oldest history kept, never short of the last) */
+	cut = oldest_kept();
+	if (cut == DT_NOEND)
+		return DT_NOBEGIN;
+	cut = Max(cut, config_int(SIZE_CUT_SETTING, DT_NOBEGIN));
+	return Min(cut + batch, now);
+}
+
+static void
+maintain_as_owner(const ProllyWindowPolicy *db, List *moved,
+				  TimestampTz size_cut, ProllyWindowResult *r)
+{
+	HeapTuple	tuple;
+	Oid			owner;
+	Oid			save_userid;
+	int			save_sec;
+
+	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	owner = ((Form_pg_database) GETSTRUCT(tuple))->datdba;
+	ReleaseSysCache(tuple);
+
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	SetUserIdAndSecContext(owner, save_sec | SECURITY_RESTRICTED_OPERATION);
+	PG_TRY();
+	{
+		/*
+		 * (the cuts tried noted after, not before: a refs write takes the
+		 * refs' lock to the transaction's end, and commits would wait on
+		 * this worker through the archive's transfer)
+		 */
+		sever_in_background = true;
+		sever_cut(db->action, NULL, size_cut, r);
+		sever_in_background = false;
+		if (!sever_busy)
+			foreach_ptr(LineageCut, lc, moved)
+				config_int_set(lc->key, lc->cut, false);
+	}
+	PG_FINALLY();
+	{
+		sever_in_background = false;
+		SetUserIdAndSecContext(save_userid, save_sec);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The history window severed in the background (autovacuum's visit), as
+ * the database's owner, so an archive's checks are the owner's, as at
+ * dolt_history_sever(): only once some lineage's cut, rounded down to its
+ * batch, has moved past the last one tried, or the size limit says (see
+ * size_cut_due()).  A try that fails is reported and retried after a
+ * wait that doubles with each failure in a row (a minute, to a day), not
+ * at every visit.  True if a fragment was made: what only it reached is a
+ * full collection's (collect_due()), which several fragments share.
+ */
+static bool
+archive_maintain(void)
+{
+	ProllyWindowPolicy db;
+	ProllyWindowResult r;
+	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz size_cut;
+	List	   *moved;
+	bool		any;
+	bool		want_full = false;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int64		failures;
+
+	window_init();
+	archive_policy(NULL, &db);
+	if (db.action == PROLLY_WINDOW_NONE)
+		return false;
+	if (now < config_int(RETRY_SETTING, DT_NOBEGIN))
+		return false;
+	moved = moved_cuts(now, &any);
+	size_cut = size_cut_due(&db, now, &want_full);
+	if (moved == NIL && size_cut == DT_NOBEGIN)
+	{
+		if (want_full)
+			config_int_set(FULL_WANTED_SETTING, 1, false);
+		return false;
+	}
+
+	memset(&r, 0, sizeof(r));
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		maintain_as_owner(&db, moved, size_cut, &r);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		int64		wait;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		/*
+		 * (one that passes by itself, the history moved meanwhile, a
+		 * cancel by a lock's waiter, a lock not got: tried again at the
+		 * next visit, no wait, no failure counted)
+		 */
+		if ((edata->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+			 edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			 edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE ||
+			 edata->sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED) &&
+			config_int(TRANSIENT_SETTING, 0) + 1 < TRANSIENT_MOST)
+		{
+			config_int_set(TRANSIENT_SETTING,
+						   config_int(TRANSIENT_SETTING, 0) + 1, false);
+			ereport(LOG,
+					(errmsg("background severing of history of database \"%s\" given up for now: %s",
+							get_database_name(MyDatabaseId), edata->message),
+					 errhint("Tried again at the next visit.")));
+			FreeErrorData(edata);
+			return false;
+		}
+		failures = config_int(FAILURES_SETTING, 0) + 1;
+		wait = BACKOFF_FIRST;
+		for (int64 i = 1; i < failures && wait < BACKOFF_MOST; i++)
+			wait *= 2;
+		wait = Min(wait, BACKOFF_MOST);
+		config_int_set(FAILURES_SETTING, failures, false);
+		config_int_set(RETRY_SETTING, now + wait, false);
+		ereport(WARNING,
+				(errcode(edata->sqlerrcode),
+				 errmsg("background severing of history of database \"%s\" failed: %s",
+						get_database_name(MyDatabaseId), edata->message),
+				 edata->detail ? errdetail_internal("%s", edata->detail) : 0,
+				 errhint("Tried again in %lld seconds (failure %lld in a row).",
+						 (long long) (wait / USECS_PER_SEC),
+						 (long long) failures)));
+		FreeErrorData(edata);
+		return false;
+	}
+	PG_END_TRY();
+	/* (another sever has the turn: this visit's cuts tried at the next) */
+	if (sever_busy)
+		return false;
+	config_int_set(FAILURES_SETTING, 0, true);
+	config_int_set(RETRY_SETTING, 0, true);
+	config_int_set(TRANSIENT_SETTING, 0, true);
+	if (r.fragment > 0 || want_full)
+		config_int_set(FULL_WANTED_SETTING, 1, false);
+	if (size_cut != DT_NOBEGIN)
+	{
+		/* (one batch for size per measurement, a fragment made or not) */
+		if (r.fragment > 0)
+		{
+			config_int_set(SIZE_CUT_SETTING, size_cut, false);
+			config_int_set(SIZE_PENDING_SETTING, 1, false);
+		}
+		else
+			config_int_set(SIZE_RETRY_SETTING, now + collect_interval(), false);
+		config_int_set(OVER_COUNT_SETTING, 0, false);
+	}
+	return r.fragment > 0;
+}
+
+/*
+ * Whether the background's collection is a full one now: fragments made
+ * (or a measurement asked for) since its last full one, which ended at
+ * least prolly.history_collect_interval ago (an hour where unset): so
+ * several fragments share one collection, and full collections never run
+ * back to back.
+ */
+static bool
+archive_collect_due(void)
+{
+	window_init();
+	if (config_int(FULL_WANTED_SETTING, 0) == 0)
+		return false;
+	return GetCurrentTimestamp() >=
+		config_int(LAST_FULL_SETTING, DT_NOBEGIN) + collect_interval();
+}
+
+/*
+ * The background's full collection done: when, and the store as it left
+ * it (measured for the size limit), the fragments it freed no longer
+ * waiting.
+ */
+static void
+archive_collected(void)
+{
+	ProllyWindowPolicy db;
+	uint64		bytes;
+
+	window_init();
+	archive_policy(NULL, &db);
+	bytes = store_bytes();
+	config_int_set(LAST_FULL_SETTING, GetCurrentTimestamp(), false);
+	config_int_set(MEASURED_SETTING, (int64) bytes, false);
+	config_int_set(FULL_WANTED_SETTING, 0, true);
+	config_int_set(SIZE_PENDING_SETTING, 0, true);
+	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
+		config_int_set(OVER_COUNT_SETTING,
+					   config_int(OVER_COUNT_SETTING, 0) + 1, false);
+	else
+		config_int_set(OVER_COUNT_SETTING, 0, true);
 }
 
 /* ------------------------------------------------------------------------
@@ -2678,6 +3709,20 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
 	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
+static bool
+collect_delta_key(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	List	  **keys = arg;
+	StringInfo	k;
+
+	if (key->len < 1 || key->data[0] != KEY_DELTA)
+		return false;
+	k = makeStringInfo();
+	appendBinaryStringInfo(k, (const char *) key->data, key->len);
+	*keys = lappend(*keys, k);
+	return true;
+}
+
 /*
  * Repair the newest nfragments of the horizon's fragments (all, if < 0),
  * newest first: each one's chunks received from source (a remote's name
@@ -2708,7 +3753,7 @@ archive_repair(const char *source, int nfragments)
 	 * first, before the chunk store's that a receive takes to the end of
 	 * the transaction, as a collection takes them.
 	 */
-	sever_slot_lock();
+	(void) sever_slot_lock();
 	horizon_lock(ExclusiveLock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, r, records)
@@ -2777,7 +3822,7 @@ archive_repair(const char *source, int nfragments)
 		foreach_ptr(PlanCommit, pc, commits)
 			ids = lappend(ids, &pc->id);
 		fragment_root(commits, &root);
-		fragment_closure(ids, &digest, &chunks, &bytes, NULL);
+		fragment_closure(ids, &digest, &chunks, &bytes, NULL, NULL);
 		if (list_length(commits) != r->f.commits || !same_hash(&root, &r->f.root) ||
 			!same_hash(&digest, &r->f.digest))
 			ereport(ERROR,
@@ -2790,14 +3835,28 @@ archive_repair(const char *source, int nfragments)
 							   prolly_hash_hex(&r->f.root),
 							   prolly_hash_hex(&r->f.digest))));
 
-		/* (its edges and record let go of: the boundary keeps its parents) */
+		/*
+		 * (its edges and record let go of: the boundary keeps its parents;
+		 * and a boundary's delta over a first parent back here, which a
+		 * walk finds again)
+		 */
 		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
 					ForwardScanDirection, collect_edge_of, &eo);
 		foreach_ptr(StringInfoData, ek, eo.keys)
 		{
 			ProllyKey	key = {(const uint8 *) ek->data, ek->len};
+			ProllyHash	parent;
+			ProllyHash	boundary;
+			ProllyCommitInfo binfo;
+			const char *p = ek->data + 1;
+			const char *end = ek->data + ek->len;
 
+			p = get_id(p, end, &parent);
+			(void) get_id(p, end, &boundary);
 			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+			if (PROLLY_CALL(dc.refs, commit_get, &boundary, &binfo) &&
+				binfo.nparents > 0 && same_hash(&binfo.parents[0], &parent))
+				drop_delta(&boundary);
 		}
 		initStringInfo(&k);
 		number_key(&k, KEY_FRAGMENT, r->f.number);
@@ -2815,6 +3874,22 @@ archive_repair(const char *source, int nfragments)
 						(long long) r->f.commits,
 						timestamptz_to_str(r->f.oldest),
 						timestamptz_to_str(r->f.newest), url)));
+	}
+	/* (the horizon empty, no boundary's delta is wanted any more) */
+	if (repaired > 0 && fragment_records() == NIL)
+	{
+		char		d = KEY_DELTA;
+		ProllyKey	from = {(const uint8 *) &d, 1};
+		List	   *keys = NIL;
+
+		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+					ForwardScanDirection, collect_delta_key, &keys);
+		foreach_ptr(StringInfoData, dk, keys)
+		{
+			ProllyKey	key = {(const uint8 *) dk->data, dk->len};
+
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		}
 	}
 	return repaired;
 }
@@ -2874,12 +3949,52 @@ prolly_window_check_absent(const ProllyHash *id)
 				 errhint("Run dolt_history_repair() to reattach it.")));
 }
 
+HTAB *
+prolly_window_horizon(void)
+{
+	ProllyDatabaseComponents c;
+	HTAB	   *now;
+	HTAB	   *copy;
+	HASH_SEQ_STATUS seq;
+	ProllyHash *id;
+
+	prolly_database_components(&c);
+	if (c.history_window != &prolly_window_archive || !IsTransactionState())
+		return NULL;
+	window_init();
+	if (!PROLLY_HAS(dc.refs, side_scan))
+		return NULL;
+	now = archived_parents();
+	copy = id_set("prolly horizon held", sizeof(ProllyHash));
+	hash_seq_init(&seq, now);
+	while ((id = hash_seq_search(&seq)) != NULL)
+		(void) hash_search(copy, id, HASH_ENTER, NULL);
+	return copy;
+}
+
+static bool stops_at(bool archived, const ProllyHash *parent);
+
+bool
+prolly_window_held_stops_at(HTAB *horizon, const ProllyHash *parent)
+{
+	if (horizon == NULL)
+		return prolly_window_stops_at(parent);
+	return stops_at(parent->len > 0 && set_has(horizon, parent), parent);
+}
+
 bool
 prolly_window_stops_at(const ProllyHash *parent)
 {
+	return stops_at(prolly_window_archived(parent), parent);
+}
+
+/* (the notice, once a transaction, for a listing stopping at parent) */
+static bool
+stops_at(bool archived, const ProllyHash *parent)
+{
 	static LocalTransactionId told = InvalidLocalTransactionId;
 
-	if (!prolly_window_archived(parent))
+	if (!archived)
 		return false;
 	if (told != MyProc->vxid.lxid)
 	{
@@ -2910,6 +4025,9 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.repair = archive_repair,
 	.policy = archive_policy,
 	.set_policy = archive_set_policy,
+	.maintain = archive_maintain,
+	.collect_due = archive_collect_due,
+	.collected = archive_collected,
 	.window = archive_window,
 	.in_window = archive_in_window,
 };

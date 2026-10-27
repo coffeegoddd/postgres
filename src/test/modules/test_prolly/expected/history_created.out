@@ -1,0 +1,1627 @@
+-- What a fragment's commits made is the same however it is found: walked
+-- with their parents here, or, past an older fragment's sever, from the
+-- delta kept for its boundary.  Each shape of history below is severed in
+-- two fragments, let go of, and repaired from a remote, which verifies the
+-- set found at the sever against the set found at the repair.
+\getenv abs_builddir PG_ABS_BUILDDIR
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set shape_file :abs_srcdir '/sql/history_created_shape.psql'
+\set dir :abs_builddir '/tmp_check/history_created'
+SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+SELECT current_database() AS home \gset
+\set VERBOSITY terse
+\set shape revert
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+ same_history 
+--------------
+ t
+(1 row)
+
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+\set shape resurrect
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+ same_history 
+--------------
+ t
+(1 row)
+
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+\set shape append
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+ same_history 
+--------------
+ t
+(1 row)
+
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+\set shape merge
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+ side 
+------
+ t
+(1 row)
+
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+ main 
+------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+ side_gone 
+-----------
+ t
+(1 row)
+
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+ same_history 
+--------------
+ t
+(1 row)
+
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+\set shape create_drop
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+ same_history 
+--------------
+ t
+(1 row)
+
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+\set shape amend
+\i :shape_file
+-- One shape of history, severed in two fragments and repaired: its second
+-- fragment's set is found by walking its commits while the first's are
+-- still here, and again, at the repair, with them gone (the boundary's
+-- delta kept); the repair verifies only if the two agree.
+SELECT :'shape' = 'revert' AS s_revert, :'shape' = 'resurrect' AS s_resurrect,
+	   :'shape' = 'append' AS s_append, :'shape' = 'merge' AS s_merge,
+	   :'shape' = 'create_drop' AS s_create_drop,
+	   :'shape' = 'amend' AS s_amend \gset
+CREATE DATABASE regress_history_created;
+-- (notices name this file's path)
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE TABLE hc.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hc_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+CREATE FUNCTION hc_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END $$;
+CREATE FUNCTION hc_rows() RETURNS text LANGUAGE sql AS $$
+	SELECT md5(string_agg(c.commit_hash || ':' ||
+		(SELECT coalesce(md5(string_agg(id || '=' || v, ',' ORDER BY id)), '')
+		 FROM dolt_at(c.commit_hash, NULL::hc.t)), ',' ORDER BY c.commit_order))
+	FROM dolt_log('main') c
+$$;
+INSERT INTO hc.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hc_commit('base', 1)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'base' WHERE id % 3 = 0;
+SELECT length(hc_commit('base 2', 2)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\if :s_revert
+-- a table made, a row changed, and changed back: its root is the first's
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+UPDATE hc.n SET v = repeat('n', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+\endif
+\if :s_resurrect
+-- rows deleted, then put back as they were
+DELETE FROM hc.t WHERE id BETWEEN 100 AND 200;
+SELECT length(hc_commit('deleted', 3)) > 0 AS committed;
+INSERT INTO hc.t SELECT g, CASE WHEN g % 3 = 0 THEN 'base' ELSE 'v' || g END FROM generate_series(100, 200) g;
+SELECT length(hc_commit('put back', 4)) > 0 AS committed;
+UPDATE hc.t SET v = 'x' WHERE id = 5;
+SELECT length(hc_commit('after', 5)) > 0 AS committed;
+\endif
+\if :s_append
+-- a table made, then appended to past its last key, twice
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1501, 21500) g;
+SELECT length(hc_commit('appended', 4)) > 0 AS committed;
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(21501, 22000) g;
+SELECT length(hc_commit('appended again', 5)) > 0 AS committed;
+\endif
+\if :s_merge
+-- a table made on main, a branch's change merged in
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+SELECT dolt_checkout('-b', 'side') IS NOT NULL AS side;
+UPDATE hc.n SET v = 'side' WHERE id = 10;
+SELECT length(hc_commit('on side', 4)) > 0 AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS main;
+UPDATE hc.t SET v = 'main' WHERE id = 290;
+SELECT length(hc_commit('on main', 5)) > 0 AS committed;
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged', '--date', '2020-01-07'))[4] IS NOT NULL AS merged;
+SELECT dolt_branch('-D', 'side') IS NOT NULL AS side_gone;
+\endif
+\if :s_amend
+-- a table made; after the first sever, the boundary amended: a commit
+-- whose first parent is severed, past no recorded edge
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\endif
+\if :s_create_drop
+-- a table made, dropped, and made again as it was
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made', 3)) > 0 AS committed;
+DROP TABLE hc.n;
+SELECT length(hc_commit('dropped', 4)) > 0 AS committed;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 1500) g;
+SELECT length(hc_commit('made again', 5)) > 0 AS committed;
+\endif
+-- (then what the shape made let go of, the history kept past it)
+DROP TABLE IF EXISTS hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT hc_rows() AS seen \gset
+\c regress_history_created
+\c regress_history_created
+SELECT dolt_remote('add', 'origin', :'url' || '_' || :'shape');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | severed 
+----------+---------
+        1 | t
+(1 row)
+
+\if :s_amend
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log('main') WHERE message = 'made')) IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+UPDATE hc.n SET v = repeat('m', 40) || id;
+SELECT length(trim(both '{}' from dolt_commit('--amend', '-Am', 'made, amended', '--date', '2020-01-04')::text)) > 0 AS amended;
+ amended 
+---------
+ t
+(1 row)
+
+UPDATE hc.n SET v = 'changed' WHERE id = 200;
+SELECT length(hc_commit('changed', 4)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.n SET v = repeat('m', 40) || 200 WHERE id = 200;
+SELECT length(hc_commit('reverted', 5)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DROP TABLE hc.n;
+UPDATE hc.t SET v = 'later' WHERE id = 1;
+SELECT length(hc_commit('later', 9)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 2;
+SELECT length(hc_commit('later 2', 10)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc.t SET v = 'later' WHERE id = 3;
+SELECT length(hc_commit('later 3', 11)) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\c regress_history_created
+SELECT dolt_push('--force', 'origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+-- (the horizon told of the amend's edge to its severed parent by a sever
+-- that cuts nothing, so a collection frees that parent)
+SELECT tops[1] AS severed_top FROM prolly_history_horizon() \gset
+SELECT commits FROM dolt_history_drop('2020-01-01 00:00+00');
+ commits 
+---------
+       0
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT hc_err(format('SELECT prolly_root_hash(%L)', :'severed_top')) AS parent_freed;
+               parent_freed                
+-------------------------------------------
+ commit <hash> is past the history horizon
+(1 row)
+
+\endif
+SELECT fragment, commits > 0 AS severed FROM dolt_history_drop('2020-01-08 00:00+00');
+ fragment | severed 
+----------+---------
+        2 | t
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+-- (the newer fragment first, the older one's commits gone, then the rest)
+SELECT dolt_history_repair('origin', 1) AS repaired_newer;
+ repaired_newer 
+----------------
+              1
+(1 row)
+
+SELECT dolt_history_repair('origin') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments_left FROM prolly_history_horizon();
+ fragments_left 
+----------------
+              0
+(1 row)
+
+\if :s_amend
+-- (its history read before was cut at the first sever: read whole now)
+SELECT count(*) AS logged, string_agg(message, ', ' ORDER BY commit_order) AS log
+FROM dolt_log('main');
+ logged |                                   log                                   
+--------+-------------------------------------------------------------------------
+      8 | base, base 2, made, amended, changed, reverted, later, later 2, later 3
+(1 row)
+
+\else
+SELECT hc_rows() = :'seen' AS same_history;
+\endif
+\c :home
+DROP DATABASE regress_history_created;
+-- A table renamed, or moved to another schema, is the same tree under
+-- another name: what the commit makes is what changed, not the table
+-- again.  (The fragment's chunks count it: a few, where the table has
+-- hundreds.)
+CREATE DATABASE regress_history_created;
+ALTER DATABASE regress_history_created SET client_min_messages = warning;
+\c regress_history_created
+CREATE SCHEMA hc VERSIONED;
+CREATE SCHEMA hc2 VERSIONED;
+CREATE TABLE hc.n (id int PRIMARY KEY, v text);
+INSERT INTO hc.n SELECT g, repeat('n', 40) || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'made', '--date', '2020-01-02')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE hc.n RENAME TO renamed;
+SELECT length(dolt_commit('-Am', 'renamed', '--date', '2020-01-03')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE hc.renamed SET SCHEMA hc2;
+SELECT length(dolt_commit('-Am', 'moved', '--date', '2020-01-04')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- (a table dropped beside one renamed, the two alike but for their rows:
+-- the renamed one paired with its own tree, not the dropped one's)
+CREATE TABLE hc2.a (id int PRIMARY KEY, v text);
+INSERT INTO hc2.a SELECT g, repeat('a', 40) || g FROM generate_series(1, 20000) g;
+CREATE TABLE hc2.b (id int PRIMARY KEY, v text);
+INSERT INTO hc2.b SELECT g, repeat('b', 40) || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'two alike', '--date', '2020-01-05')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DROP TABLE hc2.a;
+ALTER TABLE hc2.b RENAME TO c;
+SELECT length(dolt_commit('-Am', 'dropped and renamed', '--date', '2020-01-06')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc2.renamed SET v = 'later' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'later', '--date', '2020-01-10')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc2.renamed SET v = 'later' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 'later 2', '--date', '2020-01-11')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hc2.renamed SET v = 'later' WHERE id = 3;
+SELECT length(dolt_commit('-Am', 'later 3', '--date', '2020-01-12')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits, chunks > 100 AS the_table FROM dolt_history_drop('2020-01-02 12:00+00');
+ fragment | commits | the_table 
+----------+---------+-----------
+        1 |       1 | t
+(1 row)
+
+SELECT fragment, commits, chunks < 20 AS only_what_changed FROM dolt_history_drop('2020-01-05 00:00+00');
+ fragment | commits | only_what_changed 
+----------+---------+-------------------
+        2 |       2 | t
+(1 row)
+
+SELECT fragment, commits, chunks > 100 AS the_tables FROM dolt_history_drop('2020-01-05 12:00+00');
+ fragment | commits | the_tables 
+----------+---------+------------
+        3 |       1 | t
+(1 row)
+
+SELECT fragment, commits, chunks < 20 AS only_what_changed FROM dolt_history_drop('2020-01-06 12:00+00');
+ fragment | commits | only_what_changed 
+----------+---------+-------------------
+        4 |       1 | t
+(1 row)
+
+\c :home
+DROP DATABASE regress_history_created;
