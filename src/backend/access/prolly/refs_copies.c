@@ -3681,6 +3681,7 @@ int			prolly_kept_commits = 2;
 int			prolly_restore_min_changes = 2;
 int			prolly_root_interval = -1;
 int			prolly_root_interval_commits = 1;
+bool		prolly_freeze_roots = true;
 
 
 typedef struct KeptTable
@@ -3707,6 +3708,26 @@ typedef struct KeptCommit
 #define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
 
 static bool commit_height(const ProllyHash *id, int64 *height);
+
+/*
+ * The freezing of a keep's roots as it captures them, if the root freezer
+ * does so and prolly.freeze_roots asks (NULL: they are kept as
+ * captured).  Not under dolt.transaction_commit, whose every transaction's commit would pay it:
+ * there the freezer freezes later.
+ */
+static BranchFreezePage
+freeze_at_keep(const ProllyDatabaseComponents *dc)
+{
+	const char *tc = GetConfigOption("dolt.transaction_commit", true, false);
+
+	if (!prolly_freeze_roots ||
+		dc->root_freezer == NULL || !PROLLY_HAS(dc->root_freezer, at_capture) ||
+		!PROLLY_HAS(dc->root_freezer, freeze_page) ||
+		!dc->root_freezer->at_capture() ||
+		(tc != NULL && strcmp(tc, "on") == 0))
+		return NULL;
+	return dc->root_freezer->freeze_page;
+}
 
 /*
  * Roots are captured at commits, but no more often than the interval asks:
@@ -4636,7 +4657,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	 * transaction's commit would try it)
 	 */
 	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
-							kept_settled, snap))
+							kept_settled, snap, freeze_at_keep(&dc), snap))
 	{
 		root_note(name, GetCurrentTimestamp());
 		return;

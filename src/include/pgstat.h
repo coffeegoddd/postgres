@@ -823,9 +823,14 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BMAP_ROOTS_RELEASED,	/* captured roots let go of */
 	PGSTAT_PROLLY_BMAP_ROOTS_SHARED,	/* relations made of a captured
 										 * root */
+	PGSTAT_PROLLY_BMAP_MAP_PAGES_STAMPED,	/* map pointers set in a new
+											 * epoch, a change under them
+											 * the first since it began */
+	PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ,	/* map nodes read to find the
+											 * pages changed since an epoch */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_ROOTS_SHARED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_CHANGED_NODES_READ + 1)
 
 typedef struct PgStat_ProllyStats
 {

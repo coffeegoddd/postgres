@@ -180,4 +180,17 @@ extern bool prolly_window_archived(const ProllyHash *id);
  */
 extern bool prolly_window_stops_at(const ProllyHash *parent);
 
+/*
+ * The horizon as it stands now, held: a copy of the commits past it (a
+ * set, in CurrentMemoryContext), for a reader that lists history a little
+ * at a time (a cursor's log) and must stop where it would have stopped
+ * when it began, whatever severs or rollbacks come meanwhile.  NULL when
+ * the window keeps none (its listing asks prolly_window_stops_at()).
+ */
+extern struct HTAB *prolly_window_horizon(void);
+
+/* As prolly_window_stops_at(), against a horizon held. */
+extern bool prolly_window_held_stops_at(struct HTAB *horizon,
+										const ProllyHash *parent);
+
 #endif							/* PROLLY_WINDOW_H */

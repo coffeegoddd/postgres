@@ -80,7 +80,7 @@ SELECT * FROM since(:'before');
          name          | value 
 -----------------------+-------
  apply_rows            |     0
- bmap_map_pages_copied |    18
+ bmap_map_pages_copied |    27
  first_use_tables_kept |     3
 (3 rows)
 

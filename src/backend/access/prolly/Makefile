@@ -67,6 +67,8 @@ OBJS = \
 	prolly_dolt.o \
 	prolly_log_count.o \
 	prolly_snapshot.o \
+	prolly_history_scan.o \
+	prolly_log_scan.o \
 	prolly_revision.o \
 	prolly_vcs.o \
 	prolly_autovacuum.o \
@@ -79,6 +81,8 @@ OBJS = \
 	refs_generations.o \
 	refs_history.o \
 	refs_stub.o \
+	rootfreeze_capture.o \
+	rootfreeze_stub.o \
 	transfer_chunks.o \
 	transfer_stub.o \
 	tablefile_basic.o \
