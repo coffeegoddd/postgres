@@ -520,3 +520,27 @@ prolly_history_plan(PG_FUNCTION_ARGS)
 	PROLLY_CALL(w, plan, &before, plan_row, rsinfo);
 	return (Datum) 0;
 }
+
+/*
+ * dolt_history_repair(source text, fragments int) returns int
+ *
+ * Reattach the history horizon's newest fragments (fragments NULL: all of
+ * them), newest first, from source (a remote's name or URL; NULL: each
+ * fragment's archive), each verified against its identity and digest
+ * before the horizon lets go of it: the history reads as it did.  The
+ * count repaired.  The database owner's.
+ */
+Datum
+dolt_history_repair(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	char	   *source = PG_ARGISNULL(0) ? NULL :
+		text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int			n = PG_ARGISNULL(1) ? -1 : PG_GETARG_INT32(1);
+
+	if (!PG_ARGISNULL(1) && n < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("fragments must not be negative")));
+	PG_RETURN_INT32(PROLLY_CALL(w, repair, source, n));
+}

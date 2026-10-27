@@ -34,6 +34,13 @@
  *   for a collection: it holds the horizon's lock shared until the
  *   transaction ends, and refuses a transaction that changed the horizon.
  *   fragments() visits the horizon's fragments, newest first.
+ * - repair() reattaches the newest nfragments of them (< 0: all), newest
+ *   first, from source (a remote's name or URL; NULL: each fragment's
+ *   archive), and lets go of the horizon's record of each only once its
+ *   chunks are back, each re-hashed as received, and its commits give its
+ *   identity and digest again; otherwise nothing changes.  It holds every
+ *   ref and the horizon's lock, and is the database owner's.  The count
+ *   repaired.
  *
  * Provisional (v0).
  *
@@ -121,12 +128,13 @@ typedef struct ProllyWindowRoutine
 						  void *read_arg, ProllyWindowEdgeVisit visit,
 						  void *arg);
 	void		(*fragments) (ProllyWindowFragmentVisit visit, void *arg);
+	int			(*repair) (const char *source, int nfragments);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
-	"plan", "sever", "archived", "edges", "fragments"
+	"plan", "sever", "archived", "edges", "fragments", "repair"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK fragments
+#define PROLLY_WINDOW_LAST_CALLBACK repair
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)

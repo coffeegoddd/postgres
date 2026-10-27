@@ -1,0 +1,301 @@
+-- Repairing history severed at the horizon: a fragment's chunks brought
+-- back from a remote (or a clone) that has them, each re-hashed as it is
+-- received, then the fragment verified against its identity and digest
+-- before the horizon lets go of it.  The history reads as it did, bit for
+-- bit: the log, the hashes, the diffs, every commit's tables.
+\getenv abs_builddir PG_ABS_BUILDDIR
+\set dir :abs_builddir '/tmp_check/history_repair'
+SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+\set url_empty :url '_empty'
+SELECT current_database() AS home \gset
+-- (notices without their details, which name commits by hash)
+\set VERBOSITY terse
+CREATE DATABASE regress_history_repair;
+\c regress_history_repair
+CREATE FUNCTION hr_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
+						  '"/[^"]*"', '"<dir>"', 'g');
+END $$;
+CREATE SCHEMA hr VERSIONED;
+CREATE TABLE hr.t (id int PRIMARY KEY, v text);
+CREATE FUNCTION hr_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+INSERT INTO hr.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(hr_commit('d1', 1)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+UPDATE hr.t SET v = 'd2' WHERE id % 3 = 0;
+SELECT length(hr_commit('d2', 2)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+DELETE FROM hr.t WHERE id > 250;
+SELECT length(hr_commit('d3', 3)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+UPDATE hr.t SET v = 'd4' WHERE id % 5 = 0;
+SELECT length(hr_commit('d4', 4)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+INSERT INTO hr.t VALUES (1000, 'd5');
+SELECT length(hr_commit('d5', 5)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+UPDATE hr.t SET v = 'd6' WHERE id = 1;
+SELECT length(hr_commit('d6', 6)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+UPDATE hr.t SET v = 'd7' WHERE id = 2;
+SELECT length(hr_commit('d7', 7)) AS committed;
+ committed 
+-----------
+        40
+(1 row)
+
+-- history(): the history as read, every bit that should come back the same
+CREATE TABLE hr_seen (what text, n int, got text);
+CREATE FUNCTION hr_history() RETURNS TABLE (what text, n int, got text)
+LANGUAGE plpgsql AS $$
+DECLARE
+	c record;
+	prev text;
+BEGIN
+	FOR c IN SELECT commit_hash, message, date, commit_order FROM dolt_log('main')
+			 ORDER BY commit_order LOOP
+		what := 'log'; n := c.commit_order;
+		got := c.commit_hash || ' ' || c.message || ' ' || c.date;
+		RETURN NEXT;
+		what := 'root'; got := prolly_root_hash(c.commit_hash); RETURN NEXT;
+		what := 'rows';
+		SELECT md5(string_agg(id || '=' || v, ',' ORDER BY id)) INTO got
+		FROM dolt_at(c.commit_hash, NULL::hr.t);
+		RETURN NEXT;
+		IF prev IS NOT NULL THEN
+			what := 'diff';
+			SELECT md5(string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id),
+								  ',' ORDER BY coalesce((to_row).id, (from_row).id)))
+			INTO got FROM dolt_diff(prev, c.commit_hash, NULL::hr.t);
+			RETURN NEXT;
+		END IF;
+		prev := c.commit_hash;
+	END LOOP;
+	what := 'history_rows';
+	n := 0;
+	SELECT count(*)::text INTO got FROM dolt_history_table(NULL::hr.t) h;
+	RETURN NEXT;
+END $$;
+INSERT INTO hr_seen SELECT * FROM hr_history();
+SELECT what, count(*) FROM hr_seen GROUP BY what ORDER BY what;
+     what     | count 
+--------------+-------
+ diff         |     6
+ history_rows |     1
+ log          |     7
+ root         |     7
+ rows         |     7
+(5 rows)
+
+-- A remote has the history; then it is severed here and let go of.
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') AS pushed;
+          pushed           
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+-- (and another has none of it: a database of its own pushed there)
+CREATE DATABASE regress_history_repair_other;
+\c regress_history_repair_other
+CREATE SCHEMA hr VERSIONED;
+CREATE TABLE hr.t (id int PRIMARY KEY, v text);
+SELECT length(dolt_commit('-Am', 'unrelated')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_remote('add', 'empty', :'url_empty');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('empty', 'main') AS pushed_unrelated;
+     pushed_unrelated     
+--------------------------
+ {0,"main -> empty/main"}
+(1 row)
+
+\c regress_history_repair
+DROP DATABASE regress_history_repair_other;
+SELECT dolt_remote('add', 'empty', :'url_empty');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT fragment, commits FROM dolt_history_drop('2020-01-04 00:00+00');
+ fragment | commits 
+----------+---------
+        1 |       2
+(1 row)
+
+SELECT fragment, commits FROM dolt_history_drop('2020-01-05 12:00+00');
+ fragment | commits 
+----------+---------
+        2 |       2
+(1 row)
+
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+ freed 
+-------
+ t
+(1 row)
+
+SELECT fragment, state, commits FROM prolly_history_horizon();
+ fragment |  state  | commits 
+----------+---------+---------
+        2 | deleted |       2
+        1 | deleted |       2
+(2 rows)
+
+SELECT count(*) AS logged FROM dolt_log('main');
+NOTICE:  history stops at the history horizon
+ logged 
+--------
+      3
+(1 row)
+
+-- A deleted fragment is repaired only from where its history is; one
+-- that lacks it repairs nothing.
+SELECT hr_err('SELECT dolt_history_repair()') AS no_source;
+                          no_source                          
+-------------------------------------------------------------
+ fragment 2 of the history horizon was deleted, not archived
+(1 row)
+
+SELECT hr_err($$SELECT dolt_history_repair('empty')$$) AS lacking;
+                    lacking                    
+-----------------------------------------------
+ commit <hash> is missing from the chunk store
+(1 row)
+
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+ fragments 
+-----------
+         2
+(1 row)
+
+-- Only the database's owner repairs.
+CREATE ROLE regress_hr_other;
+SET ROLE regress_hr_other;
+SELECT hr_err($$SELECT dolt_history_repair('origin')$$) AS other;
+                                  other                                   
+--------------------------------------------------------------------------
+ permission denied to repair history of database "regress_history_repair"
+(1 row)
+
+RESET ROLE;
+-- The newest fragment alone: the log reaches its commits, and stops at
+-- the older one's.
+SELECT dolt_history_repair('origin', 1) AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT fragment, commits FROM prolly_history_horizon();
+ fragment | commits 
+----------+---------
+        1 |       2
+(1 row)
+
+SELECT count(*) AS logged FROM dolt_log('main');
+NOTICE:  history stops at the history horizon
+ logged 
+--------
+      5
+(1 row)
+
+-- The rest, by URL: the history is as it was.
+SELECT dolt_history_repair(:'url') AS repaired;
+ repaired 
+----------
+        1
+(1 row)
+
+SELECT count(*) AS fragments FROM prolly_history_horizon();
+ fragments 
+-----------
+         0
+(1 row)
+
+SELECT h.what, h.n, h.got = s.got AS same
+FROM hr_history() h FULL JOIN hr_seen s USING (what, n)
+WHERE h.got IS DISTINCT FROM s.got;
+ what | n | same 
+------+---+------
+(0 rows)
+
+SELECT count(*) AS compared FROM hr_history();
+ compared 
+----------
+       28
+(1 row)
+
+-- And a collection keeps it all, the horizon gone.
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT h.what, h.n FROM hr_history() h FULL JOIN hr_seen s USING (what, n)
+WHERE h.got IS DISTINCT FROM s.got;
+ what | n 
+------+---
+(0 rows)
+
+SELECT hr_err('SELECT dolt_history_repair()') AS nothing_left;
+ nothing_left 
+--------------
+ no error
+(1 row)
+
+\c :home
+DROP DATABASE regress_history_repair;
+DROP ROLE regress_hr_other;

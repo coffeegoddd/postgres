@@ -1695,6 +1695,17 @@ settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
 
+dolt_history_repair(source, fragments) reattaches fragments, newest
+first (all, or the newest few), from a remote or clone that has their
+history (source, by name or URL) or, archived, from where they were
+archived: the transfer receives the tops and what they reach that the
+store lacks, re-hashing each chunk, and the fragment's commits, from its
+tops to its stops, must give its identity and digest again before its
+edges and record are let go of; otherwise nothing changes.  A repair is
+the database owner's and holds the horizon's lock exclusively.  The
+history then reads as it did: the same commits, hashes, roots, rows and
+diffs.
+
 Listings stop at the horizon, as a shallow clone's do: dolt_log, the
 history tables and history mounts list the commits kept, with a notice
 once a transaction; history walks (a merge base's, HEAD~n) don't go past

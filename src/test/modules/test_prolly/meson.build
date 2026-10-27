@@ -169,6 +169,7 @@ tests += {
       'commit_cache',
       'head_log',
       'history_horizon',
+      'history_repair',
       'store_sizes',
       'storage_breakdown',
       'get_many',
