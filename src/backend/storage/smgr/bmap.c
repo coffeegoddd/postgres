@@ -121,7 +121,8 @@
  * frees the blocks allocated as it began that nothing holds, rewrites the
  * stuck counts that now fit, moves the blocks past the allocated count down
  * into free ones (compact_store()), and shortens the store to its last
- * allocated block (SHRINK, which redo truncates by too).  Branch creation (a share,
+ * allocated block (SHRINK, which redo truncates by too), unless another
+ * sweep of it runs, which may still free blocks past that.  Branch creation (a share,
  * the one thing that adds holders) waits for it while it counts, and the
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
@@ -804,20 +805,32 @@ drop_gone_buffers(SMgrRelation reln)
 
 typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
 
-/*
- * Has reln's map gone, or is it going: its file unlinked, or emptied, as
- * md.c empties a fork's file just before unlinking it?  A map is never
- * empty otherwise, except as it is made, before its first pages.
- */
-static bool
-map_going(SMgrRelation reln)
+/* the size of reln's fork's file, or -1 if it has none */
+static off_t
+fork_size(SMgrRelation reln, ForkNumber fork)
 {
-	RelPathStr	path = relpathperm(reln->smgr_rlocator.locator, BMAP_FORKNUM);
+	RelPathStr	path = relpathperm(reln->smgr_rlocator.locator, fork);
 	struct stat st;
 
 	if (stat(path.str, &st) < 0)
-		return errno == ENOENT;
-	return st.st_size == 0;
+		return errno == ENOENT ? -1 : 1;
+	return st.st_size;
+}
+
+/*
+ * Has reln's map gone, or is it going: its file unlinked, or emptied, as
+ * md.c empties a fork's file just before unlinking it?  A map is never
+ * empty otherwise, except as it is made, before its first pages.  Its
+ * changes list's file going (it had pages when the read began, 'had_chg')
+ * says so too: a drop's unlink removes the forks one at a time, and
+ * nothing else empties or removes the list while its header is held, as
+ * its readers hold it.
+ */
+static bool
+map_going(SMgrRelation reln, bool had_chg)
+{
+	return fork_size(reln, BMAP_FORKNUM) <= 0 ||
+		(had_chg && fork_size(reln, BMAP_CHANGES_FORKNUM) <= 0);
 }
 
 /*
@@ -845,6 +858,7 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
 	ErrorData  *edata = NULL;
+	bool		had_chg = fork_size(reln, BMAP_CHANGES_FORKNUM) > 0;
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -870,7 +884,7 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 		return true;
 	if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_OPERATOR_INTERVENTION &&
 		ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_INSUFFICIENT_RESOURCES &&
-		map_going(reln))
+		map_going(reln, had_chg))
 	{
 		ereport(DEBUG1,
 				(errmsg_internal("map of relation %u passed over, dropped as it was read: %s",
@@ -11152,6 +11166,15 @@ sweep_recount(RelFileLocator rel, const BlockNumber *stuck, uint32 n,
  * Shorten the page store to its last allocated block: the high-water mark
  * lowered and the file truncated, the record first.  Under the metapage's
  * lock, so nothing is allocated meanwhile.
+ *
+ * Not while another sweep of the store runs (this one no longer counts
+ * itself).  That sweep may have counted blocks this one has since freed,
+ * as nothing held them, and still be about to free them.  Shortened past
+ * them, the store would grow again into the same block numbers, the
+ * allocator taking no free block while a sweep runs, and its frees would
+ * then let go of blocks a relation holds.  A sweep that begins after the
+ * check reads the metapage after the store is shortened.  The next sweep
+ * shortens it.
  */
 static BlockNumber
 sweep_shrink(RelFileLocator rel)
@@ -11170,6 +11193,11 @@ sweep_shrink(RelFileLocator rel)
 	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
 	meta = PageGetBmapMeta(BufferGetPage(metabuf));
 	hw = new_hw = meta->hw;
+	if (sweep_running(rel))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return 0;
+	}
 
 	/* each bitmap page read once, from the end, a word of free blocks at once */
 	while (new_hw > 0)
@@ -12394,6 +12422,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	FreeDir(dir);
 	sweep_roots_free(&sr);
 	LockRelease(&tag, ExclusiveLock, false);
+	INJECTION_POINT("bmap-sweep-freeing", NULL);
 
 	/* (a block nothing holds gets no new holder: freed after the lock) */
 	free_blocks(rel, tofree.blocks, tofree.n);

@@ -426,6 +426,7 @@ tests += {
       't/420_status_from_fold.pl',
       't/340_bmap_sweep_dropped_map.pl',
       't/810_dropped_map_readers.pl',
+      't/811_sweep_shrink_concurrent.pl',
       't/341_fold_trim_no_wait.pl',
       't/342_fold_worker_drop.pl',
       't/343_autofold_drop.pl',
