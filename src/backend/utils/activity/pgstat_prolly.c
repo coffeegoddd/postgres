@@ -179,6 +179,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_ROOTS_FROZEN_LATER] = "roots_frozen_later",
 	[PGSTAT_PROLLY_BUFFER_GENERATIONS] = "buffer_generations",
 	[PGSTAT_PROLLY_BUFFER_REL_GENERATIONS] = "buffer_rel_generations",
+	[PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ] = "bmap_roots_pages_read",
 };
 
 /*

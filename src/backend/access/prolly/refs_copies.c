@@ -372,6 +372,11 @@
  * it; 22: other components' entries (the history horizon).
  * 23: kept relations' pages by roots their page stores keep (not
  * snapshots their storage keeps), and each kept commit's time.
+ * 24: kept relations' flags and frozen roots' undecided pages, kept
+ * commits' flags and the snapshot their roots captured among writers are
+ * to be frozen as of, and branches keeping such roots under their own
+ * tag; and frozen roots' pages all-visible where no dead line pointer is
+ * left (a restore sets its visibility map from them).
  */
 #define REFS_FORMAT		"24"
 

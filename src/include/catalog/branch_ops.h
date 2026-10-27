@@ -311,8 +311,10 @@ typedef struct BranchOpsRoutine
 	 * going when the transaction commits, into renewed[] (each one kept as
 	 * it is now: by the same root, named as of its new storage).  O(1) in
 	 * each relation's size, and nothing if none changed since: if one did,
-	 * each gets new storage made of its root (with no free space or
-	 * visibility map, but for one unchanged since, which takes its own), its row the oldest
+	 * each gets new storage made of its root (with no free space map, and
+	 * no visibility map but for a frozen root's, whose map is its storage's
+	 * for the pages unchanged since and each changed page's frozen copy's
+	 * for the others), its row the oldest
 	 * transaction ids it had then (one unchanged may hold hints, in its
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its

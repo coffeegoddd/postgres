@@ -40,12 +40,14 @@
  *   with xmin frozen, xmax invalid and no update chain; the others are
  *   dead line pointers, but for a HOT chain's root, which redirects to the
  *   version left.  Line pointers are never made unused, nor moved.  The
- *   page's all-visible flag and prune hint are cleared.  Returns whether
- *   any version was left.  *undecided says whether the page as frozen
- *   depends on a transaction the snapshot doesn't see that hasn't aborted
- *   (running then, or begun since, and perhaps committed now): a later
- *   snapshot may see it, so the same page frozen as of that one may
- *   differ.
+ *   page's prune hint is cleared, and its all-visible flag set if no dead
+ *   line pointer is left (every version left is frozen, so the page is
+ *   all-visible and all-frozen: a restore of the root sets its visibility
+ *   map bits from the flag), cleared otherwise.  Returns whether any
+ *   version was left.  *undecided says whether the page as frozen depends
+ *   on a transaction the snapshot doesn't see that hasn't aborted (running
+ *   then, or begun since, and perhaps committed now): a later snapshot may
+ *   see it, so the same page frozen as of that one may differ.
  * - freeze_later() says whether a root captured as it is, writers at
  *   work, is frozen later, in the background, before the database forgets
  *   the ids it holds; asked as such a root is about to be captured, it

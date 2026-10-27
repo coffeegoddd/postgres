@@ -837,9 +837,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BUFFER_GENERATIONS,	/* raises of every cached page's
 										 * generation of sharing */
 	PGSTAT_PROLLY_BUFFER_REL_GENERATIONS,	/* and of one relation's */
+	PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ,	/* pages of captured roots' slots
+											 * read */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BUFFER_REL_GENERATIONS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ + 1)
 
 typedef struct PgStat_ProllyStats
 {
