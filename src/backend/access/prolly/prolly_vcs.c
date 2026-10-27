@@ -529,7 +529,8 @@ plan_row(ProllyWindowItemKind kind, const ProllyHash *commit,
  * prolly_history_plan(before timestamptz)
  *	returns setof (kind text, commit_hash text, parent_hash text, why text)
  *
- * What a sever before before would do, doing none of it: each commit it
+ * What a sever before before (NULL: as the database's window has it)
+ * would do, doing none of it: each commit it
  * would sever, each boundary commit with the parent it would no longer
  * keep, and each commit kept past the window and why (a ref's, a merge
  * base's).
@@ -539,10 +540,10 @@ prolly_history_plan(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	const ProllyWindowRoutine *w = database_window();
-	TimestampTz before = PG_GETARG_TIMESTAMPTZ(0);
+	TimestampTz before = PG_ARGISNULL(0) ? 0 : PG_GETARG_TIMESTAMPTZ(0);
 
 	InitMaterializedSRF(fcinfo, 0);
-	PROLLY_CALL(w, plan, &before, plan_row, rsinfo);
+	PROLLY_CALL(w, plan, PG_ARGISNULL(0) ? NULL : &before, plan_row, rsinfo);
 	return (Datum) 0;
 }
 
@@ -568,4 +569,151 @@ dolt_history_repair(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("fragments must not be negative")));
 	PG_RETURN_INT32(PROLLY_CALL(w, repair, source, n));
+}
+
+static Datum
+sever_row(FunctionCallInfo fcinfo, const ProllyWindowResult *r)
+{
+	TupleDesc	tupdesc;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	static const char *const actions[] = {"archive", "delete", "none"};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = CStringGetTextDatum(actions[r->action]);
+	values[1] = Int64GetDatum(r->fragment);
+	nulls[1] = r->fragment == 0;
+	values[2] = Int64GetDatum(r->commits);
+	values[3] = hashes_datum(r->boundary, r->nboundary);
+	values[4] = Int64GetDatum(r->chunks);
+	values[5] = Int64GetDatum(r->sent);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
+													  values, nulls)));
+}
+
+/*
+ * dolt_history_sever()
+ *	returns record (action text, fragment bigint, commits bigint,
+ *					boundary text[], chunks bigint, sent bigint)
+ *
+ * Sever the history past the database's window, as its settings have it
+ * (prolly.history_window_action, prolly.history_window and the rest, as the
+ * database has them, never the session): archived to
+ * prolly.history_archive and found whole there, deleted, or nothing.  The
+ * database owner's.
+ */
+Datum
+dolt_history_sever(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	ProllyWindowPolicy p;
+	ProllyWindowResult r;
+
+	PROLLY_CALL(w, policy, NULL, &p);
+	PROLLY_CALL(w, sever, p.action, NULL, &r);
+	return sever_row(fcinfo, &r);
+}
+
+/*
+ * dolt_history_window(branch text, setting text, value text) returns void
+ *
+ * Set branch's lineage's own window setting (window, min_commits or
+ * batch; value NULL: the database's again).  The database owner's.
+ */
+Datum
+dolt_history_window(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a branch and a setting are needed")));
+	PROLLY_CALL(w, set_policy, text_to_cstring(PG_GETARG_TEXT_PP(0)),
+				text_to_cstring(PG_GETARG_TEXT_PP(1)),
+				PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2)));
+	PG_RETURN_VOID();
+}
+
+/*
+ * prolly_history_in_window(branch text, commit_hash text) returns bool
+ *
+ * Whether the commit is in the history window now: in branch's lineage's
+ * (NULL: any branch's), kept for its age or count as a sever would keep
+ * it.  A commit kept only for a ref or a merge base isn't.
+ */
+Datum
+prolly_history_in_window(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	char	   *hex;
+	ProllyHash	commit;
+
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a commit is needed")));
+	hex = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (!prolly_hash_from_hex(hex, strlen(hex), &commit))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a commit hash", hex)));
+	PG_RETURN_BOOL(PROLLY_CALL(w, in_window,
+							   PG_ARGISNULL(0) ? NULL :
+							   text_to_cstring(PG_GETARG_TEXT_PP(0)),
+							   &commit));
+}
+
+/*
+ * prolly_history_policy(branch text)
+ *	returns record (action text, time_window interval, min_commits bigint,
+ *					batch interval, max_size bigint, archive text)
+ *
+ * The window branch's lineage keeps (NULL: the database's), as the
+ * database's settings and the branch's own have it.
+ */
+Datum
+prolly_history_policy(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	ProllyWindowPolicy p;
+	TupleDesc	tupdesc;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	static const char *const actions[] = {"archive", "delete", "none"};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(w, policy,
+				PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(0)),
+				&p);
+	values[0] = CStringGetTextDatum(actions[p.action]);
+	if (p.keep_time > 0)
+	{
+		Interval   *iv = palloc0(sizeof(Interval));
+
+		iv->time = p.keep_time;
+		values[1] = IntervalPGetDatum(iv);
+	}
+	else
+		nulls[1] = true;
+	values[2] = Int64GetDatum(p.keep_commits);
+	if (p.batch > 0)
+	{
+		Interval   *iv = palloc0(sizeof(Interval));
+
+		iv->time = p.batch;
+		values[3] = IntervalPGetDatum(iv);
+	}
+	else
+		nulls[3] = true;
+	values[4] = Int64GetDatum(p.max_bytes);
+	nulls[4] = p.max_bytes == 0;
+	if (p.archive)
+		values[5] = CStringGetTextDatum(p.archive);
+	else
+		nulls[5] = true;
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
+													  values, nulls)));
 }

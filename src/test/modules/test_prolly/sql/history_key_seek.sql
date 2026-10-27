@@ -100,7 +100,7 @@ SELECT dolt_commit('-am', 'renamed') IS NOT NULL AS committed;
 SELECT same($$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5$$,
 			$$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hk.t) WHERE (row).id + 0 = 5$$) AS across_changes;
 SELECT (row).v2, (row).w FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5
-ORDER BY commit_date DESC, (row).v2 LIMIT 3;
+ORDER BY commit_date DESC, (row).v2 COLLATE "C" LIMIT 3;
 
 -- A primary key of two columns: its first, then a range on its second.
 CREATE TABLE hk.p (a int, b int, v text, PRIMARY KEY (a, b));
@@ -174,6 +174,20 @@ SELECT EXISTS (SELECT 1 FROM dolt_history_table(NULL::hk.t) h
 	WHERE (row).id = 5 AND h IS NOT NULL) AS exists_whole;
 SELECT count(*) AS joined FROM generate_series(5, 6) k(id)
 	JOIN dolt_history_table(NULL::hk.t) h ON (h.row).id = 5 AND h IS NOT NULL;
+
+-- The scan is dolt_history_table's: one who can't execute it can't
+-- read it, though the table is granted.
+CREATE ROLE regress_history_key_nobody;
+GRANT USAGE ON SCHEMA hk TO regress_history_key_nobody;
+GRANT SELECT ON hk.t TO regress_history_key_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_history_table(anyelement) FROM PUBLIC;
+SET ROLE regress_history_key_nobody;
+SELECT count(*) FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_history_table(anyelement) TO PUBLIC;
+REVOKE ALL ON hk.t FROM regress_history_key_nobody;
+REVOKE ALL ON SCHEMA hk FROM regress_history_key_nobody;
+DROP ROLE regress_history_key_nobody;
 
 -- A keyless table: nothing to seek by.
 CREATE TABLE hk.k (id int, v text);
