@@ -41,6 +41,16 @@ ALTER TABLE hc.n RENAME TO renamed;
 SELECT length(dolt_commit('-Am', 'renamed', '--date', '2020-01-03')::text) > 0 AS committed;
 ALTER TABLE hc.renamed SET SCHEMA hc2;
 SELECT length(dolt_commit('-Am', 'moved', '--date', '2020-01-04')::text) > 0 AS committed;
+-- (a table dropped beside one renamed, the two alike but for their rows:
+-- the renamed one paired with its own tree, not the dropped one's)
+CREATE TABLE hc2.a (id int PRIMARY KEY, v text);
+INSERT INTO hc2.a SELECT g, repeat('a', 40) || g FROM generate_series(1, 20000) g;
+CREATE TABLE hc2.b (id int PRIMARY KEY, v text);
+INSERT INTO hc2.b SELECT g, repeat('b', 40) || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'two alike', '--date', '2020-01-05')::text) > 0 AS committed;
+DROP TABLE hc2.a;
+ALTER TABLE hc2.b RENAME TO c;
+SELECT length(dolt_commit('-Am', 'dropped and renamed', '--date', '2020-01-06')::text) > 0 AS committed;
 UPDATE hc2.renamed SET v = 'later' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'later', '--date', '2020-01-10')::text) > 0 AS committed;
 UPDATE hc2.renamed SET v = 'later' WHERE id = 2;
@@ -49,5 +59,7 @@ UPDATE hc2.renamed SET v = 'later' WHERE id = 3;
 SELECT length(dolt_commit('-Am', 'later 3', '--date', '2020-01-12')::text) > 0 AS committed;
 SELECT fragment, commits, chunks > 100 AS the_table FROM dolt_history_drop('2020-01-02 12:00+00');
 SELECT fragment, commits, chunks < 20 AS only_what_changed FROM dolt_history_drop('2020-01-05 00:00+00');
+SELECT fragment, commits, chunks > 100 AS the_tables FROM dolt_history_drop('2020-01-05 12:00+00');
+SELECT fragment, commits, chunks < 20 AS only_what_changed FROM dolt_history_drop('2020-01-06 12:00+00');
 \c :home
 DROP DATABASE regress_history_created;
