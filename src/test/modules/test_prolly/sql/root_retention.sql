@@ -124,5 +124,24 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN value ELSE (value > 0)::int END
 FROM since(:'before');
 SELECT dolt_checkout('main');
 
+-- roots captured among writers (each transaction a commit) count what
+-- their freezing copies, so a cap thins them too
+ALTER DATABASE root_retention RESET prolly.history_min_commits;
+SELECT held() AS h0 \gset
+SET dolt.transaction_commit = on;
+SET prolly.root_interval = 0;
+UPDATE rr.t SET v = 21 WHERE id % 10 = 1;
+UPDATE rr.t SET v = 22 WHERE id % 10 = 2;
+UPDATE rr.t SET v = 23 WHERE id % 10 = 3;
+RESET prolly.root_interval;
+RESET dolt.transaction_commit;
+SELECT test_freeze_kept() AS frozen;
+SELECT held() > :h0 AS frozen_roots_counted;
+ALTER DATABASE root_retention SET prolly.history_root_max_size = '1';
+SELECT test_retain_roots('main');
+-- (the newest, and c10's, the tag's)
+SELECT count(*) AS kept_under_cap FROM test_kept_commits('main');
+ALTER DATABASE root_retention RESET prolly.history_root_max_size;
+
 \c :home
 DROP DATABASE root_retention;
