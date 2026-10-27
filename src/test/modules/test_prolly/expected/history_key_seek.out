@@ -210,7 +210,7 @@ SELECT same($$SELECT (row).*, commit_hash FROM dolt_history_table(NULL::hk.t) WH
 (1 row)
 
 SELECT (row).v2, (row).w FROM dolt_history_table(NULL::hk.t) WHERE (row).id = 5
-ORDER BY commit_date DESC, (row).v2 LIMIT 3;
+ORDER BY commit_date DESC, (row).v2 COLLATE "C" LIMIT 3;
    v2    | w 
 ---------+---
  renamed | 1
