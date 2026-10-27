@@ -457,6 +457,14 @@ retire(const ProllyDatabaseComponents *dc)
 			RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
+			/*
+			 * (a cancel or a shutdown isn't the retire's failure: it ends
+			 * the visit, as it would anywhere else in it, and the retire
+			 * stays wanted)
+			 */
+			if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+				ERRCODE_OPERATOR_INTERVENTION)
+				ReThrowError(edata);
 			ereport(WARNING,
 					(errcode(edata->sqlerrcode),
 					 errmsg("automatic retire of generations %u to %u of database \"%s\" failed: %s",
