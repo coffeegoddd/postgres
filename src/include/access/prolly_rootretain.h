@@ -60,6 +60,11 @@ typedef struct ProllyRetainedRoot
 	bool		newest;			/* the branch's newest: never retired */
 	bool		tagged;			/* a tag names its commit: never retired */
 	bool		from_newest;	/* judged in the pass from the newest */
+	bool		head_elsewhere; /* another branch's head is at its commit
+								 * (a seek of the index of heads' roots) */
+	TimestampTz committed_at;	/* the commit's date */
+	int64		younger;		/* live roots of the branch newer than it */
+	bool		on_severed;		/* a parent is past the history horizon */
 } ProllyRetainedRoot;
 
 typedef enum ProllyRootVerdict

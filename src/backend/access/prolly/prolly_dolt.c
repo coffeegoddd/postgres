@@ -4678,6 +4678,56 @@ log_entries(const char *ref)
 	return log_walk(list_make1(&start));
 }
 
+static bool
+log_count_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	return PROLLY_CALL(refs(), commit_get, id, info);
+}
+
+/*
+ * The commits start reaches, itself included, from the nearest commit down
+ * its first parents whose count a branch's kept commit records (the refs'
+ * commit_count()), one more for each commit between (a merge's other
+ * parents by prolly_history_commits()'s walk): for a commit made within
+ * the root interval, the commits since the keep below it.  False if none
+ * below records one, or a commit can't be read: the log is counted then.
+ */
+static bool
+log_count_recorded(const ProllyHash *start, int64 *n)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly log count",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	List	   *chain = NIL;
+	ProllyHash	cur = *start;
+	int64		below = 0;
+	bool		found = false;
+
+	while (!(found = PROLLY_CALL(refs(), commit_count, &cur, &below)))
+	{
+		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(refs(), commit_get, &cur, info) ||
+			info->nparents == 0)
+			break;
+		chain = lcons(info, chain);
+		cur = info->parents[0];
+	}
+	foreach_ptr(ProllyCommitInfo, info, chain)
+	{
+		if (!found)
+			break;
+		found = prolly_history_commits(info->parents, info->nparents, below,
+									   log_count_lookup, NULL, &below);
+	}
+	*n = below;
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return found;
+}
+
 int64
 prolly_log_count(const char *ref)
 {
@@ -4691,26 +4741,13 @@ prolly_log_count(const char *ref)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	}
-	/* (the count the refs keep, while the log reaches every commit counted) */
-	if (PROLLY_HAS(refs(), side_get) && !prolly_window_severed())
+	/* (the count kept commits record, while the log reaches all it counts) */
+	if (PROLLY_HAS(refs(), commit_count) && !prolly_window_severed())
 	{
-		ProllyKey	k = {(const uint8 *) start.bytes, start.len};
-		StringInfoData v;
-		bool		kept;
+		int64		n;
 
-		initStringInfo(&v);
-		kept = PROLLY_CALL(refs(), side_get, PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
-			v.len == 8;
-		if (kept)
-		{
-			uint64		n = 0;
-
-			for (int i = 0; i < 8; i++)
-				n = (n << 8) | (uint8) v.data[i];
-			pfree(v.data);
-			return (int64) n;
-		}
-		pfree(v.data);
+		if (log_count_recorded(&start, &n))
+			return n;
 	}
 	return list_length(log_walk(list_make1(&start)));
 }

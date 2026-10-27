@@ -5,6 +5,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_holds;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE root_holds SET prolly.history_window = '1000 years';
 \c root_holds
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -43,12 +46,14 @@ WHERE k.commit_id = :'c3';
 -- main keeps only its newest from now on: its roots of c3 let go of
 SELECT dolt_checkout('main');
 ALTER DATABASE root_holds SET prolly.history_min_commits = 1;
+ALTER DATABASE root_holds SET prolly.history_window = '1 microsecond';
 DO $$ BEGIN FOR i IN 11..14 LOOP
 	UPDATE rh.t SET v = i WHERE id % 50 = i;
 	PERFORM dolt_commit('-am', 'c' || i);
 END LOOP; END $$;
 SELECT test_retain_roots('main');
 ALTER DATABASE root_holds RESET prolly.history_min_commits;
+ALTER DATABASE root_holds SET prolly.history_window = '1000 years';
 SELECT count(*) AS main_kept FROM test_kept_commits('main');
 
 -- side moves back to c3 again: by its own roots

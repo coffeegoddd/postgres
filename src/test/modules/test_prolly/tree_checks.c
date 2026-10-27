@@ -896,7 +896,11 @@ tree_seeks_in_order(const ProllyImplInfo *impl)
  * pass starts from the root: one edit reads its path, and at most a
  * neighbour where the new chunking runs on past the old node.  And within
  * a keep_nodes() scope, reading the same key again reads only its leaf;
- * once the scope ends, the whole path again.
+ * once the scope ends, the whole path again.  Within a keep_leaves()
+ * scope, the leaf too is read once: a key read and then edited, as a fold
+ * looks each changed key up before applying its edits, has its path read
+ * once in all.  Nested in a keep_nodes() scope, it leaves the nodes above
+ * the leaves to the outer one, which still has them once it ends.
  */
 void
 tree_apply_reads_paths_once(const ProllyImplInfo *impl)
@@ -962,6 +966,56 @@ tree_apply_reads_paths_once(const ProllyImplInfo *impl)
 				 (unsigned long long) reads[1], (unsigned long long) reads[2],
 				 nodes.levels, nodes.levels);
 		pfree(v.data);
+
+		if (PROLLY_HAS(tr, keep_leaves))
+		{
+			MemoryContext outer = AllocSetContextCreate(CurrentMemoryContext,
+														"kept nodes",
+														ALLOCSET_DEFAULT_SIZES);
+			MemoryContext inner = AllocSetContextCreate(CurrentMemoryContext,
+														"kept leaves",
+														ALLOCSET_DEFAULT_SIZES);
+			int			k = MAX_KEY / 3;
+			int			version = 8;
+			int			was = ref->version[k];
+			KeyBuf		kb3;
+			ProllyKey	key3 = key_of(k, &kb3);
+			ProllyNodeRef edited = root;
+			uint64		got[4];
+
+			initStringInfo(&v);
+			env.counters = &cnt;
+			PROLLY_CALL(tr, keep_nodes, outer);
+			PROLLY_CALL(tr, keep_leaves, inner);
+			for (int i = 0; i < 4; i++)
+			{
+				memset(&cnt, 0, sizeof(cnt));
+				if (i == 2)
+				{
+					apply_batch(tr, &env, ref, &k, &version, 1, &edited);
+					/* (root, unedited, is the tree read on) */
+					ref->version[k] = was;
+				}
+				else
+				{
+					if (i == 3)
+						MemoryContextDelete(inner);
+					resetStringInfo(&v);
+					if (!PROLLY_CALL(tr, get, &env, &root, &key3, &v))
+						elog(ERROR, "get did not find key %d", k);
+				}
+				got[i] = cnt.nodes_read;
+			}
+			MemoryContextDelete(outer);
+			env.counters = NULL;
+			if (got[0] != (uint64) nodes.levels || got[1] != 0 ||
+				got[2] > 1 || got[3] != 1)
+				elog(ERROR, "a key of a %d-level tree read twice, edited, and read once its leaf scope ended, in a scope keeping nodes, read %llu, %llu, %llu and %llu nodes, expected %d, 0, at most 1 and 1",
+					 nodes.levels, (unsigned long long) got[0],
+					 (unsigned long long) got[1], (unsigned long long) got[2],
+					 (unsigned long long) got[3], nodes.levels);
+			pfree(v.data);
+		}
 
 		/*
 		 * A scope keeps no more than maintenance_work_mem of nodes: many

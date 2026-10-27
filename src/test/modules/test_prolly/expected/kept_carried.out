@@ -6,6 +6,9 @@
 -- writing no row.
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_carried;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_carried SET prolly.history_window = '1000 years';
 \c kept_carried
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;
@@ -243,6 +246,7 @@ SELECT dolt_tag('empty', 'HEAD');
 (1 row)
 
 ALTER DATABASE kept_carried SET prolly.history_min_commits = 3;
+ALTER DATABASE kept_carried SET prolly.history_window = '1 microsecond';
 SELECT dolt_reset('--hard', :'a');
  dolt_reset 
 ------------
@@ -323,6 +327,7 @@ SELECT counted('relations_restored') > :r AS restored,
 (1 row)
 
 ALTER DATABASE kept_carried RESET prolly.history_min_commits;
+ALTER DATABASE kept_carried SET prolly.history_window = '1000 years';
 -- every block the stores hold is held by a map or a snapshot kept
 SELECT dolt_commit('--allow-empty', '-m', 'settled') IS NOT NULL AS committed;
  committed 

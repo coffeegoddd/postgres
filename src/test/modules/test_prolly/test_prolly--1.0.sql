@@ -673,14 +673,10 @@ CREATE FUNCTION test_commit_height(commit_id text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- The commits the refs keep a commit reaches; NULL if they keep none.
+-- The commits a commit reaches, as a branch's kept commit of it records
+-- them; NULL if none does.
 CREATE FUNCTION test_commit_commits(commit_id text)
 RETURNS int8
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
--- The refs keep the commits a commit reaches no more.
-CREATE FUNCTION test_commit_commits_forget(commit_id text)
-RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- A commit's height as the history walk finds it, and the commits it read.
