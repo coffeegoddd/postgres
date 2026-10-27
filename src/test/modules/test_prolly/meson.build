@@ -215,6 +215,7 @@ tests += {
       'generations_retire_roots',
       'generations_toast',
       'generations_select',
+      'generations_window',
       'gc_spill',
       'gc_declared',
       'gc_file_size',

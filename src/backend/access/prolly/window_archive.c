@@ -3858,6 +3858,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 #define MEASURED_SETTING	"history_window.measured"
 #define OVER_COUNT_SETTING	"history_window.over_count"
 #define FULL_WANTED_SETTING	"history_window.full_wanted"
+#define RETIRE_WANTED_SETTING "history_window.retire_wanted"
 #define LAST_FULL_SETTING	"history_window.last_full"
 #define FAILURES_SETTING	"history_window.failures"
 #define RETRY_SETTING		"history_window.retry_at"
@@ -4107,6 +4108,8 @@ maintain_as_owner(const ProllyWindowPolicy *db, List *moved,
 	PG_END_TRY();
 }
 
+static bool retires(void);
+
 /*
  * The history window severed in the background (autovacuum's visit), as
  * the database's owner, so an archive's checks are the owner's, as at
@@ -4212,7 +4215,17 @@ archive_maintain(void)
 	config_int_set(FAILURES_SETTING, 0, true);
 	config_int_set(RETRY_SETTING, 0, true);
 	config_int_set(TRANSIENT_SETTING, 0, true);
-	if (r.fragment > 0 || want_full)
+
+	/*
+	 * (what only a fragment reached freed by a retire of the generations
+	 * holding it, where the reclamation retires: a full collection's cost
+	 * is the whole store's)
+	 */
+	if (r.fragment > 0 && retires())
+		config_int_set(RETIRE_WANTED_SETTING, 1, false);
+	else if (r.fragment > 0)
+		config_int_set(FULL_WANTED_SETTING, 1, false);
+	if (want_full)
 		config_int_set(FULL_WANTED_SETTING, 1, false);
 	if (size_cut != DT_NOBEGIN)
 	{
@@ -4227,6 +4240,129 @@ archive_maintain(void)
 		config_int_set(OVER_COUNT_SETTING, 0, false);
 	}
 	return r.fragment > 0;
+}
+
+/* Does the database's reclamation retire generations, as it chooses them? */
+static bool
+retires(void)
+{
+	return dc.reclamation != NULL && PROLLY_HAS(dc.reclamation, retire) &&
+		PROLLY_HAS(dc.reclamation, choose);
+}
+
+/* The newest fragment archived and found whole there: its generation. */
+static bool
+note_archived_generation(const ProllyKey *key, const ProllyValue *value,
+						 void *arg)
+{
+	FragmentRecord r;
+
+	if (key->len != 9 || key->data[0] != KEY_FRAGMENT)
+		return false;
+	fragment_decode((const char *) value->data, value->len,
+					(int64) get_be64((const char *) key->data + 1), &r);
+	if (r.f.deleted || r.f.location == NULL)
+		return true;
+	*(uint32 *) arg = r.generation;
+	return false;
+}
+
+/*
+ * A retire is due once a fragment was made since the last; and, whether or
+ * not, the newest generation one may take: in archive mode, while some
+ * lineage has a window, none newer than the store's generation as the
+ * newest fragment archived was severed (0: none was), so that what a
+ * sever has yet to archive is never in a retire chosen meanwhile.  (Its
+ * chunks are the refs' until it is recorded, which happens only once the
+ * archive holds them whole; the limit keeps that so by generation too,
+ * whatever a retire's marking finds.)
+ */
+static bool
+archive_retire_due(uint32 *max_hi)
+{
+	ProllyWindowPolicy db;
+	bool		any;
+
+	window_init();
+	archive_policy(NULL, &db);
+	*max_hi = PG_UINT32_MAX;
+	(void) moved_cuts(GetCurrentTimestamp(), &any);
+	if (db.action == PROLLY_WINDOW_ARCHIVE && any)
+	{
+		StringInfoData k;
+		ProllyKey	from;
+
+		*max_hi = 0;
+		initStringInfo(&k);
+		number_key(&k, KEY_FRAGMENT, PG_INT64_MAX);
+		from.data = (const uint8 *) k.data;
+		from.len = k.len;
+		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+					BackwardScanDirection, note_archived_generation, max_hi);
+		pfree(k.data);
+	}
+	return config_int(RETIRE_WANTED_SETTING, 0) != 0;
+}
+
+/*
+ * The background's retire done: the fragments it was for no longer
+ * waiting, and the store measured as after a full collection, for the
+ * size limit (what the retire left is what the limit's next cut weighs).
+ */
+static void
+archive_retired(void)
+{
+	ProllyWindowPolicy db;
+	uint64		bytes;
+
+	window_init();
+	archive_policy(NULL, &db);
+	bytes = store_bytes();
+	config_int_set(RETIRE_WANTED_SETTING, 0, true);
+	config_int_set(MEASURED_SETTING, (int64) bytes, false);
+	config_int_set(SIZE_PENDING_SETTING, 0, true);
+	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
+		config_int_set(OVER_COUNT_SETTING,
+					   config_int(OVER_COUNT_SETTING, 0) + 1, false);
+	else
+		config_int_set(OVER_COUNT_SETTING, 0, true);
+}
+
+static void
+newest_epoch(uint32 epoch, TimestampTz ended, void *arg)
+{
+	TimestampTz *newest = arg;
+
+	*newest = Max(*newest, ended);
+}
+
+/*
+ * A batch boundary passed since the store's newest generation ended (the
+ * database's batch, an hour where it names none): only while some
+ * lineage has a window, whose fragments are cut at batches.
+ */
+static bool
+archive_seal_due(void)
+{
+	ProllyWindowPolicy db;
+	TimestampTz now = GetCurrentTimestamp();
+	TimestampTz newest = DT_NOBEGIN;
+	TimestampTz boundary;
+	int64		batch;
+	bool		any;
+
+	window_init();
+	if (!PROLLY_HAS(tree_env.chunk_store, epochs))
+		return false;
+	(void) moved_cuts(now, &any);
+	if (!any)
+		return false;
+	archive_policy(NULL, &db);
+	batch = db.batch > 0 ? db.batch : DEFAULT_BACKGROUND_BATCH;
+	boundary = now - (((now % batch) + batch) % batch);
+	PROLLY_CALL(tree_env.chunk_store, epochs, tree_env.chunks, newest_epoch,
+				&newest);
+	return newest < boundary;
 }
 
 /*
@@ -4921,4 +5057,7 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.collected = archive_collected,
 	.window = archive_window,
 	.in_window = archive_in_window,
+	.retire_due = archive_retire_due,
+	.retired = archive_retired,
+	.seal_due = archive_seal_due,
 };

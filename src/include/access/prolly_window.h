@@ -46,7 +46,18 @@
  *   grows; true if it made a fragment.  collect_due() says whether the
  *   background's collection is to be a full one now (fragments made since
  *   the last, which ended long enough ago); collected() notes that one
- *   ran, and the store's size it left.
+ *   ran, and the store's size it left.  With a reclamation that retires
+ *   generations, a fragment made asks for a retire instead (retire_due():
+ *   true until retired() notes one ran, measured as collected() measures);
+ *   retire_due() also gives the newest generation any retire may take now
+ *   (archive mode, while some lineage has a window: the store's generation
+ *   when the newest fragment archived, and found whole there, was severed,
+ *   so that no retire frees what a fragment not yet archived holds; 0 if
+ *   none was; otherwise no limit).  seal_due() says whether a batch
+ *   boundary has passed since the store's newest generation ended, so a
+ *   collection is to settle what came since in a generation of its own:
+ *   generations then follow the batches fragments are cut at, and a
+ *   fragment's data is in few of them.
  * - archived() says whether commit id is past the horizon: a top of a
  *   fragment, named by a boundary commit.  edges() visits the horizon's
  *   boundary edges (a boundary commit and the parent it doesn't keep) as
@@ -200,14 +211,17 @@ typedef struct ProllyWindowRoutine
 	void		(*window) (const char *branch, ProllyWindowCommitVisit visit,
 						   void *arg);
 	bool		(*in_window) (const char *branch, const ProllyHash *commit);
+	bool		(*retire_due) (uint32 *max_hi);
+	void		(*retired) (void);
+	bool		(*seal_due) (void);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
 	"policy", "set_policy", "maintain", "collect_due", "collected", \
-	"window", "in_window"
+	"window", "in_window", "retire_due", "retired", "seal_due"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK in_window
+#define PROLLY_WINDOW_LAST_CALLBACK seal_due
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)

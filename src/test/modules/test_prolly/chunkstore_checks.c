@@ -2878,6 +2878,8 @@ test_chunk_retire_choose(PG_FUNCTION_ARGS)
 	ProllyDatabaseComponents dc;
 	uint64		budget = PG_ARGISNULL(0) ?
 		(uint64) prolly_gc_retire_budget * 1024 : (uint64) PG_GETARG_INT64(0);
+	uint32		max_hi = PG_NARGS() < 2 || PG_ARGISNULL(1) ? PG_UINT32_MAX :
+		(uint32) Min(Max(PG_GETARG_INT64(1), 0), PG_UINT32_MAX);
 	uint32		lo = 0;
 	uint32		hi = 0;
 	TupleDesc	desc;
@@ -2887,7 +2889,7 @@ test_chunk_retire_choose(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	prolly_database_components(&dc);
-	if (!PROLLY_CALL(dc.reclamation, choose, budget, PG_UINT32_MAX, &lo, &hi))
+	if (!PROLLY_CALL(dc.reclamation, choose, budget, max_hi, &lo, &hi))
 		nulls[0] = nulls[1] = true;
 	values[0] = Int64GetDatum((int64) lo);
 	values[1] = Int64GetDatum((int64) hi);
@@ -2914,6 +2916,32 @@ test_chunk_note_garbage(PG_FUNCTION_ARGS)
 	for (int i = 0; i < n; i++)
 		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
 	PG_RETURN_INT64(PROLLY_CALL(cs(), note_garbage, store(), hashes, n));
+}
+
+/*
+ * The history window's answer for the background's next collection: a
+ * retire due (a fragment made since the last), the newest generation any
+ * retire may take now (NULL: no limit), and a seal due.
+ */
+PG_FUNCTION_INFO_V1(test_window_retire_due);
+Datum
+test_window_retire_due(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	uint32		max_hi = PG_UINT32_MAX;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	values[0] = BoolGetDatum(PROLLY_CALL(dc.history_window, retire_due, &max_hi));
+	values[1] = Int64GetDatum((int64) max_hi);
+	nulls[1] = (max_hi == PG_UINT32_MAX);
+	values[2] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 PG_FUNCTION_INFO_V1(test_logical_horizon);
