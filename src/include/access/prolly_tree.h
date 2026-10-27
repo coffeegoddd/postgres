@@ -362,6 +362,15 @@ typedef struct ProllyTreeRoutine
 	 * reads only trees it holds while the scope is open.  Scopes nest.
 	 */
 	void		(*keep_nodes) (MemoryContext cxt);
+
+	/*
+	 * Optional: keep_nodes(), the leaves read kept too, for a caller that
+	 * reads leaves and then changes them (looking up each key it is about
+	 * to edit, then applying the edits), so each leaf is read from the
+	 * chunk store once.  It keeps no more than keep_nodes() does in all,
+	 * and finds the nodes an outer scope keeps.
+	 */
+	void		(*keep_leaves) (MemoryContext cxt);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -369,9 +378,10 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered", "diff_estimate", "value_splice", "rank", "keep_nodes"
+	"diff_unordered", "diff_estimate", "value_splice", "rank", "keep_nodes", \
+	"keep_leaves"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK keep_nodes
+#define PROLLY_TREE_LAST_CALLBACK keep_leaves
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)
