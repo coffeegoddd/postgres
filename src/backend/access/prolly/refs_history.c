@@ -674,9 +674,9 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 }
 
 /*
- * The commits a commit with these parents reaches, itself included, as
- * each commit records them: one more than its first parent's, and for a
- * merge, more by those its other parents reach that the first doesn't.
+ * The commits a commit with these parents reaches, itself included: one
+ * more than its first parent's, and for a merge, more by those its other
+ * parents reach that the first doesn't.
  * Those are found by heights, highest first, each commit painted with the
  * sides that reach it (the first parent's, the others'): a commit's
  * children are all higher, so its sides are known once it is taken, and
@@ -744,10 +744,10 @@ paint(HTAB *painted, pairingheap *queue, const ProllyHash *id, int sides,
 
 bool
 prolly_history_commits(const ProllyHash *parents, int nparents,
+					   int64 first_commits,
 					   ProllyCommitLookup lookup, void *lookup_arg,
 					   int64 *commits)
 {
-	ProllyCommitInfo info;
 	MemoryContext cxt;
 	MemoryContext old;
 	HASHCTL		ctl;
@@ -762,9 +762,7 @@ prolly_history_commits(const ProllyHash *parents, int nparents,
 		*commits = 1;
 		return true;
 	}
-	if (!lookup(&parents[0], &info, lookup_arg) || !info.has_commits)
-		return false;
-	*commits = info.commits + 1;
+	*commits = first_commits + 1;
 	if (nparents == 1)
 		return true;
 

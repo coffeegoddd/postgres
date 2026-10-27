@@ -475,36 +475,6 @@ check_height(ProllyDatabaseComponents *dc, const ProllyHash *id,
 				 errdetail("A commit's height is one more than the greatest of its parents'.")));
 }
 
-/*
- * Refuse a commit (id, info) from a remote whose recorded count of the
- * commits it reaches isn't the one its parents give
- * (prolly_history_commits()): count(*) of dolt_log() is taken from it.
- * A commit recording none is counted, not trusted; one recording a count
- * its parents can't give is refused.
- */
-static void
-check_commits(ProllyDatabaseComponents *dc, const ProllyHash *id,
-			  const ProllyCommitInfo *info)
-{
-	int64		want;
-
-	if (!info->has_commits)
-		return;
-	if (!prolly_history_commits(info->parents, info->nparents, history_lookup,
-								dc, &want))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the remote's commit %s records " INT64_FORMAT " commits, which its parents don't give",
-						prolly_hash_hex(id), info->commits),
-				 errdetail("A commit records the commits it reaches only when its first parent records them.")));
-	if (info->commits != want)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the remote's commit %s records " INT64_FORMAT " commits, not " INT64_FORMAT,
-						prolly_hash_hex(id), info->commits, want),
-				 errdetail("A commit records the commits it reaches, itself included.")));
-}
-
 /* Every commit received from those given: those the store hasn't. */
 static void
 check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
@@ -550,7 +520,6 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 							prolly_hash_hex(id)),
 					 errdetail("A database takes only commits of the format it makes.")));
 		check_height(&dc, id, &info, heights);
-		check_commits(&dc, id, &info);
 		for (int i = 0; i < info.nparents; i++)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));
@@ -822,7 +791,6 @@ check_cloned_commits(const ProllyHash *commits, int ncommits)
 							prolly_hash_hex(id)),
 					 errdetail("A database takes only commits of the format it makes.")));
 		check_height(&dc, id, &info, heights);
-		check_commits(&dc, id, &info);
 		for (int i = 0; i < info.nparents; i++)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));

@@ -1,12 +1,24 @@
--- Each commit records the commits it reaches, itself included (one more
--- than its first parent's, and for a merge, more by those its other
--- parents reach that the first doesn't), as Dolt's commit closure counts
--- them.  So count(*) of dolt_log(ref) alone is planned as a scan giving
--- the count ref's commit records, reading one commit, not the history; a
--- history horizon, or a commit recording none, has the log counted as it
--- gives its rows.  A remote's commit whose count isn't its parents' is
--- refused.
+-- The refs keep, for each commit a head moves to, the commits it reaches,
+-- itself included (one more than its first parent's, and for a merge,
+-- more by those its other parents reach that the first doesn't), as
+-- Dolt's commit closure counts them, outside the commit: commit ids are
+-- as they were.  So count(*) of dolt_log(ref) alone is planned as a scan
+-- giving that count, reading no history; a history horizon, or a commit
+-- they keep none for, has the log counted as it gives its rows, and the
+-- next head move keeps the missing ones.
 SELECT current_database() AS home \gset
+
+-- A commit's id is its content's alone, as before counts were kept: a
+-- first commit of fixed content, author and date has the id it had.
+CREATE DATABASE regress_log_count_ids;
+\c regress_log_count_ids
+CREATE SCHEMA ids VERSIONED;
+CREATE TABLE ids.t (id int PRIMARY KEY);
+INSERT INTO ids.t VALUES (1);
+SET dolt.author = 'pinned <pinned@example.com>';
+SELECT dolt_commit('-Am', 'pinned', '--date', '2001-02-03 04:05:06+00') AS pinned_id;
+\c :home
+DROP DATABASE regress_log_count_ids;
 CREATE DATABASE regress_log_count;
 \c regress_log_count
 CREATE EXTENSION test_prolly;
@@ -105,58 +117,51 @@ SELECT counts('main') AS main;
 SELECT count(DISTINCT commit_hash) = (SELECT count(*) FROM dolt_log) AS once
 FROM (SELECT * FROM dolt_log OFFSET 0) l;
 
--- A commit recording no count (made elsewhere, or before counts were):
--- the log counted; and the commits made on it record none.
+
+-- History the refs keep no counts for (made elsewhere, or before they
+-- were kept): counted as the log is, and kept once a head moves there,
+-- down the first parents to one kept.
 SELECT test_commit_chain(dolt_hashof('main'), 3) AS old_head \gset
-SELECT test_commit_commits(:'old_head') AS recorded_on_old;
+SELECT test_commit_commits(:'old_head') AS kept_for_old;
+:flush
+SELECT commits_read() AS before \gset
 SELECT counts(:'old_head') AS counted;
+:flush
+SELECT commits_read() - :before > 50 AS walked;
 SELECT dolt_reset('--hard', :'old_head') IS NOT NULL AS reset;
+SELECT test_commit_commits(:'old_head') AS kept_once_moved;
+SELECT test_commit_commits(dolt_hashof('main~1')) AS kept_beneath;
 UPDATE lc.t SET v = 0 WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'on old')::text) AS committed;
-SELECT test_commit_commits(dolt_hashof('main')) AS recorded_on_new,
+SELECT test_commit_commits(dolt_hashof('main')) AS kept_on_new,
 	counts('main') AS counted;
 
--- A remote's commit recording a count its parent doesn't give is
--- refused: a clone receives nothing.
-SELECT test_commit_with_commits(dolt_hashof('a'), 2) AS forged \gset
-SELECT test_commit_commits(:'forged') AS forged_count;
+-- A count forgotten (the refs' entries are derived, and may be missing):
+-- the log counted, the same, then kept again by the next head move.
+SELECT dolt_hashof('main') AS head \gset
+SELECT test_commit_commits_forget(:'head');
+SELECT test_commit_commits(:'head') AS forgotten, counts('main') AS counted;
+UPDATE lc.t SET v = 1 WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'after forgetting')::text) AS committed;
+SELECT test_commit_commits(:'head') AS kept_again,
+	test_commit_commits(dolt_hashof('main')) AS kept_head, counts('main') AS counted;
+
+-- A clone is sent none (they are the refs', not the commits'): its head's move
+-- keeps them, the same count.
 \getenv abs_builddir PG_ABS_BUILDDIR
 SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/log-count-' ||
 	txid_current() AS url \gset
-SELECT dolt_branch('forged', :'forged');
-SELECT dolt_remote('add', 'fr', :'url');
-SELECT dolt_push('fr', 'forged') AS pushed;
-SELECT test_commit_with_commits(dolt_hashof('a'), test_commit_commits(dolt_hashof('a')) + 1) AS right \gset
-SELECT dolt_branch('right', :'right');
-SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/log-count-right-' ||
-	txid_current() AS right_url \gset
-SELECT dolt_remote('add', 'rr', :'right_url');
-SELECT dolt_push('rr', 'right') AS pushed;
-SELECT counts('right') AS right_counts;
-CREATE DATABASE regress_log_count_received;
-\c regress_log_count_received
-SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS test_prolly;
-RESET client_min_messages;
-CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
-BEGIN
-	EXECUTE q;
-	RETURN 'no error';
-EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{32,}', '<hash>', 'g');
-END $$;
-SELECT pg_temp.err(format('SELECT dolt_clone(%L)', :'url')) AS cloned;
-SELECT count(*) AS branches FROM dolt_branches;
+SELECT dolt_remote('add', 'origin', :'url');
+SELECT dolt_push('origin', 'main') AS pushed;
+SELECT counts('main') AS main_counts \gset
+CREATE DATABASE regress_log_count_clone;
+\c regress_log_count_clone
+SELECT dolt_clone(:'url') IS NOT NULL AS cloned;
+SELECT (SELECT count(*) FROM dolt_log('main')) || ' ' ||
+	(SELECT count(*) FROM (SELECT * FROM dolt_log('main') OFFSET 0) l) =
+	:'main_counts' AS cloned_counts;
 \c :home
-DROP DATABASE regress_log_count_received;
--- (the right count is taken, the clone's count the same)
-CREATE DATABASE regress_log_count_right;
-\c regress_log_count_right
-SELECT dolt_clone(:'right_url') IS NOT NULL AS cloned;
-SELECT (SELECT count(*) FROM dolt_log('right')) || ' ' ||
-	(SELECT count(*) FROM (SELECT * FROM dolt_log('right') OFFSET 0) l) AS cloned_counts;
-\c :home
-DROP DATABASE regress_log_count_right;
+DROP DATABASE regress_log_count_clone;
 DROP DATABASE regress_log_count;
 
 -- The history horizon: the log stops there, and so does its count.
@@ -176,8 +181,17 @@ BEGIN
 END $$;
 SELECT hz_commits(6) AS commits;
 SELECT count(*) AS before_severed FROM dolt_log;
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/log-count-hz-' ||
+	txid_current() AS hz_url \gset
+SELECT dolt_remote('add', 'origin', :'hz_url');
+SELECT dolt_push('origin', 'main') AS pushed;
 SELECT count(*) > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
 SELECT count(*) AS counted FROM dolt_log;
 SELECT count(*) AS rows FROM (SELECT * FROM dolt_log OFFSET 0) l;
+-- repaired, the whole history counted again
+SELECT dolt_history_repair('origin') > 0 AS repaired;
+SELECT count(*) AS repaired_count FROM dolt_log;
+SELECT count(*) AS repaired_rows FROM (SELECT * FROM dolt_log OFFSET 0) l;
 \c :home
 DROP DATABASE regress_log_count_horizon;

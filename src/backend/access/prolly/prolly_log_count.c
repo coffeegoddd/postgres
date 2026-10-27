@@ -3,13 +3,13 @@
  * prolly_log_count.c
  *	  count(*) of dolt_log(ref) from the commit's recorded count.
  *
- * Each commit records the commits it reaches, itself included (the refs'
- * "commits" item, prolly_history_commits()), as Dolt's commit closure
- * counts them.  So SELECT count(*) FROM dolt_log(ref), whose rows are those
+ * The refs keep, for each commit a head has moved to, the commits it
+ * reaches, itself included (PROLLY_REFS_SPACE_COMMITS,
+ * prolly_history_commits()), as Dolt's commit closure counts them.  So SELECT count(*) FROM dolt_log(ref), whose rows are those
  * commits while no history is severed, needs no walk of the history: a
  * query whose grouping is count(*) of dolt_log alone is planned as a scan
  * giving the one row, the count prolly_log_count() finds, in place of the
- * aggregate over the log's rows.  A commit recording no count, or a history
+ * aggregate over the log's rows.  A commit they keep none for, or a history
  * horizon (the log stops there), has the log counted as it gives its rows.
  *
  * IDENTIFICATION
@@ -79,7 +79,7 @@ counts_alone(List *exprs, Aggref **count)
 										PVC_INCLUDE_PLACEHOLDERS);
 
 	*count = NULL;
-	foreach_node(Node, n, found)
+	foreach_ptr(Node, n, found)
 	{
 		Aggref	   *a = (Aggref *) n;
 

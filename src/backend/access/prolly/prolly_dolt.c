@@ -4688,7 +4688,6 @@ int64
 prolly_log_count(const char *ref)
 {
 	ProllyHash	start;
-	ProllyCommitInfo info;
 
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
 	{
@@ -4698,10 +4697,27 @@ prolly_log_count(const char *ref)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	}
-	/* (the count recorded, while the log reaches every commit counted) */
-	if (PROLLY_CALL(refs(), commit_get, &start, &info) && info.has_commits &&
-		!prolly_window_severed())
-		return info.commits;
+	/* (the count the refs keep, while the log reaches every commit counted) */
+	if (PROLLY_HAS(refs(), side_get) && !prolly_window_severed())
+	{
+		ProllyKey	k = {(const uint8 *) start.bytes, start.len};
+		StringInfoData v;
+		bool		kept;
+
+		initStringInfo(&v);
+		kept = PROLLY_CALL(refs(), side_get, PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
+			v.len == 8;
+		if (kept)
+		{
+			uint64		n = 0;
+
+			for (int i = 0; i < 8; i++)
+				n = (n << 8) | (uint8) v.data[i];
+			pfree(v.data);
+			return (int64) n;
+		}
+		pfree(v.data);
+	}
 	return list_length(log_walk(list_make1(&start)));
 }
 

@@ -1853,18 +1853,19 @@ a history drop and a full collection in another session meanwhile don't
 free what it has yet to read.  The scan gives the entry's whole row too
 (dolt_log l ... count(l), l IS NOT NULL), made of its columns.
 
-Each commit records the commits it reaches, itself included (its
-"commits" item, prolly_history_commits()), as Dolt's commit closure
-counts them: one more than its first parent's, and for a merge, more by
-those its other parents reach that the first doesn't, found by heights
-highest first, so a merge reads only the commits above the history its
-sides share.  A remote's commit whose count isn't what its parents give
-is refused.  So count(*) of dolt_log(ref) alone (no quals, GROUP BY or
-HAVING) is planned as a scan giving the count ref's commit records
-(prolly_log_count.c), reading one commit however long the history.  A
-commit recording none (its first parent records none), or a history
-horizon, which the log stops at, has the log counted as it gives its
-rows.
+The refs keep, for each commit a head moves to, the commits it reaches,
+itself included (the side space PROLLY_REFS_SPACE_COMMITS, keyed by commit
+id, prolly_history_commits()), as Dolt's commit closure counts them: one
+more than its first parent's, and for a merge, more by those its other
+parents reach that the first doesn't, found by heights highest first.
+They are derived, not part of the commit (its id is its content's, as
+before), and transfers don't send them: a head moved to a commit whose
+first parents have none (history made before, or received) keeps them
+down to one that has, once.  So count(*) of dolt_log(ref) alone (no
+quals, GROUP BY or HAVING) is planned as a scan giving that count
+(prolly_log_count.c), reading no history.  A commit the refs keep none
+for, or a history horizon, which the log stops at, has the log counted
+as it gives its rows.
 
 Remotes
 -------

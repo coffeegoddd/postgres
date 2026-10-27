@@ -173,11 +173,6 @@
  * commit content has the same id in every database:
  *
  *	"author"	-> the author
- *	"commits"	-> the commits it reaches, itself included
- *				   (prolly_history_commits()), 8 bytes big-endian: what
- *				   count(*) of its dolt_log() gives while no history is
- *				   severed; a commit without it (its first parent records
- *				   none, or its history couldn't be read) has them counted
  *	"dependencies" -> what the versioned objects needed from outside
  *				   the versioned schemas (length byte, hash of the
  *				   canonicalizer's tree of them); a commit without it
@@ -2305,6 +2300,8 @@ baseline_index_set(const char *name, const ProllyNodeRef *was,
 	pfree(key.data);
 }
 
+static void commits_note(const ProllyHash *commit);
+
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
  * that moved it (head_moved_unseen()).  A branch that gets its first head
@@ -2365,7 +2362,10 @@ branch_set_head(const char *name, const ProllyHash *head)
 	pfree(key.data);
 	pfree(v.data);
 	if (head)
+	{
 		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
+		commits_note(head);
+	}
 }
 
 /*
@@ -3708,7 +3708,6 @@ typedef struct KeptCommit
 #define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
 
 static bool commit_height(const ProllyHash *id, int64 *height);
-static bool commit_number(const ProllyHash *id, const char *item, int64 *n);
 
 /*
  * The freezing of a keep's roots as it captures them, if the root freezer
@@ -6264,25 +6263,6 @@ parents_height(const ProllyHash *parents, int nparents)
 }
 
 /*
- * The commits a commit with these parents reaches, itself included
- * (prolly_history_commits()); for one parent, read from its "commits"
- * item alone.  False if that can't be known.
- */
-static bool
-parents_commits(const ProllyHash *parents, int nparents, int64 *commits)
-{
-	int64		first;
-
-	if (nparents != 1)
-		return prolly_history_commits(parents, nparents, copies_lookup_commit,
-									  NULL, commits);
-	if (!commit_number(&parents[0], "commits", &first))
-		return false;
-	*commits = first + 1;
-	return true;
-}
-
-/*
  * Write a commit's tree of root and dependencies (what its versioned
  * objects need from outside); its id is the root's hash.  It is dated now,
  * as Dolt's are, not at the transaction's start, so a parent another
@@ -6322,23 +6302,13 @@ copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
-	 * Keys in order: author, commits (if known), dependencies, height,
-	 * identity (if any), message, parents, root, time.
+	 * Keys in order: author, dependencies, height, identity (if any),
+	 * message, parents, root, time.
 	 */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
 	resetStringInfo(&v);
-	{
-		int64		commits;
-
-		if (parents_commits(parents, nparents, &commits))
-		{
-			put_uint64(&v, (uint64) commits);
-			add_item(b, "commits", &v);
-			resetStringInfo(&v);
-		}
-	}
 	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
@@ -6422,7 +6392,7 @@ get_time(const StringInfoData *v, TimestampTz *at)
 }
 
 /* The most items a commit has (write_commit's). */
-#define COMMIT_ITEMS	9
+#define COMMIT_ITEMS	8
 
 /* Is a commit's item k the one named name? */
 static bool
@@ -6515,26 +6485,18 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 			ref_of(&deps, &info->dependencies);
 			info->has_dependencies = true;
 		}
-		else if (item_is(&k, "height") || item_is(&k, "time") ||
-				 item_is(&k, "commits"))
+		else if (item_is(&k, "height") || item_is(&k, "time"))
 		{
 			StringInfoData n = {unconstify(char *, p), v.len, v.len, 0};
-			uint64		count;
+			uint64		height;
 
 			if (item_is(&k, "time"))
 				(void) get_time(&n, &info->committed_at);
-			else if (!get_uint64(&n, &count) || count == 0 ||
-					 count > PG_INT64_MAX)
-				;
-			else if (item_is(&k, "height"))
+			else if (get_uint64(&n, &height) && height > 0 &&
+					 height <= PG_INT64_MAX)
 			{
-				info->height = (int64) count;
+				info->height = (int64) height;
 				info->has_height = true;
-			}
-			else
-			{
-				info->commits = (int64) count;
-				info->has_commits = true;
 			}
 		}
 		else if (item_is(&k, "identity") && v.len > 0)
@@ -6622,12 +6584,9 @@ commit_time(const ProllyHash *id, TimestampTz *at)
 	return found;
 }
 
-/*
- * Just a count commit id records (its "height" or "commits" item), which
- * is read only for it.
- */
+/* Just the height commit id records, which is read only for it. */
 static bool
-commit_number(const ProllyHash *id, const char *item, int64 *n)
+commit_height(const ProllyHash *id, int64 *height)
 {
 	ProllyNodeRef ref;
 	StringInfoData v;
@@ -6639,18 +6598,12 @@ commit_number(const ProllyHash *id, const char *item, int64 *n)
 		return false;
 	ref_of(id, &ref);
 	initStringInfo(&v);
-	found = read_item(&ref, item, &v) && get_uint64(&v, &h) &&
+	found = read_item(&ref, "height", &v) && get_uint64(&v, &h) &&
 		h > 0 && h <= PG_INT64_MAX;
 	pfree(v.data);
 	if (found)
-		*n = (int64) h;
+		*height = (int64) h;
 	return found;
-}
-
-static bool
-commit_height(const ProllyHash *id, int64 *height)
-{
-	return commit_number(id, "height", height);
 }
 
 /* A commit id in hex; false if refname isn't one. */
@@ -12203,6 +12156,94 @@ copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
 	}
 	refs_put(k.data, k.len, value ? &v : NULL);
 	pfree(k.data);
+}
+
+/*
+ * The commits a commit reaches (PROLLY_REFS_SPACE_COMMITS), as the refs
+ * keep them; false if they keep none for it.
+ */
+static bool
+commits_get(const ProllyHash *commit, int64 *n)
+{
+	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
+	StringInfoData v;
+	uint64		c;
+	bool		found;
+
+	initStringInfo(&v);
+	found = copies_side_get(PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
+		get_uint64(&v, &c) && c > 0 && c <= PG_INT64_MAX;
+	pfree(v.data);
+	if (found)
+		*n = (int64) c;
+	return found;
+}
+
+static void
+commits_put(const ProllyHash *commit, int64 n)
+{
+	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
+	StringInfoData v;
+	ProllyValue val;
+
+	initStringInfo(&v);
+	put_uint64(&v, (uint64) n);
+	val.data = (const uint8 *) v.data;
+	val.len = v.len;
+	copies_side_put(PROLLY_REFS_SPACE_COMMITS, &k, &val);
+	pfree(v.data);
+}
+
+/*
+ * A head moved to commit (the refs held): the commits it reaches kept, if
+ * not kept already.  From its parents': for one whose first parent's are
+ * missing too (history made before they were kept, or received), down
+ * its first parents to one kept (or a root), each found on the way kept,
+ * once; a merge's other parents by prolly_history_commits()'s walk.  A
+ * commit that can't be read leaves those above it without.
+ */
+static void
+commits_note(const ProllyHash *commit)
+{
+	MemoryContext cxt;
+	MemoryContext old;
+	List	   *chain = NIL;
+	ProllyHash	cur = *commit;
+	int64		below = 0;
+	int64		n;
+
+	if (commits_get(commit, &n))
+		return;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit counts",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	for (;;)
+	{
+		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
+
+		CHECK_FOR_INTERRUPTS();
+		if (!copies_commit_get(&cur, info))
+		{
+			chain = NIL;		/* (nothing above it can be counted) */
+			break;
+		}
+		chain = lcons(info, chain);
+		if (info->nparents == 0)
+			break;
+		if (commits_get(&info->parents[0], &below))
+			break;
+		cur = info->parents[0];
+	}
+	foreach_ptr(ProllyCommitInfo, info, chain)
+	{
+		if (!prolly_history_commits(info->parents, info->nparents, below,
+									copies_lookup_commit, NULL, &n))
+			break;
+		commits_put(&info->id, n);
+		below = n;
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 typedef bool (*SideVisit) (const ProllyKey *key, const ProllyValue *value,
