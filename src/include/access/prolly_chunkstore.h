@@ -95,13 +95,16 @@
  *   slot's bytes.  gc_new() visits what is new since the seal, or since its
  *   last call: the root, and each chunk appended since; the first call waits
  *   for the transactions that appended to the sealed segments and were in
- *   progress at the seal, then for every other transaction running then
- *   (one begun before the seal may name what it read under an older root,
- *   which the root as of the seal may no longer reach; a collector that
- *   keeps trees across transactions forgets them before the call), and
- *   with window true it holds every append off until gc_swap().  gc_copy() writes the marked slots (but those of files
- *   kept whole) to new table files (settled, unless the scope is the
- *   journal), before the window; gc_swap()
+ *   progress at the seal, then (but for a move of the journal, which frees
+ *   nothing) for every other transaction running then that has used the
+ *   store (one begun before the seal may name what it read under an older
+ *   root, which the root as of the seal may no longer reach; a collector
+ *   that keeps trees across transactions forgets them before the call).
+ *   Table files may be added while it waits, not by those it waits for.
+ *   With window true it holds every append off until gc_swap().  gc_copy()
+ *   writes the marked slots (but those of files kept whole) to new table
+ *   files (settled, unless the scope is the journal), before the window;
+ *   gc_swap()
  *   writes those marked since, and replaces the manifest: the new files and
  *   those kept, the segment appends go to, the next GC generation.  What
  *   was collected and not kept is no longer found; gc_retire() removes it

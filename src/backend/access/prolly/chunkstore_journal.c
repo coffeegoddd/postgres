@@ -476,6 +476,16 @@ typedef struct KeepTouch
 	Oid			spcoid;
 	TransactionId xid;
 	LocalTransactionId held;
+
+	/*
+	 * The transaction (of the backend's) that has used a store of database
+	 * used_dboid (xact_note()), which a collection begun since may wait for;
+	 * and waited, that transaction once a collection holding the table file
+	 * writers' lock waits for it to end (until its swap).  Under mutex.
+	 */
+	Oid			used_dboid;
+	LocalTransactionId used;
+	LocalTransactionId waited;
 } KeepTouch;
 
 /* shared by every backend */
@@ -1228,6 +1238,7 @@ open_segment(Segment *g)
 #define SYNC_TABLE_FILE		1
 
 static JournalShared *shared(void);
+static void waited_clear(ProllyChunkStore *s);
 
 /*
  * Whether sync requests are to be taken as refused (by the queue), for a
@@ -2505,6 +2516,24 @@ stored_has(ProllyChunkStore *s, const ProllyHash *key)
 }
 
 /*
+ * Note in shared memory that the transaction uses a store of the database,
+ * before it reads the store's root: a collection that doesn't see it noted
+ * (journal_gc_new()) sealed before that root was read, so the transaction
+ * reads what the collection marks or keeps.
+ */
+static void
+xact_used(ProllyChunkStore *s)
+{
+	JournalShared *js = shared();
+	KeepTouch  *t = &touches(js)[MyProcNumber];
+
+	SpinLockAcquire(&js->mutex);
+	t->used_dboid = s->dboid;
+	t->used = MyProc->vxid.lxid;
+	SpinLockRelease(&js->mutex);
+}
+
+/*
  * Note the GC generation the transaction began in, at its first use of the
  * store: it holds chunks no swap since may have dropped.
  */
@@ -2513,6 +2542,7 @@ xact_note(ProllyChunkStore *s)
 {
 	if (MyProc->vxid.lxid == s->xact_lxid)
 		return;
+	xact_used(s);
 	refresh_segments(s);
 	s->xact_lxid = MyProc->vxid.lxid;
 	s->xact_generation = s->gc_generation;
@@ -4716,15 +4746,39 @@ remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
 }
 
 /*
- * Take the table file writers' lock, and read the manifest it protects.
- * With unless_collecting, not if a collection of the store holds it (false
- * then, nothing taken): from its seal to its swap a collection waits for
- * the transactions running when it began to end, so one of those waiting
- * for the lock would wait for good.  (One that takes it later waits for
- * this transaction, which then holds it, as for any other.)
+ * Is this transaction one a collection waits for (journal_gc_new()), until
+ * its swap?  Then it adds no table file: what it found stored, and so
+ * didn't send or keep, it found before the collection began keeping such
+ * chunks, and once the collection holds the writers' lock again it would
+ * wait for good.
  */
 static bool
-lock_manifest_as(ProllyChunkStore *s, Manifest *m, bool unless_collecting)
+xact_waited(ProllyChunkStore *s)
+{
+	JournalShared *js = shared();
+	KeepTouch  *t = &touches(js)[MyProcNumber];
+	bool		waited;
+
+	SpinLockAcquire(&js->mutex);
+	waited = t->used_dboid == s->dboid && t->waited == MyProc->vxid.lxid &&
+		t->waited != InvalidLocalTransactionId;
+	SpinLockRelease(&js->mutex);
+	return waited;
+}
+
+/*
+ * Take the table file writers' lock, and read the manifest it protects.
+ * With unless_collecting, not while a collection of the store runs (false
+ * then, nothing taken), for a pass that can as well be left to the next
+ * (a conjoin, which would rewrite files the collection reads).  With
+ * unless_waited, not if this transaction is one a collection waits for
+ * (false then).  Any other waits for the lock, as for any writer's: a
+ * collection lets it go while it waits for transactions, so only for the
+ * collection's marking and copying, until its swap.
+ */
+static bool
+lock_manifest_as(ProllyChunkStore *s, Manifest *m, bool unless_collecting,
+				 bool unless_waited)
 {
 	LOCKTAG		tag;
 	char	   *dir;
@@ -4735,21 +4789,20 @@ lock_manifest_as(ProllyChunkStore *s, Manifest *m, bool unless_collecting)
 				 errmsg("cannot change a chunk store during recovery")));
 	PreventCommandIfReadOnly("writing a chunk store's table files");
 	SET_LOCKTAG_OBJECT(tag, s->dboid, MANIFEST_LOCK_CLASSID, 0, 0);
-	if (!unless_collecting ||
-		LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+	if (unless_waited && xact_waited(s))
+		return false;
+	if (unless_collecting)
 	{
-		if (unless_collecting)
-		{
-			LOCKTAG		gc_tag;
-			int			ncollecting = 0;
+		LOCKTAG		gc_tag;
+		int			ncollecting = 0;
 
-			SET_LOCKTAG_OBJECT(gc_tag, s->dboid, GC_LOCK_CLASSID, 0, 0);
-			(void) GetLockConflicts(&gc_tag, ShareLock, &ncollecting);
-			if (ncollecting > 0)
-				return false;
-		}
-		(void) LockAcquire(&tag, ExclusiveLock, false, false);
+		/* (the lock may be free while a collection waits: asked first) */
+		SET_LOCKTAG_OBJECT(gc_tag, s->dboid, GC_LOCK_CLASSID, 0, 0);
+		(void) GetLockConflicts(&gc_tag, ShareLock, &ncollecting);
+		if (ncollecting > 0)
+			return false;
 	}
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	(void) read_manifest(dir, m);
 	remove_unnamed(s, dir, m);
@@ -4760,7 +4813,28 @@ lock_manifest_as(ProllyChunkStore *s, Manifest *m, bool unless_collecting)
 static void
 lock_manifest(ProllyChunkStore *s, Manifest *m)
 {
-	(void) lock_manifest_as(s, m, false);
+	(void) lock_manifest_as(s, m, false, false);
+}
+
+/*
+ * For a transaction about to add table files: the writers' lock (false if
+ * a collection holding it waits for the transaction), and the transaction
+ * noted (xact_note()).  One that hasn't used the store yet takes the lock
+ * first, waiting out a collection's swap if one holds it, and is noted
+ * after: it begins with the store as swapped, not straddling the swap.
+ */
+static bool
+lock_manifest_noted(ProllyChunkStore *s, Manifest *m)
+{
+	bool		first = MyProc->vxid.lxid != s->xact_lxid;
+
+	if (!first)
+		xact_note(s);
+	if (!lock_manifest_as(s, m, false, true))
+		return false;
+	if (first)
+		xact_note(s);
+	return true;
 }
 
 /* A transaction refused the table file writers' lock: a collection holds it. */
@@ -4770,7 +4844,7 @@ collecting_refused(void)
 	ereport(ERROR,
 			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 			 errmsg("the chunk store is being collected"),
-			 errdetail("A transaction that began before the collection's swap could not add to the store's table files after it."),
+			 errdetail("A collection of the store is waiting for this transaction to end; table files can't be added until it has swapped."),
 			 errhint("Try the transaction again.")));
 }
 
@@ -6774,8 +6848,7 @@ add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg,
 	Manifest	m;
 	bool	   *keep;
 
-	xact_note(s);
-	if (!lock_manifest_as(s, &m, true))
+	if (!lock_manifest_noted(s, &m))
 		collecting_refused();
 	if (m.gc_generation != s->xact_generation)
 		ereport(ERROR,
@@ -7070,8 +7143,7 @@ journal_adopt_received(ProllyChunkStore *s)
 	List	   *ids;
 	List	   *tables = received_tables(s);
 
-	xact_note(s);
-	if (!lock_manifest_as(s, &m, true))
+	if (!lock_manifest_noted(s, &m))
 		collecting_refused();
 	if (m.gc_generation != s->xact_generation)
 		ereport(ERROR,
@@ -7128,7 +7200,7 @@ journal_forget_received(ProllyChunkStore *s, const char *const *keep, int nkeep)
 	List	   *ids;
 
 	received_changed(s);
-	if (!lock_manifest_as(s, &m, true))
+	if (!lock_manifest_as(s, &m, false, true))
 		collecting_refused();
 	ids = received_ids(dir);
 	foreach_ptr(uint64, id, ids)
@@ -7432,7 +7504,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	uint32		epoch_hi = 0;
 
 	/* (none while a collection runs: the next pass conjoins) */
-	if (!lock_manifest_as(s, &m, true))
+	if (!lock_manifest_as(s, &m, true, false))
 		return;
 	if (m.nfiles < 2 || (max_files > 0 && m.nfiles <= max_files))
 		return;
@@ -7848,6 +7920,7 @@ struct ProllyChunkGc
 	VirtualTransactionId *held; /* begun as a standby's, holding pointers */
 	int			nheld;
 	bool		waited;
+	bool		overflow_told;	/* its keep set's overflow logged */
 	Segment    *appended;		/* the segment appended to from the seal */
 	int			keep;			/* its KeepSet, -1 once let go */
 	bool		keep_all;		/* it had none */
@@ -8243,6 +8316,7 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 		wait_for_readers(vxids, nvxids);
 	}
 	lock_manifest(s, &gc->m);
+	waited_clear(s);			/* (any a collection that failed left) */
 	if (gc->m.nretiring > 0)
 		retire(s, &gc->m);
 	else
@@ -8624,6 +8698,45 @@ gc_prepared(ProllyChunkGc *gc, List *prepared, ProllyChunkGcVisit visit,
  * pointers are on pages.  With window, appends are held off from here
  * until the swap.
  */
+/*
+ * The writers' lock taken again after the collection's waits, and the
+ * manifest read again: table files added meanwhile (transfers', received
+ * ones adopted) are named beside those collected, outside the collection,
+ * and its own files' ids follow theirs.  Anything else changed (a file
+ * gone, a segment sealed) and the collection fails, to be tried again.
+ */
+static void
+gc_relock(ProllyChunkGc *gc)
+{
+	MemoryContext old = MemoryContextSwitchTo(gc->cxt);
+	Manifest	m;
+	bool		same;
+
+	lock_manifest(gc->s, &m);
+	same = m.gc_generation == gc->m.gc_generation &&
+		m.nsegments == gc->m.nsegments &&
+		memcmp(m.segments, gc->m.segments,
+			   sizeof(uint64) * m.nsegments) == 0 &&
+		m.last_id >= gc->m.last_id;
+	for (int i = 0; i < gc->m.nfiles && same; i++)
+	{
+		bool		found = false;
+
+		for (int j = 0; j < m.nfiles && !found; j++)
+			found = m.files[j].id == gc->m.files[i].id &&
+				m.files[j].flags == gc->m.files[i].flags;
+		same = found;
+	}
+	if (!same)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("the chunk store changed while it was being collected"),
+				 errhint("Try the collection again.")));
+	gc->m = m;
+	gc->next_id = Max(gc->next_id, m.last_id + 1);
+	MemoryContextSwitchTo(old);
+}
+
 static void
 journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			   void *arg)
@@ -8641,6 +8754,17 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 	{
 		List	   *prepared = NIL;
 
+		/*
+		 * The writers' lock let go while waiting (a transaction left open
+		 * would otherwise hold off every transfer), taken again after: if
+		 * the collection has written no table file yet (a move has, before
+		 * its first call), which a writer taking the lock would take for
+		 * one left unnamed and remove.
+		 */
+		bool		release = (gc->written == NIL);
+
+		if (release)
+			unlock_manifest(s);
 		foreach(lc, gc->xids)
 		{
 			if (wait_unprepared(lfirst_xid(lc)))
@@ -8659,15 +8783,39 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		 * of the seal or a later one: what it reads is marked from there, or
 		 * was appended since.
 		 */
+		if (gc->settle)
 		{
+			JournalShared *js = shared();
+			KeepTouch  *ts = touches(js);
 			int			nrunning;
+			int			n = 0;
 			VirtualTransactionId *running =
 				GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
 									  &nrunning);
 
-			wait_for_readers(running, nrunning);
+			/*
+			 * (those that have used a store of the database: one that hasn't
+			 * reads the root as of its first use, after the seal; each
+			 * marked waited, so it doesn't wait for the writers' lock)
+			 */
+			SpinLockAcquire(&js->mutex);
+			for (int i = 0; i < nrunning; i++)
+			{
+				KeepTouch  *t = &ts[running[i].procNumber];
+
+				if (t->used_dboid == s->dboid &&
+					t->used == running[i].localTransactionId)
+				{
+					t->waited = t->used;
+					running[n++] = running[i];
+				}
+			}
+			SpinLockRelease(&js->mutex);
+			wait_for_readers(running, n);
 			pfree(running);
 		}
+		if (release)
+			gc_relock(gc);
 		INJECTION_POINT("prolly-gc-running-waited", NULL);
 		gc->waited = true;
 		if (prepared != NIL)
@@ -9051,6 +9199,23 @@ swap_epochs(ProllyChunkGc *gc, Manifest *nm)
  * appends go to, what was collected and not kept retiring, the next
  * generation.  Appends go on.
  */
+/*
+ * The collection has swapped: the transactions it waited for may wait for
+ * the table file writers' lock again.
+ */
+static void
+waited_clear(ProllyChunkStore *s)
+{
+	JournalShared *js = shared();
+	KeepTouch  *ts = touches(js);
+
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < js->nranges; i++)
+		if (ts[i].used_dboid == s->dboid)
+			ts[i].waited = InvalidLocalTransactionId;
+	SpinLockRelease(&js->mutex);
+}
+
 static void
 journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 				ProllyGcResult *result)
@@ -9127,6 +9292,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 		INSTR_TIME_SUBTRACT(now, gc->window_began);
 		window_usec = INSTR_TIME_GET_MICROSEC(now);
 	}
+	waited_clear(s);
 	unlock_manifest(s);
 	gc->readers = GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
 										&gc->nreaders);
@@ -9201,6 +9367,15 @@ journal_gc_kept(ProllyChunkGc *gc, ProllyChunkRefVisit visit, void *arg)
 		visit(&hashes[i], arg);
 	gc->kept_seen += n;
 	pfree(hashes);
+	if (overflow && !gc->overflow_told)
+	{
+		gc->overflow_told = true;
+		ereport(LOG,
+				(errmsg("a collection of the chunk store of database %u keeps every chunk it collects from",
+						gc->s->dboid),
+				 errdetail("More than %d chunks were found stored or kept while it ran, more than its keep set holds.",
+						   KEEP_MAX)));
+	}
 	return !overflow;
 }
 

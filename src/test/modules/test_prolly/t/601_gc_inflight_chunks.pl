@@ -232,5 +232,57 @@ unlike($log,
 like(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'gc_collections'}),
 	qr/^[1-9]/, 'and collections ran');
 
+# (and the store is whole: a full collection marks, and so reads, all the
+# root reaches; each task branch's rows and log read)
+sql(q{SELECT dolt_gc('--full')});
+for my $t (1 .. 4)
+{
+	my $b = "task$t";
+	like(sql("SELECT count(*) FROM dolt_at('" . $b . "', NULL::s.t)"),
+		qr/^[1-9]/, "$b reads whole");
+	like(sql("SELECT count(*) FROM (SELECT * FROM dolt_log('" . $b . "') OFFSET 0) l"),
+		qr/^[1-9]/, "$b log reads whole");
+}
+
+# 6. Transfers beside a collection.  A transaction open as it begins that
+# has used the store is waited for before the swap; one that never has
+# isn't.  While it waits the collection lets the table file writers' lock
+# go: a transfer begun meanwhile adds its file and commits, the collection
+# still waiting, and the file is kept.  The transaction waited for is
+# refused a table file at once (what it found stored, it found before the
+# collection kept such chunks).
+# (nothing left retiring, whose readers a collection waits for first)
+sql(q{SELECT test_chunk_gc(false) IS NOT NULL});
+my $idle = $node->background_psql('gi');
+$idle->query_safe(q{BEGIN; SELECT 1});
+my $g6 = collect('prolly-gc-running-waited');
+pass('a collection waits for no transaction that never used the store');
+$node->safe_psql('gi', q{SELECT injection_points_wakeup('prolly-gc-running-waited')});
+$idle->query_safe(q{COMMIT});
+$idle->quit;
+collected($g6);
+
+my $user = $node->background_psql('gi', on_error_stop => 0);
+$user->query_safe(q{BEGIN; SELECT test_chunk_has('00')});
+my $g7 = $node->background_psql('gi');
+$g7->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_gc(false) IS NOT NULL;
+	\echo done
+});
+waiting('virtualxid', "the collection did not wait for the store's user");
+sql(q{SELECT test_chunk_table_file(ARRAY['beside a collection'::bytea])});
+pass('a transfer adds its file while the collection waits');
+is(sql(q{SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'virtualxid'}), '1',
+	'the collection still waiting');
+$user->query(q{SELECT test_chunk_table_file(ARRAY['refused'::bytea])});
+like($user->{stderr}, qr/the chunk store is being collected/,
+	'the transaction the collection waits for is refused a table file at once');
+$user->query(q{ROLLBACK});
+$user->quit;
+collected($g7);
+is(has(sql(q{SELECT test_content_hash('beside a collection')})), 't',
+	"the transfer's chunk is kept by the collection");
+
 $node->stop;
 done_testing();
