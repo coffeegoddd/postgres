@@ -142,7 +142,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  reclamation    | stub           | identity                       | pass
  reclamation    | stub           | live_chunks_never_freed        | not implemented (missing collect)
  reclamation    | stub           | keeps_what_writers_reference   | not implemented (missing collect)
- reclamation    | stub           | complete                       | not implemented (3 of 3 callbacks missing)
+ reclamation    | stub           | complete                       | not implemented (4 of 4 callbacks missing)
  refs           | copies         | identity                       | pass
  refs           | copies         | branch_lifecycle               | no checks yet
  refs           | copies         | commit_then_resolve            | no checks yet
@@ -152,7 +152,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs           | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs           | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs           | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs           | stub           | complete                       | not implemented (104 of 104 callbacks missing)
+ refs           | stub           | complete                       | not implemented (105 of 105 callbacks missing)
  transfer       | chunks         | identity                       | pass
  transfer       | chunks         | receive_then_send              | no checks yet
  transfer       | chunks         | complete                       | pass
@@ -214,7 +214,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree           | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
  tree           | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
  tree           | stub           | value_splices                  | not implemented (missing value_write, value_read, value_root, value_splice)
- tree           | stub           | complete                       | not implemented (25 of 25 callbacks missing)
+ tree           | stub           | complete                       | not implemented (26 of 26 callbacks missing)
  table_keying   | pk_or_prefix   | identity                       | pass
  table_keying   | pk_or_prefix   | round_trip                     | pass
  table_keying   | pk_or_prefix   | keys_and_content               | pass
@@ -314,7 +314,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | identity                       | pass
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
- history_window | stub           | complete                       | not implemented (14 of 14 callbacks missing)
+ history_window | stub           | complete                       | not implemented (18 of 18 callbacks missing)
  root_freezer   | capture        | identity                       | pass
  root_freezer   | capture        | complete                       | pass
  root_freezer   | lazy           | identity                       | pass

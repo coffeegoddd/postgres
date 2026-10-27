@@ -30,5 +30,71 @@ SELECT id, length(v), md5(v) = md5((SELECT string_agg(md5(i::text), '')
 	FROM gt.t ORDER BY id;
 SELECT test_chunk_verify_generations() > 0 AS generations;
 
+
 \c postgres
 DROP DATABASE generations_toast_db;
+
+-- Values a commit's frozen page root holds: they survive retires of every
+-- generation but the newest, and a reset to the commit restores them;
+-- once the commit is severed (and no longer kept), retires free its data,
+-- the head's values stay, and a reset to it is refused, saying how to
+-- repair it.
+\set VERBOSITY terse
+CREATE DATABASE generations_toast_frozen;
+\c generations_toast_frozen
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA gt VERSIONED;
+CREATE FUNCTION gt_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	hint text;
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS hint = PG_EXCEPTION_HINT;
+	RETURN regexp_replace(SQLERRM || ' (' || hint || ')', '[0-9a-f]{40}',
+						  '<hash>', 'g');
+END $$;
+CREATE TABLE gt.k (id int PRIMARY KEY, v text);
+CREATE FUNCTION gt_val(id int, tag text) RETURNS text LANGUAGE sql AS $$
+	SELECT string_agg(md5(tag || id || '.' || i), '' ORDER BY i)
+	FROM generate_series(1, 190) i
+$$;
+INSERT INTO gt.k SELECT g, gt_val(g, 'k1') FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'k1', '--date', '2020-01-01')::text) > 0 AS committed;
+SELECT commit_hash AS k1 FROM dolt_log('main') LIMIT 1 \gset
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+UPDATE gt.k SET v = gt_val(id, 'k2');
+SELECT length(dolt_commit('-Am', 'k2', '--date', '2020-01-02')::text) > 0 AS committed;
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+UPDATE gt.k SET v = gt_val(id, 'k3');
+SELECT length(dolt_commit('-Am', 'k3', '--date', '2020-01-03')::text) > 0 AS committed;
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+UPDATE gt.k SET v = gt_val(id, 'k4');
+SELECT length(dolt_commit('-Am', 'k4', '--date', '2020-01-04')::text) > 0 AS committed;
+SELECT kept >= 0 AS collected FROM test_chunk_gc(false);
+SELECT max(epoch_hi) AS newest, min(epoch_lo) FILTER (WHERE settled) AS oldest
+	FROM test_chunk_generations() \gset
+SELECT freed >= 0 AS retired FROM test_chunk_retire(:oldest, :newest - 1);
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT dolt_branch('probe') IS NOT NULL AS branched;
+SELECT dolt_checkout('probe') IS NOT NULL AS checked_out;
+UPDATE gt.k SET v = 'dirty' WHERE id = 1;
+SELECT dolt_reset('--hard', :'k1') IS NOT NULL AS reset;
+SELECT count(*) FILTER (WHERE v = gt_val(id, 'k1')) AS k1_values FROM gt.k;
+SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
+SELECT dolt_branch('-D', 'probe') IS NOT NULL AS deleted;
+
+SELECT commits FROM dolt_history_drop('2020-01-03');
+SELECT max(epoch_hi) AS newest, min(epoch_lo) FILTER (WHERE settled) AS oldest
+	FROM test_chunk_generations() \gset
+SELECT freed > 0 AS retired FROM test_chunk_retire(:oldest, :newest - 1);
+SELECT count(*) FILTER (WHERE v = gt_val(id, 'k4')) AS head_values FROM gt.k;
+SELECT dolt_branch('probe2') IS NOT NULL AS branched;
+SELECT dolt_checkout('probe2') IS NOT NULL AS checked_out;
+SELECT gt_err(format('SELECT dolt_reset(%L, %L)', '--hard', :'k1')) AS reset_k1;
+SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
+SELECT test_chunk_verify_generations() > 0 AS generations;
+
+\c postgres
+DROP DATABASE generations_toast_frozen;

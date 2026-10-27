@@ -9,6 +9,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_head_restore;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_head_restore SET prolly.history_window = '1000 years';
 \c kept_head_restore
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;
@@ -28,6 +31,7 @@ CREATE FUNCTION now_counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM counted()
 $$;
 ALTER DATABASE kept_head_restore SET prolly.history_min_commits = 1;
+ALTER DATABASE kept_head_restore SET prolly.history_window = '1 microsecond';
 CREATE SCHEMA kh VERSIONED;
 CREATE TABLE kh.t (id bigint PRIMARY KEY, v int NOT NULL, w text NOT NULL);
 CREATE INDEX t_v ON kh.t (v);
@@ -136,6 +140,7 @@ FROM kh.n n;
 -- keeps b and the head (a's snapshot carried, or kept anew); a reset back
 -- to a then gives a's pages back, writing no row.
 ALTER DATABASE kept_head_restore SET prolly.history_min_commits = 2;
+ALTER DATABASE kept_head_restore SET prolly.history_window = '1 microsecond';
 DROP TABLE kh.n;
 SELECT dolt_commit('-am', 'n dropped') IS NOT NULL AS committed;
 SELECT dolt_reset('--hard', :'a') IS NOT NULL AS reset;
@@ -157,6 +162,7 @@ SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
 	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
 SELECT rows_digest() = :'at_a' AS at_a, clean(), indexes_valid();
 ALTER DATABASE kept_head_restore RESET prolly.history_min_commits;
+ALTER DATABASE kept_head_restore SET prolly.history_window = '1000 years';
 
 \c :home
 DROP DATABASE kept_head_restore;

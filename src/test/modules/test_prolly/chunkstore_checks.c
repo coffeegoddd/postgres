@@ -35,6 +35,7 @@
 #include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "utils/timestamp.h"
 #include "access/prolly_commitcache.h"
@@ -2490,8 +2491,9 @@ test_commit_height(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_commit_commits(commit): the commits the refs keep that the commit
- * reaches (PROLLY_REFS_SPACE_COMMITS); NULL if they keep none for it.
+ * test_commit_commits(commit): the commits the commit reaches, as a
+ * branch's kept commit of it records them (the refs' commit_count());
+ * NULL if none does.
  */
 PG_FUNCTION_INFO_V1(test_commit_commits);
 Datum
@@ -2499,42 +2501,14 @@ test_commit_commits(PG_FUNCTION_ARGS)
 {
 	ProllyDatabaseComponents dc;
 	ProllyHash	id;
-	ProllyKey	k;
-	StringInfoData v;
-	uint64		n = 0;
+	int64		n;
 
 	prolly_database_components(&dc);
 	text_hash(PG_GETARG_TEXT_PP(0), &id);
-	k.data = (const uint8 *) id.bytes;
-	k.len = id.len;
-	initStringInfo(&v);
-	if (!PROLLY_CALL(dc.refs, side_get, PROLLY_REFS_SPACE_COMMITS, &k, &v) ||
-		v.len != 8)
+	if (!PROLLY_HAS(dc.refs, commit_count) ||
+		!PROLLY_CALL(dc.refs, commit_count, &id, &n))
 		PG_RETURN_NULL();
-	for (int i = 0; i < 8; i++)
-		n = (n << 8) | (uint8) v.data[i];
-	PG_RETURN_INT64((int64) n);
-}
-
-/*
- * test_commit_commits_forget(commit): the refs keep the commits it reaches
- * no more, as for history made before they were kept.
- */
-PG_FUNCTION_INFO_V1(test_commit_commits_forget);
-Datum
-test_commit_commits_forget(PG_FUNCTION_ARGS)
-{
-	ProllyDatabaseComponents dc;
-	ProllyHash	id;
-	ProllyKey	k;
-
-	prolly_database_components(&dc);
-	text_hash(PG_GETARG_TEXT_PP(0), &id);
-	k.data = (const uint8 *) id.bytes;
-	k.len = id.len;
-	PROLLY_CALL(dc.refs, lock);
-	PROLLY_CALL(dc.refs, side_put, PROLLY_REFS_SPACE_COMMITS, &k, NULL);
-	PG_RETURN_VOID();
+	PG_RETURN_INT64(n);
 }
 
 /* The refs' commits, counted as prolly_history_height() reads them. */
@@ -2862,6 +2836,88 @@ test_chunk_retire(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum((int64) r.chunks_kept);
 	values[1] = Int64GetDatum((int64) r.chunks_freed);
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/*
+ * The generations the reclamation would retire now, within budget bytes
+ * of their files (NULL: prolly.gc_retire_budget's): NULLs if none.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_retire_choose);
+Datum
+test_chunk_retire_choose(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	uint64		budget = PG_ARGISNULL(0) ?
+		(uint64) prolly_gc_retire_budget * 1024 : (uint64) PG_GETARG_INT64(0);
+	uint32		max_hi = PG_NARGS() < 2 || PG_ARGISNULL(1) ? PG_UINT32_MAX :
+		(uint32) Min(Max(PG_GETARG_INT64(1), 0), PG_UINT32_MAX);
+	uint32		want = PG_NARGS() < 3 || PG_ARGISNULL(2) ? 0 :
+		(uint32) Min(Max(PG_GETARG_INT64(2), 0), PG_UINT32_MAX);
+	uint32		lo = 0;
+	uint32		hi = 0;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	if (!PROLLY_CALL(dc.reclamation, choose, budget, max_hi, want, &lo, &hi))
+		nulls[0] = nulls[1] = true;
+	values[0] = Int64GetDatum((int64) lo);
+	values[1] = Int64GetDatum((int64) hi);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/*
+ * Note chunks as garbage, as a sever does (the chunk store's
+ * note_garbage()): the files' indexes probed.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_note_garbage);
+Datum
+test_chunk_note_garbage(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	ProllyHash *hashes;
+
+	deconstruct_array_builtin(arr, TEXTOID, &elems, &nulls, &n);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
+	PG_RETURN_INT64(PROLLY_CALL(cs(), note_garbage, store(), hashes, n));
+}
+
+/*
+ * The history window's answer for the background's next collection: a
+ * retire due (a fragment made since the last), the newest generation any
+ * retire may take now (NULL: no limit), and a seal due.
+ */
+PG_FUNCTION_INFO_V1(test_window_retire_due);
+Datum
+test_window_retire_due(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	uint32		max_hi = PG_UINT32_MAX;
+	uint32		want = 0;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	values[0] = BoolGetDatum(PROLLY_CALL(dc.history_window, retire_due,
+										 &max_hi, &want));
+	values[1] = Int64GetDatum((int64) max_hi);
+	nulls[1] = (max_hi == PG_UINT32_MAX);
+	values[2] = Int64GetDatum((int64) want);
+	values[3] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

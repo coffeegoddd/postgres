@@ -390,7 +390,7 @@
  * number), with counts of the entries naming each root and a summary of
  * the branch's; and an index of tags by commit.
  */
-#define REFS_FORMAT		"25"
+#define REFS_FORMAT		"26"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -968,6 +968,28 @@ check_merge_conflicts(const char *what)
 static List *retain_pending = NIL;
 static void retain_kept_branches(void);
 
+/*
+ * The commits heads left other than forward, by a reset, an amend or a
+ * move elsewhere (HeadLeft, in TopTransactionContext): each one's kept
+ * entry is dated anew as the transaction commits, before the passes, so
+ * that it stays in its branch's window until the move away is older than
+ * the window, however long the head was at it.
+ */
+typedef struct HeadLeft
+{
+	char	   *name;
+	ProllyHash	commit;
+} HeadLeft;
+
+static List *heads_left = NIL;
+static void heads_left_note(const char *name, const ProllyHash *was,
+							const ProllyHash *head);
+
+/* (the parents of a commit being made the head, as its maker gives them) */
+static const ProllyHash *made_parents = NULL;
+static int	made_nparents = -1;
+static void heads_left_date(void);
+
 static void
 refs_xact_callback(XactEvent event, void *arg)
 {
@@ -1001,6 +1023,7 @@ refs_xact_callback(XactEvent event, void *arg)
 			scoped_pending = NIL;
 			pending_cxt = NULL; /* (TopTransactionContext's: gone) */
 			retain_pending = NIL;
+			heads_left = NIL;
 			forget_read_caches();
 			break;
 		default:
@@ -1910,9 +1933,8 @@ branch_entry_tag(char tag)
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), or a commit's count
- * (PROLLY_REFS_SPACE_COMMITS: whoever writes it writes the same), not
- * having held every ref nor begun to commit?
+ * the commit, which no other transaction writes), not having held every
+ * ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -1924,9 +1946,6 @@ scoped_key(const char *key, int keylen)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
 		(keylen > 1 && key[0] == TAG_OWNED))
-		return true;
-	/* (a commit's count of what it reaches: the same whoever writes it) */
-	if (keylen > 2 && key[0] == TAG_SIDE && key[1] == PROLLY_REFS_SPACE_COMMITS)
 		return true;
 	name = entry_branch(key, keylen, &len);
 	return name != NULL && branch_held(name, len);
@@ -2355,8 +2374,6 @@ baseline_index_set(const char *name, const ProllyNodeRef *was,
 	pfree(key.data);
 }
 
-static void commits_note(const ProllyHash *commit);
-
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
  * that moved it (head_moved_unseen()).  A branch that gets its first head
@@ -2419,8 +2436,30 @@ branch_set_head(const char *name, const ProllyHash *head)
 	if (head)
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
-		commits_note(head);
+		heads_left_note(name, &was_head, head);
 	}
+}
+
+/*
+ * branch_set_head() of a commit just made with these parents: whether the
+ * head moved forward is known without reading the commit.
+ */
+static void
+branch_set_head_made(const char *name, const ProllyHash *head,
+					 const ProllyHash *parents, int nparents)
+{
+	made_parents = parents;
+	made_nparents = nparents;
+	PG_TRY();
+	{
+		branch_set_head(name, head);
+	}
+	PG_FINALLY();
+	{
+		made_parents = NULL;
+		made_nparents = -1;
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -3787,6 +3826,8 @@ typedef struct KeptCommit
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
 	int64		height;			/* the commit's (0 if not known) */
 	int64		pages;			/* its roots' pages no root before holds */
+	int64		commits;		/* the commits it reaches, itself included
+								 * (0: not known) */
 	uint64		seq;			/* retired: its number among the branch's
 								 * retired (0: not given one yet) */
 	char	   *owner;			/* the branch whose entry it was read as
@@ -3821,6 +3862,12 @@ typedef struct KeptSummary
 #define KEPT_SUMMARY_FIELDS	9
 
 static bool commit_height(const ProllyHash *id, int64 *height);
+/* first parents a keep's count walks past the commits made since its last */
+#define KEPT_COUNT_SLACK	4
+static int64 kept_count_new(const ProllyHash *commit, List *known,
+							 int64 limit);
+static bool copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info,
+								 void *arg);
 
 /*
  * The freezing of a keep's roots as it captures them, if the root freezer
@@ -4195,6 +4242,7 @@ kept_encode(StringInfo v, const KeptCommit *kc)
 	appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
 	appendBinaryStringInfo(v, &kc->height, sizeof(int64));
 	appendBinaryStringInfo(v, &kc->pages, sizeof(int64));
+	appendBinaryStringInfo(v, &kc->commits, sizeof(int64));
 	appendStringInfoChar(v, kc->severed ? 1 : 0);
 	appendStringInfoChar(v, kc->unfrozen ? KEPT_UNFROZEN : 0);
 	if (kc->unfrozen)
@@ -4249,7 +4297,7 @@ kept_decode(const char *kp, int klen, const char *p, const char *end)
 		kc->seq = get_be64_at(nul + 2);
 	}
 	if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId) +
-							   sizeof(TimestampTz) + 2 * sizeof(int64) + 1))
+							   sizeof(TimestampTz) + 3 * sizeof(int64) + 1))
 		kept_corrupt();
 	memcpy(&kc->retired, p, sizeof(FullTransactionId));
 	p += sizeof(FullTransactionId);
@@ -4260,6 +4308,8 @@ kept_decode(const char *kp, int klen, const char *p, const char *end)
 	memcpy(&kc->height, p, sizeof(int64));
 	p += sizeof(int64);
 	memcpy(&kc->pages, p, sizeof(int64));
+	p += sizeof(int64);
+	memcpy(&kc->commits, p, sizeof(int64));
 	p += sizeof(int64);
 	kc->severed = *p++ != 0;
 	if (end - p < 1)
@@ -5758,6 +5808,15 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 	kc->commit = *commit_id;
 	if (!commit_height(commit_id, &kc->height))
 		kc->height = 0;
+	/*
+	 * (counted from the previous keep, the commits made since: a keep after
+	 * a move back in history, below it, walks no further than a few)
+	 */
+	kc->commits = kept_count_new(commit_id, newest,
+								 (kc->height > 0 && s.last_height > 0 &&
+								  kc->height > s.last_height ?
+								  kc->height - s.last_height : 0) +
+								 KEPT_COUNT_SLACK);
 	kc->pages = (int64) pages;
 	if (branch_baseline(name, &baseline))
 		kc->baseline = baseline.hash;
@@ -5871,11 +5930,29 @@ typedef struct KeptOf
 	List	   *names;
 } KeptOf;
 
+/*
+ * Could kept commit kc (NULL: none), another branch's, give a move its
+ * pages?  Only once its roots are frozen: one captured among writers is
+ * never given back as captured, and only its own branch freezes it.
+ */
+static bool
+kept_serves_move(const KeptCommit *kc)
+{
+	if (kc == NULL || kc->unfrozen)
+		return false;
+	for (int t = 0; t < kc->ntables; t++)
+		for (int r = 0; r < kc->tables[t].nrels; r++)
+			if (kc->tables[t].rels[r].flags & BRANCH_KEPT_UNFROZEN)
+				return false;
+	return true;
+}
+
 static bool note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg);
 
 /*
- * Does a branch but name keep commit's pages, held against its own
- * keeps and passes until the transaction ends?  Each branch the index of
+ * Does a branch but name keep commit's pages, frozen so that a move can
+ * be given them (kept_serves_move()), held against its own keeps and
+ * passes until the transaction ends?  Each branch the index of
  * kept commits names is tried, never waited for (one in a keeping
  * transaction now is passed over: its pass may be letting go of its
  * own), and its entry read again once held.  So two branches' passes
@@ -5897,13 +5974,62 @@ kept_by_other(const char *name, const ProllyHash *commit)
 	{
 		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
 			continue;
-		if (kept_lookup(other, commit, false) != NULL)
+		if (kept_serves_move(kept_lookup(other, commit, false)))
 		{
 			INJECTION_POINT("prolly-root-kept-elsewhere", NULL);
 			return true;
 		}
 	}
 	return false;
+}
+
+/* (a branch named in a root's index, and whether its head is the commit) */
+typedef struct HeadAt
+{
+	const char *name;
+	const ProllyHash *commit;
+	int			prefix_len;
+	bool		found;
+} HeadAt;
+
+static bool
+note_head_at(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	HeadAt	   *ha = arg;
+	const char *p = (const char *) k->data + ha->prefix_len;
+	int			len = k->len - ha->prefix_len;
+	char	   *other = pnstrdup(p, len);
+	ProllyHash	head;
+
+	if (strcmp(other, ha->name) != 0 && branch_head(other, &head) &&
+		same_hash(&head, ha->commit))
+		ha->found = true;
+	pfree(other);
+	return !ha->found;
+}
+
+/*
+ * Is another branch than name's head at commit?  A seek of the index of
+ * heads' roots, at commit's root: only the branches whose heads have that
+ * root are read.
+ */
+static bool
+head_elsewhere(const char *name, const ProllyHash *commit)
+{
+	StringInfoData prefix;
+	ProllyHash	root;
+	HeadAt		ha = {name, commit, 0, false};
+
+	if (!head_commit_root(commit, &root))
+		return false;
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_ROOT_OF);
+	put_hash(&prefix, &root);
+	appendStringInfoChar(&prefix, 'h');
+	ha.prefix_len = prefix.len;
+	visit_prefix_while(prefix.data, prefix.len, false, note_head_at, &ha);
+	pfree(prefix.data);
+	return ha.found;
 }
 
 /* Does a tag name commit (a seek of the tags' index)? */
@@ -5932,8 +6058,85 @@ typedef struct RetainScan
 	bool		stopping;		/* kept one the pass ends at: only the
 								 * others of its height are judged */
 	int64		stop_height;
+	ProllyHash	head;			/* the branch's head */
+	HTAB	   *ranks;			/* each live one, by how many on the head's
+								 * first parents are newer (PG_INT64_MAX:
+								 * not among those ranked) */
+	int64		ranked;
 	List	   *retire;
 } RetainScan;
+
+/* (a live entry's rank on the branch's history, from the newest) */
+typedef struct KeptRank
+{
+	ProllyHash	commit;			/* (the key) */
+	int64		rank;
+} KeptRank;
+
+/* the commits a ranks' walk passes beyond those its interval keeps */
+#define RANK_WALK_SLACK		1024
+
+/* (each live entry's commit, for the ranks' walk to find) */
+static bool
+live_one(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	RetainScan *rs = arg;
+	KeptCommit *o = kept_decode((const char *) k->data, k->len,
+								(const char *) v->data,
+								(const char *) v->data + v->len);
+	ProllyHash	key;
+	bool		found;
+	KeptRank   *kr;
+
+	memset(&key, 0, sizeof(key));
+	key.len = o->commit.len;
+	memcpy(key.bytes, o->commit.bytes, o->commit.len);
+	kr = hash_search(rs->ranks, &key, HASH_ENTER, &found);
+	if (!found)
+		kr->rank = PG_INT64_MAX;
+	return true;
+}
+
+/*
+ * Rank the live entries on branch name's history from its head, newest
+ * first, as many as min_commits asks: down the head's first parents, so
+ * that a commit reset or amended away from, which isn't on it, takes no
+ * place of the head's own.  The walk ends at the min_commits'th found, or
+ * below the branch's oldest live entry (lowest), and passes at most as
+ * many commits as the root interval would keep that many in, a few more
+ * than min_commits by default.
+ */
+static void
+rank_history(RetainScan *rs, int64 min_commits, int64 lowest)
+{
+	ProllyHash	cur = rs->head;
+	int64		limit = min_commits * Max(prolly_root_interval_commits, 1) +
+		RANK_WALK_SLACK;
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly kept ranks walk",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+
+	for (int64 walked = 0; walked < limit && rs->ranked < min_commits;
+		 walked++)
+	{
+		ProllyCommitInfo info;
+		KeptRank   *kr;
+		int64		h;
+
+		CHECK_FOR_INTERRUPTS();
+		if (commit_height(&cur, &h) && h < lowest)
+			break;
+		kr = hash_search(rs->ranks, &cur, HASH_FIND, NULL);
+		if (kr != NULL && kr->rank == PG_INT64_MAX)
+			kr->rank = rs->ranked++;
+		if (!copies_commit_get(&cur, &info) || info.nparents == 0)
+			break;
+		cur = info.parents[0];
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
 
 static bool
 retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
@@ -5956,10 +6159,33 @@ retain_one(const ProllyKey *k, const ProllyValue *v, void *arg)
 	r.height = o->height;
 	r.bytes = o->pages * BLCKSZ;
 	r.kept_at = o->kept_at;
+	/* (the head's own root too: a reset may have come back to an old one) */
 	r.newest = rs->left <= 1 ||
-		(rs->kept_now != NULL && same_hash(&o->commit, rs->kept_now));
+		(rs->kept_now != NULL && same_hash(&o->commit, rs->kept_now)) ||
+		same_hash(&o->commit, &rs->head);
 	r.tagged = commit_tagged(&o->commit);
 	r.from_newest = rs->from_newest;
+	r.head_elsewhere = head_elsewhere(rs->name, &o->commit);
+	/*
+	 * (the live roots newer than it on the head's first parents: one off
+	 * them, reset or amended away from, is among no newest)
+	 */
+	{
+		KeptRank   *kr = rs->ranks ? hash_search(rs->ranks, &o->commit,
+												 HASH_FIND, NULL) : NULL;
+
+		r.younger = kr ? kr->rank : PG_INT64_MAX;
+	}
+	{
+		ProllyCommitInfo info;
+
+		if (copies_commit_get(&o->commit, &info))
+		{
+			r.committed_at = info.committed_at;
+			for (int i = 0; i < info.nparents; i++)
+				r.on_severed |= prolly_window_archived(&info.parents[i]);
+		}
+	}
 	verdict = rs->rr->judge(rs->pass, &r);
 	if (verdict == PROLLY_ROOT_RETIRE_IF_KEPT)
 		verdict = kept_by_other(rs->name, &o->commit) ? PROLLY_ROOT_RETIRE :
@@ -6004,6 +6230,7 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	int64		excess = 0;
 	int64		cap;
 	int64		left;
+	int64		min_commits = 0;
 	bool		due;
 
 	prolly_database_components(&dc);
@@ -6027,6 +6254,31 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	rs.name = name;
 	rs.kept_now = kept_now;
 	rs.left = s->nlive;
+	if (due && dc.history_window != NULL &&
+		PROLLY_HAS(dc.history_window, policy))
+	{
+		ProllyWindowPolicy p;
+
+		PROLLY_CALL(dc.history_window, policy, name, &p);
+		min_commits = p.keep_commits;
+	}
+	(void) branch_head(name, &rs.head);
+	if (min_commits > 0 && rs.head.len > 0)
+	{
+		StringInfoData all;
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(KeptRank);
+		ctl.hcxt = CurrentMemoryContext;
+		rs.ranks = hash_create("prolly kept ranks", 64, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		initStringInfo(&all);
+		kept_prefix(&all, name, KEPT_LIVE);
+		visit_prefix_while(all.data, all.len, true, live_one, &rs);
+		pfree(all.data);
+		rank_history(&rs, min_commits, s->lowest);
+	}
 	rs.pass = rs.rr->begin(name, excess, due);
 	if (due)
 		s->keeps = 0;
@@ -6058,6 +6310,67 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	}
 }
 
+/*
+ * Branch name's head moved from was (len 0: none) to head: unless forward
+ * (was is a parent of head, as a commit or a merge moves it), was is noted
+ * as left (heads_left).
+ */
+static void
+heads_left_note(const char *name, const ProllyHash *was, const ProllyHash *head)
+{
+	ProllyCommitInfo info;
+	MemoryContext old;
+	HeadLeft   *hl;
+
+	if (was->len == 0 || same_hash(was, head))
+		return;
+	if (made_nparents >= 0)
+	{
+		for (int i = 0; i < made_nparents; i++)
+			if (same_hash(&made_parents[i], was))
+				return;
+	}
+	else if (copies_commit_get(head, &info))
+		for (int i = 0; i < info.nparents; i++)
+			if (same_hash(&info.parents[i], was))
+				return;
+	foreach_ptr(HeadLeft, l, heads_left)
+		if (strcmp(l->name, name) == 0 && same_hash(&l->commit, was))
+			return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	hl = palloc(sizeof(HeadLeft));
+	hl->name = pstrdup(name);
+	hl->commit = *was;
+	heads_left = lappend(heads_left, hl);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Each commit a head left (heads_left) that its branch keeps: its entry's
+ * date (kept_at, which the window reads) made now, the time of the move
+ * away.  One seek and one entry written for each.
+ */
+static void
+heads_left_date(void)
+{
+	List	   *left = heads_left;
+
+	heads_left = NIL;
+	foreach_ptr(HeadLeft, l, left)
+	{
+		KeptCommit *kc;
+
+		if (!branch_exists(l->name))
+			continue;
+		kept_forget_name(l->name);
+		kc = kept_lookup(l->name, &l->commit, true);
+		if (kc == NULL || FullTransactionIdIsValid(kc->retired))
+			continue;
+		kc->kept_at = GetCurrentTimestamp();
+		kept_put(l->name, list_make1(kc), NULL);
+	}
+}
+
 /* The passes due of the branches the transaction kept commits of. */
 static void
 retain_kept_branches(void)
@@ -6070,7 +6383,11 @@ retain_kept_branches(void)
 	 * checkout's is, leaves the pass to the branch's next keep)
 	 */
 	if (XactReadOnly || RecoveryInProgress())
+	{
+		heads_left = NIL;
 		return;
+	}
+	heads_left_date();
 	foreach_ptr(char, name, names)
 	{
 		KeptSummary s;
@@ -6093,6 +6410,119 @@ note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
 	p = get_hash(p, end, &commit);
 	ko->names = lappend(ko->names, pnstrdup(p, end - p));
 	return true;
+}
+
+/*
+ * The commits commit reaches, as a branch's kept commit of it records
+ * them (a seek of the index of kept commits); false if none keeps it with
+ * a count.
+ */
+static bool
+kept_count_get(const ProllyHash *commit, int64 *n)
+{
+	StringInfoData prefix;
+	KeptOf		ko = {NIL};
+	bool		found = false;
+
+	initStringInfo(&prefix);
+	appendStringInfoChar(&prefix, TAG_KEPT_OF);
+	put_hash(&prefix, commit);
+	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
+	pfree(prefix.data);
+	foreach_ptr(char, name, ko.names)
+	{
+		KeptCommit *kc = kept_lookup(name, commit, false);
+
+		if (kc != NULL && kc->commits > 0)
+		{
+			*n = kc->commits;
+			found = true;
+			break;
+		}
+	}
+	list_free_deep(ko.names);
+	return found;
+}
+
+/* A count known of commit: from known (live entries), else any branch's. */
+static bool
+count_known(const ProllyHash *commit, List *known, int64 *n)
+{
+	foreach_ptr(KeptCommit, o, known)
+	{
+		if (!FullTransactionIdIsValid(o->retired) && o->commits > 0 &&
+			same_hash(&o->commit, commit))
+		{
+			*n = o->commits;
+			return true;
+		}
+	}
+	return kept_count_get(commit, n);
+}
+
+/*
+ * The commits commit reaches, itself included (0: not known): from the
+ * nearest commit down its first parents with a count known (in known, a
+ * list of live entries, or any branch's kept commit of it), or a root,
+ * one more for each first parent between (a merge's other parents by
+ * prolly_history_commits()'s walk), at most limit first parents down.  For
+ * a commit being kept, the nearest is the branch's previous keep, and the
+ * limit the commits made since (by height), so every keep's count is
+ * exact under any root interval; a keep after a move back in history
+ * walks a few, and records none if none is found.
+ */
+static int64
+kept_count_new(const ProllyHash *commit, List *known, int64 limit)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly kept count",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	List	   *chain = NIL;
+	ProllyHash	cur = *commit;
+	int64		below = 0;
+	int64		n = 0;
+	bool		found = false;
+
+	for (int64 walked = 0; walked <= limit; walked++)
+	{
+		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
+
+		CHECK_FOR_INTERRUPTS();
+		if (!copies_commit_get(&cur, info))
+			break;
+		chain = lcons(info, chain);
+		if (info->nparents == 0 ||
+			count_known(&info->parents[0], known, &below))
+		{
+			found = true;
+			break;
+		}
+		cur = info->parents[0];
+	}
+	if (found)
+	{
+		foreach_ptr(ProllyCommitInfo, info, chain)
+		{
+			if (!prolly_history_commits(info->parents, info->nparents, below,
+										copies_lookup_commit, NULL, &n))
+			{
+				n = 0;
+				break;
+			}
+			below = n;
+		}
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return n;
+}
+
+static bool
+copies_commit_count(const ProllyHash *commit, int64 *count)
+{
+	refs_init();
+	return kept_count_get(commit, count);
 }
 
 /*
@@ -9655,7 +10085,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
 				 message, &identity, commit_id);
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, parents, nparents);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id, NULL, nparents > 0 ? &parents[0] : NULL);
 	note_anchor(name, commit_id, &anchor);
@@ -10491,7 +10921,7 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 		if (anchor_of(name, &head, &anchor))
 			note_anchor(name, commit_id, &anchor);
 	}
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, &head, 1);
 	carry_head_names(name, &head, commit_id);
 	{
 		ProllyNodeRef baseline;
@@ -10589,7 +11019,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
 				 message, &identity, commit_id);
-	branch_set_head(name, commit_id);
+	branch_set_head_made(name, commit_id, parents, nparents);
 	branch_set_baseline(name, &next, &root);
 	/* (the working set committed, or a move's result over changes of its own) */
 	note_head_names(name, commit_id,
@@ -13890,94 +14320,6 @@ copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
 	pfree(k.data);
 }
 
-/*
- * The commits a commit reaches (PROLLY_REFS_SPACE_COMMITS), as the refs
- * keep them; false if they keep none for it.
- */
-static bool
-commits_get(const ProllyHash *commit, int64 *n)
-{
-	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
-	StringInfoData v;
-	uint64		c;
-	bool		found;
-
-	initStringInfo(&v);
-	found = copies_side_get(PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
-		get_uint64(&v, &c) && c > 0 && c <= PG_INT64_MAX;
-	pfree(v.data);
-	if (found)
-		*n = (int64) c;
-	return found;
-}
-
-static void
-commits_put(const ProllyHash *commit, int64 n)
-{
-	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
-	StringInfoData v;
-	ProllyValue val;
-
-	initStringInfo(&v);
-	put_uint64(&v, (uint64) n);
-	val.data = (const uint8 *) v.data;
-	val.len = v.len;
-	copies_side_put(PROLLY_REFS_SPACE_COMMITS, &k, &val);
-	pfree(v.data);
-}
-
-/*
- * A head moved to commit (the refs held): the commits it reaches kept, if
- * not kept already.  From its parents': for one whose first parent's are
- * missing too (history made before they were kept, or received), down
- * its first parents to one kept (or a root), each found on the way kept,
- * once; a merge's other parents by prolly_history_commits()'s walk.  A
- * commit that can't be read leaves those above it without.
- */
-static void
-commits_note(const ProllyHash *commit)
-{
-	MemoryContext cxt;
-	MemoryContext old;
-	List	   *chain = NIL;
-	ProllyHash	cur = *commit;
-	int64		below = 0;
-	int64		n;
-
-	if (commits_get(commit, &n))
-		return;
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit counts",
-								ALLOCSET_DEFAULT_SIZES);
-	old = MemoryContextSwitchTo(cxt);
-	for (;;)
-	{
-		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
-
-		CHECK_FOR_INTERRUPTS();
-		if (!copies_commit_get(&cur, info))
-		{
-			chain = NIL;		/* (nothing above it can be counted) */
-			break;
-		}
-		chain = lcons(info, chain);
-		if (info->nparents == 0)
-			break;
-		if (commits_get(&info->parents[0], &below))
-			break;
-		cur = info->parents[0];
-	}
-	foreach_ptr(ProllyCommitInfo, info, chain)
-	{
-		if (!prolly_history_commits(info->parents, info->nparents, below,
-									copies_lookup_commit, NULL, &n))
-			break;
-		commits_put(&info->id, n);
-		below = n;
-	}
-	MemoryContextSwitchTo(old);
-	MemoryContextDelete(cxt);
-}
-
 typedef bool (*SideVisit) (const ProllyKey *key, const ProllyValue *value,
 						   void *arg);
 
@@ -14725,6 +15067,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.retain_roots = copies_retain_roots,
 	.kept_commit = copies_kept_commit,
 	.forget_kept = copies_forget_kept,
+	.commit_count = copies_commit_count,
 	.unfrozen_branches = copies_unfrozen_branches,
 	.freeze_kept = copies_freeze_kept,
 	.kept_holders = copies_kept_holders,
