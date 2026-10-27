@@ -18,9 +18,13 @@
  *						   (len 0: none), ids with their bytes
  *						   complemented.  Its commit object is kept: its
  *						   data is what is severed
- *	'r' root			-> a severed commit's root or dependencies' tree:
- *						   the commit (complemented), for the error a read
- *						   of it gives
+ *	'p' commit			-> as 'c', for a severed commit whose data may be
+ *						   here still: the commits a full collection must
+ *						   not follow to their trees.  A sever lets go of
+ *						   those whose trees are gone
+ *	'r' tree commit		-> (empty) a severed commit's root or dependencies'
+ *						   tree, and the commit, for the error a read of it
+ *						   gives: several commits may share a tree
  *	'D' boundary piece	-> what a boundary commit makes over its first
  *						   parent, severed (see fragment_closure()): a
  *						   piece (8 bytes big-endian) of it, each hash an
@@ -92,6 +96,7 @@
 #include "access/xact.h"
 #include "catalog/pg_database.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
@@ -111,6 +116,7 @@
 #define KEY_FRAGMENT	'f'
 #define KEY_NEXT		'n'
 #define KEY_SEVERED		'c'
+#define KEY_PENDING		'p'
 #define KEY_ROOT		'r'
 
 #define FRAGMENT_VERSION	3
@@ -385,12 +391,13 @@ typedef struct Severed
 } Severed;
 
 static bool
-severed_decode(const ProllyKey *key, const ProllyValue *value, Severed *sv)
+severed_decode(char tag, const ProllyKey *key, const ProllyValue *value,
+			   Severed *sv)
 {
 	const char *p = (const char *) key->data;
 	const char *end = p + key->len;
 
-	if (p >= end || *p != KEY_SEVERED)
+	if (p >= end || *p != tag)
 		return false;
 	(void) get_id(p + 1, end, &sv->id);
 	p = (const char *) value->data;
@@ -411,18 +418,24 @@ collect_severed(const ProllyKey *key, const ProllyValue *value, void *arg)
 	SeveredVisit visit = ((void **) arg)[0];
 	Severed		sv;
 
-	if (!severed_decode(key, value, &sv))
+	pgstat_count_prolly(PGSTAT_PROLLY_HORIZON_ENTRIES_READ, 1);
+	if (!severed_decode(KEY_PENDING, key, value, &sv))
 		return false;
 	visit(&sv, ((void **) arg)[1]);
 	return true;
 }
 
-/* Visit the severed commits, as the refs at root have them (NULL: now). */
+/*
+ * Visit the severed commits whose data may be here still (pending: not
+ * yet found freed by a sever), as the refs at root have them (NULL:
+ * now).  So a collection reads the commits whose trees it might yet
+ * follow, not every commit ever severed.
+ */
 static void
-visit_severed(const ProllyHash *root, ProllyChunkRead read, void *read_arg,
+visit_pending(const ProllyHash *root, ProllyChunkRead read, void *read_arg,
 			  SeveredVisit visit, void *arg)
 {
-	char		c = KEY_SEVERED;
+	char		c = KEY_PENDING;
 	ProllyKey	from = {(const uint8 *) &c, 1};
 	void	   *args[2] = {(void *) visit, arg};
 
@@ -469,17 +482,17 @@ severed_put(const ProllyHash *id, const ProllyCommitInfo *info, int64 number)
 	put_value_id(&v, &info->root.hash);
 	put_value_id(&v, info->has_dependencies ? &info->dependencies.hash : &none);
 	put_entry(&k, &v);
-	resetStringInfo(&k);
-	resetStringInfo(&v);
-	appendStringInfoChar(&k, KEY_ROOT);
-	put_id(&k, &info->root.hash);
-	put_value_id(&v, id);
+	/* (and pending: its data here until a sever finds it freed) */
+	k.data[0] = KEY_PENDING;
 	put_entry(&k, &v);
-	if (info->has_dependencies)
+	resetStringInfo(&v);
+	/* (a tree to each commit severed with it: several may share one) */
+	for (int t = 0; t < (info->has_dependencies ? 2 : 1); t++)
 	{
 		resetStringInfo(&k);
 		appendStringInfoChar(&k, KEY_ROOT);
-		put_id(&k, &info->dependencies.hash);
+		put_id(&k, t == 0 ? &info->root.hash : &info->dependencies.hash);
+		put_id(&k, id);
 		put_entry(&k, &v);
 	}
 	pfree(k.data);
@@ -496,47 +509,75 @@ severed_drop(const ProllyHash *id, const ProllyCommitInfo *info)
 	appendStringInfoChar(&k, KEY_SEVERED);
 	put_id(&k, id);
 	drop_entry(&k);
-	resetStringInfo(&k);
-	appendStringInfoChar(&k, KEY_ROOT);
-	put_id(&k, &info->root.hash);
+	k.data[0] = KEY_PENDING;
 	drop_entry(&k);
-	if (info->has_dependencies)
+	for (int t = 0; t < (info->has_dependencies ? 2 : 1); t++)
 	{
 		resetStringInfo(&k);
 		appendStringInfoChar(&k, KEY_ROOT);
-		put_id(&k, &info->dependencies.hash);
+		put_id(&k, t == 0 ? &info->root.hash : &info->dependencies.hash);
+		put_id(&k, id);
 		drop_entry(&k);
 	}
 	pfree(k.data);
 }
 
-static void
-note_severed(const Severed *sv, void *arg)
+/* Whether a commit's data is severed, as a point lookup kept for the transaction. */
+typedef struct SeveredMemo
 {
-	(void) set_add((HTAB *) arg, &sv->id);
-}
+	ProllyHash	id;				/* key */
+	bool		severed;
+} SeveredMemo;
 
-/* The commits whose data is severed (ProllyHash), read once a transaction. */
-static HTAB *
-archived_parents(void)
+/*
+ * Whether commit id's data is severed (its 'c' entry): looked up once a
+ * transaction, each commit asked of, so a reader pays for the commits it
+ * reads, not for every one ever severed.
+ */
+static bool
+is_severed(const ProllyHash *id)
 {
-	if (archived_set != NULL && archived_lxid == MyProc->vxid.lxid)
-		return archived_set;
-	if (archived_cxt == NULL)
-		archived_cxt = AllocSetContextCreate(TopMemoryContext,
-											 "prolly history horizon",
-											 ALLOCSET_SMALL_SIZES);
-	MemoryContextReset(archived_cxt);
+	ProllyHash	k = hash_key(id);
+	SeveredMemo *m;
+	bool		found;
+
+	if (id->len == 0)
+		return false;
+	if (archived_set == NULL || archived_lxid != MyProc->vxid.lxid)
 	{
-		MemoryContext old = MemoryContextSwitchTo(archived_cxt);
+		if (archived_cxt == NULL)
+			archived_cxt = AllocSetContextCreate(TopMemoryContext,
+												 "prolly history horizon",
+												 ALLOCSET_SMALL_SIZES);
+		MemoryContextReset(archived_cxt);
+		{
+			MemoryContext old = MemoryContextSwitchTo(archived_cxt);
 
-		archived_set = id_set("prolly horizon commits", sizeof(ProllyHash));
-		archived_lxid = InvalidLocalTransactionId;
-		visit_severed(NULL, NULL, NULL, note_severed, archived_set);
-		MemoryContextSwitchTo(old);
+			archived_set = id_set("prolly horizon commits", sizeof(SeveredMemo));
+			MemoryContextSwitchTo(old);
+		}
+		archived_lxid = MyProc->vxid.lxid;
 	}
-	archived_lxid = MyProc->vxid.lxid;
-	return archived_set;
+	m = hash_search(archived_set, &k, HASH_ENTER, &found);
+	if (!found)
+	{
+		StringInfoData key;
+		StringInfoData v;
+		ProllyKey	pk;
+
+		m->severed = false;
+		initStringInfo(&key);
+		initStringInfo(&v);
+		appendStringInfoChar(&key, KEY_SEVERED);
+		put_id(&key, id);
+		pk.data = (const uint8 *) key.data;
+		pk.len = key.len;
+		pgstat_count_prolly(PGSTAT_PROLLY_HORIZON_ENTRIES_READ, 1);
+		m->severed = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &pk, &v);
+		pfree(key.data);
+		pfree(v.data);
+	}
+	return m->severed;
 }
 
 /*
@@ -567,7 +608,7 @@ archive_archived(const ProllyHash *id)
 	window_init();
 	if (!PROLLY_HAS(dc.refs, side_scan))
 		return false;
-	return set_has(archived_parents(), id);
+	return is_severed(id);
 }
 
 /*
@@ -647,7 +688,7 @@ archive_edges(const ProllyHash *refs_root, ProllyChunkRead read,
 	{
 		void	   *args[2] = {(void *) visit, arg};
 
-		visit_severed(refs_root, read, read_arg, edge_of_severed, args);
+		visit_pending(refs_root, read, read_arg, edge_of_severed, args);
 	}
 }
 
@@ -1089,7 +1130,6 @@ typedef struct Plan
 	List	   *edges;			/* ProllyHash *, pairs: boundary, parent */
 	List	   *severed;		/* PlanCommit *, the fragment */
 	List	   *stops;			/* ProllyHash *, outside it, its commits name */
-	HTAB	   *archived;		/* the horizon's parents now */
 	HTAB	   *heights;		/* of commits recording none */
 	List	   *orphans;		/* ProllyHash *, pairs: a kept commit and a
 								 * parent past the horizon no edge names it
@@ -1390,6 +1430,69 @@ ref_commits(void)
 		(void) set_add(set, &rs.onto);
 	}
 	return set;
+}
+
+typedef struct Gone
+{
+	List	   *gone;			/* ProllyHash *, records to let go of */
+	HTAB	   *live_deps;		/* the branch heads' dependencies' trees */
+} Gone;
+
+static void
+note_head_deps(const char *name, const ProllyHash *head, void *arg)
+{
+	ProllyCommitInfo info;
+
+	if (head->len > 0 && PROLLY_CALL(dc.refs, commit_get, head, &info) &&
+		info.has_dependencies)
+		(void) set_add((HTAB *) arg, &info.dependencies.hash);
+}
+
+static void
+note_gone(const Severed *sv, void *arg)
+{
+	Gone	   *g = arg;
+
+	if (PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, &sv->root) ||
+		(sv->dependencies.len > 0 &&
+		 !set_has(g->live_deps, &sv->dependencies) &&
+		 PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks,
+					 &sv->dependencies)))
+		return;
+	g->gone = lappend(g->gone, memcpy(palloc(sizeof(ProllyHash)), &sv->id,
+									  sizeof(ProllyHash)));
+}
+
+/*
+ * Let go of the pending records of severed commits whose trees a
+ * collection has freed: no collection need cut them any more (a tree
+ * written again is live by what wrote it).  So what a collection reads of
+ * the horizon is what it may yet free.  A dependencies' tree a branch head
+ * shares is live, so it holds no record back; one it stops sharing later
+ * stays, named by the severed commits let go of (a small tree, one for
+ * each set of dependencies, until a repair or the commits' own severing
+ * past the graph).  The caller holds the refs.
+ */
+static void
+prune_pending(void)
+{
+	Gone		g = {NIL, id_set("prolly live dependencies", sizeof(ProllyHash))};
+	List	   *gone;
+	StringInfoData k;
+
+	PROLLY_CALL(dc.refs, branches, note_head_deps, g.live_deps);
+	visit_pending(NULL, NULL, NULL, note_gone, &g);
+	gone = g.gone;
+	hash_destroy(g.live_deps);
+	initStringInfo(&k);
+	foreach_ptr(ProllyHash, id, gone)
+	{
+		resetStringInfo(&k);
+		appendStringInfoChar(&k, KEY_PENDING);
+		put_id(&k, id);
+		drop_entry(&k);
+	}
+	pfree(k.data);
 }
 
 static void
@@ -1711,7 +1814,7 @@ young(Plan *plan, PlanCommit *pc, TimestampTz cut)
 		{
 			PlanCommit *p;
 
-			if (set_has(plan->archived, &top->e.parents[i]))
+			if (is_severed(&top->e.parents[i]))
 				continue;
 			p = plan_commit(plan, &top->e.parents[i]);
 			if (p->young_cut != cut)
@@ -1783,7 +1886,7 @@ walk_window(Plan *plan, Head *h)
 		{
 			ProllyHash *p = &pc->e.parents[i];
 
-			if (set_has(plan->archived, p))
+			if (is_severed(p))
 			{
 				if (!edge_known(&pc->id, p))
 					add_pair(&plan->orphans, &pc->id, p);
@@ -1881,7 +1984,6 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 	memset(plan, 0, sizeof(*plan));
 	plan->commits = id_set("prolly window plan", sizeof(PlanCommit));
 	plan->head_ids = id_set("prolly window heads", sizeof(ProllyHash));
-	plan->archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, plan);
 	note_refs(plan);
 	if (!head_windows(plan, before, size_cut, size_height))
@@ -1911,7 +2013,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 	{
 		PlanCommit *pc = plan_commit(plan, b);
 
-		if (set_has(plan->archived, b) || pc->kept)
+		if (is_severed(b) || pc->kept)
 			continue;
 		pc->by_base = true;
 		keep(plan, pc);
@@ -1921,7 +2023,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 	{
 		PlanCommit *pc = plan_commit(plan, r);
 
-		if (set_has(plan->archived, r) || pc->kept)
+		if (is_severed(r) || pc->kept)
 			continue;
 		pc->pinned = true;
 		keep(plan, pc);
@@ -1937,7 +2039,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 			ProllyHash *p = &pc->e.parents[i];
 			PlanCommit *parent;
 
-			if (set_has(plan->archived, p))
+			if (is_severed(p))
 				continue;
 			parent = plan_commit(plan, p);
 			if (!parent->kept)
@@ -1959,7 +2061,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 		{
 			ProllyHash *st = &r->stops[i];
 
-			if (set_has(plan->archived, st) || plan_commit(plan, st)->kept)
+			if (is_severed(st) || plan_commit(plan, st)->kept)
 				continue;
 			todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)), st,
 										sizeof(ProllyHash)));
@@ -1992,7 +2094,7 @@ make_plan(Plan *plan, const TimestampTz *before, TimestampTz size_cut,
 
 				if (set_has(fragment, p))
 					continue;
-				if (set_has(plan->archived, p) || plan_commit(plan, p)->kept)
+				if (is_severed(p) || plan_commit(plan, p)->kept)
 				{
 					if (set_add(stops, p))
 						plan->stops = lappend(plan->stops, p);
@@ -2052,7 +2154,6 @@ window_commits(const char *branch)
 	plan.quiet = true;
 	plan.commits = id_set("prolly window plan", sizeof(PlanCommit));
 	plan.head_ids = id_set("prolly window heads", sizeof(ProllyHash));
-	plan.archived = archived_parents();
 	PROLLY_CALL(dc.refs, branches, note_branch, &plan);
 	note_refs(&plan);
 	/*
@@ -3294,6 +3395,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	 * now, kept for when it falls in a fragment itself)
 	 */
 	(void) record_orphans(&plan);
+	prune_pending();
 	/* (each commit severed: its data, not its commit object) */
 	foreach_ptr(PlanCommit, pc, plan.severed)
 	{
@@ -3456,7 +3558,7 @@ oldest_of(const char *name, const ProllyHash *head, void *arg)
 			continue;
 		*oldest = Min(*oldest, info.committed_at);
 		for (int i = 0; i < info.nparents; i++)
-			if (!set_has(archived_parents(), &info.parents[i]) &&
+			if (!is_severed(&info.parents[i]) &&
 				set_add(seen, &info.parents[i]))
 				todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)),
 											&info.parents[i], sizeof(ProllyHash)));
@@ -4216,9 +4318,29 @@ prolly_window_check_missing(const ProllyHash *id)
 
 /* Does the horizon hold any fragment? */
 static bool
+any_fragment(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	if (key->len == 9 && key->data[0] == KEY_FRAGMENT)
+		*(bool *) arg = true;
+	return false;				/* (the first is enough) */
+}
+
+static bool
 horizon_any(void)
 {
-	return hash_get_num_entries(archived_parents()) > 0;
+	StringInfoData k;
+	ProllyKey	from;
+	bool		any = false;
+
+	initStringInfo(&k);
+	number_key(&k, KEY_FRAGMENT, PG_INT64_MAX);
+	from.data = (const uint8 *) k.data;
+	from.len = k.len;
+	pgstat_count_prolly(PGSTAT_PROLLY_HORIZON_ENTRIES_READ, 1);
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+				BackwardScanDirection, any_fragment, &any);
+	pfree(k.data);
+	return any;
 }
 
 void
@@ -4241,15 +4363,33 @@ prolly_window_check_absent(const ProllyHash *id)
 				 errhint("Run dolt_history_repair() to reattach it.")));
 }
 
+typedef struct RootOf
+{
+	StringInfoData prefix;		/* 'r' and the tree */
+	bool		found;
+	ProllyHash	commit;
+} RootOf;
+
+static bool
+root_of(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	RootOf	   *ro = arg;
+
+	if (key->len <= (Size) ro->prefix.len ||
+		memcmp(key->data, ro->prefix.data, ro->prefix.len) != 0)
+		return false;
+	(void) get_id((const char *) key->data + ro->prefix.len,
+				  (const char *) key->data + key->len, &ro->commit);
+	ro->found = true;
+	return false;				/* (one commit severed with it is enough) */
+}
+
 void
 prolly_window_check_root(const ProllyHash *tree_id)
 {
 	ProllyDatabaseComponents c;
-	StringInfoData k;
-	StringInfoData v;
 	ProllyKey	key;
-	bool		found;
-	ProllyHash	commit;
+	RootOf		ro;
 
 	if (!IsTransactionState() || tree_id->len == 0)
 		return;
@@ -4257,24 +4397,22 @@ prolly_window_check_root(const ProllyHash *tree_id)
 	if (c.history_window != &prolly_window_archive)
 		return;
 	window_init();
-	if (!PROLLY_HAS(dc.refs, side_get))
+	if (!PROLLY_HAS(dc.refs, side_scan))
 		return;
-	initStringInfo(&k);
-	initStringInfo(&v);
-	appendStringInfoChar(&k, KEY_ROOT);
-	put_id(&k, tree_id);
-	key.data = (const uint8 *) k.data;
-	key.len = k.len;
-	found = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v);
-	if (found)
-		(void) get_value_id(v.data, v.data + v.len, &commit);
-	pfree(k.data);
-	pfree(v.data);
-	if (found)
+	initStringInfo(&ro.prefix);
+	ro.found = false;
+	appendStringInfoChar(&ro.prefix, KEY_ROOT);
+	put_id(&ro.prefix, tree_id);
+	key.data = (const uint8 *) ro.prefix.data;
+	key.len = ro.prefix.len;
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &key, ForwardScanDirection,
+				root_of, &ro);
+	pfree(ro.prefix.data);
+	if (ro.found)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("commit %s is past the history horizon",
-						prolly_hash_hex(&commit)),
+						prolly_hash_hex(&ro.commit)),
 				 errdetail("Its data was severed from this database: archived, or deleted.  Its history is kept."),
 				 errhint("Run dolt_history_repair() to reattach it.")));
 }

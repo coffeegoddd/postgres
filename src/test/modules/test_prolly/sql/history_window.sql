@@ -367,6 +367,52 @@ SELECT v FROM old.t;
 \c regress_history_window
 DROP DATABASE regress_history_window_o;
 
+-- What a reader and a collection read of the horizon doesn't grow with
+-- the commits ever severed: a commit's severing is a point lookup, and a
+-- full collection reads only the severed commits whose data may be here
+-- still (those a later sever hasn't found freed).
+CREATE DATABASE regress_history_window_n;
+\c regress_history_window_n
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'start');
+SELECT length(dolt_commit('-Am', 'start', '--date', '2020-01-01')::text) > 0 AS committed;
+DO $$
+BEGIN
+	FOR i IN 1 .. 120 LOOP
+		UPDATE hw.t SET v = 'c' || i;
+		PERFORM dolt_commit('-am', 'c' || i, '--date',
+							(timestamptz '2020-01-01' + make_interval(hours => i))::text);
+	END LOOP;
+END $$;
+UPDATE hw.t SET v = 'later';
+SELECT length(dolt_commit('-am', 'later', '--date', '2020-02-01')::text) > 0 AS committed;
+UPDATE hw.t SET v = 'now';
+SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
+ALTER DATABASE regress_history_window_n SET prolly.history_window_action = delete;
+\c regress_history_window_n
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+SELECT fragment, commits FROM dolt_history_drop('2020-01-20');
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+-- (a second sever, of one commit, finds the first's data freed)
+SELECT fragment, commits FROM dolt_history_drop('2020-02-02');
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('horizon_entries_read') >= 0 AS counting;
+SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('horizon_entries_read') < 10 AS collection_reads_few;
+SELECT kind, count(*) FROM prolly_history_plan(NULL) GROUP BY 1 ORDER BY 1;
+SELECT count(*) FROM dolt_at('HEAD', NULL::hw.t);
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('horizon_entries_read') < 10 AS plan_and_read_few;
+\c regress_history_window
+DROP DATABASE regress_history_window_n;
+
 -- Delete mode with many tags: each keeps only its own commit's data, so
 -- what is outside the window and untagged is severed.
 CREATE DATABASE regress_history_window_t;
