@@ -827,6 +827,39 @@ class BenchTests(unittest.TestCase):
         with self.assertRaisesRegex(window.PathError, 'without a root'):
             window.check_path('merge_ff', 3, merge_in, {'moves_root_missing': 1}, 0)
 
+    def test_go_engines_issue_the_sql_their_servers_accept(self):
+        # (each statement as run once against Dolt 2.4.0 and Doltgres 1.0.0:
+        # AS OF a quoted commit hash on a table reference, as both grammars
+        # take it; dolt_merge's -m and --author, as Dolt's merge arguments,
+        # which Doltgres shares, take them; the rest as before)
+        from engines import ENGINES
+        author = "'VC Bench <vc-bench@example.invalid>'"
+        for name, call, schema in (('dolt', 'CALL', 'database()'), ('doltgres', 'SELECT', 'current_schema()')):
+            e = ENGINES[name]
+            self.assertEqual(e.vc_sql('commit', ('-Am', 'c', '--allow-empty', '--author', e.AUTHOR)),
+                             f"{call} dolt_commit('-Am','c','--allow-empty','--author',{author})")
+            self.assertEqual(e.vc_sql('branch', ('side', 'h0')), f"{call} dolt_branch('side','h0')")
+            self.assertEqual(e.vc_sql('branch', ('-D', 'side')), f"{call} dolt_branch('-D','side')")
+            self.assertEqual(e.vc_sql('checkout', ('side',)), f"{call} dolt_checkout('side')")
+            self.assertEqual(e.vc_sql('reset', ('--hard', 'h0')), f"{call} dolt_reset('--hard','h0')")
+            self.assertEqual(e.vc_sql('reset', ('--soft', 'h0')), f"{call} dolt_reset('--soft','h0')")
+            self.assertEqual(e.merge_sql('main', 'vc_bench merge'),
+                             f"{call} dolt_merge('main','-m','vc_bench merge','--author',{author})")
+            self.assertEqual(e.hash_sql('HEAD'), "SELECT hashof('HEAD')")
+            self.assertEqual(e.diff_sql('h0', 'HEAD'), "SELECT count(*) FROM dolt_diff('h0','HEAD','bench_rows')")
+            self.assertEqual(e.table_count_sql(),
+                             "SELECT count(*) FROM information_schema.tables "
+                             f"WHERE table_schema={schema} AND table_name='bench_rows'")
+            # (no session setup before a merge: the author is an argument)
+            self.assertIsNone(e.before_merge(None))
+        self.assertEqual(ENGINES['dolt'].at_sql('h0', [1, 2]),
+                         "SELECT id,revision FROM bench_rows AS OF 'h0' WHERE id IN (1,2) ORDER BY id")
+        self.assertEqual(ENGINES['doltgres'].at_sql('h0', [1, 2]),
+                         "SELECT id,revision FROM bench_rows AS OF 'h0' "
+                         "WHERE id IN (SELECT id FROM (VALUES (1),(2)) v(id)) ORDER BY id")
+        # (the hash quoted as a literal: one with a quote can't escape it)
+        self.assertIn("AS OF 'it''s'", ENGINES['dolt'].at_sql("it's", [1]))
+
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
