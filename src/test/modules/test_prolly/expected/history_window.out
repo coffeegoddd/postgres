@@ -234,7 +234,10 @@ NOTICE:  history stops at the history horizon
 -- A window by count: at least three commits, however old, for main; the
 -- cut in whole days (cold_batch).  With long gone, its merge base pins
 -- nothing.  A second fragment, archived beside the first: what the
--- archive has already isn't sent again.
+-- archive has already isn't sent again.  (What is sent is what the archive
+-- lacks of all the fragment reaches; what the fragment made, its chunks,
+-- may be more, a chunk made again that the archive has, or fewer: so this
+-- history's two being equal is this history's, no rule.)
 SELECT dolt_branch('-D', 'long');
  dolt_branch 
 -------------
@@ -252,10 +255,10 @@ SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
 
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent = chunks AS sent_what_was_born
+	   sent = chunks AS sent_what_was_born_here
 FROM dolt_history_sever();
- action  | fragment | commits | boundary | sent_what_was_born 
----------+----------+---------+----------+--------------------
+ action  | fragment | commits | boundary | sent_what_was_born_here 
+---------+----------+---------+----------+-------------------------
  archive |        2 |       1 | {a6}     | t
 (1 row)
 

@@ -111,7 +111,10 @@ SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_orde
 -- A window by count: at least three commits, however old, for main; the
 -- cut in whole days (cold_batch).  With long gone, its merge base pins
 -- nothing.  A second fragment, archived beside the first: what the
--- archive has already isn't sent again.
+-- archive has already isn't sent again.  (What is sent is what the archive
+-- lacks of all the fragment reaches; what the fragment made, its chunks,
+-- may be more, a chunk made again that the archive has, or fewer: so this
+-- history's two being equal is this history's, no rule.)
 SELECT dolt_branch('-D', 'long');
 ALTER DATABASE regress_history_window SET prolly.history_warm = '1 hour';
 ALTER DATABASE regress_history_window SET prolly.history_min_commits = 3;
@@ -119,7 +122,7 @@ ALTER DATABASE regress_history_window SET prolly.history_cold_batch = '1 day';
 SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent = chunks AS sent_what_was_born
+	   sent = chunks AS sent_what_was_born_here
 FROM dolt_history_sever();
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
 SELECT hw_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;

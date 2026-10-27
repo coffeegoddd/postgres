@@ -15,8 +15,10 @@
  *	'n'					-> the next fragment's number
  *	'D' boundary piece	-> what a boundary commit makes over its first
  *						   parent, severed (see fragment_closure()): a
- *						   piece (4 bytes big-endian) of it, each hash an
- *						   id with its bytes complemented
+ *						   piece (8 bytes big-endian) of it, each hash an
+ *						   id with its bytes complemented; one boundary's
+ *						   per sever, let go of when the parent is
+ *						   repaired
  *
  * None names a chunk: a collection asks edges() which parents not to
  * follow from which commits, and keeps nothing for a fragment.
@@ -1338,24 +1340,34 @@ hash_cmp(const ListCell *a, const ListCell *b)
 #define KEY_DELTA		'D'
 #define DELTA_PIECE		128		/* hashes a delta entry holds */
 
-/* A visit of what a commit makes: noted once each, never descended past. */
-static bool
+/* A node a commit makes, noted (once, however often it is visited). */
+static void
 note_node(Closure *c, const ProllyHash *h)
 {
 	if (!set_add(c->seen, h))
-		return false;
+		return;
 	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)), h,
 										  sizeof(ProllyHash)));
 	resetStringInfo(&c->buf);
 	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, h, &c->buf))
 		c->bytes += c->buf.len;
-	return true;
 }
 
+/*
+ * Every visit descends, a node noted already too: a diff visits a node
+ * and goes down only into the children that differ from the parent's, so
+ * a node noted there may have children noted nowhere yet, which a later
+ * commit's whole walk of it (a table made, whose root a revert brings
+ * back) must reach.  Declining it would make what a commit adds depend on
+ * the commits noted before it; descending, each adds exactly what it
+ * makes, whatever the order, so the set found walking the commits is the
+ * one found from a boundary's kept delta.
+ */
 static bool
 closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 {
-	return note_node(arg, &node->hash);
+	note_node(arg, &node->hash);
+	return true;
 }
 
 /*
@@ -1438,6 +1450,32 @@ keep_delta(const ProllyHash *b, const ProllyCommitInfo *binfo,
 	hash_destroy(c.seen);
 }
 
+/* Let go of boundary commit b's kept delta. */
+static void
+drop_delta(const ProllyHash *b)
+{
+	for (uint32 piece = 0;; piece++)
+	{
+		StringInfoData k;
+		StringInfoData v;
+		ProllyKey	key;
+		bool		found;
+
+		initStringInfo(&k);
+		initStringInfo(&v);
+		delta_key(&k, b, piece);
+		key.data = (const uint8 *) k.data;
+		key.len = k.len;
+		found = PROLLY_CALL(dc.refs, side_get, SPACE_HORIZON, &key, &v);
+		if (found)
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		pfree(k.data);
+		pfree(v.data);
+		if (!found)
+			break;
+	}
+}
+
 /* A boundary commit's kept delta, noted into c; false if none is kept. */
 static bool
 kept_delta(Closure *c, const ProllyHash *id)
@@ -1467,7 +1505,7 @@ kept_delta(Closure *c, const ProllyHash *id)
 			ProllyHash	h;
 
 			p = get_value_id(p, end, &h);
-			(void) note_node(c, &h);
+			note_node(c, &h);
 		}
 		pfree(k.data);
 		pfree(v.data);
@@ -1895,7 +1933,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 						f.deleted ? "deleted" : "archived",
 						(long long) f.commits, timestamptz_to_str(f.oldest),
 						timestamptz_to_str(f.newest), (long long) f.number),
-				 errdetail("The boundary is %s.  The fragment's commits reach %lld chunks (%lld bytes), those no kept commit reaches freed by the next collection.",
+				 errdetail("The boundary is %s.  The fragment's commits made %lld chunks (%lld bytes), those no kept commit reaches freed by the next collection.",
 						   boundary.data, (long long) f.chunks,
 						   (long long) f.bytes)));
 		pfree(boundary.data);
@@ -2309,14 +2347,28 @@ archive_repair(const char *source, int nfragments)
 							   prolly_hash_hex(&r->f.root),
 							   prolly_hash_hex(&r->f.digest))));
 
-		/* (its edges and record let go of: the boundary keeps its parents) */
+		/*
+		 * (its edges and record let go of: the boundary keeps its parents;
+		 * and a boundary's delta over a first parent back here, which a
+		 * walk finds again)
+		 */
 		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
 					ForwardScanDirection, collect_edge_of, &eo);
 		foreach_ptr(StringInfoData, ek, eo.keys)
 		{
 			ProllyKey	key = {(const uint8 *) ek->data, ek->len};
+			ProllyHash	parent;
+			ProllyHash	boundary;
+			ProllyCommitInfo binfo;
+			const char *p = ek->data + 1;
+			const char *end = ek->data + ek->len;
 
+			p = get_id(p, end, &parent);
+			(void) get_id(p, end, &boundary);
 			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+			if (PROLLY_CALL(dc.refs, commit_get, &boundary, &binfo) &&
+				binfo.nparents > 0 && same_hash(&binfo.parents[0], &parent))
+				drop_delta(&boundary);
 		}
 		initStringInfo(&k);
 		number_key(&k, KEY_FRAGMENT, r->f.number);

@@ -1738,7 +1738,10 @@ nodes), found by the commits alone, so a chunk resurrected or
 deduplicated counts where a commit has it and its parent doesn't.  What
 a boundary commit makes over the parent a sever cuts is kept beside the
 horizon ('D'), since that parent is gone once collected and the boundary
-commit may fall in a later fragment.  So a sever's fragment, its digest,
+commit may fall in a later fragment.  So the refs' side space grows by one
+boundary's delta (what one commit changed) for each sever, delete mode
+too, since any later repair wants it; a repair that brings the parent back
+lets it go of.  So a sever's fragment, its digest,
 what it sends to the archive and what a repair checks cost what its
 commits changed, not the database, but the first fragment's, whose
 oldest commit makes its whole tree.  Freeing what a sever cut is still a
