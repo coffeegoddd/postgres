@@ -1127,13 +1127,15 @@ note_merge_bases(Plan *plan)
 												lookup_commit, NULL, &bases);
 
 			/*
-			 * (a ref's commit on the branch's history is its own merge
-			 * base: no path to keep for a merge of it)
+			 * (a ref's commit on the branch's history, but a tag's, is the
+			 * branch's lineage: no window, nor path, of its own; a tag's
+			 * keeps the path to it)
 			 */
 			if (b->name == NULL && nbases == 1 && same_id(&bases[0], &b->head))
 			{
 				b->on_lineage = true;
-				continue;
+				if (!b->standalone)
+					continue;
 			}
 			for (int k = 0; k < nbases; k++)
 			{
