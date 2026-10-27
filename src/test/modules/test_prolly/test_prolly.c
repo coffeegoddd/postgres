@@ -30,7 +30,11 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "access/prolly_remote.h"
 #include "access/xact.h"
+#include "utils/wait_event.h"
+#include "storage/latch.h"
+#include "miscadmin.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -401,11 +405,248 @@ static const ProllyHashRoutine test_broken_hash = {
 	.finish = fnv_finish,
 };
 
+/*
+ * A remote that lies, test only: "liar://path" is the file remote at path,
+ * but it says it has every chunk, and keeps none it is sent.  Its heads
+ * and what it already held are the file remote's.  For an archive's
+ * check that it gives back what it was sent.
+ */
+static const ProllyRemoteRoutine *
+liar_file(void)
+{
+	return prolly_remote_for_url("file:///");
+}
+
+static void
+liar_check_url(const char *url)
+{
+	if (strncmp(url, "liar://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a liar remote's URL", url)));
+}
+
+static ProllyRemote *
+liar_open(const char *url, bool create)
+{
+	liar_check_url(url);
+	return liar_file()->open(psprintf("file://%s", url + 7), create);
+}
+
+static void
+liar_close(ProllyRemote *r)
+{
+	liar_file()->close(r);
+}
+
+static void
+liar_format(ProllyRemote *r, StringInfo out)
+{
+	liar_file()->format(r, out);
+}
+
+static void
+liar_heads(ProllyRemote *r, ProllyRemoteHeadVisit visit, void *arg)
+{
+	liar_file()->heads(r, visit, arg);
+}
+
+static bool
+liar_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
+{
+	return liar_file()->get(r, hash, out);
+}
+
+static bool
+liar_has(ProllyRemote *r, const ProllyHash *hash)
+{
+	return true;
+}
+
+static void
+liar_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	for (int i = 0; i < n; i++)
+		has[i] = true;
+}
+
+static void
+liar_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	ProllyHash	h;
+	StringInfoData data;
+
+	initStringInfo(&data);
+	while (next(arg, &h, &data))
+		resetStringInfo(&data);
+	pfree(data.data);
+}
+
+static bool
+liar_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
+			   const ProllyHash *head, const char *format, bool force)
+{
+	return liar_file()->move_head(r, branch, expected, head, format, force);
+}
+
+static void
+liar_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
+			  ProllyRemoteChunkVisit visit, void *arg)
+{
+	liar_file()->get_many(r, hashes, n, visit, arg);
+}
+
+static const ProllyRemoteRoutine test_liar_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9003,
+		.name = "liar",
+		.description = "test only: a file remote that says it has every chunk and keeps none",
+	},
+	.check_url = liar_check_url,
+	.open = liar_open,
+	.close = liar_close,
+	.format = liar_format,
+	.heads = liar_heads,
+	.get = liar_get,
+	.has = liar_has,
+	.add_chunks = liar_add_chunks,
+	.move_head = liar_move_head,
+	.get_many = liar_get_many,
+	.has_many = liar_has_many,
+};
+
+/*
+ * A slow remote, test only: "slow://path" is the file remote at path, but
+ * each chunk it takes takes four tenths of a second.  For a sever's
+ * time limit, which is one without progress, not one in all.
+ */
+static ProllyRemote *
+slow_open(const char *url, bool create)
+{
+	if (strncmp(url, "slow://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a slow remote's URL", url)));
+	return liar_file()->open(psprintf("file://%s", url + 7), create);
+}
+
+static void
+slow_check_url(const char *url)
+{
+	if (strncmp(url, "slow://", 7) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a slow remote's URL", url)));
+}
+
+typedef struct SlowNext
+{
+	ProllyChunkNext next;
+	void	   *arg;
+} SlowNext;
+
+static bool
+slow_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	SlowNext   *sn = arg;
+
+	pg_usleep(400000);
+	CHECK_FOR_INTERRUPTS();
+	return sn->next(sn->arg, hash, data);
+}
+
+static void
+slow_add_chunks(ProllyRemote *r, ProllyChunkNext next, void *arg)
+{
+	SlowNext	sn = {next, arg};
+
+	liar_file()->add_chunks(r, slow_next, &sn);
+}
+
+static bool
+slow_has(ProllyRemote *r, const ProllyHash *hash)
+{
+	return liar_file()->has(r, hash);
+}
+
+static void
+slow_has_many(ProllyRemote *r, const ProllyHash *hashes, int n, bool *has)
+{
+	liar_file()->has_many(r, hashes, n, has);
+}
+
+static const ProllyRemoteRoutine test_slow_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9005,
+		.name = "slow",
+		.description = "test only: a file remote four tenths of a second a chunk",
+	},
+	.check_url = slow_check_url,
+	.open = slow_open,
+	.close = liar_close,
+	.format = liar_format,
+	.heads = liar_heads,
+	.get = liar_get,
+	.has = slow_has,
+	.add_chunks = slow_add_chunks,
+	.move_head = liar_move_head,
+	.get_many = liar_get_many,
+	.has_many = slow_has_many,
+};
+
+/*
+ * A remote that never answers, test only: "stall://..." opens by waiting,
+ * interruptibly, for ever.  For a sever's time limit on its archive.
+ */
+static void
+stall_check_url(const char *url)
+{
+	if (strncmp(url, "stall://", 8) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a stall remote's URL", url)));
+}
+
+static ProllyRemote *
+stall_open(const char *url, bool create)
+{
+	for (;;)
+	{
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 100, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	return NULL;
+}
+
+static void
+stall_close(ProllyRemote *r)
+{
+}
+
+static const ProllyRemoteRoutine test_stall_remote = {
+	.info = {
+		.iface = PROLLY_IFACE_REMOTE,
+		.impl_id = 9004,
+		.name = "stall",
+		.description = "test only: a remote that never answers",
+	},
+	.check_url = stall_check_url,
+	.open = stall_open,
+	.close = stall_close,
+};
+
 void
 _PG_init(void)
 {
 	prolly_register_impl(&test_fnv_hash.info);
 	prolly_register_impl(&test_broken_hash.info);
+	prolly_register_impl(&test_liar_remote.info);
+	prolly_register_impl(&test_stall_remote.info);
+	prolly_register_impl(&test_slow_remote.info);
 }
 
 /* ------------------------------------------------------------------------

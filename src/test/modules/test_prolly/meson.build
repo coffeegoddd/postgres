@@ -171,6 +171,7 @@ tests += {
       'history_horizon',
       'history_horizon_refs',
       'history_repair',
+      'history_window',
       'store_sizes',
       'storage_breakdown',
       'get_many',

@@ -17,14 +17,20 @@
  * digest, and the history reads as it did.
  *
  * Contract:
- * - plan() works out what a sever before date before would cut, without
- *   changing anything: the commits it would sever, the boundary edges,
+ * - policy() gives the window branch name's lineage keeps (NULL: the
+ *   database's), as the database's settings and the branch's own have it
+ *   (never a session's); set_policy() sets a branch's own setting (value
+ *   NULL: the database's again), the database owner's.
+ * - plan() works out what a sever would cut (before not NULL: every commit
+ *   dated before it, whatever the policy), without changing anything: the commits it would sever, the boundary edges,
  *   and the commits kept past the window (pinned).  A commit any ref
  *   names is kept; so is every commit on the way from a branch head to
  *   its merge base with each other branch head.  It holds every ref.
- * - sever() severs what plan() finds, as action says: delete (the
- *   horizon records the fragment, none of it kept elsewhere), or none
- *   (nothing).  It holds every ref and the horizon's lock, and is the
+ * - sever() severs what plan() finds, as action says: archive (the
+ *   fragment sent to the policy's archive, and found whole there, before
+ *   the horizon records it; with no archive, nothing is severed, with a
+ *   warning), delete (the horizon records the fragment, none of it kept
+ *   elsewhere), or none (nothing).  It holds every ref and the horizon's lock, and is the
  *   database owner's.  Its result says what was done.  A collection after
  *   the transaction commits frees what only the fragment reached.
  * - archived() says whether commit id is past the horizon: a top of a
@@ -67,6 +73,26 @@ typedef enum ProllyWindowAction
 	PROLLY_WINDOW_DELETE,		/* freed, not archived */
 	PROLLY_WINDOW_NONE,			/* kept */
 } ProllyWindowAction;
+
+/*
+ * A window: what a branch's lineage keeps here.  A commit is kept if it
+ * is dated within keep_time of now or among the keep_commits newest of
+ * its head (either, where both are set; neither: everything is kept).
+ * batch, if set, rounds the cut down to a whole multiple of it, so
+ * fragments are whole hours or days.  max_bytes is the most the history
+ * kept here may hold (0: no limit).  action is what is done with history
+ * past the window, and archive where it goes (a remote's name or URL;
+ * NULL: nowhere, so archive mode severs nothing).
+ */
+typedef struct ProllyWindowPolicy
+{
+	int64		keep_commits;	/* 0: not set */
+	int64		keep_time;		/* microseconds; 0: not set */
+	int64		max_bytes;		/* 0: not set */
+	int64		batch;			/* microseconds; 0: not set */
+	ProllyWindowAction action;
+	char	   *archive;
+} ProllyWindowPolicy;
 
 /* A commit a plan severs, or a boundary edge, or a pin. */
 typedef enum ProllyWindowItemKind
@@ -135,12 +161,16 @@ typedef struct ProllyWindowRoutine
 	void		(*fragments) (ProllyWindowFragmentVisit visit, void *arg);
 	void		(*hold) (void);
 	int			(*repair) (const char *source, int nfragments);
+	void		(*policy) (const char *name, ProllyWindowPolicy *policy);
+	void		(*set_policy) (const char *name, const char *setting,
+							   const char *value);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
-	"plan", "sever", "archived", "edges", "fragments", "hold", "repair"
+	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
+	"policy", "set_policy"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK repair
+#define PROLLY_WINDOW_LAST_CALLBACK set_policy
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)
@@ -155,6 +185,9 @@ prolly_window_lookup(const char *name)
  * found a commit missing from the store.
  */
 extern void prolly_window_check_missing(const ProllyHash *id);
+
+/* Defines the prolly.history_* settings, once a backend. */
+extern void prolly_window_init(void);
 
 /*
  * As prolly_window_check_missing(), and if the horizon holds any fragment,
