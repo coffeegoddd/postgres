@@ -598,7 +598,7 @@ sever_row(FunctionCallInfo fcinfo, const ProllyWindowResult *r)
  *					boundary text[], chunks bigint, sent bigint)
  *
  * Sever the history past the database's window, as its settings have it
- * (prolly.history_window_action, prolly.history_warm and the rest, as the
+ * (prolly.history_window_action, prolly.history_window and the rest, as the
  * database has them, never the session): archived to
  * prolly.history_archive and found whole there, deleted, or nothing.  The
  * database owner's.
@@ -618,8 +618,8 @@ dolt_history_sever(PG_FUNCTION_ARGS)
 /*
  * dolt_history_window(branch text, setting text, value text) returns void
  *
- * Set branch's lineage's own window setting (warm, min_commits or
- * cold_batch; value NULL: the database's again).  The database owner's.
+ * Set branch's lineage's own window setting (window, min_commits or
+ * batch; value NULL: the database's again).  The database owner's.
  */
 Datum
 dolt_history_window(PG_FUNCTION_ARGS)
@@ -637,9 +637,38 @@ dolt_history_window(PG_FUNCTION_ARGS)
 }
 
 /*
+ * prolly_history_in_window(branch text, commit_hash text) returns bool
+ *
+ * Whether the commit is in the history window now: in branch's lineage's
+ * (NULL: any branch's), kept for its age or count as a sever would keep
+ * it.  A commit kept only for a ref or a merge base isn't.
+ */
+Datum
+prolly_history_in_window(PG_FUNCTION_ARGS)
+{
+	const ProllyWindowRoutine *w = database_window();
+	char	   *hex;
+	ProllyHash	commit;
+
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a commit is needed")));
+	hex = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (!prolly_hash_from_hex(hex, strlen(hex), &commit))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a commit hash", hex)));
+	PG_RETURN_BOOL(PROLLY_CALL(w, in_window,
+							   PG_ARGISNULL(0) ? NULL :
+							   text_to_cstring(PG_GETARG_TEXT_PP(0)),
+							   &commit));
+}
+
+/*
  * prolly_history_policy(branch text)
- *	returns record (action text, warm interval, min_commits bigint,
- *					cold_batch interval, max_size bigint, archive text)
+ *	returns record (action text, time_window interval, min_commits bigint,
+ *					batch interval, max_size bigint, archive text)
  *
  * The window branch's lineage keeps (NULL: the database's), as the
  * database's settings and the branch's own have it.

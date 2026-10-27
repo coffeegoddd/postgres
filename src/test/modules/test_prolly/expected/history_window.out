@@ -70,9 +70,9 @@ SELECT dolt_checkout('main');
 
 -- No window: everything is kept, whatever the action.
 SELECT * FROM prolly_history_policy(NULL);
- action  | warm | min_commits | cold_batch | max_size | archive 
----------+------+-------------+------------+----------+---------
- archive |      |           0 |            |          | 
+ action  | time_window | min_commits | batch | max_size | archive 
+---------+-------------+-------------+-------+----------+---------
+ archive |             |           0 |       |          | 
 (1 row)
 
 SELECT count(*) AS planned FROM prolly_history_plan(NULL);
@@ -83,21 +83,21 @@ SELECT count(*) AS planned FROM prolly_history_plan(NULL);
 
 -- A window of three days, as the database has it; the long branch keeps
 -- ten of its own; the first sever severs only what both are past.
-ALTER DATABASE regress_history_window SET prolly.history_warm = '3 days';
-SELECT dolt_history_window('long', 'warm', '10 days');
+ALTER DATABASE regress_history_window SET prolly.history_window = '3 days';
+SELECT dolt_history_window('long', 'window', '10 days');
  dolt_history_window 
 ---------------------
  
 (1 row)
 
-SELECT action, warm, min_commits FROM prolly_history_policy(NULL);
- action  |    warm    | min_commits 
----------+------------+-------------
- archive | @ 72 hours |           0
+SELECT action, time_window, min_commits FROM prolly_history_policy(NULL);
+ action  | time_window | min_commits 
+---------+-------------+-------------
+ archive | @ 72 hours  |           0
 (1 row)
 
-SELECT action, warm FROM prolly_history_policy('long');
- action  |    warm     
+SELECT action, time_window FROM prolly_history_policy('long');
+ action  | time_window 
 ---------+-------------
  archive | @ 240 hours
 (1 row)
@@ -108,7 +108,7 @@ SELECT hw_err($$SELECT dolt_history_window('long', 'archive', 'x')$$) AS not_a_b
  a branch's history window has no setting "archive"
 (1 row)
 
-SELECT hw_err($$SELECT dolt_history_window(NULL, 'warm', '1 day')$$) AS null_branch,
+SELECT hw_err($$SELECT dolt_history_window(NULL, 'window', '1 day')$$) AS null_branch,
 	   hw_err($$SELECT dolt_history_window('long', NULL, '1 day')$$) AS null_setting;
             null_branch            |           null_setting            
 -----------------------------------+-----------------------------------
@@ -128,12 +128,12 @@ FROM prolly_history_plan(NULL) ORDER BY kind, commit, parent;
 -- A session's settings don't count: not the action, not the window, not
 -- the archive.  Archive mode with no archive severs nothing, and says so.
 SET prolly.history_window_action = delete;
-SET prolly.history_warm = '1 hour';
+SET prolly.history_window = '1 hour';
 SET prolly.history_archive = 'file:///nowhere';
-SELECT action, warm, archive FROM prolly_history_policy(NULL);
- action  |    warm    | archive 
----------+------------+---------
- archive | @ 72 hours | 
+SELECT action, time_window, archive FROM prolly_history_policy(NULL);
+ action  | time_window | archive 
+---------+-------------+---------
+ archive | @ 72 hours  | 
 (1 row)
 
 SELECT action, fragment, commits FROM dolt_history_sever();
@@ -150,7 +150,7 @@ SELECT count(*) AS fragments FROM prolly_history_horizon();
 (1 row)
 
 RESET prolly.history_window_action;
-RESET prolly.history_warm;
+RESET prolly.history_window;
 RESET prolly.history_archive;
 -- Nor does anyone but the database's owner sever, set a branch's window,
 -- or make the database's settings.
@@ -164,7 +164,7 @@ SELECT hw_err('SELECT * FROM dolt_history_sever()') AS other_sever;
  permission denied to sever history of database "regress_history_window"
 (1 row)
 
-SELECT hw_err($$SELECT dolt_history_window('main', 'warm', '1 hour')$$) AS other_window;
+SELECT hw_err($$SELECT dolt_history_window('main', 'window', '1 hour')$$) AS other_window;
                                     other_window                                     
 -------------------------------------------------------------------------------------
  permission denied to set the window of history of database "regress_history_window"
@@ -306,7 +306,7 @@ NOTICE:  history stops at the history horizon
 (6 rows)
 
 -- A window by count: at least three commits, however old, for main; the
--- cut in whole days (cold_batch).  With long gone, its merge base pins
+-- cut in whole days (prolly.history_batch).  With long gone, its merge base pins
 -- nothing.  A second fragment, archived elsewhere than the first: what
 -- the fragment reaches is sent there whole, made before it too, and the
 -- archive checked for all of it, since a repair of it from there receives
@@ -318,13 +318,13 @@ SELECT dolt_branch('-D', 'long');
  {0}
 (1 row)
 
-ALTER DATABASE regress_history_window SET prolly.history_warm = '1 hour';
+ALTER DATABASE regress_history_window SET prolly.history_window = '1 hour';
 ALTER DATABASE regress_history_window SET prolly.history_min_commits = 3;
-ALTER DATABASE regress_history_window SET prolly.history_cold_batch = '1 day';
-SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
- action  |   warm   | min_commits | cold_batch 
----------+----------+-------------+------------
- archive | @ 1 hour |           3 | @ 24 hours
+ALTER DATABASE regress_history_window SET prolly.history_batch = '1 day';
+SELECT action, time_window, min_commits, batch FROM prolly_history_policy('main');
+ action  | time_window | min_commits |   batch    
+---------+-------------+-------------+------------
+ archive | @ 1 hour    |           3 | @ 24 hours
 (1 row)
 
 SELECT :'url' || '_second' AS url_second \gset
@@ -420,7 +420,7 @@ SELECT length(dolt_commit('-am', 'b4', '--date', '2020-01-04')::text) > 0 AS com
  t
 (1 row)
 
-ALTER DATABASE regress_history_window_b SET prolly.history_warm = '1 hour';
+ALTER DATABASE regress_history_window_b SET prolly.history_window = '1 hour';
 ALTER DATABASE regress_history_window_b SET prolly.history_archive = :'url';
 SELECT action, fragment > 0 AS archived, commits FROM dolt_history_sever();
  action  | archived | commits 
@@ -511,7 +511,7 @@ SELECT count(*) AS planned_without FROM prolly_history_plan(NULL);
                0
 (1 row)
 
-SELECT dolt_history_window('main', 'warm', '1 hour');
+SELECT dolt_history_window('main', 'window', '1 hour');
  dolt_history_window 
 ---------------------
  
@@ -534,7 +534,7 @@ SELECT dolt_branch('own') IS NOT NULL AS made;
  t
 (1 row)
 
-SELECT dolt_history_window('own', 'warm', '5 days');
+SELECT dolt_history_window('own', 'window', '5 days');
  dolt_history_window 
 ---------------------
  
@@ -546,8 +546,8 @@ SELECT dolt_branch('-m', 'own', 'owned') IS NOT NULL AS renamed;
  t
 (1 row)
 
-SELECT warm FROM prolly_history_policy('owned');
-    warm     
+SELECT time_window FROM prolly_history_policy('owned');
+ time_window 
 -------------
  @ 120 hours
 (1 row)
@@ -564,9 +564,9 @@ SELECT dolt_branch('owned') IS NOT NULL AS made_again;
  t
 (1 row)
 
-SELECT warm FROM prolly_history_policy('owned');
-   warm   
-----------
+SELECT time_window FROM prolly_history_policy('owned');
+ time_window 
+-------------
  @ 1 hour
 (1 row)
 
@@ -578,8 +578,7 @@ SELECT dolt_branch('-D', 'owned') IS NOT NULL AS dropped;
 
 -- A branch's window narrower than the database's cuts the branch's own
 -- history: what else names its commits (its page roots, its log, a
--- tracking branch) keeps only those, not the database's window.  And the
--- warm window is never shorter than prolly.history_hot.
+-- tracking branch) keeps only those, not the database's window.
 CREATE DATABASE regress_history_window_d;
 \c regress_history_window_d
 CREATE SCHEMA hw VERSIONED;
@@ -612,8 +611,8 @@ SELECT length(dolt_commit('-am', 'a0', '--date', (now() - interval '2 hours')::t
  t
 (1 row)
 
-ALTER DATABASE regress_history_window_d SET prolly.history_warm = '9 days';
-SELECT dolt_history_window('main', 'warm', '3 days');
+ALTER DATABASE regress_history_window_d SET prolly.history_window = '9 days';
+SELECT dolt_history_window('main', 'window', '3 days');
  dolt_history_window 
 ---------------------
  
@@ -629,55 +628,35 @@ ORDER BY 1, 2;
  severed  | a8
 (3 rows)
 
-ALTER DATABASE regress_history_window_d SET prolly.history_hot = '9 days';
-\c regress_history_window_d
-SELECT p.kind, l.message
-FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-ORDER BY 1, 2;
-NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
-   kind   | message 
-----------+---------
- boundary | a8
- severed  | a10
-(2 rows)
+-- The window as a sever has it, for others to ask (the page roots' kept
+-- inside it): main's three days hold a1 and a0, not a8, which the
+-- database's nine days would.
+SELECT l.message, prolly_history_in_window('main', l.commit_hash) AS main,
+	prolly_history_in_window(NULL, l.commit_hash) AS any
+FROM dolt_log('main') l ORDER BY l.date;
+ message | main | any 
+---------+------+-----
+ a10     | f    | f
+ a8      | f    | f
+ a1      | t    | t
+ a0      | t    | t
+(4 rows)
 
-SELECT warm FROM prolly_history_policy('main');
-NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
-    warm     
--------------
- @ 216 hours
-(1 row)
-
--- (hot keeps what is younger in every mode: a window by count alone, and
--- a cut given)
-SELECT dolt_history_window('main', 'warm', NULL);
+-- (a count keeps its newest, whatever their age)
+SELECT dolt_history_window('main', 'min_commits', '3');
  dolt_history_window 
 ---------------------
  
 (1 row)
 
-ALTER DATABASE regress_history_window_d RESET prolly.history_warm;
-ALTER DATABASE regress_history_window_d SET prolly.history_min_commits = 1;
-\c regress_history_window_d
-SELECT p.kind, l.message
-FROM prolly_history_plan(NULL) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
-NOTICE:  the history window of branch "main" is taken as prolly.history_hot, which it can't be shorter than
-NOTICE:  the history window of database "regress_history_window_d" is taken as prolly.history_hot, which it can't be shorter than
-   kind   | message 
-----------+---------
- boundary | a8
- severed  | a10
-(2 rows)
-
-SELECT p.kind, l.message
-FROM prolly_history_plan(now()) p LEFT JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
-WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
-   kind   | message 
-----------+---------
- boundary | a8
- severed  | a10
-(2 rows)
+SELECT l.message FROM dolt_log('main') l
+WHERE prolly_history_in_window('main', l.commit_hash) ORDER BY l.date;
+ message 
+---------
+ a8
+ a1
+ a0
+(3 rows)
 
 \c regress_history_window
 DROP DATABASE regress_history_window_d;
@@ -686,6 +665,8 @@ DROP DATABASE regress_history_window_d;
 -- them; one dated in the future keeps itself and what is above it until
 -- its date; history merged in with old dates of its own ages by them.
 CREATE DATABASE regress_history_window_f;
+-- (its commits' hashes vary with now(): a warning naming one kept out)
+ALTER DATABASE regress_history_window_f SET client_min_messages = error;
 \c regress_history_window_f
 CREATE SCHEMA hw VERSIONED;
 CREATE TABLE hw.t (id int PRIMARY KEY, v text);
@@ -702,7 +683,7 @@ SELECT hw_c('a10', now() - interval '10 days') AND hw_c('a8', now() - interval '
  t
 (1 row)
 
-ALTER DATABASE regress_history_window_f SET prolly.history_warm = '3 days';
+ALTER DATABASE regress_history_window_f SET prolly.history_window = '3 days';
 \c regress_history_window_f
 SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
 	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
@@ -799,6 +780,71 @@ WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
 
 \c regress_history_window
 DROP DATABASE regress_history_window_f;
+-- A commit dated far ahead ages from when it arrived here, the head log's
+-- first move to it, with a warning: once the window is past that, it is
+-- severed like any other, the first plan to see it included.
+CREATE DATABASE regress_history_window_g;
+\c regress_history_window_g
+CREATE SCHEMA hw VERSIONED;
+CREATE TABLE hw.t (id int PRIMARY KEY, v text);
+INSERT INTO hw.t VALUES (1, 'start');
+SELECT length(dolt_commit('-Am', 'start', '--date', '2020-01-01')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'ahead';
+SELECT length(dolt_commit('-am', 'ahead', '--date', '2099-01-01')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE hw.t SET v = 'now';
+SELECT length(dolt_commit('-am', 'now')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER DATABASE regress_history_window_g SET prolly.history_window = '1 second';
+ALTER DATABASE regress_history_window_g SET prolly.history_window_action = delete;
+SELECT pg_sleep(1.5);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+\c regress_history_window_g
+\set VERBOSITY terse
+SELECT p.kind, l.message FROM prolly_history_plan(NULL) p
+	JOIN dolt_log('main') l ON l.commit_hash = p.commit_hash
+WHERE p.kind IN ('severed', 'boundary') ORDER BY 1, 2;
+WARNING:  commit c0aee0999182f5622cec33089908ea360469b4b9 is dated 2099-01-01 00:00:00-08, after it arrived here
+   kind   | message 
+----------+---------
+ boundary | now
+ severed  | ahead
+ severed  | start
+(3 rows)
+
+SELECT fragment, commits FROM dolt_history_sever();
+WARNING:  commit c0aee0999182f5622cec33089908ea360469b4b9 is dated 2099-01-01 00:00:00-08, after it arrived here
+ fragment | commits 
+----------+---------
+        1 |       2
+(1 row)
+
+-- (nothing more past the window)
+SELECT count(*) FROM prolly_history_plan(NULL) WHERE kind = 'severed';
+ count 
+-------
+     0
+(1 row)
+
+\c regress_history_window
+DROP DATABASE regress_history_window_g;
 \c :home
 DROP DATABASE regress_history_window;
 DROP ROLE regress_hw_other;
