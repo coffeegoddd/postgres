@@ -6526,15 +6526,68 @@ retain_roots(const char *name, KeptSummary *s, const ProllyHash *kept_now,
 	}
 }
 
+/* the commits a move's descent check reads, at most */
+#define FORWARD_CHECK_MAX	256
+
+/*
+ * Does head descend from was (a fast-forward, or a reset forward)?  Its
+ * ancestors above was's height are read, at most FORWARD_CHECK_MAX of
+ * them; past that, or with a height not recorded, it is taken not to.
+ */
+static bool
+descends_from(const ProllyHash *head, const ProllyHash *was)
+{
+	ProllyCommitInfo info;
+	int64		floor;
+	List	   *todo;
+	List	   *seen = NIL;
+	int			read = 0;
+	bool		found = false;
+
+	if (!copies_commit_get(was, &info) || !info.has_height)
+		return false;
+	floor = info.height;
+	todo = list_make1(memcpy(palloc(sizeof(ProllyHash)), head, sizeof(ProllyHash)));
+	while (todo != NIL && !found && read < FORWARD_CHECK_MAX)
+	{
+		ProllyHash *cur = linitial(todo);
+		bool		listed = false;
+
+		todo = list_delete_first(todo);
+		foreach_ptr(ProllyHash, h, seen)
+			listed |= same_hash(h, cur);
+		if (listed)
+			continue;
+		seen = lappend(seen, cur);
+		read++;
+		if (!copies_commit_get(cur, &info) || !info.has_height)
+			break;
+		if (info.height <= floor)
+			continue;
+		for (int i = 0; i < info.nparents && !found; i++)
+		{
+			if (same_hash(&info.parents[i], was))
+				found = true;
+			else
+				todo = lappend(todo, memcpy(palloc(sizeof(ProllyHash)),
+											&info.parents[i],
+											sizeof(ProllyHash)));
+		}
+	}
+	list_free_deep(todo);
+	list_free_deep(seen);
+	return found;
+}
+
 /*
  * Branch name's head moved from was (len 0: none) to head: unless forward
- * (was is a parent of head, as a commit or a merge moves it), was is noted
- * as left (heads_left).
+ * (head descends from was, as a commit, a merge or a fast-forward moves
+ * it), was is noted as left (heads_left).  A commit's maker gives its
+ * parents (made_parents), so a commit reads nothing here.
  */
 static void
 heads_left_note(const char *name, const ProllyHash *was, const ProllyHash *head)
 {
-	ProllyCommitInfo info;
 	MemoryContext old;
 	HeadLeft   *hl;
 
@@ -6546,10 +6599,8 @@ heads_left_note(const char *name, const ProllyHash *was, const ProllyHash *head)
 			if (same_hash(&made_parents[i], was))
 				return;
 	}
-	else if (copies_commit_get(head, &info))
-		for (int i = 0; i < info.nparents; i++)
-			if (same_hash(&info.parents[i], was))
-				return;
+	else if (descends_from(head, was))
+		return;
 	foreach_ptr(HeadLeft, l, heads_left)
 		if (strcmp(l->name, name) == 0 && same_hash(&l->commit, was))
 			return;

@@ -120,3 +120,36 @@ SELECT test_retain_roots('b');
 SELECT kept('b', :'x') AS b_still_keeps_x;
 \c :home
 DROP DATABASE kept_departures_other;
+
+-- A fast-forward over several commits is a move forward, not away: the
+-- old head isn't dated again, and leaves the window as its age says.
+CREATE DATABASE kept_departures_ff;
+ALTER DATABASE kept_departures_ff SET prolly.history_window = '3 seconds';
+\c kept_departures_ff
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION kept(c text) RETURNS bool LANGUAGE sql AS $$
+	SELECT EXISTS (SELECT FROM test_kept_commits('main') WHERE commit_id = c)
+$$;
+CREATE SCHEMA kf VERSIONED;
+CREATE TABLE kf.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO kf.t SELECT g, 0 FROM generate_series(1, 100) g;
+SELECT dolt_commit('-Am', 'a0') IS NOT NULL AS committed;
+UPDATE kf.t SET v = 1;
+SELECT dolt_commit('-am', 'a1') IS NOT NULL AS committed;
+SELECT dolt_hashof('main') AS a1 \gset
+SELECT dolt_branch('f');
+SELECT dolt_checkout('f');
+UPDATE kf.t SET v = 2;
+SELECT dolt_commit('-am', 'f1') IS NOT NULL AS committed;
+UPDATE kf.t SET v = 3;
+SELECT dolt_commit('-am', 'f2') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT pg_sleep(4);
+SELECT (dolt_merge('f'))[1] IS NOT NULL AS fast_forwarded;
+SELECT dolt_hashof('main') = dolt_hashof('f') AS at_f2;
+SELECT test_retain_roots('main');
+SELECT kept(:'a1') AS old_head_kept;
+\c :home
+DROP DATABASE kept_departures_ff;
