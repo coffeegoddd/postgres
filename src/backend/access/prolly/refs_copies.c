@@ -5640,9 +5640,15 @@ restore_pages(const ProllyCommitInfo *commit)
 		if (list_length(restored) > before)
 			branch_note_head_restore(MyBranch);
 	}
+	/*
+	 * (the head's roots frozen for it only if a table is left that they
+	 * could give back)
+	 */
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
-		(was = kept_usable(name, &kept, kept_find(kept, &head),
-						   MyBranch)) != NULL && was->baseline.len > 0 &&
+		(was = kept_find(kept, &head)) != NULL &&
+		!(was->unfrozen && list_length(restored) >= was->ntables) &&
+		(was = kept_usable(name, &kept, was, MyBranch)) != NULL &&
+		was->baseline.len > 0 &&
 		copies_commit_get(&head, &at_head))
 	{
 		int			before = list_length(restored);

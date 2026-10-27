@@ -242,6 +242,7 @@ tests += {
       'root_holds',
       'root_freezing',
       'root_changed_pages',
+      'lazy_root_freezing',
       'kept_pages',
       'kept_head_restore',
       'bounded_counts',

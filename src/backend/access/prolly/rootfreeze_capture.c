@@ -231,11 +231,15 @@ capture_freeze_later(void)
 	return false;
 }
 
-/* (roots are frozen as they are captured: none is waiting) */
+/*
+ * (its own roots are frozen as they are captured; one another freezer left
+ * unfrozen, captured among writers, is frozen on a move to it all the
+ * same: never given back as captured, and frozen it is O(1) to give back)
+ */
 static bool
 capture_freeze_now(void)
 {
-	return false;
+	return true;
 }
 
 const ProllyRootFreezerRoutine prolly_rootfreeze_capture = {
