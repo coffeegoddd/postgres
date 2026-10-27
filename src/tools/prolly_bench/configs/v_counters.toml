@@ -5,6 +5,9 @@
 # (a quadratic path) shows as about 9x at these sizes, a linear path as
 # about 1x.  Autovacuum is off but in the variants that turn it on.
 
+# V7 counts commits' work under its own root interval (below) and the
+# default history window, which holds every commit of a run; it sets no
+# window of its own, so its counts stay comparable run to run.
 [run]
 quality = "smoke"
 repetitions = 1

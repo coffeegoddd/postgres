@@ -121,7 +121,8 @@
  * frees the blocks allocated as it began that nothing holds, rewrites the
  * stuck counts that now fit, moves the blocks past the allocated count down
  * into free ones (compact_store()), and shortens the store to its last
- * allocated block (SHRINK, which redo truncates by too).  Branch creation (a share,
+ * allocated block (SHRINK, which redo truncates by too), unless another
+ * sweep of it runs, which may still free blocks past that.  Branch creation (a share,
  * the one thing that adds holders) waits for it while it counts, and the
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
@@ -821,6 +822,34 @@ drop_gone_buffers(SMgrRelation reln)
 
 typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
 
+/* the size of reln's fork's file, or -1 if it has none */
+static off_t
+fork_size(SMgrRelation reln, ForkNumber fork)
+{
+	RelPathStr	path = relpathperm(reln->smgr_rlocator.locator, fork);
+	struct stat st;
+
+	if (stat(path.str, &st) < 0)
+		return errno == ENOENT ? -1 : 1;
+	return st.st_size;
+}
+
+/*
+ * Has reln's map gone, or is it going: its file unlinked, or emptied, as
+ * md.c empties a fork's file just before unlinking it?  A map is never
+ * empty otherwise, except as it is made, before its first pages.  Its
+ * changes list's file going (it had pages when the read began, 'had_chg')
+ * says so too: a drop's unlink removes the forks one at a time, and
+ * nothing else empties or removes the list while its header is held, as
+ * its readers hold it.
+ */
+static bool
+map_going(SMgrRelation reln, bool had_chg)
+{
+	return fork_size(reln, BMAP_FORKNUM) <= 0 ||
+		(had_chg && fork_size(reln, BMAP_CHANGES_FORKNUM) <= 0);
+}
+
 /*
  * Read reln's map, which may be a dropped relation's, by read(): every map
  * of a page store is read so (a sweep's, a compaction's, a size
@@ -829,16 +858,24 @@ typedef void (*DroppedRead) (SMgrRelation reln, void *arg);
  * its pins are let go of and, if the relation is gone by then, none of its
  * pages stays in shared buffers, where a relation given its file number
  * later would find them.  (One read before the unlink, the files still
- * there as it ends, is the drop's to drop: smgrdounlinkall().)  A read
- * that fails because the files went (the drop's invalidation closing
- * them, say) fails as before, its pages dropped first.
+ * there as it ends, is the drop's to drop: smgrdounlinkall().)
+ *
+ * A read that fails because the files went meanwhile (emptied, then
+ * unlinked, as the drop's commit removes them, or closed by its
+ * invalidation and gone when opened again) is passed over: false, and what
+ * read() left in *arg is as far as it got.  A dropped relation's map is
+ * passed over by every reader once it is gone: what it held was queued
+ * for release before its files went, so a sweep counts it from the queue.
+ * Any other failure, and a cancel, a shutdown or running out of memory or
+ * disk whatever the map's state, is thrown again.
  */
-static void
+static bool
 read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
 	ErrorData  *edata = NULL;
+	bool		had_chg = fork_size(reln, BMAP_CHANGES_FORKNUM) > 0;
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -860,8 +897,20 @@ read_maybe_dropped(SMgrRelation reln, DroppedRead read, void *arg)
 	}
 	PG_END_TRY();
 	drop_gone_buffers(reln);
-	if (edata != NULL)
-		ReThrowError(edata);
+	if (edata == NULL)
+		return true;
+	if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_OPERATOR_INTERVENTION &&
+		ERRCODE_TO_CATEGORY(edata->sqlerrcode) != ERRCODE_INSUFFICIENT_RESOURCES &&
+		map_going(reln, had_chg))
+	{
+		ereport(DEBUG1,
+				(errmsg_internal("map of relation %u passed over, dropped as it was read: %s",
+								 reln->smgr_rlocator.locator.relNumber,
+								 edata->message)));
+		FreeErrorData(edata);
+		return false;
+	}
+	ReThrowError(edata);
 }
 
 /* rel's page store's entry among those swept, or NULL; the mutex held */
@@ -1797,12 +1846,17 @@ read_entries(SMgrRelation reln, bool node, BlockNumber blk, bool for_write,
 
 	if (for_write || cached_only)
 	{
-		PrefetchBufferResult r = PrefetchSharedBuffer(fsrel, fork, blk);
+		/*
+		 * (looked up only: a hint's lookup comes after the writes it hints
+		 * at, by when the relation may be dropped and its map's file gone,
+		 * and a page not cached is read, if at all, at once)
+		 */
+		Buffer		recent = LookupSharedBuffer(floc, fork, blk);
 
-		if (BufferIsValid(r.recent_buffer) &&
-			ReadRecentBuffer(floc, fork, blk, r.recent_buffer))
+		if (BufferIsValid(recent) &&
+			ReadRecentBuffer(floc, fork, blk, recent))
 		{
-			buf = r.recent_buffer;
+			buf = recent;
 			/* a change keeping the page locked (map_lock()) can't be waited for */
 			if (BufferIsLockedByMe(buf))
 			{
@@ -10478,6 +10532,15 @@ sweep_relation_read(SMgrRelation reln, void *arg)
 	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
 	if (mapnblocks == 0)
 		return;
+#ifdef USE_INJECTION_POINTS
+	{
+		/* (the relation's file number, for a test to stop at one only) */
+		char		relnumber[16];
+
+		snprintf(relnumber, sizeof(relnumber), "%u", rel.relNumber);
+		INJECTION_POINT("bmap-sweep-relation", relnumber);
+	}
+#endif
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
@@ -10505,7 +10568,13 @@ sweep_relation_read(SMgrRelation reln, void *arg)
 /*
  * sweep_relation_read(), the relation perhaps dropped while it is read (its
  * buffers dropped before these were read): none of its pages stays in
- * shared buffers (read_maybe_dropped()).
+ * shared buffers (read_maybe_dropped()).  One whose files go as it is read
+ * is passed over, what it held counted from the release queue.  What was
+ * counted of it before its read failed stays counted, which only holds a
+ * block more: of its map's own fork only the header and the root page are
+ * read before the tree's nodes, which are the page store's, and its
+ * changes list only after them, so no node is marked reached with its
+ * children left uncounted.
  */
 static void
 sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
@@ -11192,6 +11261,15 @@ sweep_recount(RelFileLocator rel, const BlockNumber *stuck, uint32 n,
  * Shorten the page store to its last allocated block: the high-water mark
  * lowered and the file truncated, the record first.  Under the metapage's
  * lock, so nothing is allocated meanwhile.
+ *
+ * Not while another sweep of the store runs (this one no longer counts
+ * itself).  That sweep may have counted blocks this one has since freed,
+ * as nothing held them, and still be about to free them.  Shortened past
+ * them, the store would grow again into the same block numbers, the
+ * allocator taking no free block while a sweep runs, and its frees would
+ * then let go of blocks a relation holds.  A sweep that begins after the
+ * check reads the metapage after the store is shortened.  The next sweep
+ * shortens it.
  */
 static BlockNumber
 sweep_shrink(RelFileLocator rel)
@@ -11210,6 +11288,11 @@ sweep_shrink(RelFileLocator rel)
 	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
 	meta = PageGetBmapMeta(BufferGetPage(metabuf));
 	hw = new_hw = meta->hw;
+	if (sweep_running(rel))
+	{
+		UnlockReleaseBuffer(metabuf);
+		return 0;
+	}
 
 	/* each bitmap page read once, from the end, a word of free blocks at once */
 	while (new_hw > 0)
@@ -11597,8 +11680,18 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	alloc_release(&alloc);
 	map_unlock(mapbuf);
 	ReleaseBuffer(mapbuf);
-	UnlockReleaseBuffer(headerbuf);
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * The old block freed before the header is let go of.  Held by nothing
+	 * from the remap on, it would otherwise be found so by a sweep counting
+	 * the relation (under its header) once this compaction's own sweep no
+	 * longer counts as running: freed by that sweep, then given out again
+	 * by the allocator, it would be freed here from under its new holder.
+	 * (A crash between the two records leaves it to a sweep, as before.)
+	 */
+	free_blocks(rel, &phys, 1);
+	UnlockReleaseBuffer(headerbuf);
 	pfree(ndelta);
 	return true;
 }
@@ -11613,8 +11706,8 @@ cmp_move_desc(const void *a, const void *b)
 }
 
 /*
- * Move one relation's blocks from 'target' on, the highest first; the old
- * blocks go back to the allocator.  With 'held' (the relation held against
+ * Move one relation's blocks from 'target' on, the highest first; each old
+ * block goes back to the allocator with its move (compact_page()).  With 'held' (the relation held against
  * its drop), the moves stop once another waits for that hold, so a DDL
  * waits for no more than a move.  Those that only try their locks (a
  * restore of a branch's kept pages, a branch's deletion) aren't waiting,
@@ -11628,7 +11721,6 @@ compact_relation(SMgrRelation reln, BlockNumber target,
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	CompactWalk cw = {target, 0, NULL, 0, 0};
 	Buffer		headerbuf;
-	BlockList	freed = {NULL, 0, 0};
 	uint64		moved = 0;
 
 	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
@@ -11657,19 +11749,10 @@ compact_relation(SMgrRelation reln, BlockNumber target,
 			 LockHasWaiters(held, AccessShareLock, false)))
 			break;
 		if (compact_page(reln, m->blkno, m->phys))
-		{
-			block_list_add(&freed, m->phys);
 			moved++;
-		}
 		CHECK_FOR_INTERRUPTS();
 	}
 	INJECTION_POINT("bmap-compact-moved", NULL);
-	if (freed.n > 0)
-	{
-		qsort(freed.blocks, freed.n, sizeof(BlockNumber), cmp_block);
-		free_blocks(rel, freed.blocks, freed.n);
-		pfree(freed.blocks);
-	}
 	pfree(cw.moves);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_BLOCKS_MOVED, moved);
 	return moved;
@@ -12434,6 +12517,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	FreeDir(dir);
 	sweep_roots_free(&sr);
 	LockRelease(&tag, ExclusiveLock, false);
+	INJECTION_POINT("bmap-sweep-freeing", NULL);
 
 	/* (a block nothing holds gets no new holder: freed after the lock) */
 	free_blocks(rel, tofree.blocks, tofree.n);
@@ -13247,7 +13331,9 @@ bmapwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		/*
 		 * Writeback is a hint; blocks without an entry, or whose map page
-		 * isn't cached, are skipped.
+		 * isn't cached, are skipped.  So are a relation's dropped since its
+		 * pages were written: its map's buffers went with it, and its
+		 * map's file isn't opened (read_entries()).
 		 */
 		if (!BlockNumberIsValid(phys))
 			return;

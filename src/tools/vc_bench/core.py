@@ -281,6 +281,24 @@ class SQL:
     def counters(self):
         return self.adapter.counters(self)
 
+    def window_state(self, branches):
+        return self.adapter.window_state(self, branches)
+
+    def target(self, chain, index, c):
+        return self.adapter.target(self, chain, index, c)
+
+    def path_counters(self):
+        return self.adapter.path_counters(self)
+
+    def at_sql(self, commit, ids):
+        return self.adapter.at_sql(commit, ids)
+
+    def merge_sql(self, branch, message):
+        return self.adapter.merge_sql(branch, message)
+
+    def before_merge(self):
+        return self.adapter.before_merge(self)
+
 
 def disk_size(path):
     apparent = allocated = 0

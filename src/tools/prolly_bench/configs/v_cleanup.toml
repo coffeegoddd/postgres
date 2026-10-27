@@ -7,6 +7,8 @@
 # paired latency ratio, and gates it with --gate-latency.  The "pr" size
 # runs in pull-request CI, "nightly" nightly.
 
+# V10 gates cleanup's reads, not version-control latency: it sets no
+# history window, the default (a month) holding every commit it makes.
 [run]
 quality = "smoke"
 repetitions = 1

@@ -16,6 +16,7 @@ from memory import Sampler
 from report import fit, report
 from human_report import render
 import preflight
+import window
 
 
 class FakeVersionedSQL:
@@ -24,15 +25,80 @@ class FakeVersionedSQL:
     working set.  It answers the statements run_cell() sends, so a case's
     validation and restore run against it; keep_dirty_on_hard_reset makes a
     hard reset that leaves the working set as it was, a bug to be caught."""
-    def __init__(self, n, k, commits, branch, keep_dirty_on_hard_reset=False):
+    def __init__(self, n, k, commits, branch, keep_dirty_on_hard_reset=False,
+                 windowed=False, roots=None, in_window=None, write_rows_anyway=False):
         from experiment import changed_ids
+        self.made, self.parent_of = {}, {}
         self.commits, self.changed = commits, changed_ids(n, k)
         self.branches = {branch: [len(commits) - 1, self.rows(len(commits) - 1)]}
         self.current, self.keep_dirty = branch, keep_dirty_on_hard_reset
         self.statements = []
+        # A model of a history window (windowed): the commits with roots
+        # (all by default) and those in the window (all by default).  A
+        # hard reset gives back its commit's root, or the nearest before
+        # it, or writes its rows, counting the path as pg_stat_prolly does;
+        # write_rows_anyway models a move that writes rows with a root.
+        self.full_write_merge = False
+        self.ff_writes_rows = False
+        self.windowed = windowed
+        self.roots = set(commits if roots is None else roots)
+        self.in_window = set(commits if in_window is None else in_window)
+        self.write_rows_anyway = write_rows_anyway
+        self.path = dict.fromkeys(window.PATH_COUNTERS, 0)
+        self.targets_checked = []
+
+    def target(self, chain, index, c):
+        self.targets_checked.append(chain[index])
+        if not self.windowed:
+            return window.local_target()
+        return window.classify(chain, index, self.in_window.__contains__, self.roots.__contains__,
+                               c.get('history_window', {}).get('root_interval_commits', 1),
+                               c.get('history_window', {}).get('allow_past', False))
+
+    def path_counters(self):
+        return dict(self.path) if self.windowed else None
+
+    def at_sql(self, commit, ids):
+        return 'AT ' + json.dumps([commit, list(ids)])
+
+    def _move(self, i):
+        if not self.windowed:
+            return
+        nearest = next((j for j in range(i, -1, -1) if self.commits[j] in self.roots), None)
+        if nearest == i:
+            self.path['moves_root_kept'] += 1
+            if self.write_rows_anyway:
+                self.path['move_tables_written'] += 1
+        elif nearest is not None:
+            self.path['moves_root_nearest'] += 1
+            self.path['move_tables_written'] += 1
+        else:
+            self.path['moves_root_missing'] += 1
+            self.path['move_tables_written'] += 1
 
     def rows(self, i):
+        # (a commit the run made, a merge's side or the merge: its own rows)
+        if i in self.made:
+            return dict(self.made[i])
         return {r: i for r in self.changed}
+
+    def parents(self, i):
+        return self.parent_of.get(i, [i - 1] if i else [])
+
+    def ancestors(self, i):
+        out, todo = set(), [i]
+        while todo:
+            j = todo.pop()
+            if j not in out:
+                out.add(j)
+                todo += self.parents(j)
+        return out
+
+    def merge_sql(self, branch, message):
+        return 'VC ' + json.dumps(['merge', branch, '-m', message])
+
+    def before_merge(self):
+        self.statements.append('BEFORE MERGE')
 
     def state(self, ref):
         head, work = self.branches[self.current]
@@ -86,9 +152,40 @@ class FakeVersionedSQL:
             elif op == 'checkout':
                 assert args[0] in self.branches, args[0]
                 self.current = args[0]
+            elif op == 'commit':
+                b = self.branches[self.current]
+                self.commits = self.commits + ['m%d' % len(self.commits)]
+                i = len(self.commits) - 1
+                self.made[i], self.parent_of[i] = dict(b[1]), [b[0]]
+                b[0] = i
+            elif op == 'merge':
+                b = self.branches[self.current]
+                theirs = self.branches[args[0]][0]
+                if b[0] in self.ancestors(theirs):
+                    b[0], b[1] = theirs, self.rows(theirs)
+                    self._move(theirs)
+                    if self.windowed and self.ff_writes_rows:
+                        self.path['move_tables_written'] += 1
+                        self.path['apply_rows'] += len(self.changed)
+                else:
+                    base = max(self.ancestors(b[0]) & self.ancestors(theirs))
+                    was, side = self.rows(base), self.rows(theirs)
+                    merged = self.rows(b[0])
+                    changed = {r: v for r, v in side.items() if was.get(r, 0) != v}
+                    merged.update(changed)
+                    self.commits = self.commits + ['m%d' % len(self.commits)]
+                    i = len(self.commits) - 1
+                    self.made[i], self.parent_of[i] = merged, [b[0], theirs]
+                    b[0], b[1] = i, dict(merged)
+                    if self.windowed:
+                        self.path['apply_rows'] += len(changed)
+                        if self.full_write_merge:
+                            self.path['apply_loads'] += 1
             elif op == 'reset':
                 b = self.branches[self.current]
                 b[0] = self.commits.index(args[1])
+                if args[0] == '--hard':
+                    self._move(b[0])
                 if args[0] == '--hard' and (not self.keep_dirty or b[1] is None):
                     b[1] = self.rows(b[0])
         elif q.startswith('HASH '):
@@ -99,6 +196,10 @@ class FakeVersionedSQL:
             elif ref.startswith('HEAD~'):
                 head -= int(ref[5:])
             out = [[self.commits[head]]]
+        elif q.startswith('AT '):
+            commit, ids = json.loads(q[3:])
+            rows = self.rows(self.commits.index(commit))
+            out = [[str(i), str(rows.get(i, 0))] for i in ids]
         elif q.startswith('DIFF '):
             a, b = (self.state(r) for r in json.loads(q[5:]))
             out = [[str(sum(a.get(i, 0) != b.get(i, 0) for i in set(a) | set(b)))]]
@@ -352,12 +453,15 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(core.ENGINES['doltgres'].ids_in(ids),
                          'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
 
-    def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',), warmups=1):
+    def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',), warmups=1,
+                  history_window=None):
         import random
         from experiment import run_cell
         c = {'passes': list(passes), 'warmups': warmups, 'repetitions': 1, 'history_depths': [1, 3],
              'sample_interval_ms': 10, 'payload_bytes': 16,
              'dirty_sizes': {'small': {'rows': 3}, 'half': {'fraction': 0.5}}}
+        if history_window is not None:
+            c['history_window'] = history_window
         out = io.StringIO()
         run_cell(None, c, engine, n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
                  out, random.Random(7))
@@ -384,9 +488,10 @@ class BenchTests(unittest.TestCase):
         self.assertTrue(all(r['status'] == 'ok' for r in records))
         timed = {r['sql'] for r in records if r['operation'] == 'drop_table'}
         self.assertEqual(timed, {'DROP TABLE bench_rows'})
-        # (the used branch is checked out before the timed delete; the other never)
+        # (the used branch is checked out before the timed delete; the other
+        # never; a three-way merge's side, at each depth, to commit on it)
         checkouts = [q for q in sql.statements if q.startswith('VC ["checkout", "new_')]
-        self.assertEqual(len(checkouts), 3 + 6)
+        self.assertEqual(len(checkouts), 3 + 6 + 2)
         # every temporary branch is gone at the end, and the table is back
         self.assertEqual(set(sql.branches), {'fixture'})
         self.assertIsNotNone(sql.branches['fixture'][1])
@@ -530,6 +635,230 @@ class BenchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as e:
             self._run_cell(sql, n, k, commits)
         self.assertRegex(str(e.exception), 'working rows|hard reset leaves no working changes|preserved dirty')
+
+    def test_window_settings_hold_every_commit_a_fixture_builds(self):
+        from engines import ENGINES
+        c = {'history_depths': [32, 100, 500]}
+        got = window.settings(c)
+        self.assertEqual(got['prolly.history_min_commits'], '501')
+        self.assertEqual(got['prolly.history_window'], window.DEFAULT_TIME_WINDOW)
+        self.assertEqual(got['prolly.root_interval_commits'], '1')
+        self.assertEqual(got['prolly.root_interval'], '0')
+        self.assertEqual(got['prolly.history_max_size'], '')
+        self.assertEqual(got['prolly.history_window_action'], 'none')
+        self.assertEqual(ENGINES['prolly'].window_settings(c), got)
+        self.assertEqual(ENGINES['dolt'].window_settings(c), {})
+        self.assertEqual(ENGINES['doltgres'].window_settings(c), {})
+        with self.assertRaisesRegex(ValueError, 'fewer than the 501'):
+            window.settings({**c, 'history_window': {'min_commits': 500}})
+        with self.assertRaisesRegex(ValueError, 'at least 1'):
+            window.settings({**c, 'history_window': {'root_interval_commits': 0}})
+
+        class Admin:
+            def __init__(self):
+                self.sent = []
+
+            def query(self, q):
+                self.sent.append(q)
+        admin = Admin()
+        ENGINES['prolly'].apply_window(admin, 'bench_n10', c)
+        self.assertIn("ALTER DATABASE bench_n10 SET prolly.history_min_commits = '501'", admin.sent)
+        self.assertEqual(len(admin.sent), len(got))
+        admin = Admin()
+        ENGINES['dolt'].apply_window(admin, 'bench_n10', c)
+        self.assertEqual(admin.sent, [])
+
+    def test_targets_are_classified_by_window_and_root(self):
+        chain = ['c0', 'c1', 'c2', 'c3', 'c4']
+        everything = set(chain).__contains__
+        self.assertEqual(window.classify(chain, 4, everything, everything, 1),
+                         {'window': 'in', 'root': 'kept', 'root_distance': 0})
+        roots = {'c0', 'c3'}.__contains__
+        self.assertEqual(window.classify(chain, 2, everything, roots, 3),
+                         {'window': 'in', 'root': 'nearest', 'root_distance': 2})
+        # (the nearest root is past the interval: no root to measure from)
+        with self.assertRaisesRegex(window.WindowError, 'keep a root'):
+            window.classify(chain, 2, everything, roots, 2)
+        with self.assertRaisesRegex(window.WindowError, 'keep a root'):
+            window.classify(chain, 1, everything, {'c3'}.__contains__, 1)
+        past = {'c3', 'c4'}.__contains__
+        with self.assertRaisesRegex(window.WindowError, 'outside the history window'):
+            window.classify(chain, 1, past, everything, 1)
+        self.assertEqual(window.classify(chain, 1, past, everything, 1, allow_past=True),
+                         {'window': 'past', 'root': None, 'root_distance': None})
+
+    def test_path_checks_refuse_anything_but_the_root_path(self):
+        kept = {'window': 'in', 'root': 'kept', 'root_distance': 0}
+        nearest = {'window': 'in', 'root': 'nearest', 'root_distance': 1}
+        window.check_path('reset_hard', 3, kept, {'moves_root_kept': 1})
+        window.check_path('reset_hard', 3, nearest, {'moves_root_nearest': 1, 'move_tables_written': 1})
+        window.check_path('diff_history', 3, kept, {})
+        window.check_path('reset_hard', 0, kept, {})
+        for op, d, target, deltas, why in [
+                ('reset_hard', 3, kept, {'moves_root_kept': 1, 'move_tables_written': 1}, 'wrote rows'),
+                ('checkout', 3, kept, {'move_tables_written': 2}, 'wrote rows'),
+                ('reset_hard', 3, kept, {'moves_root_missing': 1, 'move_tables_written': 1}, 'without a root'),
+                ('reset_hard', 3, kept, {}, 'moves_root_kept is 0'),
+                ('reset_hard', 3, nearest, {'moves_root_kept': 1}, 'moves_root_nearest is 0'),
+                ('reset_hard', 3, kept, {'moves_root_kept': 1, 'restores_lock_busy': 1}, 'for a lock'),
+                ('at_history', 3, kept, {'severed_refusals': 1}, 'past the horizon'),
+                ('diff_history', 3, kept, {'move_tables_written': 1}, 'wrote rows')]:
+            with self.assertRaisesRegex(window.PathError, why):
+                window.check_path(op, d, target, deltas)
+        # (a target past the window is measured apart, held to nothing; an
+        # engine without a window has no roots to check)
+        window.check_path('reset_hard', 3, {'window': 'past', 'root': None, 'root_distance': None},
+                          {'moves_root_missing': 1, 'move_tables_written': 1})
+        window.check_path('reset_hard', 3, window.local_target(), {})
+
+    def test_every_target_is_checked_and_every_path_recorded(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        records = self._run_cell(sql, n, k, commits, engine='prolly')
+        self.assertTrue(records and all(r['status'] == 'ok' for r in records))
+        # (one check before each operation, warmups too)
+        self.assertEqual(len(sql.targets_checked), len(records))
+        self.assertTrue(all(r['window'] == 'in' and r['target_root'] == 'kept' for r in records))
+        self.assertTrue(all(set(r['path']) == set(window.PATH_COUNTERS) for r in records))
+        hard = [r for r in records if r['operation'] == 'reset_hard' and r['distance']]
+        self.assertTrue(hard and all(r['path']['moves_root_kept'] == 1 for r in hard))
+        at = [r for r in records if r['operation'] == 'at_history']
+        self.assertEqual({r['distance'] for r in at}, {0, 1, 3})
+        # the counters pass takes the path from its own reads
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        sql.counters = lambda: dict(sql.path)
+        records = self._run_cell(sql, n, k, commits, engine='prolly', passes=('counters',), warmups=0)
+        hard = [r for r in records if r['operation'] == 'reset_hard' and r['distance']]
+        self.assertTrue(hard and all(r['path']['moves_root_kept'] == 1 for r in hard))
+
+    def test_a_move_that_writes_rows_fails_the_run(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True, write_rows_anyway=True)
+        with self.assertRaisesRegex(window.PathError, 'wrote rows'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
+
+    def test_a_target_without_a_root_fails_before_it_is_measured(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True, roots=set(commits) - {'c3'})
+        with self.assertRaisesRegex(window.WindowError, 'keep a root'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
+        # within the root interval, its nearest root (c2) is measured from
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True, roots=set(commits) - {'c3'})
+        records = self._run_cell(sql, n, k, commits, engine='prolly',
+                                 history_window={'root_interval_commits': 2})
+        near = [r for r in records if r['distance'] == 1]
+        self.assertTrue(near and all(r['target_root'] == 'nearest' and r['root_distance'] == 1 for r in near))
+        hard = [r for r in near if r['operation'] == 'reset_hard']
+        self.assertTrue(all(r['path']['moves_root_nearest'] == 1 for r in hard))
+
+    def test_targets_past_the_window_are_measured_apart(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True, in_window=set(commits) - {'c1'})
+        with self.assertRaisesRegex(window.WindowError, 'outside the history window'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True, in_window=set(commits) - {'c1'},
+                               roots=set(commits) - {'c1'})
+        records = self._run_cell(sql, n, k, commits, engine='prolly', warmups=0,
+                                 history_window={'allow_past': True})
+        self.assertEqual({r['window'] for r in records if r['distance'] == 3}, {'past'})
+        self.assertEqual({r['window'] for r in records if r['distance'] != 3}, {'in'})
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            core.write_json(path/'manifest.json', {'status': 'complete', 'planned_samples': len(records)})
+            (path/'samples.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(path)
+            rows = list(__import__('csv').DictReader((path/'summary.csv').open()))
+            groups = {(r['operation'], r['distance'], r['window']) for r in rows}
+            self.assertIn(('reset_hard', '3', 'past'), groups)
+            self.assertNotIn(('reset_hard', '3', 'in'), groups)
+            self.assertIn(('reset_hard', '1', 'in'), groups)
+            kept = [r for r in rows if r['operation'] == 'reset_hard' and r['distance'] == '1']
+            self.assertEqual(kept[0]['target_root'], 'kept')
+            self.assertEqual(kept[0]['median_path_moves_root_kept'], '1')
+            text = (path/'report.md').read_text()
+            self.assertIn('Hard reset [past the history window]', text)
+            self.assertIn('root kept; moves_root_kept 1', text)
+
+    def test_merges_from_in_window_bases_write_only_the_rows_they_change(self):
+        from experiment import side_ids, changed_ids
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        self.assertTrue(side_ids(n, k) and not set(side_ids(n, k)) & set(changed_ids(n, k)))
+        with self.assertRaisesRegex(ValueError, 'needs rows no commit changes'):
+            side_ids(8, 8)
+        plan = {(case['operation'], case['distance']) for case in cases({'history_depths': [1, 4],
+                                                                         'dirty_sizes': {}})}
+        for d in (1, 4):
+            self.assertIn(('merge_ff', d), plan)
+            self.assertIn(('merge', d), plan)
+        self.assertNotIn(('merge', 0), plan)
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        records = self._run_cell(sql, n, k, commits, engine='prolly')
+        ff = [r for r in records if r['operation'] == 'merge_ff']
+        three = [r for r in records if r['operation'] == 'merge']
+        self.assertEqual({r['distance'] for r in ff}, {1, 3})
+        self.assertTrue(all(r['window'] == 'in' and r['target_root'] == 'kept' for r in ff + three))
+        self.assertTrue(all(r['path']['moves_root_kept'] == 1 and r['path']['apply_rows'] == 0 for r in ff))
+        self.assertTrue(all(r['path']['apply_rows'] == k for r in three))
+        self.assertTrue(all(r['sql'].startswith('VC ["merge"') for r in ff + three))
+        # (the session is left as it was: its branch at HEAD, the side gone)
+        self.assertEqual(list(sql.branches), ['fixture'])
+        # a merge that fills a table from nothing, or writes more rows than
+        # it changes, fails the run
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        sql.full_write_merge = True
+        with self.assertRaisesRegex(window.PathError, 'full table write'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
+        # a fast-forward is a move: one that writes the rows to the head
+        # instead of giving back its root fails the run
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        sql.ff_writes_rows = True
+        with self.assertRaisesRegex(window.PathError, 'the fast-forward wrote rows'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
+        merge_in = {'window': 'in', 'root': 'kept', 'root_distance': 0}
+        window.check_path('merge_ff', 3, merge_in, {'moves_root_kept': 1}, 0)
+        with self.assertRaisesRegex(window.PathError, 'moves_root_kept is 0'):
+            window.check_path('merge_ff', 3, merge_in, {}, 0)
+        with self.assertRaisesRegex(window.PathError, 'the fast-forward wrote rows'):
+            window.check_path('merge_ff', 3, merge_in, {'moves_root_kept': 1, 'apply_rows': 8}, 8)
+        window.check_path('merge', 3, merge_in, {'apply_rows': 3}, 3)
+        with self.assertRaisesRegex(window.PathError, 'more than the 3'):
+            window.check_path('merge', 3, merge_in, {'apply_rows': 64}, 3)
+        with self.assertRaisesRegex(window.PathError, 'without a root'):
+            window.check_path('merge_ff', 3, merge_in, {'moves_root_missing': 1}, 0)
+
+    def test_go_engines_issue_the_sql_their_servers_accept(self):
+        # (each statement as run once against Dolt 2.4.0 and Doltgres 1.0.0:
+        # AS OF a quoted commit hash on a table reference, as both grammars
+        # take it; dolt_merge's -m and --author, as Dolt's merge arguments,
+        # which Doltgres shares, take them; the rest as before)
+        from engines import ENGINES
+        author = "'VC Bench <vc-bench@example.invalid>'"
+        for name, call, schema in (('dolt', 'CALL', 'database()'), ('doltgres', 'SELECT', 'current_schema()')):
+            e = ENGINES[name]
+            self.assertEqual(e.vc_sql('commit', ('-Am', 'c', '--allow-empty', '--author', e.AUTHOR)),
+                             f"{call} dolt_commit('-Am','c','--allow-empty','--author',{author})")
+            self.assertEqual(e.vc_sql('branch', ('side', 'h0')), f"{call} dolt_branch('side','h0')")
+            self.assertEqual(e.vc_sql('branch', ('-D', 'side')), f"{call} dolt_branch('-D','side')")
+            self.assertEqual(e.vc_sql('checkout', ('side',)), f"{call} dolt_checkout('side')")
+            self.assertEqual(e.vc_sql('reset', ('--hard', 'h0')), f"{call} dolt_reset('--hard','h0')")
+            self.assertEqual(e.vc_sql('reset', ('--soft', 'h0')), f"{call} dolt_reset('--soft','h0')")
+            self.assertEqual(e.merge_sql('main', 'vc_bench merge'),
+                             f"{call} dolt_merge('main','-m','vc_bench merge','--author',{author})")
+            self.assertEqual(e.hash_sql('HEAD'), "SELECT hashof('HEAD')")
+            self.assertEqual(e.diff_sql('h0', 'HEAD'), "SELECT count(*) FROM dolt_diff('h0','HEAD','bench_rows')")
+            self.assertEqual(e.table_count_sql(),
+                             "SELECT count(*) FROM information_schema.tables "
+                             f"WHERE table_schema={schema} AND table_name='bench_rows'")
+            # (no session setup before a merge: the author is an argument)
+            self.assertIsNone(e.before_merge(None))
+        self.assertEqual(ENGINES['dolt'].at_sql('h0', [1, 2]),
+                         "SELECT id,revision FROM bench_rows AS OF 'h0' WHERE id IN (1,2) ORDER BY id")
+        self.assertEqual(ENGINES['doltgres'].at_sql('h0', [1, 2]),
+                         "SELECT id,revision FROM bench_rows AS OF 'h0' "
+                         "WHERE id IN (SELECT id FROM (VALUES (1),(2)) v(id)) ORDER BY id")
+        # (the hash quoted as a literal: one with a quote can't escape it)
+        self.assertIn("AS OF 'it''s'", ENGINES['dolt'].at_sql("it's", [1]))
 
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:

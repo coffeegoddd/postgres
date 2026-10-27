@@ -775,6 +775,17 @@ CREATE FUNCTION test_window_retire_due(OUT due boolean, OUT max_hi int8,
 	OUT want int8, OUT seal_due boolean)
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Set a history window setting of the database's refs (NULL: unset), as
+-- the background notes it.
+CREATE FUNCTION test_window_config_set(name text, value int8)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Take the severs' turn, as a sever does, to the transaction's end.
+CREATE FUNCTION test_hold_sever_turn()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The oldest position a logical slot of the current database, or one of a
 -- standby's as its feedback said, may decode from (NULL: none): what a
 -- collection keeps the values the WAL names from.

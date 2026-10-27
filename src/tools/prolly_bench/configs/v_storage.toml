@@ -5,6 +5,8 @@
 # timings: one client, autovacuum off, so each stage reads the same bytes
 # whatever else the machine runs.
 
+# V8 measures sizes in the default history window, which holds every
+# commit it makes; it sets no window of its own.
 [run]
 quality = "smoke"
 repetitions = 1

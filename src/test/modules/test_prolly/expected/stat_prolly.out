@@ -181,9 +181,13 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  buffer_rel_generations        |     6
  bmap_roots_pages_read         |     0
  horizon_entries_read          |     1
+ moves_root_kept               |     0
+ moves_root_nearest            |     0
+ moves_root_missing            |     0
+ severed_refusals              |     0
  kept_entries_read             |     4
  kept_entries_written          |     1
-(127 rows)
+(131 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,

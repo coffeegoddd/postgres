@@ -190,6 +190,63 @@ the maximum configured distance and is recorded in every sample.
 | `branch_delete`, D=0 or D>0 | Delete (`-D`) a branch made at HEAD or an older saved hash and never checked out |
 | `branch_delete_used`, D=0 or D>0 | The same, for a branch checked out once (and left) before the timed delete, so the engine has made what a session on it needs |
 | `drop_table` | `DROP TABLE bench_rows` on the scratch branch, clean or with a dirty working set; a hard reset to HEAD brings it back, untimed |
+| `at_history`, D=0 or D>0 | Read three changed rows as the saved hash has them (prolly: `dolt_at(hash, NULL::bench_rows)`; Dolt and Doltgres: `bench_rows AS OF hash`), by key |
+| `merge_ff`, D>0 | The scratch branch, hard reset (untimed) to the saved hash, merges the fixture branch: a fast-forward to HEAD |
+| `merge`, D>0 | A branch made at the saved hash, with one commit (untimed) changing rows no fixture commit changes, merges the fixture branch (HEAD): a three-way merge with an in-window base, its merge commit made; the branch is deleted after, untimed, so neither commit keeps a root |
+
+### The history window
+
+Operations are measured inside the history window, the optimal path for
+version control: every commit a run targets keeps a root of its pages, so
+a move to it gives the pages back rather than writing rows. `window.py`
+holds the settings and the checks; each engine answers them through
+`engines.py` (Dolt and Doltgres keep all history locally and have no
+window: their targets are all in it).
+
+- **The window holds all the history a run builds, at every size.**
+  `prepare` sets it on each prolly database before it builds any history
+  (a root let go of, its commit outside the window, isn't kept again), and
+  `run` sets it again before connecting: `prolly.history_window` (100
+  years by default), `prolly.history_min_commits` (the deepest history
+  measured plus the baseline: every commit a fixture builds), no root size
+  cap and no chunk-store cap (`prolly.history_max_size`), nothing severed
+  (`prolly.history_window_action` none), and a root at every commit (`prolly.root_interval` 0,
+  `prolly.root_interval_commits` 1). Override them in `config.json`'s
+  `history_window` (`time`, `min_commits`, `root_interval_ms`,
+  `root_interval_commits`); `min_commits` below what a fixture builds is
+  refused. A fixture whose history was built under other window settings
+  is refused too: prepare it into a new root.
+- **Before each operation**, its target (the saved hash at distance D; at
+  D=0 the head) is checked with `prolly_history_in_window()` and
+  `prolly_history_roots()`: in the window, and keeping a root, or (with a
+  root interval over one commit) one on a commit before it within the
+  interval. A target with neither fails the run before it is measured. A
+  target outside the window fails it too, unless `history_window.allow_past`
+  is true: then it is measured in a group of its own, labelled
+  `[past the history window]` (`window` "past" in the samples and CSVs),
+  never in the window's medians.
+- **After each operation**, in every pass, pg_stat_prolly's path counters
+  are read (outside timing) and must show the root path: no
+  `moves_root_missing` (a move to a commit without a root), no
+  `restores_lock_busy` (a restore given up for a lock), no
+  `severed_refusals` (a read refused, or rows left out, past the history
+  horizon), no `move_tables_written` but for a move from the nearest root,
+  and a hard reset to D>0 counted in `moves_root_kept` (or
+  `moves_root_nearest`). A failed check fails the run; it never becomes a
+  slow sample.
+- **Reported beside each latency:** the root each target was checked to
+  have and the medians of the path counters it moved (summary.csv's
+  `target_root`, `root_distance` and `median_path_*`, and the latency
+  tables), and, in the report's History window section and the manifest's
+  `windows`, the window's settings and the roots the fixture branch keeps
+  at each cell's start and end.
+
+Merges are held to the same window: their base is the target checked
+before them. A fast-forward is a move to the merged head, which keeps a
+root: it must count `moves_root_kept` and write no rows
+(`move_tables_written` and `apply_rows` 0). A three-way merge may write the
+rows it changes, at most K (`apply_rows`), and no `apply_loads` (a table
+filled from nothing). More is a full table write, and fails the run.
 
 ### Dirty working sets: xsmall, small, medium, large
 
