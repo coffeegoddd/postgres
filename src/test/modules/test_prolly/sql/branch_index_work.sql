@@ -150,7 +150,8 @@ SELECT dolt_branch('-m', 'bix_0003', 'Bix_0002');
 -- The indexes, as committed, against what they index, each way: each
 -- branch with a head is under its head's root ('r' kind 'h') and its
 -- baseline's fold's ('r' kind 'w'), with its name folded ('f'); each
--- live kept commit has its 'k' and 's' entries, and no others are left.
+-- live kept commit has its data trees' entries under its branch's prefix
+-- ('y'), and no others are left.
 CREATE FUNCTION pg_temp.ix() RETURNS TABLE (tag text, branch text, keyed text,
 	value text) LANGUAGE sql AS $$ SELECT * FROM test_refs_index() $$;
 CREATE FUNCTION pg_temp.check_ix() RETURNS TABLE (problem text, n int8)
@@ -186,17 +187,17 @@ LANGUAGE sql AS $$
 		AND i.branch NOT LIKE 'detached/%'
 	UNION ALL
 	SELECT 'kept commit not indexed', count(*) FROM live
-	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'k' AND i.branch = live.name
-		AND i.keyed = '14' || live.commit_id)
+	WHERE NOT EXISTS (SELECT FROM ix i WHERE i.tag = 'y' AND i.branch = live.name
+		AND right(i.keyed, 40) = live.commit_id)
 	UNION ALL
 	SELECT 'kept index of no live kept commit', count(*) FROM ix i
-	WHERE i.tag IN ('k', 's') AND NOT EXISTS (SELECT FROM live
+	WHERE i.tag = 'y' AND NOT EXISTS (SELECT FROM live
 		WHERE live.name = i.branch AND right(i.keyed, 40) = live.commit_id)
 	ORDER BY 1
 $$;
 SELECT * FROM pg_temp.check_ix();
-SELECT count(*) FILTER (WHERE tag = 'k') > 0 AS kept_indexed,
-	count(*) FILTER (WHERE tag = 's') > 0 AS tables_indexed,
+SELECT count(*) FILTER (WHERE tag = 'y') > 0 AS kept_indexed,
+	count(*) FILTER (WHERE tag = 'y') > 0 AS tables_indexed,
 	count(*) FILTER (WHERE tag = 'r' AND right(keyed, 2) = '77') > 0 AS baselines_indexed
 FROM pg_temp.ix();
 
@@ -234,7 +235,7 @@ SELECT dolt_branch('-D', 'bix_moved') IS NOT NULL AS deleted;
 SELECT count(*) AS left_of_deleted FROM pg_temp.ix() WHERE branch = 'bix_moved';
 SELECT dolt_branch('bix_moved') IS NOT NULL AS made_again;
 SELECT tag, keyed = lower(branch) AS folded FROM pg_temp.ix()
-WHERE branch = 'bix_moved' AND tag IN ('f', 'k', 's') ORDER BY tag;
+WHERE branch = 'bix_moved' AND tag IN ('f', 'y') ORDER BY tag;
 SELECT * FROM pg_temp.check_ix();
 
 -- A kept commit read in a transaction that rolls back, then the branch
@@ -253,7 +254,7 @@ SELECT length(dolt_commit('-am', 'kc rolled back')::text) > 0 AS committed;
 SELECT count(*) > 0 AS kept FROM test_kept_commits('bix_kc');
 SELECT (dolt_checkout('main'))[1];
 ROLLBACK;
-SELECT count(*) > 0 AS kept_indexed FROM pg_temp.ix() WHERE branch = 'bix_kc' AND tag = 'k';
+SELECT count(*) > 0 AS kept_indexed FROM pg_temp.ix() WHERE branch = 'bix_kc' AND tag = 'y';
 SELECT dolt_branch('-D', 'bix_kc') IS NOT NULL AS deleted;
 SELECT count(*) AS left_of_deleted FROM pg_temp.ix() WHERE branch = 'bix_kc';
 SELECT * FROM pg_temp.check_ix();
@@ -273,13 +274,13 @@ SELECT pg_temp.since('refs_nodes_written') IS NOT NULL AS counting;
 SELECT pg_temp.commits(100);
 :flush
 SELECT pg_temp.since('refs_nodes_written') / 100.0 AS per_commit_100 \gset
-SELECT count(*) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
-FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
+SELECT count(DISTINCT right(keyed, 40)) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
+FROM pg_temp.ix() WHERE tag = 'y' AND branch = 'main';
 SELECT pg_temp.commits(400);
 :flush
 SELECT pg_temp.since('refs_nodes_written') / 400.0 AS per_commit_400 \gset
-SELECT count(*) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
-FROM pg_temp.ix() WHERE tag = 'k' AND branch = 'main';
+SELECT count(DISTINCT right(keyed, 40)) = (SELECT count(*) FROM test_kept_commits('main')) AS main_kept_indexed
+FROM pg_temp.ix() WHERE tag = 'y' AND branch = 'main';
 SELECT :per_commit_400 <= 1.5 * :per_commit_100 AS written_flat;
 SELECT * FROM pg_temp.check_ix();
 

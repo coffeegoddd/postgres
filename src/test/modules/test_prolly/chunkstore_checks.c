@@ -1433,9 +1433,10 @@ bytes_hex(const uint8 *p, int n)
 
 /*
  * test_refs_index(): the refs' index entries, from the chunk store's root
- * (what committed): each one's tag; the branch it names; what it is keyed
- * by, in hex (the hashes, length first, and a root's kind byte), or for
- * the case-folded names the name folded; and its value, in hex.
+ * (what committed): each one's tag ('y' for a branch's index of its kept
+ * commits' data trees); the branch it names; what it is keyed by, in hex
+ * (the hashes, length first, and a root's kind byte), or for the
+ * case-folded names the name folded; and its value, in hex.
  */
 PG_FUNCTION_INFO_V1(test_refs_index);
 Datum
@@ -1467,10 +1468,22 @@ test_refs_index(PG_FUNCTION_ARGS)
 		int			skip = 0;
 		char	   *keyed;
 
-		if (tag == 'k' || tag == 'r')
+		/* (a branch's index of its kept commits' data trees: '~' name '\0' 'y') */
+		if (tag == '~')
+		{
+			const uint8 *nul = memchr(p, '\0', end - p);
+
+			if (nul == NULL || nul + 1 >= end || nul[1] != 'y')
+				continue;
+			values[0] = CStringGetTextDatum("y");
+			values[1] = PointerGetDatum(cstring_to_text_with_len((const char *) p, nul - p));
+			values[2] = CStringGetTextDatum(bytes_hex(nul + 2, end - (nul + 2)));
+			values[3] = CStringGetTextDatum(bytes_hex(v.data, v.len));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			continue;
+		}
+		if (tag == 'r')
 			skip = 1;
-		else if (tag == 's')
-			skip = 2;
 		else if (tag != 'f')
 			continue;
 		for (int i = 0; i < skip && p < end; i++)

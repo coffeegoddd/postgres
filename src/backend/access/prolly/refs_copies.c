@@ -67,8 +67,11 @@
  *	'I' name	-> the working set's identity anchor (the canonicalizer's
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
- *	'K' name NUL kind ... -> a commit the branch's pages are kept as of
- *				   (see "Kept pages"): kind 'l' and its commit's height
+ *	'~' name NUL kind ... -> a commit the branch's pages are kept as of
+ *				   (see "Kept pages"; the tag sorts after every other, so
+ *				   what a branch keeps, which its window bounds, is one
+ *				   region after every other entry, a commit's own at its
+ *				   right end): kind 'l' and its commit's height
  *				   (8 bytes, big-endian) and id (hash length, hash) for one
  *				   kept, 'r' and a number (8 bytes, big-endian) for one
  *				   retired; each the transaction that retired it (a
@@ -93,7 +96,7 @@
  *				   (4 bytes each but the root, native byte order), then
  *				   its frozen root's undecided pages (a varint count, then
  *				   4 bytes each)
- *	'K' name NUL 'h' root -> how many of the branch's entries (kept or
+ *	'~' name NUL 'x' root -> how many of the branch's entries (kept or
  *				   retired) name the root: its tablespace (4 bytes) and id
  *				   (8 bytes, big-endian; for storage a restore replaced,
  *				   its file number after, 4 bytes), the count 8 bytes
@@ -101,10 +104,11 @@
  *	'u' name	-> nothing: branch name keeps a commit whose roots are to
  *				   be frozen (KEPT_UNFROZEN), not retired
  *	't' commit name -> nothing: tag name names the commit
- *	'k' commit name -> nothing: branch name keeps pages as of the commit
- *				   (hash length, hash), an entry of its 'K' not retired
- *	's' data commit name -> nothing: and that commit's kept table has the
- *				   data tree data (hash length, hash, each)
+ *	'~' name NUL 'y' data commit -> nothing: the branch's kept commit
+ *				   (an entry of its 'l', hash length, hash) has a table
+ *				   whose data tree is data (the same); a commit's own entry
+ *				   is found by its height, and another branch's through
+ *				   the heads' roots ('r') or the branches with a summary
  *	'r' root kind name -> nothing: the branch's head's root (kind 'h', as
  *				   'B' has it) or its baseline's fold's (kind 'w', as 'W'
  *				   has it) is root
@@ -333,7 +337,8 @@
 #define TAG_IDENTITY	'I'	/* the working set's identity anchor */
 #define TAG_TAG			'T'	/* a tag, by name */
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
-#define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
+#define TAG_KEPT		'~'	/* the commits a branch's pages are kept as of
+								 * (last of the tags: see kept_prefix()) */
 #define TAG_KEPT_SUMMARY 'L'	/* and a summary of them */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
@@ -350,8 +355,6 @@
  * they hold is a seek of the refs, not a read of every branch's entries;
  * each key ends with the branch's name.
  */
-#define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
-#define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
 #define TAG_KEPT_UNFROZEN 'u'	/* a branch's kept commits to be frozen */
 #define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
 #define TAG_FOLDED		'f'	/* a branch's name, case folded */
@@ -390,7 +393,7 @@
  * number), with counts of the entries naming each root and a summary of
  * the branch's; and an index of tags by commit.
  */
-#define REFS_FORMAT		"26"
+#define REFS_FORMAT		"27"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -1709,6 +1712,191 @@ refs_root(ProllyNodeRef *root)
 	return refs_root_unflushed(root);
 }
 
+/*
+ * A scan of the refs as the transaction sees them: the tree's entries, as
+ * the scoped changes pending (refs_get() reads those first) change them,
+ * without applying those first.  So a transaction that reads its refs as
+ * it changes them (a keep reads its branch's entries, then puts some,
+ * then reads again) writes its changes in one edit, as it publishes them,
+ * not a tree for each read.  What is pending is read as the scan opens.
+ */
+typedef struct RefsScan
+{
+	ProllyTreeCursor *c;		/* (NULL: no tree yet) */
+	bool		backward;
+	ScopedPending *pend;		/* pending in range, in the scan's order */
+	int			npend;
+	int			pi;
+	bool		have_tree;		/* tk, tv: the tree's next */
+	bool		tree_done;
+	StringInfoData tk;
+	StringInfoData tv;
+	StringInfoData ok;			/* what next() gave */
+	StringInfoData ov;
+} RefsScan;
+
+/* the changes pending past which a scan applies them first */
+#define SCAN_PENDING_MAX	512
+
+static int
+refs_key_cmp(const char *a, int alen, const char *b, int blen)
+{
+	int			c = memcmp(a, b, Min(alen, blen));
+
+	return c != 0 ? c : (alen > blen) - (alen < blen);
+}
+
+static int
+scan_pending_cmp(const void *a, const void *b)
+{
+	const ScopedPending *x = a;
+	const ScopedPending *y = b;
+
+	return refs_key_cmp(x->key, x->keylen, y->key, y->keylen);
+}
+
+/* A scan from from (backward: down from it), false if the refs have no root. */
+static RefsScan *
+refs_scan_open(const ProllyKey *from, bool backward)
+{
+	RefsScan   *rs = palloc0(sizeof(RefsScan));
+	ProllyNodeRef root;
+
+	refs_init();
+	/*
+	 * (a transaction with very many changes pending, as one of many
+	 * commits is, applies them now and then, so that each scan and each
+	 * put isn't the work of all of them)
+	 */
+	if (list_length(scoped_pending) > SCAN_PENDING_MAX)
+		flush_scoped();
+	rs->backward = backward;
+	initStringInfo(&rs->tk);
+	initStringInfo(&rs->tv);
+	initStringInfo(&rs->ok);
+	initStringInfo(&rs->ov);
+	if (refs_root_unflushed(&root))
+	{
+		rs->c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+		PROLLY_CALL(tree, cursor_seek, rs->c, from,
+					backward ? BackwardScanDirection : ForwardScanDirection);
+	}
+	else
+		rs->tree_done = true;
+	if (scoped && scoped_pending != NIL)
+	{
+		rs->pend = palloc_array(ScopedPending, list_length(scoped_pending));
+		foreach_ptr(ScopedPending, sp, scoped_pending)
+		{
+			int			c = refs_key_cmp(sp->key, sp->keylen,
+										 (const char *) from->data, from->len);
+
+			if (backward ? c > 0 : c < 0)
+				continue;
+			rs->pend[rs->npend].key = memcpy(palloc(Max(sp->keylen, 1)),
+											 sp->key, sp->keylen);
+			rs->pend[rs->npend].keylen = sp->keylen;
+			rs->pend[rs->npend].value = sp->value ?
+				memcpy(palloc(Max(sp->len, 1)), sp->value, sp->len) : NULL;
+			rs->pend[rs->npend].len = sp->len;
+			rs->npend++;
+		}
+		qsort(rs->pend, rs->npend, sizeof(ScopedPending), scan_pending_cmp);
+		if (backward)
+			for (int i = 0; i < rs->npend / 2; i++)
+			{
+				ScopedPending t = rs->pend[i];
+
+				rs->pend[i] = rs->pend[rs->npend - 1 - i];
+				rs->pend[rs->npend - 1 - i] = t;
+			}
+	}
+	return rs;
+}
+
+static bool
+refs_scan_next(RefsScan *rs, ProllyKey *k, ProllyValue *v)
+{
+	for (;;)
+	{
+		ScopedPending *p = rs->pi < rs->npend ? &rs->pend[rs->pi] : NULL;
+		int			c;
+
+		if (!rs->have_tree && !rs->tree_done)
+		{
+			ProllyKey	tk;
+			ProllyValue tv;
+
+			if (PROLLY_CALL(tree, cursor_next, rs->c, &tk, &tv))
+			{
+				resetStringInfo(&rs->tk);
+				appendBinaryStringInfo(&rs->tk, (const char *) tk.data, tk.len);
+				resetStringInfo(&rs->tv);
+				appendBinaryStringInfo(&rs->tv, (const char *) tv.data, tv.len);
+				rs->have_tree = true;
+			}
+			else
+				rs->tree_done = true;
+		}
+		if (!rs->have_tree && p == NULL)
+			return false;
+		if (!rs->have_tree)
+			c = 1;				/* (the pending one) */
+		else if (p == NULL)
+			c = -1;				/* (the tree's) */
+		else
+		{
+			c = refs_key_cmp(rs->tk.data, rs->tk.len, p->key, p->keylen);
+			if (rs->backward)
+				c = -c;
+		}
+		resetStringInfo(&rs->ok);
+		resetStringInfo(&rs->ov);
+		if (c < 0)
+		{
+			appendBinaryStringInfo(&rs->ok, rs->tk.data, rs->tk.len);
+			appendBinaryStringInfo(&rs->ov, rs->tv.data, rs->tv.len);
+			rs->have_tree = false;
+		}
+		else
+		{
+			/* (the pending change replaces the tree's entry of its key) */
+			if (c == 0)
+				rs->have_tree = false;
+			rs->pi++;
+			if (p->value == NULL)
+				continue;
+			appendBinaryStringInfo(&rs->ok, p->key, p->keylen);
+			appendBinaryStringInfo(&rs->ov, p->value, p->len);
+		}
+		k->data = (const uint8 *) rs->ok.data;
+		k->len = rs->ok.len;
+		v->data = (const uint8 *) rs->ov.data;
+		v->len = rs->ov.len;
+		return true;
+	}
+}
+
+static void
+refs_scan_close(RefsScan *rs)
+{
+	if (rs->c)
+		PROLLY_CALL(tree, cursor_close, rs->c);
+	for (int i = 0; i < rs->npend; i++)
+	{
+		pfree(rs->pend[i].key);
+		if (rs->pend[i].value)
+			pfree(rs->pend[i].value);
+	}
+	if (rs->pend)
+		pfree(rs->pend);
+	pfree(rs->tk.data);
+	pfree(rs->tv.data);
+	pfree(rs->ok.data);
+	pfree(rs->ov.data);
+	pfree(rs);
+}
+
 static void
 branch_lock_tag(LOCKTAG *tag, const char *name, int len)
 {
@@ -1860,12 +2048,8 @@ entry_branch(const char *key, int keylen, int *len)
 		return NULL;
 	switch (key[0])
 	{
-		case TAG_KEPT_OF:
 		case TAG_ROOT_OF:
 			skip = 1;
-			break;
-		case TAG_KEPT_TABLE:
-			skip = 2;
 			break;
 		case TAG_FOLDED:
 			p = memchr(p, '\0', end - p);
@@ -4069,7 +4253,8 @@ root_due(const char *name, const KeptSummary *s, const ProllyHash *commit_id)
  */
 #define KEPT_LIVE		'l'
 #define KEPT_RETIRED	'r'
-#define KEPT_HOLDS		'h'
+#define KEPT_HOLDS		'x'
+#define KEPT_DATA		'y'
 
 
 static void put_be32(StringInfo out, uint32 v);
@@ -4394,32 +4579,28 @@ kept_declare(const ProllyKey *key, const char *p, const char *end,
 }
 
 /*
- * The index entries of a live kept commit: the commit's ('k'), and each
- * of its tables' data trees' ('s').  None for one retired, which no reader
- * takes.
+ * The index entries of a live kept commit: each of its tables' data trees'
+ * (KEPT_DATA, under the branch's prefix).  None for one retired, which no
+ * reader takes.  A commit's own entry is found by its height, so it needs
+ * none.
  */
 static List *
 kept_index_keys(const char *name, const KeptCommit *kc)
 {
 	List	   *keys = NIL;
-	StringInfo	k;
 
 	if (FullTransactionIdIsValid(kc->retired))
 		return NIL;
-	k = makeStringInfo();
-	appendStringInfoChar(k, TAG_KEPT_OF);
-	put_hash(k, &kc->commit);
-	appendStringInfoString(k, name);
-	keys = lappend(keys, k);
 	for (int t = 0; t < kc->ntables; t++)
 	{
+		StringInfo	k;
+
 		if (kc->tables[t].data.len == 0)
 			continue;
 		k = makeStringInfo();
-		appendStringInfoChar(k, TAG_KEPT_TABLE);
+		kept_prefix(k, name, KEPT_DATA);
 		put_hash(k, &kc->tables[t].data);
 		put_hash(k, &kc->commit);
-		appendStringInfoString(k, name);
 		keys = lappend(keys, k);
 	}
 	return keys;
@@ -4588,14 +4769,13 @@ kept_scan(const char *name, char kind, bool backward, int limit, bool note)
 {
 	StringInfoData prefix;
 	StringInfoData seek;
-	ProllyNodeRef root;
-	ProllyTreeCursor *c;
+	RefsScan   *c;
 	ProllyKey	from;
 	ProllyKey	k;
 	ProllyValue v;
 	List	   *out = NIL;
 
-	if (limit == 0 || !refs_root(&root))
+	if (limit == 0)
 		return NIL;
 	initStringInfo(&prefix);
 	kept_prefix(&prefix, name, kind);
@@ -4606,11 +4786,9 @@ kept_scan(const char *name, char kind, bool backward, int limit, bool note)
 			appendStringInfoChar(&seek, '\377');
 	from.data = (const uint8 *) seek.data;
 	from.len = seek.len;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
-	PROLLY_CALL(tree, cursor_seek, c, &from,
-				backward ? BackwardScanDirection : ForwardScanDirection);
+	c = refs_scan_open(&from, backward);
 	while ((limit < 0 || list_length(out) < limit) &&
-		   PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   refs_scan_next(c, &k, &v) &&
 		   k.len >= prefix.len && memcmp(k.data, prefix.data, prefix.len) == 0)
 	{
 		out = lappend(out, kept_decode((const char *) k.data, k.len,
@@ -4619,7 +4797,7 @@ kept_scan(const char *name, char kind, bool backward, int limit, bool note)
 		if (note)
 			kept_note_loaded(name, &k, &v);
 	}
-	PROLLY_CALL(tree, cursor_close, c);
+	refs_scan_close(c);
 	pfree(prefix.data);
 	pfree(seek.data);
 	return out;
@@ -4969,37 +5147,88 @@ typedef struct KeptHolder
 	ProllyHash	commit;
 } KeptHolder;
 
-/* An index entry of kept_holders()'s prefix: its commit (if keyed by data) and name. */
 static void
-note_kept_holder(const ProllyKey *k, const ProllyValue *v, void *arg)
+note_kept_branch(const ProllyKey *k, const ProllyValue *v, void *arg)
 {
-	List	  **out = arg;
-	const char *p = (const char *) k->data + 1;
-	const char *end = (const char *) k->data + k->len;
-	KeptHolder *h = palloc0(sizeof(KeptHolder));
-	ProllyHash	skipped;
+	List	  **names = arg;
 
-	if (k->data[0] == TAG_KEPT_TABLE)
-		p = get_hash(p, end, &skipped);
-	p = get_hash(p, end, &h->commit);
-	h->name = pnstrdup(p, end - p);
-	*out = lappend(*out, h);
+	*names = lappend(*names, pnstrdup((const char *) k->data + 1, k->len - 1));
 }
 
+/*
+ * The branches keeping any commit's pages (those with a summary): a scan
+ * of the summaries, one entry for each branch.
+ */
+static List *
+kept_branches(void)
+{
+	char		prefix = TAG_KEPT_SUMMARY;
+	List	   *names = NIL;
+
+	visit_prefix(&prefix, 1, note_kept_branch, &names);
+	return names;
+}
+
+/* A data index entry of a branch's prefix: its commit, after the data. */
+typedef struct DataHolders
+{
+	const char *name;
+	int			prefix_len;
+	List	   *holders;
+} DataHolders;
+
+static void
+note_data_holder(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	DataHolders *dh = arg;
+	KeptHolder *h = palloc0(sizeof(KeptHolder));
+
+	(void) get_hash((const char *) k->data + dh->prefix_len,
+					(const char *) k->data + k->len, &h->commit);
+	h->name = pstrdup(dh->name);
+	dh->holders = lappend(dh->holders, h);
+}
+
+/*
+ * The refs' kept_holders(): each branch keeping pages is asked, a seek of
+ * its own entries (by the commit's height, or its index of data trees),
+ * so the work is in the branches that keep any, not in what they keep.
+ */
 static void
 copies_kept_holders(const ProllyHash *commit, const ProllyHash *data,
 					ProllyKeptHolderVisit visit, void *arg)
 {
-	StringInfoData prefix;
 	List	   *holders = NIL;
 
 	refs_init();
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, data != NULL ? TAG_KEPT_TABLE : TAG_KEPT_OF);
-	put_hash(&prefix, data != NULL ? data : commit);
 	/* (read whole first: a visit may read the refs of its own) */
-	visit_prefix(prefix.data, prefix.len, note_kept_holder, &holders);
-	pfree(prefix.data);
+	foreach_ptr(char, name, kept_branches())
+	{
+		if (data == NULL)
+		{
+			KeptHolder *h;
+
+			if (kept_lookup(name, commit, false) == NULL)
+				continue;
+			h = palloc0(sizeof(KeptHolder));
+			h->name = name;
+			h->commit = *commit;
+			holders = lappend(holders, h);
+		}
+		else
+		{
+			StringInfoData prefix;
+			DataHolders dh = {name, 0, NIL};
+
+			initStringInfo(&prefix);
+			kept_prefix(&prefix, name, KEPT_DATA);
+			put_hash(&prefix, data);
+			dh.prefix_len = prefix.len;
+			visit_prefix(prefix.data, prefix.len, note_data_holder, &dh);
+			pfree(prefix.data);
+			holders = list_concat(holders, dh.holders);
+		}
+	}
 	foreach_ptr(KeptHolder, h, holders)
 		visit(h->name, &h->commit, arg);
 }
@@ -5925,11 +6154,6 @@ kept_orphans(const char *name, List *entries, int *n)
 	return out;
 }
 
-typedef struct KeptOf
-{
-	List	   *names;
-} KeptOf;
-
 /*
  * Could kept commit kc (NULL: none), another branch's, give a move its
  * pages?  Only once its roots are frozen: one captured among writers is
@@ -5947,30 +6171,22 @@ kept_serves_move(const KeptCommit *kc)
 	return true;
 }
 
-static bool note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg);
 
 /*
  * Does a branch but name keep commit's pages, frozen so that a move can
  * be given them (kept_serves_move()), held against its own keeps and
- * passes until the transaction ends?  Each branch the index of
- * kept commits names is tried, never waited for (one in a keeping
- * transaction now is passed over: its pass may be letting go of its
- * own), and its entry read again once held.  So two branches' passes
+ * passes until the transaction ends?  Each branch keeping any is tried (a
+ * seek of its entries by the commit's height; asked only of a root out of
+ * its window that another branch's head is at), never waited for (one in
+ * a keeping transaction now is passed over: its pass may be letting go of
+ * its own), and its entry read again once held.  So two branches' passes
  * can't each let go of their root on the strength of the other's: the
  * second waits for the first's branch, and finds its entry retired.
  */
 static bool
 kept_by_other(const char *name, const ProllyHash *commit)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
-
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, other, ko.names)
+	foreach_ptr(char, other, kept_branches())
 	{
 		if (strcmp(other, name) == 0 || !try_lock_branch(other, true))
 			continue;
@@ -6399,49 +6615,35 @@ retain_kept_branches(void)
 	}
 }
 
-static bool
-note_kept_of(const ProllyKey *k, const ProllyValue *v, void *arg)
-{
-	KeptOf	   *ko = arg;
-	const char *p = (const char *) k->data + 1;
-	const char *end = (const char *) k->data + k->len;
-	ProllyHash	commit;
-
-	p = get_hash(p, end, &commit);
-	ko->names = lappend(ko->names, pnstrdup(p, end - p));
-	return true;
-}
-
 /*
  * The commits commit reaches, as a branch's kept commit of it records
- * them (a seek of the index of kept commits); false if none keeps it with
- * a count.
+ * them: the session's branch's first, then each other keeping any (a seek
+ * of each one's entries by the commit's height); false if none keeps it
+ * with a count.
  */
 static bool
 kept_count_get(const ProllyHash *commit, int64 *n)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
-	bool		found = false;
+	const char *current = branch_ops()->current();
+	List	   *names = kept_branches();
 
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, name, ko.names)
+	if (current != NULL)
+		names = lcons((char *) current, names);
+	foreach_ptr(char, name, names)
 	{
-		KeptCommit *kc = kept_lookup(name, commit, false);
+		KeptCommit *kc;
 
+		if (current != NULL && foreach_current_index(name) > 0 &&
+			strcmp(name, current) == 0)
+			continue;
+		kc = kept_lookup(name, commit, false);
 		if (kc != NULL && kc->commits > 0)
 		{
 			*n = kc->commits;
-			found = true;
-			break;
+			return true;
 		}
 	}
-	list_free_deep(ko.names);
-	return found;
+	return false;
 }
 
 /* A count known of commit: from known (live entries), else any branch's. */
@@ -6529,21 +6731,13 @@ copies_commit_count(const ProllyHash *commit, int64 *count)
  * Retire every branch's kept commit commit, severed: its history is past
  * the horizon, cold, so its root is let go of by the branch's next keep,
  * and its commit and trees no longer kept from collection meanwhile.
- * The caller holds every ref.  A seek of the index of kept commits.
+ * The caller holds every ref.  A seek of each keeping branch's entries.
  */
 static void
 copies_forget_kept(const ProllyHash *commit)
 {
-	StringInfoData prefix;
-	KeptOf		ko = {NIL};
-
 	refs_init();
-	initStringInfo(&prefix);
-	appendStringInfoChar(&prefix, TAG_KEPT_OF);
-	put_hash(&prefix, commit);
-	visit_prefix_while(prefix.data, prefix.len, false, note_kept_of, &ko);
-	pfree(prefix.data);
-	foreach_ptr(char, name, ko.names)
+	foreach_ptr(char, name, kept_branches())
 	{
 		KeptCommit *kc;
 
@@ -6947,7 +7141,7 @@ note_other_kept(const char *name, const ProllyHash *commit, void *arg)
 
 /*
  * Commit id's kept pages, which the session branch's list (kept) has, or
- * else another branch's (found by the refs' index of kept commits): the
+ * else another branch's (found by a seek of each keeping branch's): the
  * entry, and in *source the branch keeping it.  NULL if none does.  A
  * commit's pages are the commit's whichever branch kept them.
  */
@@ -12587,20 +12781,16 @@ visit_prefix(const char *prefix, int prefixlen,
 			 void (*visit) (const ProllyKey *k, const ProllyValue *v, void *arg),
 			 void *arg)
 {
-	ProllyNodeRef root;
-	ProllyTreeCursor *c;
+	RefsScan   *c;
 	ProllyKey	from = {(const uint8 *) prefix, prefixlen};
 	ProllyKey	k;
 	ProllyValue v;
 
-	if (!refs_root(&root))
-		return;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
-	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+	c = refs_scan_open(&from, false);
+	while (refs_scan_next(c, &k, &v) &&
 		   k.len >= prefixlen && memcmp(k.data, prefix, prefixlen) == 0)
 		visit(&k, &v, arg);
-	PROLLY_CALL(tree, cursor_close, c);
+	refs_scan_close(c);
 }
 
 /*
@@ -12613,15 +12803,12 @@ visit_prefix_while(const char *prefix, int prefixlen, bool backward,
 								  void *arg),
 				   void *arg)
 {
-	ProllyNodeRef root;
-	ProllyTreeCursor *c;
+	RefsScan   *c;
 	StringInfoData seek;
 	ProllyKey	from;
 	ProllyKey	k;
 	ProllyValue v;
 
-	if (!refs_root(&root))
-		return;
 	/* (backward, from past every key with the prefix) */
 	initStringInfo(&seek);
 	appendBinaryStringInfo(&seek, prefix, prefixlen);
@@ -12630,14 +12817,12 @@ visit_prefix_while(const char *prefix, int prefixlen, bool backward,
 			appendStringInfoChar(&seek, '\377');
 	from.data = (const uint8 *) seek.data;
 	from.len = seek.len;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
-	PROLLY_CALL(tree, cursor_seek, c, &from,
-				backward ? BackwardScanDirection : ForwardScanDirection);
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+	c = refs_scan_open(&from, backward);
+	while (refs_scan_next(c, &k, &v) &&
 		   k.len >= prefixlen && memcmp(k.data, prefix, prefixlen) == 0 &&
 		   visit(&k, &v, arg))
 		;
-	PROLLY_CALL(tree, cursor_close, c);
+	refs_scan_close(c);
 	pfree(seek.data);
 }
 
