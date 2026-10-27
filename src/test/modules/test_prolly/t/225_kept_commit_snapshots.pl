@@ -28,13 +28,6 @@ sub counter
 	return sql("SELECT value FROM pg_stat_prolly WHERE name = '$_[0]'");
 }
 
-# tables given another state's pages: shared, or restored from a kept
-# commit's roots (whichever branch kept them)
-sub given
-{
-	return counter('move_tables_shared') + counter('relations_restored');
-}
-
 my $rows = q{SELECT count(*) || ':' || sum(v) FROM ks.t};
 
 # main and b at c0; each round, main commits (its pages kept), then moves
@@ -84,10 +77,10 @@ $main->query_safe(q{INSERT INTO ks.t VALUES (777777, 7, 'main only')});
 $reader->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class WHERE false});
 $main->query_safe(q{DELETE FROM ks.t WHERE id = 777777});
 my $c1 = main_commits(1);
-my $shared = given();
+my $shared = counter('move_tables_shared');
 my $applied = counter('apply_rows');
 $mover->query_safe(qq{SELECT dolt_reset('--hard', '$c1'); SELECT pg_stat_force_next_flush()});
-is(given(), $shared, 'an older snapshot open: no kept pages shared');
+is(counter('move_tables_shared'), $shared, 'an older snapshot open: no kept pages shared');
 cmp_ok(counter('apply_rows'), '>', $applied, 'the rows written');
 is($mover->query_safe($rows), at_round(1), 'the reset branch has the commit\'s rows');
 is($reader->query_safe(q{SELECT count(*) FROM ks.t WHERE id = 777777}), '0',
@@ -98,9 +91,9 @@ is($reader->query_safe($rows), at_round(1), 'and after, the commit\'s rows');
 # with no older snapshot, the same reset shares the kept pages
 $mover->query_safe(q{UPDATE ks.t SET v = 0 WHERE id <= 6000});
 my $c2 = main_commits(2);
-$shared = given();
+$shared = counter('move_tables_shared');
 $mover->query_safe(qq{SELECT dolt_reset('--hard', '$c2'); SELECT pg_stat_force_next_flush()});
-cmp_ok(given(), '>', $shared, 'no older snapshot: the kept pages shared');
+cmp_ok(counter('move_tables_shared'), '>', $shared, 'no older snapshot: the kept pages shared');
 is($mover->query_safe($rows), at_round(2), 'with the commit\'s rows');
 
 # 2. the mover's own snapshot is older than the keeping (repeatable read,
@@ -112,13 +105,13 @@ foreach my $level ('REPEATABLE READ', 'SERIALIZABLE')
 	$mover->query_safe(q{UPDATE ks.t SET v = 0 WHERE id <= 6000});
 	$mover->query_safe(qq{BEGIN ISOLATION LEVEL $level; SELECT count(*) FROM ks.t});
 	my $c = main_commits($round);
-	$shared = given();
+	$shared = counter('move_tables_shared');
 	$mover->query_safe(qq{SELECT dolt_reset('--hard', '$c')});
 	is($mover->query_safe($rows), at_round($round),
 		lc($level) . ': the reset reads the commit\'s rows');
 	$mover->query_safe('COMMIT');
 	$mover->query_safe('SELECT pg_stat_force_next_flush()');
-	is(given(), $shared, lc($level) . ': no kept pages shared');
+	is(counter('move_tables_shared'), $shared, lc($level) . ': no kept pages shared');
 	is($mover->query_safe($rows), at_round($round), lc($level) . ': and after');
 }
 

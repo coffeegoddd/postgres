@@ -14,7 +14,7 @@ CREATE EXTENSION test_prolly;
 RESET client_min_messages;
 CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
-	WHERE name IN ('apply_rows', 'relations_restored', 'pages_kept')
+	WHERE name IN ('apply_rows', 'relations_restored', 'move_tables_shared', 'pages_kept')
 $$;
 CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
 LANGUAGE sql AS $$
@@ -78,8 +78,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
         name        | case 
 --------------------+------
  apply_rows         |    0
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 5) AS at_c5,
 	NOT EXISTS (SELECT FROM dolt_status) AS clean;
@@ -121,8 +122,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
         name        | case 
 --------------------+------
  apply_rows         |    0
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 30) AS at_c30;
  at_c30 
@@ -170,8 +172,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
         name        | case 
 --------------------+------
  apply_rows         |    0
- relations_restored |    1
-(2 rows)
+ move_tables_shared |    1
+ relations_restored |    0
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
  at_c12 
@@ -240,8 +243,9 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::i
         name        | case 
 --------------------+------
  apply_rows         |    1
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 39) AS at_c39;
  at_c39 
@@ -297,8 +301,9 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::i
         name        | case 
 --------------------+------
  apply_rows         |    1
- relations_restored |    1
-(2 rows)
+ move_tables_shared |    1
+ relations_restored |    0
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 33) AS at_c33;
  at_c33 
@@ -421,8 +426,9 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value <= 3 * 100)::int
         name        | value 
 --------------------+-------
  apply_rows         |     1
- relations_restored |     7
-(2 rows)
+ move_tables_shared |     1
+ relations_restored |     0
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 100) AS at_merge,
 	NOT EXISTS (SELECT FROM dolt_status) AS clean;

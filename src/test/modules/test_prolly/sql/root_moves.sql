@@ -16,7 +16,7 @@ RESET client_min_messages;
 
 CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
-	WHERE name IN ('apply_rows', 'relations_restored', 'pages_kept')
+	WHERE name IN ('apply_rows', 'relations_restored', 'move_tables_shared', 'pages_kept')
 $$;
 CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
 LANGUAGE sql AS $$

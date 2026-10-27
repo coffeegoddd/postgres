@@ -341,10 +341,16 @@ typedef struct BranchOpsRoutine
 	 * new storage as restore() carries it, carried[] naming each there
 	 * (every one of them, the root shared included); with another's,
 	 * carried[] is carry[] as it is (carry may then be NULL, ncarry 0).
+	 * With replaced (and renewed) not NULL, the storage each relation had
+	 * isn't dropped but named in replaced[], each relation's new storage in
+	 * renewed[] (one for each, in order), for the caller to keep for the
+	 * snapshots older than the move, as restore()'s replaced[] are kept.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept, const BranchKeptRelation *carry,
 							   int ncarry, BranchKeptRelation *carried,
+							   BranchKeptRelation *renewed,
+							   BranchKeptRelation *replaced,
 							   BranchLockWait *wait);
 
 	/*
