@@ -4911,7 +4911,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 	UnlockReleaseBuffer(chgbuf);
 	UnlockReleaseBuffer(headerbuf);
 
-	MarkBufferedPagesShared();
+	MarkRelationPagesShared(reln->smgr_rlocator.locator);
 }
 
 /*
@@ -5797,8 +5797,9 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 
 /*
  * preserve_header_lock(), with 'concurrent': the relation's writers aren't
- * kept out.  Then each walk, its header held, first has every cached page
- * prepared again before it next changes (MarkBufferedPagesShared()): a
+ * kept out.  Then each walk, its header held, first has each of the
+ * relation's cached pages prepared again before it next changes
+ * (MarkRelationPagesShared(), only its pages): a
  * writer's next change of one of the relation's pages waits for the
  * header (its preparation reads the map's epoch under it) and, once the
  * caller has raised the epoch, copies it.  What may still change a page
@@ -5836,7 +5837,7 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
 		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel,
 				   BMAP_FORKNUM, 0);
 		if (concurrent)
-			MarkBufferedPagesShared();
+			MarkRelationPagesShared(rel);
 		header = PageGetBmapHeader(BufferGetPage(headerbuf));
 		if (own)
 			own->n = 0;
@@ -6281,7 +6282,8 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 * or pruning can change it, and either holds for dst too, whose page is
 	 * the same (and gets it when flushed, below).
 	 */
-	MarkBufferedPagesShared();
+	MarkRelationPagesShared(src->smgr_rlocator.locator);
+	MarkRelationPagesShared(dst->smgr_rlocator.locator);
 
 	/*
 	 * The shared blocks get src's latest pages.  The PRESERVE images logged
@@ -6719,7 +6721,7 @@ bmap_snapshot_take(SMgrRelation reln)
 	BlockList	own = {0};
 	uint64		id = snapshot_take_slot(reln, &own);
 
-	MarkBufferedPagesShared();
+	MarkRelationPagesShared(reln->smgr_rlocator.locator);
 	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
 	if (own.n > 0)
 		store_flush_end(reln->smgr_rlocator.locator, false);
@@ -6750,7 +6752,8 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 		ids[i] = snapshot_take_slot(rels[i], &own[i]);
 		INJECTION_POINT("bmap-snapshot-slot-taken", NULL);
 	}
-	MarkBufferedPagesShared();
+	for (int i = 0; i < n; i++)
+		MarkRelationPagesShared(rels[i]->smgr_rlocator.locator);
 	for (int i = 0; i < n; i++)
 	{
 		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
@@ -9868,7 +9871,8 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 								   InvalidRelFileNumber, 0);
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
 	}
-	MarkBufferedPagesShared();
+	for (int i = 0; i < n; i++)
+		MarkRelationPagesShared(rels[i]->smgr_rlocator.locator);
 	for (int i = 0; i < n; i++)
 	{
 		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
@@ -9908,7 +9912,12 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
 		if (ok)
 			done++;
 	}
-	MarkBufferedPagesShared();
+
+	/*
+	 * (no raise of every page's generation: each relation's walk raised its
+	 * own under its header, its writers' next changes waiting for the header
+	 * and then seeing the raised epoch)
+	 */
 	for (int i = 0; i < done; i++)
 	{
 		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
@@ -9938,7 +9947,7 @@ bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
 	BlockList	own = {0};
 	BmapRootId	id = root_capture_slot(reln, &own, true, false, of, live_epoch);
 
-	MarkBufferedPagesShared();
+	MarkRelationPagesShared(reln->smgr_rlocator.locator);
 	FlushRelationsAllBuffers(&reln, 1);
 	store_flush_end(reln->smgr_rlocator.locator, false);
 	INJECTION_POINT("bmap-roots-captured", NULL);
@@ -10590,7 +10599,7 @@ bmap_raise_epoch(SMgrRelation reln)
 	PageSetLSN(BufferGetPage(headerbuf), lsn);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(headerbuf);
-	MarkBufferedPagesShared();
+	MarkRelationPagesShared(rel);
 	return hdelta.epoch;
 }
 

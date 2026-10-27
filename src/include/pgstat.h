@@ -834,9 +834,12 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_ROOTS_FROZEN_LATER,	/* kept commits whose roots,
 										 * captured among writers, were
 										 * frozen after */
+	PGSTAT_PROLLY_BUFFER_GENERATIONS,	/* raises of every cached page's
+										 * generation of sharing */
+	PGSTAT_PROLLY_BUFFER_REL_GENERATIONS,	/* and of one relation's */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_ROOTS_FROZEN_LATER + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BUFFER_REL_GENERATIONS + 1)
 
 typedef struct PgStat_ProllyStats
 {
