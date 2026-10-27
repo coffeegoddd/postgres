@@ -38,11 +38,10 @@
  *				   its tree (a byte, its high bit set if the tree has
  *				   any), the tree's root, count of moves and last move's
  *				   date if so (as a remote-tracking branch's log's entry
- *				   holds them), then each such move's date (the first's 8
- *				   bytes big-endian, each after it a varint of the time
- *				   since the one before) and commit (its hash's length and
- *				   the hash's bytes complemented), but the last move's,
- *				   the head's
+ *				   holds them), then each such move's date (8 bytes
+ *				   big-endian: so many bytes whatever the time between
+ *				   moves) and commit (its hash's length and the hash's
+ *				   bytes complemented), but the last move's, the head's
  *	'Y' name	-> the transaction that last moved its baseline (the same)
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
@@ -11673,18 +11672,12 @@ tail_moves(const StringInfoData *v, const ProllyHash *head, LogMove *moves,
 				 errmsg("a prolly head log is corrupt")));
 	for (int i = 0; i < n; i++)
 	{
-		if (i == 0)
-		{
-			if (end - p < 8)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("a prolly head log is corrupt")));
-			moves[i].at = (TimestampTz) get_be64_at(p);
-			p += 8;
-		}
-		else
-			moves[i].at = moves[i - 1].at +
-				(TimestampTz) prolly_get_varint(&p, end);
+		if (end - p < 8)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly head log is corrupt")));
+		moves[i].at = (TimestampTz) get_be64_at(p);
+		p += 8;
 		if (i < n - 1)
 			p = get_log_id(p, end, &moves[i].commit);
 		else
@@ -11763,10 +11756,7 @@ head_log_note(const char *name, const ProllyHash *was, const ProllyHash *head,
 		put_log_state(mover, &ls);
 	for (int i = 0; i < n; i++)
 	{
-		if (i == 0)
-			put_uint64(mover, (uint64) tail[i].at);
-		else
-			prolly_put_varint(mover, (uint64) (tail[i].at - tail[i - 1].at));
+		put_uint64(mover, (uint64) tail[i].at);
 		if (i < n - 1)
 			put_log_id(mover, &tail[i].commit);
 	}
