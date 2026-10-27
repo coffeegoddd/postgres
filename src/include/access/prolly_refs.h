@@ -786,8 +786,9 @@ typedef struct ProllyRefsRoutine
 	/*
 	 * Optional: visit the branches keeping pages as of commit (data NULL),
 	 * or as of a commit one of whose kept tables has the data tree data,
-	 * each with that commit (none retired).  A seek of an index: the work
-	 * is in those, however many branches there are.
+	 * each with that commit (none retired).  A seek of each branch keeping
+	 * any (by the commit's height, or its index of data trees): the work
+	 * is in those branches, not in what they keep.
 	 */
 	void		(*kept_holders) (const ProllyHash *commit, const ProllyHash *data,
 								 ProllyKeptHolderVisit visit, void *arg);

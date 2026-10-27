@@ -56,6 +56,7 @@
 #include "access/prolly_jsontree.h"
 #include "access/prolly_toast.h"
 #include "utils/array.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -1432,9 +1433,10 @@ bytes_hex(const uint8 *p, int n)
 
 /*
  * test_refs_index(): the refs' index entries, from the chunk store's root
- * (what committed): each one's tag; the branch it names; what it is keyed
- * by, in hex (the hashes, length first, and a root's kind byte), or for
- * the case-folded names the name folded; and its value, in hex.
+ * (what committed): each one's tag ('y' for a branch's index of its kept
+ * commits' data trees); the branch it names; what it is keyed by, in hex
+ * (the hashes, length first, and a root's kind byte), or for the
+ * case-folded names the name folded; and its value, in hex.
  */
 PG_FUNCTION_INFO_V1(test_refs_index);
 Datum
@@ -1466,10 +1468,22 @@ test_refs_index(PG_FUNCTION_ARGS)
 		int			skip = 0;
 		char	   *keyed;
 
-		if (tag == 'k' || tag == 'r')
+		/* (a branch's index of its kept commits' data trees: '~' name '\0' 'y') */
+		if (tag == '~')
+		{
+			const uint8 *nul = memchr(p, '\0', end - p);
+
+			if (nul == NULL || nul + 1 >= end || nul[1] != 'y')
+				continue;
+			values[0] = CStringGetTextDatum("y");
+			values[1] = PointerGetDatum(cstring_to_text_with_len((const char *) p, nul - p));
+			values[2] = CStringGetTextDatum(bytes_hex(nul + 2, end - (nul + 2)));
+			values[3] = CStringGetTextDatum(bytes_hex(v.data, v.len));
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			continue;
+		}
+		if (tag == 'r')
 			skip = 1;
-		else if (tag == 's')
-			skip = 2;
 		else if (tag != 'f')
 			continue;
 		for (int i = 0; i < skip && p < end; i++)
@@ -2920,6 +2934,39 @@ test_window_retire_due(PG_FUNCTION_ARGS)
 	values[3] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
+}
+
+/*
+ * test_window_config_set(name, value): a history window setting of the
+ * database's refs set (NULL: unset), as the background notes it.
+ */
+PG_FUNCTION_INFO_V1(test_window_config_set);
+Datum
+test_window_config_set(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, config_set, name,
+				PG_ARGISNULL(1) ? NULL :
+				psprintf(INT64_FORMAT, PG_GETARG_INT64(1)));
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_hold_sever_turn(): the severs' turn taken, as a sever takes it, to
+ * the transaction's end.
+ */
+PG_FUNCTION_INFO_V1(test_hold_sever_turn);
+Datum
+test_hold_sever_turn(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, PROLLY_HORIZON_LOCK_CLASSID, 1, 0);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(test_logical_horizon);
