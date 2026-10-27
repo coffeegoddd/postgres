@@ -64,11 +64,22 @@ typedef struct ProllyReclaimRoutine
 	 */
 	bool		(*retire) (uint32 lo, uint32 hi, bool if_free,
 						   ProllyGcResult *result);
+
+	/*
+	 * Optional, with retire: the generations a retire is worth running on
+	 * now, false if none: the oldest whose settled files are thought at
+	 * least half garbage (the store's estimates), with the next ones as
+	 * garbage after them while their files' bytes stay within budget (the
+	 * first taken whatever its size), none newer than max_hi.  Generations
+	 * whose files a conjoin merged go together.
+	 */
+	bool		(*choose) (uint64 budget, uint32 max_hi, uint32 *lo,
+						   uint32 *hi);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \
-	"collect", "move", "retire"
+	"collect", "move", "retire", "choose"
 #define PROLLY_RECLAIM_FIRST_CALLBACK collect
-#define PROLLY_RECLAIM_LAST_CALLBACK retire
+#define PROLLY_RECLAIM_LAST_CALLBACK choose
 
 #endif							/* PROLLY_RECLAIM_H */

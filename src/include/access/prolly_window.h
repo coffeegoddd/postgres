@@ -34,7 +34,10 @@
  *   warning), delete (the horizon records the fragment, none of it kept
  *   elsewhere), or none (nothing).  It holds every ref and the horizon's lock, and is the
  *   database owner's.  Its result says what was done.  A collection after
- *   the transaction commits frees what only the fragment reached.
+ *   the transaction commits frees what only the fragment reached; the
+ *   sever notes what it leaves garbage in the chunk store's estimates
+ *   (note_garbage(), where the store has it), by which a retire of the
+ *   generations holding it is chosen.
  * - maintain() severs the history window in the background, as sever()
  *   does with the database's action, as the database's owner, once a
  *   lineage's cut (rounded down to its batch; an hour where the window
