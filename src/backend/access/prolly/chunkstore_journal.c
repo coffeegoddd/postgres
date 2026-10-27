@@ -7305,6 +7305,34 @@ settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
 	return oldest;
 }
 
+/*
+ * The generation settled file f of m's (by its place in m) lists a chunk
+ * by in its section (0: it doesn't).
+ */
+static uint32
+settled_listed_epoch(ProllyChunkStore *s, const Manifest *m, int f,
+					 const ProllyHash *hash)
+{
+	ListCell   *lc;
+	HTAB	   *cache = NULL;
+	bool		always = false;
+	uint32		e = 0;
+
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+
+		if (t->id == m->files[f].id)
+		{
+			e = listed_epoch(t, &cache, CurrentMemoryContext, hash, &always);
+			break;
+		}
+	}
+	if (cache)
+		hash_destroy(cache);
+	return e;
+}
+
 /* settle()'s: a root, and the generation the settled files list it by */
 typedef struct SettleRoot
 {
@@ -7361,7 +7389,7 @@ settle_root_cmp(const void *a, const void *b)
 static void
 journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 			   const uint32 *epochs, int nroots, ProllySettleAbsent absent,
-			   void *arg)
+			   ProllySettleNamedBy named_by, void *arg)
 {
 	Manifest	m;
 	bool	   *keep;
@@ -7418,6 +7446,40 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 			r->epoch = 0;
 		r->given = epochs ? epochs[i] : 0;
 	}
+
+	/*
+	 * A root goes back to the generation of the file of what names it from
+	 * outside (a severed commit's, kept: its data is as old as it), or the
+	 * one that file lists it by; checked against it below.
+	 */
+	if (named_by != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		SettleRoot *r;
+
+		hash_seq_init(&status, listed);
+		while ((r = hash_seq_search(&status)) != NULL)
+		{
+			ProllyHash *by = NULL;
+			int			nby = named_by(arg, &r->hash, &by);
+
+			for (int b = 0; b < nby; b++)
+			{
+				ProllyHash	bkey;
+				int			f;
+				uint32		e;
+
+				hash_key(&bkey, &by[b]);
+				f = settled_file(s, &m, &bkey);
+				if (f < 0)
+					continue;
+				e = settled_listed_epoch(s, &m, f, &r->hash);
+				r->given = e > 0 ? e : m.files[f].epoch_lo;
+			}
+			if (by)
+				pfree(by);
+		}
+	}
 	foreach(lc, s->tables)
 	{
 		TableFile  *t = lfirst(lc);
@@ -7465,6 +7527,7 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 		int			head = 0;
 		int			tail = 0;
 		List	   *group = NIL;
+		int			first = g;
 
 		for (; g < nordered && order[g].epoch == epoch; g++)
 			queue[tail++] = order[g].hash;
@@ -7478,6 +7541,43 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots,
 				epoch_lo = m.files[i].epoch_lo;
 				epoch_hi = m.files[i].epoch_hi;
 			}
+		}
+
+		/*
+		 * Each chunk naming a root from outside, if settled, as new as the
+		 * generation the root goes back to, and listing it by that one if
+		 * newer; else nothing is settled, since the generations would name
+		 * a newer chunk unlisted.
+		 */
+		for (int i = first; i < g && named_by != NULL && epoch > 0; i++)
+		{
+			ProllyHash *by = NULL;
+			int			nby = named_by(arg, &order[i].hash, &by);
+
+			for (int b = 0; b < nby; b++)
+			{
+				ProllyHash	bkey;
+				int			f;
+				uint32		e;
+
+				hash_key(&bkey, &by[b]);
+				f = settled_file(s, &m, &bkey);
+				if (f < 0)
+					continue;
+				e = settled_listed_epoch(s, &m, f, &order[i].hash);
+				if (m.files[f].epoch_hi < epoch_lo ||
+					(m.files[f].epoch_lo > epoch_hi &&
+					 (e < epoch_lo || e > epoch_hi)))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("chunk %s would be settled in generations %u to %u, which chunk %s naming it, of generations %u to %u, doesn't list it by",
+									prolly_hash_hex(&order[i].hash), epoch_lo,
+									epoch_hi, prolly_hash_hex(&by[b]),
+									m.files[f].epoch_lo, m.files[f].epoch_hi),
+							 errdetail("Nothing was settled.")));
+			}
+			if (by)
+				pfree(by);
 		}
 		while (head < tail)
 		{
@@ -8679,6 +8779,15 @@ verify_ref(const ProllyHash *ref, void *arg)
 				 errmsg("chunk %s of table file \"%s\" names chunk %s of an older generation, which its section doesn't list",
 						prolly_hash_hex(vr->chunk), self->t->path,
 						prolly_hash_hex(ref))));
+
+	/*
+	 * Only a newer generation has it, and the file lists it: an edge the
+	 * history horizon cut (a severed commit's data, dropped then, listed
+	 * by the generation it was in), the chunk made again since.  A repair
+	 * puts the commit's data back beside it.
+	 */
+	if (newer && x != NULL)
+		return;
 	if (newer)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),

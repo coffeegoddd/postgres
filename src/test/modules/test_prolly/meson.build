@@ -487,6 +487,8 @@ tests += {
       't/764_root_holds.pl',
       't/790_root_retention_concurrent.pl',
       't/766_frozen_restore_vm.pl',
+      't/767_copied_maps_minimal.pl',
+      't/768_lazy_frozen_vm.pl',
       't/780_root_index_ams_writers.pl',
       't/781_root_vector_indexes.pl',
       't/782_root_records_redo.pl',
