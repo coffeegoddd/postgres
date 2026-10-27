@@ -84,7 +84,8 @@ adapts.
   objects to shared ones ([historical schema design](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/11-pages-and-dolt-snapshots.md)).
   Until [#1073](https://github.com/coffeegoddd/postgres/issues/1073), a
   commit refuses operators, operator classes and families, conversions
-  and text-search objects in a versioned schema (listed `not covered`).
+  and text-search objects in a versioned schema (listed `not covered`),
+  but not an extension's members: PostGIS's operators commit there.
 - **Why:** Postgres's own objects, extensions and ordinary tables keep
   working as they do in Postgres.
 - **Port:** create the case's tables in a versioned schema (the adapter

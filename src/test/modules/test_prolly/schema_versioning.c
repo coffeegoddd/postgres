@@ -96,7 +96,10 @@ extension_control_schema(CreateExtensionStmt *stmt)
 /*
  * CREATE EXTENSION makes the schema its control file names, if missing, as
  * the current user and outside the extension (so DROP EXTENSION leaves
- * it); it is made here first, the same way, but versioned.
+ * it).  It is made here first, also as the current user and outside the
+ * extension, but versioned.  Unlike CREATE EXTENSION's, it is made before
+ * the command starts, so event triggers aren't told of it: ddl_command_end
+ * reports only the extension.
  */
 static void
 make_extension_schema(CreateExtensionStmt *stmt)
