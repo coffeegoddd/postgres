@@ -192,6 +192,7 @@ tests += {
       'compared_folds',
       'fold_on_commit',
       'fold_leaf_reads',
+      'exact_counts',
       'row_locations',
       'describe_caches',
       'nearest_source',
