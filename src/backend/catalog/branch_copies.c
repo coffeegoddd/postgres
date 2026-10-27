@@ -51,8 +51,10 @@
 #include "access/relation.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
@@ -565,12 +567,129 @@ kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
 	return n == 0 && nblocks == root_nblocks;
 }
 
+static bool heap_format(Form_pg_class c);
+
+/*
+ * The visibility map of storage dst, just made of frozen root k of
+ * relation c's storage src (c's pages as of k's commit, frozen: see the
+ * root freezer), changed since: a copy of src's map, true of each page
+ * unchanged since the root (one src's map calls all-visible held only
+ * versions every snapshot sees, so its frozen copy, unchanged too, does),
+ * with each page changed since (or past src's length, under the root's)
+ * set from its frozen copy: all-visible and all-frozen if its all-visible
+ * flag is set (no dead line pointer left, every version frozen), neither
+ * otherwise.  Each map page set is logged as an image.  O(the map's pages
+ * and the pages changed).  Nothing if k isn't a frozen root of src's (src
+ * then gets no map, as before VACUUM).
+ */
+static void
+frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
+				 SMgrRelation src, RelFileLocator dst)
+{
+	BlockNumber root_nblocks;
+	BlockNumber nblocks;
+	BlockNumber *blknos = NULL;
+	BlockNumber *all;
+	uint8	   *flags;
+	uint32		since;
+	uint32		n;
+	uint32		m = 0;
+	SMgrRelation dsrel = smgropen(dst, INVALID_PROC_NUMBER);
+	Relation	rel;
+	Buffer		vmbuf = InvalidBuffer;
+
+	if (!heap_format(c) || k->frozenxid != FrozenTransactionId ||
+		!bmap_root_held(src->smgr_rlocator.locator, k->snapshot, &root_nblocks) ||
+		!bmap_root_base(src, k->snapshot, &since))
+		return;
+
+	/* src's map, as it is (its pages written out, looked up alone) */
+	if (smgrexists(src, VISIBILITYMAP_FORKNUM))
+	{
+		BlockNumber vmblocks = smgrnblocks(src, VISIBILITYMAP_FORKNUM);
+		BlockNumber *vb = palloc_array(BlockNumber, Max(vmblocks, 1));
+
+		for (BlockNumber b = 0; b < vmblocks; b++)
+			vb[b] = b;
+		FlushRelationBlocks(src, VISIBILITYMAP_FORKNUM, vb, vmblocks);
+		pfree(vb);
+		smgrcreate(dsrel, VISIBILITYMAP_FORKNUM, false);
+		log_smgrcreate(&dst, VISIBILITYMAP_FORKNUM);
+		RelationCopyStorage(src, dsrel, VISIBILITYMAP_FORKNUM,
+							RELPERSISTENCE_PERMANENT);
+	}
+
+	/* the pages it isn't true of: changed since, or src's no longer */
+	n = bmap_changed_pages(src, since, &blknos, &nblocks);
+	all = palloc_array(BlockNumber, n + (root_nblocks > nblocks ?
+										 root_nblocks - nblocks : 0) + 1);
+	for (uint32 i = 0; i < n; i++)
+		if (blknos[i] < nblocks)
+			all[m++] = blknos[i];
+	for (BlockNumber b = nblocks; b < root_nblocks; b++)
+		all[m++] = b;
+	flags = palloc0_array(uint8, Max(m, 1));
+	for (uint32 i = 0; i < m; i++)
+	{
+		Buffer		buf;
+
+		if (all[i] >= root_nblocks)
+			continue;
+		buf = ReadBufferWithoutRelcache(dst, MAIN_FORKNUM, all[i], RBM_NORMAL,
+										NULL, true);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(BufferGetPage(buf)) && PageIsAllVisible(BufferGetPage(buf)))
+			flags[i] = VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN;
+		UnlockReleaseBuffer(buf);
+	}
+
+	/*
+	 * (each map page's bits set under its lock, the page logged once as an
+	 * image after; a page past the map's end is made only for a bit set)
+	 */
+	rel = CreateFakeRelcacheEntry(dst);
+	for (uint32 i = 0; i < m; i++)
+	{
+		bool		last;
+
+		if (!BufferIsValid(vmbuf) || !visibilitymap_pin_ok(all[i], vmbuf))
+		{
+			if (flags[i] == 0 && !smgrexists(dsrel, VISIBILITYMAP_FORKNUM))
+				continue;
+			visibilitymap_pin(rel, all[i], &vmbuf);
+			LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+			START_CRIT_SECTION();
+		}
+		if (flags[i] != 0)
+			(void) visibilitymap_set(all[i], vmbuf, flags[i], dst);
+		else
+			(void) visibilitymap_clear(dst, all[i], vmbuf,
+									   VISIBILITYMAP_VALID_BITS);
+		last = i + 1 == m || !visibilitymap_pin_ok(all[i + 1], vmbuf);
+		if (last)
+		{
+			MarkBufferDirty(vmbuf);
+			log_newpage_buffer(vmbuf, false);
+			END_CRIT_SECTION();
+			LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+		}
+	}
+	if (BufferIsValid(vmbuf))
+		ReleaseBuffer(vmbuf);
+	FreeFakeRelcacheEntry(rel);
+	if (blknos)
+		pfree(blknos);
+	pfree(all);
+	pfree(flags);
+}
+
 /*
  * Storage of a relation's copy made of the pages kept by root k of its
  * storage: O(1).  If the relation changed since, its row takes the
  * oldest transaction ids they hold, and claims no page all-visible (the
- * copy has no visibility map); if not, the copy gets its maps too, as a
- * copy of the storage would, and its row says what the source's does.
+ * copy has no visibility map, but of a frozen root: frozen_root_maps());
+ * if not, the copy gets its maps too, as a copy of the storage would, and
+ * its row says what the source's does.
  */
 static RelFileNumber
 copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
@@ -599,6 +718,7 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	}
 	(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
 										 k->snapshot, NULL, NULL, src, true);
+	frozen_root_maps(c, k, src, class_locator(c, relnumber));
 	if (TransactionIdIsNormal(k->frozenxid))
 		c->relfrozenxid = k->frozenxid;
 	if (MultiXactIdIsValid(k->minmxid))
@@ -2239,6 +2359,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 											 smgropen(class_locator(oc, oc->relfilenode),
 													  INVALID_PROC_NUMBER),
 											 NULL, true);
+		frozen_root_maps(oc, k, smgropen(kept_locator(k), INVALID_PROC_NUMBER),
+						 class_locator(oc, relnumber));
 
 		/* (the root keeps the pages still: the new storage is of it) */
 		renewed[i].relfilenumber = relnumber;
@@ -2382,6 +2504,10 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 											 k->snapshot, NULL, NULL,
 											 other ? smgropen(sources[i], INVALID_PROC_NUMBER) : NULL,
 											 true);
+		frozen_root_maps(oc, k,
+						 smgropen(other ? sources[i] : kept_locator(k),
+								  INVALID_PROC_NUMBER),
+						 class_locator(oc, relnumber));
 		if (renewed != NULL)
 		{
 			renewed[i] = *k;

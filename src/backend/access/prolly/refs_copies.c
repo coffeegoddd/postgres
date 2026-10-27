@@ -361,7 +361,7 @@
  * 23: kept relations' pages by roots their page stores keep (not
  * snapshots their storage keeps), and each kept commit's time.
  */
-#define REFS_FORMAT		"23"
+#define REFS_FORMAT		"24"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
