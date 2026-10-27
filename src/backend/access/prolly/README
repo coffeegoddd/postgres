@@ -961,6 +961,19 @@ all; dropping a database forgets its entries.  A transaction's entries
 are everyone's only once it commits (pg_stat_prolly's commit_cache_hits
 and commit_cache_misses).
 
+Each branch has a head log (the refs' head_at() and head_moves()): its
+head's moves in order, each with when it was made and the commit it moved
+to (a commit, a merge, a reset, a transaction's commit, a pull's
+fast-forward), with the transaction; a remote-tracking branch has one as
+fetches and pushes move it.  "The commit branch B was at at time T" is a
+seek (prolly_head_at(), prolly_head_log()), whatever dates the commits
+were given.  A log is a tree of its own, keyed by each move's date and
+number, so a move goes at its right edge; the latest moves (at most 16)
+wait in the branch's mover entry, which every move writes anyway, and go
+into the tree together, so a commit doesn't rewrite more of the refs for
+its log.  A log goes with its branch (a rename keeps it).  "The nearest
+commit at or before commit C" is no question of a log: walk C's parents.
+
 A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
@@ -1200,7 +1213,7 @@ last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
 nothing of the kept commits.  A move to a commit no root was captured at
 restores the nearest kept commit before it (by first parents, no further
-back than the oldest commit the branch's own list keeps) and writes the
+back than the oldest commit any branch's list keeps) and writes the
 rows the two differ by: an interval's, and what a merge between brought
 in.  A commit's
 pages are the commit's, whichever branch kept them: a move restores them

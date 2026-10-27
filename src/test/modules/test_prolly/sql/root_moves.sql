@@ -112,6 +112,24 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::i
 SELECT digest() = (SELECT d FROM digests WHERE n = 39) AS at_c39;
 RESET prolly.root_interval_commits;
 
+-- a branch made at the head, with a kept commit of its own, moves to a
+-- commit between main's roots as main does: by the nearest root main kept
+-- below the branch's own
+SELECT dolt_hashof('HEAD') AS at_c39_hash \gset
+SELECT dolt_branch('scratch2', :'at_c39_hash');
+SELECT dolt_checkout('scratch2');
+UPDATE rm.t SET v = -6 WHERE id = 1;
+SELECT dolt_commit('-am', 's1') IS NOT NULL AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log WHERE message = 'c33'));
+SELECT pg_stat_force_next_flush();
+SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::int
+	ELSE (value > 0)::int END FROM since(:'before') WHERE name <> 'pages_kept';
+SELECT digest() = (SELECT d FROM digests WHERE n = 33) AS at_c33;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'scratch2');
+
 -- a transaction's own commit captures a root when one is due: every
 -- commit with no interval, none within a long one
 SET dolt.transaction_commit = on;

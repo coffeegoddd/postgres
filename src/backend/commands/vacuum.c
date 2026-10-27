@@ -1718,14 +1718,6 @@ vac_update_datfrozenxid(void)
 	LockDatabaseFrozenIds(ExclusiveLock);
 
 	/*
-	 * The page stores' captured roots name the transactions that captured
-	 * and let go of them: settled first, so that none of those older than
-	 * the horizon taken next is asked of the commit log, which may forget
-	 * it once datfrozenxid advances.
-	 */
-	prolly_settle_page_stores();
-
-	/*
 	 * Initialize the "min" calculation with
 	 * GetOldestNonRemovableTransactionId(), which is a reasonable
 	 * approximation to the minimum relfrozenxid for not-yet-committed
@@ -1733,6 +1725,14 @@ vac_update_datfrozenxid(void)
 	 * cannot produce a wrong minimum by starting with this.
 	 */
 	newFrozenXid = GetOldestNonRemovableTransactionId(NULL);
+
+	/*
+	 * The page stores' captured roots name the transactions that captured
+	 * and let go of them: settled against the horizon just taken, so that
+	 * none of those older is asked of the commit log, which may forget it
+	 * once datfrozenxid advances (every one older than it has ended by now).
+	 */
+	prolly_settle_page_stores();
 
 	/*
 	 * Similarly, initialize the MultiXact "min" with the value that would be
