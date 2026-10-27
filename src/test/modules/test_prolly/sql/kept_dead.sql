@@ -12,7 +12,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_dead;
-ALTER DATABASE kept_dead SET prolly.restore_min_changes = 0;
 ALTER DATABASE kept_dead SET prolly.history_min_commits = 3;
 \c kept_dead
 SET client_min_messages = warning;
@@ -141,7 +140,6 @@ ALTER DATABASE kept_dead RESET prolly.history_min_commits;
 -- the record, so collected
 \c :home
 CREATE DATABASE kept_dead_gc;
-ALTER DATABASE kept_dead_gc SET prolly.restore_min_changes = 0;
 \c kept_dead_gc
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

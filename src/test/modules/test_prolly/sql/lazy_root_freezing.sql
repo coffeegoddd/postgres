@@ -7,7 +7,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE lazy_root_freezing;
-ALTER DATABASE lazy_root_freezing SET prolly.restore_min_changes = 0;
 \c lazy_root_freezing
 SET client_min_messages = warning;
 CREATE EXTENSION pageinspect;

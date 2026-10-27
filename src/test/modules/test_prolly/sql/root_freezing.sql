@@ -8,7 +8,6 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_freezing;
-ALTER DATABASE root_freezing SET prolly.restore_min_changes = 0;
 \c root_freezing
 SET client_min_messages = warning;
 CREATE EXTENSION pageinspect;

@@ -37,7 +37,6 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 sql(q{
 	CREATE EXTENSION injection_points;
 	CREATE EXTENSION test_prolly;
-	ALTER DATABASE postgres SET prolly.restore_min_changes = 0;
 	CREATE SCHEMA kp VERSIONED;
 	CREATE TABLE kp.t (a int, b text) WITH (fillfactor = 10);
 	INSERT INTO kp.t SELECT g, repeat('t', 300) FROM generate_series(1, 2000) g;

@@ -105,3 +105,20 @@ RESET ROLE;
 \c postgres
 DROP DATABASE sweep_db;
 DROP ROLE sweep_user;
+
+-- A branch's last table dropped: the keep after it has no relation to
+-- keep, yet the dropped table's kept roots are let go of, so its pages
+-- are freed and a sweep shortens the store past them.
+CREATE DATABASE sweep_last;
+\c sweep_last
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.junk (id int PRIMARY KEY, v text);
+INSERT INTO app.junk SELECT g, repeat('x', 500) FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'junk')::text) > 0 AS committed;
+DROP TABLE app.junk;
+SELECT length(dolt_commit('-Am', 'no junk')::text) > 0 AS committed;
+SELECT length(dolt_commit('--allow-empty', '-m', 'after')::text) > 0 AS committed;
+CHECKPOINT;
+SELECT truncated > 1000 AS shrunk FROM prolly_page_sweep();
+\c postgres
+DROP DATABASE sweep_last;
