@@ -74,8 +74,10 @@ is(on_b($digest), $at_b1, 'b1\'s rows');
 my $restored = counted('relations_restored');
 my $applied = counted('apply_rows');
 on_b(qq{SELECT dolt_reset('--hard', '$b0')});
-cmp_ok(counted('relations_restored') - $restored, '>', 0,
-	'b0 restored from its own root after the share');
+# (every kept relation of both tables, nine: u's four alone if t's roots
+# were gone, its rows then written)
+is(counted('relations_restored') - $restored, 9,
+	'b0 restored from its own roots after the share, t\'s included');
 is(counted('apply_rows') - $applied, 0, 'no row written');
 is(on_b($digest), $at_b0, 'b0\'s rows');
 is(on_b(q{SET enable_seqscan = off; SELECT count(*) FROM app.t WHERE v = 2}),
