@@ -21,6 +21,8 @@ $node->append_conf(
 autovacuum = off
 prolly_fold_worker = off
 });
+# (roots kept as captured, which keep their rows' transaction ids: frozen ones keep none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION xid_wraparound; CREATE EXTENSION test_prolly');
 

@@ -699,6 +699,40 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 }
 
 /*
+ * RelationTruncateStorage
+ *		Truncate storage no relation is open on (srel, permanent and
+ *		WAL-logged) to nblocks blocks of its main fork, as RelationTruncate()
+ *		does a relation's: logged first, then cut.  Its other forks, if any,
+ *		are left as they are.
+ */
+void
+RelationTruncateStorage(SMgrRelation srel, BlockNumber nblocks)
+{
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber old_nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	xl_smgr_truncate xlrec;
+	XLogRecPtr	lsn;
+
+	if (old_nblocks <= nblocks)
+		return;
+	smgrpretruncate(srel, &fork, 1);
+	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
+	START_CRIT_SECTION();
+	xlrec.blkno = nblocks;
+	xlrec.rlocator = srel->smgr_rlocator.locator;
+	xlrec.flags = SMGR_TRUNCATE_HEAP;
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+	XLogFlush(lsn);
+	smgrtruncate(srel, &fork, 1, &old_nblocks, &nblocks);
+	END_CRIT_SECTION();
+	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
+	smgrposttruncate(srel, &fork, 1);
+}
+
+/*
  * RelationPreTruncate
  *		Perform AM-independent work before a physical truncation.
  *
