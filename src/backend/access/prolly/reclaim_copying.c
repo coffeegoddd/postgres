@@ -619,9 +619,49 @@ horizon_read_end(int code, Datum arg)
 	WalSndHorizonReadEnd();
 }
 
+/*
+ * A chunk as a retire reads the horizon's edges through: collected, or in
+ * a settled file it doesn't collect (the refs, the boundary commits, may
+ * be in one).
+ */
+static bool
+any_read(void *arg, const ProllyHash *hash, StringInfo out)
+{
+	Mark	   *mk = arg;
+
+	return PROLLY_CALL(mk->cs, gc_read_any, mk->gc, hash, out);
+}
+
+static bool collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi,
+						   bool if_free, ProllyGcResult *result);
+
 static bool
 copying_collect(bool full, bool if_free, ProllyGcResult *result)
 {
+	return collect_scoped(full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT, 0, 0,
+						  if_free, result);
+}
+
+/*
+ * Retire generations lo to hi: what of their settled files nothing names
+ * is freed, marking only what is collected (the journal, the files not
+ * settled, and theirs), from the roots and what the other settled files'
+ * sections list in them.  A file of theirs with little garbage is kept
+ * whole; one with more rewritten, its chunks keeping their generations;
+ * one all garbage dropped.
+ */
+static bool
+copying_retire(uint32 lo, uint32 hi, bool if_free, ProllyGcResult *result)
+{
+	return collect_scoped(PROLLY_GC_RETIRE, lo, hi, if_free, result);
+}
+
+static bool
+collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
+			   ProllyGcResult *result)
+{
+	bool		full = (scope == PROLLY_GC_FULL);
+	bool		retire = (scope == PROLLY_GC_RETIRE);
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
 										  MyDatabaseTableSpace);
@@ -638,7 +678,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	 * and held until the transaction ends, so the horizon read is the one
 	 * committed and stays so)
 	 */
-	if (full)
+	if (full || retire)
 	{
 		ProllyDatabaseComponents dc;
 
@@ -649,9 +689,12 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
-	mk.gc = PROLLY_CALL(cs, gc_begin, store,
-						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT, if_free,
-						&root, &mk.nslots);
+	if (retire)
+		mk.gc = PROLLY_CALL(cs, gc_begin_retire, store, lo, hi, if_free,
+							&root, &mk.nslots);
+	else
+		mk.gc = PROLLY_CALL(cs, gc_begin, store, scope, if_free, &root,
+							&mk.nslots);
 	if (mk.gc == NULL)
 		return false;			/* (another collection running) */
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
@@ -670,7 +713,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	 * collects every file, reads them: a default one keeps what the
 	 * boundary reaches, as its settled files keep what they reach.
 	 */
-	if (full && root.len > 0)
+	if ((full || retire) && root.len > 0)
 	{
 		ProllyDatabaseComponents dc;
 
@@ -679,7 +722,8 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 		{
 			CutBuild	cb = {&mk, NIL};
 
-			PROLLY_CALL(dc.history_window, edges, &root, collected_read, &mk,
+			PROLLY_CALL(dc.history_window, edges, &root,
+						retire ? any_read : collected_read, &mk,
 						note_cut, &cb);
 		}
 	}
@@ -696,6 +740,13 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	/* what the store keeps for its own reasons */
 	PROLLY_CALL(cs, gc_retained, mk.gc, mark_new, &mk);
 	drain(&mk);
+
+	/* a retire's: what the settled files it doesn't collect name */
+	if (retire)
+	{
+		PROLLY_CALL(cs, gc_inbound, mk.gc, mark_listed, &mk);
+		drain(&mk);
+	}
 
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
@@ -725,7 +776,7 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 		drain(&mk);
 
 		/* the settled files kept whole, and what they name */
-		if (full)
+		if (full || retire)
 		{
 			Keep		k = {&mk, keep, true};
 
@@ -817,4 +868,5 @@ const ProllyReclaimRoutine prolly_reclaim_copying = {
 	},
 	.collect = copying_collect,
 	.move = copying_move,
+	.retire = copying_retire,
 };

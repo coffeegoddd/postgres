@@ -2744,6 +2744,33 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 													  values, nulls)));
 }
 
+PG_FUNCTION_INFO_V1(test_chunk_retire);
+Datum
+test_chunk_retire(PG_FUNCTION_ARGS)
+{
+	int64		lo = PG_GETARG_INT64(0);
+	int64		hi = PG_GETARG_INT64(1);
+	ProllyDatabaseComponents dc;
+	ProllyGcResult r;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (lo <= 0 || hi < lo || hi > PG_UINT32_MAX)
+		elog(ERROR, "generations %lld to %lld can't be retired",
+			 (long long) lo, (long long) hi);
+	prolly_database_components(&dc);
+	(void) PROLLY_CALL(dc.reclamation, retire, (uint32) lo, (uint32) hi,
+					   false, &r);
+	values[0] = Int64GetDatum((int64) r.chunks_kept);
+	values[1] = Int64GetDatum((int64) r.chunks_freed);
+	values[2] = Int64GetDatum((int64) r.bytes_freed);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
 PG_FUNCTION_INFO_V1(test_logical_horizon);
 Datum
 test_logical_horizon(PG_FUNCTION_ARGS)

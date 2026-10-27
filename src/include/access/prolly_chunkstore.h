@@ -240,6 +240,7 @@ typedef enum ProllyGcScope
 	PROLLY_GC_DEFAULT,
 	PROLLY_GC_FULL,
 	PROLLY_GC_JOURNAL,
+	PROLLY_GC_RETIRE,			/* gc_begin_retire()'s */
 } ProllyGcScope;
 
 /*
@@ -511,6 +512,24 @@ typedef struct ProllyChunkStoreRoutine
 							  ProllyChunkListedVisit visit, void *arg);
 	int64		(*gc_find_in) (ProllyChunkGc *gc, const ProllyHash *hash,
 							   uint32 epoch);
+
+	/*
+	 * Optional: a retire, a collection of the journal, the files not
+	 * settled, and the settled files of generations lo to hi (whole: a file
+	 * that holds some of them and others is an error), as gc_begin()
+	 * begins one.  gc_inbound() visits what the settled files it doesn't
+	 * collect name in those generations, as their sections list it:
+	 * roots, for what only they name.  gc_read_any() reads a chunk as
+	 * gc_read() does, collected or in a settled file not (false: in
+	 * neither), without the transaction noting it used the store.
+	 */
+	ProllyChunkGc *(*gc_begin_retire) (ProllyChunkStore *store, uint32 lo,
+									   uint32 hi, bool if_free,
+									   ProllyHash *root, uint64 *nslots);
+	void		(*gc_inbound) (ProllyChunkGc *gc, ProllyChunkListedVisit visit,
+							   void *arg);
+	bool		(*gc_read_any) (ProllyChunkGc *gc, const ProllyHash *hash,
+								StringInfo out);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -526,9 +545,10 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle", "verify_generations", "gc_listed", "gc_find_in"
+	"settle", "verify_generations", "gc_listed", "gc_find_in", \
+	"gc_begin_retire", "gc_inbound", "gc_read_any"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_find_in
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_read_any
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

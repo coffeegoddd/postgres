@@ -8795,7 +8795,10 @@ struct ProllyChunkGc
 	GcGroup    *groups;			/* gc_groups()', made once */
 	int			nothers;		/* settled files not collected, opened */
 	TableFile **others;
-	uint32	   *others_lo;		/* (their first generations) */
+	uint32	   *others_lo;		/* (their generations) */
+	uint32	   *others_hi;
+	uint32		retire_lo;		/* a retire's generations (0: none) */
+	uint32		retire_hi;
 	List	   *written;		/* ManifestFile *, the new files */
 	bool		window;
 	instr_time	window_began;	/* (a monotonic clock) */
@@ -9135,8 +9138,9 @@ gc_add_segment(ProllyChunkGc *gc, GcFile *f)
 }
 
 static ProllyChunkGc *
-journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
-				 ProllyHash *root, uint64 *nslots)
+gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
+				uint32 retire_hi, bool if_free, ProllyHash *root,
+				uint64 *nslots)
 {
 	bool		full = (scope == PROLLY_GC_FULL);
 	MemoryContext cxt;
@@ -9190,6 +9194,8 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 	gc->s = s;
 	gc->cxt = cxt;
 	gc->full = full;
+	gc->retire_lo = retire_lo;
+	gc->retire_hi = retire_hi;
 	gc->settle = (scope != PROLLY_GC_JOURNAL);
 	gc->level = GetCurrentTransactionNestLevel();
 	gc->keep = -1;
@@ -9264,7 +9270,20 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 		GcFile	   *f;
 		bool		settled = (gc->m.files[i].flags & MANIFEST_FILE_SETTLED) != 0;
 
-		if (settled && !full && scope != PROLLY_GC_JOURNAL)
+		/* (a retire's: whole generations, each in [retire_lo, retire_hi]) */
+		bool		retired = scope == PROLLY_GC_RETIRE && settled &&
+			gc->m.files[i].epoch_lo >= retire_lo &&
+			gc->m.files[i].epoch_hi <= retire_hi;
+
+		if (scope == PROLLY_GC_RETIRE && settled && !retired &&
+			gc->m.files[i].epoch_hi >= retire_lo &&
+			gc->m.files[i].epoch_lo <= retire_hi)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("table file %llu holds generations %u to %u, not all of them retired",
+							(unsigned long long) gc->m.files[i].id,
+							gc->m.files[i].epoch_lo, gc->m.files[i].epoch_hi)));
+		if (settled && !full && !retired && scope != PROLLY_GC_JOURNAL)
 		{
 			/* (to tell the generation of what the chunks copied name) */
 			TableFile  *t = open_table(dir, &gc->m.files[i], cxt);
@@ -9278,12 +9297,14 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 			{
 				gc->others = palloc(sizeof(TableFile *) * gc->m.nfiles);
 				gc->others_lo = palloc(sizeof(uint32) * gc->m.nfiles);
+				gc->others_hi = palloc(sizeof(uint32) * gc->m.nfiles);
 			}
 			gc->others[gc->nothers] = t;
+			gc->others_hi[gc->nothers] = gc->m.files[i].epoch_hi;
 			gc->others_lo[gc->nothers++] = gc->m.files[i].epoch_lo;
 			continue;
 		}
-		if ((settled && !full) || scope == PROLLY_GC_JOURNAL)
+		if ((settled && !full && !retired) || scope == PROLLY_GC_JOURNAL)
 			continue;
 		f = &gc->files[n++];
 		f->id = gc->m.files[i].id;
@@ -9342,6 +9363,88 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
 	pfree(dir);
 	MemoryContextSwitchTo(old);
 	return gc;
+}
+
+static ProllyChunkGc *
+journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
+				 ProllyHash *root, uint64 *nslots)
+{
+	if (scope == PROLLY_GC_RETIRE)
+		elog(ERROR, "a retire begins with gc_begin_retire()");
+	return gc_begin_scoped(s, scope, 0, 0, if_free, root, nslots);
+}
+
+static ProllyChunkGc *
+journal_gc_begin_retire(ProllyChunkStore *s, uint32 lo, uint32 hi,
+						bool if_free, ProllyHash *root, uint64 *nslots)
+{
+	if (lo == 0 || lo > hi)
+		elog(ERROR, "generations %u to %u can't be retired", lo, hi);
+	return gc_begin_scoped(s, PROLLY_GC_RETIRE, lo, hi, if_free, root,
+						   nslots);
+}
+
+static int64 journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash);
+static void journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out);
+
+/*
+ * A retire's: what the settled files it doesn't collect name in the
+ * generations it does, as their sections list it (only a newer file's
+ * can).
+ */
+static void
+journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
+{
+	if (gc->retire_lo == 0)
+		return;
+	for (int i = 0; i < gc->nothers; i++)
+	{
+		XrefSection x;
+
+		CHECK_FOR_INTERRUPTS();
+		if (gc->others_hi[i] < gc->retire_lo || !xrefs_read(gc->others[i], &x))
+			continue;
+		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
+		xrefs_free(&x);
+	}
+}
+
+/*
+ * A chunk, read as a collection reads: collected (gc_read()), or from a
+ * settled file it doesn't collect; false if neither has it.
+ */
+static bool
+journal_gc_read_any(ProllyChunkGc *gc, const ProllyHash *hash, StringInfo out)
+{
+	int64		slot = journal_gc_find(gc, hash);
+	ProllyHash	key;
+
+	if (slot >= 0)
+	{
+		journal_gc_read(gc, (uint64) slot, out);
+		return true;
+	}
+	hash_key(&key, hash);
+	for (int i = 0; i < gc->nothers; i++)
+	{
+		TableFile  *t = gc->others[i];
+		uint64		offset;
+		uint32		len;
+		char	   *bytes;
+
+		if (!PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			continue;
+		bytes = palloc(len);
+		if (!table_file_read(t, offset, bytes, len))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
+							len, (unsigned long long) offset, t->path)));
+		PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
+		pfree(bytes);
+		return true;
+	}
+	return false;
 }
 
 /*
@@ -9423,7 +9526,7 @@ journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash)
 	 * of the oldest generation, so that it keeps that one: what names it
 	 * there may be as old.
 	 */
-	if (gc->full)
+	if (gc->full || gc->retire_lo > 0)
 	{
 		for (int i = 0; i < gc->nfiles; i++)
 		{
@@ -9451,7 +9554,7 @@ journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash)
 		GcFile	   *f = &gc->files[i];
 		int			at;
 
-		if (f->segment || (gc->full && f->settled))
+		if (f->segment || ((gc->full || gc->retire_lo > 0) && f->settled))
 			continue;
 		at = PROLLY_CALL(table_format(), locate, f->t->tf, &key);
 		if (at >= 0)
@@ -10958,6 +11061,9 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.keep = journal_keep,
 	.gc_kept = journal_gc_kept,
 	.gc_retained = journal_gc_retained,
+	.gc_begin_retire = journal_gc_begin_retire,
+	.gc_inbound = journal_gc_inbound,
+	.gc_read_any = journal_gc_read_any,
 	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,

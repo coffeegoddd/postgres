@@ -139,7 +139,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  reclamation    | stub           | identity                       | pass
  reclamation    | stub           | live_chunks_never_freed        | not implemented (missing collect)
  reclamation    | stub           | keeps_what_writers_reference   | not implemented (missing collect)
- reclamation    | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+ reclamation    | stub           | complete                       | not implemented (3 of 3 callbacks missing)
  refs           | copies         | identity                       | pass
  refs           | copies         | branch_lifecycle               | no checks yet
  refs           | copies         | commit_then_resolve            | no checks yet

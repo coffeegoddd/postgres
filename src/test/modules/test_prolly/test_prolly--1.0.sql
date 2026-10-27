@@ -735,6 +735,13 @@ CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Retire the chunk store's generations lo to hi: a collection of the
+-- journal, the files not settled, and the settled files of those
+-- generations, marking only what it collects.
+CREATE FUNCTION test_chunk_retire(lo int8, hi int8, OUT kept int8,
+	OUT freed int8, OUT bytes_freed int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The oldest position a logical slot of the current database, or one of a
 -- standby's as its feedback said, may decode from (NULL: none): what a
 -- collection keeps the values the WAL names from.
