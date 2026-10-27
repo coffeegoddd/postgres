@@ -5383,6 +5383,7 @@ typedef struct PreserveWalk
 	HTAB	   *logged;			/* PreserveLogged, by physical block */
 	BlockNumber record_below;	/* recording 'logged' up to it, if valid */
 	XLogRecPtr	began;			/* the WAL's insert position as this walk began */
+	bool		concurrent;		/* writers at work: a page logged checked too */
 } PreserveWalk;
 
 typedef struct PreserveLogged
@@ -5447,6 +5448,32 @@ preserve_read_page(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk,
 		return false;
 	}
 	memcpy(dst, BufferGetPage(buf), BLCKSZ);
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/*
+ * Is page 'blkno' of 'rel' changed by no one now: its share lock had
+ * without waiting (or held by the walk)?  A walk among writers asks it of
+ * a page it logged before, as of one it logs (preserve_read_page()): a
+ * writer holding the page may change it in place yet.  False, the walk's
+ * 'busy' set, if not.
+ */
+static bool
+preserve_page_idle(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk)
+{
+	Buffer		buf;
+
+	if (walk->held_block == blkno)
+		return true;
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									NULL, true);
+	if (!ConditionalLockBufferShared(buf))
+	{
+		ReleaseBuffer(buf);
+		walk->busy = blkno;
+		return false;
+	}
 	UnlockReleaseBuffer(buf);
 	return true;
 }
@@ -5521,12 +5548,15 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
 	{
 		logged = hash_search(walk->logged, &phys, HASH_FIND, NULL);
 		if (logged && logged->blkno == blkno &&
-			preserve_page_lsn(rel, blkno, walk) < logged->since)
+			preserve_page_lsn(rel, blkno, walk) < logged->since &&
+			(!walk->concurrent || preserve_page_idle(rel, blkno, walk)))
 		{
 			if (walk->held_block == blkno)
 				preserve_release_held(walk);
 			return true;
 		}
+		if (walk->concurrent && BlockNumberIsValid(walk->busy))
+			return false;
 	}
 
 	INJECTION_POINT("bmap-preserve-page", NULL);
@@ -5688,16 +5718,47 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
  * end however many backends lock the pages meanwhile, each page logged
  * once unless it moved, and only one page held at a time.
  */
+static Buffer preserve_header_lock_ext(SMgrRelation src, BlockList *own,
+										bool concurrent);
+
 static Buffer
 preserve_header_lock(SMgrRelation src, BlockList *own)
+{
+	return preserve_header_lock_ext(src, own, false);
+}
+
+/*
+ * preserve_header_lock(), with 'concurrent': the relation's writers aren't
+ * kept out.  Then each walk, its header held, first has every cached page
+ * prepared again before it next changes (MarkBufferedPagesShared()): a
+ * writer's next change of one of the relation's pages waits for the
+ * header (its preparation reads the map's epoch under it) and, once the
+ * caller has raised the epoch, copies it.  What may still change a page
+ * the walk sees is a writer that locked it before; so every page of the
+ * walk's, those logged by an earlier walk too, must have no one holding
+ * it then (preserve_page_idle()), and a page busy gives the walk up, as
+ * above.  A walk that ends, the header still held, finds the relation's
+ * own pages each as its last change left it, none of them changing: the
+ * relation as at one moment, between any two of its changes, as a crash
+ * would leave it once its WAL was replayed (a change of several pages,
+ * as a B-tree page's split, is made under all their locks).  The walks
+ * given up are bounded (PRESERVE_CONCURRENT_WALKS): InvalidBuffer, the
+ * header not held, if they run out.
+ */
+#define PRESERVE_CONCURRENT_WALKS	32
+
+static Buffer
+preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	Buffer		headerbuf = map_read(rel, 0);
 	PreserveWalk walk = {0};
+	int			walks = 0;
 
 	walk.own = own;
 	walk.held_block = InvalidBlockNumber;
 	walk.record_below = InvalidBlockNumber;
+	walk.concurrent = concurrent;
 	for (;;)
 	{
 		BmapHeader *header;
@@ -5706,6 +5767,8 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel,
 				   BMAP_FORKNUM, 0);
+		if (concurrent)
+			MarkBufferedPagesShared();
 		header = PageGetBmapHeader(BufferGetPage(headerbuf));
 		if (own)
 			own->n = 0;
@@ -5734,6 +5797,13 @@ preserve_header_lock(SMgrRelation src, BlockList *own)
 
 		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 		INJECTION_POINT("bmap-preserve-restart", NULL);
+		if (concurrent && ++walks >= PRESERVE_CONCURRENT_WALKS)
+		{
+			if (walk.logged)
+				hash_destroy(walk.logged);
+			ReleaseBuffer(headerbuf);
+			return InvalidBuffer;
+		}
 		walk.held = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, walk.busy,
 											  RBM_NORMAL, NULL, true);
 		LockBuffer(walk.held, BUFFER_LOCK_SHARE);
@@ -9542,7 +9612,7 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
  */
 static BmapRootId
 root_capture_slot(SMgrRelation reln, BlockList *own, bool logged,
-				  RelFileNumber of, uint32 live_epoch)
+				  bool concurrent, RelFileNumber of, uint32 live_epoch)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -9591,7 +9661,14 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool logged,
 				   BMAP_FORKNUM, 0);
 	}
 	else
-		headerbuf = preserve_header_lock(reln, own);
+	{
+		headerbuf = preserve_header_lock_ext(reln, own, concurrent);
+		if (!BufferIsValid(headerbuf))
+		{
+			LockRelease(&sweeptag, ShareLock, false);
+			return 0;
+		}
+	}
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
 	if (own->n > 0 || logged)
 		store_flush_begin(rel);
@@ -9719,7 +9796,7 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 		ids[i] = 0;
 	for (int i = 0; i < n; i++)
 	{
-		ids[i] = root_capture_slot(rels[i], &own[i], false,
+		ids[i] = root_capture_slot(rels[i], &own[i], false, false,
 								   InvalidRelFileNumber, 0);
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
 	}
@@ -9738,6 +9815,48 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids)
 }
 
 /*
+ * bmap_root_capture_many(), but with the relations' writers at work: each
+ * root captured at a moment no writer is changing one of the relation's
+ * pages (preserve_header_lock_ext()'s concurrent walk), so that its pages
+ * are the relation's as at that moment, each as its last change left it.
+ * The relations are captured one after another, in the order given, each
+ * at its own moment.  False if one's writers never left it so (its walks
+ * ran out): the roots captured before it are in ids[], the rest 0.
+ */
+bool
+bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
+{
+	bool		ok = true;
+	int			done = 0;
+	BlockList  *own = palloc0_array(BlockList, Max(n, 1));
+
+	for (int i = 0; i < n; i++)
+		ids[i] = 0;
+	for (int i = 0; i < n && ok; i++)
+	{
+		ids[i] = root_capture_slot(rels[i], &own[i], false, true,
+								   InvalidRelFileNumber, 0);
+		ok = ids[i] != 0;
+		if (ok)
+			done++;
+	}
+	MarkBufferedPagesShared();
+	for (int i = 0; i < done; i++)
+	{
+		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
+		if (own[i].n > 0)
+			store_flush_end(rels[i]->smgr_rlocator.locator, false);
+	}
+	for (int i = 0; i < n; i++)
+		if (own[i].blocks)
+			pfree(own[i].blocks);
+	pfree(own);
+	if (done > 0)
+		INJECTION_POINT("bmap-roots-captured", NULL);
+	return ok;
+}
+
+/*
  * A root of reln (a copy of relation 'of' whose pages were frozen into it),
  * capture as bmap_root_capture() does, but its own pages each logged as an
  * image since their last change (log_newpage()), so none again: they are
@@ -9749,7 +9868,7 @@ BmapRootId
 bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
 {
 	BlockList	own = {0};
-	BmapRootId	id = root_capture_slot(reln, &own, true, of, live_epoch);
+	BmapRootId	id = root_capture_slot(reln, &own, true, false, of, live_epoch);
 
 	MarkBufferedPagesShared();
 	FlushRelationsAllBuffers(&reln, 1);
@@ -10413,6 +10532,23 @@ bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)
 			return false;
 	}
 	*since = r.snap.epoch;
+	return true;
+}
+
+/*
+ * The epoch root 'id' of the page store of 'store' was captured at (its
+ * relation's, raised by the capture: the pages changed since have entries
+ * of it or later), into *epoch; false if the store holds no such root.
+ */
+bool
+bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch)
+{
+	Buffer		buf;
+	xl_bmap_root r;
+
+	if (!root_read(store, id, -1, &buf, &r))
+		return false;
+	*epoch = r.snap.epoch;
 	return true;
 }
 

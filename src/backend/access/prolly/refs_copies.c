@@ -81,9 +81,20 @@
  *				   varint length, then the bytes), its data tree at the
  *				   commit (hash length, hash), the count of its
  *				   relations (a varint) and each relation's OID,
- *				   tablespace, file number, captured root (8 bytes), and
- *				   oldest unfrozen transaction and multixact ids (4 bytes
- *				   each but the snapshot, native byte order)
+ *				   tablespace, file number, captured root (8 bytes),
+ *				   oldest unfrozen transaction and multixact ids, and
+ *				   flags (BRANCH_KEPT_*) (4 bytes each but the snapshot,
+ *				   native byte order), then its frozen root's undecided
+ *				   pages (a varint count, then 4 bytes each).  After
+ *				   when it was kept, a commit's flags (a byte): with
+ *				   KEPT_UNFROZEN, its roots captured among writers are to
+ *				   be frozen as of its snapshot, which follows: xmin and
+ *				   xmax (4 bytes each), then the running transactions',
+ *				   their subtransactions' and the committing
+ *				   transaction's own ids (each a varint count, then 4
+ *				   bytes each)
+ *	'u' name	-> nothing: branch name keeps a commit whose roots are to
+ *				   be frozen (KEPT_UNFROZEN), not retired
  *	'k' commit name -> nothing: branch name keeps pages as of the commit
  *				   (hash length, hash), an entry of its 'K' not retired
  *	's' data commit name -> nothing: and that commit's kept table has the
@@ -334,6 +345,7 @@
  */
 #define TAG_KEPT_OF		'k'	/* a commit's branches keeping its pages */
 #define TAG_KEPT_TABLE	's'	/* a table's kept commits holding it */
+#define TAG_KEPT_UNFROZEN 'u'	/* a branch keeping roots to be frozen */
 #define TAG_ROOT_OF		'r'	/* a root's branches with a head or baseline at it */
 #define TAG_FOLDED		'f'	/* a branch's name, case folded */
 
@@ -361,7 +373,7 @@
  * 23: kept relations' pages by roots their page stores keep (not
  * snapshots their storage keeps), and each kept commit's time.
  */
-#define REFS_FORMAT		"23"
+#define REFS_FORMAT		"24"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -3694,13 +3706,25 @@ typedef struct KeptCommit
 	FullTransactionId kept_by;	/* who kept them, having seen every writer
 								 * of the pages end */
 	TimestampTz kept_at;		/* when */
+	bool		unfrozen;		/* roots captured among writers, to be
+								 * frozen as of the snapshot below */
+	TransactionId xmin;
+	TransactionId xmax;
+	int			nxip;
+	TransactionId *xip;
+	int			nsubxip;
+	TransactionId *subxip;
+	int			nown;
+	TransactionId *own;
 	ProllyHash	commit;
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
 	int			ntables;
 	KeptTable  *tables;
 } KeptCommit;
 
-#define KEPT_RELATION_SIZE	(5 * sizeof(uint32) + sizeof(uint64))
+#define KEPT_RELATION_SIZE	(6 * sizeof(uint32) + sizeof(uint64) + 1)
+
+#define KEPT_UNFROZEN	0x01
 
 static bool commit_height(const ProllyHash *id, int64 *height);
 
@@ -3814,6 +3838,35 @@ kept_key(StringInfo key, const char *name)
 	appendStringInfoString(key, name);
 }
 
+/* Ids (or block numbers), a varint count then 4 bytes each. */
+static void
+put_xids(StringInfo v, const uint32 *xids, int n)
+{
+	prolly_put_varint(v, n);
+	if (n > 0)
+		appendBinaryStringInfo(v, xids, n * sizeof(uint32));
+}
+
+static void kept_corrupt(void);
+
+static const char *
+get_xids(const char *p, const char *end, uint32 **xids, int *n)
+{
+	uint64		count = prolly_get_varint(&p, end);
+
+	if (count > (uint64) (end - p) / sizeof(uint32))
+		kept_corrupt();
+	*n = (int) count;
+	*xids = NULL;
+	if (count > 0)
+	{
+		*xids = palloc_array(uint32, count);
+		memcpy(*xids, p, count * sizeof(uint32));
+		p += count * sizeof(uint32);
+	}
+	return p;
+}
+
 static void
 kept_encode(StringInfo v, List *kept)
 {
@@ -3834,6 +3887,15 @@ kept_encode(StringInfo v, List *kept)
 		appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
 		appendBinaryStringInfo(v, &kc->kept_by, sizeof(FullTransactionId));
 		appendBinaryStringInfo(v, &kc->kept_at, sizeof(TimestampTz));
+		appendStringInfoChar(v, kc->unfrozen ? KEPT_UNFROZEN : 0);
+		if (kc->unfrozen)
+		{
+			appendBinaryStringInfo(v, &kc->xmin, sizeof(TransactionId));
+			appendBinaryStringInfo(v, &kc->xmax, sizeof(TransactionId));
+			put_xids(v, kc->xip, kc->nxip);
+			put_xids(v, kc->subxip, kc->nsubxip);
+			put_xids(v, kc->own, kc->nown);
+		}
 		put_hash(v, &kc->commit);
 		put_hash(v, &kc->baseline);
 		prolly_put_varint(v, kc->ntables);
@@ -3855,6 +3917,8 @@ kept_encode(StringInfo v, List *kept)
 				appendBinaryStringInfo(v, &k->snapshot, sizeof(uint64));
 				appendBinaryStringInfo(v, &k->frozenxid, sizeof(uint32));
 				appendBinaryStringInfo(v, &k->minmxid, sizeof(uint32));
+				appendBinaryStringInfo(v, &k->flags, sizeof(uint32));
+				put_xids(v, k->undecided, k->nundecided);
 			}
 		}
 	}
@@ -3893,6 +3957,20 @@ kept_decode(const char *p, const char *end)
 		p += sizeof(FullTransactionId);
 		memcpy(&kc->kept_at, p, sizeof(TimestampTz));
 		p += sizeof(TimestampTz);
+		if (end - p < 1)
+			kept_corrupt();
+		kc->unfrozen = (*p++ & KEPT_UNFROZEN) != 0;
+		if (kc->unfrozen)
+		{
+			if (end - p < (ptrdiff_t) (2 * sizeof(TransactionId)))
+				kept_corrupt();
+			memcpy(&kc->xmin, p, sizeof(TransactionId));
+			memcpy(&kc->xmax, p + sizeof(TransactionId), sizeof(TransactionId));
+			p += 2 * sizeof(TransactionId);
+			p = get_xids(p, end, &kc->xip, &kc->nxip);
+			p = get_xids(p, end, &kc->subxip, &kc->nsubxip);
+			p = get_xids(p, end, &kc->own, &kc->nown);
+		}
 		p = get_hash(p, end, &kc->commit);
 		p = get_hash(p, end, &kc->baseline);
 		n = prolly_get_varint(&p, end);
@@ -3923,7 +4001,10 @@ kept_decode(const char *p, const char *end)
 				memcpy(&k->snapshot, p + 12, sizeof(uint64));
 				memcpy(&k->frozenxid, p + 20, sizeof(uint32));
 				memcpy(&k->minmxid, p + 24, sizeof(uint32));
-				p += KEPT_RELATION_SIZE;
+				memcpy(&k->flags, p + 28, sizeof(uint32));
+				p += KEPT_RELATION_SIZE - 1;
+				p = get_xids(p, end, (TransactionId **) &k->undecided,
+							 (int *) &k->nundecided);
 			}
 		}
 		kept = lappend(kept, kc);
@@ -3958,6 +4039,7 @@ static List *
 kept_index_keys(const char *name, List *kept)
 {
 	List	   *keys = NIL;
+	bool		unfrozen = false;
 
 	foreach_ptr(KeptCommit, kc, kept)
 	{
@@ -3965,6 +4047,7 @@ kept_index_keys(const char *name, List *kept)
 
 		if (FullTransactionIdIsValid(kc->retired))
 			continue;
+		unfrozen |= kc->unfrozen;
 		k = makeStringInfo();
 		appendStringInfoChar(k, TAG_KEPT_OF);
 		put_hash(k, &kc->commit);
@@ -3981,6 +4064,14 @@ kept_index_keys(const char *name, List *kept)
 			appendStringInfoString(k, name);
 			keys = lappend(keys, k);
 		}
+	}
+	if (unfrozen)
+	{
+		StringInfo	k = makeStringInfo();
+
+		appendStringInfoChar(k, TAG_KEPT_UNFROZEN);
+		appendStringInfoString(k, name);
+		keys = lappend(keys, k);
 	}
 	return keys;
 }

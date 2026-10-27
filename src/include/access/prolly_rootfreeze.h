@@ -18,20 +18,41 @@
  * reachable through a redirect.  Any session can be given such pages, and
  * they never go stale.
  *
+ * A root captured while other transactions write the relation (under
+ * dolt.transaction_commit, whose every transaction commits, a writer is
+ * nearly always at work) holds their versions too, of transactions the
+ * commit didn't see and that may commit later.  It is never given back as
+ * it is: it is kept with the commit's snapshot (ProllyRootSnapshot) and
+ * frozen as of it, later, before the database forgets the ids it holds.
+ *
  * Contract:
  * - at_capture() says whether a root is frozen as it is captured, inside
  *   the commit (its cost the commit's), or later.
  * - freeze_page() makes 'page', a copy of block 'blkno' of a heap-format
  *   relation (a table, a TOAST table, a change log), the page as of
- *   'snapshot', in place:
+ *   'as_of', in place:
  *   only versions whose inserting transaction the snapshot sees committed
- *   (or the current transaction, whose commit the snapshot's commit is),
- *   and that no transaction it sees committed (or this one) deleted, are
- *   left, with xmin frozen, xmax invalid and no update chain; the others
- *   are dead line pointers, but for a HOT chain's root, which redirects to
- *   the version left.  Line pointers are never made unused, nor moved.
- *   The page's all-visible flag and prune hint are cleared.  Returns
- *   whether any version was left.
+ *   (or one of the committing transaction's own ids), and that no
+ *   transaction it sees committed (or one of those) deleted, are left,
+ *   with xmin frozen, xmax invalid and no update chain; the others are
+ *   dead line pointers, but for a HOT chain's root, which redirects to the
+ *   version left.  Line pointers are never made unused, nor moved.  The
+ *   page's all-visible flag and prune hint are cleared.  Returns whether
+ *   any version was left.  *undecided says whether the page as frozen
+ *   depends on a transaction the snapshot doesn't see that hasn't aborted
+ *   (running then, or begun since, and perhaps committed now): a later
+ *   snapshot may see it, so the same page frozen as of that one may
+ *   differ.
+ * - freeze_later() says whether a root captured as it is, writers at
+ *   work, is frozen later, in the background, before the database forgets
+ *   the ids it holds; asked as such a root is about to be captured, it
+ *   has the background freezing told one is coming.  False: no root is
+ *   captured so, and a commit keeps a root only while no writer is at
+ *   work.
+ * - freeze_now() says whether a move to a commit whose root isn't frozen
+ *   yet freezes it then (O(the pages changed since the relation's last
+ *   frozen root)), rather than going to the nearest frozen root before
+ *   it and writing the rows between.
  *
  * Provisional (v0).
  *
@@ -46,17 +67,44 @@
 #include "storage/bufpage.h"
 #include "utils/snapshot.h"
 
+/*
+ * What a root is frozen as of: the commit's MVCC snapshot (of the other
+ * transactions), and the committing transaction's own ids (its top-level
+ * one and its committed subtransactions'), which commit with it.  'own'
+ * NULL (nown 0): the current transaction's, a root frozen inside its
+ * commit.
+ */
+typedef struct ProllyRootSnapshot
+{
+	Snapshot	snapshot;
+	int			nown;
+	TransactionId *own;
+} ProllyRootSnapshot;
+
 typedef struct ProllyRootFreezerRoutine
 {
 	ProllyImplInfo info;
 
 	bool		(*at_capture) (void);
-	bool		(*freeze_page) (Page page, BlockNumber blkno, Snapshot snapshot);
+	bool		(*freeze_page) (Page page, BlockNumber blkno,
+								const ProllyRootSnapshot *as_of,
+								bool *undecided);
+	bool		(*freeze_later) (void);
+	bool		(*freeze_now) (void);
 } ProllyRootFreezerRoutine;
 
 #define PROLLY_ROOTFREEZER_CALLBACK_NAMES \
-	"at_capture", "freeze_page"
+	"at_capture", "freeze_page", "freeze_later", "freeze_now"
 #define PROLLY_ROOTFREEZER_FIRST_CALLBACK at_capture
-#define PROLLY_ROOTFREEZER_LAST_CALLBACK freeze_page
+#define PROLLY_ROOTFREEZER_LAST_CALLBACK freeze_now
+
+/*
+ * A heap-format page frozen as of as_of, as freeze_page() describes (the
+ * built-in freezers' common rule).
+ */
+extern bool prolly_freeze_heap_page(Page page, BlockNumber blkno,
+									const ProllyRootSnapshot *as_of,
+									bool *undecided);
+
 
 #endif							/* PROLLY_ROOTFREEZE_H */
