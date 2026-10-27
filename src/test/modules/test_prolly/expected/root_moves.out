@@ -259,6 +259,74 @@ SELECT digest() = (SELECT d FROM digests WHERE n = 39) AS at_c39;
 (1 row)
 
 RESET prolly.root_interval_commits;
+-- a branch made at the head, with a kept commit of its own, moves to a
+-- commit between main's roots as main does: by the nearest root main kept
+-- below the branch's own
+SELECT dolt_hashof('HEAD') AS at_c39_hash \gset
+SELECT dolt_branch('scratch2', :'at_c39_hash');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('scratch2');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'scratch2'"}
+(1 row)
+
+UPDATE rm.t SET v = -6 WHERE id = 1;
+SELECT dolt_commit('-am', 's1') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', (SELECT commit_hash FROM dolt_log WHERE message = 'c33'));
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::int
+	ELSE (value > 0)::int END FROM since(:'before') WHERE name <> 'pages_kept';
+        name        | case 
+--------------------+------
+ apply_rows         |    1
+ relations_restored |    1
+(2 rows)
+
+SELECT digest() = (SELECT d FROM digests WHERE n = 33) AS at_c33;
+ at_c33 
+--------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'scratch2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- a transaction's own commit captures a root when one is due: every
 -- commit with no interval, none within a long one
 SET dolt.transaction_commit = on;

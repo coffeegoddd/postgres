@@ -9340,16 +9340,16 @@ roots_lower_hint(RelFileLocator rel, uint32 p)
 
 /*
  * Settle slot 'slot' of the store, *r, held or let go of, on its page held
- * exclusively in 'buf' (page p of the slots), which this releases: its
- * capturer, if committed, named no more, and its releaser, if it didn't
- * commit, either; cleared if let go of by a committed releaser (its
- * subtrees queued already).  One still running is left as it is: a
- * transaction running now is newer than the horizon VACUUM goes on to
- * take.  (bmap_roots_reclaim(), under the sweep lock.)
+ * exclusively in 'buf': its capturer, if committed, named no more, and its
+ * releaser, if it didn't commit, either; cleared if let go of by a
+ * committed releaser (its subtrees queued already): true then.  One still
+ * running is left as it is: VACUUM took its horizon first, which a
+ * transaction running now is newer than.  (bmap_roots_reclaim(), under
+ * the sweep lock.)
  */
-static void
+static bool
 root_settle(RelFileLocator store, Buffer buf, uint32 slot,
-			const xl_bmap_root *r, uint32 p)
+			const xl_bmap_root *r)
 {
 	xl_bmap_root settled = *r;
 	OwnerState	cap = owner_state(FullTransactionIdFromU64(r->snap.owner));
@@ -9358,10 +9358,7 @@ root_settle(RelFileLocator store, Buffer buf, uint32 slot,
 	bool		cleared = false;
 
 	if (cap == OWNER_RUNNING || rel == OWNER_RUNNING)
-	{
-		UnlockReleaseBuffer(buf);
-		return;
-	}
+		return false;
 	if (rel == OWNER_COMMITTED || rel == OWNER_UNKNOWN)
 	{
 		memset(&settled, 0, sizeof(settled));
@@ -9374,9 +9371,7 @@ root_settle(RelFileLocator store, Buffer buf, uint32 slot,
 	}
 	if (memcmp(&settled, r, sizeof(settled)) != 0)
 		roots_set_slot(store, buf, slot, &settled);
-	UnlockReleaseBuffer(buf);
-	if (cleared)
-		roots_lower_hint(store, p);
+	return cleared;
 }
 
 /*
@@ -9417,40 +9412,45 @@ bmap_roots_reclaim(RelFileLocator store, bool settle)
 	(void) LockAcquire(&sweeptag, ShareLock, false, false);
 	for (uint32 p = 0; p < meta.npages; p++)
 	{
+		Buffer		buf = roots_read(store, 1 + p);
+		xl_bmap_root abandoned[BMAP_ROOTS_PER_PAGE];
+		uint32		nabandoned = 0;
+		bool		freed = false;
+
+		/* (each page once: its abandoned slots cleared, then let go of) */
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
+				   with_relnumber(store, BMAP_ROOTS_RELNUMBER),
+				   MAIN_FORKNUM, 1 + p);
 		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
 		{
-			Buffer		buf = roots_read(store, 1 + p);
-			xl_bmap_root r;
-			xl_bmap_root cleared;
+			xl_bmap_root r = PageGetBmapRoots(BufferGetPage(buf))[i];
 			uint32		slot = p * BMAP_ROOTS_PER_PAGE + i;
 
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
-					   with_relnumber(store, BMAP_ROOTS_RELNUMBER),
-					   MAIN_FORKNUM, 1 + p);
-			r = PageGetBmapRoots(BufferGetPage(buf))[i];
-			if (r.snap.id != 0 && settle && root_state(&r) != ROOT_ABANDONED)
-			{
-				root_settle(store, buf, slot, &r, p);
+			if (r.snap.id == 0)
 				continue;
-			}
-			if (r.snap.id == 0 || root_state(&r) != ROOT_ABANDONED)
+			if (root_state(&r) == ROOT_ABANDONED)
 			{
-				UnlockReleaseBuffer(buf);
-				continue;
-			}
-			memset(&cleared, 0, sizeof(cleared));
-			roots_set_slot(store, buf, slot, &cleared);
-			UnlockReleaseBuffer(buf);
-			{
-				BmapQueued	items[BMAP_TREE_TOPS];
-				uint32		nq = queued_tops(snapshot_tops(&r.snap), items);
+				xl_bmap_root cleared;
 
-				(void) queue_push(store, items, nq);
+				memset(&cleared, 0, sizeof(cleared));
+				roots_set_slot(store, buf, slot, &cleared);
+				abandoned[nabandoned++] = r;
 			}
-			roots_lower_hint(store, p);
-			n++;
+			else if (settle)
+				freed |= root_settle(store, buf, slot, &r);
 		}
+		UnlockReleaseBuffer(buf);
+		for (uint32 a = 0; a < nabandoned; a++)
+		{
+			BmapQueued	items[BMAP_TREE_TOPS];
+			uint32		nq = queued_tops(snapshot_tops(&abandoned[a].snap), items);
+
+			(void) queue_push(store, items, nq);
+		}
+		if (nabandoned > 0 || freed)
+			roots_lower_hint(store, p);
+		n += nabandoned;
 	}
 	LockRelease(&sweeptag, ShareLock, false);
 	return n;
@@ -10355,8 +10355,9 @@ bmap_raise_epoch(SMgrRelation reln)
  * May root 'id' be a frozen base of relation 'live' (a root its frozen
  * roots are made of, the pages changed since it found by their epochs)?
  * Yes if it was captured of live, frozen (its pages changed since told by
- * the epoch it recorded of live), or if live was made a copy of it (told
- * by the root's own epoch, live's when made).  The epoch into *since.
+ * the epoch it recorded of live), or if live was made a copy of it, or of
+ * a root it is a copy of (told by the root's own epoch, live's when made).
+ * The epoch into *since.
  */
 bool
 bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)
@@ -10379,7 +10380,20 @@ bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)
 	root = *PageGetBmapRoot(BufferGetPage(buf));
 	UnlockReleaseBuffer(buf);
 	if (root.made_of != id)
-		return false;
+	{
+		Buffer		mbuf;
+		xl_bmap_root m;
+
+		/*
+		 * (or a copy of the root live was made of, bmap_root_copy()'s: the
+		 * same subtrees, as of the same epoch)
+		 */
+		if (root.made_of == 0 ||
+			!root_read(rel, root.made_of, -1, &mbuf, &m) ||
+			m.snap.epoch != r.snap.epoch || m.snap.nblocks != r.snap.nblocks ||
+			memcmp(m.snap.tops, r.snap.tops, sizeof(m.snap.tops)) != 0)
+			return false;
+	}
 	*since = r.snap.epoch;
 	return true;
 }
