@@ -33,11 +33,15 @@
  *   elsewhere), or none (nothing).  It holds every ref and the horizon's lock, and is the
  *   database owner's.  Its result says what was done.  A collection after
  *   the transaction commits frees what only the fragment reached.
- * - maintain() severs the database's window in the background, as
- *   sever() does with the database's action, once its cut (rounded down
- *   to a whole batch; an hour where the window names none) has moved since
- *   the last it tried; true if it made a fragment, which a full collection
- *   then frees.
+ * - maintain() severs the history window in the background, as sever()
+ *   does with the database's action, as the database's owner, once a
+ *   lineage's cut (rounded down to its batch; an hour where the window
+ *   names none) has moved since the last it tried, or the size limit says
+ *   so; a failure is reported, not raised, and retried after a wait that
+ *   grows; true if it made a fragment.  collect_due() says whether the
+ *   background's collection is to be a full one now (fragments made since
+ *   the last, which ended long enough ago); collected() notes that one
+ *   ran, and the store's size it left.
  * - archived() says whether commit id is past the horizon: a top of a
  *   fragment, named by a boundary commit.  edges() visits the horizon's
  *   boundary edges (a boundary commit and the parent it doesn't keep) as
@@ -170,13 +174,15 @@ typedef struct ProllyWindowRoutine
 	void		(*set_policy) (const char *name, const char *setting,
 							   const char *value);
 	bool		(*maintain) (void);
+	bool		(*collect_due) (void);
+	void		(*collected) (void);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
-	"policy", "set_policy", "maintain"
+	"policy", "set_policy", "maintain", "collect_due", "collected"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK maintain
+#define PROLLY_WINDOW_LAST_CALLBACK collected
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)

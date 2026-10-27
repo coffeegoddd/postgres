@@ -81,6 +81,8 @@
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #define SPACE_HORIZON	'h'
@@ -545,6 +547,7 @@ static char *warm_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
 static char *cold_batch_setting = NULL;
+static char *collect_interval_setting = NULL;
 static char *archive_setting = NULL;
 
 static const struct config_enum_entry action_options[] = {
@@ -693,6 +696,11 @@ prolly_window_init(void)
 							   "Read as the database has it; each branch still keeps its newest prolly.history_min_commits.",
 							   &max_size_setting, "", PGC_USERSET, 0,
 							   check_size, NULL, NULL);
+	DefineCustomStringVariable("prolly.history_collect_interval",
+							   "The least time between the full collections that free severed history in the background (empty: an hour).",
+							   "Read as the database has it; fragments severed meanwhile share the next one.",
+							   &collect_interval_setting, "", PGC_USERSET, 0,
+							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_cold_batch",
 							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
 							   "Read as the database has it; a branch may keep its own.",
@@ -1923,8 +1931,21 @@ replan:
 /* Background severing cuts at whole hours where the window names no batch. */
 #define DEFAULT_BACKGROUND_BATCH	USECS_PER_HOUR
 
-#define LAST_CUT_SETTING	"history_window.last_cut"
+#define DEFAULT_COLLECT_INTERVAL	USECS_PER_HOUR
+#define BACKOFF_FIRST		USECS_PER_MINUTE
+#define BACKOFF_MOST		USECS_PER_DAY
+
+/* The background's state, the database's settings in the refs. */
+#define LAST_CUT_SETTING	"history_window.last_cut"	/* :branch, a branch's */
 #define SIZE_CUT_SETTING	"history_window.size_cut"
+#define SIZE_PENDING_SETTING "history_window.size_pending"
+#define SIZE_RETRY_SETTING	"history_window.size_retry_at"
+#define MEASURED_SETTING	"history_window.measured"
+#define OVER_COUNT_SETTING	"history_window.over_count"
+#define FULL_WANTED_SETTING	"history_window.full_wanted"
+#define LAST_FULL_SETTING	"history_window.last_full"
+#define FAILURES_SETTING	"history_window.failures"
+#define RETRY_SETTING		"history_window.retry_at"
 
 static void
 size_part(const char *name, int nchunks, uint64 size, bool settled, void *arg)
@@ -1988,65 +2009,318 @@ oldest_kept(void)
 	return oldest;
 }
 
+/* A setting of the background's, a number (dflt if unset). */
+static int64
+config_int(const char *name, int64 dflt)
+{
+	StringInfoData v;
+	int64		n = dflt;
+
+	initStringInfo(&v);
+	if (PROLLY_CALL(dc.refs, config_get, name, &v))
+		n = strtoll(v.data, NULL, 10);
+	pfree(v.data);
+	return n;
+}
+
+/* Set it (unset: none), written only if it changes. */
+static void
+config_int_set(const char *name, int64 n, bool unset)
+{
+	StringInfoData v;
+	bool		had;
+	char		buf[32];
+
+	initStringInfo(&v);
+	had = PROLLY_CALL(dc.refs, config_get, name, &v);
+	snprintf(buf, sizeof(buf), INT64_FORMAT, n);
+	if (unset ? had : (!had || strcmp(v.data, buf) != 0))
+		PROLLY_CALL(dc.refs, config_set, name, unset ? NULL : buf);
+	pfree(v.data);
+}
+
+static char *
+last_cut_key(const char *branch)
+{
+	return branch ? psprintf("%s:%s", LAST_CUT_SETTING, branch) :
+		pstrdup(LAST_CUT_SETTING);
+}
+
+/* The least time between the background's full collections. */
+static int64
+collect_interval(void)
+{
+	int64		usec = database_span("prolly.history_collect_interval");
+
+	return usec > 0 ? usec : DEFAULT_COLLECT_INTERVAL;
+}
+
+typedef struct LineageCut
+{
+	char	   *key;			/* its last cut's setting */
+	TimestampTz cut;
+} LineageCut;
+
+static void
+note_lineage(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **names = arg;
+
+	if (strncmp(name, PROLLY_DETACHED_PREFIX,
+				strlen(PROLLY_DETACHED_PREFIX)) != 0)
+		*names = lappend(*names, pstrdup(name));
+}
+
 /*
- * The database's window, severed in the background (autovacuum's visit):
- * only once a cut, rounded down to a whole batch, has moved past the last
- * one tried, so a plan is worked out at most once a batch, not at every
- * visit.  Over prolly.history_max_size, each visit severs a batch more,
- * from the oldest history kept on (each branch still keeping its newest
- * min_commits), until the store fits.  True if a fragment was made: what
- * only it reached is a full collection's to free.
+ * The cuts that moved since each was last tried: every branch's, by its
+ * lineage's policy (its own warm, min_commits and cold_batch over the
+ * database's), and the database's, for the other refs.  So a branch's own
+ * window is severed in the background, at its own batch, with none for
+ * the database.  *any: some lineage has a window.
+ */
+static List *
+moved_cuts(TimestampTz now, bool *any)
+{
+	List	   *names = list_make1(NULL);
+	List	   *moved = NIL;
+
+	*any = false;
+	PROLLY_CALL(dc.refs, branches, note_lineage, &names);
+	foreach_ptr(char, name, names)
+	{
+		ProllyWindowPolicy p;
+		int64		batch;
+		TimestampTz cut;
+		char	   *key;
+
+		archive_policy(name, &p);
+		if (p.keep_time == 0 && p.keep_commits == 0)
+			continue;
+		*any = true;
+		batch = p.batch > 0 ? p.batch : DEFAULT_BACKGROUND_BATCH;
+		cut = p.keep_time > 0 ? now - p.keep_time : now;
+		cut -= ((cut % batch) + batch) % batch;
+		key = last_cut_key(name);
+		if (cut > config_int(key, DT_NOBEGIN))
+		{
+			LineageCut *lc = palloc(sizeof(LineageCut));
+
+			lc->key = key;
+			lc->cut = cut;
+			moved = lappend(moved, lc);
+		}
+	}
+	return moved;
+}
+
+/*
+ * Over prolly.history_max_size: the cut a batch past the oldest history
+ * kept (and past the last cut for size), if the store is over by
+ * what the last full collection the background ran left (the chunks it
+ * kept, the unlinks it deferred not counted: the store's files as its
+ * manifest has them), and no sever for size has been made since.  So a
+ * batch at most for each collection that ran and was measured, never more
+ * because freeing lags; in delete mode, only once two measurements in a
+ * row say so.  A measurement wanted (none yet, or the store's files over
+ * though the last was under) asks for a full collection; DT_NOBEGIN: no
+ * cut for size.
+ */
+static TimestampTz
+size_cut_due(const ProllyWindowPolicy *db, TimestampTz now)
+{
+	int64		measured;
+	int64		batch = db->batch > 0 ? db->batch : DEFAULT_BACKGROUND_BATCH;
+	TimestampTz cut;
+
+	if (db->max_bytes <= 0)
+		return DT_NOBEGIN;
+	if (config_int(SIZE_PENDING_SETTING, 0) != 0 ||
+		now < config_int(SIZE_RETRY_SETTING, DT_NOBEGIN))
+		return DT_NOBEGIN;
+	measured = config_int(MEASURED_SETTING, -1);
+	if (measured < 0 || measured <= db->max_bytes)
+	{
+		if (store_bytes() > (uint64) db->max_bytes)
+			config_int_set(FULL_WANTED_SETTING, 1, false);
+		return DT_NOBEGIN;
+	}
+	if (config_int(OVER_COUNT_SETTING, 0) <
+		(db->action == PROLLY_WINDOW_DELETE ? 2 : 1))
+	{
+		config_int_set(FULL_WANTED_SETTING, 1, false);
+		return DT_NOBEGIN;
+	}
+	/* (a batch past the oldest history kept, never short of the last) */
+	cut = oldest_kept();
+	if (cut == DT_NOEND)
+		return DT_NOBEGIN;
+	cut = Max(cut, config_int(SIZE_CUT_SETTING, DT_NOBEGIN));
+	return Min(cut + batch, now);
+}
+
+static void
+maintain_as_owner(const ProllyWindowPolicy *db, List *moved,
+				  TimestampTz size_cut, ProllyWindowResult *r)
+{
+	HeapTuple	tuple;
+	Oid			owner;
+	Oid			save_userid;
+	int			save_sec;
+
+	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	owner = ((Form_pg_database) GETSTRUCT(tuple))->datdba;
+	ReleaseSysCache(tuple);
+
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	SetUserIdAndSecContext(owner, save_sec | SECURITY_RESTRICTED_OPERATION);
+	PG_TRY();
+	{
+		foreach_ptr(LineageCut, lc, moved)
+			config_int_set(lc->key, lc->cut, false);
+		sever_cut(db->action, NULL, size_cut, r);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(save_userid, save_sec);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The history window severed in the background (autovacuum's visit), as
+ * the database's owner, so an archive's checks are the owner's, as at
+ * dolt_history_sever(): only once some lineage's cut, rounded down to its
+ * batch, has moved past the last one tried, or the size limit says (see
+ * size_cut_due()).  A try that fails is reported and retried after a
+ * wait that doubles with each failure in a row (a minute, to a day), not
+ * at every visit.  True if a fragment was made: what only it reached is a
+ * full collection's (collect_due()), which several fragments share.
  */
 static bool
 archive_maintain(void)
 {
-	ProllyWindowPolicy p;
+	ProllyWindowPolicy db;
 	ProllyWindowResult r;
 	TimestampTz now = GetCurrentTimestamp();
-	TimestampTz cut = DT_NOBEGIN;
-	TimestampTz size_cut = DT_NOBEGIN;
-	int64		batch;
-	StringInfoData v;
-	TimestampTz last = DT_NOBEGIN;
-	bool		over = false;
+	TimestampTz size_cut;
+	List	   *moved;
+	bool		any;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int64		failures;
 
 	window_init();
-	archive_policy(NULL, &p);
-	if (p.action == PROLLY_WINDOW_NONE ||
-		(p.keep_time == 0 && p.keep_commits == 0 && p.max_bytes == 0))
+	archive_policy(NULL, &db);
+	if (db.action == PROLLY_WINDOW_NONE)
 		return false;
-	batch = p.batch > 0 ? p.batch : DEFAULT_BACKGROUND_BATCH;
-	initStringInfo(&v);
-	if (p.keep_time > 0 || p.keep_commits > 0)
+	if (now < config_int(RETRY_SETTING, DT_NOBEGIN))
+		return false;
+	moved = moved_cuts(now, &any);
+	size_cut = size_cut_due(&db, now);
+	if (moved == NIL && size_cut == DT_NOBEGIN)
+		return false;
+
+	memset(&r, 0, sizeof(r));
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
 	{
-		cut = p.keep_time > 0 ? now - p.keep_time : now;
-		cut -= ((cut % batch) + batch) % batch;
-		if (PROLLY_CALL(dc.refs, config_get, LAST_CUT_SETTING, &v))
-			last = (TimestampTz) strtoll(v.data, NULL, 10);
+		maintain_as_owner(&db, moved, size_cut, &r);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
 	}
-	if (p.max_bytes > 0 && store_bytes() > (uint64) p.max_bytes)
+	PG_CATCH();
 	{
-		over = true;
-		resetStringInfo(&v);
-		if (PROLLY_CALL(dc.refs, config_get, SIZE_CUT_SETTING, &v))
-			size_cut = (TimestampTz) strtoll(v.data, NULL, 10);
+		ErrorData  *edata;
+		int64		wait;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		failures = config_int(FAILURES_SETTING, 0) + 1;
+		wait = BACKOFF_FIRST;
+		for (int64 i = 1; i < failures && wait < BACKOFF_MOST; i++)
+			wait *= 2;
+		wait = Min(wait, BACKOFF_MOST);
+		config_int_set(FAILURES_SETTING, failures, false);
+		config_int_set(RETRY_SETTING, now + wait, false);
+		ereport(WARNING,
+				(errcode(edata->sqlerrcode),
+				 errmsg("background severing of history of database \"%s\" failed: %s",
+						get_database_name(MyDatabaseId), edata->message),
+				 edata->detail ? errdetail_internal("%s", edata->detail) : 0,
+				 errhint("Tried again in %lld seconds (failure %lld in a row).",
+						 (long long) (wait / USECS_PER_SEC),
+						 (long long) failures)));
+		FreeErrorData(edata);
+		return false;
+	}
+	PG_END_TRY();
+	config_int_set(FAILURES_SETTING, 0, true);
+	config_int_set(RETRY_SETTING, 0, true);
+	if (r.fragment > 0)
+		config_int_set(FULL_WANTED_SETTING, 1, false);
+	if (size_cut != DT_NOBEGIN)
+	{
+		/* (one batch for size per measurement, a fragment made or not) */
+		if (r.fragment > 0)
+		{
+			config_int_set(SIZE_CUT_SETTING, size_cut, false);
+			config_int_set(SIZE_PENDING_SETTING, 1, false);
+		}
 		else
-			size_cut = oldest_kept();
-		size_cut = Min(size_cut + batch, now);
-		resetStringInfo(&v);
-		appendStringInfo(&v, INT64_FORMAT, (int64) size_cut);
-		PROLLY_CALL(dc.refs, config_set, SIZE_CUT_SETTING, v.data);
+			config_int_set(SIZE_RETRY_SETTING, now + collect_interval(), false);
+		config_int_set(OVER_COUNT_SETTING, 0, false);
 	}
-	if (!over && cut <= last)
-		return false;
-	if (cut > last)
-	{
-		resetStringInfo(&v);
-		appendStringInfo(&v, INT64_FORMAT, (int64) cut);
-		PROLLY_CALL(dc.refs, config_set, LAST_CUT_SETTING, v.data);
-	}
-	sever_cut(p.action, NULL, size_cut, &r);
 	return r.fragment > 0;
+}
+
+/*
+ * Whether the background's collection is a full one now: fragments made
+ * (or a measurement asked for) since its last full one, which ended at
+ * least prolly.history_collect_interval ago (an hour where unset): so
+ * several fragments share one collection, and full collections never run
+ * back to back.
+ */
+static bool
+archive_collect_due(void)
+{
+	window_init();
+	if (config_int(FULL_WANTED_SETTING, 0) == 0)
+		return false;
+	return GetCurrentTimestamp() >=
+		config_int(LAST_FULL_SETTING, DT_NOBEGIN) + collect_interval();
+}
+
+/*
+ * The background's full collection done: when, and the store as it left
+ * it (measured for the size limit), the fragments it freed no longer
+ * waiting.
+ */
+static void
+archive_collected(void)
+{
+	ProllyWindowPolicy db;
+	uint64		bytes;
+
+	window_init();
+	archive_policy(NULL, &db);
+	bytes = store_bytes();
+	config_int_set(LAST_FULL_SETTING, GetCurrentTimestamp(), false);
+	config_int_set(MEASURED_SETTING, (int64) bytes, false);
+	config_int_set(FULL_WANTED_SETTING, 0, true);
+	config_int_set(SIZE_PENDING_SETTING, 0, true);
+	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
+		config_int_set(OVER_COUNT_SETTING,
+					   config_int(OVER_COUNT_SETTING, 0) + 1, false);
+	else
+		config_int_set(OVER_COUNT_SETTING, 0, true);
 }
 
 /* ------------------------------------------------------------------------
@@ -2428,4 +2702,6 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.policy = archive_policy,
 	.set_policy = archive_set_policy,
 	.maintain = archive_maintain,
+	.collect_due = archive_collect_due,
+	.collected = archive_collected,
 };

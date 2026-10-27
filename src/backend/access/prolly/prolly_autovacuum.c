@@ -313,24 +313,27 @@ collection_due(void)
  * counted (auto_collections_skipped), rather than each reporting the
  * refusal as an error; dolt_gc() still reports it.
  */
-/* A fragment severed this visit: the collection after it is a full one. */
-static bool severed = false;
-
 /*
  * History past the database's window severed (the history window's
  * maintain()), before the collection: as the database's settings say,
  * never a session's.
  */
+/* The history window wants this visit's collection a full one. */
+static bool full_due = false;
+
 static void
 sever(void)
 {
 	ProllyDatabaseComponents dc;
 
-	severed = false;
+	full_due = false;
 	prolly_database_components(&dc);
 	if (dc.history_window == NULL || !PROLLY_HAS(dc.history_window, maintain))
 		return;
-	severed = PROLLY_CALL(dc.history_window, maintain);
+	(void) PROLLY_CALL(dc.history_window, maintain);
+	/* (asked here: a collection runs in a transaction that hasn't read) */
+	full_due = PROLLY_HAS(dc.history_window, collect_due) &&
+		PROLLY_CALL(dc.history_window, collect_due);
 }
 
 static void
@@ -338,14 +341,18 @@ collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
-	bool		full = severed;
+	bool		full = full_due;
 
-	severed = false;
+	/*
+	 * (full where the history window wants severed history freed, no
+	 * oftener than it allows)
+	 */
+	full_due = false;
+	prolly_database_components(&dc);
 	if (!full && !collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	prolly_database_components(&dc);
 	if (!PROLLY_CALL(dc.reclamation, collect, full, true, &r))
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
@@ -354,6 +361,8 @@ collect(void)
 								 get_database_name(MyDatabaseId))));
 		return;
 	}
+	if (full && PROLLY_HAS(dc.history_window, collected))
+		PROLLY_CALL(dc.history_window, collected);
 	/* (then, a step of its own, the records of the commits it took) */
 	if (PROLLY_HAS(dc.refs, forget_records))
 		(void) PROLLY_CALL(dc.refs, forget_records);
