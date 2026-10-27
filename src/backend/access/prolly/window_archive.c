@@ -888,6 +888,8 @@ typedef struct PlanCommit
 {
 	ProllyHash	id;				/* key */
 	PlanEntry	e;
+	TimestampTz young_cut;		/* young() as of this cut (DT_NOBEGIN: none) */
+	bool		young;
 	bool		kept;
 	bool		pinned;			/* kept as a ref's commit, not a window's */
 	bool		by_base;		/* kept only on the way to a merge base */
@@ -944,6 +946,8 @@ plan_commit(Plan *plan, const ProllyHash *id)
 		pc->kept = false;
 		pc->pinned = false;
 		pc->by_base = false;
+		pc->young_cut = DT_NOBEGIN;
+		pc->young = false;
 		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1166,6 +1170,63 @@ note_merge_bases(Plan *plan)
 			plan->heads = foreach_delete_current(plan->heads, h);
 }
 
+/*
+ * Whether a commit is younger than cut, by a clock that only goes forward
+ * along history: it, or a commit beneath it (this side of the horizon), is
+ * dated at cut or later, a date past now taken as now.  Commit dates
+ * needn't increase along history (one made with --date, a machine's clock
+ * skewed, an import), so by this clock no commit is older than one beneath
+ * it, and a window, the commits younger than its cut, is a prefix of every
+ * path: nothing is severed beneath a commit kept for its age.  (A commit
+ * dated in the future keeps itself and what is above it until that date
+ * is past.)  Found once for each commit and cut, walking down only past
+ * commits older than the cut: O(what a sever walks anyway).
+ */
+static bool
+young(Plan *plan, PlanCommit *pc, TimestampTz cut)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	List	   *stack;
+
+	if (pc->young_cut == cut && cut != DT_NOBEGIN)
+		return pc->young;
+	stack = list_make1(pc);
+	while (stack != NIL)
+	{
+		PlanCommit *top = llast(stack);
+		bool		pending = false;
+		bool		result = Min(top->e.committed_at, now) >= cut;
+
+		if (top->young_cut == cut && cut != DT_NOBEGIN)
+		{
+			stack = list_delete_last(stack);
+			continue;
+		}
+		for (int i = 0; !result && i < top->e.nparents; i++)
+		{
+			PlanCommit *p;
+
+			if (set_has(plan->archived, &top->e.parents[i]))
+				continue;
+			p = plan_commit(plan, &top->e.parents[i]);
+			if (p->young_cut != cut)
+			{
+				stack = lappend(stack, p);
+				pending = true;
+			}
+			else
+				result = p->young;
+		}
+		if (pending && !result)
+			continue;
+		top->young = result;
+		top->young_cut = cut;
+		stack = list_delete_last(stack);
+		CHECK_FOR_INTERRUPTS();
+	}
+	return pc->young;
+}
+
 static void
 keep(Plan *plan, PlanCommit *pc)
 {
@@ -1192,7 +1253,7 @@ walk_window(Plan *plan, Head *h)
 		todo = list_delete_last(todo);
 		CHECK_FOR_INTERRUPTS();
 		pc = plan_commit(plan, id);
-		if (same_id(id, &h->head) || pc->e.committed_at >= h->cut ||
+		if (same_id(id, &h->head) || young(plan, pc, h->cut) ||
 			(h->min_commits > 0 && head_height - pc->e.height < h->min_commits))
 		{
 			if (pc->kept && pc->by_base)
