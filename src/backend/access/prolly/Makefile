@@ -67,6 +67,7 @@ OBJS = \
 	prolly_dolt.o \
 	prolly_snapshot.o \
 	prolly_history_scan.o \
+	prolly_log_scan.o \
 	prolly_revision.o \
 	prolly_vcs.o \
 	prolly_autovacuum.o \

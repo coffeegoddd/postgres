@@ -27,7 +27,10 @@
  *
  * Contract:
  * - at_capture() says whether a root is frozen as it is captured, inside
- *   the commit (its cost the commit's), or later.
+ *   the commit (its cost the commit's), or later: captured among the
+ *   writers, kept unfrozen with the commit's snapshot, and frozen by the
+ *   fold worker or by a move to the commit (freeze_later(),
+ *   freeze_now()).
  * - freeze_page() makes 'page', a copy of block 'blkno' of a heap-format
  *   relation (a table, a TOAST table, a change log), the page as of
  *   'as_of', in place:
