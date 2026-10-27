@@ -109,10 +109,10 @@ SELECT rows_digest() = :'at_b' AS at_b, clean(), indexes_valid();
 
 
 -- A working set brought close to the commit by ordinary writes, its head
--- far from it: the head's pages don't pay (the working set is about as far
--- from the head as the head is from the commit, so it may be near the
--- commit), and only the few rows that differ are written, not the
--- head's 10,000.
+-- far from it: the head's pages are given back all the same, discarding
+-- the working set's changes in O(1) without asking how far it is from the
+-- commit, and the head's 10,000 rows from the commit are written (the
+-- move's own distance, as a reset from a clean working set writes).
 CREATE TABLE kh.n (id int PRIMARY KEY, v int);
 INSERT INTO kh.n SELECT g, 0 FROM generate_series(1, 20000) g;
 SELECT (dolt_commit('-Am', 'n a'))[1] AS na \gset

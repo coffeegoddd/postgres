@@ -65,6 +65,18 @@ typedef enum BranchKeptStatus
 	BRANCH_KEPT_GONE,
 } BranchKeptStatus;
 
+/*
+ * The snapshot id of a BranchKeptRelation that names old storage itself,
+ * not a snapshot in it: the storage a restore replaced (its tablespace and
+ * relfilenumber, no longer the relation's in pg_class), kept whole for the
+ * snapshots older than the move, which read it.  Such an entry is never
+ * restored, shared, carried or checked for its status; letting go of it
+ * (let_go(), keep()'s release[]) drops the storage as the transaction
+ * commits.  The refs keep it as a retired entry of the branch's kept list,
+ * all of whose relations are such entries.
+ */
+#define BRANCH_KEPT_STORAGE		PG_UINT64_MAX
+
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
 {
@@ -76,8 +88,8 @@ typedef struct BranchKeptTable
 #define BRANCH_LOCK_WAIT_MAX_ASKED	16
 
 /*
- * One operation's waits for the locks its share(), restore() and
- * share_kept() calls try, so that one bound covers them all: zeroed when
+ * One operation's waits for the locks its share(), share_kept() and
+ * restore() calls try, so that one bound covers them all: zeroed when
  * the operation begins.
  */
 typedef struct BranchLockWait
@@ -90,8 +102,8 @@ typedef struct BranchLockWait
 } BranchLockWait;
 
 /*
- * prolly.restore_lock_wait: how long, in milliseconds, share(), restore()
- * and share_kept() wait for a holder of a lock they need that isn't a page
+ * prolly.restore_lock_wait: how long, in milliseconds, share(),
+ * share_kept() and restore() (for a lock it doesn't hold already) wait for a holder of a lock they need that isn't a page
  * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
  * caps it).
  */
@@ -187,8 +199,8 @@ typedef struct BranchOpsRoutine
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 *
-	 * A lock not free at once is waited for, here and in restore() and
-	 * share_kept(), but never queued for, within the bounds of *wait, the
+	 * A lock not free at once is waited for, here and in share_kept() and
+	 * restore(), but never queued for, within the bounds of *wait, the
 	 * operation's (zeroed as it begins): a page sweep holding it is asked
 	 * to let go (bmap_compaction_let_go()) and waited out, within
 	 * lock_timeout of the operation's first wait (for as long as it takes
@@ -237,10 +249,16 @@ typedef struct BranchOpsRoutine
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its
 	 * snapshot is gone, its rows' transaction ids are older than the
-	 * database still knows, or one that changed is in use (each is locked
-	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
-	 * refuses, while the session itself has it open or an AFTER trigger's
-	 * event queued on it; the locks taken are kept).
+	 * database still knows, one that changed is in use by the session
+	 * itself (refused, as TRUNCATE refuses, while the session has it open
+	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
+	 * Each that changed is locked as TRUNCATE locks it: as it is if the
+	 * session holds that lock already (a hard reset takes its restores'
+	 * locks before it holds the refs, waiting for a busy one with nothing
+	 * else held, then the refs only if they are free: see refs_copies.c's
+	 * lock_for_restore() for the order), else tried, within *wait's
+	 * bounds, as share() tries, never queued for while the caller holds
+	 * the refs; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
 	 * pages, which goes as the transaction commits, and with it every
 	 * other snapshot there: so each of carry[] (ncarry of them, other
@@ -248,18 +266,26 @@ typedef struct BranchOpsRoutine
 	 * replaced storage is kept by the new storage too, O(1) each, and
 	 * carried[] (one for each, in order) names it there; one not carried
 	 * (not of a replaced storage, gone, or no room) is copied as it is.
-	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
-	 * the restored storage once it commits.
+	 * The storage each relation had isn't dropped: replaced[] (one for
+	 * each, in order) names it (its snapshot BRANCH_KEPT_STORAGE, its
+	 * relfilenumber invalid if the relation kept its storage), for the
+	 * caller to keep for the snapshots older than the move, which go on
+	 * reading it (branch_storage_hook), and to let go of (let_go() or
+	 * keep()'s release[]) once none is left.
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
 							BranchKeptRelation *renewed,
 							const BranchKeptRelation *carry, int ncarry,
 							BranchKeptRelation *carried,
+							BranchKeptRelation *replaced,
 							BranchLockWait *wait);
 
 	/*
 	 * Optional: let go of a snapshot keep() or restore() took, if its
-	 * storage still has it (a dropped relation's went with it).
+	 * storage still has it (a dropped relation's went with it); or, for
+	 * one naming storage a restore replaced (BRANCH_KEPT_STORAGE), drop
+	 * that storage as the transaction commits.  keep()'s release[] is let
+	 * go of the same way.
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
 
@@ -269,6 +295,14 @@ typedef struct BranchOpsRoutine
 	 * (a relation it gave new storage is gone from its old storage's).
 	 */
 	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: did any of the session branch's relations kept[] (nkept of
+	 * them, a table's together) change since keep() kept them, so that
+	 * restore() would give them new storage?  Asked before a hard reset
+	 * holds the refs, of the tables it locks for its restores first.
+	 */
+	bool		(*changed_since_kept) (const BranchKeptRelation *kept, int nkept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch

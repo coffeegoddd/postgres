@@ -1,11 +1,12 @@
 # Version control: a hard reset to the head gives the branch's tables the
-# pages kept as of its commit, rather than writing rows back, only where
-# nobody else is on them.  A commit made while another transaction writes
-# the branch keeps no pages (they hold that transaction's rows, which the
-# commit doesn't): the reset after writes the rows.  A reset while another
-# transaction holds a table (reading it) writes that table's rows, so its
-# snapshot still reads what it saw.  A snapshot that didn't hold the table
-# reads the pages given back once the reset commits, as after a TRUNCATE.
+# pages kept as of its commit, rather than writing rows back.  A commit
+# made while another transaction writes the branch keeps no pages (they
+# hold that transaction's rows, which the commit doesn't): the reset after
+# writes the rows.  A reset while another transaction holds a table
+# (reading it) waits for it, as TRUNCATE does, and then gives the pages
+# back; the reader's snapshot reads what it saw meanwhile.  A snapshot
+# that didn't hold the table, older than the reset, goes on reading what
+# it saw too: the storage the reset replaced, kept for it.
 
 setup		{ CREATE SCHEMA vrk VERSIONED; }
 setup
@@ -62,10 +63,12 @@ step s2_gone	{ SELECT count(*) AS in_flight FROM vrk.t WHERE id = 100; }
 # nobody else on the branch: the pages given back, no row written
 permutation s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how
 
-# a reader holding the table: its rows written, the reader's view as it was
-permutation s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s1_flush s1_how s2_read s2_end
+# a reader holding the table: the reset waits for it, the reader's view as
+# it was, and then gives the pages back
+permutation s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s2_read s2_end s1_flush s1_how
 
-# a reader that didn't hold the table reads the pages given back
+# a reader that didn't hold the table, its snapshot older than the reset,
+# reads what it saw: the storage the reset replaced
 permutation s1_dirty s2_begin s2_other s1_flush s1_mark s1_reset s1_flush s1_how s2_read s2_end
 
 # a commit while another writes keeps nothing: the reset writes the rows,
