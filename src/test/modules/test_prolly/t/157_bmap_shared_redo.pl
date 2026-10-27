@@ -84,20 +84,20 @@ is(sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$start', '$end')
 is(sql(qq{SELECT test_bmap_rows_digest($copy2)}), $rows,
 	'the second copy has the same rows');
 
-# A snapshot of a relation's pages preserves its own blocks as a share
+# A capture of a relation's pages preserves its own blocks as a share
 # does, and counts the same.
 sql(q{CREATE TABLE snap (a int, b text);
 	INSERT INTO snap SELECT g, repeat('s', 500) FROM generate_series(1, 50) g});
 my $snaprel = sql(q{SELECT pg_relation_filenode('snap')});
 $preserved_before = sql($preserved);
 my $snap_start = sql(q{SELECT pg_current_wal_insert_lsn()});
-sql(qq{SELECT test_bmap_snapshot_take($snaprel)});
+sql(qq{SELECT test_bmap_root_capture($snaprel)});
 my $snap_end = sql(q{SELECT pg_current_wal_insert_lsn()});
 my $snap_images = sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$snap_start', '$snap_end')
 	WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'});
-cmp_ok($snap_images, '>', 0, 'a snapshot logs the images of its own blocks');
+cmp_ok($snap_images, '>', 0, 'a capture logs the images of its own blocks');
 is(sql($preserved) - $preserved_before, $snap_images,
-	'pg_stat_prolly counts each page image a snapshot logs');
+	'pg_stat_prolly counts each page image a capture logs');
 sql(qq{SELECT test_bmap_truncate($rel, 10)});
 sql(qq{SELECT test_bmap_extend($rel, 1)});
 isnt(sql(qq{SELECT phys FROM test_bmap_map($rel) WHERE blkno = 10}), $phys,

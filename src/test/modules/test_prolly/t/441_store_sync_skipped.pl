@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# At wal_level minimal, as at the levels for backups, a share or snapshot
+# At wal_level minimal, as at the levels for backups, a share or capture
 # of block-mapped storage logs its own blocks as images (PRESERVE), and its
 # record says so; one holding no block of its own logs none.  None syncs
 # the page store, a whole-file fsync that wrote back every page the kernel
@@ -58,10 +58,10 @@ my $dirty = q{UPDATE app.t SET v = v + 1 WHERE id % 5 = 0};
 # A commit keeping pages changed since logs their images.
 like(logged_by($dirty, q{SELECT dolt_commit('-am', 'c1')}),
 	qr/^([1-9]\d*) \1 [1-9]\d*$/,
-	'a commit\'s kept snapshots log their own blocks as images');
+	'a commit\'s kept roots log their own blocks as images');
 
 # A hard reset of a dirty working set: its new storage holds no block of
-# its own; the snapshots it shares were logged when taken.
+# its own; the roots it shares were logged when captured.
 like(logged_by($dirty, q{SELECT dolt_reset('--hard')}),
 	qr/^0 0 /, 'a hard reset logs no image');
 is(sql(q{SELECT count(*), sum(v) FROM app.t}), '5000|1000',
@@ -79,17 +79,17 @@ like(sql(q{SELECT dolt_checkout('fresh'); SELECT count(*), sum(v) FROM app.t}),
 	qr/^5000\|1000$/m, 'the branch has the commit\'s rows');
 sql(q{SELECT dolt_reset('--hard')});
 
-# A snapshot holding blocks of its own logs them; one holding none logs
+# A capture holding blocks of its own logs them; one holding none logs
 # none, but its record says so all the same.
 sql(q{SET debug_block_mapped_heap = on;
 	CREATE TABLE plain (a int, b text);
 	INSERT INTO plain SELECT g, repeat('p', 200) FROM generate_series(1, 2000) g});
 my $plain = sql(q{SELECT pg_relation_filenode('plain')});
 like(logged_by(q{UPDATE plain SET a = a + 1 WHERE a % 10 = 0},
-		qq{SELECT test_bmap_snapshot_take($plain)}),
-	qr/^([1-9]\d*) \1 1$/, 'a snapshot with blocks of its own logs them');
-is(logged_by(q{SELECT 1}, qq{SELECT test_bmap_snapshot_take($plain)}),
-	'0 0 1', 'a snapshot with none logs none');
+		qq{SELECT test_bmap_root_capture($plain)}),
+	qr/^([1-9]\d*) \1 1$/, 'a capture with blocks of its own logs them');
+is(logged_by(q{SELECT 1}, qq{SELECT test_bmap_root_capture($plain)}),
+	'0 0 1', 'a capture with none logs none');
 
 $node->stop;
 done_testing();

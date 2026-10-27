@@ -6,8 +6,8 @@
 # the map).  Redo of the share has the copy read the page as changed, as
 # the primary's flush of the source's buffers gives it: after a crash, on a
 # standby, and from a base backup taken across the share.  The same holds
-# for a kept snapshot taken at commit: a page of the snapshot's own changed
-# in place after its image reads as changed from the snapshot on a promoted
+# for a root captured at commit: a page of the root's own changed
+# in place after its image reads as changed from the root on a promoted
 # standby.
 
 use strict;
@@ -127,8 +127,8 @@ is(sql(qq{SELECT test_bmap_rows_digest($made)}), $after, 'and the copy after a c
 is(sql(qq{SELECT test_bmap_rows_digest($k)}), $after, 'as the source');
 is(sql(q{SELECT count(*) FROM cow.k}), '25', 'the rows');
 
-# A snapshot the same way: its own page logged as an image, then locked and
-# pruned in place before the snapshot's record.
+# A capture the same way: its own page logged as an image, then locked and
+# pruned in place before the capture's record.
 sql(q{CREATE TABLE cow.s (a int PRIMARY KEY, b text);
 	INSERT INTO cow.s SELECT g, repeat('s', 230) FROM generate_series(1, 30) g});
 sql(q{DELETE FROM cow.s WHERE a BETWEEN 2 AND 6});
@@ -140,27 +140,27 @@ $reader->query_safe(q{BEGIN;
 	DECLARE c CURSOR FOR SELECT a FROM cow.s WHERE a >= 1 ORDER BY a FOR UPDATE});
 $op = $node->background_psql('postgres', on_error_stop => 0);
 $op->query_safe(q{SELECT injection_points_set_local();
-	SELECT injection_points_attach('bmap-snapshot-preserved', 'wait')});
+	SELECT injection_points_attach('bmap-root-preserved', 'wait')});
 $op->query_until(qr/started/,
-	qq{\\echo started\nSELECT test_bmap_snapshot_take($srel) AS id \\gset\n});
-$node->wait_for_event('client backend', 'bmap-snapshot-preserved');
+	qq{\\echo started\nSELECT test_bmap_root_capture($srel) AS id \\gset\n});
+$node->wait_for_event('client backend', 'bmap-root-preserved');
 $reader->query_safe(q{FETCH 1 FROM c; COMMIT});
-sql(q{SELECT injection_points_detach('bmap-snapshot-preserved')});
-sql(q{SELECT injection_points_wakeup('bmap-snapshot-preserved')});
+sql(q{SELECT injection_points_detach('bmap-root-preserved')});
+sql(q{SELECT injection_points_wakeup('bmap-root-preserved')});
 my $id = $op->query_safe(q{SELECT :'id'});
 $op->quit;
 $reader->quit;
-my $kept = sql(qq{SELECT test_bmap_share_snapshot($srel, $id)});
+my $kept = sql(qq{SELECT test_bmap_share_root($id)});
 my $skept = sql(qq{SELECT test_bmap_rows_digest($kept)});
 is($skept, sql(qq{SELECT test_bmap_rows_digest($srel)}),
-	'a relation made of the snapshot has the page as changed');
+	'a relation made of the root has the page as changed');
 
-# The standby, promoted, makes a relation of its snapshot too.
+# The standby, promoted, makes a relation of its root too.
 $node->wait_for_replay_catchup($standby);
 $standby->promote;
-my $skept2 = $standby->safe_psql('postgres', qq{SELECT test_bmap_share_snapshot($srel, $id)});
+my $skept2 = $standby->safe_psql('postgres', qq{SELECT test_bmap_share_root($id)});
 is($standby->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($skept2)}), $skept,
-	'so does one a standby makes of its snapshot');
+	'so does one a standby makes of its root');
 
 $standby->stop;
 $node->stop;

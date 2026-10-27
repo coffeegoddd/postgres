@@ -136,7 +136,7 @@ CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- The slot following the page store's flushes for shares and snapshots.
+-- The slot following the page store's flushes for shares and captures.
 CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT flushing int4)
 RETURNS record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -233,26 +233,6 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_tree(relnumber oid,
 	OUT level int4, OUT first int8, OUT block int8, OUT refs int4)
 RETURNS SETOF record
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
--- A tree map's snapshots: kept (an id), let go of, listed, and copied into a
--- new relation file number (its main fork alone), which test_bmap_unlink()
--- drops.
-CREATE FUNCTION test_bmap_snapshot_take(relnumber oid)
-RETURNS int8
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_snapshot_release(relnumber oid, id int8)
-RETURNS bool
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_snapshots(relnumber oid,
-	OUT id int8, OUT nblocks int8)
-RETURNS SETOF record
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
-
-CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
-RETURNS oid
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Roots captured into the database's page store: captured (an id), let go
