@@ -231,6 +231,8 @@ extern PrefetchBufferResult PrefetchSharedBuffer(SMgrRelation smgr_reln,
 												 BlockNumber blockNum);
 extern PrefetchBufferResult PrefetchBuffer(Relation reln, ForkNumber forkNum,
 										   BlockNumber blockNum);
+extern Buffer LookupSharedBuffer(RelFileLocator rlocator, ForkNumber forkNum,
+								 BlockNumber blockNum);
 extern bool ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum,
 							 BlockNumber blockNum, Buffer recent_buffer);
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);

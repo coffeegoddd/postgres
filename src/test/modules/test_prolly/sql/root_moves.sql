@@ -7,6 +7,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_moves;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE root_moves SET prolly.history_window = '1000 years';
 \c root_moves
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -177,6 +180,7 @@ RESET prolly.root_interval_commits;
 -- a move to a commit older than any the branch keeps looks no further
 -- back than the oldest it keeps: a few commits read, not the history
 ALTER DATABASE root_moves SET prolly.history_min_commits = 2;
+ALTER DATABASE root_moves SET prolly.history_window = '1 microsecond';
 DO $$
 BEGIN
 	FOR i IN 1..20 LOOP
@@ -198,6 +202,7 @@ SELECT pg_stat_force_next_flush();
 SELECT reads() - :reads_before < 40 AS few_commits_read;
 SELECT digest() = (SELECT d FROM digests WHERE n = 310) AS at_k10;
 ALTER DATABASE root_moves RESET prolly.history_min_commits;
+ALTER DATABASE root_moves SET prolly.history_window = '1000 years';
 
 \c :home
 DROP DATABASE root_moves;

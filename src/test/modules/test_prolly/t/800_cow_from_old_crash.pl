@@ -13,8 +13,9 @@
 # - a checkpoint between the capture and the change logs the copies'
 #   images, so a crash then, the old blocks lost, recovers the working set;
 # - a checkpoint that begins as a copy is made, its redo pointer past the
-#   capture, has the copy's image follow it (bmap_copy_images_late), so a
-#   replay from that checkpoint, the old block lost, has the page;
+#   capture, gives the copy its image after all (the insert's own
+#   full-page-write check), so a replay from that checkpoint, the old block
+#   lost, has the page;
 # - with full_page_writes off, copies log their images.
 
 use strict;
@@ -76,8 +77,10 @@ sub run_case
 {
 	my ($name, $conf, $race, $fpw) = @_;
 	my $node = PostgreSQL::Test::Cluster->new("cow_$name");
-	$node->init;
+	$node->init(allows_streaming => $conf eq '' ? 1 : 0);
+	# (a page's stamp is its buffer's: the pages are to stay cached)
 	$node->append_conf('postgresql.conf', qq{
+shared_buffers = 32MB
 autovacuum = off
 checkpoint_timeout = 1h
 max_wal_size = 1GB
@@ -129,7 +132,7 @@ $conf});
 		$sql->(q{UPDATE app.t SET v = v - 2 WHERE id % 40 = 0;
 			SELECT dolt_commit('-am', 'race')});
 		$before = index_blocks($node);
-		my $late = counted($node, 'bmap_copy_images_late');
+		my $from = $sql->('SELECT pg_current_wal_insert_lsn()');
 		my $w = $node->background_psql('postgres');
 		$w->query_safe(q{SELECT injection_points_set_local()});
 		$w->query_safe(
@@ -160,12 +163,79 @@ CHECKPOINT;
 		$w->quit;
 		$c->quit;
 		$now = $sql->($contents);
-		cmp_ok(counted($node, 'bmap_copy_images_late'), '>', $late,
-			"$name: a copy made as a checkpoint began was imaged after all");
+		my $to = $sql->('SELECT pg_current_wal_insert_lsn()');
+
+		# the copy that waited: decided without its image, it was given it
+		# by the insert's own full-page-write check (the page block's image
+		# one to restore, not one for WAL verification only)
+		my ($stdout, $stderr);
+		($stdout, $stderr) = run_command(
+			[ 'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
+			  '--start' => $from, '--end' => $to, '--rmgr' => 'BlockMap' ]);
+		my @imaged = grep { /REMAP .*\(from old\).*blkref #\d+: rel \S+ blk \d+ FPW$/ }
+		  split /\n/, $stdout;
+		cmp_ok(scalar(@imaged), '>', 0,
+			"$name: a copy made as a checkpoint began carries the page's image");
 		lose_old_blocks($node, $before);
 		is($sql->($contents), $now,
 			"$name: a replay from that checkpoint, the old blocks lost, has the working set");
 		is($sql->($checked), 't', "$name: and its indexes are valid");
+
+		# a checkpoint between a capture's images and its record: no page is
+		# stamped (its image may be before the redo pointer, and a stamp
+		# past it would let a later full-page-write decision skip the
+		# image), and the next change's copies log their images; without the
+		# checkpoint, none do
+		$sql->(q{SET debug_block_mapped_heap = on;
+			CREATE TABLE plain (a int, b text);
+			INSERT INTO plain SELECT g, repeat('p', 200) FROM generate_series(1, 2000) g});
+		my $plain = $sql->(q{SELECT pg_relation_filenode('plain')});
+		my $copies = sub {
+			my $from = $sql->('SELECT pg_current_wal_insert_lsn()');
+			$sql->(q{UPDATE plain SET a = -a WHERE a % 20 = 0});
+			my $to = $sql->('SELECT pg_current_wal_insert_lsn()');
+			my ($out) = run_command(
+				[ 'pg_waldump', '--path' => $node->data_dir . '/pg_wal',
+				  '--start' => $from, '--end' => $to, '--rmgr' => 'BlockMap' ]);
+			my @remaps = grep { m{REMAP rel \d+/\d+/$plain;} } split /\n/, $out;
+			return (scalar(@remaps), scalar(grep { /\(from old\)/ } @remaps));
+		};
+		$sql->(qq{SELECT test_bmap_root_capture($plain)});
+		my ($n, $old) = $copies->();
+		ok($n > 0 && $old == $n, "$name: copies after a capture log no images ($old of $n)");
+		my $stamped = counted($node, 'bmap_pages_stamped');
+		$w = $node->background_psql('postgres');
+		$w->query_safe(q{SELECT injection_points_set_local()});
+		$w->query_safe(
+			q{SELECT injection_points_attach('bmap-root-preserved', 'wait')});
+		$w->query_until(qr/capturing/, qq{\\echo capturing
+SELECT test_bmap_root_capture($plain);
+});
+		$node->wait_for_event('client backend', 'bmap-root-preserved');
+		$redo = $sql->(q{SELECT redo_lsn FROM pg_control_checkpoint()});
+		$c = $node->background_psql('postgres');
+		$c->query_until(qr/checkpointing/, q{\echo checkpointing
+CHECKPOINT;
+});
+		$began = 0;
+		for (1 .. 300)
+		{
+			$began = $sql->(qq{SELECT EXISTS (SELECT FROM pg_stat_activity
+				WHERE backend_type = 'checkpointer' AND wait_event LIKE 'Buffer%')
+			OR (SELECT redo_lsn FROM pg_control_checkpoint()) <> '$redo'}) eq 't';
+			last if $began;
+			usleep(100_000);
+		}
+		ok($began, "$name: a checkpoint began during the capture");
+		$sql->(q{SELECT injection_points_detach('bmap-root-preserved');
+			SELECT injection_points_wakeup('bmap-root-preserved')});
+		$w->quit;
+		$c->quit;
+		is(counted($node, 'bmap_pages_stamped'), $stamped,
+			"$name: a capture a checkpoint began during stamps no page");
+		($n, $old) = $copies->();
+		ok($n > 0 && $old == 0,
+			"$name: copies after a capture a checkpoint began during log their images ($old of $n)");
 	}
 
 	# a checkpoint between the capture and the change: images logged

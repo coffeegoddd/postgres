@@ -31,6 +31,9 @@ SELECT current_database() AS home \gset
 -- hundreds.)
 CREATE DATABASE regress_history_created;
 ALTER DATABASE regress_history_created SET client_min_messages = warning;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE regress_history_created SET prolly.history_window = '1000 years';
 \c regress_history_created
 CREATE SCHEMA hc VERSIONED;
 CREATE SCHEMA hc2 VERSIONED;

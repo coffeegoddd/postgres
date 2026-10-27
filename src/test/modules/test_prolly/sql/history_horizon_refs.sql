@@ -108,13 +108,16 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT hr_readable('tagged', 'remote', 'stashbase', 'ours', 'theirs') AS refs_kept;
 SELECT hr_readable('xa', 'xb') AS both_bases_kept;
 
--- A detached checkout's old commit keeps it, too, kept once left.
-SELECT (dolt_checkout((SELECT hash FROM hr_names WHERE name = 'old4')))[1] AS detached;
+-- A detached checkout's old commit keeps it, too, kept once left.  (The
+-- boundary's: old4's data is severed now, and its root, on severed
+-- history, is out of every window, so it can't be checked out.)
+SELECT hr_err(format('SELECT dolt_checkout(%L)', (SELECT hash FROM hr_names WHERE name = 'old4'))) AS severed_checkout;
+SELECT (dolt_checkout((SELECT hash FROM hr_names WHERE name = 'old5')))[1] AS detached;
 SELECT (dolt_checkout('main'))[1] AS back;
 SELECT count(*) AS detached_kept FROM pg_branch WHERE brname LIKE 'detached/%';
 SELECT commits FROM dolt_history_drop(now() - interval '30 days');
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
-SELECT hr_readable('old4') AS detached_kept;
+SELECT hr_readable('old5') AS detached_kept;
 
 -- The tag, the merge's and the stash's lineages merge and diff still.
 SELECT count(*) > 0 AS tag_diff FROM dolt_diff('main', 'tg', NULL::hr.t);
