@@ -1,13 +1,12 @@
 -- A move that compares a diff's count with a bound counts the diff only up
--- to the bound: whether the pages kept as of the head pay for a hard reset
--- (B, the baseline's rows from the commit, against H, the head's, and L,
--- the change finder's count since the baseline), and whether sharing
--- another branch's pages costs less than writing the rows that differ.
--- With a working set folded into the baseline (as the fold worker does),
--- B is as large as the working set's changes, which here touch every leaf
--- of the table: counted whole, the reset reads the table's tree, about
--- 2,000 nodes; counted to H + 1, a few dozen.  The decisions are the ones
--- whole counts would make, shown here case by case.
+-- to the bound: whether sharing another branch's pages costs less than
+-- writing the rows that differ.  And a hard reset to a commit whose pages
+-- aren't kept, from a dirty working set, gives the table the pages kept as
+-- of the head whatever the working set holds, without counting how far it
+-- is from the commit: the working set's changes are discarded in O(1), and
+-- only the rows the head and the commit differ by (H) are written, however
+-- many rows the working set changed (L) or its baseline holds (B), folded
+-- or not.  Shown here case by case.
 
 SELECT current_database() AS home \gset
 CREATE DATABASE bounded_counts;
@@ -87,12 +86,10 @@ SELECT t_digest() = :'at_b' AS at_b, clean();
 DROP TABLE bc.t;
 SELECT dolt_commit('-Am', 't dropped') IS NOT NULL AS committed;
 
--- A reset that doesn't pay, where L is at least B - H and both are large:
--- the head 20,000 rows from y, 60,000 more rows folded, and 61,000 changed
--- since.  B is counted in one walk, asking the change finder at each
--- bound past H, so it reads about what counting B and H whole does
--- (about 22,300 nodes, mostly writing the rows), not B's first H rows
--- again at each bound (about 30,500).
+-- L at least B - H and both large: the head 20,000 rows from y, 60,000
+-- more rows folded, and 61,000 changed since.  The head's pages are given
+-- back, and only H's 20,000 rows written, not the 81,000 the working set
+-- is from y (the working set's rows, neither folded nor counted).
 CREATE TABLE bc.l (id int PRIMARY KEY, v int NOT NULL, w text NOT NULL);
 INSERT INTO bc.l SELECT g, 0, repeat(md5(g::text), 3)
 FROM generate_series(1, 100000) g;
@@ -145,8 +142,10 @@ LANGUAGE sql AS $$
 $$;
 
 -- B small: the working set brought to y but for 5 rows and folded; the
--- head is 10,000 rows from y, more than the baseline is.  Not restored:
--- the 5 rows are written.
+-- head is 10,000 rows from y, more than the baseline is.  Restored all
+-- the same: the working set's changes are discarded, and the head's
+-- 10,000 rows written (the move's own distance, whatever the working set
+-- holds).
 SELECT commit_pair(10000, 'y1') AS y \gset
 SELECT d_digest() AS at_y \gset
 SELECT back_and_forth(:'x', :'y');
@@ -180,7 +179,7 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 SELECT :'y' AS x \gset
 
 -- L big: 6,000 rows changed and folded, then 7,000 more since, more than
--- B less H.  Not restored.
+-- B less H.  Restored: the 50 rows written.
 SELECT commit_pair(50, 'y3') AS y \gset
 SELECT d_digest() AS at_y \gset
 SELECT back_and_forth(:'x', :'y');
@@ -246,8 +245,8 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 	   d_digest() = :'at_y' AS at_y, clean();
 SELECT :'y' AS x \gset
 
--- The same with 9,000 rows changed, fewer than twice 5,000.  Not
--- restored.
+-- The same with 9,000 rows changed, fewer than twice 5,000.  Restored:
+-- the 5,000 rows written.
 SELECT commit_pair(5000, 'y7') AS y \gset
 SELECT d_digest() AS at_y \gset
 SELECT back_and_forth(:'x', :'y');

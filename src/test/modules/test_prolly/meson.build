@@ -241,6 +241,7 @@ tests += {
       'kept_pages',
       'kept_head_restore',
       'bounded_counts',
+      'dirty_discard',
       'first_use_kept',
       'branch_catalog_index',
       'kept_commit_shares',
