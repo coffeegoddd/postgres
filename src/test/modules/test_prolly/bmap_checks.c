@@ -484,6 +484,19 @@ test_bmap_drop_buffer(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Have each of a relation's cached pages checked again before it next
+ * changes, as when its storage manager begins sharing them
+ * (MarkRelationPagesShared()), though none is shared.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_mark_shared);
+Datum
+test_bmap_mark_shared(PG_FUNCTION_ARGS)
+{
+	MarkRelationPagesShared(locator_of(PG_GETARG_OID(0)));
+	PG_RETURN_VOID();
+}
+
+/*
  * test_bmap_fold_begin(relnumber): begin a fold; its list's lineage, its
  * epoch and the relation's length then.
  */
