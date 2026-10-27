@@ -1336,6 +1336,63 @@ retry:
 	return relation;
 }
 
+/* relations whose entries name storage a move replaced (rd_replaced) */
+static List *replaced_relids = NIL;
+
+/*
+ * A transaction whose snapshot can't move (REPEATABLE READ, SERIALIZABLE)
+ * reads a relation as its snapshot saw it: where a move (a hard reset)
+ * since gave the relation new storage, kept the storage it replaced for
+ * such snapshots (branch_storage_hook), the entry names that one, until
+ * the transaction ends (AtEOXact_RelationCache()).  Such an entry is
+ * read only (RelationCheckReplacedWrite()).  A snapshot that may be older
+ * than a move it can't be told of can't read the relation.
+ */
+static void
+replaced_storage(Relation relation)
+{
+	RelFileNumber rel = relation->rd_locator.relNumber;
+	bool		unsure;
+	MemoryContext old;
+
+	if (relation->rd_id < FirstNormalObjectId || !IsTransactionState() ||
+		!IsolationUsesXactSnapshot() || !FirstSnapshotSet ||
+		HistoricSnapshotActive())
+		return;
+	if (!branch_storage_hook(relation->rd_rel->reltablespace, &rel,
+							 GetTransactionSnapshot(), &unsure))
+	{
+		if (unsure)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize access due to a concurrent move of relation \"%s\"",
+							RelationGetRelationName(relation)),
+					 errdetail("The storage this transaction's snapshot would read is no longer known.")));
+		return;
+	}
+	relation->rd_locator.relNumber = rel;
+	relation->rd_replaced = true;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	replaced_relids = list_append_unique_oid(replaced_relids, relation->rd_id);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Refuse a change of relation (a write, a row lock, a definition change)
+ * while its entry names storage a move replaced: the transaction's
+ * snapshot is older than the move, and what it would change is gone.
+ */
+void
+RelationCheckReplacedWrite(Relation relation)
+{
+	if (relation->rd_replaced)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to a concurrent move of relation \"%s\"",
+						RelationGetRelationName(relation)),
+				 errdetail("A move (a hard reset) since this transaction's snapshot gave the relation other storage.")));
+}
+
 /*
  * Initialize the physical addressing info (RelFileLocator) for a relcache entry
  *
@@ -1394,6 +1451,9 @@ RelationInitPhysicalAddr(Relation relation)
 		}
 
 		relation->rd_locator.relNumber = relation->rd_rel->relfilenode;
+		relation->rd_replaced = false;
+		if (branch_storage_hook != NULL)
+			replaced_storage(relation);
 	}
 	else
 	{
@@ -3676,6 +3736,21 @@ AtEOXact_RelationCache(bool isCommit)
 
 	/* (kept in TopTransactionContext, which goes with the transaction) */
 	branch_new_states = NIL;
+
+	/*
+	 * (entries naming storage a move replaced, for this transaction's
+	 * snapshot alone: found again by the next transaction)
+	 */
+	foreach_oid(relid, replaced_relids)
+	{
+		Relation	rel;
+
+		RelationIdCacheLookup(relid, rel);
+		if (rel != NULL && rel->rd_replaced)
+			rel->rd_isvalid = false;
+	}
+	list_free(replaced_relids);
+	replaced_relids = NIL;
 
 	/*
 	 * Unless the eoxact_list[] overflowed, we only need to examine the rels

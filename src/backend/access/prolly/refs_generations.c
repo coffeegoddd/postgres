@@ -78,6 +78,7 @@
 #include "port/atomics.h"
 #include "refs_generations.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -150,6 +151,23 @@ typedef struct HeadRestore
 	FullTransactionId xid;
 } HeadRestore;
 
+/*
+ * Storage a restore replaced, kept for the snapshots older than its move
+ * (see branch_note_replaced()): a relation's new storage (newrel, in
+ * tablespace, as pg_class names them) and the storage it replaced (oldrel),
+ * by the transaction that replaced it.
+ */
+typedef struct ReplacedStorage
+{
+	Oid			database;		/* InvalidOid: a free entry */
+	Oid			tablespace;
+	RelFileNumber newrel;
+	RelFileNumber oldrel;
+	FullTransactionId xid;
+} ReplacedStorage;
+
+#define REPLACED_STORAGES	1024
+
 typedef struct BranchGenerations
 {
 	LWLock		lock;
@@ -166,6 +184,11 @@ typedef struct BranchGenerations
 	int			restores_hand;
 	FullTransactionId restores_evicted;
 	HeadRestore restores[HEAD_RESTORES];
+	/* (replaced storage: the latest of those let go of stands for them all) */
+	pg_atomic_uint32 nreplaced;	/* entries ever used: none, nothing to ask */
+	int			replaced_hand;
+	FullTransactionId replaced_evicted;
+	ReplacedStorage replaced[REPLACED_STORAGES];
 } BranchGenerations;
 
 static BranchGenerations *gens = NULL;
@@ -236,6 +259,7 @@ branch_generations_shmem_init(void *area)
 	pg_atomic_init_u64(&g->epoch, 0);
 	g->counter = 1;
 	g->absent = 1;
+	pg_atomic_init_u32(&g->nreplaced, 0);
 	gens = g;
 }
 
@@ -334,6 +358,107 @@ branch_head_restore_unseen(Oid branch, Snapshot snap)
 											snap->xmin);
 	return !FullTransactionIdPrecedes(xid, xmin) &&
 		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
+}
+
+/*
+ * The transaction gave a relation new storage (newrel, in tablespace as
+ * pg_class names it) in place of oldrel, which it keeps rather than
+ * drops: a snapshot that doesn't see the transaction reads oldrel still
+ * (branch_replaced_storage()), as if the change hadn't been made.  An
+ * entry is let go of once no snapshot can be older than its transaction;
+ * with every entry still needed, the oldest is, the latest of those let
+ * go of standing for them all.  Nothing survives a restart, nor needs to:
+ * no snapshot after one is older than a change before it.
+ */
+void
+branch_note_replaced(Oid tablespace, RelFileNumber oldrel,
+					 RelFileNumber newrel, FullTransactionId xid)
+{
+	BranchGenerations *g = shared();
+	ReplacedStorage *slot = NULL;
+	FullTransactionId horizon;
+
+	if (g == NULL)
+		return;
+	horizon = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											   GetOldestNonRemovableTransactionId(NULL));
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < REPLACED_STORAGES && slot == NULL; i++)
+	{
+		ReplacedStorage *r = &g->replaced[i];
+
+		if (!OidIsValid(r->database) || FullTransactionIdPrecedes(r->xid, horizon))
+			slot = r;
+	}
+	if (slot == NULL)
+	{
+		slot = &g->replaced[g->replaced_hand];
+		g->replaced_hand = (g->replaced_hand + 1) % REPLACED_STORAGES;
+		g->replaced_evicted = later(g->replaced_evicted, slot->xid);
+	}
+	slot->database = MyDatabaseId;
+	slot->tablespace = tablespace;
+	slot->newrel = newrel;
+	slot->oldrel = oldrel;
+	slot->xid = xid;
+	if (pg_atomic_read_u32(&g->nreplaced) == 0)
+		pg_atomic_write_u32(&g->nreplaced, 1);
+	LWLockRelease(&g->lock);
+}
+
+/* Does snap not see xid (a transaction other than the backend's own)? */
+static bool
+unseen(FullTransactionId xid, Snapshot snap)
+{
+	FullTransactionId xmin;
+
+	if (!FullTransactionIdIsValid(xid) ||
+		TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(xid)))
+		return false;
+	xmin = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											snap->xmin);
+	return !FullTransactionIdPrecedes(xid, xmin) &&
+		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
+}
+
+/*
+ * The storage snapshot snap reads of a relation whose storage is *rel (in
+ * tablespace, as pg_class names it): the storage before each change of it
+ * snap doesn't see (branch_note_replaced()), into *rel.  True if that is
+ * another; *unsure if a change snap may not see was let go of, so what it
+ * reads can't be told.
+ */
+bool
+branch_replaced_storage(Oid tablespace, RelFileNumber *rel, Snapshot snap,
+						bool *unsure)
+{
+	BranchGenerations *g = shared();
+	bool		moved = false;
+	bool		found = true;
+
+	*unsure = false;
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC ||
+		pg_atomic_read_u32(&g->nreplaced) == 0)
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	while (found)
+	{
+		found = false;
+		for (int i = 0; i < REPLACED_STORAGES && !found; i++)
+		{
+			ReplacedStorage *r = &g->replaced[i];
+
+			if (r->database == MyDatabaseId && r->tablespace == tablespace &&
+				r->newrel == *rel && unseen(r->xid, snap))
+			{
+				*rel = r->oldrel;
+				moved = found = true;
+			}
+		}
+	}
+	*unsure = unseen(g->replaced_evicted, snap);
+	LWLockRelease(&g->lock);
+	return moved;
 }
 
 /* Remember a writer that ended (the lock held exclusively). */

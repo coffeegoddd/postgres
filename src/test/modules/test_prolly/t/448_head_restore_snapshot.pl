@@ -1,13 +1,16 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A hard reset to a commit whose kept pages are gone may give a table the
-# pages kept as of the head, which isn't MVCC-safe: a snapshot taken
-# before the reset commits would then read the head's rows, neither its
-# own nor the commit's.  So while another backend holds an older snapshot
-# (a REPEATABLE READ transaction here, which hasn't read the table, so
-# holds no lock a restore would find taken), the reset writes the rows
-# instead, and that snapshot keeps reading what it saw.  Once it ends, the head's
-# pages are given back as before.
+# A hard reset to a commit whose kept pages are gone gives a table the
+# pages kept as of the head, discarding the working set in O(1), whatever
+# other snapshots there are.  A restore gives the table new storage, which
+# alone isn't MVCC-safe: a snapshot taken before the reset commits would
+# read the head's rows, neither its own nor the commit's.  So the storage
+# replaced is kept, and a transaction whose snapshot can't move and is
+# older than the reset (a REPEATABLE READ transaction here, which hasn't
+# read the table, so holds no lock the restore would wait for) goes on
+# reading it: what it saw.  It can't change it (a serialization failure,
+# as for a row changed since its snapshot).  The storage is dropped by the
+# first keep once no snapshot is older than the reset.
 
 use strict;
 use warnings FATAL => 'all';
@@ -25,7 +28,8 @@ prolly.kept_commits = 1
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
-sql(q{CREATE SCHEMA q VERSIONED;
+sql(q{CREATE EXTENSION test_prolly;
+	CREATE SCHEMA q VERSIONED;
 	CREATE TABLE q.t (id int PRIMARY KEY, v int);
 	INSERT INTO q.t SELECT g, 0 FROM generate_series(1, 1000) g;
 	CREATE TABLE q.u (id int PRIMARY KEY)});
@@ -48,19 +52,38 @@ cycle();
 sql(q{UPDATE q.t SET v = 5});
 is(sql('SELECT sum(v) FROM q.t'), '5000', 'the working set changed');
 
-my $rr = $node->background_psql('postgres');
+my $rr = $node->background_psql('postgres', on_error_stop => 0);
 # (its snapshot taken reading another table: no lock held on q.t, which
 # the restore would otherwise find taken)
 $rr->query_safe(
 	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
 my $before = sql($counts);
+my $record = sql(q{SELECT octet_length(test_refs_value('Kmain'))});
 sql("SELECT dolt_reset('--hard', '$a')");
-is(sql($counts), $before, 'with an older snapshot held, nothing is restored');
+cmp_ok(sql($counts), '>', $before,
+	'with an older snapshot held, the head\'s pages are given back');
 is(sql('SELECT sum(v) FROM q.t'), '0', 'the reset reached the commit');
 is($rr->query_safe('SELECT sum(v) FROM q.t'),
 	'5000', 'the older snapshot still reads what it saw');
-$rr->query_safe('COMMIT');
+is($rr->query_safe(q{SET enable_seqscan = off; SELECT v FROM q.t WHERE id = 7}),
+	'5', 'through the table\'s index too');
+$rr->query(q{UPDATE q.t SET v = 6 WHERE id = 1});
+like($rr->{stderr},
+	qr/could not serialize access due to a concurrent move of relation "t"/,
+	'the older snapshot can\'t change it');
+$rr->{stderr} = '';
+$rr->query_safe('ROLLBACK');
+is($rr->query_safe('SELECT sum(v) FROM q.t'), '0',
+	'a later transaction reads the commit\'s rows');
 $rr->quit;
+# (the storage replaced is let go of by the next keep, no snapshot older
+# than the reset left: the record keeps it until then)
+cmp_ok(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), '>', $record,
+	'the storage replaced is kept by the branch');
+sql(q{UPDATE q.t SET v = 1 WHERE id = 1; SELECT dolt_commit('-am', 'd')});
+is(sql(q{SELECT octet_length(test_refs_value('Kmain'))}), $record,
+	'and let go of by the next keep, no snapshot older than the reset left');
+sql("SELECT dolt_reset('--hard', '$a')");
 
 # With no older snapshot, the head's pages are given back.
 cycle();
@@ -103,9 +126,10 @@ $side->query_safe(
 	q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM q.u});
 $before = sql($counts);
 on_side("SELECT dolt_reset('--hard', '$a')");
-is(sql($counts), $before, 'a snapshot on the branch does');
+cmp_ok(sql($counts), '>', $before,
+	'nor does a snapshot on the branch');
 is($side->query_safe('SELECT sum(v) FROM q.t'),
-	'5000', 'and it still reads what it saw');
+	'5000', 'which still reads what it saw');
 $side->query_safe('COMMIT');
 $side->quit;
 

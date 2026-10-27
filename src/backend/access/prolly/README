@@ -1277,9 +1277,9 @@ move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
 snapshot, O(1), its pg_class row repointed with its oldest transaction ids
-then, as TRUNCATE gives a relation new storage, and the old storage dropped
-at commit.  The branch's other kept commits' snapshots of the relation were
-in the old storage: each is carried into the new one (bmap_snapshot_carry(),
+then, as TRUNCATE gives a relation new storage, and the old storage kept
+for the snapshots older than the move (below).  The branch's other kept
+commits' snapshots of the relation were in the old storage: each is carried into the new one (bmap_snapshot_carry(),
 a slot holding the same subtrees, each a holder more, O(1)), and their
 entries renamed, so those commits stay kept and resets back and forth
 between kept commits restore every time.  A carry's record (a snapshot
@@ -1298,24 +1298,26 @@ dropped (kept_drop_dead()), and a reset back to one writes its rows.  The
 baseline takes the table's entry from the kept baseline,
 whose change log is restored with it, so the fold that follows reads none
 of its rows.  A move to a commit whose pages aren't kept, or whose kept
-pages for a table are gone, may give that table the pages kept as of the
-branch's head instead: that discards the working set's changes in O(1),
-as a reset to the head does, and the move then writes only the rows the
-head and the commit differ by.  It does so only where that costs less
-than writing the rows the working set and the commit differ by, as told
-without folding from the baseline and the change finder's count since it
-(the working set may have been brought near the commit by its own
-writes), and only while no other session on the branch holds a snapshot
-(on main, which sessions don't lock, no other backend of the database):
-such a snapshot would read the head's rows, neither its own nor the
-commit's.  A transaction elsewhere whose snapshot can't move (REPEATABLE
-READ, SERIALIZABLE) may come to the branch later, by a checkout or a read
-of its working set: the move records that it gave the branch its head's
+pages for a table are gone, gives each table that changed since the head
+the pages kept as of the branch's head instead, whatever the working set
+holds: that discards the working set's changes in O(1), as a reset to
+the head does, and the move then writes only the rows the head and the
+commit differ by.  How far the working set is from the commit isn't
+asked: telling it without folding could only bound it (from the
+baseline and the change finder's count since it), and a working set the
+fold worker had folded only part of would be taken for one near the
+commit, and folded and written back, every row of it, where the head's
+pages discard it whatever its size.  A working set brought near the
+commit by its own writes so costs the head's rows from the commit, the
+distance a reset from a clean working set writes too.  Other sessions'
+snapshots don't hold it back either: the storage a restore replaces is
+kept (below), and a snapshot older than the move goes on reading it.  A
+transaction elsewhere whose snapshot can't move (REPEATABLE READ,
+SERIALIZABLE) may come to the branch later, by a checkout or a read of
+its working set: the move records that it gave the branch its head's
 pages (in shared memory: no snapshot outlives a restart), and such a
 transaction, if its snapshot doesn't see the move, fails with a
-serialization failure instead.  A restore of the commit's own kept pages, and a share, aren't
-held back so: a snapshot then reads the commit's rows, as after a
-TRUNCATE, a state the move makes rather than one that never was.  A branch reset back and forth between two commits
+serialization failure instead.  A branch reset back and forth between two commits
 takes this path: each restore gives a table new storage, and the other
 commit's snapshot goes with the old storage.  Whatever still differs
 (definitions, sequences, a table not restored) the move writes as before.
@@ -1323,28 +1325,55 @@ A table isn't restored if its
 storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
-couldn't write its rows, or one of its relations is in use: its rows are
-written.  Its locks are tried, not queued for, so as not to hold up the
-writers behind them.  A page sweep holding one is asked to let go, an
-autovacuum worker asked, once, to cancel its task (as Postgres cancels
-one that blocks a lock waiter) and waited for, until deadlock_timeout
-after the move first asked one, and any other holder waited for, tried
-again a little later each time, until prolly.restore_lock_wait (100 ms)
-after the move first waited: a statement lets go within a moment, a
-transaction left open won't soon, and the rows written instead often cost
-little.  lock_timeout, if set, caps both; the deadlock detector doesn't
-see these waits, so they are bounded, for the whole move.  A
-restore or share given up so is counted in pg_stat_prolly's
-restores_lock_busy.  Nor is one whose baseline
+couldn't write its rows, or the session itself is using one of its
+relations (a scan of it open, an AFTER trigger's event queued): its rows
+are written.  A restore's locks are queued for, as TRUNCATE queues for
+them: giving up would leave the move every row the working set changed
+to write back, however many.  A page sweep holding one lets go of it for
+a waiter, an autovacuum worker is cancelled after deadlock_timeout (as
+for any waiter), the deadlock detector sees the wait, and lock_timeout
+bounds it, failing the move.  A share's locks are tried, not queued for,
+so as not to hold up the writers behind them: a page sweep holding one is
+asked to let go, an autovacuum worker asked, once, to cancel its task (as
+Postgres cancels one that blocks a lock waiter) and waited for, until
+deadlock_timeout after the move first asked one, and any other holder
+waited for, tried again a little later each time, until
+prolly.restore_lock_wait (100 ms) after the move first waited: a
+statement lets go within a moment, a transaction left open won't soon,
+and the rows written instead cost only those the shared table differs
+by.  lock_timeout, if set, caps both; the deadlock detector doesn't see
+these waits, so they are bounded, for the whole move.  A share given up
+so is counted in pg_stat_prolly's restores_lock_busy.  Nor is a table
+restored whose baseline
 holds the commit's rows with fewer than prolly.restore_min_changes (2) of
 them changed since, as its change finder tells from no more than that many
 of its records (the log's entries, none read as a fold reads them):
 restoring a table costs about as much as writing a few rows back and
 syncing their pages as the commit's are kept again, so a reset of a row
-writes it.  Like TRUNCATE, a restore isn't MVCC-safe: a
-snapshot taken before the move commits reads the restored pages after
-it.  So a small reset, its rows written, is MVCC-safe, and a large one,
-restored, isn't, for a snapshot older than the move.
+writes it.
+
+A restore is MVCC-safe where TRUNCATE isn't: the storage it replaces
+isn't dropped at commit but kept, a retired entry of the branch's kept
+list naming the storage itself (its relations' snapshot
+BRANCH_KEPT_STORAGE), and shared memory names each relation's new
+storage's predecessor and the move that replaced it
+(branch_note_replaced()).  A transaction whose snapshot can't move and
+doesn't see the move reads the old storage: the relation cache gives its
+entry the old storage as it finds the relation's (RelationInitPhysicalAddr()
+asks branch_storage_hook), until the transaction ends, so it reads the
+rows it saw, its indexes and TOAST table alike.  It can't change them: a
+write, a row lock or a definition change of such an entry fails with a
+serialization failure, as a REPEATABLE READ write of a row changed since
+its snapshot does.  Statements of other transactions hold the
+relation's locks while they read it, so the move waits for them.  The
+first keep after every snapshot older than the move has ended (the
+oldest xmin any backend holds is later than the move) lets go of the
+old storage, dropping it as its transaction commits; a crash leaves it
+to the first keep after the restart, and a branch's deletion drops it.
+Shared memory names the last 1024 such storages: once one still needed
+is let go of to make room, a snapshot that may be older than it can't
+tell which storage it reads, and reading a relation of the database
+fails with a serialization failure.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
