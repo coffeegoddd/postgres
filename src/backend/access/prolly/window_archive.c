@@ -448,13 +448,22 @@ archive_archived(const ProllyHash *id)
  * taken before the horizon's (a sever archives holding only it, so
  * collections go on meanwhile).
  */
-static void
+/* A sever in the background: it takes the severs' turn only if free. */
+static bool sever_in_background = false;
+static bool sever_busy = false;	/* the last sever found the turn taken */
+
+static bool
 sever_slot_lock(void)
 {
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, HORIZON_LOCK_CLASSID, 1, 0);
-	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	/*
+	 * (in the background, never waited for: a worker waiting on another
+	 * gets it cancelled, autovacuum's rule, and the next visit tries again)
+	 */
+	return LockAcquire(&tag, ExclusiveLock, false, sever_in_background) !=
+		LOCKACQUIRE_NOT_AVAIL;
 }
 
 static void
@@ -2318,7 +2327,12 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 	 * plan takes a while, and commits on every branch would wait), nor the
 	 * horizon (an archive takes longer, and collections would wait).
 	 */
-	sever_slot_lock();
+	sever_busy = false;
+	if (!sever_slot_lock())
+	{
+		sever_busy = true;
+		return;
+	}
 	sever_clock = GetCurrentTimestamp();
 	for (int tries = 1;; tries++)
 	{
@@ -2506,6 +2520,10 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 #define LAST_FULL_SETTING	"history_window.last_full"
 #define FAILURES_SETTING	"history_window.failures"
 #define RETRY_SETTING		"history_window.retry_at"
+#define TRANSIENT_SETTING	"history_window.transient"
+
+/* Failures that pass by themselves tried again at once, this many in a row. */
+#define TRANSIENT_MOST		5
 
 static void
 size_part(const char *name, int nchunks, uint64 size, bool settled, void *arg)
@@ -2677,7 +2695,7 @@ moved_cuts(TimestampTz now, bool *any)
  * cut for size.
  */
 static TimestampTz
-size_cut_due(const ProllyWindowPolicy *db, TimestampTz now)
+size_cut_due(const ProllyWindowPolicy *db, TimestampTz now, bool *want_full)
 {
 	int64		measured;
 	int64		batch = db->batch > 0 ? db->batch : DEFAULT_BACKGROUND_BATCH;
@@ -2692,13 +2710,13 @@ size_cut_due(const ProllyWindowPolicy *db, TimestampTz now)
 	if (measured < 0 || measured <= db->max_bytes)
 	{
 		if (store_bytes() > (uint64) db->max_bytes)
-			config_int_set(FULL_WANTED_SETTING, 1, false);
+			*want_full = true;
 		return DT_NOBEGIN;
 	}
 	if (config_int(OVER_COUNT_SETTING, 0) <
 		(db->action == PROLLY_WINDOW_DELETE ? 2 : 1))
 	{
-		config_int_set(FULL_WANTED_SETTING, 1, false);
+		*want_full = true;
 		return DT_NOBEGIN;
 	}
 	/* (a batch past the oldest history kept, never short of the last) */
@@ -2728,12 +2746,21 @@ maintain_as_owner(const ProllyWindowPolicy *db, List *moved,
 	SetUserIdAndSecContext(owner, save_sec | SECURITY_RESTRICTED_OPERATION);
 	PG_TRY();
 	{
-		foreach_ptr(LineageCut, lc, moved)
-			config_int_set(lc->key, lc->cut, false);
+		/*
+		 * (the cuts tried noted after, not before: a refs write takes the
+		 * refs' lock to the transaction's end, and commits would wait on
+		 * this worker through the archive's transfer)
+		 */
+		sever_in_background = true;
 		sever_cut(db->action, NULL, size_cut, r);
+		sever_in_background = false;
+		if (!sever_busy)
+			foreach_ptr(LineageCut, lc, moved)
+				config_int_set(lc->key, lc->cut, false);
 	}
 	PG_FINALLY();
 	{
+		sever_in_background = false;
 		SetUserIdAndSecContext(save_userid, save_sec);
 	}
 	PG_END_TRY();
@@ -2758,6 +2785,7 @@ archive_maintain(void)
 	TimestampTz size_cut;
 	List	   *moved;
 	bool		any;
+	bool		want_full = false;
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	int64		failures;
@@ -2769,9 +2797,13 @@ archive_maintain(void)
 	if (now < config_int(RETRY_SETTING, DT_NOBEGIN))
 		return false;
 	moved = moved_cuts(now, &any);
-	size_cut = size_cut_due(&db, now);
+	size_cut = size_cut_due(&db, now, &want_full);
 	if (moved == NIL && size_cut == DT_NOBEGIN)
+	{
+		if (want_full)
+			config_int_set(FULL_WANTED_SETTING, 1, false);
 		return false;
+	}
 
 	memset(&r, 0, sizeof(r));
 	BeginInternalSubTransaction(NULL);
@@ -2799,11 +2831,14 @@ archive_maintain(void)
 		 * cancel by a lock's waiter, a lock not got: tried again at the
 		 * next visit, no wait, no failure counted)
 		 */
-		if (edata->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
-			edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE ||
-			edata->sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED)
+		if ((edata->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE ||
+			 edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			 edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE ||
+			 edata->sqlerrcode == ERRCODE_T_R_DEADLOCK_DETECTED) &&
+			config_int(TRANSIENT_SETTING, 0) + 1 < TRANSIENT_MOST)
 		{
+			config_int_set(TRANSIENT_SETTING,
+						   config_int(TRANSIENT_SETTING, 0) + 1, false);
 			ereport(LOG,
 					(errmsg("background severing of history of database \"%s\" given up for now: %s",
 							get_database_name(MyDatabaseId), edata->message),
@@ -2830,9 +2865,13 @@ archive_maintain(void)
 		return false;
 	}
 	PG_END_TRY();
+	/* (another sever has the turn: this visit's cuts tried at the next) */
+	if (sever_busy)
+		return false;
 	config_int_set(FAILURES_SETTING, 0, true);
 	config_int_set(RETRY_SETTING, 0, true);
-	if (r.fragment > 0)
+	config_int_set(TRANSIENT_SETTING, 0, true);
+	if (r.fragment > 0 || want_full)
 		config_int_set(FULL_WANTED_SETTING, 1, false);
 	if (size_cut != DT_NOBEGIN)
 	{
@@ -3067,7 +3106,7 @@ archive_repair(const char *source, int nfragments)
 	 * first, before the chunk store's that a receive takes to the end of
 	 * the transaction, as a collection takes them.
 	 */
-	sever_slot_lock();
+	(void) sever_slot_lock();
 	horizon_lock(ExclusiveLock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, r, records)
