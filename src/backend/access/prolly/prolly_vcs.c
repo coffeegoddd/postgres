@@ -273,16 +273,33 @@ log_name(const ProllyRefsRoutine *refs, const char *ref, const char **name,
 						refs->info.name)));
 	*name = ref;
 	*branch = NULL;
+
+	/*
+	 * ("remotes/" names a remote-tracking branch, of a remote that must
+	 * exist, as a branch of that name would be one no fetch makes; it may
+	 * have no log yet)
+	 */
 	if (strncmp(ref, "remotes/", 8) == 0)
 	{
 		LogName		ln = {ref + 8, NULL};
 
 		PROLLY_CALL(refs, remotes, match_remote, &ln);
-		if (ln.remote != NULL)
-		{
-			*name = ln.remote;
-			*branch = ref + 8 + strlen(ln.remote) + 1;
-		}
+		if (ln.remote == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("no remote is named by \"%s\"", ref),
+					 errhint("A remote-tracking branch is \"remotes/<remote>/<branch>\".")));
+		*name = ln.remote;
+		*branch = ref + 8 + strlen(ln.remote) + 1;
+		return;
+	}
+	{
+		ProllyBranchId id;
+
+		if (!PROLLY_CALL(refs, branch_lookup, ref, &id))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch \"%s\" does not exist", ref)));
 	}
 }
 
@@ -306,10 +323,15 @@ head_log(FunctionCallInfo fcinfo, TimestampTz from, TimestampTz to,
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	ProllyDatabaseComponents dc;
-	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *ref;
 	const char *name;
 	const char *branch;
 
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a head log's ref can't be null")));
+	ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	prolly_database_components(&dc);
 	log_name(dc.refs, ref, &name, &branch);
 	InitMaterializedSRF(fcinfo, 0);
@@ -325,7 +347,9 @@ head_log(FunctionCallInfo fcinfo, TimestampTz from, TimestampTz to,
  *
  * A branch's head log (ref "remotes/<remote>/<branch>": a remote-tracking
  * branch's): each move of its head, in order, with when it was made and
- * the commit it moved to.
+ * the commit it moved to.  A move's date is when it was made in its
+ * transaction, not when that committed.  An unknown branch or remote is
+ * an error.
  */
 Datum
 prolly_head_log(PG_FUNCTION_ARGS)
@@ -339,7 +363,7 @@ prolly_head_log(PG_FUNCTION_ARGS)
  *	returns setof (seq bigint, moved_at timestamptz, commit_hash text)
  *
  * The moves of ref's head log dated from_time..to_time (NULL: unbounded),
- * newest first if backward.
+ * newest first if backward (NULL: not).  ref can't be NULL.
  */
 Datum
 prolly_head_log_range(PG_FUNCTION_ARGS)
@@ -354,7 +378,8 @@ prolly_head_log_range(PG_FUNCTION_ARGS)
  * prolly_head_at(ref text, at timestamptz) returns text
  *
  * The commit ref's head was at at time at (its log's move last made at or
- * before it); NULL if it had none then.
+ * before it; a move dated when it was made in its transaction); NULL if it
+ * had none then.  An unknown branch or remote is an error.
  */
 Datum
 prolly_head_at(PG_FUNCTION_ARGS)

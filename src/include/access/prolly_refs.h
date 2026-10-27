@@ -912,8 +912,9 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Optional, together: head logs.  Each branch's head moves are logged
-	 * in order, each with its date (when it was made; never before the move
-	 * before it) and the commit it moved to, with the transaction; and a
+	 * in order, each with its date (when it was made in its transaction,
+	 * not when that committed; never before the move before it) and the
+	 * commit it moved to, with the transaction; and a
 	 * remote-tracking branch's (branch not NULL: name is its remote's), as
 	 * fetches move it.  head_at() finds the move last made at or before at
 	 * (false: none was), a seek however long the log is, whatever dates
