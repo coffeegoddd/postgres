@@ -265,6 +265,96 @@ like($mreset->query_until(qr/done/, ''), qr/reset t/,
 $mreset->quit;
 ok(counted('relations_restored') > $restored, 'restoring main\'s table');
 
+# a reset of main, both tables dirty, started in a session of its own,
+# waiting for a reader of kp.t left in an open transaction
+sub main_reset_waiting
+{
+	sql(q{UPDATE kp.t SET b = b || 'm' WHERE a % 20 = 0;
+		UPDATE kp.u SET b = b || 'm' WHERE a % 20 = 0});
+	my $reader = $node->background_psql('postgres');
+	$reader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
+	my $r = $node->background_psql('postgres', on_error_stop => 0);
+	my $rpid = $r->query_safe(q{SELECT pg_backend_pid()});
+	$r->query_until(qr/started/, q{
+		\echo started
+		SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
+		\echo done
+	});
+	$node->poll_query_until('postgres', qq{SELECT wait_event = 'relation'
+		FROM pg_stat_activity WHERE pid = $rpid})
+	  or die 'the reset did not wait for the reader';
+	return ($reader, $r, $rpid);
+}
+
+# a statement started in a session of its own, waiting for kp.t's lock
+# behind the reset (or not needing it)
+sub behind_reset
+{
+	my ($statement) = @_;
+	my $c = $node->background_psql('postgres', on_error_stop => 0);
+	my $cpid = $c->query_safe(q{SELECT pg_backend_pid()});
+	$c->query_until(qr/started/, qq{
+		\\echo started
+		$statement
+		\\echo done
+	});
+	# (or finished already, not needing it)
+	$node->poll_query_until('postgres', qq{SELECT wait_event_type = 'Lock'
+		OR state = 'idle' FROM pg_stat_activity WHERE pid = $cpid})
+	  or die 'the statement neither waited nor finished';
+	return $c;
+}
+
+# 4b. Another session of main commits a table the reset will restore,
+# its commit then reading kp.t, which the reset waits for: once the
+# reader ends, neither waits for the other (the reset holds no table
+# while it waits for another), and both finish.
+my ($mreader, $mr) = main_reset_waiting();
+my $committer = behind_reset(q{
+	INSERT INTO kp.u VALUES (100001, 'w');
+	SELECT 'committed ' || (dolt_commit('-am', 'u row') IS NOT NULL);});
+$mreader->query_safe(q{COMMIT});
+$mreader->quit;
+like($committer->query_until(qr/done/, ''), qr/committed t/,
+	'a commit of the branch beside a waiting reset finishes');
+like($mr->query_until(qr/done/, ''), qr/reset t/, 'and so does the reset');
+unlike($mr->{stderr} . $committer->{stderr}, qr/deadlock/, 'with no deadlock');
+$committer->quit;
+$mr->quit;
+
+# 4c. Another session of main checks out another branch, made of main and
+# never used, holding the refs and then waiting for kp.t behind the reset: once the reader ends, the
+# reset finds the refs held and gives its tables back, so the checkout,
+# and every other branch's operation behind it, goes on.
+# (a branch never used: its first use copies main's tables, reading kp.t)
+sql(q{SELECT dolt_branch('fresh')});
+($mreader, $mr) = main_reset_waiting();
+my $checkout = behind_reset(q{SELECT 'checked out ' || (dolt_checkout('fresh') IS NOT NULL);});
+$mreader->query_safe(q{COMMIT});
+$mreader->quit;
+like($checkout->query_until(qr/done/, ''), qr/checked out t/,
+	'a checkout leaving the branch beside a waiting reset finishes');
+like($mr->query_until(qr/done/, ''), qr/reset t/, 'and so does the reset');
+unlike($mr->{stderr} . $checkout->{stderr}, qr/deadlock/, 'with no deadlock');
+$checkout->quit;
+$mr->quit;
+
+# 4d. A reset of one row, which writes it rather than restore the table,
+# takes no lock a reader holds: it neither waits for nor blocks one.
+sql(q{UPDATE kp.t SET b = b || 'o' WHERE a = 1});
+my $oreader = $node->background_psql('postgres');
+$oreader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
+$applied = counted('apply_rows');
+my ($oret, $oout, $oerr) = $node->psql('postgres', q{
+	SET prolly.restore_min_changes = 2; SET lock_timeout = '2s';
+	SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
+	SELECT pg_stat_force_next_flush()});
+like($oout, qr/reset t/, 'a one-row reset beside a reader finishes at once');
+unlike($oerr, qr/lock timeout/, 'without waiting for the reader');
+ok(counted('apply_rows') > $applied, 'writing the row');
+$oreader->query_safe(q{COMMIT});
+$oreader->quit;
+
 # 5. In a transaction holding the refs already: a worker asked to cancel
 # is asked once.  Stopped in its error handling, the lock still held, it
 # is the same transaction holding it to the reset's retries: asked again

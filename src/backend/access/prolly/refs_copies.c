@@ -257,6 +257,8 @@
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "catalog/partition.h"
+#include "utils/wait_event.h"
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -1654,6 +1656,16 @@ try_lock_branch(const char *name, bool hold)
 	if (!hold)
 		LockRelease(&tag, ExclusiveLock, false);
 	return true;
+}
+
+/* Let go of the lock try_lock_branch() held of branch name. */
+static void
+release_branch(const char *name)
+{
+	LOCKTAG		tag;
+
+	branch_lock_tag(&tag, name, strlen(name));
+	LockRelease(&tag, ExclusiveLock, false);
 }
 
 /*
@@ -4502,6 +4514,41 @@ kept_carried(List *kept, const struct KeptCommit *was, const char *name,
 }
 
 /*
+ * Would restore_kept() give table kt (of a kept commit whose readable
+ * tables are readable) its kept pages, its relation *relid: it is on the
+ * branch as it was then, the user may write it, more than a few of its rows
+ * changed since baseline (few_changes()), and, for the head's pages
+ * (moving: targets the move's commit's tables), the move's commit holds
+ * it?  Asked by the restore, and before a hard reset holds the refs, of
+ * the tables it will lock for it (lock_for_restore()).
+ */
+static bool
+restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
+				List *readable, List *targets, bool moving,
+				const ProllyNodeRef *baseline, Oid *relid)
+{
+	NamedTree  *target = NULL;
+	NamedTree  *moved = NULL;
+
+	*relid = table_named(kt->name);
+	foreach_ptr(NamedTree, r, readable)
+	{
+		if (strcmp(r->name, kt->name) == 0)
+			target = r;
+	}
+	foreach_ptr(NamedTree, r, targets)
+	{
+		if (strcmp(r->name, kt->name) == 0)
+			moved = r;
+	}
+	return target != NULL &&
+		OidIsValid(*relid) && *relid == kt->rels[0].relid &&
+		same_relations(kept_relations(*relid), kt) && may_restore(*relid) &&
+		!few_changes(dc, baseline, *relid, &target->data) &&
+		!(moving && moved == NULL);
+}
+
+/*
  * Give the session branch's tables back the pages kept as of commit
  * (was, in the branch's list kept), but those named in skip: each that
  * changed since (O(1) each), whose baseline entry is then the kept one's.
@@ -4572,8 +4619,6 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	{
 		KeptTable  *kt = &kc->tables[t];
 		Oid			relid;
-		NamedTree  *target = NULL;
-		NamedTree  *moved = NULL;
 		BranchKeptRelation *renewed;
 		BranchKeptRelation *replaced;
 		BranchKeptRelation *carry;
@@ -4590,22 +4635,8 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		}
 		if (skipped)
 			continue;
-		relid = table_named(kt->name);
-		foreach_ptr(NamedTree, r, readable)
-		{
-			if (strcmp(r->name, kt->name) == 0)
-				target = r;
-		}
-		foreach_ptr(NamedTree, r, targets)
-		{
-			if (strcmp(r->name, kt->name) == 0)
-				moved = r;
-		}
-		if (target == NULL ||
-			!OidIsValid(relid) || relid != kt->rels[0].relid ||
-			!same_relations(kept_relations(relid), kt) || !may_restore(relid) ||
-			few_changes(dc, baseline, relid, &target->data) ||
-			(moving_to != NULL && moved == NULL))
+		if (!restore_planned(dc, kt, readable, targets, moving_to != NULL,
+							 baseline, &relid))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
 		replaced = palloc_array(BranchKeptRelation, kt->nrels);
@@ -8903,45 +8934,177 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
  * Make the commit ref names the session branch's head, and move the branch
  * there: its rows written as the commit has them.
  */
+/* The tables of kept commit kc a restore would give its pages, planned. */
+static void
+plan_restore(const ProllyDatabaseComponents *dc, const KeptCommit *kc,
+			 const ProllyNodeRef *root, const ProllyNodeRef *moving_to,
+			 const ProllyNodeRef *baseline, List **planned, List **relids)
+{
+	List	   *tables = NIL;
+	List	   *readable = NIL;
+	List	   *targets = NIL;
+
+	PROLLY_CALL(dc->canonicalizer, tables, root, NULL, note_table, &tables);
+	foreach_ptr(NamedTree, t, tables)
+	{
+		if (t->readable)
+			readable = lappend(readable, t);
+	}
+	if (moving_to != NULL)
+		PROLLY_CALL(dc->canonicalizer, tables, moving_to, NULL, note_table,
+					&targets);
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		const KeptTable *kt = &kc->tables[t];
+		Oid			relid;
+		bool		skipped = false;
+
+		foreach_ptr(char, n, *planned)
+		{
+			if (strcmp(n, kt->name) == 0)
+				skipped = true;
+		}
+		if (skipped ||
+			!restore_planned(dc, kt, readable, targets, moving_to != NULL,
+							 baseline, &relid) ||
+			!branch_ops()->changed_since_kept(kt->rels, kt->nrels))
+			continue;
+		*planned = lappend(*planned, kt->name);
+
+		/*
+		 * (a partition's ancestors first, top down, as a query on them and
+		 * the move lock them before their partitions)
+		 */
+		if (get_rel_relispartition(relid))
+		{
+			List	   *ancestors = get_partition_ancestors(relid);
+
+			for (int a = list_length(ancestors) - 1; a >= 0; a--)
+				*relids = list_append_unique_oid(*relids,
+												 list_nth_oid(ancestors, a));
+		}
+		for (int r = 0; r < kt->nrels; r++)
+			*relids = list_append_unique_oid(*relids, kt->rels[r].relid);
+	}
+}
+
+/* the longest nap between looks at whether the refs are free, in ms */
+#define RESET_REFS_MAX_DELAY_MS	10
+
 /*
  * Before a hard reset holds the refs (which every other branch's
- * operation waits for): the tables a restore would give the pages kept as
- * of the commit ref names, or of the head, locked as TRUNCATE locks them,
- * queued for (branch operations' lock_for_restore()).  A transaction that
- * read one and is still open (on main, which sessions don't lock, any)
- * then holds up the reset alone, and the restore finds the locks held.
- * Read as the refs are now: whatever changes before they are held is
- * tried for, as without this.  Not once the refs are held already.
+ * operation waits for): the tables a restore will give the pages kept as
+ * of the commit ref names, or of the head, locked as TRUNCATE locks them
+ * (planned as restore_pages() plans: only those it gives pages, not those
+ * whose rows it writes, which take a writer's locks).  So a transaction
+ * that read one and is still open (on main, which sessions don't lock,
+ * any) holds up the reset alone, and the restore finds the locks held.
+ *
+ * The lock order, against every other operation's (the branch's refs,
+ * then the root, then the relations it reads or writes):
+ * - the tables' locks all or none: those free taken, and the first one
+ *   that isn't queued for with nothing else held, then all tried again
+ *   (as lmgr.c's callers of ConditionalLockRelationOid() take sets), so
+ *   the reset never holds one table while it waits for another;
+ * - then the branch's refs and the root, only tried: if either is held,
+ *   every table's lock is given back, and the reset waits, holding
+ *   nothing, until both are free, and begins again.
+ * So it never holds a lock another operation waits for while it waits
+ * for one that operation holds.  Read as the refs are now: whatever
+ * changes before they are held the restore tries for, as without this.
+ * Not once the refs are held already (a transaction holding them waits
+ * for no relation lock here: its restores try theirs).
  */
 static void
 lock_for_restore(const char *ref)
 {
+	ProllyDatabaseComponents dc;
 	char	   *name;
 	List	   *kept;
+	List	   *planned = NIL;
+	List	   *relids = NIL;
 	ProllyHash	head;
 	ProllyHash	target;
-	bool		have_head;
-	bool		have_target;
+	ProllyCommitInfo info;
+	ProllyCommitInfo at_head;
+	ProllyNodeRef baseline;
+	KeptCommit *was;
+	Oid			waited = InvalidOid;
+	long		delay = 1;
 
 	if (whole || prolly_kept_commits <= 0 ||
-		branch_ops()->lock_for_restore == NULL || RecoveryInProgress())
+		branch_ops()->changed_since_kept == NULL || RecoveryInProgress())
 		return;
+	prolly_database_components(&dc);
 	name = branch_ops()->current();
-	have_head = branch_head(name, &head);
-	have_target = copies_resolve(ref, &target);
 	kept = kept_get(name);
-	foreach_ptr(KeptCommit, kc, kept)
-	{
-		if (FullTransactionIdIsValid(kc->retired) ||
-			!((have_head && same_hash(&kc->commit, &head)) ||
-			  (have_target && same_hash(&kc->commit, &target))))
-			continue;
-		for (int t = 0; t < kc->ntables; t++)
-			branch_ops()->lock_for_restore(kc->tables[t].rels,
-										   kc->tables[t].nrels);
-	}
+	if (kept == NIL || !branch_baseline(name, &baseline) ||
+		!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
+		return;
+	was = kept_find(kept, &target);
+	if (was != NULL && was->baseline.len > 0)
+		plan_restore(&dc, was, &info.root, NULL, &baseline, &planned, &relids);
+	if (branch_head(name, &head) && !same_hash(&head, &target) &&
+		(was = kept_find(kept, &head)) != NULL && was->baseline.len > 0 &&
+		copies_commit_get(&head, &at_head))
+		plan_restore(&dc, was, &at_head.root, &info.root, &baseline,
+					 &planned, &relids);
 	/* (read again once the refs are held) */
 	kept_read_name = NULL;
+	if (relids == NIL)
+		return;
+
+	for (;;)
+	{
+		bool		all = true;
+		ListCell   *lc;
+		int			ntaken = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		foreach(lc, relids)
+		{
+			if (!ConditionalLockRelationOid(lfirst_oid(lc), AccessExclusiveLock))
+			{
+				all = false;
+				break;
+			}
+			ntaken++;
+		}
+		/* (the lock waited for, held once more than the set needs) */
+		if (OidIsValid(waited))
+			UnlockRelationOid(waited, AccessExclusiveLock);
+		waited = InvalidOid;
+		if (all)
+		{
+			if (try_lock_branch(name, true))
+			{
+				if (!PROLLY_HAS(env.chunk_store, try_hold_root) ||
+					env.chunk_store->try_hold_root(env.chunks))
+					break;
+				release_branch(name);
+			}
+			/* (the refs held: everything given back, waited for free) */
+			foreach(lc, relids)
+				UnlockRelationOid(lfirst_oid(lc), AccessExclusiveLock);
+			while (!try_lock_branch(name, false) ||
+				   (PROLLY_HAS(env.chunk_store, root_free) &&
+					!env.chunk_store->root_free(env.chunks)))
+			{
+				CHECK_FOR_INTERRUPTS();
+				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT |
+								 WL_EXIT_ON_PM_DEATH, delay,
+								 WAIT_EVENT_BRANCH_KEPT_LOCK);
+				ResetLatch(MyLatch);
+				delay = Min(delay * 2, RESET_REFS_MAX_DELAY_MS);
+			}
+			continue;
+		}
+		/* (those taken given back, and the busy one queued for alone) */
+		for (int i = 0; i < ntaken; i++)
+			UnlockRelationOid(list_nth_oid(relids, i), AccessExclusiveLock);
+		waited = list_nth_oid(relids, ntaken);
+		LockRelationOid(waited, AccessExclusiveLock);
+	}
 	AcceptInvalidationMessages();
 }
 

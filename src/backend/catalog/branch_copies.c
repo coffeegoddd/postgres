@@ -61,7 +61,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_branch.h"
-#include "catalog/partition.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_index.h"
@@ -2270,43 +2269,20 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	return ok;
 }
 
-/*
- * Queue for the locks restore() would take of kept[] (see branch_ops.h),
- * kept[0] the table: only if one's pages changed since its snapshot, as
- * restore() gives them new storage only then.
- */
-static void
-copies_lock_for_restore(const BranchKeptRelation *kept, int nkept)
+/* Did one of kept[] change since its snapshot (see branch_ops.h)? */
+static bool
+copies_changed_since_kept(const BranchKeptRelation *kept, int nkept)
 {
-	bool		any = false;
-
-	for (int i = 0; i < nkept && !any; i++)
+	for (int i = 0; i < nkept; i++)
 	{
 		RelFileLocator loc = kept_locator(&kept[i]);
 
 		if (bmap_relation_exists(loc) &&
 			!bmap_snapshot_unchanged(smgropen(loc, INVALID_PROC_NUMBER),
 									 kept[i].snapshot))
-			any = true;
+			return true;
 	}
-	if (!any)
-		return;
-
-	/*
-	 * (a partition's ancestors first, top down, as a query on them locks
-	 * them before their partitions and the move locks them: holding a
-	 * partition first, the reset would deadlock with a query waiting behind
-	 * it on a partition)
-	 */
-	if (get_rel_relispartition(kept[0].relid))
-	{
-		List	   *ancestors = get_partition_ancestors(kept[0].relid);
-
-		for (int a = list_length(ancestors) - 1; a >= 0; a--)
-			LockRelationOid(list_nth_oid(ancestors, a), AccessExclusiveLock);
-	}
-	for (int i = 0; i < nkept; i++)
-		LockRelationOid(kept[i].relid, AccessExclusiveLock);
+	return false;
 }
 
 static void
@@ -3221,7 +3197,7 @@ static const BranchOpsRoutine branch_copies = {
 	.restore = copies_restore,
 	.let_go = copies_let_go,
 	.kept_status = copies_kept_status,
-	.lock_for_restore = copies_lock_for_restore,
+	.changed_since_kept = copies_changed_since_kept,
 	.share_kept = copies_share_kept,
 	.carry_privileges = copies_carry_privileges,
 	.carry_statistics = copies_carry_statistics,

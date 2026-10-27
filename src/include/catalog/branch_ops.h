@@ -253,9 +253,12 @@ typedef struct BranchOpsRoutine
 	 * itself (refused, as TRUNCATE refuses, while the session has it open
 	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
 	 * Each that changed is locked as TRUNCATE locks it: as it is if the
-	 * session holds that lock already (a hard reset queues for its tables'
-	 * locks before it holds the refs, as TRUNCATE queues), else tried,
-	 * within *wait's bounds, as share() tries; the locks are kept.
+	 * session holds that lock already (a hard reset takes its restores'
+	 * locks before it holds the refs, waiting for a busy one with nothing
+	 * else held, then the refs only if they are free: see refs_copies.c's
+	 * lock_for_restore() for the order), else tried, within *wait's
+	 * bounds, as share() tries, never queued for while the caller holds
+	 * the refs; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
 	 * pages, which goes as the transaction commits, and with it every
 	 * other snapshot there: so each of carry[] (ncarry of them, other
@@ -294,14 +297,12 @@ typedef struct BranchOpsRoutine
 	BranchKeptStatus (*kept_status) (const BranchKeptRelation *kept);
 
 	/*
-	 * Optional: take, queued for as TRUNCATE queues, the locks restore()
-	 * would take of the session branch's relations kept[] (nkept of them,
-	 * a table's together), if any of them changed since keep() kept them:
-	 * before the caller holds anything every other branch's operation
-	 * waits for, so that a holder of one (a reader in a transaction left
-	 * open) holds up only this move.  The locks are kept.
+	 * Optional: did any of the session branch's relations kept[] (nkept of
+	 * them, a table's together) change since keep() kept them, so that
+	 * restore() would give them new storage?  Asked before a hard reset
+	 * holds the refs, of the tables it locks for its restores first.
 	 */
-	void		(*lock_for_restore) (const BranchKeptRelation *kept, int nkept);
+	bool		(*changed_since_kept) (const BranchKeptRelation *kept, int nkept);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch
