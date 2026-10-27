@@ -818,3 +818,37 @@ OF` are built in D18's shapes.
 - **Port:** Dolt's "database revision specs: Ancestor references" reads
   are in test_prolly's `revision_names` test (by FROM-clause names; `USE`
   has no equivalent, D11); writes through a revision name are not ported.
+
+## D29. History may be kept here only for a window
+
+- **Dolt:** a database keeps its whole history locally. A shallow clone
+  (`dolt clone --depth`) keeps fewer commits; its log lists the commits
+  it has, and an operation that needs a missing commit fails.
+- **Prolly:** history can be severed past a window
+  ([#1070](https://github.com/coffeegoddd/postgres/issues/1070)). The
+  window is set per database (`prolly.history_warm`,
+  `prolly.history_min_commits`, `prolly.history_cold_batch`,
+  `prolly.history_max_size`), with branch-lineage overrides from
+  `dolt_history_window()`. What's past it is archived to a remote
+  (`prolly.history_archive`, the default action), deleted, or kept
+  (`prolly.history_window_action`), in the background or by
+  `dolt_history_sever()`; `dolt_history_drop(before)` deletes once.
+  - No commit is rewritten: hashes stay, and the oldest commits kept
+    still name their parents. A horizon in the refs records where history
+    was cut.
+  - Every commit a ref names is kept, and so is everything down to the
+    merge base of any two branch heads.
+  - As in a shallow clone, `dolt_log`, history tables and history mounts
+    list what is kept and stop at the horizon with a notice.
+  - Reading a severed commit's content (`dolt_at`, a diff, a merge whose
+    base was severed, which pinned bases prevent between live branches)
+    is an error that names `dolt_history_repair()`.
+  - `dolt_history_repair()` brings the history back, verified, from the
+    archive or from any remote or clone that has it. Afterwards it reads
+    bit for bit as before.
+- **Why:** to bound what a database keeps (10 TB with a commit per
+  transaction) without losing history or rewriting it. A severed
+  history is still the same history, so repair is always possible.
+- **Port:** Dolt's ports run with no window, which is the default, so
+  nothing is severed. Dolt has no equivalent of the window settings,
+  `dolt_history_sever`, `dolt_history_drop` or `dolt_history_repair`.

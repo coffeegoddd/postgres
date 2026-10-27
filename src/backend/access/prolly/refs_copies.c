@@ -8855,6 +8855,58 @@ copies_branch_create(const char *name, const char *start_point)
 		copy_head_records(from, name, &id);
 }
 
+static void copies_config_set(const char *name, const char *value);
+
+/*
+ * A branch's own settings (the database's settings named "...:branch", as
+ * a history window's for a lineage) follow it: moved to newname on a
+ * rename, let go of with it (newname NULL).
+ */
+static void
+branch_settings_move(const char *name, const char *newname)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag = TAG_CONFIG;
+	ProllyKey	seek = {(const uint8 *) &tag, 1};
+	size_t		nlen = strlen(name);
+	List	   *names = NIL;
+	List	   *values = NIL;
+
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &seek, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	{
+		if (k.len < 1 || k.data[0] != TAG_CONFIG)
+			break;
+		if (k.len > nlen + 2 && k.data[k.len - nlen - 1] == ':' &&
+			memcmp(k.data + k.len - nlen, name, nlen) == 0)
+		{
+			names = lappend(names, pnstrdup((const char *) k.data + 1, k.len - 1));
+			values = lappend(values, pnstrdup((const char *) v.data, v.len));
+		}
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	for (int i = 0; i < list_length(names); i++)
+	{
+		char	   *old = list_nth(names, i);
+
+		if (newname)
+		{
+			char	   *moved = psprintf("%.*s:%s",
+										 (int) (strlen(old) - nlen - 1), old,
+										 newname);
+
+			copies_config_set(moved, list_nth(values, i));
+		}
+		copies_config_set(old, NULL);
+	}
+}
+
 static void
 copies_branch_delete(const char *name, bool force)
 {
@@ -8922,6 +8974,7 @@ copies_branch_delete(const char *name, bool force)
 		pfree(key.data);
 	}
 	maker_put(TAG_CREATOR, name, InvalidOid);
+	branch_settings_move(name, NULL);
 	/*
 	 * (and the commits its pages were kept as of, their roots let go of as
 	 * the deletion commits: the page store keeps them, not the branch's
@@ -8982,6 +9035,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 				 errhint("Replace it with -f.")));
 	if (branch_exists(newname))
 		copies_branch_delete(newname, true);
+	branch_settings_move(name, newname);
 	if (OidIsValid(branch_oid(name)))
 		branch_ops()->rename(name, newname, force);
 	else

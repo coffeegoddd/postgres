@@ -18,7 +18,7 @@ $$;
 -- (the log in the order it gives, and in the order it must give)
 CREATE FUNCTION log_in_order(ref text) RETURNS bool LANGUAGE sql AS $$
 	SELECT (SELECT array_agg(commit_hash) FROM dolt_log(ref)) =
-		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash)
+		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash COLLATE "C")
 		 FROM dolt_log(ref))
 $$;
 
@@ -58,6 +58,16 @@ SELECT EXISTS (SELECT 1 FROM dolt_log l WHERE l IS NOT NULL) AS exists_whole;
 SELECT count(*) AS joined FROM dolt_log l JOIN dolt_log m
 	ON l IS NOT NULL AND l.commit_hash = m.commit_hash;
 
+-- the scan is dolt_log's: one who can't execute it can't read it
+CREATE ROLE regress_log_stream_nobody;
+REVOKE EXECUTE ON FUNCTION dolt_log(text) FROM PUBLIC;
+SET ROLE regress_log_stream_nobody;
+SELECT message FROM dolt_log LIMIT 1;
+SELECT count(l) FROM dolt_log l;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION dolt_log(text) TO PUBLIC;
+DROP ROLE regress_log_stream_nobody;
+
 -- a limited log reads about as many commits as it gives
 :flush
 SELECT commits_read() AS before \gset
@@ -92,7 +102,7 @@ SELECT (SELECT array_agg(commit_hash) FROM (SELECT commit_hash FROM dolt_log LIM
 	(SELECT (array_agg(commit_hash))[1:4] FROM dolt_log) AS prefix;
 -- (a ref the scan can't compute first: the function's rows)
 SELECT r, (SELECT count(*) FROM dolt_log(r)) AS commits
-FROM (VALUES ('HEAD'), ('b')) v(r) ORDER BY r;
+FROM (VALUES ('HEAD'), ('b')) v(r) ORDER BY r COLLATE "C";
 SELECT count(*) AS none FROM dolt_log(NULL);
 
 \c :home
@@ -103,7 +113,7 @@ CREATE DATABASE regress_log_stream_horizon;
 \c regress_log_stream_horizon
 CREATE FUNCTION log_in_order(ref text) RETURNS bool LANGUAGE sql AS $$
 	SELECT (SELECT array_agg(commit_hash) FROM dolt_log(ref)) =
-		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash)
+		(SELECT array_agg(commit_hash ORDER BY commit_order DESC, date DESC, commit_hash COLLATE "C")
 		 FROM dolt_log(ref))
 $$;
 CREATE SCHEMA hz VERSIONED;
