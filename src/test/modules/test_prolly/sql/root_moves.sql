@@ -71,6 +71,7 @@ SELECT digest() = (SELECT d FROM digests WHERE n = 30) AS at_c30;
 
 -- a branch made at the head, used and changed, moves back by the roots
 -- main kept
+SELECT held AS roots_before FROM test_bmap_roots() \gset
 SELECT dolt_branch('scratch', :'c30');
 SELECT dolt_checkout('scratch');
 UPDATE rm.t SET v = -2 WHERE id <= 3000;
@@ -83,6 +84,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
 SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'scratch');
+-- (deleted, the branch's roots are let go of: the store keeps no more than
+-- before it)
+SELECT held = :roots_before AS scratch_roots_let_go FROM test_bmap_roots();
 
 -- roots an interval of commits apart: a move between them restores the
 -- nearest before and writes the rows between, no more

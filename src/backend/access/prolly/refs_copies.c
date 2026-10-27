@@ -4221,14 +4221,14 @@ kept_commit_status(const KeptCommit *kc)
  * The commits of kept (a branch's list) whose pages are gone dropped from
  * it, and those no table can be given its pages of any more retired: a
  * retired one keeps its commit and baseline from collection, as any does,
- * until a later keep lets go of its snapshots (a first use may be reading
+ * until a later keep lets go of its roots (a first use may be reading
  * it), a dropped one no longer.  Neither counts toward
  * prolly.kept_commits or is offered to a move or a first use.  A commit's
- * storage goes with the change that replaced it (a restore of another
- * commit, a rewrite, a DROP), so the list changes with the same
- * transaction; one whose pages are gone has nothing for a first use
- * reading the list from before to make a branch of, nor anything to let
- * go of.  (A TRUNCATE leaves a table's change log on its storage: its
+ * pages are gone with the change that replaced its storage (a rewrite, a
+ * DROP), so the list changes with the same transaction; one whose pages
+ * are gone has nothing for a first use reading the list from before to
+ * make a branch of, and its roots, which its page store still keeps, are
+ * let go of as that transaction commits.  (A TRUNCATE leaves a table's change log on its storage: its
  * commits are retired, not dropped.)  but: an entry left as it is (NULL:
  * none).
  *
@@ -4247,6 +4247,7 @@ static List *
 kept_drop_dead(List *kept, const KeptCommit *but)
 {
 	List	   *left = NIL;
+	List	   *gone = NIL;
 	int			asked = 0;
 
 	foreach_ptr(KeptCommit, o, kept)
@@ -4268,11 +4269,26 @@ kept_drop_dead(List *kept, const KeptCommit *but)
 		}
 
 		if (s == BRANCH_KEPT_GONE)
+		{
+			gone = lappend(gone, o);
 			continue;
+		}
 		if (s == BRANCH_KEPT_HELD && !FullTransactionIdIsValid(o->retired))
 			o->retired = GetTopFullTransactionId();
 		left = lappend(left, o);
 	}
+
+	/*
+	 * (a gone commit's roots, which its page store keeps whatever became of
+	 * the storage, let go of as the transaction commits, but those another
+	 * commit left holds)
+	 */
+	if (branch_ops()->let_go)
+		foreach_ptr(KeptCommit, o, gone)
+			for (int t = 0; t < o->ntables; t++)
+				for (int r = 0; r < o->tables[t].nrels; r++)
+					if (!kept_holds(left, &o->tables[t].rels[r]))
+						branch_ops()->let_go(&o->tables[t].rels[r]);
 	return left;
 }
 
@@ -4768,6 +4784,7 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 {
 	bool		other = OidIsValid(source) && source != MyBranch;
 
+
 	KeptCommit *kc;
 	List	   *tables = NIL;
 	List	   *readable = NIL;
@@ -4775,6 +4792,23 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	List	   *now = NIL;
 	ProllyNodeRef from;
 	ProllyNodeRef spliced;
+
+	/*
+	 * (another branch's pages only where the commit defines what the
+	 * branch's head does: its types are another's objects, their values on
+	 * the pages read by this branch's, which the move then makes again)
+	 */
+	if (other)
+	{
+		ProllyHash	head;
+		ProllyCommitInfo hi;
+
+		if (dc->canonicalizer->same_schema == NULL ||
+			!branch_head(branch_ops()->current(), &head) ||
+			!copies_commit_get(&head, &hi) ||
+			!dc->canonicalizer->same_schema(&hi.root, &commit->root))
+			return;
+	}
 
 	/*
 	 * (the commit kept anew, the restored tables by their new storage's
@@ -8262,11 +8296,16 @@ copies_branch_delete(const char *name, bool force)
 	}
 	maker_put(TAG_CREATOR, name, InvalidOid);
 	/*
-	 * (and the commits its pages were kept as of: they went with them, the
-	 * entry read first, for the indexes of what it holds now; and its name
-	 * folded)
+	 * (and the commits its pages were kept as of, their roots let go of as
+	 * the deletion commits: the page store keeps them, not the branch's
+	 * storage; the entry read first, for the indexes of what it holds now;
+	 * and its name folded)
 	 */
-	(void) kept_get(name);
+	if (branch_ops()->let_go)
+		foreach_ptr(KeptCommit, kc, kept_get(name))
+			for (int t = 0; t < kc->ntables; t++)
+				for (int r = 0; r < kc->tables[t].nrels; r++)
+					branch_ops()->let_go(&kc->tables[t].rels[r]);
 	kept_put(name, NIL);
 	folded_index_set(name, false);
 	forget_read_caches();
