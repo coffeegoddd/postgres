@@ -71,11 +71,22 @@ typedef struct ProllyTransferRoutine
 								  ProllyRemote *remote,
 								  const ProllyHash *commits, int ncommits,
 								  const ProllyHash *stops, int nstops);
+
+	/*
+	 * receive() of trees by themselves, not commits': canonical roots
+	 * (with the data trees they name) and plain trees, as a history
+	 * horizon's repair brings back the data of commits whose commit
+	 * objects the store kept.
+	 */
+	uint64		(*receive_trees) (const ProllyRemoteRoutine *rr,
+								  ProllyRemote *remote,
+								  const ProllyHash *roots, int nroots,
+								  const ProllyHash *trees, int ntrees);
 } ProllyTransferRoutine;
 
 #define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send", "clone", \
-	"receive_until"
+	"receive_until", "receive_trees"
 #define PROLLY_TRANSFER_FIRST_CALLBACK receive
-#define PROLLY_TRANSFER_LAST_CALLBACK receive_until
+#define PROLLY_TRANSFER_LAST_CALLBACK receive_trees
 
 #endif							/* PROLLY_TRANSFER_H */

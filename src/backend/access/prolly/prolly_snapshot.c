@@ -3116,15 +3116,15 @@ history_next_commit(MountScan *ss)
 			{
 				ProllyHash *p;
 
-				/* (a listing stops at the history horizon) */
-				if (prolly_window_stops_at(&info.parents[i]))
-					continue;
 				p = palloc0(sizeof(ProllyHash));
 				*p = info.parents[i];
 				h->queue = lappend(h->queue, p);
 			}
 			MemoryContextSwitchTo(old);
 		}
+		/* (past the history horizon: listed, but no rows to mount) */
+		if (prolly_window_rows_severed(id))
+			continue;
 
 		old = MemoryContextSwitchTo(h->cxt);
 		xname = history_version_name(ss, &info, &renames);

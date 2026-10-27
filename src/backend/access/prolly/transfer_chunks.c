@@ -51,6 +51,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_seen.h"
+#include "access/prolly_tree.h"
 #include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "utils/injection_point.h"
@@ -535,12 +536,16 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 static uint64
 receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			  const ProllyHash *commits, int ncommits,
-			  const ProllyHash *stops, int nstops)
+			  const ProllyHash *stops, int nstops,
+			  const ProllyHash *roots, int nroots,
+			  const ProllyHash *trees, int ntrees)
 {
 	ProllyDatabaseComponents dc;
 	Receiving	rv;
 	uint64		count;
 	bool	   *walk;
+	bool	   *walk_roots;
+	bool	   *walk_trees;
 
 	memset(&rv, 0, sizeof(rv));
 	rv.stops = stops;
@@ -559,6 +564,12 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	walk = palloc0(sizeof(bool) * Max(ncommits, 1));
 	for (int i = 0; i < ncommits; i++)
 		walk[i] = !PROLLY_CALL(rv.cs, has, rv.store, &commits[i]);
+	walk_roots = palloc0(sizeof(bool) * Max(nroots, 1));
+	for (int i = 0; i < nroots; i++)
+		walk_roots[i] = !PROLLY_CALL(rv.cs, has, rv.store, &roots[i]);
+	walk_trees = palloc0(sizeof(bool) * Max(ntrees, 1));
+	for (int i = 0; i < ntrees; i++)
+		walk_trees[i] = !PROLLY_CALL(rv.cs, has, rv.store, &trees[i]);
 
 	/*
 	 * A remote that runs this code is told the heads this database has, and
@@ -590,7 +601,38 @@ receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			if (walk[i])
 				PROLLY_CALL(dc.refs, walk_commit, &commits[i], receive_visit, &rv);
 		}
-		check_formats(&rv, commits, ncommits);
+		if (ncommits > 0)
+			check_formats(&rv, commits, ncommits);
+
+		/* (trees by themselves: a root's, and plain ones) */
+		for (int i = 0; i < nroots; i++)
+		{
+			ProllyNodeRef ref = {0};
+
+			ref.hash = roots[i];
+			if (walk_roots[i])
+				PROLLY_CALL(dc.canonicalizer, walk, &ref, receive_visit, &rv);
+		}
+		if (ntrees > 0)
+		{
+			const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+			ProllyTreeEnv env = {0};
+
+			env.chunk_format = prolly_chunkformat_lookup("basic");
+			env.chunker = prolly_chunker_lookup("bytes");
+			env.hash = prolly_content_hash();
+			env.chunk_store = rv.cs;
+			env.chunks = rv.store;
+			env.compare = prolly_bytes_compare;
+			for (int i = 0; i < ntrees; i++)
+			{
+				ProllyNodeRef ref = {0};
+
+				ref.hash = trees[i];
+				if (walk_trees[i])
+					(void) PROLLY_CALL(tree, walk, &env, &ref, receive_visit, &rv);
+			}
+		}
 	}
 	PG_FINALLY();
 	{
@@ -610,7 +652,7 @@ static uint64
 chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 			   const ProllyHash *commits, int ncommits)
 {
-	return receive_until(rr, remote, commits, ncommits, NULL, 0);
+	return receive_until(rr, remote, commits, ncommits, NULL, 0, NULL, 0, NULL, 0);
 }
 
 static uint64
@@ -618,7 +660,17 @@ chunks_receive_until(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 					 const ProllyHash *commits, int ncommits,
 					 const ProllyHash *stops, int nstops)
 {
-	return receive_until(rr, remote, commits, ncommits, stops, nstops);
+	return receive_until(rr, remote, commits, ncommits, stops, nstops,
+						 NULL, 0, NULL, 0);
+}
+
+static uint64
+chunks_receive_trees(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+					 const ProllyHash *roots, int nroots,
+					 const ProllyHash *trees, int ntrees)
+{
+	return receive_until(rr, remote, NULL, 0, NULL, 0, roots, nroots,
+						 trees, ntrees);
 }
 
 /* Cloning */
@@ -1056,5 +1108,6 @@ const ProllyTransferRoutine prolly_transfer_chunks = {
 	.receive = chunks_receive,
 	.clone = chunks_clone,
 	.receive_until = chunks_receive_until,
+	.receive_trees = chunks_receive_trees,
 	.send = chunks_send,
 };

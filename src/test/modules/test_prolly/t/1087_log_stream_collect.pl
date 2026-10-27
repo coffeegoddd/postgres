@@ -63,10 +63,12 @@ $reader->quit;
 like($gc->query_until(qr/collected/, ''), qr/t/, 'the collection ran');
 $gc->quit;
 
-# Collected, the history is dropped.
-cmp_ok(sql(q{SET client_min_messages = warning;
-	SELECT count(*) FROM dolt_log}), '<',
-	scalar(split(/,/, $all)), 'the history dropped');
+# Collected, the history's data is dropped; its commits are listed still.
+is(sql(q{SELECT string_agg(message, ',') FROM dolt_log}), $all,
+	'every commit listed');
+my ($ret, $out, $err) = $node->psql('lc', q{SELECT count(*) FROM
+	dolt_at((SELECT commit_hash FROM dolt_log WHERE message = 'd1'), NULL::lc.t)});
+like($err, qr/is past the history horizon/, 'the history dropped');
 
 # The horizon a cursor stops at is the one it began with: a history drop
 # committed meanwhile in another session, and a rollback to a savepoint in

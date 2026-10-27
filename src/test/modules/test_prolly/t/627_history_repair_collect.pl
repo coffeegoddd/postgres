@@ -41,9 +41,10 @@ sql(qq{SELECT dolt_remote('add', 'origin', '$url');
 	SELECT dolt_push('origin', 'main')});
 sql(q{SELECT commits FROM dolt_history_drop('2020-01-04')});
 sql(q{SELECT * FROM prolly_gc(true)});
-my $logged = q{SET client_min_messages = warning;
-	SELECT count(*) FROM dolt_log('main')};
-my $short = sql($logged);
+my $top = sql(q{SELECT tops[1] FROM prolly_history_horizon()});
+my $read = qq{SELECT count(*) FROM dolt_at('$top', NULL::rc.t)};
+my ($r0, $o0, $e0) = $node->psql('rc', $read);
+like($e0, qr/is past the history horizon/, 'the severed data is freed');
 
 # The repair stops once it has received.
 my $repair = $node->background_psql('rc', on_error_stop => 0);
@@ -73,7 +74,7 @@ $repair->quit;
 like($gc->query_until(qr/collected/, ''), qr/t/, 'the collection ran after');
 $gc->quit;
 
-cmp_ok(sql($logged), '>', $short, 'the history repaired is kept');
+cmp_ok(sql($read), '>', 0, 'the history repaired is kept');
 ok(!$node->log_contains(qr/deadlock detected/), 'no deadlock');
 
 done_testing();

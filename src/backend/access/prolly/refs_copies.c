@@ -12597,6 +12597,37 @@ typedef struct WalkState
  * is walked, then its commit; another chunk that isn't a commit is passed
  * over, nothing of it visited.
  */
+/*
+ * A severed commit's trees: walked where the store has them still (not
+ * collected yet), else offered to the visitor, which must have them.
+ */
+static void
+severed_trees(const ProllyHash *id, const ProllyCommitInfo *info,
+			  WalkState *ws)
+{
+	ProllyNodeRef ref;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	for (int t = 0; t < 2; t++)
+	{
+		const ProllyNodeRef *r = t == 0 ? &info->root : &info->dependencies;
+
+		if (t == 1 && !info->has_dependencies)
+			break;
+		ref = *r;
+		if (PROLLY_CALL(env.chunk_store, has, env.chunks, &r->hash))
+		{
+			if (t == 0)
+				PROLLY_CALL(dc.canonicalizer, walk, &ref, ws->visit, ws->arg);
+			else
+				(void) PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg);
+		}
+		else if (ws->visit(&ref, 0, ws->arg))
+			prolly_window_check_missing(id);
+	}
+}
+
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
 {
@@ -12677,10 +12708,22 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		ref_of(next, &ref);
 		if (!PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
 			continue;
+
+		/*
+		 * (past the history horizon, its commit object kept, its data
+		 * severed: whole where the visitor already has it, as a remote it
+		 * is sent to may, else the walk can't go on)
+		 */
+		if (prolly_window_archived(next))
+		{
+			severed_trees(next, &info, ws);
+			goto parents;
+		}
 		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
 		if (info.has_dependencies)
 			(void) PROLLY_CALL(tree, walk, &env, &info.dependencies, ws->visit,
 							   ws->arg);
+parents:
 		for (int i = info.nparents - 1; i >= 0; i--)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));
@@ -13365,6 +13408,57 @@ copies_rebase_state(ProllyRebaseState *state)
 	pfree(key.data);
 	pfree(v.data);
 	return found;
+}
+
+static void
+note_branch_name(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **names = arg;
+
+	*names = lappend(*names, pstrdup(name));
+}
+
+/*
+ * The commits every branch's merge or rebase in progress names, whichever
+ * session began it: each branch's 'M' and 'E' entries, as merge_state()
+ * and rebase_state() read the session's own.
+ */
+static void
+copies_in_progress(ProllyInProgressVisit visit, void *arg)
+{
+	List	   *names = NIL;
+
+	refs_init();
+	copies_branches(note_branch_name, &names);
+	foreach_ptr(char, name, names)
+	{
+		ProllyMergeState ms;
+		StringInfoData key;
+		StringInfoData v;
+		ProllyRebaseState rs;
+
+		if (merge_state_of(name, &ms))
+		{
+			visit(name, &ms.theirs, arg);
+			if (ms.base.len > 0)
+				visit(name, &ms.base, arg);
+		}
+		initStringInfo(&key);
+		initStringInfo(&v);
+		rebase_key(&key, name);
+		if (refs_get(key.data, key.len, &v))
+		{
+			if (!rebase_decode(v.data, v.data + v.len, &rs))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("corrupt prolly rebase state")));
+			visit(name, &rs.head, arg);
+			visit(name, &rs.onto, arg);
+		}
+		pfree(key.data);
+		pfree(v.data);
+	}
+	list_free_deep(names);
 }
 
 static void
@@ -14600,4 +14694,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.side_put = copies_side_put,
 	.side_scan = copies_side_scan,
 	.side_scan_at = copies_side_scan_at,
+	.in_progress = copies_in_progress,
 };

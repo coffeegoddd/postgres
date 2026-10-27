@@ -839,9 +839,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BUFFER_REL_GENERATIONS,	/* and of one relation's */
 	PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ,	/* pages of captured roots' slots
 											 * read */
+	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries
+										 * read, a commit's or a fragment's */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_HORIZON_ENTRIES_READ + 1)
 
 typedef struct PgStat_ProllyStats
 {
