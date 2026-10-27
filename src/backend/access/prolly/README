@@ -1246,15 +1246,18 @@ as the database has them), and none outside it: that history is cold,
 for a sever.  Every branch has a window (prolly.history_window, a month
 by default; it can't be unset), so what a branch keeps, and the refs'
 entries for it, are bounded by it.  A branch's root is in its window if
-its commit is dated within it, or was kept within it (as the head moved
-there: a commit reset or amended away from keeps its root, and a move
-back to it is O(1), until the move is older than the window), or is
-among the branch's newest min_commits on its history; never one on
-severed history (a parent past the horizon).  Another branch's commits
+its commit is dated within it, or was kept or left within it (a commit
+the head is reset or amended away from has its entry dated again as the
+move commits, so it keeps its root, and a move back to it is O(1), until
+the move away is older than the window, however long the head was at
+it), or is among the newest min_commits kept on the head's first parents
+(a reset-away commit takes no place of theirs); never one on severed
+history (a parent past the horizon).  Another branch's commits
 are judged by seeks, not a walk of every branch: a root outside the
 branch's window is kept while another branch's head is at its commit and
-that branch keeps no root of it (one it keeps serves it), and let go of
-otherwise.  (So a commit inside another lineage's longer window of its
+that branch keeps no frozen root of it (one it keeps frozen serves it;
+one captured among writers and not yet frozen can't be given to a move),
+and let go of otherwise.  (So a commit inside another lineage's longer window of its
 own that no head is at, and that lineage doesn't keep, is let go of: the
 lineage's own keep of it serves it.)  A tag keeps its commit's root while
 it names it, and a branch's newest root is never let go of.  prolly.history_root_max_size
@@ -1276,8 +1279,8 @@ a keep reads the newest few and the retired, and writes what it changes.
 A retention pass runs as a transaction that kept a branch's commit
 commits (its head where the transaction leaves it), once the branch has
 kept half as many commits again as it keeps, or the roots hold more than
-the cap: it ranks the branch's live entries on its history (O(the
-window), spread over those keeps), then reads them from the oldest,
+the cap: it ranks the branch's live entries on the head's first parents
+as far as min_commits asks (none by default), then reads them from the oldest,
 retiring each outside the window and passing over a tag's and one another
 branch's head is at, until one in the branch's window (past the cap,
 until the cap is met), then from the newest the same way for what a
@@ -2077,17 +2080,18 @@ free what it has yet to read.  The scan gives the entry's whole row too
 
 A branch's kept commit (Root retention, above) records the commits it
 reaches, itself included (prolly_history_commits(); the refs'
-commit_count()), as Dolt's commit closure counts them: one more than its
-first parent's, from a kept commit of it a few first parents below, and
-for a merge, more by those its other parents reach that the first
+commit_count()), as Dolt's commit closure counts them: the nearest kept
+count down its first parents (the branch's previous keep, so the commits
+made since, the root interval's, are walked) and one more for each commit
+between, and for a merge, more by those its other parents reach that the first
 doesn't, found by heights highest first.  They are derived, not part of
 the commit (its id is its content's, as before), and transfers don't send
 them.  So count(*) of dolt_log(ref) alone (no quals, GROUP BY or HAVING)
 is planned as a scan giving that count (prolly_log_count.c), reading no
-history; a head is kept always.  A commit no branch keeps with a count
-(let go of, out of the window, or within the root interval), or a history
-horizon, which the log stops at, has the log counted as it gives its
-rows.
+history.  A commit no branch keeps with a count (one made within the
+root interval, or let go of) is counted the same way, from the nearest
+kept count below it (or a root, as the log would be); a history horizon,
+which the log stops at, has the log counted as it gives its rows.
 
 Remotes
 -------
