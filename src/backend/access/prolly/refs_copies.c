@@ -11092,7 +11092,7 @@ restore_relids(List *locks, List *given_up)
  * The lock order, against every other operation's (the branch's refs,
  * then the root, then the relations it reads or writes):
  * - the tables' locks all or none: those free taken, and the first one
- *   that isn't tried for with nothing else held, then all tried again
+ *   that isn't free tried for with nothing else held, then all tried again
  *   (as lmgr.c's callers of ConditionalLockRelationOid() take sets), so
  *   the reset never holds one table while it waits for another;
  * - then the branch's refs and the root, only tried: if either is held,
