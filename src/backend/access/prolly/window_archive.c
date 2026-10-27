@@ -3084,8 +3084,16 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 		StringInfoData format;
 		ReadBack	rb;
 
-		sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
-								   f->ntops);
+		/*
+		 * (what the fragment reaches, but an older fragment's data: that
+		 * is archived elsewhere, or was deleted, and may be gone here)
+		 */
+		if (PROLLY_HAS(dc.transfer, send_kept))
+			sent = (int64) PROLLY_CALL(dc.transfer, send_kept, rr, remote,
+									   f->tops, f->ntops);
+		else
+			sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
+									   f->ntops);
 		/*
 		 * (named first, so the archive keeps what it was sent, its own
 		 * collections too, while it is read back)

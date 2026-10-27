@@ -1058,8 +1058,8 @@ sent_next(void *arg, ProllyHash *hash, StringInfo data)
 }
 
 static uint64
-chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
-			const ProllyHash *commits, int ncommits)
+send_walked(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+			const ProllyHash *commits, int ncommits, bool kept_only)
 {
 	ProllyDatabaseComponents dc;
 	Sending		sd;
@@ -1079,7 +1079,13 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	PG_TRY();
 	{
 		for (int i = 0; i < ncommits; i++)
-			PROLLY_CALL(dc.refs, walk_commit, &commits[i], send_visit, &sd);
+		{
+			if (kept_only)
+				PROLLY_CALL(dc.refs, walk_commit_kept, &commits[i], send_visit,
+							&sd);
+			else
+				PROLLY_CALL(dc.refs, walk_commit, &commits[i], send_visit, &sd);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -1096,6 +1102,25 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	return sd.norder;
 }
 
+static uint64
+chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+			const ProllyHash *commits, int ncommits)
+{
+	return send_walked(rr, remote, commits, ncommits, false);
+}
+
+static uint64
+chunks_send_kept(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+				 const ProllyHash *commits, int ncommits)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, walk_commit_kept))
+		return send_walked(rr, remote, commits, ncommits, false);
+	return send_walked(rr, remote, commits, ncommits, true);
+}
+
 const ProllyTransferRoutine prolly_transfer_chunks = {
 	.info = {
 		.iface = PROLLY_IFACE_TRANSFER,
@@ -1109,5 +1134,6 @@ const ProllyTransferRoutine prolly_transfer_chunks = {
 	.clone = chunks_clone,
 	.receive_until = chunks_receive_until,
 	.receive_trees = chunks_receive_trees,
+	.send_kept = chunks_send_kept,
 	.send = chunks_send,
 };

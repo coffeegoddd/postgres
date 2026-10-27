@@ -12629,6 +12629,7 @@ typedef struct WalkState
 	ProllyTreeVisitNode visit;
 	void	   *arg;
 	HTAB	   *seen;			/* ProllyHash: commit ids walked */
+	bool		kept_only;		/* severed commits' data not visited */
 } WalkState;
 
 /*
@@ -12757,7 +12758,8 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 		 */
 		if (prolly_window_archived(next))
 		{
-			severed_trees(next, &info, ws);
+			if (!ws->kept_only)
+				severed_trees(next, &info, ws);
 			goto parents;
 		}
 		PROLLY_CALL(dc.canonicalizer, walk, &info.root, ws->visit, ws->arg);
@@ -12872,6 +12874,16 @@ copies_walk_commit(const ProllyHash *commit_id, ProllyTreeVisitNode visit,
 				   void *arg)
 {
 	WalkState	ws = {visit, arg, NULL};
+
+	refs_init();
+	walk_commit(&ws, commit_id);
+}
+
+static void
+copies_walk_commit_kept(const ProllyHash *commit_id, ProllyTreeVisitNode visit,
+						void *arg)
+{
+	WalkState	ws = {visit, arg, NULL, true};
 
 	refs_init();
 	walk_commit(&ws, commit_id);
@@ -14736,4 +14748,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.side_scan = copies_side_scan,
 	.side_scan_at = copies_side_scan_at,
 	.in_progress = copies_in_progress,
+	.walk_commit_kept = copies_walk_commit_kept,
 };
