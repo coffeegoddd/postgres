@@ -1997,7 +1997,10 @@ static inline void
 note_branch_write(Relation relation)
 {
 	if (relation->rd_rel->relam == PROLLY_TABLE_AM_OID)
+	{
+		RelationCheckReplacedWrite(relation);
 		branch_note_write(MyBranch);
+	}
 }
 
 /*

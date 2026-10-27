@@ -82,9 +82,12 @@ SELECT kept();
 
 -- the entry b was kept by before, its storage replaced, is dropped from
 -- the record, not left there retired: the record holds b's entry from the
--- restore, retired again by the keep after the move, besides b, c and a:
--- four entries the size of those three, not five
-SELECT 3 * octet_length(test_refs_value('Kmain')) = 4 * :record_of_three
+-- restore, retired again by the keep after the move, besides b, c and a,
+-- and the storage the restore replaced (kept for older snapshots, a table
+-- and its relations without a baseline: smaller than a commit's entry):
+-- more than four entries the size of those three, but less than five
+SELECT 3 * octet_length(test_refs_value('Kmain')) > 4 * :record_of_three AND
+	3 * octet_length(test_refs_value('Kmain')) < 5 * :record_of_three
 	AS gone_entry_dropped;
  gone_entry_dropped 
 --------------------
