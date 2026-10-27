@@ -625,8 +625,7 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 		pfree(vb);
 		smgrcreate(dsrel, VISIBILITYMAP_FORKNUM, false);
 		log_smgrcreate(&dst, VISIBILITYMAP_FORKNUM);
-		RelationCopyStorage(src, dsrel, VISIBILITYMAP_FORKNUM,
-							RELPERSISTENCE_PERMANENT);
+		RelationCopyMapFork(src, dsrel, VISIBILITYMAP_FORKNUM);
 	}
 
 	/*
