@@ -1042,7 +1042,8 @@ entry_cmp(const ListCell *a, const ListCell *b)
 
 /*
  * A fragment's identity: the root of a tree of its commits' index entries
- * (keyed by date, then id; each its height and parents), as any tree of
+ * (keyed by date, then id; each its parents: not its height, which a commit
+ * may not record), as any tree of
  * those entries is built.
  */
 static void
@@ -1069,7 +1070,6 @@ fragment_root(List *severed, ProllyHash *root)
 		resetStringInfo(&v);
 		put_be64(&k, ((uint64) pc->e.committed_at) ^ ((uint64) 1 << 63));
 		put_id(&k, &pc->id);
-		put_be64(&v, (uint64) pc->e.height);
 		appendStringInfoChar(&v, (char) pc->e.nparents);
 		for (int i = 0; i < pc->e.nparents; i++)
 			put_id(&v, &pc->e.parents[i]);
@@ -1112,14 +1112,15 @@ next_number(void)
 	return next;
 }
 
+/* Severing or repairing history is the database owner's (what, which). */
 static void
-check_may_sever(void)
+check_may_sever(const char *what)
 {
 	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to sever history of database \"%s\"",
-						get_database_name(MyDatabaseId)),
+				 errmsg("permission denied to %s history of database \"%s\"",
+						what, get_database_name(MyDatabaseId)),
 				 errdetail("Only the database's owner or a superuser may.")));
 }
 
@@ -1152,7 +1153,7 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a history window needs a date to cut before")));
-	check_may_sever();
+	check_may_sever("sever");
 	PreventCommandIfReadOnly("severing history");
 	horizon_lock(ExclusiveLock);
 	plan_then_hold(&plan, before);
@@ -1281,6 +1282,292 @@ archive_sever(ProllyWindowAction action, const TimestampTz *before,
 }
 
 /* ------------------------------------------------------------------------
+ * Repair
+ * ------------------------------------------------------------------------
+ */
+
+static bool
+collect_record(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	List	  **records = arg;
+	FragmentRecord *r;
+
+	if (key->len != 9 || key->data[0] != KEY_FRAGMENT)
+		return false;
+	r = palloc(sizeof(FragmentRecord));
+	fragment_decode((const char *) value->data, value->len,
+					(int64) get_be64((const char *) key->data + 1), r);
+	*records = lappend(*records, r);
+	return true;
+}
+
+/* The horizon's fragments' records, newest first. */
+static List *
+fragment_records(void)
+{
+	StringInfoData k;
+	ProllyKey	from;
+	List	   *records = NIL;
+
+	initStringInfo(&k);
+	number_key(&k, KEY_FRAGMENT, PG_INT64_MAX);
+	from.data = (const uint8 *) k.data;
+	from.len = k.len;
+	PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+				BackwardScanDirection, collect_record, &records);
+	pfree(k.data);
+	return records;
+}
+
+typedef struct EdgesOf
+{
+	int64		number;
+	List	   *keys;			/* StringInfo: each edge's key */
+} EdgesOf;
+
+static bool
+collect_edge_of(const ProllyKey *key, const ProllyValue *value, void *arg)
+{
+	EdgesOf    *eo = arg;
+
+	if (key->len < 1 || key->data[0] != KEY_EDGE)
+		return false;
+	if (value->len != 8)
+		horizon_corrupt();
+	if ((int64) get_be64((const char *) value->data) == eo->number)
+	{
+		StringInfo	k = makeStringInfo();
+
+		appendBinaryStringInfo(k, (const char *) key->data, key->len);
+		eo->keys = lappend(eo->keys, k);
+	}
+	return true;
+}
+
+/* A remote's name, if the refs know it, is its URL; else source is one. */
+typedef struct NamedRemote
+{
+	const char *name;
+	char	   *url;
+} NamedRemote;
+
+static void
+match_remote(const char *name, const char *url, void *arg)
+{
+	NamedRemote *nr = arg;
+
+	if (strcmp(name, nr->name) == 0)
+		nr->url = pstrdup(url);
+}
+
+static char *
+source_url(const char *source)
+{
+	NamedRemote nr = {source, NULL};
+
+	PROLLY_CALL(dc.refs, remotes, match_remote, &nr);
+	return nr.url ? nr.url : pstrdup(source);
+}
+
+/*
+ * A fragment's commits, back in the store: from its tops down, to its
+ * stops.  An error if one is missing still.
+ */
+static List *
+fragment_commits(const FragmentRecord *r)
+{
+	HTAB	   *seen = id_set("prolly fragment commits", sizeof(ProllyHash));
+	List	   *todo = NIL;
+	List	   *commits = NIL;
+
+	for (int i = 0; i < r->nstops; i++)
+		(void) set_add(seen, &r->stops[i]);
+	for (int i = 0; i < r->f.ntops; i++)
+		if (set_add(seen, &r->f.tops[i]))
+			todo = lappend(todo, (void *) &r->f.tops[i]);
+	while (todo != NIL)
+	{
+		ProllyHash *id = llast(todo);
+		ProllyCommitInfo info;
+		PlanCommit *pc;
+
+		todo = list_delete_last(todo);
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(tree_env.chunk_store, has, tree_env.chunks, id) ||
+			!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fragment %lld of the history horizon isn't whole: commit %s is missing",
+							(long long) r->f.number, prolly_hash_hex(id))));
+		pc = palloc0(sizeof(PlanCommit));
+		pc->id = *id;
+		pc->e.committed_at = info.committed_at;
+		pc->e.height = info.has_height ? info.height : 0;
+		pc->e.nparents = info.nparents;
+		for (int i = 0; i < info.nparents; i++)
+		{
+			pc->e.parents[i] = info.parents[i];
+			if (set_add(seen, &info.parents[i]))
+			{
+				ProllyHash *p = palloc(sizeof(ProllyHash));
+
+				*p = info.parents[i];
+				todo = lappend(todo, p);
+			}
+		}
+		commits = lappend(commits, pc);
+	}
+	hash_destroy(seen);
+	return commits;
+}
+
+static bool
+same_hash(const ProllyHash *a, const ProllyHash *b)
+{
+	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+/*
+ * Repair the newest nfragments of the horizon's fragments (all, if < 0),
+ * newest first: each one's chunks received from source (a remote's name
+ * or URL; NULL: the fragment's archive), every one re-hashed as the
+ * transfer receives it; then its commits, from its tops to its stops,
+ * must give its identity and digest again, or nothing is repaired.  Its
+ * edges and record are let go of: the history reads as it did.
+ */
+static int
+archive_repair(const char *source, int nfragments)
+{
+	List	   *records;
+	int			repaired = 0;
+
+	List	   *chosen = NIL;
+	List	   *urls = NIL;
+
+	window_init();
+	check_may_sever("repair");
+	PreventCommandIfReadOnly("repairing history");
+
+	/*
+	 * Received first, holding the horizon's lock but not the refs (a
+	 * transfer may take long; the horizon's lock blocks only collections
+	 * and severs), each fragment down to its stops: an older fragment's
+	 * tops are not received, so a source that has only this one serves
+	 * it, and the horizon goes on cutting there.  The horizon's lock comes
+	 * first, before the chunk store's that a receive takes to the end of
+	 * the transaction, as a collection takes them.
+	 */
+	horizon_lock(ExclusiveLock);
+	records = fragment_records();
+	foreach_ptr(FragmentRecord, r, records)
+	{
+		char	   *url;
+		const ProllyRemoteRoutine *rr;
+		ProllyRemote *remote;
+
+		if (nfragments >= 0 && list_length(chosen) >= nfragments)
+			break;
+		if (source == NULL && r->f.location == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("fragment %lld of the history horizon was deleted, not archived",
+							(long long) r->f.number),
+					 errhint("Name a remote or a clone that has its history.")));
+		url = source ? source_url(source) : pstrdup(r->f.location);
+		rr = prolly_remote_for_url(url);
+		remote = PROLLY_CALL(rr, open, url, false);
+		PG_TRY();
+		{
+			if (PROLLY_HAS(dc.transfer, receive_until))
+				(void) PROLLY_CALL(dc.transfer, receive_until, rr, remote,
+								   r->f.tops, r->f.ntops, r->stops, r->nstops);
+			else
+				(void) PROLLY_CALL(dc.transfer, receive, rr, remote,
+								   r->f.tops, r->f.ntops);
+		}
+		PG_FINALLY();
+		{
+			PROLLY_CALL(rr, close, remote);
+		}
+		PG_END_TRY();
+		chosen = lappend(chosen, r);
+		urls = lappend(urls, url);
+	}
+
+	/* then verified, and let go of, holding the refs too */
+	INJECTION_POINT("prolly-repair-received", NULL);
+	PROLLY_CALL(dc.refs, lock);
+	records = fragment_records();
+	foreach_ptr(FragmentRecord, c, chosen)
+	{
+		FragmentRecord *r = NULL;
+		char	   *url = list_nth(urls, foreach_current_index(c));
+		List	   *commits;
+		List	   *ids = NIL;
+		ProllyHash	root;
+		ProllyHash	digest;
+		int64		chunks;
+		int64		bytes;
+		EdgesOf		eo = {c->f.number, NIL};
+		char		e = KEY_EDGE;
+		ProllyKey	from = {(const uint8 *) &e, 1};
+		StringInfoData k;
+
+		foreach_ptr(FragmentRecord, now, records)
+			if (now->f.number == c->f.number)
+				r = now;
+		/* (one a repair let go of meanwhile is done) */
+		if (r == NULL)
+			continue;
+
+		/* (whole again, and the same history: its identity and digest) */
+		commits = fragment_commits(r);
+		foreach_ptr(PlanCommit, pc, commits)
+			ids = lappend(ids, &pc->id);
+		fragment_root(commits, &root);
+		fragment_closure(ids, &digest, &chunks, &bytes);
+		if (list_length(commits) != r->f.commits || !same_hash(&root, &r->f.root) ||
+			!same_hash(&digest, &r->f.digest))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fragment %lld of the history horizon doesn't verify",
+							(long long) r->f.number),
+					 errdetail("Its %d commits from %s give identity %s and digest %s, not %s and %s.",
+							   list_length(commits), url,
+							   prolly_hash_hex(&root), prolly_hash_hex(&digest),
+							   prolly_hash_hex(&r->f.root),
+							   prolly_hash_hex(&r->f.digest))));
+
+		/* (its edges and record let go of: the boundary keeps its parents) */
+		PROLLY_CALL(dc.refs, side_scan, SPACE_HORIZON, &from,
+					ForwardScanDirection, collect_edge_of, &eo);
+		foreach_ptr(StringInfoData, ek, eo.keys)
+		{
+			ProllyKey	key = {(const uint8 *) ek->data, ek->len};
+
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		}
+		initStringInfo(&k);
+		number_key(&k, KEY_FRAGMENT, r->f.number);
+		{
+			ProllyKey	key = {(const uint8 *) k.data, k.len};
+
+			PROLLY_CALL(dc.refs, side_put, SPACE_HORIZON, &key, NULL);
+		}
+		pfree(k.data);
+		horizon_changed();
+		repaired++;
+		ereport(LOG,
+				(errmsg("history of database \"%s\" repaired: fragment %lld, %lld commits dated %s to %s, from %s",
+						get_database_name(MyDatabaseId), (long long) r->f.number,
+						(long long) r->f.commits,
+						timestamptz_to_str(r->f.oldest),
+						timestamptz_to_str(r->f.newest), url)));
+	}
+	return repaired;
+}
+
+/* ------------------------------------------------------------------------
  * Readers at the horizon
  * ------------------------------------------------------------------------
  */
@@ -1368,4 +1655,5 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.edges = archive_edges,
 	.fragments = archive_fragments,
 	.hold = archive_hold,
+	.repair = archive_repair,
 };
