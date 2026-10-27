@@ -66,9 +66,14 @@ typedef enum BranchKeptStatus
 } BranchKeptStatus;
 
 /*
- * The snapshot id of a BranchKeptRelation that names a relation's storage
- * itself, one a restore replaced, rather than a snapshot of it: letting go
- * of it drops the storage.
+ * The snapshot id of a BranchKeptRelation that names old storage itself,
+ * not a snapshot in it: the storage a restore replaced (its tablespace and
+ * relfilenumber, no longer the relation's in pg_class), kept whole for the
+ * snapshots older than the move, which read it.  Such an entry is never
+ * restored, shared, carried or checked for its status; letting go of it
+ * (let_go(), keep()'s release[]) drops the storage as the transaction
+ * commits.  The refs keep it as a retired entry of the branch's kept list,
+ * all of whose relations are such entries.
  */
 #define BRANCH_KEPT_STORAGE		PG_UINT64_MAX
 

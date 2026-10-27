@@ -328,11 +328,11 @@
  * no classes (a move keeps a table's relation, by OID); 19: each kept
  * table's data tree, a head's root after the head, and the indexes of kept commits by commit and table,
  * of branches by their heads' and baselines' roots, and of branches' names
- * case folded; 20: a branch's kept list may name the storage a restore
+ * case folded; 21: a branch's kept list may name the storage a restore
  * replaced (a retired entry whose relations' snapshot is
  * BRANCH_KEPT_STORAGE), dropped once no snapshot is older than it.
  */
-#define REFS_FORMAT		"20"
+#define REFS_FORMAT		"21"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
