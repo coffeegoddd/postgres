@@ -1,11 +1,11 @@
--- The refs keep, for each commit a head moves to, the commits it reaches,
--- itself included (one more than its first parent's, and for a merge,
--- more by those its other parents reach that the first doesn't), as
--- Dolt's commit closure counts them, outside the commit: commit ids are
--- as they were.  So count(*) of dolt_log(ref) alone is planned as a scan
--- giving that count, reading no history; a history horizon, or a commit
--- they keep none for, has the log counted as it gives its rows, and the
--- next head move keeps the missing ones.
+-- A branch's kept commit (the pages kept as of it, for its window, as a
+-- head moves there) records the commits it reaches, itself included (one
+-- more than its first parent's, and for a merge, more by those its other
+-- parents reach that the first doesn't), as Dolt's commit closure counts
+-- them, outside the commit: commit ids are as they were.  So count(*) of
+-- dolt_log(ref) alone is planned as a scan giving that count, reading no
+-- history; a history horizon, or a commit no branch keeps with a count,
+-- has the log counted as it gives its rows.
 SELECT current_database() AS home \gset
 -- A commit's id is its content's alone, as before counts were kept: a
 -- first commit of fixed content, author and date has the id it had.
@@ -314,9 +314,9 @@ FROM (SELECT * FROM dolt_log OFFSET 0) l;
  t
 (1 row)
 
--- History the refs keep no counts for (made elsewhere, or before they
--- were kept): counted as the log is, and kept once a head moves there,
--- down the first parents to one kept.
+-- Commits no branch keeps (made elsewhere): counted as the log is; once
+-- a head moves to one, it is kept, its count from the nearest kept first
+-- parent a few below; the commits between keep none.
 SELECT test_commit_chain(dolt_hashof('main'), 3) AS old_head \gset
 SELECT test_commit_commits(:'old_head') AS kept_for_old;
  kept_for_old 
@@ -354,7 +354,7 @@ SELECT test_commit_commits(:'old_head') AS kept_once_moved;
 SELECT test_commit_commits(dolt_hashof('main~1')) AS kept_beneath;
  kept_beneath 
 --------------
-           63
+             
 (1 row)
 
 UPDATE lc.t SET v = 0 WHERE id = 1;
@@ -371,37 +371,32 @@ SELECT test_commit_commits(dolt_hashof('main')) AS kept_on_new,
           65 | 65 65
 (1 row)
 
--- A count forgotten (the refs' entries are derived, and may be missing):
--- the log counted, the same, then kept again by the next head move.
-SELECT dolt_hashof('main') AS head \gset
-SELECT test_commit_commits_forget(:'head');
- test_commit_commits_forget 
-----------------------------
+-- A commit whose root is let go of (out of the window) keeps no count:
+-- the log counted, the same; the head's is kept always.
+ALTER DATABASE regress_log_count SET prolly.history_window = '1 microsecond';
+SELECT test_retain_roots('main');
+ test_retain_roots 
+-------------------
  
 (1 row)
 
-SELECT test_commit_commits(:'head') AS forgotten, counts('main') AS counted;
- forgotten | counted 
+SELECT test_commit_commits(dolt_hashof('main~3')) AS let_go,
+	counts('main~3') AS counted;
+ let_go | counted 
+--------+---------
+        | 62 62
+(1 row)
+
+SELECT test_commit_commits(dolt_hashof('main')) AS head_kept,
+	counts('main') AS counted;
+ head_kept | counted 
 -----------+---------
-           | 65 65
+        65 | 65 65
 (1 row)
 
-UPDATE lc.t SET v = 1 WHERE id = 1;
-SELECT length(dolt_commit('-Am', 'after forgetting')::text) AS committed;
- committed 
------------
-        42
-(1 row)
-
-SELECT test_commit_commits(:'head') AS kept_again,
-	test_commit_commits(dolt_hashof('main')) AS kept_head, counts('main') AS counted;
- kept_again | kept_head | counted 
-------------+-----------+---------
-         65 |        66 | 66 66
-(1 row)
-
--- A clone is sent none (they are the refs', not the commits'): its head's move
--- keeps them, the same count.
+ALTER DATABASE regress_log_count RESET prolly.history_window;
+-- A clone is sent none (they are the refs', not the commits'): its head's keep
+-- records one, the same count.
 \getenv abs_builddir PG_ABS_BUILDDIR
 SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/log-count-' ||
 	txid_current() AS url \gset

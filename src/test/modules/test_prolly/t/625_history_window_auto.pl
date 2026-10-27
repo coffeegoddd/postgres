@@ -96,7 +96,7 @@ like($node->safe_psql('hw', q{SELECT state FROM prolly_history_horizon() LIMIT 1
 	qr/deleted/, 'deleted');
 
 # Under the size limit, as measured: nothing more severed.
-sql(q{ALTER DATABASE hw SET prolly.history_window = '';
+sql(q{ALTER DATABASE hw SET prolly.history_window = '1000 years';
 	ALTER DATABASE hw SET prolly.history_min_commits = 3;
 	ALTER DATABASE hw SET prolly.history_batch = '1 day';
 	ALTER DATABASE hw SET prolly.history_max_size = '1GB';});

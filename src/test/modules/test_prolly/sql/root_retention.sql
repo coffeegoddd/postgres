@@ -7,6 +7,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE root_retention;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE root_retention SET prolly.history_window = '1000 years';
 ALTER DATABASE root_retention SET prolly.restore_min_changes = 0;
 \c root_retention
 SET client_min_messages = warning;
@@ -54,6 +57,7 @@ SELECT kept();
 -- keep their roots, and the tag's commit
 SELECT dolt_tag('keep4', (SELECT commit_hash FROM dolt_log WHERE message = 'c4'));
 ALTER DATABASE root_retention SET prolly.history_min_commits = 5;
+ALTER DATABASE root_retention SET prolly.history_window = '1 microsecond';
 SELECT test_retain_roots('main');
 SELECT kept();
 
@@ -82,6 +86,7 @@ SELECT kept();
 
 -- a cap a byte under what the roots hold: the oldest one goes
 ALTER DATABASE root_retention RESET prolly.history_min_commits;
+ALTER DATABASE root_retention SET prolly.history_window = '1000 years';
 CREATE FUNCTION held() RETURNS bigint LANGUAGE sql AS $$
 	SELECT ('x' || encode(substring(test_refs_value('Lmain') FROM 9 FOR 8), 'hex'))::bit(64)::bigint
 $$;
@@ -112,6 +117,7 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 UPDATE rr.t SET v = 14 WHERE id % 10 = 4;
 SELECT dolt_commit('-am', 'c14') IS NOT NULL AS committed;
 ALTER DATABASE root_retention SET prolly.history_min_commits = 2;
+ALTER DATABASE root_retention SET prolly.history_window = '1 microsecond';
 SELECT test_retain_roots('main');
 SELECT kept();
 SELECT EXISTS (SELECT FROM test_kept_commits('main') WHERE commit_id = :'c13')
@@ -127,6 +133,7 @@ SELECT dolt_checkout('main');
 -- roots captured among writers (each transaction a commit) count what
 -- their freezing copies, so a cap thins them too
 ALTER DATABASE root_retention RESET prolly.history_min_commits;
+ALTER DATABASE root_retention SET prolly.history_window = '1000 years';
 SELECT held() AS h0 \gset
 SET dolt.transaction_commit = on;
 SET prolly.root_interval = 0;

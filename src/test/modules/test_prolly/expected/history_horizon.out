@@ -12,6 +12,9 @@ SELECT current_database() AS home \gset
 \set VERBOSITY terse
 -- (a database of its own: its history is only this test's)
 CREATE DATABASE regress_history_horizon;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE regress_history_horizon SET prolly.history_window = '1000 years';
 \c regress_history_horizon
 -- err(q): q's error, hashes masked
 CREATE FUNCTION hh_err(q text) RETURNS text LANGUAGE plpgsql AS $$

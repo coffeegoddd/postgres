@@ -32,6 +32,8 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 is(sql('SHOW data_checksums'), 'on', 'data checksums are on');
 # (a window of two commits)
 sql('ALTER DATABASE postgres SET prolly.history_min_commits = 2');
+# (the newest commits only: a window that holds no other)
+sql(q{ALTER DATABASE postgres SET prolly.history_window = '1 microsecond'});
 
 sql(q{
 	CREATE EXTENSION pg_buffercache;

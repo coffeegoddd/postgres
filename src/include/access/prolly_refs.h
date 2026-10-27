@@ -1003,6 +1003,15 @@ typedef struct ProllyRefsRoutine
 	 * collection.  The caller holds every ref.
 	 */
 	void		(*forget_kept) (const ProllyHash *commit);
+
+	/*
+	 * Optional: the commits commit reaches, itself included
+	 * (prolly_history_commits()), as a branch's kept commit of it records
+	 * them (a seek); false if no branch keeps it, or its entry records
+	 * none.  What count(*) of the commit's dolt_log() gives while no
+	 * history is severed.
+	 */
+	bool		(*commit_count) (const ProllyHash *commit, int64 *count);
 } ProllyRefsRoutine;
 
 /*
@@ -1068,9 +1077,10 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"made_object", "stash_set_maker", "last_fold", "branches_named", \
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
-	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept"
+	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept", \
+	"commit_count"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK forget_kept
+#define PROLLY_REFS_LAST_CALLBACK commit_count
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
@@ -1123,15 +1133,6 @@ extern bool prolly_history_commits(const ProllyHash *parents, int nparents,
 								   ProllyCommitLookup lookup, void *lookup_arg,
 								   int64 *commits);
 
-/*
- * The refs' side space (side_get()) of the commits each commit reaches,
- * itself included (prolly_history_commits()), keyed by the commit id's
- * bytes, 8 bytes big-endian: what count(*) of its dolt_log() gives while
- * no history is severed.  Derived, not part of any commit: the refs fill
- * it as a head moves to a commit (from its parents', or down its first
- * parents to one they have), and a commit missing has its log counted.
- */
-#define PROLLY_REFS_SPACE_COMMITS	'n'
 
 extern struct HTAB *prolly_history_heights(void);
 extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,

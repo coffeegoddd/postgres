@@ -10,6 +10,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE bounded_counts;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE bounded_counts SET prolly.history_window = '1000 years';
 \c bounded_counts
 
 -- (the counters a move counts, read once the session's are flushed)
@@ -62,6 +65,7 @@ SELECT dolt_branch('-D', 'other') IS NOT NULL AS deleted;
 -- the first leaf.
 RESET debug_prolly_page_roots;
 ALTER DATABASE bounded_counts SET prolly.history_min_commits = 1;
+ALTER DATABASE bounded_counts SET prolly.history_window = '1 microsecond';
 SELECT :'c' AS a \gset
 UPDATE bc.t SET v = 1 WHERE id <= 50;
 SELECT (dolt_commit('-am', 'b'))[1] AS b \gset
@@ -274,6 +278,7 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 	   (since(:'before') ->> 'apply_rows')::int AS applied,
 	   d_digest() = :'at_y' AS at_y, clean();
 ALTER DATABASE bounded_counts RESET prolly.history_min_commits;
+ALTER DATABASE bounded_counts SET prolly.history_window = '1000 years';
 
 \c :home
 DROP DATABASE bounded_counts;

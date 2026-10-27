@@ -7,6 +7,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_carried;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_carried SET prolly.history_window = '1000 years';
 ALTER DATABASE kept_carried SET prolly.restore_min_changes = 0;
 \c kept_carried
 SET client_min_messages = warning;
@@ -120,6 +123,7 @@ SELECT dolt_commit('--allow-empty', '-m', 'empty') IS NOT NULL AS committed;
 -- commit's kept by a tag, and a's and b's in the window, three commits)
 SELECT dolt_tag('empty', 'HEAD');
 ALTER DATABASE kept_carried SET prolly.history_min_commits = 3;
+ALTER DATABASE kept_carried SET prolly.history_window = '1 microsecond';
 SELECT dolt_reset('--hard', :'a');
 SELECT test_retain_roots('main');
 SELECT count(*) AS kept FROM test_kept_commits('main');
@@ -141,6 +145,7 @@ SELECT counted('relations_restored') > :r AS restored,
 	   indexes_valid();
 
 ALTER DATABASE kept_carried RESET prolly.history_min_commits;
+ALTER DATABASE kept_carried SET prolly.history_window = '1000 years';
 
 -- every block the stores hold is held by a map or a snapshot kept
 SELECT dolt_commit('--allow-empty', '-m', 'settled') IS NOT NULL AS committed;

@@ -1,11 +1,11 @@
--- The refs keep, for each commit a head moves to, the commits it reaches,
--- itself included (one more than its first parent's, and for a merge,
--- more by those its other parents reach that the first doesn't), as
--- Dolt's commit closure counts them, outside the commit: commit ids are
--- as they were.  So count(*) of dolt_log(ref) alone is planned as a scan
--- giving that count, reading no history; a history horizon, or a commit
--- they keep none for, has the log counted as it gives its rows, and the
--- next head move keeps the missing ones.
+-- A branch's kept commit (the pages kept as of it, for its window, as a
+-- head moves there) records the commits it reaches, itself included (one
+-- more than its first parent's, and for a merge, more by those its other
+-- parents reach that the first doesn't), as Dolt's commit closure counts
+-- them, outside the commit: commit ids are as they were.  So count(*) of
+-- dolt_log(ref) alone is planned as a scan giving that count, reading no
+-- history; a history horizon, or a commit no branch keeps with a count,
+-- has the log counted as it gives its rows.
 SELECT current_database() AS home \gset
 
 -- A commit's id is its content's alone, as before counts were kept: a
@@ -118,9 +118,9 @@ SELECT count(DISTINCT commit_hash) = (SELECT count(*) FROM dolt_log) AS once
 FROM (SELECT * FROM dolt_log OFFSET 0) l;
 
 
--- History the refs keep no counts for (made elsewhere, or before they
--- were kept): counted as the log is, and kept once a head moves there,
--- down the first parents to one kept.
+-- Commits no branch keeps (made elsewhere): counted as the log is; once
+-- a head moves to one, it is kept, its count from the nearest kept first
+-- parent a few below; the commits between keep none.
 SELECT test_commit_chain(dolt_hashof('main'), 3) AS old_head \gset
 SELECT test_commit_commits(:'old_head') AS kept_for_old;
 :flush
@@ -136,18 +136,18 @@ SELECT length(dolt_commit('-Am', 'on old')::text) AS committed;
 SELECT test_commit_commits(dolt_hashof('main')) AS kept_on_new,
 	counts('main') AS counted;
 
--- A count forgotten (the refs' entries are derived, and may be missing):
--- the log counted, the same, then kept again by the next head move.
-SELECT dolt_hashof('main') AS head \gset
-SELECT test_commit_commits_forget(:'head');
-SELECT test_commit_commits(:'head') AS forgotten, counts('main') AS counted;
-UPDATE lc.t SET v = 1 WHERE id = 1;
-SELECT length(dolt_commit('-Am', 'after forgetting')::text) AS committed;
-SELECT test_commit_commits(:'head') AS kept_again,
-	test_commit_commits(dolt_hashof('main')) AS kept_head, counts('main') AS counted;
+-- A commit whose root is let go of (out of the window) keeps no count:
+-- the log counted, the same; the head's is kept always.
+ALTER DATABASE regress_log_count SET prolly.history_window = '1 microsecond';
+SELECT test_retain_roots('main');
+SELECT test_commit_commits(dolt_hashof('main~3')) AS let_go,
+	counts('main~3') AS counted;
+SELECT test_commit_commits(dolt_hashof('main')) AS head_kept,
+	counts('main') AS counted;
+ALTER DATABASE regress_log_count RESET prolly.history_window;
 
--- A clone is sent none (they are the refs', not the commits'): its head's move
--- keeps them, the same count.
+-- A clone is sent none (they are the refs', not the commits'): its head's keep
+-- records one, the same count.
 \getenv abs_builddir PG_ABS_BUILDDIR
 SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/log-count-' ||
 	txid_current() AS url \gset

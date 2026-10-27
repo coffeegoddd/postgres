@@ -68,17 +68,31 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
--- No window: everything is kept, whatever the action.
+-- Every branch's history has a window: a month, unless the database
+-- sets another.  It can't be unset, empty or nothing long, nor a branch's.
 SELECT * FROM prolly_history_policy(NULL);
  action  | time_window | min_commits | batch | max_size | archive 
 ---------+-------------+-------------+-------+----------+---------
- archive |             |           0 |       |          | 
+ archive | @ 720 hours |           0 |       |          | 
 (1 row)
 
 SELECT count(*) AS planned FROM prolly_history_plan(NULL);
  planned 
 ---------
        0
+(1 row)
+
+SELECT hw_err($$SET prolly.history_window = ''$$) AS empty_refused,
+	   hw_err($$SET prolly.history_window = '0'$$) AS zero_refused;
+                      empty_refused                      |                       zero_refused                       
+---------------------------------------------------------+----------------------------------------------------------
+ invalid value for parameter "prolly.history_window": "" | invalid value for parameter "prolly.history_window": "0"
+(1 row)
+
+SELECT hw_err($$ALTER DATABASE regress_history_window SET prolly.history_window = ''$$) AS database_empty_refused;
+                 database_empty_refused                  
+---------------------------------------------------------
+ invalid value for parameter "prolly.history_window": ""
 (1 row)
 
 -- A window of three days, as the database has it; the long branch keeps
@@ -106,6 +120,12 @@ SELECT hw_err($$SELECT dolt_history_window('long', 'archive', 'x')$$) AS not_a_b
                 not_a_branch_setting                
 ----------------------------------------------------
  a branch's history window has no setting "archive"
+(1 row)
+
+SELECT hw_err($$SELECT dolt_history_window('long', 'window', '0 seconds')$$) AS branch_none_refused;
+                      branch_none_refused                       
+----------------------------------------------------------------
+ a branch's window must be a positive interval, not "0 seconds"
 (1 row)
 
 SELECT hw_err($$SELECT dolt_history_window(NULL, 'window', '1 day')$$) AS null_branch,
@@ -462,11 +482,12 @@ SELECT action, fragment, commits FROM dolt_history_sever();
  none   |          |       0
 (1 row)
 
--- A branch's own window, with none for the database, cuts its lineage
--- (a branch's own commits are above its merge bases with the others, which
--- keep the paths to them: what a branch's window cuts is what every
--- lineage that reaches it lets go of).
+-- A branch's own window, narrower than the database's (a long one here),
+-- cuts its lineage (a branch's own commits are above its merge bases with
+-- the others, which keep the paths to them: what a branch's window cuts is
+-- what every lineage that reaches it lets go of).
 CREATE DATABASE regress_history_window_c;
+ALTER DATABASE regress_history_window_c SET prolly.history_window = '1000 years';
 \c regress_history_window_c
 CREATE SCHEMA hw VERSIONED;
 CREATE TABLE hw.t (id int PRIMARY KEY, v text);

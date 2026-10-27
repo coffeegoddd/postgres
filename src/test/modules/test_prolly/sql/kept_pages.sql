@@ -9,6 +9,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE kept_pages;
+-- (history older than the window keeps no roots: a window long enough
+-- for all of this one's)
+ALTER DATABASE kept_pages SET prolly.history_window = '1000 years';
 -- (every changed table restored, however few its changes: the threshold
 -- is tested at the end)
 ALTER DATABASE kept_pages SET prolly.restore_min_changes = 0;
@@ -210,6 +213,7 @@ SELECT rows_digest() = :'at_load' AS as_loaded, clean();
 -- commits (a window of two), and those of the commits last retired (let
 -- go of once the transaction retiring them is known to have committed)
 ALTER DATABASE kept_pages SET prolly.history_min_commits = 2;
+ALTER DATABASE kept_pages SET prolly.history_window = '1 microsecond';
 UPDATE kp.t SET v = 1 WHERE id = 2;
 SELECT dolt_commit('-am', 'step 1') IS NOT NULL AS committed;
 UPDATE kp.t SET v = 2 WHERE id = 2;
@@ -227,6 +231,7 @@ UPDATE kp.t SET v = 7 WHERE id = 2;
 SELECT dolt_commit('-am', 'step 7') IS NOT NULL AS committed;
 SELECT kept('kp.t') <= 3 AS t, kept('kp.t_v') <= 3 AS t_v;
 ALTER DATABASE kept_pages RESET prolly.history_min_commits;
+ALTER DATABASE kept_pages SET prolly.history_window = '1000 years';
 
 -- with none kept, a reset writes the rows back
 SET debug_prolly_page_roots = off;
