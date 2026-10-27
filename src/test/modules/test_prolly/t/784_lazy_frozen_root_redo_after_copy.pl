@@ -30,7 +30,6 @@ $node->append_conf('postgresql.conf', q{
 autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
-prolly.restore_min_changes = 0
 prolly.kept_commits = 8
 });
 $node->start;

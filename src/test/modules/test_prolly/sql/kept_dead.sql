@@ -15,7 +15,6 @@ CREATE DATABASE kept_dead;
 -- (history older than the window keeps no roots: a window long enough
 -- for all of this one's)
 ALTER DATABASE kept_dead SET prolly.history_window = '1000 years';
-ALTER DATABASE kept_dead SET prolly.restore_min_changes = 0;
 ALTER DATABASE kept_dead SET prolly.history_min_commits = 3;
 ALTER DATABASE kept_dead SET prolly.history_window = '1 microsecond';
 \c kept_dead
@@ -150,7 +149,6 @@ CREATE DATABASE kept_dead_gc;
 -- (history older than the window keeps no roots: a window long enough
 -- for all of this one's)
 ALTER DATABASE kept_dead_gc SET prolly.history_window = '1000 years';
-ALTER DATABASE kept_dead_gc SET prolly.restore_min_changes = 0;
 \c kept_dead_gc
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

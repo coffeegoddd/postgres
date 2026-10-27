@@ -64,7 +64,12 @@ marked|too
 t     |t  
 (1 row)
 
-step s1_reset: SELECT dolt_reset('--hard') IS NOT NULL AS ok; <waiting ...>
+step s1_reset: SELECT dolt_reset('--hard') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
 step s2_read: SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty FROM vrk.t;
 dirty
 -----
@@ -72,12 +77,6 @@ dirty
 (1 row)
 
 step s2_end: COMMIT;
-step s1_reset: <... completed>
-ok
---
-t 
-(1 row)
-
 step s1_flush: SELECT pg_stat_force_next_flush();
 pg_stat_force_next_flush
 ------------------------
@@ -91,7 +90,7 @@ step s1_how:
 
 rows_written|pages_given_back|base_rows
 ------------+----------------+---------
-f           |t               |       20
+t           |f               |       20
 (1 row)
 
 

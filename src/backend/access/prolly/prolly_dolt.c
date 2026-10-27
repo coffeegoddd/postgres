@@ -4538,15 +4538,14 @@ typedef struct LogEntry
  * them): the next to give is always the greatest of those found, kept in a
  * heap, and each one given is read with its parents, those then found.  So
  * the first n commits cost about n commits read, their parents with them,
- * however long the history.  A listing stops at the history horizon.
+ * however long the history.  A listing goes across the history horizon:
+ * every commit object is kept.
  */
 struct ProllyLogStream
 {
 	HTAB	   *seen;			/* of LogEntry, by key */
 	HTAB	   *heights;		/* those reckoned of commits without one */
 	pairingheap *heap;			/* those found, not given */
-	HTAB	   *horizon;		/* the history horizon as it began (NULL:
-								 * the window's, asked) */
 };
 typedef ProllyLogStream LogStream;
 
@@ -4622,8 +4621,6 @@ log_stream_begin(List *starts)
 	ls->seen = hash_create("dolt_log commits", 256, &ctl,
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	ls->heap = pairingheap_allocate(log_heap_cmp, NULL);
-	/* (held: a sever or a rollback meanwhile doesn't move where it stops) */
-	ls->horizon = prolly_window_horizon();
 	foreach_ptr(ProllyHash, start, starts)
 		log_stream_find(ls, start);
 	return ls;
@@ -4639,13 +4636,9 @@ log_stream_next(LogStream *ls)
 	if (pairingheap_is_empty(ls->heap))
 		return NULL;
 	e = pairingheap_container(LogEntry, node, pairingheap_remove_first(ls->heap));
+	/* (every commit object is kept: a listing goes across the horizon) */
 	for (int i = 0; i < e->info.nparents; i++)
-	{
-		/* (a listing stops at the history horizon) */
-		if (prolly_window_held_stops_at(ls->horizon, &e->info.parents[i]))
-			continue;
 		log_stream_find(ls, &e->info.parents[i]);
-	}
 	return e;
 }
 
@@ -8702,6 +8695,8 @@ prolly_history_rows(Oid relid, const ProllyKeyBounds *bounds, int nbounds,
 		ProllyBoundedRead read = PROLLY_BOUNDED_NO;
 
 		CHECK_FOR_INTERRUPTS();
+		if (prolly_window_rows_severed(&e->info.id))
+			continue;
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
@@ -8819,6 +8814,8 @@ dolt_history_table_by_name(PG_FUNCTION_ARGS)
 		ProllyNodeRef data;
 
 		CHECK_FOR_INTERRUPTS();
+		if (prolly_window_rows_severed(&e->info.id))
+			continue;
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);

@@ -286,6 +286,9 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  *		Create a permanent relation's storage as a copy of a snapshot that
  *		another's block-mapped storage keeps (bmap_snapshot_take()).
  *
+ * Only the snapshot tests use it now: moves give a relation the pages of a
+ * root (RelationCreateStorageFromRoot()), not of a snapshot.
+ *
  * The new main fork shares the snapshot's pages until it changes one
  * (bmap_share_snapshot()), O(1) in the relation's size.  It gets no free
  * space map or visibility map, unless with_maps: src's describe its pages
@@ -294,8 +297,8 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * With with_maps (the caller knows src's pages are the snapshot's still,
  * and VACUUM kept from setting a bit meanwhile), they are copies of src's,
  * as RelationCreateStorageShared() makes them.  With replacing, the copy
- * is to take src's place, src dropped as the transaction commits (a
- * restore), so it shares the pages with no other relation for that.  As
+ * is to take src's place, src dropped as the transaction commits, so it
+ * shares the pages with no other relation for that.  As
  * RelationCreateStorage(), the storage is deleted if the transaction
  * aborts when register_delete.
  */
@@ -335,13 +338,14 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 				continue;
 			smgrcreate(srel, fork, false);
 			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-			RelationCopyStorage(src, srel, fork, RELPERSISTENCE_PERMANENT);
+			RelationCopyMapFork(src, srel, fork);
 		}
 	}
 
 	/*
 	 * No pending sync: the snapshot's own blocks were logged as images when
-	 * it was taken, and the share is logged.
+	 * it was taken, and the share is logged, as are the maps' pages
+	 * (RelationCopyMapFork()).
 	 */
 	return srel;
 }
@@ -400,15 +404,44 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 				continue;
 			smgrcreate(srel, fork, false);
 			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-			RelationCopyStorage(maps_from, srel, fork, RELPERSISTENCE_PERMANENT);
+			RelationCopyMapFork(maps_from, srel, fork);
 		}
 	}
 
 	/*
 	 * No pending sync: the root's own blocks were logged as images when it
-	 * was captured, and the share is logged.
+	 * was captured, and the share is logged, as are the maps' pages
+	 * (RelationCopyMapFork()).
 	 */
 	return srel;
+}
+
+/*
+ * RelationCopyMapFork
+ *		Copy a map fork (free space or visibility) of a permanent relation
+ *		into the same fork, just created, of storage made without
+ *		RelationCreateStorage().
+ *
+ * RelationCopyStorage() logs the pages and syncs them, but at
+ * wal_level=minimal it does neither, leaving the sync to the pending sync
+ * RelationCreateStorage() registers, which storage made from a snapshot or
+ * a root has none of: so the pages are logged as images here instead,
+ * through shared buffers, which a checkpoint then writes out and syncs.
+ * Until then a crash can't lose or tear them: redo writes them again.
+ */
+void
+RelationCopyMapFork(SMgrRelation src, SMgrRelation dst, ForkNumber forkNum)
+{
+	Relation	rel;
+
+	Assert(forkNum == FSM_FORKNUM || forkNum == VISIBILITYMAP_FORKNUM);
+	RelationCopyStorage(src, dst, forkNum, RELPERSISTENCE_PERMANENT);
+	if (XLogIsNeeded())
+		return;
+	rel = CreateFakeRelcacheEntry(dst->smgr_rlocator.locator);
+	/* (a map page's bits fill the hole a standard page has: kept) */
+	log_newpage_range(rel, forkNum, 0, smgrnblocks(dst, forkNum), false);
+	FreeFakeRelcacheEntry(rel);
 }
 
 /*

@@ -14,7 +14,6 @@ CREATE DATABASE kept_pages;
 ALTER DATABASE kept_pages SET prolly.history_window = '1000 years';
 -- (every changed table restored, however few its changes: the threshold
 -- is tested at the end)
-ALTER DATABASE kept_pages SET prolly.restore_min_changes = 0;
 \c kept_pages
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;
@@ -324,10 +323,8 @@ SELECT since(:'before') ->> 'apply_rows' AS applied,
 	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
 SELECT rows_digest() = :'before_amend' AS as_before, clean(), indexes_valid();
 
--- a few rows changed since a baseline holding the commit's: written back,
--- not restored (prolly.restore_min_changes); as many as the threshold:
--- restored
-SET prolly.restore_min_changes = 64;
+-- a few rows changed since a baseline holding the commit's: restored all
+-- the same, none written; and more
 SELECT dolt_commit('-Am', 'threshold', '--allow-empty') IS NOT NULL AS committed;
 SELECT rows_digest() AS at_threshold \gset
 UPDATE kp.t SET v = v + 1 WHERE id <= 3;
@@ -350,7 +347,6 @@ SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
 	   (SELECT value FROM pg_stat_prolly WHERE name = 'fold_candidates') -
 	   :candidates AS candidates;
 SELECT rows_digest() = :'at_threshold' AS as_committed, clean(), indexes_valid();
-RESET prolly.restore_min_changes;
 
 -- every block the stores hold is held by a map or a snapshot kept
 CHECKPOINT;

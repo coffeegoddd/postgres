@@ -5,8 +5,9 @@
 # gives the tables the pages of the nearest commit before it that kept
 # them (kept with no other writer at work), and writes the rows the two
 # differ by.  A reset while another transaction holds a table
-# (reading it) waits for it, as TRUNCATE does, and then gives the pages
-# back; the reader's snapshot reads what it saw meanwhile.  A snapshot
+# (reading it) tries the table's lock until prolly.restore_lock_wait,
+# never queued for, then gives up on it and writes the rows instead; the
+# reader's snapshot reads what it saw meanwhile.  A snapshot
 # that didn't hold the table, older than the reset, goes on reading what
 # it saw too: the storage the reset replaced, kept for it.
 
@@ -36,7 +37,6 @@ teardown
 }
 
 session s1
-setup			{ SET prolly.restore_min_changes = 0; }
 step s1_dirty	{ UPDATE vrk.t SET v = 'dirty' WHERE id <= 10; }
 # (the session's counts flushed as the step's transaction ends)
 step s1_flush	{ SELECT pg_stat_force_next_flush(); }
@@ -73,8 +73,9 @@ step s2_gone	{ SELECT count(*) AS in_flight FROM vrk.t WHERE id = 100; }
 # nobody else on the branch: the pages given back, no row written
 permutation s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how
 
-# a reader holding the table: the reset waits for it, the reader's view as
-# it was, and then gives the pages back
+# a reader holding the table: the reset gives up on its lock and writes
+# the rows, never waiting for the reader to end, the reader's view as it
+# was
 permutation s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s2_read s2_end s1_flush s1_how
 
 # a reader that didn't hold the table, its snapshot older than the reset,

@@ -197,6 +197,14 @@ typedef struct ProllyRebaseState
 	ProllyRebaseStep *steps;	/* (palloc'd) */
 } ProllyRebaseState;
 
+/*
+ * Visits a commit a branch's merge or rebase in progress names: the
+ * branch, and the commit (theirs or the base of a merge; the head as it
+ * began or onto of a rebase).
+ */
+typedef void (*ProllyInProgressVisit) (const char *branch,
+									   const ProllyHash *commit, void *arg);
+
 /* Visits a pin: its name, its commit and the record kept beside it. */
 typedef void (*ProllyPinVisit) (const char *name, const ProllyHash *commit,
 								const ProllyValue *info, void *arg);
@@ -1005,6 +1013,14 @@ typedef struct ProllyRefsRoutine
 	void		(*forget_kept) (const ProllyHash *commit);
 
 	/*
+	 * Optional: visit the commits every branch's merge or rebase in
+	 * progress names, whichever session began it (merge_state() and
+	 * rebase_state() give only the session's branch's): for the history
+	 * window, which keeps their data.
+	 */
+	void		(*in_progress) (ProllyInProgressVisit visit, void *arg);
+
+	/*
 	 * Optional: the commits commit reaches, itself included
 	 * (prolly_history_commits()), as a branch's kept commit of it records
 	 * them (a seek); false if no branch keeps it, or its entry records
@@ -1028,16 +1044,17 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  * all (off, for testing the moves that write rows, none are kept).
  */
 extern PGDLLIMPORT bool debug_prolly_page_roots;
+
+/*
+ * debug_prolly_restore_roots: whether a move gives tables the pages of
+ * the roots kept (off, for testing the moves that write rows while
+ * commits still keep their pages, a move writes its rows).
+ */
+extern PGDLLIMPORT bool debug_prolly_restore_roots;
 extern PGDLLIMPORT int prolly_root_interval;
 extern PGDLLIMPORT int prolly_root_interval_commits;
 extern PGDLLIMPORT bool prolly_freeze_roots;
 
-/*
- * prolly.restore_min_changes: how many of a table's rows must differ from
- * a kept commit's, since a baseline holding them, before a move back to it
- * gives the table its pages back rather than write those rows (0: always).
- */
-extern PGDLLIMPORT int prolly_restore_min_changes;
 
 /*
  * While set, the tables (qualified names) a commit being made changed in the
@@ -1078,7 +1095,7 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
 	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept", \
-	"commit_count"
+	"in_progress", "commit_count"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK commit_count
 

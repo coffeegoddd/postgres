@@ -310,11 +310,17 @@ jobs:
 
       # (pgvector's HNSW and IVFFlat under roots: the pinned pgvector built
       # against the temporary installation the step above made, and its
-      # test run again there, which skips without it)
+      # test run again there, which skips without it; pinned by commit,
+      # v0.8.7's, as a tag can be moved)
       - name: pgvector indexes under roots (test_prolly, pinned pgvector)
+        env:
+          PGVECTOR_COMMIT: f37c13f68b57d2c3472b2214fbcff699d6d34876
         run: |
-          git clone --quiet --depth 1 --branch v0.8.7 \
-            https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
+          git init --quiet "$RUNNER_TEMP/pgvector"
+          git -C "$RUNNER_TEMP/pgvector" fetch --quiet --depth 1 \
+            https://github.com/pgvector/pgvector.git "$PGVECTOR_COMMIT"
+          git -C "$RUNNER_TEMP/pgvector" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/pgvector" rev-parse HEAD)" = "$PGVECTOR_COMMIT"
           PG_CONFIG="$(find "$PWD/tmp_install" -path '*/bin/pg_config' | head -1)"
           make -s -j4 -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PG_CONFIG" OPTFLAGS=
           make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PG_CONFIG" install

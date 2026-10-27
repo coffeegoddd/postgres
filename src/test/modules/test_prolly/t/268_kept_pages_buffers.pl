@@ -21,7 +21,6 @@ $node->append_conf('postgresql.conf', qq{
 shared_buffers = 1MB
 autovacuum = off
 prolly_fold_worker = off
-prolly.restore_min_changes = 0
 });
 $node->start;
 

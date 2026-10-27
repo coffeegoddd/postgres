@@ -10,7 +10,6 @@ CREATE DATABASE kept_carried;
 -- (history older than the window keeps no roots: a window long enough
 -- for all of this one's)
 ALTER DATABASE kept_carried SET prolly.history_window = '1000 years';
-ALTER DATABASE kept_carried SET prolly.restore_min_changes = 0;
 \c kept_carried
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;

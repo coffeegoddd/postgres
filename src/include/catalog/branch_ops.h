@@ -122,9 +122,9 @@ typedef struct BranchKeptTable
 #define BRANCH_LOCK_WAIT_MAX_ASKED	16
 
 /*
- * One operation's waits for the locks its share(), share_kept() and
- * restore() calls try, so that one bound covers them all: zeroed when
- * the operation begins.
+ * One operation's waits for the locks its share(), share_kept(),
+ * restore() and try_lock() calls try, so that one bound covers them all:
+ * zeroed when the operation begins.
  */
 typedef struct BranchLockWait
 {
@@ -137,7 +137,8 @@ typedef struct BranchLockWait
 
 /*
  * prolly.restore_lock_wait: how long, in milliseconds, share(),
- * share_kept() and restore() (for a lock it doesn't hold already) wait for a holder of a lock they need that isn't a page
+ * share_kept(), restore() (for a lock it doesn't hold already) and
+ * try_lock() wait for a holder of a lock they need that isn't a page
  * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
  * caps it).
  */
@@ -333,11 +334,10 @@ typedef struct BranchOpsRoutine
 	 * or an AFTER trigger's event queued on it), or one's lock isn't had.
 	 * Each that changed is locked as TRUNCATE locks it: as it is if the
 	 * session holds that lock already (a hard reset takes its restores'
-	 * locks before it holds the refs, waiting for a busy one with nothing
+	 * locks before it holds the refs, trying for a busy one with nothing
 	 * else held, then the refs only if they are free: see refs_copies.c's
 	 * lock_for_restore() for the order), else tried, within *wait's
-	 * bounds, as share() tries, never queued for while the caller holds
-	 * the refs; the locks are kept.
+	 * bounds, as share() tries, never queued for; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
 	 * pages; the roots stay in the page store, so each of carry[] (ncarry
 	 * of them, other commits' kept pages of the same relations) kept of a
@@ -381,6 +381,15 @@ typedef struct BranchOpsRoutine
 	 * holds the refs, of the tables it locks for its restores first.
 	 */
 	bool		(*changed_since_kept) (const BranchKeptRelation *kept, int nkept);
+
+	/*
+	 * Optional: take mode on the session branch's relation relid, tried as
+	 * share() tries its locks, never queued for, within the bounds of
+	 * *wait.  False, nothing held, if it is still held after them.  A hard
+	 * reset tries the locks of the tables it restores so before it holds
+	 * the refs.
+	 */
+	bool		(*try_lock) (Oid relid, LOCKMODE mode, BranchLockWait *wait);
 
 	/*
 	 * Optional: make a branch called name as make() does, a copy of branch

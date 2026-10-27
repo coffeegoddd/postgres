@@ -481,17 +481,15 @@ SELECT count(*) > 0 AS severed FROM dolt_history_drop('2020-01-04 00:00+00');
 (1 row)
 
 SELECT count(*) AS counted FROM dolt_log;
-NOTICE:  history stops at the history horizon
  counted 
 ---------
-       4
+       6
 (1 row)
 
 SELECT count(*) AS rows FROM (SELECT * FROM dolt_log OFFSET 0) l;
-NOTICE:  history stops at the history horizon
  rows 
 ------
-    4
+    6
 (1 row)
 
 -- repaired, the whole history counted again

@@ -65,8 +65,6 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 	{
 		bool		known;
 
-		if (prolly_window_archived(&starts[i]))
-			continue;
 		queue[tail] = prolly_hash_key(&starts[i]);
 		(void) hash_search(seen, &queue[tail], HASH_ENTER, &known);
 		if (!known)
@@ -93,9 +91,6 @@ walk_from(const ProllyHash *starts, int nstarts, ProllyCommitLookup lookup,
 			ProllyHash	key;
 			bool		known;
 
-			/* (what is past the history horizon is no part of the walk) */
-			if (prolly_window_archived(&info.parents[i]))
-				continue;
 			key = prolly_hash_key(&info.parents[i]);
 			(void) hash_search(seen, &key, HASH_ENTER, &known);
 			if (known)
@@ -480,12 +475,6 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 			PaintFlags *pf = paint_flags(flags, &e.parents[p]);
 
 			if ((pf->flags | down) == pf->flags)
-				continue;
-			/*
-			 * (beneath a merge base found, the walk only marks what is
-			 * beneath it: past the history horizon there is nothing to)
-			 */
-			if ((down & PAINT_BENEATH) && prolly_window_archived(&e.parents[p]))
 				continue;
 			paint_mark(&q, pf, down);
 			if (!lookup(&e.parents[p], &pinfo, lookup_arg) || !pinfo.has_height ||

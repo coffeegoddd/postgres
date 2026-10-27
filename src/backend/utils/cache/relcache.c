@@ -297,6 +297,7 @@ static void relation_cache_invalidate(bool debug_discard, bool branch_switch);
 #ifdef USE_ASSERT_CHECKING
 static void AssertPendingSyncConsistency(Relation relation);
 #endif
+static void RelationRecheckSkippingWAL(Relation relation);
 static void AtEOXact_cleanup(Relation relation, bool isCommit);
 static void AtEOSubXact_cleanup(Relation relation, bool isCommit,
 								SubTransactionId mySubid, SubTransactionId parentSubid);
@@ -1500,6 +1501,37 @@ RelationInitPhysicalAddr(Relation relation)
 			relation->rd_firstRelfilelocatorSubid = TopSubTransactionId;
 		else
 			relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
+	}
+	else if (RelFileNumberIsValid(oldnumber) &&
+			 oldnumber != relation->rd_locator.relNumber)
+		RelationRecheckSkippingWAL(relation);
+}
+
+/*
+ * Storage a relation was given by a catalog update rather than by
+ * RelationSetNewRelfilenumber() (a branch's relation given storage that
+ * shares another's pages, or a captured root's, by branch operations):
+ * whether it skips WAL is the pending syncs' to say (wal_level minimal),
+ * not whether the relation had new storage earlier in the transaction.
+ * Storage made of shared pages is logged as it is made and has no pending
+ * sync, so writes to it must be logged too, and RelationNeedsWAL() reads
+ * rd_firstRelfilelocatorSubid; a relation whose storage has one skips WAL.
+ * A relation made in this transaction keeps rd_createSubid's verdict.
+ */
+static void
+RelationRecheckSkippingWAL(Relation relation)
+{
+	if (XLogIsNeeded() || !RELKIND_HAS_STORAGE(relation->rd_rel->relkind) ||
+		!RelationIsPermanent(relation) ||
+		relation->rd_createSubid != InvalidSubTransactionId ||
+		IsParallelWorker())
+		return;
+	if (!RelFileLocatorSkippingWAL(relation->rd_locator))
+		relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
+	else if (relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+	{
+		relation->rd_firstRelfilelocatorSubid = GetCurrentSubTransactionId();
+		EOXactListAdd(relation);
 	}
 }
 
@@ -3025,6 +3057,9 @@ RelationRebuildRelation(Relation relation)
 		SWAPFIELD(SubTransactionId, rd_newRelfilelocatorSubid);
 		SWAPFIELD(SubTransactionId, rd_firstRelfilelocatorSubid);
 		SWAPFIELD(SubTransactionId, rd_droppedSubid);
+		/* (storage a catalog update gave it: see RelationRecheckSkippingWAL) */
+		if (!RelFileLocatorEquals(relation->rd_locator, newrel->rd_locator))
+			RelationRecheckSkippingWAL(relation);
 		/* un-swap rd_rel pointers, swap contents instead */
 		SWAPFIELD(Form_pg_class, rd_rel);
 		/* ... but actually, we don't have to update newrel->rd_rel */
@@ -3374,6 +3409,7 @@ restore_branch_new_state(Relation relation)
 	relation->rd_firstRelfilelocatorSubid =
 		st ? st->firstRelfilelocatorSubid : InvalidSubTransactionId;
 	relation->rd_droppedSubid = st ? st->droppedSubid : InvalidSubTransactionId;
+	RelationRecheckSkippingWAL(relation);
 	if (st)
 		EOXactListAdd(relation);
 }
