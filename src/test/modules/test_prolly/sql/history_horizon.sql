@@ -142,6 +142,11 @@ SELECT fragment, commits,
 FROM prolly_history_horizon();
 SELECT hh_name(commit_hash) AS commit FROM dolt_log('main') ORDER BY commit_order DESC;
 
+-- Nulls: no date severs nothing; a null date plans by the database's
+-- window, which keeps everything.
+SELECT * FROM dolt_history_drop(NULL);
+SELECT count(*) AS planned FROM prolly_history_plan(NULL);
+
 \c :home
 DROP DATABASE regress_history_horizon;
 DROP ROLE regress_hh_other;
