@@ -26,6 +26,7 @@
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
+#include "access/prolly_function_scan.h"
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "nodes/extensible.h"
@@ -213,20 +214,6 @@ typedef struct LogScanState
 	bool		begun;
 } LogScanState;
 
-/*
- * The function's own check, which a function scan makes as it begins: the
- * scan reads what the function would, so one who can't execute it can't.
- */
-static void
-check_execute(Oid funcid)
-{
-	AclResult	aclresult = object_aclcheck(ProcedureRelationId, funcid,
-											GetUserId(), ACL_EXECUTE);
-
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
-	InvokeFunctionExecuteHook(funcid);
-}
 
 static void
 log_begin(CustomScanState *node, EState *estate, int eflags)
@@ -237,7 +224,7 @@ log_begin(CustomScanState *node, EState *estate, int eflags)
 	TupleDesc	scan = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	TupleDesc	row = CreateTemplateTupleDesc(LOG_COLUMNS);
 
-	check_execute(F_DOLT_LOG);
+	prolly_function_scan_check(F_DOLT_LOG);
 	/* (the scan's tuple: the function's columns, then the row whole) */
 	for (int i = 0; i < LOG_COLUMNS; i++)
 		TupleDescCopyEntry(row, i + 1, scan, i + 1);

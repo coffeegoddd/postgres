@@ -65,6 +65,7 @@ OBJS = \
 	prolly_shmem.o \
 	prolly_table.o \
 	prolly_dolt.o \
+	prolly_log_count.o \
 	prolly_snapshot.o \
 	prolly_history_scan.o \
 	prolly_log_scan.o \
