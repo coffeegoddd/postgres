@@ -100,6 +100,7 @@
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
+#include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
@@ -592,6 +593,13 @@ AutoVacLauncherMain(const void *startup_data, size_t startup_data_len)
 	 */
 	SetConfigOption("default_transaction_isolation", "read committed",
 					PGC_SUSET, PGC_S_OVERRIDE);
+
+	/*
+	 * Nor do its transactions count as running for serializable ones: a
+	 * long one (an automatic fold of a versioned table writes for as long as
+	 * it reads) would otherwise hold back their cleanup.
+	 */
+	PredicateLockingPassOverBackend();
 
 	/*
 	 * Even when system is configured to use a different fetch consistency,
@@ -1544,6 +1552,13 @@ AutoVacWorkerMain(const void *startup_data, size_t startup_data_len)
 	 */
 	SetConfigOption("default_transaction_isolation", "read committed",
 					PGC_SUSET, PGC_S_OVERRIDE);
+
+	/*
+	 * Nor do its transactions count as running for serializable ones: a
+	 * long one (an automatic fold of a versioned table writes for as long as
+	 * it reads) would otherwise hold back their cleanup.
+	 */
+	PredicateLockingPassOverBackend();
 
 	/*
 	 * Force synchronous replication off to allow regular maintenance even if

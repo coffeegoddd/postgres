@@ -445,12 +445,21 @@ static bool MyXactDidWrite = false;
 static SERIALIZABLEXACT *SavedSerializableXact = InvalidSerializableXact;
 
 /*
- * Whether this backend's transactions are passed over by predicate locking
- * (see PredicateLockingPassOverBackend()), and the slot of passedOverXids
- * holding the running one's xid, or -1.
+ * The xids of transactions running in backends that never run serializable
+ * ones (see PredicateLockingPassOverBackend()), left out of the xmin a
+ * serializable transaction is registered with: the first
+ * PredXact->passedOverXidCount entries, in no order.  A backend has one top
+ * transaction running at most, so MaxBackends entries always suffice.
+ * Protected by SerializableXactHashLock.
+ */
+static TransactionId *PassedOverXids;
+
+/*
+ * Whether this backend's transactions are passed over by predicate locking,
+ * and the running one's xid, if noted in PassedOverXids.
  */
 static bool PassedOverBackend = false;
-static int	MyPassedOverSlot = -1;
+static TransactionId MyPassedOverXid = InvalidTransactionId;
 
 static int64 max_serializable_xacts;
 
@@ -1198,6 +1207,11 @@ PredicateLockShmemRequest(void *arg)
 					   .ptr = (void **) &PredXact,
 		);
 
+	ShmemRequestStruct(.name = "PredicateLockPassedOverXids",
+					   .size = mul_size((Size) MaxBackends, sizeof(TransactionId)),
+					   .ptr = (void **) &PassedOverXids,
+		);
+
 	/*
 	 * Register hash table for SERIALIZABLEXID structs.  This stores per-xid
 	 * information for serializable transactions which have accessed data.
@@ -1287,8 +1301,6 @@ PredicateLockShmemInit(void *arg)
 	PredXact->CanPartialClearThrough = 0;
 	PredXact->HavePartialClearedThrough = 0;
 	PredXact->passedOverXidCount = 0;
-	for (int i = 0; i < MAX_PASSED_OVER_XIDS; i++)
-		PredXact->passedOverXids[i] = InvalidTransactionId;
 	PredXact->element
 		= (SERIALIZABLEXACT *) ((char *) PredXact + PredXactListDataSize);
 	/* Add all elements to available list, clean. */
@@ -1937,21 +1949,14 @@ RegisterPredicateLockingXid(TransactionId xid)
 	{
 		if (PassedOverBackend && !IsolationIsSerializable())
 		{
-			/* (a slot not forgotten is of a transaction that ended) */
-			if (MyPassedOverSlot >= 0)
+			/* (one not forgotten is of a transaction that ended) */
+			if (TransactionIdIsValid(MyPassedOverXid))
 				ForgetPassedOverXid();
 			LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
-			for (int i = 0; i < MAX_PASSED_OVER_XIDS; i++)
-			{
-				if (!TransactionIdIsValid(PredXact->passedOverXids[i]))
-				{
-					PredXact->passedOverXids[i] = xid;
-					PredXact->passedOverXidCount++;
-					MyPassedOverSlot = i;
-					break;
-				}
-			}
+			Assert(PredXact->passedOverXidCount < MaxBackends);
+			PassedOverXids[PredXact->passedOverXidCount++] = xid;
 			LWLockRelease(SerializableXactHashLock);
+			MyPassedOverXid = xid;
 		}
 		return;
 	}
@@ -2009,12 +2014,22 @@ PredicateLockingPassOverBackend(void)
 static void
 ForgetPassedOverXid(void)
 {
+	int			n;
+	int			i;
+
 	LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
-	Assert(TransactionIdIsValid(PredXact->passedOverXids[MyPassedOverSlot]));
-	PredXact->passedOverXids[MyPassedOverSlot] = InvalidTransactionId;
-	PredXact->passedOverXidCount--;
+	n = PredXact->passedOverXidCount;
+	for (i = 0; i < n; i++)
+		if (TransactionIdEquals(PassedOverXids[i], MyPassedOverXid))
+			break;
+	Assert(i < n);
+	if (i < n)
+	{
+		PassedOverXids[i] = PassedOverXids[n - 1];
+		PredXact->passedOverXidCount--;
+	}
 	LWLockRelease(SerializableXactHashLock);
-	MyPassedOverSlot = -1;
+	MyPassedOverXid = InvalidTransactionId;
 }
 
 /*
@@ -2047,8 +2062,8 @@ SerializableXmin(Snapshot snapshot)
 
 		if (!TransactionIdPrecedes(xid, xmin))
 			continue;
-		for (int j = 0; j < MAX_PASSED_OVER_XIDS && !passed_over; j++)
-			passed_over = TransactionIdEquals(PredXact->passedOverXids[j], xid);
+		for (int j = 0; j < PredXact->passedOverXidCount && !passed_over; j++)
+			passed_over = TransactionIdEquals(PassedOverXids[j], xid);
 		if (!passed_over)
 			xmin = xid;
 	}
@@ -3400,7 +3415,7 @@ ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
 	 * A transaction passed over has ended (ProcArrayEndTransaction() has
 	 * run): its xid is forgotten.
 	 */
-	if (MyPassedOverSlot >= 0 && !isReadOnlySafe)
+	if (TransactionIdIsValid(MyPassedOverXid) && !isReadOnlySafe)
 		ForgetPassedOverXid();
 
 	/* Are we at the end of a transaction, that is, a commit or abort? */

@@ -209,6 +209,10 @@ ProllyFolderLauncherMain(Datum main_arg)
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+	/* (its transactions only read the databases' list: see the worker's) */
+	SetConfigOption("default_transaction_isolation", "read committed",
+					PGC_SUSET, PGC_S_OVERRIDE);
+	PredicateLockingPassOverBackend();
 	prolly_database_components(&dc);
 
 	for (;;)

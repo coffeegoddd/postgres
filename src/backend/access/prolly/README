@@ -1493,6 +1493,9 @@ reads, and its xid, running all the while, would otherwise hold down the
 xmin of every serializable transaction begun meanwhile, keeping each one
 that commits, its predicate locks and rw-conflicts with it, until the fold
 ends; under a busy serializable workload the rw-conflict pool runs out.
+The launcher, and autovacuum's launcher and workers (whose automatic
+folds, collections and sweeps write in long transactions too), are passed
+over the same way; their transactions are read committed already.
 Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
