@@ -2048,7 +2048,7 @@ static bool
 freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 			   BranchKeptRelation *k, const BranchKeptRelation *prior,
 			   int nprior, BranchFreezePage freeze,
-			   const ProllyRootSnapshot *as_of)
+			   const ProllyRootSnapshot *as_of, bool *made)
 {
 	RelFileLocator live = class_locator(c, c->relfilenode);
 	SMgrRelation lsrel = smgropen(live, INVALID_PROC_NUMBER);
@@ -2101,8 +2101,11 @@ freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 		k->undecided = NULL;
 	}
 	else
+	{
 		freeze_into_root(c, sloc, all, n, nblocks,
 						 base ? base->snapshot : 0, freeze, as_of, u_epoch, k);
+		*made = true;
+	}
 	k->flags = BRANCH_KEPT_CONCURRENT;
 	RelationDropStorageByLocator(sloc);
 	pfree(all);
@@ -2303,6 +2306,7 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 	List	   *relids = NIL;
 	Relation	pg_class;
 	bool		ok = true;
+	bool	   *made = palloc0_array(bool, Max(nkept, 1));
 
 	let_go_of_abandoned();
 	for (int i = 0; i < nkept; i++)
@@ -2333,7 +2337,7 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				ok = false;
 			else if (heap_format(c) && (kept[i].flags & BRANCH_KEPT_UNFROZEN))
 				ok = freeze_root_of(c, &kept[i], &frozen[i], prior, nprior,
-									freeze, as_of);
+									freeze, as_of, &made[i]);
 			else
 			{
 				frozen[i] = kept[i];
@@ -2349,6 +2353,12 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 			UnlockRelationOid(relid, ShareUpdateExclusiveLock);
 	}
 	PG_END_TRY();
+
+	/* (none frozen: those made let go of again as the transaction commits) */
+	for (int i = 0; !ok && i < nkept; i++)
+		if (made[i])
+			let_go_of(kept_locator(&frozen[i]), frozen[i].snapshot);
+	pfree(made);
 	list_free(relids);
 	return ok;
 }

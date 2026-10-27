@@ -3667,7 +3667,11 @@ move_settled_checked(void *arg)
  * branch that ended (branch_writers_settled()).  So the pages hold exactly
  * the commit's rows, and the keeping transaction's own, which commit with
  * it.  At a transaction's own commit (dolt.transaction_commit), whose head
- * moves at every transaction, only once a root is due (root_due()).
+ * moves at every transaction, only once a root is due (root_due()); and
+ * there, with the lazy root freezer, among the writers: the roots captured
+ * as they are, kept unfrozen with the commit's snapshot (which must have
+ * seen every writer that ended, branch_writers_seen()), frozen as of it
+ * later by the fold worker, or by a move to the commit (kept_freeze()).
  *
  * A branch's first use at a commit another branch keeps the pages of is
  * made of them (make_of_kept(), branch operations' make_kept(), #489):
@@ -4722,6 +4726,32 @@ kept_same_roots(const KeptCommit *kc, const KeptCommit *o)
 }
 
 /*
+ * Let go of the roots fc's first ntables tables were frozen into, as the
+ * transaction commits: those not kc's own (unfrozen) nor shared with
+ * another frozen root (a base reused as it was).
+ */
+static void
+kept_let_go_frozen(const KeptCommit *fc, const KeptCommit *kc, int ntables,
+				   const BranchKeptRelation *prior, int nprior)
+{
+	if (branch_ops()->let_go == NULL)
+		return;
+	for (int t = 0; t < ntables; t++)
+		for (int r = 0; r < fc->tables[t].nrels; r++)
+		{
+			const BranchKeptRelation *f = &fc->tables[t].rels[r];
+			bool		reused = f->snapshot == kc->tables[t].rels[r].snapshot;
+
+			for (int p = 0; p < nprior && !reused; p++)
+				reused = prior[p].snapshot == f->snapshot &&
+					prior[p].relfilenumber == f->relfilenumber &&
+					prior[p].tablespace == f->tablespace;
+			if (!reused)
+				branch_ops()->let_go(f);
+		}
+}
+
+/*
  * Freeze the roots of branch name's kept commit kc (of *kept, the branch's
  * list), captured among writers (unfrozen), as of its snapshot: each of
  * its tables still restorable made frozen roots (branch operations'
@@ -4796,7 +4826,10 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 			!branch_ops()->freeze_kept(kt->rels, kt->nrels, fc->tables[t].rels,
 									   prior, nprior,
 									   dc.root_freezer->freeze_page, &as_of))
+		{
+			kept_let_go_frozen(fc, kc, t, prior, nprior);
 			return NULL;
+		}
 	}
 	if (!locked)
 	{
@@ -4808,7 +4841,10 @@ kept_freeze(const char *name, List **kept, KeptCommit *kc, bool locked)
 				o->unfrozen && kept_same_roots(o, kc))
 				at = o;
 		if (at == NULL)
+		{
+			kept_let_go_frozen(fc, kc, kc->ntables, prior, nprior);
 			return NULL;
+		}
 	}
 	at->retired = GetTopFullTransactionId();
 	foreach_ptr(KeptCommit, o, *kept)

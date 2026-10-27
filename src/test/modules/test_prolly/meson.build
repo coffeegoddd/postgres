@@ -471,6 +471,7 @@ tests += {
       't/763_root_share_released.pl',
       't/764_root_holds.pl',
       't/762_root_freezing_redo.pl',
+      't/765_lazy_root_freezing.pl',
       't/520_revision_reads.pl',
       't/556_rebase_continue_errors.pl',
       't/468_bmap_shared_redo_changes.pl',
