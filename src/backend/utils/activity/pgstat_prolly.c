@@ -181,6 +181,10 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_BUFFER_REL_GENERATIONS] = "buffer_rel_generations",
 	[PGSTAT_PROLLY_BMAP_ROOTS_PAGES_READ] = "bmap_roots_pages_read",
 	[PGSTAT_PROLLY_HORIZON_ENTRIES_READ] = "horizon_entries_read",
+	[PGSTAT_PROLLY_MOVES_ROOT_KEPT] = "moves_root_kept",
+	[PGSTAT_PROLLY_MOVES_ROOT_NEAREST] = "moves_root_nearest",
+	[PGSTAT_PROLLY_MOVES_ROOT_MISSING] = "moves_root_missing",
+	[PGSTAT_PROLLY_SEVERED_REFUSALS] = "severed_refusals",
 };
 
 /*

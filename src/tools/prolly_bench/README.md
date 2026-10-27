@@ -1352,6 +1352,22 @@ probe. Missing tables fail target checks. Prolly's table/index/TOAST canaries
 must have block-map forks. V3 verifies exact change-set and overlap cardinalities;
 impossible change sets and oversized V2 changes fail rather than being clamped.
 
+V1 to V4 and V6 measure inside the history window, where every commit keeps
+a root of its pages. Each sets the window on its database before it builds
+any history (`prolly.history_window`, 100 years unless the workload's
+`history_window` says otherwise, and a root at every commit:
+`prolly.root_interval` 0, `prolly.root_interval_commits` 1). After the
+measured window, pg_stat_prolly's path counters must show the root path:
+no `moves_root_missing` (a move to a commit without a root), no
+`move_tables_written` but for V3's merges, no `restores_lock_busy` and no
+`severed_refusals`. The counters are read once every other session of the
+database has exited (a session's counts are flushed as its backend exits),
+so none of the operations' work is missed. A failed check fails the run
+rather than reporting a slow number. The counters' growth is reported beside the latencies
+(`path_*` metrics), and the window's settings and roots kept in the
+outcome's notes. V7 to V10 are counter, storage and cleanup gates: they set
+no window, the default month holding every commit they make.
+
 The gate below reads per-operation node work from `*-counters.json`, which
 only the tree engine D1 recorded (from its node counters); no engine records
 it since D1's removal, so until prolly's folds report theirs the gate

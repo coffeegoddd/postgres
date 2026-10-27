@@ -168,6 +168,7 @@ tests += {
       'statistics_casts',
       'stat_prolly',
       'stat_prolly_moves',
+      'move_root_path',
       'node_cache',
       'commit_cache',
       'head_log',

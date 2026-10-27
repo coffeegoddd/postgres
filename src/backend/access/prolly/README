@@ -1564,6 +1564,15 @@ has a root is always restored, however few of its rows changed: a move
 to a commit kept writes no rows (but where a lock, a privilege or the
 session's own use of the table stands in the way); only a commit with no
 root writes the rows between it and the nearest root before.
+pg_stat_prolly counts each move by the root it found: moves_root_kept
+(the pages kept as of its commit, usable, given back to each table that
+needs them; another branch's root of a schema the session's branch no
+longer has isn't), moves_root_nearest (those of the nearest kept commit before it,
+and the rows between written) and moves_root_missing (neither: the rows
+written, from the head's pages if those are kept).  A table a move can't
+give a root's pages is written, as move_tables_written counts.  prolly_history_roots(branch, commit_hash) lists the
+commits whose pages are kept, by the branches keeping them, so a caller
+can tell before a move which path it will take.
 
 A restore is MVCC-safe where TRUNCATE isn't: the storage it replaces
 isn't dropped at commit but kept, a retired entry of the branch's kept
@@ -2079,7 +2088,9 @@ a merge base go across the horizon as before, and a merge across it never
 takes the histories as unrelated.  Reading a severed commit's data once
 it is freed (dolt_at, a diff, a merge whose base's rows are past it, a
 history table's rows) is an error saying the commit is past the horizon
-and how to repair it.  A repair receives the trees of its commits (the
+and how to repair it.  pg_stat_prolly's severed_refusals counts those
+refusals, and each read that leaves a severed commit's rows out (a
+history table's, with a notice) rather than refusing.  A repair receives the trees of its commits (the
 transfer's receive_trees()), their commit objects being here.
 
 dolt_log(ref) gives the commits as it finds them: a heap of those found,

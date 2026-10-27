@@ -185,8 +185,12 @@ def report(path):
         was_dirty = row['operation'] in ('diff_working', 'diff_working_history')
         row.setdefault('working_set', 'diff' if was_dirty else 'clean')
         row.setdefault('dirty_rows', row['changed_rows'] if was_dirty else 0)
+        # (results from before the history window was checked: all local)
+        row.setdefault('window', 'in')
+    # (window: a target past the history window is a group of its own,
+    # never in the window's medians)
     fields = ["engine", "operation", "rows", "changed_rows", "history_commits",
-              "working_set", "dirty_rows", "distance", "pass"]
+              "working_set", "dirty_rows", "distance", "window", "pass"]
     groups = collections.defaultdict(list)
     for row in good:
         groups[tuple(row[k] for k in fields)].append(row)
@@ -196,6 +200,15 @@ def report(path):
         times = [r["elapsed_ns"]/1e6 for r in records]
         summary.update(repetitions=len(records), median_ms=statistics.median(times),
                        min_ms=min(times), max_ms=max(times))
+        # The path each repetition took, beside its latency: the root it
+        # was checked to have, and the path counters' growth.
+        roots = sorted({str(r.get("target_root")) for r in records if r.get("target_root")})
+        if roots:
+            summary["target_root"] = "/".join(roots)
+            summary["root_distance"] = max(r.get("root_distance") or 0 for r in records)
+        if all("path" in r for r in records):
+            for name in sorted({n for r in records for n in r["path"]}):
+                summary["median_path_" + name] = statistics.median(r["path"].get(name, 0) for r in records)
         if key[-1] in PASS_FIELDS:
             measured = (LEGACY_MEMORY_FIELDS if key[-1] == "memory" and legacy else PASS_FIELDS[key[-1]])
             for k in measured:
