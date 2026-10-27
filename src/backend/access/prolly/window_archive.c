@@ -1019,7 +1019,8 @@ entry_cmp(const ListCell *a, const ListCell *b)
 
 /*
  * A fragment's identity: the root of a tree of its commits' index entries
- * (keyed by date, then id; each its height and parents), as any tree of
+ * (keyed by date, then id; each its parents: not its height, which a commit
+ * may not record), as any tree of
  * those entries is built.
  */
 static void
@@ -1046,7 +1047,6 @@ fragment_root(List *severed, ProllyHash *root)
 		resetStringInfo(&v);
 		put_be64(&k, ((uint64) pc->e.committed_at) ^ ((uint64) 1 << 63));
 		put_id(&k, &pc->id);
-		put_be64(&v, (uint64) pc->e.height);
 		appendStringInfoChar(&v, (char) pc->e.nparents);
 		for (int i = 0; i < pc->e.nparents; i++)
 			put_id(&v, &pc->e.parents[i]);
@@ -1419,29 +1419,27 @@ archive_repair(const char *source, int nfragments)
 	List	   *records;
 	int			repaired = 0;
 
+	List	   *chosen = NIL;
+	List	   *urls = NIL;
+
 	window_init();
 	check_may_sever("repair");
 	PreventCommandIfReadOnly("repairing history");
-	horizon_lock(ExclusiveLock);
-	PROLLY_CALL(dc.refs, lock);
+
+	/*
+	 * Received first, holding nothing (a transfer may take long), each
+	 * fragment down to its stops: an older fragment's tops are not
+	 * received, so a source that has only this one serves it, and the
+	 * horizon goes on cutting there.
+	 */
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, r, records)
 	{
 		char	   *url;
 		const ProllyRemoteRoutine *rr;
 		ProllyRemote *remote;
-		List	   *commits;
-		List	   *ids = NIL;
-		ProllyHash	root;
-		ProllyHash	digest;
-		int64		chunks;
-		int64		bytes;
-		EdgesOf		eo = {r->f.number, NIL};
-		char		e = KEY_EDGE;
-		ProllyKey	from = {(const uint8 *) &e, 1};
-		StringInfoData k;
 
-		if (nfragments >= 0 && repaired >= nfragments)
+		if (nfragments >= 0 && list_length(chosen) >= nfragments)
 			break;
 		if (source == NULL && r->f.location == NULL)
 			ereport(ERROR,
@@ -1454,14 +1452,47 @@ archive_repair(const char *source, int nfragments)
 		remote = PROLLY_CALL(rr, open, url, false);
 		PG_TRY();
 		{
-			(void) PROLLY_CALL(dc.transfer, receive, rr, remote, r->f.tops,
-							   r->f.ntops);
+			if (PROLLY_HAS(dc.transfer, receive_until))
+				(void) PROLLY_CALL(dc.transfer, receive_until, rr, remote,
+								   r->f.tops, r->f.ntops, r->stops, r->nstops);
+			else
+				(void) PROLLY_CALL(dc.transfer, receive, rr, remote,
+								   r->f.tops, r->f.ntops);
 		}
 		PG_FINALLY();
 		{
 			PROLLY_CALL(rr, close, remote);
 		}
 		PG_END_TRY();
+		chosen = lappend(chosen, r);
+		urls = lappend(urls, url);
+	}
+
+	/* then verified, and let go of, holding the horizon and the refs */
+	horizon_lock(ExclusiveLock);
+	PROLLY_CALL(dc.refs, lock);
+	records = fragment_records();
+	foreach_ptr(FragmentRecord, c, chosen)
+	{
+		FragmentRecord *r = NULL;
+		char	   *url = list_nth(urls, foreach_current_index(c));
+		List	   *commits;
+		List	   *ids = NIL;
+		ProllyHash	root;
+		ProllyHash	digest;
+		int64		chunks;
+		int64		bytes;
+		EdgesOf		eo = {c->f.number, NIL};
+		char		e = KEY_EDGE;
+		ProllyKey	from = {(const uint8 *) &e, 1};
+		StringInfoData k;
+
+		foreach_ptr(FragmentRecord, now, records)
+			if (now->f.number == c->f.number)
+				r = now;
+		/* (one a repair let go of meanwhile is done) */
+		if (r == NULL)
+			continue;
 
 		/* (whole again, and the same history: its identity and digest) */
 		commits = fragment_commits(r);

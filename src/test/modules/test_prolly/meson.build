@@ -457,6 +457,7 @@ tests += {
       't/595_move_carries_statistics.pl',
       't/610_ssi_fold_worker_xid.pl',
       't/626_history_horizon_standby.pl',
+      't/627_history_repair_collect.pl',
       't/520_revision_reads.pl',
       't/556_rebase_continue_errors.pl',
       't/468_bmap_shared_redo_changes.pl',
