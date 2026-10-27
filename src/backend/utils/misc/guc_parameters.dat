@@ -762,6 +762,13 @@
   boot_val => 'false',
 },
 
+{ name => 'debug_prolly_verify_generations', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Checks after each prolly chunk store collection that what each settled table file\'s chunks name is in the same generation or an older one, listed in its section, and reports an error if not, for testing.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_verify_generations',
+  boot_val => 'DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS',
+},
+
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',

@@ -483,6 +483,15 @@ typedef struct ProllyChunkStoreRoutine
 	 */
 	void		(*settle) (ProllyChunkStore *store, const ProllyHash *roots,
 						   int nroots);
+
+	/*
+	 * Optional: check the settled files' generations, an error if one is
+	 * wrong: whatever a settled file's chunks name, if here, is in a
+	 * settled file of the same generations or of older ones, and then
+	 * listed in its section.  Returns the chunks checked.  Reads every
+	 * settled chunk: for tests.
+	 */
+	int64		(*verify_generations) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -498,9 +507,9 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle"
+	"settle", "verify_generations"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK settle
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK verify_generations
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -514,6 +523,17 @@ prolly_chunkstore_lookup(const char *name)
  * checkpoints and redo call (prolly_chunkstore.c).
  */
 extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
+
+/*
+ * Whether each collection checks the settled files' generations after
+ * (verify_generations()): on in assert-enabled builds.
+ */
+#ifdef USE_ASSERT_CHECKING
+#define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS true
+#else
+#define DEFAULT_DEBUG_PROLLY_VERIFY_GENERATIONS false
+#endif
+extern PGDLLIMPORT bool debug_prolly_verify_generations;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
@@ -569,6 +589,7 @@ extern void prolly_chunk_add_stored(const ProllyChunkStoreRoutine *cs,
 									ProllyChunkNext next, void *arg);
 
 /* The chunks a chunk names, as the server's trees lay their nodes out. */
+extern bool prolly_chunk_is_leaf(const void *data, Size len);
 extern void prolly_chunk_references(const void *data, Size len,
 									ProllyChunkRefVisit visit, void *arg);
 

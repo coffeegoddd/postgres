@@ -419,6 +419,20 @@ prolly_chunk_references(const void *data, Size len, ProllyChunkRefVisit visit,
 	PROLLY_CALL(tree, references, format, data, len, visit, arg);
 }
 
+/* Is the chunk a leaf (a node of level 0, or not a node at all)? */
+bool
+prolly_chunk_is_leaf(const void *data, Size len)
+{
+	static const ProllyChunkFormatRoutine *format = NULL;
+	ProllyChunkNode node;
+
+	if (format == NULL)
+		format = prolly_chunkformat_lookup(CHUNK_FORMAT_IMPL);
+	if (!PROLLY_CALL(format, open, (const uint8 *) data, len, &node))
+		return true;
+	return node.level == 0;
+}
+
 const ProllyStoreFormat *
 prolly_store_format(void)
 {

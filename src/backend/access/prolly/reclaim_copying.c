@@ -717,6 +717,8 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	/* (a fold's tree no ref names was garbage: the folds made are stale) */
 	prolly_forget_folds();
 	PROLLY_CALL(cs, gc_retire, mk.gc);
+	if (debug_prolly_verify_generations && PROLLY_HAS(cs, verify_generations))
+		(void) PROLLY_CALL(cs, verify_generations, store);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);
 	return true;
