@@ -389,8 +389,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- Check the settled files' generations: whatever their chunks name is in
 -- the same generations or older ones, and then listed in the file's
 -- section (an error if not).  Returns the chunks checked.
-CREATE FUNCTION test_chunk_verify_generations()
+CREATE FUNCTION test_chunk_verify_generations(cut_edges boolean DEFAULT true)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Whether the history horizon cut the reference from source to target:
+-- source a severed commit, target its root's or dependencies' tree.
+CREATE FUNCTION test_window_cut_edge(source text, target text)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The collections that settled chunks the settled files still hold.

@@ -208,6 +208,7 @@ tests += {
       'generations',
       'generations_repair',
       'generations_sever',
+      'generations_cut_edges',
       'generations_retire',
       'generations_retire_guard',
       'generations_retire_sever',

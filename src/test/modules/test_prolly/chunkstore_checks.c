@@ -18,6 +18,7 @@
 #include "access/tableam.h"
 #include "common/int.h"
 #include "access/xact.h"
+#include "access/prolly_window.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_changelog.h"
 #include "access/prolly_config.h"
@@ -601,7 +602,23 @@ PG_FUNCTION_INFO_V1(test_chunk_verify_generations);
 Datum
 test_chunk_verify_generations(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(PROLLY_CALL(cs(), verify_generations, store()));
+	bool		cut = PG_NARGS() < 1 || PG_GETARG_BOOL(0);
+
+	PG_RETURN_INT64(PROLLY_CALL(cs(), verify_generations, store(),
+								cut ? prolly_window_cut_edge : NULL, NULL));
+}
+
+/* Is the reference from source to target one the history horizon cut? */
+PG_FUNCTION_INFO_V1(test_window_cut_edge);
+Datum
+test_window_cut_edge(PG_FUNCTION_ARGS)
+{
+	ProllyHash	source;
+	ProllyHash	target;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &source);
+	text_hash(PG_GETARG_TEXT_PP(1), &target);
+	PG_RETURN_BOOL(prolly_window_cut_edge(NULL, &source, &target));
 }
 
 PG_FUNCTION_INFO_V1(test_chunk_table_files);

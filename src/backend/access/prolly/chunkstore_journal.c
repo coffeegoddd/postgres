@@ -8718,6 +8718,8 @@ typedef struct VerifyRef
 	int			nfiles;
 	int			self;			/* the file of the chunk checked */
 	const ProllyHash *chunk;
+	ProllyChunkCutEdge cut;		/* (NULL: no edge is cut) */
+	void	   *cut_arg;
 } VerifyRef;
 
 static void
@@ -8781,12 +8783,14 @@ verify_ref(const ProllyHash *ref, void *arg)
 						prolly_hash_hex(vr->chunk), self->t->path,
 						prolly_hash_hex(ref))));
 	/*
-	 * Only a newer generation has it, and the file lists it: an edge the
-	 * history horizon cut (a severed commit's data, dropped then, listed
-	 * by the generation it was in), the chunk made again since.  A repair
-	 * puts the commit's data back beside it.
+	 * Only a newer generation has it, the file lists it, and the horizon
+	 * cut the edge: a severed commit's data, dropped then, listed by the
+	 * generation it was in, the chunk made again since.  A repair puts the
+	 * commit's data back beside it.  Any other such target is an error:
+	 * the listed copy is gone, and a retire would free the newer one.
 	 */
-	if (newer && x != NULL)
+	if (newer && x != NULL && vr->cut != NULL &&
+		vr->cut(vr->cut_arg, vr->chunk, ref))
 		return;
 	if (newer)
 		ereport(ERROR,
@@ -8794,7 +8798,9 @@ verify_ref(const ProllyHash *ref, void *arg)
 				 errmsg("chunk %s of table file \"%s\" names chunk %s, which only a newer generation holds",
 						prolly_hash_hex(vr->chunk), self->t->path,
 						prolly_hash_hex(ref))));
-	if (stored_has(vr->s, &key))
+	/* (the same, made again since the last collection: not settled yet) */
+	if (stored_has(vr->s, &key) &&
+		!(vr->cut != NULL && vr->cut(vr->cut_arg, vr->chunk, ref)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk %s of table file \"%s\" names chunk %s, which no settled file holds",
@@ -8804,7 +8810,8 @@ verify_ref(const ProllyHash *ref, void *arg)
 
 /* One pass over the manifest's settled files; false if they changed. */
 static bool
-verify_pass(ProllyChunkStore *s, int64 *checked)
+verify_pass(ProllyChunkStore *s, int64 *checked, ProllyChunkCutEdge cut,
+			void *cut_arg)
 {
 	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
 	uint64		before = manifests_count();
@@ -8851,7 +8858,7 @@ verify_pass(ProllyChunkStore *s, int64 *checked)
 	for (int i = 0; i < n && whole; i++)
 	{
 		const ProllyTableFileRoutine *fmt = table_format();
-		VerifyRef	vr = {s, files, n, i, NULL};
+		VerifyRef	vr = {s, files, n, i, NULL, cut, cut_arg};
 
 		for (int e = 0; e < PROLLY_CALL(fmt, count, files[i].t->tf); e++)
 		{
@@ -8893,14 +8900,15 @@ verify_pass(ProllyChunkStore *s, int64 *checked)
  * pass again if a manifest replaced them meanwhile, a few times.
  */
 static int64
-journal_verify_generations(ProllyChunkStore *s)
+journal_verify_generations(ProllyChunkStore *s, ProllyChunkCutEdge cut,
+						   void *arg)
 {
 	int64		checked = 0;
 
 	for (int attempt = 0; attempt < 5; attempt++)
 	{
 		checked = 0;
-		if (verify_pass(s, &checked))
+		if (verify_pass(s, &checked, cut, arg))
 			break;
 	}
 	return checked;

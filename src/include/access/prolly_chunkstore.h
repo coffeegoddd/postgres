@@ -271,6 +271,14 @@ typedef uint32 (*ProllySettleAbsent) (void *arg, const ProllyHash *hash,
 									  uint32 proposed);
 
 /*
+ * verify_generations()'s question of a reference: is it an edge the
+ * history horizon cut (a severed commit naming its data), which a newer
+ * generation, or none settled, may hold?
+ */
+typedef bool (*ProllyChunkCutEdge) (void *arg, const ProllyHash *source,
+									const ProllyHash *target);
+
+/*
  * settle()'s question of a root: the commits that name it from outside
  * what is settled (a fragment's boundary commits), as many as returned,
  * in *by (palloc'd).
@@ -540,10 +548,14 @@ typedef struct ProllyChunkStoreRoutine
 	 * Optional: check the settled files' generations, an error if one is
 	 * wrong: whatever a settled file's chunks name, if here, is in a
 	 * settled file of the same generations or of older ones, and then
-	 * listed in its section.  Returns the chunks checked.  Reads every
+	 * listed in its section; but where cut() says the horizon cut the
+	 * reference (NULL: none is), the chunk may be in a newer generation
+	 * the section lists it by, or not settled yet: a severed commit's
+	 * data, made again since.  Returns the chunks checked.  Reads every
 	 * settled chunk: for tests.
 	 */
-	int64		(*verify_generations) (ProllyChunkStore *store);
+	int64		(*verify_generations) (ProllyChunkStore *store,
+										   ProllyChunkCutEdge cut, void *arg);
 	uint32		(*epoch_of) (ProllyChunkStore *store, const ProllyHash *hash);
 
 	/*

@@ -69,6 +69,7 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_config.h"
 #include "access/prolly_toast.h"
+#include "access/prolly_window.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
@@ -737,7 +738,8 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 	 */
 	if (retire && debug_prolly_verify_generations &&
 		PROLLY_HAS(cs, verify_generations))
-		(void) PROLLY_CALL(cs, verify_generations, store);
+		(void) PROLLY_CALL(cs, verify_generations, store,
+						   prolly_window_cut_edge, NULL);
 
 	/*
 	 * A fold's tree no ref names may be garbage now: the folds made so far
@@ -862,7 +864,8 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (debug_prolly_verify_generations && PROLLY_HAS(cs, verify_generations))
-		(void) PROLLY_CALL(cs, verify_generations, store);
+		(void) PROLLY_CALL(cs, verify_generations, store,
+						   prolly_window_cut_edge, NULL);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);
 	return true;

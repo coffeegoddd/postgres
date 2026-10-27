@@ -4482,6 +4482,21 @@ prolly_window_archived(const ProllyHash *id)
 	return PROLLY_CALL(c.history_window, archived, id);
 }
 
+bool
+prolly_window_cut_edge(void *arg, const ProllyHash *source,
+					   const ProllyHash *target)
+{
+	ProllyDatabaseComponents c;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&c);
+	if (!prolly_window_archived(source) ||
+		!PROLLY_CALL(c.refs, commit_get, source, &info))
+		return false;
+	return same_hash(&info.root.hash, target) ||
+		(info.has_dependencies && same_hash(&info.dependencies.hash, target));
+}
+
 static void
 note_fragment(const ProllyWindowFragment *f, void *arg)
 {
