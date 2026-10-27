@@ -8603,8 +8603,8 @@ prolly_history_rows(Oid relid, const ProllyKeyBounds *bounds, int nbounds,
 										   "history rows kept",
 										   ALLOCSET_DEFAULT_SIZES);
 			hk.rows = NIL;
-			read = dm->bounded_rows(s.hash, relid, bounds, nbounds, &data,
-									&hk.sink);
+			read = dm->bounded_rows(s.hash, &e->info.root, relid, bounds,
+									nbounds, &data, &hk.sink);
 			if (read == PROLLY_BOUNDED_SAME)
 			{
 				/* (the same tree: the rows kept, given with this commit) */

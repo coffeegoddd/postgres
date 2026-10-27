@@ -15204,15 +15204,14 @@ bounded_now(Oid relid, bool *plain)
  * otherwise); any other is compared as a diff compares it.
  */
 static ProllyBoundedRead
-folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
-					int nbounds, ProllyHash *data, ProllyDiffSink *sink)
+folded_bounded_rows(const char *ref, const ProllyNodeRef *root, Oid relid,
+					const ProllyKeyBounds *bounds, int nbounds,
+					ProllyHash *data, ProllyDiffSink *sink)
 {
 	ProllyDatabaseComponents dc = components();
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
-	ProllyHash	id;
-	ProllyCommitInfo info;
 	Tables		ts = {NIL};
 	Table	   *t;
 	Table	   *now;
@@ -15223,12 +15222,11 @@ folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
 	RowDiff		rd;
 	ProllyBoundedRead result = PROLLY_BOUNDED_READ;
 
-	if (is_working(ref) || !PROLLY_CALL(dc.refs, resolve, ref, &id) ||
-		!PROLLY_CALL(dc.refs, commit_get, &id, &info) ||
+	if (is_working(ref) ||
 		(name = get_rel_name(relid) ? table_name(relid) : NULL) == NULL)
 		return PROLLY_BOUNDED_NO;
 	/* (the table's tree first, its types unread: the same tree reads nothing) */
-	PROLLY_CALL(dc.canonicalizer, tables, &info.root, name, add_table, &ts);
+	PROLLY_CALL(dc.canonicalizer, tables, root, name, add_table, &ts);
 	t = find_table(ts.tables, name);
 	if (t == NULL)
 	{

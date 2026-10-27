@@ -207,7 +207,7 @@ typedef struct ProllyMergeRoutine
 	bool		(*row_count) (const char *ref, Oid relid, double *rows);
 
 	/*
-	 * Optional: relid's table's rows at ref (a commit) whose keys are within
+	 * Optional: relid's table's rows at ref (a commit, root its root) whose keys are within
 	 * any of bounds[] (nbounds of them), to sink as diff() from nothing
 	 * gives them (each added), in key order within each bound, read by
 	 * seeking the commit's data tree: O(its depth) a bound, and the rows
@@ -217,7 +217,8 @@ typedef struct ProllyMergeRoutine
 	 * be read so (keyed otherwise, or defined otherwise than the table is
 	 * now): the caller reads it with diff().
 	 */
-	ProllyBoundedRead (*bounded_rows) (const char *ref, Oid relid,
+	ProllyBoundedRead (*bounded_rows) (const char *ref,
+									   const ProllyNodeRef *root, Oid relid,
 									   const ProllyKeyBounds *bounds,
 									   int nbounds, ProllyHash *data,
 									   ProllyDiffSink *sink);
