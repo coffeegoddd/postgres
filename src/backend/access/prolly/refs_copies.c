@@ -1909,8 +1909,9 @@ branch_entry_tag(char tag)
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), not having held every
- * ref nor begun to commit?
+ * the commit, which no other transaction writes), or a commit's count
+ * (PROLLY_REFS_SPACE_COMMITS: whoever writes it writes the same), not
+ * having held every ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -1922,6 +1923,9 @@ scoped_key(const char *key, int keylen)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
 		(keylen > 1 && key[0] == TAG_OWNED))
+		return true;
+	/* (a commit's count of what it reaches: the same whoever writes it) */
+	if (keylen > 2 && key[0] == TAG_SIDE && key[1] == PROLLY_REFS_SPACE_COMMITS)
 		return true;
 	name = entry_branch(key, keylen, &len);
 	return name != NULL && branch_held(name, len);
