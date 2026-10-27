@@ -71,7 +71,7 @@ is(sql(q{SET client_min_messages = warning;
 # fragment, the same one (its names in the archive by its content).
 my $arch = PostgreSQL::Test::Utils::tempdir() . '/archive';
 sql(qq{SELECT dolt_branch('-D', 'side');
-	ALTER DATABASE sp SET prolly.history_warm = '1 day';
+	ALTER DATABASE sp SET prolly.history_window = '1 day';
 	ALTER DATABASE sp SET prolly.history_archive = 'file://$arch'});
 $sever = $node->background_psql('sp', on_error_stop => 0);
 $sever->query_safe(q{SELECT injection_points_set_local();
@@ -125,7 +125,7 @@ for my $d (1 .. 6)
 		SELECT dolt_commit('-Am', 'd$d', '--date', '2020-01-0$d')});
 }
 my $slow = 'slow://' . PostgreSQL::Test::Utils::tempdir() . '/slow';
-csql(qq{ALTER DATABASE cl SET prolly.history_warm = '2 seconds';
+csql(qq{ALTER DATABASE cl SET prolly.history_window = '2 seconds';
 	ALTER DATABASE cl SET prolly.history_archive = '$slow'});
 my $bg = $node->background_psql('cl', on_error_stop => 0);
 $bg->query_until(qr/started/, q{\echo started

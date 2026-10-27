@@ -12890,7 +12890,7 @@
   proparallel => 'u', prorettype => 'record', proargtypes => 'text',
   proallargtypes => '{text,text,interval,int8,interval,int8,text}',
   proargmodes => '{i,o,o,o,o,o,o}',
-  proargnames => '{branch,action,warm,min_commits,cold_batch,max_size,archive}',
+  proargnames => '{branch,action,time_window,min_commits,batch,max_size,archive}',
   prosrc => 'prolly_history_policy' },
 { oid => '8524', descr => 'prolly: the history horizon\'s fragments',
   proname => 'prolly_history_horizon', prorows => '10', proretset => 't',

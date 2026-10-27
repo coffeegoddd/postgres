@@ -540,10 +540,10 @@ archive_fragments(ProllyWindowFragmentVisit visit, void *arg)
  */
 
 static int	action_setting = PROLLY_WINDOW_ARCHIVE;
-static char *warm_setting = NULL;
+static char *window_setting = NULL;
 static int	min_commits_setting = 0;
 static char *max_size_setting = NULL;
-static char *cold_batch_setting = NULL;
+static char *batch_setting = NULL;
 static char *archive_timeout_setting = NULL;
 static char *archive_setting = NULL;
 
@@ -653,10 +653,10 @@ prolly_window_init(void)
 							 &action_setting, PROLLY_WINDOW_ARCHIVE,
 							 action_options, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_warm",
+	DefineCustomStringVariable("prolly.history_window",
 							   "How long each branch's history is kept here (empty: all of it).",
 							   "Read as the database has it; a branch may keep its own (dolt_history_window()).",
-							   &warm_setting, "", PGC_USERSET, 0,
+							   &window_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomIntVariable("prolly.history_min_commits",
 							"How many of each branch's newest commits are kept here, however old.",
@@ -673,10 +673,10 @@ prolly_window_init(void)
 							   "Read as the database has it; past it, nothing is severed.",
 							   &archive_timeout_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
-	DefineCustomStringVariable("prolly.history_cold_batch",
+	DefineCustomStringVariable("prolly.history_batch",
 							   "Severed history is cut at multiples of this (empty: anywhere), so fragments are whole hours or days.",
 							   "Read as the database has it; a branch may keep its own.",
-							   &cold_batch_setting, "", PGC_USERSET, 0,
+							   &batch_setting, "", PGC_USERSET, 0,
 							   check_span, NULL, NULL);
 	DefineCustomStringVariable("prolly.history_archive",
 							   "Where history past the window is archived: a remote's URL.",
@@ -743,8 +743,8 @@ database_span(const char *name)
 	return usec;
 }
 
-static const char *const branch_settings[] = {"warm", "min_commits",
-"cold_batch"};
+static const char *const branch_settings[] = {"window", "min_commits",
+"batch"};
 
 static void
 branch_setting_key(StringInfo key, const char *name, const char *setting)
@@ -785,8 +785,8 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 			if (pg_strcasecmp(v, action_options[i].name) == 0)
 				p->action = action_options[i].val;
 	}
-	p->keep_time = database_span("prolly.history_warm");
-	p->batch = database_span("prolly.history_cold_batch");
+	p->keep_time = database_span("prolly.history_window");
+	p->batch = database_span("prolly.history_batch");
 	if ((v = database_setting("prolly.history_min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
 	if ((v = database_setting("prolly.history_max_size")) != NULL &&
@@ -796,9 +796,9 @@ archive_policy(const char *name, ProllyWindowPolicy *p)
 	p->archive = (v && *v) ? v : NULL;
 	if (name == NULL)
 		return;
-	if ((v = branch_setting(name, "warm")) != NULL)
+	if ((v = branch_setting(name, "window")) != NULL)
 		(void) parse_span(v, &p->keep_time);
-	if ((v = branch_setting(name, "cold_batch")) != NULL)
+	if ((v = branch_setting(name, "batch")) != NULL)
 		(void) parse_span(v, &p->batch);
 	if ((v = branch_setting(name, "min_commits")) != NULL)
 		p->keep_commits = strtol(v, NULL, 10);
@@ -819,7 +819,7 @@ archive_set_policy(const char *name, const char *setting, const char *value)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a branch's history window has no setting \"%s\"", setting),
-				 errhint("A branch keeps its own warm, min_commits or cold_batch; the rest are the database's.")));
+				 errhint("A branch keeps its own window, min_commits or batch; the rest are the database's.")));
 	if (value != NULL)
 	{
 		int64		n;
