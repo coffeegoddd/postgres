@@ -5,13 +5,18 @@
 # the head, then for each case a dirty working set (1,000-row UPDATE
 # batches, each its own transaction) and dolt_reset('--hard', HEAD~D).
 #
-#   reset_hard_repro.sh init  DATA BIN PORT SOCKDIR      # initdb with vc_bench's settings
+#   reset_hard_repro.sh init  DATA BIN PORT SOCKDIR [no-fold-worker]
+#                                                 # initdb with vc_bench's settings
 #   reset_hard_repro.sh load  BIN PORT SOCKDIR N [H] [K]  # table, baseline commit, history
 #   [FOLD_AT=f] reset_hard_repro.sh case  BIN PORT SOCKDIR N D FRACTION [H]
 #
-# FOLD_AT folds the working set (prolly_checkpoint()) after that fraction
-# of the dirty batches, as a fold worker that fell behind leaves it: with
-# prolly_fold_worker off, FOLD_AT=0.4 reproduces a reset that read the
+# init's no-fold-worker sets prolly_fold_worker = off, so that what is
+# folded before a reset is FOLD_AT's alone.  load resumes an interrupted
+# load at whichever phase it stopped in (the rows, the baseline commit,
+# the fixture branch, the history's commits).  FOLD_AT folds the working
+# set (prolly_checkpoint()) after that fraction of the dirty batches, as a
+# fold worker that fell behind leaves it: with the fold worker off,
+# FOLD_AT=0.4 reproduces a reset that read the
 # working set's distance from the commit from its baseline and the change
 # finder's count, and so folded and wrote back the dirty rows.  The server
 # must be started (pg_ctl) before load and case.  Example, 10 GB:
@@ -24,7 +29,7 @@ set -euo pipefail
 cmd=$1; shift
 case $cmd in
 init)
-	DATA=$1 BIN=$2 PORT=$3 SOCK=$4
+	DATA=$1 BIN=$2 PORT=$3 SOCK=$4 OPT=${5:-}
 	"$BIN/initdb" -D "$DATA" -U postgres --auth-local=trust --auth-host=trust \
 		--no-locale -E UTF8 > /dev/null
 	cat >> "$DATA/postgresql.conf" <<CONF
@@ -36,6 +41,11 @@ autovacuum = off
 max_wal_size = '8GB'
 checkpoint_timeout = '30min'
 CONF
+	if [ "$OPT" = no-fold-worker ]; then
+		echo "prolly_fold_worker = off" >> "$DATA/postgresql.conf"
+	elif [ -n "$OPT" ]; then
+		echo "unknown init option: $OPT" >&2; exit 2
+	fi
 	;;
 load)
 	BIN=$1 PORT=$2 SOCK=$3 N=$4 H=${5:-500} K=${6:-1000}
@@ -50,10 +60,13 @@ CREATE TABLE bench_rows (id BIGINT PRIMARY KEY, revision BIGINT NOT NULL,
 	payload TEXT NOT NULL) USING prolly;
 SQL
 	fi
-	FROM=$(P -d "bench_n$N" -Atc "SELECT coalesce(max(id), 0) + 1 FROM bench_rows")
-	# (rows in batches of 10,000, each its own transaction; the payload
-	# 1,024 base64 characters of sha256 digests of the id and block)
-	P -d "bench_n$N" <<SQL
+	Q() { P -d "bench_n$N" -At "$@" | tail -1; }
+	# (the rows and the baseline commit, unless it was made)
+	if [ "$(Q -c "SELECT count(*) FROM dolt_log WHERE message = 'vc_bench baseline'")" = 0 ]; then
+		FROM=$(Q -c "SELECT coalesce(max(id), 0) + 1 FROM bench_rows")
+		# (rows in batches of 10,000, each its own transaction; the payload
+		# 1,024 base64 characters of sha256 digests of the id and block)
+		P -d "bench_n$N" <<SQL
 SELECT format(\$q\$INSERT INTO bench_rows
 	SELECT i, 0, substr(translate(encode((SELECT string_agg(sha256(int8send(i) || int8send(b)), ''::bytea)
 		FROM generate_series(0, 33) b), 'base64'), E'\n', ''), 1, 1024)
@@ -61,11 +74,20 @@ SELECT format(\$q\$INSERT INTO bench_rows
 FROM generate_series($FROM, $N, 10000) s
 \gexec
 SELECT dolt_commit('-Am', 'vc_bench baseline', '--allow-empty');
-SELECT dolt_branch('fixture', dolt_hashof('HEAD'));
+SQL
+	fi
+	# (the fixture branch, unless it was made)
+	if [ "$(Q -c "SELECT count(*) FROM dolt_branches WHERE name = 'fixture'")" = 0 ]; then
+		P -d "bench_n$N" -c "SELECT dolt_branch('fixture', dolt_hashof('HEAD'))"
+	fi
+	# (the history's commits after those made; one whose UPDATE ran but
+	# whose commit didn't is made again, its UPDATE writing the same rows)
+	DONE=$(Q -c "SELECT dolt_checkout('fixture')" -c "SELECT count(*) FROM dolt_log WHERE message LIKE 'revision %'")
+	P -d "bench_n$N" <<SQL
 SELECT dolt_checkout('fixture');
 SELECT format('UPDATE bench_rows SET revision = %s WHERE id IN (SELECT 1 + i::bigint * $N / $K FROM generate_series(0, $K - 1) i)', r),
 	format('SELECT dolt_commit(''-Am'', ''revision %s'')', r)
-FROM generate_series(1, $H) r
+FROM generate_series($DONE + 1, $H) r
 \gexec
 SQL
 	;;
