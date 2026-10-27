@@ -64,11 +64,9 @@ SELECT count(*) AS changes FROM dolt_status;
 SELECT dolt_checkout('main');
 :flush
 SELECT pg_temp.since('move_tables_shared') IS NOT NULL AS counting;
-SELECT pg_temp.since('relations_restored') IS NOT NULL AS counting;
 SELECT dolt_reset('--hard', :'a1');
 :flush
--- (by the pages alike kept as of the commit, which are its storage's)
-SELECT pg_temp.since('relations_restored') > 0 AS shared;
+SELECT pg_temp.since('move_tables_shared') AS shared;
 SELECT count(*) FILTER (WHERE w = 'w') AS w_read, count(*) FILTER (WHERE v = 'alike') AS from_alike
 FROM sl.t;
 

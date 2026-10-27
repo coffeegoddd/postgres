@@ -14,7 +14,7 @@ CREATE EXTENSION test_prolly;
 RESET client_min_messages;
 CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
-	WHERE name IN ('apply_rows', 'relations_restored', 'pages_kept')
+	WHERE name IN ('apply_rows', 'relations_restored', 'move_tables_shared', 'pages_kept')
 $$;
 CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
 LANGUAGE sql AS $$
@@ -78,8 +78,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
         name        | case 
 --------------------+------
  apply_rows         |    0
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 5) AS at_c5,
 	NOT EXISTS (SELECT FROM dolt_status) AS clean;
@@ -121,8 +122,9 @@ FROM since(:'before') WHERE name <> 'pages_kept';
         name        | case 
 --------------------+------
  apply_rows         |    0
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 30) AS at_c30;
  at_c30 
@@ -172,9 +174,10 @@ FROM since(:'before');
         name        | case 
 --------------------+------
  apply_rows         |    0
+ move_tables_shared |    1
  pages_kept         |    0
- relations_restored |    1
-(3 rows)
+ relations_restored |    0
+(4 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
  at_c12 
@@ -185,7 +188,7 @@ SELECT digest() = (SELECT d FROM digests WHERE n = 12) AS at_c12;
 SELECT count(*) AS scratch_kept FROM test_kept_commits('scratch');
  scratch_kept 
 --------------
-            1
+            3
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -249,8 +252,9 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::i
         name        | case 
 --------------------+------
  apply_rows         |    1
+ move_tables_shared |    0
  relations_restored |    1
-(2 rows)
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 39) AS at_c39;
  at_c39 
@@ -306,8 +310,9 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value BETWEEN 1 AND 4 * 100)::i
         name        | case 
 --------------------+------
  apply_rows         |    1
- relations_restored |    1
-(2 rows)
+ move_tables_shared |    1
+ relations_restored |    0
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 33) AS at_c33;
  at_c33 
@@ -353,10 +358,10 @@ SELECT count(*) - :kept_before AS kept_within FROM test_kept_commits('main');
 RESET prolly.root_interval;
 RESET dolt.transaction_commit;
 -- a merge between the nearest root and the commit, with a dirty working
--- set: the move ends at the merge's rows, its other parent's included,
--- writing no more rows than the commits between changed (a root on the
--- other parent's side, the branch's, is found by the walk only when on
--- the first parents; here none pays, and the rows are written)
+-- set: the nearest root is restored and the move ends at the merge's
+-- rows, its other parent's included, writing no more rows than the
+-- commits between changed (a root on the other parent's side is found by
+-- the walk only when on the first parents)
 SET prolly.root_interval_commits = 100;
 SELECT dolt_branch('side');
  dolt_branch 
@@ -429,9 +434,10 @@ SELECT name, CASE WHEN name = 'apply_rows' THEN (value <= 3 * 100)::int
 	ELSE value END FROM since(:'before') WHERE name <> 'pages_kept';
         name        | value 
 --------------------+-------
- apply_rows         |     0
- relations_restored |     0
-(2 rows)
+ apply_rows         |     1
+ move_tables_shared |     0
+ relations_restored |     7
+(3 rows)
 
 SELECT digest() = (SELECT d FROM digests WHERE n = 100) AS at_merge,
 	NOT EXISTS (SELECT FROM dolt_status) AS clean;

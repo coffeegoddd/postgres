@@ -98,6 +98,8 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
+#include "refs_generations.h"
+
 /* dolt.author's value; read through GetConfigOption so a placeholder works. */
 static char *dolt_author = NULL;
 static bool dolt_allow_commit_conflicts = false;
@@ -264,6 +266,7 @@ prolly_session_init(const char *branch)
 								0,
 								NULL, NULL, NULL);
 		branch_tuple_hook = note_own_change;
+		branch_storage_hook = branch_replaced_storage;
 		prolly_refs_end_hook = transaction_commit_at_end;
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
@@ -4606,6 +4609,9 @@ log_walk(List *starts)
 		{
 			LogEntry   *p;
 
+			/* (a listing stops at the history horizon) */
+			if (prolly_window_stops_at(&e->info.parents[i]))
+				continue;
 			key = prolly_hash_key(&e->info.parents[i]);
 			p = hash_search(seen, &key, HASH_ENTER, &found);
 			if (!found)

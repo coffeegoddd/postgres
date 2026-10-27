@@ -128,6 +128,10 @@ CREATE FUNCTION test_bmap_epoch(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_bmap_exists(relnumber oid)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_free_blocks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -443,6 +447,23 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_refs_walk_count(declined text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The nodes the refs' walk visits (what a collection keeps), each as often
+-- as it is visited.
+CREATE FUNCTION test_refs_walk_nodes()
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The chunks the refs' root and the tables reach, found apart from a
+-- collection's marks.
+CREATE FUNCTION test_chunk_reachable()
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The hashes of the chunks a table file holds.
+CREATE FUNCTION test_chunk_file_hashes(name text)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Each table's data tree in the session branch's working set, folded
 -- once: its qualified name, the tree's hash, and why its tree can't be

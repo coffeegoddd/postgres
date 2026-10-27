@@ -30,6 +30,20 @@
 #include "utils/syscache.h"
 
 
+/*
+ * A relation whose entry names storage a move replaced (rd_replaced: the
+ * transaction's snapshot is older than the move) may be read, not changed:
+ * opened, or already locked, to change it, it is refused.
+ */
+static inline void
+check_replaced(Relation r, LOCKMODE lockmode)
+{
+	if (unlikely(r->rd_replaced) &&
+		(lockmode > AccessShareLock ||
+		 CheckRelationLockedByMe(r, RowShareLock, true)))
+		RelationCheckReplacedWrite(r);
+}
+
 /* ----------------
  *		relation_open - open any relation by relation OID
  *
@@ -74,6 +88,7 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
 	pgstat_init_relation(r);
+	check_replaced(r, lockmode);
 
 	return r;
 }
@@ -124,6 +139,7 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
 	pgstat_init_relation(r);
+	check_replaced(r, lockmode);
 
 	return r;
 }

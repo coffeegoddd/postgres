@@ -22,6 +22,7 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_commitcache.h"
+#include "access/prolly_window.h"
 #include "access/prolly_rootfreeze.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_jsontree.h"
@@ -66,6 +67,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyWritersRoutine *writers;
 	const ProllyMatCacheRoutine *matcache;
 	const ProllyCommitCacheRoutine *commit_cache;
+	const ProllyWindowRoutine *history_window;
 	const ProllyRootFreezerRoutine *root_freezer;
 } ProllyDatabaseComponents;
 

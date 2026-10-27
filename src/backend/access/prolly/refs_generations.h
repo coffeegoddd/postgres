@@ -14,6 +14,7 @@
 #include "access/prolly_refs.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
+#include "common/relpath.h"
 #include "utils/snapshot.h"
 
 /* What a branch's fold was begun at: taken before it reads anything. */
@@ -30,6 +31,12 @@ extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
 extern void branch_note_head_restore(Oid branch);
 extern bool branch_head_restore_unseen(Oid branch, Snapshot snap);
+extern bool branch_replaced_reserve(int n);
+extern void branch_note_replaced(Oid tablespace, RelFileNumber oldrel,
+								 RelFileNumber newrel, FullTransactionId xid);
+extern void branch_replaced_release_unused(void);
+extern bool branch_replaced_storage(Oid tablespace, RelFileNumber *rel,
+									Snapshot snap);
 extern void branch_generations_note_relation(Oid branch, Oid relid,
 											 int nrows);
 

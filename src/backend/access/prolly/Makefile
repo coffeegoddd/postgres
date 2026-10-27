@@ -89,6 +89,8 @@ OBJS = \
 	tree_stub.o \
 	valenc_canonical.o \
 	valenc_stub.o \
+	window_archive.o \
+	window_stub.o \
 	writers_modes.o \
 	writers_stub.o
 

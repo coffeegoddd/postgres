@@ -400,6 +400,12 @@ typedef struct BmapTreeOpaqueData
  */
 #define BMAP_TREE_SNAPSHOTS	BMAP_SNAPSHOTS_MAX
 
+/*
+ * A frozen root's copy's live_epoch (bmap_root_copy()): frozen, the holder's
+ * changes since it told by its own epoch.
+ */
+#define BMAP_LIVE_EPOCH_COPY	PG_UINT32_MAX
+
 typedef struct BmapRoot
 {
 	BmapEntry	top[BMAP_TREE_TOPS];
@@ -9849,13 +9855,16 @@ root_may_hold(const xl_bmap_root *r)
  * Root 'id' of the store held again, by a root of its own: a free slot set
  * to the same subtrees, each gaining a holder, naming the current
  * (sub)transaction as its capturer, so that it is held from that one's
- * commit and let go of on its own.  O(1), nothing written out: the blocks
- * are the root's, durable since it was captured.  Its id, or 0 if the
- * store holds no such root.
+ * commit and let go of on its own, and naming the map of holder (the
+ * relation it is held for) as the one it was captured of: that map's own,
+ * as a root captured of it would be (own_root_tops()).  O(1), nothing
+ * written out: the blocks are the root's, durable since it was captured.
+ * Its id, or 0 if the store holds no such root.
  */
 BmapRootId
-bmap_root_copy(RelFileLocator store, BmapRootId id)
+bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 {
+	uint64		holder_map;
 	LOCKTAG		sweeptag;
 	Buffer		buf;
 	Buffer		rootsmeta;
@@ -9882,6 +9891,11 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	if (!bmap_root_held(store, id, NULL) ||
 		!root_read(store, id, -1, &buf, &r))
 		return 0;
+	buf = map_read(holder, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, holder, BMAP_FORKNUM, 1);
+	holder_map = PageGetBmapRoot(BufferGetPage(buf))->map_id;
+	UnlockReleaseBuffer(buf);
 
 	/* not while a sweep counts what the maps hold */
 	SET_LOCKTAG_OBJECT(sweeptag, store.dbOid, BMAP_SWEEP_CLASSID, store.spcOid, 0);
@@ -9936,9 +9950,13 @@ bmap_root_copy(RelFileLocator store, BmapRootId id)
 	rdelta.index = ROOT_INDEX(slot);
 	rdelta.root.snap = r.snap;
 	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
-	rdelta.root.relnumber = r.relnumber;
-	rdelta.root.map_id = r.map_id;
-	rdelta.root.live_epoch = r.live_epoch;
+	rdelta.root.relnumber = holder.relNumber;
+	rdelta.root.map_id = holder_map;
+	/*
+	 * (a frozen root's copy is frozen too, but the holder's changes since
+	 * are told by the root's own epoch, the holder being made of it)
+	 */
+	rdelta.root.live_epoch = r.live_epoch != 0 ? BMAP_LIVE_EPOCH_COPY : 0;
 	memset(&mdelta, 0, sizeof(mdelta));
 	mdelta.kind = BMAP_DELTA_ROOTS_META;
 	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
@@ -10369,7 +10387,7 @@ bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)
 
 	if (!root_read(rel, id, -1, &buf, &r) || r.live_epoch == 0)
 		return false;
-	if (r.relnumber == rel.relNumber)
+	if (r.live_epoch != BMAP_LIVE_EPOCH_COPY && r.relnumber == rel.relNumber)
 	{
 		*since = r.live_epoch;
 		return true;
@@ -14533,6 +14551,7 @@ bmap_redo(XLogReaderState *record)
 				uint8		last = XLogRecMaxBlockId(record);
 
 				bool		zeroed = (xlrec->flags & BMAP_REMAP_ZERO) != 0;
+
 				/*
 				 * The page store reaches the new block; the page itself is
 				 * the last block, an image, so redo never reads the block,

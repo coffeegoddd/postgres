@@ -16,7 +16,7 @@ RESET client_min_messages;
 
 CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
 	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
-	WHERE name IN ('apply_rows', 'relations_restored', 'pages_kept')
+	WHERE name IN ('apply_rows', 'relations_restored', 'move_tables_shared', 'pages_kept')
 $$;
 CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
 LANGUAGE sql AS $$
@@ -147,10 +147,10 @@ RESET prolly.root_interval;
 RESET dolt.transaction_commit;
 
 -- a merge between the nearest root and the commit, with a dirty working
--- set: the move ends at the merge's rows, its other parent's included,
--- writing no more rows than the commits between changed (a root on the
--- other parent's side, the branch's, is found by the walk only when on
--- the first parents; here none pays, and the rows are written)
+-- set: the nearest root is restored and the move ends at the merge's
+-- rows, its other parent's included, writing no more rows than the
+-- commits between changed (a root on the other parent's side is found by
+-- the walk only when on the first parents)
 SET prolly.root_interval_commits = 100;
 SELECT dolt_branch('side');
 SELECT dolt_checkout('side');

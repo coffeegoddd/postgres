@@ -220,6 +220,14 @@ prolly_autovacuum_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.freeze_roots",
+							 "Freeze the roots a commit captures as the commit keeps them.",
+							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are (as under dolt.transaction_commit, whose roots aren't frozen as captured).",
+							 &prolly_freeze_roots,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_min_changes",
 							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
 							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
@@ -229,8 +237,8 @@ prolly_autovacuum_init(void)
 							0,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_lock_wait",
-							"How long a move giving a table its kept or shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
-							"An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.",
+							"How long a move giving a table shared pages waits for another holder of one of the table's locks, before it writes the table's rows instead.",
+							"An autovacuum worker holding one is asked to cancel and waited for apart from this; lock_timeout, if set, caps the wait.  0 doesn't wait.  A restore of the branch's own kept pages queues for its locks instead, as TRUNCATE does.",
 							&prolly_restore_lock_wait,
 							100, 0, INT_MAX,
 							PGC_USERSET,
