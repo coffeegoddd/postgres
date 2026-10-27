@@ -271,15 +271,15 @@ SELECT kind, coalesce(n.name, p.commit_hash) AS commit, coalesce(m.name, p.paren
 FROM prolly_history_plan(now() - interval '30 days') p
 LEFT JOIN hr_names n ON n.hash = p.commit_hash LEFT JOIN hr_names m ON m.hash = p.parent_hash
 ORDER BY 1, 2, 3;
-   kind   | commit | parent | why 
-----------+--------+--------+-----
- boundary | old3   | old2   | 
- pinned   | old3   |        | ref
- pinned   | old4   |        | ref
- pinned   | xa     |        | ref
- pinned   | xb     |        | ref
+   kind   | commit | parent |    why     
+----------+--------+--------+------------
+ boundary | old5   | old4   | 
+ pinned   | xa     |        | merge base
+ pinned   | xb     |        | merge base
  severed  | old1   |        | 
  severed  | old2   |        | 
+ severed  | old3   |        | 
+ severed  | old4   |        | 
 (7 rows)
 
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
@@ -291,7 +291,7 @@ SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
 SELECT commits FROM dolt_history_drop(now() - interval '30 days');
  commits 
 ---------
-       2
+       4
 (1 row)
 
 SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);

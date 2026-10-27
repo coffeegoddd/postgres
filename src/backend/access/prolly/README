@@ -1771,36 +1771,76 @@ branch's history is kept here), prolly.history_min_commits (how many of a
 branch's newest commits are kept however old), prolly.history_cold_batch
 (a cut rounded down to whole hours or days, so fragments are whole ones),
 prolly.history_max_size, prolly.history_window_action (archive, delete or
-none) and prolly.history_archive (a remote's name or URL) are read as the
+none) and prolly.history_archive (a remote's URL, not a name) are read as the
 database has them (ALTER DATABASE ... SET: its owner's or a
 superuser's), never as a session has them, so no session severs more or
 sends history elsewhere by a SET of its own.  A branch's lineage may keep
 its own warm, min_commits or cold_batch (dolt_history_window(), the
 owner's, kept in the refs' settings); prolly_history_policy() shows what
-a branch keeps.  With no window, everything is kept.
+a branch keeps.  With no window, everything is kept.  A warm window is
+never shorter than prolly.history_hot (the page roots' window, as the
+database has it): a shorter one is taken as hot, with a notice.  What a
+branch's history keeps is the branch's window's: another ref's commit on
+it (a commit the branch's pages are kept as of, a reader's pin, a
+remote-tracking branch) has no window of its own, though a collection
+keeps what the ref names until the ref lets go of it, and no path to it
+is kept as for a merge (it is its own merge base).  A tag keeps its own
+commit and the database's min_commits; a ref's commit on no branch's
+history keeps itself, and the paths to its merge bases with the
+branches.
 
 dolt_history_sever() severs what is past the window, as the action says.
+It plans, and archives, holding no ref and not the horizon's lock (only
+a lock severs and repairs take turns by); the refs moved meanwhile, it
+plans and archives again, a few times, still holding none.  Then it holds
+the horizon and the refs only to check the plan (planned again if the
+refs moved since, which must give the fragment archived) and record it.
 Archived, the fragment's tops are sent to the archive (the transfer
 sends what it lacks; a walk past the horizon goes on where the remote has
-what is severed already, so fragments archive beside one another), every
-chunk of the fragment is checked to be there, the tops are made heads of
-the archive's (history/fragment-N-i), and only then is the horizon moved,
-the fragment's location the archive's URL; with no archive, nothing is
-severed and a warning says so.  Deleted, the horizon records the fragment
-and nothing is sent.
+what is severed already, so fragments archive beside one another), the
+tops are made heads of the archive's, named by the database (the
+cluster's system identifier and its OID) and the fragment's identity, so
+the same fragment is named the same however often it is archived, then
+every chunk the fragment made is read back from the archive and re-hashed
+(an archive that says it has one it doesn't is found out), and only then
+is the horizon moved, the fragment's location the archive's URL; with no
+archive, nothing is severed and a warning says so.  The archive is opened
+as the role severing (the owner), so its checks are the owner's, and the
+archive's own permissions to push protect its history/... heads after:
+whoever may move heads there may let the history archived go.  Deleted,
+the horizon records the fragment and nothing is sent.
 
 Autovacuum's visit of a database severs its window in the background
-(the history window's maintain(), as the database's settings say), then
-collects the chunk store in full if a fragment was made, freeing it.  It
-plans only once the cut, rounded down to a whole cold_batch (an hour if
-none is set), has moved past the last cut tried (the refs' setting
-history_window.last_cut), so a window is walked at most once a batch.
-Past prolly.history_max_size (the chunk store's journal and table files),
-each visit cuts a batch later than the last, from the oldest history kept
-on (history_window.size_cut), each branch still keeping its newest
-prolly.history_min_commits, until the store fits.  The size limit is a
-background one: dolt_history_sever() cuts by the time and count windows
-alone.
+(the history window's maintain(), as the database's settings say), as
+the database's owner (with SECURITY_RESTRICTED_OPERATION), so an
+archive's checks are the owner's, as at dolt_history_sever(): a file
+archive needs the owner's pg_write_server_files.  It plans only once some
+lineage's cut has moved past the last one tried: each branch's, by its
+own window over the database's, rounded down to its own cold_batch (an
+hour if none is set), and the database's, for the other refs (the refs'
+settings history_window.last_cut and history_window.last_cut:<branch>).
+So a branch's own window is severed in the background with none for the
+database, and a window is walked at most once a batch.  A try that fails
+(an archive refused or unreachable, a cancel) is reported as a warning
+and tried again after a wait, a minute doubling with each failure in a
+row to a day (history_window.retry_at), not at every visit.
+
+What a sever cut is freed by a full collection, which the visit runs
+once fragments were made since the last, and that ended at least
+prolly.history_collect_interval ago (an hour if unset): fragments made
+meanwhile share one, and full collections never run back to back.
+Past prolly.history_max_size, as measured by the store's files (as the
+manifest has them) at the end of the background's last full collection,
+a visit cuts a batch past the oldest history kept, each branch still
+keeping its newest prolly.history_min_commits; then no more for size
+until a full collection has run and measured again, so a store whose
+freeing lags (unlinks deferred by a base backup, chunks held by a
+snapshot) isn't cut a batch a visit.  In delete mode two measurements in
+a row must say the store is over.  Nothing severed, the size cut isn't
+moved, and it isn't tried again before the next interval.  The store's
+files over the limit but the last measurement under asks for a full
+collection to measure again.  The size limit is a background one:
+dolt_history_sever() cuts by the time and count windows alone.
 
 dolt_history_repair(source, fragments) reattaches fragments, newest
 first (all, or the newest few), from a remote or clone that has their
