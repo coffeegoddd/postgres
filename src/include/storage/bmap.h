@@ -176,7 +176,8 @@ extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
 typedef uint64 BmapRootId;
 
 extern BmapRootId bmap_root_capture(SMgrRelation reln);
-extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids);
+extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
+								   uint32 *owned);
 extern bool bmap_root_capture_concurrent(SMgrRelation *rels, int n,
 										 BmapRootId *ids);
 extern BmapRootId bmap_root_capture_of(SMgrRelation reln, RelFileNumber of,

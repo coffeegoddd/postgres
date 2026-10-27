@@ -13,7 +13,7 @@ RESET client_min_messages;
 SELECT current_database() AS home \gset
 CREATE DATABASE eager_freeze;
 -- (pages shared with a branch alone: pages kept as of each commit are shared too, which VACUUM leaves as they are)
-ALTER DATABASE eager_freeze SET prolly.kept_commits = 0;
+ALTER DATABASE eager_freeze SET debug_prolly_page_roots = off;
 \c eager_freeze
 CREATE EXTENSION pageinspect;
 CREATE SCHEMA ef VERSIONED;

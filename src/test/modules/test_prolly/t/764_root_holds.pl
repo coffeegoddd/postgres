@@ -28,7 +28,6 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
-prolly.kept_commits = 1000
 prolly.restore_min_changes = 0
 });
 $node->start;
@@ -87,9 +86,10 @@ is(miscounted(), '0', 'with their holders counted');
 is($standby->safe_psql('postgres', q{SELECT held FROM test_bmap_roots()}),
 	$after, 'the standby replayed the copies');
 
-# main lets go of c0's roots (the branch deleted would; here its list kept
-# to its newest), side moves to c2 and back: by its own
-sql(q{SET prolly.kept_commits = 1;
+# main lets go of c0's roots (the branch deleted would; here its window
+# its newest commit, side keeping its own), side moves to c2 and back: by
+# its own
+sql(q{SELECT dolt_history_window('main', 'min_commits', '1');
 	UPDATE rh.t SET v = 3 WHERE id % 10 = 3; SELECT dolt_commit('-am', 'c3');
 	UPDATE rh.t SET v = 4 WHERE id % 10 = 4; SELECT dolt_commit('-am', 'c4')});
 

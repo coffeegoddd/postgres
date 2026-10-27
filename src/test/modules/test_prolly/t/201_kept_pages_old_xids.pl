@@ -25,6 +25,8 @@ prolly_fold_worker = off
 $node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION xid_wraparound; CREATE EXTENSION test_prolly');
+# (a window of two commits: the third's keep retires the first's roots)
+$node->safe_psql('postgres', 'ALTER DATABASE postgres SET prolly.history_min_commits = 2');
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 

@@ -11,7 +11,7 @@
 CREATE DATABASE regress_reload_moves;
 -- (the move planner's sources, not pages kept as of the head, which come
 -- before them and move nothing: first_use_kept tests those)
-ALTER DATABASE regress_reload_moves SET prolly.kept_commits = 0;
+ALTER DATABASE regress_reload_moves SET debug_prolly_page_roots = off;
 \c regress_reload_moves
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
@@ -117,7 +117,7 @@ DROP DATABASE regress_reload_moves;
 CREATE DATABASE regress_reload_deferred;
 -- (the move planner's sources, not pages kept as of the head, which come
 -- before them and move nothing: first_use_kept tests those)
-ALTER DATABASE regress_reload_deferred SET prolly.kept_commits = 0;
+ALTER DATABASE regress_reload_deferred SET debug_prolly_page_roots = off;
 \c regress_reload_deferred
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;

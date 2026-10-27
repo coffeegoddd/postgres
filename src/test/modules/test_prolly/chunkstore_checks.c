@@ -898,6 +898,35 @@ test_kept_commits(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * Freeze every kept commit of the session's branch whose roots were
+ * captured among writers, as the fold worker does: how many were.
+ */
+PG_FUNCTION_INFO_V1(test_freeze_kept);
+Datum
+test_freeze_kept(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	int64		n = 0;
+
+	prolly_database_components(&dc);
+	while (PROLLY_CALL(dc.refs, freeze_kept) > 0)
+		n++;
+	PG_RETURN_INT64(n);
+}
+
+/* A retention pass of branch name's kept commits, now. */
+PG_FUNCTION_INFO_V1(test_retain_roots);
+Datum
+test_retain_roots(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, retain_roots, text_to_cstring(PG_GETARG_TEXT_PP(0)));
+	PG_RETURN_VOID();
+}
+
 static void
 tree_row(const char *name, const ProllyNodeRef *data,
 		 const ProllyValue *description, const char *unreadable, void *arg)

@@ -13,7 +13,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('large_values');
 $node->init(allows_streaming => 1);
 # (the rows a reset writes, not pages kept as of its commit given back)
-$node->append_conf('postgresql.conf', "autovacuum = off\nprolly.kept_commits = 0");
+$node->append_conf('postgresql.conf', "autovacuum = off\ndebug_prolly_page_roots = off");
 $node->start;
 $node->backup('b');
 my $standby = PostgreSQL::Test::Cluster->new('large_values_standby');

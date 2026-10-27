@@ -279,6 +279,10 @@ typedef struct BranchOpsRoutine
 	 * (bmap_root_capture_concurrent()); each relation kept is
 	 * BRANCH_KEPT_UNFROZEN and _CONCURRENT, for freeze_kept() to freeze
 	 * as of the commit's snapshot (freeze is NULL then).
+	 * *pages is how many pages the roots captured hold that no root
+	 * before them did (those copied, or a root's pages changed since the
+	 * last capture): what the new roots alone keep once the relations
+	 * change again.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
@@ -286,7 +290,7 @@ typedef struct BranchOpsRoutine
 						 bool (*settled) (void *arg), void *arg,
 						 BranchFreezePage freeze,
 						 const struct ProllyRootSnapshot *as_of,
-						 bool concurrent);
+						 bool concurrent, uint64 *pages);
 
 	/*
 	 * Optional: freeze the roots keep() captured concurrently of the
@@ -301,12 +305,14 @@ typedef struct BranchOpsRoutine
 	 * nothing frozen (those made let go of as the transaction aborts or
 	 * commits), if a lock isn't free, or one is no longer on the storage
 	 * or root kept.
+	 *pages is how many pages the frozen roots copied, as keep()'s.
 	 */
 	bool		(*freeze_kept) (const BranchKeptRelation *kept, int nkept,
 								BranchKeptRelation *frozen,
 								const BranchKeptRelation *prior, int nprior,
 								BranchFreezePage freeze,
-								const struct ProllyRootSnapshot *as_of);
+								const struct ProllyRootSnapshot *as_of,
+								uint64 *pages);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,

@@ -71,6 +71,8 @@ backend_sources += files(
   'rootfreeze_capture.c',
   'rootfreeze_lazy.c',
   'rootfreeze_stub.c',
+  'rootretain_stub.c',
+  'rootretain_window.c',
   'transfer_chunks.c',
   'transfer_stub.c',
   'tablefile_basic.c',
