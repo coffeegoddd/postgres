@@ -68,6 +68,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -1427,11 +1428,15 @@ archive_repair(const char *source, int nfragments)
 	PreventCommandIfReadOnly("repairing history");
 
 	/*
-	 * Received first, holding nothing (a transfer may take long), each
-	 * fragment down to its stops: an older fragment's tops are not
-	 * received, so a source that has only this one serves it, and the
-	 * horizon goes on cutting there.
+	 * Received first, holding the horizon's lock but not the refs (a
+	 * transfer may take long; the horizon's lock blocks only collections
+	 * and severs), each fragment down to its stops: an older fragment's
+	 * tops are not received, so a source that has only this one serves
+	 * it, and the horizon goes on cutting there.  The horizon's lock comes
+	 * first, before the chunk store's that a receive takes to the end of
+	 * the transaction, as a collection takes them.
 	 */
+	horizon_lock(ExclusiveLock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, r, records)
 	{
@@ -1468,8 +1473,8 @@ archive_repair(const char *source, int nfragments)
 		urls = lappend(urls, url);
 	}
 
-	/* then verified, and let go of, holding the horizon and the refs */
-	horizon_lock(ExclusiveLock);
+	/* then verified, and let go of, holding the refs too */
+	INJECTION_POINT("prolly-repair-received", NULL);
 	PROLLY_CALL(dc.refs, lock);
 	records = fragment_records();
 	foreach_ptr(FragmentRecord, c, chosen)
