@@ -116,6 +116,36 @@ cmp_ok($kept_heap, '<=', 3,
 	'a chain on a heap table keeps no more than the transactions an active one overlapped'
 );
 
+# A serializable transaction importing another's snapshot, the source's
+# xmin above the fold's xid, which the snapshot holds as running: the
+# importer is registered at no lower an xmin (the global xmin doesn't go
+# back), and its reads are tracked.
+$a->query_safe(
+	q{BEGIN ISOLATION LEVEL SERIALIZABLE;
+	  SELECT v FROM s.t WHERE id = 1});
+my $exported = $a->query_safe(q{SELECT pg_export_snapshot()});
+$b->query_safe(
+	qq{BEGIN ISOLATION LEVEL SERIALIZABLE;
+	   SET TRANSACTION SNAPSHOT '$exported';
+	   SELECT v FROM s.t WHERE id = 2});
+is(sql(q{SELECT count(DISTINCT virtualtransaction) FROM pg_locks
+		 WHERE mode = 'SIReadLock'}),
+	'2', 'the importer of a snapshot takes predicate locks as its source does');
+$b->query_safe('COMMIT');
+$a->query_safe('COMMIT');
+is(sql(q{SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock'}), '0',
+	'both are cleaned up');
+
+# A parallel serializable query (its workers share its transaction).
+$a->query_safe(
+	q{SET debug_parallel_query = on;
+	  BEGIN ISOLATION LEVEL SERIALIZABLE;
+	  SELECT count(*) FROM s.t;
+	  COMMIT;
+	  RESET debug_parallel_query});
+is(sql(q{SELECT count(*) FROM pg_locks WHERE mode = 'SIReadLock'}), '0',
+	'a parallel serializable query is cleaned up');
+
 sub fails_to_serialize
 {
 	my ($s, $query, $name) = @_;

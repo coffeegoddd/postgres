@@ -463,6 +463,9 @@ are registered with, so a long transaction of its doesn't hold back the
 clean-up.  The bound still holds: a serializable transaction running as
 another's snapshot is taken either has its xid then, which is counted, or
 is given one no lower than that snapshot's xmax.
+A transaction importing a serializable transaction's snapshot is
+registered with no lower an xmin than its source's, which may have passed
+over an xid forgotten since; the global xmin never goes back.
 
     * Because reads in a subtransaction may cause that subtransaction
 to roll back, thereby affecting what is written by the top level

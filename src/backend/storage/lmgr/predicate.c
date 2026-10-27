@@ -509,6 +509,9 @@ static void DropAllPredicateLocksFromTable(Relation relation,
 										   bool transfer);
 static void SetNewSxactGlobalXmin(void);
 static TransactionId SerializableXmin(Snapshot snapshot);
+static TransactionId ImportedSerializableXmin(Snapshot snapshot,
+											  VirtualTransactionId *sourcevxid,
+											  SERIALIZABLEXACT *self);
 static void ForgetPassedOverXid(void);
 static void ClearOldPredicateLocks(void);
 static void ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
@@ -1835,7 +1838,9 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 	dlist_init(&(sxact->possibleUnsafeConflicts));
 	sxact->topXid = GetTopTransactionIdIfAny();
 	sxact->finishedBefore = InvalidTransactionId;
-	sxact->xmin = sourcevxid ? snapshot->xmin : SerializableXmin(snapshot);
+	sxact->xmin = sourcevxid ? ImportedSerializableXmin(snapshot, sourcevxid,
+														 sxact) :
+		SerializableXmin(snapshot);
 	sxact->pid = MyProcPid;
 	sxact->pgprocno = MyProcNumber;
 	dlist_init(&sxact->predicateLocks);
@@ -1953,10 +1958,17 @@ RegisterPredicateLockingXid(TransactionId xid)
 			if (TransactionIdIsValid(MyPassedOverXid))
 				ForgetPassedOverXid();
 			LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
+			/*
+			 * (one per backend fits; were it full, the xid would only be
+			 * counted, as any is)
+			 */
 			Assert(PredXact->passedOverXidCount < MaxBackends);
-			PassedOverXids[PredXact->passedOverXidCount++] = xid;
+			if (PredXact->passedOverXidCount < MaxBackends)
+			{
+				PassedOverXids[PredXact->passedOverXidCount++] = xid;
+				MyPassedOverXid = xid;
+			}
 			LWLockRelease(SerializableXactHashLock);
-			MyPassedOverXid = xid;
 		}
 		return;
 	}
@@ -2068,6 +2080,41 @@ SerializableXmin(Snapshot snapshot)
 			xmin = xid;
 	}
 	Assert(!TransactionIdPrecedes(xmin, snapshot->xmin));
+	return xmin;
+}
+
+/*
+ * The xmin a serializable transaction importing another's snapshot is
+ * registered with.  Its source was registered with SerializableXmin() of
+ * the same snapshot, then, which may pass over an xid since forgotten: the
+ * greater of that and of SerializableXmin() now, either a bound the
+ * snapshot keeps.  It is no lower than SxactGlobalXmin, then, as every new
+ * serializable transaction's must be.  A source not found (one read only
+ * that needed no tracking) gives the snapshot's own, raised to
+ * SxactGlobalXmin if below it, as the global xmin can't go back.
+ */
+static TransactionId
+ImportedSerializableXmin(Snapshot snapshot, VirtualTransactionId *sourcevxid,
+						 SERIALIZABLEXACT *self)
+{
+	TransactionId xmin = SerializableXmin(snapshot);
+	dlist_iter	iter;
+
+	Assert(LWLockHeldByMeInMode(SerializableXactHashLock, LW_EXCLUSIVE));
+	dlist_foreach(iter, &PredXact->activeList)
+	{
+		SERIALIZABLEXACT *source =
+			dlist_container(SERIALIZABLEXACT, xactLink, iter.cur);
+
+		if (source != self &&
+			VirtualTransactionIdEquals(source->vxid, *sourcevxid) &&
+			!SxactIsCommitted(source) &&
+			TransactionIdFollows(source->xmin, xmin))
+			xmin = source->xmin;
+	}
+	if (TransactionIdIsValid(PredXact->SxactGlobalXmin) &&
+		TransactionIdPrecedes(xmin, PredXact->SxactGlobalXmin))
+		xmin = PredXact->SxactGlobalXmin;
 	return xmin;
 }
 
