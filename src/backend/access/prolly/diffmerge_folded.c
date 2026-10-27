@@ -15155,9 +15155,53 @@ bound_keys(RowDiff *rd, const ProllyKeyBounds *b, StringInfo lo, StringInfo hi)
 }
 
 /*
+ * The table relid as the session branch defines it now (tables_defined_now()),
+ * kept for the statement: a bounded read asks it of every commit, and it
+ * can't change while one statement reads.  Whether every column is of a
+ * base type too (no enum, which a version's types may label otherwise).
+ */
+static Table *
+bounded_now(Oid relid, bool *plain)
+{
+	static Oid	relid_was = InvalidOid;
+	static LocalTransactionId lxid_was = InvalidLocalTransactionId;
+	static CommandId cid_was = InvalidCommandId;
+	static Table *now = NULL;
+	static bool plain_was = false;
+
+	if (relid != relid_was || MyProc->vxid.lxid != lxid_was ||
+		GetCurrentCommandId(false) != cid_was)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		Relation	rel = table_open(relid, AccessShareLock);
+		TupleDesc	desc = RelationGetDescr(rel);
+
+		now = find_table(tables_defined_now(relid), table_name(relid));
+		plain_was = true;
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			if (!att->attisdropped && get_typtype(att->atttypid) != TYPTYPE_BASE)
+				plain_was = false;
+		}
+		table_close(rel, AccessShareLock);
+		MemoryContextSwitchTo(old);
+		relid_was = relid;
+		lxid_was = MyProc->vxid.lxid;
+		cid_was = GetCurrentCommandId(false);
+	}
+	*plain = plain_was;
+	return now;
+}
+
+/*
  * relid's table's rows at ref within bounds, seeking its data tree (see
  * prolly_merge.h): only where the version is keyed and defined as the
  * table is now, so its keys sort and its rows decode as the table's do.
+ * A version whose description is the table's now, every column of a base
+ * type, is that without its root's types being read (no enum to label
+ * otherwise); any other is compared as a diff compares it.
  */
 static ProllyBoundedRead
 folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
@@ -15174,6 +15218,7 @@ folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
 	Table	   *now;
 	char	   *name;
 	bool		keyed;
+	bool		plain;
 	Relation	rel;
 	RowDiff		rd;
 	ProllyBoundedRead result = PROLLY_BOUNDED_READ;
@@ -15192,13 +15237,19 @@ folded_bounded_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
 	}
 	if (data->len > 0 && same_hash(&t->data.hash, data))
 		return PROLLY_BOUNDED_SAME;
-	t = find_table(version_tables(ref, relid, false), name);
-	if (t == NULL)
-		return PROLLY_BOUNDED_NO;
 	require_readable(t);
-	now = find_table(tables_defined_now(relid), name);
+	now = bounded_now(relid, &plain);
+	if (now == NULL)
+		return PROLLY_BOUNDED_NO;
+	if (!(plain && t->textlen == now->textlen &&
+		  memcmp(t->text, now->text, t->textlen) == 0))
+	{
+		t = find_table(version_tables(ref, relid, false), name);
+		if (t == NULL || !same_description(t, now))
+			return PROLLY_BOUNDED_NO;
+	}
 	(void) version_columns(t, &keyed);
-	if (now == NULL || !keyed || !same_description(t, now))
+	if (!keyed)
 		return PROLLY_BOUNDED_NO;
 
 	rel = table_open(relid, AccessShareLock);

@@ -36,6 +36,9 @@
  *   reported there instead.
  * - resolve() resolves them, keeping the current rows or taking the merged
  *   branch's.
+ * - bounded_rows() reads one commit's rows of a table within bounds on
+ *   its primary key, seeking the commit's data tree, where the version
+ *   sorts and decodes as the table does now.
  * - tables() reports each table that differs between two refs (its rows or
  *   its definition), by qualified name, in name order: added, removed or
  *   modified; then each other object that differs (the canonicalizer's
