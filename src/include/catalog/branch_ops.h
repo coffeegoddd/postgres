@@ -25,7 +25,9 @@
 
 #include "common/relpath.h"
 #include "datatype/timestamp.h"
+#include "storage/bufpage.h"
 #include "storage/lock.h"
+#include "utils/snapshot.h"
 
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
@@ -77,6 +79,13 @@ typedef enum BranchKeptStatus
  * all of whose relations are such entries.
  */
 #define BRANCH_KEPT_STORAGE		PG_UINT64_MAX
+
+/*
+ * Freeze a copy of block blkno of a heap-format relation as of snapshot,
+ * in place (the root freezer's freeze_page()).
+ */
+typedef bool (*BranchFreezePage) (Page page, BlockNumber blkno,
+								  Snapshot snapshot);
 
 /* A table's relations as kept, its own first. */
 typedef struct BranchKeptTable
@@ -232,12 +241,18 @@ typedef struct BranchOpsRoutine
 	 * are kept, the roots release[] (nrelease of them) are let go of as
 	 * the transaction commits, the locks still held: a branch being made
 	 * of kept pages (make_kept()) holds the relations against that while
-	 * it reads them.
+	 * it reads them.  With freeze, a heap-format relation's root holds its
+	 * pages frozen as of snapshot instead (freeze() of a copy of each page
+	 * changed since the relation's root in prior[], made into a root whose
+	 * unchanged pages are that root's), and its kept frozenxid is
+	 * FrozenTransactionId: it never goes stale; one unchanged since keeps
+	 * that root.  The others are kept as they are.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
 						 const BranchKeptRelation *release, int nrelease,
-						 bool (*settled) (void *arg), void *arg);
+						 bool (*settled) (void *arg), void *arg,
+						 BranchFreezePage freeze, Snapshot snapshot);
 
 	/*
 	 * Optional: give the session branch's relations kept[] (nkept of them,

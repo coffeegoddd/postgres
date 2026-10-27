@@ -64,7 +64,9 @@ FROM prolly_implementations();
  commit_cache   | stub         |       0 |              0
  history_window | archive      |       1 |              1
  history_window | stub         |       0 |              0
-(55 rows)
+ root_freezer   | capture      |       1 |              1
+ root_freezer   | stub         |       0 |              0
+(57 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -158,7 +160,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge     | stub           | identity                       | pass
  diff_merge     | stub           | diff_reports_each_change_once  | not implemented (missing diff)
  diff_merge     | stub           | merge                          | not implemented (missing merge)
- diff_merge     | stub           | complete                       | not implemented (12 of 12 callbacks missing)
+ diff_merge     | stub           | complete                       | not implemented (13 of 13 callbacks missing)
  tree           | cow            | identity                       | pass
  tree           | cow            | build_and_get                  | pass
  tree           | cow            | large_keys                     | pass
@@ -298,7 +300,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  history_window | archive        | complete                       | pass
  history_window | stub           | identity                       | pass
  history_window | stub           | complete                       | not implemented (7 of 7 callbacks missing)
-(226 rows)
+ root_freezer   | capture        | identity                       | pass
+ root_freezer   | capture        | complete                       | pass
+ root_freezer   | stub           | identity                       | pass
+ root_freezer   | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+(230 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

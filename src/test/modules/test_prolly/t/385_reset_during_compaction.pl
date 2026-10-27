@@ -28,6 +28,8 @@ autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
 });
+# (roots sharing the relations' pages as they are: frozen ones share none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }

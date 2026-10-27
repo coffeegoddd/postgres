@@ -82,6 +82,7 @@ Changes to this design are tracked in GitHub issues:
 	node_cache        prolly_nodecache.h      shared, stub
 	commit_cache      prolly_commitcache.h    shared, stub
 	history_window    prolly_window.h         archive, stub
+	root_freezer      prolly_rootfreeze.h     capture, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -1227,14 +1228,31 @@ in.  A commit's
 pages are the commit's, whichever branch kept them: a move restores them
 from another branch's kept commit too (share_kept()), so a branch made at
 a commit moves back along its history as the branch that made it would.
-Freezing is still to come: a root keeps the transaction ids of its rows,
-so a kept commit older than the database's frozen horizon is held, not
-restored.  A root's slot names the transactions that captured and let go
-of it, which VACUUM settles (bmap_roots_reclaim()) before the database's
-oldest transaction id advances: no slot then needs the commit log once it
-forgets them, and one a crash left is reclaimed rather than held.  If capture inside the commit costs too much, freezing can move
-to the background, a root not yet frozen staying usable until the horizon
-passes it.
+A root's slot names the transactions that captured and let go of it,
+which VACUUM settles (bmap_roots_reclaim()) before the database's oldest
+transaction id advances: no slot then needs the commit log once it
+forgets them, and one a crash left is reclaimed rather than held.
+A commit's roots hold its heap pages (tables', TOAST tables', change
+logs') frozen as of the commit (the root freezer, prolly_rootfreeze.h;
+"capture" freezes them as the commit keeps them): each page changed since
+the relation's last root is copied, frozen as of the commit's snapshot
+(the versions it sees, xmin frozen, xmax cleared; every other version a
+dead line pointer, never an unused one, as the root's index pages, kept
+as they are, may point at it; a HOT chain's root redirecting to the
+version left), and written to a copy of that root, temporary storage made
+a root of (branch operations' keep(), with freeze); the relation keeps
+its own pages, unshared, and its epoch raised so that each one's next
+change marks it changed since (bmap_changed_pages()).  A frozen root never
+goes stale: its kept frozenxid is FrozenTransactionId, so it is never held
+past the database's frozen horizon, and any session may be given its
+pages.  Finding the pages changed reads only the map's nodes set since the
+epoch: a page's change sets every pointer above its leaf in the map's
+epoch (once a node for each epoch), so the walk passes over the subtrees
+set before, and a relation unchanged since its root reads no node.
+prolly.freeze_roots off keeps them as captured, sharing the relation's
+pages.  Under dolt.transaction_commit roots are kept as captured: freezing them
+in every transaction's commit would cost too much, and is to move to the
+background there.
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never
@@ -1952,8 +1970,23 @@ commits above it and a join reads each commit once.  The primary key's
 bounds seek in each commit whose key is the version's, and a commit keyed
 otherwise is read whole.  Planning reads no history (the commits are
 estimated by the mounted one's height).  prolly_mounts() shows which
-mounts are history mounts.  The dolt_history_table() functions still read
-every commit.
+mounts are history mounts.
+
+dolt_history_table(NULL::t) with quals on its row's primary key columns
+((row).id = 5, = ANY, a range; equalities on the key's leading columns,
+then a range on the next) is planned as a scan of its own
+(prolly_history_scan.c): the quals' values are computed once, and each
+commit the head reaches is read by seeking its data tree for each bound
+(the diff-merge's bounded_rows()), O(the tree's depth) a bound, a commit
+whose table is the tree the commit read before it had giving that
+commit's rows again, reading nothing.  So a key's history costs the
+commits times the trees' depth, not their rows.  A version keyed
+otherwise, or described otherwise than the table is now, is read whole,
+as is every commit of a keyless table (never bounded).  The quals stay
+the scan's filter, and EXPLAIN shows those it bounds by ("History Key").
+The scan gives the entry's whole row too (h, row_to_json(h), h IS NOT
+NULL in a filter), made of its columns when the plan reads it.
+dolt_history_table() by name reads every row of every commit.
 
 Revision-qualified table names (prolly_revision.c) read a table as
 another revision has it, as Doltgres's revision databases do:
@@ -2014,7 +2047,9 @@ one, and CheckPointProlly() runs in CheckPointGuts(), and
 ProllyRecoveryConsistent() beside XLogCheckInvalidPages(), as recovery
 becomes consistent; the chunk store asks XLogBackupInProgress() (xlog.c)
 before it removes a file a backup's redo may copy from.  Every batch of
-shared invalidation messages sent calls prolly_forget_folds() (sinval.c).
+shared invalidation messages sent calls prolly_forget_folds() (sinval.c),
+but one of storage managers' messages alone (a storage truncated or
+dropped changes no catalog or row).
 createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly

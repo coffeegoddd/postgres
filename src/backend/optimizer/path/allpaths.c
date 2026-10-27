@@ -19,6 +19,7 @@
 #include <math.h>
 
 #include "access/sysattr.h"
+#include "access/prolly_history.h"
 #include "access/prolly_log.h"
 #include "access/prolly_revision.h"
 #include "access/tsmapi.h"
@@ -564,7 +565,12 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					prolly_revision_set_paths(root, rel, rte);
 				else if (!(prolly_log_rte(rte) &&
 						   prolly_log_set_paths(root, rel, rte)))
-					set_function_pathlist(root, rel, rte);	/* (else dolt_log's, as found) */
+				{
+					set_function_pathlist(root, rel, rte);
+					/* (a table's history seeking each commit by its key) */
+					if (prolly_history_rte(rte))
+						prolly_history_set_paths(root, rel, rte);
+				}
 				break;
 			case RTE_TABLEFUNC:
 				/* Table Function */

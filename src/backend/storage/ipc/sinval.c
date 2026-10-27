@@ -49,8 +49,20 @@ SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
 	SIInsertDataEntries(msgs, n);
 
-	/* (a fold made before may describe what changed: prolly's are stale) */
-	prolly_forget_folds();
+	/*
+	 * (a fold made before may describe what changed: prolly's are stale.
+	 * Not for a storage manager's messages alone, which change no catalog
+	 * and no row: a relation's storage truncated, or dropped, as a commit's
+	 * frozen roots' temporary storage is)
+	 */
+	for (int i = 0; i < n; i++)
+	{
+		if (msgs[i].id != SHAREDINVALSMGR_ID)
+		{
+			prolly_forget_folds();
+			break;
+		}
+	}
 }
 
 /*
