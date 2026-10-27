@@ -75,6 +75,31 @@ PATH_COUNTERS = ("moves_root_kept", "moves_root_nearest", "moves_root_missing",
                  "move_tables_written", "restores_lock_busy", "severed_refusals")
 
 
+# Waits, in the reading session, for every other client session of the
+# database to have exited.  A session's pg_stat_prolly counts are flushed as
+# its backend exits, before it leaves pg_stat_activity (the stats' shutdown
+# hook runs before its activity entry is cleared): once none is listed, the
+# operations' sessions' counts are all in.  (The activity snapshot cleared
+# each time round: a transaction reads one otherwise.)
+SESSIONS_EXITED = """DO $$
+DECLARE
+	tries int := 0;
+BEGIN
+	LOOP
+		PERFORM pg_stat_clear_snapshot();
+		EXIT WHEN NOT EXISTS (SELECT 1 FROM pg_stat_activity
+							  WHERE datname = current_database()
+							  AND pid <> pg_backend_pid()
+							  AND backend_type = 'client backend');
+		tries := tries + 1;
+		IF tries > 6000 THEN
+			RAISE EXCEPTION 'the operations'' sessions of % still run after 60 s', current_database();
+		END IF;
+		PERFORM pg_sleep(0.01);
+	END LOOP;
+END $$;"""
+
+
 def window_sql(dbname: str, settings: dict[str, str]) -> str:
     """The window's settings, set on database dbname."""
     return "\n".join(f"ALTER DATABASE {dbname} SET {name} = '{value}';"
@@ -118,7 +143,10 @@ class VWorkload(Workload):
 
     def path_counters(self, ctx) -> dict[str, int]:
         names = ",".join(f"'{n}'" for n in PATH_COUNTERS)
-        out = ctx.cluster.sql("SELECT pg_stat_force_next_flush();\n"
+        # (after every other session of the database has exited, its
+        # counts flushed: none is lost to a flush still to come)
+        out = ctx.cluster.sql(SESSIONS_EXITED + "\n"
+                              "SELECT pg_stat_force_next_flush();\n"
                               f"SELECT name || '=' || value FROM pg_stat_prolly WHERE name IN ({names})",
                               dbname=ctx.dbname).stdout.split()
         got = {k: int(v) for k, v in (line.split("=", 1) for line in out if "=" in line)}

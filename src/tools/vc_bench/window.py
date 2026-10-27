@@ -31,8 +31,10 @@ PATH_COUNTERS = ("moves_root_kept", "moves_root_nearest", "moves_root_missing",
 # given back from a root), and those that only read history or name it.
 MOVES = ("reset_hard", "checkout")
 
-# Merges, whose base is their target: they may write the rows the merge
-# changes (rows_bound, check_path()), never a table's every row.
+# Merges, whose base is their target.  A fast-forward is a move to the
+# merged branch's head, which keeps a root: held to a move's path, it writes
+# no rows.  A three-way merge may write the rows it changes (rows_bound,
+# check_path()), never a table's every row.
 MERGES = ("merge_ff", "merge")
 
 
@@ -67,6 +69,10 @@ def settings(c):
     return {"prolly.history_window": str(w.get("time", DEFAULT_TIME_WINDOW)),
             "prolly.history_min_commits": str(min_commits),
             "prolly.history_root_max_size": "",
+            # (no chunk-store cap, and nothing severed: history in the
+            # window is never cut in the background)
+            "prolly.history_max_size": "",
+            "prolly.history_window_action": "none",
             "prolly.root_interval": str(w.get("root_interval_ms", 0)),
             "prolly.root_interval_commits": str(interval_commits)}
 
@@ -112,6 +118,14 @@ def check_path(operation, distance, target, deltas, rows_bound=None):
         raise PathError(f"{where}: gave up a restore for a lock and wrote rows instead")
     if got["moves_root_missing"]:
         raise PathError(f"{where}: moved to a commit without a root and wrote its rows")
+    if operation == "merge_ff":
+        if not got["moves_root_kept"]:
+            raise PathError(f"{where}: the fast-forward gave back no root of the merged head "
+                            "(moves_root_kept is 0)")
+        if got["move_tables_written"] or got["apply_rows"] or got["apply_loads"]:
+            raise PathError(f"{where}: the fast-forward wrote rows ({got['move_tables_written']} tables, "
+                            f"{got['apply_rows']} rows) instead of giving back the head's root")
+        return
     if operation in MERGES:
         if got["apply_loads"]:
             raise PathError(f"{where}: filled {got['apply_loads']} tables from nothing: a full table write")

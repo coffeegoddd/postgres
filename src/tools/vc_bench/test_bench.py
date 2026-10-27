@@ -39,6 +39,7 @@ class FakeVersionedSQL:
         # it, or writes its rows, counting the path as pg_stat_prolly does;
         # write_rows_anyway models a move that writes rows with a root.
         self.full_write_merge = False
+        self.ff_writes_rows = False
         self.windowed = windowed
         self.roots = set(commits if roots is None else roots)
         self.in_window = set(commits if in_window is None else in_window)
@@ -163,6 +164,9 @@ class FakeVersionedSQL:
                 if b[0] in self.ancestors(theirs):
                     b[0], b[1] = theirs, self.rows(theirs)
                     self._move(theirs)
+                    if self.windowed and self.ff_writes_rows:
+                        self.path['move_tables_written'] += 1
+                        self.path['apply_rows'] += len(self.changed)
                 else:
                     base = max(self.ancestors(b[0]) & self.ancestors(theirs))
                     was, side = self.rows(base), self.rows(theirs)
@@ -640,6 +644,8 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(got['prolly.history_window'], window.DEFAULT_TIME_WINDOW)
         self.assertEqual(got['prolly.root_interval_commits'], '1')
         self.assertEqual(got['prolly.root_interval'], '0')
+        self.assertEqual(got['prolly.history_max_size'], '')
+        self.assertEqual(got['prolly.history_window_action'], 'none')
         self.assertEqual(ENGINES['prolly'].window_settings(c), got)
         self.assertEqual(ENGINES['dolt'].window_settings(c), {})
         self.assertEqual(ENGINES['doltgres'].window_settings(c), {})
@@ -793,7 +799,7 @@ class BenchTests(unittest.TestCase):
         self.assertEqual({r['distance'] for r in ff}, {1, 3})
         self.assertTrue(all(r['window'] == 'in' and r['target_root'] == 'kept' for r in ff + three))
         self.assertTrue(all(r['path']['moves_root_kept'] == 1 and r['path']['apply_rows'] == 0 for r in ff))
-        self.assertTrue(all(r['path']['apply_rows'] == len(side_ids(n, k)) for r in three))
+        self.assertTrue(all(r['path']['apply_rows'] == k for r in three))
         self.assertTrue(all(r['sql'].startswith('VC ["merge"') for r in ff + three))
         # (the session is left as it was: its branch at HEAD, the side gone)
         self.assertEqual(list(sql.branches), ['fixture'])
@@ -803,12 +809,23 @@ class BenchTests(unittest.TestCase):
         sql.full_write_merge = True
         with self.assertRaisesRegex(window.PathError, 'full table write'):
             self._run_cell(sql, n, k, commits, engine='prolly')
+        # a fast-forward is a move: one that writes the rows to the head
+        # instead of giving back its root fails the run
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', windowed=True)
+        sql.ff_writes_rows = True
+        with self.assertRaisesRegex(window.PathError, 'the fast-forward wrote rows'):
+            self._run_cell(sql, n, k, commits, engine='prolly')
         merge_in = {'window': 'in', 'root': 'kept', 'root_distance': 0}
+        window.check_path('merge_ff', 3, merge_in, {'moves_root_kept': 1}, 0)
+        with self.assertRaisesRegex(window.PathError, 'moves_root_kept is 0'):
+            window.check_path('merge_ff', 3, merge_in, {}, 0)
+        with self.assertRaisesRegex(window.PathError, 'the fast-forward wrote rows'):
+            window.check_path('merge_ff', 3, merge_in, {'moves_root_kept': 1, 'apply_rows': 8}, 8)
         window.check_path('merge', 3, merge_in, {'apply_rows': 3}, 3)
         with self.assertRaisesRegex(window.PathError, 'more than the 3'):
             window.check_path('merge', 3, merge_in, {'apply_rows': 64}, 3)
         with self.assertRaisesRegex(window.PathError, 'without a root'):
-            window.check_path('merge_ff', 3, merge_in, {'moves_root_missing': 1}, 8)
+            window.check_path('merge_ff', 3, merge_in, {'moves_root_missing': 1}, 0)
 
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:

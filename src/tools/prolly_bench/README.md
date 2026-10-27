@@ -1360,8 +1360,10 @@ any history (`prolly.history_window`, 100 years unless the workload's
 measured window, pg_stat_prolly's path counters must show the root path:
 no `moves_root_missing` (a move to a commit without a root), no
 `move_tables_written` but for V3's merges, no `restores_lock_busy` and no
-`severed_refusals`. A failed check fails the run rather than reporting a
-slow number. The counters' growth is reported beside the latencies
+`severed_refusals`. The counters are read once every other session of the
+database has exited (a session's counts are flushed as its backend exits),
+so none of the operations' work is missed. A failed check fails the run
+rather than reporting a slow number. The counters' growth is reported beside the latencies
 (`path_*` metrics), and the window's settings and roots kept in the
 outcome's notes. V7 to V10 are counter, storage and cleanup gates: they set
 no window, the default month holding every commit they make.

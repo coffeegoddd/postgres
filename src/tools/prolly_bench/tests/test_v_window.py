@@ -82,6 +82,20 @@ class VWindowTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "without a root"):
             measured(V3(), FakeCluster({"moves_root_missing": 1}))
 
+    def test_counters_are_read_once_the_operations_sessions_have_exited(self):
+        # (their counts are flushed as their backends exit: the read waits
+        # for every other client session of the database to be gone, in the
+        # same script, before it reads)
+        cluster = FakeCluster({"moves_root_kept": 1})
+        measured(V1(), cluster)
+        reads = [q for q in cluster.sent if "pg_stat_prolly" in q]
+        self.assertEqual(len(reads), 2)
+        for q in reads:
+            self.assertLess(q.index("pg_stat_activity"), q.index("FROM pg_stat_prolly"))
+            self.assertIn("pg_stat_clear_snapshot()", q)
+            self.assertIn("pid <> pg_backend_pid()", q)
+            self.assertIn("backend_type = 'client backend'", q)
+
     def test_path_failures(self):
         self.assertEqual(path_failures({}, False), [])
         self.assertEqual(path_failures({"moves_root_nearest": 1, "move_tables_written": 1}, True), [])

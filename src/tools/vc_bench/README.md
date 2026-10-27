@@ -192,7 +192,7 @@ the maximum configured distance and is recorded in every sample.
 | `drop_table` | `DROP TABLE bench_rows` on the scratch branch, clean or with a dirty working set; a hard reset to HEAD brings it back, untimed |
 | `at_history`, D=0 or D>0 | Read three changed rows as the saved hash has them (prolly: `dolt_at(hash, NULL::bench_rows)`; Dolt and Doltgres: `bench_rows AS OF hash`), by key |
 | `merge_ff`, D>0 | The scratch branch, hard reset (untimed) to the saved hash, merges the fixture branch: a fast-forward to HEAD |
-| `merge`, D>0 | A branch made at the saved hash, with one commit (untimed) changing rows no fixture commit changes, merged into HEAD: a three-way merge with an in-window base, its merge commit made; hard reset to HEAD after, untimed |
+| `merge`, D>0 | A branch made at the saved hash, with one commit (untimed) changing rows no fixture commit changes, merges the fixture branch (HEAD): a three-way merge with an in-window base, its merge commit made; the branch is deleted after, untimed, so neither commit keeps a root |
 
 ### The history window
 
@@ -209,7 +209,8 @@ window: their targets are all in it).
   `run` sets it again before connecting: `prolly.history_window` (100
   years by default), `prolly.history_min_commits` (the deepest history
   measured plus the baseline: every commit a fixture builds), no root size
-  cap, and a root at every commit (`prolly.root_interval` 0,
+  cap and no chunk-store cap (`prolly.history_max_size`), nothing severed
+  (`prolly.history_window_action` none), and a root at every commit (`prolly.root_interval` 0,
   `prolly.root_interval_commits` 1). Override them in `config.json`'s
   `history_window` (`time`, `min_commits`, `root_interval_ms`,
   `root_interval_commits`); `min_commits` below what a fixture builds is
@@ -241,10 +242,11 @@ window: their targets are all in it).
   at each cell's start and end.
 
 Merges are held to the same window: their base is the target checked
-before them. They may write rows, but only those the merge changes:
-`apply_rows` at most K for a fast-forward and the side's rows for a
-three-way merge, and no `apply_loads` (a table filled from nothing). More
-is a full table write, and fails the run.
+before them. A fast-forward is a move to the merged head, which keeps a
+root: it must count `moves_root_kept` and write no rows
+(`move_tables_written` and `apply_rows` 0). A three-way merge may write the
+rows it changes, at most K (`apply_rows`), and no `apply_loads` (a table
+filled from nothing). More is a full table write, and fails the run.
 
 ### Dirty working sets: xsmall, small, medium, large
 
