@@ -1,0 +1,76 @@
+-- Repairing severed history into the generations it was severed from.
+-- A full collection that drops a severed parent lists it by its
+-- generation in the boundary commit's file, even when the boundary commit
+-- is young and settled by that collection; a repair puts the parent back
+-- in that generation, so the boundary's file still lists what it names.
+-- A tree brought back after the sever, settled in a newer generation, is
+-- settled again with the fragment that names it, so no file names a newer
+-- one.  The settled files' generations check out at every step.
+
+\getenv abs_builddir PG_ABS_BUILDDIR
+\set dir :abs_builddir '/tmp_check/generations_repair'
+SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+\set VERBOSITY terse
+SELECT current_database() AS home \gset
+CREATE DATABASE regress_generations_repair;
+\c regress_generations_repair
+CREATE EXTENSION test_prolly;
+
+CREATE SCHEMA gr VERSIONED;
+CREATE TABLE gr.t (id int PRIMARY KEY, v text);
+CREATE TABLE gr_snap (id int, v text);
+CREATE FUNCTION gr_commit(msg text, day int) RETURNS text LANGUAGE sql AS $$
+	SELECT trim(both '{}' from dolt_commit('-Am', msg, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => day))::text)::text)
+$$;
+INSERT INTO gr.t SELECT g, 'v' || g FROM generate_series(1, 300) g;
+SELECT length(gr_commit('d1', 1)) AS committed;
+UPDATE gr.t SET v = 'd2' WHERE id % 4 = 0;
+SELECT length(gr_commit('d2', 2)) AS committed;
+INSERT INTO gr_snap SELECT * FROM gr.t;
+UPDATE gr.t SET v = 'd3' WHERE id % 4 = 1;
+SELECT length(gr_commit('d3', 3)) AS committed;
+UPDATE gr.t SET v = 'd4' WHERE id % 4 = 2;
+SELECT length(gr_commit('d4', 4)) AS committed;
+SELECT dolt_remote('add', 'origin', :'url') IS NOT NULL AS added;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+-- d1..d4 settled; d5..d8 stay young
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
+UPDATE gr.t SET v = 'd5' WHERE id % 4 = 3;
+SELECT length(gr_commit('d5', 5)) AS committed;
+UPDATE gr.t SET v = 'd6' WHERE id % 5 = 0;
+SELECT length(gr_commit('d6', 6)) AS committed;
+UPDATE gr.t SET v = 'd7' WHERE id % 5 = 1;
+SELECT length(gr_commit('d7', 7)) AS committed;
+UPDATE gr.t SET v = 'd8' WHERE id % 5 = 2;
+SELECT length(gr_commit('d8', 8)) AS committed;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+SELECT count(*) AS commits FROM dolt_log('main');
+SELECT count(*) AS d1_d2 FROM dolt_diff('main~7', 'main~6', NULL::gr.t);
+
+-- d1..d4 severed (d5 the boundary, still young), and dropped by a full
+-- collection, which settles d5.
+SELECT commits FROM dolt_history_drop('2020-01-05');
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+SELECT test_chunk_verify_generations() > 0 AS generations;
+
+-- A tree brought back after the sever: the table as d2 had it, settled.
+DELETE FROM gr.t;
+INSERT INTO gr.t SELECT * FROM gr_snap;
+SELECT length(gr_commit('back to d2', 9)) AS committed;
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
+SELECT test_chunk_verify_generations() > 0 AS generations;
+
+-- The repair: the history reads again, and the generations check out,
+-- through the collections after.
+SELECT dolt_history_repair(:'url') AS repaired;
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT count(*) AS commits FROM dolt_log('main');
+SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(false);
+SELECT chunks_freed >= 0 AS collected FROM prolly_gc(true);
+SELECT test_chunk_verify_generations() > 0 AS generations;
+SELECT count(*) AS d1_d2 FROM dolt_diff('main~8', 'main~7', NULL::gr.t);
+
+\c :home
+DROP DATABASE regress_generations_repair;

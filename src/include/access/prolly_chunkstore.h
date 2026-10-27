@@ -243,6 +243,14 @@ typedef enum ProllyGcScope
 } ProllyGcScope;
 
 /*
+ * Visits what a settled file's section lists: a chunk its chunks name in
+ * an older generation (epoch), with the leaf naming it (NULL: not a leaf).
+ */
+typedef void (*ProllyChunkListedVisit) (const ProllyHash *target,
+										const ProllyHash *source,
+										uint32 epoch, void *arg);
+
+/*
  * Visits a table file or segment: its name, its chunk count, its size in
  * bytes, and whether it is settled (a table file closed under what its
  * chunks name).
@@ -492,6 +500,17 @@ typedef struct ProllyChunkStoreRoutine
 	 * settled chunk: for tests.
 	 */
 	int64		(*verify_generations) (ProllyChunkStore *store);
+
+	/*
+	 * Optional: what the section of collected file 'file' (as gc_files()
+	 * numbers them) lists; and the slot of a chunk's copy in a collected
+	 * file of generation epoch (-1: none).  A file kept whole keeps what
+	 * it lists: the copy of the generation listed, not another.
+	 */
+	void		(*gc_listed) (ProllyChunkGc *gc, int file,
+							  ProllyChunkListedVisit visit, void *arg);
+	int64		(*gc_find_in) (ProllyChunkGc *gc, const ProllyHash *hash,
+							   uint32 epoch);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -507,9 +526,9 @@ typedef struct ProllyChunkStoreRoutine
 	"received_file", "received_get", "received_chunks", "adopt_received", \
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
-	"settle", "verify_generations"
+	"settle", "verify_generations", "gc_listed", "gc_find_in"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK verify_generations
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_find_in
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

@@ -4320,11 +4320,14 @@ xrefs_visit(const XrefSection *x, uint32 lo, uint32 hi, XrefVisit visit,
 }
 
 /*
- * The generation a chunk a file's chunk names is in, as the file's writer
+ * The generation a chunk a file's chunks name is in, as the file's writer
  * resolves it: the first of the interval of the file it is in (or will be
- * in), or 0 if none it knows of has it (a parent severed, its chunks gone).
+ * in), or 0 if none it knows of has it.  *always says to list it even if
+ * it is of the file's own generation: a parent the history horizon severs,
+ * which a repair brings back in that generation (see settle()).
  */
-typedef uint32 (*XrefResolve) (void *arg, const ProllyHash *target);
+typedef uint32 (*XrefResolve) (void *arg, const ProllyHash *target,
+							   bool *always);
 
 /* What a file being written lists in its section, as its chunks come. */
 typedef struct XrefBuild
@@ -4349,11 +4352,13 @@ xref_note(const ProllyHash *ref, void *arg)
 	uint32		epoch;
 	Xref	   *x;
 
+	bool		always = false;
+
 	if (ref->len == 0)
 		return;
-	epoch = xb->resolve(xb->arg, ref);
+	epoch = xb->resolve(xb->arg, ref, &always);
 	/* (one of the file's own generations, or found nowhere: not listed) */
-	if (epoch == 0 || epoch >= xb->lo)
+	if (epoch == 0 || (epoch >= xb->lo && !always))
 		return;
 	{
 		Xref		item;
@@ -4412,6 +4417,69 @@ xref_add(XrefBuild *xb, const ProllyHash *hash, const char *data, Size len,
 	xb->source = *hash;
 	xb->leaf = prolly_chunk_is_leaf(data, len);
 	prolly_chunk_references(data, len, xref_note, xb);
+}
+
+/* a target a section lists, and the generation it lists it by */
+typedef struct ListedTarget
+{
+	ProllyHash	target;			/* key */
+	uint32		epoch;
+} ListedTarget;
+
+static void
+note_listed_target(const ProllyHash *target, const ProllyHash *source,
+				   uint32 epoch, void *arg)
+{
+	HTAB	   *listed = arg;
+	ProllyHash	key;
+	ListedTarget *lt;
+	bool		found;
+
+	hash_key(&key, target);
+	lt = hash_search(listed, &key, HASH_ENTER, &found);
+	if (!found || epoch > lt->epoch)
+		lt->epoch = epoch;
+}
+
+/*
+ * The generation table file t's section lists the chunk (key) by, 0 if it
+ * doesn't, *listed caching what it lists (read once, in cxt).  For a chunk
+ * gone from the store, which a chunk of t names: a severed parent, listed
+ * when its file was written, which stays listed by the generation a repair
+ * puts it back in.
+ */
+static uint32
+listed_epoch(TableFile *t, HTAB **listed, MemoryContext cxt,
+			 const ProllyHash *key, bool *always)
+{
+	ListedTarget *lt;
+
+	if (t == NULL)
+		return 0;
+	if (*listed == NULL)
+	{
+		HASHCTL		ctl;
+		XrefSection x;
+		MemoryContext old = MemoryContextSwitchTo(cxt);
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.entrysize = sizeof(ListedTarget);
+		ctl.hcxt = cxt;
+		*listed = hash_create("prolly listed targets", 64, &ctl,
+							  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		if (xrefs_read(t, &x))
+		{
+			xrefs_visit(&x, 0, PG_UINT32_MAX, note_listed_target, *listed);
+			xrefs_free(&x);
+		}
+		MemoryContextSwitchTo(old);
+	}
+	lt = hash_search(*listed, key, HASH_FIND, NULL);
+	if (lt == NULL)
+		return 0;
+	*always = true;
+	return lt->epoch;
 }
 
 /* How many targets file f's section lists (-1: the file is gone). */
@@ -6834,26 +6902,36 @@ static int	settled_file(ProllyChunkStore *s, const Manifest *m,
 typedef struct SettleSource
 {
 	ProllyChunkStore *s;
-	List	   *hashes;			/* ProllyHash * */
+	List	   *hashes;			/* ProllyHash *: the group's */
 	ListCell   *cur;
-	HTAB	   *settling;		/* the same, by hash */
+	HTAB	   *settling;		/* SettledChunk: every group's so far */
 	const Manifest *m;
 } SettleSource;
 
+/* a chunk settle() writes, and the generation of the file it is in */
+typedef struct SettledChunk
+{
+	ProllyHash	hash;			/* key */
+	uint32		epoch;
+} SettledChunk;
+
 /*
- * The generation of a chunk a chunk settled names: none (0) if it is
- * settled with it, else the first of the settled file's it is in.
+ * The generation of a chunk a chunk settled names: the first of its own
+ * group's (none to list) or an older group's, if it is settled too; else
+ * the first of the settled file's it is in.
  */
 static uint32
-settle_resolve(void *arg, const ProllyHash *target)
+settle_resolve(void *arg, const ProllyHash *target, bool *always)
 {
 	SettleSource *ss = arg;
 	ProllyHash	key;
+	SettledChunk *sc;
 	int			f;
 
 	hash_key(&key, target);
-	if (hash_search(ss->settling, &key, HASH_FIND, NULL) != NULL)
-		return 0;
+	sc = hash_search(ss->settling, &key, HASH_FIND, NULL);
+	if (sc != NULL)
+		return sc->epoch;
 	f = settled_file(ss->s, ss->m, &key);
 	return f >= 0 ? ss->m->files[f].epoch_lo : 0;
 }
@@ -6930,16 +7008,57 @@ settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
 	return -1;
 }
 
+/* settle()'s: a root, and the generation the settled files list it by */
+typedef struct SettleRoot
+{
+	ProllyHash	hash;			/* key */
+	uint32		epoch;			/* (0: none lists it) */
+} SettleRoot;
+
+static void
+note_listed_root(const ProllyHash *target, const ProllyHash *source,
+				 uint32 epoch, void *arg)
+{
+	HTAB	   *roots = arg;
+	ProllyHash	key;
+	SettleRoot *r;
+
+	hash_key(&key, target);
+	r = hash_search(roots, &key, HASH_FIND, NULL);
+	if (r != NULL && epoch > r->epoch)
+		r->epoch = epoch;
+}
+
+static int
+settle_root_cmp(const void *a, const void *b)
+{
+	const SettleRoot *x = a;
+	const SettleRoot *y = b;
+
+	return x->epoch < y->epoch ? -1 : x->epoch > y->epoch;
+}
+
 /*
  * Settle what roots reach: every chunk they reach that no settled file
  * holds, down to those one does (and what isn't here: a severed parent),
- * written to a settled table file.  For chunks that only a settled file's
+ * written to settled table files.  For chunks that only a settled file's
  * chunks may name: a fragment of history a repair received, which the
  * boundary commits name.  A default collection doesn't read settled
  * files, so it would never find them otherwise, and would free them.
+ *
+ * Each goes back to the generation it was severed from: the one the
+ * sections of the files naming a root list it by (a collection lists a
+ * severed parent by its generation as it drops it).  Roots of one
+ * generation are settled together, oldest first, each reaching what an
+ * older one didn't; what they reach that a settled file of a newer
+ * generation holds (a tree brought back since the sever) is settled with
+ * them too, so a file names nothing newer than itself.  Roots none lists
+ * go with the newest of those listed; if none is, all go to the
+ * generation of the newest settled chunk they name.
+ *
  * Costs what it settles: a chunk is looked up in the journal's index and
- * the few files not settled; only where the walk stops, at a settled
- * chunk, are the settled files asked which has it.
+ * the few files not settled; only where the walk stops are the settled
+ * files asked which has it.  The settled files' sections are read once.
  */
 static void
 journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
@@ -6949,16 +7068,15 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 	SettleSource ss = {s, NIL, NULL, NULL, NULL};
 	XrefBuild	xb = {0};
 	ProllyHash *queue;
-	int			head = 0;
-	int			tail = 0;
 	int			max = Max(nroots, 64);
 	HASHCTL		ctl;
 	HTAB	   *seen;
+	HTAB	   *listed;
+	SettleRoot *order;
+	int			nordered = 0;
+	uint32		newest_listed = 0;
 	StringInfoData data;
-	int			newest = -1;	/* the settled file of the newest
-								 * generations what is settled names */
-	uint32		epoch_lo;
-	uint32		epoch_hi;
+	ListCell   *lc;
 
 	xact_note(s);
 	lock_manifest(s, &m);
@@ -6971,98 +7089,202 @@ journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
 	scan_journal(s);
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.hash = chunk_hash_key_hash;
-	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
+	ctl.entrysize = sizeof(ProllyHash);
 	seen = hash_create("prolly settle", 1024, &ctl,
 					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	ctl.entrysize = sizeof(SettledChunk);
 	ss.settling = hash_create("prolly settling", 1024, &ctl,
 							  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	ctl.entrysize = sizeof(SettleRoot);
+	listed = hash_create("prolly settle roots", 16, &ctl,
+						 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	ss.m = &m;
+
+	/* the generations the roots are listed by */
+	for (int i = 0; i < nroots; i++)
+	{
+		ProllyHash	key;
+		SettleRoot *r;
+		bool		found;
+
+		if (roots[i].len == 0)
+			continue;
+		hash_key(&key, &roots[i]);
+		r = hash_search(listed, &key, HASH_ENTER, &found);
+		if (!found)
+			r->epoch = 0;
+	}
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		XrefSection x;
+
+		if (t->settled && xrefs_read(t, &x))
+		{
+			xrefs_visit(&x, 0, PG_UINT32_MAX, note_listed_root, listed);
+			xrefs_free(&x);
+		}
+	}
+	order = palloc(sizeof(SettleRoot) * Max(nroots, 1));
+	{
+		HASH_SEQ_STATUS status;
+		SettleRoot *r;
+
+		hash_seq_init(&status, listed);
+		while ((r = hash_seq_search(&status)) != NULL)
+		{
+			order[nordered++] = *r;
+			newest_listed = Max(newest_listed, r->epoch);
+		}
+	}
+	for (int i = 0; i < nordered; i++)
+	{
+		if (order[i].epoch == 0)
+			order[i].epoch = newest_listed;
+	}
+	qsort(order, nordered, sizeof(SettleRoot), settle_root_cmp);
+
 	initStringInfo(&data);
+	initStringInfo(&xb.chunk);
 	queue = MemoryContextAllocHuge(CurrentMemoryContext,
 								   sizeof(ProllyHash) * max);
-	for (int i = 0; i < nroots; i++)
-		queue[tail++] = roots[i];
-	while (head < tail)
-	{
-		ProllyHash	h = queue[head++];
-		ProllyHash	key;
-		bool		found;
-		RefQueue	rq;
-
-		CHECK_FOR_INTERRUPTS();
-		if (h.len == 0)
-			continue;
-		hash_key(&key, &h);
-		(void) hash_search(seen, &key, HASH_ENTER, &found);
-		if (found)
-			continue;
-		if (!unsettled_has(s, &key))
-		{
-			/* (settled, or not here at all: the walk stops) */
-			int			f = settled_file(s, &m, &key);
-
-			if (f >= 0 &&
-				(newest < 0 || m.files[f].epoch_lo > m.files[newest].epoch_lo))
-				newest = f;
-			continue;
-		}
-		resetStringInfo(&data);
-		if (!journal_get(s, &h, &data))
-			continue;
-		ss.hashes = lappend(ss.hashes, memcpy(palloc(sizeof(ProllyHash)), &h,
-											  sizeof(ProllyHash)));
-		(void) hash_search(ss.settling, &key, HASH_ENTER, NULL);
-		/* (the queue's room reused once half of it is taken) */
-		if (head > max / 2)
-		{
-			memmove(queue, queue + head, sizeof(ProllyHash) * (tail - head));
-			tail -= head;
-			head = 0;
-		}
-		rq.queue = &queue;
-		rq.tail = &tail;
-		rq.max = &max;
-		prolly_chunk_references(data.data, data.len, queue_ref, &rq);
-	}
-
-	/*
-	 * Its generations: the newest of the settled chunks it names, so that
-	 * what names it (a boundary commit, which names those too) is of the
-	 * same or newer ones; else the oldest a settled file has; else the
-	 * next collection's.
-	 */
-	if (newest < 0)
-	{
-		for (int i = 0; i < m.nfiles; i++)
-		{
-			if (m.files[i].epoch_lo > 0 &&
-				(newest < 0 || m.files[i].epoch_lo < m.files[newest].epoch_lo))
-				newest = i;
-		}
-	}
-	if (newest >= 0)
-	{
-		epoch_lo = m.files[newest].epoch_lo;
-		epoch_hi = m.files[newest].epoch_hi;
-	}
-	else
-		epoch_lo = epoch_hi = m.gc_generation + 1;
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
-	for (int i = 0; i < m.nfiles; i++)
-		keep[i] = true;
-	ss.cur = list_head(ss.hashes);
-	xb.resolve = settle_resolve;
-	xb.arg = &ss;
-	xb.lo = epoch_lo;
-	xb.hi = epoch_hi;
-	initStringInfo(&xb.chunk);
-	write_table_file(s, &m, keep, MANIFEST_FILE_SETTLED, epoch_lo, epoch_hi,
-					 settle_next, &ss, false, NULL, false, 0, &xb);
-	hash_destroy(ss.settling);
+	for (int g = 0; g < nordered;)
+	{
+		uint32		epoch = order[g].epoch;
+		uint32		epoch_lo = epoch;
+		uint32		epoch_hi = epoch;
+		int			newest = -1;	/* (none listed: the newest named) */
+		int			head = 0;
+		int			tail = 0;
+		List	   *group = NIL;
+
+		for (; g < nordered && order[g].epoch == epoch; g++)
+			queue[tail++] = order[g].hash;
+
+		/* (the interval of a file holding the generation, if one does) */
+		for (int i = 0; i < m.nfiles && epoch > 0; i++)
+		{
+			if (m.files[i].epoch_lo > 0 && m.files[i].epoch_lo <= epoch &&
+				m.files[i].epoch_hi >= epoch)
+			{
+				epoch_lo = m.files[i].epoch_lo;
+				epoch_hi = m.files[i].epoch_hi;
+			}
+		}
+		while (head < tail)
+		{
+			ProllyHash	h = queue[head++];
+			ProllyHash	key;
+			bool		found;
+			RefQueue	rq;
+
+			CHECK_FOR_INTERRUPTS();
+			if (h.len == 0)
+				continue;
+			hash_key(&key, &h);
+			(void) hash_search(seen, &key, HASH_ENTER, &found);
+			if (found)
+				continue;
+			if (!unsettled_has(s, &key))
+			{
+				/* (settled, or not here at all: the walk stops) */
+				int			f = settled_file(s, &m, &key);
+
+				if (f < 0)
+					continue;
+				if (epoch == 0 || m.files[f].epoch_lo <= epoch_hi)
+				{
+					if (newest < 0 ||
+						m.files[f].epoch_lo > m.files[newest].epoch_lo)
+						newest = f;
+					continue;
+				}
+				/* (of a newer generation than the group's: settled with it) */
+			}
+			resetStringInfo(&data);
+			if (!journal_get(s, &h, &data))
+				continue;
+			group = lappend(group, memcpy(palloc(sizeof(ProllyHash)), &h,
+										  sizeof(ProllyHash)));
+			/* (the queue's room reused once half of it is taken) */
+			if (head > max / 2)
+			{
+				memmove(queue, queue + head, sizeof(ProllyHash) * (tail - head));
+				tail -= head;
+				head = 0;
+			}
+			rq.queue = &queue;
+			rq.tail = &tail;
+			rq.max = &max;
+			prolly_chunk_references(data.data, data.len, queue_ref, &rq);
+		}
+
+		/*
+		 * None listed: the generations of the newest settled chunk named
+		 * (what names the roots names those too); else of the oldest
+		 * settled file; else the next collection's.
+		 */
+		if (epoch == 0)
+		{
+			if (newest < 0)
+			{
+				for (int i = 0; i < m.nfiles; i++)
+				{
+					if (m.files[i].epoch_lo > 0 &&
+						(newest < 0 || m.files[i].epoch_lo < m.files[newest].epoch_lo))
+						newest = i;
+				}
+			}
+			if (newest >= 0)
+			{
+				epoch_lo = m.files[newest].epoch_lo;
+				epoch_hi = m.files[newest].epoch_hi;
+			}
+			else
+				epoch_lo = epoch_hi = m.gc_generation + 1;
+		}
+		foreach(lc, group)
+		{
+			ProllyHash	key;
+			SettledChunk *sc;
+
+			hash_key(&key, lfirst(lc));
+			sc = hash_search(ss.settling, &key, HASH_ENTER, NULL);
+			sc->epoch = epoch_lo;
+		}
+		ss.hashes = group;
+		ss.cur = list_head(group);
+		xb.resolve = settle_resolve;
+		xb.arg = &ss;
+		xb.lo = epoch_lo;
+		xb.hi = epoch_hi;
+		for (int i = 0; i < m.nfiles; i++)
+			keep[i] = true;
+		if (group != NIL)
+		{
+			write_table_file(s, &m, keep, MANIFEST_FILE_SETTLED, epoch_lo,
+							 epoch_hi, settle_next, &ss, false, NULL, false, 0,
+							 &xb);
+			/* (the manifest written names the file: the next adds to it) */
+			{
+				char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+
+				(void) read_manifest(dir, &m);
+				pfree(dir);
+				keep = repalloc(keep, sizeof(bool) * Max(m.nfiles, 1));
+			}
+		}
+		list_free_deep(group);
+	}
 	pfree(keep);
 	pfree(queue);
+	pfree(order);
 	pfree(data.data);
+	pfree(xb.chunk.data);
+	hash_destroy(listed);
+	hash_destroy(ss.settling);
 	hash_destroy(seen);
 }
 
@@ -7530,6 +7752,8 @@ typedef struct ConjoinSource
 	const Manifest *m;			/* the manifest conjoined in */
 	const bool *keep;			/* its files not conjoined */
 	TableFile **others;			/* and those, settled, opened (by file) */
+	TableFile  *listed_of;		/* the file listed is of */
+	HTAB	   *listed;			/* (listed_epoch()'s) */
 } ConjoinSource;
 
 static bool
@@ -7608,7 +7832,7 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
  * in.
  */
 static uint32
-conjoin_resolve(void *arg, const ProllyHash *target)
+conjoin_resolve(void *arg, const ProllyHash *target, bool *always)
 {
 	ConjoinSource *cs = arg;
 	ProllyHash	key;
@@ -7634,6 +7858,21 @@ conjoin_resolve(void *arg, const ProllyHash *target)
 		if (t != NULL &&
 			PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
 			return cs->m->files[i].epoch_lo;
+	}
+	/* (gone: what the file the chunk comes from listed it as, if it did) */
+	if (cs->cur != NULL)
+	{
+		TableFile  *t = lfirst(cs->cur);
+
+		if (t != cs->listed_of)
+		{
+			if (cs->listed)
+				hash_destroy(cs->listed);
+			cs->listed = NULL;
+			cs->listed_of = t;
+		}
+		return listed_epoch(t, &cs->listed, CurrentMemoryContext, &key,
+							always);
 	}
 	return 0;
 }
@@ -8494,6 +8733,7 @@ typedef struct GcFile
 	uint32		epoch_lo;		/* the generations its chunks copied are */
 	uint32		epoch_hi;		/* written in (0: not settled) */
 	int			group;			/* in gc->groups: the files written so */
+	HTAB	   *listed;			/* what its section lists (listed_epoch()) */
 } GcFile;
 
 /*
@@ -9221,6 +9461,40 @@ journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash)
 }
 
 static void
+journal_gc_listed(ProllyChunkGc *gc, int file, ProllyChunkListedVisit visit,
+				  void *arg)
+{
+	GcFile	   *f = &gc->files[file];
+	XrefSection x;
+
+	if (f->segment || f->t == NULL || !xrefs_read(f->t, &x))
+		return;
+	xrefs_visit(&x, 0, PG_UINT32_MAX, visit, arg);
+	xrefs_free(&x);
+}
+
+static int64
+journal_gc_find_in(ProllyChunkGc *gc, const ProllyHash *hash, uint32 epoch)
+{
+	ProllyHash	key;
+
+	hash_key(&key, hash);
+	for (int i = 0; i < gc->nfiles; i++)
+	{
+		GcFile	   *f = &gc->files[i];
+		int			at;
+
+		if (f->segment || !f->settled || epoch < f->epoch_lo ||
+			epoch > f->epoch_hi)
+			continue;
+		at = PROLLY_CALL(table_format(), locate, f->t->tf, &key);
+		if (at >= 0)
+			return f->first + at;
+	}
+	return -1;
+}
+
+static void
 journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out)
 {
 	GcFile	   *f = slot_file(gc, slot);
@@ -9545,6 +9819,7 @@ typedef struct GcCopy
 	bool		paced;			/* by the cost-based vacuum delay */
 	uint64	   *order;			/* the slots, file by file in offset order */
 	uint64		norder;
+	GcFile	   *src;			/* the file of the slot given last */
 	/* the window of a file last read: its bytes [start, start + buf.len) */
 	GcFile	   *window_file;
 	uint64		window_start;
@@ -9686,6 +9961,23 @@ gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
 	gcc->from.bytes = bytes;
 }
 
+/* Does the collected slot (of file f) hold the chunk hash? */
+static bool
+slot_holds(ProllyChunkGc *gc, GcFile *f, uint64 slot, const ProllyHash *hash)
+{
+	ProllyHash	key;
+
+	hash_key(&key, hash);
+	if (f->segment)
+	{
+		GcSlot	   *e = hash_search(gc->slots, &key, HASH_FIND, NULL);
+
+		return e != NULL && e->slot == slot;
+	}
+	return PROLLY_CALL(table_format(), locate, f->t->tf, &key) ==
+		(int) (slot - f->first);
+}
+
 /*
  * A chunk a collection copies names ref: one of the segments it keeps as
  * they are, for a logical slot, has it?  Then what it writes isn't
@@ -9722,6 +10014,7 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 		f = slot_file(gc, slot);
 		if (gcc->keep[f - gc->files])
 			continue;
+		gcc->src = f->segment ? NULL : f;
 		gc->copied[slot / 8] |= 1 << (slot % 8);
 		gc_read_windowed(gcc, slot, data);
 
@@ -9738,7 +10031,7 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 		PROLLY_CALL(gcc->hash, update, ctx, (const uint8 *) gcc->chunk.data,
 					gcc->chunk.len);
 		PROLLY_CALL(gcc->hash, finish, ctx, hash);
-		if (journal_gc_find(gc, hash) != (int64) slot)
+		if (!slot_holds(gc, f, slot, hash))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("chunk in file \"%s\" doesn't match its hash",
@@ -9765,23 +10058,18 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
  * not marked isn't kept (0); one not collected is in a settled file's.
  */
 static uint32
-gc_resolve(void *arg, const ProllyHash *target)
+gc_resolve(void *arg, const ProllyHash *target, bool *always)
 {
 	GcCopy	   *gcc = arg;
 	ProllyChunkGc *gc = gcc->gc;
 	int64		slot = journal_gc_find(gc, target);
 	ProllyHash	key;
 
-	if (slot >= 0)
-	{
-		GcFile	   *f = slot_file(gc, (uint64) slot);
+	GcFile	   *f = slot >= 0 ? slot_file(gc, (uint64) slot) : NULL;
 
-		if (gcc->keep[f - gc->files])
-			return f->epoch_lo;
-		if (!marked(gcc->marks, (uint64) slot))
-			return 0;
+	if (f != NULL &&
+		(gcc->keep[f - gc->files] || marked(gcc->marks, (uint64) slot)))
 		return f->epoch_lo;
-	}
 	hash_key(&key, target);
 	for (int i = 0; i < gc->nothers; i++)
 	{
@@ -9792,7 +10080,20 @@ gc_resolve(void *arg, const ProllyHash *target)
 						&offset, &len))
 			return gc->others_lo[i];
 	}
-	return 0;
+
+	/*
+	 * Collected, not marked, and named by a chunk marked: a parent the
+	 * history horizon cuts, dropped now.  Listed by its generation all the
+	 * same, so a repair puts it back there, and a retire finds it named.
+	 */
+	if (f != NULL)
+	{
+		*always = true;
+		return f->epoch_lo;
+	}
+	/* (gone: what the file the chunk comes from listed it as, if it did) */
+	return gcc->src ? listed_epoch(gcc->src->t, &gcc->src->listed, gc->cxt,
+								   &key, always) : 0;
 }
 
 /* The groups of the files collected, made once, oldest first. */
@@ -10637,6 +10938,8 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.epochs = journal_epochs,
 	.settle = journal_settle,
 	.verify_generations = journal_verify_generations,
+	.gc_listed = journal_gc_listed,
+	.gc_find_in = journal_gc_find_in,
 	.shmem_size = journal_shmem_size,
 	.shmem_init = journal_shmem_init,
 	.copy_database = journal_copy_database,

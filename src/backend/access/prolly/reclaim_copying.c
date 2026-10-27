@@ -569,6 +569,49 @@ mark_from_kept(int file, uint64 first, uint64 nslots, bool settled,
 	drain(k->mk);
 }
 
+/*
+ * What a settled file kept whole lists in older generations: the copy of
+ * the generation listed is kept, whichever copy marking took (one file's
+ * list must stay true of what is there), but a boundary commit's severed
+ * parent (a cut chunk's, as the leaf naming it says).
+ */
+static void
+mark_listed(const ProllyHash *target, const ProllyHash *source, uint32 epoch,
+			void *arg)
+{
+	Mark	   *mk = arg;
+	int64		slot;
+
+	if (source != NULL)
+	{
+		CutChunk   *cut = cut_of_hash(mk, source);
+
+		if (cut != NULL)
+		{
+			ListCell   *lc;
+
+			foreach(lc, cut->parents)
+				if (same_hash(lfirst(lc), target))
+					return;
+		}
+	}
+	slot = PROLLY_CALL(mk->cs, gc_find_in, mk->gc, target, epoch);
+	if (slot >= 0)
+		mark_slot(mk, (uint64) slot);
+}
+
+static void
+mark_from_listed(int file, uint64 first, uint64 nslots, bool settled,
+				 uint64 size, void *arg)
+{
+	Keep	   *k = arg;
+
+	if (!k->keep[file] || !settled)
+		return;
+	PROLLY_CALL(k->mk->cs, gc_listed, k->mk->gc, file, mark_listed, k->mk);
+	drain(k->mk);
+}
+
 /* (a collection's reading of the standbys' positions, ended by an error) */
 static void
 horizon_read_end(int code, Datum arg)
@@ -698,6 +741,8 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 				if (k.changed)
 					PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
 			}
+			if (PROLLY_HAS(cs, gc_listed))
+				PROLLY_CALL(cs, gc_files, mk.gc, mark_from_listed, &k);
 		}
 
 		/* copied, before the window */
