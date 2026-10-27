@@ -233,6 +233,12 @@ extern int64 prolly_window_database_size(const char *name);
  */
 extern void prolly_window_check_absent(const ProllyHash *id);
 
+/*
+ * Is any history severed (does the horizon hold a fragment)?  Readers that
+ * take a commit's recorded counts of its history for its listing's ask.
+ */
+extern bool prolly_window_severed(void);
+
 /* Is commit id past the history horizon? */
 extern bool prolly_window_archived(const ProllyHash *id);
 

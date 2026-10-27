@@ -3388,7 +3388,7 @@ fold_caches_relcache(Datum arg, Oid relid)
 }
 
 static void
-fold_caches_syscache(Datum arg, int cacheid, uint32 hashvalue)
+fold_caches_syscache(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	catalog_epoch++;
 	forget_descriptions();
@@ -17732,7 +17732,7 @@ static int	owned_nchanged_schemas = 0;
  * again)
  */
 static void
-owned_forget(Datum arg, int cacheid, uint32 hashvalue)
+owned_forget(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	owned_routines_known = false;
 	if (cacheid == PROCOID)
@@ -17833,10 +17833,12 @@ copy_name_parts(OwnedObject *c, const OwnedObject *o)
 {
 	c->ntypes = o->ntypes;
 	c->types = MemoryContextAlloc(owned_cxt, sizeof(Oid) * Max(1, o->ntypes));
-	memcpy(c->types, o->types, sizeof(Oid) * o->ntypes);
+	if (o->ntypes > 0)
+		memcpy(c->types, o->types, sizeof(Oid) * o->ntypes);
 	c->nschemas = o->nschemas;
 	c->schemas = MemoryContextAlloc(owned_cxt, sizeof(Oid) * Max(1, o->nschemas));
-	memcpy(c->schemas, o->schemas, sizeof(Oid) * o->nschemas);
+	if (o->nschemas > 0)
+		memcpy(c->schemas, o->schemas, sizeof(Oid) * o->nschemas);
 }
 
 /*

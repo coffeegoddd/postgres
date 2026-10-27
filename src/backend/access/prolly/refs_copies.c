@@ -1587,6 +1587,7 @@ publish_scoped(void)
 {
 	if (!scoped)
 		return;
+	INJECTION_POINT("prolly-refs-publishing", NULL);
 	scoped_save();
 	flush_scoped();
 	for (;;)
@@ -1909,8 +1910,9 @@ branch_entry_tag(char tag)
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), not having held every
- * ref nor begun to commit?
+ * the commit, which no other transaction writes), or a commit's count
+ * (PROLLY_REFS_SPACE_COMMITS: whoever writes it writes the same), not
+ * having held every ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -1922,6 +1924,9 @@ scoped_key(const char *key, int keylen)
 		return false;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
 		(keylen > 1 && key[0] == TAG_OWNED))
+		return true;
+	/* (a commit's count of what it reaches: the same whoever writes it) */
+	if (keylen > 2 && key[0] == TAG_SIDE && key[1] == PROLLY_REFS_SPACE_COMMITS)
 		return true;
 	name = entry_branch(key, keylen, &len);
 	return name != NULL && branch_held(name, len);
@@ -2350,6 +2355,8 @@ baseline_index_set(const char *name, const ProllyNodeRef *was,
 	pfree(key.data);
 }
 
+static void commits_note(const ProllyHash *commit);
+
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
  * that moved it (head_moved_unseen()).  A branch that gets its first head
@@ -2410,7 +2417,10 @@ branch_set_head(const char *name, const ProllyHash *head)
 	pfree(key.data);
 	pfree(v.data);
 	if (head)
+	{
 		pgstat_count_prolly(PGSTAT_PROLLY_HEAD_MOVES, 1);
+		commits_note(head);
+	}
 }
 
 /*
@@ -8520,7 +8530,7 @@ static char *owned_text = NULL;
 static bool owned_callback = false;
 
 static void
-owned_role_renamed(Datum arg, int cacheid, uint32 hashvalue)
+owned_role_renamed(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	owned_generation = 0;
 }
@@ -13698,6 +13708,94 @@ copies_side_put(char space, const ProllyKey *key, const ProllyValue *value)
 	}
 	refs_put(k.data, k.len, value ? &v : NULL);
 	pfree(k.data);
+}
+
+/*
+ * The commits a commit reaches (PROLLY_REFS_SPACE_COMMITS), as the refs
+ * keep them; false if they keep none for it.
+ */
+static bool
+commits_get(const ProllyHash *commit, int64 *n)
+{
+	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
+	StringInfoData v;
+	uint64		c;
+	bool		found;
+
+	initStringInfo(&v);
+	found = copies_side_get(PROLLY_REFS_SPACE_COMMITS, &k, &v) &&
+		get_uint64(&v, &c) && c > 0 && c <= PG_INT64_MAX;
+	pfree(v.data);
+	if (found)
+		*n = (int64) c;
+	return found;
+}
+
+static void
+commits_put(const ProllyHash *commit, int64 n)
+{
+	ProllyKey	k = {(const uint8 *) commit->bytes, commit->len};
+	StringInfoData v;
+	ProllyValue val;
+
+	initStringInfo(&v);
+	put_uint64(&v, (uint64) n);
+	val.data = (const uint8 *) v.data;
+	val.len = v.len;
+	copies_side_put(PROLLY_REFS_SPACE_COMMITS, &k, &val);
+	pfree(v.data);
+}
+
+/*
+ * A head moved to commit (the refs held): the commits it reaches kept, if
+ * not kept already.  From its parents': for one whose first parent's are
+ * missing too (history made before they were kept, or received), down
+ * its first parents to one kept (or a root), each found on the way kept,
+ * once; a merge's other parents by prolly_history_commits()'s walk.  A
+ * commit that can't be read leaves those above it without.
+ */
+static void
+commits_note(const ProllyHash *commit)
+{
+	MemoryContext cxt;
+	MemoryContext old;
+	List	   *chain = NIL;
+	ProllyHash	cur = *commit;
+	int64		below = 0;
+	int64		n;
+
+	if (commits_get(commit, &n))
+		return;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit counts",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	for (;;)
+	{
+		ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo));
+
+		CHECK_FOR_INTERRUPTS();
+		if (!copies_commit_get(&cur, info))
+		{
+			chain = NIL;		/* (nothing above it can be counted) */
+			break;
+		}
+		chain = lcons(info, chain);
+		if (info->nparents == 0)
+			break;
+		if (commits_get(&info->parents[0], &below))
+			break;
+		cur = info->parents[0];
+	}
+	foreach_ptr(ProllyCommitInfo, info, chain)
+	{
+		if (!prolly_history_commits(info->parents, info->nparents, below,
+									copies_lookup_commit, NULL, &n))
+			break;
+		commits_put(&info->id, n);
+		below = n;
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 typedef bool (*SideVisit) (const ProllyKey *key, const ProllyValue *value,

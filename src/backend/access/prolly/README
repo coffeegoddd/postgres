@@ -704,6 +704,34 @@ after it, is done whole, unless it is at the array's end (an element
 appended, the last one removed).  Folded format 22 is the first whose rows hold JSON
 trees.
 
+A collection of the chunk store never frees a chunk a running
+transaction may still name.  A transaction may build on the root as it
+read it while other transactions move the root on: a commit's refs
+changes are built on the refs as it last read them, and the trees it
+rebuilds them with name chunks that root reaches, which may be garbage by
+the collection's seal.  So the collection, once it has sealed the journal
+(and forgotten the folds the refs know of), waits for every transaction
+running then that has used the store to end before it marks what is new
+(each notes so in shared memory at its first use, before it reads the
+root); each transaction still running read the root as of the seal or a
+later one.  A move of the journal frees nothing, and waits for none.  A transaction that
+finds a chunk stored and doesn't write it again (a tree's node that the
+store has, as a refs leaf is again once a branch made since is deleted;
+a pending chunk the store holds) names it without appending it: while a
+collection runs, the chunk store adds each such chunk the collection
+collects to its keep set, so it is kept.  The collection lets the table
+file writers' lock go while it waits, and takes it again after, naming
+beside its own the table files added meanwhile (anything else changed,
+and it fails, to be retried): a transfer begun meanwhile adds its files,
+what it found stored kept as above.  A transaction the collection waits
+for is refused a table file at once (a serialization failure), until the
+swap: what it found stored it found before the collection kept such
+chunks.  A conjoin skips while a collection runs.  pg_stat_prolly's
+gc_collections counts the collections; one that waits for a long
+transaction delays its swap, not the transaction nor other transfers.  A
+keep set that overflows (more chunks found or kept than it holds) has the
+collection keep everything, which it logs.
+
 A hash pointer a read hands out (a long value of history, read or not)
 names chunks a collection may drop: the chunk store's keep() is told of
 it, and a collection keeps the chunk or waits for the transaction, read
@@ -2022,6 +2050,20 @@ is kept from collection for its transaction (the chunk store's keep()):
 a history drop and a full collection in another session meanwhile don't
 free what it has yet to read.  The scan gives the entry's whole row too
 (dolt_log l ... count(l), l IS NOT NULL), made of its columns.
+
+The refs keep, for each commit a head moves to, the commits it reaches,
+itself included (the side space PROLLY_REFS_SPACE_COMMITS, keyed by commit
+id, prolly_history_commits()), as Dolt's commit closure counts them: one
+more than its first parent's, and for a merge, more by those its other
+parents reach that the first doesn't, found by heights highest first.
+They are derived, not part of the commit (its id is its content's, as
+before), and transfers don't send them: a head moved to a commit whose
+first parents have none (history made before, or received) keeps them
+down to one that has, once.  So count(*) of dolt_log(ref) alone (no
+quals, GROUP BY or HAVING) is planned as a scan giving that count
+(prolly_log_count.c), reading no history.  A commit the refs keep none
+for, or a history horizon, which the log stops at, has the log counted
+as it gives its rows.
 
 Remotes
 -------

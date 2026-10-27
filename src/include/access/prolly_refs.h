@@ -1112,6 +1112,28 @@ extern int	prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
  * each commit's height is found once however many are asked for, and
  * lookup is asked once for each commit it finds one of.
  */
+/*
+ * The commits a commit with these parents reaches, itself included, the
+ * first parent reaching first_commits: one more, and for a merge, more by
+ * those its other parents reach that the first doesn't, found by heights.
+ * False if that can't be known: a commit the walk needs can't be read or
+ * records no height.
+ */
+extern bool prolly_history_commits(const ProllyHash *parents, int nparents,
+								   int64 first_commits,
+								   ProllyCommitLookup lookup, void *lookup_arg,
+								   int64 *commits);
+
+/*
+ * The refs' side space (side_get()) of the commits each commit reaches,
+ * itself included (prolly_history_commits()), keyed by the commit id's
+ * bytes, 8 bytes big-endian: what count(*) of its dolt_log() gives while
+ * no history is severed.  Derived, not part of any commit: the refs fill
+ * it as a head moves to a commit (from its parents', or down its first
+ * parents to one they have), and a commit missing has its log counted.
+ */
+#define PROLLY_REFS_SPACE_COMMITS	'n'
+
 extern struct HTAB *prolly_history_heights(void);
 extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,
 								   ProllyCommitLookup lookup, void *lookup_arg);
