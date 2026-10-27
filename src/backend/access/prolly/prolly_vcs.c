@@ -25,12 +25,15 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "catalog/pg_type_d.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 static text *
@@ -239,4 +242,158 @@ prolly_fold_rewritten(Oid relid)
 	PG_END_TRY();
 	AtEOXact_GUC(true, save_nestlevel);
 	return true;
+}
+
+/* A log's name: a branch, or "remotes/<remote>/<branch>" (its remote's). */
+typedef struct LogName
+{
+	const char *ref;
+	char	   *remote;			/* the longest remote ref begins with */
+} LogName;
+
+static void
+match_remote(const char *name, const char *url, void *arg)
+{
+	LogName    *ln = arg;
+	size_t		len = strlen(name);
+
+	if (strncmp(ln->ref, name, len) == 0 && ln->ref[len] == '/' &&
+		(ln->remote == NULL || strlen(ln->remote) < len))
+		ln->remote = pstrdup(name);
+}
+
+static void
+log_name(const ProllyRefsRoutine *refs, const char *ref, const char **name,
+		 const char **branch)
+{
+	if (!PROLLY_HAS(refs, head_at))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" keeps no head logs",
+						refs->info.name)));
+	*name = ref;
+	*branch = NULL;
+
+	/*
+	 * ("remotes/" names a remote-tracking branch, of a remote that must
+	 * exist, as a branch of that name would be one no fetch makes; it may
+	 * have no log yet)
+	 */
+	if (strncmp(ref, "remotes/", 8) == 0)
+	{
+		LogName		ln = {ref + 8, NULL};
+
+		PROLLY_CALL(refs, remotes, match_remote, &ln);
+		if (ln.remote == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("no remote is named by \"%s\"", ref),
+					 errhint("A remote-tracking branch is \"remotes/<remote>/<branch>\".")));
+		*name = ln.remote;
+		*branch = ref + 8 + strlen(ln.remote) + 1;
+		return;
+	}
+	{
+		ProllyBranchId id;
+
+		if (!PROLLY_CALL(refs, branch_lookup, ref, &id))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch \"%s\" does not exist", ref)));
+	}
+}
+
+static bool
+head_move_row(const ProllyHeadMove *m, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	values[0] = Int64GetDatum(m->seq);
+	values[1] = TimestampTzGetDatum(m->moved_at);
+	values[2] = PointerGetDatum(hash_to_text(&m->commit));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	return true;
+}
+
+static Datum
+head_log(FunctionCallInfo fcinfo, TimestampTz from, TimestampTz to,
+		 bool backward)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	char	   *ref;
+	const char *name;
+	const char *branch;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a head log's ref can't be null")));
+	ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	prolly_database_components(&dc);
+	log_name(dc.refs, ref, &name, &branch);
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(dc.refs, head_moves, name, branch, from, to,
+				backward ? BackwardScanDirection : ForwardScanDirection,
+				head_move_row, rsinfo);
+	return (Datum) 0;
+}
+
+/*
+ * prolly_head_log(ref text)
+ *	returns setof (seq bigint, moved_at timestamptz, commit_hash text)
+ *
+ * A branch's head log (ref "remotes/<remote>/<branch>": a remote-tracking
+ * branch's): each move of its head, in order, with when it was made and
+ * the commit it moved to.  A move's date is when it was made in its
+ * transaction, not when that committed.  An unknown branch or remote is
+ * an error.
+ */
+Datum
+prolly_head_log(PG_FUNCTION_ARGS)
+{
+	return head_log(fcinfo, DT_NOBEGIN, DT_NOEND, false);
+}
+
+/*
+ * prolly_head_log_range(ref text, from_time timestamptz,
+ *						 to_time timestamptz, backward bool)
+ *	returns setof (seq bigint, moved_at timestamptz, commit_hash text)
+ *
+ * The moves of ref's head log dated from_time..to_time (NULL: unbounded),
+ * newest first if backward (NULL: not).  ref can't be NULL.
+ */
+Datum
+prolly_head_log_range(PG_FUNCTION_ARGS)
+{
+	return head_log(fcinfo,
+					PG_ARGISNULL(1) ? DT_NOBEGIN : PG_GETARG_TIMESTAMPTZ(1),
+					PG_ARGISNULL(2) ? DT_NOEND : PG_GETARG_TIMESTAMPTZ(2),
+					!PG_ARGISNULL(3) && PG_GETARG_BOOL(3));
+}
+
+/*
+ * prolly_head_at(ref text, at timestamptz) returns text
+ *
+ * The commit ref's head was at at time at (its log's move last made at or
+ * before it; a move dated when it was made in its transaction); NULL if it
+ * had none then.  An unknown branch or remote is an error.
+ */
+Datum
+prolly_head_at(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	TimestampTz at = PG_GETARG_TIMESTAMPTZ(1);
+	const char *name;
+	const char *branch;
+	ProllyHeadMove m;
+
+	prolly_database_components(&dc);
+	log_name(dc.refs, ref, &name, &branch);
+	if (!PROLLY_CALL(dc.refs, head_at, name, branch, at, &m))
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(hash_to_text(&m.commit));
 }
