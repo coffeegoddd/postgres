@@ -1,11 +1,13 @@
 -- A full collection: every file collected, a settled file whose garbage
 -- is more than half rewritten, the rest kept whole.  What a default
 -- collection keeps (a branch deleted after its chunks settled) a full one
--- frees.
+-- frees.  (Its files are small: kept whole by their share of garbage
+-- whatever their size, prolly.gc_rewrite_below 0.)
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 CREATE DATABASE gc_full_db;
+ALTER DATABASE gc_full_db SET prolly.gc_rewrite_below = 0;
 \c gc_full_db
 CREATE EXTENSION test_prolly;
 -- err(q): q's error, its hashes masked
@@ -350,6 +352,7 @@ SELECT message FROM dolt_log('main');
 -- stays closed under what its chunks name.
 \c postgres
 CREATE DATABASE gc_closure_db;
+ALTER DATABASE gc_closure_db SET prolly.gc_rewrite_below = 0;
 \c gc_closure_db
 CREATE EXTENSION test_prolly;
 SELECT test_chunk_put('h') AS h \gset
@@ -415,6 +418,7 @@ SELECT test_chunk_has(:'g') AS g_kept_with_its_file, test_chunk_has(:'h') AS h_i
 -- through what kept file A's garbage names, so it is kept whole too.
 \c postgres
 CREATE DATABASE gc_again_db;
+ALTER DATABASE gc_again_db SET prolly.gc_rewrite_below = 0;
 \c gc_again_db
 CREATE EXTENSION test_prolly;
 SELECT array_agg(test_chunk_put(convert_to('b ' || g, 'UTF8'))) AS bs

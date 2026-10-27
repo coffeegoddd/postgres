@@ -769,6 +769,15 @@
   boot_val => 'true',
 },
 
+{ name => 'debug_prolly_settle_epoch', type => 'int', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Settles what a prolly history repair brings back in this generation, whatever its fragment records, and lists nothing it names that is not here, for testing what relies on settling it right (0: off).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_settle_epoch',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'debug_prolly_verify_fold_caches', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Folds again each prolly working set taken from an earlier fold, and works out again what a fold takes from its caches, and reports an error if they differ, for testing.',
   flags => 'GUC_NOT_IN_SAMPLE',

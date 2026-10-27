@@ -82,11 +82,21 @@ typedef struct ProllyTransferRoutine
 								  ProllyRemote *remote,
 								  const ProllyHash *roots, int nroots,
 								  const ProllyHash *trees, int ntrees);
+
+	/*
+	 * Optional: send() of what the commits reach but severed commits' data
+	 * (past the history horizon: archived elsewhere, or deleted), whose
+	 * commit objects move without it.  For a sever archiving its fragment:
+	 * the archive holds what that fragment reaches, never an older
+	 * fragment's data, so a repair from it restores the fragments it holds.
+	 */
+	uint64		(*send_kept) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+							  const ProllyHash *commits, int ncommits);
 } ProllyTransferRoutine;
 
 #define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send", "clone", \
-	"receive_until", "receive_trees"
+	"receive_until", "receive_trees", "send_kept"
 #define PROLLY_TRANSFER_FIRST_CALLBACK receive
-#define PROLLY_TRANSFER_LAST_CALLBACK receive_trees
+#define PROLLY_TRANSFER_LAST_CALLBACK send_kept
 
 #endif							/* PROLLY_TRANSFER_H */

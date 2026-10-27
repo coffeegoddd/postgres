@@ -247,6 +247,14 @@ extern bool prolly_window_severed(void);
 extern bool prolly_window_archived(const ProllyHash *id);
 
 /*
+ * Is the reference from chunk source to target one the history horizon
+ * cut: source a severed commit, target its root's or its dependencies'
+ * tree?  (arg unused: a ProllyChunkCutEdge.)
+ */
+extern bool prolly_window_cut_edge(void *arg, const ProllyHash *source,
+								   const ProllyHash *target);
+
+/*
  * For a reader that found a tree missing from the store: an error, if it
  * is a severed commit's root or dependencies' tree, that the commit is
  * past the history horizon, saying how to repair it; nothing otherwise.

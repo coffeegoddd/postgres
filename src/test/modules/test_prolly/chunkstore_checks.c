@@ -18,6 +18,7 @@
 #include "access/tableam.h"
 #include "common/int.h"
 #include "access/xact.h"
+#include "access/prolly_window.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_changelog.h"
 #include "access/prolly_config.h"
@@ -549,8 +550,8 @@ static void
 generation_row(const ProllyChunkGeneration *g, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[7];
-	bool		nulls[7] = {0};
+	Datum		values[8];
+	bool		nulls[8] = {0};
 
 	values[0] = CStringGetTextDatum(g->name);
 	values[1] = Int32GetDatum((int32) g->nchunks);
@@ -559,6 +560,7 @@ generation_row(const ProllyChunkGeneration *g, void *arg)
 	values[4] = Int64GetDatum((int64) g->epoch_hi);
 	values[5] = Int64GetDatum((int64) g->garbage);
 	values[6] = Int64GetDatum(g->xrefs);
+	values[7] = BoolGetDatum(g->repaired);
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
@@ -600,7 +602,23 @@ PG_FUNCTION_INFO_V1(test_chunk_verify_generations);
 Datum
 test_chunk_verify_generations(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(PROLLY_CALL(cs(), verify_generations, store()));
+	bool		cut = PG_NARGS() < 1 || PG_GETARG_BOOL(0);
+
+	PG_RETURN_INT64(PROLLY_CALL(cs(), verify_generations, store(),
+								cut ? prolly_window_cut_edge : NULL, NULL));
+}
+
+/* Is the reference from source to target one the history horizon cut? */
+PG_FUNCTION_INFO_V1(test_window_cut_edge);
+Datum
+test_window_cut_edge(PG_FUNCTION_ARGS)
+{
+	ProllyHash	source;
+	ProllyHash	target;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &source);
+	text_hash(PG_GETARG_TEXT_PP(1), &target);
+	PG_RETURN_BOOL(prolly_window_cut_edge(NULL, &source, &target));
 }
 
 PG_FUNCTION_INFO_V1(test_chunk_table_files);
@@ -2817,6 +2835,33 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	values[1] = Int64GetDatum((int64) r.chunks_freed);
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
 	values[3] = Int64GetDatum((int64) r.window_usec);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_retire);
+Datum
+test_chunk_retire(PG_FUNCTION_ARGS)
+{
+	int64		lo = PG_GETARG_INT64(0);
+	int64		hi = PG_GETARG_INT64(1);
+	ProllyDatabaseComponents dc;
+	ProllyGcResult r;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (lo <= 0 || hi < lo || hi > PG_UINT32_MAX)
+		elog(ERROR, "generations %lld to %lld can't be retired",
+			 (long long) lo, (long long) hi);
+	prolly_database_components(&dc);
+	(void) PROLLY_CALL(dc.reclamation, retire, (uint32) lo, (uint32) hi,
+					   false, &r);
+	values[0] = Int64GetDatum((int64) r.chunks_kept);
+	values[1] = Int64GetDatum((int64) r.chunks_freed);
+	values[2] = Int64GetDatum((int64) r.bytes_freed);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

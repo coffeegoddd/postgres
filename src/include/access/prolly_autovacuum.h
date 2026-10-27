@@ -27,6 +27,7 @@ extern PGDLLIMPORT double prolly_autofold_threshold;
 extern PGDLLIMPORT int prolly_release_max_per_pass;
 /* prolly.gc_file_size (kB): how large a collection's files grow */
 extern PGDLLIMPORT int prolly_gc_file_size;
+extern PGDLLIMPORT int prolly_gc_rewrite_below;
 /*
  * prolly.log_copied_bytes: a store's copies of its own chunks WAL-log their
  * bytes, not where they come from (for debugging, and comparing the two)

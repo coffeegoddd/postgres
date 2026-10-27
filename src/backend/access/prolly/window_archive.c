@@ -3234,8 +3234,16 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 		StringInfoData format;
 		ReadBack	rb;
 
-		sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
-								   f->ntops);
+		/*
+		 * (what the fragment reaches, but an older fragment's data: that
+		 * is archived elsewhere, or was deleted, and may be gone here)
+		 */
+		if (PROLLY_HAS(dc.transfer, send_kept))
+			sent = (int64) PROLLY_CALL(dc.transfer, send_kept, rr, remote,
+									   f->tops, f->ntops);
+		else
+			sent = (int64) PROLLY_CALL(dc.transfer, send, rr, remote, f->tops,
+									   f->ntops);
 		/*
 		 * (named first, so the archive keeps what it was sent, its own
 		 * collections too, while it is read back)
@@ -4533,10 +4541,8 @@ archive_repair(const char *source, int nfragments)
 			/*
 			 * Verified, settled: the commits, kept in settled files, name
 			 * the data received, and a default collection doesn't read
-			 * settled files.  Walking from the fragment's tops would stop
-			 * at once, since they are those commits, still here.  Each
-			 * tree goes back to the generation its commit's file lists it
-			 * by, or the file's own.
+			 * settled files.  Each tree goes back to the generation its
+			 * commit's file lists it by.
 			 */
 			if (PROLLY_HAS(tree_env.chunk_store, settle))
 			{
@@ -4549,6 +4555,7 @@ archive_repair(const char *source, int nfragments)
 			pfree(data_roots);
 			pfree(namers);
 		}
+
 
 		/*
 		 * (its edges and record let go of: the boundary keeps its parents;
@@ -4623,6 +4630,21 @@ prolly_window_archived(const ProllyHash *id)
 	if (c.history_window == NULL || !PROLLY_HAS(c.history_window, archived))
 		return false;
 	return PROLLY_CALL(c.history_window, archived, id);
+}
+
+bool
+prolly_window_cut_edge(void *arg, const ProllyHash *source,
+					   const ProllyHash *target)
+{
+	ProllyDatabaseComponents c;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&c);
+	if (!prolly_window_archived(source) ||
+		!PROLLY_CALL(c.refs, commit_get, source, &info))
+		return false;
+	return same_hash(&info.root.hash, target) ||
+		(info.has_dependencies && same_hash(&info.dependencies.hash, target));
 }
 
 static void

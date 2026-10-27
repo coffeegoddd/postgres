@@ -382,15 +382,21 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- generations (or not settled) its chunks name.
 CREATE FUNCTION test_chunk_generations(OUT name text, OUT chunks int,
 	OUT settled boolean, OUT epoch_lo bigint, OUT epoch_hi bigint,
-	OUT garbage bigint, OUT xrefs bigint)
+	OUT garbage bigint, OUT xrefs bigint, OUT repaired boolean)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- Check the settled files' generations: whatever their chunks name is in
 -- the same generations or older ones, and then listed in the file's
 -- section (an error if not).  Returns the chunks checked.
-CREATE FUNCTION test_chunk_verify_generations()
+CREATE FUNCTION test_chunk_verify_generations(cut_edges boolean DEFAULT true)
 RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Whether the history horizon cut the reference from source to target:
+-- source a severed commit, target its root's or dependencies' tree.
+CREATE FUNCTION test_window_cut_edge(source text, target text)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The collections that settled chunks the settled files still hold.
@@ -755,6 +761,13 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Retire the chunk store's generations lo to hi: a collection of the
+-- journal, the files not settled, and the settled files of those
+-- generations, marking only what it collects.
+CREATE FUNCTION test_chunk_retire(lo int8, hi int8, OUT kept int8,
+	OUT freed int8, OUT bytes_freed int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The oldest position a logical slot of the current database, or one of a

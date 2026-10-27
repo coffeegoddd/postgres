@@ -55,11 +55,20 @@ typedef struct ProllyReclaimRoutine
 
 	/* Move what was written since the last collection, freeing nothing. */
 	void		(*move) (ProllyGcResult *result);
+
+	/*
+	 * Optional: retire the store's generations lo to hi, freeing what of
+	 * their settled files nothing names, at the cost of those files, what
+	 * was written since the last collection, and what the other settled
+	 * files name in them; false if if_free and another collection runs.
+	 */
+	bool		(*retire) (uint32 lo, uint32 hi, bool if_free,
+						   ProllyGcResult *result);
 } ProllyReclaimRoutine;
 
 #define PROLLY_RECLAIM_CALLBACK_NAMES \
-	"collect", "move"
+	"collect", "move", "retire"
 #define PROLLY_RECLAIM_FIRST_CALLBACK collect
-#define PROLLY_RECLAIM_LAST_CALLBACK move
+#define PROLLY_RECLAIM_LAST_CALLBACK retire
 
 #endif							/* PROLLY_RECLAIM_H */
