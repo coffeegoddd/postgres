@@ -29,6 +29,28 @@ CREATE FUNCTION pg_temp.note(step text) RETURNS bool LANGUAGE sql AS $$
 	SELECT true
 $$;
 \set diverged false
+-- (the chunks the collection a step made kept: those a file it writes
+-- holds)
+CREATE FUNCTION pg_temp.kept_by(step text) RETURNS int8 LANGUAGE sql AS $$
+	SELECT (s.counts ->> 'gc_chunks_kept')::int8 -
+		coalesce((p.counts ->> 'gc_chunks_kept')::int8, 0)
+	FROM steps s JOIN steps p ON p.n = s.n - 1 WHERE s.step = kept_by.step
+$$;
+-- (the store's files by name, each holding as many chunks as the
+-- collection that wrote it kept: the default one, the full one, the
+-- second, the third.  How many depends on where chunk boundaries fall,
+-- which move with the transaction ids and commit hashes the refs hold
+-- (#1020), so they are measured, not fixed.)
+CREATE FUNCTION pg_temp.files() RETURNS TABLE (name text, as_kept bool, settled bool)
+LANGUAGE sql AS $$
+	SELECT f.name, f.chunks = pg_temp.kept_by(CASE f.name
+			WHEN 'prolly_table_0000000000000004' THEN 'default collection'
+			WHEN 'prolly_table_0000000000000006' THEN 'full collection'
+			WHEN 'prolly_table_0000000000000008' THEN 'gc 2'
+			WHEN 'prolly_table_000000000000000a' THEN 'gc 3' END),
+		f.settled
+	FROM test_chunk_table_files() f ORDER BY f.name
+$$;
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('start') AS _n \gset
 
@@ -58,14 +80,32 @@ SELECT dolt_gc();
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('gc 1') AS _n \gset
 SELECT count(*) AS files, bool_and(settled) AS settled FROM test_chunk_table_files();
+-- (what the refs keep alive before the delete)
+CREATE TEMP TABLE live_before AS SELECT DISTINCT n FROM test_refs_walk_nodes() n;
 SELECT dolt_branch('-D', 'big');
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('branch -D big') AS _n \gset
 
--- A default collection keeps it: it is settled.
+-- A default collection keeps it: it is settled.  It reads only the chunks
+-- appended since the first collection settled the rest, the delete's:
+-- it keeps those the refs reach now, the delete's new refs nodes, and
+-- frees the others, refs nodes the delete wrote and replaced again as it
+-- went (each entry it removes rewrites the path to it).  How many of each
+-- depends on where the refs tree's chunk boundaries fall, which move with
+-- the transaction ids and commit hashes its entries hold, so they are
+-- measured, not fixed (#1020): those reached now and not before, and the
+-- chunks the delete appended.
+SELECT count(*) AS new_live FROM test_refs_walk_nodes() n
+WHERE n NOT IN (SELECT n FROM live_before) \gset
+SELECT (a.counts ->> 'chunks_appended')::int - (b.counts ->> 'chunks_appended')::int
+	AS appended
+FROM steps a, steps b WHERE a.step = 'branch -D big' AND b.step = 'gc 1' \gset
 SELECT kept, freed FROM test_chunk_gc(false) \gset gc_
-SELECT :gc_kept AS kept, :gc_freed AS freed;
-SELECT :'diverged'::bool OR :gc_freed <> 14 AS diverged \gset
+SELECT :gc_kept = :new_live AS kept_the_new_refs,
+	   :gc_freed = :appended - :new_live AS freed_the_rest,
+	   :gc_freed > 0 AS freed_some;
+SELECT :'diverged'::bool OR :gc_kept <> :new_live OR
+	:gc_freed <> :appended - :new_live AS diverged \gset
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('default collection') AS _n \gset
 SELECT test_chunk_has(:'big_head') AS big_head;
@@ -109,15 +149,15 @@ SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('gc 3') AS _n \gset
 -- (Which files it keeps, by name: the mostly live ones kept whole, none
 -- rewritten, the one wholly garbage gone.)
-SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
-SELECT :'diverged'::bool OR coalesce((SELECT chunks <> 8 FROM test_chunk_table_files()
-	WHERE name = 'prolly_table_000000000000000a'), true) AS diverged \gset
+SELECT * FROM pg_temp.files();
+SELECT :'diverged'::bool OR NOT (SELECT bool_and(as_kept) FROM pg_temp.files())
+	AS diverged \gset
 SELECT freed > 0 AS freed FROM test_chunk_gc(true);
 SELECT pg_stat_force_next_flush() AS _f \gset
 SELECT pg_temp.note('full collection 2') AS _n \gset
 SELECT count(*) AS live_file_kept_whole FROM test_chunk_table_files()
 WHERE name = :'live_file';
-SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
+SELECT * FROM pg_temp.files();
 SELECT count(*) AS rows FROM app.t;
 SELECT message FROM dolt_log('main');
 -- (what each step counted, if a count above isn't the expected one)

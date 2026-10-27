@@ -683,6 +683,39 @@ test_refs_walk_count(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(d.visited);
 }
 
+static bool
+node_row(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[1];
+	bool		nulls[1] = {0};
+
+	values[0] = PointerGetDatum(hash_text(&node->hash));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	return true;
+}
+
+/*
+ * The nodes the refs' walk (what reclamation keeps) visits from the chunk
+ * store's root, each as often as it is visited: what a collection keeps
+ * of the chunks it reads.
+ */
+PG_FUNCTION_INFO_V1(test_refs_walk_nodes);
+Datum
+test_refs_walk_nodes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef refs;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	memset(&refs, 0, sizeof(refs));
+	PROLLY_CALL(cs(), root, store(), &refs.hash);
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk, &refs, node_row, rsinfo);
+	return (Datum) 0;
+}
+
 static void
 kept_commit_row(const ProllyKeptCommit *kept, void *arg)
 {

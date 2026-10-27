@@ -404,6 +404,10 @@ RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- How many nodes the refs' walk visits, one node (by hash) declined.
+CREATE FUNCTION test_refs_walk_nodes()
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_refs_walk_count(declined text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C;
