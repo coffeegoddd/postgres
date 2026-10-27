@@ -83,9 +83,12 @@
  * prolly_table_<id> (id in hex), in the table file format.  The manifest,
  * prolly_manifest, records the store's format, as a segment's header does,
  * and names the table files (each settled or not: closed
- * under what its chunks name), the segments, the files and segments
+ * under what its chunks name; a settled one with the generations its
+ * chunks were born in, the collections that settled them, and how many of
+ * them are thought garbage), the segments, the files and segments
  * retiring (no longer named, kept until whoever may read them has ended),
- * the last id given, the root as of its writing and the GC generation; it
+ * the last id given, the root as of its writing, the GC generation and
+ * when each generation the settled files hold ended; it
  * is replaced whole (written aside, then renamed over the old one).  Every
  * byte of a table file is WAL-logged before it is written, as journal
  * appends are: bytes new to the store as they are, those copied from its
@@ -204,7 +207,7 @@
 #define RECEIVED_ID			(UINT64CONST(1) << 63)
 #define RECEIVED_PREFIX		"prolly_received_"
 #define MANIFEST_MAGIC		"PRLYMAN1"
-#define MANIFEST_VERSION	5
+#define MANIFEST_VERSION	6
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
 #define JOURNAL_VERSION		4
@@ -347,7 +350,9 @@ typedef struct CopyFrom
 } CopyFrom;
 
 /* a table file's and a segment's entries in the manifest, in bytes */
-#define MANIFEST_FILE_ENTRY		21	/* id, chunks, size, flags */
+#define MANIFEST_FILE_ENTRY		33	/* id, chunks, size, flags, epochs,
+										 * garbage */
+#define MANIFEST_EPOCH_ENTRY	12	/* epoch, ended at */
 #define MANIFEST_SEGMENT_ENTRY	16	/* id, sealed at */
 
 /* a table file's flags in the manifest */
@@ -360,7 +365,19 @@ typedef struct ManifestFile
 	uint32		nchunks;
 	uint64		size;
 	uint8		flags;
+	uint32		epoch_lo;		/* a settled file's generations: its chunks
+								 * were born in collections epoch_lo to
+								 * epoch_hi (0: not settled, none) */
+	uint32		epoch_hi;
+	uint32		garbage;		/* its chunks thought garbage, at least */
 } ManifestFile;
+
+/* a collection that settled chunks: its generation, and when it ended */
+typedef struct ManifestEpoch
+{
+	uint32		epoch;
+	TimestampTz ended;
+} ManifestEpoch;
 
 typedef struct Manifest
 {
@@ -381,6 +398,9 @@ typedef struct Manifest
 	int			nretiring;
 	uint64	   *retiring;		/* table files and segments no longer named,
 								 * kept until those who may read them end */
+	int			nepochs;
+	ManifestEpoch *epochs;		/* oldest first: the generations the settled
+								 * files hold, as far back as the oldest */
 } Manifest;
 
 /* a table file a backend reads */
@@ -3242,6 +3262,9 @@ manifest_bytes(const Manifest *m, StringInfo out)
 		append_le(out, m->files[i].nchunks, 4);
 		append_le(out, m->files[i].size, 8);
 		append_le(out, m->files[i].flags, 1);
+		append_le(out, m->files[i].epoch_lo, 4);
+		append_le(out, m->files[i].epoch_hi, 4);
+		append_le(out, m->files[i].garbage, 4);
 	}
 	append_le(out, m->nsegments, 4);
 	for (int i = 0; i < m->nsegments; i++)
@@ -3252,6 +3275,12 @@ manifest_bytes(const Manifest *m, StringInfo out)
 	append_le(out, m->nretiring, 4);
 	for (int i = 0; i < m->nretiring; i++)
 		append_le(out, m->retiring[i], 8);
+	append_le(out, m->nepochs, 4);
+	for (int i = 0; i < m->nepochs; i++)
+	{
+		append_le(out, m->epochs[i].epoch, 4);
+		append_le(out, (uint64) m->epochs[i].ended, 8);
+	}
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, out->data, out->len);
 	FIN_CRC32C(crc);
@@ -3301,6 +3330,7 @@ read_manifest_at(const char *path, Manifest *m)
 	uint32		nfiles;
 	uint32		nsegs;
 	uint32		nretiring;
+	uint32		nepochs;
 
 	memset(m, 0, sizeof(*m));
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -3334,7 +3364,7 @@ read_manifest_at(const char *path, Manifest *m)
 	version = (uint32) read_le(p + 8, 4);
 	if (version != MANIFEST_VERSION)
 		check_format(path, "manifest", version, MANIFEST_VERSION, NULL);
-	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 1 + 4 + 4 + 4 + 4)
+	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 1 + 4 + 4 + 4 + 4 + 4)
 		goto corrupt;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, buf, st.st_size - sizeof(crc));
@@ -3373,6 +3403,13 @@ read_manifest_at(const char *path, Manifest *m)
 		m->files[i].nchunks = (uint32) read_le(p + 8, 4);
 		m->files[i].size = read_le(p + 12, 8);
 		m->files[i].flags = (uint8) p[20];
+		m->files[i].epoch_lo = (uint32) read_le(p + 21, 4);
+		m->files[i].epoch_hi = (uint32) read_le(p + 25, 4);
+		m->files[i].garbage = (uint32) read_le(p + 29, 4);
+		if (m->files[i].epoch_lo > m->files[i].epoch_hi ||
+			((m->files[i].flags & MANIFEST_FILE_SETTLED) != 0) !=
+			(m->files[i].epoch_lo > 0))
+			goto corrupt;
 		p += MANIFEST_FILE_ENTRY;
 	}
 	nsegs = (uint32) read_le(p, 4);
@@ -3390,7 +3427,7 @@ read_manifest_at(const char *path, Manifest *m)
 	}
 	nretiring = (uint32) read_le(p, 4);
 	p += 4;
-	if ((Size) (end - p) != (Size) nretiring * 8)
+	if ((Size) (end - p) < (Size) nretiring * 8 + 4)
 		goto corrupt;
 	m->nretiring = nretiring;
 	m->retiring = palloc(sizeof(uint64) * Max(nretiring, 1));
@@ -3398,6 +3435,20 @@ read_manifest_at(const char *path, Manifest *m)
 	{
 		m->retiring[i] = read_le(p, 8);
 		p += 8;
+	}
+	nepochs = (uint32) read_le(p, 4);
+	p += 4;
+	if ((Size) (end - p) != (Size) nepochs * MANIFEST_EPOCH_ENTRY)
+		goto corrupt;
+	m->nepochs = nepochs;
+	m->epochs = palloc(sizeof(ManifestEpoch) * Max(nepochs, 1));
+	for (uint32 i = 0; i < nepochs; i++)
+	{
+		m->epochs[i].epoch = (uint32) read_le(p, 4);
+		m->epochs[i].ended = (TimestampTz) read_le(p + 4, 8);
+		if (i > 0 && m->epochs[i].epoch <= m->epochs[i - 1].epoch)
+			goto corrupt;
+		p += MANIFEST_EPOCH_ENTRY;
 	}
 	pfree(buf);
 	return true;
@@ -4039,6 +4090,151 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	return false;
 }
 
+/* ------------------------------------------------------------------------
+ * Generations: what a settled file's chunks name in older ones
+ * ------------------------------------------------------------------------
+ *
+ * A settled table file's section (the table file format's write_section())
+ * lists the chunks its chunks name that are in a file of an older
+ * generation, or in none settled (XREF_YOUNG: in a segment a logical slot
+ * keeps), each once:
+ *
+ *		uint8 version (1), uint8 hash length, uint32 count of epochs, then
+ *		for each epoch, ascending: uint32 epoch, uint32 count of targets,
+ *		uint32 count of pairs; then for each epoch in that order its
+ *		targets (hashes, ascending), then its pairs (a leaf naming a
+ *		target: the leaf's hash, then the target's, ascending by target)
+ *
+ * An epoch is one of the generations of the file the target was found in.
+ * What a leaf names is listed with the leaf, so that a collection can
+ * leave out what the history horizon cuts (a boundary commit's parents).
+ */
+#define XREF_VERSION		1
+#define XREF_YOUNG			PG_UINT32_MAX
+#define XREF_HEAD			6
+#define XREF_EPOCH_ENTRY	12
+
+/* a target, as a file's chunks name it */
+typedef struct Xref
+{
+	uint32		epoch;
+	ProllyHash	target;
+	ProllyHash	source;			/* the leaf naming it (len 0: not a leaf) */
+} Xref;
+
+/* A section, read: its epochs' places in its bytes. */
+typedef struct XrefSection
+{
+	char	   *data;
+	Size		len;
+	uint8		hash_len;
+	int			nepochs;
+	uint32	   *epochs;
+	uint32	   *nplain;
+	uint32	   *npairs;
+	Size	   *at;				/* where each epoch's targets begin */
+} XrefSection;
+
+static void
+xref_corrupt(const char *path)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("the generations section of table file \"%s\" is corrupt",
+					path)));
+}
+
+/*
+ * Table file t's section, read and checked, into x; false if it has none.
+ */
+static bool
+xrefs_read(TableFile *t, XrefSection *x)
+{
+	uint64		offset;
+	uint32		len;
+	uint32		crc;
+	pg_crc32c	got;
+	Size		at;
+
+	memset(x, 0, sizeof(*x));
+	PROLLY_CALL(table_format(), section, t->tf, &offset, &len, &crc);
+	if (len == 0)
+		return false;
+	x->data = palloc(len);
+	x->len = len;
+	if (!table_file_read(t, offset, x->data, len))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
+						len, (unsigned long long) offset, t->path)));
+	INIT_CRC32C(got);
+	COMP_CRC32C(got, x->data, len);
+	FIN_CRC32C(got);
+	if (!EQ_CRC32C(got, crc) || len < XREF_HEAD ||
+		(uint8) x->data[0] != XREF_VERSION)
+		xref_corrupt(t->path);
+	x->hash_len = (uint8) x->data[1];
+	x->nepochs = (int) read_le(x->data + 2, 4);
+	if (x->hash_len == 0 || x->hash_len > PROLLY_HASH_MAX_LEN ||
+		x->nepochs < 0 ||
+		(len - XREF_HEAD) / XREF_EPOCH_ENTRY < (Size) x->nepochs)
+		xref_corrupt(t->path);
+	x->epochs = palloc(sizeof(uint32) * Max(x->nepochs, 1));
+	x->nplain = palloc(sizeof(uint32) * Max(x->nepochs, 1));
+	x->npairs = palloc(sizeof(uint32) * Max(x->nepochs, 1));
+	x->at = palloc(sizeof(Size) * Max(x->nepochs, 1));
+	at = XREF_HEAD + (Size) x->nepochs * XREF_EPOCH_ENTRY;
+	for (int i = 0; i < x->nepochs; i++)
+	{
+		const char *e = x->data + XREF_HEAD + (Size) i * XREF_EPOCH_ENTRY;
+
+		x->epochs[i] = (uint32) read_le(e, 4);
+		x->nplain[i] = (uint32) read_le(e + 4, 4);
+		x->npairs[i] = (uint32) read_le(e + 8, 4);
+		if (i > 0 && x->epochs[i] <= x->epochs[i - 1])
+			xref_corrupt(t->path);
+		x->at[i] = at;
+		at += ((Size) x->nplain[i] + 2 * (Size) x->npairs[i]) * x->hash_len;
+		if (at > len)
+			xref_corrupt(t->path);
+	}
+	if (at != len)
+		xref_corrupt(t->path);
+	return true;
+}
+
+static void
+xrefs_free(XrefSection *x)
+{
+	if (x->data == NULL)
+		return;
+	pfree(x->data);
+	pfree(x->epochs);
+	pfree(x->nplain);
+	pfree(x->npairs);
+	pfree(x->at);
+}
+
+/* How many targets file f's section lists (-1: the file is gone). */
+static int64
+file_xrefs(const char *dir, const ManifestFile *f)
+{
+	TableFile  *t = open_table(dir, f, CurrentMemoryContext);
+	XrefSection x;
+	int64		n = 0;
+
+	if (t == NULL)
+		return -1;
+	if (xrefs_read(t, &x))
+	{
+		for (int i = 0; i < x.nepochs; i++)
+			n += x.nplain[i] + x.npairs[i];
+		xrefs_free(&x);
+	}
+	close_table(t);
+	return n;
+}
+
 /*
  * Bytes of table file id written at offset: those copied from the store's
  * files (run's sources, if it has any) logged as a copy, the others as
@@ -4211,6 +4407,7 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
  */
 static void
 write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
+				 uint32 epoch_lo, uint32 epoch_hi,
 				 ProllyChunkNext next, void *arg, bool stored, CopyFrom *from,
 				 bool copies, uint64 limit)
 {
@@ -4248,6 +4445,9 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 		nm.files[nm.nfiles].nchunks = nchunks;
 		nm.files[nm.nfiles].size = size;
 		nm.files[nm.nfiles].flags = flags;
+		nm.files[nm.nfiles].epoch_lo = epoch_lo;
+		nm.files[nm.nfiles].epoch_hi = epoch_hi;
+		nm.files[nm.nfiles].garbage = 0;
 		nm.nfiles++;
 		nm.last_id = id++;
 	} while (full);
@@ -6384,8 +6584,234 @@ add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg,
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, 0, next, arg, stored, NULL, false, 0);
+	write_table_file(s, &m, keep, 0, 0, 0, next, arg, stored, NULL, false, 0);
 	pfree(keep);
+}
+
+/* a settle()'s queue of chunks to visit: an array, grown as needed */
+typedef struct RefQueue
+{
+	ProllyHash **queue;
+	int		   *tail;
+	int		   *max;
+} RefQueue;
+
+static void
+queue_ref(const ProllyHash *ref, void *arg)
+{
+	RefQueue   *rq = arg;
+
+	if (*rq->tail == *rq->max)
+	{
+		*rq->max *= 2;
+		*rq->queue = repalloc_huge(*rq->queue, sizeof(ProllyHash) * *rq->max);
+	}
+	(*rq->queue)[(*rq->tail)++] = *ref;
+}
+
+/* a settle()'s chunks, in the order found */
+typedef struct SettleSource
+{
+	ProllyChunkStore *s;
+	List	   *hashes;			/* ProllyHash * */
+	ListCell   *cur;
+} SettleSource;
+
+static bool
+settle_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	SettleSource *ss = arg;
+
+	while (ss->cur != NULL)
+	{
+		ProllyHash *h = lfirst(ss->cur);
+
+		ss->cur = lnext(ss->hashes, ss->cur);
+		resetStringInfo(data);
+		if (!journal_get(ss->s, h, data))
+			continue;
+		*hash = *h;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Is the chunk (key) the store's but in no settled file: in the journal,
+ * or a table file not settled?  (One in both is too: settling it again
+ * costs a copy, never a chunk.)
+ */
+static bool
+unsettled_has(ProllyChunkStore *s, const ProllyHash *key)
+{
+	ListCell   *lc;
+
+	if (jindex_has(s->ix, key) ||
+		hash_search(s->pending_index, key, HASH_FIND, NULL) != NULL)
+		return true;
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (!t->settled &&
+			PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The settled table file of m's (by its place in m) that has the chunk
+ * (key), or -1 if none has.
+ */
+static int
+settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
+{
+	ListCell   *lc;
+
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+		uint64		offset;
+		uint32		len;
+
+		if (!t->settled ||
+			!PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			continue;
+		for (int i = 0; i < m->nfiles; i++)
+		{
+			if (m->files[i].id == t->id)
+				return i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Settle what roots reach: every chunk they reach that no settled file
+ * holds, down to those one does (and what isn't here: a severed parent),
+ * written to a settled table file.  For chunks that only a settled file's
+ * chunks may name: a fragment of history a repair received, which the
+ * boundary commits name.  A default collection doesn't read settled
+ * files, so it would never find them otherwise, and would free them.
+ * Costs what it settles: a chunk is looked up in the journal's index and
+ * the few files not settled; only where the walk stops, at a settled
+ * chunk, are the settled files asked which has it.
+ */
+static void
+journal_settle(ProllyChunkStore *s, const ProllyHash *roots, int nroots)
+{
+	Manifest	m;
+	bool	   *keep;
+	SettleSource ss = {s, NIL, NULL};
+	ProllyHash *queue;
+	int			head = 0;
+	int			tail = 0;
+	int			max = Max(nroots, 64);
+	HASHCTL		ctl;
+	HTAB	   *seen;
+	StringInfoData data;
+	int			newest = -1;	/* the settled file of the newest
+								 * generations what is settled names */
+	uint32		epoch_lo;
+	uint32		epoch_hi;
+
+	xact_note(s);
+	lock_manifest(s, &m);
+	if (m.gc_generation != s->xact_generation)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("the chunk store was collected while the transaction ran"),
+				 errhint("Try the transaction again.")));
+	load_tables(s, true);
+	scan_journal(s);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly settle", 1024, &ctl,
+					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	initStringInfo(&data);
+	queue = MemoryContextAllocHuge(CurrentMemoryContext,
+								   sizeof(ProllyHash) * max);
+	for (int i = 0; i < nroots; i++)
+		queue[tail++] = roots[i];
+	while (head < tail)
+	{
+		ProllyHash	h = queue[head++];
+		ProllyHash	key;
+		bool		found;
+		RefQueue	rq;
+
+		CHECK_FOR_INTERRUPTS();
+		if (h.len == 0)
+			continue;
+		hash_key(&key, &h);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+		if (!unsettled_has(s, &key))
+		{
+			/* (settled, or not here at all: the walk stops) */
+			int			f = settled_file(s, &m, &key);
+
+			if (f >= 0 &&
+				(newest < 0 || m.files[f].epoch_lo > m.files[newest].epoch_lo))
+				newest = f;
+			continue;
+		}
+		resetStringInfo(&data);
+		if (!journal_get(s, &h, &data))
+			continue;
+		ss.hashes = lappend(ss.hashes, memcpy(palloc(sizeof(ProllyHash)), &h,
+											  sizeof(ProllyHash)));
+		/* (the queue's room reused once half of it is taken) */
+		if (head > max / 2)
+		{
+			memmove(queue, queue + head, sizeof(ProllyHash) * (tail - head));
+			tail -= head;
+			head = 0;
+		}
+		rq.queue = &queue;
+		rq.tail = &tail;
+		rq.max = &max;
+		prolly_chunk_references(data.data, data.len, queue_ref, &rq);
+	}
+
+	/*
+	 * Its generations: the newest of the settled chunks it names, so that
+	 * what names it (a boundary commit, which names those too) is of the
+	 * same or newer ones; else the oldest a settled file has; else the
+	 * next collection's.
+	 */
+	if (newest < 0)
+	{
+		for (int i = 0; i < m.nfiles; i++)
+		{
+			if (m.files[i].epoch_lo > 0 &&
+				(newest < 0 || m.files[i].epoch_lo < m.files[newest].epoch_lo))
+				newest = i;
+		}
+	}
+	if (newest >= 0)
+	{
+		epoch_lo = m.files[newest].epoch_lo;
+		epoch_hi = m.files[newest].epoch_hi;
+	}
+	else
+		epoch_lo = epoch_hi = m.gc_generation + 1;
+	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
+	for (int i = 0; i < m.nfiles; i++)
+		keep[i] = true;
+	ss.cur = list_head(ss.hashes);
+	write_table_file(s, &m, keep, MANIFEST_FILE_SETTLED, epoch_lo, epoch_hi,
+					 settle_next, &ss, false, NULL, false, 0);
+	pfree(keep);
+	pfree(queue);
+	pfree(data.data);
+	hash_destroy(seen);
 }
 
 static void
@@ -6693,6 +7119,8 @@ journal_adopt_received(ProllyChunkStore *s)
 		nm.files[nm.nfiles].nchunks = PROLLY_CALL(table_format(), count, t->tf);
 		nm.files[nm.nfiles].size = t->size;
 		nm.files[nm.nfiles].flags = 0;
+		nm.files[nm.nfiles].epoch_lo = nm.files[nm.nfiles].epoch_hi = 0;
+		nm.files[nm.nfiles].garbage = 0;
 		nm.nfiles++;
 	}
 	replace_manifest(s, &nm, XLOG_CHUNKS_MANIFEST);
@@ -7023,6 +7451,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	char	   *dir;
 	ListCell   *lc;
 	uint8		flags = MANIFEST_FILE_SETTLED;
+	uint32		epoch_lo = PG_UINT32_MAX;
+	uint32		epoch_hi = 0;
 
 	lock_manifest(s, &m);
 	if (m.nfiles < 2 || (max_files > 0 && m.nfiles <= max_files))
@@ -7035,9 +7465,15 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	}
 	for (int i = 0; i < m.nfiles; i++)
 	{
-		if (!keep[i])
-			flags &= m.files[i].flags;
+		if (keep[i])
+			continue;
+		flags &= m.files[i].flags;
+		epoch_lo = Min(epoch_lo, m.files[i].epoch_lo);
+		epoch_hi = Max(epoch_hi, m.files[i].epoch_hi);
 	}
+	/* (settled: the generations of those it conjoins, which are settled) */
+	if ((flags & MANIFEST_FILE_SETTLED) == 0)
+		epoch_lo = epoch_hi = 0;
 
 	/* the files as the lock's manifest names them, opened for this */
 	dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -7071,7 +7507,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true, &cs.from,
+		write_table_file(s, &m, keep, flags, epoch_lo, epoch_hi, conjoin_next,
+						 &cs, true, &cs.from,
 						 true, (uint64) prolly_gc_file_size * 1024);
 	}
 	PG_FINALLY();
@@ -7113,6 +7550,47 @@ journal_table_files(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
 			  (m.files[i].flags & MANIFEST_FILE_SETTLED) != 0, arg);
 		pfree(name);
 	}
+	pfree(dir);
+}
+
+/*
+ * The table files as the manifest names them, with their generations.
+ */
+static void
+journal_generations(ProllyChunkStore *s, ProllyChunkGenerationVisit visit,
+					void *arg)
+{
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	Manifest	m;
+
+	(void) read_manifest(dir, &m);
+	for (int i = 0; i < m.nfiles; i++)
+	{
+		ProllyChunkGeneration g = {0};
+
+		g.name = table_file_name(m.files[i].id);
+		g.nchunks = m.files[i].nchunks;
+		g.size = m.files[i].size;
+		g.settled = (m.files[i].flags & MANIFEST_FILE_SETTLED) != 0;
+		g.epoch_lo = m.files[i].epoch_lo;
+		g.epoch_hi = m.files[i].epoch_hi;
+		g.garbage = m.files[i].garbage;
+		g.xrefs = file_xrefs(dir, &m.files[i]);
+		visit(&g, arg);
+		pfree((char *) g.name);
+	}
+	pfree(dir);
+}
+
+static void
+journal_epochs(ProllyChunkStore *s, ProllyChunkEpochVisit visit, void *arg)
+{
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	Manifest	m;
+
+	(void) read_manifest(dir, &m);
+	for (int i = 0; i < m.nepochs; i++)
+		visit(m.epochs[i].epoch, m.epochs[i].ended, arg);
 	pfree(dir);
 }
 
@@ -7397,6 +7875,9 @@ struct ProllyChunkGc
 	int			nretained;		/* sealed segments not collected: a logical */
 	uint64	   *retained;		/* slot may still decode what was appended */
 	XLogRecPtr *retained_at;	/* to them (their sealed_at) */
+	HTAB	   *retained_chunks;	/* their chunks (ProllyHash), as
+									 * gc_retained() visited them */
+	bool		names_retained; /* a chunk copied names one of them */
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
@@ -8091,6 +8572,19 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 {
 	ProllyChunkStore *s = gc->s;
 
+	if (gc->nretained > 0 && gc->retained_chunks == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hcxt = gc->cxt;
+		gc->retained_chunks = hash_create("prolly collection retained chunks",
+										  1024, &ctl,
+										  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	}
+
 	for (int i = 0; i < gc->nretained; i++)
 	{
 		Segment		g;
@@ -8124,6 +8618,10 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 				record_hash_xid(rec, len, &h, &after, &xid) &&
 				!(TransactionIdIsValid(xid) && TransactionIdDidAbort(xid)))
 			{
+				ProllyHash	key;
+
+				hash_key(&key, &h);
+				(void) hash_search(gc->retained_chunks, &key, HASH_ENTER, NULL);
 				chunk = decoded_chunk(rec, len, after, g.path, &chunk_len);
 				visit(&h, chunk, chunk_len, arg);
 			}
@@ -8456,6 +8954,25 @@ gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
 	gcc->from.bytes = bytes;
 }
 
+/*
+ * A chunk a collection copies names ref: one of the segments it keeps as
+ * they are, for a logical slot, has it?  Then what it writes isn't
+ * settled: a later collection, of those segments too, must still find
+ * what the chunks it writes name.
+ */
+static void
+note_retained(const ProllyHash *ref, void *arg)
+{
+	ProllyChunkGc *gc = arg;
+	ProllyHash	key;
+
+	if (gc->names_retained || ref->len == 0)
+		return;
+	hash_key(&key, ref);
+	if (hash_search(gc->retained_chunks, &key, HASH_FIND, NULL) != NULL)
+		gc->names_retained = true;
+}
+
 static bool
 gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 {
@@ -8494,6 +9011,9 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("chunk in file \"%s\" doesn't match its hash",
 							f->path)));
+		if (gc->retained_chunks != NULL && !gc->names_retained)
+			prolly_chunk_references(gcc->chunk.data, gcc->chunk.len,
+									note_retained, gc);
 		return true;
 	}
 	return false;
@@ -8545,6 +9065,8 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 			f->nchunks = nchunks;
 			f->size = size;
 			f->flags = gc->settle ? MANIFEST_FILE_SETTLED : 0;
+			f->epoch_lo = f->epoch_hi = gc->settle ? gc->m.gc_generation + 1 : 0;
+			f->garbage = 0;
 			gc->written = lappend(gc->written, f);
 			MemoryContextSwitchTo(old);
 		}
@@ -8653,6 +9175,36 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 }
 
 /*
+ * The generations the new manifest nm (its files named) records: the
+ * collection's own, if it settled chunks, after those of the old one
+ * still held, by a settled file, or older than one is.
+ */
+static void
+swap_epochs(ProllyChunkGc *gc, Manifest *nm)
+{
+	uint32		oldest = PG_UINT32_MAX;
+
+	for (int i = 0; i < nm->nfiles; i++)
+	{
+		if (nm->files[i].epoch_lo > 0)
+			oldest = Min(oldest, nm->files[i].epoch_lo);
+	}
+	nm->epochs = palloc(sizeof(ManifestEpoch) * (gc->m.nepochs + 1));
+	nm->nepochs = 0;
+	for (int i = 0; i < gc->m.nepochs; i++)
+	{
+		if (gc->m.epochs[i].epoch >= oldest)
+			nm->epochs[nm->nepochs++] = gc->m.epochs[i];
+	}
+	if (gc->settle)
+	{
+		nm->epochs[nm->nepochs].epoch = nm->gc_generation;
+		nm->epochs[nm->nepochs].ended = GetCurrentTimestamp();
+		nm->nepochs++;
+	}
+}
+
+/*
  * In the window: the slots marked since gc_copy() written, then the
  * manifest replaced: the new files and those kept (settled ones a default
  * collection didn't collect, files a full one kept whole), the segment
@@ -8699,6 +9251,12 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	{
 		ManifestFile *f = lfirst(lc);
 
+		/* (naming what a logical slot keeps the segments of: not settled) */
+		if (gc->names_retained)
+		{
+			f->flags &= ~MANIFEST_FILE_SETTLED;
+			f->epoch_lo = f->epoch_hi = 0;
+		}
 		nm.files[nm.nfiles++] = *f;
 		written_bytes += f->size;
 	}
@@ -8724,6 +9282,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	 * (gc_new()'s; none if it couldn't tell).
 	 */
 	nm.base = gc->sealed_root;
+	swap_epochs(gc, &nm);
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	jindex_append_unlock(s->ix);
 	gc->window = false;
@@ -9209,6 +9768,9 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.forget_received = journal_forget_received,
 	.conjoin = journal_conjoin,
 	.table_files = journal_table_files,
+	.generations = journal_generations,
+	.epochs = journal_epochs,
+	.settle = journal_settle,
 	.shmem_size = journal_shmem_size,
 	.shmem_init = journal_shmem_init,
 	.copy_database = journal_copy_database,
