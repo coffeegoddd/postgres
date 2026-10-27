@@ -11846,6 +11846,7 @@ copies_reset(const char *ref)
 	BranchLockWait wait;
 
 	lock_for_restore(ref, &wait);
+	INJECTION_POINT("prolly-reset-locked", NULL);
 	lock_refs();
 	if (!copies_resolve(ref, &target) || !copies_commit_get(&target, &info))
 		ereport(ERROR,

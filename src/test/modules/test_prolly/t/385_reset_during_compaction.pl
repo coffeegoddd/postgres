@@ -115,6 +115,27 @@ sub counted
 		WHERE name = '$name'), 0)});
 }
 
+# the reset stopped once it holds the locks of the tables it restores,
+# before it restores them: the compaction (or lowering) holding none of
+# them then, and the reset holding the table
+sub reset_locked
+{
+	my ($resetter, $sweeper, $what) = @_;
+	ok( $node->poll_query_until(
+			'postgres', qq{SELECT wait_event = 'prolly-reset-locked'
+			FROM pg_stat_activity WHERE pid = $resetter}),
+		"the reset takes the tables' locks once the $what lets go");
+	is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $sweeper
+		AND locktype = 'relation' AND relation = 'kp.t'::regclass}), '0',
+		"the $what holding none of kp.t then");
+	is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $resetter
+		AND locktype = 'relation' AND relation = 'kp.t'::regclass
+		AND mode = 'AccessExclusiveLock' AND granted}), '1',
+		'and the reset holding it, to restore it');
+	sql(q{SELECT injection_points_detach('prolly-reset-locked')});
+	sql(q{SELECT injection_points_wakeup('prolly-reset-locked')});
+}
+
 sub held_by
 {
 	my ($pid) = @_;
@@ -135,6 +156,8 @@ my $restored = counted('relations_restored');
 my $applied = counted('apply_rows');
 my $reset = $node->background_psql('postgres');
 my $resetter = $reset->query_safe(q{SELECT pg_backend_pid()});
+$reset->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-reset-locked', 'wait')});
 $reset->query_until(qr/started/, q{
 	\echo started
 	SELECT dolt_reset('--hard');
@@ -148,7 +171,6 @@ ok( $node->poll_query_until(
 is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $resetter
 	AND locktype = 'relation' AND relation = $held}), '0',
 	'holding no lock of the table, nor queued for one');
-is(counted('relations_restored'), $restored, 'restoring nothing meanwhile');
 
 # one move let through: asked, the compaction lets go of the relation
 # before the next (which would stop again)
@@ -157,6 +179,7 @@ ok( $node->poll_query_until(
 		'postgres', qq{SELECT count(*) = 0 FROM pg_locks
 		WHERE pid = $sweeper AND locktype = 'relation' AND relation = $held}),
 	'the compaction lets go after the move under way');
+reset_locked($resetter, $sweeper, 'compaction');
 wake_sweep($sweep);
 $reset->query_until(qr/done/, '');
 $reset->quit;
@@ -241,6 +264,8 @@ $restored = counted('relations_restored');
 $applied = counted('apply_rows');
 $reset = $node->background_psql('postgres');
 $resetter = $reset->query_safe(q{SELECT pg_backend_pid()});
+$reset->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-reset-locked', 'wait')});
 $reset->query_until(qr/started/, q{
 	\echo started
 	SELECT dolt_reset('--hard');
@@ -251,9 +276,12 @@ ok( $node->poll_query_until(
 		'postgres', qq{SELECT wait_event = 'BmapCompactionLetGo'
 		FROM pg_stat_activity WHERE pid = $resetter}),
 	'the reset waits for the lowering to let go');
-is(counted('relations_restored'), $restored, 'restoring nothing meanwhile');
+is(sql(qq{SELECT count(*) FROM pg_locks WHERE pid = $resetter
+	AND locktype = 'relation' AND relation = 'kp.t'::regclass}), '0',
+	'holding no lock of the table, nor queued for one');
 sql(q{SELECT injection_points_detach('bmap-shared-below-held')});
 sql(q{SELECT injection_points_wakeup('bmap-shared-below-held')});
+reset_locked($resetter, $sweeper, 'lowering');
 $reset->query_until(qr/done/, '');
 $reset->quit;
 $sweep->query_until(qr/done/, '');
