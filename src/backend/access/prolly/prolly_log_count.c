@@ -19,10 +19,8 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_function_scan.h"
 #include "access/prolly_log_count.h"
-#include "catalog/objectaccess.h"
-#include "catalog/pg_proc.h"
-#include "miscadmin.h"
 #include "executor/executor.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
@@ -33,9 +31,7 @@
 #include "optimizer/pathnode.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
-#include "utils/acl.h"
 #include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
 
 static const CustomPathMethods count_path_methods;
 static const CustomScanMethods count_scan_methods;
@@ -179,14 +175,7 @@ count_begin(CustomScanState *node, EState *estate, int eflags)
 	CountScanState *cs = (CountScanState *) node;
 	CustomScan *plan = (CustomScan *) node->ss.ps.plan;
 
-	AclResult	aclresult;
-
-	/* (dolt_log's own check, which a function scan makes as it begins) */
-	aclresult = object_aclcheck(ProcedureRelationId, F_DOLT_LOG, GetUserId(),
-								ACL_EXECUTE);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(F_DOLT_LOG));
-	InvokeFunctionExecuteHook(F_DOLT_LOG);
+	prolly_function_scan_check(F_DOLT_LOG);
 	cs->ref = ExecInitExpr(linitial(plan->custom_exprs), &node->ss.ps);
 }
 

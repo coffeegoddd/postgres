@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_function_scan.h"
 #include "access/prolly_history.h"
 #include "access/prolly_log.h"
 #include "access/prolly_log_count.h"
@@ -47,6 +48,8 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/tableam.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_proc.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
@@ -4700,6 +4703,17 @@ prolly_log_count(const char *ref)
 		!prolly_window_severed())
 		return info.commits;
 	return list_length(log_walk(list_make1(&start)));
+}
+
+void
+prolly_function_scan_check(Oid funcid)
+{
+	AclResult	aclresult = object_aclcheck(ProcedureRelationId, funcid,
+											GetUserId(), ACL_EXECUTE);
+
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_FUNCTION, get_func_name(funcid));
+	InvokeFunctionExecuteHook(funcid);
 }
 
 static void
