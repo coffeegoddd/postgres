@@ -271,11 +271,11 @@ NOTICE:  history stops at the history horizon
 
 -- A window by count: at least three commits, however old, for main; the
 -- cut in whole days (cold_batch).  With long gone, its merge base pins
--- nothing.  A second fragment, archived beside the first: what the
--- archive has already isn't sent again.  (What is sent is what the archive
--- lacks of all the fragment reaches; what the fragment made, its chunks,
--- may be more, a chunk made again that the archive has, or fewer: so this
--- history's two being equal is this history's, no rule.)
+-- nothing.  A second fragment, archived elsewhere than the first: what
+-- the fragment reaches is sent there whole, made before it too, and the
+-- archive checked for all of it, since a repair of it from there receives
+-- that.  (What is sent is what the archive lacks of all the fragment
+-- reaches; what the fragment made, its chunks, may be fewer.)
 SELECT dolt_branch('-D', 'long');
  dolt_branch 
 -------------
@@ -291,14 +291,24 @@ SELECT action, warm, min_commits, cold_batch FROM prolly_history_policy('main');
  archive | @ 1 hour |           3 | @ 24 hours
 (1 row)
 
+SELECT :'url' || '_second' AS url_second \gset
+ALTER DATABASE regress_history_window SET prolly.history_archive = :'url_second';
 SELECT action, fragment, commits,
 	   array(SELECT hw_name(b) FROM unnest(boundary) b ORDER BY 1) AS boundary,
-	   sent = chunks AS sent_what_was_born_here
+	   sent > chunks AS sent_what_it_reaches
 FROM dolt_history_sever();
- action  | fragment | commits | boundary | sent_what_was_born_here 
----------+----------+---------+----------+-------------------------
+ action  | fragment | commits | boundary | sent_what_it_reaches 
+---------+----------+---------+----------+----------------------
  archive |        2 |       1 | {a6}     | t
 (1 row)
+
+SELECT fragment, location = :'url_second' AS archived_second
+FROM prolly_history_horizon() ORDER BY fragment;
+ fragment | archived_second 
+----------+-----------------
+        1 | f
+        2 | t
+(2 rows)
 
 SELECT chunks_freed > 0 AS freed FROM prolly_gc(true);
  freed 

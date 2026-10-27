@@ -1360,6 +1360,7 @@ archive_plan(const TimestampTz *before, ProllyWindowItemVisit visit, void *arg)
 
 typedef struct Closure
 {
+	bool		prune;			/* every walk whole: decline what is noted */
 	HTAB	   *seen;
 	List	   *chunks;			/* ProllyHash * */
 	int64		bytes;
@@ -1381,16 +1382,17 @@ hash_cmp(const ListCell *a, const ListCell *b)
 #define DELTA_PIECE		128		/* hashes a delta entry holds */
 
 /* A node a commit makes, noted (once, however often it is visited). */
-static void
+static bool
 note_node(Closure *c, const ProllyHash *h)
 {
 	if (!set_add(c->seen, h))
-		return;
+		return false;
 	c->chunks = lappend(c->chunks, memcpy(palloc(sizeof(ProllyHash)), h,
 										  sizeof(ProllyHash)));
 	resetStringInfo(&c->buf);
 	if (PROLLY_CALL(tree_env.chunk_store, get, tree_env.chunks, h, &c->buf))
 		c->bytes += c->buf.len;
+	return true;
 }
 
 /*
@@ -1401,13 +1403,15 @@ note_node(Closure *c, const ProllyHash *h)
  * back) must reach.  Declining it would make what a commit adds depend on
  * the commits noted before it; descending, each adds exactly what it
  * makes, whatever the order, so the set found walking the commits is the
- * one found from a boundary's kept delta.
+ * one found from a boundary's kept delta.  (A closure whose every walk is
+ * whole, prune, declines what it noted: all below it is noted too.)
  */
 static bool
 closure_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 {
-	note_node(arg, &node->hash);
-	return true;
+	Closure    *c = arg;
+
+	return note_node(c, &node->hash) || !c->prune;
 }
 
 /*
@@ -1545,7 +1549,7 @@ kept_delta(Closure *c, const ProllyHash *id)
 			ProllyHash	h;
 
 			p = get_value_id(p, end, &h);
-			note_node(c, &h);
+			(void) note_node(c, &h);
 		}
 		pfree(k.data);
 		pfree(v.data);
@@ -1615,6 +1619,54 @@ fragment_closure(List *commits, ProllyHash *digest, int64 *chunks,
 		*chunk_list = c.chunks;
 	pfree(c.buf.data);
 	hash_destroy(c.seen);
+}
+
+/*
+ * Every chunk a fragment's commits reach: each one's whole tree, the
+ * chunks born before the fragment too.  What a repair of it from an
+ * archive needs, where no older fragment's archive is that one.
+ */
+static List *
+fragment_reach(List *commits)
+{
+	Closure		c = {0};
+	ListCell   *lc;
+
+	c.prune = true;
+	c.seen = id_set("prolly fragment reach", sizeof(ProllyHash));
+	initStringInfo(&c.buf);
+	foreach(lc, commits)
+	{
+		ProllyHash *id = lfirst(lc);
+		ProllyCommitInfo info;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("commit %s is missing from the chunk store",
+							prolly_hash_hex(id))));
+		commit_created(&c, id, &info, NULL);
+	}
+	pfree(c.buf.data);
+	hash_destroy(c.seen);
+	return c.chunks;
+}
+
+static List *fragment_records(void);
+
+/*
+ * Whether an older fragment, still severed, was archived anywhere but url
+ * (its chunks a fragment reaches, born before it, are there, not at url).
+ */
+static const char *
+archived_elsewhere(const char *url)
+{
+	foreach_ptr(FragmentRecord, r, fragment_records())
+		if (!r->f.deleted && r->f.location != NULL &&
+			strcmp(r->f.location, url) != 0)
+			return r->f.location;
+	return NULL;
 }
 
 static int
@@ -1788,7 +1840,7 @@ note_head_at(const char *branch, const ProllyHash *commit, void *arg)
  */
 static int64
 archive_fragment(const char *url, const ProllyWindowFragment *f,
-				 List *chunk_list)
+				 List *chunk_list, List *reach, const char *elsewhere)
 {
 	int64		sent = 0;
 	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
@@ -1838,6 +1890,40 @@ archive_fragment(const char *url, const ProllyWindowFragment *f,
 							url, hash_get_num_entries(rb.wanted), n),
 					 errdetail("Chunk %s, for one, isn't there, or isn't what its hash says.  Nothing is severed.",
 							   prolly_hash_hex(missing))));
+		}
+
+		/*
+		 * (and, an older fragment archived elsewhere, that this archive has
+		 * all the fragment reaches: a repair from it receives that)
+		 */
+		if (reach != NIL)
+		{
+			int			nr = list_length(reach);
+			ProllyHash *rh = palloc_array(ProllyHash, nr);
+			bool	   *has = palloc_array(bool, nr);
+			int			lacking = 0;
+
+			i = 0;
+			foreach_ptr(ProllyHash, h, reach)
+				rh[i++] = *h;
+			if (PROLLY_HAS(rr, has_many))
+				PROLLY_CALL(rr, has_many, remote, rh, nr, has);
+			else
+				for (i = 0; i < nr; i++)
+					has[i] = PROLLY_CALL(rr, has, remote, &rh[i]);
+			for (i = 0; i < nr; i++)
+				if (!has[i])
+					lacking++;
+			if (lacking > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the archive at %s lacks %d of the %d chunks the history severed reaches",
+								url, lacking, nr),
+						 errdetail("They were made before it, and archived at %s.  Nothing is severed.",
+								   elsewhere),
+						 errhint("Repair the history archived there, or archive there.")));
+			pfree(rh);
+			pfree(has);
 		}
 		initStringInfo(&format);
 		PROLLY_CALL(dc.canonicalizer, format, &format);
@@ -1986,7 +2072,11 @@ replan:
 
 	if (archive_url)
 	{
-		result->sent += archive_fragment(archive_url, &f, chunk_list);
+		const char *elsewhere = archived_elsewhere(archive_url);
+
+		result->sent += archive_fragment(archive_url, &f, chunk_list,
+										 elsewhere ? fragment_reach(ids) : NIL,
+										 elsewhere);
 		f.location = archive_url;
 	}
 
