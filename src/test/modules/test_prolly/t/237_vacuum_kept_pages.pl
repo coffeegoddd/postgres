@@ -24,6 +24,8 @@ wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
 prolly.vacuum_copy_kept_pages = on
 });
+# (roots sharing the relations' pages as they are: frozen ones share none)
+$node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 $node->backup('base');
@@ -57,8 +59,8 @@ sql(q{
 });
 my $pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
 cmp_ok($pages, '>', 20, 'the table has some pages');
-is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('kv.t'))}),
-	'1', 'c1 keeps it by a snapshot');
+is(sql(q{SELECT test_bmap_roots_of(pg_relation_filenode('kv.t'))}),
+	'1', 'c1 keeps it by a root');
 
 # Its pages are shared only with c1's snapshot: VACUUM sets them all-visible.
 sql('VACUUM kv.t');

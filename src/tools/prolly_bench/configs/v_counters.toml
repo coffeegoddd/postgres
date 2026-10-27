@@ -28,6 +28,12 @@ fsync = "on"
 synchronous_commit = "on"
 full_page_writes = "on"
 max_connections = 32
+# (roots a fixed number of commits apart, not a second: so a run holds the
+# same number of capture cycles, about twenty, however fast the machine
+# commits, and vgrowth sees enough of them to tell growth from where they
+# fall; with a second, a fast machine's run held two)
+"prolly.root_interval" = "0"
+"prolly.root_interval_commits" = "100"
 
 [sizes.counters]
 v_rows = 100000

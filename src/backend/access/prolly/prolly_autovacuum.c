@@ -200,10 +200,34 @@ prolly_autovacuum_init(void)
 							"How many of the commits each branch was last at its pages are kept as of.",
 							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",
 							&prolly_kept_commits,
-							2, 0, 8,
+							2, 0, 1000000,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.root_interval",
+							"The least time between the commits a branch's pages are kept as of.",
+							"A move to a commit between them restores the nearest kept one before it and writes the rows they differ by.  -1: every commit, or a second under dolt.transaction_commit.",
+							&prolly_root_interval,
+							-1, -1, INT_MAX,
+							PGC_USERSET,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.root_interval_commits",
+							"The least number of commits between the commits a branch's pages are kept as of.",
+							"1 keeps every commit the interval in time allows.",
+							&prolly_root_interval_commits,
+							1, 1, INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.freeze_roots",
+							 "Freeze the roots a commit captures as the commit keeps them.",
+							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are (as under dolt.transaction_commit, whose roots aren't frozen as captured).",
+							 &prolly_freeze_roots,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_min_changes",
 							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
 							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
@@ -417,6 +441,28 @@ store_tablespaces(void)
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
 	return spcs;
+}
+
+/*
+ * Settle the captured roots of the current database's page stores, in
+ * every tablespace, so that none needs the commit log to say what became
+ * of a transaction older than any running now (bmap_roots_reclaim()):
+ * before the database's oldest transaction id advances, and the log may
+ * forget those.
+ */
+void
+prolly_settle_page_stores(void)
+{
+	List	   *spcs = store_tablespaces();
+	ListCell   *lc;
+
+	foreach(lc, spcs)
+	{
+		RelFileLocator store = {lfirst_oid(lc), MyDatabaseId, InvalidRelFileNumber};
+
+		(void) bmap_roots_reclaim(store, true);
+	}
+	list_free(spcs);
 }
 
 /*
