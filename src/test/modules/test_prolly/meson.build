@@ -479,6 +479,7 @@ tests += {
       't/764_root_holds.pl',
       't/780_root_index_ams_writers.pl',
       't/781_root_vector_indexes.pl',
+      't/783_frozen_root_redo_after_copy.pl',
       't/762_root_freezing_redo.pl',
       't/520_revision_reads.pl',
       't/556_rebase_continue_errors.pl',

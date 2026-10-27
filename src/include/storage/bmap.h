@@ -161,7 +161,7 @@ extern uint64 bmap_snapshot_carry(SMgrRelation src, uint64 id,
  * snapshot's work (O(1) in the relation's size, but for the pages changed
  * since its last capture or snapshot, logged as images and written out),
  * and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
- * root (bmap_root_capture_logged()) is captured of temporary storage
+ * root (bmap_root_capture_of()) is captured of temporary storage
  * holding frozen copies of a relation's pages changed since its last root,
  * the rest shared with that root, and records the relation and its epoch
  * then, so the next one's changed pages are found by their epochs
@@ -177,8 +177,8 @@ typedef uint64 BmapRootId;
 
 extern BmapRootId bmap_root_capture(SMgrRelation reln);
 extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids);
-extern BmapRootId bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of,
-										   uint32 live_epoch);
+extern BmapRootId bmap_root_capture_of(SMgrRelation reln, RelFileNumber of,
+									   uint32 live_epoch);
 extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
 								 RelFileLocator holder);
 extern bool bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since);

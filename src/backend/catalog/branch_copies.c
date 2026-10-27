@@ -52,7 +52,6 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
-#include "access/xloginsert.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
@@ -91,6 +90,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1832,9 +1832,9 @@ heap_format(Form_pg_class c)
  * relation's root among prior[] (the first of its storage that its store
  * still holds; none: every page) copied, frozen and written into a copy of
  * that root (temporary storage, dropped as the transaction ends, made a
- * root of), each logged as an image once.  The relation's own pages are
- * left as they are, and its epoch raised so that each one's next change
- * marks it changed since.  Unchanged since, it keeps that root.
+ * root of), each logged as an image once, by the capture.  The relation's
+ * own pages are left as they are, and its epoch raised so that each one's
+ * next change marks it changed since.  Unchanged since, it keeps that root.
  */
 static void
 keep_frozen(Form_pg_class c, BranchKeptRelation *k,
@@ -1902,6 +1902,7 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 	else
 		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
 										  SMGR_BMAP);
+	INJECTION_POINT("branch-keep-frozen-copy-made", NULL);
 	if (smgrnblocks(tsrel, MAIN_FORKNUM) > nblocks)
 		RelationTruncateStorage(tsrel, nblocks);
 	else if (smgrnblocks(tsrel, MAIN_FORKNUM) < nblocks)
@@ -1910,7 +1911,12 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 										  EB_SKIP_EXTENSION_LOCK | EB_CLEAR_SIZE_CACHE, nblocks,
 										  RBM_ZERO_ON_ERROR));
 
-	/* each page changed: frozen, and the copy's (a new block of its own) */
+	/*
+	 * each page changed: frozen, and the copy's (a new block of its own),
+	 * logged by the capture, as images of the blocks the root holds: the
+	 * copy's map may be gone when its records are replayed
+	 * (bmap_root_capture_of())
+	 */
 	for (uint32 i = 0; i < n; i++)
 	{
 		Buffer		buf;
@@ -1924,12 +1930,8 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 			(void) freeze((Page) copy.data, blknos[i], snapshot);
 		buf = ReadBufferWithoutRelcache(tloc, MAIN_FORKNUM, blknos[i],
 										RBM_ZERO_AND_LOCK, NULL, true);
-		START_CRIT_SECTION();
 		memcpy(BufferGetPage(buf), copy.data, BLCKSZ);
 		MarkBufferDirty(buf);
-		if (!PageIsNew(BufferGetPage(buf)))
-			log_newpage_buffer(buf, true);
-		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1940,7 +1942,7 @@ keep_frozen(Form_pg_class c, BranchKeptRelation *k,
 	live_epoch = bmap_raise_epoch(lsrel);
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
-	k->snapshot = bmap_root_capture_logged(tsrel, c->relfilenode, live_epoch);
+	k->snapshot = bmap_root_capture_of(tsrel, c->relfilenode, live_epoch);
 	note_taken(live, k->snapshot);
 	k->frozenxid = FrozenTransactionId;
 	k->minmxid = InvalidMultiXactId;
