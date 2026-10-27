@@ -11585,8 +11585,18 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	alloc_release(&alloc);
 	map_unlock(mapbuf);
 	ReleaseBuffer(mapbuf);
-	UnlockReleaseBuffer(headerbuf);
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * The old block freed before the header is let go of.  Held by nothing
+	 * from the remap on, it would otherwise be found so by a sweep counting
+	 * the relation (under its header) once this compaction's own sweep no
+	 * longer counts as running: freed by that sweep, then given out again
+	 * by the allocator, it would be freed here from under its new holder.
+	 * (A crash between the two records leaves it to a sweep, as before.)
+	 */
+	free_blocks(rel, &phys, 1);
+	UnlockReleaseBuffer(headerbuf);
 	pfree(ndelta);
 	return true;
 }
@@ -11601,8 +11611,8 @@ cmp_move_desc(const void *a, const void *b)
 }
 
 /*
- * Move one relation's blocks from 'target' on, the highest first; the old
- * blocks go back to the allocator.  With 'held' (the relation held against
+ * Move one relation's blocks from 'target' on, the highest first; each old
+ * block goes back to the allocator with its move (compact_page()).  With 'held' (the relation held against
  * its drop), the moves stop once another waits for that hold, so a DDL
  * waits for no more than a move.  Those that only try their locks (a
  * restore of a branch's kept pages, a branch's deletion) aren't waiting,
@@ -11616,7 +11626,6 @@ compact_relation(SMgrRelation reln, BlockNumber target,
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	CompactWalk cw = {target, 0, NULL, 0, 0};
 	Buffer		headerbuf;
-	BlockList	freed = {NULL, 0, 0};
 	uint64		moved = 0;
 
 	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
@@ -11645,19 +11654,10 @@ compact_relation(SMgrRelation reln, BlockNumber target,
 			 LockHasWaiters(held, AccessShareLock, false)))
 			break;
 		if (compact_page(reln, m->blkno, m->phys))
-		{
-			block_list_add(&freed, m->phys);
 			moved++;
-		}
 		CHECK_FOR_INTERRUPTS();
 	}
 	INJECTION_POINT("bmap-compact-moved", NULL);
-	if (freed.n > 0)
-	{
-		qsort(freed.blocks, freed.n, sizeof(BlockNumber), cmp_block);
-		free_blocks(rel, freed.blocks, freed.n);
-		pfree(freed.blocks);
-	}
 	pfree(cw.moves);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_BLOCKS_MOVED, moved);
 	return moved;
