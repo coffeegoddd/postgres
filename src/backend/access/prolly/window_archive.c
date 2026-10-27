@@ -131,8 +131,7 @@
 #define FRAGMENT_VERSION	3
 #define FRAGMENT_DELETED	0x01
 
-/* The horizon's lock: an object lock in the database, of this class. */
-#define HORIZON_LOCK_CLASSID	((Oid) 0x50524848)
+#define HORIZON_LOCK_CLASSID	PROLLY_HORIZON_LOCK_CLASSID
 
 static void check_may_sever(const char *what);
 static List *fragment_records(void);
@@ -3892,6 +3891,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 #define RETIRE_WANTED_SETTING "history_window.retire_wanted"
 #define RETIRE_FAILURES_SETTING "history_window.retire_failures"
 #define RETIRE_RETRY_SETTING "history_window.retire_retry_at"
+#define RETIRE_SEVER_WAIT_SETTING "history_window.retire_sever_wait_since"
 
 /* Background retires that fail this many times in a row: a full collection. */
 #define RETIRE_FAILURES_MOST	3
@@ -4304,6 +4304,35 @@ sever_running(void)
 	return n > 0;
 }
 
+/*
+ * Is a retire held off for another backend's sever?  Only for so long:
+ * from the first visit that found one severing, until
+ * prolly.history_collect_interval (an hour where unset) has passed, after
+ * which the retire runs all the same and waits for the sever's
+ * transaction, so severs that keep the turn taken don't hold a wanted
+ * retire off for good.  (Asked only while one is wanted: the note is a
+ * write.)
+ */
+static bool
+sever_held_off(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	int64		since;
+
+	if (!sever_running())
+	{
+		config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
+		return false;
+	}
+	since = config_int(RETIRE_SEVER_WAIT_SETTING, 0);
+	if (since == 0)
+	{
+		config_int_set(RETIRE_SEVER_WAIT_SETTING, now, false);
+		return true;
+	}
+	return now - since < collect_interval();
+}
+
 /* Does the database's reclamation retire generations, as it chooses them? */
 static bool
 retires(void)
@@ -4352,7 +4381,7 @@ archive_retire_due(uint32 *max_hi, uint32 *want)
 	wanted = config_int(RETIRE_WANTED_SETTING, 0);
 	*want = wanted > 0 ? (uint32) (wanted - 1) : 0;
 	/* (failing: not again until the wait is over, nor once full is wanted) */
-	if (sever_running() ||
+	if ((wanted > 0 ? sever_held_off() : sever_running()) ||
 		GetCurrentTimestamp() < config_int(RETIRE_RETRY_SETTING, DT_NOBEGIN) ||
 		config_int(RETIRE_FAILURES_SETTING, 0) >= RETIRE_FAILURES_MOST)
 	{
@@ -4394,6 +4423,7 @@ archive_retired(void)
 	config_int_set(RETIRE_WANTED_SETTING, 0, true);
 	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
 	config_int_set(RETIRE_RETRY_SETTING, 0, true);
+	config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
 	config_int_set(MEASURED_SETTING, (int64) bytes, false);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
@@ -4502,6 +4532,7 @@ archive_collected(void)
 	config_int_set(RETIRE_WANTED_SETTING, 0, true);
 	config_int_set(RETIRE_FAILURES_SETTING, 0, true);
 	config_int_set(RETIRE_RETRY_SETTING, 0, true);
+	config_int_set(RETIRE_SEVER_WAIT_SETTING, 0, true);
 	config_int_set(SIZE_PENDING_SETTING, 0, true);
 	if (db.max_bytes > 0 && bytes > (uint64) db.max_bytes)
 		config_int_set(OVER_COUNT_SETTING,

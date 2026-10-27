@@ -56,6 +56,7 @@
 #include "access/prolly_jsontree.h"
 #include "access/prolly_toast.h"
 #include "utils/array.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -2920,6 +2921,39 @@ test_window_retire_due(PG_FUNCTION_ARGS)
 	values[3] = BoolGetDatum(PROLLY_CALL(dc.history_window, seal_due));
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
+}
+
+/*
+ * test_window_config_set(name, value): a history window setting of the
+ * database's refs set (NULL: unset), as the background notes it.
+ */
+PG_FUNCTION_INFO_V1(test_window_config_set);
+Datum
+test_window_config_set(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, config_set, name,
+				PG_ARGISNULL(1) ? NULL :
+				psprintf(INT64_FORMAT, PG_GETARG_INT64(1)));
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_hold_sever_turn(): the severs' turn taken, as a sever takes it, to
+ * the transaction's end.
+ */
+PG_FUNCTION_INFO_V1(test_hold_sever_turn);
+Datum
+test_hold_sever_turn(PG_FUNCTION_ARGS)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_OBJECT(tag, MyDatabaseId, PROLLY_HORIZON_LOCK_CLASSID, 1, 0);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(test_logical_horizon);
