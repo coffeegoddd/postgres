@@ -40,7 +40,7 @@ f           |t               |       20
 (1 row)
 
 
-starting permutation: s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s1_flush s1_how s2_read s2_end
+starting permutation: s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s2_read s2_end s1_flush s1_how
 step s1_dirty: UPDATE vrk.t SET v = 'dirty' WHERE id <= 10;
 step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s2_read: SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty FROM vrk.t;
@@ -64,7 +64,15 @@ marked|too
 t     |t  
 (1 row)
 
-step s1_reset: SELECT dolt_reset('--hard') IS NOT NULL AS ok;
+step s1_reset: SELECT dolt_reset('--hard') IS NOT NULL AS ok; <waiting ...>
+step s2_read: SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty FROM vrk.t;
+dirty
+-----
+   10
+(1 row)
+
+step s2_end: COMMIT;
+step s1_reset: <... completed>
 ok
 --
 t 
@@ -83,16 +91,9 @@ step s1_how:
 
 rows_written|pages_given_back|base_rows
 ------------+----------------+---------
-t           |f               |       20
+f           |t               |       20
 (1 row)
 
-step s2_read: SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty FROM vrk.t;
-dirty
------
-   10
-(1 row)
-
-step s2_end: COMMIT;
 
 starting permutation: s1_dirty s2_begin s2_other s1_flush s1_mark s1_reset s1_flush s1_how s2_read s2_end
 step s1_dirty: UPDATE vrk.t SET v = 'dirty' WHERE id <= 10;
@@ -143,7 +144,7 @@ f           |t               |       20
 step s2_read: SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty FROM vrk.t;
 dirty
 -----
-    0
+   10
 (1 row)
 
 step s2_end: COMMIT;

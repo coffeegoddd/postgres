@@ -78,6 +78,7 @@
 #include "port/atomics.h"
 #include "refs_generations.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -150,6 +151,23 @@ typedef struct HeadRestore
 	FullTransactionId xid;
 } HeadRestore;
 
+/*
+ * Storage a restore replaced, kept for the snapshots older than its move
+ * (see branch_note_replaced()): a relation's new storage (newrel, in
+ * tablespace, as pg_class names them) and the storage it replaced (oldrel),
+ * by the transaction that replaced it.
+ */
+typedef struct ReplacedStorage
+{
+	Oid			database;		/* InvalidOid: a free entry */
+	Oid			tablespace;
+	RelFileNumber newrel;		/* invalid: reserved, not yet filled */
+	RelFileNumber oldrel;
+	FullTransactionId xid;
+} ReplacedStorage;
+
+#define REPLACED_STORAGES	1024
+
 typedef struct BranchGenerations
 {
 	LWLock		lock;
@@ -166,6 +184,10 @@ typedef struct BranchGenerations
 	int			restores_hand;
 	FullTransactionId restores_evicted;
 	HeadRestore restores[HEAD_RESTORES];
+	/* (replaced storage: the latest of those let go of stands for them all) */
+	pg_atomic_uint32 nreplaced;	/* entries filled: none, nothing to ask */
+	pg_atomic_uint64 replaced_newest;	/* the latest filled entry's xid */
+	ReplacedStorage replaced[REPLACED_STORAGES];
 } BranchGenerations;
 
 static BranchGenerations *gens = NULL;
@@ -236,6 +258,8 @@ branch_generations_shmem_init(void *area)
 	pg_atomic_init_u64(&g->epoch, 0);
 	g->counter = 1;
 	g->absent = 1;
+	pg_atomic_init_u32(&g->nreplaced, 0);
+	pg_atomic_init_u64(&g->replaced_newest, 0);
 	gens = g;
 }
 
@@ -334,6 +358,184 @@ branch_head_restore_unseen(Oid branch, Snapshot snap)
 											snap->xmin);
 	return !FullTransactionIdPrecedes(xid, xmin) &&
 		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
+}
+
+/*
+ * Storage a restore replaced is kept, not dropped, for the snapshots that
+ * don't see the move: each relation's new storage is named here with the
+ * storage it replaced (oldrel, in tablespace as pg_class names it) and the
+ * transaction that replaced it, and a snapshot that doesn't see that
+ * transaction reads oldrel still (branch_replaced_storage()), as if the
+ * change hadn't been made.  An entry is let go of once no snapshot can be
+ * older than its transaction.  A restore reserves its entries before it
+ * replaces anything (branch_replaced_reserve()), and with none free it
+ * doesn't restore (the move writes the rows instead): an entry still
+ * needed is never let go of, so no snapshot reads storage it can't tell.
+ * Nothing survives a restart, nor needs to: no snapshot after one is older
+ * than a change before it.
+ */
+bool
+branch_replaced_reserve(int n)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId top = GetTopFullTransactionId();
+	FullTransactionId horizon;
+	int			nfree = 0;
+	int			nlive = 0;
+
+	if (g == NULL)
+		return false;
+#ifdef USE_INJECTION_POINTS
+	if (IS_INJECTION_POINT_ATTACHED("prolly-replaced-storage-full"))
+		return false;
+#endif
+	horizon = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											   GetOldestNonRemovableTransactionId(NULL));
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < REPLACED_STORAGES; i++)
+	{
+		ReplacedStorage *r = &g->replaced[i];
+
+		/* (a reservation of the transaction's own stays, unfilled or not) */
+		if (OidIsValid(r->database) && FullTransactionIdPrecedes(r->xid, horizon))
+			r->database = InvalidOid;
+		if (!OidIsValid(r->database))
+			nfree++;
+		else if (RelFileNumberIsValid(r->newrel))
+			nlive++;
+	}
+	pg_atomic_write_u32(&g->nreplaced, nlive);
+	if (nfree < n)
+	{
+		LWLockRelease(&g->lock);
+		return false;
+	}
+	for (int i = 0; i < REPLACED_STORAGES && n > 0; i++)
+	{
+		ReplacedStorage *r = &g->replaced[i];
+
+		if (OidIsValid(r->database))
+			continue;
+		r->database = MyDatabaseId;
+		r->newrel = InvalidRelFileNumber;
+		r->xid = top;
+		n--;
+	}
+	LWLockRelease(&g->lock);
+	return true;
+}
+
+/*
+ * Fill one of the transaction's reservations: a relation's new storage
+ * (newrel, in tablespace) in place of oldrel, kept for older snapshots.
+ */
+void
+branch_note_replaced(Oid tablespace, RelFileNumber oldrel,
+					 RelFileNumber newrel, FullTransactionId xid)
+{
+	BranchGenerations *g = shared();
+	ReplacedStorage *slot = NULL;
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < REPLACED_STORAGES && slot == NULL; i++)
+	{
+		ReplacedStorage *r = &g->replaced[i];
+
+		if (r->database == MyDatabaseId && !RelFileNumberIsValid(r->newrel) &&
+			FullTransactionIdEquals(r->xid, xid))
+			slot = r;
+	}
+	if (slot == NULL)
+		elog(ERROR, "no replaced storage entry reserved");
+	slot->tablespace = tablespace;
+	slot->newrel = newrel;
+	slot->oldrel = oldrel;
+	pg_atomic_add_fetch_u32(&g->nreplaced, 1);
+	if (U64FromFullTransactionId(xid) > pg_atomic_read_u64(&g->replaced_newest))
+		pg_atomic_write_u64(&g->replaced_newest, U64FromFullTransactionId(xid));
+	LWLockRelease(&g->lock);
+}
+
+/* Free the transaction's reservations not filled. */
+void
+branch_replaced_release_unused(void)
+{
+	BranchGenerations *g = shared();
+	FullTransactionId top = GetTopFullTransactionIdIfAny();
+
+	if (g == NULL || !FullTransactionIdIsValid(top))
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < REPLACED_STORAGES; i++)
+	{
+		ReplacedStorage *r = &g->replaced[i];
+
+		if (r->database == MyDatabaseId && !RelFileNumberIsValid(r->newrel) &&
+			FullTransactionIdEquals(r->xid, top))
+			r->database = InvalidOid;
+	}
+	LWLockRelease(&g->lock);
+}
+
+/* Does snap not see xid (a transaction other than the backend's own)? */
+static bool
+unseen(FullTransactionId xid, Snapshot snap)
+{
+	FullTransactionId xmin;
+
+	if (!FullTransactionIdIsValid(xid) ||
+		TransactionIdIsCurrentTransactionId(XidFromFullTransactionId(xid)))
+		return false;
+	xmin = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											snap->xmin);
+	return !FullTransactionIdPrecedes(xid, xmin) &&
+		XidInMVCCSnapshot(XidFromFullTransactionId(xid), snap);
+}
+
+/*
+ * The storage snapshot snap reads of a relation whose storage is *rel (in
+ * tablespace, as pg_class names it): the storage before each change of it
+ * snap doesn't see (branch_note_replaced()), into *rel.  True if that is
+ * another.  Without entries, or with every entry's transaction older than
+ * snap's xmin (seen by it), nothing is looked up.
+ */
+bool
+branch_replaced_storage(Oid tablespace, RelFileNumber *rel, Snapshot snap)
+{
+	BranchGenerations *g = shared();
+	bool		moved = false;
+	bool		found = true;
+	FullTransactionId newest;
+
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC ||
+		pg_atomic_read_u32(&g->nreplaced) == 0)
+		return false;
+	newest = FullTransactionIdFromU64(pg_atomic_read_u64(&g->replaced_newest));
+	if (FullTransactionIdPrecedes(newest,
+								  FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+																   snap->xmin)))
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	while (found)
+	{
+		found = false;
+		for (int i = 0; i < REPLACED_STORAGES && !found; i++)
+		{
+			ReplacedStorage *r = &g->replaced[i];
+
+			if (r->database == MyDatabaseId && r->tablespace == tablespace &&
+				RelFileNumberIsValid(r->newrel) && r->newrel == *rel &&
+				unseen(r->xid, snap))
+			{
+				*rel = r->oldrel;
+				moved = found = true;
+			}
+		}
+	}
+	LWLockRelease(&g->lock);
+	return moved;
 }
 
 /* Remember a writer that ended (the lock held exclusively). */
