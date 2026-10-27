@@ -586,6 +586,14 @@ typedef struct ProllyChunkStoreRoutine
 							   void *arg);
 	bool		(*gc_read_any) (ProllyChunkGc *gc, const ProllyHash *hash,
 								StringInfo out);
+
+	/*
+	 * Optional: a collected chunk (by its slot) is a node of the refs tree,
+	 * as the collection read it as of the seal; before gc_copy().  The
+	 * files written list what such a chunk names in older generations
+	 * apart (a retire reads the live refs tree instead of that list).
+	 */
+	void		(*gc_refs_node) (ProllyChunkGc *gc, uint64 slot);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -602,9 +610,9 @@ typedef struct ProllyChunkStoreRoutine
 	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
 	"root_free", "wait_root_free", "generation", "generations", "epochs", \
 	"settle", "verify_generations", "epoch_of", "gc_listed", "gc_find_in", \
-	"gc_begin_retire", "gc_inbound", "gc_read_any"
+	"gc_begin_retire", "gc_inbound", "gc_read_any", "gc_refs_node"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_read_any
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_refs_node
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

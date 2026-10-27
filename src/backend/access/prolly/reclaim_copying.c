@@ -665,6 +665,93 @@ any_read(void *arg, const ProllyHash *hash, StringInfo out)
 	return PROLLY_CALL(mk->cs, gc_read_any, mk->gc, hash, out);
 }
 
+/* The refs tree's walk: the nodes left to read. */
+typedef struct RefsWalk
+{
+	List	   *todo;			/* ProllyHash * */
+} RefsWalk;
+
+static void
+push_refs_node(const ProllyHash *hash, void *arg)
+{
+	RefsWalk   *rw = arg;
+
+	rw->todo = lappend(rw->todo,
+					   memcpy(palloc(sizeof(ProllyHash)), hash, sizeof(ProllyHash)));
+}
+
+/*
+ * The refs tree as of the seal (root): each of its nodes collected told
+ * to the store, which lists what they name in older generations apart
+ * (they change with every commit, and one no longer live, kept in a
+ * settled file a retire doesn't collect, would otherwise keep what it
+ * named), and marked.  A collection that isn't a retire reads only those
+ * collected: what changed since the last collection is all of them, as
+ * a node is written anew whenever one below it is.  A retire, which
+ * reads no node's list, reads every node of the live tree through any
+ * file, and marks what each of its leaves names.  What a node names past
+ * the tree (commits, working sets) is marked as any chunk's references
+ * are.
+ */
+static void
+mark_refs_tree(Mark *mk, const ProllyHash *root, bool retire)
+{
+	RefsWalk	rw = {NIL};
+	HASHCTL		ctl;
+	HTAB	   *seen;
+	StringInfoData data;
+
+	if (root->len == 0 || !PROLLY_HAS(mk->cs, gc_refs_node))
+		return;
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly refs nodes walked", 256, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	initStringInfo(&data);
+	push_refs_node(root, &rw);
+	while (rw.todo != NIL)
+	{
+		ProllyHash *h = llast(rw.todo);
+		ProllyHash	key;
+		int64		slot;
+		bool		found;
+
+		rw.todo = list_delete_last(rw.todo);
+		CHECK_FOR_INTERRUPTS();
+		memset(&key, 0, sizeof(key));
+		key.len = h->len;
+		memcpy(key.bytes, h->bytes, h->len);
+		pfree(h);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+		slot = PROLLY_CALL(mk->cs, gc_find, mk->gc, &key);
+		resetStringInfo(&data);
+		if (slot >= 0)
+		{
+			PROLLY_CALL(mk->cs, gc_refs_node, mk->gc, (uint64) slot);
+			mark_slot(mk, (uint64) slot);
+			PROLLY_CALL(mk->cs, gc_read, mk->gc, (uint64) slot, &data);
+		}
+		else if (!retire ||
+				 !PROLLY_CALL(mk->cs, gc_read_any, mk->gc, &key, &data))
+			continue;
+
+		/*
+		 * (an internal node's children are the tree's nodes; a leaf's
+		 * references, past it, marked: drained, for one collected)
+		 */
+		if (!prolly_chunk_is_leaf(data.data, data.len))
+			prolly_chunk_references(data.data, data.len, push_refs_node, &rw);
+		else if (slot < 0)
+			mark_named(mk, data.data, data.len);
+		drain(mk);
+	}
+	pfree(data.data);
+	hash_destroy(seen);
+}
+
 static bool collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi,
 						   bool if_free, ProllyGcResult *result);
 
@@ -779,6 +866,9 @@ collect_scoped(ProllyGcScope scope, uint32 lo, uint32 hi, bool if_free,
 						note_cut, &cb);
 		}
 	}
+
+	/* the refs tree as of the seal, its nodes told to the store */
+	mark_refs_tree(&mk, &root, retire);
 
 	/* what the root as of the seal reaches */
 	if (root.len > 0)

@@ -4290,19 +4290,25 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
  * lists the chunks its chunks name that are in a file of an older
  * generation, each once:
  *
- *		uint8 version (1), uint8 hash length, uint32 count of epochs, then
+ *		uint8 version (2), uint8 hash length, uint32 count of epochs, then
  *		for each epoch, ascending: uint32 epoch, uint32 count of targets,
- *		uint32 count of pairs; then for each epoch in that order its
- *		targets (hashes, ascending), then its pairs (a leaf naming a
- *		target: the leaf's hash, then the target's, ascending by target)
+ *		uint32 count of pairs, uint32 count of refs pairs; then for each
+ *		epoch in that order its targets (hashes, ascending), then its
+ *		pairs (a leaf naming a target: the leaf's hash, then the
+ *		target's, ascending by target), then its refs pairs (a node of the
+ *		refs tree naming a target, internal ones too, the same way)
  *
  * An epoch is one of the generations of the file the target was found in.
  * What a leaf names is listed with the leaf, so that a collection can
  * leave out what the history horizon cuts (a boundary commit's parents).
+ * What a node of the refs tree names is listed apart (the collection
+ * writing the file says which chunks are its nodes): a retire reads the
+ * live refs tree itself, so that one no longer live, kept in a file it
+ * doesn't collect, keeps nothing of what it named.
  */
-#define XREF_VERSION		1
+#define XREF_VERSION		2
 #define XREF_HEAD			6
-#define XREF_EPOCH_ENTRY	12
+#define XREF_EPOCH_ENTRY	16
 
 /* a target, as a file's chunks name it */
 typedef struct Xref
@@ -4310,6 +4316,7 @@ typedef struct Xref
 	uint32		epoch;
 	ProllyHash	target;
 	ProllyHash	source;			/* the leaf naming it (len 0: not a leaf) */
+	bool		refs;			/* source a node of the refs tree */
 } Xref;
 
 static int
@@ -4321,6 +4328,8 @@ xref_cmp(const void *a, const void *b)
 
 	if (x->epoch != y->epoch)
 		return x->epoch < y->epoch ? -1 : 1;
+	if (x->refs != y->refs)
+		return x->refs ? 1 : -1;
 	if ((x->source.len > 0) != (y->source.len > 0))
 		return x->source.len > 0 ? 1 : -1;
 	c = memcmp(x->target.bytes, y->target.bytes, x->target.len);
@@ -4357,10 +4366,13 @@ xrefs_encode(Xref *xrefs, int n, uint8 hash_len, StringInfo out)
 		int			j = i;
 		uint32		plain = 0;
 		uint32		pairs = 0;
+		uint32		refs = 0;
 
 		while (j < n && xrefs[j].epoch == xrefs[i].epoch)
 		{
-			if (xrefs[j].source.len > 0)
+			if (xrefs[j].refs)
+				refs++;
+			else if (xrefs[j].source.len > 0)
 				pairs++;
 			else
 				plain++;
@@ -4369,11 +4381,12 @@ xrefs_encode(Xref *xrefs, int n, uint8 hash_len, StringInfo out)
 		append_le(out, xrefs[i].epoch, 4);
 		append_le(out, plain, 4);
 		append_le(out, pairs, 4);
+		append_le(out, refs, 4);
 		i = j;
 	}
 	for (int i = 0; i < n; i++)
 	{
-		if (xrefs[i].source.len > 0)
+		if (xrefs[i].source.len > 0 || xrefs[i].refs)
 			appendBinaryStringInfo(out, (char *) xrefs[i].source.bytes, hash_len);
 		appendBinaryStringInfo(out, (char *) xrefs[i].target.bytes, hash_len);
 	}
@@ -4389,7 +4402,9 @@ typedef struct XrefSection
 	uint32	   *epochs;
 	uint32	   *nplain;
 	uint32	   *npairs;
+	uint32	   *nrefs;
 	Size	   *at;				/* where each epoch's targets begin */
+	bool		skip_refs;		/* visits leave out the refs pairs */
 } XrefSection;
 
 static void
@@ -4427,9 +4442,14 @@ xrefs_read(TableFile *t, XrefSection *x)
 	INIT_CRC32C(got);
 	COMP_CRC32C(got, x->data, len);
 	FIN_CRC32C(got);
-	if (!EQ_CRC32C(got, crc) || len < XREF_HEAD ||
-		(uint8) x->data[0] != XREF_VERSION)
+	if (!EQ_CRC32C(got, crc) || len < XREF_HEAD)
 		xref_corrupt(t->path);
+	if ((uint8) x->data[0] != XREF_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the generations section of table file \"%s\" is of version %u, not %u",
+						t->path, (uint8) x->data[0], XREF_VERSION),
+				 errdetail("This build reads only its own version.")));
 	x->hash_len = (uint8) x->data[1];
 	x->nepochs = (int) read_le(x->data + 2, 4);
 	if (x->hash_len == 0 || x->hash_len > PROLLY_HASH_MAX_LEN ||
@@ -4439,6 +4459,7 @@ xrefs_read(TableFile *t, XrefSection *x)
 	x->epochs = palloc(sizeof(uint32) * Max(x->nepochs, 1));
 	x->nplain = palloc(sizeof(uint32) * Max(x->nepochs, 1));
 	x->npairs = palloc(sizeof(uint32) * Max(x->nepochs, 1));
+	x->nrefs = palloc(sizeof(uint32) * Max(x->nepochs, 1));
 	x->at = palloc(sizeof(Size) * Max(x->nepochs, 1));
 	at = XREF_HEAD + (Size) x->nepochs * XREF_EPOCH_ENTRY;
 	for (int i = 0; i < x->nepochs; i++)
@@ -4448,10 +4469,12 @@ xrefs_read(TableFile *t, XrefSection *x)
 		x->epochs[i] = (uint32) read_le(e, 4);
 		x->nplain[i] = (uint32) read_le(e + 4, 4);
 		x->npairs[i] = (uint32) read_le(e + 8, 4);
+		x->nrefs[i] = (uint32) read_le(e + 12, 4);
 		if (i > 0 && x->epochs[i] <= x->epochs[i - 1])
 			xref_corrupt(t->path);
 		x->at[i] = at;
-		at += ((Size) x->nplain[i] + 2 * (Size) x->npairs[i]) * x->hash_len;
+		at += ((Size) x->nplain[i] + 2 * (Size) x->npairs[i] +
+			   2 * (Size) x->nrefs[i]) * x->hash_len;
 		if (at > len)
 			xref_corrupt(t->path);
 	}
@@ -4469,12 +4492,14 @@ xrefs_free(XrefSection *x)
 	pfree(x->epochs);
 	pfree(x->nplain);
 	pfree(x->npairs);
+	pfree(x->nrefs);
 	pfree(x->at);
 }
 
 /*
  * Visit the targets of a section's epochs from lo to hi: each with the
- * leaf naming it (NULL: not a leaf's).
+ * leaf or node of the refs tree naming it (NULL: another node's); the
+ * refs pairs left out where x->skip_refs says.
  */
 typedef void (*XrefVisit) (const ProllyHash *target, const ProllyHash *source,
 						   uint32 epoch, void *arg);
@@ -4508,6 +4533,35 @@ xrefs_visit(const XrefSection *x, uint32 lo, uint32 hi, XrefVisit visit,
 			p += 2 * x->hash_len;
 			visit(&target, &source, x->epochs[i], arg);
 		}
+		for (uint32 j = 0; j < x->nrefs[i] && !x->skip_refs; j++)
+		{
+			memcpy(source.bytes, p, x->hash_len);
+			memcpy(target.bytes, p + x->hash_len, x->hash_len);
+			p += 2 * x->hash_len;
+			visit(&target, &source, x->epochs[i], arg);
+		}
+	}
+}
+
+/* Visit the nodes of the refs tree a section's refs pairs name targets from. */
+static void
+xrefs_refs_sources(const XrefSection *x, void (*visit) (const ProllyHash *source,
+														void *arg), void *arg)
+{
+	for (int i = 0; i < x->nepochs; i++)
+	{
+		const char *p = x->data + x->at[i] +
+			((Size) x->nplain[i] + 2 * (Size) x->npairs[i]) * x->hash_len;
+		ProllyHash	source;
+
+		memset(&source, 0, sizeof(source));
+		source.len = x->hash_len;
+		for (uint32 j = 0; j < x->nrefs[i]; j++)
+		{
+			memcpy(source.bytes, p, x->hash_len);
+			p += 2 * x->hash_len;
+			visit(&source, arg);
+		}
 	}
 }
 
@@ -4534,6 +4588,8 @@ typedef struct XrefBuild
 	HTAB	   *seen;			/* the items, each once (NULL: none yet) */
 	ProllyHash	source;			/* the chunk being added */
 	bool		leaf;			/* and whether it is a leaf */
+	bool		refs;			/* or a node of the refs tree */
+	bool		(*is_refs) (void *arg, const ProllyHash *hash);	/* (NULL: none is) */
 	StringInfoData chunk;		/* (its bytes, unframed) */
 } XrefBuild;
 
@@ -4560,10 +4616,11 @@ xref_note(const ProllyHash *ref, void *arg)
 		item.epoch = epoch;
 		memcpy(item.target.bytes, ref->bytes, ref->len);
 		item.target.len = ref->len;
-		if (xb->leaf)
+		if (xb->leaf || xb->refs)
 		{
 			memcpy(item.source.bytes, xb->source.bytes, xb->source.len);
 			item.source.len = xb->source.len;
+			item.refs = xb->refs;
 		}
 		if (xb->seen == NULL)
 		{
@@ -4608,6 +4665,7 @@ xref_add(XrefBuild *xb, const ProllyHash *hash, const char *data, Size len,
 	}
 	xb->source = *hash;
 	xb->leaf = prolly_chunk_is_leaf(data, len);
+	xb->refs = xb->is_refs != NULL && xb->is_refs(xb->arg, hash);
 	prolly_chunk_references(data, len, xref_note, xb);
 }
 
@@ -4687,7 +4745,7 @@ file_xrefs(const char *dir, const ManifestFile *f)
 	if (xrefs_read(t, &x))
 	{
 		for (int i = 0; i < x.nepochs; i++)
-			n += x.nplain[i] + x.npairs[i];
+			n += x.nplain[i] + x.npairs[i] + x.nrefs[i];
 		xrefs_free(&x);
 	}
 	close_table(t);
@@ -8162,7 +8220,33 @@ typedef struct ConjoinSource
 	TableFile **others;			/* and those, settled, opened (by file) */
 	TableFile  *listed_of;		/* the file listed is of */
 	HTAB	   *listed;			/* (listed_epoch()'s) */
+	HTAB	   *refs_nodes;		/* ProllyHash: the refs tree's nodes their
+								 * sections list targets from */
 } ConjoinSource;
+
+static void
+note_refs_source(const ProllyHash *source, void *arg)
+{
+	ProllyHash	key;
+
+	hash_key(&key, source);
+	(void) hash_search((HTAB *) arg, &key, HASH_ENTER, NULL);
+}
+
+/*
+ * Is a conjoined chunk a node of the refs tree?  As a file conjoined
+ * lists it (what it names in older generations only gets fewer, the
+ * generations conjoined together).
+ */
+static bool
+conjoin_is_refs(void *arg, const ProllyHash *hash)
+{
+	ConjoinSource *cs = arg;
+	ProllyHash	key;
+
+	hash_key(&key, hash);
+	return hash_search(cs->refs_nodes, &key, HASH_FIND, NULL) != NULL;
+}
 
 static bool
 conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
@@ -8565,6 +8649,18 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
+		cs.refs_nodes = hash_create("prolly conjoin refs nodes", 64, &ctl,
+									HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		foreach(lc, cs.tables)
+		{
+			XrefSection x;
+
+			if (xrefs_read(lfirst(lc), &x))
+			{
+				xrefs_refs_sources(&x, note_refs_source, cs.refs_nodes);
+				xrefs_free(&x);
+			}
+		}
 
 		/*
 		 * (settled: what its chunks name in the settled files left, each
@@ -8589,6 +8685,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			}
 		}
 		xb.resolve = conjoin_resolve;
+		xb.is_refs = conjoin_is_refs;
 		xb.arg = &cs;
 		xb.lo = epoch_lo;
 		xb.hi = epoch_hi;
@@ -9248,6 +9345,8 @@ struct ProllyChunkGc
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
+	uint8	   *refs_nodes;		/* slots of the refs tree's nodes (NULL:
+								 * none said) */
 	uint64	   *read_order;		/* gc_read_order()'s, made once */
 	int			ngroups;
 	GcGroup    *groups;			/* gc_groups()', made once */
@@ -9858,6 +9957,8 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 		CHECK_FOR_INTERRUPTS();
 		if (gc->others_hi[i] < gc->retire_lo || !xrefs_read(gc->others[i], &x))
 			continue;
+		/* (what the refs tree names, the retire reads from the live one) */
+		x.skip_refs = true;
 		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
 		xrefs_free(&x);
 	}
@@ -10863,6 +10964,30 @@ gc_groups(ProllyChunkGc *gc)
  * lists in its section what its chunks name in older generations.
  */
 static void
+journal_gc_refs_node(ProllyChunkGc *gc, uint64 slot)
+{
+	if (slot >= gc->nslots)
+		return;
+	if (gc->refs_nodes == NULL)
+		gc->refs_nodes = MemoryContextAllocZero(gc->cxt, gc->nslots / 8 + 1);
+	gc->refs_nodes[slot / 8] |= 1 << (slot % 8);
+}
+
+/* Is a chunk copied a node of the refs tree, as the collection said? */
+static bool
+gc_is_refs(void *arg, const ProllyHash *hash)
+{
+	GcCopy	   *gcc = arg;
+	ProllyChunkGc *gc = gcc->gc;
+	int64		slot;
+
+	if (gc->refs_nodes == NULL)
+		return false;
+	slot = journal_gc_find(gc, hash);
+	return slot >= 0 && (gc->refs_nodes[slot / 8] & (1 << (slot % 8))) != 0;
+}
+
+static void
 gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 {
 	GcCopy		gcc = {gc, marks, keep, 0, prolly_content_hash(), paced};
@@ -10880,6 +11005,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 	initStringInfo(&gcc.chunk);
 	initStringInfo(&xb.chunk);
 	xb.resolve = gc_resolve;
+	xb.is_refs = gc_is_refs;
 	xb.arg = &gcc;
 	for (int g = 0; g < gc->ngroups; g++)
 	{
@@ -11514,6 +11640,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.gc_begin_retire = journal_gc_begin_retire,
 	.gc_inbound = journal_gc_inbound,
 	.gc_read_any = journal_gc_read_any,
+	.gc_refs_node = journal_gc_refs_node,
 	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,
