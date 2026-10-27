@@ -178,11 +178,14 @@ typedef uint64 BmapRootId;
 extern BmapRootId bmap_root_capture(SMgrRelation reln);
 extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
 								   uint32 *owned);
+extern bool bmap_root_capture_concurrent(SMgrRelation *rels, int n,
+										 BmapRootId *ids);
 extern BmapRootId bmap_root_capture_logged(SMgrRelation reln, RelFileNumber of,
 										   uint32 live_epoch);
 extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
 								 RelFileLocator holder);
 extern bool bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since);
+extern bool bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch);
 extern BmapRootId bmap_made_of(SMgrRelation reln);
 extern uint32 bmap_changed_pages(SMgrRelation reln, uint32 since,
 								 BlockNumber **blknos, BlockNumber *nblocks);

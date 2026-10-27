@@ -36,27 +36,50 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/prolly_builtins.h"
+#include "storage/procarray.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "storage/bufpage.h"
 #include "utils/snapmgr.h"
 
-/* Does 'snapshot' see transaction 'xid' committed (or is it this one)? */
+/* Is xid one of the committing transaction's own (as_of's)? */
 static bool
-committed_seen(TransactionId xid, bool hinted_committed, Snapshot snapshot)
+own_xid(TransactionId xid, const ProllyRootSnapshot *as_of)
+{
+	if (as_of->own == NULL)
+		return TransactionIdIsCurrentTransactionId(xid);
+	for (int i = 0; i < as_of->nown; i++)
+		if (TransactionIdEquals(as_of->own[i], xid))
+			return true;
+	return false;
+}
+
+/*
+ * Does as_of see transaction 'xid' committed (or is it one of the
+ * committing transaction's own)?  One it doesn't see that hasn't aborted
+ * makes the page *undecided: a later snapshot may see it.
+ */
+static bool
+committed_seen(TransactionId xid, bool hinted_committed,
+			   const ProllyRootSnapshot *as_of, bool *undecided)
 {
 	if (!TransactionIdIsNormal(xid))
 		return xid == FrozenTransactionId || xid == BootstrapTransactionId;
-	if (TransactionIdIsCurrentTransactionId(xid))
+	if (own_xid(xid, as_of))
 		return true;
-	if (XidInMVCCSnapshot(xid, snapshot))
+	if (XidInMVCCSnapshot(xid, as_of->snapshot))
+	{
+		if (TransactionIdIsInProgress(xid) || TransactionIdDidCommit(xid))
+			*undecided = true;
 		return false;
+	}
 	return hinted_committed || TransactionIdDidCommit(xid);
 }
 
 /* Is the version left: inserted, and not deleted, as the snapshot sees? */
 static bool
-version_left(HeapTupleHeader tup, Snapshot snapshot)
+version_left(HeapTupleHeader tup, const ProllyRootSnapshot *as_of,
+			 bool *undecided)
 {
 	TransactionId xmax;
 
@@ -64,7 +87,8 @@ version_left(HeapTupleHeader tup, Snapshot snapshot)
 	{
 		if (HeapTupleHeaderXminInvalid(tup) ||
 			!committed_seen(HeapTupleHeaderGetRawXmin(tup),
-							HeapTupleHeaderXminCommitted(tup), snapshot))
+							HeapTupleHeaderXminCommitted(tup), as_of,
+							undecided))
 			return false;
 	}
 	if ((tup->t_infomask & HEAP_XMAX_INVALID) ||
@@ -76,7 +100,7 @@ version_left(HeapTupleHeader tup, Snapshot snapshot)
 	return !committed_seen(xmax,
 						   !(tup->t_infomask & HEAP_XMAX_IS_MULTI) &&
 						   (tup->t_infomask & HEAP_XMAX_COMMITTED),
-						   snapshot);
+						   as_of, undecided);
 }
 
 /*
@@ -111,15 +135,22 @@ chain_left(Page page, OffsetNumber off, const bool *left)
 	return InvalidOffsetNumber;
 }
 
-static bool
-capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
+bool
+prolly_freeze_heap_page(Page page, BlockNumber blkno,
+						const ProllyRootSnapshot *as_of, bool *undecided)
 {
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 	bool		left[MaxHeapTuplesPerPage + 1] = {0};
 	bool		any = false;
 
-	if (PageIsNew(page) || PageIsEmpty(page))
+	*undecided = false;
+	if (PageIsNew(page))
 		return false;
+	if (PageIsEmpty(page))
+	{
+		PageSetAllVisible(page);
+		return false;
+	}
 	Assert(maxoff <= MaxHeapTuplesPerPage);
 
 	/* (each version judged before any line pointer changes) */
@@ -129,7 +160,7 @@ capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
 
 		if (ItemIdIsNormal(lp))
 			left[off] = version_left((HeapTupleHeader) PageGetItem(page, lp),
-									 snapshot);
+									 as_of, undecided);
 	}
 
 	/* chains' roots first: they redirect to a version found by its chain */
@@ -179,7 +210,18 @@ capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
 		ItemPointerSet(&tup->t_ctid, blkno, off);
 		any = true;
 	}
-	PageClearAllVisible(page);
+	/*
+	 * (all-visible, and all-frozen, if no dead line pointer is left: every
+	 * version left is frozen, and an index entry may point at a dead one,
+	 * which an index-only scan must not take for a row)
+	 */
+	PageSetAllVisible(page);
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		if (ItemIdIsDead(PageGetItemId(page, off)))
+		{
+			PageClearAllVisible(page);
+			break;
+		}
 	PageClearFull(page);
 	((PageHeader) page)->pd_prune_xid = InvalidTransactionId;
 	return any;
@@ -187,6 +229,31 @@ capture_freeze_page(Page page, BlockNumber blkno, Snapshot snapshot)
 
 static bool
 capture_at_capture(void)
+{
+	return true;
+}
+
+static bool
+capture_freeze_page(Page page, BlockNumber blkno,
+					const ProllyRootSnapshot *as_of, bool *undecided)
+{
+	return prolly_freeze_heap_page(page, blkno, as_of, undecided);
+}
+
+/* (a root not frozen at capture is kept only while no writer is at work) */
+static bool
+capture_freeze_later(void)
+{
+	return false;
+}
+
+/*
+ * (its own roots are frozen as they are captured; one another freezer left
+ * unfrozen, captured among writers, is frozen on a move to it all the
+ * same: never given back as captured, and frozen it is O(1) to give back)
+ */
+static bool
+capture_freeze_now(void)
 {
 	return true;
 }
@@ -201,4 +268,6 @@ const ProllyRootFreezerRoutine prolly_rootfreeze_capture = {
 	},
 	.at_capture = capture_at_capture,
 	.freeze_page = capture_freeze_page,
+	.freeze_later = capture_freeze_later,
+	.freeze_now = capture_freeze_now,
 };

@@ -432,17 +432,23 @@ typedef struct xl_bmap_roots_delta
 
 /*
  * Block data of the roots' metapage: how many pages of slots follow it,
- * the first that may have a free slot, and the last root's sequence number.
+ * the first that may have a free slot, and the last root's sequence number;
+ * and, if 'naming' isn't 0, that page of slots (its block number) marked as
+ * one whose slots may name a transaction, or with BMAP_DELTA_NAMING_CLEAR,
+ * as one whose slots name none.
  */
 typedef struct xl_bmap_roots_meta_delta
 {
 	uint16		kind;			/* BMAP_DELTA_ROOTS_META */
-	uint16		flags;			/* BMAP_DELTA_INIT */
+	uint16		flags;			/* BMAP_DELTA_INIT, BMAP_DELTA_NAMING_CLEAR */
 	uint32		npages;
 	uint32		hint;
-	uint32		unused;
+	uint32		naming;
 	uint64		seq;
 } xl_bmap_roots_meta_delta;
+
+/* a roots' metapage delta that unmarks its page of slots 'naming' */
+#define BMAP_DELTA_NAMING_CLEAR	0x02
 
 /* Block data of a tree's root page: a snapshot slot set (or cleared). */
 typedef struct xl_bmap_snapshot_delta

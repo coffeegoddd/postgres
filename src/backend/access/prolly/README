@@ -1249,8 +1249,9 @@ pass reads the entries it retires and passes over, not every root.
 Roots are captured no more often than prolly.root_interval (by default
 every commit made by hand, and a second under dolt.transaction_commit,
 whose transactions each make a commit) and prolly.root_interval_commits
-allow; a transaction's own commit keeps its pages too when one is due and
-no other writer of the branch is at work.  The time a branch's root was
+allow; a transaction's own commit keeps its pages too when one is due,
+captured among the branch's other writers and frozen later (the lazy
+root freezer, below).  The time a branch's root was
 last kept, or tried, is in shared memory: once the interval passes, one
 backend's commit claims the next try, and the others' within it read
 nothing of the kept commits.  The cost is WAL: after each capture the
@@ -1291,9 +1292,42 @@ epoch: a page's change sets every pointer above its leaf in the map's
 epoch (once a node for each epoch), so the walk passes over the subtrees
 set before, and a relation unchanged since its root reads no node.
 prolly.freeze_roots off keeps them as captured, sharing the relation's
-pages.  Under dolt.transaction_commit roots are kept as captured: freezing them
-in every transaction's commit would cost too much, and is to move to the
-background there.
+pages.
+
+Under dolt.transaction_commit every transaction commits, so another writer
+is nearly always at work: a keep that waited for none would almost never
+keep a root, and one that locked them out would stall them all.  There
+the root freezer is "lazy".  A commit's keep (once a root is due) locks
+the relations against VACUUM and definitions only
+(ShareUpdateExclusiveLock, tried), and captures each relation's root at a
+moment no writer is changing one of its pages: the capture's walk, its
+header held, has every cached page prepared again before it next
+changes, so a writer's next change waits for the header and then copies
+the page, and it gives up a walk on a page a writer holds
+(bmap_root_capture_concurrent()).  Indexes are captured before their
+tables, so every entry of an index's root names a row its table's root
+holds.  Such a root holds the versions of transactions the commit didn't
+see, so it is kept unfrozen (BRANCH_KEPT_UNFROZEN), the commit's
+snapshot recorded with it in the refs (xmin, xmax, the running
+transactions' and their subtransactions' ids, and the committing
+transaction's own; a snapshot whose subtransactions overflowed keeps no
+root), and it is never given back as captured.  The fold worker freezes
+each branch's oldest such commit every pass (the refs' freeze_kept()):
+each heap-format relation's root made a frozen root as of the snapshot,
+from the nearest frozen root of the relation before it (the pages changed
+since, and the pages that root's freezing left undecided: frozen as of a
+snapshot that didn't see a transaction that may yet commit, so a later
+snapshot may freeze them differently); the commit kept anew by the
+frozen roots, its unfrozen entry retired.  The database's frozen ids are
+held meanwhile, so the transactions the roots hold stay known; a commit
+past the horizon before it is frozen is retired, never given back.  A
+move to an unfrozen commit freezes it first (freeze_now()); another
+branch's is passed over for the nearest frozen root.  The fold launcher
+starts a worker in every database once as it starts, for the roots a
+crash or a restart left unfrozen.  A relation's pages unchanged since such
+a root still aren't the commit's (a writer the commit didn't see may have
+changed them before), so a restore always gives it new storage, with no
+visibility map (BRANCH_KEPT_CONCURRENT).
 
 Durability through WAL.  The blocks a share or snapshot comes to share
 must hold its pages durably, as long as anything holds them: they never

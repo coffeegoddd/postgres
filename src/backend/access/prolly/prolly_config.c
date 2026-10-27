@@ -16,6 +16,8 @@
  */
 #include "postgres.h"
 
+#include "utils/guc.h"
+
 #include "access/prolly_config.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -66,6 +68,24 @@ profile_impl(const char *const *impls, ProllyInterface iface)
 	if (impls[iface] == NULL)
 		return NULL;
 	return prolly_get_impl(iface, impls[iface]);
+}
+
+/*
+ * The root freezer: the profile's for commits made by hand (frozen as they
+ * are captured, inside the commit), "lazy" under dolt.transaction_commit,
+ * whose every transaction commits, so that a commit captures its roots
+ * among the writers and leaves their freezing to the background.
+ */
+static const ProllyRootFreezerRoutine *
+root_freezer(void)
+{
+	const char *tc = GetConfigOption("dolt.transaction_commit", true, false);
+
+	if (tc != NULL && strcmp(tc, "on") == 0)
+		return (const ProllyRootFreezerRoutine *)
+			prolly_get_impl(PROLLY_IFACE_ROOT_FREEZER, "lazy");
+	return (const ProllyRootFreezerRoutine *)
+		profile_impl(copies_profile, PROLLY_IFACE_ROOT_FREEZER);
 }
 
 Oid
@@ -430,8 +450,7 @@ prolly_database_components(ProllyDatabaseComponents *components)
 		profile_impl(copies_profile, PROLLY_IFACE_COMMIT_CACHE);
 	components->history_window = (const ProllyWindowRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_HISTORY_WINDOW);
-	components->root_freezer = (const ProllyRootFreezerRoutine *)
-		profile_impl(copies_profile, PROLLY_IFACE_ROOT_FREEZER);
+	components->root_freezer = root_freezer();
 	components->root_retention = (const ProllyRootRetentionRoutine *)
 		profile_impl(copies_profile, PROLLY_IFACE_ROOT_RETENTION);
 }

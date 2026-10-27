@@ -699,6 +699,30 @@ static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
  * theirs.  Flags read locked may be mid-settle: read again once the header
  * is unlocked (as briefly as any holder of it keeps it).
  */
+/* The slot of relation rel's generation of sharing. */
+static inline uint32
+BufferSmgrRelSlot(const RelFileLocator *rel)
+{
+	uint32		h = rel->relNumber ^ (rel->dbOid * 0x9E3779B1) ^
+		(rel->spcOid * 0x85EBCA77);
+
+	return h % BUFFER_SMGR_REL_GENERATIONS;
+}
+
+/*
+ * The generation of sharing of the page in buf_hdr: the global one and its
+ * relation's, summed (each only rises, so a raise of either is a new sum).
+ * The buffer is pinned, so its tag stays.
+ */
+static inline uint64
+BufferSmgrGenerationOf(BufferDesc *buf_hdr)
+{
+	RelFileLocator rel = BufTagGetRelFileLocator(&buf_hdr->tag);
+
+	return pg_atomic_read_u64(BufferSmgrGeneration) +
+		pg_atomic_read_u64(&BufferSmgrRelGenerations[BufferSmgrRelSlot(&rel)]);
+}
+
 static inline bool
 BufferSmgrSettled(BufferDesc *buf_hdr, uint64 *buf_state)
 {
@@ -709,7 +733,7 @@ BufferSmgrSettled(BufferDesc *buf_hdr, uint64 *buf_state)
 		pg_read_barrier();
 		*buf_state = pg_atomic_read_u64(&buf_hdr->state);
 		if (likely(!(*buf_state & BM_LOCKED)))
-			return gen == pg_atomic_read_u64(BufferSmgrGeneration);
+			return gen == BufferSmgrGenerationOf(buf_hdr);
 		(void) WaitBufHdrUnlocked(buf_hdr);
 	}
 }
@@ -3112,7 +3136,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				set_bits |= BM_SMGR_PREPARES;
 				pg_atomic_write_u64(&victim_buf_hdr->smgr_gen,
 									RecoveryInProgress() ? 0 :
-									pg_atomic_read_u64(BufferSmgrGeneration));
+									BufferSmgrGenerationOf(victim_buf_hdr));
 			}
 
 			UnlockBufHdrExt(victim_buf_hdr, buf_state,
@@ -6907,9 +6931,9 @@ UnlockBuffer(Buffer buffer)
  */
 
 static uint64
-BufferSmgrCheckBegin(void)
+BufferSmgrCheckBegin(BufferDesc *buf_hdr)
 {
-	uint64		gen = pg_atomic_read_u64(BufferSmgrGeneration);
+	uint64		gen = BufferSmgrGenerationOf(buf_hdr);
 
 	/* (the storage manager's state is read after) */
 	pg_memory_barrier();
@@ -6926,7 +6950,7 @@ BufferSmgrSettle(BufferDesc *buf_hdr, uint64 gen, uint64 set_bits,
 {
 	uint64		buf_state = LockBufHdr(buf_hdr);
 
-	if (pg_atomic_read_u64(BufferSmgrGeneration) != gen)
+	if (BufferSmgrGenerationOf(buf_hdr) != gen)
 	{
 		UnlockBufHdr(buf_hdr);
 		return;
@@ -6965,7 +6989,7 @@ PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr, bool neutral)
 		RecoveryInProgress())
 		return;
 
-	gen = BufferSmgrCheckBegin();
+	gen = BufferSmgrCheckBegin(buf_hdr);
 	smgrprepareforchange(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 								  INVALID_PROC_NUMBER),
 						 BufTagGetForkNum(&buf_hdr->tag),
@@ -7006,7 +7030,7 @@ BufferSmgrPageIsShared(BufferDesc *buf_hdr)
 			return false;
 	}
 
-	gen = BufferSmgrCheckBegin();
+	gen = BufferSmgrCheckBegin(buf_hdr);
 	shared = smgrpageisshared(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 									   INVALID_PROC_NUMBER),
 							  BufTagGetForkNum(&buf_hdr->tag),
@@ -7135,6 +7159,22 @@ void
 MarkBufferedPagesShared(void)
 {
 	(void) pg_atomic_fetch_add_u64(BufferSmgrGeneration, 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_BUFFER_GENERATIONS, 1);
+}
+
+/*
+ * MarkRelationPagesShared -- MarkBufferedPagesShared(), of relation rel's
+ * cached pages alone
+ *
+ * Every page of rel (and of the relations whose generation shares its
+ * slot) is prepared again before it next changes; the others' writers go
+ * on as they were.  O(1).
+ */
+void
+MarkRelationPagesShared(RelFileLocator rel)
+{
+	(void) pg_atomic_fetch_add_u64(&BufferSmgrRelGenerations[BufferSmgrRelSlot(&rel)], 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_BUFFER_REL_GENERATIONS, 1);
 }
 
 /*

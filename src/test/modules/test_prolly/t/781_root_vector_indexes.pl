@@ -29,6 +29,8 @@ if ($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_available_extensions WHERE name = 'vector'}) eq '0')
 {
 	$node->stop;
+	# (where the job installed it, its absence a failure)
+	BAIL_OUT('pgvector is not installed') if $ENV{PG_TEST_REQUIRE_VECTOR};
 	plan skip_all => 'pgvector is not installed';
 }
 
