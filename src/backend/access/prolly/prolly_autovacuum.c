@@ -76,6 +76,7 @@ int			prolly_journal_move_threshold = 256;
 int			prolly_conjoin_max_files = 256;
 int			prolly_gc_file_size = 65536;
 int			prolly_gc_rewrite_below = -1;
+int			prolly_gc_retire_budget = 1048576;
 bool		prolly_log_copied_bytes = false;
 double		prolly_autofold_threshold = 0.05;
 int			prolly_release_max_per_pass = 1000000;
@@ -156,6 +157,14 @@ prolly_autovacuum_init(void)
 							"Above it, a file is kept whole while at most half of it is garbage.  -1 is a quarter of prolly.gc_file_size; 0 keeps every file so.",
 							&prolly_gc_rewrite_below,
 							-1, -1, MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.gc_retire_budget",
+							"How many bytes of settled table files one retire of old generations collects at most.",
+							"The oldest generation thought at least half garbage is retired whatever its size; those after it only within this.  It bounds how long a retire holds off table file writers.",
+							&prolly_gc_retire_budget,
+							1048576, 1, MAX_KILOBYTES,
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);

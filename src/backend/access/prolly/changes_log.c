@@ -1161,6 +1161,34 @@ fold_keys_spilled(Finder *f, const ProllyTableFold *baseline,
 	*data = cur;
 }
 
+/*
+ * A scope in which the tree keeps the leaves it reads (keep_leaves()), for
+ * a pass that looks each key up in a tree and then applies its edits to
+ * that tree: the apply finds each leaf the lookups read, which it would
+ * otherwise read from the chunk store again.  NULL if the tree keeps none.
+ * The scope ends as its context is deleted (keep_leaves_end()), or with
+ * the transaction's memory on an error.
+ */
+static MemoryContext
+keep_leaves_begin(Finder *f)
+{
+	MemoryContext cxt;
+
+	if (!PROLLY_HAS(f->tree, keep_leaves))
+		return NULL;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold's kept leaves",
+								ALLOCSET_DEFAULT_SIZES);
+	PROLLY_CALL(f->tree, keep_leaves, cxt);
+	return cxt;
+}
+
+static void
+keep_leaves_end(MemoryContext cxt)
+{
+	if (cxt != NULL)
+		MemoryContextDelete(cxt);
+}
+
 /* Each candidate's old and new rows; the pairs that differ are edits. */
 static void
 fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
@@ -1168,6 +1196,7 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	Edits		ed = {NULL, 0};
 	int			nedits;
 	ProllyEdit *edits;
+	MemoryContext kept;
 
 	if (f->spill)
 	{
@@ -1177,20 +1206,30 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	unique_keys(f);
 	ed.edits = MemoryContextAllocHuge(CurrentMemoryContext,
 									  Max(f->n, 1) * sizeof(ProllyEdit));
-	each_change(f, &baseline->data, edit_emit, &ed);
-	edits = ed.edits;
-	nedits = ed.nedits;
-	f->work.rows_written += nedits;
-	/* (many edits: merged, a pass over the baseline; else each applied) */
-	if (nedits > 0 &&
-		(f->merge ||
-		 (uint64) nedits * MERGE_FRACTION >
-		 PROLLY_CALL(f->tree, count, &f->env, &baseline->data)))
-		merge_build(f, baseline, edits, nedits, data);
-	else if (nedits > 0)
-		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
-	else
-		*data = baseline->data;
+	kept = keep_leaves_begin(f);
+	PG_TRY();
+	{
+		each_change(f, &baseline->data, edit_emit, &ed);
+		edits = ed.edits;
+		nedits = ed.nedits;
+		f->work.rows_written += nedits;
+		/* (many edits: merged, a pass over the baseline; else each applied) */
+		if (nedits > 0 &&
+			(f->merge ||
+			 (uint64) nedits * MERGE_FRACTION >
+			 PROLLY_CALL(f->tree, count, &f->env, &baseline->data)))
+			merge_build(f, baseline, edits, nedits, data);
+		else if (nedits > 0)
+			PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits,
+						nedits, data);
+		else
+			*data = baseline->data;
+	}
+	PG_FINALLY();
+	{
+		keep_leaves_end(kept);
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -1200,7 +1239,7 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
  * the keying can't tell apart but the bytes can, or a count below none.
  */
 static bool
-apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
+apply_copies_kept(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 {
 	ProllyEdit *edits;
 	int			nedits = 0;
@@ -1309,6 +1348,25 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 		PROLLY_CALL(f->tree, apply, &f->env, data_in, edits, nedits, data);
 	else if (ok)
 		*data = *data_in;
+	return ok;
+}
+
+/* apply_copies_kept(), each leaf its lookups read kept for its apply */
+static bool
+apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
+{
+	MemoryContext kept = keep_leaves_begin(f);
+	bool		ok;
+
+	PG_TRY();
+	{
+		ok = apply_copies_kept(f, data_in, data);
+	}
+	PG_FINALLY();
+	{
+		keep_leaves_end(kept);
+	}
+	PG_END_TRY();
 	return ok;
 }
 

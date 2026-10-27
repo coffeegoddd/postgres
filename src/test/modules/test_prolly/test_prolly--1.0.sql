@@ -752,6 +752,19 @@ CREATE FUNCTION test_chunk_retire(lo int8, hi int8, OUT kept int8,
 	OUT freed int8, OUT bytes_freed int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The generations the reclamation would retire now: the oldest thought at
+-- least half garbage, and those after it as much within budget bytes of
+-- their files (NULL: prolly.gc_retire_budget's); NULLs if none.
+CREATE FUNCTION test_chunk_retire_choose(budget int8 DEFAULT NULL,
+	OUT lo int8, OUT hi int8)
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Note chunks as garbage, as a sever does: counted against the oldest
+-- settled file holding each.  Returns the files' indexes probed.
+CREATE FUNCTION test_chunk_note_garbage(hashes text[])
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The oldest position a logical slot of the current database, or one of a
 -- standby's as its feedback said, may decode from (NULL: none): what a
 -- collection keeps the values the WAL names from.

@@ -35,6 +35,7 @@
 #include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "utils/timestamp.h"
 #include "access/prolly_commitcache.h"
@@ -2837,6 +2838,55 @@ test_chunk_retire(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
+}
+
+/*
+ * The generations the reclamation would retire now, within budget bytes
+ * of their files (NULL: prolly.gc_retire_budget's): NULLs if none.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_retire_choose);
+Datum
+test_chunk_retire_choose(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	uint64		budget = PG_ARGISNULL(0) ?
+		(uint64) prolly_gc_retire_budget * 1024 : (uint64) PG_GETARG_INT64(0);
+	uint32		lo = 0;
+	uint32		hi = 0;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	if (!PROLLY_CALL(dc.reclamation, choose, budget, PG_UINT32_MAX, &lo, &hi))
+		nulls[0] = nulls[1] = true;
+	values[0] = Int64GetDatum((int64) lo);
+	values[1] = Int64GetDatum((int64) hi);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/*
+ * Note chunks as garbage, as a sever does (the chunk store's
+ * note_garbage()): the files' indexes probed.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_note_garbage);
+Datum
+test_chunk_note_garbage(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	ProllyHash *hashes;
+
+	deconstruct_array_builtin(arr, TEXTOID, &elems, &nulls, &n);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
+	PG_RETURN_INT64(PROLLY_CALL(cs(), note_garbage, store(), hashes, n));
 }
 
 PG_FUNCTION_INFO_V1(test_logical_horizon);
