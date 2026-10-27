@@ -11468,7 +11468,7 @@ copies_made_object(Oid classId, Oid id, StringInfo name, int *n)
  * ------------------------------------------------------------------------
  */
 
-#define HEAD_LOG_TAIL	32
+#define HEAD_LOG_TAIL	16
 
 typedef struct LogState
 {

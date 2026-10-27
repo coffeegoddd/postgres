@@ -968,7 +968,7 @@ fast-forward), with the transaction; a remote-tracking branch has one as
 fetches and pushes move it.  "The commit branch B was at at time T" is a
 seek (prolly_head_at(), prolly_head_log()), whatever dates the commits
 were given.  A log is a tree of its own, keyed by each move's date and
-number, so a move goes at its right edge; the latest moves (at most 32)
+number, so a move goes at its right edge; the latest moves (at most 16)
 wait in the branch's mover entry, which every move writes anyway, and go
 into the tree together, so a commit doesn't rewrite more of the refs for
 its log.  A log goes with its branch (a rename keeps it).  "The nearest
