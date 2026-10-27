@@ -233,7 +233,7 @@ int			block_map_replay_entries = 65536;
  * snapshots of the relation's tree.  This server reads only version 10 and
  * refuses anything older (refuse_version()).
  */
-#define BMAP_VERSION		10
+#define BMAP_VERSION		11
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -403,7 +403,21 @@ typedef struct BmapRoot
 	BmapEntry	top[BMAP_TREE_TOPS];
 	uint64		map_id;			/* the map's identity: where its record began */
 	uint64		made_of;		/* the captured root it was made a copy of */
+	uint64		lineage;		/* the map's lineage (0: map_id, its own) */
 } BmapRoot;
+
+/*
+ * A map's lineage: the identity its storage's pages are told by across
+ * new storage.  A map begins its own (its map_id, which no other map has),
+ * but one made of a captured root to take a relation's storage's place
+ * (a restore) carries on that storage's, so that the roots captured of
+ * either are of the relation still and nothing names the storage itself.
+ */
+static inline uint64
+root_lineage(const BmapRoot *root)
+{
+	return root->lineage != 0 ? root->lineage : root->map_id;
+}
 
 StaticAssertDecl(sizeof(xl_bmap_top) == sizeof(BmapEntry),
 				 "a captured root's pointer is a map entry");
@@ -1420,6 +1434,7 @@ apply_root_delta(Page page, const xl_bmap_root_delta *delta)
 		root->top[k].since = delta->tops[k].since;
 	}
 	root->made_of = delta->made_of;
+	root->lineage = delta->lineage;
 }
 
 /* a captured root's pointers, as map entries */
@@ -6030,12 +6045,14 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
  * changes something under one, which copies the path to it.  With 'from',
  * the pointers are those of a root captured of src, and dst's header gets
  * 'hdelta' in the same record, and src's header (held exclusively by the
- * caller in 'sheader', if valid) 'shdelta'.
+ * caller in 'sheader', if valid) 'shdelta'.  dst begins a lineage of its
+ * own, or with 'lineage' not 0 carries that one on.
  */
 static void
 tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 				const xl_bmap_header_delta *hdelta, Buffer sheader,
-				const xl_bmap_header_delta *shdelta, uint64 made_of)
+				const xl_bmap_header_delta *shdelta, uint64 made_of,
+				uint64 lineage)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
@@ -6063,6 +6080,7 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	rdelta.flags = BMAP_DELTA_INIT;
 	rdelta.ntops = BMAP_TREE_TOPS;
 	rdelta.made_of = made_of;
+	rdelta.lineage = lineage;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.tops[k].block = root.top[k].block;
@@ -6209,7 +6227,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 	if (own.n > 0)
 		store_flush_begin(srel);
-	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL, 0);
+	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL, 0, 0);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
 	/* the copy has the same changes since src's last fold */
@@ -9002,7 +9020,7 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
  */
 static BmapRootId
 root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
-				  RelFileNumber of, uint32 live_epoch)
+				  RelFileNumber of, uint32 live_epoch, uint64 of_lineage)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -9089,6 +9107,9 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	rdelta.root.snap.epoch = hdelta.epoch;
 	rdelta.root.relnumber = RelFileNumberIsValid(of) ? of : rel.relNumber;
 	rdelta.root.map_id = root.map_id;
+	/* (a frozen root's is the relation's whose pages it froze) */
+	rdelta.root.lineage = RelFileNumberIsValid(of) ? of_lineage :
+		root_lineage(&root);
 	rdelta.root.live_epoch = live_epoch;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
@@ -9182,7 +9203,7 @@ bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
 	for (int i = 0; i < n; i++)
 	{
 		ids[i] = root_capture_slot(rels[i], &own[i], false,
-								   InvalidRelFileNumber, 0);
+								   InvalidRelFileNumber, 0, 0);
 		if (owned)
 			owned[i] = own[i].n;
 		INJECTION_POINT("bmap-root-slot-captured", NULL);
@@ -9223,7 +9244,7 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
 	for (int i = 0; i < n && ok; i++)
 	{
 		ids[i] = root_capture_slot(rels[i], &own[i], true,
-								   InvalidRelFileNumber, 0);
+								   InvalidRelFileNumber, 0, 0);
 		ok = ids[i] != 0;
 		if (ok)
 			done++;
@@ -9252,7 +9273,8 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
 /*
  * A root of reln (a copy of relation 'of' whose pages were frozen into it),
  * captured as bmap_root_capture() does, recorded as of relation 'of', its
- * pages changed since told by epoch 'live_epoch' there (bmap_root_since()).
+ * pages changed since told by epoch 'live_epoch' there (bmap_root_since()),
+ * and of 'of''s lineage, 'lineage' (bmap_lineage()).
  *
  * The copy is temporary storage, dropped once the root is captured, so its
  * pages are logged as bmap_root_capture() logs a relation's own (the
@@ -9264,10 +9286,12 @@ bmap_root_capture_concurrent(SMgrRelation *rels, int n, BmapRootId *ids)
  * them.
  */
 BmapRootId
-bmap_root_capture_of(SMgrRelation reln, RelFileNumber of, uint32 live_epoch)
+bmap_root_capture_of(SMgrRelation reln, RelFileNumber of, uint32 live_epoch,
+					 uint64 lineage)
 {
 	BlockList	own = {0};
-	BmapRootId	id = root_capture_slot(reln, &own, false, of, live_epoch);
+	BmapRootId	id = root_capture_slot(reln, &own, false, of, live_epoch,
+									   lineage);
 
 	MarkRelationPagesShared(reln->smgr_rlocator.locator);
 	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
@@ -9388,7 +9412,7 @@ root_may_hold(const xl_bmap_root *r)
  * (sub)transaction as its capturer, so that it is held from that one's
  * commit and let go of on its own, and naming the map of holder (the
  * relation it is held for) as the one it was captured of: that map's own,
- * as a root captured of it would be (own_root_tops()).  O(1), nothing
+ * and its lineage, as a root captured of it would be (own_root_tops()).  O(1), nothing
  * written out: the blocks are the root's, durable since it was captured.
  * Its id, or 0 if the store holds no such root.
  */
@@ -9396,6 +9420,7 @@ BmapRootId
 bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 {
 	uint64		holder_map;
+	uint64		holder_lineage;
 	LOCKTAG		sweeptag;
 	Buffer		buf;
 	Buffer		rootsmeta;
@@ -9426,6 +9451,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, holder, BMAP_FORKNUM, 1);
 	holder_map = PageGetBmapRoot(BufferGetPage(buf))->map_id;
+	holder_lineage = root_lineage(PageGetBmapRoot(BufferGetPage(buf)));
 	UnlockReleaseBuffer(buf);
 
 	/* not while a sweep counts what the maps hold */
@@ -9483,6 +9509,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
 	rdelta.root.relnumber = holder.relNumber;
 	rdelta.root.map_id = holder_map;
+	rdelta.root.lineage = holder_lineage;
 	/*
 	 * (a frozen root's copy is frozen too, but the holder's changes since
 	 * are told by the root's own epoch, the holder being made of it)
@@ -9672,14 +9699,16 @@ bmap_root_unchanged(SMgrRelation reln, BmapRootId id)
  * may be; and with 'sharer', a relation still holding the root's pages
  * (the storage of another branch's table the root was kept of), so may
  * those of sharer, which its header's shared_below then says (in the same
- * record), so that its VACUUM leaves them.  Only the main fork.  The
+ * record), so that its VACUUM leaves them.  With 'lineage_of', dst carries
+ * on that storage's lineage (the one it takes the place of, whose roots are
+ * then of dst too); otherwise it begins its own.  Only the main fork.  The
  * root's slot is read under its page's lock, which keeps a releaser from
  * naming it meanwhile; a header held is locked first, as a capture locks
  * it.
  */
 void
 bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
-				SMgrRelation sharer)
+				SMgrRelation sharer, SMgrRelation lineage_of)
 {
 	RelFileLocator drel = dst->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -9689,6 +9718,7 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	xl_bmap_header_delta hdelta;
 	xl_bmap_header_delta shdelta;
 	uint32		shared_below = 0;
+	uint64		lineage = lineage_of ? bmap_lineage(lineage_of) : 0;
 
 	smgrusewhich(dst, SMGR_BMAP);
 	SET_LOCKTAG_OBJECT(sweeptag, drel.dbOid, BMAP_SWEEP_CLASSID, drel.spcOid, 0);
@@ -9769,7 +9799,7 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	hdelta.shared_below = replacing != NULL ?
 		Min(shared_below, hdelta.epoch) : hdelta.epoch;
 	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, sheader,
-					&shdelta, id);
+					&shdelta, id, lineage);
 	UnlockReleaseBuffer(buf);
 	if (BufferIsValid(sheader))
 		UnlockReleaseBuffer(sheader);
@@ -10008,6 +10038,37 @@ bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch)
 		return false;
 	*epoch = r.snap.epoch;
 	return true;
+}
+
+/* reln's map's lineage (see root_lineage()). */
+uint64
+bmap_lineage(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf = map_read(rel, 1);
+	uint64		lineage;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	lineage = root_lineage(PageGetBmapRoot(BufferGetPage(buf)));
+	UnlockReleaseBuffer(buf);
+	return lineage;
+}
+
+/*
+ * Was root 'id' captured of reln's lineage: of reln, of storage reln took
+ * the place of by carrying its lineage on (a restore), or of a copy of
+ * either's pages frozen as of them?  False if the store holds no such root.
+ */
+bool
+bmap_root_of(SMgrRelation reln, BmapRootId id)
+{
+	Buffer		buf;
+	xl_bmap_root r;
+
+	if (!root_read(reln->smgr_rlocator.locator, id, -1, &buf, &r))
+		return false;
+	return r.lineage != 0 && r.lineage == bmap_lineage(reln);
 }
 
 /* The captured root reln's tree was made a copy of (0: none). */

@@ -369,6 +369,7 @@ typedef struct xl_bmap_root_delta
 	uint32		ntops;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
 	uint64		made_of;		/* the captured root it is a copy of (0: none) */
+	uint64		lineage;		/* the lineage it carries on (0: its own) */
 } xl_bmap_root_delta;
 
 /*
@@ -394,7 +395,7 @@ typedef struct xl_bmap_snapshot
  * (snap.id 0: the slot is free; snap.owner the capturing
  * (sub)transaction), the (sub)transaction that let go of it (0: none),
  * and the map it was captured of: its identity (which no other map has,
- * whatever its file number) and file number (or the relation of whose
+ * whatever its file number), lineage and file number (or the relation of whose
  * pages it holds frozen copies, and the epoch of that relation since which
  * they changed).  It holds its subtrees
  * while its capturer has committed (or is too old to say) and nobody who
@@ -408,6 +409,8 @@ typedef struct xl_bmap_root
 	uint32		relnumber;
 	uint32		live_epoch;		/* of relnumber, its changes since told by
 								 * (0: snap.epoch) */
+	uint64		lineage;		/* of the map it was captured of (or of
+								 * relnumber's) */
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */

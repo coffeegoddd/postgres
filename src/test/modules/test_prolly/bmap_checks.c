@@ -665,7 +665,7 @@ test_bmap_share_root(PG_FUNCTION_ARGS)
 											 RELPERSISTENCE_PERMANENT);
 	SMgrRelation dst = smgropen(locator_of(copy), INVALID_PROC_NUMBER);
 
-	bmap_share_root((BmapRootId) PG_GETARG_INT64(0), dst, NULL, NULL);
+	bmap_share_root((BmapRootId) PG_GETARG_INT64(0), dst, NULL, NULL, NULL);
 	PG_RETURN_OID(copy);
 }
 

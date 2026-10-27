@@ -294,14 +294,17 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * meanwhile).  With replacing, the storage made takes that storage's place
  * (dropped as the transaction commits: a restore), and shares the pages
  * with no other relation for that; with sharer, a relation that still
- * holds the root's pages is told it shares them (bmap_share_root()).  The
- * storage is deleted if the
+ * holds the root's pages is told it shares them (bmap_share_root()).  With
+ * lineage_of, the storage carries that storage's lineage on (the session's
+ * own storage it gives new pages to: the roots captured of it stay its
+ * own); otherwise it begins one of its own.  The storage is deleted if the
  * transaction aborts when register_delete.
  */
 SMgrRelation
 RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 							  SMgrRelation maps_from, SMgrRelation replacing,
-							  SMgrRelation sharer, bool register_delete)
+							  SMgrRelation sharer, SMgrRelation lineage_of,
+							  bool register_delete)
 {
 	SMgrRelation srel;
 
@@ -323,7 +326,7 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 	}
 
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
-	bmap_share_root(root, srel, replacing, sharer);
+	bmap_share_root(root, srel, replacing, sharer, lineage_of);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 	if (maps_from)
 	{

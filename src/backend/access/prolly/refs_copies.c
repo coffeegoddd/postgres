@@ -388,8 +388,11 @@
  * 25: each kept commit an entry of its own, by height (retired ones by
  * number), with counts of the entries naming each root and a summary of
  * the branch's; and an index of tags by commit.
+ * 28: a kept relation's file number is the storage its root was captured
+ * of, never renamed by a restore: whose relation the root is, the block
+ * map's lineages tell.
  */
-#define REFS_FORMAT		"27"
+#define REFS_FORMAT		"28"
 
 /* A maker record's length: the role, then its dependency's id (each an OID) */
 #define MAKER_RECORD_LEN	(2 * sizeof(Oid))
@@ -3431,9 +3434,6 @@ static List *kept_get(const char *name);
 static void kept_put(const char *name, List *kept, KeptSummary *given);
 static void kept_forget_name(const char *name);
 
-static int	kept_carried(List *kept, const struct KeptCommit *was,
-						 const char *name, BranchKeptRelation **carry,
-						 BranchKeptRelation ***into);
 
 /*
  * The tables of the session's branch whose rows differ from target's made
@@ -3457,8 +3457,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	ListCell   *c;
 	char	   *current = branch_ops()->current();
 	int			nshared = 0;
-	List	   *kept = NIL;		/* the branch's kept commits, if shared from */
-	bool		renamed = false;
 
 	prolly_database_components(&dc);
 	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
@@ -3537,32 +3535,16 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		if (s->kept_commit != NULL)
 		{
 			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
-			BranchKeptRelation *carry;
-			BranchKeptRelation *carried;
-			BranchKeptRelation **into;
-			int			ncarry = 0;
 
 			/*
-			 * (the session's own kept pages: the branch's kept commits'
-			 * snapshots of the table carried into its new storage, as a
-			 * restore carries them, and their entries renamed)
+			 * (of the session's own kept pages, the new storage carries
+			 * the table's lineage on, so the branch's other kept roots of
+			 * it stay its own, with nothing renamed; of another branch's,
+			 * it begins its own)
 			 */
-			if (s->branch == MyBranch && kept == NIL)
-			{
-				kept_forget_name(current);
-				kept = kept_get(current);
-			}
-			if (s->branch == MyBranch)
-				ncarry = kept_carried(kept, NULL, table, &carry, &into);
-			else
-				carry = NULL;
-			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels,
-											carry, ncarry, carried, NULL,
+											s->branch == MyBranch, NULL,
 											NULL, &move_wait);
-			for (int j = 0; done && j < ncarry; j++)
-				*into[j] = carried[j];
-			renamed |= done && ncarry > 0;
 		}
 		else
 			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s,
@@ -3573,8 +3555,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			nshared++;
 		}
 	}
-	if (renamed)
-		kept_put(current, kept, NULL);
 	if (nshared == 0)
 		return false;
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
@@ -4608,6 +4588,7 @@ kept_scan(const char *name, char kind, bool backward, int limit, bool note)
 		out = lappend(out, kept_decode((const char *) k.data, k.len,
 									   (const char *) v.data,
 									   (const char *) v.data + v.len));
+		pgstat_count_prolly(PGSTAT_PROLLY_KEPT_ENTRIES_READ, 1);
 		if (note)
 			kept_note_loaded(name, &k, &v);
 	}
@@ -4647,6 +4628,7 @@ kept_lookup(const char *name, const ProllyHash *commit, bool note)
 		ProllyValue val = {(const uint8 *) v.data, v.len};
 
 		kc = kept_decode(key.data, key.len, v.data, v.data + v.len);
+		pgstat_count_prolly(PGSTAT_PROLLY_KEPT_ENTRIES_READ, 1);
 		if (note)
 			kept_note_loaded(name, &k, &val);
 	}
@@ -4852,6 +4834,7 @@ kept_put(const char *name, List *kept, KeptSummary *given)
 			live_changed = true;
 		}
 		refs_put(x->key.data, x->key.len, NULL);
+		pgstat_count_prolly(PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN, 1);
 	}
 	foreach_ptr(KeptChange, y, added)
 	{
@@ -4866,6 +4849,7 @@ kept_put(const char *name, List *kept, KeptSummary *given)
 			live_changed = true;
 		}
 		refs_put(y->key.data, y->key.len, &y->enc);
+		pgstat_count_prolly(PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN, 1);
 	}
 	foreach_ptr(KeptCount, c, counts)
 	{
@@ -6622,49 +6606,6 @@ kept_total_bytes(void)
 }
 
 /*
- * The relations of table name as the other commits of kept (but was, and
- * those retired) keep them: copies into *carry, and where each is into
- * *into, for a restore of the table to carry their snapshots into the
- * storage it gives it (restore()'s carry[]), which would otherwise go with
- * the storage it replaces.  How many.
- */
-static int
-kept_carried(List *kept, const struct KeptCommit *was, const char *name,
-			 BranchKeptRelation **carry, BranchKeptRelation ***into)
-{
-	int			n = 0;
-
-	foreach_ptr(KeptCommit, o, kept)
-	{
-		if (o == was || FullTransactionIdIsValid(o->retired))
-			continue;
-		for (int t = 0; t < o->ntables; t++)
-			if (strcmp(o->tables[t].name, name) == 0)
-				n += o->tables[t].nrels;
-	}
-	*carry = palloc_array(BranchKeptRelation, Max(n, 1));
-	*into = palloc_array(BranchKeptRelation *, Max(n, 1));
-	n = 0;
-	foreach_ptr(KeptCommit, o, kept)
-	{
-		if (o == was || FullTransactionIdIsValid(o->retired))
-			continue;
-		for (int t = 0; t < o->ntables; t++)
-		{
-			if (strcmp(o->tables[t].name, name) != 0)
-				continue;
-			for (int r = 0; r < o->tables[t].nrels; r++)
-			{
-				(*carry)[n] = o->tables[t].rels[r];
-				(*into)[n] = &o->tables[t].rels[r];
-				n++;
-			}
-		}
-	}
-	return n;
-}
-
-/*
  * Would restore_kept() give table kt (of a kept commit whose readable
  * tables are readable) its kept pages, its relation *relid: it is on the
  * branch as it was then (other: kept by another branch, whose pages it
@@ -6720,9 +6661,13 @@ restore_planned(const ProllyDatabaseComponents *dc, const KeptTable *kt,
  * storage each restored relation had is kept for the snapshots older than
  * the move (replaced_entry()).  The tables restored are added to
  * *restored, and *baseline spliced with the kept one's entries for them;
- * *kept is the branch's list with the commit kept anew (by the restored
- * tables' new storage) and the storage replaced, to be put once the
- * restores are done.
+ * *kept is the branch's list with the storage replaced added (and, for
+ * another branch's pages held for the session's, the commit kept anew by
+ * them), to be put once the restores are done.  A restore of the branch's
+ * own pages changes no entry: each restored relation's new storage
+ * carries its old storage's lineage on, so the commit's roots, and every
+ * other kept commit's of the table, are of it as they were (restore()),
+ * whatever their number.
  */
 static void
 restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
@@ -6761,9 +6706,8 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 	}
 
 	/*
-	 * (the commit kept anew, the restored tables by their new storage's
-	 * snapshots; the entry it was kept by retired, never changed in place,
-	 * so its snapshots stay until the transaction is known to commit)
+	 * (a copy: another branch's entry is never put, and the session's kept
+	 * anew of it holds roots of its own; the branch's own is left as it is)
 	 */
 	kc = palloc(sizeof(KeptCommit));
 	*kc = *was;
@@ -6797,10 +6741,6 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		Oid			relid;
 		BranchKeptRelation *renewed;
 		BranchKeptRelation *replaced;
-		BranchKeptRelation *carry;
-		BranchKeptRelation *carried;
-		BranchKeptRelation **into;
-		int			ncarry;
 		bool		any = false;
 		bool		skipped = false;
 
@@ -6819,10 +6759,10 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 
 		/*
 		 * (another branch's kept pages: shared, as a move shares them,
-		 * that branch's list left as it is, and the session's kept commits
-		 * of the table, of another lineage, carried nowhere; the storage
-		 * replaced kept for the snapshots older than the move, as a
-		 * restore's is)
+		 * that branch's list left as it is; the new storage carries the
+		 * table's lineage on, as a restore's does, so the session's kept
+		 * commits of the table stay its own; the storage replaced kept for
+		 * the snapshots older than the move, as a restore's is)
 		 */
 		if (other)
 		{
@@ -6830,24 +6770,14 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 			bool		all = branch_ops()->hold != NULL;
 			int			nheld = 0;
 
-			/*
-			 * (the session's own kept commits of the table carried to the
-			 * new storage, renamed, as a restore on the branch carries them:
-			 * their roots are the store's)
-			 */
-			ncarry = kept_carried(*kept, NULL, kt->name, &carry, &into);
-			carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 			if (!branch_replaced_reserve(kt->nrels))
 				continue;
-			if (!branch_ops()->share_kept(source, kt->rels, kt->nrels, carry,
-										  ncarry, carried, renewed, replaced,
-										  &move_wait))
+			if (!branch_ops()->share_kept(source, kt->rels, kt->nrels, true,
+										  renewed, replaced, &move_wait))
 			{
 				branch_replaced_release_unused();
 				continue;
 			}
-			for (int j = 0; j < ncarry; j++)
-				*into[j] = carried[j];
 			now = lappend(now, kt->name);
 			storage = lappend(storage,
 							  replaced_entry(kc, kt, renewed, replaced));
@@ -6878,8 +6808,6 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 					branch_ops()->let_go(&held[r]);
 			continue;
 		}
-		ncarry = kept_carried(*kept, was, kt->name, &carry, &into);
-		carried = palloc_array(BranchKeptRelation, Max(ncarry, 1));
 		/*
 		 * (an entry for each relation's replaced storage reserved first:
 		 * with none free, nothing is replaced, and the rows are written,
@@ -6887,38 +6815,25 @@ restore_kept(const ProllyDatabaseComponents *dc, const ProllyCommitInfo *commit,
 		 */
 		if (!branch_replaced_reserve(kt->nrels))
 			continue;
-		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, carry, ncarry,
-								   carried, replaced, &move_wait))
+		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed, replaced,
+								   &move_wait))
 		{
 			branch_replaced_release_unused();
 			continue;
 		}
-		for (int j = 0; j < ncarry; j++)
-			*into[j] = carried[j];
 		for (int r = 0; r < kt->nrels; r++)
-			any |= renewed[r].relfilenumber != kt->rels[r].relfilenumber;
+			any |= RelFileNumberIsValid(replaced[r].relfilenumber);
 		if (any)
 			storage = lappend(storage, replaced_entry(kc, kt, renewed, replaced));
 		branch_replaced_release_unused();
 		if (!any)
 			continue;
-		memcpy(kt->rels, renewed, sizeof(BranchKeptRelation) * kt->nrels);
 		now = lappend(now, kt->name);
 	}
 	if (now == NIL)
 		return;
 
-	/*
-	 * (the restored tables' roots, which their new storage is of, kept at
-	 * once; the other commits whose pages were in the storage replaced
-	 * dropped with it)
-	 */
-	if (!other)
-	{
-		*kept = kept_drop_dead(lcons(kc, *kept), kc, NULL);
-		was->retired = GetTopFullTransactionId();
-	}
-	else if (own != NIL)
+	if (other && own != NIL)
 	{
 		/*
 		 * (kept anew by the session's branch: only the tables it holds, as
@@ -6975,22 +6890,37 @@ note_other_kept(const char *name, const ProllyHash *commit, void *arg)
 }
 
 /*
- * Commit id's kept pages, which the session branch's list (kept) has, or
- * else another branch's (found by the refs' index of kept commits): the
- * entry, and in *source the branch keeping it.  NULL if none does.  A
- * commit's pages are the commit's whichever branch kept them.
+ * Branch name's live entry for commit, from *kept (some of the branch's
+ * entries, read by kept_scan() or this) or else read by a seek and added
+ * to it, to be put with it: NULL if the branch keeps no such commit.  So a
+ * move reads the entries it uses, never the branch's every one.
  */
 static KeptCommit *
-kept_anywhere(List *kept, const ProllyHash *id, Oid *source)
+kept_load(const char *name, List **kept, const ProllyHash *commit)
+{
+	KeptCommit *kc = kept_find(*kept, commit);
+
+	if (kc == NULL && (kc = kept_lookup(name, commit, true)) != NULL)
+		*kept = lappend(*kept, kc);
+	return kc;
+}
+
+/*
+ * Commit id's kept pages, which the session branch's list (*kept, as
+ * kept_load() has it) has, or else another branch's (found by the refs'
+ * index of kept commits): the entry, and in *source the branch keeping
+ * it.  NULL if none does.  A commit's pages are the commit's whichever
+ * branch kept them.
+ */
+static KeptCommit *
+kept_anywhere(List **kept, const ProllyHash *id, Oid *source)
 {
 	KeptCommit *kc = NULL;
 	OtherKept	ok = {branch_ops()->current(), NULL};
 	HeapTuple	tup;
 
-	/* (a seek first: the list is the branch's every kept commit) */
 	*source = MyBranch;
-	if (kept_lookup(ok.current, id, false) != NULL)
-		kc = kept_find(kept, id);
+	kc = kept_load(ok.current, kept, id);
 	if (kc != NULL && kc->baseline.len > 0)
 		return kc;
 	copies_kept_holders(id, NULL, note_other_kept, &ok);
@@ -7033,7 +6963,7 @@ note_lowest_kept(const ProllyKey *k, const ProllyValue *v, void *arg)
 }
 
 static KeptCommit *
-nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
+nearest_kept(List **kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
 			 Oid *source)
 {
 	ProllyHash	id;
@@ -7072,8 +7002,8 @@ nearest_kept(List *kept, const ProllyCommitInfo *commit, ProllyCommitInfo *info,
  * nearest kept commit before it are, where they pay, and the move then
  * writes the rows the two differ by.  The tables
  * that aren't (the commit isn't kept, or a table's kept pages are gone: a
- * restore of another commit since gave the table new storage, and its
- * old storage, where the commit's snapshot was, went with it) are given
+ * rewrite or a truncation since gave the table storage of another
+ * lineage, which none of its roots was captured of) are given
  * the pages kept as of the branch's head, if those are kept: so the move
  * discards the working set's changes in O(1), as a hard reset to the head
  * does, and writes only the rows the head and the commit differ by, not
@@ -7103,10 +7033,15 @@ restore_pages(const ProllyCommitInfo *commit)
 		return;
 	name = branch_ops()->current();
 	kept_forget_name(name);
-	kept = kept_get(name);
+	/*
+	 * (only the newest few entries, and those the move uses, each found by
+	 * a seek: a restore renames no other entry, so its reads, as its
+	 * writes, don't grow with the branch's kept commits)
+	 */
+	kept = kept_scan(name, KEPT_LIVE, true, KEPT_ASKED_MAX, true);
 	if (!branch_baseline(name, &baseline))
 		return;
-	was = kept_usable(name, &kept, kept_anywhere(kept, &commit->id, &source),
+	was = kept_usable(name, &kept, kept_anywhere(&kept, &commit->id, &source),
 					  source);
 	if (was != NULL)
 		restore_kept(&dc, commit, was, source, &kept, NIL, NULL, &baseline,
@@ -7120,7 +7055,7 @@ restore_pages(const ProllyCommitInfo *commit)
 		was = NULL;
 	if (was == NULL &&
 		(was = kept_usable(name, &kept,
-						   nearest_kept(kept, commit, &at_head, &source),
+						   nearest_kept(&kept, commit, &at_head, &source),
 						   source)) != NULL &&
 		!(branch_head(name, &head) && same_hash(&head, &at_head.id)))
 	{
@@ -7140,7 +7075,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	 * could give back)
 	 */
 	if (branch_head(name, &head) && !same_hash(&head, &commit->id) &&
-		(was = kept_find(kept, &head)) != NULL &&
+		(was = kept_load(name, &kept, &head)) != NULL &&
 		!(was->unfrozen && list_length(restored) >= was->ntables) &&
 		(was = kept_usable(name, &kept, was, MyBranch)) != NULL &&
 		was->baseline.len > 0 &&

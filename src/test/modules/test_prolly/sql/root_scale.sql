@@ -124,7 +124,7 @@ BEGIN
 		EXECUTE format('INSERT INTO r%s VALUES (1)', i);
 	END LOOP;
 END $$;
-SELECT (slots / 68) AS slot_pages FROM test_bmap_roots() \gset
+SELECT (slots / 63) AS slot_pages FROM test_bmap_roots() \gset
 SELECT mark();
 SELECT freed >= 0 AS swept FROM prolly_page_sweep();
 :flush

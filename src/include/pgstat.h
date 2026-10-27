@@ -841,9 +841,12 @@ typedef enum PgStat_ProllyCounter
 											 * read */
 	PGSTAT_PROLLY_HORIZON_ENTRIES_READ, /* the history horizon's entries
 										 * read, a commit's or a fragment's */
+	PGSTAT_PROLLY_KEPT_ENTRIES_READ,	/* branches' kept-commit entries
+										 * read from the refs */
+	PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN, /* and put or deleted */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_HORIZON_ENTRIES_READ + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

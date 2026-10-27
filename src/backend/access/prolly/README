@@ -1464,20 +1464,37 @@ root, O(1), its pg_class row repointed with its oldest transaction ids
 then, as TRUNCATE gives a relation new storage, and the old storage kept
 for the snapshots older than the move (below).  The branch's other kept
 commits' roots of the relation are the page store's, not the old
-storage's: their entries are renamed to the new storage (carried),
-nothing copied, so those commits stay kept and resets back and forth
-between kept commits restore every time.  An abort or a crash before the
-commit drops or orphans the new storage; the old one and the roots are
-untouched.  A move that gives a table the pages another of the branch's
-own kept commits holds of the target's rows (share_kept(), from a commit
-with the same data: an empty commit's, an amend's) carries them the same
-way.  A move that gives a table another branch's storage (share(), or
-share_kept() of another branch's kept pages) replaces the table's storage
-too but carries nothing: those pages are of another lineage, so the
-branch's kept commits of that table are dropped (kept_drop_dead()), and
-a reset back to one shares another kept root or writes its rows.  A
-move that restores another branch's kept commit holds its roots for the
-session's branch too (hold(): another root of the same subtrees, O(1),
+storage's, and nothing kept names the storage: each block map has a
+lineage (bmap_lineage(): a map begins its own, its identity, which no
+other map has), each root records its map's (a frozen root, the
+relation's it froze), and a root is a relation's while it is of the
+lineage of the relation's storage (bmap_root_of()).  The new storage a
+restore makes carries the lineage of the storage it replaces on, logged
+with the map in the same record, so the branch's other kept roots of the
+relation are of it as they were of the old one: nothing is renamed and
+no kept entry is written, not even the restored commit's.  A restore is
+so O(1) in the number of roots, whatever the window holds: it reads only
+the kept entries it uses (the target's, the head's, the newest few, by
+seeks), and writes only the entry of the storage it replaced, kept for
+older snapshots; pg_stat_prolly's kept_entries_read and
+kept_entries_written count them.  Resets back and forth between kept
+commits restore every time.  An abort or a crash before the commit drops
+or orphans the new storage, which nothing names: the old one and the
+roots are untouched.  A move that gives a table the pages another of the
+branch's own kept commits holds of the target's rows (share_kept(), from
+a commit with the same data: an empty commit's, an amend's) carries the
+lineage on the same way.  A move that gives a table another branch's
+storage (share()), or another branch's kept pages where they cost less
+than writing the rows (share_kept() from the move's planned shares),
+replaces the table's storage too, but its new storage begins a lineage
+of its own, so the branch's kept commits of that table are gone for it,
+dropped by a later keep (kept_drop_dead()), and a reset back to one
+shares another kept root or writes its rows.  A move that restores
+another branch's kept commit (share_kept() of the commit's every table)
+gives the new storage the session storage's lineage, as a restore does
+(the pages are stored alike on both branches), so the branch's own kept
+commits of the table stay restorable; and it holds the commit's roots
+for the session's branch too (hold(): another root of the same subtrees, O(1),
 frozen if the source's was) and lists the commit as the branch's own,
 so the keep after the move captures nothing and a move back restores
 it from the branch's own list.  The
@@ -1598,10 +1615,11 @@ tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
 
-A restore gives each table it restores new storage and carries the
-other kept commits' roots of it there (above); a rewrite or a truncation
-gives it storage no root was captured of, and a drop takes it, so its
-kept commits' roots are then gone for it, let go of by a later keep.
+A restore gives each table it restores new storage of the same lineage,
+which the other kept commits' roots of it are still of (above); a
+rewrite or a truncation gives it storage of a lineage of its own, no
+root's, and a drop takes it, so its kept commits' roots are then gone for
+it, let go of by a later keep.
 Each keep and each restore asks what is left of each kept commit's
 pages (branch
 operations' kept_status(); pg_stat_prolly's kept_status_checks counts the
@@ -1625,7 +1643,7 @@ keeping its commit
 and baseline from collection, until a later keep lets go of its
 roots.  Neither is offered to a
 move or a first use.  A commit with a table whose relations are all still
-on the storage that kept them stays kept (restore_pages() may still pass
+on storage of the lineage that kept them stays kept (restore_pages() may still pass
 the table over, renamed or with other relations since).  Roots that a
 dropped commit shares with one let go of are kept until a later keep: the
 change that made it gone may roll back.

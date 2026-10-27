@@ -38,10 +38,11 @@ typedef bool (*BranchVisitWhile) (const char *name, Oid branch, void *arg);
 /*
  * A relation's pages as keep() kept them, for restore() to give back: the
  * storage they were kept of (its tablespace, 0 for the database's, and
- * file number: a restore of them since names its new storage), the root
- * that keeps them in the tablespace's page store ('snapshot', its id
- * there), and the relation's oldest unfrozen transaction and multixact ids
- * then (its pages hold none older).
+ * file number, which nothing compares: a root is the relation's while it
+ * is of its storage's lineage, which a restore's new storage carries on),
+ * the root that keeps them in the tablespace's page store ('snapshot', its
+ * id there), and the relation's oldest unfrozen transaction and multixact
+ * ids then (its pages hold none older).
  */
 typedef struct BranchKeptRelation
 {
@@ -80,8 +81,9 @@ typedef struct BranchKeptRelation
  * pages not to be given back (a root not frozen, whose rows' transaction
  * ids are older than the database still knows: a frozen root is never
  * held); or gone, its root no longer kept, or the
- * relation on other storage now than the one kept (or restored since) of
- * it, so nothing is left to give back.
+ * relation on storage now of another lineage than the root (a rewrite, a
+ * truncation, another branch's pages shared), so nothing is left to give
+ * back.
  */
 typedef enum BranchKeptStatus
 {
@@ -95,7 +97,7 @@ typedef enum BranchKeptStatus
  * not a snapshot in it: the storage a restore replaced (its tablespace and
  * relfilenumber, no longer the relation's in pg_class), kept whole for the
  * snapshots older than the move, which read it.  Such an entry is never
- * restored, shared, carried or checked for its status; letting go of it
+ * restored, shared or checked for its status; letting go of it
  * (let_go(), keep()'s release[]) drops the storage as the transaction
  * commits.  The refs keep it as a retired entry of the branch's kept list,
  * all of whose relations are such entries.
@@ -339,11 +341,11 @@ typedef struct BranchOpsRoutine
 	 * lock_for_restore() for the order), else tried, within *wait's
 	 * bounds, as share() tries, never queued for; the locks are kept.
 	 * The storage a relation is given replaces the storage that kept its
-	 * pages; the roots stay in the page store, so each of carry[] (ncarry
-	 * of them, other commits' kept pages of the same relations) kept of a
-	 * replaced storage is named as of the new storage in carried[] (one
-	 * for each, in order), nothing copied; one not of a replaced storage
-	 * is copied as it is.
+	 * pages and carries its lineage on (bmap_lineage()): the roots stay
+	 * in the page store, and every other root kept of the replaced storage
+	 * is of the new one too, as kept_status() tells, with nothing renamed
+	 * (O(1) in the number of roots).  renewed[] names each relation's new
+	 * storage (its relfilenumber; the root and the rest as kept[]).
 	 * The storage each relation had isn't dropped: replaced[] (one for
 	 * each, in order) names it (its snapshot BRANCH_KEPT_STORAGE, its
 	 * relfilenumber invalid if the relation kept its storage), for the
@@ -353,8 +355,6 @@ typedef struct BranchOpsRoutine
 	 */
 	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
 							BranchKeptRelation *renewed,
-							const BranchKeptRelation *carry, int ncarry,
-							BranchKeptRelation *carried,
 							BranchKeptRelation *replaced,
 							BranchLockWait *wait);
 
@@ -423,18 +423,19 @@ typedef struct BranchOpsRoutine
 	 * snapshot taken before the keeping transaction ended could read
 	 * versions source made and deleted, rows never the session branch's,
 	 * so the caller gives only pages kept before every snapshot there is.
-	 * With source the session's own branch, carry[] is carried into the
-	 * new storage as restore() carries it, carried[] naming each there
-	 * (every one of them, the root shared included); with another's,
-	 * carried[] is carry[] as it is (carry may then be NULL, ncarry 0).
+	 * With keep_lineage, the new storage carries the lineage of the
+	 * storage it replaces on, as restore()'s does, so the branch's other
+	 * kept roots of the relation stay of it (whichever branch's pages it
+	 * is given: they are stored alike); otherwise it begins a lineage of
+	 * its own, and none of the branch's kept roots of the relation is of
+	 * it any more.
 	 * With replaced (and renewed) not NULL, the storage each relation had
 	 * isn't dropped but named in replaced[], each relation's new storage in
 	 * renewed[] (one for each, in order), for the caller to keep for the
 	 * snapshots older than the move, as restore()'s replaced[] are kept.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
-							   int nkept, const BranchKeptRelation *carry,
-							   int ncarry, BranchKeptRelation *carried,
+							   int nkept, bool keep_lineage,
 							   BranchKeptRelation *renewed,
 							   BranchKeptRelation *replaced,
 							   BranchLockWait *wait);

@@ -40,6 +40,7 @@ extern SMgrRelation RelationCreateStorageFromRoot(RelFileLocator rlocator,
 												  SMgrRelation maps_from,
 												  SMgrRelation replacing,
 												  SMgrRelation sharer,
+												  SMgrRelation lineage_of,
 												  bool register_delete);
 extern void RelationDropStorage(Relation rel);
 extern void RelationDropStorageByLocator(RelFileLocator rlocator);
