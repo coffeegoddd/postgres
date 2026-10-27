@@ -149,14 +149,42 @@ dirty
 
 step s2_end: COMMIT;
 
-starting permutation: s2_begin s2_write s1_dirty s1_commit s2_end s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how s2_gone
+starting permutation: s2_begin s2_write s1_dirty s1_flush s1_kmark s1_commit s1_flush s1_kept s2_end s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how s2_gone
 step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s2_write: INSERT INTO vrk.t VALUES (100, 'in flight');
 step s1_dirty: UPDATE vrk.t SET v = 'dirty' WHERE id <= 10;
+step s1_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step s1_kmark: 
+	SELECT set_config('vrk.kept', vrk_counted('pages_kept')::text, false) IS NOT NULL AS marked;
+
+marked
+------
+t     
+(1 row)
+
 step s1_commit: SELECT dolt_commit('-am', 'vrk commit') IS NOT NULL AS ok;
 ok
 --
 t 
+(1 row)
+
+step s1_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step s1_kept: 
+	SELECT vrk_counted('pages_kept') = current_setting('vrk.kept')::bigint AS kept_nothing;
+
+kept_nothing
+------------
+t           
 (1 row)
 
 step s2_end: COMMIT;
@@ -195,7 +223,7 @@ step s1_how:
 
 rows_written|pages_given_back|base_rows
 ------------+----------------+---------
-t           |f               |       10
+t           |t               |       10
 (1 row)
 
 step s2_gone: SELECT count(*) AS in_flight FROM vrk.t WHERE id = 100;

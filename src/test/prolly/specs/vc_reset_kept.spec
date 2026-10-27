@@ -2,7 +2,9 @@
 # pages kept as of its commit, rather than writing rows back.  A commit
 # made while another transaction writes the branch keeps no pages (they
 # hold that transaction's rows, which the commit doesn't): the reset after
-# writes the rows.  A reset while another transaction holds a table
+# gives the tables the pages of the nearest commit before it that kept
+# them (kept with no other writer at work), and writes the rows the two
+# differ by.  A reset while another transaction holds a table
 # (reading it) waits for it, as TRUNCATE does, and then gives the pages
 # back; the reader's snapshot reads what it saw meanwhile.  A snapshot
 # that didn't hold the table, older than the reset, goes on reading what
@@ -51,6 +53,14 @@ step s1_how
 		(SELECT count(*) FROM vrk.t WHERE v = 'base') AS base_rows;
 }
 step s1_commit	{ SELECT dolt_commit('-am', 'vrk commit') IS NOT NULL AS ok; }
+step s1_kmark
+{
+	SELECT set_config('vrk.kept', vrk_counted('pages_kept')::text, false) IS NOT NULL AS marked;
+}
+step s1_kept
+{
+	SELECT vrk_counted('pages_kept') = current_setting('vrk.kept')::bigint AS kept_nothing;
+}
 
 session s2
 step s2_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
@@ -71,6 +81,8 @@ permutation s1_dirty s2_begin s2_read s1_flush s1_mark s1_reset s2_read s2_end s
 # reads what it saw: the storage the reset replaced
 permutation s1_dirty s2_begin s2_other s1_flush s1_mark s1_reset s1_flush s1_how s2_read s2_end
 
-# a commit while another writes keeps nothing: the reset writes the rows,
-# and the other's row, committed after the commit, is discarded with them
-permutation s2_begin s2_write s1_dirty s1_commit s2_end s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how s2_gone
+# a commit while another writes keeps nothing: the reset gives back the
+# pages kept as of the commit before (the base's, kept with nobody else
+# writing) and writes the rows between, and the other's row, committed
+# after the commit, is discarded with the working set
+permutation s2_begin s2_write s1_dirty s1_flush s1_kmark s1_commit s1_flush s1_kept s2_end s1_dirty s1_flush s1_mark s1_reset s1_flush s1_how s2_gone
