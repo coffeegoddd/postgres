@@ -7,6 +7,8 @@
 -- to the merge base of two branches.
 
 SELECT current_database() AS home \gset
+-- (notices without their details, which name commits by hash)
+\set VERBOSITY terse
 -- (a database of its own: its history is only this test's)
 CREATE DATABASE regress_history_horizon;
 \c regress_history_horizon
