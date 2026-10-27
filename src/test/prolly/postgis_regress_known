@@ -10,3 +10,4 @@
 # on that mode as the summary prints it.  Only that diff is listed: a test
 # whose diff changes is a regression again, and so is a listed test that
 # agrees with heap, so a fixed bug's line must go with its fix.
+regress/core/regress_index prolly_all_txn #1073 bug 290333ad51db1ba7a23531db0bc0f1c3 commits refuse the operator the test makes in its own schema, versioned in this mode
