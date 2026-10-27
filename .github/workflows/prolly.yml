@@ -308,6 +308,19 @@ jobs:
       - name: Prolly interface conformance and recovery (test_prolly)
         run: make -C src/test/modules/test_prolly check
 
+      # (pgvector's HNSW and IVFFlat under roots: the pinned pgvector built
+      # against the temporary installation the step above made, and its
+      # test run again there, which skips without it)
+      - name: pgvector indexes under roots (test_prolly, pinned pgvector)
+        run: |
+          git clone --quiet --depth 1 --branch v0.8.7 \
+            https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
+          PG_CONFIG="$(find "$PWD/tmp_install" -path '*/bin/pg_config' | head -1)"
+          make -s -j4 -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PG_CONFIG" OPTFLAGS=
+          make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PG_CONFIG" install
+          PG_TEST_REQUIRE_VECTOR=1 make -C src/test/modules/test_prolly check NO_TEMP_INSTALL=1 REGRESS= \
+            PROVE_TESTS=t/781_root_vector_indexes.pl
+
       - name: pg_waldump (prolly resource managers)
         run: make -C src/bin/pg_waldump check
 
