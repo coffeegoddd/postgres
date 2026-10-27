@@ -103,6 +103,12 @@ extern bool branch_fold_last(Oid branch, Snapshot snap,
 extern bool branch_writers_settled(Oid branch, Snapshot snap);
 
 /*
+ * Does snap see every writer of branch that committed, others still
+ * writing it or not?
+ */
+extern bool branch_writers_seen(Oid branch, Snapshot snap);
+
+/*
  * The fold worker's view: the databases, and the current database's
  * branches (with their generation), whose generation moved since it last
  * saw them; and what it saw.

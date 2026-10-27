@@ -1418,6 +1418,31 @@ branch_writers_settled(Oid branch, Snapshot snap)
 }
 
 /*
+ * Does snap see every writer of branch that committed, whoever may be
+ * writing it still?  For pages kept while writers are at work, to be
+ * frozen as of snap: their versions of writers snap doesn't see are
+ * dropped then, so only an ended writer it doesn't see (whose rows the
+ * commit lacks, but the pages hold as committed) would be wrong.  False
+ * where nothing can be told, as for branch_writers_settled().
+ */
+bool
+branch_writers_seen(Oid branch, Snapshot snap)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	bool		seen;
+
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC ||
+		RecoveryInProgress() || written_overflow)
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, branch);
+	seen = sees_writers(g, e, snap);
+	LWLockRelease(&g->lock);
+	return seen;
+}
+
+/*
  * Roots are captured no more often than an interval asks: each branch's
  * last root time is shared by every backend, so that one of them, not each,
  * reads the branch's kept commits and tries a keep once the interval has

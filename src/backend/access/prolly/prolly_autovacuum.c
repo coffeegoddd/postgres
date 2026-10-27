@@ -224,7 +224,7 @@ prolly_autovacuum_init(void)
 							NULL, NULL, NULL);
 	DefineCustomBoolVariable("prolly.freeze_roots",
 							 "Freeze the roots a commit captures as the commit keeps them.",
-							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are (as under dolt.transaction_commit, whose roots aren't frozen as captured).",
+							 "A frozen root holds copies of the pages changed since the relation's last, frozen as of the commit, and shares none with the relation; off, a root shares the relation's pages as they are.  Under dolt.transaction_commit roots are captured among the writers and frozen later, in the background, or by a move to their commit; off, they are kept only while no other writer is at work.",
 							 &prolly_freeze_roots,
 							 true,
 							 PGC_USERSET,
