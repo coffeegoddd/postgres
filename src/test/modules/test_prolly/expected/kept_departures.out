@@ -270,3 +270,258 @@ SELECT kept('b', :'x') AS b_still_keeps_x;
 
 \c :home
 DROP DATABASE kept_departures_other;
+-- A third branch's keep of a commit, its head elsewhere: a move on
+-- another branch is given its pages (the refs' kept_holders()), a count
+-- of the commit's log reads its recorded count, and a sever forgets its
+-- keep with every other branch's.
+CREATE DATABASE kept_departures_third;
+\c kept_departures_third
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
+	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
+	WHERE name IN ('apply_rows', 'move_tables_shared', 'commits_read')
+$$;
+CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
+LANGUAGE sql AS $$
+	SELECT key, value::bigint - coalesce((before ->> key)::bigint, 0)
+	FROM jsonb_each_text(counted()) ORDER BY 1
+$$;
+CREATE FUNCTION kept(b text, c text) RETURNS bool LANGUAGE sql AS $$
+	SELECT EXISTS (SELECT FROM test_kept_commits(b) WHERE commit_id = c)
+$$;
+CREATE SCHEMA k3 VERSIONED;
+CREATE TABLE k3.t (id int PRIMARY KEY, v int NOT NULL);
+INSERT INTO k3.t SELECT g, 0 FROM generate_series(1, 2000) g;
+-- commits dated long ago, one a day: all past a sever before 2020-06
+CREATE FUNCTION old(tag text, i int) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	UPDATE k3.t SET v = i WHERE id <= 20;
+	RETURN dolt_commit('-am', tag || i, '--date',
+		(timestamptz '2020-01-01 00:00+00' + make_interval(days => i))::text);
+END $$;
+SELECT dolt_commit('-Am', 'base', '--date', '2020-01-01 00:00+00') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT length(old('old', i)) > 0 AS committed FROM generate_series(1, 20) i;
+ committed 
+-----------
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+(20 rows)
+
+SELECT dolt_hashof('main') AS y \gset
+SELECT length(old('old', i)) > 0 AS committed FROM generate_series(21, 30) i;
+ committed 
+-----------
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+ t
+(10 rows)
+
+SELECT dolt_hashof('main') AS x \gset
+SELECT dolt_branch('b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('c');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT length(old('main', i)) > 0 AS committed FROM generate_series(31, 32) i;
+ committed 
+-----------
+ t
+ t
+(2 rows)
+
+UPDATE k3.t SET v = -1 WHERE id = 2000;
+SELECT dolt_commit('-am', 'main on') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- b and c keep y by a move back to it, then go on from x: y is below
+-- every branch's fork, the commits a sever before 2020-06 cuts
+SELECT dolt_checkout('b');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'b'"}
+(1 row)
+
+SELECT dolt_reset('--hard', :'y') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'x') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT length(old('b', i)) > 0 AS committed FROM generate_series(41, 42) i;
+ committed 
+-----------
+ t
+ t
+(2 rows)
+
+UPDATE k3.t SET v = -2 WHERE id = 1999;
+SELECT dolt_commit('-am', 'b on') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('c');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'c'"}
+(1 row)
+
+SELECT dolt_reset('--hard', :'y') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'x') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT length(old('c', i)) > 0 AS committed FROM generate_series(51, 52) i;
+ committed 
+-----------
+ t
+ t
+(2 rows)
+
+UPDATE k3.t SET v = -3 WHERE id = 1998;
+SELECT dolt_commit('-am', 'c on') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT kept('main', :'y') AS main_keeps, kept('b', :'y') AS b_keeps,
+	kept('c', :'y') AS c_keeps;
+ main_keeps | b_keeps | c_keeps 
+------------+---------+---------
+ t          | t       | t
+(1 row)
+
+-- (main's own let go of, so only other branches keep x)
+ALTER DATABASE kept_departures_third SET prolly.history_window = '1 microsecond';
+SELECT test_retain_roots('main');
+ test_retain_roots 
+-------------------
+ 
+(1 row)
+
+ALTER DATABASE kept_departures_third RESET prolly.history_window;
+SELECT kept('main', :'y') AS main_keeps, kept('b', :'y') AS b_keeps;
+ main_keeps | b_keeps 
+------------+---------
+ f          | t
+(1 row)
+
+-- the count: another branch's recorded one, no walk of the history
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT counted() AS before \gset
+SELECT count(*) AS y_commits FROM dolt_log(:'y');
+ y_commits 
+-----------
+        21
+(1 row)
+
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT value <= 2 AS count_read_few FROM since(:'before') WHERE name = 'commits_read';
+ count_read_few 
+----------------
+ t
+(1 row)
+
+-- a move on main to x: another branch's pages shared, no rows written
+SELECT dolt_hashof('main') AS main_on \gset
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'y') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT name, value > 0 AS counted FROM since(:'before')
+WHERE name IN ('apply_rows', 'move_tables_shared') ORDER BY name;
+        name        | counted 
+--------------------+---------
+ apply_rows         | f
+ move_tables_shared | t
+(2 rows)
+
+-- a sever past x: every branch's keep of x forgotten
+SELECT dolt_reset('--hard', :'main_on') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS severed FROM dolt_history_drop('2020-06-01 00:00+00');
+ severed 
+---------
+ t
+(1 row)
+
+SELECT kept('main', :'y') AS main_keeps, kept('b', :'y') AS b_keeps,
+	kept('c', :'y') AS c_keeps;
+ main_keeps | b_keeps | c_keeps 
+------------+---------+---------
+ f          | f       | f
+(1 row)
+
+\c :home
+DROP DATABASE kept_departures_third;

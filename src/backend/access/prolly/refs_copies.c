@@ -4237,13 +4237,17 @@ root_due(const char *name, const KeptSummary *s, const ProllyHash *commit_id)
  * A branch's kept commits are entries of their own, so that a keep reads
  * and writes only the few it changes, however many the branch keeps:
  *
- *	'K' name '\0' 'l' height hash	-> a commit kept (live), by its height
- *	'K' name '\0' 'r' seq			-> one retired, by its number
- *	'K' name '\0' 'h' root			-> how many entries (live or retired)
+ *	'~' name '\0' 'l' height hash	-> a commit kept (live), by its height
+ *	'~' name '\0' 'r' seq			-> one retired, by its number
+ *	'~' name '\0' 'x' root			-> how many entries (live or retired)
  *									   name that root (be64)
+ *	'~' name '\0' 'y' data hash	-> nothing: a live one has a table of
+ *									   that data tree
  *	'L' name						-> the branch's summary (KeptSummary)
  *
- * (height and seq big-endian, so the keys sort by them; a root is its
+ * ('~' sorts after every other tag, so a branch's are one region after
+ * the refs' other entries, a commit's own at its right end; height and
+ * seq big-endian, so the keys sort by them; a root is its
  * tablespace and id, and for storage a restore replaced its file number
  * too.)  The live ones sort oldest first by height, which is the order
  * history ages in along a branch: a retention pass takes them from the
@@ -4465,7 +4469,7 @@ kept_encode(StringInfo v, const KeptCommit *kc)
 	}
 }
 
-/* An entry (key k, value p..end) of a 'K' entry kind KEPT_LIVE or KEPT_RETIRED. */
+/* An entry (key k, value p..end) of a '~' entry kind KEPT_LIVE or KEPT_RETIRED. */
 static KeptCommit *
 kept_decode(const char *kp, int klen, const char *p, const char *end)
 {
@@ -4553,7 +4557,7 @@ kept_decode(const char *kp, int klen, const char *p, const char *end)
 	return kc;
 }
 
-/* A 'K' entry's commits and baselines, declared (a count names none). */
+/* A '~' entry's commits and baselines, declared (a count names none). */
 static void
 kept_declare(const ProllyKey *key, const char *p, const char *end,
 			 StringInfo refs)
