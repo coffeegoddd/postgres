@@ -124,7 +124,7 @@ sql(q{
 	SELECT dolt_commit('-Am', 'c3');
 	SELECT dolt_branch('f');
 });
-is((split /\n/, sql(q{SET prolly.kept_commits = 0; SELECT dolt_checkout('f');
+is((split /\n/, sql(q{SET debug_prolly_page_roots = off; SELECT dolt_checkout('f');
 	SELECT count(*) FROM kv.x}))[-1], '3000', 'f is first used, sharing main\'s storage');
 sql(q{UPDATE kv.x SET v = 'z' WHERE id = 1});
 sql('VACUUM kv.x');

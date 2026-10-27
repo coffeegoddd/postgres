@@ -654,6 +654,14 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 						&root, &mk.nslots);
 	if (mk.gc == NULL)
 		return false;			/* (another collection running) */
+
+	/*
+	 * A fold's tree no ref names may be garbage now: the folds made so far
+	 * are forgotten before the store's first gc_new() waits for the
+	 * transactions running, so that none begun after it builds on one.
+	 * (Those made from here on are appended since the seal, and kept.)
+	 */
+	prolly_forget_folds();
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
 	mk.cap = Max((uint64) maintenance_work_mem * 1024 / sizeof(uint64), 1024);
@@ -759,8 +767,6 @@ copying_collect(bool full, bool if_free, ProllyGcResult *result)
 	PG_END_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
 	WalSndHorizonReadEnd();
 
-	/* (a fold's tree no ref names was garbage: the folds made are stale) */
-	prolly_forget_folds();
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (debug_prolly_verify_generations && PROLLY_HAS(cs, verify_generations))
 		(void) PROLLY_CALL(cs, verify_generations, store);

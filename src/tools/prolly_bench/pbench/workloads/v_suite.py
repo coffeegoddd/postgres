@@ -875,7 +875,7 @@ class V10(VWorkload):
     key, a secondary and a composite index, one with values out of line
     (TOAST and hash pointers), one of long jsonb documents (JSON trees,
     edited by path across commits), and a keyless one; commits kept
-    (prolly.kept_commits) and a kept detached checkout; a branch used and
+    (their page roots) and a kept detached checkout; a branch used and
     deleted whose commit a snapshot mount still reads, and another that
     nothing reads (what a collection frees); a table dropped, and one
     dropped and made again; a merge; a snapshot mount of the first commit

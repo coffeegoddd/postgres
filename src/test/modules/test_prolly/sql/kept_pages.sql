@@ -206,9 +206,10 @@ SELECT dolt_reset('--hard');
 SELECT kept('kp.t') <= 3 AS few_kept;
 SELECT rows_digest() = :'at_load' AS as_loaded, clean();
 
--- however many commits, each relation keeps no more snapshots than kept
--- commits, and those of the commit last retired (let go of once the
--- transaction retiring it is known to have committed)
+-- however many commits, each relation keeps no more roots than kept
+-- commits (a window of two), and those of the commits last retired (let
+-- go of once the transaction retiring them is known to have committed)
+ALTER DATABASE kept_pages SET prolly.history_min_commits = 2;
 UPDATE kp.t SET v = 1 WHERE id = 2;
 SELECT dolt_commit('-am', 'step 1') IS NOT NULL AS committed;
 UPDATE kp.t SET v = 2 WHERE id = 2;
@@ -221,10 +222,14 @@ UPDATE kp.t SET v = 5 WHERE id = 2;
 SELECT dolt_commit('-am', 'step 5') IS NOT NULL AS committed;
 UPDATE kp.t SET v = 6 WHERE id = 2;
 SELECT dolt_commit('-am', 'step 6') IS NOT NULL AS committed;
+SELECT test_retain_roots('main');
+UPDATE kp.t SET v = 7 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 7') IS NOT NULL AS committed;
 SELECT kept('kp.t') <= 3 AS t, kept('kp.t_v') <= 3 AS t_v;
+ALTER DATABASE kept_pages RESET prolly.history_min_commits;
 
 -- with none kept, a reset writes the rows back
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 UPDATE kp.t SET v = 11 WHERE id <= 10;
 SELECT dolt_commit('-am', 'not kept') IS NOT NULL AS committed;
 SELECT rows_digest() AS unkept \gset
@@ -236,7 +241,7 @@ SELECT pg_stat_force_next_flush();
 SELECT (since(:'before') ->> 'apply_rows')::int AS applied,
 	   since(:'before') ->> 'relations_restored' AS restored;
 SELECT rows_digest() = :'unkept' AS as_committed, clean();
-RESET prolly.kept_commits;
+RESET debug_prolly_page_roots;
 
 -- a branch renamed keeps its record; deleted, its record goes with it
 SELECT dolt_branch('kb');

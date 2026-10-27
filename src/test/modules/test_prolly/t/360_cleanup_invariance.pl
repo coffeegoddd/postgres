@@ -29,7 +29,6 @@ $node->append_conf(
 autovacuum = off
 autovacuum_naptime = 1
 prolly_fold_worker = off
-prolly.kept_commits = 4
 });
 # (roots sharing the relations' pages as they are: frozen ones share none)
 $node->append_conf('postgresql.conf', 'prolly.freeze_roots = off');
@@ -37,6 +36,8 @@ $node->start;
 my $log_start = -s $node->logfile;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+# (a window of each lineage's newest four commits keeps their roots)
+sql(q{ALTER DATABASE postgres SET prolly.history_min_commits = 4});
 
 my $rows = 3000;
 sql(qq{
@@ -144,7 +145,7 @@ sql(qq{
 });
 # A branch nothing else is made from, with an insert-only table whose
 # pages only its commits' snapshots share, and six commits on it: the
-# first ones leave prolly.kept_commits' window, their snapshots let go of.
+# first ones leave the history window, their roots let go of.
 # u2, of the same shape, is first used later by a branch the sweep must
 # then stop counting.  (No query checks out a commit of solo: a checkout
 # would share these pages.)

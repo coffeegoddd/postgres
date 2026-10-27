@@ -81,7 +81,10 @@ OBJS = \
 	refs_history.o \
 	refs_stub.o \
 	rootfreeze_capture.o \
+	rootfreeze_lazy.o \
 	rootfreeze_stub.o \
+	rootretain_stub.o \
+	rootretain_window.o \
 	transfer_chunks.o \
 	transfer_stub.o \
 	tablefile_basic.o \

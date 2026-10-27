@@ -37,7 +37,7 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 $$;
 -- (rows written, not pages given back: kept_pages tests those; and the
 -- check, which folds again, off to count)
-SET prolly.kept_commits = 0;
+SET debug_prolly_page_roots = off;
 SET debug_prolly_verify_fold_caches = off;
 -- 1,000 dirty rows reset: folded once (1,000 candidates), almost nothing
 -- appended.

@@ -2663,7 +2663,9 @@ splice_matches(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
 
 	initStringInfo(&edited);
 	appendBinaryStringInfo(&edited, val->data, offset);
-	appendBinaryStringInfo(&edited, ins, ilen);
+	/* (a deletion inserts nothing: 'ins' may be NULL) */
+	if (ilen > 0)
+		appendBinaryStringInfo(&edited, ins, ilen);
 	appendBinaryStringInfo(&edited, val->data + offset + cut,
 						   val->len - offset - cut);
 	initStringInfo(&want);
