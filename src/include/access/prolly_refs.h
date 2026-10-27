@@ -1019,6 +1019,13 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  * all (off, for testing the moves that write rows, none are kept).
  */
 extern PGDLLIMPORT bool debug_prolly_page_roots;
+
+/*
+ * debug_prolly_restore_roots: whether a move gives tables the pages of
+ * the roots kept (off, for testing the moves that write rows while
+ * commits still keep their pages, a move writes its rows).
+ */
+extern PGDLLIMPORT bool debug_prolly_restore_roots;
 extern PGDLLIMPORT int prolly_root_interval;
 extern PGDLLIMPORT int prolly_root_interval_commits;
 extern PGDLLIMPORT bool prolly_freeze_roots;

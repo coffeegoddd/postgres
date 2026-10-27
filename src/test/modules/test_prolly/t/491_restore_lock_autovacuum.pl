@@ -381,14 +381,15 @@ unlike($mr->{stderr} . $checkout->{stderr}, qr/deadlock/, 'with no deadlock');
 $checkout->quit;
 $mr->quit;
 
-# 4d. A reset of one row, which writes it rather than restore the table,
-# takes no lock a reader holds: it neither waits for nor blocks one.
+# 4d. A reset that writes its row rather than restore the table (rows, with
+# debug_prolly_restore_roots off: a restore waits for a reader, as TRUNCATE
+# does) takes no lock a reader holds: it neither waits for nor blocks one.
 sql(q{UPDATE kp.t SET b = b || 'o' WHERE a = 1});
 my $oreader = $node->background_psql('postgres');
 $oreader->query_safe(q{BEGIN; SELECT count(*) FROM kp.t});
 $applied = counted('apply_rows');
 my ($oret, $oout, $oerr) = $node->psql('postgres', q{
-	SET lock_timeout = '2s';
+	SET lock_timeout = '2s'; SET debug_prolly_restore_roots = off;
 	SELECT 'reset ' || (dolt_reset('--hard') IS NOT NULL);
 	SELECT pg_stat_force_next_flush()});
 like($oout, qr/reset t/, 'a one-row reset beside a reader finishes at once');

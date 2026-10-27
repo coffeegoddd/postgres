@@ -24,6 +24,7 @@ max_wal_senders = 0
 autovacuum = off
 autovacuum_naptime = 1s
 checkpoint_timeout = '1h'
+debug_prolly_restore_roots = off
 });
 $node->start;
 

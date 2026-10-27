@@ -3731,6 +3731,7 @@ move_settled_checked(void *arg)
  * the change is known to commit.
  */
 bool		debug_prolly_page_roots = true;
+bool		debug_prolly_restore_roots = true;
 int			prolly_root_interval = -1;
 int			prolly_root_interval_commits = 1;
 bool		prolly_freeze_roots = true;
@@ -6613,7 +6614,8 @@ restore_pages(const ProllyCommitInfo *commit)
 	ProllyCommitInfo at_head;
 	Oid			source = MyBranch;
 
-	if (!debug_prolly_page_roots || branch_ops()->restore == NULL ||
+	if (!debug_prolly_page_roots || !debug_prolly_restore_roots ||
+		branch_ops()->restore == NULL ||
 		RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
@@ -11058,7 +11060,7 @@ lock_for_restore(const char *ref)
 	KeptCommit *was;
 	Oid			waited = InvalidOid;
 
-	if (whole || !debug_prolly_page_roots ||
+	if (whole || !debug_prolly_page_roots || !debug_prolly_restore_roots ||
 		branch_ops()->changed_since_kept == NULL || RecoveryInProgress())
 		return;
 	prolly_database_components(&dc);
