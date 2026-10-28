@@ -595,13 +595,35 @@ sees(Snapshot snap, FullTransactionId xmin, FullTransactionId xid)
 
 /*
  * ... and every writer up to latest, the latest of those no longer
- * remembered one by one?  Only if it precedes the xmin: they all do then.
+ * remembered one by one?  They all are if latest precedes the xmin.  Else
+ * one of them unseen was running as snap was taken (latest precedes its
+ * xmax, so each began before it) and has committed since: so all are seen
+ * unless a transaction snap counts as running, up to latest, has
+ * committed.  (One still running isn't a writer that ended, and one that
+ * aborted is seen, as sees() takes it.)  Not just the xmin: a writer at
+ * work since before the others, holding the xmin back, would otherwise
+ * have every snapshot taken while it works miss writers that ended,
+ * once more had ended than are remembered one by one.
  */
 static bool
-sees_all_to(FullTransactionId xmin, FullTransactionId latest)
+sees_all_to(Snapshot snap, FullTransactionId xmin, FullTransactionId latest)
 {
-	return !FullTransactionIdIsValid(latest) ||
-		FullTransactionIdPrecedes(latest, xmin);
+	TransactionId last;
+
+	if (!FullTransactionIdIsValid(latest) ||
+		FullTransactionIdPrecedes(latest, xmin))
+		return true;
+	last = XidFromFullTransactionId(latest);
+	if (!TransactionIdPrecedes(last, snap->xmax))
+		return false;
+	for (uint32 i = 0; i < snap->xcnt; i++)
+	{
+		TransactionId x = snap->xip[i];
+
+		if (TransactionIdPrecedesOrEquals(x, last) && TransactionIdDidCommit(x))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -614,11 +636,11 @@ sees_writers(BranchGenerations *g, BranchGeneration *e, Snapshot snap)
 	FullTransactionId xmin = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
 															  snap->xmin);
 
-	if (!sees_all_to(xmin, g->overflow_ended))
+	if (!sees_all_to(snap, xmin, g->overflow_ended))
 		return false;
 	if (e == NULL)
-		return sees_all_to(xmin, g->absent_ended);
-	if (!sees_all_to(xmin, e->ended.before))
+		return sees_all_to(snap, xmin, g->absent_ended);
+	if (!sees_all_to(snap, xmin, e->ended.before))
 		return false;
 	for (int i = 0; i < e->ended.nlast; i++)
 	{

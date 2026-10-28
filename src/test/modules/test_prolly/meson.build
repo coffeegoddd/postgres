@@ -539,6 +539,7 @@ tests += {
       't/880_autovacuum_gc_no_wait.pl',
       't/881_window_seal_timing.pl',
       't/883_window_seal_idle.pl',
+      't/912_freeze_roots_after_unfrozen.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',
