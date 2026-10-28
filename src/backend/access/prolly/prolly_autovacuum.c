@@ -10,9 +10,16 @@
  * appends go to, written since the last collection, and the table files
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
- * collection, by the database's reclamation.  Only sizes are read, not the
- * journal.  Another collection running, it skips its own quietly (counted
- * in pg_stat_prolly's auto_collections_skipped): that one collects what
+ * collection, by the database's reclamation.  A default collection also
+ * runs below those, once at each batch boundary of the history window
+ * passed since the store's newest generation ended or the background's
+ * last collection did (the window's seal_due(); its sealed() notes each
+ * collection), so the generations follow the batches; none with
+ * prolly.gc_journal_threshold -1, which turns the default collections
+ * off, though the window's full collections and retires still run.  Only
+ * sizes are read, not the journal.  Another collection running, it skips
+ * its own quietly (counted in pg_stat_prolly's auto_collections_skipped):
+ * that one collects what
  * was due.  None of these waits for a transaction longer than
  * prolly.gc_free_wait: a collection, retire or move that would (one using
  * the store as it begins, still running) is given up, rolled back and
@@ -119,7 +126,7 @@ prolly_autovacuum_init(void)
 		return;
 	DefineCustomIntVariable("prolly.gc_journal_threshold",
 							"How far the chunk journal grows before autovacuum collects the chunk store.",
-							"-1 turns automatic collection off.",
+							"-1 turns off the default collections and the history window's seals; the window's full collections and retires, which free severed history, still run.",
 							&prolly_gc_journal_threshold,
 							128, -1, MAX_KILOBYTES / 1024,
 							PGC_SIGHUP,
@@ -388,6 +395,7 @@ static bool seal_wanted = false;
 static bool retire_refused = false;	/* another collection ran meanwhile */
 static bool retire_errored = false; /* the retire raised an error */
 static bool retire_ran = false;	/* a retire ran, and swapped */
+static bool collection_ran = false; /* a default or full collection ran */
 
 static void
 sever(void)
@@ -616,10 +624,14 @@ collect(void)
 	retire_refused = false;
 	retire_errored = false;
 	retire_ran = false;
+	collection_ran = false;
 	collect_now();
 	prolly_database_components(&dc);
 	if (dc.history_window == NULL)
 		return;
+	/* (either ended a generation: the next seal is counted from it) */
+	if ((collection_ran || retire_ran) && PROLLY_HAS(dc.history_window, sealed))
+		PROLLY_CALL(dc.history_window, sealed);
 	if (retire_errored)
 	{
 		if (PROLLY_HAS(dc.history_window, retire_failed))
@@ -648,8 +660,13 @@ collect_now(void)
 	prolly_database_components(&dc);
 	if (!full && retire(&dc))
 		return;
-	/* (a batch boundary passed: what came since settled on its own) */
-	seal = !full && seal_wanted && anything_to_collect();
+	/*
+	 * (a batch boundary passed: what came since settled on its own; not
+	 * with prolly.gc_journal_threshold -1, which turns the default
+	 * collections off)
+	 */
+	seal = !full && seal_wanted && prolly_gc_journal_threshold >= 0 &&
+		anything_to_collect();
 	seal_wanted = false;
 	if (!full && !seal && !retire_errored && !collection_due())
 		return;
@@ -657,6 +674,7 @@ collect_now(void)
 	VacuumCostBalance = 0;
 	if (!reclaim_if_free(&dc, false, full, &r))
 		return;
+	collection_ran = true;
 	if (full && PROLLY_HAS(dc.history_window, collected))
 		PROLLY_CALL(dc.history_window, collected);
 	/* (then, a step of its own, the records of the commits it took) */
