@@ -161,10 +161,11 @@ def replay_target(lsn: int, page: int = 8192, segment: int = 16 << 20) -> int:
 def store_files(dbdir: Path) -> dict[str, Any]:
     """The chunk store's files as the filesystem has them: the bytes of its
     table files and journal segments (what the manifest's sizes should add
-    up to), of its manifest and index, and each table file's section
-    length, read from its footer."""
-    files_bytes = meta_bytes = 0
+    up to), of its manifest and index, each table file's size and section
+    length (read from its footer), and how many journal segments."""
+    files_bytes = meta_bytes = segments = 0
     sections: dict[str, int] = {}
+    tables: dict[str, int] = {}
     for f in dbdir.iterdir():
         name = f.name
         if name.startswith(STORE_META_PREFIXES):
@@ -176,11 +177,14 @@ def store_files(dbdir: Path) -> dict[str, Any]:
         if not name.startswith(STORE_FILE_PREFIXES):
             continue
         try:
-            files_bytes += f.lstat().st_size
+            size = f.lstat().st_size
         except OSError:
             continue
+        files_bytes += size
         if not name.startswith("prolly_table_"):
+            segments += 1
             continue
+        tables[name] = size
         try:
             with open(f, "rb") as fh:
                 fh.seek(-FOOTER_SIZE, os.SEEK_END)
@@ -189,7 +193,8 @@ def store_files(dbdir: Path) -> dict[str, Any]:
             continue
         if len(foot) == FOOTER_SIZE and foot[-8:] == b"PRLYTBL1":
             sections[name] = struct.unpack_from("<I", foot, FOOTER_SECTION_LEN)[0]
-    return {"files_bytes": files_bytes, "meta_bytes": meta_bytes, "sections": sections}
+    return {"files_bytes": files_bytes, "meta_bytes": meta_bytes, "sections": sections,
+            "tables": tables, "segments": segments}
 
 
 def dir_bytes(top: Path, skip: tuple[str, ...] = ()) -> int:
@@ -239,12 +244,14 @@ class StandbySession:
 
 class ReplayWatch:
     """Polls the standby from before a retire until it has replayed past a
-    target given after it: when the first poll that saw it was, and the
-    poll before (the replay was between them)."""
+    target given after it: the first poll that saw the target replayed,
+    taken before the target was known or after, and the poll before it
+    (the replay was between them)."""
 
     def __init__(self, poll, interval_s: float = 0.0005, timeout_s: float = 600.0):
         self.poll, self.interval, self.timeout = poll, interval_s, timeout_s
         self.target: Optional[int] = None
+        self.polls: list[tuple[float, int]] = []
         self.hit: Optional[tuple[Optional[float], float]] = None
         self.error: Optional[BaseException] = None
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -253,17 +260,27 @@ class ReplayWatch:
         self.thread.start()
         return self
 
+    @staticmethod
+    def first_past(polls: list[tuple[float, int]], target: int) -> Optional[tuple[Optional[float], float]]:
+        """The first of polls (time, replay LSN) at or past target, and the
+        time of the one before (None: none before)."""
+        for k, (ts, lsn) in enumerate(polls):
+            if lsn >= target:
+                return (polls[k - 1][0] if k else None), ts
+        return None
+
     def _run(self) -> None:
-        prev: Optional[float] = None
         t0 = time.monotonic()
         try:
             while True:
-                ts, lsn = self.poll()
+                self.polls.append(self.poll())
+                # (every poll is kept: the standby may have replayed the
+                # target before the target was known here)
                 target = self.target
-                if target is not None and lsn >= target:
-                    self.hit = (prev, ts)
-                    return
-                prev = ts
+                if target is not None:
+                    self.hit = self.first_past(self.polls, target)
+                    if self.hit is not None:
+                        return
                 if time.monotonic() - t0 > self.timeout:
                     raise RuntimeError(f"the standby didn't replay in {self.timeout:.0f} s")
                 time.sleep(self.interval)
@@ -400,17 +417,14 @@ class V11(VWorkload):
 
     def store(self, ctx) -> dict[str, Any]:
         """The chunk store's sizes as its manifest has them; its files' bytes
-        as the filesystem has them (a difference is a file the manifest
-        doesn't name, or names but isn't there); its sections' bytes, read
+        as the filesystem has them; whether the table files on disk, by name
+        and size, or the count of journal segments, differ from what the
+        manifest names (a leaked or missing file); its sections' bytes, read
         from the files' footers; the data directory's bytes without pg_wal,
         and pg_wal's."""
-        s = ctx.cluster.scalar(
-            "SELECT json_build_object('journal_segments', journal_segments, 'journal_bytes', journal_bytes,"
-            " 'table_files', table_files, 'table_file_bytes', table_file_bytes,"
-            " 'settled_files', settled_files, 'settled_bytes', settled_bytes) FROM prolly_store_sizes()",
-            dbname=ctx.dbname)
-        out = json.loads(s)
+        out = self.store_sizes(ctx)
         out["store_bytes"] = out["journal_bytes"] + out["table_file_bytes"]
+        named = self.table_file_bytes(ctx)
         data = Path(ctx.cluster.data_dir)
         dbdir = data / "base" / ctx.cluster.scalar(
             "SELECT oid FROM pg_database WHERE datname = current_database()", dbname=ctx.dbname)
@@ -418,8 +432,17 @@ class V11(VWorkload):
         self.sections = disk["sections"]
         out["store_files_bytes_on_disk"] = disk["files_bytes"]
         out["store_meta_bytes_on_disk"] = disk["meta_bytes"]
+        # (a journal segment grows as the fold worker or a commit appends
+        # to it, between the manifest's read and the walk: its bytes are
+        # only reported, and a difference is flagged only if the manifest
+        # read again after the walk differs too)
         out["store_disk_minus_manifest_bytes"] = disk["files_bytes"] - out["store_bytes"]
-        out["store_files_mismatch"] = disk["files_bytes"] != out["store_bytes"]
+        mismatch = disk["tables"] != named or disk["segments"] != out["journal_segments"]
+        if mismatch:
+            again = self.store_sizes(ctx)
+            mismatch = (disk["tables"] != self.table_file_bytes(ctx) or
+                        disk["segments"] != again["journal_segments"])
+        out["store_files_mismatch"] = mismatch
         out["section_bytes_on_disk"] = sum(disk["sections"].values())
         out["table_files_on_disk"] = len(disk["sections"])
         out["data_dir_bytes"] = dir_bytes(data, skip=("pg_wal",))
@@ -427,6 +450,13 @@ class V11(VWorkload):
         out["relation_bytes"] = int(ctx.cluster.scalar(
             "SELECT pg_total_relation_size('vc_rows')", dbname=ctx.dbname))
         return out
+
+    def store_sizes(self, ctx) -> dict[str, Any]:
+        return json.loads(ctx.cluster.scalar(
+            "SELECT json_build_object('journal_segments', journal_segments, 'journal_bytes', journal_bytes,"
+            " 'table_files', table_files, 'table_file_bytes', table_file_bytes,"
+            " 'settled_files', settled_files, 'settled_bytes', settled_bytes) FROM prolly_store_sizes()",
+            dbname=ctx.dbname))
 
     def generations(self, ctx) -> list[dict[str, Any]]:
         if not self.retire:

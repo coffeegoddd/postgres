@@ -14,7 +14,8 @@
 #
 # One client, autovacuum off (the cycles vacuum the table themselves, and
 # no background collection, conjoin or sever runs between them), and a
-# streaming standby replaying everything.
+# streaming standby replaying everything.  The fold worker is left on, as by
+# default: it runs beside the cycles as it would beside any workload.
 
 [run]
 quality = "smoke"

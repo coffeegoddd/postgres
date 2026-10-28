@@ -9,6 +9,7 @@ import stat
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,13 +56,40 @@ def table_file(path, section):
     path.write_bytes(b"\0" * 100 + bytes(foot))
 
 
+def fake_store_cluster(data, manifests):
+    """A cluster whose manifest reads answer from manifests in turn (the
+    last repeated): each {"tables": {name: bytes}, "journal_bytes": n,
+    "journal_segments": n}."""
+    reads = {"sizes": 0, "files": 0}
+
+    def manifest(kind):
+        m = manifests[min(reads[kind], len(manifests) - 1)]
+        reads[kind] += 1
+        return m
+
+    def scalar(q, **k):
+        if "prolly_store_sizes()" in q:
+            m = manifest("sizes")
+            tb = sum(m["tables"].values())
+            return json.dumps({"journal_segments": m.get("journal_segments", 1),
+                               "journal_bytes": m.get("journal_bytes", 10),
+                               "table_files": len(m["tables"]), "table_file_bytes": tb,
+                               "settled_files": len(m["tables"]), "settled_bytes": tb})
+        if "test_chunk_table_files()" in q:
+            return json.dumps(manifest("files")["tables"])
+        if "pg_database" in q:
+            return "5"
+        if "pg_total_relation_size" in q:
+            return "0"
+        raise AssertionError(q)
+
+    return SimpleNamespace(data_dir=data, scalar=scalar), reads
+
+
 class StoreTest(unittest.TestCase):
-    def store(self, data, table_file_bytes):
-        sizes = json.dumps({"journal_segments": 1, "journal_bytes": 10, "table_files": 1,
-                            "table_file_bytes": table_file_bytes, "settled_files": 1,
-                            "settled_bytes": table_file_bytes})
-        answers = iter([sizes, "5", "0"])
-        cluster = SimpleNamespace(data_dir=data, scalar=lambda q, **k: next(answers))
+    def store(self, data, table_file_bytes, manifests=None):
+        manifests = manifests or [{"tables": {"prolly_table_00ab": table_file_bytes}}]
+        cluster, self.reads = fake_store_cluster(data, manifests)
         return g.V11().store(SimpleNamespace(cluster=cluster, dbname="db"))
 
     def layout(self, d):
@@ -107,6 +135,34 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(got["store_disk_minus_manifest_bytes"], 148)
             self.assertEqual(got["table_files_on_disk"], 2)
 
+    def test_journal_append_between_reads_is_not_flagged(self):
+        # (the manifest says 10 journal bytes, the segment on disk has 14:
+        # the fold worker appended between the read and the walk)
+        with tempfile.TemporaryDirectory() as d:
+            data, db = self.layout(d)
+            (db / "prolly_journal").write_bytes(b"\0" * 14)
+            got = self.store(data, 148)
+            self.assertFalse(got["store_files_mismatch"])
+            self.assertEqual(got["store_disk_minus_manifest_bytes"], 4)
+
+    def test_table_file_added_between_reads_is_not_flagged(self):
+        # (a collection added a file after the first read; the manifest
+        # read again after the walk names it)
+        with tempfile.TemporaryDirectory() as d:
+            data, db = self.layout(d)
+            table_file(db / "prolly_table_00cd", 10)
+            got = self.store(data, 148, [{"tables": {"prolly_table_00ab": 148}},
+                                         {"tables": {"prolly_table_00ab": 148, "prolly_table_00cd": 148}}])
+            self.assertFalse(got["store_files_mismatch"])
+            self.assertEqual(self.reads["files"], 2)
+
+    def test_table_file_of_another_size_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, _ = self.layout(d)
+            got = self.store(data, 148, [{"tables": {"prolly_table_00ab": 150}, "journal_bytes": 8}])
+            self.assertEqual(got["store_disk_minus_manifest_bytes"], 0)
+            self.assertTrue(got["store_files_mismatch"])
+
 
 FAKE_PSQL = """import os, sys, time
 for line in sys.stdin:
@@ -148,6 +204,67 @@ class ReplayTest(unittest.TestCase):
         got = g.replay_times((prev, hit), 10.0015)
         self.assertAlmostEqual(got["standby_replay_ms"], 1.5)
         self.assertAlmostEqual(got["standby_replay_resolution_ms"], 1.0)
+
+
+class ReplayLateTargetTest(unittest.TestCase):
+    def test_polls_before_the_target_was_known_count(self):
+        # (the standby has replayed the target by the first poll; the
+        # target is known only after many polls, as after the retire's
+        # psql exits)
+        clock = iter(10.0 + k * 0.001 for k in range(100000))
+        w = g.ReplayWatch(lambda: (next(clock), 9), interval_s=0)
+        w.start()
+        while len(w.polls) < 50:
+            time.sleep(0.001)
+        prev, hit = w.wait(9)
+        self.assertIsNone(prev)
+        self.assertEqual(hit, 10.0)
+        # (replayed before the retire's end, at 10.0105: <= 0)
+        self.assertLess(g.replay_times((prev, hit), 10.0105)["standby_replay_ms"], 0)
+
+    def test_first_past_takes_the_poll_before(self):
+        polls = [(1.0, 3), (1.1, 5), (1.2, 9), (1.3, 9)]
+        self.assertEqual(g.ReplayWatch.first_past(polls, 9), (1.1, 1.2))
+        self.assertEqual(g.ReplayWatch.first_past(polls, 4), (1.0, 1.1))
+        self.assertIsNone(g.ReplayWatch.first_past(polls, 10))
+
+
+class CycleSectionsTest(unittest.TestCase):
+    def test_new_section_bytes_are_the_new_files_sections(self):
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d)
+            db = data / "base" / "5"
+            db.mkdir(parents=True)
+            (data / "pg_wal").mkdir()
+            table_file(db / "prolly_table_00ab", 1000)
+            manifests = [{"tables": {"prolly_table_00ab": 148}}]
+            cluster, _ = fake_store_cluster(data, manifests)
+            cluster.sql = lambda *a, **k: SimpleNamespace(ok=True, stdout="", stderr="")
+            base_scalar = cluster.scalar
+            cluster.scalar = lambda q, **k: "abc" if "dolt_hashof" in q else base_scalar(q, **k)
+
+            def timed(cl, db_, stmts):
+                if any("test_chunk_gc" in x for x in stmts):
+                    # (the default collection writes a file of its own)
+                    table_file(db / "prolly_table_00cd", 345)
+                    manifests[0] = {"tables": {"prolly_table_00ab": 148, "prolly_table_00cd": 148}}
+                    return [([""], 1.0), ([""], 1.0), (["1 2 3 4"], 1.0)]
+                return [(["0 0 0"], 1.0)]
+
+            w = g.V11()
+            w.retire = False
+            w.counters = lambda ctx: {}
+            w.point_reads = lambda *a: {}
+            ctx = SimpleNamespace(cluster=cluster, dbname="db", params={}, size_params={"v_rows": 100})
+            w.store(ctx)
+            saved = g.timed
+            g.timed = timed
+            try:
+                rec = w.cycle(ctx, 1, 10, "steady")
+            finally:
+                g.timed = saved
+            self.assertEqual(rec["new_section_bytes"], 345)
+            self.assertEqual(rec["section_bytes_on_disk"], 1345)
 
 
 class RetireStepTest(unittest.TestCase):

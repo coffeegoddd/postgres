@@ -6,7 +6,8 @@
 # default collection's cost follows the file count; so both sides run
 # this config, a build that records sections and one that doesn't (one
 # without retires can run nothing else), and only the recording differs.
-# No standby, sweep or conjoin.
+# No standby, sweep or conjoin.  The fold worker is left on, as by default
+# and as in v_generations.toml.
 #
 #   prolly_bench run V --am prolly --config configs/v_generations_noretire.toml \
 #       --pg-bin DIR/inst/bin --sizes gen1
