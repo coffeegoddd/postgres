@@ -14,6 +14,18 @@
 
 #define VC_MAX_PARENTS 8
 
+#define VC_OK 0
+#define VC_ERR (-10)			/* bad argument or state */
+#define VC_ERR_SEVERED (-3)		/* needs a commit cut from local history */
+#define VC_ERR_OUTSIDE_WINDOW (-4)	/* stopped at the window's edge */
+
+/*
+ * Stop at the window's edge: refuse any commit the window does not hold,
+ * even one still present in a local segment.  The edge is the one set by
+ * the last vc_sever (before any sever, all history is in the window).
+ */
+#define VC_WINDOW_ONLY 0x1
+
 typedef struct VcTable
 {
 	PHash		schema;
@@ -86,6 +98,46 @@ typedef struct VcBranch
 	PHash		merge_head;
 } VcBranch;
 
+/*
+ * The window: every branch head (and pending merge head), each commit
+ * within depth generations of one, and each pinned commit.
+ */
+typedef struct VcWindow
+{
+	uint32_t	depth;			/* >= 1 */
+	const PHash *pinned;
+	size_t		npinned;
+} VcWindow;
+
+typedef enum VcSegState
+{
+	VC_SEG_LOCAL,				/* detached, still held here */
+	VC_SEG_EXPORTED,			/* copied whole to an archive, freed here */
+	VC_SEG_DISCARDED,			/* gone */
+	VC_SEG_ATTACHED				/* moved back into the window's history */
+} VcSegState;
+
+/* Commits severed from the window together. */
+typedef struct VcSegment
+{
+	VcSegState	state;
+	PHash	   *commits;
+	size_t		n;
+	ChunkStore *archive;		/* where an exported segment lives */
+} VcSegment;
+
+#define VC_NO_SEGMENT UINT32_MAX
+
+typedef enum VcLocation
+{
+	VC_LOC_UNKNOWN,
+	VC_LOC_WINDOW,				/* held by the window's history */
+	VC_LOC_SEGMENT,				/* in a local, detached segment */
+	VC_LOC_EXPORTED,			/* in a segment moved to an archive */
+	VC_LOC_DISCARDED,			/* in a discarded segment */
+	VC_LOC_BOUNDARY				/* named as a parent; never had locally */
+} VcLocation;
+
 typedef struct VcRepo
 {
 	ProllyCtx	ctx;
@@ -94,7 +146,13 @@ typedef struct VcRepo
 	size_t		cap;
 	size_t		cur;
 	uint64_t	clock;
+	PHashMap	loc;			/* commit -> where it is */
+	VcSegment  *segs;
+	size_t		nsegs;
+	size_t		segcap;
 } VcRepo;
+
+typedef void (*VcLogFn) (void *arg, const VcCommit *c);
 
 /* Root values. */
 extern PHash vc_root_empty(ProllyCtx *ctx);
@@ -124,7 +182,8 @@ extern bool vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out);
 extern PHash vc_commit_write(ProllyCtx *ctx, const PHash *root,
 							 const PHash *parents, uint32_t nparents,
 							 uint64_t time, const char *msg);
-extern bool vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
+/* 1 with the base, 0 if none, VC_ERR_SEVERED if the walk crosses a cut. */
+extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
 						  PHash *out);
 
 /* Repositories and branches. */
@@ -137,15 +196,41 @@ extern void vc_set_working(VcRepo *r, const PHash *rv);
 extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);
-extern void vc_reset_hard(VcRepo *r, const PHash *commit);
+extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
 extern int	vc_merge(VcRepo *r, const char *branch, VcMergeResult *res);
 extern void vc_merge_result_free(VcMergeResult *res);
+/*
+ * History, merge base and diff by commit.  They read as far as local data
+ * goes (VC_ERR_SEVERED at a cut), or with VC_WINDOW_ONLY stop at the
+ * window's edge (VC_ERR_OUTSIDE_WINDOW).  The failing commit is in
+ * r->ctx.err_hash.  vc_log follows first parents, at most max commits.
+ * In window-only mode a merge base past the edge is VC_ERR_OUTSIDE_WINDOW
+ * too, with the base in err_hash.
+ */
+extern int	vc_log(VcRepo *r, const PHash *start, size_t max, unsigned flags,
+				   VcLogFn fn, void *arg);
+extern int	vc_merge_base_in(VcRepo *r, const PHash *a, const PHash *b,
+							 unsigned flags, PHash *out);
+extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
+							unsigned flags, VcTableChangeFn fn, void *arg);
+
+/*
+ * Severing.  vc_sever moves every commit the window no longer covers into
+ * a new local segment (or reports VC_NO_SEGMENT): only holds move, no chunk
+ * is copied or freed.  A segment can then be exported (copied whole to an
+ * archive store, then let go here), discarded, or attached again.
+ */
+extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
+extern int	vc_segment_export(VcRepo *r, uint32_t seg, ChunkStore *archive);
+extern int	vc_segment_discard(VcRepo *r, uint32_t seg);
+extern int	vc_segment_attach(VcRepo *r, uint32_t seg);
+extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32_t *seg);
 
 /* Remotes: another repo with its own chunk store. */
-extern void vc_sync_commit(ProllyCtx *src, ProllyCtx *dst, const PHash *commit);
+extern int	vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit);
 extern int	vc_push(VcRepo *local, VcRepo *remote, const char *branch);
 extern int	vc_fetch(VcRepo *local, VcRepo *remote, const char *branch,
 					 PHash *head);
-extern void vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src);
+extern int	vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src);
 
 #endif							/* VC_H */

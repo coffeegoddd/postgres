@@ -10,7 +10,7 @@ CFLAGS += -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wno-unused-p
 SRCS = phash.c chunkfmt.c chunkstore.c memstore.c prolly.c vc.c
 OBJS = $(SRCS:.c=.o)
 HDRS = prolly_util.h phash.h chunkfmt.h chunkstore.h prolly.h vc.h
-TESTS = test/test_prolly test/test_vc test/test_lifetime
+TESTS = test/test_prolly test/test_vc test/test_lifetime test/test_window
 
 all: libprolly.a
 

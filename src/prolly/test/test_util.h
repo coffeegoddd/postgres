@@ -274,6 +274,79 @@ batch_free(EditBatch *b)
 	free(b->vals);
 }
 
+/* Chunk closures and hash sets. */
+typedef struct NodeWalk
+{
+	ChunkStore *cs;
+	PHashMap   *set;
+} NodeWalk;
+
+static inline void node_walk_fn(void *arg, const PHash *h, bool strong);
+
+/* Every chunk in the strong closure of h. */
+static inline void
+closure(ChunkStore *cs, const PHash *h, PHashMap *set)
+{
+	NodeWalk	w = {cs, set};
+	bool		created;
+	size_t		len;
+	const uint8_t *d;
+
+	phmap_ref(set, h, &created);
+	if (!created)
+		return;
+	d = cs->ops->get(cs, h, &len);
+	CHECK(d != NULL);
+	CHECK(chunk_refs(d, len, node_walk_fn, &w));
+}
+
+static inline void
+node_walk_fn(void *arg, const PHash *h, bool strong)
+{
+	NodeWalk   *w = arg;
+
+	if (strong)
+		closure(w->cs, h, w->set);
+}
+
+static inline void
+set_add_fn(void *arg, const PHash *h)
+{
+	bool		created;
+
+	phmap_ref(arg, h, &created);
+	CHECK(created);				/* chunk diff reports each node once */
+}
+
+static inline size_t
+set_size(const PHashMap *m)
+{
+	return m->n;
+}
+
+/* a minus b, as a set. */
+static inline void
+set_minus(const PHashMap *a, const PHashMap *b, PHashMap *out)
+{
+	bool		created;
+
+	phmap_init(out);
+	for (size_t i = 0; i < a->cap; i++)
+		if (a->used[i] && !phmap_find((PHashMap *) b, &a->keys[i]))
+			phmap_ref(out, &a->keys[i], &created);
+}
+
+static inline bool
+set_equal(const PHashMap *a, const PHashMap *b)
+{
+	if (a->n != b->n)
+		return false;
+	for (size_t i = 0; i < a->cap; i++)
+		if (a->used[i] && !phmap_find((PHashMap *) b, &a->keys[i]))
+			return false;
+	return true;
+}
+
 /* Small chunks make tall trees from few rows, exercising every level. */
 static const ChunkPolicy small_policy = {64, 256, 1024};
 

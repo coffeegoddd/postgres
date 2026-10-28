@@ -216,7 +216,7 @@ test_branch_checkout_isolation(void)
 	put_row(&r, "t", 1, 1);
 	vc_commit(&r, "base");
 	CHECK(vc_branch_create(&r, "feature", NULL) == 0);
-	CHECK(vc_branch_create(&r, "feature", NULL) == -1);
+	CHECK(vc_branch_create(&r, "feature", NULL) == VC_ERR);
 
 	/* uncommitted work stays with its branch across checkouts */
 	put_row(&r, "t", 2, 1);
@@ -228,7 +228,7 @@ test_branch_checkout_isolation(void)
 	CHECK(working_row(&r, "t", 3) == -1);
 	CHECK(vc_checkout(&r, "feature") == 0);
 	CHECK(working_row(&r, "t", 3) == 1);
-	CHECK(vc_checkout(&r, "nope") == -1);
+	CHECK(vc_checkout(&r, "nope") == VC_ERR);
 	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
@@ -249,12 +249,12 @@ test_reset_hard(void)
 	put_row(&r, "t", 1, 2);
 	c2 = vc_commit(&r, "two");
 	put_row(&r, "t", 1, 3);
-	vc_reset_hard(&r, &c2);
+	CHECK(vc_reset_hard(&r, &c2) == VC_OK);
 	CHECK(working_row(&r, "t", 1) == 2);
-	vc_reset_hard(&r, &c1);
+	CHECK(vc_reset_hard(&r, &c1) == VC_OK);
 	CHECK(working_row(&r, "t", 1) == 1);
 	CHECK(phash_eq(&vc_head(&r)->head, &c1));
-	vc_reset_hard(&r, &c2);
+	CHECK(vc_reset_hard(&r, &c2) == VC_OK);
 	CHECK(working_row(&r, "t", 1) == 2);
 	check_store(cs, 0);
 	vc_repo_free(&r);
@@ -355,7 +355,7 @@ test_merge_fast_forward_and_up_to_date(void)
 
 	/* refuse to merge over uncommitted changes */
 	put_row(&r, "t", 9, 9);
-	CHECK(vc_merge(&r, "feature", &m) == -1);
+	CHECK(vc_merge(&r, "feature", &m) == VC_ERR);
 	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
@@ -530,15 +530,15 @@ test_merge_base_shapes(void)
 	vc_checkout(&r, "b");
 	put_row(&r, "t", 3, 1);
 	y = vc_commit(&r, "b1");
-	CHECK(vc_merge_base(&r.ctx, &x, &y, &mb) && phash_eq(&mb, &base));
-	CHECK(vc_merge_base(&r.ctx, &y, &x, &mb) && phash_eq(&mb, &base));
-	CHECK(vc_merge_base(&r.ctx, &x, &base, &mb) && phash_eq(&mb, &base));
+	CHECK(vc_merge_base(&r.ctx, &x, &y, &mb) == 1 && phash_eq(&mb, &base));
+	CHECK(vc_merge_base(&r.ctx, &y, &x, &mb) == 1 && phash_eq(&mb, &base));
+	CHECK(vc_merge_base(&r.ctx, &x, &base, &mb) == 1 && phash_eq(&mb, &base));
 
 	/* after merging main into b, the base of the two heads is main's head */
 	CHECK(vc_merge(&r, "main", &m) == 0 && m.status == VC_MERGE_COMMITTED);
 	m1 = m.commit;
 	vc_merge_result_free(&m);
-	CHECK(vc_merge_base(&r.ctx, &m1, &x, &mb) && phash_eq(&mb, &x));
+	CHECK(vc_merge_base(&r.ctx, &m1, &x, &mb) == 1 && phash_eq(&mb, &x));
 	vc_checkout(&r, "main");
 	put_row(&r, "t", 4, 1);
 	vc_commit(&r, "a3");
@@ -569,8 +569,8 @@ test_push_fetch_clone(void)
 		put_row(&remote, "t", k, 0);
 	vc_commit(&remote, "seed");
 
-	vc_repo_clone(&local, lcs, &remote);
-	vc_repo_clone(&other, ocs, &remote);
+	CHECK(vc_repo_clone(&local, lcs, &remote) == VC_OK);
+	CHECK(vc_repo_clone(&other, ocs, &remote) == VC_OK);
 	CHECK(phash_eq(&vc_head(&local)->head, &vc_head(&remote)->head));
 	CHECK(working_row(&local, "t", 299) == 0);
 
@@ -583,7 +583,7 @@ test_push_fetch_clone(void)
 	/* other's push is not a fast-forward of the remote: rejected */
 	put_row(&other, "t", 2, 2);
 	vc_commit(&other, "other change");
-	CHECK(vc_push(&other, &remote, "main") == -1);
+	CHECK(vc_push(&other, &remote, "main") == VC_ERR);
 
 	/* fetch, merge, push succeeds */
 	CHECK(vc_fetch(&other, &remote, "main", &head) == 0);
@@ -685,7 +685,7 @@ vc_scale_case(uint64_t n, VcScale *s)
 	vc_set_working(&r, &rv);
 	c0 = vc_commit(&r, "load");
 	s->height = t_height(&r.ctx, &data);
-	vc_repo_clone(&remote, rcs, &r);
+	CHECK(vc_repo_clone(&remote, rcs, &r) == VC_OK);
 
 	/* branch: a new ref, no chunks */
 	st = cs->stats;
@@ -727,9 +727,9 @@ vc_scale_case(uint64_t n, VcScale *s)
 
 	/* reset --hard to an older commit */
 	st = cs->stats;
-	vc_reset_hard(&r, &c0);
+	CHECK(vc_reset_hard(&r, &c0) == VC_OK);
 	s->reset_reads = STATS_DELTA(cs, st, gets);
-	vc_reset_hard(&r, &c1);
+	CHECK(vc_reset_hard(&r, &c1) == VC_OK);
 
 	/* three-way merge of k changes on each side */
 	vc_checkout(&r, "main");
@@ -858,7 +858,7 @@ merge_base_reads(uint64_t history, uint64_t ahead)
 	}
 	b = vc_head(&r)->head;
 	st = cs->stats;
-	CHECK(vc_merge_base(&r.ctx, &a, &b, &mb));
+	CHECK(vc_merge_base(&r.ctx, &a, &b, &mb) == 1);
 	reads = STATS_DELTA(cs, st, gets);
 	CHECK(phash_eq(&mb, &fork));
 	check_store(cs, 0);
