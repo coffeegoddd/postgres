@@ -599,6 +599,49 @@ backed_off_done(Oid branch)
 		*b = backoffs[--nbackoffs];
 }
 
+/*
+ * Cancels.  A fold of the worker's holds its tables' locks to its end, and
+ * a move that restores a branch's tables (a hard reset to a commit kept
+ * with a root, say) only tries them, never queuing for them, so it would
+ * give up and write the rows instead.  What the fold folds the move is
+ * about to replace, so the move asks it to cancel (CancelWorkerHolders(),
+ * as it asks an autovacuum worker), and the fold gives up, rolled back as
+ * a fold refused a lock is, and is made again after its backoff, of what
+ * is left then.  The worker is told apart by PROC_IN_FOLD, set only while
+ * it folds; a cancel that comes at any other time (its freezes, its naps)
+ * is ignored, so that none ends the worker or a freeze.  Nothing waits on
+ * a fold of the worker's but for its locks: a commit, a status or a diff
+ * folds what it needs itself.
+ */
+static volatile sig_atomic_t folding = false;
+
+static void
+fold_cancel_handler(SIGNAL_ARGS)
+{
+	if (folding)
+		StatementCancelHandler(postgres_signal_arg, pg_siginfo);
+	else
+		SetLatch(MyLatch);
+}
+
+static void
+fold_cancellable(bool on)
+{
+	if (!on)
+		folding = false;
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	if (on)
+		MyProc->statusFlags |= PROC_IN_FOLD;
+	else
+		MyProc->statusFlags &= ~PROC_IN_FOLD;
+	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+	LWLockRelease(ProcArrayLock);
+	if (on)
+		folding = true;
+	else
+		QueryCancelPending = false; /* (one that came too late to matter) */
+}
+
 /* What a pass did. */
 typedef enum PassResult
 {
@@ -687,11 +730,13 @@ fold_pass(const ProllyRefsRoutine *refs)
 			 * until the table is written again)
 			 */
 			pace_begin();
+			fold_cancellable(true);
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
 				fold_branch(&folded);
 			else
 				branch_ops()->run_on(names[i], fold_branch, &folded);
+			fold_cancellable(false);
 			pace_end();
 			if (folded)
 			{
@@ -728,14 +773,17 @@ fold_pass(const ProllyRefsRoutine *refs)
 		PG_CATCH();
 		{
 			/*
-			 * (a retry: a paced fold that gave way to a lock request, or a
+			 * (a retry: a paced fold that gave way to a lock request, a
 			 * relation's lock another holds, which the fold doesn't wait
-			 * for: checkpoint_unless_moved())
+			 * for: checkpoint_unless_moved(), or a fold asked to cancel,
+			 * by a move that restores the tables it held)
 			 */
 			bool		retry = fold_gave_way ||
 				(geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE &&
-				 RelationLockRefused);
+				 RelationLockRefused) ||
+				geterrcode() == ERRCODE_QUERY_CANCELED;
 
+			folding = false;
 			pace_end();
 			fold_gave_way = false;
 			HOLD_INTERRUPTS();
@@ -743,6 +791,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 				EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
+			fold_cancellable(false);
 			RESUME_INTERRUPTS();
 			Assert(!RelationLocksNoWait);
 
@@ -754,7 +803,8 @@ fold_pass(const ProllyRefsRoutine *refs)
 				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
 				AtEOXact_PgStat_Prolly();
 				elog(DEBUG1, "fold worker left branch %u for its next pass: "
-					 "it gave way to a lock request, or a lock it needed was held",
+					 "it gave way to a lock request, a lock it needed was held, "
+					 "or it was asked to cancel",
 					 moved[i].branch);
 			}
 			else
@@ -883,6 +933,7 @@ ProllyFolderWorkerMain(Datum main_arg)
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
+	pqsignal(SIGINT, fold_cancel_handler);
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 	SetConfigOption("application_name", "prolly fold worker", PGC_USERSET,

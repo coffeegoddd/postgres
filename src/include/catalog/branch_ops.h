@@ -120,7 +120,10 @@ typedef struct BranchKeptTable
 	const BranchKeptRelation *rels;
 } BranchKeptTable;
 
-/* the autovacuum workers' transactions one operation asks to cancel, at most */
+/*
+ * the workers' transactions (autovacuum's, the fold worker's) one operation
+ * asks to cancel, at most
+ */
 #define BRANCH_LOCK_WAIT_MAX_ASKED	16
 
 /*
@@ -131,8 +134,9 @@ typedef struct BranchKeptTable
 typedef struct BranchLockWait
 {
 	TimestampTz start;			/* when one of its tries first waited */
-	TimestampTz asked;			/* when it first asked an autovacuum worker
-								 * to cancel */
+	TimestampTz asked;			/* when it first asked a worker (an
+								 * autovacuum's, the fold worker's) to
+								 * cancel */
 	int			nasked;			/* the workers' transactions asked */
 	VirtualTransactionId asked_xacts[BRANCH_LOCK_WAIT_MAX_ASKED];
 } BranchLockWait;
@@ -141,8 +145,8 @@ typedef struct BranchLockWait
  * prolly.restore_lock_wait: how long, in milliseconds, share(),
  * share_kept(), restore() (for a lock it doesn't hold already) and
  * try_lock() wait for a holder of a lock they need that isn't a page
- * sweep or an autovacuum worker, before giving up (lock_timeout, if set,
- * caps it).
+ * sweep, an autovacuum worker or a fold of the session branch's by the fold
+ * worker, before giving up (lock_timeout, if set, caps it).
  */
 extern PGDLLIMPORT int prolly_restore_lock_wait;
 

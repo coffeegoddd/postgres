@@ -229,10 +229,18 @@ int			prolly_restore_lock_wait = 100;
  *   (bmap_compaction_let_go()), as it does for a waiter in the lock's
  *   queue, and waited out;
  * - an autovacuum worker is asked to cancel its task
- *   (CancelAutoVacuumHolders()), once, as Postgres asks one blocking a
- *   lock waiter, and waited for: it gives up its vacuum at its next check
- *   for interrupts, and comes back to the relation later;
+ *   (CancelWorkerHolders()), once, as Postgres asks one blocking a lock
+ *   waiter, and waited for: it gives up its vacuum at its next check for
+ *   interrupts, and comes back to the relation later;
+ * - so is the fold worker folding the session branch's working set, for a
+ *   lock of the branch's own relation (relid valid; never one of another
+ *   branch's, whose fold the move leaves alone): what it folds the move is
+ *   about to replace, so it gives the fold up, rolled back as a fold
+ *   refused a lock is, and folds again later what is left, counted in
+ *   restores_fold_cancels;
  * - any other holder is waited for, tried again a little later each time.
+ *   (No backend waits on a fold of the worker's for anything but the
+ *   locks it holds: a commit, a status or a diff folds for itself.)
  *
  * The waits are short, and never as long as it takes, because giving up
  * costs only the rows the move then writes instead, and because the
@@ -266,6 +274,7 @@ try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, BranchLockWait *wait)
 	{
 		TimestampTz now;
 		bool		others_done;
+		int			nfolds = 0;
 
 		CHECK_FOR_INTERRUPTS();
 		if (OidIsValid(relid) ? ConditionalLockRelationOid(relid, mode) :
@@ -285,11 +294,13 @@ try_lock(const LOCKTAG *tag, Oid relid, LOCKMODE mode, BranchLockWait *wait)
 		 */
 		if (!(others_done && wait->asked != 0 &&
 			  TimestampDifferenceExceeds(wait->asked, now, cancel_bound)) &&
-			CancelAutoVacuumHolders(tag, mode, wait->asked_xacts,
-									&wait->nasked,
-									BRANCH_LOCK_WAIT_MAX_ASKED) > 0 &&
+			CancelWorkerHolders(tag, mode, OidIsValid(relid),
+								wait->asked_xacts, &wait->nasked,
+								BRANCH_LOCK_WAIT_MAX_ASKED, &nfolds) > 0 &&
 			wait->asked == 0)
 			wait->asked = now;
+		if (nfolds > 0)
+			pgstat_count_prolly(PGSTAT_PROLLY_RESTORES_FOLD_CANCELS, nfolds);
 		if (others_done &&
 			(wait->asked == 0 ||
 			 TimestampDifferenceExceeds(wait->asked, now, cancel_bound)))
