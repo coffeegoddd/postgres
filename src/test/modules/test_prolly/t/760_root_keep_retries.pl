@@ -1,7 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Under dolt.transaction_commit, a root due at a transaction's commit is
-# kept only if no other writer of the branch holds its tables.  A keep
+# Under dolt.transaction_commit, with prolly.freeze_roots off, a root due
+# at a transaction's commit is kept only if no other writer of the branch
+# holds its tables; with it on (the default), the root is captured among
+# the writers and frozen later, so the keep is had all the same.  A keep
 # that can't be had is not tried again within prolly.root_interval: each
 # try reads the branch's kept commits and asks what is left of them, and
 # every transaction's commit would try it while another writer works.
@@ -46,16 +48,24 @@ sql('CREATE EXTENSION injection_points');
 my $writer = $node->background_psql('postgres');
 $writer->query_safe(q{BEGIN; UPDATE rk.w SET v = 1});
 
-# a root is due (the interval passed since c0 was kept), but every keep
-# finds rk.w held
+# a root is due (the interval passed since c0 was kept): with roots
+# frozen (the default), the keep is had while rk.w is held
 sleep(3);
-my $checks = counted('kept_status_checks');
 my $kept = counted('pages_kept');
 my $s = $node->background_psql('postgres');
 $s->query_safe(q{SET dolt.transaction_commit = on; SET prolly.root_interval = '2s'});
-$s->query_safe("UPDATE rk.t SET v = $_ WHERE id = 1") for 1 .. 50;
+$s->query_safe("UPDATE rk.t SET v = $_ WHERE id = 1") for 1 .. 5;
 $s->query_safe('SELECT pg_stat_force_next_flush()');
-is(counted('pages_kept'), $kept, 'no keep had');
+cmp_ok(counted('pages_kept'), '>', $kept, 'roots frozen: a keep had among the writers');
+
+# the interval passed again, roots not frozen: every keep finds rk.w held
+sleep(3);
+my $checks = counted('kept_status_checks');
+$kept = counted('pages_kept');
+$s->query_safe(q{SET prolly.freeze_roots = off});
+$s->query_safe("UPDATE rk.t SET v = 50 + $_ WHERE id = 1") for 1 .. 50;
+$s->query_safe('SELECT pg_stat_force_next_flush()');
+is(counted('pages_kept'), $kept, 'roots not frozen: no keep had');
 cmp_ok(counted('kept_status_checks') - $checks, '<', 50,
 	'one keep tried in the interval, not one for each commit');
 

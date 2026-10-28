@@ -7,6 +7,9 @@
 # and a valid index of each (a table TRUNCATE emptied in the move's
 # transaction too), whether the rows' WAL was written (wal_level replica)
 # or skipped and the new storage synced or logged at commit (minimal).
+# The commits are made within prolly.root_interval of the first, so none
+# but it keeps its pages: a move to one restores the kept commit before it
+# and writes the rows they differ by, which is the path tested.
 
 use strict;
 use warnings FATAL => 'all';
@@ -28,6 +31,7 @@ wal_level = $wal_level
 max_wal_senders = 0
 autovacuum = off
 checkpoint_timeout = '1h'
+prolly.root_interval = '1h'
 });
 	$node->start;
 
