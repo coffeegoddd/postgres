@@ -556,9 +556,11 @@ emptied_relations(List *emptied, List **relids)
 /*
  * Are the pages of storage reln still those root k keeps of it?  A root
  * holding them as they were shares reln's subtrees until one changes
- * (bmap_root_unchanged()); a frozen one holds copies, so reln's pages
- * changed since are looked for (bmap_changed_pages(), which reads only
- * the map's nodes set since: none if nothing changed).
+ * (bmap_root_unchanged()); a frozen one holds copies, so a page of reln's
+ * changed since is looked for (bmap_changed_since(), which ends at the
+ * first one found: the map's nodes on one path down, however many pages
+ * changed, so a move discarding a large working set reads no more of the
+ * map than one discarding a row).
  */
 static bool
 kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
@@ -566,9 +568,6 @@ kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
 	RelFileLocator loc = reln->smgr_rlocator.locator;
 	BlockNumber root_nblocks;
 	BlockNumber nblocks;
-	BlockNumber *blknos;
-	uint32		n;
-
 	uint32		since;
 
 	/* (pages a writer the commit didn't see changed are not the commit's) */
@@ -579,10 +578,8 @@ kept_unchanged(SMgrRelation reln, const BranchKeptRelation *k)
 	if (!bmap_root_held(loc, k->snapshot, &root_nblocks) ||
 		!bmap_root_base(reln, k->snapshot, &since))
 		return false;
-	n = bmap_changed_pages(reln, since, &blknos, &nblocks);
-	if (blknos)
-		pfree(blknos);
-	return n == 0 && nblocks == root_nblocks;
+	return !bmap_changed_since(reln, since, &nblocks) &&
+		nblocks == root_nblocks;
 }
 
 static bool heap_format(Form_pg_class c);
@@ -2767,10 +2764,11 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		if (rows[i] == NULL ||
 			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
 			ok = false;
-		else
+		else if (!any)
 		{
 			Form_pg_class c = (Form_pg_class) GETSTRUCT(rows[i]);
 
+			/* (one changed is enough: every one gets new storage then) */
 			if (!kept_unchanged(smgropen(class_locator(c, c->relfilenode),
 										 INVALID_PROC_NUMBER),
 								&kept[i]))

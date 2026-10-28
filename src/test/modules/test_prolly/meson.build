@@ -528,6 +528,8 @@ tests += {
       't/860_reset_fold_holder.pl',
       't/861_reset_after_drop.pl',
       't/862_merge_remade_rows.pl',
+      't/870_reset_changed_walk.pl',
+      't/871_fold_cancel_in_sort.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',

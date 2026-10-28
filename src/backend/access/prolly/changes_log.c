@@ -98,6 +98,7 @@
 #include "portability/instr_time.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -500,7 +501,26 @@ compact_copies(Finder *f)
 	int64		u = 0;
 
 	if (f->n > 1)
+	{
+#ifdef USE_INJECTION_POINTS
+		char		filenode[16];
+
+		/*
+		 * (only a sort that compares: told the table's file number, if the
+		 * fold is the fold worker's; held from interrupts while it waits, so
+		 * a cancel sent meanwhile is taken in the sort)
+		 */
+		snprintf(filenode, sizeof(filenode), "%u",
+				 f->rel->rd_locator.relNumber);
+		HOLD_INTERRUPTS();
+		INJECTION_POINT("prolly-fold-sort",
+						AmBackgroundWorkerProcess() ? filenode : NULL);
+		RESUME_INTERRUPTS();
+#endif
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
+		INJECTION_POINT("prolly-fold-sorted",
+						AmBackgroundWorkerProcess() ? filenode : NULL);
+	}
 	for (int64 i = 0; i < f->n; i++)
 	{
 		Copy	   *c = &f->c[i];
@@ -722,7 +742,13 @@ same_bytes(const char *a, uint32 alen, const uint8 *b, uint32 blen)
 	return alen == blen && memcmp(a, b, alen) == 0;
 }
 
-/* By the keying's order, then by bytes (as a full fold orders rows). */
+/*
+ * By the keying's order, then by bytes (as a full fold orders rows).  A
+ * sort of a large working set's copies runs a long while in memory, so
+ * each comparison checks for interrupts: a cancel (a move restoring the
+ * tables the fold worker holds asks its fold to give up) is taken within
+ * the sort, not after it.
+ */
 static int
 copy_cmp(const void *a, const void *b, void *arg)
 {
@@ -730,7 +756,10 @@ copy_cmp(const void *a, const void *b, void *arg)
 	const Copy *y = b;
 	ProllyKey	kx = {(const uint8 *) x->key, x->keylen};
 	ProllyKey	ky = {(const uint8 *) y->key, y->keylen};
-	int			r = keying_compare(&kx, &ky, arg);
+	int			r;
+
+	CHECK_FOR_INTERRUPTS();
+	r = keying_compare(&kx, &ky, arg);
 
 	if (r == 0)
 		r = memcmp(x->key, y->key, Min(x->keylen, y->keylen));

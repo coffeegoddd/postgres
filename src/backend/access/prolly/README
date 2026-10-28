@@ -1368,6 +1368,11 @@ pages.  Finding the pages changed reads only the map's nodes set since the
 epoch: a page's change sets every pointer above its leaf in the map's
 epoch (once a node for each epoch), so the walk passes over the subtrees
 set before, and a relation unchanged since its root reads no node.
+Whether a relation's pages are still its frozen root's (a move asks it
+of each relation it would restore or share) is answered at the first
+changed page found (bmap_changed_since()), reading the map's nodes on one
+path down, so a move discarding a large working set reads no more of the
+map for that than one discarding a row.
 prolly.freeze_roots off keeps them as captured, sharing the relation's
 pages.
 
