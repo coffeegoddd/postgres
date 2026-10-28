@@ -12036,6 +12036,8 @@ typedef struct TypeMoves
 	List	   *detached;		/* typed tables detached before their types
 								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
+	List	   *late_drops;		/* the old ones types going use: dropped
+								 * after those (with the types going) */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
 									 * again with the others, after them) */
@@ -12051,6 +12053,7 @@ typedef struct MovedType
 	MoveItem   *to;
 	Oid			typid;
 	char	   *aside;			/* qualified, once renamed */
+	bool		late;			/* a type going uses it: dropped after that */
 } MovedType;
 
 static MovedType *
@@ -12062,6 +12065,25 @@ moved_type(List *moved, Oid typid)
 		if (((MovedType *) lfirst(lc))->typid == typid)
 			return lfirst(lc);
 	return NULL;
+}
+
+/* Is type typid the branch's, and one to doesn't define (it goes)? */
+static bool
+type_goes(List *from, List *to, Oid typid)
+{
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	Form_pg_type typ;
+	char	   *name;
+	bool		goes;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+	name = qualified(typ->typnamespace, NameStr(typ->typname));
+	ReleaseSysCache(tup);
+	goes = find_item(from, 'y', name) != NULL && find_item(to, 'y', name) == NULL;
+	pfree(name);
+	return goes;
 }
 
 /*
@@ -12140,6 +12162,22 @@ move_type(List **moved, List *from, List *to, Oid typid, const char *user)
 	return mt;
 }
 
+/*
+ * A type using mt that is to be moved with it, unless it goes: then it
+ * keeps using mt renamed aside until it is dropped with the other types
+ * going, and mt's old one is dropped after it.
+ */
+static void
+move_type_user(List **moved, List *from, List *to, MovedType *mt, Oid typid)
+{
+	if (moved_type(*moved, typid) != NULL)
+		return;
+	if (type_goes(from, to, typid))
+		mt->late = true;
+	else
+		(void) move_type(moved, from, to, typid, mt->from->name);
+}
+
 /* The line of item def's table definition, of a section, named name. */
 static const char *
 table_def_line(const MoveItem *t, int section, const char *name)
@@ -12192,11 +12230,12 @@ in_partition_key(Oid relid, AttrNumber attnum)
  * anew, the columns of versioned tables using it (or arrays of it)
  * converted, and the old dropped.  What uses one is found through what
  * depends on it: a composite type or a domain the branch has is moved
- * with it (as to defines it); typed tables are detached for move_table()
- * to attach again once their columns match; a check constraint, an index
- * or a default of a versioned table, or a routine, is dropped first and
- * made again after (as to defines it, if alike; the table's or routine's
- * own move does the rest).  Anything else using it (a column of another
+ * with it (as to defines it), or, one to doesn't define, left on the old
+ * one, which is dropped after it goes; typed tables are detached for
+ * move_table() to attach again once their columns match; a check
+ * constraint, an index or a default of a versioned table, or a routine,
+ * is dropped first and made again after (as to defines it, if alike; the
+ * table's or routine's own move does the rest).  Anything else using it (a column of another
  * schema's table, an operator) can't be moved with it: refused.  Views and
  * materialized views using them go and come back with the others
  * (folded_move_schema()).
@@ -12308,10 +12347,7 @@ type_moves(List *from, List *to)
 					}
 					else if (kind == RELKIND_COMPOSITE_TYPE)
 					{
-						Oid			ct = get_rel_type_id(d->objid);
-
-						if (moved_type(moved, ct) == NULL)
-							(void) move_type(&moved, from, to, ct, mt->from->name);
+						move_type_user(&moved, from, to, mt, get_rel_type_id(d->objid));
 						handled = true;
 					}
 					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
@@ -12424,8 +12460,7 @@ type_moves(List *from, List *to)
 				}
 				else if (d->classid == TypeRelationId)
 				{
-					if (moved_type(moved, d->objid) == NULL)
-						(void) move_type(&moved, from, to, d->objid, mt->from->name);
+					move_type_user(&moved, from, to, mt, d->objid);
 					handled = true;
 				}
 				else if (d->classid == ConstraintRelationId)
@@ -12439,8 +12474,7 @@ type_moves(List *from, List *to)
 					if (OidIsValid(con->contypid))
 					{
 						/* (a domain's: it moves with it) */
-						if (moved_type(moved, con->contypid) == NULL)
-							(void) move_type(&moved, from, to, con->contypid, mt->from->name);
+						move_type_user(&moved, from, to, mt, con->contypid);
 						handled = true;
 					}
 					else if (OidIsValid(con->conrelid) &&
@@ -12602,8 +12636,16 @@ type_moves(List *from, List *to)
 														 &tm.unvalidated));
 		made_as_item(llast(tm.creates), mt->to->name, 'y');
 		made_as_since(tm.unvalidated, m, mt->to->name, 'y');
-		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
-		made_as_item(llast(tm.drops), mt->from->name, 'y');
+		if (mt->late)
+		{
+			tm.late_drops = lappend(tm.late_drops, psprintf("DROP TYPE %s", mt->aside));
+			made_as_item(llast(tm.late_drops), mt->from->name, 'y');
+		}
+		else
+		{
+			tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
+			made_as_item(llast(tm.drops), mt->from->name, 'y');
+		}
 	}
 	tm.before = list_concat(list_copy(tm.aggregate_drops), tm.before);
 	return tm;
@@ -14480,7 +14522,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(foreign_alters);
 	run_statements(foreign_routines);
 	sql_bodies = try_statements(sql_bodies);
-	make_views(type_drops);
+	make_views(list_concat(type_drops, tm.late_drops));
 	run_statements(collation_drops);
 	run_statements(schema_drops);
 

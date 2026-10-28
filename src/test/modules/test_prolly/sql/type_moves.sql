@@ -199,3 +199,31 @@ INSERT INTO tm4.t (id) VALUES (2);
 SELECT * FROM tm4.t ORDER BY id;
 DROP SCHEMA tm4 CASCADE;
 SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;
+
+-- A type the commit defines otherwise, used by a composite type and a
+-- domain the commit doesn't define at all (with tables using them): those
+-- go, keeping the old type until they do, rather than being refused
+CREATE SCHEMA tm5 VERSIONED;
+CREATE DOMAIN tm5.d AS int;
+SELECT length(dolt_commit('-Am', 'tm5 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm5_one \gset
+ALTER DOMAIN tm5.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm5.comp AS (x tm5.d);
+CREATE DOMAIN tm5.d2 AS tm5.d;
+CREATE TABLE tm5.t (id int PRIMARY KEY, c tm5.comp, c2 tm5.d2);
+INSERT INTO tm5.t VALUES (1, ROW(1), 2);
+SELECT length(dolt_commit('-Am', 'tm5 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm5_two \gset
+SELECT dolt_reset('--hard', :'tm5_one') IS NOT NULL AS reset;
+SELECT to_regtype('tm5.comp') IS NULL AS comp_gone,
+	   to_regtype('tm5.d2') IS NULL AS d2_gone,
+	   to_regclass('tm5.t') IS NULL AS t_gone;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+SELECT count(*) AS aside FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm5' AND t.typname LIKE 'prolly_moving%';
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm5_two') IS NOT NULL AS reset;
+SELECT * FROM tm5.t;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+DROP SCHEMA tm5 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm5 gone')::text) AS committed;

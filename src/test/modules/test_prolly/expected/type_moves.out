@@ -595,3 +595,89 @@ SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;
         42
 (1 row)
 
+-- A type the commit defines otherwise, used by a composite type and a
+-- domain the commit doesn't define at all (with tables using them): those
+-- go, keeping the old type until they do, rather than being refused
+CREATE SCHEMA tm5 VERSIONED;
+CREATE DOMAIN tm5.d AS int;
+SELECT length(dolt_commit('-Am', 'tm5 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm5_one \gset
+ALTER DOMAIN tm5.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm5.comp AS (x tm5.d);
+CREATE DOMAIN tm5.d2 AS tm5.d;
+CREATE TABLE tm5.t (id int PRIMARY KEY, c tm5.comp, c2 tm5.d2);
+INSERT INTO tm5.t VALUES (1, ROW(1), 2);
+SELECT length(dolt_commit('-Am', 'tm5 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm5_two \gset
+SELECT dolt_reset('--hard', :'tm5_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT to_regtype('tm5.comp') IS NULL AS comp_gone,
+	   to_regtype('tm5.d2') IS NULL AS d2_gone,
+	   to_regclass('tm5.t') IS NULL AS t_gone;
+ comp_gone | d2_gone | t_gone 
+-----------+---------+--------
+ t         | t       | t
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS aside FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm5' AND t.typname LIKE 'prolly_moving%';
+ aside 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm5_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm5.t;
+ id |  c  | c2 
+----+-----+----
+  1 | (1) |  2
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+ conname 
+---------
+ k
+(1 row)
+
+DROP SCHEMA tm5 CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table tm5.t
+drop cascades to type tm5.d
+drop cascades to type tm5.comp
+drop cascades to type tm5.d2
+SELECT length(dolt_commit('-Am', 'tm5 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
