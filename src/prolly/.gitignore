@@ -4,3 +4,4 @@
 /test/test_window
 /test/test_remote
 /test/test_image
+/bench/winbench

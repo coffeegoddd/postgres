@@ -1,0 +1,5 @@
+# prolly_pages extension
+comment = 'write whole pages back into relations, for restoring commit images'
+default_version = '1.0'
+module_pathname = '$libdir/prolly_pages'
+relocatable = true

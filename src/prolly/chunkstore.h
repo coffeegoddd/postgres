@@ -151,4 +151,11 @@ extern bool cs_check_invariants(ChunkStore *cs, size_t *orphans, char *why,
 /* In-memory backend. */
 extern ChunkStore *memstore_create(void);
 
+/*
+ * File-backed backend: one append-only data file, memory-mapped for reads,
+ * with an in-memory index.  Freed bytes are not reclaimed in the file.
+ */
+extern ChunkStore *filestore_create(const char *path);
+extern uint64_t filestore_file_bytes(ChunkStore *cs);
+
 #endif							/* CHUNKSTORE_H */

@@ -1,0 +1,17 @@
+/* contrib/prolly_pages/prolly_pages--1.0.sql */
+
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION prolly_pages" to load this file. \quit
+
+CREATE FUNCTION prolly_put_pages(rel regclass, fork text, blocks int4[], pages bytea)
+RETURNS int4
+AS 'MODULE_PATHNAME', 'prolly_put_pages'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION prolly_truncate(rel regclass, nblocks int4)
+RETURNS void
+AS 'MODULE_PATHNAME', 'prolly_truncate'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION prolly_put_pages(regclass, text, int4[], bytea) FROM PUBLIC;
+REVOKE ALL ON FUNCTION prolly_truncate(regclass, int4) FROM PUBLIC;
