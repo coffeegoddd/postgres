@@ -9,7 +9,7 @@ for any commit inside an arbitrarily sized window.
 | Piece | What it is | Lifetime |
 |---|---|---|
 | Working set | The schema's heap and indexes, mutable, plain SQL | Always |
-| Change stream | One logical-decoding slot per versioned schema | Always |
+| Change stream | One logical-decoding slot per versioned schema, read by one persistent streaming decoder | Always |
 | Prolly tree | Commits, plus a *working root* per branch | Commits: per the window; working roots: always |
 | Keyframes | Commit images (page images + page map) at selected commits | Local only, inside the window, never exported |
 | Window | Incremental head coverage, sever into segments, export or discard | Always |
@@ -22,17 +22,32 @@ Only keyframes are optional.  Everything else is required.
    individual writes; the standing costs are logical-level WAL, plus hint
    logging (data checksums or `wal_log_hints`) when keyframes are used.
 
-2. **Checkpoint.**  Triggered in the background by time or by the size of the
-   undecoded tail, and on demand by commit, diff, status and checkout.
-   Decodes committed changes up to WAL position L, applies them to the
-   branch's working root, and records *working root = working set as of L*.
-   Cost: O(rows since the last checkpoint), kept bounded by the triggers.
+2. **Checkpoint.**  The streaming decoder parses committed changes as they
+   arrive and applies whole transactions to the branch's working root in
+   batches, by row count or time (background checkpoints), confirming its
+   position so the slot advances.  An on-demand checkpoint (commit, diff,
+   status, checkout) is a *barrier*: a non-transactional logical message
+   with a fresh token; when the stream reaches it, every transaction whose
+   commit record precedes it has been applied.  Cost: O(rows since the last
+   background apply).  No WAL is decoded twice.
 
-3. **Dolt commit.**  A synchronous checkpoint, then the commit chunk; the
-   hash is known on return.  Then the keyframe decision (below): if one is
-   cut, the pages changed since the previous keyframe's base point are
-   captured on top of it, O(changed pages).  Otherwise commit does nothing
-   physical.
+3. **Dolt commit.**  No lock, and writers are never blocked.  The caller
+   commits its own SQL transaction, then: barrier, commit chunk, return the
+   hash.  "Synchronous" only means the caller waits for its commit's
+   contents to reach the prolly tree.
+   - The commit holds exactly the working root as of the barrier: every
+     transaction whose commit record precedes the barrier in the WAL, each
+     all or nothing.  Transactions committing later land in the working
+     root afterwards, like uncommitted Dolt working-set changes, and the
+     branch's working root carries on.
+   - That cut follows WAL commit order: exactly what a replica replaying the
+     same WAL shows.  In rare corner cases it can differ from what an MVCC
+     snapshot taken at the same instant sees, because a commit record is
+     written slightly before the transaction becomes visible to new
+     snapshots.
+   - Then the keyframe decision (below).  A keyframe is captured under an
+     MVCC snapshot taken at the barrier, so it does not block writers
+     either; if none is cut, commit does nothing physical.
 
 4. **diff, status, log, merge base.**  Checkpoint, then prolly tree only:
    O(d log n) against any commit in the window.  Diff sees committed SQL
