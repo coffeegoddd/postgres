@@ -1147,14 +1147,14 @@ query are made only as that batch runs.  A merge still checks every foreign key 
 wrote whole, by query; the executor's own sorts and hashes spill under
 work_mem as for any query.
 
-A commit, a checkpoint and a fold of a transaction's own rows change
-only their branch's refs (its head, baseline, the names of its head's
-tables, its merge state and violations, the commits its pages are kept
-as of).  Every change of a branch's refs
+A commit, a checkpoint, a soft reset and a fold of a transaction's own
+rows change only their branch's refs (its head, baseline, the names of
+its head's tables, its merge state and violations, the commits its pages
+are kept as of).  Every change of a branch's refs
 is made holding that branch's lock to transaction end, and they take
 only that, so commits on different branches run together while those on
 one branch take turns.  Anything else that changes the refs (a branch
-made, deleted or renamed, a reset, a merge, a push) holds the session
+made, deleted or renamed, a hard reset, a merge, a push) holds the session
 branch's lock (and any branch's it changes), then moves the store's root
 with its transaction, as all of them did before: other such movers wait
 for it.  A branch's holder makes its changes in a refs tree of its own,
