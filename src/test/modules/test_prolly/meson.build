@@ -525,6 +525,7 @@ tests += {
       't/820_restore_flat_in_roots.pl',
       't/821_restore_lineage.pl',
       't/822_planned_share_lineage.pl',
+      't/863_jindex_checkpoint_unlocked.pl',
       't/860_reset_fold_holder.pl',
       't/861_reset_after_drop.pl',
       't/862_merge_remade_rows.pl',

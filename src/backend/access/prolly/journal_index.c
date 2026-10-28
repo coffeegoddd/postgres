@@ -68,6 +68,7 @@
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 
 /* the tranche of every index's locks, made once */
@@ -745,18 +746,50 @@ saved_position(JournalIndex *ix, JournalSegScan *g)
 	return pos;
 }
 
+/* a copy of a chunk, as save_index() took it out of the index */
+typedef struct SavedCopy
+{
+	uint8		key[JINDEX_MAX_HASH];
+	uint64		segment;
+	uint64		offset;
+	uint32		len;
+	TransactionId xid;
+} SavedCopy;
+
 /*
- * Write ix's file, aside and then renamed over the last: written (to the
- * OS) under the index's lock, shared, as it is read; made durable and
- * renamed after.  Laid out: magic, version, the store's format, the hash's
- * length, the root (its length, bytes, segment and offset), the segments
- * (each's id and position), each copy of each chunk (its hash, segment,
- * offset, length and xid), then how many copies, and the CRC of all of it.
+ * Write ix's file, aside and then renamed over the last.  Laid out: magic,
+ * version, the store's format, the hash's length, the root (its length,
+ * bytes, segment and offset), the segments (each's id and position), each
+ * copy of each chunk (its hash, segment, offset, length and xid), then how
+ * many copies, and the CRC of all of it.
+ *
+ * Nothing is held across the file's writes, nor for a time that grows with
+ * the index: the root and the segments' positions are taken under the
+ * index's lock, shared, and let go of at once; the chunks are copied out
+ * of the dshash after, each partition's under only its own lock (as any
+ * reader of a chunk takes it), and their transactions asked of, and
+ * written, with nothing held.  That is consistent as the file is read: a
+ * chunk is taken from it only below its segment's position saved, which
+ * is the first of what the segment had been read up to and its holes and
+ * PADs when the positions were taken; every chunk indexed then below it
+ * is still indexed when the copy reaches its partition (a chunk leaves the
+ * index only with its segment, which the manifest then no longer names,
+ * and which the file's reader passes over), and one indexed since is past
+ * it, read again from the journal.  The changes counted are those as of
+ * the positions: any made since are saved by the next checkpoint.
+ *
+ * The registry's entry for the database (r, of dboid) is held while the
+ * index is read, so a drop of the database waits for that, and let go of
+ * for the writes; it is taken again to put the file in place, only if the
+ * database's index is still the one read (not dropped meanwhile, its OID
+ * perhaps used again), and the file then renamed under it.
  */
 static void
-save_index(JournalIndex *ix, const char *format, int format_len)
+save_index(JournalIndex *ix, Registered *r, const char *format, int format_len)
 {
 	IndexShared *db = ix->db;
+	Oid			dboid = ix->dboid;
+	dsa_pointer dbptr = r->db;
 	char	   *dir = GetDatabasePath(db->dboid, db->spcoid);
 	char	   *path = psprintf("%s/%s", dir, JINDEX_FILE);
 	char	   *temp = psprintf("%s.tmp", path);
@@ -766,6 +799,15 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 	uint8		hlen = 0;
 	uint64		changes;
 	uint64		count = 0;
+	ProllyHash	root;
+	uint64		root_segment;
+	uint64		root_offset;
+	uint32		nsegs;
+	uint64	   *seg_ids;
+	uint64	   *seg_pos;
+	SavedCopy  *copies;
+	Size		ncopies = 0;
+	Size		maxcopies = 1024;
 	dshash_seq_status status;
 	Chunk	   *c;
 	bool		ok;
@@ -779,77 +821,73 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 			ereport(LOG,
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", temp)));
+		dshash_detach(ix->chunks);
+		ix->chunks = NULL;
+		dshash_release_lock(registry, r);
 		pfree(w);
 		pfree(temp);
 		pfree(path);
 		pfree(dir);
 		return;
 	}
-	w->ok = true;
-	w->len = 0;
-	INIT_CRC32C(w->crc);
-	put_bytes(w, FILE_MAGIC, 8);
-	put_bytes(w, &version, sizeof(version));
-	put_bytes(w, &flen, 1);
-	put_bytes(w, format, format_len);
+
+	/* (the root and the segments' positions, under the lock a moment) */
 	jindex_lock(ix, false);
 	changes = pg_atomic_read_u64(&db->changes);
-	/* (the hash's length: the root's, or any chunk's) */
-	hlen = db->scan.root.len;
-	if (hlen == 0)
+	root = db->scan.root;
+	root_segment = db->scan.root_segment;
+	root_offset = db->scan.root_offset;
+	nsegs = db->scan.nsegments;
+	seg_ids = palloc(sizeof(uint64) * Max(nsegs, 1));
+	seg_pos = palloc(sizeof(uint64) * Max(nsegs, 1));
+	for (uint32 i = 0; i < nsegs; i++)
 	{
-		dshash_seq_init(&status, ix->chunks, false);
-		if ((c = dshash_seq_next(&status)) != NULL)
-			hlen = c->hash_len;
-		dshash_seq_term(&status);
-	}
-	{
-		uint32		nsegs = db->scan.nsegments;
+		JournalSegScan *g = jindex_segment(ix, i);
 
-		put_bytes(w, &hlen, 1);
-		put_bytes(w, &db->scan.root.len, 1);
-		put_bytes(w, db->scan.root.bytes, db->scan.root.len);
-		put_bytes(w, &db->scan.root_segment, 8);
-		put_bytes(w, &db->scan.root_offset, 8);
-		put_bytes(w, &nsegs, 4);
-		for (int i = 0; i < db->scan.nsegments; i++)
-		{
-			JournalSegScan *g = jindex_segment(ix, i);
-			uint64		pos = saved_position(ix, g);
-
-			put_bytes(w, &g->id, 8);
-			put_bytes(w, &pos, 8);
-		}
+		seg_ids[i] = g->id;
+		seg_pos[i] = saved_position(ix, g);
 	}
+	jindex_unlock(ix);
+
+	/*
+	 * (the chunks, copied out partition by partition: each copy of each,
+	 * of the hash's length, the root's or else the first chunk's)
+	 */
+	hlen = root.len;
+	copies = palloc_extended(sizeof(SavedCopy) * maxcopies, MCXT_ALLOC_HUGE);
 	dshash_seq_init(&status, ix->chunks, false);
 	while ((c = dshash_seq_next(&status)) != NULL)
 	{
+		if (hlen == 0)
+			hlen = c->hash_len;
+		if (c->hash_len != hlen)
+			continue;
 		for (dsa_pointer p = InvalidDsaPointer;;)
 		{
-			uint64		segment = c->segment;
-			uint64		offset = c->offset;
-			uint32		len = c->len;
-			TransactionId xid = c->xid;
+			SavedCopy  *sc;
 
+			if (ncopies == maxcopies)
+			{
+				maxcopies *= 2;
+				copies = repalloc_huge(copies, sizeof(SavedCopy) * maxcopies);
+			}
+			sc = &copies[ncopies++];
+			memcpy(sc->key, c->key, JINDEX_MAX_HASH);
 			if (DsaPointerIsValid(p))
 			{
 				Copy	   *o = dsa_get_address(area, p);
 
-				segment = o->segment;
-				offset = o->offset;
-				len = o->len;
-				xid = o->xid;
+				sc->segment = o->segment;
+				sc->offset = o->offset;
+				sc->len = o->len;
+				sc->xid = o->xid;
 			}
-			if (TransactionIdIsValid(xid) && !TransactionIdIsInProgress(xid))
-				xid = InvalidTransactionId;
-			if (c->hash_len == hlen)
+			else
 			{
-				put_bytes(w, c->key, c->hash_len);
-				put_bytes(w, &segment, 8);
-				put_bytes(w, &offset, 8);
-				put_bytes(w, &len, 4);
-				put_bytes(w, &xid, 4);
-				count++;
+				sc->segment = c->segment;
+				sc->offset = c->offset;
+				sc->len = c->len;
+				sc->xid = c->xid;
 			}
 			p = DsaPointerIsValid(p) ? ((Copy *) dsa_get_address(area, p))->other :
 				c->other;
@@ -858,7 +896,48 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 		}
 	}
 	dshash_seq_term(&status);
-	jindex_unlock(ix);
+	dshash_detach(ix->chunks);
+	ix->chunks = NULL;
+	dshash_release_lock(registry, r);
+
+	/* (and written, nothing held) */
+	w->ok = true;
+	w->len = 0;
+	INIT_CRC32C(w->crc);
+	put_bytes(w, FILE_MAGIC, 8);
+	put_bytes(w, &version, sizeof(version));
+	put_bytes(w, &flen, 1);
+	put_bytes(w, format, format_len);
+	put_bytes(w, &hlen, 1);
+	put_bytes(w, &root.len, 1);
+	put_bytes(w, root.bytes, root.len);
+	put_bytes(w, &root_segment, 8);
+	put_bytes(w, &root_offset, 8);
+	put_bytes(w, &nsegs, 4);
+	for (uint32 i = 0; i < nsegs; i++)
+	{
+		put_bytes(w, &seg_ids[i], 8);
+		put_bytes(w, &seg_pos[i], 8);
+	}
+	for (Size i = 0; i < ncopies; i++)
+	{
+		SavedCopy  *sc = &copies[i];
+		TransactionId xid = sc->xid;
+
+		if (i == 0)
+			INJECTION_POINT("prolly-jindex-save-chunks", NULL);
+		if (TransactionIdIsValid(xid) && !TransactionIdIsInProgress(xid))
+			xid = InvalidTransactionId;
+		put_bytes(w, sc->key, hlen);
+		put_bytes(w, &sc->segment, 8);
+		put_bytes(w, &sc->offset, 8);
+		put_bytes(w, &sc->len, 4);
+		put_bytes(w, &xid, 4);
+		count++;
+	}
+	pfree(copies);
+	pfree(seg_ids);
+	pfree(seg_pos);
 	put_bytes(w, &count, 8);
 	writer_flush(w);
 	FIN_CRC32C(w->crc);
@@ -868,10 +947,13 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 	ok = w->ok && pg_fsync(w->fd) == 0;
 	if (CloseTransientFile(w->fd) != 0)
 		ok = false;
-	if (ok && durable_rename(temp, path, LOG) == 0)
+	r = ok ? dshash_find(registry, &dboid, false) : NULL;
+	if (r != NULL && r->db == dbptr && durable_rename(temp, path, LOG) == 0)
 		db->saved = changes;
 	else
 		(void) unlink(temp);
+	if (r != NULL)
+		dshash_release_lock(registry, r);
 	pfree(w);
 	pfree(temp);
 	pfree(path);
@@ -903,16 +985,15 @@ jindex_checkpoint(const char *format, int format_len)
 		Oid			dboid = lfirst_oid(lc);
 		JournalIndex ix;
 
-		/* (the registry's entry held while written: a drop waits) */
+		/* (the registry's entry held while the index is read: a drop waits) */
 		r = dshash_find(registry, &dboid, false);
 		if (r == NULL)
 			continue;
 		ix.dboid = dboid;
 		ix.db = dsa_get_address(area, r->db);
 		ix.chunks = dshash_attach(area, &params, ix.db->chunks, NULL);
-		save_index(&ix, format, format_len);
-		dshash_detach(ix.chunks);
-		dshash_release_lock(registry, r);
+		/* (lets go of the entry, and detaches the chunks) */
+		save_index(&ix, r, format, format_len);
 	}
 	list_free(dbs);
 }
