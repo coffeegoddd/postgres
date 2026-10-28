@@ -1,0 +1,62 @@
+# V11: generational chunk-store files under steady churn (#1104's
+# measurements).  A vc_bench-shaped table (1,024-byte rows) at 1 and 10
+# logical GB; ten warm-up cycles, then ten measured ones, each updating
+# 10,000 rows spread over the keys, committing, collecting, severing all
+# but the newest three commits (delete mode) and retiring what is chosen;
+# then a churn sweep, a conjoin of the table files, and a full collection.
+#
+#   build_postgres.py --build-dir DIR --with-test-prolly -- CFLAGS=-O2 ...
+#   prolly_bench run V --am prolly --config configs/v_generations.toml \
+#       --pg-bin DIR/inst/bin --sizes gen1
+#
+# One client, autovacuum off (the cycles vacuum the table themselves, and
+# no background collection, conjoin or sever runs between them), and a
+# streaming standby replaying everything.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["gen1", "gen10"]
+workloads = ["V11"]
+fio_baseline = false
+seed = 1
+collectors = ["wal"]
+
+[postgres]
+shared_buffers = "4GB"
+autovacuum = "off"
+checkpoint_timeout = "1h"
+max_wal_size = "32GB"
+wal_level = "replica"
+max_wal_senders = 4
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 32
+
+[sizes.smoke]
+v_rows = 20000
+
+[sizes.gen1]
+v_rows = 961538
+
+[sizes.gen10]
+v_rows = 9615384
+
+[workloads.V11]
+background = ["none"]
+churn = 10000
+warm_cycles = 10
+cycles = 10
+sweep = [2500, 5000, 20000, 40000]
+sweep_cycles = 3
+window_cycles = 3
+reads = 200
+standby = true
+retire = true
+conjoin_files = 4
+full = true
+verify = true
