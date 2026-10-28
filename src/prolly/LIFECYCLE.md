@@ -103,6 +103,27 @@ commit, two indexes) and `bench/branchbench` at the engine level.
 | Switch between random heads | grows with the heads' distance, not with branch count |
 | Correctness | every checkout verified row by row against the prolly tree, with amcheck and index-driven counts |
 
+### Step 1: the lifecycle without keyframes
+
+`bench/winbench --lifecycle` on 10M rows (1.8 GB), 2,000 random row changes
+per commit, four branches; medians, every checkout verified row by row.
+
+| Operation | Work | Time |
+|---|---|---|
+| Dolt commit | 2,000-row tail | 123 ms (checkpoint 114 ms) |
+| diff WORKING X | 2,000-row tail, ~36k rows differ | 220 ms (checkpoint 152 ms, prolly diff 69 ms) |
+| Branch switch | ~16k rows replayed | 233 ms (replay 166 ms) |
+| Reset to a commit in the window | ~8k rows replayed | 162 ms (replay 70 ms) |
+| Background checkpoints | 34 during the run | mean 61 ms, max 131 ms |
+
+- Replay costs ~8 µs per row against ~150 µs per page for keyframe restore
+  as built (~2 pages per row here): ~30× cheaper per change on this
+  workload.
+- Checkpoints dominate.  The same 2,000-row tail took ~45 ms at 200k rows
+  and ~114 ms at 10M: partly the taller tree, mostly the SQL decoding
+  function re-reading WAL from the slot's restart point on every call.  A
+  persistent streaming decoder should remove most of it.
+
 ## Next
 
 1. **The lifecycle without keyframes:** background and on-demand checkpoints,
