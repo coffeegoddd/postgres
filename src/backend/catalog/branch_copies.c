@@ -1581,7 +1581,13 @@ copies_family(Oid relid)
 		{
 			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-			if (c->relbranch != MyBranch && c->relkind == RELKIND_RELATION)
+			/*
+			 * (not a partition's: one made again as the relation it was,
+			 * its indexes partitions of its parent's, keeps none of their
+			 * OIDs, as before)
+			 */
+			if (c->relbranch != MyBranch && c->relkind == RELKIND_RELATION &&
+				!c->relispartition)
 			{
 				branch = c->relbranch;
 				toast = c->reltoastrelid;
