@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -82,6 +83,24 @@ def source_info(path):
     return {"path": str(path), "commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=path, text=True).strip(),
         "status": subprocess.check_output(["git", "status", "--porcelain"], cwd=path, text=True)}
+
+
+def trace(message):
+    """One line appended to $VC_BENCH_TRACE, if set: a UTC time and the
+    message.  Every request the harness sends is traced with how long it
+    took, and each case marks its setup, its timed operation and its
+    validation, so a slow cell's untimed work can be told apart."""
+    path = os.environ.get("VC_BENCH_TRACE")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds')} {message}\n")
+
+
+def _trace_sql(r):
+    """A request, shortened: id lists collapsed to their length."""
+    sql = r.get("sql") or f"<{', '.join(k for k in r if k != 'timeout')}>"
+    sql = re.sub(r"IN \(([0-9, ]{40,})\)", lambda m: f"IN (<{m.group(1).count(',') + 1} ids>)", sql)
+    return " ".join(sql.split())[:220]
 
 
 def init(root, smoke):
@@ -241,9 +260,11 @@ class SQL:
         self.p.stdout.close()
 
     def request(self, **r):
+        t0 = time.time()
         self.p.stdin.write(json.dumps({"timeout": self.timeout, **r}) + "\n")
         self.p.stdin.flush()
         line = self.p.stdout.readline()
+        trace(f"{time.time() - t0:9.3f}s  {_trace_sql(r)}")
         if not line:
             raise RuntimeError("SQL driver exited unexpectedly")
         result = json.loads(line)

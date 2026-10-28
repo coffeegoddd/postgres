@@ -495,6 +495,20 @@ python3 -m unittest discover -s src/tools/vc_bench -p 'test_*.py'
 (cd src/tools/vc_bench/driver && go test ./...)
 ```
 
+To see where a run's time goes, set `VC_BENCH_TRACE` to a file before `run`
+(or `prepare`). Every statement the harness sends is appended to it with its UTC
+time and how long it took, long id lists shortened to their count. Each case
+marks the start of its setup (`==== CASE <op> D=<d> <working set>: setup`), of
+its timed statement (`---- timed`) and of its validation (`---- validation`).
+That tells a slow cell's untimed setup and checks apart from the operation
+measured, and shows a statement that is still waiting: the last line is the one
+before it.
+
+```sh
+VC_BENCH_TRACE=~/dbs/benchmarks/trace.log python3 "$B" run --engines prolly --passes timing
+tail -f ~/dbs/benchmarks/trace.log
+```
+
 Use your own branch for manual writes, preserving the `fixture_*` branches and
 saved baseline commits. Manually started servers are yours to stop. To remove
 data, stop the servers and remove the chosen root yourself; the harness provides

@@ -11,7 +11,7 @@ import time
 import uuid
 
 from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, engine_passes, log, server, sha256,
-                  write_json)
+                  trace, write_json)
 from engines import literal
 from memory import Sampler
 import window
@@ -241,6 +241,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                 rng.shuffle(order)
                 for case in order:
                     op, d = case["operation"], case["distance"]
+                    trace(f"==== CASE {op} D={d} {case['working_set']}: setup")
                     old = fixture["commits"][h-d]
                     # (asked first: the target in the window, kept with a
                     # root, or measured apart; never a slow sample)
@@ -324,9 +325,11 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         path_before = sql.path_counters() if mode != "counters" else None
                         if sampler:
                             sampler.start()
+                        trace("---- timed")
                         try:
                             result = sql.query(query)
                         finally:
+                            trace("---- validation")
                             if sampler:
                                 record["memory"] = sampler.finish(result.get("elapsed_ns", 0))
                         record["elapsed_ns"] = result["elapsed_ns"]

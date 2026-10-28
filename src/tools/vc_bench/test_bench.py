@@ -364,6 +364,29 @@ class BenchTests(unittest.TestCase):
             self.assertIn('&lt;script&gt;&#124;bad', md)
             self.assertIn('&lt;script&gt;|bad', html)
 
+    def test_trace_appends_requests_with_id_lists_shortened(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "trace.log")
+            core.trace("not traced")
+            self.assertFalse(os.path.exists(path))
+            old = os.environ.get("VC_BENCH_TRACE")
+            os.environ["VC_BENCH_TRACE"] = path
+            try:
+                core.trace("==== CASE reset_hard D=32 p90: setup")
+                core.trace(core._trace_sql({"sql": "UPDATE bench_rows SET revision=501 WHERE id IN (" +
+                                                   ",".join(str(i) for i in range(1, 1001)) + ")"}))
+                core.trace(core._trace_sql({"start": 1, "count": 1000, "width": 1024}))
+            finally:
+                if old is None:
+                    del os.environ["VC_BENCH_TRACE"]
+                else:
+                    os.environ["VC_BENCH_TRACE"] = old
+            lines = open(path).read().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].endswith(" ==== CASE reset_hard D=32 p90: setup"))
+        self.assertIn("WHERE id IN (<1000 ids>)", lines[1])
+        self.assertTrue(lines[2].endswith(" <start, count, width>"))
+
     def test_integer_aggregate_decoding(self):
         self.assertEqual(integer('1.048576e+06'), 1048576)
         self.assertEqual(integer('9999999360'), 9999999360)
