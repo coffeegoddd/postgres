@@ -22,11 +22,21 @@ INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-m', '1000 rows', '--date', '2026-01-01 00:00:02+00')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 -- (the block map's bytes in blocks, whatever the block size; the journal's
--- bytes depend on whether the server compresses its chunks, below)
+-- bytes depend on whether the server compresses its chunks, below; the
+-- chunks' bytes, below, on the object ids the cluster is at)
 SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
 	ELSE value END AS value
 FROM pg_stat_prolly
-WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
+WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned',
+	'chunk_bytes_appended', 'bytes_hashed');
+-- The chunks' bytes: chunks hold object ids in a variable-length form,
+-- so their length moves by a few bytes with the ids a cluster has
+-- given out (tests run before this one, in one cluster, give out more);
+-- what is hashed beyond the chunks' bytes doesn't.
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended')
+	BETWEEN 27000 AND 27400 AS chunk_bytes,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') -
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS hashed_beyond;
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') >=
