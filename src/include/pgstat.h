@@ -856,9 +856,12 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_SEVERED_REFUSALS, /* reads and moves refused, or rows left
 									 * out, as their commit was past the
 									 * history horizon */
+	PGSTAT_PROLLY_KEPT_ENTRIES_READ,	/* branches' kept-commit entries
+										 * read from the refs */
+	PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN, /* and put or deleted */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_SEVERED_REFUSALS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

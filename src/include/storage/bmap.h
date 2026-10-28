@@ -135,7 +135,11 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
  * the rest shared with that root, and records the relation and its epoch
  * then, so the next one's changed pages are found by their epochs
  * (bmap_root_base(), bmap_changed_pages()).  bmap_root_copy() holds a root
- * again by a root of its own, the same subtrees, in O(1).  A root
+ * again by a root of its own, the same subtrees, in O(1).  Each root
+ * records its map's lineage (bmap_lineage()): a relation made of a root to
+ * take another storage's place may carry that storage's on, so that the
+ * roots captured of the storage it replaced are its own too
+ * (bmap_root_of()), with nothing renamed.  A root
  * is held once its capturing (sub)transaction commits, and let go of once
  * the (sub)transaction that lets go of it commits: one whose capturer
  * aborted, or was ended by a crash, holds nothing, and neither does one
@@ -149,13 +153,15 @@ extern void bmap_root_capture_many(SMgrRelation *rels, int n, BmapRootId *ids,
 								   uint32 *owned);
 extern bool bmap_root_capture_concurrent(SMgrRelation *rels, int n,
 										 BmapRootId *ids);
-extern BmapRootId bmap_root_capture_of(SMgrRelation reln, RelFileNumber of,
+extern BmapRootId bmap_root_capture_of(SMgrRelation reln, SMgrRelation of,
 									   uint32 live_epoch);
 extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
 								 RelFileLocator holder);
 extern bool bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since);
 extern bool bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch);
 extern BmapRootId bmap_made_of(SMgrRelation reln);
+extern uint64 bmap_lineage(SMgrRelation reln);
+extern bool bmap_root_of(SMgrRelation reln, BmapRootId id);
 extern uint32 bmap_changed_pages(SMgrRelation reln, uint32 since,
 								 BlockNumber **blknos, BlockNumber *nblocks);
 extern uint32 bmap_raise_epoch(SMgrRelation reln);
@@ -164,7 +170,8 @@ extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
 						   BlockNumber *nblocks);
 extern bool bmap_root_unchanged(SMgrRelation reln, BmapRootId id);
 extern void bmap_share_root(BmapRootId id, SMgrRelation dst,
-							SMgrRelation replacing, SMgrRelation sharer);
+							SMgrRelation replacing, SMgrRelation sharer,
+							SMgrRelation lineage_of);
 extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
 
 /* inspection, for tests */

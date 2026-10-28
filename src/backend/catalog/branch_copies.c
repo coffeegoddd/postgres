@@ -733,11 +733,13 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	if (kept_unchanged(src, k))
 	{
 		(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
-											 k->snapshot, src, NULL, src, true);
+											 k->snapshot, src, NULL, src, NULL,
+											 true);
 		return relnumber;
 	}
 	(void) RelationCreateStorageFromRoot(class_locator(c, relnumber),
-										 k->snapshot, NULL, NULL, src, true);
+										 k->snapshot, NULL, NULL, src, NULL,
+										 true);
 	frozen_root_maps(c, k, src, class_locator(c, relnumber));
 	if (TransactionIdIsNormal(k->frozenxid))
 		c->relfrozenxid = k->frozenxid;
@@ -1891,6 +1893,24 @@ kept_locator(const BranchKeptRelation *k)
 }
 
 /*
+ * Is root k of relation c's storage as it is now: captured of it, or of
+ * storage it carries the lineage of (a restore's, whose new storage
+ * carries on the storage it replaced: bmap_root_of())?  A rewrite, a
+ * truncation, a share of another branch's pages give storage a lineage of
+ * its own, which no root kept before was captured of.  So nothing kept
+ * names the storage itself, and a restore renames nothing.
+ */
+static bool
+root_of_storage(Form_pg_class c, const BranchKeptRelation *k)
+{
+	RelFileLocator loc = class_locator(c, c->relfilenode);
+
+	return c->reltablespace == k->tablespace &&
+		bmap_relation_exists(loc) &&
+		bmap_root_of(smgropen(loc, INVALID_PROC_NUMBER), k->snapshot);
+}
+
+/*
  * Roots to capture, together (bmap_root_capture_many(): the generation of
  * sharing raised once, each relation's pages changed since its last
  * capture written out, and made durable by the transaction's commit, which
@@ -2038,7 +2058,7 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 	tloc = class_locator(c, tnumber);
 	if (base_root != 0)
 		tsrel = RelationCreateStorageFromRoot(tloc, base_root, NULL, NULL,
-											  NULL, true);
+											  NULL, NULL, true);
 	else
 		tsrel = RelationCreateStorageWith(tloc, RELPERSISTENCE_PERMANENT, true,
 										  SMGR_BMAP);
@@ -2085,7 +2105,9 @@ freeze_into_root(Form_pg_class c, RelFileLocator from, const BlockNumber *blknos
 
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
-	k->snapshot = bmap_root_capture_of(tsrel, c->relfilenode, live_epoch);
+	k->snapshot = bmap_root_capture_of(tsrel,
+									   smgropen(live, INVALID_PROC_NUMBER),
+									   live_epoch);
 	note_taken(live, k->snapshot);
 	k->frozenxid = FrozenTransactionId;
 	k->minmxid = InvalidMultiXactId;
@@ -2106,10 +2128,9 @@ frozen_base(Form_pg_class c, SMgrRelation lsrel, const BranchKeptRelation *p,
 			uint32 *since, BlockNumber *nblocks)
 {
 	return p->relid == c->oid &&
-		p->relfilenumber == c->relfilenode &&
-		p->tablespace == c->reltablespace &&
 		p->frozenxid == FrozenTransactionId &&
 		!(p->flags & BRANCH_KEPT_UNFROZEN) &&
+		root_of_storage(c, p) &&
 		bmap_root_held(lsrel->smgr_rlocator.locator, p->snapshot, nblocks) &&
 		bmap_root_base(lsrel, p->snapshot, since);
 }
@@ -2231,7 +2252,7 @@ freeze_root_of(Form_pg_class c, const BranchKeptRelation *u,
 	sloc = class_locator(c, GetNewRelFileNumber(c->reltablespace, NULL,
 												c->relpersistence));
 	ssrel = RelationCreateStorageFromRoot(sloc, u->snapshot, NULL, NULL, NULL,
-										  true);
+										  NULL, true);
 	n = bmap_changed_pages(ssrel, base ? since : 0, &blknos, &nblocks);
 	n = pages_to_freeze(blknos, n, base, nblocks, &all);
 	if (blknos)
@@ -2406,9 +2427,8 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			for (int p = 0; p < nprior && !again; p++)
 			{
 				if (prior[p].relid == c->oid &&
-					prior[p].relfilenumber == c->relfilenode &&
-					prior[p].tablespace == c->reltablespace &&
 					!(prior[p].flags & BRANCH_KEPT_UNFROZEN && !concurrent) &&
+					root_of_storage(c, &prior[p]) &&
 					bmap_root_unchanged(smgropen(class_locator(c, c->relfilenode),
 												 INVALID_PROC_NUMBER),
 										prior[p].snapshot))
@@ -2488,8 +2508,7 @@ copies_freeze_kept(const BranchKeptRelation *kept, int nkept,
 				break;
 			}
 			c = (Form_pg_class) GETSTRUCT(t);
-			if (c->relfilenode != kept[i].relfilenumber ||
-				c->reltablespace != kept[i].tablespace ||
+			if (!root_of_storage(c, &kept[i]) ||
 				!bmap_root_held(kept_locator(&kept[i]), kept[i].snapshot, NULL))
 				ok = false;
 			else if (heap_format(c) && (kept[i].flags & BRANCH_KEPT_UNFROZEN))
@@ -2537,8 +2556,7 @@ kept_status_of(Form_pg_class c, const BranchKeptRelation *k)
 	TransactionId datfrozenxid;
 	MultiXactId datminmxid;
 
-	if (c->relfilenode != k->relfilenumber ||
-		c->reltablespace != k->tablespace ||
+	if (!root_of_storage(c, k) ||
 		!bmap_root_held(kept_locator(k), k->snapshot, NULL))
 		return BRANCH_KEPT_GONE;
 
@@ -2571,45 +2589,13 @@ can_restore(Form_pg_class c, const BranchKeptRelation *k)
 }
 
 /*
- * Relation relid moved from storage old to new storage dst, old dropped as
- * the transaction commits: each of the branch's kept commits' roots of old
- * that carry[] names (ncarry of them) named as of dst in carried[], so
- * that a later restore finds the relation on the storage that keeps them.
- * A root is its page store's, not old's: nothing is copied, and it holds
- * what it held.  One not of old is left as carry[] names it.
- */
-static void
-carry_kept(Oid relid, RelFileLocator old, RelFileLocator dst,
-		   const BranchKeptRelation *carry, int ncarry,
-		   BranchKeptRelation *carried)
-{
-	for (int j = 0; j < ncarry; j++)
-	{
-		const BranchKeptRelation *c = &carry[j];
-
-		/*
-		 * (storage a restore replaced, kept for older snapshots, is never
-		 * carried: it names the storage itself, and is dropped, not
-		 * renamed; a snapshot still reading it needs nothing of the new)
-		 */
-		Assert(c->snapshot != BRANCH_KEPT_STORAGE);
-		if (c->relid != relid || c->snapshot == BRANCH_KEPT_STORAGE ||
-			!RelFileLocatorEquals(kept_locator(c), old))
-			continue;
-		carried[j] = *c;
-		carried[j].relfilenumber = dst.relNumber;
-	}
-}
-
-/*
  * Give the session branch's relations kept[] back the pages keep() kept
  * (see branch_ops.h).
  */
 static bool
 copies_restore(const BranchKeptRelation *kept, int nkept,
-			   BranchKeptRelation *renewed, const BranchKeptRelation *carry,
-			   int ncarry, BranchKeptRelation *carried,
-			   BranchKeptRelation *replaced, BranchLockWait *wait)
+			   BranchKeptRelation *renewed, BranchKeptRelation *replaced,
+			   BranchLockWait *wait)
 {
 	Relation	pg_class;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
@@ -2618,8 +2604,6 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	bool		ok = true;
 
 	let_go_of_abandoned();
-	for (int j = 0; j < ncarry; j++)
-		carried[j] = carry[j];
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 
 	/* (each checked before any is restored) */
@@ -2629,10 +2613,15 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		if (rows[i] == NULL ||
 			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
 			ok = false;
-		else if (!kept_unchanged(smgropen(kept_locator(&kept[i]),
-										  INVALID_PROC_NUMBER),
-								 &kept[i]))
-			any = true;
+		else
+		{
+			Form_pg_class c = (Form_pg_class) GETSTRUCT(rows[i]);
+
+			if (!kept_unchanged(smgropen(class_locator(c, c->relfilenode),
+										 INVALID_PROC_NUMBER),
+								&kept[i]))
+				any = true;
+		}
 	}
 
 	/*
@@ -2689,6 +2678,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		HeapTuple	o = rows[i];
 		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
 		RelFileNumber relnumber;
+		SMgrRelation old;
 
 		renewed[i] = *k;
 		replaced[i] = *k;
@@ -2698,18 +2688,21 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 			continue;
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
 										oc->relpersistence);
+		old = smgropen(class_locator(oc, oc->relfilenode), INVALID_PROC_NUMBER);
+
+		/*
+		 * (the new storage carries the old one's lineage on: the branch's
+		 * other kept roots of the relation, the page store's, are of it
+		 * as they were of the old, whatever their number, with nothing
+		 * renamed)
+		 */
 		(void) RelationCreateStorageFromRoot(class_locator(oc, relnumber),
-											 k->snapshot, NULL,
-											 smgropen(class_locator(oc, oc->relfilenode),
-													  INVALID_PROC_NUMBER),
-											 NULL, true);
-		frozen_root_maps(oc, k, smgropen(kept_locator(k), INVALID_PROC_NUMBER),
-						 class_locator(oc, relnumber));
+											 k->snapshot, NULL, old, NULL,
+											 old, true);
+		frozen_root_maps(oc, k, old, class_locator(oc, relnumber));
 
 		/* (the root keeps the pages still: the new storage is of it) */
 		renewed[i].relfilenumber = relnumber;
-		carry_kept(k->relid, class_locator(oc, oc->relfilenode),
-				   class_locator(oc, relnumber), carry, ncarry, carried);
 
 		/*
 		 * (the storage replaced kept, not dropped: a snapshot older than the
@@ -2747,8 +2740,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
  */
 static bool
 copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
-				  const BranchKeptRelation *carry, int ncarry,
-				  BranchKeptRelation *carried, BranchKeptRelation *renewed,
+				  bool keep_lineage, BranchKeptRelation *renewed,
 				  BranchKeptRelation *replaced, BranchLockWait *wait)
 {
 	bool		other = source != MyBranch;
@@ -2756,9 +2748,6 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
 	RelFileLocator *sources = palloc0_array(RelFileLocator, Max(nkept, 1));
 	bool		ok = true;
-
-	for (int j = 0; j < ncarry; j++)
-		carried[j] = carry[j];
 
 	/* (not the pages of a branch being deleted) */
 	if (other && !pin_branch(source))
@@ -2841,16 +2830,23 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 		HeapTuple	o = rows[i];
 		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
 		RelFileNumber relnumber;
+		SMgrRelation cur = smgropen(class_locator(oc, oc->relfilenode),
+									INVALID_PROC_NUMBER);
 
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
 										oc->relpersistence);
+
+		/*
+		 * (with keep_lineage, the new storage carries its lineage on, as a
+		 * restore's does, so the branch's other kept roots stay of it;
+		 * else it begins its own, which none of them was captured of)
+		 */
 		(void) RelationCreateStorageFromRoot(class_locator(oc, relnumber),
 											 k->snapshot, NULL, NULL,
 											 other ? smgropen(sources[i], INVALID_PROC_NUMBER) : NULL,
-											 true);
+											 keep_lineage ? cur : NULL, true);
 		frozen_root_maps(oc, k,
-						 smgropen(other ? sources[i] : kept_locator(k),
-								  INVALID_PROC_NUMBER),
+						 other ? smgropen(sources[i], INVALID_PROC_NUMBER) : cur,
 						 class_locator(oc, relnumber));
 		if (renewed != NULL)
 		{
@@ -2859,13 +2855,6 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 			renewed[i].relfilenumber = relnumber;
 		}
 
-		/*
-		 * (the session's own kept roots carried, as restore() carries
-		 * them, from another branch's pages too: they are the page store's
-		 * whatever the storage now holds, so a rename is all they need)
-		 */
-		carry_kept(k->relid, class_locator(oc, oc->relfilenode),
-				   class_locator(oc, relnumber), carry, ncarry, carried);
 		if (replaced != NULL)
 		{
 			/*
@@ -2907,15 +2896,26 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept,
 static bool
 copies_changed_since_kept(const BranchKeptRelation *kept, int nkept)
 {
-	for (int i = 0; i < nkept; i++)
-	{
-		RelFileLocator loc = kept_locator(&kept[i]);
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	bool		changed = false;
 
+	for (int i = 0; i < nkept && !changed; i++)
+	{
+		HeapTuple	t = class_row(pg_class, kept[i].relid, MyBranch);
+		Form_pg_class c;
+		RelFileLocator loc;
+
+		if (t == NULL)
+			continue;
+		c = (Form_pg_class) GETSTRUCT(t);
+		loc = class_locator(c, c->relfilenode);
 		if (bmap_relation_exists(loc) &&
 			!kept_unchanged(smgropen(loc, INVALID_PROC_NUMBER), &kept[i]))
-			return true;
+			changed = true;
+		heap_freetuple(t);
 	}
-	return false;
+	table_close(pg_class, AccessShareLock);
+	return changed;
 }
 
 /*

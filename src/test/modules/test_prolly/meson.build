@@ -522,6 +522,8 @@ tests += {
       't/467_bmap_preserve_skipped.pl',
       't/471_kept_carried_crash.pl',
       't/472_kept_carried_standby.pl',
+      't/820_restore_flat_in_roots.pl',
+      't/821_restore_lineage.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',
