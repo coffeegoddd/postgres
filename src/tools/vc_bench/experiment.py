@@ -367,7 +367,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                                    + (f"{record['elapsed_ns'] / 1e6:.1f} ms" if "elapsed_ns" in record else "-")
                                    + (f", restore {record['restore_sec']:.1f} s"
                                       if "restore_sec" in record else ""))
-                        trace(f"==== CASE {summary}")
+                        trace(f"==== {summary}")
                         log(f"{engine}/n={n:,}/k={k:,} {mode}: {summary}")
                 log(f"{engine}/n={n}/k={k}: {mode} {'warmup' if rep < 0 else 'repetition '+str(rep+1)} complete")
     finally:
