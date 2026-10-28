@@ -58,7 +58,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned',
 	'chunk_bytes_appended', 'bytes_hashed');
              name              | value 
 -------------------------------+-------
- nodes_read                    |    61
+ nodes_read                    |    42
  nodes_written                 |    12
  value_nodes_written           |     0
  chunks_appended               |    12
@@ -118,7 +118,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned',
  describe_cache_hits           |     1
  apply_rows_batched            |     0
  apply_loads                   |     0
- node_cache_hits               |    54
+ node_cache_hits               |    35
  node_cache_misses             |     0
  fold_rows_located             |  1000
  bmap_map_pages_copied         |     0
@@ -160,7 +160,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned',
  definitions_reused            |     0
  status_reused                 |     0
  auto_collections_skipped      |     0
- refs_nodes_read               |    53
+ refs_nodes_read               |    34
  refs_nodes_written            |     3
  bmap_refcount_reads           |     0
  status_from_fold              |     0
