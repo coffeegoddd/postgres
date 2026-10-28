@@ -1697,27 +1697,40 @@ get_memo_find(const char *key, int keylen)
 	return NULL;
 }
 
-/* Note what key holds under get_memo_root: value (len bytes), or none. */
+/*
+ * Note what key holds: value (len bytes), or none.  What it allocates is
+ * allocated before the memo changes, so an error (out of memory) leaves
+ * the memo as it was.
+ */
 static void
-get_memo_note(const char *key, int keylen, bool found, const char *value,
-			  int len)
+get_memo_put(const char *key, int keylen, bool found, const char *value,
+			 int len)
 {
 	RefsGetMemo *m = get_memo_find(key, keylen);
+	int			had = (m != NULL && m->found) ? m->len : 0;
+	char	   *k = NULL;
+	char	   *v = NULL;
 	MemoryContext old;
 
-	if (get_memo_root.len == 0)
+	if (!found)
+		len = 0;
+	if (keylen + len > GET_MEMO_BYTES)
+	{
+		/* (too large to note: forgotten, so a get reads it) */
+		if (m != NULL)
+			*m = get_memo[--get_memo_n];
 		return;
-	if (m == NULL &&
-		(get_memo_n >= GET_MEMO_MAX ||
-		 get_memo_bytes + keylen + len > GET_MEMO_BYTES))
+	}
+	if ((m == NULL && get_memo_n >= GET_MEMO_MAX) ||
+		get_memo_bytes - had + (m == NULL ? keylen : 0) + len > GET_MEMO_BYTES)
 	{
 		ProllyHash	root = get_memo_root;
 
 		/* (full: begun again, of the same root) */
 		get_memo_reset();
 		get_memo_root = root;
-		if (keylen + len > GET_MEMO_BYTES)
-			return;
+		m = NULL;
+		had = 0;
 	}
 	if (get_memo_cxt == NULL)
 		get_memo_cxt = AllocSetContextCreate(TopMemoryContext,
@@ -1726,31 +1739,47 @@ get_memo_note(const char *key, int keylen, bool found, const char *value,
 	old = MemoryContextSwitchTo(get_memo_cxt);
 	if (m == NULL)
 	{
+		k = palloc(Max(keylen, 1));
+		memcpy(k, key, keylen);
+	}
+	if (found)
+	{
+		v = palloc(Max(len, 1));
+		memcpy(v, value, len);
+	}
+	MemoryContextSwitchTo(old);
+	if (m == NULL)
+	{
 		m = &get_memo[get_memo_n++];
-		m->key = palloc(Max(keylen, 1));
-		memcpy(m->key, key, keylen);
+		m->key = k;
 		m->keylen = keylen;
 		get_memo_bytes += keylen;
 	}
 	else if (m->found)
 		pfree(m->value);
 	m->found = found;
-	m->value = NULL;
-	m->len = found ? len : 0;
-	if (found)
-	{
-		m->value = palloc(Max(len, 1));
-		memcpy(m->value, value, len);
-		get_memo_bytes += len;
-	}
-	MemoryContextSwitchTo(old);
+	m->value = v;
+	m->len = len;
+	get_memo_bytes += len - had;
+}
+
+/* ... noted as what get_memo_root holds, if the memo is of one */
+static void
+get_memo_note(const char *key, int keylen, bool found, const char *value,
+			  int len)
+{
+	if (get_memo_root.len == 0)
+		return;
+	get_memo_put(key, keylen, found, value, len);
 }
 
 /*
  * This backend applied edits (n of them) to the root from, making to:
- * a memo of from becomes one of to, with what the edits put.  A memo of
- * another root is left, to be emptied by the next get, which reads
- * another.
+ * a memo of from becomes one of to, with what the edits put.  It is of no
+ * root while they are noted, so an error part way (the transaction then
+ * aborting, from still the root) leaves no memo of from holding to's
+ * values: the next get empties it.  A memo of another root is left, to be
+ * emptied by the next get, which reads another.
  */
 static void
 get_memo_carry(const ProllyHash *from, const ProllyHash *to,
@@ -1758,12 +1787,13 @@ get_memo_carry(const ProllyHash *from, const ProllyHash *to,
 {
 	if (get_memo_root.len == 0 || !same_hash(from, &get_memo_root))
 		return;
+	memset(&get_memo_root, 0, sizeof(get_memo_root));
 	for (int i = 0; i < n; i++)
-		get_memo_note((const char *) edits[i].key.data, edits[i].key.len,
-					  !edits[i].is_delete,
-					  (const char *) edits[i].value.data,
-					  edits[i].value.len);
-	/* (a note that filled the memo began it again, of from: still right) */
+		get_memo_put((const char *) edits[i].key.data, edits[i].key.len,
+					 !edits[i].is_delete,
+					 (const char *) edits[i].value.data,
+					 edits[i].value.len);
+	INJECTION_POINT("prolly-refs-memo-carried", NULL);
 	get_memo_root = *to;
 }
 

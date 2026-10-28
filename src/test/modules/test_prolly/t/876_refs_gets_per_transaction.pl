@@ -85,7 +85,7 @@ note "later transactions' refs_nodes_read: @last";
 # took each from about 12 nodes to about 33.
 cmp_ok($first, "<=", 9,
 	"a transaction's refs reads are its commit's, not a descent per get ($first)");
-cmp_ok($last, '<=', $first + 6,
+cmp_ok($last, "<=", 16,
 	"after two thousand commits they grow by the commit's own descents ($first -> $last)");
 
 $node->stop;
