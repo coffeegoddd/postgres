@@ -131,6 +131,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/tidstore.h"
@@ -2273,10 +2274,12 @@ lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
  * isn't changed (that would copy it), only its map page.  The page must
  * already say it is all-visible (PD_ALL_VISIBLE), since a writer clears the
  * map's bit only of a page that says so.  Only an all-frozen page is set:
- * the map page is logged as an image, which carries no conflict horizon for
- * a standby's queries, and a frozen page's versions are visible to every
- * snapshot, a standby's too.  The caller holds a share lock on buf, so no
- * writer clears the page's flag until the bits are set.
+ * the change is logged as a record of the map page alone
+ * (XLOG_HEAP2_VM_SET, a few bytes but for the map page's first image after
+ * a checkpoint), which carries no conflict horizon for a standby's
+ * queries, and a frozen page's versions are visible to every snapshot, a
+ * standby's too.  The caller holds buf's cleanup lock, so no writer clears
+ * the page's flag until the bits are set.
  */
 static void
 lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
@@ -2284,6 +2287,7 @@ lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 {
 	bool		all_frozen;
 	TransactionId newest_live_xid;
+	const uint8 flags = VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN;
 	uint8		old;
 
 	if (PageIsNew(page) || PageIsEmpty(page) || !PageIsAllVisible(page))
@@ -2302,12 +2306,22 @@ lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 
 	LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 	START_CRIT_SECTION();
-	old = visibilitymap_set(blkno, vmbuffer,
-							VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN,
-							vacrel->rel->rd_locator);
+	old = visibilitymap_set(blkno, vmbuffer, flags, vacrel->rel->rd_locator);
 	MarkBufferDirty(vmbuffer);
 	if (RelationNeedsWAL(vacrel->rel))
-		log_newpage_buffer(vmbuffer, false);
+	{
+		xl_heap_vm_set xlrec;
+		XLogRecPtr	recptr;
+
+		xlrec.heap_blkno = blkno;
+		xlrec.flags = flags;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfHeapVmSet);
+		/* (a map page's contents lie past pd_lower: not a standard page) */
+		XLogRegisterBuffer(0, vmbuffer, 0);
+		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VM_SET);
+		PageSetLSN(BufferGetPage(vmbuffer), recptr);
+	}
 	END_CRIT_SECTION();
 	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 

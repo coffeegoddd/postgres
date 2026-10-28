@@ -6,7 +6,8 @@
 # whose bits are cleared for the pages changed since.  It reads none of
 # those pages for that: the relation pages the reset's backend reads or
 # finds in its buffers (pg_stat_io) don't grow with the working set it
-# discards, 90% of the table's rows changed against 10%.
+# discards, 90% of the table's rows changed against 10%.  A VACUUM after
+# it sets the bits again with a few bytes of WAL a page.
 #
 # The updates are HOT (fillfactor 50), so the table's own pages are the
 # ones changed.
@@ -81,6 +82,21 @@ ok($cleared90 >= $blocks * 9 / 10 - 2,
 # about 0.8 * $blocks)
 ok($io90 - $io10 < $blocks / 20,
 	"no heap page read for the pages changed (grew by " . ($io90 - $io10) . ")");
+
+# A VACUUM then sets the cleared pages' bits again, leaving the pages (the
+# root's still, shared with it) as they are.  Each map change is logged as
+# a record of the map page alone, a few bytes but for the map page's first
+# image after a checkpoint, not an image a page: the WAL it writes is
+# far below the table's size.
+my $lsn0 = sql('SELECT pg_current_wal_insert_lsn()');
+sql('VACUUM app.t');
+my $wal = sql(qq{SELECT pg_current_wal_insert_lsn() - '$lsn0'::pg_lsn});
+note("VACUUM after the reset wrote $wal bytes of WAL for $blocks pages");
+is(sql(q{SELECT count(*) FROM pg_visibility_map('app.t')
+	WHERE NOT (all_visible AND all_frozen)}), '0',
+	'the VACUUM set every page all-visible and all-frozen');
+ok($wal < $blocks * 512,
+	"its WAL far below the table's size ($wal bytes, $blocks pages)");
 
 $node->stop;
 done_testing();
