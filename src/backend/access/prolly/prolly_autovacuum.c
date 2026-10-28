@@ -13,10 +13,12 @@
  * collection, by the database's reclamation.  Only sizes are read, not the
  * journal.  Another collection running, it skips its own quietly (counted
  * in pg_stat_prolly's auto_collections_skipped): that one collects what
- * was due.  It never waits for a transaction: a collection that would
- * (one running that used the store before the seal) is given up, rolled
- * back and counted alike, to run on a later visit, and one running at the
- * swap leaves what the swap dropped to the next collection to remove.  Then it moves the journal (the reclamation's move(): its
+ * was due.  None of these waits for a transaction longer than
+ * prolly.gc_free_wait: a collection, retire or move that would (one using
+ * the store as it begins, still running) is given up, rolled back and
+ * counted alike, to run on a later visit; and one using the store at the
+ * swap, still running, leaves what the swap dropped to a later collection
+ * to remove once it ends.  Then it moves the journal (the reclamation's move(): its
  * segments rewritten as a table file, nothing freed) once its segments
  * have passed prolly.journal_move_threshold, which bounds what a backend
  * reads to index the journal when collections are rare (a large store) or
@@ -147,6 +149,14 @@ prolly_autovacuum_init(void)
 							PGC_SIGHUP,
 							0,
 							check_conjoin_max_files, NULL, NULL);
+	DefineCustomIntVariable("prolly.gc_free_wait",
+							"How long autovacuum's collection of the chunk store waits for a transaction it must outlast before it is given up.",
+							"The transactions using the store as it begins: it is tried again on a later visit.  Those begun meanwhile aren't waited for.",
+							&prolly_gc_free_wait,
+							10000, 0, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.gc_file_size",
 							"How large each table file a collection writes grows before it starts another.",
 							"Files of a set size can be sent whole to a remote and conjoined later.",
@@ -404,36 +414,32 @@ sever(void)
 }
 
 /*
- * A retire, if one is worth running: the generations the reclamation
- * chooses by the store's estimates of their garbage, within
- * prolly.gc_retire_budget, none newer than the history window allows; true
- * if it ran (it collects what a default collection would, too).
- */
-/*
- * A collection given up for a transaction still running, which autovacuum
- * never waits for (an open transaction would hold the worker, and every
- * collection after it, for as long as it stays open): counted as skipped,
- * and tried again next visit.
+ * A collection given up for a transaction still running past
+ * prolly.gc_free_wait (an open transaction would otherwise hold the worker,
+ * and every collection after it, for as long as it stays open): counted as
+ * skipped, and tried again next visit.
  */
 static void
-given_up_note(void)
+given_up_note(const char *what)
 {
 	pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 	ereport(DEBUG1,
-			(errmsg_internal("automatic collection of database \"%s\" given up: a transaction it would wait for is running",
-							 get_database_name(MyDatabaseId))));
+			(errmsg_internal("automatic %s of database \"%s\" given up: a transaction it would wait for is running",
+							 what, get_database_name(MyDatabaseId))));
 }
 
 /*
- * The reclamation's collection, if free: false if it didn't run (another
- * collection runs, or it was given up, its work rolled back).
+ * The reclamation's collection (move: its move of the journal), if free:
+ * false if it didn't run (another collection runs, or it was given up,
+ * what it did rolled back).
  */
 static bool
-collect_if_free(const ProllyDatabaseComponents *dc, bool full,
+reclaim_if_free(const ProllyDatabaseComponents *dc, bool move, bool full,
 				ProllyGcResult *r)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
+	const char *what = move ? "move of the chunk journal" : "collection";
 	bool		ran = false;
 
 	BeginInternalSubTransaction(NULL);
@@ -441,7 +447,8 @@ collect_if_free(const ProllyDatabaseComponents *dc, bool full,
 	prolly_gc_given_up = false;
 	PG_TRY();
 	{
-		ran = PROLLY_CALL(dc->reclamation, collect, full, true, r);
+		ran = move ? PROLLY_CALL(dc->reclamation, move, true, r) :
+			PROLLY_CALL(dc->reclamation, collect, full, true, r);
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
@@ -456,20 +463,29 @@ collect_if_free(const ProllyDatabaseComponents *dc, bool full,
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
-		given_up_note();
+		given_up_note(what);
 		return false;
 	}
 	PG_END_TRY();
-	if (!ran)
+	if (!ran && prolly_gc_given_up)
+		given_up_note(what);
+	else if (!ran)
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 		ereport(DEBUG1,
-				(errmsg_internal("automatic collection of database \"%s\" skipped: another collection of its chunk store is running",
-								 get_database_name(MyDatabaseId))));
+				(errmsg_internal("automatic %s of database \"%s\" skipped: another collection of its chunk store is running",
+								 what, get_database_name(MyDatabaseId))));
 	}
+	prolly_gc_given_up = false;
 	return ran;
 }
 
+/*
+ * A retire, if one is worth running: the generations the reclamation
+ * chooses by the store's estimates of their garbage, within
+ * prolly.gc_retire_budget, none newer than the history window allows; true
+ * if it ran (it collects what a default collection would, too).
+ */
 static bool
 retire(const ProllyDatabaseComponents *dc)
 {
@@ -541,7 +557,7 @@ retire(const ProllyDatabaseComponents *dc)
 			{
 				prolly_gc_given_up = false;
 				FreeErrorData(edata);
-				given_up_note();
+				given_up_note("retire");
 				retire_refused = true;
 				return true;
 			}
@@ -559,9 +575,14 @@ retire(const ProllyDatabaseComponents *dc)
 	}
 	if (!ran)
 	{
-		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		/* (given up before it began, as above; or another runs: it collects) */
+		if (prolly_gc_given_up)
+			given_up_note("retire");
+		else
+			pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		prolly_gc_given_up = false;
 		retire_refused = true;
-		return true;			/* (another collection runs: it collects) */
+		return true;
 	}
 	retire_ran = true;
 	if (PROLLY_HAS(dc->refs, forget_records))
@@ -634,7 +655,7 @@ collect_now(void)
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	if (!collect_if_free(&dc, full, &r))
+	if (!reclaim_if_free(&dc, false, full, &r))
 		return;
 	if (full && PROLLY_HAS(dc.history_window, collected))
 		PROLLY_CALL(dc.history_window, collected);
@@ -680,7 +701,8 @@ move(void)
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	PROLLY_CALL(dc.reclamation, move, &r);
+	if (!reclaim_if_free(&dc, true, false, &r))
+		return;
 	ereport(DEBUG1,
 			(errmsg_internal("automatic move of the chunk journal of database \"%s\": %llu chunks moved, appends held off %llu us",
 							 get_database_name(MyDatabaseId),

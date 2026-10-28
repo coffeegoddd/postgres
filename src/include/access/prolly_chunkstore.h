@@ -108,7 +108,8 @@
  *   writes those marked since, and replaces the manifest: the new files and
  *   those kept, the segment appends go to, the next GC generation.  What
  *   was collected and not kept is no longer found; gc_retire() removes it
- *   once every transaction running at the swap has ended.  A transaction
+ *   once every transaction that had used the store at the swap has ended
+ *   (one that hadn't reads the manifest swapped in).  A transaction
  *   running at a swap that then appends a chunk naming one no longer found
  *   fails (a serialization failure), as does one adding a table file
  *   (add_table_file()) whose transaction began before the swap, or while
@@ -139,14 +140,19 @@
  *   for days: gc_new() keeps as roots the chunks one appended to the
  *   segments collected, and gc_retire() doesn't wait for one running at
  *   the swap (it reads nothing more).
- * - A collection begun with if_free never waits for a transaction at all
- *   (a background one's, which an open transaction must not hold up):
- *   where gc_begin() or gc_new() would wait for one still running, the
- *   collection is given up instead, an ERRCODE_LOCK_NOT_AVAILABLE error
- *   with prolly_gc_given_up set, for the caller to roll back and collect
- *   again later; and gc_retire(), with one running at the swap still
- *   running, leaves what the swap stopped naming retiring, for the next
- *   collection to remove.
+ * - A collection begun with if_free (a background one's, which an open
+ *   transaction must not hold up) waits for a transaction at most
+ *   prolly_gc_free_wait milliseconds, polling for its end rather than
+ *   sleeping on its lock; the set waited for only shrinks, so transactions
+ *   begun meanwhile don't hold it.  gc_begin() first waits so for those
+ *   using the store (and those its retiring files wait for), and with one
+ *   still running gives up before doing anything: NULL returned, with
+ *   prolly_gc_given_up set.  Past the seal, a wait in gc_new() that runs
+ *   out gives up with an ERRCODE_LOCK_NOT_AVAILABLE error, with
+ *   prolly_gc_given_up set, for the caller to roll back (the seal stays).
+ *   gc_retire(), with one using the store at the swap still running after
+ *   its wait, leaves what the swap stopped naming retiring, for a later
+ *   collection to remove once those have ended.
  *   gc_retained() visits the chunks a collection keeps whatever names
  *   them, the store's own reasons (a logical replication slot may still
  *   decode a row naming what was appended after its position): roots, as
@@ -668,8 +674,12 @@ extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 #endif
 extern PGDLLIMPORT bool debug_prolly_verify_generations;
 extern PGDLLIMPORT int debug_prolly_settle_epoch;
-/* A collection begun if free given up, rather than waiting (gc_new()). */
+/*
+ * A collection begun if free given up, rather than waiting longer than
+ * prolly_gc_free_wait (milliseconds) for a transaction.
+ */
 extern PGDLLIMPORT bool prolly_gc_given_up;
+extern PGDLLIMPORT int prolly_gc_free_wait;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);

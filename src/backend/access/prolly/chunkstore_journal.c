@@ -188,6 +188,7 @@
 #include "portability/instr_time.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/lwlock.h"
@@ -9478,7 +9479,8 @@ struct ProllyChunkGc
 	int			level;			/* the transaction nesting level it began at */
 	bool		full;
 	bool		settle;			/* the files written are settled */
-	bool		if_free;		/* given up rather than waiting */
+	bool		if_free;		/* given up rather than waiting long */
+	TimestampTz deadline;		/* with if_free: how long it waits */
 	Manifest	m;				/* as the seal left it */
 	uint64		segment;		/* where appends go from the seal */
 	ProllyHash	sealed_root;	/* the root the collected segments end at,
@@ -9578,25 +9580,46 @@ wait_for_readers(VirtualTransactionId *vxids, int n)
 	}
 }
 
-/* Is one of these transactions still running (not prepared)? */
-static bool
-readers_running(VirtualTransactionId *vxids, int n)
-{
-	for (int i = 0; i < n; i++)
-	{
-		if (!ConditionalVirtualXactLockUnprepared(vxids[i]))
-			return true;
-	}
-	return false;
-}
-
+int			prolly_gc_free_wait = 10000;
 bool		prolly_gc_given_up = false;
 
 /*
- * A collection begun if free, finding a transaction it would wait for
- * still running: given up (an error, the transaction's to roll back), to
- * run again later, rather than waiting for a transaction that may stay
- * open for hours.
+ * Wait for these transactions to end (or be prepared) until deadline:
+ * false if one still runs then.  Their ends are polled for, not slept on
+ * as a lock, and the set only shrinks, so a collection waits out the
+ * transactions it must, however many begin meanwhile.
+ */
+static bool
+readers_end_by(const VirtualTransactionId *vxids, int n, TimestampTz deadline)
+{
+	VirtualTransactionId *left = palloc(sizeof(VirtualTransactionId) * Max(n, 1));
+	int			nleft = n;
+
+	memcpy(left, vxids, sizeof(VirtualTransactionId) * n);
+	for (;;)
+	{
+		int			k = 0;
+
+		for (int i = 0; i < nleft; i++)
+			if (!ConditionalVirtualXactLockUnprepared(left[i]))
+				left[k++] = left[i];
+		nleft = k;
+		if (nleft == 0 || GetCurrentTimestamp() >= deadline)
+			break;
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10L, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	pfree(left);
+	return nleft == 0;
+}
+
+/*
+ * A collection begun if free, a transaction it waits for still running at
+ * its deadline, past its seal: given up (an error, the transaction's to roll
+ * back), to run again later.  (Before the seal, gc_begin() gives up
+ * without one, nothing done.)
  */
 static void
 gc_give_up(void)
@@ -9607,13 +9630,41 @@ gc_give_up(void)
 			 errmsg("collection of this database's chunk store given up: a transaction it waits for is running")));
 }
 
-/* Readers' waits, as the collection waits: or given up, if free. */
+/* Readers' waits, as the collection waits: if free, until its deadline. */
 static void
 gc_wait_for_readers(ProllyChunkGc *gc, VirtualTransactionId *vxids, int n)
 {
-	if (gc->if_free && readers_running(vxids, n))
+	if (!gc->if_free)
+		wait_for_readers(vxids, n);
+	else if (!readers_end_by(vxids, n, gc->deadline))
 		gc_give_up();
-	wait_for_readers(vxids, n);
+}
+
+/*
+ * The transactions running now that have used store s (xact_used()), but
+ * ours.
+ */
+static VirtualTransactionId *
+store_users(ProllyChunkStore *s, int *n)
+{
+	JournalShared *js = shared();
+	KeepTouch  *ts = touches(js);
+	int			nrunning;
+	VirtualTransactionId *running =
+		GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0, &nrunning);
+
+	*n = 0;
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < nrunning; i++)
+	{
+		KeepTouch  *t = &ts[running[i].procNumber];
+
+		if (t->used_dboid == s->dboid &&
+			t->used == running[i].localTransactionId)
+			running[(*n)++] = running[i];
+	}
+	SpinLockRelease(&js->mutex);
+	return running;
 }
 
 /* The prepared transaction vxid is the id of (invalid: it is none's). */
@@ -9636,7 +9687,7 @@ prepared_xid(VirtualTransactionId vxid)
  * finished, maybe days later.
  */
 static bool
-wait_unprepared(TransactionId xid, bool if_free)
+wait_unprepared(TransactionId xid, TimestampTz deadline)
 {
 	for (;;)
 	{
@@ -9681,10 +9732,13 @@ wait_unprepared(TransactionId xid, bool if_free)
 			if (pxid == xid)
 				running = i;
 		}
-		if (running >= 0 && if_free &&
-			!ConditionalVirtualXactLockUnprepared(vxids[running]))
-			gc_give_up();
-		if (running >= 0)
+		/* (with a deadline, polled for until then, then given up) */
+		if (running >= 0 && deadline != 0)
+		{
+			if (!readers_end_by(&vxids[running], 1, deadline))
+				gc_give_up();
+		}
+		else if (running >= 0)
 			VirtualXactLockUnprepared(vxids[running]);
 		else
 			pg_usleep(1000L);	/* ending, or being prepared */
@@ -9892,6 +9946,7 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	int			n = 0;
 	uint64		slot = 0;
 	XLogRecPtr	horizon;
+	LOCKTAG		tag;
 
 	if (s->gc != NULL)
 		elog(ERROR, "a chunk store collection is running in this transaction");
@@ -9913,18 +9968,14 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	 * until the swap (from then on a transfer older than the swap is
 	 * refused, not waited for).
 	 */
+	SET_LOCKTAG_OBJECT(tag, s->dboid, GC_LOCK_CLASSID, 0, 0);
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
 	{
-		LOCKTAG		tag;
-
-		SET_LOCKTAG_OBJECT(tag, s->dboid, GC_LOCK_CLASSID, 0, 0);
-		if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
-		{
-			if (if_free)
-				return NULL;
-			ereport(ERROR,
-					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("another collection of this database's chunk store is running")));
-		}
+		if (if_free)
+			return NULL;
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("another collection of this database's chunk store is running")));
 	}
 
 	cxt = AllocSetContextCreate(TopTransactionContext, "prolly collection",
@@ -9936,6 +9987,8 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	gc->cxt = cxt;
 	gc->full = full;
 	gc->if_free = if_free;
+	gc->deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+											   prolly_gc_free_wait);
 	gc->retire_lo = retire_lo;
 	gc->retire_hi = retire_hi;
 	gc->settle = (scope != PROLLY_GC_JOURNAL);
@@ -9943,19 +9996,40 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	gc->keep = -1;
 
 	/*
-	 * What an earlier collection left retiring (it failed after its swap),
-	 * once nobody who may read it is left: waited for before the
-	 * manifest's lock, which they may be waiting for.
+	 * What an earlier collection left retiring (it failed after its swap,
+	 * or its retire was left to this one), once nobody who may read it is
+	 * left: waited for before the manifest's lock, which they may be
+	 * waiting for.  If free, the transactions using the store now (those
+	 * using it at that swap still running among them), until the deadline:
+	 * they are also those the seal's root may not reach.  So, before
+	 * anything is done (a seal is logged, and stays), a collection given
+	 * up, NULL returned with prolly_gc_given_up set, leaves nothing behind.
 	 */
 	(void) read_manifest(dir, &gc->m);
-	if (gc->m.nretiring > 0)
+	if (if_free)
+	{
+		int			nvxids;
+		VirtualTransactionId *vxids = store_users(s, &nvxids);
+		bool		ended = readers_end_by(vxids, nvxids, gc->deadline);
+
+		pfree(vxids);
+		if (!ended)
+		{
+			MemoryContextSwitchTo(old);
+			MemoryContextDelete(cxt);
+			LockRelease(&tag, ExclusiveLock, false);
+			prolly_gc_given_up = true;
+			return NULL;
+		}
+	}
+	else if (gc->m.nretiring > 0)
 	{
 		int			nvxids;
 		VirtualTransactionId *vxids = GetCurrentVirtualXIDs(InvalidTransactionId,
 															false, false, 0,
 															&nvxids);
 
-		gc_wait_for_readers(gc, vxids, nvxids);
+		wait_for_readers(vxids, nvxids);
 	}
 	lock_manifest(s, &gc->m);
 	waited_clear(s);			/* (any a collection that failed left) */
@@ -10737,7 +10811,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			unlock_manifest(s);
 		foreach(lc, gc->xids)
 		{
-			if (wait_unprepared(lfirst_xid(lc), gc->if_free))
+			if (wait_unprepared(lfirst_xid(lc), gc->if_free ? gc->deadline : 0))
 				prepared = lappend_xid(prepared, lfirst_xid(lc));
 		}
 		gc_wait_for_readers(gc, gc->held, gc->nheld);
@@ -11599,8 +11673,12 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	}
 	waited_clear(s);
 	unlock_manifest(s);
-	gc->readers = GetCurrentVirtualXIDs(InvalidTransactionId, false, false, 0,
-										&gc->nreaders);
+	/*
+	 * (those that had used the store: one that hadn't reads the manifest
+	 * swapped in at its first use; any still running when a later
+	 * collection begins are among the store's users it waits for)
+	 */
+	gc->readers = store_users(s, &gc->nreaders);
 	load_tables(s, true);
 
 	{
@@ -11729,11 +11807,14 @@ journal_gc_retire(ProllyChunkGc *gc)
 	Manifest	m;
 
 	/*
-	 * (if free, with one of them still running: what the swap stopped
-	 * naming stays retiring, for the next collection to remove once nobody
-	 * running then is left)
+	 * (if free, with one of them still running past a wait of its own:
+	 * what the swap stopped naming stays retiring, for a later collection
+	 * to remove once they have ended, as noted at the swap)
 	 */
-	if (gc->if_free && readers_running(gc->readers, gc->nreaders))
+	if (gc->if_free &&
+		!readers_end_by(gc->readers, gc->nreaders,
+						TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													prolly_gc_free_wait)))
 	{
 		gc_abort(gc);
 		MemoryContextDelete(gc->cxt);
