@@ -605,7 +605,8 @@ typedef struct ProllyChunkStoreRoutine
 	 * Optional: a collected chunk (by its slot) is a node of the refs tree,
 	 * as the collection read it as of the seal; before gc_copy().  The
 	 * files written list what such a chunk names in older generations
-	 * apart (a retire reads the live refs tree instead of that list).
+	 * apart; gc_inbound() visits that list too, as a node no longer live
+	 * still names what it lists.
 	 */
 	void		(*gc_refs_node) (ProllyChunkGc *gc, uint64 slot);
 

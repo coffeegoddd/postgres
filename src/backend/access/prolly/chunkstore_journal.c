@@ -4314,9 +4314,12 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
  * What a leaf names is listed with the leaf, so that a collection can
  * leave out what the history horizon cuts (a boundary commit's parents).
  * What a node of the refs tree names is listed apart (the collection
- * writing the file says which chunks are its nodes): a retire reads the
- * live refs tree itself, so that one no longer live, kept in a file it
- * doesn't collect, keeps nothing of what it named.
+ * writing the file says which chunks are its nodes), and a retire marks
+ * it as it marks the rest: a node no longer live, kept in a file the
+ * retire doesn't collect, still names it, and the store holds whatever a
+ * chunk it holds names (were the target freed, the node would dangle, and
+ * a later write that came to the same bytes would find the node there and
+ * not write it again, its subtree gone).
  */
 #define XREF_VERSION		2
 #define XREF_HEAD			6
@@ -4416,7 +4419,6 @@ typedef struct XrefSection
 	uint32	   *npairs;
 	uint32	   *nrefs;
 	Size	   *at;				/* where each epoch's targets begin */
-	bool		skip_refs;		/* visits leave out the refs pairs */
 } XrefSection;
 
 static void
@@ -4510,8 +4512,7 @@ xrefs_free(XrefSection *x)
 
 /*
  * Visit the targets of a section's epochs from lo to hi: each with the
- * leaf or node of the refs tree naming it (NULL: another node's); the
- * refs pairs left out where x->skip_refs says.
+ * leaf or node of the refs tree naming it (NULL: another node's).
  */
 typedef void (*XrefVisit) (const ProllyHash *target, const ProllyHash *source,
 						   uint32 epoch, void *arg);
@@ -4545,7 +4546,7 @@ xrefs_visit(const XrefSection *x, uint32 lo, uint32 hi, XrefVisit visit,
 			p += 2 * x->hash_len;
 			visit(&target, &source, x->epochs[i], arg);
 		}
-		for (uint32 j = 0; j < x->nrefs[i] && !x->skip_refs; j++)
+		for (uint32 j = 0; j < x->nrefs[i]; j++)
 		{
 			memcpy(source.bytes, p, x->hash_len);
 			memcpy(target.bytes, p + x->hash_len, x->hash_len);
@@ -10310,8 +10311,6 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 		CHECK_FOR_INTERRUPTS();
 		if (gc->others_hi[i] < gc->retire_lo || !xrefs_read(gc->others[i], &x))
 			continue;
-		/* (what the refs tree names, the retire reads from the live one) */
-		x.skip_refs = true;
 		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
 
 		/*

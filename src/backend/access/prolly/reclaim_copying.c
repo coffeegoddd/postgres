@@ -703,15 +703,14 @@ push_refs_node(const ProllyHash *hash, void *arg)
 /*
  * The refs tree as of the seal (root): each of its nodes collected told
  * to the store, which lists what they name in older generations apart
- * (they change with every commit, and one no longer live, kept in a
- * settled file a retire doesn't collect, would otherwise keep what it
- * named), and marked.  A collection that isn't a retire reads only those
- * collected: what changed since the last collection is all of them, as
- * a node is written anew whenever one below it is.  A retire, which
- * reads no node's list, reads every node of the live tree through any
- * file, and marks what each of its leaves names.  What a node names past
- * the tree (commits, working sets) is marked as any chunk's references
- * are.
+ * (they change with every commit), and marked.  A collection that isn't
+ * a retire reads only those collected: what changed since the last
+ * collection is all of them, as a node is written anew whenever one
+ * below it is.  A retire reads every node of the live tree through any
+ * file, and marks what each of its leaves names; what the settled files
+ * it doesn't collect list, their refs nodes' lists among them, live or
+ * not, gc_inbound() marks besides.  What a node names past the tree
+ * (commits, working sets) is marked as any chunk's references are.
  */
 static void
 mark_refs_tree(Mark *mk, const ProllyHash *root, bool retire)

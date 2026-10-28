@@ -544,6 +544,7 @@ tests += {
       't/892_gen_retire_cost.pl',
       't/893_gen_default_gc_cost.pl',
       't/894_gen_store_files_on_disk.pl',
+      't/898_gen_retire_refs_closure.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',
