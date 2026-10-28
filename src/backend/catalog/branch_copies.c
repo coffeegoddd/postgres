@@ -67,6 +67,7 @@
 #include "catalog/pg_branch.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_enum.h"
@@ -1515,6 +1516,148 @@ branch_rows(Oid catalog, Oid index, AttrNumber relattr, Oid relid,
 	PG_END_TRY();
 	table_close(rel, AccessShareLock);
 	return rows;
+}
+
+/*
+ * (one relation of the family, its name from branch's row of it; an
+ * index's pg_index row there too, index)
+ */
+static List *
+family_add(List *family, Relation pg_class, Oid relid, Oid branch,
+		   HeapTuple index)
+{
+	HeapTuple	tup = class_row(pg_class, relid, branch);
+	BranchFamilyRelation *f;
+
+	if (tup == NULL)
+		return family;
+	f = palloc(sizeof(BranchFamilyRelation));
+	f->relid = relid;
+	f->relnamespace = ((Form_pg_class) GETSTRUCT(tup))->relnamespace;
+	f->relname = ((Form_pg_class) GETSTRUCT(tup))->relname;
+	f->relam = ((Form_pg_class) GETSTRUCT(tup))->relam;
+	f->index = index;
+	heap_freetuple(tup);
+	return lappend(family, f);
+}
+
+/* (relid's indexes on branch, each added) */
+static List *
+family_add_indexes(List *family, Relation pg_class, Oid relid, Oid branch)
+{
+	foreach_ptr(HeapTupleData, tup, branch_rows(IndexRelationId,
+												IndexIndrelidIndexId,
+												Anum_pg_index_indrelid,
+												relid, branch))
+		family = family_add(family, pg_class,
+							((Form_pg_index) GETSTRUCT(tup))->indexrelid,
+							branch, tup);
+	return family;
+}
+
+/*
+ * The relations stored with table relid as another branch has them (see
+ * branch_ops.h): the first other branch with a row of it, by its pg_class,
+ * pg_index and pg_depend rows.
+ */
+static List *
+copies_family(Oid relid)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			branch = InvalidOid;
+	Oid			toast = InvalidOid;
+	List	   *family = NIL;
+
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(pg_class, ClassOidIndexId, true, NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+			if (c->relbranch != MyBranch && c->relkind == RELKIND_RELATION)
+			{
+				branch = c->relbranch;
+				toast = c->reltoastrelid;
+				break;
+			}
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	if (!OidIsValid(branch))
+	{
+		table_close(pg_class, AccessShareLock);
+		return NIL;
+	}
+	family = family_add_indexes(family, pg_class, relid, branch);
+	if (OidIsValid(toast))
+	{
+		family = family_add(family, pg_class, toast, branch, NULL);
+		family = family_add_indexes(family, pg_class, toast, branch);
+	}
+
+	/* (a change log, say: a relation internally dependent on the table) */
+	{
+		Relation	pg_depend = table_open(DependRelationId, AccessShareLock);
+		const CatalogBranchInfo *info = catalog_branch_info(DependRelationId);
+		ScanKeyData keys[2];
+		List	   *internal = NIL;
+
+		ScanKeyInit(&keys[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(RelationRelationId));
+		ScanKeyInit(&keys[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(relid));
+		CatalogAllBranches = true;
+		PG_TRY();
+		{
+			scan = systable_beginscan(pg_depend, DependReferenceIndexId, true,
+									  NULL, 2, keys);
+			while ((tup = systable_getnext(scan)) != NULL)
+			{
+				Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+
+				if (catalog_row_branch(info, tup) == branch &&
+					d->classid == RelationRelationId &&
+					d->deptype == DEPENDENCY_INTERNAL && d->objid != toast &&
+					!list_member_oid(internal, d->objid))
+					internal = lappend_oid(internal, d->objid);
+			}
+			systable_endscan(scan);
+		}
+		PG_FINALLY();
+		{
+			CatalogAllBranches = false;
+		}
+		PG_END_TRY();
+		table_close(pg_depend, AccessShareLock);
+		foreach_oid(r, internal)
+		{
+			HeapTuple	c = class_row(pg_class, r, branch);
+
+			if (c == NULL)
+				continue;
+			/* (not an index: those of the table are added already) */
+			if (((Form_pg_class) GETSTRUCT(c))->relkind != RELKIND_INDEX)
+			{
+				family = family_add(family, pg_class, r, branch, NULL);
+				family = family_add_indexes(family, pg_class, r, branch);
+			}
+			heap_freetuple(c);
+		}
+	}
+	table_close(pg_class, AccessShareLock);
+	return family;
 }
 
 /* Is column attnum of two rows of catalog the same value? */
@@ -3877,6 +4020,7 @@ static const BranchOpsRoutine branch_copies = {
 	.changed_since_kept = copies_changed_since_kept,
 	.try_lock = try_lock_relation,
 	.share_kept = copies_share_kept,
+	.family = copies_family,
 	.hold = copies_hold,
 	.carry_privileges = copies_carry_privileges,
 	.carry_statistics = copies_carry_statistics,

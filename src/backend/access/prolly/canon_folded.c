@@ -8336,6 +8336,13 @@ static HTAB *maker_statements = NULL;
 /* While a move's statements run, the relations its tables are to be. */
 static List *move_kept_relids = NIL;
 
+/*
+ * ... and those stored with each table made as its relation, as another
+ * branch has them (BranchFamilyRelation *, in TopTransactionContext): its
+ * indexes, TOAST table and change log are to be those relations too.
+ */
+static List *move_kept_family = NIL;
+
 Oid
 prolly_recorded_owner(const char *name, Oid owner, const char *owner_name)
 {
@@ -10258,14 +10265,68 @@ move_makers_before(List *from, List *to, List *relids)
 	}
 }
 
+/* Is relid free for a relation made now (and its cache entry forgotten)? */
+static bool
+kept_relid_free(Oid relid)
+{
+	return !SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)) &&
+		RelationForgetForNewRelation(relid);
+}
+
 /*
- * The OID a table named relname in schema relnamespace, made now, is to
- * have: the relation a move making it says it is (move_relids_before()),
- * if the branch has no relation of that OID (and the relation cache's
- * entry of it, another branch's, isn't open); else InvalidOid (a new one).
- * Asked as the relation is made (heap_create_with_catalog()), once, only
- * while the move's statements run: the name's entry is used up.
+ * The OID a relation named relname in schema relnamespace, made now, is to
+ * have: for a table, the relation a move making it says it is
+ * (move_relids_before()); for a TOAST table or a change log, the relation
+ * it is, as another branch has it, of a table made so (move_kept_family).  Only if the branch has no relation of that OID
+ * (and the relation cache's entry of it, another branch's, isn't open);
+ * else InvalidOid (a new one).  Asked as the relation is made
+ * (heap_create_with_catalog(), index_create()), once, only while the
+ * move's statements run: the name's entry is used up.  So a table made
+ * again is every relation it was, and its kept roots, which name them by
+ * OID, give it its pages; one whose OID was taken meanwhile is a new
+ * relation, and those roots don't serve it.
  */
+/* (the family's relation named relname in relnamespace, used up; or NULL) */
+static BranchFamilyRelation *
+family_take(const char *relname, Oid relnamespace)
+{
+	ListCell   *lc;
+
+	foreach(lc, move_kept_family)
+	{
+		BranchFamilyRelation *f = lfirst(lc);
+
+		if (f->relnamespace != relnamespace ||
+			strcmp(NameStr(f->relname), relname) != 0)
+			continue;
+		move_kept_family = foreach_delete_current(move_kept_family, lc);
+		return f;
+	}
+	return NULL;
+}
+
+/*
+ * The relation an index named relname in relnamespace, made now, is to be
+ * (see prolly_move_kept_relid()), with *row that one's pg_index row and
+ * *relam its access method, for the caller to make it so only if it is
+ * defined alike (an OID names one definition, on every branch); else
+ * InvalidOid.
+ */
+Oid
+prolly_move_kept_index(const char *relname, Oid relnamespace,
+					   HeapTuple *row, Oid *relam)
+{
+	BranchFamilyRelation *f;
+
+	if (move_kept_family == NIL ||
+		(f = family_take(relname, relnamespace)) == NULL ||
+		f->index == NULL || !kept_relid_free(f->relid))
+		return InvalidOid;
+	*row = f->index;
+	*relam = f->relam;
+	return f->relid;
+}
+
 Oid
 prolly_move_kept_relid(const char *relname, Oid relnamespace)
 {
@@ -10273,28 +10334,43 @@ prolly_move_kept_relid(const char *relname, Oid relnamespace)
 	char	   *name;
 	ListCell   *lc;
 	Oid			relid = InvalidOid;
+	bool		table = false;
+	BranchFamilyRelation *f;
 
-	if (move_kept_relids == NIL)
+	if (move_kept_relids == NIL && move_kept_family == NIL)
 		return InvalidOid;
-	nsp = get_namespace_name(relnamespace);
-	if (nsp == NULL)
-		return InvalidOid;
-	name = quote_qualified_identifier(nsp, relname);
-	foreach(lc, move_kept_relids)
+	/* (an index's is asked of prolly_move_kept_index()) */
+	if ((f = family_take(relname, relnamespace)) != NULL && f->index == NULL)
+		relid = f->relid;
+	if (!OidIsValid(relid))
 	{
-		MoveRelid  *mr = lfirst(lc);
+		nsp = get_namespace_name(relnamespace);
+		if (nsp == NULL)
+			return InvalidOid;
+		name = quote_qualified_identifier(nsp, relname);
+		foreach(lc, move_kept_relids)
+		{
+			MoveRelid  *mr = lfirst(lc);
 
-		if (strcmp(mr->name, name) != 0)
-			continue;
-		relid = mr->relid;
-		move_kept_relids = foreach_delete_current(move_kept_relids, lc);
-		break;
+			if (strcmp(mr->name, name) != 0)
+				continue;
+			relid = mr->relid;
+			table = true;
+			move_kept_relids = foreach_delete_current(move_kept_relids, lc);
+			break;
+		}
+		pfree(name);
 	}
-	pfree(name);
-	if (OidIsValid(relid) &&
-		(SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)) ||
-		 !RelationForgetForNewRelation(relid)))
+	if (OidIsValid(relid) && !kept_relid_free(relid))
 		relid = InvalidOid;
+	if (OidIsValid(relid) && table && branch_ops()->family != NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		move_kept_family = list_concat(move_kept_family,
+									   branch_ops()->family(relid));
+		MemoryContextSwitchTo(old);
+	}
 	return relid;
 }
 
@@ -14390,6 +14466,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MemoryContextSwitchTo(spi);
 	}
 	move_kept_relids = NIL;
+	move_kept_family = NIL;
 	/*
 	 * (what its making gave those made from a commit, from its maker's
 	 * default privileges: none; those the branch had, made again, their
@@ -14451,6 +14528,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		/* (a move that failed leaves no makers behind: their memory goes) */
 		reset_makers();
 		move_kept_relids = NIL;
+		move_kept_family = NIL;
 		prolly_writing_held_rows(held);
 		prolly_move_calls_end(calls, done);
 	}

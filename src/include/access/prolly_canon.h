@@ -588,6 +588,8 @@ extern PGDLLIMPORT List *prolly_move_provenance;
  * (InvalidOid: a new one).  heap_create_with_catalog() asks it.
  */
 extern Oid	prolly_move_kept_relid(const char *relname, Oid relnamespace);
+extern Oid	prolly_move_kept_index(const char *relname, Oid relnamespace,
+								   HeapTuple *row, Oid *relam);
 
 /*
  * While set, the relations (ProllyKeptRelation *) tables a move makes are

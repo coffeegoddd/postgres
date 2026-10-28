@@ -3080,6 +3080,9 @@ static BranchLockWait move_wait;
  */
 static const BranchLockWait *move_wait_begun = NULL;
 
+/* The commit a move settles the branch's rows at, while it does. */
+static const ProllyCommitInfo *settling = NULL;
+
 static void
 settle(const ProllyCommitInfo *commit, const KnownSource *source)
 {
@@ -3090,7 +3093,16 @@ settle(const ProllyCommitInfo *commit, const KnownSource *source)
 	move_wait_begun = NULL;
 	if (source == NULL)
 		restore_pages(commit);
-	settle_rows(&commit->root, source);
+	settling = source == NULL ? commit : NULL;
+	PG_TRY();
+	{
+		settle_rows(&commit->root, source);
+	}
+	PG_FINALLY();
+	{
+		settling = NULL;
+	}
+	PG_END_TRY();
 	anchor_at_commit(commit);
 	if (ActiveSnapshotSet())
 		keep_pages(&commit->id, commit->nparents > 0 ? &commit->parents[0] : NULL,
@@ -7286,6 +7298,81 @@ restore_pages(const ProllyCommitInfo *commit)
 		if (list_length(restored) > before)
 			branch_note_head_restore(MyBranch);
 	}
+	if (restored == NIL)
+		return;
+	kept_put(name, kept, NULL);
+	branch_set_baseline(name, &baseline, NULL);
+}
+
+/*
+ * Another branch's kept entry for commit id (one the session's branch
+ * keeps is passed over), its branch into *source; NULL if none.
+ */
+static KeptCommit *
+kept_elsewhere(const ProllyHash *id, Oid *source)
+{
+	OtherKept	ok = {branch_ops()->current(), NULL};
+	KeptCommit *kc;
+	HeapTuple	tup;
+
+	copies_kept_holders(id, NULL, note_other_kept, &ok);
+	if (ok.name == NULL ||
+		(kc = kept_lookup(ok.name, id, false)) == NULL || kc->baseline.len == 0)
+		return NULL;
+	tup = SearchSysCache1(BRANCHNAME, CStringGetDatum(ok.name));
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	*source = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+	return kc;
+}
+
+/*
+ * The refs' pages_for_made(): a table a move to the commit settled makes
+ * again (dropped since) is a relation of new storage, its relations those
+ * it was (the move makes them so: prolly_move_kept_relid()), which none of
+ * the branch's own kept roots is of; so it is given the pages another
+ * branch keeps as of the commit, as a hard reset to it shares them
+ * (restore_kept()), and the move then writes none of its rows.  The
+ * branch's own entry is tried first, for a table a restore can serve.
+ */
+static void
+copies_pages_for_made(const ProllyNodeRef *target)
+{
+	ProllyDatabaseComponents dc;
+	const ProllyCommitInfo *commit = settling;
+	char	   *name;
+	List	   *kept;
+	List	   *restored = NIL;
+	KeptCommit *was;
+	ProllyNodeRef baseline;
+	Oid			source = MyBranch;
+
+	/*
+	 * (not under wal_level minimal: a relation made in this transaction
+	 * then skips WAL until it commits, synced at commit as its storage was
+	 * made, which storage given to it isn't; its rows are written instead)
+	 */
+	if (commit == NULL || !same_hash(&commit->root.hash, &target->hash) ||
+		!debug_prolly_page_roots || !debug_prolly_restore_roots ||
+		branch_ops()->share_kept == NULL || RecoveryInProgress() ||
+		!XLogIsNeeded())
+		return;
+	prolly_database_components(&dc);
+	if (dc.canonicalizer->splice_baseline == NULL)
+		return;
+	name = branch_ops()->current();
+	kept = kept_scan(name, KEPT_LIVE, true, KEPT_ASKED_MAX, true);
+	if (!branch_baseline(name, &baseline))
+		return;
+	if ((was = kept_usable(name, &kept, kept_load(name, &kept, &commit->id),
+						   MyBranch)) != NULL && was->baseline.len > 0)
+		restore_kept(&dc, commit, was, MyBranch, &kept, NIL, NULL, &baseline,
+					 &restored);
+	if ((was = kept_usable(name, &kept, kept_elsewhere(&commit->id, &source),
+						   source)) != NULL)
+		restore_kept(&dc, commit, was, source, &kept, restored, NULL,
+					 &baseline, &restored);
 	if (restored == NIL)
 		return;
 	kept_put(name, kept, NULL);
@@ -15156,6 +15243,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches = copies_branches,
 	.branches_named = copies_branches_named,
 	.working_set = copies_working_set,
+	.pages_for_made = copies_pages_for_made,
 	.read_working_set = copies_read_working_set,
 	.read_definitions = copies_read_definitions,
 	.working_changes = copies_working_changes,
