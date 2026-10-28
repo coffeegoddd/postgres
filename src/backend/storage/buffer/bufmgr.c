@@ -4822,6 +4822,28 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 }
 
 /*
+ * Write a dirty buffer whose header the caller holds locked, having checked
+ * it holds the page wanted.  mine: this backend already holds a pin on it,
+ * as a scan running the function that asked for the flush does; that pin
+ * keeps the page in the buffer, so it is used, not a second one taken
+ * (PinBuffer_Locked() is only for a buffer this backend hasn't pinned).
+ * The caller must not hold the buffer's content lock.
+ */
+static void
+FlushLockedBufHdr(BufferDesc *bufHdr, SMgrRelation reln, bool mine)
+{
+	if (mine)
+	{
+		UnlockBufHdr(bufHdr);
+		FlushUnlockedBuffer(bufHdr, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		return;
+	}
+	PinBuffer_Locked(bufHdr);
+	FlushUnlockedBuffer(bufHdr, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	UnpinBuffer(bufHdr);
+}
+
+/*
  * RelationGetNumberOfBlocksInFork
  *		Determines the current number of pages in the specified relation fork.
  *
@@ -5574,6 +5596,7 @@ FlushRelationBuffers(Relation rel)
 	for (i = 0; i < NBuffers; i++)
 	{
 		uint64		buf_state;
+		bool		mine;
 
 		bufHdr = GetBufferDescriptor(i);
 
@@ -5588,14 +5611,11 @@ FlushRelationBuffers(Relation rel)
 		ReservePrivateRefCountEntry();
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
+		mine = GetPrivateRefCount(BufferDescriptorGetBuffer(bufHdr)) > 0;
 		buf_state = LockBufHdr(bufHdr);
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
-			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			UnpinBuffer(bufHdr);
-		}
+			FlushLockedBufHdr(bufHdr, srel, mine);
 		else
 			UnlockBufHdr(bufHdr);
 	}
@@ -5646,6 +5666,7 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		SMgrSortArray *srelent = NULL;
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
 		uint64		buf_state;
+		bool		mine;
 
 		/*
 		 * As in DropRelationBuffers, an unlocked precheck should be safe and
@@ -5683,14 +5704,11 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		ReservePrivateRefCountEntry();
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
+		mine = GetPrivateRefCount(BufferDescriptorGetBuffer(bufHdr)) > 0;
 		buf_state = LockBufHdr(bufHdr);
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srelent->rlocator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
-			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			UnpinBuffer(bufHdr);
-		}
+			FlushLockedBufHdr(bufHdr, srelent->srel, mine);
 		else
 			UnlockBufHdr(bufHdr);
 	}
@@ -5892,6 +5910,7 @@ FlushDatabaseBuffers(Oid dbid)
 {
 	int			i;
 	BufferDesc *bufHdr;
+	bool		mine;
 
 	for (i = 0; i < NBuffers; i++)
 	{
@@ -5910,14 +5929,11 @@ FlushDatabaseBuffers(Oid dbid)
 		ReservePrivateRefCountEntry();
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
+		mine = GetPrivateRefCount(BufferDescriptorGetBuffer(bufHdr)) > 0;
 		buf_state = LockBufHdr(bufHdr);
 		if (bufHdr->tag.dbOid == dbid &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
-			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			UnpinBuffer(bufHdr);
-		}
+			FlushLockedBufHdr(bufHdr, NULL, mine);
 		else
 			UnlockBufHdr(bufHdr);
 	}
@@ -7227,6 +7243,7 @@ FlushRelationBlocks(SMgrRelation reln, ForkNumber forknum,
 		int			buf_id;
 		BufferDesc *bufHdr;
 		uint64		buf_state;
+		bool		mine;
 
 		InitBufferTag(&tag, &rlocator, forknum, blocks[i]);
 		hash = BufTableHashCode(&tag);
@@ -7243,14 +7260,11 @@ FlushRelationBlocks(SMgrRelation reln, ForkNumber forknum,
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
 		/* (the buffer's tag rechecked locked: it may hold another page now) */
+		mine = GetPrivateRefCount(BufferDescriptorGetBuffer(bufHdr)) > 0;
 		buf_state = LockBufHdr(bufHdr);
 		if (BufferTagsEqual(&bufHdr->tag, &tag) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
-			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			UnpinBuffer(bufHdr);
-		}
+			FlushLockedBufHdr(bufHdr, reln, mine);
 		else
 			UnlockBufHdr(bufHdr);
 	}

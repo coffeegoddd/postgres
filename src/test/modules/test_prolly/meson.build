@@ -217,6 +217,7 @@ tests += {
       'generations_retire_guard',
       'generations_retire_sever',
       'generations_retire_roots',
+      'gc_scan_pins',
       'generations_toast',
       'generations_select',
       'generations_window',
