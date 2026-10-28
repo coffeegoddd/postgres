@@ -199,3 +199,142 @@ INSERT INTO tm4.t (id) VALUES (2);
 SELECT * FROM tm4.t ORDER BY id;
 DROP SCHEMA tm4 CASCADE;
 SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;
+
+-- A type the commit defines otherwise, used by a composite type and a
+-- domain the commit doesn't define at all (with tables using them): those
+-- go, keeping the old type until they do, rather than being refused
+CREATE SCHEMA tm5 VERSIONED;
+CREATE DOMAIN tm5.d AS int;
+SELECT length(dolt_commit('-Am', 'tm5 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm5_one \gset
+ALTER DOMAIN tm5.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm5.comp AS (x tm5.d);
+CREATE DOMAIN tm5.d2 AS tm5.d;
+CREATE TABLE tm5.t (id int PRIMARY KEY, c tm5.comp, c2 tm5.d2);
+INSERT INTO tm5.t VALUES (1, ROW(1), 2);
+SELECT length(dolt_commit('-Am', 'tm5 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm5_two \gset
+SELECT dolt_reset('--hard', :'tm5_one') IS NOT NULL AS reset;
+SELECT to_regtype('tm5.comp') IS NULL AS comp_gone,
+	   to_regtype('tm5.d2') IS NULL AS d2_gone,
+	   to_regclass('tm5.t') IS NULL AS t_gone;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+SELECT count(*) AS aside FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm5' AND t.typname LIKE 'prolly_moving%';
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm5_two') IS NOT NULL AS reset;
+SELECT * FROM tm5.t;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+DROP SCHEMA tm5 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm5 gone')::text) AS committed;
+
+
+-- ... and a domain going over a domain moved with it, kept (over the
+-- one changed): every type renamed aside is dropped once that goes
+CREATE SCHEMA tm6 VERSIONED;
+CREATE DOMAIN tm6.d AS int;
+CREATE DOMAIN tm6.d2 AS tm6.d;
+CREATE TABLE tm6.k (id int PRIMARY KEY, a tm6.d2);
+INSERT INTO tm6.k VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'tm6 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm6_one \gset
+ALTER TABLE tm6.k DROP COLUMN a;
+ALTER DOMAIN tm6.d ADD CONSTRAINT k CHECK (VALUE > 0);
+ALTER TABLE tm6.k ADD COLUMN a tm6.d2;
+UPDATE tm6.k SET a = 1;
+CREATE DOMAIN tm6.d3 AS tm6.d2;
+CREATE TABLE tm6.g (id int PRIMARY KEY, d3 tm6.d3);
+INSERT INTO tm6.g VALUES (1, 3);
+SELECT length(dolt_commit('-Am', 'tm6 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm6_two \gset
+SELECT dolt_reset('--hard', :'tm6_one') IS NOT NULL AS reset;
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm6' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+SELECT * FROM tm6.k;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm6.d'::regtype;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm6_two') IS NOT NULL AS reset;
+SELECT * FROM tm6.g;
+DROP SCHEMA tm6 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm6 gone')::text) AS committed;
+
+-- ... a composite type going with a column of a composite type moved
+-- with it, kept
+CREATE SCHEMA tm7 VERSIONED;
+CREATE DOMAIN tm7.d AS int;
+CREATE TYPE tm7.inner AS (x tm7.d);
+CREATE TABLE tm7.k (id int PRIMARY KEY, b tm7.inner);
+INSERT INTO tm7.k VALUES (1, ROW(1));
+SELECT length(dolt_commit('-Am', 'tm7 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm7_one \gset
+ALTER TABLE tm7.k DROP COLUMN b;
+ALTER DOMAIN tm7.d ADD CONSTRAINT k CHECK (VALUE > 0);
+ALTER TABLE tm7.k ADD COLUMN b tm7.inner;
+UPDATE tm7.k SET b = ROW(1);
+CREATE TYPE tm7.outer AS (i tm7.inner);
+CREATE TABLE tm7.g (id int PRIMARY KEY, o tm7.outer);
+INSERT INTO tm7.g VALUES (1, ROW(ROW(4)));
+SELECT length(dolt_commit('-Am', 'tm7 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm7_two \gset
+SELECT dolt_reset('--hard', :'tm7_one') IS NOT NULL AS reset;
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm7' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+SELECT * FROM tm7.k;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm7.d'::regtype;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm7_two') IS NOT NULL AS reset;
+SELECT * FROM tm7.g;
+DROP SCHEMA tm7 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm7 gone')::text) AS committed;
+
+-- ... a typed table going, of a composite type going: its columns aren't
+-- converted (a typed table's can't be), they go with it
+CREATE SCHEMA tm8 VERSIONED;
+CREATE DOMAIN tm8.d AS int;
+SELECT length(dolt_commit('-Am', 'tm8 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm8_one \gset
+ALTER DOMAIN tm8.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm8.c AS (x tm8.d);
+CREATE TABLE tm8.u OF tm8.c;
+INSERT INTO tm8.u VALUES (5);
+SELECT length(dolt_commit('-Am', 'tm8 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm8_two \gset
+SELECT dolt_reset('--hard', :'tm8_one') IS NOT NULL AS reset;
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm8' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+SELECT to_regclass('tm8.u') IS NULL AS u_gone;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm8.d'::regtype;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm8_two') IS NOT NULL AS reset;
+SELECT * FROM tm8.u;
+DROP SCHEMA tm8 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm8 gone')::text) AS committed;
+
+-- ... a range type going over the type changed
+CREATE SCHEMA tm9 VERSIONED;
+CREATE DOMAIN tm9.d AS int;
+SELECT length(dolt_commit('-Am', 'tm9 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm9_one \gset
+ALTER DOMAIN tm9.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm9.r AS RANGE (subtype = tm9.d);
+CREATE TABLE tm9.g (id int PRIMARY KEY, r tm9.r);
+INSERT INTO tm9.g VALUES (1, '[1,5)');
+SELECT length(dolt_commit('-Am', 'tm9 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm9_two \gset
+SELECT dolt_reset('--hard', :'tm9_one') IS NOT NULL AS reset;
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm9' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+SELECT conname FROM pg_constraint WHERE contypid = 'tm9.d'::regtype;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm9_two') IS NOT NULL AS reset;
+SELECT * FROM tm9.g;
+DROP SCHEMA tm9 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm9 gone')::text) AS committed;

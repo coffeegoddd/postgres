@@ -595,3 +595,408 @@ SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;
         42
 (1 row)
 
+-- A type the commit defines otherwise, used by a composite type and a
+-- domain the commit doesn't define at all (with tables using them): those
+-- go, keeping the old type until they do, rather than being refused
+CREATE SCHEMA tm5 VERSIONED;
+CREATE DOMAIN tm5.d AS int;
+SELECT length(dolt_commit('-Am', 'tm5 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm5_one \gset
+ALTER DOMAIN tm5.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm5.comp AS (x tm5.d);
+CREATE DOMAIN tm5.d2 AS tm5.d;
+CREATE TABLE tm5.t (id int PRIMARY KEY, c tm5.comp, c2 tm5.d2);
+INSERT INTO tm5.t VALUES (1, ROW(1), 2);
+SELECT length(dolt_commit('-Am', 'tm5 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm5_two \gset
+SELECT dolt_reset('--hard', :'tm5_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT to_regtype('tm5.comp') IS NULL AS comp_gone,
+	   to_regtype('tm5.d2') IS NULL AS d2_gone,
+	   to_regclass('tm5.t') IS NULL AS t_gone;
+ comp_gone | d2_gone | t_gone 
+-----------+---------+--------
+ t         | t       | t
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS aside FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm5' AND t.typname LIKE 'prolly_moving%';
+ aside 
+-------
+     0
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm5_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm5.t;
+ id |  c  | c2 
+----+-----+----
+  1 | (1) |  2
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm5.d'::regtype;
+ conname 
+---------
+ k
+(1 row)
+
+DROP SCHEMA tm5 CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table tm5.t
+drop cascades to type tm5.d
+drop cascades to type tm5.comp
+drop cascades to type tm5.d2
+SELECT length(dolt_commit('-Am', 'tm5 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- ... and a domain going over a domain moved with it, kept (over the
+-- one changed): every type renamed aside is dropped once that goes
+CREATE SCHEMA tm6 VERSIONED;
+CREATE DOMAIN tm6.d AS int;
+CREATE DOMAIN tm6.d2 AS tm6.d;
+CREATE TABLE tm6.k (id int PRIMARY KEY, a tm6.d2);
+INSERT INTO tm6.k VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'tm6 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm6_one \gset
+ALTER TABLE tm6.k DROP COLUMN a;
+ALTER DOMAIN tm6.d ADD CONSTRAINT k CHECK (VALUE > 0);
+ALTER TABLE tm6.k ADD COLUMN a tm6.d2;
+UPDATE tm6.k SET a = 1;
+CREATE DOMAIN tm6.d3 AS tm6.d2;
+CREATE TABLE tm6.g (id int PRIMARY KEY, d3 tm6.d3);
+INSERT INTO tm6.g VALUES (1, 3);
+SELECT length(dolt_commit('-Am', 'tm6 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm6_two \gset
+SELECT dolt_reset('--hard', :'tm6_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm6' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+ typname 
+---------
+ d
+ d2
+(2 rows)
+
+SELECT * FROM tm6.k;
+ id | a 
+----+---
+  1 | 1
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm6.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm6_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm6.g;
+ id | d3 
+----+----
+  1 |  3
+(1 row)
+
+DROP SCHEMA tm6 CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table tm6.k
+drop cascades to table tm6.g
+drop cascades to type tm6.d
+drop cascades to type tm6.d2
+drop cascades to type tm6.d3
+SELECT length(dolt_commit('-Am', 'tm6 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- ... a composite type going with a column of a composite type moved
+-- with it, kept
+CREATE SCHEMA tm7 VERSIONED;
+CREATE DOMAIN tm7.d AS int;
+CREATE TYPE tm7.inner AS (x tm7.d);
+CREATE TABLE tm7.k (id int PRIMARY KEY, b tm7.inner);
+INSERT INTO tm7.k VALUES (1, ROW(1));
+SELECT length(dolt_commit('-Am', 'tm7 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm7_one \gset
+ALTER TABLE tm7.k DROP COLUMN b;
+ALTER DOMAIN tm7.d ADD CONSTRAINT k CHECK (VALUE > 0);
+ALTER TABLE tm7.k ADD COLUMN b tm7.inner;
+UPDATE tm7.k SET b = ROW(1);
+CREATE TYPE tm7.outer AS (i tm7.inner);
+CREATE TABLE tm7.g (id int PRIMARY KEY, o tm7.outer);
+INSERT INTO tm7.g VALUES (1, ROW(ROW(4)));
+SELECT length(dolt_commit('-Am', 'tm7 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm7_two \gset
+SELECT dolt_reset('--hard', :'tm7_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm7' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+ typname 
+---------
+ d
+ inner
+(2 rows)
+
+SELECT * FROM tm7.k;
+ id |  b  
+----+-----
+  1 | (1)
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm7.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm7_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm7.g;
+ id |    o    
+----+---------
+  1 | ("(4)")
+(1 row)
+
+DROP SCHEMA tm7 CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table tm7.k
+drop cascades to table tm7.g
+drop cascades to type tm7.d
+drop cascades to type tm7."inner"
+drop cascades to type tm7."outer"
+SELECT length(dolt_commit('-Am', 'tm7 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- ... a typed table going, of a composite type going: its columns aren't
+-- converted (a typed table's can't be), they go with it
+CREATE SCHEMA tm8 VERSIONED;
+CREATE DOMAIN tm8.d AS int;
+SELECT length(dolt_commit('-Am', 'tm8 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm8_one \gset
+ALTER DOMAIN tm8.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm8.c AS (x tm8.d);
+CREATE TABLE tm8.u OF tm8.c;
+INSERT INTO tm8.u VALUES (5);
+SELECT length(dolt_commit('-Am', 'tm8 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm8_two \gset
+SELECT dolt_reset('--hard', :'tm8_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm8' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+ typname 
+---------
+ d
+(1 row)
+
+SELECT to_regclass('tm8.u') IS NULL AS u_gone;
+ u_gone 
+--------
+ t
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm8.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm8_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm8.u;
+ x 
+---
+ 5
+(1 row)
+
+DROP SCHEMA tm8 CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to type tm8.d
+drop cascades to type tm8.c
+drop cascades to table tm8.u
+SELECT length(dolt_commit('-Am', 'tm8 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- ... a range type going over the type changed
+CREATE SCHEMA tm9 VERSIONED;
+CREATE DOMAIN tm9.d AS int;
+SELECT length(dolt_commit('-Am', 'tm9 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm9_one \gset
+ALTER DOMAIN tm9.d ADD CONSTRAINT k CHECK (VALUE > 0);
+CREATE TYPE tm9.r AS RANGE (subtype = tm9.d);
+CREATE TABLE tm9.g (id int PRIMARY KEY, r tm9.r);
+INSERT INTO tm9.g VALUES (1, '[1,5)');
+SELECT length(dolt_commit('-Am', 'tm9 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm9_two \gset
+SELECT dolt_reset('--hard', :'tm9_one') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'tm9' AND t.typtype IN ('d', 'c', 'r')
+  AND (t.typrelid = 0 OR t.typrelid IN (SELECT oid FROM pg_class WHERE relkind = 'c'))
+ORDER BY 1;
+ typname 
+---------
+ d
+(1 row)
+
+SELECT conname FROM pg_constraint WHERE contypid = 'tm9.d'::regtype;
+ conname 
+---------
+(0 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm9_two') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT * FROM tm9.g;
+ id |   r   
+----+-------
+  1 | [1,5)
+(1 row)
+
+DROP SCHEMA tm9 CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table tm9.g
+drop cascades to type tm9.d
+drop cascades to type tm9.r
+SELECT length(dolt_commit('-Am', 'tm9 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
