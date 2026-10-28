@@ -136,7 +136,7 @@ python3 "$B" --root ~/dbs/benchmarks/smoke run
 ```
 
 Smoke uses four tiny sizes, four historical commits, and two repetitions. It
-validates integration and operation semantics; its scaling estimates are
+checks that the harness runs end to end; its scaling estimates are
 intentionally inconclusive. `--engines dolt,doltgres,prolly` selects a subset
 for build, prepare, run, start, stop, or status. `prepare` and `run` automatically
 start and stop one engine at a time. Servers already started with `start` are
@@ -262,17 +262,6 @@ The dirty rows are written in one transaction, so its commit flushes the
 log once. prolly's is a single `UPDATE ... FROM generate_series(...)` that
 spreads the ids itself; Dolt and Doltgres send 1,000 ids to a statement.
 
-**Validation** (`config.json`'s `validation`) is how a case checks its working
-set, untimed. `full` counts the dirty rows with a `dolt_diff` (and a soft
-reset's rows with another). `sampled` reads by key a sample of each kind of
-row instead: 500 dirty rows (at the new revision), 500 of the fixture's other
-changed rows (at HEAD's) and 500 rows neither touched (at the baseline's). It
-catches a lost or wrongly kept working set, but not a few stray rows outside
-the sample. The default, `auto`, is `full` up to 1,000,000 rows and
-`sampled` past them: a full count of millions of dirty rows takes minutes at
-10 GB, several times a case. Each sample records the mode it used
-(`validation`).
-
 A dirty `reset_hard` at D>0 times both costs at once: discarding the Q dirty
 rows and moving the branch back D commits. To tell them apart, read the dirty
 cell at D=0 (the discard alone) and the clean cell at D>0 (the move alone).
@@ -321,13 +310,10 @@ The operation contracts are:
   and the pending edits. The expected diff to the new HEAD accounts for the exact
   union/overlap of the historical K keys and dirty Q keys.
 
-Dirty setup, validation, and hard-reset cleanup are outside timing and memory
+Dirty setup and the restore after each case are outside timing and memory
 sampling (in a `reset_hard` case the hard reset is the timed operation, and
-the cleanup too). Setup uses point probes, avoiding a pre-timed VC diff that could fold
-or materialize pending storage state. Post-operation validation checks values,
-HEADs, and full diff cardinalities before restoring the clean starting state.
-Large dirty sets can make setup/validation substantially longer than the timed
-operation. Memory baseline includes the already-dirty working set; growth is
+the cleanup too). Setup reads nothing back, avoiding a pre-timed VC diff that
+could fold or materialize pending storage state. Memory baseline includes the already-dirty working set; growth is
 the additional resident memory during the operation.
 
 Diff uses `SELECT count(*) FROM dolt_diff(...)` so the engine must exhaust the
@@ -337,13 +323,16 @@ all changed payloads. The fork's typed `NULL::bench_rows` API is adapted to
 Dolt/Doltgres's table-name API. Dolt uses CALL for VC procedures; PostgreSQL
 engines use SELECT.
 
-Setup, validation, branch deletion, and restoration run outside measurements.
-Branches are fresh names and are removed after each successful test, avoiding
-branch-count growth. Each soft reset is checked for both the new HEAD and the
-preserved working rows/diff. Checkout probes the restored values; diffs check
-cardinality. Failures abort the run and retain scratch refs for investigation.
-Baseline loading verifies count, total payload length, revision sum, and payload
-samples. The fork additionally checks that the table really uses prolly.
+Setup, branch deletion, and the restore run outside measurements. The run
+measures timing: it doesn't check the operations' results. After each case the
+restore puts the session back on its scratch branch, at the fixture's head with
+a clean working set, with the case's branches deleted, so every case starts
+from the same state. Branches are fresh names and are removed after each
+successful test, avoiding branch-count growth. Failures (an operation's error,
+or a failed history-window or path check) abort the run and retain scratch refs
+for investigation. `prepare` still verifies each fixture once as it builds it:
+the loaded rows' count, total payload length, revision sum and payload samples,
+and that the table really uses prolly.
 
 Operation order and table-size order are seeded and shuffled. Engines run
 serially in a seeded shuffled order, with no OS cache drop: these are **warm-cache
@@ -411,8 +400,8 @@ The `counters` pass runs only for engines that keep work counters
 tree nodes read and written, chunks appended, rows and change-log pages a
 fold read, pages copied, rows applied, and more). Around each operation it
 calls `pg_stat_force_next_flush()` and reads `pg_stat_prolly`: once after
-the dirty-row setup and its probes, and once before validation and
-restoration, so each sample counts the timed statement alone. The view is
+the dirty-row setup, and once before the restore, so each sample counts the
+timed statement alone. The view is
 per database and the benchmark is the database's only session (autovacuum
 is off), so nothing else counts in it. Each sample keeps the counters the
 operation moved (`counters` in `samples.jsonl`). The report gives each
@@ -514,15 +503,14 @@ To see where a run's time goes, set `VC_BENCH_TRACE` to a file before `run`
 (or `prepare`). Every statement the harness sends is appended to it with its UTC
 time and how long it took, long id lists shortened to their count. Each case
 marks the start of its setup (`==== CASE <i>/<n> <op> D=<d> <working set>:
-setup`), its dirty write and probe (`---- setup: dirty write (<rows> rows)`,
-`---- setup: probe`), its timed statement (`---- timed`), its validation
-(`---- validation`) and its restore (`---- restore`), and ends with a summary
-(`==== CASE <i>/<n> ...: ok; setup <s> s, timed <ms> ms, validation <s> s`).
+setup`), its dirty write (`---- setup: dirty write (<rows> rows)`), its timed
+statement (`---- timed`) and its restore (`---- restore`), and ends with a
+summary (`==== CASE <i>/<n> ...: ok; setup <s> s, timed <ms> ms, restore <s> s`).
 That tells a slow cell's untimed setup and checks apart from the operation
 measured, and shows a statement that is still waiting: the last line is the one
 before it. The same summary is logged for every case, traced or not, and each
-sample keeps `setup_sec` and `validation_sec`: the harness's own work around
-the timed statement (its validation includes the restore).
+sample keeps `setup_sec` and `restore_sec`: the harness's own work around
+the timed statement.
 
 ```sh
 VC_BENCH_TRACE=~/dbs/benchmarks/trace.log python3 "$B" run --engines prolly --passes timing

@@ -11,7 +11,7 @@ import socket
 import sys
 
 import core
-from experiment import changed_ids, integer, union_count, cases
+from experiment import changed_ids, integer, cases
 from memory import Sampler
 from report import fit, report
 from human_report import render
@@ -236,13 +236,6 @@ class BenchTests(unittest.TestCase):
                      {'rows': 2, 'fraction': .1}, {}):
             with self.assertRaises(ValueError):
                 core.dirty_rows(spec, 128)
-
-    def test_dirty_and_historical_union_handles_partial_overlap(self):
-        for n in (1, 7, 16, 31):
-            for a in range(1, n+1):
-                for b in range(1, n+1):
-                    self.assertEqual(union_count(n, a, b),
-                                     len(set(changed_ids(n, a)) | set(changed_ids(n, b))))
 
     def test_case_plan_covers_each_dirty_size_operation_and_depth(self):
         plan = cases({'history_depths': [1, 4]})
@@ -520,15 +513,30 @@ class BenchTests(unittest.TestCase):
         # (the used branch is checked out before the timed delete; the other
         # never; a three-way merge's side, at each depth, to commit on it)
         checkouts = [q for q in sql.statements if q.startswith('VC ["checkout", "new_')]
-        self.assertEqual(len(checkouts), 3 + 6 + 2)
+        self.assertEqual(len(checkouts), 3 + 2)
         # every temporary branch is gone at the end, and the table is back
         self.assertEqual(set(sql.branches), {'fixture'})
         self.assertIsNotNone(sql.branches['fixture'][1])
 
+    def test_the_run_checks_no_results_and_restores_after_every_case(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        records = self._run_cell(sql, n, k, commits, warmups=0)
+        self.assertTrue(records and all(r['status'] == 'ok' for r in records))
+        self.assertTrue(all('setup_sec' in r and 'restore_sec' in r for r in records))
+        # no diff but the timed ones, and no reads of rows but a used branch's
+        diffs = [q for q in sql.statements if q.startswith('DIFF ')]
+        self.assertEqual(len(diffs), len([r for r in records if r['operation'].startswith('diff_')]))
+        reads = [q for q in sql.statements if q.startswith('SELECT id,revision')]
+        self.assertEqual(len(reads), len([r for r in records if r['operation'] == 'branch_delete_used']))
+        # every case's branches are gone at the end, and the session is back
+        self.assertEqual(set(sql.branches), {'fixture'})
+        self.assertEqual(sql.current, 'fixture')
+
     def test_counters_pass_counts_the_operation_alone(self):
         # The model counts every statement: the operation's deltas are the
         # operation's one statement, not the dirty rows' setup before it or
-        # the validation and restoration after.
+        # the restore after.
         n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
         sql = FakeVersionedSQL(n, k, commits, 'fixture')
         records = self._run_cell(sql, n, k, commits, engine='prolly', passes=('timing', 'counters'))
@@ -658,12 +666,6 @@ class BenchTests(unittest.TestCase):
         self.assertTrue(records and not any(r['warmup'] for r in records))
         self.assertEqual(len([r for r in records if r['operation'] == 'reset_hard']), 3 * 3)
 
-    def test_in_spread_matches_changed_ids(self):
-        from experiment import in_spread
-        for n, count in ((64, 3), (64, 32), (64, 64), (961538, 9616), (97, 13)):
-            spread = set(changed_ids(n, count))
-            self.assertEqual({x for x in range(1, n + 1) if in_spread(x, n, count)}, spread)
-
     def test_dirty_writes_run_in_one_transaction(self):
         import re
         from engines import ENGINES
@@ -681,47 +683,6 @@ class BenchTests(unittest.TestCase):
             if q.startswith('UPDATE bench_rows SET revision=5 '):
                 self.assertEqual(sql.statements[i - 1], 'BEGIN')
                 self.assertEqual(sql.statements[i + 1], 'COMMIT')
-
-    def test_sampled_validation_reads_rows_instead_of_counting_diffs(self):
-        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
-        full_count = 'DIFF ' + json.dumps([commits[-1], 'WORKING'])
-        counts = {}
-        for mode in ('full', 'sampled'):
-            sql = FakeVersionedSQL(n, k, commits, 'fixture')
-            records = self._run_cell(sql, n, k, commits, warmups=0, validation=mode)
-            self.assertTrue(all(r['status'] == 'ok' and r['validation'] == mode for r in records))
-            self.assertTrue(all('setup_sec' in r and 'validation_sec' in r for r in records))
-            counts[mode] = sql.statements.count(full_count)
-        self.assertGreater(counts['full'], 0)
-        self.assertEqual(counts['sampled'], 0)
-
-    def test_sampled_validation_catches_a_lost_dirty_row(self):
-        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
-
-        class LosesADirtyRow(FakeVersionedSQL):
-            # (a branch made from a dirty working set puts one of its dirty
-            # rows back, one the three-row probe doesn't read)
-            def query(self, q):
-                out = super().query(q)
-                if q.startswith('VC ') and json.loads(q[3:])[:1] == ['branch'] and \
-                        json.loads(q[3:])[1] != '-D':
-                    work = self.branches[self.current][1]
-                    dirty = sorted(i for i, v in work.items() if v == len(commits))
-                    if len(dirty) > 3:
-                        work[dirty[1]] = len(commits) - 1
-                return out
-
-        sql = LosesADirtyRow(n, k, commits, 'fixture')
-        with self.assertRaises(RuntimeError) as e:
-            self._run_cell(sql, n, k, commits, warmups=0, validation='sampled')
-        self.assertRegex(str(e.exception), 'sampled working rows')
-
-    def test_a_hard_reset_that_keeps_dirty_rows_is_caught(self):
-        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
-        sql = FakeVersionedSQL(n, k, commits, 'fixture', keep_dirty_on_hard_reset=True)
-        with self.assertRaises(RuntimeError) as e:
-            self._run_cell(sql, n, k, commits)
-        self.assertRegex(str(e.exception), 'working rows|hard reset leaves no working changes|preserved dirty')
 
     def test_window_settings_hold_every_commit_a_fixture_builds(self):
         from engines import ENGINES

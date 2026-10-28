@@ -85,17 +85,11 @@ def source_info(path):
         "status": subprocess.check_output(["git", "status", "--porcelain"], cwd=path, text=True)}
 
 
-# How a case's working set is checked (experiment.validation_mode()): auto
-# is full up to FULL_VALIDATION_MAX_ROWS rows, sampled past them.
-VALIDATION_MODES = ("auto", "full", "sampled")
-FULL_VALIDATION_MAX_ROWS = 1_000_000
-
-
 def trace(message):
     """One line appended to $VC_BENCH_TRACE, if set: a UTC time and the
     message.  Every request the harness sends is traced with how long it
     took, and each case marks its setup, its timed operation and its
-    validation, so a slow cell's untimed work can be told apart."""
+    restore, so a slow cell's untimed work can be told apart."""
     path = os.environ.get("VC_BENCH_TRACE")
     if path:
         with open(path, "a") as f:
@@ -144,9 +138,6 @@ def config(root):
     if max(c["changes"]) > min(rows):
         raise ValueError("every changed-row count must fit in the smallest table")
     c.setdefault('dirty_sizes', default_dirty_sizes())
-    c.setdefault('validation', 'auto')
-    if c['validation'] not in VALIDATION_MODES:
-        raise ValueError("validation must be one of " + ", ".join(VALIDATION_MODES))
     if not isinstance(c['dirty_sizes'], dict):
         raise ValueError('dirty_sizes must map profile names to rows or fraction specifications')
     for label, spec in c['dirty_sizes'].items():
