@@ -111,6 +111,14 @@ static const struct exclude_list_item skip[] = {
 	{"pg_filenode.map", false},
 	{"pg_internal.init", true},
 	{"PG_VERSION", false},
+
+	/*
+	 * The chunk store's files in a database's directory (its journal's
+	 * segments and index, its table files, its manifest, the window's seal):
+	 * not relation files, and they hold no pages.  basebackup.c verifies
+	 * only files named as relations, so it passes over them already.
+	 */
+	{"prolly_", true},
 #ifdef EXEC_BACKEND
 	{"config_exec_params", true},
 #endif
