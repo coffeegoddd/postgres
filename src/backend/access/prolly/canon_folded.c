@@ -10500,6 +10500,25 @@ retype_rewrites(const char *name, const char *col, const char *type)
  * (they may not cast, or cast to values its keys or NOT NULLs refuse),
  * all to's written afresh.
  */
+/*
+ * Is table name, which the move makes, to be made as a relation it was
+ * (move_kept_relids, read before the move's statements are planned), and
+ * given pages kept of it, not its rows (the refs' pages_kept_for())?
+ */
+static bool
+made_as_kept(const char *name)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, pages_kept_for))
+		return false;
+	foreach_ptr(MoveRelid, mr, move_kept_relids)
+		if (strcmp(mr->name, name) == 0)
+			return PROLLY_CALL(dc.refs, pages_kept_for, name);
+	return false;
+}
+
 static bool
 move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		   const TableDef *to)
@@ -10510,6 +10529,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	List	   *from_names = NIL;
 	List	   *to_names = NIL;
 	ListCell   *lc;
+	bool		kept = false;
 
 	memset(&none, 0, sizeof(none));
 	if (to == NULL)
@@ -10582,6 +10602,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
+		kept = made_as_kept(name);
 		initStringInfo(&sql);
 		if (to->partition_of)
 		{
@@ -10915,7 +10936,19 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		foreach(c, to->constraints)
 			if (strcmp(first_field(lfirst(c)), idx) == 0)
 				owned = true;
-		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
+		if (owned || list_has_string(from->indexes, lfirst(lc)))
+			continue;
+
+		/*
+		 * (made after the rows, built once over them; but a table made
+		 * again as a relation it was, to be given the pages kept of it,
+		 * gets them first, on its empty storage, so that it is every
+		 * relation it was when the move gives it those pages, and writes
+		 * no row)
+		 */
+		if (kept)
+			sm->changes = lappend(sm->changes, pstrdup(lfirst(lc)));
+		else
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
 	}
 

@@ -8,7 +8,9 @@
 # its relations by OID, still serve it: a later hard reset to an older
 # commit, at any depth, gives back that commit's pages and writes no row.
 # Without that, the reset to the head wrote every row, and each later
-# reset wrote the rows between the head and its commit.
+# reset wrote the rows between the head and its commit.  With no root of
+# the head kept, the reset writes the table's rows (its indexes built
+# after them), and the table is right and its indexes check out.
 
 use strict;
 use warnings FATAL => 'all';
@@ -70,10 +72,13 @@ my $n = 0;
 # reset to the head, then hard resets of it to older commits
 sub case
 {
-	my ($wide) = @_;
+	my ($wide, $roots) = @_;
 	$n++;
 	my $t = "app.t$n";
-	my $what = $wide ? 'with a secondary index and TOAST' : 'plain';
+	my $what = ($wide ? 'with a secondary index and TOAST' : 'plain')
+	  . ($roots ? '' : ', no root of the head');
+	# (no root kept of the fixture's later commits)
+	my $set = $roots ? '' : 'SET prolly.root_interval_commits = 1000;';
 	my $digest = qq{SELECT md5(string_agg(id || ':' || rev || ':' || md5(payload), ',' ORDER BY id)) FROM $t};
 
 	sql(qq{SELECT dolt_checkout('main') IS NOT NULL;
@@ -90,7 +95,7 @@ sub case
 	my @commits;
 	for my $r (1 .. 12)
 	{
-		my $h = on("fixture$n", qq{UPDATE $t SET rev = $r WHERE id % 50 = 0;
+		my $h = on("fixture$n", qq{$set UPDATE $t SET rev = $r WHERE id % 50 = 0;
 			SELECT (dolt_commit('-am', 'r$r'))[1]});
 		push @commits, $h;
 		$at{$h} = on("fixture$n", $digest);
@@ -109,8 +114,21 @@ sub case
 		   OR c.relname ~ ('^pg_(toast|prolly_log)_' || '$t'::regclass::oid)};
 	my $before = on("scratch$n", $rels);
 
+	my $indexes = qq{SELECT count(*) FROM (SELECT bt_index_check(indexrelid, true)
+		FROM pg_index WHERE indrelid IN ('$t'::regclass,
+			(SELECT reltoastrelid FROM pg_class WHERE oid = '$t'::regclass))) s};
+
 	on("scratch$n", qq{DROP TABLE $t});
 	my $d = counted("scratch$n", qq{SELECT dolt_reset('--hard', '$head')});
+	if (!$roots)
+	{
+		is($d->{apply_rows}, 5000, "$what: the reset bringing the table back writes its rows");
+		is(on("scratch$n", $digest), $at{$head}, "$what: the table holds the head's rows");
+		is(on("scratch$n", $indexes), $wide ? 3 : 2, "$what: its indexes check out");
+		is(on("scratch$n", q{SELECT count(*) FROM dolt_status}), '0',
+			"$what: the working set is clean");
+		return;
+	}
 	is($d->{apply_rows}, 0, "$what: the reset bringing the table back writes no row");
 	is($d->{apply_loads}, 0, "$what: nor loads the table");
 	is($d->{move_tables_written}, 0, "$what: nor writes any table");
@@ -126,18 +144,17 @@ sub case
 		is($d->{apply_rows}, 0, "$what, depth $depth: no row written");
 		is($d->{move_tables_written}, 0, "$what, depth $depth: no table written");
 		is(on("scratch$n", $digest), $at{$to}, "$what, depth $depth: the commit's rows");
-		is( on("scratch$n", qq{SELECT count(*) FROM (SELECT bt_index_check(indexrelid, true)
-				FROM pg_index WHERE indrelid IN ('$t'::regclass,
-					(SELECT reltoastrelid FROM pg_class WHERE oid = '$t'::regclass))) s}),
-			$wide ? 3 : 2, "$what, depth $depth: its indexes check out");
+		is(on("scratch$n", $indexes), $wide ? 3 : 2,
+			"$what, depth $depth: its indexes check out");
 		is(on("scratch$n", q{SELECT count(*) FROM dolt_status}), '0',
 			"$what, depth $depth: the working set is clean");
 	}
 }
 
 sql(q{CREATE SCHEMA app VERSIONED});
-case(0);
-case(1);
+case(0, 1);
+case(1, 1);
+case(1, 0);
 
 $node->stop;
 done_testing();

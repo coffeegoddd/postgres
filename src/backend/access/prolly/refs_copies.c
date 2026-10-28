@@ -7336,6 +7336,40 @@ kept_elsewhere(const ProllyHash *id, Oid *source)
  * (restore_kept()), and the move then writes none of its rows.  The
  * branch's own entry is tried first, for a table a restore can serve.
  */
+/* (the conditions copies_pages_for_made() gives pages under) */
+static bool
+pages_for_made_possible(void)
+{
+	/*
+	 * (not under wal_level minimal: a relation made in this transaction
+	 * then skips WAL until it commits, synced at commit as its storage was
+	 * made, which storage given to it isn't; its rows are written instead)
+	 */
+	return settling != NULL && debug_prolly_page_roots &&
+		debug_prolly_restore_roots && branch_ops()->share_kept != NULL &&
+		!RecoveryInProgress() && XLogIsNeeded();
+}
+
+/*
+ * The refs' pages_kept_for(): another branch keeps pages as of the move's
+ * commit, frozen, with table name among them (a table made again is of
+ * storage none of the branch's own roots is of).
+ */
+static bool
+copies_pages_kept_for(const char *name)
+{
+	KeptCommit *kc;
+	Oid			source;
+
+	if (!pages_for_made_possible() ||
+		(kc = kept_elsewhere(&settling->id, &source)) == NULL || kc->unfrozen)
+		return false;
+	for (int t = 0; t < kc->ntables; t++)
+		if (strcmp(kc->tables[t].name, name) == 0)
+			return true;
+	return false;
+}
+
 static void
 copies_pages_for_made(const ProllyNodeRef *target)
 {
@@ -7348,15 +7382,8 @@ copies_pages_for_made(const ProllyNodeRef *target)
 	ProllyNodeRef baseline;
 	Oid			source = MyBranch;
 
-	/*
-	 * (not under wal_level minimal: a relation made in this transaction
-	 * then skips WAL until it commits, synced at commit as its storage was
-	 * made, which storage given to it isn't; its rows are written instead)
-	 */
-	if (commit == NULL || !same_hash(&commit->root.hash, &target->hash) ||
-		!debug_prolly_page_roots || !debug_prolly_restore_roots ||
-		branch_ops()->share_kept == NULL || RecoveryInProgress() ||
-		!XLogIsNeeded())
+	if (!pages_for_made_possible() ||
+		!same_hash(&commit->root.hash, &target->hash))
 		return;
 	prolly_database_components(&dc);
 	if (dc.canonicalizer->splice_baseline == NULL)
@@ -15244,6 +15271,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches_named = copies_branches_named,
 	.working_set = copies_working_set,
 	.pages_for_made = copies_pages_for_made,
+	.pages_kept_for = copies_pages_kept_for,
 	.read_working_set = copies_read_working_set,
 	.read_definitions = copies_read_definitions,
 	.working_changes = copies_working_changes,
