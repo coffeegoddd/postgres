@@ -100,9 +100,65 @@ Only keyframes are optional.  Everything else is required.
   point reaches the WAL and is read: hint changes logged, a checkpoint at the
   base point, and the WAL flushed before the changed pages are read
   (`bench/lp_dead_repro.sql` shows each failure).
-- **Longer term:** copy-on-write page storage, where the working set's pages
-  live in the page store, makes every commit a free keyframe and checkout
-  O(1), at the price of a custom storage manager.
+- **Longer term:** copy-on-write page storage (next section) makes every
+  commit's page-map root a free keyframe, once settled.
+
+## Concurrent branches: copy-on-write working sets
+
+**The limitation.**  As built, a versioned schema has one physical working
+set, and it holds exactly one branch, the checked-out one.  Every branch
+has its own logical working set (its working root in the prolly tree), and
+everything at the version-control level scales to a million branches, but
+two sessions cannot run SQL against two different branches at once: one
+would have to switch the working set (a replay, 100–500 ms measured),
+which moves it for everyone.  Concurrent writers on *one* branch are fine.
+
+**The target design: one copy-on-write working set per branch.**  Each
+branch's working set is its own page map over a shared, content-addressed
+page store.  Pages are shared until a branch writes one; the write puts a
+new page in that branch's map only, so branches stay isolated.
+
+| Operation | One physical working set (built) | Copy-on-write working sets (target) |
+|---|---|---|
+| Branch create | O(1) in the tree | O(1): copy the branch's page-map roots |
+| A session on a branch / checkout | Replay the difference; moves the working set for everyone | O(1): connect to that branch's own working set; sessions on different branches run concurrently |
+| Reset to commit X in the window | Replay, O(changed rows × indexes) | O(1) if X kept a settled page-map root; otherwise the nearest settled root plus replay |
+| diff WORKING X | Checkpoint, then prolly diff | Unchanged: the branch's own change stream feeds its working root |
+| Rebase, merge, cherry-pick, revert | Computed in the tree, applied by row replay | Unchanged, replayed into that branch's working set only |
+| Commit | Barrier, then the prolly commit | Same, plus freezing the branch's page-map root in O(1): its keyframe, once settled |
+| Branch delete | Drop the working root | Drop the branch's database; frees only the pages no other root shares |
+
+The window's guarantees are kept and two get stronger: switching becomes
+O(1) whatever the change size, and so does reset to any commit whose
+settled root is retained.
+
+**What has to hold:**
+
+1. **Commit roots must be settled before reset may use them.**  A frozen
+   page map can hold tuples from transactions in progress at the commit;
+   if they commit later, resetting to that root would show their rows.  A
+   commit's root is settled by removing what its MVCC snapshot cannot see
+   and freezing the rest: O(changed pages) per commit, not O(data).  An
+   unsettled root is never a reset target; reset uses the nearest settled
+   root plus replay, which stays correct.
+2. **Each branch has its own identity inside Postgres.**  Shared buffers,
+   catalogs and WAL name pages by (database, relation file, block), so two
+   branches cannot share those names.  One database per branch, created by
+   copying page-map roots, gives that: catalogs (and so DDL) per branch,
+   sessions connect to their branch's database, buffers and WAL unchanged.
+   Branches share the cluster's transaction ids and commit log, so pages
+   shared between branches stay valid.
+3. **A storage manager backed by the page store** resolves (relation,
+   fork, block) through the branch's page map and writes copy-on-write;
+   recovery replays WAL into the page store.  Core Postgres has no
+   pluggable storage manager API; the fork adds one.
+
+**What it costs.**  Every page write also updates the branch's page map
+(O(log n)); that overhead against plain Postgres is the first thing to
+measure.  Each settled root kept in the window costs the pages changed
+since the previous one, the same as a keyframe, so the retention policy
+still applies; without a root, reset falls back to replay.  It is the
+largest component so far: storage manager, buffer manager and recovery.
 
 ## Evidence so far
 
@@ -203,15 +259,21 @@ verified.
   workload.
 - Checkpoints dominate.  The same 2,000-row tail took ~45 ms at 200k rows
   and ~114 ms at 10M: partly the taller tree, mostly the SQL decoding
-  function re-reading WAL from the slot's restart point on every call.  A
-  persistent streaming decoder should remove most of it.
+  function re-reading WAL from the slot's restart point on every call.  The
+  persistent streaming decoder (below) removed it.
 
 ## Next
 
-1. **The lifecycle without keyframes:** background and on-demand checkpoints,
-   Dolt commit, checkpoint-then-diff, row-replay checkout under a replication
-   origin; measured in the harness.
-2. **Keyframes and the planner,** with a server-side restore for a fair
-   cost, and a workload matrix (locality, index count, diff size, distance)
-   to find *R*, or show keyframes are not worth keeping.
-3. **Decide on copy-on-write page storage.**
+1. ~~The lifecycle without keyframes~~: built and measured above, with the
+   streaming decoder, commits as of the barrier, and inside-vs-outside
+   window costs.
+2. **Copy-on-write working sets:** a storage manager backed by the page
+   store; branch databases created by copying page-map roots; two sessions
+   writing to two branches concurrently; isolation, crash recovery, and
+   write overhead against stock Postgres.
+3. **Settled commit roots** and reset by swapping roots, measured against
+   replay; with them, the keyframe policy becomes a retention policy for
+   roots.
+4. **Hooking up BranchBench** (on hold): a generic row codec for any
+   table, DDL capture, and the verbs not built yet (rebase, revert,
+   cross-branch reads, stored conflicts).
