@@ -63,5 +63,21 @@ SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT count(*) AS changed FROM dolt_status;
 SELECT dolt_branch('--unprotect', 'main');
 
+-- a soft reset moves only its branch's head, as a commit does, and writes
+-- the refs once, as the transaction ends: a node or a few (a path of the
+-- refs tree), not a path for each entry it changes
+UPDATE rm.t SET v = 'once' WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'to undo')::text) AS committed;
+SELECT dolt_hashof('HEAD~1') AS undo_to \gset
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT value AS refs_written FROM pg_stat_prolly
+WHERE name = 'refs_nodes_written' \gset
+SELECT dolt_reset('--soft', 'HEAD~1');
+SELECT pg_stat_force_next_flush() IS NULL AS flushed \gset
+SELECT value - :refs_written BETWEEN 1 AND 4 AS refs_written_once
+FROM pg_stat_prolly WHERE name = 'refs_nodes_written';
+SELECT dolt_hashof('HEAD') = :'undo_to' AS head_moved;
+SELECT table_name, status FROM dolt_status;
+
 \c contrib_regression
 DROP DATABASE regress_reset_modes;
