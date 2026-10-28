@@ -61,6 +61,8 @@ typedef struct Opts
 	int			bg_ms;			/* background checkpoint every this many ms */
 	int64_t		bg_bytes;		/* ... or once this much WAL is undecoded */
 	int			diffs;
+	bool		sql_decode;		/* decode by SQL function calls, not a stream */
+	int			bg_rows;		/* stream: apply once this many rows are pending */
 	uint64_t	seed;
 } Opts;
 
@@ -83,7 +85,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, 1
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, 5000, 1
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -470,6 +472,51 @@ decode_into_prolly(const char *lsn)
 	free(el.voff);
 	buf_free(&el.arena);
 	return n;
+}
+
+/* Applies an edit list to the working table and empties it; caller holds repo_lock. */
+static size_t
+editlist_apply(EditList *el)
+{
+	size_t		n = el->n;
+
+	for (size_t i = 0; i < el->n; i++)
+	{
+		el->e[i].key = el->arena.data + el->koff[i];
+		el->e[i].klen = 8;
+		el->e[i].val = el->arena.data + el->voff[i];
+	}
+	if (el->n > 0)
+	{
+		PHash		rv = vc_working(&repo);
+
+		CHECK(vc_table_edit(&repo.ctx, &rv, "t", el->e, el->n, &rv) == 0);
+		vc_set_working(&repo, &rv);
+	}
+	el->n = 0;
+	el->arena.len = 0;
+	return n;
+}
+
+/* Moves every edit of src to the end of dst. */
+static void
+editlist_move(EditList *dst, EditList *src)
+{
+	for (size_t i = 0; i < src->n; i++)
+	{
+		px_grow((void **) &dst->e, &dst->cap, dst->n + 1, sizeof(ProllyEdit));
+		dst->koff = px_realloc(dst->koff, dst->cap * sizeof(size_t));
+		dst->voff = px_realloc(dst->voff, dst->cap * sizeof(size_t));
+		dst->koff[dst->n] = dst->arena.len;
+		buf_append(&dst->arena, src->arena.data + src->koff[i], 8);
+		dst->voff[dst->n] = dst->arena.len;
+		buf_append(&dst->arena, src->arena.data + src->voff[i], src->e[i].vlen);
+		dst->e[dst->n].del = src->e[i].del;
+		dst->e[dst->n].vlen = src->e[i].vlen;
+		dst->n++;
+	}
+	src->n = 0;
+	src->arena.len = 0;
 }
 
 /* ------------------------------------------------------------ page sets */
@@ -1377,6 +1424,225 @@ bg_main(void *arg)
 	return NULL;
 }
 
+/* --------------------------------------------------------- stream decoder */
+
+/*
+ * One persistent logical replication stream, owned by its thread.  It
+ * parses committed changes as they arrive, applies them to the working
+ * root in batches (by row count or time: the background checkpoints), and
+ * confirms its position so the slot advances.  A synchronous checkpoint
+ * is a barrier: a logical message with a fresh token, emitted after the
+ * work to include; when the stream reaches it, everything committed before
+ * it is applied, and the waiter is woken.
+ */
+static PGconn *repl;
+static pthread_mutex_t bar_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bar_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t bar_next,
+			bar_seen;
+static size_t bar_rows;			/* rows the last barrier applied */
+
+static uint64_t
+get_be64(const char *p)
+{
+	uint64_t	v = 0;
+
+	for (int i = 0; i < 8; i++)
+		v = v << 8 | (uint8_t) p[i];
+	return v;
+}
+
+static void
+put_be64(char *p, uint64_t v)
+{
+	for (int i = 7; i >= 0; i--, v >>= 8)
+		p[i] = (char) v;
+}
+
+static void
+send_feedback(uint64_t lsn)
+{
+	char		buf[34];
+	struct timespec ts;
+	uint64_t	us;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	us = (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000 -
+		UINT64_C(946684800) * 1000000;	/* since 2000-01-01 */
+	buf[0] = 'r';
+	put_be64(buf + 1, lsn);
+	put_be64(buf + 9, lsn);
+	put_be64(buf + 17, lsn);
+	put_be64(buf + 25, us);
+	buf[33] = 0;
+	CHECK(PQputCopyData(repl, buf, sizeof(buf)) == 1);
+	CHECK(PQflush(repl) == 0);
+}
+
+static void *
+stream_main(void *arg)
+{
+	EditList	txn = {0},
+				pend = {0};
+	uint64_t	commit_lsn = 0,
+				applied_lsn = 0;
+	double		last_apply = now_ms(),
+				last_fb = now_ms();
+	Buf			line = BUF_INIT;
+
+	while (!bg_stop)
+	{
+		char	   *msg;
+		int			len = PQgetCopyData(repl, &msg, 1);
+		bool		apply_now = false;
+		uint64_t	token = 0;
+
+		if (len == 0)
+		{
+			fd_set		rfds;
+			struct timeval tv = {0, 20000};
+
+			FD_ZERO(&rfds);
+			FD_SET(PQsocket(repl), &rfds);
+			select(PQsocket(repl) + 1, &rfds, NULL, NULL, &tv);
+			CHECK(PQconsumeInput(repl) == 1);
+		}
+		else if (len < 0)
+		{
+			fprintf(stderr, "\nstream ended: %s\n", PQerrorMessage(repl));
+			exit(1);
+		}
+		else
+		{
+			if (msg[0] == 'w' && len > 25)
+			{
+				uint64_t	start = get_be64(msg + 1);
+
+				line.len = 0;
+				buf_append(&line, msg + 25, (size_t) len - 25);
+				buf_append_byte(&line, 0);
+				if (strncmp((char *) line.data, "table ", 6) == 0)
+					parse_change((char *) line.data, &txn);
+				else if (strncmp((char *) line.data, "COMMIT", 6) == 0)
+				{
+					editlist_move(&pend, &txn);
+					commit_lsn = start;
+				}
+				else if (strncmp((char *) line.data, "message:", 8) == 0 &&
+						 strstr((char *) line.data, "prefix: prolly-ckpt"))
+				{
+					const char *c = strstr((char *) line.data, "content:");
+
+					token = c ? strtoull(c + 8, NULL, 10) : 0;
+					apply_now = true;
+				}
+			}
+			else if (msg[0] == 'k' && len >= 18 && msg[17])
+				send_feedback(applied_lsn);
+			PQfreemem(msg);
+		}
+
+		if (apply_now || (size_t) pend.n >= (size_t) o.bg_rows ||
+			(pend.n > 0 && now_ms() - last_apply >= o.bg_ms))
+		{
+			double		t = now_ms();
+			size_t		rows;
+
+			pthread_mutex_lock(&repo_lock);
+			rows = editlist_apply(&pend);
+			pthread_mutex_unlock(&repo_lock);
+			applied_lsn = commit_lsn;
+			last_apply = now_ms();
+			if (token == 0 && rows > 0)
+			{
+				double		ms = now_ms() - t;
+
+				bg_stats.count++;
+				bg_stats.rows += rows;
+				bg_stats.ms += ms;
+				if (ms > bg_stats.max_ms)
+					bg_stats.max_ms = ms;
+			}
+			if (token)
+			{
+				pthread_mutex_lock(&bar_mu);
+				bar_seen = token;
+				bar_rows = rows;
+				pthread_cond_broadcast(&bar_cv);
+				pthread_mutex_unlock(&bar_mu);
+			}
+		}
+		if (now_ms() - last_fb >= 1000)
+		{
+			send_feedback(applied_lsn);
+			last_fb = now_ms();
+		}
+	}
+	buf_free(&line);
+	return NULL;
+}
+
+/* Waits until everything committed so far is in the working root. */
+static size_t
+checkpoint(double *ms)
+{
+	double		t = now_ms();
+	size_t		rows;
+
+	if (o.sql_decode)
+	{
+		pthread_mutex_lock(&repo_lock);
+		rows = checkpoint_now(ms);
+		pthread_mutex_unlock(&repo_lock);
+		return rows;
+	}
+	{
+		uint64_t	token;
+		char		tok_s[24];
+		const char *vals[1] = {tok_s};
+
+		pthread_mutex_lock(&bar_mu);
+		token = ++bar_next;
+		pthread_mutex_unlock(&bar_mu);
+		snprintf(tok_s, sizeof(tok_s), "%llu", (unsigned long long) token);
+		PQclear(qp("SELECT pg_logical_emit_message(false, 'prolly-ckpt', $1, true)", 1, vals,
+				   NULL, NULL, 0));
+		pthread_mutex_lock(&bar_mu);
+		while (bar_seen < token)
+			pthread_cond_wait(&bar_cv, &bar_mu);
+		rows = bar_rows;
+		pthread_mutex_unlock(&bar_mu);
+	}
+	*ms = now_ms() - t;
+	return rows;
+}
+
+static void
+start_stream(const char *from_lsn)
+{
+	char		conninfo[512];
+	char		cmd[256];
+	PGresult   *r;
+
+	snprintf(conninfo, sizeof(conninfo), "%s replication=database", o.conninfo);
+	repl = PQconnectdb(conninfo);
+	if (PQstatus(repl) != CONNECTION_OK)
+	{
+		fprintf(stderr, "replication connect: %s", PQerrorMessage(repl));
+		exit(1);
+	}
+	snprintf(cmd, sizeof(cmd),
+			 "START_REPLICATION SLOT prolly LOGICAL %s (\"include-xids\" '0', "
+			 "\"skip-empty-xacts\" '1', \"only-local\" '1')", from_lsn);
+	r = PQexec(repl, cmd);
+	if (PQresultStatus(r) != PGRES_COPY_BOTH)
+	{
+		fprintf(stderr, "START_REPLICATION: %s", PQerrorMessage(repl));
+		exit(1);
+	}
+	PQclear(r);
+}
+
 static void
 life_commit(int seq, const char *branch)
 {
@@ -1387,8 +1653,8 @@ life_commit(int seq, const char *branch)
 	PHash		c;
 	uint32_t	seg;
 
+	tail = checkpoint(&ms);
 	pthread_mutex_lock(&repo_lock);
-	tail = checkpoint_now(&ms);
 	snprintf(msg, sizeof(msg), "%s %d", branch, seq);
 	c = vc_commit(&repo, msg);
 	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
@@ -1425,8 +1691,8 @@ life_diff(const PHash *target)
 				to;
 	int			path;
 
+	tail = checkpoint(&ms);
 	pthread_mutex_lock(&repo_lock);
-	tail = checkpoint_now(&ms);
 	t1 = now_ms();
 	CHECK(vc_commit_load(&repo.ctx, target, &c));
 	from = table_root(&repo.br[repo.cur].working);
@@ -1455,8 +1721,8 @@ life_checkout(const PHash *target, const char *branch)
 				to;
 	int			path;
 
+	tail = checkpoint(&ms);
 	pthread_mutex_lock(&repo_lock);
-	tail = checkpoint_now(&ms);
 	t1 = now_ms();
 	from = table_root(&repo.br[repo.cur].working);
 	if (branch)
@@ -1524,7 +1790,13 @@ run_lifecycle(void)
 	qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
 	snprintf(working_lsn, sizeof(working_lsn), "%s", lsn);
 	CHECK(vc_window_track(&repo, (uint32_t) o.window) == VC_OK);
-	pthread_create(&bg, NULL, bg_main, NULL);
+	if (o.sql_decode)
+		pthread_create(&bg, NULL, bg_main, NULL);
+	else
+	{
+		start_stream(lsn);
+		pthread_create(&bg, NULL, stream_main, NULL);
+	}
 
 	for (int i = 1; i <= o.commits; i++)
 	{
@@ -1578,6 +1850,7 @@ run_lifecycle(void)
 	}
 	bg_stop = true;
 	pthread_join(bg, NULL);
+	printf("# decoding: %s\n", o.sql_decode ? "SQL function per checkpoint" : "persistent stream");
 	printf("# background checkpoints: %llu, %llu rows, mean %.1f ms, max %.1f ms\n",
 		   (unsigned long long) bg_stats.count, (unsigned long long) bg_stats.rows,
 		   bg_stats.count ? bg_stats.ms / (double) bg_stats.count : 0, bg_stats.max_ms);
@@ -1606,7 +1879,8 @@ usage(void)
 			"winbench [--rows N] [--pad B] [--commits N] [--changes N] [--txns N]\n"
 			"         [--window W] [--checkouts N] [--branches N] [--branch-commits N]\n"
 			"         [--verify 0|1|2] [--no-sql] [--reuse] [--no-final-verify] [--seed N]\n"
-			"         [--lifecycle [--bg-ms MS] [--bg-bytes B] [--diffs N]]\n"
+			"         [--lifecycle [--bg-ms MS] [--bg-rows N] [--diffs N]\n"
+			"                      [--sql-decode [--bg-bytes B]]]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -1621,7 +1895,8 @@ main(int argc, char **argv)
 		{"verify", 1, 0, 'v'}, {"no-sql", 0, 0, 'S'}, {"reuse", 0, 0, 'R'},
 		{"seed", 1, 0, 's'}, {"conn", 1, 0, 'C'}, {"pgdata", 1, 0, 'D'},
 		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
-		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'}, {0, 0, 0, 0}
+		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
+		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -1653,6 +1928,8 @@ main(int argc, char **argv)
 			case 'T': o.bg_ms = atoi(optarg); break;
 			case 'Y': o.bg_bytes = atoll(optarg); break;
 			case 'f': o.diffs = atoi(optarg); break;
+			case 'Q': o.sql_decode = true; break;
+			case 'W': o.bg_rows = atoi(optarg); break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -1692,6 +1969,8 @@ main(int argc, char **argv)
 		cs_destroy(cs);
 		PQfinish(rep);
 		PQfinish(dec);
+		if (repl)
+			PQfinish(repl);
 		PQfinish(db);
 		return 0;
 	}
