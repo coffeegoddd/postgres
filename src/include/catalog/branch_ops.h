@@ -69,8 +69,8 @@ typedef struct BranchKeptRelation
  * the commit didn't see may have changed them before), so a restore
  * always gives it new storage; a frozen root's gets the visibility map a
  * frozen root's restore makes (its storage's for the pages unchanged
- * since, but for those its freezing left undecided, and each other page's
- * frozen copy's).
+ * since, but for those its freezing left undecided, which are cleared as
+ * each page changed since is).
  */
 #define BRANCH_KEPT_UNFROZEN	0x01
 #define BRANCH_KEPT_CONCURRENT	0x02
@@ -339,8 +339,8 @@ typedef struct BranchOpsRoutine
 	 * each relation's size, and nothing if none changed since: if one did,
 	 * each gets new storage made of its root (with no free space map, and
 	 * no visibility map but for a frozen root's, whose map is its storage's
-	 * for the pages unchanged since and each changed page's frozen copy's
-	 * for the others), its row the oldest
+	 * for the pages unchanged since, cleared for the others, none of them
+	 * read), its row the oldest
 	 * transaction ids it had then (one unchanged may hold hints, in its
 	 * buffers, true of it alone).  All or none: false, nothing changed,
 	 * if one isn't on the branch with the storage that kept it, its

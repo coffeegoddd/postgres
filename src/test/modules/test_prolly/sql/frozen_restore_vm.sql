@@ -1,10 +1,9 @@
--- A frozen root's pages are all-visible and all-frozen when no dead line
--- pointer is left on them (their all-visible flag set as they are
--- frozen).  A restore of the root, the relation changed since, gives the
+-- A restore of a frozen root, the relation changed since, gives the
 -- restored relation a visibility map: the source's for the pages
--- unchanged since, each changed page's from its frozen copy.  So an
--- index-only scan after the restore reads no heap page that is all
--- frozen, and the map is true of the pages.
+-- unchanged since, cleared for each page changed since (its frozen copy
+-- not read).  An index-only scan after the restore fetches the changed
+-- pages from the heap until VACUUM sets their bits again, and the map is
+-- true of the pages throughout.
 
 SELECT current_database() AS home \gset
 CREATE DATABASE frozen_restore_vm;
@@ -26,33 +25,41 @@ SELECT dolt_commit('-am', 'c2') IS NOT NULL AS committed;
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT count(*) FILTER (WHERE v = 0) AS at_c1 FROM fv.t;
 
--- the map: every page all-visible and all-frozen, and true of them
-SELECT all_visible = pg_relation_size('fv.t') / 8192 AS all_visible,
-	all_frozen = pg_relation_size('fv.t') / 8192 AS all_frozen
-FROM pg_visibility_map_summary('fv.t');
+-- the map: every page changed, so none all-visible or all-frozen
+SELECT all_visible, all_frozen FROM pg_visibility_map_summary('fv.t');
 SELECT count(*) AS not_frozen FROM pg_check_frozen('fv.t');
 SELECT count(*) AS not_visible FROM pg_check_visible('fv.t');
 
--- an index-only scan reads no heap page
+-- an index-only scan fetches each row from the heap.  The pages are the
+-- root's still, shared with it, so a VACUUM leaves them as it leaves any
+-- shared page with nothing to reclaim, bits unset; with
+-- prolly.vacuum_copy_kept_pages it copies them and sets the bits again
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT count(id) FROM fv.t WHERE id <= 5000;
+VACUUM fv.t;
+SELECT all_visible FROM pg_visibility_map_summary('fv.t');
+SET prolly.vacuum_copy_kept_pages = on;
+VACUUM fv.t;
+RESET prolly.vacuum_copy_kept_pages;
+SELECT all_visible = pg_relation_size('fv.t') / 8192 AS all_visible
+FROM pg_visibility_map_summary('fv.t');
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 SELECT count(id) FROM fv.t WHERE id <= 5000;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 -- a root with dead line pointers left (rows updated, not vacuumed, before
--- the commit): those pages not all-visible, the others so; an index-only
--- scan still finds only the commit's rows
+-- the commit), every page changed since: none all-visible; an index-only
+-- scan finds only the commit's rows
 UPDATE fv.t SET v = 2 WHERE id <= 100;
 SELECT dolt_commit('-am', 'c3') IS NOT NULL AS committed;
 UPDATE fv.t SET v = 3;
 SELECT dolt_commit('-am', 'c4') IS NOT NULL AS committed;
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT count(*) FILTER (WHERE v = 2) AS updated, count(*) AS rows FROM fv.t;
-SELECT all_visible < pg_relation_size('fv.t') / 8192 AS some_not_visible,
-	all_visible > 0 AS some_visible
-FROM pg_visibility_map_summary('fv.t');
+SELECT all_visible, all_frozen FROM pg_visibility_map_summary('fv.t');
 SELECT count(*) AS not_frozen FROM pg_check_frozen('fv.t');
 SELECT count(*) AS not_visible FROM pg_check_visible('fv.t');
 SET enable_seqscan = off;
