@@ -531,6 +531,8 @@ tests += {
       't/862_merge_remade_rows.pl',
       't/870_reset_changed_walk.pl',
       't/871_fold_cancel_in_sort.pl',
+      't/872_reset_vm_no_heap_reads.pl',
+      't/873_vm_set_logical_decoding.pl',
       't/876_refs_gets_per_transaction.pl',
       't/877_refs_gets_fresh.pl',
       't/878_refs_memo_carry_error.pl',

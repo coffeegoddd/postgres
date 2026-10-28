@@ -594,11 +594,14 @@ static bool block_listed(const BlockNumber *blocks, uint32 n,
  * unchanged since the root (one src's map calls all-visible held only
  * versions every snapshot sees, so its frozen copy, unchanged too, does),
  * with each page changed since (or past src's length, under the root's)
- * set from its frozen copy: all-visible and all-frozen if its all-visible
- * flag is set (no dead line pointer left, every version frozen), neither
- * otherwise.  Each map page set is logged as an image.  O(the map's pages
- * and the pages changed).  Nothing if k isn't a frozen root of src's (src
- * then gets no map, as before VACUUM).
+ * cleared, its frozen copy not read: a bit left unset is only a heap
+ * fetch for an index-only scan until the next VACUUM sets it (it sets the
+ * map's bits of a shared, all-frozen page without copying the page),
+ * while a heap page read for each changed page would cost a reset
+ * discarding a large working set one cold read a page.  Each map page cleared is logged as
+ * an image.  O(the map's pages and the map's nodes listing the pages
+ * changed); no heap page read.  Nothing if k isn't a frozen root of src's
+ * or src has no map (dst then gets none, as before VACUUM).
  */
 static void
 frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
@@ -608,7 +611,6 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 	BlockNumber nblocks;
 	BlockNumber *blknos = NULL;
 	BlockNumber *all;
-	uint8	   *flags;
 	uint32		since;
 	uint32		n;
 	uint32		m = 0;
@@ -623,7 +625,8 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 		return;
 
 	/* src's map, as it is (its pages written out, looked up alone) */
-	if (smgrexists(src, VISIBILITYMAP_FORKNUM))
+	if (!smgrexists(src, VISIBILITYMAP_FORKNUM))
+		return;
 	{
 		BlockNumber vmblocks = smgrnblocks(src, VISIBILITYMAP_FORKNUM);
 		BlockNumber *vb = palloc_array(BlockNumber, Max(vmblocks, 1));
@@ -657,24 +660,10 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 		all[m++] = b;
 	if (k->nundecided > 0 && m > 1)
 		qsort(all, m, sizeof(BlockNumber), cmp_blocknumber);
-	flags = palloc0_array(uint8, Max(m, 1));
-	for (uint32 i = 0; i < m; i++)
-	{
-		Buffer		buf;
-
-		if (all[i] >= root_nblocks)
-			continue;
-		buf = ReadBufferWithoutRelcache(dst, MAIN_FORKNUM, all[i], RBM_NORMAL,
-										NULL, true);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (!PageIsNew(BufferGetPage(buf)) && PageIsAllVisible(BufferGetPage(buf)))
-			flags[i] = VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN;
-		UnlockReleaseBuffer(buf);
-	}
 
 	/*
-	 * (each map page's bits set under its lock, the page logged once as an
-	 * image after; a page past the map's end is made only for a bit set)
+	 * (each map page's bits cleared under its lock, the page logged once
+	 * as an image after)
 	 */
 	rel = CreateFakeRelcacheEntry(dst);
 	for (uint32 i = 0; i < m; i++)
@@ -683,17 +672,12 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 
 		if (!BufferIsValid(vmbuf) || !visibilitymap_pin_ok(all[i], vmbuf))
 		{
-			if (flags[i] == 0 && !smgrexists(dsrel, VISIBILITYMAP_FORKNUM))
-				continue;
 			visibilitymap_pin(rel, all[i], &vmbuf);
 			LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
 			START_CRIT_SECTION();
 		}
-		if (flags[i] != 0)
-			(void) visibilitymap_set(all[i], vmbuf, flags[i], dst);
-		else
-			(void) visibilitymap_clear(dst, all[i], vmbuf,
-									   VISIBILITYMAP_VALID_BITS);
+		(void) visibilitymap_clear(dst, all[i], vmbuf,
+								   VISIBILITYMAP_VALID_BITS);
 		last = i + 1 == m || !visibilitymap_pin_ok(all[i + 1], vmbuf);
 		if (last)
 		{
@@ -709,7 +693,6 @@ frozen_root_maps(Form_pg_class c, const BranchKeptRelation *k,
 	if (blknos)
 		pfree(blknos);
 	pfree(all);
-	pfree(flags);
 }
 
 /*

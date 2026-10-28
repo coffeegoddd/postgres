@@ -472,6 +472,7 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
 		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
 		case XLOG_HEAP2_LOCK_UPDATED:
+		case XLOG_HEAP2_VM_SET:
 			break;
 		default:
 			elog(ERROR, "unexpected RM_HEAP2_ID record type: %u", info);

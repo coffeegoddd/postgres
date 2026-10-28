@@ -3,12 +3,12 @@
 # A commit's roots captured among writers (dolt.transaction_commit) are
 # kept unfrozen, and frozen on a move to the commit, as of its snapshot.
 # A restore of them then gives the table a visibility map whose bits come
-# from the frozen pages' all-visible flags, so those flags must be the
-# freezer's own: a page holding a version of a transaction in progress at
-# the capture (made dead by the freezing, its index entry still there)
-# is never flagged all-visible, nor does a page keep the live page's
-# flag.  So an index-only scan doesn't take the in-progress row for one
-# of the commit's, and the map is true of the pages.
+# from the live table's map, cleared for every page changed since the
+# capture and every page the freezing left undecided: a page holding a
+# version of a transaction in progress at the capture (made dead by the
+# freezing, its index entry still there) never keeps a bit the live
+# page's map had.  So an index-only scan doesn't take the in-progress row
+# for one of the commit's, and the map is true of the pages.
 
 use strict;
 use warnings FATAL => 'all';
@@ -75,8 +75,10 @@ like(sql(q{SET enable_seqscan = off; SET enable_bitmapscan = off;
 	EXPLAIN (COSTS OFF) SELECT count(*) FROM lv.t WHERE v = 777}), qr/Index Only Scan/,
 	'read by an index-only scan');
 is(sql($ios), '0', 'which takes none of the writer\'s rows for the commit\'s');
-ok(sql(q{SELECT all_visible FROM pg_visibility_map_summary('lv.t')}) > 0,
-	'the table has a visibility map');
+# (every page was changed by the commit's own update before the capture,
+# its live map bit cleared then, so none is claimed all-visible)
+is(sql(q{SELECT all_visible FROM pg_visibility_map_summary('lv.t')}), '0',
+	'the map claims no page all-visible');
 is(sql($clean), '0', 'true of the pages');
 
 $node->stop;

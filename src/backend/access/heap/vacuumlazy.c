@@ -131,6 +131,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/tidstore.h"
@@ -447,6 +448,9 @@ static int	lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 							BlockNumber blkno, Page page,
 							Buffer vmbuffer,
 							bool *has_lpdead_items, bool *vm_page_frozen);
+static void lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf,
+								BlockNumber blkno, Page page,
+								Buffer vmbuffer);
 static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 							  BlockNumber blkno, Page page,
 							  bool *has_lpdead_items);
@@ -1536,6 +1540,8 @@ lazy_scan_heap(LVRelState *vacrel)
 		 */
 		if (left_shared)
 		{
+			if (!has_lpdead_items)
+				lazy_scan_shared_vm(vacrel, buf, blkno, page, vmbuffer);
 			vacrel->shared_pages++;
 			if (was_eager_scanned && vacrel->eager_scan_remaining_fails > 0)
 				vacrel->eager_scan_remaining_fails--;
@@ -2257,6 +2263,75 @@ lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 			return true;
 	}
 	return false;
+}
+
+/*
+ *	lazy_scan_shared_vm() -- set the map's bits of a shared page left as it is
+ *
+ * A page another relation shares, left as it is (nothing on it to reclaim),
+ * still gets its visibility map bits when it is all-visible and every tuple
+ * on it frozen, as a restored frozen root's pages are: the heap page itself
+ * isn't changed (that would copy it), only its map page.  The page must
+ * already say it is all-visible (PD_ALL_VISIBLE), since a writer clears the
+ * map's bit only of a page that says so.  Only an all-frozen page is set:
+ * the change is logged as a record of the map page alone
+ * (XLOG_HEAP2_VM_SET, a few bytes but for the map page's first image after
+ * a checkpoint), which carries no conflict horizon for a standby's
+ * queries, and a frozen page's versions are visible to every snapshot, a
+ * standby's too.  The caller holds buf's cleanup lock, so no writer clears
+ * the page's flag until the bits are set.
+ */
+static void
+lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
+					Page page, Buffer vmbuffer)
+{
+	bool		all_frozen;
+	TransactionId newest_live_xid;
+	const uint8 flags = VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN;
+	uint8		old;
+
+	if (PageIsNew(page) || PageIsEmpty(page) || !PageIsAllVisible(page))
+		return;
+	if (VM_ALL_FROZEN(vacrel->rel, blkno, &vmbuffer))
+		return;
+	if (!heap_page_would_be_all_visible(vacrel->rel, buf, vacrel->vistest,
+										true, NULL, 0, &all_frozen,
+										&newest_live_xid, &vacrel->offnum) ||
+		!all_frozen)
+	{
+		vacrel->offnum = InvalidOffsetNumber;
+		return;
+	}
+	vacrel->offnum = InvalidOffsetNumber;
+
+	LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+	START_CRIT_SECTION();
+	old = visibilitymap_set(blkno, vmbuffer, flags, vacrel->rel->rd_locator);
+	MarkBufferDirty(vmbuffer);
+	if (RelationNeedsWAL(vacrel->rel))
+	{
+		xl_heap_vm_set xlrec;
+		XLogRecPtr	recptr;
+
+		xlrec.heap_blkno = blkno;
+		xlrec.flags = flags;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfHeapVmSet);
+		/* (a map page's contents lie past pd_lower: not a standard page) */
+		XLogRegisterBuffer(0, vmbuffer, 0);
+		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VM_SET);
+		PageSetLSN(BufferGetPage(vmbuffer), recptr);
+	}
+	END_CRIT_SECTION();
+	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+
+	if ((old & VISIBILITYMAP_ALL_VISIBLE) == 0)
+	{
+		vacrel->new_all_visible_pages++;
+		vacrel->new_all_visible_all_frozen_pages++;
+	}
+	else
+		vacrel->new_all_frozen_pages++;
 }
 
 /*
