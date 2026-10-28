@@ -3,7 +3,7 @@
 # The chunk store's table files and manifest: a standby's are the
 # primary's byte for byte; a crash keeps the files the manifest names; a
 # writer that fails before its manifest leaves no file named, and the next
-# one writes over what it left; recovery stopped at every record boundary
+# one removes what it left, under an id never given again; recovery stopped at every record boundary
 # has the files of the last manifest before it; a base backup restores
 # them.
 
@@ -89,8 +89,10 @@ SKIP:
 	is(sql($named), $manifests[3], 'its file isn\'t named');
 	is(has('e1'), 'f', 'nor its chunk found');
 	sql(q{SELECT test_chunk_table_file(ARRAY['e2'::bytea])});
-	is(sql($named), 'prolly_table_0000000000000004:43 prolly_table_0000000000000005:1',
-		'the next writer writes over what it left');
+	# (the id the failed writer's file had isn't given again: redo of its
+	# removal, after a crash, would remove a file made again under it)
+	is(sql($named), 'prolly_table_0000000000000004:43 prolly_table_0000000000000006:1',
+		'the next writer removes what it left, its own file under a new id');
 }
 
 # Conjoins and checkpoints, readers and failures, at their awkward moments.

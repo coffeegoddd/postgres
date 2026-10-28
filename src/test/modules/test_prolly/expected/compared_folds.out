@@ -25,6 +25,15 @@ SELECT length(dolt_commit('-am', 'second')::text) > 0 AS committed;
  t
 (1 row)
 
+-- (refs of more than one level, as a database with more branches has
+-- them: a reset's refs entries are written together, a path of the tree
+-- for all of them, so they stay a handful however deep the refs are)
+SELECT count(dolt_branch('pad' || g)) AS padded FROM generate_series(1, 100) g;
+ padded 
+--------
+    100
+(1 row)
+
 -- since(counter): pg_stat_prolly's counter's growth since it was last
 -- asked, the session's counts flushed first (:flush, a statement of its
 -- own).
