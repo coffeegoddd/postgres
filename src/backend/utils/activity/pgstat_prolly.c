@@ -188,6 +188,9 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_KEPT_ENTRIES_READ] = "kept_entries_read",
 	[PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN] = "kept_entries_written",
 	[PGSTAT_PROLLY_RESTORES_FOLD_CANCELS] = "restores_fold_cancels",
+	[PGSTAT_PROLLY_GC_CHUNKS_READ] = "gc_chunks_read",
+	[PGSTAT_PROLLY_GC_XREFS_READ] = "gc_xrefs_read",
+	[PGSTAT_PROLLY_CHUNK_INDEX_PROBES] = "chunk_index_probes",
 };
 
 /*

@@ -188,7 +188,10 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned',
  kept_entries_read             |     4
  kept_entries_written          |     1
  restores_fold_cancels         |     0
-(130 rows)
+ gc_chunks_read                |     0
+ gc_xrefs_read                 |     0
+ chunk_index_probes            |     0
+(133 rows)
 
 -- The chunks' bytes: chunks hold object ids in a variable-length form,
 -- so their length moves by a few bytes with the ids a cluster has

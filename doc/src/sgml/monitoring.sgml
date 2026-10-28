@@ -5790,6 +5790,14 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        collections read for the hash pointers their pages hold: only those
        of the ranges written since the last collection, or every block
        after a restart);
+       <literal>gc_chunks_read</literal> (chunks collections read to mark
+       what they name: from the files they collect, and a retire's from the
+       settled files it reads through);
+       <literal>gc_xrefs_read</literal> (entries of settled table files'
+       cross-generation sections that retires read);
+       <literal>chunk_index_probes</literal> (table files' indexes that
+       lookups of a chunk probed, each file whose index a lookup reads
+       counting once: reads, collections and recording alike);
        <literal>commits_read</literal> (commits read from the chunk store, as
        walks of history and <function>dolt_serve_since</function> read
        them);

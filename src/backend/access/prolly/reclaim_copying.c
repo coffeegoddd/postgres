@@ -86,6 +86,7 @@
 #include "access/prolly_window.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "replication/slot.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
@@ -450,6 +451,7 @@ note_cut(const ProllyHash *boundary, const ProllyHash *parent, void *arg)
 			!PROLLY_CALL(format, open, (const uint8 *) data.data, data.len,
 						 &node))
 			continue;
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_READ, 1);
 		if (node.level > 0)
 		{
 			cb->children = NIL;
@@ -514,6 +516,7 @@ drain(Mark *mk)
 	{
 		resetStringInfo(&mk->buf);
 		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_READ, 1);
 		mark_named_cut(mk, mk->buf.data, mk->buf.len, cut_of_slot(mk, slot));
 
 		/* (a chunk read costs as a page missed, where a delay is active) */
@@ -534,7 +537,10 @@ mark_new(const ProllyHash *hash, const char *data, Size len, void *arg)
 	if (data == NULL)
 		mark_hash(mk, hash);
 	else
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_READ, 1);
 		mark_named_cut(mk, data, len, cut_of_hash(mk, hash));
+	}
 }
 
 static void
@@ -756,6 +762,7 @@ mark_refs_tree(Mark *mk, const ProllyHash *root, bool retire)
 		else if (!retire ||
 				 !PROLLY_CALL(mk->cs, gc_read_any, mk->gc, &key, &data))
 			continue;
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_READ, 1);
 
 		/*
 		 * (an internal node's children are the tree's nodes; a leaf's

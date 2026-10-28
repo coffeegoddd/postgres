@@ -862,9 +862,16 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_RESTORES_FOLD_CANCELS,	/* folds of the fold worker's a
 											 * restore asked to give up,
 											 * holding a lock it needed */
+	PGSTAT_PROLLY_GC_CHUNKS_READ,	/* chunks collections read to mark what
+									 * they name */
+	PGSTAT_PROLLY_GC_XREFS_READ,	/* entries of settled files' sections
+									 * retires read */
+	PGSTAT_PROLLY_CHUNK_INDEX_PROBES,	/* table files' indexes chunk
+										 * lookups probed, each file once a
+										 * lookup */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RESTORES_FOLD_CANCELS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_CHUNK_INDEX_PROBES + 1)
 
 typedef struct PgStat_ProllyStats
 {

@@ -2819,6 +2819,9 @@ reserve_pending(ProllyChunkStore *s, Append *a, int *pad_at)
 }
 
 static const ProllyTableFileRoutine *table_format(void);
+static bool tf_find(ProllyTableFile *tf, const ProllyHash *hash,
+					uint64 *offset, uint32 *len);
+static int	tf_locate(ProllyTableFile *tf, const ProllyHash *hash);
 
 static int
 pending_hash_cmp(const void *a, const void *b)
@@ -2877,7 +2880,7 @@ stored_at(ProllyChunkStore *s, const ProllyHash *key, FoundChunk *f)
 		{
 			TableFile  *t = lfirst(lc);
 
-			if (PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			if (tf_find(t->tf, key, &offset, &len))
 			{
 				f->settled = t->settled;
 				return true;
@@ -3023,7 +3026,7 @@ again:
 			uint32		len;
 
 			if (!stored[i] &&
-				PROLLY_CALL(table_format(), find, t->tf, &es[i]->hash, &offset, &len))
+				tf_find(t->tf, &es[i]->hash, &offset, &len))
 			{
 				stored[i] = true;
 				found[i].settled = t->settled;
@@ -3385,6 +3388,27 @@ table_format(void)
 	if (fmt == NULL)
 		fmt = prolly_tablefile_lookup(TABLE_FILE_FORMAT);
 	return fmt;
+}
+
+/*
+ * A chunk looked up in one table file's index (its filter first): where
+ * it is, or its place among the file's chunks (-1: not there).  Each is a
+ * probe of that file's index, counted (chunk_index_probes), so that what
+ * a lookup costs in the number of files is seen.
+ */
+static bool
+tf_find(ProllyTableFile *tf, const ProllyHash *hash, uint64 *offset,
+		uint32 *len)
+{
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_INDEX_PROBES, 1);
+	return PROLLY_CALL(table_format(), find, tf, hash, offset, len);
+}
+
+static int
+tf_locate(ProllyTableFile *tf, const ProllyHash *hash)
+{
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_INDEX_PROBES, 1);
+	return PROLLY_CALL(table_format(), locate, tf, hash);
 }
 
 static JournalShared *
@@ -4260,7 +4284,7 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			char	   *bytes;
 			ssize_t		n;
 
-			if (!PROLLY_CALL(table_format(), find, t->tf, hash, &offset, &len))
+			if (!tf_find(t->tf, hash, &offset, &len))
 				continue;
 			if (out == NULL)
 				return true;
@@ -4554,6 +4578,38 @@ xrefs_visit(const XrefSection *x, uint32 lo, uint32 hi, XrefVisit visit,
 			visit(&target, &source, x->epochs[i], arg);
 		}
 	}
+}
+
+/*
+ * xrefs_visit(), the entries visited counted (gc_xrefs_read): a retire's
+ * reads of the sections of the files it doesn't collect, and of those it
+ * drops.
+ */
+typedef struct XrefCounted
+{
+	XrefVisit	visit;
+	void	   *arg;
+	int64		n;
+} XrefCounted;
+
+static void
+xref_counted(const ProllyHash *target, const ProllyHash *source, uint32 epoch,
+			 void *arg)
+{
+	XrefCounted *xc = arg;
+
+	xc->n++;
+	xc->visit(target, source, epoch, xc->arg);
+}
+
+static void
+xrefs_visit_counted(const XrefSection *x, uint32 lo, uint32 hi,
+					XrefVisit visit, void *arg)
+{
+	XrefCounted xc = {visit, arg, 0};
+
+	xrefs_visit(x, lo, hi, xref_counted, &xc);
+	pgstat_count_prolly(PGSTAT_PROLLY_GC_XREFS_READ, xc.n);
 }
 
 /* Visit the nodes of the refs tree a section's refs pairs name targets from. */
@@ -5714,7 +5770,7 @@ many_locate(ProllyChunkStore *s, const ProllyHash *key, ManyRead *r)
 	{
 		TableFile  *t = lfirst(lc);
 
-		if (PROLLY_CALL(table_format(), find, t->tf, key, &r->offset, &r->len))
+		if (tf_find(t->tf, key, &r->offset, &r->len))
 		{
 			r->g = NULL;
 			r->t = t;
@@ -7403,7 +7459,7 @@ unsettled_has(ProllyChunkStore *s, const ProllyHash *key)
 		uint32		len;
 
 		if (!t->settled &&
-			PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			tf_find(t->tf, key, &offset, &len))
 			return true;
 	}
 	return false;
@@ -7428,7 +7484,7 @@ settled_file(ProllyChunkStore *s, const Manifest *m, const ProllyHash *key)
 
 		if (!t->settled ||
 			(oldest >= 0 && t->epoch_lo >= m->files[oldest].epoch_lo) ||
-			!PROLLY_CALL(table_format(), find, t->tf, key, &offset, &len))
+			!tf_find(t->tf, key, &offset, &len))
 			continue;
 		for (int i = 0; i < m->nfiles; i++)
 		{
@@ -8052,7 +8108,7 @@ journal_received_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out
 		uint64		offset;
 		uint32		len;
 
-		if (!PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+		if (!tf_find(t->tf, &key, &offset, &len))
 			continue;
 		if (out)
 			table_chunk(t, offset, len, false, out);
@@ -8406,7 +8462,7 @@ conjoin_resolve(void *arg, const ProllyHash *target, bool *always)
 	{
 		TableFile  *t = lfirst(lc);
 
-		if (PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+		if (tf_find(t->tf, &key, &offset, &len))
 			return 0;
 	}
 	for (int i = 0; i < cs->m->nfiles; i++)
@@ -8417,7 +8473,7 @@ conjoin_resolve(void *arg, const ProllyHash *target, bool *always)
 			continue;
 		t = cs->others[i];
 		if (t != NULL &&
-			PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			tf_find(t->tf, &key, &offset, &len))
 			return cs->m->files[i].epoch_lo;
 	}
 	/* (gone: what the file the chunk comes from listed it as, if it did) */
@@ -8927,6 +8983,7 @@ verify_ref(const ProllyHash *ref, void *arg)
 		uint64		offset;
 		uint32		len;
 
+		/* (a check's lookups, not the store's work: not counted) */
 		if (!PROLLY_CALL(table_format(), find, f->t->tf, &key, &offset, &len))
 			continue;
 		/* (in its own generations: nothing to list) */
@@ -9103,7 +9160,7 @@ journal_epoch_of(ProllyChunkStore *s, const ProllyHash *hash)
 		uint32		len;
 
 		if (t->settled && (epoch == 0 || t->epoch_lo < epoch) &&
-			PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			tf_find(t->tf, &key, &offset, &len))
 			epoch = t->epoch_lo;
 	}
 	return epoch;
@@ -9169,7 +9226,7 @@ journal_note_garbage(ProllyChunkStore *s, const ProllyHash *hashes, int n)
 			uint32		len;
 
 			probes++;
-			if (PROLLY_CALL(table_format(), find, ts[i]->tf, &key, &offset,
+			if (tf_find(ts[i]->tf, &key, &offset,
 							&len))
 			{
 				counts[i]++;
@@ -10311,7 +10368,7 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 		CHECK_FOR_INTERRUPTS();
 		if (gc->others_hi[i] < gc->retire_lo || !xrefs_read(gc->others[i], &x))
 			continue;
-		xrefs_visit(&x, gc->retire_lo, gc->retire_hi, visit, arg);
+		xrefs_visit_counted(&x, gc->retire_lo, gc->retire_hi, visit, arg);
 
 		/*
 		 * (and what it lists older, read already: not lost when what the
@@ -10332,8 +10389,8 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 											   HASH_ELEM | HASH_FUNCTION |
 											   HASH_CONTEXT);
 			}
-			xrefs_visit(&x, 1, gc->retire_lo - 1, note_lost_ref,
-						gc->listed_older);
+			xrefs_visit_counted(&x, 1, gc->retire_lo - 1, note_lost_ref,
+								gc->listed_older);
 		}
 		xrefs_free(&x);
 	}
@@ -10372,6 +10429,7 @@ journal_gc_inbound(ProllyChunkGc *gc, ProllyChunkListedVisit visit, void *arg)
 			resetStringInfo(&chunk);
 			PROLLY_CALL(fmt, decode, t->tf, bytes.data, len, &chunk);
 			rn.source = h;
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_READ, 1);
 			prolly_chunk_references(chunk.data, chunk.len, repaired_name, &rn);
 		}
 		pfree(bytes.data);
@@ -10402,7 +10460,7 @@ journal_gc_read_any(ProllyChunkGc *gc, const ProllyHash *hash, StringInfo out)
 		uint32		len;
 		char	   *bytes;
 
-		if (!PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+		if (!tf_find(t->tf, &key, &offset, &len))
 			continue;
 		bytes = palloc(len);
 		if (!table_file_read(t, offset, bytes, len))
@@ -10511,7 +10569,7 @@ journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash)
 			if (f->segment || !f->settled ||
 				(oldest >= 0 && f->epoch_lo >= oldest_lo))
 				continue;
-			at = PROLLY_CALL(table_format(), locate, f->t->tf, &key);
+			at = tf_locate(f->t->tf, &key);
 			if (at >= 0)
 			{
 				oldest = f->first + at;
@@ -10531,7 +10589,7 @@ journal_gc_find(ProllyChunkGc *gc, const ProllyHash *hash)
 
 		if (f->segment || ((gc->full || gc->retire_lo > 0) && f->settled))
 			continue;
-		at = PROLLY_CALL(table_format(), locate, f->t->tf, &key);
+		at = tf_locate(f->t->tf, &key);
 		if (at >= 0)
 			return f->first + at;
 	}
@@ -10565,7 +10623,7 @@ journal_gc_find_in(ProllyChunkGc *gc, const ProllyHash *hash, uint32 epoch)
 		if (f->segment || !f->settled || epoch < f->epoch_lo ||
 			epoch > f->epoch_hi)
 			continue;
-		at = PROLLY_CALL(table_format(), locate, f->t->tf, &key);
+		at = tf_locate(f->t->tf, &key);
 		if (at >= 0)
 			return f->first + at;
 	}
@@ -11154,7 +11212,7 @@ slot_holds(ProllyChunkGc *gc, GcFile *f, uint64 slot, const ProllyHash *hash)
 
 		return e != NULL && e->slot == slot;
 	}
-	return PROLLY_CALL(table_format(), locate, f->t->tf, &key) ==
+	return tf_locate(f->t->tf, &key) ==
 		(int) (slot - f->first);
 }
 
@@ -11256,7 +11314,7 @@ gc_resolve(void *arg, const ProllyHash *target, bool *always)
 		uint64		offset;
 		uint32		len;
 
-		if (PROLLY_CALL(table_format(), find, gc->others[i]->tf, &key,
+		if (tf_find(gc->others[i]->tf, &key,
 						&offset, &len))
 			return gc->others_lo[i];
 	}
@@ -11534,7 +11592,7 @@ retire_lost_refs(ProllyChunkGc *gc, const bool *keep)
 		if (keep[j] || gc->files[j].segment || !gc->files[j].settled ||
 			gc->files[j].t == NULL || !xrefs_read(gc->files[j].t, &x))
 			continue;
-		xrefs_visit(&x, 1, gc->retire_lo - 1, note_lost_ref, lost);
+		xrefs_visit_counted(&x, 1, gc->retire_lo - 1, note_lost_ref, lost);
 		xrefs_free(&x);
 	}
 	if (gc->listed_older != NULL)
@@ -11561,7 +11619,7 @@ retire_lost_refs(ProllyChunkGc *gc, const bool *keep)
 			continue;
 		if (xrefs_read(t, &x))
 		{
-			xrefs_visit(&x, 1, gc->retire_lo - 1, drop_lost_ref, lost);
+			xrefs_visit_counted(&x, 1, gc->retire_lo - 1, drop_lost_ref, lost);
 			xrefs_free(&x);
 		}
 		close_table(t);
@@ -11576,7 +11634,7 @@ retire_lost_refs(ProllyChunkGc *gc, const bool *keep)
 			uint32		len;
 
 			if (lr->epoch < gc->others_lo[i] || lr->epoch > gc->others_hi[i] ||
-				!PROLLY_CALL(table_format(), find, gc->others[i]->tf,
+				!tf_find(gc->others[i]->tf,
 							 &lr->target, &offset, &len))
 				continue;
 			if (gc->lost == NULL)
