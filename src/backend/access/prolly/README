@@ -386,7 +386,27 @@ it can't alter in place).  Its storage is a file of its own; a relation
 cache entry of that OID, of another branch's relation or of the one just
 dropped, is forgotten first (RelationForgetForNewRelation()), and where it
 can't be (open) or the branch has a relation of that OID, the table is a
-new relation.  A branch's copies keep their OIDs, so a table is the same
+new relation.  A table so made is every relation it was: its TOAST table
+and that one's index, its change log and that one's index, and its
+indexes are each made as the relation another branch that has the table
+has (branch operations' family(), asked by heap_create_with_catalog()
+and index_create()), each only where its OID is free here, and an index
+only where it is defined alike (an OID names one definition on every
+branch).  So the table's kept roots, which name its relations by OID,
+serve it after: a hard reset bringing a dropped table back gives it the
+pages another branch keeps as of the commit before writing its rows (the
+refs' pages_for_made(), from the move's rows step; its secondary indexes
+made first, on its empty storage, where those pages are kept, as the
+refs' pages_kept_for() says, and after its rows otherwise), and writes
+none; and a later reset to another kept commit gives back that commit's
+pages.  (Not under wal_level minimal, where a relation made in the
+transaction skips WAL until it commits: its rows are written.)  Only a
+table the branch had none of as the move began is brought back so: one
+the move itself drops and makes again (a definition it can't alter in
+place, a conflict resolved with theirs) keeps only its own OID, its other
+relations new, so that the fold of the move's rows step reads them as the
+new, empty relations they are, not as those the baseline knows, which
+held the rows.  A branch's copies keep their OIDs, so a table is the same
 relation on every branch that has it from the same making.
 
 A table is its relation and its name together.  Two relations of one name

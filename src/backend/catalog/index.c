@@ -27,6 +27,7 @@
 #include "access/attmap.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/prolly_canon.h"
 #include "access/prolly_keying.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -679,6 +680,73 @@ UpdateIndexRelation(Oid indexoid,
 
 
 /*
+ * Does pg_index row row define the index UpdateIndexRelation() would
+ * record for these (but its OID and state)?  (Only so that an OID keeps
+ * naming one definition: the guard on pages is the branch operations'
+ * share, which compares the two branches' rows again before it gives any.)
+ */
+static bool
+index_row_alike(HeapTuple row, Oid heapoid, const IndexInfo *indexInfo,
+				const Oid *collationOids, const Oid *opclassOids,
+				const int16 *coloptions, bool primary, bool isexclusion)
+{
+	Form_pg_index f = (Form_pg_index) GETSTRUCT(row);
+	Relation	pg_index = table_open(IndexRelationId, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(pg_index);
+	char	   *exprs = indexInfo->ii_Expressions != NIL ?
+		nodeToString(indexInfo->ii_Expressions) : NULL;
+	char	   *pred = indexInfo->ii_Predicate != NIL ?
+		nodeToString(make_ands_explicit(indexInfo->ii_Predicate)) : NULL;
+	bool		isnull;
+	Datum		d;
+	bool		alike;
+
+	alike = f->indrelid == heapoid &&
+		f->indnatts == indexInfo->ii_NumIndexAttrs &&
+		f->indnkeyatts == indexInfo->ii_NumIndexKeyAttrs &&
+		f->indisunique == indexInfo->ii_Unique &&
+		f->indnullsnotdistinct == indexInfo->ii_NullsNotDistinct &&
+		f->indisprimary == primary && f->indisexclusion == isexclusion &&
+		f->indkey.dim1 == indexInfo->ii_NumIndexAttrs;
+	for (int i = 0; alike && i < indexInfo->ii_NumIndexAttrs; i++)
+		alike = f->indkey.values[i] == indexInfo->ii_IndexAttrNumbers[i];
+	if (alike)
+	{
+		oidvector  *collation;
+		oidvector  *opclass;
+		int2vector *option;
+
+		d = heap_getattr(row, Anum_pg_index_indcollation, desc, &isnull);
+		collation = (oidvector *) DatumGetPointer(d);
+		d = heap_getattr(row, Anum_pg_index_indclass, desc, &isnull);
+		opclass = (oidvector *) DatumGetPointer(d);
+		d = heap_getattr(row, Anum_pg_index_indoption, desc, &isnull);
+		option = (int2vector *) DatumGetPointer(d);
+		alike = collation->dim1 == indexInfo->ii_NumIndexKeyAttrs &&
+			opclass->dim1 == indexInfo->ii_NumIndexKeyAttrs &&
+			option->dim1 == indexInfo->ii_NumIndexKeyAttrs;
+		for (int i = 0; alike && i < indexInfo->ii_NumIndexKeyAttrs; i++)
+			alike = collation->values[i] == collationOids[i] &&
+				opclass->values[i] == opclassOids[i] &&
+				option->values[i] == coloptions[i];
+	}
+	if (alike)
+	{
+		d = heap_getattr(row, Anum_pg_index_indexprs, desc, &isnull);
+		alike = isnull ? exprs == NULL :
+			exprs != NULL && strcmp(TextDatumGetCString(d), exprs) == 0;
+	}
+	if (alike)
+	{
+		d = heap_getattr(row, Anum_pg_index_indpred, desc, &isnull);
+		alike = isnull ? pred == NULL :
+			pred != NULL && strcmp(TextDatumGetCString(d), pred) == 0;
+	}
+	table_close(pg_index, AccessShareLock);
+	return alike;
+}
+
+/*
  * index_create
  *
  * heapRelation: table to build index on (suitably locked by caller)
@@ -977,8 +1045,32 @@ index_create(Relation heapRelation,
 		}
 		else
 		{
-			indexRelationId =
-				GetNewRelFileNumber(tableSpaceId, pg_class, relpersistence);
+			HeapTuple	kept_row;
+			Oid			kept_am;
+
+			/*
+			 * (an index of a versioned table a move makes again is the
+			 * relation it was, if defined as that one is, its storage a
+			 * file of its own)
+			 */
+			indexRelationId = prolly_move_kept_index(indexRelationName,
+													 namespaceId, &kept_row,
+													 &kept_am);
+			if (OidIsValid(indexRelationId) &&
+				!(kept_am == accessMethodId &&
+				  index_row_alike(kept_row, heapRelationId, indexInfo,
+								  collationIds, opclassIds, coloptions,
+								  isprimary, is_exclusion)))
+				indexRelationId = InvalidOid;
+			if (OidIsValid(indexRelationId))
+			{
+				if (!RelFileNumberIsValid(relFileNumber))
+					relFileNumber = GetNewRelFileNumber(tableSpaceId, pg_class,
+														relpersistence);
+			}
+			else
+				indexRelationId =
+					GetNewRelFileNumber(tableSpaceId, pg_class, relpersistence);
 		}
 	}
 
