@@ -128,10 +128,12 @@ $s->(q{UPDATE app.t SET v = 5 WHERE id <= 100});
 my $s1 = $s->(q{SELECT (dolt_commit('-am', 's1'))[1]});
 my $at_s1 = $s->($digest);
 $s->(q{UPDATE app.t SET v = 6 WHERE id <= 200});
-my $shared = counted('move_tables_shared');
+my $shared = counted('move_tables_shared') + counted('relations_restored');
+$applied = counted('apply_rows');
 $s->(qq{SELECT dolt_reset('--hard', '$a')});
-cmp_ok(counted('move_tables_shared'), '>', $shared,
-	's given main\'s kept pages of a');
+cmp_ok(counted('move_tables_shared') + counted('relations_restored'), '>',
+	$shared, 's given main\'s kept pages of a, shared or restored');
+is(counted('apply_rows') - $applied, 0, 'no row written');
 is($s->($digest), $at_a, 'a\'s rows on s');
 $s->(q{UPDATE app.t SET v = 7 WHERE id <= 200});
 $restored = counted('relations_restored');
