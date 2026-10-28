@@ -523,6 +523,66 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V10 --config s
 src/tools/prolly_bench/prolly_bench vclean G/*-V-prolly --markdown cleanup.md
 ```
 
+### Generational retires (V11)
+
+`configs/v_generations.toml` runs V11: the chunk store's generational
+table files under steady churn, at 1 and 10 logical GB of a
+vc_bench-shaped table (an int64 key, an int64 revision, 1,024 bytes of
+row-specific payload).  After the base load is committed and collected,
+each cycle updates `churn` rows spread over the keys, commits, runs a
+default collection (a new generation), severs all but the newest
+`window_cycles` commits in delete mode (`dolt_history_drop()`), and
+retires the generations the reclamation chooses.  Warm-up cycles come
+first, enough for `warm_severs` (10) severs that cut history before the
+measured ones; then `sweep_cycles` cycles at each `sweep` churn.  At the
+end, on the store as the cycles left it: point reads, a conjoin of the
+table files (to `conjoin_files`) and point reads again; then a full
+collection, which frees the garbage the retires left.
+
+Per cycle (`v11-cycles.jsonl`):
+- the update's, commit's, default collection's, sever's and retire's
+  times;
+- the retired files' bytes and chunks; the bytes the retire freed, and of
+  them R's own (its files gone less their rewritten survivors) and the
+  young set's; the younger files' section entries;
+- the retire's WAL bytes, and the streaming standby's replay time after
+  it: one session on the standby, kept open, polls its replay LSN through
+  the retire.  The replay time is the first poll that saw the retire's
+  WAL replayed, whether taken before the harness knew the retire's end
+  LSN or after, so it can be <= 0 (already replayed when the retire
+  returned); `standby_replay_resolution_ms` is the gap between that poll
+  and the one before;
+- the store's bytes as the manifest has them and its files' bytes on the
+  filesystem; `store_files_mismatch` when the table files on disk, by
+  name and size, or the count of journal segments differ from what the
+  manifest names, read before the walk and again after it (a leaked or
+  missing file; a segment's growth between the reads isn't one); the
+  manifest's and index's bytes, the data directory's bytes without
+  `pg_wal`, and `pg_wal`'s;
+- the table files and their sections' bytes (read from the files'
+  footers), and the sections of the files the cycle made;
+- `pg_stat_prolly`'s deltas;
+- point reads of the oldest commit the window keeps (latency, and the
+  chunk-store reads of the reads alone, the mount's not counted).
+
+The end (`v11-end.json`): the point reads before and after the conjoin,
+and what the full collection freed.
+
+It drives test_prolly's chunk-store functions, so the build needs them:
+`build_postgres.py --with-test-prolly`.  With `retire = false` a cycle
+stops after its sever.  `configs/v_generations_noretire.toml` is that,
+with the same cycles: run it on a build that records sections and on one
+that doesn't (which has no retires) to compare the default collection's
+times.  Both sides run without retires, because a retire's young copy
+adds a file a cycle and the default collection's cost follows the file
+count.
+
+```sh
+src/tools/prolly_bench/build_postgres.sh --build-dir build-gen --with-test-prolly -- CFLAGS=-O2 --with-openssl --with-lz4
+src/tools/prolly_bench/prolly_bench run V --am prolly --config src/tools/prolly_bench/configs/v_generations.toml \
+    --pg-bin build-gen/inst/bin --sizes gen1
+```
+
 ## Write amplification
 
 `configs/s_write_amp.toml` runs the standard procedure's workloads with the
@@ -956,7 +1016,7 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Suite` | S, V, C, G, GV ([Suites](#suites)) | `pbench/suites/` |
-| `Workload` | S1-S10 and S13, V1-V4 and V6-V10, C1-C4 | `pbench/workloads/` |
+| `Workload` | S1-S10 and S13, V1-V4 and V6-V11, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |

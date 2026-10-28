@@ -40,6 +40,9 @@ def main():
                         "pin's repository)")
     p.add_argument("--postgis-allow-library-mismatch", action="store_true",
                    help="build PostGIS with GEOS/PROJ/GDAL versions other than the pin's (recorded)")
+    p.add_argument("--with-test-prolly", action="store_true",
+                   help="also install the test_prolly module, whose chunk-store functions "
+                        "V11 drives (retires, generations, conjoins)")
     p.add_argument("configure", nargs=argparse.REMAINDER)
     args = p.parse_args()
     if args.jobs <= 0:
@@ -56,8 +59,11 @@ def main():
     command = [str(source / "configure"), f"--prefix={install}", *flags]
     with (build / "build.log").open("w") as log:
         # pg_walinspect: the write_amp collector splits WAL by resource manager.
-        for cmd in (command, ["make", f"-j{args.jobs}"], ["make", "install"],
-                    ["make", "-C", "contrib/pg_walinspect", "install"]):
+        steps = [command, ["make", f"-j{args.jobs}"], ["make", "install"],
+                 ["make", "-C", "contrib/pg_walinspect", "install"]]
+        if args.with_test_prolly:
+            steps.append(["make", f"-j{args.jobs}", "-C", "src/test/modules/test_prolly", "install"])
+        for cmd in steps:
             subprocess.run(cmd, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
     libraries = list(envmod.LIBRARIES)
     extensions = {}
