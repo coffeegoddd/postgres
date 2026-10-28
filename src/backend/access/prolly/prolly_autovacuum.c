@@ -547,8 +547,13 @@ collect_now(void)
 	prolly_database_components(&dc);
 	if (!full && retire(&dc))
 		return;
-	/* (a batch boundary passed: what came since settled on its own) */
-	seal = !full && seal_wanted && anything_to_collect();
+	/*
+	 * (a batch boundary passed: what came since settled on its own; not
+	 * with prolly.gc_journal_threshold -1, which turns the default
+	 * collections off)
+	 */
+	seal = !full && seal_wanted && prolly_gc_journal_threshold >= 0 &&
+		anything_to_collect();
 	seal_wanted = false;
 	if (!full && !seal && !retire_errored && !collection_due())
 		return;
