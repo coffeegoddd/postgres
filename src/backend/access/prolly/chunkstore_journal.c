@@ -9478,6 +9478,7 @@ struct ProllyChunkGc
 	int			level;			/* the transaction nesting level it began at */
 	bool		full;
 	bool		settle;			/* the files written are settled */
+	bool		if_free;		/* given up rather than waiting */
 	Manifest	m;				/* as the seal left it */
 	uint64		segment;		/* where appends go from the seal */
 	ProllyHash	sealed_root;	/* the root the collected segments end at,
@@ -9577,6 +9578,44 @@ wait_for_readers(VirtualTransactionId *vxids, int n)
 	}
 }
 
+/* Is one of these transactions still running (not prepared)? */
+static bool
+readers_running(VirtualTransactionId *vxids, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (!ConditionalVirtualXactLockUnprepared(vxids[i]))
+			return true;
+	}
+	return false;
+}
+
+bool		prolly_gc_given_up = false;
+
+/*
+ * A collection begun if free, finding a transaction it would wait for
+ * still running: given up (an error, the transaction's to roll back), to
+ * run again later, rather than waiting for a transaction that may stay
+ * open for hours.
+ */
+static void
+gc_give_up(void)
+{
+	prolly_gc_given_up = true;
+	ereport(ERROR,
+			(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+			 errmsg("collection of this database's chunk store given up: a transaction it waits for is running")));
+}
+
+/* Readers' waits, as the collection waits: or given up, if free. */
+static void
+gc_wait_for_readers(ProllyChunkGc *gc, VirtualTransactionId *vxids, int n)
+{
+	if (gc->if_free && readers_running(vxids, n))
+		gc_give_up();
+	wait_for_readers(vxids, n);
+}
+
 /* The prepared transaction vxid is the id of (invalid: it is none's). */
 static TransactionId
 prepared_xid(VirtualTransactionId vxid)
@@ -9597,7 +9636,7 @@ prepared_xid(VirtualTransactionId vxid)
  * finished, maybe days later.
  */
 static bool
-wait_unprepared(TransactionId xid)
+wait_unprepared(TransactionId xid, bool if_free)
 {
 	for (;;)
 	{
@@ -9642,6 +9681,9 @@ wait_unprepared(TransactionId xid)
 			if (pxid == xid)
 				running = i;
 		}
+		if (running >= 0 && if_free &&
+			!ConditionalVirtualXactLockUnprepared(vxids[running]))
+			gc_give_up();
 		if (running >= 0)
 			VirtualXactLockUnprepared(vxids[running]);
 		else
@@ -9893,6 +9935,7 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	gc->s = s;
 	gc->cxt = cxt;
 	gc->full = full;
+	gc->if_free = if_free;
 	gc->retire_lo = retire_lo;
 	gc->retire_hi = retire_hi;
 	gc->settle = (scope != PROLLY_GC_JOURNAL);
@@ -9912,7 +9955,7 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 															false, false, 0,
 															&nvxids);
 
-		wait_for_readers(vxids, nvxids);
+		gc_wait_for_readers(gc, vxids, nvxids);
 	}
 	lock_manifest(s, &gc->m);
 	waited_clear(s);			/* (any a collection that failed left) */
@@ -10694,10 +10737,10 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 			unlock_manifest(s);
 		foreach(lc, gc->xids)
 		{
-			if (wait_unprepared(lfirst_xid(lc)))
+			if (wait_unprepared(lfirst_xid(lc), gc->if_free))
 				prepared = lappend_xid(prepared, lfirst_xid(lc));
 		}
-		wait_for_readers(gc->held, gc->nheld);
+		gc_wait_for_readers(gc, gc->held, gc->nheld);
 
 		/*
 		 * And every other transaction running now.  One begun before the
@@ -10738,7 +10781,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 				}
 			}
 			SpinLockRelease(&js->mutex);
-			wait_for_readers(running, n);
+			gc_wait_for_readers(gc, running, n);
 			pfree(running);
 		}
 		if (release)
@@ -11685,6 +11728,17 @@ journal_gc_retire(ProllyChunkGc *gc)
 {
 	Manifest	m;
 
+	/*
+	 * (if free, with one of them still running: what the swap stopped
+	 * naming stays retiring, for the next collection to remove once nobody
+	 * running then is left)
+	 */
+	if (gc->if_free && readers_running(gc->readers, gc->nreaders))
+	{
+		gc_abort(gc);
+		MemoryContextDelete(gc->cxt);
+		return;
+	}
 	wait_for_readers(gc->readers, gc->nreaders);
 	INJECTION_POINT("prolly-gc-retire", NULL);
 	lock_manifest(gc->s, &m);

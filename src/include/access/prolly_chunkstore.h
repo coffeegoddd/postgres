@@ -139,6 +139,14 @@
  *   for days: gc_new() keeps as roots the chunks one appended to the
  *   segments collected, and gc_retire() doesn't wait for one running at
  *   the swap (it reads nothing more).
+ * - A collection begun with if_free never waits for a transaction at all
+ *   (a background one's, which an open transaction must not hold up):
+ *   where gc_begin() or gc_new() would wait for one still running, the
+ *   collection is given up instead, an ERRCODE_LOCK_NOT_AVAILABLE error
+ *   with prolly_gc_given_up set, for the caller to roll back and collect
+ *   again later; and gc_retire(), with one running at the swap still
+ *   running, leaves what the swap stopped naming retiring, for the next
+ *   collection to remove.
  *   gc_retained() visits the chunks a collection keeps whatever names
  *   them, the store's own reasons (a logical replication slot may still
  *   decode a row naming what was appended after its position): roots, as
@@ -660,6 +668,8 @@ extern const ProllyChunkStoreRoutine *prolly_chunk_store(void);
 #endif
 extern PGDLLIMPORT bool debug_prolly_verify_generations;
 extern PGDLLIMPORT int debug_prolly_settle_epoch;
+/* A collection begun if free given up, rather than waiting (gc_new()). */
+extern PGDLLIMPORT bool prolly_gc_given_up;
 extern Size prolly_chunkstore_commit_payload(char **data);
 extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);

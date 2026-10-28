@@ -13,7 +13,10 @@
  * collection, by the database's reclamation.  Only sizes are read, not the
  * journal.  Another collection running, it skips its own quietly (counted
  * in pg_stat_prolly's auto_collections_skipped): that one collects what
- * was due.  Then it moves the journal (the reclamation's move(): its
+ * was due.  It never waits for a transaction: a collection that would
+ * (one running that used the store before the seal) is given up, rolled
+ * back and counted alike, to run on a later visit, and one running at the
+ * swap leaves what the swap dropped to the next collection to remove.  Then it moves the journal (the reclamation's move(): its
  * segments rewritten as a table file, nothing freed) once its segments
  * have passed prolly.journal_move_threshold, which bounds what a backend
  * reads to index the journal when collections are rare (a large store) or
@@ -406,6 +409,67 @@ sever(void)
  * prolly.gc_retire_budget, none newer than the history window allows; true
  * if it ran (it collects what a default collection would, too).
  */
+/*
+ * A collection given up for a transaction still running, which autovacuum
+ * never waits for (an open transaction would hold the worker, and every
+ * collection after it, for as long as it stays open): counted as skipped,
+ * and tried again next visit.
+ */
+static void
+given_up_note(void)
+{
+	pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic collection of database \"%s\" given up: a transaction it would wait for is running",
+							 get_database_name(MyDatabaseId))));
+}
+
+/*
+ * The reclamation's collection, if free: false if it didn't run (another
+ * collection runs, or it was given up, its work rolled back).
+ */
+static bool
+collect_if_free(const ProllyDatabaseComponents *dc, bool full,
+				ProllyGcResult *r)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bool		ran = false;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	prolly_gc_given_up = false;
+	PG_TRY();
+	{
+		ran = PROLLY_CALL(dc->reclamation, collect, full, true, r);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		if (geterrcode() != ERRCODE_LOCK_NOT_AVAILABLE || !prolly_gc_given_up)
+			PG_RE_THROW();
+		prolly_gc_given_up = false;
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		given_up_note();
+		return false;
+	}
+	PG_END_TRY();
+	if (!ran)
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		ereport(DEBUG1,
+				(errmsg_internal("automatic collection of database \"%s\" skipped: another collection of its chunk store is running",
+								 get_database_name(MyDatabaseId))));
+	}
+	return ran;
+}
+
 static bool
 retire(const ProllyDatabaseComponents *dc)
 {
@@ -440,6 +504,7 @@ retire(const ProllyDatabaseComponents *dc)
 
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
+		prolly_gc_given_up = false;
 		PG_TRY();
 		{
 			ran = PROLLY_CALL(dc->reclamation, retire, lo, hi, true, &r);
@@ -465,6 +530,21 @@ retire(const ProllyDatabaseComponents *dc)
 			if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
 				ERRCODE_OPERATOR_INTERVENTION)
 				ReThrowError(edata);
+
+			/*
+			 * (given up for a transaction still running, which it doesn't
+			 * wait for: not a failure, but refused, as when another
+			 * collection runs, and tried again next time)
+			 */
+			if (edata->sqlerrcode == ERRCODE_LOCK_NOT_AVAILABLE &&
+				prolly_gc_given_up)
+			{
+				prolly_gc_given_up = false;
+				FreeErrorData(edata);
+				given_up_note();
+				retire_refused = true;
+				return true;
+			}
 			ereport(WARNING,
 					(errcode(edata->sqlerrcode),
 					 errmsg("automatic retire of generations %u to %u of database \"%s\" failed: %s",
@@ -554,14 +634,8 @@ collect_now(void)
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
-	if (!PROLLY_CALL(dc.reclamation, collect, full, true, &r))
-	{
-		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
-		ereport(DEBUG1,
-				(errmsg_internal("automatic collection of database \"%s\" skipped: another collection of its chunk store is running",
-								 get_database_name(MyDatabaseId))));
+	if (!collect_if_free(&dc, full, &r))
 		return;
-	}
 	if (full && PROLLY_HAS(dc.history_window, collected))
 		PROLLY_CALL(dc.history_window, collected);
 	/* (then, a step of its own, the records of the commits it took) */
