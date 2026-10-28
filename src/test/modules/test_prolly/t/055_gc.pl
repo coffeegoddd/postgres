@@ -348,7 +348,8 @@ is($standby->safe_psql('gcdb', $files), sql($files),
 
 # A crash as a store's first table file is written, before any manifest
 # (and with no journal): recovery removes the file no manifest names, in
-# a directory that holds it alone.
+# a directory that holds it alone, and writes a first manifest giving its
+# id, so it isn't given again.
 $node->safe_psql('postgres', 'CREATE DATABASE first_file');
 $node->safe_psql('first_file',
 	'CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points');
@@ -377,7 +378,7 @@ $standby->stop;
 $node->stop('immediate');
 $writer->{run}->finish;
 $node->start;
-is($store_files->(), '', 'recovery removes it');
+is($store_files->(), 'prolly_manifest', 'recovery removes it, its id noted as given');
 
 $node->stop;
 done_testing();

@@ -1619,15 +1619,34 @@ publish_scoped(void)
 	INJECTION_POINT("prolly-refs-publishing", NULL);
 	scoped_save();
 	flush_scoped();
-	for (;;)
+	/*
+	 * (written though the transaction is read-only now: they were made
+	 * while it could write the refs, holding their locks, which a
+	 * read-only one can't take, or where a read-only one may, as a first
+	 * use or a branch made is, with that lifted then)
+	 */
 	{
-		ProllyHash	cur;
+		bool		was_read_only = XactReadOnly;
 
-		PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
-		rebase_scoped(&cur);
-		if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur,
-						&scoped_mine))
-			break;
+		XactReadOnly = false;
+		PG_TRY();
+		{
+			for (;;)
+			{
+				ProllyHash	cur;
+
+				PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
+				rebase_scoped(&cur);
+				if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur,
+								&scoped_mine))
+					break;
+			}
+		}
+		PG_FINALLY();
+		{
+			XactReadOnly = was_read_only;
+		}
+		PG_END_TRY();
 	}
 	scoped = false;
 }
@@ -1877,6 +1896,9 @@ static bool
 refs_root(ProllyNodeRef *root)
 {
 	refs_init();
+	/* (a holder of every ref has its root moved to what it put) */
+	if (whole)
+		publish_scoped();
 	flush_scoped();
 	return refs_root_unflushed(root);
 }
@@ -2284,10 +2306,11 @@ branch_entry_tag(char tag)
 }
 
 /*
- * May the entry key be changed in the scoped changes: one of a branch the
+ * May the entry key be changed in the scoped changes, the transaction not
+ * having begun to commit: any, holding every ref (refs_put() takes the
+ * lock of a branch's entry's branch first); else one of a branch the
  * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), not having held every
- * ref nor begun to commit?
+ * the commit, which no other transaction writes)?
  */
 static bool
 scoped_key(const char *key, int keylen)
@@ -2295,8 +2318,10 @@ scoped_key(const char *key, int keylen)
 	const char *name;
 	int			len;
 
-	if (published || whole)
+	if (published)
 		return false;
+	if (whole)
+		return true;
 	if ((keylen == 1 && key[0] == TAG_RECORDS) ||
 		(keylen > 1 && key[0] == TAG_OWNED))
 		return true;
@@ -2343,7 +2368,31 @@ refs_get(const char *key, int keylen, StringInfo value)
 	return found;
 }
 
-/* Put (value NULL: delete) one entry, with the transaction. */
+/* (a branch's entries are changed only by a holder of its lock) */
+static void
+lock_entry_branch(const char *key, int keylen)
+{
+	int			len;
+	const char *name = entry_branch(key, keylen, &len);
+
+	if (name != NULL && !branch_held(name, len))
+	{
+		char	   *n = pnstrdup(name, len);
+
+		lock_branch(n);
+		pfree(n);
+	}
+}
+
+/*
+ * Put (value NULL: delete) one entry, with the transaction: in the scoped
+ * changes if it may be (scoped_key()), applied with the others in one
+ * edit.  A holder of every ref puts each there too, the root it holds
+ * their base, until it next reads the refs' root (refs_root()) or holds
+ * them again (lock_refs()), which move the root to them: so a move that
+ * changes many entries (a hard reset, a branch made) writes a path of the
+ * tree for those together, not one for each.
+ */
 static void
 refs_put(const char *key, int keylen, const StringInfoData *value)
 {
@@ -2367,6 +2416,8 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 		/* (a store with no root yet gets one from a holder of every ref) */
 		if (scoped || cur.len > 0)
 		{
+			if (whole)
+				lock_entry_branch(key, keylen);
 			scoped_save();
 			if (!scoped)
 			{
@@ -2401,20 +2452,7 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 		}
 	}
 	lock_refs();
-
-	/* (a branch's entries are changed only by a holder of its lock) */
-	{
-		int			len;
-		const char *name = entry_branch(key, keylen, &len);
-
-		if (name != NULL && !branch_held(name, len))
-		{
-			char	   *n = pnstrdup(name, len);
-
-			lock_branch(n);
-			pfree(n);
-		}
-	}
+	lock_entry_branch(key, keylen);
 	if (!refs_root(&root))
 		elog(ERROR, "prolly refs have no root");
 	PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
