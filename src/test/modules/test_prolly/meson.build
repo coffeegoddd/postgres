@@ -536,6 +536,7 @@ tests += {
       't/876_refs_gets_per_transaction.pl',
       't/877_refs_gets_fresh.pl',
       't/878_refs_memo_carry_error.pl',
+      't/880_autovacuum_gc_no_wait.pl',
       't/882_gc_unnamed_ids.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
