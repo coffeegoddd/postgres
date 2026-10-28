@@ -395,8 +395,81 @@ paint_mark(PaintQueue *q, PaintFlags *pf, uint8 add)
 	pf->flags |= add;
 }
 
+/*
+ * The last pair of commits painted, and what was found: a merge asks for
+ * its base, then its commit's count of the commits it reaches asks for the
+ * same pair's common ancestors, and commits are immutable, so the second
+ * walk would read the same commits for the same answer.  complete: the
+ * walk ended with nothing left to take that isn't beneath a candidate, so
+ * the candidates are every maximal common ancestor, not just those that
+ * may be the best.
+ */
+typedef struct PaintMemo
+{
+	bool		valid;
+	bool		complete;
+	ProllyHash	a;
+	ProllyHash	b;
+	int			nfound;
+	ProllyHash *found;
+	int64	   *heights;
+} PaintMemo;
+
+static PaintMemo paint_memo;
+
 static bool
-paint_common(const ProllyHash *a, const ProllyHash *b,
+hash_equal(const ProllyHash *x, const ProllyHash *y)
+{
+	return x->len == y->len && memcmp(x->bytes, y->bytes, x->len) == 0;
+}
+
+static bool
+paint_recalled(const ProllyHash *a, const ProllyHash *b, bool all,
+			   ProllyHash **found, int64 **heights, int *nfound)
+{
+	PaintMemo  *m = &paint_memo;
+
+	if (!m->valid || (all && !m->complete) ||
+		!hash_equal(&m->a, a) || !hash_equal(&m->b, b))
+		return false;
+	*nfound = m->nfound;
+	*found = palloc_array(ProllyHash, Max(m->nfound, 1));
+	*heights = palloc_array(int64, Max(m->nfound, 1));
+	memcpy(*found, m->found, sizeof(ProllyHash) * m->nfound);
+	memcpy(*heights, m->heights, sizeof(int64) * m->nfound);
+	return true;
+}
+
+static void
+paint_remember(const ProllyHash *a, const ProllyHash *b, bool complete,
+			   const ProllyHash *found, const int64 *heights, int nfound)
+{
+	PaintMemo  *m = &paint_memo;
+
+	if (m->found)
+		pfree(m->found);
+	if (m->heights)
+		pfree(m->heights);
+	m->found = MemoryContextAlloc(TopMemoryContext,
+								  sizeof(ProllyHash) * Max(nfound, 1));
+	m->heights = MemoryContextAlloc(TopMemoryContext,
+									sizeof(int64) * Max(nfound, 1));
+	memcpy(m->found, found, sizeof(ProllyHash) * nfound);
+	memcpy(m->heights, heights, sizeof(int64) * nfound);
+	m->nfound = nfound;
+	m->a = *a;
+	m->b = *b;
+	m->complete = complete;
+	m->valid = true;
+}
+
+/*
+ * (all: on past the first candidate's height until every commit left is
+ * beneath a candidate, so every maximal common ancestor is found, as a
+ * count of the commits only one side reaches needs)
+ */
+static bool
+paint_common(const ProllyHash *a, const ProllyHash *b, bool all,
 			 ProllyCommitLookup lookup, void *lookup_arg,
 			 ProllyHash **found, int64 **heights, int *nfound)
 {
@@ -406,6 +479,9 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 	ProllyCommitInfo info;
 	int			cap = 4;
 	bool		ok = true;
+
+	if (paint_recalled(a, b, all, found, heights, nfound))
+		return true;
 
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(PaintFlags);
@@ -441,7 +517,7 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 	 * far one side's commits reach beneath it.
 	 */
 	while (ok && q.open > 0 &&
-		   !(*nfound > 0 && q.e[0].height < (*heights)[0]))
+		   !(!all && *nfound > 0 && q.e[0].height < (*heights)[0]))
 	{
 		PaintEntry	e = paint_pop(&q);
 		PaintFlags *f = paint_flags(flags, &e.id);
@@ -493,6 +569,8 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 		pfree(*found);
 		pfree(*heights);
 	}
+	else
+		paint_remember(a, b, q.open == 0, *found, *heights, *nfound);
 	return ok;
 }
 
@@ -604,7 +682,7 @@ prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
 	int64	   *heights;
 	int			n;
 
-	if (paint_common(a, b, lookup, lookup_arg, bases, &heights, &n))
+	if (paint_common(a, b, false, lookup, lookup_arg, bases, &heights, &n))
 	{
 		pfree(heights);
 		return n;
@@ -623,7 +701,8 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 	bool		found = false;
 	int64		best_height = 0;
 
-	if (!paint_common(a, b, lookup, lookup_arg, &common, &heights, &ncommon))
+	if (!paint_common(a, b, false, lookup, lookup_arg, &common, &heights,
+					  &ncommon))
 	{
 		ncommon = walked_common(a, b, lookup, lookup_arg, &common);
 		return best_common(common, ncommon, lookup, lookup_arg, base);
@@ -683,6 +762,8 @@ typedef struct Painted
 	int64		height;
 	int			sides;
 	bool		taken;
+	int			nparents;
+	ProllyHash	parents[PROLLY_MAX_PARENTS];
 } Painted;
 
 static int
@@ -718,6 +799,8 @@ paint(HTAB *painted, pairingheap *queue, const ProllyHash *id, int sides,
 		p->height = info.height;
 		p->sides = sides;
 		p->taken = false;
+		p->nparents = info.nparents;
+		memcpy(p->parents, info.parents, sizeof(ProllyHash) * info.nparents);
 		pairingheap_add(queue, &p->node);
 		if (sides == SIDE_OTHER)
 			(*others)++;
@@ -731,9 +814,44 @@ paint(HTAB *painted, pairingheap *queue, const ProllyHash *id, int sides,
 	return true;
 }
 
+/*
+ * A two-parent merge's count by its parents' common ancestors, without a
+ * walk of the commits only the other parent reaches: those it reaches,
+ * less those beneath the one maximal common ancestor, which are all it
+ * shares with the first parent (every common ancestor is beneath it).
+ * None in common: all it reaches.  False if there are several, or a count
+ * isn't known: the caller walks then.  The common ancestors are what the
+ * merge asked of the same pair for its base, so they aren't walked again.
+ */
+static bool
+commits_by_base(const ProllyHash *parents, ProllyCommitCount count,
+				void *count_arg, ProllyCommitLookup lookup, void *lookup_arg,
+				int64 *others)
+{
+	ProllyHash *found;
+	int64	   *heights;
+	int			nfound;
+	int64		theirs = 0;
+	int64		shared = 0;
+	bool		known;
+
+	if (!paint_common(&parents[0], &parents[1], true, lookup, lookup_arg,
+					  &found, &heights, &nfound))
+		return false;
+	known = nfound <= 1 && count(&parents[1], &theirs, count_arg) &&
+		(nfound == 0 || count(&found[0], &shared, count_arg)) &&
+		theirs >= shared;
+	pfree(found);
+	pfree(heights);
+	if (known)
+		*others = theirs - shared;
+	return known;
+}
+
 bool
 prolly_history_commits(const ProllyHash *parents, int nparents,
-					   int64 first_commits,
+					   int64 first_commits, ProllyCommitCount count,
+					   void *count_arg,
 					   ProllyCommitLookup lookup, void *lookup_arg,
 					   int64 *commits)
 {
@@ -754,6 +872,12 @@ prolly_history_commits(const ProllyHash *parents, int nparents,
 	*commits = first_commits + 1;
 	if (nparents == 1)
 		return true;
+	if (nparents == 2 && count != NULL &&
+		commits_by_base(parents, count, count_arg, lookup, lookup_arg, &theirs))
+	{
+		*commits += theirs;
+		return true;
+	}
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly commit count",
 								ALLOCSET_DEFAULT_SIZES);
@@ -772,7 +896,6 @@ prolly_history_commits(const ProllyHash *parents, int nparents,
 	{
 		Painted    *p = pairingheap_container(Painted, node,
 											  pairingheap_remove_first(queue));
-		ProllyCommitInfo pinfo;
 
 		CHECK_FOR_INTERRUPTS();
 		p->taken = true;
@@ -781,13 +904,9 @@ prolly_history_commits(const ProllyHash *parents, int nparents,
 			others--;
 			theirs++;
 		}
-		if (!lookup(&p->id, &pinfo, lookup_arg))
-		{
-			known = false;
-			break;
-		}
-		for (int i = 0; i < pinfo.nparents && known; i++)
-			known = paint(painted, queue, &pinfo.parents[i], p->sides,
+		/* (its parents as read when it was painted: it isn't read again) */
+		for (int i = 0; i < p->nparents && known; i++)
+			known = paint(painted, queue, &p->parents[i], p->sides,
 						  &others, lookup, lookup_arg);
 	}
 	MemoryContextSwitchTo(old);

@@ -2212,12 +2212,18 @@ reaches, itself included (prolly_history_commits(); the refs'
 commit_count()), as Dolt's commit closure counts them: the nearest kept
 count down its first parents (the branch's previous keep, so the commits
 made since, the root interval's, are walked) and one more for each commit
-between, and for a merge, more by those its other parents reach that the first
-doesn't, found by heights highest first.  They are derived, not part of
-the commit (its id is its content's, as before), and transfers don't send
-them.  So count(*) of dolt_log(ref) alone (no quals, GROUP BY or HAVING)
-is planned as a scan giving that count (prolly_log_count.c), reading no
-history.  A commit no branch keeps with a count (one made within the
+between, and for a merge, more by those its other parents reach that the
+first doesn't.  For a merge of two whose parents share one maximal common
+ancestor, those are the other parent's count less the ancestor's, the
+ancestor being the merge's base, which the merge just found (the last
+pair's common ancestors are remembered, commits being immutable), so the
+commits between the base and the other parent are read once, by the
+base's search, not walked again; otherwise (criss-cross histories, a
+count not known) they are found by heights highest first.  They are
+derived, not part of the commit (its id is its content's, as before),
+and transfers don't send them.  So count(*) of dolt_log(ref) alone (no
+quals, GROUP BY or HAVING) is planned as a scan giving that count
+(prolly_log_count.c), reading no history.  A commit no branch keeps with a count (one made within the
 root interval, or let go of) is counted the same way, from the nearest
 kept count below it (or a root, as the log would be); a history horizon,
 which the log stops at, has the log counted as it gives its rows.

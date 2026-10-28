@@ -1169,14 +1169,26 @@ extern int	prolly_history_merge_bases(const ProllyHash *a, const ProllyHash *b,
  * lookup is asked once for each commit it finds one of.
  */
 /*
+ * The commits a commit reaches, itself included, if known without a walk
+ * (a count a kept commit records); false if not.
+ */
+typedef bool (*ProllyCommitCount) (const ProllyHash *id, int64 *commits,
+								   void *arg);
+
+/*
  * The commits a commit with these parents reaches, itself included, the
  * first parent reaching first_commits: one more, and for a merge, more by
- * those its other parents reach that the first doesn't, found by heights.
- * False if that can't be known: a commit the walk needs can't be read or
- * records no height.
+ * those its other parents reach that the first doesn't.  For a merge of
+ * two whose parents have one maximal common ancestor, and count (if not
+ * NULL) knows its count and the second parent's, those are the second's
+ * less the ancestor's, the ancestor found as the merge's base was (and
+ * not found again, the same pair asked for just before); otherwise they
+ * are found by heights.  False if that can't be known: a commit the walk
+ * needs can't be read or records no height.
  */
 extern bool prolly_history_commits(const ProllyHash *parents, int nparents,
 								   int64 first_commits,
+								   ProllyCommitCount count, void *count_arg,
 								   ProllyCommitLookup lookup, void *lookup_arg,
 								   int64 *commits);
 

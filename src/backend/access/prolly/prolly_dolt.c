@@ -4684,13 +4684,20 @@ log_count_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 	return PROLLY_CALL(refs(), commit_get, id, info);
 }
 
+static bool
+log_count_known(const ProllyHash *id, int64 *n, void *arg)
+{
+	return PROLLY_CALL(refs(), commit_count, id, n);
+}
+
 /*
  * The commits start reaches, itself included, from the nearest commit down
  * its first parents whose count a branch's kept commit records (the refs'
  * commit_count()), one more for each commit between (a merge's other
- * parents by prolly_history_commits()'s walk): for a commit made within
- * the root interval, the commits since the keep below it.  False if none
- * below records one, or a commit can't be read: the log is counted then.
+ * parents by prolly_history_commits(), by its base's count): for a
+ * commit made within the root interval, the commits since the keep below
+ * it.  False if none below records one, or a commit can't be read: the
+ * log is counted then.
  */
 static bool
 log_count_recorded(const ProllyHash *start, int64 *n)
@@ -4720,6 +4727,7 @@ log_count_recorded(const ProllyHash *start, int64 *n)
 		if (!found)
 			break;
 		found = prolly_history_commits(info->parents, info->nparents, below,
+									   log_count_known, NULL,
 									   log_count_lookup, NULL, &below);
 	}
 	*n = below;

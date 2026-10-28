@@ -6843,12 +6843,20 @@ count_known(const ProllyHash *commit, List *known, int64 *n)
 	return kept_count_get(commit, n);
 }
 
+/* count_known() as a ProllyCommitCount, its known list the argument */
+static bool
+count_known_of(const ProllyHash *commit, int64 *n, void *arg)
+{
+	return count_known(commit, (List *) arg, n);
+}
+
 /*
  * The commits commit reaches, itself included (0: not known): from the
  * nearest commit down its first parents with a count known (in known, a
  * list of live entries, or any branch's kept commit of it), or a root,
  * one more for each first parent between (a merge's other parents by
- * prolly_history_commits()'s walk), at most limit first parents down.  For
+ * prolly_history_commits(), by its base's count), at most limit first
+ * parents down.  For
  * a commit being kept, the nearest is the branch's previous keep, and the
  * limit the commits made since (by height), so every keep's count is
  * exact under any root interval; a keep after a move back in history
@@ -6888,6 +6896,7 @@ kept_count_new(const ProllyHash *commit, List *known, int64 limit)
 		foreach_ptr(ProllyCommitInfo, info, chain)
 		{
 			if (!prolly_history_commits(info->parents, info->nparents, below,
+										count_known_of, known,
 										copies_lookup_commit, NULL, &n))
 			{
 				n = 0;
