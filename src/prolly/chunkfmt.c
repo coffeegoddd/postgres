@@ -146,6 +146,39 @@ delta_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 	return true;
 }
 
+static bool
+manifest_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
+{
+	const uint8_t *p = data + 2;
+	const uint8_t *end = data + len;
+	uint64_t	nl,
+				n,
+				nb,
+				gen;
+	PHash		h;
+
+	if (!read_uvarint(&p, end, &nl) || nl > (uint64_t) (end - p))
+		return false;
+	p += nl;
+	if (!read_uvarint(&p, end, &n) || n > len)
+		return false;
+	for (uint64_t i = 0; i < n; i++)
+	{
+		if (!read_hash(&p, end, &h) || !read_uvarint(&p, end, &gen))
+			return false;
+		fn(arg, &h, true);
+	}
+	if (!read_uvarint(&p, end, &nb) || nb > len)
+		return false;
+	for (uint64_t i = 0; i < nb; i++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, false);
+	}
+	return p == end;
+}
+
 bool
 chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 {
@@ -161,6 +194,8 @@ chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 			return commit_refs(data, len, fn, arg);
 		case CHUNK_TAG_DELTA:
 			return delta_refs(data, len, fn, arg);
+		case CHUNK_TAG_MANIFEST:
+			return manifest_refs(data, len, fn, arg);
 		default:
 			return false;
 	}

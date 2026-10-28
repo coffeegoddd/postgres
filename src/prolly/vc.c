@@ -677,6 +677,8 @@ repo_init_empty(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 	memset(r, 0, sizeof(*r));
 	prolly_ctx_init(&r->ctx, cs, policy);
 	phmap_init(&r->loc);
+	phmap_init(&r->hint);
+	r->name = px_memdup("", 1);
 }
 
 void
@@ -699,9 +701,17 @@ vc_repo_free(VcRepo *r)
 		free(r->br[i].name);
 	free(r->br);
 	for (size_t i = 0; i < r->nsegs; i++)
+	{
 		free(r->segs[i].commits);
+		free(r->segs[i].archive_name);
+	}
 	free(r->segs);
 	phmap_free(&r->loc);
+	phmap_free(&r->hint);
+	for (size_t i = 0; i < r->nhints; i++)
+		free(r->hints[i]);
+	free(r->hints);
+	free(r->name);
 	prolly_ctx_free(&r->ctx);
 	memset(r, 0, sizeof(*r));
 }
@@ -1039,24 +1049,68 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	return VC_OK;
 }
 
+/* Commits of one segment that are not members: its boundary edges. */
+static void
+segment_bounds(ProllyCtx *ctx, const PHash *members, size_t n, PHashMap *mem,
+			   PHash **out, size_t *nout)
+{
+	size_t		cap = 0;
+	PHashMap	seen;
+	bool		created;
+
+	phmap_init(&seen);
+	*out = NULL;
+	*nout = 0;
+	for (size_t i = 0; i < n; i++)
+	{
+		VcCommit	c;
+
+		if (!vc_commit_load(ctx, &members[i], &c))
+			continue;
+		for (uint32_t j = 0; j < c.nparents; j++)
+		{
+			if (phmap_find(mem, &c.parents[j]))
+				continue;
+			phmap_ref(&seen, &c.parents[j], &created);
+			if (!created)
+				continue;
+			px_grow((void **) out, &cap, *nout + 1, sizeof(PHash));
+			(*out)[(*nout)++] = c.parents[j];
+		}
+	}
+	phmap_free(&seen);
+}
+
+/*
+ * Exports a segment: copies each member with its whole tree to the
+ * archive, then writes a manifest there that names the members, their
+ * generations, the segment's boundary and the source repo, and holds them.
+ * Only then are the local holds released, which truncates local history
+ * to the window.
+ */
 int
-vc_segment_export(VcRepo *r, uint32_t id, ChunkStore *archive)
+vc_segment_export(VcRepo *r, uint32_t id, const VcSource *archive)
 {
 	VcSegment  *seg;
 	PinSet		ps;
-	PHash		bad;
+	PHash		bad,
+				manifest;
+	PHashMap	mem;
+	PHash	   *bounds;
+	size_t		nb;
+	Buf			b = BUF_INIT;
+	bool		created;
+	int			rc;
 
-	if (id >= r->nsegs || archive == r->ctx.cs)
+	if (id >= r->nsegs || archive->cs == r->ctx.cs)
 		return VC_ERR;
 	seg = &r->segs[id];
 	if (seg->state != VC_SEG_LOCAL)
 		return VC_ERR;
-	/* a self-contained copy first: each commit with its whole tree */
-	pinset_init(&ps, archive);
+	pinset_init(&ps, archive->cs);
 	for (size_t i = 0; i < seg->n; i++)
 	{
-		int			rc = cs_copy_closure(r->ctx.cs, &ps, &seg->commits[i], true, &bad);
-
+		rc = cs_copy_closure(r->ctx.cs, &ps, &seg->commits[i], true, &bad);
 		if (rc != CS_OK)
 		{
 			pinset_free(&ps);
@@ -1064,17 +1118,53 @@ vc_segment_export(VcRepo *r, uint32_t id, ChunkStore *archive)
 			return rc;
 		}
 	}
+
+	phmap_init(&mem);
 	for (size_t i = 0; i < seg->n; i++)
-		cs_ref_root(archive, &seg->commits[i]);
+		phmap_ref(&mem, &seg->commits[i], &created);
+	segment_bounds(&r->ctx, seg->commits, seg->n, &mem, &bounds, &nb);
+	phmap_free(&mem);
+	buf_append_byte(&b, CHUNK_TAG_MANIFEST);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append_uvarint(&b, strlen(r->name));
+	buf_append(&b, r->name, strlen(r->name));
+	buf_append_uvarint(&b, seg->n);
+	for (size_t i = 0; i < seg->n; i++)
+	{
+		VcCommit	c;
+
+		vc_commit_load(&r->ctx, &seg->commits[i], &c);
+		buf_append(&b, seg->commits[i].b, PHASH_LEN);
+		buf_append_uvarint(&b, c.generation);
+	}
+	buf_append_uvarint(&b, nb);
+	for (size_t i = 0; i < nb; i++)
+		buf_append(&b, bounds[i].b, PHASH_LEN);
+	free(bounds);
+	rc = cs_put(archive->cs, b.data, b.len, &manifest, &bad);
+	buf_free(&b);
+	if (rc != CS_OK)
+	{
+		pinset_free(&ps);
+		r->ctx.err_hash = bad;
+		return rc;
+	}
+	cs_ref_root(archive->cs, &manifest);
 	pinset_free(&ps);
-	/* then let go locally: frees what only this segment reached */
+
 	for (size_t i = 0; i < seg->n; i++)
 		cs_unref_root(r->ctx.cs, &seg->commits[i]);
 	seg->state = VC_SEG_EXPORTED;
-	seg->archive = archive;
+	seg->archive = archive->cs;
+	seg->archive_name = px_memdup(archive->name, strlen(archive->name) + 1);
+	seg->manifest = manifest;
 	return VC_OK;
 }
 
+/*
+ * Discards a segment.  A local one is let go here; an exported one is let
+ * go in its archive, which frees exactly what no other manifest there holds.
+ */
 int
 vc_segment_discard(VcRepo *r, uint32_t id)
 {
@@ -1086,7 +1176,9 @@ vc_segment_discard(VcRepo *r, uint32_t id)
 	if (seg->state == VC_SEG_LOCAL)
 		for (size_t i = 0; i < seg->n; i++)
 			cs_unref_root(r->ctx.cs, &seg->commits[i]);
-	else if (seg->state != VC_SEG_EXPORTED)
+	else if (seg->state == VC_SEG_EXPORTED)
+		cs_unref_root(seg->archive, &seg->manifest);
+	else
 		return VC_ERR;
 	seg->state = VC_SEG_DISCARDED;
 	seg->archive = NULL;
@@ -1161,6 +1253,159 @@ vc_locate(VcRepo *r, const PHash *h, uint32_t *seg)
 	}
 }
 
+/* ------------------------------------------------------------- archives */
+
+typedef struct ManifestAcc
+{
+	ChunkStore *cs;
+	PHash	   *v;
+	size_t		n;
+	size_t		cap;
+} ManifestAcc;
+
+static void
+manifest_visit(void *arg, const PHash *h)
+{
+	ManifestAcc *acc = arg;
+	size_t		len;
+	const uint8_t *d = acc->cs->ops->get(acc->cs, h, &len);
+
+	if (d && len >= 2 && d[0] == CHUNK_TAG_MANIFEST)
+	{
+		px_grow((void **) &acc->v, &acc->cap, acc->n + 1, sizeof(PHash));
+		acc->v[acc->n++] = *h;
+	}
+}
+
+void
+vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n)
+{
+	ManifestAcc acc = {archive, NULL, 0, 0};
+
+	/* a scan: archives are cold and listing them is rare */
+	archive->ops->foreach(archive, manifest_visit, &acc);
+	*manifests = acc.v;
+	*n = acc.n;
+}
+
+bool
+vc_manifest_load(ChunkStore *archive, const PHash *h, VcManifest *m)
+{
+	size_t		len;
+	const uint8_t *d = cs_get(archive, h, &len);
+	const uint8_t *p,
+			   *end;
+	uint64_t	nl,
+				n,
+				nb;
+
+	memset(m, 0, sizeof(*m));
+	if (d == NULL || len < 2 || d[0] != CHUNK_TAG_MANIFEST ||
+		d[1] != CHUNK_FORMAT_VERSION)
+		return false;
+	p = d + 2;
+	end = d + len;
+	if (!read_uvarint(&p, end, &nl) || nl > (uint64_t) (end - p))
+		return false;
+	m->repo = px_malloc(nl + 1);
+	memcpy(m->repo, p, nl);
+	m->repo[nl] = '\0';
+	p += nl;
+	if (!read_uvarint(&p, end, &n) || n > len)
+		goto bad;
+	m->members = px_malloc(n * sizeof(PHash));
+	m->gens = px_malloc(n * sizeof(uint64_t));
+	for (uint64_t i = 0; i < n; i++)
+	{
+		if ((size_t) (end - p) < PHASH_LEN)
+			goto bad;
+		memcpy(m->members[i].b, p, PHASH_LEN);
+		p += PHASH_LEN;
+		if (!read_uvarint(&p, end, &m->gens[i]))
+			goto bad;
+		m->n++;
+	}
+	if (!read_uvarint(&p, end, &nb) || nb > len)
+		goto bad;
+	m->bounds = px_malloc(nb * sizeof(PHash));
+	for (uint64_t i = 0; i < nb; i++)
+	{
+		if ((size_t) (end - p) < PHASH_LEN)
+			goto bad;
+		memcpy(m->bounds[i].b, p, PHASH_LEN);
+		p += PHASH_LEN;
+		m->nb++;
+	}
+	if (p == end)
+		return true;
+bad:
+	vc_manifest_free(m);
+	return false;
+}
+
+void
+vc_manifest_free(VcManifest *m)
+{
+	free(m->repo);
+	free(m->members);
+	free(m->gens);
+	free(m->bounds);
+	memset(m, 0, sizeof(*m));
+}
+
+/* ----------------------------------------------------------------- hints */
+
+void
+vc_repo_set_name(VcRepo *r, const char *name)
+{
+	free(r->name);
+	r->name = px_memdup(name, strlen(name) + 1);
+}
+
+void
+vc_set_window_depth(VcRepo *r, uint32_t depth)
+{
+	r->window_depth = depth;
+}
+
+static void
+set_hint(VcRepo *r, const PHash *h, const char *where)
+{
+	size_t		i;
+	bool		created;
+
+	if (where == NULL || where[0] == '\0')
+		return;
+	for (i = 0; i < r->nhints; i++)
+		if (strcmp(r->hints[i], where) == 0)
+			break;
+	if (i == r->nhints)
+	{
+		px_grow((void **) &r->hints, &r->hintcap, r->nhints + 1, sizeof(char *));
+		r->hints[r->nhints++] = px_memdup(where, strlen(where) + 1);
+	}
+	*phmap_ref(&r->hint, h, &created) = i + 1;
+}
+
+const char *
+vc_hint(VcRepo *r, const PHash *h)
+{
+	uint64_t   *v = phmap_find(&r->hint, h);
+
+	return v ? r->hints[*v - 1] : NULL;
+}
+
+/* Where src would say the content of a commit it lacks can be found. */
+static const char *
+hint_from(VcRepo *src, const PHash *h)
+{
+	uint32_t	seg;
+
+	if (vc_locate(src, h, &seg) == VC_LOC_EXPORTED)
+		return src->segs[seg].archive_name;
+	return vc_hint(src, h);
+}
+
 /* -------------------------------------------------------------- remotes */
 
 static int
@@ -1172,107 +1417,263 @@ gen_cmp(const void *pa, const void *pb)
 	return (a->gen > b->gen) - (a->gen < b->gen);
 }
 
-/*
- * Copies every commit reachable from commit that dst lacks, each with the
- * strong closure of its root value, into dst's window history.  Parents
- * are weak references, so they are walked here, oldest first.  A parent
- * src does not have (cut from its history) becomes a boundary in dst.
- */
-int
-vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit)
+/* A planned transfer: commits to send, oldest first, and new boundaries. */
+typedef struct Plan
 {
-	PHashMap	seen;
-	GenEnt	   *todo = NULL;
-	size_t		ntodo = 0,
-				todocap = 0;
+	GenEnt	   *send;
+	size_t		nsend;
+	size_t		sendcap;
+	PHash	   *bound;
+	const char **bhint;
+	size_t		nbound;
+	size_t		boundcap;
+	bool		connected;		/* reached a commit the receiver knows */
+} Plan;
+
+static void
+plan_free(Plan *p)
+{
+	free(p->send);
+	free(p->bound);
+	free(p->bhint);
+	memset(p, 0, sizeof(*p));
+}
+
+static void
+plan_bound(Plan *p, const PHash *h, const char *hint)
+{
+	px_grow((void **) &p->bound, &p->boundcap, p->nbound + 1, sizeof(PHash));
+	p->bhint = px_realloc(p->bhint, p->boundcap * sizeof(char *));
+	p->bound[p->nbound] = *h;
+	p->bhint[p->nbound] = hint;
+	p->nbound++;
+}
+
+/*
+ * Plans what src must send so dst has heads.  It walks parents from each
+ * head, stopping at any commit dst already knows, whatever its location
+ * there: discarded or exported history is never sent back implicitly.
+ * With depth > 0, a path stops depth generations below its head; what lies
+ * past becomes a boundary.  A parent src itself lacks is a boundary too,
+ * hinting where src says it lives.
+ */
+static void
+plan_walk(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
+		  uint32_t depth, Plan *p)
+{
+	PHashMap	seen,
+				planned;
 	PHash	   *stack = NULL;
-	size_t		nstack = 0,
-				stackcap = 0;
+	uint64_t   *sbound = NULL;
+	size_t		n = 0,
+				cap = 0;
 	bool		created;
-	int			rc = VC_OK;
 
 	phmap_init(&seen);
-	px_grow((void **) &stack, &stackcap, 1, sizeof(PHash));
-	stack[nstack++] = *commit;
-	while (nstack > 0)
+	phmap_init(&planned);
+	for (size_t i = 0; i < nheads; i++)
 	{
-		PHash		h = stack[--nstack];
+		VcCommit	c;
+		uint64_t	b = 0;
+
+		if (depth > 0 && vc_commit_load(&src->ctx, &heads[i], &c))
+			b = c.generation > depth ? c.generation - depth : 0;
+		px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
+		sbound = px_realloc(sbound, cap * sizeof(uint64_t));
+		stack[n] = heads[i];
+		sbound[n++] = b;
+	}
+	while (n > 0)
+	{
+		PHash		h = stack[--n];
+		uint64_t	b = sbound[n];
+		uint64_t   *v;
 		VcCommit	c;
 
-		phmap_ref(&seen, &h, &created);
-		if (!created || cs_has(dst->ctx.cs, &h))
+		if (phmap_find(&dst->loc, &h))
+		{
+			p->connected = true;
 			continue;
+		}
+		v = phmap_ref(&seen, &h, &created);
+		if (!created && *v <= b + 1)
+			continue;
+		*v = b + 1;
 		if (!vc_commit_load(&src->ctx, &h, &c))
 		{
-			uint64_t   *v = phmap_ref(&dst->loc, &h, &created);
-
-			if (created)
-				*v = LOC_BOUNDARY;
+			plan_bound(p, &h, hint_from(src, &h));
 			continue;
 		}
-		px_grow((void **) &todo, &todocap, ntodo + 1, sizeof(GenEnt));
-		todo[ntodo].gen = c.generation;
-		todo[ntodo].h = h;
-		ntodo++;
+		phmap_ref(&planned, &h, &created);
+		if (created)
+		{
+			px_grow((void **) &p->send, &p->sendcap, p->nsend + 1, sizeof(GenEnt));
+			p->send[p->nsend].gen = c.generation;
+			p->send[p->nsend].h = h;
+			p->nsend++;
+		}
 		for (uint32_t i = 0; i < c.nparents; i++)
 		{
-			px_grow((void **) &stack, &stackcap, nstack + 1, sizeof(PHash));
-			stack[nstack++] = c.parents[i];
+			if (c.parent_gen[i] > b)
+			{
+				px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
+				sbound = px_realloc(sbound, cap * sizeof(uint64_t));
+				stack[n] = c.parents[i];
+				sbound[n++] = b;
+			}
+			else if (!phmap_find(&dst->loc, &c.parents[i]))
+				plan_bound(p, &c.parents[i], src->name);
 		}
 	}
-	if (ntodo > 1)
-		qsort(todo, ntodo, sizeof(GenEnt), gen_cmp);
-	for (size_t i = 0; i < ntodo && rc == VC_OK; i++)
+	/* a boundary that some other path sends is no boundary */
+	{
+		size_t		k = 0;
+
+		for (size_t i = 0; i < p->nbound; i++)
+			if (!phmap_find(&planned, &p->bound[i]))
+			{
+				p->bound[k] = p->bound[i];
+				p->bhint[k++] = p->bhint[i];
+			}
+		p->nbound = k;
+	}
+	if (p->nsend > 1)
+		qsort(p->send, p->nsend, sizeof(GenEnt), gen_cmp);
+	free(stack);
+	free(sbound);
+	phmap_free(&seen);
+	phmap_free(&planned);
+}
+
+/*
+ * Connect first: send everything down to commits dst knows.  Only when the
+ * heads share no history with dst does depth apply, as for a clone.
+ */
+static void
+plan_transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
+			  uint32_t depth, Plan *p)
+{
+	memset(p, 0, sizeof(*p));
+	plan_walk(src, dst, heads, nheads, 0, p);
+	if (!p->connected && depth > 0)
+	{
+		plan_free(p);
+		plan_walk(src, dst, heads, nheads, depth, p);
+	}
+}
+
+/* Copies the planned commits into dst, pinned there but not yet held. */
+static int
+plan_copy(VcRepo *src, VcRepo *dst, const Plan *p)
+{
+	for (size_t i = 0; i < p->nsend; i++)
 	{
 		PHash		bad;
+		int			rc = cs_copy_closure(src->ctx.cs, &dst->ctx.pins,
+										 &p->send[i].h, true, &bad);
 
-		rc = cs_copy_closure(src->ctx.cs, &dst->ctx.pins, &todo[i].h, true, &bad);
 		if (rc != CS_OK)
 		{
 			dst->ctx.err_hash = bad;
-			break;
+			prolly_release_pins(&dst->ctx);
+			return rc;
 		}
-		cs_ref_root(dst->ctx.cs, &todo[i].h);
-		set_loc(dst, &todo[i].h, LOC_WINDOW);
+	}
+	return VC_OK;
+}
+
+/* Takes the copied commits into dst's window history and records boundaries. */
+static void
+plan_adopt(VcRepo *dst, const Plan *p)
+{
+	for (size_t i = 0; i < p->nsend; i++)
+	{
+		cs_ref_root(dst->ctx.cs, &p->send[i].h);
+		set_loc(dst, &p->send[i].h, LOC_WINDOW);
+	}
+	for (size_t i = 0; i < p->nbound; i++)
+	{
+		bool		created;
+		uint64_t   *v = phmap_ref(&dst->loc, &p->bound[i], &created);
+
+		if (created)
+			*v = LOC_BOUNDARY;
+		if (vc_hint(dst, &p->bound[i]) == NULL)
+			set_hint(dst, &p->bound[i], p->bhint[i]);
 	}
 	prolly_release_pins(&dst->ctx);
-	free(todo);
-	free(stack);
-	phmap_free(&seen);
+}
+
+static int
+transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
+		 uint32_t depth)
+{
+	Plan		p;
+	int			rc;
+
+	plan_transfer(src, dst, heads, nheads, depth, &p);
+	rc = plan_copy(src, dst, &p);
+	if (rc == VC_OK)
+		plan_adopt(dst, &p);
+	plan_free(&p);
 	return rc;
 }
 
+int
+vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit)
+{
+	return transfer(src, dst, commit, 1, 0);
+}
+
+static void
+move_branch(VcRepo *r, VcBranch *b, const PHash *head, const PHash *root)
+{
+	b->head = *head;
+	b->head_root = *root;
+	set_working(r, b, root);
+}
+
+/*
+ * The remote checks fast-forward itself, against its own history plus the
+ * commits just received (pinned, not yet held), so it never needs history
+ * the sender has cut.  A rejected push leaves nothing behind.
+ */
 int
 vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 {
 	VcBranch   *lb = vc_branch_find(local, branch);
 	VcBranch   *rb = vc_branch_find(remote, branch);
+	Plan		p;
 	PHash		base;
 	int			rc;
 
 	if (lb == NULL)
 		return VC_ERR;
+	if (rb && phash_eq(&rb->head, &lb->head))
+		return VC_OK;
+	plan_transfer(local, remote, &lb->head, 1, remote->window_depth, &p);
+	if ((rc = plan_copy(local, remote, &p)) != VC_OK)
+	{
+		plan_free(&p);
+		return rc;
+	}
 	if (rb != NULL)
 	{
-		/* fast-forward only: the remote head must be in our history */
-		if (!cs_has(local->ctx.cs, &rb->head))
-			return VC_ERR;
-		rc = vc_merge_base(&local->ctx, &lb->head, &rb->head, &base);
-		if (rc < 0)
-			return rc;
-		if (rc == 0 || !phash_eq(&base, &rb->head))
-			return VC_ERR;
+		rc = vc_merge_base(&remote->ctx, &lb->head, &rb->head, &base);
+		if (rc != 1 || !phash_eq(&base, &rb->head))
+		{
+			prolly_release_pins(&remote->ctx);
+			plan_free(&p);
+			return rc < 0 ? rc : VC_ERR;
+		}
 	}
-	if ((rc = vc_sync_commit(local, remote, &lb->head)) != VC_OK)
-		return rc;
+	plan_adopt(remote, &p);
+	plan_free(&p);
+	rb = vc_branch_find(remote, branch);
 	if (rb == NULL)
 		add_branch(remote, branch, &lb->head, &lb->head_root);
 	else
-	{
-		rb->head = lb->head;
-		rb->head_root = lb->head_root;
-		set_working(remote, rb, &lb->head_root);
-	}
+		move_branch(remote, rb, &lb->head, &lb->head_root);
 	return VC_OK;
 }
 
@@ -1284,25 +1685,198 @@ vc_fetch(VcRepo *local, VcRepo *remote, const char *branch, PHash *head)
 
 	if (rb == NULL)
 		return VC_ERR;
-	if ((rc = vc_sync_commit(remote, local, &rb->head)) != VC_OK)
+	if ((rc = transfer(remote, local, &rb->head, 1, local->window_depth)) != VC_OK)
 		return rc;
 	*head = rb->head;
 	return VC_OK;
 }
 
 int
-vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src)
+vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src, uint32_t depth)
 {
+	PHash	   *heads = px_malloc(src->nbr * sizeof(PHash));
+	int			rc;
+
 	repo_init_empty(dst, cs, &src->ctx.policy);
 	dst->clock = src->clock;
+	dst->window_depth = depth;
 	for (size_t i = 0; i < src->nbr; i++)
-	{
-		int			rc = vc_sync_commit(src, dst, &src->br[i].head);
-
-		if (rc != VC_OK)
-			return rc;
+		heads[i] = src->br[i].head;
+	rc = transfer(src, dst, heads, src->nbr, depth);
+	free(heads);
+	if (rc != VC_OK)
+		return rc;
+	for (size_t i = 0; i < src->nbr; i++)
 		add_branch(dst, src->br[i].name, &src->br[i].head, &src->br[i].head_root);
-	}
 	dst->cur = src->cur;
+	prolly_release_pins(&dst->ctx);
 	return VC_OK;
+}
+
+/*
+ * Fetches history past a cut from any chunk source (a remote's store, an
+ * archive, another repo), verified by hash, into a new local segment: old
+ * history comes back without entering the window.  The walk starts at
+ * `from` and goes back `generations` (0: as far as the source has), stopping
+ * at commits this repo has content for.
+ */
+int
+vc_deepen(VcRepo *r, const VcSource *src, const PHash *from,
+		  uint32_t generations, uint32_t *seg_out)
+{
+	ProllyCtx	sctx;
+	PHash	   *stack = NULL;
+	size_t		n = 0,
+				cap = 0;
+	PHashMap	seen;
+	GenEnt	   *todo = NULL;
+	size_t		ntodo = 0,
+				todocap = 0;
+	PHash	   *bounds = NULL;
+	size_t		nb = 0,
+				bcap = 0;
+	VcCommit	c;
+	uint64_t	bound;
+	bool		created;
+	int			rc = VC_OK;
+	VcLocation	where = vc_locate(r, from, NULL);
+	VcSegment  *seg;
+
+	*seg_out = VC_NO_SEGMENT;
+	if (where != VC_LOC_UNKNOWN && where != VC_LOC_BOUNDARY &&
+		where != VC_LOC_DISCARDED)
+		return VC_ERR;			/* present here, or exported: attach it */
+	prolly_ctx_init(&sctx, src->cs, &r->ctx.policy);
+	if (!vc_commit_load(&sctx, from, &c))
+	{
+		prolly_ctx_free(&sctx);
+		r->ctx.err_hash = *from;
+		return VC_ERR_SEVERED;
+	}
+	bound = generations && c.generation > generations ? c.generation - generations : 0;
+	phmap_init(&seen);
+	px_grow((void **) &stack, &cap, 1, sizeof(PHash));
+	stack[n++] = *from;
+	while (n > 0)
+	{
+		PHash		h = stack[--n];
+		VcLocation	l = vc_locate(r, &h, NULL);
+
+		if (l == VC_LOC_WINDOW || l == VC_LOC_SEGMENT || l == VC_LOC_EXPORTED)
+			continue;
+		phmap_ref(&seen, &h, &created);
+		if (!created)
+			continue;
+		if (!vc_commit_load(&sctx, &h, &c))
+			continue;			/* the source lacks it: stays a boundary */
+		px_grow((void **) &todo, &todocap, ntodo + 1, sizeof(GenEnt));
+		todo[ntodo].gen = c.generation;
+		todo[ntodo].h = h;
+		ntodo++;
+		for (uint32_t i = 0; i < c.nparents; i++)
+		{
+			if (c.parent_gen[i] > bound)
+			{
+				px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
+				stack[n++] = c.parents[i];
+			}
+			else if (vc_locate(r, &c.parents[i], NULL) == VC_LOC_UNKNOWN ||
+					 vc_locate(r, &c.parents[i], NULL) == VC_LOC_BOUNDARY)
+			{
+				px_grow((void **) &bounds, &bcap, nb + 1, sizeof(PHash));
+				bounds[nb++] = c.parents[i];
+			}
+		}
+	}
+	if (ntodo > 1)
+		qsort(todo, ntodo, sizeof(GenEnt), gen_cmp);
+	for (size_t i = 0; i < ntodo && rc == VC_OK; i++)
+	{
+		PHash		bad;
+
+		rc = cs_copy_closure(src->cs, &r->ctx.pins, &todo[i].h, true, &bad);
+		if (rc != CS_OK)
+			r->ctx.err_hash = bad;
+	}
+	if (rc == VC_OK && ntodo > 0)
+	{
+		px_grow((void **) &r->segs, &r->segcap, r->nsegs + 1, sizeof(VcSegment));
+		seg = &r->segs[r->nsegs];
+		memset(seg, 0, sizeof(*seg));
+		seg->state = VC_SEG_LOCAL;
+		seg->commits = px_malloc(ntodo * sizeof(PHash));
+		seg->n = ntodo;
+		for (size_t i = 0; i < ntodo; i++)
+		{
+			seg->commits[i] = todo[i].h;
+			cs_ref_root(r->ctx.cs, &todo[i].h);
+			set_loc(r, &todo[i].h, LOC_SEG_BASE + r->nsegs);
+		}
+		for (size_t i = 0; i < nb; i++)
+		{
+			uint64_t   *v = phmap_ref(&r->loc, &bounds[i], &created);
+
+			if (created)
+				*v = LOC_BOUNDARY;
+			if (vc_hint(r, &bounds[i]) == NULL)
+				set_hint(r, &bounds[i], src->name);
+		}
+		*seg_out = (uint32_t) r->nsegs++;
+	}
+	prolly_release_pins(&r->ctx);
+	prolly_ctx_free(&sctx);
+	free(stack);
+	free(todo);
+	free(bounds);
+	phmap_free(&seen);
+	return rc;
+}
+
+/*
+ * Fetches branch from remote into a tracking branch "<remote>/<branch>"
+ * and merges it into the current branch.  If the merge base lies past this
+ * repo's cut and max_deepen > 0, deepens from the remote in growing steps,
+ * up to max_deepen generations in all, until the merge can see its base.
+ */
+int
+vc_pull(VcRepo *local, VcRepo *remote, const char *branch, uint32_t max_deepen,
+		VcMergeResult *res)
+{
+	PHash		head;
+	char		tracking[256];
+	VcBranch   *tb;
+	VcCommit	c;
+	uint32_t	step = 4,
+				used = 0;
+	int			rc;
+
+	memset(res, 0, sizeof(*res));
+	if ((rc = vc_fetch(local, remote, branch, &head)) != VC_OK)
+		return rc;
+	snprintf(tracking, sizeof(tracking), "%s/%s", remote->name, branch);
+	if ((rc = load_commit(&local->ctx, &head, &c)) != VC_OK)
+		return rc;
+	tb = vc_branch_find(local, tracking);
+	if (tb == NULL)
+		add_branch(local, tracking, &head, &c.root);
+	else
+		move_branch(local, tb, &head, &c.root);
+	for (;;)
+	{
+		VcSource	s = {remote->name, remote->ctx.cs};
+		PHash		missing;
+		uint32_t	g,
+					seg;
+
+		rc = vc_merge(local, tracking, res);
+		if (rc != VC_ERR_SEVERED || used >= max_deepen)
+			return rc;
+		missing = local->ctx.err_hash;
+		g = step < max_deepen - used ? step : max_deepen - used;
+		if (vc_deepen(local, &s, &missing, g, &seg) != VC_OK ||
+			seg == VC_NO_SEGMENT)
+			return rc;
+		used += g;
+		step *= 2;
+	}
 }

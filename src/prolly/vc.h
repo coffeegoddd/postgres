@@ -124,7 +124,31 @@ typedef struct VcSegment
 	PHash	   *commits;
 	size_t		n;
 	ChunkStore *archive;		/* where an exported segment lives */
+	char	   *archive_name;
+	PHash		manifest;		/* holds it there */
 } VcSegment;
+
+/*
+ * Anything chunks can be fetched from by hash: a remote's store, an
+ * archive, another repo.  Everything fetched is verified, so any source
+ * will do.  The name is what boundaries record as a hint.
+ */
+typedef struct VcSource
+{
+	const char *name;
+	ChunkStore *cs;
+} VcSource;
+
+/* What an archive says about a segment exported to it. */
+typedef struct VcManifest
+{
+	char	   *repo;			/* the repo that exported it */
+	PHash	   *members;
+	uint64_t   *gens;
+	size_t		n;
+	PHash	   *bounds;			/* parents of members that are not members */
+	size_t		nb;
+} VcManifest;
 
 #define VC_NO_SEGMENT UINT32_MAX
 
@@ -150,6 +174,12 @@ typedef struct VcRepo
 	VcSegment  *segs;
 	size_t		nsegs;
 	size_t		segcap;
+	char	   *name;			/* how others refer to this repo */
+	uint32_t	window_depth;	/* receiver depth for clones; 0: unlimited */
+	PHashMap	hint;			/* boundary commit -> hints index + 1 */
+	char	  **hints;
+	size_t		nhints;
+	size_t		hintcap;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -221,16 +251,43 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
  * archive store, then let go here), discarded, or attached again.
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
-extern int	vc_segment_export(VcRepo *r, uint32_t seg, ChunkStore *archive);
+extern int	vc_segment_export(VcRepo *r, uint32_t seg, const VcSource *archive);
 extern int	vc_segment_discard(VcRepo *r, uint32_t seg);
 extern int	vc_segment_attach(VcRepo *r, uint32_t seg);
 extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32_t *seg);
 
-/* Remotes: another repo with its own chunk store. */
+/* Archives: list and read the manifests of segments exported there. */
+extern void vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n);
+extern bool vc_manifest_load(ChunkStore *archive, const PHash *h, VcManifest *m);
+extern void vc_manifest_free(VcManifest *m);
+
+/*
+ * Remotes: another repo with its own store and window.
+ *
+ * A transfer sends the commits the receiver lacks, each with its whole
+ * tree, stopping at any commit the receiver already knows, wherever it is
+ * there, so discarded or exported history never comes back implicitly.
+ * Fetch and push connect: they send everything down to known commits.  A
+ * clone, or heads that share no history with the receiver, stop at the
+ * receiver's window depth.  Parents not sent become boundaries on the
+ * receiver, with a hint naming where their content can be found.  Push is
+ * checked for fast-forward by the receiver.  Each repo applies its own
+ * window: nothing is severed on receive.
+ */
+extern void vc_repo_set_name(VcRepo *r, const char *name);
+extern void vc_set_window_depth(VcRepo *r, uint32_t depth);
+extern const char *vc_hint(VcRepo *r, const PHash *commit);
 extern int	vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit);
 extern int	vc_push(VcRepo *local, VcRepo *remote, const char *branch);
 extern int	vc_fetch(VcRepo *local, VcRepo *remote, const char *branch,
 					 PHash *head);
-extern int	vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src);
+/* depth 0 clones everything the source has. */
+extern int	vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src, uint32_t depth);
+/* History past a cut, from any source, into a new local segment. */
+extern int	vc_deepen(VcRepo *r, const VcSource *src, const PHash *from,
+					  uint32_t generations, uint32_t *seg);
+/* Fetch into "<remote>/<branch>" and merge, deepening up to max_deepen. */
+extern int	vc_pull(VcRepo *local, VcRepo *remote, const char *branch,
+					uint32_t max_deepen, VcMergeResult *res);
 
 #endif							/* VC_H */

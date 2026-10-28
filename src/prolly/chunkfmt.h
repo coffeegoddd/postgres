@@ -20,6 +20,10 @@
  *			uvarint time, uvarint msglen, msg
  * Delta:	tag, version, base hash (weak), target hash (weak), uvarint n,
  *			(op byte, uvarint klen, key, [uvarint vlen, value])...
+ * Manifest: tag, version, uvarint namelen, source repo name, uvarint n,
+ *			(member commit hash (strong), uvarint generation)..., uvarint nb,
+ *			(boundary commit hash (weak))...
+ *			Describes a segment exported to an archive and holds it there.
  */
 #ifndef CHUNKFMT_H
 #define CHUNKFMT_H
@@ -30,6 +34,7 @@
 #define CHUNK_TAG_SCHEMA 0x53
 #define CHUNK_TAG_COMMIT 0x43
 #define CHUNK_TAG_DELTA 0x44
+#define CHUNK_TAG_MANIFEST 0x4d
 
 /*
  * Covers the encodings and the chunk boundary function; anything that

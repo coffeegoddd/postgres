@@ -569,8 +569,8 @@ test_push_fetch_clone(void)
 		put_row(&remote, "t", k, 0);
 	vc_commit(&remote, "seed");
 
-	CHECK(vc_repo_clone(&local, lcs, &remote) == VC_OK);
-	CHECK(vc_repo_clone(&other, ocs, &remote) == VC_OK);
+	CHECK(vc_repo_clone(&local, lcs, &remote, 0) == VC_OK);
+	CHECK(vc_repo_clone(&other, ocs, &remote, 0) == VC_OK);
 	CHECK(phash_eq(&vc_head(&local)->head, &vc_head(&remote)->head));
 	CHECK(working_row(&local, "t", 299) == 0);
 
@@ -685,7 +685,7 @@ vc_scale_case(uint64_t n, VcScale *s)
 	vc_set_working(&r, &rv);
 	c0 = vc_commit(&r, "load");
 	s->height = t_height(&r.ctx, &data);
-	CHECK(vc_repo_clone(&remote, rcs, &r) == VC_OK);
+	CHECK(vc_repo_clone(&remote, rcs, &r, 0) == VC_OK);
 
 	/* branch: a new ref, no chunks */
 	st = cs->stats;
