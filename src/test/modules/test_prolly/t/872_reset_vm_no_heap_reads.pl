@@ -53,7 +53,8 @@ sub dirty_reset
 {
 	my ($pct) = @_;
 
-	sql(qq{UPDATE app.t SET rev = rev + 1 WHERE id <= $nrows * $pct / 100});
+	sql(qq{UPDATE app.t SET rev = rev + 1 WHERE id <= $nrows * $pct / 100;
+		SELECT pg_stat_force_next_flush()});
 	my $before = sql($io);
 	sql(qq{SELECT dolt_reset('--hard', '$head') IS NOT NULL;
 		SELECT pg_stat_force_next_flush()});

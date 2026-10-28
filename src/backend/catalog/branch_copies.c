@@ -595,9 +595,10 @@ static bool block_listed(const BlockNumber *blocks, uint32 n,
  * versions every snapshot sees, so its frozen copy, unchanged too, does),
  * with each page changed since (or past src's length, under the root's)
  * cleared, its frozen copy not read: a bit left unset is only a heap
- * fetch for an index-only scan until VACUUM sets it, while a heap page
- * read for each changed page would cost a reset discarding a large
- * working set one cold read a page.  Each map page cleared is logged as
+ * fetch for an index-only scan until the next VACUUM sets it (it sets the
+ * map's bits of a shared, all-frozen page without copying the page),
+ * while a heap page read for each changed page would cost a reset
+ * discarding a large working set one cold read a page.  Each map page cleared is logged as
  * an image.  O(the map's pages and the map's nodes listing the pages
  * changed); no heap page read.  Nothing if k isn't a frozen root of src's
  * or src has no map (dst then gets none, as before VACUUM).

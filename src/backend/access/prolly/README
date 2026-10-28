@@ -1376,10 +1376,11 @@ map for that than one discarding a row.  A restore of a frozen root
 gives the new storage a copy of the relation's visibility map with the
 bits of every page changed since cleared, those pages not read: the
 unchanged pages keep their bits, so a reset discarding a large working
-set reads no heap page for its map.  A changed page's bits come back once
-VACUUM sets them: as the page is the root's still, shared with it, only
-with prolly.vacuum_copy_kept_pages (which copies it), or after a write
-has made it the relation's own.
+set reads no heap page for its map.  A changed page's bits come back at
+the next VACUUM: the page is the root's still, shared with it, so VACUUM
+leaves it as it is, but sets its map's bits when it says it is
+all-visible and holds only frozen versions, the map page logged as an
+image and the heap page unchanged.
 prolly.freeze_roots off keeps them as captured, sharing the relation's
 pages.
 

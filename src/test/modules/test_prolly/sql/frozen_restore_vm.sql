@@ -31,20 +31,18 @@ SELECT count(*) AS not_frozen FROM pg_check_frozen('fv.t');
 SELECT count(*) AS not_visible FROM pg_check_visible('fv.t');
 
 -- an index-only scan fetches each row from the heap.  The pages are the
--- root's still, shared with it, so a VACUUM leaves them as it leaves any
--- shared page with nothing to reclaim, bits unset; with
--- prolly.vacuum_copy_kept_pages it copies them and sets the bits again
+-- root's still, shared with it, so a VACUUM leaves them as they are, but
+-- sets their bits again (they are all-visible and frozen)
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 SELECT count(id) FROM fv.t WHERE id <= 5000;
 VACUUM fv.t;
-SELECT all_visible FROM pg_visibility_map_summary('fv.t');
-SET prolly.vacuum_copy_kept_pages = on;
-VACUUM fv.t;
-RESET prolly.vacuum_copy_kept_pages;
-SELECT all_visible = pg_relation_size('fv.t') / 8192 AS all_visible
+SELECT all_visible = pg_relation_size('fv.t') / 8192 AS all_visible,
+	all_frozen = pg_relation_size('fv.t') / 8192 AS all_frozen
 FROM pg_visibility_map_summary('fv.t');
+SELECT count(*) AS not_frozen FROM pg_check_frozen('fv.t');
+SELECT count(*) AS not_visible FROM pg_check_visible('fv.t');
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 SELECT count(id) FROM fv.t WHERE id <= 5000;
 RESET enable_seqscan;

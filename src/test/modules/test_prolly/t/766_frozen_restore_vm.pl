@@ -6,6 +6,8 @@
 # The pages unchanged since keep their bits; the changed ones have none.
 # Redo replays it: after a crash, and on a standby, the map is the same,
 # page by page checked (wal_consistency_checking), and true of the pages.
+# A plain VACUUM then sets the changed pages' bits again without copying
+# them, replayed the same way.
 #
 # The updates are HOT (fillfactor 50), so the pages changed are those the
 # updated rows were on.
@@ -83,6 +85,41 @@ is($standby->safe_psql('postgres', $summary), "$kept,$kept",
 	'the standby replayed the map');
 is($standby->safe_psql('postgres', wrong($changed)), '0,0', 'page by page');
 is($standby->safe_psql('postgres', $clean), '0', 'true of its pages too');
+
+# A plain VACUUM sets the changed pages' bits again: they are the root's
+# still, shared with it, so it leaves them as they are, but they say they
+# are all-visible and hold only frozen versions.  An index-only scan then
+# fetches no row from the heap.
+my $fetches = q{SET enable_seqscan = off; SET enable_bitmapscan = off;
+	EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+	SELECT count(id) FROM fv.t WHERE id <= 5000};
+sub heap_fetches
+{
+	my ($out) = @_;
+	return $out =~ /Heap Fetches: (\d+)/ ? $1 : 'none';
+}
+ok(heap_fetches(sql($fetches)) > 0, 'before VACUUM, an index-only scan fetches from the heap');
+my ($vstdout, $verbose);
+$node->psql('postgres', 'VACUUM (VERBOSE) fv.t', stdout => \$vstdout, stderr => \$verbose);
+my ($left) = $verbose =~ /pages shared: (\d+) shared/;
+ok(defined $left && $left >= $nchanged,
+	'VACUUM left the shared pages as they are (' . ($left // 'none') . ')');
+is(sql($summary), "$n,$n", 'after VACUUM, every page all-visible and all-frozen');
+is(heap_fetches(sql($fetches)), '0', 'an index-only scan fetches no row from the heap');
+is(sql($clean), '0', 'the map true of the pages');
+
+$node->stop('immediate');
+$node->start;
+is(sql($summary), "$n,$n", 'after a crash, VACUUM\'s bits as they were');
+is(heap_fetches(sql($fetches)), '0', 'still no heap fetch');
+is(sql($clean), '0', 'and true of the pages');
+
+$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+is($standby->safe_psql('postgres', $summary), "$n,$n",
+	'the standby replayed VACUUM\'s bits');
+is(heap_fetches($standby->safe_psql('postgres', $fetches)), '0',
+	'no heap fetch on the standby');
+is($standby->safe_psql('postgres', $clean), '0', 'true of its pages');
 
 $standby->stop;
 $node->stop;
