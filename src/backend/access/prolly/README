@@ -1305,7 +1305,16 @@ commit's entry is found by its height (a seek); another branch's keep of
 it through the index of heads' roots, for a retention pass, or by a seek
 of each branch keeping any, for a move's or a first use's source.  A
 transaction's refs reads see its changes pending without applying them
-first, so it writes its refs once, as it publishes them.  So a one-row
+first, so it writes its refs once, as it publishes them.  A refs get is
+answered from what an earlier get read under the same root (the tree is
+content addressed, so a key's value is a function of the root), and the
+backend's own edits carry that to the root they make; a get that finds
+another root (another session's move, a rebase, a rollback) reads it
+afresh.  So a transaction's many gets of its branch's head, merge state
+and names and the writer settings descend the refs once each, and a run
+of transactions only this backend commits doesn't descend them again
+for an entry none of them changed: what grows with the window is its
+commits' own puts, not every get.  So a one-row
 commit writes a few refs nodes whatever the window: about 4 under a
 window of the newest commit, 6 to 9 under a month or a century (the
 region's right end, the small entries' leaf, the data-tree index's, and
