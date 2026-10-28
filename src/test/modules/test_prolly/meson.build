@@ -532,6 +532,7 @@ tests += {
       't/870_reset_changed_walk.pl',
       't/871_fold_cancel_in_sort.pl',
       't/872_reset_vm_no_heap_reads.pl',
+      't/873_vm_set_logical_decoding.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',
