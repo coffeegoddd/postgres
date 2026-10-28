@@ -3519,18 +3519,20 @@ dolt_reset(PG_FUNCTION_ARGS)
 	PreventCommandIfReadOnly("dolt_reset()");
 	/* (a hard reset to the head drops the branch's changes: checked too) */
 	prolly_check_head_move(branch_ops()->current());
+
+	/*
+	 * (the branch held before its head is read, for either: a commit that
+	 * lands while the reset waits is the head a soft reset resolves from,
+	 * not one it moves the head back past; and the checks below of what
+	 * the head is, a protected branch's among them, are of the head the
+	 * reset moves, not one another move replaced while it waited)
+	 */
+	if (PROLLY_HAS(refs(), lock_head))
+		PROLLY_CALL(refs(), lock_head);
 	if (!hard)
 	{
 		ProllyMergeState ms;
 		ProllyHash	target;
-
-		/*
-		 * (the branch held before its head is read: a commit that lands
-		 * while the reset waits is the head it resolves from, not one it
-		 * would move the head back past)
-		 */
-		if (PROLLY_HAS(refs(), lock_head))
-			PROLLY_CALL(refs(), lock_head);
 
 		if (PROLLY_CALL(refs(), merge_state, &ms))
 			ereport(ERROR,

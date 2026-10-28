@@ -1165,9 +1165,11 @@ are kept as of).  Every change of a branch's refs
 is made holding that branch's lock to transaction end, and they take
 only that, so commits on different branches run together while those on
 one branch take turns.  A move that resolves its target from the head
-takes the lock before it reads the head: a soft reset (the refs'
-lock_head()), so a commit that lands while it waits is the head it steps
-back from, not one it moves the head back past; a commit reads its
+takes the lock before it reads the head: a reset (the refs'
+lock_head()), so a commit that lands while it waits is the head a soft
+reset steps back from, not one it moves the head back past, and a hard
+reset's checks of the head (a protected branch moved to another commit)
+are of the head it moves; a commit reads its
 parent, the head, once it holds the lock, and one given its parents (a
 merge's) refuses, to be retried, if the head is no longer the first;
 an amend or a rebase holds every ref first, and refuses if the head

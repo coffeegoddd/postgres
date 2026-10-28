@@ -4,6 +4,8 @@
 # target from: a commit of the branch that lands while the reset waits is
 # the head it steps back from, not one it moves the head back past, and
 # two soft resets of HEAD~1, one waiting for the other, step back twice.
+# A hard reset holds it as well before it checks what the head is (a
+# protected branch moved to another commit is the database owner's).
 
 use strict;
 use warnings FATAL => 'all';
@@ -82,6 +84,37 @@ is(head(), $c2, 'two soft resets of HEAD~1 step back twice');
 isnt(head(), $c3, 'not once');
 $first->quit;
 $second->quit;
+
+# A hard reset by a role that isn't the database's owner, to the head, of
+# a protected branch, waiting behind the owner's move of it: its check is
+# of the head the owner left, so it is refused as a move of the branch to
+# another commit, not run as one to its head.
+sql(q{CREATE ROLE regress_w IN ROLE pg_prolly_write;
+	GRANT USAGE ON SCHEMA app TO regress_w;
+	GRANT ALL ON app.t TO regress_w;
+	SELECT dolt_commit('-Am', 'granted')});
+sql(q{SELECT dolt_reset('--hard'); SELECT dolt_branch('--protect', 'main')});
+my $old = head();
+my $owner = $node->background_psql('sr');
+$owner->query_safe(q{BEGIN; SELECT dolt_reset('--hard', 'HEAD~1')});
+my $moved_to = $owner->query_safe(q{SELECT dolt_hashof('HEAD')});
+chomp $moved_to;
+my $writer = $node->background_psql('sr', on_error_stop => 0);
+my $wpid = $writer->query_safe('SELECT pg_backend_pid()');
+chomp $wpid;
+$writer->query_until(qr/started/, qq{\\echo started
+SET ROLE regress_w;
+SELECT dolt_reset('--hard', '$old') IS NOT NULL AS moved;
+\\echo done
+});
+ok(waits_for_lock($wpid), 'the hard reset waits for the owner\'s move');
+$owner->query_safe('COMMIT');
+$writer->query_until(qr/done/, '');
+like($writer->{stderr}, qr/branch "main" is protected/,
+	'then is refused: the protected branch\'s head moved since it was asked');
+is(head(), $moved_to, 'the head stays where the owner moved it');
+$owner->quit;
+$writer->quit;
 
 $node->stop;
 done_testing();
