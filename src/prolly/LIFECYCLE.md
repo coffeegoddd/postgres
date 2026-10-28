@@ -116,6 +116,21 @@ per commit, four branches; medians, every checkout verified row by row.
 | Reset to a commit in the window | ~8k rows replayed | 162 ms (replay 70 ms) |
 | Background checkpoints | 34 during the run | mean 61 ms, max 131 ms |
 
+At 10× the data (100M rows, 17 GB, past the 16 GB buffer pool), same
+workload, every checkout verified:
+
+| Operation | 10M rows (1.8 GB) | 100M rows (17 GB) | Growth for 10× data |
+|---|---|---|---|
+| Dolt commit | 123 ms | 180 ms | 1.5× |
+| diff WORKING X (~36k rows) | 220 ms (prolly diff 69 ms) | 298 ms (prolly diff 123 ms) | 1.4× (diff 1.8×) |
+| Branch switch (~16k rows) | 233 ms (8.1 µs/row) | 502 ms (10.6 µs/row) | 2.2× |
+| Reset (~8k rows) | 162 ms (8.6 µs/row) | 212 ms (11.4 µs/row) | 1.3× |
+| Background checkpoint | mean 61 ms | mean 136 ms | 2.2× |
+
+Costs follow the change, with sublinear growth from the taller trees and
+from the table no longer fitting in the buffer pool (random row replay
+starts to miss), not O(data).
+
 - Replay costs ~8 µs per row against ~150 µs per page for keyframe restore
   as built (~2 pages per row here): ~30× cheaper per change on this
   workload.
