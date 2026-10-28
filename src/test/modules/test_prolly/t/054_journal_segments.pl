@@ -3,7 +3,8 @@
 # The journal's segments: a standby's are the primary's byte for byte; a
 # crash keeps every segment the manifest names, and a root written over a
 # PAD in a segment sealed meanwhile; a seal that fails before its manifest
-# leaves no segment named, and the next one removes what it left.
+# leaves no segment named, and the next one removes what it left, under an
+# id never given again.
 
 use strict;
 use warnings FATAL => 'all';
@@ -79,7 +80,9 @@ SKIP:
 	$root = $h;
 
 	# A seal that fails between its segment and its manifest leaves the
-	# segment unnamed; the next seal removes it, and takes its id.
+	# segment unnamed; the next seal removes it, and takes the next id (the
+	# removed one's isn't given again: redo of its removal, after a crash,
+	# would remove a segment made again under it).
 	sql(q{SELECT injection_points_attach('prolly-segment-made', 'error')});
 	my ($ret, $out, $err) = $node->psql('postgres', 'SELECT test_chunk_seal()');
 	like($err, qr/error triggered for injection point prolly-segment-made/,
@@ -89,8 +92,8 @@ SKIP:
 	sql('SELECT test_chunk_seal()');
 	is(sql(q{SELECT string_agg(name, ' ' ORDER BY name) FROM test_chunk_segments()}),
 		'prolly_journal prolly_journal_0000000000000001 prolly_journal_0000000000000002 '
-		. 'prolly_journal_0000000000000003 prolly_journal_0000000000000004',
-		'the next seal takes its id');
+		. 'prolly_journal_0000000000000003 prolly_journal_0000000000000005',
+		'the next seal takes the next id');
 	is(sql(q{SELECT count(*) FROM
 		(SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'postgres') db,
 		pg_ls_dir(d) f WHERE f LIKE 'prolly\_journal%'}), '5', 'no segment file left unnamed');

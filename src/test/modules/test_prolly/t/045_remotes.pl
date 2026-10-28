@@ -83,7 +83,8 @@ SKIP:
 	  if $ENV{enable_injection_points} ne 'yes';
 
 	# A fetch that fails after writing its table file, before naming it:
-	# the file stays unnamed, and the next fetch writes over it.  (The
+	# the file stays unnamed, and the next fetch removes it, naming its own
+	# under a new id (one whose removal is logged isn't given again).  (The
 	# injection point is this session's alone.)
 	sql('b', 'CREATE EXTENSION injection_points');
 	my ($ret, $out, $err) = $node->psql('b', q{SELECT injection_points_set_local();
@@ -97,7 +98,9 @@ SKIP:
 	my $left = on_disk('b');
 	isnt($left, '', 'its file stays on disk, unnamed');
 	sql('b', 'SELECT dolt_fetch()');
-	is(sql('b', $named), $left, 'the next fetch writes over it, and names it');
+	my $now = sql('b', $named);
+	is(on_disk('b'), $now, 'the next fetch removes it, and names its own');
+	isnt((split /:/, $now)[0], (split /:/, $left)[0], 'under a new id');
 }
 
 sql('b', 'SELECT dolt_fetch()');
