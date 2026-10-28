@@ -36,14 +36,14 @@ sql(q{
 });
 my $log = sql(q{SELECT 'pg_toast.pg_prolly_log_' || 's.t'::regclass::oid});
 
-# The log past the threshold, and the branch's refs held by a session's
-# open transaction, begun after the writes (they are what it sees), before
-# autovacuum's folds are turned on: autovacuum neither waits for the refs
-# nor folds.
+# The log past the threshold, and the refs held by a session's open
+# transaction (a branch made, which holds every ref to its end), begun
+# after the writes (they are what it sees), before autovacuum's folds are
+# turned on: autovacuum neither waits for the refs nor folds.
 sql(q{UPDATE s.t SET v = 1 WHERE id <= 3000});
 my $holder = $node->background_psql('postgres');
 $holder->query_safe(q{BEGIN});
-$holder->query_safe(q{SELECT dolt_reset('--soft', 'HEAD')});
+$holder->query_safe(q{SELECT dolt_branch('held')});
 my $offset = -s $node->logfile;
 $node->append_conf('postgresql.conf', 'prolly.autofold_threshold = 0.05');
 $node->reload;
