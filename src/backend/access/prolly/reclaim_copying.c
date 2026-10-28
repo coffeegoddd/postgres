@@ -1147,8 +1147,8 @@ mark_none(const ProllyHash *hash, const char *data, Size len, void *arg)
  * next default collection collects), nothing dropped; the table files are
  * left as they are.  Copying is paced as marking is.
  */
-static void
-copying_move(ProllyGcResult *result)
+static bool
+copying_move(bool if_free, ProllyGcResult *result)
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
@@ -1160,8 +1160,10 @@ copying_move(ProllyGcResult *result)
 	int			nfiles = 0;
 	bool	   *keep;
 
-	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, false, &root,
+	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, if_free, &root,
 					 &nslots);
+	if (gc == NULL)
+		return false;			/* (another collection running, or given up) */
 	marks = MemoryContextAllocHuge(CurrentMemoryContext, nslots / 8 + 1);
 	memset(marks, 0xFF, nslots / 8 + 1);
 	PROLLY_CALL(cs, gc_files, gc, count_file, &nfiles);
@@ -1170,6 +1172,7 @@ copying_move(ProllyGcResult *result)
 	PROLLY_CALL(cs, gc_new, gc, true, mark_none, NULL);
 	PROLLY_CALL(cs, gc_swap, gc, marks, keep, result);
 	PROLLY_CALL(cs, gc_retire, gc);
+	return true;
 }
 
 const ProllyReclaimRoutine prolly_reclaim_copying = {
