@@ -31,6 +31,12 @@ $node->safe_psql('ws', q{CREATE EXTENSION test_prolly;
 sub sql { return $node->safe_psql('ws', $_[0]); }
 sub has { return sql("SELECT test_chunk_has('$_[0]')"); }
 
+# (not within a minute of a UTC day boundary, the batch's: a boundary
+# passing in the sleep below would seal)
+{
+	my $left = 86400 - time() % 86400;
+	sleep($left + 1) if $left < 60;
+}
 # The first seal: the store's first generation ends, though nothing in it
 # is live.
 sql(q{SELECT test_chunk_put('the first generation''s')});

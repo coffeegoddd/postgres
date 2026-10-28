@@ -103,8 +103,10 @@
 #include "access/prolly_datum.h"
 #include "access/xact.h"
 #include "catalog/pg_database.h"
+#include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
@@ -3896,7 +3898,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 /* Background retires that fail this many times in a row: a full collection. */
 #define RETIRE_FAILURES_MOST	3
 #define LAST_FULL_SETTING	"history_window.last_full"
-#define LAST_SEALED_SETTING	"history_window.last_sealed"
+#define SEALED_FILE			"prolly_window_sealed"
 #define FAILURES_SETTING	"history_window.failures"
 #define RETRY_SETTING		"history_window.retry_at"
 #define TRANSIENT_SETTING	"history_window.transient"
@@ -4466,6 +4468,44 @@ newest_epoch(uint32 epoch, TimestampTz ended, void *arg)
 }
 
 /*
+ * The note of the background's last collection (sealed()): a file of the
+ * database's directory, beside its store, not in the store, which the
+ * note would change, and so have the next boundary's seal collect again,
+ * nor in the refs, whose lock the background would then wait for.  Not
+ * WAL-logged, nor synced: lost (a crash, a standby promoted, a backup
+ * restored), the next seal is due at the next visit, one more collection.
+ */
+static char *
+sealed_path(void)
+{
+	char	   *dir = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
+	char	   *path = psprintf("%s/%s", dir, SEALED_FILE);
+
+	pfree(dir);
+	return path;
+}
+
+static TimestampTz
+sealed_at(void)
+{
+	char	   *path = sealed_path();
+	char		buf[32];
+	int			fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	ssize_t		n = -1;
+
+	if (fd >= 0)
+	{
+		n = read(fd, buf, sizeof(buf) - 1);
+		CloseTransientFile(fd);
+	}
+	pfree(path);
+	if (n <= 0)
+		return DT_NOBEGIN;
+	buf[n] = '\0';
+	return (TimestampTz) strtoll(buf, NULL, 10);
+}
+
+/*
  * A batch boundary passed since the store's newest generation ended, or
  * the background's last collection did (sealed()), whichever is later (the
  * database's batch, an hour where it names none): only while some lineage
@@ -4492,7 +4532,7 @@ archive_seal_due(void)
 	boundary = now - (((now % batch) + batch) % batch);
 	PROLLY_CALL(tree_env.chunk_store, epochs, tree_env.chunks, newest_epoch,
 				&newest);
-	newest = Max(newest, config_int(LAST_SEALED_SETTING, DT_NOBEGIN));
+	newest = Max(newest, sealed_at());
 	return newest < boundary;
 }
 
@@ -4504,8 +4544,29 @@ archive_seal_due(void)
 static void
 archive_sealed(void)
 {
-	window_init();
-	config_int_set(LAST_SEALED_SETTING, GetCurrentTimestamp(), false);
+	char	   *path = sealed_path();
+	char	   *temp = psprintf("%s.tmp", path);
+	char		buf[32];
+	int			len = snprintf(buf, sizeof(buf), INT64_FORMAT,
+							   (int64) GetCurrentTimestamp());
+	int			fd = OpenTransientFile(temp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	bool		written;
+
+	/* (a note that can't be written costs a seal more: no error) */
+	written = fd >= 0 && write(fd, buf, len) == len;
+	if (!written)
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", temp)));
+	if (fd >= 0)
+		CloseTransientFile(fd);
+	if (written && rename(temp, path) != 0)
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						temp, path)));
+	pfree(temp);
+	pfree(path);
 }
 
 /*

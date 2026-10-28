@@ -71,7 +71,9 @@
  *   ran (it ended a generation, whether or not it settled anything), so
  *   seal_due() counts from it: a collection that settled nothing new
  *   records no generation in the store, and the next seal would otherwise
- *   be due at once.
+ *   be due at once.  The note is kept outside the store and the refs:
+ *   written to the store, it would itself be due to be sealed, and the
+ *   refs' lock may be held.
  * - archived() says whether commit id is past the horizon: a top of a
  *   fragment, named by a boundary commit.  edges() visits the horizon's
  *   boundary edges (a boundary commit and the parent it doesn't keep) as

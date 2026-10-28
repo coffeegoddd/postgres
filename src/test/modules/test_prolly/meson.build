@@ -537,6 +537,7 @@ tests += {
       't/877_refs_gets_fresh.pl',
       't/878_refs_memo_carry_error.pl',
       't/881_window_seal_timing.pl',
+      't/883_window_seal_idle.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',

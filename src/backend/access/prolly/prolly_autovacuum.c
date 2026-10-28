@@ -10,8 +10,14 @@
  * appends go to, written since the last collection, and the table files
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
- * collection, by the database's reclamation.  Only sizes are read, not the
- * journal.  Another collection running, it skips its own quietly (counted
+ * collection, by the database's reclamation.  A default collection also
+ * runs below those, once at each batch boundary of the history window
+ * passed since the store's newest generation ended or the background's
+ * last collection did (the window's seal_due(); its sealed() notes each
+ * collection), so the generations follow the batches; none with
+ * prolly.gc_journal_threshold -1, which turns the default collections
+ * off, though the window's full collections and retires still run.  Only
+ * sizes are read, not the journal.  Another collection running, it skips its own quietly (counted
  * in pg_stat_prolly's auto_collections_skipped): that one collects what
  * was due.  Then it moves the journal (the reclamation's move(): its
  * segments rewritten as a table file, nothing freed) once its segments
@@ -114,7 +120,7 @@ prolly_autovacuum_init(void)
 		return;
 	DefineCustomIntVariable("prolly.gc_journal_threshold",
 							"How far the chunk journal grows before autovacuum collects the chunk store.",
-							"-1 turns automatic collection off.",
+							"-1 turns off the default collections and the history window's seals; the window's full collections and retires, which free severed history, still run.",
 							&prolly_gc_journal_threshold,
 							128, -1, MAX_KILOBYTES / 1024,
 							PGC_SIGHUP,

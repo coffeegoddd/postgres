@@ -2041,6 +2041,19 @@ settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
 
+Autovacuum seals the store at each batch boundary (prolly.history_batch):
+a default collection, below the size thresholds, once a boundary has
+passed since the store's newest generation ended or since the
+background's last collection (the window's seal_due() and sealed()),
+with anything written since, so what came in a batch settles in a
+generation of its own and a fragment's data is in few of them.  The note
+of the last collection is a file beside the store, neither in it (the
+note would be new data, and an idle database would seal at every
+boundary) nor in the refs (whose lock the background would wait for);
+lost, a seal runs one visit early.  prolly.gc_journal_threshold -1 turns
+seals off with the default collections; the window's full collections
+and retires, which free severed history, still run.
+
 The window is the database's.  prolly.history_window (how long each
 branch's history is kept here), prolly.history_min_commits (how many of a
 branch's newest commits are kept however old), prolly.history_batch
