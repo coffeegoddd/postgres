@@ -9,6 +9,7 @@
  * the window decides otherwise), and each branch holds its working root.
  * Mutating repo calls release the context's pins once results are held.
  */
+#include <sys/types.h>
 #include <time.h>
 
 #include "vc.h"
@@ -727,6 +728,8 @@ vc_repo_free(VcRepo *r)
 	for (size_t i = 0; i < r->nhints; i++)
 		free(r->hints[i]);
 	free(r->hints);
+	free(r->img_commit);
+	free(r->img_hash);
 	free(r->name);
 	prolly_ctx_free(&r->ctx);
 	memset(r, 0, sizeof(*r));
@@ -965,6 +968,75 @@ vc_log(VcRepo *r, const PHash *start, size_t max, unsigned flags,
 	return VC_OK;
 }
 
+/* ---------------------------------------------------------- commit images */
+
+static ssize_t
+image_slot(VcRepo *r, const PHash *commit)
+{
+	for (size_t i = 0; i < r->nimg; i++)
+		if (phash_eq(&r->img_commit[i], commit))
+			return (ssize_t) i;
+	return -1;
+}
+
+static void
+image_release(VcRepo *r, const PHash *commit)
+{
+	ssize_t		i = image_slot(r, commit);
+
+	if (i < 0)
+		return;
+	cs_unref_root(r->ctx.cs, &r->img_hash[i]);
+	r->nimg--;
+	r->img_commit[i] = r->img_commit[r->nimg];
+	r->img_hash[i] = r->img_hash[r->nimg];
+}
+
+int
+vc_image_set(VcRepo *r, const PHash *commit, const PHash *image)
+{
+	ssize_t		i;
+
+	if (!in_window(r, commit))
+	{
+		r->ctx.err_hash = *commit;
+		return VC_ERR_OUTSIDE_WINDOW;
+	}
+	if (!cs_has(r->ctx.cs, image))
+	{
+		r->ctx.err_hash = *image;
+		return VC_ERR;
+	}
+	cs_ref_root(r->ctx.cs, image);
+	i = image_slot(r, commit);
+	if (i >= 0)
+	{
+		cs_unref_root(r->ctx.cs, &r->img_hash[i]);
+		r->img_hash[i] = *image;
+	}
+	else
+	{
+		px_grow((void **) &r->img_commit, &r->imgcap, r->nimg + 1, sizeof(PHash));
+		r->img_hash = px_realloc(r->img_hash, r->imgcap * sizeof(PHash));
+		r->img_commit[r->nimg] = *commit;
+		r->img_hash[r->nimg] = *image;
+		r->nimg++;
+	}
+	prolly_release_pins(&r->ctx);
+	return VC_OK;
+}
+
+bool
+vc_image_get(VcRepo *r, const PHash *commit, PHash *image)
+{
+	ssize_t		i = image_slot(r, commit);
+
+	if (i < 0)
+		return false;
+	*image = r->img_hash[i];
+	return true;
+}
+
 /* --------------------------------------------------------------- window */
 
 /*
@@ -1051,6 +1123,10 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	phmap_free(&win);
 	if (n == 0)
 		return VC_OK;
+
+	/* commit images are only for the window: severed commits let theirs go */
+	for (size_t i = 0; i < n; i++)
+		image_release(r, &members[i]);
 
 	/* detach: the holds move to the segment; no chunk is read, copied or freed */
 	px_grow((void **) &r->segs, &r->segcap, r->nsegs + 1, sizeof(VcSegment));

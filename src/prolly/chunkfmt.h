@@ -24,6 +24,12 @@
  *			(member commit hash (strong), uvarint generation)..., uvarint nb,
  *			(boundary commit hash (weak))...
  *			Describes a segment exported to an archive and holds it there.
+ * Page:	tag, version, the page's bytes
+ * Image:	tag, version, uvarint pg major, uvarint page size, uvarint
+ *			catalog version, 8-byte system id, commit hash (weak), has-base
+ *			byte, [base image hash (weak)], uvarint lsn, uvarint snapshot xmin,
+ *			uvarint xmax, uvarint nxip, uvarint xip..., page map root (strong),
+ *			relation map root (strong)
  */
 #ifndef CHUNKFMT_H
 #define CHUNKFMT_H
@@ -35,6 +41,8 @@
 #define CHUNK_TAG_COMMIT 0x43
 #define CHUNK_TAG_DELTA 0x44
 #define CHUNK_TAG_MANIFEST 0x4d
+#define CHUNK_TAG_PAGE 0x47
+#define CHUNK_TAG_IMAGE 0x49
 
 /*
  * Covers the encodings and the chunk boundary function; anything that

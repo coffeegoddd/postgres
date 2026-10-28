@@ -179,6 +179,49 @@ manifest_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 	return p == end;
 }
 
+static bool
+image_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
+{
+	const uint8_t *p = data + 2;
+	const uint8_t *end = data + len;
+	uint64_t	v,
+				nxip;
+	PHash		h;
+
+	for (int i = 0; i < 3; i++)
+		if (!read_uvarint(&p, end, &v))
+			return false;
+	if (end - p < 8)
+		return false;
+	p += 8;
+	if (!read_hash(&p, end, &h))
+		return false;
+	fn(arg, &h, false);
+	if (p >= end)
+		return false;
+	if (*p++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, false);
+	}
+	for (int i = 0; i < 3; i++)	/* lsn, xmin, xmax */
+		if (!read_uvarint(&p, end, &v))
+			return false;
+	if (!read_uvarint(&p, end, &nxip) || nxip > len)
+		return false;
+	for (uint64_t i = 0; i < nxip; i++)
+		if (!read_uvarint(&p, end, &v))
+			return false;
+	for (int i = 0; i < 2; i++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, true);
+	}
+	return p == end;
+}
+
 bool
 chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 {
@@ -196,6 +239,10 @@ chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 			return delta_refs(data, len, fn, arg);
 		case CHUNK_TAG_MANIFEST:
 			return manifest_refs(data, len, fn, arg);
+		case CHUNK_TAG_PAGE:
+			return true;
+		case CHUNK_TAG_IMAGE:
+			return image_refs(data, len, fn, arg);
 		default:
 			return false;
 	}

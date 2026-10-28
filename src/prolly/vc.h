@@ -182,6 +182,10 @@ typedef struct VcRepo
 	char	  **hints;
 	size_t		nhints;
 	size_t		hintcap;
+	PHash	   *img_commit;		/* commit images held, by commit */
+	PHash	   *img_hash;
+	size_t		nimg;
+	size_t		imgcap;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -257,6 +261,14 @@ extern int	vc_segment_export(VcRepo *r, uint32_t seg, const VcSource *archive);
 extern int	vc_segment_discard(VcRepo *r, uint32_t seg);
 extern int	vc_segment_attach(VcRepo *r, uint32_t seg);
 extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32_t *seg);
+
+/*
+ * Commit images (see image.h) are local optimization artifacts: a commit
+ * in the window may hold one, replacing any it held before, and severing
+ * the commit releases it.  They are never exported or sent to remotes.
+ */
+extern int	vc_image_set(VcRepo *r, const PHash *commit, const PHash *image);
+extern bool vc_image_get(VcRepo *r, const PHash *commit, PHash *image);
 
 /* Archives: list and read the manifests of segments exported there. */
 extern void vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n);

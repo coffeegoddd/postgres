@@ -99,6 +99,8 @@ decref_fn(void *arg, const PHash *h, bool strong)
 	if (!strong)
 		return;
 	m = f->cs->ops->meta(f->cs, h);
+	if (m == NULL)
+		return;					/* already damaged: nothing to release */
 	m->refs--;
 	f->cs->stats.ref_updates++;
 	if (is_dead(m))
@@ -156,8 +158,10 @@ cs_ref_root(ChunkStore *cs, const PHash *h)
 void
 cs_unref_root(ChunkStore *cs, const PHash *h)
 {
-	ChunkMeta  *m = must_meta(cs, h);
+	ChunkMeta  *m = cs->ops->meta(cs, h);
 
+	if (m == NULL)
+		return;					/* already damaged: nothing to release */
 	if (m->roots == 0)
 		abort();
 	if (--m->roots == 0 && is_dead(m))
@@ -173,8 +177,10 @@ cs_pin(ChunkStore *cs, const PHash *h)
 void
 cs_unpin(ChunkStore *cs, const PHash *h)
 {
-	ChunkMeta  *m = must_meta(cs, h);
+	ChunkMeta  *m = cs->ops->meta(cs, h);
 
+	if (m == NULL)
+		return;					/* already damaged: nothing to release */
 	if (m->pins == 0)
 		abort();
 	if (--m->pins == 0 && is_dead(m))

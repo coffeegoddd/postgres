@@ -624,6 +624,27 @@ test_missing_chunk_errors(void)
 	cs_destroy(cs);
 }
 
+/* Letting go of a tree whose store is already damaged frees the rest, no crash. */
+static void
+test_release_over_damage(void)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx;
+	PHash		a,
+				leaf;
+
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	a = build_even_rows(&ctx, 5000);	/* held by pins only */
+	leaf = leaf_holding(&ctx, &a, 4000);
+	prolly_release_pins(&ctx);		/* drops the edit leaf_holding made */
+	a = build_even_rows(&ctx, 5000);
+	cs->ops->del(cs, &leaf);	/* damage under a still-pinned tree */
+	prolly_release_pins(&ctx);
+	CHECK_EQ(cs->ops->count(cs), 0);
+	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
+}
+
 /* ------------------------------------------------------------ chunk diff */
 
 static void
@@ -1145,6 +1166,7 @@ main(void)
 	RUN(test_failed_edit_leaves_no_garbage);
 	RUN(test_orphan_sweep_after_crash);
 	RUN(test_missing_chunk_errors);
+	RUN(test_release_over_damage);
 	RUN(test_chunk_diff_exact);
 	RUN(test_sever_frees_chunk_diff);
 	RUN(test_repair_restores_severed_tree);
