@@ -5069,6 +5069,18 @@ VirtualXactLockUnprepared(VirtualTransactionId vxid)
 }
 
 /*
+ *		ConditionalVirtualXactLockUnprepared
+ *
+ * Has the given VXID's transaction ended or been prepared?  As
+ * VirtualXactLockUnprepared(), but never waiting: false while it runs.
+ */
+bool
+ConditionalVirtualXactLockUnprepared(VirtualTransactionId vxid)
+{
+	return VirtualXactLockGuts(vxid, false, false);
+}
+
+/*
  * LockWaiterCount
  *
  * Find the number of lock requester on this locktag

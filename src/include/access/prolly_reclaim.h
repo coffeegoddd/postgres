@@ -27,7 +27,11 @@
  *   chunk, garbage and all (not settled: the next default collection still
  *   collects it), so the journal a backend indexes by reading it stays
  *   short.  It frees nothing, and leaves the table files as they are.
- *   Optional.
+ *   Optional.  With if_free, as collect(): false if another collection
+ *   runs or it was given up before it began.
+ * - With if_free, a collection, retire or move waits for a transaction no
+ *   longer than prolly_gc_free_wait (prolly_chunkstore.h), and is given up
+ *   rather than wait longer.
  *
  * Provisional (v0).
  *
@@ -53,8 +57,12 @@ typedef struct ProllyReclaimRoutine
 	 */
 	bool		(*collect) (bool full, bool if_free, ProllyGcResult *result);
 
-	/* Move what was written since the last collection, freeing nothing. */
-	void		(*move) (ProllyGcResult *result);
+	/*
+	 * Move what was written since the last collection, freeing nothing.
+	 * False if if_free and another collection of the store is running, or
+	 * it was given up.
+	 */
+	bool		(*move) (bool if_free, ProllyGcResult *result);
 
 	/*
 	 * Optional: retire the store's generations lo to hi, freeing what of
