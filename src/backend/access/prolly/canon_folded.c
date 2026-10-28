@@ -405,12 +405,18 @@ static void
 finder_fold_run(void *arg)
 {
 	FinderFold *f = arg;
+#ifdef USE_INJECTION_POINTS
+	char		filenode[16];
+
+	/* (told the table's file number, if the fold is the fold worker's) */
+	snprintf(filenode, sizeof(filenode), "%u", f->rel->rd_locator.relNumber);
+#endif
 
 	if (f->next)
 		resetStringInfo(f->next);
-	/* (the table locked, its fold about to begin: the fold worker's, or not) */
+	/* (the table locked, its fold about to begin) */
 	INJECTION_POINT("prolly-fold-table",
-					AmBackgroundWorkerProcess() ? "worker" : "session");
+					AmBackgroundWorkerProcess() ? filenode : NULL);
 	PROLLY_CALL(f->finder, fold, f->rel, f->env, f->baseline, f->why, f->data, f->next);
 }
 

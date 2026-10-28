@@ -9,9 +9,10 @@
 # (restores_lock_busy).  Afterwards the rows are the commit's, the working
 # set is clean, and a later commit holds what was written since.
 #
-# The fold is held mid-fold, the table locked, at an injection point, on
-# the branch the commits were made on (a restore of its own storage) and
-# on another branch made of its head (a share of the kept pages).
+# The worker's fold is held mid-fold, the table locked, at an injection
+# point, on the branch the commits were made on (a restore of its own
+# storage) and on another branch made of its head (a share of the kept
+# pages).
 
 use strict;
 use warnings FATAL => 'all';
@@ -80,7 +81,10 @@ sub reset_beside_fold
 	my ($branch) = @_;
 	my $co = "SELECT dolt_checkout('$branch') IS NOT NULL;";
 
-	sql(q{SELECT injection_points_attach('prolly-fold-table', 'wait', 'worker')});
+	# (the point told each table's file number, and stopping at the
+	# branch's copy of app.t only: the worker may fold another branch first)
+	my @fn = split /\n/, sql(qq{$co SELECT pg_relation_filenode('app.t')});
+	sql(qq{SELECT injection_points_attach('prolly-fold-table', 'wait', '$fn[-1]')});
 	sql(qq{$co UPDATE app.t SET rev = 99 WHERE id <= 18000});
 	ok( $node->poll_query_until(
 			'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
