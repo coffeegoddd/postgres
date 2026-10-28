@@ -547,12 +547,18 @@ Per cycle (`v11-cycles.jsonl`):
   young set's; the younger files' section entries;
 - the retire's WAL bytes, and the streaming standby's replay time after
   it: one session on the standby, kept open, polls its replay LSN through
-  the retire, and `standby_replay_resolution_ms` is the gap between the
-  poll that saw the retire replayed and the one before;
+  the retire.  The replay time is the first poll that saw the retire's
+  WAL replayed, whether taken before the harness knew the retire's end
+  LSN or after, so it can be <= 0 (already replayed when the retire
+  returned); `standby_replay_resolution_ms` is the gap between that poll
+  and the one before;
 - the store's bytes as the manifest has them and its files' bytes on the
-  filesystem (`store_files_mismatch` when they differ: a leaked or
-  missing file), the manifest's and index's bytes, the data directory's
-  bytes without `pg_wal`, and `pg_wal`'s;
+  filesystem; `store_files_mismatch` when the table files on disk, by
+  name and size, or the count of journal segments differ from what the
+  manifest names, read before the walk and again after it (a leaked or
+  missing file; a segment's growth between the reads isn't one); the
+  manifest's and index's bytes, the data directory's bytes without
+  `pg_wal`, and `pg_wal`'s;
 - the table files and their sections' bytes (read from the files'
   footers), and the sections of the files the cycle made;
 - `pg_stat_prolly`'s deltas;
