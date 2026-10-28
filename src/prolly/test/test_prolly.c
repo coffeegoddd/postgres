@@ -55,7 +55,7 @@ model_build(ProllyCtx *ctx, const Model *m)
 		batch_put(&b, k, m->version[k]);
 		kvs[n++] = (ProllyKV) {b.e[b.n - 1].key, 8, b.e[b.n - 1].val, VAL_LEN};
 	}
-	root = prolly_build(ctx, kvs, n);
+	root = t_build(ctx, kvs, n);
 	free(kvs);
 	batch_free(&b);
 	return root;
@@ -64,7 +64,7 @@ model_build(ProllyCtx *ctx, const Model *m)
 static void
 check_matches_model(ProllyCtx *ctx, const PHash *root, const Model *m)
 {
-	ProllyIter *it = prolly_iter_open(ctx, root, NULL, 0);
+	ProllyIter *it = t_iter(ctx, root, NULL, 0);
 	const uint8_t *k,
 			   *v;
 	size_t		kl,
@@ -73,7 +73,7 @@ check_matches_model(ProllyCtx *ctx, const PHash *root, const Model *m)
 				seen = 0;
 	PHash		canonical;
 
-	while (prolly_iter_next(it, &k, &kl, &v, &vl))
+	while (t_next(it, &k, &kl, &v, &vl))
 	{
 		uint64_t	key;
 
@@ -90,7 +90,7 @@ check_matches_model(ProllyCtx *ctx, const PHash *root, const Model *m)
 	prolly_iter_close(it);
 	for (; next < m->keyspace; next++)
 		CHECK(!m->present[next]);
-	CHECK_EQ(prolly_count(ctx, root), seen);
+	CHECK_EQ(t_count(ctx, root), seen);
 	CHECK_EQ(seen, model_count(m));
 
 	/* same contents, built from scratch, must give the same root */
@@ -130,9 +130,10 @@ static void
 test_empty_map(void)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, prolly_default_policy};
-	PHash		e = prolly_empty(&ctx);
-	PHash		built = prolly_build(&ctx, NULL, 0);
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	PHash		e = t_empty(&ctx);
+	PHash		built = t_build(&ctx, NULL, 0);
 	const uint8_t *v;
 	size_t		vl;
 	uint8_t		key[8];
@@ -140,15 +141,16 @@ test_empty_map(void)
 	ProllyDiffList d;
 
 	CHECK(phash_eq(&e, &built));
-	CHECK_EQ(prolly_count(&ctx, &e), 0);
-	CHECK_EQ(prolly_height(&ctx, &e), 1);
+	CHECK_EQ(t_count(&ctx, &e), 0);
+	CHECK_EQ(t_height(&ctx, &e), 1);
 	put_u64(key, 1);
-	CHECK(!prolly_get(&ctx, &e, key, 8, &v, &vl));
-	it = prolly_iter_open(&ctx, &e, NULL, 0);
-	CHECK(!prolly_iter_next(it, &v, &vl, &v, &vl));
+	CHECK(!t_get(&ctx, &e, key, 8, &v, &vl));
+	it = t_iter(&ctx, &e, NULL, 0);
+	CHECK(!t_next(it, &v, &vl, &v, &vl));
 	prolly_iter_close(it);
-	prolly_diff_collect(&ctx, &e, &e, &d);
+	CHECK_OK(prolly_diff_collect(&ctx, &e, &e, &d));
 	CHECK_EQ(d.n, 0);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -161,8 +163,9 @@ random_edits_case(const ChunkPolicy *policy, uint64_t seed, uint64_t keyspace,
 				  int rounds, size_t max_batch)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, *policy};
-	PHash		root = prolly_empty(&ctx);
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, policy);
+	PHash		root = t_empty(&ctx);
 	Model		m;
 	EditBatch	b;
 
@@ -195,7 +198,7 @@ random_edits_case(const ChunkPolicy *policy, uint64_t seed, uint64_t keyspace,
 				m.version[k] = ver;
 			}
 		}
-		root = prolly_apply(&ctx, &root, b.e, b.n);
+		root = t_apply(&ctx, &root, b.e, b.n);
 		check_matches_model(&ctx, &root, &m);
 		for (int i = 0; i < 20; i++)
 		{
@@ -206,7 +209,7 @@ random_edits_case(const ChunkPolicy *policy, uint64_t seed, uint64_t keyspace,
 			bool		found;
 
 			put_u64(key, k);
-			found = prolly_get(&ctx, &root, key, 8, &v, &vl);
+			found = t_get(&ctx, &root, key, 8, &v, &vl);
 			CHECK(found == m.present[k]);
 			if (found)
 				CHECK(get_u64(v + 8) == m.version[k]);
@@ -223,14 +226,15 @@ random_edits_case(const ChunkPolicy *policy, uint64_t seed, uint64_t keyspace,
 			batch_del(&b, k);
 			m.present[k] = false;
 		}
-	root = prolly_apply(&ctx, &root, b.e, b.n);
+	root = t_apply(&ctx, &root, b.e, b.n);
 	{
-		PHash		e = prolly_empty(&ctx);
+		PHash		e = t_empty(&ctx);
 
 		CHECK(phash_eq(&root, &e));
 	}
 	batch_free(&b);
 	model_free(&m);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -252,8 +256,9 @@ test_single_key_edits(void)
 {
 	/* one-edit batches: inserts at both ends, the middle, and deletes */
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, small_policy};
-	PHash		root = prolly_empty(&ctx);
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	PHash		root = t_empty(&ctx);
 	Model		m;
 	EditBatch	b;
 
@@ -276,13 +281,14 @@ test_single_key_edits(void)
 			m.present[k] = true;
 			m.version[k] = (uint64_t) i;
 		}
-		root = prolly_apply(&ctx, &root, b.e, b.n);
+		root = t_apply(&ctx, &root, b.e, b.n);
 		if (i % 250 == 0)
 			check_matches_model(&ctx, &root, &m);
 	}
 	check_matches_model(&ctx, &root, &m);
 	batch_free(&b);
 	model_free(&m);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -291,7 +297,8 @@ test_history_independence(void)
 {
 	const uint64_t n = 30000;
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, small_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &small_policy);
 	PHash		expect = build_even_rows(&ctx, n);
 	uint64_t   *order = px_malloc(n * sizeof(uint64_t));
 	EditBatch	b;
@@ -299,7 +306,7 @@ test_history_independence(void)
 	batch_init(&b, n);
 	for (int trial = 0; trial < 4; trial++)
 	{
-		PHash		root = prolly_empty(&ctx);
+		PHash		root = t_empty(&ctx);
 		size_t		done = 0;
 
 		rng_seed(100 + (uint64_t) trial);
@@ -329,7 +336,7 @@ test_history_independence(void)
 			b.n = 0;
 			for (size_t i = 0; i < chunk && done < n; i++, done++)
 				batch_put(&b, order[done] * 2, 0);
-			root = prolly_apply(&ctx, &root, b.e, b.n);
+			root = t_apply(&ctx, &root, b.e, b.n);
 		}
 		CHECK(phash_eq(&root, &expect));
 
@@ -337,16 +344,17 @@ test_history_independence(void)
 		b.n = 0;
 		for (uint64_t i = 0; i < n / 2; i++)
 			batch_del(&b, order[i] * 2);
-		root = prolly_apply(&ctx, &root, b.e, b.n);
+		root = t_apply(&ctx, &root, b.e, b.n);
 		CHECK(!phash_eq(&root, &expect));
 		b.n = 0;
 		for (uint64_t i = 0; i < n / 2; i++)
 			batch_put(&b, order[i] * 2, 0);
-		root = prolly_apply(&ctx, &root, b.e, b.n);
+		root = t_apply(&ctx, &root, b.e, b.n);
 		CHECK(phash_eq(&root, &expect));
 	}
 	free(order);
 	batch_free(&b);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -354,7 +362,8 @@ static void
 test_iter_from_key(void)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, small_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &small_policy);
 	PHash		root = build_even_rows(&ctx, 5000);
 
 	for (uint64_t start = 0; start < 10002; start += 37)
@@ -369,8 +378,8 @@ test_iter_from_key(void)
 		int			seen = 0;
 
 		put_u64(key, start);
-		it = prolly_iter_open(&ctx, &root, key, 8);
-		while (seen < 30 && prolly_iter_next(it, &k, &kl, &v, &vl))
+		it = t_iter(&ctx, &root, key, 8);
+		while (seen < 30 && t_next(it, &k, &kl, &v, &vl))
 		{
 			CHECK(get_u64(k) == expect);
 			expect += 2;
@@ -380,6 +389,7 @@ test_iter_from_key(void)
 			CHECK(seen == 0);
 		prolly_iter_close(it);
 	}
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -418,7 +428,8 @@ test_diff_matches_model(void)
 {
 	const uint64_t keyspace = 20000;
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, small_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &small_policy);
 
 	for (int trial = 0; trial < 12; trial++)
 	{
@@ -453,7 +464,7 @@ test_diff_matches_model(void)
 			x.to = dir ? &a : &b;
 			x.next = 0;
 			x.n = 0;
-			prolly_diff(&ctx, dir ? &rb : &ra, dir ? &ra : &rb, diff_check_fn, &x);
+			CHECK_OK(prolly_diff(&ctx, dir ? &rb : &ra, dir ? &ra : &rb, diff_check_fn, &x));
 			for (; x.next < keyspace; x.next++)
 				CHECK(x.from->present[x.next] == x.to->present[x.next] &&
 					  (!x.from->present[x.next] ||
@@ -462,6 +473,7 @@ test_diff_matches_model(void)
 		model_free(&a);
 		model_free(&b);
 	}
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -469,7 +481,8 @@ static void
 test_merge(void)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, small_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &small_policy);
 	PHash		base = build_even_rows(&ctx, 10000);
 	PHash		ours,
 				theirs,
@@ -499,23 +512,23 @@ test_merge(void)
 		all.e[all.n++] = o.e[i];
 	for (size_t i = 0; i < t.n; i++)
 		all.e[all.n++] = t.e[i];
-	ours = prolly_apply(&ctx, &base, o.e, o.n);
-	theirs = prolly_apply(&ctx, &base, t.e, t.n);
-	expect = prolly_apply(&ctx, &base, all.e, all.n);
-	prolly_merge(&ctx, &base, &ours, &theirs, &mr);
+	ours = t_apply(&ctx, &base, o.e, o.n);
+	theirs = t_apply(&ctx, &base, t.e, t.n);
+	expect = t_apply(&ctx, &base, all.e, all.n);
+	CHECK_OK(prolly_merge(&ctx, &base, &ours, &theirs, &mr));
 	CHECK_EQ(mr.nconflicts, 0);
 	CHECK(phash_eq(&mr.root, &expect));
 	prolly_merge_result_free(&mr);
-	prolly_merge(&ctx, &base, &theirs, &ours, &mr);
+	CHECK_OK(prolly_merge(&ctx, &base, &theirs, &ours, &mr));
 	CHECK_EQ(mr.nconflicts, 0);
 	CHECK(phash_eq(&mr.root, &expect));
 	prolly_merge_result_free(&mr);
 
 	/* trivial merges */
-	prolly_merge(&ctx, &base, &base, &theirs, &mr);
+	CHECK_OK(prolly_merge(&ctx, &base, &base, &theirs, &mr));
 	CHECK(phash_eq(&mr.root, &theirs) && mr.nconflicts == 0);
 	prolly_merge_result_free(&mr);
-	prolly_merge(&ctx, &base, &ours, &base, &mr);
+	CHECK_OK(prolly_merge(&ctx, &base, &ours, &base, &mr));
 	CHECK(phash_eq(&mr.root, &ours) && mr.nconflicts == 0);
 	prolly_merge_result_free(&mr);
 
@@ -526,9 +539,9 @@ test_merge(void)
 	batch_del(&o, 200);
 	batch_put(&t, 200, 2);
 	batch_put(&t, 300, 2);
-	ours = prolly_apply(&ctx, &base, o.e, o.n);
-	theirs = prolly_apply(&ctx, &base, t.e, t.n);
-	prolly_merge(&ctx, &base, &ours, &theirs, &mr);
+	ours = t_apply(&ctx, &base, o.e, o.n);
+	theirs = t_apply(&ctx, &base, t.e, t.n);
+	CHECK_OK(prolly_merge(&ctx, &base, &ours, &theirs, &mr));
 	CHECK_EQ(mr.nconflicts, 2);
 	CHECK(get_u64(mr.conflicts[0].key) == 100 && get_u64(mr.conflicts[1].key) == 200);
 	CHECK(get_u64(mr.conflicts[0].ours + 8) == 1 && get_u64(mr.conflicts[0].theirs + 8) == 2);
@@ -539,14 +552,15 @@ test_merge(void)
 		uint8_t		key[8];
 
 		put_u64(key, 300);
-		CHECK(prolly_get(&ctx, &mr.root, key, 8, &v, &vl) && get_u64(v + 8) == 2);
+		CHECK(t_get(&ctx, &mr.root, key, 8, &v, &vl) && get_u64(v + 8) == 2);
 		put_u64(key, 100);
-		CHECK(prolly_get(&ctx, &mr.root, key, 8, &v, &vl) && get_u64(v + 8) == 1);
+		CHECK(t_get(&ctx, &mr.root, key, 8, &v, &vl) && get_u64(v + 8) == 1);
 	}
 	prolly_merge_result_free(&mr);
 	batch_free(&o);
 	batch_free(&t);
 	batch_free(&all);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -605,7 +619,8 @@ static void
 scale_case(uint64_t n, ScaleResult *r)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, prolly_default_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	PHash		root,
 				edited,
 				ours,
@@ -623,7 +638,7 @@ scale_case(uint64_t n, ScaleResult *r)
 	root = build_even_rows(&ctx, n);
 	r->build_sec = now_sec() - t;
 	r->chunks = cs->ops->count(cs);
-	r->height = prolly_height(&ctx, &root);
+	r->height = t_height(&ctx, &root);
 	batch_init(&b, 2 * SCALE_K);
 
 	s = cs->stats;
@@ -634,12 +649,12 @@ scale_case(uint64_t n, ScaleResult *r)
 		size_t		vl;
 
 		put_u64(key, rnd_below(n) * 2);
-		CHECK(prolly_get(&ctx, &root, key, 8, &v, &vl));
+		CHECK(t_get(&ctx, &root, key, 8, &v, &vl));
 	}
 	r->get_reads = STATS_DELTA(cs, s, gets) / 1000.0;
 
 	s = cs->stats;
-	CHECK_EQ(prolly_count(&ctx, &root), n);
+	CHECK_EQ(t_count(&ctx, &root), n);
 	r->count_reads = STATS_DELTA(cs, s, gets);
 
 	/* single-row update, averaged over 50 rows */
@@ -648,7 +663,7 @@ scale_case(uint64_t n, ScaleResult *r)
 	{
 		b.n = 0;
 		batch_put(&b, rnd_below(n) * 2, 1000 + (uint64_t) i);
-		edited = prolly_apply(&ctx, &root, b.e, b.n);
+		edited = t_apply(&ctx, &root, b.e, b.n);
 	}
 	r->edit1_reads = STATS_DELTA(cs, s, gets) / 50;
 	r->edit1_writes = STATS_DELTA(cs, s, new_chunks) / 50;
@@ -657,28 +672,29 @@ scale_case(uint64_t n, ScaleResult *r)
 	random_edits(&b, n, SCALE_K, 1);
 	s = cs->stats;
 	t = now_sec();
-	edited = prolly_apply(&ctx, &root, b.e, b.n);
+	edited = t_apply(&ctx, &root, b.e, b.n);
 	r->editk_usec = (now_sec() - t) * 1e6;
 	r->editk_reads = STATS_DELTA(cs, s, gets);
 	r->editk_writes = STATS_DELTA(cs, s, new_chunks);
 
 	s = cs->stats;
-	prolly_diff(&ctx, &root, &edited, count_fn, &ndiff);
+	CHECK_OK(prolly_diff(&ctx, &root, &edited, count_fn, &ndiff));
 	r->diff_reads = STATS_DELTA(cs, s, gets);
 	CHECK(ndiff > 0 && ndiff <= SCALE_K);
 
 	/* three-way merge of k changes on each side */
 	random_edits(&b, n, SCALE_K, 2);
-	ours = prolly_apply(&ctx, &root, b.e, b.n);
+	ours = t_apply(&ctx, &root, b.e, b.n);
 	random_edits(&b, n, SCALE_K, 3);
-	theirs = prolly_apply(&ctx, &root, b.e, b.n);
+	theirs = t_apply(&ctx, &root, b.e, b.n);
 	s = cs->stats;
-	prolly_merge(&ctx, &root, &ours, &theirs, &mr);
+	CHECK_OK(prolly_merge(&ctx, &root, &ours, &theirs, &mr));
 	r->merge_reads = STATS_DELTA(cs, s, gets);
 	r->merge_writes = STATS_DELTA(cs, s, new_chunks);
 	prolly_merge_result_free(&mr);
 
 	batch_free(&b);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 
@@ -770,10 +786,11 @@ static void
 test_structural_sharing(void)
 {
 	ChunkStore *cs = memstore_create();
-	ProllyCtx	ctx = {cs, prolly_default_policy};
+	ProllyCtx	ctx;
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
 	PHash		root = build_even_rows(&ctx, 200000);
 	uint64_t	base_bytes = cs->ops->bytes(cs);
-	uint64_t	h = (uint64_t) prolly_height(&ctx, &root);
+	uint64_t	h = (uint64_t) t_height(&ctx, &root);
 	EditBatch	b;
 
 	rng_seed(9);
@@ -783,12 +800,13 @@ test_structural_sharing(void)
 		ChunkStoreStats s = cs->stats;
 
 		random_edits(&b, 200000, 10, (uint64_t) v + 10);
-		root = prolly_apply(&ctx, &root, b.e, b.n);
+		root = t_apply(&ctx, &root, b.e, b.n);
 		CHECK_LE(STATS_DELTA(cs, s, new_chunks), 3 * 10 * h);
 	}
 	/* 100 versions cost a few full copies' worth, not 100 */
 	CHECK_LE(cs->ops->bytes(cs) - base_bytes, base_bytes * 5);
 	batch_free(&b);
+	prolly_ctx_free(&ctx);
 	cs_destroy(cs);
 }
 

@@ -2,17 +2,33 @@
  * vc.c
  *	  Root values, commits, branches, merge and remotes.
  *
- * Schema chunk:	SCHEMA_TAG, DDL bytes
- * Commit chunk:	COMMIT_TAG, root hash, uvarint generation,
- *					uvarint nparents, (parent hash, uvarint generation)...,
- *					uvarint time, uvarint msglen, msg
- * Root value entry: table name -> schema hash, data root hash
+ * Schema and commit layouts are in chunkfmt.h.  A root value is a map from
+ * table name to (schema hash, data root hash), both held strongly.
+ *
+ * Holds: every commit is held by a root ref (history is kept whole until
+ * the window decides otherwise), and each branch holds its working root.
+ * Mutating repo calls release the context's pins once results are held.
  */
 #include "vc.h"
 
-#define SCHEMA_TAG 0x53
-#define COMMIT_TAG 0x43
 #define ENTRY_LEN (2 * PHASH_LEN)
+#define RV_VREFS 2				/* a table entry holds its schema and data root */
+
+/*
+ * The version-control layer does not yet handle history cut off by the
+ * window, so a tree error here is fatal.
+ */
+static void
+vc_must(ProllyCtx *ctx, int rc)
+{
+	char		hex[PHASH_HEX_LEN + 1];
+
+	if (rc >= 0)
+		return;
+	phash_hex(&ctx->err_hash, hex);
+	fprintf(stderr, "vc: tree error %d at chunk %s\n", rc, hex);
+	abort();
+}
 
 /* ---------------------------------------------------------- root values */
 
@@ -38,7 +54,10 @@ entry_decode(const uint8_t *v, size_t vl, VcTable *t)
 PHash
 vc_root_empty(ProllyCtx *ctx)
 {
-	return prolly_empty(ctx);
+	PHash		h;
+
+	vc_must(ctx, prolly_empty(ctx, RV_VREFS, &h));
+	return h;
 }
 
 bool
@@ -47,8 +66,11 @@ vc_table_get(ProllyCtx *ctx, const PHash *rv, const char *name, VcTable *out)
 	const uint8_t *v;
 	size_t		vl;
 
-	if (!prolly_get(ctx, rv, (const uint8_t *) name, strlen(name), &v, &vl))
+	int			rc = prolly_get(ctx, rv, (const uint8_t *) name, strlen(name), &v, &vl);
+
+	if (rc == PROLLY_NOT_FOUND)
 		return false;
+	vc_must(ctx, rc);
 	entry_decode(v, vl, out);
 	return true;
 }
@@ -59,8 +81,11 @@ put_entry(ProllyCtx *ctx, const PHash *rv, const char *name, const VcTable *t)
 	uint8_t		val[ENTRY_LEN];
 	ProllyEdit	e = {(const uint8_t *) name, strlen(name), val, ENTRY_LEN, false};
 
+	PHash		out;
+
 	entry_encode(val, t);
-	return prolly_apply(ctx, rv, &e, 1);
+	vc_must(ctx, prolly_apply(ctx, rv, &e, 1, &out));
+	return out;
 }
 
 static PHash
@@ -69,9 +94,10 @@ put_schema(ProllyCtx *ctx, const void *schema, size_t slen)
 	Buf			b = BUF_INIT;
 	PHash		h;
 
-	buf_append_byte(&b, SCHEMA_TAG);
+	buf_append_byte(&b, CHUNK_TAG_SCHEMA);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	buf_append(&b, schema, slen);
-	h = cs_put_chunk(ctx->cs, b.data, b.len);
+	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
 	buf_free(&b);
 	return h;
 }
@@ -82,10 +108,11 @@ vc_schema_get(ProllyCtx *ctx, const PHash *schema, size_t *len)
 	size_t		l;
 	const uint8_t *d = cs_get(ctx->cs, schema, &l);
 
-	if (d == NULL || l < 1 || d[0] != SCHEMA_TAG)
+	if (d == NULL || l < 2 || d[0] != CHUNK_TAG_SCHEMA ||
+		d[1] != CHUNK_FORMAT_VERSION)
 		return NULL;
-	*len = l - 1;
-	return d + 1;
+	*len = l - 2;
+	return d + 2;
 }
 
 int
@@ -97,7 +124,7 @@ vc_table_create(ProllyCtx *ctx, const PHash *rv, const char *name,
 	if (vc_table_get(ctx, rv, name, &t))
 		return -1;
 	t.schema = put_schema(ctx, schema, slen);
-	t.data = prolly_empty(ctx);
+	vc_must(ctx, prolly_empty(ctx, 0, &t.data));
 	*out = put_entry(ctx, rv, name, &t);
 	return 0;
 }
@@ -123,7 +150,7 @@ vc_table_drop(ProllyCtx *ctx, const PHash *rv, const char *name, PHash *out)
 
 	if (!vc_table_get(ctx, rv, name, &t))
 		return -1;
-	*out = prolly_apply(ctx, rv, &e, 1);
+	vc_must(ctx, prolly_apply(ctx, rv, &e, 1, out));
 	return 0;
 }
 
@@ -135,7 +162,7 @@ vc_table_edit(ProllyCtx *ctx, const PHash *rv, const char *name,
 
 	if (!vc_table_get(ctx, rv, name, &t))
 		return -1;
-	t.data = prolly_apply(ctx, &t.data, edits, n);
+	vc_must(ctx, prolly_apply(ctx, &t.data, edits, n, &t.data));
 	*out = put_entry(ctx, rv, name, &t);
 	return 0;
 }
@@ -181,7 +208,7 @@ vc_diff_tables(ProllyCtx *ctx, const PHash *from, const PHash *to,
 {
 	DiffTablesArg a = {fn, arg};
 
-	prolly_diff(ctx, from, to, diff_tables_fn, &a);
+	vc_must(ctx, prolly_diff(ctx, from, to, diff_tables_fn, &a));
 }
 
 typedef struct ConflictList
@@ -244,8 +271,9 @@ merge_table(ProllyCtx *ctx, const ProllyDiff *o, const ProllyDiff *t,
 		return false;
 	}
 
-	empty = prolly_empty(ctx);
-	prolly_merge(ctx, has_base ? &base.data : &empty, &ours.data, &theirs.data, &mr);
+	vc_must(ctx, prolly_empty(ctx, 0, &empty));
+	vc_must(ctx, prolly_merge(ctx, has_base ? &base.data : &empty, &ours.data,
+							  &theirs.data, &mr));
 	for (size_t i = 0; i < mr.nconflicts; i++)
 		add_conflict(cl, VC_CONFLICT_ROW, t->key, t->klen,
 					 mr.conflicts[i].key, mr.conflicts[i].klen);
@@ -267,8 +295,8 @@ vc_merge_roots(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 	size_t		nedits = 0,
 				a = 0;
 
-	prolly_diff_collect(ctx, base, ours, &dours);
-	prolly_diff_collect(ctx, base, theirs, &dtheirs);
+	vc_must(ctx, prolly_diff_collect(ctx, base, ours, &dours));
+	vc_must(ctx, prolly_diff_collect(ctx, base, theirs, &dtheirs));
 	edits = px_malloc(dtheirs.n * sizeof(ProllyEdit));
 	vals = px_malloc(dtheirs.n * ENTRY_LEN);
 	for (size_t b = 0; b < dtheirs.n; b++)
@@ -309,7 +337,9 @@ vc_merge_roots(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 			nedits++;
 		}
 	}
-	*out = nedits ? prolly_apply(ctx, ours, edits, nedits) : *ours;
+	*out = *ours;
+	if (nedits)
+		vc_must(ctx, prolly_apply(ctx, ours, edits, nedits, out));
 	*conflicts = cl.v;
 	*nconflicts = cl.n;
 	free(edits);
@@ -341,9 +371,10 @@ vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out)
 	uint64_t	np,
 				ml;
 
-	if (d == NULL || len < 1 + PHASH_LEN || d[0] != COMMIT_TAG)
+	if (d == NULL || len < 2 + PHASH_LEN || d[0] != CHUNK_TAG_COMMIT ||
+		d[1] != CHUNK_FORMAT_VERSION)
 		return false;
-	p = d + 1;
+	p = d + 2;
 	end = d + len;
 	out->hash = *h;
 	memcpy(out->root.b, p, PHASH_LEN);
@@ -402,7 +433,8 @@ vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 		if (gens[i] > gen)
 			gen = gens[i];
 	}
-	buf_append_byte(&b, COMMIT_TAG);
+	buf_append_byte(&b, CHUNK_TAG_COMMIT);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	buf_append(&b, root->b, PHASH_LEN);
 	buf_append_uvarint(&b, gen + 1);
 	buf_append_uvarint(&b, nparents);
@@ -414,7 +446,7 @@ vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 	buf_append_uvarint(&b, time);
 	buf_append_uvarint(&b, strlen(msg));
 	buf_append(&b, msg, strlen(msg));
-	h = cs_put_chunk(ctx->cs, b.data, b.len);
+	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
 	buf_free(&b);
 	return h;
 }
@@ -542,6 +574,17 @@ vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b, PHash *out)
 
 /* ----------------------------------------------------------------- repo */
 
+static void
+set_working(VcRepo *r, VcBranch *b, const PHash *rv)
+{
+	PHash		old = b->working;
+
+	cs_ref_root(r->ctx.cs, rv);
+	b->working = *rv;
+	cs_unref_root(r->ctx.cs, &old);
+	prolly_release_pins(&r->ctx);
+}
+
 static VcBranch *
 add_branch(VcRepo *r, const char *name, const PHash *head, const PHash *root)
 {
@@ -554,7 +597,19 @@ add_branch(VcRepo *r, const char *name, const PHash *head, const PHash *root)
 	b->head = *head;
 	b->head_root = *root;
 	b->working = *root;
+	cs_ref_root(r->ctx.cs, root);
 	return b;
+}
+
+/* Writes a commit and keeps it in history. */
+static PHash
+keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32_t np,
+			const char *msg)
+{
+	PHash		h = vc_commit_write(&r->ctx, root, parents, np, r->clock++, msg);
+
+	cs_ref_root(r->ctx.cs, &h);
+	return h;
 }
 
 void
@@ -564,11 +619,11 @@ vc_repo_init(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 				commit;
 
 	memset(r, 0, sizeof(*r));
-	r->ctx.cs = cs;
-	r->ctx.policy = *policy;
+	prolly_ctx_init(&r->ctx, cs, policy);
 	root = vc_root_empty(&r->ctx);
-	commit = vc_commit_write(&r->ctx, &root, NULL, 0, r->clock++, "init");
+	commit = keep_commit(r, &root, NULL, 0, "init");
 	add_branch(r, "main", &commit, &root);
+	prolly_release_pins(&r->ctx);
 }
 
 void
@@ -577,6 +632,7 @@ vc_repo_free(VcRepo *r)
 	for (size_t i = 0; i < r->nbr; i++)
 		free(r->br[i].name);
 	free(r->br);
+	prolly_ctx_free(&r->ctx);
 	memset(r, 0, sizeof(*r));
 }
 
@@ -604,7 +660,7 @@ vc_working(VcRepo *r)
 void
 vc_set_working(VcRepo *r, const PHash *rv)
 {
-	vc_head(r)->working = *rv;
+	set_working(r, vc_head(r), rv);
 }
 
 int
@@ -641,12 +697,12 @@ vc_commit(VcRepo *r, const char *msg)
 {
 	VcBranch   *b = vc_head(r);
 	PHash		parents[2] = {b->head, b->merge_head};
-	PHash		h = vc_commit_write(&r->ctx, &b->working, parents,
-									b->merging ? 2 : 1, r->clock++, msg);
+	PHash		h = keep_commit(r, &b->working, parents, b->merging ? 2 : 1, msg);
 
 	b->head = h;
 	b->head_root = b->working;
 	b->merging = false;
+	prolly_release_pins(&r->ctx);
 	return h;
 }
 
@@ -654,11 +710,12 @@ void
 vc_reset_hard(VcRepo *r, const PHash *commit)
 {
 	VcBranch   *b = vc_head(r);
+	PHash		root = must_load_commit(&r->ctx, commit).root;
 
 	b->head = *commit;
-	b->head_root = must_load_commit(&r->ctx, commit).root;
-	b->working = b->head_root;
+	b->head_root = root;
 	b->merging = false;
+	set_working(r, b, &root);
 }
 
 int
@@ -690,7 +747,8 @@ vc_merge(VcRepo *r, const char *branch, VcMergeResult *res)
 	if (phash_eq(&base, &ours))
 	{
 		b->head = theirs;
-		b->head_root = b->working = ctheirs.root;
+		b->head_root = ctheirs.root;
+		set_working(r, b, &ctheirs.root);
 		res->status = VC_MERGE_FAST_FORWARD;
 		res->commit = theirs;
 		return 0;
@@ -698,9 +756,9 @@ vc_merge(VcRepo *r, const char *branch, VcMergeResult *res)
 	cbase = must_load_commit(&r->ctx, &base);
 	vc_merge_roots(&r->ctx, &cbase.root, &b->head_root, &ctheirs.root, &merged,
 				   &res->conflicts, &res->nconflicts);
-	b->working = merged;
 	b->merging = true;
 	b->merge_head = theirs;
+	set_working(r, b, &merged);
 	if (res->nconflicts > 0)
 	{
 		res->status = VC_MERGE_CONFLICTS;
@@ -720,38 +778,6 @@ vc_merge_result_free(VcMergeResult *res)
 
 /* -------------------------------------------------------------- remotes */
 
-typedef struct SyncArg
-{
-	ProllyCtx  *src;
-	ChunkStore *dst;
-} SyncArg;
-
-static void
-copy_chunk(ProllyCtx *src, ChunkStore *dst, const PHash *h)
-{
-	size_t		len;
-	const uint8_t *d;
-
-	if (cs_has(dst, h))
-		return;
-	d = cs_get(src->cs, h, &len);
-	if (d == NULL)
-		abort();
-	cs_put(dst, h, d, len);
-}
-
-static void
-sync_entry_fn(void *arg, const uint8_t *key, size_t klen,
-			  const uint8_t *val, size_t vlen)
-{
-	SyncArg    *s = arg;
-	VcTable		t;
-
-	entry_decode(val, vlen, &t);
-	copy_chunk(s->src, s->dst, &t.schema);
-	prolly_sync(s->src, s->dst, &t.data, NULL, NULL);
-}
-
 static int
 gen_cmp(const void *pa, const void *pb)
 {
@@ -762,11 +788,12 @@ gen_cmp(const void *pa, const void *pb)
 }
 
 /*
- * Copies every chunk reachable from commit that dst lacks.  Commits go
- * oldest generation first so dst never holds a commit without its parents.
+ * Copies every commit reachable from commit that dst lacks, each with the
+ * strong closure of its root value, and keeps them in dst's history.
+ * Parents are weak references, so they are walked here, oldest first.
  */
 void
-vc_sync_commit(ProllyCtx *src, ChunkStore *dst, const PHash *commit)
+vc_sync_commit(ProllyCtx *src, ProllyCtx *dst, const PHash *commit)
 {
 	PHashMap	seen;
 	GenEnt	   *todo = NULL;
@@ -775,7 +802,6 @@ vc_sync_commit(ProllyCtx *src, ChunkStore *dst, const PHash *commit)
 	PHash	   *stack = NULL;
 	size_t		nstack = 0,
 				stackcap = 0;
-	SyncArg		sa = {src, dst};
 	bool		created;
 
 	phmap_init(&seen);
@@ -787,7 +813,7 @@ vc_sync_commit(ProllyCtx *src, ChunkStore *dst, const PHash *commit)
 		VcCommit	c;
 
 		phmap_ref(&seen, &h, &created);
-		if (!created || cs_has(dst, &h))
+		if (!created || cs_has(dst->cs, &h))
 			continue;
 		c = must_load_commit(src, &h);
 		px_grow((void **) &todo, &todocap, ntodo + 1, sizeof(GenEnt));
@@ -804,11 +830,16 @@ vc_sync_commit(ProllyCtx *src, ChunkStore *dst, const PHash *commit)
 		qsort(todo, ntodo, sizeof(GenEnt), gen_cmp);
 	for (size_t i = 0; i < ntodo; i++)
 	{
-		VcCommit	c = must_load_commit(src, &todo[i].h);
+		PHash		bad;
 
-		prolly_sync(src, dst, &c.root, sync_entry_fn, &sa);
-		copy_chunk(src, dst, &todo[i].h);
+		if (cs_copy_closure(src->cs, &dst->pins, &todo[i].h, true, &bad) != CS_OK)
+		{
+			dst->err_hash = bad;
+			vc_must(dst, CS_ERR_MISSING);
+		}
+		cs_ref_root(dst->cs, &todo[i].h);
 	}
+	prolly_release_pins(dst);
 	free(todo);
 	free(stack);
 	phmap_free(&seen);
@@ -831,12 +862,15 @@ vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 			!phash_eq(&base, &rb->head))
 			return -1;
 	}
-	vc_sync_commit(&local->ctx, remote->ctx.cs, &lb->head);
+	vc_sync_commit(&local->ctx, &remote->ctx, &lb->head);
 	if (rb == NULL)
-		rb = add_branch(remote, branch, &lb->head, &lb->head_root);
-	rb->head = lb->head;
-	rb->head_root = lb->head_root;
-	rb->working = lb->head_root;
+		add_branch(remote, branch, &lb->head, &lb->head_root);
+	else
+	{
+		rb->head = lb->head;
+		rb->head_root = lb->head_root;
+		set_working(remote, rb, &lb->head_root);
+	}
 	return 0;
 }
 
@@ -847,7 +881,7 @@ vc_fetch(VcRepo *local, VcRepo *remote, const char *branch, PHash *head)
 
 	if (rb == NULL)
 		return -1;
-	vc_sync_commit(&remote->ctx, local->ctx.cs, &rb->head);
+	vc_sync_commit(&remote->ctx, &local->ctx, &rb->head);
 	*head = rb->head;
 	return 0;
 }
@@ -856,12 +890,11 @@ void
 vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src)
 {
 	memset(dst, 0, sizeof(*dst));
-	dst->ctx.cs = cs;
-	dst->ctx.policy = src->ctx.policy;
+	prolly_ctx_init(&dst->ctx, cs, &src->ctx.policy);
 	dst->clock = src->clock;
 	for (size_t i = 0; i < src->nbr; i++)
 	{
-		vc_sync_commit(&src->ctx, cs, &src->br[i].head);
+		vc_sync_commit(&src->ctx, &dst->ctx, &src->br[i].head);
 		add_branch(dst, src->br[i].name, &src->br[i].head, &src->br[i].head_root);
 	}
 	dst->cur = src->cur;

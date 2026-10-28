@@ -98,6 +98,105 @@ get_u64(const uint8_t *p)
 	return v;
 }
 
+#define CHECK_OK(expr) \
+	do { \
+		int _rc = (expr); \
+		if (_rc != PROLLY_OK) { \
+			fprintf(stderr, "\n%s:%d: %s returned %d\n", __FILE__, __LINE__, #expr, _rc); \
+			exit(1); \
+		} \
+	} while (0)
+
+/* Wrappers for calls that must succeed. */
+static inline PHash
+t_empty(ProllyCtx *ctx)
+{
+	PHash		h;
+
+	CHECK_OK(prolly_empty(ctx, 0, &h));
+	return h;
+}
+
+static inline PHash
+t_build(ProllyCtx *ctx, const ProllyKV *kvs, size_t n)
+{
+	PHash		h;
+
+	CHECK_OK(prolly_build(ctx, 0, kvs, n, &h));
+	return h;
+}
+
+static inline PHash
+t_apply(ProllyCtx *ctx, const PHash *root, const ProllyEdit *e, size_t n)
+{
+	PHash		h;
+
+	CHECK_OK(prolly_apply(ctx, root, e, n, &h));
+	return h;
+}
+
+static inline bool
+t_get(ProllyCtx *ctx, const PHash *root, const uint8_t *key, size_t klen,
+	  const uint8_t **val, size_t *vlen)
+{
+	int			rc = prolly_get(ctx, root, key, klen, val, vlen);
+
+	CHECK(rc == PROLLY_OK || rc == PROLLY_NOT_FOUND);
+	return rc == PROLLY_OK;
+}
+
+static inline uint64_t
+t_count(ProllyCtx *ctx, const PHash *root)
+{
+	uint64_t	n;
+
+	CHECK_OK(prolly_count(ctx, root, &n));
+	return n;
+}
+
+static inline int
+t_height(ProllyCtx *ctx, const PHash *root)
+{
+	int			h;
+
+	CHECK_OK(prolly_height(ctx, root, &h));
+	return h;
+}
+
+static inline ProllyIter *
+t_iter(ProllyCtx *ctx, const PHash *root, const uint8_t *start, size_t slen)
+{
+	ProllyIter *it;
+
+	CHECK_OK(prolly_iter_open(ctx, root, start, slen, &it));
+	return it;
+}
+
+static inline bool
+t_next(ProllyIter *it, const uint8_t **k, size_t *kl, const uint8_t **v,
+	   size_t *vl)
+{
+	int			rc = prolly_iter_next(it, k, kl, v, vl);
+
+	CHECK(rc >= 0);
+	return rc == 1;
+}
+
+/* The store invariants hold, with at most max_orphans unheld chunks. */
+static inline void
+check_store(ChunkStore *cs, size_t max_orphans)
+{
+	char		why[200];
+	size_t		orphans;
+
+	if (!cs_check_invariants(cs, &orphans, why, sizeof(why)))
+	{
+		fprintf(stderr, "\nstore invariant broken: %s\n", why);
+		exit(1);
+	}
+	CHECK_LE(orphans, max_orphans);
+}
+
 /* Row values are 16 bytes: the key, then a version. */
 #define VAL_LEN 16
 
@@ -123,7 +222,7 @@ build_even_rows(ProllyCtx *ctx, uint64_t n)
 		make_val(vals + i * VAL_LEN, i * 2, 0);
 		kvs[i] = (ProllyKV) {keys + i * 8, 8, vals + i * VAL_LEN, VAL_LEN};
 	}
-	root = prolly_build(ctx, kvs, n);
+	root = t_build(ctx, kvs, n);
 	free(keys);
 	free(vals);
 	free(kvs);

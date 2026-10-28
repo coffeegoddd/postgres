@@ -89,7 +89,7 @@ row_version(VcRepo *r, const PHash *rv, const char *table, uint64_t key)
 
 	CHECK(vc_table_get(&r->ctx, rv, table, &t));
 	put_u64(k, key);
-	if (!prolly_get(&r->ctx, &t.data, k, 8, &v, &vl))
+	if (!t_get(&r->ctx, &t.data, k, 8, &v, &vl))
 		return -1;
 	return (int64_t) get_u64(v + 8);
 }
@@ -170,6 +170,37 @@ test_commit_and_log(void)
 		CHECK(row_version(&r, &r1, "t", 1) == -1);
 		CHECK(row_version(&r, &r2, "t", 1) == 1);
 	}
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * Every intermediate working set is released when the next replaces it:
+ * the store holds only what commits and working sets reach.
+ */
+static void
+test_working_set_churn_frees(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	size_t		after_commit;
+
+	vc_repo_init(&r, cs, &small_policy);
+	create_table(&r, "t", schema_v1);
+	for (uint64_t k = 0; k < 3000; k++)
+		put_row(&r, "t", k, 0);
+	vc_commit(&r, "load");
+	check_store(cs, 0);
+	after_commit = cs->ops->count(cs);
+	/* rewriting the same rows over and over must not grow the store */
+	for (int round = 0; round < 5; round++)
+		for (uint64_t k = 0; k < 3000; k += 7)
+			put_row(&r, "t", k, (uint64_t) round + 1);
+	for (uint64_t k = 0; k < 3000; k += 7)
+		put_row(&r, "t", k, 0);
+	check_store(cs, 0);
+	CHECK_EQ(cs->ops->count(cs), after_commit);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -198,6 +229,7 @@ test_branch_checkout_isolation(void)
 	CHECK(vc_checkout(&r, "feature") == 0);
 	CHECK(working_row(&r, "t", 3) == 1);
 	CHECK(vc_checkout(&r, "nope") == -1);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -224,6 +256,7 @@ test_reset_hard(void)
 	CHECK(phash_eq(&vc_head(&r)->head, &c1));
 	vc_reset_hard(&r, &c2);
 	CHECK(working_row(&r, "t", 1) == 2);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -291,6 +324,7 @@ test_diff_and_ddl(void)
 	CHECK(schema_is(&r, &r0, "b", schema_v1));
 	CHECK(vc_table_create(&r.ctx, &r1, "a", "x", 1, &w) == -1);
 	CHECK(vc_table_drop(&r.ctx, &r1, "zzz", &w) == -1);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -322,6 +356,7 @@ test_merge_fast_forward_and_up_to_date(void)
 	/* refuse to merge over uncommitted changes */
 	put_row(&r, "t", 9, 9);
 	CHECK(vc_merge(&r, "feature", &m) == -1);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -369,6 +404,7 @@ test_three_way_merge(void)
 	CHECK(schema_is(&r, &w, "u", schema_v2));
 	CHECK(schema_is(&r, &w, "v", schema_v1));
 	vc_merge_result_free(&m);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -436,6 +472,7 @@ test_merge_conflicts(void)
 	vc_commit(&r, "resolve");
 	CHECK(vc_commit_load(&r.ctx, &vc_head(&r)->head, &c));
 	CHECK(c.nparents == 2);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -465,6 +502,7 @@ test_same_changes_same_root(void)
 	del_row(&r, "t", 9999);
 	b = vc_working(&r);
 	CHECK(phash_eq(&a, &b));
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -508,6 +546,7 @@ test_merge_base_shapes(void)
 	vc_merge_result_free(&m);
 	CHECK(working_row(&r, "t", 1) == 1 && working_row(&r, "t", 3) == 1 &&
 		  working_row(&r, "t", 4) == 1);
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -559,6 +598,9 @@ test_push_fetch_clone(void)
 	CHECK(vc_push(&local, &remote, "topic") == 0);
 	CHECK(vc_branch_find(&remote, "topic") != NULL);
 
+	check_store(rcs, 0);
+	check_store(lcs, 0);
+	check_store(ocs, 0);
 	vc_repo_free(&remote);
 	vc_repo_free(&local);
 	vc_repo_free(&other);
@@ -642,7 +684,7 @@ vc_scale_case(uint64_t n, VcScale *s)
 	CHECK(vc_table_set_data(&r.ctx, &rv, "t", &data, &rv) == 0);
 	vc_set_working(&r, &rv);
 	c0 = vc_commit(&r, "load");
-	s->height = prolly_height(&r.ctx, &data);
+	s->height = t_height(&r.ctx, &data);
 	vc_repo_clone(&remote, rcs, &r);
 
 	/* branch: a new ref, no chunks */
@@ -674,7 +716,7 @@ vc_scale_case(uint64_t n, VcScale *s)
 	r1 = commit_root(&r, &c1);
 	CHECK(vc_table_get(&r.ctx, &r0, "t", &t0) && vc_table_get(&r.ctx, &r1, "t", &t1));
 	st = cs->stats;
-	prolly_diff(&r.ctx, &t0.data, &t1.data, row_diff_count, &ndiff);
+	CHECK_OK(prolly_diff(&r.ctx, &t0.data, &t1.data, row_diff_count, &ndiff));
 	s->diff_reads = STATS_DELTA(cs, st, gets);
 	CHECK(ndiff > 0 && ndiff <= VC_K);
 
@@ -819,6 +861,7 @@ merge_base_reads(uint64_t history, uint64_t ahead)
 	CHECK(vc_merge_base(&r.ctx, &a, &b, &mb));
 	reads = STATS_DELTA(cs, st, gets);
 	CHECK(phash_eq(&mb, &fork));
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 	return reads;
@@ -839,6 +882,7 @@ int
 main(void)
 {
 	RUN(test_commit_and_log);
+	RUN(test_working_set_churn_frees);
 	RUN(test_branch_checkout_isolation);
 	RUN(test_reset_hard);
 	RUN(test_diff_and_ddl);

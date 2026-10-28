@@ -142,7 +142,7 @@ extern int	vc_merge(VcRepo *r, const char *branch, VcMergeResult *res);
 extern void vc_merge_result_free(VcMergeResult *res);
 
 /* Remotes: another repo with its own chunk store. */
-extern void vc_sync_commit(ProllyCtx *src, ChunkStore *dst, const PHash *commit);
+extern void vc_sync_commit(ProllyCtx *src, ProllyCtx *dst, const PHash *commit);
 extern int	vc_push(VcRepo *local, VcRepo *remote, const char *branch);
 extern int	vc_fetch(VcRepo *local, VcRepo *remote, const char *branch,
 					 PHash *head);
