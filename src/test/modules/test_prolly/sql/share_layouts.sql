@@ -5,6 +5,11 @@
 -- branch's tuples read by this one's descriptor would put a column's
 -- value in the wrong place.
 
+-- A database of its own, so that a reset moves this test's table alone (a
+-- move restores every table with a root, those earlier tests left too).
+SELECT current_database() AS home \gset
+CREATE DATABASE regress_share_layouts;
+\c regress_share_layouts
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -72,3 +77,6 @@ FROM sl.t;
 
 SELECT dolt_branch('-D', 'lay', 'alike');
 DROP SCHEMA sl CASCADE;
+
+\c :home
+DROP DATABASE regress_share_layouts;

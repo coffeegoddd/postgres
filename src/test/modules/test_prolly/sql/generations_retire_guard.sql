@@ -46,7 +46,16 @@ SELECT dolt_history_repair('origin', 1) AS repaired;
 SET debug_prolly_verify_generations = off;
 SELECT test_chunk_generation() + 5 AS wrong \gset
 SET debug_prolly_settle_epoch = :wrong;
-SELECT dolt_history_repair('origin') AS repaired;
+-- (the chunks named by hash, not shown: the commit's depends on the name
+-- of the role the test runs as)
+DO $$
+BEGIN
+	PERFORM dolt_history_repair('origin');
+	RAISE NOTICE 'repaired';
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END
+$$;
 RESET debug_prolly_settle_epoch;
 SELECT count(*) AS fragments FROM prolly_history_horizon();
 SELECT kept >= 0 AS retired FROM test_chunk_retire(:wrong, :wrong);

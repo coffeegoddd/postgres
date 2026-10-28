@@ -156,10 +156,10 @@ DROP DATABASE refs_per_commit;
 -- about 4 KB once the tree is full), and no more nodes after 200 than
 -- after 50
 SELECT win, at, refs_nodes <= 10 AS few_refs_nodes, bytes <= 36000 AS few_bytes
-FROM refs_measured ORDER BY win, at;
+FROM refs_measured ORDER BY win COLLATE "C", at;
 SELECT a.win, b.refs_nodes <= a.refs_nodes + 2 AS refs_nodes_flat
 FROM refs_measured a JOIN refs_measured b ON a.win = b.win AND a.at = 50 AND b.at = 200
-ORDER BY a.win;
+ORDER BY a.win COLLATE "C";
 -- the window bounds what is kept
-SELECT win, live FROM refs_measured WHERE at = 200 ORDER BY win;
+SELECT win, live FROM refs_measured WHERE at = 200 ORDER BY win COLLATE "C";
 DROP TABLE refs_measured;

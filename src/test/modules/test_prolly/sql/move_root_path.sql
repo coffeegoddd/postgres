@@ -21,7 +21,7 @@ LANGUAGE sql AS $$
 	WHERE name IN ('moves_root_kept', 'moves_root_nearest',
 				   'moves_root_missing', 'move_tables_written',
 				   'severed_refusals')
-	ORDER BY name
+	ORDER BY name COLLATE "C"
 $$;
 CREATE FUNCTION mr_err(q text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
@@ -117,7 +117,7 @@ LANGUAGE sql AS $$
 	WHERE name IN ('moves_root_kept', 'moves_root_nearest',
 				   'moves_root_missing', 'move_tables_written',
 				   'severed_refusals')
-	ORDER BY name
+	ORDER BY name COLLATE "C"
 $$;
 CREATE SCHEMA mr VERSIONED;
 CREATE TABLE mr.t (id int PRIMARY KEY, v int NOT NULL);
@@ -150,7 +150,7 @@ LANGUAGE sql AS $$
 	WHERE name IN ('moves_root_kept', 'moves_root_nearest',
 				   'moves_root_missing', 'move_tables_written',
 				   'severed_refusals')
-	ORDER BY name
+	ORDER BY name COLLATE "C"
 $$;
 CREATE FUNCTION mr_err(q text) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN

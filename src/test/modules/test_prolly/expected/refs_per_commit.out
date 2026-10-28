@@ -197,33 +197,33 @@ DROP DATABASE refs_per_commit;
 -- about 4 KB once the tree is full), and no more nodes after 200 than
 -- after 50
 SELECT win, at, refs_nodes <= 10 AS few_refs_nodes, bytes <= 36000 AS few_bytes
-FROM refs_measured ORDER BY win, at;
+FROM refs_measured ORDER BY win COLLATE "C", at;
           win          | at  | few_refs_nodes | few_bytes 
 -----------------------+-----+----------------+-----------
- 100 years             |  50 | t              | t
- 100 years             | 200 | t              | t
  1 microsecond         |  50 | t              | t
  1 microsecond         | 200 | t              | t
+ 100 years             |  50 | t              | t
+ 100 years             | 200 | t              | t
  a month (the default) |  50 | t              | t
  a month (the default) | 200 | t              | t
 (6 rows)
 
 SELECT a.win, b.refs_nodes <= a.refs_nodes + 2 AS refs_nodes_flat
 FROM refs_measured a JOIN refs_measured b ON a.win = b.win AND a.at = 50 AND b.at = 200
-ORDER BY a.win;
+ORDER BY a.win COLLATE "C";
           win          | refs_nodes_flat 
 -----------------------+-----------------
- 100 years             | t
  1 microsecond         | t
+ 100 years             | t
  a month (the default) | t
 (3 rows)
 
 -- the window bounds what is kept
-SELECT win, live FROM refs_measured WHERE at = 200 ORDER BY win;
+SELECT win, live FROM refs_measured WHERE at = 200 ORDER BY win COLLATE "C";
           win          | live 
 -----------------------+------
- 100 years             |  201
  1 microsecond         |    1
+ 100 years             |  201
  a month (the default) |  201
 (3 rows)
 

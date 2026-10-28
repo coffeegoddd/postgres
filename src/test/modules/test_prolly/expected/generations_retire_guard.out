@@ -120,8 +120,17 @@ SELECT dolt_history_repair('origin', 1) AS repaired;
 SET debug_prolly_verify_generations = off;
 SELECT test_chunk_generation() + 5 AS wrong \gset
 SET debug_prolly_settle_epoch = :wrong;
-SELECT dolt_history_repair('origin') AS repaired;
-ERROR:  chunk f3040220054968fc7999b415f8048eb9f94e0085 would be settled in generations 8 to 8, which chunk 688d000cc320e36107933a0131353efd10525261 naming it, of generations 1 to 1, doesn't list it by
+-- (the chunks named by hash, not shown: the commit's depends on the name
+-- of the role the test runs as)
+DO $$
+BEGIN
+	PERFORM dolt_history_repair('origin');
+	RAISE NOTICE 'repaired';
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
+END
+$$;
+NOTICE:  refused: chunk <hash> would be settled in generations 8 to 8, which chunk <hash> naming it, of generations 1 to 1, doesn't list it by
 RESET debug_prolly_settle_epoch;
 SELECT count(*) AS fragments FROM prolly_history_horizon();
  fragments 
