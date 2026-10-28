@@ -537,6 +537,8 @@ tests += {
       't/877_refs_gets_fresh.pl',
       't/878_refs_memo_carry_error.pl',
       't/880_autovacuum_gc_no_wait.pl',
+      't/881_window_seal_timing.pl',
+      't/883_window_seal_idle.pl',
       't/890_gen_retire_frees_severed.pl',
       't/891_gen_steady_state.pl',
       't/892_gen_retire_cost.pl',

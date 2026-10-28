@@ -34,7 +34,21 @@ sub has { return sql("SELECT test_chunk_has('$_[0]')"); }
 
 is(sql('SHOW prolly.gc_journal_threshold'), '1MB', 'the threshold is a setting');
 
-# Below the threshold, garbage stays.
+# A new store's first generation ends at autovacuum's first visit (the
+# history window's seal: none has ended yet), whatever the threshold;
+# from then on, until a batch boundary (a day here) passes, below the
+# threshold garbage stays.
+sql(q{ALTER DATABASE av SET prolly.history_batch = '1 day'});
+# (not within a minute of a UTC day boundary, the batch's: a boundary
+# passing in the sleep below would seal)
+{
+	my $left = 86400 - time() % 86400;
+	sleep($left + 1) if $left < 60;
+}
+sql(q{SELECT test_chunk_put('before the first generation ends')});
+ok( $node->poll_query_until(
+		'av', q{SELECT NOT seal_due FROM test_window_retire_due()}),
+	'the store\'s first generation ends');
 my $dead = sql(q{SELECT test_chunk_put('dead below the threshold')});
 sleep(3);
 is(has($dead), 't', 'garbage below the threshold stays');

@@ -67,7 +67,13 @@
  *   boundary has passed since the store's newest generation ended, so a
  *   collection is to settle what came since in a generation of its own:
  *   generations then follow the batches fragments are cut at, and a
- *   fragment's data is in few of them.
+ *   fragment's data is in few of them.  sealed() notes a collection that
+ *   ran (it ended a generation, whether or not it settled anything), so
+ *   seal_due() counts from it: a collection that settled nothing new
+ *   records no generation in the store, and the next seal would otherwise
+ *   be due at once.  The note is kept outside the store and the refs:
+ *   written to the store, it would itself be due to be sealed, and the
+ *   refs' lock may be held.
  * - archived() says whether commit id is past the horizon: a top of a
  *   fragment, named by a boundary commit.  edges() visits the horizon's
  *   boundary edges (a boundary commit and the parent it doesn't keep) as
@@ -232,15 +238,16 @@ typedef struct ProllyWindowRoutine
 	void		(*retired) (void);
 	void		(*retire_failed) (void);
 	bool		(*seal_due) (void);
+	void		(*sealed) (void);
 } ProllyWindowRoutine;
 
 #define PROLLY_WINDOW_CALLBACK_NAMES \
 	"plan", "sever", "archived", "edges", "fragments", "hold", "repair", \
 	"policy", "set_policy", "maintain", "collect_due", "collected", \
 	"window", "in_window", "retire_due", "retired", "retire_failed", \
-	"seal_due"
+	"seal_due", "sealed"
 #define PROLLY_WINDOW_FIRST_CALLBACK plan
-#define PROLLY_WINDOW_LAST_CALLBACK seal_due
+#define PROLLY_WINDOW_LAST_CALLBACK sealed
 
 static inline const ProllyWindowRoutine *
 prolly_window_lookup(const char *name)
