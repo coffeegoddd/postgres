@@ -400,7 +400,13 @@ made first, on its empty storage, where those pages are kept, as the
 refs' pages_kept_for() says, and after its rows otherwise), and writes
 none; and a later reset to another kept commit gives back that commit's
 pages.  (Not under wal_level minimal, where a relation made in the
-transaction skips WAL until it commits: its rows are written.)  A branch's copies keep their OIDs, so a table is the same
+transaction skips WAL until it commits: its rows are written.)  Only a
+table the branch had none of as the move began is brought back so: one
+the move itself drops and makes again (a definition it can't alter in
+place, a conflict resolved with theirs) keeps only its own OID, its other
+relations new, so that the fold of the move's rows step reads them as the
+new, empty relations they are, not as those the baseline knows, which
+held the rows.  A branch's copies keep their OIDs, so a table is the same
 relation on every branch that has it from the same making.
 
 A table is its relation and its name together.  Two relations of one name

@@ -585,9 +585,18 @@ extern PGDLLIMPORT List *prolly_move_provenance;
  * The OID a table the session's move makes now (named relname, in schema
  * relnamespace) is to have, if the branch has no relation of it: the
  * relation its version is of, or the one it was, before it was made again
- * (InvalidOid: a new one).  heap_create_with_catalog() asks it.
+ * (InvalidOid: a new one); or the OID of a TOAST table or change log of a
+ * table the move brings back, as another branch has it.
+ * heap_create_with_catalog() asks it.
  */
 extern Oid	prolly_move_kept_relid(const char *relname, Oid relnamespace);
+
+/*
+ * The relation an index the running move makes is to be, of a table it
+ * brings back, with that relation's pg_index row and access method (from
+ * another branch), for index_create() to make it so only where it is
+ * defined alike; InvalidOid if none.
+ */
 extern Oid	prolly_move_kept_index(const char *relname, Oid relnamespace,
 								   HeapTuple *row, Oid *relam);
 

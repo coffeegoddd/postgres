@@ -8266,6 +8266,11 @@ typedef struct MoveRelid
 	Oid			relid;
 	Oid			owner;			/* the role it is made as (InvalidOid: the
 								 * move's) */
+	List	   *family;			/* its other relations, as another branch
+								 * has them, to be made as those relations
+								 * too (move_kept_family): of a relation the
+								 * branch has none of as the move begins,
+								 * those whose OIDs it has none of either */
 } MoveRelid;
 
 /*
@@ -10069,6 +10074,38 @@ save_remade(const char *name, char kind)
  * one dropped here, makes it again as that relation.  Read before the
  * move's statements.
  */
+/*
+ * Table relid's other relations as another branch has them, for a move
+ * about to make it as relid: only for a move that settles the branch at a
+ * commit, which gives a table it makes the pages kept of it (the refs'
+ * pages_kept_for(NULL)); none if the branch has a relation of relid now,
+ * and none whose OID the branch has a relation of now.  What a fold knows
+ * of a table (the working set's baseline, another branch's working set
+ * known as folded) it knows by its relations' OIDs, as holding the rows
+ * they held, and a relation made again as one of them is new and empty:
+ * so only a move that gives the table its pages, and sets the baseline's
+ * entry for it, brings its relations back; another (a merge) makes them
+ * new.  And the move drops what the branch has before it makes the table:
+ * only a table the branch had none of as the move began (dropped since
+ * its commit), and only relations it had none of, are brought back.
+ */
+static List *
+family_before(Oid relid)
+{
+	ProllyDatabaseComponents dc;
+	List	   *family = NIL;
+
+	prolly_database_components(&dc);
+	if (branch_ops()->family == NULL || !PROLLY_HAS(dc.refs, pages_kept_for) ||
+		!PROLLY_CALL(dc.refs, pages_kept_for, NULL) ||
+		SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return NIL;
+	foreach_ptr(BranchFamilyRelation, f, branch_ops()->family(relid))
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(f->relid)))
+			family = lappend(family, f);
+	return family;
+}
+
 static List *
 move_relids_before(List *from, List *to, List *remade)
 {
@@ -10109,6 +10146,7 @@ move_relids_before(List *from, List *to, List *remade)
 				mr->name = t->name;
 				mr->relid = k->relid;
 				mr->owner = k->owner;
+				mr->family = family_before(k->relid);
 				out = lappend(out, mr);
 				given = true;
 			}
@@ -10134,6 +10172,7 @@ move_relids_before(List *from, List *to, List *remade)
 			mr->name = t->name;
 			mr->relid = of->relid;
 			mr->owner = prolly_recorded_owner(t->name, of->owner, of->owner_name);
+			mr->family = family_before(of->relid);
 			out = lappend(out, mr);
 			break;
 		}
@@ -10273,19 +10312,6 @@ kept_relid_free(Oid relid)
 		RelationForgetForNewRelation(relid);
 }
 
-/*
- * The OID a relation named relname in schema relnamespace, made now, is to
- * have: for a table, the relation a move making it says it is
- * (move_relids_before()); for a TOAST table or a change log, the relation
- * it is, as another branch has it, of a table made so (move_kept_family).  Only if the branch has no relation of that OID
- * (and the relation cache's entry of it, another branch's, isn't open);
- * else InvalidOid (a new one).  Asked as the relation is made
- * (heap_create_with_catalog(), index_create()), once, only while the
- * move's statements run: the name's entry is used up.  So a table made
- * again is every relation it was, and its kept roots, which name them by
- * OID, give it its pages; one whose OID was taken meanwhile is a new
- * relation, and those roots don't serve it.
- */
 /* (the family's relation named relname in relnamespace, used up; or NULL) */
 static BranchFamilyRelation *
 family_take(const char *relname, Oid relnamespace)
@@ -10327,6 +10353,25 @@ prolly_move_kept_index(const char *relname, Oid relnamespace,
 	return f->relid;
 }
 
+/*
+ * The OID a relation named relname in schema relnamespace, made now, is to
+ * have: for a table, the relation a move making it says it is
+ * (move_relids_before()); for a TOAST table or a change log, the relation
+ * it is, as another branch has it, of a table the move brings back that
+ * the branch had none of as the move began (move_kept_family).  Only if
+ * the branch has no relation of that OID (and the relation cache's entry
+ * of it, another branch's, isn't open); else InvalidOid (a new one).
+ * Asked as the relation is made (heap_create_with_catalog(),
+ * index_create()), once, only while the move's statements run: the name's
+ * entry is used up.  So a table brought back is every relation it was,
+ * and its kept roots, which name them by OID, give it its pages; one whose
+ * OID was taken meanwhile is a new relation, and those roots don't serve
+ * it.  A table the move itself drops and makes again (a definition it
+ * can't alter in place, a conflict resolved with theirs) keeps only its
+ * own OID: its other relations are new, so that the fold the move's rows
+ * step makes reads them as the new, empty relations they are, not as
+ * those the working set's baseline knows, which held its rows.
+ */
 Oid
 prolly_move_kept_relid(const char *relname, Oid relnamespace)
 {
@@ -10334,7 +10379,7 @@ prolly_move_kept_relid(const char *relname, Oid relnamespace)
 	char	   *name;
 	ListCell   *lc;
 	Oid			relid = InvalidOid;
-	bool		table = false;
+	List	   *family = NIL;
 	BranchFamilyRelation *f;
 
 	if (move_kept_relids == NIL && move_kept_family == NIL)
@@ -10355,7 +10400,7 @@ prolly_move_kept_relid(const char *relname, Oid relnamespace)
 			if (strcmp(mr->name, name) != 0)
 				continue;
 			relid = mr->relid;
-			table = true;
+			family = mr->family;
 			move_kept_relids = foreach_delete_current(move_kept_relids, lc);
 			break;
 		}
@@ -10363,12 +10408,11 @@ prolly_move_kept_relid(const char *relname, Oid relnamespace)
 	}
 	if (OidIsValid(relid) && !kept_relid_free(relid))
 		relid = InvalidOid;
-	if (OidIsValid(relid) && table && branch_ops()->family != NULL)
+	if (OidIsValid(relid) && family != NIL)
 	{
 		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
 
-		move_kept_family = list_concat(move_kept_family,
-									   branch_ops()->family(relid));
+		move_kept_family = list_concat(move_kept_family, family);
 		MemoryContextSwitchTo(old);
 	}
 	return relid;
@@ -10491,16 +10535,6 @@ retype_rewrites(const char *name, const char *col, const char *type)
 }
 
 /*
- * The statements turning table name's definition from (NULL: none) into to
- * (NULL: dropped): what must go before the rows are written, and what the
- * rows must satisfy, after.  Columns are added and dropped, and changed in
- * type or default, when that gives to's columns in to's order; else the
- * table is made again (its rows written afresh).  A column's type changes
- * with the rows converted, unless sm->rewritten: then the rows go first
- * (they may not cast, or cast to values its keys or NOT NULLs refuse),
- * all to's written afresh.
- */
-/*
  * Is table name, which the move makes, to be made as a relation it was
  * (move_kept_relids, read before the move's statements are planned), and
  * given pages kept of it, not its rows (the refs' pages_kept_for())?
@@ -10515,10 +10549,21 @@ made_as_kept(const char *name)
 		return false;
 	foreach_ptr(MoveRelid, mr, move_kept_relids)
 		if (strcmp(mr->name, name) == 0)
-			return PROLLY_CALL(dc.refs, pages_kept_for, name);
+			return mr->family != NIL &&
+				PROLLY_CALL(dc.refs, pages_kept_for, name);
 	return false;
 }
 
+/*
+ * The statements turning table name's definition from (NULL: none) into to
+ * (NULL: dropped): what must go before the rows are written, and what the
+ * rows must satisfy, after.  Columns are added and dropped, and changed in
+ * type or default, when that gives to's columns in to's order; else the
+ * table is made again (its rows written afresh).  A column's type changes
+ * with the rows converted, unless sm->rewritten: then the rows go first
+ * (they may not cast, or cast to values its keys or NOT NULLs refuse),
+ * all to's written afresh.
+ */
 static bool
 move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		   const TableDef *to)

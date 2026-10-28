@@ -681,7 +681,9 @@ UpdateIndexRelation(Oid indexoid,
 
 /*
  * Does pg_index row row define the index UpdateIndexRelation() would
- * record for these (but its OID and state)?
+ * record for these (but its OID and state)?  (Only so that an OID keeps
+ * naming one definition: the guard on pages is the branch operations'
+ * share, which compares the two branches' rows again before it gives any.)
  */
 static bool
 index_row_alike(HeapTuple row, Oid heapoid, const IndexInfo *indexInfo,

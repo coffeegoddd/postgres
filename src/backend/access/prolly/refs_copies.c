@@ -7327,15 +7327,6 @@ kept_elsewhere(const ProllyHash *id, Oid *source)
 	return kc;
 }
 
-/*
- * The refs' pages_for_made(): a table a move to the commit settled makes
- * again (dropped since) is a relation of new storage, its relations those
- * it was (the move makes them so: prolly_move_kept_relid()), which none of
- * the branch's own kept roots is of; so it is given the pages another
- * branch keeps as of the commit, as a hard reset to it shares them
- * (restore_kept()), and the move then writes none of its rows.  The
- * branch's own entry is tried first, for a table a restore can serve.
- */
 /* (the conditions copies_pages_for_made() gives pages under) */
 static bool
 pages_for_made_possible(void)
@@ -7352,17 +7343,31 @@ pages_for_made_possible(void)
 
 /*
  * The refs' pages_kept_for(): another branch keeps pages as of the move's
- * commit, frozen, with table name among them (a table made again is of
- * storage none of the branch's own roots is of).
+ * commit, frozen, seen by every snapshot, of the schema the branch's head
+ * has, with table name among them (a table made again is of storage none
+ * of the branch's own roots is of): restore_kept()'s checks of the entry.
+ * What the share then checks of the relations themselves (the same set,
+ * stored alike on both branches) can't be asked before they are made; a
+ * table it refuses is written, correctly, through indexes made first.
+ * NULL asks whether the move is one pages_for_made() gives pages in at
+ * all.
  */
 static bool
 copies_pages_kept_for(const char *name)
 {
+	ProllyDatabaseComponents dc;
 	KeptCommit *kc;
 	Oid			source;
 
-	if (!pages_for_made_possible() ||
-		(kc = kept_elsewhere(&settling->id, &source)) == NULL || kc->unfrozen)
+	if (!pages_for_made_possible())
+		return false;
+	if (name == NULL)
+		return true;
+	if ((kc = kept_elsewhere(&settling->id, &source)) == NULL || kc->unfrozen ||
+		!kept_before_every_snapshot_xid(kc->kept_by))
+		return false;
+	prolly_database_components(&dc);
+	if (!head_schema_of(&dc, settling))
 		return false;
 	for (int t = 0; t < kc->ntables; t++)
 		if (strcmp(kc->tables[t].name, name) == 0)
@@ -7370,6 +7375,15 @@ copies_pages_kept_for(const char *name)
 	return false;
 }
 
+/*
+ * The refs' pages_for_made(): a table a move to the commit settled makes
+ * again (dropped since) is a relation of new storage, its relations those
+ * it was (the move makes them so: prolly_move_kept_relid()), which none of
+ * the branch's own kept roots is of; so it is given the pages another
+ * branch keeps as of the commit, as a hard reset to it shares them
+ * (restore_kept()), and the move then writes none of its rows.  The
+ * branch's own entry is tried first, for a table a restore can serve.
+ */
 static void
 copies_pages_for_made(const ProllyNodeRef *target)
 {

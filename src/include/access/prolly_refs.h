@@ -398,6 +398,8 @@ typedef struct ProllyRefsRoutine
 	 * which the move under way makes again, pages kept of it?  Asked as
 	 * the move plans its statements, so a table that won't get them is
 	 * written as any table made is (its indexes built after its rows).
+	 * With name NULL: is the move one pages_for_made() gives pages in at
+	 * all (a move settling the branch at a commit)?
 	 */
 	bool		(*pages_kept_for) (const char *name);
 
