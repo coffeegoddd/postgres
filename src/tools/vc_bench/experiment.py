@@ -10,8 +10,8 @@ import shutil
 import time
 import uuid
 
-from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, engine_passes, log, server, sha256,
-                  trace, write_json)
+from core import (ENGINES, FULL_VALIDATION_MAX_ROWS, SQL, default_dirty_sizes, dirty_rows, disk_size,
+                  engine_passes, log, server, sha256, trace, write_json)
 from engines import literal
 from memory import Sampler
 import window
@@ -47,16 +47,74 @@ def counter_deltas(before, after):
     return {name: d for name, d in sorted(deltas.items()) if d}
 
 
-def verify_dirty(sql, n, count, revision, latest):
-    probe(sql, n, count, revision)
-    expect(int(sql.scalar(sql.diff_sql(latest, 'WORKING'))), count, 'preserved dirty row count')
+# Rows of each kind a sampled validation reads by key.
+SAMPLE_ROWS = 500
+
+
+def validation_mode(c, n):
+    """How a case checks its working set at n rows: "full" counts the dirty
+    rows with a diff, "sampled" reads a sample of rows of each kind by key
+    (sample_working()); config's validation "auto" (the default) is full up
+    to FULL_VALIDATION_MAX_ROWS rows.  A full count of millions of dirty
+    rows takes minutes at 10 GB, untimed, several times a case."""
+    mode = c.get("validation", "auto")
+    if mode == "auto":
+        return "full" if n <= FULL_VALIDATION_MAX_ROWS else "sampled"
+    return mode
+
+
+def in_spread(x, n, count):
+    """Whether id x is one of changed_ids(n, count), without the list: ids
+    increase with their index, so x's is the least i whose id reaches it."""
+    i = -(-(x - 1)*count // n)
+    return i < count and 1 + i*n//count == x
+
+
+def sample_working(sql, n, k, count, h):
+    """The working set as latest's rows with count dirty ones at h+1, read
+    by key: dirty rows at h+1, the fixture's other changed rows at h, and
+    rows neither touches at the baseline's 0, SAMPLE_ROWS of each (spread
+    over the table)."""
+    m = min(SAMPLE_ROWS, count)
+    expected = {1 + (j*count//m)*n//count: h+1 for j in range(m)}
+    changed = [i for i in changed_ids(n, k) if not in_spread(i, n, count)]
+    for i in changed[::max(1, len(changed)//SAMPLE_ROWS)][:SAMPLE_ROWS]:
+        expected[i] = h
+    untouched = 0
+    for j in range(8*SAMPLE_ROWS):
+        x = 1 + j*n//(8*SAMPLE_ROWS)
+        if untouched < SAMPLE_ROWS and x not in expected and \
+                not in_spread(x, n, count) and not in_spread(x, n, k):
+            expected[x] = 0
+            untouched += 1
+    ids = sorted(expected)
+    for start in range(0, len(ids), 1000):
+        picks = ids[start:start+1000]
+        rows = sql.query("SELECT id,revision FROM bench_rows WHERE " + sql.ids_in(picks) +
+                         " ORDER BY id")["rows"]
+        expect(rows, [[str(i), str(expected[i])] for i in picks], "sampled working rows")
+
+
+def verify_dirty(sql, n, k, count, h, latest, mode):
+    """The working set is latest's rows with the count dirty rows at h+1:
+    the dirty rows counted by a diff (mode "full"), or a sample of rows of
+    each kind read by key ("sampled")."""
+    probe(sql, n, count, h+1)
+    if mode == "full":
+        expect(int(sql.scalar(sql.diff_sql(latest, 'WORKING'))), count, 'preserved dirty row count')
+    else:
+        sample_working(sql, n, k, count, h)
 
 
 def update(sql, n, k, revision):
-    ids = changed_ids(n, k)
-    for start in range(0, k, 1000):
-        sql.query(f"UPDATE bench_rows SET revision={revision} WHERE " +
-                  sql.ids_in(ids[start:start+1000]))
+    """Set revision on the k rows changed_ids(n, k) names, in one
+    transaction (the engine's statements: dirty_update_sql()), so its
+    commit flushes the log once, not once for each statement."""
+    statements = sql.dirty_update_sql(n, k, revision)
+    sql.query("BEGIN")
+    for statement in statements:
+        sql.query(statement)
+    sql.query("COMMIT")
 
 
 def expect(actual, expected, what):
@@ -239,9 +297,12 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
             for rep in range(-c["warmups"], c["repetitions"]):
                 order = cases(c)
                 rng.shuffle(order)
-                for case in order:
+                for number, case in enumerate(order, 1):
                     op, d = case["operation"], case["distance"]
-                    trace(f"==== CASE {op} D={d} {case['working_set']}: setup")
+                    label = f"{op} D={d} {case['working_set']}"
+                    trace(f"==== CASE {number}/{len(order)} {label}: setup")
+                    started = time.perf_counter()
+                    timed_at = validated_at = None
                     old = fixture["commits"][h-d]
                     # (asked first: the target in the window, kept with a
                     # root, or measured apart; never a slow sample)
@@ -250,10 +311,13 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                     dirty = profile != 'clean'
                     count = (k if profile == 'diff' else
                              dirty_rows(c.get('dirty_sizes', default_dirty_sizes())[profile], n) if dirty else 0)
+                    mode_check = validation_mode(c, n)
                     if dirty:
+                        trace(f"---- setup: dirty write ({count:,} rows)")
                         update(sql, n, count, h+1)
                         # Point reads confirm pending values without invoking a VC
                         # diff that could materialize/fold the dirty tree before timing.
+                        trace("---- setup: probe")
                         probe(sql, n, count, h+1)
                     if op == "merge_ff":
                         sql.vc("reset", "--hard", old)
@@ -326,9 +390,11 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         if sampler:
                             sampler.start()
                         trace("---- timed")
+                        timed_at = time.perf_counter()
                         try:
                             result = sql.query(query)
                         finally:
+                            validated_at = time.perf_counter()
                             trace("---- validation")
                             if sampler:
                                 record["memory"] = sampler.finish(result.get("elapsed_ns", 0))
@@ -352,13 +418,13 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             expect(sql.hash(tmpbranch), old, "new branch target")
                             if dirty:
                                 expect(sql.hash(), latest, 'branch creation preserves source HEAD')
-                                verify_dirty(sql, n, count, h+1, latest)
+                                verify_dirty(sql, n, k, count, h, latest, mode_check)
                                 sql.vc('checkout', tmpbranch)
                                 probe(sql, n, k, h-d)
                                 expect(int(sql.scalar(sql.diff_sql('HEAD', 'WORKING'))), 0,
                                        'new branch starts clean at requested commit')
                                 sql.vc('checkout', scratch)
-                                verify_dirty(sql, n, count, h+1, latest)
+                                verify_dirty(sql, n, k, count, h, latest, mode_check)
                             sql.vc("branch", "-D", tmpbranch)
                         elif op == "checkout":
                             expect(sql.hash(), old, "checked-out HEAD")
@@ -369,21 +435,24 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             sql.vc("checkout", scratch)
                             if dirty:
                                 expect(sql.hash(), latest, 'checkout preserves source HEAD')
-                                verify_dirty(sql, n, count, h+1, latest)
+                                verify_dirty(sql, n, k, count, h, latest, mode_check)
                             else:
                                 probe(sql, n, k, h)
                         elif op == "reset_soft":
                             expect(sql.hash(), old, "soft-reset HEAD")
                             if dirty:
-                                verify_dirty(sql, n, count, h+1, latest)
+                                verify_dirty(sql, n, k, count, h, latest, mode_check)
                             else:
                                 probe(sql, n, k, h)
-                            expected_diff = (union_count(n, k, count) if dirty else k) if d else count
-                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), expected_diff,
-                                   "soft reset preserves both committed and dirty working rows")
+                            # (sampled: the dirty rows' count is verify_dirty()'s
+                            # sample; a full diff of millions of them isn't run)
+                            if not dirty or mode_check == "full":
+                                expected_diff = (union_count(n, k, count) if dirty else k) if d else count
+                                expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), expected_diff,
+                                       "soft reset preserves both committed and dirty working rows")
                             sql.vc("reset", "--soft", latest)
                             if dirty:
-                                verify_dirty(sql, n, count, h+1, latest)
+                                verify_dirty(sql, n, k, count, h, latest, mode_check)
                         elif op == "reset_hard":
                             # The head at the commit, the working set its rows
                             # alone: the dirty rows discarded, the commits since
@@ -437,6 +506,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             expect(int(result["rows"][0][0]), 0 if op == "diff_equal" else k, "diff cardinality")
                             record["diff_rows"] = int(result["rows"][0][0])
                         if dirty and op not in ("reset_hard", "drop_table"):
+                            trace("---- restore")
                             sql.vc("reset", "--hard", latest)
                             probe(sql, n, k, h)
                         record["status"] = "ok"
@@ -444,8 +514,22 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         record["status"], record["error"] = "failed", str(e)
                         raise
                     finally:
+                        # (the harness's own work around the timed statement:
+                        # its setup, and its validation and restore)
+                        ended = time.perf_counter()
+                        record["validation"] = mode_check
+                        record["setup_sec"] = round((timed_at or ended) - started, 3)
+                        if validated_at is not None:
+                            record["validation_sec"] = round(ended - validated_at, 3)
                         output.write(json.dumps(record) + "\n")
                         output.flush()
+                        summary = (f"case {number}/{len(order)} {label}: {record['status']}; "
+                                   f"setup {record['setup_sec']:.1f} s, timed "
+                                   + (f"{record['elapsed_ns'] / 1e6:.1f} ms" if "elapsed_ns" in record else "-")
+                                   + (f", validation {record['validation_sec']:.1f} s"
+                                      if "validation_sec" in record else ""))
+                        trace(f"==== CASE {summary}")
+                        log(f"{engine}/n={n:,}/k={k:,} {mode}: {summary}")
                 log(f"{engine}/n={n}/k={k}: {mode} {'warmup' if rep < 0 else 'repetition '+str(rep+1)} complete")
     finally:
         # On an error preserve scratch branches for inspection; on success remove

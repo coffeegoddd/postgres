@@ -68,6 +68,14 @@ class Engine:
         """The predicate that the benchmark table's id is one of ids."""
         return "id IN (" + ",".join(str(int(i)) for i in ids) + ")"
 
+    def dirty_update_sql(self, n, count, revision):
+        """The statements that set revision on the count rows of n that
+        experiment.changed_ids() spreads them over, which update() runs in
+        one transaction: by default 1,000 ids to a statement."""
+        ids = [1 + i*n//count for i in range(count)]
+        return [f"UPDATE bench_rows SET revision={int(revision)} WHERE " + self.ids_in(ids[s:s+1000])
+                for s in range(0, count, 1000)]
+
     def table_count_sql(self):
         """How many benchmark tables the session's database has: 1, or 0
         once dropped."""
@@ -311,6 +319,13 @@ class Prolly(Engine):
 
     def hash_sql(self, ref):
         return f"SELECT dolt_hashof({literal(ref)})"
+
+    def dirty_update_sql(self, n, count, revision):
+        # (one statement: the server spreads the ids as changed_ids() does,
+        # instead of a statement and a round trip for each 1,000)
+        return [f"UPDATE bench_rows SET revision={int(revision)} "
+                f"FROM generate_series(0, {int(count) - 1}) g "
+                f"WHERE bench_rows.id = 1 + (g::bigint * {int(n)}) / {int(count)}"]
 
     def diff_sql(self, a, b):
         return f"SELECT count(*) FROM dolt_diff({literal(a)},{literal(b)},NULL::bench_rows)"

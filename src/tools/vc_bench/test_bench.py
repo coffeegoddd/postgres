@@ -126,6 +126,10 @@ class FakeVersionedSQL:
     def ids_in(self, ids):
         return 'id IN (' + ','.join(map(str, ids)) + ')'
 
+    def dirty_update_sql(self, n, count, revision):
+        from engines import Engine
+        return Engine.dirty_update_sql(self, n, count, revision)
+
     def table_count_sql(self):
         return 'TABLES bench_rows'
 
@@ -477,7 +481,7 @@ class BenchTests(unittest.TestCase):
                          'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
 
     def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',), warmups=1,
-                  history_window=None):
+                  history_window=None, validation=None):
         import random
         from experiment import run_cell
         c = {'passes': list(passes), 'warmups': warmups, 'repetitions': 1, 'history_depths': [1, 3],
@@ -485,6 +489,8 @@ class BenchTests(unittest.TestCase):
              'dirty_sizes': {'small': {'rows': 3}, 'half': {'fraction': 0.5}}}
         if history_window is not None:
             c['history_window'] = history_window
+        if validation is not None:
+            c['validation'] = validation
         out = io.StringIO()
         run_cell(None, c, engine, n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
                  out, random.Random(7))
@@ -651,6 +657,64 @@ class BenchTests(unittest.TestCase):
         records = self._run_cell(sql, n, k, commits, warmups=0)
         self.assertTrue(records and not any(r['warmup'] for r in records))
         self.assertEqual(len([r for r in records if r['operation'] == 'reset_hard']), 3 * 3)
+
+    def test_in_spread_matches_changed_ids(self):
+        from experiment import in_spread
+        for n, count in ((64, 3), (64, 32), (64, 64), (961538, 9616), (97, 13)):
+            spread = set(changed_ids(n, count))
+            self.assertEqual({x for x in range(1, n + 1) if in_spread(x, n, count)}, spread)
+
+    def test_dirty_writes_run_in_one_transaction(self):
+        import re
+        from engines import ENGINES
+        n, count = 961538, 865385
+        statements = ENGINES['prolly'].dirty_update_sql(n, count, 501)
+        self.assertEqual(len(statements), 1)
+        m = re.search(r"generate_series\(0, (\d+)\) g WHERE bench_rows.id = 1 \+ \(g::bigint \* (\d+)\) / (\d+)",
+                      statements[0])
+        self.assertEqual((int(m.group(1)), int(m.group(2)), int(m.group(3))), (count - 1, n, count))
+        self.assertEqual(len(ENGINES['dolt'].dirty_update_sql(n, count, 501)), (count + 999) // 1000)
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        self._run_cell(sql, n, k, commits, warmups=0)
+        for i, q in enumerate(sql.statements):
+            if q.startswith('UPDATE bench_rows SET revision=5 '):
+                self.assertEqual(sql.statements[i - 1], 'BEGIN')
+                self.assertEqual(sql.statements[i + 1], 'COMMIT')
+
+    def test_sampled_validation_reads_rows_instead_of_counting_diffs(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        full_count = 'DIFF ' + json.dumps([commits[-1], 'WORKING'])
+        counts = {}
+        for mode in ('full', 'sampled'):
+            sql = FakeVersionedSQL(n, k, commits, 'fixture')
+            records = self._run_cell(sql, n, k, commits, warmups=0, validation=mode)
+            self.assertTrue(all(r['status'] == 'ok' and r['validation'] == mode for r in records))
+            self.assertTrue(all('setup_sec' in r and 'validation_sec' in r for r in records))
+            counts[mode] = sql.statements.count(full_count)
+        self.assertGreater(counts['full'], 0)
+        self.assertEqual(counts['sampled'], 0)
+
+    def test_sampled_validation_catches_a_lost_dirty_row(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+
+        class LosesADirtyRow(FakeVersionedSQL):
+            # (a branch made from a dirty working set puts one of its dirty
+            # rows back, one the three-row probe doesn't read)
+            def query(self, q):
+                out = super().query(q)
+                if q.startswith('VC ') and json.loads(q[3:])[:1] == ['branch'] and \
+                        json.loads(q[3:])[1] != '-D':
+                    work = self.branches[self.current][1]
+                    dirty = sorted(i for i, v in work.items() if v == len(commits))
+                    if len(dirty) > 3:
+                        work[dirty[1]] = len(commits) - 1
+                return out
+
+        sql = LosesADirtyRow(n, k, commits, 'fixture')
+        with self.assertRaises(RuntimeError) as e:
+            self._run_cell(sql, n, k, commits, warmups=0, validation='sampled')
+        self.assertRegex(str(e.exception), 'sampled working rows')
 
     def test_a_hard_reset_that_keeps_dirty_rows_is_caught(self):
         n, k, commits = 64, 8, ['c%d' % i for i in range(5)]

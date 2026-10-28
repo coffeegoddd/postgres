@@ -258,6 +258,21 @@ size and historical change count K, in the latency and memory passes.
 `drop_table` also runs with each dirty size, at D=0 only. The branch deletions
 run clean: the dirty rows would be the session branch's, not the deleted one's.
 
+The dirty rows are written in one transaction, so its commit flushes the
+log once. prolly's is a single `UPDATE ... FROM generate_series(...)` that
+spreads the ids itself; Dolt and Doltgres send 1,000 ids to a statement.
+
+**Validation** (`config.json`'s `validation`) is how a case checks its working
+set, untimed. `full` counts the dirty rows with a `dolt_diff` (and a soft
+reset's rows with another). `sampled` reads by key a sample of each kind of
+row instead: 500 dirty rows (at the new revision), 500 of the fixture's other
+changed rows (at HEAD's) and 500 rows neither touched (at the baseline's). It
+catches a lost or wrongly kept working set, but not a few stray rows outside
+the sample. The default, `auto`, is `full` up to 1,000,000 rows and
+`sampled` past them: a full count of millions of dirty rows takes minutes at
+10 GB, several times a case. Each sample records the mode it used
+(`validation`).
+
 A dirty `reset_hard` at D>0 times both costs at once: discarding the Q dirty
 rows and moving the branch back D commits. To tell them apart, read the dirty
 cell at D=0 (the discard alone) and the clean cell at D>0 (the move alone).
@@ -498,11 +513,16 @@ python3 -m unittest discover -s src/tools/vc_bench -p 'test_*.py'
 To see where a run's time goes, set `VC_BENCH_TRACE` to a file before `run`
 (or `prepare`). Every statement the harness sends is appended to it with its UTC
 time and how long it took, long id lists shortened to their count. Each case
-marks the start of its setup (`==== CASE <op> D=<d> <working set>: setup`), of
-its timed statement (`---- timed`) and of its validation (`---- validation`).
+marks the start of its setup (`==== CASE <i>/<n> <op> D=<d> <working set>:
+setup`), its dirty write and probe (`---- setup: dirty write (<rows> rows)`,
+`---- setup: probe`), its timed statement (`---- timed`), its validation
+(`---- validation`) and its restore (`---- restore`), and ends with a summary
+(`==== CASE <i>/<n> ...: ok; setup <s> s, timed <ms> ms, validation <s> s`).
 That tells a slow cell's untimed setup and checks apart from the operation
 measured, and shows a statement that is still waiting: the last line is the one
-before it.
+before it. The same summary is logged for every case, traced or not, and each
+sample keeps `setup_sec` and `validation_sec`: the harness's own work around
+the timed statement (its validation includes the restore).
 
 ```sh
 VC_BENCH_TRACE=~/dbs/benchmarks/trace.log python3 "$B" run --engines prolly --passes timing
