@@ -38,9 +38,14 @@ sub use_db
 	$db = $_[0];
 	$node->safe_psql('postgres', "CREATE DATABASE $db");
 	# (a window of the newest two commits: the roots of commits past it
-	# are let go of, as junk's must be for a shrink)
+	# are let go of, as junk's must be for a shrink.  Every branch has a
+	# window of time too, a month by default, which keeps the root of
+	# every commit dated within it: so one of a microsecond, and only the
+	# newest two kept)
 	$node->safe_psql('postgres',
 		"ALTER DATABASE $db SET prolly.history_min_commits = 2");
+	$node->safe_psql('postgres',
+		"ALTER DATABASE $db SET prolly.history_window = '1 microsecond'");
 	sql(q{CREATE EXTENSION amcheck; CREATE SCHEMA app VERSIONED});
 }
 
