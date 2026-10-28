@@ -17,17 +17,24 @@ cycle:
      sizes, its files and their sections, pg_stat_prolly and a batch of
      point reads of the oldest commit the window keeps.
 
-`warm_cycles` cycles come first, then `cycles` measured ones at `churn`,
-then `sweep_cycles` cycles at each of the `sweep` churns.  After them the
+Warm-up cycles come first, enough that `warm_severs` severs (10) have
+cut history before the measured phase (a sever cuts nothing until the
+window is full, at cycle `window_cycles`); then `cycles` measured ones at
+`churn`, then `sweep_cycles` cycles at each of the `sweep` churns.  After
+them, on the store as the cycles left it, point reads are taken, the
 table files are conjoined (to `conjoin_files`) and the point reads taken
-again, and a full collection gives what the retires left as garbage.
+again; last, a full collection gives what the retires left as garbage.
 
 With `standby`, a streaming standby made by a base backup after the load
-replays everything; each retire's replay time is how long after the
-retire returned the standby had replayed its WAL.  With `retire` false
-(a build without retires), cycles stop after the sever: the default
-collection's times can then be compared with a build that doesn't record
-sections.
+replays everything.  One session on it, kept open, polls its replay LSN
+and its clock all through each retire; a retire's replay time is the
+first poll that saw its WAL replayed, less the retire's end on the
+primary's clock (the same host's), and its resolution the gap between
+that poll and the one before.  With `retire` false, cycles stop after the
+sever: so it runs on a build without retires, and on one with them, it
+gives the default collection's times at the same file count as such a
+build (a retire adds a file a cycle, the young copy), for comparing with
+and without recording sections.
 
 Every cycle's numbers are in raw/v11-cycles.jsonl; the cell's metrics are
 their summaries.  The chunk-store functions it drives are test_prolly's
@@ -44,6 +51,7 @@ import re
 import statistics
 import struct
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -64,6 +72,21 @@ EPOCH_DAY = "2020-01-01 00:00+00"
 # a little-endian uint32 at 20 (tablefile_basic.c).
 FOOTER_SIZE = 48
 FOOTER_SECTION_LEN = 20
+
+# The chunk store's own files in a database's directory: its table files,
+# its journal's segments (prolly_journal, prolly_journal_<id>), and the
+# manifest and the journal's index.  The first two are what
+# prolly_store_sizes() counts.
+STORE_FILE_PREFIXES = ("prolly_table_", "prolly_journal")
+STORE_META_PREFIXES = ("prolly_manifest", "prolly_index")
+
+# A WAL page's header (short, and long at a segment's start): an insert
+# LSN at a page boundary is given past it, where no record ends.
+XLOG_SHORT_PHD = 24
+XLOG_LONG_PHD = 40
+
+STANDBY_POLL_SQL = ("SELECT extract(epoch FROM clock_timestamp()) || ' ' || "
+                    "coalesce(pg_last_wal_replay_lsn(), '0/0'::pg_lsn);\n")
 
 PAYLOAD_SQL = """
 CREATE FUNCTION public.v11_payload(id bigint) RETURNS text LANGUAGE sql IMMUTABLE AS $$
@@ -110,6 +133,162 @@ def churn_ids(rows: int, churn: int, cycle: int) -> tuple[int, int]:
     return 1 + cycle % stride, stride
 
 
+def warm_cycles(params) -> int:
+    """The warm-up cycles: warm_cycles if given, else enough for warm_severs
+    severs that cut history (the first is at cycle window_cycles)."""
+    if "warm_cycles" in params:
+        return int(params["warm_cycles"])
+    return int(params.get("window_cycles", 3)) - 1 + int(params.get("warm_severs", 10))
+
+
+def lsn_int(lsn: str) -> int:
+    hi, lo = lsn.strip().split("/")
+    return (int(hi, 16) << 32) | int(lo, 16)
+
+
+def replay_target(lsn: int, page: int = 8192, segment: int = 16 << 20) -> int:
+    """What a standby's replay LSN reaches once it has replayed to the
+    primary's insert LSN lsn.  At a page boundary the insert LSN is past
+    the next page's header, but the last record ends at the boundary,
+    which is where replay stops until more WAL comes."""
+    if lsn % segment == XLOG_LONG_PHD:
+        return lsn - XLOG_LONG_PHD
+    if lsn % page == XLOG_SHORT_PHD:
+        return lsn - XLOG_SHORT_PHD
+    return lsn
+
+
+def store_files(dbdir: Path) -> dict[str, Any]:
+    """The chunk store's files as the filesystem has them: the bytes of its
+    table files and journal segments (what the manifest's sizes should add
+    up to), of its manifest and index, and each table file's section
+    length, read from its footer."""
+    files_bytes = meta_bytes = 0
+    sections: dict[str, int] = {}
+    for f in dbdir.iterdir():
+        name = f.name
+        if name.startswith(STORE_META_PREFIXES):
+            try:
+                meta_bytes += f.lstat().st_size
+            except OSError:
+                pass
+            continue
+        if not name.startswith(STORE_FILE_PREFIXES):
+            continue
+        try:
+            files_bytes += f.lstat().st_size
+        except OSError:
+            continue
+        if not name.startswith("prolly_table_"):
+            continue
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(-FOOTER_SIZE, os.SEEK_END)
+                foot = fh.read(FOOTER_SIZE)
+        except OSError:
+            continue
+        if len(foot) == FOOTER_SIZE and foot[-8:] == b"PRLYTBL1":
+            sections[name] = struct.unpack_from("<I", foot, FOOTER_SECTION_LEN)[0]
+    return {"files_bytes": files_bytes, "meta_bytes": meta_bytes, "sections": sections}
+
+
+def dir_bytes(top: Path, skip: tuple[str, ...] = ()) -> int:
+    """The apparent bytes of top's files, less the top-level entries skip."""
+    total = 0
+    for root, dirs, names in os.walk(top):
+        if Path(root) == Path(top):
+            dirs[:] = [d for d in dirs if d not in skip]
+            names = [n for n in names if n not in skip]
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+class StandbySession:
+    """One session on the standby, kept open: a poll is one query on it, a
+    round trip on an open connection rather than a psql start."""
+
+    def __init__(self, sb):
+        self.proc = subprocess.Popen(
+            [sb.bin("psql"), "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-d", "postgres"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env=sb.client_env())
+
+    def poll(self) -> tuple[float, int]:
+        """The standby's clock (epoch seconds) and replay LSN."""
+        self.proc.stdin.write(STANDBY_POLL_SQL)
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"the standby's poll session exited ({self.proc.poll()})")
+        ts, lsn = line.split()
+        return float(ts), lsn_int(lsn)
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
+        self.proc.stdout.close()
+
+
+class ReplayWatch:
+    """Polls the standby from before a retire until it has replayed past a
+    target given after it: when the first poll that saw it was, and the
+    poll before (the replay was between them)."""
+
+    def __init__(self, poll, interval_s: float = 0.0005, timeout_s: float = 600.0):
+        self.poll, self.interval, self.timeout = poll, interval_s, timeout_s
+        self.target: Optional[int] = None
+        self.hit: Optional[tuple[Optional[float], float]] = None
+        self.error: Optional[BaseException] = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "ReplayWatch":
+        self.thread.start()
+        return self
+
+    def _run(self) -> None:
+        prev: Optional[float] = None
+        t0 = time.monotonic()
+        try:
+            while True:
+                ts, lsn = self.poll()
+                target = self.target
+                if target is not None and lsn >= target:
+                    self.hit = (prev, ts)
+                    return
+                prev = ts
+                if time.monotonic() - t0 > self.timeout:
+                    raise RuntimeError(f"the standby didn't replay in {self.timeout:.0f} s")
+                time.sleep(self.interval)
+        except BaseException as e:      # (raised again by wait())
+            self.error = e
+
+    def wait(self, target: int) -> tuple[Optional[float], float]:
+        self.target = target
+        self.thread.join(self.timeout + 10)
+        if self.error is not None:
+            raise self.error
+        if self.hit is None:
+            raise RuntimeError("the standby's replay watch didn't finish")
+        return self.hit
+
+
+def replay_times(hit: tuple[Optional[float], float], end_ts: float) -> dict[str, Optional[float]]:
+    """A retire's replay time: at most how long after the retire ended
+    (end_ts, the primary's clock) the standby had replayed it (<= 0: by
+    then already), and the resolution, the time since the poll before."""
+    prev, ts = hit
+    return {"standby_replay_ms": 1000 * (ts - end_ts),
+            "standby_replay_resolution_ms": None if prev is None else 1000 * (ts - prev)}
+
+
 def timed(cluster, dbname: str, statements: list[str]) -> list[tuple[list[str], float]]:
     """Run statements in one session: each one's output rows and time (ms)."""
     script = "\\timing on\n" + "\n".join(s.rstrip().rstrip(";") + ";" for s in statements) + "\n"
@@ -139,6 +318,11 @@ class V11(VWorkload):
     def tables(self, ctx):
         return ["vc_rows"]
 
+    # (set by prepare(); these defaults are the usual build's)
+    standby = None
+    wal_page, wal_segment = 8192, 16 << 20
+    sections: dict[str, int] = {}
+
     # -- set up -----------------------------------------------------------
 
     def prepare(self, ctx: Context) -> None:
@@ -166,13 +350,17 @@ class V11(VWorkload):
         sql("CHECKPOINT")
         self.dboid = ctx.cluster.scalar("SELECT oid FROM pg_database WHERE datname = current_database()",
                                         dbname=ctx.dbname)
+        self.wal_page = int(ctx.cluster.scalar("SELECT current_setting('wal_block_size')"))
+        self.wal_segment = int(ctx.cluster.scalar(
+            "SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'"))
         self.prep = {"load_s": load_s, "base_commit_s": commit_s, "base_gc_s": gc_s,
                      "rows": n, **self.store(ctx)}
         self.standby = self.make_standby(ctx) if p.get("standby", False) else None
         (ctx.raw_dir / "v11-prepare.json").write_text(json.dumps(self.prep, indent=1) + "\n")
 
     def make_standby(self, ctx: Context):
-        """A streaming standby from a base backup of the primary."""
+        """A streaming standby from a base backup of the primary, and a
+        session on it kept open for the replay polls."""
         from pbench.clusters.local import LocalCluster
         from pbench.core.runner import free_port
         primary = ctx.cluster
@@ -192,28 +380,30 @@ class V11(VWorkload):
                     "max_standby_streaming_delay = 30s\n")
         sb.start()
         sb.wait_ready()
-        self.wait_replayed(ctx, sb, self.lsn(ctx))
-        return sb
+        self.standby = StandbySession(sb)
+        self.wait_replayed(self.lsn(ctx))
+        return self.standby
 
     # -- reading the store --------------------------------------------------
 
-    def lsn(self, ctx) -> str:
-        return ctx.cluster.scalar("SELECT pg_current_wal_insert_lsn()")
+    def lsn(self, ctx) -> int:
+        return lsn_int(ctx.cluster.scalar("SELECT pg_current_wal_insert_lsn()"))
 
-    def wait_replayed(self, ctx, sb, lsn: str, timeout: float = 600.0) -> float:
-        """Seconds until the standby had replayed past lsn."""
+    def wait_replayed(self, lsn: int, timeout: float = 600.0) -> None:
+        """Until the standby had replayed to the primary's insert LSN lsn."""
+        target = replay_target(lsn, self.wal_page, self.wal_segment)
         t0 = time.monotonic()
-        while True:
-            r = sb.sql(f"SELECT pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn", check=False)
-            if r.ok and r.stdout.strip() == "t":
-                return time.monotonic() - t0
+        while self.standby.poll()[1] < target:
             if time.monotonic() - t0 > timeout:
-                raise RuntimeError(f"the standby didn't replay to {lsn} in {timeout:.0f} s")
-            time.sleep(0.002)
+                raise RuntimeError(f"the standby didn't replay to {lsn:X} in {timeout:.0f} s")
+            time.sleep(0.001)
 
     def store(self, ctx) -> dict[str, Any]:
-        """The chunk store's sizes and files, its sections' bytes read from
-        the files' footers, and the data directory's bytes."""
+        """The chunk store's sizes as its manifest has them; its files' bytes
+        as the filesystem has them (a difference is a file the manifest
+        doesn't name, or names but isn't there); its sections' bytes, read
+        from the files' footers; the data directory's bytes without pg_wal,
+        and pg_wal's."""
         s = ctx.cluster.scalar(
             "SELECT json_build_object('journal_segments', journal_segments, 'journal_bytes', journal_bytes,"
             " 'table_files', table_files, 'table_file_bytes', table_file_bytes,"
@@ -221,32 +411,19 @@ class V11(VWorkload):
             dbname=ctx.dbname)
         out = json.loads(s)
         out["store_bytes"] = out["journal_bytes"] + out["table_file_bytes"]
-        dbdir = Path(ctx.cluster.data_dir) / "base" / ctx.cluster.scalar(
+        data = Path(ctx.cluster.data_dir)
+        dbdir = data / "base" / ctx.cluster.scalar(
             "SELECT oid FROM pg_database WHERE datname = current_database()", dbname=ctx.dbname)
-        section = 0
-        files = 0
-        for f in dbdir.iterdir():
-            if not f.name.startswith("prolly_table_"):
-                continue
-            try:
-                with open(f, "rb") as fh:
-                    fh.seek(-FOOTER_SIZE, os.SEEK_END)
-                    foot = fh.read(FOOTER_SIZE)
-            except OSError:
-                continue
-            if len(foot) == FOOTER_SIZE and foot[-8:] == b"PRLYTBL1":
-                section += struct.unpack_from("<I", foot, FOOTER_SECTION_LEN)[0]
-                files += 1
-        out["section_bytes_on_disk"] = section
-        out["table_files_on_disk"] = files
-        total = 0
-        for root, _, names in os.walk(ctx.cluster.data_dir):
-            for name in names:
-                try:
-                    total += os.lstat(os.path.join(root, name)).st_size
-                except OSError:
-                    pass
-        out["data_dir_bytes"] = total
+        disk = store_files(dbdir)
+        self.sections = disk["sections"]
+        out["store_files_bytes_on_disk"] = disk["files_bytes"]
+        out["store_meta_bytes_on_disk"] = disk["meta_bytes"]
+        out["store_disk_minus_manifest_bytes"] = disk["files_bytes"] - out["store_bytes"]
+        out["store_files_mismatch"] = disk["files_bytes"] != out["store_bytes"]
+        out["section_bytes_on_disk"] = sum(disk["sections"].values())
+        out["table_files_on_disk"] = len(disk["sections"])
+        out["data_dir_bytes"] = dir_bytes(data, skip=("pg_wal",))
+        out["pg_wal_bytes"] = dir_bytes(data / "pg_wal")
         out["relation_bytes"] = int(ctx.cluster.scalar(
             "SELECT pg_total_relation_size('vc_rows')", dbname=ctx.dbname))
         return out
@@ -259,6 +436,11 @@ class V11(VWorkload):
             dbname=ctx.dbname)
         return json.loads(s)
 
+    def table_file_bytes(self, ctx) -> dict[str, int]:
+        return json.loads(ctx.cluster.scalar(
+            "SELECT coalesce(json_object_agg(name, bytes), '{}') FROM test_chunk_table_files()",
+            dbname=ctx.dbname))
+
     def counters(self, ctx) -> dict[str, int]:
         out = ctx.cluster.sql(SESSIONS_EXITED + "\nSELECT pg_stat_force_next_flush();\n"
                               "SELECT name || '=' || value FROM pg_stat_prolly",
@@ -267,27 +449,32 @@ class V11(VWorkload):
 
     def point_reads(self, ctx, commit: str, reads: int, seed: int) -> dict[str, Any]:
         """reads point reads of commit by key, in one new session: each
-        one's time, and the chunk-store reads they took."""
+        one's time, and the chunk-store reads they took (those alone: the
+        mount's and the unmount's are outside the counts, and a counter
+        session's own are taken off)."""
         n = self.rows(ctx)
         # (distinct keys, spread, a different set each call)
         keys = [1 + (seed * 7919 + i * (n // reads + 1)) % n for i in range(reads)]
-        before = self.counters(ctx)
         # (a snapshot mount of the commit, which seeks its tree by the key;
         # mounted and unmounted around the reads, so its pin holds nothing
         # past them)
         ctx.cluster.sql(f"SELECT prolly_mount('{commit}', 'versioned', 'v11_at', ARRAY['vc_rows'])",
                         dbname=ctx.dbname)
         try:
+            # (the counts after the first counter session's exit less those
+            # before it are what one counter session adds itself)
+            idle = self.counters(ctx)
+            before = self.counters(ctx)
             got = timed(ctx.cluster, ctx.dbname,
                         [f"SELECT id FROM v11_at.vc_rows WHERE id = {k}" for k in keys])
+            after = self.counters(ctx)
         finally:
             ctx.cluster.sql("SELECT prolly_unmount('v11_at')", dbname=ctx.dbname)
-        after = self.counters(ctx)
         for (rows, _), k in zip(got, keys):
             if rows != [str(k)]:
                 raise RuntimeError(f"point read of {k} at {commit} returned {rows}")
         ms = [t for _, t in got]
-        d = {k: after.get(k, 0) - before.get(k, 0)
+        d = {k: (after.get(k, 0) - before.get(k, 0)) - (before.get(k, 0) - idle.get(k, 0))
              for k in ("chunk_file_reads", "node_cache_misses", "node_cache_hits", "nodes_read")}
         return {"read_ms_p50": percentile(ms, 50), "read_ms_p95": percentile(ms, 95),
                 "read_ms_mean": statistics.fmean(ms),
@@ -301,6 +488,7 @@ class V11(VWorkload):
         db = ctx.dbname
         first, stride = churn_ids(n, churn, i)
         rec: dict[str, Any] = {"cycle": i, "phase": phase, "churn": churn}
+        sections_before = dict(self.sections)
         c0 = self.counters(ctx)
         upd, com, gc = timed(ctx.cluster, db, [
             f"UPDATE vc_rows r SET rev = {i} FROM generate_series({first}, {n}, {stride}) g "
@@ -332,7 +520,12 @@ class V11(VWorkload):
         ctx.cluster.sql("VACUUM vc_rows", dbname=db)
         c2 = self.counters(ctx)
         rec["counters"] = {k: c2[k] - c0.get(k, 0) for k in c2 if c2[k] != c0.get(k, 0)}
+        # (all the table-file bytes the cycle wrote, the default
+        # collection's and the retire's, against the sections of the files
+        # the cycle made)
+        rec["cycle_table_file_bytes_written"] = rec["counters"].get("table_file_bytes_written", 0)
         rec.update(self.store(ctx))
+        rec["new_section_bytes"] = sum(v for k, v in self.sections.items() if k not in sections_before)
         # (the oldest commit the window keeps: its tree spans the most
         # generations)
         oldest = ctx.cluster.scalar(f"SELECT dolt_hashof('main~{min(keep - 1, i)}')", dbname=db)
@@ -352,28 +545,49 @@ class V11(VWorkload):
             return out
         lo, hi = int(lo_hi[0]), int(lo_hi[1])
         r_files = [g for g in gens_before if g["settled"] and lo <= g["epoch_lo"] and g["epoch_hi"] <= hi]
+        # (the younger files' section entries, whatever they name: how many
+        # of them name R isn't known here)
         out.update(retired=True, retire_lo=lo, retire_hi=hi, retire_files=len(r_files),
                    retire_r_chunks=sum(g["chunks"] for g in r_files),
                    retire_r_garbage_est=sum(g["garbage"] for g in r_files),
-                   retire_inbound_xrefs=sum(g["xrefs"] for g in gens_before if g["epoch_lo"] > hi))
+                   retire_younger_section_entries=sum(g["xrefs"] for g in gens_before if g["epoch_lo"] > hi))
         names = {g["name"] for g in r_files}
-        sizes = json.loads(ctx.cluster.scalar(
-            "SELECT coalesce(json_object_agg(name, bytes), '{}') FROM test_chunk_table_files()", dbname=db))
+        sizes = self.table_file_bytes(ctx)
         out["retire_r_bytes"] = sum(v for k, v in sizes.items() if k in names)
+        watch = None
         if self.standby is not None:
-            self.wait_replayed(ctx, self.standby, self.lsn(ctx))
-        lsn0 = self.lsn(ctx)
-        ((rows, ms),) = timed(ctx.cluster, db, [
-            f"SELECT kept || ' ' || freed || ' ' || bytes_freed FROM test_chunk_retire({lo}, {hi})"])
-        lsn1 = self.lsn(ctx)
+            self.wait_replayed(self.lsn(ctx))
+            watch = ReplayWatch(self.standby.poll).start()
+        try:
+            # (the LSNs and the end's time in the retire's own session)
+            (start, _), (rows, ms), (end, _) = timed(ctx.cluster, db, [
+                "SELECT pg_current_wal_insert_lsn()",
+                f"SELECT kept || ' ' || freed || ' ' || bytes_freed FROM test_chunk_retire({lo}, {hi})",
+                "SELECT extract(epoch FROM clock_timestamp()) || ' ' || pg_current_wal_insert_lsn()"])
+        except BaseException:
+            if watch is not None:
+                watch.target = 0
+            raise
+        lsn0 = start[0]
+        end_ts, lsn1 = end[0].split()
         out["retire_ms"] = ms
         out["retire_kept"], out["retire_freed"], out["retire_bytes_freed"] = (int(x) for x in rows[0].split())
-        out["retire_wal_bytes"] = int(ctx.cluster.scalar(f"SELECT pg_wal_lsn_diff('{lsn1}', '{lsn0}')"))
-        if self.standby is not None:
-            out["standby_replay_ms"] = 1000 * self.wait_replayed(ctx, self.standby, lsn1)
+        out["retire_wal_bytes"] = lsn_int(lsn1) - lsn_int(lsn0)
+        if watch is not None:
+            out.update(replay_times(watch.wait(replay_target(lsn_int(lsn1), self.wal_page, self.wal_segment)),
+                                    float(end_ts)))
         gens_after = self.generations(ctx)
         after = {g["name"] for g in gens_after}
         out["retire_files_dropped_or_rewritten"] = len(names - after)
+        # (R's own share of the bytes freed: its files gone, less the files
+        # its survivors were rewritten to, which keep R's generations; the
+        # rest is the young set's, collected and copied with it)
+        sizes_after = self.table_file_bytes(ctx)
+        rewritten = [g["name"] for g in gens_after if g["name"] not in sizes and g["settled"]
+                     and lo <= g["epoch_lo"] and g["epoch_hi"] <= hi]
+        out["retire_r_bytes_freed"] = (sum(sizes[k] for k in names - after)
+                                       - sum(sizes_after.get(k, 0) for k in rewritten))
+        out["retire_young_bytes_freed"] = out["retire_bytes_freed"] - out["retire_r_bytes_freed"]
         # (a file kept whole is still there, its estimate now the garbage
         # the retire found in it)
         kept = [g for g in gens_after if g["name"] in names]
@@ -385,7 +599,7 @@ class V11(VWorkload):
     def measure(self, ctx: Context, window: Window) -> Outcome:
         p = ctx.params
         churn = int(p.get("churn", 10000))
-        warm, cycles = int(p.get("warm_cycles", 10)), int(p.get("cycles", 10))
+        warm, cycles = warm_cycles(p), int(p.get("cycles", 10))
         sweep = [int(x) for x in p.get("sweep", [])]
         sweep_cycles = int(p.get("sweep_cycles", 3))
         log = (ctx.raw_dir / "v11-cycles.jsonl").open("w")
@@ -398,40 +612,36 @@ class V11(VWorkload):
             log.flush()
 
         i = 0
-        with window:
-            for _ in range(warm):
-                i += 1
-                run(i, churn, "warm")
-            for _ in range(cycles):
-                i += 1
-                run(i, churn, "steady")
-            for k in sweep:
-                for _ in range(sweep_cycles):
+        try:
+            with window:
+                for _ in range(warm):
                     i += 1
-                    run(i, k, f"sweep{k}")
-            end = self.finish(ctx, recs)
-        log.close()
+                    run(i, churn, "warm")
+                for _ in range(cycles):
+                    i += 1
+                    run(i, churn, "steady")
+                for k in sweep:
+                    for _ in range(sweep_cycles):
+                        i += 1
+                        run(i, k, f"sweep{k}")
+                end = self.finish(ctx, recs)
+        finally:
+            log.close()
+            if self.standby is not None:
+                self.standby.close()
         (ctx.raw_dir / "v11-end.json").write_text(json.dumps(end, indent=1) + "\n")
         return Outcome(metrics=self.summary(recs, end), transactions=len(recs), unit="cycle",
                        notes=[f"V11: {len(recs)} cycles; per-cycle numbers in v11-cycles.jsonl"])
 
     def finish(self, ctx, recs) -> dict[str, Any]:
-        """After the cycles: a full collection on that state, every file
-        with garbage rewritten (so what it frees is all the garbage the
-        retires left); then point reads, a conjoin of the table files, and
-        point reads again."""
+        """After the cycles, on the store as they left it: point reads, a
+        conjoin of the table files, and point reads again; then a full
+        collection, every file with garbage rewritten (so what it frees is
+        all the garbage the retires left; a conjoin copies garbage with the
+        rest)."""
         p = ctx.params
         db = ctx.dbname
         end: dict[str, Any] = {}
-        if p.get("full", True):
-            before = self.store(ctx)
-            (_, (rows, ms)) = timed(ctx.cluster, db, [
-                "SET prolly.gc_rewrite_below = 2147483647",
-                "SELECT chunks_kept || ' ' || chunks_freed || ' ' || bytes_freed FROM prolly_gc(true)"])
-            kept, freed, bytes_freed = (int(x) for x in rows[0].split())
-            after = self.store(ctx)
-            end.update(full_gc_ms=ms, full_gc_kept=kept, full_gc_freed=freed,
-                       full_gc_bytes_freed=bytes_freed, before_full=before, after_full=after)
         files = int(p.get("conjoin_files", 0))
         if files and recs:
             commit = recs[-1]["read_commit"]
@@ -441,6 +651,15 @@ class V11(VWorkload):
             end["conjoin_ms"] = ms
             end["after_conjoin"] = self.store(ctx)
             end["reads_after_conjoin"] = self.point_reads(ctx, commit, int(p.get("reads", 200)), 10007)
+        if p.get("full", True):
+            before = self.store(ctx)
+            (_, (rows, ms)) = timed(ctx.cluster, db, [
+                "SET prolly.gc_rewrite_below = 2147483647",
+                "SELECT chunks_kept || ' ' || chunks_freed || ' ' || bytes_freed FROM prolly_gc(true)"])
+            kept, freed, bytes_freed = (int(x) for x in rows[0].split())
+            after = self.store(ctx)
+            end.update(full_gc_ms=ms, full_gc_kept=kept, full_gc_freed=freed,
+                       full_gc_bytes_freed=bytes_freed, before_full=before, after_full=after)
         if p.get("verify", True) and self.retire:
             ((rows, ms),) = timed(ctx.cluster, db, ["SELECT test_chunk_verify_generations()"])
             end["verified_chunks"], end["verify_ms"] = int(rows[0]), ms
@@ -454,9 +673,13 @@ class V11(VWorkload):
         ret = [r for r in steady if r.get("retired")]
         m["steady_cycles"] = len(steady)
         m["steady_retires"] = len(ret)
-        for name in ("retire_ms", "retire_r_bytes", "retire_bytes_freed", "retire_wal_bytes",
-                     "standby_replay_ms", "retire_files"):
+        for name in ("retire_ms", "retire_r_bytes", "retire_bytes_freed", "retire_r_bytes_freed",
+                     "retire_young_bytes_freed", "retire_wal_bytes", "standby_replay_ms",
+                     "standby_replay_resolution_ms", "retire_files"):
             m[f"steady_{name}_median"] = median([r.get(name) for r in ret])
+        m["steady_standby_replay_resolution_ms_max"] = max(
+            (r["standby_replay_resolution_ms"] for r in ret
+             if r.get("standby_replay_resolution_ms") is not None), default=None)
         m["steady_retire_ms_max"] = max((r["retire_ms"] for r in ret), default=None)
         for name in ("default_gc_ms", "commit_ms", "update_ms", "sever_ms"):
             m[f"steady_{name}_median"] = median([r[name] for r in steady])
@@ -472,20 +695,26 @@ class V11(VWorkload):
         m["retire_ms_per_mib_slope"] = slope([r["retire_r_bytes"] / 2**20 for r in done],
                                              [r["retire_ms"] for r in done])
         m["retires_kept_whole"] = sum(1 for r in done if r.get("retire_files_kept_whole"))
-        written = sum(r["default_gc_table_file_bytes_written"] for r in steady)
+        m["retired_r_bytes_freed_total"] = sum(r.get("retire_r_bytes_freed", 0) for r in recs)
         section = [r.get("new_file_xrefs") for r in steady if r.get("new_file_xrefs") is not None]
         m["steady_section_entries_per_cycle_median"] = median(section)
+        m["store_files_mismatch_cycles"] = sum(1 for r in recs if r.get("store_files_mismatch"))
         if steady:
-            sec = [b - a for a, b in zip([r["section_bytes_on_disk"] for r in recs[:-1]],
-                                         [r["section_bytes_on_disk"] for r in recs[1:]])]
+            # (the sections of the files a cycle made, against all the
+            # table-file bytes it wrote)
+            written = sum(r["cycle_table_file_bytes_written"] for r in steady)
+            m["steady_section_bytes_per_cycle_median"] = median([r["new_section_bytes"] for r in steady])
+            m["section_bytes_per_gb_written"] = (sum(r["new_section_bytes"] for r in steady) / written * 2**30
+                                                 if written else None)
+            m["default_gc_bytes_written_steady"] = sum(r["default_gc_table_file_bytes_written"] for r in steady)
+            m["cycle_table_file_bytes_written_steady"] = written
             m["store_bytes_first_steady"] = steady[0]["store_bytes"]
             m["store_bytes_last_steady"] = steady[-1]["store_bytes"]
             xs = [r["cycle"] for r in steady]
-            m["store_bytes_slope_per_cycle"] = slope(xs, [r["store_bytes"] for r in steady])
-            m["data_dir_bytes_slope_per_cycle"] = slope(xs, [r["data_dir_bytes"] for r in steady])
+            for name in ("store_bytes", "store_files_bytes_on_disk", "data_dir_bytes", "pg_wal_bytes"):
+                m[f"{name}_slope_per_cycle"] = slope(xs, [r[name] for r in steady])
             m["table_files_first_steady"] = steady[0]["table_files"]
             m["table_files_last_steady"] = steady[-1]["table_files"]
-            m["default_gc_bytes_written_steady"] = written
             m["section_bytes_last"] = recs[-1]["section_bytes_on_disk"]
             for q in ("read_ms_p50", "read_ms_p95", "read_chunk_file_reads_per_read"):
                 m[f"first_steady_{q}"] = steady[0][q]

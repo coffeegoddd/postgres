@@ -1,0 +1,60 @@
+# V11 without the retires: the default collection's times with and
+# without recording sections (#1104's measurement 5b).  The same table,
+# churn, window and warm-up and measured cycles as v_generations.toml, but
+# each cycle stops after its sever.  A retire copies the young set into a
+# file of its own, a file a cycle more than without retires, and the
+# default collection's cost follows the file count; so both sides run
+# this config, a build that records sections and one that doesn't (one
+# without retires can run nothing else), and only the recording differs.
+# No standby, sweep or conjoin.
+#
+#   prolly_bench run V --am prolly --config configs/v_generations_noretire.toml \
+#       --pg-bin DIR/inst/bin --sizes gen1
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["gen1", "gen10"]
+workloads = ["V11"]
+fio_baseline = false
+seed = 1
+collectors = ["wal"]
+
+[postgres]
+shared_buffers = "4GB"
+autovacuum = "off"
+checkpoint_timeout = "1h"
+max_wal_size = "32GB"
+wal_level = "replica"
+max_wal_senders = 4
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 32
+
+[sizes.smoke]
+v_rows = 20000
+
+[sizes.gen1]
+v_rows = 961538
+
+[sizes.gen10]
+v_rows = 9615384
+
+[workloads.V11]
+background = ["none"]
+churn = 10000
+warm_severs = 10               # (warm-up cycles: window_cycles - 1 + this)
+cycles = 10
+sweep = []
+sweep_cycles = 3
+window_cycles = 3
+reads = 200
+standby = false
+retire = false
+conjoin_files = 0
+full = true
+verify = true

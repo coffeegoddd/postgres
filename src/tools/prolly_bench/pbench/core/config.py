@@ -242,7 +242,7 @@ def validate(cfg: dict, suite: str) -> None:
             "V9": {"background", "rows", "delta", "delta_rows", "deltas", "others",
                    "others_rows", "branches"},
             "V10": {"background", "caches", "reps"},
-            "V11": {"background", "churn", "warm_cycles", "cycles", "sweep", "sweep_cycles",
+            "V11": {"background", "churn", "warm_cycles", "warm_severs", "cycles", "sweep", "sweep_cycles",
                     "window_cycles", "reads", "standby", "retire", "conjoin_files", "full",
                     "verify", "load_batch"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})

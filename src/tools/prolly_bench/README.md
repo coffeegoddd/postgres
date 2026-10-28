@@ -532,24 +532,44 @@ row-specific payload).  After the base load is committed and collected,
 each cycle updates `churn` rows spread over the keys, commits, runs a
 default collection (a new generation), severs all but the newest
 `window_cycles` commits in delete mode (`dolt_history_drop()`), and
-retires the generations the reclamation chooses.  Ten warm-up cycles come
-before the measured ones, then `sweep_cycles` cycles at each `sweep`
-churn; then a conjoin of the table files (to `conjoin_files`) and a full
-collection on the final state.  Per cycle (`v11-cycles.jsonl`): the
-update's, commit's, default collection's, sever's and retire's times, the
-retired files' bytes and chunks, the bytes freed, the retire's WAL bytes
-and a streaming standby's replay time after it, the store's and data
-directory's bytes, its files and their sections' bytes (read from the
-files' footers), `pg_stat_prolly`'s deltas, and point reads of the oldest
-commit the window keeps (latency, chunk-store reads per read).  The end
-(`v11-end.json`): point reads before and after the conjoin, and what the
-full collection freed, which is the garbage the retires left.
+retires the generations the reclamation chooses.  Warm-up cycles come
+first, enough for `warm_severs` (10) severs that cut history before the
+measured ones; then `sweep_cycles` cycles at each `sweep` churn.  At the
+end, on the store as the cycles left it: point reads, a conjoin of the
+table files (to `conjoin_files`) and point reads again; then a full
+collection, which frees the garbage the retires left.
+
+Per cycle (`v11-cycles.jsonl`):
+- the update's, commit's, default collection's, sever's and retire's
+  times;
+- the retired files' bytes and chunks; the bytes the retire freed, and of
+  them R's own (its files gone less their rewritten survivors) and the
+  young set's; the younger files' section entries;
+- the retire's WAL bytes, and the streaming standby's replay time after
+  it: one session on the standby, kept open, polls its replay LSN through
+  the retire, and `standby_replay_resolution_ms` is the gap between the
+  poll that saw the retire replayed and the one before;
+- the store's bytes as the manifest has them and its files' bytes on the
+  filesystem (`store_files_mismatch` when they differ: a leaked or
+  missing file), the manifest's and index's bytes, the data directory's
+  bytes without `pg_wal`, and `pg_wal`'s;
+- the table files and their sections' bytes (read from the files'
+  footers), and the sections of the files the cycle made;
+- `pg_stat_prolly`'s deltas;
+- point reads of the oldest commit the window keeps (latency, and the
+  chunk-store reads of the reads alone, the mount's not counted).
+
+The end (`v11-end.json`): the point reads before and after the conjoin,
+and what the full collection freed.
 
 It drives test_prolly's chunk-store functions, so the build needs them:
-`build_postgres.py --with-test-prolly`.  With `retire = false` (a build
-without retires) a cycle stops after its sever, so the default
-collection's times can be compared with a build that records no
-sections.
+`build_postgres.py --with-test-prolly`.  With `retire = false` a cycle
+stops after its sever.  `configs/v_generations_noretire.toml` is that,
+with the same cycles: run it on a build that records sections and on one
+that doesn't (which has no retires) to compare the default collection's
+times.  Both sides run without retires, because a retire's young copy
+adds a file a cycle and the default collection's cost follows the file
+count.
 
 ```sh
 src/tools/prolly_bench/build_postgres.sh --build-dir build-gen --with-test-prolly -- CFLAGS=-O2 --with-openssl --with-lz4
