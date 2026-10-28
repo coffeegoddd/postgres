@@ -1,8 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * prolly_history_scan.c
- *	  dolt_history_table(NULL::t) read by the rows its primary key's quals
- *	  bound: a scan of its own that seeks each commit's data tree.
+ *	  dolt_history_table(NULL::t), and dolt_at(ref, NULL::t), read by the
+ *	  rows their primary key's quals bound: a scan of their own that seeks
+ *	  each commit's data tree.
  *
  * As a function, dolt_history_table() reads every row of every commit the
  * head reaches, the query's quals filtering them after.  Planned where the
@@ -20,6 +21,14 @@
  * stay the scan's filter, so a bound is only ever an optimization; the
  * rows, and the errors, are the function's.  EXPLAIN shows the quals the
  * scan bounds by ("History Key").
+ *
+ * dolt_at(ref, NULL::t), its ref known before the scan, is scanned so too
+ * where the quals compare its columns (id = 5): the one commit ref names
+ * is sought for each bound ("At Key"); WORKING, or a version that can't be
+ * sought, is read whole.  A value of another type than the key column's
+ * bounds it where the operator family compares the two and the value's
+ * type casts implicitly to the column's (an int literal against a bigint
+ * key: int4 to int8, which is exact), the value cast so for the bound.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_history_scan.c
@@ -55,7 +64,9 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
+#include "parser/parse_coerce.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -67,9 +78,19 @@
  * ------------------------------------------------------------------------
  */
 
-/* The table dolt_history_table(tbl)'s entry reads (InvalidOid: not one). */
+/* Which function an entry the scan reads is */
+typedef enum HistoryKind
+{
+	HISTORY_TABLE,				/* dolt_history_table(tbl): (row).column */
+	HISTORY_AT					/* dolt_at(ref, tbl): column */
+} HistoryKind;
+
+/*
+ * The table dolt_history_table(tbl)'s or dolt_at(ref, tbl)'s entry reads
+ * (InvalidOid: not one), and which; *ref dolt_at()'s ref.
+ */
 static Oid
-history_relid(RangeTblEntry *rte)
+history_relid(RangeTblEntry *rte, HistoryKind *kind, Node **ref)
 {
 	RangeTblFunction *rtfunc;
 	FuncExpr   *f;
@@ -82,9 +103,20 @@ history_relid(RangeTblEntry *rte)
 	if (!IsA(rtfunc->funcexpr, FuncExpr))
 		return InvalidOid;
 	f = (FuncExpr *) rtfunc->funcexpr;
-	if (f->funcid != F_DOLT_HISTORY_TABLE_ANYELEMENT || list_length(f->args) != 1)
+	if (f->funcid == F_DOLT_HISTORY_TABLE_ANYELEMENT && list_length(f->args) == 1)
+	{
+		*kind = HISTORY_TABLE;
+		*ref = NULL;
+		arg = linitial(f->args);
+	}
+	else if (f->funcid == F_DOLT_AT && list_length(f->args) == 2)
+	{
+		*kind = HISTORY_AT;
+		*ref = linitial(f->args);
+		arg = lsecond(f->args);
+	}
+	else
 		return InvalidOid;
-	arg = linitial(f->args);
 	if (!IsA(arg, Const))
 		return InvalidOid;
 	return get_typ_typrelid(exprType(arg));
@@ -93,7 +125,10 @@ history_relid(RangeTblEntry *rte)
 bool
 prolly_history_rte(RangeTblEntry *rte)
 {
-	return OidIsValid(history_relid(rte));
+	HistoryKind kind;
+	Node	   *ref;
+
+	return OidIsValid(history_relid(rte, &kind, &ref));
 }
 
 /* The table's primary key, as the scan bounds it. */
@@ -140,15 +175,24 @@ history_key(Oid relid, HistoryKey *key)
 	return ok;
 }
 
-/* Is node the entry's row's column attno: (row).column? */
+/*
+ * Is node the entry's row's column attno: (row).column, or for dolt_at()
+ * the column itself?
+ */
 static bool
-row_column(Node *node, Index relid, AttrNumber attno)
+row_column(Node *node, Index relid, AttrNumber attno, HistoryKind kind)
 {
 	FieldSelect *fs;
 	Var		   *v;
 
 	if (IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
+	if (kind == HISTORY_AT)
+	{
+		v = (Var *) node;
+		return IsA(node, Var) && v->varno == relid && v->varlevelsup == 0 &&
+			v->varattno == attno;
+	}
 	if (!IsA(node, FieldSelect))
 		return false;
 	fs = (FieldSelect *) node;
@@ -170,13 +214,16 @@ known_before(Node *expr, Index relid)
 /*
  * A restriction clause that bounds key column c: (row).column op value or
  * value op (row).column (commuted), or (row).column = ANY (array), with
- * the operator the column's operator family's, of the column's type and
- * collation; the clause as column op value (*strategy its strategy, *in
- * whether it is = ANY), else NULL.
+ * the operator the column's operator family's and the column's
+ * collation, the value of the column's type or of one that casts to it
+ * implicitly (within the family, such a cast is exact: int4 to int8); the
+ * clause as column op value, with the column type's own operator and the
+ * value cast to the column's type (*strategy its strategy, *in whether it
+ * is = ANY), else NULL.
  */
 static Expr *
 key_clause(RelOptInfo *rel, const HistoryKey *key, int c, RestrictInfo *rinfo,
-		   int *strategy, bool *in)
+		   HistoryKind kind, int *strategy, bool *in)
 {
 	Node	   *left;
 	Node	   *right;
@@ -184,6 +231,7 @@ key_clause(RelOptInfo *rel, const HistoryKey *key, int c, RestrictInfo *rinfo,
 	Oid			collid;
 	Oid			lefttype;
 	Oid			righttype;
+	Oid			keytype = key->opcintypes[c];
 	Expr	   *clause = rinfo->clause;
 
 	if (rinfo->pseudoconstant)
@@ -209,7 +257,7 @@ key_clause(RelOptInfo *rel, const HistoryKey *key, int c, RestrictInfo *rinfo,
 		right = lsecond(op->args);
 		opno = op->opno;
 		collid = op->inputcollid;
-		if (!row_column(left, rel->relid, key->attnos[c]))
+		if (!row_column(left, rel->relid, key->attnos[c], kind))
 		{
 			Node	   *t = left;
 
@@ -222,17 +270,38 @@ key_clause(RelOptInfo *rel, const HistoryKey *key, int c, RestrictInfo *rinfo,
 	}
 	else
 		return NULL;
-	if (!row_column(left, rel->relid, key->attnos[c]) ||
+	if (!row_column(left, rel->relid, key->attnos[c], kind) ||
 		!known_before(right, rel->relid) ||
 		!op_in_opfamily(opno, key->opfamilies[c]))
 		return NULL;
 	get_op_opfamily_properties(opno, key->opfamilies[c], false, strategy,
 							   &lefttype, &righttype);
-	/* (the value of the column's own type, so it bounds its keys as it is) */
-	if (lefttype != key->opcintypes[c] || righttype != key->opcintypes[c] ||
+	if (lefttype != keytype ||
 		(OidIsValid(key->collations[c]) && collid != key->collations[c]) ||
 		(*in && *strategy != BTEqualStrategyNumber))
 		return NULL;
+	/*
+	 * (a value of another type: cast to the column's, so it bounds its keys
+	 * as they are, compared by the column type's own operator)
+	 */
+	if (righttype != keytype)
+	{
+		Oid			from = exprType(right);
+		Oid			to = *in ? get_array_type(keytype) : keytype;
+
+		if (!can_coerce_type(1, &righttype, &keytype, COERCION_IMPLICIT) ||
+			!OidIsValid(to))
+			return NULL;
+		opno = get_opfamily_member(key->opfamilies[c], keytype, keytype,
+								   *strategy);
+		if (!OidIsValid(opno))
+			return NULL;
+		right = coerce_to_target_type(NULL, right, from, to, -1,
+									  COERCION_IMPLICIT, COERCE_IMPLICIT_CAST,
+									  -1);
+		if (right == NULL)
+			return NULL;
+	}
 	if (*in)
 	{
 		ScalarArrayOpExpr *sa = copyObject((ScalarArrayOpExpr *) clause);
@@ -252,21 +321,29 @@ static const CustomScanMethods history_scan_methods;
 /*
  * The path: where the restriction clauses bound the primary key's leading
  * columns (equalities, at most one of them an IN list, then a range on the
- * next column), a scan seeking each commit.  Cheaper than the function's
+ * next column), a scan seeking each commit (dolt_at(): the one its ref
+ * names, the ref known before the scan).  Cheaper than the function's
  * scan of every row, which stays a path too.  custom_private: the table,
- * then each bounding clause's column and strategy, then the clauses.
+ * then each bounding clause's column and strategy, then the clauses, then
+ * which function it is and dolt_at()'s ref.
  */
 void
 prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 						 RangeTblEntry *rte)
 {
-	Oid			relid = history_relid(rte);
+	HistoryKind kind;
+	Node	   *ref;
+	Oid			relid = history_relid(rte, &kind, &ref);
 	HistoryKey	key;
 	List	   *keys = NIL;
 	List	   *clauses = NIL;
 	bool		have_in = false;
 	CustomPath *cp;
 
+	/* (dolt_at()'s ref computed before the scan: no row's, none volatile) */
+	if (kind == HISTORY_AT &&
+		(pull_varnos(root, ref) != NULL || contain_volatile_functions(ref)))
+		return;
 	if (!history_key(relid, &key))
 		return;
 	for (int c = 0; c < key.ncolumns; c++)
@@ -279,7 +356,8 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 		{
 			int			strategy;
 			bool		in;
-			Expr	   *clause = key_clause(rel, &key, c, rinfo, &strategy, &in);
+			Expr	   *clause = key_clause(rel, &key, c, rinfo, kind, &strategy,
+											&in);
 
 			if (clause == NULL || equal || (in && have_in))
 				continue;
@@ -350,7 +428,8 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 	cp->path.pathkeys = NIL;
 	cp->flags = 0;
 	cp->custom_paths = NIL;
-	cp->custom_private = list_make3(makeInteger((int) relid), keys, clauses);
+	cp->custom_private = list_make5(makeInteger((int) relid), keys, clauses,
+									makeInteger((int) kind), ref);
 	cp->methods = &history_path_methods;
 	add_path(rel, (Path *) cp);
 }
@@ -358,10 +437,10 @@ prolly_history_set_paths(PlannerInfo *root, RelOptInfo *rel,
 /*
  * The plan: no scan relation (the entry is a function's), its scan tuple
  * the function's columns (custom_scan_tlist); the bounding clauses in
- * custom_exprs, so that their values are fixed up as any expression's.
- * custom_private: the table, then each clause's column, strategy, whether
- * it is an IN list, and its key column's operator family, type and
- * collation.
+ * custom_exprs, so that their values are fixed up as any expression's
+ * (and, for dolt_at(), its ref after them).  custom_private: the table,
+ * then each clause's column, strategy, whether it is an IN list, and its
+ * key column's operator family, type and collation, then which function.
  */
 static Plan *
 history_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -394,10 +473,15 @@ history_plan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cs->flags = best_path->flags;
 	cs->custom_plans = NIL;
 	cs->custom_exprs = copyObject(lthird(best_path->custom_private));
+	/* (dolt_at()'s ref after the clauses, fixed up as they are) */
+	if (intVal(list_nth(best_path->custom_private, 3)) == HISTORY_AT)
+		cs->custom_exprs = lappend(cs->custom_exprs,
+								   copyObject(list_nth(best_path->custom_private, 4)));
 	cs->custom_scan_tlist = scan_tlist;
 	cs->custom_relids = bms_copy(rel->relids);
-	cs->custom_private = list_make2(linitial(best_path->custom_private),
-									lsecond(best_path->custom_private));
+	cs->custom_private = list_make3(linitial(best_path->custom_private),
+									lsecond(best_path->custom_private),
+									list_nth(best_path->custom_private, 3));
 	cs->methods = &history_scan_methods;
 	return (Plan *) cs;
 }
@@ -416,6 +500,8 @@ typedef struct HistoryScanState
 {
 	CustomScanState css;
 	Oid			relid;
+	HistoryKind kind;
+	ExprState  *ref;			/* dolt_at()'s */
 	List	   *keys;			/* each clause's column, strategy, IN, and the
 								 * key column's operator family, type and
 								 * collation */
@@ -428,6 +514,16 @@ typedef struct HistoryScanState
 } HistoryScanState;
 
 
+/* The bounding clauses of the plan's custom_exprs (dolt_at()'s ref after) */
+static List *
+history_clauses(CustomScan *cs)
+{
+	if (intVal(lthird(cs->custom_private)) == HISTORY_AT)
+		return list_copy_head(cs->custom_exprs,
+							  list_length(cs->custom_exprs) - 1);
+	return cs->custom_exprs;
+}
+
 static void
 history_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -438,7 +534,9 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 	int			ncolumns = scan->natts - 1;
 	Bitmapset  *used = NULL;
 
-	prolly_function_scan_check(F_DOLT_HISTORY_TABLE_ANYELEMENT);
+	hs->kind = (HistoryKind) intVal(lthird(cs->custom_private));
+	prolly_function_scan_check(hs->kind == HISTORY_AT ? F_DOLT_AT :
+							   F_DOLT_HISTORY_TABLE_ANYELEMENT);
 	/*
 	 * (the scan's tuple: the function's columns, then the row whole, formed
 	 * from them only if the plan reads it)
@@ -456,7 +554,8 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 	hs->relid = (Oid) intVal(linitial(cs->custom_private));
 	hs->keys = lsecond(cs->custom_private);
 	hs->values = NIL;
-	foreach_ptr(Expr, clause, cs->custom_exprs)
+	hs->ref = NULL;
+	foreach_ptr(Expr, clause, history_clauses(cs))
 	{
 		List	   *args = IsA(clause, ScalarArrayOpExpr) ?
 			((ScalarArrayOpExpr *) clause)->args : ((OpExpr *) clause)->args;
@@ -464,6 +563,8 @@ history_begin(CustomScanState *node, EState *estate, int eflags)
 		hs->values = lappend(hs->values,
 							 ExecInitExpr((Expr *) lsecond(args), &node->ss.ps));
 	}
+	if (hs->kind == HISTORY_AT)
+		hs->ref = ExecInitExpr(llast(cs->custom_exprs), &node->ss.ps);
 }
 
 /* values[] sorted by the key column's btree order, for distinct_values() */
@@ -615,14 +716,25 @@ history_next(ScanState *node)
 		old = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 		hs->store = tuplestore_begin_heap(false, false, work_mem);
 		nbounds = history_bounds(hs, econtext, &bounds);
-		if (nbounds > 0)
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		rsinfo.type = T_ReturnSetInfo;
+		rsinfo.setResult = hs->store;
+		rsinfo.setDesc = hs->rowdesc;
+		if (hs->kind == HISTORY_AT)
 		{
-			memset(&rsinfo, 0, sizeof(rsinfo));
-			rsinfo.type = T_ReturnSetInfo;
-			rsinfo.setResult = hs->store;
-			rsinfo.setDesc = hs->rowdesc;
-			prolly_history_rows(hs->relid, bounds, nbounds, &rsinfo);
+			bool		isnull;
+			Datum		ref = ExecEvalExpr(hs->ref, econtext, &isnull);
+
+			if (isnull)
+				ereport(ERROR,
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("dolt_at's ref can't be null")));
+			/* (none bounded, a NULL value: checked as dolt_at() is, nothing read) */
+			prolly_at_rows(TextDatumGetCString(ref), hs->relid, bounds,
+						   nbounds, &rsinfo);
 		}
+		else if (nbounds > 0)
+			prolly_history_rows(hs->relid, bounds, nbounds, &rsinfo);
 		MemoryContextSwitchTo(old);
 		hs->read = true;
 	}
@@ -687,8 +799,9 @@ history_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	List	   *context;
 
 	context = set_deparse_context_plan(es->deparse_cxt, (Plan *) cs, ancestors);
-	ExplainPropertyText("History Key",
-						deparse_expression((Node *) make_ands_explicit(cs->custom_exprs),
+	ExplainPropertyText(intVal(lthird(cs->custom_private)) == HISTORY_AT ?
+						"At Key" : "History Key",
+						deparse_expression((Node *) make_ands_explicit(history_clauses(cs)),
 										   context, es->verbose, false),
 						es);
 }

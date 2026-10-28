@@ -269,6 +269,7 @@ tests += {
       'bounded_counts',
       'dirty_discard',
       'history_key_seek',
+      'at_key_seek',
       'log_stream',
       'first_use_kept',
       'branch_catalog_index',

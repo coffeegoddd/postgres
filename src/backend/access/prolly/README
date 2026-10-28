@@ -2372,6 +2372,14 @@ the scan's filter, and EXPLAIN shows those it bounds by ("History Key").
 The scan gives the entry's whole row too (h, row_to_json(h), h IS NOT
 NULL in a filter), made of its columns when the plan reads it.
 dolt_history_table() by name reads every row of every commit.
+dolt_at(ref, NULL::t) with such quals on its columns (id = 5), its ref
+known before the scan, is planned as the same scan ("At Key"): the one
+commit ref names is sought for each bound, so a point read is O(the
+tree's depth) whatever the table's size; WORKING, or a version that
+can't be sought, is read whole.  For either, a value of another type
+than the key column's bounds it where the column's operator family
+compares the two and the value's type casts implicitly to the column's
+(an int literal against a bigint key), the value cast so for the bound.
 
 Revision-qualified table names (prolly_revision.c) read a table as
 another revision has it, as Doltgres's revision databases do:

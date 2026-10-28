@@ -8567,6 +8567,57 @@ dolt_at(PG_FUNCTION_ARGS)
 }
 
 /*
+ * relid's table's rows at ref whose primary keys any of bounds[] (nbounds
+ * of them) bounds, into rsinfo's store as dolt_at(ref, NULL::t) gives them
+ * (refused as it refuses them): where ref is a commit and its version can
+ * be sought (prolly_merge.h's bounded_rows()), read by seeking its data
+ * tree for each bound, O(its depth) a bound; else read whole, the caller's
+ * filter keeping what the bounds would.  With no bounds, none is read (a
+ * bound's value was NULL: no key is bounded by it).
+ */
+void
+prolly_at_rows(const char *ref, Oid relid, const ProllyKeyBounds *bounds,
+			   int nbounds, ReturnSetInfo *rsinfo)
+{
+	const ProllyMergeRoutine *dm = diff_merge();
+	Relation	rel;
+	AtSink		s;
+	List	   *lineages = NIL;
+	ProllyBoundedRead read = PROLLY_BOUNDED_NO;
+
+	rel = open_row_type_table(relid, "dolt_at", ACL_SELECT);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = rsinfo;
+	check_typed_at(relid, ref, &lineages, "dolt_at");
+	rows_begin(&s.rows, rel);
+	if (nbounds > 0 && PROLLY_HAS(dm, bounded_rows) &&
+		strcmp(ref, "WORKING") != 0 && strcmp(ref, "STAGED") != 0)
+	{
+		ProllyHash	id;
+		ProllyCommitInfo info;
+
+		if (PROLLY_CALL(refs(), resolve, ref, &id) &&
+			PROLLY_CALL(refs(), commit_get, &id, &info))
+		{
+			ProllyHash	data;
+
+			data.len = 0;
+			read = dm->bounded_rows(hash_hex(&id), &info.root, relid, bounds,
+									nbounds, &data, &s.sink);
+		}
+	}
+	if (nbounds > 0 && read != PROLLY_BOUNDED_READ)
+	{
+		/* (rows a refused seek gave are given again by the whole read) */
+		tuplestore_clear(rsinfo->setResult);
+		PROLLY_CALL(dm, diff, NULL, ref, relid, &s.sink);
+	}
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+}
+
+/*
  * relid's table's rows as ref has them, read as dolt_at(ref, NULL::t) reads
  * them (refused as it refuses them, decoded as the table is defined here),
  * put to store as rows of the table's descriptor.
