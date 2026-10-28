@@ -85,6 +85,9 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(m["store_bytes_slope_per_cycle"], 0.0)
         self.assertEqual(m["residual_garbage_ratio"], 0.1)
         self.assertEqual(m["retired_bytes_freed_total"], 100 * 5 + 200)
+        # (retire_ms against R's MiB: 10 or 11 ms at 1000 bytes, 20 ms at 2000)
+        self.assertGreater(m["retire_ms_per_mib_slope"], 0)
+        self.assertEqual(m["retires_kept_whole"], 0)
 
 
 class ConfigTest(unittest.TestCase):

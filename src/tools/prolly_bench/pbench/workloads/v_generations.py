@@ -371,8 +371,15 @@ class V11(VWorkload):
         out["retire_wal_bytes"] = int(ctx.cluster.scalar(f"SELECT pg_wal_lsn_diff('{lsn1}', '{lsn0}')"))
         if self.standby is not None:
             out["standby_replay_ms"] = 1000 * self.wait_replayed(ctx, self.standby, lsn1)
-        after = {g["name"] for g in self.generations(ctx)}
+        gens_after = self.generations(ctx)
+        after = {g["name"] for g in gens_after}
         out["retire_files_dropped_or_rewritten"] = len(names - after)
+        # (a file kept whole is still there, its estimate now the garbage
+        # the retire found in it)
+        kept = [g for g in gens_after if g["name"] in names]
+        out["retire_files_kept_whole"] = len(kept)
+        out["retire_kept_whole_chunks"] = sum(g["chunks"] for g in kept)
+        out["retire_kept_whole_garbage"] = sum(g["garbage"] for g in kept)
         return out
 
     def measure(self, ctx: Context, window: Window) -> Outcome:
@@ -458,6 +465,13 @@ class V11(VWorkload):
             rs = [r for r in recs if r["churn"] == k and r["phase"] != "warm" and r.get("retired")]
             m[f"churn{k}_retire_ms_median"] = median([r["retire_ms"] for r in rs])
             m[f"churn{k}_retire_r_bytes_median"] = median([r["retire_r_bytes"] for r in rs])
+        # (a retire's cost against the bytes it collected: a sweep cycle
+        # retires a generation made window_cycles cycles before, at the
+        # churn then)
+        done = [r for r in recs if r["phase"] != "warm" and r.get("retired")]
+        m["retire_ms_per_mib_slope"] = slope([r["retire_r_bytes"] / 2**20 for r in done],
+                                             [r["retire_ms"] for r in done])
+        m["retires_kept_whole"] = sum(1 for r in done if r.get("retire_files_kept_whole"))
         written = sum(r["default_gc_table_file_bytes_written"] for r in steady)
         section = [r.get("new_file_xrefs") for r in steady if r.get("new_file_xrefs") is not None]
         m["steady_section_entries_per_cycle_median"] = median(section)
