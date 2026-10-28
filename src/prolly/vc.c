@@ -9,6 +9,8 @@
  * the window decides otherwise), and each branch holds its working root.
  * Mutating repo calls release the context's pins once results are held.
  */
+#include <time.h>
+
 #include "vc.h"
 
 #define ENTRY_LEN (2 * PHASH_LEN)
@@ -681,6 +683,19 @@ repo_init_empty(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 	r->name = px_memdup("", 1);
 }
 
+/*
+ * Repos started separately must not share history by accident, so each
+ * init commit is unique: the repo clock starts from the time and a
+ * process-wide counter.
+ */
+static uint64_t
+unique_clock(void)
+{
+	static uint64_t counter;
+
+	return ((uint64_t) time(NULL) << 24) + (++counter << 4);
+}
+
 void
 vc_repo_init(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 {
@@ -688,6 +703,7 @@ vc_repo_init(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 				commit;
 
 	repo_init_empty(r, cs, policy);
+	r->clock = unique_clock();
 	root = vc_root_empty(&r->ctx);
 	commit = keep_commit(r, &root, NULL, 0, "init");
 	add_branch(r, "main", &commit, &root);
@@ -1387,22 +1403,22 @@ set_hint(VcRepo *r, const PHash *h, const char *where)
 	*phmap_ref(&r->hint, h, &created) = i + 1;
 }
 
+/* Where this repo says a commit it lacks can be found. */
 const char *
 vc_hint(VcRepo *r, const PHash *h)
 {
-	uint64_t   *v = phmap_find(&r->hint, h);
+	uint32_t	seg;
+	uint64_t   *v;
 
+	if (vc_locate(r, h, &seg) == VC_LOC_EXPORTED)
+		return r->segs[seg].archive_name;
+	v = phmap_find(&r->hint, h);
 	return v ? r->hints[*v - 1] : NULL;
 }
 
-/* Where src would say the content of a commit it lacks can be found. */
 static const char *
 hint_from(VcRepo *src, const PHash *h)
 {
-	uint32_t	seg;
-
-	if (vc_locate(src, h, &seg) == VC_LOC_EXPORTED)
-		return src->segs[seg].archive_name;
 	return vc_hint(src, h);
 }
 
@@ -1428,6 +1444,8 @@ typedef struct Plan
 	size_t		nbound;
 	size_t		boundcap;
 	bool		connected;		/* reached a commit the receiver knows */
+	bool		cut;			/* reached a commit the sender has cut */
+	PHash		first_cut;
 } Plan;
 
 static void
@@ -1501,6 +1519,9 @@ plan_walk(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 		*v = b + 1;
 		if (!vc_commit_load(&src->ctx, &h, &c))
 		{
+			if (!p->cut)
+				p->first_cut = h;
+			p->cut = true;
 			plan_bound(p, &h, hint_from(src, &h));
 			continue;
 		}
@@ -1546,20 +1567,38 @@ plan_walk(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 }
 
 /*
- * Connect first: send everything down to commits dst knows.  Only when the
- * heads share no history with dst does depth apply, as for a clone.
+ * Histories must attach: walking back from the heads has to reach a commit
+ * dst already knows, wherever it is there (a cut commit with the same hash
+ * is the same history).  Everything down to it is sent.  If the walk ends
+ * at roots without that, the histories are unrelated; if it ends at the
+ * sender's own cut, they cannot be shown to attach until that history is
+ * restored.  Only a clone (allow_unrelated) skips this, and stops at depth.
  */
-static void
+static int
 plan_transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
-			  uint32_t depth, Plan *p)
+			  uint32_t depth, bool allow_unrelated, Plan *p)
 {
 	memset(p, 0, sizeof(*p));
 	plan_walk(src, dst, heads, nheads, 0, p);
-	if (!p->connected && depth > 0)
+	if (p->connected || (p->nsend == 0 && !p->cut))
+		return VC_OK;
+	if (allow_unrelated)
 	{
-		plan_free(p);
-		plan_walk(src, dst, heads, nheads, depth, p);
+		if (depth > 0)
+		{
+			plan_free(p);
+			plan_walk(src, dst, heads, nheads, depth, p);
+		}
+		return VC_OK;
 	}
+	if (p->cut)
+	{
+		src->ctx.err_hash = dst->ctx.err_hash = p->first_cut;
+		plan_free(p);
+		return VC_ERR_DETACHED;
+	}
+	plan_free(p);
+	return VC_ERR_UNRELATED;
 }
 
 /* Copies the planned commits into dst, pinned there but not yet held. */
@@ -1606,23 +1645,19 @@ plan_adopt(VcRepo *dst, const Plan *p)
 
 static int
 transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
-		 uint32_t depth)
+		 uint32_t depth, bool allow_unrelated)
 {
 	Plan		p;
-	int			rc;
+	int			rc = plan_transfer(src, dst, heads, nheads, depth,
+								   allow_unrelated, &p);
 
-	plan_transfer(src, dst, heads, nheads, depth, &p);
+	if (rc != VC_OK)
+		return rc;
 	rc = plan_copy(src, dst, &p);
 	if (rc == VC_OK)
 		plan_adopt(dst, &p);
 	plan_free(&p);
 	return rc;
-}
-
-int
-vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit)
-{
-	return transfer(src, dst, commit, 1, 0);
 }
 
 static void
@@ -1651,7 +1686,8 @@ vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 		return VC_ERR;
 	if (rb && phash_eq(&rb->head, &lb->head))
 		return VC_OK;
-	plan_transfer(local, remote, &lb->head, 1, remote->window_depth, &p);
+	if ((rc = plan_transfer(local, remote, &lb->head, 1, 0, false, &p)) != VC_OK)
+		return rc;
 	if ((rc = plan_copy(local, remote, &p)) != VC_OK)
 	{
 		plan_free(&p);
@@ -1685,7 +1721,7 @@ vc_fetch(VcRepo *local, VcRepo *remote, const char *branch, PHash *head)
 
 	if (rb == NULL)
 		return VC_ERR;
-	if ((rc = transfer(remote, local, &rb->head, 1, local->window_depth)) != VC_OK)
+	if ((rc = transfer(remote, local, &rb->head, 1, 0, false)) != VC_OK)
 		return rc;
 	*head = rb->head;
 	return VC_OK;
@@ -1702,7 +1738,7 @@ vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src, uint32_t depth)
 	dst->window_depth = depth;
 	for (size_t i = 0; i < src->nbr; i++)
 		heads[i] = src->br[i].head;
-	rc = transfer(src, dst, heads, src->nbr, depth);
+	rc = transfer(src, dst, heads, src->nbr, depth, true);
 	free(heads);
 	if (rc != VC_OK)
 		return rc;

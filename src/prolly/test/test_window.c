@@ -553,12 +553,21 @@ test_remotes_across_edge(void)
 	check_snap(&clone.ctx, &l.d, &sd);
 	check_store(ccs, 0);
 
-	/* pushing a new branch to an unrelated remote stops at the edge too */
+	/*
+	 * pushing to an unrelated remote: the walk reaches this repo's own cut
+	 * before anything the remote knows, so attachment cannot be shown
+	 */
 	vc_repo_init(&fresh, rcs, &small_policy);
 	CHECK(vc_branch_create(&r, "topic", NULL) == VC_OK);
-	CHECK(vc_push(&r, &fresh, "topic") == VC_OK);
-	CHECK(vc_locate(&fresh, &l.b, NULL) == VC_LOC_BOUNDARY);
-	CHECK(vc_locate(&fresh, &l.d, NULL) == VC_LOC_WINDOW);
+	{
+		size_t		before = rcs->ops->count(rcs);
+
+		CHECK(vc_push(&r, &fresh, "topic") == VC_ERR_DETACHED);
+		CHECK(phash_eq(&r.ctx.err_hash, &l.b));
+		CHECK(strcmp(vc_hint(&r, &l.b), "archive") == 0);
+		CHECK_EQ(rcs->ops->count(rcs), before);
+		CHECK(vc_branch_find(&fresh, "topic") == NULL);
+	}
 	check_store(rcs, 0);
 
 	/* fetching new work from a full-history remote needs nothing past the edge */

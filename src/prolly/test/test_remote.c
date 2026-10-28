@@ -315,10 +315,10 @@ test_restore_from_archive_alone(void)
 	CHECK(phash_eq(&newest, &l.b));
 
 	vc_repo_init(&fresh, ncs, &small_policy);
+	/* separately started repos share nothing, not even init */
+	CHECK(vc_locate(&fresh, &l.init, NULL) == VC_LOC_UNKNOWN);
 	CHECK(vc_deepen(&fresh, &(VcSource) {"cold", acs}, &newest, 0, &nseg) == VC_OK);
-	/* fresh's own init commit is byte-identical to db1's: only A and B come */
-	CHECK(vc_locate(&fresh, &l.init, NULL) == VC_LOC_WINDOW);
-	CHECK_EQ(fresh.segs[nseg].n, 2);
+	CHECK_EQ(fresh.segs[nseg].n, 3);
 	CHECK(vc_segment_attach(&fresh, nseg) == VC_OK);
 	check_snap(&fresh.ctx, &l.b, &sb);
 	CHECK(vc_branch_create(&fresh, "restored", &l.b) == VC_OK);
@@ -634,6 +634,190 @@ test_branching_both_sides(void)
 	cs_destroy(acs);
 }
 
+
+/* ------------------------------------------------------------ attachment */
+
+/* Separately started repos share no history: every transfer is refused. */
+static void
+test_unrelated_histories_rejected(void)
+{
+	ChunkStore *acs = memstore_create(),
+			   *bcs = memstore_create();
+	VcRepo		a,
+				b;
+	PHash		head;
+	VcMergeResult m;
+	size_t		na,
+				nb;
+
+	setup(&a, acs);
+	name_repo(&a, "a");
+	setup(&b, bcs);
+	name_repo(&b, "b");
+	CHECK(!phash_eq(&vc_head(&a)->head, &vc_head(&b)->head));
+	commit_rows(&a, 0, 1000, 1, "a1");
+	commit_rows(&b, 0, 1000, 1, "b1");	/* same rows, different history */
+	na = acs->ops->count(acs);
+	nb = bcs->ops->count(bcs);
+
+	CHECK(vc_fetch(&a, &b, "main", &head) == VC_ERR_UNRELATED);
+	CHECK(vc_push(&a, &b, "main") == VC_ERR_UNRELATED);
+	CHECK(vc_branch_create(&a, "side", NULL) == VC_OK);
+	CHECK(vc_push(&a, &b, "side") == VC_ERR_UNRELATED);	/* a new branch too */
+	CHECK(vc_pull(&a, &b, "main", 100, &m) == VC_ERR_UNRELATED);
+	CHECK(vc_branch_find(&a, "b/main") == NULL);
+	CHECK_EQ(acs->ops->count(acs), na);
+	CHECK_EQ(bcs->ops->count(bcs), nb);
+	check_store(acs, 0);
+	check_store(bcs, 0);
+
+	vc_repo_free(&a);
+	vc_repo_free(&b);
+	cs_destroy(acs);
+	cs_destroy(bcs);
+}
+
+/*
+ * The remote moved on and cut the history that joins it to the laptop's:
+ * fetch is refused as detached, naming the cut and its archive, until the
+ * laptop restores that stretch from the archive.
+ */
+static void
+test_detached_fetch_until_repaired(void)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create(),
+			   *acs = memstore_create();
+	VcRepo		origin,
+				laptop;
+	Linear		l;
+	PHash		c[6],
+				head;
+	uint32_t	seg,
+				dseg;
+	VcMergeResult m;
+	size_t		before;
+
+	setup(&origin, ocs);
+	name_repo(&origin, "origin");
+	l = build_linear(&origin);
+	CHECK(vc_repo_clone(&laptop, lcs, &origin, 2) == VC_OK);	/* knows C, D */
+	for (int i = 0; i < 6; i++)
+		c[i] = commit_rows(&origin, 100 + (uint64_t) i * 10, 105 + (uint64_t) i * 10,
+						   50 + (uint64_t) i, "E..J");
+	CHECK(vc_sever(&origin, &depth2, &seg) == VC_OK);
+	CHECK(vc_segment_export(&origin, seg, &(VcSource) {"cold", acs}) == VC_OK);
+
+	before = lcs->ops->count(lcs);
+	CHECK(vc_fetch(&laptop, &origin, "main", &head) == VC_ERR_DETACHED);
+	CHECK(phash_eq(&laptop.ctx.err_hash, &c[3]));
+	CHECK(strcmp(vc_hint(&origin, &c[3]), "cold") == 0);
+	CHECK_EQ(lcs->ops->count(lcs), before);
+	CHECK(vc_pull(&laptop, &origin, "main", 100, &m) == VC_ERR_DETACHED);
+	check_store(lcs, 0);
+
+	/* repair: bring the joining stretch in from the archive, then fetch */
+	CHECK(vc_deepen(&laptop, &(VcSource) {"cold", acs}, &c[3], 0, &dseg) == VC_OK);
+	CHECK_EQ(laptop.segs[dseg].n, 4);	/* E..H, stopping at D */
+	CHECK(vc_pull(&laptop, &origin, "main", 0, &m) == VC_OK);
+	CHECK(m.status == VC_MERGE_FAST_FORWARD && phash_eq(&m.commit, &c[5]));
+	vc_merge_result_free(&m);
+	(void) l;
+	check_store(lcs, 0);
+
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+	cs_destroy(lcs);
+	cs_destroy(acs);
+}
+
+/*
+ * The laptop worked offline and cut its own history: its push cannot be
+ * shown to attach and is refused, leaving nothing on the remote, until the
+ * laptop attaches its segment again.
+ */
+static void
+test_detached_push_until_attached(void)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create(),
+			   *acs = memstore_create();
+	VcRepo		origin,
+				laptop;
+	PHash		c[5];
+	uint32_t	seg;
+	size_t		before;
+
+	setup(&origin, ocs);
+	name_repo(&origin, "origin");
+	build_linear(&origin);
+	CHECK(vc_repo_clone(&laptop, lcs, &origin, 0) == VC_OK);
+	name_repo(&laptop, "laptop");
+	for (int i = 0; i < 5; i++)
+		c[i] = commit_rows(&laptop, 200 + (uint64_t) i * 10, 205 + (uint64_t) i * 10,
+						   80 + (uint64_t) i, "offline");
+	CHECK(vc_sever(&laptop, &depth2, &seg) == VC_OK);
+	CHECK(vc_segment_export(&laptop, seg, &(VcSource) {"cold", acs}) == VC_OK);
+
+	before = ocs->ops->count(ocs);
+	CHECK(vc_push(&laptop, &origin, "main") == VC_ERR_DETACHED);
+	CHECK(phash_eq(&laptop.ctx.err_hash, &c[2]));
+	CHECK_EQ(ocs->ops->count(ocs), before);
+	check_store(ocs, 0);
+
+	CHECK(vc_segment_attach(&laptop, seg) == VC_OK);
+	CHECK(vc_push(&laptop, &origin, "main") == VC_OK);
+	CHECK(phash_eq(&vc_head(&origin)->head, &c[4]));
+	check_store(ocs, 0);
+
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+	cs_destroy(lcs);
+	cs_destroy(acs);
+}
+
+/*
+ * Attaching through a cut commit: the remote discarded B, but a new branch
+ * built on B still attaches there (same hash, same history), and B itself
+ * is not sent back.
+ */
+static void
+test_attach_at_cut_commit(void)
+{
+	ChunkStore *ocs = memstore_create(),
+			   *lcs = memstore_create();
+	VcRepo		origin,
+				laptop;
+	Linear		l;
+	uint32_t	seg;
+	PHash		x;
+	LogAcc		acc;
+
+	setup(&origin, ocs);
+	name_repo(&origin, "origin");
+	l = build_linear(&origin);
+	CHECK(vc_repo_clone(&laptop, lcs, &origin, 0) == VC_OK);
+	CHECK(vc_sever(&origin, &depth2, &seg) == VC_OK);
+	CHECK(vc_segment_discard(&origin, seg) == VC_OK);
+
+	CHECK(vc_branch_create(&laptop, "hotfix", &l.b) == VC_OK);
+	vc_checkout(&laptop, "hotfix");
+	x = commit_rows(&laptop, 300, 310, 90, "fix on B");
+	CHECK(vc_push(&laptop, &origin, "hotfix") == VC_OK);
+	CHECK(phash_eq(&vc_branch_find(&origin, "hotfix")->head, &x));
+	CHECK(!ocs->ops->has(ocs, &l.b));
+	CHECK(vc_locate(&origin, &l.b, NULL) == VC_LOC_DISCARDED);
+	CHECK(log_from(&origin, &x, 0, &acc) == VC_ERR_SEVERED && acc.n == 1);
+	check_store(ocs, 0);
+
+	vc_repo_free(&origin);
+	vc_repo_free(&laptop);
+	cs_destroy(ocs);
+	cs_destroy(lcs);
+}
+
 /* ---------------------------------------------------------------- scaling */
 
 #define RS_K 20
@@ -744,6 +928,10 @@ main(void)
 	RUN(test_merge_parent_beyond_depth);
 	RUN(test_explicit_restore_on_remote);
 	RUN(test_branching_both_sides);
+	RUN(test_unrelated_histories_rejected);
+	RUN(test_detached_fetch_until_repaired);
+	RUN(test_detached_push_until_attached);
+	RUN(test_attach_at_cut_commit);
 	RUN(test_transfer_costs);
 	printf("test_remote: all tests passed\n");
 	return 0;

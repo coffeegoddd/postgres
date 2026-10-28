@@ -18,6 +18,8 @@
 #define VC_ERR (-10)			/* bad argument or state */
 #define VC_ERR_SEVERED (-3)		/* needs a commit cut from local history */
 #define VC_ERR_OUTSIDE_WINDOW (-4)	/* stopped at the window's edge */
+#define VC_ERR_UNRELATED (-5)	/* the histories share no commit */
+#define VC_ERR_DETACHED (-6)	/* the sender's history is cut before it attaches */
 
 /*
  * Stop at the window's edge: refuse any commit the window does not hold,
@@ -175,7 +177,7 @@ typedef struct VcRepo
 	size_t		nsegs;
 	size_t		segcap;
 	char	   *name;			/* how others refer to this repo */
-	uint32_t	window_depth;	/* receiver depth for clones; 0: unlimited */
+	uint32_t	window_depth;	/* the window depth this repo keeps */
 	PHashMap	hint;			/* boundary commit -> hints index + 1 */
 	char	  **hints;
 	size_t		nhints;
@@ -267,17 +269,24 @@ extern void vc_manifest_free(VcManifest *m);
  * A transfer sends the commits the receiver lacks, each with its whole
  * tree, stopping at any commit the receiver already knows, wherever it is
  * there, so discarded or exported history never comes back implicitly.
- * Fetch and push connect: they send everything down to known commits.  A
- * clone, or heads that share no history with the receiver, stop at the
- * receiver's window depth.  Parents not sent become boundaries on the
- * receiver, with a hint naming where their content can be found.  Push is
- * checked for fast-forward by the receiver.  Each repo applies its own
- * window: nothing is severed on receive.
+ *
+ * Fetch, push and pull require the histories to attach: walking back from
+ * the heads must reach a commit the receiver knows (as a cut commit too:
+ * the same hash is the same history).  Otherwise they are rejected with
+ * nothing left behind: VC_ERR_UNRELATED if the walk reached roots, or
+ * VC_ERR_DETACHED if it reached the sender's own cut first (err_hash names
+ * it, vc_hint says where it lives), which deepening or attaching repairs.
+ * Only a clone into an empty repo starts unattached, at the given depth.
+ *
+ * Parents not sent become boundaries on the receiver, with a hint naming
+ * where their content can be found.  Push is checked for fast-forward by
+ * the receiver.  Each repo applies its own window: nothing is severed on
+ * receive.
  */
 extern void vc_repo_set_name(VcRepo *r, const char *name);
 extern void vc_set_window_depth(VcRepo *r, uint32_t depth);
+/* Where this repo says a commit it lacks can be found: its archive or a hint. */
 extern const char *vc_hint(VcRepo *r, const PHash *commit);
-extern int	vc_sync_commit(VcRepo *src, VcRepo *dst, const PHash *commit);
 extern int	vc_push(VcRepo *local, VcRepo *remote, const char *branch);
 extern int	vc_fetch(VcRepo *local, VcRepo *remote, const char *branch,
 					 PHash *head);
