@@ -5147,15 +5147,32 @@ unnamed_files(const char *dir, const Manifest *m, bool dropped, List **ids,
  * get to remove (it failed, or the server stopped, in between), or one it
  * was writing.  With the manifest's lock held, no writer is writing one
  * now.
+ *
+ * One past the ids m gave (a writer that failed before its manifest named
+ * it) is given in m first, the manifest written so, before it is removed:
+ * an id is never given again once its removal is WAL-logged.  Else a file
+ * made again under it, from copies of files since removed, would be
+ * removed by redo of the old one's removal after a crash, with nothing
+ * left to copy it from.
  */
 static void
-remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+remove_unnamed(ProllyChunkStore *s, const char *dir, Manifest *m)
 {
 	List	   *ids = NIL;
 	List	   *segs = NIL;
 	ListCell   *lc;
+	uint64		last = m->last_id;
 
 	unnamed_files(dir, m, false, &ids, &segs);
+	foreach(lc, ids)
+		last = Max(last, *(uint64 *) lfirst(lc));
+	foreach(lc, segs)
+		last = Max(last, *(uint64 *) lfirst(lc));
+	if (last > m->last_id)
+	{
+		m->last_id = last;
+		replace_manifest(s, m, XLOG_CHUNKS_MANIFEST);
+	}
 	foreach(lc, ids)
 		table_file_unlink(s, dir, *(uint64 *) lfirst(lc), false);
 	foreach(lc, segs)
