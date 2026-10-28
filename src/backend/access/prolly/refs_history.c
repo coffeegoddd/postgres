@@ -446,10 +446,14 @@ paint_remember(const ProllyHash *a, const ProllyHash *b, bool complete,
 {
 	PaintMemo  *m = &paint_memo;
 
+	/* (not valid till filled: an allocation failing leaves none) */
+	m->valid = false;
 	if (m->found)
 		pfree(m->found);
 	if (m->heights)
 		pfree(m->heights);
+	m->found = NULL;
+	m->heights = NULL;
 	m->found = MemoryContextAlloc(TopMemoryContext,
 								  sizeof(ProllyHash) * Max(nfound, 1));
 	m->heights = MemoryContextAlloc(TopMemoryContext,
@@ -835,10 +839,12 @@ commits_by_base(const ProllyHash *parents, ProllyCommitCount count,
 	int64		shared = 0;
 	bool		known;
 
-	if (!paint_common(&parents[0], &parents[1], true, lookup, lookup_arg,
+	/* (the other parent's count first: without it, no walk for the base) */
+	if (!count(&parents[1], &theirs, count_arg) ||
+		!paint_common(&parents[0], &parents[1], true, lookup, lookup_arg,
 					  &found, &heights, &nfound))
 		return false;
-	known = nfound <= 1 && count(&parents[1], &theirs, count_arg) &&
+	known = nfound <= 1 &&
 		(nfound == 0 || count(&found[0], &shared, count_arg)) &&
 		theirs >= shared;
 	pfree(found);
