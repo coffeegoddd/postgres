@@ -3896,6 +3896,7 @@ sever_cut(ProllyWindowAction action, const TimestampTz *before,
 /* Background retires that fail this many times in a row: a full collection. */
 #define RETIRE_FAILURES_MOST	3
 #define LAST_FULL_SETTING	"history_window.last_full"
+#define LAST_SEALED_SETTING	"history_window.last_sealed"
 #define FAILURES_SETTING	"history_window.failures"
 #define RETRY_SETTING		"history_window.retry_at"
 #define TRANSIENT_SETTING	"history_window.transient"
@@ -4465,9 +4466,10 @@ newest_epoch(uint32 epoch, TimestampTz ended, void *arg)
 }
 
 /*
- * A batch boundary passed since the store's newest generation ended (the
- * database's batch, an hour where it names none): only while some
- * lineage has a window, whose fragments are cut at batches.
+ * A batch boundary passed since the store's newest generation ended, or
+ * the background's last collection did (sealed()), whichever is later (the
+ * database's batch, an hour where it names none): only while some lineage
+ * has a window, whose fragments are cut at batches.
  */
 static bool
 archive_seal_due(void)
@@ -4490,7 +4492,20 @@ archive_seal_due(void)
 	boundary = now - (((now % batch) + batch) % batch);
 	PROLLY_CALL(tree_env.chunk_store, epochs, tree_env.chunks, newest_epoch,
 				&newest);
+	newest = Max(newest, config_int(LAST_SEALED_SETTING, DT_NOBEGIN));
 	return newest < boundary;
+}
+
+/*
+ * A background collection ran, ending a generation: the next seal is
+ * counted from now, whether or not it settled anything (the store records
+ * only the generations its settled files hold).
+ */
+static void
+archive_sealed(void)
+{
+	window_init();
+	config_int_set(LAST_SEALED_SETTING, GetCurrentTimestamp(), false);
 }
 
 /*
@@ -5204,4 +5219,5 @@ const ProllyWindowRoutine prolly_window_archive = {
 	.retired = archive_retired,
 	.retire_failed = archive_retire_failed,
 	.seal_due = archive_seal_due,
+	.sealed = archive_sealed,
 };

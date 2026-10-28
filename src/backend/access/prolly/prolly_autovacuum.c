@@ -375,6 +375,7 @@ static bool seal_wanted = false;
 static bool retire_refused = false;	/* another collection ran meanwhile */
 static bool retire_errored = false; /* the retire raised an error */
 static bool retire_ran = false;	/* a retire ran, and swapped */
+static bool collection_ran = false; /* a default or full collection ran */
 
 static void
 sever(void)
@@ -515,10 +516,14 @@ collect(void)
 	retire_refused = false;
 	retire_errored = false;
 	retire_ran = false;
+	collection_ran = false;
 	collect_now();
 	prolly_database_components(&dc);
 	if (dc.history_window == NULL)
 		return;
+	/* (either ended a generation: the next seal is counted from it) */
+	if ((collection_ran || retire_ran) && PROLLY_HAS(dc.history_window, sealed))
+		PROLLY_CALL(dc.history_window, sealed);
 	if (retire_errored)
 	{
 		if (PROLLY_HAS(dc.history_window, retire_failed))
@@ -567,6 +572,7 @@ collect_now(void)
 								 get_database_name(MyDatabaseId))));
 		return;
 	}
+	collection_ran = true;
 	if (full && PROLLY_HAS(dc.history_window, collected))
 		PROLLY_CALL(dc.history_window, collected);
 	/* (then, a step of its own, the records of the commits it took) */

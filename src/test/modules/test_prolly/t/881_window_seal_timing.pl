@@ -4,9 +4,9 @@
 # passed since the store's newest generation ended, below the size
 # thresholds) run once a boundary, not at every visit: a collection that
 # settled nothing new (a store holding nothing live) still ends its
-# generation, the time the next seal is counted from.  And with
-# prolly.gc_journal_threshold -1, which turns the default collections off,
-# there are none.
+# generation, which the window notes (sealed()): the time the next seal is
+# counted from.  And with prolly.gc_journal_threshold -1, which turns the
+# default collections off, there are none.
 
 use strict;
 use warnings FATAL => 'all';
@@ -33,11 +33,10 @@ sub has { return sql("SELECT test_chunk_has('$_[0]')"); }
 
 # The first seal: the store's first generation ends, though nothing in it
 # is live.
-my $first = sql(q{SELECT test_chunk_put('the first generation''s')});
-ok($node->poll_query_until('ws', qq{SELECT NOT test_chunk_has('$first')}),
-	'a seal ends the first generation');
-is(sql(q{SELECT count(*) FROM test_chunk_epochs()}), '1',
-	'its end is recorded though it settled nothing');
+sql(q{SELECT test_chunk_put('the first generation''s')});
+ok( $node->poll_query_until(
+		'ws', q{SELECT NOT seal_due FROM test_window_retire_due()}),
+	'a seal ends the first generation, and none is due after it');
 
 # No boundary of a day passes in the visits after: nothing below the
 # threshold is collected.

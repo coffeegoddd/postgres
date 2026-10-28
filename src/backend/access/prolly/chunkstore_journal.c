@@ -11288,16 +11288,24 @@ journal_gc_copy(ProllyChunkGc *gc, const uint8 *marks, const bool *keep)
 
 /*
  * The generations the new manifest nm (its files named) records: the
- * collection's own, after those of the old one still held by a settled
- * file, or older than one is.  Its own is recorded even if it settled
- * nothing new (a store holding nothing live), as the newest: when the
- * generation the next one begins ended, which the history window's seals
- * are timed from.
+ * collection's own, if it settled chunks new to settled files, after
+ * those of the old one still held by a settled file, or older than one
+ * is.
  */
 static void
 swap_epochs(ProllyChunkGc *gc, Manifest *nm)
 {
 	uint32		oldest = PG_UINT32_MAX;
+	bool		settled_new = false;
+	ListCell   *lc;
+
+	foreach(lc, gc->written)
+	{
+		ManifestFile *f = lfirst(lc);
+
+		if (f->epoch_lo == nm->gc_generation)
+			settled_new = true;
+	}
 
 	for (int i = 0; i < nm->nfiles; i++)
 	{
@@ -11311,7 +11319,7 @@ swap_epochs(ProllyChunkGc *gc, Manifest *nm)
 		if (gc->m.epochs[i].epoch >= oldest)
 			nm->epochs[nm->nepochs++] = gc->m.epochs[i];
 	}
-	if (gc->settle)
+	if (settled_new)
 	{
 		nm->epochs[nm->nepochs].epoch = nm->gc_generation;
 		nm->epochs[nm->nepochs].ended = GetCurrentTimestamp();

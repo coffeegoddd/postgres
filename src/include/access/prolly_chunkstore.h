@@ -317,7 +317,7 @@ typedef struct ProllyChunkGeneration
 typedef void (*ProllyChunkGenerationVisit) (const ProllyChunkGeneration *g,
 											void *arg);
 
-/* A collection's generation (settling chunks, or none), and when it ended. */
+/* A collection that settled chunks: its generation, and when it ended. */
 typedef void (*ProllyChunkEpochVisit) (uint32 epoch, TimestampTz ended,
 									   void *arg);
 

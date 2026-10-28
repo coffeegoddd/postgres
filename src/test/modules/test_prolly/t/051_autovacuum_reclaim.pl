@@ -40,7 +40,8 @@ is(sql('SHOW prolly.gc_journal_threshold'), '1MB', 'the threshold is a setting')
 # threshold garbage stays.
 sql(q{ALTER DATABASE av SET prolly.history_batch = '1 day'});
 sql(q{SELECT test_chunk_put('before the first generation ends')});
-ok($node->poll_query_until('av', q{SELECT count(*) > 0 FROM test_chunk_epochs()}),
+ok( $node->poll_query_until(
+		'av', q{SELECT NOT seal_due FROM test_window_retire_due()}),
 	'the store\'s first generation ends');
 my $dead = sql(q{SELECT test_chunk_put('dead below the threshold')});
 sleep(3);
