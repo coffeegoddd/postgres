@@ -24,6 +24,7 @@
 #define _DEFAULT_SOURCE
 #include <fcntl.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <libpq-fe.h>
@@ -56,6 +57,10 @@ typedef struct Opts
 	bool		sql_baseline;
 	bool		reuse;			/* keep the loaded table from a previous run */
 	bool		final_verify;	/* compare every row at the end */
+	bool		lifecycle;		/* no images: checkpoints, replay checkouts */
+	int			bg_ms;			/* background checkpoint every this many ms */
+	int64_t		bg_bytes;		/* ... or once this much WAL is undecoded */
+	int			diffs;
 	uint64_t	seed;
 } Opts;
 
@@ -78,10 +83,15 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, 1
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, 1
 };
 
-static PGconn *db;
+static PGconn *db;				/* the workload and queries */
+static PGconn *dec;				/* logical decoding: the slot's one user */
+static PGconn *rep;				/* replay, under a replication origin decoding skips */
+static pthread_mutex_t repo_lock = PTHREAD_MUTEX_INITIALIZER;
+static char working_lsn[32];	/* working root = working set as of here */
+static volatile bool bg_stop;
 static uint32_t dboid;
 static Rel rels[MAX_RELS];
 static int nrels;
@@ -106,18 +116,25 @@ now_ms(void)
 }
 
 static PGresult *
-qp(const char *sql, int n, const char *const *vals, const int *lens,
-   const int *fmts, int resfmt)
+qpc(PGconn *c, const char *sql, int n, const char *const *vals, const int *lens,
+	const int *fmts, int resfmt)
 {
-	PGresult   *r = PQexecParams(db, sql, n, NULL, vals, lens, fmts, resfmt);
+	PGresult   *r = PQexecParams(c, sql, n, NULL, vals, lens, fmts, resfmt);
 	ExecStatusType st = PQresultStatus(r);
 
 	if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK && st != PGRES_COPY_OUT)
 	{
-		fprintf(stderr, "\nquery failed: %s\n%s\n", sql, PQerrorMessage(db));
+		fprintf(stderr, "\nquery failed: %s\n%s\n", sql, PQerrorMessage(c));
 		exit(1);
 	}
 	return r;
+}
+
+static PGresult *
+qp(const char *sql, int n, const char *const *vals, const int *lens,
+   const int *fmts, int resfmt)
+{
+	return qpc(db, sql, n, vals, lens, fmts, resfmt);
 }
 
 static PGresult *
@@ -139,13 +156,19 @@ qx(const char *sql)
  * to the flushed position, so force a flush first.
  */
 static void
-flush_lsn(char *out)
+flush_lsn_on(PGconn *c, char *out)
 {
-	PGresult   *r = q("SELECT pg_logical_emit_message(false, 'prolly', '', true), "
-					  "pg_current_wal_flush_lsn()");
+	PGresult   *r = qpc(c, "SELECT pg_logical_emit_message(false, 'prolly', '', true), "
+						"pg_current_wal_flush_lsn()", 0, NULL, NULL, NULL, 0);
 
 	snprintf(out, 32, "%s", PQgetvalue(r, 0, 1));
 	PQclear(r);
+}
+
+static void
+flush_lsn(char *out)
+{
+	flush_lsn_on(db, out);
 }
 
 static void
@@ -418,8 +441,10 @@ static size_t
 decode_into_prolly(const char *lsn)
 {
 	const char *vals[1] = {lsn};
-	PGresult   *r = qp("SELECT data FROM pg_logical_slot_get_changes('prolly', $1::pg_lsn, NULL, "
-					   "'include-xids', '0', 'skip-empty-xacts', '1')", 1, vals, NULL, NULL, 0);
+	PGresult   *r = qpc(o.lifecycle ? dec : db,
+						"SELECT data FROM pg_logical_slot_get_changes('prolly', $1::pg_lsn, NULL, "
+						"'include-xids', '0', 'skip-empty-xacts', '1', 'only-local', '1')",
+						1, vals, NULL, NULL, 0);
 	EditList	el = {0};
 	size_t		n;
 
@@ -1020,6 +1045,44 @@ sql_diff_fn(void *arg, const ProllyDiff *d)
 	rd->nins++;
 }
 
+/* Replays the rows that differ between two table roots as SQL on c. */
+static uint64_t
+replay_diff(PGconn *c, const PHash *from, const PHash *to)
+{
+	RowDiffs	rd;
+	const char *vals[4];
+
+	memset(&rd, 0, sizeof(rd));
+	buf_append_byte(&rd.del, '{');
+	buf_append_byte(&rd.ins, '{');
+	buf_append_byte(&rd.k, '{');
+	buf_append_byte(&rd.v, '{');
+	buf_append_byte(&rd.pad, '{');
+	CHECK_OK(prolly_diff(&repo.ctx, from, to, sql_diff_fn, &rd));
+	buf_append(&rd.del, "}", 2);
+	buf_append(&rd.ins, "}", 2);
+	buf_append(&rd.k, "}", 2);
+	buf_append(&rd.v, "}", 2);
+	buf_append(&rd.pad, "}", 2);
+	PQclear(qpc(c, "BEGIN", 0, NULL, NULL, NULL, 0));
+	vals[0] = (const char *) rd.del.data;
+	PQclear(qpc(c, "DELETE FROM t WHERE id = ANY($1::bigint[])", 1, vals, NULL, NULL, 0));
+	vals[0] = (const char *) rd.ins.data;
+	vals[1] = (const char *) rd.k.data;
+	vals[2] = (const char *) rd.v.data;
+	vals[3] = (const char *) rd.pad.data;
+	PQclear(qpc(c, "INSERT INTO t SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::text[]) "
+				"ON CONFLICT (id) DO UPDATE SET k = excluded.k, v = excluded.v, pad = excluded.pad",
+				4, vals, NULL, NULL, 0));
+	PQclear(qpc(c, "COMMIT", 0, NULL, NULL, NULL, 0));
+	buf_free(&rd.del);
+	buf_free(&rd.ins);
+	buf_free(&rd.k);
+	buf_free(&rd.v);
+	buf_free(&rd.pad);
+	return rd.ndel + rd.nins;
+}
+
 /* Baseline: replays the prolly diff as SQL; returns rows changed. */
 static uint64_t
 checkout_sql(const PHash *target)
@@ -1027,42 +1090,14 @@ checkout_sql(const PHash *target)
 	VcCommit	c;
 	PHash		from = table_root(&repo.br[repo.cur].working),
 				to;
-	RowDiffs	rd;
-	const char *vals[4];
+	uint64_t	n;
 
-	memset(&rd, 0, sizeof(rd));
 	CHECK(vc_commit_load(&repo.ctx, target, &c));
 	to = table_root(&c.root);
-	buf_append_byte(&rd.del, '{');
-	buf_append_byte(&rd.ins, '{');
-	buf_append_byte(&rd.k, '{');
-	buf_append_byte(&rd.v, '{');
-	buf_append_byte(&rd.pad, '{');
-	CHECK_OK(prolly_diff(&repo.ctx, &from, &to, sql_diff_fn, &rd));
-	buf_append(&rd.del, "}", 2);
-	buf_append(&rd.ins, "}", 2);
-	buf_append(&rd.k, "}", 2);
-	buf_append(&rd.v, "}", 2);
-	buf_append(&rd.pad, "}", 2);
-	qx("BEGIN");
-	vals[0] = (const char *) rd.del.data;
-	PQclear(qp("DELETE FROM t WHERE id = ANY($1::bigint[])", 1, vals, NULL, NULL, 0));
-	vals[0] = (const char *) rd.ins.data;
-	vals[1] = (const char *) rd.k.data;
-	vals[2] = (const char *) rd.v.data;
-	vals[3] = (const char *) rd.pad.data;
-	PQclear(qp("INSERT INTO t SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::text[]) "
-			   "ON CONFLICT (id) DO UPDATE SET k = excluded.k, v = excluded.v, pad = excluded.pad",
-			   4, vals, NULL, NULL, 0));
-	qx("COMMIT");
+	n = replay_diff(db, &from, &to);
 	qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
 	/* the pages diverged from any image; base_img and base_lsn still describe them */
-	buf_free(&rd.del);
-	buf_free(&rd.ins);
-	buf_free(&rd.k);
-	buf_free(&rd.v);
-	buf_free(&rd.pad);
-	return rd.ndel + rd.nins;
+	return n;
 }
 
 /* -------------------------------------------------------------- verify */
@@ -1273,6 +1308,287 @@ switch_to(const PHash *target, bool by_sql, uint64_t db_pages)
 	fflush(stdout);
 }
 
+/* ------------------------------------------------------------- lifecycle */
+
+typedef struct CkptStats
+{
+	uint64_t	count;
+	uint64_t	rows;
+	double		ms;
+	double		max_ms;
+} CkptStats;
+
+static CkptStats bg_stats;
+
+/*
+ * Checkpoint: decode everything committed so far into the working root.
+ * Caller holds repo_lock.  Returns rows decoded; *ms the time taken.
+ */
+static size_t
+checkpoint_now(double *ms)
+{
+	char		lsn[32];
+	double		t = now_ms();
+	size_t		rows;
+
+	flush_lsn_on(dec, lsn);
+	rows = decode_into_prolly(lsn);
+	snprintf(working_lsn, sizeof(working_lsn), "%s", lsn);
+	*ms = now_ms() - t;
+	return rows;
+}
+
+/* Background checkpoints, by time or by undecoded WAL, while writers run. */
+static void *
+bg_main(void *arg)
+{
+	double		last = now_ms();
+
+	while (!bg_stop)
+	{
+		bool		due;
+
+		usleep(20000);
+		pthread_mutex_lock(&repo_lock);
+		due = now_ms() - last >= o.bg_ms;
+		if (!due && o.bg_bytes > 0)
+		{
+			const char *vals[1] = {working_lsn};
+			PGresult   *r = qpc(dec, "SELECT pg_current_wal_lsn() - $1::pg_lsn", 1, vals,
+								NULL, NULL, 0);
+
+			due = strtoll(PQgetvalue(r, 0, 0), NULL, 10) >= o.bg_bytes;
+			PQclear(r);
+		}
+		if (due)
+		{
+			double		ms;
+			size_t		rows = checkpoint_now(&ms);
+
+			bg_stats.count++;
+			bg_stats.rows += rows;
+			bg_stats.ms += ms;
+			if (ms > bg_stats.max_ms)
+				bg_stats.max_ms = ms;
+			last = now_ms();
+		}
+		pthread_mutex_unlock(&repo_lock);
+	}
+	return NULL;
+}
+
+static void
+life_commit(int seq, const char *branch)
+{
+	double		ms,
+				t0 = now_ms();
+	size_t		tail;
+	char		msg[64];
+	PHash		c;
+	uint32_t	seg;
+
+	pthread_mutex_lock(&repo_lock);
+	tail = checkpoint_now(&ms);
+	snprintf(msg, sizeof(msg), "%s %d", branch, seq);
+	c = vc_commit(&repo, msg);
+	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
+	if (seg != VC_NO_SEGMENT)
+		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
+	CHECK(ncommits < MAX_COMMITS);
+	commits[ncommits].hash = c;
+	snprintf(commits[ncommits].branch, sizeof(commits[ncommits].branch), "%s", branch);
+	commits[ncommits].seq = seq;
+	ncommits++;
+	printf("commit,%s,%d,%s,tail_rows=%zu,ckpt_ms=%.1f,commit_ms=%.1f,store_live_mb=%.0f\n",
+		   branch, seq, hex(&c), tail, ms, now_ms() - t0, cs->ops->bytes(cs) / 1048576.0);
+	pthread_mutex_unlock(&repo_lock);
+	fflush(stdout);
+}
+
+static void
+count_diff_fn(void *arg, const ProllyDiff *d)
+{
+	(*(uint64_t *) arg)++;
+}
+
+/* diff WORKING X: checkpoint, then the prolly tree alone. */
+static void
+life_diff(const PHash *target)
+{
+	double		ms,
+				t0 = now_ms(),
+				t1;
+	size_t		tail;
+	uint64_t	d = 0;
+	VcCommit	c;
+	PHash		from,
+				to;
+	int			path;
+
+	pthread_mutex_lock(&repo_lock);
+	tail = checkpoint_now(&ms);
+	t1 = now_ms();
+	CHECK(vc_commit_load(&repo.ctx, target, &c));
+	from = table_root(&repo.br[repo.cur].working);
+	to = table_root(&c.root);
+	CHECK_OK(prolly_diff(&repo.ctx, &from, &to, count_diff_fn, &d));
+	path = path_len(&repo.br[repo.cur].head, target);
+	printf("diff,%s,path=%d,tail_rows=%zu,rows=%llu,ckpt_ms=%.1f,diff_ms=%.1f,total_ms=%.1f\n",
+		   hex(target), path, tail, (unsigned long long) d, ms, now_ms() - t1, now_ms() - t0);
+	pthread_mutex_unlock(&repo_lock);
+	fflush(stdout);
+}
+
+/*
+ * Moves the working set: to commit target on the current branch (reset),
+ * or to another branch's working set (switch, when branch is set).
+ */
+static void
+life_checkout(const PHash *target, const char *branch)
+{
+	double		ms,
+				t0 = now_ms(),
+				t1;
+	size_t		tail;
+	uint64_t	rows;
+	PHash		from,
+				to;
+	int			path;
+
+	pthread_mutex_lock(&repo_lock);
+	tail = checkpoint_now(&ms);
+	t1 = now_ms();
+	from = table_root(&repo.br[repo.cur].working);
+	if (branch)
+	{
+		VcBranch   *b = vc_branch_find(&repo, branch);
+
+		path = path_len(&repo.br[repo.cur].head, &b->head);
+		CHECK(vc_checkout(&repo, branch) == VC_OK);
+		to = table_root(&repo.br[repo.cur].working);
+	}
+	else
+	{
+		VcCommit	c;
+
+		path = path_len(&repo.br[repo.cur].head, target);
+		CHECK(vc_commit_load(&repo.ctx, target, &c));
+		to = table_root(&c.root);
+	}
+	/* replay before a reset: the reset lets go of the tree we diff from */
+	rows = replay_diff(rep, &from, &to);
+	if (!branch)
+		CHECK(vc_reset_hard(&repo, target) == VC_OK);
+	printf("checkout,replay,%s,path=%d,tail_rows=%zu,rows=%llu,ckpt_ms=%.1f,replay_ms=%.1f,"
+		   "total_ms=%.1f\n", branch ? branch : hex(target), path, tail,
+		   (unsigned long long) rows, ms, now_ms() - t1, now_ms() - t0);
+	if (o.verify == 2)
+		verify_full(&to);
+	else if (o.verify == 1)
+		verify_changed(&from, &to);
+	pthread_mutex_unlock(&repo_lock);
+	fflush(stdout);
+}
+
+static PGconn *
+connect_or_die(void)
+{
+	PGconn	   *c = PQconnectdb(o.conninfo);
+
+	if (PQstatus(c) != CONNECTION_OK)
+	{
+		fprintf(stderr, "connect: %s", PQerrorMessage(c));
+		exit(1);
+	}
+	return c;
+}
+
+static void
+run_lifecycle(void)
+{
+	pthread_t	bg;
+	PHash		c0;
+	char		lsn[32];
+
+	dec = connect_or_die();
+	rep = connect_or_die();
+	PQclear(qpc(rep, "SELECT pg_replication_origin_create('prolly_replay') "
+				"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = 'prolly_replay')",
+				0, NULL, NULL, NULL, 0));
+	PQclear(qpc(rep, "SELECT pg_replication_origin_session_setup('prolly_replay')",
+				0, NULL, NULL, NULL, 0));
+
+	c0 = vc_commit(&repo, "load");
+	commits[ncommits++] = (CommitInfo) {c0, "main", 0};
+	flush_lsn(lsn);
+	qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
+	snprintf(working_lsn, sizeof(working_lsn), "%s", lsn);
+	CHECK(vc_window_track(&repo, (uint32_t) o.window) == VC_OK);
+	pthread_create(&bg, NULL, bg_main, NULL);
+
+	for (int i = 1; i <= o.commits; i++)
+	{
+		workload(i);
+		life_commit(i, "main");
+	}
+	for (int b = 0; b < o.branches; b++)
+	{
+		char		name[32];
+		int			from;
+
+		pthread_mutex_lock(&repo_lock);
+		from = pick_in_window();
+		snprintf(name, sizeof(name), "b%d", b);
+		CHECK(vc_branch_create(&repo, name, &commits[from].hash) == VC_OK);
+		pthread_mutex_unlock(&repo_lock);
+		life_checkout(NULL, name);
+		for (int i = 1; i <= o.branch_commits; i++)
+		{
+			workload(1000 * (b + 1) + i);
+			life_commit(i, name);
+		}
+	}
+	/* diffs against commits in the window, with a fresh tail each time */
+	for (int k = 0; k < o.diffs; k++)
+	{
+		int			t;
+
+		workload(5000 + k);
+		pthread_mutex_lock(&repo_lock);
+		t = pick_in_window();
+		pthread_mutex_unlock(&repo_lock);
+		life_diff(&commits[t].hash);
+	}
+	/* switches between branch heads, then resets to commits in the window */
+	for (int k = 0; k < o.checkouts && o.branches > 0; k++)
+	{
+		char		name[32];
+
+		snprintf(name, sizeof(name), "b%d", (int) rnd_below((uint64_t) o.branches));
+		life_checkout(NULL, name);
+	}
+	for (int k = 0; k < o.checkouts; k++)
+	{
+		int			t;
+
+		pthread_mutex_lock(&repo_lock);
+		t = pick_in_window();
+		pthread_mutex_unlock(&repo_lock);
+		life_checkout(&commits[t].hash, NULL);
+	}
+	bg_stop = true;
+	pthread_join(bg, NULL);
+	printf("# background checkpoints: %llu, %llu rows, mean %.1f ms, max %.1f ms\n",
+		   (unsigned long long) bg_stats.count, (unsigned long long) bg_stats.rows,
+		   bg_stats.count ? bg_stats.ms / (double) bg_stats.count : 0, bg_stats.max_ms);
+	if (o.final_verify)
+	{
+		PHash		td = table_root(&repo.br[repo.cur].working);
+
+		verify_full(&td);
+	}
+}
+
 static uint64_t
 db_pages(void)
 {
@@ -1290,6 +1606,7 @@ usage(void)
 			"winbench [--rows N] [--pad B] [--commits N] [--changes N] [--txns N]\n"
 			"         [--window W] [--checkouts N] [--branches N] [--branch-commits N]\n"
 			"         [--verify 0|1|2] [--no-sql] [--reuse] [--no-final-verify] [--seed N]\n"
+			"         [--lifecycle [--bg-ms MS] [--bg-bytes B] [--diffs N]]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -1303,7 +1620,8 @@ main(int argc, char **argv)
 		{"checkouts", 1, 0, 'k'}, {"branches", 1, 0, 'b'}, {"branch-commits", 1, 0, 'B'},
 		{"verify", 1, 0, 'v'}, {"no-sql", 0, 0, 'S'}, {"reuse", 0, 0, 'R'},
 		{"seed", 1, 0, 's'}, {"conn", 1, 0, 'C'}, {"pgdata", 1, 0, 'D'},
-		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {0, 0, 0, 0}
+		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
+		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'}, {0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -1331,6 +1649,10 @@ main(int argc, char **argv)
 			case 'D': o.pgdata = optarg; break;
 			case 'F': o.store = optarg; break;
 			case 'N': o.final_verify = false; break;
+			case 'L': o.lifecycle = true; break;
+			case 'T': o.bg_ms = atoi(optarg); break;
+			case 'Y': o.bg_bytes = atoll(optarg); break;
+			case 'f': o.diffs = atoi(optarg); break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -1360,6 +1682,19 @@ main(int argc, char **argv)
 	vc_repo_init(&repo, cs, &prolly_default_policy);
 	setup_db();
 	load_prolly();
+	if (o.lifecycle)
+	{
+		run_lifecycle();
+		printf("# done: %d commits, store live %.0f MB, db %llu pages (%.0f MB)\n", ncommits,
+			   cs->ops->bytes(cs) / 1048576.0, (unsigned long long) db_pages(),
+			   db_pages() * 8192.0 / 1048576.0);
+		vc_repo_free(&repo);
+		cs_destroy(cs);
+		PQfinish(rep);
+		PQfinish(dec);
+		PQfinish(db);
+		return 0;
+	}
 	c0 = vc_commit(&repo, "load");
 	t0 = now_ms();
 	img0 = capture_full(&c0, &pages0);

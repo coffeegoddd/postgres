@@ -34,7 +34,7 @@ clean:
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
 bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< libprolly.a \
-		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -pthread
 
 bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
