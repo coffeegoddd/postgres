@@ -11517,7 +11517,12 @@ copies_set_head(const ProllyHash *commit_id)
 	StringInfoData anchor;
 	bool		anchored;
 
-	lock_refs();
+	/*
+	 * (only the branch's own entries change, as a commit's head move changes
+	 * them: in the scoped changes, under the branch's lock, written once as
+	 * the transaction ends, not a path of the refs for each entry)
+	 */
+	lock_branch(name);
 	have_head = branch_head(name, &head);
 	initStringInfo(&anchor);
 	anchored = anchor_of(name, have_head ? &head : NULL, &anchor);
