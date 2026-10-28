@@ -1633,6 +1633,141 @@ publish_scoped(void)
 }
 
 /*
+ * What refs_get() found, or found missing, under one refs root: a get of a
+ * key is a function of the root it reads, the tree being content
+ * addressed, so a later get that resolves to the same root is answered
+ * from here, without descending the tree again.  A transaction gets the
+ * same few entries many times (its branch's head, merge state and names,
+ * the writer settings), and each descent is a path from the root down,
+ * which grows with the refs (every root kept in the history window is in
+ * them).
+ *
+ * A get that resolves to another root (another session moved the refs, a
+ * rebase onto them rebuilt the scoped changes, a subtransaction's rollback
+ * restored them, or the transaction ended without publishing) empties
+ * the memo first, so each get sees exactly the root it would have read.
+ * Only this backend's own edits of the root the memo is of carry it to
+ * the root they make, their keys taking the values put: apply() of those
+ * edits to that root is what that root holds, entry for entry.  So a run
+ * of transactions that only this backend commits gets each entry it
+ * doesn't change once, not once a transaction.
+ *
+ * In its own context under TopMemoryContext, emptied when it holds
+ * GET_MEMO_MAX entries or GET_MEMO_BYTES of them.
+ */
+typedef struct RefsGetMemo
+{
+	char	   *key;
+	int			keylen;
+	bool		found;
+	char	   *value;			/* (found: the bytes a get appends) */
+	int			len;
+} RefsGetMemo;
+
+#define GET_MEMO_MAX	64
+#define GET_MEMO_BYTES	(256 * 1024)
+
+static MemoryContext get_memo_cxt = NULL;
+static RefsGetMemo get_memo[GET_MEMO_MAX];
+static int	get_memo_n = 0;
+static Size get_memo_bytes = 0;
+static ProllyHash get_memo_root;	/* (len 0: of no root) */
+
+static void
+get_memo_reset(void)
+{
+	if (get_memo_cxt != NULL)
+		MemoryContextReset(get_memo_cxt);
+	get_memo_n = 0;
+	get_memo_bytes = 0;
+	memset(&get_memo_root, 0, sizeof(get_memo_root));
+}
+
+/* The memo of key (len bytes), under get_memo_root; NULL if none. */
+static RefsGetMemo *
+get_memo_find(const char *key, int keylen)
+{
+	for (int i = 0; i < get_memo_n; i++)
+	{
+		RefsGetMemo *m = &get_memo[i];
+
+		if (m->keylen == keylen && memcmp(m->key, key, keylen) == 0)
+			return m;
+	}
+	return NULL;
+}
+
+/* Note what key holds under get_memo_root: value (len bytes), or none. */
+static void
+get_memo_note(const char *key, int keylen, bool found, const char *value,
+			  int len)
+{
+	RefsGetMemo *m = get_memo_find(key, keylen);
+	MemoryContext old;
+
+	if (get_memo_root.len == 0)
+		return;
+	if (m == NULL &&
+		(get_memo_n >= GET_MEMO_MAX ||
+		 get_memo_bytes + keylen + len > GET_MEMO_BYTES))
+	{
+		ProllyHash	root = get_memo_root;
+
+		/* (full: begun again, of the same root) */
+		get_memo_reset();
+		get_memo_root = root;
+		if (keylen + len > GET_MEMO_BYTES)
+			return;
+	}
+	if (get_memo_cxt == NULL)
+		get_memo_cxt = AllocSetContextCreate(TopMemoryContext,
+											 "prolly refs get memo",
+											 ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(get_memo_cxt);
+	if (m == NULL)
+	{
+		m = &get_memo[get_memo_n++];
+		m->key = palloc(Max(keylen, 1));
+		memcpy(m->key, key, keylen);
+		m->keylen = keylen;
+		get_memo_bytes += keylen;
+	}
+	else if (m->found)
+		pfree(m->value);
+	m->found = found;
+	m->value = NULL;
+	m->len = found ? len : 0;
+	if (found)
+	{
+		m->value = palloc(Max(len, 1));
+		memcpy(m->value, value, len);
+		get_memo_bytes += len;
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * This backend applied edits (n of them) to the root from, making to:
+ * a memo of from becomes one of to, with what the edits put.  A memo of
+ * another root is left, to be emptied by the next get, which reads
+ * another.
+ */
+static void
+get_memo_carry(const ProllyHash *from, const ProllyHash *to,
+			   const ProllyEdit *edits, int n)
+{
+	if (get_memo_root.len == 0 || !same_hash(from, &get_memo_root))
+		return;
+	for (int i = 0; i < n; i++)
+		get_memo_note((const char *) edits[i].key.data, edits[i].key.len,
+					  !edits[i].is_delete,
+					  (const char *) edits[i].value.data,
+					  edits[i].value.len);
+	/* (a note that filled the memo began it again, of from: still right) */
+	get_memo_root = *to;
+}
+
+/*
  * ... but for the scoped changes pending (refs_get() reads those first).
  */
 static bool
@@ -1700,6 +1835,7 @@ flush_scoped(void)
 	}
 	ref_of(&scoped_mine, &root);
 	PROLLY_CALL(tree, apply, &env, &root, edits, n, &new_root);
+	get_memo_carry(&scoped_mine, &new_root.hash, edits, n);
 	scoped_mine = new_root.hash;
 	pfree(edits);
 	scoped_pending = NIL;
@@ -2144,6 +2280,9 @@ refs_get(const char *key, int keylen, StringInfo value)
 	ProllyNodeRef root;
 	ProllyKey	k = {(const uint8 *) key, keylen};
 	ScopedPending *sp;
+	RefsGetMemo *m;
+	int			start;
+	bool		found;
 
 	refs_init();
 	if (scoped && (sp = pending_of(key, keylen)) != NULL)
@@ -2156,7 +2295,22 @@ refs_get(const char *key, int keylen, StringInfo value)
 	}
 	if (!refs_root_unflushed(&root))
 		return false;
-	return PROLLY_CALL(tree, get, &env, &root, &k, value);
+	if (!same_hash(&root.hash, &get_memo_root))
+	{
+		get_memo_reset();
+		get_memo_root = root.hash;
+	}
+	if ((m = get_memo_find(key, keylen)) != NULL)
+	{
+		if (m->found)
+			appendBinaryStringInfo(value, m->value, m->len);
+		return m->found;
+	}
+	start = value->len;
+	found = PROLLY_CALL(tree, get, &env, &root, &k, value);
+	get_memo_note(key, keylen, found, value->data + start,
+				  found ? value->len - start : 0);
+	return found;
 }
 
 /* Put (value NULL: delete) one entry, with the transaction. */
@@ -2237,6 +2391,7 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
 					 &new_root.hash))
 		elog(ERROR, "prolly refs moved while held");
+	get_memo_carry(&root.hash, &new_root.hash, &e, 1);
 }
 
 /* ------------------------------------------------------------------------
