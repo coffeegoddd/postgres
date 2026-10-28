@@ -12036,8 +12036,8 @@ typedef struct TypeMoves
 	List	   *detached;		/* typed tables detached before their types
 								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
-	List	   *late_drops;		/* the old ones types going use: dropped
-								 * after those (with the types going) */
+	List	   *late_drops;		/* or, if what goes uses one, all of them,
+								 * after the types going */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
 									 * again with the others, after them) */
@@ -12053,7 +12053,7 @@ typedef struct MovedType
 	MoveItem   *to;
 	Oid			typid;
 	char	   *aside;			/* qualified, once renamed */
-	bool		late;			/* a type going uses it: dropped after that */
+	bool		late;			/* what goes uses it: dropped after that */
 } MovedType;
 
 static MovedType *
@@ -12162,6 +12162,18 @@ move_type(List **moved, List *from, List *to, Oid typid, const char *user)
 	return mt;
 }
 
+/* Is relation relid a table of the branch's that to doesn't define? */
+static bool
+table_goes(List *from, List *to, Oid relid)
+{
+	char	   *name = qualified(get_rel_namespace(relid), get_rel_name(relid));
+	bool		goes = find_item(from, 't', name) != NULL &&
+		find_item(to, 't', name) == NULL;
+
+	pfree(name);
+	return goes;
+}
+
 /*
  * A type using mt that is to be moved with it, unless it goes: then it
  * keeps using mt renamed aside until it is dropped with the other types
@@ -12254,6 +12266,7 @@ type_moves(List *from, List *to)
 	List	   *moved = NIL;
 	ListCell   *lc;
 	int			i;
+	bool		any_late = false;
 
 	foreach(lc, from)
 	{
@@ -12368,6 +12381,18 @@ type_moves(List *from, List *to)
 								handled = true;
 							}
 						}
+					}
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid > 0 &&
+							 table_goes(from, to, d->objid))
+					{
+						/*
+						 * (a table the move drops: its column keeps the
+						 * type renamed aside until it goes, unconverted, as
+						 * a typed table's can't be)
+						 */
+						mt->late = true;
+						handled = true;
 					}
 					else if (kind == RELKIND_PARTITIONED_TABLE && versioned &&
 							 d->objsubid > 0 && in_partition_key(d->objid, d->objsubid))
@@ -12564,9 +12589,11 @@ type_moves(List *from, List *to)
 				}
 				else if (d->classid == ProcedureRelationId &&
 						 part_of_type(ProcedureRelationId, d->objid))
+				{
 					/* (a range type's constructor: the range is) */
-					(void) move_type(&moved, from, to, get_func_rettype(d->objid),
-									 mt->from->name);
+					move_type_user(&moved, from, to, mt, get_func_rettype(d->objid));
+					handled = true;
+				}
 				else if (d->classid == ProcedureRelationId)
 				{
 					HeapTuple	pt = SearchSysCache1(PROCOID, ObjectIdGetDatum(d->objid));
@@ -12621,6 +12648,13 @@ type_moves(List *from, List *to)
 		}
 	}
 
+	/*
+	 * (one renamed aside may use another, a domain over it or a composite
+	 * with a column of it, which then can't go before it: if any waits for
+	 * what goes, all do)
+	 */
+	foreach(lc, moved)
+		any_late = any_late || ((MovedType *) lfirst(lc))->late;
 	foreach(lc, moved)
 	{
 		MovedType  *mt = lfirst(lc);
@@ -12636,7 +12670,7 @@ type_moves(List *from, List *to)
 														 &tm.unvalidated));
 		made_as_item(llast(tm.creates), mt->to->name, 'y');
 		made_as_since(tm.unvalidated, m, mt->to->name, 'y');
-		if (mt->late)
+		if (any_late)
 		{
 			tm.late_drops = lappend(tm.late_drops, psprintf("DROP TYPE %s", mt->aside));
 			made_as_item(llast(tm.late_drops), mt->from->name, 'y');
