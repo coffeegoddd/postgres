@@ -505,7 +505,7 @@ time and how long it took, long id lists shortened to their count. Each case
 marks the start of its setup (`==== CASE <i>/<n> <op> D=<d> <working set>:
 setup`), its dirty write (`---- setup: dirty write (<rows> rows)`), its timed
 statement (`---- timed`) and its restore (`---- restore`), and ends with a
-summary (`==== CASE <i>/<n> ...: ok; setup <s> s, timed <ms> ms, restore <s> s`).
+summary (`==== case <i>/<n> ...: ok; setup <s> s, timed <ms> ms, restore <s> s`).
 That tells a slow cell's untimed setup and checks apart from the operation
 measured, and shows a statement that is still waiting: the last line is the one
 before it. The same summary is logged for every case, traced or not, and each
