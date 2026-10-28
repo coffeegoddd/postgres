@@ -241,6 +241,14 @@ extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
 extern int	vc_branch_delete(VcRepo *r, const char *name);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);
+
+/*
+ * Commits root (held by the caller until this returns) on the current
+ * branch.  The working root is left alone, so changes it already has
+ * beyond root stay uncommitted: a commit can capture the state as of a
+ * point while the working set keeps moving.
+ */
+extern PHash vc_commit_root(VcRepo *r, const PHash *root, const char *msg);
 extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
 extern int	vc_merge(VcRepo *r, const char *branch, VcMergeResult *res);
 extern void vc_merge_result_free(VcMergeResult *res);

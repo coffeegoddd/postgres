@@ -124,6 +124,12 @@ commit_root(VcRepo *r, const PHash *commit)
 	return c.root;
 }
 
+static void
+table_change_fn_count(void *arg, const VcTableChange *c)
+{
+	(*(int *) arg)++;
+}
+
 /* ------------------------------------------------------------------ tests */
 
 static void
@@ -201,6 +207,49 @@ test_working_set_churn_frees(void)
 		put_row(&r, "t", k, 0);
 	check_store(cs, 0);
 	CHECK_EQ(cs->ops->count(cs), after_commit);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* Committing an earlier root leaves the working root's later changes uncommitted. */
+static void
+test_commit_root_keeps_later_changes(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		as_of,
+				c,
+				w;
+	VcCommit	cm;
+	int			changed = 0;
+
+	vc_repo_init(&r, cs, &small_policy);
+	create_table(&r, "t", schema_v1);
+	put_row(&r, "t", 1, 1);
+	vc_commit(&r, "one");
+	put_row(&r, "t", 2, 1);
+	as_of = vc_working(&r);
+	cs_ref_root(cs, &as_of);	/* what a barrier would hold */
+	put_row(&r, "t", 3, 1);		/* lands after the barrier */
+	c = vc_commit_root(&r, &as_of, "as of the barrier");
+	cs_unref_root(cs, &as_of);
+
+	CHECK(vc_commit_load(&r.ctx, &c, &cm) && phash_eq(&cm.root, &as_of));
+	CHECK(phash_eq(&vc_head(&r)->head_root, &as_of));
+	CHECK(row_version(&r, &cm.root, "t", 2) == 1);
+	CHECK(row_version(&r, &cm.root, "t", 3) == -1);
+	CHECK(working_row(&r, "t", 3) == 1);	/* still in the working set */
+	w = vc_working(&r);
+	vc_diff_tables(&r.ctx, &as_of, &w, table_change_fn_count, &changed);
+	CHECK_EQ(changed, 1);
+	/* the uncommitted change is what blocks a merge */
+	{
+		VcMergeResult m;
+
+		CHECK(vc_branch_create(&r, "other", NULL) == VC_OK);
+		CHECK(vc_merge(&r, "other", &m) == VC_ERR);
+	}
+	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -883,6 +932,7 @@ main(void)
 {
 	RUN(test_commit_and_log);
 	RUN(test_working_set_churn_frees);
+	RUN(test_commit_root_keeps_later_changes);
 	RUN(test_branch_checkout_isolation);
 	RUN(test_reset_hard);
 	RUN(test_diff_and_ddl);

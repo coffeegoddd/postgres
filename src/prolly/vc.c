@@ -906,21 +906,29 @@ vc_checkout(VcRepo *r, const char *name)
 }
 
 PHash
-vc_commit(VcRepo *r, const char *msg)
+vc_commit_root(VcRepo *r, const PHash *root, const char *msg)
 {
 	VcBranch   *b = vc_head(r);
 	PHash		parents[2] = {b->head, b->merge_head};
-	PHash		h = keep_commit(r, &b->working, parents, b->merging ? 2 : 1, msg);
+	PHash		h = keep_commit(r, root, parents, b->merging ? 2 : 1, msg);
 
 	b = vc_head(r);
 	move_head(r, &parents[0], &h);
 	if (b->merging)
 		move_head(r, &parents[1], NULL);
 	b->head = h;
-	b->head_root = b->working;
+	b->head_root = *root;
 	b->merging = false;
 	prolly_release_pins(&r->ctx);
 	return h;
+}
+
+PHash
+vc_commit(VcRepo *r, const char *msg)
+{
+	PHash		root = vc_head(r)->working;
+
+	return vc_commit_root(r, &root, msg);
 }
 
 int

@@ -62,6 +62,7 @@ typedef struct Opts
 	int64_t		bg_bytes;		/* ... or once this much WAL is undecoded */
 	int			diffs;
 	bool		sql_decode;		/* decode by SQL function calls, not a stream */
+	bool		concurrent;		/* check commits against a concurrent writer */
 	int			bg_rows;		/* stream: apply once this many rows are pending */
 	uint64_t	seed;
 } Opts;
@@ -85,7 +86,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, 5000, 1
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, 5000, 1
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -1441,6 +1442,10 @@ static pthread_cond_t bar_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t bar_next,
 			bar_seen;
 static size_t bar_rows;			/* rows the last barrier applied */
+static PHash bar_root;			/* the working root at the last barrier, held */
+static volatile int64_t cw_done;	/* concurrent writer transactions committed */
+static int64_t cw_upper;		/* ... as of the last barrier's return */
+static bool bar_root_held;
 
 static uint64_t
 get_be64(const char *p)
@@ -1550,6 +1555,15 @@ stream_main(void *arg)
 
 			pthread_mutex_lock(&repo_lock);
 			rows = editlist_apply(&pend);
+			if (token)
+			{
+				/* hold the root as of the barrier: later applies replace it */
+				if (bar_root_held)
+					cs_unref_root(repo.ctx.cs, &bar_root);
+				bar_root = vc_working(&repo);
+				cs_ref_root(repo.ctx.cs, &bar_root);
+				bar_root_held = true;
+			}
 			pthread_mutex_unlock(&repo_lock);
 			applied_lsn = commit_lsn;
 			last_apply = now_ms();
@@ -1654,9 +1668,16 @@ life_commit(int seq, const char *branch)
 	uint32_t	seg;
 
 	tail = checkpoint(&ms);
+	if (o.concurrent)
+	{
+		/* let later transactions land in the working root before we commit */
+		cw_upper = __atomic_load_n(&cw_done, __ATOMIC_SEQ_CST);
+		usleep(150000);
+	}
 	pthread_mutex_lock(&repo_lock);
 	snprintf(msg, sizeof(msg), "%s %d", branch, seq);
-	c = vc_commit(&repo, msg);
+	/* exactly the state as of the barrier, whatever has landed since */
+	c = o.sql_decode ? vc_commit(&repo, msg) : vc_commit_root(&repo, &bar_root, msg);
 	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
 	if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
@@ -1769,6 +1790,102 @@ connect_or_die(void)
 	return c;
 }
 
+/* ----------------------------------------------------- concurrent writer */
+
+#define CW_BASE INT64_C(1000000000000)
+#define CW_ROWS 50				/* rows per writer transaction */
+
+static volatile bool cw_stop;
+
+/* Commits transaction after transaction of new rows, ids in order. */
+static void *
+writer_main(void *arg)
+{
+	PGconn	   *w = connect_or_die();
+	char		sql[256];
+
+	for (int64_t txn = 0; !cw_stop; txn++)
+	{
+		int64_t		lo = CW_BASE + txn * CW_ROWS;
+
+		snprintf(sql, sizeof(sql),
+				 "INSERT INTO t SELECT g, 1, 7, 'w' FROM generate_series(%lld::bigint, %lld::bigint) g",
+				 (long long) lo, (long long) (lo + CW_ROWS - 1));
+		PQclear(qpc(w, sql, 0, NULL, NULL, NULL, 0));
+		__atomic_store_n(&cw_done, txn + 1, __ATOMIC_SEQ_CST);
+	}
+	PQfinish(w);
+	return NULL;
+}
+
+/*
+ * Each commit, taken while the writer runs, must hold exactly a prefix of
+ * its transactions (no transaction split, none skipped), and at least all
+ * that had committed before the commit began.
+ */
+static void
+run_concurrent(void)
+{
+	pthread_t	wt;
+	int64_t		lower[64],
+				upper[64];
+	int			n = 0;
+
+	pthread_create(&wt, NULL, writer_main, NULL);
+	for (; n < 40; n++)
+	{
+		usleep((useconds_t) (20000 + rnd_below(80000)));
+		lower[n] = __atomic_load_n(&cw_done, __ATOMIC_SEQ_CST);
+		life_commit(n + 1, "main");
+		upper[n] = cw_upper;
+	}
+	cw_stop = true;
+	pthread_join(wt, NULL);
+	{
+		double		ms;
+
+		checkpoint(&ms);		/* the working root catches up with the writer */
+	}
+	pthread_mutex_lock(&repo_lock);
+	for (int i = 0; i < n; i++)
+	{
+		const PHash *c = &commits[ncommits - n + i].hash;
+		VcCommit	cm;
+		PHash		data;
+		uint8_t		start[8];
+		ProllyIter *it;
+		const uint8_t *k,
+				   *v;
+		size_t		kl,
+					vl;
+		int64_t		expect = CW_BASE,
+					rows = 0;
+
+		CHECK(vc_commit_load(&repo.ctx, c, &cm));
+		data = table_root(&cm.root);
+		row_key(start, CW_BASE);
+		it = t_iter(&repo.ctx, &data, start, 8);
+		while (t_next(it, &k, &kl, &v, &vl))
+		{
+			int64_t		id = (int64_t) (get_u64(k) ^ (1ULL << 63));
+
+			CHECK(id == expect);	/* contiguous from the first: a prefix */
+			expect++;
+			rows++;
+		}
+		prolly_iter_close(it);
+		CHECK(rows % CW_ROWS == 0);	/* whole transactions only */
+		CHECK(rows / CW_ROWS >= lower[i]);	/* nothing committed before is missing */
+		/* nothing from after the barrier: at most the one then in flight */
+		CHECK(rows / CW_ROWS <= upper[i] + 1);
+		printf("concurrent,commit=%d,writer_txns=%lld,committed_before=%lld,at_barrier=%lld\n",
+			   i + 1, (long long) (rows / CW_ROWS), (long long) lower[i], (long long) upper[i]);
+	}
+	pthread_mutex_unlock(&repo_lock);
+	printf("# concurrent: %d commits each held a whole prefix of the writer's %lld transactions\n",
+		   n, (long long) cw_done);
+}
+
 static void
 run_lifecycle(void)
 {
@@ -1798,6 +1915,11 @@ run_lifecycle(void)
 		pthread_create(&bg, NULL, stream_main, NULL);
 	}
 
+	if (o.concurrent)
+	{
+		run_concurrent();
+		goto finish;
+	}
 	for (int i = 1; i <= o.commits; i++)
 	{
 		workload(i);
@@ -1848,8 +1970,11 @@ run_lifecycle(void)
 		pthread_mutex_unlock(&repo_lock);
 		life_checkout(&commits[t].hash, NULL);
 	}
+finish:
 	bg_stop = true;
 	pthread_join(bg, NULL);
+	if (bar_root_held)
+		cs_unref_root(repo.ctx.cs, &bar_root);
 	printf("# decoding: %s\n", o.sql_decode ? "SQL function per checkpoint" : "persistent stream");
 	printf("# background checkpoints: %llu, %llu rows, mean %.1f ms, max %.1f ms\n",
 		   (unsigned long long) bg_stats.count, (unsigned long long) bg_stats.rows,
@@ -1896,7 +2021,8 @@ main(int argc, char **argv)
 		{"seed", 1, 0, 's'}, {"conn", 1, 0, 'C'}, {"pgdata", 1, 0, 'D'},
 		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
-		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {0, 0, 0, 0}
+		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
+		{0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -1930,6 +2056,7 @@ main(int argc, char **argv)
 			case 'f': o.diffs = atoi(optarg); break;
 			case 'Q': o.sql_decode = true; break;
 			case 'W': o.bg_rows = atoi(optarg); break;
+			case 'K': o.concurrent = true; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)

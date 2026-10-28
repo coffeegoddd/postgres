@@ -146,6 +146,31 @@ Costs follow the change, with sublinear growth from the taller trees and
 from the table no longer fitting in the buffer pool (random row replay
 starts to miss), not O(data).
 
+With the persistent streaming decoder in place of the SQL function (same
+workload; every checkout verified):
+
+| | Commit | diff WORKING X | Branch switch | Reset |
+|---|---|---|---|---|
+| 10M, SQL decoding | 123 ms | 220 ms | 233 ms | 162 ms |
+| 10M, stream | 71 ms | 138 ms | 171 ms | 75 ms |
+| 100M, SQL decoding | 180 ms | 298 ms | 502 ms | 212 ms |
+| 100M, stream | 74 ms | 207 ms | 431 ms | 99 ms |
+
+Commit no longer grows with the data.  Background applies absorb most of
+the tail (700–800 rows left for the commit's barrier instead of 2,000), and
+an empty checkpoint costs 1–2 ms.  What still grows is the prolly diff
+(taller tree) and replay once the table outgrows the buffer pool.
+
+**Commits under concurrent writers.**  `winbench --lifecycle --concurrent`
+runs a writer committing 50-row transactions nonstop while 40 Dolt commits
+are taken, holding each commit back 150 ms after its barrier so later
+transactions land in the working root first.  Every commit held exactly a
+prefix of the writer's transactions: whole transactions only, everything
+committed before the commit began, nothing from after its barrier
+(8,248 writer transactions).  Committing the working root at lock time,
+instead of the root as of the barrier (`vc_commit_root`), fails the last
+check.
+
 - Replay costs ~8 µs per row against ~150 µs per page for keyframe restore
   as built (~2 pages per row here): ~30× cheaper per change on this
   workload.
