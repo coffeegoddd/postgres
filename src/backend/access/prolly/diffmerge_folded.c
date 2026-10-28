@@ -4937,13 +4937,19 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 	}
 }
 
-/* The same after definitions changed: the branch folded as it is now. */
+/*
+ * The same after definitions changed: the tables made again given the
+ * pages kept of them, if the refs can, then the branch folded as it is now.
+ */
 static void
 move_rows(void *arg)
 {
+	ProllyDatabaseComponents dc = components();
 	ProllyNodeRef working;
 
-	(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
+	if (PROLLY_HAS(dc.refs, pages_for_made))
+		PROLLY_CALL(dc.refs, pages_for_made, arg);
+	(void) PROLLY_CALL(dc.refs, working_set, NULL, &working);
 	rows_from(&working, arg);
 }
 

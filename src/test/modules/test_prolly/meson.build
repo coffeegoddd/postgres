@@ -526,6 +526,8 @@ tests += {
       't/821_restore_lineage.pl',
       't/822_planned_share_lineage.pl',
       't/860_reset_fold_holder.pl',
+      't/861_reset_after_drop.pl',
+      't/862_merge_remade_rows.pl',
       't/459_record_owners_sessions.pl',
       't/477_forget_owned_concurrent.pl',
       't/478_records_concurrent_commits.pl',

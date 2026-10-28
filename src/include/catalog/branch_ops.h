@@ -150,6 +150,16 @@ typedef struct BranchLockWait
  */
 extern PGDLLIMPORT int prolly_restore_lock_wait;
 
+/* A relation stored with a table, as another branch has it (family()). */
+typedef struct BranchFamilyRelation
+{
+	Oid			relid;
+	Oid			relnamespace;
+	NameData	relname;
+	Oid			relam;
+	HeapTuple	index;			/* an index's pg_index row there, else NULL */
+} BranchFamilyRelation;
+
 typedef struct BranchOpsRoutine
 {
 	const char *name;
@@ -443,6 +453,18 @@ typedef struct BranchOpsRoutine
 							   BranchKeptRelation *renewed,
 							   BranchKeptRelation *replaced,
 							   BranchLockWait *wait);
+
+	/*
+	 * Optional: the relations stored with table relid (its indexes, its
+	 * TOAST table, each relation internally dependent on it, as a change
+	 * log is, and the indexes of those; not the table itself) as another
+	 * branch that has the table has them,
+	 * each a BranchFamilyRelation *; NIL if no other branch has it.  A
+	 * move that makes the table again as relid makes each of those again
+	 * as the relation it was (where its OID is free here), so the table's
+	 * kept roots, which name its relations by OID, serve it after.
+	 */
+	List	   *(*family) (Oid relid);
 
 	/*
 	 * Optional: hold the pages kept (keep()'s, of any branch) again, for
