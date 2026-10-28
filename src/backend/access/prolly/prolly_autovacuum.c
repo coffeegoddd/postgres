@@ -151,9 +151,9 @@ prolly_autovacuum_init(void)
 							check_conjoin_max_files, NULL, NULL);
 	DefineCustomIntVariable("prolly.gc_free_wait",
 							"How long autovacuum's collection of the chunk store waits for a transaction it must outlast before it is given up.",
-							"The transactions using the store as it begins: it is tried again on a later visit.  Those begun meanwhile aren't waited for.",
+							"The transactions using the store as it begins (those begun meanwhile aren't waited for): given up, it is tried again on a later visit.  0 gives it up at once if one is running; -1 waits without a bound.",
 							&prolly_gc_free_wait,
-							10000, 0, INT_MAX,
+							10000, -1, INT_MAX,
 							PGC_SIGHUP,
 							GUC_UNIT_MS,
 							NULL, NULL, NULL);

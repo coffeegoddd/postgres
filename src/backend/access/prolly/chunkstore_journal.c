@@ -9584,6 +9584,19 @@ int			prolly_gc_free_wait = 10000;
 bool		prolly_gc_given_up = false;
 
 /*
+ * The deadline of a wait of a collection begun if free, beginning now:
+ * prolly_gc_free_wait from now, or none if that is -1.
+ */
+static TimestampTz
+free_deadline(void)
+{
+	if (prolly_gc_free_wait < 0)
+		return DT_NOEND;
+	return TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+									   prolly_gc_free_wait);
+}
+
+/*
  * Wait for these transactions to end (or be prepared) until deadline:
  * false if one still runs then.  Their ends are polled for, not slept on
  * as a lock, and the set only shrinks, so a collection waits out the
@@ -9987,8 +10000,7 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	gc->cxt = cxt;
 	gc->full = full;
 	gc->if_free = if_free;
-	gc->deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-											   prolly_gc_free_wait);
+	gc->deadline = free_deadline();
 	gc->retire_lo = retire_lo;
 	gc->retire_hi = retire_hi;
 	gc->settle = (scope != PROLLY_GC_JOURNAL);
@@ -10830,6 +10842,12 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		 */
 		bool		release = (gc->written == NIL);
 
+		/*
+		 * (if free, a bound of their own, from now: they give up with the
+		 * seal done, so not for what gc_begin()'s wait, or the marking
+		 * since, used of its bound)
+		 */
+		gc->deadline = free_deadline();
 		if (release)
 			unlock_manifest(s);
 		foreach(lc, gc->xids)
@@ -11835,9 +11853,7 @@ journal_gc_retire(ProllyChunkGc *gc)
 	 * to remove once they have ended, as noted at the swap)
 	 */
 	if (gc->if_free &&
-		!readers_end_by(gc->readers, gc->nreaders,
-						TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-													prolly_gc_free_wait)))
+		!readers_end_by(gc->readers, gc->nreaders, free_deadline()))
 	{
 		gc_abort(gc);
 		MemoryContextDelete(gc->cxt);

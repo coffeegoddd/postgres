@@ -86,6 +86,29 @@ sub lock_waits_until
 	return $w;
 }
 
+my $collected_re = qr/automatic collection of database "av": \d+ chunks kept/;
+
+# Is chunk h collected by the collections from offset on?  Asked only once
+# one has finished (a chunk has() finds while a collection runs is kept by
+# it): after each, once; if it's still there, more garbage brings another
+# collection, up to a few times.
+sub collected_after
+{
+	my ($offset, $h, $tag) = @_;
+	for my $round (1 .. 5)
+	{
+		my $tries = 0;
+		while (log_count($offset, $collected_re) < $round)
+		{
+			usleep(50_000);
+			return 0 if ++$tries > 1200;
+		}
+		return 1 if has($h) eq 'f';
+		garbage(" $tag $round");
+	}
+	return 0;
+}
+
 my $given_up =
   qr/automatic collection of database "av" given up: a transaction it would wait for is running/;
 
@@ -104,8 +127,9 @@ is(lock_waits_until($offset, $given_up, 3), 0,
 is(join(',', segments()), join(',', @before),
 	'the collections given up sealed no segment');
 is(has($dead), 't', 'the garbage stays meanwhile');
+$offset = -s $node->logfile;
 $holder->query_safe(q{COMMIT});
-ok($node->poll_query_until('av', qq{SELECT NOT test_chunk_has('$dead')}),
+ok(collected_after($offset, $dead, 'one more'),
 	'and is collected once the transaction ends');
 
 # A steady stream of short transactions reading the store, in two
@@ -130,8 +154,9 @@ for (1 .. 2)
 	push @busy, $b;
 }
 my $dead_busy = sql(q{SELECT test_chunk_put('dead under load')});
+$offset = -s $node->logfile;
 garbage(' two');
-ok($node->poll_query_until('av', qq{SELECT NOT test_chunk_has('$dead_busy')}),
+ok(collected_after($offset, $dead_busy, 'two more'),
 	'under a steady stream of short transactions, a collection runs');
 
 # A transaction begun after a collection's waits, using the store at its
@@ -155,12 +180,9 @@ $offset = -s $node->logfile;
 $node->safe_psql('av', q{
 	SELECT injection_points_detach('prolly-gc-running-waited');
 	SELECT injection_points_wakeup('prolly-gc-running-waited')});
-is( lock_waits_until(
-		$offset, qr/automatic collection of database "av": \d+ chunks kept/, 1),
-	0,
+is(lock_waits_until($offset, $collected_re, 1), 0,
 	'its retire sleeps on no lock of a transaction using the store at the swap');
-ok($node->poll_query_until('av', qq{SELECT NOT test_chunk_has('$dead2')}),
-	'what it collected is gone');
+is(has($dead2), 'f', 'what it collected is gone');
 my %now = map { $_ => 1 } segments();
 ok(scalar(grep { $now{$_} } @collected) > 0,
 	'the segments it dropped stay, retiring, while the transaction runs');
