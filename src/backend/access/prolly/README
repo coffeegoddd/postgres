@@ -1164,7 +1164,14 @@ its head's tables, its merge state and violations, the commits its pages
 are kept as of).  Every change of a branch's refs
 is made holding that branch's lock to transaction end, and they take
 only that, so commits on different branches run together while those on
-one branch take turns.  Anything else that changes the refs (a branch
+one branch take turns.  A move that resolves its target from the head
+takes the lock before it reads the head: a soft reset (the refs'
+lock_head()), so a commit that lands while it waits is the head it steps
+back from, not one it moves the head back past; a commit reads its
+parent, the head, once it holds the lock, and one given its parents (a
+merge's) refuses, to be retried, if the head is no longer the first;
+an amend or a rebase holds every ref first, and refuses if the head
+moved since it read it.  Anything else that changes the refs (a branch
 made, deleted or renamed, a hard reset, a merge, a push) holds the session
 branch's lock (and any branch's it changes), then moves the store's root
 with its transaction, as all of them did before: other such movers wait

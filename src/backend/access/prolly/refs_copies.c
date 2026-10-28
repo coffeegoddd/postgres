@@ -11508,6 +11508,13 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	UnregisterSnapshot(snap);
 }
 
+/* The session's branch's own entries held (the refs' lock_head()). */
+static void
+copies_lock_head(void)
+{
+	lock_branch(branch_ops()->current());
+}
+
 static void
 copies_set_head(const ProllyHash *commit_id)
 {
@@ -15565,5 +15572,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.side_scan = copies_side_scan,
 	.side_scan_at = copies_side_scan_at,
 	.in_progress = copies_in_progress,
+	.lock_head = copies_lock_head,
 	.walk_commit_kept = copies_walk_commit_kept,
 };

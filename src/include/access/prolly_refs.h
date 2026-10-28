@@ -1058,6 +1058,17 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*walk_commit_kept) (const ProllyHash *commit_id,
 									 ProllyTreeVisitNode visit, void *arg);
+
+	/*
+	 * Optional: hold the session's branch's own entries until the
+	 * transaction ends (its head, as a commit's head move holds them):
+	 * another session's commit or head move of the branch is waited for,
+	 * and waits, but holders of other branches don't.  For a move that
+	 * resolves its target from the head, as a soft reset does: taken
+	 * before it reads the head, so a commit landing meanwhile is built on,
+	 * not dropped.
+	 */
+	void		(*lock_head) (void);
 } ProllyRefsRoutine;
 
 /*
@@ -1125,9 +1136,9 @@ extern char *prolly_record_relation_name(const char *nspname,
 	"forget_records", "check_copies_read", "branches_folded", \
 	"head_at", "head_moves", "side_get", "side_put", "side_scan", "side_scan_at", \
 	"unfrozen_branches", "freeze_kept", "retain_roots", "kept_commit", "forget_kept", \
-	"in_progress", "commit_count", "walk_commit_kept"
+	"in_progress", "commit_count", "walk_commit_kept", "lock_head"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK walk_commit_kept
+#define PROLLY_REFS_LAST_CALLBACK lock_head
 
 /*
  * For refs implementations: a commit's info by its id (false if there is
