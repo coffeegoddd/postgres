@@ -9,3 +9,21 @@
 # Entries stand until removed (unlike perf_accept.toml's): the change that
 # ends the growth removes its entries, and vgrowth reports an accepted
 # counter that no longer grows, so that it does.
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "nodes_read"
+reason = "refs tree a level deeper since #1129's kept entries (#1207)"
+
+[[accept]]
+workload = "V7/shared-bgnone"
+engine = "prolly"
+counter = "nodes_read"
+reason = "refs tree a level deeper since #1129's kept entries (#1207)"
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "nodes_read"
+reason = "refs tree a level deeper since #1129's kept entries (#1207)"
