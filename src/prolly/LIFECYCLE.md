@@ -171,6 +171,33 @@ committed before the commit began, nothing from after its barrier
 instead of the root as of the barrier (`vc_commit_root`), fails the last
 check.
 
+**Inside vs outside the window.**  `winbench --lifecycle --outside` on 10M
+rows, 2,000 row changes per commit, 45 commits; the same targets with a
+10-commit window (severed history exported to an archive store, a local
+file here) and with a 60-commit window (everything inside); every checkout
+verified.
+
+| Commits back | diff, inside | diff, outside | checkout, inside | checkout, outside | Brought back from the archive |
+|---|---|---|---|---|---|
+| 5 | 28 ms | (inside) | 162 ms | (inside) | — |
+| 15 | 63 ms | 555 ms | 343 ms | 835 ms | 11.6k chunks, 64 MB, 492 ms |
+| 20 | 78 ms | 484 ms | 352 ms | 788 ms | 10.0k chunks, 54 MB, 406 ms |
+| 30 | 109 ms | 820 ms | 530 ms | 1,196 ms | 17.8k chunks, 98 MB, 711 ms |
+| 40 | 137 ms | 823 ms | 644 ms | 1,298 ms | 17.8k chunks, 98 MB, 693 ms |
+| Full rebuild of the table from the tree | | | | 30.9 s | |
+
+- Outside the window the only extra is bringing the target back from the
+  archive: the chunks that version does not share with what is still
+  local.  Diff and replay then cost what they do inside.
+- That makes diff ~6–9× slower and checkout ~2× (replay is a larger share
+  of a checkout).  The cost follows how far the old version has drifted
+  from local history, not the table's size, and bringing one old commit
+  back makes nearby ones cheaper (they share chunks).
+- A full rebuild, what is left without a diff path, is 40–100× the
+  inside-the-window cost.
+- With a remote archive, only the bring-back part changes: it becomes
+  bandwidth and round trips, ~100 MB per bring-back at these distances.
+
 - Replay costs ~8 µs per row against ~150 µs per page for keyframe restore
   as built (~2 pages per row here): ~30× cheaper per change on this
   workload.
