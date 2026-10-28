@@ -10010,8 +10010,31 @@ gc_begin_scoped(ProllyChunkStore *s, ProllyGcScope scope, uint32 retire_lo,
 	{
 		int			nvxids;
 		VirtualTransactionId *vxids = store_users(s, &nvxids);
-		bool		ended = readers_end_by(vxids, nvxids, gc->deadline);
+		bool		ended;
 
+		/*
+		 * (a move of the journal frees nothing, so it waits only for those
+		 * that may have appended to what it seals: those with an xid)
+		 */
+		if (scope == PROLLY_GC_JOURNAL && gc->m.nretiring == 0)
+		{
+			int			k = 0;
+
+			for (int i = 0; i < nvxids; i++)
+			{
+				TransactionId xid;
+				TransactionId xmin;
+				int			nsubxid;
+				bool		overflowed;
+
+				ProcNumberGetTransactionIds(vxids[i].procNumber, &xid, &xmin,
+											&nsubxid, &overflowed);
+				if (TransactionIdIsValid(xid))
+					vxids[k++] = vxids[i];
+			}
+			nvxids = k;
+		}
+		ended = readers_end_by(vxids, nvxids, gc->deadline);
 		pfree(vxids);
 		if (!ended)
 		{

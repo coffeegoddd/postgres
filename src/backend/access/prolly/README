@@ -740,8 +740,9 @@ collection's files no longer named are removed once every transaction
 that had used the store at its swap has ended.  Autovacuum's collections,
 retires and moves (begun if free) wait for a transaction at most
 prolly.gc_free_wait, polling for its end rather than sleeping on its
-lock, and only for those using the store as they begin (a set that only
-shrinks, so a steady stream of short transactions doesn't hold them off):
+lock, and only for those using the store as they begin (a move, those
+of them that may have appended: with an xid), a set that only shrinks, so
+a steady stream of short transactions doesn't hold them off:
 one still running then gives the collection up before it seals anything,
 to be tried again on a later visit, and a retire whose readers still run
 leaves the files retiring for a later collection.  A transaction that

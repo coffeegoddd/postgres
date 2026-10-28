@@ -183,7 +183,8 @@ for (1 .. 600)
 ok($gone, 'a later collection removes the retiring segments, under load');
 
 # A move of the journal: with collections off and the move due, an open
-# transaction that appended gives the move up too.
+# transaction that may have appended (one with an xid) gives the move up
+# too.  (One that only read doesn't: a move frees nothing; t/069.)
 $node->append_conf('postgresql.conf', qq{
 prolly.gc_journal_threshold = -1
 prolly.journal_move_threshold = 1
@@ -193,6 +194,7 @@ $node->poll_query_until('av',
 	q{SELECT current_setting('prolly.journal_move_threshold') = '1MB'})
   or die 'the setting did not reload';
 $holder->query_safe(q{BEGIN});
+$holder->query_safe(q{SELECT txid_current()});
 $holder->query_safe(q{SELECT test_chunk_has(test_chunk_put('the holder''s again'))});
 garbage(' five');
 $offset = -s $node->logfile;
