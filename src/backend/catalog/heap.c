@@ -1287,10 +1287,12 @@ heap_create_with_catalog(const char *relname,
 
 		/*
 		 * (a versioned table a move makes is the relation its version is
-		 * of, or was, its storage a file of its own)
+		 * of, or was, its storage a file of its own; and so is its TOAST
+		 * table, and its change log)
 		 */
 		if (!OidIsValid(relid) &&
-			(relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE) &&
+			(relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE ||
+			 relkind == RELKIND_TOASTVALUE) &&
 			OidIsValid(relid = prolly_move_kept_relid(relname, relnamespace)))
 			relfilenumber = GetNewRelFileNumber(reltablespace, pg_class_desc,
 												relpersistence);

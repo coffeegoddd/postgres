@@ -384,6 +384,25 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*working_set) (const char *branch, ProllyNodeRef *root);
 
+	/*
+	 * Optional: during a move of the session's branch to target (its
+	 * definitions changed, its rows not yet written), give each table the
+	 * move made again (one the working set lacked, dropped since the commit)
+	 * the pages kept as of the move's commit, if they are kept (any
+	 * branch's), so that the move writes none of its rows.
+	 */
+	void		(*pages_for_made) (const ProllyNodeRef *target);
+
+	/*
+	 * Optional: will pages_for_made() try to give table name (qualified),
+	 * which the move under way makes again, pages kept of it?  Asked as
+	 * the move plans its statements, so a table that won't get them is
+	 * written as any table made is (its indexes built after its rows).
+	 * With name NULL: is the move one pages_for_made() gives pages in at
+	 * all (a move settling the branch at a commit)?
+	 */
+	bool		(*pages_kept_for) (const char *name);
+
 
 	/*
 	 * Make the commit ref names the session branch's head commit, and its
@@ -1084,7 +1103,7 @@ extern char *prolly_record_relation_name(const char *nspname,
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
-	"commit_with", "branches", "working_set", "reset", "merge_state", \
+	"commit_with", "branches", "working_set", "pages_for_made", "pages_kept_for", "reset", "merge_state", \
 	"set_merge_state", "hold", "lock", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "visit_violations", "add_violations", \
 	"read_working_set", "walk_commit", "remote_set", \

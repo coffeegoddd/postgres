@@ -8266,6 +8266,11 @@ typedef struct MoveRelid
 	Oid			relid;
 	Oid			owner;			/* the role it is made as (InvalidOid: the
 								 * move's) */
+	List	   *family;			/* its other relations, as another branch
+								 * has them, to be made as those relations
+								 * too (move_kept_family): of a relation the
+								 * branch has none of as the move begins,
+								 * those whose OIDs it has none of either */
 } MoveRelid;
 
 /*
@@ -8335,6 +8340,13 @@ static HTAB *maker_statements = NULL;
 
 /* While a move's statements run, the relations its tables are to be. */
 static List *move_kept_relids = NIL;
+
+/*
+ * ... and those stored with each table made as its relation, as another
+ * branch has them (BranchFamilyRelation *, in TopTransactionContext): its
+ * indexes, TOAST table and change log are to be those relations too.
+ */
+static List *move_kept_family = NIL;
 
 Oid
 prolly_recorded_owner(const char *name, Oid owner, const char *owner_name)
@@ -10062,6 +10074,38 @@ save_remade(const char *name, char kind)
  * one dropped here, makes it again as that relation.  Read before the
  * move's statements.
  */
+/*
+ * Table relid's other relations as another branch has them, for a move
+ * about to make it as relid: only for a move that settles the branch at a
+ * commit, which gives a table it makes the pages kept of it (the refs'
+ * pages_kept_for(NULL)); none if the branch has a relation of relid now,
+ * and none whose OID the branch has a relation of now.  What a fold knows
+ * of a table (the working set's baseline, another branch's working set
+ * known as folded) it knows by its relations' OIDs, as holding the rows
+ * they held, and a relation made again as one of them is new and empty:
+ * so only a move that gives the table its pages, and sets the baseline's
+ * entry for it, brings its relations back; another (a merge) makes them
+ * new.  And the move drops what the branch has before it makes the table:
+ * only a table the branch had none of as the move began (dropped since
+ * its commit), and only relations it had none of, are brought back.
+ */
+static List *
+family_before(Oid relid)
+{
+	ProllyDatabaseComponents dc;
+	List	   *family = NIL;
+
+	prolly_database_components(&dc);
+	if (branch_ops()->family == NULL || !PROLLY_HAS(dc.refs, pages_kept_for) ||
+		!PROLLY_CALL(dc.refs, pages_kept_for, NULL) ||
+		SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return NIL;
+	foreach_ptr(BranchFamilyRelation, f, branch_ops()->family(relid))
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(f->relid)))
+			family = lappend(family, f);
+	return family;
+}
+
 static List *
 move_relids_before(List *from, List *to, List *remade)
 {
@@ -10102,6 +10146,7 @@ move_relids_before(List *from, List *to, List *remade)
 				mr->name = t->name;
 				mr->relid = k->relid;
 				mr->owner = k->owner;
+				mr->family = family_before(k->relid);
 				out = lappend(out, mr);
 				given = true;
 			}
@@ -10127,6 +10172,7 @@ move_relids_before(List *from, List *to, List *remade)
 			mr->name = t->name;
 			mr->relid = of->relid;
 			mr->owner = prolly_recorded_owner(t->name, of->owner, of->owner_name);
+			mr->family = family_before(of->relid);
 			out = lappend(out, mr);
 			break;
 		}
@@ -10258,13 +10304,73 @@ move_makers_before(List *from, List *to, List *relids)
 	}
 }
 
+/* Is relid free for a relation made now (and its cache entry forgotten)? */
+static bool
+kept_relid_free(Oid relid)
+{
+	return !SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)) &&
+		RelationForgetForNewRelation(relid);
+}
+
+/* (the family's relation named relname in relnamespace, used up; or NULL) */
+static BranchFamilyRelation *
+family_take(const char *relname, Oid relnamespace)
+{
+	ListCell   *lc;
+
+	foreach(lc, move_kept_family)
+	{
+		BranchFamilyRelation *f = lfirst(lc);
+
+		if (f->relnamespace != relnamespace ||
+			strcmp(NameStr(f->relname), relname) != 0)
+			continue;
+		move_kept_family = foreach_delete_current(move_kept_family, lc);
+		return f;
+	}
+	return NULL;
+}
+
 /*
- * The OID a table named relname in schema relnamespace, made now, is to
- * have: the relation a move making it says it is (move_relids_before()),
- * if the branch has no relation of that OID (and the relation cache's
- * entry of it, another branch's, isn't open); else InvalidOid (a new one).
- * Asked as the relation is made (heap_create_with_catalog()), once, only
- * while the move's statements run: the name's entry is used up.
+ * The relation an index named relname in relnamespace, made now, is to be
+ * (see prolly_move_kept_relid()), with *row that one's pg_index row and
+ * *relam its access method, for the caller to make it so only if it is
+ * defined alike (an OID names one definition, on every branch); else
+ * InvalidOid.
+ */
+Oid
+prolly_move_kept_index(const char *relname, Oid relnamespace,
+					   HeapTuple *row, Oid *relam)
+{
+	BranchFamilyRelation *f;
+
+	if (move_kept_family == NIL ||
+		(f = family_take(relname, relnamespace)) == NULL ||
+		f->index == NULL || !kept_relid_free(f->relid))
+		return InvalidOid;
+	*row = f->index;
+	*relam = f->relam;
+	return f->relid;
+}
+
+/*
+ * The OID a relation named relname in schema relnamespace, made now, is to
+ * have: for a table, the relation a move making it says it is
+ * (move_relids_before()); for a TOAST table or a change log, the relation
+ * it is, as another branch has it, of a table the move brings back that
+ * the branch had none of as the move began (move_kept_family).  Only if
+ * the branch has no relation of that OID (and the relation cache's entry
+ * of it, another branch's, isn't open); else InvalidOid (a new one).
+ * Asked as the relation is made (heap_create_with_catalog(),
+ * index_create()), once, only while the move's statements run: the name's
+ * entry is used up.  So a table brought back is every relation it was,
+ * and its kept roots, which name them by OID, give it its pages; one whose
+ * OID was taken meanwhile is a new relation, and those roots don't serve
+ * it.  A table the move itself drops and makes again (a definition it
+ * can't alter in place, a conflict resolved with theirs) keeps only its
+ * own OID: its other relations are new, so that the fold the move's rows
+ * step makes reads them as the new, empty relations they are, not as
+ * those the working set's baseline knows, which held its rows.
  */
 Oid
 prolly_move_kept_relid(const char *relname, Oid relnamespace)
@@ -10273,28 +10379,42 @@ prolly_move_kept_relid(const char *relname, Oid relnamespace)
 	char	   *name;
 	ListCell   *lc;
 	Oid			relid = InvalidOid;
+	List	   *family = NIL;
+	BranchFamilyRelation *f;
 
-	if (move_kept_relids == NIL)
+	if (move_kept_relids == NIL && move_kept_family == NIL)
 		return InvalidOid;
-	nsp = get_namespace_name(relnamespace);
-	if (nsp == NULL)
-		return InvalidOid;
-	name = quote_qualified_identifier(nsp, relname);
-	foreach(lc, move_kept_relids)
+	/* (an index's is asked of prolly_move_kept_index()) */
+	if ((f = family_take(relname, relnamespace)) != NULL && f->index == NULL)
+		relid = f->relid;
+	if (!OidIsValid(relid))
 	{
-		MoveRelid  *mr = lfirst(lc);
+		nsp = get_namespace_name(relnamespace);
+		if (nsp == NULL)
+			return InvalidOid;
+		name = quote_qualified_identifier(nsp, relname);
+		foreach(lc, move_kept_relids)
+		{
+			MoveRelid  *mr = lfirst(lc);
 
-		if (strcmp(mr->name, name) != 0)
-			continue;
-		relid = mr->relid;
-		move_kept_relids = foreach_delete_current(move_kept_relids, lc);
-		break;
+			if (strcmp(mr->name, name) != 0)
+				continue;
+			relid = mr->relid;
+			family = mr->family;
+			move_kept_relids = foreach_delete_current(move_kept_relids, lc);
+			break;
+		}
+		pfree(name);
 	}
-	pfree(name);
-	if (OidIsValid(relid) &&
-		(SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)) ||
-		 !RelationForgetForNewRelation(relid)))
+	if (OidIsValid(relid) && !kept_relid_free(relid))
 		relid = InvalidOid;
+	if (OidIsValid(relid) && family != NIL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		move_kept_family = list_concat(move_kept_family, family);
+		MemoryContextSwitchTo(old);
+	}
 	return relid;
 }
 
@@ -10415,6 +10535,26 @@ retype_rewrites(const char *name, const char *col, const char *type)
 }
 
 /*
+ * Is table name, which the move makes, to be made as a relation it was
+ * (move_kept_relids, read before the move's statements are planned), and
+ * given pages kept of it, not its rows (the refs' pages_kept_for())?
+ */
+static bool
+made_as_kept(const char *name)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, pages_kept_for))
+		return false;
+	foreach_ptr(MoveRelid, mr, move_kept_relids)
+		if (strcmp(mr->name, name) == 0)
+			return mr->family != NIL &&
+				PROLLY_CALL(dc.refs, pages_kept_for, name);
+	return false;
+}
+
+/*
  * The statements turning table name's definition from (NULL: none) into to
  * (NULL: dropped): what must go before the rows are written, and what the
  * rows must satisfy, after.  Columns are added and dropped, and changed in
@@ -10434,6 +10574,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	List	   *from_names = NIL;
 	List	   *to_names = NIL;
 	ListCell   *lc;
+	bool		kept = false;
 
 	memset(&none, 0, sizeof(none));
 	if (to == NULL)
@@ -10506,6 +10647,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
+		kept = made_as_kept(name);
 		initStringInfo(&sql);
 		if (to->partition_of)
 		{
@@ -10839,7 +10981,19 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		foreach(c, to->constraints)
 			if (strcmp(first_field(lfirst(c)), idx) == 0)
 				owned = true;
-		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
+		if (owned || list_has_string(from->indexes, lfirst(lc)))
+			continue;
+
+		/*
+		 * (made after the rows, built once over them; but a table made
+		 * again as a relation it was, to be given the pages kept of it,
+		 * gets them first, on its empty storage, so that it is every
+		 * relation it was when the move gives it those pages, and writes
+		 * no row)
+		 */
+		if (kept)
+			sm->changes = lappend(sm->changes, pstrdup(lfirst(lc)));
+		else
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
 	}
 
@@ -14390,6 +14544,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MemoryContextSwitchTo(spi);
 	}
 	move_kept_relids = NIL;
+	move_kept_family = NIL;
 	/*
 	 * (what its making gave those made from a commit, from its maker's
 	 * default privileges: none; those the branch had, made again, their
@@ -14451,6 +14606,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		/* (a move that failed leaves no makers behind: their memory goes) */
 		reset_makers();
 		move_kept_relids = NIL;
+		move_kept_family = NIL;
 		prolly_writing_held_rows(held);
 		prolly_move_calls_end(calls, done);
 	}

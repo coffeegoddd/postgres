@@ -134,7 +134,8 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
  * holding frozen copies of a relation's pages changed since its last root,
  * the rest shared with that root, and records the relation and its epoch
  * then, so the next one's changed pages are found by their epochs
- * (bmap_root_base(), bmap_changed_pages()).  bmap_root_copy() holds a root
+ * (bmap_root_base(), bmap_changed_pages(), or bmap_changed_since() to ask
+ * only whether one changed).  bmap_root_copy() holds a root
  * again by a root of its own, the same subtrees, in O(1).  Each root
  * records its map's lineage (bmap_lineage()): a relation made of a root to
  * take another storage's place may carry that storage's on, so that the
@@ -164,6 +165,8 @@ extern uint64 bmap_lineage(SMgrRelation reln);
 extern bool bmap_root_of(SMgrRelation reln, BmapRootId id);
 extern uint32 bmap_changed_pages(SMgrRelation reln, uint32 since,
 								 BlockNumber **blknos, BlockNumber *nblocks);
+extern bool bmap_changed_since(SMgrRelation reln, uint32 since,
+							   BlockNumber *nblocks);
 extern uint32 bmap_raise_epoch(SMgrRelation reln);
 extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
 extern bool bmap_root_held(RelFileLocator store, BmapRootId id,

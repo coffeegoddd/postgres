@@ -9889,6 +9889,7 @@ typedef struct ChangedWalk
 {
 	uint32		since;
 	BlockNumber nblocks;
+	bool		any;			/* only whether one changed: the first ends it */
 	BlockNumber *blknos;
 	uint32		n;
 	uint32		cap;
@@ -9897,6 +9898,11 @@ typedef struct ChangedWalk
 static void
 changed_add(ChangedWalk *cw, BlockNumber blkno)
 {
+	if (cw->any)
+	{
+		cw->n = 1;
+		return;
+	}
 	if (cw->n == cw->cap)
 	{
 		cw->cap = Max(cw->cap * 2, 64);
@@ -9950,8 +9956,40 @@ changed_walk_node(SMgrRelation reln, const BmapEntry *ptr, uint16 level,
 		else
 			changed_walk_node(reln, &entries[i], level - 1,
 							  (BlockNumber) child, cw);
+		if (cw->any && cw->n > 0)
+			break;
 	}
 	pfree(entries);
+}
+
+/* changed_walk_node() from each of reln's subtrees: its length into *nblocks */
+static void
+changed_walk(SMgrRelation reln, ChangedWalk *cw)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		buf;
+	BmapRoot	root;
+	uint64		first = 0;
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	cw->nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(headerbuf);
+	for (int k = 0; k < BMAP_TREE_TOPS && first < cw->nblocks; k++)
+	{
+		if (BlockNumberIsValid(root.top[k].block))
+			changed_walk_node(reln, &root.top[k], k, (BlockNumber) first, cw);
+		if (cw->any && cw->n > 0)
+			break;
+		first += tree_span(k);
+	}
 }
 
 /*
@@ -9967,34 +10005,31 @@ uint32
 bmap_changed_pages(SMgrRelation reln, uint32 since, BlockNumber **blknos,
 				   BlockNumber *nblocks)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		headerbuf;
-	Buffer		buf;
-	BmapRoot	root;
-	ChangedWalk cw = {since, 0, NULL, 0, 0};
-	uint64		first = 0;
+	ChangedWalk cw = {since, 0, false, NULL, 0, 0};
 
-	headerbuf = map_read(rel, 0);
-	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	cw.nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
-	buf = map_read(rel, 1);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
-	root = *PageGetBmapRoot(BufferGetPage(buf));
-	UnlockReleaseBuffer(buf);
-	UnlockReleaseBuffer(headerbuf);
-	for (int k = 0; k < BMAP_TREE_TOPS && first < cw.nblocks; k++)
-	{
-		if (BlockNumberIsValid(root.top[k].block))
-			changed_walk_node(reln, &root.top[k], k, (BlockNumber) first, &cw);
-		first += tree_span(k);
-	}
+	changed_walk(reln, &cw);
 	if (cw.n > 1)
 		qsort(cw.blknos, cw.n, sizeof(BlockNumber), cmp_block);
 	*blknos = cw.blknos;
 	*nblocks = cw.nblocks;
 	return cw.n;
+}
+
+/*
+ * Did a page of reln under its length change since epoch 'since', as
+ * bmap_changed_pages() would find one?  Its length into *nblocks.  The walk
+ * ends at the first changed page found, so it reads the map's nodes on one
+ * path down, not every node set since: O(the tree's height), not O(changed
+ * pages), for a caller that asks only whether the pages are a root's still.
+ */
+bool
+bmap_changed_since(SMgrRelation reln, uint32 since, BlockNumber *nblocks)
+{
+	ChangedWalk cw = {since, 0, true, NULL, 0, 0};
+
+	changed_walk(reln, &cw);
+	*nblocks = cw.nblocks;
+	return cw.n > 0;
 }
 
 /*
