@@ -734,7 +734,18 @@ the collection's seal.  So the collection, once it has sealed the journal
 running then that has used the store to end before it marks what is new
 (each notes so in shared memory at its first use, before it reads the
 root); each transaction still running read the root as of the seal or a
-later one.  A move of the journal frees nothing, and waits for none.  A transaction that
+later one.  A move of the journal frees nothing, but waits as a
+collection does for the transactions that appended to what it seals.  A
+collection's files no longer named are removed once every transaction
+that had used the store at its swap has ended.  Autovacuum's collections,
+retires and moves (begun if free) wait for a transaction at most
+prolly.gc_free_wait, polling for its end rather than sleeping on its
+lock, and only for those using the store as they begin (a move, those
+of them that may have appended: with an xid), a set that only shrinks, so
+a steady stream of short transactions doesn't hold them off:
+one still running then gives the collection up before it seals anything,
+to be tried again on a later visit, and a retire whose readers still run
+leaves the files retiring for a later collection.  A transaction that
 finds a chunk stored and doesn't write it again (a tree's node that the
 store has, as a refs leaf is again once a branch made since is deleted;
 a pending chunk the store holds) names it without appending it: while a
@@ -2040,6 +2051,19 @@ fragment reached is freed.  A default collection follows them (as its
 settled files keep what they reach), and none runs in the transaction that
 changed the horizon, which might yet roll back.  A collection holds the
 horizon's lock shared, so no sever or repair moves the horizon meanwhile.
+
+Autovacuum seals the store at each batch boundary (prolly.history_batch):
+a default collection, below the size thresholds, once a boundary has
+passed since the store's newest generation ended or since the
+background's last collection (the window's seal_due() and sealed()),
+with anything written since, so what came in a batch settles in a
+generation of its own and a fragment's data is in few of them.  The note
+of the last collection is a file beside the store, neither in it (the
+note would be new data, and an idle database would seal at every
+boundary) nor in the refs (whose lock the background would wait for);
+lost, a seal runs one visit early.  prolly.gc_journal_threshold -1 turns
+seals off with the default collections; the window's full collections
+and retires, which free severed history, still run.
 
 The window is the database's.  prolly.history_window (how long each
 branch's history is kept here), prolly.history_min_commits (how many of a

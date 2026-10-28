@@ -460,5 +460,6 @@ extern void VirtualXactLockTableInsert(VirtualTransactionId vxid);
 extern void VirtualXactLockTableCleanup(void);
 extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
 extern void VirtualXactLockUnprepared(VirtualTransactionId vxid);
+extern bool ConditionalVirtualXactLockUnprepared(VirtualTransactionId vxid);
 
 #endif							/* LOCK_H_ */
