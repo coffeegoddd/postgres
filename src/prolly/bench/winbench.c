@@ -63,6 +63,7 @@ typedef struct Opts
 	int			diffs;
 	bool		sql_decode;		/* decode by SQL function calls, not a stream */
 	bool		concurrent;		/* check commits against a concurrent writer */
+	const char *outside;		/* distances to measure, e.g. "5,15,30" */
 	int			bg_rows;		/* stream: apply once this many rows are pending */
 	uint64_t	seed;
 } Opts;
@@ -86,7 +87,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, 5000, 1
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -99,6 +100,7 @@ static uint32_t dboid;
 static Rel rels[MAX_RELS];
 static int nrels;
 static ChunkStore *cs;
+static ChunkStore *archive;		/* where severed history goes, with --outside */
 static VcRepo repo;
 static ImgFormat fmt;
 static PHash base_img;			/* the image the working set's pages derive from */
@@ -1679,7 +1681,9 @@ life_commit(int seq, const char *branch)
 	/* exactly the state as of the barrier, whatever has landed since */
 	c = o.sql_decode ? vc_commit(&repo, msg) : vc_commit_root(&repo, &bar_root, msg);
 	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
-	if (seg != VC_NO_SEGMENT)
+	if (seg != VC_NO_SEGMENT && archive)
+		CHECK(vc_segment_export(&repo, seg, &(VcSource) {"archive", archive}) == VC_OK);
+	else if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
 	CHECK(ncommits < MAX_COMMITS);
 	commits[ncommits].hash = c;
@@ -1886,6 +1890,150 @@ run_concurrent(void)
 		   n, (long long) cw_done);
 }
 
+/* ---------------------------------------------------------- outside window */
+
+/* Brings an exported commit back from the archive; returns ms, *chunks copied. */
+static double
+attach_if_outside(const PHash *x, uint64_t *chunks, uint64_t *bytes)
+{
+	uint32_t	seg;
+	uint64_t	n0 = cs->stats.new_chunks,
+				b0 = cs->stats.new_bytes;
+	double		t = now_ms();
+
+	*chunks = *bytes = 0;
+	if (vc_locate(&repo, x, &seg) != VC_LOC_EXPORTED)
+		return 0;
+	CHECK(vc_segment_attach(&repo, seg) == VC_OK);
+	*chunks = cs->stats.new_chunks - n0;
+	*bytes = cs->stats.new_bytes - b0;
+	return now_ms() - t;
+}
+
+/* The whole table rebuilt from the tree at data, on the replay connection. */
+static double
+rebuild_from(const PHash *data, uint64_t *rows)
+{
+	ProllyIter *it = t_iter(&repo.ctx, data, NULL, 0);
+	const uint8_t *k,
+			   *v;
+	size_t		kl,
+				vl;
+	Buf			b = BUF_INIT;
+	double		t = now_ms();
+	PGresult   *r;
+
+	*rows = 0;
+	PQclear(qpc(rep, "BEGIN", 0, NULL, NULL, NULL, 0));
+	PQclear(qpc(rep, "TRUNCATE t", 0, NULL, NULL, NULL, 0));
+	r = PQexec(rep, "COPY t FROM STDIN");
+	CHECK(PQresultStatus(r) == PGRES_COPY_IN);
+	PQclear(r);
+	while (t_next(it, &k, &kl, &v, &vl))
+	{
+		char		head[64];
+		int			n = snprintf(head, sizeof(head), "%lld\t%d\t%d\t",
+								 (long long) (get_u64(k) ^ (1ULL << 63)),
+								 (int32_t) (get_u64(v) >> 32), (int32_t) (uint32_t) get_u64(v));
+
+		buf_append(&b, head, (size_t) n);
+		buf_append(&b, v + 8, vl - 8);
+		buf_append_byte(&b, '\n');
+		if (b.len > (1 << 20))
+		{
+			CHECK(PQputCopyData(rep, (const char *) b.data, (int) b.len) == 1);
+			b.len = 0;
+		}
+		(*rows)++;
+	}
+	prolly_iter_close(it);
+	if (b.len)
+		CHECK(PQputCopyData(rep, (const char *) b.data, (int) b.len) == 1);
+	CHECK(PQputCopyEnd(rep, NULL) == 1);
+	r = PQgetResult(rep);
+	CHECK(PQresultStatus(r) == PGRES_COMMAND_OK);
+	PQclear(r);
+	PQclear(PQgetResult(rep));
+	PQclear(qpc(rep, "COMMIT", 0, NULL, NULL, NULL, 0));
+	buf_free(&b);
+	return now_ms() - t;
+}
+
+/*
+ * diff and checkout against commits at each distance behind the head:
+ * inside the window they are local; outside they come back from the
+ * archive first.  Then one full rebuild, for the case nothing else fits.
+ */
+static void
+run_outside(void)
+{
+	char	   *list = px_memdup(o.outside, strlen(o.outside) + 1);
+	PHash		head = repo.br[repo.cur].head;
+	int			last_main = ncommits - 1;
+	bool		rebuilt = false;
+
+	for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","))
+	{
+		int			dist = atoi(tok);
+		PHash		x;
+		VcCommit	c;
+		PHash		from,
+					to;
+		uint64_t	chunks,
+					bytes,
+					d = 0,
+					rows;
+		double		ms,
+					attach_ms,
+					t;
+		const char *where;
+
+		if (dist > last_main)
+			continue;
+		x = commits[last_main - dist].hash;
+		checkpoint(&ms);
+		pthread_mutex_lock(&repo_lock);
+		where = vc_locate(&repo, &x, NULL) == VC_LOC_WINDOW ? "window" : "outside";
+
+		/* diff WORKING X */
+		attach_ms = attach_if_outside(&x, &chunks, &bytes);
+		t = now_ms();
+		CHECK(vc_commit_load(&repo.ctx, &x, &c));
+		from = table_root(&repo.br[repo.cur].working);
+		to = table_root(&c.root);
+		CHECK_OK(prolly_diff(&repo.ctx, &from, &to, count_diff_fn, &d));
+		printf("outside,diff,dist=%d,%s,attach_ms=%.0f,attach_chunks=%llu,attach_mb=%.1f,"
+			   "diff_ms=%.0f,rows=%llu,total_ms=%.0f\n", dist, where, attach_ms,
+			   (unsigned long long) chunks, bytes / 1048576.0, now_ms() - t,
+			   (unsigned long long) d, attach_ms + now_ms() - t);
+
+		/* checkout X by replay, then back to the head (not measured) */
+		t = now_ms();
+		rows = replay_diff(rep, &from, &to);
+		CHECK(vc_reset_hard(&repo, &x) == VC_OK);
+		printf("outside,checkout,dist=%d,%s,attach_ms=%.0f,replay_ms=%.0f,rows=%llu,total_ms=%.0f\n",
+			   dist, where, attach_ms, now_ms() - t, (unsigned long long) rows,
+			   attach_ms + now_ms() - t);
+		verify_changed(&from, &to);
+
+		if (!rebuilt && strcmp(where, "outside") == 0)
+		{
+			uint64_t	n;
+			double		rms = rebuild_from(&to, &n);
+
+			printf("outside,rebuild,dist=%d,rows=%llu,ms=%.0f\n", dist, (unsigned long long) n,
+				   rms);
+			verify_changed(&from, &to);
+			rebuilt = true;
+		}
+		replay_diff(rep, &to, &from);
+		CHECK(vc_reset_hard(&repo, &head) == VC_OK);
+		pthread_mutex_unlock(&repo_lock);
+		fflush(stdout);
+	}
+	free(list);
+}
+
 static void
 run_lifecycle(void)
 {
@@ -1924,6 +2072,11 @@ run_lifecycle(void)
 	{
 		workload(i);
 		life_commit(i, "main");
+	}
+	if (o.outside)
+	{
+		run_outside();
+		goto finish;
 	}
 	for (int b = 0; b < o.branches; b++)
 	{
@@ -2022,7 +2175,7 @@ main(int argc, char **argv)
 		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
-		{0, 0, 0, 0}
+		{"outside", 1, 0, 'O'}, {0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -2057,6 +2210,7 @@ main(int argc, char **argv)
 			case 'Q': o.sql_decode = true; break;
 			case 'W': o.bg_rows = atoi(optarg); break;
 			case 'K': o.concurrent = true; break;
+			case 'O': o.outside = optarg; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -2083,6 +2237,13 @@ main(int argc, char **argv)
 	}
 
 	cs = filestore_create(o.store);
+	if (o.outside)
+	{
+		char		apath[512];
+
+		snprintf(apath, sizeof(apath), "%s.archive", o.store);
+		archive = filestore_create(apath);
+	}
 	vc_repo_init(&repo, cs, &prolly_default_policy);
 	setup_db();
 	load_prolly();
@@ -2094,6 +2255,8 @@ main(int argc, char **argv)
 			   db_pages() * 8192.0 / 1048576.0);
 		vc_repo_free(&repo);
 		cs_destroy(cs);
+		if (archive)
+			cs_destroy(archive);
 		PQfinish(rep);
 		PQfinish(dec);
 		if (repl)
