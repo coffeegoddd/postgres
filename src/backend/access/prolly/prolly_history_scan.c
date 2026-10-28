@@ -27,8 +27,8 @@
  * is sought for each bound ("At Key"); WORKING, or a version that can't be
  * sought, is read whole.  A value of another type than the key column's
  * bounds it where the operator family compares the two and the value's
- * type casts implicitly to the column's (an int literal against a bigint
- * key: int4 to int8, which is exact), the value cast so for the bound.
+ * type widens exactly to the column's (an int literal against a bigint
+ * key: int4 to int8), the value cast so for the bound.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_history_scan.c
@@ -51,6 +51,7 @@
 #include "commands/explain_state.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type_d.h"
 #include "utils/acl.h"
 #include "access/prolly_function_scan.h"
 #include "executor/executor.h"
@@ -212,11 +213,34 @@ known_before(Node *expr, Index relid)
 }
 
 /*
+ * Does a value of type from cast to type to exactly, every value its own,
+ * in the order the two compare in (an integer or float widened)?  Only
+ * such a cast may stand for a cross-type comparison in a bound: one that
+ * rounds or truncates (text to name) would bound other keys than the
+ * comparison selects.
+ */
+static bool
+exact_cast(Oid from, Oid to)
+{
+	switch (to)
+	{
+		case INT4OID:
+			return from == INT2OID;
+		case INT8OID:
+			return from == INT2OID || from == INT4OID;
+		case FLOAT8OID:
+			return from == FLOAT4OID;
+		default:
+			return false;
+	}
+}
+
+/*
  * A restriction clause that bounds key column c: (row).column op value or
  * value op (row).column (commuted), or (row).column = ANY (array), with
  * the operator the column's operator family's and the column's
  * collation, the value of the column's type or of one that casts to it
- * implicitly (within the family, such a cast is exact: int4 to int8); the
+ * exactly (exact_cast(): int4 to int8); the
  * clause as column op value, with the column type's own operator and the
  * value cast to the column's type (*strategy its strategy, *in whether it
  * is = ANY), else NULL.
@@ -281,16 +305,16 @@ key_clause(RelOptInfo *rel, const HistoryKey *key, int c, RestrictInfo *rinfo,
 		(*in && *strategy != BTEqualStrategyNumber))
 		return NULL;
 	/*
-	 * (a value of another type: cast to the column's, so it bounds its keys
-	 * as they are, compared by the column type's own operator)
+	 * (a value of another type that casts to the column's exactly: cast so,
+	 * it bounds its keys as they are, compared by the column type's own
+	 * operator)
 	 */
 	if (righttype != keytype)
 	{
 		Oid			from = exprType(right);
 		Oid			to = *in ? get_array_type(keytype) : keytype;
 
-		if (!can_coerce_type(1, &righttype, &keytype, COERCION_IMPLICIT) ||
-			!OidIsValid(to))
+		if (!exact_cast(righttype, keytype) || !OidIsValid(to))
 			return NULL;
 		opno = get_opfamily_member(key->opfamilies[c], keytype, keytype,
 								   *strategy);

@@ -144,6 +144,14 @@ SELECT bounded_whole('ak.p', 'HEAD', $$a > 'k19' COLLATE "POSIX"$$) AS other_col
 -- (the second column alone bounds nothing: not the key's prefix)
 EXPLAIN (COSTS OFF) SELECT v FROM dolt_at('HEAD', NULL::ak.p) WHERE b = 3;
 
+-- (a value whose cast to the key's type truncates isn't a bound: text
+-- against a name key, the 64th byte cut)
+CREATE TABLE ak.nm (k name PRIMARY KEY);
+INSERT INTO ak.nm VALUES (repeat('a', 63)), ('b');
+SELECT dolt_commit('-Am', 'nm') IS NOT NULL AS committed;
+EXPLAIN (COSTS OFF) SELECT k FROM dolt_at('HEAD', NULL::ak.nm) WHERE k < repeat('a', 64)::text;
+SELECT bounded_whole('ak.nm', 'HEAD', $$k < repeat('a', 64)::text$$) AS truncated;
+
 -- WORKING: read whole, the rows the same.
 UPDATE ak.big SET v = 'working' WHERE id = 5;
 SELECT v FROM dolt_at('WORKING', NULL::ak.big) WHERE id = 5;

@@ -2378,8 +2378,10 @@ commit ref names is sought for each bound, so a point read is O(the
 tree's depth) whatever the table's size; WORKING, or a version that
 can't be sought, is read whole.  For either, a value of another type
 than the key column's bounds it where the column's operator family
-compares the two and the value's type casts implicitly to the column's
-(an int literal against a bigint key), the value cast so for the bound.
+compares the two and the value's type widens exactly to the column's
+(an integer or a float widened: an int literal against a bigint key), the
+value cast so for the bound; a cast that rounds or truncates (text to
+name) would bound other keys than the comparison selects.
 
 Revision-qualified table names (prolly_revision.c) read a table as
 another revision has it, as Doltgres's revision databases do:
