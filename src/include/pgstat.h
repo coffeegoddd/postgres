@@ -859,9 +859,12 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_KEPT_ENTRIES_READ,	/* branches' kept-commit entries
 										 * read from the refs */
 	PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN, /* and put or deleted */
+	PGSTAT_PROLLY_RESTORES_FOLD_CANCELS,	/* folds of the fold worker's a
+											 * restore asked to give up,
+											 * holding a lock it needed */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_ENTRIES_WRITTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_RESTORES_FOLD_CANCELS + 1)
 
 typedef struct PgStat_ProllyStats
 {

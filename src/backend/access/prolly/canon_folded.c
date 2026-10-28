@@ -408,6 +408,9 @@ finder_fold_run(void *arg)
 
 	if (f->next)
 		resetStringInfo(f->next);
+	/* (the table locked, its fold about to begin: the fold worker's, or not) */
+	INJECTION_POINT("prolly-fold-table",
+					AmBackgroundWorkerProcess() ? "worker" : "session");
 	PROLLY_CALL(f->finder, fold, f->rel, f->env, f->baseline, f->why, f->data, f->next);
 }
 

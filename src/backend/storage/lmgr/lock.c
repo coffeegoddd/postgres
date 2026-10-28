@@ -3409,13 +3409,16 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 }
 
 /*
- * CancelAutoVacuumHolders
+ * CancelWorkerHolders
  *		Ask each autovacuum worker holding a lock that conflicts with
  *		lockmode on locktag to cancel its task, as ProcSleep() asks one
  *		that blocks a lock waiter, but for a caller that only tries the
  *		lock: it isn't in the lock's queue, so the deadlock check that would
  *		find the worker never runs.  A worker vacuuming to prevent
- *		wraparound is left alone.
+ *		wraparound is left alone.  With folds, a fold worker holding one in
+ *		a fold (PROC_IN_FOLD) is asked too: it gives the fold up, rolled
+ *		back, and folds again later; *nfolds is how many of those were
+ *		asked now.
  *
  *		Each is asked once, as ProcSleep() asks once per wait: asked[] (of
  *		*nasked, room for maxasked) holds the transactions asked already,
@@ -3427,19 +3430,21 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
  *		tries the lock again once they have let go.
  */
 int
-CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
-						VirtualTransactionId *asked, int *nasked,
-						int maxasked)
+CancelWorkerHolders(const LOCKTAG *locktag, LOCKMODE lockmode, bool folds,
+					VirtualTransactionId *asked, int *nasked, int maxasked,
+					int *nfolds)
 {
 	VirtualTransactionId *holders;
 	int			nholders;
 	int			nnew = 0;
 
+	*nfolds = 0;
 	holders = GetLockConflicts(locktag, lockmode, &nholders);
 	for (int i = 0; i < nholders; i++)
 	{
 		PGPROC	   *proc;
 		int			pid = 0;
+		bool		fold = false;
 		bool		seen = false;
 
 		for (int j = 0; j < *nasked && !seen; j++)
@@ -3450,7 +3455,10 @@ CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
 		if (proc == NULL)
 			continue;
 
-		/* (still the transaction found holding it, and an autovacuum's) */
+		/*
+		 * (still the transaction found holding it, and an autovacuum's or,
+		 * if asked for, a fold's)
+		 */
 		LWLockAcquire(ProcArrayLock, LW_SHARED);
 		if (proc->vxid.lxid == holders[i].localTransactionId)
 		{
@@ -3459,6 +3467,11 @@ CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
 			if ((statusFlags & PROC_IS_AUTOVACUUM) &&
 				!(statusFlags & PROC_VACUUM_FOR_WRAPAROUND))
 				pid = proc->pid;
+			else if (folds && (statusFlags & PROC_IN_FOLD))
+			{
+				pid = proc->pid;
+				fold = true;
+			}
 		}
 		LWLockRelease(ProcArrayLock);
 		if (pid == 0)
@@ -3466,13 +3479,16 @@ CancelAutoVacuumHolders(const LOCKTAG *locktag, LOCKMODE lockmode,
 
 		asked[(*nasked)++] = holders[i];
 		ereport(DEBUG1,
-				(errmsg_internal("sending cancel to autovacuum PID %d holding a lock process %d tries for",
+				(errmsg_internal("sending cancel to %s PID %d holding a lock process %d tries for",
+								 fold ? "fold worker" : "autovacuum",
 								 pid, MyProcPid)));
 		/* (one gone meanwhile isn't complained of, as in ProcSleep()) */
 		if (kill(pid, SIGINT) < 0 && errno != ESRCH)
 			ereport(WARNING,
 					(errmsg("could not send signal to process %d: %m", pid)));
 		nnew++;
+		if (fold)
+			(*nfolds)++;
 	}
 	if (!InHotStandby)
 		pfree(holders);
