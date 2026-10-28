@@ -499,25 +499,28 @@ static void
 compact_copies(Finder *f)
 {
 	int64		u = 0;
-#ifdef USE_INJECTION_POINTS
-	char		filenode[16];
-
-	/*
-	 * (told the table's file number, if the fold is the fold worker's; held
-	 * from interrupts while it waits, so a cancel sent meanwhile is taken
-	 * in the sort)
-	 */
-	snprintf(filenode, sizeof(filenode), "%u", f->rel->rd_locator.relNumber);
-	HOLD_INTERRUPTS();
-	INJECTION_POINT("prolly-fold-sort",
-					AmBackgroundWorkerProcess() ? filenode : NULL);
-	RESUME_INTERRUPTS();
-#endif
 
 	if (f->n > 1)
+	{
+#ifdef USE_INJECTION_POINTS
+		char		filenode[16];
+
+		/*
+		 * (only a sort that compares: told the table's file number, if the
+		 * fold is the fold worker's; held from interrupts while it waits, so
+		 * a cancel sent meanwhile is taken in the sort)
+		 */
+		snprintf(filenode, sizeof(filenode), "%u",
+				 f->rel->rd_locator.relNumber);
+		HOLD_INTERRUPTS();
+		INJECTION_POINT("prolly-fold-sort",
+						AmBackgroundWorkerProcess() ? filenode : NULL);
+		RESUME_INTERRUPTS();
+#endif
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
-	INJECTION_POINT("prolly-fold-sorted",
-					AmBackgroundWorkerProcess() ? filenode : NULL);
+		INJECTION_POINT("prolly-fold-sorted",
+						AmBackgroundWorkerProcess() ? filenode : NULL);
+	}
 	for (int64 i = 0; i < f->n; i++)
 	{
 		Copy	   *c = &f->c[i];
