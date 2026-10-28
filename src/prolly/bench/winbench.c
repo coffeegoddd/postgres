@@ -94,6 +94,8 @@ static int64_t next_id;
 static CommitInfo commits[MAX_COMMITS];
 static int ncommits;
 static uint64_t snap_dummy_xip[1];
+static uint64_t last_dirty,
+			last_diff;			/* checkout page sources, for reporting */
 
 /* ----------------------------------------------------------------- utils */
 
@@ -267,7 +269,7 @@ setup_db(void)
 
 			snprintf(sql, sizeof(sql),
 					 "INSERT INTO t SELECT g, (g * 7919) %% 1000003, 0, lpad(g::text, %d, 'x') "
-					 "FROM generate_series(%lld, %lld) g", o.pad, (long long) a, (long long) b);
+					 "FROM generate_series(%lld::bigint, %lld::bigint) g", o.pad, (long long) a, (long long) b);
 			qx(sql);
 		}
 		qx("ALTER TABLE t ADD PRIMARY KEY (id)");
@@ -921,7 +923,13 @@ checkout_images(const PHash *target)
 	CHECK_OK(img_load(&repo.ctx, &base_img, &bh));
 	flush_lsn(lsn);
 	wal_pages(base_lsn, lsn, &s);	/* what the working set changed since its base */
-	CHECK_OK(img_diff(&repo.ctx, &bh, &th, img_diff_fn, &s));
+	last_dirty = s.n;
+	{
+		size_t		before = s.n;
+
+		CHECK_OK(img_diff(&repo.ctx, &bh, &th, img_diff_fn, &s));
+		last_diff = s.n - before;
+	}
 	pageset_sort(&s);
 
 	qx("BEGIN");
@@ -1220,6 +1228,22 @@ distance(const PHash *a, const PHash *b)
 	return (int) ca.generation - (int) cb.generation;
 }
 
+/* Commits between a and b through their merge base: how far apart they are. */
+static int
+path_len(const PHash *a, const PHash *b)
+{
+	PHash		base;
+	VcCommit	ca,
+				cb,
+				cbase;
+
+	if (vc_merge_base_in(&repo, a, b, 0, &base) != 1 ||
+		!vc_commit_load(&repo.ctx, &base, &cbase))
+		return -1;				/* the base is past the cut */
+	CHECK(vc_commit_load(&repo.ctx, a, &ca) && vc_commit_load(&repo.ctx, b, &cb));
+	return (int) (ca.generation - cbase.generation + cb.generation - cbase.generation);
+}
+
 static void
 switch_to(const PHash *target, bool by_sql, uint64_t db_pages)
 {
@@ -1230,6 +1254,7 @@ switch_to(const PHash *target, bool by_sql, uint64_t db_pages)
 				t1;
 	uint64_t	work;
 	int			dist = distance(&repo.br[repo.cur].head, target);
+	int			path = path_len(&repo.br[repo.cur].head, target);
 
 	CHECK(vc_commit_load(&repo.ctx, target, &c));
 	to = table_root(&c.root);
@@ -1240,9 +1265,11 @@ switch_to(const PHash *target, bool by_sql, uint64_t db_pages)
 		verify_full(&to);
 	else if (o.verify == 1)
 		verify_changed(&from, &to);
-	printf("checkout,%s,%s,dist=%d,%s=%llu,ms=%.1f,db_pages=%llu,verify_ms=%.0f\n",
-		   by_sql ? "sql" : "image", hex(target), dist, by_sql ? "rows" : "pages",
-		   (unsigned long long) work, t1 - t0, (unsigned long long) db_pages, now_ms() - t1);
+	printf("checkout,%s,%s,dist=%d,path=%d,%s=%llu,dirty=%llu,diff=%llu,ms=%.1f,db_pages=%llu,verify_ms=%.0f\n",
+		   by_sql ? "sql" : "image", hex(target), dist, path, by_sql ? "rows" : "pages",
+		   (unsigned long long) work, by_sql ? 0ULL : (unsigned long long) last_dirty,
+		   by_sql ? 0ULL : (unsigned long long) last_diff, t1 - t0,
+		   (unsigned long long) db_pages, now_ms() - t1);
 	fflush(stdout);
 }
 
@@ -1369,18 +1396,38 @@ main(int argc, char **argv)
 		uint64_t	dbp = db_pages();
 
 		for (int k = 0; k < o.checkouts; k++)
+			switch_to(&commits[pick_in_window()].hash, false, dbp);
+	}
+
+	/* switches between branch heads */
+	if (o.branches > 0)
+	{
+		uint64_t	dbp = db_pages();
+
+		for (int k = 0; k < o.checkouts; k++)
 		{
-			int			t = pick_in_window();
+			char		name[32];
+			VcBranch   *b;
 
-			switch_to(&commits[t].hash, false, dbp);
-			if (o.sql_baseline)
-			{
-				int			u = pick_in_window();
-
-				switch_to(&commits[u].hash, true, dbp);
-			}
+			snprintf(name, sizeof(name), "b%d", (int) rnd_below((uint64_t) o.branches));
+			b = vc_branch_find(&repo, name);
+			printf("# head switch to %s\n", name);
+			switch_to(&b->head, false, dbp);
 		}
 	}
+
+	/*
+	 * The SQL baseline last: replaying rows leaves the pages diverged from
+	 * every image, which would inflate image checkouts that came after.
+	 */
+	if (o.sql_baseline)
+	{
+		uint64_t	dbp = db_pages();
+
+		for (int k = 0; k < o.checkouts; k++)
+			switch_to(&commits[pick_in_window()].hash, true, dbp);
+	}
+
 	/* one full verification at the end */
 	if (o.final_verify)
 	{

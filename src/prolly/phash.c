@@ -194,3 +194,40 @@ phmap_ref(PHashMap *m, const PHash *k, bool *created)
 		}
 	}
 }
+
+bool
+phmap_remove(PHashMap *m, const PHash *k)
+{
+	size_t		mask,
+				i,
+				j;
+
+	if (m->cap == 0)
+		return false;
+	mask = m->cap - 1;
+	for (i = phmap_slot(k, m->cap);; i = (i + 1) & mask)
+	{
+		if (!m->used[i])
+			return false;
+		if (phash_eq(&m->keys[i], k))
+			break;
+	}
+	m->used[i] = 0;
+	m->n--;
+	/* shift back later entries of the probe run that may now sit too far */
+	for (j = (i + 1) & mask; m->used[j]; j = (j + 1) & mask)
+	{
+		size_t		home = phmap_slot(&m->keys[j], m->cap);
+		bool		stays = i <= j ? (home > i && home <= j) : (home > i || home <= j);
+
+		if (!stays)
+		{
+			m->keys[i] = m->keys[j];
+			m->vals[i] = m->vals[j];
+			m->used[i] = 1;
+			m->used[j] = 0;
+			i = j;
+		}
+	}
+	return true;
+}

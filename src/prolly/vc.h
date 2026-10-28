@@ -186,6 +186,13 @@ typedef struct VcRepo
 	PHash	   *img_hash;
 	size_t		nimg;
 	size_t		imgcap;
+	PHashMap	brmap;			/* hash of branch name -> index + 1 */
+	PHashMap	imgmap;			/* commit -> image index + 1 */
+	uint32_t	track_depth;	/* incremental window depth; 0: not tracked */
+	PHashMap	cover;			/* commit -> heads whose window covers it */
+	PHash	   *pending;		/* commits whose cover fell to 0, or entered */
+	size_t		npending;
+	size_t		pendcap;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -230,6 +237,8 @@ extern VcBranch *vc_head(VcRepo *r);
 extern PHash vc_working(VcRepo *r);
 extern void vc_set_working(VcRepo *r, const PHash *rv);
 extern int	vc_branch_create(VcRepo *r, const char *name, const PHash *commit);
+/* Deletes a branch other than the current one; its working set is let go. */
+extern int	vc_branch_delete(VcRepo *r, const char *name);
 extern int	vc_checkout(VcRepo *r, const char *name);
 extern PHash vc_commit(VcRepo *r, const char *msg);
 extern int	vc_reset_hard(VcRepo *r, const PHash *commit);
@@ -257,6 +266,18 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
  * archive store, then let go here), discarded, or attached again.
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
+
+/*
+ * Incremental window.  vc_window_track(r, depth) starts counting, for every
+ * commit, how many branch heads (and pending merge heads) have it within
+ * depth generations.  Moving, creating or deleting a head then updates only
+ * the commits near it, O(depth), and a vc_sever with the same depth and no
+ * pins takes only the commits whose count fell to zero, so neither cost
+ * grows with the number of branches.  vc_window_verify recomputes the
+ * counts from scratch and checks them (O(branches x depth); for tests).
+ */
+extern int	vc_window_track(VcRepo *r, uint32_t depth);
+extern bool vc_window_verify(VcRepo *r);
 extern int	vc_segment_export(VcRepo *r, uint32_t seg, const VcSource *archive);
 extern int	vc_segment_discard(VcRepo *r, uint32_t seg);
 extern int	vc_segment_attach(VcRepo *r, uint32_t seg);

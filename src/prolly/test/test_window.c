@@ -596,6 +596,193 @@ test_remotes_across_edge(void)
 	cs_destroy(rcs);
 }
 
+/* ------------------------------------------------------ incremental window */
+
+/* Commits a sever with this window would cut, computed from scratch. */
+static int
+full_cut_count(VcRepo *r, uint32_t depth)
+{
+	ChunkStore *cs2 = memstore_create();
+	VcRepo		probe;
+	int			n = 0;
+
+	(void) cs2;
+	(void) probe;
+	/* the window as a set: every head's commits within depth */
+	{
+		PHashMap	win;
+
+		phmap_init(&win);
+		for (size_t i = 0; i < r->nbr; i++)
+		{
+			PHash	   *stack = px_malloc(sizeof(PHash) * 4096);
+			uint64_t   *bound = px_malloc(sizeof(uint64_t) * 4096);
+			size_t		sn = 0;
+			VcCommit	c;
+
+			CHECK(vc_commit_load(&r->ctx, &r->br[i].head, &c));
+			stack[sn] = r->br[i].head;
+			bound[sn++] = c.generation > depth ? c.generation - depth : 0;
+			while (sn > 0)
+			{
+				PHash		h = stack[--sn];
+				uint64_t	b = bound[sn];
+				bool		created;
+
+				phmap_ref(&win, &h, &created);
+				if (!vc_commit_load(&r->ctx, &h, &c))
+					continue;
+				for (uint32_t p = 0; p < c.nparents; p++)
+					if (c.parent_gen[p] > b && sn < 4096)
+					{
+						stack[sn] = c.parents[p];
+						bound[sn++] = b;
+					}
+			}
+			free(stack);
+			free(bound);
+		}
+		for (size_t i = 0; i < r->loc.cap; i++)
+			if (r->loc.used[i] && vc_locate(r, &r->loc.keys[i], NULL) == VC_LOC_WINDOW &&
+				!phmap_find(&win, &r->loc.keys[i]))
+				n++;
+		phmap_free(&win);
+	}
+	cs_destroy(cs2);
+	return n;
+}
+
+/*
+ * Random branch work with the window tracked incrementally: the counts
+ * always equal a recomputation, and each incremental sever cuts exactly
+ * what a full one would.
+ */
+static void
+test_incremental_window_matches_full(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	const uint32_t depth = 3;
+	int			nbranches = 1,
+				severs = 0,
+				cut_total = 0;
+	char		name[32];
+
+	setup(&r, cs);
+	commit_rows(&r, 0, 2000, 0, "base");
+	CHECK(vc_window_track(&r, depth) == VC_OK);
+	CHECK(vc_window_verify(&r));
+	rng_seed(8080);
+	for (int step = 0; step < 400; step++)
+	{
+		uint64_t	op = rnd_below(100);
+
+		if (op < 45)
+		{
+			/* commit on a random branch */
+			size_t		b = rnd_below(r.nbr);
+
+			CHECK(vc_checkout(&r, r.br[b].name) == VC_OK);
+			commit_rows(&r, rnd_below(2000), rnd_below(2000) + 2000, (uint64_t) step, "c");
+		}
+		else if (op < 65)
+		{
+			/* branch at a random head or the current head */
+			size_t		b = rnd_below(r.nbr);
+
+			snprintf(name, sizeof(name), "b%d", nbranches++);
+			CHECK(vc_branch_create(&r, name, &r.br[b].head) == VC_OK);
+		}
+		else if (op < 75 && r.nbr > 2)
+		{
+			size_t		b = rnd_below(r.nbr);
+
+			if (b != r.cur)
+				CHECK(vc_branch_delete(&r, r.br[b].name) == VC_OK);
+		}
+		else if (op < 82)
+		{
+			/* reset the current branch to another branch's head */
+			size_t		b = rnd_below(r.nbr);
+
+			CHECK(vc_reset_hard(&r, &r.br[b].head) == VC_OK);
+		}
+		else if (op < 90)
+		{
+			/* merge another branch in; a conflict is committed as ours */
+			size_t		b = rnd_below(r.nbr);
+			VcMergeResult m;
+			int			rc;
+
+			if (b == r.cur)
+				continue;
+			rc = vc_merge(&r, r.br[b].name, &m);
+			if (rc == VC_ERR_SEVERED)
+				continue;		/* their base was cut: correctly refused */
+			CHECK(rc == VC_OK);
+			if (m.status == VC_MERGE_CONFLICTS)
+				vc_commit(&r, "resolve");
+			vc_merge_result_free(&m);
+		}
+		else
+		{
+			/* sever: incremental, checked against a full recomputation */
+			int			want = full_cut_count(&r, depth);
+			uint32_t	seg;
+
+			CHECK(vc_sever(&r, &(VcWindow) {depth, NULL, 0}, &seg) == VC_OK);
+			CHECK_EQ(seg == VC_NO_SEGMENT ? 0 : (int) r.segs[seg].n, want);
+			if (seg != VC_NO_SEGMENT)
+				CHECK(vc_segment_discard(&r, seg) == VC_OK);
+			severs++;
+			cut_total += want;
+			CHECK_EQ(full_cut_count(&r, depth), 0);
+		}
+		CHECK(vc_window_verify(&r));
+	}
+	CHECK(severs > 20 && cut_total > 50);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* Branches are found, created and deleted by name in O(1). */
+static void
+test_many_branches(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	char		name[32];
+	double		t0;
+
+	setup(&r, cs);
+	commit_rows(&r, 0, 100, 0, "base");
+	CHECK(vc_window_track(&r, 4) == VC_OK);
+	t0 = now_sec();
+	for (int i = 0; i < 100000; i++)
+	{
+		snprintf(name, sizeof(name), "br-%d", i);
+		CHECK(vc_branch_create(&r, name, NULL) == VC_OK);
+	}
+	for (int i = 0; i < 100000; i += 3)
+	{
+		snprintf(name, sizeof(name), "br-%d", i);
+		CHECK(vc_branch_delete(&r, name) == VC_OK);
+	}
+	for (int i = 0; i < 100000; i++)
+	{
+		snprintf(name, sizeof(name), "br-%d", i);
+		CHECK((vc_branch_find(&r, name) != NULL) == (i % 3 != 0));
+	}
+	CHECK(vc_branch_find(&r, "main") != NULL);
+	CHECK(vc_branch_delete(&r, "main") == VC_ERR);	/* the current branch */
+	CHECK(vc_window_verify(&r));
+	CHECK(now_sec() - t0 < 5.0);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 /* ---------------------------------------------------------------- scaling */
 
 typedef struct WinScale
@@ -745,6 +932,8 @@ main(void)
 	RUN(test_pinned_commit_stays);
 	RUN(test_refuse_outside_window);
 	RUN(test_remotes_across_edge);
+	RUN(test_incremental_window_matches_full);
+	RUN(test_many_branches);
 	RUN(test_window_scaling);
 	printf("test_window: all tests passed\n");
 	return 0;

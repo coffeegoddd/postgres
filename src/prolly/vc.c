@@ -618,6 +618,59 @@ vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b, PHash *out)
 #define LOC_BOUNDARY UINT64_MAX
 
 static int	reach_commit(VcRepo *r, const PHash *h, unsigned flags, VcCommit *c);
+static int	window_add(VcRepo *r, PHashMap *win, const PHash *head, uint64_t depth);
+
+static PHash
+name_key(const char *name)
+{
+	PHash		k;
+
+	phash_compute(name, strlen(name), &k);
+	return k;
+}
+
+static void
+pending_push(VcRepo *r, const PHash *h)
+{
+	px_grow((void **) &r->pending, &r->pendcap, r->npending + 1, sizeof(PHash));
+	r->pending[r->npending++] = *h;
+}
+
+/* Adds (+1) or removes (-1) a head's window from the cover counts. */
+static void
+cover_head(VcRepo *r, const PHash *head, int delta)
+{
+	PHashMap	win;
+
+	if (r->track_depth == 0)
+		return;
+	phmap_init(&win);
+	window_add(r, &win, head, r->track_depth);
+	for (size_t i = 0; i < win.cap; i++)
+	{
+		bool		created;
+		uint64_t   *c;
+
+		if (!win.used[i])
+			continue;
+		c = phmap_ref(&r->cover, &win.keys[i], &created);
+		if (delta > 0)
+			(*c)++;
+		else if (--(*c) == 0)
+			pending_push(r, &win.keys[i]);
+	}
+	phmap_free(&win);
+}
+
+/* A head moved from old to new; either may be NULL. */
+static void
+move_head(VcRepo *r, const PHash *old, const PHash *new)
+{
+	if (new)
+		cover_head(r, new, +1);	/* add first, so nothing passes through 0 */
+	if (old)
+		cover_head(r, old, -1);
+}
 
 static void
 set_working(VcRepo *r, VcBranch *b, const PHash *rv)
@@ -643,6 +696,13 @@ add_branch(VcRepo *r, const char *name, const PHash *head, const PHash *root)
 	b->head_root = *root;
 	b->working = *root;
 	cs_ref_root(r->ctx.cs, root);
+	{
+		bool		created;
+		PHash		k = name_key(name);
+
+		*phmap_ref(&r->brmap, &k, &created) = (uint64_t) (b - r->br);
+	}
+	move_head(r, NULL, head);
 	return b;
 }
 
@@ -662,6 +722,15 @@ in_window(VcRepo *r, const PHash *h)
 	return v && *v == LOC_WINDOW;
 }
 
+/* A commit enters the window's history; sever decides if it stays. */
+static void
+enter_window(VcRepo *r, const PHash *h)
+{
+	set_loc(r, h, LOC_WINDOW);
+	if (r->track_depth)
+		pending_push(r, h);
+}
+
 /* Writes a commit and keeps it in the window's history. */
 static PHash
 keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32_t np,
@@ -670,7 +739,7 @@ keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32_t np,
 	PHash		h = vc_commit_write(&r->ctx, root, parents, np, r->clock++, msg);
 
 	cs_ref_root(r->ctx.cs, &h);
-	set_loc(r, &h, LOC_WINDOW);
+	enter_window(r, &h);
 	return h;
 }
 
@@ -681,6 +750,9 @@ repo_init_empty(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 	prolly_ctx_init(&r->ctx, cs, policy);
 	phmap_init(&r->loc);
 	phmap_init(&r->hint);
+	phmap_init(&r->brmap);
+	phmap_init(&r->imgmap);
+	phmap_init(&r->cover);
 	r->name = px_memdup("", 1);
 }
 
@@ -730,6 +802,10 @@ vc_repo_free(VcRepo *r)
 	free(r->hints);
 	free(r->img_commit);
 	free(r->img_hash);
+	phmap_free(&r->brmap);
+	phmap_free(&r->imgmap);
+	phmap_free(&r->cover);
+	free(r->pending);
 	free(r->name);
 	prolly_ctx_free(&r->ctx);
 	memset(r, 0, sizeof(*r));
@@ -738,10 +814,42 @@ vc_repo_free(VcRepo *r)
 VcBranch *
 vc_branch_find(VcRepo *r, const char *name)
 {
-	for (size_t i = 0; i < r->nbr; i++)
-		if (strcmp(r->br[i].name, name) == 0)
-			return &r->br[i];
-	return NULL;
+	PHash		k = name_key(name);
+	uint64_t   *v = phmap_find(&r->brmap, &k);
+
+	if (v == NULL || strcmp(r->br[*v].name, name) != 0)
+		return NULL;
+	return &r->br[*v];
+}
+
+int
+vc_branch_delete(VcRepo *r, const char *name)
+{
+	VcBranch   *b = vc_branch_find(r, name);
+	size_t		i,
+				last;
+	PHash		k = name_key(name);
+
+	if (b == NULL || (size_t) (b - r->br) == r->cur)
+		return VC_ERR;
+	i = (size_t) (b - r->br);
+	move_head(r, &b->head, NULL);
+	if (b->merging)
+		move_head(r, &b->merge_head, NULL);
+	cs_unref_root(r->ctx.cs, &b->working);
+	free(b->name);
+	phmap_remove(&r->brmap, &k);
+	last = --r->nbr;
+	if (i != last)
+	{
+		PHash		lk = name_key(r->br[last].name);
+
+		r->br[i] = r->br[last];
+		*phmap_find(&r->brmap, &lk) = i;
+		if (r->cur == last)
+			r->cur = i;
+	}
+	return VC_OK;
 }
 
 VcBranch *
@@ -804,6 +912,10 @@ vc_commit(VcRepo *r, const char *msg)
 	PHash		parents[2] = {b->head, b->merge_head};
 	PHash		h = keep_commit(r, &b->working, parents, b->merging ? 2 : 1, msg);
 
+	b = vc_head(r);
+	move_head(r, &parents[0], &h);
+	if (b->merging)
+		move_head(r, &parents[1], NULL);
 	b->head = h;
 	b->head_root = b->working;
 	b->merging = false;
@@ -820,6 +932,9 @@ vc_reset_hard(VcRepo *r, const PHash *commit)
 
 	if ((rc = reach_commit(r, commit, VC_WINDOW_ONLY, &c)) != VC_OK)
 		return rc;
+	move_head(r, &b->head, commit);
+	if (b->merging)
+		move_head(r, &b->merge_head, NULL);
 	b->head = *commit;
 	b->head_root = c.root;
 	b->merging = false;
@@ -858,6 +973,7 @@ vc_merge(VcRepo *r, const char *branch, VcMergeResult *res)
 		return rc;
 	if (phash_eq(&base, &ours))
 	{
+		move_head(r, &b->head, &theirs);
 		b->head = theirs;
 		b->head_root = ctheirs.root;
 		set_working(r, b, &ctheirs.root);
@@ -872,6 +988,7 @@ vc_merge(VcRepo *r, const char *branch, VcMergeResult *res)
 				   &res->conflicts, &res->nconflicts);
 	b->merging = true;
 	b->merge_head = theirs;
+	move_head(r, NULL, &theirs);
 	set_working(r, b, &merged);
 	if (res->nconflicts > 0)
 	{
@@ -973,10 +1090,9 @@ vc_log(VcRepo *r, const PHash *start, size_t max, unsigned flags,
 static ssize_t
 image_slot(VcRepo *r, const PHash *commit)
 {
-	for (size_t i = 0; i < r->nimg; i++)
-		if (phash_eq(&r->img_commit[i], commit))
-			return (ssize_t) i;
-	return -1;
+	uint64_t   *v = phmap_find(&r->imgmap, commit);
+
+	return v ? (ssize_t) *v : -1;
 }
 
 static void
@@ -987,9 +1103,14 @@ image_release(VcRepo *r, const PHash *commit)
 	if (i < 0)
 		return;
 	cs_unref_root(r->ctx.cs, &r->img_hash[i]);
+	phmap_remove(&r->imgmap, commit);
 	r->nimg--;
-	r->img_commit[i] = r->img_commit[r->nimg];
-	r->img_hash[i] = r->img_hash[r->nimg];
+	if ((size_t) i != r->nimg)
+	{
+		r->img_commit[i] = r->img_commit[r->nimg];
+		r->img_hash[i] = r->img_hash[r->nimg];
+		*phmap_find(&r->imgmap, &r->img_commit[i]) = (uint64_t) i;
+	}
 }
 
 int
@@ -1020,6 +1141,11 @@ vc_image_set(VcRepo *r, const PHash *commit, const PHash *image)
 		r->img_hash = px_realloc(r->img_hash, r->imgcap * sizeof(PHash));
 		r->img_commit[r->nimg] = *commit;
 		r->img_hash[r->nimg] = *image;
+		{
+			bool		created;
+
+			*phmap_ref(&r->imgmap, commit, &created) = r->nimg;
+		}
 		r->nimg++;
 	}
 	prolly_release_pins(&r->ctx);
@@ -1097,6 +1223,28 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	*seg_out = VC_NO_SEGMENT;
 	if (w->depth == 0)
 		return VC_ERR;			/* branch heads are always in the window */
+	if (r->track_depth == w->depth && w->npinned == 0)
+	{
+		/* incremental: only commits whose cover fell to zero can leave */
+		PHashMap	seen;
+		bool		created;
+
+		phmap_init(&seen);
+		for (size_t i = 0; i < r->npending; i++)
+		{
+			uint64_t   *c = phmap_find(&r->cover, &r->pending[i]);
+
+			phmap_ref(&seen, &r->pending[i], &created);
+			if (created && in_window(r, &r->pending[i]) && (c == NULL || *c == 0))
+			{
+				px_grow((void **) &members, &cap, n + 1, sizeof(PHash));
+				members[n++] = r->pending[i];
+			}
+		}
+		phmap_free(&seen);
+		r->npending = 0;
+		goto detach;
+	}
 	phmap_init(&win);
 	for (size_t i = 0; i < r->nbr && rc == VC_OK; i++)
 	{
@@ -1121,8 +1269,12 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 			members[n++] = r->loc.keys[i];
 		}
 	phmap_free(&win);
+detach:
 	if (n == 0)
+	{
+		free(members);
 		return VC_OK;
+	}
 
 	/* commit images are only for the window: severed commits let theirs go */
 	for (size_t i = 0; i < n; i++)
@@ -1139,6 +1291,87 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 		*phmap_find(&r->loc, &members[i]) = LOC_SEG_BASE + r->nsegs;
 	*seg_out = (uint32_t) r->nsegs++;
 	return VC_OK;
+}
+
+int
+vc_window_track(VcRepo *r, uint32_t depth)
+{
+	phmap_free(&r->cover);
+	phmap_init(&r->cover);
+	r->npending = 0;
+	r->track_depth = depth;
+	if (depth == 0)
+		return VC_OK;
+	for (size_t i = 0; i < r->nbr; i++)
+	{
+		cover_head(r, &r->br[i].head, +1);
+		if (r->br[i].merging)
+			cover_head(r, &r->br[i].merge_head, +1);
+	}
+	/* everything already in the window is a candidate once */
+	for (size_t i = 0; i < r->loc.cap; i++)
+		if (r->loc.used[i] && r->loc.vals[i] == LOC_WINDOW)
+			pending_push(r, &r->loc.keys[i]);
+	return VC_OK;
+}
+
+bool
+vc_window_verify(VcRepo *r)
+{
+	PHashMap	want,
+				pend;
+	bool		ok = true,
+				created;
+
+	if (r->track_depth == 0)
+		return true;
+	phmap_init(&want);
+	for (size_t i = 0; i < r->nbr; i++)
+	{
+		PHashMap	win;
+
+		phmap_init(&win);
+		window_add(r, &win, &r->br[i].head, r->track_depth);
+		if (r->br[i].merging)
+		{
+			for (size_t j = 0; j < win.cap; j++)
+				if (win.used[j])
+					(*phmap_ref(&want, &win.keys[j], &created))++;
+			phmap_free(&win);
+			phmap_init(&win);
+			window_add(r, &win, &r->br[i].merge_head, r->track_depth);
+		}
+		for (size_t j = 0; j < win.cap; j++)
+			if (win.used[j])
+				(*phmap_ref(&want, &win.keys[j], &created))++;
+		phmap_free(&win);
+	}
+	/* counts agree, in both directions */
+	for (size_t i = 0; i < want.cap && ok; i++)
+		if (want.used[i])
+		{
+			uint64_t   *c = phmap_find(&r->cover, &want.keys[i]);
+
+			ok = c && *c == want.vals[i];
+		}
+	for (size_t i = 0; i < r->cover.cap && ok; i++)
+		if (r->cover.used[i] && r->cover.vals[i] > 0)
+		{
+			uint64_t   *c = phmap_find(&want, &r->cover.keys[i]);
+
+			ok = c && *c == r->cover.vals[i];
+		}
+	/* every uncovered commit in the window is waiting to be severed */
+	phmap_init(&pend);
+	for (size_t i = 0; i < r->npending; i++)
+		phmap_ref(&pend, &r->pending[i], &created);
+	for (size_t i = 0; i < r->loc.cap && ok; i++)
+		if (r->loc.used[i] && r->loc.vals[i] == LOC_WINDOW &&
+			!phmap_find(&want, &r->loc.keys[i]))
+			ok = phmap_find(&pend, &r->loc.keys[i]) != NULL;
+	phmap_free(&pend);
+	phmap_free(&want);
+	return ok;
 }
 
 /* Commits of one segment that are not members: its boundary edges. */
@@ -1311,7 +1544,7 @@ vc_segment_attach(VcRepo *r, uint32_t id)
 		return VC_ERR;
 	/* the holds move back to the window's history */
 	for (size_t i = 0; i < seg->n; i++)
-		set_loc(r, &seg->commits[i], LOC_WINDOW);
+		enter_window(r, &seg->commits[i]);
 	seg->state = VC_SEG_ATTACHED;
 	seg->archive = NULL;
 	return VC_OK;
@@ -1704,7 +1937,7 @@ plan_adopt(VcRepo *dst, const Plan *p)
 	for (size_t i = 0; i < p->nsend; i++)
 	{
 		cs_ref_root(dst->ctx.cs, &p->send[i].h);
-		set_loc(dst, &p->send[i].h, LOC_WINDOW);
+		enter_window(dst, &p->send[i].h);
 	}
 	for (size_t i = 0; i < p->nbound; i++)
 	{
@@ -1739,6 +1972,7 @@ transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 static void
 move_branch(VcRepo *r, VcBranch *b, const PHash *head, const PHash *root)
 {
+	move_head(r, &b->head, head);
 	b->head = *head;
 	b->head_root = *root;
 	set_working(r, b, root);

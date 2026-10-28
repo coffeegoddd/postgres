@@ -40,5 +40,6 @@ extern void phmap_free(PHashMap *m);
 extern uint64_t *phmap_find(PHashMap *m, const PHash *k);
 /* Returns the slot for k, inserting it with value 0 if absent. */
 extern uint64_t *phmap_ref(PHashMap *m, const PHash *k, bool *created);
+extern bool phmap_remove(PHashMap *m, const PHash *k);
 
 #endif							/* PHASH_H */

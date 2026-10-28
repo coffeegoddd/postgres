@@ -5,3 +5,4 @@
 /test/test_remote
 /test/test_image
 /bench/winbench
+/bench/branchbench
