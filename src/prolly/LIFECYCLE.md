@@ -308,6 +308,45 @@ history (1.6 GB) in the archive.  Compaction copied 1.18 bytes per byte it
 gave back (1.5 s in all): random updates spread dead space through every
 file; grouping chunks by age would lower that.
 
+**Compared with Dolt's generational GC.**  Dolt (`go/store/nbs/generational_chunk_store.go`,
+`go/store/types/value_store.go`) keeps two chunk stores, an old and a new
+generation, each of immutable table files plus a manifest (new writes go
+through an append-only journal).  A collection traces from the roots:
+chunks reachable from branch, remote and internal refs (committed
+history) are copied into the old generation, chunks reachable only from
+other roots (working sets) into fresh new-generation files, and the rest
+of the new generation is dropped.  By default the old generation is never
+collected (chunks already in it are skipped), so committed history only
+accumulates; `dolt gc --full` traces and rewrites it too, at O(all live
+history).  The bet: garbage is recent churn and history is permanent.
+
+| | Dolt (generational, tracing) | Here (reference counts, compaction) |
+|---|---|---|
+| Finding garbage | Traces from the roots at each collection | Exact reference counts: garbage is known when its last hold goes |
+| Where garbage is expected | Recent churn; history is permanent | Committed history leaving the window, which Dolt's default collection never looks at |
+| Cost of a collection | O(live data in the generation collected); the old generation only with `--full`, O(all history) | O(live bytes in the files rewritten); no tracing, except rebuilding counts on open |
+| Reclaiming severed history | Only `--full` | Ordinary compaction |
+| Files | Immutable files, manifest swap | The same |
+| New writes | Append-only journal | Memory until a flush (the WAL covers them in the real system) |
+
+Dolt's default collection is cheap because it ignores history; the
+window makes dropping or offloading history routine, which under Dolt's
+scheme would need a full collection each time.
+
+Worth taking from it:
+
+- **Placement by age.**  Compaction here copied 1.18 bytes per byte given
+  back because random updates scatter dead space through every file.
+  Grouping chunks by age (say, the commit generation that first wrote
+  them) would make history leaving the window tend to free whole files,
+  with little or no copying: generational GC's real insight, that things
+  which die together should live together.  The window gives the
+  boundary.
+- **Archive compression.**  Dolt's archive format compresses old data with
+  shared dictionaries; it suits exported and archived segments.
+
+Neither changes the design; both are for the real implementation.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per
