@@ -37,9 +37,10 @@ bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -pthread
 
 # Rebuilding a schema, every index included, from the store (see bench/rebuild.c).
-bench/rebuild: bench/rebuild.c bench/pgoutput.c bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
-	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ bench/rebuild.c \
-		bench/pgoutput.c libprolly.a \
+REBUILD_SRCS = bench/rebuild.c bench/ws_pg.c bench/ws_codec.c bench/ws_logical.c bench/ws_stream.c \
+	bench/ws_diff.c bench/ws_merge.c bench/pgoutput.c
+bench/rebuild: $(REBUILD_SRCS) bench/ws.h bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $(REBUILD_SRCS) libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
 
 # Against the running server: every commit of the fixture must rebuild, and
@@ -47,6 +48,8 @@ bench/rebuild: bench/rebuild.c bench/pgoutput.c bench/pgoutput.h test/test_util.
 rebuild-check: bench/rebuild
 	./bench/rebuild
 	./bench/rebuild --stream
+	./bench/rebuild --ddl
+	./bench/rebuild --merge
 	for b in row sequence matview nohide; do \
 		if ./bench/rebuild --steps 1 --break $$b >/dev/null 2>&1; then \
 			echo "rebuild: --break $$b went unnoticed"; exit 1; \

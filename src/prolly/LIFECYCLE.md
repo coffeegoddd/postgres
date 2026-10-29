@@ -355,26 +355,37 @@ them from rows plus their definitions, so a commit must reproduce two
 things exactly: every row, and the whole schema.  Then every index Postgres
 builds from them must behave as the original did.
 
-**What a commit holds** (the logical working set, `bench/rebuild.c`, behind
-a `WorkingSetOps` so that another codec can replace it):
+**What a commit holds** (the logical working set, `bench/ws_logical.c` and
+`bench/ws_codec.c`, behind a `WorkingSetOps` so that another codec can
+replace it):
 
 | Root value entry | Schema chunk | Data |
 |---|---|---|
-| `~pre` | pg_dump's pre-data section of the schema: types, domains, collations, functions, tables, sequences, partitions, identity, defaults, validated checks | none |
-| `~post` | pg_dump's post-data section: indexes, PK/unique/exclusion/FK constraints, NOT VALID checks, triggers, policies, CLUSTER ON, statistics objects, the REFRESH of populated materialized views | none |
+| `~obj` | none | every object of the schema as pg_dump writes it, one entry each: (section, type, name) → its DDL.  Pre-data: types, domains, collations, functions, tables, sequences, partitions, identity, defaults, validated checks.  Post-data: indexes, constraints, NOT VALID checks, triggers, policies, CLUSTER ON, statistics objects, the REFRESH of populated materialized views |
 | `~seq` | none | sequence → (last_value, is_called) |
-| each table holding rows (leaf partitions included) | the codec layout: key column count, column list | COPY text rows keyed by the primary key's fields; without a primary key, the whole row → its count |
+| each table holding rows (leaf partitions included) | its layout: the primary key and every column by tag (name, type, default, stored or generated) | rows keyed by the primary key's values; the value holds the other non-NULL columns as (tag, bytes) cells; without a primary key, the row's cells → its count |
 
-Rows are stored as COPY text under fixed session settings (ISO dates, UTC,
-shortest exact floats, hex bytea), so they are portable across Postgres
-versions and keep NULL distinct from the string `\N`.  Generated columns
-(stored and virtual) are not stored, because Postgres computes them again.
-Extensions live outside the schema (the unit of version control), so every
-database has them installed before a rebuild.
+The first version kept the schema as two pg_dump sections and rows as
+positional COPY text.  Both were replaced so that diff and merge can work on
+the schema (see *Structured schema* below).
 
-**Rebuild** into an empty database (extensions only): run `~pre`, COPY every
-table, restore sequence positions, run `~post` (indexes are built here,
-constraints validated, materialized views refreshed), then VACUUM ANALYZE.
+Values are each type's output text under fixed session settings (ISO dates,
+UTC, shortest exact floats, hex bytea), so they are portable across
+Postgres versions.  NULLs are absent cells, so they cost nothing and stay
+distinct from the string `\N`.  Generated columns (stored and virtual) are
+not stored, because Postgres computes them again.  Extensions live outside
+the schema (the unit of version control), so every database has them
+installed before a rebuild.
+
+**Rebuild** into an empty database (extensions and the tag table only):
+1. run the pre-data objects, ordered by type, retrying any whose
+   dependencies aren't there yet until no more succeed;
+2. write the commit's column tags;
+3. COPY every table;
+4. restore sequence positions;
+5. run the post-data objects the same way (indexes are built here,
+   constraints validated, materialized views refreshed);
+6. VACUUM ANALYZE.
 
 **The test** (`make rebuild-check`, against the running server):
 
@@ -546,6 +557,155 @@ capture, and every commit rebuilds and passes every check.
   - ALTER TYPE on composite types nested in other types or in arrays;
   - DDL from extensions;
   - `publish_via_partition_root`.
+
+### Structured schema: column tags, diff and merge
+
+A schema stored as one pg_dump text can be rebuilt, but it can't be
+merged: any DDL on two branches conflicts.  And positional row text can't
+be read across a schema change.  Dolt versions the schema as structured
+data instead:
+- every column has a stable numeric **tag**, which survives renames;
+- merges, diffs and foreign keys match columns by tag;
+- indexes are stored as prolly trees of their own.
+
+Dolt still rewrites every row for `ADD COLUMN … DEFAULT`, `DROP COLUMN`, a
+reorder, a primary-key change, and a type change the stored bytes can't
+absorb (`ShouldRewriteTable`); only ADD COLUMN of a nullable column without
+a default is metadata only.  The prototype now does the same on Postgres's
+terms.
+
+**How:**
+- **Objects:** the schema is a map of objects, one per pg_dump entry,
+  keyed (section, type, name) → DDL.
+- **Tags:** every column has a tag, kept in a `prolly.tags` table in each
+  database.
+  - A tag is given when the column first appears, from the table name,
+    column name and type, so two branches adding the same column agree on
+    it (as Dolt's do).
+  - It survives renames and retypes, and a rebuild writes the commit's tags
+    back (`bench/prolly_tags.sql`).
+- **Layouts:** each table's layout lists the primary key and every column
+  by tag.
+- **Rows:** keyed by the primary key's values, with the other non-NULL
+  columns as (tag, bytes) cells sorted by tag.  So a rename, a nullable
+  `ADD COLUMN`, a retype that keeps the text, or dropping an all-NULL
+  column leaves every row byte-identical.
+- **Diff** (`bench/ws_diff.c`) reports:
+  - objects added, dropped and changed;
+  - columns added, dropped, renamed, retyped and with changed defaults, by
+    tag;
+  - rows inserted, deleted and updated.  A row counts as updated only if a
+    value in a column both sides have changed; rows whose bytes changed
+    only because of a schema change count as rewritten.
+- **Merge** (`bench/ws_merge.c`):
+  - **Objects** get a three-way merge by key.
+  - **CREATE TABLE** merges item by item: columns by tag, constraints by
+    name, the rest only if one side changed it.
+  - **Layouts** merge column by column.
+  - **Rows** merge by key; where both sides changed a row, they merge
+    column by column.  A keyless table merges as a multiset, adding theirs'
+    change in count to ours.
+  - **One-sided rows** move into the merged schema: dropped columns'
+    values are removed, and columns the other side added with a default get
+    it.
+  - **Sequences** keep the further position.
+  - **Conflicts** are typed: object, table-ddl, column, column-name, key,
+    table, row.
+- **Constraint violations** surface when the merged commit is restored,
+  which now collects problems instead of failing:
+  - an object that never applies is reported as unapplied;
+  - a row that breaks a CHECK or NOT NULL in the table's definition is
+    reported, the constraint is set aside, and the other rows still load.
+
+**DDL steps** (`bench/rebuild --ddl`, 5,000 keyed rows and 2,000 keyless).
+Each step's diff must contain its expected lines, and each commit must
+rebuild to itself:
+
+| Change | Row data | Diff |
+|---|---|---|
+| rename a column | same tree | column renamed; 0 rows |
+| ADD COLUMN, nullable, no default | same tree | column added |
+| ADD COLUMN … DEFAULT 7 | changed | column added; 0 updated, 5,000 rewritten |
+| retype int → bigint (same text) | same tree | column retyped |
+| retype bigint → numeric(10,2) | changed | column retyped; 5,000 updated |
+| drop an all-NULL column | same tree | column dropped |
+| drop a column with values | changed | column dropped; 0 updated, 5,000 rewritten |
+| CREATE INDEX | same tree | object added |
+| change rows | changed | +1 −10 ~10 |
+| drop a column and add it back | same tree | (same tag: same column) |
+| keyless: add nullable, rename | same tree | column added / renamed |
+| keyless: add with default | changed | 0 updated (rewritten) |
+| keyless: change rows | changed | +2 −20 |
+
+**Merge scenarios** (`bench/rebuild --merge`, 21 of them).  Each one:
+1. builds a base commit;
+2. makes theirs in a database rebuilt from the base, and ours in the
+   original;
+3. merges at the merge base;
+4. restores the result.
+
+Outcomes must be exactly those expected.  Each clean result must pass
+amcheck, answer its checks, and capture back to the merged root value.
+
+| Scenario | Outcome |
+|---|---|
+| different rows changed; theirs inserts | clean |
+| same row, different columns | clean (merged by column) |
+| same cell | conflict row acct 5 |
+| delete vs update | conflict row item 7 |
+| both add different columns (one with a default); ours inserts | clean; ours' new row gets theirs' default |
+| rename vs update of that column | clean |
+| both add the same column | clean (same tag) |
+| same column name, different types | conflict column-name |
+| both retype a column differently | conflict column |
+| drop vs update of that column | clean (the drop wins) |
+| both insert the same email | violation acct_email_key |
+| parent deleted vs child inserted | violation item_acct_fkey |
+| CHECK added vs violating update | violation score_small |
+| UNIQUE index vs duplicating update | violation acct_name |
+| same index name, different definitions | conflict object INDEX x |
+| keyless: both insert the same row; theirs deletes | clean, counts added |
+| both add an enum value | conflict object TYPE color |
+| rename vs a new index on the old name | unapplied INDEX acct_name_idx |
+| NOT NULL DEFAULT column vs ours' insert | clean; default filled |
+| sequence advanced on both | clean; further position kept |
+| both insert the next serial id | conflict row ticket 1 |
+
+No clean merge needed normalizing.  Rebuilt and captured again, each gave
+back exactly the merged root value, so the item-by-item CREATE TABLE merge
+reproduces pg_dump's text.  The earlier checks still all pass: the rebuild
+fixture, the streamed fixture (tags travel in the layout messages), and
+every `--break` case.
+
+**Findings:**
+
+- **Keyless rows need an additive merge.**  Both sides inserting the same
+  row makes the same new count on both, so a merge of values keeps one
+  insert.  The counts must add instead.  Scenario 16 caught it.
+- **Inline CHECKs make COPY all or nothing.**  One violating row emptied
+  the table, which then broke a foreign key as well.  Setting the violated
+  constraint aside and reloading reports only the real violation.  Scenario
+  13 caught it.
+- **Objects other than tables still name columns.**  An index or view a
+  branch creates on a column the other branch renamed won't apply
+  (scenario 18).  Dolt defines indexes over tags.  Here the merge would
+  have to rewrite such objects' column references from the tags, or store
+  their definitions by attribute.
+- **Per-cell tags cost space.**  60-bit tags take 9 bytes per cell: the
+  rebuild fixture's store grew from 55 to 75.5 MB (+37%).  The real format
+  should be positional within the layout, mapping each tag to a slot, with
+  trailing absent slots meaning NULL (as Dolt's tuples are), or use small
+  per-table column numbers.
+- **To decide:**
+  - a drop wins over a concurrent update of the dropped column (scenario
+    10), silently;
+  - a column dropped and added again with the same name and type gets the
+    same tag, so diffs treat it as the same column;
+  - a default filled into rows the other side wrote is evaluated once, so
+    a volatile default gives every such row one value;
+  - violations are reported rather than recorded with their rows, as
+    Dolt's `dolt_constraint_violations` does; that is the next piece for a
+    real merge.
 
 ## Evidence so far
 

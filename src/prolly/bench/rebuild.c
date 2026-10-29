@@ -28,47 +28,15 @@
  * a count, for tables without one), and sequence positions.  Indexes are
  * not stored: Postgres builds them from the rows and their definitions.
  */
-#define _DEFAULT_SOURCE
-#include <ctype.h>
-#include <inttypes.h>
 #include <getopt.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-#include <libpq-fe.h>
+#include "ws.h"
 
-#include "../test/test_util.h"
-#include "pgoutput.h"
-
-#ifndef PGBIN
-#define PGBIN "/home/dustin/cursor_src/pg-v2-build/inst/bin"
-#endif
-
-#define SCHEMA "rt"
 #define MAX_STEPS 64
 #define MAX_CHECKS 512
 #define MAX_INDEXES 1024
 
-/* Settings under which row text is written and read. */
-#define SESSION_SETTINGS \
-	"SET DateStyle = ISO; SET IntervalStyle = postgres; SET TimeZone = 'UTC'; " \
-	"SET extra_float_digits = 1; SET bytea_output = hex; SET search_path = ''"
-
-typedef struct Opts
-{
-	const char *conninfo;
-	const char *fixture;
-	const char *work;
-	const char *bindir;
-	const char *src_db;
-	const char *dst_db;
-	const char *brk;			/* a deliberate fault, to show the checks catch it */
-	int			steps;			/* 0: all */
-	bool		stream;			/* commits from the replication stream */
-	const char *stream_sql;
-} Opts;
-
-static Opts o = {
+Opts		o = {
 	"host=/tmp port=5499 user=postgres",
 	"bench/rebuild_fixture",
 	"/home/dustin/pgv2-bench/rebuild",
@@ -78,43 +46,10 @@ static Opts o = {
 	NULL,
 	0,
 	false,
-	"bench/rebuild_stream.sql",
+	"bench",
 };
 
-/*
- * Faults the checks must catch.  Each names a way a rebuild could go wrong:
- *	row			a table loses a row
- *	sequence	sequence positions are not restored
- *	matview		post-data is dumped schema-only, which drops the REFRESH of
- *				populated materialized views
- *	nohide		queries are planned with every index visible, so the plan
- *				may answer through some other index than the one named
- * and with --stream:
- *	cast		rows the event trigger sends are formatted with casts to text,
- *				which differ from output functions (bool, char(n), inet)
- *	isnull		they test NULL with IS NULL, true of a composite value whose
- *				fields are all NULL
- *	toast		unchanged TOASTed values are not taken from the current row
- *	noreemit	rows sent after a rewriting DDL statement are ignored
- *	noflush		the barrier is not flushed, so it waits in the WAL until
- *				something else flushes it (caught by the barrier's deadline)
- */
-static bool
-broken(const char *what)
-{
-	return o.brk && strcmp(o.brk, what) == 0;
-}
-
 static int	failures = 0;
-
-static void
-die(const char *fmt, const char *a)
-{
-	fprintf(stderr, "rebuild: ");
-	fprintf(stderr, fmt, a);
-	fprintf(stderr, "\n");
-	exit(1);
-}
 
 static void
 fail(const char *what, const char *detail)
@@ -122,1326 +57,6 @@ fail(const char *what, const char *detail)
 	failures++;
 	printf("FAIL %s%s%s\n", what, detail ? ": " : "", detail ? detail : "");
 }
-
-/* ------------------------------------------------------------ the server */
-
-static PGconn *
-pg_open(const char *db)
-{
-	char		ci[512];
-	PGconn	   *c;
-	PGresult   *res;
-
-	snprintf(ci, sizeof(ci), "%s dbname=%s", o.conninfo, db);
-	c = PQconnectdb(ci);
-	if (PQstatus(c) != CONNECTION_OK)
-		die("connect: %s", PQerrorMessage(c));
-	PQsetNoticeProcessor(c, NULL, NULL);
-	res = PQexec(c, SESSION_SETTINGS);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		die("settings: %s", PQerrorMessage(c));
-	PQclear(res);
-	return c;
-}
-
-static PGresult *
-pg_exec(PGconn *c, const char *sql)
-{
-	PGresult   *res = PQexec(c, sql);
-	ExecStatusType st = PQresultStatus(res);
-
-	if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
-	{
-		fprintf(stderr, "rebuild: %s\n", sql);
-		die("%s", PQerrorMessage(c));
-	}
-	return res;
-}
-
-static void
-pg_cmd(PGconn *c, const char *sql)
-{
-	PQclear(pg_exec(c, sql));
-}
-
-/* Runs a command line; true when it exits 0. */
-static bool
-run(const char *cmd)
-{
-	int			rc = system(cmd);
-
-	return rc == 0;
-}
-
-static void
-psql_file(const char *db, const char *file)
-{
-	char		cmd[2048];
-
-	snprintf(cmd, sizeof(cmd),
-			 "%s/psql -X -q -v ON_ERROR_STOP=1 -d '%s dbname=%s' -f '%s' >/dev/null",
-			 o.bindir, o.conninfo, db, file);
-	if (!run(cmd))
-		die("psql failed on %s", file);
-}
-
-static void
-fresh_database(const char *db)
-{
-	PGconn	   *c = pg_open("postgres");
-	char		sql[256],
-				file[1024];
-
-	snprintf(sql, sizeof(sql), "DROP DATABASE IF EXISTS %s", db);
-	pg_cmd(c, sql);
-	snprintf(sql, sizeof(sql), "CREATE DATABASE %s TEMPLATE template0", db);
-	pg_cmd(c, sql);
-	PQfinish(c);
-	snprintf(file, sizeof(file), "%s/setup.sql", o.fixture);
-	psql_file(db, file);
-}
-
-/* Reads a command's whole output. */
-static char *
-slurp_cmd(const char *cmd, size_t *len)
-{
-	FILE	   *f = popen(cmd, "r");
-	Buf			b = {0};
-	char		tmp[65536];
-	size_t		n;
-
-	if (f == NULL)
-		die("cannot run %s", cmd);
-	while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0)
-		buf_append(&b, tmp, n);
-	if (pclose(f) != 0)
-		die("failed: %s", cmd);
-	buf_append(&b, "", 1);
-	*len = b.len - 1;
-	return (char *) b.data;
-}
-
-static char *
-slurp_file(const char *path, size_t *len)
-{
-	FILE	   *f = fopen(path, "r");
-	Buf			b = {0};
-	char		tmp[65536];
-	size_t		n;
-
-	if (f == NULL)
-		die("cannot read %s", path);
-	while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0)
-		buf_append(&b, tmp, n);
-	fclose(f);
-	buf_append(&b, "", 1);
-	*len = b.len - 1;
-	return (char *) b.data;
-}
-
-static void
-write_file(const char *path, const void *data, size_t len)
-{
-	FILE	   *f = fopen(path, "w");
-
-	if (f == NULL || fwrite(data, 1, len, f) != len || fclose(f) != 0)
-		die("cannot write %s", path);
-}
-
-/*
- * One pg_dump section of the schema, without the per-dump random
- * \restrict key lines, so equal schemas give equal text.  Post-data is
- * dumped with data on: that section holds no rows, but it is where a
- * populated materialized view's REFRESH lives, which schema-only drops.
- */
-/* When set, dumps read the database as of this exported snapshot. */
-static char dump_snapshot[64];
-
-static char *
-dump_section(const char *db, const char *section, size_t *len)
-{
-	char		cmd[2048],
-				snap[96] = "";
-	char	   *raw,
-			   *out,
-			   *p;
-	size_t		rawlen,
-				n = 0;
-
-	if (dump_snapshot[0])
-		snprintf(snap, sizeof(snap), "--snapshot=%s", dump_snapshot);
-	snprintf(cmd, sizeof(cmd),
-			 "%s/pg_dump %s %s --section=%s -n %s -d '%s dbname=%s'",
-			 o.bindir, snap,
-			 strcmp(section, "pre-data") == 0 || broken("matview") ? "--schema-only" : "",
-			 section, SCHEMA, o.conninfo, db);
-	raw = slurp_cmd(cmd, &rawlen);
-	out = px_malloc(rawlen + 1);
-	for (p = raw; *p;)
-	{
-		char	   *nl = strchr(p, '\n');
-		size_t		ll = nl ? (size_t) (nl - p + 1) : strlen(p);
-
-		if (strncmp(p, "\\restrict ", 10) != 0 && strncmp(p, "\\unrestrict ", 12) != 0)
-		{
-			memcpy(out + n, p, ll);
-			n += ll;
-		}
-		p += ll;
-	}
-	out[n] = '\0';
-	free(raw);
-	*len = n;
-	return out;
-}
-
-/* ------------------------------------------------- working set <-> prolly */
-
-/*
- * How a schema's working set becomes a root value and back.  capture reads
- * the schema in a database into a root value; restore builds it, from the
- * root value alone, into a database holding nothing but the extensions.
- */
-typedef struct WorkingSetOps
-{
-	const char *name;
-	PHash		(*capture) (ProllyCtx *ctx, const char *db);
-	void		(*restore) (ProllyCtx *ctx, const PHash *rv, const char *db);
-} WorkingSetOps;
-
-/*
- * The logical working set.  Entries of the root value:
- *	~pre, ~post		pg_dump's pre-data and post-data sections, as the schema
- *	~seq			sequence name -> "last_value \t is_called"
- *	<relation>		one per table holding rows (leaf partitions included);
- *					its schema is the codec layout, its data the rows
- * The codec layout: "rel <quoted name>\nkey <n>\ncols <m>\nlist <columns>\n".
- * Rows are COPY text with the key columns first: with a primary key the key
- * is the first n fields and the value the rest; without one (n = 0) the
- * key is the whole row and the value how many times it occurs.  Stored and
- * virtual generated columns are not kept; Postgres computes them again.
- */
-
-typedef struct Row
-{
-	char	   *line;
-	size_t		len;
-	size_t		klen;			/* key bytes; the value starts after a tab */
-} Row;
-
-static int
-row_cmp(const void *a, const void *b)
-{
-	const Row  *x = a,
-			   *y = b;
-
-	return key_cmp((const uint8_t *) x->line, x->klen, (const uint8_t *) y->line, y->klen);
-}
-
-/* The byte length of the first n tab-separated fields of a COPY text line. */
-static size_t
-fields_len(const char *line, size_t len, int n)
-{
-	for (size_t i = 0; i < len; i++)
-		if (line[i] == '\t' && --n == 0)
-			return i;
-	return len;
-}
-
-/* A table's row map from its rows as COPY text lines (taken over and freed). */
-static PHash
-rows_build(ProllyCtx *ctx, Row *rows, size_t n, int nkey, const char *rel)
-{
-	ProllyKV   *kvs;
-	char	   *counts;
-	size_t		nkv = 0;
-	PHash		out;
-
-	qsort(rows, n, sizeof(Row), row_cmp);
-	kvs = px_malloc((n ? n : 1) * sizeof(ProllyKV));
-	counts = px_malloc((n ? n : 1) * 24);
-	for (size_t i = 0; i < n;)
-	{
-		size_t		j = i + 1;
-
-		if (nkey == 0)
-			while (j < n && row_cmp(&rows[i], &rows[j]) == 0)
-				j++;
-		else if (j < n && row_cmp(&rows[i], &rows[j]) == 0)
-			die("duplicate key in %s", rel);
-		kvs[nkv].key = (const uint8_t *) rows[i].line;
-		kvs[nkv].klen = rows[i].klen;
-		if (nkey == 0)
-		{
-			char	   *cnt = counts + nkv * 24;
-
-			kvs[nkv].vlen = (size_t) sprintf(cnt, "%zu", j - i);
-			kvs[nkv].val = (const uint8_t *) cnt;
-		}
-		else
-		{
-			size_t		vs = rows[i].klen < rows[i].len ? rows[i].klen + 1 : rows[i].len;
-
-			kvs[nkv].val = (const uint8_t *) rows[i].line + vs;
-			kvs[nkv].vlen = rows[i].len - vs;
-		}
-		nkv++;
-		i = j;
-	}
-	out = t_build(ctx, kvs, nkv);
-	for (size_t i = 0; i < n; i++)
-		free(rows[i].line);
-	free(rows);
-	free(kvs);
-	free(counts);
-	return out;
-}
-
-static void
-row_add(Row **rows, size_t *n, size_t *cap, const char *line, size_t len, int nkey)
-{
-	px_grow((void **) rows, cap, *n + 1, sizeof(Row));
-	(*rows)[*n].len = len;
-	(*rows)[*n].line = px_memdup(line, len ? len : 1);
-	(*rows)[*n].klen = nkey ? fields_len(line, len, nkey) : len;
-	(*n)++;
-}
-
-static PHash
-capture_rows(ProllyCtx *ctx, PGconn *c, const char *rel, const char *list, int nkey)
-{
-	char	   *sql = px_malloc(strlen(list) + strlen(rel) + 128);
-	PGresult   *res;
-	Row		   *rows = NULL;
-	size_t		n = 0,
-				cap = 0;
-	char	   *line;
-	int			len;
-
-	sprintf(sql, "COPY (SELECT %s FROM ONLY %s.%s) TO STDOUT", list, SCHEMA, rel);
-	res = PQexec(c, sql);
-	if (PQresultStatus(res) != PGRES_COPY_OUT)
-		die("copy out: %s", PQerrorMessage(c));
-	PQclear(res);
-	while ((len = PQgetCopyData(c, &line, 0)) > 0)
-	{
-		row_add(&rows, &n, &cap, line, (size_t) len - 1, nkey);	/* drop the newline */
-		PQfreemem(line);
-	}
-	res = PQgetResult(c);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		die("copy out: %s", PQerrorMessage(c));
-	PQclear(res);
-	free(sql);
-	return rows_build(ctx, rows, n, nkey, rel);
-}
-
-static PHash
-capture_sequences(ProllyCtx *ctx, PGconn *c)
-{
-	PGresult   *res = pg_exec(c,
-							  "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-							  "WHERE n.nspname = '" SCHEMA "' AND c.relkind = 'S' ORDER BY c.relname COLLATE \"C\"");
-	int			n = PQntuples(res);
-	ProllyKV   *kvs = px_malloc((n ? n : 1) * sizeof(ProllyKV));
-	char	  **vals = px_malloc((n ? n : 1) * sizeof(char *));
-	PHash		out;
-
-	for (int i = 0; i < n; i++)
-	{
-		const char *name = PQgetvalue(res, i, 0);
-		PGresult   *r3;
-		char		sql[512];
-
-		snprintf(sql, sizeof(sql), "SELECT last_value, is_called FROM %s.\"%s\"", SCHEMA, name);
-		r3 = pg_exec(c, sql);
-		vals[i] = px_malloc(64);
-		snprintf(vals[i], 64, "%s\t%s", PQgetvalue(r3, 0, 0), PQgetvalue(r3, 0, 1));
-		PQclear(r3);
-		kvs[i].key = (const uint8_t *) name;
-		kvs[i].klen = strlen(name);
-		kvs[i].val = (const uint8_t *) vals[i];
-		kvs[i].vlen = strlen(vals[i]);
-	}
-	out = t_build(ctx, kvs, (size_t) n);
-	for (int i = 0; i < n; i++)
-		free(vals[i]);
-	free(vals);
-	free(kvs);
-	PQclear(res);
-	return out;
-}
-
-static PHash
-put_table(ProllyCtx *ctx, PHash rv, const char *name, const char *schema, size_t slen,
-		  const PHash *data)
-{
-	CHECK(vc_table_create(ctx, &rv, name, schema, slen, &rv) == 0);
-	if (data)
-		CHECK(vc_table_set_data(ctx, &rv, name, data, &rv) == 0);
-	return rv;
-}
-
-/*
- * Every table holding rows in the schema, with its codec layout:
- *	oid, name, persistence, layout, key count, quoted name, column list,
- *	and an SQL expression giving a row's COPY text (for the event trigger).
- * Key columns come first (the primary key's, in its order), then the rest
- * by attribute number; "order" gives each layout column's position among
- * the table's columns by attribute number, which is the order a
- * replication stream sends them in.  The row expression formats each value
- * with its type's output function (as COPY and the stream do), not a cast
- * to text: casts differ for some types (bool, char(n), inet).  The capture and the stream's event
- * trigger both run this query, so they agree on layouts byte for byte.
- */
-#define LAYOUT_SQL \
-	"WITH rel AS (SELECT c.oid, c.relname, c.relpersistence FROM pg_class c " \
-	"  JOIN pg_namespace n ON n.oid = c.relnamespace " \
-	"  WHERE n.nspname = '" SCHEMA "' AND c.relkind = 'r'), " \
-	"pk AS (SELECT i.indrelid, k.attnum, k.ord FROM pg_index i, " \
-	"  unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) " \
-	"  WHERE i.indisprimary AND k.ord <= i.indnkeyatts), " \
-	"col AS (SELECT r.oid, a.attname, a.attnum, p.ord, " \
-	"    rank() OVER (PARTITION BY r.oid ORDER BY a.attnum) - 1 AS pos FROM rel r " \
-	"  JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 " \
-	"    AND NOT a.attisdropped AND a.attgenerated = '' " \
-	"  LEFT JOIN pk p ON p.indrelid = r.oid AND p.attnum = a.attnum), " \
-	"lay AS (SELECT r.oid, r.relname, r.relpersistence, " \
-	"  (SELECT count(*) FROM col WHERE col.oid = r.oid AND ord IS NOT NULL) AS nkey, " \
-	"  (SELECT count(*) FROM col WHERE col.oid = r.oid) AS ncols, " \
-	"  (SELECT string_agg(quote_ident(attname), ', ' ORDER BY ord NULLS LAST, attnum) " \
-	"     FROM col WHERE col.oid = r.oid) AS list, " \
-	"  (SELECT string_agg(pos::text, ',' ORDER BY ord NULLS LAST, attnum) " \
-	"     FROM col WHERE col.oid = r.oid) AS ord, " \
-	"  (SELECT string_agg(format('prolly.esc(num_nulls(%I) > 0, format(''%%s'', %I))', attname, attname), " \
-	"     $$ || E'\\t' || $$ " \
-	"     ORDER BY ord NULLS LAST, attnum) FROM col WHERE col.oid = r.oid) AS rowexpr " \
-	"  FROM rel r) " \
-	"SELECT oid, relname, relpersistence, " \
-	"  format(E'rel %s\\nkey %s\\ncols %s\\nlist %s\\norder %s\\n', quote_ident(relname), " \
-	"    nkey, ncols, coalesce(list, ''), coalesce(ord, '')) AS layout, " \
-	"  nkey, quote_ident(relname) AS quoted, coalesce(list, '') AS list, rowexpr " \
-	"FROM lay ORDER BY relname COLLATE \"C\""
-
-/* The definitions (~pre, ~post) and sequence positions (~seq). */
-static PHash
-capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
-{
-	size_t		len;
-	char	   *ddl;
-	PHash		seq;
-
-	ddl = dump_section(db, "pre-data", &len);
-	rv = put_table(ctx, rv, "~pre", ddl, len, NULL);
-	free(ddl);
-	ddl = dump_section(db, "post-data", &len);
-	rv = put_table(ctx, rv, "~post", ddl, len, NULL);
-	free(ddl);
-	seq = capture_sequences(ctx, c);
-	return put_table(ctx, rv, "~seq", "", 0, &seq);
-}
-
-static PHash
-logical_capture(ProllyCtx *ctx, const char *db)
-{
-	PGconn	   *c = pg_open(db);
-	PHash		rv = capture_defs(ctx, vc_root_empty(ctx), c, db);
-	PGresult   *res = pg_exec(c, LAYOUT_SQL);
-
-	for (int i = 0; i < PQntuples(res); i++)
-	{
-		const char *name = PQgetvalue(res, i, 1),
-				   *layout = PQgetvalue(res, i, 3);
-		PHash		data = capture_rows(ctx, c, PQgetvalue(res, i, 5), PQgetvalue(res, i, 6),
-										atoi(PQgetvalue(res, i, 4)));
-
-		rv = put_table(ctx, rv, name, layout, strlen(layout), &data);
-	}
-	PQclear(res);
-	PQfinish(c);
-	return rv;
-}
-
-typedef struct TableList
-{
-	char	  **names;
-	VcTable    *t;
-	size_t		n,
-				cap,
-				tcap;
-} TableList;
-
-static void
-table_list_fn(void *arg, const VcTableChange *ch)
-{
-	TableList  *l = arg;
-
-	if (!ch->has_to)
-		return;
-	px_grow((void **) &l->names, &l->cap, l->n + 1, sizeof(char *));
-	px_grow((void **) &l->t, &l->tcap, l->n + 1, sizeof(VcTable));
-	l->names[l->n] = px_malloc(ch->nlen + 1);
-	memcpy(l->names[l->n], ch->name, ch->nlen);
-	l->names[l->n][ch->nlen] = '\0';
-	l->t[l->n++] = ch->to;
-}
-
-static void
-table_list(ProllyCtx *ctx, const PHash *rv, TableList *l)
-{
-	PHash		empty = vc_root_empty(ctx);
-
-	memset(l, 0, sizeof(*l));
-	vc_diff_tables(ctx, &empty, rv, table_list_fn, l);
-}
-
-static void
-table_list_free(TableList *l)
-{
-	for (size_t i = 0; i < l->n; i++)
-		free(l->names[i]);
-	free(l->names);
-	free(l->t);
-}
-
-/* The schema chunk's bytes as a NUL-terminated string. */
-static char *
-schema_text(ProllyCtx *ctx, const PHash *h, size_t *len)
-{
-	const uint8_t *s = vc_schema_get(ctx, h, len);
-	char	   *out;
-
-	CHECK(s != NULL);
-	out = px_malloc(*len + 1);
-	memcpy(out, s, *len);
-	out[*len] = '\0';
-	return out;
-}
-
-static void
-restore_ddl(ProllyCtx *ctx, const PHash *schema, const char *db, const char *what)
-{
-	char		path[1024];
-	size_t		len;
-	char	   *ddl = schema_text(ctx, schema, &len);
-
-	snprintf(path, sizeof(path), "%s/%s.sql", o.work, what);
-	write_file(path, ddl, len);
-	psql_file(db, path);
-	free(ddl);
-}
-
-static void
-restore_rows(ProllyCtx *ctx, PGconn *c, const VcTable *t)
-{
-	size_t		slen;
-	char	   *layout = schema_text(ctx, &t->schema, &slen),
-			   *rel = layout + 4,
-			   *p,
-			   *list;
-	int			nkey,
-				ncols;
-	char	   *sql;
-	PGresult   *res;
-	ProllyIter *it;
-	const uint8_t *k,
-			   *v;
-	size_t		kl,
-				vl;
-	Buf			line = {0};
-
-	p = strchr(rel, '\n');
-	*p++ = '\0';
-	CHECK(sscanf(p, "key %d\ncols %d\n", &nkey, &ncols) == 2);
-	list = strstr(p, "list ") + 5;
-	*strchr(list, '\n') = '\0';
-	sql = px_malloc(strlen(rel) + strlen(list) + 64);
-	sprintf(sql, "COPY %s.%s (%s) FROM STDIN", SCHEMA, rel, list);
-	res = PQexec(c, sql);
-	if (PQresultStatus(res) != PGRES_COPY_IN)
-		die("copy in: %s", PQerrorMessage(c));
-	PQclear(res);
-	it = t_iter(ctx, &t->data, NULL, 0);
-	if (broken("row") && strcmp(rel, "kinds") == 0)
-		t_next(it, &k, &kl, &v, &vl);
-	while (t_next(it, &k, &kl, &v, &vl))
-	{
-		long		times = 1;
-
-		line.len = 0;
-		buf_append(&line, k, kl);
-		if (nkey == 0)
-		{
-			char		cnt[24];
-
-			CHECK(vl < sizeof(cnt));
-			memcpy(cnt, v, vl);
-			cnt[vl] = '\0';
-			times = atol(cnt);
-		}
-		else if (ncols > nkey)
-		{
-			buf_append(&line, "\t", 1);
-			buf_append(&line, v, vl);
-		}
-		buf_append(&line, "\n", 1);
-		for (long i = 0; i < times; i++)
-			if (PQputCopyData(c, (const char *) line.data, (int) line.len) != 1)
-				die("copy in: %s", PQerrorMessage(c));
-	}
-	prolly_iter_close(it);
-	if (PQputCopyEnd(c, NULL) != 1)
-		die("copy in: %s", PQerrorMessage(c));
-	res = PQgetResult(c);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		die("copy in: %s", PQerrorMessage(c));
-	PQclear(res);
-	free(line.data);
-	free(sql);
-	free(layout);
-}
-
-static void
-restore_sequences(ProllyCtx *ctx, PGconn *c, const PHash *data)
-{
-	ProllyIter *it = t_iter(ctx, data, NULL, 0);
-	const uint8_t *k,
-			   *v;
-	size_t		kl,
-				vl;
-
-	while (t_next(it, &k, &kl, &v, &vl))
-	{
-		char		name[256],
-					val[64],
-				   *tab;
-		const char *params[3];
-		PGresult   *res;
-
-		CHECK(kl < sizeof(name) && vl < sizeof(val));
-		memcpy(name, k, kl);
-		name[kl] = '\0';
-		memcpy(val, v, vl);
-		val[vl] = '\0';
-		tab = strchr(val, '\t');
-		*tab++ = '\0';
-		params[0] = name;
-		params[1] = val;
-		params[2] = tab;
-		res = PQexecParams(c, "SELECT setval(format('" SCHEMA ".%I', $1::text)::regclass, "
-						   "$2::int8, $3::bool)", 3, NULL, params, NULL, NULL, 0);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			die("setval: %s", PQerrorMessage(c));
-		PQclear(res);
-	}
-	prolly_iter_close(it);
-}
-
-static void
-logical_restore(ProllyCtx *ctx, const PHash *rv, const char *db)
-{
-	TableList	l;
-	PGconn	   *c;
-	VcTable		t;
-
-	table_list(ctx, rv, &l);
-	CHECK(vc_table_get(ctx, rv, "~pre", &t));
-	restore_ddl(ctx, &t.schema, db, "pre");
-	c = pg_open(db);
-	for (size_t i = 0; i < l.n; i++)
-		if (l.names[i][0] != '~')
-			restore_rows(ctx, c, &l.t[i]);
-	CHECK(vc_table_get(ctx, rv, "~seq", &t));
-	if (!broken("sequence"))
-		restore_sequences(ctx, c, &t.data);
-	PQfinish(c);
-	CHECK(vc_table_get(ctx, rv, "~post", &t));
-	restore_ddl(ctx, &t.schema, db, "post");
-	table_list_free(&l);
-}
-
-static const WorkingSetOps logical_ops = {"logical", logical_capture, logical_restore};
-
-/* ----------------------------------------------- the streamed working set */
-
-/*
- * The working set as the real lifecycle sees it: rows from a pgoutput
- * stream, DDL from the event trigger's messages in that stream (see
- * rebuild_stream.sql), and at each Dolt commit a barrier.  The commit takes
- * the DDL lock, exports a snapshot and writes the barrier, then lets DDL go;
- * the stream is applied up to the barrier, and the definitions, sequence
- * positions and unlogged tables (which the WAL does not carry) are read
- * at the snapshot.  The root value must equal a fresh capture's.
- */
-
-#define STREAM_SLOT "prolly_rt"
-#define STREAM_PUB "prolly_rt"
-#define DDL_LOCK "4242"
-#define PEND_MAX 200000			/* pending edits applied beyond this */
-#define BARRIER_DEADLINE 5.0	/* seconds; the fixture's steps take well under 1 */
-
-typedef struct PendEnt
-{
-	size_t		koff,
-				klen,
-				voff,
-				vlen;
-	bool		del;
-} PendEnt;
-
-typedef struct STable
-{
-	uint32_t	oid;
-	char	   *name;
-	char	   *layout;
-	char		persist;
-	int			nkey,
-				ncols;
-	int		   *order;			/* layout position -> stream column */
-	char	   *quoted;
-	char	   *list;
-	PHash		data;
-	bool		live;
-	/* Edits not yet applied to data; the last edit of a key wins. */
-	Buf			arena;
-	PendEnt    *pe;
-	size_t		npe,
-				pecap;
-	size_t	   *slot;			/* pe index + 1, by key hash */
-	size_t		scap;
-} STable;
-
-typedef struct Stream
-{
-	ProllyCtx  *ctx;
-	PgoStream  *pgo;
-	STable	   *t;
-	size_t		n,
-				cap;
-	char		token[32];
-	bool		stop;
-	uint64_t	barrier_lsn;
-	uint64_t	changes,
-				ddl_msgs,
-				rows_msgs,
-				rows_reemitted,
-				toast_filled;
-	double		wait_s,			/* reading the stream to the barrier */
-				defs_s;			/* definitions and sequences at the snapshot */
-} Stream;
-
-static Stream stream;
-
-static STable *
-st_find(uint32_t oid)
-{
-	for (size_t i = 0; i < stream.n; i++)
-		if (stream.t[i].oid == oid)
-			return &stream.t[i];
-	return NULL;
-}
-
-static uint64_t
-bytes_hash(const uint8_t *k, size_t n)
-{
-	uint64_t	h = 1469598103934665603ULL;
-
-	for (size_t i = 0; i < n; i++)
-		h = (h ^ k[i]) * 1099511628211ULL;
-	return h;
-}
-
-static PendEnt *
-pend_find(STable *t, const uint8_t *k, size_t kl, size_t **slotp)
-{
-	if (t->scap == 0)
-		return NULL;
-	for (size_t i = bytes_hash(k, kl) & (t->scap - 1);; i = (i + 1) & (t->scap - 1))
-	{
-		PendEnt    *e;
-
-		if (t->slot[i] == 0)
-		{
-			if (slotp)
-				*slotp = &t->slot[i];
-			return NULL;
-		}
-		e = &t->pe[t->slot[i] - 1];
-		if (bytes_eq(t->arena.data + e->koff, e->klen, k, kl))
-		{
-			if (slotp)
-				*slotp = &t->slot[i];
-			return e;
-		}
-	}
-}
-
-static void
-pend_rehash(STable *t)
-{
-	size_t		cap = t->scap ? t->scap * 2 : 1024;
-
-	free(t->slot);
-	t->slot = calloc(cap, sizeof(size_t));
-	if (t->slot == NULL)
-		abort();
-	t->scap = cap;
-	for (size_t j = 0; j < t->npe; j++)
-	{
-		size_t	   *sp;
-		PendEnt    *e = &t->pe[j];
-
-		pend_find(t, t->arena.data + e->koff, e->klen, &sp);
-		*sp = j + 1;
-	}
-}
-
-static void st_flush(STable *t);
-
-static void
-pend_put(STable *t, const void *k, size_t kl, const void *v, size_t vl, bool del)
-{
-	PendEnt    *e;
-	size_t	   *sp;
-
-	if (t->npe >= PEND_MAX)
-		st_flush(t);
-	if ((t->npe + 1) * 2 > t->scap)
-		pend_rehash(t);
-	px_grow((void **) &t->pe, &t->pecap, t->npe + 1, sizeof(PendEnt));
-	e = &t->pe[t->npe];
-	e->koff = t->arena.len;
-	e->klen = kl;
-	buf_append(&t->arena, k, kl);
-	e->voff = t->arena.len;
-	e->vlen = vl;
-	buf_append(&t->arena, v, vl);
-	e->del = del;
-	pend_find(t, k, kl, &sp);	/* a key edited again overwrites its slot */
-	*sp = ++t->npe;
-}
-
-static void
-pend_clear(STable *t)
-{
-	t->npe = 0;
-	t->arena.len = 0;
-	if (t->slot)
-		memset(t->slot, 0, t->scap * sizeof(size_t));
-}
-
-static void
-st_flush(STable *t)
-{
-	ProllyEdit *ed;
-
-	if (t->npe == 0)
-		return;
-	ed = px_malloc(t->npe * sizeof(ProllyEdit));
-	for (size_t i = 0; i < t->npe; i++)
-	{
-		ed[i].key = t->arena.data + t->pe[i].koff;
-		ed[i].klen = t->pe[i].klen;
-		ed[i].val = t->arena.data + t->pe[i].voff;
-		ed[i].vlen = t->pe[i].vlen;
-		ed[i].del = t->pe[i].del;
-	}
-	t->data = t_apply(stream.ctx, &t->data, ed, t->npe);
-	free(ed);
-	pend_clear(t);
-}
-
-static void
-st_flush_all(void)
-{
-	for (size_t i = 0; i < stream.n; i++)
-		st_flush(&stream.t[i]);
-}
-
-/* A key's current value (pending edits first), copied into out. */
-static bool
-st_get(STable *t, const uint8_t *k, size_t kl, Buf *out)
-{
-	PendEnt    *e = pend_find(t, k, kl, NULL);
-	const uint8_t *v;
-	size_t		vl;
-
-	out->len = 0;
-	if (e)
-	{
-		if (e->del)
-			return false;
-		buf_append(out, t->arena.data + e->voff, e->vlen);
-		return true;
-	}
-	if (!t_get(stream.ctx, &t->data, k, kl, &v, &vl))
-		return false;
-	buf_append(out, v, vl);
-	return true;
-}
-
-/* A value as COPY text writes it. */
-static void
-copy_escape(Buf *b, const char *v, int len)
-{
-	for (int i = 0; i < len; i++)
-	{
-		char		c = v[i],
-					e = 0;
-
-		switch (c)
-		{
-			case '\\': e = '\\'; break;
-			case '\n': e = 'n'; break;
-			case '\r': e = 'r'; break;
-			case '\t': e = 't'; break;
-			case '\b': e = 'b'; break;
-			case '\f': e = 'f'; break;
-			case '\v': e = 'v'; break;
-		}
-		if (e)
-		{
-			char		pair[2] = {'\\', e};
-
-			buf_append(b, pair, 2);
-		}
-		else
-			buf_append(b, &c, 1);
-	}
-}
-
-/* The f-th tab-separated field of a line. */
-static bool
-field_of(const uint8_t *line, size_t len, int f, const uint8_t **out, size_t *olen)
-{
-	size_t		start = 0;
-
-	for (size_t i = 0; i <= len; i++)
-		if (i == len || line[i] == '\t')
-		{
-			if (f-- == 0)
-			{
-				*out = line + start;
-				*olen = i - start;
-				return true;
-			}
-			start = i + 1;
-		}
-	return false;
-}
-
-/*
- * Layout positions [from, to) of a tuple as COPY text fields.  A value the
- * stream left out (unchanged TOAST) comes from prev, a tuple of the same
- * row, or else from cur, the row's current value (its non-key fields).
- */
-static void
-st_fields(STable *t, const PgoTuple *tup, int from, int to, const PgoTuple *prev,
-		  const Buf *cur, Buf *out)
-{
-	out->len = 0;
-	for (int p = from; p < to; p++)
-	{
-		int			col = t->order[p];
-		char		k = tup->kind[col];
-
-		if (p > from)
-			buf_append(out, "\t", 1);
-		if (k == PGO_UNCHANGED && prev && prev->kind[col] == PGO_TEXT)
-		{
-			copy_escape(out, prev->val[col], prev->len[col]);
-			stream.toast_filled++;
-		}
-		else if (k == PGO_UNCHANGED && broken("toast"))
-			buf_append(out, "\\N", 2);
-		else if (k == PGO_UNCHANGED)
-		{
-			const uint8_t *f;
-			size_t		fl;
-
-			if (cur == NULL || p < t->nkey || !field_of(cur->data, cur->len, p - t->nkey, &f, &fl))
-				die("an unchanged value in %s with no current row to take it from", t->name);
-			buf_append(out, f, fl);
-			stream.toast_filled++;
-		}
-		else if (k == PGO_NULL)
-			buf_append(out, "\\N", 2);
-		else
-			copy_escape(out, tup->val[col], tup->len[col]);
-	}
-}
-
-/* Adds delta to a keyless row's count. */
-static void
-st_count(STable *t, const Buf *row, long delta)
-{
-	Buf			cur = {0};
-	long		n = 0;
-	char		cnt[24];
-	int			cl;
-
-	if (st_get(t, row->data, row->len, &cur))
-	{
-		CHECK(cur.len < sizeof(cnt));
-		memcpy(cnt, cur.data, cur.len);
-		cnt[cur.len] = '\0';
-		n = atol(cnt);
-	}
-	n += delta;
-	if (n < 0)
-		die("a keyless row of %s deleted more often than it was there", t->name);
-	cl = snprintf(cnt, sizeof(cnt), "%ld", n);
-	pend_put(t, row->data, row->len, cnt, (size_t) cl, n == 0);
-	free(cur.data);
-}
-
-static void
-stream_change(void *arg, char op, uint32_t relid, char oldkind, const PgoTuple *old,
-			  const PgoTuple *new_)
-{
-	STable	   *t = st_find(relid);
-	static Buf	key,
-				okey,
-				val,
-				cur;
-
-	/* Tables the schema does not hold, or not yet (CREATE TABLE AS). */
-	if (t == NULL || t->persist != 'p')
-		return;
-	if ((new_ && new_->ncols != t->ncols) || (old && old->ncols != t->ncols))
-		die("a change to %s does not match its layout", t->name);
-	stream.changes++;
-	if (t->nkey == 0)
-	{
-		if (op != 'I' && oldkind != 'O')
-			die("a change to keyless %s without its old row", t->name);
-		if (op != 'I')
-		{
-			st_fields(t, old, 0, t->ncols, NULL, NULL, &okey);
-			st_count(t, &okey, -1);
-		}
-		if (op != 'D')
-		{
-			st_fields(t, new_, 0, t->ncols, old, NULL, &key);
-			st_count(t, &key, +1);
-		}
-		return;
-	}
-	if (op == 'D')
-	{
-		st_fields(t, old, 0, t->nkey, NULL, NULL, &okey);
-		pend_put(t, okey.data, okey.len, NULL, 0, true);
-		return;
-	}
-	st_fields(t, new_, 0, t->nkey, NULL, NULL, &key);
-	if (op == 'U' && old)
-		st_fields(t, old, 0, t->nkey, NULL, NULL, &okey);
-	else
-	{
-		okey.len = 0;
-		buf_append(&okey, key.data, key.len);
-	}
-	if (op == 'U')
-		st_get(t, okey.data, okey.len, &cur);
-	st_fields(t, new_, t->nkey, t->ncols, old && oldkind == 'O' ? old : NULL,
-			  op == 'U' ? &cur : NULL, &val);
-	if (!bytes_eq(okey.data, okey.len, key.data, key.len))
-		pend_put(t, okey.data, okey.len, NULL, 0, true);
-	pend_put(t, key.data, key.len, val.data, val.len, false);
-}
-
-static void
-stream_truncate(void *arg, int n, const uint32_t *relids)
-{
-	for (int i = 0; i < n; i++)
-	{
-		STable	   *t = st_find(relids[i]);
-
-		if (t)
-		{
-			pend_clear(t);
-			t->data = t_empty(stream.ctx);
-		}
-	}
-}
-
-static void
-st_free(STable *t)
-{
-	free(t->name);
-	free(t->layout);
-	free(t->order);
-	free(t->quoted);
-	free(t->list);
-	free(t->arena.data);
-	free(t->pe);
-	free(t->slot);
-}
-
-/* Reads a layout's key and column counts, order, name and column list. */
-static void
-st_parse_layout(STable *t)
-{
-	char	   *l = t->layout,
-			   *p,
-			   *e;
-
-	free(t->order);
-	free(t->quoted);
-	free(t->list);
-	e = strchr(l + 4, '\n');
-	t->quoted = px_memdup(l + 4, (size_t) (e - l - 4) + 1);
-	t->quoted[e - l - 4] = '\0';
-	CHECK(sscanf(e + 1, "key %d\ncols %d\n", &t->nkey, &t->ncols) == 2);
-	p = strstr(e, "\nlist ") + 6;
-	e = strchr(p, '\n');
-	t->list = px_memdup(p, (size_t) (e - p) + 1);
-	t->list[e - p] = '\0';
-	p = strstr(e, "\norder ") + 7;
-	t->order = px_malloc((size_t) (t->ncols ? t->ncols : 1) * sizeof(int));
-	for (int i = 0; i < t->ncols; i++)
-	{
-		t->order[i] = (int) strtol(p, &p, 10);
-		p++;
-	}
-}
-
-static void
-stream_layout(const char *d, size_t len)
-{
-	const char *end = d + len;
-
-	st_flush_all();
-	for (size_t i = 0; i < stream.n; i++)
-		stream.t[i].live = false;
-	while (d < end)
-	{
-		char	   *p;
-		uint32_t	oid = (uint32_t) strtoul(d, &p, 10);
-		char		persist = p[1];
-		size_t		nl = strtoul(p + 3, &p, 10),
-					ll;
-		const char *name = p + 1;
-		STable	   *t;
-
-		ll = strtoul(name + nl + 1, &p, 10);
-		t = st_find(oid);
-		if (t == NULL)
-		{
-			px_grow((void **) &stream.t, &stream.cap, stream.n + 1, sizeof(STable));
-			t = &stream.t[stream.n++];
-			memset(t, 0, sizeof(*t));
-			t->oid = oid;
-			t->data = t_empty(stream.ctx);
-		}
-		free(t->name);
-		free(t->layout);
-		t->name = px_memdup(name, nl + 1);
-		t->name[nl] = '\0';
-		t->layout = px_memdup(p + 1, ll + 1);
-		t->layout[ll] = '\0';
-		t->persist = persist;
-		t->live = true;
-		st_parse_layout(t);
-		d = p + 1 + ll;
-	}
-	for (size_t i = 0; i < stream.n;)
-		if (!stream.t[i].live)
-		{
-			st_free(&stream.t[i]);
-			stream.t[i] = stream.t[--stream.n];
-		}
-		else
-			i++;
-}
-
-static void
-stream_rows(const char *d, size_t len)
-{
-	char	   *p;
-	uint32_t	oid = (uint32_t) strtoul(d, &p, 10);
-	long		n = strtol(p + 1, &p, 10);
-	const char *line = p + 1,
-			   *end = d + len;
-	STable	   *t = st_find(oid);
-	Row		   *rows = NULL;
-	size_t		nrows = 0,
-				cap = 0;
-
-	if (t == NULL)
-		die("%s", "rows for a table no layout named");
-	pend_clear(t);
-	for (long i = 0; i < n; i++)
-	{
-		const char *nl = memchr(line, '\n', (size_t) (end - line));
-		size_t		ll = nl ? (size_t) (nl - line) : (size_t) (end - line);
-
-		row_add(&rows, &nrows, &cap, line, ll, t->nkey);
-		line += ll + 1;
-	}
-	t->data = rows_build(stream.ctx, rows, nrows, t->nkey, t->name);
-	stream.rows_reemitted += (uint64_t) n;
-}
-
-static void
-stream_message(void *arg, bool tx, const char *prefix, const char *d, size_t len,
-			   uint64_t lsn)
-{
-	if (strcmp(prefix, "prolly.layout") == 0)
-	{
-		stream.ddl_msgs++;
-		stream_layout(d, len);
-	}
-	else if (strcmp(prefix, "prolly.rows") == 0 && !broken("noreemit"))
-	{
-		stream.rows_msgs++;
-		st_flush_all();
-		stream_rows(d, len);
-	}
-	else if (strcmp(prefix, "prolly.barrier") == 0 && !tx &&
-			 bytes_eq((const uint8_t *) d, len, (const uint8_t *) stream.token,
-					  strlen(stream.token)))
-	{
-		stream.barrier_lsn = lsn;
-		stream.stop = true;
-	}
-}
-
-static const PgoCallbacks stream_cb = {stream_change, stream_truncate, NULL, stream_message};
-
-static void
-drop_slot(void)
-{
-	PGconn	   *c = pg_open("postgres");
-
-	for (int i = 0; i < 100; i++)
-	{
-		PGresult   *res = pg_exec(c, "SELECT active FROM pg_replication_slots "
-								  "WHERE slot_name = '" STREAM_SLOT "'");
-		bool		gone = PQntuples(res) == 0,
-					active = !gone && PQgetvalue(res, 0, 0)[0] == 't';
-
-		PQclear(res);
-		if (gone)
-			break;
-		if (!active)
-		{
-			pg_cmd(c, "SELECT pg_drop_replication_slot('" STREAM_SLOT "')");
-			break;
-		}
-		usleep(100000);
-	}
-	PQfinish(c);
-}
-
-/* Installs the event triggers, publication and slot, and starts the stream. */
-static void
-stream_setup(ProllyCtx *ctx, const char *db)
-{
-	size_t		len;
-	char	   *sql = slurp_file(o.stream_sql, &len),
-			   *p;
-	Buf			b = {0};
-	char		path[1024],
-				ci[1024];
-
-	for (p = sql; *p;)
-	{
-		char	   *at = strstr(p, "@LAYOUT@");
-
-		if (at == NULL)
-		{
-			buf_append(&b, p, strlen(p));
-			break;
-		}
-		buf_append(&b, p, (size_t) (at - p));
-		{
-			const char *lay = LAYOUT_SQL;
-			const char *from = broken("cast") ? "format(''%%s'', %I)" :
-				broken("isnull") ? "num_nulls(%I) > 0" : NULL;
-			const char *to = broken("cast") ? "%I::text" : "%I IS NULL";
-			const char *hit = from ? strstr(lay, from) : NULL;
-
-			if (from && hit == NULL)
-				die("%s", "the fault's target is not in the layout query");
-			if (hit)
-			{
-				buf_append(&b, lay, (size_t) (hit - lay));
-				buf_append(&b, to, strlen(to));
-				lay = hit + strlen(from);
-			}
-			buf_append(&b, lay, strlen(lay));
-		}
-		p = at + 8;
-	}
-	snprintf(path, sizeof(path), "%s/stream.sql", o.work);
-	write_file(path, b.data, b.len);
-	psql_file(db, path);
-	free(b.data);
-	free(sql);
-	memset(&stream, 0, sizeof(stream));
-	stream.ctx = ctx;
-	/* Values arrive as text under the same settings the capture uses. */
-	snprintf(ci, sizeof(ci),
-			 "%s dbname=%s options='-c DateStyle=ISO -c IntervalStyle=postgres "
-			 "-c TimeZone=UTC -c extra_float_digits=1 -c bytea_output=hex'",
-			 o.conninfo, db);
-	stream.pgo = pgo_start(ci, STREAM_SLOT, STREAM_PUB);
-}
-
-static PHash
-stream_capture(ProllyCtx *ctx, const char *db)
-{
-	static int	seq = 0;
-	PGconn	   *c = pg_open(db);
-	PGresult   *res;
-	const char *params[1];
-	PHash		rv;
-	double		t0,
-				t1;
-
-	/* The barrier: no DDL in flight, a snapshot, the barrier, DDL resumes. */
-	snprintf(stream.token, sizeof(stream.token), "%d", ++seq);
-	pg_cmd(c, "SELECT pg_advisory_lock(" DDL_LOCK ")");
-	pg_cmd(c, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-	res = pg_exec(c, "SELECT pg_export_snapshot()");
-	snprintf(dump_snapshot, sizeof(dump_snapshot), "%s", PQgetvalue(res, 0, 0));
-	PQclear(res);
-	params[0] = stream.token;
-	/* Flushed: the stream sends only flushed WAL. */
-	res = PQexecParams(c, broken("noflush")
-					   ? "SELECT pg_logical_emit_message(false, 'prolly.barrier', $1)"
-					   : "SELECT pg_logical_emit_message(false, 'prolly.barrier', $1, true)",
-					   1, NULL, params, NULL, NULL, 0);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		die("barrier: %s", PQerrorMessage(c));
-	PQclear(res);
-	pg_cmd(c, "SELECT pg_advisory_unlock(" DDL_LOCK ")");
-
-	stream.stop = false;
-	t0 = now_sec();
-	pgo_run(stream.pgo, &stream_cb, &stream, &stream.stop);
-	st_flush_all();
-	t1 = now_sec();
-	rv = capture_defs(ctx, vc_root_empty(ctx), c, db);
-	stream.wait_s = t1 - t0;
-	stream.defs_s = now_sec() - t1;
-	for (size_t i = 0; i < stream.n; i++)
-	{
-		STable	   *t = &stream.t[i];
-		PHash		data = t->persist == 'p' ? t->data
-			: capture_rows(ctx, c, t->quoted, t->list, t->nkey);
-
-		rv = put_table(ctx, rv, t->name, t->layout, strlen(t->layout), &data);
-	}
-	pg_cmd(c, "COMMIT");
-	dump_snapshot[0] = '\0';
-	PQfinish(c);
-	pgo_feedback(stream.pgo, stream.barrier_lsn);
-	return rv;
-}
-
-static const WorkingSetOps stream_ops = {"streamed", stream_capture, logical_restore};
 
 /* --------------------------------------------------------------- checks */
 
@@ -1800,6 +415,41 @@ check_rebuilt(const char *db, char **expect, const char *label, bool last)
 	PQfinish(c);
 }
 
+/* A row (or an object, for ~ entries) as text; "(none)" if absent. */
+static void
+show_row(ProllyCtx *ctx, const PHash *schema, const char *name, const uint8_t *k, size_t kl,
+		 const uint8_t *v, size_t vl, Buf *out)
+{
+	out->len = 0;
+	if (v == NULL)
+		buf_append(out, "(none)", 6);
+	else if (name[0] == '~')
+	{
+		buf_append(out, k, kl);
+		buf_append(out, " => ", 4);
+		buf_append(out, v, vl);
+	}
+	else
+	{
+		size_t		len;
+		char	   *text = schema_text(ctx, schema, &len);
+		WsLayout	L;
+		WsField		f[WS_MAX_COLS];
+
+		layout_must_parse(text, &L);
+		ws_decode(&L, k, kl, v, vl, f);
+		ws_copy_line(&L, f, out);
+		if (L.nkey == 0)
+		{
+			out->len--;
+			buf_append(out, " x", 2);
+			buf_append(out, v, vl);
+		}
+		ws_layout_free(&L);
+		free(text);
+	}
+}
+
 /* Which entries differ, and for definitions how. */
 static void
 explain_mismatch(ProllyCtx *ctx, const PHash *want, const PHash *got, const char *label)
@@ -1826,40 +476,38 @@ explain_mismatch(ProllyCtx *ctx, const PHash *want, const PHash *got, const char
 			continue;
 		printf("  %s differs (%s)\n", a.names[i],
 			   phash_eq(&a.t[i].schema, &b.t[j].schema) ? "rows" : "definition");
-		if (!phash_eq(&a.t[i].data, &b.t[j].data))
+		if (!phash_eq(&a.t[i].schema, &b.t[j].schema))
 		{
-			ProllyDiffList dl = {0};
-
-			CHECK(prolly_diff_collect(ctx, &a.t[i].data, &b.t[j].data, &dl) == PROLLY_OK);
-			printf("    %zu keys differ; the first:\n", dl.n);
-			for (size_t d = 0; d < dl.n && d < 3; d++)
-				printf("    key  %.*s\n    want %.*s\n    got  %.*s\n",
-					   (int) (dl.v[d].klen < 200 ? dl.v[d].klen : 200), dl.v[d].key,
-					   (int) (dl.v[d].flen < 600 ? dl.v[d].flen : 600),
-					   dl.v[d].from ? (const char *) dl.v[d].from : "",
-					   (int) (dl.v[d].tlen < 600 ? dl.v[d].tlen : 600),
-					   dl.v[d].to ? (const char *) dl.v[d].to : "");
-			prolly_diff_list_free(&dl);
-		}
-		if (a.names[i][0] == '~' && !phash_eq(&a.t[i].schema, &b.t[j].schema))
-		{
-			char		pa[1024],
-						pb[1024],
-						cmd[2200];
 			size_t		la,
 						lb;
 			char	   *ta = schema_text(ctx, &a.t[i].schema, &la),
 					   *tb = schema_text(ctx, &b.t[j].schema, &lb);
 
-			snprintf(pa, sizeof(pa), "%s/want%s.sql", o.work, a.names[i] + 1);
-			snprintf(pb, sizeof(pb), "%s/got%s.sql", o.work, a.names[i] + 1);
-			write_file(pa, ta, la);
-			write_file(pb, tb, lb);
-			snprintf(cmd, sizeof(cmd), "diff '%s' '%s' | head -40", pa, pb);
-			if (system(cmd) < 0)
-				printf("  (diff failed)\n");
+			printf("    want layout:\n%s    got layout:\n%s", ta, tb);
 			free(ta);
 			free(tb);
+		}
+		if (!phash_eq(&a.t[i].data, &b.t[j].data))
+		{
+			ProllyDiffList dl = {0};
+			Buf			wa = {0},
+						gb = {0};
+
+			CHECK(prolly_diff_collect(ctx, &a.t[i].data, &b.t[j].data, &dl) == PROLLY_OK);
+			printf("    %zu keys differ; the first:\n", dl.n);
+			for (size_t d = 0; d < dl.n && d < 3; d++)
+			{
+				show_row(ctx, &a.t[i].schema, a.names[i], dl.v[d].key, dl.v[d].klen,
+						 dl.v[d].from, dl.v[d].flen, &wa);
+				show_row(ctx, &b.t[j].schema, b.names[j], dl.v[d].key, dl.v[d].klen,
+						 dl.v[d].to, dl.v[d].tlen, &gb);
+				printf("    want %.*s\n    got  %.*s\n", (int) (wa.len < 600 ? wa.len : 600),
+					   (const char *) wa.data, (int) (gb.len < 600 ? gb.len : 600),
+					   (const char *) gb.data);
+			}
+			free(wa.data);
+			free(gb.data);
+			prolly_diff_list_free(&dl);
 		}
 	}
 	for (size_t j = 0; j < b.n; j++)
@@ -1874,6 +522,441 @@ explain_mismatch(ProllyCtx *ctx, const PHash *want, const PHash *got, const char
 	}
 	table_list_free(&a);
 	table_list_free(&b);
+}
+
+/* ------------------------------------------------- DDL and merge runners */
+
+/* A fixture file's sections: lines "-- <name> [title]" start one. */
+typedef struct Section
+{
+	char	   *name;
+	char	   *title;
+	Buf			text;
+} Section;
+
+static int
+read_sections(const char *path, Section **out)
+{
+	size_t		len;
+	char	   *text = slurp_file(path, &len),
+			   *p = text;
+	Section    *s = NULL;
+	size_t		cap = 0;
+	int			n = 0;
+	static const char *names[] = {"base", "step", "expect", "ours", "theirs", NULL};
+
+	while (*p)
+	{
+		char	   *nl = strchr(p, '\n');
+		size_t		ll = nl ? (size_t) (nl - p) : strlen(p);
+		bool		hdr = false;
+
+		for (int i = 0; names[i] && !hdr; i++)
+		{
+			size_t		nlen = strlen(names[i]);
+
+			if (strncmp(p, "-- ", 3) == 0 && strncmp(p + 3, names[i], nlen) == 0 &&
+				(p[3 + nlen] == '\n' || p[3 + nlen] == ' ' || p[3 + nlen] == '\0'))
+			{
+				px_grow((void **) &s, &cap, (size_t) n + 1, sizeof(Section));
+				memset(&s[n], 0, sizeof(Section));
+				s[n].name = strdup(names[i]);
+				s[n].title = strndup(p + 3 + nlen + (p[3 + nlen] == ' '),
+									 ll > 3 + nlen ? ll - 3 - nlen - (p[3 + nlen] == ' ') : 0);
+				n++;
+				hdr = true;
+			}
+		}
+		if (!hdr && n > 0)
+		{
+			buf_append(&s[n - 1].text, p, ll);
+			buf_append(&s[n - 1].text, "\n", 1);
+		}
+		p += ll + (nl ? 1 : 0);
+	}
+	for (int i = 0; i < n; i++)
+		buf_append(&s[i].text, "", 1);
+	free(text);
+	*out = s;
+	return n;
+}
+
+static void
+apply_sql(const char *db, const Buf *sql)
+{
+	char		path[1024];
+
+	snprintf(path, sizeof(path), "%s/apply.sql", o.work);
+	write_file(path, sql->data, sql->len ? sql->len - 1 : 0);
+	psql_file(db, path);
+}
+
+/* The expect section's lines, without blanks and comments. */
+static int
+expect_lines(const Section *s, char ***out)
+{
+	char	   *copy = strdup((const char *) s->text.data);
+	char	  **l = NULL;
+	size_t		cap = 0;
+	int			n = 0;
+
+	for (char *p = strtok(copy, "\n"); p; p = strtok(NULL, "\n"))
+	{
+		if (p[0] == '\0' || p[0] == '#')
+			continue;
+		px_grow((void **) &l, &cap, (size_t) n + 1, sizeof(char *));
+		l[n++] = strdup(p);
+	}
+	free(copy);
+	*out = l;
+	return n;
+}
+
+/* Rebuilds a root value into dst and captures it again: it must not change. */
+static bool
+round_trip(ProllyCtx *ctx, const PHash *rv, const char *dst, const char *label)
+{
+	PHash		got;
+
+	fresh_database(dst);
+	ws_install(dst, false);
+	ws_restore(ctx, rv, dst, NULL);
+	got = logical_capture(ctx, dst);
+	if (phash_eq(&got, rv))
+		return true;
+	fail(label, "the rebuild captures to a different root value");
+	explain_mismatch(ctx, rv, &got, label);
+	return false;
+}
+
+/*
+ * The DDL fixture: a base, then steps each with the diff lines it must
+ * produce against the step before.  Every step's commit must also rebuild
+ * to itself.
+ */
+static void
+run_ddl(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	Section    *sec;
+	char		path[1024];
+	int			n;
+	PHash		prev;
+	const char *db = "rt_ddl";
+
+	snprintf(path, sizeof(path), "%s/ddl.sql", o.fixture);
+	n = read_sections(path, &sec);
+	vc_repo_init(&r, cs, &prolly_default_policy);
+	fresh_database(db);
+	ws_install(db, true);
+	CHECK(n > 0 && strcmp(sec[0].name, "base") == 0);
+	apply_sql(db, &sec[0].text);
+	prev = logical_capture(&r.ctx, db);
+	vc_set_working(&r, &prev);
+	vc_commit(&r, "base");
+	printf("# DDL steps (%s/ddl.sql)\n", o.fixture);
+	for (int i = 1; i < n; i++)
+	{
+		WsDiff		d;
+		PHash		cur;
+		char	  **want = NULL;
+		int			nw = 0;
+		bool		ok = true;
+
+		if (strcmp(sec[i].name, "step") != 0)
+			continue;
+		if (i + 1 < n && strcmp(sec[i + 1].name, "expect") == 0)
+			nw = expect_lines(&sec[i + 1], &want);
+		apply_sql(db, &sec[i].text);
+		cur = logical_capture(&r.ctx, db);
+		vc_set_working(&r, &cur);
+		vc_commit(&r, sec[i].title);
+		ws_diff(&r.ctx, &prev, &cur, &d);
+		for (int w = 0; w < nw; w++)
+			if (!ws_diff_has(&d, want[w]))
+			{
+				fail(sec[i].title, want[w]);
+				ok = false;
+			}
+		printf("%-40s %s\n", sec[i].title, ok ? "as expected" : "NOT as expected; the diff:");
+		if (!ok)
+			for (size_t q = 0; q < d.n; q++)
+				printf("    %s\n", d.line[q]);
+		round_trip(&r.ctx, &cur, "rt_ddl_dst", sec[i].title);
+		ws_diff_free(&d);
+		for (int w = 0; w < nw; w++)
+			free(want[w]);
+		free(want);
+		prev = cur;
+	}
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+static bool
+eval_default(void *arg, const char *expr, const char *type, Buf *out)
+{
+	PGconn	  **conns = arg;
+
+	for (int i = 0; conns[i]; i++)
+	{
+		char	   *sql = px_malloc(strlen(expr) + strlen(type) + 64);
+		PGresult   *res;
+
+		sprintf(sql, "SELECT format('%%s', (%s)::%s)", expr, type);
+		res = PQexec(conns[i], sql);
+		free(sql);
+		if (PQresultStatus(res) == PGRES_TUPLES_OK && !PQgetisnull(res, 0, 0))
+		{
+			out->len = 0;
+			buf_append(out, PQgetvalue(res, 0, 0), strlen(PQgetvalue(res, 0, 0)));
+			PQclear(res);
+			return true;
+		}
+		PQclear(res);
+	}
+	return false;
+}
+
+static int
+str_cmp(const void *a, const void *b)
+{
+	return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+/*
+ * One merge scenario: base.sql, then ours and theirs applied on two
+ * branches (theirs in a database rebuilt from the base commit), merged,
+ * and the result restored.  The outcomes (conflicts, constraint violations,
+ * objects that do not apply, normalization) must be exactly those expected,
+ * and the merged database must pass amcheck and answer its checks.
+ */
+static void
+run_merge_scenario(ProllyCtx *ctx, const char *file)
+{
+	Section    *sec;
+	char		path[1024];
+	int			n;
+	const Buf  *ours = NULL,
+			   *theirs = NULL;
+	char	  **want = NULL,
+			  **got = NULL;
+	int			nw = 0,
+				ng = 0;
+	size_t		gcap = 0;
+	PHash		B,
+				O,
+				T,
+				cb,
+				co,
+				ct,
+				mb;
+	WsMerge		m;
+	PGconn	   *conns[3];
+	bool		ok = true;
+
+	snprintf(path, sizeof(path), "%s/merge/%s", o.fixture, file);
+	n = read_sections(path, &sec);
+	for (int i = 0; i < n; i++)
+	{
+		if (strcmp(sec[i].name, "ours") == 0)
+			ours = &sec[i].text;
+		else if (strcmp(sec[i].name, "theirs") == 0)
+			theirs = &sec[i].text;
+		else if (strcmp(sec[i].name, "expect") == 0)
+			nw = expect_lines(&sec[i], &want);
+	}
+	if (ours == NULL || theirs == NULL)
+		die("%s needs -- ours and -- theirs", file);
+
+	fresh_database("rt_mb");
+	ws_install("rt_mb", true);
+	snprintf(path, sizeof(path), "%s/merge/base.sql", o.fixture);
+	psql_file("rt_mb", path);
+	B = logical_capture(ctx, "rt_mb");
+	cb = vc_commit_write(ctx, &B, NULL, 0, 1, "base");
+
+	/* Their branch starts from the base commit, rebuilt. */
+	fresh_database("rt_mt");
+	ws_install("rt_mt", false);
+	ws_restore(ctx, &B, "rt_mt", NULL);
+	ws_install_triggers("rt_mt");
+	apply_sql("rt_mt", theirs);
+	T = logical_capture(ctx, "rt_mt");
+	ct = vc_commit_write(ctx, &T, &cb, 1, 2, "theirs");
+	apply_sql("rt_mb", ours);
+	O = logical_capture(ctx, "rt_mb");
+	co = vc_commit_write(ctx, &O, &cb, 1, 3, "ours");
+	CHECK(vc_merge_base(ctx, &co, &ct, &mb) == 1 && phash_eq(&mb, &cb));
+
+	conns[0] = pg_open("rt_mt");
+	conns[1] = pg_open("rt_mb");
+	conns[2] = NULL;
+	ws_merge(ctx, &B, &O, &T, eval_default, conns, &m);
+	PQfinish(conns[0]);
+	PQfinish(conns[1]);
+
+	for (size_t i = 0; i < m.nconflicts; i++)
+	{
+		char		line[1300];
+
+		snprintf(line, sizeof(line), "conflict %s", m.conflict[i]);
+		px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
+		got[ng++] = strdup(line);
+	}
+	if (m.nconflicts == 0)
+	{
+		WsReport	rep = {0};
+
+		fresh_database("rt_mm");
+		ws_install("rt_mm", false);
+		ws_restore(ctx, &m.root, "rt_mm", &rep);
+		for (size_t i = 0; i < rep.n; i++)
+		{
+			char		line[1300];
+			const char *w = rep.p[i].what;
+
+			if (strncmp(rep.p[i].sqlstate, "23", 2) == 0)
+				snprintf(line, sizeof(line), "violation %s",
+						 rep.p[i].constraint[0] ? rep.p[i].constraint : strrchr(w, ' ') + 1);
+			else
+				snprintf(line, sizeof(line), "unapplied %s (%s)", w, rep.p[i].message);
+			px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
+			got[ng++] = strdup(line);
+		}
+		if (rep.n == 0)
+		{
+			PHash		N = logical_capture(ctx, "rt_mm");
+			bool		expect_norm = false;
+
+			for (int w = 0; w < nw; w++)
+				expect_norm |= strcmp(want[w], "normalized") == 0;
+			if (!phash_eq(&N, &m.root))
+			{
+				px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
+				got[ng++] = strdup("normalized");
+				if (!expect_norm)
+					explain_mismatch(ctx, &N, &m.root, file);
+			}
+			vc_commit_write(ctx, &m.root, (PHash[]) {co, ct}, 2, 4, "merge");
+		}
+		report_free(&rep);
+	}
+
+	/* Outcomes must be exactly those expected; checks run on the result. */
+	qsort(got, (size_t) ng, sizeof(char *), str_cmp);
+	for (int w = 0; w < nw; w++)
+	{
+		bool		have = false;
+
+		if (strncmp(want[w], "check ", 6) == 0 || strcmp(want[w], "clean") == 0)
+			continue;
+		for (int g = 0; g < ng; g++)
+			have |= strcmp(got[g], want[w]) == 0 ||
+				(strncmp(want[w], "unapplied ", 10) == 0 &&
+				 strncmp(got[g], want[w], strlen(want[w])) == 0);
+		if (!have)
+		{
+			fail(file, want[w]);
+			ok = false;
+		}
+	}
+	for (int g = 0; g < ng; g++)
+	{
+		bool		have = false;
+
+		for (int w = 0; w < nw; w++)
+			have |= strcmp(got[g], want[w]) == 0 ||
+				(strncmp(want[w], "unapplied ", 10) == 0 &&
+				 strncmp(got[g], want[w], strlen(want[w])) == 0);
+		if (!have)
+		{
+			fail(file, got[g]);
+			ok = false;
+		}
+	}
+	if (ng == 0)
+	{
+		PGconn	   *c = pg_open("rt_mm");
+
+		amcheck(c, file);
+		pg_cmd(c, "SET search_path = public");
+		for (int w = 0; w < nw; w++)
+		{
+			char	   *bar,
+					   *ans,
+					   *q;
+
+			if (strncmp(want[w], "check ", 6) != 0)
+				continue;
+			q = strdup(want[w] + 6);
+			bar = strstr(q, " => ");
+			if (bar == NULL)
+				die("a check needs <sql> => <answer>: %s", want[w]);
+			*bar = '\0';
+			ans = plain_answer(c, q);
+			if (ans[0] && ans[strlen(ans) - 1] == '\n')
+				ans[strlen(ans) - 1] = '\0';
+			if (strcmp(ans, bar + 4) != 0)
+			{
+				char		msg[1200];
+
+				snprintf(msg, sizeof(msg), "%s gave %s, not %s", q, ans, bar + 4);
+				fail(file, msg);
+				ok = false;
+			}
+			free(ans);
+			free(q);
+		}
+		PQfinish(c);
+	}
+	printf("%-36s %s:", file, ok ? "as expected" : "NOT as expected");
+	if (ng == 0)
+		printf(" clean, %" PRIu64 " rows merged by column", m.cells_merged);
+	for (int g = 0; g < ng; g++)
+		printf("%s %s", g ? ";" : "", got[g]);
+	printf("\n");
+	ws_merge_free(&m);
+	for (int g = 0; g < ng; g++)
+		free(got[g]);
+	free(got);
+	for (int w = 0; w < nw; w++)
+		free(want[w]);
+	free(want);
+}
+
+static void
+run_merges(void)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx;
+	char		cmd[1100];
+	char		line[512];
+	FILE	   *ls;
+	char	   *files[256];
+	int			nf = 0;
+
+	prolly_ctx_init(&ctx, cs, &prolly_default_policy);
+	snprintf(cmd, sizeof(cmd), "ls '%s/merge' | grep -E '^[0-9]+-.*\\.sql$'", o.fixture);
+	ls = popen(cmd, "r");
+	while (nf < 256 && fgets(line, sizeof(line), ls))
+	{
+		line[strcspn(line, "\n")] = '\0';
+		files[nf++] = strdup(line);
+	}
+	pclose(ls);
+	qsort(files, (size_t) nf, sizeof(char *), str_cmp);
+	printf("# merge scenarios (%s/merge)\n", o.fixture);
+	for (int i = 0; i < nf; i++)
+	{
+		if (o.steps > 0 && i >= o.steps)
+			break;
+		run_merge_scenario(&ctx, files[i]);
+		free(files[i]);
+	}
+	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
 }
 
 /* ----------------------------------------------------------------- main */
@@ -1958,7 +1041,7 @@ main(int argc, char **argv)
 	static struct option opts[] = {
 		{"conninfo", 1, 0, 'c'}, {"fixture", 1, 0, 'f'}, {"work", 1, 0, 'w'},
 		{"bindir", 1, 0, 'b'}, {"break", 1, 0, 'x'}, {"steps", 1, 0, 's'},
-		{"stream", 0, 0, 'S'},
+		{"stream", 0, 0, 'S'}, {"ddl", 0, 0, 'D'}, {"merge", 0, 0, 'M'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -1967,6 +1050,7 @@ main(int argc, char **argv)
 	int			nsteps = 0,
 				ch;
 	bool		whole;
+	char		mode = 0;
 	char		path[1024],
 				err[256];
 	char	   *names[MAX_STEPS];
@@ -1986,12 +1070,27 @@ main(int argc, char **argv)
 			case 'x': o.brk = optarg; break;
 			case 's': o.steps = atoi(optarg); break;
 			case 'S': o.stream = true; break;
+			case 'D': mode = 'D'; break;
+			case 'M': mode = 'M'; break;
 			default:
 				fprintf(stderr, "rebuild [--conninfo C] [--fixture DIR] [--work DIR] [--bindir DIR]\n"
-						"        [--steps N] [--stream]\n"
+						"        [--steps N] [--stream] [--ddl] [--merge]\n"
 						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush]\n");
 				return 2;
 		}
+	mkdir(o.work, 0700);
+	if (mode)
+	{
+		if (mode == 'D')
+			run_ddl();
+		else
+			run_merges();
+		if (failures)
+			printf("# %d FAILURES\n", failures);
+		else
+			printf("# every %s as expected\n", mode == 'D' ? "DDL step" : "merge");
+		return failures ? 1 : 0;
+	}
 	load_checks();
 
 	/* The steps are the fixture's numbered SQL files, in order. */
@@ -2027,6 +1126,7 @@ main(int argc, char **argv)
 	if (o.stream)
 		drop_slot();
 	fresh_database(o.src_db);
+	ws_install(o.src_db, true);
 	if (o.stream)
 		stream_setup(&r.ctx, o.src_db);
 	for (int i = 0; i < nsteps; i++)
@@ -2110,6 +1210,7 @@ main(int argc, char **argv)
 		CHECK(s != NULL && phash_eq(&s->root, &log.root[li]));
 		snprintf(label, sizeof(label), "%s", s->file);
 		fresh_database(o.dst_db);
+		ws_install(o.dst_db, false);
 		ws->restore(&r.ctx, &log.root[li], o.dst_db);
 		{
 			PGconn	   *c = pg_open(o.dst_db);

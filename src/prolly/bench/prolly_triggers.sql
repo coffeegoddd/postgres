@@ -1,5 +1,6 @@
--- What the streamed working set installs in the source database.  Every
--- DDL statement, inside its own transaction, writes to the WAL stream:
+-- What a source database's working set needs beyond prolly_tags.sql.
+-- Every DDL statement gives new columns their tags and, inside its own
+-- transaction, writes to the WAL stream:
 --
 --   prolly.layout   every table's codec layout after the statement, so rows
 --                   that follow it in the stream are read with the new one
@@ -16,16 +17,6 @@
 -- IDENTITY FULL, since their rows are keyed by the whole old row.
 --
 -- @LAYOUT@ is replaced with the layout query the capture uses.
-
-CREATE SCHEMA prolly;
-
--- A value as COPY text writes it, given its output function's text.
-CREATE FUNCTION prolly.esc(is_null bool, t text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
-	SELECT CASE WHEN is_null THEN '\N' ELSE
-		replace(replace(replace(replace(replace(replace(replace(t,
-			'\', '\\'), chr(10), '\n'), chr(13), '\r'), chr(9), '\t'),
-			chr(8), '\b'), chr(12), '\f'), chr(11), '\v') END
-$$;
 
 CREATE FUNCTION prolly.ddl_start() RETURNS event_trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -47,6 +38,7 @@ BEGIN
 		RETURN;
 	END IF;
 	PERFORM set_config('prolly.busy', 'on', true);
+	PERFORM prolly.assign_tags();
 
 	FOR rec IN SELECT c.oid FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
 		WHERE ns.nspname = 'rt' AND c.relkind = 'r' AND c.relpersistence = 'p'
@@ -90,5 +82,3 @@ $body$;
 
 CREATE EVENT TRIGGER prolly_ddl_start ON ddl_command_start EXECUTE FUNCTION prolly.ddl_start();
 CREATE EVENT TRIGGER prolly_ddl_end ON ddl_command_end EXECUTE FUNCTION prolly.ddl_end();
-CREATE PUBLICATION prolly_rt FOR ALL TABLES;
-SELECT pg_create_logical_replication_slot('prolly_rt', 'pgoutput');
