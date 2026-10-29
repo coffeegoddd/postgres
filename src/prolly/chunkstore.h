@@ -171,8 +171,8 @@ extern uint64_t filestore_file_bytes(ChunkStore *cs);
  * Flush and compaction invalidate bytes previously returned by get.
  */
 #define DS_CRASHED (-30)			/* stopped at a failpoint */
-#define DS_FP_FLUSH_BEFORE_RENAME 1
-#define DS_FP_FLUSH_BEFORE_MANIFEST 2
+#define DS_FP_JOURNAL_BEFORE_ROOT 1	/* chunks appended, no root record */
+#define DS_FP_JOURNAL_BEFORE_SYNC 2	/* root record appended, not synced */
 #define DS_FP_COMPACT_BEFORE_RENAME 3
 #define DS_FP_COMPACT_BEFORE_MANIFEST 4
 #define DS_FP_COMPACT_BEFORE_UNLINK 5
@@ -188,6 +188,9 @@ typedef struct DirCompactStats
 } DirCompactStats;
 
 extern ChunkStore *dirstore_open(const char *dir, char *err, size_t errlen);
+extern ChunkStore *dirstore_open_at(const char *dir, const PHash *state, char *err,
+									size_t errlen);
+extern uint64_t dirstore_journal_end(ChunkStore *cs);
 extern int	dirstore_flush(ChunkStore *cs);
 extern int	dirstore_compact(ChunkStore *cs, double min_dead_fraction,
 							 DirCompactStats *stats);

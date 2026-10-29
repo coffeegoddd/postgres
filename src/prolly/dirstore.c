@@ -3,10 +3,27 @@
  *	  Durable ChunkStore in a directory of immutable chunk files.
  *
  * Layout of the directory:
+ *	j-<id>.journal	the journal: append-only; new chunks and the root
+ *					records that commit them
  *	c-<id>.chunks	immutable chunk files: written whole to a temporary
  *					name, fsynced, renamed into place, never changed again
- *	MANIFEST		which chunk files are live, the durable root set and the
- *					repository-state root; replaced whole by rename
+ *	MANIFEST		which chunk files and journal are live, and the durable
+ *					root set and repository-state root as of its writing;
+ *					replaced whole by rename
+ *
+ * Journal records, each [u32 length][u8 kind][payload][u32 crc32c] with
+ * the length counting the whole record and the checksum all before it:
+ *	'C'				a chunk: 20-byte hash, the chunk's bytes
+ *	'R'				the root set and state: u64 root count, (20-byte hash,
+ *					u64 hold count)..., u8 has state, [20-byte state root]
+ * A flush appends the new chunks and a root record and fdatasyncs: that is
+ * the commit point.  The file is extended ahead with zeros, and a zero
+ * length ends the log.  On open the journal is replayed after the
+ * manifest: chunk records are indexed, the last root record wins.  A torn
+ * tail (a short, oversized or failing record with no valid root record
+ * after it) is cut off; a valid root record after the damage means the
+ * damage is not at the tail, and the open refuses.  A store can also be
+ * opened as of an earlier root record, which cuts the journal after it.
  *
  * Chunk file:
  *	records			per chunk: u32 length, 20-byte hash, the chunk's bytes
@@ -15,22 +32,24 @@
  *	footer			"PRLYCHK1", u32 format, u64 chunk count, u64 index
  *					offset, u64 record bytes, 20-byte hash of the index
  * Manifest:
- *	"PRLYMAN1", u32 format, u64 next file id, u32 file count, u64 ids,
+ *	"PRLYMAN1", u32 format, u64 next file id, u64 journal id, u32 file
+ *	count, u64 ids,
  *	u64 root count, (20-byte hash, u64 hold count)..., u8 has state,
  *	[20-byte state root], 20-byte hash of everything before it
  * All integers big-endian.
  *
- * New chunks are kept in memory until a flush writes them out as a new
- * file and then a new manifest.  Compaction (garbage collection) copies
- * the live chunks of files with enough dead space, or of small files, into
- * new files, installs a manifest without the old files, then deletes them:
- * that is where disk space comes back.  Reference counts are not stored:
+ * New chunks are kept in memory until a flush appends them to the journal.
+ * Compaction (garbage collection) copies the live chunks of the journal,
+ * of files with enough dead space and of small files into new files,
+ * starts a new journal, installs a manifest naming them and not the old
+ * ones, then deletes the old: that is where disk space comes back.  Reference counts are not stored:
  * opening the store rebuilds them by walking from the manifest's roots;
  * anything unreachable is dead.  Files the manifest does not name (left by
  * a crash) are deleted on open.
  *
  * Bytes returned by get stay valid until the next flush (for chunks not
- * yet written) or compaction (for chunks in the files it replaces).
+ * yet written) or compaction (for chunks in the files and journal it
+ * replaces).
  */
 #define _DEFAULT_SOURCE
 #include <dirent.h>
@@ -44,7 +63,12 @@
 
 #define FILE_MAGIC "PRLYCHK1"
 #define MANIFEST_MAGIC "PRLYMAN1"
-#define DS_FORMAT 1
+#define DS_FORMAT 2
+#define JOURNAL_RESERVE ((size_t) 1 << 38)	/* address space for a journal */
+#define JOURNAL_AHEAD ((uint64_t) 4 << 20)	/* zeros kept past the end */
+#define JREC_MAX ((uint32_t) 256 << 20)
+#define JREC_HDR 5				/* length, kind */
+#define JREC_CRC 4
 #define REC_HDR (4 + PHASH_LEN)
 #define INDEX_ENT (PHASH_LEN + 8 + 4)
 #define FOOTER_LEN (8 + 4 + 8 + 8 + 8 + PHASH_LEN)
@@ -57,6 +81,8 @@
 typedef struct DFile
 {
 	bool		used;
+	bool		journal;
+	size_t		reserve;		/* a journal's mapping, larger than the file */
 	uint64_t	id;
 	uint8_t    *map;
 	size_t		size;
@@ -93,6 +119,13 @@ typedef struct DirStore
 	PHash		state;
 	int			failpoint;
 	size_t		file_target;
+	/* the journal */
+	uint64_t	journal_id;
+	int			jfd;
+	uint32_t	jslot;
+	uint64_t	jend;			/* end of the last whole record */
+	uint64_t	jalloc;			/* bytes allocated (zeros past jend) */
+	bool		dirty;			/* roots or state changed since the last flush */
 } DirStore;
 
 /* ----------------------------------------------------------------- helpers */
@@ -184,6 +217,37 @@ static void
 file_name(char *buf, size_t n, uint64_t id)
 {
 	snprintf(buf, n, "c-%016llx.chunks", (unsigned long long) id);
+}
+
+static void
+journal_name(char *buf, size_t n, uint64_t id)
+{
+	snprintf(buf, n, "j-%016llx.journal", (unsigned long long) id);
+}
+
+/* CRC-32C (Castagnoli), bitwise reflected, as journal records use. */
+static uint32_t
+crc32c(const uint8_t *p, size_t n)
+{
+	static uint32_t table[256];
+	static bool made = false;
+	uint32_t	c = 0xffffffffu;
+
+	if (!made)
+	{
+		for (uint32_t i = 0; i < 256; i++)
+		{
+			uint32_t	x = i;
+
+			for (int k = 0; k < 8; k++)
+				x = x & 1 ? (x >> 1) ^ 0x82f63b78u : x >> 1;
+			table[i] = x;
+		}
+		made = true;
+	}
+	for (size_t i = 0; i < n; i++)
+		c = table[(c ^ p[i]) & 0xff] ^ (c >> 8);
+	return c ^ 0xffffffffu;
 }
 
 /* ------------------------------------------------------------------ index */
@@ -302,6 +366,7 @@ ds_put(ChunkStore *cs, const PHash *h, const uint8_t *data, size_t len)
 	e->len = (uint32_t) len;
 	e->file = IN_MEM;
 	ds->live += len;
+	ds->dirty = true;
 	return true;
 }
 
@@ -357,6 +422,7 @@ ds_note_root(ChunkStore *cs, const PHash *h, uint64_t roots)
 	DirStore   *ds = (DirStore *) cs;
 	bool		created;
 
+	ds->dirty = true;
 	if (roots == 0)
 		phmap_remove(&ds->roots, h);
 	else
@@ -433,9 +499,10 @@ static void
 unmap_file(DFile *f)
 {
 	if (f->map)
-		munmap(f->map, f->size);
+		munmap(f->map, f->journal ? f->reserve : f->size);
 	f->map = NULL;
 	f->used = false;
+	f->journal = false;
 }
 
 /*
@@ -544,12 +611,14 @@ write_manifest(DirStore *ds, int crash_point)
 	buf_append(&b, tmp, 4);
 	put_be64(tmp, ds->next_id);
 	buf_append(&b, tmp, 8);
+	put_be64(tmp, ds->journal_id);
+	buf_append(&b, tmp, 8);
 	for (size_t i = 0; i < ds->nfiles; i++)
-		nf += ds->files[i].used;
+		nf += ds->files[i].used && !ds->files[i].journal;
 	put_be32(tmp, nf);
 	buf_append(&b, tmp, 4);
 	for (size_t i = 0; i < ds->nfiles; i++)
-		if (ds->files[i].used)
+		if (ds->files[i].used && !ds->files[i].journal)
 		{
 			put_be64(tmp, ds->files[i].id);
 			buf_append(&b, tmp, 8);
@@ -574,17 +643,322 @@ write_manifest(DirStore *ds, int crash_point)
 	return ok;
 }
 
+/* -------------------------------------------------------------- journal */
+
+/* Allocates the journal (zeros) to at least end, and some ahead. */
+static void
+journal_reserve(DirStore *ds, uint64_t end)
+{
+	uint64_t	want;
+	int			rc;
+
+	if (end <= ds->jalloc)
+		return;
+	want = end + JOURNAL_AHEAD;
+	if (want > JOURNAL_RESERVE)
+	{
+		errno = EFBIG;
+		die("journal is full:", ds->dir);
+	}
+	rc = posix_fallocate(ds->jfd, (off_t) ds->jalloc, (off_t) (want - ds->jalloc));
+	if (rc != 0)
+	{
+		errno = rc;
+		die("cannot extend the journal in", ds->dir);
+	}
+	ds->jalloc = want;
+	ds->files[ds->jslot].size = (size_t) want;
+}
+
+/* Opens (or creates) journal id and maps it; nothing is read yet. */
+static bool
+journal_open(DirStore *ds, uint64_t id, bool create, char *err, size_t errlen)
+{
+	char		name[64],
+				path[1024];
+	struct stat st;
+	size_t		slot = new_file_slot(ds);
+	DFile	   *f = &ds->files[slot];
+
+	journal_name(name, sizeof(name), id);
+	snprintf(path, sizeof(path), "%s/%s", ds->dir, name);
+	ds->jfd = open(path, O_RDWR | (create ? O_CREAT | O_EXCL : 0), 0600);
+	if (ds->jfd < 0)
+	{
+		snprintf(err, errlen, "journal %s is missing or unreadable", name);
+		return false;
+	}
+	if (fstat(ds->jfd, &st) != 0)
+		die("cannot stat", path);
+	f->map = mmap(NULL, JOURNAL_RESERVE, PROT_READ, MAP_SHARED | MAP_NORESERVE, ds->jfd, 0);
+	if (f->map == MAP_FAILED)
+		die("cannot map", path);
+	f->reserve = JOURNAL_RESERVE;
+	f->journal = true;
+	f->used = true;
+	f->id = id;
+	f->size = (size_t) st.st_size;
+	f->live_bytes = f->dead_bytes = 0;
+	ds->journal_id = id;
+	ds->jslot = (uint32_t) slot;
+	ds->jalloc = (uint64_t) st.st_size;
+	ds->jend = 0;
+	if (create)
+	{
+		journal_reserve(ds, 1);
+		if (fsync(ds->jfd) != 0)
+			die("cannot sync", path);
+		fsync_dir(ds->dir);
+	}
+	return true;
+}
+
+static void
+journal_write(DirStore *ds, const uint8_t *data, size_t len)
+{
+	size_t		done = 0;
+
+	journal_reserve(ds, ds->jend + len);
+	while (done < len)
+	{
+		ssize_t		n = pwrite(ds->jfd, data + done, len - done, (off_t) (ds->jend + done));
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			die("cannot write the journal in", ds->dir);
+		done += (size_t) n;
+	}
+	ds->jend += len;
+}
+
+/* Appends a record of the given kind: its payload is what follows *start. */
+static size_t
+rec_begin(Buf *b, char kind)
+{
+	size_t		start = b->len;
+	uint8_t		hdr[JREC_HDR] = {0, 0, 0, 0, (uint8_t) kind};
+
+	buf_append(b, hdr, JREC_HDR);
+	return start;
+}
+
+static void
+rec_end(Buf *b, size_t start)
+{
+	uint8_t		crc[JREC_CRC];
+
+	put_be32(b->data + start, (uint32_t) (b->len - start + JREC_CRC));
+	put_be32(crc, crc32c(b->data + start, b->len - start));
+	buf_append(b, crc, JREC_CRC);
+}
+
+static void
+root_record(DirStore *ds, Buf *b)
+{
+	size_t		start = rec_begin(b, 'R');
+	uint8_t		tmp[PHASH_LEN + 8];
+
+	put_be64(tmp, ds->roots.n);
+	buf_append(b, tmp, 8);
+	for (size_t i = 0; i < ds->roots.cap; i++)
+		if (ds->roots.used[i])
+		{
+			memcpy(tmp, ds->roots.keys[i].b, PHASH_LEN);
+			put_be64(tmp + PHASH_LEN, ds->roots.vals[i]);
+			buf_append(b, tmp, PHASH_LEN + 8);
+		}
+	buf_append_byte(b, ds->has_state);
+	if (ds->has_state)
+		buf_append(b, ds->state.b, PHASH_LEN);
+	rec_end(b, start);
+}
+
+/* The length of a whole, valid record at off, or 0. */
+static uint32_t
+rec_valid(const uint8_t *map, uint64_t size, uint64_t off)
+{
+	uint32_t	len;
+
+	if (off + JREC_HDR > size)
+		return 0;
+	len = get_be32(map + off);
+	if (len < JREC_HDR + JREC_CRC || len > JREC_MAX || off + len > size)
+		return 0;
+	if (crc32c(map + off, len - JREC_CRC) != get_be32(map + off + len - JREC_CRC))
+		return 0;
+	return len;
+}
+
+static bool
+read_root_record(DirStore *ds, const uint8_t *p, uint32_t len, PHashMap *roots,
+				 bool *has_state, PHash *state)
+{
+	const uint8_t *end = p + len - JREC_CRC;
+	uint64_t	n;
+
+	p += JREC_HDR;
+	if (end - p < 9)
+		return false;
+	n = get_be64(p);
+	p += 8;
+	if ((uint64_t) (end - p) < n * (PHASH_LEN + 8) + 1)
+		return false;
+	phmap_free(roots);
+	phmap_init(roots);
+	for (uint64_t i = 0; i < n; i++, p += PHASH_LEN + 8)
+	{
+		PHash		h;
+		bool		created;
+
+		memcpy(h.b, p, PHASH_LEN);
+		*phmap_ref(roots, &h, &created) = get_be64(p + PHASH_LEN);
+	}
+	*has_state = *p++ != 0;
+	if (*has_state)
+	{
+		if (end - p < PHASH_LEN)
+			return false;
+		memcpy(state->b, p, PHASH_LEN);
+	}
+	return true;
+}
+
+/* Cuts the journal after its last good record, and syncs. */
+static void
+journal_cut(DirStore *ds, uint64_t at)
+{
+	if (ftruncate(ds->jfd, (off_t) at) != 0)
+		die("cannot truncate the journal in", ds->dir);
+	ds->jalloc = at;
+	ds->files[ds->jslot].size = (size_t) at;
+	ds->jend = at;
+	journal_reserve(ds, at + 1);
+	if (fdatasync(ds->jfd) != 0)
+		die("cannot sync the journal in", ds->dir);
+}
+
+/*
+ * Replays the journal: chunks indexed, the last root record's roots and
+ * state taken.  With stop set, stops after the root record whose state is
+ * *stop (or at the start, if the manifest's state is) and cuts the rest.
+ */
+static bool
+journal_replay(DirStore *ds, const PHash *stop, char *err, size_t errlen)
+{
+	DFile	   *f = &ds->files[ds->jslot];
+	const uint8_t *map = f->map;
+	uint64_t	size = ds->jalloc,
+				off = 0;
+	bool		found = stop && ds->has_state && phash_eq(&ds->state, stop);
+
+	if (found)
+	{
+		/* What the manifest names: the journal adds nothing to it. */
+		journal_cut(ds, 0);
+		return true;
+	}
+	while (off < size)
+	{
+		uint32_t	len;
+
+		if (off + 4 <= size && get_be32(map + off) == 0)
+			break;				/* the zeros past the end */
+		len = rec_valid(map, size, off);
+		if (len == 0)
+		{
+			/* Torn, or damaged within: a valid root record later says which. */
+			for (uint64_t q = off + 1; q + JREC_HDR + JREC_CRC <= size; q++)
+			{
+				uint32_t	ql;
+
+				if (map[q + 4] != 'R')
+					continue;
+				ql = rec_valid(map, size, q);
+				if (ql != 0)
+				{
+					snprintf(err, errlen,
+							 "journal damaged at offset %llu with a valid root record after it "
+							 "(not a torn tail): repair from a backup",
+							 (unsigned long long) off);
+					return false;
+				}
+			}
+			break;
+		}
+		if (map[off + 4] == 'C')
+		{
+			PHash		h;
+			uint32_t	clen = len - JREC_HDR - PHASH_LEN - JREC_CRC;
+			DEntry	   *e;
+
+			memcpy(h.b, map + off + JREC_HDR, PHASH_LEN);
+			if (ds_find(ds, &h))
+				f->dead_bytes += len;
+			else
+			{
+				e = ds_insert(ds, &h);
+				e->file = ds->jslot;
+				e->off = off + JREC_HDR + PHASH_LEN;
+				e->len = clen;
+				f->live_bytes += len;
+				ds->live += clen;
+			}
+		}
+		else if (map[off + 4] == 'R')
+		{
+			if (!read_root_record(ds, map + off, len, &ds->roots, &ds->has_state, &ds->state))
+			{
+				snprintf(err, errlen, "journal root record at %llu does not parse",
+						 (unsigned long long) off);
+				return false;
+			}
+			if (stop && ds->has_state && phash_eq(&ds->state, stop))
+			{
+				found = true;
+				off += len;
+				break;
+			}
+		}
+		else
+		{
+			snprintf(err, errlen, "journal record of unknown kind at %llu",
+					 (unsigned long long) off);
+			return false;
+		}
+		off += len;
+	}
+	if (stop && !found)
+	{
+		char		hex[PHASH_HEX_LEN + 1];
+
+		phash_hex(stop, hex);
+		snprintf(err, errlen, "no root record has state %s", hex);
+		return false;
+	}
+	if (stop || off < size)
+		journal_cut(ds, off);
+	ds->jend = off;
+	return true;
+}
+
 /* ------------------------------------------------------------------- flush */
 
+/*
+ * Appends the new chunks and a root record to the journal and syncs it:
+ * the commit point.  Nothing to do if nothing changed.
+ */
 int
 dirstore_flush(ChunkStore *cs)
 {
 	DirStore   *ds = (DirStore *) cs;
 	DEntry	  **ents = NULL;
+	size_t	   *at = NULL;
 	size_t		n = 0,
 				cap = 0,
-				bytes = 0,
-				start = 0;
+				acap = 0;
+	Buf			b = BUF_INIT;
+	uint64_t	base = ds->jend;
 
 	for (size_t i = 0; i < ds->cap; i++)
 		if (ds->tab[i].state == SLOT_USED && ds->tab[i].file == IN_MEM)
@@ -592,29 +966,59 @@ dirstore_flush(ChunkStore *cs)
 			px_grow((void **) &ents, &cap, n + 1, sizeof(DEntry *));
 			ents[n++] = &ds->tab[i];
 		}
-	/* one file per file_target bytes */
-	for (size_t i = 0; i <= n; i++)
+	if (n == 0 && !ds->dirty)
+		return CS_OK;
+	for (size_t i = 0; i < n; i++)
 	{
-		if (i == n || (bytes > 0 && bytes + ents[i]->len > ds->file_target))
-		{
-			if (i > start &&
-				!write_chunk_file(ds, ents + start, i - start, DS_FP_FLUSH_BEFORE_RENAME))
-			{
-				free(ents);
-				return DS_CRASHED;
-			}
-			start = i;
-			bytes = 0;
-		}
-		if (i < n)
-			bytes += REC_HDR + ents[i]->len;
+		size_t		start = rec_begin(&b, 'C');
+
+		buf_append(&b, ents[i]->h.b, PHASH_LEN);
+		px_grow((void **) &at, &acap, i + 1, sizeof(size_t));
+		at[i] = b.len;
+		buf_append(&b, ents[i]->mem, ents[i]->len);
+		rec_end(&b, start);
 	}
+	if (ds->failpoint == DS_FP_JOURNAL_BEFORE_ROOT)
+	{
+		journal_write(ds, b.data, b.len);
+		buf_free(&b);
+		free(ents);
+		free(at);
+		return DS_CRASHED;
+	}
+	root_record(ds, &b);
+	journal_write(ds, b.data, b.len);
+	buf_free(&b);
+	if (ds->failpoint == DS_FP_JOURNAL_BEFORE_SYNC)
+	{
+		free(ents);
+		free(at);
+		return DS_CRASHED;
+	}
+	if (fdatasync(ds->jfd) != 0)
+		die("cannot sync the journal in", ds->dir);
+
+	/* The chunks now live in the journal. */
+	for (size_t i = 0; i < n; i++)
+	{
+		DEntry	   *e = ents[i];
+
+		free(e->mem);
+		e->mem = NULL;
+		e->file = ds->jslot;
+		e->off = base + at[i];
+		ds->files[ds->jslot].live_bytes += JREC_HDR + PHASH_LEN + e->len + JREC_CRC;
+	}
+	ds->dirty = false;
 	free(ents);
-	if (ds->failpoint == DS_FP_FLUSH_BEFORE_MANIFEST)
-		return DS_CRASHED;
-	if (!write_manifest(ds, -1))
-		return DS_CRASHED;
+	free(at);
 	return CS_OK;
+}
+
+uint64_t
+dirstore_journal_end(ChunkStore *cs)
+{
+	return ((DirStore *) cs)->jend;
 }
 
 /* ------------------------------------------------------------- compaction */
@@ -651,7 +1055,7 @@ dirstore_file_count(ChunkStore *cs)
 	size_t		n = 0;
 
 	for (size_t i = 0; i < ds->nfiles; i++)
-		n += ds->files[i].used;
+		n += ds->files[i].used && !ds->files[i].journal;
 	return n;
 }
 
@@ -690,7 +1094,7 @@ dirstore_compact(ChunkStore *cs, double min_dead_fraction, DirCompactStats *st)
 	nf0 = ds->nfiles;
 	victim = calloc(nf0 + 1, sizeof(bool));
 	for (size_t i = 0; i < nf0; i++)
-		if (ds->files[i].used && ds->files[i].size < ds->file_target / 4)
+		if (ds->files[i].used && !ds->files[i].journal && ds->files[i].size < ds->file_target / 4)
 			nsmall++;
 	for (size_t i = 0; i < nf0; i++)
 	{
@@ -699,6 +1103,16 @@ dirstore_compact(ChunkStore *cs, double min_dead_fraction, DirCompactStats *st)
 
 		if (!f->used)
 			continue;
+		if (f->journal)
+		{
+			/* The journal is always folded into chunk files. */
+			if (ds->jend > 0)
+			{
+				victim[i] = true;
+				nvict++;
+			}
+			continue;
+		}
 		if ((f->dead_bytes > 0 && total > 0 &&
 			 (double) f->dead_bytes >= min_dead_fraction * (double) total) ||
 			(nsmall > 1 && f->size < ds->file_target / 4))
@@ -752,7 +1166,20 @@ dirstore_compact(ChunkStore *cs, double min_dead_fraction, DirCompactStats *st)
 		free(victim);
 		return DS_CRASHED;
 	}
-	/* the manifest no longer names the old files; then they go */
+	/* a new journal, then a manifest naming it and not the old files */
+	{
+		uint32_t	old = ds->jslot;
+		int			oldfd = ds->jfd;
+		char		jerr[256];
+
+		if (victim[old])
+		{
+			if (!journal_open(ds, ds->next_id++, true, jerr, sizeof(jerr)))
+				die("cannot create a journal in", ds->dir);
+			close(oldfd);
+			ds->files[old].used = true;
+		}
+	}
 	for (size_t i = 0; i < nf0; i++)
 		if (victim[i])
 			ds->files[i].used = false;
@@ -772,7 +1199,10 @@ dirstore_compact(ChunkStore *cs, double min_dead_fraction, DirCompactStats *st)
 			char		name[64],
 						path[1024];
 
-			file_name(name, sizeof(name), ds->files[i].id);
+			if (ds->files[i].journal)
+				journal_name(name, sizeof(name), ds->files[i].id);
+			else
+				file_name(name, sizeof(name), ds->files[i].id);
 			snprintf(path, sizeof(path), "%s/%s", ds->dir, name);
 			ds->files[i].used = true;	/* for unmap_file's bookkeeping */
 			unmap_file(&ds->files[i]);
@@ -872,6 +1302,8 @@ remove_strays(DirStore *ds)
 
 		if (len > 4 && strcmp(nm + len - 4, ".tmp") == 0)
 			stray = true;
+		else if (strncmp(nm, "j-", 2) == 0 && len > 10 && strcmp(nm + len - 8, ".journal") == 0)
+			stray = strtoull(nm + 2, NULL, 16) != ds->journal_id;
 		else if (strncmp(nm, "c-", 2) == 0 && len > 7 && strcmp(nm + len - 7, ".chunks") == 0)
 		{
 			uint64_t	id = strtoull(nm + 2, NULL, 16);
@@ -1017,6 +1449,16 @@ rebuild_holds(DirStore *ds, char *err, size_t errlen)
 ChunkStore *
 dirstore_open(const char *dir, char *err, size_t errlen)
 {
+	return dirstore_open_at(dir, NULL, err, errlen);
+}
+
+/*
+ * Opens the store as of the root record whose state is *stop (NULL: the
+ * last), cutting the journal after it.
+ */
+ChunkStore *
+dirstore_open_at(const char *dir, const PHash *stop, char *err, size_t errlen)
+{
 	DirStore   *ds = px_malloc(sizeof(DirStore));
 	char		path[1024];
 	int			fd;
@@ -1031,6 +1473,7 @@ dirstore_open(const char *dir, char *err, size_t errlen)
 	ds->file_target = 64 << 20;
 	ds->next_id = 1;
 	ds->failpoint = -1;
+	ds->jfd = -1;
 	phmap_init(&ds->roots);
 	if (ds->tab == NULL)
 		abort();
@@ -1056,7 +1499,7 @@ dirstore_open(const char *dir, char *err, size_t errlen)
 		close(fd);
 		end = m + st.st_size;
 		phash_compute(m, (size_t) st.st_size - PHASH_LEN, &sum);
-		if (st.st_size < 8 + 4 + 8 + 4 + 8 + 1 + PHASH_LEN ||
+		if (st.st_size < 8 + 4 + 8 + 8 + 4 + 8 + 1 + PHASH_LEN ||
 			memcmp(m, MANIFEST_MAGIC, 8) != 0 || get_be32(m + 8) != DS_FORMAT ||
 			memcmp(sum.b, end - PHASH_LEN, PHASH_LEN) != 0)
 		{
@@ -1065,8 +1508,9 @@ dirstore_open(const char *dir, char *err, size_t errlen)
 			goto fail;
 		}
 		ds->next_id = get_be64(m + 12);
-		nf = get_be32(m + 20);
-		p = m + 24;
+		ds->journal_id = get_be64(m + 20);
+		nf = get_be32(m + 28);
+		p = m + 32;
 		for (uint32_t i = 0; i < nf; i++, p += 8)
 			if (!load_file(ds, get_be64(p), err, errlen))
 			{
@@ -1087,6 +1531,20 @@ dirstore_open(const char *dir, char *err, size_t errlen)
 		if (ds->has_state)
 			memcpy(ds->state.b, p, PHASH_LEN);
 		free(m);
+		if (!journal_open(ds, ds->journal_id, false, err, errlen) ||
+			!journal_replay(ds, stop, err, errlen))
+			goto fail;
+	}
+	else
+	{
+		/* A new store: its journal, and a manifest naming it, first. */
+		if (stop)
+		{
+			snprintf(err, errlen, "no store to open as of a root");
+			goto fail;
+		}
+		if (!journal_open(ds, ds->next_id++, true, err, errlen) || !write_manifest(ds, -1))
+			goto fail;
 	}
 	remove_strays(ds);
 	if (!rebuild_holds(ds, err, errlen))
@@ -1161,7 +1619,9 @@ dirstore_crash(ChunkStore *cs)
 
 	for (size_t i = 0; i < ds->nfiles; i++)
 		if (ds->files[i].map)
-			munmap(ds->files[i].map, ds->files[i].size);
+			munmap(ds->files[i].map, ds->files[i].journal ? ds->files[i].reserve : ds->files[i].size);
+	if (ds->jfd >= 0)
+		close(ds->jfd);
 	for (size_t i = 0; i < ds->cap; i++)
 		if (ds->tab[i].state == SLOT_USED && ds->tab[i].file == IN_MEM)
 			free(ds->tab[i].mem);

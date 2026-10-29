@@ -40,8 +40,8 @@ cleanup(char *dir)
 
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
 			continue;
-		CHECK(strncmp(de->d_name, "c-", 2) == 0 || strcmp(de->d_name, "MANIFEST") == 0 ||
-			  strstr(de->d_name, ".tmp") != NULL);
+		CHECK(strncmp(de->d_name, "c-", 2) == 0 || strncmp(de->d_name, "j-", 2) == 0 ||
+			  strcmp(de->d_name, "MANIFEST") == 0 || strstr(de->d_name, ".tmp") != NULL);
 		snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
 		CHECK(unlink(path) == 0);
 	}
@@ -243,6 +243,9 @@ test_files_are_immutable(void)
 		prolly_release_pins(&ctx);
 		CHECK_OK(dirstore_flush(cs));
 	}
+	/* flushes go to the journal; compaction writes the chunk files */
+	CHECK_EQ(dirstore_file_count(cs), 0);
+	CHECK_OK(dirstore_compact(cs, 0.0, &st));
 	list_files(dir, &first);
 	CHECK(first.n >= 4);
 	usleep(20000);				/* so a rewrite would show in the mtime */
@@ -262,7 +265,8 @@ test_files_are_immutable(void)
 	}
 	cs_unref_root(cs, &roots[0]);
 	cs_unref_root(cs, &roots[1]);
-	CHECK_OK(dirstore_compact(cs, 0.1, &st));
+	/* any dead space: the three roots share most chunks, packed together */
+	CHECK_OK(dirstore_compact(cs, 0.0, &st));
 	CHECK(st.files_after > 0);
 	list_files(dir, &later);
 	for (int i = 0; i < first.n; i++)
@@ -320,6 +324,11 @@ test_corruption_detected(void)
 	cs_ref_root(cs, &root);
 	prolly_release_pins(&ctx);
 	prolly_ctx_free(&ctx);
+	{
+		DirCompactStats st;
+
+		CHECK_OK(dirstore_compact(cs, 0.0, &st));	/* chunk files from the journal */
+	}
 	cs_destroy(cs);
 	list_files(dir, &l);
 	for (int i = 0; i < l.n; i++)
@@ -454,7 +463,7 @@ static void
 test_crash_points(void)
 {
 	static const int points[] = {
-		DS_FP_FLUSH_BEFORE_RENAME, DS_FP_FLUSH_BEFORE_MANIFEST,
+		DS_FP_JOURNAL_BEFORE_ROOT, DS_FP_JOURNAL_BEFORE_SYNC,
 		DS_FP_COMPACT_BEFORE_RENAME, DS_FP_COMPACT_BEFORE_MANIFEST,
 		DS_FP_COMPACT_BEFORE_UNLINK
 	};
@@ -504,12 +513,17 @@ test_crash_points(void)
 			/* the free was never in a manifest, but b was: b intact */
 			CHECK_EQ(t_count(&ctx, &b), 6250);	/* 250 of the edits are new odd keys */
 		}
-		else if (points[p] == DS_FP_FLUSH_BEFORE_RENAME ||
-				 points[p] == DS_FP_FLUSH_BEFORE_MANIFEST)
+		else if (points[p] == DS_FP_JOURNAL_BEFORE_ROOT)
 		{
-			/* the flush never completed: back to a alone */
+			/* no root record: back to a alone, b's chunks unreferenced */
 			CHECK(!cs->ops->has(cs, &b));
 			CHECK_EQ(t_count(&ctx, &a), 6000);
+		}
+		else
+		{
+			/* the root record reached the file (a process crash, not a
+			 * power cut: the page cache keeps it), so b is committed */
+			CHECK_EQ(t_count(&ctx, &b), 6250);
 		}
 		/* no file the manifest does not name survives the reopen */
 		list_files(dir, &l);
@@ -524,6 +538,269 @@ test_crash_points(void)
 		cs_destroy(cs);
 		cleanup(dir);
 	}
+}
+
+/* ---------------------------------------------------------------- journal */
+
+/* The journal's path in dir (there is one). */
+static void
+journal_path(const char *dir, char *out, size_t n)
+{
+	DIR		   *d = opendir(dir);
+	struct dirent *de;
+
+	out[0] = '\0';
+	while ((de = readdir(d)) != NULL)
+		if (strncmp(de->d_name, "j-", 2) == 0)
+			snprintf(out, n, "%s/%s", dir, de->d_name);
+	closedir(d);
+	CHECK(out[0] != '\0');
+}
+
+static uint8_t *
+read_all(const char *path, size_t *len)
+{
+	struct stat st;
+	FILE	   *f = fopen(path, "rb");
+	uint8_t    *b;
+
+	CHECK(f != NULL && stat(path, &st) == 0);
+	b = px_malloc((size_t) st.st_size + 1);
+	CHECK(fread(b, 1, (size_t) st.st_size, f) == (size_t) st.st_size);
+	fclose(f);
+	*len = (size_t) st.st_size;
+	return b;
+}
+
+/*
+ * Three commits a, b, c, each flushed: their roots held and their state
+ * set to their root.  Returns the journal end after each.
+ */
+static void
+three_commits(const char *dir, PHash *roots, uint64_t *ends)
+{
+	ChunkStore *cs = reopen(dir);
+	ProllyCtx	ctx;
+
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	for (int i = 0; i < 3; i++)
+	{
+		EditBatch	b;
+
+		if (i == 0)
+			roots[i] = build_even_rows(&ctx, 3000);
+		else
+		{
+			batch_init(&b, 200);
+			for (uint64_t k = 0; k < 200; k++)
+				batch_put(&b, k * 13 + (uint64_t) i, (uint64_t) i);
+			roots[i] = t_apply(&ctx, &roots[i - 1], b.e, b.n);
+			batch_free(&b);
+		}
+		cs_ref_root(cs, &roots[i]);
+		if (i > 0)
+			cs_unref_root(cs, &roots[i - 1]);
+		dirstore_set_state(cs, &roots[i]);
+		prolly_release_pins(&ctx);
+		CHECK_OK(dirstore_flush(cs));
+		ends[i] = dirstore_journal_end(cs);
+	}
+	prolly_ctx_free(&ctx);
+	dirstore_crash(cs);			/* nothing more to write */
+}
+
+/* Flushes append to the journal and nothing else; earlier bytes stay. */
+static void
+test_journal_append_only(void)
+{
+	char	   *dir = tmpdir();
+	PHash		roots[3];
+	uint64_t	ends[3];
+	char		jp[1024];
+	size_t		len1,
+				len2;
+	uint8_t    *before,
+			   *after;
+	ChunkStore *cs;
+	ProllyCtx	ctx;
+	PHash		more;
+	PHash		st;
+
+	three_commits(dir, roots, ends);
+	journal_path(dir, jp, sizeof(jp));
+	before = read_all(jp, &len1);
+	CHECK(ends[0] < ends[1] && ends[1] < ends[2] && ends[2] <= len1);
+	cs = reopen(dir);
+	CHECK_EQ(dirstore_file_count(cs), 0);	/* no chunk files yet */
+	CHECK(dirstore_get_state(cs, &st) && phash_eq(&st, &roots[2]));
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	more = build_even_rows(&ctx, 500);
+	cs_ref_root(cs, &more);
+	prolly_release_pins(&ctx);
+	CHECK_OK(dirstore_flush(cs));
+	after = read_all(jp, &len2);
+	CHECK(memcmp(before, after, (size_t) ends[2]) == 0);
+	CHECK(dirstore_journal_end(cs) > ends[2]);
+	verify_store(cs);
+	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
+	free(before);
+	free(after);
+	cleanup(dir);
+}
+
+/*
+ * A power cut loses whatever was not synced: the journal cut anywhere
+ * after commit a's end opens as the last commit wholly before the cut,
+ * with every chunk of it there and the store consistent.
+ */
+static void
+test_journal_torn_tail(void)
+{
+	char	   *dir = tmpdir();
+	PHash		roots[3];
+	uint64_t	ends[3];
+	char		jp[1024];
+	size_t		len;
+	uint8_t    *orig;
+	int			cuts = 0;
+
+	three_commits(dir, roots, ends);
+	journal_path(dir, jp, sizeof(jp));
+	orig = read_all(jp, &len);
+	for (uint64_t cut = ends[0]; cut <= ends[2]; cut += 1 + (ends[2] - ends[0]) / 97)
+	{
+		uint64_t	at = cut;
+		ChunkStore *cs;
+		ProllyCtx	ctx;
+		PHash		st;
+		int			want = cut >= ends[2] ? 2 : cut >= ends[1] ? 1 : 0;
+		FILE	   *f;
+
+		for (int pass = 0; pass < 2; pass++)
+		{
+			/* the cut, then (second pass) the same cut torn mid-record */
+			f = fopen(jp, "wb");
+			CHECK(f && fwrite(orig, 1, (size_t) at, f) == (size_t) at);
+			if (pass == 1)
+			{
+				static const uint8_t junk[7] = {0, 0, 0x40, 0, 'C', 1, 2};
+
+				fwrite(junk, 1, sizeof(junk), f);	/* a header that runs past the end */
+			}
+			fclose(f);
+			cs = reopen(dir);
+			CHECK(dirstore_get_state(cs, &st) && phash_eq(&st, &roots[want]));
+			prolly_ctx_init(&ctx, cs, &small_policy);
+			CHECK_EQ(t_count(&ctx, &roots[want]), 3000 + (want >= 1 ? 100 : 0) + (want >= 2 ? 100 : 0));
+			verify_store(cs);
+			CHECK(dirstore_journal_end(cs) <= at);
+			prolly_ctx_free(&ctx);
+			dirstore_crash(cs);
+			cuts++;
+		}
+	}
+	CHECK(cuts > 100);
+	free(orig);
+	cleanup(dir);
+}
+
+/* Damage before a valid root record is not a torn tail: the open refuses. */
+static void
+test_journal_mid_log_damage(void)
+{
+	char	   *dir = tmpdir();
+	PHash		roots[3];
+	uint64_t	ends[3];
+	char		jp[1024],
+				err[256];
+	FILE	   *f;
+	int			c;
+	ChunkStore *cs;
+	PHash		st;
+
+	three_commits(dir, roots, ends);
+	journal_path(dir, jp, sizeof(jp));
+	f = fopen(jp, "r+b");
+	CHECK(fseek(f, 40, SEEK_SET) == 0);	/* inside commit a's first chunk */
+	c = fgetc(f);
+	CHECK(fseek(f, 40, SEEK_SET) == 0);
+	fputc(c ^ 1, f);
+	fclose(f);
+	CHECK(dirstore_open(dir, err, sizeof(err)) == NULL);
+	CHECK(strstr(err, "not a torn tail") != NULL);
+
+	/* the same damage in the last commit's records is a torn tail */
+	f = fopen(jp, "r+b");
+	CHECK(fseek(f, 40, SEEK_SET) == 0);
+	fputc(c, f);
+	CHECK(fseek(f, (long) ends[2] - 9, SEEK_SET) == 0);	/* in c's root record */
+	c = fgetc(f);
+	CHECK(fseek(f, (long) ends[2] - 9, SEEK_SET) == 0);
+	fputc(c ^ 1, f);
+	fclose(f);
+	cs = reopen(dir);
+	CHECK(dirstore_get_state(cs, &st) && phash_eq(&st, &roots[1]));
+	verify_store(cs);
+	dirstore_crash(cs);
+	cleanup(dir);
+}
+
+/*
+ * Opening as of an earlier root record: what is after it is cut away, and
+ * the store carries on from there.  An unknown state is refused.
+ */
+static void
+test_journal_open_at(void)
+{
+	char	   *dir = tmpdir();
+	PHash		roots[3],
+				st,
+				nowhere;
+	uint64_t	ends[3];
+	char		err[256];
+	ChunkStore *cs;
+	ProllyCtx	ctx;
+	DirCompactStats cst;
+
+	three_commits(dir, roots, ends);
+	memset(nowhere.b, 7, PHASH_LEN);
+	CHECK(dirstore_open_at(dir, &nowhere, err, sizeof(err)) == NULL);
+	CHECK(strstr(err, "no root record") != NULL);
+
+	cs = dirstore_open_at(dir, &roots[0], err, sizeof(err));
+	CHECK(cs != NULL);
+	CHECK(dirstore_get_state(cs, &st) && phash_eq(&st, &roots[0]));
+	CHECK_EQ(dirstore_journal_end(cs), ends[0]);
+	CHECK(!cs->ops->has(cs, &roots[2]));
+	verify_store(cs);
+	dirstore_crash(cs);
+
+	/* the cut is durable: a plain open now sees a */
+	cs = reopen(dir);
+	CHECK(dirstore_get_state(cs, &st) && phash_eq(&st, &roots[0]));
+	/* and a later commit, then compaction, then opening as of it */
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	{
+		PHash		d = build_even_rows(&ctx, 1234);
+
+		cs_ref_root(cs, &d);
+		dirstore_set_state(cs, &d);
+		prolly_release_pins(&ctx);
+		CHECK_OK(dirstore_compact(cs, 0.0, &cst));
+		CHECK(dirstore_file_count(cs) > 0 && dirstore_journal_end(cs) == 0);
+		prolly_ctx_free(&ctx);
+		dirstore_crash(cs);
+		cs = dirstore_open_at(dir, &d, err, sizeof(err));
+		CHECK(cs != NULL);
+		prolly_ctx_init(&ctx, cs, &small_policy);
+		CHECK_EQ(t_count(&ctx, &d), 1234);
+		CHECK_EQ(t_count(&ctx, &roots[0]), 3000);
+		verify_store(cs);
+		prolly_ctx_free(&ctx);
+		cs_destroy(cs);
+	}
+	cleanup(dir);
 }
 
 /* ------------------------------------------------- severing gives disk back */
@@ -650,8 +927,11 @@ test_severing_gives_disk_back(void)
 	/* with it, disk follows what the window holds, not history's length */
 	CHECK_LE(gc.disk[last], gc.disk[mid] * 13 / 10);
 	CHECK_LE(gc.disk[last], none.disk[last] / 2);
-	/* just after a compaction, disk is close to the live bytes */
-	CHECK_LE(gc.disk[last], gc.live[last] * 3 / 2 + (1 << 20));
+	/*
+	 * Just after a compaction, disk is close to the live bytes, plus the
+	 * zeros the journal keeps allocated ahead of its end (4 MB).
+	 */
+	CHECK_LE(gc.disk[last], gc.live[last] * 3 / 2 + (1 << 20) + (4 << 20));
 	/* exported history leaves this host the same way */
 	CHECK_LE(exp.disk[last], gc.disk[last] * 11 / 10 + (1 << 20));
 	CHECK(adisk > 0);
@@ -663,6 +943,10 @@ main(void)
 	RUN(test_round_trip);
 	RUN(test_unflushed_lost_garbage_dropped);
 	RUN(test_files_are_immutable);
+	RUN(test_journal_append_only);
+	RUN(test_journal_torn_tail);
+	RUN(test_journal_mid_log_damage);
+	RUN(test_journal_open_at);
 	RUN(test_corruption_detected);
 	RUN(test_repo_save_and_reopen);
 	RUN(test_crash_points);
