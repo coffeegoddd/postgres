@@ -28,7 +28,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check
+.PHONY: all check clean rebuild-check durability-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
@@ -69,6 +69,14 @@ rebuild-check: bench/rebuild
 	if ./bench/rebuild --move --break keepall >/dev/null 2>&1; then \
 		echo "rebuild: --move --break keepall went unnoticed"; exit 1; \
 	else echo "rebuild: --move --break keepall caught"; fi
+
+# Crash safety and backups, in a cluster of their own (made on first use
+# in CRASHDB, on port 5498): every crash point of a commit recovered, then
+# a base backup recovered to a point in time.
+CRASHDB ?= /home/dustin/pgv2-bench/crashdb
+durability-check: bench/rebuild
+	./bench/rebuild --crash-suite --conninfo "host=/tmp port=5498 user=postgres" --pgdata $(CRASHDB)
+	./bench/rebuild --backup-suite --conninfo "host=/tmp port=5498 user=postgres" --pgdata $(CRASHDB)
 
 bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a

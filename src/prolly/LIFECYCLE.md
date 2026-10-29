@@ -865,6 +865,125 @@ every changed row alone, is caught.
   - the checks after a move run on a database with planner statistics from
     VACUUM ANALYZE (included in the times above, as it is for rebuilds).
 
+## Crash safety and backups
+
+**The design:** a chunk journal in the store, and the commit of record in
+Postgres.  Dolt was the model:
+- **From Dolt:** its chunk journal (length-prefixed, CRC32C records with
+  root records among the chunks, one `fdatasync` per commit, a pre-zeroed
+  tail, refusing to open on mid-log damage); its single root of record;
+  and its incremental backups.
+- **Where it differs:** Dolt owns all its state, so a commit is one root
+  swap.  Here Postgres owns the working set, so the root of record lives in
+  Postgres.  (Dolt's binlog is the cautionary case: written after the
+  commit, not synced, not atomic with it.)
+
+**The store** (`dirstore.c`):
+- **Flushing:** a flush appends the new chunks and a root record (the root
+  set and repo state) to `j-<id>.journal` and fdatasyncs it.  That's the
+  store's commit point, with no new file per commit.
+- **Records:** `[u32 length][kind][payload][crc32c]`.  The file is extended
+  4 MB ahead with zeros, and a zero length ends the log.
+- **Opening:** opening replays the journal after the manifest.
+  - A torn tail is cut.
+  - Damage followed by a valid root record isn't a torn tail, and the open
+    refuses.
+  - `dirstore_open_at` opens as of an earlier root record and cuts what
+    follows.
+- **Compaction:** compaction folds the journal into immutable chunk files
+  and starts a new one.
+
+**A Dolt commit, in order** (`bench/rebuild --durable`):
+1. The barrier, and the stream applied up to it.
+2. The commit's chunks and root record appended to the journal, then
+   synced.
+3. `INSERT INTO prolly.roots` (seq, state, root value, barrier LSN, journal
+   end, the decoder's tables), in an ordinary transaction.  The commit
+   exists from here.
+4. Only then is the replication slot told the WAL up to the barrier may go.
+
+Postgres never names a root whose chunks aren't durable, and the WAL needed
+to redo a commit is kept until the commit is recorded.
+
+**Recovery:**
+1. Open the store as of the last row in `prolly.roots`, cutting any journal
+   records past it.
+2. Rebuild the decoder from that commit's root value and table map.
+3. Replay from the slot, passing over transactions that commit at or
+   before the recorded barrier.  Postgres's own crash recovery can move a
+   slot's position back.
+4. The recomputed commit is the same root value, by content addressing.
+
+**Crash tests** (`make durability-check`, in a cluster of its own on port
+5498).  Each case kills the committer, or Postgres itself, at a point in a
+commit, sometimes followed by a power cut (the journal cut at a random
+offset past the last recorded root).  It then resumes and finishes the
+fixture.  The resumed run must record each step exactly once, as the
+store's log holds it, with every stream root equal to a fresh capture's and
+the store consistent.
+
+| Case | Result |
+|---|---|
+| streamed, nothing durable (commit 1, and across the DDL commit 2) | recovered |
+| journal synced, root not recorded (1, 2) | recovered |
+| root recorded, slot not told (1, 2) | recovered |
+| journal synced, then a power cut | recovered |
+| root recorded, then a power cut | recovered |
+| Postgres down hard mid-commit | recovered |
+| Postgres down hard after the root was recorded | recovered |
+
+The store's own tests cover 200 power-cut points, each cut clean and torn
+mid-record, and all open as the last whole commit.  Damage in the middle of
+the log is refused, and opening as of an older root is tested.
+
+**Backups:**
+- **Physical, with point-in-time recovery** (the backup suite):
+  1. `pg_basebackup` after commit 1, with WAL archived, and the store copied
+     then.
+  2. Commits 2 and 3, and the store copied again with the journal last.
+  3. Recovered to just after commit 2.
+
+  Then:
+  - the recovered database's last commit of record is 2;
+  - the store copied with the base backup refuses to serve it;
+  - the later copy opens as of commit 2, which rebuilds;
+  - the recovered source's tables are commit 2's, apart from the unlogged
+    table, which recovery empties.
+
+  The rule: copy the store after the base backup, journal last.  The
+  journal is append-only and content-addressed, so a later copy holds every
+  earlier root's chunks, as long as compaction keeps what a retained backup
+  needs.
+- **Logical, incremental** (`--backup DIR`): after every commit the repo is
+  pushed to a backup store, and only the chunks it lacks are sent.  Restored
+  from the backup alone, the last commit rebuilds.
+
+| Commit | Commit time | Journal sync | Root row | Source WAL | Journal added | Backup sent |
+|---|---|---|---|---|---|---|
+| load | 3.9 s | 0.32 s | 7 ms | 114 MB | 32.9 MB (0.29×) | 32.6 MB, 0.28 s |
+| rows changed | 1.0 s | 13 ms | 6 ms | 18.5 MB | 4.5 MB (0.24×) | 4.4 MB, 0.04 s |
+| DDL | 4.5 s | 76 ms | 6 ms | 133 MB | 28.3 MB (0.21×) | 28.1 MB, 0.26 s |
+| rows changed | 1.8 s | 28 ms | 7 ms | 44 MB | 10.6 MB (0.24×) | 10.5 MB, 0.09 s |
+
+**What this says about logging chunks through Postgres's WAL:**
+- **The cost:** it would add the journal's bytes to the WAL, 21–29% more
+  here.  This fixture's WAL is heavy (index builds, full-page images);
+  workloads of small random updates write far less WAL per changed row, so
+  the ratio would be higher (the disk benchmark wrote about 9 MB of chunks
+  per 2,000 random updates).
+- **What it would buy:** standbys and point-in-time recovery of the store
+  with no extra steps.
+- **What the journal plus root row costs:** one fdatasync and one small
+  transaction per commit, and point-in-time recovery works as long as the
+  store is copied after the base backup.
+
+  The cheaper next step, if history must survive failover, is recomputing
+  the store on a standby from the WAL, which already holds everything a
+  commit is made from.
+- **Not covered:**
+  - compaction's retention rule for chunks that backups still need;
+  - concurrent writers while crashing.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

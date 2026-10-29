@@ -35,6 +35,8 @@ typedef struct PgoCallbacks
 						   const PgoTuple *old, const PgoTuple *new_);
 	void		(*truncate) (void *arg, int n, const uint32_t *relids);
 	void		(*commit) (void *arg, uint64_t lsn);
+	/* A transaction begins; final_lsn is where it commits. */
+	void		(*begin) (void *arg, uint64_t final_lsn);
 	void		(*message) (void *arg, bool transactional, const char *prefix,
 							const char *data, size_t len, uint64_t lsn);
 } PgoCallbacks;

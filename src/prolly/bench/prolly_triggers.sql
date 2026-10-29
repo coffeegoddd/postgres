@@ -82,3 +82,16 @@ $body$;
 
 CREATE EVENT TRIGGER prolly_ddl_start ON ddl_command_start EXECUTE FUNCTION prolly.ddl_start();
 CREATE EVENT TRIGGER prolly_ddl_end ON ddl_command_end EXECUTE FUNCTION prolly.ddl_end();
+
+-- The commits of record: a Dolt commit exists once its row is here.  Its
+-- chunks were synced to the store's journal first; the replication slot
+-- lets go of the WAL behind its barrier only after.  tables is what the
+-- stream's decoder needs to pick up from it.
+CREATE TABLE prolly.roots (
+	seq int PRIMARY KEY,
+	state bytea NOT NULL,		-- the repo-state chunk
+	rv bytea NOT NULL,			-- the commit's root value
+	barrier pg_lsn NOT NULL,
+	journal_end bigint NOT NULL,
+	tables text NOT NULL
+);

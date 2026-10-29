@@ -46,6 +46,9 @@ typedef struct Opts
 	bool		stream;			/* commits from the replication stream */
 	const char *sqldir;			/* prolly_tags.sql and prolly_triggers.sql */
 	const char *only;			/* --merge: these scenario numbers (comma separated) */
+	const char *store;			/* --durable: the store's directory */
+	const char *pgdata;			/* --durable: the cluster's (for crashing it) */
+	const char *backup;			/* --durable: an incremental backup store */
 } Opts;
 
 extern Opts o;
@@ -316,6 +319,9 @@ typedef struct Stream
 	bool		stop;
 	uint64_t	barrier_lsn;
 	bool		unflushed;		/* the last barrier was not flushed when written */
+	int			seq;			/* barriers written */
+	uint64_t	skip_lsn;		/* transactions committing at or before it are applied */
+	bool		skipping;		/* in such a transaction */
 	uint64_t	changes,
 				ddl_msgs,
 				rows_msgs,
@@ -331,6 +337,10 @@ extern void drop_slot(void);
 extern void stream_setup(ProllyCtx *ctx, const char *db);
 extern PHash stream_capture(ProllyCtx *ctx, const char *db);
 extern void st_free(STable *t);
+extern void stream_ack(void);
+extern char *stream_tables(void);
+extern void stream_resume(ProllyCtx *ctx, const char *db, const PHash *rv, const char *tables,
+						  uint64_t after_lsn, int seq);
 
 /* ------------------------------------------------------ tags in objects */
 

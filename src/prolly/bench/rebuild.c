@@ -28,9 +28,10 @@
  * a count, for tables without one), and sequence positions.  Indexes are
  * not stored: Postgres builds them from the rows and their definitions.
  */
-#include <getopt.h>
-
 #include "ws.h"
+
+#include <getopt.h>
+#include <sys/wait.h>
 
 #define MAX_STEPS 64
 #define MAX_CHECKS 512
@@ -47,6 +48,9 @@ Opts		o = {
 	0,
 	false,
 	"bench",
+	NULL,
+	NULL,
+	NULL,
 	NULL,
 };
 
@@ -1075,6 +1079,801 @@ run_merges(void)
 	cs_destroy(cs);
 }
 
+/* ---------------------------------------------- durable commits, crashes */
+
+static const char *crash_at;	/* "<step>:<point>" */
+static const char *self_path;
+
+/*
+ * Dies at a named point of a step's commit, as a crash would: the process
+ * goes without cleaning up ("<step>:<point>"), or Postgres goes down hard
+ * first ("<step>:pg-<point>").
+ */
+static void
+maybe_crash(int step, const char *point)
+{
+	char		want[64],
+				pgwant[64];
+
+	if (crash_at == NULL)
+		return;
+	snprintf(want, sizeof(want), "%d:%s", step, point);
+	snprintf(pgwant, sizeof(pgwant), "%d:pg-%s", step, point);
+	if (strcmp(crash_at, pgwant) == 0)
+	{
+		char		cmd[1400];
+
+		snprintf(cmd, sizeof(cmd), "%s/pg_ctl -D '%s' stop -m immediate >/dev/null 2>&1",
+				 o.bindir, o.pgdata);
+		if (system(cmd) != 0)
+			fprintf(stderr, "rebuild: could not crash the server\n");
+	}
+	if (strcmp(crash_at, want) == 0 || strcmp(crash_at, pgwant) == 0)
+	{
+		printf("# crashing at %s\n", crash_at);
+		fflush(stdout);
+		_exit(70);
+	}
+}
+
+static void
+hash_hexval(const PHash *h, char *out)
+{
+	out[0] = '\\';
+	out[1] = 'x';
+	phash_hex(h, out + 2);
+}
+
+static bool
+hex_hash(const char *hex, PHash *out)
+{
+	if (strlen(hex) != 2 * PHASH_LEN)
+		return false;
+	for (int i = 0; i < PHASH_LEN; i++)
+	{
+		unsigned	v;
+
+		if (sscanf(hex + 2 * i, "%2x", &v) != 1)
+			return false;
+		out->b[i] = (uint8_t) v;
+	}
+	return true;
+}
+
+static uint64_t
+wal_lsn(const char *db)
+{
+	PGconn	   *c = pg_open(db);
+	PGresult   *res = pg_exec(c, "SELECT (pg_current_wal_lsn() - '0/0')::text");
+	uint64_t	v = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+
+	PQclear(res);
+	PQfinish(c);
+	return v;
+}
+
+/* The commit of record: a row in prolly.roots, in the source database. */
+static void
+record_root(const char *db, int seq, const PHash *state, const PHash *rv, uint64_t barrier,
+			const char *tables, uint64_t jend)
+{
+	PGconn	   *c = pg_open(db);
+	char		sq[16],
+				sh[64],
+				rh[64],
+				lsn[40],
+				je[24];
+	const char *params[6] = {sq, sh, rh, lsn, je, tables};
+	PGresult   *res;
+
+	snprintf(sq, sizeof(sq), "%d", seq);
+	hash_hexval(state, sh);
+	hash_hexval(rv, rh);
+	snprintf(lsn, sizeof(lsn), "%X/%X", (unsigned) (barrier >> 32), (unsigned) barrier);
+	snprintf(je, sizeof(je), "%" PRIu64, jend);
+	res = PQexecParams(c, "INSERT INTO prolly.roots VALUES ($1::int, $2::bytea, $3::bytea, "
+					   "$4::pg_lsn, $5::int8, $6)", 6, NULL, params, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		die("record root: %s", PQerrorMessage(c));
+	PQclear(res);
+	PQfinish(c);
+}
+
+typedef struct RootRow
+{
+	int			seq;
+	PHash		state,
+				rv;
+	uint64_t	barrier,
+				jend;
+	char	   *tables;
+} RootRow;
+
+/* Every recorded commit, in order; how many. */
+static int
+read_roots(const char *db, RootRow **out)
+{
+	PGconn	   *c = pg_open(db);
+	PGresult   *res = pg_exec(c, "SELECT seq, encode(state, 'hex'), encode(rv, 'hex'), "
+							  "(barrier - '0/0')::text, journal_end, tables FROM prolly.roots ORDER BY seq");
+	int			n = PQntuples(res);
+	RootRow    *r = calloc((size_t) (n ? n : 1), sizeof(RootRow));
+
+	for (int i = 0; i < n; i++)
+	{
+		r[i].seq = atoi(PQgetvalue(res, i, 0));
+		CHECK(hex_hash(PQgetvalue(res, i, 1), &r[i].state));
+		CHECK(hex_hash(PQgetvalue(res, i, 2), &r[i].rv));
+		r[i].barrier = strtoull(PQgetvalue(res, i, 3), NULL, 10);
+		r[i].jend = strtoull(PQgetvalue(res, i, 4), NULL, 10);
+		r[i].tables = strdup(PQgetvalue(res, i, 5));
+	}
+	PQclear(res);
+	PQfinish(c);
+	*out = r;
+	return n;
+}
+
+static void
+applied_path(char *out, size_t n)
+{
+	snprintf(out, n, "%s.applied", o.store);
+}
+
+typedef struct RootList
+{
+	PHash		root[MAX_STEPS];
+	size_t		n;
+} RootList;
+
+static void
+roots_fn(void *arg, const VcCommit *c)
+{
+	RootList   *l = arg;
+
+	if (l->n < MAX_STEPS)
+		l->root[l->n++] = c->root;
+}
+
+/*
+ * The streamed fixture with every commit made durable in order: the
+ * journal synced, the root recorded in Postgres, then the slot told.  With
+ * resume, picks up after a crash from the last recorded commit.  Then
+ * checks: one recorded commit per step, each the commit the store's log
+ * holds, the store consistent, and (unless quick) the last commit
+ * rebuilding to its root value.
+ */
+static void
+run_durable(char **names, int nsteps, bool resume, bool quick)
+{
+	ChunkStore *cs;
+	VcRepo		r;
+	char		err[256],
+				ap[1100];
+	int			start = 0,
+				applied = -1;
+	RootRow    *rows;
+	int			nrows;
+	PHash		state;
+	RootList	log = {0};
+	ChunkStore *bcs = NULL;
+	VcRepo		b;
+	bool		bfresh = false;
+
+	if (o.store == NULL)
+		die("%s", "--durable needs --store");
+	applied_path(ap, sizeof(ap));
+	if (!resume)
+	{
+		cs = dirstore_open(o.store, err, sizeof(err));
+		if (cs == NULL)
+			die("store: %s", err);
+		if (cs->ops->count(cs) != 0)
+			die("%s must start empty", o.store);
+		vc_repo_init(&r, cs, &prolly_default_policy);
+		drop_slot();
+		fresh_database(o.src_db);
+		ws_install(o.src_db, true);
+		stream_setup(&r.ctx, o.src_db);
+		stream.seq = getpid() * 1000;	/* barrier tokens unique across runs */
+		printf("# durable commits: %d steps\n", nsteps);
+	}
+	else
+	{
+		RootRow    *last;
+		FILE	   *f = fopen(ap, "r");
+
+		nrows = read_roots(o.src_db, &rows);
+		if (nrows == 0)
+			die("%s", "nothing recorded to resume from");
+		last = &rows[nrows - 1];
+		cs = dirstore_open_at(o.store, &last->state, err, sizeof(err));
+		if (cs == NULL)
+			die("store: %s", err);
+		CHECK(vc_repo_open(&r, cs, &prolly_default_policy, &last->state) == VC_OK);
+		stream_resume(&r.ctx, o.src_db, &last->rv, last->tables, last->barrier, getpid() * 1000);
+		start = last->seq + 1;
+		applied = last->seq;
+		state = last->state;	/* if every step is already recorded */
+		if (f)
+		{
+			if (fscanf(f, "%d", &applied) != 1)
+				applied = last->seq;
+			fclose(f);
+		}
+		printf("# resuming after step %d (applied through %d), journal cut to %" PRIu64 "\n",
+			   last->seq, applied, dirstore_journal_end(cs));
+	}
+	if (o.backup)
+	{
+		PHash		bst;
+
+		bcs = dirstore_open(o.backup, err, sizeof(err));
+		if (bcs == NULL)
+			die("backup: %s", err);
+		if (dirstore_get_state(bcs, &bst))
+			CHECK(vc_repo_open(&b, bcs, &prolly_default_policy, &bst) == VC_OK);
+		else
+			bfresh = true;
+	}
+	for (int i = start; i < nsteps; i++)
+	{
+		PHash		rv,
+					fresh;
+		char	   *tables;
+		double		t0 = now_sec(),
+					t1,
+					t2;
+		uint64_t	wal0 = wal_lsn(o.src_db),
+					j0 = dirstore_journal_end(cs);
+
+		if (i > applied)
+		{
+			char		file[1024];
+			FILE	   *f;
+
+			snprintf(file, sizeof(file), "%s/%s", o.fixture, names[i]);
+			psql_file(o.src_db, file);
+			f = fopen(ap, "w");
+			fprintf(f, "%d\n", i);
+			fclose(f);
+			applied = i;
+		}
+		rv = stream_capture(&r.ctx, o.src_db);
+		maybe_crash(i, "apply");
+		fresh = logical_capture(&r.ctx, o.src_db);
+		if (!phash_eq(&fresh, &rv))
+		{
+			fail(names[i], "the stream's root value differs from a fresh capture's");
+			explain_mismatch(&r.ctx, &fresh, &rv, names[i]);
+		}
+		vc_set_working(&r, &rv);
+		vc_commit(&r, names[i]);
+		state = vc_repo_save(&r);
+		dirstore_set_state(cs, &state);
+		t1 = now_sec();
+		CHECK_OK(dirstore_flush(cs));
+		t2 = now_sec();
+		maybe_crash(i, "synced");
+		tables = stream_tables();
+		record_root(o.src_db, i, &state, &rv, stream.barrier_lsn, tables,
+					dirstore_journal_end(cs));
+		free(tables);
+		maybe_crash(i, "recorded");
+		stream_ack();
+		{
+			/* Where the WAL is now: a point-in-time target just after this commit. */
+			PGconn	   *c = pg_open(o.src_db);
+			PGresult   *res = pg_exec(c, "SELECT pg_current_wal_lsn()");
+			char		lp[1200];
+			FILE	   *f;
+
+			snprintf(lp, sizeof(lp), "%s.lsn", o.store);
+			f = fopen(lp, "a");
+			fprintf(f, "%d %s\n", i, PQgetvalue(res, 0, 0));
+			fclose(f);
+			PQclear(res);
+			PQfinish(c);
+		}
+		printf("%s: committed in %.2f s (journal sync %.3f s, root recorded %.3f s)\n", names[i],
+			   now_sec() - t0, t2 - t1, now_sec() - t2);
+		{
+			/*
+			 * The source's WAL for the step and commit, against the bytes the
+			 * commit added to the journal: what logging chunks through the
+			 * WAL would add to it.
+			 */
+			uint64_t	wal = wal_lsn(o.src_db) - wal0,
+						jb = dirstore_journal_end(cs) - j0;
+
+			printf("  WAL %.1f MB for the step; journal +%.1f MB (%.2fx the WAL)\n",
+				   wal / 1048576.0, jb / 1048576.0, wal ? (double) jb / (double) wal : 0);
+		}
+		if (bcs)
+		{
+			/* The backup takes only what it lacks. */
+			uint64_t	before = bcs->ops->bytes(bcs);
+			size_t		cbefore = bcs->ops->count(bcs);
+			PHash		bst;
+			double		t3 = now_sec();
+
+			if (bfresh)
+			{
+				vc_repo_init(&b, bcs, &prolly_default_policy);
+				CHECK(vc_repo_clone(&b, bcs, &r, 0) == VC_OK);
+				bfresh = false;
+			}
+			else
+				CHECK(vc_push(&r, &b, vc_head(&r)->name) == VC_OK);
+			bst = vc_repo_save(&b);
+			dirstore_set_state(bcs, &bst);
+			CHECK_OK(dirstore_flush(bcs));
+			printf("  backup: +%zu chunks, +%.1f KB in %.3f s (backup holds %.1f MB; store %.1f MB)\n",
+				   bcs->ops->count(bcs) - cbefore, (bcs->ops->bytes(bcs) - before) / 1024.0,
+				   now_sec() - t3, bcs->ops->bytes(bcs) / 1048576.0, cs->ops->bytes(cs) / 1048576.0);
+		}
+	}
+	pgo_close(stream.pgo);
+	for (size_t i = 0; i < stream.n; i++)
+		st_free(&stream.t[i]);
+	free(stream.t);
+
+	/* One recorded commit per step, each the store's. */
+	nrows = read_roots(o.src_db, &rows);
+	if (nrows != nsteps)
+		fail("roots", "not one recorded commit per step");
+	CHECK(vc_log(&r, &vc_head(&r)->head, MAX_STEPS, 0, roots_fn, &log) == VC_OK);
+	for (int i = 0; i < nrows && i < nsteps; i++)
+	{
+		if (rows[i].seq != i)
+			fail("roots", "a step recorded out of order");
+		if ((size_t) (nsteps - 1 - i) >= log.n || !phash_eq(&rows[i].rv, &log.root[nsteps - 1 - i]))
+			fail(names[i], "the recorded commit is not the store's");
+	}
+	if (nrows > 0 && !phash_eq(&rows[nrows - 1].state, &state))
+		fail("roots", "the last recorded state is not the store's");
+	{
+		PHash		bad;
+
+		if (!dirstore_verify(cs, &bad))
+			fail("store", "a chunk's bytes do not match its hash");
+		check_store(cs, 0);
+	}
+	if (!quick && nrows > 0)
+	{
+		PHash		got;
+
+		fresh_database(o.dst_db);
+		ws_install(o.dst_db, false);
+		ws_restore(&r.ctx, &rows[nrows - 1].rv, o.dst_db, NULL);
+		got = logical_capture(&r.ctx, o.dst_db);
+		if (!phash_eq(&got, &rows[nrows - 1].rv))
+		{
+			fail("rebuild", "the last commit rebuilds to a different root value");
+			explain_mismatch(&r.ctx, &rows[nrows - 1].rv, &got, "rebuild");
+		}
+		else
+			printf("# the last commit rebuilds to its root value\n");
+	}
+	printf("# %d commits recorded, the store holds them all\n", nrows);
+	if (bcs)
+	{
+		/* Restored from the backup alone: the same last commit. */
+		PHash		bst;
+		VcRepo		rb;
+
+		vc_repo_free(&b);
+		cs_destroy(bcs);
+		bcs = dirstore_open(o.backup, err, sizeof(err));
+		if (bcs == NULL)
+			die("backup reopen: %s", err);
+		CHECK(dirstore_get_state(bcs, &bst));
+		CHECK(vc_repo_open(&rb, bcs, &prolly_default_policy, &bst) == VC_OK);
+		{
+			VcCommit	hc;
+
+			CHECK(vc_commit_load(&rb.ctx, &vc_head(&rb)->head, &hc));
+			if (nrows == 0 || !phash_eq(&hc.root, &rows[nrows - 1].rv))
+				fail("backup", "the backup's head is not the last recorded commit");
+			else if (!quick)
+			{
+				PHash		got;
+
+				fresh_database(o.dst_db);
+				ws_install(o.dst_db, false);
+				ws_restore(&rb.ctx, &hc.root, o.dst_db, NULL);
+				got = logical_capture(&rb.ctx, o.dst_db);
+				if (!phash_eq(&got, &hc.root))
+					fail("backup", "the backup's head rebuilds to a different root value");
+				else
+					printf("# restored from the backup alone, the last commit rebuilds\n");
+			}
+			else
+				printf("# the backup's head is the last recorded commit\n");
+		}
+		{
+			PHash		bad;
+
+			if (!dirstore_verify(bcs, &bad))
+				fail("backup", "a chunk's bytes do not match its hash");
+		}
+		vc_repo_free(&rb);
+		cs_destroy(bcs);
+	}
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* ------------------------------------------------------------ crash suite */
+
+typedef struct CrashCase
+{
+	int			step;
+	const char *point;
+	bool		power_cut;		/* lose the journal past the last recorded root */
+	const char *what;
+} CrashCase;
+
+static int
+run_child(const char *args, const char *log)
+{
+	char		cmd[4096];
+	int			rc;
+
+	snprintf(cmd, sizeof(cmd),
+			 "'%s' --conninfo '%s' --fixture '%s' --work '%s' --bindir '%s' --pgdata '%s' %s > '%s' 2>&1",
+			 self_path, o.conninfo, o.fixture, o.work, o.bindir, o.pgdata, args, log);
+	rc = system(cmd);
+	return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+}
+
+static void
+cluster(const char *how)
+{
+	char		cmd[2048];
+
+	if (strcmp(how, "start") == 0)
+		snprintf(cmd, sizeof(cmd), "%s/pg_ctl -D '%s' -l '%s/server.log' -w status >/dev/null 2>&1 || "
+				 "%s/pg_ctl -D '%s' -l '%s/server.log' -w start >/dev/null", o.bindir, o.pgdata,
+				 o.pgdata, o.bindir, o.pgdata, o.pgdata);
+	else
+		snprintf(cmd, sizeof(cmd), "%s/pg_ctl -D '%s' -m fast -w stop >/dev/null", o.bindir, o.pgdata);
+	if (!run(cmd))
+		die("cluster %s failed", how);
+}
+
+/* Cuts the journal at a point between the last recorded root's end and its end. */
+static void
+power_cut(const char *store, uint64_t from, unsigned seed)
+{
+	char		cmd[1400],
+				path[2900];
+	FILE	   *ls;
+	struct stat st;
+	uint64_t	at;
+
+	snprintf(cmd, sizeof(cmd), "ls '%s' | grep '^j-'", store);
+	ls = popen(cmd, "r");
+	CHECK(fgets(cmd, sizeof(cmd), ls) != NULL);
+	pclose(ls);
+	cmd[strcspn(cmd, "\n")] = '\0';
+	snprintf(path, sizeof(path), "%s/%s", store, cmd);
+	CHECK(stat(path, &st) == 0);
+	at = from + (uint64_t) seed % ((uint64_t) st.st_size - from + 1);
+	CHECK(truncate(path, (off_t) at) == 0);
+	printf("    journal cut at %" PRIu64 " (last recorded root ends at %" PRIu64 ", file %lld)\n",
+		   at, from, (long long) st.st_size);
+}
+
+/*
+ * Crashes a durable run at each point of a commit, in a cluster of its own
+ * (made on first use), then resumes it: the resumed run must finish with
+ * every step recorded once, as the store holds it.
+ */
+static void
+run_crash_suite(void)
+{
+	static const CrashCase cases[] = {
+		{1, "apply", false, "streamed, nothing durable"},
+		{1, "synced", false, "journal synced, root not recorded"},
+		{1, "recorded", false, "root recorded, slot not told"},
+		{2, "apply", false, "across DDL: streamed, nothing durable"},
+		{2, "synced", false, "across DDL: journal synced, root not recorded"},
+		{2, "recorded", false, "across DDL: root recorded, slot not told"},
+		{2, "synced", true, "journal synced, then a power cut"},
+		{3, "recorded", true, "root recorded, then a power cut"},
+		{1, "pg-apply", false, "Postgres down hard mid-commit"},
+		{2, "pg-recorded", false, "Postgres down hard after the root was recorded"},
+	};
+	char		cmd[2048];
+	struct stat st;
+	int			bad = 0;
+
+	if (o.pgdata == NULL)
+		die("%s", "--crash-suite needs --pgdata (a directory for its own cluster)");
+	snprintf(cmd, sizeof(cmd), "%s/PG_VERSION", o.pgdata);
+	if (stat(cmd, &st) != 0)
+	{
+		char		conf[1200];
+		FILE	   *f;
+		const char *port = strstr(o.conninfo, "port=");
+
+		snprintf(cmd, sizeof(cmd), "%s/initdb -D '%s' -U postgres --auth=trust >/dev/null", o.bindir,
+				 o.pgdata);
+		if (!run(cmd))
+			die("%s", "initdb failed");
+		snprintf(conf, sizeof(conf), "%s/postgresql.conf", o.pgdata);
+		f = fopen(conf, "a");
+		fprintf(f, "\nport = %d\nunix_socket_directories = '/tmp'\nwal_level = logical\n"
+				"max_wal_senders = 10\nmax_replication_slots = 10\nshared_buffers = 128MB\n"
+				"fsync = on\n", port ? atoi(port + 5) : 5498);
+		fclose(f);
+	}
+	cluster("start");
+	printf("# crash suite (cluster %s)\n", o.pgdata);
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+	{
+		const CrashCase *c = &cases[i];
+		char		store[1100],
+					args[2400],
+					log1[1200],
+					log2[1200];
+		int			rc;
+
+		snprintf(store, sizeof(store), "%s/crash-XXXXXX", o.work);
+		if (mkdtemp(store) == NULL)
+			die("%s", "cannot make a store");
+		snprintf(log1, sizeof(log1), "%s.crash.log", store);
+		snprintf(log2, sizeof(log2), "%s.resume.log", store);
+		printf("%-48s ", c->what);
+		fflush(stdout);
+		snprintf(args, sizeof(args), "--durable --quick --store '%s' --crash %d:%s", store, c->step,
+				 c->point);
+		rc = run_child(args, log1);
+		if (rc != 70)
+		{
+			printf("the run did not crash as asked (exit %d; see %s)\n", rc, log1);
+			bad++;
+			continue;
+		}
+		if (strncmp(c->point, "pg-", 3) == 0)
+			cluster("start");	/* Postgres recovers from its WAL */
+		if (c->power_cut)
+		{
+			RootRow    *rows;
+			int			n = read_roots(o.src_db, &rows);
+
+			printf("\n");
+			power_cut(store, n ? rows[n - 1].jend : 0, (unsigned) (i * 7919 + 13));
+			printf("%-48s ", "");
+		}
+		snprintf(args, sizeof(args), "--durable --resume %s --store '%s'", i == 0 ? "" : "--quick",
+				 store);
+		rc = run_child(args, log2);
+		if (rc != 0)
+		{
+			printf("RESUME FAILED (exit %d; see %s)\n", rc, log2);
+			bad++;
+			continue;
+		}
+		printf("recovered\n");
+	}
+	drop_slot();
+	cluster("stop");
+	if (bad)
+	{
+		char		msg[64];
+
+		snprintf(msg, sizeof(msg), "%d cases", bad);
+		fail("crash suite", msg);
+	}
+}
+
+
+/* ----------------------------------------------------------- backup suite */
+
+static bool
+sh(const char *fmt, const char *a, const char *b, const char *c, const char *d)
+{
+	char		cmd[4096];
+
+	snprintf(cmd, sizeof(cmd), fmt, a, b, c, d);
+	return run(cmd);
+}
+
+/*
+ * A physical backup and recovery to a point in time: commits 0-1, then
+ * pg_basebackup and a copy of the store; commits 2-3, then the store
+ * copied again (the journal last, so it holds every earlier root's
+ * chunks).  The base backup recovered (in a cluster of its own) to just
+ * after commit 2 must name commit 2 as its last commit; the first copy of
+ * the store cannot serve it, the later one opens as of it and rebuilds
+ * it, and the recovered source's tables are commit 2's.
+ */
+static void
+run_backup_suite(void)
+{
+	char		archive[1100],
+				base[1100],
+				store[1100],
+				copy1[1200],
+				copy2[1200],
+				args[2400],
+				log[1300],
+				lp[1300],
+				target[64] = "",
+				conf[1300],
+				err[256];
+	const char *saved_conninfo = o.conninfo;
+	char		restored_ci[600];
+	PGconn	   *c;
+	PGresult   *res;
+	FILE	   *f;
+	int			rc;
+	RootRow    *rows;
+	int			n;
+
+	if (o.pgdata == NULL)
+		die("%s", "--backup-suite needs --pgdata (the crash suite's cluster)");
+	snprintf(archive, sizeof(archive), "%s/backup-archive-XXXXXX", o.work);
+	snprintf(base, sizeof(base), "%s/backup-base-XXXXXX", o.work);
+	snprintf(store, sizeof(store), "%s/backup-store-XXXXXX", o.work);
+	if (!mkdtemp(archive) || !mkdtemp(base) || !mkdtemp(store))
+		die("%s", "cannot make backup directories");
+	snprintf(copy1, sizeof(copy1), "%s.copy1", store);
+	snprintf(copy2, sizeof(copy2), "%s.copy2", store);
+
+	/* WAL archiving on the cluster. */
+	cluster("start");
+	snprintf(conf, sizeof(conf), "%s/postgresql.auto.conf", o.pgdata);
+	f = fopen(conf, "w");
+	fprintf(f, "# Do not edit this file manually!\n"
+			"# It will be overwritten by the ALTER SYSTEM command.\n"
+			"archive_mode = on\narchive_command = 'cp %%p %s/%%f'\n", archive);
+	fclose(f);
+	cluster("stop");
+	cluster("start");
+	printf("# backup suite (cluster %s, archive %s)\n", o.pgdata, archive);
+
+	snprintf(log, sizeof(log), "%s.run1.log", store);
+	snprintf(args, sizeof(args), "--durable --quick --steps 2 --store '%s'", store);
+	if ((rc = run_child(args, log)) != 0)
+		die("commits 0-1 failed; see %s", log);
+	{
+		const char *port = strstr(o.conninfo, "port=");
+		char		pn[16];
+
+		snprintf(pn, sizeof(pn), "%d", port ? atoi(port + 5) : 5498);
+		if (!sh("%s/pg_basebackup -h /tmp -p %s -U postgres -D '%s' -X stream -c fast >/dev/null 2>&1",
+				o.bindir, pn, base, ""))
+			die("%s", "pg_basebackup failed");
+	}
+	if (!sh("cp -a '%s' '%s'", store, copy1, "", ""))
+		die("%s", "copying the store failed");
+	printf("base backup taken after commit 1; store copied\n");
+
+	snprintf(log, sizeof(log), "%s.run2.log", store);
+	snprintf(args, sizeof(args), "--durable --quick --resume --store '%s'", store);
+	if ((rc = run_child(args, log)) != 0)
+		die("commits 2-3 failed; see %s", log);
+	c = pg_open(o.src_db);
+	pg_cmd(c, "SELECT pg_switch_wal()");
+	PQfinish(c);
+	usleep(1500000);			/* the archiver copies the last segment */
+	if (!sh("cp -a '%s' '%s'", store, copy2, "", ""))
+		die("%s", "copying the store failed");
+	snprintf(lp, sizeof(lp), "%s.lsn", store);
+	f = fopen(lp, "r");
+	{
+		int			seq;
+		char		lsn[64];
+
+		while (f && fscanf(f, "%d %63s", &seq, lsn) == 2)
+			if (seq == 2)
+				snprintf(target, sizeof(target), "%s", lsn);
+		if (f)
+			fclose(f);
+	}
+	if (target[0] == '\0')
+		die("%s", "no WAL position recorded after commit 2");
+	printf("commits 2-3 made; store copied again; recovering to %s (just after commit 2)\n", target);
+
+	/* The base backup, recovered to just after commit 2, on port 5497. */
+	snprintf(conf, sizeof(conf), "%s/postgresql.auto.conf", base);
+	f = fopen(conf, "a");
+	fprintf(f, "port = 5497\narchive_mode = off\nrestore_command = 'cp %s/%%f %%p'\n"
+			"recovery_target_lsn = '%s'\nrecovery_target_action = 'promote'\n", archive, target);
+	fclose(f);
+	snprintf(conf, sizeof(conf), "%s/recovery.signal", base);
+	f = fopen(conf, "w");
+	fclose(f);
+	if (!sh("%s/pg_ctl -D '%s' -l '%s/server.log' -w start >/dev/null", o.bindir, base, base, ""))
+		die("%s", "the recovered cluster did not start");
+	snprintf(restored_ci, sizeof(restored_ci), "host=/tmp port=5497 user=postgres");
+	o.conninfo = restored_ci;
+	for (int i = 0; i < 100; i++)
+	{
+		bool		done;
+
+		c = pg_open("postgres");
+		res = pg_exec(c, "SELECT NOT pg_is_in_recovery()");
+		done = PQgetvalue(res, 0, 0)[0] == 't';
+		PQclear(res);
+		PQfinish(c);
+		if (done)
+			break;
+		usleep(100000);
+	}
+
+	n = read_roots(o.src_db, &rows);
+	printf("recovered: %d commits recorded, the last %d\n", n, n ? rows[n - 1].seq : -1);
+	if (n != 3 || rows[2].seq != 2)
+		fail("backup suite", "the recovered database does not end at commit 2");
+	else
+	{
+		ChunkStore *cs = dirstore_open_at(copy1, &rows[2].state, err, sizeof(err));
+		VcRepo		r;
+		PHash		got,
+					src;
+
+		if (cs != NULL)
+		{
+			fail("backup suite", "the store copied before commit 2 claims to hold it");
+			dirstore_crash(cs);
+		}
+		else
+			printf("the store copied before commit 2 cannot serve it (%s)\n", err);
+		cs = dirstore_open_at(copy2, &rows[2].state, err, sizeof(err));
+		if (cs == NULL)
+			fail("backup suite", err);
+		else
+		{
+			CHECK(vc_repo_open(&r, cs, &prolly_default_policy, &rows[2].state) == VC_OK);
+			fresh_database(o.dst_db);
+			ws_install(o.dst_db, false);
+			ws_restore(&r.ctx, &rows[2].rv, o.dst_db, NULL);
+			got = logical_capture(&r.ctx, o.dst_db);
+			if (!phash_eq(&got, &rows[2].rv))
+				fail("backup suite", "commit 2 does not rebuild from the later store copy");
+			else
+				printf("the later store copy opens as of commit 2, which rebuilds\n");
+
+			/* The recovered source holds commit 2's rows (not unlogged ones). */
+			src = logical_capture(&r.ctx, o.src_db);
+			{
+				WsDiff		d;
+				int			off = 0;
+
+				ws_diff(&r.ctx, &rows[2].rv, &src, &d);
+				for (size_t q = 0; q < d.n; q++)
+					if (strncmp(d.line[q], "data ", 5) == 0 && strstr(d.line[q], " changed") &&
+						strstr(d.line[q], "scratch") == NULL)
+					{
+						printf("    %s\n", d.line[q]);
+						off++;
+					}
+				if (off)
+					fail("backup suite", "the recovered source's rows are not commit 2's");
+				else
+					printf("the recovered source's tables are commit 2's (the unlogged one empty)\n");
+				ws_diff_free(&d);
+			}
+			vc_repo_free(&r);
+			dirstore_crash(cs);
+		}
+	}
+	o.conninfo = saved_conninfo;
+	sh("%s/pg_ctl -D '%s' -m fast -w stop >/dev/null", o.bindir, base, "", "");
+
+	/* The cluster without archiving again. */
+	snprintf(conf, sizeof(conf), "%s/postgresql.auto.conf", o.pgdata);
+	f = fopen(conf, "w");
+	fprintf(f, "# Do not edit this file manually!\n# It will be overwritten by the ALTER SYSTEM command.\n");
+	fclose(f);
+	drop_slot();
+	cluster("stop");
+}
+
 /* ------------------------------------------------------- moving in place */
 
 /* Row keys that differ between two root values, over every table. */
@@ -1293,6 +2092,9 @@ main(int argc, char **argv)
 		{"bindir", 1, 0, 'b'}, {"break", 1, 0, 'x'}, {"steps", 1, 0, 's'},
 		{"stream", 0, 0, 'S'}, {"ddl", 0, 0, 'D'}, {"merge", 0, 0, 'M'},
 		{"only", 1, 0, 'O'}, {"move", 0, 0, 'V'},
+		{"durable", 0, 0, 'U'}, {"store", 1, 0, 'T'}, {"crash", 1, 0, 'C'},
+		{"resume", 0, 0, 'R'}, {"quick", 0, 0, 'Q'}, {"crash-suite", 0, 0, 'Z'},
+		{"pgdata", 1, 0, 'P'}, {"backup", 1, 0, 'B'}, {"backup-suite", 0, 0, 'Y'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -1302,6 +2104,10 @@ main(int argc, char **argv)
 				ch;
 	bool		whole;
 	char		mode = 0;
+	bool		resume = false,
+				quick = false;
+
+	self_path = argv[0];
 	char		path[1024],
 				err[256];
 	char	   *names[MAX_STEPS];
@@ -1325,9 +2131,20 @@ main(int argc, char **argv)
 			case 'M': mode = 'M'; break;
 			case 'O': o.only = optarg; break;
 			case 'V': mode = 'V'; break;
+			case 'U': mode = 'U'; break;
+			case 'Z': mode = 'Z'; break;
+			case 'T': o.store = optarg; break;
+			case 'C': crash_at = optarg; break;
+			case 'R': resume = true; break;
+			case 'Q': quick = true; break;
+			case 'P': o.pgdata = optarg; break;
+			case 'B': o.backup = optarg; break;
+			case 'Y': mode = 'Y'; break;
 			default:
 				fprintf(stderr, "rebuild [--conninfo C] [--fixture DIR] [--work DIR] [--bindir DIR]\n"
 						"        [--steps N] [--stream] [--ddl] [--merge [--only N,N...]] [--move]\n"
+						"        [--durable --store DIR [--resume] [--quick] [--crash STEP:POINT]]\n"
+						"        [--backup DIR] [--crash-suite --pgdata DIR] [--backup-suite --pgdata DIR]\n"
 						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush|\n"
 						"                 notags|noviol|keepall]\n");
 				return 2;
@@ -1362,6 +2179,21 @@ main(int argc, char **argv)
 		nsteps = o.steps;
 	if (nsteps == 0)
 		die("no steps in %s", o.fixture);
+	if (mode == 'U' || mode == 'Z' || mode == 'Y')
+	{
+		if (mode == 'U')
+			run_durable(names, nsteps, resume, quick);
+		else if (mode == 'Z')
+			run_crash_suite();
+		else
+			run_backup_suite();
+		if (failures)
+			printf("# %d FAILURES\n", failures);
+		else
+			printf("# %s\n", mode == 'U' ? "durable run as expected" :
+				   mode == 'Z' ? "every crash recovered" : "backups restore as expected");
+		return failures ? 1 : 0;
+	}
 	if (mode == 'V')
 	{
 		run_moves(names, nsteps);
@@ -1429,6 +2261,8 @@ main(int argc, char **argv)
 		}
 		vc_set_working(&r, &s->root);
 		s->commit = vc_commit(&r, s->file);
+		if (o.stream)
+			stream_ack();		/* this run keeps its commits in memory until the end */
 		stats(&r.ctx, &s->root);
 		s->expect = source_answers(o.src_db);
 	}

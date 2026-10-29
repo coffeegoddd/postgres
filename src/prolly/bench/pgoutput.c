@@ -133,7 +133,14 @@ dispatch(const char *msg, size_t len, const PgoCallbacks *cb, void *arg)
 
 	switch (tag)
 	{
-		case 'B':				/* begin */
+		case 'B':
+			{
+				uint64_t	final_lsn = rdn(&r, 8);
+
+				if (cb->begin)
+					cb->begin(arg, final_lsn);
+				break;
+			}
 		case 'R':				/* relation: columns follow the catalog */
 		case 'Y':				/* type */
 		case 'O':				/* origin */

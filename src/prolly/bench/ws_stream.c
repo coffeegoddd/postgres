@@ -270,7 +270,7 @@ stream_change(void *arg, char op, uint32_t relid, char oldkind, const PgoTuple *
 	bool		have_cur = false;
 
 	/* Tables the schema does not hold, or not yet (CREATE TABLE AS). */
-	if (t == NULL || t->persist != 'p')
+	if (t == NULL || t->persist != 'p' || stream.skipping)
 		return;
 	if ((new_ && new_->ncols != t->L.nstored) || (old && old->ncols != t->L.nstored))
 		die("a change to %s does not match its layout", t->name);
@@ -321,6 +321,8 @@ stream_change(void *arg, char op, uint32_t relid, char oldkind, const PgoTuple *
 static void
 stream_truncate(void *arg, int n, const uint32_t *relids)
 {
+	if (stream.skipping)
+		return;
 	for (int i = 0; i < n; i++)
 	{
 		STable	   *t = st_find(relids[i]);
@@ -426,6 +428,8 @@ static void
 stream_message(void *arg, bool tx, const char *prefix, const char *d, size_t len,
 			   uint64_t lsn)
 {
+	if (tx && stream.skipping)
+		return;
 	if (strcmp(prefix, "prolly.layout") == 0)
 	{
 		stream.ddl_msgs++;
@@ -446,7 +450,19 @@ stream_message(void *arg, bool tx, const char *prefix, const char *d, size_t len
 	}
 }
 
-static const PgoCallbacks stream_cb = {stream_change, stream_truncate, NULL, stream_message};
+/*
+ * After a resume the slot may send transactions again that the last
+ * recorded commit already holds (Postgres's own crash recovery can take a
+ * slot's position back to its last checkpoint): they are passed over.
+ */
+static void
+stream_begin(void *arg, uint64_t final_lsn)
+{
+	stream.skipping = final_lsn <= stream.skip_lsn;
+}
+
+static const PgoCallbacks stream_cb = {stream_change, stream_truncate, NULL, stream_begin,
+stream_message};
 
 void
 drop_slot(void)
@@ -499,7 +515,6 @@ stream_setup(ProllyCtx *ctx, const char *db)
 PHash
 stream_capture(ProllyCtx *ctx, const char *db)
 {
-	static int	seq = 0;
 	PGconn	   *c = pg_open(db);
 	PGresult   *res;
 	const char *params[1];
@@ -508,7 +523,7 @@ stream_capture(ProllyCtx *ctx, const char *db)
 				t1;
 
 	/* The barrier: no DDL in flight, a snapshot, the barrier, DDL resumes. */
-	snprintf(stream.token, sizeof(stream.token), "%d", ++seq);
+	snprintf(stream.token, sizeof(stream.token), "%d", ++stream.seq);
 	pg_cmd(c, "SELECT pg_advisory_lock(" DDL_LOCK ")");
 	pg_cmd(c, "BEGIN ISOLATION LEVEL REPEATABLE READ");
 	res = pg_exec(c, "SELECT pg_export_snapshot()");
@@ -556,8 +571,81 @@ stream_capture(ProllyCtx *ctx, const char *db)
 	pg_cmd(c, "COMMIT");
 	dump_snapshot[0] = '\0';
 	PQfinish(c);
-	pgo_feedback(stream.pgo, stream.barrier_lsn);
 	return rv;
+}
+
+/*
+ * The slot may let go of the WAL up to the last barrier: the caller has
+ * made the commit durable (journal synced, root recorded).
+ */
+void
+stream_ack(void)
+{
+	pgo_feedback(stream.pgo, stream.barrier_lsn);
+}
+
+/* The decoder's tables, "oid \t persistence \t name" per line: to resume from. */
+char *
+stream_tables(void)
+{
+	Buf			b = {0};
+
+	for (size_t i = 0; i < stream.n; i++)
+	{
+		char		line[700];
+		int			n = snprintf(line, sizeof(line), "%u\t%c\t%s\n", stream.t[i].oid,
+								 stream.t[i].persist, stream.t[i].name);
+
+		buf_append(&b, line, (size_t) n);
+	}
+	buf_append(&b, "", 1);
+	return (char *) b.data;
+}
+
+/*
+ * Picks the stream up again after a crash: the decoder's tables as the
+ * last recorded commit has them (rows from its root value), barriers
+ * counted from seq, and what that commit holds passed over.
+ */
+void
+stream_resume(ProllyCtx *ctx, const char *db, const PHash *rv, const char *tables,
+			  uint64_t after_lsn, int seq)
+{
+	char		ci[1024];
+	char	   *copy = strdup(tables);
+
+	memset(&stream, 0, sizeof(stream));
+	stream.ctx = ctx;
+	stream.seq = seq;
+	stream.skip_lsn = after_lsn;
+	for (char *line = strtok(copy, "\n"); line; line = strtok(NULL, "\n"))
+	{
+		char	   *p;
+		uint32_t	oid = (uint32_t) strtoul(line, &p, 10);
+		char		persist = p[1];
+		const char *name = p + 3;
+		STable	   *t;
+		VcTable		vt;
+		size_t		len;
+
+		px_grow((void **) &stream.t, &stream.cap, stream.n + 1, sizeof(STable));
+		t = &stream.t[stream.n++];
+		memset(t, 0, sizeof(*t));
+		t->oid = oid;
+		t->persist = persist;
+		t->name = strdup(name);
+		CHECK(vc_table_get(ctx, rv, name, &vt));
+		t->layout = schema_text(ctx, &vt.schema, &len);
+		layout_must_parse(t->layout, &t->L);
+		t->data = vt.data;
+		t->live = true;
+	}
+	free(copy);
+	snprintf(ci, sizeof(ci),
+			 "%s dbname=%s options='-c DateStyle=ISO -c IntervalStyle=postgres "
+			 "-c TimeZone=UTC -c extra_float_digits=1 -c bytea_output=hex'",
+			 o.conninfo, db);
+	stream.pgo = pgo_start(ci, STREAM_SLOT, STREAM_PUB);
 }
 
 static void
