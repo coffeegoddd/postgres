@@ -205,6 +205,38 @@ schema to a branch's files and rebuilds those relcache entries.
    tested).
 6. Everything experiment A could not give, except a branch per session.
 
+### Catalogs: versioned at the row level (decided)
+
+Versioned and unversioned schemas live side by side in one database
+(`CREATE SCHEMA ... VERSIONED`), so catalogs branch by row, not by file:
+- **one set of catalog files.**  Rows of objects in a versioned schema
+  carry a branch; all other rows carry none and are shared.  A backend
+  sees the shared rows plus its own branch's; unique indexes include the
+  branch; a branch's copy of an object keeps its object id;
+- **dependencies** point only from versioned objects to shared ones;
+- **three classes of catalog data:**
+  - versioned, committed to history: names and definitions (`pg_class`,
+    `pg_attribute`, `pg_type`, `pg_proc`, `pg_constraint`, `pg_index`,
+    `pg_trigger`, `pg_rewrite`, `pg_policy`, `pg_namespace`,
+    `pg_sequence`, `pg_depend`, `pg_description`, ...);
+  - per branch, never committed: `pg_statistic` and the physical columns
+    of `pg_class` (relfilenode, relpages, reltuples, relallvisible,
+    relfrozenxid, relminmxid);
+  - shared, cluster-wide: `pg_authid`, `pg_auth_members`, `pg_database`,
+    `pg_tablespace`, `pg_shdepend`, `pg_db_role_setting`,
+    `pg_subscription`, ...
+- **what it subsumes:** each branch's `pg_class` row names its own files,
+  so experiment A's catalog swap and experiment B's locator hook become
+  unnecessary; per-branch statistics and freeze ids come with the rows.
+- **commits** hold the canonical form (definitions as DDL, column tags),
+  not raw catalog rows, which name cluster-local ids; diff and merge work
+  there, and the DDL moves bridge history and the physical catalogs.
+- **the cost:** every catalog read must honor the branch (system caches,
+  catalog scans, unique checks): a patch across core.  To be measured by
+  experiment C.
+- Whole-database branching with a catalog file set per branch was
+  considered and set aside: it cannot keep unversioned schemas shared.
+
 ### Patches so far
 
 | Patch | Feature | Status |
