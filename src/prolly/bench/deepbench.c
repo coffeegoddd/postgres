@@ -27,6 +27,9 @@
  * fills to the limits above and is then cut back to these (1 commit: a
  * tumbling window); just after a cut, "recent" may lie past it, and its
  * merge base is then -1 too.
+ * --store pg keeps the history in Postgres (bench/pgstore.c), in a schema
+ * of the database PROLLY_PG names (default: the test server's
+ * prolly_pgstore); disk is then the store's relations.
  * --rewrite runs the repo in history mode REWRITE: each sever writes the
  * kept commits again, and the hook keeps this program's commit list on
  * their new hashes.  --chunk sets the chunk size: the
@@ -42,6 +45,7 @@
 #include <unistd.h>
 
 #include "../test/test_util.h"
+#include "pgstore.h"
 
 static const char *ddl = "CREATE TABLE t (id int8 PRIMARY KEY, v int8)";
 
@@ -133,6 +137,7 @@ main(int argc, char **argv)
 		{"keep-bytes", 1, 0, 'B'}, {"keep-seconds", 1, 0, 'S'},
 		{"max-commits", 1, 0, 'C'}, {"max-bytes", 1, 0, 'X'}, {"max-seconds", 1, 0, 'T'},
 		{"low-commits", 1, 0, 'L'}, {"low-bytes", 1, 0, 'Y'}, {"low-seconds", 1, 0, 'Z'},
+		{"store", 1, 0, 'G'},
 		{0, 0, 0, 0}
 	};
 	int			ch;
@@ -144,6 +149,7 @@ main(int argc, char **argv)
 				data,
 				old_head;
 	bool		rewrite = false;
+	bool		pg = false;
 	uint64_t	next_milestone = 1000;
 	uint32_t	depth;
 	bool		policy_mode;
@@ -170,6 +176,7 @@ main(int argc, char **argv)
 			case 'L': win.low_commits = strtoull(optarg, NULL, 10); break;
 			case 'Y': win.low_bytes = strtoull(optarg, NULL, 10); break;
 			case 'Z': win.low_seconds = strtoull(optarg, NULL, 10); break;
+			case 'G': pg = strcmp(optarg, "pg") == 0; break;
 			case 'd': base = optarg; break;
 			case 'k':
 				policy.target_bytes = (uint32_t) atoi(optarg);
@@ -192,7 +199,19 @@ main(int argc, char **argv)
 	mkdir(base, 0700);
 	snprintf(dir, sizeof(dir), "%s/%ld-%d", base, (long) time(NULL), (int) getpid());
 	mkdir(dir, 0700);
-	cs = dirstore_open(dir, err, sizeof(err));
+	if (pg)
+	{
+		const char *ci = getenv("PROLLY_PG");
+		char		schema[64];
+
+		snprintf(schema, sizeof(schema), "deep_%d", (int) getpid());
+		cs = pgstore_open(ci ? ci : "host=/tmp port=5499 user=postgres dbname=prolly_pgstore",
+						  schema, true, false, err, sizeof(err));
+		if (cs == NULL)
+			fprintf(stderr, "deepbench: %s\n", err);
+	}
+	else
+		cs = dirstore_open(dir, err, sizeof(err));
 	CHECK(cs != NULL);
 	rng_seed(7);
 	vc_repo_init(&r, cs, &policy);
@@ -291,13 +310,13 @@ main(int argc, char **argv)
 
 			t = now_sec();
 			st = vc_repo_save(&r);
-			dirstore_set_state(cs, &st);
+			(pg ? pgstore_set_state(cs, &st) : dirstore_set_state(cs, &st));
 			acc.save_s += now_sec() - t;
 			acc.save_bytes += cs->stats.new_bytes - before;
 			acc.saves++;
 		}
 		if (i % (uint64_t) flush_every == 0)
-			CHECK_OK(dirstore_flush(cs));
+			CHECK_OK(pg ? pgstore_flush(cs) : dirstore_flush(cs));
 
 		if (i == next_milestone || i == ncommits)
 		{
@@ -383,7 +402,7 @@ main(int argc, char **argv)
 
 			/* reopen from the saved state, as recovery would */
 			st = vc_repo_save(&r);
-			dirstore_set_state(cs, &st);
+			(pg ? pgstore_set_state(cs, &st) : dirstore_set_state(cs, &st));
 			CHECK(cs_get(cs, &st, &stlen) != NULL);
 			{
 				VcRepo		r2;
@@ -420,7 +439,7 @@ main(int argc, char **argv)
 	}
 	printf("# commit_us includes severing; severs in the interval, sever_ms per sever; log100,\n"
 		   "# mb_short in us; mb_long in ms (-1: past the cut); diffs ms/rows; disk %.0f MB\n",
-		   dirstore_disk_bytes(cs) / 1048576.0);
+		   (pg ? pgstore_disk_bytes(cs) : dirstore_disk_bytes(cs)) / 1048576.0);
 	free(heads);
 	phmap_free(&head_at);
 	vc_repo_free(&r);

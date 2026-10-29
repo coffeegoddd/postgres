@@ -7,9 +7,13 @@
  *	  fetch, push, pull) work between it and other stores.
  *
  *	  PROLLY_PG names the database (default: host=/tmp port=5499
- *	  user=postgres dbname=prolly_pgstore, made if missing).
+ *	  user=postgres dbname=prolly_pgstore, made if missing).  With
+ *	  PROLLY_PG_STANDBY naming the same database on a hot standby of that
+ *	  server, the store is also opened there.
  */
+#define _DEFAULT_SOURCE
 #include <libpq-fe.h>
+#include <unistd.h>
 
 #include "test_repo.h"
 #include "../bench/pgstore.h"
@@ -333,6 +337,90 @@ test_fresh_and_ephemeral(void)
 	PQfinish(c);
 }
 
+/* Waits until the standby has replayed everything the primary has written. */
+static void
+await_replay(const char *standby)
+{
+	PGconn	   *p = PQconnectdb(conninfo),
+			   *s = PQconnectdb(standby);
+	PGresult   *res = PQexec(p, "SELECT pg_current_wal_lsn()");
+	char		sql[200];
+
+	snprintf(sql, sizeof(sql), "SELECT pg_last_wal_replay_lsn() >= '%s'", PQgetvalue(res, 0, 0));
+	PQclear(res);
+	for (int i = 0; i < 300; i++)
+	{
+		bool		done;
+
+		res = PQexec(s, sql);
+		done = PQresultStatus(res) == PGRES_TUPLES_OK && PQgetvalue(res, 0, 0)[0] == 't';
+		PQclear(res);
+		if (done)
+			break;
+		usleep(100000);
+	}
+	PQfinish(p);
+	PQfinish(s);
+}
+
+/*
+ * A hot standby has the store as the primary has it, with nothing of ours
+ * to ship it: flushed history opens there, read only, and follows as the
+ * primary goes on.
+ */
+static void
+test_on_a_standby(const char *standby)
+{
+	ChunkStore *cs = open_pg("pgs_standby", true),
+			   *scs;
+	VcRepo		r,
+				s;
+	Linear		l;
+	Snap		sd;
+	PHash		st,
+				later;
+	char		err[512];
+
+	setup(&r, cs);
+	l = build_linear(&r);
+	sd = snap(&r.ctx, &l.d);
+	st = vc_repo_save(&r);
+	pgstore_set_state(cs, &st);
+	CHECK_EQ(pgstore_flush(cs), 0);
+	await_replay(standby);
+
+	scs = pgstore_open(standby, "pgs_standby", false, false, err, sizeof(err));
+	if (scs == NULL)
+		fprintf(stderr, "standby: %s\n", err);
+	CHECK(scs != NULL);
+	CHECK(pgstore_get_state(scs, &st));
+	CHECK(vc_repo_open(&s, scs, &small_policy, &st) == VC_OK);
+	CHECK(phash_eq(&vc_head(&s)->head, &l.d));
+	check_snap(&s.ctx, &l.d, &sd);
+	same_log(&r, &s, &l.d);
+	/* read only there: a flush is refused */
+	CHECK(pgstore_flush(scs) != 0);
+	vc_repo_free(&s);
+	cs_destroy(scs);
+
+	/* the primary goes on; the standby follows */
+	later = commit_rows(&r, 4000, 4100, 30, "later");
+	st = vc_repo_save(&r);
+	pgstore_set_state(cs, &st);
+	CHECK_EQ(pgstore_flush(cs), 0);
+	await_replay(standby);
+	scs = pgstore_open(standby, "pgs_standby", false, false, err, sizeof(err));
+	CHECK(scs != NULL);
+	CHECK(pgstore_get_state(scs, &st));
+	CHECK(vc_repo_open(&s, scs, &small_policy, &st) == VC_OK);
+	CHECK(phash_eq(&vc_head(&s)->head, &later));
+	same_log(&r, &s, &later);
+	vc_repo_free(&s);
+	cs_destroy(scs);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 int
 main(void)
 {
@@ -360,6 +448,15 @@ main(void)
 	RUN(test_discarded_history_leaves_the_server);
 	RUN(test_remotes_across_stores);
 	RUN(test_fresh_and_ephemeral);
+	if (getenv("PROLLY_PG_STANDBY"))
+	{
+		const char *standby = getenv("PROLLY_PG_STANDBY");
+
+		printf("%-44s", "test_on_a_standby");
+		fflush(stdout);
+		test_on_a_standby(standby);
+		printf("ok\n");
+	}
 	printf("test_pgstore: all tests passed\n");
 	return 0;
 }

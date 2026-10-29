@@ -25,6 +25,18 @@ test/test_pgstore: test/test_pgstore.c bench/pgstore.c bench/pgstore.h test/test
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
 pgstore-check: test/test_pgstore
 	./test/test_pgstore
+# The same against waldb (port 5495) and its hot standby (5492), both
+# made by contrib/prolly_wal/spike: the store is opened on the standby too.
+pgstore-standby-check: test/test_pgstore
+	$(PGINST)/bin/pg_ctl -D /home/dustin/pgv2-bench/waldb -l /home/dustin/pgv2-bench/waldb/server.log -w start
+	$(PGINST)/bin/pg_ctl -D /home/dustin/pgv2-bench/waldb_standby -l /home/dustin/pgv2-bench/waldb_standby/server.log -w start
+	$(PGINST)/bin/psql -h /tmp -p 5495 -U postgres -d postgres -X -qAt \
+		-c "SELECT 1 FROM pg_database WHERE datname = 'prolly_pgstore'" | grep -q 1 || \
+		$(PGINST)/bin/psql -h /tmp -p 5495 -U postgres -d postgres -X -q -c "CREATE DATABASE prolly_pgstore"
+	PROLLY_PG="host=/tmp port=5495 user=postgres dbname=prolly_pgstore" \
+	PROLLY_PG_STANDBY="host=/tmp port=5492 user=postgres dbname=prolly_pgstore" ./test/test_pgstore
+	$(PGINST)/bin/pg_ctl -D /home/dustin/pgv2-bench/waldb_standby -w stop -m fast
+	$(PGINST)/bin/pg_ctl -D /home/dustin/pgv2-bench/waldb -w stop -m fast
 
 test/%: test/%.c test/test_util.h test/test_repo.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
@@ -35,7 +47,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check durability-check trigger-check gen-check branch-check pgstore-check
+.PHONY: all check clean rebuild-check durability-check trigger-check gen-check branch-check pgstore-check pgstore-standby-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
@@ -141,8 +153,9 @@ bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
 bench/diskbench: bench/diskbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
 
-bench/deepbench: bench/deepbench.c test/test_util.h libprolly.a $(HDRS)
-	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
+bench/deepbench: bench/deepbench.c bench/pgstore.c bench/pgstore.h test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< bench/pgstore.c libprolly.a \
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
 
 # Where restoring pages beats replaying rows, against a running server (see bench/kfbench.c).
 bench/storebench: bench/storebench.c test/test_util.h libprolly.a $(HDRS)
