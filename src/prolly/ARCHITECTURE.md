@@ -368,6 +368,41 @@ manager (checkpoints and standbys for free), with a custom resource
 manager only where its records are smaller than page images, or where
 logical decoding needs to read them.
 
+### Experiment E: chunks and roots as rows of tables
+
+Experiment D's recommendation, tested: chunks as rows of a table keyed by
+hash (`STORAGE EXTERNAL`, so TOAST does not compress them again), roots as
+rows of a table updated in the user's own transaction.  Nothing custom.
+`contrib/prolly_wal/spike/heap_store_test.sh`, against experiment D on the
+same cluster, with a hot standby.
+
+- **Crashes:** a root and its transaction's rows survive or vanish
+  together; a transaction open at the crash leaves nothing; a checkpoint
+  inside the transaction loses nothing.  A rolled-back transaction leaves
+  no chunks either (D's files stay behind as orphans).
+- **Standby:** the root, its chunk and the transaction's rows appear on a
+  hot standby as soon as the commit replays.  D's root does not move there
+  until promotion: it waits as a pending file.
+- **Logical decoding** sees chunk inserts and root updates as ordinary
+  rows.
+- **Cost,** 20,000 random 4 KB chunks, 100 to a transaction:
+
+  | | Time | WAL | On disk |
+  |---|---:|---:|---:|
+  | table rows (heap, TOAST, index) | 3.8 s | 92 MB | 109 MB |
+  | files and custom WAL (D) | 26.6 s | 80 MB | 78 MB |
+
+  The files pay an fsync per chunk at commit, since a custom resource
+  manager has no checkpoint callback; the table pays about 38% more disk
+  (TOAST's 2 KB pieces, the hash index) and 15% more WAL.
+
+**Conclusion:** the history store keeps chunks and roots as rows of tables.
+Commit atomicity, crash recovery, checkpoints, standbys and decoding come
+from Postgres with no hook; neither the checkpoint callback nor the
+transaction-redo hook is needed.  A dedicated page format for chunks
+(through the buffer manager, to win back the disk overhead) remains an
+option behind the chunk store interface, measured when it matters.
+
 ### Patches so far
 
 | Patch | Feature | Status |
@@ -376,8 +411,8 @@ logical decoding needs to read them.
 | a relation-for-file hook in decoding | logical decoding of branch files | needed for B |
 | per-branch file fields (relpages, reltuples, relallvisible, relfrozenxid, relminmxid) and the freeze horizon | VACUUM, ANALYZE, wraparound safety per branch | needed for B; A needs the horizon part |
 | `pg_namespace.nspbranch`, branch-aware name lookup, the catalog filter, `catalog_branch`, branch-scoped decoding (`spike/catalog_branch.patch`) | catalogs branched by row | spike; makes the two above unnecessary |
-| a checkpoint callback for custom resource managers | chunk files flushed at checkpoints, not at each commit | only if chunks stay outside the buffer manager |
-| a transaction-redo hook | roots moving at commit on a standby | only if roots are not rows of a table |
+| a checkpoint callback for custom resource managers | chunk files flushed at checkpoints, not at each commit | not needed: chunks are table rows (experiment E) |
+| a transaction-redo hook | roots moving at commit on a standby | not needed: roots are table rows (experiment E) |
 
 ## Order
 
