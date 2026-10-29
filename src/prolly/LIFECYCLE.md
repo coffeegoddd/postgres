@@ -986,6 +986,12 @@ the log is refused, and opening as of an older root is tested.
 
 ## Parents in a commit graph (severing to a real root)
 
+**Decision (2026-10-29):** keep parents in the commits (`vc`), with the
+saved-state change below.  The commit graph cost a little more space, and
+lost `vc`'s refusal to re-fetch the seam commit, in exchange for a real
+root at the cut.  `vcg`/`cgraph` stay in the prototype only as the
+measured alternative.
+
 **The question:** when the window severs init <- a <- b <- c <- d <- e
 down to c <- d <- e, can c become a real root without rewriting any
 commit?  With parents inside the commit (`vc.c`), no: c's hash covers
