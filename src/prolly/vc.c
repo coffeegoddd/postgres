@@ -476,6 +476,36 @@ change_bytes(ProllyCtx *ctx, const PHash *root, const PHash *base)
 	return a.bytes;
 }
 
+/* A commit chunk from its fields, with each parent's measures. */
+static PHash
+commit_put(ProllyCtx *ctx, const PHash *root, uint64_t gen, uint64_t bytes, uint64_t time,
+		   uint32_t nparents, const PHash *parents, const uint64_t *pgen,
+		   const uint64_t *pbytes, const uint64_t *ptime, const char *msg, size_t msglen)
+{
+	Buf			b = BUF_INIT;
+	PHash		h;
+
+	buf_append_byte(&b, CHUNK_TAG_COMMIT);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	buf_append(&b, root->b, PHASH_LEN);
+	buf_append_uvarint(&b, gen);
+	buf_append_uvarint(&b, bytes);
+	buf_append_uvarint(&b, time);
+	buf_append_uvarint(&b, nparents);
+	for (uint32_t i = 0; i < nparents; i++)
+	{
+		buf_append(&b, parents[i].b, PHASH_LEN);
+		buf_append_uvarint(&b, pgen[i]);
+		buf_append_uvarint(&b, pbytes[i]);
+		buf_append_uvarint(&b, ptime[i]);
+	}
+	buf_append_uvarint(&b, msglen);
+	buf_append(&b, msg, msglen);
+	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
+	buf_free(&b);
+	return h;
+}
+
 /*
  * time is raised past every parent's, so along any history generation,
  * change bytes and time all only fall.
@@ -484,11 +514,12 @@ PHash
 vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 				uint32_t nparents, uint64_t time, const char *msg)
 {
-	Buf			b = BUF_INIT;
 	VcCommit	pc[VC_MAX_PARENTS];
 	uint64_t	gen = 0,
-				bytes = 0;
-	PHash		h;
+				bytes = 0,
+				pgen[VC_MAX_PARENTS],
+				pbytes[VC_MAX_PARENTS],
+				ptime[VC_MAX_PARENTS];
 
 	if (nparents > VC_MAX_PARENTS)
 		abort();
@@ -503,25 +534,14 @@ vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 			time = pc[i].time + 1;
 	}
 	bytes += change_bytes(ctx, root, nparents ? &pc[0].root : NULL);
-	buf_append_byte(&b, CHUNK_TAG_COMMIT);
-	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
-	buf_append(&b, root->b, PHASH_LEN);
-	buf_append_uvarint(&b, gen + 1);
-	buf_append_uvarint(&b, bytes);
-	buf_append_uvarint(&b, time);
-	buf_append_uvarint(&b, nparents);
 	for (uint32_t i = 0; i < nparents; i++)
 	{
-		buf_append(&b, parents[i].b, PHASH_LEN);
-		buf_append_uvarint(&b, pc[i].generation);
-		buf_append_uvarint(&b, pc[i].bytes);
-		buf_append_uvarint(&b, pc[i].time);
+		pgen[i] = pc[i].generation;
+		pbytes[i] = pc[i].bytes;
+		ptime[i] = pc[i].time;
 	}
-	buf_append_uvarint(&b, strlen(msg));
-	buf_append(&b, msg, strlen(msg));
-	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
-	buf_free(&b);
-	return h;
+	return commit_put(ctx, root, gen + 1, bytes, time, nparents, parents, pgen, pbytes, ptime,
+					  msg, strlen(msg));
 }
 
 /* Max-heap of commits ordered by generation. */
@@ -1371,6 +1391,7 @@ vc_repo_save(VcRepo *r)
 	buf_append_uvarint(&b, r->since_commits);
 	buf_append_uvarint(&b, r->since_bytes);
 	buf_append_uvarint(&b, r->last_sever);
+	buf_append_uvarint(&b, r->history);
 	buf_append_uvarint(&b, r->window_depth);
 	buf_append_uvarint(&b, r->track_depth);
 	buf_append_uvarint(&b, r->cur);
@@ -1513,6 +1534,7 @@ vc_repo_open(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy, const PHash *
 	r->since_commits = rd_uv(&rd);
 	r->since_bytes = rd_uv(&rd);
 	r->last_sever = rd_uv(&rd);
+	r->history = (VcHistoryMode) rd_uv(&rd);
 	r->window_depth = (uint32_t) rd_uv(&rd);
 	track = rd_uv(&rd);
 	r->cur = rd_uv(&rd);
@@ -1856,6 +1878,156 @@ window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHash
 	return rc;
 }
 
+typedef struct Kept
+{
+	VcCommit	c;
+	bool		moved;			/* written again */
+	PHash		now;
+	uint64_t	gen,
+				bytes;
+} Kept;
+
+static int
+kept_cmp(const void *a, const void *b)
+{
+	const Kept *x = a,
+			   *y = b;
+
+	return (x->c.generation > y->c.generation) - (x->c.generation < y->c.generation);
+}
+
+/*
+ * REWRITE mode: the cut commits are let go at once, and every kept commit
+ * with cut history beneath it is written again, oldest first: cut parents
+ * dropped, rewritten ones replaced.  Its root value, time and message stay;
+ * its generation and change bytes are recounted from its new parents, its
+ * own change bytes kept, so measures from a head stay as they were.  A kept
+ * commit with nothing cut beneath it keeps its hash.  Heads, merge heads
+ * and images move to the new hashes; the hook hears each one.
+ */
+static void
+rewrite_history(VcRepo *r, const PHash *cut, size_t ncut)
+{
+	PHashMap	cutset,
+				idx;
+	HashList	held = window_commits(r);
+	Kept	   *k = px_malloc((held.n ? held.n : 1) * sizeof(Kept));
+	size_t		nk = 0;
+	bool		created;
+
+	phmap_init(&cutset);
+	phmap_init(&idx);
+	for (size_t i = 0; i < ncut; i++)
+		phmap_ref(&cutset, &cut[i], &created);
+	for (size_t i = 0; i < held.n; i++)
+		if (!phmap_find(&cutset, &held.v[i]))
+		{
+			memset(&k[nk], 0, sizeof(Kept));
+			k[nk].c = must_load_commit(&r->ctx, &held.v[i]);
+			nk++;
+		}
+	free(held.v);
+	qsort(k, nk, sizeof(Kept), kept_cmp);
+	for (size_t i = 0; i < nk; i++)
+		*phmap_ref(&idx, &k[i].c.hash, &created) = i;
+
+	for (size_t i = 0; i < nk; i++)
+	{
+		VcCommit   *c = &k[i].c;
+		PHash		par[VC_MAX_PARENTS];
+		uint64_t	pg[VC_MAX_PARENTS],
+					pb[VC_MAX_PARENTS],
+					pt[VC_MAX_PARENTS],
+					own = c->bytes,
+					gen = 0,
+					bytes = 0,
+					oldmax = 0;
+		uint32_t	np = 0;
+		bool		changed = false;
+
+		for (uint32_t j = 0; j < c->nparents; j++)
+		{
+			uint64_t   *at = phmap_find(&idx, &c->parents[j]);
+
+			if (c->parent_bytes[j] > oldmax)
+				oldmax = c->parent_bytes[j];
+			if (phmap_find(&cutset, &c->parents[j]))
+			{
+				changed = true;
+				continue;
+			}
+			par[np] = c->parents[j];
+			pg[np] = c->parent_gen[j];
+			pb[np] = c->parent_bytes[j];
+			pt[np] = c->parent_time[j];
+			if (at && k[*at].moved)
+			{
+				par[np] = k[*at].now;
+				pg[np] = k[*at].gen;
+				pb[np] = k[*at].bytes;
+				changed = true;
+			}
+			np++;
+		}
+		if (!changed)
+			continue;
+		own = c->bytes - oldmax;
+		for (uint32_t j = 0; j < np; j++)
+		{
+			if (pg[j] > gen)
+				gen = pg[j];
+			if (pb[j] > bytes)
+				bytes = pb[j];
+		}
+		k[i].gen = gen + 1;
+		k[i].bytes = bytes + own;
+		k[i].now = commit_put(&r->ctx, &c->root, k[i].gen, k[i].bytes, c->time, np, par, pg, pb,
+							  pt, c->msg, c->msglen);
+		k[i].moved = true;
+	}
+
+	/* the new commits held before the old ones go: they share their trees */
+	for (size_t i = 0; i < nk; i++)
+		if (k[i].moved)
+		{
+			ssize_t		img = image_slot(r, &k[i].c.hash);
+
+			cs_ref_root(r->ctx.cs, &k[i].now);
+			set_loc(r, &k[i].now, LOC_WINDOW);
+			set_loc(r, &k[i].c.hash, LOC_GONE);
+			if (img >= 0)
+			{
+				phmap_remove(&r->imgmap, &k[i].c.hash);
+				r->img_commit[img] = k[i].now;
+				*phmap_ref(&r->imgmap, &k[i].now, &created) = (uint64_t) img;
+			}
+			for (size_t b = 0; b < r->nbr; b++)
+			{
+				if (phash_eq(&r->br[b].head, &k[i].c.hash))
+					r->br[b].head = k[i].now;
+				if (r->br[b].merging && phash_eq(&r->br[b].merge_head, &k[i].c.hash))
+					r->br[b].merge_head = k[i].now;
+			}
+			if (r->rewrite_fn)
+				r->rewrite_fn(r->rewrite_arg, &k[i].c.hash, &k[i].now);
+		}
+	for (size_t i = 0; i < nk; i++)
+		if (k[i].moved)
+			cs_unref_root(r->ctx.cs, &k[i].c.hash);
+	/* and what was cut goes for good */
+	for (size_t i = 0; i < ncut; i++)
+	{
+		set_loc(r, &cut[i], LOC_GONE);
+		cs_unref_root(r->ctx.cs, &cut[i]);
+	}
+	if (r->track_depth)
+		vc_window_track(r, r->track_depth);
+	free(k);
+	phmap_free(&cutset);
+	phmap_free(&idx);
+	prolly_release_pins(&r->ctx);
+}
+
 int
 vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 {
@@ -1950,6 +2122,14 @@ detach:
 	for (size_t i = 0; i < n; i++)
 		image_release(r, &members[i]);
 
+	if (r->history == VC_HISTORY_REWRITE)
+	{
+		rewrite_history(r, members, n);
+		free(members);
+		free(edge);
+		return VC_OK;
+	}
+
 	/* detach: the holds move to the segment; no chunk is read, copied or freed */
 	px_grow((void **) &r->segs, &r->segcap, r->nsegs + 1, sizeof(VcSegment));
 	seg = &r->segs[r->nsegs];
@@ -1964,6 +2144,19 @@ detach:
 		set_loc(r, &members[i], LOC_SEG_BASE + r->nsegs);
 	*seg_out = (uint32_t) r->nsegs++;
 	return VC_OK;
+}
+
+void
+vc_set_history_mode(VcRepo *r, VcHistoryMode mode)
+{
+	r->history = mode;
+}
+
+void
+vc_set_rewrite_hook(VcRepo *r, VcRewriteFn fn, void *arg)
+{
+	r->rewrite_fn = fn;
+	r->rewrite_arg = arg;
 }
 
 static uint64_t
@@ -2781,9 +2974,12 @@ transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 		 uint32_t depth, bool allow_unrelated)
 {
 	Plan		p;
-	int			rc = plan_transfer(src, dst, heads, nheads, depth,
-								   allow_unrelated, &p);
+	int			rc;
 
+	/* hashes a rewriting repo gives out do not last: it has no remotes */
+	if (src->history == VC_HISTORY_REWRITE || dst->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
+	rc = plan_transfer(src, dst, heads, nheads, depth, allow_unrelated, &p);
 	if (rc != VC_OK)
 		return rc;
 	rc = plan_copy(src, dst, &p);
@@ -2815,6 +3011,10 @@ vc_push(VcRepo *local, VcRepo *remote, const char *branch)
 	Plan		p;
 	PHash		base;
 	int			rc;
+
+	/* hashes a rewriting repo gives out do not last: it has no remotes */
+	if (local->history == VC_HISTORY_REWRITE || remote->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 
 	if (lb == NULL)
 		return VC_ERR;
@@ -2853,6 +3053,10 @@ vc_fetch(VcRepo *local, VcRepo *remote, const char *branch, PHash *head)
 	VcBranch   *rb = vc_branch_find(remote, branch);
 	int			rc;
 
+	/* hashes a rewriting repo gives out do not last: it has no remotes */
+	if (local->history == VC_HISTORY_REWRITE || remote->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
+
 	if (rb == NULL)
 		return VC_ERR;
 	if ((rc = transfer(remote, local, &rb->head, 1, 0, false)) != VC_OK)
@@ -2866,6 +3070,10 @@ vc_repo_clone(VcRepo *dst, ChunkStore *cs, VcRepo *src, uint32_t depth)
 {
 	PHash	   *heads = px_malloc(src->nbr * sizeof(PHash));
 	int			rc;
+
+	/* hashes a rewriting repo gives out do not last: it has no remotes */
+	if (src->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 
 	repo_init_empty(dst, cs, &src->ctx.policy);
 	dst->clock = src->clock;
@@ -2913,6 +3121,8 @@ vc_deepen(VcRepo *r, const VcSource *src, const PHash *from,
 	VcSegment  *seg;
 
 	*seg_out = VC_NO_SEGMENT;
+	if (r->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 	if (where != VC_LOC_UNKNOWN && where != VC_LOC_BOUNDARY &&
 		where != VC_LOC_DISCARDED)
 		return VC_ERR;			/* present here, or exported: attach it */
@@ -3019,6 +3229,10 @@ vc_pull(VcRepo *local, VcRepo *remote, const char *branch, uint32_t max_deepen,
 	uint32_t	step = 4,
 				used = 0;
 	int			rc;
+
+	/* hashes a rewriting repo gives out do not last: it has no remotes */
+	if (local->history == VC_HISTORY_REWRITE || remote->history == VC_HISTORY_REWRITE)
+		return VC_ERR_REWRITTEN;
 
 	memset(res, 0, sizeof(*res));
 	if ((rc = vc_fetch(local, remote, branch, &head)) != VC_OK)

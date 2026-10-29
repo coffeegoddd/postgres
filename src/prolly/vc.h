@@ -20,6 +20,28 @@
 #define VC_ERR_OUTSIDE_WINDOW (-4)	/* stopped at the window's edge */
 #define VC_ERR_UNRELATED (-5)	/* the histories share no commit */
 #define VC_ERR_DETACHED (-6)	/* the sender's history is cut before it attaches */
+#define VC_ERR_REWRITTEN (-12)	/* remotes, with a repo that rewrites its history */
+
+/*
+ * What a sever does with the history it cuts.
+ *	KEEP	commits keep their hashes: what is cut becomes a segment, to
+ *			export, discard or attach again, and the kept commits still
+ *			name the parents they lost.  Remotes work across cuts.
+ *	REWRITE	what is cut is let go at once, and every kept commit with cut
+ *			history beneath it is written again without it: the oldest
+ *			kept commits become roots, and their descendants get new
+ *			hashes.  Nothing of the cut history is kept, so earlier windows
+ *			come back from backups of earlier roots.  Hashes change at every
+ *			sever, so a repo in this mode has no remotes.
+ */
+typedef enum VcHistoryMode
+{
+	VC_HISTORY_KEEP = 0,
+	VC_HISTORY_REWRITE = 1
+} VcHistoryMode;
+
+/* Told, for each commit a rewriting sever replaced, the old and new hash. */
+typedef void (*VcRewriteFn) (void *arg, const PHash *old, const PHash *now);
 
 /*
  * Stop at the window's edge: refuse any commit the window does not hold,
@@ -234,6 +256,9 @@ typedef struct VcRepo
 	size_t		pendcap;
 	bool		has_state;		/* the last saved state chunk, held */
 	PHash		state;
+	VcHistoryMode history;
+	VcRewriteFn rewrite_fn;
+	void	   *rewrite_arg;
 	PHashMap	cut;			/* parents of held commits that are not known */
 	bool		cut_valid;
 	bool		cut_lazy;		/* a discard without edges: derive them */
@@ -348,6 +373,14 @@ extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
  */
 #define VC_SEVER_SLACK 10
 extern bool vc_sever_due(VcRepo *r, const VcWindow *w);
+
+/*
+ * The history mode (KEEP until set); in REWRITE mode vc_sever rewrites and
+ * reports no segment.  The hook hears each commit replaced, so whatever
+ * names commits outside the repo can follow.
+ */
+extern void vc_set_history_mode(VcRepo *r, VcHistoryMode mode);
+extern void vc_set_rewrite_hook(VcRepo *r, VcRewriteFn fn, void *arg);
 
 /* The clock commits and windows read, in microseconds (for tests). */
 extern void vc_set_clock(VcRepo *r, uint64_t (*now) (void *arg), void *arg);

@@ -1473,6 +1473,57 @@ answers one row short through `kinds_ip_spgist`.
 - `make rebuild-check` fails on those three moves until it is fixed
   upstream.
 
+## History mode REWRITE: a window and nothing else
+
+**What it is for.**  Some users want history only for a window: no
+remotes, earlier windows restored from backups of earlier roots.  For
+them, a sever squashes.
+- **What goes:** the cut history goes at once.  No segments, boundaries or
+  record of the cut commits remain, and their chunks are freed.
+- **What is rewritten:** every kept commit with cut history beneath it is
+  written again without it.  The oldest kept commits become true roots,
+  and their descendants get new hashes.
+- **The cost:** the user takes that rewrite as the price of the mode.
+
+**How** (`vc_set_history_mode(r, VC_HISTORY_REWRITE)`).  Each sever walks
+the kept commits oldest first:
+- **Parents:** cut parents are dropped, and rewritten ones replaced by
+  their new hashes.
+- **What stays:** root value, time and message, and the commit's own
+  change bytes.
+- **What is recounted:** generation and cumulative change bytes, so every
+  measure the window takes from a head is as before.
+- **Unchanged commits:** one with nothing cut beneath it keeps its hash.
+- **What follows the new hashes:** branch heads, pending merge heads and
+  keyframe images.  `vc_set_rewrite_hook` hears each old and new hash, so
+  records outside the repo (`prolly.roots`, say) can follow.
+- **Persistence and remotes:** the mode is saved with the repo.  Push,
+  fetch, pull, clone and deepen return `VC_ERR_REWRITTEN`, since its
+  hashes do not last.
+
+**Tests** (`test/test_rewrite.c`):
+- **init <- A <- B <- C <- D with a window of two** ends as C' <- D': C'
+  has no parents and generation 1, the log ends cleanly, both hold
+  exactly the rows they did, nothing but the two commits is known, and no
+  old commit is in the store.
+- **The store** stays the window's size over 300 severs.
+- **Branches** over shared history get one new root and still merge, and
+  a merge commit drops only its cut parent.
+- **A sever with nothing to cut** changes nothing.
+- **What follows the commits:** images and merge heads follow them.
+- **The window:** measures from the head are unchanged, and the
+  incremental window stays exact.
+- **The mode** survives a reopen, and remotes are refused.
+- **Each part of the rewrite was broken in turn, and each break was
+  caught.**
+
+**Cost at 1M commits** (`bench/deepbench --rewrite --due --max-commits
+100000`):
+- commit plus amortized severing is 132 us, against 112 us in KEEP mode;
+- each sever rewrites up to the window's 100k commits: 426 ms, against
+  196 ms;
+- saves, reopens, logs, short merge bases and diffs are as in KEEP mode.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

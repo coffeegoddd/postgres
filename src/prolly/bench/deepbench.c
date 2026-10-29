@@ -22,7 +22,10 @@
  * By default the window holds every commit (a depth beyond the history).
  * --keep-bytes, --keep-seconds (floors) and --max-commits, --max-bytes,
  * --max-seconds (ceilings) set a window instead; diffs then reach back at
- * most to the oldest commit held, and a merge base past the cut is -1.  --chunk sets the chunk size: the
+ * most to the oldest commit held, and a merge base past the cut is -1.
+ * --rewrite runs the repo in history mode REWRITE: each sever writes the
+ * kept commits again, and the hook keeps this program's commit list on
+ * their new hashes.  --chunk sets the chunk size: the
  * table's own writes per commit do not depend on the window, so small
  * chunks keep a long run's disk down without changing what is measured.
  */
@@ -45,6 +48,23 @@ maxrss_mb(void)
 
 	getrusage(RUSAGE_SELF, &ru);
 	return ru.ru_maxrss / 1024.0;
+}
+
+/* The commits made, by index, followed through rewrites. */
+static PHash *heads;
+static PHashMap head_at;		/* hash -> index + 1 */
+
+static void
+rewritten(void *arg, const PHash *old, const PHash *now)
+{
+	uint64_t   *v = phmap_find(&head_at, old);
+	bool		created;
+
+	if (v == NULL)
+		return;
+	heads[*v - 1] = *now;
+	*phmap_ref(&head_at, now, &created) = *v;
+	phmap_remove(&head_at, old);
 }
 
 static void
@@ -105,7 +125,7 @@ main(int argc, char **argv)
 		{"rows", 1, 0, 'r'}, {"commits", 1, 0, 'c'}, {"changes", 1, 0, 'n'},
 		{"save-every", 1, 0, 's'}, {"flush-every", 1, 0, 'f'},
 		{"sever-every", 1, 0, 'v'}, {"track", 0, 0, 't'}, {"dir", 1, 0, 'd'},
-		{"chunk", 1, 0, 'k'}, {"due", 0, 0, 'u'},
+		{"chunk", 1, 0, 'k'}, {"due", 0, 0, 'u'}, {"rewrite", 0, 0, 'W'},
 		{"keep-bytes", 1, 0, 'B'}, {"keep-seconds", 1, 0, 'S'},
 		{"max-commits", 1, 0, 'C'}, {"max-bytes", 1, 0, 'X'}, {"max-seconds", 1, 0, 'T'},
 		{0, 0, 0, 0}
@@ -117,8 +137,8 @@ main(int argc, char **argv)
 	VcRepo		r;
 	PHash		rv,
 				data,
-				*heads,
 				old_head;
+	bool		rewrite = false;
 	uint64_t	next_milestone = 1000;
 	uint32_t	depth;
 	bool		policy_mode;
@@ -136,6 +156,7 @@ main(int argc, char **argv)
 			case 'v': sever_every = atoi(optarg); break;
 			case 't': track = true; break;
 			case 'u': due = true; break;
+			case 'W': rewrite = true; break;
 			case 'B': win.keep_bytes = strtoull(optarg, NULL, 10); break;
 			case 'S': win.keep_seconds = strtoull(optarg, NULL, 10); break;
 			case 'C': win.max_commits = strtoull(optarg, NULL, 10); break;
@@ -172,7 +193,18 @@ main(int argc, char **argv)
 	CHECK(vc_table_set_data(&r.ctx, &rv, "t", &data, &rv) == 0);
 	vc_set_working(&r, &rv);
 	heads = px_malloc((ncommits + 1) * sizeof(PHash));
+	phmap_init(&head_at);
+	if (rewrite)
+	{
+		vc_set_history_mode(&r, VC_HISTORY_REWRITE);
+		vc_set_rewrite_hook(&r, rewritten, NULL);
+	}
 	heads[0] = vc_commit(&r, "load");
+	{
+		bool		created;
+
+		*phmap_ref(&head_at, &heads[0], &created) = 1;
+	}
 
 	/* "old": one commit off the first; its merge base with main is heads[0] */
 	CHECK(vc_branch_create(&r, "old", &heads[0]) == VC_OK);
@@ -193,6 +225,7 @@ main(int argc, char **argv)
 	if (track)
 		CHECK(vc_window_track(&r, depth) == VC_OK);
 
+	printf("# history mode %s\n", rewrite ? "REWRITE" : "KEEP");
 	printf("# window: keep_bytes %" PRIu64 " keep_seconds %" PRIu64 " max_commits %" PRIu64
 		   " max_bytes %" PRIu64 " max_seconds %" PRIu64 "%s\n", win.keep_bytes, win.keep_seconds,
 		   win.max_commits, win.max_bytes, win.max_seconds, policy_mode ? "" : " (all held)");
@@ -217,6 +250,11 @@ main(int argc, char **argv)
 		batch_free(&b);
 		vc_set_working(&r, &o);
 		heads[i] = vc_commit(&r, "tx");
+		{
+			bool		created;
+
+			*phmap_ref(&head_at, &heads[i], &created) = i + 1;
+		}
 		acc.commit_s += now_sec() - t;
 		acc.commits++;
 
@@ -301,11 +339,14 @@ main(int argc, char **argv)
 			ts = (now_sec() - ts) * 1e6;
 			tlg = now_sec();
 			{
-				int			mrc = vc_merge_base_in(&r, &heads[i], &old_head, 0, &base);
+				int			mrc;
+
+				old_head = vc_branch_find(&r, "old")->head;
+				mrc = vc_merge_base_in(&r, &heads[i], &old_head, 0, &base);
 
 				tlg = (now_sec() - tlg) * 1e3;
 				if (mrc == 1)
-					CHECK(phash_eq(&base, &heads[0]));
+					CHECK(rewrite || phash_eq(&base, &heads[0]));
 				else
 				{
 					CHECK(policy_mode && (mrc == VC_ERR_SEVERED || mrc == 0));
@@ -362,6 +403,7 @@ main(int argc, char **argv)
 		   "# mb_short in us; mb_long in ms (-1: past the cut); diffs ms/rows; disk %.0f MB\n",
 		   dirstore_disk_bytes(cs) / 1048576.0);
 	free(heads);
+	phmap_free(&head_at);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 	return 0;
