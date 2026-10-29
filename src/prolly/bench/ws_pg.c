@@ -26,6 +26,9 @@
  *	notags		objects keep column names, so an index or view one branch adds
  *				does not follow a rename on the other
  *	noviol		constraint violations are found but not stored
+ * and with --move:
+ *	keepall		every changed row is taken to be as the schema change left it,
+ *				so none is rewritten
  */
 bool
 broken(const char *what)

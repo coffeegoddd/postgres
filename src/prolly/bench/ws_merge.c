@@ -73,20 +73,6 @@ pick(const char *b, const char *o, const char *t, bool *clash)
 
 /* ------------------------------------------------- a table's definition */
 
-typedef struct DdlItem
-{
-	char	   *key;			/* t:<tag>, n:<name> or c:<constraint> */
-	char	   *line;			/* without its trailing comma */
-} DdlItem;
-
-typedef struct Ddl
-{
-	char	   *head;			/* through "CREATE ... (" and its newline */
-	DdlItem    *item;
-	int			n;
-	size_t		cap;
-	char	   *tail;			/* from the closing ")" */
-} Ddl;
 
 /* A quoted or plain identifier at p, as written. */
 static char *
@@ -111,7 +97,7 @@ ident_at(const char *p)
 	return strndup(p, (size_t) (e - p));
 }
 
-static bool
+bool
 ddl_parse(const char *text, const WsLayout *L, Ddl *d)
 {
 	const char *open = strstr(text, " (\n"),
@@ -170,7 +156,7 @@ ddl_parse(const char *text, const WsLayout *L, Ddl *d)
 	return true;
 }
 
-static void
+void
 ddl_free(Ddl *d)
 {
 	for (int i = 0; i < d->n; i++)
@@ -183,7 +169,7 @@ ddl_free(Ddl *d)
 	free(d->tail);
 }
 
-static const char *
+const char *
 ddl_item(const Ddl *d, const char *key)
 {
 	for (int i = 0; d && i < d->n; i++)

@@ -221,6 +221,31 @@ typedef struct TableList
 extern const WorkingSetOps logical_ops;
 extern const WorkingSetOps stream_ops;
 
+typedef struct ObjList
+{
+	ProllyKV   *kv;
+	size_t		n,
+				cap;
+} ObjList;
+
+typedef struct Obj
+{
+	char	   *key;			/* section, type, name */
+	char	   *ddl;			/* rendered */
+	char	   *tddl;			/* as stored: columns by tag */
+	int			prio;
+} Obj;
+
+extern int	obj_prio(const char *key);
+extern int	obj_cmp(const void *a, const void *b);
+extern void run_objects(PGconn *c, Obj *objs, size_t n, WsReport *rep);
+extern void obj_add(ObjList *l, const char *key, size_t kl, const char *body, size_t bl);
+extern void split_dump(const char *text, char sec, ObjList *l);
+extern int	kv_cmp(const void *a, const void *b);
+extern void collect_objects(PGconn *c, const char *db, ObjList *l);
+extern void objlist_free(ObjList *l);
+extern void restore_sequences(ProllyCtx *ctx, PGconn *c, const PHash *data);
+
 extern void row_from_line(const WsLayout *L, const char *line, size_t len, Row *r);
 extern void row_add(Row **rows, size_t *n, size_t *cap, const WsLayout *L, const char *line,
 					size_t len);
@@ -329,6 +354,27 @@ extern PHash colmap_build(ProllyCtx *ctx, const ColMap *m);
 extern void colmap_free(ColMap *m);
 extern void templ(const char *s, size_t n, const ColMap *m, Buf *out);
 extern bool render(const char *s, size_t n, const ColMap *m, Buf *out, uint64_t *missing);
+extern void restore_tags(PGconn *c, const ColMap *cols);
+
+/* A CREATE TABLE object split into its column and constraint items. */
+typedef struct DdlItem
+{
+	char	   *key;			/* t:<tag>, n:<name> or c:<constraint> */
+	char	   *line;			/* without its trailing comma */
+} DdlItem;
+
+typedef struct Ddl
+{
+	char	   *head;			/* through "CREATE ... (" and its newline */
+	DdlItem    *item;
+	int			n;
+	size_t		cap;
+	char	   *tail;			/* from the closing ")" */
+} Ddl;
+
+extern bool ddl_parse(const char *text, const WsLayout *L, Ddl *d);
+extern void ddl_free(Ddl *d);
+extern const char *ddl_item(const Ddl *d, const char *key);
 
 /* ----------------------------------------------------------- violations */
 
@@ -347,6 +393,30 @@ extern void ws_record_violations(const char *db, const WsReport *rep, WsLines *o
 extern int	ws_resolve(const char *db, WsLines *unresolved);
 extern PHash capture_violations(ProllyCtx *ctx, PGconn *c);
 extern void restore_violations(ProllyCtx *ctx, PGconn *c, const PHash *data);
+
+/* ------------------------------------------------------- moving in place */
+
+typedef struct WsMoveStats
+{
+	double		secs,
+				schema_secs,
+				rows_secs,
+				create_secs,	/* objects created, indexes built */
+				refresh_secs;
+	uint64_t	deleted,
+				inserted,
+				updated,
+				skipped;		/* rows whose bytes changed only with the schema */
+	int			dropped,
+				created,
+				built,			/* indexes and constraints built */
+				altered,
+				recreated,
+				renamed;
+} WsMoveStats;
+
+extern int	ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db,
+					WsMoveStats *st, WsReport *rep);
 
 /* -------------------------------------------------------- diff and merge */
 

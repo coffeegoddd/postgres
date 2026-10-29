@@ -780,6 +780,91 @@ Two new faults are caught: objects keeping column names (`--break
 notags`, the rename scenarios fail), and violations not stored
 (`--break noviol`).
 
+### Moving the working set in place
+
+Checkout, reset and applying a merge move a live database from one commit
+to another.  Rebuilding into an empty database works but costs the whole
+schema.  `bench/ws_move.c` moves it in place, in this order:
+1. **Enum values** the target adds go in place, outside the transaction
+   (Postgres can't use a new value in the transaction that adds it).
+2. **Objects** the target lacks or changed are dropped.  Anything on a table
+   the target drops goes with the table.
+3. **Types, domains, functions and sequences** the target adds or changed
+   are created.
+4. **Tables:**
+   - columns are renamed (through spare names, so swaps work);
+   - each table the target drops is dropped and each it adds is created;
+   - a table both have is altered in place where Postgres allows it:
+     columns added at the end, dropped or retyped; defaults and NOT NULL
+     changed; table constraints and storage parameters changed;
+   - otherwise it is recreated: columns reordered, partitioning or other
+     definition changes, or a type it uses dropped.
+5. **Tags** are set as the target has them.
+6. **Rows:**
+   - a new or recreated table is loaded whole;
+   - for the rest, only the row keys that differ are deleted and inserted;
+   - a row whose bytes differ only because of the schema change is left
+     alone: its shared columns agree, and each new column holds what the
+     database filled it with.
+7. **Statements that need the rows** run next: NOT NULL, constraints, then
+   sequences and violations.
+8. **Convergence:** until the database's objects equal the target's,
+   whatever the target has and the database lacks is created, and anything
+   extra dropped.
+9. **Materialized views** are refreshed.
+
+Writes run with `session_replication_role = replica`, so user triggers,
+foreign keys and event triggers don't fire.
+
+**The test** (`bench/rebuild --move`) moves one database through all 12
+ordered pairs of the four fixture commits.  After each move it must capture
+to exactly the target's root value, pass amcheck on every heap, B-tree and
+GIN index, and answer the target's 90 checks (queries forced through each
+named index, sequences, constraints).  `--break keepall`, which leaves
+every changed row alone, is caught.
+
+| Move | In place | Full rebuild | Changed keys | Rows deleted / inserted / kept | Where the time goes |
+|---|---|---|---|---|---|
+| load → rows changed | 1.2 s | 5.9 s | 12,230 | 9,515 / 7,118 / 0 | rows 0.45 s |
+| rows → rows (03 ↔ 02, the DDL already behind) | 1.9 s | 5.7–6.0 s | 7,410 | 7,042–7,108 / 6,928–7,222 / 0–180 | rows 1.1 s |
+| rows → DDL (01 → 02) | 5.6 s | 5.7 s | 20,119 | 0 / 138 / 19,981 | schema 3.6 s |
+| DDL → rows (02 → 01, an enum value taken out) | 5.8 s | 5.9 s | 20,081 | 0 / 20,081 / 0 | objects 4.6 s |
+| load → after DDL and rows (00 → 03) | 8.0 s | 6.0 s | 30,807 | 15,809 / 13,664 / 11,881 | schema 5.2 s |
+
+- **Without DDL, a move costs the rows that changed:** 3–5× faster than a
+  rebuild here, and the gap grows with table size.
+- **Rows only rewritten by a schema change aren't written.**
+  `ADD COLUMN … DEFAULT` makes 19,981 rows' bytes differ, but Postgres's
+  fast default already gives them the value, so they are left alone.
+- **DDL that Postgres implements as a rewrite costs O(table + its indexes)
+  in place too:**
+  - `ALTER COLUMN … TYPE` rewrites `kinds` and rebuilds its 40 indexes
+    (3.6 s of the 5.6 s);
+  - taking an enum value out isn't possible in Postgres, so the type is
+    dropped and every table using it recreated (4.6 s, nearly all index
+    builds).
+
+  So checkout across DDL costs about what Postgres's own DDL costs.  The
+  window's cheap checkout holds for row changes and for in-place DDL
+  (renames, nullable or fast-default columns, constraints, indexes), not
+  for table rewrites.  Avoiding that would take keyframes of the
+  rewritten tables' pages, or copy-on-write working sets.
+- **Merges apply in place:** all 14 clean merge scenarios are applied to
+  ours' working set, and each captures to exactly the merged root value.
+- **Bugs found:**
+  - the object lists' keys aren't NUL-terminated, and a lookup treated
+    them as strings;
+  - indexes and constraints of a partition the target drops can't be
+    dropped first;
+  - a fillfactor change recreated the table where `ALTER TABLE SET` does.
+
+  The move tests cover all three.
+- **Not covered yet:**
+  - moves under concurrent writers;
+  - moves with violations pending;
+  - the checks after a move run on a database with planner statistics from
+    VACUUM ANALYZE (included in the times above, as it is for rebuilds).
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

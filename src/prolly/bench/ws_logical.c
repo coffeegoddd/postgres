@@ -184,14 +184,8 @@ put_table(ProllyCtx *ctx, PHash rv, const char *name, const char *schema, size_t
 	return rv;
 }
 
-typedef struct ObjList
-{
-	ProllyKV   *kv;
-	size_t		n,
-				cap;
-} ObjList;
 
-static void
+void
 obj_add(ObjList *l, const char *key, size_t kl, const char *body, size_t bl)
 {
 	px_grow((void **) &l->kv, &l->cap, l->n + 1, sizeof(ProllyKV));
@@ -217,7 +211,7 @@ trim_end(const char *p, size_t n)
  *	--
  * and runs to the next.  What precedes the first is the prelude.
  */
-static void
+void
 split_dump(const char *text, char sec, ObjList *l)
 {
 	const char *hdr = "\n--\n-- Name: ";
@@ -256,7 +250,7 @@ split_dump(const char *text, char sec, ObjList *l)
 	}
 }
 
-static int
+int
 kv_cmp(const void *a, const void *b)
 {
 	const ProllyKV *x = a,
@@ -265,65 +259,85 @@ kv_cmp(const void *a, const void *b)
 	return key_cmp(x->key, x->klen, y->key, y->klen);
 }
 
-/* The definitions (~obj) and sequence positions (~seq). */
-PHash
-capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
+/*
+ * The schema's objects in a database, keys and DDL with column references
+ * by tag, sorted by key: what ~obj holds.
+ */
+void
+collect_objects(PGconn *c, const char *db, ObjList *l)
 {
 	size_t		len;
 	char	   *ddl;
-	ObjList		l = {0};
 	ColMap		cols;
-	PHash		objs,
-				seq,
-				colsmap;
 
+	memset(l, 0, sizeof(*l));
 	ddl = dump_section(db, "pre-data", &len);
-	split_dump(ddl, 'a', &l);
+	split_dump(ddl, 'a', l);
 	free(ddl);
 	ddl = dump_section(db, "post-data", &len);
-	split_dump(ddl, 'b', &l);
+	split_dump(ddl, 'b', l);
 	free(ddl);
 
 	/* Column references by tag, in keys (column comments) and DDL. */
 	colmap_from_db(c, &cols);
-	for (size_t i = 0; i < l.n; i++)
+	for (size_t i = 0; i < l->n; i++)
 	{
 		Buf			k = {0},
 					v = {0};
 
-		if (l.kv[i].key[0] == '0' || broken("notags"))
+		if (l->kv[i].key[0] == '0' || broken("notags"))
 			continue;
-		templ((const char *) l.kv[i].key, l.kv[i].klen, &cols, &k);
-		templ((const char *) l.kv[i].val, l.kv[i].vlen, &cols, &v);
-		free((void *) l.kv[i].key);
-		free((void *) l.kv[i].val);
+		templ((const char *) l->kv[i].key, l->kv[i].klen, &cols, &k);
+		templ((const char *) l->kv[i].val, l->kv[i].vlen, &cols, &v);
+		free((void *) l->kv[i].key);
+		free((void *) l->kv[i].val);
 		buf_append(&k, "", 1);
 		buf_append(&v, "", 1);
-		l.kv[i].key = k.data;
-		l.kv[i].klen = k.len - 1;
-		l.kv[i].val = v.data;
-		l.kv[i].vlen = v.len - 1;
+		l->kv[i].key = k.data;
+		l->kv[i].klen = k.len - 1;
+		l->kv[i].val = v.data;
+		l->kv[i].vlen = v.len - 1;
 	}
+	colmap_free(&cols);
+	qsort(l->kv, l->n, sizeof(ProllyKV), kv_cmp);
+	for (size_t i = 1; i < l->n; i++)
+		if (key_cmp(l->kv[i - 1].key, l->kv[i - 1].klen, l->kv[i].key, l->kv[i].klen) == 0)
+			die("two objects named %s", (const char *) l->kv[i].key);
+}
+
+void
+objlist_free(ObjList *l)
+{
+	for (size_t i = 0; i < l->n; i++)
+	{
+		free((void *) l->kv[i].key);
+		free((void *) l->kv[i].val);
+	}
+	free(l->kv);
+	memset(l, 0, sizeof(*l));
+}
+
+/* The definitions (~obj, ~cols, ~viol) and sequence positions (~seq). */
+PHash
+capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
+{
+	ObjList		l;
+	ColMap		cols;
+	PHash		objs,
+				seq,
+				colsmap,
+				viol;
+
+	collect_objects(c, db, &l);
+	objs = t_build(ctx, l.kv, l.n);
+	objlist_free(&l);
+	colmap_from_db(c, &cols);
 	colsmap = colmap_build(ctx, &cols);
 	colmap_free(&cols);
-	qsort(l.kv, l.n, sizeof(ProllyKV), kv_cmp);
-	for (size_t i = 1; i < l.n; i++)
-		if (key_cmp(l.kv[i - 1].key, l.kv[i - 1].klen, l.kv[i].key, l.kv[i].klen) == 0)
-			die("two objects named %s", (const char *) l.kv[i].key);
-	objs = t_build(ctx, l.kv, l.n);
-	for (size_t i = 0; i < l.n; i++)
-	{
-		free((void *) l.kv[i].key);
-		free((void *) l.kv[i].val);
-	}
-	free(l.kv);
 	rv = put_table(ctx, rv, "~obj", "", 0, &objs);
 	rv = put_table(ctx, rv, "~cols", "", 0, &colsmap);
-	{
-		PHash		viol = capture_violations(ctx, c);
-
-		rv = put_table(ctx, rv, "~viol", "", 0, &viol);
-	}
+	viol = capture_violations(ctx, c);
+	rv = put_table(ctx, rv, "~viol", "", 0, &viol);
 	seq = capture_sequences(ctx, c);
 	return put_table(ctx, rv, "~seq", "", 0, &seq);
 }
@@ -475,16 +489,9 @@ report_free(WsReport *rep)
 	memset(rep, 0, sizeof(*rep));
 }
 
-typedef struct Obj
-{
-	char	   *key;			/* section, type, name */
-	char	   *ddl;			/* rendered */
-	char	   *tddl;			/* as stored: columns by tag */
-	int			prio;
-} Obj;
 
 /* Where an object goes in its section; dependencies are left to retries. */
-static int
+int
 obj_prio(const char *key)
 {
 	static const struct
@@ -516,7 +523,7 @@ obj_prio(const char *key)
 	return 15;
 }
 
-static int
+int
 obj_cmp(const void *a, const void *b)
 {
 	const Obj  *x = a,
@@ -533,7 +540,7 @@ obj_cmp(const void *a, const void *b)
  * Runs a section's objects, each in a savepoint, again and again while
  * some succeed; what never succeeds is reported with its last error.
  */
-static void
+void
 run_objects(PGconn *c, Obj *objs, size_t n, WsReport *rep)
 {
 	bool	   *done = calloc(n ? n : 1, sizeof(bool));
@@ -763,7 +770,7 @@ restore_rows(ProllyCtx *ctx, PGconn *c, const char *name, const VcTable *t, WsRe
  * Gives the restored columns the tags the commit holds: every column in
  * ~cols, partitioned tables' too.
  */
-static void
+void
 restore_tags(PGconn *c, const ColMap *cols)
 {
 	for (size_t i = 0; i < cols->n; i++)
@@ -787,7 +794,7 @@ restore_tags(PGconn *c, const ColMap *cols)
 	}
 }
 
-static void
+void
 restore_sequences(ProllyCtx *ctx, PGconn *c, const PHash *data)
 {
 	ProllyIter *it = t_iter(ctx, data, NULL, 0);

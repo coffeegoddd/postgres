@@ -789,7 +789,8 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 	int			nw = 0,
 				ng = 0,
 				na = 0;
-	bool		stored = false;
+	bool		stored = false,
+				inplace = false;
 	size_t		gcap = 0;
 	PHash		B,
 				O,
@@ -938,6 +939,31 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 					explain_mismatch(ctx, &N, &m.root, file);
 			}
 			vc_commit_write(ctx, &m.root, (PHash[]) {co, ct}, 2, 4, "merge");
+
+			/* The merge applied in place to ours' working set. */
+			{
+				WsMoveStats mst;
+				WsReport	mrep = {0};
+				PHash		P;
+
+				ws_move(ctx, &O, &m.root, "rt_mb", &mst, &mrep);
+				for (size_t i = 0; i < mrep.n; i++)
+				{
+					char		msg[1400];
+
+					snprintf(msg, sizeof(msg), "in place: %s: %s", mrep.p[i].what, mrep.p[i].message);
+					fail(file, msg);
+				}
+				report_free(&mrep);
+				P = logical_capture(ctx, "rt_mb");
+				if (!phash_eq(&P, &m.root))
+				{
+					fail(file, "the merge applied in place captures to a different root value");
+					explain_mismatch(ctx, &m.root, &P, file);
+				}
+				else
+					inplace = true;
+			}
 		}
 		report_free(&rep);
 	}
@@ -985,6 +1011,8 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 		printf("%s %s", g ? ";" : "", got[g]);
 	if (stored)
 		printf("; stored%s", resolve ? ", resolved" : "");
+	if (inplace)
+		printf("; applied in place");
 	printf("\n");
 	for (int a2 = 0; a2 < na; a2++)
 		free(after[a2]);
@@ -1044,6 +1072,140 @@ run_merges(void)
 		free(files[i]);
 	}
 	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
+}
+
+/* ------------------------------------------------------- moving in place */
+
+/* Row keys that differ between two root values, over every table. */
+static uint64_t
+row_changes(ProllyCtx *ctx, const PHash *a, const PHash *b)
+{
+	TableList	lb;
+	uint64_t	n = 0;
+
+	table_list(ctx, b, &lb);
+	for (size_t i = 0; i < lb.n; i++)
+	{
+		VcTable		ta;
+		ProllyDiffList dl = {0};
+
+		if (lb.names[i][0] == '~')
+			continue;
+		if (!vc_table_get(ctx, a, lb.names[i], &ta))
+		{
+			uint64_t	c = 0;
+
+			CHECK(prolly_count(ctx, &lb.t[i].data, &c) == PROLLY_OK);
+			n += c;
+			continue;
+		}
+		CHECK(prolly_diff_collect(ctx, &ta.data, &lb.t[i].data, &dl) == PROLLY_OK);
+		n += dl.n;
+		prolly_diff_list_free(&dl);
+	}
+	table_list_free(&lb);
+	return n;
+}
+
+static void
+vacuum_analyze(const char *db)
+{
+	PGconn	   *c = pg_open(db);
+
+	pg_cmd(c, "VACUUM ANALYZE");
+	PQfinish(c);
+}
+
+/*
+ * The working set moved in place between every ordered pair of the
+ * fixture's commits, through one database: each move must leave it
+ * capturing to the target's root value and answering the target's checks.
+ */
+static void
+run_moves(char **names, int nsteps)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		root[MAX_STEPS];
+	char	  **expect[MAX_STEPS];
+	double		rebuild_s[MAX_STEPS];
+	static const int chain[] = {1, 2, 3, 2, 1, 0, 2, 0, 3, 1, 3, 0};
+	int			cur = 0;
+
+	vc_repo_init(&r, cs, &prolly_default_policy);
+	fresh_database(o.src_db);
+	ws_install(o.src_db, true);
+	for (int i = 0; i < nsteps; i++)
+	{
+		char		file[1024];
+
+		snprintf(file, sizeof(file), "%s/%s", o.fixture, names[i]);
+		psql_file(o.src_db, file);
+		root[i] = logical_capture(&r.ctx, o.src_db);
+		vc_set_working(&r, &root[i]);
+		vc_commit(&r, names[i]);
+		expect[i] = source_answers(o.src_db);
+	}
+	printf("# full rebuilds, for comparison\n");
+	for (int i = 0; i < nsteps; i++)
+	{
+		double		t0 = now_sec();
+
+		fresh_database("rt_move");
+		ws_install("rt_move", false);
+		ws_restore(&r.ctx, &root[i], "rt_move", NULL);
+		vacuum_analyze("rt_move");
+		rebuild_s[i] = now_sec() - t0;
+		printf("%-14s rebuilt in %.2f s\n", names[i], rebuild_s[i]);
+	}
+	fresh_database("rt_move");
+	ws_install("rt_move", false);
+	ws_restore(&r.ctx, &root[0], "rt_move", NULL);
+	vacuum_analyze("rt_move");
+	printf("# moves in place (one database, starting at %s)\n", names[0]);
+	printf("%-28s %7s %7s %6s %6s %6s %6s %6s %5s %5s %5s\n", "move", "secs", "rebuild",
+		   "diff", "del", "ins", "upd", "kept", "built", "alter", "recr");
+	for (size_t m = 0; m < sizeof(chain) / sizeof(chain[0]); m++)
+	{
+		int			next = chain[m];
+		WsMoveStats st;
+		WsReport	rep = {0};
+		char		label[256];
+		PHash		got;
+		double		t0;
+
+		if (next >= nsteps || cur >= nsteps)
+			continue;
+		snprintf(label, sizeof(label), "%.12s -> %.12s", names[cur], names[next]);
+		t0 = now_sec();
+		ws_move(&r.ctx, &root[cur], &root[next], "rt_move", &st, &rep);
+		vacuum_analyze("rt_move");
+		st.secs = now_sec() - t0;
+		for (size_t i = 0; i < rep.n; i++)
+		{
+			char		msg[1400];
+
+			snprintf(msg, sizeof(msg), "%s: %s", rep.p[i].what, rep.p[i].message);
+			fail(label, msg);
+		}
+		report_free(&rep);
+		printf("%-28s %7.2f %7.2f %6" PRIu64 " %6" PRIu64 " %6" PRIu64 " %6" PRIu64 " %6" PRIu64
+			   " %5d %5d %5d\n", label, st.secs, rebuild_s[next],
+			   row_changes(&r.ctx, &root[cur], &root[next]), st.deleted, st.inserted, st.updated,
+			   st.skipped, st.built, st.altered, st.recreated);
+		printf("%28s schema %.2f s, rows %.2f s, objects %.2f s, refresh %.2f s\n", "",
+			   st.schema_secs, st.rows_secs, st.create_secs, st.refresh_secs);
+		got = logical_capture(&r.ctx, "rt_move");
+		if (!phash_eq(&got, &root[next]))
+		{
+			fail(label, "the moved working set captures to a different root value");
+			explain_mismatch(&r.ctx, &root[next], &got, label);
+		}
+		check_rebuilt("rt_move", expect[next], label, false);
+		cur = next;
+	}
+	vc_repo_free(&r);
 	cs_destroy(cs);
 }
 
@@ -1130,7 +1292,7 @@ main(int argc, char **argv)
 		{"conninfo", 1, 0, 'c'}, {"fixture", 1, 0, 'f'}, {"work", 1, 0, 'w'},
 		{"bindir", 1, 0, 'b'}, {"break", 1, 0, 'x'}, {"steps", 1, 0, 's'},
 		{"stream", 0, 0, 'S'}, {"ddl", 0, 0, 'D'}, {"merge", 0, 0, 'M'},
-		{"only", 1, 0, 'O'},
+		{"only", 1, 0, 'O'}, {"move", 0, 0, 'V'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -1162,15 +1324,16 @@ main(int argc, char **argv)
 			case 'D': mode = 'D'; break;
 			case 'M': mode = 'M'; break;
 			case 'O': o.only = optarg; break;
+			case 'V': mode = 'V'; break;
 			default:
 				fprintf(stderr, "rebuild [--conninfo C] [--fixture DIR] [--work DIR] [--bindir DIR]\n"
-						"        [--steps N] [--stream] [--ddl] [--merge [--only N,N...]]\n"
+						"        [--steps N] [--stream] [--ddl] [--merge [--only N,N...]] [--move]\n"
 						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush|\n"
-						"                 notags|noviol]\n");
+						"                 notags|noviol|keepall]\n");
 				return 2;
 		}
 	mkdir(o.work, 0700);
-	if (mode)
+	if (mode == 'D' || mode == 'M')
 	{
 		if (mode == 'D')
 			run_ddl();
@@ -1199,6 +1362,15 @@ main(int argc, char **argv)
 		nsteps = o.steps;
 	if (nsteps == 0)
 		die("no steps in %s", o.fixture);
+	if (mode == 'V')
+	{
+		run_moves(names, nsteps);
+		if (failures)
+			printf("# %d FAILURES\n", failures);
+		else
+			printf("# every move as expected\n");
+		return failures ? 1 : 0;
+	}
 
 	mkdir(o.work, 0700);
 	/* Each run gets its own store beside the earlier ones. */
