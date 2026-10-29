@@ -1,0 +1,356 @@
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 6a09a1a1517..5bad6078050 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -40,8 +40,10 @@
+ #include "access/valid.h"
+ #include "access/visibilitymap.h"
+ #include "access/xloginsert.h"
++#include "catalog/namespace.h"
+ #include "catalog/pg_database.h"
+ #include "catalog/pg_database_d.h"
++#include "catalog/pg_namespace_d.h"
+ #include "commands/vacuum.h"
+ #include "executor/instrument_node.h"
+ #include "pgstat.h"
+@@ -591,6 +593,25 @@ page_collect_tuples(HeapScanDesc scan, Snapshot snapshot,
+ 										   &batchmvcc,
+ 										   scan->rs_vistuples);
+ 
++	/* another branch's catalog rows are not this session's */
++	if (relid == NamespaceRelationId && catalog_branch_filter)
++	{
++		int			keep = 0;
++
++		for (int i = 0; i < nvis; i++)
++		{
++			ItemId		lp = PageGetItemId(page, scan->rs_vistuples[i]);
++			HeapTupleData t;
++
++			t.t_data = (HeapTupleHeader) PageGetItem(page, lp);
++			t.t_len = ItemIdGetLength(lp);
++			t.t_tableOid = relid;
++			if (!catalog_branch_hides(&t))
++				scan->rs_vistuples[keep++] = scan->rs_vistuples[i];
++		}
++		nvis = keep;
++	}
++
+ 	/*
+ 	 * So far we don't have batch API for testing serializabilty, so do so
+ 	 * one-by-one.
+diff --git a/src/backend/access/heap/heapam_visibility.c b/src/backend/access/heap/heapam_visibility.c
+index 905444ae036..94868e590ef 100644
+--- a/src/backend/access/heap/heapam_visibility.c
++++ b/src/backend/access/heap/heapam_visibility.c
+@@ -72,6 +72,7 @@
+ #include "access/tableam.h"
+ #include "access/transam.h"
+ #include "access/xact.h"
++#include "catalog/namespace.h"
+ #include "access/xlog.h"
+ #include "storage/bufmgr.h"
+ #include "storage/procarray.h"
+@@ -1735,16 +1736,20 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+ {
+ 	switch (snapshot->snapshot_type)
+ 	{
++		/* another branch's catalog rows are not this session's */
+ 		case SNAPSHOT_MVCC:
+-			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL);
++			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL) &&
++				!catalog_branch_hides(htup);
+ 		case SNAPSHOT_SELF:
+-			return HeapTupleSatisfiesSelf(htup, snapshot, buffer);
++			return HeapTupleSatisfiesSelf(htup, snapshot, buffer) &&
++				!catalog_branch_hides(htup);
+ 		case SNAPSHOT_ANY:
+ 			return HeapTupleSatisfiesAny(htup, snapshot, buffer);
+ 		case SNAPSHOT_TOAST:
+ 			return HeapTupleSatisfiesToast(htup, snapshot, buffer);
+ 		case SNAPSHOT_DIRTY:
+-			return HeapTupleSatisfiesDirty(htup, snapshot, buffer);
++			return HeapTupleSatisfiesDirty(htup, snapshot, buffer) &&
++				!catalog_branch_hides(htup);
+ 		case SNAPSHOT_HISTORIC_MVCC:
+ 			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer);
+ 		case SNAPSHOT_NON_VACUUMABLE:
+diff --git a/src/backend/catalog/namespace.c b/src/backend/catalog/namespace.c
+index 0647a198dea..9bf7707ddbf 100644
+--- a/src/backend/catalog/namespace.c
++++ b/src/backend/catalog/namespace.c
+@@ -58,6 +58,7 @@
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/snapmgr.h"
++#include "utils/relcache.h"
+ #include "utils/syscache.h"
+ #include "utils/varlena.h"
+ 
+@@ -3603,13 +3604,52 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
+  * If missing_ok is false, throw an error if namespace name not found.  If
+  * true, just return InvalidOid.
+  */
++int			catalog_branch = 0;
++bool		catalog_branch_filter = true;
++
++/* The namespace named nspname for this session: its branch's, else shared. */
++HeapTuple
++SearchNamespaceByName(const char *nspname)
++{
++	HeapTuple	tup;
++
++	if (catalog_branch != 0)
++	{
++		tup = SearchSysCache2(NAMESPACENAME, CStringGetDatum(nspname),
++							  Int32GetDatum(catalog_branch));
++		if (HeapTupleIsValid(tup))
++			return tup;
++	}
++	return SearchSysCache2(NAMESPACENAME, CStringGetDatum(nspname), Int32GetDatum(0));
++}
++
++/* Whether a tuple is another branch's row, hidden from this session's scans. */
++bool
++catalog_branch_hides(HeapTuple htup)
++{
++	int32		branch;
++
++	if (htup->t_tableOid != NamespaceRelationId || !catalog_branch_filter)
++		return false;
++	branch = ((Form_pg_namespace) GETSTRUCT(htup))->nspbranch;
++	return branch != 0 && branch != catalog_branch;
++}
++
+ Oid
+ get_namespace_oid(const char *nspname, bool missing_ok)
+ {
+ 	Oid			oid;
+ 
+-	oid = GetSysCacheOid1(NAMESPACENAME, Anum_pg_namespace_oid,
+-						  CStringGetDatum(nspname));
++	{
++		HeapTuple	tup = SearchNamespaceByName(nspname);
++
++		oid = InvalidOid;
++		if (HeapTupleIsValid(tup))
++		{
++			oid = ((Form_pg_namespace) GETSTRUCT(tup))->oid;
++			ReleaseSysCache(tup);
++		}
++	}
+ 	if (!OidIsValid(oid) && !missing_ok)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+@@ -4789,6 +4829,38 @@ check_search_path(char **newval, void **extra, GucSource source)
+ }
+ 
+ /* assign_hook: do extra actions as needed */
++/*
++ * A session that changes branch sees other catalog rows: every cached
++ * catalog entry, and the search path's namespaces, are looked up again.
++ */
++static void
++catalog_branch_changed(void)
++{
++	baseSearchPathValid = false;
++	if (criticalRelcachesBuilt && IsTransactionState())
++		InvalidateSystemCaches();
++}
++
++void
++assign_catalog_branch(int newval, void *extra)
++{
++	if (newval != catalog_branch)
++	{
++		catalog_branch = newval;
++		catalog_branch_changed();
++	}
++}
++
++void
++assign_catalog_branch_filter(bool newval, void *extra)
++{
++	if (newval != catalog_branch_filter)
++	{
++		catalog_branch_filter = newval;
++		catalog_branch_changed();
++	}
++}
++
+ void
+ assign_search_path(const char *newval, void *extra)
+ {
+diff --git a/src/backend/catalog/pg_namespace.c b/src/backend/catalog/pg_namespace.c
+index f35ef5a344e..3b1e41ad93b 100644
+--- a/src/backend/catalog/pg_namespace.c
++++ b/src/backend/catalog/pg_namespace.c
+@@ -19,6 +19,7 @@
+ #include "catalog/catalog.h"
+ #include "catalog/dependency.h"
+ #include "catalog/indexing.h"
++#include "catalog/namespace.h"
+ #include "catalog/objectaccess.h"
+ #include "catalog/pg_namespace.h"
+ #include "utils/builtins.h"
+@@ -58,7 +59,10 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
+ 		elog(ERROR, "no namespace name supplied");
+ 
+ 	/* make sure there is no existing namespace of same name */
+-	if (SearchSysCacheExists1(NAMESPACENAME, PointerGetDatum(nspName)))
++	tup = SearchNamespaceByName(nspName);
++	if (HeapTupleIsValid(tup))
++		ReleaseSysCache(tup);
++	if (HeapTupleIsValid(tup))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+ 				 errmsg("schema \"%s\" already exists", nspName)));
+@@ -85,6 +89,7 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
+ 	namestrcpy(&nname, nspName);
+ 	values[Anum_pg_namespace_nspname - 1] = NameGetDatum(&nname);
+ 	values[Anum_pg_namespace_nspowner - 1] = ObjectIdGetDatum(ownerId);
++	values[Anum_pg_namespace_nspbranch - 1] = Int32GetDatum(0);
+ 	if (nspacl != NULL)
+ 		values[Anum_pg_namespace_nspacl - 1] = PointerGetDatum(nspacl);
+ 	else
+diff --git a/src/backend/commands/schemacmds.c b/src/backend/commands/schemacmds.c
+index b016983f904..ceb29b1cc9d 100644
+--- a/src/backend/commands/schemacmds.c
++++ b/src/backend/commands/schemacmds.c
+@@ -259,7 +259,14 @@ RenameSchema(const char *oldname, const char *newname)
+ 
+ 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
+ 
+-	tup = SearchSysCacheCopy1(NAMESPACENAME, CStringGetDatum(oldname));
++	tup = SearchNamespaceByName(oldname);
++	if (HeapTupleIsValid(tup))
++	{
++		HeapTuple	copy = heap_copytuple(tup);
++
++		ReleaseSysCache(tup);
++		tup = copy;
++	}
+ 	if (!HeapTupleIsValid(tup))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+@@ -339,7 +346,7 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
+ 
+ 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
+ 
+-	tup = SearchSysCache1(NAMESPACENAME, CStringGetDatum(name));
++	tup = SearchNamespaceByName(name);
+ 	if (!HeapTupleIsValid(tup))
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+diff --git a/src/backend/utils/misc/guc_parameters.dat b/src/backend/utils/misc/guc_parameters.dat
+index 380679a76c0..1a596d469c8 100644
+--- a/src/backend/utils/misc/guc_parameters.dat
++++ b/src/backend/utils/misc/guc_parameters.dat
+@@ -394,6 +394,22 @@
+   options => 'bytea_output_options',
+ },
+ 
++{ name => 'catalog_branch', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
++  short_desc => 'Sets the branch whose catalog rows this session sees (0: none).',
++  variable => 'catalog_branch',
++  boot_val => '0',
++  min => '0',
++  max => 'INT_MAX',
++  assign_hook => 'assign_catalog_branch',
++},
++
++{ name => 'catalog_branch_filter', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
++  short_desc => 'Hides other branches\' catalog rows from this session\'s scans.',
++  variable => 'catalog_branch_filter',
++  boot_val => 'true',
++  assign_hook => 'assign_catalog_branch_filter',
++},
++
+ { name => 'check_function_bodies', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+   short_desc => 'Check routine bodies during CREATE FUNCTION and CREATE PROCEDURE.',
+   variable => 'check_function_bodies',
+diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
+index 056d48eb279..b4584441700 100644
+--- a/src/include/catalog/catversion.h
++++ b/src/include/catalog/catversion.h
+@@ -57,6 +57,6 @@
+  */
+ 
+ /*							yyyymmddN */
+-#define CATALOG_VERSION_NO	202610201
++#define CATALOG_VERSION_NO	202610291
+ 
+ #endif
+diff --git a/src/include/catalog/namespace.h b/src/include/catalog/namespace.h
+index 9453a3e4932..4ede947d9b6 100644
+--- a/src/include/catalog/namespace.h
++++ b/src/include/catalog/namespace.h
+@@ -14,6 +14,7 @@
+ #ifndef NAMESPACE_H
+ #define NAMESPACE_H
+ 
++#include "access/htup.h"
+ #include "nodes/primnodes.h"
+ #include "storage/lockdefs.h"
+ #include "storage/procnumber.h"
+@@ -164,6 +165,18 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
+ extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
+ extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
+ 
++/*
++ * Branched catalogs: a namespace row with nspbranch set belongs to that
++ * branch alone.  catalog_branch is this session's branch (0: none);
++ * names resolve to its rows first, then to shared ones, and while
++ * catalog_branch_filter is on its scans of pg_namespace do not see other
++ * branches' rows.
++ */
++extern PGDLLIMPORT int catalog_branch;
++extern PGDLLIMPORT bool catalog_branch_filter;
++extern HeapTuple SearchNamespaceByName(const char *nspname);
++extern bool catalog_branch_hides(HeapTuple htup);
++
+ extern Oid	LookupCreationNamespace(const char *nspname);
+ extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid);
+ extern Oid	QualifiedNameGetCreationNamespace(const List *names, char **objname_p);
+diff --git a/src/include/catalog/pg_namespace.h b/src/include/catalog/pg_namespace.h
+index 358fc67c047..d71d2e8fdd8 100644
+--- a/src/include/catalog/pg_namespace.h
++++ b/src/include/catalog/pg_namespace.h
+@@ -29,6 +29,7 @@
+  *
+  *	nspname				name of the namespace
+  *	nspowner			owner (creator) of the namespace
++ *	nspbranch			the branch this row belongs to, or 0: shared by all
+  *	nspacl				access privilege list
+  * ----------------------------------------------------------------
+  */
+@@ -40,6 +41,7 @@ CATALOG(pg_namespace,2615,NamespaceRelationId)
+ 
+ 	NameData	nspname;
+ 	Oid			nspowner BKI_DEFAULT(POSTGRES) BKI_LOOKUP(pg_authid);
++	int32		nspbranch BKI_DEFAULT(0);
+ 
+ #ifdef CATALOG_VARLEN			/* variable-length fields start here */
+ 	aclitem		nspacl[];
+@@ -57,7 +59,7 @@ typedef FormData_pg_namespace *Form_pg_namespace;
+ 
+ DECLARE_TOAST(pg_namespace, 4163, 4164);
+ 
+-DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops));
++DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops, nspbranch int4_ops));
+ DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops));
+ 
+ MAKE_SYSCACHE(NAMESPACENAME, pg_namespace_nspname_index, 4);
+diff --git a/src/include/utils/guc_hooks.h b/src/include/utils/guc_hooks.h
+index 06453a18c03..9865ea94a3c 100644
+--- a/src/include/utils/guc_hooks.h
++++ b/src/include/utils/guc_hooks.h
+@@ -122,6 +122,8 @@ extern bool check_restrict_nonsystem_relation_kind(char **newval, void **extra,
+ extern void assign_restrict_nonsystem_relation_kind(const char *newval, void *extra);
+ extern bool check_search_path(char **newval, void **extra, GucSource source);
+ extern void assign_search_path(const char *newval, void *extra);
++extern void assign_catalog_branch(int newval, void *extra);
++extern void assign_catalog_branch_filter(bool newval, void *extra);
+ extern bool check_serial_buffers(int *newval, void **extra, GucSource source);
+ extern bool check_session_authorization(char **newval, void **extra, GucSource source);
+ extern void assign_session_authorization(const char *newval, void *extra);
