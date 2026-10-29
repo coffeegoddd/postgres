@@ -88,18 +88,20 @@ Only keyframes are optional.  Everything else is required.
 
 ## Keyframe policy
 
-- **Default: none.**  Prolly tree + change stream covers commit, diff, merge,
-  remotes, and most checkouts by row replay.
-- **Keyframes where measurement says they pay:** at branch heads (the latest
-  per branch: switching heads is the most common move), and along history
-  each time *R* rows have changed since the last keyframe, where *R* is the
-  measured point at which restoring pages beats replaying rows.  If replay
-  always wins once restore's constant factor is fixed, *R* = ∞ and there are
-  no keyframes.
-- **Restoring a keyframe is exact only if** every page change after its base
-  point reaches the WAL and is read: hint changes logged, a checkpoint at the
-  base point, and the WAL flushed before the changed pages are read
-  (`bench/lp_dead_repro.sql` shows each failure).
+The keyframe planner (`kfplan.h`) decides, measured in *Keyframes:
+replay or restore* below:
+- **checkout:** restore the target's keyframe, or the nearest imaged
+  ancestor's and then replay the rest, when that is priced lower than
+  replaying the rows;
+- **capture:** keep a keyframe at a commit when restoring the change since
+  the last one, plus capturing it, beats replaying it;
+- **costs:** each path's costs are refitted from every move the planner
+  observes, starting from the costs measured for the server's
+  wal_compression.
+- **Exactness:** restoring a keyframe is exact only if every page change
+  after its base point reaches the WAL and is read.  That needs logged
+  hints, a checkpoint at the base point, and the WAL flushed before the
+  changed pages are read (`bench/lp_dead_repro.sql` shows each failure).
 - **Longer term:** copy-on-write page storage (next section) makes every
   commit's page-map root a free keyframe, once settled.
 
@@ -235,10 +237,11 @@ What it proved, against a real Postgres where it matters:
 - **Inside the window is what makes it cheap.**  Outside it, diff costs
   ~6–9× more and checkout ~2× (bringing the old version back from the
   archive); a full rebuild costs ~100×.
-- **Keyframes as built lose to row replay** on random workloads (~150 µs
-  per page restored vs ~8 µs per row replayed), so the default is none.
-  Restoring pages exactly also needs logged hints, a checkpoint at the base
-  point, and a flushed WAL (`bench/lp_dead_repro.sql`).
+- **Keyframes pay for large or dense changes** (superseded: the earlier
+  "~150 µs per page, so none" was pglz compression and one WAL record per
+  page; see *Keyframes: replay or restore*).  Restoring pages exactly also
+  needs logged hints, a checkpoint at the base point, and a flushed WAL
+  (`bench/lp_dead_repro.sql`).
 
 - **Severed history really leaves the disk.**  Immutable chunk files and
   compaction keep disk at the live size while history grows (1.8 GB
@@ -1228,6 +1231,90 @@ table, 4 changes a commit, about 15 KB of change bytes each):
   binds.
 - **The cost of severing** includes discarding, which frees the cut
   commits' chunks: about 2 us a commit held.
+
+## Keyframes: replay or restore
+
+**The measurement** (`bench/kfbench`, 1M rows with two indexes, every move
+verified by row checksum and amcheck).  Each change shape moves back to
+the base state by replay (one upsert of the rows) or by restore (the pages
+that differ, read by the server from a file and logged 32 to a WAL record
+by `prolly_put_pages_file`).  Timed after a checkpoint (cold) and without
+one (warm), under each wal_compression.
+
+| Change | off | pglz | lz4 | zstd |
+|---|---:|---:|---:|---:|
+| 10k sparse rows, cold: replay / restore ms | 255 / 192 | 1,045 / 949 | 192 / 146 | 309 / 252 |
+| 10k sparse rows, warm | 97 / 182 | 94 / 919 | 98 / 144 | 93 / 254 |
+| 100k clustered rows, cold | 970 / 78 | 1,398 / 468 | 964 / 73 | 986 / 122 |
+| all 1M rows, cold | 8,535 / 385 | 10,535 / 1,414 | 8,057 / 254 | 8,036 / 404 |
+| WAL of that restore | 181 MB | 43 MB | 47 MB | 26 MB |
+
+**What decides it.**  Both paths write the pages that differ, so the
+model is:
+- `replay = F_r + a·rows + b_cold·cold_pages + b_warm·warm_pages`;
+- `restore = F_s + c·pages`.
+
+Measured with lz4: a ≈ 7.6 us/row; b_cold ≈ 19 us and b_warm ≈ 3.7 us a
+page; c ≈ 10 us a page; F_s ≈ 8-17 ms.
+- **Cold:** replay pays more per page than restore (a full-page image on
+  first touch plus heap and index work), so restore wins past a few
+  hundred to a few thousand rows.
+- **Warm:** the pages already have their image since the checkpoint, and
+  replay wins sparse changes up to about 10k rows.  Dense or large changes
+  restore regardless: 100k clustered rows 73 ms against 964, the whole
+  table 254 ms against 8 s.
+- **How the change is spread** matters less than expected.  Size and
+  checkpoint recency decide most of it.
+
+**WAL compression is part of the design.**
+- **lz4:** the fastest restore and about 4x less WAL than off, with replay
+  unchanged.  Recommend it.
+- **zstd:** the least WAL, but slower.
+- **pglz:** 3-5x slower on restore.
+- Costs are kept per setting, matched to the server's.
+
+**The planner** (`kfplan.c`, behind an interface):
+- **Inputs:** rows (prolly diff count), pages (image diff and the WAL),
+  and warm pages (written since the last checkpoint).
+- **Self-calibration.**  `kf_calibrating_planner` refits both models from
+  every move it observes:
+  - decaying least squares weighted by 1/time;
+  - costs kept non-negative;
+  - the measured costs act as a prior worth one observation.
+- **Exploration.**  It learns only from the path it takes, so a path not
+  taken for 50 decisions is tried on the next small move (under a quarter
+  of the average).  That is cheap, and it is what pins fixed costs.
+  Near-tie exploration was tried and removed: nothing needed it.
+
+**Accuracy** (`test/test_kfplan.c`):
+- **The measured moves, each predicted from the others:**
+  - off: 14/16 right, 0.7% of the best time lost;
+  - pglz: 16/16, 0%;
+  - lz4: 14/16, 1.2%.
+  - The misses are the 1,000-row cold moves at the break-even, 6-10 ms
+    each.
+- **A simulated server, starting from another server's costs:**
+  - 0.7% lost, against 9.7% for a planner that keeps those costs;
+  - late decisions 456/458 right (those where one path is 20% and 1 ms
+    cheaper).
+  - After a switch to pglz-like costs: 370/370, 0.06% lost.
+  - Without exploration, from a prior that hides replay: 311/455 right,
+    against 452/455 with it.
+
+**End to end** (`bench/winbench --planned`, 1M rows, a keyframe at each
+commit by the capture rule, 20 checkouts, each verified row by row against
+the prolly tree):
+- **Calibration worked:** the first checkout restored, estimated at 208 ms
+  and taking 1,112 ms.  winbench's restore path sends pages as bytea, one
+  record each.  The planner then replayed every later checkout, its
+  estimates within about 20% of the time taken.
+- **Planning cost too much:** the whole checkout grew from 0.3 to 2.3 s
+  while the moves took 70-320 ms.  Counting candidate pages scans the WAL
+  since the working set's base, a range that only grows.  The engine
+  needs the dirty-page set maintained as the WAL is decoded, so a plan
+  costs O(1).
+- **Keyframes cost storage:** about 40 MB of new image chunks a commit
+  here, 1 GB live across a 20-commit window.
 
 ## Evidence so far
 

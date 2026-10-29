@@ -19,6 +19,15 @@
  *	verify		the table's rows against the prolly tree at the target, and
  *				amcheck on both indexes.
  *
+ *	--planned	keyframes and checkouts as the keyframe planner (kfplan.h)
+ *				decides, calibrating itself from the costs given (measured
+ *				by bench/kfbench) as it observes each move: a commit
+ *				keeps an image only when the change since the last one
+ *				would be cheaper to restore than to replay, and a checkout
+ *				replays rows, or restores the target's image or its nearest
+ *				imaged ancestor's and replays the rest, whichever is
+ *				priced lower.  Each checkout prints the choice, its estimate
+ *				and the time it took, and is verified like any other.
  * Output: one CSV line per commit and per checkout, then a summary.
  */
 #define _DEFAULT_SOURCE
@@ -31,6 +40,7 @@
 
 #include "../test/test_util.h"
 #include "../image.h"
+#include "../kfplan.h"
 
 #define BLCK 8192
 #define HEAP_PER_VM_PAGE 32672	/* heap blocks one visibility map page covers */
@@ -66,6 +76,7 @@ typedef struct Opts
 	const char *outside;		/* distances to measure, e.g. "5,15,30" */
 	int			bg_rows;		/* stream: apply once this many rows are pending */
 	uint64_t	seed;
+	const char *planned;		/* keyframe costs: row,replay_page,page,replay_fixed,restore_fixed,capture */
 } Opts;
 
 typedef struct Rel
@@ -87,7 +98,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -111,6 +122,9 @@ static int ncommits;
 static uint64_t snap_dummy_xip[1];
 static uint64_t last_dirty,
 			last_diff;			/* checkout page sources, for reporting */
+static KfPlanner *planner;		/* with --planned */
+static uint64_t rows_since_image;	/* rows committed since the last image */
+static double density = 1.0;	/* pages per row changed, from the images captured */
 
 /* ----------------------------------------------------------------- utils */
 
@@ -891,10 +905,35 @@ dolt_commit(int seq, const char *branch)
 	snprintf(msg, sizeof(msg), "%s %d", branch, seq);
 	c = vc_commit(&repo, msg);
 	t1 = now_ms();
-	img = capture_incremental(&c, lsn, &pages);
-	CHECK(vc_image_set(&repo, &c, &img) == VC_OK);
-	t2 = now_ms();
-	set_base_point(&img);
+	rows_since_image += rows;
+	pages = 0;
+	if (planner)
+	{
+		PageSet		s = {0};
+
+		wal_pages(base_lsn, lsn, &s);
+		pages = s.n;
+		free(s.v);
+	}
+	if (planner == NULL ||
+		planner->ops->should_capture(planner, &(KfMove) {rows_since_image, pages, 0}))
+	{
+		img = capture_incremental(&c, lsn, &pages);
+		CHECK(vc_image_set(&repo, &c, &img) == VC_OK);
+		if (rows_since_image > 0)
+			density = 0.8 * density + 0.2 * ((double) pages / (double) rows_since_image);
+		rows_since_image = 0;
+		t2 = now_ms();
+		set_base_point(&img);
+	}
+	else
+	{
+		/* no image: the working set's base stays the last one */
+		printf("# commit %s %d: no keyframe (%zu rows on %llu pages since the last)\n",
+			   branch, seq, (size_t) rows_since_image, (unsigned long long) pages);
+		pages = 0;
+		t2 = now_ms();
+	}
 	t3 = now_ms();
 
 	/* the window: what falls out is discarded, images with it */
@@ -1133,6 +1172,163 @@ replay_diff(PGconn *c, const PHash *from, const PHash *to)
 	return rd.ndel + rd.nins;
 }
 
+static void
+count_fn(void *arg, const ProllyDiff *d)
+{
+	(*(uint64_t *) arg)++;
+}
+
+static uint64_t
+rows_between(const PHash *from_rv, const PHash *to_rv)
+{
+	uint64_t	n = 0;
+	PHash		a = table_root(from_rv),
+				b = table_root(to_rv);
+
+	CHECK_OK(prolly_diff(&repo.ctx, &a, &b, count_fn, &n));
+	return n;
+}
+
+/* Pages written since the working set's base: warm, since the base checkpointed. */
+static uint64_t
+dirty_since_base(void)
+{
+	PageSet		s = {0};
+	char		lsn[32];
+	uint64_t	n;
+
+	flush_lsn(lsn);
+	wal_pages(base_lsn, lsn, &s);
+	n = s.n;
+	free(s.v);
+	return n;
+}
+
+/* Pages a restore to image img would write: changed since the base, or differing. */
+static uint64_t
+restore_pages(const PHash *img)
+{
+	ImgHeader	th,
+				bh;
+	PageSet		s = {0};
+	char		lsn[32];
+	uint64_t	n;
+
+	CHECK_OK(img_load(&repo.ctx, img, &th));
+	CHECK_OK(img_load(&repo.ctx, &base_img, &bh));
+	flush_lsn(lsn);
+	wal_pages(base_lsn, lsn, &s);
+	CHECK_OK(img_diff(&repo.ctx, &bh, &th, img_diff_fn, &s));
+	pageset_sort(&s);
+	n = s.n;
+	for (size_t i = 1; i < s.n; i++)
+		if (s.v[i].oid == s.v[i - 1].oid && s.v[i].fork == s.v[i - 1].fork &&
+			s.v[i].block == s.v[i - 1].block)
+			n--;
+	img_header_free(&th);
+	img_header_free(&bh);
+	free(s.v);
+	return n;
+}
+
+static uint64_t checkout_sql(const PHash *target);
+
+/*
+ * Checks out target the way the planner prices cheapest: replay the rows,
+ * or restore the target's image or its nearest imaged ancestor's and
+ * replay the rows from there.  Returns rows replayed plus pages written.
+ */
+static uint64_t
+checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t howlen)
+{
+	PHash		work = repo.br[repo.cur].working,
+				kf[2];
+	KfCandidate cand[2];
+	size_t		n = 0;
+	VcCommit	tc;
+	uint64_t	rows = rows_between(&work, NULL == target ? &work : &work),
+				done;
+	KfChoice	ch;
+	double		t;
+
+	CHECK(vc_commit_load(&repo.ctx, target, &tc));
+	rows = rows_between(&work, &tc.root);
+	/* the target's own image, and the nearest imaged ancestor's */
+	{
+		PHash		h = *target;
+
+		for (int hop = 0; hop < 64 && n < 2; hop++)
+		{
+			VcCommit	c;
+			PHash		img;
+
+			if (!vc_commit_load(&repo.ctx, &h, &c))
+				break;
+			if (vc_image_get(&repo, &h, &img))
+			{
+				memset(&cand[n], 0, sizeof(KfCandidate));
+				cand[n].keyframe = h;
+				cand[n].pages = restore_pages(&img);
+				cand[n].after.rows = hop ? rows_between(&c.root, &tc.root) : 0;
+				cand[n].after.pages = (uint64_t) ((double) cand[n].after.rows * density);
+				/* rows replayed after a restore land on pages it just wrote */
+				cand[n].after.warm_pages = cand[n].after.pages;
+				kf[n++] = h;
+				break;
+			}
+			if (c.nparents == 0)
+				break;
+			h = c.parents[0];
+		}
+	}
+	{
+		uint64_t	rp = (uint64_t) ((double) rows * density),
+					warm = dirty_since_base();
+		KfMove		m;
+
+		m.rows = rows;
+		m.pages = rp < table_pages ? rp : table_pages;
+		m.warm_pages = warm < m.pages ? warm : m.pages;
+		ch = planner->ops->choose(planner, &m, cand, n);
+		t = now_ms();
+		if (ch.path == KF_REPLAY)
+		{
+			done = checkout_sql(target);
+			planner->ops->observe_replay(planner, &m, (now_ms() - t) * 1000);
+			snprintf(how, howlen, "replay,rows=%llu,warm=%llu/%llu", (unsigned long long) rows,
+					 (unsigned long long) m.warm_pages, (unsigned long long) m.pages);
+		}
+		else
+		{
+			const KfCandidate *k = &cand[ch.candidate];
+			double		t2;
+
+			done = checkout_images(&kf[ch.candidate]);
+			t2 = now_ms();
+			planner->ops->observe_restore(planner, k->pages, (t2 - t) * 1000);
+			if (k->after.rows)
+			{
+				VcCommit	kc;
+				PHash		from,
+							to = table_root(&tc.root);
+
+				CHECK(vc_commit_load(&repo.ctx, &kf[ch.candidate], &kc));
+				from = table_root(&kc.root);
+				done += replay_diff(db, &from, &to);
+				qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
+				planner->ops->observe_replay(planner, &k->after, (now_ms() - t2) * 1000);
+			}
+			snprintf(how, howlen, "restore%s,pages=%llu,rows_after=%llu",
+					 k->after.rows ? "+replay" : "", (unsigned long long) k->pages,
+					 (unsigned long long) k->after.rows);
+		}
+	}
+	snprintf(how + strlen(how), howlen - strlen(how),
+			 ",est_ms=%.1f,replay_est_ms=%.1f,run_ms=%.1f%s", ch.est_us / 1000,
+			 ch.replay_us / 1000, now_ms() - t, ch.explored ? ",explored" : "");
+	return done;
+}
+
 /* Baseline: replays the prolly diff as SQL; returns rows changed. */
 static uint64_t
 checkout_sql(const PHash *target)
@@ -1341,20 +1537,26 @@ switch_to(const PHash *target, bool by_sql, uint64_t db_pages)
 	int			dist = distance(&repo.br[repo.cur].head, target);
 	int			path = path_len(&repo.br[repo.cur].head, target);
 
+	char		how[256] = "";
+
 	CHECK(vc_commit_load(&repo.ctx, target, &c));
 	to = table_root(&c.root);
-	work = by_sql ? checkout_sql(target) : checkout_images(target);
+	if (planner && !by_sql)
+		work = checkout_planned(target, db_pages, how, sizeof(how));
+	else
+		work = by_sql ? checkout_sql(target) : checkout_images(target);
 	t1 = now_ms();
 	CHECK(vc_reset_hard(&repo, target) == VC_OK);
 	if (o.verify == 2)
 		verify_full(&to);
 	else if (o.verify == 1)
 		verify_changed(&from, &to);
-	printf("checkout,%s,%s,dist=%d,path=%d,%s=%llu,dirty=%llu,diff=%llu,ms=%.1f,db_pages=%llu,verify_ms=%.0f\n",
-		   by_sql ? "sql" : "image", hex(target), dist, path, by_sql ? "rows" : "pages",
+	printf("checkout,%s,%s,dist=%d,path=%d,%s=%llu,dirty=%llu,diff=%llu,ms=%.1f,db_pages=%llu,verify_ms=%.0f%s%s\n",
+		   by_sql ? "sql" : how[0] ? "planned" : "image", hex(target), dist, path,
+		   by_sql ? "rows" : how[0] ? "work" : "pages",
 		   (unsigned long long) work, by_sql ? 0ULL : (unsigned long long) last_dirty,
 		   by_sql ? 0ULL : (unsigned long long) last_diff, t1 - t0,
-		   (unsigned long long) db_pages, now_ms() - t1);
+		   (unsigned long long) db_pages, now_ms() - t1, how[0] ? "," : "", how);
 	fflush(stdout);
 }
 
@@ -2159,6 +2361,7 @@ usage(void)
 			"         [--verify 0|1|2] [--no-sql] [--reuse] [--no-final-verify] [--seed N]\n"
 			"         [--lifecycle [--bg-ms MS] [--bg-rows N] [--diffs N]\n"
 			"                      [--sql-decode [--bg-bytes B]]]\n"
+			"         [--planned REPLAY_FIXED,ROW,COLD_PAGE,WARM_PAGE,RESTORE_FIXED,PAGE,CAPTURE (us)]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -2175,7 +2378,7 @@ main(int argc, char **argv)
 		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
-		{"outside", 1, 0, 'O'}, {0, 0, 0, 0}
+		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -2211,10 +2414,24 @@ main(int argc, char **argv)
 			case 'W': o.bg_rows = atoi(optarg); break;
 			case 'K': o.concurrent = true; break;
 			case 'O': o.outside = optarg; break;
+			case 'P': o.planned = optarg; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
 		usage();
+	if (o.planned)
+	{
+		KfCosts		k;
+
+		KfCalibration cal = {.forget = 0.99, .prior_weight = 1, .explore_every = 50};
+
+		memset(&k, 0, sizeof(k));
+		if (sscanf(o.planned, "%lf,%lf,%lf,%lf,%lf,%lf,%lf", &k.replay_fixed_us, &k.row_us,
+				   &k.replay_page_us, &k.replay_warm_page_us, &k.restore_fixed_us, &k.page_us,
+				   &k.capture_page_us) != 7)
+			usage();
+		planner = kf_calibrating_planner(&k, &cal);
+	}
 	rng_seed(o.seed);
 	db = PQconnectdb(o.conninfo);
 	if (PQstatus(db) != CONNECTION_OK)

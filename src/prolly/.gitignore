@@ -10,3 +10,5 @@
 /bench/diskbench
 /bench/rebuild
 /bench/deepbench
+/bench/kfbench
+/test/test_kfplan
