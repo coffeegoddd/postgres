@@ -60,10 +60,10 @@ rebuild-check: bench/rebuild
 			echo "rebuild: --stream --break $$b went unnoticed"; exit 1; \
 		else echo "rebuild: --stream --break $$b caught"; fi; \
 	done
-	for b in notags noviol; do \
-		if ./bench/rebuild --merge --break $$b >/dev/null 2>&1; then \
-			echo "rebuild: --merge --break $$b went unnoticed"; exit 1; \
-		else echo "rebuild: --merge --break $$b caught"; fi; \
+	for b in notags:18,22,23,24,25 noviol:11,12,13,14,27,28; do \
+		if ./bench/rebuild --merge --break $${b%%:*} --only $${b#*:} >/dev/null 2>&1; then \
+			echo "rebuild: --merge --break $${b%%:*} went unnoticed"; exit 1; \
+		else echo "rebuild: --merge --break $${b%%:*} caught"; fi; \
 	done
 
 bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)

@@ -25,6 +25,7 @@
 #endif
 
 #define SCHEMA "rt"
+#define TEMPLATE_DB "rt_template"	/* the extensions, copied into every database */
 #define WS_MAX_COLS 1600		/* Postgres's limit */
 
 /* Settings under which row text is written and read. */
@@ -44,6 +45,7 @@ typedef struct Opts
 	int			steps;			/* 0: all */
 	bool		stream;			/* commits from the replication stream */
 	const char *sqldir;			/* prolly_tags.sql and prolly_triggers.sql */
+	const char *only;			/* --merge: these scenario numbers (comma separated) */
 } Opts;
 
 extern Opts o;

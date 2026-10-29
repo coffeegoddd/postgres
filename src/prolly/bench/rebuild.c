@@ -47,6 +47,7 @@ Opts		o = {
 	0,
 	false,
 	"bench",
+	NULL,
 };
 
 static int	failures = 0;
@@ -1023,6 +1024,22 @@ run_merges(void)
 	{
 		if (o.steps > 0 && i >= o.steps)
 			break;
+		if (o.only)
+		{
+			char		num[16];
+			char		list[256];
+			bool		hit = false;
+
+			snprintf(num, sizeof(num), "%d", atoi(files[i]));
+			snprintf(list, sizeof(list), "%s", o.only);
+			for (char *t = strtok(list, ","); t; t = strtok(NULL, ","))
+				hit |= atoi(t) == atoi(num);
+			if (!hit)
+			{
+				free(files[i]);
+				continue;
+			}
+		}
 		run_merge_scenario(&ctx, files[i]);
 		free(files[i]);
 	}
@@ -1113,6 +1130,7 @@ main(int argc, char **argv)
 		{"conninfo", 1, 0, 'c'}, {"fixture", 1, 0, 'f'}, {"work", 1, 0, 'w'},
 		{"bindir", 1, 0, 'b'}, {"break", 1, 0, 'x'}, {"steps", 1, 0, 's'},
 		{"stream", 0, 0, 'S'}, {"ddl", 0, 0, 'D'}, {"merge", 0, 0, 'M'},
+		{"only", 1, 0, 'O'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -1143,9 +1161,10 @@ main(int argc, char **argv)
 			case 'S': o.stream = true; break;
 			case 'D': mode = 'D'; break;
 			case 'M': mode = 'M'; break;
+			case 'O': o.only = optarg; break;
 			default:
 				fprintf(stderr, "rebuild [--conninfo C] [--fixture DIR] [--work DIR] [--bindir DIR]\n"
-						"        [--steps N] [--stream] [--ddl] [--merge]\n"
+						"        [--steps N] [--stream] [--ddl] [--merge [--only N,N...]]\n"
 						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush|\n"
 						"                 notags|noviol]\n");
 				return 2;

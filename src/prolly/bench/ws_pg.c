@@ -107,17 +107,28 @@ psql_file(const char *db, const char *file)
 void
 fresh_database(const char *db)
 {
+	static bool made = false;
 	PGconn	   *c = pg_open("postgres");
 	char		sql[256],
 				file[1024];
 
+	/*
+	 * A template with the extensions, made once per run: copying it is far
+	 * quicker than installing them in every database.
+	 */
+	if (!made)
+	{
+		pg_cmd(c, "DROP DATABASE IF EXISTS " TEMPLATE_DB);
+		pg_cmd(c, "CREATE DATABASE " TEMPLATE_DB " TEMPLATE template0");
+		snprintf(file, sizeof(file), "%s/setup.sql", o.fixture);
+		psql_file(TEMPLATE_DB, file);
+		made = true;
+	}
 	snprintf(sql, sizeof(sql), "DROP DATABASE IF EXISTS %s", db);
 	pg_cmd(c, sql);
-	snprintf(sql, sizeof(sql), "CREATE DATABASE %s TEMPLATE template0", db);
+	snprintf(sql, sizeof(sql), "CREATE DATABASE %s TEMPLATE " TEMPLATE_DB, db);
 	pg_cmd(c, sql);
 	PQfinish(c);
-	snprintf(file, sizeof(file), "%s/setup.sql", o.fixture);
-	psql_file(db, file);
 }
 
 /* Reads a command's whole output. */
