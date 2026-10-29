@@ -306,6 +306,8 @@ static void RelationParseRelOptions(Relation relation, HeapTuple tuple);
 static void RelationBuildTupleDesc(Relation relation);
 static Relation RelationBuildDesc(Oid targetRelId, bool insertIt);
 static void RelationInitPhysicalAddr(Relation relation);
+
+relation_locator_hook_type relation_locator_hook = NULL;
 static void load_critical_index(Oid indexoid, Oid heapoid);
 static TupleDesc GetPgClassDescriptor(void);
 static TupleDesc GetPgIndexDescriptor(void);
@@ -1398,6 +1400,9 @@ RelationInitPhysicalAddr(Relation relation)
 			elog(ERROR, "could not find relation mapping for relation \"%s\", OID %u",
 				 RelationGetRelationName(relation), relation->rd_id);
 	}
+
+	if (relation_locator_hook)
+		(*relation_locator_hook) (relation);
 
 	/*
 	 * For RelationNeedsWAL() to answer correctly on parallel workers, restore

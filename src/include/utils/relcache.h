@@ -156,6 +156,15 @@ extern void RelationCacheInitFilePostInvalidate(void);
 extern void RelationCacheInitFileRemove(void);
 
 /* should be used only by relcache.c and catcache.c */
+/*
+ * Hook for choosing a relation's physical files: called whenever a relcache
+ * entry's rd_locator is set from the catalog, and may set another file
+ * number for this backend alone.  Every reader and writer of the relation in
+ * this backend then uses those files; other backends are unaffected.
+ */
+typedef void (*relation_locator_hook_type) (Relation relation);
+extern PGDLLIMPORT relation_locator_hook_type relation_locator_hook;
+
 extern PGDLLIMPORT bool criticalRelcachesBuilt;
 
 /* should be used only by relcache.c and postinit.c */

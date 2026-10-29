@@ -164,6 +164,55 @@ No core change.  `spike/branch_test.sql`, `spike/sessions.sh` and
 5. **DROP TABLE leaves the other branches' files** on disk.  Fixable from
    an extension with `object_access_hook`.
 
+### Experiment B: a branch per session (`relation_locator_hook`)
+
+A 14-line core hook at the end of `RelationInitPhysicalAddr` lets an
+extension set a relation's file number for its own backend.
+`prolly_branch.use_branch` sets a session GUC mapping each relation of the
+schema to a branch's files and rebuilds those relcache entries.
+`spike/session_branch_test.sh` tests it.
+
+**What works with the hook:**
+- two sessions on two branches at once, each reading and writing its own,
+  every index exact and amcheck clean; a new session sees the checked-out
+  branch;
+- parallel workers read the session's branch (the GUC travels with them);
+- a global checkout leaves a session that chose its branch on it;
+- crash recovery with both branches written.
+
+**What it breaks or still needs:**
+1. **Logical decoding fails outright** on a session's branch files:
+   `could not map filenumber ... to relation OID`.  Decoding maps files to
+   relations through `pg_class`.  Needs a hook there (a patch), or our own
+   WAL records decoded by our own resource manager.
+2. **Per-file catalog fields are shared.**  VACUUM in a session on g wrote
+   g's relpages and reltuples into `pg_class` (0/-1 to 66/2469, while main
+   has 2375 rows); relfrozenxid goes the same way, so the freeze horizon
+   is wrong for every other branch.  Needs those fields per branch, with
+   hooks where VACUUM, ANALYZE and the horizon read and write them
+   (patches).
+3. **Sequence caches outlive a branch change:** a session that drew 21
+   from g's sequence then drew 22 on main, from g's cache.  Fixable in the
+   extension: reset the caches on a switch (`ResetSequenceCaches`).
+4. **DDL lands in the shared catalog.**  An index built in g's session is
+   built from g's rows; main's session then reads it and fails (`could not
+   read blocks 65..65`).  With definitions moved at checkout (decision
+   (b)), DDL must not run while sessions are on other branches of the
+   schema: it takes the schema exclusively, or it is refused.
+5. **Statistics are per relation, not per branch:** `pg_statistic` and the
+   cumulative stats mix branches.  Row locks and SSI predicate locks are
+   tagged by relation and TID, so two branches can contend falsely (not
+   tested).
+6. Everything experiment A could not give, except a branch per session.
+
+### Patches so far
+
+| Patch | Feature | Status |
+|---|---|---|
+| `relation_locator_hook` (relcache.c, relcache.h) | a branch per session | spike |
+| a relation-for-file hook in decoding | logical decoding of branch files | needed for B |
+| per-branch file fields (relpages, reltuples, relallvisible, relfrozenxid, relminmxid) and the freeze horizon | VACUUM, ANALYZE, wraparound safety per branch | needed for B; A needs the horizon part |
+
 ## Order
 
 1. This map.

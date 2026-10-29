@@ -12,6 +12,12 @@
  * same definitions on every branch, and files the catalog does not name
  * (parked branches) that the server's own bookkeeping does not see.
  *
+ * With relation_locator_hook (a core hook), a session can also work on a
+ * branch of its own: prolly_branch.files maps each of the schema's
+ * relations to the branch's file number for this session, and the hook
+ * applies it as each relcache entry is built.  The setting is a GUC, so
+ * parallel workers get it with the rest of the session's settings.
+ *
  * prolly_branch_copy_files copies a relation's files to a new file number;
  * prolly_branch_point points a relation at a file number, with the
  * pg_class fields that belong to the file; prolly_branch_drop_file drops a
@@ -38,7 +44,10 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
+#include "utils/memutils.h"
+#include "utils/relcache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -47,6 +56,109 @@ PG_MODULE_MAGIC_EXT(.name = "prolly_branch",.version = PG_VERSION);
 PG_FUNCTION_INFO_V1(prolly_branch_copy_files);
 PG_FUNCTION_INFO_V1(prolly_branch_point);
 PG_FUNCTION_INFO_V1(prolly_branch_drop_file);
+PG_FUNCTION_INFO_V1(prolly_branch_invalidate);
+
+/* ------------------------------------------------------- a session's branch */
+
+/* "relid:filenode,..." for this session; empty: the catalog's files */
+static char *session_files = NULL;
+
+typedef struct FileMap
+{
+	Oid			relid;
+	RelFileNumber filenode;
+} FileMap;
+
+static FileMap *map = NULL;
+static int	nmap = 0;
+static char *map_from = NULL;	/* the setting the map was parsed from */
+static relation_locator_hook_type prev_locator_hook = NULL;
+
+static int
+map_cmp(const void *a, const void *b)
+{
+	Oid			x = ((const FileMap *) a)->relid,
+				y = ((const FileMap *) b)->relid;
+
+	return (x > y) - (x < y);
+}
+
+/* Parses the setting when it changed; no catalog access, so safe anywhere. */
+static void
+load_map(void)
+{
+	const char *p = session_files ? session_files : "";
+	int			cap = 0;
+
+	if (map_from && strcmp(map_from, p) == 0)
+		return;
+	if (map_from)
+		pfree(map_from);
+	map_from = MemoryContextStrdup(TopMemoryContext, p);
+	nmap = 0;
+	for (const char *q = p; *q; q++)
+		cap += *q == ',';
+	cap++;
+	if (map)
+		pfree(map);
+	map = MemoryContextAlloc(TopMemoryContext, sizeof(FileMap) * cap);
+	while (*p)
+	{
+		char	   *end;
+		unsigned long relid = strtoul(p, &end, 10),
+					filenode;
+
+		if (*end != ':')
+			break;
+		filenode = strtoul(end + 1, &end, 10);
+		map[nmap].relid = (Oid) relid;
+		map[nmap].filenode = (RelFileNumber) filenode;
+		nmap++;
+		p = *end == ',' ? end + 1 : end;
+	}
+	qsort(map, nmap, sizeof(FileMap), map_cmp);
+}
+
+static void
+branch_locator(Relation relation)
+{
+	if (prev_locator_hook)
+		prev_locator_hook(relation);
+	if (session_files == NULL || session_files[0] == '\0')
+		return;
+	load_map();
+	{
+		FileMap		key = {RelationGetRelid(relation), 0};
+		FileMap    *hit = bsearch(&key, map, nmap, sizeof(FileMap), map_cmp);
+
+		if (hit)
+			relation->rd_locator.relNumber = hit->filenode;
+	}
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomStringVariable("prolly_branch.files",
+							   "This session's file number for each relation of a branch.",
+							   NULL, &session_files, "", PGC_USERSET, 0, NULL, NULL, NULL);
+	MarkGUCPrefixReserved("prolly_branch");
+	prev_locator_hook = relation_locator_hook;
+	relation_locator_hook = branch_locator;
+}
+
+/*
+ * prolly_branch_invalidate(rel regclass)
+ *
+ * Rebuilds rel's relcache entry at the next command, so a changed
+ * prolly_branch.files takes effect.
+ */
+Datum
+prolly_branch_invalidate(PG_FUNCTION_ARGS)
+{
+	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
+	PG_RETURN_VOID();
+}
 
 static Relation
 open_with_storage(Oid relid)

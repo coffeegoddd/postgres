@@ -122,3 +122,29 @@ BEGIN
 	DELETE FROM prolly_branch.files
 	 WHERE branch = name AND relid IN (SELECT prolly_branch.rels(n));
 END $$;
+
+CREATE FUNCTION invalidate(rel regclass) RETURNS void
+AS 'MODULE_PATHNAME', 'prolly_branch_invalidate' LANGUAGE C STRICT;
+
+-- This session works on a branch of its own, whatever is checked out: each
+-- relation of the schema reads and writes the branch's file.
+CREATE FUNCTION use_branch(sch name, name text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	n oid := sch::regnamespace;
+	r record;
+	m text := '';
+BEGIN
+	PERFORM prolly_branch.remember(n);
+	FOR r IN SELECT rel AS relid FROM prolly_branch.rels(n) rel LOOP
+		IF NOT EXISTS (SELECT FROM prolly_branch.files f WHERE f.branch = name AND f.relid = r.relid) THEN
+			RAISE EXCEPTION 'branch % has no file for %: definitions differ', name, r.relid::regclass;
+		END IF;
+	END LOOP;
+	SELECT string_agg(f.relid || ':' || f.filenode, ',') INTO m
+	  FROM prolly_branch.files f
+	 WHERE f.branch = name AND f.relid IN (SELECT prolly_branch.rels(n));
+	PERFORM set_config('prolly_branch.files', coalesce(m, ''), false);
+	FOR r IN SELECT rel AS relid FROM prolly_branch.rels(n) rel LOOP
+		PERFORM prolly_branch.invalidate(r.relid);
+	END LOOP;
+END $$;
