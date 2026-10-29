@@ -856,6 +856,12 @@ ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep)
 	colmap_from_tree(ctx, rv, &cols);
 	it = t_iter(ctx, &t.data, NULL, 0);
 	pg_cmd(c, "BEGIN");
+	/*
+	 * No user code runs while a commit is restored: the event triggers
+	 * that would see this DDL are off until it commits.  Row triggers and
+	 * rules come after the rows, with the objects that need them.
+	 */
+	pg_cmd(c, "SELECT prolly.quiet()");
 	while (t_next(it, &k, &kl, &v, &vl))
 	{
 		Buf			r = {0};
@@ -913,6 +919,7 @@ ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep)
 	run_objects(c, objs + npre, nobj - npre, rep);
 	if (vc_table_get(ctx, rv, "~viol", &t))
 		restore_violations(ctx, c, &t.data);
+	pg_cmd(c, "SELECT prolly.unquiet()");
 	pg_cmd(c, "COMMIT");
 	PQfinish(c);
 	for (size_t i = 0; i < nobj; i++)

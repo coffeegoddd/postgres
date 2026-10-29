@@ -22,8 +22,13 @@
  *	   database lacks (or has otherwise) is created, as in a restore, and
  *	   what the database has and B lacks is dropped;
  *	8. populated materialized views refreshed.
- * Writes run with session_replication_role = replica, so neither user
- * triggers nor foreign keys fire while rows move.
+ * No user code runs: rows go through prolly_apply_insert and
+ * prolly_apply_delete, which fire no triggers and sit below the rule
+ * rewriter, and each transaction runs between prolly.quiet() and
+ * prolly.unquiet(), which set session_replication_role = replica and turn
+ * off, while it runs, the triggers, rules and event triggers enabled
+ * ALWAYS or REPLICA.  What the commits hold already includes what those
+ * did when the rows were first written.
  */
 #include "ws.h"
 
@@ -854,6 +859,91 @@ same_in_db(Move *mv, const WsLayout *LA, const WsLayout *LB, const uint8_t *va, 
 	return true;
 }
 
+/* A quoted identifier (as quote_ident gives it) as the name it stands for. */
+static void
+unquote_ident(const char *q, Buf *out)
+{
+	if (q[0] != '"')
+	{
+		buf_append(out, q, strlen(q));
+		return;
+	}
+	for (const char *p = q + 1; *p && !(p[0] == '"' && p[1] != '"'); p++)
+	{
+		buf_append(out, p, 1);
+		if (p[0] == '"')
+			p++;
+	}
+}
+
+/* A text[] literal of the columns with these tags. */
+static void
+col_array(const WsLayout *L, const uint64_t *tags, int n, Buf *out)
+{
+	out->len = 0;
+	buf_append(out, "{", 1);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			name = {0};
+
+		unquote_ident(ws_layout_col(L, tags[i])->name, &name);
+		if (i)
+			buf_append(out, ",", 1);
+		buf_append(out, "\"", 1);
+		for (size_t j = 0; j < name.len; j++)
+		{
+			if (name.data[j] == '"' || name.data[j] == '\\')
+				buf_append(out, "\\", 1);
+			buf_append(out, &name.data[j], 1);
+		}
+		buf_append(out, "\"", 1);
+		free(name.data);
+	}
+	buf_append(out, "}", 2);
+}
+
+/*
+ * Applies data, COPY text for the columns in cols, with prolly_apply_insert
+ * or prolly_apply_delete: no user code runs.  Every line must take effect.
+ */
+static void
+apply_rows(Move *mv, const char *fn, const WsLayout *L, Buf *cols, Buf *data, uint64_t lines)
+{
+	char		rel[600],
+				sql[200];
+	const char *vals[3];
+	PGresult   *res;
+
+	if (lines == 0)
+		return;
+	snprintf(rel, sizeof(rel), SCHEMA ".%s", L->rel);
+	snprintf(sql, sizeof(sql), "SELECT public.%s($1::regclass, $2::text[], $3)", fn);
+	buf_append(data, "", 1);
+	vals[0] = rel;
+	vals[1] = (const char *) cols->data;
+	vals[2] = (const char *) data->data;
+	res = PQexecParams(mv->c, sql, 3, NULL, vals, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		char		what[800];
+
+		snprintf(what, sizeof(what), "%s %s: %s", fn, rel, PQerrorMessage(mv->c));
+		die("move %s", what);
+	}
+	if (strtoull(PQgetvalue(res, 0, 0), NULL, 10) != lines)
+	{
+		char		what[800];
+
+		snprintf(what, sizeof(what), "%s %s: %s of %llu rows", fn, rel, PQgetvalue(res, 0, 0),
+				 (unsigned long long) lines);
+		die("move %s", what);
+	}
+	PQclear(res);
+	data->len = 0;
+}
+
+#define APPLY_BATCH (4 << 20)
+
 /* The rows of one table that differ between A and B. */
 static void
 move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const WsLayout *LB,
@@ -862,13 +952,15 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 	ProllyDiffList dl = {0};
 	Buf			del = {0},
 				line = {0},
-				copy = {0};
+				keys = {0},
+				kcols = {0},
+				cols = {0},
+				copy_data = {0};
+	uint64_t	nkeys = 0,
+				nlines = 0;
 	Buf		   *defs = calloc((size_t) LB->nstored + 1, sizeof(Buf));
 	bool	   *have = calloc((size_t) LB->nstored + 1, sizeof(bool));
 	WsField		f[WS_MAX_COLS];
-	int			ndel = 0;
-	bool		copying = false;
-	PGresult   *res;
 
 	(void) name;
 	if (phash_eq(da, db))
@@ -908,35 +1000,23 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 		ws_decode(LA, x->key, x->klen, x->from, x->flen, f);
 		if (LB->nkey > 0)
 		{
-			if (ndel == 0)
-			{
-				buf_append(&del, "DELETE FROM ONLY " SCHEMA ".", strlen("DELETE FROM ONLY " SCHEMA "."));
-				buf_append(&del, LB->rel, strlen(LB->rel));
-				buf_append(&del, " WHERE (", 8);
-				for (int k = 0; k < LB->nkey; k++)
-				{
-					if (k)
-						buf_append(&del, ", ", 2);
-					buf_append(&del, ws_layout_col(LB, LB->key[k])->name,
-							   strlen(ws_layout_col(LB, LB->key[k])->name));
-				}
-				buf_append(&del, ") IN (", 6);
-			}
-			else
-				buf_append(&del, ", ", 2);
-			buf_append(&del, "(", 1);
+			/* the key, a line of COPY text for prolly_apply_delete */
+			if (nkeys == 0 && kcols.len == 0)
+				col_array(LB, LB->key, LB->nkey, &kcols);
 			for (int k = 0; k < LB->nkey; k++)
 			{
 				if (k)
-					buf_append(&del, ", ", 2);
-				literal(mv->c, &del, &f[k], ws_layout_col(LB, LB->key[k])->type);
+					buf_append(&keys, "\t", 1);
+				if (f[k].null)
+					buf_append(&keys, "\\N", 2);
+				else
+					ws_copy_escape(&keys, f[k].p, f[k].len);
 			}
-			buf_append(&del, ")", 1);
-			if (++ndel == 500)
+			buf_append(&keys, "\n", 1);
+			if (++nkeys, keys.len >= APPLY_BATCH)
 			{
-				buf_append(&del, ")", 1);
-				run_sql(mv, &del);
-				ndel = 0;
+				apply_rows(mv, "prolly_apply_delete", LB, &kcols, &keys, nkeys);
+				nkeys = 0;
 			}
 		}
 		else
@@ -967,12 +1047,8 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 		}
 		mv->st->deleted += (uint64_t) times;
 	}
-	if (ndel)
-	{
-		buf_append(&del, ")", 1);
-		run_sql(mv, &del);
-	}
-	/* Then the new versions, by COPY. */
+	apply_rows(mv, "prolly_apply_delete", LB, &kcols, &keys, nkeys);
+	/* Then the new versions. */
 	for (size_t i = 0; i < dl.n; i++)
 	{
 		const ProllyDiff *x = &dl.v[i];
@@ -1000,39 +1076,24 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 				continue;
 			times = to - from;
 		}
-		if (!copying)
-		{
-			copy.len = 0;
-			buf_append(&copy, "COPY " SCHEMA ".", strlen("COPY " SCHEMA "."));
-			buf_append(&copy, LB->rel, strlen(LB->rel));
-			buf_append(&copy, " (", 2);
-			ws_copy_list(LB, &copy);
-			buf_append(&copy, ") FROM STDIN", 13);
-			res = PQexec(mv->c, (const char *) copy.data);
-			if (PQresultStatus(res) != PGRES_COPY_IN)
-				die("move copy: %s", PQerrorMessage(mv->c));
-			PQclear(res);
-			copying = true;
-		}
+		if (cols.len == 0)
+			col_array(LB, LB->copy, LB->nstored, &cols);
 		ws_decode(LB, x->key, x->klen, x->to, x->tlen, f);
 		ws_copy_line(LB, f, &line);
 		for (long q = 0; q < times; q++)
-			if (PQputCopyData(mv->c, (const char *) line.data, (int) line.len) != 1)
-				die("move copy: %s", PQerrorMessage(mv->c));
+			buf_append(&copy_data, line.data, line.len);
+		nlines += (uint64_t) times;
+		if (copy_data.len >= APPLY_BATCH)
+		{
+			apply_rows(mv, "prolly_apply_insert", LB, &cols, &copy_data, nlines);
+			nlines = 0;
+		}
 		if (x->from)
 			mv->st->updated++;
 		else
 			mv->st->inserted += (uint64_t) times;
 	}
-	if (copying)
-	{
-		if (PQputCopyEnd(mv->c, NULL) != 1)
-			die("move copy: %s", PQerrorMessage(mv->c));
-		res = PQgetResult(mv->c);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			die("move copy: %s", PQerrorMessage(mv->c));
-		PQclear(res);
-	}
+	apply_rows(mv, "prolly_apply_insert", LB, &cols, &copy_data, nlines);
 done:
 	for (int i = 0; i <= LB->nstored; i++)
 		if (defs[i].len != (size_t) -1)
@@ -1041,7 +1102,10 @@ done:
 	free(have);
 	free(del.data);
 	free(line.data);
-	free(copy.data);
+	free(keys.data);
+	free(kcols.data);
+	free(cols.data);
+	free(copy_data.data);
 	prolly_diff_list_free(&dl);
 }
 
@@ -1080,7 +1144,7 @@ converge(Move *mv, const char *db)
 
 		collect_objects(mv->c, db, &cur);
 		pg_cmd(mv->c, "BEGIN");
-		pg_cmd(mv->c, "SET session_replication_role = replica");
+		pg_cmd(mv->c, "SELECT prolly.quiet()");
 		for (size_t i = 0; i < cur.n; i++)
 		{
 			const ProllyKV *b = obj_findn(&mv->ob, cur.kv[i].key, cur.kv[i].klen);
@@ -1148,6 +1212,7 @@ converge(Move *mv, const char *db)
 			report_free(&r);
 		}
 		mv->st->created += (int) n;
+		pg_cmd(mv->c, "SELECT prolly.unquiet()");
 		pg_cmd(mv->c, "COMMIT");
 		for (size_t i = 0; i < n; i++)
 		{
@@ -1189,7 +1254,9 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 	table_list(ctx, to, &lb);
 	pg_cmd(mv.c, "SET session_replication_role = replica");
 
-	/* 1. Enum values added, outside the transaction. */
+	/* 1. Enum values added, in a transaction of their own. */
+	pg_cmd(mv.c, "BEGIN");
+	pg_cmd(mv.c, "SELECT prolly.quiet()");
 	for (size_t i = 0; i < mv.oa.n; i++)
 	{
 		const ProllyKV *a = &mv.oa.kv[i],
@@ -1216,6 +1283,9 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 		}
 	}
 
+	pg_cmd(mv.c, "SELECT prolly.unquiet()");
+	pg_cmd(mv.c, "COMMIT");
+
 	pg_cmd(mv.c, "BEGIN");
 	{
 		const ProllyKV *pre = obj_find(&mv.ob, "0\tprelude\t");
@@ -1230,6 +1300,7 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 	}
 	pg_cmd(mv.c, SESSION_SETTINGS);
 	pg_cmd(mv.c, "SET session_replication_role = replica");
+	pg_cmd(mv.c, "SELECT prolly.quiet()");
 
 	/* 2. What B lacks or changed, dropped; a dropped type takes its tables. */
 	for (int sec = 'b'; sec >= 'a'; sec--)
@@ -1482,6 +1553,7 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 	pg_cmd(mv.c, "DELETE FROM prolly.violations");
 	if (vc_table_get(ctx, to, "~viol", &vt))
 		restore_violations(ctx, mv.c, &vt.data);
+	pg_cmd(mv.c, "SELECT prolly.unquiet()");
 	pg_cmd(mv.c, "COMMIT");
 
 	/* 7. Every other object as B has it. */
@@ -1489,6 +1561,8 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 
 	/* 8. Materialized views from the rows now there. */
 	t1 = now_sec();
+	pg_cmd(mv.c, "BEGIN");
+	pg_cmd(mv.c, "SELECT prolly.quiet()");
 	{
 		PGresult   *res = pg_exec(mv.c,
 								  "SELECT format('REFRESH MATERIALIZED VIEW %s', c.oid::regclass) FROM pg_class c "
@@ -1500,6 +1574,8 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 			exec_or_report(mv.c, PQgetvalue(res, i, 0), "refresh", NULL);
 		PQclear(res);
 	}
+	pg_cmd(mv.c, "SELECT prolly.unquiet()");
+	pg_cmd(mv.c, "COMMIT");
 	st->refresh_secs = since(t1);
 	st->secs = since(t0);
 

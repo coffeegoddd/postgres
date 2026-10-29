@@ -13,6 +13,14 @@
  * reads them from a file on the server, as a restore reading its own chunk
  * store would, and can log them XLR_MAX_BLOCK_ID to a record.
  *
+ * prolly_apply_insert and prolly_apply_delete write rows the way version
+ * control must: through the executor's simple apply paths (as logical
+ * replication applies rows), keeping indexes, constraints and stored
+ * generated columns, but with no trigger descriptor and below the rule
+ * rewriter, so no user code runs.  A checkout or merge reproduces rows a
+ * commit already holds, trigger effects included; firing again would
+ * apply them twice.
+ *
  * prolly_get_pages_frozen reads pages for a keyframe with every heap tuple
  * resolved against the caller's snapshot: the visible ones frozen, the
  * rest gone.  A raw page names transactions, which the server forgets as
@@ -31,6 +39,13 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/tableam.h"
+#include "commands/copy.h"
+#include "executor/executor.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_node.h"
+#include "parser/parse_relation.h"
+#include "utils/lsyscache.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "access/xloginsert.h"
@@ -53,6 +68,8 @@ PG_FUNCTION_INFO_V1(prolly_put_pages);
 PG_FUNCTION_INFO_V1(prolly_truncate);
 PG_FUNCTION_INFO_V1(prolly_put_pages_file);
 PG_FUNCTION_INFO_V1(prolly_get_pages_frozen);
+PG_FUNCTION_INFO_V1(prolly_apply_insert);
+PG_FUNCTION_INFO_V1(prolly_apply_delete);
 
 static Relation
 open_for_write(Oid relid)
@@ -420,6 +437,227 @@ prolly_get_pages_frozen(PG_FUNCTION_ARGS)
 	}
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_BYTEA_P(out);
+}
+
+/* ------------------------------------------------------------ row apply */
+
+/* COPY text handed to COPY's reader as its data source. */
+static const char *apply_data;
+static size_t apply_left;
+
+static int
+apply_read(void *outbuf, int minread, int maxread)
+{
+	int			n = apply_left < (size_t) maxread ? (int) apply_left : maxread;
+
+	memcpy(outbuf, apply_data, n);
+	apply_data += n;
+	apply_left -= n;
+	return n;
+}
+
+typedef struct Apply
+{
+	Relation	rel;
+	EState	   *estate;
+	ResultRelInfo *rri;
+	CopyFromState cstate;
+} Apply;
+
+/*
+ * Opens rel for applying rows: an executor state with rel as its result
+ * relation, its indexes open, and no triggers; and COPY's reader over
+ * data for the columns named.
+ */
+static void
+apply_begin(Apply *a, Oid relid, ArrayType *cols, text *data)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	List	   *perminfos = NIL;
+	List	   *names = NIL;
+	Datum	   *cv;
+	bool	   *cn;
+	int			nc;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to apply rows")));
+	a->rel = table_open(relid, RowExclusiveLock);
+	if (a->rel->rd_rel->relkind != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a table: rows go to its partitions",
+						RelationGetRelationName(a->rel))));
+	a->estate = CreateExecutorState();
+	rte->rtekind = RTE_RELATION;
+	rte->relid = relid;
+	rte->relkind = a->rel->rd_rel->relkind;
+	rte->rellockmode = RowExclusiveLock;
+	addRTEPermissionInfo(&perminfos, rte);
+	ExecInitRangeTable(a->estate, list_make1(rte), perminfos, bms_make_singleton(1));
+	a->rri = makeNode(ResultRelInfo);
+	InitResultRelInfo(a->rri, a->rel, 1, NULL, 0);
+	/* version control runs no user code: no triggers, and no rules below the rewriter */
+	a->rri->ri_TrigDesc = NULL;
+	a->estate->es_opened_result_relations = lappend(a->estate->es_opened_result_relations, a->rri);
+	a->estate->es_output_cid = GetCurrentCommandId(true);
+	ExecOpenIndices(a->rri, false);
+
+	deconstruct_array_builtin(cols, TEXTOID, &cv, &cn, &nc);
+	for (int i = 0; i < nc; i++)
+		names = lappend(names, makeString(TextDatumGetCString(cv[i])));
+	apply_data = VARDATA_ANY(data);
+	apply_left = VARSIZE_ANY_EXHDR(data);
+	a->cstate = BeginCopyFrom(make_parsestate(NULL), a->rel, NULL, NULL, false, apply_read,
+							  names, NIL);
+}
+
+static void
+apply_end(Apply *a)
+{
+	EndCopyFrom(a->cstate);
+	ExecCloseIndices(a->rri);
+	ExecResetTupleTable(a->estate->es_tupleTable, false);
+	FreeExecutorState(a->estate);
+	table_close(a->rel, NoLock);
+}
+
+/*
+ * prolly_apply_insert(rel regclass, cols text[], data text) returns int8
+ *
+ * Inserts each line of data, COPY text for the columns named, as a row.
+ * Columns not named get their defaults, as in COPY; identity columns take
+ * the values given; stored generated columns are computed.
+ */
+Datum
+prolly_apply_insert(PG_FUNCTION_ARGS)
+{
+	Apply		a;
+	TupleTableSlot *slot;
+	ExprContext *econtext;
+	int64		n = 0;
+
+	apply_begin(&a, PG_GETARG_OID(0), PG_GETARG_ARRAYTYPE_P(1), PG_GETARG_TEXT_PP(2));
+	slot = table_slot_create(a.rel, &a.estate->es_tupleTable);
+	econtext = GetPerTupleExprContext(a.estate);
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		ResetPerTupleExprContext(a.estate);
+		ExecClearTuple(slot);
+		if (!NextCopyFrom(a.cstate, econtext, slot->tts_values, slot->tts_isnull))
+			break;
+		ExecStoreVirtualTuple(slot);
+		ExecSimpleRelationInsert(a.rri, a.estate, slot);
+		n++;
+	}
+	apply_end(&a);
+	PG_RETURN_INT64(n);
+}
+
+/*
+ * prolly_apply_delete(rel regclass, cols text[], data text) returns int8
+ *
+ * Deletes, for each line of data (COPY text for the columns named), one
+ * row that has those values: found through the table's replica identity
+ * index when the columns are its key, or by comparing every column when
+ * the table's identity is FULL (a keyless table, each line one copy).
+ * Returns the rows deleted; a line that matches nothing deletes nothing.
+ */
+Datum
+prolly_apply_delete(PG_FUNCTION_ARGS)
+{
+	Apply		a;
+	TupleTableSlot *search,
+			   *found;
+	EPQState	epq;
+	Oid			idx;
+	TupleDesc	desc;
+	List	   *attnums = NIL;
+	int64		n = 0;
+	ArrayType  *cols = PG_GETARG_ARRAYTYPE_P(1);
+
+	apply_begin(&a, PG_GETARG_OID(0), cols, PG_GETARG_TEXT_PP(2));
+	desc = RelationGetDescr(a.rel);
+	idx = RelationGetReplicaIndex(a.rel);
+	{
+		Datum	   *cv;
+		bool	   *cn;
+		int			nc;
+
+		deconstruct_array_builtin(cols, TEXTOID, &cv, &cn, &nc);
+		for (int i = 0; i < nc; i++)
+		{
+			AttrNumber	at = attnameAttNum(a.rel, TextDatumGetCString(cv[i]), false);
+
+			if (at == InvalidAttrNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("column \"%s\" does not exist", TextDatumGetCString(cv[i]))));
+			attnums = lappend_int(attnums, at);
+		}
+	}
+	search = table_slot_create(a.rel, &a.estate->es_tupleTable);
+	found = table_slot_create(a.rel, &a.estate->es_tupleTable);
+	EvalPlanQualInit(&epq, a.estate, NULL, NIL, -1, NIL);
+	for (;;)
+	{
+		char	  **fields;
+		int			nf;
+		ListCell   *lc;
+		int			i = 0;
+		bool		hit;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!NextCopyFromRawFields(a.cstate, &fields, &nf))
+			break;
+		if (nf != list_length(attnums))
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("%d fields for %d columns", nf, list_length(attnums))));
+		/* the named columns from their text; nothing else is evaluated */
+		ExecClearTuple(search);
+		for (int c = 0; c < desc->natts; c++)
+		{
+			search->tts_values[c] = (Datum) 0;
+			search->tts_isnull[c] = true;
+		}
+		foreach(lc, attnums)
+		{
+			AttrNumber	at = lfirst_int(lc);
+			Form_pg_attribute att = TupleDescAttr(desc, at - 1);
+			Oid			infunc,
+						ioparam;
+
+			if (fields[i] != NULL)
+			{
+				getTypeInputInfo(att->atttypid, &infunc, &ioparam);
+				search->tts_values[at - 1] = OidInputFunctionCall(infunc, fields[i], ioparam,
+																 att->atttypmod);
+				search->tts_isnull[at - 1] = false;
+			}
+			i++;
+		}
+		ExecStoreVirtualTuple(search);
+		/* the identity index is unique: its key alone names the row */
+		if (OidIsValid(idx))
+			hit = RelationFindReplTupleByIndex(a.rel, idx, true, LockTupleExclusive, search, found);
+		else
+			hit = RelationFindReplTupleSeq(a.rel, LockTupleExclusive, search, found);
+		if (hit)
+		{
+			EvalPlanQualSetSlot(&epq, found);
+			ExecSimpleRelationDelete(a.rri, a.estate, &epq, found);
+			n++;
+		}
+		/* each delete must be seen by the next search: two copies are two rows */
+		CommandCounterIncrement();
+		a.estate->es_output_cid = GetCurrentCommandId(true);
+	}
+	EvalPlanQualEnd(&epq);
+	apply_end(&a);
+	PG_RETURN_INT64(n);
 }
 
 /*

@@ -15,6 +15,10 @@
  *				as a restore reading its own chunk store would
  *				(prolly_put_pages_file), one record per page
  *	pages-batch	the same, XLR_MAX_BLOCK_ID pages per WAL record
+ *	replay-c	(with --replay-c) the rows replayed below SQL: their keys
+ *				deleted and their committed versions inserted by
+ *				prolly_apply_delete and prolly_apply_insert, which run no
+ *				user code
  * under each wal_compression in --compressions (replay and pages-batch
  * under every one; the other page paths, which differ only in transport,
  * under the first).  A checkpoint
@@ -61,11 +65,12 @@ typedef struct Opts
 	const char *shapes;
 	bool		warm;
 	const char *compressions;
+	bool		replay_c;
 } Opts;
 
 static Opts o = {"host=/tmp port=5499 dbname=postgres", NULL,
 	"/home/dustin/pgv2-bench/kfbench", 1000000, 100, 3,
-"sparse:100,sparse:1000,sparse:10000,sparse:100000,cluster:1000,cluster:10000,cluster:100000,all:0", false, "pglz,off"};
+"sparse:100,sparse:1000,sparse:10000,sparse:100000,cluster:1000,cluster:10000,cluster:100000,all:0", false, "pglz,off", false};
 
 static PGconn *db;
 static char *comps[4];			/* wal_compression settings to measure */
@@ -341,10 +346,11 @@ typedef enum Method
 	M_PAGES_SQL,
 	M_PAGES_FILE,
 	M_PAGES_BATCH,
+	M_REPLAY_C,
 	M_COUNT
 } Method;
 
-static const char *method_name[] = {"replay", "pages-sql", "pages-file", "pages-batch"};
+static const char *method_name[] = {"replay", "pages-sql", "pages-file", "pages-batch", "replay-c"};
 
 /* Writes the move's pages (staging written already for the file methods). */
 static void
@@ -542,6 +548,42 @@ replay(const Shape *s)
 	free(pad);
 }
 
+/* S1 -> S0 by rows, through the apply functions instead of SQL. */
+static void
+replay_c(const Shape *s)
+{
+	Buf			keys = BUF_INIT,
+				rows = BUF_INIT;
+	char	   *pad = px_malloc((size_t) o.pad + 1);
+	const char *vals[1];
+
+	for (int64_t i = 0; i < s->n; i++)
+	{
+		int32_t		k;
+		char		line[64];
+		int			len;
+
+		k0_pad0(s->ids[i], &k, pad);
+		len = snprintf(line, sizeof(line), "%lld\n", (long long) s->ids[i]);
+		buf_append(&keys, line, (size_t) len);
+		len = snprintf(line, sizeof(line), "%lld\t%d\t0\t", (long long) s->ids[i], k);
+		buf_append(&rows, line, (size_t) len);
+		buf_append(&rows, pad, (size_t) o.pad);
+		buf_append(&rows, "\n", 1);
+	}
+	buf_append(&keys, "", 1);
+	buf_append(&rows, "", 1);
+	qx("BEGIN");
+	vals[0] = (const char *) keys.data;
+	PQclear(qp("SELECT prolly_apply_delete('t', '{id}', $1)", 1, vals, NULL, NULL));
+	vals[0] = (const char *) rows.data;
+	PQclear(qp("SELECT prolly_apply_insert('t', '{id,k,v,pad}', $1)", 1, vals, NULL, NULL));
+	qx("COMMIT");
+	buf_free(&keys);
+	buf_free(&rows);
+	free(pad);
+}
+
 /* ---------------------------------------------------------------- check */
 
 static char s0_sum[64];
@@ -620,6 +662,7 @@ main(int argc, char **argv)
 		{"conn", 1, 0, 'c'}, {"pgdata", 1, 0, 'D'}, {"staging", 1, 0, 's'},
 		{"rows", 1, 0, 'r'}, {"pad", 1, 0, 'p'}, {"reps", 1, 0, 'n'},
 		{"shapes", 1, 0, 'h'}, {"warm", 0, 0, 'w'}, {"compressions", 1, 0, 'z'},
+		{"replay-c", 0, 0, 'C'},
 		{0, 0, 0, 0}
 	};
 	int			ch;
@@ -640,6 +683,7 @@ main(int argc, char **argv)
 			case 'h': o.shapes = optarg; break;
 			case 'w': o.warm = true; break;
 			case 'z': o.compressions = optarg; break;
+			case 'C': o.replay_c = true; break;
 			default:
 				fprintf(stderr, "kfbench --pgdata DIR [--conn STR] [--staging DIR] [--rows N]\n"
 						"        [--pad B] [--reps N] [--shapes kind:n,...] [--warm]\n"
@@ -716,6 +760,8 @@ main(int argc, char **argv)
 				/* past the first setting, only replay and the best page path */
 				if (comp > 0 && mth != M_REPLAY && mth != M_PAGES_BATCH)
 					continue;
+				if (mth == M_REPLAY_C && !o.replay_c)
+					continue;
 				for (int rep = 0; rep < reps; rep++)
 				{
 					double		t;
@@ -734,6 +780,8 @@ main(int argc, char **argv)
 					t = now_sec();
 					if (mth == M_REPLAY)
 						replay(&s);
+					else if (mth == M_REPLAY_C)
+						replay_c(&s);
 					else
 						apply_pages("back", &s0, &back, mth);
 					ms[rep] = (now_sec() - t) * 1e3;

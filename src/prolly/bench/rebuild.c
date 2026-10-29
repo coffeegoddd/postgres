@@ -342,6 +342,29 @@ check_rebuilt(const char *db, char **expect, const char *label, bool last)
 	int			planned = 0;
 
 	amcheck(c, label);
+	/*
+	 * A fixture whose event triggers log DDL into public.vc_noise: version
+	 * control ran no user code here, so nothing logged.
+	 */
+	{
+		PGresult   *res = pg_exec(c, "SELECT to_regclass('public.vc_noise') IS NOT NULL");
+		const char *noise = "";
+
+		if (strcmp(PQgetvalue(res, 0, 0), "t") == 0)
+		{
+			PQclear(res);
+			res = pg_exec(c, "SELECT coalesce(string_agg(what, ', '), '') FROM public.vc_noise");
+			noise = PQgetvalue(res, 0, 0);
+		}
+		if (noise[0])
+		{
+			char		msg[1200];
+
+			snprintf(msg, sizeof(msg), "user event triggers ran: %.1100s", noise);
+			fail(label, msg);
+		}
+		PQclear(res);
+	}
 	load_indexes(c);
 	pg_cmd(c, "SET search_path = public");
 	pg_cmd(c, "SET enable_seqscan = off");

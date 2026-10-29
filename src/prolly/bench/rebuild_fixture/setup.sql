@@ -1,5 +1,6 @@
 -- Extensions live outside the versioned schema; every database gets them.
 CREATE EXTENSION amcheck;
+CREATE EXTENSION prolly_pages;
 CREATE EXTENSION btree_gist;
 CREATE EXTENSION btree_gin;
 CREATE EXTENSION pg_trgm;

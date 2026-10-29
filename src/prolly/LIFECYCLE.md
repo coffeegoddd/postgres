@@ -1388,6 +1388,91 @@ a page), against 83 ms through `get_raw_page`.
 - like TRUNCATE, a restore is not MVCC-safe for snapshots older than it;
   checkout holds an exclusive lock, and the spec says so.
 
+## Version control runs no user code
+
+**The rule.**  A checkout, merge, move or rebuild reproduces rows and
+objects that commits already hold, and those include whatever triggers and
+rules did when the rows were first written: audit rows, counters,
+rewritten values.  Running them again would apply them twice, and a
+trigger that raises would block the operation.  So version control runs
+none of the user's triggers, rules or event triggers.  (Dolt's merge and
+checkout run none either.)  Triggers are versioned like any other object,
+enable states included: pg_dump's entry for a trigger, rule or event
+trigger carries its ENABLE ALWAYS, REPLICA or DISABLE.
+
+**What replica mode left on.**  `session_replication_role = replica`
+silences ordinary triggers and rules, but not:
+- triggers and rules enabled ALWAYS;
+- those enabled REPLICA, which replica mode switches on;
+- event triggers enabled ALWAYS or REPLICA.
+
+**How** (both are in the prototype):
+- **Rows, below SQL (C).**  `prolly_apply_insert` and `prolly_apply_delete`
+  (in `contrib/prolly_pages`) take COPY text and write through the
+  executor's simple apply paths, as logical replication does.
+  - Nothing user-defined runs: there is no trigger descriptor, and the
+    writes go below the rule rewriter.
+  - Indexes, constraints and stored generated columns are kept.
+  - Identity columns take the committed values.
+  - A delete finds its row through the replica identity index, or for a
+    keyless table by every column, one copy a line.
+  - In-place moves now write every insert and keyed delete this way.
+- **Everything else, by transaction (B).**  `prolly.quiet()` switches off
+  every ALWAYS and REPLICA trigger, rule and event trigger, and sets
+  replica mode, inside the caller's transaction; `prolly.unquiet()`
+  switches them back on before it commits.
+  - No other session ever sees anything off, and the catalog ends as it
+    began.
+  - Event triggers go off first and come back last, since switching the
+    others is DDL.
+  - Re-enabling goes by object id and only for what is still off: an
+    object the operation dropped stays dropped, and one it made again or
+    set itself keeps that state.
+  - Every move transaction, the restore and the harness's own install run
+    this way.
+
+**Tests:**
+- **`bench/trigger_fixture`** (`make trigger-check`) passes in every mode:
+  rebuild, stream, all 12 moves, and 2 merges applied in place.  It has:
+  - BEFORE and AFTER row triggers, statement, TRUNCATE and deferred
+    constraint triggers, each ALWAYS, REPLICA or default;
+  - a BEFORE trigger that rewrites rows, and one that refuses to delete
+    locked rows;
+  - DO ALSO rules and a conditional DO INSTEAD rule;
+  - ALWAYS and REPLICA event triggers logging into an unversioned table;
+  - identity and generated columns, and a keyless table;
+  - commits that change enable states, drop a trigger and add one.
+- **What the checks show:**
+  - every move captures to exactly its target's root, so no extra audit
+    row, rewritten value, counter step or diverted row;
+  - the enable states match, and the guard trigger still refuses deletes;
+  - no user event trigger logged anything;
+  - in the merges, rows from the other branch carry exactly one run of the
+    row rewriter.
+- **`bench/quiet_test.sql`** checks the functions directly: what goes off,
+  what comes back, and objects remade, set or dropped in between.
+- **Each of these was broken in turn, and each break was caught:**
+  - the apply functions firing triggers;
+  - quiet doing nothing, or missing REPLICA triggers, event triggers or
+    replica mode;
+  - unquiet doing nothing, missing rules, or overriding the operation's
+    own states;
+  - the install not quiet.
+
+**Cost.**  The C apply runs at about SQL replay's speed, -10% to +14%
+across shapes, with the same WAL.  Heap, index and WAL writes dominate,
+not parsing and planning, so its value is that no user code can run.
+
+**A Postgres bug it exposed.**  Inserting a row at a time lays rows out
+differently from COPY, and in one order the main fixture's SP-GiST `inet`
+index loses a row.  The move test catches it: an `ip <<= ...` query
+answers one row short through `kinds_ip_spgist`.
+- `bench/spgist_inet_repro.sql` reproduces it with 270 inet values (IPv4
+  and IPv6 mixed), plain COPY and CREATE INDEX, and nothing of ours.
+- GiST and B-tree indexes on the same rows are right.
+- `make rebuild-check` fails on those three moves until it is fixed
+  upstream.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

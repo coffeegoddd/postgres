@@ -1,0 +1,17 @@
+# Checks run after every commit, on the source when the commit is captured
+# and on every database rebuilt or moved to it; both must give the same
+# answer (see rebuild_fixture/checks.txt for the format).  A move or
+# rebuild that ran user code shows here as extra audit rows, rewritten
+# values, a moved counter or a diverted row, and as a different root value.
+
+s SELECT count(*), sum(v), sum(twice), string_agg(coalesce(note, '-'), ',' ORDER BY id) FROM rt.item
+s SELECT count(*), string_agg(what, ',' ORDER BY id) FROM rt.audit
+s SELECT n FROM rt.counter
+s SELECT count(*), sum(v), max(id) FROM rt.ident
+s SELECT x, y, count(*) FROM rt.bag GROUP BY x, y ORDER BY x, y
+s SELECT string_agg(id || ':' || msg, ',' ORDER BY id) FROM rt.inbox
+s SELECT string_agg(id || ':' || msg, ',' ORDER BY id) FROM rt.outbox
+s SELECT string_agg(t.tgname || '=' || t.tgenabled, ',' ORDER BY t.tgname) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'rt' AND NOT t.tgisinternal
+s SELECT string_agg(r.rulename || '=' || r.ev_enabled, ',' ORDER BY r.rulename) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'rt' AND r.rulename <> '_RETURN'
+s SELECT string_agg(evtname || '=' || evtenabled, ',' ORDER BY evtname) FROM pg_event_trigger
+v P0001|DELETE FROM rt.item WHERE id = 2

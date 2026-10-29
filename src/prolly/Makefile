@@ -28,7 +28,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check durability-check
+.PHONY: all check clean rebuild-check durability-check trigger-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
@@ -69,6 +69,21 @@ rebuild-check: bench/rebuild
 	if ./bench/rebuild --move --break keepall >/dev/null 2>&1; then \
 		echo "rebuild: --move --break keepall went unnoticed"; exit 1; \
 	else echo "rebuild: --move --break keepall caught"; fi
+
+# Version control runs no user code: the trigger fixture (triggers, rules
+# and event triggers of every kind and enable state) through every mode,
+# and prolly.quiet()/unquiet() checked directly.
+trigger-check: bench/rebuild
+	./bench/rebuild --fixture bench/trigger_fixture
+	./bench/rebuild --fixture bench/trigger_fixture --stream
+	./bench/rebuild --fixture bench/trigger_fixture --move
+	./bench/rebuild --fixture bench/trigger_fixture --merge
+	$(PGINST)/bin/psql -h /tmp -p 5499 -U postgres -d postgres -X -q \
+		-c "DROP DATABASE IF EXISTS quiet_test" -c "CREATE DATABASE quiet_test"
+	$(PGINST)/bin/psql -h /tmp -p 5499 -U postgres -d quiet_test -X -q -v ON_ERROR_STOP=1 \
+		-o /dev/null -f bench/prolly_tags.sql
+	$(PGINST)/bin/psql -h /tmp -p 5499 -U postgres -d quiet_test -X -q -v ON_ERROR_STOP=1 \
+		-o /dev/null -f bench/quiet_test.sql
 
 # Crash safety and backups, in a cluster of their own (made on first use
 # in CRASHDB, on port 5498): every crash point of a commit recovered, then
