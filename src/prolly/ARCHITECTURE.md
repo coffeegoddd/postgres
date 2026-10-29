@@ -232,9 +232,10 @@ Versioned and unversioned schemas live side by side in one database
   not raw catalog rows, which name cluster-local ids; diff and merge work
   there, and the DDL moves bridge history and the physical catalogs.
 - **the cost,** as measured by experiment C: a branch column and one index
-  change on `pg_namespace`, branch-aware name lookups, and one filter in
+  change each on `pg_namespace` and `pg_extension`, branch-aware name
+  lookups, and one filter in
   the visibility check for queries (not for lookups by object id): about
-  520 lines in 14 files.
+  630 lines in 17 files.
 - Whole-database branching with a catalog file set per branch was
   considered and set aside: it cannot keep unversioned schemas shared.
 
@@ -268,7 +269,7 @@ branch it is on:
   that branch's; on no branch, all of them;
 - changing branch resets the catalog caches and the search path.
 
-The patch is about 520 lines in 14 files, kept as a patch file because it
+The patch is about 630 lines in 17 files, kept as a patch file because it
 changes the catalog (a cluster made without it cannot run with it).
 Branch 2 was made by dumping branch 1's schema and restoring it on branch
 2: the canonical-form path commits will use.  `spike/catalog_branch_test.sh`
@@ -292,23 +293,27 @@ makes its own cluster.
 - `DROP ROLE` is refused from any branch while another branch has objects
   the role owns, and names them;
 - temporary tables work on a branch, and may share a versioned table's
-  name; an extension in a shared schema serves every branch;
+  name;
+- **extensions are shared or per branch, never both.**  `pg_extension`'s
+  name index is `(extname, extnamespace)`, extension lookups by name take
+  the one in a shared schema or the session's branch's, and `pg_extension`
+  is filtered like the other catalogs.  Two branches each installed their
+  own `pg_trgm` in their own `app`, at 1.6 and 1.5; each used and updated
+  its own, and dropping one left the other.  A shared install is refused
+  while any branch has its own, and a branch's while a shared one exists.
+  Only the extension's shared library is one per cluster, so branches may
+  hold different versions of an extension's SQL objects, not of its C
+  code;
 - dropping a branch's schema leaves the other branch's.
 
 **What it does not give yet:**
-1. **Extensions in a versioned schema exist on one branch only.**
-   `pg_extension` is one row per name per database: on branch 2,
-   `CREATE EXTENSION pg_trgm SCHEMA app` fails (`already exists`) while
-   branch 1's copy is invisible to it.  Per-branch extensions need
-   `pg_extension` filtered by its namespace and its name index widened, as
-   `pg_namespace`'s was.
-2. **The hidden set costs a catalog scan when stale.**  With 6,007 hidden
+1. **The hidden set costs a catalog scan when stale.**  With 6,007 hidden
    relations (about 12,000 hidden objects), rebuilding it takes about 2 ms;
    any DDL anywhere makes it stale, so the next catalog query in each
    session pays that.  Indexes on the namespace columns, or keeping the
    set by the invalidations themselves, would make it proportional to what
    changed.
-3. Shared catalogs naming branch objects (`pg_shdepend`,
+2. Shared catalogs naming branch objects (`pg_shdepend`,
    `pg_publication_rel`, `pg_subscription_rel`), security labels and
    initial privileges are not yet filtered; publications and subscriptions
    on versioned schemas are untried.

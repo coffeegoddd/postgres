@@ -6,7 +6,7 @@
 # cluster, made here, since the patch changes the catalog).
 set -u
 INST=/home/dustin/cursor_src/pg-v2-cat/inst/bin
-DATA=/home/dustin/pgv2-bench/catdb
+DATA=/home/dustin/pgv2-bench/catdb2	# made by initdb here, which runs the patched bootstrap
 PORT=5496
 fail=0
 expect() { if [ "$2" == "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: got [$2] want [$3]"; fail=1; fi; }
@@ -129,12 +129,20 @@ echo "== C12. temporary tables on a branch"
 expect "a temp table on branch 2" "$(on 2 -c "CREATE TEMP TABLE scratch (x int)" -c "INSERT INTO scratch VALUES (1), (2)" -c "SELECT count(*) FROM scratch" -c "SELECT count(*) FROM pg_class WHERE relname = 'scratch'" | tr '\n' ' ')" "2 1 "
 expect "a temp table may share a versioned table's name" "$(on 1 -c "CREATE TEMP TABLE t (x int)" -c "SELECT count(*) FROM pg_temp.t" -c "SELECT count(*) FROM app.t" | tr '\n' ' ')" "0 51 "
 
-echo "== C13. extensions"
+echo "== C13. extensions: shared, or one per branch"
 expect "an extension in a shared schema serves both branches" "$(on 1 -c "CREATE EXTENSION hstore SCHEMA pub" >/dev/null; on 2 -c "SELECT ('a=>1'::pub.hstore) OPERATOR(pub.->) 'a'")" 1
+expect "a branch may not have its own while a shared one exists" "$(on 2 -c "CREATE EXTENSION hstore SCHEMA app" | grep -c 'already exists')" 1
 on 1 -c "DROP EXTENSION hstore" >/dev/null
-echo "  an extension in branch 1's versioned schema: $(on 1 -c "CREATE EXTENSION pg_trgm SCHEMA app" 2>&1 | head -1)ok"
-echo "  the same on branch 2: $(on 2 -c "CREATE EXTENSION pg_trgm SCHEMA app" 2>&1 | head -1)"
-echo "  branch 2 using branch 1's: $(on 2 -c "SELECT app.similarity('abc', 'abd')" 2>&1 | head -1)"
+expect "branch 1 installs its own, at 1.6" "$(on 1 -c "CREATE EXTENSION pg_trgm SCHEMA app" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'")" 1.6
+expect "branch 2 installs its own, at 1.5" "$(on 2 -c "CREATE EXTENSION pg_trgm VERSION '1.5' SCHEMA app" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'")" 1.5
+expect "each branch uses its own" "$(on 1 -c "SELECT round(app.similarity('abc', 'abd')::numeric, 2)")/$(on 2 -c "SELECT round(app.similarity('abc', 'abd')::numeric, 2)")" "0.33/0.33"
+expect "one pg_trgm listed on each branch" "$(on 1 -c "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")/$(on 2 -c "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")" "1/1"
+expect "branch 2 updates its own" "$(on 2 -c "ALTER EXTENSION pg_trgm UPDATE TO '1.6'" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'")" 1.6
+expect "a shared one is refused while a branch has its own" "$(on 0 -c "CREATE EXTENSION pg_trgm SCHEMA pub" | grep -c 'already exists')" 1
+expect "a session on no branch sees neither" "$(on 0 -c "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")" 0
+on 2 -c "DROP EXTENSION pg_trgm" >/dev/null
+expect "dropping branch 2's leaves branch 1's" "$(on 1 -c "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")/$(on 2 -c "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")" "1/0"
+expect "branch 1's still works" "$(on 1 -c "SELECT round(app.similarity('abc', 'abd')::numeric, 2)")" 0.33
 
 echo "== C10. dropping a branch's schema leaves the other"
 on 2 -c "DROP SCHEMA app CASCADE" >/dev/null

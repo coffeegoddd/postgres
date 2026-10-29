@@ -95,13 +95,14 @@ index 905444ae036..fa311c6848e 100644
  			return HeapTupleSatisfiesSelf(htup, snapshot, buffer);
  		case SNAPSHOT_ANY:
 diff --git a/src/backend/catalog/namespace.c b/src/backend/catalog/namespace.c
-index 0647a198dea..2f9dbb84661 100644
+index 0647a198dea..8af26a29e0b 100644
 --- a/src/backend/catalog/namespace.c
 +++ b/src/backend/catalog/namespace.c
-@@ -25,6 +25,25 @@
+@@ -25,6 +25,26 @@
  #include "access/xlog.h"
  #include "catalog/dependency.h"
  #include "catalog/namespace.h"
++#include "catalog/pg_extension.h"
 +#include "catalog/pg_aggregate.h"
 +#include "catalog/pg_attrdef.h"
 +#include "catalog/pg_attribute.h"
@@ -124,7 +125,7 @@ index 0647a198dea..2f9dbb84661 100644
  #include "catalog/objectaccess.h"
  #include "catalog/pg_authid.h"
  #include "catalog/pg_collation.h"
-@@ -58,6 +77,7 @@
+@@ -58,6 +78,7 @@
  #include "utils/lsyscache.h"
  #include "utils/memutils.h"
  #include "utils/snapmgr.h"
@@ -132,7 +133,7 @@ index 0647a198dea..2f9dbb84661 100644
  #include "utils/syscache.h"
  #include "utils/varlena.h"
  
-@@ -3603,13 +3623,369 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
+@@ -3603,13 +3624,390 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
   * If missing_ok is false, throw an error if namespace name not found.  If
   * true, just return InvalidOid.
   */
@@ -206,6 +207,7 @@ index 0647a198dea..2f9dbb84661 100644
 +		case TSDictionaryRelationId:
 +		case TSParserRelationId:
 +		case TSTemplateRelationId:
++		case ExtensionRelationId:
 +		case AttributeRelationId:
 +		case IndexRelationId:
 +		case AttrDefaultRelationId:
@@ -281,7 +283,8 @@ index 0647a198dea..2f9dbb84661 100644
 +	Oid		   *set;
 +
 +	if (!catalog_branch_filter || !hidden_stale || hidden_building ||
-+		!catalog_branch_filters(RelationGetRelid(rel)) || !IsTransactionState())
++		!IsNormalProcessingMode() || !catalog_branch_filters(RelationGetRelid(rel)) ||
++		!IsTransactionState())
 +		return;
 +	if (!hidden_callback)
 +	{
@@ -323,6 +326,7 @@ index 0647a198dea..2f9dbb84661 100644
 +			hidden_members(TypeRelationId, Anum_pg_type_oid, Anum_pg_type_typnamespace, set, n);
 +			hidden_members(ProcedureRelationId, Anum_pg_proc_oid, Anum_pg_proc_pronamespace, set, n);
 +			hidden_members(ConstraintRelationId, Anum_pg_constraint_oid, Anum_pg_constraint_connamespace, set, n);
++			hidden_members(ExtensionRelationId, Anum_pg_extension_oid, Anum_pg_extension_extnamespace, set, n);
 +		}
 +		if (hidden_n > 0)
 +			qsort(hidden_set, hidden_n, sizeof(Oid), oid_cmp_hidden);
@@ -338,6 +342,21 @@ index 0647a198dea..2f9dbb84661 100644
 +	hidden_nsp = set;
 +	nhidden = n;
 +	hidden_stale = false;
++}
++
++/* The branch a namespace belongs to (0: shared), by object id. */
++int32
++namespace_branch(Oid nspid)
++{
++	HeapTuple	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspid));
++	int32		branch = 0;
++
++	if (HeapTupleIsValid(tup))
++	{
++		branch = ((Form_pg_namespace) GETSTRUCT(tup))->nspbranch;
++		ReleaseSysCache(tup);
++	}
++	return branch;
 +}
 +
 +/*
@@ -368,7 +387,7 @@ index 0647a198dea..2f9dbb84661 100644
 +	Oid			nspid;
 +
 +	if (!catalog_branch_filter || snapshot->for_catalog ||
-+		snapshot->snapshot_type != SNAPSHOT_MVCC)
++		snapshot->snapshot_type != SNAPSHOT_MVCC || !IsNormalProcessingMode())
 +		return false;
 +	switch (htup->t_tableOid)
 +	{
@@ -419,6 +438,9 @@ index 0647a198dea..2f9dbb84661 100644
 +			break;
 +		case TSTemplateRelationId:
 +			nspid = ((Form_pg_ts_template) GETSTRUCT(htup))->tmplnamespace;
++			break;
++		case ExtensionRelationId:
++			nspid = ((Form_pg_extension) GETSTRUCT(htup))->extnamespace;
 +			break;
 +		default:
 +			{
@@ -504,7 +526,7 @@ index 0647a198dea..2f9dbb84661 100644
  	if (!OidIsValid(oid) && !missing_ok)
  		ereport(ERROR,
  				(errcode(ERRCODE_UNDEFINED_SCHEMA),
-@@ -4789,6 +5165,39 @@ check_search_path(char **newval, void **extra, GucSource source)
+@@ -4789,6 +5187,39 @@ check_search_path(char **newval, void **extra, GucSource source)
  }
  
  /* assign_hook: do extra actions as needed */
@@ -576,6 +598,116 @@ index f35ef5a344e..3b1e41ad93b 100644
  	if (nspacl != NULL)
  		values[Anum_pg_namespace_nspacl - 1] = PointerGetDatum(nspacl);
  	else
+diff --git a/src/backend/commands/extension.c b/src/backend/commands/extension.c
+index 5855668c5ca..4991980e841 100644
+--- a/src/backend/commands/extension.c
++++ b/src/backend/commands/extension.c
+@@ -228,10 +228,7 @@ get_extension_location(ExtensionLocation *loc)
+ Oid
+ get_extension_oid(const char *extname, bool missing_ok)
+ {
+-	Oid			result;
+-
+-	result = GetSysCacheOid1(EXTENSIONNAME, Anum_pg_extension_oid,
+-							 CStringGetDatum(extname));
++	Oid			result = extension_visible(extname, NULL);
+ 
+ 	if (!OidIsValid(result) && !missing_ok)
+ 		ereport(ERROR,
+@@ -242,6 +239,59 @@ get_extension_oid(const char *extname, bool missing_ok)
+ 	return result;
+ }
+ 
++/*
++ * The extension named extname this session's branch sees: one in a shared
++ * schema, or in its branch's (an extension is one or the other).  With
++ * schema_branch, also sets it to the branch of that extension's schema.
++ */
++Oid
++extension_visible(const char *extname, int32 *schema_branch)
++{
++	Relation	rel = table_open(ExtensionRelationId, AccessShareLock);
++	ScanKeyData key;
++	SysScanDesc scan;
++	HeapTuple	tup;
++	Oid			result = InvalidOid;
++
++	ScanKeyInit(&key, Anum_pg_extension_extname, BTEqualStrategyNumber, F_NAMEEQ,
++				CStringGetDatum(extname));
++	scan = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, &key);
++	while (HeapTupleIsValid(tup = systable_getnext(scan)))
++	{
++		Form_pg_extension f = (Form_pg_extension) GETSTRUCT(tup);
++		int32		branch = namespace_branch(f->extnamespace);
++
++		if (branch == 0 || branch == catalog_branch)
++		{
++			result = f->oid;
++			if (schema_branch)
++				*schema_branch = branch;
++			break;
++		}
++	}
++	systable_endscan(scan);
++	table_close(rel, AccessShareLock);
++	return result;
++}
++
++/* Whether any branch, or a shared schema, has an extension named extname. */
++static bool
++extension_anywhere(const char *extname)
++{
++	Relation	rel = table_open(ExtensionRelationId, AccessShareLock);
++	ScanKeyData key;
++	SysScanDesc scan;
++	bool		found;
++
++	ScanKeyInit(&key, Anum_pg_extension_extname, BTEqualStrategyNumber, F_NAMEEQ,
++				CStringGetDatum(extname));
++	scan = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, &key);
++	found = HeapTupleIsValid(systable_getnext(scan));
++	systable_endscan(scan);
++	table_close(rel, AccessShareLock);
++	return found;
++}
++
+ /*
+  * get_extension_name - given an extension OID, look up the name
+  *
+@@ -2259,6 +2309,17 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
+ 	ObjectAddresses *refobjs;
+ 	ListCell   *lc;
+ 
++	/*
++	 * An extension is shared or per branch, never both: a shared one is
++	 * refused while any branch has its own, and a branch's while a shared
++	 * one exists (which this session would see).
++	 */
++	if (namespace_branch(schemaOid) == 0 ? extension_anywhere(extName)
++		: OidIsValid(extension_visible(extName, NULL)))
++		ereport(ERROR,
++				(errcode(ERRCODE_DUPLICATE_OBJECT),
++				 errmsg("extension \"%s\" already exists on a branch or shared", extName)));
++
+ 	/*
+ 	 * Build and insert the pg_extension tuple
+ 	 */
+@@ -3509,7 +3570,14 @@ ExecAlterExtensionStmt(ParseState *pstate, AlterExtensionStmt *stmt)
+ 	extScan = systable_beginscan(extRel, ExtensionNameIndexId, true,
+ 								 NULL, 1, key);
+ 
+-	extTup = systable_getnext(extScan);
++	/* the one this session's branch sees */
++	while (HeapTupleIsValid(extTup = systable_getnext(extScan)))
++	{
++		int32		branch = namespace_branch(((Form_pg_extension) GETSTRUCT(extTup))->extnamespace);
++
++		if (branch == 0 || branch == catalog_branch)
++			break;
++	}
+ 
+ 	if (!HeapTupleIsValid(extTup))
+ 		ereport(ERROR,
 diff --git a/src/backend/commands/schemacmds.c b/src/backend/commands/schemacmds.c
 index b016983f904..ceb29b1cc9d 100644
 --- a/src/backend/commands/schemacmds.c
@@ -678,7 +810,7 @@ index 6defd7203b1..bc466feac4d 100644
  SnapshotData SnapshotAnyData = {SNAPSHOT_ANY};
  SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
 diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
-index 056d48eb279..b4584441700 100644
+index 056d48eb279..14c76ba5996 100644
 --- a/src/include/catalog/catversion.h
 +++ b/src/include/catalog/catversion.h
 @@ -57,6 +57,6 @@
@@ -686,11 +818,11 @@ index 056d48eb279..b4584441700 100644
  
  /*							yyyymmddN */
 -#define CATALOG_VERSION_NO	202610201
-+#define CATALOG_VERSION_NO	202610291
++#define CATALOG_VERSION_NO	202610292
  
  #endif
 diff --git a/src/include/catalog/namespace.h b/src/include/catalog/namespace.h
-index 9453a3e4932..6cf44f89c79 100644
+index 9453a3e4932..5f3ce22a9f1 100644
 --- a/src/include/catalog/namespace.h
 +++ b/src/include/catalog/namespace.h
 @@ -14,6 +14,9 @@
@@ -703,7 +835,7 @@ index 9453a3e4932..6cf44f89c79 100644
  #include "nodes/primnodes.h"
  #include "storage/lockdefs.h"
  #include "storage/procnumber.h"
-@@ -164,6 +167,23 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
+@@ -164,6 +167,24 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
  extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
  extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
  
@@ -723,10 +855,24 @@ index 9453a3e4932..6cf44f89c79 100644
 +extern void catalog_branch_prepare(Relation rel);
 +extern bool catalog_branch_hides(HeapTuple htup, Snapshot snapshot);
 +extern bool catalog_branch_skips(Relation rel);
++extern int32 namespace_branch(Oid nspid);
 +
  extern Oid	LookupCreationNamespace(const char *nspname);
  extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid);
  extern Oid	QualifiedNameGetCreationNamespace(const List *names, char **objname_p);
+diff --git a/src/include/catalog/pg_extension.h b/src/include/catalog/pg_extension.h
+index c8711418435..6daabe341dc 100644
+--- a/src/include/catalog/pg_extension.h
++++ b/src/include/catalog/pg_extension.h
+@@ -58,7 +58,7 @@ typedef FormData_pg_extension *Form_pg_extension;
+ DECLARE_TOAST(pg_extension, 4147, 4148);
+ 
+ DECLARE_UNIQUE_INDEX_PKEY(pg_extension_oid_index, 3080, ExtensionOidIndexId, pg_extension, btree(oid oid_ops));
+-DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, ExtensionNameIndexId, pg_extension, btree(extname name_ops));
++DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, ExtensionNameIndexId, pg_extension, btree(extname name_ops, extnamespace oid_ops));
+ 
+ MAKE_SYSCACHE(EXTENSIONOID, pg_extension_oid_index, 2);
+ MAKE_SYSCACHE(EXTENSIONNAME, pg_extension_name_index, 2);
 diff --git a/src/include/catalog/pg_namespace.h b/src/include/catalog/pg_namespace.h
 index 358fc67c047..d71d2e8fdd8 100644
 --- a/src/include/catalog/pg_namespace.h
@@ -756,6 +902,18 @@ index 358fc67c047..d71d2e8fdd8 100644
  DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops));
  
  MAKE_SYSCACHE(NAMESPACENAME, pg_namespace_nspname_index, 4);
+diff --git a/src/include/commands/extension.h b/src/include/commands/extension.h
+index 7a76bdebcfa..3b5b384971e 100644
+--- a/src/include/commands/extension.h
++++ b/src/include/commands/extension.h
+@@ -48,6 +48,7 @@ extern ObjectAddress ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *
+ 													ObjectAddress *objAddr);
+ 
+ extern Oid	get_extension_oid(const char *extname, bool missing_ok);
++extern Oid	extension_visible(const char *extname, int32 *schema_branch);
+ extern char *get_extension_name(Oid ext_oid);
+ extern Oid	get_extension_schema(Oid ext_oid);
+ extern bool extension_file_exists(const char *extensionName);
 diff --git a/src/include/utils/guc_hooks.h b/src/include/utils/guc_hooks.h
 index 06453a18c03..9865ea94a3c 100644
 --- a/src/include/utils/guc_hooks.h
