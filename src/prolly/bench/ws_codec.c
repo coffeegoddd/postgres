@@ -121,11 +121,11 @@ ws_layout_parse(const char *text, size_t len, WsLayout *L)
 
 		for (int k = 0; k < L->nkey; k++)
 			inkey |= L->key[k] == L->cols[i].tag;
-		if (L->cols[i].kind == 's' && !inkey)
+		if (L->cols[i].kind != 'v' && !inkey)
 			L->copy[L->nstored++] = L->cols[i].tag;
 	}
 	for (int i = 0; i < L->ncols; i++)
-		if (L->cols[i].kind == 's')
+		if (L->cols[i].kind != 'v')
 		{
 			if (L->cols[i].pos < 0 || L->cols[i].pos >= L->nstored)
 				return false;
@@ -223,6 +223,49 @@ ws_copy_list(const WsLayout *L, Buf *out)
 			buf_append(out, ", ", 2);
 		buf_append(out, c->name, strlen(c->name));
 	}
+}
+
+/* A quoted identifier (as quote_ident gives it) as the name it stands for. */
+static void
+unquote_ident(const char *q, Buf *out)
+{
+	if (q[0] != '"')
+	{
+		buf_append(out, q, strlen(q));
+		return;
+	}
+	for (const char *p = q + 1; *p && !(p[0] == '"' && p[1] != '"'); p++)
+	{
+		buf_append(out, p, 1);
+		if (p[0] == '"')
+			p++;
+	}
+}
+
+/* A text[] literal of the columns with these tags. */
+void
+ws_col_array(const WsLayout *L, const uint64_t *tags, int n, Buf *out)
+{
+	out->len = 0;
+	buf_append(out, "{", 1);
+	for (int i = 0; i < n; i++)
+	{
+		Buf			name = {0};
+
+		unquote_ident(ws_layout_col(L, tags[i])->name, &name);
+		if (i)
+			buf_append(out, ",", 1);
+		buf_append(out, "\"", 1);
+		for (size_t j = 0; j < name.len; j++)
+		{
+			if (name.data[j] == '"' || name.data[j] == '\\')
+				buf_append(out, "\\", 1);
+			buf_append(out, &name.data[j], 1);
+		}
+		buf_append(out, "\"", 1);
+		free(name.data);
+	}
+	buf_append(out, "}", 2);
 }
 
 /* ----------------------------------------------------------------- rows */

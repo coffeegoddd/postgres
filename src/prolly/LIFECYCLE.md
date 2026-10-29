@@ -1412,8 +1412,9 @@ silences ordinary triggers and rules, but not:
   executor's simple apply paths, as logical replication does.
   - Nothing user-defined runs: there is no trigger descriptor, and the
     writes go below the rule rewriter.
-  - Indexes, constraints and stored generated columns are kept.
-  - Identity columns take the committed values.
+  - Indexes and constraints are kept.
+  - Identity columns and stored generated columns take the committed
+    values (see the next section).
   - A delete finds its row through the replica identity index, or for a
     keyless table by every column, one copy a line.
   - In-place moves now write every insert and keyed delete this way.
@@ -1472,6 +1473,89 @@ answers one row short through `kinds_ip_spgist`.
 - GiST and B-tree indexes on the same rows are right.
 - `make rebuild-check` fails on those three moves until it is fixed
   upstream.
+
+## Identity and generated columns
+
+**Decision (Dolt's).**  A stored generated column is data: its values are
+in the commit like any other column's, as computed when the rows were
+written.  Wherever version control writes rows back (rebuild, stream
+capture, checkout, every move), they are copied, never computed again.
+Only a row a merge makes is computed:
+- a row both sides changed and the merge combined by column;
+- a row one side wrote under another expression than the merged schema's,
+  or without the column.
+The generated column itself never conflicts.  If its expression fails on
+the merged values (a division by zero neither side wrote), the row is a
+`generated <table> <key>` conflict.  Dolt does the same: stored generated
+columns live in the row, and `withGeneratedColumns` recomputes them only
+for rows the merge resolved.
+
+**Why copy.**
+- Moves are exact.  `CREATE OR REPLACE FUNCTION` on a function a
+  generation expression calls does not rewrite the table: older rows keep
+  the old body's values.  Computing them again at checkout would give a
+  working set that differs from the commit.
+- No user code: a generation expression may call any user function marked
+  IMMUTABLE.  Merge is the one exception, and only for the rows it makes:
+  the merge is writing new rows, as the user would.  (In MySQL, and so in
+  Dolt, a generated column cannot call a stored function, so its merge
+  runs no user code at all.)
+
+**What changed.**
+- **Layout:** a column is `s` stored, `g` stored generated or `v` virtual.
+  `g` columns are in the row's values, its COPY text and its diffs; `v`
+  columns hold nothing.
+- **Row apply** (`prolly_apply_insert`) parses fields itself, since COPY
+  refuses generated columns.  It builds Postgres's generation plan and
+  takes out each column it was given, so those are copied and a column not
+  named is still computed.  Every ordinary column must be named; a virtual
+  one cannot be.
+- **Restore** loads a table with `g` columns through row apply (plain COPY
+  otherwise, which is faster).
+- **Stream capture** publishes stored generated columns
+  (`publish_generated_columns = stored`).
+- **Moves** replace a changed function in place (`CREATE OR REPLACE`): a
+  drop would take every generated column that calls it.  If it cannot be
+  replaced (its result type changed), it is dropped and the tables that
+  call it are recreated.
+- **Identity columns in moves:** a changed identity is dropped with
+  `DROP IDENTITY`, not a sequence drop, which Postgres refuses.  A
+  recreated table gets its identity back before the sequences are set.
+- **Merge:** a `WsEval` gives the merge its evaluators: defaults, as
+  before, and now generated columns.
+
+**Tests.**
+- **`bench/gen_fixture`** (`make gen-check`) passes in every mode:
+  rebuild, stream, all 20 moves, and 5 merges applied in place.  It has:
+  - identity columns ALWAYS and BY DEFAULT, with their own start and
+    increment, altered and restarted;
+  - stored generated columns that call a user function (which counts its
+    calls in an unversioned sequence), in an index, under a CHECK, NULL;
+  - a virtual column, and a keyless table with a generated column;
+  - a commit that replaces the function, so older and newer rows hold
+    different bodies' values;
+  - expressions replaced, a generated column added, one made plain.
+- **What the checks show:**
+  - every rebuild and move captures to its commit's root, and the call
+    count where version control wrote stays at zero;
+  - the identities' sequences are where the source left them;
+  - merges: sources changed on both sides, an expression replaced against
+    new rows, a column added against new rows, the function replaced
+    against a changed row (kept as written), and a failing expression (a
+    conflict).
+- **Each was broken in turn, and each break was caught:**
+  - row apply computing the values: the call count, and after the
+    function is replaced, a different root;
+  - the merge copying from a side instead of computing (`noregen`);
+  - the stream not sent generated columns (`nogenpub`).
+- **Bugs it found in moves:** the function replace, and identity drops and
+  re-adds, above.  Without them the fixture's moves fail.
+
+**Still user code in row replay** (not changed here): CHECK constraints
+and domain checks run on every row and can call user functions;
+expression and partial indexes must call theirs to build entries; user
+types' input functions run.  The rows come from a valid commit, so the
+checks could be skipped; the indexes cannot be, except by page restore.
 
 ## History mode REWRITE: a window and nothing else
 

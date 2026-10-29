@@ -375,6 +375,30 @@ check_rebuilt(const char *db, char **expect, const char *label, bool last)
 		}
 		PQclear(res);
 	}
+	/*
+	 * A fixture whose generation expressions count their calls in
+	 * public.vc_gen_calls: version control copied the values it holds and
+	 * computed none, so the count never moved here.
+	 */
+	{
+		PGresult   *res = pg_exec(c, "SELECT to_regclass('public.vc_gen_calls') IS NOT NULL");
+
+		if (strcmp(PQgetvalue(res, 0, 0), "t") == 0)
+		{
+			PQclear(res);
+			res = pg_exec(c, "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+						  "FROM public.vc_gen_calls");
+			if (strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+			{
+				char		msg[200];
+
+				snprintf(msg, sizeof(msg), "generation expressions ran %s times",
+						 PQgetvalue(res, 0, 0));
+				fail(label, msg);
+			}
+		}
+		PQclear(res);
+	}
 	load_indexes(c);
 	pg_cmd(c, "SET search_path = public");
 	pg_cmd(c, "SET enable_seqscan = off");
@@ -760,6 +784,74 @@ eval_default(void *arg, const char *expr, const char *type, Buf *out)
 	return false;
 }
 
+/*
+ * A stored generated column's value for a row a merge made: its expression
+ * over the row's stored columns, each given as its output text and read
+ * back as its type, formatted as the capture formats it.
+ */
+static bool
+eval_generated(void *arg, const WsLayout *L, const WsCol *col, const WsCell *cells, int n,
+			   Buf *out, bool *null)
+{
+	PGconn	  **conns = arg;
+	Buf			sql = {0};
+	const char **vals = px_malloc(sizeof(char *) * (size_t) (L->ncols + 1));
+	char	  **owned = px_malloc(sizeof(char *) * (size_t) (L->ncols + 1));
+	int			np = 0;
+	bool		ok = false;
+
+	buf_append(&sql, "SELECT v IS NULL, format('%s', v) FROM (SELECT (", strlen("SELECT v IS NULL, format('%s', v) FROM (SELECT ("));
+	buf_append(&sql, col->def, strlen(col->def));
+	buf_append(&sql, ")::", 3);
+	buf_append(&sql, col->type, strlen(col->type));
+	buf_append(&sql, " AS v FROM (SELECT", strlen(" AS v FROM (SELECT"));
+	for (int i = 0; i < L->ncols; i++)
+	{
+		const WsCol *c = &L->cols[i];
+		char		ref[32];
+		int			rl;
+
+		if (c->kind != 's')
+			continue;
+		owned[np] = NULL;
+		vals[np] = NULL;
+		for (int j = 0; j < n; j++)
+			if (cells[j].tag == c->tag)
+			{
+				owned[np] = strndup((const char *) cells[j].p, cells[j].len);
+				vals[np] = owned[np];
+			}
+		rl = snprintf(ref, sizeof(ref), "%s $%d::", np ? "," : "", np + 1);
+		buf_append(&sql, ref, (size_t) rl);
+		buf_append(&sql, c->type, strlen(c->type));
+		buf_append(&sql, " AS ", 4);
+		buf_append(&sql, c->name, strlen(c->name));
+		np++;
+	}
+	buf_append(&sql, ") s) q", 7);	/* with the NUL */
+	for (int i = 0; conns[i] && !ok; i++)
+	{
+		PGresult   *res = PQexecParams(conns[i], (const char *) sql.data, np, NULL, vals,
+									   NULL, NULL, 0);
+
+		if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+		{
+			*null = PQgetvalue(res, 0, 0)[0] == 't';
+			out->len = 0;
+			if (!*null)
+				buf_append(out, PQgetvalue(res, 0, 1), strlen(PQgetvalue(res, 0, 1)));
+			ok = true;
+		}
+		PQclear(res);
+	}
+	for (int i = 0; i < np; i++)
+		free(owned[i]);
+	free(owned);
+	free(vals);
+	free(sql.data);
+	return ok;
+}
+
 static int
 str_cmp(const void *a, const void *b)
 {
@@ -883,7 +975,7 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 	conns[0] = pg_open("rt_mt");
 	conns[1] = pg_open("rt_mb");
 	conns[2] = NULL;
-	ws_merge(ctx, &B, &O, &T, eval_default, conns, &m);
+	ws_merge(ctx, &B, &O, &T, &(WsEval) {eval_default, eval_generated, conns}, &m);
 	PQfinish(conns[0]);
 	PQfinish(conns[1]);
 

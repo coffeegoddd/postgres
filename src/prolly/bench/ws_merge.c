@@ -15,11 +15,20 @@
  *	table <table>				one dropped a table the other changed
  *	row <table> <key>			both changed a value differently, or one
  *								deleted a row the other changed
+ *	generated <table> <key>		a stored generated column could not be
+ *								computed for a row the merge made
  *
  * With no conflicts, rows that only one side changed are moved to the
  * merged schema: values of columns the merge dropped are removed, and
  * columns the other side added with a default get it.  What the merged
  * schema then rejects (constraints) is found by restoring the result.
+ *
+ * Stored generated columns are values like any other, copied wherever a
+ * row is kept as a side wrote it.  They never conflict: a row the merge
+ * makes from both sides has them computed again from its merged values,
+ * and so does a row one side wrote under a different expression (or
+ * without the column) than the merged schema's.  That is the one place
+ * version control evaluates them, and so runs the functions they call.
  */
 #include "ws.h"
 
@@ -527,7 +536,7 @@ merge_layout(const char *table, const WsLayout *Lb, const WsLayout *Lo, const Ws
 				conflict(m, "column-name", where);
 				ok = false;
 			}
-		M.cols[i].pos = M.cols[i].kind == 's' ? pos++ : -1;
+		M.cols[i].pos = M.cols[i].kind != 'v' ? pos++ : -1;
 	}
 	if (ok)
 		ws_layout_write(&M, out);
@@ -551,14 +560,14 @@ typedef struct TableMerge
 			   *Lo,
 			   *Lt,
 			   *Lm;
-	WsDefaultFn def;
-	void	   *defarg;
+	const WsEval *ev;
 	WsMerge    *m;
 	/* defaults of added columns, evaluated once */
 	uint64_t   *dtag;
 	Buf		   *dval;
 	bool	   *dhas;
 	int			nd;
+	Buf			gval[WS_MAX_COLS];	/* generated values of the row at hand */
 } TableMerge;
 
 static bool
@@ -603,6 +612,101 @@ key_text(const WsLayout *L, const uint8_t *k, size_t kl, char *out, size_t cap)
 }
 
 /*
+ * Computes the stored generated columns of a row in the merged layout:
+ * all of them (side NULL), or those side wrote under another expression
+ * or did not have.  cells are the row's non-key cells; k its key (NULL for
+ * a keyless table, whose cells are the whole row).  The values replace the
+ * cells' own and live until the next call.  False, with a conflict, if one
+ * could not be computed.
+ */
+static bool
+regenerate(TableMerge *tm, const WsLayout *side, const uint8_t *k, size_t kl,
+		   WsCell *cells, int *n)
+{
+	const WsLayout *L = tm->Lm;
+	WsCell		row[WS_MAX_COLS];
+	int			nr = 0,
+				ng = 0;
+	const uint8_t *p = k,
+			   *end = k + kl;
+
+	for (int i = 0; i < L->ncols; i++)
+	{
+		const WsCol *c = &L->cols[i],
+				   *sc;
+
+		if (c->kind != 'g')
+			continue;
+		sc = side ? ws_layout_col(side, c->tag) : NULL;
+		if (side && sc && sc->kind == 'g' && strcmp(sc->def, c->def) == 0)
+			continue;
+		ng++;
+	}
+	if (ng == 0 || broken("noregen"))
+		return true;
+
+	/* the row as the expressions see it: key columns, then the rest */
+	for (int i = 0; k && i < L->nkey; i++)
+	{
+		uint64_t	len = 0;
+
+		if (!read_uvarint(&p, end, &len) || len > (uint64_t) (end - p))
+			die("a malformed key in %s", L->rel);
+		row[nr].tag = L->key[i];
+		row[nr].p = p;
+		row[nr].len = (size_t) len;
+		nr++;
+		p += len;
+	}
+	for (int i = 0; i < *n; i++)
+		row[nr++] = cells[i];
+
+	for (int i = 0; i < L->ncols; i++)
+	{
+		const WsCol *c = &L->cols[i],
+				   *sc;
+		bool		null = false;
+		int			at = -1;
+
+		if (c->kind != 'g')
+			continue;
+		sc = side ? ws_layout_col(side, c->tag) : NULL;
+		if (side && sc && sc->kind == 'g' && strcmp(sc->def, c->def) == 0)
+			continue;
+		tm->gval[i].len = 0;
+		if (tm->ev == NULL || tm->ev->gen == NULL ||
+			!tm->ev->gen(tm->ev->arg, L, c, row, nr, &tm->gval[i], &null))
+		{
+			char		where[1300],
+						kt[200];
+
+			if (k)
+				key_text(L, k, kl, kt, sizeof(kt));
+			else
+				snprintf(kt, sizeof(kt), "(keyless)");
+			snprintf(where, sizeof(where), "%s %s", tm->name, kt);
+			conflict(tm->m, "generated", where);
+			return false;
+		}
+		for (int j = 0; j < *n; j++)
+			if (cells[j].tag == c->tag)
+				at = j;
+		if (null)
+		{
+			if (at >= 0)
+				cells[at] = cells[--*n];
+			continue;
+		}
+		if (at < 0)
+			at = (*n)++;
+		cells[at].tag = c->tag;
+		cells[at].p = tm->gval[i].data ? tm->gval[i].data : (const uint8_t *) "";
+		cells[at].len = tm->gval[i].len;
+	}
+	return true;
+}
+
+/*
  * Merges a row both sides changed, column by column, into out (the
  * value's cells in the merged layout's non-key columns).
  */
@@ -626,6 +730,9 @@ merge_cells(TableMerge *tm, const uint8_t *k, size_t kl, const ProllyConflict *c
 				   *t,
 				   *keep;
 
+		/* computed below from the merged values, so never a conflict */
+		if (ws_layout_col(tm->Lm, tag)->kind == 'g' && !broken("noregen"))
+			continue;
 		cell_of(cb, nb, tag, &b);
 		cell_of(co, no, tag, &o);
 		cell_of(ct, nt, tag, &t);
@@ -648,6 +755,8 @@ merge_cells(TableMerge *tm, const uint8_t *k, size_t kl, const ProllyConflict *c
 		if (keep)
 			cm[nm++] = *keep;
 	}
+	if (!regenerate(tm, NULL, k, kl, cm, &nm))
+		return false;
 	out->len = 0;
 	ws_cells_encode(cm, nm, out);
 	tm->m->cells_merged++;
@@ -687,18 +796,21 @@ added_default(TableMerge *tm, const WsLayout *side, uint64_t tag, const uint8_t 
 	tm->dhas = px_realloc(tm->dhas, (size_t) (tm->nd + 1) * sizeof(bool));
 	tm->dtag[tm->nd] = tag;
 	memset(&tm->dval[tm->nd], 0, sizeof(Buf));
-	tm->dhas[tm->nd] = tm->def && tm->def(tm->defarg, c->def, c->type, &tm->dval[tm->nd]);
+	tm->dhas[tm->nd] = tm->ev->def && tm->ev->def(tm->ev->arg, c->def, c->type, &tm->dval[tm->nd]);
 	tm->nd++;
 	return added_default(tm, side, tag, p, len);
 }
 
 /*
  * A row one side changed, in the merged layout: values of dropped columns
- * removed, columns the other side added with a default filled in.  For a
- * keyless table the row is its key.
+ * removed, columns the other side added with a default filled in, and
+ * generated columns computed where the side's expression was another.  k
+ * is the row's key, NULL for a keyless table (whose row is its key).
+ * False if a generated column could not be computed.
  */
-static void
-migrate(TableMerge *tm, const WsLayout *side, const uint8_t *v, size_t vl, Buf *out)
+static bool
+migrate(TableMerge *tm, const WsLayout *side, const uint8_t *k, size_t kl,
+		const uint8_t *v, size_t vl, Buf *out)
 {
 	WsCell		c[WS_MAX_COLS],
 				keep[WS_MAX_COLS];
@@ -725,8 +837,11 @@ migrate(TableMerge *tm, const WsLayout *side, const uint8_t *v, size_t vl, Buf *
 			nk++;
 		}
 	}
+	if (!regenerate(tm, side, k, kl, keep, &nk))
+		return false;
 	out->len = 0;
 	ws_cells_encode(keep, nk, out);
+	return true;
 }
 
 typedef struct EditList
@@ -793,7 +908,8 @@ migrate_side(TableMerge *tm, const PHash *merged, const PHash *db, const PHash *
 			continue;
 		if (tm->Lm->nkey > 0)
 		{
-			migrate(tm, side, v, vl, &nv);
+			if (!migrate(tm, side, dl.v[i].key, dl.v[i].klen, v, vl, &nv))
+				continue;
 			if (!bytes_eq(nv.data, nv.len, v, vl))
 				edit_add(&el, dl.v[i].key, dl.v[i].klen, nv.data, nv.len, false);
 		}
@@ -807,7 +923,8 @@ migrate_side(TableMerge *tm, const PHash *merged, const PHash *db, const PHash *
 			char		cnt[24];
 			int			cl;
 
-			migrate(tm, side, k + 1, dl.v[i].klen - 1, &nv);
+			if (!migrate(tm, side, NULL, 0, k + 1, dl.v[i].klen - 1, &nv))
+				continue;
 			nk.len = 0;
 			buf_append(&nk, "r", 1);
 			buf_append(&nk, nv.data, nv.len);
@@ -910,7 +1027,7 @@ vt_eq(const VcTable *a, const VcTable *b)
 
 void
 ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *theirs,
-		 WsDefaultFn def, void *defarg, WsMerge *m)
+		 const WsEval *ev, WsMerge *m)
 {
 	TableList	lb,
 				lo,
@@ -1033,8 +1150,7 @@ ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *thei
 				tm.Lo = &Lo;
 				tm.Lt = &Lt;
 				tm.Lm = &Lm;
-				tm.def = def;
-				tm.defarg = defarg;
+				tm.ev = ev;
 				tm.m = m;
 				d = merge_rows(&tm, b ? &b->data : &e, &o->data, &t->data);
 				if (m->nconflicts == before)
@@ -1043,6 +1159,8 @@ ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *thei
 					free(tm.dval[q].data);
 				free(tm.dtag);
 				free(tm.dval);
+				for (int q = 0; q < WS_MAX_COLS; q++)
+					free(tm.gval[q].data);
 				free(tm.dhas);
 				ws_layout_free(&Lm);
 			}

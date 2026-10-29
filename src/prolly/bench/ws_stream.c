@@ -499,7 +499,10 @@ stream_setup(ProllyCtx *ctx, const char *db)
 	PGconn	   *c = pg_open(db);
 	char		ci[1024];
 
-	pg_cmd(c, "CREATE PUBLICATION " STREAM_PUB " FOR ALL TABLES");
+	/* stored generated columns are row values, so the stream sends them */
+	pg_cmd(c, broken("nogenpub") ? "CREATE PUBLICATION " STREAM_PUB " FOR ALL TABLES"
+		   : "CREATE PUBLICATION " STREAM_PUB " FOR ALL TABLES "
+		   "WITH (publish_generated_columns = stored)");
 	pg_cmd(c, "SELECT pg_create_logical_replication_slot('" STREAM_SLOT "', 'pgoutput')");
 	PQfinish(c);
 	memset(&stream, 0, sizeof(stream));

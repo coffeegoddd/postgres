@@ -15,11 +15,12 @@
  *
  * prolly_apply_insert and prolly_apply_delete write rows the way version
  * control must: through the executor's simple apply paths (as logical
- * replication applies rows), keeping indexes, constraints and stored
- * generated columns, but with no trigger descriptor and below the rule
- * rewriter, so no user code runs.  A checkout or merge reproduces rows a
- * commit already holds, trigger effects included; firing again would
- * apply them twice.
+ * replication applies rows), keeping indexes and constraints, but with no
+ * trigger descriptor and below the rule rewriter, so no user code runs.  A
+ * checkout or merge reproduces rows a commit already holds, trigger effects
+ * included; firing again would apply them twice.  Stored generated columns
+ * are reproduced the same way: the values given are written as they are,
+ * not computed again.
  *
  * prolly_get_pages_frozen reads pages for a keyframe with every heap tuple
  * resolved against the caller's snapshot: the visible ones frozen, the
@@ -42,6 +43,7 @@
 #include "access/tableam.h"
 #include "commands/copy.h"
 #include "executor/executor.h"
+#include "executor/nodeModifyTable.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
@@ -462,19 +464,20 @@ typedef struct Apply
 	EState	   *estate;
 	ResultRelInfo *rri;
 	CopyFromState cstate;
+	List	   *attnums;		/* the columns named, in the order given */
 } Apply;
 
 /*
  * Opens rel for applying rows: an executor state with rel as its result
  * relation, its indexes open, and no triggers; and COPY's reader over
- * data for the columns named.
+ * data, split into fields for the columns named.  The fields are turned
+ * into values here, not by COPY, which does not take generated columns.
  */
 static void
 apply_begin(Apply *a, Oid relid, ArrayType *cols, text *data)
 {
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
 	List	   *perminfos = NIL;
-	List	   *names = NIL;
 	Datum	   *cv;
 	bool	   *cn;
 	int			nc;
@@ -504,13 +507,76 @@ apply_begin(Apply *a, Oid relid, ArrayType *cols, text *data)
 	a->estate->es_output_cid = GetCurrentCommandId(true);
 	ExecOpenIndices(a->rri, false);
 
+	a->attnums = NIL;
 	deconstruct_array_builtin(cols, TEXTOID, &cv, &cn, &nc);
 	for (int i = 0; i < nc; i++)
-		names = lappend(names, makeString(TextDatumGetCString(cv[i])));
+	{
+		char	   *name = TextDatumGetCString(cv[i]);
+		AttrNumber	at = attnameAttNum(a->rel, name, false);
+
+		if (at == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" does not exist", name)));
+		if (list_member_int(a->attnums, at))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_COLUMN),
+					 errmsg("column \"%s\" named twice", name)));
+		if (TupleDescAttr(RelationGetDescr(a->rel), at - 1)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("column \"%s\" is virtual: it holds no value", name)));
+		a->attnums = lappend_int(a->attnums, at);
+	}
 	apply_data = VARDATA_ANY(data);
 	apply_left = VARSIZE_ANY_EXHDR(data);
 	a->cstate = BeginCopyFrom(make_parsestate(NULL), a->rel, NULL, NULL, false, apply_read,
-							  names, NIL);
+							  NIL, NIL);
+}
+
+/*
+ * The next line's fields as values in slot, through each column type's
+ * input function; columns not named are NULL.  False at the end of data.
+ */
+static bool
+apply_next(Apply *a, TupleTableSlot *slot)
+{
+	TupleDesc	desc = RelationGetDescr(a->rel);
+	char	  **fields;
+	int			nf;
+	int			i = 0;
+	ListCell   *lc;
+
+	if (!NextCopyFromRawFields(a->cstate, &fields, &nf))
+		return false;
+	if (nf != list_length(a->attnums))
+		ereport(ERROR,
+				(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+				 errmsg("%d fields for %d columns", nf, list_length(a->attnums))));
+	ExecClearTuple(slot);
+	for (int c = 0; c < desc->natts; c++)
+	{
+		slot->tts_values[c] = (Datum) 0;
+		slot->tts_isnull[c] = true;
+	}
+	foreach(lc, a->attnums)
+	{
+		AttrNumber	at = lfirst_int(lc);
+		Form_pg_attribute att = TupleDescAttr(desc, at - 1);
+		Oid			infunc,
+					ioparam;
+
+		if (fields[i] != NULL)
+		{
+			getTypeInputInfo(att->atttypid, &infunc, &ioparam);
+			slot->tts_values[at - 1] = OidInputFunctionCall(infunc, fields[i], ioparam,
+															att->atttypmod);
+			slot->tts_isnull[at - 1] = false;
+		}
+		i++;
+	}
+	ExecStoreVirtualTuple(slot);
+	return true;
 }
 
 static void
@@ -527,28 +593,46 @@ apply_end(Apply *a)
  * prolly_apply_insert(rel regclass, cols text[], data text) returns int8
  *
  * Inserts each line of data, COPY text for the columns named, as a row.
- * Columns not named get their defaults, as in COPY; identity columns take
- * the values given; stored generated columns are computed.
+ * Every column that is not generated must be named.  Identity columns take
+ * the values given, and so do the stored generated columns named: what a
+ * commit holds is written back, not computed again (a function the
+ * expression calls may have changed since, or be user code).  A stored
+ * generated column not named is computed, as for a row a merge made.
  */
 Datum
 prolly_apply_insert(PG_FUNCTION_ARGS)
 {
 	Apply		a;
 	TupleTableSlot *slot;
-	ExprContext *econtext;
+	TupleDesc	desc;
 	int64		n = 0;
 
 	apply_begin(&a, PG_GETARG_OID(0), PG_GETARG_ARRAYTYPE_P(1), PG_GETARG_TEXT_PP(2));
+	desc = RelationGetDescr(a.rel);
+	for (int c = 0; c < desc->natts; c++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, c);
+
+		if (!att->attisdropped && att->attgenerated == '\0' &&
+			!list_member_int(a.attnums, c + 1))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("column \"%s\" not named", NameStr(att->attname))));
+	}
+	if (desc->constr && desc->constr->has_generated_stored)
+	{
+		/* the plan that computes them, with the columns given taken out */
+		ExecInitGenerated(a.rri, a.estate, CMD_INSERT);
+		foreach_int(at, a.attnums)
+			a.rri->ri_GeneratedExprsI[at - 1] = NULL;
+	}
 	slot = table_slot_create(a.rel, &a.estate->es_tupleTable);
-	econtext = GetPerTupleExprContext(a.estate);
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
 		ResetPerTupleExprContext(a.estate);
-		ExecClearTuple(slot);
-		if (!NextCopyFrom(a.cstate, econtext, slot->tts_values, slot->tts_isnull))
+		if (!apply_next(&a, slot))
 			break;
-		ExecStoreVirtualTuple(slot);
 		ExecSimpleRelationInsert(a.rri, a.estate, slot);
 		n++;
 	}
@@ -573,73 +657,21 @@ prolly_apply_delete(PG_FUNCTION_ARGS)
 			   *found;
 	EPQState	epq;
 	Oid			idx;
-	TupleDesc	desc;
-	List	   *attnums = NIL;
 	int64		n = 0;
-	ArrayType  *cols = PG_GETARG_ARRAYTYPE_P(1);
 
-	apply_begin(&a, PG_GETARG_OID(0), cols, PG_GETARG_TEXT_PP(2));
-	desc = RelationGetDescr(a.rel);
+	apply_begin(&a, PG_GETARG_OID(0), PG_GETARG_ARRAYTYPE_P(1), PG_GETARG_TEXT_PP(2));
 	idx = RelationGetReplicaIndex(a.rel);
-	{
-		Datum	   *cv;
-		bool	   *cn;
-		int			nc;
-
-		deconstruct_array_builtin(cols, TEXTOID, &cv, &cn, &nc);
-		for (int i = 0; i < nc; i++)
-		{
-			AttrNumber	at = attnameAttNum(a.rel, TextDatumGetCString(cv[i]), false);
-
-			if (at == InvalidAttrNumber)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_COLUMN),
-						 errmsg("column \"%s\" does not exist", TextDatumGetCString(cv[i]))));
-			attnums = lappend_int(attnums, at);
-		}
-	}
 	search = table_slot_create(a.rel, &a.estate->es_tupleTable);
 	found = table_slot_create(a.rel, &a.estate->es_tupleTable);
 	EvalPlanQualInit(&epq, a.estate, NULL, NIL, -1, NIL);
 	for (;;)
 	{
-		char	  **fields;
-		int			nf;
-		ListCell   *lc;
-		int			i = 0;
 		bool		hit;
 
 		CHECK_FOR_INTERRUPTS();
-		if (!NextCopyFromRawFields(a.cstate, &fields, &nf))
-			break;
-		if (nf != list_length(attnums))
-			ereport(ERROR,
-					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-					 errmsg("%d fields for %d columns", nf, list_length(attnums))));
 		/* the named columns from their text; nothing else is evaluated */
-		ExecClearTuple(search);
-		for (int c = 0; c < desc->natts; c++)
-		{
-			search->tts_values[c] = (Datum) 0;
-			search->tts_isnull[c] = true;
-		}
-		foreach(lc, attnums)
-		{
-			AttrNumber	at = lfirst_int(lc);
-			Form_pg_attribute att = TupleDescAttr(desc, at - 1);
-			Oid			infunc,
-						ioparam;
-
-			if (fields[i] != NULL)
-			{
-				getTypeInputInfo(att->atttypid, &infunc, &ioparam);
-				search->tts_values[at - 1] = OidInputFunctionCall(infunc, fields[i], ioparam,
-																 att->atttypmod);
-				search->tts_isnull[at - 1] = false;
-			}
-			i++;
-		}
-		ExecStoreVirtualTuple(search);
+		if (!apply_next(&a, search))
+			break;
 		/* the identity index is unique: its key alone names the row */
 		if (OidIsValid(idx))
 			hit = RelationFindReplTupleByIndex(a.rel, idx, true, LockTupleExclusive, search, found);

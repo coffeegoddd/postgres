@@ -22,10 +22,13 @@
  *	noflush		the barrier is not flushed, so it waits in the WAL until
  *				something else flushes it (caught by checking the WAL is
  *				flushed past it)
+ *	nogenpub	the stream is not sent stored generated columns
  * and with --merge:
  *	notags		objects keep column names, so an index or view one branch adds
  *				does not follow a rename on the other
  *	noviol		constraint violations are found but not stored
+ *	noregen		stored generated columns are copied from a side, never
+ *				computed for a row the merge made
  * and with --move:
  *	keepall		every changed row is taken to be as the schema change left it,
  *				so none is rewritten

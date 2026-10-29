@@ -590,13 +590,54 @@ run_objects(PGconn *c, Obj *objs, size_t n, WsReport *rep)
 	free(last);
 }
 
+/*
+ * Rows as COPY text into a table with stored generated columns, through
+ * prolly_apply_insert: COPY would compute them again, and they are to be
+ * what the commit holds.  Batched; a batch's error is returned, as COPY's.
+ */
+#define APPLY_BATCH (4 << 20)
+
+static PGresult *
+apply_batch(PGconn *c, const WsLayout *L, Buf *cols, Buf *data)
+{
+	char		rel[600];
+	const char *vals[3];
+	PGresult   *res;
+
+	if (data->len == 0)
+		return NULL;
+	snprintf(rel, sizeof(rel), SCHEMA ".%s", L->rel);
+	buf_append(data, "", 1);
+	vals[0] = rel;
+	vals[1] = (const char *) cols->data;
+	vals[2] = (const char *) data->data;
+	res = PQexecParams(c, "SELECT public.prolly_apply_insert($1::regclass, $2::text[], $3)",
+					   3, NULL, vals, NULL, NULL, 0);
+	data->len = 0;
+	if (PQresultStatus(res) == PGRES_TUPLES_OK)
+	{
+		PQclear(res);
+		return NULL;
+	}
+	return res;
+}
+
+static bool
+has_generated(const WsLayout *L)
+{
+	for (int i = 0; i < L->ncols; i++)
+		if (L->cols[i].kind == 'g')
+			return true;
+	return false;
+}
+
 /* One COPY of a table's rows; the result, or NULL if it loaded. */
 static PGresult *
 copy_rows(ProllyCtx *ctx, PGconn *c, const char *name, const WsLayout *L, const VcTable *t)
 {
 	Buf			sql = {0},
 				line = {0};
-	PGresult   *res;
+	PGresult   *res = NULL;
 	ProllyIter *it;
 	const uint8_t *k,
 			   *v;
@@ -604,16 +645,24 @@ copy_rows(ProllyCtx *ctx, PGconn *c, const char *name, const WsLayout *L, const 
 				vl;
 	WsField		f[WS_MAX_COLS];
 	bool		skip = broken("row") && strcmp(name, "kinds") == 0;
+	bool		apply = has_generated(L);
+	Buf			cols = {0},
+				batch = {0};
 
-	buf_append(&sql, "COPY " SCHEMA ".", strlen("COPY " SCHEMA "."));
-	buf_append(&sql, L->rel, strlen(L->rel));
-	buf_append(&sql, " (", 2);
-	ws_copy_list(L, &sql);
-	buf_append(&sql, ") FROM STDIN", 13);
-	res = PQexec(c, (const char *) sql.data);
-	if (PQresultStatus(res) != PGRES_COPY_IN)
-		die("copy in: %s", PQerrorMessage(c));
-	PQclear(res);
+	if (apply)
+		ws_col_array(L, L->copy, L->nstored, &cols);
+	else
+	{
+		buf_append(&sql, "COPY " SCHEMA ".", strlen("COPY " SCHEMA "."));
+		buf_append(&sql, L->rel, strlen(L->rel));
+		buf_append(&sql, " (", 2);
+		ws_copy_list(L, &sql);
+		buf_append(&sql, ") FROM STDIN", 13);
+		res = PQexec(c, (const char *) sql.data);
+		if (PQresultStatus(res) != PGRES_COPY_IN)
+			die("copy in: %s", PQerrorMessage(c));
+		PQclear(res);
+	}
 	it = t_iter(ctx, &t->data, NULL, 0);
 	while (t_next(it, &k, &kl, &v, &vl))
 	{
@@ -636,10 +685,31 @@ copy_rows(ProllyCtx *ctx, PGconn *c, const char *name, const WsLayout *L, const 
 		ws_decode(L, k, kl, v, vl, f);
 		ws_copy_line(L, f, &line);
 		for (long i = 0; i < times; i++)
-			if (PQputCopyData(c, (const char *) line.data, (int) line.len) != 1)
-				die("copy in: %s", PQerrorMessage(c));
+		{
+			if (!apply)
+			{
+				if (PQputCopyData(c, (const char *) line.data, (int) line.len) != 1)
+					die("copy in: %s", PQerrorMessage(c));
+				continue;
+			}
+			buf_append(&batch, line.data, line.len);
+			if (batch.len >= APPLY_BATCH && (res = apply_batch(c, L, &cols, &batch)) != NULL)
+				break;
+		}
+		if (apply && res != NULL)
+			break;
 	}
 	prolly_iter_close(it);
+	if (apply)
+	{
+		if (res == NULL)
+			res = apply_batch(c, L, &cols, &batch);
+		free(cols.data);
+		free(batch.data);
+		free(line.data);
+		free(sql.data);
+		return res;
+	}
 	if (PQputCopyEnd(c, NULL) != 1)
 		die("copy in: %s", PQerrorMessage(c));
 	res = PQgetResult(c);

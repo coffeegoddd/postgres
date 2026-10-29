@@ -28,7 +28,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check durability-check trigger-check
+.PHONY: all check clean rebuild-check durability-check trigger-check gen-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
@@ -84,6 +84,21 @@ trigger-check: bench/rebuild
 		-o /dev/null -f bench/prolly_tags.sql
 	$(PGINST)/bin/psql -h /tmp -p 5499 -U postgres -d quiet_test -X -q -v ON_ERROR_STOP=1 \
 		-o /dev/null -f bench/quiet_test.sql
+
+# Identity and generated columns: a commit's stored generated values are
+# copied wherever rows are written back (rebuild, stream, every move) and
+# computed only for rows a merge makes; the identities' sequences follow.
+gen-check: bench/rebuild
+	./bench/rebuild --fixture bench/gen_fixture
+	./bench/rebuild --fixture bench/gen_fixture --stream
+	./bench/rebuild --fixture bench/gen_fixture --move
+	./bench/rebuild --fixture bench/gen_fixture --merge
+	if ./bench/rebuild --fixture bench/gen_fixture --stream --break nogenpub >/dev/null 2>&1; then \
+		echo "rebuild: --stream --break nogenpub went unnoticed"; exit 1; \
+	else echo "rebuild: --stream --break nogenpub caught"; fi
+	if ./bench/rebuild --fixture bench/gen_fixture --merge --break noregen >/dev/null 2>&1; then \
+		echo "rebuild: --merge --break noregen went unnoticed"; exit 1; \
+	else echo "rebuild: --merge --break noregen caught"; fi
 
 # Crash safety and backups, in a cluster of their own (made on first use
 # in CRASHDB, on port 5498): every crash point of a commit recovered, then

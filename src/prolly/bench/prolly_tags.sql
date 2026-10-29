@@ -21,6 +21,11 @@ BEGIN
 	PERFORM set_config('prolly.install_quieted', off, true);
 END $$;
 
+-- Rows are written back through its row apply, which runs no user code.
+SET LOCAL client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS prolly_pages SCHEMA public;
+RESET client_min_messages;
+
 CREATE SCHEMA prolly;
 
 CREATE TABLE prolly.tags (

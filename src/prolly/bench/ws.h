@@ -74,8 +74,8 @@ extern char dump_snapshot[64];
 typedef struct WsCol
 {
 	uint64_t	tag;
-	char		kind;			/* s stored, g generated */
-	int			pos;			/* among stored columns by attribute; -1 if generated */
+	char		kind;			/* s stored, g stored generated, v virtual */
+	int			pos;			/* among stored columns by attribute; -1 if virtual */
 	char	   *type;
 	char	   *name;			/* quoted */
 	char	   *def;			/* default or generation expression, or empty */
@@ -115,6 +115,7 @@ extern const WsCol *ws_layout_col(const WsLayout *L, uint64_t tag);
 extern const WsCol *ws_layout_col_named(const WsLayout *L, const char *quoted);
 extern int	ws_copy_index(const WsLayout *L, uint64_t tag);
 extern void ws_copy_list(const WsLayout *L, Buf *out);
+extern void ws_col_array(const WsLayout *L, const uint64_t *tags, int n, Buf *out);
 extern void ws_cells_encode(WsCell *c, int n, Buf *out);
 extern int	ws_cells(const uint8_t *v, size_t vl, WsCell *out, int max);
 extern bool ws_cell_get(const uint8_t *v, size_t vl, uint64_t tag, const uint8_t **p,
@@ -181,6 +182,9 @@ typedef struct TableList
  * Every table holding rows in the schema, with its layout (ws_codec.c):
  *	oid, name, persistence, layout, and an SQL expression giving a row's
  *	COPY text in COPY order (for the event trigger).
+ * A column is s stored, g stored generated or v virtual generated; the
+ * stored ones, generated or not, are the row's values, so a commit holds a
+ * stored generated column's values as computed when the rows were written.
  * A column's pos is its place among the stored columns by attribute number,
  * which is the order a replication stream sends them in.  The row
  * expression formats each value with its type's output function (as COPY
@@ -198,8 +202,8 @@ typedef struct TableList
 	"  WHERE i.indisprimary AND k.ord <= i.indnkeyatts), " \
 	"col AS (SELECT r.oid, a.attname, a.attnum, a.attgenerated, p.ord, g.tag, " \
 	"    format_type(a.atttypid, a.atttypmod) AS typ, pg_get_expr(d.adbin, d.adrelid) AS def, " \
-	"    CASE WHEN a.attgenerated = '' THEN " \
-	"      rank() OVER (PARTITION BY r.oid, a.attgenerated = '' ORDER BY a.attnum) - 1 " \
+	"    CASE WHEN a.attgenerated <> 'v' THEN " \
+	"      rank() OVER (PARTITION BY r.oid, a.attgenerated <> 'v' ORDER BY a.attnum) - 1 " \
 	"    ELSE -1 END AS pos FROM rel r " \
 	"  JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped " \
 	"  LEFT JOIN pk p ON p.indrelid = r.oid AND p.attnum = a.attnum " \
@@ -209,12 +213,12 @@ typedef struct TableList
 	"  (SELECT string_agg(tag::text, ',' ORDER BY ord) FROM col " \
 	"     WHERE col.oid = r.oid AND ord IS NOT NULL) AS keytags, " \
 	"  (SELECT string_agg(format(E'col %s\\t%s\\t%s\\t%s\\t%s\\t%s\\n', tag, " \
-	"       CASE WHEN attgenerated = '' THEN 's' ELSE 'g' END, pos, typ, " \
+	"       CASE attgenerated WHEN '' THEN 's' WHEN 's' THEN 'g' ELSE 'v' END, pos, typ, " \
 	"       quote_ident(attname), coalesce(def, '')), '' ORDER BY attnum) " \
 	"     FROM col WHERE col.oid = r.oid) AS cols, " \
 	"  (SELECT string_agg(format('prolly.esc(num_nulls(%I) > 0, format(''%%s'', %I))', attname, attname), " \
 	"     $$ || E'\\t' || $$ ORDER BY ord NULLS LAST, attnum) " \
-	"     FROM col WHERE col.oid = r.oid AND attgenerated = '') AS rowexpr " \
+	"     FROM col WHERE col.oid = r.oid AND attgenerated <> 'v') AS rowexpr " \
 	"  FROM rel r) " \
 	"SELECT oid, relname, relpersistence, " \
 	"  format(E'rel %s\\nkey %s\\n%s', quote_ident(relname), coalesce(keytags, ''), " \
@@ -442,8 +446,23 @@ extern void ws_diff(ProllyCtx *ctx, const PHash *from, const PHash *to, WsDiff *
 extern bool ws_diff_has(const WsDiff *d, const char *line);
 extern void ws_diff_free(WsDiff *d);
 
-/* Evaluates a column default to its output text, for rows merged without it. */
+/*
+ * What a merge evaluates on a server.  def gives a column default's output
+ * text, for rows merged without the column.  gen gives a stored generated
+ * column's output text (or *null) for a row the merge made, from the row's
+ * cells (key columns included, NULLs absent) in layout L.  Each returns
+ * false if the expression fails.
+ */
 typedef bool (*WsDefaultFn) (void *arg, const char *expr, const char *type, Buf *out);
+typedef bool (*WsGenerateFn) (void *arg, const WsLayout *L, const WsCol *col,
+							  const WsCell *cells, int n, Buf *out, bool *null);
+
+typedef struct WsEval
+{
+	WsDefaultFn def;
+	WsGenerateFn gen;
+	void	   *arg;
+} WsEval;
 
 typedef struct WsMerge
 {
@@ -455,7 +474,7 @@ typedef struct WsMerge
 } WsMerge;
 
 extern void ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
-					 const PHash *theirs, WsDefaultFn def, void *defarg, WsMerge *out);
+					 const PHash *theirs, const WsEval *ev, WsMerge *out);
 extern void ws_merge_free(WsMerge *m);
 
 #endif

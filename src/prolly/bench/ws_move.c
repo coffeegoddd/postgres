@@ -197,6 +197,15 @@ drop_sql(PGconn *c, const char *type, const char *name, const char *ddl)
 		snprintf(buf, sizeof(buf), "DROP MATERIALIZED VIEW IF EXISTS " SCHEMA ".%s CASCADE", qa);
 	else if (strcmp(type, "STATISTICS") == 0)
 		snprintf(buf, sizeof(buf), "DROP STATISTICS IF EXISTS " SCHEMA ".%s", qa);
+	else if (strcmp(type, "SEQUENCE") == 0 && strncmp(ddl, "ALTER TABLE ", 12) == 0 &&
+			 strstr(ddl, " ADD GENERATED "))
+	{
+		/* an identity column's: the column gives it up, keeping its values */
+		const char *add = strstr(ddl, " ADD GENERATED ");
+
+		snprintf(buf, sizeof(buf), "ALTER TABLE IF EXISTS %.*s DROP IDENTITY IF EXISTS",
+				 (int) (add - ddl - 12), ddl + 12);
+	}
 	else if (strcmp(type, "SEQUENCE") == 0)
 		snprintf(buf, sizeof(buf), "DROP SEQUENCE IF EXISTS " SCHEMA ".%s CASCADE", qa);
 	else if (strcmp(type, "TYPE") == 0)
@@ -398,6 +407,109 @@ mt_get(Move *mv, const char *name)
 	memset(&mv->t[mv->nt], 0, sizeof(MoveTable));
 	mv->t[mv->nt].name = strdup(name);
 	return &mv->t[mv->nt++];
+}
+
+/*
+ * A table just created gets its identity columns back: each is B's SEQUENCE
+ * object, an ALTER TABLE on the table, which ran before the table was
+ * recreated (sequences come before tables) and went with the old one.
+ */
+static void
+identities(Move *mv, const char *name, const char *qt, WsReport *rep)
+{
+	char		prefix[1200],
+				bare[1200];
+
+	/* pg_dump quotes the name only where it must */
+	snprintf(prefix, sizeof(prefix), "ALTER TABLE " SCHEMA ".%s ALTER COLUMN ", qt);
+	snprintf(bare, sizeof(bare), "ALTER TABLE " SCHEMA ".%s ALTER COLUMN ", name);
+	for (size_t i = 0; i < mv->ob.n; i++)
+	{
+		char		type[200],
+					oname[1000];
+		char	   *r;
+
+		key_parts(&mv->ob.kv[i], type, sizeof(type), oname, sizeof(oname));
+		if (mv->ob.kv[i].key[0] != 'a' || strcmp(type, "SEQUENCE") != 0)
+			continue;
+		r = rendered((const char *) mv->ob.kv[i].val, mv->ob.kv[i].vlen, &mv->cb);
+		if ((strncmp(r, prefix, strlen(prefix)) == 0 || strncmp(r, bare, strlen(bare)) == 0) &&
+			strstr(r, " ADD GENERATED "))
+			exec_or_report(mv->c, r, "identity", rep);
+		free(r);
+	}
+}
+
+static bool
+is_routine(const char *type)
+{
+	return strcmp(type, "FUNCTION") == 0 || strcmp(type, "PROCEDURE") == 0;
+}
+
+/*
+ * A function or procedure both A and B have, changed: replaced in place,
+ * as CREATE OR REPLACE does, so what depends on it stays (a generated
+ * column that calls it would go with a drop, values and all).  When it
+ * cannot be replaced (its result type changed), it is dropped instead,
+ * and the tables whose generated columns or defaults call it recreated.
+ * True if replaced; false leaves it to be created with the others.
+ */
+static bool
+replace_routine(Move *mv, ProllyCtx *ctx, const PHash *from, const TableList *la,
+				const ProllyKV *b, WsReport *rep)
+{
+	char		type[200],
+				name[1000],
+				base[1000];
+	char	   *ddl,
+			   *sql;
+	Buf			q = {0};
+	PGresult   *res;
+	bool		ok;
+
+	key_parts(b, type, sizeof(type), name, sizeof(name));
+	if (!is_routine(type))
+		return false;
+	ddl = rendered((const char *) b->val, b->vlen, &mv->cb);
+	if (strncmp(ddl, "CREATE ", 7) == 0)
+	{
+		buf_append(&q, "CREATE OR REPLACE ", 18);
+		buf_append(&q, ddl + 7, strlen(ddl + 7) + 1);
+	}
+	free(ddl);
+	if (q.data == NULL)
+		return false;
+	pg_cmd(mv->c, "SAVEPOINT replace_routine");
+	res = PQexec(mv->c, (const char *) q.data);
+	ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+	PQclear(res);
+	free(q.data);
+	if (ok)
+	{
+		pg_cmd(mv->c, "RELEASE SAVEPOINT replace_routine");
+		mv->st->created++;
+		return true;
+	}
+	pg_cmd(mv->c, "ROLLBACK TO SAVEPOINT replace_routine");
+	sql = drop_sql(mv->c, type, name, "");
+	exec_or_report(mv->c, sql, "drop", rep);
+	free(sql);
+	mv->st->dropped++;
+	snprintf(base, sizeof(base), "%s", name);
+	if (strchr(base, '('))
+		*strchr(base, '(') = '\0';
+	for (size_t t = 0; t < la->n; t++)
+	{
+		WsLayout	L;
+
+		if (la->names[t][0] == '~' || !table_layout(ctx, from, la->names[t], &L, NULL))
+			continue;
+		for (int c = 0; c < L.ncols; c++)
+			if (strstr(L.cols[c].def, base))
+				mt_get(mv, la->names[t])->recreate = true;
+		ws_layout_free(&L);
+	}
+	return false;
 }
 
 static const ColRef *
@@ -650,7 +762,7 @@ alter_table(Move *mv, const char *name, const char *ta, const char *tb, const Ws
 						nnb = strstr(db.item[i].line, " NOT NULL") != NULL;
 
 			if (strcmp(ra, rb) != 0 || ca == NULL || cb == NULL || r == NULL ||
-				ca->kind != cb->kind || ca->kind == 'g')
+				ca->kind != cb->kind || ca->kind != 's')
 			{
 				free(ra);
 				free(rb);
@@ -859,49 +971,6 @@ same_in_db(Move *mv, const WsLayout *LA, const WsLayout *LB, const uint8_t *va, 
 	return true;
 }
 
-/* A quoted identifier (as quote_ident gives it) as the name it stands for. */
-static void
-unquote_ident(const char *q, Buf *out)
-{
-	if (q[0] != '"')
-	{
-		buf_append(out, q, strlen(q));
-		return;
-	}
-	for (const char *p = q + 1; *p && !(p[0] == '"' && p[1] != '"'); p++)
-	{
-		buf_append(out, p, 1);
-		if (p[0] == '"')
-			p++;
-	}
-}
-
-/* A text[] literal of the columns with these tags. */
-static void
-col_array(const WsLayout *L, const uint64_t *tags, int n, Buf *out)
-{
-	out->len = 0;
-	buf_append(out, "{", 1);
-	for (int i = 0; i < n; i++)
-	{
-		Buf			name = {0};
-
-		unquote_ident(ws_layout_col(L, tags[i])->name, &name);
-		if (i)
-			buf_append(out, ",", 1);
-		buf_append(out, "\"", 1);
-		for (size_t j = 0; j < name.len; j++)
-		{
-			if (name.data[j] == '"' || name.data[j] == '\\')
-				buf_append(out, "\\", 1);
-			buf_append(out, &name.data[j], 1);
-		}
-		buf_append(out, "\"", 1);
-		free(name.data);
-	}
-	buf_append(out, "}", 2);
-}
-
 /*
  * Applies data, COPY text for the columns in cols, with prolly_apply_insert
  * or prolly_apply_delete: no user code runs.  Every line must take effect.
@@ -1007,7 +1076,7 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 		{
 			/* the key, a line of COPY text for prolly_apply_delete */
 			if (nkeys == 0 && kcols.len == 0)
-				col_array(LB, LB->key, LB->nkey, &kcols);
+				ws_col_array(LB, LB->key, LB->nkey, &kcols);
 			for (int k = 0; k < LB->nkey; k++)
 			{
 				if (k)
@@ -1082,7 +1151,7 @@ move_rows(Move *mv, const char *name, const WsLayout *LA, const PHash *da, const
 			times = to - from;
 		}
 		if (cols.len == 0)
-			col_array(LB, LB->copy, LB->nstored, &cols);
+			ws_col_array(LB, LB->copy, LB->nstored, &cols);
 		ws_decode(LB, x->key, x->klen, x->to, x->tlen, f);
 		ws_copy_line(LB, f, &line);
 		for (long q = 0; q < times; q++)
@@ -1321,6 +1390,9 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 			key_parts(a, type, sizeof(type), name, sizeof(name));
 			if (strcmp(type, "TABLE") == 0)
 				continue;
+			/* replaced in place below: a drop would take what depends on it */
+			if (b && is_routine(type))
+				continue;
 			{
 				char	   *r = rendered((const char *) a->val, a->vlen, &mv.ca);
 				char	   *sql;
@@ -1391,6 +1463,11 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 			char	   *key = strndup((const char *) b->key, b->klen);
 
 			if (b->key[0] != 'a' || kv_same(a, b) || obj_prio(key) >= tprio)
+			{
+				free(key);
+				continue;
+			}
+			if (a && replace_routine(&mv, ctx, from, &la, b, rep))
 			{
 				free(key);
 				continue;
@@ -1489,6 +1566,7 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 				exec_or_report(mv.c, r, "create table", rep);
 				t->fresh = true;
 				free(r);
+				identities(&mv, name, qt, rep);
 			}
 			free(qt);
 		}
