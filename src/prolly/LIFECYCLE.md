@@ -989,8 +989,8 @@ the log is refused, and opening as of an older root is tested.
 **Decision (2026-10-29):** keep parents in the commits (`vc`), with the
 saved-state change below.  The commit graph cost a little more space, and
 lost `vc`'s refusal to re-fetch the seam commit, in exchange for a real
-root at the cut.  `vcg`/`cgraph` stay in the prototype only as the
-measured alternative.
+root at the cut.  The commit-graph engine (`vcg.c`, `cgraph.c`, its tests
+and `bench/graphbench`) was then removed; it is in commit 8822996e6e1.
 
 **The question:** when the window severs init <- a <- b <- c <- d <- e
 down to c <- d <- e, can c become a real root without rewriting any

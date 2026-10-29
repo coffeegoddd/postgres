@@ -30,12 +30,6 @@
  *			byte, [base image hash (weak)], uvarint lsn, uvarint snapshot xmin,
  *			uvarint xmax, uvarint nxip, uvarint xip..., page map root (strong),
  *			relation map root (strong)
- * Graph commit: tag, version, root value hash (strong), uvarint generation,
- *			16-byte nonce, uvarint time, uvarint msglen, msg.  Its parents are
- *			not in it: they are edges in a commit graph map (see cgraph.h).
- * Graph repo state: tag, version, then a graph repo's branches, commit
- *			graph root, held commits and segments (see vcg_repo_save).  Like
- *			repo state, it names no chunk strongly.
  * Repo state: tag, version, then a repo's branches, commit locations,
  *			segments, hints and image holds (see vc_repo_save).  It names no
  *			chunk strongly: what it lists is held by the store's roots.
@@ -53,8 +47,6 @@
 #define CHUNK_TAG_PAGE 0x47
 #define CHUNK_TAG_IMAGE 0x49
 #define CHUNK_TAG_REPO 0x52
-#define CHUNK_TAG_GCOMMIT 0x4b
-#define CHUNK_TAG_GREPO 0x67
 
 /*
  * Covers the encodings and the chunk boundary function; anything that
