@@ -120,20 +120,30 @@ count_tables_fn(void *arg, const VcTableChange *c)
 	(*(int *) arg)++;
 }
 
+typedef struct HeldArg
+{
+	VcRepo	   *r;
+	uint32_t	skip;
+	PHashMap   *out;
+} HeldArg;
+
+static inline void
+held_fn(void *arg, const PHash *h, VcLocation l, uint32_t seg)
+{
+	HeldArg    *a = arg;
+
+	if (l == VC_LOC_WINDOW || (l == VC_LOC_SEGMENT && seg != a->skip))
+		closure(a->r->ctx.cs, h, a->out);
+}
+
 /* Every chunk some hold other than segment `skip` keeps alive. */
 static inline void
 held_elsewhere(VcRepo *r, uint32_t skip, PHashMap *out)
 {
-	phmap_init(out);
-	for (size_t i = 0; i < r->loc.cap; i++)
-		if (r->loc.used[i])
-		{
-			uint32_t	seg = VC_NO_SEGMENT;
-			VcLocation	l = vc_locate(r, &r->loc.keys[i], &seg);
+	HeldArg		a = {r, skip, out};
 
-			if (l == VC_LOC_WINDOW || (l == VC_LOC_SEGMENT && seg != skip))
-				closure(r->ctx.cs, &r->loc.keys[i], out);
-		}
+	phmap_init(out);
+	vc_locations(r, held_fn, &a);
 	for (size_t i = 0; i < r->nbr; i++)
 		closure(r->ctx.cs, &r->br[i].working, out);
 }

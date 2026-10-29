@@ -601,6 +601,21 @@ test_remotes_across_edge(void)
 
 /* ------------------------------------------------------ incremental window */
 
+typedef struct OutsideArg
+{
+	PHashMap   *win;
+	int			n;
+} OutsideArg;
+
+static void
+outside_fn(void *arg, const PHash *h, VcLocation where, uint32_t seg)
+{
+	OutsideArg *a = arg;
+
+	if (where == VC_LOC_WINDOW && !phmap_find(a->win, h))
+		a->n++;
+}
+
 /* Commits a sever with this window would cut, computed from scratch. */
 static int
 full_cut_count(VcRepo *r, uint32_t depth)
@@ -645,10 +660,12 @@ full_cut_count(VcRepo *r, uint32_t depth)
 			free(stack);
 			free(bound);
 		}
-		for (size_t i = 0; i < r->loc.cap; i++)
-			if (r->loc.used[i] && vc_locate(r, &r->loc.keys[i], NULL) == VC_LOC_WINDOW &&
-				!phmap_find(&win, &r->loc.keys[i]))
-				n++;
+		{
+			OutsideArg	a = {&win, 0};
+
+			vc_locations(r, outside_fn, &a);
+			n = a.n;
+		}
 		phmap_free(&win);
 	}
 	cs_destroy(cs2);
@@ -921,53 +938,108 @@ test_window_scaling(void)
 	printf("%-44s", "");
 }
 
+typedef struct CutCount
+{
+	int			discarded,
+				window;
+} CutCount;
+
+static void
+cut_count_fn(void *arg, const PHash *h, VcLocation where, uint32_t seg)
+{
+	CutCount   *c = arg;
+
+	c->discarded += where == VC_LOC_DISCARDED;
+	c->window += where == VC_LOC_WINDOW;
+}
+
 /*
  * The saved repo is the size of what it holds: commits cut and discarded
- * leave nothing in it.  Reopened, the commit just past the oldest kept one
- * is still known as discarded, read from the kept commit itself.
+ * leave nothing in it, and a save writes what changed, not the history.
+ * Reopened, the commit just past the oldest kept one is still known as
+ * discarded; an older edge is forgotten once the commit naming it goes.
+ * With tracked severs that edge is read from the kept commit itself; with
+ * full ones the sever records it.
  */
 static void
-test_state_does_not_grow_with_history(void)
+state_run(bool tracked)
 {
 	ChunkStore *cs = memstore_create();
 	VcRepo		r;
 	PHash		state,
 				head,
-				edge;
+				edge,
+				first_edge = {{0}};
 	size_t		len10 = 0,
 				len = 0;
+	uint64_t	wrote10 = 0,
+				wrote = 0;
 	uint32_t	seg;
 	LogAcc		acc;
+	CutCount	cc = {0};
 
 	setup(&r, cs);
-	CHECK(vc_window_track(&r, 5) == VC_OK);
-	for (int i = 1; i <= 200; i++)
+	if (tracked)
+		CHECK(vc_window_track(&r, 5) == VC_OK);
+	for (int i = 1; i <= 400; i++)
 	{
+		uint64_t	before;
+
 		commit_rows(&r, (uint64_t) i, (uint64_t) i + 1, (uint64_t) i, "step");
 		CHECK(vc_sever(&r, &(VcWindow) {5, NULL, 0}, &seg) == VC_OK);
 		if (seg != VC_NO_SEGMENT)
+		{
+			CHECK(r.segs[seg].edge_known == !tracked);
 			CHECK(vc_segment_discard(&r, seg) == VC_OK);
+		}
+		if (i == 10)
+		{
+			CHECK(log_from(&r, &vc_head(&r)->head, 0, &acc) == VC_ERR_SEVERED);
+			first_edge = r.ctx.err_hash;
+			CHECK(vc_locate(&r, &first_edge, NULL) == VC_LOC_DISCARDED);
+		}
+		before = cs->stats.new_bytes;
 		state = vc_repo_save(&r);
 		CHECK(cs_get(cs, &state, &len) != NULL);
 		if (i == 10)
+		{
 			len10 = len;
+			wrote10 = cs->stats.new_bytes - before;
+		}
+		wrote = cs->stats.new_bytes - before;
 	}
 	CHECK(len10 > 0);
-	/* a varint or two per commit held grows a byte as the clock moves on */
+	/* a varint grows a byte as the clock and segment ids move on */
 	CHECK_LE(len, len10 + 16);
+	/* a save writes a commit's worth of locations, not the history */
+	CHECK_LE(wrote, 2 * wrote10 + 2048);
 	head = vc_head(&r)->head;
 	CHECK(log_from(&r, &head, 0, &acc) == VC_ERR_SEVERED && acc.n == 5);
 	edge = r.ctx.err_hash;
 	CHECK(vc_locate(&r, &edge, NULL) == VC_LOC_DISCARDED);
+	CHECK(vc_locate(&r, &first_edge, NULL) == VC_LOC_UNKNOWN);
+	vc_locations(&r, cut_count_fn, &cc);
+	CHECK_EQ(cc.window, 5);
+	CHECK_LE(cc.discarded, 1);
 	vc_repo_free(&r);
 
 	CHECK(vc_repo_open(&r, cs, &small_policy, &state) == VC_OK);
-	CHECK_EQ(r.nsegs, 0);
+	/* ids are kept; every segment stands as discarded, holding nothing */
+	for (size_t i = 0; i < r.nsegs; i++)
+		CHECK(r.segs[i].state == VC_SEG_DISCARDED && r.segs[i].n == 0);
 	CHECK(vc_locate(&r, &edge, NULL) == VC_LOC_DISCARDED);
+	CHECK(vc_locate(&r, &first_edge, NULL) == VC_LOC_UNKNOWN);
 	CHECK(vc_window_verify(&r));
 	check_store(cs, 0);
 	vc_repo_free(&r);
 	cs_destroy(cs);
+}
+
+static void
+test_state_does_not_grow_with_history(void)
+{
+	state_run(true);
+	state_run(false);
 }
 
 int

@@ -128,6 +128,13 @@ typedef struct VcSegment
 	ChunkStore *archive;		/* where an exported segment lives */
 	char	   *archive_name;
 	PHash		manifest;		/* holds it there */
+	/*
+	 * Members that commits kept in the window name as parents, found by the
+	 * sever that cut them: what stays known of the segment once discarded.
+	 */
+	PHash	   *edge;
+	size_t		nedge;
+	bool		edge_known;		/* false after an incremental sever */
 } VcSegment;
 
 /*
@@ -172,7 +179,13 @@ typedef struct VcRepo
 	size_t		cap;
 	size_t		cur;
 	uint64_t	clock;
-	PHashMap	loc;			/* commit -> where it is */
+	/*
+	 * Where each known commit is: a prolly map saved with the repo, and the
+	 * changes since it was last written (0 for a removal).  Lookups read
+	 * the changes, then the map, so nothing scales with history in memory.
+	 */
+	PHashMap	loc;
+	PHash		loc_root;
 	VcSegment  *segs;
 	size_t		nsegs;
 	size_t		segcap;
@@ -197,6 +210,7 @@ typedef struct VcRepo
 	PHash		state;
 	PHashMap	cut;			/* parents of held commits that are not known */
 	bool		cut_valid;
+	bool		cut_lazy;		/* a discard without edges: derive them */
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -295,8 +309,7 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
  * size of what it holds however much is cut.  What it still knows of them
  * is what the commits it holds name: their parents, which vc_locate reports
  * as discarded and which transfers stop at.  Deeper discarded commits are
- * unknown again.  Saving keeps only local and exported segments, so
- * segment ids last only for the session.
+ * unknown again.  Saving keeps only local and exported segments; ids stay.
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
 
@@ -315,6 +328,10 @@ extern int	vc_segment_export(VcRepo *r, uint32_t seg, const VcSource *archive);
 extern int	vc_segment_discard(VcRepo *r, uint32_t seg);
 extern int	vc_segment_attach(VcRepo *r, uint32_t seg);
 extern VcLocation vc_locate(VcRepo *r, const PHash *commit, uint32_t *seg);
+
+/* Every commit the repo knows of and where it is (O(history); for tests). */
+typedef void (*VcLocFn) (void *arg, const PHash *commit, VcLocation where, uint32_t seg);
+extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
 
 /*
  * Commit images (see image.h) are local optimization artifacts: a commit

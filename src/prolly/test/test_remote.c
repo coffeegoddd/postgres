@@ -14,14 +14,19 @@ name_repo(VcRepo *r, const char *name)
 	vc_repo_set_name(r, name);
 }
 
+static void
+count_window_fn(void *arg, const PHash *h, VcLocation where, uint32_t seg)
+{
+	if (where == VC_LOC_WINDOW)
+		(*(int *) arg)++;
+}
+
 static int
 count_window(VcRepo *r)
 {
 	int			n = 0;
 
-	for (size_t i = 0; i < r->loc.cap; i++)
-		if (r->loc.used[i] && vc_locate(r, &r->loc.keys[i], NULL) == VC_LOC_WINDOW)
-			n++;
+	vc_locations(r, count_window_fn, &n);
 	return n;
 }
 
@@ -37,6 +42,13 @@ build_main(VcRepo *r, int n)
 		c[i] = commit_rows(r, (uint64_t) i * 700, (uint64_t) i * 700 + 100,
 						   (uint64_t) i, "main");
 	return c;
+}
+
+static void
+boundary_fn(void *arg, const PHash *h, VcLocation where, uint32_t seg)
+{
+	if (where == VC_LOC_BOUNDARY)
+		*(PHash *) arg = *h;
 }
 
 /* ------------------------------------------------------------------ tests */
@@ -889,9 +901,7 @@ test_transfer_costs(void)
 	{
 		PHash		edge = {{0}};
 
-		for (size_t i = 0; i < shallow.loc.cap; i++)
-			if (shallow.loc.used[i] && shallow.loc.vals[i] == UINT64_MAX)
-				edge = shallow.loc.keys[i];
+		vc_locations(&shallow, boundary_fn, &edge);
 		st = scs->stats;
 		CHECK(vc_deepen(&shallow, &(VcSource) {"origin", ocs}, &edge, 5, &seg) == VC_OK);
 		deepen_new = STATS_DELTA(scs, st, new_chunks);

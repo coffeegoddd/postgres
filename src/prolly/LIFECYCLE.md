@@ -1105,6 +1105,76 @@ With both on the same state:
   has it.  `vcg` doesn't even stop at the seam commit: `vc` reads cut
   parents from its kept commits, but `vcg` has only the segment hash.
 
+## Millions of commits in the window
+
+**The question:** do version-control operations stay cheap when the
+window holds one deep history of millions of commits?  That is what a
+high-rate `dolt tx commit` mode produces.  The earlier scale tests were
+wide (1M branches of one to three commits each) or shallow (400 commits).
+
+**`bench/deepbench`** runs on the durable store:
+- a 100k-row table, 1 KB chunks (the table's own writes per commit do not
+  depend on the window), and 4 row changes per commit;
+- 1M commits on main, all kept;
+- a full sever pass every 1000 commits;
+- two side branches for merge bases: one off the first commit, one off ten
+  commits back.
+
+**What was O(history) per commit, and the fix.**  The saved repo state held
+a location for every known commit, rewritten whole at each save.  Now:
+- locations are a prolly map in the store, keyed by commit;
+- changes wait in memory and are written at save, so a save costs
+  O(changes x log W);
+- segment ids are stable, so locations never need renumbering;
+- a sever that walks the window records which cut commits the kept ones
+  name, so discarding no longer needs an O(W) walk to rebuild them.  After
+  an incremental sever, it falls back to rebuilding them lazily.
+
+**At 1M commits**, before and after:
+
+| Measure | Before | After |
+|---|---:|---:|
+| Commit (edit + commit) | 90 us | 85 us |
+| Save repo state | 35 ms, 11.3 MB written | 37 us, 5.7 KB written |
+| Saved state chunk | 20.5 MB | 0.3 KB |
+| Reopen from saved state | 42 ms | < 0.1 ms |
+| Full sever pass | 227 ms | 238 ms |
+| Log of 100 | 123 us | 103 us |
+| Merge base, ten commits back | 2 us | 1 us |
+| Merge base, the whole history back | 538 ms | 491 ms |
+| Row diff, 1 commit back (4 rows) | < 0.1 ms | < 0.1 ms |
+| Row diff, 1000 back (3,922 rows) | 3.6 ms | 3.4 ms |
+| Row diff, 500k back (all 100k rows) | 5.3 ms | 4.3 ms |
+| Disk | 39 GB | 31 GB |
+
+- **The fix makes saving independent of history.**  Before, a save every
+  commit would have written about 11 TB over the run, so the baseline
+  saved every 1000 commits; the after run saved every commit.  The 8 GB of
+  disk saved is the old state chunks.
+- **Flat with history:** commit, save, reopen, short logs and merge bases,
+  and diffs.  A diff costs the rows that differ, never the commits between:
+  500k commits back costs what the whole table differing costs.
+- **Still linear in W:**
+  - The full sever pass walks the window (about 0.24 us per commit held).
+    Run it every W/k commits rather than every 1000 and it costs O(k) per
+    commit, however deep the window is.
+  - A merge base far back walks every commit between, as in git and Dolt:
+    0.5 s across 1M commits.  Ancestor skip pointers (a commit naming its
+    ancestor at generation g - 2^k) would make it logarithmic, if
+    long-lived branches merging across millions of commits matter.
+- **Memory (about 19 GB in both runs) is the store, not the repo.**  The
+  journal is memory-mapped, and the store keeps an index entry per chunk
+  (about 20 chunks per commit here, since every version of the table is
+  kept).  That cost is per chunk retained, whatever the window.
+
+**Keyframes don't change with commit count.**  Checkout cost follows the
+rows that differ: the prolly diff found 100k differing rows in 4 ms.  The
+Postgres side is what costs: replaying 100k rows at about 8 us each is
+about 0.8 s.  That is where a keyframe could pay.  Its break-even point R
+(rows changed since the last keyframe) still needs measuring against the
+real page-restore path, not the libpq harness's 150 us per page.  Nothing
+in the window's depth changes R.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per
