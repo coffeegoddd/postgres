@@ -160,7 +160,7 @@ typedef enum VcLocation
 	VC_LOC_WINDOW,				/* held by the window's history */
 	VC_LOC_SEGMENT,				/* in a local, detached segment */
 	VC_LOC_EXPORTED,			/* in a segment moved to an archive */
-	VC_LOC_DISCARDED,			/* in a discarded segment */
+	VC_LOC_DISCARDED,			/* a parent of a commit held, discarded here */
 	VC_LOC_BOUNDARY				/* named as a parent; never had locally */
 } VcLocation;
 
@@ -195,6 +195,8 @@ typedef struct VcRepo
 	size_t		pendcap;
 	bool		has_state;		/* the last saved state chunk, held */
 	PHash		state;
+	PHashMap	cut;			/* parents of held commits that are not known */
+	bool		cut_valid;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -288,6 +290,13 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
  * a new local segment (or reports VC_NO_SEGMENT): only holds move, no chunk
  * is copied or freed.  A segment can then be exported (copied whole to an
  * archive store, then let go here), discarded, or attached again.
+ *
+ * A discarded segment's commits are forgotten, so the saved repo stays the
+ * size of what it holds however much is cut.  What it still knows of them
+ * is what the commits it holds name: their parents, which vc_locate reports
+ * as discarded and which transfers stop at.  Deeper discarded commits are
+ * unknown again.  Saving keeps only local and exported segments, so
+ * segment ids last only for the session.
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
 

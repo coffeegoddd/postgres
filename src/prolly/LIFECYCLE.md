@@ -1054,32 +1054,40 @@ chunk it is given, so bytes under the wrong name can never land.
 the same seeded commits through both engines on the durable store; table
 data comes out as identical chunks, so only history differs.
 
+The first comparison was not like for like: `vc` saved a location for
+every commit it ever had, plus every segment's commit list, and rewrote
+all of it at every commit.  That came to 315 KB after 5000 commits and
+808 MB written.  So `vc` now keeps the same state as `vcg`:
+- a discarded segment's commits are forgotten, and only local and
+  exported segments are saved;
+- what it still knows of cut history is what its held commits name: their
+  parents.  Those are rebuilt from the commits on open, so a transfer
+  still stops at the seam commit and never re-sends it;
+- deeper discarded commits become unknown, as in `vcg`.
+
+With both on the same state:
+
 | Workload | History, vc | History, vcg | Written, vc | Written, vcg |
 |---|---:|---:|---:|---:|
-| 200k rows, 200 commits x 2000 changes, window 20 | 13.1 KB | 6.2 KB | 821 MB | 821 MB |
-| 20k rows, 5000 commits x 1 change, window 50 | 318 KB | 6.1 KB | 808 MB | 70 MB |
-| same, never severed | 396 KB | 610 KB | 294 MB | 326 MB |
-| 20k rows, 2000 commits x 10 changes, 32 branches, window 10 | 134 KB | 39 KB | 231 MB | 158 MB |
+| 200k rows, 200 commits x 2000 changes, window 20 | 1.7 KB | 2.5 KB | 820 MB | 821 MB |
+| 20k rows, 5000 commits x 1 change, window 50 | 4.1 KB | 6.2 KB | 49 MB | 70 MB |
+| same, never severed | 396 KB | 611 KB | 294 MB | 325 MB |
+| 20k rows, 2000 commits x 10 changes, 32 branches, window 10 | 27 KB | 39 KB | 143 MB | 159 MB |
 
 "History" is the live commits, graph and saved state at the end.
 "Written" is every byte put over the run.
 
-- **Severing:** history stays the size of the window.  The big
-  difference is the saved state:
-  - `vc` remembers every commit it ever had (its location map, so cut
-    history never comes back implicitly) and every segment's commit list;
-  - it rewrites all of that at every commit: 315 KB after 5000 commits,
-    which is most of the 808 MB written.
-  - `vcg` keeps that knowledge in the edges and segment hashes instead,
-    so its state stays at about 1 KB.
-  - The same diet would work for `vc` too, if it gave up refusing to
-    re-fetch discarded history.
-- **Never severing:** the graph costs more, about 43 bytes more per
-  commit live.  Each commit also rewrites the graph's last leaf and its
-  path, about 6 KB written per commit with 4 KB chunks; a smaller chunk
-  target for the graph would cut that.
-- **Disk:** table data dominates everywhere.  On disk the two differ by
-  under 0.3 MB in every run (5.26 vs 4.95 MB after the 5000-commit run).
+- **`vc` is a little smaller everywhere.**  Its commits carry about 13
+  bytes more each (parents in place of the nonce).  The graph costs more
+  than that: about 43 bytes per commit live, and each commit rewrites the
+  graph's last leaf and its path, about 4 KB written per commit with 4 KB
+  chunks.  A smaller chunk target for the graph would cut the writes.
+- **Disk:** table data dominates.  On disk the two differ by under
+  0.3 MB in every run.
+- **So the decoupling buys semantics, not space:** a real root at the cut
+  with no hash changed, and relinking checked against a recorded hash.
+  The saving in the first comparison was the state diet, which now
+  applies to both.
 
 **Left open:**
 - A receiver accepts a new commit's edges on the sender's graph root,
@@ -1088,7 +1096,8 @@ data comes out as identical chunks, so only history differs.
 - The window is recomputed on every sever, not tracked incrementally.
 - `vcg` has no commit images, pins, `VC_WINDOW_ONLY`, deepen or pull yet.
 - Fetch can bring back history this repo discarded, if a sender still
-  has it.
+  has it.  `vcg` doesn't even stop at the seam commit: `vc` reads cut
+  parents from its kept commits, but `vcg` has only the segment hash.
 
 ## Evidence so far
 

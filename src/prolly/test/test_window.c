@@ -229,7 +229,10 @@ test_discard_frees_exactly(void)
 	CHECK(vc_segment_discard(&r, seg) == VC_OK);
 	CHECK_EQ(STATS_DELTA(cs, st, frees), want);
 	check_store(cs, 0);
-	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_DISCARDED);
+	/* C names B, so B is known as discarded; A, below it, is forgotten */
+	CHECK(vc_locate(&r, &l.b, NULL) == VC_LOC_DISCARDED);
+	CHECK(vc_locate(&r, &l.a, NULL) == VC_LOC_UNKNOWN);
+	CHECK_EQ(r.segs[seg].n, 0);
 	check_snap(&r.ctx, &l.d, &sd);
 	CHECK(log_from(&r, &l.d, 0, &acc) == VC_ERR_SEVERED && acc.n == 2);
 	CHECK(vc_segment_attach(&r, seg) == VC_ERR_SEVERED);
@@ -918,6 +921,55 @@ test_window_scaling(void)
 	printf("%-44s", "");
 }
 
+/*
+ * The saved repo is the size of what it holds: commits cut and discarded
+ * leave nothing in it.  Reopened, the commit just past the oldest kept one
+ * is still known as discarded, read from the kept commit itself.
+ */
+static void
+test_state_does_not_grow_with_history(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		state,
+				head,
+				edge;
+	size_t		len10 = 0,
+				len = 0;
+	uint32_t	seg;
+	LogAcc		acc;
+
+	setup(&r, cs);
+	CHECK(vc_window_track(&r, 5) == VC_OK);
+	for (int i = 1; i <= 200; i++)
+	{
+		commit_rows(&r, (uint64_t) i, (uint64_t) i + 1, (uint64_t) i, "step");
+		CHECK(vc_sever(&r, &(VcWindow) {5, NULL, 0}, &seg) == VC_OK);
+		if (seg != VC_NO_SEGMENT)
+			CHECK(vc_segment_discard(&r, seg) == VC_OK);
+		state = vc_repo_save(&r);
+		CHECK(cs_get(cs, &state, &len) != NULL);
+		if (i == 10)
+			len10 = len;
+	}
+	CHECK(len10 > 0);
+	/* a varint or two per commit held grows a byte as the clock moves on */
+	CHECK_LE(len, len10 + 16);
+	head = vc_head(&r)->head;
+	CHECK(log_from(&r, &head, 0, &acc) == VC_ERR_SEVERED && acc.n == 5);
+	edge = r.ctx.err_hash;
+	CHECK(vc_locate(&r, &edge, NULL) == VC_LOC_DISCARDED);
+	vc_repo_free(&r);
+
+	CHECK(vc_repo_open(&r, cs, &small_policy, &state) == VC_OK);
+	CHECK_EQ(r.nsegs, 0);
+	CHECK(vc_locate(&r, &edge, NULL) == VC_LOC_DISCARDED);
+	CHECK(vc_window_verify(&r));
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 int
 main(void)
 {
@@ -925,6 +977,7 @@ main(void)
 	RUN(test_export_self_contained);
 	RUN(test_second_export_copies_diff);
 	RUN(test_discard_frees_exactly);
+	RUN(test_state_does_not_grow_with_history);
 	RUN(test_branches_cut_at_shared_ancestor);
 	RUN(test_stale_branch_head_stays);
 	RUN(test_merge_commit_parents_across_edge);

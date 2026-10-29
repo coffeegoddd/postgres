@@ -753,6 +753,7 @@ repo_init_empty(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 	phmap_init(&r->brmap);
 	phmap_init(&r->imgmap);
 	phmap_init(&r->cover);
+	phmap_init(&r->cut);
 	r->name = px_memdup("", 1);
 }
 
@@ -796,6 +797,7 @@ vc_repo_free(VcRepo *r)
 	}
 	free(r->segs);
 	phmap_free(&r->loc);
+	phmap_free(&r->cut);
 	phmap_free(&r->hint);
 	for (size_t i = 0; i < r->nhints; i++)
 		free(r->hints[i]);
@@ -1115,6 +1117,8 @@ vc_repo_save(VcRepo *r)
 {
 	Buf			b = BUF_INIT;
 	PHash		h;
+	uint64_t   *newid,
+				nkeep = 0;
 
 	buf_append_byte(&b, CHUNK_TAG_REPO);
 	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
@@ -1135,18 +1139,33 @@ vc_repo_save(VcRepo *r)
 		buf_append_byte(&b, br->merging);
 		put_hash(&b, &br->merge_head);
 	}
+	/*
+	 * Only segments still holding or naming something are saved, renumbered;
+	 * a location in any other is a commit back in the window.
+	 */
+	newid = px_malloc((r->nsegs ? r->nsegs : 1) * sizeof(uint64_t));
+	for (size_t i = 0; i < r->nsegs; i++)
+		newid[i] = r->segs[i].state == VC_SEG_LOCAL || r->segs[i].state == VC_SEG_EXPORTED ?
+			nkeep++ : UINT64_MAX;
 	buf_append_uvarint(&b, r->loc.n);
 	for (size_t i = 0; i < r->loc.cap; i++)
 		if (r->loc.used[i])
 		{
+			uint64_t	v = r->loc.vals[i];
+
+			if (v != LOC_WINDOW && v != LOC_BOUNDARY)
+				v = newid[v - LOC_SEG_BASE] == UINT64_MAX ? LOC_WINDOW :
+					LOC_SEG_BASE + newid[v - LOC_SEG_BASE];
 			put_hash(&b, &r->loc.keys[i]);
-			buf_append_uvarint(&b, r->loc.vals[i]);
+			buf_append_uvarint(&b, v);
 		}
-	buf_append_uvarint(&b, r->nsegs);
+	buf_append_uvarint(&b, nkeep);
 	for (size_t i = 0; i < r->nsegs; i++)
 	{
 		VcSegment  *sg = &r->segs[i];
 
+		if (newid[i] == UINT64_MAX)
+			continue;
 		buf_append_byte(&b, (uint8_t) sg->state);
 		buf_append_uvarint(&b, sg->n);
 		for (size_t j = 0; j < sg->n; j++)
@@ -1172,6 +1191,7 @@ vc_repo_save(VcRepo *r)
 	}
 	vc_must(&r->ctx, prolly_put_chunk(&r->ctx, b.data, b.len, &h));
 	buf_free(&b);
+	free(newid);
 	if (!r->has_state || !phash_eq(&r->state, &h))
 	{
 		cs_ref_root(r->ctx.cs, &h);
@@ -1761,6 +1781,20 @@ vc_segment_discard(VcRepo *r, uint32_t id)
 		cs_unref_root(seg->archive, &seg->manifest);
 	else
 		return VC_ERR;
+	/* forgotten: only what held commits name of them stays known */
+	for (size_t i = 0; i < seg->n; i++)
+	{
+		uint64_t   *v = phmap_find(&r->loc, &seg->commits[i]);
+
+		if (v && *v == LOC_SEG_BASE + id)
+			phmap_remove(&r->loc, &seg->commits[i]);
+	}
+	free(seg->commits);
+	seg->commits = NULL;
+	seg->n = 0;
+	free(seg->archive_name);
+	seg->archive_name = NULL;
+	r->cut_valid = false;
 	seg->state = VC_SEG_DISCARDED;
 	seg->archive = NULL;
 	return VC_OK;
@@ -1806,6 +1840,51 @@ vc_segment_attach(VcRepo *r, uint32_t id)
 	return VC_OK;
 }
 
+/*
+ * Whether h is a parent of a commit held here that the repo does not
+ * otherwise know: a commit discarded at the edge of what is kept.  Read
+ * from the held commits themselves, so nothing is saved for it.
+ */
+static bool
+cut_known(VcRepo *r, const PHash *h)
+{
+	if (!r->cut_valid)
+	{
+		phmap_free(&r->cut);
+		phmap_init(&r->cut);
+		for (size_t i = 0; i < r->loc.cap; i++)
+		{
+			VcCommit	c;
+			uint64_t	v;
+
+			if (!r->loc.used[i])
+				continue;
+			v = r->loc.vals[i];
+			if (v != LOC_WINDOW &&
+				(v == LOC_BOUNDARY || r->segs[v - LOC_SEG_BASE].state != VC_SEG_LOCAL))
+				continue;
+			if (!vc_commit_load(&r->ctx, &r->loc.keys[i], &c))
+				continue;
+			for (uint32_t j = 0; j < c.nparents; j++)
+				if (!phmap_find(&r->loc, &c.parents[j]))
+				{
+					bool		created;
+
+					phmap_ref(&r->cut, &c.parents[j], &created);
+				}
+		}
+		r->cut_valid = true;
+	}
+	return phmap_find(&r->cut, h) != NULL;
+}
+
+/* Known here: anywhere in the repo's history, or cut at its edge. */
+static bool
+knows(VcRepo *r, const PHash *h)
+{
+	return phmap_find(&r->loc, h) != NULL || cut_known(r, h);
+}
+
 VcLocation
 vc_locate(VcRepo *r, const PHash *h, uint32_t *seg)
 {
@@ -1813,7 +1892,7 @@ vc_locate(VcRepo *r, const PHash *h, uint32_t *seg)
 	uint64_t	id;
 
 	if (v == NULL)
-		return VC_LOC_UNKNOWN;
+		return cut_known(r, h) ? VC_LOC_DISCARDED : VC_LOC_UNKNOWN;
 	if (*v == LOC_WINDOW)
 		return VC_LOC_WINDOW;
 	if (*v == LOC_BOUNDARY)
@@ -2073,7 +2152,7 @@ plan_walk(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 		uint64_t   *v;
 		VcCommit	c;
 
-		if (phmap_find(&dst->loc, &h))
+		if (knows(dst, &h))
 		{
 			p->connected = true;
 			continue;
@@ -2107,7 +2186,7 @@ plan_walk(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 				stack[n] = c.parents[i];
 				sbound[n++] = b;
 			}
-			else if (!phmap_find(&dst->loc, &c.parents[i]))
+			else if (!knows(dst, &c.parents[i]))
 				plan_bound(p, &c.parents[i], src->name);
 		}
 	}
