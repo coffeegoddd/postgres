@@ -318,6 +318,56 @@ makes its own cluster.
    initial privileges are not yet filtered; publications and subscriptions
    on versioned schemas are untried.
 
+### Experiment D: a custom WAL resource manager (`contrib/prolly_wal`)
+
+On stock Postgres (`shared_preload_libraries`, the experimental resource
+manager id): chunks are content-addressed files under `pg_prolly/chunks`,
+each written after its WAL record, and a root (a name and a chunk hash)
+moves exactly when the SQL transaction that set it commits.  `set_root`
+logs the change and locks the name until the transaction ends; before the
+commit record a pending file names the roots, durably; after it the
+roots are written and the pending file goes; on abort it goes too.  At
+the end of recovery, committed transactions' pending roots are applied and
+the rest dropped.  `spike/crash_test.sh` makes its own cluster.
+
+**What works:**
+- a root and the rows of the same transaction move together: committed,
+  both survive a crash; rolled back, neither appears;
+- a crash after the commit record but before the root's file: recovery
+  applies the root, and the row is there;
+- a crash with the transaction open: neither root nor row;
+- a checkpoint between `set_root` and the commit, then a crash: the root
+  still moves (the pending file is durable before the commit record, so it
+  does not depend on WAL the checkpoint lets go);
+- chunks committed, a checkpoint, a crash: the chunks are there;
+- a subtransaction rolled back takes back its root; two transactions on
+  one root move it in commit order (the second waits for the first).
+
+**What stock Postgres does not give:**
+1. **No checkpoint callback** for a custom resource manager.  Nothing
+   flushes the chunk files before a checkpoint lets their WAL go, so each
+   transaction fsyncs the files it wrote, and the pending file, before it
+   commits.  Either a checkpoint hook (a patch) lets them be flushed at
+   checkpoints, as relation files are, or the chunks live in relation
+   pages under the buffer manager, which checkpoints and replicates them
+   with no hook.
+2. **No commit in redo.**  A custom resource manager sees its own records,
+   not the commit records, so a standby cannot move a root when the
+   transaction's commit replays: roots apply at the end of recovery
+   (promotion) only.  Roots kept as rows of a table would move with the
+   commit on a standby as everywhere else, with nothing custom; or a hook
+   on transaction redo (a patch).
+3. **`pg_waldump` cannot describe the records** (`custom128 ... desc:
+   UNKNOWN`): a frontend tool cannot load the extension's code.
+4. A production resource manager needs its own id, registered with the
+   project, in place of the experimental one.
+
+**What this suggests:** roots as rows of a table (transactional, MVCC,
+replicated, nothing custom); chunks in relation pages through the buffer
+manager (checkpoints and standbys for free), with a custom resource
+manager only where its records are smaller than page images, or where
+logical decoding needs to read them.
+
 ### Patches so far
 
 | Patch | Feature | Status |
@@ -326,6 +376,8 @@ makes its own cluster.
 | a relation-for-file hook in decoding | logical decoding of branch files | needed for B |
 | per-branch file fields (relpages, reltuples, relallvisible, relfrozenxid, relminmxid) and the freeze horizon | VACUUM, ANALYZE, wraparound safety per branch | needed for B; A needs the horizon part |
 | `pg_namespace.nspbranch`, branch-aware name lookup, the catalog filter, `catalog_branch`, branch-scoped decoding (`spike/catalog_branch.patch`) | catalogs branched by row | spike; makes the two above unnecessary |
+| a checkpoint callback for custom resource managers | chunk files flushed at checkpoints, not at each commit | only if chunks stay outside the buffer manager |
+| a transaction-redo hook | roots moving at commit on a standby | only if roots are not rows of a table |
 
 ## Order
 

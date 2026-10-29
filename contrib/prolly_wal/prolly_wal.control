@@ -1,0 +1,6 @@
+# prolly_wal extension
+comment = 'a chunk store and roots logged through a custom WAL resource manager (a spike)'
+default_version = '1.0'
+module_pathname = '$libdir/prolly_wal'
+relocatable = false
+schema = prolly_wal
