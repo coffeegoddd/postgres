@@ -447,14 +447,16 @@ At 20,000 chunks the proportions are the same.
   call per chunk); a reader in C inside the backend would narrow the gap
   to `dirstore`, unmeasured.
 
-**Decided (2026-10-29): the history store is `dirstore`**, modeled on
-Dolt's proven store (its chunk journal, table files and garbage
-collection).  It is the fastest store at every operation measured.  What
-it brings to build, as Dolt has them: the root of record kept with the SQL
-commit (the journal design in *Crash safety and backups*), its own
-backups, and replicas of the store for standbys.  Rows of a table and
-pages of our own layout stay behind the `ChunkStore` interface as
-measured alternatives, not the design.
+**Decided (2026-10-29): the history store is pages of our own layout,
+inside Postgres** (`contrib/prolly_chunkpages`).  `dirstore` was briefly
+chosen, for its speed; but a store outside Postgres needs its own way to
+reach standbys in step with the commits that name its chunks (its writes
+logged a second time through a custom resource manager, or shipped after
+each commit, or no standbys for history), where a store inside Postgres
+gets standbys, base backups, point-in-time recovery and decoding with the
+rest of the database.  Within Postgres, our own pages beat table rows on
+disk, reads and discard.  `dirstore` and table rows stay behind the
+`ChunkStore` interface as measured alternatives.
 
 ### Patches so far
 
@@ -499,8 +501,8 @@ the run fails at once (`make branch-check`).
 | Identity and generated columns | holds | |
 | Unlogged and temporary tables, large objects, replication, history security, statistics | holds | built against branched catalogs |
 | Keyframes: replay or restore, the planner, frozen keyframes | holds, narrower | branch switches need no keyframe; they serve resets and checkouts to older commits, and making a branch from a commit; the keyframe manager waits on that narrower use |
-| The chunk store on disk (`dirstore`) | holds (decided) | the history store, modeled on Dolt's; experiment F measured it fastest at everything |
-| Crash safety and backups of the store | holds | the store's own journal, root of record with the SQL commit, and backup suite, as built; standby replicas of the store still to design |
+| The chunk store on disk (`dirstore`) | superseded (decided) | the history store is pages of our own layout inside Postgres (experiment F); `dirstore` stays behind the `ChunkStore` interface, the fastest measured alternative |
+| Crash safety and backups of the store | superseded | inside Postgres, its WAL, crash recovery, standbys, base backups and point-in-time recovery cover the store; `dirstore`'s journal and backup suite test `dirstore` only |
 | Concurrent branches: copy-on-write working sets | changed | concurrent branches come from branched catalogs, with each branch's files copied whole when it is made; copy-on-write remains the way to make branch creation and reset O(1) (it needs relation files that share pages, below the catalog) |
 | Constant-time branch, reset and release | open | needs copy-on-write files; not built |
 | Experiment A (catalog swap) and B (`relation_locator_hook`) | superseded by C | the hook is still in the tree (`relcache.c`), unused by the design; to be removed with the next core patch set |
