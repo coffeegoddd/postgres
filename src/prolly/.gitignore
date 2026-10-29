@@ -7,3 +7,4 @@
 /bench/winbench
 /bench/branchbench
 /test/test_dirstore
+/bench/diskbench

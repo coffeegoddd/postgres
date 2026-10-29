@@ -240,6 +240,10 @@ What it proved, against a real Postgres where it matters:
   Restoring pages exactly also needs logged hints, a checkpoint at the base
   point, and a flushed WAL (`bench/lp_dead_repro.sql`).
 
+- **Severed history really leaves the disk.**  Immutable chunk files and
+  compaction keep disk at the live size while history grows (1.8 GB
+  without compaction vs 196 MB with it, over 200 commits).
+
 What it left open:
 
 - **Concurrent SQL on different branches** needs a working set per branch;
@@ -255,6 +259,54 @@ What it left open:
   transaction rates.
 - **BranchBench**, which needs the generic codec and DDL, and per-branch
   working sets for its multi-agent scenarios.
+
+## The chunk store on disk
+
+`dirstore` keeps every chunk in a directory of **immutable chunk files**
+plus a `MANIFEST`.
+
+| File | Contents | How it changes |
+|---|---|---|
+| `c-<id>.chunks` | records (u32 length, 20-byte hash, the chunk's bytes), then an index sorted by hash (hash, offset, length), then a footer (magic, format, count, index offset, hash of the index) | written whole to a temporary name, fsynced, renamed into place; never modified |
+| `MANIFEST` | format, next file id, the live chunk files, the durable root set (hash, hold count), the repo-state root, and a hash of it all | replaced whole by rename |
+
+- **Writes** collect in memory and a flush writes them as a new file, then a
+  new manifest.  Work not yet flushed is lost in a crash; in the real
+  system the WAL covers it.
+- **Opening** loads each file's index, deletes files the manifest does not
+  name (crash leftovers), and rebuilds reference counts by walking from the
+  roots; anything unreachable is dead.  That walk is O(live chunks): fine
+  here, while at terabyte scale the counts would be persisted.
+- **Repo state** (branches, commit locations, segments, hints, image holds,
+  window tracking) is itself a chunk the manifest names (`vc_repo_save`,
+  `vc_repo_open`).
+- **Garbage collection is compaction:** the live chunks of files with
+  enough dead space, and of small files, are copied into new files, a
+  manifest without the old files is installed, then the old files are
+  deleted.  Only then does disk space come back.
+- **Proven by tests** (`test/test_dirstore.c`): round trips through
+  reopening; chunk files unchanged byte for byte (and in mtime) across
+  puts, flushes, frees and compaction; corruption detected; repo state
+  saved and reopened; a crash at every point of flush and compaction
+  recovered from, with no stray files left.
+
+**Severing gives disk back.**  `bench/diskbench`: 1M rows, 4 KB chunks, 200
+commits of 2,000 random updates, a 20-commit window, history severed
+behind it every commit.
+
+| Commits | Disk, no compaction | Disk, compaction every 20 (discard) | Disk, compaction every 20 (export) | Live bytes |
+|---|---|---|---|---|
+| 20 | 206 MB | 206 MB | 206 MB | 195 MB |
+| 60 | 565 MB | 196 MB | 196 MB | 194 MB |
+| 100 | 924 MB | 196 MB | 196 MB | 194 MB |
+| 200 | 1,824 MB | 196 MB | 196 MB | 194 MB |
+
+Without compaction disk grows ~9 MB per commit, keeping every byte ever
+written; with it, disk stays at the live size (~1% overhead) however long
+history gets.  Exporting behaves the same locally, with the severed
+history (1.6 GB) in the archive.  Compaction copied 1.18 bytes per byte it
+gave back (1.5 s in all): random updates spread dead space through every
+file; grouping chunks by age would lower that.
 
 ## Evidence so far
 
