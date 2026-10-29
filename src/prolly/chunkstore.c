@@ -152,7 +152,11 @@ must_meta(ChunkStore *cs, const PHash *h)
 void
 cs_ref_root(ChunkStore *cs, const PHash *h)
 {
-	must_meta(cs, h)->roots++;
+	ChunkMeta  *m = must_meta(cs, h);
+
+	m->roots++;
+	if (cs->ops->note_root)
+		cs->ops->note_root(cs, h, m->roots);
 }
 
 void
@@ -164,7 +168,10 @@ cs_unref_root(ChunkStore *cs, const PHash *h)
 		return;					/* already damaged: nothing to release */
 	if (m->roots == 0)
 		abort();
-	if (--m->roots == 0 && is_dead(m))
+	--m->roots;
+	if (cs->ops->note_root)
+		cs->ops->note_root(cs, h, m->roots);
+	if (m->roots == 0 && is_dead(m))
 		free_cascade(cs, h);
 }
 

@@ -193,6 +193,8 @@ typedef struct VcRepo
 	PHash	   *pending;		/* commits whose cover fell to 0, or entered */
 	size_t		npending;
 	size_t		pendcap;
+	bool		has_state;		/* the last saved state chunk, held */
+	PHash		state;
 } VcRepo;
 
 typedef void (*VcLogFn) (void *arg, const VcCommit *c);
@@ -231,6 +233,20 @@ extern int	vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b,
 
 /* Repositories and branches. */
 extern void vc_repo_init(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy);
+
+/*
+ * Saving and reopening.  vc_repo_save writes the repo's state (branches,
+ * commit locations, segments, hints, image holds, window tracking) as a
+ * chunk, holds it in place of the previous one, and returns its hash; a
+ * durable store records that hash with its roots.  vc_repo_open rebuilds a
+ * repo from it, on a store whose holds are already in place (a reopened
+ * store rebuilds them from its roots).  An exported segment's archive must
+ * be given again with vc_segment_set_archive.
+ */
+extern PHash vc_repo_save(VcRepo *r);
+extern int	vc_repo_open(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy,
+						 const PHash *state);
+extern void vc_segment_set_archive(VcRepo *r, uint32_t seg, ChunkStore *archive);
 extern void vc_repo_free(VcRepo *r);
 extern VcBranch *vc_branch_find(VcRepo *r, const char *name);
 extern VcBranch *vc_head(VcRepo *r);

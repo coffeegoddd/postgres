@@ -184,7 +184,7 @@ mem_destroy(ChunkStore *cs)
 
 static const ChunkStoreOps mem_ops = {
 	mem_get, mem_put, mem_has, mem_meta, mem_del, mem_foreach,
-	mem_count, mem_bytes, mem_destroy
+	mem_count, mem_bytes, mem_destroy, NULL
 };
 
 ChunkStore *

@@ -243,6 +243,8 @@ chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 			return true;
 		case CHUNK_TAG_IMAGE:
 			return image_refs(data, len, fn, arg);
+		case CHUNK_TAG_REPO:
+			return true;
 		default:
 			return false;
 	}

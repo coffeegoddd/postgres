@@ -30,6 +30,9 @@
  *			byte, [base image hash (weak)], uvarint lsn, uvarint snapshot xmin,
  *			uvarint xmax, uvarint nxip, uvarint xip..., page map root (strong),
  *			relation map root (strong)
+ * Repo state: tag, version, then a repo's branches, commit locations,
+ *			segments, hints and image holds (see vc_repo_save).  It names no
+ *			chunk strongly: what it lists is held by the store's roots.
  */
 #ifndef CHUNKFMT_H
 #define CHUNKFMT_H
@@ -43,6 +46,7 @@
 #define CHUNK_TAG_MANIFEST 0x4d
 #define CHUNK_TAG_PAGE 0x47
 #define CHUNK_TAG_IMAGE 0x49
+#define CHUNK_TAG_REPO 0x52
 
 /*
  * Covers the encodings and the chunk boundary function; anything that

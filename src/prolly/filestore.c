@@ -220,7 +220,7 @@ fs_destroy(ChunkStore *cs)
 
 static const ChunkStoreOps file_ops = {
 	fs_get, fs_put, fs_has, fs_meta, fs_del, fs_foreach,
-	fs_count, fs_bytes, fs_destroy
+	fs_count, fs_bytes, fs_destroy, NULL
 };
 
 /* Creates a store backed by a new file at path (replacing any file there). */

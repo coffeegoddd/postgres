@@ -1093,6 +1093,254 @@ vc_log(VcRepo *r, const PHash *start, size_t max, unsigned flags,
 	return VC_OK;
 }
 
+/* ------------------------------------------------------- saving and opening */
+
+static void
+put_hash(Buf *b, const PHash *h)
+{
+	buf_append(b, h->b, PHASH_LEN);
+}
+
+static void
+put_str(Buf *b, const char *s)
+{
+	size_t		n = s ? strlen(s) : 0;
+
+	buf_append_uvarint(b, n);
+	buf_append(b, s, n);
+}
+
+PHash
+vc_repo_save(VcRepo *r)
+{
+	Buf			b = BUF_INIT;
+	PHash		h;
+
+	buf_append_byte(&b, CHUNK_TAG_REPO);
+	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
+	put_str(&b, r->name);
+	buf_append_uvarint(&b, r->clock);
+	buf_append_uvarint(&b, r->window_depth);
+	buf_append_uvarint(&b, r->track_depth);
+	buf_append_uvarint(&b, r->cur);
+	buf_append_uvarint(&b, r->nbr);
+	for (size_t i = 0; i < r->nbr; i++)
+	{
+		VcBranch   *br = &r->br[i];
+
+		put_str(&b, br->name);
+		put_hash(&b, &br->head);
+		put_hash(&b, &br->head_root);
+		put_hash(&b, &br->working);
+		buf_append_byte(&b, br->merging);
+		put_hash(&b, &br->merge_head);
+	}
+	buf_append_uvarint(&b, r->loc.n);
+	for (size_t i = 0; i < r->loc.cap; i++)
+		if (r->loc.used[i])
+		{
+			put_hash(&b, &r->loc.keys[i]);
+			buf_append_uvarint(&b, r->loc.vals[i]);
+		}
+	buf_append_uvarint(&b, r->nsegs);
+	for (size_t i = 0; i < r->nsegs; i++)
+	{
+		VcSegment  *sg = &r->segs[i];
+
+		buf_append_byte(&b, (uint8_t) sg->state);
+		buf_append_uvarint(&b, sg->n);
+		for (size_t j = 0; j < sg->n; j++)
+			put_hash(&b, &sg->commits[j]);
+		put_str(&b, sg->archive_name);
+		put_hash(&b, &sg->manifest);
+	}
+	buf_append_uvarint(&b, r->nhints);
+	for (size_t i = 0; i < r->nhints; i++)
+		put_str(&b, r->hints[i]);
+	buf_append_uvarint(&b, r->hint.n);
+	for (size_t i = 0; i < r->hint.cap; i++)
+		if (r->hint.used[i])
+		{
+			put_hash(&b, &r->hint.keys[i]);
+			buf_append_uvarint(&b, r->hint.vals[i]);
+		}
+	buf_append_uvarint(&b, r->nimg);
+	for (size_t i = 0; i < r->nimg; i++)
+	{
+		put_hash(&b, &r->img_commit[i]);
+		put_hash(&b, &r->img_hash[i]);
+	}
+	vc_must(&r->ctx, prolly_put_chunk(&r->ctx, b.data, b.len, &h));
+	buf_free(&b);
+	if (!r->has_state || !phash_eq(&r->state, &h))
+	{
+		cs_ref_root(r->ctx.cs, &h);
+		if (r->has_state)
+			cs_unref_root(r->ctx.cs, &r->state);
+	}
+	r->state = h;
+	r->has_state = true;
+	prolly_release_pins(&r->ctx);
+	return h;
+}
+
+typedef struct Reader
+{
+	const uint8_t *p,
+			   *end;
+	bool		ok;
+} Reader;
+
+static uint64_t
+rd_uv(Reader *rd)
+{
+	uint64_t	v = 0;
+
+	if (rd->ok && !read_uvarint(&rd->p, rd->end, &v))
+		rd->ok = false;
+	return v;
+}
+
+static PHash
+rd_hash(Reader *rd)
+{
+	PHash		h = {{0}};
+
+	if (rd->ok && rd->end - rd->p >= PHASH_LEN)
+	{
+		memcpy(h.b, rd->p, PHASH_LEN);
+		rd->p += PHASH_LEN;
+	}
+	else
+		rd->ok = false;
+	return h;
+}
+
+static char *
+rd_str(Reader *rd)
+{
+	uint64_t	n = rd_uv(rd);
+	char	   *s;
+
+	if (!rd->ok || n > (uint64_t) (rd->end - rd->p))
+	{
+		rd->ok = false;
+		return px_memdup("", 1);
+	}
+	s = px_malloc(n + 1);
+	memcpy(s, rd->p, n);
+	s[n] = '\0';
+	rd->p += n;
+	return s;
+}
+
+int
+vc_repo_open(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy, const PHash *state)
+{
+	size_t		len;
+	const uint8_t *d = cs_get(cs, state, &len);
+	Reader		rd;
+	uint64_t	n,
+				track;
+
+	repo_init_empty(r, cs, policy);
+	if (d == NULL || len < 2 || d[0] != CHUNK_TAG_REPO || d[1] != CHUNK_FORMAT_VERSION)
+		return VC_ERR;
+	rd = (Reader) {d + 2, d + len, true};
+	free(r->name);
+	r->name = rd_str(&rd);
+	r->clock = rd_uv(&rd);
+	r->window_depth = (uint32_t) rd_uv(&rd);
+	track = rd_uv(&rd);
+	r->cur = rd_uv(&rd);
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		VcBranch   *b;
+		bool		created;
+		PHash		k;
+
+		px_grow((void **) &r->br, &r->cap, r->nbr + 1, sizeof(VcBranch));
+		b = &r->br[r->nbr];
+		memset(b, 0, sizeof(*b));
+		b->name = rd_str(&rd);
+		b->head = rd_hash(&rd);
+		b->head_root = rd_hash(&rd);
+		b->working = rd_hash(&rd);
+		b->merging = rd.ok && rd.p < rd.end && *rd.p++ != 0;
+		b->merge_head = rd_hash(&rd);
+		k = name_key(b->name);
+		*phmap_ref(&r->brmap, &k, &created) = r->nbr;
+		r->nbr++;
+	}
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		PHash		h = rd_hash(&rd);
+
+		set_loc(r, &h, rd_uv(&rd));
+	}
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		VcSegment  *sg;
+
+		px_grow((void **) &r->segs, &r->segcap, r->nsegs + 1, sizeof(VcSegment));
+		sg = &r->segs[r->nsegs++];
+		memset(sg, 0, sizeof(*sg));
+		sg->state = (VcSegState) (rd.ok && rd.p < rd.end ? *rd.p++ : 0);
+		sg->n = rd_uv(&rd);
+		if (sg->n > len)
+			rd.ok = false;
+		sg->commits = px_malloc((rd.ok ? sg->n : 0) * sizeof(PHash) + 1);
+		for (size_t j = 0; j < sg->n && rd.ok; j++)
+			sg->commits[j] = rd_hash(&rd);
+		sg->archive_name = rd_str(&rd);
+		sg->manifest = rd_hash(&rd);
+	}
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		px_grow((void **) &r->hints, &r->hintcap, r->nhints + 1, sizeof(char *));
+		r->hints[r->nhints++] = rd_str(&rd);
+	}
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		PHash		h = rd_hash(&rd);
+		bool		created;
+
+		*phmap_ref(&r->hint, &h, &created) = rd_uv(&rd);
+	}
+	n = rd_uv(&rd);
+	for (uint64_t i = 0; i < n && rd.ok; i++)
+	{
+		bool		created;
+
+		px_grow((void **) &r->img_commit, &r->imgcap, r->nimg + 1, sizeof(PHash));
+		r->img_hash = px_realloc(r->img_hash, r->imgcap * sizeof(PHash));
+		r->img_commit[r->nimg] = rd_hash(&rd);
+		r->img_hash[r->nimg] = rd_hash(&rd);
+		*phmap_ref(&r->imgmap, &r->img_commit[r->nimg], &created) = r->nimg;
+		r->nimg++;
+	}
+	if (!rd.ok || rd.p != rd.end || r->nbr == 0 || r->cur >= r->nbr)
+		return VC_ERR;
+	r->state = *state;
+	r->has_state = true;
+	/* holds are already in place; the window's counts are derived */
+	if (track)
+		vc_window_track(r, (uint32_t) track);
+	return VC_OK;
+}
+
+void
+vc_segment_set_archive(VcRepo *r, uint32_t seg, ChunkStore *archive)
+{
+	if (seg < r->nsegs)
+		r->segs[seg].archive = archive;
+}
+
 /* ---------------------------------------------------------- commit images */
 
 static ssize_t

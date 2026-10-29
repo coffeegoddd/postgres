@@ -70,6 +70,8 @@ typedef struct ChunkStoreOps
 	size_t		(*count) (ChunkStore *cs);
 	uint64_t	(*bytes) (ChunkStore *cs);
 	void		(*destroy) (ChunkStore *cs);
+	/* Optional: told each time a chunk's durable root count changes. */
+	void		(*note_root) (ChunkStore *cs, const PHash *h, uint64_t roots);
 } ChunkStoreOps;
 
 struct ChunkStore
@@ -157,5 +159,45 @@ extern ChunkStore *memstore_create(void);
  */
 extern ChunkStore *filestore_create(const char *path);
 extern uint64_t filestore_file_bytes(ChunkStore *cs);
+
+/*
+ * Durable backend: a directory of immutable chunk files plus a MANIFEST
+ * (see dirstore.c for the format).  Chunks are written by dirstore_flush
+ * as new files; dirstore_compact (garbage collection) copies the live
+ * chunks of files with at least min_dead_fraction dead space, and of small
+ * files, into new files, installs a manifest without the old ones and
+ * deletes them.  Reference counts are rebuilt on open from the manifest's
+ * roots.  cs_destroy flushes; dirstore_crash lets go without writing.
+ * Flush and compaction invalidate bytes previously returned by get.
+ */
+#define DS_CRASHED (-30)			/* stopped at a failpoint */
+#define DS_FP_FLUSH_BEFORE_RENAME 1
+#define DS_FP_FLUSH_BEFORE_MANIFEST 2
+#define DS_FP_COMPACT_BEFORE_RENAME 3
+#define DS_FP_COMPACT_BEFORE_MANIFEST 4
+#define DS_FP_COMPACT_BEFORE_UNLINK 5
+
+typedef struct DirCompactStats
+{
+	uint64_t	files_before,
+				files_after;
+	uint64_t	disk_before,
+				disk_after;		/* bytes allocated on disk */
+	uint64_t	chunks_copied,
+				bytes_copied;
+} DirCompactStats;
+
+extern ChunkStore *dirstore_open(const char *dir, char *err, size_t errlen);
+extern int	dirstore_flush(ChunkStore *cs);
+extern int	dirstore_compact(ChunkStore *cs, double min_dead_fraction,
+							 DirCompactStats *stats);
+extern uint64_t dirstore_disk_bytes(ChunkStore *cs);
+extern size_t dirstore_file_count(ChunkStore *cs);
+extern void dirstore_set_state(ChunkStore *cs, const PHash *state);
+extern bool dirstore_get_state(ChunkStore *cs, PHash *state);
+extern void dirstore_set_failpoint(ChunkStore *cs, int failpoint);
+extern void dirstore_set_file_target(ChunkStore *cs, size_t bytes);
+extern void dirstore_crash(ChunkStore *cs);
+extern bool dirstore_verify(ChunkStore *cs, PHash *bad);
 
 #endif							/* CHUNKSTORE_H */
