@@ -8,3 +8,4 @@
 /bench/branchbench
 /test/test_dirstore
 /bench/diskbench
+/bench/rebuild

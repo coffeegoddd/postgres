@@ -347,6 +347,119 @@ Worth taking from it:
 
 Neither changes the design; both are for the real implementation.
 
+## Rebuilding Postgres from the prolly tree
+
+The question: does a commit hold everything Postgres needs to work, with
+every kind of index?  Indexes are not stored in the tree.  Postgres builds
+them from rows plus their definitions, so a commit must reproduce two
+things exactly: every row, and the whole schema.  Then every index Postgres
+builds from them must behave as the original did.
+
+**What a commit holds** (the logical working set, `bench/rebuild.c`, behind
+a `WorkingSetOps` so that another codec can replace it):
+
+| Root value entry | Schema chunk | Data |
+|---|---|---|
+| `~pre` | pg_dump's pre-data section of the schema: types, domains, collations, functions, tables, sequences, partitions, identity, defaults, validated checks | none |
+| `~post` | pg_dump's post-data section: indexes, PK/unique/exclusion/FK constraints, NOT VALID checks, triggers, policies, CLUSTER ON, statistics objects, the REFRESH of populated materialized views | none |
+| `~seq` | none | sequence → (last_value, is_called) |
+| each table holding rows (leaf partitions included) | the codec layout: key column count, column list | COPY text rows keyed by the primary key's fields; without a primary key, the whole row → its count |
+
+Rows are stored as COPY text under fixed session settings (ISO dates, UTC,
+shortest exact floats, hex bytea), so they are portable across Postgres
+versions and keep NULL distinct from the string `\N`.  Generated columns
+(stored and virtual) are not stored, because Postgres computes them again.
+Extensions live outside the schema (the unit of version control), so every
+database has them installed before a rebuild.
+
+**Rebuild** into an empty database (extensions only): run `~pre`, COPY every
+table, restore sequence positions, run `~post` (indexes are built here,
+constraints validated, materialized views refreshed), then VACUUM ANALYZE.
+
+**The test** (`make rebuild-check`, against the running server):
+
+1. Four commits are made from the fixture in `bench/rebuild_fixture/`: a
+   load, then row changes, then DDL changes, then rows again.  Each is
+   captured into a repo in a durable `dirstore`.
+2. The store is closed and reopened, and every commit in the log is rebuilt
+   from the store alone.
+3. Each rebuild must:
+   - **capture back to the same root value.**  Root values are history
+     independent, so this proves the schema dump and every row of every
+     table are identical.
+   - **pass amcheck:** `verify_heapam` with TOAST on every heap, and
+     `bt_index_parent_check` (heapallindexed, rootdescend, checkunique) on
+     every B-tree.  `gin_index_check` runs on every GIN index.
+   - **answer the checks** in `checks.txt` as the source answered at that
+     commit:
+     - 63 queries, each answered through a named index.  The table's other
+       indexes are hidden from the planner inside a rolled-back
+       transaction, and the plan must use the named index.  The source
+       answers with index scans off, so the index's answer is compared with
+       the heap's.
+     - 9 queries on sequences, views, the materialized view, generated
+       columns and TOASTed values.
+     - 17 statements each constraint must reject with its SQLSTATE: unique,
+       primary key, exclusion, FK, check, NOT VALID check, domain, partition
+       bound, not-null, identity.
+4. Across the rebuilds, every index amcheck cannot verify (hash, GiST,
+   SP-GiST, BRIN, bloom) must answer at least one query, and every query
+   must return rows at some commit.
+5. Four deliberate faults must each be caught (`--break`):
+   - a lost row;
+   - unrestored sequences;
+   - matviews left unpopulated;
+   - planning with every index visible.
+
+**Result:** all four commits rebuild to the same root value, and every check
+passes.  A rebuild takes about 5 s on the fixture: 49–51k rows in 18–19
+tables, a 55 MB store.
+
+| Covered in the fixture | |
+|---|---|
+| Index methods (first commit) | 26 btree, 13 GiST, 11 GIN, 8 BRIN, 6 SP-GiST, 3 hash, 1 bloom; 8 partitioned parent indexes |
+| B-tree | composite primary keys, DESC NULLS FIRST, INCLUDE (covering), partial, expression (through a schema function), `text_pattern_ops`, composite-type field, fillfactor and deduplicate_items off, on a nondeterministic ICU collation (NULLS NOT DISTINCT), deferrable, on a matview |
+| GIN | `jsonb_ops`, `jsonb_path_ops`, arrays, tsvector, `pg_trgm`, hstore, btree_gin over int8 and an enum, partitioned |
+| GiST | point, box, polygon, circle, range, multirange, tsvector, `pg_trgm`, cube, inet, btree_gist multicolumn, two exclusion constraints, KNN ordering |
+| SP-GiST | quad and kd point, text radix, inet, range, box |
+| BRIN | minmax, minmax-multi, bloom, inclusion (inet and box), autosummarize, on every partition |
+| Types | every built-in scalar, NaN, ±Infinity, −0, infinite dates, timestamps and intervals, BC dates, empty and multi-dimensional arrays, arrays with non-1 lower bounds and NULLs, enums (with a value inserted between others), composite, domain, ranges, multiranges, geometric, text search, bit strings, money, pg_lsn, json with duplicate keys, hstore, cube, ICU collations, tabs, newlines, backslashes, `\N` and empty strings, 128–260 KB values (compressible and not, EXTERNAL storage) |
+| Tables | no primary key with duplicate and all-NULL rows, identity, stored and virtual generated columns, fast defaults (`ADD COLUMN … DEFAULT`), dropped and retyped columns, two-level range/hash partitions with a default partition, detach and attach, inheritance, unlogged, renamed, RLS, replica identity, comments, column statistics targets |
+| Sequences | serial, identity (custom start and increment), cycling (wrapped), never called |
+
+**Findings:**
+
+- **Materialized views:**
+  - `pg_dump --schema-only` drops the REFRESH of populated materialized
+    views, so a rebuild left them empty (error 55000 on read).  Post-data is
+    now dumped with data on; the section holds no rows.  `--break matview`
+    keeps the regression covered.
+  - Like any dump and restore, a rebuild refreshes a materialized view from
+    the current rows, so a source view left stale between refreshes comes
+    back fresh.  The view's contents are not versioned, only whether it is
+    populated.
+- **Indexes need nothing of their own.**  Every index, of every method,
+  rebuilt from rows plus its definition and gave the heap's answers.  This
+  holds at every commit, including after enum values were inserted between
+  others and after column drops and retypes.
+- **What the rows alone do not keep**, and Postgres does not need:
+  - physical layout: the heap is reloaded in key order, so ctids, page
+    contents, fill and correlation differ (BRIN stays correct, but its
+    pruning depends on that order);
+  - planner statistics, which are regenerated by ANALYZE;
+  - OIDs and relfilenodes.
+  None of these change any answer.
+- **Large values make large chunks.**  A row is one item, so a 260 KB value
+  is a 262 KB chunk, against the 16 KB target.  This is correct, but it
+  defeats structural sharing for big values: changing a byte rewrites the
+  whole chunk.  Dolt chunks large values into their own trees; the real
+  codec should too.
+- **Not covered:** large objects (not schema scoped); roles, grants to
+  other roles and tablespaces (cluster objects); extension versions;
+  publications, subscriptions, event triggers, foreign tables; `xml`
+  (this build has no libxml).  Indexes on virtual generated columns are
+  not supported by Postgres itself.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per
@@ -455,7 +568,9 @@ The prototype phase is concluded (see *Conclusions of the prototype*).  In
 the real implementation, in order:
 
 1. The lifecycle with the streaming decoder, a generic row codec and DDL
-   capture; explicit commits as of the barrier; the time-based window.
+   capture (the logical working set of `bench/rebuild.c` is the reference
+   to match, with large values in their own trees); explicit commits as of
+   the barrier; the time-based window.
 2. The **dolt tx commit** mode, asynchronous, measured at high transaction
    rates.
 3. Copy-on-write working sets (a page-store storage manager, a database

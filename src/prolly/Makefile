@@ -28,13 +28,28 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean
+.PHONY: all check clean rebuild-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
 bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -pthread
+
+# Rebuilding a schema, every index included, from the store (see bench/rebuild.c).
+bench/rebuild: bench/rebuild.c test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $< libprolly.a \
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
+
+# Against the running server: every commit of the fixture must rebuild, and
+# each deliberate fault must be caught.
+rebuild-check: bench/rebuild
+	./bench/rebuild
+	for b in row sequence matview nohide; do \
+		if ./bench/rebuild --steps 1 --break $$b >/dev/null 2>&1; then \
+			echo "rebuild: --break $$b went unnoticed"; exit 1; \
+		else echo "rebuild: --break $$b caught"; fi; \
+	done
 
 bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
