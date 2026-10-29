@@ -23,6 +23,10 @@
  * --keep-bytes, --keep-seconds (floors) and --max-commits, --max-bytes,
  * --max-seconds (ceilings) set a window instead; diffs then reach back at
  * most to the oldest commit held, and a merge base past the cut is -1.
+ * --low-commits, --low-bytes, --low-seconds set low marks: the window
+ * fills to the limits above and is then cut back to these (1 commit: a
+ * tumbling window); just after a cut, "recent" may lie past it, and its
+ * merge base is then -1 too.
  * --rewrite runs the repo in history mode REWRITE: each sever writes the
  * kept commits again, and the hook keeps this program's commit list on
  * their new hashes.  --chunk sets the chunk size: the
@@ -128,6 +132,7 @@ main(int argc, char **argv)
 		{"chunk", 1, 0, 'k'}, {"due", 0, 0, 'u'}, {"rewrite", 0, 0, 'W'},
 		{"keep-bytes", 1, 0, 'B'}, {"keep-seconds", 1, 0, 'S'},
 		{"max-commits", 1, 0, 'C'}, {"max-bytes", 1, 0, 'X'}, {"max-seconds", 1, 0, 'T'},
+		{"low-commits", 1, 0, 'L'}, {"low-bytes", 1, 0, 'Y'}, {"low-seconds", 1, 0, 'Z'},
 		{0, 0, 0, 0}
 	};
 	int			ch;
@@ -162,6 +167,9 @@ main(int argc, char **argv)
 			case 'C': win.max_commits = strtoull(optarg, NULL, 10); break;
 			case 'X': win.max_bytes = strtoull(optarg, NULL, 10); break;
 			case 'T': win.max_seconds = strtoull(optarg, NULL, 10); break;
+			case 'L': win.low_commits = strtoull(optarg, NULL, 10); break;
+			case 'Y': win.low_bytes = strtoull(optarg, NULL, 10); break;
+			case 'Z': win.low_seconds = strtoull(optarg, NULL, 10); break;
 			case 'd': base = optarg; break;
 			case 'k':
 				policy.target_bytes = (uint32_t) atoi(optarg);
@@ -172,7 +180,8 @@ main(int argc, char **argv)
 				fprintf(stderr, "deepbench [--rows N] [--commits N] [--changes N] [--save-every N]\n"
 						"          [--flush-every N] [--sever-every N] [--due] [--track] [--dir D]\n"
 						"          [--keep-bytes N] [--keep-seconds N] [--max-commits N]\n"
-						"          [--max-bytes N] [--max-seconds N] [--chunk BYTES]\n");
+						"          [--max-bytes N] [--max-seconds N] [--low-commits N]\n"
+						"          [--low-bytes N] [--low-seconds N] [--chunk BYTES] [--rewrite]\n");
 				return 2;
 		}
 	depth = (uint32_t) (ncommits + 100);
@@ -227,8 +236,9 @@ main(int argc, char **argv)
 
 	printf("# history mode %s\n", rewrite ? "REWRITE" : "KEEP");
 	printf("# window: keep_bytes %" PRIu64 " keep_seconds %" PRIu64 " max_commits %" PRIu64
-		   " max_bytes %" PRIu64 " max_seconds %" PRIu64 "%s\n", win.keep_bytes, win.keep_seconds,
-		   win.max_commits, win.max_bytes, win.max_seconds, policy_mode ? "" : " (all held)");
+		   " max_bytes %" PRIu64 " max_seconds %" PRIu64 " low %" PRIu64 "/%" PRIu64 "/%" PRIu64 "%s\n",
+		   win.keep_bytes, win.keep_seconds, win.max_commits, win.max_bytes, win.max_seconds,
+		   win.low_commits, win.low_bytes, win.low_seconds, policy_mode ? "" : " (all held)");
 	printf("# %" PRIu64 " rows, %u-byte chunks, %d changes per commit, save every %d, sever every %d%s, flush every %d\n",
 		   rows, policy.target_bytes, changes, save_every, track ? 1 : sever_every, track ? " (tracked)" : "",
 		   flush_every);
@@ -308,7 +318,10 @@ main(int argc, char **argv)
 			double		chg;
 			size_t		stlen = 0;
 
-			/* "recent": one commit off ten commits back */
+			/* "recent": one commit off ten commits back, if the window holds it */
+			bool		has_recent = vc_locate(&r, &heads[i > 10 ? i - 10 : 0], NULL) == VC_LOC_WINDOW;
+
+			if (has_recent)
 			{
 				EditBatch	e;
 				PHash		w2,
@@ -333,10 +346,14 @@ main(int argc, char **argv)
 				CHECK(lrc == VC_OK || lrc == VC_ERR_SEVERED);
 			}
 			tl = (now_sec() - tl) * 1e6;
-			ts = now_sec();
-			CHECK(vc_merge_base_in(&r, &heads[i], &vc_branch_find(&r, "recent")->head, 0, &base) == 1);
-			CHECK(phash_eq(&base, &heads[i > 10 ? i - 10 : 0]));
-			ts = (now_sec() - ts) * 1e6;
+			ts = -1;
+			if (has_recent)
+			{
+				ts = now_sec();
+				CHECK(vc_merge_base_in(&r, &heads[i], &vc_branch_find(&r, "recent")->head, 0, &base) == 1);
+				CHECK(phash_eq(&base, &heads[i > 10 ? i - 10 : 0]));
+				ts = (now_sec() - ts) * 1e6;
+			}
 			tlg = now_sec();
 			{
 				int			mrc;
@@ -356,10 +373,11 @@ main(int argc, char **argv)
 			/* as far back as main's own window reaches */
 			back = i;
 			if (policy_mode)
-				for (back = 1; back < i &&
+				for (back = 0; back < i &&
 					 vc_locate(&r, &heads[i - back - 1], NULL) == VC_LOC_WINDOW; back++)
 					;
-			td1 = row_diff(&r, &heads[i - 1], &heads[i], &d1);
+			/* just after a cut to one commit, nothing lies behind the head */
+			td1 = row_diff(&r, &heads[i - (back < 1 ? 0 : 1)], &heads[i], &d1);
 			td1k = row_diff(&r, &heads[i - (back < 1000 ? back : 1000)], &heads[i], &d1k);
 			tdh = row_diff(&r, &heads[i - (back < i / 2 ? back : i / 2)], &heads[i], &dh);
 
@@ -377,7 +395,8 @@ main(int argc, char **argv)
 				vc_repo_free(&r2);
 			}
 			/* "recent" goes, so its window does not hold main's history */
-			CHECK(vc_branch_delete(&r, "recent") == VC_OK);
+			if (has_recent)
+				CHECK(vc_branch_delete(&r, "recent") == VC_OK);
 			{
 				VcCommit	hc,
 							pc;

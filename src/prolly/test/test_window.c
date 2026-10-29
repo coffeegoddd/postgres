@@ -1100,53 +1100,59 @@ own_bytes(const VcCommit *c)
 }
 
 /*
- * The window straight from its definition: every ancestor of a head (or the
- * head itself) that a floor keeps and no ceiling cuts.
+ * One head's window straight from its definition, added to out: every
+ * ancestor of the head (or the head itself) that a floor keeps and no
+ * ceiling cuts.
  */
+static void
+expected_head(VcRepo *r, const PHash *head, const VcWindow *w, uint64_t now, PHashMap *out)
+{
+	VcCommit	H;
+	PHashMap	anc;
+	PHash	   *stack = px_malloc(sizeof(PHash) * 100000);
+	size_t		n = 0;
+	bool		created;
+
+	CHECK(vc_commit_load(&r->ctx, head, &H));
+	phmap_init(&anc);
+	stack[n++] = *head;
+	while (n > 0)
+	{
+		PHash		h = stack[--n];
+		VcCommit	c;
+		uint64_t	after,
+					span;
+		bool		floor,
+					ceil;
+
+		phmap_ref(&anc, &h, &created);
+		if (!created || !vc_commit_load(&r->ctx, &h, &c))
+			continue;
+		after = H.bytes - c.bytes;
+		span = after + own_bytes(&c);
+		floor = (!w->depth && !w->keep_bytes && !w->keep_seconds) ||
+			(w->depth && H.generation - c.generation < w->depth) ||
+			(w->keep_bytes && after < w->keep_bytes) ||
+			(w->keep_seconds && now - c.time < w->keep_seconds * SEC);
+		ceil = (w->max_commits && H.generation - c.generation >= w->max_commits) ||
+			(w->max_bytes && span > w->max_bytes) ||
+			(w->max_seconds && now - c.time >= w->max_seconds * SEC);
+		if (phash_eq(&h, head) || (floor && !ceil))
+			phmap_ref(out, &h, &created);
+		for (uint32_t j = 0; j < c.nparents; j++)
+			stack[n++] = c.parents[j];
+	}
+	phmap_free(&anc);
+	free(stack);
+}
+
+/* The window of every head, straight from its definition. */
 static void
 expected_window(VcRepo *r, const VcWindow *w, uint64_t now, PHashMap *out)
 {
 	phmap_init(out);
 	for (size_t i = 0; i < r->nbr; i++)
-	{
-		VcCommit	H;
-		PHashMap	anc;
-		PHash	   *stack = px_malloc(sizeof(PHash) * 100000);
-		size_t		n = 0;
-		bool		created;
-
-		CHECK(vc_commit_load(&r->ctx, &r->br[i].head, &H));
-		phmap_init(&anc);
-		stack[n++] = r->br[i].head;
-		while (n > 0)
-		{
-			PHash		h = stack[--n];
-			VcCommit	c;
-			uint64_t	after,
-						span;
-			bool		floor,
-						ceil;
-
-			phmap_ref(&anc, &h, &created);
-			if (!created || !vc_commit_load(&r->ctx, &h, &c))
-				continue;
-			after = H.bytes - c.bytes;
-			span = after + own_bytes(&c);
-			floor = (!w->depth && !w->keep_bytes && !w->keep_seconds) ||
-				(w->depth && H.generation - c.generation < w->depth) ||
-				(w->keep_bytes && after < w->keep_bytes) ||
-				(w->keep_seconds && now - c.time < w->keep_seconds * SEC);
-			ceil = (w->max_commits && H.generation - c.generation >= w->max_commits) ||
-				(w->max_bytes && span > w->max_bytes) ||
-				(w->max_seconds && now - c.time >= w->max_seconds * SEC);
-			if (phash_eq(&h, &r->br[i].head) || (floor && !ceil))
-				phmap_ref(out, &h, &created);
-			for (uint32_t j = 0; j < c.nparents; j++)
-				stack[n++] = c.parents[j];
-		}
-		phmap_free(&anc);
-		free(stack);
-	}
+		expected_head(r, &r->br[i].head, w, now, out);
 }
 
 typedef struct WinSet
@@ -1483,6 +1489,400 @@ test_sever_when_due(void)
 	cs_destroy(cs);
 }
 
+/* ------------------------------------------------------------ low marks */
+
+static uint64_t
+tighter(uint64_t limit, uint64_t mark)
+{
+	if (mark == 0)
+		return limit;
+	if (limit == 0)
+		return mark;
+	return mark < limit ? mark : limit;
+}
+
+/*
+ * The marked window straight from its definition: a head whose high-mark
+ * window would let go of a held commit (a parent of the window's commits,
+ * outside it, still held) is cut back to its low-mark window; any other
+ * head keeps its high-mark window.
+ */
+static void
+expected_marked(VcRepo *r, const VcWindow *w, uint64_t now, PHashMap *held,
+				PHashMap *out)
+{
+	VcWindow	high = *w,
+				low = *w;
+
+	high.low_commits = high.low_bytes = high.low_seconds = 0;
+	low.max_commits = tighter(w->max_commits, w->low_commits);
+	low.max_bytes = tighter(w->max_bytes, w->low_bytes);
+	low.max_seconds = tighter(w->max_seconds, w->low_seconds);
+	low.low_commits = low.low_bytes = low.low_seconds = 0;
+	phmap_init(out);
+	for (size_t i = 0; i < r->nbr; i++)
+	{
+		PHashMap	hs;
+		bool		over = false;
+
+		phmap_init(&hs);
+		expected_head(r, &r->br[i].head, &high, now, &hs);
+		for (size_t j = 0; j < hs.cap && !over; j++)
+		{
+			VcCommit	c;
+
+			if (!hs.used[j] || !vc_commit_load(&r->ctx, &hs.keys[j], &c))
+				continue;
+			for (uint32_t k = 0; k < c.nparents; k++)
+				if (!phmap_find(&hs, &c.parents[k]) && phmap_find(held, &c.parents[k]))
+					over = true;
+		}
+		phmap_free(&hs);
+		expected_head(r, &r->br[i].head, over ? &low : &high, now, out);
+	}
+}
+
+/* Severs with a marked window and checks the window left is the definition's. */
+static void
+sever_marked_and_compare(VcRepo *r, const VcWindow *w, uint64_t now)
+{
+	PHashMap	want;
+	WinSet		held,
+				got;
+	uint32_t	seg;
+
+	phmap_init(&held.set);
+	vc_locations(r, window_set_fn, &held);
+	expected_marked(r, w, now, &held.set, &want);
+	CHECK(vc_sever(r, w, &seg) == VC_OK);
+	if (seg != VC_NO_SEGMENT)
+		CHECK(vc_segment_discard(r, seg) == VC_OK);
+	phmap_init(&got.set);
+	vc_locations(r, window_set_fn, &got);
+	CHECK(set_equal(&want, &got.set));
+	CHECK_EQ(r->nheld, set_size(&got.set));
+	phmap_free(&want);
+	phmap_free(&held.set);
+	phmap_free(&got.set);
+}
+
+static void
+sever_discard(VcRepo *r, const VcWindow *w)
+{
+	uint32_t	seg;
+
+	CHECK(vc_sever(r, w, &seg) == VC_OK);
+	if (seg != VC_NO_SEGMENT)
+		CHECK(vc_segment_discard(r, seg) == VC_OK);
+}
+
+/*
+ * A line of commits severed after each one: the window holds h commits,
+ * and the next makes h + 1, or, past the high mark of N, the low mark L.
+ */
+static void
+marks_line(uint64_t N, uint64_t low, uint64_t want_low)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	VcWindow	w = {.max_commits = N, .low_commits = low};
+	uint64_t	h;
+	int			resets = 0;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(21);
+	commit_rows(&r, 0, 2000, 0, "load");
+	sever_discard(&r, &w);
+	h = r.nheld;				/* the initial commit and the load, if under N */
+	CHECK_EQ(h, N >= 2 ? 2 : 1);
+	for (int i = 1; i <= (int) (4 * N + 3); i++)
+	{
+		timed_commit(&r, &clk, 1, 1 + (int) rnd_below(20), (uint64_t) i);
+		sever_marked_and_compare(&r, &w, clk.us);
+		h = h + 1 <= N ? h + 1 : want_low;
+		if (h == want_low && want_low < N)
+			resets++;
+		CHECK_EQ(r.nheld, h);
+		CHECK(r.nheld <= N);
+	}
+	if (want_low < N)
+		CHECK(resets >= 3);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* low_commits = 1: the window grows to N commits, then holds only the head. */
+static void
+test_marks_tumbling(void)
+{
+	marks_line(8, 1, 1);
+	marks_line(1, 1, 1);		/* a high mark of one: only ever the head */
+}
+
+/* A low mark between: it grows to N, then back to the last L. */
+static void
+test_marks_hysteresis(void)
+{
+	marks_line(10, 4, 4);
+	marks_line(10, 9, 9);
+}
+
+/* A low mark at or past the high mark slides, as with no low mark. */
+static void
+test_marks_at_high_slide(void)
+{
+	marks_line(10, 10, 10);
+	marks_line(10, 25, 10);
+}
+
+/* Low marks alone are refused: they need a high mark to fill to. */
+static void
+test_marks_need_high(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	uint32_t	seg;
+
+	setup(&r, cs);
+	commit_rows(&r, 0, 100, 0, "load");
+	CHECK(vc_sever(&r, &(VcWindow) {.low_commits = 1}, &seg) == VC_ERR);
+	CHECK(vc_sever(&r, &(VcWindow) {.low_bytes = 100, .low_seconds = 5}, &seg) == VC_ERR);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * A floor is the high mark too: a depth floor of 30 with no ceiling fills
+ * to 30 commits, then is cut to the low mark, which wins over the floor.
+ */
+static void
+test_marks_floor_is_high(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	VcWindow	w = {.depth = 30, .low_commits = 5};
+	bool		cut = false;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(22);
+	commit_rows(&r, 0, 2000, 0, "load");
+	for (int i = 1; i <= 70; i++)
+	{
+		timed_commit(&r, &clk, 1, 3, (uint64_t) i);
+		sever_marked_and_compare(&r, &w, clk.us);
+		CHECK(r.nheld <= 30);
+		cut |= r.nheld == 5;
+	}
+	CHECK(cut);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * Each branch fills and empties on its own: a busy branch is cut back to
+ * its low mark while a quiet one keeps its whole window, shared history
+ * included.
+ */
+static void
+test_marks_branches_independent(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	VcWindow	w = {.max_commits = 12, .low_commits = 2};
+	PHash		fork;
+	PHashMap	held;
+	WinSet		got;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(23);
+	commit_rows(&r, 0, 2000, 0, "load");
+	for (int i = 1; i <= 5; i++)
+		timed_commit(&r, &clk, 1, 2, (uint64_t) i);
+	fork = vc_head(&r)->head;
+	CHECK(vc_branch_create(&r, "busy", &fork) == VC_OK);
+	CHECK(vc_checkout(&r, "busy") == VC_OK);
+	for (int i = 6; i <= 30; i++)
+		timed_commit(&r, &clk, 1, 2, (uint64_t) i);
+	CHECK(vc_checkout(&r, "main") == VC_OK);
+	timed_commit(&r, &clk, 1, 2, 31);
+	sever_marked_and_compare(&r, &w, clk.us);
+	/* main (7 commits deep at most) is short of 12: all of its window stays */
+	phmap_init(&held);
+	expected_head(&r, &vc_head(&r)->head, &(VcWindow) {.max_commits = 12}, clk.us, &held);
+	phmap_init(&got.set);
+	vc_locations(&r, window_set_fn, &got);
+	for (size_t i = 0; i < held.cap; i++)
+		if (held.used[i])
+			CHECK(phmap_find(&got.set, &held.keys[i]) != NULL);
+	CHECK(phmap_find(&got.set, &fork) != NULL);
+	/* busy is cut to its last 2, so beside main's 7 the window holds 9 */
+	CHECK_EQ(r.nheld, set_size(&held) + 2);
+	phmap_free(&held);
+	phmap_free(&got.set);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* A pinned commit stays through a cut to the low mark. */
+static void
+test_marks_pinned(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	PHash		pin;
+	VcWindow	w = {.max_commits = 6, .low_commits = 1};
+	uint32_t	seg;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(24);
+	commit_rows(&r, 0, 2000, 0, "load");
+	pin = timed_commit(&r, &clk, 1, 2, 1);
+	w.pinned = &pin;
+	w.npinned = 1;
+	for (int i = 2; i <= 20; i++)
+	{
+		timed_commit(&r, &clk, 1, 2, (uint64_t) i);
+		sever_discard(&r, &w);
+		CHECK(vc_locate(&r, &pin, &seg) == VC_LOC_WINDOW);
+		CHECK(r.nheld <= 7);
+	}
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * Random histories, branches and merges under random marked windows: every
+ * sever leaves exactly the definition's window.
+ */
+static void
+test_marks_random(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	const char *names[] = {"main", "b1", "b2", "b3"};
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(25);
+	commit_rows(&r, 0, 4000, 0, "load");
+	for (int b = 1; b < 4; b++)
+		CHECK(vc_branch_create(&r, names[b], &vc_head(&r)->head) == VC_OK);
+	for (int round = 0; round < 6; round++)
+	{
+		VcWindow	w = {0};
+		uint64_t	unit = 3000;
+
+		/* one window per round, so that branches fill and are cut under it */
+		if (rnd_below(2))
+			w.depth = (uint32_t) (4 + rnd_below(20));
+		if (rnd_below(3) == 0)
+			w.keep_bytes = unit * (4 + rnd_below(20));
+		if (rnd_below(3) == 0)
+			w.keep_seconds = 60 * (4 + rnd_below(20));
+		if (rnd_below(2))
+			w.max_commits = 4 + rnd_below(20);
+		if (rnd_below(3) == 0)
+			w.max_bytes = unit * (6 + rnd_below(30));
+		if (rnd_below(3) == 0)
+			w.max_seconds = 60 * (6 + rnd_below(30));
+		if (!w.depth && !w.keep_bytes && !w.keep_seconds && !w.max_commits &&
+			!w.max_bytes && !w.max_seconds)
+			w.max_commits = 10;
+		if (rnd_below(2))
+			w.low_commits = 1 + rnd_below(6);
+		if (rnd_below(3) == 0)
+			w.low_bytes = unit * (1 + rnd_below(6));
+		if (rnd_below(3) == 0)
+			w.low_seconds = 60 * (1 + rnd_below(6));
+		if (!w.low_commits && !w.low_bytes && !w.low_seconds)
+			w.low_commits = 1;
+		for (int step = 1; step <= 80; step++)
+		{
+			int			b = (int) rnd_below(4);
+
+			vc_checkout(&r, names[b]);
+			if (rnd_below(8) == 0)
+			{
+				VcMergeResult m;
+				int			o = (int) rnd_below(4);
+
+				if (o != b && vc_merge(&r, names[o], &m) == VC_OK &&
+					m.status == VC_MERGE_CONFLICTS)
+					vc_reset_hard(&r, &vc_head(&r)->head);
+				vc_merge_result_free(&m);
+			}
+			else
+				timed_commit(&r, &clk, rnd_below(120), 1 + (int) rnd_below(30),
+							 (uint64_t) (round * 100 + step));
+			if (step % 3 == 0)
+			{
+				vc_checkout(&r, "main");
+				sever_marked_and_compare(&r, &w, clk.us);
+			}
+		}
+	}
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * Severing when due with a tumbling window: the window stays within a
+ * tenth over its high mark, and the severs stay about one per tenth of it
+ * however small the window is after a cut.
+ */
+static void
+test_marks_when_due(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	VcWindow	w = {.max_commits = 200, .low_commits = 1};
+	int			severs = 0,
+				resets = 0;
+	uint64_t	most = 0;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(26);
+	commit_rows(&r, 0, 4000, 0, "load");
+	for (int i = 1; i <= 3000; i++)
+	{
+		timed_commit(&r, &clk, 1, 1, (uint64_t) i);
+		if (r.nheld > most)
+			most = r.nheld;
+		if (vc_sever_due(&r, &w))
+		{
+			uint64_t	before = r.nheld;
+
+			sever_discard(&r, &w);
+			severs++;
+			if (r.nheld == 1 && before > 1)
+				resets++;
+		}
+	}
+	CHECK_LE(most, 200 + 200 / (VC_SEVER_SLACK - 1) + 2);
+	CHECK(resets >= 3000 / 230);
+	/* due once a tenth of the held commits are new: about ln(200) x 10 per batch */
+	CHECK_LE(severs, (3000 / 200 + 1) * 70);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 int
 main(void)
 {
@@ -1505,6 +1905,15 @@ main(void)
 	RUN(test_window_limits);
 	RUN(test_window_policy_random);
 	RUN(test_sever_when_due);
+	RUN(test_marks_tumbling);
+	RUN(test_marks_hysteresis);
+	RUN(test_marks_at_high_slide);
+	RUN(test_marks_need_high);
+	RUN(test_marks_floor_is_high);
+	RUN(test_marks_branches_independent);
+	RUN(test_marks_pinned);
+	RUN(test_marks_random);
+	RUN(test_marks_when_due);
 	printf("test_window: all tests passed\n");
 	return 0;
 }

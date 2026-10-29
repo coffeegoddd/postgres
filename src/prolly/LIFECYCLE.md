@@ -1232,6 +1232,80 @@ table, 4 changes a commit, about 15 KB of change bytes each):
 - **The cost of severing** includes discarding, which frees the cut
   commits' chunks: about 2 us a commit held.
 
+## Low and high marks: sliding, tumbling, in between
+
+**What it is.**  The floors and ceilings above are the window's high mark.
+Low marks (`low_commits`, `low_bytes`, `low_seconds`) say what a cut
+leaves:
+- **no low mark:** the window slides, as before: every sever cuts each
+  head's history back to exactly its window;
+- **with low marks:** a head's window grows until it reaches its high
+  mark, meaning it would let go of a commit still held.  The sever then cuts
+  that head's history back to its low mark (the window with the low marks
+  as further ceilings), and it grows again;
+- **`low_commits = 1`** keeps only the head: a tumbling window, history in
+  batches.  A low mark between gives hysteresis ("grow to 1M commits, cut
+  back to the last 100k"); one at or past the high mark slides;
+- **per branch:** a head short of its high mark keeps its whole window, so
+  each branch fills and empties on its own.  A low mark wins over a floor,
+  as a ceiling does; low marks with no high mark are refused.
+
+No state is added: what is held says where each head is in its fill, and
+`vc_sever_due` is unchanged (a sever is about a tenth of what is held, so
+after a cut to one commit severs are frequent but tiny).
+
+**What it buys.**
+- **REWRITE mode:** a cut writes again only what the low mark keeps.  A
+  tumbling cut writes one commit, the head, which becomes the root; a
+  sliding sever writes the whole window every time.
+- **Batches:** each cut is one segment holding exactly one batch, a clean
+  unit to export, archive or back up; each batch's root restores it.
+- **The cost:** right after a cut, history is only the low mark: no diff or
+  revert past it.  What is guaranteed is the low mark, not the high one.
+
+**Tests** (`test/test_window.c`, `test/test_rewrite.c`):
+- a line of commits severed after each: the window holds h, then h + 1, or
+  past N the low mark, for tumbling, hysteresis, a high mark of one, a low
+  mark at and past the high mark (which slides);
+- a depth floor as the high mark, cut back to a low mark under it;
+- branches filling on their own (a busy branch cut, a quiet one keeping
+  its whole window and the shared history), a pinned commit through a cut;
+- randomized branches, merges, clocks and marked windows of every limit,
+  against the window computed from the definition;
+- severing when due with a tumbling window: within a tenth over the high
+  mark, severs bounded;
+- REWRITE: each cut writes exactly the low mark's commits again, the
+  oldest a root at generation 1, and nothing between cuts;
+- low marks alone refused.
+- **Each part was broken in turn, and each break was caught:** never
+  reaching the high mark, always reaching it, byte and time low marks
+  ignored, one head's cut applied to every head.
+
+**At 1M commits** (`bench/deepbench --due --max-commits 100000`, with and
+without `--low-commits 1`, in both modes; the four ran side by side, so
+absolute times are about 1.7x a lone run's, and only the comparison
+counts):
+
+| | Commit + sever | Severs, 100k to 1M | Each | Held at 1M |
+|---|---:|---:|---:|---:|
+| KEEP, sliding | 214 us | 81 | 336 ms | 110,133 |
+| KEEP, tumbling | 225 us | 810 | 47 ms | 91,494 |
+| REWRITE, sliding | 236 us | 81 | 595 ms | 110,133 |
+| REWRITE, tumbling | 226 us | 810 | 47 ms | 91,494 |
+
+- **REWRITE:** tumbling takes the rewrite out of severing (a cut writes one
+  commit), so its severs cost what KEEP's do, and commits are about 4%
+  cheaper than sliding.  The long pause is gone: no sever over 50 ms on
+  average, against 595 ms.
+- **KEEP:** tumbling is about 5% dearer.  `vc_sever_due` fires at a tenth
+  of what is held, so after a cut it fires often, and each of those severs
+  walks the window twice (once to see whether the high mark is reached)
+  and mostly cuts nothing.  The total walking matches sliding's; the second
+  walk is the extra.
+- **To improve:** with low marks the due rule could wait for the high mark
+  itself (a head reaches max_commits only once the commits held do), so
+  severs would come once per batch.  Not done yet.
+
 ## Keyframes: replay or restore
 
 **The measurement** (`bench/kfbench`, 1M rows with two indexes, every move

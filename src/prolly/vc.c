@@ -1878,6 +1878,80 @@ window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHash
 	return rc;
 }
 
+static bool
+has_low_marks(const VcWindow *w)
+{
+	return w->low_commits || w->low_bytes || w->low_seconds;
+}
+
+static uint64_t
+tighter(uint64_t limit, uint64_t mark)
+{
+	if (mark == 0)
+		return limit;
+	if (limit == 0)
+		return mark;
+	return mark < limit ? mark : limit;
+}
+
+/* The window a head at its high mark is cut back to: the low marks as ceilings too. */
+static VcWindow
+low_window(const VcWindow *w)
+{
+	VcWindow	low = *w;
+
+	low.max_commits = tighter(w->max_commits, w->low_commits);
+	low.max_bytes = tighter(w->max_bytes, w->low_bytes);
+	low.max_seconds = tighter(w->max_seconds, w->low_seconds);
+	low.low_commits = low.low_bytes = low.low_seconds = 0;
+	return low;
+}
+
+/*
+ * Whether head's window has reached its high mark: it would let go of a
+ * commit still held (one it stops at, cut by a ceiling or past the floors).
+ */
+static int
+at_high_mark(VcRepo *r, const PHash *head, const VcWindow *w, bool *over)
+{
+	PHashMap	win,
+				below;
+	int			rc;
+
+	phmap_init(&win);
+	phmap_init(&below);
+	rc = window_add(r, &win, head, w, &below);
+	*over = false;
+	for (size_t i = 0; rc == VC_OK && i < below.cap && !*over; i++)
+		if (below.used[i] && !phmap_find(&win, &below.keys[i]) && in_window(r, &below.keys[i]))
+			*over = true;
+	phmap_free(&win);
+	phmap_free(&below);
+	return rc;
+}
+
+/* Adds head's window to win: its high mark's, or its low mark's once it reached the high one. */
+static int
+window_add_marked(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
+				  PHashMap *below)
+{
+	VcWindow	high = *w,
+				low;
+	bool		over;
+	int			rc;
+
+	high.low_commits = high.low_bytes = high.low_seconds = 0;
+	if (!has_low_marks(w))
+		return window_add(r, win, head, &high, below);
+	rc = at_high_mark(r, head, &high, &over);
+	if (rc != VC_OK)
+		return rc;
+	if (!over)
+		return window_add(r, win, head, &high, below);
+	low = low_window(w);
+	return window_add(r, win, head, &low, below);
+}
+
 typedef struct Kept
 {
 	VcCommit	c;
@@ -2046,7 +2120,7 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	if (!w->depth && !w->keep_bytes && !w->keep_seconds && !w->max_commits &&
 		!w->max_bytes && !w->max_seconds)
 		return VC_ERR;			/* no window at all */
-	if (r->track_depth == w->depth && w->npinned == 0 && depth_only(w))
+	if (r->track_depth == w->depth && w->npinned == 0 && depth_only(w) && !has_low_marks(w))
 	{
 		/* incremental: only commits whose cover fell to zero can leave */
 		PHashMap	seen;
@@ -2072,9 +2146,9 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	phmap_init(&below);
 	for (size_t i = 0; i < r->nbr && rc == VC_OK; i++)
 	{
-		rc = window_add(r, &win, &r->br[i].head, w, &below);
+		rc = window_add_marked(r, &win, &r->br[i].head, w, &below);
 		if (rc == VC_OK && r->br[i].merging)
-			rc = window_add(r, &win, &r->br[i].merge_head, w, &below);
+			rc = window_add_marked(r, &win, &r->br[i].merge_head, w, &below);
 	}
 	for (size_t i = 0; i < w->npinned && rc == VC_OK; i++)
 		rc = window_add(r, &win, &w->pinned[i], &(VcWindow) {.depth = 1}, &below);

@@ -420,6 +420,71 @@ test_no_remotes(void)
 	cs_destroy(cc);
 }
 
+/*
+ * Low marks: each cut writes again only what the low mark keeps, so a
+ * tumbling window (low_commits 1) writes one commit per batch, the head,
+ * which becomes the root; between cuts nothing is written.  A low mark of
+ * three writes three, the oldest a root.
+ */
+static void
+marks_rewrite(uint64_t low)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	Moves		m;
+	uint32_t	seg;
+	VcWindow	w = {.max_commits = 8, .low_commits = low};
+	int			cuts = 0;
+	uint64_t	held;
+
+	rewriting(&r, cs, &m);
+	commit_rows(&r, 0, 2000, 0, "load");
+	CHECK(vc_sever(&r, &w, &seg) == VC_OK);
+	held = r.nheld;
+	for (int i = 1; i <= 40; i++)
+	{
+		int			before = m.n;
+		LogAcc		acc;
+		VcCommit	c;
+
+		commit_rows(&r, (uint64_t) (i * 7) % 2000, (uint64_t) (i * 7) % 2000 + 5, (uint64_t) i, "step");
+		CHECK(vc_sever(&r, &w, &seg) == VC_OK);
+		CHECK(seg == VC_NO_SEGMENT);
+		if (held + 1 <= 8)
+		{
+			/* filling: nothing written again */
+			held++;
+			CHECK_EQ(m.n, before);
+		}
+		else
+		{
+			/* cut: the low mark's commits written again, the oldest a root */
+			held = low;
+			cuts++;
+			CHECK_EQ(m.n - before, (int) low);
+			CHECK(log_from(&r, &vc_head(&r)->head, 0, &acc) == VC_OK);
+			CHECK_EQ(acc.n, low);
+			CHECK(vc_commit_load(&r.ctx, &acc.v[acc.n - 1], &c));
+			CHECK_EQ(c.nparents, 0);
+			CHECK_EQ(c.generation, 1);
+		}
+		CHECK_EQ(r.nheld, held);
+		m.n = 0;
+	}
+	CHECK(cuts >= 4);
+	cs_collect_orphans(cs);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+static void
+test_low_marks(void)
+{
+	marks_rewrite(1);
+	marks_rewrite(3);
+}
+
 int
 main(void)
 {
@@ -433,6 +498,7 @@ main(void)
 	RUN(test_tracked_window);
 	RUN(test_save_and_reopen);
 	RUN(test_no_remotes);
+	RUN(test_low_marks);
 	printf("test_rewrite: all tests passed\n");
 	return 0;
 }

@@ -140,6 +140,17 @@ typedef struct VcBranch
  * max_commits, or bytes > max_bytes, or age >= max_seconds: any ceiling
  * cuts it, and a ceiling wins over a floor.  Zero leaves a limit unset; a
  * window with none set is refused.  Heads are always kept.
+ *
+ * Low marks.  Without them the window slides: each sever cuts a head's
+ * history back to exactly the window above (its high mark).  With any low
+ * mark set, a head's window grows until it reaches its high mark, which is
+ * when the window would let go of a commit still held; the sever then cuts
+ * that head's history back to its low mark, the window with the low marks
+ * as further ceilings, and it grows again.  low_commits = 1 keeps only the
+ * head (a tumbling window, history in batches); low marks at or past the
+ * ceilings slide as before.  A head short of its high mark keeps its whole
+ * window, so each branch fills and empties on its own.  A low mark needs a
+ * high mark: low marks alone are refused.
  */
 typedef struct VcWindow
 {
@@ -151,6 +162,9 @@ typedef struct VcWindow
 	uint64_t	max_commits;	/* ceiling */
 	uint64_t	max_bytes;		/* ceiling */
 	uint64_t	max_seconds;	/* ceiling */
+	uint64_t	low_commits;	/* low mark */
+	uint64_t	low_bytes;		/* low mark */
+	uint64_t	low_seconds;	/* low mark */
 } VcWindow;
 
 typedef enum VcSegState
