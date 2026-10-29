@@ -234,7 +234,7 @@ Versioned and unversioned schemas live side by side in one database
 - **the cost,** as measured by experiment C: a branch column and one index
   change on `pg_namespace`, branch-aware name lookups, and one filter in
   the visibility check for queries (not for lookups by object id): about
-  560 lines in 15 files.
+  520 lines in 14 files.
 - Whole-database branching with a catalog file set per branch was
   considered and set aside: it cannot keep unversioned schemas shared.
 
@@ -268,7 +268,7 @@ branch it is on:
   that branch's; on no branch, all of them;
 - changing branch resets the catalog caches and the search path.
 
-The patch is about 560 lines in 15 files, kept as a patch file because it
+The patch is about 520 lines in 14 files, kept as a patch file because it
 changes the catalog (a cluster made without it cannot run with it).
 Branch 2 was made by dumping branch 1's schema and restoring it on branch
 2: the canonical-form path commits will use.  `spike/catalog_branch_test.sh`
