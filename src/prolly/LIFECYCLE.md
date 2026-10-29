@@ -160,6 +160,102 @@ since the previous one, the same as a keyframe, so the retention policy
 still applies; without a root, reset falls back to replay.  It is the
 largest component so far: storage manager, buffer manager and recovery.
 
+## Mode: dolt tx commit
+
+A user-configured mode, off by default, enabled per versioned schema: every
+SQL transaction becomes its own Dolt commit.  The aim is clean history:
+each commit holds exactly one transaction's changes, so its diff against
+its parent is exactly what that transaction did.
+
+**No temporary branch per transaction is needed.**  The branch-and-merge
+form (a branch per SQL transaction, merged into the default branch at
+COMMIT) gives the same result, but Postgres already does both halves:
+MVCC isolates the transaction, and at COMMIT its changes are already part
+of the default branch's working set, write conflicts settled by row locks
+or a serialization failure, so such a merge could never conflict.  The
+change stream delivers committed transactions one at a time in commit
+order, and replaying them in that order reproduces the database (as
+logical replication does).  So with the mode on, the decoder writes one
+commit per decoded transaction: its parent is the previous transaction's
+commit, its diff is that transaction's net row changes, and history is
+linear.  Copy-on-write is not needed for any of it.
+
+**Asynchronous.**  SQL COMMIT returns as usual; the Dolt commit appears
+once the decoder reaches it (milliseconds), and its hash can be found by
+transaction id.  COMMIT latency is unchanged.  (A synchronous form exists
+if ever wanted: the decoder as a synchronous standby, so COMMIT waits for
+it; decoder throughput would then cap the write rate.)
+
+**Commit contents and metadata.**  Each commit records the transaction id
+and commit timestamp from the stream; a session can give it a message
+with a transactional logical message inside the transaction, so the
+message commits or aborts with it; the transaction's DDL joins it once DDL
+is captured.  An explicit Dolt commit, with the mode on, becomes a named
+marker (a tag) on the per-transaction history, or a squash commit for
+coarser history; diffs between markers are prolly diffs as usual.
+
+**What changes in the model:**
+
+| | Mode off (explicit commits) | Mode on (dolt tx commit) |
+|---|---|---|
+| Who makes commits | `dolt_commit`, through a barrier | The decoder, at each decoded transaction |
+| Working root | Ahead of the head between commits | Equal to the head, apart from the undecoded tail |
+| Tree writes | Batched: many transactions per tree edit | One tree edit per transaction |
+| Storage per change | Path copies shared by a batch | ~tree height × node size per touched leaf; a 1-row transaction ~3–4 nodes (12–16 KB at 4 KB chunks) |
+| Throughput limit | Not the decoder | The decoder's commits per second: ~100–250 µs per commit measured at the engine level, ~4–10k transactions/s per decoder |
+| Window size | A count of Dolt commits | By time or bytes: a count would mean N transactions |
+
+**The window's guarantees are unchanged.**  Diff, checkout, reset, merge,
+severing and remotes cost the same per change, and every per-transaction
+commit in the window can be diffed against or checked out.  What grows is
+the number of commits and the storage per unit of change, which the window
+bounds; that is why the window should be sized by time or bytes in this
+mode (see the time-based window: corrected commit times recorded in each
+commit, so the edge is found without reading past it).
+
+**To measure before relying on it:** decoder throughput and lag at high
+transaction rates; storage per transaction for small transactions (smaller
+chunks for heavily written tables cut it, at the cost of taller trees);
+the latency spike from a very large transaction, which arrives at commit
+as one unit.
+
+## Conclusions of the prototype
+
+What it proved, against a real Postgres where it matters:
+
+- **The history window works at scale.**  Severing moves holds only;
+  segments export to an archive or remote, are discarded with exact frees,
+  or come back verified; remotes respect both sides' windows and refuse
+  histories that do not attach.  Per-operation costs stay flat from 1k to
+  1M branches (`bench/branchbench`).
+- **The lifecycle needs no artifact.**  Prolly tree plus one streaming
+  decoder: commit ~71–74 ms whether the table is 1.8 GB or 17 GB; diff and
+  checkout cost what changed, not the table's size; commits capture
+  exactly the state as of their barrier under concurrent writers.
+- **Inside the window is what makes it cheap.**  Outside it, diff costs
+  ~6–9× more and checkout ~2× (bringing the old version back from the
+  archive); a full rebuild costs ~100×.
+- **Keyframes as built lose to row replay** on random workloads (~150 µs
+  per page restored vs ~8 µs per row replayed), so the default is none.
+  Restoring pages exactly also needs logged hints, a checkpoint at the base
+  point, and a flushed WAL (`bench/lp_dead_repro.sql`).
+
+What it left open:
+
+- **Concurrent SQL on different branches** needs a working set per branch;
+  the target is copy-on-write working sets (above), the production storage
+  layer rather than a prototype.  A cheaper interim (a database per active
+  branch, cloned with `file_copy_method = clone` on a copy-on-write
+  filesystem) would test the lifecycle's fit without it.
+- **O(1) reset** through settled commit roots, which comes with
+  copy-on-write.
+- **Generic tables and DDL** (row codec for any table, DDL capture), the
+  verbs not built (rebase, revert, cross-branch reads, stored conflicts),
+  the time-based window, and **dolt tx commit** measured at high
+  transaction rates.
+- **BranchBench**, which needs the generic codec and DDL, and per-branch
+  working sets for its multi-agent scenarios.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per
@@ -264,16 +360,14 @@ verified.
 
 ## Next
 
-1. ~~The lifecycle without keyframes~~: built and measured above, with the
-   streaming decoder, commits as of the barrier, and inside-vs-outside
-   window costs.
-2. **Copy-on-write working sets:** a storage manager backed by the page
-   store; branch databases created by copying page-map roots; two sessions
-   writing to two branches concurrently; isolation, crash recovery, and
-   write overhead against stock Postgres.
-3. **Settled commit roots** and reset by swapping roots, measured against
-   replay; with them, the keyframe policy becomes a retention policy for
-   roots.
-4. **Hooking up BranchBench** (on hold): a generic row codec for any
-   table, DDL capture, and the verbs not built yet (rebase, revert,
-   cross-branch reads, stored conflicts).
+The prototype phase is concluded (see *Conclusions of the prototype*).  In
+the real implementation, in order:
+
+1. The lifecycle with the streaming decoder, a generic row codec and DDL
+   capture; explicit commits as of the barrier; the time-based window.
+2. The **dolt tx commit** mode, asynchronous, measured at high transaction
+   rates.
+3. Copy-on-write working sets (a page-store storage manager, a database
+   per branch, settled commit roots), for concurrent branches and O(1)
+   reset.
+4. BranchBench against it.
