@@ -231,9 +231,10 @@ Versioned and unversioned schemas live side by side in one database
 - **commits** hold the canonical form (definitions as DDL, column tags),
   not raw catalog rows, which name cluster-local ids; diff and merge work
   there, and the DDL moves bridge history and the physical catalogs.
-- **the cost:** every catalog read must honor the branch (system caches,
-  catalog scans, unique checks): a patch across core.  To be measured by
-  experiment C.
+- **the cost,** as measured by experiment C: a branch column and one index
+  change on `pg_namespace`, branch-aware name lookups, and one filter in
+  the visibility check for queries (not for lookups by object id): about
+  560 lines in 15 files.
 - Whole-database branching with a catalog file set per branch was
   considered and set aside: it cannot keep unversioned schemas shared.
 
@@ -242,56 +243,75 @@ Versioned and unversioned schemas live side by side in one database
 A versioned schema has one `pg_namespace` row per branch, all with the same
 name; `nspbranch` says whose row it is (0: shared).  Each branch's objects
 are its own rows in every other catalog, made in its namespace under new
-object ids, so no other catalog changes: only `pg_namespace` gets the
-column, and its name index becomes `(nspname, nspbranch)`.  A session's
-`catalog_branch` (a GUC) says which branch it is on:
-- names resolve to the session's branch's namespace, then to a shared one
-  (`SearchNamespaceByName`; the five name lookups in core use it);
-- the session's scans of `pg_namespace` do not see other branches' rows
-  (one test in the tuple visibility check, and the page-at-a-time scan);
+object ids: only `pg_namespace` gets a column, and its name index becomes
+`(nspname, nspbranch)`.  A session's `catalog_branch` (a GUC) says which
+branch it is on:
+- **names** resolve to the session's branch's namespace, then to a shared
+  one (`SearchNamespaceByName`; the five name lookups in core use it);
+- **queries** do not see other branches' catalog rows: in `pg_namespace`,
+  in every catalog with a namespace column (`pg_class`, `pg_type`,
+  `pg_proc`, `pg_constraint`, operators, collations, text search, extended
+  statistics), and in the catalogs describing those objects
+  (`pg_attribute`, `pg_index`, `pg_attrdef`, `pg_trigger`, `pg_rewrite`,
+  `pg_policy`, `pg_inherits`, `pg_sequence`, `pg_statistic`, `pg_enum`,
+  `pg_range`, `pg_aggregate`, `pg_depend`, `pg_description`, ...);
+- **lookups by object id are not filtered:** catalog snapshots are marked,
+  and the filter leaves their reads whole, so decoding, `DROP ROLE` and
+  dependency walks find every branch's objects;
+- **the filter** is one test in the tuple visibility check (and the
+  page-at-a-time scan), against a per-backend set of hidden object ids:
+  other branches' namespaces and the relations, types, functions and
+  constraints in them.  The set is rebuilt when a scan of a filtered
+  catalog begins (never mid-scan, under a buffer lock), after a cache
+  invalidation of any of those objects or a branch change;
+- **logical decoding** on a branch carries the shared schemas' changes and
+  that branch's; on no branch, all of them;
 - changing branch resets the catalog caches and the search path.
 
-The patch is 151 lines in 10 files, kept as a patch file because it
+The patch is about 560 lines in 15 files, kept as a patch file because it
 changes the catalog (a cluster made without it cannot run with it).
 Branch 2 was made by dumping branch 1's schema and restoring it on branch
-2: the canonical-form path commits will use.  `spike/catalog_branch_test.sh`.
+2: the canonical-form path commits will use.  `spike/catalog_branch_test.sh`
+makes its own cluster.
 
 **What works:**
-- each branch has its own definitions and rows: a column added, an enum
-  value added and rows changed on one branch only; `information_schema`,
-  `\d` and `pg_indexes` answer per branch;
-- DDL on two branches at once, including the same table name made on both;
+- each branch has its own definitions and rows (a column and an enum value
+  added on one branch only); `information_schema`, `\d`, `pg_indexes` and
+  `pg_dump` answer per branch;
+- DDL on two branches at once, including the same table name on both;
 - a shared schema beside it: writes from either branch seen by both, and a
   foreign key from a versioned table into a shared one;
-- a session on no branch does not see the versioned schema;
-- `SET catalog_branch` inside a session, prepared statements included;
+- a session on no branch sees no versioned schema; `SET catalog_branch`
+  inside a session, prepared statements included;
 - each branch's table has its own `pg_class` row, so its own files,
   relpages, reltuples and relfrozenxid: experiment A's catalog swap,
   experiment B's locator hook and B's shared-numbers problem are gone;
-- the freeze horizon is the minimum over every branch's tables, since all
-  their rows are in the one `pg_class`;
+- the freeze horizon is the minimum over every branch's tables;
+  autovacuum visits every branch's tables (all are in the one
+  `pg_class`), each with its own statistics;
 - `DROP ROLE` is refused from any branch while another branch has objects
-  the role owns (`pg_shdepend` is shared);
+  the role owns, and names them;
+- temporary tables work on a branch, and may share a versioned table's
+  name; an extension in a shared schema serves every branch;
 - dropping a branch's schema leaves the other branch's.
 
 **What it does not give yet:**
-1. **Only `pg_namespace` is filtered.**  `pg_class` and the other
-   catalogs still list every branch's rows (two rows named `t`, seen from
-   branch 1).  Joins through `pg_namespace` hide them, which is why
-   `information_schema` and `\d` are right; but `pg_dump` reads `pg_class`
-   whole and then fails on a namespace it cannot see (`schema with OID
-   16500 does not exist`).  Hiding rows of hidden namespaces in every
-   catalog that has a namespace column (`pg_class`, `pg_type`, `pg_proc`,
-   `pg_constraint`, ...) needs, at visibility time, which namespaces are
-   hidden: a per-backend set kept by cache invalidation, never built while
-   a buffer is locked.  Lookups by object id must stay unfiltered: decoding,
-   `DROP ROLE` and dependency walks find other branches' objects that way.
-2. **Logical decoding names both branches' tables `app.t`.**  Both
-   branches' writes decode, but the stream cannot tell them apart: the
-   output needs the branch.
-3. Not yet tried: autovacuum per branch (its scan of `pg_class` sees every
-   branch's tables, so it should vacuum them all), temporary tables, and
-   extensions in versioned schemas.
+1. **Extensions in a versioned schema exist on one branch only.**
+   `pg_extension` is one row per name per database: on branch 2,
+   `CREATE EXTENSION pg_trgm SCHEMA app` fails (`already exists`) while
+   branch 1's copy is invisible to it.  Per-branch extensions need
+   `pg_extension` filtered by its namespace and its name index widened, as
+   `pg_namespace`'s was.
+2. **The hidden set costs a catalog scan when stale.**  With 6,007 hidden
+   relations (about 12,000 hidden objects), rebuilding it takes about 2 ms;
+   any DDL anywhere makes it stale, so the next catalog query in each
+   session pays that.  Indexes on the namespace columns, or keeping the
+   set by the invalidations themselves, would make it proportional to what
+   changed.
+3. Shared catalogs naming branch objects (`pg_shdepend`,
+   `pg_publication_rel`, `pg_subscription_rel`), security labels and
+   initial privileges are not yet filtered; publications and subscriptions
+   on versioned schemas are untried.
 
 ### Patches so far
 
@@ -300,7 +320,7 @@ Branch 2 was made by dumping branch 1's schema and restoring it on branch
 | `relation_locator_hook` (relcache.c, relcache.h) | a branch per session | spike |
 | a relation-for-file hook in decoding | logical decoding of branch files | needed for B |
 | per-branch file fields (relpages, reltuples, relallvisible, relfrozenxid, relminmxid) and the freeze horizon | VACUUM, ANALYZE, wraparound safety per branch | needed for B; A needs the horizon part |
-| `pg_namespace.nspbranch`, branch-aware name lookup, the visibility filter, `catalog_branch` (`spike/catalog_branch.patch`) | catalogs branched by row | spike; makes the two above unnecessary |
+| `pg_namespace.nspbranch`, branch-aware name lookup, the catalog filter, `catalog_branch`, branch-scoped decoding (`spike/catalog_branch.patch`) | catalogs branched by row | spike; makes the two above unnecessary |
 
 ## Order
 

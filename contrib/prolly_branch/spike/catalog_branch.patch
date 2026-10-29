@@ -1,5 +1,5 @@
 diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
-index 6a09a1a1517..5bad6078050 100644
+index 6a09a1a1517..96ac80bb30d 100644
 --- a/src/backend/access/heap/heapam.c
 +++ b/src/backend/access/heap/heapam.c
 @@ -40,8 +40,10 @@
@@ -18,7 +18,7 @@ index 6a09a1a1517..5bad6078050 100644
  										   scan->rs_vistuples);
  
 +	/* another branch's catalog rows are not this session's */
-+	if (relid == NamespaceRelationId && catalog_branch_filter)
++	if (catalog_branch_filter && !snapshot->for_catalog && catalog_branch_filters(relid))
 +	{
 +		int			keep = 0;
 +
@@ -30,7 +30,7 @@ index 6a09a1a1517..5bad6078050 100644
 +			t.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 +			t.t_len = ItemIdGetLength(lp);
 +			t.t_tableOid = relid;
-+			if (!catalog_branch_hides(&t))
++			if (!catalog_branch_hides(&t, snapshot))
 +				scan->rs_vistuples[keep++] = scan->rs_vistuples[i];
 +		}
 +		nvis = keep;
@@ -39,8 +39,39 @@ index 6a09a1a1517..5bad6078050 100644
  	/*
  	 * So far we don't have batch API for testing serializabilty, so do so
  	 * one-by-one.
+@@ -1174,6 +1195,8 @@ heap_beginscan(Relation relation, Snapshot snapshot,
+ {
+ 	HeapScanDesc scan;
+ 
++	catalog_branch_prepare(relation);
++
+ 	/*
+ 	 * increment relation ref count while scanning relation
+ 	 *
+diff --git a/src/backend/access/heap/heapam_indexscan.c b/src/backend/access/heap/heapam_indexscan.c
+index 49981525c67..f3175b03edb 100644
+--- a/src/backend/access/heap/heapam_indexscan.c
++++ b/src/backend/access/heap/heapam_indexscan.c
+@@ -14,6 +14,8 @@
+  */
+ #include "postgres.h"
+ 
++#include "catalog/namespace.h"
++
+ #include "access/amapi.h"
+ #include "access/heapam.h"
+ #include "access/relscan.h"
+@@ -75,6 +77,8 @@ heapam_index_scan_begin(IndexScanDesc scan, uint32 flags)
+ {
+ 	IndexScanHeapData *hscan = palloc0_object(IndexScanHeapData);
+ 
++	catalog_branch_prepare(scan->heapRelation);
++
+ 	hscan->xs_cbuf = InvalidBuffer;
+ 	hscan->xs_blk = InvalidBlockNumber;
+ 	hscan->xs_vmbuffer = InvalidBuffer;
 diff --git a/src/backend/access/heap/heapam_visibility.c b/src/backend/access/heap/heapam_visibility.c
-index 905444ae036..94868e590ef 100644
+index 905444ae036..fa311c6848e 100644
 --- a/src/backend/access/heap/heapam_visibility.c
 +++ b/src/backend/access/heap/heapam_visibility.c
 @@ -72,6 +72,7 @@
@@ -51,7 +82,7 @@ index 905444ae036..94868e590ef 100644
  #include "access/xlog.h"
  #include "storage/bufmgr.h"
  #include "storage/procarray.h"
-@@ -1735,16 +1736,20 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+@@ -1735,8 +1736,10 @@ HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  {
  	switch (snapshot->snapshot_type)
  	{
@@ -59,27 +90,41 @@ index 905444ae036..94868e590ef 100644
  		case SNAPSHOT_MVCC:
 -			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL);
 +			return HeapTupleSatisfiesMVCC(htup, snapshot, buffer, NULL) &&
-+				!catalog_branch_hides(htup);
++				!catalog_branch_hides(htup, snapshot);
  		case SNAPSHOT_SELF:
--			return HeapTupleSatisfiesSelf(htup, snapshot, buffer);
-+			return HeapTupleSatisfiesSelf(htup, snapshot, buffer) &&
-+				!catalog_branch_hides(htup);
+ 			return HeapTupleSatisfiesSelf(htup, snapshot, buffer);
  		case SNAPSHOT_ANY:
- 			return HeapTupleSatisfiesAny(htup, snapshot, buffer);
- 		case SNAPSHOT_TOAST:
- 			return HeapTupleSatisfiesToast(htup, snapshot, buffer);
- 		case SNAPSHOT_DIRTY:
--			return HeapTupleSatisfiesDirty(htup, snapshot, buffer);
-+			return HeapTupleSatisfiesDirty(htup, snapshot, buffer) &&
-+				!catalog_branch_hides(htup);
- 		case SNAPSHOT_HISTORIC_MVCC:
- 			return HeapTupleSatisfiesHistoricMVCC(htup, snapshot, buffer);
- 		case SNAPSHOT_NON_VACUUMABLE:
 diff --git a/src/backend/catalog/namespace.c b/src/backend/catalog/namespace.c
-index 0647a198dea..9bf7707ddbf 100644
+index 0647a198dea..2f9dbb84661 100644
 --- a/src/backend/catalog/namespace.c
 +++ b/src/backend/catalog/namespace.c
-@@ -58,6 +58,7 @@
+@@ -25,6 +25,25 @@
+ #include "access/xlog.h"
+ #include "catalog/dependency.h"
+ #include "catalog/namespace.h"
++#include "catalog/pg_aggregate.h"
++#include "catalog/pg_attrdef.h"
++#include "catalog/pg_attribute.h"
++#include "catalog/pg_depend.h"
++#include "catalog/pg_description.h"
++#include "catalog/pg_enum.h"
++#include "catalog/pg_index.h"
++#include "catalog/pg_inherits.h"
++#include "catalog/pg_partitioned_table.h"
++#include "catalog/pg_policy.h"
++#include "catalog/pg_range.h"
++#include "catalog/pg_rewrite.h"
++#include "catalog/pg_sequence.h"
++#include "catalog/pg_statistic.h"
++#include "catalog/pg_trigger.h"
++#include "access/genam.h"
++#include "access/table.h"
++#include "catalog/pg_class.h"
++#include "catalog/pg_constraint.h"
+ #include "catalog/objectaccess.h"
+ #include "catalog/pg_authid.h"
+ #include "catalog/pg_collation.h"
+@@ -58,6 +77,7 @@
  #include "utils/lsyscache.h"
  #include "utils/memutils.h"
  #include "utils/snapmgr.h"
@@ -87,7 +132,7 @@ index 0647a198dea..9bf7707ddbf 100644
  #include "utils/syscache.h"
  #include "utils/varlena.h"
  
-@@ -3603,13 +3604,52 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
+@@ -3603,13 +3623,369 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
   * If missing_ok is false, throw an error if namespace name not found.  If
   * true, just return InvalidOid.
   */
@@ -110,16 +155,333 @@ index 0647a198dea..9bf7707ddbf 100644
 +	return SearchSysCache2(NAMESPACENAME, CStringGetDatum(nspname), Int32GetDatum(0));
 +}
 +
-+/* Whether a tuple is another branch's row, hidden from this session's scans. */
-+bool
-+catalog_branch_hides(HeapTuple htup)
++/*
++ * Other branches' objects: the namespaces of other branches, and every
++ * relation, type, function and constraint in them, by object id (one
++ * counter assigns them all).  Their catalog rows, and the rows of other
++ * catalogs that describe them, are hidden from this session's queries.
++ * Built when a scan of such a catalog begins (never mid-scan, while a
++ * buffer is locked), and built again after any of them changes or the
++ * session changes branch.
++ */
++static Oid *hidden_nsp = NULL;
++static int	nhidden = 0;
++static bool hidden_stale = true;
++static bool hidden_building = false;
++static bool hidden_callback = false;
++
++static void
++hidden_invalidate(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 +{
++	hidden_stale = true;
++}
++
++static int
++oid_cmp_hidden(const void *a, const void *b)
++{
++	Oid			x = *(const Oid *) a,
++				y = *(const Oid *) b;
++
++	return (x > y) - (x < y);
++}
++
++/* Whether relid is a catalog whose rows can belong to a branch. */
++bool
++catalog_branch_filters(Oid relid)
++{
++	switch (relid)
++	{
++		case NamespaceRelationId:
++		case RelationRelationId:
++		case TypeRelationId:
++		case ProcedureRelationId:
++		case ConstraintRelationId:
++		case OperatorRelationId:
++		case OperatorClassRelationId:
++		case OperatorFamilyRelationId:
++		case CollationRelationId:
++		case ConversionRelationId:
++		case StatisticExtRelationId:
++		case TSConfigRelationId:
++		case TSDictionaryRelationId:
++		case TSParserRelationId:
++		case TSTemplateRelationId:
++		case AttributeRelationId:
++		case IndexRelationId:
++		case AttrDefaultRelationId:
++		case TriggerRelationId:
++		case RewriteRelationId:
++		case PolicyRelationId:
++		case InheritsRelationId:
++		case SequenceRelationId:
++		case StatisticRelationId:
++		case PartitionedRelationId:
++		case EnumRelationId:
++		case RangeRelationId:
++		case AggregateRelationId:
++		case DependRelationId:
++		case DescriptionRelationId:
++			return true;
++		default:
++			return false;
++	}
++}
++
++static Oid *hidden_set;
++static int	hidden_n,
++			hidden_cap;
++
++static void
++hidden_add(Oid oid)
++{
++	if (hidden_n == hidden_cap)
++	{
++		hidden_cap = hidden_cap ? hidden_cap * 2 : 64;
++		hidden_set = hidden_set ? repalloc(hidden_set, hidden_cap * sizeof(Oid))
++			: MemoryContextAlloc(TopMemoryContext, hidden_cap * sizeof(Oid));
++	}
++	hidden_set[hidden_n++] = oid;
++}
++
++static bool
++hidden_has(const Oid *set, int n, Oid oid)
++{
++	return n > 0 && bsearch(&oid, set, n, sizeof(Oid), oid_cmp_hidden) != NULL;
++}
++
++/* Adds every row of catalog relid whose namespace (column nspatt) is hidden. */
++static void
++hidden_members(Oid relid, AttrNumber oidatt, AttrNumber nspatt, const Oid *nsps, int nnsp)
++{
++	Relation	rel = table_open(relid, AccessShareLock);
++	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
++	HeapTuple	tup;
++	bool		isnull;
++
++	while (HeapTupleIsValid(tup = systable_getnext(scan)))
++	{
++		Oid			nsp = DatumGetObjectId(heap_getattr(tup, nspatt, RelationGetDescr(rel), &isnull));
++
++		if (!isnull && hidden_has(nsps, nnsp, nsp))
++			hidden_add(DatumGetObjectId(heap_getattr(tup, oidatt, RelationGetDescr(rel), &isnull)));
++	}
++	systable_endscan(scan);
++	table_close(rel, AccessShareLock);
++}
++
++/* Before a scan of rel begins: the hidden namespaces, up to date. */
++void
++catalog_branch_prepare(Relation rel)
++{
++	Relation	nsp;
++	SysScanDesc scan;
++	HeapTuple	tup;
++	int			cap = 16,
++				n = 0;
++	Oid		   *set;
++
++	if (!catalog_branch_filter || !hidden_stale || hidden_building ||
++		!catalog_branch_filters(RelationGetRelid(rel)) || !IsTransactionState())
++		return;
++	if (!hidden_callback)
++	{
++		CacheRegisterSyscacheCallback(NAMESPACEOID, hidden_invalidate, (Datum) 0);
++		CacheRegisterSyscacheCallback(RELOID, hidden_invalidate, (Datum) 0);
++		CacheRegisterSyscacheCallback(TYPEOID, hidden_invalidate, (Datum) 0);
++		CacheRegisterSyscacheCallback(PROCOID, hidden_invalidate, (Datum) 0);
++		CacheRegisterSyscacheCallback(CONSTROID, hidden_invalidate, (Datum) 0);
++		hidden_callback = true;
++	}
++	set = MemoryContextAlloc(TopMemoryContext, cap * sizeof(Oid));
++	hidden_building = true;
++	PG_TRY();
++	{
++		nsp = table_open(NamespaceRelationId, AccessShareLock);
++		scan = systable_beginscan(nsp, InvalidOid, false, NULL, 0, NULL);
++		while (HeapTupleIsValid(tup = systable_getnext(scan)))
++		{
++			Form_pg_namespace f = (Form_pg_namespace) GETSTRUCT(tup);
++
++			if (f->nspbranch == 0 || f->nspbranch == catalog_branch)
++				continue;
++			if (n == cap)
++			{
++				cap *= 2;
++				set = repalloc(set, cap * sizeof(Oid));
++			}
++			set[n++] = f->oid;
++		}
++		systable_endscan(scan);
++		table_close(nsp, AccessShareLock);
++		qsort(set, n, sizeof(Oid), oid_cmp_hidden);
++		hidden_n = 0;
++		for (int i = 0; i < n; i++)
++			hidden_add(set[i]);
++		if (n > 0)
++		{
++			hidden_members(RelationRelationId, Anum_pg_class_oid, Anum_pg_class_relnamespace, set, n);
++			hidden_members(TypeRelationId, Anum_pg_type_oid, Anum_pg_type_typnamespace, set, n);
++			hidden_members(ProcedureRelationId, Anum_pg_proc_oid, Anum_pg_proc_pronamespace, set, n);
++			hidden_members(ConstraintRelationId, Anum_pg_constraint_oid, Anum_pg_constraint_connamespace, set, n);
++		}
++		if (hidden_n > 0)
++			qsort(hidden_set, hidden_n, sizeof(Oid), oid_cmp_hidden);
++	}
++	PG_FINALLY();
++	{
++		hidden_building = false;
++	}
++	PG_END_TRY();
++	qsort(set, n, sizeof(Oid), oid_cmp_hidden);
++	if (hidden_nsp)
++		pfree(hidden_nsp);
++	hidden_nsp = set;
++	nhidden = n;
++	hidden_stale = false;
++}
++
++/*
++ * Whether rel is in another branch's namespace: logical decoding on a
++ * branch (catalog_branch set) carries the shared schemas' changes and that
++ * branch's, not the other branches'.  On no branch it carries them all.
++ */
++bool
++catalog_branch_skips(Relation rel)
++{
++	HeapTuple	tup;
 +	int32		branch;
 +
-+	if (htup->t_tableOid != NamespaceRelationId || !catalog_branch_filter)
++	if (catalog_branch == 0)
 +		return false;
-+	branch = ((Form_pg_namespace) GETSTRUCT(htup))->nspbranch;
++	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(rel->rd_rel->relnamespace));
++	if (!HeapTupleIsValid(tup))
++		return false;
++	branch = ((Form_pg_namespace) GETSTRUCT(tup))->nspbranch;
++	ReleaseSysCache(tup);
 +	return branch != 0 && branch != catalog_branch;
++}
++
++/* Whether a catalog row is another branch's, hidden from this query. */
++bool
++catalog_branch_hides(HeapTuple htup, Snapshot snapshot)
++{
++	Oid			nspid;
++
++	if (!catalog_branch_filter || snapshot->for_catalog ||
++		snapshot->snapshot_type != SNAPSHOT_MVCC)
++		return false;
++	switch (htup->t_tableOid)
++	{
++		case NamespaceRelationId:
++			{
++				int32		branch = ((Form_pg_namespace) GETSTRUCT(htup))->nspbranch;
++
++				return branch != 0 && branch != catalog_branch;
++			}
++		case RelationRelationId:
++			nspid = ((Form_pg_class) GETSTRUCT(htup))->relnamespace;
++			break;
++		case TypeRelationId:
++			nspid = ((Form_pg_type) GETSTRUCT(htup))->typnamespace;
++			break;
++		case ProcedureRelationId:
++			nspid = ((Form_pg_proc) GETSTRUCT(htup))->pronamespace;
++			break;
++		case ConstraintRelationId:
++			nspid = ((Form_pg_constraint) GETSTRUCT(htup))->connamespace;
++			break;
++		case OperatorRelationId:
++			nspid = ((Form_pg_operator) GETSTRUCT(htup))->oprnamespace;
++			break;
++		case OperatorClassRelationId:
++			nspid = ((Form_pg_opclass) GETSTRUCT(htup))->opcnamespace;
++			break;
++		case OperatorFamilyRelationId:
++			nspid = ((Form_pg_opfamily) GETSTRUCT(htup))->opfnamespace;
++			break;
++		case CollationRelationId:
++			nspid = ((Form_pg_collation) GETSTRUCT(htup))->collnamespace;
++			break;
++		case ConversionRelationId:
++			nspid = ((Form_pg_conversion) GETSTRUCT(htup))->connamespace;
++			break;
++		case StatisticExtRelationId:
++			nspid = ((Form_pg_statistic_ext) GETSTRUCT(htup))->stxnamespace;
++			break;
++		case TSConfigRelationId:
++			nspid = ((Form_pg_ts_config) GETSTRUCT(htup))->cfgnamespace;
++			break;
++		case TSDictionaryRelationId:
++			nspid = ((Form_pg_ts_dict) GETSTRUCT(htup))->dictnamespace;
++			break;
++		case TSParserRelationId:
++			nspid = ((Form_pg_ts_parser) GETSTRUCT(htup))->prsnamespace;
++			break;
++		case TSTemplateRelationId:
++			nspid = ((Form_pg_ts_template) GETSTRUCT(htup))->tmplnamespace;
++			break;
++		default:
++			{
++				/* a row describing an object: hidden with the object */
++				Oid			obj,
++							obj2 = InvalidOid;
++
++				switch (htup->t_tableOid)
++				{
++					case AttributeRelationId:
++						obj = ((Form_pg_attribute) GETSTRUCT(htup))->attrelid;
++						break;
++					case IndexRelationId:
++						obj = ((Form_pg_index) GETSTRUCT(htup))->indexrelid;
++						break;
++					case AttrDefaultRelationId:
++						obj = ((Form_pg_attrdef) GETSTRUCT(htup))->adrelid;
++						break;
++					case TriggerRelationId:
++						obj = ((Form_pg_trigger) GETSTRUCT(htup))->tgrelid;
++						break;
++					case RewriteRelationId:
++						obj = ((Form_pg_rewrite) GETSTRUCT(htup))->ev_class;
++						break;
++					case PolicyRelationId:
++						obj = ((Form_pg_policy) GETSTRUCT(htup))->polrelid;
++						break;
++					case InheritsRelationId:
++						obj = ((Form_pg_inherits) GETSTRUCT(htup))->inhrelid;
++						break;
++					case SequenceRelationId:
++						obj = ((Form_pg_sequence) GETSTRUCT(htup))->seqrelid;
++						break;
++					case StatisticRelationId:
++						obj = ((Form_pg_statistic) GETSTRUCT(htup))->starelid;
++						break;
++					case PartitionedRelationId:
++						obj = ((Form_pg_partitioned_table) GETSTRUCT(htup))->partrelid;
++						break;
++					case EnumRelationId:
++						obj = ((Form_pg_enum) GETSTRUCT(htup))->enumtypid;
++						break;
++					case RangeRelationId:
++						obj = ((Form_pg_range) GETSTRUCT(htup))->rngtypid;
++						break;
++					case AggregateRelationId:
++						obj = ((Form_pg_aggregate) GETSTRUCT(htup))->aggfnoid;
++						break;
++					case DependRelationId:
++						obj = ((Form_pg_depend) GETSTRUCT(htup))->objid;
++						obj2 = ((Form_pg_depend) GETSTRUCT(htup))->refobjid;
++						break;
++					case DescriptionRelationId:
++						obj = ((Form_pg_description) GETSTRUCT(htup))->objoid;
++						break;
++					default:
++						return false;
++				}
++				return hidden_has(hidden_set, hidden_n, obj) ||
++					(OidIsValid(obj2) && hidden_has(hidden_set, hidden_n, obj2));
++			}
++	}
++	return hidden_has(hidden_set, hidden_n, nspid);
 +}
 +
  Oid
@@ -142,7 +504,7 @@ index 0647a198dea..9bf7707ddbf 100644
  	if (!OidIsValid(oid) && !missing_ok)
  		ereport(ERROR,
  				(errcode(ERRCODE_UNDEFINED_SCHEMA),
-@@ -4789,6 +4829,38 @@ check_search_path(char **newval, void **extra, GucSource source)
+@@ -4789,6 +5165,39 @@ check_search_path(char **newval, void **extra, GucSource source)
  }
  
  /* assign_hook: do extra actions as needed */
@@ -154,6 +516,7 @@ index 0647a198dea..9bf7707ddbf 100644
 +catalog_branch_changed(void)
 +{
 +	baseSearchPathValid = false;
++	hidden_stale = true;
 +	if (criticalRelcachesBuilt && IsTransactionState())
 +		InvalidateSystemCaches();
 +}
@@ -242,6 +605,38 @@ index b016983f904..ceb29b1cc9d 100644
  	if (!HeapTupleIsValid(tup))
  		ereport(ERROR,
  				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+diff --git a/src/backend/replication/logical/reorderbuffer.c b/src/backend/replication/logical/reorderbuffer.c
+index 46843985317..2e63c3657ad 100644
+--- a/src/backend/replication/logical/reorderbuffer.c
++++ b/src/backend/replication/logical/reorderbuffer.c
+@@ -96,6 +96,7 @@
+ #include "access/xact.h"
+ #include "access/xlog_internal.h"
+ #include "catalog/catalog.h"
++#include "catalog/namespace.h"
+ #include "common/int.h"
+ #include "lib/binaryheap.h"
+ #include "miscadmin.h"
+@@ -2368,6 +2369,10 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
+ 					if (!RelationIsLogicallyLogged(relation))
+ 						goto change_done;
+ 
++					/* a stream on a branch carries that branch's changes */
++					if (catalog_branch_skips(relation))
++						goto change_done;
++
+ 					/*
+ 					 * Ignore temporary heaps created during DDL unless the
+ 					 * plugin has asked for them.
+@@ -2503,7 +2508,7 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
+ 							if (!RelationIsValid(rel))
+ 								elog(ERROR, "could not open relation with OID %u", relid);
+ 
+-							if (!RelationIsLogicallyLogged(rel))
++							if (!RelationIsLogicallyLogged(rel) || catalog_branch_skips(rel))
+ 							{
+ 								RelationClose(rel);
+ 								continue;
 diff --git a/src/backend/utils/misc/guc_parameters.dat b/src/backend/utils/misc/guc_parameters.dat
 index 380679a76c0..1a596d469c8 100644
 --- a/src/backend/utils/misc/guc_parameters.dat
@@ -269,6 +664,19 @@ index 380679a76c0..1a596d469c8 100644
  { name => 'check_function_bodies', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
    short_desc => 'Check routine bodies during CREATE FUNCTION and CREATE PROCEDURE.',
    variable => 'check_function_bodies',
+diff --git a/src/backend/utils/time/snapmgr.c b/src/backend/utils/time/snapmgr.c
+index 6defd7203b1..bc466feac4d 100644
+--- a/src/backend/utils/time/snapmgr.c
++++ b/src/backend/utils/time/snapmgr.c
+@@ -140,7 +140,7 @@
+  */
+ static SnapshotData CurrentSnapshotData = {SNAPSHOT_MVCC};
+ static SnapshotData SecondarySnapshotData = {SNAPSHOT_MVCC};
+-static SnapshotData CatalogSnapshotData = {SNAPSHOT_MVCC};
++static SnapshotData CatalogSnapshotData = {.snapshot_type = SNAPSHOT_MVCC,.for_catalog = true};
+ SnapshotData SnapshotSelfData = {SNAPSHOT_SELF};
+ SnapshotData SnapshotAnyData = {SNAPSHOT_ANY};
+ SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
 diff --git a/src/include/catalog/catversion.h b/src/include/catalog/catversion.h
 index 056d48eb279..b4584441700 100644
 --- a/src/include/catalog/catversion.h
@@ -282,18 +690,20 @@ index 056d48eb279..b4584441700 100644
  
  #endif
 diff --git a/src/include/catalog/namespace.h b/src/include/catalog/namespace.h
-index 9453a3e4932..4ede947d9b6 100644
+index 9453a3e4932..6cf44f89c79 100644
 --- a/src/include/catalog/namespace.h
 +++ b/src/include/catalog/namespace.h
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,9 @@
  #ifndef NAMESPACE_H
  #define NAMESPACE_H
  
 +#include "access/htup.h"
++#include "utils/relcache.h"
++#include "utils/snapshot.h"
  #include "nodes/primnodes.h"
  #include "storage/lockdefs.h"
  #include "storage/procnumber.h"
-@@ -164,6 +165,18 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
+@@ -164,6 +167,23 @@ extern Oid	LookupNamespaceNoError(const char *nspname);
  extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
  extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
  
@@ -301,13 +711,18 @@ index 9453a3e4932..4ede947d9b6 100644
 + * Branched catalogs: a namespace row with nspbranch set belongs to that
 + * branch alone.  catalog_branch is this session's branch (0: none);
 + * names resolve to its rows first, then to shared ones, and while
-+ * catalog_branch_filter is on its scans of pg_namespace do not see other
-+ * branches' rows.
++ * catalog_branch_filter is on, its queries do not see other branches'
++ * rows: in pg_namespace, nor in any catalog whose rows belong to one of
++ * those namespaces.  Catalog snapshots are not filtered, so lookups by
++ * object id find every branch's objects.
 + */
 +extern PGDLLIMPORT int catalog_branch;
 +extern PGDLLIMPORT bool catalog_branch_filter;
 +extern HeapTuple SearchNamespaceByName(const char *nspname);
-+extern bool catalog_branch_hides(HeapTuple htup);
++extern bool catalog_branch_filters(Oid relid);
++extern void catalog_branch_prepare(Relation rel);
++extern bool catalog_branch_hides(HeapTuple htup, Snapshot snapshot);
++extern bool catalog_branch_skips(Relation rel);
 +
  extern Oid	LookupCreationNamespace(const char *nspname);
  extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid);
@@ -354,3 +769,20 @@ index 06453a18c03..9865ea94a3c 100644
  extern bool check_serial_buffers(int *newval, void **extra, GucSource source);
  extern bool check_session_authorization(char **newval, void **extra, GucSource source);
  extern void assign_session_authorization(const char *newval, void *extra);
+diff --git a/src/include/utils/snapshot.h b/src/include/utils/snapshot.h
+index 9766aabcad4..91dcb3b156d 100644
+--- a/src/include/utils/snapshot.h
++++ b/src/include/utils/snapshot.h
+@@ -207,6 +207,12 @@ typedef struct SnapshotData
+ 	 * transactions completed since the last GetSnapshotData().
+ 	 */
+ 	uint64		snapXactCompletionCount;
++
++	/*
++	 * A catalog snapshot: version control's catalog filter leaves its reads
++	 * whole, so lookups by object id find every branch's rows.
++	 */
++	bool		for_catalog;
+ } SnapshotData;
+ 
+ #endif							/* SNAPSHOT_H */

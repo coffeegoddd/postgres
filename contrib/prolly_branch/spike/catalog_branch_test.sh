@@ -62,9 +62,8 @@ expect "enum on 2" "$(on 2 -c "SELECT enum_range(NULL::app.mood)")" "{ok,sad,gla
 expect "\\d on 2 shows extra" "$(on 2 -c '\d app.t' | grep -c extra)" 1
 expect "\\d on 1 does not" "$(on 1 -c '\d app.t' | grep -c extra)" 0
 expect "one app schema listed on 1" "$(on 1 -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'app'")" 1
-# pg_dump reads every pg_class row, then looks up each one's namespace: the
-# other branch's rows name a namespace this branch cannot see
-echo "  pg_dump on 1 with two branches: $(PGOPTIONS='-c catalog_branch=1' "$INST/pg_dump" -h /tmp -p $PORT -U postgres -n app -s spike_c 2>&1 >/dev/null | head -1)"
+expect "pg_dump on 1: no extra" "$(PGOPTIONS='-c catalog_branch=1' "$INST/pg_dump" -h /tmp -p $PORT -U postgres -n app -s spike_c 2>&1 | grep -c 'extra\|error')" 0
+expect "pg_dump on 2: extra" "$(PGOPTIONS='-c catalog_branch=2' "$INST/pg_dump" -h /tmp -p $PORT -U postgres -n app -s spike_c 2>&1 | grep -c 'extra integer')" 1
 
 echo "== C2. DDL on both branches at once"
 ( on 1 -c "BEGIN; CREATE INDEX t_m1 ON app.t (m); SELECT pg_sleep(1); COMMIT;" >/dev/null ) &
@@ -86,21 +85,28 @@ echo "== C5. switching branch inside a session"
 expect "SET catalog_branch" "$(on 1 -c "SELECT count(*) FROM app.t" -c "SET catalog_branch = 2" -c "SELECT count(*) FROM app.t" | tr '\n' ' ')" "90 150 "
 expect "a prepared statement across a switch" "$(on 1 -c "PREPARE q AS SELECT count(*) FROM app.t" -c "EXECUTE q" -c "SET catalog_branch = 2" -c "EXECUTE q" | tr '\n' ' ')" "90 150 "
 
-echo "== C6. what is not filtered: pg_class and the other catalogs"
-echo "  pg_class rows named t, seen from 1: $(on 1 -c "SELECT count(*) FROM pg_class WHERE relname = 't'")"
-echo "  pg_class rows named t whose namespace 1 can see: $(on 1 -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE relname = 't'")"
-echo "  regclass of the other branch's t, from 1: $(on 1 -c "SELECT c.oid::regclass FROM pg_class c WHERE relname = 't' AND relnamespace <> 'app'::regnamespace")"
-
+echo "== C6. other catalogs: queries see one branch, lookups by id see all"
+expect "pg_class rows named t, from 1" "$(on 1 -c "SELECT count(*) FROM pg_class WHERE relname = 't'")" 1
+expect "pg_type rows named mood, from 2" "$(on 2 -c "SELECT count(*) FROM pg_type WHERE typname = 'mood'")" 1
+expect "pg_proc rows named f, from 2" "$(on 2 -c "SELECT count(*) FROM pg_proc WHERE proname = 'f'")" 1
+expect "pg_constraint rows on app tables, from 1" "$(on 1 -c "SELECT count(*) FROM pg_constraint WHERE conname = 't_pkey'")" 1
+expect "a session on no branch sees none of them" "$(on 0 -c "SELECT count(*) FROM pg_class WHERE relname = 't'")" 0
+expect "with the filter off, both" "$(on 1 -c "SET catalog_branch_filter = off" -c "SELECT count(*) FROM pg_class WHERE relname = 't'")" 2
+expect "a lookup by id finds the other branch's table" "$(on 1 -c "SET catalog_branch_filter = off" -c "SELECT c.oid FROM pg_class c WHERE relname = 't' AND relnamespace <> 'app'::regnamespace" | tail -1 | xargs -I{} env PGOPTIONS='-c catalog_branch=1' "$INST/psql" -h /tmp -p $PORT -U postgres -d spike_c -X -qAt -c "SELECT {}::regclass::text <> '{}'")" t
 echo "== C7. VACUUM: each branch's table keeps its own numbers; the horizon sees both"
 on 1 -c "VACUUM app.t" >/dev/null; on 2 -c "VACUUM app.t" >/dev/null
 echo "  reltuples by branch: 1 $(on 1 -c "SELECT reltuples::int FROM pg_class WHERE oid = 'app.t'::regclass"), 2 $(on 2 -c "SELECT reltuples::int FROM pg_class WHERE oid = 'app.t'::regclass")"
 expect "datfrozenxid is the min over both branches' tables" "$(on 1 -c "SELECT (SELECT datfrozenxid FROM pg_database WHERE datname = current_database())::text::int8 <= min(relfrozenxid::text::int8) FROM pg_class WHERE relkind = 'r' AND relfrozenxid <> '0'")" t
 
-echo "== C8. logical decoding of both branches' writes"
+echo "== C8. logical decoding: a stream on a branch carries that branch's changes"
 on 1 -c "SELECT 1 FROM pg_create_logical_replication_slot('spike_c', 'test_decoding')" >/dev/null
 on 1 -c "INSERT INTO app.t (v, p) VALUES (501, 1)" >/dev/null
 on 2 -c "INSERT INTO app.t (v, p) VALUES (502, 1)" >/dev/null
-on 0 -c "SELECT data FROM pg_logical_slot_get_changes('spike_c', NULL, NULL) WHERE data LIKE 'table%'" | cut -c1-80
+on 2 -c "INSERT INTO pub.p VALUES (3, 'shared, from 2')" >/dev/null
+peek() { on "$1" -c "SELECT string_agg(coalesce(substring(data from 'v\[integer\]:([0-9]+)'), substring(data from 'note\[text\]:''([a-z]+)')), ',' ORDER BY lsn) FROM pg_logical_slot_peek_changes('spike_c', NULL, NULL) WHERE data LIKE 'table%'"; }
+expect "on branch 1: its row and the shared one" "$(peek 1)" "501,shared"
+expect "on branch 2: its row and the shared one" "$(peek 2)" "502,shared"
+expect "on no branch: all of them" "$(peek 0)" "501,502,shared"
 on 0 -c "SELECT pg_drop_replication_slot('spike_c')" >/dev/null
 
 echo "== C9. a role owning objects on one branch"
@@ -108,9 +114,31 @@ on 2 -c "ALTER TABLE app.only OWNER TO owner2" >/dev/null
 echo "  DROP ROLE from branch 1: $(on 1 -c "DROP ROLE owner2" | head -3 | tr '\n' ' ')"
 echo "  DROP ROLE from branch 0: $(on 0 -c "DROP ROLE owner2" | head -3 | tr '\n' ' ')"
 
+echo "== C11. autovacuum visits every branch's tables"
+"$INST/psql" -h /tmp -p $PORT -U postgres -d postgres -X -q -c "ALTER SYSTEM SET autovacuum_naptime = 1" -c "ALTER SYSTEM SET autovacuum_vacuum_threshold = 10" -c "ALTER SYSTEM SET autovacuum_vacuum_scale_factor = 0" -c "SELECT pg_reload_conf()" >/dev/null
+on 1 -c "DELETE FROM app.t WHERE v <= 40" >/dev/null
+on 2 -c "DELETE FROM app.t WHERE v <= 30" >/dev/null
+vacuumed() { on "$1" -c "SELECT last_autovacuum IS NOT NULL FROM pg_stat_user_tables WHERE schemaname = 'app' AND relname = 't'"; }
+for i in $(seq 1 30); do [ "$(vacuumed 1)$(vacuumed 2)" == "tt" ] && break; sleep 1; done
+expect "branch 1's t autovacuumed" "$(vacuumed 1)" t
+expect "branch 2's t autovacuumed" "$(vacuumed 2)" t
+expect "each branch's dead rows gone" "$(on 1 -c "SELECT n_dead_tup FROM pg_stat_user_tables WHERE schemaname = 'app' AND relname = 't'")/$(on 2 -c "SELECT n_dead_tup FROM pg_stat_user_tables WHERE schemaname = 'app' AND relname = 't'")" "0/0"
+"$INST/psql" -h /tmp -p $PORT -U postgres -d postgres -X -q -c "ALTER SYSTEM RESET ALL" -c "SELECT pg_reload_conf()" >/dev/null
+
+echo "== C12. temporary tables on a branch"
+expect "a temp table on branch 2" "$(on 2 -c "CREATE TEMP TABLE scratch (x int)" -c "INSERT INTO scratch VALUES (1), (2)" -c "SELECT count(*) FROM scratch" -c "SELECT count(*) FROM pg_class WHERE relname = 'scratch'" | tr '\n' ' ')" "2 1 "
+expect "a temp table may share a versioned table's name" "$(on 1 -c "CREATE TEMP TABLE t (x int)" -c "SELECT count(*) FROM pg_temp.t" -c "SELECT count(*) FROM app.t" | tr '\n' ' ')" "0 51 "
+
+echo "== C13. extensions"
+expect "an extension in a shared schema serves both branches" "$(on 1 -c "CREATE EXTENSION hstore SCHEMA pub" >/dev/null; on 2 -c "SELECT ('a=>1'::pub.hstore) OPERATOR(pub.->) 'a'")" 1
+on 1 -c "DROP EXTENSION hstore" >/dev/null
+echo "  an extension in branch 1's versioned schema: $(on 1 -c "CREATE EXTENSION pg_trgm SCHEMA app" 2>&1 | head -1)ok"
+echo "  the same on branch 2: $(on 2 -c "CREATE EXTENSION pg_trgm SCHEMA app" 2>&1 | head -1)"
+echo "  branch 2 using branch 1's: $(on 2 -c "SELECT app.similarity('abc', 'abd')" 2>&1 | head -1)"
+
 echo "== C10. dropping a branch's schema leaves the other"
 on 2 -c "DROP SCHEMA app CASCADE" >/dev/null
 expect "2 has no app" "$(on 2 -c "SELECT count(*) FROM app.t" | grep -c 'does not exist')" 1
-expect "1 still has it" "$(on 1 -c "SELECT count(*) FROM app.t")" 91
+expect "1 still has it" "$(on 1 -c "SELECT count(*) FROM app.t")" 51
 "$INST/pg_ctl" -D "$DATA" -w stop -m fast >/dev/null
 exit $fail
