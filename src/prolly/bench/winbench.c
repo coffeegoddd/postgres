@@ -898,7 +898,7 @@ dolt_commit(int seq, const char *branch)
 	t3 = now_ms();
 
 	/* the window: what falls out is discarded, images with it */
-	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
+	CHECK(vc_sever(&repo, &(VcWindow) {.depth = (uint32_t) o.window}, &seg) == VC_OK);
 	if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
 
@@ -1680,7 +1680,7 @@ life_commit(int seq, const char *branch)
 	snprintf(msg, sizeof(msg), "%s %d", branch, seq);
 	/* exactly the state as of the barrier, whatever has landed since */
 	c = o.sql_decode ? vc_commit(&repo, msg) : vc_commit_root(&repo, &bar_root, msg);
-	CHECK(vc_sever(&repo, &(VcWindow) {(uint32_t) o.window, NULL, 0}, &seg) == VC_OK);
+	CHECK(vc_sever(&repo, &(VcWindow) {.depth = (uint32_t) o.window}, &seg) == VC_OK);
 	if (seg != VC_NO_SEGMENT && archive)
 		CHECK(vc_segment_export(&repo, seg, &(VcSource) {"archive", archive}) == VC_OK);
 	else if (seg != VC_NO_SEGMENT)

@@ -382,7 +382,8 @@ vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out)
 	out->hash = *h;
 	memcpy(out->root.b, p, PHASH_LEN);
 	p += PHASH_LEN;
-	if (!read_uvarint(&p, end, &out->generation) ||
+	if (!read_uvarint(&p, end, &out->generation) || !read_uvarint(&p, end, &out->bytes) ||
+		!read_uvarint(&p, end, &out->time) ||
 		!read_uvarint(&p, end, &np) || np > VC_MAX_PARENTS)
 		return false;
 	out->nparents = (uint32_t) np;
@@ -392,11 +393,12 @@ vc_commit_load(ProllyCtx *ctx, const PHash *h, VcCommit *out)
 			return false;
 		memcpy(out->parents[i].b, p, PHASH_LEN);
 		p += PHASH_LEN;
-		if (!read_uvarint(&p, end, &out->parent_gen[i]))
+		if (!read_uvarint(&p, end, &out->parent_gen[i]) ||
+			!read_uvarint(&p, end, &out->parent_bytes[i]) ||
+			!read_uvarint(&p, end, &out->parent_time[i]))
 			return false;
 	}
-	if (!read_uvarint(&p, end, &out->time) || !read_uvarint(&p, end, &ml) ||
-		ml != (uint64_t) (end - p))
+	if (!read_uvarint(&p, end, &ml) || ml != (uint64_t) (end - p))
 		return false;
 	out->msg = (const char *) p;
 	out->msglen = ml;
@@ -420,34 +422,101 @@ must_load_commit(ProllyCtx *ctx, const PHash *h)
 	return c;
 }
 
+typedef struct SizeAcc
+{
+	ProllyCtx  *ctx;
+	uint64_t	bytes;
+} SizeAcc;
+
+static void
+size_fn(void *arg, const PHash *h)
+{
+	SizeAcc    *a = arg;
+	size_t		len;
+
+	if (cs_get(a->ctx->cs, h, &len))
+		a->bytes += len;
+}
+
+static void
+table_bytes_fn(void *arg, const VcTableChange *c)
+{
+	SizeAcc    *a = arg;
+	PHash		from;
+
+	if (!c->has_to)
+		return;
+	if (!c->has_from || !phash_eq(&c->from.schema, &c->to.schema))
+		size_fn(a, &c->to.schema);
+	if (c->has_from)
+		from = c->from.data;
+	else
+		vc_must(a->ctx, prolly_empty(a->ctx, 0, &from));
+	vc_must(a->ctx, prolly_chunk_diff(a->ctx, &c->to.data, &from, size_fn, a));
+}
+
+/*
+ * A commit's change bytes: the chunks its root value has that base (its
+ * first parent's, or an empty one) lacks.  Content alone decides it, so it
+ * costs what changed and is the same wherever the commit is written.
+ */
+static uint64_t
+change_bytes(ProllyCtx *ctx, const PHash *root, const PHash *base)
+{
+	SizeAcc		a = {ctx, 0};
+	PHash		empty;
+
+	if (base == NULL)
+	{
+		empty = vc_root_empty(ctx);
+		base = &empty;
+	}
+	vc_must(ctx, prolly_chunk_diff(ctx, root, base, size_fn, &a));
+	vc_diff_tables(ctx, base, root, table_bytes_fn, &a);
+	return a.bytes;
+}
+
+/*
+ * time is raised past every parent's, so along any history generation,
+ * change bytes and time all only fall.
+ */
 PHash
 vc_commit_write(ProllyCtx *ctx, const PHash *root, const PHash *parents,
 				uint32_t nparents, uint64_t time, const char *msg)
 {
 	Buf			b = BUF_INIT;
-	uint64_t	gens[VC_MAX_PARENTS];
-	uint64_t	gen = 0;
+	VcCommit	pc[VC_MAX_PARENTS];
+	uint64_t	gen = 0,
+				bytes = 0;
 	PHash		h;
 
 	if (nparents > VC_MAX_PARENTS)
 		abort();
 	for (uint32_t i = 0; i < nparents; i++)
 	{
-		gens[i] = must_load_commit(ctx, &parents[i]).generation;
-		if (gens[i] > gen)
-			gen = gens[i];
+		pc[i] = must_load_commit(ctx, &parents[i]);
+		if (pc[i].generation > gen)
+			gen = pc[i].generation;
+		if (pc[i].bytes > bytes)
+			bytes = pc[i].bytes;
+		if (pc[i].time >= time)
+			time = pc[i].time + 1;
 	}
+	bytes += change_bytes(ctx, root, nparents ? &pc[0].root : NULL);
 	buf_append_byte(&b, CHUNK_TAG_COMMIT);
 	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	buf_append(&b, root->b, PHASH_LEN);
 	buf_append_uvarint(&b, gen + 1);
+	buf_append_uvarint(&b, bytes);
+	buf_append_uvarint(&b, time);
 	buf_append_uvarint(&b, nparents);
 	for (uint32_t i = 0; i < nparents; i++)
 	{
 		buf_append(&b, parents[i].b, PHASH_LEN);
-		buf_append_uvarint(&b, gens[i]);
+		buf_append_uvarint(&b, pc[i].generation);
+		buf_append_uvarint(&b, pc[i].bytes);
+		buf_append_uvarint(&b, pc[i].time);
 	}
-	buf_append_uvarint(&b, time);
 	buf_append_uvarint(&b, strlen(msg));
 	buf_append(&b, msg, strlen(msg));
 	vc_must(ctx, prolly_put_chunk(ctx, b.data, b.len, &h));
@@ -621,8 +690,9 @@ vc_merge_base(ProllyCtx *ctx, const PHash *a, const PHash *b, PHash *out)
 #define LOC_BOUNDARY UINT64_MAX
 
 static int	reach_commit(VcRepo *r, const PHash *h, unsigned flags, VcCommit *c);
-static int	window_add(VcRepo *r, PHashMap *win, const PHash *head, uint64_t depth,
+static int	window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
 					   PHashMap *below);
+static uint64_t now_us(VcRepo *r);
 
 static PHash
 name_key(const char *name)
@@ -649,7 +719,7 @@ cover_head(VcRepo *r, const PHash *head, int delta)
 	if (r->track_depth == 0)
 		return;
 	phmap_init(&win);
-	window_add(r, &win, head, r->track_depth, NULL);
+	window_add(r, &win, head, &(VcWindow) {.depth = r->track_depth}, NULL);
 	for (size_t i = 0; i < win.cap; i++)
 	{
 		bool		created;
@@ -854,9 +924,30 @@ in_window(VcRepo *r, const PHash *h)
 static void
 enter_window(VcRepo *r, const PHash *h)
 {
+	if (loc_get(r, h) != LOC_WINDOW)
+		r->nheld++;
 	set_loc(r, h, LOC_WINDOW);
 	if (r->track_depth)
 		pending_push(r, h);
+}
+
+/* Writes a commit and keeps it in the window's history. */
+static uint64_t
+now_us(VcRepo *r)
+{
+	struct timespec ts;
+
+	if (r->now)
+		return r->now(r->now_arg);
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
+}
+
+void
+vc_set_clock(VcRepo *r, uint64_t (*now) (void *arg), void *arg)
+{
+	r->now = now;
+	r->now_arg = arg;
 }
 
 /* Writes a commit and keeps it in the window's history. */
@@ -864,10 +955,27 @@ static PHash
 keep_commit(VcRepo *r, const PHash *root, const PHash *parents, uint32_t np,
 			const char *msg)
 {
-	PHash		h = vc_commit_write(&r->ctx, root, parents, np, r->clock++, msg);
+	uint64_t	t = now_us(r);
+	PHash		h;
+	VcCommit	c;
 
+	/* a repo's commits are strictly ordered in time */
+	if (t <= r->clock)
+		t = r->clock + 1;
+	h = vc_commit_write(&r->ctx, root, parents, np, t, msg);
 	cs_ref_root(r->ctx.cs, &h);
 	enter_window(r, &h);
+	c = must_load_commit(&r->ctx, &h);
+	r->clock = c.time;
+	r->since_commits++;
+	{
+		uint64_t	pb = 0;
+
+		for (uint32_t i = 0; i < c.nparents; i++)
+			if (c.parent_bytes[i] > pb)
+				pb = c.parent_bytes[i];
+		r->since_bytes += c.bytes - pb;
+	}
 	return h;
 }
 
@@ -890,15 +998,18 @@ repo_init_empty(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 
 /*
  * Repos started separately must not share history by accident, so each
- * init commit is unique: the repo clock starts from the time and a
- * process-wide counter.
+ * init commit is unique: no two in a process get the same time.
  */
 static uint64_t
-unique_clock(void)
+unique_clock(VcRepo *r)
 {
-	static uint64_t counter;
+	static uint64_t last;
+	uint64_t	t = now_us(r);
 
-	return ((uint64_t) time(NULL) << 24) + (++counter << 4);
+	if (t <= last)
+		t = last + 1;
+	last = t;
+	return t - 1;
 }
 
 void
@@ -908,7 +1019,8 @@ vc_repo_init(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy)
 				commit;
 
 	repo_init_empty(r, cs, policy);
-	r->clock = unique_clock();
+	r->clock = unique_clock(r);
+	r->last_sever = r->clock;
 	root = vc_root_empty(&r->ctx);
 	commit = keep_commit(r, &root, NULL, 0, "init");
 	add_branch(r, "main", &commit, &root);
@@ -1255,6 +1367,10 @@ vc_repo_save(VcRepo *r)
 	buf_append_byte(&b, CHUNK_FORMAT_VERSION);
 	put_str(&b, r->name);
 	buf_append_uvarint(&b, r->clock);
+	buf_append_uvarint(&b, r->nheld);
+	buf_append_uvarint(&b, r->since_commits);
+	buf_append_uvarint(&b, r->since_bytes);
+	buf_append_uvarint(&b, r->last_sever);
 	buf_append_uvarint(&b, r->window_depth);
 	buf_append_uvarint(&b, r->track_depth);
 	buf_append_uvarint(&b, r->cur);
@@ -1393,6 +1509,10 @@ vc_repo_open(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy, const PHash *
 	free(r->name);
 	r->name = rd_str(&rd);
 	r->clock = rd_uv(&rd);
+	r->nheld = rd_uv(&rd);
+	r->since_commits = rd_uv(&rd);
+	r->since_bytes = rd_uv(&rd);
+	r->last_sever = rd_uv(&rd);
 	r->window_depth = (uint32_t) rd_uv(&rd);
 	track = rd_uv(&rd);
 	r->cur = rd_uv(&rd);
@@ -1583,23 +1703,129 @@ vc_image_get(VcRepo *r, const PHash *commit, PHash *image)
 
 /* --------------------------------------------------------------- window */
 
+/* Only a depth: the window is a generation band. */
+static bool
+depth_only(const VcWindow *w)
+{
+	return w->depth && !w->keep_bytes && !w->keep_seconds && !w->max_commits && !w->max_bytes &&
+		!w->max_seconds;
+}
+
+/* Whether a floor keeps a commit with these measures, against head H. */
+static bool
+floor_keeps(const VcWindow *w, const VcCommit *H, uint64_t now, uint64_t gen,
+			uint64_t bytes, uint64_t time)
+{
+	if (!w->depth && !w->keep_bytes && !w->keep_seconds)
+		return true;			/* no floor: the ceilings decide */
+	return (w->depth && gen + w->depth > H->generation) ||
+		(w->keep_bytes && bytes + w->keep_bytes > H->bytes) ||
+		(w->keep_seconds && time + w->keep_seconds * 1000000 > now);
+}
+
 /*
- * Adds to win every commit within depth generations of head: those with
- * generation > gen(head) - depth on some path from it.  win maps each
- * commit to 1 + the lowest generation bound it was expanded under, so a
- * commit reached again under a lower bound is expanded again.  Parent
- * generations live in the child, so nothing outside the window is read.
+ * Whether a ceiling cuts a commit; span is the change bytes of it and
+ * every commit after it up to H.
+ */
+static bool
+ceiling_cuts(const VcWindow *w, const VcCommit *H, uint64_t now, uint64_t gen,
+			 uint64_t span, uint64_t time)
+{
+	return (w->max_commits && gen + w->max_commits <= H->generation) ||
+		(w->max_bytes && span > w->max_bytes) ||
+		(w->max_seconds && time + w->max_seconds * 1000000 <= now);
+}
+
+/*
+ * The window of one head under floors and ceilings.  Generation, change
+ * bytes and time only fall along history, so once a commit is out, all
+ * its ancestors are out on that path: the walk stops there.  A parent's
+ * measures are in its child, so a parent no floor keeps is never read; one
+ * a byte ceiling may cut is read for its own change bytes.
  */
 static int
-window_add(VcRepo *r, PHashMap *win, const PHash *head, uint64_t depth, PHashMap *below)
+window_add_policy(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w,
+				  PHashMap *below)
 {
+	VcCommit	H,
+				c;
+	PHashMap	seen;
+	PHash	   *stack = NULL;
+	size_t		n = 0,
+				cap = 0;
+	uint64_t	now = now_us(r);
+	int			rc = load_commit(&r->ctx, head, &H);
+	bool		created;
+
+	if (rc != VC_OK)
+		return rc;
+	phmap_init(&seen);
+	px_grow((void **) &stack, &cap, 1, sizeof(PHash));
+	stack[n++] = *head;
+	while (n > 0)
+	{
+		PHash		h = stack[--n];
+		uint64_t	pb = 0;
+
+		phmap_ref(&seen, &h, &created);
+		if (!created)
+			continue;
+		/* a wider window can reach commits already cut; they stay cut */
+		if (!vc_commit_load(&r->ctx, &h, &c))
+			continue;
+		for (uint32_t i = 0; i < c.nparents; i++)
+			if (c.parent_bytes[i] > pb)
+				pb = c.parent_bytes[i];
+		if (!phash_eq(&h, head) &&
+			ceiling_cuts(w, &H, now, c.generation, H.bytes - pb, c.time))
+		{
+			if (below)
+				phmap_ref(below, &h, &created);
+			continue;
+		}
+		phmap_ref(win, &h, &created);
+		for (uint32_t i = 0; i < c.nparents; i++)
+		{
+			if (!floor_keeps(w, &H, now, c.parent_gen[i], c.parent_bytes[i], c.parent_time[i]) ||
+				ceiling_cuts(w, &H, now, c.parent_gen[i], H.bytes - c.parent_bytes[i],
+							 c.parent_time[i]))
+			{
+				if (below)
+					phmap_ref(below, &c.parents[i], &created);
+				continue;
+			}
+			px_grow((void **) &stack, &cap, n + 1, sizeof(PHash));
+			stack[n++] = c.parents[i];
+		}
+	}
+	free(stack);
+	phmap_free(&seen);
+	return VC_OK;
+}
+
+/*
+ * Adds to win every commit in head's window.  With only a depth, those
+ * with generation > gen(head) - depth on some path from it: win maps each
+ * commit to 1 + the lowest generation bound it was expanded under, so a
+ * commit reached again under a lower bound is expanded again, and heads
+ * sharing history share the walk.  Parent generations live in the child,
+ * so nothing outside the window is read.  below collects the parents the
+ * window stops at.
+ */
+static int
+window_add(VcRepo *r, PHashMap *win, const PHash *head, const VcWindow *w, PHashMap *below)
+{
+	uint64_t	depth = w->depth;
 	VcCommit	c;
 	PHash	   *stack = NULL;
 	size_t		n = 0,
 				cap = 0;
 	uint64_t	bound;
-	int			rc = load_commit(&r->ctx, head, &c);
+	int			rc;
 
+	if (!depth_only(w))
+		return window_add_policy(r, win, head, w, below);
+	rc = load_commit(&r->ctx, head, &c);
 	if (rc != VC_OK)
 		return rc;
 	bound = c.generation > depth ? c.generation - depth : 0;
@@ -1645,9 +1871,10 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	VcSegment  *seg;
 
 	*seg_out = VC_NO_SEGMENT;
-	if (w->depth == 0)
-		return VC_ERR;			/* branch heads are always in the window */
-	if (r->track_depth == w->depth && w->npinned == 0)
+	if (!w->depth && !w->keep_bytes && !w->keep_seconds && !w->max_commits &&
+		!w->max_bytes && !w->max_seconds)
+		return VC_ERR;			/* no window at all */
+	if (r->track_depth == w->depth && w->npinned == 0 && depth_only(w))
 	{
 		/* incremental: only commits whose cover fell to zero can leave */
 		PHashMap	seen;
@@ -1673,12 +1900,12 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	phmap_init(&below);
 	for (size_t i = 0; i < r->nbr && rc == VC_OK; i++)
 	{
-		rc = window_add(r, &win, &r->br[i].head, w->depth, &below);
+		rc = window_add(r, &win, &r->br[i].head, w, &below);
 		if (rc == VC_OK && r->br[i].merging)
-			rc = window_add(r, &win, &r->br[i].merge_head, w->depth, &below);
+			rc = window_add(r, &win, &r->br[i].merge_head, w, &below);
 	}
 	for (size_t i = 0; i < w->npinned && rc == VC_OK; i++)
-		rc = window_add(r, &win, &w->pinned[i], 1, &below);
+		rc = window_add(r, &win, &w->pinned[i], &(VcWindow) {.depth = 1}, &below);
 	if (rc != VC_OK)
 	{
 		phmap_free(&win);
@@ -1708,12 +1935,16 @@ vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg_out)
 	phmap_free(&win);
 	phmap_free(&below);
 detach:
+	r->since_commits = 0;
+	r->since_bytes = 0;
+	r->last_sever = now_us(r);
 	if (n == 0)
 	{
 		free(members);
 		free(edge);
 		return VC_OK;
 	}
+	r->nheld -= n;
 
 	/* commit images are only for the window: severed commits let theirs go */
 	for (size_t i = 0; i < n; i++)
@@ -1733,6 +1964,31 @@ detach:
 		set_loc(r, &members[i], LOC_SEG_BASE + r->nsegs);
 	*seg_out = (uint32_t) r->nsegs++;
 	return VC_OK;
+}
+
+static uint64_t
+min_set(uint64_t a, uint64_t b)
+{
+	if (a == 0)
+		return b;
+	if (b == 0)
+		return a;
+	return a < b ? a : b;
+}
+
+bool
+vc_sever_due(VcRepo *r, const VcWindow *w)
+{
+	uint64_t	bytes = min_set(w->keep_bytes, w->max_bytes),
+				secs = min_set(w->keep_seconds, w->max_seconds);
+
+	if (r->since_commits * VC_SEVER_SLACK >= (r->nheld ? r->nheld : 1))
+		return true;
+	if (bytes && r->since_bytes * VC_SEVER_SLACK >= bytes)
+		return true;
+	if (secs && (now_us(r) - r->last_sever) * VC_SEVER_SLACK >= secs * 1000000)
+		return true;
+	return false;
 }
 
 int
@@ -1777,7 +2033,7 @@ vc_window_verify(VcRepo *r)
 		PHashMap	win;
 
 		phmap_init(&win);
-		window_add(r, &win, &r->br[i].head, r->track_depth, NULL);
+		window_add(r, &win, &r->br[i].head, &(VcWindow) {.depth = r->track_depth}, NULL);
 		if (r->br[i].merging)
 		{
 			for (size_t j = 0; j < win.cap; j++)
@@ -1785,7 +2041,7 @@ vc_window_verify(VcRepo *r)
 					(*phmap_ref(&want, &win.keys[j], &created))++;
 			phmap_free(&win);
 			phmap_init(&win);
-			window_add(r, &win, &r->br[i].merge_head, r->track_depth, NULL);
+			window_add(r, &win, &r->br[i].merge_head, &(VcWindow) {.depth = r->track_depth}, NULL);
 		}
 		for (size_t j = 0; j < win.cap; j++)
 			if (win.used[j])

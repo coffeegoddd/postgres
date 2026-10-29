@@ -1175,6 +1175,60 @@ about 0.8 s.  That is where a keyframe could pay.  Its break-even point R
 real page-restore path, not the libpq harness's 150 us per page.  Nothing
 in the window's depth changes R.
 
+## The window as floors and ceilings
+
+**What it is.**  The window is set by commits, change size or time, alone
+or combined, as floors (keep at least) and ceilings (keep at most):
+- **floors:** `depth` (generations from a head), `keep_bytes`,
+  `keep_seconds`;
+- **ceilings:** `max_commits`, `max_bytes`, `max_seconds`;
+- **the rule:** a commit is kept when any floor covers it and no ceiling
+  cuts it, so a ceiling wins over a floor.  With no floor set, the
+  ceilings alone decide.  Branch heads are always kept;
+- **change size** is new-chunk bytes: the chunks a commit's root has that
+  its first parent's lacks.  Content alone decides it, and it costs what
+  changed to compute at commit time.
+
+**How it is cheap.**
+- **What a commit carries:** its generation, cumulative change bytes and
+  time (wall-clock microseconds, raised past every parent's), and the same
+  three for each parent.  All three only fall along history.  So a head's
+  window is one walk that stops at the first commit out, and a parent no
+  floor keeps is never read.
+- **When to sever:** `vc_sever_due` says a sever is due once the commits
+  since the last one reach a tenth of those held, or their change bytes a
+  tenth of the smallest byte limit, or the time a tenth of the shortest
+  time limit.  Severing when due keeps the window within W/9 over a
+  ceiling, at a cost per commit that does not grow with W.
+- **The tests** (`test/test_window.c`) check:
+  - every limit as a floor and as a ceiling, and exact byte boundaries;
+  - change bytes against a direct closure diff, and times always
+    increasing;
+  - the overshoot bound, and the counters across a reopen;
+  - a randomized run of branches, merges, clock jumps and policies,
+    against the window computed straight from the definition.
+
+**At 1M commits** (`bench/deepbench --due`, saving every commit; a 100k-row
+table, 4 changes a commit, about 15 KB of change bytes each):
+
+| Window | Held at 1M | Commit + sever | Save | Severs, 100k to 1M |
+|---|---:|---:|---:|---:|
+| everything | 1,000,004 | 109 us | 35 us | 22, 169 ms each |
+| at most 100k commits | 110,133 | 112 us | 28 us | 81, 196 ms each |
+| at least 0.5 GB, at most 1.5 GB | 33,063 | 109 us | 25 us | 288, 44 ms each |
+| at least 10 s, at most 30 s | 54,835 | 115 us | 26 us | 175, 85 ms each |
+| at least 5 s, at most 200k commits and 1 GB | 28,353 | 108 us | 24 us | 308, 41 ms each |
+
+- **Flat.**  Commit plus amortized severing is 98-115 us from 1k to 1M
+  commits in every policy.  Logs, short merge bases, diffs and reopening
+  do not move.
+- **What a ceiling does.**  It only bounds what the floors keep.  With a
+  10-second floor under a 30-second ceiling, the window is the last 10
+  seconds (about 55k commits here); a ceiling over a smaller floor never
+  binds.
+- **The cost of severing** includes discarding, which frees the cut
+  commits' chunks: about 2 us a commit held.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

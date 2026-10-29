@@ -849,7 +849,7 @@ disk_run(bool compact, bool export, DiskRun *out, uint64_t *archive_disk)
 		vc_set_working(&r, &o);
 		batch_free(&b);
 		vc_commit(&r, "step");
-		CHECK(vc_sever(&r, &(VcWindow) {5, NULL, 0}, &seg) == VC_OK);
+		CHECK(vc_sever(&r, &(VcWindow) {.depth = 5}, &seg) == VC_OK);
 		if (seg != VC_NO_SEGMENT && export)
 			CHECK(vc_segment_export(&r, seg, &(VcSource) {"cold", acs}) == VC_OK);
 		else if (seg != VC_NO_SEGMENT)

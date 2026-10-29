@@ -98,7 +98,7 @@ main(int argc, char **argv)
 		vc_set_working(&r, &o);
 		batch_free(&b);
 		vc_commit(&r, "step");
-		CHECK(vc_sever(&r, &(VcWindow) {(uint32_t) window, NULL, 0}, &seg) == VC_OK);
+		CHECK(vc_sever(&r, &(VcWindow) {.depth = (uint32_t) window}, &seg) == VC_OK);
 		if (seg != VC_NO_SEGMENT && acs)
 			CHECK(vc_segment_export(&r, seg, &(VcSource) {"archive", acs}) == VC_OK);
 		else if (seg != VC_NO_SEGMENT)

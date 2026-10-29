@@ -16,8 +16,9 @@
  *			Every node of a tree carries the same policy and vrefs.
  * Schema:	tag, version, DDL bytes
  * Commit:	tag, version, root value hash (strong), uvarint generation,
- *			uvarint nparents, (parent hash (weak), uvarint generation)...,
- *			uvarint time, uvarint msglen, msg
+ *			uvarint change bytes, uvarint time, uvarint nparents, (parent
+ *			hash (weak), uvarint generation, uvarint change bytes, uvarint
+ *			time)..., uvarint msglen, msg
  * Delta:	tag, version, base hash (weak), target hash (weak), uvarint n,
  *			(op byte, uvarint klen, key, [uvarint vlen, value])...
  * Manifest: tag, version, uvarint namelen, source repo name, uvarint n,
@@ -52,7 +53,7 @@
  * Covers the encodings and the chunk boundary function; anything that
  * changes the bytes a given set of rows produces must bump it.
  */
-#define CHUNK_FORMAT_VERSION 1
+#define CHUNK_FORMAT_VERSION 2
 
 /* Chunk size policy; chunks average about target_bytes. */
 typedef struct ChunkPolicy

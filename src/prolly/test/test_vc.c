@@ -851,7 +851,8 @@ test_vc_scaling(void)
 		CHECK_EQ(x->branch_reads + x->branch_writes, 0);
 		CHECK_EQ(x->checkout_reads + x->checkout_writes, 0);
 		CHECK_EQ(x->commit_writes, 1);
-		CHECK_LE(x->commit_reads, 1);
+		/* O(k log n): a commit reads what changed, to measure its change bytes */
+		CHECK_LE(x->commit_reads, 4 * VC_K * h + 4);
 		CHECK_EQ(x->reset_reads, 1);
 		CHECK_EQ(x->log_reads, 3);
 		/* O(k log n); the +6 covers the root-value map and schema */

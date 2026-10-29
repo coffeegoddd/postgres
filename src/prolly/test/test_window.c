@@ -395,7 +395,7 @@ test_merge_commit_parents_across_edge(void)
 	VcMergeResult m;
 	VcCommit	cm;
 	LogAcc		acc;
-	VcWindow	depth1 = {1, NULL, 0};
+	VcWindow	depth1 = {.depth = 1};
 	Snap		se;
 
 	setup(&r, cs);
@@ -438,7 +438,7 @@ test_overlapping_branch_windows(void)
 	VcRepo		r;
 	PHash		h[8];
 	uint32_t	seg;
-	VcWindow	depth3 = {3, NULL, 0};
+	VcWindow	depth3 = {.depth = 3};
 
 	/* main: init, 1..6; side from 3: s1, s2 (stored in h[7] and r) */
 	setup(&r, cs);
@@ -477,7 +477,7 @@ test_pinned_commit_stays(void)
 	VcRepo		r;
 	Linear		l;
 	uint32_t	seg;
-	VcWindow	w = {1, NULL, 0};
+	VcWindow	w = {.depth = 1};
 
 	setup(&r, cs);
 	l = build_linear(&r);
@@ -502,7 +502,7 @@ test_refuse_outside_window(void)
 	VcRepo		r;
 	Linear		l;
 	uint32_t	seg;
-	VcWindow	bad = {0, NULL, 0};
+	VcWindow	bad = {.depth = 0};
 
 	setup(&r, cs);
 	l = build_linear(&r);
@@ -750,7 +750,7 @@ test_incremental_window_matches_full(void)
 			int			want = full_cut_count(&r, depth);
 			uint32_t	seg;
 
-			CHECK(vc_sever(&r, &(VcWindow) {depth, NULL, 0}, &seg) == VC_OK);
+			CHECK(vc_sever(&r, &(VcWindow) {.depth = depth}, &seg) == VC_OK);
 			CHECK_EQ(seg == VC_NO_SEGMENT ? 0 : (int) r.segs[seg].n, want);
 			if (seg != VC_NO_SEGMENT)
 				CHECK(vc_segment_discard(&r, seg) == VC_OK);
@@ -826,7 +826,7 @@ win_scale_case(int history, WinScale *s)
 	ChunkStore *cs = memstore_create();
 	ChunkStore *archive = memstore_create();
 	VcRepo		r;
-	VcWindow	w = {5, NULL, 0};
+	VcWindow	w = {.depth = 5};
 	uint32_t	seg;
 	ChunkStoreStats st;
 	PHash		prev,
@@ -986,7 +986,7 @@ state_run(bool tracked)
 		uint64_t	before;
 
 		commit_rows(&r, (uint64_t) i, (uint64_t) i + 1, (uint64_t) i, "step");
-		CHECK(vc_sever(&r, &(VcWindow) {5, NULL, 0}, &seg) == VC_OK);
+		CHECK(vc_sever(&r, &(VcWindow) {.depth = 5}, &seg) == VC_OK);
 		if (seg != VC_NO_SEGMENT)
 		{
 			CHECK(r.segs[seg].edge_known == !tracked);
@@ -1042,6 +1042,447 @@ test_state_does_not_grow_with_history(void)
 	state_run(false);
 }
 
+/* ---------------------------------------------------- floors and ceilings */
+
+typedef struct FakeClock
+{
+	uint64_t	us;
+} FakeClock;
+
+static uint64_t
+fake_now(void *arg)
+{
+	return ((FakeClock *) arg)->us;
+}
+
+#define SEC 1000000ULL
+
+/*
+ * Fake clocks start from the real one: a repo's first commit is made on
+ * the system clock, and no commit's time goes back past its parent's.
+ */
+static uint64_t
+clock_base(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t) ts.tv_sec * SEC + 1000 * SEC;
+}
+
+/* A commit of k random row changes on the current branch, after dt seconds. */
+static PHash
+timed_commit(VcRepo *r, FakeClock *clk, uint64_t dt, int k, uint64_t ver)
+{
+	EditBatch	b;
+	PHash		rv = vc_working(r),
+				out;
+
+	clk->us += dt * SEC;
+	batch_init(&b, (size_t) k);
+	for (int i = 0; i < k; i++)
+		batch_put(&b, rnd_below(KEYS), ver);
+	CHECK(vc_table_edit(&r->ctx, &rv, "t", b.e, b.n, &out) == 0);
+	vc_set_working(r, &out);
+	batch_free(&b);
+	return vc_commit(r, "timed");
+}
+
+static uint64_t
+own_bytes(const VcCommit *c)
+{
+	uint64_t	pb = 0;
+
+	for (uint32_t i = 0; i < c->nparents; i++)
+		if (c->parent_bytes[i] > pb)
+			pb = c->parent_bytes[i];
+	return c->bytes - pb;
+}
+
+/*
+ * The window straight from its definition: every ancestor of a head (or the
+ * head itself) that a floor keeps and no ceiling cuts.
+ */
+static void
+expected_window(VcRepo *r, const VcWindow *w, uint64_t now, PHashMap *out)
+{
+	phmap_init(out);
+	for (size_t i = 0; i < r->nbr; i++)
+	{
+		VcCommit	H;
+		PHashMap	anc;
+		PHash	   *stack = px_malloc(sizeof(PHash) * 100000);
+		size_t		n = 0;
+		bool		created;
+
+		CHECK(vc_commit_load(&r->ctx, &r->br[i].head, &H));
+		phmap_init(&anc);
+		stack[n++] = r->br[i].head;
+		while (n > 0)
+		{
+			PHash		h = stack[--n];
+			VcCommit	c;
+			uint64_t	after,
+						span;
+			bool		floor,
+						ceil;
+
+			phmap_ref(&anc, &h, &created);
+			if (!created || !vc_commit_load(&r->ctx, &h, &c))
+				continue;
+			after = H.bytes - c.bytes;
+			span = after + own_bytes(&c);
+			floor = (!w->depth && !w->keep_bytes && !w->keep_seconds) ||
+				(w->depth && H.generation - c.generation < w->depth) ||
+				(w->keep_bytes && after < w->keep_bytes) ||
+				(w->keep_seconds && now - c.time < w->keep_seconds * SEC);
+			ceil = (w->max_commits && H.generation - c.generation >= w->max_commits) ||
+				(w->max_bytes && span > w->max_bytes) ||
+				(w->max_seconds && now - c.time >= w->max_seconds * SEC);
+			if (phash_eq(&h, &r->br[i].head) || (floor && !ceil))
+				phmap_ref(out, &h, &created);
+			for (uint32_t j = 0; j < c.nparents; j++)
+				stack[n++] = c.parents[j];
+		}
+		phmap_free(&anc);
+		free(stack);
+	}
+}
+
+typedef struct WinSet
+{
+	PHashMap	set;
+} WinSet;
+
+static void
+window_set_fn(void *arg, const PHash *h, VcLocation where, uint32_t seg)
+{
+	bool		created;
+
+	if (where == VC_LOC_WINDOW)
+		phmap_ref(&((WinSet *) arg)->set, h, &created);
+}
+
+/* Severs with w and checks the window left is exactly the definition's. */
+static void
+sever_and_compare(VcRepo *r, const VcWindow *w, uint64_t now)
+{
+	PHashMap	want;
+	WinSet		got;
+	uint32_t	seg;
+
+	expected_window(r, w, now, &want);
+	CHECK(vc_sever(r, w, &seg) == VC_OK);
+	if (seg != VC_NO_SEGMENT)
+		CHECK(vc_segment_discard(r, seg) == VC_OK);
+	phmap_init(&got.set);
+	vc_locations(r, window_set_fn, &got);
+	CHECK(set_equal(&want, &got.set));
+	CHECK_EQ(r->nheld, set_size(&got.set));
+	phmap_free(&want);
+	phmap_free(&got.set);
+}
+
+/* A commit's change bytes are exactly the chunks its root adds over its first parent's. */
+static void
+test_change_bytes(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(11);
+	commit_rows(&r, 0, 2000, 0, "load");
+	for (int i = 1; i <= 20; i++)
+	{
+		PHash		h = timed_commit(&r, &clk, 1, 1 + (int) rnd_below(60), (uint64_t) i);
+		VcCommit	c,
+					p;
+		PHashMap	mine,
+					theirs,
+					only;
+		uint64_t	sum = 0;
+
+		CHECK(vc_commit_load(&r.ctx, &h, &c) && vc_commit_load(&r.ctx, &c.parents[0], &p));
+		phmap_init(&mine);
+		phmap_init(&theirs);
+		closure(cs, &c.root, &mine);
+		closure(cs, &p.root, &theirs);
+		set_minus(&mine, &theirs, &only);
+		for (size_t j = 0; j < only.cap; j++)
+			if (only.used[j])
+			{
+				size_t		len;
+
+				CHECK(cs_get(cs, &only.keys[j], &len) != NULL);
+				sum += len;
+			}
+		CHECK_EQ(own_bytes(&c), sum);
+		CHECK_EQ(c.bytes, p.bytes + sum);
+		CHECK(c.time > p.time);
+		phmap_free(&mine);
+		phmap_free(&theirs);
+		phmap_free(&only);
+	}
+	/* a commit written with a time before its parent's is placed after it */
+	{
+		VcCommit	p,
+					c;
+		PHash		h;
+
+		CHECK(vc_commit_load(&r.ctx, &vc_head(&r)->head, &p));
+		h = vc_commit_write(&r.ctx, &p.root, &p.hash, 1, p.time - 100 * SEC, "early");
+		CHECK(vc_commit_load(&r.ctx, &h, &c));
+		CHECK_EQ(c.time, p.time + 1);
+		prolly_release_pins(&r.ctx);
+		cs_collect_orphans(cs);
+	}
+	/* a clock that goes back still gives a later time than the parent's */
+	{
+		VcCommit	c,
+					p;
+		PHash		h;
+
+		clk.us -= 500 * SEC;
+		h = timed_commit(&r, &clk, 0, 1, 99);
+		CHECK(vc_commit_load(&r.ctx, &h, &c) && vc_commit_load(&r.ctx, &c.parents[0], &p));
+		CHECK(c.time > p.time);
+	}
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* Each limit alone, as floor and as ceiling, and a ceiling beating a floor. */
+static void
+test_window_limits(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	PHash		h[41];
+	VcCommit	c;
+	uint64_t	sz[41];
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(12);
+	commit_rows(&r, 0, 4000, 0, "load");
+	for (int i = 1; i <= 40; i++)
+	{
+		/* one commit a minute, of varying size */
+		h[i] = timed_commit(&r, &clk, 60, 1 + (int) rnd_below(40), (uint64_t) i);
+		CHECK(vc_commit_load(&r.ctx, &h[i], &c));
+		sz[i] = own_bytes(&c);
+	}
+
+	/* commits: a floor of 8 under a ceiling of 5 keeps 5 */
+	sever_and_compare(&r, &(VcWindow) {.depth = 8, .max_commits = 5}, clk.us);
+	CHECK_EQ(r.nheld, 5);
+	/* ceilings only shrink: 8 under 20 is still the 5 left */
+	sever_and_compare(&r, &(VcWindow) {.depth = 8, .max_commits = 20}, clk.us);
+	CHECK_EQ(r.nheld, 5);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+
+	/* the rest on fresh copies of the same history */
+	for (int variant = 0; variant < 6; variant++)
+	{
+		uint64_t	after = 0,
+					span = 0;
+		int			keep = 0;
+
+		cs = memstore_create();
+		setup(&r, cs);
+		vc_set_clock(&r, fake_now, &clk);
+		clk.us = clock_base();
+		rng_seed(12);
+		commit_rows(&r, 0, 4000, 0, "load");
+		for (int i = 1; i <= 40; i++)
+			timed_commit(&r, &clk, 60, 1 + (int) rnd_below(40), (uint64_t) i);
+		switch (variant)
+		{
+			case 5:
+				/* exactly the bytes after commit 38: it is no longer needed */
+				sever_and_compare(&r, &(VcWindow) {.keep_bytes = sz[40] + sz[39]}, clk.us);
+				CHECK_EQ(r.nheld, 2);
+				break;
+			case 0:
+				/* bytes floor: keep until the commits after reach 10 sizes' worth */
+				for (int i = 40; i >= 1 && after < 10 * sz[40]; i--, keep++)
+					after += sz[i];
+				sever_and_compare(&r, &(VcWindow) {.depth = 1, .keep_bytes = 10 * sz[40]}, clk.us);
+				CHECK_EQ(r.nheld, (uint64_t) keep);
+				break;
+			case 1:
+				/* bytes ceiling: at most what the last 12 commits changed */
+				for (int i = 40; i > 28; i--)
+					span += sz[i];
+				sever_and_compare(&r, &(VcWindow) {.depth = 30, .max_bytes = span}, clk.us);
+				CHECK_EQ(r.nheld, 12);
+				break;
+			case 2:
+				/* time floor: ten minutes keeps the commits of the last ten minutes */
+				sever_and_compare(&r, &(VcWindow) {.depth = 1, .keep_seconds = 600}, clk.us);
+				CHECK_EQ(r.nheld, 10);
+				break;
+			case 3:
+				/* time ceiling beats a commit floor */
+				sever_and_compare(&r, &(VcWindow) {.depth = 30, .max_seconds = 300}, clk.us);
+				CHECK_EQ(r.nheld, 5);
+				break;
+			case 4:
+				/* the head stays however old: an hour later, a one-minute ceiling */
+				clk.us += 3600 * SEC;
+				sever_and_compare(&r, &(VcWindow) {.depth = 30, .max_seconds = 60}, clk.us);
+				CHECK_EQ(r.nheld, 1);
+				break;
+		}
+		check_store(cs, 0);
+		vc_repo_free(&r);
+		cs_destroy(cs);
+	}
+}
+
+/*
+ * Random branching, merging, clocks and policies: after every sever the
+ * window is exactly what its definition says, and the held count agrees.
+ */
+static void
+test_window_policy_random(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	const char *names[] = {"main", "b1", "b2", "b3"};
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(13);
+	commit_rows(&r, 0, 4000, 0, "load");
+	for (int b = 1; b < 4; b++)
+		CHECK(vc_branch_create(&r, names[b], &vc_head(&r)->head) == VC_OK);
+	for (int step = 1; step <= 300; step++)
+	{
+		int			b = (int) rnd_below(4);
+
+		vc_checkout(&r, names[b]);
+		if (rnd_below(8) == 0)
+		{
+			VcMergeResult m;
+			int			o = (int) rnd_below(4);
+
+			if (o != b && vc_merge(&r, names[o], &m) == VC_OK &&
+				m.status == VC_MERGE_CONFLICTS)
+				vc_reset_hard(&r, &vc_head(&r)->head);
+			vc_merge_result_free(&m);
+		}
+		else
+			timed_commit(&r, &clk, rnd_below(120), 1 + (int) rnd_below(30), (uint64_t) step);
+		if (step % 10 == 0)
+		{
+			VcWindow	w = {.depth = (uint32_t) rnd_below(12)};
+			uint64_t	unit = 3000;
+
+			if (rnd_below(2))
+				w.keep_bytes = unit * (1 + rnd_below(20));
+			if (rnd_below(2))
+				w.keep_seconds = 60 * (1 + rnd_below(20));
+			if (rnd_below(3) == 0)
+				w.max_commits = 2 + rnd_below(15);
+			if (rnd_below(3) == 0)
+				w.max_bytes = unit * (2 + rnd_below(30));
+			if (rnd_below(3) == 0)
+				w.max_seconds = 60 * (2 + rnd_below(30));
+			vc_checkout(&r, "main");
+			sever_and_compare(&r, &w, clk.us);
+		}
+	}
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/*
+ * Severing only when due keeps the window within a tenth over its ceiling,
+ * and the counters survive a reopen.
+ */
+static void
+test_sever_when_due(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	FakeClock	clk = {clock_base()};
+	VcWindow	w = {.max_commits = 200};
+	int			severs = 0;
+	uint64_t	most = 0;
+	PHash		st;
+
+	setup(&r, cs);
+	vc_set_clock(&r, fake_now, &clk);
+	rng_seed(14);
+	commit_rows(&r, 0, 4000, 0, "load");
+	for (int i = 1; i <= 3000; i++)
+	{
+		timed_commit(&r, &clk, 1, 1, (uint64_t) i);
+		if (r.nheld > most)
+			most = r.nheld;
+		if (vc_sever_due(&r, &w))
+		{
+			uint32_t	seg;
+
+			CHECK(vc_sever(&r, &w, &seg) == VC_OK);
+			if (seg != VC_NO_SEGMENT)
+				CHECK(vc_segment_discard(&r, seg) == VC_OK);
+			severs++;
+			CHECK_EQ(r.since_commits, 0);
+		}
+	}
+	/* held grows while commits come: due after W / (slack - 1) of them */
+	CHECK_LE(most, 200 + 200 / (VC_SEVER_SLACK - 1) + 2);
+	/* about one sever per tenth of the window, not one per commit */
+	CHECK_LE(severs, 3000 * VC_SEVER_SLACK / 200 + 20);
+	CHECK(severs >= 3000 / 200);
+
+	/* a time ceiling: due once a tenth of it has passed */
+	{
+		VcWindow	tw = {.depth = 1, .max_seconds = 1000};
+
+		CHECK(vc_sever(&r, &tw, &(uint32_t) {0}) == VC_OK);
+		CHECK(!vc_sever_due(&r, &(VcWindow) {.depth = 1, .max_seconds = 1000000000}));
+		clk.us += 99 * SEC;
+		CHECK(!vc_sever_due(&r, &(VcWindow) {.depth = 1, .max_seconds = 1000}) ||
+			  r.since_commits * VC_SEVER_SLACK >= r.nheld);
+		clk.us += 2 * SEC;
+		CHECK(vc_sever_due(&r, &tw));
+	}
+
+	r.since_commits = 7;
+	r.since_bytes = 1234;
+	st = vc_repo_save(&r);
+	{
+		VcRepo		r2;
+		WinSet		got;
+
+		CHECK(vc_repo_open(&r2, cs, &small_policy, &st) == VC_OK);
+		CHECK_EQ(r2.nheld, r.nheld);
+		CHECK_EQ(r2.since_commits, 7);
+		CHECK_EQ(r2.since_bytes, 1234);
+		CHECK_EQ(r2.last_sever, r.last_sever);
+		phmap_init(&got.set);
+		vc_locations(&r2, window_set_fn, &got);
+		CHECK_EQ(set_size(&got.set), r2.nheld);
+		phmap_free(&got.set);
+		vc_repo_free(&r2);
+	}
+	cs_collect_orphans(cs);
+	check_store(cs, 0);
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
 int
 main(void)
 {
@@ -1060,6 +1501,10 @@ main(void)
 	RUN(test_incremental_window_matches_full);
 	RUN(test_many_branches);
 	RUN(test_window_scaling);
+	RUN(test_change_bytes);
+	RUN(test_window_limits);
+	RUN(test_window_policy_random);
+	RUN(test_sever_when_due);
 	printf("test_window: all tests passed\n");
 	return 0;
 }

@@ -235,7 +235,7 @@ main(int argc, char **argv)
 			ops.commits++;
 			pimg = img;
 			t = now_sec();
-			CHECK(vc_sever(&r, &(VcWindow) {depth, NULL, 0}, &seg) == VC_OK);
+			CHECK(vc_sever(&r, &(VcWindow) {.depth = depth}, &seg) == VC_OK);
 			if (seg != VC_NO_SEGMENT)
 				CHECK(vc_segment_discard(&r, seg) == VC_OK);
 			ops.sever_us += (now_sec() - t) * 1e6;

@@ -51,10 +51,13 @@ typedef struct VcCommit
 	PHash		hash;
 	PHash		root;
 	uint64_t	generation;		/* 1 + the largest parent generation */
+	uint64_t	bytes;			/* change bytes: its own + the largest parent's */
+	uint64_t	time;			/* microseconds; never before a parent's */
 	uint32_t	nparents;
 	PHash		parents[VC_MAX_PARENTS];
 	uint64_t	parent_gen[VC_MAX_PARENTS];
-	uint64_t	time;
+	uint64_t	parent_bytes[VC_MAX_PARENTS];
+	uint64_t	parent_time[VC_MAX_PARENTS];
 	const char *msg;			/* not NUL-terminated */
 	size_t		msglen;
 } VcCommit;
@@ -101,14 +104,31 @@ typedef struct VcBranch
 } VcBranch;
 
 /*
- * The window: every branch head (and pending merge head), each commit
- * within depth generations of one, and each pinned commit.
+ * The window: every branch head (and pending merge head), each pinned
+ * commit, and each commit an ancestor of a head that the head's floors keep
+ * and its ceilings allow.  Measured from a head, a commit's
+ *	commits is how many generations it lies back (the head is 1),
+ *	bytes is the change bytes of it and every commit after it up to the head
+ *		(a commit's change bytes: the chunks its root has that its first
+ *		parent's root lacks),
+ *	age is how long ago it was committed.
+ * A floor keeps a commit while commits <= depth, or bytes from the commits
+ * after it < keep_bytes, or age < keep_seconds: any floor keeps it, and with
+ * no floor set everything is kept.  A ceiling cuts it once commits >
+ * max_commits, or bytes > max_bytes, or age >= max_seconds: any ceiling
+ * cuts it, and a ceiling wins over a floor.  Zero leaves a limit unset; a
+ * window with none set is refused.  Heads are always kept.
  */
 typedef struct VcWindow
 {
-	uint32_t	depth;			/* >= 1 */
+	uint32_t	depth;			/* floor: generations */
 	const PHash *pinned;
 	size_t		npinned;
+	uint64_t	keep_bytes;		/* floor */
+	uint64_t	keep_seconds;	/* floor */
+	uint64_t	max_commits;	/* ceiling */
+	uint64_t	max_bytes;		/* ceiling */
+	uint64_t	max_seconds;	/* ceiling */
 } VcWindow;
 
 typedef enum VcSegState
@@ -178,7 +198,13 @@ typedef struct VcRepo
 	size_t		nbr;
 	size_t		cap;
 	size_t		cur;
-	uint64_t	clock;
+	uint64_t	clock;			/* the last commit time given out */
+	uint64_t	(*now) (void *arg);	/* microseconds; NULL: the system clock */
+	void	   *now_arg;
+	uint64_t	nheld;			/* commits the window's history holds */
+	uint64_t	since_commits;	/* since the last sever */
+	uint64_t	since_bytes;
+	uint64_t	last_sever;		/* time of it */
 	/*
 	 * Where each known commit is: a prolly map saved with the repo, and the
 	 * changes since it was last written (0 for a removal).  Lookups read
@@ -312,6 +338,19 @@ extern int	vc_diff_commits(VcRepo *r, const PHash *from, const PHash *to,
  * unknown again.  Saving keeps only local and exported segments; ids stay.
  */
 extern int	vc_sever(VcRepo *r, const VcWindow *w, uint32_t *seg);
+
+/*
+ * Whether a sever is due: once commits since the last one reach a tenth
+ * of those held, or their change bytes a tenth of the smallest byte limit,
+ * or the time since it a tenth of the shortest time limit.  Severing when
+ * due keeps the window within about a tenth over its ceilings, at a cost
+ * per commit that does not grow with the window.
+ */
+#define VC_SEVER_SLACK 10
+extern bool vc_sever_due(VcRepo *r, const VcWindow *w);
+
+/* The clock commits and windows read, in microseconds (for tests). */
+extern void vc_set_clock(VcRepo *r, uint64_t (*now) (void *arg), void *arg);
 
 /*
  * Incremental window.  vc_window_track(r, depth) starts counting, for every

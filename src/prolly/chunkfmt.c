@@ -120,11 +120,13 @@ commit_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 	if (!read_hash(&p, end, &h))
 		return false;
 	fn(arg, &h, true);
-	if (!read_uvarint(&p, end, &gen) || !read_uvarint(&p, end, &np) || np > 64)
+	if (!read_uvarint(&p, end, &gen) || !read_uvarint(&p, end, &gen) ||
+		!read_uvarint(&p, end, &gen) || !read_uvarint(&p, end, &np) || np > 64)
 		return false;
 	for (uint64_t i = 0; i < np; i++)
 	{
-		if (!read_hash(&p, end, &h) || !read_uvarint(&p, end, &gen))
+		if (!read_hash(&p, end, &h) || !read_uvarint(&p, end, &gen) ||
+			!read_uvarint(&p, end, &gen) || !read_uvarint(&p, end, &gen))
 			return false;
 		fn(arg, &h, false);
 	}

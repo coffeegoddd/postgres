@@ -192,6 +192,6 @@ build_linear(VcRepo *r)
 	return l;
 }
 
-static const VcWindow depth2 = {2, NULL, 0};
+static const VcWindow depth2 = {.depth = 2};
 
 #endif							/* TEST_REPO_H */

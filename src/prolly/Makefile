@@ -86,3 +86,4 @@ bench/diskbench: bench/diskbench.c test/test_util.h libprolly.a $(HDRS)
 
 bench/deepbench: bench/deepbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
+
