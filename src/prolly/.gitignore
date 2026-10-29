@@ -14,3 +14,5 @@
 /test/test_kfplan
 /bench/xidbench
 /test/test_rewrite
+/bench/storebench
+/test/test_pgstore
