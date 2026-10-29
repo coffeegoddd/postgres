@@ -686,11 +686,9 @@ every `--break` case.
   the table, which then broke a foreign key as well.  Setting the violated
   constraint aside and reloading reports only the real violation.  Scenario
   13 caught it.
-- **Objects other than tables still name columns.**  An index or view a
-  branch creates on a column the other branch renamed won't apply
-  (scenario 18).  Dolt defines indexes over tags.  Here the merge would
-  have to rewrite such objects' column references from the tags, or store
-  their definitions by attribute.
+- **Objects other than tables named columns** at first, so an index or
+  view a branch created on a column the other branch renamed wouldn't
+  apply.  They now reference tags (below).
 - **Per-cell tags cost space.**  60-bit tags take 9 bytes per cell: the
   rebuild fixture's store grew from 55 to 75.5 MB (+37%).  The real format
   should be positional within the layout, mapping each tag to a slot, with
@@ -703,9 +701,84 @@ every `--break` case.
     same tag, so diffs treat it as the same column;
   - a default filled into rows the other side wrote is evaluated once, so
     a volatile default gives every such row one value;
-  - violations are reported rather than recorded with their rows, as
-    Dolt's `dolt_constraint_violations` does; that is the next piece for a
-    real merge.
+  - a merge with violations leaves them in the working set to be
+    resolved (as Dolt does); committing over unresolved ones is allowed
+    here, and the violations go into the commit.
+
+**Column references by tag in objects.**  Every object's DDL, and the key
+of a column's comment, is stored with each column reference replaced by
+`@{<tag>}`, and rendered with the commit's names on restore (`bench/ws_tags.c`).
+A `~cols` entry maps each tag to its table and name, for every table
+including partitioned ones; it merges by tag, so a rename on one side is
+taken and two different renames conflict.
+- **What counts as a reference:**
+  - pg_dump writes relations schema-qualified, so an object's tables are
+    known.
+  - An identifier is a column reference when it names a column of such a
+    table and isn't a function, type, qualifier, field of a composite
+    value, string, comment or dollar-quoted body, or a name after a keyword
+    like AS or INDEX.
+  - `table.column` belongs to that table.  An unqualified name belongs to
+    the nearest table named before it that has that column.
+- **Why it's safe:** rendering a capture always gives the captured text
+  back, so a reference read wrong costs only a rename's reach, never a
+  rebuild.
+- **Merged objects:** CREATE TABLE items are now keyed by the tag in the
+  column line itself.  A rename changes only `~cols` and the layout; the
+  table's object, and every index, view or constraint that uses the column,
+  stays byte-identical.
+- **The real implementation** would serialize the catalog's expression
+  trees, whose column references are attribute numbers, mapped to tags,
+  and needs no lexer.
+
+New scenarios, all clean.  A branch adds each of these while the other
+renames a column it uses; the result restores, passes amcheck, and its
+definitions show the new names:
+- an index on the renamed column;
+- a view through a join and table aliases, and a materialized view;
+- an expression index with a predicate;
+- a foreign key to a renamed primary key, from a renamed column;
+- a CHECK, and a trigger `UPDATE OF` the column.
+
+Two branches renaming one column differently conflict.
+
+**Constraint violations are stored** (`bench/ws_viol.c`), modelled on Dolt.
+When a merged commit is restored, each violated constraint is:
+- **deferred:** a foreign key or CHECK is added back NOT VALID, so rows
+  written meanwhile are still checked; a unique constraint or index, an
+  exclusion constraint or a NOT NULL waits;
+- **found row by row:**
+  - foreign key: child rows whose referenced row is missing;
+  - CHECK: rows for which the expression is false;
+  - unique (constraint or index, with its predicate): rows that share
+    their key with another row;
+  - NOT NULL: rows with the column NULL;
+  - exclusion: recorded without rows;
+- **recorded:** in `prolly.violations` in the working database (a row per
+  violating row, keyed by its primary key values, and a row per constraint
+  holding its object key and definition by tag), and so in the commit's
+  `~viol` entry.  The diff reports `violation added|resolved`.
+
+Resolving re-applies each deferred definition and clears what now holds.
+
+| Scenario | Violations found | After a fix and resolving |
+|---|---|---|
+| both insert the same email | acct 5001, 5002 (acct_email_key) | the unique constraint is back |
+| parent deleted vs child inserted | item 9001 (item_acct_fkey) | the foreign key validated |
+| CHECK added vs violating update | acct 1 (score_small) | the CHECK validated |
+| UNIQUE index vs duplicating update | acct 1, 2 (acct_name) | the unique index built |
+| NOT NULL added vs NULLs written | acct 3, 4 (acct_name_not_null) | NOT NULL set again |
+| unresolved: a CHECK and a unique constraint | item 10, 20 and acct 1, 5001 | (kept) |
+
+In each:
+- **Storing:** the working set with violations captures to a root value
+  whose `~viol` holds them, and that root value rebuilds to itself.
+- **Resolving:** the resolved working set has no violations, and its
+  schema objects equal the merged commit's exactly.
+
+Two new faults are caught: objects keeping column names (`--break
+notags`, the rename scenarios fail), and violations not stored
+(`--break noviol`).
 
 ## Evidence so far
 

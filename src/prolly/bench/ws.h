@@ -7,7 +7,9 @@
 #ifndef WS_H
 #define WS_H
 
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
+#endif
 #include <ctype.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -140,7 +142,10 @@ typedef struct WsProblem
 	char	   *what;			/* "<type> <name>" or "rows <table>" */
 	char	   *sqlstate;
 	char	   *constraint;
+	char	   *column;
 	char	   *message;
+	char	   *key;			/* the object's key (columns by tag), or empty */
+	char	   *ddl;			/* the definition that failed, or empty */
 } WsProblem;
 
 typedef struct WsReport
@@ -231,6 +236,8 @@ extern char *schema_text(ProllyCtx *ctx, const PHash *h, size_t *len);
 extern bool table_layout(ProllyCtx *ctx, const PHash *rv, const char *name, WsLayout *L,
 						 PHash *data);
 extern void report_add(WsReport *rep, const char *what, const PGresult *res);
+extern void report_add_ddl(WsReport *rep, const char *what, const PGresult *res,
+						   const char *key, const char *ddl);
 extern void report_free(WsReport *rep);
 extern void ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep);
 extern void ws_install(const char *db, bool triggers);
@@ -281,6 +288,7 @@ typedef struct Stream
 	char		token[32];
 	bool		stop;
 	uint64_t	barrier_lsn;
+	bool		unflushed;		/* the last barrier was not flushed when written */
 	uint64_t	changes,
 				ddl_msgs,
 				rows_msgs,
@@ -296,6 +304,47 @@ extern void drop_slot(void);
 extern void stream_setup(ProllyCtx *ctx, const char *db);
 extern PHash stream_capture(ProllyCtx *ctx, const char *db);
 extern void st_free(STable *t);
+
+/* ------------------------------------------------------ tags in objects */
+
+typedef struct ColRef
+{
+	char	   *table;			/* quoted */
+	char	   *name;			/* quoted */
+	uint64_t	tag;
+} ColRef;
+
+typedef struct ColMap
+{
+	ColRef	   *c;
+	size_t		n,
+				cap;
+} ColMap;
+
+extern void colmap_from_db(PGconn *c, ColMap *m);
+extern void colmap_from_tree(ProllyCtx *ctx, const PHash *rv, ColMap *m);
+extern PHash colmap_build(ProllyCtx *ctx, const ColMap *m);
+extern void colmap_free(ColMap *m);
+extern void templ(const char *s, size_t n, const ColMap *m, Buf *out);
+extern bool render(const char *s, size_t n, const ColMap *m, Buf *out, uint64_t *missing);
+
+/* ----------------------------------------------------------- violations */
+
+/* "violation <constraint> <table> <rowkey>" ("*" for no row), one each. */
+typedef struct WsLines
+{
+	char	  **line;
+	size_t		n,
+				cap;
+} WsLines;
+
+extern void lines_add(WsLines *l, const char *line);
+extern void lines_free(WsLines *l);
+extern void ws_record_violations(const char *db, const WsReport *rep, WsLines *out,
+								 WsLines *unapplied);
+extern int	ws_resolve(const char *db, WsLines *unresolved);
+extern PHash capture_violations(ProllyCtx *ctx, PGconn *c);
+extern void restore_violations(ProllyCtx *ctx, PGconn *c, const PHash *data);
 
 /* -------------------------------------------------------- diff and merge */
 

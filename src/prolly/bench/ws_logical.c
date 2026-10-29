@@ -272,8 +272,10 @@ capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
 	size_t		len;
 	char	   *ddl;
 	ObjList		l = {0};
+	ColMap		cols;
 	PHash		objs,
-				seq;
+				seq,
+				colsmap;
 
 	ddl = dump_section(db, "pre-data", &len);
 	split_dump(ddl, 'a', &l);
@@ -281,6 +283,29 @@ capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
 	ddl = dump_section(db, "post-data", &len);
 	split_dump(ddl, 'b', &l);
 	free(ddl);
+
+	/* Column references by tag, in keys (column comments) and DDL. */
+	colmap_from_db(c, &cols);
+	for (size_t i = 0; i < l.n; i++)
+	{
+		Buf			k = {0},
+					v = {0};
+
+		if (l.kv[i].key[0] == '0' || broken("notags"))
+			continue;
+		templ((const char *) l.kv[i].key, l.kv[i].klen, &cols, &k);
+		templ((const char *) l.kv[i].val, l.kv[i].vlen, &cols, &v);
+		free((void *) l.kv[i].key);
+		free((void *) l.kv[i].val);
+		buf_append(&k, "", 1);
+		buf_append(&v, "", 1);
+		l.kv[i].key = k.data;
+		l.kv[i].klen = k.len - 1;
+		l.kv[i].val = v.data;
+		l.kv[i].vlen = v.len - 1;
+	}
+	colsmap = colmap_build(ctx, &cols);
+	colmap_free(&cols);
 	qsort(l.kv, l.n, sizeof(ProllyKV), kv_cmp);
 	for (size_t i = 1; i < l.n; i++)
 		if (key_cmp(l.kv[i - 1].key, l.kv[i - 1].klen, l.kv[i].key, l.kv[i].klen) == 0)
@@ -293,6 +318,12 @@ capture_defs(ProllyCtx *ctx, PHash rv, PGconn *c, const char *db)
 	}
 	free(l.kv);
 	rv = put_table(ctx, rv, "~obj", "", 0, &objs);
+	rv = put_table(ctx, rv, "~cols", "", 0, &colsmap);
+	{
+		PHash		viol = capture_violations(ctx, c);
+
+		rv = put_table(ctx, rv, "~viol", "", 0, &viol);
+	}
 	seq = capture_sequences(ctx, c);
 	return put_table(ctx, rv, "~seq", "", 0, &seq);
 }
@@ -398,9 +429,17 @@ table_layout(ProllyCtx *ctx, const PHash *rv, const char *name, WsLayout *L, PHa
 void
 report_add(WsReport *rep, const char *what, const PGresult *res)
 {
+	report_add_ddl(rep, what, res, "", "");
+}
+
+void
+report_add_ddl(WsReport *rep, const char *what, const PGresult *res, const char *key,
+			   const char *ddl)
+{
 	const char *st = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : NULL;
 	const char *con = res ? PQresultErrorField(res, PG_DIAG_CONSTRAINT_NAME) : NULL;
 	const char *msg = res ? PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY) : NULL;
+	const char *col = res ? PQresultErrorField(res, PG_DIAG_COLUMN_NAME) : NULL;
 	WsProblem  *p;
 
 	if (rep == NULL)
@@ -414,6 +453,9 @@ report_add(WsReport *rep, const char *what, const PGresult *res)
 	p->sqlstate = strdup(st ? st : "");
 	p->constraint = strdup(con ? con : "");
 	p->message = strdup(msg ? msg : "");
+	p->column = strdup(col ? col : "");
+	p->key = strdup(key);
+	p->ddl = strdup(ddl);
 }
 
 void
@@ -425,6 +467,9 @@ report_free(WsReport *rep)
 		free(rep->p[i].sqlstate);
 		free(rep->p[i].constraint);
 		free(rep->p[i].message);
+		free(rep->p[i].column);
+		free(rep->p[i].key);
+		free(rep->p[i].ddl);
 	}
 	free(rep->p);
 	memset(rep, 0, sizeof(*rep));
@@ -433,7 +478,8 @@ report_free(WsReport *rep)
 typedef struct Obj
 {
 	char	   *key;			/* section, type, name */
-	char	   *ddl;
+	char	   *ddl;			/* rendered */
+	char	   *tddl;			/* as stored: columns by tag */
 	int			prio;
 } Obj;
 
@@ -528,7 +574,7 @@ run_objects(PGconn *c, Obj *objs, size_t n, WsReport *rep)
 			for (char *p = what; *p; p++)
 				if (*p == '\t')
 					*p = ' ';
-			report_add(rep, what, last[i]);
+			report_add_ddl(rep, what, last[i], objs[i].key, objs[i].tddl);
 		}
 		if (last[i])
 			PQclear(last[i]);
@@ -634,14 +680,76 @@ restore_rows(ProllyCtx *ctx, PGconn *c, const char *name, const VcTable *t, WsRe
 		con = PQresultErrorField(res, PG_DIAG_CONSTRAINT_NAME);
 		col = PQresultErrorField(res, PG_DIAG_COLUMN_NAME);
 		snprintf(what, sizeof(what), "rows %s", name);
-		report_add(rep, what, res);
 		sql[0] = '\0';
 		if (st && strcmp(st, "23514") == 0 && con)
+		{
+			/* The check's definition, to apply again once resolved. */
+			const char *params[2];
+			char		rel[600],
+						def[4096];
+			PGresult   *r2;
+			ColMap		cols;
+			Buf			t = {0};
+
+			snprintf(rel, sizeof(rel), SCHEMA ".%s", L.rel);
+			params[0] = rel;
+			params[1] = con;
+			r2 = PQexecParams(c, "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+							  "WHERE conrelid = $1::regclass AND conname = $2",
+							  2, NULL, params, NULL, NULL, 0);
+			snprintf(def, sizeof(def), "ALTER TABLE ONLY %s ADD CONSTRAINT %s %s;", rel,
+					 con, PQresultStatus(r2) == PGRES_TUPLES_OK && PQntuples(r2) == 1
+					 ? PQgetvalue(r2, 0, 0) : "");
+			PQclear(r2);
+			colmap_from_db(c, &cols);
+			templ(def, strlen(def), &cols, &t);
+			buf_append(&t, "", 1);
+			colmap_free(&cols);
+			report_add_ddl(rep, what, res, "", (const char *) t.data);
+			free(t.data);
 			snprintf(sql, sizeof(sql), "ALTER TABLE " SCHEMA ".%s DROP CONSTRAINT \"%s\"",
 					 L.rel, con);
+		}
 		else if (st && strcmp(st, "23502") == 0 && col)
+		{
+			char		def[1400];
+			ColMap		cols;
+			Buf			t = {0};
+			PGresult   *q = PQexecParams(c, "SELECT quote_ident($1)", 1, NULL, &col, NULL, NULL, 0);
+
+			snprintf(def, sizeof(def), "ALTER TABLE ONLY " SCHEMA ".%s ALTER COLUMN %s SET NOT NULL;",
+					 L.rel, PQgetvalue(q, 0, 0));
+			PQclear(q);
+			colmap_from_db(c, &cols);
+			templ(def, strlen(def), &cols, &t);
+			buf_append(&t, "", 1);
+			colmap_free(&cols);
+			report_add_ddl(rep, what, res, "", (const char *) t.data);
+			free(t.data);
+			if (rep && rep->n > 0)
+			{
+				/* The error does not name the constraint; the catalog does. */
+				char		rel[600];
+				const char *params[2] = {rel, col};
+				PGresult   *r2;
+
+				snprintf(rel, sizeof(rel), SCHEMA ".%s", L.rel);
+				r2 = PQexecParams(c, "SELECT conname FROM pg_constraint c JOIN pg_attribute a "
+								  "ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey) "
+								  "WHERE c.conrelid = $1::regclass AND c.contype = 'n' AND a.attname = $2",
+								  2, NULL, params, NULL, NULL, 0);
+				if (PQresultStatus(r2) == PGRES_TUPLES_OK && PQntuples(r2) == 1)
+				{
+					free(rep->p[rep->n - 1].constraint);
+					rep->p[rep->n - 1].constraint = strdup(PQgetvalue(r2, 0, 0));
+				}
+				PQclear(r2);
+			}
 			snprintf(sql, sizeof(sql), "ALTER TABLE " SCHEMA ".%s ALTER COLUMN \"%s\" DROP NOT NULL",
 					 L.rel, col);
+		}
+		else
+			report_add(rep, what, res);
 		PQclear(res);
 		if (sql[0] == '\0')
 			break;
@@ -651,27 +759,25 @@ restore_rows(ProllyCtx *ctx, PGconn *c, const char *name, const VcTable *t, WsRe
 	ws_layout_free(&L);
 }
 
-/* Gives the restored columns the tags the commit holds. */
+/*
+ * Gives the restored columns the tags the commit holds: every column in
+ * ~cols, partitioned tables' too.
+ */
 static void
-restore_tags(ProllyCtx *ctx, PGconn *c, const char *name, const VcTable *t)
+restore_tags(PGconn *c, const ColMap *cols)
 {
-	size_t		slen;
-	char	   *text = schema_text(ctx, &t->schema, &slen);
-	WsLayout	L;
-	char		rel[600];
-
-	layout_must_parse(text, &L);
-	snprintf(rel, sizeof(rel), SCHEMA ".%s", L.rel);
-	for (int i = 0; i < L.ncols; i++)
+	for (size_t i = 0; i < cols->n; i++)
 	{
-		char		tag[32];
-		const char *params[3] = {rel, L.cols[i].name, tag};
+		char		rel[600],
+					tag[32];
+		const char *params[3] = {rel, cols->c[i].name, tag};
 		PGresult   *res;
 
-		snprintf(tag, sizeof(tag), "%" PRIu64, L.cols[i].tag);
+		snprintf(rel, sizeof(rel), SCHEMA ".%s", cols->c[i].table);
+		snprintf(tag, sizeof(tag), "%" PRIu64, cols->c[i].tag);
 		res = PQexecParams(c,
 						   "INSERT INTO prolly.tags SELECT a.attrelid, a.attnum, $3::int8 "
-						   "FROM pg_attribute a WHERE a.attrelid = $1::regclass "
+						   "FROM pg_attribute a WHERE a.attrelid = to_regclass($1) "
 						   "AND quote_ident(a.attname) = $2 AND NOT a.attisdropped "
 						   "ON CONFLICT (relid, attnum) DO UPDATE SET tag = excluded.tag",
 						   3, NULL, params, NULL, NULL, 0);
@@ -679,8 +785,6 @@ restore_tags(ProllyCtx *ctx, PGconn *c, const char *name, const VcTable *t)
 			die("tags: %s", PQerrorMessage(c));
 		PQclear(res);
 	}
-	free(text);
-	ws_layout_free(&L);
 }
 
 static void
@@ -739,16 +843,31 @@ ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep)
 				cap = 0,
 				npre;
 	Obj		   *objs = NULL;
+	ColMap		cols;
 
 	CHECK(vc_table_get(ctx, rv, "~obj", &t));
+	colmap_from_tree(ctx, rv, &cols);
 	it = t_iter(ctx, &t.data, NULL, 0);
 	pg_cmd(c, "BEGIN");
 	while (t_next(it, &k, &kl, &v, &vl))
 	{
-		char	   *ddl = px_malloc(vl + 1);
+		Buf			r = {0};
+		uint64_t	missing = 0;
+		char	   *ddl;
 
-		memcpy(ddl, v, vl);
-		ddl[vl] = '\0';
+		/* Column references as the names this commit gives them. */
+		if (!render((const char *) v, vl, &cols, &r, &missing))
+		{
+			char		what[1100];
+
+			snprintf(what, sizeof(what), "%.*s (column tag %" PRIu64 " unknown)",
+					 (int) kl, (const char *) k, missing);
+			report_add(rep, what, NULL);
+			free(r.data);
+			continue;
+		}
+		buf_append(&r, "", 1);
+		ddl = (char *) r.data;
 		if (kl > 0 && k[0] == '0')
 		{
 			PGresult   *res = PQexec(c, ddl);
@@ -764,6 +883,7 @@ ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep)
 		memcpy(objs[nobj].key, k, kl);
 		objs[nobj].key[kl] = '\0';
 		objs[nobj].ddl = ddl;
+		objs[nobj].tddl = strndup((const char *) v, vl);
 		objs[nobj].prio = obj_prio(objs[nobj].key);
 		nobj++;
 	}
@@ -776,25 +896,27 @@ ws_restore(ProllyCtx *ctx, const PHash *rv, const char *db, WsReport *rep)
 	/* The session settings for rows, after the prelude's. */
 	pg_cmd(c, SESSION_SETTINGS);
 	table_list(ctx, rv, &l);
+	restore_tags(c, &cols);
 	for (size_t i = 0; i < l.n; i++)
 		if (l.names[i][0] != '~')
-		{
-			restore_tags(ctx, c, l.names[i], &l.t[i]);
 			restore_rows(ctx, c, l.names[i], &l.t[i], rep);
-		}
 	CHECK(vc_table_get(ctx, rv, "~seq", &t));
 	if (!broken("sequence"))
 		restore_sequences(ctx, c, &t.data);
 	run_objects(c, objs + npre, nobj - npre, rep);
+	if (vc_table_get(ctx, rv, "~viol", &t))
+		restore_violations(ctx, c, &t.data);
 	pg_cmd(c, "COMMIT");
 	PQfinish(c);
 	for (size_t i = 0; i < nobj; i++)
 	{
 		free(objs[i].key);
 		free(objs[i].ddl);
+		free(objs[i].tddl);
 	}
 	free(objs);
 	table_list_free(&l);
+	colmap_free(&cols);
 }
 
 static void

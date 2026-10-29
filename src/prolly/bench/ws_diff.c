@@ -15,6 +15,7 @@
  *	rows <table> +<inserted> -<deleted> ~<updated>
  *	rewritten <table> <n>					rows whose bytes changed but whose values,
  *											in the columns both sides have, did not
+ *	violation added|resolved <constraint> <table> <rowkey>
  * A row counts as updated only if a value in a column both sides have
  * changed: renaming a column changes no row.
  */
@@ -288,6 +289,31 @@ ws_diff(ProllyCtx *ctx, const PHash *from, const PHash *to, WsDiff *d)
 		PHash		e = t_empty(ctx);
 
 		diff_objects(ctx, ia >= 0 ? &a.t[ia].data : &e, ib >= 0 ? &b.t[ib].data : &e, d);
+	}
+	{
+		int			ia = find(&a, "~viol"),
+					ib = find(&b, "~viol");
+		PHash		e = t_empty(ctx);
+		ProllyDiffList dl = {0};
+
+		CHECK(prolly_diff_collect(ctx, ia >= 0 ? &a.t[ia].data : &e,
+								  ib >= 0 ? &b.t[ib].data : &e, &dl) == PROLLY_OK);
+		for (size_t i = 0; i < dl.n; i++)
+		{
+			char		key[1400],
+					   *cons,
+					   *row;
+
+			snprintf(key, sizeof(key), "%.*s", (int) dl.v[i].klen, (const char *) dl.v[i].key);
+			cons = strchr(key, '\t');
+			*cons++ = '\0';
+			row = strchr(cons, '\t');
+			*row++ = '\0';
+			if (*row && (dl.v[i].from == NULL || dl.v[i].to == NULL))
+				add_line(d, "violation %s %s %s %s", dl.v[i].from ? "resolved" : "added", cons,
+						 key, row);
+		}
+		prolly_diff_list_free(&dl);
 	}
 	for (size_t i = 0; i < a.n; i++)
 		if (a.names[i][0] != '~' && find(&b, a.names[i]) < 0)

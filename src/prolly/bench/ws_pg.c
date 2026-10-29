@@ -20,7 +20,12 @@
  *	toast		unchanged TOASTed values are not taken from the current row
  *	noreemit	rows sent after a rewriting DDL statement are ignored
  *	noflush		the barrier is not flushed, so it waits in the WAL until
- *				something else flushes it (caught by the barrier's deadline)
+ *				something else flushes it (caught by checking the WAL is
+ *				flushed past it)
+ * and with --merge:
+ *	notags		objects keep column names, so an index or view one branch adds
+ *				does not follow a rename on the other
+ *	noviol		constraint violations are found but not stored
  */
 bool
 broken(const char *what)

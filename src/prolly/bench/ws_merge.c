@@ -143,6 +143,12 @@ ddl_parse(const char *text, const WsLayout *L, Ddl *d)
 			name = ident_at(s + 11);
 			snprintf(key, sizeof(key), "c:%s", name);
 		}
+		else if (strncmp(s, "@{", 2) == 0)
+		{
+			/* A column, by its tag. */
+			name = strndup(s + 2, strcspn(s + 2, "}"));
+			snprintf(key, sizeof(key), "t:%s", name);
+		}
 		else
 		{
 			const WsCol *c;
@@ -260,6 +266,18 @@ merge_table_ddl(const char *table, const char *b, const char *o, const char *t,
 
 			while (*nm == ' ')
 				nm++;
+			if (strncmp(keys[i], "t:", 2) == 0)
+			{
+				const WsCol *col = NULL;
+				uint64_t	tag = strtoull(keys[i] + 2, NULL, 10);
+
+				if (Lo)
+					col = ws_layout_col(Lo, tag);
+				if (col == NULL && Lt)
+					col = ws_layout_col(Lt, tag);
+				if (col)
+					nm = col->name;
+			}
 			snprintf(where, sizeof(where), "%s.%.*s", table, (int) strcspn(nm, " "), nm);
 			conflict(m, "column", where);
 			ok = false;
@@ -406,6 +424,34 @@ merge_sequences(ProllyCtx *ctx, const PHash *sb, const PHash *so, const PHash *s
 	}
 	out = ne ? t_apply(ctx, &res.root, ed, ne) : res.root;
 	free(ed);
+	prolly_merge_result_free(&res);
+	return out;
+}
+
+/*
+ * Columns by tag across every table (partitioned ones too): renamed by
+ * one side is renamed; changed differently by both is a conflict.
+ */
+static PHash
+merge_cols(ProllyCtx *ctx, const PHash *cb, const PHash *co, const PHash *ct, WsMerge *m)
+{
+	ProllyMergeResult res = {0};
+	PHash		out;
+
+	CHECK(prolly_merge(ctx, cb, co, ct, &res) == PROLLY_OK);
+	for (size_t i = 0; i < res.nconflicts; i++)
+	{
+		const ProllyConflict *c = &res.conflicts[i];
+		const uint8_t *v = c->ours ? c->ours : c->theirs;
+		size_t		vl = c->ours ? c->olen : c->tlen;
+		char		where[1200];
+		const uint8_t *tab = memchr(v, '\t', vl);
+
+		snprintf(where, sizeof(where), "%.*s.%.*s", (int) (tab - v), (const char *) v,
+				 (int) (vl - (size_t) (tab - v) - 1), (const char *) tab + 1);
+		conflict(m, "column", where);
+	}
+	out = res.root;
 	prolly_merge_result_free(&res);
 	return out;
 }
@@ -922,6 +968,25 @@ ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours, const PHash *thei
 		const VcTable *keep = NULL;
 		bool		full = false;
 
+		if (strcmp(name, "~viol") == 0)
+		{
+			/* Violations either side has; resolving them is the user's. */
+			ProllyMergeResult res = {0};
+
+			CHECK(prolly_merge(ctx, b ? &b->data : &e, o ? &o->data : &e,
+							   t ? &t->data : &e, &res) == PROLLY_OK);
+			rv = put_table(ctx, rv, name, "", 0, &res.root);
+			prolly_merge_result_free(&res);
+			continue;
+		}
+		if (strcmp(name, "~cols") == 0)
+		{
+			PHash		d = merge_cols(ctx, b ? &b->data : &e, o ? &o->data : &e,
+									   t ? &t->data : &e, m);
+
+			rv = put_table(ctx, rv, name, "", 0, &d);
+			continue;
+		}
 		if (strcmp(name, "~obj") == 0 || strcmp(name, "~seq") == 0)
 		{
 			PHash		d = strcmp(name, "~obj") == 0

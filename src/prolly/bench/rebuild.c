@@ -543,7 +543,8 @@ read_sections(const char *path, Section **out)
 	Section    *s = NULL;
 	size_t		cap = 0;
 	int			n = 0;
-	static const char *names[] = {"base", "step", "expect", "ours", "theirs", NULL};
+	static const char *names[] = {"base", "step", "expect", "ours", "theirs", "resolve", "after",
+	NULL};
 
 	while (*p)
 	{
@@ -725,6 +726,46 @@ str_cmp(const void *a, const void *b)
 	return strcmp(*(char *const *) a, *(char *const *) b);
 }
 
+/* The "check <sql> => <answer>" lines on a database, after amcheck. */
+static bool
+run_checks(const char *db, const char *file, char **want, int nw)
+{
+	PGconn	   *c = pg_open(db);
+	bool		ok = true;
+
+	amcheck(c, file);
+	pg_cmd(c, "SET search_path = public");
+	for (int w = 0; w < nw; w++)
+	{
+		char	   *bar,
+				   *ans,
+				   *q;
+
+		if (strncmp(want[w], "check ", 6) != 0)
+			continue;
+		q = strdup(want[w] + 6);
+		bar = strstr(q, " => ");
+		if (bar == NULL)
+			die("a check needs <sql> => <answer>: %s", want[w]);
+		*bar = '\0';
+		ans = plain_answer(c, q);
+		if (ans[0] && ans[strlen(ans) - 1] == '\n')
+			ans[strlen(ans) - 1] = '\0';
+		if (strcmp(ans, bar + 4) != 0)
+		{
+			char		msg[1200];
+
+			snprintf(msg, sizeof(msg), "%s gave %s, not %s", q, ans, bar + 4);
+			fail(file, msg);
+			ok = false;
+		}
+		free(ans);
+		free(q);
+	}
+	PQfinish(c);
+	return ok;
+}
+
 /*
  * One merge scenario: base.sql, then ours and theirs applied on two
  * branches (theirs in a database rebuilt from the base commit), merged,
@@ -739,11 +780,15 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 	char		path[1024];
 	int			n;
 	const Buf  *ours = NULL,
-			   *theirs = NULL;
+			   *theirs = NULL,
+			   *resolve = NULL;
 	char	  **want = NULL,
-			  **got = NULL;
+			  **got = NULL,
+			  **after = NULL;
 	int			nw = 0,
-				ng = 0;
+				ng = 0,
+				na = 0;
+	bool		stored = false;
 	size_t		gcap = 0;
 	PHash		B,
 				O,
@@ -766,6 +811,10 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 			theirs = &sec[i].text;
 		else if (strcmp(sec[i].name, "expect") == 0)
 			nw = expect_lines(&sec[i], &want);
+		else if (strcmp(sec[i].name, "resolve") == 0)
+			resolve = &sec[i].text;
+		else if (strcmp(sec[i].name, "after") == 0)
+			na = expect_lines(&sec[i], &after);
 	}
 	if (ours == NULL || theirs == NULL)
 		die("%s needs -- ours and -- theirs", file);
@@ -812,18 +861,66 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 		fresh_database("rt_mm");
 		ws_install("rt_mm", false);
 		ws_restore(ctx, &m.root, "rt_mm", &rep);
-		for (size_t i = 0; i < rep.n; i++)
 		{
-			char		line[1300];
-			const char *w = rep.p[i].what;
+			WsLines		viol = {0},
+						unapplied = {0};
 
-			if (strncmp(rep.p[i].sqlstate, "23", 2) == 0)
-				snprintf(line, sizeof(line), "violation %s",
-						 rep.p[i].constraint[0] ? rep.p[i].constraint : strrchr(w, ' ') + 1);
-			else
-				snprintf(line, sizeof(line), "unapplied %s (%s)", w, rep.p[i].message);
-			px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
-			got[ng++] = strdup(line);
+			ws_record_violations("rt_mm", &rep, &viol, &unapplied);
+			for (size_t i = 0; i < viol.n; i++)
+			{
+				px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
+				got[ng++] = strdup(viol.line[i]);
+			}
+			for (size_t i = 0; i < unapplied.n; i++)
+			{
+				px_grow((void **) &got, &gcap, (size_t) ng + 1, sizeof(char *));
+				got[ng++] = strdup(unapplied.line[i]);
+			}
+
+			/*
+			 * Violations are stored: the working set with them captures to
+			 * a root value holding them, which rebuilds to itself.
+			 */
+			if (viol.n > 0 && unapplied.n == 0)
+			{
+				PHash		W = logical_capture(ctx, "rt_mm");
+				VcTable		vt;
+				uint64_t	nv = 0;
+
+				CHECK(vc_table_get(ctx, &W, "~viol", &vt));
+				CHECK(prolly_count(ctx, &vt.data, &nv) == PROLLY_OK);
+				if (nv == 0)
+					fail(file, "the violations were not stored");
+				stored = round_trip(ctx, &W, "rt_mm2", file);
+				if (resolve)
+				{
+					WsLines		left = {0};
+					PHash		R;
+					VcTable		ro,
+								mo;
+
+					apply_sql("rt_mm", resolve);
+					if (ws_resolve("rt_mm", &left) != 0)
+						for (size_t i = 0; i < left.n; i++)
+							fail(file, left.line[i]);
+					R = logical_capture(ctx, "rt_mm");
+					CHECK(vc_table_get(ctx, &R, "~viol", &vt));
+					CHECK(prolly_count(ctx, &vt.data, &nv) == PROLLY_OK);
+					if (nv != 0)
+						fail(file, "violations remain after resolving");
+					CHECK(vc_table_get(ctx, &R, "~obj", &ro));
+					CHECK(vc_table_get(ctx, &m.root, "~obj", &mo));
+					if (!phash_eq(&ro.data, &mo.data))
+					{
+						fail(file, "resolving did not give back the merged schema");
+						explain_mismatch(ctx, &m.root, &R, file);
+					}
+					vc_commit_write(ctx, &R, (PHash[]) {co, ct}, 2, 4, "merge, resolved");
+					lines_free(&left);
+				}
+			}
+			lines_free(&viol);
+			lines_free(&unapplied);
 		}
 		if (rep.n == 0)
 		{
@@ -877,46 +974,20 @@ run_merge_scenario(ProllyCtx *ctx, const char *file)
 		}
 	}
 	if (ng == 0)
-	{
-		PGconn	   *c = pg_open("rt_mm");
-
-		amcheck(c, file);
-		pg_cmd(c, "SET search_path = public");
-		for (int w = 0; w < nw; w++)
-		{
-			char	   *bar,
-					   *ans,
-					   *q;
-
-			if (strncmp(want[w], "check ", 6) != 0)
-				continue;
-			q = strdup(want[w] + 6);
-			bar = strstr(q, " => ");
-			if (bar == NULL)
-				die("a check needs <sql> => <answer>: %s", want[w]);
-			*bar = '\0';
-			ans = plain_answer(c, q);
-			if (ans[0] && ans[strlen(ans) - 1] == '\n')
-				ans[strlen(ans) - 1] = '\0';
-			if (strcmp(ans, bar + 4) != 0)
-			{
-				char		msg[1200];
-
-				snprintf(msg, sizeof(msg), "%s gave %s, not %s", q, ans, bar + 4);
-				fail(file, msg);
-				ok = false;
-			}
-			free(ans);
-			free(q);
-		}
-		PQfinish(c);
-	}
+		ok &= run_checks("rt_mm", file, want, nw);
+	else if (resolve && stored)
+		ok &= run_checks("rt_mm", file, after, na);
 	printf("%-36s %s:", file, ok ? "as expected" : "NOT as expected");
 	if (ng == 0)
 		printf(" clean, %" PRIu64 " rows merged by column", m.cells_merged);
 	for (int g = 0; g < ng; g++)
 		printf("%s %s", g ? ";" : "", got[g]);
+	if (stored)
+		printf("; stored%s", resolve ? ", resolved" : "");
 	printf("\n");
+	for (int a2 = 0; a2 < na; a2++)
+		free(after[a2]);
+	free(after);
 	ws_merge_free(&m);
 	for (int g = 0; g < ng; g++)
 		free(got[g]);
@@ -1075,7 +1146,8 @@ main(int argc, char **argv)
 			default:
 				fprintf(stderr, "rebuild [--conninfo C] [--fixture DIR] [--work DIR] [--bindir DIR]\n"
 						"        [--steps N] [--stream] [--ddl] [--merge]\n"
-						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush]\n");
+						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush|\n"
+						"                 notags|noviol]\n");
 				return 2;
 		}
 	mkdir(o.work, 0700);
@@ -1148,6 +1220,8 @@ main(int argc, char **argv)
 
 			printf("  stream %.2f s to the barrier, definitions %.2f s\n", stream.wait_s,
 				   stream.defs_s);
+			if (stream.unflushed)
+				fail(s->file, "the barrier was not flushed when written");
 			if (stream.wait_s > BARRIER_DEADLINE)
 				fail(s->file, "the stream took too long to reach the barrier");
 			printf("  streamed so far: %" PRIu64 " changes, %" PRIu64 " layout and %" PRIu64

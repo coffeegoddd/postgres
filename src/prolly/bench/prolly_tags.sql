@@ -57,3 +57,17 @@ CREATE FUNCTION prolly.esc(is_null bool, t text) RETURNS text LANGUAGE sql IMMUT
 			'\', '\\'), chr(10), '\n'), chr(13), '\r'), chr(9), '\t'),
 			chr(8), '\b'), chr(12), '\f'), chr(11), '\v') END
 $$;
+
+-- Constraint violations a merge left in this working set: a row per
+-- violating row (rowkey: its primary key values, comma separated, or the
+-- whole row for a table without one), and a row per constraint (rowkey
+-- NULL) whose detail is its object key and definition, columns by tag, to
+-- apply once the rows are fixed.  Foreign keys and checks stay as NOT VALID
+-- meanwhile, so new rows are checked; unique constraints wait.
+CREATE TABLE prolly.violations (
+	tbl text NOT NULL,
+	cons text NOT NULL,
+	kind text NOT NULL,
+	rowkey text,
+	detail text NOT NULL
+);

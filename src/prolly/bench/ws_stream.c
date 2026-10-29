@@ -522,6 +522,19 @@ stream_capture(ProllyCtx *ctx, const char *db)
 					   1, NULL, params, NULL, NULL, 0);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		die("barrier: %s", PQerrorMessage(c));
+
+	/*
+	 * The stream sends WAL only once flushed: a barrier that is not would
+	 * wait for whatever flushes next.
+	 */
+	{
+		const char *lsn[1] = {PQgetvalue(res, 0, 0)};
+		PGresult   *r2 = PQexecParams(c, "SELECT pg_current_wal_flush_lsn() >= $1::pg_lsn",
+									  1, NULL, lsn, NULL, NULL, 0);
+
+		stream.unflushed = PQresultStatus(r2) != PGRES_TUPLES_OK || PQgetvalue(r2, 0, 0)[0] != 't';
+		PQclear(r2);
+	}
 	PQclear(res);
 	pg_cmd(c, "SELECT pg_advisory_unlock(" DDL_LOCK ")");
 
