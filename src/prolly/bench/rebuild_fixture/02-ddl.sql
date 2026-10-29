@@ -16,3 +16,5 @@ CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO (
 ALTER TABLE scratch RENAME TO scratch2;
 ALTER TABLE node SET (fillfactor = 60);
 CREATE INDEX node_path_spgist ON node USING spgist (path);
+ALTER TABLE ticket RENAME COLUMN note TO memo;
+CREATE TABLE ctas AS SELECT id, memo FROM ticket WHERE id % 2 = 0;

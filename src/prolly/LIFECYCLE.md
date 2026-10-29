@@ -460,6 +460,93 @@ tables, a 55 MB store.
   (this build has no libxml).  Indexes on virtual generated columns are
   not supported by Postgres itself.
 
+### Through the replication stream: DDL in the commit stream
+
+The rebuild above captures each commit fresh.  The lifecycle instead
+commits from the streaming decoder, so two problems had to be solved:
+- **DDL.** Logical decoding carries rows but not DDL, so a schema change
+  has to land at the right place among the row changes.
+- **Unchanged TOAST.** An UPDATE that leaves a TOASTed value alone does not
+  send that value.
+
+`bench/rebuild --stream` drives the same fixture through a pgoutput stream.
+At every commit its root value must equal a fresh capture's, and then every
+commit is rebuilt and checked as above.
+
+How it works (`bench/rebuild_stream.sql`, `bench/pgoutput.c`):
+
+- **DDL travels in the stream as logical messages.**  An event trigger at
+  `ddl_command_end` writes, inside the DDL's own transaction:
+  - **`prolly.layout`:** every table's codec layout, so rows after the
+    statement are read with the new layout and rows before it with the old
+    one;
+  - **`prolly.rows`:** the whole contents of each table whose row text the
+    statement may have changed with no decoded changes of its own.  This
+    covers ALTER TABLE (rewrites, fast defaults, dropped and retyped
+    columns), CREATE TABLE AS and ALTER TYPE, and extends to partitions and
+    inheritance children.  The decoder replaces the table with those rows.
+  
+  The layout query is the one the capture uses, so the two agree byte for
+  byte.  Aborted transactions never reach the stream, and their DDL with
+  them.
+- **Definitions are dumped at the barrier.**  DDL takes a shared advisory
+  lock at `ddl_command_start`, held to the end of its transaction.  A Dolt
+  commit then:
+  1. takes the lock exclusively;
+  2. exports a snapshot;
+  3. writes the barrier (non-transactional and flushed);
+  4. releases the lock.
+  
+  The stream is applied up to the barrier.  The definitions
+  (`pg_dump --snapshot`), sequence positions and unlogged tables, which the
+  WAL does not carry, are read at the snapshot.  DDL waits only for that
+  instant, and row writers never wait.
+- **Unchanged TOAST values** are taken from the row's current value in the
+  tree: pending edits first, then the tree.
+- **Keyless tables** are given `REPLICA IDENTITY FULL` by the trigger,
+  since their rows are keyed by the whole old row; without it Postgres
+  refuses their UPDATEs and DELETEs once a publication covers them.  This
+  shows in the schema dump.
+
+**Result:** all four commits stream to the same root value as a fresh
+capture, and every commit rebuilds and passes every check.
+- **Exercised:** DDL and DML in one transaction, a rolled-back DDL
+  transaction, TRUNCATE, CREATE TABLE AS, column renames, dropped and
+  retyped columns, fast defaults, an enum value added mid-list, partition
+  detach and attach, rows moving between partitions, primary-key updates,
+  cascades, and unchanged TOAST values (50 filled from the tree).
+- **Size:** about 112k streamed changes, 106 layout messages, 19 rows
+  messages (101k rows re-sent).
+- **Time:** the stream reaches the barrier in 0.07–0.71 s per commit, and
+  the definitions take 0.09 s.
+
+**Findings** (each kept by a `--stream --break` case):
+
+- **Casts to text are not output functions.**  `bool::text` is `false`
+  where the output function gives `f`, `char(n)::text` drops the padding,
+  and `inet::text` adds `/32`.  COPY and the stream use output functions,
+  so the trigger formats rows with `format('%s', …)` (`--break cast`).
+- **`x IS NULL` is true for a composite value whose fields are all NULL**,
+  which is not a NULL value.  The trigger uses `num_nulls(x) > 0`
+  (`--break isnull`; the fixture now has such a row).
+- **The barrier must be flushed.**  Logical decoding sends only flushed
+  WAL, so an unflushed non-transactional message waited 1.6–20 s, until
+  something else flushed the WAL.  This is the same lesson as the forced
+  flush before reading changed blocks (`--break noflush`, caught by a 5 s
+  deadline).
+- **Rewriting DDL costs O(table) in the stream.**  The rows are re-sent
+  whole, including for fast defaults and enum additions that Postgres does
+  in O(1).  This is correct, but the real implementation should transform
+  rows in the decoder where it can (add or drop a column, rename) and
+  re-send only for real type changes (`--break noreemit` shows the rows
+  are needed).
+- **Not covered yet:**
+  - the barrier protocol under concurrent DDL and row writers (it is
+    implemented, but the fixture is sequential);
+  - ALTER TYPE on composite types nested in other types or in arrays;
+  - DDL from extensions;
+  - `publish_via_partition_root`.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per
@@ -568,9 +655,10 @@ The prototype phase is concluded (see *Conclusions of the prototype*).  In
 the real implementation, in order:
 
 1. The lifecycle with the streaming decoder, a generic row codec and DDL
-   capture (the logical working set of `bench/rebuild.c` is the reference
-   to match, with large values in their own trees); explicit commits as of
-   the barrier; the time-based window.
+   capture (`bench/rebuild.c` is the reference: the logical working set,
+   and DDL carried in the stream by an event trigger, with large values in
+   their own trees and rewrites transformed in the decoder); explicit
+   commits as of the barrier; the time-based window.
 2. The **dolt tx commit** mode, asynchronous, measured at high transaction
    rates.
 3. Copy-on-write working sets (a page-store storage manager, a database

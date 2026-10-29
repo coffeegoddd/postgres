@@ -98,6 +98,8 @@ UPDATE kinds SET cid = network(set_masklen(ip, CASE family(ip) WHEN 4 THEN 16 EL
 	mac = ('08:00:2b:' || lpad(to_hex((a / 256) % 256), 2, '0') || ':'
 		   || lpad(to_hex(a % 256), 2, '0') || ':' || lpad(to_hex(length(b)), 2, '0'))::macaddr;
 UPDATE kinds SET mac8 = mac::macaddr8;
+-- A composite value whose fields are all NULL is not itself NULL.
+INSERT INTO kinds (a, b, ad) VALUES (9001, 'nullrow', ROW(NULL, NULL));
 
 -- B-tree: composite, ordered, covering, partial, expression, operator class.
 CREATE INDEX kinds_tstz_desc ON kinds (tstz DESC NULLS FIRST, i8);

@@ -37,18 +37,25 @@ bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -pthread
 
 # Rebuilding a schema, every index included, from the store (see bench/rebuild.c).
-bench/rebuild: bench/rebuild.c test/test_util.h libprolly.a $(HDRS)
-	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $< libprolly.a \
+bench/rebuild: bench/rebuild.c bench/pgoutput.c bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ bench/rebuild.c \
+		bench/pgoutput.c libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
 
 # Against the running server: every commit of the fixture must rebuild, and
 # each deliberate fault must be caught.
 rebuild-check: bench/rebuild
 	./bench/rebuild
+	./bench/rebuild --stream
 	for b in row sequence matview nohide; do \
 		if ./bench/rebuild --steps 1 --break $$b >/dev/null 2>&1; then \
 			echo "rebuild: --break $$b went unnoticed"; exit 1; \
 		else echo "rebuild: --break $$b caught"; fi; \
+	done
+	for b in cast isnull toast noreemit noflush; do \
+		if ./bench/rebuild --stream --steps 3 --break $$b >/dev/null 2>&1; then \
+			echo "rebuild: --stream --break $$b went unnoticed"; exit 1; \
+		else echo "rebuild: --stream --break $$b caught"; fi; \
 	done
 
 bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
