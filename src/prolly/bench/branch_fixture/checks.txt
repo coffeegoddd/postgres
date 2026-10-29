@@ -1,0 +1,17 @@
+# The generated-column fixture's checks, run on branch 1 beside a decoy branch 2 rt
+# (see setup.sql): every answer must be as without the decoy.
+# Checks run after every commit, on the source when the commit is captured
+# and on every database rebuilt or moved to it; both must give the same
+# answer (see rebuild_fixture/checks.txt for the format).  A value computed
+# again shows as a different g after the function is replaced; the
+# identities' sequences must be where the source left them.
+
+s SELECT count(*), sum(a), sum(g), string_agg(id || '=' || coalesce(g::text, '-') || ',' || coalesce(k, '-') || ',' || coalesce(v::text, '-'), ';' ORDER BY id) FROM rt.item
+s SELECT string_agg(id || '=' || coalesce(to_jsonb(i) ->> 'h', '-'), ',' ORDER BY id) FROM rt.item i
+s SELECT count(*), string_agg(id || '=' || a || ',' || coalesce(sq::text, '-'), ';' ORDER BY id) FROM rt.byd
+s SELECT x, gx, count(*) FROM rt.bag GROUP BY x, gx ORDER BY x, gx
+s SELECT string_agg(sequencename || '=' || coalesce(last_value::text, '-') || '/' || increment_by || '/' || start_value, ',' ORDER BY sequencename) FROM pg_sequences WHERE schemaname = 'rt'
+s SELECT string_agg(attname || '=' || attidentity || attgenerated, ',' ORDER BY attrelid::regclass::text, attnum) FROM pg_attribute WHERE attrelid IN ('rt.item'::regclass, 'rt.byd'::regclass, 'rt.bag'::regclass) AND attnum > 0 AND NOT attisdropped
+s SELECT id, g FROM rt.item WHERE g BETWEEN 50 AND 120 ORDER BY id
+# rejected before any value is computed, so the call count stays
+v 428C9|INSERT INTO rt.item (id, a, b) VALUES (1, 1, 'explicit')

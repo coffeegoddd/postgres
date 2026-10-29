@@ -1842,8 +1842,9 @@ verified.
 
 ## Next
 
-The prototype phase is concluded (see *Conclusions of the prototype*).  In
-the real implementation, in order:
+Superseded in part by the seam spike: see *Earlier results under the seam*
+in `ARCHITECTURE.md` for what each result here means now, and its list of
+what is left to build.  The order as it stood before the spike:
 
 1. The lifecycle with the streaming decoder, a generic row codec and DDL
    capture (`bench/rebuild.c` is the reference: the logical working set,

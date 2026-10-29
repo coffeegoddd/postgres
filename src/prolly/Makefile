@@ -28,7 +28,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check durability-check trigger-check gen-check
+.PHONY: all check clean rebuild-check durability-check trigger-check gen-check branch-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
@@ -104,6 +104,21 @@ gen-check: bench/rebuild
 	if ./bench/rebuild --fixture bench/gen_fixture --merge --break noregen >/dev/null 2>&1; then \
 		echo "rebuild: --merge --break noregen went unnoticed"; exit 1; \
 	else echo "rebuild: --merge --break noregen caught"; fi
+
+# Branched catalogs: against a server built with
+# contrib/prolly_branch/spike/catalog_branch.patch (CATINST), the catalog
+# test, then the harness on branch 1 beside a decoy branch 2 schema of the
+# same name, in every mode.
+CATINST ?= /home/dustin/cursor_src/pg-v2-cat/inst/bin
+CATCONN ?= host=/tmp port=5496 user=postgres
+branch-check: bench/rebuild
+	bash ../../contrib/prolly_branch/spike/catalog_branch_test.sh
+	$(CATINST)/pg_ctl -D /home/dustin/pgv2-bench/catdb2 -l /home/dustin/pgv2-bench/catdb2/server.log -w start
+	for m in "" --stream --move --merge; do \
+		PGOPTIONS="-c catalog_branch=1" ./bench/rebuild --conninfo "$(CATCONN)" --bindir $(CATINST) \
+			--fixture bench/branch_fixture $$m || exit 1; \
+	done
+	$(CATINST)/pg_ctl -D /home/dustin/pgv2-bench/catdb2 -w stop -m fast
 
 # Crash safety and backups, in a cluster of their own (made on first use
 # in CRASHDB, on port 5498): every crash point of a commit recovered, then

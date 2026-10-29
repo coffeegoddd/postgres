@@ -407,12 +407,58 @@ option behind the chunk store interface, measured when it matters.
 
 | Patch | Feature | Status |
 |---|---|---|
-| `relation_locator_hook` (relcache.c, relcache.h) | a branch per session | spike |
+| `relation_locator_hook` (relcache.c, relcache.h) | a branch per session | superseded by branched catalogs; to be removed |
 | a relation-for-file hook in decoding | logical decoding of branch files | needed for B |
 | per-branch file fields (relpages, reltuples, relallvisible, relfrozenxid, relminmxid) and the freeze horizon | VACUUM, ANALYZE, wraparound safety per branch | needed for B; A needs the horizon part |
 | `pg_namespace.nspbranch`, branch-aware name lookup, the catalog filter, `catalog_branch`, branch-scoped decoding (`spike/catalog_branch.patch`) | catalogs branched by row | spike; makes the two above unnecessary |
 | a checkpoint callback for custom resource managers | chunk files flushed at checkpoints, not at each commit | not needed: chunks are table rows (experiment E) |
 | a transaction-redo hook | roots moving at commit on a standby | not needed: roots are table rows (experiment E) |
+
+## Earlier results under the seam
+
+Every result in `LIFECYCLE.md`, against what the spike decided: a branch
+of a versioned schema is its own catalog rows and its own relation files
+(experiment C), the history store is rows of tables (experiment E), and
+checkout across branches is a change of `catalog_branch`, not a move of
+data.
+
+**Checked by running it.**  The whole harness (capture, logical and
+streamed; rebuild; moves; merges; DDL; history reads) and all three
+fixtures pass on the patched server (12 runs).  `bench/branch_fixture`
+then runs it on branch 1, with `rt` versioned there, beside a decoy branch
+2 `rt` whose tables, types, functions and rows clash with the fixture's:
+rebuild, stream, move and merge all pass, and with the catalog filter off
+the run fails at once (`make branch-check`).
+
+| Result (`LIFECYCLE.md`) | Status | Under the seam |
+|---|---|---|
+| Prolly tree, version control core: commits, merge base, log, diff | holds | layers 2 and 3 do not see Postgres |
+| The window: segments, severing, floors and ceilings, low marks, millions of commits | holds | |
+| Parents in commits (the commit graph rejected) | holds | |
+| History mode REWRITE | holds | |
+| Remotes: fetch, push, clone, attachment rules | holds | |
+| Structured schema: column tags, schema diff and merge | holds | the canonical form commits hold; the bridge between history and each branch's catalog rows |
+| Rebuilding Postgres from the tree | holds | how a branch is made from a commit, a clone, or history outside the window; a new branch is made this way today (dump and restore), with statistics and without unlogged contents |
+| Capture: streaming decoder, barrier, DDL by event trigger | holds, changed | decoding is per branch (a stream on a branch carries that branch's and the shared schemas' changes); the decoder becomes a background worker, one per branch with a working set |
+| Mode: dolt tx commit | holds | per branch, as capture |
+| Moving the working set in place | changed | no longer how one switches branch (a session sets its branch, O(1)); still how a branch is reset, checked out to an older commit, or given a merge's result, as row changes a subscriber follows |
+| No user code during moves | holds | applies to resets and merges into a branch |
+| Identity and generated columns | holds | |
+| Unlogged and temporary tables, large objects, replication, history security, statistics | holds | built against branched catalogs |
+| Keyframes: replay or restore, the planner, frozen keyframes | holds, narrower | branch switches need no keyframe; they serve resets and checkouts to older commits, and making a branch from a commit; the keyframe manager waits on that narrower use |
+| The chunk store on disk (`dirstore`) | superseded | the history store is rows of tables (experiment E); `dirstore` stays a store for tests and tools behind the `ChunkStore` interface |
+| Crash safety and backups of the store | superseded | the store is tables, so Postgres's own WAL, crash recovery, base backups and point-in-time recovery cover it; the store's own journal and backup suite test `dirstore` only |
+| Concurrent branches: copy-on-write working sets | changed | concurrent branches come from branched catalogs, with each branch's files copied whole when it is made; copy-on-write remains the way to make branch creation and reset O(1) (it needs relation files that share pages, below the catalog) |
+| Constant-time branch, reset and release | open | needs copy-on-write files; not built |
+| Experiment A (catalog swap) and B (`relation_locator_hook`) | superseded by C | the hook is still in the tree (`relcache.c`), unused by the design; to be removed with the next core patch set |
+
+**What is still to build, from this review:**
+1. Branch creation without copying every file (copy-on-write relation
+   files), for O(1) branches and resets.
+2. The decoder as a background worker per branch, writing into the
+   table-backed history store.
+3. Making a schema versioned and making a branch as SQL (today: a catalog
+   update and dump/restore in the tests).
 
 ## Order
 
