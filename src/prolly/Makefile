@@ -138,6 +138,9 @@ bench/deepbench: bench/deepbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
 
 # Where restoring pages beats replaying rows, against a running server (see bench/kfbench.c).
+bench/storebench: bench/storebench.c test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
+
 bench/kfbench: bench/kfbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq

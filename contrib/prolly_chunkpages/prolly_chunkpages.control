@@ -1,0 +1,6 @@
+# prolly_chunkpages extension
+comment = 'a chunk store in pages of its own layout, through the buffer manager (a spike)'
+default_version = '1.0'
+module_pathname = '$libdir/prolly_chunkpages'
+relocatable = false
+schema = cp

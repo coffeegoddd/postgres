@@ -396,12 +396,63 @@ same cluster, with a hot standby.
   manager has no checkpoint callback; the table pays about 38% more disk
   (TOAST's 2 KB pieces, the hash index) and 15% more WAL.
 
-**Conclusion:** the history store keeps chunks and roots as rows of tables.
-Commit atomicity, crash recovery, checkpoints, standbys and decoding come
-from Postgres with no hook; neither the checkpoint callback nor the
-transaction-redo hook is needed.  A dedicated page format for chunks
-(through the buffer manager, to win back the disk overhead) remains an
-option behind the chunk store interface, measured when it matters.
+**What it showed:** inside Postgres, commit atomicity, crash recovery,
+checkpoints, standbys and decoding come with no hook, so neither hook
+experiment D needed is needed.  It compared rows only with D's files;
+experiment F compares rows, pages of our own layout and `dirstore`.
+
+### Experiment F: three history stores on one workload
+
+Experiment E compared table rows only with experiment D's file per chunk,
+which fsyncs every file at commit; not with `dirstore`, the journal store
+built on Dolt's design.  So: rows of a table, pages of our own layout
+(`contrib/prolly_chunkpages`: an append-only byte log across a relation's
+pages, through the buffer manager with generic WAL, a hash index table,
+and a minimal table access method so nothing reads the pages as heap),
+and `dirstore` (`bench/storebench`), on one workload
+(`bench/store_compare.sh`): random 4 KB chunks committed 100 at a time,
+every chunk read back in random order (every byte fetched), then a random
+half discarded and its space taken back.  `dirstore`'s chunks are reached
+as history reaches them, through a node per batch with only the node a
+root.  At 100,000 chunks (400 MB):
+
+| | rows | pages | dirstore |
+|---|---:|---:|---:|
+| write | 6.0 s | 8.0 s | 3.6 s |
+| WAL written | 460 MB | 427 MB | none (its journal) |
+| on disk | 543 MB | 408 MB | 411 MB |
+| read, warm | 0.72 s | 0.54 s | 0.09 s |
+| read, after a restart | 1.06 s | 0.80 s | 0.09 s (0.81 s to reopen) |
+| discard half and reclaim | 3.0 s, and nothing given back; then VACUUM FULL 1.1 s (exclusive lock) | 1.4 s | 0.35 s |
+| WAL for the discard | 412 + 221 MB | 224 MB | none |
+| on disk after | 271 MB | 212 MB | 210 MB |
+
+At 20,000 chunks the proportions are the same.
+
+**What it shows:**
+- **`dirstore` is fastest at everything:** writes about 1.7x, reads about
+  6-8x (memory-mapped files, no SQL), discards about 4x.  It writes the
+  data once, where the Postgres stores write it to the WAL and again at
+  checkpoint.  Its costs are the ones experiments D and E found: its own
+  durability ordered against the SQL commit, its own backups, standbys
+  that do not see it (or a transaction-redo hook), no logical decoding, and
+  reopening rebuilds reference counts in O(live chunks) (0.8 s here).
+- **Pages beat rows** on everything but write speed: a quarter less disk
+  (no TOAST pieces), reads 25% faster, and a discard that gives the space
+  back in half the time with half the WAL, with no exclusive lock (rows
+  need VACUUM FULL to shrink at all).  Writes are a third slower, in an
+  unoptimized first version (the meta page is logged with every chunk,
+  and each chunk is a SQL call).
+- **The reads of both Postgres stores go through SQL** here (an executor
+  call per chunk); a reader in C inside the backend would narrow the gap
+  to `dirstore`, unmeasured.
+
+**Where this leaves the decision:** the plumbing argument stands: inside
+Postgres, roots move with the commit, standbys and backups and decoding
+need nothing, no hook is patched in.  Within that, pages of our own
+layout are the better store than rows.  `dirstore` remains the faster
+store, at the price of that plumbing.  The history store is behind the
+`ChunkStore` interface either way.
 
 ### Patches so far
 
@@ -446,8 +497,8 @@ the run fails at once (`make branch-check`).
 | Identity and generated columns | holds | |
 | Unlogged and temporary tables, large objects, replication, history security, statistics | holds | built against branched catalogs |
 | Keyframes: replay or restore, the planner, frozen keyframes | holds, narrower | branch switches need no keyframe; they serve resets and checkouts to older commits, and making a branch from a commit; the keyframe manager waits on that narrower use |
-| The chunk store on disk (`dirstore`) | superseded | the history store is rows of tables (experiment E); `dirstore` stays a store for tests and tools behind the `ChunkStore` interface |
-| Crash safety and backups of the store | superseded | the store is tables, so Postgres's own WAL, crash recovery, base backups and point-in-time recovery cover it; the store's own journal and backup suite test `dirstore` only |
+| The chunk store on disk (`dirstore`) | open | experiment F: fastest at everything, but outside Postgres's commit, standbys, backups and decoding; inside Postgres, pages of our own layout beat table rows; the choice is pending |
+| Crash safety and backups of the store | depends on the store | inside Postgres, its own WAL, recovery, base backups and point-in-time recovery cover the store; `dirstore` keeps its own journal and backup suite |
 | Concurrent branches: copy-on-write working sets | changed | concurrent branches come from branched catalogs, with each branch's files copied whole when it is made; copy-on-write remains the way to make branch creation and reset O(1) (it needs relation files that share pages, below the catalog) |
 | Constant-time branch, reset and release | open | needs copy-on-write files; not built |
 | Experiment A (catalog swap) and B (`relation_locator_hook`) | superseded by C | the hook is still in the tree (`relcache.c`), unused by the design; to be removed with the next core patch set |
