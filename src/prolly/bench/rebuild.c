@@ -72,10 +72,12 @@ typedef struct Check
 	char	   *sql;
 	bool		used;			/* q: its index answered it in some rebuild */
 	bool		nonempty;		/* q: some commit gave rows */
+	bool		not_moved;		/* Q: skipped after in-place moves */
 } Check;
 
 static Check checks[MAX_CHECKS];
 static int	nchecks;
+static bool checking_move;		/* the database was moved in place, not rebuilt */
 
 static void
 load_checks(void)
@@ -94,10 +96,18 @@ load_checks(void)
 
 		if (p[0] == '#' || p[0] == '\0')
 			continue;
-		if (nchecks == MAX_CHECKS || p[1] != ' ' || strchr("qsv", p[0]) == NULL)
+		if (nchecks == MAX_CHECKS || p[1] != ' ' || strchr("qQsv", p[0]) == NULL)
 			die("bad check line: %s", p);
 		ch = &checks[nchecks++];
-		ch->kind = p[0];
+		/*
+		 * Q: a q check skipped after in-place moves.  For the SP-GiST inet
+		 * index: a move writes rows one at a time, and in the order that
+		 * leaves them in, a Postgres bug makes SP-GiST inet_ops miss rows
+		 * (bench/spgist_inet_repro.sql reproduces it without us).  A
+		 * rebuild's COPY order does not hit it, so the check still runs there.
+		 */
+		ch->not_moved = p[0] == 'Q';
+		ch->kind = ch->not_moved ? 'q' : p[0];
 		p += 2;
 		if (ch->kind == 's')
 		{
@@ -374,6 +384,8 @@ check_rebuilt(const char *db, char **expect, const char *label, bool last)
 		char	   *got;
 		char		msg[2048];
 
+		if (ch->not_moved && checking_move)
+			continue;			/* a Postgres bug (see load_checks) */
 		if (ch->kind == 'q')
 		{
 			if (index_exists(c, ch->arg))
@@ -2024,7 +2036,9 @@ run_moves(char **names, int nsteps)
 			fail(label, "the moved working set captures to a different root value");
 			explain_mismatch(&r.ctx, &root[next], &got, label);
 		}
+		checking_move = true;
 		check_rebuilt("rt_move", expect[next], label, false);
+		checking_move = false;
 		cur = next;
 	}
 	vc_repo_free(&r);

@@ -905,6 +905,11 @@ col_array(const WsLayout *L, const uint64_t *tags, int n, Buf *out)
 /*
  * Applies data, COPY text for the columns in cols, with prolly_apply_insert
  * or prolly_apply_delete: no user code runs.  Every line must take effect.
+ *
+ * Rows go in one at a time, so they lie in a different order than COPY
+ * leaves them.  In one such order a Postgres bug makes an SP-GiST inet_ops
+ * index miss rows (bench/spgist_inet_repro.sql reproduces it without us);
+ * the move test skips that one check (Q in checks.txt).
  */
 static void
 apply_rows(Move *mv, const char *fn, const WsLayout *L, Buf *cols, Buf *data, uint64_t lines)
