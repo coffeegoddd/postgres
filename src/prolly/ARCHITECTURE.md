@@ -112,6 +112,58 @@ how a schema's contents look as trees.
 - **Concurrent branches:** copy-on-write working sets would replace the
   working-set half of layers 5 and 6.  Layers 1 to 4 and 7 to 9 stay.
 
+## The seam: what stock Postgres gives
+
+The engine goes inside Postgres as an extension below the table access
+method seam, as OrioleDB does, so upstream changes keep merging.  Where a
+seam cannot give a feature its full semantics, we patch: small,
+hook-shaped patches, listed here with the feature that needs each.
+
+### Experiment A: a branch as relation files (`contrib/prolly_branch`)
+
+A branch of a schema is one set of files: a copy of every table, index,
+TOAST relation and sequence file.  Checkout points `pg_class` at the
+branch's files (with the fields that belong to a file: relpages,
+reltuples, relallvisible, relfrozenxid, relminmxid), in a transaction.
+No core change.  `spike/branch_test.sql`, `spike/sessions.sh` and
+`spike/horizon_ddl.sh` test it.
+
+**What works on stock Postgres:**
+- every index method (B-tree, hash, GiST, GIN, SP-GiST, BRIN, pg_trgm's
+  GIN) answers each branch exactly, with amcheck clean, since a table and
+  its indexes switch together; TOAST and identity sequences are per branch;
+- a checkout is transactional: rolled back, it leaves the branch it found;
+  a branch made in a rolled-back transaction leaves no files;
+- readers wait for a checkout and then see the new branch; prepared plans
+  follow it; an open cursor holds a checkout off until its transaction
+  ends;
+- VACUUM and ANALYZE on one branch leave the others as they were;
+- crash recovery: both branches survive an immediate stop, since every
+  write to a branch's files is ordinary WAL.
+
+**What it cannot give:**
+1. **One branch per database at a time.**  `pg_class` names one file per
+   relation, so every session sees the checked-out branch.  A branch per
+   session needs the relation-to-file mapping to be per backend (experiment
+   B).
+2. **The same definition on every branch.**  Shown: after `ALTER COLUMN a
+   TYPE bigint` on one branch, the other branch's file read under the new
+   definition is garbage (`20/339457` for `2/20`).  Branches that differ in
+   definitions need per-branch catalogs, or a checkout that moves the
+   definitions (as the harness's moves do) and switches files only where
+   the physical layout matches.
+3. **Logical decoding does not see a switch.**  Writes on each branch are
+   decoded, but the switch itself is not in the stream, so a subscriber
+   merges both branches' rows into one table.
+4. **Files the catalog does not name are invisible to the server's own
+   bookkeeping.**  The freeze horizon (`vac_update_datfrozenxid`) and so
+   commit-status truncation consider only `pg_class`: a parked branch's
+   unfrozen xids can outlive the status the server keeps for them.  Parked
+   files must be frozen when parked, or the horizon must include them (a
+   hook).  Autovacuum likewise never visits them.
+5. **DROP TABLE leaves the other branches' files** on disk.  Fixable from
+   an extension with `object_access_hook`.
+
 ## Order
 
 1. This map.

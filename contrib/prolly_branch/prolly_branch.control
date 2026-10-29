@@ -1,0 +1,6 @@
+# prolly_branch extension
+comment = 'branches as relation files, switched in the catalog (a spike)'
+default_version = '1.0'
+module_pathname = '$libdir/prolly_branch'
+relocatable = false
+schema = prolly_branch
