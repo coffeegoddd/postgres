@@ -19,6 +19,13 @@ $(OBJS): $(HDRS)
 libprolly.a: $(OBJS)
 	$(AR) rcs $@ $^
 
+# The history store inside Postgres, against the running test server.
+test/test_pgstore: test/test_pgstore.c bench/pgstore.c bench/pgstore.h test/test_util.h test/test_repo.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ test/test_pgstore.c bench/pgstore.c libprolly.a \
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
+pgstore-check: test/test_pgstore
+	./test/test_pgstore
+
 test/%: test/%.c test/test_util.h test/test_repo.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
 
@@ -28,7 +35,7 @@ check: $(TESTS)
 clean:
 	rm -f $(OBJS) libprolly.a $(TESTS)
 
-.PHONY: all check clean rebuild-check durability-check trigger-check gen-check branch-check
+.PHONY: all check clean rebuild-check durability-check trigger-check gen-check branch-check pgstore-check
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst

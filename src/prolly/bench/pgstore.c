@@ -1,0 +1,846 @@
+/*
+ * pgstore.c
+ *	  The history store inside Postgres, behind the ChunkStore interface (see
+ *	  pgstore.h): chunk metadata in memory, chunks in a schema's page log
+ *	  (contrib/prolly_chunkpages) on the server.
+ *
+ * Schema s holds:
+ *	pages	the log (access method prolly_chunks), written by cp.cp_append
+ *	idx		hash -> place in the log and length
+ *	roots	hash -> durable root count
+ *	state	the repo state root
+ * A flush is one transaction: new chunks copied in (binary COPY to a
+ * temporary table, then appended to the log and indexed), chunks let go
+ * removed from the index, the roots and state written whole.  The log's
+ * space for chunks let go comes back by compaction (cp.compact), not here.
+ */
+#include <libpq-fe.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "pgstore.h"
+
+#define SLOT_EMPTY 0
+#define SLOT_USED 1
+#define SLOT_DELETED 2
+
+typedef struct PEntry
+{
+	PHash		h;
+	uint8_t    *data;			/* cached bytes, or NULL: on the server */
+	size_t		len;
+	int64_t		loc;			/* place in the log; -1 until flushed */
+	ChunkMeta	meta;
+	uint8_t		state;
+	bool		pending;		/* not yet on the server */
+} PEntry;
+
+typedef struct PgStore
+{
+	ChunkStore	base;
+	PGconn	   *c;
+	char	   *schema;			/* quoted */
+	bool		ephemeral;
+	bool		readonly;		/* a standby: the store is only read */
+	bool		failed;			/* not opened: nothing to flush */
+	PEntry	   *tab;
+	size_t		cap,
+				used,
+				deleted;
+	uint64_t	bytes;
+	size_t		npending;
+	PHashMap	roots;
+	bool		roots_dirty;
+	PHash	   *dels;			/* chunks let go since the last flush */
+	size_t		ndel,
+				delcap;
+	PHash		state;
+	bool		has_state,
+				state_dirty;
+	uint64_t	server_reads;
+} PgStore;
+
+/* ------------------------------------------------------------- the table */
+
+static size_t
+slot_of(const PHash *h, size_t cap)
+{
+	uint64_t	x;
+
+	memcpy(&x, h->b, sizeof(x));
+	return (size_t) (x & (cap - 1));
+}
+
+static PEntry *
+find(PgStore *ps, const PHash *h)
+{
+	for (size_t i = slot_of(h, ps->cap);; i = (i + 1) & (ps->cap - 1))
+	{
+		PEntry	   *e = &ps->tab[i];
+
+		if (e->state == SLOT_EMPTY)
+			return NULL;
+		if (e->state == SLOT_USED && phash_eq(&e->h, h))
+			return e;
+	}
+}
+
+static void
+rehash(PgStore *ps, size_t cap)
+{
+	PEntry	   *old = ps->tab;
+	size_t		oldcap = ps->cap;
+
+	ps->tab = calloc(cap, sizeof(PEntry));
+	if (ps->tab == NULL)
+		abort();
+	ps->cap = cap;
+	ps->deleted = 0;
+	for (size_t i = 0; i < oldcap; i++)
+	{
+		if (old[i].state != SLOT_USED)
+			continue;
+		for (size_t j = slot_of(&old[i].h, cap);; j = (j + 1) & (cap - 1))
+			if (ps->tab[j].state == SLOT_EMPTY)
+			{
+				ps->tab[j] = old[i];
+				break;
+			}
+	}
+	free(old);
+}
+
+/* A new entry for h (which must be absent), with zeroed metadata. */
+static PEntry *
+insert(PgStore *ps, const PHash *h)
+{
+	PEntry	   *slot = NULL;
+
+	if ((ps->used + ps->deleted + 1) * 10 > ps->cap * 7)
+		rehash(ps, (ps->used + 1) * 10 > ps->cap * 5 ? ps->cap * 2 : ps->cap);
+	for (size_t i = slot_of(h, ps->cap);; i = (i + 1) & (ps->cap - 1))
+		if (ps->tab[i].state != SLOT_USED)
+		{
+			slot = &ps->tab[i];
+			break;
+		}
+	if (slot->state == SLOT_DELETED)
+		ps->deleted--;
+	memset(slot, 0, sizeof(*slot));
+	slot->state = SLOT_USED;
+	slot->h = *h;
+	slot->loc = -1;
+	ps->used++;
+	return slot;
+}
+
+/* --------------------------------------------------------------- the server */
+
+static bool
+ok(PGresult *res, char *err, size_t errlen, PGconn *c)
+{
+	ExecStatusType s = PQresultStatus(res);
+
+	if (s == PGRES_COMMAND_OK || s == PGRES_TUPLES_OK || s == PGRES_COPY_IN)
+		return true;
+	if (err)
+		snprintf(err, errlen, "%s", PQerrorMessage(c));
+	return false;
+}
+
+static bool
+run(PgStore *ps, const char *sql, char *err, size_t errlen)
+{
+	PGresult   *res = PQexec(ps->c, sql);
+	bool		good = ok(res, err, errlen, ps->c);
+
+	PQclear(res);
+	return good;
+}
+
+static void
+must(PgStore *ps, const char *sql)
+{
+	char		err[512];
+
+	if (!run(ps, sql, err, sizeof(err)))
+	{
+		fprintf(stderr, "pgstore: %s: %s\n", sql, err);
+		abort();
+	}
+}
+
+/* sql with the schema in place of each %s (at most four). */
+static char *
+in_schema(PgStore *ps, const char *fmt)
+{
+	size_t		n = strlen(fmt) + 4 * strlen(ps->schema) + 1;
+	char	   *out = malloc(n);
+
+	snprintf(out, n, fmt, ps->schema, ps->schema, ps->schema, ps->schema);
+	return out;
+}
+
+static void
+must_in(PgStore *ps, const char *fmt)
+{
+	char	   *sql = in_schema(ps, fmt);
+
+	must(ps, sql);
+	free(sql);
+}
+
+static void
+put_be16(Buf *b, uint16_t v)
+{
+	uint8_t		x[2] = {(uint8_t) (v >> 8), (uint8_t) v};
+
+	buf_append(b, x, 2);
+}
+
+static void
+put_be32(Buf *b, uint32_t v)
+{
+	uint8_t		x[4] = {(uint8_t) (v >> 24), (uint8_t) (v >> 16), (uint8_t) (v >> 8), (uint8_t) v};
+
+	buf_append(b, x, 4);
+}
+
+static int64_t
+get_be64(const char *p)
+{
+	uint64_t	v = 0;
+
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | (uint8_t) p[i];
+	return (int64_t) v;
+}
+
+static uint32_t
+get_be32(const char *p)
+{
+	return ((uint32_t) (uint8_t) p[0] << 24) | ((uint32_t) (uint8_t) p[1] << 16) |
+		((uint32_t) (uint8_t) p[2] << 8) | (uint8_t) p[3];
+}
+
+/* A hash as a bytea literal: \x and hex. */
+static void
+hash_literal(const PHash *h, char *out)
+{
+	out[0] = '\\';
+	out[1] = 'x';
+	phash_hex(h, out + 2);
+}
+
+/* ------------------------------------------------------------ the store */
+
+static const uint8_t *
+pg_get(ChunkStore *cs, const PHash *h, size_t *len)
+{
+	PgStore    *ps = (PgStore *) cs;
+	PEntry	   *e = find(ps, h);
+
+	if (e == NULL)
+		return NULL;
+	if (e->data == NULL)
+	{
+		char	   *sql = in_schema(ps, "SELECT cp.cp_read('%s.pages', $1::int8, $2::int4)");
+		char		loc[24],
+					l[16];
+		const char *vals[2] = {loc, l};
+		PGresult   *res;
+
+		snprintf(loc, sizeof(loc), "%lld", (long long) e->loc);
+		snprintf(l, sizeof(l), "%zu", e->len);
+		res = PQexecParams(ps->c, sql, 2, NULL, vals, NULL, NULL, 1);
+		free(sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+			(size_t) PQgetlength(res, 0, 0) != e->len)
+		{
+			fprintf(stderr, "pgstore: reading a chunk: %s\n", PQerrorMessage(ps->c));
+			abort();
+		}
+		e->data = px_memdup(PQgetvalue(res, 0, 0), e->len);
+		PQclear(res);
+		ps->server_reads++;
+		/* what the server sent must be the chunk asked for */
+		{
+			PHash		got;
+
+			phash_compute(e->data, e->len, &got);
+			if (!phash_eq(&got, h))
+			{
+				fprintf(stderr, "pgstore: the server's bytes for a chunk do not match its hash\n");
+				abort();
+			}
+		}
+	}
+	*len = e->len;
+	return e->data;
+}
+
+static bool
+pg_put(ChunkStore *cs, const PHash *h, const uint8_t *data, size_t len)
+{
+	PgStore    *ps = (PgStore *) cs;
+	PEntry	   *e;
+
+	if (find(ps, h))
+		return false;
+	e = insert(ps, h);
+	e->data = px_memdup(data, len);
+	e->len = len;
+	e->pending = true;
+	ps->npending++;
+	ps->bytes += len;
+	return true;
+}
+
+static bool
+pg_has(ChunkStore *cs, const PHash *h)
+{
+	return find((PgStore *) cs, h) != NULL;
+}
+
+static ChunkMeta *
+pg_meta(ChunkStore *cs, const PHash *h)
+{
+	PEntry	   *e = find((PgStore *) cs, h);
+
+	return e ? &e->meta : NULL;
+}
+
+static void
+pg_del(ChunkStore *cs, const PHash *h)
+{
+	PgStore    *ps = (PgStore *) cs;
+	PEntry	   *e = find(ps, h);
+
+	if (e == NULL)
+		return;
+	if (e->pending)
+		ps->npending--;
+	else
+	{
+		px_grow((void **) &ps->dels, &ps->delcap, ps->ndel + 1, sizeof(PHash));
+		ps->dels[ps->ndel++] = *h;
+	}
+	free(e->data);
+	e->data = NULL;
+	ps->bytes -= e->len;
+	e->state = SLOT_DELETED;
+	ps->used--;
+	ps->deleted++;
+}
+
+static void
+pg_foreach(ChunkStore *cs, ChunkVisitFn fn, void *arg)
+{
+	PgStore    *ps = (PgStore *) cs;
+
+	for (size_t i = 0; i < ps->cap; i++)
+		if (ps->tab[i].state == SLOT_USED)
+			fn(arg, &ps->tab[i].h);
+}
+
+static size_t
+pg_count(ChunkStore *cs)
+{
+	return ((PgStore *) cs)->used;
+}
+
+static uint64_t
+pg_bytes(ChunkStore *cs)
+{
+	return ((PgStore *) cs)->bytes;
+}
+
+static void
+pg_note_root(ChunkStore *cs, const PHash *h, uint64_t roots)
+{
+	PgStore    *ps = (PgStore *) cs;
+	bool		created;
+
+	ps->roots_dirty = true;
+	if (roots == 0)
+		phmap_remove(&ps->roots, h);
+	else
+		*phmap_ref(&ps->roots, h, &created) = roots;
+}
+
+static void pg_destroy(ChunkStore *cs);
+
+static void
+quiet(void *arg, const char *message)
+{
+}
+
+static const ChunkStoreOps pg_ops = {
+	pg_get, pg_put, pg_has, pg_meta, pg_del, pg_foreach,
+	pg_count, pg_bytes, pg_destroy, pg_note_root
+};
+
+/* -------------------------------------------------------------- flushing */
+
+/* The chunks not yet on the server, through a binary COPY. */
+static void
+send_new(PgStore *ps)
+{
+	Buf			b = {0};
+	PGresult   *res;
+	char	   *sql;
+	static const char header[] = "PGCOPY\n\377\r\n";
+
+	must(ps, "TRUNCATE prolly_pending");
+	res = PQexec(ps->c, "COPY prolly_pending (hash, data) FROM STDIN (FORMAT binary)");
+	if (PQresultStatus(res) != PGRES_COPY_IN)
+	{
+		fprintf(stderr, "pgstore: copy: %s\n", PQerrorMessage(ps->c));
+		abort();
+	}
+	PQclear(res);
+	buf_append(&b, header, 11);
+	put_be32(&b, 0);
+	put_be32(&b, 0);
+	for (size_t i = 0; i < ps->cap; i++)
+	{
+		PEntry	   *e = &ps->tab[i];
+
+		if (e->state != SLOT_USED || !e->pending)
+			continue;
+		put_be16(&b, 2);
+		put_be32(&b, PHASH_LEN);
+		buf_append(&b, e->h.b, PHASH_LEN);
+		put_be32(&b, (uint32_t) e->len);
+		buf_append(&b, e->data, e->len);
+		if (b.len > (1 << 20))
+		{
+			if (PQputCopyData(ps->c, (const char *) b.data, (int) b.len) != 1)
+				abort();
+			b.len = 0;
+		}
+	}
+	put_be16(&b, 0xffff);
+	if (PQputCopyData(ps->c, (const char *) b.data, (int) b.len) != 1 ||
+		PQputCopyEnd(ps->c, NULL) != 1)
+		abort();
+	res = PQgetResult(ps->c);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "pgstore: copy: %s\n", PQerrorMessage(ps->c));
+		abort();
+	}
+	PQclear(res);
+	free(b.data);
+
+	/* appended to the log in one pass; each chunk's place comes back */
+	sql = in_schema(ps, "INSERT INTO %s.idx (hash, loc, len) "
+					"SELECT hash, cp.cp_append('%s.pages', data), length(data) FROM prolly_pending "
+					"ON CONFLICT (hash) DO NOTHING RETURNING hash, loc");
+	res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+	free(sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, "pgstore: append: %s\n", PQerrorMessage(ps->c));
+		abort();
+	}
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		PHash		h;
+		PEntry	   *e;
+
+		memcpy(h.b, PQgetvalue(res, i, 0), PHASH_LEN);
+		e = find(ps, &h);
+		if (e)
+			e->loc = get_be64(PQgetvalue(res, i, 1));
+	}
+	PQclear(res);
+}
+
+/* A text[] of bytea literals for n hashes. */
+static void
+hash_array(const PHash *hs, size_t n, Buf *out)
+{
+	char		lit[PHASH_HEX_LEN + 3];
+
+	out->len = 0;
+	buf_append(out, "{", 1);
+	for (size_t i = 0; i < n; i++)
+	{
+		hash_literal(&hs[i], lit);
+		if (i)
+			buf_append(out, ",", 1);
+		buf_append(out, "\"\\", 2);		/* the backslash, escaped for the array */
+		buf_append(out, lit, strlen(lit));
+		buf_append(out, "\"", 1);
+	}
+	buf_append(out, "}", 2);
+}
+
+int
+pgstore_flush(ChunkStore *cs)
+{
+	PgStore    *ps = (PgStore *) cs;
+	Buf			arr = {0};
+	char	   *sql;
+
+	if (ps->readonly)
+		return -1;
+	if (ps->npending == 0 && ps->ndel == 0 && !ps->roots_dirty && !ps->state_dirty)
+		return 0;
+	must(ps, "BEGIN");
+	if (ps->npending > 0)
+		send_new(ps);
+	if (ps->ndel > 0)
+	{
+		const char *vals[1];
+		PGresult   *res;
+
+		hash_array(ps->dels, ps->ndel, &arr);
+		vals[0] = (const char *) arr.data;
+		sql = in_schema(ps, "DELETE FROM %s.idx WHERE hash = ANY ($1::bytea[])");
+		res = PQexecParams(ps->c, sql, 1, NULL, vals, NULL, NULL, 0);
+		free(sql);
+		if (!ok(res, NULL, 0, ps->c))
+		{
+			fprintf(stderr, "pgstore: delete: %s\n", PQerrorMessage(ps->c));
+			abort();
+		}
+		PQclear(res);
+		ps->ndel = 0;
+	}
+	if (ps->roots_dirty)
+	{
+		Buf			counts = {0};
+		PHash	   *hs = NULL;
+		size_t		n = 0,
+					cap = 0;
+		const char *vals[2];
+		PGresult   *res;
+		char		num[24];
+
+		must_in(ps, "DELETE FROM %s.roots");
+		buf_append(&counts, "{", 1);
+		for (size_t i = 0; i < ps->roots.cap; i++)
+			if (ps->roots.used[i])
+			{
+				px_grow((void **) &hs, &cap, n + 1, sizeof(PHash));
+				hs[n] = ps->roots.keys[i];
+				snprintf(num, sizeof(num), "%s%llu", n ? "," : "",
+						 (unsigned long long) ps->roots.vals[i]);
+				buf_append(&counts, num, strlen(num));
+				n++;
+			}
+		buf_append(&counts, "}", 2);
+		if (n > 0)
+		{
+			hash_array(hs, n, &arr);
+			vals[0] = (const char *) arr.data;
+			vals[1] = (const char *) counts.data;
+			sql = in_schema(ps, "INSERT INTO %s.roots SELECT * FROM unnest($1::bytea[], $2::int8[])");
+			res = PQexecParams(ps->c, sql, 2, NULL, vals, NULL, NULL, 0);
+			free(sql);
+			if (!ok(res, NULL, 0, ps->c))
+			{
+				fprintf(stderr, "pgstore: roots: %s\n", PQerrorMessage(ps->c));
+				abort();
+			}
+			PQclear(res);
+		}
+		free(hs);
+		free(counts.data);
+		ps->roots_dirty = false;
+	}
+	if (ps->state_dirty)
+	{
+		char		lit[PHASH_HEX_LEN + 3];
+		const char *vals[1] = {lit};
+		PGresult   *res;
+
+		hash_literal(&ps->state, lit);
+		sql = in_schema(ps, "INSERT INTO %s.state VALUES (1, $1::bytea) "
+						"ON CONFLICT (k) DO UPDATE SET root = EXCLUDED.root");
+		res = PQexecParams(ps->c, sql, 1, NULL, vals, NULL, NULL, 0);
+		free(sql);
+		if (!ok(res, NULL, 0, ps->c))
+			abort();
+		PQclear(res);
+		ps->state_dirty = false;
+	}
+	must(ps, "COMMIT");
+
+	/* what is on the server is read from there from now on */
+	for (size_t i = 0; i < ps->cap; i++)
+	{
+		PEntry	   *e = &ps->tab[i];
+
+		if (e->state != SLOT_USED)
+			continue;
+		e->pending = false;
+		free(e->data);
+		e->data = NULL;
+	}
+	ps->npending = 0;
+	free(arr.data);
+	return 0;
+}
+
+void
+pgstore_set_state(ChunkStore *cs, const PHash *state)
+{
+	PgStore    *ps = (PgStore *) cs;
+
+	ps->state = *state;
+	ps->has_state = true;
+	ps->state_dirty = true;
+}
+
+bool
+pgstore_get_state(ChunkStore *cs, PHash *state)
+{
+	PgStore    *ps = (PgStore *) cs;
+
+	if (ps->has_state)
+		*state = ps->state;
+	return ps->has_state;
+}
+
+uint64_t
+pgstore_disk_bytes(ChunkStore *cs)
+{
+	PgStore    *ps = (PgStore *) cs;
+	char	   *sql = in_schema(ps, "SELECT pg_relation_size('%s.pages') + pg_total_relation_size('%s.idx')");
+	PGresult   *res = PQexec(ps->c, sql);
+	uint64_t	n = 0;
+
+	free(sql);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK)
+		n = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+	PQclear(res);
+	return n;
+}
+
+uint64_t
+pgstore_server_reads(ChunkStore *cs)
+{
+	return ((PgStore *) cs)->server_reads;
+}
+
+static void
+pg_destroy(ChunkStore *cs)
+{
+	PgStore    *ps = (PgStore *) cs;
+
+	if (PQstatus(ps->c) == CONNECTION_OK && !ps->failed)
+	{
+		if (ps->ephemeral)
+			must_in(ps, "DROP SCHEMA %s CASCADE");
+		else if (!ps->readonly)
+			pgstore_flush(cs);
+	}
+	for (size_t i = 0; i < ps->cap; i++)
+		if (ps->tab[i].state == SLOT_USED)
+			free(ps->tab[i].data);
+	free(ps->tab);
+	free(ps->dels);
+	phmap_free(&ps->roots);
+	PQfinish(ps->c);
+	free(ps->schema);
+	free(ps);
+}
+
+/* ------------------------------------------------------------- opening */
+
+typedef struct Mark
+{
+	PgStore    *ps;
+	PHashMap   *seen;
+	PHash	   *stack;
+	size_t		n,
+				cap;
+	bool		ok;
+} Mark;
+
+static void
+mark_fn(void *arg, const PHash *h, bool strong)
+{
+	Mark	   *m = arg;
+	PEntry	   *e = find(m->ps, h);
+	bool		created;
+
+	if (!strong)
+		return;
+	if (e == NULL)
+	{
+		m->ok = false;
+		return;
+	}
+	e->meta.refs++;
+	phmap_ref(m->seen, h, &created);
+	if (created)
+	{
+		px_grow((void **) &m->stack, &m->cap, m->n + 1, sizeof(PHash));
+		m->stack[m->n++] = *h;
+	}
+}
+
+/*
+ * The chunks the roots reach are live, with reference counts equal to the
+ * strong edges among them; the rest are let go at the next flush.
+ */
+static bool
+rebuild_holds(PgStore *ps, char *err, size_t errlen)
+{
+	PHashMap	seen;
+	Mark		m = {ps, &seen, NULL, 0, 0, true};
+	bool		created;
+
+	phmap_init(&seen);
+	for (size_t i = 0; i < ps->roots.cap; i++)
+	{
+		PEntry	   *e;
+
+		if (!ps->roots.used[i])
+			continue;
+		e = find(ps, &ps->roots.keys[i]);
+		if (e == NULL)
+		{
+			snprintf(err, errlen, "a root is not in the store");
+			phmap_free(&seen);
+			return false;
+		}
+		e->meta.roots = ps->roots.vals[i];
+		phmap_ref(&seen, &e->h, &created);
+		if (created)
+		{
+			px_grow((void **) &m.stack, &m.cap, m.n + 1, sizeof(PHash));
+			m.stack[m.n++] = e->h;
+		}
+	}
+	while (m.n > 0 && m.ok)
+	{
+		PHash		h = m.stack[--m.n];
+		size_t		len = 0;
+		const uint8_t *d = pg_get(&ps->base, &h, &len);
+
+		if (!chunk_refs(d, len, mark_fn, &m))
+			m.ok = false;
+	}
+	free(m.stack);
+	if (!m.ok)
+	{
+		snprintf(err, errlen, "a chunk the roots reach is missing or does not parse");
+		phmap_free(&seen);
+		return false;
+	}
+	for (size_t i = 0; i < ps->cap; i++)
+	{
+		PEntry	   *e = &ps->tab[i];
+
+		if (e->state == SLOT_USED && !phmap_find(&seen, &e->h))
+			pg_del(&ps->base, &e->h);
+	}
+	phmap_free(&seen);
+	return true;
+}
+
+ChunkStore *
+pgstore_open(const char *conninfo, const char *schema, bool fresh, bool ephemeral, char *err,
+			 size_t errlen)
+{
+	PgStore    *ps = px_malloc(sizeof(PgStore));
+	char	   *sql;
+	PGresult   *res;
+
+	memset(ps, 0, sizeof(*ps));
+	ps->base.ops = &pg_ops;
+	ps->cap = 1024;
+	ps->tab = calloc(ps->cap, sizeof(PEntry));
+	ps->ephemeral = ephemeral;
+	phmap_init(&ps->roots);
+	ps->c = PQconnectdb(conninfo);
+	if (PQstatus(ps->c) != CONNECTION_OK)
+	{
+		snprintf(err, errlen, "%s", PQerrorMessage(ps->c));
+		PQfinish(ps->c);
+		free(ps->tab);
+		free(ps);
+		return NULL;
+	}
+	PQsetNoticeProcessor(ps->c, quiet, NULL);
+	res = PQexecParams(ps->c, "SELECT quote_ident($1)", 1, NULL, &schema, NULL, NULL, 0);
+	ps->schema = strdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	if (fresh)
+	{
+		must(ps, "CREATE EXTENSION IF NOT EXISTS prolly_chunkpages");
+		must_in(ps, "DROP SCHEMA IF EXISTS %s CASCADE");
+		must_in(ps, "CREATE SCHEMA %s");
+		must_in(ps, "CREATE TABLE %s.pages () USING prolly_chunks");
+		must_in(ps, "CREATE TABLE %s.idx (hash bytea PRIMARY KEY, loc int8 NOT NULL, len int4 NOT NULL)");
+		must_in(ps, "CREATE TABLE %s.roots (hash bytea PRIMARY KEY, n int8 NOT NULL)");
+		must_in(ps, "CREATE TABLE %s.state (k int PRIMARY KEY, root bytea NOT NULL)");
+	}
+	/* a standby is read only: there the store is only read */
+	res = PQexec(ps->c, "SELECT pg_is_in_recovery()");
+	ps->readonly = PQresultStatus(res) == PGRES_TUPLES_OK && PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	if (!ps->readonly)
+		must(ps, "CREATE TEMP TABLE IF NOT EXISTS prolly_pending (hash bytea, data bytea)");
+
+	/* every chunk the store holds, by place and length */
+	sql = in_schema(ps, "SELECT hash, loc, len FROM %s.idx");
+	res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+	free(sql);
+	if (!ok(res, err, errlen, ps->c))
+	{
+		PQclear(res);
+		ps->failed = true;
+		pg_destroy(&ps->base);
+		return NULL;
+	}
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		PHash		h;
+		PEntry	   *e;
+
+		memcpy(h.b, PQgetvalue(res, i, 0), PHASH_LEN);
+		e = insert(ps, &h);
+		e->loc = get_be64(PQgetvalue(res, i, 1));
+		e->len = get_be32(PQgetvalue(res, i, 2));
+		ps->bytes += e->len;
+	}
+	PQclear(res);
+
+	sql = in_schema(ps, "SELECT hash, n FROM %s.roots");
+	res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+	free(sql);
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		PHash		h;
+		bool		created;
+
+		memcpy(h.b, PQgetvalue(res, i, 0), PHASH_LEN);
+		*phmap_ref(&ps->roots, &h, &created) = (uint64_t) get_be64(PQgetvalue(res, i, 1));
+	}
+	PQclear(res);
+
+	sql = in_schema(ps, "SELECT root FROM %s.state WHERE k = 1");
+	res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+	free(sql);
+	if (PQntuples(res) == 1)
+	{
+		memcpy(ps->state.b, PQgetvalue(res, 0, 0), PHASH_LEN);
+		ps->has_state = true;
+	}
+	PQclear(res);
+
+	if (!rebuild_holds(ps, err, errlen))
+	{
+		ps->failed = true;
+		pg_destroy(&ps->base);
+		return NULL;
+	}
+	return &ps->base;
+}
