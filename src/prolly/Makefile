@@ -51,15 +51,15 @@ clean:
 
 # The window benchmark against a running server (see bench/winbench.c).
 PGINST ?= /home/dustin/cursor_src/pg-v2-build/inst
-bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
-	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< libprolly.a \
+bench/winbench: bench/winbench.c bench/pgstore.c bench/pgstore.h test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< bench/pgstore.c libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -pthread
 
 # Rebuilding a schema, every index included, from the store (see bench/rebuild.c).
 REBUILD_SRCS = bench/rebuild.c bench/ws_pg.c bench/ws_codec.c bench/ws_logical.c bench/ws_stream.c \
 	bench/ws_tags.c bench/ws_viol.c bench/ws_move.c bench/ws_diff.c bench/ws_merge.c bench/ws_history.c bench/pgoutput.c
-bench/rebuild: $(REBUILD_SRCS) bench/ws.h bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
-	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $(REBUILD_SRCS) libprolly.a \
+bench/rebuild: $(REBUILD_SRCS) bench/pgstore.c bench/pgstore.h bench/ws.h bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $(REBUILD_SRCS) bench/pgstore.c libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
 
 # Against the running server: every commit of the fixture must rebuild, and

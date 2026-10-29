@@ -31,7 +31,10 @@
 #include "ws.h"
 
 #include <getopt.h>
+#include <signal.h>
 #include <sys/wait.h>
+
+#include "pgstore.h"
 
 #define MAX_STEPS 64
 #define MAX_CHECKS 512
@@ -2269,6 +2272,99 @@ run_moves(char **names, int nsteps)
 	cs_destroy(cs);
 }
 
+/* ------------------------------------------------------- capture daemon */
+
+static volatile sig_atomic_t daemon_stop;
+
+static void
+daemon_term(int sig)
+{
+	daemon_stop = 1;
+}
+
+/*
+ * Version control running beside a workload: the stream decoder captures
+ * the source database's committed changes, and every interval a Dolt
+ * commit records them into a history store inside Postgres (pgstore), until
+ * SIGTERM.  One line per commit: the capture (decode to the barrier, and
+ * the definitions), the commit, and the flush to the store.
+ */
+static void
+run_capture_daemon(int secs)
+{
+	char		err[512];
+	const char *ci = getenv("PROLLY_PG");
+	ChunkStore *cs = pgstore_open(ci ? ci : "host=/tmp port=5499 user=postgres dbname=prolly_pgstore",
+								  "capture", true, false, err, sizeof(err));
+	VcRepo		r;
+	int			n = 0;
+
+	if (cs == NULL)
+		die("history store: %s", err);
+	signal(SIGTERM, daemon_term);
+	signal(SIGINT, daemon_term);
+	/* a fresh versioned schema, where unqualified tables go */
+	fresh_database(o.src_db);
+	ws_install(o.src_db, true);
+	{
+		PGconn	   *c = pg_open(o.src_db);
+		char		sql[300];
+
+		pg_cmd(c, "CREATE SCHEMA " SCHEMA);
+		snprintf(sql, sizeof(sql), "ALTER DATABASE %s SET search_path = " SCHEMA ", public", o.src_db);
+		pg_cmd(c, sql);
+		PQfinish(c);
+	}
+	vc_repo_init(&r, cs, &prolly_default_policy);
+	stream_setup(&r.ctx, o.src_db);
+	printf("# capture daemon on %s, a commit every %d s: ready\n", o.src_db, secs);
+	fflush(stdout);
+	while (!daemon_stop)
+	{
+		double		t0,
+					t1,
+					t2,
+					t3;
+		PHash		rv,
+					st;
+
+		for (int i = 0; i < secs * 10 && !daemon_stop; i++)
+			usleep(100000);
+		t0 = now_sec();
+		rv = stream_capture(&r.ctx, o.src_db);
+		t1 = now_sec();
+		vc_set_working(&r, &rv);
+		vc_commit(&r, "capture");
+		t2 = now_sec();
+		st = vc_repo_save(&r);
+		pgstore_set_state(cs, &st);
+		CHECK_OK(pgstore_flush(cs));
+		stream_ack();
+		t3 = now_sec();
+		printf("commit %d: capture %.0f ms, commit %.0f ms, flush %.0f ms, store %.1f MB\n", ++n,
+			   (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3, pgstore_disk_bytes(cs) / 1048576.0);
+		fflush(stdout);
+	}
+	/* what capture kept up with is exactly the database */
+	{
+		PHash		rv = stream_capture(&r.ctx, o.src_db),
+					whole = logical_capture(&r.ctx, o.src_db);
+
+		stream_ack();
+		if (phash_eq(&rv, &whole))
+			printf("# verified: the last capture equals the database read whole\n");
+		else
+		{
+			printf("# MISMATCH: the last capture differs from the database read whole\n");
+			explain_mismatch(&r.ctx, &whole, &rv, "capture daemon");
+		}
+	}
+	vc_repo_free(&r);
+	cs_destroy(cs);
+	drop_slot();
+	printf("# capture daemon stopped after %d commits\n", n);
+}
+
 /* ------------------------------------------------------ history and RLS */
 
 /* One answer, or the error's first line, from a query run as role. */
@@ -2491,7 +2587,7 @@ main(int argc, char **argv)
 		{"durable", 0, 0, 'U'}, {"store", 1, 0, 'T'}, {"crash", 1, 0, 'C'},
 		{"resume", 0, 0, 'R'}, {"quick", 0, 0, 'Q'}, {"crash-suite", 0, 0, 'Z'},
 		{"pgdata", 1, 0, 'P'}, {"backup", 1, 0, 'B'}, {"backup-suite", 0, 0, 'Y'},
-		{"history-rls", 0, 0, 'H'},
+		{"history-rls", 0, 0, 'H'}, {"capture-daemon", 1, 0, 'E'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -2501,6 +2597,7 @@ main(int argc, char **argv)
 				ch;
 	bool		whole;
 	char		mode = 0;
+	int			daemon_secs = 0;
 	bool		resume = false,
 				quick = false;
 
@@ -2531,6 +2628,7 @@ main(int argc, char **argv)
 			case 'U': mode = 'U'; break;
 			case 'Z': mode = 'Z'; break;
 			case 'H': mode = 'H'; break;
+			case 'E': mode = 'E'; daemon_secs = atoi(optarg); break;
 			case 'T': o.store = optarg; break;
 			case 'C': crash_at = optarg; break;
 			case 'R': resume = true; break;
@@ -2548,6 +2646,11 @@ main(int argc, char **argv)
 				return 2;
 		}
 	mkdir(o.work, 0700);
+	if (mode == 'E')
+	{
+		run_capture_daemon(daemon_secs > 0 ? daemon_secs : 5);
+		return 0;
+	}
 	if (mode == 'H')
 	{
 		run_history_rls();

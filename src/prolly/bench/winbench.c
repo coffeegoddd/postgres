@@ -39,6 +39,7 @@
 #include <libpq-fe.h>
 
 #include "../test/test_util.h"
+#include "pgstore.h"
 #include "../image.h"
 #include "../kfplan.h"
 
@@ -111,6 +112,7 @@ static uint32_t dboid;
 static Rel rels[MAX_RELS];
 static int nrels;
 static ChunkStore *cs;
+static bool store_pg;			/* --store-pg: the history store in Postgres */
 static ChunkStore *archive;		/* where severed history goes, with --outside */
 static VcRepo repo;
 static ImgFormat fmt;
@@ -1887,6 +1889,14 @@ life_commit(int seq, const char *branch)
 		CHECK(vc_segment_export(&repo, seg, &(VcSource) {"archive", archive}) == VC_OK);
 	else if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
+	/* with the history store in Postgres, the commit is durable once flushed */
+	if (store_pg)
+	{
+		PHash		st = vc_repo_save(&repo);
+
+		pgstore_set_state(cs, &st);
+		CHECK_OK(pgstore_flush(cs));
+	}
 	CHECK(ncommits < MAX_COMMITS);
 	commits[ncommits].hash = c;
 	snprintf(commits[ncommits].branch, sizeof(commits[ncommits].branch), "%s", branch);
@@ -2376,6 +2386,7 @@ main(int argc, char **argv)
 		{"verify", 1, 0, 'v'}, {"no-sql", 0, 0, 'S'}, {"reuse", 0, 0, 'R'},
 		{"seed", 1, 0, 's'}, {"conn", 1, 0, 'C'}, {"pgdata", 1, 0, 'D'},
 		{"store", 1, 0, 'F'}, {"no-final-verify", 0, 0, 'N'}, {"lifecycle", 0, 0, 'L'},
+		{"store-pg", 0, 0, 'G'},
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
 		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {0, 0, 0, 0}
@@ -2407,6 +2418,7 @@ main(int argc, char **argv)
 			case 'F': o.store = optarg; break;
 			case 'N': o.final_verify = false; break;
 			case 'L': o.lifecycle = true; break;
+			case 'G': store_pg = true; break;
 			case 'T': o.bg_ms = atoi(optarg); break;
 			case 'Y': o.bg_bytes = atoll(optarg); break;
 			case 'f': o.diffs = atoi(optarg); break;
@@ -2453,7 +2465,21 @@ main(int argc, char **argv)
 		CHECK(fmt.page_size == BLCK);
 	}
 
-	cs = filestore_create(o.store);
+	if (store_pg)
+	{
+		char		err[512];
+		const char *ci = getenv("PROLLY_PG");
+
+		cs = pgstore_open(ci ? ci : "host=/tmp port=5499 user=postgres dbname=prolly_pgstore",
+						  "winbench", true, false, err, sizeof(err));
+		if (cs == NULL)
+		{
+			fprintf(stderr, "winbench: %s\n", err);
+			return 1;
+		}
+	}
+	else
+		cs = filestore_create(o.store);
 	if (o.outside)
 	{
 		char		apath[512];
