@@ -1316,6 +1316,78 @@ the prolly tree):
 - **Keyframes cost storage:** about 40 MB of new image chunks a commit
   here, 1 GB live across a 20-commit window.
 
+## Keyframes across the freeze horizon
+
+**The hazard.**  A keyframe is pages, and a heap page names transactions:
+each tuple's xmin and xmax, or a multixact.  The server can resolve those
+only within its horizon:
+- per relation, `relfrozenxid` and `relminmxid`;
+- the commit log (`pg_xact`) and `pg_multixact`, truncated behind
+  `datfrozenxid`;
+- and xids compare modulo 2^32.
+
+Put back a raw page from behind the horizon, and every read of it fails.
+A second hazard: a page captured while another transaction is in flight
+names that transaction, and once it commits, a restore shows its rows,
+though they are not part of the commit.
+
+**The fix: frozen keyframes.**  `prolly_get_pages_frozen` (in
+`contrib/prolly_pages`) reads pages with every heap tuple resolved against
+the caller's snapshot, which is the commit's exported snapshot, imported.
+- **Visible tuples:** frozen, xmax cleared, ctid pointing at themselves.
+- **Each HOT chain** keeps at most its one visible member.  A root that is
+  not visible becomes a redirect to it, so index entries, which point at
+  roots, still find it.
+- **The rest:** a root with nothing visible becomes dead, where indexes
+  may still point; dropped heap-only tuples become unused.
+- **Index and visibility-map pages** are copied as they are.  B-tree pages
+  name no 32-bit xids, and the visibility map's bits stay true, since a
+  page all-visible before is all-frozen after.
+- **So a frozen image names no transaction.**  It is valid however far the
+  horizon moves, and it holds exactly the commit's rows, whatever was in
+  flight.
+
+**Tests** (`bench/xidbench`, a throwaway cluster of its own, about 5 s).
+Each case captures raw and frozen images of a table with:
+- several inserting transactions;
+- HOT and non-HOT updates;
+- deletes and TOAST.
+
+It then restores each and checks:
+- rows by checksum against the capture's snapshot;
+- `verify_heapam` with TOAST;
+- `bt_index_check` with heapallindexed;
+- counts through each index;
+- that a tuple without an updater points at itself;
+- VACUUM.
+
+| Case | Raw image | Frozen image |
+|---|---|---|
+| 3M xids later, every database frozen (template0 too), commit log cut | fails 5 of 6 checks: "could not access commit status of transaction", "xmin precedes oldest valid transaction ID" | passes all |
+| A transaction in flight at capture commits afterwards | shows its rows | exactly the commit's rows |
+| Two sessions hold share locks (1,847 multixacts on the pages) | n/a | no multixact or xmax left; passes all |
+| Inserts, updates, deletes and VACUUM after a frozen restore | n/a | passes all |
+
+Each part of the transform was broken in turn, and each break was caught:
+- xmin not frozen;
+- xmax kept;
+- the root not redirected;
+- invisible tuples kept;
+- dead roots kept;
+- ctid not reset;
+- no transform at all.
+
+**Cost:** freezing in the capture is cheaper than reading pages one SQL
+call at a time.  16k heap pages took 34 ms frozen in one call (about 2 us
+a page), against 83 ms through `get_raw_page`.
+
+**What follows for the engine:**
+- every keyframe is captured frozen, as of the commit's snapshot, and
+  never as raw pages;
+- the window can keep keyframes as long as it keeps commits;
+- like TRUNCATE, a restore is not MVCC-safe for snapshots older than it;
+  checkout holds an exclusive lock, and the spec says so.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

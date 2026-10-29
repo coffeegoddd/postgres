@@ -13,6 +13,12 @@
  * reads them from a file on the server, as a restore reading its own chunk
  * store would, and can log them XLR_MAX_BLOCK_ID to a record.
  *
+ * prolly_get_pages_frozen reads pages for a keyframe with every heap tuple
+ * resolved against the caller's snapshot: the visible ones frozen, the
+ * rest gone.  A raw page names transactions, which the server forgets as
+ * its freeze horizon moves; a frozen copy names none, so it can be put
+ * back however long after.
+ *
  * contrib/prolly_pages/prolly_pages.c
  *
  *-------------------------------------------------------------------------
@@ -22,6 +28,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
@@ -37,12 +45,14 @@
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(prolly_put_pages);
 PG_FUNCTION_INFO_V1(prolly_truncate);
 PG_FUNCTION_INFO_V1(prolly_put_pages_file);
+PG_FUNCTION_INFO_V1(prolly_get_pages_frozen);
 
 static Relation
 open_for_write(Oid relid)
@@ -220,6 +230,196 @@ prolly_put_pages_file(PG_FUNCTION_ARGS)
 	CacheInvalidateRelcache(rel);
 	relation_close(rel, NoLock);
 	PG_RETURN_INT32(nb);
+}
+
+/* A visible tuple, frozen: no transaction named, no update after it. */
+static void
+freeze_tuple(HeapTupleHeader t, BlockNumber blk, OffsetNumber off)
+{
+	t->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_COMBOCID | HEAP_MOVED);
+	t->t_infomask |= HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXminFrozen(t);
+	HeapTupleHeaderSetXmax(t, InvalidTransactionId);
+	t->t_infomask2 &= ~(HEAP_KEYS_UPDATED | HEAP_HOT_UPDATED);
+	ItemPointerSet(&t->t_ctid, blk, off);
+}
+
+/*
+ * Rewrites copy, a copy of the heap page in buf, as the snapshot sees it.
+ * Each HOT chain (a root, or a redirect to one, and the heap-only tuples
+ * its updates made) keeps at most its one visible member, frozen: a
+ * redirect from the root reaches it if it is not the root, so index
+ * entries, which point at roots, still find it.  A chain with nothing
+ * visible leaves its root dead, where indexes may still point; dropped
+ * heap-only tuples become unused, as no index points at them.  The live
+ * page is not changed, beyond hint bits a visibility check may set.
+ */
+static void
+freeze_heap_page(Relation rel, Buffer buf, Page copy, Snapshot snap)
+{
+	Page		live = BufferGetPage(buf);
+	BlockNumber blk = BufferGetBlockNumber(buf);
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(live);
+	bool		visible[MaxHeapTuplesPerPage + 1];
+	bool		inchain[MaxHeapTuplesPerPage + 1];
+	bool		freed = false;
+
+	memset(visible, 0, sizeof(visible));
+	memset(inchain, 0, sizeof(inchain));
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		lp = PageGetItemId(live, off);
+		HeapTupleData tup;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		tup.t_data = (HeapTupleHeader) PageGetItem(live, lp);
+		tup.t_len = ItemIdGetLength(lp);
+		tup.t_tableOid = RelationGetRelid(rel);
+		ItemPointerSet(&tup.t_self, blk, off);
+		visible[off] = HeapTupleSatisfiesVisibility(&tup, snap, buf);
+	}
+
+	for (OffsetNumber root = FirstOffsetNumber; root <= maxoff; root++)
+	{
+		ItemId		lp = PageGetItemId(live, root);
+		bool		redirect = ItemIdIsRedirected(lp);
+		OffsetNumber chain[MaxHeapTuplesPerPage];
+		int			n = 0;
+		OffsetNumber cur,
+					v = InvalidOffsetNumber;
+		TransactionId prior = InvalidTransactionId;
+
+		if (redirect)
+			cur = ItemIdGetRedirect(lp);
+		else if (ItemIdIsNormal(lp) &&
+				 !HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(live, lp)))
+			cur = root;
+		else
+			continue;
+
+		while (cur >= FirstOffsetNumber && cur <= maxoff && !inchain[cur])
+		{
+			ItemId		clp = PageGetItemId(live, cur);
+			HeapTupleHeader t;
+
+			if (!ItemIdIsNormal(clp))
+				break;
+			t = (HeapTupleHeader) PageGetItem(live, clp);
+			if (n > 0 && (!HeapTupleHeaderIsHeapOnly(t) ||
+						  !TransactionIdEquals(HeapTupleHeaderGetXmin(t), prior)))
+				break;
+			chain[n++] = cur;
+			inchain[cur] = true;
+			if (!HeapTupleHeaderIsHotUpdated(t) ||
+				ItemPointerGetBlockNumber(&t->t_ctid) != blk)
+				break;
+			prior = HeapTupleHeaderGetUpdateXid(t);
+			cur = ItemPointerGetOffsetNumber(&t->t_ctid);
+		}
+		for (int i = 0; i < n && v == InvalidOffsetNumber; i++)
+			if (visible[chain[i]])
+				v = chain[i];
+
+		for (int i = 0; i < n; i++)
+		{
+			ItemId		cp = PageGetItemId(copy, chain[i]);
+
+			if (chain[i] == v)
+				freeze_tuple((HeapTupleHeader) PageGetItem(copy, cp), blk, chain[i]);
+			else if (chain[i] == root)
+			{
+				if (v != InvalidOffsetNumber)
+					ItemIdSetRedirect(cp, v);
+				else
+					ItemIdSetDead(cp);
+			}
+			else
+			{
+				ItemIdSetUnused(cp);
+				freed = true;
+			}
+		}
+		if (redirect)
+		{
+			ItemId		cp = PageGetItemId(copy, root);
+
+			if (v != InvalidOffsetNumber)
+				ItemIdSetRedirect(cp, v);
+			else
+				ItemIdSetDead(cp);
+		}
+	}
+
+	/* heap-only tuples no chain reached: nothing can find them */
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		if (!inchain[off] && ItemIdIsNormal(PageGetItemId(live, off)))
+		{
+			ItemIdSetUnused(PageGetItemId(copy, off));
+			freed = true;
+		}
+	((PageHeader) copy)->pd_prune_xid = InvalidTransactionId;
+	if (freed)
+		PageSetHasFreeLinePointers(copy);
+}
+
+/*
+ * prolly_get_pages_frozen(rel regclass, fork text, blocks int4[])
+ *
+ * The pages at the blocks, back to back, as the caller's snapshot sees
+ * them: for a table's (or TOAST table's) main fork, every tuple frozen or
+ * gone (see freeze_heap_page); anything else as it is.  Run it in a
+ * REPEATABLE READ transaction with the commit's exported snapshot to read
+ * a keyframe as of that commit.
+ */
+Datum
+prolly_get_pages_frozen(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	char	   *forkname = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ArrayType  *barr = PG_GETARG_ARRAYTYPE_P(2);
+	ForkNumber	fork = forkname_to_number(forkname);
+	Relation	rel;
+	Datum	   *blocks;
+	bool	   *bnulls;
+	int			nb;
+	bytea	   *out;
+	bool		heap;
+	Snapshot	snap = GetActiveSnapshot();
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to read raw pages")));
+	rel = relation_open(relid, AccessShareLock);
+	heap = fork == MAIN_FORKNUM &&
+		(rel->rd_rel->relkind == RELKIND_RELATION ||
+		 rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
+		 rel->rd_rel->relkind == RELKIND_MATVIEW);
+	deconstruct_array_builtin(barr, INT4OID, &blocks, &bnulls, &nb);
+	out = palloc(VARHDRSZ + (Size) nb * BLCKSZ);
+	SET_VARSIZE(out, VARHDRSZ + (Size) nb * BLCKSZ);
+
+	for (int i = 0; i < nb; i++)
+	{
+		Page		copy = (Page) (VARDATA(out) + (Size) i * BLCKSZ);
+		Buffer		buf;
+
+		if (bnulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("null block number")));
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBufferExtended(rel, fork, (BlockNumber) DatumGetInt32(blocks[i]),
+								 RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(copy, BufferGetPage(buf), BLCKSZ);
+		if (heap && !PageIsNew(copy))
+			freeze_heap_page(rel, buf, copy, snap);
+		UnlockReleaseBuffer(buf);
+	}
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_BYTEA_P(out);
 }
 
 /*

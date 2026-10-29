@@ -91,3 +91,8 @@ bench/deepbench: bench/deepbench.c test/test_util.h libprolly.a $(HDRS)
 bench/kfbench: bench/kfbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -o $@ $< libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
+
+# Keyframes across the freeze horizon, in a throwaway cluster of its own (see bench/xidbench.c).
+bench/xidbench: bench/xidbench.c test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $< libprolly.a \
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
