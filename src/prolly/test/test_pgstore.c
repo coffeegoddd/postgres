@@ -132,6 +132,7 @@ test_reads_after_flush(void)
 				sd;
 	uint64_t	before;
 
+	pgstore_set_cache(cs, 0);	/* nothing kept: every read after a flush is the server's */
 	setup(&r, cs);
 	l = build_linear(&r);
 	sb = snap(&r.ctx, &l.b);

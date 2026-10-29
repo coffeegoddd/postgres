@@ -458,6 +458,42 @@ rest of the database.  Within Postgres, our own pages beat table rows on
 disk, reads and discard.  `dirstore` and table rows stay behind the
 `ChunkStore` interface as measured alternatives.
 
+### Trying it: pgstore
+
+`bench/pgstore.c` puts the engine on the page store over libpq, behind the
+`ChunkStore` interface: chunk metadata in memory (as `dirstore` keeps it),
+a schema per store (the page log, the hash index, the roots, the repo
+state), a flush sending what changed in one transaction, reads checked
+against their hashes, recently used chunks cached across flushes up to a
+budget (256 MB).
+
+**Tests** (`make pgstore-check`, `make pgstore-standby-check`): commits,
+branches and state across reopening; reads from the server after a flush;
+the same data chunks as an in-memory store; discarded history leaving the
+server; clone, push, fetch and pull between it, memory and another
+`pgstore`; fresh and ephemeral stores; and on a hot standby, the store
+opens read only with the primary's heads, log and rows and follows as the
+primary commits, with nothing of ours shipping it.  Deletes never sent and
+chunk places recorded wrong are each caught.
+
+**At scale** (`deepbench --store pg --due --max-commits 20000`, against
+`dirstore`):
+
+| | dirstore | pgstore, no cache | pgstore, 256 MB cache |
+|---|---:|---:|---:|
+| commit, 1k-10k | 181 us | 309 us | 192 us |
+| commit, 10k-100k (with severing) | 192 us | 667 us | 455 us |
+| each sever, 10k-100k | 30 ms | 959 ms | 571 ms |
+| log of 100 | 0.16 ms | 1.9 ms | 0.03 ms |
+| diff 1,000 back | 2.6 ms | 41 ms | 3.3 ms |
+| memory | 3.6 GB | 133 MB | 406 MB |
+
+What is left of the gap is reads that miss the cache: each is a round
+trip over libpq (20-40 us), where `dirstore` reads mapped memory.  Severing
+walks the whole window, so a window larger than the cache pays it.  Inside
+the server, the store would be read through the buffer manager (about 5
+us a chunk through SQL in experiment F, less from C).
+
 ### Patches so far
 
 | Patch | Feature | Status |

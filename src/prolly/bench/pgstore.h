@@ -8,7 +8,8 @@
  * durable roots and the repo state.  Like dirstore, chunk metadata lives in
  * memory and reference counts are rebuilt from the roots on open; a flush
  * sends what changed (new chunks, chunks let go, roots, state) in one
- * transaction, and invalidates bytes previously returned by get.
+ * transaction, and invalidates bytes previously returned by get.  Chunks
+ * stay cached across flushes up to a budget, least recently used let go.
  */
 #ifndef PGSTORE_H
 #define PGSTORE_H
@@ -27,6 +28,11 @@ extern void pgstore_set_state(ChunkStore *cs, const PHash *state);
 extern bool pgstore_get_state(ChunkStore *cs, PHash *state);
 /* Bytes the store's relations take on disk. */
 extern uint64_t pgstore_disk_bytes(ChunkStore *cs);
+/*
+ * Bytes of flushed chunks kept cached across a flush (default 256 MB); 0
+ * reads everything flushed from the server.
+ */
+extern void pgstore_set_cache(ChunkStore *cs, uint64_t bytes);
 /* Reads served by the server since open (not from the store's cache). */
 extern uint64_t pgstore_server_reads(ChunkStore *cs);
 

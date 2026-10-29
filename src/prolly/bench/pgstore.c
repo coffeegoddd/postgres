@@ -13,6 +13,10 @@
  * temporary table, then appended to the log and indexed), chunks let go
  * removed from the index, the roots and state written whole.  The log's
  * space for chunks let go comes back by compaction (cp.compact), not here.
+ *
+ * Chunks read or written stay cached across a flush up to a byte budget,
+ * the least recently used let go first, and only at a flush (which is when
+ * bytes returned by get may become invalid, as with dirstore).
  */
 #include <libpq-fe.h>
 #include <stdio.h>
@@ -31,6 +35,7 @@ typedef struct PEntry
 	uint8_t    *data;			/* cached bytes, or NULL: on the server */
 	size_t		len;
 	int64_t		loc;			/* place in the log; -1 until flushed */
+	uint64_t	used;			/* when last read or written (the store's tick) */
 	ChunkMeta	meta;
 	uint8_t		state;
 	bool		pending;		/* not yet on the server */
@@ -59,6 +64,8 @@ typedef struct PgStore
 	bool		has_state,
 				state_dirty;
 	uint64_t	server_reads;
+	uint64_t	tick;
+	uint64_t	cache_budget;	/* bytes of flushed chunks kept across a flush */
 } PgStore;
 
 /* ------------------------------------------------------------- the table */
@@ -243,6 +250,7 @@ pg_get(ChunkStore *cs, const PHash *h, size_t *len)
 
 	if (e == NULL)
 		return NULL;
+	e->used = ++ps->tick;
 	if (e->data == NULL)
 	{
 		char	   *sql = in_schema(ps, "SELECT cp.cp_read('%s.pages', $1::int8, $2::int4)");
@@ -291,6 +299,7 @@ pg_put(ChunkStore *cs, const PHash *h, const uint8_t *data, size_t len)
 	e = insert(ps, h);
 	e->data = px_memdup(data, len);
 	e->len = len;
+	e->used = ++ps->tick;
 	e->pending = true;
 	ps->npending++;
 	ps->bytes += len;
@@ -458,6 +467,15 @@ send_new(PgStore *ps)
 	PQclear(res);
 }
 
+static int
+by_use(const void *a, const void *b)
+{
+	uint64_t	x = (*(PEntry *const *) a)->used,
+				y = (*(PEntry *const *) b)->used;
+
+	return (x > y) - (x < y);
+}
+
 /* A text[] of bytea literals for n hashes. */
 static void
 hash_array(const PHash *hs, size_t n, Buf *out)
@@ -570,16 +588,38 @@ pgstore_flush(ChunkStore *cs)
 	}
 	must(ps, "COMMIT");
 
-	/* what is on the server is read from there from now on */
-	for (size_t i = 0; i < ps->cap; i++)
+	/* on the server now; the cache keeps the most recently used */
 	{
-		PEntry	   *e = &ps->tab[i];
+		PEntry	  **cached = NULL;
+		size_t		n = 0,
+					cap = 0;
+		uint64_t	total = 0;
 
-		if (e->state != SLOT_USED)
-			continue;
-		e->pending = false;
-		free(e->data);
-		e->data = NULL;
+		for (size_t i = 0; i < ps->cap; i++)
+		{
+			PEntry	   *e = &ps->tab[i];
+
+			if (e->state != SLOT_USED)
+				continue;
+			e->pending = false;
+			if (e->data)
+			{
+				px_grow((void **) &cached, &cap, n + 1, sizeof(PEntry *));
+				cached[n++] = e;
+				total += e->len;
+			}
+		}
+		if (total > ps->cache_budget)
+		{
+			qsort(cached, n, sizeof(PEntry *), by_use);
+			for (size_t i = 0; i < n && total > ps->cache_budget; i++)
+			{
+				total -= cached[i]->len;
+				free(cached[i]->data);
+				cached[i]->data = NULL;
+			}
+		}
+		free(cached);
 	}
 	ps->npending = 0;
 	free(arr.data);
@@ -619,6 +659,12 @@ pgstore_disk_bytes(ChunkStore *cs)
 		n = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
 	PQclear(res);
 	return n;
+}
+
+void
+pgstore_set_cache(ChunkStore *cs, uint64_t bytes)
+{
+	((PgStore *) cs)->cache_budget = bytes;
 }
 
 uint64_t
@@ -758,6 +804,7 @@ pgstore_open(const char *conninfo, const char *schema, bool fresh, bool ephemera
 	ps->cap = 1024;
 	ps->tab = calloc(ps->cap, sizeof(PEntry));
 	ps->ephemeral = ephemeral;
+	ps->cache_budget = 256 << 20;
 	phmap_init(&ps->roots);
 	ps->c = PQconnectdb(conninfo);
 	if (PQstatus(ps->c) != CONNECTION_OK)
