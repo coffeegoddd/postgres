@@ -363,7 +363,9 @@ logical_capture(ProllyCtx *ctx, const char *db)
 		PHash		data;
 
 		layout_must_parse(layout, &L);
-		data = capture_rows(ctx, c, &L);
+		/* an unlogged table's definition is committed, its contents never */
+		data = PQgetvalue(res, i, 2)[0] == 'u' && !broken("unlogged") ? t_empty(ctx)
+			: capture_rows(ctx, c, &L);
 		rv = put_table(ctx, rv, PQgetvalue(res, i, 1), layout, strlen(layout), &data);
 		ws_layout_free(&L);
 	}

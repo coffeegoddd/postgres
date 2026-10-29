@@ -56,6 +56,7 @@
 #include "common/relpath.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/array.h"
@@ -92,6 +93,27 @@ open_for_write(Oid relid)
 }
 
 /*
+ * The live tuples on a page of rel's main fork, if rel is a table: a page
+ * restore writes them without the row changes that would tell the planner
+ * the table changed, so they are counted as inserted, and autoanalyze sees
+ * the table as it would after a move made of row changes.
+ */
+static int64
+restored_tuples(Relation rel, ForkNumber fork, Page page)
+{
+	int64		n = 0;
+	char		kind = rel->rd_rel->relkind;
+
+	if (fork != MAIN_FORKNUM || PageIsNew(page) ||
+		(kind != RELKIND_RELATION && kind != RELKIND_MATVIEW && kind != RELKIND_TOASTVALUE))
+		return 0;
+	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++)
+		if (ItemIdIsNormal(PageGetItemId(page, off)))
+			n++;
+	return n;
+}
+
+/*
  * prolly_put_pages(rel regclass, fork text, blocks int4[], pages bytea)
  *
  * pages holds one BLCKSZ page per block, back to back.  Writes each page at
@@ -110,6 +132,7 @@ prolly_put_pages(PG_FUNCTION_ARGS)
 	Datum	   *blocks;
 	bool	   *bnulls;
 	int			nb;
+	int64		tuples = 0;
 
 	deconstruct_array_builtin(barr, INT4OID, &blocks, &bnulls, &nb);
 	if (VARSIZE_ANY_EXHDR(pages) != (size_t) nb * BLCKSZ)
@@ -145,8 +168,11 @@ prolly_put_pages(PG_FUNCTION_ARGS)
 		if (RelationNeedsWAL(rel))
 			log_newpage_buffer(buf, fork == MAIN_FORKNUM);
 		END_CRIT_SECTION();
+		tuples += restored_tuples(rel, fork, BufferGetPage(buf));
 		UnlockReleaseBuffer(buf);
 	}
+	if (tuples > 0)
+		pgstat_count_heap_insert(rel, tuples);
 
 	/* index access methods cache their metapages in the relcache */
 	CacheInvalidateRelcache(rel);
@@ -191,6 +217,7 @@ prolly_put_pages_file(PG_FUNCTION_ARGS)
 	int			nb,
 				fd;
 	char	   *pages = palloc((size_t) XLR_MAX_BLOCK_ID * BLCKSZ);
+	int64		tuples = 0;
 
 	deconstruct_array_builtin(barr, INT4OID, &blocks, &bnulls, &nb);
 	for (int i = 0; i < nb; i++)
@@ -241,10 +268,15 @@ prolly_put_pages_file(PG_FUNCTION_ARGS)
 		}
 		END_CRIT_SECTION();
 		for (int i = 0; i < m; i++)
+		{
+			tuples += restored_tuples(rel, fork, BufferGetPage(bufs[i]));
 			UnlockReleaseBuffer(bufs[i]);
+		}
 	}
 	close(fd);
 	pfree(pages);
+	if (tuples > 0)
+		pgstat_count_heap_insert(rel, tuples);
 
 	CacheInvalidateRelcache(rel);
 	relation_close(rel, NoLock);

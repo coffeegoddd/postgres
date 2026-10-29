@@ -40,15 +40,34 @@ CREATE INDEX t_v ON app.t (v);
 CREATE VIEW app.tv AS SELECT id, v FROM app.t WHERE v > 10;
 CREATE FUNCTION app.f(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
 INSERT INTO app.t (v, p) SELECT g, 1 FROM generate_series(1, 100) g;
+CREATE UNLOGGED TABLE app.u (k int PRIMARY KEY, v text);
+INSERT INTO app.u SELECT g, 'u' || g FROM generate_series(1, 50) g;
+ANALYZE app.t;
+SELECT lo_from_bytea(424242, 'a large object');
 SQL
 
 echo "== branch 2: the versioned schema dumped from branch 1, restored on branch 2"
-PGOPTIONS="-c catalog_branch=1" "$INST/pg_dump" -h /tmp -p $PORT -U postgres -n app spike_c > /tmp/claude-1000/spike_c_app.sql
+# a branch is made from the canonical form: definitions, rows and statistics,
+# without unlogged tables' contents (they are never history)
+PGOPTIONS="-c catalog_branch=1" "$INST/pg_dump" -h /tmp -p $PORT -U postgres -n app --statistics \
+	--no-unlogged-table-data spike_c > /tmp/claude-1000/spike_c_app.sql
 { cat /tmp/claude-1000/spike_c_app.sql
   echo "SET allow_system_table_mods = on;"
   echo "UPDATE pg_namespace SET nspbranch = 2 WHERE oid = 'app'::regnamespace;"
 } | on 2 >/dev/null
 expect "the restore went in" "$(on 2 -c "SELECT count(*) FROM app.t")" 100
+
+echo "== A.4 unlogged tables and large objects on branches"
+expect "branch 2 has the unlogged table's definition, and no rows" "$(on 2 -c "SELECT count(*) FROM app.u")" 0
+expect "branch 1 keeps its own rows" "$(on 1 -c "SELECT count(*) FROM app.u")" 50
+expect "a large object is shared: branch 2 reads branch 1's" "$(on 2 -c "SELECT convert_from(lo_get(424242), 'UTF8')")" "a large object"
+expect "and branch 1 reads one made on branch 2" "$(on 2 -c "SELECT lo_from_bytea(424243, 'from 2')" >/dev/null; on 1 -c "SELECT convert_from(lo_get(424243), 'UTF8')")" "from 2"
+
+echo "== A.7 statistics come with a new branch"
+stats() { on "$1" -c "SELECT string_agg(attname || ':' || n_distinct || ':' || coalesce(array_length(histogram_bounds, 1), 0), ',' ORDER BY attname) FROM pg_stats WHERE schemaname = 'app' AND tablename = 't'"; }
+expect "branch 2's column statistics are branch 1's, without an ANALYZE" "$(stats 2)" "$(stats 1)"
+expect "and they are there" "$([ -n "$(stats 1)" ] && echo yes)" yes
+expect "its row estimate too" "$(on 2 -c "SELECT reltuples FROM pg_class WHERE oid = 'app.t'::regclass")" "$(on 1 -c "SELECT reltuples FROM pg_class WHERE oid = 'app.t'::regclass")"
 
 echo "== C1. each branch sees its own definitions and rows"
 on 2 -c "ALTER TABLE app.t ADD COLUMN extra int DEFAULT 9; INSERT INTO app.t (v, p) SELECT g, 1 FROM generate_series(1, 50) g; ALTER TYPE app.mood ADD VALUE 'glad'" >/dev/null
@@ -69,8 +88,8 @@ echo "== C2. DDL on both branches at once"
 ( on 1 -c "BEGIN; CREATE INDEX t_m1 ON app.t (m); SELECT pg_sleep(1); COMMIT;" >/dev/null ) &
 ( on 2 -c "BEGIN; CREATE INDEX t_m2 ON app.t (m, extra); SELECT pg_sleep(1); COMMIT;" >/dev/null ) &
 wait
-expect "1's indexes" "$(on 1 -c "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'app'")" "t_m1,t_pkey,t_v"
-expect "2's indexes" "$(on 2 -c "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'app'")" "t_m2,t_pkey,t_v"
+expect "1's indexes" "$(on 1 -c "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'app'")" "t_m1,t_pkey,t_v,u_pkey"
+expect "2's indexes" "$(on 2 -c "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'app'")" "t_m2,t_pkey,t_v,u_pkey"
 expect "the same name made on both branches (CREATE TABLE app.only)" "$(on 1 -c "CREATE TABLE app.only (x int)" && on 2 -c "CREATE TABLE app.only (y int)" && echo made)" made
 
 echo "== C3. the shared schema is shared"
@@ -113,6 +132,29 @@ echo "== C9. a role owning objects on one branch"
 on 2 -c "ALTER TABLE app.only OWNER TO owner2" >/dev/null
 echo "  DROP ROLE from branch 1: $(on 1 -c "DROP ROLE owner2" | head -3 | tr '\n' ' ')"
 echo "  DROP ROLE from branch 0: $(on 0 -c "DROP ROLE owner2" | head -3 | tr '\n' ' ')"
+
+echo "== A.5 a publication belongs to one branch"
+"$INST/psql" -h /tmp -p $PORT -U postgres -d postgres -X -q -c "DROP DATABASE IF EXISTS sub_c" -c "CREATE DATABASE sub_c" >/dev/null
+"$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -q -c "CREATE SCHEMA app" \
+	-c "CREATE TABLE app.t (id int PRIMARY KEY, v int, m text, p int, extra int)" >/dev/null
+on 2 -c "CREATE PUBLICATION pub2 FOR TABLE app.t" -c "SELECT 1 FROM pg_create_logical_replication_slot('sub2', 'pgoutput')" >/dev/null
+expect "the publication lists branch 2's table on branch 2" "$(on 2 -c "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'pub2'")" 1
+expect "and nothing on branch 1" "$(on 1 -c "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'pub2'")" 0
+# the subscriber reads the publication's tables from the publisher: it must
+# connect on the publication's branch, or it sees none of them
+"$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -q -c "CREATE SUBSCRIPTION s0 CONNECTION 'host=/tmp port=$PORT user=postgres dbname=spike_c' PUBLICATION pub2 WITH (create_slot = false, slot_name = 'none', copy_data = false, enabled = false)" >/dev/null 2>&1
+expect "a subscription on no branch covers no tables" "$("$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -qAt -c "SELECT count(*) FROM pg_subscription_rel r JOIN pg_subscription s ON s.oid = r.srsubid WHERE s.subname = 's0'")" 0
+"$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -q -c "ALTER SUBSCRIPTION s0 SET (slot_name = NONE)" -c "DROP SUBSCRIPTION s0" >/dev/null 2>&1
+"$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -q -c "CREATE SUBSCRIPTION s2 CONNECTION 'host=/tmp port=$PORT user=postgres dbname=spike_c options=''-c catalog_branch=2''' PUBLICATION pub2 WITH (create_slot = false, slot_name = 'sub2', copy_data = false)" >/dev/null 2>&1
+expect "one on branch 2 covers its table" "$("$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -qAt -c "SELECT count(*) FROM pg_subscription_rel")" 1
+on 1 -c "INSERT INTO app.t (v, p) VALUES (7001, 1)" >/dev/null
+on 2 -c "INSERT INTO app.t (v, p) VALUES (7002, 1)" >/dev/null
+for i in $(seq 1 100); do [ "$("$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -qAt -c "SELECT count(*) FROM app.t")" != 0 ] && break; sleep 0.1; done
+sleep 0.5
+expect "the subscriber has branch 2's row, not branch 1's" "$("$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -qAt -c "SELECT string_agg(v::text, ',' ORDER BY v) FROM app.t")" 7002
+"$INST/psql" -h /tmp -p $PORT -U postgres -d sub_c -X -q -c "DROP SUBSCRIPTION s2" >/dev/null 2>&1
+on 1 -c "DELETE FROM app.t WHERE v = 7001" >/dev/null
+on 2 -c "DROP PUBLICATION pub2" >/dev/null
 
 echo "== C11. autovacuum visits every branch's tables"
 "$INST/psql" -h /tmp -p $PORT -U postgres -d postgres -X -q -c "ALTER SYSTEM SET autovacuum_naptime = 1" -c "ALTER SYSTEM SET autovacuum_vacuum_threshold = 10" -c "ALTER SYSTEM SET autovacuum_vacuum_scale_factor = 0" -c "SELECT pg_reload_conf()" >/dev/null

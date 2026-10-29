@@ -1631,6 +1631,62 @@ expression and partial indexes must call theirs to build entries; user
 types' input functions run.  The rows come from a valid commit, so the
 checks could be skipped; the indexes cannot be, except by page restore.
 
+## Unlogged tables, large objects, replication, history security, statistics
+
+The remaining Postgres features against version control, decided
+(2026-10-29) and tested.
+
+**Unlogged and temporary tables, large objects.**
+- An unlogged table in a versioned schema is versioned by definition, never
+  by contents: Postgres empties it after a crash, and history must not hold
+  what a crash erases.  Capture (logical and stream) commits its definition
+  with no rows; a move empties it, as a crash would; a new branch, made by
+  `pg_dump --no-unlogged-table-data`, gets it empty.
+- Temporary tables are a session's and never versioned; they work on a
+  branch, even under a versioned table's name.
+- Large objects stay shared: `pg_largeobject` is addressed by object id,
+  not by schema.  A branch reads another's.  Versioned binary data belongs
+  in `bytea` columns.
+- Tests: `check_unlogged` on every commit (definition present, no rows) and
+  every rebuilt or moved database (empty); the `unlogged` break (rows
+  committed) is caught; experiment C's branch and large object checks.
+
+**Logical replication downstream.**
+- Anything that changes a branch's contents reaches the replication stream
+  as row changes: every move of every fixture is decoded, and the stream
+  carries exactly the rows the move wrote (200 for 200, 266 for 266).
+  Moves never swap files, so a subscriber follows a branch.
+- A publication belongs to the branch it was made on (its tables are that
+  branch's relations).  A subscription reads the publication's tables from
+  the publisher, so it must connect on that branch (`options=-c
+  catalog_branch=N`); connected on no branch, it covers no tables.
+  Tested end to end: a subscriber database receives branch 2's row and not
+  branch 1's.
+
+**Row security through history.**
+- History is read under today's security: the reading branch's current
+  row security policies and current SELECT grants (table and column), not
+  those the commit was made under, which may have been looser.
+- `ws_history_table` reads a table as of a commit into a scratch table with
+  the commit's columns and rows and the current table's policies and
+  grants; queries run as the reader.  If a current policy cannot apply to
+  the commit's columns, the read is refused and nothing is left behind.
+- `rebuild --history-rls`: a commit made under a policy that showed every
+  row, read as alice, shows only her rows; the secret column is denied by
+  today's column grants; a diff shows alice her own change and bob his;
+  a commit before the column today's policy reads is refused.  The
+  `oldpolicies` break fails every one of these.
+
+**Statistics after moves.**
+- Statistics are a branch's own and never committed.  A new branch copies
+  its parent's (`pg_dump --statistics`): column statistics and row
+  estimates match without an ANALYZE.
+- A move made of row changes raises the tables' change counters, so
+  autoanalyze takes them up: checked after every move.
+- A page restore writes rows without row changes, so it counts the live
+  tuples it wrote as inserted (`prolly_put_pages`): restoring 5,000 tuples
+  counts 5,000 changes (`bench/stats_test.sh`; without the counting, 0).
+
 ## History mode REWRITE: a window and nothing else
 
 **What it is for.**  Some users want history only for a window: no

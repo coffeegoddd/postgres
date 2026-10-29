@@ -344,6 +344,44 @@ amcheck(PGconn *c, const char *label)
 	printf("  amcheck: %d heaps, %d btree, %d gin\n", heaps, btrees, gins);
 }
 
+/*
+ * A commit holds an unlogged table's definition and none of its rows,
+ * whatever the source holds: they are not durable, so not history.
+ */
+static void
+check_unlogged(ProllyCtx *ctx, const PHash *rv, const char *db, const char *label)
+{
+	PGconn	   *c = pg_open(db);
+	PGresult   *res = pg_exec(c, "SELECT c.relname "
+							  "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+							  "WHERE n.nspname = '" SCHEMA "' AND c.relkind = 'r' "
+							  "AND c.relpersistence = 'u'");
+
+	for (int i = 0; i < PQntuples(res); i++)
+	{
+		const char *name = PQgetvalue(res, i, 0);
+		VcTable		vt;
+		uint64_t	n = 0;
+		char		msg[300];
+
+		if (!vc_table_get(ctx, rv, name, &vt))
+		{
+			snprintf(msg, sizeof(msg), "unlogged table %s's definition is not in the commit", name);
+			fail(label, msg);
+			continue;
+		}
+		CHECK(prolly_count(ctx, &vt.data, &n) == PROLLY_OK);
+		if (n != 0)
+		{
+			snprintf(msg, sizeof(msg), "unlogged table %s's %llu rows are in the commit", name,
+					 (unsigned long long) n);
+			fail(label, msg);
+		}
+	}
+	PQclear(res);
+	PQfinish(c);
+}
+
 /* Every check on a rebuilt database against the source's answers. */
 static void
 check_rebuilt(const char *db, char **expect, const char *label, bool last)
@@ -396,6 +434,32 @@ check_rebuilt(const char *db, char **expect, const char *label, bool last)
 						 PQgetvalue(res, 0, 0));
 				fail(label, msg);
 			}
+		}
+		PQclear(res);
+	}
+	/* nothing of an unlogged table is in a commit, so it comes back empty */
+	{
+		PGresult   *res = pg_exec(c, "SELECT format('%I', c.relname) FROM pg_class c "
+								  "JOIN pg_namespace n ON n.oid = c.relnamespace "
+								  "WHERE n.nspname = '" SCHEMA "' AND c.relkind = 'r' "
+								  "AND c.relpersistence = 'u'");
+
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			char		sql[300];
+			PGresult   *n;
+
+			snprintf(sql, sizeof(sql), "SELECT count(*) FROM " SCHEMA ".%s", PQgetvalue(res, i, 0));
+			n = pg_exec(c, sql);
+			if (strcmp(PQgetvalue(n, 0, 0), "0") != 0)
+			{
+				char		msg[300];
+
+				snprintf(msg, sizeof(msg), "unlogged table %s holds %s rows", PQgetvalue(res, i, 0),
+						 PQgetvalue(n, 0, 0));
+				fail(label, msg);
+			}
+			PQclear(n);
 		}
 		PQclear(res);
 	}
@@ -2104,9 +2168,77 @@ run_moves(char **names, int nsteps)
 		if (next >= nsteps || cur >= nsteps)
 			continue;
 		snprintf(label, sizeof(label), "%.12s -> %.12s", names[cur], names[next]);
+		/* a logical slot sees what a subscriber would */
+		{
+			PGconn	   *c = pg_open("rt_move");
+
+			pg_cmd(c, "SELECT pg_drop_replication_slot('rt_move') FROM pg_replication_slots "
+				   "WHERE slot_name = 'rt_move'");
+			pg_cmd(c, "SELECT pg_create_logical_replication_slot('rt_move', 'test_decoding')");
+			PQfinish(c);
+		}
 		t0 = now_sec();
 		ws_move(&r.ctx, &root[cur], &root[next], "rt_move", &st, &rep);
+		/*
+		 * Statistics are a branch's own and never committed: a move's row
+		 * changes raise the tables' change counters, so autoanalyze takes
+		 * them up.  (The counters reach the shared statistics shortly after
+		 * the move's session ends.)
+		 */
+		{
+			PGconn	   *c = pg_open("rt_move");
+			uint64_t	wrote = st.deleted + st.inserted + st.updated,
+						mods = 0;
+
+			for (int i = 0; i < 50 && mods < wrote; i++)
+			{
+				PGresult   *res = pg_exec(c, "SELECT coalesce(sum(n_mod_since_analyze), 0) "
+										  "FROM pg_stat_user_tables WHERE schemaname = '" SCHEMA "'");
+
+				mods = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+				PQclear(res);
+				if (mods < wrote)
+				{
+					pg_cmd(c, "SELECT pg_stat_clear_snapshot()");
+					usleep(100000);
+				}
+			}
+			if (mods < wrote)
+			{
+				char		msg[200];
+
+				snprintf(msg, sizeof(msg), "the change counters show %llu changes, the move wrote %llu",
+						 (unsigned long long) mods, (unsigned long long) wrote);
+				fail(label, msg);
+			}
+			PQfinish(c);
+		}
 		vacuum_analyze("rt_move");
+		/*
+		 * A move changes a branch's rows as row changes, so a subscriber
+		 * follows it: the stream carries exactly the rows the move wrote.
+		 */
+		{
+			PGconn	   *c = pg_open("rt_move");
+			PGresult   *res = pg_exec(c, "SELECT count(*) FROM pg_logical_slot_get_changes('rt_move', "
+									  "NULL, NULL) WHERE data ~ '^table " SCHEMA "\\.[^:]+: (INSERT|UPDATE|DELETE):'");
+			uint64_t	decoded = strtoull(PQgetvalue(res, 0, 0), NULL, 10),
+						wrote = st.deleted + st.inserted + st.updated;
+
+			printf("%28s stream: %llu row changes for %llu written\n", "",
+				   (unsigned long long) decoded, (unsigned long long) wrote);
+			if (decoded != wrote)
+			{
+				char		msg[200];
+
+				snprintf(msg, sizeof(msg), "the replication stream carries %llu row changes, the move wrote %llu",
+						 (unsigned long long) decoded, (unsigned long long) wrote);
+				fail(label, msg);
+			}
+			PQclear(res);
+			pg_cmd(c, "SELECT pg_drop_replication_slot('rt_move')");
+			PQfinish(c);
+		}
 		st.secs = now_sec() - t0;
 		for (size_t i = 0; i < rep.n; i++)
 		{
@@ -2133,6 +2265,141 @@ run_moves(char **names, int nsteps)
 		checking_move = false;
 		cur = next;
 	}
+	vc_repo_free(&r);
+	cs_destroy(cs);
+}
+
+/* ------------------------------------------------------ history and RLS */
+
+/* One answer, or the error's first line, from a query run as role. */
+static char *
+as_role(const char *role, const char *db, const char *sql)
+{
+	char		ci[600];
+	PGconn	   *c;
+	PGresult   *res;
+	char	   *out;
+
+	snprintf(ci, sizeof(ci), "%s dbname=%s user=%s", o.conninfo, db, role);
+	c = PQconnectdb(ci);
+	if (PQstatus(c) != CONNECTION_OK)
+		die("connect: %s", PQerrorMessage(c));
+	res = PQexec(c, sql);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK)
+		out = strdup(PQntuples(res) && !PQgetisnull(res, 0, 0) ? PQgetvalue(res, 0, 0) : "");
+	else
+	{
+		const char *e = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
+
+		out = strdup(e ? e : "error");
+	}
+	PQclear(res);
+	PQfinish(c);
+	return out;
+}
+
+/* want is the answer exactly, or with error set, words of the error. */
+static void
+expect_as_(const char *what, const char *role, const char *db, const char *sql, const char *want,
+		   bool error)
+{
+	char	   *got = as_role(role, db, sql);
+
+	if (error ? strstr(got, want) == NULL : strcmp(got, want) != 0)
+	{
+		char		msg[1200];
+
+		snprintf(msg, sizeof(msg), "as %s: got [%s], want [%s]", role, got, want);
+		fail(what, msg);
+	}
+	else
+		printf("  ok   %s (as %s)\n", what, role);
+	free(got);
+}
+
+#define expect_as(what, role, db, sql, want) expect_as_(what, role, db, sql, want, false)
+#define expect_error_as(what, role, db, sql, want) expect_as_(what, role, db, sql, want, true)
+
+/*
+ * Reading history under today's row security and grants: a commit made
+ * when the policy let everyone read every row is read, as alice, with
+ * today's policy (her own rows) and today's column grants (no secret).
+ */
+static void
+run_history_rls(void)
+{
+	ChunkStore *cs = memstore_create();
+	VcRepo		r;
+	PHash		c0,
+				c1,
+				c2;
+	PGconn	   *c;
+	char		err[1000];
+	const char *db = o.src_db;
+
+	vc_repo_init(&r, cs, &prolly_default_policy);
+	{
+		PGconn	   *p = pg_open("postgres");
+
+		pg_cmd(p, "DO $$BEGIN CREATE ROLE alice LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END$$");
+		pg_cmd(p, "DO $$BEGIN CREATE ROLE bob LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END$$");
+		PQfinish(p);
+	}
+	fresh_database(db);
+	ws_install(db, true);
+	c = pg_open(db);
+	/* commit 0: no owner column yet */
+	pg_cmd(c, "CREATE SCHEMA rt");
+	pg_cmd(c, "CREATE TABLE rt.doc (id int PRIMARY KEY, body text, secret text)");
+	pg_cmd(c, "INSERT INTO rt.doc VALUES (1, 'early', 's1')");
+	c0 = logical_capture(&r.ctx, db);
+	/* commit 1: an owner per row, and a policy that shows every row */
+	pg_cmd(c, "ALTER TABLE rt.doc ADD COLUMN owner text");
+	pg_cmd(c, "TRUNCATE rt.doc");
+	pg_cmd(c, "INSERT INTO rt.doc VALUES (1, 'a1', 's1', 'alice'), (2, 'a2', 's2', 'alice'), "
+		   "(3, 'a3', 's3', 'alice'), (4, 'b1', 's4', 'bob'), (5, 'b2', 's5', 'bob'), (6, 'b3', 's6', 'bob')");
+	pg_cmd(c, "ALTER TABLE rt.doc ENABLE ROW LEVEL SECURITY");
+	pg_cmd(c, "CREATE POLICY everyone ON rt.doc USING (true)");
+	pg_cmd(c, "GRANT USAGE ON SCHEMA rt TO alice, bob");
+	pg_cmd(c, "GRANT SELECT ON rt.doc TO alice, bob");
+	c1 = logical_capture(&r.ctx, db);
+	/* commit 2, today: each sees their own rows, and not the secret */
+	pg_cmd(c, "DROP POLICY everyone ON rt.doc");
+	pg_cmd(c, "CREATE POLICY own ON rt.doc USING (owner = current_user)");
+	pg_cmd(c, "REVOKE SELECT ON rt.doc FROM alice, bob");
+	pg_cmd(c, "GRANT SELECT (id, body, owner) ON rt.doc TO alice, bob");
+	pg_cmd(c, "INSERT INTO rt.doc VALUES (7, 'a4', 's7', 'alice')");
+	pg_cmd(c, "UPDATE rt.doc SET body = 'b2 changed' WHERE id = 5");
+	c2 = logical_capture(&r.ctx, db);
+
+	printf("# history as of commit 1, made under a policy that showed every row\n");
+	expect_as("today, alice sees her rows", "alice", db,
+			  "SELECT string_agg(id::text, ',' ORDER BY id) FROM rt.doc", "1,2,3,7");
+	if (!ws_history_table(&r.ctx, &c1, "doc", c, "doc_c1", err, sizeof(err)))
+		fail("history", err);
+	if (!ws_history_table(&r.ctx, &c2, "doc", c, "doc_c2", err, sizeof(err)))
+		fail("history", err);
+	expect_as("commit 1 as alice: her rows only, by today's policy", "alice", db,
+			  "SELECT string_agg(id::text, ',' ORDER BY id) FROM " SCRATCH_SCHEMA ".doc_c1", "1,2,3");
+	expect_as("commit 1 as bob: his rows only", "bob", db,
+			  "SELECT string_agg(id::text, ',' ORDER BY id) FROM " SCRATCH_SCHEMA ".doc_c1", "4,5,6");
+	expect_error_as("commit 1's secret column, by today's column grants", "alice", db,
+			  "SELECT secret FROM " SCRATCH_SCHEMA ".doc_c1", "permission denied");
+	expect_as("the diff from commit 1 to 2 as alice: her new row, not bob's change", "alice", db,
+			  "SELECT string_agg(id::text, ',' ORDER BY id) FROM (SELECT id, body, owner FROM "
+			  SCRATCH_SCHEMA ".doc_c2 EXCEPT SELECT id, body, owner FROM " SCRATCH_SCHEMA ".doc_c1) d", "7");
+	expect_as("the same diff as bob: his change", "bob", db,
+			  "SELECT string_agg(id::text, ',' ORDER BY id) FROM (SELECT id, body, owner FROM "
+			  SCRATCH_SCHEMA ".doc_c2 EXCEPT SELECT id, body, owner FROM " SCRATCH_SCHEMA ".doc_c1) d", "5");
+
+	printf("# history as of commit 0, before the column today's policy reads\n");
+	if (ws_history_table(&r.ctx, &c0, "doc", c, "doc_c0", err, sizeof(err)))
+		fail("commit 0", "read with a policy that cannot apply to it");
+	else
+		printf("  ok   refused: %s", err);
+	expect_error_as("nothing of it was left behind", "alice", db,
+			  "SELECT count(*) FROM " SCRATCH_SCHEMA ".doc_c0", "does not exist");
+	PQfinish(c);
 	vc_repo_free(&r);
 	cs_destroy(cs);
 }
@@ -2224,6 +2491,7 @@ main(int argc, char **argv)
 		{"durable", 0, 0, 'U'}, {"store", 1, 0, 'T'}, {"crash", 1, 0, 'C'},
 		{"resume", 0, 0, 'R'}, {"quick", 0, 0, 'Q'}, {"crash-suite", 0, 0, 'Z'},
 		{"pgdata", 1, 0, 'P'}, {"backup", 1, 0, 'B'}, {"backup-suite", 0, 0, 'Y'},
+		{"history-rls", 0, 0, 'H'},
 		{0, 0, 0, 0}
 	};
 	const WorkingSetOps *ws = &logical_ops,
@@ -2262,6 +2530,7 @@ main(int argc, char **argv)
 			case 'V': mode = 'V'; break;
 			case 'U': mode = 'U'; break;
 			case 'Z': mode = 'Z'; break;
+			case 'H': mode = 'H'; break;
 			case 'T': o.store = optarg; break;
 			case 'C': crash_at = optarg; break;
 			case 'R': resume = true; break;
@@ -2274,11 +2543,20 @@ main(int argc, char **argv)
 						"        [--steps N] [--stream] [--ddl] [--merge [--only N,N...]] [--move]\n"
 						"        [--durable --store DIR [--resume] [--quick] [--crash STEP:POINT]]\n"
 						"        [--backup DIR] [--crash-suite --pgdata DIR] [--backup-suite --pgdata DIR]\n"
-						"        [--break row|sequence|matview|nohide|cast|isnull|toast|noreemit|noflush|\n"
+						"        [--break row|sequence|matview|nohide|unlogged|cast|isnull|toast|noreemit|noflush|\n"
 						"                 notags|noviol|keepall]\n");
 				return 2;
 		}
 	mkdir(o.work, 0700);
+	if (mode == 'H')
+	{
+		run_history_rls();
+		if (failures)
+			printf("# %d FAILURES\n", failures);
+		else
+			printf("# history reads as expected\n");
+		return failures ? 1 : 0;
+	}
 	if (mode == 'D' || mode == 'M')
 	{
 		if (mode == 'D')
@@ -2366,6 +2644,7 @@ main(int argc, char **argv)
 		t1 = now_sec();
 		s->root = src_ws->capture(&r.ctx, o.src_db);
 		printf("%s: applied %.2f s, captured %.2f s\n", s->file, t1 - t0, now_sec() - t1);
+		check_unlogged(&r.ctx, &s->root, o.src_db, s->file);
 		if (o.stream)
 		{
 			PHash		fresh = logical_capture(&r.ctx, o.src_db);

@@ -38,7 +38,7 @@ bench/winbench: bench/winbench.c test/test_util.h libprolly.a $(HDRS)
 
 # Rebuilding a schema, every index included, from the store (see bench/rebuild.c).
 REBUILD_SRCS = bench/rebuild.c bench/ws_pg.c bench/ws_codec.c bench/ws_logical.c bench/ws_stream.c \
-	bench/ws_tags.c bench/ws_viol.c bench/ws_move.c bench/ws_diff.c bench/ws_merge.c bench/pgoutput.c
+	bench/ws_tags.c bench/ws_viol.c bench/ws_move.c bench/ws_diff.c bench/ws_merge.c bench/ws_history.c bench/pgoutput.c
 bench/rebuild: $(REBUILD_SRCS) bench/ws.h bench/pgoutput.h test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -I$(PGINST)/include -DPGBIN='"$(PGINST)/bin"' -o $@ $(REBUILD_SRCS) libprolly.a \
 		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq
@@ -51,7 +51,7 @@ rebuild-check: bench/rebuild
 	./bench/rebuild --ddl
 	./bench/rebuild --merge
 	./bench/rebuild --move
-	for b in row sequence matview nohide; do \
+	for b in row sequence matview nohide unlogged; do \
 		if ./bench/rebuild --steps 1 --break $$b >/dev/null 2>&1; then \
 			echo "rebuild: --break $$b went unnoticed"; exit 1; \
 		else echo "rebuild: --break $$b caught"; fi; \
@@ -69,6 +69,11 @@ rebuild-check: bench/rebuild
 	if ./bench/rebuild --move --break keepall >/dev/null 2>&1; then \
 		echo "rebuild: --move --break keepall went unnoticed"; exit 1; \
 	else echo "rebuild: --move --break keepall caught"; fi
+	./bench/rebuild --history-rls
+	if ./bench/rebuild --history-rls --break oldpolicies >/dev/null 2>&1; then \
+		echo "rebuild: --history-rls --break oldpolicies went unnoticed"; exit 1; \
+	else echo "rebuild: --history-rls --break oldpolicies caught"; fi
+	./bench/stats_test.sh
 
 # Version control runs no user code: the trigger fixture (triggers, rules
 # and event triggers of every kind and enable state) through every mode,

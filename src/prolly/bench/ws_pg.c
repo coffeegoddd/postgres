@@ -12,6 +12,7 @@
  *				populated materialized views
  *	nohide		queries are planned with every index visible, so the plan
  *				may answer through some other index than the one named
+ *	unlogged	an unlogged table's rows are committed
  * and with --stream:
  *	cast		rows the event trigger sends are formatted with casts to text,
  *				which differ from output functions (bool, char(n), inet)
@@ -29,6 +30,8 @@
  *	noviol		constraint violations are found but not stored
  *	noregen		stored generated columns are copied from a side, never
  *				computed for a row the merge made
+ * and with --history-rls:
+ *	oldpolicies	history is read without today's row security policies
  * and with --move:
  *	keepall		every changed row is taken to be as the schema change left it,
  *				so none is rewritten

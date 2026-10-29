@@ -25,6 +25,7 @@
 #endif
 
 #define SCHEMA "rt"
+#define SCRATCH_SCHEMA "hist"		/* where history is read, under today's security */
 #define TEMPLATE_DB "rt_template"	/* the extensions, copied into every database */
 #define WS_MAX_COLS 1600		/* Postgres's limit */
 
@@ -476,5 +477,9 @@ typedef struct WsMerge
 extern void ws_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 					 const PHash *theirs, const WsEval *ev, WsMerge *out);
 extern void ws_merge_free(WsMerge *m);
+
+/* History: a table as of a commit, under the current policies and grants. */
+extern bool ws_history_table(ProllyCtx *ctx, const PHash *root, const char *table, PGconn *c,
+							 const char *scratch, char *err, size_t errlen);
 
 #endif

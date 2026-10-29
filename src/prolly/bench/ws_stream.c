@@ -567,7 +567,10 @@ stream_capture(ProllyCtx *ctx, const char *db)
 	for (size_t i = 0; i < stream.n; i++)
 	{
 		STable	   *t = &stream.t[i];
-		PHash		data = t->persist == 'p' ? t->data : capture_rows(ctx, c, &t->L);
+		/* an unlogged table's definition is committed, its contents never */
+		PHash		data = t->persist == 'p' ? t->data
+			: t->persist == 'u' && !broken("unlogged") ? t_empty(ctx)
+			: capture_rows(ctx, c, &t->L);
 
 		rv = put_table(ctx, rv, t->name, t->layout, strlen(t->layout), &data);
 	}

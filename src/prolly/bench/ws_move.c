@@ -1622,6 +1622,25 @@ ws_move(ProllyCtx *ctx, const PHash *from, const PHash *to, const char *db, WsMo
 		}
 		ws_layout_free(&LB);
 	}
+	/*
+	 * Unlogged tables hold nothing a commit has: whatever they held is not
+	 * the target's, so they are left empty, as after a crash.
+	 */
+	{
+		PGresult   *res = pg_exec(mv.c, "SELECT format('%I', c.relname) FROM pg_class c "
+								  "JOIN pg_namespace n ON n.oid = c.relnamespace "
+								  "WHERE n.nspname = '" SCHEMA "' AND c.relkind = 'r' "
+								  "AND c.relpersistence = 'u'");
+
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			char		sql[600];
+
+			snprintf(sql, sizeof(sql), "TRUNCATE " SCHEMA ".%s", PQgetvalue(res, i, 0));
+			exec_or_report(mv.c, sql, "empty unlogged table", rep);
+		}
+		PQclear(res);
+	}
 	st->rows_secs = since(t1);
 
 	/* 6. What needed the rows; sequences. */
