@@ -7,10 +7,10 @@ CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wno-unused-parameter
 
-SRCS = phash.c chunkfmt.c chunkstore.c memstore.c filestore.c dirstore.c prolly.c vc.c image.c
+SRCS = phash.c chunkfmt.c chunkstore.c memstore.c filestore.c dirstore.c prolly.c vc.c image.c cgraph.c vcg.c
 OBJS = $(SRCS:.c=.o)
-HDRS = prolly_util.h phash.h chunkfmt.h chunkstore.h prolly.h vc.h image.h
-TESTS = test/test_prolly test/test_vc test/test_lifetime test/test_window test/test_remote test/test_image test/test_dirstore
+HDRS = prolly_util.h phash.h chunkfmt.h chunkstore.h prolly.h vc.h image.h cgraph.h vcg.h
+TESTS = test/test_prolly test/test_vc test/test_lifetime test/test_window test/test_remote test/test_image test/test_dirstore test/test_vcg
 
 all: libprolly.a
 
@@ -82,4 +82,7 @@ bench/branchbench: bench/branchbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
 
 bench/diskbench: bench/diskbench.c test/test_util.h libprolly.a $(HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a
+
+bench/graphbench: bench/graphbench.c test/test_util.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ $< libprolly.a

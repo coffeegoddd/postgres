@@ -984,6 +984,112 @@ the log is refused, and opening as of an older root is tested.
   - compaction's retention rule for chunks that backups still need;
   - concurrent writers while crashing.
 
+## Parents in a commit graph (severing to a real root)
+
+**The question:** when the window severs init <- a <- b <- c <- d <- e
+down to c <- d <- e, can c become a real root without rewriting any
+commit?  With parents inside the commit (`vc.c`), no: c's hash covers
+"my parent is b", so c stays a commit whose parent is cut.  `vcg.c`
+tries the other way.  It sits beside `vc.c`, so the two can be measured
+against each other.
+
+**The design** (`cgraph.h`, `vcg.h`):
+- **Commits:** a commit's hash covers its root value, generation, a
+  16-byte random nonce, time and message.  It does not cover its parents.
+  The nonce keeps two commits with the same root and message distinct.
+- **The commit graph:** parent edges live in a prolly map keyed by
+  (generation, commit).  Its root hash covers every edge.  Keying by
+  generation means new commits touch only the last leaves, and a sever
+  touches only the first ones.
+- **Sever:**
+  - the cut commits' edges, plus the edges from kept commits into them,
+    go into a segment graph, and its root hash H names the segment;
+  - each kept commit loses its cut parents and records H;
+  - c is then a root (no parents) whose history continues in H, and no
+    commit hash changes.
+- **Relink:** a segment comes back from any store only if it hashes to H
+  and the commits it names hash to their names.  Relinking puts back the
+  exact graph that was cut, down to the same root hash.  Segments go back
+  newest first; a merge commit cut on both sides is refused until the
+  later cut is back.
+- **Sync:**
+  - a ref is a head plus the sender's graph root, and edges are read
+    through that root, so each chunk is checked against its hash;
+  - an edge must agree with the generations at both ends (they are part
+    of each commit's hash);
+  - it must also agree with any edge the receiver already holds for that
+    commit.  A root-with-seam on one side agrees with the full edge on the
+    other.
+  - Fetches stop at commits the receiver knows, and report detached or
+    unrelated histories, as in `vc`.
+- **What the repo saves:** branches, the graph root, the commits held, and
+  only the segments it still holds or exported.  A discarded segment is
+  found again by the hash its kept commit records (`vcg_segment_find`).
+  So the saved state is the size of the window, however much has been
+  cut.
+
+**Tests** (`test/test_vcg.c`, 16 of them):
+- nonces;
+- the example above, where c becomes a root with the same hashes;
+- relinking from the local store, from an archive, and from forged
+  stores, each refused (another history's segment under H, another
+  commit's bytes under a cut commit's name);
+- newest-first ordering, and a merge commit cut twice;
+- the merge base inside the window, and past the cut (`VCG_ERR_SEVERED`);
+- merges;
+- sync between repos cut at different depths;
+- fast-forward-only push;
+- forged edges on fetch: contradicting a known edge, a skipped generation,
+  a head missing from the graph;
+- detached and unrelated fetches;
+- a clone carrying the cut and relinking it from the original's archive;
+- save and reopen;
+- the saved state not growing with history.
+
+Each check was also disabled in turn to confirm a test fails.  The one
+exception is hash verification when copying: the store re-hashes every
+chunk it is given, so bytes under the wrong name can never land.
+
+**Disk, against parents in the commits** (`bench/graphbench`).  It runs
+the same seeded commits through both engines on the durable store; table
+data comes out as identical chunks, so only history differs.
+
+| Workload | History, vc | History, vcg | Written, vc | Written, vcg |
+|---|---:|---:|---:|---:|
+| 200k rows, 200 commits x 2000 changes, window 20 | 13.1 KB | 6.2 KB | 821 MB | 821 MB |
+| 20k rows, 5000 commits x 1 change, window 50 | 318 KB | 6.1 KB | 808 MB | 70 MB |
+| same, never severed | 396 KB | 610 KB | 294 MB | 326 MB |
+| 20k rows, 2000 commits x 10 changes, 32 branches, window 10 | 134 KB | 39 KB | 231 MB | 158 MB |
+
+"History" is the live commits, graph and saved state at the end.
+"Written" is every byte put over the run.
+
+- **Severing:** history stays the size of the window.  The big
+  difference is the saved state:
+  - `vc` remembers every commit it ever had (its location map, so cut
+    history never comes back implicitly) and every segment's commit list;
+  - it rewrites all of that at every commit: 315 KB after 5000 commits,
+    which is most of the 808 MB written.
+  - `vcg` keeps that knowledge in the edges and segment hashes instead,
+    so its state stays at about 1 KB.
+  - The same diet would work for `vc` too, if it gave up refusing to
+    re-fetch discarded history.
+- **Never severing:** the graph costs more, about 43 bytes more per
+  commit live.  Each commit also rewrites the graph's last leaf and its
+  path, about 6 KB written per commit with 4 KB chunks; a smaller chunk
+  target for the graph would cut that.
+- **Disk:** table data dominates everywhere.  On disk the two differ by
+  under 0.3 MB in every run (5.26 vs 4.95 MB after the 5000-commit run).
+
+**Left open:**
+- A receiver accepts a new commit's edges on the sender's graph root,
+  just as it accepts the sender's head.  A sender lying about history the
+  receiver has never seen is not detectable.
+- The window is recomputed on every sever, not tracked incrementally.
+- `vcg` has no commit images, pins, `VC_WINDOW_ONLY`, deepen or pull yet.
+- Fetch can bring back history this repo discarded, if a sender still
+  has it.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

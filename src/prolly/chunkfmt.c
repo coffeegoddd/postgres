@@ -132,6 +132,19 @@ commit_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 }
 
 static bool
+gcommit_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
+{
+	const uint8_t *p = data + 2;
+	const uint8_t *end = data + len;
+	PHash		h;
+
+	if (!read_hash(&p, end, &h))
+		return false;
+	fn(arg, &h, true);
+	return true;
+}
+
+static bool
 delta_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 {
 	const uint8_t *p = data + 2;
@@ -244,7 +257,10 @@ chunk_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 		case CHUNK_TAG_IMAGE:
 			return image_refs(data, len, fn, arg);
 		case CHUNK_TAG_REPO:
+		case CHUNK_TAG_GREPO:
 			return true;
+		case CHUNK_TAG_GCOMMIT:
+			return gcommit_refs(data, len, fn, arg);
 		default:
 			return false;
 	}

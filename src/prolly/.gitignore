@@ -9,3 +9,5 @@
 /test/test_dirstore
 /bench/diskbench
 /bench/rebuild
+/test/test_vcg
+/bench/graphbench
