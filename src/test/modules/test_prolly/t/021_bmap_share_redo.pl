@@ -4,8 +4,8 @@
 # own blocks, those the share logged as images, rather than by visiting
 # every buffer: a standby or crash recovery replaying many shares with a
 # large shared_buffers would otherwise pay for the whole buffer pool at
-# each one.  The copy, the standby and crash recovery still read the
-# source's pages as of the share.
+# each one, a share right after a checkpoint included.  The copy, the
+# standby and crash recovery still read the source's pages as of the share.
 
 use strict;
 use warnings FATAL => 'all';
@@ -71,6 +71,32 @@ ok( $standby->log_contains(
 	'a share of pages shared already writes out none');
 is(ssql(qq{SELECT test_bmap_rows_digest($copy2)}), $digest,
 	'and its copy reads them too');
+
+# A share right after a checkpoint, the first change of its source's header
+# since, logs the header as an image: the record keeps the header's delta
+# with it, so redo still has the source's length and epoch for its walk.
+sql(q{
+	CREATE TABLE u (a int, b text);
+	INSERT INTO u SELECT g, repeat('u', 100) FROM generate_series(1, 2000) g;
+});
+my $usrc = sql(q{SELECT pg_relation_filenode('u')});
+my $upages = sql(q{SELECT pg_relation_size('u') / 8192});
+my $upath = sql(q{SELECT pg_relation_filepath('u')});
+sql('CHECKPOINT');
+$log_offset = -s $standby->logfile;
+my $ucopy = sql(qq{SELECT test_bmap_share($usrc)});
+my $udigest = sql(qq{SELECT test_bmap_rows_digest($usrc)});
+$primary->wait_for_replay_catchup($standby);
+ok( $standby->log_contains(
+		qr/redo of a share of \Q$upath\E writes out its own pages: $upages,/,
+		$log_offset),
+	'a share after a checkpoint writes out the source\'s own pages, looked up');
+ok( !$standby->log_contains(
+		qr/redo of a share of \Q$upath\E writes out every buffer of it/,
+		$log_offset),
+	'visiting no other buffer');
+is(ssql(qq{SELECT test_bmap_rows_digest($ucopy)}), $udigest,
+	'and the standby\'s copy reads the source\'s pages');
 
 # Changing some pages after the share makes them the source's own again;
 # the next share's redo, in crash recovery, writes out only those.
