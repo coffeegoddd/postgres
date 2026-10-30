@@ -83,19 +83,26 @@ my ($large_bytes, $large_images) = wal_of(qq{SELECT test_bmap_share($large)}, $l
 
 # Pages changed since the checkpoint have their images in the WAL since
 # the redo pointer: neither the share nor the copies made by the next
-# change log them again.
+# change log them again.  Each counted apart, as each is a lesson of its
+# own.
 my $imaged = make_table('imaged', 100);
 sql(q{CHECKPOINT});
 sql(q{UPDATE imaged SET a = a WHERE a % 17 = 1});
-my (undef, $images) = wal_of(qq{
-	SELECT test_bmap_share($imaged);
-	UPDATE imaged SET a = a WHERE a % 17 = 2;
-}, $imaged);
+my (undef, $share_images) =
+  wal_of(qq{SELECT test_bmap_share($imaged)}, $imaged);
+my (undef, $copy_images) =
+  wal_of(q{UPDATE imaged SET a = a WHERE a % 17 = 2}, $imaged);
+{
+	local $TODO = 'a share logs an image of each page the relation owns';
+
+	is($share_images, 0,
+		'a share logs no image of pages imaged since the redo pointer');
+}
 {
 	local $TODO = 'a copy logs the page\'s image though one is in the WAL since the redo pointer';
 
-	is($images, 0,
-		'a share and the copies after it log no image of pages imaged since the redo pointer');
+	is($copy_images, 0,
+		'and the copies after it log none either');
 }
 
 # The first write to each page after a checkpoint: of a table none shares
