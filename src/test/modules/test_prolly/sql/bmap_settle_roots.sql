@@ -3,7 +3,9 @@
 -- and the commit log may forget those transactions, VACUUM settles every
 -- root: one held names no transaction any more, and one whose capturer
 -- aborted is reclaimed.  Otherwise, once the log can't say a capturer
--- aborted, its root would be held for good.
+-- aborted, its root would be held for good.  (Whether the roots name
+-- their capturers before the VACUUM isn't checked: autovacuum may settle
+-- them first, in vac_update_datfrozenxid().)
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 SET debug_block_mapped_heap = on;
 CREATE TABLE settle_t (id int) WITH (autovacuum_enabled = off);
@@ -16,7 +18,6 @@ COMMIT;
 BEGIN;
 SELECT test_bmap_root_capture(:t) > 0 AS captured_then_aborted;
 ROLLBACK;
-SELECT test_bmap_roots_naming() > 0 AS roots_name_transactions;
 
 VACUUM settle_t;
 SELECT test_bmap_roots_naming() AS roots_naming_after_vacuum;
