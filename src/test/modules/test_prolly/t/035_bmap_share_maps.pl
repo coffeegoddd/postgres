@@ -206,12 +206,13 @@ is(sql(q{SELECT count(*) FROM pg_check_visible('large_copy')}), '0',
 # change leaves the map page's LSN as it was, so its LSN doesn't tell
 # whether its changes are all in the WAL.  (A VACUUM after the checkpoint
 # sets a bit again, logging the map page; a change after the share then
-# clears another, copying the page.)
+# clears another, copying the page.)  The change is made with copies
+# without an image allowed, as every copy logs one by default.
 my $vm_imaged = make_table('vm_imaged', 10);
 sql(q{CHECKPOINT; UPDATE vm_imaged SET b = 'y' WHERE a = 1; VACUUM vm_imaged;});
 my ($vm_imaged_copy) = share_wal($vm_imaged);
 my $start = sql(q{SELECT pg_current_wal_insert_lsn()});
-sql(q{UPDATE vm_imaged SET b = 'z' WHERE a = 7});
+sql(q{SET block_map_copy_images = off; UPDATE vm_imaged SET b = 'z' WHERE a = 7});
 sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
 is(sql(qq{
 	SELECT count(*) || ',' || count(*) FILTER (WHERE block_fpi_length > 0)
