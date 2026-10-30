@@ -69,6 +69,10 @@ CREATE FUNCTION test_bmap_sweep_due()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_bmap_drop_orphans()
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- drain: the release queue drained after, as a drop's blocks were freed
 -- before the queue (false leaves them queued)
 CREATE FUNCTION test_bmap_unlink(relnumber oid, drain bool DEFAULT true)

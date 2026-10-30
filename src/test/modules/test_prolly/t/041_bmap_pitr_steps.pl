@@ -11,8 +11,9 @@
 # - a copy, a table made in the share's transaction, exists only if that
 #   transaction committed;
 # - verify_heapam finds every table sound;
-# - once the release queue is drained, each block's reference count is its
-#   holders less one;
+# - storage made by a transaction that never committed (a share stopped
+#   before its commit) is dropped as an orphan, and once the release queue
+#   is drained, each block's reference count is its holders less one;
 # - a sweep then changes no table's rows.
 
 use strict;
@@ -196,16 +197,17 @@ recovery_target_action = 'promote'
 			  if $got{$table} ne 'none';
 		}
 
-		# (a share stopped after its tree record and before its commit
-		# leaves the copy's holds counted: #1299)
-		my $leaks = $s->{name} eq 'share' && $share_tree >= 0 &&
+		# A share stopped after its tree record and before its commit leaves
+		# the copy's storage, holding the source's blocks, with no commit or
+		# abort to drop it: storage of a transaction that never committed,
+		# which is dropped as an orphan.
+		my $orphaned = $s->{name} eq 'share' && $share_tree >= 0 &&
 		  $target->[2] > $share_tree && $got{c1} eq 'none';
+		my $orphans = $node->safe_psql('postgres', q{SELECT test_bmap_drop_orphans()});
+		cmp_ok($orphans, '>=', 1, "$what: the uncommitted share's storage is dropped as an orphan")
+		  if $orphaned;
 		$node->safe_psql('postgres', q{SELECT * FROM test_bmap_release_drain()});
-		TODO:
-		{
-			local $TODO = 'a share that never commits leaks its holds (#1299)' if $leaks;
-			is(counts_off($node), 0, "$what: each block's count is its holders less one");
-		}
+		is(counts_off($node), 0, "$what: each block's count is its holders less one");
 		$node->safe_psql('postgres', q{SELECT * FROM test_bmap_sweep()});
 		is(rows($node, $_), $got{$_}, "$what: a sweep then leaves $_ as it was")
 		  for @tables;

@@ -2749,10 +2749,10 @@ maintain_storage(void)
 		smgrmaintain(block_map_release_max_per_pass, maintain_storage_pace,
 					 &done);
 		ereport(DEBUG1,
-				(errmsg_internal("automatic storage maintenance of database \"%s\": %" PRIu64 " release entries let go of, %" PRIu64 " blocks freed; %" PRIu64 " stores swept, %" PRIu64 " blocks freed",
+				(errmsg_internal("automatic storage maintenance of database \"%s\": %" PRIu64 " release entries let go of, %" PRIu64 " blocks freed; %" PRIu64 " stores swept, %" PRIu64 " blocks freed; %" PRIu64 " orphaned storage dropped",
 								 get_database_name(MyDatabaseId),
 								 done.released, done.released_freed,
-								 done.swept, done.swept_freed)));
+								 done.swept, done.swept_freed, done.orphans)));
 		CommitTransactionCommand();
 	}
 	PG_CATCH();
