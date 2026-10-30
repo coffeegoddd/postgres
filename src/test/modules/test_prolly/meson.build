@@ -90,6 +90,7 @@ tests += {
       't/038_bmap_copy_images_default.pl',
       't/039_bmap_sequences.pl',
       't/040_bmap_share_index_ams.pl',
+      't/041_bmap_pitr_steps.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
