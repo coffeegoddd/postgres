@@ -93,9 +93,11 @@ FROM test_bmap_changed_pages(:small, test_bmap_raise_epoch(:small)) b;
                         0
 (1 row)
 
--- A page held by a root of its relation alone is shared, but with no other
--- relation (VACUUM vacuums it as the relation's own); once another relation
--- shares the relation's storage, it is shared elsewhere too.  Block 0 was
+-- A page held by a root of its relation alone is shared; storage made of
+-- the root shared it with another relation, so it counts as shared
+-- elsewhere until it changes or a sweep finds it the relation's own (VACUUM
+-- vacuums it as shared meanwhile), as after a share of the relation's
+-- storage.  Block 0 was
 -- changed since the roots were captured: no longer shared, but its next
 -- change copies it, as the epoch was raised.
 SELECT test_bmap_unlink(:small_copy);
@@ -113,7 +115,7 @@ SELECT test_bmap_unlink(:big_copy);
 SELECT * FROM test_bmap_page_shared(:small, 1);
  shared | copies | elsewhere 
 --------+--------+-----------
- t      | t      | f
+ t      | t      | t
 (1 row)
 
 SELECT * FROM test_bmap_page_shared(:small, 0);
