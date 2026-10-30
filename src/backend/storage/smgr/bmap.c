@@ -535,6 +535,13 @@ StaticAssertDecl(BMAP_TREE_TOPS >= 4 && BMAP_TREE_TOPS <= 6 &&
  * which begins a leaf (every subtree's first block is a multiple of a
  * leaf's span): no leaf holds both forks' entries, so a run of a leaf's
  * entries is of one fork.
+ *
+ * So a block-mapped relation's main fork holds fewer blocks than md.c's
+ * can: BMAP_VM_BASE, which with 8 kB blocks is 4,294,835,619, 131,676
+ * blocks (about 1 GB) short of md.c's limit of InvalidBlockNumber blocks.  An
+ * extension past it fails as md.c's past its own does
+ * (check_extend_limit()), saying the lower limit.
+ *
  * Within this module a "key" is a block of the tree, of either fork; a
  * relation's buffer names the fork and the block within it (key_fork(),
  * key_block()).
@@ -6777,6 +6784,12 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	XLogRecPtr	copy_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	passed = InvalidXLogRecPtr;
 
+	/*
+	 * A copy allocates, writes and logs, and may fail: never in a critical
+	 * section, where a caller that locked the page there (a page of a map
+	 * fork, say, locked only once its change began) would PANIC instead.
+	 */
+	Assert(CritSectionCount == 0);
 	if (!fork_mapped(forknum))
 		return;
 	blkno = fork_key(forknum, blkno);
