@@ -702,12 +702,14 @@ GetFileBackupMethod(IncrementalBackupInfo *ib, const char *path,
 	/*
 	 * Nor is the block-mapped page store, as far as WAL summaries can tell:
 	 * WAL names the logical blocks of block-mapped relations, never the page
-	 * store's physical blocks holding them, so the summaries have no entry
-	 * for it however much it changed.  Sending it incrementally would send
-	 * none of its blocks, and pg_combinebackup would restore it as it was in
-	 * the prior backup.  Back it up in full every time.  (Its allocator,
-	 * reference counts and the relations' map forks are buffers WAL-logged
-	 * under their own file numbers, so they are summarized.)
+	 * store's physical blocks holding their data, so the summaries have no
+	 * entry for the store's data pages however much they changed (only for
+	 * its map nodes, which are WAL-logged as the store's own pages).
+	 * Sending it incrementally would send none of the data pages' changes,
+	 * and pg_combinebackup would restore them as they were in the prior
+	 * backup.  Back it up in full every time.  (Its allocator, reference
+	 * counts and the relations' map forks are buffers WAL-logged under their
+	 * own file numbers, so they are summarized.)
 	 *
 	 * This makes every incremental backup carry each database's whole page
 	 * store, unchanged or not: on a block-mapped cluster an incremental

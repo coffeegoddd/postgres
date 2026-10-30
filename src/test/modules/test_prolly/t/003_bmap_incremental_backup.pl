@@ -1,9 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Incremental backups of block-mapped storage.  WAL names the logical blocks
-# of block-mapped relations, never the page store's physical blocks, so WAL
-# summaries know nothing of the page store's changes: an incremental backup
-# must send the page store in full.
+# of block-mapped relations, never the page store's physical blocks holding
+# their data, so WAL summaries know nothing of the changes to the store's
+# data pages (only of its map nodes): an incremental backup must send the
+# page store in full.
 
 use strict;
 use warnings FATAL => 'all';
