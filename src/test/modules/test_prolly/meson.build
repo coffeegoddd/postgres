@@ -71,7 +71,7 @@ tests += {
       't/016_bmap_drop_buffers_two_passes.pl',
       't/020_bmap_share_wal.pl',
       't/021_bmap_share_redo.pl',
-      't/022_bmap_refs.pl',
+      't/031_bmap_refs.pl',
       't/023_bmap_held_root_reuse.pl',
       't/024_bmap_sweep_incremental.pl',
       't/025_bmap_sparse_map.pl',
