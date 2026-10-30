@@ -766,6 +766,10 @@
 #autovacuum_vacuum_cost_limit = -1      # default vacuum cost limit for
                                         # autovacuum, -1 means use
                                         # vacuum_cost_limit
+#block_map_release_max_per_pass = 1000000      # release queue entries of
+                                                # dropped block-mapped storage
+                                                # a worker lets go of in a
+                                                # database; -1 means no limit
 
 # - Cost-Based Vacuum Delay -
 

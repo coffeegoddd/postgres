@@ -141,6 +141,7 @@ double		autovacuum_vacuum_insert_score_weight = 1.0;
 double		autovacuum_analyze_score_weight = 1.0;
 double		autovacuum_vac_cost_delay;
 int			autovacuum_vac_cost_limit;
+int			block_map_release_max_per_pass = 1000000;
 
 int			Log_autovacuum_min_duration = 600000;
 int			Log_autoanalyze_min_duration = 600000;
@@ -371,6 +372,8 @@ static int	db_comparator(const void *a, const void *b);
 static void autovac_recalculate_workers_for_balance(void);
 
 static void do_autovacuum(void);
+static void maintain_storage(void);
+static void maintain_storage_pace(void);
 static void FreeWorkerInfo(int code, Datum arg);
 
 static autovac_table *table_recheck_autovac(Oid relid, HTAB *table_toast_map,
@@ -2710,6 +2713,64 @@ deleted:
 
 	/* Finally close out the last transaction. */
 	CommitTransactionCommand();
+
+	/*
+	 * Then the storage managers' own upkeep of the database's storage.  A
+	 * worker started only to prevent wraparound leaves it to a later one, so
+	 * as not to put off the next database's freezing.
+	 */
+	if (AutoVacuumingActive())
+		maintain_storage();
+}
+
+/*
+ * Background maintenance of the database's storage by its storage managers
+ * (smgrmaintain()): what dropped relations' storage still holds is let go
+ * of, at most block_map_release_max_per_pass entries a pass, under the
+ * cost-based delay, and whatever else is due runs, such as a sweep of a
+ * block-mapped page store after a crash may have leaked some of its blocks.
+ * It is a saving, not the pass's work: an error in it is reported and the
+ * worker goes on, the transaction it ran in rolled back.
+ */
+static void
+maintain_storage(void)
+{
+	SMgrMaintenance done;
+
+	/* the cost-based delay, as for a table with no options of its own */
+	av_storage_param_cost_delay = -1;
+	av_storage_param_cost_limit = -1;
+
+	StartTransactionCommand();
+	PG_TRY();
+	{
+		VacuumUpdateCosts();
+		VacuumCostBalance = 0;
+		smgrmaintain(block_map_release_max_per_pass, maintain_storage_pace,
+					 &done);
+		ereport(DEBUG1,
+				(errmsg_internal("automatic storage maintenance of database \"%s\": %" PRIu64 " release entries let go of, %" PRIu64 " blocks freed; %" PRIu64 " stores swept, %" PRIu64 " blocks freed",
+								 get_database_name(MyDatabaseId),
+								 done.released, done.released_freed,
+								 done.swept, done.swept_freed)));
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		AbortOutOfAnyTransaction();
+		FlushErrorState();
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+}
+
+/* between steps of the storage's maintenance: the cost-based delay */
+static void
+maintain_storage_pace(void)
+{
+	vacuum_delay_point(false);
 }
 
 /*
