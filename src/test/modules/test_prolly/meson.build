@@ -76,6 +76,8 @@ tests += {
       't/024_bmap_sweep_incremental.pl',
       't/025_bmap_sparse_map.pl',
       't/026_bmap_checksums.pl',
+      't/027_bmap_verifybackup.pl',
+      't/028_bmap_rewind.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
