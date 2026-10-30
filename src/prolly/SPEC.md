@@ -374,6 +374,162 @@ prolly trees and ours writes only the rows that came from *T*.  A
 fast-forward costs more in ours, because Dolt moves a pointer where ours
 must rewrite the rows *T* changed.
 
+### The window
+
+Without further adjustment, the hybrid model does not make
+version-control operations at arbitrary commits scale.  Every operation
+that moves a working set to another commit must rewrite the rows that
+differ in the tables' pages.  *D*, the number of rows that differ between
+the working set and the target, is at most the number of row changes made
+by the commits between them, and at most the number of rows in both: it
+tends to grow with the distance to the target, up to every row of the
+tables.  Dolt does these in O(1), by pointing at another tree.  The
+most severe gaps are:
+
+| Operation | Dolt | Dustgres | At scale |
+|---|---|---|---|
+| Hard reset to an arbitrary commit | O(1) | O(L + D log n) | up to O(n log n) for a distant commit |
+| Check out an arbitrary commit | O(1) | O(L + D log n) | up to O(n log n) for a distant commit |
+| Create a branch from an arbitrary commit | O(1) | O(C + D) | up to O(C + n) for a distant commit |
+| Fast-forward merge | O(1) | O(L + D log n) | up to O(n log n) for a branch far ahead |
+
+Operations that stay in the history store (diff, log, a three-way merge,
+soft reset) or that only change pointers (checkout of a branch, creating a
+branch from HEAD) are not affected.
+
+The window is the answer to these gaps.  It is a stretch of recent
+history, kept locally, in which version-control operations at arbitrary
+commits are guaranteed to be efficient, at the cost of the storage it
+takes.  It does so in two ways.  First, it bounds how much history is
+kept: the history that falls outside the window can be truncated, archived
+to a remote, or squashed into a new root at the window's boundary.
+Second, within its bounds it keeps keyframes, snapshot-like images that
+make moving a working set to a commit within the window cheap.
+
+**How its bounds are set.**  The window is measured back from each branch
+head, by number of commits, by the bytes of change they hold, by age, or by
+a combination:
+- **Ceilings** say how much history may be kept, for example 10,000
+  commits or 50 GB.  A commit beyond any ceiling falls outside the window.
+- **Floors** say how much must be kept, for example the last 100 commits
+  or the last 7 days.  A ceiling wins over a floor.
+- **Low marks** are optional, and choose how the window moves.  Without
+  them it slides: each truncation cuts back to the ceilings, a little at a
+  time.  With them it fills and empties: history grows up to the ceilings,
+  is then cut back to the low marks in one step, and grows again.  This
+  trades a steady size for fewer, larger truncations.
+
+Heads, and commits that are pinned (by a tag, for example), are always
+kept.  With no window set, every commit is kept, as in Dolt.
+
+**Truncating history.**  Truncation is optional, and runs in the background
+when history has grown about a tenth past the ceilings, so its cost per
+commit does not grow with the window.  It works in one of two modes:
+- **Keep hashes.**  The history cut off becomes a segment.  A segment can
+  be exported to an archive or a remote, discarded, or attached again
+  later.  The commits that remain keep their hashes and still name the
+  parents they lost, so clones, pushes and pulls keep working across the
+  cut.
+- **Rewrite.**  The history cut off is let go at once, and the oldest
+  commits kept are rewritten without parents, so they and their
+  descendants get new hashes.  Nothing of the cut history remains, so this
+  mode suits data that must not be retained; it rules out remotes, whose
+  hashes would no longer match.
+
+**Keyframes.**  The operations that move a working set to another commit,
+hard reset, checkout of an arbitrary commit and creating a branch from
+one, cost O(D) in rewritten rows, with *D* the number of rows that differ
+between the working set and the target.  A keyframe removes most of that
+cost.  A keyframe of a commit *X* is a physical copy of the versioned
+schema's working set as of *X*, made of four parts:
+- **Pages.**  Every page of every relation in the schema (tables, indexes,
+  TOAST tables and sequences, with their free space and visibility maps)
+  as of *X*.
+- **A page map.**  A prolly map from (relation, fork, block number) to the
+  page stored there.  Pages are stored by hash, so keyframes share every
+  page that did not change between them, and two keyframes can be diffed
+  in time proportional to the pages that differ.
+- **A relation map.**  A prolly map from each relation to its description:
+  its kind, the table it belongs to, its size in blocks, and its catalog
+  rows.
+- **A header.**  It names *X*, the keyframe it was built on, the WAL
+  position and MVCC snapshot of *X*, and the format it is valid for (the
+  Postgres version, page size, catalog version and cluster).
+
+**Keyframe pages are frozen.**  A keyframe is read under *X*'s snapshot:
+every heap tuple that *X* sees is frozen, so that it names no transaction,
+and every tuple *X* does not see is removed.  A raw page names transaction
+IDs that the server forgets as time passes; a frozen page names none, so
+it can be put back at any later time and shows exactly *X*'s rows.
+
+**Restoring a keyframe.**  In production, under copy-on-write, a
+keyframe's pages are kept as copy-on-write pages, and its page map is a set
+of block maps.  Moving a working set to *X* then shares the keyframe's
+block maps, as creating a branch does, and makes its catalog rows from the
+relation map, which costs O(C).  In the prototype, keyframes are stored as
+chunks in the history store, and restoring one writes back only the pages
+that differ from the working set, which costs O(P), with *P* the number of
+differing pages; *P* is at most *D*, and usually far smaller, since a page
+holds many rows.  When the target has no keyframe but one lies near it, the
+nearest keyframe is restored and only the rows between the two are
+rewritten; a planner chooses, from measured costs, between that and
+rewriting rows from the current state.
+**When keyframes are taken.**  Keyframes are spaced by change, not by
+commits: a new one is taken once the rows changed since the last one reach
+a spacing *Δ*.  Every commit in the window then lies within about *Δ*/2
+rows of a keyframe, so moving a working set to any commit in the window
+costs at most a restore plus replaying *Δ*/2 rows, however many commits the
+window holds.  *Δ* is set from three things:
+- **The break-even point.**  Below a certain size of change, replaying rows
+  is cheaper than restoring pages, so *Δ* never goes below it.  The planner
+  learns this point from the measured costs of the moves it makes.
+- **The storage budget.**  Each keyframe holds about the pages touched by
+  its *Δ* rows, so all keyframes together hold about the pages touched by
+  all the change in the window.  A smaller budget means a larger *Δ*.
+- **The target cost.**  Optionally, a bound on the slowest move in the
+  window, such as one second, which sets the largest *Δ* allowed.
+
+How this plays out depends on the window:
+- **A window with little change**, below the break-even point, has no
+  keyframes: replaying rows is always cheaper, and the costs of the
+  sections above apply.
+- **A window with millions of commits** has one keyframe per *Δ* rows of
+  change.  At 1,000 rows per commit and a *Δ* of 100,000 rows, that is one
+  keyframe per 100 commits, or 10,000 for a million commits.  When the
+  budget or the workload changes, dropping every other keyframe doubles
+  *Δ*; since keyframes share pages, each drop frees only the pages no other
+  keyframe holds.
+
+Keyframes are taken by a background worker, after a commit, never on its
+path.  Taking one copies, and freezes, each page changed since the keyframe
+it is built on, so its cost follows the write rate, not the number of
+commits; when the worker falls behind, it skips keyframes and the spacing
+widens until it catches up.
+
+**Keyframes live only inside the window.**  A keyframe is released when
+its commit leaves the window.  Keyframes are physical and local: they
+belong to this cluster, are not sent to remotes, and can always be rebuilt
+from the prolly trees, which stay the portable record.
+
+**What is prototyped.**  The planner is built and tested: it prices
+replaying rows against restoring a keyframe, decides when a keyframe is
+worth taking, and recalibrates its costs from what each move actually
+takes.  The keyframe format, including frozen pages, page maps and page
+diffs, is built and tested too.  What remains to build is the manager
+that acts on the planner: the background worker, the spacing and budget,
+thinning, and releasing keyframes as the window moves.
+
+**Time complexity with keyframes**, in production, with *C* the number of
+tables and indexes in the versioned schema, and *D'* the number of rows
+between the target and its nearest keyframe (in the prototype, each O(C)
+of a restore is O(P) instead):
+
+| Operation | Without a keyframe | With a keyframe of the target | With a keyframe near the target |
+|---|---|---|---|
+| Hard reset to an arbitrary commit | O(L + D log n) | O(L + C) | O(L + C + D' log n) |
+| Check out an arbitrary commit | O(L + D log n) | O(L + C) | O(L + C + D' log n) |
+| Create a branch from an arbitrary commit | O(C + D) | O(C) | O(C + D') |
+
 ### Compared with stock Postgres: OLTP performance
 
 - **Statements run on the stock path.**  Reads and writes use the same
