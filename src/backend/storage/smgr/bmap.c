@@ -94,7 +94,8 @@
  * Until the redo pointer of the checkpoint last completed passes that position
  * (page_copy_holds()), the block isn't claimed in place by its other holder,
  * which copies the page instead and lets the block go; nor freed, its free
- * waiting on the release queue, whose drains stop before it; nor moved by a
+ * waiting on the release queue, whose drains pass over it (writing it back
+ * below what they pop, so that it holds up nothing else); nor moved by a
  * compaction; and no hint is set on its page, which a recovery would copy.
  * Its first change in place or free after that is preceded by a PASSED record
  * (copies_passed()), unless one was logged for a later copy already.  The
@@ -6953,11 +6954,20 @@ tree_walk(SMgrRelation reln, TreeNodeVisit visit_node,
 #define BMAP_RELEASE_REFS_PAGES	16
 #define BMAP_RELEASE_BITS_PAGES	4
 
+/*
+ * Entries a step passes over at most, held by copies without an image
+ * (release_step()), and writes back under what it pushes.
+ */
+#define BMAP_RELEASE_HELD		(3 * BMAP_QUEUE_PER_PAGE)
+
 StaticAssertDecl(BMAP_RELEASE_REFS_PAGES <= BMAP_REFS_PER_RECORD,
 				 "a step's count pages are locked at once");
-StaticAssertDecl(1 + 3 + BMAP_RELEASE_REFS_PAGES + 1 + BMAP_RELEASE_BITS_PAGES <=
-				 XLR_MAX_BLOCK_ID + 1,
+StaticAssertDecl(1 + BMAP_QUEUE_PAGES_PER_RECORD + BMAP_RELEASE_REFS_PAGES + 1 +
+				 BMAP_RELEASE_BITS_PAGES <= XLR_MAX_BLOCK_ID + 1,
 				 "a step's pages fit one record");
+StaticAssertDecl((BMAP_RELEASE_HELD + BMAP_TREE_FANOUT + 1 + BMAP_QUEUE_PER_PAGE - 1) /
+				 BMAP_QUEUE_PER_PAGE + 1 <= BMAP_QUEUE_PAGES_PER_RECORD,
+				 "the entries a step writes back and pushes fit one record's queue pages");
 StaticAssertDecl(BMAP_TREE_FANOUT <= 2 * BMAP_QUEUE_PER_PAGE,
 				 "a node's children are pushed onto three pages at most");
 
@@ -7715,6 +7725,22 @@ queued_children(RelFileLocator rel, const BmapQueued *node,
  * is popped with nothing let go of; one whose drop is still to commit stops
  * the step there.  False if the queue is empty, or its top waits for its
  * drop to commit.
+ *
+ * An entry of a block that a copy made without an image may still read
+ * (see "Copies without an image") is passed over, not let go of: the step
+ * writes it back below what it pushes, in place of the entries it popped
+ * (the same record).  Such entries are pushed on top as copies free blocks,
+ * the newest of the queue, and the copies they wait for pass only at the
+ * next checkpoint; stopping at them would keep every entry under them,
+ * dropped relations that have nothing to do with any copy, until the
+ * copies stopped.  Passed over, they sink beneath what the step pops, and
+ * a later drain past the checkpoint frees them.  The order of the other
+ * entries stays as it was.  An entry that takes a count off a node's (its
+ * flags say it counted) stays above the node's entry, which keeps the
+ * node's hold until what is pushed over it is done, so the step stops at
+ * a node once it passed over one of those.  At most BMAP_RELEASE_HELD are
+ * passed over; more on top of the queue keep it waiting for the next
+ * checkpoint, as they would all be freed by then.
  */
 static bool
 release_step(RelFileLocator rel, BmapRelease *done)
@@ -7736,6 +7762,9 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	BmapQueued *children = NULL;
 	int			nchildren = 0;
 	uint32		npushed = 0;
+	BmapQueued *held = NULL;
+	uint32		nheld = 0;
+	bool		held_counts = false;
 	uint32		nlet = 0;
 	bool		uncertain = false;
 	const BmapQueued *node = NULL;
@@ -7777,9 +7806,9 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		FullTransactionId last_owner = InvalidFullTransactionId;
 		OwnerState	last_state = OWNER_NONE;
 
-		while (k + ndiscard < BMAP_RELEASE_STEP && k + ndiscard < n)
+		while (k + ndiscard < BMAP_RELEASE_STEP && k + ndiscard + nheld < n)
 		{
-			uint32		pos = n - 1 - k - ndiscard;
+			uint32		pos = n - 1 - k - ndiscard - nheld;
 			BmapQueued	e;
 			int			saveref = nref;
 			FullTransactionId owner;
@@ -7825,11 +7854,22 @@ release_step(RelFileLocator rel, BmapRelease *done)
 
 			/*
 			 * A block a copy made without an image may still read stays
-			 * held until the copy is past the restart point: the step ends
-			 * before it (asked again below, under the count's lock, for
-			 * the blocks the step frees).
+			 * held until the copy is past the restart point: the step
+			 * passes over it, to write it back below (asked again below,
+			 * under the count's lock, for the blocks the step frees).
 			 */
 			if (e.level == BMAP_QUEUED_BLOCK && lookup_copy_holds(rel, e.block))
+			{
+				if (nheld == BMAP_RELEASE_HELD)
+					break;
+				if (held == NULL)
+					held = palloc_array(BmapQueued, BMAP_RELEASE_HELD);
+				held[nheld++] = e;
+				if (e.flags & (BMAP_QUEUED_COUNTED | BMAP_QUEUED_UNCOUNT))
+					held_counts = true;
+				continue;
+			}
+			if (e.level != BMAP_QUEUED_BLOCK && held_counts)
 				break;
 			if (!page_fits(REF_PAGE(e.block), refpages, &nref,
 						   BMAP_RELEASE_REFS_PAGES))
@@ -7850,12 +7890,14 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);
 	}
-	npop = k + ndiscard;
-	if (npop == 0)
+	if (k + ndiscard == 0)
 	{
+		if (held)
+			pfree(held);
 		UnlockReleaseBuffer(metabuf);
 		return false;
 	}
+	npop = k + ndiscard + nheld;
 
 	/* the roots' counts said not to be whole first, for a sweep to count */
 	if (uncertain && roots_exist(rel))
@@ -7962,6 +8004,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 				refs_release(&rp);
 				if (children)
 					pfree(children);
+				if (held)
+					pfree(held);
 				UnlockReleaseBuffer(metabuf);
 				return release_step(rel, done);
 			}
@@ -8066,12 +8110,23 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		adelta.nbitmap_added = 0;
 	}
 
-	/* a node freed: its children, in the place of the entries popped */
+	/*
+	 * The entries passed over, and a node's children over them, in the
+	 * place of the entries popped
+	 */
 	qp.n = 0;
+	if (nheld > 0 && npushed > 0)
+	{
+		held = repalloc_array(held, BmapQueued, nheld + npushed);
+		memcpy(held + nheld, children, npushed * sizeof(BmapQueued));
+	}
+	else if (npushed > 0)
+		held = children;
+	npushed += nheld;
 	if (npushed > 0)
 	{
 		queue_cover(rel, QUEUE_PAGE(n - npop + npushed - 1) + 1);
-		queue_write(rel, &qp, n - npop, children, npushed);
+		queue_write(rel, &qp, n - npop, held, npushed);
 	}
 
 	xlrec.locator = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
@@ -8124,6 +8179,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	queue_release(&qp);
 	refs_release(&rp);
 	UnlockReleaseBuffer(metabuf);
+	if (held && held != children)
+		pfree(held);
 	if (children)
 		pfree(children);
 
@@ -8131,7 +8188,7 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	for (uint32 i = 0; i < nfree; i++)
 		store_written(rel, tofree[i], 1);
 
-	done->entries += npop;
+	done->entries += npop - nheld;
 	done->discarded += ndiscard;
 	done->freed += freed;
 	done->unrefs += unrefs;

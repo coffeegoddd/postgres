@@ -185,6 +185,34 @@ is(sql(qq{
 	't', 'logging first that the copies are past the restart point');
 sql(qq{SELECT test_bmap_unlink($copy)});
 
+# Blocks held for copies are pushed on top of the queue, over what a drop
+# queued before them; a drain passes over them, freeing the dropped
+# table's blocks under them, however many cycles of copies keep pushing
+# more.  A checkpoint past the last copies then lets them go too.
+sql(q{
+	CREATE TABLE d (a int, b text);
+	INSERT INTO d SELECT g, repeat('d', 200) FROM generate_series(1, 20000) g;
+	DROP TABLE d;
+});
+my $dpending = sql(q{SELECT test_bmap_release_pending()});
+my $dfreed = 0;
+for my $i (1 .. 3)
+{
+	my ($st, $scp, $sblocks, $spg) = shared_and_copied("stall$i");
+	remake_pages($scp, $spg);
+	$dfreed += sql(q{SELECT freed FROM test_bmap_release_drain()});
+	cmp_ok(sql(q{SELECT test_bmap_release_pending()}), '<=', 3 * 2 * $spg,
+		"cycle $i of copies: a drain passes over the held blocks to what is under them");
+	sql(qq{SELECT test_bmap_unlink($scp, false)});
+	sql(qq{DROP TABLE stall$i});
+}
+cmp_ok($dfreed, '>=', $dpending,
+	'the dropped table\'s blocks are freed while copies keep coming');
+sql(q{CHECKPOINT});
+sql(q{SELECT * FROM test_bmap_release_drain()});
+is(sql(q{SELECT test_bmap_release_pending()}), '0',
+	'and after a checkpoint past the copies, the queue drains to empty');
+
 # A standby: the copies replayed there read the old blocks from its disk
 # until its restart point passes them.  The primary, after its checkpoint,
 # claims the blocks in place and changes them; the standby's replay moves
