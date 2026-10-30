@@ -110,6 +110,11 @@ CREATE FUNCTION test_bmap_rows_digest(relnumber oid)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The bytes of WAL this backend has written, leaving out full-page images.
+CREATE FUNCTION test_bmap_own_wal()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Read a block zeroed and locked, as an access method about to initialize
 -- it does (only if it isn't in a buffer), and leave it uninitialized.
 CREATE FUNCTION test_bmap_zero_block(relnumber oid, blkno int)

@@ -17,9 +17,11 @@ CREATE EXTENSION test_prolly;
 RESET client_min_messages;
 SET debug_block_mapped_heap = on;
 
--- The WAL written since a mark, in bytes.
-CREATE FUNCTION pg_temp.wal_since(mark pg_lsn) RETURNS numeric
-LANGUAGE sql AS $$ SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), mark) $$;
+-- The WAL this backend wrote since a mark, in bytes, leaving out full-page
+-- images: neither another backend's WAL nor the first image of a page after
+-- a checkpoint can tip a comparison of two steps' map work.
+CREATE FUNCTION pg_temp.wal_since(mark int8) RETURNS int8
+LANGUAGE sql AS $$ SELECT test_bmap_own_wal() - mark $$;
 
 -- The shared buffers a statement reads, hit or not.
 CREATE FUNCTION pg_temp.buffers_read(query text) RETURNS bigint
@@ -54,12 +56,12 @@ SELECT held FROM test_bmap_roots();
 -- alone: about as much for the big table as for the small one.
 SELECT test_bmap_root_capture(:small) AS small_first \gset
 CHECKPOINT;
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_root_capture(:small) AS small_again \gset
-SELECT pg_temp.wal_since(:'mark') AS small_capture_wal \gset
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT pg_temp.wal_since(:mark) AS small_capture_wal \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_root_capture(:big) AS big_again \gset
-SELECT pg_temp.wal_since(:'mark') AS big_capture_wal \gset
+SELECT pg_temp.wal_since(:mark) AS big_capture_wal \gset
 SELECT :big_capture_wal < :small_capture_wal + 8192 AS capture_wal_flat;
 SELECT test_bmap_root_release(:small_first) AND test_bmap_root_release(:small_again)
 	AND test_bmap_root_release(:big_again) AS let_go;

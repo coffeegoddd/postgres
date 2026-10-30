@@ -14,9 +14,11 @@ SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
 RESET client_min_messages;
 SET debug_block_mapped_heap = on;
--- The WAL written since a mark, in bytes.
-CREATE FUNCTION pg_temp.wal_since(mark pg_lsn) RETURNS numeric
-LANGUAGE sql AS $$ SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), mark) $$;
+-- The WAL this backend wrote since a mark, in bytes, leaving out full-page
+-- images: neither another backend's WAL nor the first image of a page after
+-- a checkpoint can tip a comparison of two steps' map work.
+CREATE FUNCTION pg_temp.wal_since(mark int8) RETURNS int8
+LANGUAGE sql AS $$ SELECT test_bmap_own_wal() - mark $$;
 -- Two tables, of about 1000 and 10000 blocks, each over two subtrees.
 -- Autovacuum stays off them: a VACUUM would change their pages, and write
 -- WAL, while the work of a step is measured.
@@ -77,38 +79,38 @@ WHERE level = 1 OR first = 0 ORDER BY first, level;
 -- A relation's first share logs an image of each page it had not shared
 -- before, once in the page's life, which makes the shared block durable.
 -- The map work of a share comes on top of that, and is all a later share
--- logs: about as much for the big table as for the small one (within a
--- page image), a count for each subtree rather than for each block.  Dropping such a copy, which
--- holds nothing of its own, logs as little.
+-- logs besides page images: about as much for the big table as for the
+-- small one, a count for each subtree rather than for each block.  Dropping
+-- such a copy, which holds nothing of its own, logs as little.
 CHECKPOINT;
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_share(:small) AS small_again \gset
-SELECT pg_temp.wal_since(:'mark') AS small_share_wal \gset
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT pg_temp.wal_since(:mark) AS small_share_wal \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_share(:big) AS big_again \gset
-SELECT pg_temp.wal_since(:'mark') AS big_share_wal \gset
+SELECT pg_temp.wal_since(:mark) AS big_share_wal \gset
 SELECT :big_share_wal < :small_share_wal + 8192 AS share_wal_flat;
  share_wal_flat 
 ----------------
  t
 (1 row)
 
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_unlink(:small_again);
  test_bmap_unlink 
 ------------------
  
 (1 row)
 
-SELECT pg_temp.wal_since(:'mark') AS small_drop_wal \gset
-SELECT pg_current_wal_insert_lsn() AS mark \gset
+SELECT pg_temp.wal_since(:mark) AS small_drop_wal \gset
+SELECT test_bmap_own_wal() AS mark \gset
 SELECT test_bmap_unlink(:big_again);
  test_bmap_unlink 
 ------------------
  
 (1 row)
 
-SELECT pg_temp.wal_since(:'mark') AS big_drop_wal \gset
+SELECT pg_temp.wal_since(:mark) AS big_drop_wal \gset
 SELECT :big_drop_wal < :small_drop_wal + 8192 AS drop_wal_flat,
 	:big_drop_wal < :big_blocks * 4 AS drop_wal_below_a_count_a_block;
  drop_wal_flat | drop_wal_below_a_count_a_block 
