@@ -2,6 +2,7 @@
 
 test_prolly_sources = files(
   'bmap_checks.c',
+  'bmap_primitive_checks.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_bufmgr.c',
@@ -41,6 +42,7 @@ tests += {
       'bmap_tree_share',
       'bmap_captured_roots',
       'vacuum_shared',
+      'bmap_primitives',
     ],
   },
   'tap': {

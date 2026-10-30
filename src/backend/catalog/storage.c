@@ -283,6 +283,77 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 }
 
 /*
+ * RelationCreateStorageFromRoot
+ *		Create a permanent relation's storage as a copy of a root captured
+ *		into its page store (bmap_root_capture()).
+ *
+ * The main fork shares the root's pages until it changes one
+ * (bmap_share_root()), O(1) in the relation's size.  It gets no free space
+ * map or visibility map, so the relation claims no page all-visible and
+ * knows of no free space until vacuumed, unless maps_from: then they are
+ * copies of that relation's (the caller knows its pages are the root's
+ * still, and VACUUM kept from setting a bit meanwhile).  With replacing,
+ * the storage made takes that storage's place (dropped as the transaction
+ * commits: a restore), and shares the pages with no other relation for
+ * that; with sharer, a relation that still holds the root's pages is told
+ * it shares them (bmap_share_root()).  With lineage_of, the storage
+ * carries that storage's lineage on (so the roots captured of it stay its
+ * own); otherwise it begins one of its own.  The storage is deleted if the
+ * transaction aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
+							  SMgrRelation maps_from, SMgrRelation replacing,
+							  SMgrRelation sharer, SMgrRelation lineage_of,
+							  bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/*
+	 * Registered first: storage made partway holds some of the root's pages,
+	 * which only dropping it gives back.
+	 */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	bmap_share_root(root, srel, replacing, sharer, lineage_of);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+	if (maps_from)
+	{
+		FlushRelationsAllBuffers(&maps_from, 1);
+		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+		{
+			if (!smgrexists(maps_from, fork))
+				continue;
+			smgrcreate(srel, fork, false);
+			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+			RelationCopyMapFork(maps_from, srel, fork);
+		}
+	}
+
+	/*
+	 * No pending sync: the root's own blocks were logged as images when it
+	 * was captured, and the share is logged, as are the maps' pages
+	 * (RelationCopyMapFork()).
+	 */
+	return srel;
+}
+
+/*
  * RelationCopyMapFork
  *		Copy a map fork (free space or visibility) of a permanent relation
  *		into the same fork, just created, of storage made without
@@ -290,10 +361,11 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  *
  * RelationCopyStorage() logs the pages and syncs them, but at
  * wal_level=minimal it does neither, leaving the sync to the pending sync
- * RelationCreateStorage() registers, which shared storage has none of: so
- * the pages are logged as images here instead, through shared buffers,
- * which a checkpoint then writes out and syncs.  Until then a crash can't
- * lose or tear them: redo writes them again.
+ * RelationCreateStorage() registers, which shared storage and storage made
+ * from a root have none of: so the pages are logged as images here
+ * instead, through shared buffers, which a checkpoint then writes out and
+ * syncs.  Until then a crash can't lose or tear them: redo writes them
+ * again.
  */
 void
 RelationCopyMapFork(SMgrRelation src, SMgrRelation dst, ForkNumber forkNum)
