@@ -189,9 +189,8 @@ this design must make cheap.
   size of the tables.
 - **Switching branches moves no data.**  Each branch has its own tables, so
   a session switches by choosing another branch.
-- **Moving a branch to another commit applies the difference.**  Reset,
-  checkout of an older commit and the result of a merge are computed in the
-  history store, and then applied to the branch's tables as ordinary row
+- **Moving a branch to another commit applies the difference.**  A hard
+  reset and the result of a merge are computed in the history store, and then applied to the branch's tables as ordinary row
   changes.
 - **A new branch shares its parent's pages.**  Its tables share pages with
   the parent copy-on-write, so creating it copies no data.
