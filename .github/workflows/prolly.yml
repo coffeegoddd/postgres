@@ -231,6 +231,41 @@ jobs:
             **/output_iso/regression.diffs
           if-no-files-found: ignore
 
+  # Postgres's own regression, isolation and recovery suites with every
+  # user heap table (and so its indexes and TOAST table) block-mapped.
+  upstream-block-mapped:
+    name: nightly upstream suites on block-mapped storage
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build
+        run: |
+          ./configure $CONFIGURE_FLAGS
+          make -s -j4
+          make -s -j4 -C src/test/modules
+
+      - name: Upstream suites on block-mapped storage
+        run: make -C src/test/prolly check-upstream-bmap PROVE_FLAGS='-j4 --timer'
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: upstream-block-mapped-logs
+          path: |
+            **/regression.diffs
+            **/tmp_check/log/**
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore
+
   check-world:
     name: nightly check-world
     if: github.event_name == 'schedule' || inputs.nightly
