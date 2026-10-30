@@ -1,0 +1,75 @@
+-- The block map's primitives that later work builds on: a relation made of
+-- a held root in O(1) of its size, the pages changed since an epoch, and
+-- whether a page is shared and with whom.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+SET debug_block_mapped_heap = on;
+
+CREATE TABLE small_t (id int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO small_t SELECT g, repeat('s', 200) FROM generate_series(1, 2000) g;
+CREATE TABLE big_t (id int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO big_t SELECT g, repeat('b', 200) FROM generate_series(1, 60000) g;
+SELECT relfilenode AS small FROM pg_class WHERE relname = 'small_t' \gset
+SELECT relfilenode AS big FROM pg_class WHERE relname = 'big_t' \gset
+SELECT pg_relation_size('big_t') / pg_relation_size('small_t') >= 20 AS big_is_bigger;
+
+-- Hold a root of each; a capture logs the relation's pages that were never
+-- shared before, so the relations are captured once first and then again,
+-- and the second captures are what is measured.
+BEGIN;
+SELECT test_bmap_root_capture(:small) AS r0, test_bmap_root_capture(:big) AS r1 \gset
+COMMIT;
+CHECKPOINT;
+SELECT test_bmap_digest(:small) AS small_digest, test_bmap_digest(:big) AS big_digest \gset
+SELECT pg_current_wal_insert_lsn() AS l0 \gset
+BEGIN;
+SELECT test_bmap_root_capture(:small) AS small_root \gset
+COMMIT;
+SELECT pg_current_wal_insert_lsn() AS l1 \gset
+BEGIN;
+SELECT test_bmap_root_capture(:big) AS big_root \gset
+COMMIT;
+SELECT pg_current_wal_insert_lsn() AS l2 \gset
+SELECT pg_wal_lsn_diff(:'l2', :'l1') <= pg_wal_lsn_diff(:'l1', :'l0') + 16384
+	AS capture_wal_flat_in_size;
+
+-- Relations made of the roots, in WAL that doesn't grow with their size,
+-- read back the pages the roots held, whatever the tables became since.
+UPDATE big_t SET pad = 'changed' WHERE id <= 100;
+SELECT pg_current_wal_insert_lsn() AS m0 \gset
+SELECT test_bmap_storage_from_root(:small_root) AS small_copy \gset
+SELECT pg_current_wal_insert_lsn() AS m1 \gset
+SELECT test_bmap_storage_from_root(:big_root) AS big_copy \gset
+SELECT pg_current_wal_insert_lsn() AS m2 \gset
+SELECT pg_wal_lsn_diff(:'m2', :'m1') <= pg_wal_lsn_diff(:'m1', :'m0') + 16384
+	AS made_wal_flat_in_size;
+SELECT test_bmap_digest(:small_copy) = :'small_digest' AS small_copy_is_root;
+SELECT test_bmap_digest(:big_copy) = :'big_digest' AS big_copy_is_root;
+SELECT test_bmap_digest(:big) <> :'big_digest' AS big_changed_since;
+
+-- The pages changed since an epoch are found from the map: exactly those
+-- whose rows changed after it was raised.
+SELECT test_bmap_raise_epoch(:small) AS epoch \gset
+UPDATE small_t SET pad = 'x' WHERE ctid IN ('(0,1)', '(3,1)', '(7,1)');
+SELECT array_agg(b ORDER BY b) AS changed FROM test_bmap_changed_pages(:small, :epoch) b;
+SELECT count(*) AS changed_since_next_epoch
+FROM test_bmap_changed_pages(:small, test_bmap_raise_epoch(:small)) b;
+
+-- A page held by a root of its relation alone is shared, but with no other
+-- relation (VACUUM vacuums it as the relation's own); once another relation
+-- shares the relation's storage, it is shared elsewhere too.  Block 0 was
+-- changed since the roots were captured: no longer shared, but its next
+-- change copies it, as the epoch was raised.
+SELECT test_bmap_unlink(:small_copy);
+SELECT test_bmap_unlink(:big_copy);
+SELECT * FROM test_bmap_page_shared(:small, 1);
+SELECT * FROM test_bmap_page_shared(:small, 0);
+SELECT test_bmap_share(:small) AS small_share \gset
+SELECT * FROM test_bmap_page_shared(:small, 1);
+SELECT test_bmap_unlink(:small_share);
+
+BEGIN;
+SELECT test_bmap_root_release(id) FROM unnest(ARRAY[:r0, :r1, :small_root, :big_root]::int8[]) id;
+COMMIT;
+DROP TABLE small_t, big_t;
+SELECT entries >= 0 AS drained FROM test_bmap_release_drain();
+RESET debug_block_mapped_heap;

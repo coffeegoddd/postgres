@@ -35,6 +35,13 @@ extern SMgrRelation RelationCreateStorageWith(RelFileLocator rlocator,
 extern SMgrRelation RelationCreateStorageShared(RelFileLocator rlocator,
 												SMgrRelation src,
 												bool register_delete);
+extern SMgrRelation RelationCreateStorageFromRoot(RelFileLocator rlocator,
+												  uint64 root,
+												  SMgrRelation maps_from,
+												  SMgrRelation replacing,
+												  SMgrRelation sharer,
+												  SMgrRelation lineage_of,
+												  bool register_delete);
 extern void RelationDropStorage(Relation rel);
 extern void RelationPreserveStorage(RelFileLocator rlocator, bool atCommit);
 extern void RelationPreTruncate(Relation rel);

@@ -188,3 +188,23 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)
 RETURNS float8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The block map's primitives: storage made from a held root (with copies
+-- of another relation's free space and visibility maps, unless 0), an
+-- epoch raised and the pages changed since one, and whether a page is
+-- shared, would be copied, and may be held by another relation.
+CREATE FUNCTION test_bmap_storage_from_root(root int8, maps_from oid DEFAULT 0)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_raise_epoch(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_changed_pages(relnumber oid, since int8)
+RETURNS SETOF int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_page_shared(relnumber oid, blkno int8,
+	OUT shared bool, OUT copies bool, OUT elsewhere bool)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
