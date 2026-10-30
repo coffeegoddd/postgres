@@ -73,7 +73,7 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
-patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change; storage manager hooks before an asynchronous read and before extension; blocks the storage manager has no storage for read as zeroes without I/O; single-block lookups, flushes and drops
+patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change, never in a critical section; storage manager hooks before an asynchronous read and before extension; blocks the storage manager has no storage for read as zeroes without I/O; single-block lookups, flushes and drops
 patch src/backend/storage/lmgr/lock.c  1a  LockHasWaiters() handles a lock taken by the fast path, which a page store compaction checks
 patch src/backend/storage/smgr/Makefile  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)

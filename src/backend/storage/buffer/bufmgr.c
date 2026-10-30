@@ -7060,6 +7060,11 @@ PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr)
 		RecoveryInProgress())
 		return;
 
+	/*
+	 * Preparing may copy the page, which allocates, writes and logs, and may
+	 * fail: the page must be locked before the change's critical section.
+	 */
+	Assert(CritSectionCount == 0);
 	gen = BufferSmgrCheckBegin(buf_hdr);
 	smgrprepareforchange(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 								  INVALID_PROC_NUMBER),
