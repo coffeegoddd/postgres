@@ -96,7 +96,8 @@ CommitTs
 ReplicationOrigin
 Generic
 LogicalMessage
-XLOG2$/,
+XLOG2
+BlockMap$/,
 	'rmgr list');
 
 
@@ -175,6 +176,12 @@ VACUUM FULL pg_authid;
 -- database
 CREATE DATABASE d1;
 DROP DATABASE d1;
+
+-- block map
+SET debug_block_mapped_heap = on;
+CREATE TABLE bmap_tbl (a int PRIMARY KEY);
+INSERT INTO bmap_tbl SELECT generate_series(1, 1000);
+RESET debug_block_mapped_heap;
 });
 
 my $tblspc_path = PostgreSQL::Test::Utils::tempdir_short();
@@ -486,6 +493,11 @@ for my $scenario (@scenarios)
 		@lines =
 		  test_pg_waldump($path, $start_lsn, $end_lsn, '--rmgr' => 'Btree');
 		is(grep(!/^rmgr: Btree/, @lines), 0, 'only Btree lines');
+
+		@lines =
+		  test_pg_waldump($path, $start_lsn, $end_lsn, '--rmgr' => 'BlockMap');
+		isnt(scalar(@lines), 0, 'BlockMap lines output');
+		is(grep(!/^rmgr: BlockMap/, @lines), 0, 'only BlockMap lines');
 
 		@lines =
 		  test_pg_waldump($path, $start_lsn, $end_lsn, '--fork' => 'init');
