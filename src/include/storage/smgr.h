@@ -110,8 +110,7 @@ extern void smgrprerestore(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber blocknum, Buffer buffer,
-								 bool neutral);
+								 BlockNumber blocknum, Buffer buffer);
 extern uint32 smgrreleasestep(SMgrRelation reln);
 extern void smgrprecommitdrop(SMgrRelation reln);
 extern bool smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,

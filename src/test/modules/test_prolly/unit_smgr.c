@@ -112,7 +112,7 @@ md_hooks_do_nothing(void)
 
 	buf = ReadBuffer(rel, 0);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	smgrprepareforchange(srel, MAIN_FORKNUM, 0, buf, false);
+	smgrprepareforchange(srel, MAIN_FORKNUM, 0, buf);
 	UnlockReleaseBuffer(buf);
 
 	CHECK_EQ(smgrnblocks(srel, MAIN_FORKNUM), nblocks);

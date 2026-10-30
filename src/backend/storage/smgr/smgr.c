@@ -147,8 +147,7 @@ typedef struct f_smgr
 	 */
 	bool		(*smgr_preparesforchanges) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_prepareforchange) (SMgrRelation reln, ForkNumber forknum,
-										  BlockNumber blocknum, Buffer buffer,
-										  bool neutral);
+										  BlockNumber blocknum, Buffer buffer);
 	bool		(*smgr_pageisshared) (SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, bool *copies);
 
@@ -768,18 +767,16 @@ smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum)
  *							 before it changes.
  *
  * A page shared with another relation is copied, so the change is this
- * relation's alone.  A 'neutral' change changes no row the page holds
- * (pruning, freezing): the storage manager may then leave the page as it
- * would leave it unchanged.  Called before any critical section: it may
- * allocate, write and log.
+ * relation's alone.  Called before any critical section: it may allocate,
+ * write and log.
  */
 void
 smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, Buffer buffer, bool neutral)
+					 BlockNumber blocknum, Buffer buffer)
 {
 	if (smgrsw[reln->smgr_which].smgr_prepareforchange)
 		smgrsw[reln->smgr_which].smgr_prepareforchange(reln, forknum, blocknum,
-													   buffer, neutral);
+													   buffer);
 }
 
 /*
