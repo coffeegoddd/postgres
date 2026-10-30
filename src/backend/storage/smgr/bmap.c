@@ -13403,7 +13403,11 @@ bmapzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * block by a record of its own at its first change, where mapping them
 	 * here takes one record for a leaf's worth.
 	 */
-	if ((uint64) blocknum + nblocks > (uint64) MaxBlockNumber + 1)
+	/*
+	 * (as md.c's, which stops short of a length of InvalidBlockNumber: a
+	 * cached length would read as unknown)
+	 */
+	if ((uint64) blocknum + nblocks >= (uint64) InvalidBlockNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
@@ -13425,6 +13429,13 @@ bmappreextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	if (forknum != MAIN_FORKNUM || nblocks <= 0)
 		return;
+	/* (no block past MaxBlockNumber, as smgrextend() would refuse it) */
+	if ((uint64) blocknum + nblocks > (uint64) MaxBlockNumber + 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot extend file \"%s\" beyond %u blocks",
+						relpath(reln->smgr_rlocator, forknum).str,
+						InvalidBlockNumber)));
 	extend_to(reln, blocknum, blocknum + nblocks, NULL, true);
 }
 
