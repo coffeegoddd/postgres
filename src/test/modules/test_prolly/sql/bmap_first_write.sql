@@ -91,10 +91,11 @@ SELECT (:shared_buffers - :plain_buffers) <= 8 * :pages AS shared_buffers_bounde
 SELECT (:dropped_buffers - :plain_buffers) <= 6 * :pages AS dropped_buffers_bounded;
 
 -- One record a page more than md.c's: the copy's, or the claim's, plus a
--- few records copying or stamping the table's paths and its visibility
--- map's page.
+-- few records copying the table's paths and its visibility map's page,
+-- or, its copy dropped, moving them (a node another map may have shared
+-- moves to a new block: its record and its old block's freeing).
 SELECT :shared_records - :plain_records - :pages <= 10 AS shared_one_record_per_page;
-SELECT :dropped_records - :plain_records - :pages <= 10 AS dropped_one_record_per_page;
+SELECT :dropped_records - :plain_records - :pages <= 14 AS dropped_one_record_per_page;
 
 SELECT test_bmap_unlink(:shared_copy);
 DROP SCHEMA fw CASCADE;
