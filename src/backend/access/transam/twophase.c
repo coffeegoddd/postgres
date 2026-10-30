@@ -920,13 +920,6 @@ TwoPhaseGetDummyProcNumber(FullTransactionId fxid, bool lock_held)
 }
 
 /*
- * TwoPhaseGetDummyProc
- *		Get the PGPROC that represents a prepared transaction
- *
- * If lock_held is set to true, TwoPhaseStateLock will not be taken, so the
- * caller had better hold it.
- */
-/*
  * TwoPhaseTransactionIsKnown
  *		Whether fxid is a prepared transaction, or one whose COMMIT or
  *		ROLLBACK PREPARED is still being done: its entry stays until the
@@ -950,6 +943,13 @@ TwoPhaseTransactionIsKnown(FullTransactionId fxid)
 	return found;
 }
 
+/*
+ * TwoPhaseGetDummyProc
+ *		Get the PGPROC that represents a prepared transaction
+ *
+ * If lock_held is set to true, TwoPhaseStateLock will not be taken, so the
+ * caller had better hold it.
+ */
 PGPROC *
 TwoPhaseGetDummyProc(FullTransactionId fxid, bool lock_held)
 {
