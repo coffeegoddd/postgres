@@ -91,7 +91,7 @@ static void fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber fo
 static Relation lock_and_open_sequence(SeqTable seq);
 static void create_seq_hashtable(void);
 static void init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel);
-static Form_pg_sequence_data read_seq_tuple(Relation rel,
+static Form_pg_sequence_data read_seq_tuple(Relation rel, int lockmode,
 											Buffer *buf, HeapTuple seqdatatuple);
 static void init_params(ParseState *pstate, List *options, bool for_identity,
 						bool isInit,
@@ -270,7 +270,7 @@ ResetSequence(Oid seq_relid)
 	 * indeed a sequence.
 	 */
 	init_sequence(seq_relid, &elm, &seq_rel);
-	(void) read_seq_tuple(seq_rel, &buf, &seqdatatuple);
+	(void) read_seq_tuple(seq_rel, BUFFER_LOCK_SHARE, &buf, &seqdatatuple);
 
 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seq_relid));
 	if (!HeapTupleIsValid(pgstuple))
@@ -471,7 +471,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	seqform = (Form_pg_sequence) GETSTRUCT(seqtuple);
 
 	/* lock page buffer and read tuple into new sequence structure */
-	(void) read_seq_tuple(seqrel, &buf, &datatuple);
+	(void) read_seq_tuple(seqrel, BUFFER_LOCK_SHARE, &buf, &datatuple);
 
 	/* copy the existing sequence data tuple, so it can be modified locally */
 	newdatatuple = heap_copytuple(&datatuple);
@@ -559,7 +559,7 @@ SequenceChangePersistence(Oid relid, char newrelpersistence)
 	if (RelationNeedsWAL(seqrel))
 		GetTopTransactionId();
 
-	(void) read_seq_tuple(seqrel, &buf, &seqdatatuple);
+	(void) read_seq_tuple(seqrel, BUFFER_LOCK_SHARE, &buf, &seqdatatuple);
 	RelationSetNewRelfilenumber(seqrel, newrelpersistence);
 	fill_seq_with_data(seqrel, &seqdatatuple);
 	UnlockReleaseBuffer(buf);
@@ -688,7 +688,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	ReleaseSysCache(pgstuple);
 
 	/* lock page buffer and read tuple */
-	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
+	seq = read_seq_tuple(seqrel, BUFFER_LOCK_EXCLUSIVE, &buf, &seqdatatuple);
 	page = BufferGetPage(buf);
 
 	last = next = result = seq->last_value;
@@ -984,7 +984,7 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 	PreventCommandIfParallelMode("setval()");
 
 	/* lock page buffer and read tuple */
-	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
+	seq = read_seq_tuple(seqrel, BUFFER_LOCK_EXCLUSIVE, &buf, &seqdatatuple);
 
 	if ((next < minv) || (next > maxv))
 		ereport(ERROR,
@@ -1181,14 +1181,20 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 /*
  * Given an opened sequence relation, lock the page buffer and find the tuple
  *
- * *buf receives the reference to the pinned-and-ex-locked buffer
+ * The buffer is locked in 'lockmode': BUFFER_LOCK_EXCLUSIVE to change the
+ * page, BUFFER_LOCK_SHARE only to read it.  A storage manager that shares
+ * pages between relations copies a shared page as it is locked exclusively,
+ * so readers take the share lock.
+ *
+ * *buf receives the reference to the pinned-and-locked buffer
  * *seqdatatuple receives the reference to the sequence tuple proper
  *		(this arg should point to a local variable of type HeapTupleData)
  *
  * Function's return value points to the data payload of the tuple
  */
 static Form_pg_sequence_data
-read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
+read_seq_tuple(Relation rel, int lockmode, Buffer *buf,
+			   HeapTuple seqdatatuple)
 {
 	Page		page;
 	ItemId		lp;
@@ -1196,7 +1202,7 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	Form_pg_sequence_data seq;
 
 	*buf = ReadBuffer(rel, 0);
-	LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+	LockBuffer(*buf, lockmode);
 
 	page = BufferGetPage(*buf);
 	sm = (sequence_magic *) PageGetSpecialPointer(page);
@@ -1218,10 +1224,13 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	 * xmax, which eventually leads to clog access failures or worse. If we
 	 * see this has happened, clean up after it.  We treat this like a hint
 	 * bit update, ie, don't bother to WAL-log it, since we can certainly do
-	 * this again if the update gets lost.
+	 * this again if the update gets lost.  Only under the exclusive lock: a
+	 * reader leaves it, and new storage made from what it read gets no xmax
+	 * (fill_seq_fork_with_data()).
 	 */
 	Assert(!(seqdatatuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI));
-	if (HeapTupleHeaderGetRawXmax(seqdatatuple->t_data) != InvalidTransactionId)
+	if (lockmode == BUFFER_LOCK_EXCLUSIVE &&
+		HeapTupleHeaderGetRawXmax(seqdatatuple->t_data) != InvalidTransactionId)
 	{
 		HeapTupleHeaderSetXmax(seqdatatuple->t_data, InvalidTransactionId);
 		seqdatatuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
@@ -1828,7 +1837,7 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		Form_pg_sequence_data seq;
 		Page		page;
 
-		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+		seq = read_seq_tuple(seqrel, BUFFER_LOCK_SHARE, &buf, &seqtuple);
 		page = BufferGetPage(buf);
 
 		values[0] = Int64GetDatum(seq->last_value);
@@ -1884,7 +1893,7 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
 
-		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+		seq = read_seq_tuple(seqrel, BUFFER_LOCK_SHARE, &buf, &seqtuple);
 
 		is_called = seq->is_called;
 		result = seq->last_value;
