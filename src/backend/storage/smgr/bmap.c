@@ -165,7 +165,12 @@
  * the bitmap pages) and bitmap pages saying which physical blocks are used.
  * Freed blocks are reused before the page store grows.  A reused block is
  * zeroed before it is mapped, so a crash can't expose its old contents at a
- * new logical block.  Truncation shortens the logical length, and once
+ * new logical block, unless the record mapping it carries the page's image
+ * or redo takes the page from elsewhere (a copy's: see bmapprepareforchange()),
+ * never reading the block.  Copies grow the store by several blocks at
+ * once, which md.c allocates without writing them: the blocks past the
+ * high-water mark are zeroes the allocator gives out next, as a crash
+ * leaves those of an extension whose record it lost.  Truncation shortens the logical length, and once
  * it is done (outside its critical section) lets go of the blocks past it,
  * freeing those no other map holds.  A crash in
  * between leaves them mapped past the length, where a later truncation or
@@ -3133,17 +3138,30 @@ drop_node_buffer(RelFileLocator rel, BlockNumber blk)
 }
 
 /*
+ * The blocks a page store grows by at once for copies (prepare_store()):
+ * enough that md.c allocates them without writing them (more than eight).
+ */
+#define BMAP_STORE_AHEAD	64
+
+/*
  * Make the page store hold the blocks below 'new_hw', zeroing the blocks
  * from 'old_hw', and zero the reused blocks.  Done before the record that
  * maps them, and again by its redo unless 'skip_existing': then blocks the
  * page store already has are left as they are.
+ *
+ * A store that must grow grows to a multiple of 'ahead' blocks (if not 0),
+ * the blocks past 'new_hw' zeroes the allocator hasn't given out yet, as a
+ * crash can leave them: the caller skips existing blocks, so that the
+ * copies taking them next find them there and write nothing, where growing
+ * a block at a time would write each block's zeroes first.
  *
  * A reused block may have been a tree's node, whose page may still be in a
  * buffer, dirty: it is dropped first (drop_node_buffer()).
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
-			  const BlockNumber *reused, uint32 nreused, bool skip_existing)
+			  const BlockNumber *reused, uint32 nreused, bool skip_existing,
+			  BlockNumber ahead)
 {
 	SMgrRelation ssrel = store_smgr(rel);
 	BlockNumber store_cur = mdnblocks(ssrel, MAIN_FORKNUM);
@@ -3170,6 +3188,9 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 	}
 	if (blk < new_hw)
 	{
+		Assert(ahead == 0 || skip_existing);
+		if (ahead > 0 && (uint64) new_hw + ahead <= MaxBlockNumber)
+			new_hw = (new_hw + ahead - 1) / ahead * ahead;
 		mdzeroextend(ssrel, MAIN_FORKNUM, blk, new_hw - blk, false);
 		/* (a node's buffer is read with the store's length, in recovery) */
 		ssrel->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
@@ -3834,7 +3855,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, const MapPage *leaf,
 	map_lock(mapbuf, false);
 
 	/* the page store before the record */
-	prepare_store(rel, old_hw, new_hw, reused, nreused, false);
+	prepare_store(rel, old_hw, new_hw, reused, nreused, false, 0);
 	if (content)
 	{
 		const void *page = content;
@@ -7050,16 +7071,20 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		reused = new_block < alloc.old_hw;
 
 		/*
-		 * The page store reaches the block.  The page's contents come with
-		 * the record, as an image; a page of zeroes (one being initialized)
-		 * is zeroed in the new block instead, here and in redo.  An image's
-		 * block is written only from the page's buffer, later, so a node's
-		 * stale buffer for it is dropped now, here and in redo.
+		 * The page store reaches the block, grown ahead for the copies to
+		 * come (prepare_store()).  The page's contents come with the record,
+		 * as an image, or redo takes them from the page as replay has it or
+		 * from the old block (redo_remap_page()), so the block is written
+		 * only from the page's buffer, later, and a block the store has is
+		 * left as it is, as redo leaves it; a node's stale buffer for it is
+		 * dropped now, here and in redo.  A page of zeroes (one being
+		 * initialized) is zeroed in the new block instead, here and in redo.
 		 */
 		if (reused && !zeroed)
 			drop_node_buffer(rel, new_block);
 		prepare_store(rel, alloc.old_hw, alloc.new_hw,
-					  &new_block, zeroed && reused ? 1 : 0, false);
+					  &new_block, zeroed && reused ? 1 : 0, !zeroed,
+					  zeroed ? 0 : BMAP_STORE_AHEAD);
 
 		/* the old block, a holder fewer (a hole has none) */
 		if (!hole)
@@ -12913,7 +12938,7 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	if (new_block < alloc.old_hw && !zeroed)
 		drop_node_buffer(rel, new_block);
 	prepare_store(rel, alloc.old_hw, alloc.new_hw, &new_block,
-				  zeroed && new_block < alloc.old_hw ? 1 : 0, false);
+				  zeroed && new_block < alloc.old_hw ? 1 : 0, false, 0);
 
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
@@ -15831,7 +15856,7 @@ bmap_redo(XLogReaderState *record)
 				BlockNumber *reused = (BlockNumber *) ((char *) xlrec + SizeOfBmapExtend);
 
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
-							  reused, xlrec->nreused, false);
+							  reused, xlrec->nreused, false, 0);
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
 				forget_cached_size(xlrec->locator);
@@ -16000,7 +16025,7 @@ bmap_redo(XLogReaderState *record)
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  &xlrec->new_block,
 							  zeroed && xlrec->new_block < xlrec->old_hw ? 1 : 0,
-							  !zeroed);
+							  !zeroed, 0);
 				for (uint8 id = 0; id < last; id++)
 					redo_block(record, id);
 				if (zeroed)
