@@ -6550,6 +6550,14 @@ queued_state(const BmapQueued *q)
 	state = owner_state(owner);
 	if (state == OWNER_COMMITTED && drop_in_flight(owner))
 		state = OWNER_RUNNING;
+
+	/*
+	 * (a test takes a committed owner for one too old to say of, as one
+	 * past the commit log's truncation would be)
+	 */
+	if (state == OWNER_COMMITTED &&
+		IS_INJECTION_POINT_ATTACHED("bmap-owner-unknown"))
+		state = OWNER_UNKNOWN;
 	return state;
 }
 

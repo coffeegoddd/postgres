@@ -135,7 +135,7 @@ is(root_rows($roots[0]), $first_rows, 'nor the first root');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 13
+	skip 'Injection points not supported by this build', 25
 	  if $ENV{enable_injection_points} ne 'yes';
 
 	sql(q{CREATE EXTENSION injection_points});
@@ -209,6 +209,62 @@ SKIP:
 	counts_exact('after it');
 	is(sql(q{SELECT freed FROM test_bmap_sweep()}), '0',
 		'a sweep after it finds nothing more');
+
+	# A counted root let go of by a transaction too old for the commit log
+	# to say whether it committed: the drain can't take off for sure what
+	# its entries counted, so it lets go of nothing they hold and says the
+	# counts are not whole, in a record of its own before its step's; the
+	# next sweep counts every root anew and frees what only the root held.
+	my $unknown = sql(qq{UPDATE t SET b = 'unknown' WHERE a = 77;
+		SELECT test_bmap_root_capture($t)});
+	my $unknown_rows = root_rows($unknown);
+	sql(qq{UPDATE t SET b = 'after' WHERE a = 77});
+	sql(q{SELECT * FROM test_bmap_sweep()});
+	counts_exact('with a root to be let go of by an unknown owner');
+	sql(qq{SELECT test_bmap_root_release($unknown)});
+	sql(q{SELECT injection_points_attach('bmap-owner-unknown', 'notice')});
+	is(sql(q{SELECT freed FROM test_bmap_release_drain()}), '0',
+		'a drain of entries of an unknown owner frees nothing');
+	is(sql(q{SELECT test_bmap_release_pending()}), '0',
+		'and discards them');
+	sql(q{SELECT injection_points_detach('bmap-owner-unknown')});
+	is(sql(q{SELECT whole FROM test_bmap_root_counts()}), 'f',
+		"the roots' counts are then not whole");
+	cmp_ok(sql(q{SELECT freed FROM test_bmap_sweep()}), '>', 0,
+		'a sweep counting every root anew frees what only that root held');
+	counts_exact('after it');
+	is(root_rows($roots[0]), $first_rows, 'and a root kept reads as it did');
+
+	# Again, with a crash between that record and the step's.
+	$unknown = sql(qq{UPDATE t SET b = 'unknown again' WHERE a = 78;
+		SELECT test_bmap_root_capture($t)});
+	sql(qq{UPDATE t SET b = 'after' WHERE a = 78});
+	sql(q{SELECT * FROM test_bmap_sweep()});
+	sql(qq{SELECT test_bmap_root_release($unknown)});
+	sql('CHECKPOINT');
+	$s = $node->background_psql('postgres', on_error_stop => 0);
+	$s->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('bmap-owner-unknown', 'notice');
+		SELECT injection_points_attach('bmap-release-step', 'wait')});
+	$s->query_until(qr/draining/, q{
+		\echo draining
+		SELECT * FROM test_bmap_release_drain();
+	});
+	$node->wait_for_event('client backend', 'bmap-release-step');
+	sql(q{CREATE TABLE wal_flushed_again (a int)});
+	$node->stop('immediate');
+	eval { $s->quit };
+	$node->start;
+	is(sql(q{SELECT whole FROM test_bmap_root_counts()}), 'f',
+		"a crash after an unknown owner's entries were met leaves the counts not whole");
+	cmp_ok(sql(q{SELECT test_bmap_release_pending()}), '>', 0,
+		'and the entries queued');
+	sql(q{SELECT * FROM test_bmap_release_drain()});
+	sql(q{SELECT * FROM test_bmap_sweep()});
+	counts_exact('after a drain and a sweep');
+	is(sql(q{SELECT freed FROM test_bmap_sweep()}), '0',
+		'a sweep after them finds nothing more');
+	is(root_rows($roots[0]), $first_rows, 'and a root kept reads as it did');
 }
 
 $node->stop;
