@@ -1,0 +1,19 @@
+#-------------------------------------------------------------------------
+#
+# Makefile--
+#    Makefile for src/backend/prolly, the version-control engine's code
+#    compiled into the server
+#
+# IDENTIFICATION
+#    src/backend/prolly/Makefile
+#
+#-------------------------------------------------------------------------
+
+subdir = src/backend/prolly
+top_builddir = ../../..
+include $(top_builddir)/src/Makefile.global
+
+OBJS = \
+	registry.o
+
+include $(top_srcdir)/src/backend/common.mk
