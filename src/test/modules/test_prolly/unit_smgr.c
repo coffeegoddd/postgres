@@ -54,6 +54,7 @@ md_pages_are_its_own(void)
 	CHECK(!smgrpreparesforchanges(srel, MAIN_FORKNUM));
 	CHECK(!smgrpageisshared(srel, MAIN_FORKNUM, 0, &copies));
 	CHECK(!copies);
+	CHECK(!smgrpagesharedelsewhere(srel, MAIN_FORKNUM, 0));
 	CHECK(!smgrreplacesblocks(srel, MAIN_FORKNUM));
 	CHECK(!smgrreplacedafter(srel, MAIN_FORKNUM, 0, GetXLogInsertRecPtr()));
 	CHECK(!smgrcanshare(srel));

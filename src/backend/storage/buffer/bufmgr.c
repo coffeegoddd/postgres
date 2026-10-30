@@ -2833,9 +2833,11 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 	/*
 	 * Before anything is taken for the extension, its storage manager may
-	 * make room for the blocks (reading and changing storage of its own):
-	 * no extension lock is held yet, nor any other, as nobody takes the
-	 * extension lock while holding another lock.
+	 * make room for the blocks (reading and changing storage of its own).
+	 * The relation's extension lock isn't held yet, though the caller may
+	 * hold one of the relation's pages locked (a B-tree split holds the
+	 * page it splits): the storage manager must lock only pages of its own
+	 * that no backend waits for while holding a relation's page.
 	 */
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
 		smgrbeforeextend(BMR_GET_SMGR(bmr), fork, extend_by);
