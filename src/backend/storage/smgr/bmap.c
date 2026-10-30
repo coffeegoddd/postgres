@@ -11915,8 +11915,10 @@ bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
  * after each step.  A step pops up to a record's worth
  * of entries, so the last may go past the limit by that much.  Then each
  * store whose sweep is due (bmap_sweep_due()) is swept.  A sweep drains its
- * queue in full first, whatever the limit, but one is due rarely: once after
- * the server starts, and after a count it could fix has lost a holder.
+ * queue in full first, whatever the limit, and isn't paced, as it holds off
+ * shares and the reuse of freed blocks while it runs; but one is due rarely:
+ * once after the server starts, and after a count it could fix has lost a
+ * holder.
  */
 void
 bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
