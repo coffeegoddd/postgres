@@ -30,12 +30,32 @@ sub check_orphan_relfilenodes
 	   SELECT pg_relation_filepath(oid) FROM pg_class
 	   WHERE reltablespace = 0 AND relpersistence <> 't' AND
 	   pg_relation_filepath(oid) IS NOT NULL;");
+	my @referenced = split /\n/, $filepaths_referenced;
+	my $has_bmap = 0;
+	foreach my $path (@referenced)
+	{
+		if (-f $node->data_dir . "/${path}_bmap")
+		{
+			$path .= '_bmap';
+			$has_bmap = 1;
+		}
+	}
+	# A mapped relation's map replaces its main file.  The database also
+	# owns a shared allocator, page store and reference counts, and, once
+	# used, a release queue and captured roots (storage/bmap_files.h).
+	# Keep checking both missing and unreferenced relation/map files.
+	if ($has_bmap)
+	{
+		push @referenced, "${prefix}9419", "${prefix}9420", "${prefix}9421";
+		push @referenced, grep { -f $node->data_dir . "/$_" }
+		  ("${prefix}9441", "${prefix}9442");
+	}
 	is_deeply(
 		[
 			sort(map { "$prefix$_" }
-				  grep(/^[0-9]+$/, slurp_dir($node->data_dir . "/$prefix")))
+				  grep(/^[0-9]+(?:_bmap)?$/, slurp_dir($node->data_dir . "/$prefix")))
 		],
-		[ sort split /\n/, $filepaths_referenced ],
+		[ sort @referenced ],
 		$test_name);
 	return;
 }
