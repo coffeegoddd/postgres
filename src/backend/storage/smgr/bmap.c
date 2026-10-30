@@ -5318,7 +5318,11 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	MarkBufferDirty(dheader);
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogRegisterBuffer(0, sheader, REGBUF_STANDARD);
+	/*
+	 * (the delta kept with an image too: redo finds the source's own blocks
+	 * from its length and epoch, and without them writes out every buffer)
+	 */
+	XLogRegisterBuffer(0, sheader, REGBUF_STANDARD | REGBUF_KEEP_DATA);
 	XLogRegisterBufData(0, &sdelta, sizeof(sdelta));
 	XLogRegisterBuffer(1, dheader, REGBUF_STANDARD);
 	XLogRegisterBufData(1, &ddelta, sizeof(ddelta));
