@@ -156,21 +156,11 @@ sub none_changed_shared
 	}
 }
 
-# Maintenance on the source alone while all is shared: GIN's pending list
-# cleaned, BRIN ranges summarized and one desummarized.
-sql(q{
-	INSERT INTO t SELECT g, point(0, 0), point(0, 0), ARRAY[7, 3], 'p'
-		FROM generate_series(30001, 30200) g;
-	SELECT gin_clean_pending_list('t_gin');
-	SELECT brin_summarize_new_values('t_brin');
-	SELECT brin_desummarize_range('t_brin', 0);
-});
-
 # Each side writes its own rows: inserts that split pages (and fill GIN's
 # pending list), updates that move rows, deletes.
 sql(q{
 	INSERT INTO t SELECT g, point(g % 1000, g / 20), point(g / 20, g % 1000),
-		ARRAY[g % 50, 7, 3], 't' FROM generate_series(20001, 29999) g;
+		ARRAY[g % 50, 7, 3], 't' FROM generate_series(20001, 30000) g;
 	UPDATE t SET p = point(150, 150), q = point(150, 150), arr = arr || 3
 		WHERE a % 97 = 0;
 	DELETE FROM t WHERE a % 13 = 0;
@@ -207,6 +197,17 @@ none_changed_shared('written on both sides');
 $primary->safe_psql('postgres', q{VACUUM t; VACUUM c});
 check_all($primary, 'after VACUUM', %after);
 none_changed_shared('after VACUUM');
+
+# Index maintenance on the copy alone, after VACUUM (which summarizes into
+# the revmap pages both still share): GIN's pending list cleaned, BRIN
+# ranges summarized and one desummarized.  No row changes.
+sql(q{
+	SELECT gin_clean_pending_list('c_gin');
+	SELECT brin_summarize_new_values('c_brin');
+	SELECT brin_desummarize_range('c_brin', 0);
+});
+check_all($primary, 'after maintenance of the copy', %after);
+none_changed_shared('after maintenance of the copy');
 
 $primary->wait_for_replay_catchup($standby);
 check_all($standby, 'on the standby', %after);
