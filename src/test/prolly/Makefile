@@ -40,8 +40,9 @@ include $(top_builddir)/src/Makefile.global
 PROLLY_AM ?= heap
 export PROLLY_AM
 
-# extensions the branched catalogs' tests install on branches
-EXTRA_INSTALL = contrib/hstore contrib/pg_trgm
+# extensions the branched catalogs' tests install on branches, and the
+# output plugin their decoding test reads changes with
+EXTRA_INSTALL = contrib/hstore contrib/pg_trgm contrib/test_decoding
 
 AM_CONF = $(abs_top_srcdir)/$(subdir)/am/$(PROLLY_AM).conf
 ifeq ($(wildcard $(AM_CONF)),)

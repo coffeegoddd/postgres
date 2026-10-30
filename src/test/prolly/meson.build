@@ -38,6 +38,7 @@ tests += {
     'tests': [
       't/200_branch_schema_names.pl',
       't/201_branch_sessions.pl',
+      't/202_branch_decoding.pl',
     ],
   },
 }

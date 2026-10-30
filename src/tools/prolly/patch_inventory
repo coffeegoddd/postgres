@@ -84,6 +84,7 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
+patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
 patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed
 patch src/backend/replication/walreceiver.c  1a  reports in each status reply where a recovery of the standby may begin and whether a backup runs on it, for the block map's standby hold
 patch src/backend/replication/walsender.c  1a  keeps each standby's reported hold, in its physical slot too, and publishes the earliest to the block map (WalSndComputeRecoveryHold), capped by block_map_standby_hold_max_size

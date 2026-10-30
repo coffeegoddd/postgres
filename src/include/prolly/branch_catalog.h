@@ -34,6 +34,7 @@
 #define PROLLY_BRANCH_CATALOG_H
 
 #include "access/htup.h"
+#include "utils/relcache.h"
 
 /* The branch whose catalog rows this session sees (0: none). */
 extern PGDLLIMPORT int catalog_branch;
@@ -97,6 +98,13 @@ extern int32 VersionedNamespaceBranch(const char *nspname);
  * between branches.
  */
 extern Oid	ExtensionOidByName(const char *extname);
+
+/*
+ * Whether logical decoding in this session leaves out changes to rel:
+ * on a branch, another branch's tables are left out; on no branch,
+ * nothing is.
+ */
+extern bool CatalogBranchSkipsRelation(Relation rel);
 extern void ExtensionCheckNameFree(const char *extname, Oid nspid);
 extern void ExtensionCheckMove(const char *extname, Oid oldnspid, Oid newnspid);
 
