@@ -501,7 +501,7 @@ get_rel_infos_query(void)
 					  "      c.oid >= %u::pg_catalog.oid) OR "
 					  "     (n.nspname = 'pg_catalog' AND "
 					  "      relname IN ('pg_largeobject'%s) ))), ",
-					  (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
+					  TRANSFER_SEQUENCES() ?
 					  ", " CppAsString2(RELKIND_SEQUENCE) : "",
 					  FirstNormalObjectId,
 					  (GET_MAJOR_VERSION(old_cluster.major_version) >= 1600) ?

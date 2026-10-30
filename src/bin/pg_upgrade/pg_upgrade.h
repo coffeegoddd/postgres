@@ -357,6 +357,19 @@ extern LogOpts log_opts;
 extern UserOpts user_opts;
 extern ClusterInfo old_cluster,
 			new_cluster;
+
+/*
+ * Whether sequences' files are transferred, as tables' are, rather than
+ * their values dumped and set in the new cluster: with --swap, which moves
+ * the old cluster's files, and from a cluster of version 20 or later, whose
+ * sequences may be block-mapped.  A block-mapped sequence's pages are in
+ * its database's page store, which is transferred whole over the store the
+ * new cluster made; a sequence the new cluster made and set there would be
+ * left naming blocks of a store that is gone.
+ */
+#define TRANSFER_SEQUENCES() \
+	(user_opts.transfer_mode == TRANSFER_MODE_SWAP || \
+	 GET_MAJOR_VERSION(old_cluster.major_version) >= 2000)
 extern OSInfo os_info;
 
 
