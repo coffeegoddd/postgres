@@ -2048,7 +2048,8 @@ do_autovacuum(void)
 	}
 	else
 	{
-		default_freeze_min_age = vacuum_freeze_min_age;
+		/* (vacuum's default for the table: vacuum_get_cutoffs()) */
+		default_freeze_min_age = -1;
 		default_freeze_table_age = vacuum_freeze_table_age;
 		default_multixact_freeze_min_age = vacuum_multixact_freeze_min_age;
 		default_multixact_freeze_table_age = vacuum_multixact_freeze_table_age;
