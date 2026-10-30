@@ -5,3 +5,4 @@ test: branch_schemas
 test: branch_functions
 test: branch_catalogs
 test: branch_shared_catalogs
+test: branch_extensions

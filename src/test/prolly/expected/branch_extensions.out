@@ -1,0 +1,120 @@
+-- Extensions are shared or a branch's, never both: one in a shared schema
+-- serves every branch, and otherwise each branch may have its own copy of
+-- an extension's SQL objects, at its own version.
+SELECT pg_branch_id_allocate() AS b1 \gset
+SELECT pg_branch_id_allocate() AS b2 \gset
+CREATE SCHEMA pub;
+SET catalog_branch = :b1;
+CREATE SCHEMA app VERSIONED;
+SET catalog_branch = :b2;
+CREATE SCHEMA app VERSIONED;
+-- a shared extension serves both branches
+SET catalog_branch = :b1;
+CREATE EXTENSION hstore SCHEMA pub;
+SET catalog_branch = :b2;
+SELECT ('a=>1'::pub.hstore) OPERATOR(pub.->) 'a' AS from_b2;
+ from_b2 
+---------
+ 1
+(1 row)
+
+SELECT count(*) FROM pg_extension WHERE extname = 'hstore';
+ count 
+-------
+     1
+(1 row)
+
+-- and no branch may have its own beside it
+CREATE EXTENSION hstore SCHEMA app;
+ERROR:  extension "hstore" already exists
+SET catalog_branch = :b1;
+DROP EXTENSION hstore;
+-- each branch its own, at its own version
+CREATE EXTENSION pg_trgm VERSION '1.6' SCHEMA app;
+SET catalog_branch = :b2;
+CREATE EXTENSION pg_trgm VERSION '1.5' SCHEMA app;
+SELECT extversion, extnamespace = 'app'::regnamespace AS in_app
+FROM pg_extension WHERE extname = 'pg_trgm';
+ extversion | in_app 
+------------+--------
+ 1.5        | t
+(1 row)
+
+SELECT round(app.similarity('abc', 'abd')::numeric, 2) AS b2_similarity;
+ b2_similarity 
+---------------
+          0.33
+(1 row)
+
+SET catalog_branch = :b1;
+SELECT extversion, extnamespace = 'app'::regnamespace AS in_app
+FROM pg_extension WHERE extname = 'pg_trgm';
+ extversion | in_app 
+------------+--------
+ 1.6        | t
+(1 row)
+
+SELECT round(app.similarity('abc', 'abd')::numeric, 2) AS b1_similarity;
+ b1_similarity 
+---------------
+          0.33
+(1 row)
+
+SELECT count(*) AS b1_functions FROM pg_proc WHERE proname = 'similarity';
+ b1_functions 
+--------------
+            1
+(1 row)
+
+-- a branch updates its own
+SET catalog_branch = :b2;
+ALTER EXTENSION pg_trgm UPDATE TO '1.6';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm';
+ extversion 
+------------
+ 1.6
+(1 row)
+
+-- a shared one is refused while a branch has its own, and a session on no
+-- branch sees neither branch's
+RESET catalog_branch;
+CREATE EXTENSION pg_trgm SCHEMA pub;
+ERROR:  extension "pg_trgm" already exists
+DETAIL:  A branch has its own copy of the extension; a shared one cannot be made beside it.
+SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm';
+ count 
+-------
+     0
+(1 row)
+
+-- an extension does not move between kinds of schema
+SET catalog_branch = :b2;
+ALTER EXTENSION pg_trgm SET SCHEMA pub;
+ERROR:  cannot move extension "pg_trgm" between a versioned schema and another kind or branch of schema
+-- dropping one branch's leaves the other's
+DROP EXTENSION pg_trgm;
+SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm';
+ count 
+-------
+     0
+(1 row)
+
+SET catalog_branch = :b1;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm';
+ extversion 
+------------
+ 1.6
+(1 row)
+
+SELECT round(app.similarity('abc', 'abd')::numeric, 2) AS b1_similarity;
+ b1_similarity 
+---------------
+          0.33
+(1 row)
+
+DROP EXTENSION pg_trgm;
+DROP SCHEMA app;
+SET catalog_branch = :b2;
+DROP SCHEMA app;
+RESET catalog_branch;
+DROP SCHEMA pub;

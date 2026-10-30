@@ -57,6 +57,7 @@
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "nodes/queryjumble.h"
+#include "prolly/branch_catalog.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -230,8 +231,8 @@ get_extension_oid(const char *extname, bool missing_ok)
 {
 	Oid			result;
 
-	result = GetSysCacheOid1(EXTENSIONNAME, Anum_pg_extension_oid,
-							 CStringGetDatum(extname));
+	/* a shared extension, or the session's branch's */
+	result = ExtensionOidByName(extname);
 
 	if (!OidIsValid(result) && !missing_ok)
 		ereport(ERROR,
@@ -2259,6 +2260,9 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	ObjectAddresses *refobjs;
 	ListCell   *lc;
 
+	/* an extension is shared or a branch's, never both */
+	ExtensionCheckNameFree(extName, schemaOid);
+
 	/*
 	 * Build and insert the pg_extension tuple
 	 */
@@ -3276,6 +3280,10 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 
 	nspOid = LookupCreationNamespace(newschema);
 
+	/* a shared extension stays shared, and a branch's on its branch */
+	ExtensionCheckMove(extensionName, get_extension_schema(extensionOid),
+					   nspOid);
+
 	/*
 	 * Permission check: must own extension.  Note that we don't bother to
 	 * check ownership of the individual member objects ...
@@ -3501,12 +3509,13 @@ ExecAlterExtensionStmt(ParseState *pstate, AlterExtensionStmt *stmt)
 	 */
 	extRel = table_open(ExtensionRelationId, AccessShareLock);
 
+	/* (the one this session sees: shared, or its branch's) */
 	ScanKeyInit(&key[0],
-				Anum_pg_extension_extname,
-				BTEqualStrategyNumber, F_NAMEEQ,
-				CStringGetDatum(stmt->extname));
+				Anum_pg_extension_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(get_extension_oid(stmt->extname, true)));
 
-	extScan = systable_beginscan(extRel, ExtensionNameIndexId, true,
+	extScan = systable_beginscan(extRel, ExtensionOidIndexId, true,
 								 NULL, 1, key);
 
 	extTup = systable_getnext(extScan);

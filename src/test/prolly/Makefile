@@ -40,6 +40,9 @@ include $(top_builddir)/src/Makefile.global
 PROLLY_AM ?= heap
 export PROLLY_AM
 
+# extensions the branched catalogs' tests install on branches
+EXTRA_INSTALL = contrib/hstore contrib/pg_trgm
+
 AM_CONF = $(abs_top_srcdir)/$(subdir)/am/$(PROLLY_AM).conf
 ifeq ($(wildcard $(AM_CONF)),)
 $(error there are no settings for table access method "$(PROLLY_AM)": $(AM_CONF) does not exist)

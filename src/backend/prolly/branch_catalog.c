@@ -44,6 +44,7 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "commands/sequence.h"
@@ -263,6 +264,86 @@ VersionedNamespaceBranch(const char *nspname)
 				 errmsg("branch %d has not been allocated", catalog_branch),
 				 errhint("Allocate a branch with pg_branch_id_allocate().")));
 	return catalog_branch;
+}
+
+/*
+ * Extensions.  pg_extension's name index is (extname, extnamespace), so an
+ * extension name can have one row per branch; the rows of one name are
+ * adjacent in it, and there are only as many as there are branches with
+ * their own copy.
+ */
+typedef enum ExtensionMatch
+{
+	EXT_VISIBLE,				/* shared, or on the session's branch */
+	EXT_CONFLICTS,				/* would conflict with one on branch */
+} ExtensionMatch;
+
+static Oid
+find_extension(const char *extname, ExtensionMatch match, int32 branch)
+{
+	Relation	rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			result = InvalidOid;
+
+	rel = table_open(ExtensionRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_extension_extname, BTEqualStrategyNumber,
+				F_NAMEEQ, CStringGetDatum(extname));
+	scan = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_extension e = (Form_pg_extension) GETSTRUCT(tup);
+		int32		b = NamespaceBranch(e->extnamespace);
+		bool		hit;
+
+		if (match == EXT_VISIBLE)
+			hit = b == 0 || b == catalog_branch;
+		else
+			hit = branch == 0 || b == 0 || b == branch;
+		if (hit)
+		{
+			result = e->oid;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return result;
+}
+
+Oid
+ExtensionOidByName(const char *extname)
+{
+	return find_extension(extname, EXT_VISIBLE, 0);
+}
+
+void
+ExtensionCheckNameFree(const char *extname, Oid nspid)
+{
+	int32		branch = NamespaceBranch(nspid);
+	uint32		h = hash_bytes((const unsigned char *) extname, strlen(extname));
+
+	/* (see lock_namespace_name) */
+	LockDatabaseObject(ExtensionRelationId, (Oid) h, 1, ExclusiveLock);
+
+	if (OidIsValid(find_extension(extname, EXT_CONFLICTS, branch)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("extension \"%s\" already exists", extname),
+				 branch == 0 ?
+				 errdetail("A branch has its own copy of the extension; a shared one cannot be made beside it.") :
+				 errdetail("The extension is shared, or this branch already has it.")));
+}
+
+void
+ExtensionCheckMove(const char *extname, Oid oldnspid, Oid newnspid)
+{
+	if (NamespaceBranch(oldnspid) != NamespaceBranch(newnspid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move extension \"%s\" between a versioned schema and another kind or branch of schema",
+						extname)));
 }
 
 /*

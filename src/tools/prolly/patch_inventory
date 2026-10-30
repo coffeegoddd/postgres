@@ -74,6 +74,7 @@ patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act o
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
+patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
 patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
 patch src/backend/commands/publicationcmds.c  1b  ALTER PUBLICATION ... SET leaves another branch's tables and schemas
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
@@ -134,6 +135,7 @@ patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks g
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
+patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
 patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate()
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator

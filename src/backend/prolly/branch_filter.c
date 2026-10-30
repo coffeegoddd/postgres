@@ -723,6 +723,8 @@ static const struct
 	TypeRelationId, Anum_pg_cast_castsource},
 	{TransformRelationId, TransformOidIndexId, Anum_pg_transform_oid,
 	TypeRelationId, Anum_pg_transform_trftype},
+	{ExtensionRelationId, ExtensionOidIndexId, Anum_pg_extension_oid,
+	NamespaceRelationId, Anum_pg_extension_extnamespace},
 	{PublicationRelRelationId, PublicationRelObjectIndexId, Anum_pg_publication_rel_oid,
 	RelationRelationId, Anum_pg_publication_rel_prrelid},
 	{PublicationNamespaceRelationId, PublicationNamespaceObjectIndexId,
