@@ -105,6 +105,24 @@ SELECT test_bmap_diff_reads(:big, :big_share) AS big_reads \gset
 SELECT test_bmap_diff_reads(:t, :small_share) AS small_reads \gset
 SELECT :big_reads <= :small_reads + 2 AS reads_flat_in_size;
 
+-- Maps whose trees differ in height: the small table's has one level, the
+-- big one's a second subtree a level deeper, which the small one has none
+-- of.  Every block differs (the tables hold no page in common), in either
+-- order; and a share of the big table cut to fewer blocks than a leaf maps
+-- differs from it in every block past its length.
+SELECT diff_of(:t, :big) = diff_by_entries(:t, :big) AS heights_agree,
+	diff_of(:big, :t) = diff_by_entries(:big, :t) AS heights_agree_reversed,
+	(SELECT count(*) FROM test_bmap_diff(:t, :big)) =
+		pg_relation_size('big_t') / current_setting('block_size')::int
+	AS heights_every_block;
+SELECT test_bmap_share(:big) AS big_cut \gset
+SELECT test_bmap_truncate(:big_cut, 100, true);
+SELECT diff_of(:big, :big_cut) = array(SELECT generate_series(100,
+	pg_relation_size('big_t') / current_setting('block_size')::int - 1)::int8)
+	AS cut_past_its_length,
+	diff_of(:big_cut, :big) = diff_by_entries(:big_cut, :big) AS cut_agrees;
+SELECT test_bmap_unlink(:big_cut);
+
 SELECT test_bmap_unlink(:big_share);
 SELECT test_bmap_unlink(:small_share);
 BEGIN;
