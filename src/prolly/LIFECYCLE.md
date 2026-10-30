@@ -1444,6 +1444,26 @@ would take 2–3.3 s), its crossover learned at about 6–9 commits.  A few
 choices were its exploration: two restores at 4 back, one replay at 19,
 one slow restore of 4.1 s.
 
+**Under each wal_compression** (the same run repeated, 2026-10-30; medians
+in ms of the checkouts in each band of distance):
+
+| Commits back | off: replay / restore | pglz | lz4 | zstd |
+|---|---|---|---|---|
+| 1–3 | 694 / 1,403 | 727 / 2,313 | 634 / 1,248 | 637 / 1,367 |
+| 4–9 | 934 / 1,589 | 949 / 2,840 | 789 / 1,354 | 808 / 1,506 |
+| 10–19 | 2,130 / 1,495 | 1,701 / 2,662 | 1,787 / 1,311 | 2,008 / 1,375 |
+| 20–29 | 2,446 / 1,553 | 2,214 / 2,938 | 2,417 / 1,447 | 2,293 / 1,521 |
+| 30+ | 3,569 / 1,706 | 3,035 / 3,029 | 2,985 / 1,485 | 3,240 / 1,655 |
+| Server writing the pages, mean | 372 | 1,668 | 239 | 457 |
+
+- Replay barely depends on the setting; restore does, because it logs
+  every page whole.
+- Under lz4, off and zstd, restore wins from about 10 commits back, by
+  about 2× at 30 and more.
+- Under pglz, restore is about 7× slower to write and never wins within
+  38 commits: keyframes need lz4 (or zstd), and the planner's costs must
+  be kept per setting.
+
 **What this shows and what it doesn't.**  The prototype's keyframes, without
 freezing, beat replay past a crossover, and the planner finds it.  It does
 not measure frozen keyframes, keyframes taken in the background, or the
