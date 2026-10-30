@@ -808,6 +808,14 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 	if (!OidIsValid(objid) || depth > 4)
 		return 0;
 
+	/*
+	 * Objects initdb made are shared, and need no reading (nor could the
+	 * TOAST tables of the catalogs be found an owner: pinned objects have no
+	 * dependencies recorded)
+	 */
+	if (objid < FirstNormalObjectId)
+		return 0;
+
 	key = map_key(classid, objid);
 	e = hash_search(map_table(), &key, HASH_FIND, NULL);
 	if (e == NULL || e->objid != objid)
