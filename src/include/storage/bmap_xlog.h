@@ -42,7 +42,8 @@
  *						source's page image, main data its physical BlockNumber;
  *						redo restores both the source buffer and that store block
  * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
- *						(its epoch raised), block 1 the copy's (its length)
+ *						(its epoch raised), block 1 the copy's (its length);
+ *						PRESERVE records may follow it
  * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
  *						leaf whose entries change (BMAP_UNREF_MAP); or a
  *						sweep's roots' counts (BMAP_UNREF_ROOTS)
@@ -80,18 +81,26 @@ typedef struct xl_bmap_rel
 
 /*
  * SHARE's and SHARED's main data: the relation shared and its copy.  With
- * BMAP_PRESERVE_LOGGED (SHARED), the source's own blocks were logged as
- * PRESERVE images before the record, whose redo wrote them to their
- * blocks: redo of the share syncs nothing (it writes the source's buffers
- * out, for a page changed in place after its image).
+ * BMAP_PRESERVE_LOGGED (SHARED), the source's own blocks given theirs
+ * since the redo pointer of the checkpoint last completed as the share
+ * began were logged as PRESERVE images before the record, whose redo
+ * wrote them to their blocks; with BMAP_SHARE_SYNCED, the others, the
+ * newest of which got its block at 'synced_since', were written out and
+ * synced by the share after the record instead (and maybe logged as
+ * PRESERVE images after it, if a backup began meanwhile).  Redo of the
+ * share writes the source's buffers out and, with BMAP_SHARE_SYNCED,
+ * syncs the page store and makes sure no later recovery of this server
+ * begins at or before 'synced_since'.
  */
 #define BMAP_PRESERVE_LOGGED	0x01
+#define BMAP_SHARE_SYNCED		0x02
 
 typedef struct xl_bmap_share
 {
 	RelFileLocator src;
 	RelFileLocator dst;
 	uint8		flags;
+	XLogRecPtr	synced_since;
 } xl_bmap_share;
 
 /*

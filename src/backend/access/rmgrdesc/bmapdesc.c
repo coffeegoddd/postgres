@@ -55,6 +55,9 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->src.relNumber, xlrec->dst.relNumber,
 								 (xlrec->flags & BMAP_PRESERVE_LOGGED) ?
 								 " (images logged)" : "");
+				if (xlrec->flags & BMAP_SHARE_SYNCED)
+					appendStringInfo(buf, "; synced since %X/%08X",
+									 LSN_FORMAT_ARGS(xlrec->synced_since));
 				break;
 			}
 		case XLOG_BMAP_PRESERVE:
