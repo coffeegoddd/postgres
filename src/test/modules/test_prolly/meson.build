@@ -55,6 +55,7 @@ tests += {
       't/009_bmap_evictions.pl',
       't/010_bmap_evict_lock.pl',
       't/011_bmap_relfilenumber_reuse.pl',
+      't/019_bmap_share_maps_minimal.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
