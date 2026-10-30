@@ -57,7 +57,7 @@ patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL de
 patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
 patch src/backend/access/transam/twophase.c  1a  says whether a transaction is prepared or being prepared (TwoPhaseTransactionIsKnown), so its block-mapped storage isn't taken for an orphan
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
-patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start; tells the block map where recovery ended (bmap_recovery_done)
+patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start; tells the block map where recovery ended (bmap_recovery_done); says where a recovery of this server may begin, an online backup running on it included (GetRecoveryHold)
 patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check of a block whose storage was replaced after the record
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
 patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers
@@ -77,6 +77,9 @@ patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pa
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
+patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed
+patch src/backend/replication/walreceiver.c  1a  reports in each status reply where a recovery of the standby may begin and whether a backup runs on it, for the block map's standby hold
+patch src/backend/replication/walsender.c  1a  keeps each standby's reported hold, in its physical slot too, and publishes the earliest to the block map (WalSndComputeRecoveryHold), capped by block_map_standby_hold_max_size
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
 patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change, never in a critical section; storage manager hooks before an asynchronous read and before extension; blocks the storage manager has no storage for read as zeroes without I/O; single-block lookups, flushes and drops
 patch src/backend/storage/lmgr/lock.c  1a  LockHasWaiters() handles a lock taken by the fast path, which a page store compaction checks
@@ -92,9 +95,9 @@ patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
-patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass and block_map_replay_entries
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
@@ -111,7 +114,7 @@ patch src/include/Makefile     0  installs the engine's headers in src/include/p
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
-patch src/include/access/xlog.h  1a  declares GetBackupState, XLogNoteSyncedPages and XLogNoteSyncedReplay
+patch src/include/access/xlog.h  1a  declares GetBackupState, GetRecoveryHold, XLogNoteSyncedPages and XLogNoteSyncedReplay
 patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view
@@ -124,6 +127,9 @@ patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped
 patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
+patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold
+patch src/include/replication/walsender.h  1a  declares WalSndComputeRecoveryHold
+patch src/include/replication/walsender_private.h  1a  WalSnd keeps the standby's reported hold and whether a backup runs on it
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/lwlocklist.h  1a  the block map's replay lock is a built-in tranche, so it takes no slot extensions may use

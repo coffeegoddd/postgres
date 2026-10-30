@@ -22,6 +22,7 @@ $primary->init(allows_streaming => 1);
 $primary->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
 block_map_copy_images = off  # copies without an image, as tested here
+block_map_standby_hold_max_size = 0  # no standby hold: the fallbacks, as tested here
 autovacuum = off
 checkpoint_timeout = 1h
 max_wal_size = 1GB

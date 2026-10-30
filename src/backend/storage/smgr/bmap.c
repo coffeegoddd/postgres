@@ -150,6 +150,28 @@
  * that finds the page's position passed clears its bits.  What this costs: a
  * copy where a claim would do, and blocks held, until the next checkpoint.
  *
+ * The standby hold.  A standby's recovery may begin before the primary's
+ * checkpoint: at its restart point, which lags, or at the start of an
+ * online backup taken on it.  Each standby reports where (GetRecoveryHold(),
+ * the earliest of its own and of the standbys it serves) and whether a
+ * backup runs on it, in its status replies; its physical slot keeps the
+ * position while it is away, and across a restart of this server
+ * (WalSndComputeRecoveryHold(), which publishes the earliest over the
+ * standbys connected and the slots kept: bmap_set_standby_hold()).  The
+ * copies' horizon is then the earliest of this server's restart point and
+ * that (copy_horizon()): a block copied from without an image after it is
+ * kept as it is, as above, until every standby known is past the copy, so
+ * no PASSED record's redo needs a restartpoint of a standby known; and a
+ * share syncs only the blocks its source got before it, so neither does a
+ * share's.  While a backup runs on a standby, copies and shares log the
+ * images they would leave out (backup_state()), as for one of this
+ * server's, so its replay relies on nothing synced and the backup stops as
+ * a good one.  A hold more than block_map_standby_hold_max_size of WAL
+ * behind is let go of, as a slot past max_slot_wal_keep_size is; then, and
+ * for a standby nobody knows of (one reading WAL from an archive), and for
+ * what was copied before a report arrived, the restartpoints and the
+ * backup's failure above remain, failing safe.
+ *
  * Recovery reads map pages that can be from different moments: one written
  * after the point redo has reached, another not yet written.  A version
  * older than the record being replayed gives it the block it was made for.
@@ -329,6 +351,7 @@
 bool		debug_block_mapped_heap = false;
 int			block_map_replay_entries = 65536;
 bool		block_map_copy_images = true;
+int			block_map_standby_hold_max_size = -1;
 
 /* ----------------------------------------------------------------
  * Page layouts
@@ -804,6 +827,14 @@ typedef struct BmapShared
 	 * passed (see "Copies without an image")
 	 */
 	pg_atomic_uint64 copies_passed;
+
+	/*
+	 * The standby hold (see "The standby hold"): the earliest position a
+	 * recovery of a standby this server knows of may begin at (0: none),
+	 * and whether one runs an online backup.
+	 */
+	pg_atomic_uint64 standby_hold;
+	pg_atomic_uint32 standby_backups;
 	pg_atomic_uint64 run_since_xid;	/* the first transaction since recovery ended */
 
 	/* the remaps ahead of replay (bmap_ahead), and how many there are */
@@ -908,6 +939,8 @@ BmapShmemInit(void *arg)
 	LWLockInitialize(&bmap_shared->ahead_lock, LWTRANCHE_BMAP_REPLAY_AHEAD);
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
 	pg_atomic_init_u64(&bmap_shared->copies_passed, 0);
+	pg_atomic_init_u64(&bmap_shared->standby_hold, InvalidXLogRecPtr);
+	pg_atomic_init_u32(&bmap_shared->standby_backups, 0);
 	pg_atomic_init_u64(&bmap_shared->run_since_xid, 0);
 	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
 	for (int i = 0; i < MaxBackends; i++)
@@ -1226,6 +1259,7 @@ static void store_flush_begin(RelFileLocator rel);
 static void store_flush_end(RelFileLocator rel, bool given_up);
 static bool store_written_out(RelFileLocator rel);
 static XLogRecPtr last_checkpoint_redo(void);
+static XLogRecPtr copy_horizon(void);
 static XLogRecPtr queue_push(RelFileLocator rel, const BmapQueued *items,
 							 uint32 n);
 
@@ -1571,7 +1605,7 @@ copies_passed(XLogRecPtr passed)
 	if (XLogRecPtrIsInvalid(passed) ||
 		passed <= pg_atomic_read_u64(&bmap_shared->copies_passed))
 		return;
-	xlrec.horizon = last_checkpoint_redo();
+	xlrec.horizon = Max(copy_horizon(), passed);
 	xlrec.copied = passed;
 	Assert(passed <= xlrec.horizon);
 	XLogBeginInsert();
@@ -2815,7 +2849,7 @@ lookup_copy_holds(RelFileLocator rel, BlockNumber phys)
 	buf = refs_read(rel, REF_PAGE(phys));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
-	holds = page_copy_holds(BufferGetPage(buf), phys, last_checkpoint_redo(),
+	holds = page_copy_holds(BufferGetPage(buf), phys, copy_horizon(),
 							&passed);
 	UnlockReleaseBuffer(buf);
 	return holds;
@@ -4392,7 +4426,7 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 
 	/* those a copy holds, first (on pages of counts read one at a time) */
 	{
-		XLogRecPtr	horizon = last_checkpoint_redo();
+		XLogRecPtr	horizon = copy_horizon();
 		XLogRecPtr	passed = InvalidXLogRecPtr;
 		BlockNumber nrefpages = refs_nblocks(rel);
 		Buffer		buf = InvalidBuffer;
@@ -5064,7 +5098,7 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 	uint32		nfree = 0;
 	BlockNumber nrefpages;
 	uint32		i = 0;
-	XLogRecPtr	horizon = last_checkpoint_redo();
+	XLogRecPtr	horizon = copy_horizon();
 	XLogRecPtr	passed = InvalidXLogRecPtr;
 
 	Assert(to - from <= BMAP_PIECE);
@@ -6383,6 +6417,63 @@ last_checkpoint_redo(void)
 }
 
 /*
+ * Where a recovery that reads blocks copied without an image may begin, at
+ * the earliest: this server's own (last_checkpoint_redo()), or, on a
+ * primary, a standby's it knows of (the standby hold), if earlier.  A block
+ * copied from without an image after it is kept as it is.
+ */
+static XLogRecPtr
+copy_horizon(void)
+{
+	XLogRecPtr	redo = last_checkpoint_redo();
+	XLogRecPtr	hold = pg_atomic_read_u64(&bmap_shared->standby_hold);
+
+	if (XLogRecPtrIsValid(hold) && hold < redo && !RecoveryInProgress())
+		return hold;
+	return redo;
+}
+
+/*
+ * The online backups running (GetBackupState()), and one more if a standby
+ * this server knows of runs one: a copy or a share then logs the images it
+ * would leave out, as for one of this server's.
+ */
+static void
+backup_state(int *running, XLogRecPtr *last_start)
+{
+	GetBackupState(running, last_start);
+	if (pg_atomic_read_u32(&bmap_shared->standby_backups) != 0)
+		(*running)++;
+}
+
+/*
+ * The standby hold (WalSndComputeRecoveryHold()), published: 'hold' the
+ * earliest position a recovery of a standby known may begin at
+ * (InvalidXLogRecPtr: none), and whether one runs an online backup.
+ */
+void
+bmap_set_standby_hold(XLogRecPtr hold, bool backups)
+{
+	if (bmap_shared == NULL)
+		return;
+	pg_atomic_write_u64(&bmap_shared->standby_hold, hold);
+	pg_atomic_write_u32(&bmap_shared->standby_backups, backups ? 1 : 0);
+}
+
+/* The standby hold as published, and whether a standby runs a backup. */
+XLogRecPtr
+bmap_standby_hold(bool *backups)
+{
+	if (bmap_shared == NULL)
+	{
+		*backups = false;
+		return InvalidXLogRecPtr;
+	}
+	*backups = pg_atomic_read_u32(&bmap_shared->standby_backups) != 0;
+	return pg_atomic_read_u64(&bmap_shared->standby_hold);
+}
+
+/*
  * Log images of the own blocks a share synced (SyncedBlocks), read from the
  * page store, after the share's record: for a base backup begun while the
  * share ran, which may have copied a block before it was written.  The
@@ -6524,8 +6615,8 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 * the checkpoint last completed, unless a backup runs or src's data
 	 * skips WAL (then none).
 	 */
-	checkpointed = last_checkpoint_redo();
-	GetBackupState(&backups, &backup_start);
+	checkpointed = copy_horizon();
+	backup_state(&backups, &backup_start);
 	synced.image_from = (backups > 0 || RelFileLocatorSkippingWAL(srel)) ?
 		InvalidXLogRecPtr : checkpointed;
 
@@ -6640,7 +6731,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 		 * its write: the blocks' images, as they are synced, are logged
 		 * after all, for a recovery from the backup to replay.
 		 */
-		GetBackupState(&backups_now, &backup_start_now);
+		backup_state(&backups_now, &backup_start_now);
 		if (backups_now > 0 || backup_start_now != backup_start)
 			preserve_synced(srel, &synced);
 
@@ -7196,7 +7287,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 	}
 	old_block = hole ? InvalidBlockNumber : entry.block;
-	horizon = last_checkpoint_redo();
+	horizon = copy_horizon();
 
 	if (!hole && refs_has_page(rel, REF_PAGE(old_block)))
 	{
@@ -7303,7 +7394,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			XLogRecPtr	backup_start;
 
 			GetFullPageWriteInfo(&redo, &page_writes);
-			GetBackupState(&backups, &backup_start);
+			backup_state(&backups, &backup_start);
 			copied = page_writes && backups == 0 &&
 				!XLogCheckBufferNeedsBackup(buffer);
 		}
@@ -8453,7 +8544,7 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		UnlockReleaseBuffer(metabuf);
 		return false;
 	}
-	horizon = last_checkpoint_redo();
+	horizon = copy_horizon();
 
 	/*
 	 * The entries from the top, until one is a node (whose children may

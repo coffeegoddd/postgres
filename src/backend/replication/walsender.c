@@ -97,6 +97,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "storage/bmap.h"
 #include "utils/pgstat_internal.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
@@ -2557,6 +2558,8 @@ ProcessStandbyReplyMessage(void)
 	XLogRecPtr	writePtr,
 				flushPtr,
 				applyPtr;
+	XLogRecPtr	recoveryHold = InvalidXLogRecPtr;
+	bool		recoveryBackups = false;
 	bool		replyRequested;
 	TimeOffset	writeLag,
 				flushLag,
@@ -2575,6 +2578,12 @@ ProcessStandbyReplyMessage(void)
 	applyPtr = pq_getmsgint64(&reply_message);
 	replyTime = pq_getmsgint64(&reply_message);
 	replyRequested = pq_getmsgbyte(&reply_message);
+	/* (a standby of this fork's: where a recovery of it may begin) */
+	if (reply_message.cursor < reply_message.len)
+	{
+		recoveryHold = pq_getmsgint64(&reply_message);
+		recoveryBackups = pq_getmsgbyte(&reply_message) != 0;
+	}
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -2646,6 +2655,36 @@ ProcessStandbyReplyMessage(void)
 	if (!am_cascading_walsender)
 		SyncRepReleaseWaiters();
 
+	/* the block map's standby hold, kept by a physical slot too */
+	if (XLogRecPtrIsValid(recoveryHold))
+	{
+		bool		changed;
+
+		SpinLockAcquire(&MyWalSnd->mutex);
+		changed = MyWalSnd->recoveryHold != recoveryHold ||
+			MyWalSnd->recoveryBackups != recoveryBackups;
+		MyWalSnd->recoveryHold = recoveryHold;
+		MyWalSnd->recoveryBackups = recoveryBackups;
+		SpinLockRelease(&MyWalSnd->mutex);
+		if (MyReplicationSlot && SlotIsPhysical(MyReplicationSlot))
+		{
+			ReplicationSlot *slot = MyReplicationSlot;
+			bool		slot_changed;
+
+			SpinLockAcquire(&slot->mutex);
+			slot_changed = slot->data.recovery_hold != recoveryHold;
+			slot->data.recovery_hold = recoveryHold;
+			SpinLockRelease(&slot->mutex);
+			if (slot_changed)
+			{
+				ReplicationSlotMarkDirty();
+				changed = true;
+			}
+		}
+		if (changed)
+			WalSndComputeRecoveryHold();
+	}
+
 	/*
 	 * Advance our local xmin horizon when the client confirmed a flush.
 	 */
@@ -2656,6 +2695,106 @@ ProcessStandbyReplyMessage(void)
 		else
 			PhysicalConfirmReceivedLocation(flushPtr);
 	}
+}
+
+/*
+ * Compute the block map's standby hold (see "The standby hold" in bmap.c):
+ * the earliest position a recovery of a standby this server knows of may
+ * begin at, over the standbys connected and the physical slots kept, and
+ * whether any runs an online backup; and publish it.  A hold further back
+ * than block_map_standby_hold_max_size of WAL is let go of, as a slot past
+ * max_slot_wal_keep_size is: its standby, replaying a change to what the
+ * hold kept, then has a restartpoint made, and one that can't recover
+ * without (crashing first, or a backup running on it) has to be made anew.
+ */
+void
+WalSndComputeRecoveryHold(void)
+{
+	XLogRecPtr	hold = InvalidXLogRecPtr;
+	bool		backups = false;
+	XLogRecPtr	limit = InvalidXLogRecPtr;
+	static XLogRecPtr warned = InvalidXLogRecPtr;
+
+	if (block_map_standby_hold_max_size >= 0 && !RecoveryInProgress())
+	{
+		XLogRecPtr	insert = GetXLogInsertRecPtr();
+		uint64		cap = (uint64) block_map_standby_hold_max_size * 1024 * 1024;
+
+		limit = insert > cap ? insert - cap : 1;
+	}
+
+	if (WalSndCtl != NULL)
+	{
+		for (int i = 0; i < max_wal_senders; i++)
+		{
+			WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
+			XLogRecPtr	h;
+			bool		b;
+			bool		warn = false;
+
+			SpinLockAcquire(&walsnd->mutex);
+			h = walsnd->pid != 0 ? walsnd->recoveryHold : InvalidXLogRecPtr;
+			b = walsnd->recoveryBackups;
+			/* (said once a standby connected) */
+			if (XLogRecPtrIsValid(h) && XLogRecPtrIsValid(limit) && h < limit)
+			{
+				warn = !walsnd->recoveryHoldLost;
+				walsnd->recoveryHoldLost = true;
+			}
+			SpinLockRelease(&walsnd->mutex);
+			if (!XLogRecPtrIsValid(h))
+				continue;
+			if (XLogRecPtrIsValid(limit) && h < limit)
+			{
+				if (warn)
+					ereport(LOG,
+							(errmsg("letting go of a standby's hold at %X/%08X on blocks copied without an image",
+									LSN_FORMAT_ARGS(h)),
+							 errdetail("The standby's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+				continue;
+			}
+			if (!XLogRecPtrIsValid(hold) || h < hold)
+				hold = h;
+			backups |= b;
+		}
+	}
+
+	if (ReplicationSlotCtl != NULL)
+	{
+		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+		for (int i = 0; i < max_replication_slots; i++)
+		{
+			ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+			XLogRecPtr	h;
+			ReplicationSlotInvalidationCause inval;
+
+			if (!s->in_use || !SlotIsPhysical(s))
+				continue;
+			SpinLockAcquire(&s->mutex);
+			h = s->data.recovery_hold;
+			inval = s->data.invalidated;
+			SpinLockRelease(&s->mutex);
+			if (!XLogRecPtrIsValid(h) || inval != RS_INVAL_NONE)
+				continue;
+			if (XLogRecPtrIsValid(limit) && h < limit)
+			{
+				if (h != warned)
+				{
+					warned = h;
+					ereport(LOG,
+							(errmsg("letting go of replication slot \"%s\"'s hold at %X/%08X on blocks copied without an image",
+									NameStr(s->data.name), LSN_FORMAT_ARGS(h)),
+							 errdetail("The slot's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+				}
+				continue;
+			}
+			if (!XLogRecPtrIsValid(hold) || h < hold)
+				hold = h;
+		}
+		LWLockRelease(ReplicationSlotControlLock);
+	}
+
+	bmap_set_standby_hold(hold, backups);
 }
 
 /* compute new replication slot xmin horizon if needed */
@@ -3265,6 +3404,9 @@ InitWalSenderSlot(void)
 			walsnd->applyLag = -1;
 			walsnd->sync_standby_priority = 0;
 			walsnd->replyTime = 0;
+			walsnd->recoveryHold = InvalidXLogRecPtr;
+			walsnd->recoveryBackups = false;
+			walsnd->recoveryHoldLost = false;
 
 			/*
 			 * The kind assignment is done here and not in StartReplication()
@@ -3309,7 +3451,12 @@ WalSndKill(int code, Datum arg)
 	SpinLockAcquire(&walsnd->mutex);
 	/* Mark WalSnd struct as no longer being in use. */
 	walsnd->pid = 0;
+	walsnd->recoveryHold = InvalidXLogRecPtr;
+	walsnd->recoveryBackups = false;
 	SpinLockRelease(&walsnd->mutex);
+
+	/* (a standby gone without a slot no longer holds anything) */
+	WalSndComputeRecoveryHold();
 }
 
 /* XLogReaderRoutine->segment_open callback */

@@ -23,6 +23,7 @@ $primary->init(allows_streaming => 1);
 $primary->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
 autovacuum = off
+block_map_standby_hold_max_size = 0  # no standby hold: the fallbacks, as tested here
 checkpoint_timeout = 1h
 max_wal_size = 1GB
 bgwriter_lru_maxpages = 0

@@ -819,6 +819,29 @@ test_bmap_refs_file_asks(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_bmap_standby_hold(): the standby hold published (NULL: none), and
+ * whether a standby runs an online backup.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_standby_hold);
+
+Datum
+test_bmap_standby_hold(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+	bool		backups;
+	XLogRecPtr	hold = bmap_standby_hold(&backups);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = LSNGetDatum(hold);
+	nulls[0] = !XLogRecPtrIsValid(hold);
+	values[1] = BoolGetDatum(backups);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
  * test_bmap_root_counts(): whether the roots' counts of the database's page
  * store are whole, the roots they count, and the blocks whose counts differ
  * from the roots counted anew

@@ -220,6 +220,12 @@ CREATE FUNCTION test_bmap_refs_file_asks()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The standby hold published (NULL: none): the earliest position a
+-- recovery of a standby known may begin at, and whether one runs a backup.
+CREATE FUNCTION test_bmap_standby_hold(OUT hold pg_lsn, OUT backups bool)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_root_counts(OUT whole bool, OUT counted int8,
 	OUT differ int8)
 RETURNS record

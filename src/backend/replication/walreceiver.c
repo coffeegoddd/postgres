@@ -69,6 +69,7 @@
 #include "postmaster/interrupt.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
+#include "storage/bmap.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -1265,6 +1266,24 @@ XLogWalRcvSendReply(bool force, bool requestReply, bool checkApply)
 	pq_sendint64(&reply_message, applyPtr);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
+
+	/*
+	 * Where a recovery of this server, or of one it serves, may begin, and
+	 * whether an online backup runs on either: the upstream server keeps
+	 * the blocks of block-mapped storage such a recovery reads (see "The
+	 * standby hold" in bmap.c).
+	 */
+	{
+		bool		backups;
+		bool		served_backups;
+		XLogRecPtr	hold = GetRecoveryHold(&backups);
+		XLogRecPtr	served = bmap_standby_hold(&served_backups);
+
+		if (XLogRecPtrIsValid(served) && served < hold)
+			hold = served;
+		pq_sendint64(&reply_message, hold);
+		pq_sendbyte(&reply_message, (backups || served_backups) ? 1 : 0);
+	}
 
 	/* Send it */
 	elog(DEBUG2, "sending write %X/%08X flush %X/%08X apply %X/%08X%s",
