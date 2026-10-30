@@ -25,6 +25,7 @@ $primary->start;
 $primary->safe_psql('postgres', q{
 	CREATE EXTENSION test_prolly;
 	CREATE EXTENSION amcheck;
+	CREATE EXTENSION pg_walinspect;
 });
 $primary->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('share_index_ams_standby');
@@ -132,12 +133,44 @@ for my $rel (@rels)
 		'0/' . sql(qq{SELECT count(*) FROM test_bmap_map($node)}),
 		"${rel}: reads leave every page shared");
 }
+my $lsn0 = sql(q{SELECT pg_current_wal_insert_lsn()});
+
+# Every block of a relation or its copy that WAL says changed since the
+# share no longer maps to the same block as the other side's: no change,
+# by any path, reached a page both still share.
+sub none_changed_shared
+{
+	my ($what) = @_;
+
+	sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
+	for my $rel (@rels)
+	{
+		my $node = sql(qq{SELECT pg_relation_filenode('$rel')});
+		is(sql(qq{SELECT coalesce(string_agg(DISTINCT w.relfilenode || ':' || w.relblocknumber, ' '), '')
+			FROM pg_get_wal_block_info('$lsn0', pg_current_wal_lsn()) w
+			JOIN test_bmap_map($node) s ON s.blkno = w.relblocknumber
+			JOIN test_bmap_map($copy{$rel}) c ON c.blkno = w.relblocknumber
+			WHERE w.relfilenode IN ($node, $copy{$rel}) AND w.relforknumber = 0
+			  AND s.phys = c.phys}), '',
+			"$what: every block of $rel or its copy changed since the share is copied");
+	}
+}
+
+# Maintenance on the source alone while all is shared: GIN's pending list
+# cleaned, BRIN ranges summarized and one desummarized.
+sql(q{
+	INSERT INTO t SELECT g, point(0, 0), point(0, 0), ARRAY[7, 3], 'p'
+		FROM generate_series(30001, 30200) g;
+	SELECT gin_clean_pending_list('t_gin');
+	SELECT brin_summarize_new_values('t_brin');
+	SELECT brin_desummarize_range('t_brin', 0);
+});
 
 # Each side writes its own rows: inserts that split pages (and fill GIN's
 # pending list), updates that move rows, deletes.
 sql(q{
 	INSERT INTO t SELECT g, point(g % 1000, g / 20), point(g / 20, g % 1000),
-		ARRAY[g % 50, 7, 3], 't' FROM generate_series(20001, 30000) g;
+		ARRAY[g % 50, 7, 3], 't' FROM generate_series(20001, 29999) g;
 	UPDATE t SET p = point(150, 150), q = point(150, 150), arr = arr || 3
 		WHERE a % 97 = 0;
 	DELETE FROM t WHERE a % 13 = 0;
@@ -169,9 +202,11 @@ for my $rel (@rels)
 		"${rel}'s changed pages were copied away from ${c}'s");
 }
 check_all($primary, 'written on both sides', %after);
+none_changed_shared('written on both sides');
 
 $primary->safe_psql('postgres', q{VACUUM t; VACUUM c});
 check_all($primary, 'after VACUUM', %after);
+none_changed_shared('after VACUUM');
 
 $primary->wait_for_replay_catchup($standby);
 check_all($standby, 'on the standby', %after);
