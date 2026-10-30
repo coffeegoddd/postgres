@@ -62,6 +62,18 @@ is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $shared_at,
 isnt(sql(qq{SELECT test_bmap_rows_digest($s)}), $shared_at,
 	'the source reads its own');
 
+# Reading a shared sequence's value copies nothing and logs nothing.
+my $copy2 = sql(qq{SELECT test_bmap_share($s)});
+my $phys2 = sql(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0});
+my $lsn = sql(q{SELECT pg_current_wal_insert_lsn()});
+sql(q{SELECT last_value FROM pg_sequences WHERE sequencename = 's';
+	SELECT pg_sequence_last_value('s'); SELECT * FROM pg_get_sequence_data('s')});
+is(sql(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 0}), $phys2,
+	'reading a shared sequence\'s value leaves its page shared');
+is(sql(qq{SELECT pg_current_wal_insert_lsn() = '$lsn'}), 't',
+	'and logs nothing');
+sql(qq{SELECT test_bmap_unlink($copy2)});
+
 $primary->wait_for_replay_catchup($standby);
 is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $shared_at,
 	'the standby reads the copy as shared');
@@ -71,7 +83,6 @@ cmp_ok(ssql(q{SELECT last_value FROM s}), '>=', sql(q{SELECT last_value FROM s})
 
 # A crash: the source goes on past every value it gave out, the copy
 # still reads as shared.
-my $source = sql(q{SELECT test_bmap_rows_digest(pg_relation_filenode('s'))});
 $primary->stop('immediate');
 $primary->start;
 cmp_ok(sql(q{SELECT nextval('s')}), '>', 51,
@@ -97,6 +108,18 @@ is(sql(q{SELECT max(id) FROM t}), '6', 'a serial column goes on after its sequen
 $primary->wait_for_replay_catchup($standby);
 is(ssql(q{SELECT max(id) FROM t}), '6', 'on the standby too');
 
-sql(qq{SELECT test_bmap_unlink($copy)});
-sql(qq{SELECT test_bmap_unlink($seq_copy)});
+# The standby, promoted, goes on from past every value the primary gave
+# out, and its copy reads as shared.
+$primary->wait_for_replay_catchup($standby);
+my $given = sql(q{SELECT last_value FROM s});
+$primary->stop;
+$standby->promote;
+cmp_ok(ssql(q{SELECT nextval('s')}), '>', $given,
+	'a promoted standby gives out no value the primary gave');
+is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $shared_at,
+	'and reads the copy as shared');
+$standby->stop('immediate');
+$standby->start;
+is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $shared_at,
+	'through a crash after its promotion');
 done_testing();
