@@ -5,6 +5,7 @@
 -- pages are still their own, so a share made later rarely needs copying.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 CREATE EXTENSION IF NOT EXISTS pg_visibility;
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
 SET debug_block_mapped_heap = on;
 SET vacuum_freeze_min_age TO DEFAULT;
 
@@ -55,6 +56,33 @@ VACUUM (FREEZE) frozen_t;
 SELECT shared_blocks(:f, :fcopy) = :fblocks AS frozen_still_shared;
 SELECT test_bmap_unlink(:fcopy);
 
+-- A shared page that says it is all-visible and is all-frozen, but whose
+-- map bits were cleared (the map emptied here), gets them back from VACUUM
+-- without being copied: a record of the map page alone, VM_SET, for each.
+CREATE TABLE vmset_t (id int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO vmset_t SELECT g, repeat('v', 200) FROM generate_series(1, 3000) g;
+VACUUM (FREEZE) vmset_t;
+SELECT relfilenode AS v FROM pg_class WHERE relname = 'vmset_t' \gset
+SELECT pg_relation_size('vmset_t') / 8192 AS vblocks \gset
+SELECT pg_truncate_visibility_map('vmset_t');
+SELECT count(*) AS bits_left FROM pg_visibility_map('vmset_t') WHERE all_visible;
+SELECT count(*) = :vblocks AS pages_say_all_visible
+FROM pg_visibility('vmset_t') WHERE pd_all_visible;
+SELECT test_bmap_share(:v) AS vcopy \gset
+SELECT pg_current_wal_insert_lsn() AS vm_mark \gset
+VACUUM vmset_t;
+SELECT count(*) = :vblocks AS bits_back FROM pg_visibility_map('vmset_t')
+WHERE all_visible AND all_frozen;
+SELECT shared_blocks(:v, :vcopy) = :vblocks AS vm_set_copies_nothing;
+-- (WAL flushed by a transaction that logs a change: the VACUUM's commits none)
+CREATE TABLE vm_set_flushed ();
+DROP TABLE vm_set_flushed;
+SELECT count(*) = :vblocks AS vm_set_records
+FROM pg_get_wal_block_info(:'vm_mark', pg_current_wal_flush_lsn())
+WHERE resource_manager = 'Heap2' AND record_type = 'VM_SET'
+  AND relfilenode = :v AND relforknumber = 2;
+SELECT test_bmap_unlink(:vcopy);
+
 -- A page shared only with a root held of the relation itself, not with
 -- another relation, is vacuumed as the relation's own: frozen and set
 -- all-visible, copied, while the root keeps the version it had.
@@ -73,7 +101,7 @@ BEGIN;
 SELECT test_bmap_root_release(:root);
 COMMIT;
 
-DROP TABLE shared_t, frozen_t, held_t;
+DROP TABLE shared_t, frozen_t, vmset_t, held_t;
 DROP FUNCTION shared_blocks(oid, oid);
 SELECT entries >= 0 AS drained FROM test_bmap_release_drain();
 RESET debug_block_mapped_heap;

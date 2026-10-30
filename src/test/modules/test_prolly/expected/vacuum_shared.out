@@ -6,6 +6,7 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_visibility;
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
 SET debug_block_mapped_heap = on;
 SET vacuum_freeze_min_age TO DEFAULT;
 -- the logical blocks whose physical block two relations' maps both name
@@ -106,6 +107,67 @@ SELECT test_bmap_unlink(:fcopy);
  
 (1 row)
 
+-- A shared page that says it is all-visible and is all-frozen, but whose
+-- map bits were cleared (the map emptied here), gets them back from VACUUM
+-- without being copied: a record of the map page alone, VM_SET, for each.
+CREATE TABLE vmset_t (id int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO vmset_t SELECT g, repeat('v', 200) FROM generate_series(1, 3000) g;
+VACUUM (FREEZE) vmset_t;
+SELECT relfilenode AS v FROM pg_class WHERE relname = 'vmset_t' \gset
+SELECT pg_relation_size('vmset_t') / 8192 AS vblocks \gset
+SELECT pg_truncate_visibility_map('vmset_t');
+ pg_truncate_visibility_map 
+----------------------------
+ 
+(1 row)
+
+SELECT count(*) AS bits_left FROM pg_visibility_map('vmset_t') WHERE all_visible;
+ bits_left 
+-----------
+         0
+(1 row)
+
+SELECT count(*) = :vblocks AS pages_say_all_visible
+FROM pg_visibility('vmset_t') WHERE pd_all_visible;
+ pages_say_all_visible 
+-----------------------
+ t
+(1 row)
+
+SELECT test_bmap_share(:v) AS vcopy \gset
+SELECT pg_current_wal_insert_lsn() AS vm_mark \gset
+VACUUM vmset_t;
+SELECT count(*) = :vblocks AS bits_back FROM pg_visibility_map('vmset_t')
+WHERE all_visible AND all_frozen;
+ bits_back 
+-----------
+ t
+(1 row)
+
+SELECT shared_blocks(:v, :vcopy) = :vblocks AS vm_set_copies_nothing;
+ vm_set_copies_nothing 
+-----------------------
+ t
+(1 row)
+
+-- (WAL flushed by a transaction that logs a change: the VACUUM's commits none)
+CREATE TABLE vm_set_flushed ();
+DROP TABLE vm_set_flushed;
+SELECT count(*) = :vblocks AS vm_set_records
+FROM pg_get_wal_block_info(:'vm_mark', pg_current_wal_flush_lsn())
+WHERE resource_manager = 'Heap2' AND record_type = 'VM_SET'
+  AND relfilenode = :v AND relforknumber = 2;
+ vm_set_records 
+----------------
+ t
+(1 row)
+
+SELECT test_bmap_unlink(:vcopy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
 -- A page shared only with a root held of the relation itself, not with
 -- another relation, is vacuumed as the relation's own: frozen and set
 -- all-visible, copied, while the root keeps the version it had.
@@ -133,7 +195,7 @@ SELECT test_bmap_root_release(:root);
 (1 row)
 
 COMMIT;
-DROP TABLE shared_t, frozen_t, held_t;
+DROP TABLE shared_t, frozen_t, vmset_t, held_t;
 DROP FUNCTION shared_blocks(oid, oid);
 SELECT entries >= 0 AS drained FROM test_bmap_release_drain();
  drained 
