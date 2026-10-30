@@ -694,8 +694,7 @@ BmapShmemInit(void *arg)
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
 	bmap_shared->nswept = 0;
-	LWLockInitialize(&bmap_shared->ahead_lock,
-					 LWLockNewTrancheId("block map replay"));
+	LWLockInitialize(&bmap_shared->ahead_lock, LWTRANCHE_BMAP_REPLAY_AHEAD);
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
 	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
 	for (int i = 0; i < MaxBackends; i++)

@@ -78,7 +78,7 @@ patch src/backend/storage/smgr/Makefile  1a  builds the block-mapped storage man
 patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/storage/smgr/meson.build  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write; per-relation choice of implementation
-patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation
+patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation by its logical length; its map fork counts as none
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
@@ -106,6 +106,7 @@ patch src/include/meson.build  0  installs the engine's headers in src/include/p
 patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
+patch src/include/storage/lwlocklist.h  1a  the block map's replay lock is a built-in tranche, so it takes no slot extensions may use
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write
 patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
