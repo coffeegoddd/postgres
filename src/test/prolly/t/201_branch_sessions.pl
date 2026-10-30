@@ -109,6 +109,40 @@ unlike($d1, qr/extra/, 'and not the other\'s column');
 like($d2, qr/extra integer DEFAULT 7/, 'the second branch\'s dump has its column');
 unlike($d2, qr/t_v1/, 'and not the other\'s index');
 unlike($dump->(0), qr/CREATE TABLE/, 'a dump on no branch has no versioned table');
+like($d1, qr/CREATE SCHEMA app VERSIONED;/, 'a versioned schema is dumped as one');
+
+# a new branch made from the first branch's dump, definitions and rows
+my $b3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
+my ($full, $err);
+{
+	local $ENV{PGOPTIONS} = "-c catalog_branch=$b1";
+	IPC::Run::run([ 'pg_dump', '-n', 'app', '-d', $node->connstr('postgres') ],
+		'>', \$full, '2>', \$err);
+}
+{
+	local $ENV{PGOPTIONS} = "-c catalog_branch=$b3";
+	my ($out, $rerr);
+	IPC::Run::run([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr('postgres') ],
+		'<', \$full, '>', \$out, '2>', \$rerr);
+	is($rerr, '', 'the dump restores on a new branch');
+}
+is(on($b3, 'SELECT count(*), sum(v) FROM app.t'),
+	on($b1, 'SELECT count(*), sum(v) FROM app.t'),
+	'the new branch has the first branch\'s rows');
+is( on(
+		$b3,
+		"SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'app'"),
+	't_pkey,t_v1',
+	'and its definitions');
+is(on($b1, 'SELECT count(*) FROM app.t'), $b1 * 10 + 1, 'the first branch is as it was');
+{
+	local $ENV{PGOPTIONS} = "-c catalog_branch=0";
+	my ($out, $rerr);
+	IPC::Run::run([ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-d', $node->connstr('postgres') ],
+		'<', \$full, '>', \$out, '2>', \$rerr);
+	like($rerr, qr/cannot create versioned schema "app" on no branch/,
+		'and it cannot be restored on no branch');
+}
 
 $node->stop;
 done_testing();
