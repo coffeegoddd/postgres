@@ -28,6 +28,7 @@
 #include "catalog/storage.h"
 #include "common/cryptohash.h"
 #include "common/md5.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -138,6 +139,20 @@ Datum
 test_bmap_rows_digest(PG_FUNCTION_ARGS)
 {
 	return digest(PG_GETARG_OID(0), true);
+}
+
+/*
+ * test_bmap_own_wal(): the bytes of WAL this backend has written, leaving
+ * out full-page images.  The difference between two calls is the WAL of the
+ * work between them, whatever other backends log meanwhile, and whether or
+ * not a checkpoint made that work log a page's first image.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_own_wal);
+
+Datum
+test_bmap_own_wal(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) (pgWalUsage.wal_bytes - pgWalUsage.wal_fpi_bytes));
 }
 
 /*
