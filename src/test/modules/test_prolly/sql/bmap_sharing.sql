@@ -31,7 +31,7 @@ SELECT bool_and(epoch < 1) AS entries_older FROM test_bmap_map(:copy);
 -- drop queues them, to be let go of by a drain: itself it frees nothing,
 -- and leaves the copy's counts as they were.
 -- (what earlier tests dropped, let go of first: after a checkpoint, so that
--- blocks copied from without an image are freed too)
+-- any blocks copied from without an image are freed too)
 CHECKPOINT;
 SELECT entries >= 0 AS drained_before FROM test_bmap_release_drain();
 SELECT test_bmap_free_blocks() AS free_before \gset

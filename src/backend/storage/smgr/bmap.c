@@ -7057,8 +7057,9 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 * replay skipped some of them (redo_remap_page()).  Its pages are
 		 * few, one for many thousands of the relation's.  Nor with
 		 * block_map_copy_images on (the default), which keeps every recovery
-		 * from needing the old block: a standby's backup and pg_rewind then
-		 * work as they do for any relation.
+		 * from needing the old block for a copy: a standby's backup across
+		 * copies and pg_rewind after them then work as they do for any
+		 * relation (a share's synced blocks still limit both: bmapshare()).
 		 */
 		if (!block_map_copy_images && !hole && !zeroed && BufferIsValid(refbuf) &&
 			forknum == MAIN_FORKNUM &&

@@ -365,7 +365,7 @@
 },
 
 { name => 'block_map_copy_images', type => 'bool', context => 'PGC_SUSET', group => 'WAL_SETTINGS',
-  short_desc => 'Logs a full-page image of each shared page of block-mapped storage copied before its first change.',
+  short_desc => 'Logs a full-page image of a shared page of block-mapped storage copied before its first change.',
   long_desc => 'When off, a copy whose page already has an image in the WAL since the last checkpoint is logged without one, which saves WAL, but the old block must then stay as it is until no recovery could begin before the copy: an online backup taken on a standby across such copies fails as it stops, a standby whose restartpoint cannot be made cannot recover from a crash, and pg_rewind refuses a source that made such copies after the servers diverged.',
   variable => 'block_map_copy_images',
   boot_val => 'true',

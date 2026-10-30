@@ -64,7 +64,7 @@ SELECT :pages = pg_relation_size('fw.shared') / 8192 AND
 SELECT test_bmap_share(:shared) AS shared_copy \gset
 SELECT test_bmap_share(:dropped) AS dropped_copy \gset
 SELECT test_bmap_unlink(:dropped_copy);
--- (past the copies made without images, so the dropped copy's pages are
+-- (past any copies made without images, so the dropped copy's pages are
 -- claimed, not copied)
 CHECKPOINT;
 
