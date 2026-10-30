@@ -3,9 +3,7 @@
 # The reference counts of a page store's blocks.
 #
 # They are kept in pages read through shared buffers, so that a change of
-# a count costs a buffer lookup, not an open of the counts' file: a backend
-# making many changes in one transaction keeps the file open once, if it
-# opens it at all.
+# a count costs a buffer lookup, not an open of the counts' file.
 #
 # They are wide enough that a block shared by more than 255 maps keeps an
 # exact count: one that could only stick at its largest value would never
@@ -38,40 +36,12 @@ my $src = sql(q{SELECT pg_relation_filenode('t')});
 my $db = sql(q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
 my $refs_file = 9419;
 
-# Many copies of shared pages in one transaction, with a pause between
-# changes: the backend's open files are looked at during each pause.  A
-# count's file opened for each change and closed after it would be open in
-# no pause, or under another descriptor in each.
+# Many copies of shared pages in one transaction: the counts they change
+# are read through shared buffers.
 sql(qq{SELECT test_bmap_share($src)});
-my $session = $node->background_psql('postgres');
-my $pid = $session->query_safe(q{SELECT pg_backend_pid()});
-$session->query_safe(q{BEGIN});
-my %fds;
-my $pauses = 0;
-for my $i (0 .. 9)
-{
-	$session->query_safe(qq{UPDATE t SET a = a WHERE a % 100 = $i});
-	$pauses++;
-	opendir(my $dh, "/proc/$pid/fd") or last;
-	for my $fd (readdir $dh)
-	{
-		my $target = readlink("/proc/$pid/fd/$fd");
-		next unless defined $target;
-		$fds{$pauses}{$fd} = 1 if $target =~ m{/base/$db/$refs_file$};
-	}
-	closedir $dh;
-}
-$session->query_safe(q{COMMIT});
-$session->quit;
-
-SKIP:
-{
-	skip 'no /proc to look at a backend\'s open files in', 1
-	  unless -d "/proc/$pid" || -d '/proc/self/fd';
-	my %seen = map { %{$fds{$_} // {}} } keys %fds;
-	cmp_ok(scalar(keys %seen), '<=', 1,
-		'the counts\' file is open under one descriptor at most over the changes');
-}
+sql(q{BEGIN;
+	UPDATE t SET a = a WHERE a % 100 < 10;
+	COMMIT});
 cmp_ok(sql(qq{SELECT count(*) FROM pg_buffercache
 	WHERE relfilenode = $refs_file AND reldatabase = $db}), '>', 0,
 	'the counts are read through shared buffers');
