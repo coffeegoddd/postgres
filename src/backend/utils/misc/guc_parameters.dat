@@ -389,6 +389,16 @@
   max => '67108864',
 },
 
+{ name => 'block_map_standby_hold_max_size', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
+  short_desc => 'Sets how far back a standby\'s hold on blocks of block-mapped storage copied without an image may reach.',
+  long_desc => 'Each standby reports the earliest position a recovery of it may begin at, kept by its physical slot while it is away, and blocks copied without an image after it are kept as they are until it reports past them. A hold more WAL than this behind is let go of: that standby then has a restartpoint made as it replays a change to such a block, and if it crashes first, or a backup runs on it, has to be made anew. -1 means no maximum.',
+  flags => 'GUC_UNIT_MB',
+  variable => 'block_map_standby_hold_max_size',
+  boot_val => '-1',
+  min => '-1',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'block_size', type => 'int', context => 'PGC_INTERNAL', group => 'PRESET_OPTIONS',
   short_desc => 'Shows the size of a disk block.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',

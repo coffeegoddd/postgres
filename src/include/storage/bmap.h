@@ -42,6 +42,7 @@ extern PGDLLIMPORT int block_map_replay_entries;
 
 /* a shared page's copy always logs its image */
 extern PGDLLIMPORT bool block_map_copy_images;
+extern PGDLLIMPORT int block_map_standby_hold_max_size;
 
 /* storage manager callbacks */
 extern void bmapinit(void);
@@ -186,6 +187,8 @@ extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
 extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
 							   uint64 *slots, uint64 *naming);
 extern uint64 bmap_refs_file_asks(void);
+extern void bmap_set_standby_hold(XLogRecPtr hold, bool backups);
+extern XLogRecPtr bmap_standby_hold(bool *backups);
 extern bool bmap_inspect_root_counts(RelFileLocator store, uint64 *counted,
 									 uint64 *differ);
 extern void bmap_inspect_block(SMgrRelation reln, ForkNumber forknum,

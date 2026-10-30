@@ -159,6 +159,14 @@ typedef struct ReplicationSlotPersistentData
 	 * for logical slots on the primary server.
 	 */
 	bool		failover;
+
+	/*
+	 * A physical slot's standby: the earliest position a recovery of it may
+	 * begin at, as it last reported (InvalidXLogRecPtr: none reported).  The
+	 * block map keeps what such a recovery reads (see "The standby hold" in
+	 * bmap.c), while the standby is away too.
+	 */
+	XLogRecPtr	recovery_hold;
 } ReplicationSlotPersistentData;
 
 /*

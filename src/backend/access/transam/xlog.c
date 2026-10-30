@@ -453,6 +453,14 @@ typedef struct XLogCtlInsert
 	XLogRecPtr	lastBackupStart;
 
 	/*
+	 * The restart point as the oldest of the backups running began
+	 * (InvalidXLogRecPtr: none runs), no later than any such backup's
+	 * start: on a standby, where a recovery of a backup taken may begin
+	 * (GetRecoveryHold()).
+	 */
+	XLogRecPtr	backupHoldSince;
+
+	/*
 	 * WAL insertion locks.
 	 */
 	WALInsertLockPadded *WALInsertLocks;
@@ -7323,6 +7331,34 @@ GetBackupState(int *running, XLogRecPtr *last_start)
 }
 
 /*
+ * GetRecoveryHold -- the earliest position a recovery of this server may
+ * begin at: its restart point, or where the oldest online backup running
+ * on it began (no later than the restart point as it began), and whether
+ * one runs
+ *
+ * A standby reports it to its upstream server (see "The standby hold" in
+ * bmap.c), which then keeps what such a recovery would read.
+ */
+XLogRecPtr
+GetRecoveryHold(bool *backups)
+{
+	XLogRecPtr	redo;
+	TimeLineID	tli;
+	XLogRecPtr	since;
+	int			running;
+
+	GetOldestRestartPoint(&redo, &tli);
+	WALInsertLockAcquire();
+	running = XLogCtl->Insert.runningBackups;
+	since = XLogCtl->Insert.backupHoldSince;
+	WALInsertLockRelease();
+	*backups = running > 0;
+	if (running > 0 && XLogRecPtrIsValid(since) && since < redo)
+		return since;
+	return redo;
+}
+
+/*
  * XLogNoteSyncedPages -- pages were written out and synced instead of
  * logged, relying on no recovery beginning at or before 'since'
  *
@@ -10143,9 +10179,18 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 	 * runningBackups, to ensure adequate interlocking against
 	 * XLogInsertRecord().
 	 */
-	WALInsertLockAcquireExclusive();
-	XLogCtl->Insert.runningBackups++;
-	WALInsertLockRelease();
+	{
+		XLogRecPtr	hold_since;
+		TimeLineID	hold_tli;
+
+		GetOldestRestartPoint(&hold_since, &hold_tli);
+		WALInsertLockAcquireExclusive();
+		if (XLogCtl->Insert.runningBackups == 0 ||
+			hold_since < XLogCtl->Insert.backupHoldSince)
+			XLogCtl->Insert.backupHoldSince = hold_since;
+		XLogCtl->Insert.runningBackups++;
+		WALInsertLockRelease();
+	}
 
 	/*
 	 * Ensure we decrement runningBackups if we fail below. NB -- for this to
@@ -10475,7 +10520,8 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	 * exactly one do_pg_backup_stop() call.
 	 */
 	Assert(XLogCtl->Insert.runningBackups > 0);
-	XLogCtl->Insert.runningBackups--;
+	if (--XLogCtl->Insert.runningBackups == 0)
+		XLogCtl->Insert.backupHoldSince = InvalidXLogRecPtr;
 
 	/*
 	 * Clean up session-level lock.
@@ -10755,7 +10801,8 @@ do_pg_abort_backup(int code, Datum arg)
 	{
 		WALInsertLockAcquireExclusive();
 		Assert(XLogCtl->Insert.runningBackups > 0);
-		XLogCtl->Insert.runningBackups--;
+		if (--XLogCtl->Insert.runningBackups == 0)
+			XLogCtl->Insert.backupHoldSince = InvalidXLogRecPtr;
 
 		sessionBackupState = SESSION_BACKUP_NONE;
 		WALInsertLockRelease();

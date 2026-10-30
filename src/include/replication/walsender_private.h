@@ -75,6 +75,17 @@ typedef struct WalSnd
 	 */
 	TimestampTz replyTime;
 
+	/*
+	 * The earliest position a recovery of the standby may begin at, and
+	 * whether an online backup runs on it, as it last reported
+	 * (InvalidXLogRecPtr: none reported); and whether the hold was let go
+	 * of, past block_map_standby_hold_max_size (see "The standby hold" in
+	 * bmap.c).
+	 */
+	XLogRecPtr	recoveryHold;
+	bool		recoveryBackups;
+	bool		recoveryHoldLost;
+
 	ReplicationKind kind;
 } WalSnd;
 

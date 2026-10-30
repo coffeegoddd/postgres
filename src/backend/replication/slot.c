@@ -50,6 +50,7 @@
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/slot.h"
+#include "replication/walsender.h"
 #include "replication/walsender_private.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -141,7 +142,7 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 	sizeof(ReplicationSlotOnDisk) - ReplicationSlotOnDiskConstantSize
 
 #define SLOT_MAGIC		0x1051CA1	/* format identifier */
-#define SLOT_VERSION	5		/* version for new files */
+#define SLOT_VERSION	6		/* version for new files */
 
 /* Control array for replication slot management */
 ReplicationSlotCtlData *ReplicationSlotCtl = NULL;
@@ -1138,6 +1139,7 @@ ReplicationSlotDropPtr(ReplicationSlot *slot)
 	 */
 	ReplicationSlotsComputeRequiredXmin(false);
 	ReplicationSlotsComputeRequiredLSN();
+	WalSndComputeRecoveryHold();
 
 	/*
 	 * If removing the directory fails, the worst thing that will happen is
@@ -2398,6 +2400,12 @@ CheckPointReplicationSlots(bool is_shutdown)
 	 */
 	if (last_saved_restart_lsn_updated)
 		ReplicationSlotsComputeRequiredLSN();
+
+	/*
+	 * (and the block map's standby hold, which the size cap may let go of
+	 * as WAL is written, and a standby gone may no longer hold)
+	 */
+	WalSndComputeRecoveryHold();
 }
 
 /*
@@ -2456,6 +2464,8 @@ StartupReplicationSlots(void)
 	/* Now that we have recovered all the data, compute replication xmin */
 	ReplicationSlotsComputeRequiredXmin(false);
 	ReplicationSlotsComputeRequiredLSN();
+	/* (and the block map's standby hold, before anything is copied) */
+	WalSndComputeRecoveryHold();
 }
 
 /* ----

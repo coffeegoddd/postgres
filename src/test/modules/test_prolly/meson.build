@@ -99,6 +99,7 @@ tests += {
       't/041_bmap_pitr_steps.pl',
       't/042_bmap_orphan_maps.pl',
       't/043_bmap_shared_writers.pl',
+      't/044_bmap_standby_hold.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
