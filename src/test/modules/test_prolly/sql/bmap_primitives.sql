@@ -14,33 +14,36 @@ SELECT pg_relation_size('big_t') / pg_relation_size('small_t') >= 20 AS big_is_b
 
 -- Hold a root of each; a capture logs the relation's pages that were never
 -- shared before, so the relations are captured once first and then again,
--- and the second captures are what is measured.
+-- and the second captures are what is measured: the WAL this backend
+-- writes, leaving out full-page images (test_bmap_own_wal()), so that
+-- neither another backend's WAL nor a page's first image after a checkpoint
+-- counts.
 BEGIN;
 SELECT test_bmap_root_capture(:small) AS r0, test_bmap_root_capture(:big) AS r1 \gset
 COMMIT;
 CHECKPOINT;
 SELECT test_bmap_digest(:small) AS small_digest, test_bmap_digest(:big) AS big_digest \gset
-SELECT pg_current_wal_insert_lsn() AS l0 \gset
+SELECT test_bmap_own_wal() AS l0 \gset
 BEGIN;
 SELECT test_bmap_root_capture(:small) AS small_root \gset
 COMMIT;
-SELECT pg_current_wal_insert_lsn() AS l1 \gset
+SELECT test_bmap_own_wal() AS l1 \gset
 BEGIN;
 SELECT test_bmap_root_capture(:big) AS big_root \gset
 COMMIT;
-SELECT pg_current_wal_insert_lsn() AS l2 \gset
-SELECT pg_wal_lsn_diff(:'l2', :'l1') <= pg_wal_lsn_diff(:'l1', :'l0') + 16384
+SELECT test_bmap_own_wal() AS l2 \gset
+SELECT :l2 - :l1 <= :l1 - :l0 + 16384
 	AS capture_wal_flat_in_size;
 
 -- Relations made of the roots, in WAL that doesn't grow with their size,
 -- read back the pages the roots held, whatever the tables became since.
 UPDATE big_t SET pad = 'changed' WHERE id <= 100;
-SELECT pg_current_wal_insert_lsn() AS m0 \gset
+SELECT test_bmap_own_wal() AS m0 \gset
 SELECT test_bmap_storage_from_root(:small_root) AS small_copy \gset
-SELECT pg_current_wal_insert_lsn() AS m1 \gset
+SELECT test_bmap_own_wal() AS m1 \gset
 SELECT test_bmap_storage_from_root(:big_root) AS big_copy \gset
-SELECT pg_current_wal_insert_lsn() AS m2 \gset
-SELECT pg_wal_lsn_diff(:'m2', :'m1') <= pg_wal_lsn_diff(:'m1', :'m0') + 16384
+SELECT test_bmap_own_wal() AS m2 \gset
+SELECT :m2 - :m1 <= :m1 - :m0 + 16384
 	AS made_wal_flat_in_size;
 SELECT test_bmap_digest(:small_copy) = :'small_digest' AS small_copy_is_root;
 SELECT test_bmap_digest(:big_copy) = :'big_digest' AS big_copy_is_root;
