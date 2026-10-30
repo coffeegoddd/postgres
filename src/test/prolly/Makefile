@@ -13,6 +13,7 @@
 #
 #	make -C src/test/prolly check			# every group, on PROLLY_AM
 #	make -C src/test/prolly check-heap		# the semantics groups, on heap
+#	make -C src/test/prolly check-upstream-bmap	# Postgres's suites, block-mapped
 #
 # TAP tests are numbered by group: 0xx check that the access method under
 # test is in effect, 1xx check durability and are part of the semantics
@@ -62,7 +63,17 @@ check-tap-durability: PROVE_TESTS = t/1*.pl
 check-tap-durability: temp-install
 	$(prove_check)
 
-.PHONY: check check-heap $(SEMANTICS_TARGETS)
+# Postgres's regression, isolation and recovery suites with every user
+# heap table, index and TOAST table in block-mapped storage.  They pass in
+# full: block-mapped storage changes where pages live, not what they hold.
+BMAP_CONF = $(abs_top_srcdir)/$(subdir)/bmap.conf
+
+check-upstream-bmap: temp-install
+	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(BMAP_CONF)
+	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(BMAP_CONF)
+	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(BMAP_CONF)
+
+.PHONY: check check-heap check-upstream-bmap $(SEMANTICS_TARGETS)
 
 clean distclean:
 	rm -rf results output_iso tmp_check tmp_check_iso log
