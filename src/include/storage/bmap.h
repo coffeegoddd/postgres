@@ -59,6 +59,7 @@ extern void bmapenddrops(void);
 extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber nblocks);
 extern uint32 bmapreleasestep(SMgrRelation reln);
+extern void bmapsettlexids(void);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);

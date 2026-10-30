@@ -17,7 +17,8 @@ EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
 REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
-	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives
+	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
+	bmap_settle_roots
 TAP_TESTS = 1
 
 EXTRA_INSTALL = contrib/pageinspect contrib/pg_buffercache contrib/pg_visibility \
