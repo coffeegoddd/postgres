@@ -1,0 +1,39 @@
+-- The unit tests of the engine's code in the server.  Each row is one test;
+-- a failure shows its error in detail.
+CREATE EXTENSION test_prolly;
+SELECT suite, test, result, detail FROM test_prolly_unit_tests();
+  suite   |              test              | result | detail 
+----------+--------------------------------+--------+--------
+ harness  | checks_pass                    | ok     | 
+ harness  | check_fails                    | ok     | 
+ harness  | comparisons_fail_with_values   | ok     | 
+ harness  | rng_sequence                   | ok     | 
+ harness  | u64_keys_sort_as_bytes         | ok     | 
+ registry | register_and_look_up           | ok     | 
+ registry | names_are_copied               | ok     | 
+ registry | lists_in_registration_order    | ok     | 
+ registry | rejects_duplicates             | ok     | 
+ registry | rejects_bad_names_and_routines | ok     | 
+(10 rows)
+
+-- one suite, by name
+SELECT suite, test, result FROM test_prolly_unit_tests('harness');
+  suite  |             test             | result 
+---------+------------------------------+--------
+ harness | checks_pass                  | ok
+ harness | check_fails                  | ok
+ harness | comparisons_fail_with_values | ok
+ harness | rng_sequence                 | ok
+ harness | u64_keys_sort_as_bytes       | ok
+(5 rows)
+
+-- running them again gives the same results: no test depends on running
+-- once per session
+SELECT count(*) AS failures FROM test_prolly_unit_tests() WHERE result <> 'ok';
+ failures 
+----------
+        0
+(1 row)
+
+SELECT * FROM test_prolly_unit_tests('no_such_suite');
+ERROR:  unit test suite "no_such_suite" does not exist

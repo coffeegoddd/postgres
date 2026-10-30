@@ -1,0 +1,28 @@
+src/test/prolly/README
+
+The requirements suite
+======================
+
+These are tests of what the version-control engine must do, run against a
+server: regression tests (sql/, listed in semantics_schedule), isolation
+tests (specs/, listed in isolation_schedule) and TAP tests (t/).  Tests of
+one interface or one implementation belong in src/test/modules/test_prolly
+instead.
+
+PROLLY_AM names the table access method the suite runs on, and
+am/$(PROLLY_AM).conf holds the server settings that put new tables on it;
+TAP tests get the same settings by making their servers with
+ProllyTest::new_node.  Every group starts by checking that the settings are
+in effect, so a mistake in them fails the run rather than letting the
+suite test something else.
+
+The tests of Postgres semantics expect exactly what stock Postgres does.
+Running them on heap shows that the tests themselves are right:
+
+    make -C src/test/prolly check       # every group, on PROLLY_AM
+    make -C src/test/prolly check-heap  # the semantics groups, on heap
+
+The groups can also be run one at a time: check-target, check-semantics,
+check-isolation and check-tap-durability.  TAP tests are numbered by group:
+0xx check that the access method under test is in effect, and 1xx check
+durability.

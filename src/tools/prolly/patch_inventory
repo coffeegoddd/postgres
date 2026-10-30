@@ -25,6 +25,8 @@ own   .github/workflows/prolly.yml
 own   contrib/prolly/
 own   src/backend/prolly/
 own   src/include/prolly/
+own   src/test/modules/test_prolly/
+own   src/test/prolly/
 own   src/tools/prolly/
 own   src/tools/prolly_bench/
 
@@ -35,3 +37,7 @@ patch src/backend/Makefile     0  links the engine's code in src/backend/prolly 
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
+patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
+patch src/test/meson.build     0  runs the requirements suite in src/test/prolly
+patch src/test/modules/Makefile     0  builds and runs the engine's unit and conformance tests in test_prolly
+patch src/test/modules/meson.build  0  builds and runs the engine's unit and conformance tests in test_prolly

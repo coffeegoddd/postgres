@@ -1,0 +1,16 @@
+-- Rows written are read back, changed and removed as stock Postgres does.
+CREATE TABLE sem_basic (id int PRIMARY KEY, v text);
+
+INSERT INTO sem_basic SELECT g, 'v' || g FROM generate_series(1, 5) g;
+UPDATE sem_basic SET v = v || '!' WHERE id % 2 = 0;
+DELETE FROM sem_basic WHERE id = 5;
+
+SELECT * FROM sem_basic ORDER BY id;
+
+-- a rolled-back change leaves no trace
+BEGIN;
+DELETE FROM sem_basic;
+ROLLBACK;
+SELECT count(*) FROM sem_basic;
+
+DROP TABLE sem_basic;

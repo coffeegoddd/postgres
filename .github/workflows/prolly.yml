@@ -63,6 +63,15 @@ jobs:
       - name: Postgres regression tests
         run: make check
 
+      - name: Engine unit tests and interface conformance (test_prolly)
+        run: make -C src/test/modules/test_prolly check
+
+      - name: Requirements suite, validated against heap
+        run: make -C src/test/prolly check-heap
+
+      - name: Requirements suite on the access method under test
+        run: make -C src/test/prolly check
+
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v5
@@ -147,6 +156,12 @@ jobs:
 
       - name: Postgres regression tests
         run: make check
+
+      - name: Engine unit tests and interface conformance (test_prolly)
+        run: make -C src/test/modules/test_prolly check
+
+      - name: Requirements suite
+        run: make -C src/test/prolly check
 
       - name: Upload logs
         if: always()
