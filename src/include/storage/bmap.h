@@ -60,6 +60,8 @@ extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber nblocks);
 extern uint32 bmapreleasestep(SMgrRelation reln);
 extern void bmapsettlexids(void);
+extern void bmapmaintain(int64 release_max, void (*pace) (void),
+						 SMgrMaintenance *done);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
@@ -214,7 +216,8 @@ extern bool bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start);
  * dropped at a commit is queued before the commit record, its entries naming
  * the transaction: they hold nothing until it commits (a step stops at them),
  * and are popped with nothing let go of if it doesn't.  A relation's
- * extension takes steps first when the store would grow.
+ * extension takes steps first when the store would grow, and autovacuum
+ * takes them in the background (bmapmaintain()).
  */
 typedef struct BmapRelease
 {

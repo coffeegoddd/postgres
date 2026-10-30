@@ -94,6 +94,19 @@ typedef SMgrRelationData *SMgrRelation;
 
 extern PGDLLIMPORT const PgAioTargetInfo aio_smgr_target_info;
 
+/*
+ * What a pass of background maintenance of the current database's storage
+ * did (smgrmaintain()): how much of what dropped storage held was let go of,
+ * and what the sweeps that were due found.
+ */
+typedef struct SMgrMaintenance
+{
+	uint64		released;		/* release queue entries let go of */
+	uint64		released_freed; /* blocks those freed */
+	uint64		swept;			/* stores swept */
+	uint64		swept_freed;	/* blocks the sweeps freed */
+} SMgrMaintenance;
+
 extern void smgrinit(void);
 extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
 extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
@@ -122,6 +135,8 @@ extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer);
 extern uint32 smgrreleasestep(SMgrRelation reln);
 extern void smgrsettlexids(void);
+extern void smgrmaintain(int64 release_max, void (*pace) (void),
+						 SMgrMaintenance *done);
 extern void smgrprecommitdrop(SMgrRelation reln);
 extern bool smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum);

@@ -207,6 +207,17 @@ typedef struct f_smgr
 	void		(*smgr_settlexids) (void);
 
 	/*
+	 * Background maintenance of the current database's storage, by an
+	 * autovacuum worker after it has processed the database's tables: let go
+	 * of at most release_max more of what dropped storage holds (-1: no
+	 * limit), calling pace (if not NULL) between steps, and run whatever
+	 * other upkeep is due, adding what was done to *done.  In a transaction.
+	 * May be NULL.
+	 */
+	void		(*smgr_maintain) (int64 release_max, void (*pace) (void),
+								  SMgrMaintenance *done);
+
+	/*
 	 * May writing out a page of one of a relation's forks read the
 	 * relation's buffers of 'forknum'?  May be NULL (never).
 	 */
@@ -310,6 +321,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_beforeextend = bmapbeforeextend,
 		.smgr_releasestep = bmapreleasestep,
 		.smgr_settlexids = bmapsettlexids,
+		.smgr_maintain = bmapmaintain,
 		.smgr_writesread = bmapwritesread,
 		.smgr_readsdropped = true,
 		.smgr_unlink = bmapunlink,
@@ -981,6 +993,32 @@ smgrsettlexids(void)
 	for (int i = 0; i < NSmgr; i++)
 		if (smgrsw[i].smgr_settlexids)
 			smgrsw[i].smgr_settlexids();
+}
+
+/*
+ * smgrmaintain() -- Background maintenance of the current database's
+ *					 storage, in every storage manager that does any.
+ *
+ * Lets go of at most release_max entries of what dropped storage still
+ * holds in all (-1: no limit), calling pace, if not NULL, between steps so
+ * that the caller can sleep under its cost limits and accept interrupts,
+ * and runs what other upkeep is due.  *done is zeroed, then counts what was
+ * done.  In a transaction.
+ */
+void
+smgrmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
+{
+	memset(done, 0, sizeof(*done));
+	for (int i = 0; i < NSmgr; i++)
+	{
+		int64		left = release_max;
+
+		if (smgrsw[i].smgr_maintain == NULL)
+			continue;
+		if (release_max >= 0)
+			left = Max(release_max - (int64) done->released, 0);
+		smgrsw[i].smgr_maintain(left, pace, done);
+	}
 }
 
 /*
