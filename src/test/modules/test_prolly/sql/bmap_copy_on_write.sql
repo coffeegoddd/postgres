@@ -9,6 +9,8 @@ RESET client_min_messages;
 
 CREATE SCHEMA cow;
 SET debug_block_mapped_heap = on;
+-- (copies without an image, until the default is checked below)
+SET block_map_copy_images = off;
 CREATE TABLE cow.t (a int8, b int8, c int8, d int8);
 INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(1, 20000) g;
 SELECT pg_relation_filenode('cow.t') AS src \gset
@@ -56,6 +58,17 @@ SELECT test_bmap_free_blocks() > :free_before AS old_block_freed;
 SELECT test_bmap_write(:src, 4, 46);
 SELECT phys = :shared_phys4 AS claimed, epoch = test_bmap_epoch(:src) AS born_now
   FROM test_bmap_map(:src) WHERE blkno = 4;
+
+-- By default a copy logs the page's image, so no recovery needs the old
+-- block: the page left to the source alone is claimed at once, with no
+-- checkpoint between.
+RESET block_map_copy_images;
+SHOW block_map_copy_images;
+SELECT phys AS shared_phys5 FROM test_bmap_map(:copy) WHERE blkno = 5 \gset
+SELECT test_bmap_write(:copy, 5, 47);
+SELECT test_bmap_write(:src, 5, 48);
+SELECT phys = :shared_phys5 AS claimed_at_once
+  FROM test_bmap_map(:src) WHERE blkno = 5;
 
 -- Rows changed through SQL are copied the same way.  (Reading the source
 -- may set hint bits on pages still shared, which changes no row.)

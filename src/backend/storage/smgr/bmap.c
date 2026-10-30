@@ -103,8 +103,9 @@
  * record (tree_find()).  A map, or page store, of an older format (the flat
  * maps of version 1) is refused, not read (refuse_version()).
  *
- * Copies without an image.  A shared page copied before it changes is logged
- * without its image when a full-page write would leave the image out: the page
+ * Copies without an image.  With block_map_copy_images off, a shared page
+ * copied before it changes is logged without its image when a full-page
+ * write would leave the image out: the page
  * has changed since the redo pointer, so its image is in the WAL since.  The
  * copy's redo takes the page as replay rebuilt it in its buffer, or, where
  * replay may have skipped the page's records (its map on disk newer), from the
@@ -326,6 +327,7 @@
 
 bool		debug_block_mapped_heap = false;
 int			block_map_replay_entries = 65536;
+bool		block_map_copy_images = true;
 
 /* ----------------------------------------------------------------
  * Page layouts
@@ -7053,9 +7055,12 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 * map page nor sets its LSN, so its LSN says nothing of whether its
 		 * changes since the redo pointer are all in the WAL, nor of whether
 		 * replay skipped some of them (redo_remap_page()).  Its pages are
-		 * few, one for many thousands of the relation's.
+		 * few, one for many thousands of the relation's.  Nor with
+		 * block_map_copy_images on (the default), which keeps every recovery
+		 * from needing the old block: a standby's backup and pg_rewind then
+		 * work as they do for any relation.
 		 */
-		if (!hole && !zeroed && BufferIsValid(refbuf) &&
+		if (!block_map_copy_images && !hole && !zeroed && BufferIsValid(refbuf) &&
 			forknum == MAIN_FORKNUM &&
 			!BufferIsDirty(buffer) && !RelFileLocatorSkippingWAL(rel))
 		{

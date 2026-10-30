@@ -364,6 +364,13 @@
   max => '10.0',
 },
 
+{ name => 'block_map_copy_images', type => 'bool', context => 'PGC_SUSET', group => 'WAL_SETTINGS',
+  short_desc => 'Logs a full-page image of each shared page of block-mapped storage copied before its first change.',
+  long_desc => 'When off, a copy whose page already has an image in the WAL since the last checkpoint is logged without one, which saves WAL, but the old block must then stay as it is until no recovery could begin before the copy: an online backup taken on a standby across such copies fails as it stops, a standby whose restartpoint cannot be made cannot recover from a crash, and pg_rewind refuses a source that made such copies after the servers diverged.',
+  variable => 'block_map_copy_images',
+  boot_val => 'true',
+},
+
 { name => 'block_map_release_max_per_pass', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Sets how many release queue entries of dropped block-mapped storage an autovacuum worker lets go of in a database.',
   long_desc => 'After processing a database\'s tables, an autovacuum worker lets go of what dropped block-mapped relations still hold, under the cost-based vacuum delay, at most this many entries. -1 means no limit; 0 leaves it to extensions and VACUUM. A page store sweep the worker runs when one is due (once after the server starts, and after a crash or an error may have leaked blocks) drains the queue in full first, whatever this limit, and is not paced by the delay, as it holds off sharing and the reuse of freed blocks while it runs.',
