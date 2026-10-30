@@ -364,6 +364,15 @@
   max => '10.0',
 },
 
+{ name => 'block_map_release_max_per_pass', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Sets how many release queue entries of dropped block-mapped storage an autovacuum worker lets go of in a database.',
+  long_desc => 'After processing a database\'s tables, an autovacuum worker lets go of what dropped block-mapped relations still hold, under the cost-based vacuum delay, at most this many entries. -1 means no limit; 0 leaves it to extensions and VACUUM.',
+  variable => 'block_map_release_max_per_pass',
+  boot_val => '1000000',
+  min => '-1',
+  max => 'INT_MAX',
+},
+
 { name => 'block_map_replay_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Sets how many logical blocks of block-mapped relations recovery remembers a later remap of, ahead of its replay.',
   long_desc => 'A full-page image of a block map page can be older than the version on disk; recovery remembers each block the newer version maps from a later WAL position, until replay reaches it. Recovery stops if more are needed at once.',

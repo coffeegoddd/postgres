@@ -68,7 +68,7 @@ patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
-patch src/backend/postmaster/autovacuum.c  1a  leaves the freeze age to VACUUM when no setting gives one, so storage that shares pages freezes eagerly under autovacuum too
+patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain); block_map_release_max_per_pass
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
 patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change; storage manager hooks before an asynchronous read and before extension; single-block lookups, flushes and drops
@@ -80,9 +80,9 @@ patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage
 patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation by its logical length; its map fork counts as none
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_replay_entries and debug_block_mapped_heap
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
-patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_replay_entries
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_release_max_per_pass and block_map_replay_entries
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
@@ -96,6 +96,7 @@ patch src/include/catalog/storage.h  1a  declares storage creation in a chosen s
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_all_visible
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
+patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write

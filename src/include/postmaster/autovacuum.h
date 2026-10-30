@@ -43,6 +43,7 @@ extern PGDLLIMPORT int autovacuum_freeze_max_age;
 extern PGDLLIMPORT int autovacuum_multixact_freeze_max_age;
 extern PGDLLIMPORT double autovacuum_vac_cost_delay;
 extern PGDLLIMPORT int autovacuum_vac_cost_limit;
+extern PGDLLIMPORT int block_map_release_max_per_pass;
 extern PGDLLIMPORT double autovacuum_freeze_score_weight;
 extern PGDLLIMPORT double autovacuum_multixact_freeze_score_weight;
 extern PGDLLIMPORT double autovacuum_vacuum_score_weight;
