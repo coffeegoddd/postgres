@@ -34,6 +34,7 @@ SUBDIRS = \
 	partitioning \
 	port \
 	postmaster \
+	prolly \
 	regex \
 	replication \
 	rewrite \

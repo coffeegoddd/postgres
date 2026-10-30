@@ -144,6 +144,7 @@ header_subdirs = [
   'parser',
   'partitioning',
   'postmaster',
+  'prolly',
   'regex',
   'replication',
   'rewrite',

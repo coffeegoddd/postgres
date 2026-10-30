@@ -37,6 +37,7 @@ SUBDIRS = \
 	parser \
 	partitioning \
 	postmaster \
+	prolly \
 	regex \
 	replication \
 	rewrite \

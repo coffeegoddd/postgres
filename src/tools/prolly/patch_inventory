@@ -1,0 +1,37 @@
+# The patch inventory: every file outside the fork's own directories that
+# differs from the postgres/postgres commit the fork last merged.
+#
+# Merging a new upstream release means re-examining each of these files, so
+# each one is listed here with the reason the fork changes it.  The check
+# in check_patch_inventory.sh fails when a changed file is missing from this
+# list, when a listed file no longer differs from upstream, or when a line
+# is malformed.
+#
+# Two kinds of line:
+#
+#   own   PATH
+#       PATH belongs to the fork alone; nothing under it (if it ends in /)
+#       or nothing at it (if it doesn't) is a core change.
+#
+#   patch PATH LAYER REASON...
+#       PATH is a core file the fork changes.  LAYER is the roadmap layer
+#       that needs the change; REASON is a one-line explanation.
+#
+# Blank lines and lines starting with # are ignored.  Keep each section
+# sorted by path.
+
+# The fork's own files.
+own   .github/workflows/prolly.yml
+own   contrib/prolly/
+own   src/backend/prolly/
+own   src/include/prolly/
+own   src/tools/prolly/
+own   src/tools/prolly_bench/
+
+# Core files the fork changes.
+patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
+patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
+patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
+patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
+patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
+patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
