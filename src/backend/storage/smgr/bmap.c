@@ -294,6 +294,7 @@
 #include "common/hashfn.h"
 #include "common/int.h"
 #include "common/relpath.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
@@ -6932,8 +6933,23 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			UnlockReleaseBuffer(headerbuf);
 			return;
 		}
-		/* (every pointer set in the map's epoch: the path is its own) */
-		if (path_epoch >= epoch || tree_path_own(reln, blkno, epoch, true))
+		/*
+		 * (every pointer set in the map's epoch: the path is its own, as
+		 * tree_path_own() would find, which assert-enabled builds ask, so
+		 * that the two rules can't drift apart; the buffers it reads aren't
+		 * counted as the change's, which tests measure)
+		 */
+		if (path_epoch >= epoch)
+		{
+#ifdef USE_ASSERT_CHECKING
+			BufferUsage usage = pgBufferUsage;
+
+			Assert(tree_path_own(reln, blkno, epoch, true));
+			pgBufferUsage = usage;
+#endif
+			break;
+		}
+		if (tree_path_own(reln, blkno, epoch, true))
 			break;
 
 		/*
