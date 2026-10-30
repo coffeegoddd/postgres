@@ -6017,11 +6017,12 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 
 	/* (the map's epoch before the capture raised it) */
 	uint32		epoch = snap->epoch - 1;
-	RedoRefsPage *rp = palloc(sizeof(RedoRefsPage));
-	bool		ok = true;
 
-	rp->pageno = InvalidBlockNumber;
-	rp->nblocks = InvalidBlockNumber;
+	/* (on the stack: its page is read into, I/O-aligned) */
+	RedoRefsPage rp;
+
+	rp.pageno = InvalidBlockNumber;
+	rp.nblocks = InvalidBlockNumber;
 	redo_walk_nodes = 0;
 	redo_walk_ref_pages = 0;
 
@@ -6036,16 +6037,12 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 			top.since = snap->tops[k].since;
 			if (!redo_own_node(rel, &top, k, (BlockNumber) first,
 							   snap->nblocks, snap->vm_nblocks, epoch, lsn,
-							   tops_held ? 1 : 0, rp, own))
-			{
-				ok = false;
-				break;
-			}
+							   tops_held ? 1 : 0, &rp, own))
+				return false;
 		}
 		first += tree_span(k);
 	}
-	pfree(rp);
-	return ok;
+	return true;
 }
 
 /*
