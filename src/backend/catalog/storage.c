@@ -454,7 +454,6 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * corresponding sync request will be processed before the checkpoint
 	 * completes.
 	 */
-
 	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
 
