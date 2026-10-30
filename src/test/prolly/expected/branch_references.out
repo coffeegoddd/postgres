@@ -1,0 +1,97 @@
+-- References between branches and shared schemas: versioned objects may
+-- depend on shared ones, never the other way round, nor across branches;
+-- a shared table's foreign keys from several branches each act on their
+-- own branch's table.
+SELECT pg_branch_id_allocate() AS b1 \gset
+SELECT pg_branch_id_allocate() AS b2 \gset
+CREATE SCHEMA pub;
+CREATE TABLE pub.p (id int PRIMARY KEY);
+INSERT INTO pub.p VALUES (1), (2), (3);
+SET catalog_branch = :b1;
+CREATE SCHEMA app VERSIONED;
+CREATE TYPE app.mood AS ENUM ('ok');
+CREATE TABLE app.c (id int PRIMARY KEY, p int REFERENCES pub.p ON DELETE CASCADE,
+					r int REFERENCES pub.p ON DELETE RESTRICT);
+INSERT INTO app.c VALUES (11, 1, NULL), (12, 2, NULL);
+SELECT 'app.c'::regclass::oid AS c1 \gset
+SET catalog_branch = :b2;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.c (id int PRIMARY KEY, p int REFERENCES pub.p ON DELETE CASCADE,
+					r int REFERENCES pub.p ON DELETE RESTRICT);
+INSERT INTO app.c VALUES (21, 1, NULL), (22, 2, 3);
+-- a shared row deleted from one branch cascades on every branch's table
+SET catalog_branch = :b1;
+DELETE FROM pub.p WHERE id = 1;
+SELECT id FROM app.c ORDER BY id;
+ id 
+----
+ 12
+(1 row)
+
+SET catalog_branch = :b2;
+SELECT id FROM app.c ORDER BY id;
+ id 
+----
+ 22
+(1 row)
+
+-- and a row another branch's table restricts stays
+SET catalog_branch = :b1;
+DELETE FROM pub.p WHERE id = 3;
+ERROR:  update or delete on table "p" violates RESTRICT setting of foreign key constraint "c_r_fkey" on table "c"
+DETAIL:  Key (id)=(3) is referenced from table "c".
+SELECT id FROM pub.p ORDER BY id;
+ id 
+----
+  2
+  3
+(2 rows)
+
+-- a shared object cannot depend on a versioned one
+CREATE VIEW pub.v AS SELECT * FROM app.c;
+ERROR:  an object outside a versioned schema cannot depend on column id of table app.c
+DETAIL:  Objects in versioned schemas may depend on shared objects, not the other way round.
+CREATE TABLE pub.x (m app.mood);
+ERROR:  an object outside a versioned schema cannot depend on type app.mood
+DETAIL:  Objects in versioned schemas may depend on shared objects, not the other way round.
+CREATE TABLE pub.y (c int REFERENCES app.c);
+ERROR:  an object outside a versioned schema cannot depend on index app.c_pkey
+DETAIL:  Objects in versioned schemas may depend on shared objects, not the other way round.
+CREATE FUNCTION pub.f() RETURNS bigint LANGUAGE sql
+	BEGIN ATOMIC SELECT count(*) FROM app.c; END;
+ERROR:  an object outside a versioned schema cannot depend on table app.c
+DETAIL:  Objects in versioned schemas may depend on shared objects, not the other way round.
+-- nor a versioned one on another branch's
+SET catalog_branch = :b2;
+CREATE TABLE app.z (r regclass DEFAULT :'c1'::regclass);
+ERROR:  an object cannot depend on another branch's table app.c
+DETAIL:  Objects in versioned schemas may depend on shared objects, not the other way round.
+-- but a temporary one may, being the session's
+CREATE TEMP VIEW tv AS SELECT * FROM app.c;
+SELECT count(*) FROM tv;
+ count 
+-------
+     1
+(1 row)
+
+DROP VIEW tv;
+-- objects do not move between kinds of schema, nor between branches
+ALTER TABLE app.c SET SCHEMA pub;
+ERROR:  cannot move objects between a versioned schema and another kind or branch of schema
+ALTER TABLE pub.p SET SCHEMA app;
+ERROR:  cannot move objects between a versioned schema and another kind or branch of schema
+CREATE SCHEMA app2 VERSIONED;
+ALTER TABLE app.c SET SCHEMA app2;
+SELECT count(*) FROM app2.c;
+ count 
+-------
+     1
+(1 row)
+
+SET client_min_messages = warning;
+DROP SCHEMA app, app2 CASCADE;
+SET catalog_branch = :b1;
+DROP SCHEMA app CASCADE;
+RESET catalog_branch;
+DROP SCHEMA pub CASCADE;
+RESET client_min_messages;

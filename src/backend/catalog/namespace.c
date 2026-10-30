@@ -3542,6 +3542,9 @@ CheckSetNamespace(Oid oldNspOid, Oid nspOid)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot move objects into or out of TOAST schema")));
+
+	/* an object keeps its branch, or stays shared */
+	CatalogBranchCheckMove(oldNspOid, nspOid);
 }
 
 /*

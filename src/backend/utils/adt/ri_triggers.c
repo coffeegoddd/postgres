@@ -45,6 +45,7 @@
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
+#include "prolly/branch_catalog.h"
 #include "parser/parse_relation.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -2578,6 +2579,7 @@ ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
 	Relation	query_rel;
 	Oid			save_userid;
 	int			save_sec_context;
+	int32		save_branch;
 
 	/*
 	 * Use the query type code to determine whether the query is run against
@@ -2594,8 +2596,13 @@ ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
 
-	/* Create the plan */
+	/*
+	 * Create the plan, resolving the names in it as on the branch of the
+	 * referencing table, whatever branch this session is on
+	 */
+	save_branch = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
 	qplan = SPI_prepare(querystr, nargs, argtypes);
+	CatalogBranchResolveRestore(save_branch);
 
 	if (qplan == NULL)
 		elog(ERROR, "SPI_prepare returned %s for %s", SPI_result_code_string(SPI_result), querystr);
@@ -2630,6 +2637,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	int			spi_result;
 	Oid			save_userid;
 	int			save_sec_context;
+	int32		save_branch;
 	Datum		vals[RI_MAX_NUMKEYS * 2];
 	char		nulls[RI_MAX_NUMKEYS * 2];
 
@@ -2720,10 +2728,12 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	 * the outer query's after-trigger context and fire after all RI updates
 	 * on the same row are complete, rather than immediately.
 	 */
+	save_branch = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
 	spi_result = SPI_execute_snapshot(qplan,
 									  vals, nulls,
 									  test_snapshot, crosscheck_snapshot,
 									  false, false, limit);
+	CatalogBranchResolveRestore(save_branch);
 
 	/* Restore UID and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);

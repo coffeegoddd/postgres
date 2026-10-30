@@ -68,7 +68,8 @@ patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bo
 patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
-patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one
+patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema
+patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
@@ -107,6 +108,7 @@ patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page 
 patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
+patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve names on its table's branch, whatever branch the session is on
 patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per branch
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
