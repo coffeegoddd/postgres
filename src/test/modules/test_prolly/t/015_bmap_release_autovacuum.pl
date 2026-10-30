@@ -92,6 +92,39 @@ ok(!grep({ $_ > 300 + 128 } @drained),
   or diag("passes: @drained");
 is($swept, 0, 'and no sweep, none being due');
 
+# The maintenance holds no snapshot, so no xmin holds back every backend's
+# horizon while a worker drains under the cost-based delay (unlike a table's
+# vacuum, it doesn't run as a vacuum, whose xmin others' horizons pass
+# over).  A slow drain: each step's buffer accesses cost a sleep.  The
+# catalogs vacuumed first, so a worker has little else to do.
+sql('VACUUM');
+sql(q{CREATE TABLE x (a int, b int8) WITH (fillfactor = 10, autovacuum_enabled = off);
+	INSERT INTO x SELECT g, g FROM generate_series(1, 20000) g});
+sql('DROP TABLE x');
+cmp_ok(sql(q{SELECT test_bmap_release_pending()}), '>', 0, 'a drop queues');
+$node->append_conf(
+	'postgresql.conf', q{
+autovacuum_vacuum_cost_delay = 100
+autovacuum_vacuum_cost_limit = 1
+});
+autovacuum(1);
+my $draining = q{FROM pg_stat_activity a
+	WHERE backend_type = 'autovacuum worker' AND datname = 'postgres'
+	  AND wait_event = 'VacuumDelay'
+	  AND NOT EXISTS (SELECT FROM pg_stat_progress_vacuum v WHERE v.pid = a.pid)
+	  AND NOT EXISTS (SELECT FROM pg_stat_progress_analyze v WHERE v.pid = a.pid)};
+ok( $node->poll_query_until(
+		'postgres', "SELECT count(*) > 0 $draining"),
+	'a worker drains under the cost-based delay');
+is( sql("SELECT string_agg(coalesce(backend_xmin::text, 'none'), ',') $draining"),
+	'none', 'and it holds no xmin meanwhile');
+$node->append_conf('postgresql.conf', 'autovacuum_vacuum_cost_delay = 0');
+$node->reload;
+ok( $node->poll_query_until(
+		'postgres', q{SELECT test_bmap_release_pending() = 0}),
+	'the queue drains');
+autovacuum(0);
+
 # A crash leaks a table's blocks: its drop, prepared, commits, and the crash
 # comes before the drop's storage is queued.  Recovery replays the drop,
 # which leaves letting go of the table's storage to the primary's records.

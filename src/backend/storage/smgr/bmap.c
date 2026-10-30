@@ -7735,6 +7735,14 @@ store_tablespaces(void)
 	}
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
+
+	/*
+	 * The scan's catalog snapshot would stay registered, keeping an xmin
+	 * for as long as the caller's transaction runs: autovacuum's storage
+	 * maintenance would hold back every backend's horizon while it drains
+	 * and sweeps.
+	 */
+	InvalidateCatalogSnapshot();
 	return spcs;
 }
 
@@ -9912,6 +9920,8 @@ class_row_of(RelFileLocator rel, Oid *relid)
 	}
 	systable_endscan(scan);
 	table_close(pg_class, AccessShareLock);
+	/* (no xmin kept for the rest of a sweep or compaction) */
+	InvalidateCatalogSnapshot();
 	return found;
 }
 
