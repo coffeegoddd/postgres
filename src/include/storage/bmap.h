@@ -186,17 +186,16 @@ extern bool bmap_inspect_store_sync(RelFileLocator rel, uint64 *written,
 
 /*
  * The sweep: what a database's page store in a tablespace holds counted
- * exactly, blocks nothing holds freed, stuck counts rewritten, the store
- * shortened.
+ * exactly, blocks nothing holds freed (their counts zeroed first), the
+ * store shortened.
  */
 typedef struct BmapSweep
 {
 	uint64		relations;		/* maps read */
 	uint64		freed;			/* blocks nothing held */
-	uint64		recounted;		/* stuck counts rewritten */
+	uint64		recounted;		/* counts of blocks nothing held zeroed */
 	uint64		truncated;		/* blocks the store was shortened by */
 	uint64		moved;			/* blocks moved down for it */
-	uint64		stuck;			/* counts left stuck: past what one holds */
 } BmapSweep;
 
 extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
