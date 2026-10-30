@@ -4732,6 +4732,7 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	}
 
 	/* the last of them, and the node's own, with the copy */
+	INJECTION_POINT("bmap-tree-copy-counts", NULL);
 	parentbuf = parent_read(reln, parent);
 	{
 		uint32		rest = n - i;
@@ -4756,11 +4757,26 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
 		pfree(all);
 	}
-	refs_add_holders(&rp, rel, children + i, n - i);
 	c = refs_get(&rp, ptr->block);
 	if (c == 0)
-		elog(ERROR, "node %u of the page store of \"%s\" is copied but held once",
-			 ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+	{
+		/*
+		 * The node's other holder copied it, or let it go, since it was
+		 * found shared: tree_node_own() looks before the counts are locked,
+		 * and another relation sharing it changes its own path under its
+		 * own header only.  The node is this relation's alone now, so it is
+		 * claimed, its pointer set in this epoch, rather than copied.  Its
+		 * children gain no holder from this record; any an earlier HOLD
+		 * record gave them are freed a sweep later, as after a crash
+		 * between the two.
+		 */
+		refs_release(&rp);
+		ReleaseBuffer(parentbuf);
+		pfree(entries);
+		pfree(children);
+		return tree_stamp_node(reln, parent, epoch, ptr);
+	}
+	refs_add_holders(&rp, rel, children + i, n - i);
 	refs_set(&rp, ptr->block, c - 1);
 
 	alloc_take(rel, 1, &node, &alloc);
