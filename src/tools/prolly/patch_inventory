@@ -65,7 +65,7 @@ patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery st
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
-patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming
+patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/postmaster/autovacuum.c  1a  leaves the freeze age to VACUUM when no setting gives one, so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
