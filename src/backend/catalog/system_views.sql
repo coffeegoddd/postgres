@@ -1547,6 +1547,22 @@ GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subsynccommit, subwalrcvtimeout, subpublications, suborigin)
     ON pg_subscription TO public;
 
+CREATE VIEW pg_stat_block_mapped AS
+    SELECT
+            C.oid AS relid,
+            N.nspname AS schemaname,
+            C.relname AS relname,
+            C.relkind AS relkind,
+            S.pages_copied,
+            S.pages_claimed,
+            S.nodes_copied,
+            S.stats_reset
+    FROM pg_class C
+         LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace),
+         LATERAL pg_stat_get_block_map(C.oid) S
+    WHERE C.relkind IN ('r', 't', 'm', 'i', 'S') AND
+          S.pages_copied IS NOT NULL;
+
 CREATE VIEW pg_stat_subscription_stats AS
     SELECT
         ss.subid,

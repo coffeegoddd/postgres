@@ -7,6 +7,7 @@ backend_sources += files(
   'pgstat_archiver.c',
   'pgstat_backend.c',
   'pgstat_bgwriter.c',
+  'pgstat_block_map.c',
   'pgstat_checkpointer.c',
   'pgstat_database.c',
   'pgstat_function.c',

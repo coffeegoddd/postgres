@@ -347,6 +347,21 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_timestamp_cb = pgstat_function_reset_timestamp_cb,
 	},
 
+	[PGSTAT_KIND_BLOCK_MAP] = {
+		.name = "block_map",
+
+		.fixed_amount = false,
+		.write_to_file = true,
+
+		.shared_size = sizeof(PgStatShared_BlockMap),
+		.shared_data_off = offsetof(PgStatShared_BlockMap, stats),
+		.shared_data_len = sizeof(((PgStatShared_BlockMap *) 0)->stats),
+		.pending_size = sizeof(PgStat_BlockMapCounts),
+
+		.flush_pending_cb = pgstat_block_map_flush_cb,
+		.reset_timestamp_cb = pgstat_block_map_reset_timestamp_cb,
+	},
+
 	[PGSTAT_KIND_REPLSLOT] = {
 		.name = "replslot",
 

@@ -46,6 +46,7 @@ tests += {
       'bmap_settle_roots',
       'bmap_diff',
       'bmap_first_write',
+      'bmap_block_map_stats',
     ],
   },
   'tap': {

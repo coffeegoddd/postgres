@@ -1879,6 +1879,18 @@ pg_stat_bgwriter| SELECT pg_stat_get_bgwriter_buf_written_clean() AS buffers_cle
     pg_stat_get_bgwriter_maxwritten_clean() AS maxwritten_clean,
     pg_stat_get_buf_alloc() AS buffers_alloc,
     pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+pg_stat_block_mapped| SELECT c.oid AS relid,
+    n.nspname AS schemaname,
+    c.relname,
+    c.relkind,
+    s.pages_copied,
+    s.pages_claimed,
+    s.nodes_copied,
+    s.stats_reset
+   FROM (pg_class c
+     LEFT JOIN pg_namespace n ON ((n.oid = c.relnamespace))),
+    LATERAL pg_stat_get_block_map(c.oid) s(pages_copied, pages_claimed, nodes_copied, stats_reset)
+  WHERE ((c.relkind = ANY (ARRAY['r'::"char", 't'::"char", 'm'::"char", 'i'::"char", 'S'::"char"])) AND (s.pages_copied IS NOT NULL));
 pg_stat_checkpointer| SELECT pg_stat_get_checkpointer_num_timed() AS num_timed,
     pg_stat_get_checkpointer_num_requested() AS num_requested,
     pg_stat_get_checkpointer_num_performed() AS num_done,
