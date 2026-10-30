@@ -174,6 +174,9 @@ $sbackup->query_safe(q{SET client_min_messages = warning});
 $sbackup->query_safe(q{SELECT pg_backup_start('standby_hold', true)});
 ok($primary->poll_query_until('postgres', q{SELECT backups FROM test_bmap_standby_hold()}),
 	'a backup on the standby is reported');
+sql(q{CHECKPOINT});
+is(sql(q{SELECT backups FROM test_bmap_standby_hold()}), 't',
+	'and stays reported as the checkpointer recomputes the hold');
 ($copy, $blocks, $pages, $end) = shared_and_copied('v', 1);
 sql(q{CHECKPOINT});
 remake_pages($copy, $pages, $blocks);

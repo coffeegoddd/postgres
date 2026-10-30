@@ -1219,7 +1219,11 @@ XLogWalRcvSendReply(bool force, bool requestReply, bool checkApply)
 	static XLogRecPtr writePtr = InvalidXLogRecPtr;
 	static XLogRecPtr flushPtr = InvalidXLogRecPtr;
 	static XLogRecPtr applyPtr = InvalidXLogRecPtr;
+	static XLogRecPtr holdPtr = InvalidXLogRecPtr;
+	static bool holdBackups = false;
 	XLogRecPtr	latestApplyPtr = InvalidXLogRecPtr;
+	XLogRecPtr	latestHold;
+	bool		latestBackups;
 	TimestampTz now;
 
 	/*
@@ -1234,6 +1238,22 @@ XLogWalRcvSendReply(bool force, bool requestReply, bool checkApply)
 	now = GetCurrentTimestamp();
 
 	/*
+	 * Where a recovery of this server, or of one it serves, may begin, and
+	 * whether an online backup runs on either: the upstream server keeps
+	 * the blocks of block-mapped storage such a recovery reads (see "The
+	 * standby hold" in bmap.c).  A change of either is sent at once.
+	 */
+	{
+		bool		served_backups;
+		XLogRecPtr	served = bmap_standby_hold(&served_backups);
+
+		latestHold = GetRecoveryHold(&latestBackups);
+		if (XLogRecPtrIsValid(served) && served < latestHold)
+			latestHold = served;
+		latestBackups |= served_backups;
+	}
+
+	/*
 	 * We can compare the write and flush positions to the last message we
 	 * sent without taking any lock, but the apply position requires a spin
 	 * lock, so we don't check that unless it is expected to advance since the
@@ -1246,7 +1266,8 @@ XLogWalRcvSendReply(bool force, bool requestReply, bool checkApply)
 
 		if (writePtr == LogstreamResult.Write
 			&& flushPtr == LogstreamResult.Flush
-			&& (!checkApply || applyPtr == latestApplyPtr))
+			&& (!checkApply || applyPtr == latestApplyPtr)
+			&& holdPtr == latestHold && holdBackups == latestBackups)
 			return;
 	}
 
@@ -1266,24 +1287,10 @@ XLogWalRcvSendReply(bool force, bool requestReply, bool checkApply)
 	pq_sendint64(&reply_message, applyPtr);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
-
-	/*
-	 * Where a recovery of this server, or of one it serves, may begin, and
-	 * whether an online backup runs on either: the upstream server keeps
-	 * the blocks of block-mapped storage such a recovery reads (see "The
-	 * standby hold" in bmap.c).
-	 */
-	{
-		bool		backups;
-		bool		served_backups;
-		XLogRecPtr	hold = GetRecoveryHold(&backups);
-		XLogRecPtr	served = bmap_standby_hold(&served_backups);
-
-		if (XLogRecPtrIsValid(served) && served < hold)
-			hold = served;
-		pq_sendint64(&reply_message, hold);
-		pq_sendbyte(&reply_message, (backups || served_backups) ? 1 : 0);
-	}
+	holdPtr = latestHold;
+	holdBackups = latestBackups;
+	pq_sendint64(&reply_message, holdPtr);
+	pq_sendbyte(&reply_message, holdBackups ? 1 : 0);
 
 	/* Send it */
 	elog(DEBUG2, "sending write %X/%08X flush %X/%08X apply %X/%08X%s",
