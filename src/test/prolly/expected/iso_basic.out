@@ -1,0 +1,31 @@
+Parsed test spec with 3 sessions
+
+starting permutation: w_begin s_begin w_insert r_count w_commit r_count s_count s_commit
+step w_begin: BEGIN;
+step s_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM iso_basic;
+count
+-----
+    0
+(1 row)
+
+step w_insert: INSERT INTO iso_basic VALUES (1, 'one');
+step r_count: SELECT count(*) FROM iso_basic;
+count
+-----
+    0
+(1 row)
+
+step w_commit: COMMIT;
+step r_count: SELECT count(*) FROM iso_basic;
+count
+-----
+    1
+(1 row)
+
+step s_count: SELECT count(*) FROM iso_basic;
+count
+-----
+    0
+(1 row)
+
+step s_commit: COMMIT;

@@ -1,0 +1,3 @@
+# Isolation tests of Postgres semantics, run on the access method under
+# test.
+test: iso_basic

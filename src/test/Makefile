@@ -18,6 +18,7 @@ SUBDIRS = \
 	modules \
 	perl \
 	postmaster \
+	prolly \
 	recovery \
 	regress \
 	subscription

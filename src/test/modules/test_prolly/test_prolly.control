@@ -1,0 +1,4 @@
+comment = 'Unit tests and interface conformance suites for the version-control engine'
+default_version = '1.0'
+module_pathname = '$libdir/test_prolly'
+relocatable = true
