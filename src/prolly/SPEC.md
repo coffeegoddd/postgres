@@ -110,10 +110,17 @@ This hybrid storage approach has four key parts:
   from its tables into the history store.  Each branch has a working tree:
   a prolly tree in the history store that holds the same rows as the
   branch's tables.  Capture reads the branch's committed changes from the
-  WAL with logical decoding, the Postgres feature that turns WAL records
-  back into row-level inserts, updates and deletes, one committed
-  transaction at a time and in commit order.  It applies them to the
-  working tree, so the tree follows the tables a short way behind.  A Dolt commit records the
+  WAL with logical decoding.  Logical decoding is the Postgres feature
+  behind logical replication, and it turns WAL records back into row
+  changes: each insert, update and delete, with its table and column
+  values.  It requires `wal_level = logical`, which adds to the WAL what
+  decoding needs, such as the old row's key on an update or delete.  It
+  emits a transaction's changes only once the transaction commits, one
+  whole transaction at a time and in commit order, so aborted work never
+  appears.  A replication slot records how far its reader has got, so
+  the server keeps the WAL the reader has not reached yet.  Capture
+  applies the changes to the working tree, so the tree follows the tables
+  a short way behind.  A Dolt commit records the
   working tree as of a point in the WAL, without blocking writers.
 - **The window.**  A configurable stretch of history in which
   version-control operations are guaranteed to be efficient, at the cost of
