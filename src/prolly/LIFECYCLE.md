@@ -1470,6 +1470,38 @@ not measure frozen keyframes, keyframes taken in the background, or the
 production restore by sharing block maps, which should be flat at
 milliseconds rather than at the cost of the pages that differ.
 
+## Materialized and unmaterialized branches
+
+**The question.**  Every branch of a versioned schema has had its own
+catalog rows.  Does giving catalog rows only to the branches in use
+(materializing a branch on checkout or write, dematerializing it when
+clean) pay for itself?
+
+**The run** (2026-10-30, `~/pgv2-bench/matbranch/run.sh` on experiment C's
+cluster, which has branched catalogs and no copy-on-write storage): 300
+branches of a versioned schema of 10 tables, each with a primary key, one
+index and 100 rows.  All 300 are materialized, then all but 30, then all
+but 2.  A checkout is a session's switch to another materialized branch
+and its first query there, the median of 41.
+
+| Measure | All 300 materialized | 30 materialized | 2 materialized |
+|---|---:|---:|---:|
+| Checkout | 1.92 ms | 0.46 ms | 0.31 ms |
+| Checkout just after DDL elsewhere | 2.03 ms | 0.50 ms | 0.35 ms |
+| Rows in `pg_class` | 15,423 | 1,023 | 463 |
+| Main catalogs on disk | 26 MB | 12 MB | 10 MB |
+| Materializing one more branch | 361 ms | 93 ms | 67 ms |
+
+- Materializing all 300 slowed with every branch: 98, 182, 260 and 361 ms
+  a branch for each quarter.  Each branch's DDL pays for every branch
+  before it.  At about 870 branches it was about 1.5 s a branch.
+- Dematerializing cost 104 ms a branch with 300 materialized and 26 ms
+  with 30.
+- The catalog's size on disk barely shrinks, since VACUUM keeps the
+  space; the row counts are what scans pay for.
+
+Adopted: branches are materialized on use and dematerialized when clean.
+
 ## Keyframes across the freeze horizon
 
 **The hazard.**  A keyframe is pages, and a heap page names transactions:

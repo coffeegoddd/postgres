@@ -312,23 +312,25 @@ on one branch.  Each page those rows are on is copied the first time it is
 written, so the pages added are at most the pages the *D* rows are on,
 plus their index entries.  Dolt adds only the branch's name.
 
-**Proposed: materialized and unmaterialized branches.**  To be prototyped
-before it is adopted.  What makes our branches cost more than Dolt's is
-the working set, not the branch itself.  So a branch would have one of
-two states, and moving between them would be an explicit, priced step:
+**Materialized and unmaterialized branches.**  What makes our branches
+cost more than Dolt's is the working set, not the branch itself.  So a
+branch has one of two states, and moving between them is an explicit,
+priced step:
 - **Unmaterialized.**  The branch is only a head in the history store,
   as in Dolt: no catalog rows and no pages.  It can be read through
   history (log, diff, history and AS OF queries) but not written by SQL.
 - **Materialized.**  The branch has a working set: its own catalog rows,
   and pages shared copy-on-write.  It can be written.
 
-A branch would be materialized when a session checks it out, when it is
-first written, or on request.  It would be dematerialized on request, or
-after a time unused.  Dematerializing a branch whose working set holds
-uncommitted changes is refused, as Dolt refuses a merge that would stomp
-them.  Its head stays, and it gives back its catalog rows and pages.
+A branch is materialized when a session checks it out, when it is first
+written, or on request.  It is dematerialized on request, or after a time
+unused.  Dematerializing a branch whose working set holds uncommitted
+changes is refused, as Dolt refuses a merge that would stomp them.  Its
+head stays, and it gives back its catalog rows and pages.  Creating a
+branch makes only its head; the costs in the tables above are paid when it
+is materialized.
 
-| Operation | Dolt | Today | Proposed |
+| Operation | Dolt | Every branch materialized | Materialized on use |
 |---|---|---|---|
 | Create a branch | O(1) | O(C), or O(C + D) | O(1) |
 | Materialize at a materialized branch's HEAD | | | O(C) |
@@ -337,10 +339,31 @@ them.  Its head stays, and it gives back its catalog rows and pages.
 | Catalog filtering in checkout | | O(B × C) | O(B<sub>m</sub> × C) |
 
 Here *B<sub>m</sub>* is the number of materialized branches.  A thousand
-branches would then cost a thousand heads, and only those in use would pay
-for a working set.  This is also how clones treat branches today (layer
-12): other branches arrive as heads, and get a working set when checked
-out.
+branches cost a thousand heads, and only those in use pay for a working
+set.  Clones treat branches the same way: other branches arrive as heads,
+and get a working set when checked out.
+
+**Measured.**  On the prototype's branched catalogs, a versioned schema of
+10 tables, each with a primary key and one index, and 300 branches.
+Single runs.  This counts catalog work only: the prototype's catalogs have
+no copy-on-write storage, so a branch's data was created rather than
+shared.  Sharing it costs about 2 ms in production (see The window).
+
+| Measure | All 300 materialized | 30 materialized | 2 materialized |
+|---|---:|---:|---:|
+| Checkout (switch, then the first query) | 1.92 ms | 0.46 ms | 0.31 ms |
+| The same just after DDL elsewhere | 2.03 ms | 0.50 ms | 0.35 ms |
+| Rows in `pg_class` | 15,423 | 1,023 | 463 |
+| Materializing one more branch | 361 ms | 93 ms | 67 ms |
+
+- Checkout's catalog filtering follows the materialized branches, not all
+  of them.
+- With every branch materialized, each new branch's catalog work grew
+  with the branches before it: 98 ms each for the first 75, then 182, 260
+  and 361 ms for each later 75.  Materialized on use, it costs about 70 to
+  90 ms however many heads exist.
+- The catalog holds 33× fewer rows, which everything that scans it, from
+  autovacuum to `pg_dump`, benefits from.
 
 #### Checkout
 
@@ -351,8 +374,9 @@ the working set is clean or dirty: uncommitted changes stay in the pages of
 the branch they were made on.
 
 The one cost that grows is catalog filtering: the session rebuilds the set
-of other branches' catalog rows it must hide, which costs O(B × C), with
-*B* the number of branches (about 2 ms at 12,000 hidden objects in the
+of other branches' catalog rows it must hide, which costs O(B<sub>m</sub>
+× C), with *B<sub>m</sub>* the number of materialized branches (about 2 ms
+at 12,000 hidden objects in the
 prototype).
 
 As in Dolt, there is no checkout of a commit by itself (a detached HEAD):
@@ -363,8 +387,9 @@ Branching, or a branch is moved to it by a hard reset.
 
 | Operation | Dolt | This design |
 |---|---|---|
-| Check out from HEAD, clean | O(1) | O(1) in rows; O(B × C) in catalog filtering |
-| Check out from HEAD, dirty | O(1) | O(1) in rows; O(B × C) in catalog filtering |
+| Check out from HEAD, clean | O(1) | O(1) in rows; O(B<sub>m</sub> × C) in catalog filtering |
+| Check out from HEAD, dirty | O(1) | O(1) in rows; O(B<sub>m</sub> × C) in catalog filtering |
+| Check out an unmaterialized branch | O(1) | O(C) to materialize it, then as above |
 
 #### Diff
 
@@ -888,10 +913,7 @@ be kept.
   against even spacing, on `winbench` and `kfbench`, across history depths;
 - the storage held by keyframes under each spacing;
 - the cost of a move to tiered history: fetching chunks and an exported
-  keyframe from a file remote, then restoring;
-- for materialization: the cost of creating, materializing and
-  dematerializing, and catalog filtering with many unmaterialized
-  branches.
+  keyframe from a file remote, then restoring.
 
 ### Compared with stock Postgres: OLTP performance
 
