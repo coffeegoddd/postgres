@@ -10,29 +10,31 @@ SELECT test_prolly_loaded_at_preload();
 (1 row)
 
 SELECT suite, test, result, detail FROM test_prolly_unit_tests();
-  suite   |              test              | result | detail 
-----------+--------------------------------+--------+--------
- harness  | checks_pass                    | ok     | 
- harness  | check_fails                    | ok     | 
- harness  | comparisons_fail_with_values   | ok     | 
- harness  | rng_sequence                   | ok     | 
- harness  | u64_keys_sort_as_bytes         | ok     | 
- bufmgr   | md_pages_are_not_shared        | ok     | 
- bufmgr   | cleanup_lock_unprepared        | ok     | 
- bufmgr   | lookup_cached_blocks           | ok     | 
- bufmgr   | flush_listed_blocks            | ok     | 
- bufmgr   | drop_one_block                 | ok     | 
- bufmgr   | drop_unlinked_relation_buffers | ok     | 
- registry | register_and_look_up           | ok     | 
- registry | names_are_copied               | ok     | 
- registry | lists_in_registration_order    | ok     | 
- registry | rejects_duplicates             | ok     | 
- registry | rejects_bad_names_and_routines | ok     | 
- smgr     | md_is_chosen                   | ok     | 
- smgr     | md_pages_are_its_own           | ok     | 
- smgr     | md_refuses_shares              | ok     | 
- smgr     | md_hooks_do_nothing            | ok     | 
-(20 rows)
+     suite     |              test              | result | detail 
+---------------+--------------------------------+--------+--------
+ harness       | checks_pass                    | ok     | 
+ harness       | check_fails                    | ok     | 
+ harness       | comparisons_fail_with_values   | ok     | 
+ harness       | rng_sequence                   | ok     | 
+ harness       | u64_keys_sort_as_bytes         | ok     | 
+ bufmgr        | md_pages_are_not_shared        | ok     | 
+ bufmgr        | cleanup_lock_unprepared        | ok     | 
+ bufmgr        | lookup_cached_blocks           | ok     | 
+ bufmgr        | flush_listed_blocks            | ok     | 
+ bufmgr        | drop_one_block                 | ok     | 
+ bufmgr        | drop_unlinked_relation_buffers | ok     | 
+ registry      | register_and_look_up           | ok     | 
+ registry      | names_are_copied               | ok     | 
+ registry      | lists_in_registration_order    | ok     | 
+ registry      | rejects_duplicates             | ok     | 
+ registry      | rejects_bad_names_and_routines | ok     | 
+ smgr          | md_is_chosen                   | ok     | 
+ smgr          | md_pages_are_its_own           | ok     | 
+ smgr          | md_refuses_shares              | ok     | 
+ smgr          | md_hooks_do_nothing            | ok     | 
+ branch_filter | rows_naming_objects            | ok     | 
+ branch_filter | which_scans_filter             | ok     | 
+(22 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

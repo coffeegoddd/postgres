@@ -6,6 +6,7 @@ test_prolly_sources = files(
   'branch_conformance.c',
   'test_checksum.c',
   'test_prolly.c',
+  'unit_branch_filter.c',
   'unit_bufmgr.c',
   'unit_harness.c',
   'unit_registry.c',

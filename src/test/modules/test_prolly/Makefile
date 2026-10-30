@@ -8,6 +8,7 @@ OBJS = \
 	branch_conformance.o \
 	test_checksum.o \
 	test_prolly.o \
+	unit_branch_filter.o \
 	unit_bufmgr.o \
 	unit_harness.o \
 	unit_registry.o \

@@ -14,8 +14,11 @@
  * - a row describing an object (pg_attribute, pg_index, pg_attrdef,
  *	 pg_trigger, pg_rewrite, pg_policy, pg_inherits, pg_sequence,
  *	 pg_statistic, pg_enum, pg_range, pg_aggregate, pg_amop, ...) is that
- *	 object's branch's, and a pg_depend or pg_description row is hidden
- *	 when an object it names is.
+ *	 object's branch's, and a pg_depend, pg_description, pg_init_privs or
+ *	 pg_seclabel row is hidden when an object it names is;
+ * - the rows of shared catalogs that name this database's objects
+ *	 (pg_shdepend) are those objects' branches', and so are a publication's
+ *	 or a subscription's rows naming a branch's table or schema.
  *
  * An object's branch comes from the branch map (BranchMapRoutine).  The
  * map in use answers from a per-backend cache, and on a miss reads the
@@ -73,6 +76,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_init_privs.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -81,12 +85,17 @@
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_publication_namespace.h"
+#include "catalog/pg_publication_rel.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_seclabel.h"
 #include "catalog/pg_sequence.h"
+#include "catalog/pg_shdepend.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
+#include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
@@ -294,6 +303,45 @@ row_owners(Oid relid, HeapTuple tup, RowOwners *owners)
 				add_owner(owners, d->classoid, d->objoid);
 				break;
 			}
+		case InitPrivsRelationId:
+			{
+				Form_pg_init_privs p = (Form_pg_init_privs) row;
+
+				add_owner(owners, p->classoid, p->objoid);
+				break;
+			}
+		case SecLabelRelationId:
+			{
+				FormData_pg_seclabel *l = (FormData_pg_seclabel *) row;
+
+				add_owner(owners, l->classoid, l->objoid);
+				break;
+			}
+
+			/*
+			 * A shared catalog's rows of this database's objects; another
+			 * database's are left as they are, since this backend cannot
+			 * read that database's catalogs to learn their branches.
+			 */
+		case SharedDependRelationId:
+			{
+				Form_pg_shdepend d = (Form_pg_shdepend) row;
+
+				if (d->dbid == MyDatabaseId)
+					add_owner(owners, d->classid, d->objid);
+				break;
+			}
+
+			/* publications and subscriptions of a branch's tables */
+		case PublicationRelRelationId:
+			add_owner(owners, RelationRelationId, ((Form_pg_publication_rel) row)->prrelid);
+			break;
+		case PublicationNamespaceRelationId:
+			add_owner(owners, NamespaceRelationId, ((Form_pg_publication_namespace) row)->pnnspid);
+			break;
+		case SubscriptionRelRelationId:
+			add_owner(owners, RelationRelationId, ((Form_pg_subscription_rel) row)->srrelid);
+			break;
 		default:
 			return false;
 	}
@@ -345,6 +393,12 @@ filtered_catalog(Oid relid)
 		case StatisticExtDataRelationId:
 		case DependRelationId:
 		case DescriptionRelationId:
+		case SharedDependRelationId:
+		case InitPrivsRelationId:
+		case SecLabelRelationId:
+		case PublicationRelRelationId:
+		case PublicationNamespaceRelationId:
+		case SubscriptionRelRelationId:
 			return true;
 		default:
 			return false;
@@ -645,6 +699,11 @@ static const struct
 	TypeRelationId, Anum_pg_cast_castsource},
 	{TransformRelationId, TransformOidIndexId, Anum_pg_transform_oid,
 	TypeRelationId, Anum_pg_transform_trftype},
+	{PublicationRelRelationId, PublicationRelObjectIndexId, Anum_pg_publication_rel_oid,
+	RelationRelationId, Anum_pg_publication_rel_prrelid},
+	{PublicationNamespaceRelationId, PublicationNamespaceObjectIndexId,
+		Anum_pg_publication_namespace_oid,
+	NamespaceRelationId, Anum_pg_publication_namespace_pnnspid},
 };
 
 /*
