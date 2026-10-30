@@ -42,6 +42,7 @@ tests += {
     'tests': [
       't/001_preloaded.pl',
       't/002_bmap_storage.pl',
+      't/011_bmap_relfilenumber_reuse.pl',
     ],
   },
 }

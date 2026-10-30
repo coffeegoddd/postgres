@@ -52,6 +52,7 @@ patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
 patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers
 patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bootstrap catalogs
+patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/storage.c  1a  creates storage in a chosen storage manager or as a share of another relation's; truncation, drop and commit hooks for storage managers
