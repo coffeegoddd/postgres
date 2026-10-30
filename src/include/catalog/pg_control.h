@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	2001
+#define PG_CONTROL_VERSION	2002
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -178,6 +178,22 @@ typedef struct ControlFileData
 	XLogRecPtr	backupStartPoint;
 	XLogRecPtr	backupEndPoint;
 	bool		backupEndRequired;
+
+	/*
+	 * A storage manager may make pages durable by writing them out and
+	 * syncing them instead of logging them, which relies on no recovery
+	 * beginning at or before a position: replay from there could write
+	 * something else over such a page and then skip the records that made
+	 * it what it is.  syncedSince is the newest such position of the pages
+	 * synced so on this server, by a record it made or replayed, and
+	 * syncedCount how many times one was (XLogNoteSyncedPages()).  Recovery
+	 * refuses to begin at or before syncedSince, as does an online backup
+	 * on a standby whose restart point isn't past it; pg_rewind refuses to
+	 * rewind from a source that synced pages so since where the target's
+	 * replay would begin, or while it copied files.
+	 */
+	XLogRecPtr	syncedSince;
+	uint64		syncedCount;
 
 	/*
 	 * Parameter settings that determine if the WAL can be used for archival

@@ -6242,6 +6242,24 @@ StartupXLOG(void)
 					&haveBackupLabel, &haveTblspcMap);
 	checkPoint = ControlFile->checkPointCopy;
 
+	/*
+	 * Pages synced instead of logged need recovery to begin past the
+	 * position they rely on (XLogNoteSyncedPages()): a crash's recovery
+	 * begins past it, from a checkpoint made since, and a standby's
+	 * replay of such a record makes a restartpoint past it; one that
+	 * couldn't, a data directory pg_rewind made from such a source, or a
+	 * backup's copy of it, can't be recovered from here.
+	 */
+	if (InRecovery && XLogRecPtrIsValid(ControlFile->syncedSince) &&
+		checkPoint.redo <= ControlFile->syncedSince)
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("recovery would begin at %X/%08X, not past pages synced without being logged at %X/%08X",
+						LSN_FORMAT_ARGS(checkPoint.redo),
+						LSN_FORMAT_ARGS(ControlFile->syncedSince)),
+				 errdetail("Replay from there could overwrite those pages and then skip the records that made them."),
+				 errhint("Restore a base backup taken since, or clone the server again.")));
+
 	/* initialize shared memory variables from the checkpoint record */
 	TransamVariables->nextXid = checkPoint.nextXid;
 	TransamVariables->nextOid = checkPoint.nextOid;
@@ -7293,6 +7311,31 @@ GetBackupState(int *running, XLogRecPtr *last_start)
 	*running = XLogCtl->Insert.runningBackups;
 	*last_start = XLogCtl->Insert.lastBackupStart;
 	WALInsertLockRelease();
+}
+
+/*
+ * XLogNoteSyncedPages -- pages were written out and synced instead of
+ * logged, relying on no recovery beginning at or before 'since'
+ *
+ * Replay from there could write something else over such a page (a storage
+ * manager reusing a block for it, say) and then skip the records that made
+ * it what it is.  The caller makes its pages durable first, and calls this
+ * once it has, whether it made the record that relies on them or replays
+ * it.  pg_control keeps the newest such position, which recovery refuses
+ * to begin at or before (StartupXLOG()), as does an online backup on a
+ * standby (do_pg_backup_start()), and pg_rewind checks; and counts the
+ * calls, by which pg_rewind tells that pages were synced so while it
+ * copied files.
+ */
+void
+XLogNoteSyncedPages(XLogRecPtr since)
+{
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	if (since > ControlFile->syncedSince)
+		ControlFile->syncedSince = since;
+	ControlFile->syncedCount++;
+	UpdateControlFile();
+	LWLockRelease(ControlFileLock);
 }
 
 /*
@@ -10129,6 +10172,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 		do
 		{
 			bool		checkpointfpw;
+			XLogRecPtr	synced_since;
 
 			/*
 			 * Force a CHECKPOINT.  Aside from being necessary to prevent torn
@@ -10162,11 +10206,27 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 			state->startpoint = ControlFile->checkPointCopy.redo;
 			state->starttli = ControlFile->checkPointCopy.ThisTimeLineID;
 			checkpointfpw = ControlFile->checkPointCopy.fullPageWrites;
+			synced_since = ControlFile->syncedSince;
 			LWLockRelease(ControlFileLock);
 
 			if (backup_started_in_recovery)
 			{
 				XLogRecPtr	recptr;
+
+				/*
+				 * A backup begins at the last restartpoint, and a recovery
+				 * from at or before pages replay synced instead of logging
+				 * them could lose them (see XLogNoteSyncedPages()).
+				 */
+				if (XLogRecPtrIsValid(synced_since) &&
+					state->startpoint <= synced_since)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("the last restartpoint %X/%08X is not past pages replay synced without logging them at %X/%08X",
+									LSN_FORMAT_ARGS(state->startpoint),
+									LSN_FORMAT_ARGS(synced_since)),
+							 errhint("Run CHECKPOINT on the primary, wait for the standby to replay it, "
+									 "and then try an online backup again.")));
 
 				/*
 				 * Check to see if all WAL replayed during online backup

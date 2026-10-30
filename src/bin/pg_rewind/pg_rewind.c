@@ -479,6 +479,29 @@ main(int argc, char **argv)
 				LSN_FORMAT_ARGS(chkptrec), chkpttli);
 
 	/*
+	 * The source may have made pages durable by syncing them instead of
+	 * logging them, relying on no recovery beginning at or before a
+	 * position its control file keeps.  The rewound server's replay begins
+	 * at the last common checkpoint (or the source's restartpoint, if
+	 * earlier: see perform_rewind()), over files copied from the source as
+	 * they are now: if that is not past the position, replay could write
+	 * something else over such a page and then skip the records that made
+	 * it, and the server would refuse to start.
+	 */
+	if (XLogRecPtrIsValid(ControlFile_source.syncedSince) &&
+		Min(chkptredo, ControlFile_source.checkPointCopy.redo) <=
+		ControlFile_source.syncedSince)
+	{
+		pg_log_error("source server synced pages without logging them at %X/%08X, not before the rewound server's replay would begin at %X/%08X",
+					 LSN_FORMAT_ARGS(ControlFile_source.syncedSince),
+					 LSN_FORMAT_ARGS(Min(chkptredo,
+										 ControlFile_source.checkPointCopy.redo)));
+		pg_log_error_detail("Replay from there could overwrite those pages and then skip the records that made them.");
+		pg_log_error_hint("Recreate the target server from a base backup of the source server.");
+		exit(1);
+	}
+
+	/*
 	 * Replay on the rewound server resumes from the last common checkpoint
 	 * and adopts the data checksum state recorded there, not the state in the
 	 * control file installed from the source.  If checksums were enabled at
@@ -616,6 +639,7 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	XLogRecPtr	endrec;
 	TimeLineID	endtli;
 	ControlFileData ControlFile_new;
+	bool		synced_meanwhile;
 	size_t		size;
 	char	   *buffer;
 
@@ -710,6 +734,15 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	{
 		pg_fatal("source system was modified while pg_rewind was running");
 	}
+
+	/*
+	 * A live source that synced pages without logging them while the files
+	 * were copied (see main()) may have had them copied before they were
+	 * written, which no WAL makes up for.  The target is no longer usable
+	 * then: its control file is written so that recovery refuses to begin.
+	 */
+	synced_meanwhile = ControlFile_source_after.syncedCount !=
+		ControlFile_source.syncedCount;
 
 	if (showprogress)
 		pg_log_info("creating backup label and updating control file");
@@ -809,8 +842,19 @@ perform_rewind(filemap_t *filemap, rewind_source *source,
 	if (ControlFile_new.data_checksum_lsn > divergerec)
 		ControlFile_new.data_checksum_lsn = divergerec;
 
+	if (synced_meanwhile)
+		ControlFile_new.syncedSince = Max(ControlFile_new.syncedSince, endrec);
+
 	if (!dry_run)
 		update_controlfile(datadir_target, &ControlFile_new, do_sync);
+
+	if (synced_meanwhile)
+	{
+		pg_log_error("source server synced pages without logging them while files were copied");
+		pg_log_error_detail("The files copied may hold those pages from before they were written, and the target server can't be recovered.");
+		pg_log_error_hint("Recreate the target server from a base backup of the source server.");
+		exit(1);
+	}
 }
 
 static void

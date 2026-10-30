@@ -184,7 +184,7 @@ $sbackup->quit;
 # Injection points: a backup begun while a share syncs its blocks.
 SKIP:
 {
-	skip 'Injection points not supported by this build', 2
+	skip 'Injection points not supported by this build', 7
 	  if $ENV{enable_injection_points} ne 'yes';
 
 	sql(q{CREATE EXTENSION injection_points});
@@ -212,8 +212,54 @@ SKIP:
 		'logged after the share\'s record');
 	$during_backup->query_safe(q{SELECT * FROM pg_backup_stop()});
 	$during_backup->quit;
+
+	# A share's replay whose restartpoint can't be made (an injection point
+	# takes it for one that couldn't be, as when recovery holds references
+	# to pages it couldn't find): the standby says so, and a crash then
+	# can't be recovered from its restart point, before the blocks.
+	my $unsafe = make_table('unsafe', 10);
+	sql(q{CHECKPOINT});
+	$primary->wait_for_replay_catchup($standby);
+	$standby->safe_psql('postgres',
+		q{SELECT injection_points_attach('bmap-share-no-restartpoint', 'notice')});
+	$log_offset = -s $standby->logfile;
+	sql(qq{SELECT test_bmap_share($unsafe)});
+	$primary->wait_for_replay_catchup($standby);
+	ok($standby->log_contains(qr/restart point of recovery .* is not past the blocks a share of .* synced/,
+			$log_offset),
+		'a standby that makes no restartpoint past the blocks says so');
+	$standby->stop('immediate');
+	$log_offset = -s $standby->logfile;
+	ok(!$standby->start(fail_ok => 1), 'and refuses to recover from before them after a crash');
+	ok($standby->log_contains(qr/recovery would begin at .*, not past pages synced without being logged/,
+			$log_offset),
+		'saying why');
+
+	# A standby whose restart point isn't past such pages refuses an online
+	# backup, which would begin there, until a restartpoint is.
+	$primary->backup('again');
+	my $standby2 = PostgreSQL::Test::Cluster->new('share_synced_standby2');
+	$standby2->init_from_backup($primary, 'again', has_streaming => 1);
+	$standby2->append_conf('postgresql.conf', qq{
+checkpoint_timeout = 1h
+max_wal_size = 1GB
+});
+	$standby2->start;
+	$primary->wait_for_replay_catchup($standby2);
+	$standby2->safe_psql('postgres',
+		q{SELECT test_synced_pages_note(pg_last_wal_replay_lsn())});
+	my ($ret, $out, $err) = $standby2->psql('postgres',
+		q{SELECT pg_backup_start('refused', true)});
+	like($err, qr/is not past pages replay synced without logging them/,
+		'a standby refuses a backup beginning before pages synced');
+	sql(q{CHECKPOINT});
+	$primary->wait_for_replay_catchup($standby2);
+	($ret, $out, $err) = $standby2->psql('postgres',
+		q{SELECT pg_backup_start('allowed', true); SELECT pg_backup_stop()});
+	is($ret, 0, "and allows one once a restartpoint can be made past them ($err)");
+	$standby2->stop;
 }
 
-$standby->stop;
+$standby->stop if $ENV{enable_injection_points} ne 'yes';
 $primary->stop;
 done_testing();
