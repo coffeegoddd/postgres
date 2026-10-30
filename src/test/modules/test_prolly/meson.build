@@ -47,7 +47,17 @@ tests += {
       't/001_preloaded.pl',
       't/002_bmap_storage.pl',
       't/003_bmap_incremental_backup.pl',
+      't/004_bmap_share.pl',
+      't/005_bmap_share_limits.pl',
+      't/006_bmap_replaced_blocks.pl',
+      't/007_bmap_shared_changes.pl',
+      't/008_bmap_drop_replay.pl',
+      't/009_bmap_evictions.pl',
+      't/010_bmap_evict_lock.pl',
       't/011_bmap_relfilenumber_reuse.pl',
     ],
+    'env': {
+      'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
   },
 }
