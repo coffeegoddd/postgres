@@ -16,6 +16,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use PostgreSQL::Test::RecursiveCopy;
 
 my $primary = PostgreSQL::Test::Cluster->new('share_synced_primary');
 $primary->init(allows_streaming => 1);
@@ -166,37 +167,50 @@ $primary->wait_for_replay_catchup($standby);
 my $sbackup = $standby->background_psql('postgres', on_error_stop => 0);
 $sbackup->query_safe(q{SET client_min_messages = warning});
 $sbackup->query_safe(q{SELECT pg_backup_start('share_synced_standby', true)});
-sql(qq{SELECT test_bmap_share($late)});
+my $late_copy = sql(qq{SELECT test_bmap_share($late)});
+my $late_digest = sql(qq{SELECT test_bmap_rows_digest($late)});
 $primary->wait_for_replay_catchup($standby);
 $sbackup->query(q{SELECT * FROM pg_backup_stop()});
 like($sbackup->{stderr}, qr/relies on pages the primary synced without logging them/,
 	'a backup on the standby during the replay of a synced share fails');
 $sbackup->quit;
 
-# One begun after the replay stops as usual.
+# One begun after the replay stops as usual, and a server restored from
+# it reads the copy, the source changed since.
 $sbackup = $standby->background_psql('postgres');
 $sbackup->query_safe(q{SET client_min_messages = warning});
 $sbackup->query_safe(q{SELECT pg_backup_start('share_synced_standby_after', true)});
 $sbackup->query_safe(q{SELECT * FROM pg_backup_stop()});
 pass('a backup on the standby begun after the replay stops');
 $sbackup->quit;
+sql(q{UPDATE late SET b = 'z' WHERE a % 5 = 0});
+$primary->wait_for_replay_catchup($standby);
+$standby->backup('after_replay');
+my $restored = PostgreSQL::Test::Cluster->new('share_synced_restored');
+$restored->init_from_backup($standby, 'after_replay', has_streaming => 1);
+$restored->start;
+$standby->wait_for_replay_catchup($restored, $primary);
+is($restored->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($late_copy)}),
+	$late_digest, 'a server restored from a standby backup after the replay reads the copy');
+$restored->stop;
 
 # Injection points: a backup begun while a share syncs its blocks.
 SKIP:
 {
-	skip 'Injection points not supported by this build', 7
+	skip 'Injection points not supported by this build', 9
 	  if $ENV{enable_injection_points} ne 'yes';
 
 	sql(q{CREATE EXTENSION injection_points});
 	my $during = make_table('during', 20);
 	sql(q{CHECKPOINT});
+	my $during_digest = sql(qq{SELECT test_bmap_rows_digest($during)});
 	$start = sql(q{SELECT pg_current_wal_insert_lsn()});
 	$log_offset = -s $primary->logfile;
 	sql(q{SELECT injection_points_attach('bmap-share-sync', 'wait')});
 	my $sharing = $primary->background_psql('postgres');
 	$sharing->query_until(qr/started/, qq{
 		\\echo started
-		SELECT test_bmap_share($during);
+		SELECT test_bmap_share($during) AS during_copy \\gset
 	});
 	$primary->wait_for_event('client backend', 'bmap-share-sync');
 	my $during_backup = $primary->background_psql('postgres');
@@ -204,14 +218,39 @@ SKIP:
 	$during_backup->query_safe(q{SELECT pg_backup_start('share_synced_during', true)});
 	sql(q{SELECT injection_points_detach('bmap-share-sync')});
 	sql(q{SELECT injection_points_wakeup('bmap-share-sync')});
+	my $during_copy = $sharing->query_safe(q{\\echo :during_copy});
 	$sharing->quit;
 	ok($primary->log_contains(qr/a share of .* logged images of \d+ blocks it synced, a backup having begun/,
 			$log_offset),
 		'a backup begun while a share syncs its blocks gets their images');
 	cmp_ok(images_since($start, $during), '>=', sql(q{SELECT pg_relation_size('during') / 8192}),
 		'logged after the share\'s record');
-	$during_backup->query_safe(q{SELECT * FROM pg_backup_stop()});
+
+	# The backup's files copied, the source's map newer than the share (its
+	# first page copied, and written out), and the backup restored: it
+	# reads the copy and the source as they were.
+	sql(q{UPDATE during SET b = 'z' WHERE a = 1});
+	my $during_rows = sql(qq{SELECT test_bmap_rows_digest($during)});
+	sql(q{SELECT pg_buffercache_evict_relation('during')});
+	my $backup_dir = $primary->backup_dir . '/during_share';
+	PostgreSQL::Test::RecursiveCopy::copypath($primary->data_dir, $backup_dir,
+		filterfn => sub {
+			my $src = shift;
+			return $src ne 'postmaster.pid' && $src ne 'postmaster.opts' &&
+			  $src !~ m{^pg_wal/.};
+		});
+	my $label = $during_backup->query_safe(q{SELECT labelfile FROM pg_backup_stop()});
 	$during_backup->quit;
+	PostgreSQL::Test::Utils::append_to_file("$backup_dir/backup_label", $label);
+	my $from_during = PostgreSQL::Test::Cluster->new('share_synced_during');
+	$from_during->init_from_backup($primary, 'during_share', has_streaming => 1);
+	$from_during->start;
+	$primary->wait_for_replay_catchup($from_during);
+	is($from_during->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($during_copy)}),
+		$during_digest, 'a server restored from a backup begun during the share reads the copy');
+	is($from_during->safe_psql('postgres', qq{SELECT test_bmap_rows_digest($during)}),
+		$during_rows, 'and the source');
+	$from_during->stop;
 
 	# A share's replay whose restartpoint can't be made (an injection point
 	# takes it for one that couldn't be, as when recovery holds references
