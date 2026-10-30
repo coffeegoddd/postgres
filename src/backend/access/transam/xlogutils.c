@@ -564,6 +564,22 @@ XLogReadBufferForRecord(RelFileLocator rlocator, ForkNumber forknum,
 		ReadRecentBuffer(rlocator, forknum, blkno, recent_buffer))
 	{
 		buffer = recent_buffer;
+
+		/*
+		 * Only storage whose pages are prepared before they change can give
+		 * blocks other storage (smgrreplacesblocks()), and its buffers say
+		 * so, so a cached page of any other storage is used without opening
+		 * its relation.
+		 */
+		if ((flags & REDO_READ_SKIP_REPLACED) &&
+			BufferPreparesForChanges(buffer) &&
+			smgrreplacedafter(smgropen(rlocator, INVALID_PROC_NUMBER),
+							  forknum, blkno, record_lsn))
+		{
+			ReleaseBuffer(buffer);
+			*replaced = true;
+			return InvalidBuffer;
+		}
 		goto recent_buffer_fast_path;
 	}
 

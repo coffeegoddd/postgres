@@ -116,7 +116,9 @@ typedef struct f_smgr
 
 	/*
 	 * Can the fork's blocks be given other storage, which may have held
-	 * another relation's pages?  May be NULL (never).
+	 * another relation's pages?  May be NULL (never).  A fork whose blocks
+	 * can be is one whose pages are prepared before they change
+	 * (smgr_preparesforchanges): redo tells such pages by their buffers.
 	 */
 	bool		(*smgr_replacesblocks) (SMgrRelation reln, ForkNumber forknum);
 

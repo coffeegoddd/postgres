@@ -21,6 +21,8 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  bufmgr   | cleanup_lock_unprepared        | ok     | 
  bufmgr   | lookup_cached_blocks           | ok     | 
  bufmgr   | flush_listed_blocks            | ok     | 
+ bufmgr   | drop_one_block                 | ok     | 
+ bufmgr   | drop_unlinked_relation_buffers | ok     | 
  registry | register_and_look_up           | ok     | 
  registry | names_are_copied               | ok     | 
  registry | lists_in_registration_order    | ok     | 
@@ -30,7 +32,7 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  smgr     | md_pages_are_its_own           | ok     | 
  smgr     | md_refuses_shares              | ok     | 
  smgr     | md_hooks_do_nothing            | ok     | 
-(18 rows)
+(20 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

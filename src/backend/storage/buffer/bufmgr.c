@@ -709,17 +709,16 @@ BufferSmgrRelSlot(const RelFileLocator *rel)
 }
 
 /*
- * The generation of sharing of the page in buf_hdr: the global one and its
- * relation's, summed (each only rises, so a raise of either is a new sum).
- * The buffer is pinned, so its tag stays.
+ * The generation of sharing of the page in buf_hdr: its relation's slot's,
+ * plus one, so that it is never 0, the generation of a page settled at
+ * none.  The buffer is pinned, so its tag stays.
  */
 static inline uint64
 BufferSmgrGenerationOf(BufferDesc *buf_hdr)
 {
 	RelFileLocator rel = BufTagGetRelFileLocator(&buf_hdr->tag);
 
-	return pg_atomic_read_u64(BufferSmgrGeneration) +
-		pg_atomic_read_u64(&BufferSmgrRelGenerations[BufferSmgrRelSlot(&rel)]);
+	return pg_atomic_read_u64(&BufferSmgrRelGenerations[BufferSmgrRelSlot(&rel)]) + 1;
 }
 
 static inline bool
@@ -2334,6 +2333,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	BufferDesc *victim_buf_hdr;
 	uint64		victim_buf_state;
 	uint64		set_bits = 0;
+	bool		prepares;
 
 	/* Make sure we will have room to remember the buffer pin */
 	ResourceOwnerEnlarge(CurrentResourceOwner);
@@ -2386,6 +2386,13 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * buffer.  Remember to unlock the mapping lock while doing the work.
 	 */
 	LWLockRelease(newPartitionLock);
+
+	/*
+	 * Whether the page's storage manager prepares pages before they change,
+	 * asked now, while no lock is held: the answer goes into the buffer
+	 * header below, under its spinlock.
+	 */
+	prepares = smgrpreparesforchanges(smgr, forkNum);
 
 	/*
 	 * Acquire a victim buffer. Somebody else might try to do the same, we
@@ -2468,7 +2475,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * A page read from storage that may share it with another relation is
 	 * checked before its first change (PrepareBufferForChange()).
 	 */
-	if (smgrpreparesforchanges(smgr, forkNum))
+	if (prepares)
 	{
 		set_bits |= BM_SMGR_PREPARES | BM_SMGR_PREPARE;
 		pg_atomic_write_u64(&victim_buf_hdr->smgr_gen, 0);
@@ -2955,6 +2962,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	BlockNumber first_block;
 	IOContext	io_context = IOContextForStrategy(strategy);
 	instr_time	io_start;
+	bool		prepares;
+	bool		in_recovery;
 
 	/*
 	 * Before anything is taken for the extension, its storage manager may
@@ -2966,6 +2975,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 */
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
 		smgrbeforeextend(BMR_GET_SMGR(bmr), fork, extend_by);
+
+	/*
+	 * Whether the new pages' storage manager prepares pages before they
+	 * change, and whether recovery is in progress, asked once and before
+	 * any lock is taken: the answers go into buffer headers below, under
+	 * their spinlocks.
+	 */
+	prepares = smgrpreparesforchanges(BMR_GET_SMGR(bmr), fork);
+	in_recovery = RecoveryInProgress();
 
 	LimitAdditionalPins(&extend_by);
 
@@ -3162,11 +3180,11 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 * share or snapshot: a page extended then is settled at none,
 			 * to be checked before its first change once recovery ends.
 			 */
-			if (smgrpreparesforchanges(BMR_GET_SMGR(bmr), fork))
+			if (prepares)
 			{
 				set_bits |= BM_SMGR_PREPARES;
 				pg_atomic_write_u64(&victim_buf_hdr->smgr_gen,
-									RecoveryInProgress() ? 0 :
+									in_recovery ? 0 :
 									BufferSmgrGenerationOf(victim_buf_hdr));
 			}
 
@@ -6945,8 +6963,8 @@ UnlockBuffer(Buffer buffer)
 /*
  * Pages a storage manager prepares before they change (BM_SMGR_PREPARES),
  * so that a page it shares with another relation is copied first.  Whether
- * a page is to be prepared is settled at a generation of sharing
- * (BufferSmgrGeneration), which the buffer records (smgr_gen): the storage
+ * a page is to be prepared is settled at its relation's generation of
+ * sharing (BufferSmgrGenerationOf()), which the buffer records (smgr_gen): the storage
  * manager raises the generation when it begins sharing pages with another
  * relation (MarkRelationPagesShared()), so that every page settled
  * before then is checked again before it next changes, without visiting
@@ -7109,6 +7127,23 @@ BufferPrepareForChange(Buffer buffer)
 }
 
 /*
+ * BufferPreparesForChanges -- does the page's storage manager prepare its
+ * pages before they change (smgrpreparesforchanges())?
+ *
+ * Read from the buffer's header, without asking the storage manager.  The
+ * buffer must be pinned.
+ */
+bool
+BufferPreparesForChanges(Buffer buffer)
+{
+	Assert(BufferIsPinned(buffer));
+	if (BufferIsLocal(buffer))
+		return false;
+	return (pg_atomic_read_u64(&GetBufferDescriptor(buffer - 1)->state) &
+			BM_SMGR_PREPARES) != 0;
+}
+
+/*
  * BufferPageIsShared -- would preparing the page for a change copy it?
  *
  * For changes worth skipping rather than paying a copy for.  The page must
@@ -7159,7 +7194,10 @@ BufferPageIsSharedElsewhere(Buffer buffer)
  *
  * For a storage manager that has just begun sharing rel's pages with
  * another relation: pages already prepared (or found not shared) would
- * otherwise change in place.  O(1): it raises rel's generation of sharing,
+ * otherwise change in place.  The storage manager publishes the share in
+ * its own state first, so that a check begun after the raise sees the
+ * share; one begun before it sees the old generation at its end and leaves
+ * the page unsettled (BufferSmgrSettle()).  O(1): it raises rel's generation of sharing,
  * at which every page of rel (and of the relations whose generation shares
  * its slot) is checked again (BufferNeedsSmgrPrepare()), each page's next
  * change paying the storage manager's check; other relations' writers go
@@ -7306,11 +7344,13 @@ ConditionalLockBuffer(Buffer buffer)
 		return false;
 
 	/*
-	 * Preparing the page may copy it, which waits only for the storage
-	 * manager's own pages, never for another buffer's content lock: the
-	 * deadlocks callers avoid by not waiting can't arise.  Declining the
-	 * lock instead would make callers that retry until they get it (an
-	 * SP-GiST insertion) loop for as long as the page is shared.
+	 * Preparing the page may copy it, which locks the storage manager's own
+	 * pages (its map) after this one.  Those come after every relation's
+	 * pages in the lock order: no backend waits for a relation's page while
+	 * holding one of them, so the deadlocks callers avoid by not waiting
+	 * can't arise.  Declining the lock instead would make callers that
+	 * retry until they get it (an SP-GiST insertion) loop for as long as
+	 * the page is shared.
 	 */
 	if (unlikely(BufferNeedsSmgrPrepare(buf)))
 		PrepareBufferForChange(buffer, buf);
