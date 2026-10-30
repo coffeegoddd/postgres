@@ -19,6 +19,11 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots
 TAP_TESTS = 1
 
+EXTRA_INSTALL = contrib/pageinspect contrib/pg_buffercache contrib/pg_walinspect \
+	src/test/modules/injection_points
+
+export enable_injection_points
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
