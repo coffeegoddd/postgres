@@ -129,12 +129,40 @@ SELECT count(*), sum(b) FROM cow.t;
  20000 | 200630000
 (1 row)
 
+-- Reads don't copy pages: opportunistic pruning skips a shared page.
+CREATE TABLE cow.p (a int8, b int8, c int8, d int8) WITH (fillfactor = 100);
+INSERT INTO cow.p SELECT g, g, g, g FROM generate_series(1, 1000) g;
+UPDATE cow.p SET b = b + 1;
+SELECT pg_relation_filenode('cow.p') AS p \gset
+SELECT test_bmap_share(:p) AS pcopy \gset
+SELECT string_agg(phys::text, ',' ORDER BY blkno) AS p_map FROM test_bmap_map(:p) \gset
+SELECT count(*) FROM cow.p WHERE b > 0;
+ count 
+-------
+  1000
+(1 row)
+
+SELECT string_agg(phys::text, ',' ORDER BY blkno) = :'p_map' AS no_page_copied
+  FROM test_bmap_map(:p);
+ no_page_copied 
+----------------
+ t
+(1 row)
+
 SELECT test_bmap_unlink(:copy);
  test_bmap_unlink 
 ------------------
  
 (1 row)
 
+SELECT test_bmap_unlink(:pcopy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
 DROP SCHEMA cow CASCADE;
-NOTICE:  drop cascades to table cow.t
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table cow.t
+drop cascades to table cow.p
 RESET debug_block_mapped_heap;

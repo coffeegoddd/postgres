@@ -1112,6 +1112,9 @@ _bt_conditionallockbuf(Relation rel, Buffer buf)
 
 /*
  *	_bt_upgradelockbufcleanup() -- upgrade lock to a full cleanup lock.
+ *
+ * VACUUM takes it on every leaf page, and changes few: the page is prepared
+ * for a change by the change (BufferPrepareForChange()).
  */
 void
 _bt_upgradelockbufcleanup(Relation rel, Buffer buf)
@@ -1124,7 +1127,7 @@ _bt_upgradelockbufcleanup(Relation rel, Buffer buf)
 
 	/* LockBuffer() asserts that pin is held by this backend */
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	LockBufferForCleanup(buf);
+	LockBufferForCleanupUnprepared(buf);
 }
 
 /*
@@ -1173,6 +1176,9 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
+
+	/* locked by _bt_upgradelockbufcleanup() */
+	BufferPrepareForChange(buf);
 
 	/* Generate new version of posting lists without deleted TIDs */
 	if (nupdatable > 0)

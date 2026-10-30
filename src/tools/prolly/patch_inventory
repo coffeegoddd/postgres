@@ -47,6 +47,7 @@ patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager 
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
 patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing
 patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; scans eagerly to freeze while pages are a relation's own
+patch src/backend/access/nbtree/nbtpage.c  1a  B-tree VACUUM takes leaf cleanup locks unprepared and prepares only the pages it changes, so shared leaves aren't copied
 patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
 patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
 patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions
