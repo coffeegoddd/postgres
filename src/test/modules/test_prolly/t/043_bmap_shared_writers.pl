@@ -111,6 +111,19 @@ for my $rel ('t', 'c')
 cmp_ok(sql(q{SELECT count(*) FILTER (WHERE refs = 0) FROM test_bmap_map(pg_relation_filenode('c'))}),
 	'>', 0, 'the copy\'s changed pages were copied');
 
+# Sweep until a sweep frees nothing: the blocks freed.
+sub sweep_all
+{
+	my $total = 0;
+	for (1 .. 10)
+	{
+		my $freed = sql(q{SELECT freed FROM test_bmap_sweep()});
+		last if $freed == 0;
+		$total += $freed;
+	}
+	return $total;
+}
+
 sub check
 {
 	my ($what) = @_;
@@ -149,10 +162,12 @@ check('after VACUUM');
 # once: each relation's path changes under its own header only, so one
 # side may find a node shared that the other copies before it takes the
 # counts' lock.  It is then the first side's alone, and is claimed rather
-# than copied (it used to fail "is copied but held once").
+# than copied (it used to fail "is copied but held once"); the holders its
+# children were given first, each in a record of its own here, are taken
+# back, so once both sides are dropped nothing is left for a sweep.
 SKIP:
 {
-	skip 'injection points not supported by this build', 7
+	skip 'injection points not supported by this build', 8
 	  unless $ENV{enable_injection_points} eq 'yes';
 	sql(q{
 		CREATE EXTENSION IF NOT EXISTS injection_points;
@@ -172,12 +187,15 @@ SKIP:
 	my $first = $node->background_psql('postgres');
 	$first->query_safe(q{SELECT injection_points_set_local()});
 	$first->query_safe(q{SELECT injection_points_attach('bmap-tree-copy-counts', 'wait')});
+	$first->query_safe(q{SELECT injection_points_attach('bmap-tree-hold-first', 'notice')});
 	$first->query_until(qr/^$/, "UPDATE u SET n = 1 WHERE k = 10000;\n");
 	$node->wait_for_event('client backend', 'bmap-tree-copy-counts');
 	sql(q{UPDATE v SET n = 2 WHERE k = 10000});
+	# (detached before the wakeup: a path of more levels would wait again)
+	sql(q{SELECT injection_points_detach('bmap-tree-copy-counts')});
 	sql(q{SELECT injection_points_wakeup('bmap-tree-copy-counts')});
 	my $done = eval {
-		$first->query_safe(q{SELECT injection_points_detach('bmap-tree-copy-counts')});
+		$first->query_safe(q{SELECT 1});
 		1;
 	};
 	ok($done, 'the change held at the copy goes on, the node now its own')
@@ -190,6 +208,47 @@ SKIP:
 		'00', 'amcheck finds both heaps sound');
 	$first->quit;
 	ok(!$node->log_contains(qr/is copied but held once/), 'no copy failed');
+
+	# (what earlier steps left for a sweep, first)
+	sweep_all();
+	sql(q{DROP TABLE u, v});
+	sql(q{SELECT * FROM test_bmap_release_drain()});
+	is(sweep_all(), 0, 'dropping both sides frees every block: no child is held once too often');
+}
+
+# A lookup reads a map's tree under no lock of its header, a node at a
+# time.  One holding a pointer to a node its map shares, read before its
+# map copied the node, must not follow it into the other map once that
+# map, the node now its own, changes it in place: the node is born again
+# as it is claimed, and the lookup begins again from the root.
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  unless $ENV{enable_injection_points} eq 'yes';
+	sql(q{
+		CREATE TABLE x (a int, b text);
+		INSERT INTO x SELECT g, repeat('x', 500) FROM generate_series(1, 200) g;
+		CHECKPOINT;
+	});
+	my $x = sql(q{SELECT pg_relation_filenode('x')});
+	my $xc = sql(qq{SELECT test_bmap_share($x)});
+	sql(q{CHECKPOINT});
+	my $before = sql(qq{SELECT test_bmap_read($x, 3, false)});
+	my $reader = $node->background_psql('postgres');
+	$reader->query_safe(q{SELECT injection_points_set_local()});
+	$reader->query_safe(q{SELECT injection_points_attach('bmap-tree-find-root', 'wait')});
+	$reader->query_until(qr/^$/, "SELECT test_bmap_read($xc, 3, true) AS seen \\gset\n");
+	$node->wait_for_event('client backend', 'bmap-tree-find-root');
+	# the copy's change copies the shared leaf; the source then has it alone
+	sql(qq{SELECT test_bmap_write($xc, 5, 7)});
+	sql(qq{SELECT test_bmap_write($x, 3, 99)});
+	sql(q{CHECKPOINT});
+	sql(q{SELECT injection_points_detach('bmap-tree-find-root')});
+	sql(q{SELECT injection_points_wakeup('bmap-tree-find-root')});
+	is($reader->query_safe(q{SELECT :'seen'}), $before,
+		'a lookup holding a pointer from before its map copied a node reads its own block');
+	is(sql(qq{SELECT test_bmap_read($x, 3, false)}), '99', 'while the source has its change');
+	$reader->quit;
 }
 
 $node->stop;

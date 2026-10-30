@@ -1752,7 +1752,7 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 		/* (in redo, an entry kept from a newer page: see redo_block()) */
 		if (e->since > delta->since)
 			continue;
-		if (e->block != ent[i].block)
+		if (e->block != ent[i].block || (delta->flags & BMAP_NODE_REBORN))
 			e->since = delta->since;
 		else if (e->epoch == ent[i].epoch)
 			continue;
@@ -2416,6 +2416,7 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 					 errmsg("block 1 of \"%s\" is not the root page of a block map of format version %u, which this server reads only",
 							relpathperm(rel, BMAP_FORKNUM).str, BMAP_VERSION),
 					 errhint("Recreate the database from a dump made by the server that wrote it.")));
+		INJECTION_POINT("bmap-tree-find-root", NULL);
 
 		for (level = path.top; level >= 0; level--)
 		{
@@ -3611,19 +3612,26 @@ tree_node_own(RelFileLocator rel, const BmapEntry *ptr, uint32 epoch,
 
 /*
  * Set the pointer 'ptr' in 'parent' (the relation's own) to the relation's
- * own node, set before the map's epoch, in 'epoch' instead: so every node
- * above a leaf changed in an epoch is pointed to as of that epoch at least,
+ * own node, of 'level' mapping from 'first', set before the map's epoch, in
+ * 'epoch' instead, and the node born again: a lookup that read a pointer
+ * to it before (tree_find(), under no header lock) may be of another map
+ * that shared it and has since copied it, and must not take it for the
+ * node it read of once this relation changes it in place.  The epoch makes
+ * every node above a leaf changed in an epoch pointed to as of that epoch at
+ * least,
  * and the pages changed since an epoch are found by walking only the
  * subtrees set since (bmap_changed_pages()).  One record, the parent's
- * delta, made once a node for each epoch: the first change under it.  The
- * header is held exclusively.  Returns the pointer as set.
+ * delta and the node's image, made once a node for each epoch: the first
+ * change under it.  The header is held exclusively.  Returns the pointer
+ * as set.
  */
 static BmapEntry
 tree_stamp_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
-				const BmapEntry *ptr)
+				uint16 level, BlockNumber first, const BmapEntry *ptr)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		parentbuf;
+	Buffer		nodebuf;
 	xl_bmap_tree xlrec;
 	struct
 	{
@@ -3633,7 +3641,20 @@ tree_stamp_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	BmapEntry	stamped = *ptr;
 	XLogRecPtr	lsn;
 
+	/*
+	 * Both read first, then the node locked and the parent last, with no
+	 * read until both are unlocked: the node is held as a node just made is
+	 * (map_lock()), the one other page locked a change of no page it maps
+	 * being written meanwhile.
+	 */
+	nodebuf = tree_read(rel, ptr->block, RBM_NORMAL);
 	parentbuf = parent_read(reln, parent);
+	map_lock(nodebuf, true);
+	if (!tree_node_is(BufferGetPage(nodebuf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
 	map_lock(parentbuf, false);
 	parent_check(reln, parent, BufferGetPage(parentbuf));
 	if (PageGetBmapEntries(BufferGetPage(parentbuf))[parent->slot].block != ptr->block)
@@ -3647,27 +3668,34 @@ tree_stamp_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	xlrec.from = InvalidBlockNumber;
 	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
 	stamped.epoch = epoch;
+	stamped.since = GetXLogInsertRecPtr();
 	pdelta.d.kind = BMAP_DELTA_NODE;
-	pdelta.d.flags = 0;
+	pdelta.d.flags = BMAP_NODE_REBORN;
 	pdelta.d.nentries = 1;
-	pdelta.d.since = GetXLogInsertRecPtr();
+	pdelta.d.since = stamped.since;
 	pdelta.e.slot = parent->slot;
 	pdelta.e.block = ptr->block;
 	pdelta.e.epoch = epoch;
 
 	START_CRIT_SECTION();
+	PageGetBmapTreeOpaque(BufferGetPage(nodebuf))->born = stamped.since;
+	MarkBufferDirty(nodebuf);
 	apply_node_delta(BufferGetPage(parentbuf), &pdelta.d);
 	MarkBufferDirty(parentbuf);
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
 	XLogRegisterBuffer(0, parentbuf, REGBUF_STANDARD);
 	XLogRegisterBufData(0, &pdelta, sizeof(pdelta));
+	XLogRegisterBuffer(1, nodebuf, REGBUF_FORCE_IMAGE);
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
 	PageSetLSN(BufferGetPage(parentbuf), lsn);
+	PageSetLSN(BufferGetPage(nodebuf), lsn);
 	END_CRIT_SECTION();
 
 	map_unlock(parentbuf);
 	ReleaseBuffer(parentbuf);
+	map_unlock(nodebuf);
+	ReleaseBuffer(nodebuf);
 	return stamped;
 }
 
@@ -3716,7 +3744,8 @@ tree_leaf_for(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
 				ptr = tree_copy_node(reln, &parent, epoch, level,
 									 path.first[level], &ptr);
 			else if (ptr.epoch < epoch)
-				ptr = tree_stamp_node(reln, &parent, epoch, &ptr);
+				ptr = tree_stamp_node(reln, &parent, epoch, level,
+									  path.first[level], &ptr);
 			owned = true;
 		}
 		parent.root = false;
@@ -4765,16 +4794,34 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 		 * found shared: tree_node_own() looks before the counts are locked,
 		 * and another relation sharing it changes its own path under its
 		 * own header only.  The node is this relation's alone now, so it is
-		 * claimed, its pointer set in this epoch, rather than copied.  Its
-		 * children gain no holder from this record; any an earlier HOLD
-		 * record gave them are freed a sweep later, as after a crash
-		 * between the two.
+		 * claimed, born again in this epoch (tree_stamp_node()), rather
+		 * than copied.  Its children gain no holder from this record, and
+		 * those the earlier HOLD records gave them are taken back (UNHOLD):
+		 * else each would stay counted once too often, copied rather than
+		 * claimed at its next change, its block never freed.
 		 */
 		refs_release(&rp);
 		ReleaseBuffer(parentbuf);
+		for (uint32 k = 0; k < i;)
+		{
+			uint32		covered = refs_lock(rel, children + k, i - k, &rp);
+
+			for (uint32 m = 0; m < covered; m++)
+			{
+				uint32		held = refs_get(&rp, children[k + m]);
+
+				Assert(held > 0);
+				refs_set(&rp, children[k + m], held - 1);
+			}
+			xlrec.op = BMAP_TREE_UNHOLD;
+			log_refs_record(XLOG_BMAP_TREE, &xlrec, sizeof(xlrec), InvalidBuffer,
+							NULL, 0, &rp);
+			refs_release(&rp);
+			k += covered;
+		}
 		pfree(entries);
 		pfree(children);
-		return tree_stamp_node(reln, parent, epoch, ptr);
+		return tree_stamp_node(reln, parent, epoch, level, first, ptr);
 	}
 	refs_add_holders(&rp, rel, children + i, n - i);
 	refs_set(&rp, ptr->block, c - 1);

@@ -245,15 +245,20 @@ typedef struct xl_bmap_extend
  * BMAP_TREE_EPOCH		the map's epoch raised, so that each page's next change
  *						claims or copies it: block 0 is its header
  * BMAP_TREE_STAMP		a pointer to the relation's own node 'node' set in the
- *						map's epoch, the first change under it in the epoch:
- *						block 0 is the parent (a node, or the tree's root
- *						page), its delta
+ *						map's epoch, the first change under it in the epoch,
+ *						and the node born again: block 0 is the parent (a
+ *						node, or the tree's root page), its delta
+ *						(BMAP_NODE_REBORN); block 1 the node, an image
  * BMAP_TREE_FREE_SPACE	VACUUM recorded the free space of every page the
  *						free space map might not know: block 0 is the
  *						header, which then says none
  * BMAP_TREE_CREATOR	the storage of a transaction that never committed,
  *						taken to be dropped: block 0 is the header, which
  *						then names the transaction dropping it
+ * BMAP_TREE_UNHOLD		the holders HOLD records gave children of node 'from'
+ *						taken back, the node claimed instead of copied (its
+ *						other holder copied it first): the reference-count
+ *						pages of the children, each a holder fewer
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -265,6 +270,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_STAMP			10
 #define BMAP_TREE_FREE_SPACE	11
 #define BMAP_TREE_CREATOR		12
+#define BMAP_TREE_UNHOLD		13
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_ROOT		0x02
@@ -380,6 +386,14 @@ typedef struct xl_bmap_header_delta
  * takes 'since', a WAL position no later than the record's start and after
  * every earlier record of the logical block.
  */
+/*
+ * BMAP_NODE_REBORN: the entries' births are set to 'since' though their
+ * blocks are the same, the node each points to born again (its page's
+ * birth set to 'since' too), so a lookup holding a pointer to it from
+ * before doesn't take it for the node it read of.
+ */
+#define BMAP_NODE_REBORN		0x02	/* (0x01 is BMAP_DELTA_INIT) */
+
 typedef struct xl_bmap_node_delta
 {
 	uint16		kind;			/* BMAP_DELTA_NODE */
