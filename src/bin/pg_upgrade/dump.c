@@ -59,8 +59,7 @@ generate_old_dump(void)
 						   "\"%s/pg_dump\" %s --no-data %s %s --quote-all-identifiers "
 						   "--binary-upgrade --format=custom %s --no-sync --file=\"%s/%s\" %s",
 						   new_cluster.bindir, cluster_conn_opts(&old_cluster),
-						   (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
-						   "" : "--sequence-data",
+						   TRANSFER_SEQUENCES() ? "" : "--sequence-data",
 						   log_opts.verbose ? "--verbose" : "",
 						   user_opts.do_statistics ? "--statistics" : "--no-statistics",
 						   log_opts.dumpdir,
