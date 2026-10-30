@@ -460,7 +460,7 @@ Datum
 test_bmap_write(PG_FUNCTION_ARGS)
 {
 	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
-	BlockNumber blkno = PG_GETARG_INT32(1);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT64(1);
 	int32		value = PG_GETARG_INT32(2);
 	Buffer		buf;
 	Page		page;
@@ -482,6 +482,121 @@ test_bmap_write(PG_FUNCTION_ARGS)
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_bmap_extend_at(relnumber, blkno): write an initialized, empty page
+ * at blkno, past the relation's end, as a hash index's bucket allocation
+ * writes the last block of a range: told to the storage manager
+ * (smgrpreextend()), logged, then written with smgrextend(), leaving the
+ * blocks between the old end and it unwritten.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_extend_at);
+
+Datum
+test_bmap_extend_at(PG_FUNCTION_ARGS)
+{
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT64(1);
+	PGIOAlignedBlock page;
+
+	PageInit(page.data, BLCKSZ, 0);
+	smgrpreextend(srel, MAIN_FORKNUM, blkno, 1);
+	log_newpage(&srel->smgr_rlocator.locator, MAIN_FORKNUM, blkno, page.data,
+				true);
+	PageSetChecksum(page.data, blkno);
+	smgrextend(srel, MAIN_FORKNUM, blkno, page.data, false);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_bmap_init_block(relnumber, blkno): initialize a block below the
+ * relation's end as an access method makes a new page there (a hash
+ * index's new bucket): read zeroed and locked, initialized, logged.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_init_block);
+
+Datum
+test_bmap_init_block(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	Buffer		buf;
+
+	(void) bmap_smgr(loc.relNumber);
+	buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM,
+									(BlockNumber) PG_GETARG_INT64(1),
+									RBM_ZERO_AND_LOCK, NULL, true);
+	START_CRIT_SECTION();
+	PageInit(BufferGetPage(buf), BLCKSZ, 0);
+	MarkBufferDirty(buf);
+	log_newpage_buffer(buf, true);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_bmap_read(relnumber, blkno, buffered): read a page, through shared
+ * buffers or with smgrread(): 'zeroes' if it is all zeroes, else the byte
+ * test_bmap_write() changes (the first of its hole).
+ */
+PG_FUNCTION_INFO_V1(test_bmap_read);
+
+Datum
+test_bmap_read(PG_FUNCTION_ARGS)
+{
+	RelFileLocator loc = locator_of(PG_GETARG_OID(0));
+	SMgrRelation srel = bmap_smgr(loc.relNumber);
+	BlockNumber blkno = (BlockNumber) PG_GETARG_INT64(1);
+	PGIOAlignedBlock page;
+	PageHeader	ph = (PageHeader) page.data;
+
+	if (PG_GETARG_BOOL(2))
+	{
+		Buffer		buf = ReadBufferWithoutRelcache(loc, MAIN_FORKNUM, blkno,
+													RBM_NORMAL, NULL, true);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(page.data, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
+	}
+	else
+		smgrread(srel, MAIN_FORKNUM, blkno, page.data);
+	if (pg_memory_is_all_zeros(page.data, BLCKSZ))
+		PG_RETURN_TEXT_P(cstring_to_text("zeroes"));
+	if (ph->pd_lower >= BLCKSZ)
+		elog(ERROR, "block %u has no hole", blkno);
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d",
+											  (int) (uint8) page.data[ph->pd_lower])));
+}
+
+static void
+mapped_row(BlockNumber blkno, BlockNumber phys, void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = Int64GetDatum(blkno);
+	values[1] = Int64GetDatum(phys);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * test_bmap_mapped(relnumber): the logical blocks that have a physical
+ * block, and theirs, found walking the map's nodes, not every block below
+ * the length, so a map with holes over billions of blocks costs only them.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_mapped);
+
+Datum
+test_bmap_mapped(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	bmap_inspect_entries(bmap_smgr(PG_GETARG_OID(0)), mapped_row, rsinfo);
+	return (Datum) 0;
 }
 
 /*

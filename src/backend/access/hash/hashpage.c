@@ -1027,8 +1027,7 @@ _hash_alloc_buckets(Relation rel, BlockNumber firstblock, uint32 nblocks)
 
 	if (RelationNeedsWAL(rel))
 	{
-		smgrpreextend(RelationGetSmgr(rel), MAIN_FORKNUM, firstblock,
-					  lastblock - firstblock + 1);
+		smgrpreextend(RelationGetSmgr(rel), MAIN_FORKNUM, lastblock, 1);
 		log_newpage(&rel->rd_locator,
 					MAIN_FORKNUM,
 					lastblock,

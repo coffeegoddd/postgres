@@ -256,8 +256,11 @@ typedef struct f_smgr
 	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
 							   BlockNumber blocknum,
 							   void **buffers, BlockNumber nblocks);
-	/* before an asynchronous read's handle is acquired; may be NULL */
-	void		(*smgr_prepareread) (SMgrRelation reln, ForkNumber forknum,
+	/*
+	 * before an asynchronous read's handle is acquired: the blocks from
+	 * blocknum that have no storage, and read as zeroes; may be NULL
+	 */
+	BlockNumber (*smgr_prepareread) (SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber blocknum, BlockNumber nblocks);
 	void		(*smgr_startreadv) (PgAioHandle *ioh,
 									SMgrRelation reln, ForkNumber forknum,
@@ -1358,17 +1361,25 @@ smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  * one handle, so whatever a storage manager must read to start the read
  * (a storage manager that maps blocks to storage of its own reads its
  * map), it reads here.
+ *
+ * Returns how many of the blocks from blocknum have no storage at all (a
+ * storage manager that maps blocks may leave a hole where a write past the
+ * end skipped blocks, as a sparse file does): they read as zeroes, and the
+ * caller fills their pages itself instead of starting a read for them.
  */
-void
+BlockNumber
 smgrprepareread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				BlockNumber nblocks)
 {
+	BlockNumber holes;
+
 	if (smgrsw[reln->smgr_which].smgr_prepareread == NULL)
-		return;
+		return 0;
 	HOLD_INTERRUPTS();
-	smgrsw[reln->smgr_which].smgr_prepareread(reln, forknum, blocknum,
-											  nblocks);
+	holes = smgrsw[reln->smgr_which].smgr_prepareread(reln, forknum, blocknum,
+													  nblocks);
 	RESUME_INTERRUPTS();
+	return holes;
 }
 
 /*

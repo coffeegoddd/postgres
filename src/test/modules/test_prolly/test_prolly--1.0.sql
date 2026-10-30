@@ -101,8 +101,31 @@ RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Change a byte of a page's hole, as an access method changes a page.
-CREATE FUNCTION test_bmap_write(relnumber oid, blkno int, value int)
+CREATE FUNCTION test_bmap_write(relnumber oid, blkno int8, value int)
 RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Write an empty page past the end, as a hash index's bucket allocation
+-- writes the last of its blocks, leaving those between unwritten.
+CREATE FUNCTION test_bmap_extend_at(relnumber oid, blkno int8)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Initialize a block below the end, as an access method makes a new page.
+CREATE FUNCTION test_bmap_init_block(relnumber oid, blkno int8)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Read a page, through shared buffers or not: 'zeroes', or the byte
+-- test_bmap_write() changes.
+CREATE FUNCTION test_bmap_read(relnumber oid, blkno int8, buffered bool)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The logical blocks that have a physical block, found from the map's nodes.
+CREATE FUNCTION test_bmap_mapped(relnumber oid,
+	OUT blkno int8, OUT phys int8)
+RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- A digest of heap pages' rows, leaving out hint bits.

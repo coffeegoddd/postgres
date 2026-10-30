@@ -69,10 +69,16 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 			{
 				xl_bmap_remap *xlrec = (xl_bmap_remap *) rec;
 
-				appendStringInfo(buf, "rel %u/%u/%u; blk %u; block %u -> %u%s; hw %u -> %u",
+				appendStringInfo(buf, "rel %u/%u/%u; blk %u; ",
 								 xlrec->locator.spcOid, xlrec->locator.dbOid,
-								 xlrec->locator.relNumber, xlrec->blkno,
-								 xlrec->old_block, xlrec->new_block,
+								 xlrec->locator.relNumber, xlrec->blkno);
+				/* (a hole, given its first block, had none) */
+				if (xlrec->old_block == InvalidBlockNumber)
+					appendStringInfoString(buf, "hole");
+				else
+					appendStringInfo(buf, "block %u", xlrec->old_block);
+				appendStringInfo(buf, " -> %u%s; hw %u -> %u",
+								 xlrec->new_block,
 								 (xlrec->flags & BMAP_REMAP_ZERO) ? " (zeroed)" : "",
 								 xlrec->old_hw, xlrec->new_hw);
 				break;
