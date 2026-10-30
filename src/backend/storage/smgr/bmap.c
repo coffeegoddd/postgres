@@ -9126,7 +9126,7 @@ roots_exist(RelFileLocator rel)
 {
 	SMgrRelation rsrel = roots_smgr(rel);
 
-	return refs_file_exists(rsrel) && refs_file_nblocks(rsrel) > 0;
+	return smgrexists(rsrel, MAIN_FORKNUM) && smgrnblocks(rsrel, MAIN_FORKNUM) > 0;
 }
 
 /*
@@ -9144,7 +9144,7 @@ ensure_roots(RelFileLocator rel)
 		return;
 	SET_LOCKTAG_RELATION(tag, rel.dbOid, BMAP_ROOTS_RELNUMBER);
 	(void) LockAcquire(&tag, AccessExclusiveLock, false, false);
-	if (!refs_file_exists(rsrel))
+	if (!smgrexists(rsrel, MAIN_FORKNUM))
 	{
 		RelFileLocator rloc = with_relnumber(rel, BMAP_ROOTS_RELNUMBER);
 
@@ -9152,7 +9152,7 @@ ensure_roots(RelFileLocator rel)
 		log_smgrcreate(&rloc, MAIN_FORKNUM);
 	}
 	check_may_read();
-	if (refs_file_nblocks(rsrel) == 0)
+	if (smgrnblocks(rsrel, MAIN_FORKNUM) == 0)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
 										  EB_SKIP_EXTENSION_LOCK, 1,
@@ -9167,7 +9167,7 @@ roots_cover(RelFileLocator rel, BlockNumber need)
 	SMgrRelation rsrel = roots_smgr(rel);
 
 	check_may_read();
-	if (refs_file_nblocks(rsrel) < need)
+	if (smgrnblocks(rsrel, MAIN_FORKNUM) < need)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
 										  EB_SKIP_EXTENSION_LOCK, need,
@@ -14186,7 +14186,7 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 	srels[4] = roots_smgr(rel);
 	if (!smgrexists(srels[0], MAIN_FORKNUM) &&
 		!smgrexists(srels[1], MAIN_FORKNUM) &&
-		!smgrexists(srels[2], MAIN_FORKNUM) &&
+		!refs_file_exists(srels[2]) &&
 		!smgrexists(srels[3], MAIN_FORKNUM) &&
 		!smgrexists(srels[4], MAIN_FORKNUM))
 		return;
