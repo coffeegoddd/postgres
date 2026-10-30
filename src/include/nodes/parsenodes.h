@@ -2434,6 +2434,7 @@ typedef struct CreateSchemaStmt
 	RoleSpec   *authrole;		/* the owner of the created schema */
 	List	   *schemaElts;		/* schema components (list of parsenodes) */
 	bool		if_not_exists;	/* just do nothing if schema already exists? */
+	bool		versioned;		/* one per branch, on the session's branch? */
 } CreateSchemaStmt;
 
 typedef enum DropBehavior

@@ -30,6 +30,7 @@
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/scansup.h"
+#include "prolly/branch_catalog.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -149,8 +150,13 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 		SetUserIdAndSecContext(owner_uid,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
-	/* Create the schema's namespace */
-	namespaceId = NamespaceCreate(schemaName, owner_uid, false);
+	/*
+	 * Create the schema's namespace: a versioned schema's goes on the
+	 * session's branch
+	 */
+	namespaceId = NamespaceCreateOnBranch(schemaName, owner_uid, false,
+										  stmt->versioned ?
+										  VersionedNamespaceBranch(schemaName) : 0);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();
@@ -259,7 +265,15 @@ RenameSchema(const char *oldname, const char *newname)
 
 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy1(NAMESPACENAME, CStringGetDatum(oldname));
+	/* the session's branch's schema of that name, else a shared one */
+	tup = SearchNamespaceByName(oldname);
+	if (HeapTupleIsValid(tup))
+	{
+		HeapTuple	copy = heap_copytuple(tup);
+
+		ReleaseSysCache(tup);
+		tup = copy;
+	}
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
@@ -268,11 +282,8 @@ RenameSchema(const char *oldname, const char *newname)
 	nspform = (Form_pg_namespace) GETSTRUCT(tup);
 	nspOid = nspform->oid;
 
-	/* make sure the new name doesn't exist */
-	if (OidIsValid(get_namespace_oid(newname, true)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_SCHEMA),
-				 errmsg("schema \"%s\" already exists", newname)));
+	/* make sure the new name doesn't exist, as the same kind of schema */
+	NamespaceCheckNameFree(newname, nspform->nspbranch);
 
 	/* must be owner */
 	if (!object_ownercheck(NamespaceRelationId, nspOid, GetUserId()))
@@ -339,7 +350,7 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
 
 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache1(NAMESPACENAME, CStringGetDatum(name));
+	tup = SearchNamespaceByName(name);
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),

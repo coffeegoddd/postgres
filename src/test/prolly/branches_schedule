@@ -1,0 +1,4 @@
+# Regression tests of branched catalogs: versioned schemas, one set of
+# catalog rows per branch, beside shared schemas.  They do not depend on
+# the table access method, and run on the one under test.
+test: branch_schemas

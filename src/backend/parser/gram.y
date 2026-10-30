@@ -322,7 +322,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <str>			opt_single_name
 %type <list>		opt_qualified_name
-%type <boolean>		opt_concurrently opt_usingindex
+%type <boolean>		opt_concurrently opt_usingindex opt_versioned
 %type <dbehavior>	opt_drop_behavior
 %type <list>		opt_utility_option_list
 %type <list>		opt_wait_with_clause
@@ -803,7 +803,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
 
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
-	VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
+	VERBOSE VERSION_P VERSIONED VIEW VIEWS VIRTUAL VOLATILE
 
 	WAIT WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
 
@@ -1576,60 +1576,70 @@ add_drop:	ADD_P									{ $$ = +1; }
  *****************************************************************************/
 
 CreateSchemaStmt:
-			CREATE SCHEMA opt_single_name AUTHORIZATION RoleSpec OptSchemaEltList
+			CREATE SCHEMA opt_single_name AUTHORIZATION RoleSpec opt_versioned OptSchemaEltList
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
 
 					/* One can omit the schema name or the authorization id. */
 					n->schemaname = $3;
 					n->authrole = $5;
-					n->schemaElts = $6;
+					n->versioned = $6;
+					n->schemaElts = $7;
 					n->if_not_exists = false;
 					$$ = (Node *) n;
 				}
-			| CREATE SCHEMA ColId OptSchemaEltList
+			| CREATE SCHEMA ColId opt_versioned OptSchemaEltList
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
 
 					/* ...but not both */
 					n->schemaname = $3;
 					n->authrole = NULL;
-					n->schemaElts = $4;
+					n->versioned = $4;
+					n->schemaElts = $5;
 					n->if_not_exists = false;
 					$$ = (Node *) n;
 				}
-			| CREATE SCHEMA IF_P NOT EXISTS opt_single_name AUTHORIZATION RoleSpec OptSchemaEltList
+			| CREATE SCHEMA IF_P NOT EXISTS opt_single_name AUTHORIZATION RoleSpec opt_versioned OptSchemaEltList
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
 
 					/* schema name can be omitted here, too */
 					n->schemaname = $6;
 					n->authrole = $8;
-					if ($9 != NIL)
+					n->versioned = $9;
+					if ($10 != NIL)
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("CREATE SCHEMA IF NOT EXISTS cannot include schema elements"),
-								 parser_errposition(@9)));
-					n->schemaElts = $9;
+								 parser_errposition(@10)));
+					n->schemaElts = $10;
 					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
-			| CREATE SCHEMA IF_P NOT EXISTS ColId OptSchemaEltList
+			| CREATE SCHEMA IF_P NOT EXISTS ColId opt_versioned OptSchemaEltList
 				{
 					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
 
 					/* ...but not here */
 					n->schemaname = $6;
 					n->authrole = NULL;
-					if ($7 != NIL)
+					n->versioned = $7;
+					if ($8 != NIL)
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("CREATE SCHEMA IF NOT EXISTS cannot include schema elements"),
-								 parser_errposition(@7)));
-					n->schemaElts = $7;
+								 parser_errposition(@8)));
+					n->schemaElts = $8;
 					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
+		;
+
+/* a versioned schema: one per branch, made on the session's branch */
+opt_versioned:
+			VERSIONED								{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
 		;
 
 OptSchemaEltList:
@@ -18390,6 +18400,7 @@ unreserved_keyword:
 			| VALUE_P
 			| VARYING
 			| VERSION_P
+			| VERSIONED
 			| VIEW
 			| VIEWS
 			| VIRTUAL
@@ -19050,6 +19061,7 @@ bare_label_keyword:
 			| VARIADIC
 			| VERBOSE
 			| VERSION_P
+			| VERSIONED
 			| VIEW
 			| VIEWS
 			| VIRTUAL

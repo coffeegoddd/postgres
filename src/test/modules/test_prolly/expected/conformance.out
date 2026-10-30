@@ -9,17 +9,21 @@ NOTICE:  extension "test_prolly" already exists, skipping
 SELECT iface, implementation, test, result,
        regexp_replace(detail, ' \([0-9]+ vs [0-9]+\)$', '') AS detail
 FROM test_prolly_conformance();
-     iface     | implementation  |          test          | result |                                          detail                                          
----------------+-----------------+------------------------+--------+------------------------------------------------------------------------------------------
- test_checksum | hash_bytes      | registered             | ok     | 
- test_checksum | hash_bytes      | deterministic          | ok     | 
- test_checksum | hash_bytes      | detects_changed_byte   | ok     | 
- test_checksum | hash_bytes      | detects_changed_length | ok     | 
- test_checksum | drops_last_byte | registered             | ok     | 
- test_checksum | drops_last_byte | deterministic          | ok     | 
- test_checksum | drops_last_byte | detects_changed_byte   | failed | CHECK failed: routine(impl)->checksum(buf, sizeof(buf)) != before
- test_checksum | drops_last_byte | detects_changed_length | failed | CHECK failed: routine(impl)->checksum(buf, len) != routine(impl)->checksum(buf, len - 1)
-(8 rows)
+     iface     | implementation  |            test            | result |                                          detail                                          
+---------------+-----------------+----------------------------+--------+------------------------------------------------------------------------------------------
+ test_checksum | hash_bytes      | registered                 | ok     | 
+ test_checksum | hash_bytes      | deterministic              | ok     | 
+ test_checksum | hash_bytes      | detects_changed_byte       | ok     | 
+ test_checksum | hash_bytes      | detects_changed_length     | ok     | 
+ test_checksum | drops_last_byte | registered                 | ok     | 
+ test_checksum | drops_last_byte | deterministic              | ok     | 
+ test_checksum | drops_last_byte | detects_changed_byte       | failed | CHECK failed: routine(impl)->checksum(buf, sizeof(buf)) != before
+ test_checksum | drops_last_byte | detects_changed_length     | failed | CHECK failed: routine(impl)->checksum(buf, len) != routine(impl)->checksum(buf, len - 1)
+ branch_ids    | sequence        | registered                 | ok     | 
+ branch_ids    | sequence        | allocates_increasing       | ok     | 
+ branch_ids    | sequence        | knows_what_it_allocated    | ok     | 
+ branch_ids    | sequence        | rollback_keeps_identifiers | ok     | 
+(12 rows)
 
 -- a failure says where its check is
 SELECT location ~ '^test_checksum\.c:[0-9]+$' AS has_location

@@ -23,3 +23,20 @@ tests += {
     ],
   },
 }
+
+# Branched catalogs, which do not depend on the table access method.
+tests += {
+  'name': 'prolly_branches',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'schedule': files('branches_schedule'),
+    'regress_args': ['--temp-config', files('am/heap.conf')],
+  },
+  'tap': {
+    'env': {'PROLLY_AM': 'heap'},
+    'tests': [
+      't/200_branch_schema_names.pl',
+    ],
+  },
+}

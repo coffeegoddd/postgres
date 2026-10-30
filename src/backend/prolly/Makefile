@@ -14,6 +14,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	branch_catalog.o \
 	registry.o
 
 include $(top_srcdir)/src/backend/common.mk

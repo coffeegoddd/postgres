@@ -3,6 +3,7 @@
 test_prolly_sources = files(
   'bmap_checks.c',
   'bmap_primitive_checks.c',
+  'branch_conformance.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_bufmgr.c',

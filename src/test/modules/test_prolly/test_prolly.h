@@ -63,9 +63,13 @@ extern const ProllyUnitSuite unit_bufmgr_suite;
 extern const ProllyUnitSuite unit_registry_suite;
 extern const ProllyUnitSuite unit_smgr_suite;
 extern const ProllyConformanceSuite conformance_test_checksum_suite;
+extern const ProllyConformanceSuite conformance_branch_ids_suite;
 
 /* Registration of the example interface's implementations. */
 extern void register_test_checksum_implementations(void);
+
+/* Registration of the server's implementations of branched catalogs. */
+extern void register_branch_implementations(void);
 
 /*
  * Assertions.  A failed check raises an error naming the condition, and the

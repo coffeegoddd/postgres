@@ -3,8 +3,9 @@
 # Makefile for src/test/prolly
 #
 # The requirements suite: tests of what the version-control engine must
-# do, run against a server.  It has regression tests (semantics_schedule),
-# isolation tests (isolation_schedule) and TAP tests (t/).
+# do, run against a server.  It has regression tests (semantics_schedule,
+# branches_schedule), isolation tests (isolation_schedule) and TAP tests
+# (t/).
 #
 # PROLLY_AM names the table access method under test, and am/$(PROLLY_AM).conf
 # holds the server settings that put new tables on it.  The tests of
@@ -17,7 +18,7 @@
 #
 # TAP tests are numbered by group: 0xx check that the access method under
 # test is in effect, 1xx check durability and are part of the semantics
-# groups.
+# groups, 2xx check branched catalogs.
 #
 # src/test/prolly/Makefile
 #
@@ -50,7 +51,10 @@ endif
 # The groups that test Postgres semantics, and so also run on heap.
 SEMANTICS_TARGETS = check-target check-semantics check-isolation check-tap-durability
 
-check: $(SEMANTICS_TARGETS)
+# The groups that test what version control adds.
+VC_TARGETS = check-branches
+
+check: $(SEMANTICS_TARGETS) $(VC_TARGETS)
 
 check-heap: temp-install
 	$(MAKE) $(SEMANTICS_TARGETS) PROLLY_AM=heap
@@ -72,6 +76,15 @@ check-tap-durability: PROVE_TESTS = t/1*.pl
 check-tap-durability: temp-install
 	$(prove_check)
 
+check-branches: temp-install
+	$(pg_regress_check) --temp-config=$(AM_CONF) \
+		--schedule=$(srcdir)/branches_schedule
+	$(MAKE) check-tap-branches
+
+check-tap-branches: PROVE_TESTS = t/2*.pl
+check-tap-branches: temp-install
+	$(prove_check)
+
 # Postgres's regression, isolation and recovery suites with every user
 # heap table, index and TOAST table in block-mapped storage.  They pass in
 # full: block-mapped storage changes where pages live, not what they hold.
@@ -86,7 +99,7 @@ check-upstream-bmap: temp-install
 	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(BMAP_CONF) || status=1; \
 	exit $$status
 
-.PHONY: check check-heap check-upstream-bmap $(SEMANTICS_TARGETS)
+.PHONY: check check-heap check-upstream-bmap check-tap-branches $(SEMANTICS_TARGETS) $(VC_TARGETS)
 
 clean distclean:
 	rm -rf results output_iso tmp_check tmp_check_iso log

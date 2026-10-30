@@ -21,6 +21,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_namespace.h"
+#include "prolly/branch_catalog.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -42,6 +43,19 @@
 Oid
 NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 {
+	return NamespaceCreateOnBranch(nspName, ownerId, isTemp, 0);
+}
+
+/*
+ * NamespaceCreateOnBranch
+ *
+ * Create a namespace that belongs to one branch (a versioned schema's row
+ * on that branch), or to every branch if branch is 0.
+ */
+Oid
+NamespaceCreateOnBranch(const char *nspName, Oid ownerId, bool isTemp,
+						int32 branch)
+{
 	Relation	nspdesc;
 	HeapTuple	tup;
 	Oid			nspoid;
@@ -57,11 +71,11 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 	if (!nspName)
 		elog(ERROR, "no namespace name supplied");
 
-	/* make sure there is no existing namespace of same name */
-	if (SearchSysCacheExists1(NAMESPACENAME, PointerGetDatum(nspName)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_SCHEMA),
-				 errmsg("schema \"%s\" already exists", nspName)));
+	/*
+	 * make sure there is no existing namespace of same name, on this branch
+	 * or shared, nor (for a shared one) on any branch
+	 */
+	NamespaceCheckNameFree(nspName, branch);
 
 	if (!isTemp)
 		nspacl = get_user_default_acl(OBJECT_SCHEMA, ownerId,
@@ -85,6 +99,7 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 	namestrcpy(&nname, nspName);
 	values[Anum_pg_namespace_nspname - 1] = NameGetDatum(&nname);
 	values[Anum_pg_namespace_nspowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_namespace_nspbranch - 1] = Int32GetDatum(branch);
 	if (nspacl != NULL)
 		values[Anum_pg_namespace_nspacl - 1] = PointerGetDatum(nspacl);
 	else

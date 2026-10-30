@@ -1589,3 +1589,11 @@ CREATE VIEW pg_aios AS
     SELECT * FROM pg_get_aios();
 REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
+
+-- Branch identifiers for versioned schemas are handed out from this
+-- sequence, one per database.  Anyone may read how far it has gone, which
+-- is what tells a session whether a branch has been allocated; only
+-- pg_branch_id_allocate() advances it.
+CREATE SEQUENCE pg_branch_id_seq AS integer NO CYCLE;
+REVOKE ALL ON pg_branch_id_seq FROM PUBLIC;
+GRANT SELECT ON pg_branch_id_seq TO PUBLIC;

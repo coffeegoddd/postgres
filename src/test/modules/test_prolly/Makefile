@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	bmap_checks.o \
 	bmap_primitive_checks.o \
+	branch_conformance.o \
 	test_checksum.o \
 	test_prolly.o \
 	unit_bufmgr.o \

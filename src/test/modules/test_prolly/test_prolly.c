@@ -53,6 +53,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 
 static const ProllyConformanceSuite *const conformance_suites[] = {
 	&conformance_test_checksum_suite,
+	&conformance_branch_ids_suite,
 };
 
 /* The outcome of one test. */
@@ -68,6 +69,7 @@ _PG_init(void)
 {
 	loaded_at_preload = process_shared_preload_libraries_in_progress;
 	register_test_checksum_implementations();
+	register_branch_implementations();
 }
 
 /*

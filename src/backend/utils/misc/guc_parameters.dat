@@ -429,6 +429,17 @@
   options => 'bytea_output_options',
 },
 
+{ name => 'catalog_branch', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Sets the branch whose versioned schemas this session sees.',
+  long_desc => '0 means no branch: the session sees only shared schemas.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'catalog_branch',
+  boot_val => '0',
+  min => '0',
+  max => 'INT_MAX',
+  assign_hook => 'assign_catalog_branch',
+},
+
 { name => 'check_function_bodies', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Check routine bodies during CREATE FUNCTION and CREATE PROCEDURE.',
   variable => 'check_function_bodies',
