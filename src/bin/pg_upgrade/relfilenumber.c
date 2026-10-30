@@ -16,9 +16,37 @@
 #include "common/int.h"
 #include "common/logging.h"
 #include "pg_upgrade.h"
+#include "storage/bmap_files.h"
 
 static void transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace);
 static void transfer_relfile(FileNameMap *map, const char *type_suffix);
+static bool is_bmap_relfile(const FileNameMap *map);
+static void transfer_bmap_store(const FileNameMap *map);
+static void remove_new_relfile(const FileNameMap *map, const char *type_suffix);
+
+/*
+ * The files of a database's block-mapped page store (storage/bmap_files.h):
+ * the store, its allocator, reference counts, release queue and captured
+ * roots, under file numbers no catalog object has.
+ */
+static const RelFileNumber bmap_store_relnumbers[] = {
+	BMAP_STORE_RELNUMBER,
+	BMAP_ALLOC_RELNUMBER,
+	BMAP_REFS_RELNUMBER,
+	BMAP_QUEUE_RELNUMBER,
+	BMAP_ROOTS_RELNUMBER,
+};
+
+static bool
+is_bmap_store_relnumber(RelFileNumber rfn)
+{
+	for (int i = 0; i < lengthof(bmap_store_relnumbers); i++)
+	{
+		if (rfn == bmap_store_relnumbers[i])
+			return true;
+	}
+	return false;
+}
 
 /*
  * The following set of sync_queue_* functions are used for --swap to reduce
@@ -378,6 +406,10 @@ swap_catalog_files(FileNameMap *maps, int size, const char *old_catalog_dir,
 
 			if (bsearch(&key, maps, size, sizeof(FileNameMap), FileNameMapCmp))
 				continue;
+
+			/* the old block-mapped page store holds the user tables' pages */
+			if (is_bmap_store_relnumber(rfn))
+				continue;
 		}
 
 		snprintf(dest, sizeof(dest), "%s/%s", old_catalog_dir, de->d_name);
@@ -404,6 +436,10 @@ swap_catalog_files(FileNameMap *maps, int size, const char *old_catalog_dir,
 			FileNameMap key = {.relfilenumber = rfn};
 
 			if (bsearch(&key, maps, size, sizeof(FileNameMap), FileNameMapCmp))
+				continue;
+
+			/* (nor is the new cluster's page store, the old one kept) */
+			if (is_bmap_store_relnumber(rfn))
 				continue;
 		}
 
@@ -509,8 +545,24 @@ transfer_single_new_db(FileNameMap *maps, int size,
 		if (old_tablespace == NULL ||
 			strcmp(maps[mapnum].old_tablespace, old_tablespace) == 0)
 		{
-			/* transfer primary file */
-			transfer_relfile(&maps[mapnum], "");
+			/*
+			 * A block-mapped relation has no main fork file: its pages are in
+			 * its database's page store, which is transferred whole, and its
+			 * map fork names their blocks there.  The relation the new
+			 * cluster made in its place, block-mapped or not, gives way.
+			 */
+			if (is_bmap_relfile(&maps[mapnum]))
+			{
+				transfer_bmap_store(&maps[mapnum]);
+				remove_new_relfile(&maps[mapnum], "");
+				transfer_relfile(&maps[mapnum], "_bmap");
+			}
+			else
+			{
+				/* transfer primary file */
+				transfer_relfile(&maps[mapnum], "");
+				remove_new_relfile(&maps[mapnum], "_bmap");
+			}
 
 			/*
 			 * Copy/link any fsm and vm files, if they exist
@@ -521,6 +573,103 @@ transfer_single_new_db(FileNameMap *maps, int size,
 	}
 }
 
+
+/*
+ * Is the old cluster's relation block-mapped: has it a map fork?
+ */
+static bool
+is_bmap_relfile(const FileNameMap *map)
+{
+	char		old_file[MAXPGPATH];
+	struct stat statbuf;
+
+	snprintf(old_file, sizeof(old_file), "%s%s/%u/%u_bmap",
+			 map->old_tablespace, map->old_tablespace_suffix,
+			 map->db_oid, map->relfilenumber);
+	if (stat(old_file, &statbuf) == 0)
+		return true;
+	if (errno != ENOENT)
+		pg_fatal("error while checking for file existence \"%s.%s\" (\"%s\"): %m",
+				 map->nspname, map->relname, old_file);
+	return false;
+}
+
+/*
+ * Remove the new cluster's file of a relation's fork (type_suffix), each
+ * of its segments, if it has one.
+ */
+static void
+remove_new_relfile(const FileNameMap *map, const char *type_suffix)
+{
+	char		new_file[MAXPGPATH];
+
+	for (int segno = 0;; segno++)
+	{
+		char		extent_suffix[65];
+
+		if (segno == 0)
+			extent_suffix[0] = '\0';
+		else
+			snprintf(extent_suffix, sizeof(extent_suffix), ".%d", segno);
+		snprintf(new_file, sizeof(new_file), "%s%s/%u/%u%s%s",
+				 map->new_tablespace, map->new_tablespace_suffix,
+				 map->db_oid, map->relfilenumber, type_suffix,
+				 extent_suffix);
+		if (unlink(new_file) != 0)
+		{
+			if (errno == ENOENT)
+				return;
+			pg_fatal("could not remove file \"%s\": %m", new_file);
+		}
+	}
+}
+
+/*
+ * Transfer the page store of a block-mapped relation's database and
+ * tablespace, the first time one of its relations is transferred: every
+ * file of it, in place of the new cluster's.
+ */
+static void
+transfer_bmap_store(const FileNameMap *map)
+{
+	static char **done = NULL;
+	static int	ndone = 0;
+	char		key[MAXPGPATH];
+
+	snprintf(key, sizeof(key), "%s%s/%u", map->old_tablespace,
+			 map->old_tablespace_suffix, map->db_oid);
+	for (int i = 0; i < ndone; i++)
+	{
+		if (strcmp(done[i], key) == 0)
+			return;
+	}
+	done = pg_realloc(done, (ndone + 1) * sizeof(char *));
+	done[ndone++] = pg_strdup(key);
+
+	for (int i = 0; i < lengthof(bmap_store_relnumbers); i++)
+	{
+		FileNameMap store = *map;
+		char		old_file[MAXPGPATH];
+		struct stat statbuf;
+
+		store.relfilenumber = bmap_store_relnumbers[i];
+		store.nspname = "pg_catalog";
+		store.relname = "block-mapped page store";
+		snprintf(old_file, sizeof(old_file), "%s/%u", key, store.relfilenumber);
+		if (stat(old_file, &statbuf) != 0)
+		{
+			if (errno == ENOENT)
+			{
+				remove_new_relfile(&store, "");
+				continue;
+			}
+			pg_fatal("error while checking for file existence \"%s\": %m",
+					 old_file);
+		}
+		remove_new_relfile(&store, "");
+		transfer_relfile(&store, "");
+	}
+}
 
 /*
  * transfer_relfile()
