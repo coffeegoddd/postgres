@@ -89,7 +89,7 @@ jobs:
   # tree against its merge base with postgres/master, so it needs the
   # history of both (but no file contents: diffing names needs trees only).
   patch-inventory:
-    name: patch inventory
+    name: patch inventory and sync tooling
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -108,6 +108,9 @@ jobs:
 
       - name: Check the patch inventory
         run: src/tools/prolly/check_patch_inventory.sh
+
+      - name: Tests of the upstream sync
+        run: src/tools/prolly/test_upstream_sync.sh "$RUNNER_TEMP/upstream-sync-test"
 
   # The tree also builds with meson; a build file that only one of the two
   # systems knows about breaks the other, so both are built on every change,
