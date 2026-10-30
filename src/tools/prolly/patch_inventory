@@ -138,3 +138,4 @@ patch src/test/modules/meson.build  0  builds and runs the engine's unit and con
 patch src/test/recovery/t/016_min_consistency.pl  1a  reads a block-mapped relation's pages from the page store when the suite runs block-mapped
 patch src/test/recovery/t/018_wal_optimize.pl  1a  counts the page store's files and map forks as the relations' when the suite runs block-mapped
 patch src/test/regress/expected/rules.out  1a  shows the pg_stat_block_mapped view
+patch src/test/regress/expected/stats.out  1a  lists the block_map statistics kind
