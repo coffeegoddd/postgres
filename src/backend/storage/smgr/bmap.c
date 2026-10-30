@@ -184,7 +184,6 @@
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/autovacuum.h"
 #include "port/pg_bitutils.h"
 #include "storage/bmap.h"
 #include "storage/bmap_xlog.h"
@@ -11745,9 +11744,9 @@ store_free(RelFileLocator rel)
  * isn't empty, take release steps first (not waiting for another drain or
  * a sweep), until enough are free, the queue is empty or its top waits for
  * a drop, or BMAP_GROWTH_RELEASE_STEPS were taken, so that dropped storage
- * is reused before the store grows.  Only with autovacuum off, whose
- * workers otherwise drain the queue in the background, and only in a
- * transaction.  The caller holds no extension lock (a step takes locks of
+ * is reused before the store grows.  Only in a transaction; nothing
+ * else drains the queue in the background yet, so this is what keeps a
+ * dropped relation's blocks from being lost to the store.  The caller holds no extension lock (a step takes locks of
  * its own), but may hold a relation's page locked, as a B-tree split does:
  * a step locks the allocator's pages and counts, as the extension's
  * allocation does, and the queue's pages, none of which a backend waits
@@ -11763,7 +11762,7 @@ bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 	int			hint = (int) (hash_bytes_uint32((uint32) (key ^ (key >> 32))) %
 							  BMAP_QUEUE_HINTS);
 
-	if (forknum != MAIN_FORKNUM || nblocks == 0 || AutoVacuumingActive() ||
+	if (forknum != MAIN_FORKNUM || nblocks == 0 ||
 		!IsTransactionState() || CritSectionCount > 0 ||
 		RecoveryInProgress())
 		return;
