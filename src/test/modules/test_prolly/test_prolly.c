@@ -49,6 +49,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_bufmgr_suite,
 	&unit_registry_suite,
 	&unit_smgr_suite,
+	&unit_branch_filter_suite,
 };
 
 static const ProllyConformanceSuite *const conformance_suites[] = {
