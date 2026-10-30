@@ -116,6 +116,14 @@ typedef struct f_smgr
 	void		(*smgr_syncshares) (bool isCommit);
 
 	/*
+	 * The main fork's blocks whose pages differ between two relations of
+	 * this implementation (see smgrdiff()); may be NULL (they can't be
+	 * compared but by reading them).
+	 */
+	uint32		(*smgr_diff) (SMgrRelation a, SMgrRelation b,
+							  BlockNumber **blknos);
+
+	/*
 	 * Can the fork's blocks be given other storage, which may have held
 	 * another relation's pages?  May be NULL (never).  A fork whose blocks
 	 * can be is one whose pages are prepared before they change
@@ -308,6 +316,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_exists = bmapexists,
 		.smgr_share = bmapshare,
 		.smgr_syncshares = bmapsyncshares,
+		.smgr_diff = bmap_diff,
 		.smgr_replacesblocks = bmapreplacesblocks,
 		.smgr_replacedafter = bmapreplacedafter,
 		.smgr_prerestore = bmapprerestore,
@@ -763,6 +772,32 @@ smgrshare(SMgrRelation src, SMgrRelation dst)
 
 	smgrusewhich(dst, which);
 	smgrsw[which].smgr_share(src, dst);
+}
+
+/*
+ * smgrdiff() -- The main fork's blocks whose pages differ between a and b.
+ *
+ * Into *blknos (palloc'd, ascending) the blocks either relation has a
+ * different page at, a block under one's length and not under the other's
+ * counting too; returns how many.  An implementation that shares pages
+ * (smgrshare()) knows which pages two relations hold in common without
+ * reading them, so this costs what differs, not the relations' sizes.
+ * Both relations must be held by one implementation that can, in the same
+ * tablespace and database; the caller keeps both from changing meanwhile.
+ */
+uint32
+smgrdiff(SMgrRelation a, SMgrRelation b, BlockNumber **blknos)
+{
+	int			which = a->smgr_which;
+
+	if (b->smgr_which != which || smgrsw[which].smgr_diff == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("storage of relations %s and %s can't be compared",
+						relpath(a->smgr_rlocator, MAIN_FORKNUM).str,
+						relpath(b->smgr_rlocator, MAIN_FORKNUM).str)));
+
+	return smgrsw[which].smgr_diff(a, b, blknos);
 }
 
 /*
