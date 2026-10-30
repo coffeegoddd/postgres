@@ -30,7 +30,14 @@
  * allocated or copied for them.  A share leaves the copy none
  * (RelationCreateStorageShared()), as a hint the copy builds again as it is
  * vacuumed: a copy's page with free space is shared, and filling it would
- * copy it first anyway.
+ * copy it first anyway.  But VACUUM skips the pages the visibility map says
+ * are all-visible, and a copy's map is its source's, so the free space of
+ * the pages shared all-visible would never be found: the header says how
+ * many of the relation's first pages the free space map may know nothing
+ * of (free_space_unknown, set by a share or a root's), and VACUUM reads
+ * those it skips, only to record their free space, then has the header
+ * say none (bmapfreespaceknown()).  Reading is all it does to them: a page
+ * read isn't prepared, so nothing is copied.
  *
  * The map.  Block 0 of the map fork is a header holding the relation's
  * logical length and epoch, and block 1 its root page (BmapRoot), the
@@ -383,6 +390,8 @@ typedef struct BmapHeader
 								 * with another map; those born since, only
 								 * with the roots captured of the map */
 	BlockNumber vm_nblocks;		/* its visibility map's length */
+	BlockNumber free_space_unknown; /* pages from 0 whose free space the
+									 * free space map may not know */
 } BmapHeader;
 
 typedef struct BmapMeta
@@ -1681,6 +1690,8 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 	PageGetBmapHeader(page)->epoch = delta->epoch;
 	if (delta->flags & BMAP_DELTA_SHARED_BELOW)
 		PageGetBmapHeader(page)->shared_below = delta->shared_below;
+	if (delta->flags & BMAP_DELTA_FREE_SPACE)
+		PageGetBmapHeader(page)->free_space_unknown = delta->free_space_unknown;
 }
 
 /*
@@ -1698,6 +1709,7 @@ header_delta_of(Page page, xl_bmap_header_delta *delta)
 	delta->vm_nblocks = header->vm_nblocks;
 	delta->epoch = header->epoch;
 	delta->shared_below = 0;
+	delta->free_space_unknown = 0;
 }
 
 /* (whether it changed the page) */
@@ -6210,6 +6222,10 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	sdelta.flags = ddelta.flags = BMAP_DELTA_SHARED_BELOW;
 	sdelta.nblocks = ddelta.nblocks = nblocks;
 	sdelta.vm_nblocks = ddelta.vm_nblocks = vm_nblocks;
+	sdelta.free_space_unknown = ddelta.free_space_unknown = 0;
+	/* (the copy has no free space map: none of its pages' is known) */
+	ddelta.flags |= BMAP_DELTA_FREE_SPACE;
+	ddelta.free_space_unknown = nblocks;
 	sdelta.epoch = ddelta.epoch = epoch + 1;
 	/* (every entry either has is the other's too) */
 	sdelta.shared_below = ddelta.shared_below = epoch + 1;
@@ -9424,6 +9440,7 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	hdelta.flags = 0;
 	hdelta.nblocks = header->nblocks;
 	hdelta.vm_nblocks = header->vm_nblocks;
+	hdelta.free_space_unknown = 0;
 	hdelta.epoch = header->epoch + 1;
 	hdelta.shared_below = 0;
 	memset(&rdelta, 0, sizeof(rdelta));
@@ -10122,6 +10139,7 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 			shdelta.flags = BMAP_DELTA_SHARED_BELOW;
 			shdelta.nblocks = sh->nblocks;
 			shdelta.vm_nblocks = sh->vm_nblocks;
+			shdelta.free_space_unknown = 0;
 			shdelta.epoch = sh->epoch;
 			shdelta.shared_below = Max(sh->shared_below, r.snap.epoch);
 			if (shdelta.shared_below == sh->shared_below)
@@ -10150,9 +10168,11 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	}
 	create_map(dst);
 	hdelta.kind = BMAP_DELTA_HEADER;
-	hdelta.flags = BMAP_DELTA_SHARED_BELOW;
+	/* (made without a free space map, or with another's: none known) */
+	hdelta.flags = BMAP_DELTA_SHARED_BELOW | BMAP_DELTA_FREE_SPACE;
 	hdelta.nblocks = r.snap.nblocks;
 	hdelta.vm_nblocks = r.snap.vm_nblocks;
+	hdelta.free_space_unknown = r.snap.nblocks;
 	hdelta.epoch = r.snap.epoch;
 	hdelta.shared_below = replacing != NULL ?
 		Min(shared_below, hdelta.epoch) : hdelta.epoch;
@@ -10347,6 +10367,7 @@ bmap_raise_epoch(SMgrRelation reln)
 	hdelta.flags = 0;
 	hdelta.nblocks = header->nblocks;
 	hdelta.vm_nblocks = header->vm_nblocks;
+	hdelta.free_space_unknown = 0;
 	hdelta.epoch = header->epoch + 1;
 	hdelta.shared_below = 0;
 	xlrec.locator = rel;
@@ -10368,6 +10389,82 @@ bmap_raise_epoch(SMgrRelation reln)
 	UnlockReleaseBuffer(headerbuf);
 	MarkRelationPagesShared(rel);
 	return hdelta.epoch;
+}
+
+/*
+ * How many of the relation's first pages the free space map may know
+ * nothing of (see "The visibility map is mapped too"): VACUUM reads those
+ * of them it would skip, to record their free space.  0 for a fork other
+ * than the main fork.
+ */
+BlockNumber
+bmapfreespaceunknown(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	BlockNumber n;
+
+	if (!mdexists(reln, BMAP_FORKNUM))
+		return 0;
+	buf = map_read(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	n = PageGetBmapHeader(BufferGetPage(buf))->free_space_unknown;
+	UnlockReleaseBuffer(buf);
+	return n;
+}
+
+/*
+ * VACUUM recorded the free space of each of the relation's pages below
+ * 'upto': if that is every page the header says the free space map may not
+ * know, the header says none now.  Logged, so that a standby promoted, or a
+ * recovery, doesn't read them all again.  The free space map's pages aren't
+ * logged, and a crash may lose what was recorded in them, as it may lose
+ * any of VACUUM's records of free space: a hint.
+ */
+void
+bmapfreespaceknown(SMgrRelation reln, BlockNumber upto)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	xl_bmap_header_delta hdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+	BlockNumber unknown;
+
+	if (!mdexists(reln, BMAP_FORKNUM))
+		return;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	unknown = PageGetBmapHeader(BufferGetPage(headerbuf))->free_space_unknown;
+	if (unknown == 0 || upto < unknown)
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	header_delta_of(BufferGetPage(headerbuf), &hdelta);
+	hdelta.flags = BMAP_DELTA_FREE_SPACE;
+	hdelta.free_space_unknown = 0;
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_FREE_SPACE;
+	xlrec.flags = 0;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	START_CRIT_SECTION();
+	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
+	MarkBufferDirty(headerbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, headerbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &hdelta, sizeof(hdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(headerbuf), lsn);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(headerbuf);
+	elog(DEBUG1, "free space of the first %u pages of %s is known",
+		 unknown, relpathperm(rel, MAIN_FORKNUM).str);
 }
 
 /*
@@ -12304,6 +12401,7 @@ sweep_shared_below(SMgrRelation reln, const uint32 *holders, BlockNumber hw,
 		delta.flags = BMAP_DELTA_SHARED_BELOW;
 		delta.nblocks = header->nblocks;
 		delta.vm_nblocks = header->vm_nblocks;
+		delta.free_space_unknown = 0;
 		delta.epoch = header->epoch;
 		delta.shared_below = oh.below;
 		START_CRIT_SECTION();
@@ -13996,6 +14094,7 @@ create_map(SMgrRelation reln)
 	delta.flags = BMAP_DELTA_INIT;
 	delta.nblocks = 0;
 	delta.vm_nblocks = 0;
+	delta.free_space_unknown = 0;
 	delta.epoch = 0;
 	delta.shared_below = 0;
 	memset(&rdelta, 0, sizeof(rdelta));

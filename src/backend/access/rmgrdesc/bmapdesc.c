@@ -137,6 +137,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 					appendStringInfoString(buf, "epoch raised");
 				else if (xlrec->op == BMAP_TREE_STAMP)
 					appendStringInfo(buf, "node %u stamped", xlrec->node);
+				else if (xlrec->op == BMAP_TREE_FREE_SPACE)
+					appendStringInfoString(buf, "free space known");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

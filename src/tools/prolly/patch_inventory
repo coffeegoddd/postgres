@@ -47,7 +47,7 @@ patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of block
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (block-mapped with debug_block_mapped_heap; kept across rewrites)
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
 patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing
-patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; scans eagerly to freeze while pages are a relation's own
+patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; scans eagerly to freeze while pages are a relation's own; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
 patch src/backend/access/nbtree/nbtpage.c  1a  B-tree VACUUM takes leaf cleanup locks unprepared and prepares only the pages it changes, so shared leaves aren't copied
 patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
 patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
@@ -78,7 +78,7 @@ patch src/backend/storage/lmgr/lock.c  1a  LockHasWaiters() handles a lock taken
 patch src/backend/storage/smgr/Makefile  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/storage/smgr/meson.build  1a  builds the block-mapped storage manager
-patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write; per-relation choice of implementation
+patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write, and says which pages' free space a copy's free space map may not know; per-relation choice of implementation
 patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
@@ -110,7 +110,7 @@ patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_pe
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/lwlocklist.h  1a  the block map's replay lock is a built-in tranche, so it takes no slot extensions may use
-patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write
+patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write, and says which pages' free space a copy's free space map may not know
 patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
 patch src/test/meson.build     0  runs the requirements suite in src/test/prolly

@@ -84,6 +84,7 @@ tests += {
       't/033_bmap_rewind_synced.pl',
       't/034_bmap_copy_without_image.pl',
       't/035_bmap_share_maps.pl',
+      't/037_bmap_share_free_space.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

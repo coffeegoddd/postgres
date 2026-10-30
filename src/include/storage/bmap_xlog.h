@@ -247,6 +247,9 @@ typedef struct xl_bmap_extend
  *						map's epoch, the first change under it in the epoch:
  *						block 0 is the parent (a node, or the tree's root
  *						page), its delta
+ * BMAP_TREE_FREE_SPACE	VACUUM recorded the free space of every page the
+ *						free space map might not know: block 0 is the
+ *						header, which then says none
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -256,6 +259,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_ROOT_SLOT		8
 #define BMAP_TREE_EPOCH			9
 #define BMAP_TREE_STAMP			10
+#define BMAP_TREE_FREE_SPACE	11
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_ROOT		0x02
@@ -355,10 +359,13 @@ typedef struct xl_bmap_header_delta
 	uint32		epoch;
 	uint32		shared_below;	/* (BMAP_DELTA_SHARED_BELOW) */
 	BlockNumber vm_nblocks;
+	BlockNumber free_space_unknown; /* (BMAP_DELTA_FREE_SPACE) */
 } xl_bmap_header_delta;
 
 /* a header delta that sets the header's shared_below too */
 #define BMAP_DELTA_SHARED_BELOW	0x02
+/* and one that sets how many pages' free space may be unknown */
+#define BMAP_DELTA_FREE_SPACE	0x04
 
 /*
  * Block data of a map page: entries set.  An entry whose block changes
