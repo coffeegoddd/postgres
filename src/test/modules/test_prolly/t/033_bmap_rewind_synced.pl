@@ -34,6 +34,7 @@ sub failover
 	$primary->init(allows_streaming => 1);
 	$primary->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
+block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 wal_log_hints = on
 wal_keep_size = 512MB

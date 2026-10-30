@@ -31,6 +31,7 @@ sub scenario
 	$node->init;
 	$node->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
+block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 checkpoint_timeout = 1h
 bgwriter_lru_maxpages = 0
@@ -160,6 +161,7 @@ scenario('same_block_fpw', 0, 1);
 	$node->init;
 	$node->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
+block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 checkpoint_timeout = 1h
 bgwriter_lru_maxpages = 0
@@ -218,6 +220,7 @@ full_page_writes = off
 	$node->init(allows_streaming => 1);
 	$node->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
+block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 checkpoint_timeout = 1h
 bgwriter_lru_maxpages = 0

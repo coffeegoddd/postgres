@@ -32,6 +32,9 @@ extern PGDLLIMPORT bool debug_block_mapped_heap;
 /* logical blocks recovery remembers a later remap of, at most */
 extern PGDLLIMPORT int block_map_replay_entries;
 
+/* a shared page's copy always logs its image */
+extern PGDLLIMPORT bool block_map_copy_images;
+
 /* storage manager callbacks */
 extern void bmapinit(void);
 extern bool bmapclaims(RelFileLocatorBackend rlocator);

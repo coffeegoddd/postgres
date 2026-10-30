@@ -87,6 +87,7 @@ tests += {
       't/035_bmap_share_maps.pl',
       't/036_bmap_share_vm_images.pl',
       't/037_bmap_share_free_space.pl',
+      't/038_bmap_copy_images_default.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

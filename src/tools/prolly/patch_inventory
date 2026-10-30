@@ -82,9 +82,9 @@ patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage
 patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
-patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_release_max_per_pass and block_map_replay_entries
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass and block_map_replay_entries
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks

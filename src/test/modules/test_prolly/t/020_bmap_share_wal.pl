@@ -23,6 +23,7 @@ my $node = PostgreSQL::Test::Cluster->new('share_wal');
 $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
+block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 checkpoint_timeout = 1h
 max_wal_size = 1GB
