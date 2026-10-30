@@ -258,6 +258,36 @@ on one branch.  Each page those rows are on is copied the first time it is
 written, so the pages added are at most the pages the *D* rows are on,
 plus their index entries.  Dolt adds only the branch's name.
 
+**Proposed: materialized and unmaterialized branches.**  To be prototyped
+before it is adopted.  What makes our branches cost more than Dolt's is
+the working set, not the branch itself.  So a branch would have one of
+two states, and moving between them would be an explicit, priced step:
+- **Unmaterialized.**  The branch is only a head in the history store,
+  as in Dolt: no catalog rows and no pages.  It can be read through
+  history (log, diff, history and AS OF queries) but not written by SQL.
+- **Materialized.**  The branch has a working set: its own catalog rows,
+  and pages shared copy-on-write.  It can be written.
+
+A branch would be materialized when a session checks it out, when it is
+first written, or on request.  It would be dematerialized on request, or
+after a time unused.  Dematerializing a branch whose working set holds
+uncommitted changes is refused, as Dolt refuses a merge that would stomp
+them.  Its head stays, and it gives back its catalog rows and pages.
+
+| Operation | Dolt | Today | Proposed |
+|---|---|---|---|
+| Create a branch | O(1) | O(C), or O(C + D) | O(1) |
+| Materialize at a materialized branch's HEAD | | | O(C) |
+| Materialize at an arbitrary commit | | | O(C + D) |
+| Dematerialize a clean branch | | | O(C) |
+| Catalog filtering in checkout | | O(B × C) | O(B<sub>m</sub> × C) |
+
+Here *B<sub>m</sub>* is the number of materialized branches.  A thousand
+branches would then cost a thousand heads, and only those in use would pay
+for a working set.  This is also how clones treat branches today (layer
+12): other branches arrive as heads, and get a working set when checked
+out.
+
 #### Checkout
 
 Checkout discards the session's cached catalog entries; from then on,
@@ -612,6 +642,66 @@ again, from an archive or a remote, which adds that history back.
 Keyframes' own storage is a standing cost of the window, not of any
 operation: about the pages touched by all the change in the window,
 bounded by the storage budget that sets *Δ*.
+
+**Proposed: exponential spacing, tiered history, and no hard window.**
+To be prototyped before it is adopted.  With even spacing, cost has a
+cliff at the window's edge.  Inside it, any commit is within *Δ*/2 rows
+of a keyframe.  Outside it, there is no keyframe, and a move costs O(D).
+Two changes would replace the cliff with a slope.
+
+- **Exponential spacing.**  Keyframes would be dense near the heads and
+  sparser with age.  Measured in rows of change back from the nearest
+  head, they would sit at about *Δ<sub>0</sub>*, *Δ<sub>0</sub>r*,
+  *Δ<sub>0</sub>r<sup>2</sup>*, and so on, with *r* > 1.  As the heads
+  move on, a keyframe would be dropped once its neighbours are closer than
+  the spacing at its distance, the way backups are thinned from hourly to
+  daily to monthly.
+  - A commit *d* rows back would then be within about *d*(*r* − 1)/2 rows
+    of a keyframe.
+  - Covering *H* rows of history would take about 1 +
+    log<sub>*r*</sub>(*H* / *Δ<sub>0</sub>*) keyframes, against *H* / *Δ*
+    for even spacing.
+  - Each keyframe holds only the pages it does not share with its
+    neighbours, at most a whole schema's pages.  So the total stays
+    bounded without cutting history.
+- **Tiered history.**  The window's edge would stop being where history
+  ends, and become where it moves to cheaper storage.
+  - Recent history and keyframes stay on the server.
+  - Older history chunks, and older keyframes exported as portable chunks,
+    would move to object storage or a remote, and be fetched when an
+    operation needs them.  A keyframe's exported form would be its frozen
+    pages, page map and relation map, as the prototype stores them.
+  - History chunks are immutable and named by hash, so they can live
+    anywhere; this is the keep-hashes mode's segment, attached on demand
+    instead of by hand.
+  - An exported keyframe is restored by writing its pages, O(P), not by
+    sharing block maps, O(C).  That still costs far less than replaying
+    every row.
+
+Truncation would stay for data that must not be kept (rewrite mode).
+
+The proposed costs to reach a commit *d* rows of change back, with *r* the
+spacing ratio and *P* the pages that differ:
+
+| Operation | Even spacing, in the window | Even spacing, outside it | Exponential, on the server | Exponential, tiered off it |
+|---|---|---|---|---|
+| Hard reset | O(L + C + Δ log n) | O(L + D log n) | O(L + C + d(r − 1) log n) | O(L + P + d(r − 1) log n), plus fetching |
+| Create a branch | O(C + Δ) | O(C + D) | O(C + d(r − 1)) | O(P + d(r − 1)), plus fetching |
+| Keyframes kept | *H*/*Δ* in the window | | log<sub>*r*</sub>(*H*/*Δ<sub>0</sub>*) | |
+
+Recent commits would stay as cheap as today.  Old ones would cost in
+proportion to how far back they are, never the full rewrite, and nothing
+is lost unless the data must not be kept.
+
+**What the prototype must show** before either is adopted:
+- the planner's choices and measured move costs under exponential spacing,
+  against even spacing, on `winbench` and `kfbench`, across history depths;
+- the storage held by keyframes under each spacing;
+- the cost of a move to tiered history: fetching chunks and an exported
+  keyframe from a file remote, then restoring;
+- for materialization: the cost of creating, materializing and
+  dematerializing, and catalog filtering with many unmaterialized
+  branches.
 
 ### Compared with stock Postgres: OLTP performance
 
