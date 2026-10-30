@@ -2,5 +2,6 @@
 
 backend_sources += files(
   'branch_catalog.c',
+  'branch_filter.c',
   'registry.c',
 )

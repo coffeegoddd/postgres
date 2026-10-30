@@ -23,7 +23,12 @@ FROM test_prolly_conformance();
  branch_ids    | sequence        | allocates_increasing       | ok     | 
  branch_ids    | sequence        | knows_what_it_allocated    | ok     | 
  branch_ids    | sequence        | rollback_keeps_identifiers | ok     | 
-(12 rows)
+ branch_map    | cached          | registered                 | ok     | 
+ branch_map    | cached          | shared_and_missing_objects | ok     | 
+ branch_map    | cached          | versioned_objects          | ok     | 
+ branch_map    | cached          | reset_forgets              | ok     | 
+ branch_map    | cached          | forgets_dropped_objects    | ok     | 
+(17 rows)
 
 -- a failure says where its check is
 SELECT location ~ '^test_checksum\.c:[0-9]+$' AS has_location

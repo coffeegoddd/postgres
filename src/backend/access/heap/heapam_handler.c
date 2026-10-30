@@ -38,6 +38,7 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/branch_filter.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -2302,7 +2303,8 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 			ItemPointerSet(&(tuple->t_self), blockno, tupoffset);
 
 
-			if (all_visible)
+			/* (the catalog filter left only some of the page's tuples) */
+			if (all_visible && !hscan->rs_branch_filter)
 				visible = true;
 			else
 				visible = SampleHeapTupleVisible(scan, hscan->rs_cbuf,
@@ -2657,6 +2659,11 @@ BitmapHeapScanNextBlock(TableScanDesc scan,
 	}
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/* other branches' catalog rows, with the page unlocked */
+	if (hscan->rs_branch_filter)
+		ntup = CatalogBranchFilterPage(scan->rs_rd, BufferGetPage(buffer),
+									   block, hscan->rs_vistuples, ntup);
 
 	Assert(ntup <= MaxHeapTuplesPerPage);
 	hscan->rs_ntuples = ntup;

@@ -40,6 +40,13 @@ extern PGDLLIMPORT int catalog_branch;
 extern void assign_catalog_branch(int newval, void *extra);
 
 /*
+ * True while a branch change runs the pg_namespace syscache callbacks, so
+ * that a callback whose state does not depend on the session's branch can
+ * tell this from a change to the namespaces themselves.
+ */
+extern PGDLLIMPORT bool catalog_branch_changing;
+
+/*
  * Allocates branch identifiers: positive numbers, each handed out once in
  * the database it was allocated in.
  *

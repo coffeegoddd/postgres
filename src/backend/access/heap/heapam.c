@@ -45,6 +45,7 @@
 #include "commands/vacuum.h"
 #include "executor/instrument_node.h"
 #include "pgstat.h"
+#include "prolly/branch_filter.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -699,6 +700,12 @@ heap_prepare_pagescan(TableScanDesc sscan)
 	}
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/* other branches' catalog rows, with the page unlocked */
+	if (scan->rs_branch_filter)
+		scan->rs_ntuples = CatalogBranchFilterPage(scan->rs_base.rs_rd, page,
+												   block, scan->rs_vistuples,
+												   scan->rs_ntuples);
 }
 
 /*
@@ -1214,6 +1221,15 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	if (!(snapshot && IsMVCCSnapshot(snapshot)))
 		scan->rs_base.rs_flags &= ~SO_ALLOW_PAGEMODE;
 
+	/*
+	 * A query of a catalog does not see other branches' rows.  The filter
+	 * runs on the tuples found visible on a page once its lock is released,
+	 * so such a scan runs page at a time.
+	 */
+	scan->rs_branch_filter = CatalogBranchFilters(relation, snapshot);
+	if (scan->rs_branch_filter)
+		scan->rs_base.rs_flags |= SO_ALLOW_PAGEMODE;
+
 	/* Check that a historic snapshot is not used for non-catalog tables */
 	if (snapshot &&
 		IsHistoricMVCCSnapshot(snapshot) &&
@@ -1348,7 +1364,8 @@ heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 		else
 			scan->rs_base.rs_flags &= ~SO_ALLOW_SYNC;
 
-		if (allow_pagemode && scan->rs_base.rs_snapshot &&
+		if ((allow_pagemode || scan->rs_branch_filter) &&
+			scan->rs_base.rs_snapshot &&
 			IsMVCCSnapshot(scan->rs_base.rs_snapshot))
 			scan->rs_base.rs_flags |= SO_ALLOW_PAGEMODE;
 		else
@@ -1756,6 +1773,11 @@ heap_fetch(Relation relation,
 	HeapCheckForSerializableConflictOut(valid, relation, tuple, buffer, snapshot);
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/* another branch's catalog row, with the page unlocked */
+	if (valid && CatalogBranchFilters(relation, snapshot) &&
+		CatalogBranchHides(relation, tuple))
+		valid = false;
 
 	if (valid)
 	{

@@ -3,3 +3,4 @@
 # the table access method, and run on the one under test.
 test: branch_schemas
 test: branch_functions
+test: branch_catalogs

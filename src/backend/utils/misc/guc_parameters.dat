@@ -440,6 +440,14 @@
   assign_hook => 'assign_catalog_branch',
 },
 
+{ name => 'catalog_branch_filter', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Hides other branches\' catalog rows from this session\'s queries.',
+  long_desc => 'With this off, queries of the catalogs see every branch\'s rows.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'catalog_branch_filter',
+  boot_val => 'true',
+},
+
 { name => 'check_function_bodies', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Check routine bodies during CREATE FUNCTION and CREATE PROCEDURE.',
   variable => 'check_function_bodies',
