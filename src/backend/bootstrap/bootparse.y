@@ -30,6 +30,7 @@
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "storage/smgr.h"
 #include "utils/memutils.h"
 
 #include "bootparse.h"
@@ -217,7 +218,8 @@ Boot_CreateStmt:
 												   true,
 												   &relfrozenxid,
 												   &relminmxid,
-												   true);
+												   true,
+												   SMGR_MD);
 						elog(DEBUG4, "bootstrap relation created");
 					}
 					else

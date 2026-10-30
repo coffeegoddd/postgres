@@ -51,6 +51,7 @@
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/storage.h"
 #include "catalog/toasting.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
@@ -71,6 +72,7 @@
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
+#include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -1281,6 +1283,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	Datum		reloptions;
 	bool		isNull;
 	Oid			namespaceid;
+	int			save_smgr;
 
 	OldHeap = table_open(OIDOldHeap, lockmode);
 	OldHeapDesc = RelationGetDescr(OldHeap);
@@ -1322,64 +1325,81 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	 */
 	snprintf(NewHeapName, sizeof(NewHeapName), "pg_temp_%u", OIDOldHeap);
 
-	OIDNewHeap = heap_create_with_catalog(NewHeapName,
-										  namespaceid,
-										  NewTableSpace,
-										  InvalidOid,
-										  InvalidOid,
-										  InvalidOid,
-										  OldHeap->rd_rel->relowner,
-										  NewAccessMethod,
-										  OldHeapDesc,
-										  NIL,
-										  RELKIND_RELATION,
-										  relpersistence,
-										  false,
-										  RelationIsMapped(OldHeap),
-										  ONCOMMIT_NOOP,
-										  reloptions,
-										  false,
-										  true,
-										  true,
-										  OIDOldHeap,
-										  NULL);
-	Assert(OIDNewHeap != InvalidOid);
-
-	ReleaseSysCache(tuple);
-
 	/*
-	 * Advance command counter so that the newly-created relation's catalog
-	 * tuples will be visible to table_open.
+	 * The new heap and its TOAST table are kept by the storage manager that
+	 * keeps the old heap, unless the access method changes: then the new
+	 * one decides.
 	 */
-	CommandCounterIncrement();
-
-	/*
-	 * If necessary, create a TOAST table for the new relation.
-	 *
-	 * If the relation doesn't have a TOAST table already, we can't need one
-	 * for the new relation.  The other way around is possible though: if some
-	 * wide columns have been dropped, NewHeapCreateToastTable can decide that
-	 * no TOAST table is needed for the new table.
-	 *
-	 * Note that NewHeapCreateToastTable ends with CommandCounterIncrement, so
-	 * that the TOAST table will be visible for insertion.
-	 */
-	toastid = OldHeap->rd_rel->reltoastrelid;
-	if (OidIsValid(toastid))
+	save_smgr = new_relation_smgr;
+	if (NewAccessMethod == OldHeap->rd_rel->relam)
+		new_relation_smgr = RelationGetSmgr(OldHeap)->smgr_which;
+	PG_TRY();
 	{
-		/* keep the existing toast table's reloptions, if any */
-		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(toastid));
-		if (!HeapTupleIsValid(tuple))
-			elog(ERROR, "cache lookup failed for relation %u", toastid);
-		reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
-									 &isNull);
-		if (isNull)
-			reloptions = (Datum) 0;
 
-		NewHeapCreateToastTable(OIDNewHeap, reloptions, lockmode, toastid);
+		OIDNewHeap = heap_create_with_catalog(NewHeapName,
+											  namespaceid,
+											  NewTableSpace,
+											  InvalidOid,
+											  InvalidOid,
+											  InvalidOid,
+											  OldHeap->rd_rel->relowner,
+											  NewAccessMethod,
+											  OldHeapDesc,
+											  NIL,
+											  RELKIND_RELATION,
+											  relpersistence,
+											  false,
+											  RelationIsMapped(OldHeap),
+											  ONCOMMIT_NOOP,
+											  reloptions,
+											  false,
+											  true,
+											  true,
+											  OIDOldHeap,
+											  NULL);
+		Assert(OIDNewHeap != InvalidOid);
 
 		ReleaseSysCache(tuple);
+
+		/*
+		 * Advance command counter so that the newly-created relation's catalog
+		 * tuples will be visible to table_open.
+		 */
+		CommandCounterIncrement();
+
+		/*
+		 * If necessary, create a TOAST table for the new relation.
+		 *
+		 * If the relation doesn't have a TOAST table already, we can't need one
+		 * for the new relation.  The other way around is possible though: if some
+		 * wide columns have been dropped, NewHeapCreateToastTable can decide that
+		 * no TOAST table is needed for the new table.
+		 *
+		 * Note that NewHeapCreateToastTable ends with CommandCounterIncrement, so
+		 * that the TOAST table will be visible for insertion.
+		 */
+		toastid = OldHeap->rd_rel->reltoastrelid;
+		if (OidIsValid(toastid))
+		{
+			/* keep the existing toast table's reloptions, if any */
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(toastid));
+			if (!HeapTupleIsValid(tuple))
+				elog(ERROR, "cache lookup failed for relation %u", toastid);
+			reloptions = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
+										 &isNull);
+			if (isNull)
+				reloptions = (Datum) 0;
+
+			NewHeapCreateToastTable(OIDNewHeap, reloptions, lockmode, toastid);
+
+			ReleaseSysCache(tuple);
+		}
 	}
+	PG_FINALLY();
+	{
+		new_relation_smgr = save_smgr;
+	}
+	PG_END_TRY();
 
 	table_close(OldHeap, NoLock);
 

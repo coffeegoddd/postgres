@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 test_prolly_sources = files(
+  'bmap_checks.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_bufmgr.c',
@@ -34,11 +35,13 @@ tests += {
     'sql': [
       'unit',
       'conformance',
+      'bmap_storage',
     ],
   },
   'tap': {
     'tests': [
       't/001_preloaded.pl',
+      't/002_bmap_storage.pl',
     ],
   },
 }

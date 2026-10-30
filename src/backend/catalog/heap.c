@@ -298,7 +298,8 @@ heap_create(const char *relname,
 			bool allow_system_table_mods,
 			TransactionId *relfrozenxid,
 			MultiXactId *relminmxid,
-			bool create_storage)
+			bool create_storage,
+			int smgr_which)
 {
 	Relation	rel;
 
@@ -388,7 +389,8 @@ heap_create(const char *relname,
 											   relpersistence,
 											   relfrozenxid, relminmxid);
 		else if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
-			RelationCreateStorage(rel->rd_locator, relpersistence, true);
+			RelationCreateStorageWith(rel->rd_locator, relpersistence, true,
+									  smgr_which);
 		else
 			Assert(false);
 	}
@@ -1343,7 +1345,8 @@ heap_create_with_catalog(const char *relname,
 							   allow_system_table_mods,
 							   &relfrozenxid,
 							   &relminmxid,
-							   true);
+							   true,
+							   SMGR_MD);
 
 	Assert(relid == RelationGetRelid(new_rel_desc));
 

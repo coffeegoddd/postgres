@@ -72,6 +72,7 @@ PG_SHMEM_SUBSYSTEM(WalSummarizerShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(PgArchShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(ApplyLauncherShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(SlotSyncShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(BmapShmemCallbacks)
 
 /* other modules that need some shared memory space */
 PG_SHMEM_SUBSYSTEM(BTreeShmemCallbacks)

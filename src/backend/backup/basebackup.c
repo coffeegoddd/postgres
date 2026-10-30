@@ -40,6 +40,7 @@
 #include "replication/slot.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
+#include "storage/bmap_files.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/dsm_impl.h"
@@ -1653,6 +1654,7 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	 * could be validating a checksum.
 	 */
 	if (!noverify_checksums && RelFileNumberIsValid(relfilenumber) &&
+		relfilenumber != BMAP_STORE_RELNUMBER &&
 		backup_checksums_verifiable(sink->bbs_state->startptr))
 		verify_checksum = true;
 

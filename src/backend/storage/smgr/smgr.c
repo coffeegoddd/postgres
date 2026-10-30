@@ -67,6 +67,7 @@
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
@@ -203,6 +204,15 @@ typedef struct f_smgr
 	 */
 	bool		(*smgr_writesread) (ForkNumber forknum);
 
+	/*
+	 * Does the storage manager read relations whose drop has committed,
+	 * until their files are unlinked (a sweep counting what every map of a
+	 * store holds)?  Such a read after the relations' buffers were dropped
+	 * brings pages back into shared buffers, so they are dropped again once
+	 * the files are gone.
+	 */
+	bool		smgr_readsdropped;
+
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
@@ -267,6 +277,50 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+	},
+	/* block-mapped */
+	[SMGR_BMAP] = {
+		.smgr_init = bmapinit,
+		.smgr_shutdown = NULL,
+		.smgr_claims = bmapclaims,
+		.smgr_open = bmapopen,
+		.smgr_close = bmapclose,
+		.smgr_create = bmapcreate,
+		.smgr_exists = bmapexists,
+		.smgr_share = bmapshare,
+		.smgr_syncshares = bmapsyncshares,
+		.smgr_replacesblocks = bmapreplacesblocks,
+		.smgr_replacedafter = bmapreplacedafter,
+		.smgr_prerestore = bmapprerestore,
+		.smgr_preparesforchanges = bmappreparesforchanges,
+		.smgr_prepareforchange = bmapprepareforchange,
+		.smgr_pageisshared = bmappageisshared,
+		.smgr_pagesharedelsewhere = bmappagesharedelsewhere,
+		.smgr_predrop = bmappredrop,
+		.smgr_precommitdrop = bmapprecommitdrop,
+		.smgr_enddrops = bmapenddrops,
+		.smgr_beforeextend = bmapbeforeextend,
+		.smgr_releasestep = bmapreleasestep,
+		.smgr_writesread = bmapwritesread,
+		.smgr_readsdropped = true,
+		.smgr_unlink = bmapunlink,
+		.smgr_extend = bmapextend,
+		.smgr_zeroextend = bmapzeroextend,
+		.smgr_preextend = bmappreextend,
+		.smgr_prefetch = bmapprefetch,
+		.smgr_maxcombine = bmapmaxcombine,
+		.smgr_readv = bmapreadv,
+		.smgr_prepareread = bmapprepareread,
+		.smgr_startreadv = bmapstartreadv,
+		.smgr_writev = bmapwritev,
+		.smgr_writeback = bmapwriteback,
+		.smgr_nblocks = bmapnblocks,
+		.smgr_pretruncate = bmappretruncate,
+		.smgr_truncate = bmaptruncate,
+		.smgr_posttruncate = bmapposttruncate,
+		.smgr_immedsync = bmapimmedsync,
+		.smgr_registersync = bmapregistersync,
+		.smgr_fd = bmapfd,
 	}
 };
 
@@ -1031,6 +1085,25 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
+	}
+
+	/*
+	 * The buffers a storage manager's own readers read back between the drop
+	 * of the buffers and the unlink, dropped too.  A reader that reads them
+	 * after this finds the files gone, once it is done with them (or
+	 * fails), and drops them itself.  (Recovery runs no such readers.)
+	 */
+	if (!isRedo)
+	{
+		SMgrRelation *redrop = palloc_array(SMgrRelation, nrels);
+		int			nredrop = 0;
+
+		for (i = 0; i < nrels; i++)
+			if (smgrsw[rels[i]->smgr_which].smgr_readsdropped)
+				redrop[nredrop++] = rels[i];
+		if (nredrop > 0)
+			DropUnlinkedRelationsAllBuffers(redrop, nredrop);
+		pfree(redrop);
 	}
 
 	pfree(rlocators);
