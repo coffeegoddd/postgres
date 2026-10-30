@@ -48,6 +48,7 @@ tests += {
       'bmap_diff',
       'bmap_first_write',
       'bmap_block_map_stats',
+      'branch_map_cost',
     ],
   },
   'isolation': {

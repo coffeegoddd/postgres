@@ -19,7 +19,9 @@
  * configuration named by default_text_search_config, and the replication
  * output plugin's view of which publications cover which tables.  Each of
  * those is kept current by a syscache callback on pg_namespace, so a
- * branch change runs those callbacks as if every schema had changed.  It
+ * branch change runs those callbacks as if every schema had changed (the
+ * catalog filter's map of objects to branches, which does not depend on
+ * the session's branch, ignores that; see catalog_branch_changing).  It
  * also discards the session's sequence caches, as DISCARD SEQUENCES does,
  * so that currval() never answers for a sequence the session can no longer
  * name.  None of this reads the catalogs, so it is safe wherever a setting
@@ -54,6 +56,9 @@
 
 int			catalog_branch = 0;
 
+/* set while a branch change runs the pg_namespace callbacks */
+bool		catalog_branch_changing = false;
+
 /*
  * A branch change: discard what was resolved from schema names (see the
  * file header).
@@ -64,7 +69,9 @@ assign_catalog_branch(int newval, void *extra)
 	if (newval == catalog_branch)
 		return;
 
+	catalog_branch_changing = true;
 	CallSyscacheCallbacks(NAMESPACEOID, 0);
+	catalog_branch_changing = false;
 	CallSyscacheCallbacks(TSCONFIGOID, 0);
 	ResetSequenceCaches();
 }

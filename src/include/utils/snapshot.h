@@ -180,6 +180,13 @@ typedef struct SnapshotData
 	bool		takenDuringRecovery;	/* recovery-shaped snapshot? */
 	bool		copied;			/* false if it's a static snapshot */
 
+	/*
+	 * A catalog snapshot, or a copy of one.  Version control's catalog
+	 * filter leaves scans with these whole, so that lookups by object id see
+	 * every branch's catalog rows.
+	 */
+	bool		is_catalog;
+
 	CommandId	curcid;			/* in my xact, CID < curcid are visible */
 
 	/*

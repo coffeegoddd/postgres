@@ -37,6 +37,7 @@ tests += {
     'env': {'PROLLY_AM': 'heap'},
     'tests': [
       't/200_branch_schema_names.pl',
+      't/201_branch_sessions.pl',
     ],
   },
 }

@@ -19,7 +19,8 @@ DATA = test_prolly--1.0.sql
 
 REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
-	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats
+	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
+	branch_map_cost
 ISOLATION = bmap_shared_writers
 TAP_TESTS = 1
 

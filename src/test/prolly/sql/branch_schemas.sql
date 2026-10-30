@@ -51,10 +51,13 @@ RESET catalog_branch;
 SELECT * FROM app.t;
 SELECT to_regnamespace('app') IS NULL AS no_app;
 
--- one row per branch, with its branch in nspbranch
+-- one row per branch, with its branch in nspbranch (a session sees only
+-- its branch's rows, so this looks with the catalog filter off)
+SET catalog_branch_filter = off;
 SELECT count(*) AS rows, count(*) FILTER (WHERE nspbranch = :b1) AS on_b1,
 	   count(*) FILTER (WHERE nspbranch = :b2) AS on_b2
 FROM pg_namespace WHERE nspname = 'app';
+RESET catalog_branch_filter;
 SELECT nspbranch FROM pg_namespace WHERE nspname = 'pub';
 
 -- a name is shared or versioned, never both

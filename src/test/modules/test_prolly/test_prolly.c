@@ -54,6 +54,7 @@ static const ProllyUnitSuite *const unit_suites[] = {
 static const ProllyConformanceSuite *const conformance_suites[] = {
 	&conformance_test_checksum_suite,
 	&conformance_branch_ids_suite,
+	&conformance_branch_map_suite,
 };
 
 /* The outcome of one test. */

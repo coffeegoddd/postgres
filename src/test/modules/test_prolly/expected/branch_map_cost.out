@@ -1,0 +1,288 @@
+-- What the catalog filter costs: each object's branch is read from the
+-- catalogs once, and again only after the object changes.  Neither a
+-- branch change nor what other branches hold makes a session read again.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+SELECT pg_branch_id_allocate() AS b1 \gset
+SELECT pg_branch_id_allocate() AS b2 \gset
+-- the same versioned schema on two branches, a hundred tables each
+SET catalog_branch = :b1;
+CREATE SCHEMA cost VERSIONED;
+SELECT format('CREATE TABLE cost.t%s (a int, b text)', g)
+FROM generate_series(1, 100) g \gexec
+CREATE TABLE cost.t1 (a int, b text)
+CREATE TABLE cost.t2 (a int, b text)
+CREATE TABLE cost.t3 (a int, b text)
+CREATE TABLE cost.t4 (a int, b text)
+CREATE TABLE cost.t5 (a int, b text)
+CREATE TABLE cost.t6 (a int, b text)
+CREATE TABLE cost.t7 (a int, b text)
+CREATE TABLE cost.t8 (a int, b text)
+CREATE TABLE cost.t9 (a int, b text)
+CREATE TABLE cost.t10 (a int, b text)
+CREATE TABLE cost.t11 (a int, b text)
+CREATE TABLE cost.t12 (a int, b text)
+CREATE TABLE cost.t13 (a int, b text)
+CREATE TABLE cost.t14 (a int, b text)
+CREATE TABLE cost.t15 (a int, b text)
+CREATE TABLE cost.t16 (a int, b text)
+CREATE TABLE cost.t17 (a int, b text)
+CREATE TABLE cost.t18 (a int, b text)
+CREATE TABLE cost.t19 (a int, b text)
+CREATE TABLE cost.t20 (a int, b text)
+CREATE TABLE cost.t21 (a int, b text)
+CREATE TABLE cost.t22 (a int, b text)
+CREATE TABLE cost.t23 (a int, b text)
+CREATE TABLE cost.t24 (a int, b text)
+CREATE TABLE cost.t25 (a int, b text)
+CREATE TABLE cost.t26 (a int, b text)
+CREATE TABLE cost.t27 (a int, b text)
+CREATE TABLE cost.t28 (a int, b text)
+CREATE TABLE cost.t29 (a int, b text)
+CREATE TABLE cost.t30 (a int, b text)
+CREATE TABLE cost.t31 (a int, b text)
+CREATE TABLE cost.t32 (a int, b text)
+CREATE TABLE cost.t33 (a int, b text)
+CREATE TABLE cost.t34 (a int, b text)
+CREATE TABLE cost.t35 (a int, b text)
+CREATE TABLE cost.t36 (a int, b text)
+CREATE TABLE cost.t37 (a int, b text)
+CREATE TABLE cost.t38 (a int, b text)
+CREATE TABLE cost.t39 (a int, b text)
+CREATE TABLE cost.t40 (a int, b text)
+CREATE TABLE cost.t41 (a int, b text)
+CREATE TABLE cost.t42 (a int, b text)
+CREATE TABLE cost.t43 (a int, b text)
+CREATE TABLE cost.t44 (a int, b text)
+CREATE TABLE cost.t45 (a int, b text)
+CREATE TABLE cost.t46 (a int, b text)
+CREATE TABLE cost.t47 (a int, b text)
+CREATE TABLE cost.t48 (a int, b text)
+CREATE TABLE cost.t49 (a int, b text)
+CREATE TABLE cost.t50 (a int, b text)
+CREATE TABLE cost.t51 (a int, b text)
+CREATE TABLE cost.t52 (a int, b text)
+CREATE TABLE cost.t53 (a int, b text)
+CREATE TABLE cost.t54 (a int, b text)
+CREATE TABLE cost.t55 (a int, b text)
+CREATE TABLE cost.t56 (a int, b text)
+CREATE TABLE cost.t57 (a int, b text)
+CREATE TABLE cost.t58 (a int, b text)
+CREATE TABLE cost.t59 (a int, b text)
+CREATE TABLE cost.t60 (a int, b text)
+CREATE TABLE cost.t61 (a int, b text)
+CREATE TABLE cost.t62 (a int, b text)
+CREATE TABLE cost.t63 (a int, b text)
+CREATE TABLE cost.t64 (a int, b text)
+CREATE TABLE cost.t65 (a int, b text)
+CREATE TABLE cost.t66 (a int, b text)
+CREATE TABLE cost.t67 (a int, b text)
+CREATE TABLE cost.t68 (a int, b text)
+CREATE TABLE cost.t69 (a int, b text)
+CREATE TABLE cost.t70 (a int, b text)
+CREATE TABLE cost.t71 (a int, b text)
+CREATE TABLE cost.t72 (a int, b text)
+CREATE TABLE cost.t73 (a int, b text)
+CREATE TABLE cost.t74 (a int, b text)
+CREATE TABLE cost.t75 (a int, b text)
+CREATE TABLE cost.t76 (a int, b text)
+CREATE TABLE cost.t77 (a int, b text)
+CREATE TABLE cost.t78 (a int, b text)
+CREATE TABLE cost.t79 (a int, b text)
+CREATE TABLE cost.t80 (a int, b text)
+CREATE TABLE cost.t81 (a int, b text)
+CREATE TABLE cost.t82 (a int, b text)
+CREATE TABLE cost.t83 (a int, b text)
+CREATE TABLE cost.t84 (a int, b text)
+CREATE TABLE cost.t85 (a int, b text)
+CREATE TABLE cost.t86 (a int, b text)
+CREATE TABLE cost.t87 (a int, b text)
+CREATE TABLE cost.t88 (a int, b text)
+CREATE TABLE cost.t89 (a int, b text)
+CREATE TABLE cost.t90 (a int, b text)
+CREATE TABLE cost.t91 (a int, b text)
+CREATE TABLE cost.t92 (a int, b text)
+CREATE TABLE cost.t93 (a int, b text)
+CREATE TABLE cost.t94 (a int, b text)
+CREATE TABLE cost.t95 (a int, b text)
+CREATE TABLE cost.t96 (a int, b text)
+CREATE TABLE cost.t97 (a int, b text)
+CREATE TABLE cost.t98 (a int, b text)
+CREATE TABLE cost.t99 (a int, b text)
+CREATE TABLE cost.t100 (a int, b text)
+SET catalog_branch = :b2;
+CREATE SCHEMA cost VERSIONED;
+SELECT format('CREATE TABLE cost.t%s (a int, b text)', g)
+FROM generate_series(1, 100) g \gexec
+CREATE TABLE cost.t1 (a int, b text)
+CREATE TABLE cost.t2 (a int, b text)
+CREATE TABLE cost.t3 (a int, b text)
+CREATE TABLE cost.t4 (a int, b text)
+CREATE TABLE cost.t5 (a int, b text)
+CREATE TABLE cost.t6 (a int, b text)
+CREATE TABLE cost.t7 (a int, b text)
+CREATE TABLE cost.t8 (a int, b text)
+CREATE TABLE cost.t9 (a int, b text)
+CREATE TABLE cost.t10 (a int, b text)
+CREATE TABLE cost.t11 (a int, b text)
+CREATE TABLE cost.t12 (a int, b text)
+CREATE TABLE cost.t13 (a int, b text)
+CREATE TABLE cost.t14 (a int, b text)
+CREATE TABLE cost.t15 (a int, b text)
+CREATE TABLE cost.t16 (a int, b text)
+CREATE TABLE cost.t17 (a int, b text)
+CREATE TABLE cost.t18 (a int, b text)
+CREATE TABLE cost.t19 (a int, b text)
+CREATE TABLE cost.t20 (a int, b text)
+CREATE TABLE cost.t21 (a int, b text)
+CREATE TABLE cost.t22 (a int, b text)
+CREATE TABLE cost.t23 (a int, b text)
+CREATE TABLE cost.t24 (a int, b text)
+CREATE TABLE cost.t25 (a int, b text)
+CREATE TABLE cost.t26 (a int, b text)
+CREATE TABLE cost.t27 (a int, b text)
+CREATE TABLE cost.t28 (a int, b text)
+CREATE TABLE cost.t29 (a int, b text)
+CREATE TABLE cost.t30 (a int, b text)
+CREATE TABLE cost.t31 (a int, b text)
+CREATE TABLE cost.t32 (a int, b text)
+CREATE TABLE cost.t33 (a int, b text)
+CREATE TABLE cost.t34 (a int, b text)
+CREATE TABLE cost.t35 (a int, b text)
+CREATE TABLE cost.t36 (a int, b text)
+CREATE TABLE cost.t37 (a int, b text)
+CREATE TABLE cost.t38 (a int, b text)
+CREATE TABLE cost.t39 (a int, b text)
+CREATE TABLE cost.t40 (a int, b text)
+CREATE TABLE cost.t41 (a int, b text)
+CREATE TABLE cost.t42 (a int, b text)
+CREATE TABLE cost.t43 (a int, b text)
+CREATE TABLE cost.t44 (a int, b text)
+CREATE TABLE cost.t45 (a int, b text)
+CREATE TABLE cost.t46 (a int, b text)
+CREATE TABLE cost.t47 (a int, b text)
+CREATE TABLE cost.t48 (a int, b text)
+CREATE TABLE cost.t49 (a int, b text)
+CREATE TABLE cost.t50 (a int, b text)
+CREATE TABLE cost.t51 (a int, b text)
+CREATE TABLE cost.t52 (a int, b text)
+CREATE TABLE cost.t53 (a int, b text)
+CREATE TABLE cost.t54 (a int, b text)
+CREATE TABLE cost.t55 (a int, b text)
+CREATE TABLE cost.t56 (a int, b text)
+CREATE TABLE cost.t57 (a int, b text)
+CREATE TABLE cost.t58 (a int, b text)
+CREATE TABLE cost.t59 (a int, b text)
+CREATE TABLE cost.t60 (a int, b text)
+CREATE TABLE cost.t61 (a int, b text)
+CREATE TABLE cost.t62 (a int, b text)
+CREATE TABLE cost.t63 (a int, b text)
+CREATE TABLE cost.t64 (a int, b text)
+CREATE TABLE cost.t65 (a int, b text)
+CREATE TABLE cost.t66 (a int, b text)
+CREATE TABLE cost.t67 (a int, b text)
+CREATE TABLE cost.t68 (a int, b text)
+CREATE TABLE cost.t69 (a int, b text)
+CREATE TABLE cost.t70 (a int, b text)
+CREATE TABLE cost.t71 (a int, b text)
+CREATE TABLE cost.t72 (a int, b text)
+CREATE TABLE cost.t73 (a int, b text)
+CREATE TABLE cost.t74 (a int, b text)
+CREATE TABLE cost.t75 (a int, b text)
+CREATE TABLE cost.t76 (a int, b text)
+CREATE TABLE cost.t77 (a int, b text)
+CREATE TABLE cost.t78 (a int, b text)
+CREATE TABLE cost.t79 (a int, b text)
+CREATE TABLE cost.t80 (a int, b text)
+CREATE TABLE cost.t81 (a int, b text)
+CREATE TABLE cost.t82 (a int, b text)
+CREATE TABLE cost.t83 (a int, b text)
+CREATE TABLE cost.t84 (a int, b text)
+CREATE TABLE cost.t85 (a int, b text)
+CREATE TABLE cost.t86 (a int, b text)
+CREATE TABLE cost.t87 (a int, b text)
+CREATE TABLE cost.t88 (a int, b text)
+CREATE TABLE cost.t89 (a int, b text)
+CREATE TABLE cost.t90 (a int, b text)
+CREATE TABLE cost.t91 (a int, b text)
+CREATE TABLE cost.t92 (a int, b text)
+CREATE TABLE cost.t93 (a int, b text)
+CREATE TABLE cost.t94 (a int, b text)
+CREATE TABLE cost.t95 (a int, b text)
+CREATE TABLE cost.t96 (a int, b text)
+CREATE TABLE cost.t97 (a int, b text)
+CREATE TABLE cost.t98 (a int, b text)
+CREATE TABLE cost.t99 (a int, b text)
+CREATE TABLE cost.t100 (a int, b text)
+-- the first scans learn every object they meet
+SET catalog_branch = :b1;
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+ count 
+-------
+   100
+(1 row)
+
+SELECT reads AS r0 FROM test_branch_map_stats() \gset
+-- asked again, nothing is read
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+ count 
+-------
+   100
+(1 row)
+
+SELECT reads - :r0 AS reads_again FROM test_branch_map_stats();
+ reads_again 
+-------------
+           0
+(1 row)
+
+-- nor after a branch change
+SET catalog_branch = :b2;
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+ count 
+-------
+   100
+(1 row)
+
+SELECT reads - :r0 AS reads_after_branch_change FROM test_branch_map_stats();
+ reads_after_branch_change 
+---------------------------
+                         0
+(1 row)
+
+-- DDL on one branch costs the next scan only the objects it changed: a
+-- new table is its relation, its row type and array type, and its
+-- columns' relation, not the two hundred tables already known
+SELECT reads AS r1 FROM test_branch_map_stats() \gset
+CREATE TABLE cost.extra (a int, b text);
+SET catalog_branch = :b1;
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+ count 
+-------
+   100
+(1 row)
+
+SELECT reads - :r1 BETWEEN 1 AND 6 AS reads_what_changed FROM test_branch_map_stats();
+ reads_what_changed 
+--------------------
+ t
+(1 row)
+
+-- a dropped table's answers are forgotten
+SELECT forgotten AS f0 FROM test_branch_map_stats() \gset
+DROP TABLE cost.t1;
+SELECT forgotten > :f0 AS forgot_dropped FROM test_branch_map_stats();
+ forgot_dropped 
+----------------
+ t
+(1 row)
+
+SET client_min_messages = warning;
+DROP SCHEMA cost CASCADE;
+SET catalog_branch = :b2;
+DROP SCHEMA cost CASCADE;
+RESET catalog_branch;
+RESET client_min_messages;

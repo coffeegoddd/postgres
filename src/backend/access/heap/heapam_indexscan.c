@@ -20,6 +20,7 @@
 #include "access/tableam_indexscan.h"
 #include "access/visibilitymap.h"
 #include "pgstat.h"
+#include "prolly/branch_filter.h"
 #include "storage/predicate.h"
 
 
@@ -81,6 +82,10 @@ heapam_index_scan_begin(IndexScanDesc scan, uint32 flags)
 
 	/* Remember if scan is read-only */
 	hscan->xs_readonly = (flags & SO_HINT_REL_READ_ONLY) != 0;
+
+	/* A query of a catalog does not see other branches' rows */
+	hscan->xs_branch_filter = CatalogBranchFilters(scan->heapRelation,
+												   scan->xs_snapshot);
 
 	/* Resolve which xs_getnext_slot implementation to use for this scan */
 	if (scan->xs_want_itup)
@@ -365,7 +370,8 @@ heapam_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 										 ItemPointerGetBlockNumber(&scan->xs_heaptid),
 										 &hscan->xs_vmbuffer);
 
-			if (unlikely(!all_visible))
+			/* (the catalog filter must see each row) */
+			if (unlikely(!all_visible || hscan->xs_branch_filter))
 			{
 				/* Page isn't all-visible, so need a heap fetch */
 				if (!heapam_index_only_heap_fetch(scan))
@@ -490,6 +496,14 @@ heapam_index_heap_fetch(IndexScanDesc scan, IndexScanHeapData *hscan,
 											!scan->xs_heap_continue);
 	heapTuple->t_self = *tid;
 	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_UNLOCK);
+
+	/* another branch's catalog row, with the page unlocked */
+	if (got_heap_tuple && unlikely(hscan->xs_branch_filter) &&
+		CatalogBranchHides(rel, heapTuple))
+	{
+		got_heap_tuple = false;
+		all_dead = false;
+	}
 
 	if (got_heap_tuple)
 	{

@@ -72,6 +72,7 @@
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/branch_filter.h"
 #include "postmaster/walwriter.h"
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"

@@ -46,7 +46,9 @@ patch contrib/meson.build      0  builds the fork's extensions under contrib/pro
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
+patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (NewRelationStorageManager(); kept across rewrites)
+patch src/backend/access/heap/heapam_indexscan.c  1b  index and index-only scans of catalogs hide other branches' rows, visiting the heap for each
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
 patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing; VACUUM freezes a page the storage shares with nothing whenever all its tuples can be (freeze_own_eagerly)
 patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; counts a shared page left as it is as an eager scan's failure; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
@@ -102,6 +104,7 @@ patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber kee
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
+patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
@@ -115,6 +118,7 @@ patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource m
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
+patch src/include/access/heapam.h  1b  heap and index scans remember whether they hide other branches' catalog rows
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
@@ -144,6 +148,7 @@ patch src/include/storage/smgr.h  1a  storage manager interface for storage that
 patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
 patch src/include/utils/pgstat_internal.h  1a  the block map statistics kind's shared entry and callbacks
 patch src/include/utils/pgstat_kind.h  1a  PGSTAT_KIND_BLOCK_MAP, a variable-numbered kind after the fixed ones
+patch src/include/utils/snapshot.h  1b  SnapshotData.is_catalog, set on catalog snapshots
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
 patch src/test/meson.build     0  runs the requirements suite in src/test/prolly
 patch src/test/modules/Makefile     0  builds and runs the engine's unit and conformance tests in test_prolly

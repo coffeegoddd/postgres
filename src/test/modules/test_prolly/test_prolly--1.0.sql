@@ -282,3 +282,14 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_diff_reads(a oid, b oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Branched catalogs: what the branch map in use did (questions asked,
+-- catalog reads made to answer them, answers forgotten on invalidation,
+-- answers kept now), and a way to make it forget everything.
+CREATE FUNCTION test_branch_map_stats(OUT probes int8, OUT reads int8,
+	OUT forgotten int8, OUT entries int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_branch_map_reset()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
