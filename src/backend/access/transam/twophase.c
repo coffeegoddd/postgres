@@ -926,6 +926,30 @@ TwoPhaseGetDummyProcNumber(FullTransactionId fxid, bool lock_held)
  * If lock_held is set to true, TwoPhaseStateLock will not be taken, so the
  * caller had better hold it.
  */
+/*
+ * TwoPhaseTransactionIsKnown
+ *		Whether fxid is a prepared transaction, or one whose COMMIT or
+ *		ROLLBACK PREPARED is still being done: its entry stays until the
+ *		end of FinishPreparedTransaction(), after its files are dropped.
+ */
+bool
+TwoPhaseTransactionIsKnown(FullTransactionId fxid)
+{
+	bool		found = false;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	for (int i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		if (FullTransactionIdEquals(TwoPhaseState->prepXacts[i]->fxid, fxid))
+		{
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(TwoPhaseStateLock);
+	return found;
+}
+
 PGPROC *
 TwoPhaseGetDummyProc(FullTransactionId fxid, bool lock_held)
 {

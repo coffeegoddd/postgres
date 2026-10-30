@@ -69,7 +69,8 @@ is(sql(q{SELECT test_bmap_drop_orphans()}), '1',
 	'it is found as the storage of a transaction that never committed');
 ok(!-f "$base/${copy}_bmap", 'and dropped');
 ok(-f "$base/${kept}_bmap", 'a copy made outside any transaction is left');
-ok($committed eq '' || -f "$base/${committed}_bmap", 'and so is one that committed');
+isnt($committed, '', 'the committed share made storage');
+ok(-f "$base/${committed}_bmap", 'and so is one that committed');
 is(sql(q{SELECT test_bmap_drop_orphans()}), '0', 'nothing is left to drop');
 
 # Its holds are let go of: once the other copies go too, t's blocks are
@@ -107,6 +108,56 @@ ok($node->poll_query_until('postgres', qq{SELECT NOT EXISTS (SELECT 1 FROM pg_ls
 	'autovacuum\'s storage maintenance drops what the crash orphaned');
 ok($node->log_contains(qr/dropping storage "base\/$db\/$ucopy" made by transaction \d+, which did not commit/),
 	'saying so');
+
+# A transaction of this server is never taken for an orphan, even while
+# its abort, out of the proc array already, has yet to drop its storage
+# itself: only transactions begun before recovery ended can be orphans.
+SKIP:
+{
+	skip 'injection points not supported by this build', 3
+	  unless $ENV{enable_injection_points} eq 'yes';
+	$node->append_conf('postgresql.conf', 'autovacuum = off');
+	$node->restart;
+	sql(q{CREATE EXTENSION IF NOT EXISTS injection_points});
+	sql(q{
+		CREATE TABLE v (a int, b text);
+		INSERT INTO v SELECT g, repeat('v', 200) FROM generate_series(1, 5000) g;
+		CHECKPOINT;
+	});
+	my $v = sql(q{SELECT pg_relation_filenode('v')});
+	my $vrows = sql(q{SELECT md5(string_agg(v::text, ',' ORDER BY a)) FROM v});
+	my $abort = $node->background_psql('postgres');
+	$abort->query_safe(q{SELECT injection_points_set_local()});
+	$abort->query_safe(q{SELECT injection_points_attach('bmap-predrop', 'wait')});
+	$abort->query_safe(q{BEGIN});
+	$abort->query_safe(qq{SELECT test_bmap_share($v, true)});
+	$abort->query_until(qr/^$/, "ROLLBACK;\n");
+	$node->wait_for_event('client backend', 'bmap-predrop');
+	is(sql(q{SELECT test_bmap_drop_orphans()}), '0',
+		'a transaction aborting now is no orphan, though out of the proc array');
+	sql(q{SELECT injection_points_wakeup('bmap-predrop')});
+	$abort->quit;
+	sql(q{SELECT * FROM test_bmap_release_drain()});
+	is(sql(qq{SELECT count(*) FILTER (WHERE refs <> 0) FROM test_bmap_map($v)}), '0',
+		'its own drop let go of its holds, once');
+	is(sql(q{SELECT md5(string_agg(v::text, ',' ORDER BY a)) FROM v}), $vrows,
+		'and the source reads as it did');
+}
+
+# A table made a full 2^32 transactions ago is no orphan when a recent
+# transaction with the same 32-bit id aborted: creators are compared by
+# their full ids, and one older than the commit log keeps is kept.
+sql(q{CREATE TABLE w (a int, b text); INSERT INTO w SELECT g, 'w' FROM generate_series(1, 1000) g;});
+my $wx = sql(q{SELECT xmin FROM pg_class WHERE relname = 'w'});
+sql(q{VACUUM FREEZE; CHECKPOINT;});
+$node->stop;
+command_ok([ 'pg_resetwal', '-D', $node->data_dir, '-e', '1', '-x', $wx - 5, '-u', $wx - 10 ],
+	'a full epoch later');
+$node->start;
+sql(q{BEGIN; SELECT txid_current(); ROLLBACK;}) for 1 .. 10;
+is(sql(q{SELECT test_bmap_drop_orphans()}), '0',
+	'a table whose creator\'s 32-bit id came round again is no orphan');
+is(sql(q{SELECT count(*) FROM w}), '1000', 'and keeps its rows');
 
 $node->stop;
 done_testing();

@@ -281,6 +281,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/transam.h"
+#include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -803,6 +804,7 @@ typedef struct BmapShared
 	 * passed (see "Copies without an image")
 	 */
 	pg_atomic_uint64 copies_passed;
+	pg_atomic_uint64 run_since_xid;	/* the first transaction since recovery ended */
 
 	/* the remaps ahead of replay (bmap_ahead), and how many there are */
 	LWLock		ahead_lock;
@@ -906,6 +908,7 @@ BmapShmemInit(void *arg)
 	LWLockInitialize(&bmap_shared->ahead_lock, LWTRANCHE_BMAP_REPLAY_AHEAD);
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
 	pg_atomic_init_u64(&bmap_shared->copies_passed, 0);
+	pg_atomic_init_u64(&bmap_shared->run_since_xid, 0);
 	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
 	for (int i = 0; i < MaxBackends; i++)
 	{
@@ -14242,6 +14245,16 @@ bmap_creating(FullTransactionId xid)
 	creating_xact = xid;
 }
 
+void
+bmap_recovery_done(FullTransactionId next)
+{
+	pg_atomic_write_u64(&bmap_shared->run_since_xid, U64FromFullTransactionId(next));
+}
+
+/* The lock that keeps two scans of one page store for orphans apart. */
+#define ORPHANS_LOCK(tag, spc, db) \
+	SET_LOCKTAG_OBJECT(tag, db, TableSpaceRelationId, spc, 0x626d)
+
 /*
  * The maps of the database's page store in tablespace spcOid made by a
  * transaction that is neither in progress nor committed: it aborted
@@ -14256,13 +14269,27 @@ int
 bmap_drop_orphans(Oid spcOid, Oid dbOid)
 {
 	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
-	char	   *path = GetDatabasePath(dbOid, spcOid);
+	char	   *path;
 	DIR		   *dir;
 	struct dirent *de;
 	int			n = 0;
+	FullTransactionId since;
+	LOCKTAG		tag;
 
 	if (RecoveryInProgress())
 		return 0;
+	since = FullTransactionIdFromU64(pg_atomic_read_u64(&bmap_shared->run_since_xid));
+	if (!FullTransactionIdIsValid(since))
+		return 0;
+
+	/*
+	 * One scan at a time, the lock held to this transaction's end; a later
+	 * one finds what this one took as taken (below).
+	 */
+	ORPHANS_LOCK(tag, spcOid, dbOid);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+
+	path = GetDatabasePath(dbOid, spcOid);
 	dir = AllocateDir(path);
 	while ((de = ReadDir(dir, path)) != NULL)
 	{
@@ -14270,8 +14297,8 @@ bmap_drop_orphans(Oid spcOid, Oid dbOid)
 		char	   *end;
 		SMgrRelation reln;
 		Buffer		buf;
+		Page		page;
 		FullTransactionId creator;
-		TransactionId xid;
 
 		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
 		if (end == de->d_name || strcmp(end, "_bmap") != 0)
@@ -14281,22 +14308,63 @@ bmap_drop_orphans(Oid spcOid, Oid dbOid)
 		if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
 			continue;
 		buf = map_read(rel, 0);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		creator = PageIsNew(BufferGetPage(buf)) ? InvalidFullTransactionId :
-			PageGetBmapHeader(BufferGetPage(buf))->creator;
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		creator = PageIsNew(page) ? InvalidFullTransactionId :
+			PageGetBmapHeader(page)->creator;
+
+		/*
+		 * An orphan: made by a transaction that began before recovery
+		 * ended, so by no backend running now, that is not prepared (nor
+		 * being finished by COMMIT or ROLLBACK PREPARED, which drops its
+		 * storage itself), and that ended without committing (owner_state()
+		 * compares full transaction ids, and knows one too old for the
+		 * commit log for unknown, which is kept).
+		 */
+		if (!FullTransactionIdIsValid(creator) ||
+			!FullTransactionIdPrecedes(creator, since) ||
+			TwoPhaseTransactionIsKnown(creator) ||
+			owner_state(creator) != OWNER_ENDED)
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		/*
+		 * Taken: the map names this transaction instead, which began after
+		 * recovery ended, so no other scan takes it; if this one aborts, the
+		 * next start finds it again.  Logged, as the header always is.
+		 */
+		{
+			xl_bmap_header_delta delta;
+			xl_bmap_tree xlrec;
+			XLogRecPtr	lsn;
+
+			header_delta_of(page, &delta);
+			delta.flags = BMAP_DELTA_CREATOR;
+			delta.creator = GetTopFullTransactionId();
+			xlrec.locator = rel;
+			xlrec.op = BMAP_TREE_CREATOR;
+			xlrec.flags = 0;
+			xlrec.node = xlrec.from = InvalidBlockNumber;
+			xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+			START_CRIT_SECTION();
+			apply_header_delta(page, &delta);
+			MarkBufferDirty(buf);
+			XLogBeginInsert();
+			XLogRegisterData(&xlrec, sizeof(xlrec));
+			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+			XLogRegisterBufData(0, &delta, sizeof(delta));
+			lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+			PageSetLSN(page, lsn);
+			END_CRIT_SECTION();
+		}
 		UnlockReleaseBuffer(buf);
-		if (!FullTransactionIdIsValid(creator))
-			continue;
-		xid = XidFromFullTransactionId(creator);
-		if (!TransactionIdIsNormal(xid) ||
-			TransactionIdPrecedes(xid, TransamVariables->oldestClogXid) ||
-			TransactionIdIsInProgress(xid) || TransactionIdDidCommit(xid))
-			continue;
-		(void) GetTopTransactionId();
 		RelationDropStorageAtCommit(rel);
 		ereport(LOG,
-				(errmsg("dropping storage \"%s\" made by transaction %u, which did not commit",
-						relpath(reln->smgr_rlocator, MAIN_FORKNUM).str, xid)));
+				(errmsg("dropping storage \"%s\" made by transaction %" PRIu64 ", which did not commit",
+						relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
+						U64FromFullTransactionId(creator))));
 		n++;
 	}
 	FreeDir(dir);
@@ -14345,8 +14413,9 @@ create_map(SMgrRelation reln)
 	delta.free_space_unknown = 0;
 	delta.epoch = 0;
 	delta.shared_below = 0;
-	/* the transaction making it, which drops it if it aborts */
-	if (FullTransactionIdIsValid(creating_xact))
+	/* the transaction making it, which drops it if it aborts (not one an error left) */
+	if (FullTransactionIdIsValid(creating_xact) &&
+		FullTransactionIdEquals(creating_xact, GetTopFullTransactionIdIfAny()))
 	{
 		delta.flags |= BMAP_DELTA_CREATOR;
 		delta.creator = creating_xact;

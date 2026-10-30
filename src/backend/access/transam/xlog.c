@@ -85,6 +85,7 @@
 #include "replication/snapbuild.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -6966,6 +6967,13 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+
+	/*
+	 * Transactions from here on are this server's: storage of one that
+	 * began before and never committed is an orphan of the crash or of the
+	 * recovery's stop (bmap_drop_orphans()).
+	 */
+	bmap_recovery_done(ReadNextFullTransactionId());
 
 	/*
 	 * Wake up the checkpointer process as there might be a request to disable
