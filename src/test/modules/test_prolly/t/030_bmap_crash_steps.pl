@@ -121,7 +121,7 @@ sub crash_at
 	});
 	$primary->wait_for_event('client backend', $point);
 	$primary->stop('immediate');
-	$session->quit;
+	eval { $session->quit };
 	$primary->start;
 
 	delete $tables{$dropping}
