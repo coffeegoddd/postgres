@@ -100,6 +100,7 @@
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
@@ -2368,6 +2369,10 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					if (!RelationIsLogicallyLogged(relation))
 						goto change_done;
 
+					/* decoding on a branch leaves out other branches' tables */
+					if (CatalogBranchSkipsRelation(relation))
+						goto change_done;
+
 					/*
 					 * Ignore temporary heaps created during DDL unless the
 					 * plugin has asked for them.
@@ -2503,7 +2508,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							if (!RelationIsValid(rel))
 								elog(ERROR, "could not open relation with OID %u", relid);
 
-							if (!RelationIsLogicallyLogged(rel))
+							if (!RelationIsLogicallyLogged(rel) ||
+								CatalogBranchSkipsRelation(rel))
 							{
 								RelationClose(rel);
 								continue;

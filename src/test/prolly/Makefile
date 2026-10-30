@@ -40,7 +40,8 @@ include $(top_builddir)/src/Makefile.global
 PROLLY_AM ?= heap
 export PROLLY_AM
 
-# extensions the branched catalogs' tests install on branches
+# extensions the branched catalogs' tests install on branches (their
+# decoding test's output plugin is the recovery suite's, above)
 EXTRA_INSTALL += contrib/hstore contrib/pg_trgm
 
 AM_CONF = $(abs_top_srcdir)/$(subdir)/am/$(PROLLY_AM).conf

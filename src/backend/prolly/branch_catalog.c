@@ -58,6 +58,7 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 int			catalog_branch = 0;
@@ -264,6 +265,22 @@ VersionedNamespaceBranch(const char *nspname)
 				 errmsg("branch %d has not been allocated", catalog_branch),
 				 errhint("Allocate a branch with pg_branch_id_allocate().")));
 	return catalog_branch;
+}
+
+/*
+ * Logical decoding reads the catalogs with historic snapshots, as of each
+ * change, so a relation's namespace and that namespace's branch are those
+ * the change was made under.
+ */
+bool
+CatalogBranchSkipsRelation(Relation rel)
+{
+	int32		branch;
+
+	if (catalog_branch == 0)
+		return false;
+	branch = NamespaceBranch(RelationGetNamespace(rel));
+	return branch != 0 && branch != catalog_branch;
 }
 
 /*
