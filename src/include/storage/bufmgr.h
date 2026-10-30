@@ -351,6 +351,7 @@ extern void MarkRelationPagesShared(RelFileLocator rel);
 extern void FlushRelationBlocks(SMgrRelation reln, ForkNumber forknum,
 								const BlockNumber *blocks, uint32 n);
 extern void BufferPrepareForChange(Buffer buffer);
+extern bool BufferPreparesForChanges(Buffer buffer);
 extern bool BufferPageIsShared(Buffer buffer);
 extern bool BufferPageIsSharedElsewhere(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);

@@ -365,8 +365,8 @@ typedef struct BufferDesc
 	proclist_head lock_waiters;
 
 	/*
-	 * With BM_SMGR_PREPARES: the generation of the storage managers' sharing
-	 * (BufferSmgrGeneration) at which the page's BM_SMGR_PREPARE,
+	 * With BM_SMGR_PREPARES: the generation of its relation's sharing
+	 * (BufferSmgrRelGenerations) at which the page's BM_SMGR_PREPARE,
 	 * BM_SMGR_SHARED and BM_SMGR_OWN were settled.  They hold only while it
 	 * is the current one: a page settled at an older generation is to be
 	 * prepared before it next changes.  Set under the buffer header spinlock.
@@ -430,13 +430,11 @@ typedef struct WritebackContext
 
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
-extern PGDLLIMPORT pg_atomic_uint64 *BufferSmgrGeneration;
 
 /*
  * Generations of sharing of each relation's pages, by a hash of its
- * locator (relations sharing a slot share its raises): a buffer's
- * generation is the sum of the global one and its relation's slot's, so
- * that a raise of one relation's has only its pages checked again.
+ * locator (relations sharing a slot share its raises), so that a raise of
+ * one relation's has only its pages checked again.
  */
 #define BUFFER_SMGR_REL_GENERATIONS	1024
 extern PGDLLIMPORT pg_atomic_uint64 *BufferSmgrRelGenerations;

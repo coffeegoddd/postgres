@@ -19,7 +19,9 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "executor/spi.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "test_prolly.h"
@@ -99,18 +101,115 @@ lookup_cached_blocks(void)
 	table_close(rel, AccessShareLock);
 }
 
-/* writing out listed blocks leaves them cached and clean */
+/*
+ * A scratch table of 'nblocks' blocks or more, all cached; dropped by
+ * drop_scratch().
+ */
+static Relation
+make_scratch(const char *name, int nblocks)
+{
+	char	   *sql = psprintf("CREATE TABLE %s (a int, pad text);"
+							   "INSERT INTO %s SELECT g, repeat('x', 1000)"
+							   " FROM generate_series(1, %d) g;"
+							   "SELECT count(*) FROM %s",
+							   name, name, nblocks * 7, name);
+
+	CHECK_EQ(SPI_connect(), SPI_OK_CONNECT);
+	CHECK(SPI_execute(sql, false, 0) >= 0);
+	SPI_finish();
+	return table_open(RelnameGetRelid(name), AccessExclusiveLock);
+}
+
+static void
+drop_scratch(Relation rel)
+{
+	char	   *sql = psprintf("DROP TABLE %s", RelationGetRelationName(rel));
+
+	table_close(rel, NoLock);
+	CHECK_EQ(SPI_connect(), SPI_OK_CONNECT);
+	CHECK_EQ(SPI_execute(sql, false, 0), SPI_OK_UTILITY);
+	SPI_finish();
+}
+
+/* dirty a cached page of rel, as a change of its pd_prune_xid would */
+static void
+dirty_page(Relation rel, BlockNumber blk)
+{
+	Buffer		buf = ReadBuffer(rel, blk);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	MarkBufferDirty(buf);
+	CHECK(BufferIsDirty(buf));
+	UnlockReleaseBuffer(buf);
+}
+
+/* is block blk of rel's main fork cached dirty? */
+static bool
+cached_dirty(Relation rel, BlockNumber blk)
+{
+	Buffer		buf = ReadBuffer(rel, blk);
+	bool		dirty;
+
+	/* (BufferIsDirty() asks for the lock a change would take) */
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	dirty = BufferIsDirty(buf);
+	UnlockReleaseBuffer(buf);
+	return dirty;
+}
+
+/*
+ * Writing out listed blocks cleans those that were dirty and leaves them
+ * cached; blocks not listed stay dirty; a listed block not cached (past the
+ * end) is passed over.
+ */
 static void
 flush_listed_blocks(void)
 {
-	Relation	rel = open_md_relation();
+	Relation	rel = make_scratch("unit_bufmgr_flush", 3);
 	BlockNumber blocks[2] = {0, RelationGetNumberOfBlocks(rel) + 1000};
-	Buffer		buf;
 
+	dirty_page(rel, 0);
+	dirty_page(rel, 1);
 	FlushRelationBlocks(RelationGetSmgr(rel), MAIN_FORKNUM, blocks, 2);
-	buf = LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 0);
-	CHECK(BufferIsValid(buf));
-	table_close(rel, AccessShareLock);
+	CHECK(BufferIsValid(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 0)));
+	CHECK(!cached_dirty(rel, 0));
+	CHECK(cached_dirty(rel, 1));
+	drop_scratch(rel);
+}
+
+/* dropping one cached block drops that block's buffer alone, dirty or not */
+static void
+drop_one_block(void)
+{
+	Relation	rel = make_scratch("unit_bufmgr_drop_block", 3);
+
+	dirty_page(rel, 1);
+	CHECK(BufferIsValid(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 0)));
+	CHECK(BufferIsValid(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 1)));
+
+	DropBufferBlock(rel->rd_locator, MAIN_FORKNUM, 1);
+	CHECK_EQ(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 1), InvalidBuffer);
+	CHECK(BufferIsValid(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 0)));
+
+	/* a block not cached is nothing to drop */
+	DropBufferBlock(rel->rd_locator, MAIN_FORKNUM, 1);
+	drop_scratch(rel);
+}
+
+/* dropping an unlinked relation's buffers drops every fork's */
+static void
+drop_unlinked_relation_buffers(void)
+{
+	Relation	rel = make_scratch("unit_bufmgr_drop_unlinked", 3);
+	SMgrRelation srel = RelationGetSmgr(rel);
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+	dirty_page(rel, 0);
+	DropUnlinkedRelationsAllBuffers(&srel, 1);
+	for (BlockNumber blk = 0; blk < nblocks; blk++)
+		CHECK_EQ(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, blk),
+				 InvalidBuffer);
+	drop_scratch(rel);
 }
 
 static const ProllyUnitTest tests[] = {
@@ -118,6 +217,8 @@ static const ProllyUnitTest tests[] = {
 	{"cleanup_lock_unprepared", cleanup_lock_unprepared},
 	{"lookup_cached_blocks", lookup_cached_blocks},
 	{"flush_listed_blocks", flush_listed_blocks},
+	{"drop_one_block", drop_one_block},
+	{"drop_unlinked_relation_buffers", drop_unlinked_relation_buffers},
 };
 
 const ProllyUnitSuite unit_bufmgr_suite = {"bufmgr", tests, lengthof(tests)};
