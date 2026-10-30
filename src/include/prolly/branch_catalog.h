@@ -34,6 +34,7 @@
 #define PROLLY_BRANCH_CATALOG_H
 
 #include "access/htup.h"
+#include "catalog/objectaddress.h"
 #include "utils/relcache.h"
 
 /* The branch whose catalog rows this session sees (0: none). */
@@ -105,6 +106,29 @@ extern Oid	ExtensionOidByName(const char *extname);
  * nothing is.
  */
 extern bool CatalogBranchSkipsRelation(Relation rel);
+
+/*
+ * Dependencies point from versioned objects to shared ones, never from a
+ * shared object to a versioned one, nor between branches: a shared object
+ * must not change when one branch changes.  (A temporary object may
+ * depend on the session's versioned objects: it is the session's alone.)
+ * CatalogBranchCheckDependencies errors out if depender may not depend on
+ * referenced; CatalogBranchCheckMove if an object may not move from one
+ * schema to another, which would change its branch.
+ */
+extern void CatalogBranchCheckDependencies(const ObjectAddress *depender,
+										   const ObjectAddress *referenced,
+										   int nreferenced);
+extern void CatalogBranchCheckMove(Oid oldnspid, Oid newnspid);
+
+/*
+ * Resolves schema names as on the branch of namespace nspid (when it is a
+ * versioned schema's) until CatalogBranchResolveRestore is given what this
+ * returned, or the (sub)transaction aborts.  Referential integrity uses it
+ * for the queries it runs on another branch's tables, which name them.
+ */
+extern int32 CatalogBranchResolveAs(Oid nspid);
+extern void CatalogBranchResolveRestore(int32 saved);
 extern void ExtensionCheckNameFree(const char *extname, Oid nspid);
 extern void ExtensionCheckMove(const char *extname, Oid oldnspid, Oid newnspid);
 

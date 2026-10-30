@@ -58,6 +58,7 @@
 #include "access/stratnum.h"
 #include "access/table.h"
 #include "access/transam.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_amop.h"
@@ -731,6 +732,24 @@ learn(Oid classid, Oid objid, BranchMapEntry *e)
 		return true;
 	}
 
+	/*
+	 * A foreign key's triggers on the referenced table belong to the key,
+	 * whose table may be on a branch when the referenced one is shared
+	 */
+	if (classid == TriggerRelationId)
+	{
+		if (!read_column(TriggerRelationId, TriggerOidIndexId,
+						 Anum_pg_trigger_oid, objid,
+						 Anum_pg_trigger_tgconstraint, &value))
+			return false;
+		if (OidIsValid(DatumGetObjectId(value)))
+		{
+			e->owner_class = ConstraintRelationId;
+			e->owner_objid = DatumGetObjectId(value);
+			return true;
+		}
+	}
+
 	for (int i = 0; i < lengthof(owned_classes); i++)
 	{
 		if (owned_classes[i].classid != classid)
@@ -756,8 +775,14 @@ learn(Oid classid, Oid objid, BranchMapEntry *e)
 		nspid = DatumGetObjectId(value);
 		if (classid == RelationRelationId && nspid == PG_TOAST_NAMESPACE)
 		{
+			/*
+			 * (not yet known while the TOAST table's own dependency is
+			 * being recorded: nothing is kept then)
+			 */
 			e->owner_class = RelationRelationId;
 			e->owner_objid = toast_owner(objid);
+			if (!OidIsValid(e->owner_objid))
+				return false;
 		}
 		else
 		{
@@ -803,6 +828,93 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 	if (!OidIsValid(e->owner_class))
 		return e->branch;
 	return cached_object_branch_depth(e->owner_class, e->owner_objid, depth + 1);
+}
+
+/*
+ * The namespace of an object, or of the object it belongs to, read without
+ * the map (only the dependency check asks, and rarely); InvalidOid if it
+ * has none.
+ */
+static Oid
+object_namespace(Oid classid, Oid objid, int depth)
+{
+	Datum		value;
+
+	if (depth > 4)
+		return InvalidOid;
+	for (int i = 0; i < lengthof(owned_classes); i++)
+	{
+		if (owned_classes[i].classid != classid)
+			continue;
+		if (!read_column(classid, owned_classes[i].oidindex,
+						 owned_classes[i].oidatt, objid,
+						 owned_classes[i].owner_att, &value))
+			return InvalidOid;
+		if (owned_classes[i].owner_class == NamespaceRelationId)
+			return DatumGetObjectId(value);
+		return object_namespace(owned_classes[i].owner_class,
+								DatumGetObjectId(value), depth + 1);
+	}
+	if (is_objectclass_supported(classid) &&
+		get_object_attnum_namespace(classid) != InvalidAttrNumber &&
+		read_column(classid, get_object_oid_index(classid),
+					get_object_attnum_oid(classid), objid,
+					get_object_attnum_namespace(classid), &value))
+		return DatumGetObjectId(value);
+	return InvalidOid;
+}
+
+void
+CatalogBranchCheckDependencies(const ObjectAddress *depender,
+							   const ObjectAddress *referenced,
+							   int nreferenced)
+{
+	int32		depender_branch = -1;
+
+	for (int i = 0; i < nreferenced; i++)
+	{
+		int32		branch;
+
+		branch = BranchMap->object_branch(referenced[i].classId,
+										  referenced[i].objectId);
+		if (branch == 0)
+			continue;
+		if (depender_branch < 0)
+			depender_branch = BranchMap->object_branch(depender->classId,
+													   depender->objectId);
+		if (depender_branch == branch)
+			continue;
+		if (depender_branch == 0)
+		{
+			Oid			nspid = object_namespace(depender->classId,
+												 depender->objectId, 0);
+
+			/*
+			 * a temporary object is the session's alone, and a TOAST table
+			 * (its dependency on its table being what is recorded now) is
+			 * its table's
+			 */
+			if (isAnyTempNamespace(nspid) || nspid == PG_TOAST_NAMESPACE)
+				continue;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 depender_branch == 0 ?
+				 errmsg("an object outside a versioned schema cannot depend on %s",
+						getObjectDescription(&referenced[i], false)) :
+				 errmsg("an object cannot depend on another branch's %s",
+						getObjectDescription(&referenced[i], false)),
+				 errdetail("Objects in versioned schemas may depend on shared objects, not the other way round.")));
+	}
+}
+
+void
+CatalogBranchCheckMove(Oid oldnspid, Oid newnspid)
+{
+	if (NamespaceBranch(oldnspid) != NamespaceBranch(newnspid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move objects between a versioned schema and another kind or branch of schema")));
 }
 
 static int32

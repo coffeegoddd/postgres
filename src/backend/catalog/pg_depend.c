@@ -27,6 +27,7 @@
 #include "catalog/partition.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
+#include "prolly/branch_catalog.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/fmgroids.h"
@@ -85,6 +86,9 @@ recordMultipleDependencies(const ObjectAddress *depender,
 	 */
 	if (IsBootstrapProcessingMode())
 		return;
+
+	/* a shared object must not depend on a branch's */
+	CatalogBranchCheckDependencies(depender, referenced, nreferenced);
 
 	dependDesc = table_open(DependRelationId, RowExclusiveLock);
 

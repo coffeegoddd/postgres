@@ -40,6 +40,7 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
@@ -92,13 +93,63 @@ search_namespace(const char *nspname, int32 branch)
 	return HeapTupleIsValid(tup) ? tup : NULL;
 }
 
+/*
+ * The branch names resolve on while referential integrity runs a query for
+ * a constraint of another branch's table (-1: the session's).  Reset when
+ * a transaction or subtransaction aborts, since the code that set it is
+ * then gone.
+ */
+static int32 resolve_branch = -1;
+static bool resolve_callbacks = false;
+
+static void
+resolve_xact_callback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		resolve_branch = -1;
+}
+
+static void
+resolve_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						 SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		resolve_branch = -1;
+}
+
+int32
+CatalogBranchResolveAs(Oid nspid)
+{
+	int32		saved = resolve_branch;
+	int32		branch = NamespaceBranch(nspid);
+
+	if (branch != 0)
+	{
+		if (!resolve_callbacks)
+		{
+			RegisterXactCallback(resolve_xact_callback, NULL);
+			RegisterSubXactCallback(resolve_subxact_callback, NULL);
+			resolve_callbacks = true;
+		}
+		resolve_branch = branch;
+	}
+	return saved;
+}
+
+void
+CatalogBranchResolveRestore(int32 saved)
+{
+	resolve_branch = saved;
+}
+
 HeapTuple
 SearchNamespaceByName(const char *nspname)
 {
 	HeapTuple	tup = NULL;
+	int32		branch = resolve_branch >= 0 ? resolve_branch : catalog_branch;
 
-	if (catalog_branch != 0)
-		tup = search_namespace(nspname, catalog_branch);
+	if (branch != 0)
+		tup = search_namespace(nspname, branch);
 	if (tup == NULL)
 		tup = search_namespace(nspname, 0);
 	return tup;
