@@ -4943,13 +4943,65 @@ redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
 	return true;
 }
 
-/* the nodes redo's walk of a capture read (redo_own_blocks()) */
+/* the nodes redo's walk of a capture or a share read (redo_own_blocks()) */
 static uint32 redo_walk_nodes = 0;
 
+/*
+ * The shares redo has seen the tree's record of and not yet the record
+ * that raises the source's epoch (XLOG_BMAP_SHARED): each copy's pointers,
+ * the source's tops as of the share.  The source's header is held between
+ * the two records, so its tree is the same at the second.  Shares are made
+ * one at a time per source, and few at once: a share whose tree record
+ * was replayed before recovery began, or pushed out by others, is redone
+ * without its tops, visiting every buffer.
+ */
+#define REDO_SHARES		8
+
+typedef struct RedoShare
+{
+	RelFileLocator dst;
+	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+	bool		valid;
+} RedoShare;
+
+static RedoShare redo_shares[REDO_SHARES];
+static int	redo_shares_next = 0;
+
+static void
+redo_share_begun(RelFileLocator dst, const xl_bmap_top *tops)
+{
+	RedoShare  *rs = &redo_shares[redo_shares_next];
+
+	redo_shares_next = (redo_shares_next + 1) % REDO_SHARES;
+	rs->dst = dst;
+	memcpy(rs->tops, tops, sizeof(rs->tops));
+	rs->valid = true;
+}
+
+/* the share to 'dst' begun (redo_share_begun()), forgotten; false if none */
+static bool
+redo_share_tops(RelFileLocator dst, xl_bmap_top *tops)
+{
+	for (int i = 0; i < REDO_SHARES; i++)
+	{
+		if (redo_shares[i].valid && RelFileLocatorEquals(redo_shares[i].dst, dst))
+		{
+			memcpy(tops, redo_shares[i].tops, sizeof(redo_shares[i].tops));
+			redo_shares[i].valid = false;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * 'held_more' is the holders the node's count has that the walk's record
+ * gave it already: the copy's, for a top of a share's source.
+ */
 static bool
 redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			  BlockNumber first, BlockNumber nblocks, uint32 epoch,
-			  XLogRecPtr lsn, BlockList *own)
+			  XLogRecPtr lsn, uint8 held_more, BlockList *own)
 {
 	PGIOAlignedBlock page;
 	BmapEntry  *entries;
@@ -4962,7 +5014,9 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 	{
 		if (!redo_lookup_ref(rel, ptr->block, lsn, &count))
 			return false;
-		if (count > 0)
+		if (count < held_more)
+			return false;
+		if (count > held_more)
 			return true;
 	}
 	if (!redo_walk_read(with_relnumber(rel, BMAP_STORE_RELNUMBER), ptr->block,
@@ -4983,7 +5037,8 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			continue;
 		if (level > 0)
 			ok = redo_own_node(rel, &entries[i], level - 1,
-							   (BlockNumber) child, nblocks, epoch, lsn, own);
+							   (BlockNumber) child, nblocks, epoch, lsn, 0,
+							   own);
 		else if (!redo_lookup_ref(rel, entries[i].block, lsn, &count))
 			ok = false;
 		else if (count == 0)
@@ -5013,10 +5068,15 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
  * verified, is newer than the record, or isn't the node (or count page)
  * the pointer to it names.  It relies on data checksums to find a torn
  * page: without them the caller doesn't walk.
+ *
+ * Redo of a share walks its source the same way, at the record that raises
+ * the source's epoch ('snap' made of what the share's records hold), after
+ * the share's tops each got a holder more for the copy: 'tops_held' says
+ * so.
  */
 static bool
 redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
-				XLogRecPtr lsn, BlockList *own)
+				XLogRecPtr lsn, bool tops_held, BlockList *own)
 {
 	uint64		first = 0;
 
@@ -5035,7 +5095,8 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 			top.epoch = snap->tops[k].epoch;
 			top.since = snap->tops[k].since;
 			if (!redo_own_node(rel, &top, k, (BlockNumber) first,
-							   snap->nblocks, epoch, lsn, own))
+							   snap->nblocks, epoch, lsn, tops_held ? 1 : 0,
+							   own))
 				return false;
 		}
 		first += tree_span(k);
@@ -13334,6 +13395,21 @@ bmap_redo(XLogReaderState *record)
 				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
 					prepare_node_store(xlrec->locator, xlrec->node,
 									   xlrec->old_hw, xlrec->new_hw);
+
+				/* a share's tops, for its source's walk (XLOG_BMAP_SHARED) */
+				if (xlrec->op == BMAP_TREE_SHARE &&
+					!(xlrec->flags & BMAP_TREE_OF_ROOT))
+				{
+					xl_bmap_root_delta rdelta;
+					Size		len;
+					char	   *data = XLogRecGetBlockData(record, 0, &len);
+
+					if (data != NULL && len == sizeof(rdelta))
+					{
+						memcpy(&rdelta, data, sizeof(rdelta));
+						redo_share_begun(xlrec->locator, rdelta.tops);
+					}
+				}
 				if (kept)
 				{
 					xl_bmap_roots_delta rdelta;
@@ -13351,7 +13427,7 @@ bmap_redo(XLogReaderState *record)
 					if (!DataChecksumsNeedVerify())
 						why = "data checksums are off, so a page it would read could be torn";
 					else if (!redo_own_blocks(xlrec->locator, &rdelta.root.snap,
-											  record->ReadRecPtr, &own))
+											  record->ReadRecPtr, false, &own))
 						why = "a page of its map or counts read is newer than the replay, unverified, or not the node named";
 					else
 						walked = true;
@@ -13500,11 +13576,40 @@ bmap_redo(XLogReaderState *record)
 			{
 				xl_bmap_share *xlrec = (xl_bmap_share *) XLogRecGetData(record);
 				SMgrRelation src = smgropen(xlrec->src, INVALID_PROC_NUMBER);
+				xl_bmap_snapshot snap;
+				xl_bmap_header_delta sdelta;
+				Size		len;
+				char	   *data = XLogRecGetBlockData(record, 0, &len);
+				BlockList	own = {0};
+				const char *why = NULL;
 
 				/* (every share logs its source's own blocks as images) */
 				if (!(xlrec->flags & BMAP_PRESERVE_LOGGED))
 					elog(PANIC, "block map share record of %s without its own blocks' images",
 						 relpathperm(xlrec->src, MAIN_FORKNUM).str);
+
+				/*
+				 * The source's own blocks as of the share, as the capture's
+				 * redo finds a root's: from the tops its tree record gave
+				 * the copy, and the source's length and epoch, which this
+				 * record raises.
+				 */
+				memset(&snap, 0, sizeof(snap));
+				if (!redo_share_tops(xlrec->dst, snap.tops))
+					why = "its tree's record was not replayed";
+				else if (data == NULL || len != sizeof(sdelta))
+					why = "its source's header has no delta";
+				else if (!DataChecksumsNeedVerify())
+					why = "data checksums are off, so a page it would read could be torn";
+				else
+				{
+					memcpy(&sdelta, data, sizeof(sdelta));
+					snap.nblocks = sdelta.nblocks;
+					snap.epoch = sdelta.epoch;
+					if (!redo_own_blocks(xlrec->src, &snap, record->ReadRecPtr,
+										 true, &own))
+						why = "a page of its map or counts read is newer than the replay, unverified, or not the node named";
+				}
 				redo_block(record, 0);
 				redo_block(record, 1);
 				forget_cached_size(xlrec->dst);
@@ -13520,9 +13625,27 @@ bmap_redo(XLogReaderState *record)
 				 * went to the source's buffer only.  Only the sync is left
 				 * out then, to the checkpointer (a restartpoint), as for any
 				 * page written out; the blocks shared already were written
-				 * when they were first shared.
+				 * when they were first shared.  The own pages are those of
+				 * the walk above, each looked up in the buffers, so that a
+				 * share costs redo as many lookups as it logged images, not
+				 * a visit of every buffer; every buffer is visited only if
+				 * the walk can't trust what it reads, as for a capture.
 				 */
-				FlushRelationsAllBuffers(&src, 1);
+				if (why == NULL)
+				{
+					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map",
+						 relpathperm(xlrec->src, MAIN_FORKNUM).str,
+						 own.n, redo_walk_nodes);
+					FlushRelationBlocks(src, MAIN_FORKNUM, own.blocks, own.n);
+				}
+				else
+				{
+					elog(DEBUG1, "redo of a share of %s writes out every buffer of it: %s",
+						 relpathperm(xlrec->src, MAIN_FORKNUM).str, why);
+					FlushRelationsAllBuffers(&src, 1);
+				}
+				if (own.blocks)
+					pfree(own.blocks);
 				elog(DEBUG1, "redo of a share of %s syncs nothing: its own pages were logged as images",
 					 relpathperm(xlrec->src, MAIN_FORKNUM).str);
 				break;
