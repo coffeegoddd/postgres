@@ -68,10 +68,14 @@ check-tap-durability: temp-install
 # full: block-mapped storage changes where pages live, not what they hold.
 BMAP_CONF = $(abs_top_srcdir)/$(subdir)/bmap.conf
 
+# (each suite runs whatever became of the one before, and the target fails
+# if any did)
 check-upstream-bmap: temp-install
-	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(BMAP_CONF)
-	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(BMAP_CONF)
-	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(BMAP_CONF)
+	@status=0; \
+	$(MAKE) -C $(top_builddir)/src/test/regress check TEMP_CONFIG=$(BMAP_CONF) || status=1; \
+	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(BMAP_CONF) || status=1; \
+	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(BMAP_CONF) || status=1; \
+	exit $$status
 
 .PHONY: check check-heap check-upstream-bmap $(SEMANTICS_TARGETS)
 
