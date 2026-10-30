@@ -69,7 +69,7 @@ SELECT test_bmap_unlink(:dropped_copy);
  
 (1 row)
 
--- (past the copies made without images, so the dropped copy's pages are
+-- (past any copies made without images, so the dropped copy's pages are
 -- claimed, not copied)
 CHECKPOINT;
 SELECT * FROM fw.first_writes('fw.plain', :pages) \gset plain_
