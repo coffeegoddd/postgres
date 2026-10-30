@@ -41,6 +41,7 @@ own   src/tools/prolly_bench/
 # Core files the fork changes.
 patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
+patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (block-mapped with debug_block_mapped_heap; kept across rewrites)
@@ -79,7 +80,7 @@ patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of bl
 patch src/backend/storage/smgr/meson.build  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write; per-relation choice of implementation
 patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation; the block map's replay lock
-patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation by its logical length; its map fork counts as none
+patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_release_max_per_pass, block_map_replay_entries and debug_block_mapped_heap
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings

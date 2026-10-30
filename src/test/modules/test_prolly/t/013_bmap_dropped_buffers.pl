@@ -56,9 +56,12 @@ sub catch_up
 
 my $db = q{(SELECT oid FROM pg_database WHERE datname = current_database())};
 
-# a table of two blocks, shared, so that a change copies its blocks
+# a table of two blocks, shared, so that a change copies its blocks (its
+# visibility map made by a change first, so that the change below makes no
+# blocks of its own for it)
 sql(q{CREATE TABLE t (a int, b text);
-	INSERT INTO t SELECT g, repeat('t', 100) FROM generate_series(1, 100) g});
+	INSERT INTO t SELECT g, repeat('t', 100) FROM generate_series(1, 100) g;
+	UPDATE t SET b = 't' WHERE a IN (1, 100)});
 my $rel = sql(q{SELECT pg_relation_filenode('t')});
 sql(qq{SELECT test_bmap_share($rel)});
 sql('CHECKPOINT');

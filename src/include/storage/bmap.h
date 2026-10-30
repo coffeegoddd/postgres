@@ -90,7 +90,8 @@ extern void bmapwritev(SMgrRelation reln, ForkNumber forknum,
 extern void bmapwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber bmapnblocks(SMgrRelation reln, ForkNumber forknum);
-extern void bmappretruncate(SMgrRelation reln, ForkNumber forknum);
+extern void bmappretruncate(SMgrRelation reln, ForkNumber *forknum,
+							int nforks);
 extern void bmaptruncate(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber curnblk, BlockNumber nblocks);
 extern void bmapposttruncate(SMgrRelation reln, ForkNumber forknum);
@@ -173,7 +174,8 @@ extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
 							   uint64 *slots, uint64 *naming);
 extern bool bmap_inspect_root_counts(RelFileLocator store, uint64 *counted,
 									 uint64 *differ);
-extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
+extern void bmap_inspect_block(SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
 extern uint32 bmap_inspect_epoch(SMgrRelation reln);
@@ -292,7 +294,8 @@ typedef struct BmapSizes
 	uint64		map_bytes;		/* the maps' files */
 	uint64		alloc_bytes;	/* the allocator's, the counts', the release
 								 * queue's and the captured roots' files */
-	uint64		vm_bytes;		/* the relations' other forks (md.c) */
+	uint64		vm_bytes;		/* the relations' other forks (md.c): no
+								 * visibility map's, which are mapped */
 	uint64		fsm_bytes;
 } BmapSizes;
 

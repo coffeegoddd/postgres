@@ -1,7 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # The largest relations work: a block map reaching the last block a
-# relation can have, MaxBlockNumber (2^32 - 2), built sparsely.  A write
+# block-mapped relation can have, built sparsely (its main fork stops short
+# of MaxBlockNumber by the blocks of the tree its visibility map has).  A write
 # past a block-mapped relation's end (as a hash index's bucket allocation
 # writes the last block of a range, or a copy sets its destination's size)
 # maps the block written alone, leaving a hole between, as md.c's file
@@ -79,9 +80,10 @@ is(sql(qq{SELECT test_bmap_read($t, 2500, true)}), 'zeroes',
 is(sql(qq{SELECT test_bmap_read($t, 2501, false)}), 'zeroes',
 	'and through the storage manager');
 
-# The last block a relation can have.
+# The last block a relation can have: the main fork's, below the blocks the
+# visibility map is given in the tree.
 my $before = store_blocks();
-my $last = 4294967294;
+my $last = 4294835618;
 my $mid = 3000000000;
 durable(qq{SELECT test_bmap_extend_at($t, $last)});
 is(sql(q{SELECT pg_relation_size('t') / 8192}), $last + 1,
@@ -232,27 +234,25 @@ $node->wait_for_catchup($standby);
 is($standby->safe_psql('postgres', q{SELECT count(*), sum(a) FROM u}),
 	'30000|450015000', 'as does the standby');
 
-# The limits of extension, as md.c's: zero-extension (as the buffer
-# manager extends) stops short of a length of InvalidBlockNumber, which the
-# storage manager's cached length would read as unknown, while a write of
-# the last block, MaxBlockNumber, reaches it; a write of InvalidBlockNumber
-# fails.
+# The limits of extension: zero-extension (as the buffer manager extends)
+# past the longest length fails, while a write of the last block reaches
+# it; a write of the block after it fails.
 sql(q{CREATE TABLE v (a int)});
 my $v = sql(q{SELECT pg_relation_filenode('v')});
 durable(qq{SELECT test_bmap_extend_at($v, @{[$last - 1]})});
 is(sql(q{SELECT pg_relation_size('v') / 8192}), $last,
 	'a relation one block short of the longest');
 my ($ret, $out, $err) = $node->psql('postgres',
-	qq{SELECT test_bmap_extend($v, 1)});
-isnt($ret, 0, 'zero-extension to a length of InvalidBlockNumber fails');
-like($err, qr/cannot extend file .* beyond 4294967295 blocks/,
-	'as md.c refuses it');
+	qq{SELECT test_bmap_extend($v, 2)});
+isnt($ret, 0, 'zero-extension past the longest length fails');
+like($err, qr/cannot extend file .* beyond 4294835619 blocks/,
+	'saying how long the fork can be');
 is(sql(q{SELECT pg_relation_size('v') / 8192}), $last,
 	'leaving the length as it was');
 ($ret, $out, $err) = $node->psql('postgres',
 	qq{SELECT test_bmap_extend_at($v, @{[$last + 1]})});
-isnt($ret, 0, 'a write of block InvalidBlockNumber fails');
-like($err, qr/cannot extend file .* beyond 4294967295 blocks/,
+isnt($ret, 0, 'a write of the block after the last fails');
+like($err, qr/cannot extend file .* beyond 4294835619 blocks/,
 	'before anything is mapped for it');
 durable(qq{SELECT test_bmap_extend_at($v, $last)});
 is(sql(q{SELECT pg_relation_size('v') / 8192}), $last + 1,

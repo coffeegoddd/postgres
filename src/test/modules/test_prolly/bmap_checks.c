@@ -157,8 +157,8 @@ test_bmap_own_wal(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_bmap_map(relnumber): every logical block's physical block, birth
- * epoch and reference count.
+ * test_bmap_map(relnumber, fork): every block's physical block, birth epoch
+ * and reference count, of the main fork (fork 0) or the visibility map (2).
  */
 PG_FUNCTION_INFO_V1(test_bmap_map);
 
@@ -167,8 +167,12 @@ test_bmap_map(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
-	BlockNumber nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	ForkNumber	fork = (ForkNumber) PG_GETARG_INT32(1);
+	BlockNumber nblocks;
 
+	if (fork != MAIN_FORKNUM && fork != VISIBILITYMAP_FORKNUM)
+		elog(ERROR, "fork %d is not block-mapped", fork);
+	nblocks = smgrnblocks(srel, fork);
 	InitMaterializedSRF(fcinfo, 0);
 	for (BlockNumber blk = 0; blk < nblocks; blk++)
 	{
@@ -178,7 +182,7 @@ test_bmap_map(PG_FUNCTION_ARGS)
 		uint32		epoch;
 		uint32		refs;
 
-		bmap_inspect_block(srel, blk, &phys, &epoch, &refs);
+		bmap_inspect_block(srel, fork, blk, &phys, &epoch, &refs);
 		values[0] = Int64GetDatum(blk);
 		values[1] = Int64GetDatum(phys);
 		values[2] = Int64GetDatum(epoch);
@@ -210,7 +214,8 @@ test_bmap_past_end(PG_FUNCTION_ARGS)
 		uint32		epoch;
 		uint32		refs;
 
-		bmap_inspect_block(srel, (BlockNumber) blk, &phys, &epoch, &refs);
+		bmap_inspect_block(srel, MAIN_FORKNUM, (BlockNumber) blk, &phys, &epoch,
+						   &refs);
 		if (!BlockNumberIsValid(phys))
 			continue;
 		values[0] = Int64GetDatum(blk);

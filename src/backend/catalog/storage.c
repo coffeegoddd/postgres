@@ -228,11 +228,16 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
  * RelationCreateStorageShared
  *		Create a permanent relation's storage as a copy of another's.
  *
- * The new main fork shares src's pages until either relation changes one
- * (smgrshare()); its visibility map and free space map are copies of src's
- * (its pages are src's, byte for byte, so what src's maps say of them
- * holds; changes made after clear the new relation's own bits, as any
- * change does).  As RelationCreateStorage(), the storage is deleted if the
+ * The new storage shares src's pages until either relation changes one
+ * (smgrshare()), its visibility map's too: its pages are src's, byte for
+ * byte, so what src's map says of them holds, and a change made after
+ * clears the changing relation's own bits, as any change does.  It gets no
+ * free space map: copying src's would cost a page of it for every few
+ * thousand pages shared, and a free space map is only a hint, which the
+ * new relation's VACUUM builds again for the pages it changes.  Until then
+ * inserts extend it, which costs no more than filling a shared page would:
+ * that copies the page first.  So the share's cost doesn't grow with src's
+ * size.  As RelationCreateStorage(), the storage is deleted if the
  * transaction aborts when register_delete.
  */
 SMgrRelation
@@ -266,25 +271,10 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
 	/*
-	 * The maps copied, as full-page images (src's buffers written first: the
-	 * copy reads its storage).  Without them the new relation would claim
-	 * no page all-visible, and know of no free space, until vacuumed.
-	 */
-	FlushRelationsAllBuffers(&src, 1);
-	for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
-	{
-		if (!smgrexists(src, fork))
-			continue;
-		smgrcreate(srel, fork, false);
-		log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-		RelationCopyMapFork(src, srel, fork);
-	}
-
-	/*
 	 * No pending sync, even when WAL is skipped for new relations: the share
-	 * is logged (its source's own blocks as images), as are the maps' pages
-	 * (RelationCopyMapFork()), and syncing or logging the new relation at
-	 * commit could write every page it shares.
+	 * is logged (its source's own blocks as images, or synced), and syncing
+	 * or logging the new relation at commit could write every page it
+	 * shares.
 	 */
 	return srel;
 }
@@ -342,18 +332,14 @@ check_root_horizon(RelFileLocator rlocator, uint64 root)
  *		Create a permanent relation's storage as a copy of a root captured
  *		into its page store (bmap_root_capture()).
  *
- * The main fork shares the root's pages until it changes one
- * (bmap_share_root()), O(1) in the relation's size.  It gets no free space
- * map or visibility map, so the relation claims no page all-visible and
- * knows of no free space until vacuumed, unless maps_from: then they are
- * copies of that relation's.  The caller must know that every bit set in
- * maps_from's visibility map holds for the root's version of the page: that
- * no page of maps_from has changed since the root was captured, or at least
- * none whose bit is set.  Nothing here keeps VACUUM from setting one
- * meanwhile, and it vacuums a page shared only with roots held of the
- * relation as the relation's own: it may freeze the relation's copy of a
- * page and set the bits, while the root keeps the version it had, its
- * tuples unfrozen.  With replacing,
+ * The storage shares the root's pages until it changes one
+ * (bmap_share_root()), O(1) in the relation's size, its visibility map's
+ * too, which the root captured with the pages it describes (a root that
+ * holds frozen copies of a relation's pages keeps no visibility map, whose
+ * bits were of the pages before they were frozen in).  It gets no
+ * free space map, so the relation knows of no free space until vacuumed,
+ * unless maps_from: then it is a copy of that relation's, a hint that may
+ * be wrong of the root's pages without harm.  With replacing,
  * the storage made takes that storage's place (dropped as the transaction
  * commits: a restore), and shares the pages with no other relation for
  * that; with sharer, a relation that still holds the root's pages is told
@@ -404,23 +390,18 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
 	bmap_share_root(root, srel, replacing, sharer, lineage_of);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
-	if (maps_from)
+	if (maps_from && smgrexists(maps_from, FSM_FORKNUM))
 	{
 		FlushRelationsAllBuffers(&maps_from, 1);
-		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
-		{
-			if (!smgrexists(maps_from, fork))
-				continue;
-			smgrcreate(srel, fork, false);
-			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-			RelationCopyMapFork(maps_from, srel, fork);
-		}
+		smgrcreate(srel, FSM_FORKNUM, false);
+		log_smgrcreate(&srel->smgr_rlocator.locator, FSM_FORKNUM);
+		RelationCopyMapFork(maps_from, srel, FSM_FORKNUM);
 	}
 
 	/*
 	 * No pending sync: the root's own blocks were logged as images when it
-	 * was captured, and the share is logged, as are the maps' pages
-	 * (RelationCopyMapFork()).
+	 * was captured, and the share is logged, as are the free space map's
+	 * pages (RelationCopyMapFork()).
 	 */
 	return srel;
 }
