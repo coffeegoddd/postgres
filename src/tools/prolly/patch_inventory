@@ -44,7 +44,11 @@ patch contrib/meson.build      0  builds the fork's extensions under contrib/pro
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (block-mapped with debug_block_mapped_heap; kept across rewrites)
+patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
+patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing
+patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; scans eagerly to freeze while pages are a relation's own
 patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
+patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
 patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions
 patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
@@ -61,6 +65,7 @@ patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery st
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
+patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
 patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change; storage manager hooks before an asynchronous read and before extension; single-block lookups, flushes and drops
@@ -80,10 +85,12 @@ patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL descri
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
+patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, and the copy of a map fork for one
+patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_all_visible
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change

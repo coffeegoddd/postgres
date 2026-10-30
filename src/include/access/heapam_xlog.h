@@ -60,7 +60,7 @@
 #define XLOG_HEAP2_PRUNE_ON_ACCESS		0x10
 #define XLOG_HEAP2_PRUNE_VACUUM_SCAN	0x20
 #define XLOG_HEAP2_PRUNE_VACUUM_CLEANUP	0x30
-/* 0x40 was XLOG_HEAP2_VISIBLE */
+#define XLOG_HEAP2_VM_SET		0x40
 #define XLOG_HEAP2_MULTI_INSERT 0x50
 #define XLOG_HEAP2_LOCK_UPDATED 0x60
 #define XLOG_HEAP2_NEW_CID		0x70
@@ -494,6 +494,21 @@ typedef struct xl_heap_new_cid
 } xl_heap_new_cid;
 
 #define SizeOfHeapNewCid (offsetof(xl_heap_new_cid, target_tid) + sizeof(ItemPointerData))
+
+/*
+ * This is what we need to know about a visibility map change that leaves its
+ * heap page as it is: VACUUM setting the bits of a page another relation
+ * shares, which already says it is all-visible.  Block 0 is the visibility
+ * map page; the heap page is not registered, nor changed.  Only an
+ * all-frozen page is set this way, so the record carries no conflict horizon.
+ */
+typedef struct xl_heap_vm_set
+{
+	BlockNumber heap_blkno;		/* the heap page whose bits are set */
+	uint8		flags;			/* VISIBILITYMAP_* bits set */
+} xl_heap_vm_set;
+
+#define SizeOfHeapVmSet (offsetof(xl_heap_vm_set, flags) + sizeof(uint8))
 
 /* logical rewrite xlog record header */
 typedef struct xl_heap_rewrite_mapping

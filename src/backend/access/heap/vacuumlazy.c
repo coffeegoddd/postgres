@@ -131,6 +131,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/tidstore.h"
@@ -332,6 +333,8 @@ typedef struct LVRelState
 
 	BlockNumber lpdead_item_pages;	/* # pages with LP_DEAD items */
 	BlockNumber missed_dead_pages;	/* # pages with missed dead tuples */
+	BlockNumber shared_pages;	/* # pages another relation shares, left
+								 * as they are */
 	BlockNumber nonempty_pages; /* actually, last nonempty page + 1 */
 
 	/* Statistics output by us, for table */
@@ -437,9 +440,14 @@ static int	lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 							BlockNumber blkno, Page page,
 							Buffer vmbuffer,
 							bool *has_lpdead_items, bool *vm_page_frozen);
+static void lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf,
+								BlockNumber blkno, Page page,
+								Buffer vmbuffer);
 static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 							  BlockNumber blkno, Page page,
 							  bool *has_lpdead_items);
+static bool lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf,
+								  BlockNumber blkno, Page page);
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
@@ -525,6 +533,23 @@ heap_vacuum_eager_scan_setup(LVRelState *vacrel, const VacuumParams *params)
 	 */
 	if (vacrel->aggressive)
 		return;
+
+	/*
+	 * Storage that shares pages wants every page frozen while it is still
+	 * the relation's own (vacuum_get_cutoffs()): every all-visible page not
+	 * yet all-frozen is scanned, in every region, whatever the table's size.
+	 */
+	if (vacrel->cutoffs.freeze_all_visible)
+	{
+		visibilitymap_count(vacrel->rel, &allvisible, &allfrozen);
+		vacrel->eager_scan_remaining_successes = allvisible - allfrozen;
+		if (vacrel->eager_scan_remaining_successes == 0)
+			return;
+		vacrel->next_eager_scan_region_start = 0;
+		vacrel->eager_scan_max_fails_per_region = EAGER_SCAN_REGION_SIZE;
+		vacrel->eager_scan_remaining_fails = EAGER_SCAN_REGION_SIZE;
+		return;
+	}
 
 	/*
 	 * Aggressively vacuuming a small relation shouldn't take long, so it
@@ -745,6 +770,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	vacrel->new_frozen_tuple_pages = 0;
 	vacrel->lpdead_item_pages = 0;
 	vacrel->missed_dead_pages = 0;
+	vacrel->shared_pages = 0;
 	vacrel->nonempty_pages = 0;
 	/* dead_items_alloc allocates vacrel->dead_items later on */
 
@@ -1069,6 +1095,10 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 								 _("tuples missed: %" PRId64 " dead from %u pages not removed due to cleanup lock contention\n"),
 								 vacrel->missed_dead_tuples,
 								 vacrel->missed_dead_pages);
+			if (vacrel->shared_pages > 0)
+				appendStringInfo(&buf,
+								 _("pages shared: %u shared with another relation, left as they are\n"),
+								 vacrel->shared_pages);
 			diff = (int32) (ReadNextTransactionId() -
 							vacrel->cutoffs.OldestXmin);
 			appendStringInfo(&buf,
@@ -1328,6 +1358,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		void	   *per_buffer_data = NULL;
 		bool		vm_page_frozen = false;
 		bool		got_cleanup_lock = false;
+		bool		left_shared = false;
 
 		vacuum_delay_point(false);
 
@@ -1430,8 +1461,12 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * the page in lazy_scan_prune.  But when it's not possible to acquire
 		 * a cleanup lock right away, we may be able to settle for reduced
 		 * processing using lazy_scan_noprune.
+		 *
+		 * The page is prepared for a change only when one is made: most pages
+		 * VACUUM visits don't change, and preparing a page another relation
+		 * shares copies it.
 		 */
-		got_cleanup_lock = ConditionalLockBufferForCleanup(buf);
+		got_cleanup_lock = ConditionalLockBufferForCleanupUnprepared(buf);
 
 		if (!got_cleanup_lock)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1442,6 +1477,28 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
+		}
+
+		/*
+		 * A page another relation shares (a branch's, copy-on-write) is left
+		 * as it is when there's nothing on it to reclaim: freezing it or
+		 * setting it all-visible would copy it, undoing the sharing for
+		 * nothing the relations need.  Its tuples are counted, as a page's
+		 * whose cleanup lock wasn't obtained are.  One with dead tuples or
+		 * dead line pointers is pruned as any (copied: the space it frees is
+		 * real, and left, its dead would be counted at every VACUUM and
+		 * never removed), and an aggressive VACUUM that must freeze a tuple
+		 * of it still does (lazy_scan_noprune() says so).  A page shared only
+		 * with roots held of the relation itself, and not with another
+		 * relation, is vacuumed as any: the copy is the relation's for good,
+		 * and the held root keeps the version it had.
+		 */
+		if (got_cleanup_lock && BufferPageIsShared(buf) &&
+			BufferPageIsSharedElsewhere(buf) &&
+			!lazy_scan_reclaimable(vacrel, buf, blkno, page))
+		{
+			got_cleanup_lock = false;
+			left_shared = true;
 		}
 
 		/*
@@ -1461,8 +1518,23 @@ lazy_scan_heap(LVRelState *vacrel)
 			 */
 			Assert(vacrel->aggressive);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			LockBufferForCleanup(buf);
+			LockBufferForCleanupUnprepared(buf);
 			got_cleanup_lock = true;
+			left_shared = false;
+		}
+
+		/*
+		 * A shared page left as it is counts as an eager scan's failure: it
+		 * wasn't frozen, and shared pages can be most of a table, so leaving
+		 * them out of the cap would have every region read in full.
+		 */
+		if (left_shared)
+		{
+			if (!has_lpdead_items)
+				lazy_scan_shared_vm(vacrel, buf, blkno, page, vmbuffer);
+			vacrel->shared_pages++;
+			if (was_eager_scanned && vacrel->eager_scan_remaining_fails > 0)
+				vacrel->eager_scan_remaining_fails--;
 		}
 
 		/*
@@ -1954,6 +2026,8 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		 */
 		if (!PageIsAllVisible(page))
 		{
+			BufferPrepareForChange(buf);
+
 			/* Lock vmbuffer before entering critical section */
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 
@@ -2145,6 +2219,109 @@ lazy_scan_prune(LVRelState *vacrel,
 	*has_lpdead_items = (presult.lpdead_items > 0);
 
 	return presult.ndeleted;
+}
+
+/*
+ *	lazy_scan_reclaimable() -- does the page hold anything VACUUM would free?
+ *
+ * Dead line pointers, or tuples dead to every snapshot (as lazy_scan_noprune()
+ * tells them), which pruning would remove.  Caller holds a lock on the
+ * buffer.
+ */
+static bool
+lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
+					  Page page)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		itemid = PageGetItemId(page, offnum);
+		HeapTupleData tuple;
+
+		if (ItemIdIsDead(itemid))
+			return true;
+		if (!ItemIdIsNormal(itemid))
+			continue;
+		ItemPointerSet(&(tuple.t_self), blkno, offnum);
+		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
+		tuple.t_len = ItemIdGetLength(itemid);
+		tuple.t_tableOid = RelationGetRelid(vacrel->rel);
+		if (HeapTupleSatisfiesVacuum(&tuple, vacrel->cutoffs.OldestXmin,
+									 buf) == HEAPTUPLE_DEAD)
+			return true;
+	}
+	return false;
+}
+
+/*
+ *	lazy_scan_shared_vm() -- set the map's bits of a shared page left as it is
+ *
+ * A page another relation shares, left as it is (nothing on it to reclaim),
+ * still gets its visibility map bits when it is all-visible and every tuple
+ * on it frozen, as a restored frozen root's pages are: the heap page itself
+ * isn't changed (that would copy it), only its map page.  The page must
+ * already say it is all-visible (PD_ALL_VISIBLE), since a writer clears the
+ * map's bit only of a page that says so.  Only an all-frozen page is set:
+ * the change is logged as a record of the map page alone
+ * (XLOG_HEAP2_VM_SET, a few bytes but for the map page's first image after
+ * a checkpoint), which carries no conflict horizon for a standby's
+ * queries, and a frozen page's versions are visible to every snapshot, a
+ * standby's too.  The caller holds buf's cleanup lock, so no writer clears
+ * the page's flag until the bits are set.
+ */
+static void
+lazy_scan_shared_vm(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
+					Page page, Buffer vmbuffer)
+{
+	bool		all_frozen;
+	TransactionId newest_live_xid;
+	const uint8 flags = VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN;
+	uint8		old;
+
+	if (PageIsNew(page) || PageIsEmpty(page) || !PageIsAllVisible(page))
+		return;
+	if (VM_ALL_FROZEN(vacrel->rel, blkno, &vmbuffer))
+		return;
+	if (!heap_page_would_be_all_visible(vacrel->rel, buf, vacrel->vistest,
+										true, NULL, 0, &all_frozen,
+										&newest_live_xid, &vacrel->offnum) ||
+		!all_frozen)
+	{
+		vacrel->offnum = InvalidOffsetNumber;
+		return;
+	}
+	vacrel->offnum = InvalidOffsetNumber;
+
+	LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+	START_CRIT_SECTION();
+	old = visibilitymap_set(blkno, vmbuffer, flags, vacrel->rel->rd_locator);
+	MarkBufferDirty(vmbuffer);
+	if (RelationNeedsWAL(vacrel->rel))
+	{
+		xl_heap_vm_set xlrec;
+		XLogRecPtr	recptr;
+
+		xlrec.heap_blkno = blkno;
+		xlrec.flags = flags;
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfHeapVmSet);
+		/* (a map page's contents lie past pd_lower: not a standard page) */
+		XLogRegisterBuffer(0, vmbuffer, 0);
+		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VM_SET);
+		PageSetLSN(BufferGetPage(vmbuffer), recptr);
+	}
+	END_CRIT_SECTION();
+	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+
+	if ((old & VISIBILITYMAP_ALL_VISIBLE) == 0)
+	{
+		vacrel->new_all_visible_pages++;
+		vacrel->new_all_visible_all_frozen_pages++;
+	}
+	else
+		vacrel->new_all_frozen_pages++;
 }
 
 /*

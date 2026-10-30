@@ -54,10 +54,12 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
+#include "utils/guc_tables.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -1113,6 +1115,52 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 	return vacrels;
 }
 
+/* Was GUC name set explicitly (anywhere but its built-in default)? */
+static bool
+setting_given(const char *name)
+{
+	struct config_generic *guc = find_option(name, false, true, ERROR);
+
+	return guc != NULL && guc->source > PGC_S_DYNAMIC_DEFAULT;
+}
+
+/*
+ * Does a VACUUM of rel freeze eagerly, when its caller gives no freeze age?
+ * Yes for a relation whose storage may share its pages with other
+ * relations copy-on-write (smgrcanshare()), unless vacuum_freeze_min_age
+ * or the relation's autovacuum_freeze_min_age reloption was set
+ * explicitly: its freeze age is then 0, and *all_visible says whether it
+ * also scans every all-visible page not yet all-frozen (unless the eager
+ * scan's failure rate, vacuum_max_eager_freeze_failure_rate, was set).
+ *
+ * Such storage copies a shared page before any change to it, freezing
+ * included, while a page no other relation holds yet is frozen in place.
+ * So its tuples are frozen as soon as every snapshot sees them, while the
+ * page is still the relation's own; one frozen and marked all-frozen then
+ * is shared that way (the visibility map goes with the copy), and no
+ * VACUUM of either relation needs to copy it to freeze it later.  Pages a
+ * read set all-visible (on-access pruning) are among them, which a normal
+ * VACUUM would skip.  The cost is the freeze WAL, earlier than it would
+ * have been, and reading the all-visible pages until they are frozen.
+ */
+static bool
+freezes_eagerly(Relation rel, bool *all_visible)
+{
+	StdRdOptions *relopts = (StdRdOptions *) rel->rd_options;
+
+	*all_visible = false;
+	if (!smgrcanshare(RelationGetSmgr(rel)))
+		return false;
+	if (relopts != NULL && relopts->autovacuum.freeze_min_age >= 0)
+		return false;
+	if (setting_given("vacuum_freeze_min_age"))
+		return false;
+	*all_visible =
+		!(relopts != NULL && relopts->vacuum_max_eager_freeze_failure_rate >= 0) &&
+		!setting_given("vacuum_max_eager_freeze_failure_rate");
+	return true;
+}
+
 /*
  * vacuum_get_cutoffs() -- compute OldestXmin and freeze cutoff points
  *
@@ -1204,12 +1252,15 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 
 	/*
 	 * Determine the minimum freeze age to use: as specified by the caller, or
-	 * vacuum_freeze_min_age, but in any case not more than half
+	 * vacuum_freeze_min_age (or 0, for storage that shares pages:
+	 * freezes_eagerly()), but in any case not more than half
 	 * autovacuum_freeze_max_age, so that autovacuums to prevent XID
 	 * wraparound won't occur too frequently.
 	 */
+	cutoffs->freeze_all_visible = false;
 	if (freeze_min_age < 0)
-		freeze_min_age = vacuum_freeze_min_age;
+		freeze_min_age = freezes_eagerly(rel, &cutoffs->freeze_all_visible)
+			? 0 : vacuum_freeze_min_age;
 	freeze_min_age = Min(freeze_min_age, autovacuum_freeze_max_age / 2);
 	Assert(freeze_min_age >= 0);
 
@@ -2013,6 +2064,67 @@ vac_truncate_clog(TransactionId frozenXID,
 
 
 /*
+ * Storage whose pages other relations may share may also have pages held
+ * by storage dropped since, queued to be let go of.  Until then such a
+ * page counts as shared, so VACUUM would leave it as it is, or copy it to
+ * prune or freeze it, though nothing else will hold it: so that is let go
+ * of first, under the cost-based delay.
+ *
+ * It is a saving, not the VACUUM's work: an anti-wraparound VACUUM, which
+ * must not be put off, doesn't do it, and an error in it (a queue that
+ * can't be read) is reported as a warning and the VACUUM goes on, the
+ * subtransaction it ran in rolled back.  A cancel, a shutdown or running
+ * out of resources still ends the VACUUM.
+ */
+static void
+vacuum_release_dropped(Relation rel, const VacuumParams *params)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+
+	if (params->is_wraparound || !smgrcanshare(RelationGetSmgr(rel)))
+		return;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		while (smgrreleasestep(RelationGetSmgr(rel)) > 0)
+			vacuum_delay_point(false);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+
+		/*
+		 * A cancel or timeout (raised by the cost-based delay's interrupt
+		 * check), a shutdown, or running out of memory or disk is the
+		 * VACUUM's own, not the queue's.
+		 */
+		if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+			ERRCODE_OPERATOR_INTERVENTION ||
+			ERRCODE_TO_CATEGORY(edata->sqlerrcode) ==
+			ERRCODE_INSUFFICIENT_RESOURCES)
+			ReThrowError(edata);
+		ereport(WARNING,
+				(errmsg("could not let go of dropped storage before vacuuming \"%s\": %s",
+						RelationGetRelationName(rel), edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+/*
  *	vacuum_rel() -- vacuum one heap relation
  *
  *		relid identifies the relation to vacuum.  If relation is supplied,
@@ -2353,7 +2465,10 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 			rel = NULL;
 		}
 		else
+		{
+			vacuum_release_dropped(rel, &params);
 			table_relation_vacuum(rel, &params, bstrategy);
+		}
 	}
 
 	/* Roll back any GUC changes executed by index functions */
