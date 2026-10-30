@@ -425,6 +425,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 
 	RelationPreTruncate(rel);
 
+	/* anything the storage manager needs, read before the critical section */
+	smgrpretruncate(RelationGetSmgr(rel), forks, nforks);
+
 	/*
 	 * The code which follows can interact with concurrent checkpoints in two
 	 * separate ways.
@@ -451,8 +454,6 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * corresponding sync request will be processed before the checkpoint
 	 * completes.
 	 */
-	/* anything the storage manager needs, read before the critical section */
-	smgrpretruncate(RelationGetSmgr(rel), forks, nforks);
 
 	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;

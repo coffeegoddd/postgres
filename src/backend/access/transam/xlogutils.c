@@ -52,6 +52,16 @@ bool		InRecovery = false;
 /* Are we in Hot Standby mode? Only valid in startup process, see xlogutils.h */
 HotStandbyState standbyState = STANDBY_DISABLED;
 
+/* what XLogReadBufferForRecord() asks the block's storage manager */
+#define REDO_READ_RESTORING_IMAGE	0x01
+#define REDO_READ_SKIP_REPLACED		0x02
+
+static Buffer XLogReadBufferForRecord(RelFileLocator rlocator,
+									  ForkNumber forknum, BlockNumber blkno,
+									  ReadBufferMode mode, Buffer recent_buffer,
+									  XLogRecPtr record_lsn, int flags,
+									  bool *replaced);
+
 /*
  * During XLOG replay, we may see XLOG records for incremental updates of
  * pages that no longer exist, because their relation was later dropped or
@@ -411,15 +421,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
 
-		/*
-		 * The version the image replaces may be newer than the image, and its
-		 * storage manager may need to know what it said.
-		 */
-		smgrprerestore(smgropen(rlocator, INVALID_PROC_NUMBER), forknum,
-					   blkno, record->ReadRecPtr);
-		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
-									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
-									  prefetch_buffer);
+		*buf = XLogReadBufferForRecord(rlocator, forknum, blkno,
+									   get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
+									   prefetch_buffer, record->ReadRecPtr,
+									   REDO_READ_RESTORING_IMAGE, NULL);
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			ereport(ERROR,
@@ -452,20 +457,19 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	}
 	else
 	{
+		bool		replaced = false;
+
 		/*
 		 * A block given other storage after this record has what the record
 		 * changed in the page the new storage began with; the storage may
 		 * hold another relation's page until then.
 		 */
-		if (!zeromode &&
-			smgrreplacedafter(smgropen(rlocator, INVALID_PROC_NUMBER),
-							  forknum, blkno, record->ReadRecPtr))
-		{
-			*buf = InvalidBuffer;
+		*buf = XLogReadBufferForRecord(rlocator, forknum, blkno, mode,
+									   prefetch_buffer, record->ReadRecPtr,
+									   zeromode ? 0 : REDO_READ_SKIP_REPLACED,
+									   &replaced);
+		if (replaced)
 			return BLK_NOTFOUND;
-		}
-
-		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
 		if (BufferIsValid(*buf))
 		{
 			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
@@ -519,6 +523,35 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 					   BlockNumber blkno, ReadBufferMode mode,
 					   Buffer recent_buffer)
 {
+	return XLogReadBufferForRecord(rlocator, forknum, blkno, mode,
+								   recent_buffer, InvalidXLogRecPtr, 0, NULL);
+}
+
+/*
+ * XLogReadBufferForRecord
+ *		XLogReadBufferExtended(), for a block of the record at WAL position
+ *		'record_lsn', asking the block's storage manager what 'flags' say
+ *
+ * REDO_READ_RESTORING_IMAGE: a full-page image of the block is about to be
+ * restored over the version the block has, which may be newer and say
+ * something its storage manager needs to know (smgrprerestore()).
+ *
+ * REDO_READ_SKIP_REPLACED: if the block was given other storage after the
+ * record (smgrreplacedafter()), read nothing and set *replaced: what the
+ * record changed is in the page the new storage began with, and the
+ * storage may hold another relation's page until replay reaches the
+ * change.
+ *
+ * The storage manager is asked only once the relation is open, as it is to
+ * read the block anyway, so redo of relations whose storage manager does
+ * neither pays nothing for the questions.
+ */
+static Buffer
+XLogReadBufferForRecord(RelFileLocator rlocator, ForkNumber forknum,
+						BlockNumber blkno, ReadBufferMode mode,
+						Buffer recent_buffer, XLogRecPtr record_lsn,
+						int flags, bool *replaced)
+{
 	BlockNumber lastblock;
 	Buffer		buffer;
 	SMgrRelation smgr;
@@ -536,6 +569,15 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	/* Open the relation at smgr level */
 	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+	if (flags & REDO_READ_RESTORING_IMAGE)
+		smgrprerestore(smgr, forknum, blkno, record_lsn);
+	if ((flags & REDO_READ_SKIP_REPLACED) &&
+		smgrreplacedafter(smgr, forknum, blkno, record_lsn))
+	{
+		*replaced = true;
+		return InvalidBuffer;
+	}
 
 	/*
 	 * Create the target file if it doesn't already exist.  This lets us cope

@@ -153,7 +153,8 @@ typedef struct f_smgr
 
 	/*
 	 * Of a page smgr_pageisshared says is shared: may another relation hold
-	 * it, not only snapshots of this one?  May be NULL (always).
+	 * it, not only snapshots of this one?  May be NULL (always, if
+	 * smgr_pageisshared is set).
 	 */
 	bool		(*smgr_pagesharedelsewhere) (SMgrRelation reln,
 											 ForkNumber forknum,
@@ -170,8 +171,11 @@ typedef struct f_smgr
 	void		(*smgr_precommitdrop) (SMgrRelation reln);
 
 	/*
-	 * As a top-level transaction's drops are done, at commit or abort; may
-	 * be NULL.
+	 * Once relations' buffers have been dropped to unlink them: every
+	 * unlink outside recovery (a subtransaction's abort, COMMIT PREPARED)
+	 * and the end of a top-level transaction's drops, at commit or abort.
+	 * What smgr_precommitdrop prepared is done with by then; a call with
+	 * nothing prepared must do nothing.  May be NULL.
 	 */
 	void		(*smgr_enddrops) (void);
 
@@ -799,14 +803,21 @@ smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 /*
  * smgrpagesharedelsewhere() -- Of a shared page: may another relation hold
  *								it, not only the relation's own snapshots?
+ *
+ * Storage that shares no page (md.c) shares none elsewhere either; storage
+ * that shares pages but can't tell its own snapshots from other relations
+ * answers yes.
  */
 bool
 smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum)
 {
-	return smgrsw[reln->smgr_which].smgr_pagesharedelsewhere == NULL ||
-		smgrsw[reln->smgr_which].smgr_pagesharedelsewhere(reln, forknum,
-														   blocknum);
+	const f_smgr *sw = &smgrsw[reln->smgr_which];
+
+	if (sw->smgr_pageisshared == NULL)
+		return false;
+	return sw->smgr_pagesharedelsewhere == NULL ||
+		sw->smgr_pagesharedelsewhere(reln, forknum, blocknum);
 }
 
 /*
@@ -861,7 +872,10 @@ smgrbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 }
 
 /*
- * smgrenddrops() -- A top-level transaction's drops are done.
+ * smgrenddrops() -- Relations' drops are done (their buffers dropped).
+ *
+ * Called by every unlink outside recovery, and at the end of a top-level
+ * transaction's drops, at commit or abort.
  */
 void
 smgrenddrops(void)
