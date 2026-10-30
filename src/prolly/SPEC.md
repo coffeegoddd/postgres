@@ -667,13 +667,127 @@ its authoritative state.  A keyframe is an acceleration structure only:
 - **Every restore is tested against a replay to the same commit,** row by
   row and with amcheck on every index.
 
-**What is prototyped.**  The planner is built and tested: it prices
-replaying rows against restoring a keyframe, decides when a keyframe is
-worth taking, and recalibrates its costs from what each move actually
-takes.  The keyframe format, including frozen pages, page maps and page
-diffs, is built and tested too.  What remains to build is the manager
-that acts on the planner: the background worker, the spacing and budget,
-thinning, and releasing keyframes as the window moves.
+**The planner: replay or restore.**  Every move of a working set to
+another commit, a hard reset or a branch created at an arbitrary commit,
+has two ways there, and a planner chooses between them for each move:
+- **Replay:** rewrite the *D* rows that differ between the working set and
+  the target.
+- **Restore:** restore a keyframe near the target, then replay the *D'*
+  rows that differ between the keyframe and the target.  *D'* is zero when
+  the target has a keyframe of its own.
+
+The planner prices each from counts it has before writing anything:
+- **Replay** costs a fixed part, a cost per row, and a cost per page the
+  rows are on.  A page first written since the last checkpoint ("cold")
+  costs more than one already written since ("warm"), because its first
+  change logs a whole image of it.
+- **Restore** costs a fixed part plus the restore's own work, then the
+  replay of the *D'* rows after it.  In production the restore's own work
+  is sharing block maps, O(C).  In the prototype it is writing back the
+  pages that differ, O(P).
+- **The candidates** are the keyframes nearest the target, before and
+  after it.  Their distances come from each commit's running count of
+  change, so finding them needs no diff.
+
+The planner calibrates itself:
+- It starts from costs measured for the server and its `wal_compression`.
+- It refits them from the time every move actually takes, by least
+  squares, with older moves weighing less.
+- It learns only from the path it takes, so a path not taken for 50 moves
+  is tried on the next small move.  That keeps a wrong first guess from
+  hiding a path for good.
+
+The same prices decide when a keyframe is worth taking: once restoring
+the change since the last keyframe, plus taking the new one, would beat
+replaying that change.
+
+A plan must cost O(1).  The counts it needs are kept as capture decodes
+the WAL, not computed by scanning it.  The prototype computed one by
+scanning the WAL since the working set's base, and planning grew to 2.3 s
+while the moves took 70 to 320 ms.
+
+**What is prototyped.**  The planner is built and tested, with its
+calibration.  The keyframe format, including frozen pages, page maps and
+page diffs, is built and tested too.  Restoring by sharing block maps has
+been measured on the production storage manager.  What remains to build
+is the manager that acts on the planner: the background worker, the
+spacing and budget, thinning, and releasing keyframes as the window moves.
+
+**Measured: restoring a keyframe against replaying rows.**  Three
+measurements, each checked by comparing every row with the target's
+(checksums or row-by-row) and by amcheck on every index.
+
+*1. The production restore, from held block maps.*  On the production
+storage manager, a table and its two indexes were captured as held
+block-map roots at a state X.  After D rows changed, the table was put
+back exactly to X in one of two ways.  Replay rewrote the D rows from a
+saved copy of X.  Restore made new storage from the held roots and pointed
+the table's and indexes' catalog entries at it.  The target is always X
+itself, so this is a restore to a keyframe of the target, with nothing to
+replay after it.
+
+| Table | Rows changed | Replay | Restore |
+|---|---:|---:|---:|
+| 1M rows | 100k | 1,345 ms | 2.1 ms |
+| 1M rows | 1M | 9,038 ms | 2.0 ms |
+| 10M rows | 100k | 4,576 ms | 2.6 ms |
+| 10M rows | 1M | 16,657 ms | 1.6 ms |
+| 10M rows | 10M | 124,176 ms | 4.4 ms |
+
+The restore costs about 2 ms whatever the table's size and however much
+changed: O(C), as stated above.  (The replays scanned both tables to find
+the changed rows, which inflates replay most for small changes, so small
+changes are left out of this table.)
+
+*2. Real keyframes in the prototype, by distance.*  A table of 1M rows,
+40 commits of 20,000 random row changes each, a keyframe at every commit
+(not frozen), `wal_compression = lz4`.  Each checkout is to a random
+commit, by replaying the rows that differ or by restoring that commit's
+keyframe.  The prototype restores by writing back the pages that differ,
+so its restores cost what those pages cost, not production's 2 ms.
+
+| Commits back | Replay | Restore |
+|---|---:|---:|
+| 1 | 324 ms (19k rows) | 1,205–1,247 ms |
+| 4 | 722–989 ms (74k rows) | 1,210–1,466 ms |
+| 10 | 1,188 ms (180k rows) | 1,086–1,277 ms |
+| 19 | 1,744–2,216 ms (313k rows) | 1,217 ms |
+| 26 | 2,496 ms (418k rows) | 1,145 ms |
+| 38 | 3,307 ms (574k rows) | 1,423 ms (37 back) |
+
+- Replay grows with the rows that differ, about 6 µs a row.
+- Restore is flat.  Random changes of this size touch about 19,000 of the
+  table's 23,700 pages in one commit, so nearly every page differs, and
+  the pages that differ can never exceed the table's.  This spread of
+  changes is the worst case for a restore that writes pages.
+- They cross at about 10 commits back.  At 38 the restore is 2.3× faster,
+  and the gap widens with distance.
+- The planner, choosing on the same history, replayed targets 1 to 3
+  commits back and restored from about 9 back.  It learned that crossover
+  from its own moves.
+
+*3. The same, under each `wal_compression`.*  A restore logs every page
+whole, so it depends on the setting; replay hardly does.  Medians in ms,
+replay / restore:
+
+| Commits back | off | pglz | lz4 | zstd |
+|---|---|---|---|---|
+| 1–3 | 694 / 1,403 | 727 / 2,313 | 634 / 1,248 | 637 / 1,367 |
+| 10–19 | 2,130 / 1,495 | 1,701 / 2,662 | 1,787 / 1,311 | 2,008 / 1,375 |
+| 30+ | 3,569 / 1,706 | 3,035 / 3,029 | 2,985 / 1,485 | 3,240 / 1,655 |
+
+Under lz4, zstd and off, restore wins from about 10 commits back.  Under
+pglz it never wins within 38.  So keyframes want lz4 (or zstd), and the
+planner keeps its costs per setting.
+
+*Not yet measured:*
+- the production restore followed by a replay of *D'*;
+- frozen keyframes taken in the background;
+- how much storage copy-on-write keyframes hold for a given spacing.
+
+The restore half costs about 2 ms in production, so a move's cost is
+essentially the replay of *D'*, which spacing sets: more keyframes, smaller
+*D'*, more storage.
 
 **Time complexity with keyframes**, in production, with *C* the number of
 tables and indexes in the versioned schema, and *D'* the number of rows
@@ -762,9 +876,12 @@ spacing ratio and *P* the pages that differ:
 | Create a branch | O(C + Δ) | O(C + D) | O(C + d(r − 1)) | O(P + d(r − 1)), plus fetching |
 | Keyframes kept | *H*/*Δ* in the window | | log<sub>*r*</sub>(*H*/*Δ<sub>0</sub>*) | |
 
-Recent commits would stay as cheap as today.  Old ones would cost in
-proportion to how far back they are, never the full rewrite, and nothing
-is lost unless the data must not be kept.
+Recent commits would stay as cheap as today.  Old ones would cost more
+with distance, since the rows replayed after the nearest keyframe grow
+with it.  Once that gap covers most of a table's turnover, a move costs
+about what rewriting the table does.  Exponential spacing trades that cost
+far back for bounded storage.  Nothing is lost unless the data must not
+be kept.
 
 **What the prototype must show** before either is adopted:
 - the planner's choices and measured move costs under exponential spacing,
