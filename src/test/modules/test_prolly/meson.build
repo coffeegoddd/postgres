@@ -81,6 +81,7 @@ tests += {
       't/029_bmap_upgrade.pl',
       't/030_bmap_crash_steps.pl',
       't/032_bmap_share_synced.pl',
+      't/033_bmap_rewind_synced.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

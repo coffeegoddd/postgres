@@ -5582,7 +5582,14 @@ preserve_synced(RelFileLocator rel, SyncedBlocks *synced)
  * and moves its server's restart point past the newest of them
  * ('synced_since'), asking for a restartpoint if it must; and an image is
  * logged of each block src got since the checkpoint, which a recovery
- * from before it replays after all such writes.
+ * from before it replays after all such writes.  Both the share and its
+ * redo keep the position in pg_control once the blocks are durable
+ * (XLogNoteSyncedPages()), where it keeps any recovery from beginning at or
+ * before it: a standby's that couldn't make the restartpoint, and a
+ * server's that pg_rewind made of this one, which replays from the last
+ * checkpoint it had in common with this one over the page store copied as
+ * it is now (pg_rewind refuses such a source, and one that syncs blocks so
+ * while it copies files).
  *
  * A base backup copies the page store while the share may write it: one
  * running as the share begins gets an image of every own block, as does a
@@ -5764,6 +5771,13 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 		GetBackupState(&backups_now, &backup_start_now);
 		if (backups_now > 0 || backup_start_now != backup_start)
 			preserve_synced(srel, &synced);
+
+		/*
+		 * Said in pg_control, once the blocks are durable: no recovery may
+		 * begin at or before the newest of them was given to src, and a
+		 * rewind copying files meanwhile can't rely on what it copied.
+		 */
+		XLogNoteSyncedPages(synced.newest);
 	}
 	if (own.n > 0)
 		store_flush_end(srel, false);
@@ -14515,11 +14529,13 @@ forget_cached_size(RelFileLocator rel)
  * base backup's start, may not, so a restartpoint is asked for and waited
  * for.  It begins at the last checkpoint record replayed, which is no
  * older than the checkpoint the share began after, past every block the
- * share synced.  (A restartpoint can't be made while recovery has
- * references to pages it couldn't find, which only a recovery that hasn't
- * reached consistency has; the first replay of a share by a server
- * happens after it, or the share logged images, since a backup it would
- * begin from was running.)
+ * share synced.  A restartpoint can't always be made: none is while
+ * recovery has references to pages it couldn't find, and a checkpoint
+ * record replayed meanwhile (a backup's replay passing one before it
+ * reaches consistency) is never one's.  So the position is kept in
+ * pg_control too (XLogNoteSyncedPages()), where it keeps an online backup
+ * of this server, and a recovery, from beginning at or before it until a
+ * restartpoint past it is made.
  */
 static void
 redo_share_synced(const xl_bmap_share *xlrec, XLogRecPtr lsn)
@@ -14532,14 +14548,27 @@ redo_share_synced(const xl_bmap_share *xlrec, XLogRecPtr lsn)
 			 relpathperm(xlrec->src, MAIN_FORKNUM).str,
 			 LSN_FORMAT_ARGS(last_checkpoint_redo()),
 			 LSN_FORMAT_ARGS(xlrec->synced_since));
-		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_WAIT);
+		/* (a test takes the restartpoint for one that couldn't be made) */
+		if (!IS_INJECTION_POINT_ATTACHED("bmap-share-no-restartpoint"))
+			RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_WAIT);
 		if (last_checkpoint_redo() <= xlrec->synced_since)
 			ereport(WARNING,
 					(errmsg("restart point of recovery %X/%08X is not past the blocks a share of \"%s\" synced",
 							LSN_FORMAT_ARGS(last_checkpoint_redo()),
 							relpathperm(xlrec->src, MAIN_FORKNUM).str),
-					 errdetail("A crash before the next restartpoint could lose rows the share's copy reads.")));
+					 errdetail("Until a restartpoint is made past %X/%08X, an online backup of this server is refused and a recovery from its restart point fails.",
+							   LSN_FORMAT_ARGS(xlrec->synced_since))));
 	}
+
+	/*
+	 * Said in pg_control once the restartpoint is made, if it could be: a
+	 * crash before then recovers from the restart point before it, which
+	 * finds every map as at this record, so replays the source's records
+	 * for its blocks.  If it couldn't be made, recovery from the restart
+	 * point would fail, and so would a backup beginning there, until a
+	 * restartpoint past the blocks is made.
+	 */
+	XLogNoteSyncedPages(xlrec->synced_since);
 	elog(DEBUG1, "redo of a share of %s synced its own pages, its restart point %X/%08X, the newest of them given at %X/%08X",
 		 relpathperm(xlrec->src, MAIN_FORKNUM).str,
 		 LSN_FORMAT_ARGS(last_checkpoint_redo()),

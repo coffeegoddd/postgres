@@ -38,6 +38,7 @@
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 
 static RelFileLocator
@@ -850,4 +851,19 @@ test_bmap_lookups(PG_FUNCTION_ARGS)
 	if (sum == 0 && nblocks > 0)
 		elog(ERROR, "no block found");
 	PG_RETURN_FLOAT8(INSTR_TIME_GET_MICROSEC(elapsed));
+}
+
+/*
+ * test_synced_pages_note(lsn): say in pg_control that pages were synced
+ * instead of logged, relying on no recovery beginning at or before 'lsn',
+ * as a share or its replay does once the pages are durable.  For tests of
+ * what then refuses to begin there.
+ */
+PG_FUNCTION_INFO_V1(test_synced_pages_note);
+
+Datum
+test_synced_pages_note(PG_FUNCTION_ARGS)
+{
+	XLogNoteSyncedPages(PG_GETARG_LSN(0));
+	PG_RETURN_VOID();
 }

@@ -172,6 +172,12 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- test_bmap_unlink() drops), counted (those held, and the slots), and the
 -- slots of captures that never committed reclaimed; and those held captured
 -- of a relation file number.
+-- Say in pg_control that pages were synced instead of logged, relying on
+-- no recovery beginning at or before 'lsn'.
+CREATE FUNCTION test_synced_pages_note(lsn pg_lsn)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_root_capture(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
