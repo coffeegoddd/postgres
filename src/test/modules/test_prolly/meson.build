@@ -44,6 +44,7 @@ tests += {
       'vacuum_shared',
       'bmap_primitives',
       'bmap_settle_roots',
+      'bmap_diff',
     ],
   },
   'tap': {
