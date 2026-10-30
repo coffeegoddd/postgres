@@ -50,7 +50,10 @@
  * XLOG_BMAP_REMAP		a shared page is copied before it changes: block 0 is
  *						the leaf, then the allocator's metapage and bitmap
  *						pages, the old block's reference-count page if its
- *						count changes, and last the page itself, as an image
+ *						count changes, and last the page itself, as an
+ *						image unless BMAP_REMAP_COPIED
+ * XLOG_BMAP_PASSED		blocks copied without an image (BMAP_REMAP_COPIED)
+ *						up to a position may change: no block
  * XLOG_BMAP_TREE		a map's nodes (xl_bmap_tree says how)
  * XLOG_BMAP_RELEASE	the release queue (xl_bmap_release says how): block 0
  *						is its metapage, then its pages; a drain's record
@@ -66,6 +69,7 @@
 #define XLOG_BMAP_EXTEND		0x30
 #define XLOG_BMAP_TRUNCATE		0x40
 #define XLOG_BMAP_FREE			0x50
+#define XLOG_BMAP_PASSED		0x60
 #define XLOG_BMAP_SHARED		0x70
 #define XLOG_BMAP_UNREF			0x80
 #define XLOG_BMAP_REMAP			0x90
@@ -135,12 +139,35 @@ typedef struct xl_bmap_shrink
  * leaves and the one it takes, and the page store's high-water mark before
  * and after.  The page's image comes as its last block, unless it is all
  * zeroes (BMAP_REMAP_ZERO): then redo zeroes the new block, as extending
- * does.  The old block, which another map still holds, keeps what it has:
+ * does; or unless the page's image or a change since the redo pointer is
+ * in the WAL already, as a full-page write leaves it out
+ * (BMAP_REMAP_COPIED): then redo copies the page as replay has it in its
+ * buffer, or else from the old block, and the old block's reference-count
+ * page says the block was copied from and where (its delta's
+ * BMAP_DELTA_COPIED), so that the old block keeps that page until no
+ * recovery begins before the copy.  (The record may carry the image all
+ * the same, if a checkpoint began as it was inserted; redo restores it.)
+ * The old block, which another map still holds, keeps what it has:
  * the primary doesn't write there (the image may have hints only this
  * map's buffer had).  A hole given its first block has no old block
  * (InvalidBlockNumber).
  */
 #define BMAP_REMAP_ZERO		0x01
+#define BMAP_REMAP_COPIED	0x02
+
+/*
+ * PASSED's main data: the redo pointer of the checkpoint last completed,
+ * which every copy made without an image of a block now to be changed in
+ * place or freed precedes, and the newest such copy's position (its
+ * record's end).  Redo makes sure its server's restart point is no older
+ * than the first, and keeps the second in pg_control (see bmap.c's
+ * "Copies without an image").
+ */
+typedef struct xl_bmap_passed
+{
+	XLogRecPtr	horizon;
+	XLogRecPtr	copied;
+} xl_bmap_passed;
 
 typedef struct xl_bmap_remap
 {
@@ -518,6 +545,16 @@ typedef struct xl_bmap_refs_delta
 	uint32		nroots;
 	/* xl_bmap_ref_delta refs[nrefs + nroots] follow */
 } xl_bmap_refs_delta;
+
+/*
+ * Flags of a reference-count page's delta: BMAP_DELTA_COPIED, the first
+ * count set is of a block copied without an image, whose copied bit is
+ * set, and the page's copy position becomes the record's end; with
+ * BMAP_DELTA_COPIED_RESET, the page's copied bits are all cleared first
+ * (the copies they told of all precede the restart point).
+ */
+#define BMAP_DELTA_COPIED		0x02
+#define BMAP_DELTA_COPIED_RESET	0x04
 
 typedef struct xl_bmap_ref_delta
 {

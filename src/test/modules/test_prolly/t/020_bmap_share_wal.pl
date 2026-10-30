@@ -105,12 +105,10 @@ my (undef, $copy_images) =
   wal_of(q{UPDATE imaged SET a = a WHERE a % 17 = 2}, $imaged);
 is($share_images, 0,
 	'a share logs no image of pages imaged since the redo pointer');
-{
-	local $TODO = 'a copy logs the page\'s image though one is in the WAL since the redo pointer';
-
-	is($copy_images, 0,
-		'and the copies after it log none either');
-}
+is(sql(qq{SELECT count(*) FROM test_bmap_map($imaged) WHERE refs = 0}),
+	sql(q{SELECT pg_relation_size('imaged') / 8192}),
+	'the change copied every page');
+is($copy_images, 0, 'and the copies after it log none either');
 
 # The first write to each page after a checkpoint: of a table none shares
 # and of one that is shared.  The shared table's pages are copied, which

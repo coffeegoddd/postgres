@@ -82,6 +82,39 @@
  * record (tree_find()).  A map, or page store, of an older format (the flat
  * maps of version 1) is refused, not read (refuse_version()).
  *
+ * Copies without an image.  A shared page copied before it changes is logged
+ * without its image when a full-page write would leave the image out: the page
+ * has changed since the redo pointer, so its image is in the WAL since.  The
+ * copy's redo takes the page as replay rebuilt it in its buffer, or, where
+ * replay may have skipped the page's records (its map on disk newer), from the
+ * old block, which holds the page as the copy saw it (redo_remap_page()).  So
+ * the old block keeps that page until no recovery of any server begins before
+ * the copy.  Its reference-count page says it was copied from (a bit a block)
+ * and where (the page's copy position, the newest copy from its blocks).
+ * Until the redo pointer of the checkpoint last completed passes that position
+ * (page_copy_holds()), the block isn't claimed in place by its other holder,
+ * which copies the page instead and lets the block go; nor freed, its free
+ * waiting on the release queue, whose drains stop before it; nor moved by a
+ * compaction; and no hint is set on its page, which a recovery would copy.
+ * Its first change in place or free after that is preceded by a PASSED record
+ * (copies_passed()), unless one was logged for a later copy already.  The
+ * record's redo moves the restart point of a standby or an archive recovery
+ * past the copies it replayed, asking for a restartpoint if need be, so that a
+ * crash of that server never replays a copy after the block changed
+ * (redo_copies_passed()); a backup taken on a standby meanwhile fails as it
+ * stops.  Crash recovery of the primary begins at that checkpoint, past the
+ * copies.  Both the record and its redo keep the copy's position in
+ * pg_control, as a share's synced blocks are kept, where it keeps pg_rewind
+ * from rewinding a server from this one (which would replay from before the
+ * copy over a page store copied after the change), and any recovery from
+ * beginning before it.  A copy logs the image all the same while a base backup
+ * runs (which replays from before the copy, and may copy the block after it
+ * changes: one begun meanwhile begins at a checkpoint begun after the copy
+ * did, which makes XLogInsert() add the image), without full-page writes,
+ * and for a relation whose data skips WAL.  A later copy that finds the
+ * page's position passed clears its bits.  What this costs: a copy where a
+ * claim would do, and blocks held, until the next checkpoint.
+ *
  * Recovery reads map pages that can be from different moments: one written
  * after the point redo has reached, another not yet written.  A version
  * older than the record being replayed gives it the block it was made for.
@@ -281,10 +314,12 @@ int			block_map_replay_entries = 65536;
  * reference-count pages didn't keep the roots' counts, nor its release
  * queue entries whether those counted them; version 15's maps had an entry
  * for every block below the relation's length, which a server reading
- * them could count on (a map now has holes).  This server reads only
- * version 16 and refuses anything older (refuse_version()).
+ * them could count on (a map now has holes); version 16's reference-count
+ * pages didn't say which blocks were copied without an image, nor where.
+ * This server reads only version 17 and refuses anything older
+ * (refuse_version()).
  */
-#define BMAP_VERSION		16
+#define BMAP_VERSION		17
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -348,13 +383,25 @@ typedef struct BmapQueueMeta
 
 /*
  * A reference-count page's blocks: a count each, a uint32, then a roots'
- * count each, another uint32 (see "The roots' counts").  A roots' count
- * is as wide as a count, so that the roots of a long version history
- * (one for each commit, every one of them pointing to the same pages of a
- * table that doesn't change) never take it to its limit.
+ * count each, another uint32 (see "The roots' counts"), then a copied
+ * bit each (see "Copies without an image").  A roots' count is as wide as
+ * a count, so that the roots of a long version history (one for each
+ * commit, every one of them pointing to the same pages of a table that
+ * doesn't change) never take it to its limit.  The page's copy position,
+ * an XLogRecPtr, ends its contents.  The copied bits follow the uint32s,
+ * as bytes, and the position is read and written with memcpy(), so
+ * nothing on the page is misaligned.
  */
 #define BMAP_REFS_PER_PAGE \
-	((uint32) (BMAP_CONTENT_SIZE / (sizeof(uint32) + sizeof(uint32))))
+	((uint32) (((BMAP_CONTENT_SIZE - sizeof(XLogRecPtr)) * 8) / \
+			   ((sizeof(uint32) + sizeof(uint32)) * 8 + 1)))
+#define BMAP_REFS_COPIED_OFFSET \
+	(BMAP_REFS_PER_PAGE * (sizeof(uint32) + sizeof(uint32)))
+#define BMAP_REFS_COPY_LSN_OFFSET	(BMAP_CONTENT_SIZE - sizeof(XLogRecPtr))
+
+StaticAssertDecl(BMAP_REFS_COPIED_OFFSET + (BMAP_REFS_PER_PAGE + 7) / 8 <=
+				 BMAP_REFS_COPY_LSN_OFFSET,
+				 "a reference-count page's copied bits fit before its copy position");
 
 /* the release queue's page and slot of entry 'i' */
 #define BMAP_QUEUE_PER_PAGE \
@@ -492,6 +539,8 @@ StaticAssertDecl(BMAP_DELTA_ROOT_TOPS == BMAP_TREE_TOPS,
 #define PageGetBmapRefs(page)	((uint32 *) PageGetContents(page))
 #define PageGetBmapRootRefs(page) \
 	((uint32 *) (PageGetContents(page) + BMAP_REFS_PER_PAGE * sizeof(uint32)))
+#define PageGetBmapCopiedBits(page) \
+	((uint8 *) (PageGetContents(page) + BMAP_REFS_COPIED_OFFSET))
 
 /*
  * A block's roots' count: how many of the captured roots' pages hold it,
@@ -595,6 +644,12 @@ typedef struct BmapShared
 	int			nswept;
 	BmapSwept	swept[BMAP_SWEPT_MAX];
 
+	/*
+	 * The newest copy made without an image a PASSED record has said is
+	 * passed (see "Copies without an image")
+	 */
+	pg_atomic_uint64 copies_passed;
+
 	/* the remaps ahead of replay (bmap_ahead), and how many there are */
 	LWLock		ahead_lock;
 	pg_atomic_uint32 nahead;
@@ -696,6 +751,7 @@ BmapShmemInit(void *arg)
 	bmap_shared->nswept = 0;
 	LWLockInitialize(&bmap_shared->ahead_lock, LWTRANCHE_BMAP_REPLAY_AHEAD);
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
+	pg_atomic_init_u64(&bmap_shared->copies_passed, 0);
 	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
 	for (int i = 0; i < MaxBackends; i++)
 	{
@@ -1012,6 +1068,9 @@ with_relnumber(RelFileLocator rel, RelFileNumber relnumber)
 static void store_flush_begin(RelFileLocator rel);
 static void store_flush_end(RelFileLocator rel, bool given_up);
 static bool store_written_out(RelFileLocator rel);
+static XLogRecPtr last_checkpoint_redo(void);
+static XLogRecPtr queue_push(RelFileLocator rel, const BmapQueued *items,
+							 uint32 n);
 
 static SMgrRelation
 store_smgr(RelFileLocator rel)
@@ -1247,6 +1306,106 @@ page_ref(Page page, BlockNumber phys)
 	return PageIsNew(page) ? 0 : PageGetBmapRefs(page)[REF_SLOT(phys)];
 }
 
+/* a locked reference-count page's copy position (see "Copies without an image") */
+static XLogRecPtr
+page_copy_lsn(Page page)
+{
+	XLogRecPtr	lsn;
+
+	if (PageIsNew(page))
+		return InvalidXLogRecPtr;
+	memcpy(&lsn, PageGetContents(page) + BMAP_REFS_COPY_LSN_OFFSET, sizeof(lsn));
+	return lsn;
+}
+
+static void
+page_set_copy_lsn(Page page, XLogRecPtr lsn)
+{
+	memcpy(PageGetContents(page) + BMAP_REFS_COPY_LSN_OFFSET, &lsn, sizeof(lsn));
+}
+
+/*
+ * Was 'phys' copied from without an image, at or before its locked
+ * reference-count page's copy position (*copy_lsn)?
+ */
+static bool
+page_copied(Page page, BlockNumber phys, XLogRecPtr *copy_lsn)
+{
+	uint32		slot = REF_SLOT(phys);
+
+	*copy_lsn = page_copy_lsn(page);
+	return !PageIsNew(page) &&
+		(PageGetBmapCopiedBits(page)[slot / 8] & (1 << (slot % 8))) != 0;
+}
+
+/*
+ * May 'phys' not yet change in place, nor be freed?  It was copied from
+ * without an image, perhaps after the redo pointer of the checkpoint last
+ * completed ('horizon'), so that a recovery from there would copy it
+ * again, and needs it as it is.  Otherwise, if it was copied from at all,
+ * *passed says where at the latest (else it is left alone), for
+ * copies_passed() before the change's record.
+ */
+static bool
+page_copy_holds(Page page, BlockNumber phys, XLogRecPtr horizon,
+				XLogRecPtr *passed)
+{
+	XLogRecPtr	copy_lsn;
+
+	if (!page_copied(page, phys, &copy_lsn))
+		return false;
+	if (copy_lsn > horizon)
+		return true;
+	*passed = Max(*passed, copy_lsn);
+	return false;
+}
+
+/*
+ * Before a record that changes in place, or frees, a block copied from
+ * without an image at or before 'passed' (InvalidXLogRecPtr: none), which
+ * the restart point is past: a PASSED record, unless one said a copy no
+ * older is passed already.  Its redo moves the restart point of a server
+ * replaying it (a standby, a recovery from archives) past the copy before
+ * the change, which a recovery from before the copy would read in place of
+ * what the copy saw.  Its WAL precedes the record's, the shared position
+ * set only once it is inserted.
+ *
+ * The same holds of any recovery from before the copy over files copied
+ * after the change: a server pg_rewind made of this one, replaying from
+ * the last checkpoint the two had in common.  So the copy's position is
+ * kept in pg_control (XLogNoteSyncedPages()) before the change, as a
+ * share's synced blocks are, where pg_rewind refuses such a source (and
+ * one that changes such a block while it copies files), and recovery
+ * refuses to begin at or before it.  The checkpoint the copy is past
+ * begins this server's own recovery past it, and a base backup of it
+ * begins past every copy logged without an image (one running makes
+ * copies log their images).  The positions noted only grow, a record and
+ * a note for each newer copy passed: few, as each is the newest copy from
+ * a reference-count page's blocks.
+ */
+static void
+copies_passed(XLogRecPtr passed)
+{
+	xl_bmap_passed xlrec;
+
+	if (XLogRecPtrIsInvalid(passed) ||
+		passed <= pg_atomic_read_u64(&bmap_shared->copies_passed))
+		return;
+	xlrec.horizon = last_checkpoint_redo();
+	xlrec.copied = passed;
+	Assert(passed <= xlrec.horizon);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	(void) XLogInsert(RM_BMAP_ID, XLOG_BMAP_PASSED);
+
+	/*
+	 * (the copy's position is its record's end: a recovery beginning
+	 * there doesn't replay it)
+	 */
+	XLogNoteSyncedPages(passed - 1);
+	pg_atomic_monotonic_advance_u64(&bmap_shared->copies_passed, passed);
+}
+
 /*
  * Add a page to a relation's map fork, returned zeroed and locked
  * exclusively.  The caller holds the map's header exclusively, which
@@ -1453,6 +1612,14 @@ apply_refs_delta(Page page, const xl_bmap_refs_delta *delta)
 
 	if (delta->flags & BMAP_DELTA_INIT)
 		init_page(page, BMAP_PAGE_REFS);
+	if (delta->flags & BMAP_DELTA_COPIED_RESET)
+		memset(PageGetBmapCopiedBits(page), 0, (BMAP_REFS_PER_PAGE + 7) / 8);
+	if (delta->flags & BMAP_DELTA_COPIED)
+	{
+		Assert(delta->nrefs > 0 && ref[0].slot < BMAP_REFS_PER_PAGE);
+		PageGetBmapCopiedBits(page)[ref[0].slot / 8] |=
+			(uint8) (1 << (ref[0].slot % 8));
+	}
 	counts = PageGetBmapRefs(page);
 	for (uint32 i = 0; i < delta->nrefs; i++)
 	{
@@ -2321,6 +2488,28 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 	count = page_ref(BufferGetPage(buf), phys);
 	UnlockReleaseBuffer(buf);
 	return count;
+}
+
+/*
+ * Does a copy made without an image hold 'phys' as it is (page_copy_holds()),
+ * read under a share lock?  For hints: the change itself asks again.
+ */
+static bool
+lookup_copy_holds(RelFileLocator rel, BlockNumber phys)
+{
+	Buffer		buf;
+	bool		holds;
+	XLogRecPtr	passed = InvalidXLogRecPtr;
+
+	if (REF_PAGE(phys) >= refs_nblocks(rel))
+		return false;
+	buf = refs_read(rel, REF_PAGE(phys));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
+	holds = page_copy_holds(BufferGetPage(buf), phys, last_checkpoint_redo(),
+							&passed);
+	UnlockReleaseBuffer(buf);
+	return holds;
 }
 
 /* a block whose count to look up, with where the count goes */
@@ -3697,11 +3886,61 @@ StaticAssertDecl(sizeof(xl_bmap_bits_delta) + BMAP_FREE_BITS_MAX * sizeof(uint32
  * The records aren't one: a crash between them leaves the blocks not yet
  * freed allocated, held by nothing, until a page sweep (bmap_sweep())
  * frees what no map holds.
+ *
+ * A block a copy made without an image may still read (see "Copies without
+ * an image") isn't freed yet: it is pushed onto the release queue instead,
+ * whose entry holds it until a drain finds the copy past the restart point.
+ * Returns how many were (blocks[] is left reordered); a crash before the
+ * push leaves them to a sweep too.
  */
-static void
+static uint32
 free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 {
 	uint32		i = 0;
+	uint32		nheld = 0;
+	BmapQueued *held = NULL;
+
+	/* those a copy holds, first (on pages of counts read one at a time) */
+	{
+		XLogRecPtr	horizon = last_checkpoint_redo();
+		XLogRecPtr	passed = InvalidXLogRecPtr;
+		BlockNumber nrefpages = refs_nblocks(rel);
+		Buffer		buf = InvalidBuffer;
+		uint32		nfree = 0;
+
+		for (uint32 k = 0; k < n; k++)
+		{
+			BlockNumber b = blocks[k];
+
+			if (REF_PAGE(b) >= nrefpages)
+			{
+				blocks[nfree++] = b;
+				continue;
+			}
+			if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != REF_PAGE(b))
+			{
+				if (BufferIsValid(buf))
+					UnlockReleaseBuffer(buf);
+				buf = refs_read(rel, REF_PAGE(b));
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				check_refs_page(BufferGetPage(buf), rel, REF_PAGE(b));
+			}
+			if (page_copy_holds(BufferGetPage(buf), b, horizon, &passed))
+			{
+				if (held == NULL)
+					held = palloc0_array(BmapQueued, n);
+				held[nheld].block = b;
+				held[nheld].level = BMAP_QUEUED_BLOCK;
+				nheld++;
+			}
+			else
+				blocks[nfree++] = b;
+		}
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		n = nfree;
+		copies_passed(passed);
+	}
 
 	while (i < n)
 	{
@@ -3807,6 +4046,15 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 	/* (what a scan found in them no longer holds) */
 	for (i = 0; i < n; i++)
 		store_written(rel, blocks[i], 1);
+
+	if (nheld > 0)
+	{
+		(void) queue_push(rel, held, nheld);
+		elog(DEBUG1, "%u blocks of the page store of database %u, copied from without an image since the restart point, are queued, not freed",
+			 nheld, rel.dbOid);
+		pfree(held);
+	}
+	return nheld;
 }
 
 /* ----------------------------------------------------------------
@@ -4284,10 +4532,13 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 	SlotEntry	items[BMAP_PIECE];
 	BlockNumber phys[BMAP_PIECE];
 	BlockNumber tofree[BMAP_PIECE];
+	bool		holds[BMAP_PIECE] = {0};
 	uint32		nitems = 0;
 	uint32		nfree = 0;
 	BlockNumber nrefpages;
 	uint32		i = 0;
+	XLogRecPtr	horizon = last_checkpoint_redo();
+	XLogRecPtr	passed = InvalidXLogRecPtr;
 
 	Assert(to - from <= BMAP_PIECE);
 	mapbuf = mp_read(reln, mp);
@@ -4343,6 +4594,19 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 		else
 			/* blocks past the counts' pages count zero: all claimed */
 			covered = nitems - i;
+		/*
+		 * A block a copy made without an image may still read can't be
+		 * claimed, to be written over in place: it is let go of instead
+		 * (freed, which queues it until the copy is past the restart
+		 * point).
+		 */
+		for (uint32 k = i; k < i + covered && end > i && !release; k++)
+		{
+			Page		page = BufferGetPage(rp.buf[refs_find(&rp, phys[k])]);
+
+			holds[k] = page_copy_holds(page, phys[k], horizon, &passed);
+		}
+		copies_passed(passed);
 		map_lock(mapbuf, false);
 
 		for (uint32 k = i; k < i + covered; k++)
@@ -4350,7 +4614,7 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 			uint32		c = end > i ? refs_get(&rp, phys[k]) : 0;
 
 			ent[ndelta->nentries].slot = items[k].slot;
-			if (c == 0 && !release)
+			if (c == 0 && !release && !holds[k])
 			{
 				/* no other map holds it: it is ours */
 				ent[ndelta->nentries].block = items[k].block;
@@ -6117,9 +6381,14 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	}
 	if (entry.epoch >= epoch)
 		return false;
-	/* (a tree's block is shared too if its leaf is, through any node) */
+	/*
+	 * (a tree's block is shared too if its leaf is, through any node; and
+	 * one a copy made without an image may still read is copied as if
+	 * shared, so no hint is set on it either, which the copy would take)
+	 */
 	shared = lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0 ||
-		!tree_path_own(reln, blkno, epoch, false);
+		!tree_path_own(reln, blkno, epoch, false) ||
+		lookup_copy_holds(reln->smgr_rlocator.locator, entry.block);
 
 	/*
 	 * Its next change prepares it all the same, born before the map's
@@ -6172,13 +6441,16 @@ bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
  * Prepare logical block 'blkno', locked exclusively in 'buffer', for a
  * change.  An entry born in the map's epoch is the map's own.  An older one
  * may be shared: if no other map holds its block any more, it is claimed
- * (born again in this epoch); otherwise the page is copied to a new block,
- * which the map takes, and the old block loses a reference.  The copy's
- * record carries the page's image (without its hole, when that is all
- * zeroes), so redo makes the new block without reading it; a page of
- * zeroes, which its caller is about to initialize, needs no image.  Before
- * the copy, contents only in the buffer are written to the old block,
- * which other maps still read.
+ * (born again in this epoch), unless a copy made without an image may
+ * still read it; otherwise the page is copied to a new block, which the
+ * map takes, and the old block loses a reference (or, held by nothing
+ * now, is freed, which queues it).  The copy's record carries the page's
+ * image (without its hole, when that is all zeroes), so redo makes the new
+ * block without reading it, unless a full-page write would leave the image
+ * out (see "Copies without an image"); a page of zeroes, which its caller
+ * is about to initialize, needs no image.  Before the copy, contents only
+ * in the buffer are written to the old block, which other maps still
+ * read.
  *
  * A tree's entry is changed on a leaf that is the relation's own: a leaf
  * another map shares, or one under a shared node, has its path copied first
@@ -6216,6 +6488,11 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	XLogRecPtr	lsn;
 	MapPage		mp;
 	bool		hole = false;
+	bool		held = false;
+	bool		let_go = false;
+	XLogRecPtr	horizon;
+	XLogRecPtr	copy_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	passed = InvalidXLogRecPtr;
 
 	if (forknum != MAIN_FORKNUM)
 		return;
@@ -6279,6 +6556,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 	}
 	old_block = hole ? InvalidBlockNumber : entry.block;
+	horizon = last_checkpoint_redo();
 
 	if (!hole && REF_PAGE(old_block) < refs_nblocks(rel))
 	{
@@ -6286,6 +6564,15 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		LockBuffer(refbuf, BUFFER_LOCK_EXCLUSIVE);
 		check_refs_page(BufferGetPage(refbuf), rel, REF_PAGE(old_block));
 		count = page_ref(BufferGetPage(refbuf), old_block);
+		copy_lsn = page_copy_lsn(BufferGetPage(refbuf));
+
+		/*
+		 * A block a copy made without an image may still read isn't
+		 * claimed: the page is copied instead, and the block let go of
+		 * (see "Copies without an image").
+		 */
+		held = page_copy_holds(BufferGetPage(refbuf), old_block, horizon,
+							   &passed);
 	}
 
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + sizeof(xl_bmap_entry_delta));
@@ -6295,12 +6582,13 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	ent->slot = MP_SLOT(&mp, blkno);
 	ent->epoch = epoch;
 
-	if (count == 0 && !hole)
+	if (count == 0 && !hole && !held)
 	{
 		xl_bmap_unref xlrec;
 		RefsPages	norefs;
 
 		/* no other map holds it: claim it */
+		copies_passed(passed);
 		ent->block = old_block;
 		mapbuf = mp_read(reln, &mp);
 		map_lock(mapbuf, false);
@@ -6324,6 +6612,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		Page		page = BufferGetPage(buffer);
 		bool		zeroed = pg_memory_is_all_zeros(page, BLCKSZ);
 		bool		reused;
+		bool		copied = false;
+		bool		reset = false;
 
 		/*
 		 * This record restores the page before the caller's change.  If
@@ -6338,6 +6628,44 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		 * prepared.)
 		 */
 		Assert(!hole || !BufferIsDirty(buffer));
+
+		/*
+		 * The page is copied without its image when one is needed no more
+		 * than a full-page write would log one: the page's image or a
+		 * change since the redo pointer is in the WAL, which replay rebuilds
+		 * the page from (or skips, the map on disk newer, the old block
+		 * holding the page as the copy saw it).  Not if the old block is
+		 * written now (its write isn't logged), nor while a base backup
+		 * runs (which may copy the old block after it changes, and replays
+		 * from before the copy), nor for a relation whose data skips WAL,
+		 * nor without full-page writes (which log no image to make this
+		 * one redundant).  A backup begun meanwhile begins at a checkpoint
+		 * begun after this, which makes XLogInsert() add the image after
+		 * all.
+		 */
+		if (!hole && !zeroed && BufferIsValid(refbuf) &&
+			!BufferIsDirty(buffer) && !RelFileLocatorSkippingWAL(rel))
+		{
+			XLogRecPtr	redo;
+			bool		page_writes;
+			int			backups;
+			XLogRecPtr	backup_start;
+
+			GetFullPageWriteInfo(&redo, &page_writes);
+			GetBackupState(&backups, &backup_start);
+			copied = page_writes && backups == 0 &&
+				!XLogCheckBufferNeedsBackup(buffer);
+		}
+
+		/*
+		 * The copied bits told of copies all past the restart point: cleared
+		 * (once standbys know: copies_passed())
+		 */
+		if (copied && !XLogRecPtrIsInvalid(copy_lsn) && copy_lsn <= horizon)
+		{
+			reset = true;
+			copies_passed(copy_lsn);
+		}
 		if (!hole && BufferIsDirty(buffer))
 			FlushOneBuffer(buffer);
 
@@ -6365,7 +6693,17 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			rdelta->nrefs = 1;
 			ref = (xl_bmap_ref_delta *) (rdelta + 1);
 			ref->slot = REF_SLOT(old_block);
-			ref->count = count - 1;
+
+			/*
+			 * (a block a copy holds, with no other holder: let go of, which
+			 * queues it, below)
+			 */
+			ref->count = count > 0 ? count - 1 : 0;
+			let_go = count == 0;
+			if (copied)
+				rdelta->flags |= BMAP_DELTA_COPIED;
+			if (reset)
+				rdelta->flags |= BMAP_DELTA_COPIED_RESET;
 		}
 
 		mapbuf = mp_read(reln, &mp);
@@ -6379,6 +6717,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		xlrec.old_hw = alloc.old_hw;
 		xlrec.new_hw = alloc.new_hw;
 		xlrec.flags = zeroed ? BMAP_REMAP_ZERO : 0;
+		if (copied)
+			xlrec.flags |= BMAP_REMAP_COPIED;
 
 		XLogEnsureRecordSpace(5 + BMAP_ALLOC_MAX_PAGES, 0);
 		ndelta->since = GetXLogInsertRecPtr();
@@ -6403,13 +6743,16 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		if (zeroed)
 			XLogRegisterBuffer(id, buffer, REGBUF_WILL_INIT);
 		else
-			XLogRegisterBuffer(id, buffer, REGBUF_FORCE_IMAGE |
+			XLogRegisterBuffer(id, buffer, (copied ? 0 : REGBUF_FORCE_IMAGE) |
 							   (page_hole_is_zero(page) ? REGBUF_STANDARD : 0));
 		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_REMAP);
 		PageSetLSN(BufferGetPage(mapbuf), lsn);
 		alloc_set_lsn(&alloc, lsn);
 		if (rdelta)
 			PageSetLSN(BufferGetPage(refbuf), lsn);
+		/* (set once inserted, as redo sets it: the image is taken before) */
+		if (copied)
+			page_set_copy_lsn(BufferGetPage(refbuf), lsn);
 		/* a page of zeroes stays one: a new page has no LSN */
 		if (!zeroed)
 			PageSetLSN(page, lsn);
@@ -6424,6 +6767,13 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	ReleaseBuffer(mapbuf);
 	if (BufferIsValid(refbuf))
 		UnlockReleaseBuffer(refbuf);
+
+	/*
+	 * The old block, held by nothing now, is freed, which queues it while a
+	 * copy may read it (a crash before leaves it to a sweep).
+	 */
+	if (let_go)
+		(void) free_blocks(rel, &old_block, 1);
 	UnlockReleaseBuffer(headerbuf);
 	pfree(ndelta);
 }
@@ -7401,6 +7751,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	xl_bmap_release xlrec;
 	XLogRecPtr	lsn;
 	int			id;
+	XLogRecPtr	horizon;
+	XLogRecPtr	passed = InvalidXLogRecPtr;
 
 	metabuf = queue_lock_meta(rel, &n, &isnew);
 	if (n == 0)
@@ -7408,6 +7760,7 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		UnlockReleaseBuffer(metabuf);
 		return false;
 	}
+	horizon = last_checkpoint_redo();
 
 	/*
 	 * The entries from the top, until one is a node (whose children may
@@ -7469,6 +7822,15 @@ release_step(RelFileLocator rel, BmapRelease *done)
 				ndiscard++;
 				continue;
 			}
+
+			/*
+			 * A block a copy made without an image may still read stays
+			 * held until the copy is past the restart point: the step ends
+			 * before it (asked again below, under the count's lock, for
+			 * the blocks the step frees).
+			 */
+			if (e.level == BMAP_QUEUED_BLOCK && lookup_copy_holds(rel, e.block))
+				break;
 			if (!page_fits(REF_PAGE(e.block), refpages, &nref,
 						   BMAP_RELEASE_REFS_PAGES))
 				break;
@@ -7587,6 +7949,22 @@ release_step(RelFileLocator rel, BmapRelease *done)
 				refs_set(&rp, b, 0);
 			tofree[nfree++] = b;
 			frees = true;
+
+			/*
+			 * (a block copied from since it was looked at above: the step
+			 * is taken again, which ends before it; a node is never copied
+			 * from as a page, its bits a block's before it, long passed)
+			 */
+			if (!is_node && REF_PAGE(b) < nrefpages &&
+				page_copy_holds(BufferGetPage(rp.buf[refs_find(&rp, b)]), b,
+								horizon, &passed))
+			{
+				refs_release(&rp);
+				if (children)
+					pfree(children);
+				UnlockReleaseBuffer(metabuf);
+				return release_step(rel, done);
+			}
 		}
 
 		/*
@@ -7630,6 +8008,12 @@ release_step(RelFileLocator rel, BmapRelease *done)
 				refs_set_root(&rp, b, nv);
 		}
 	}
+
+	/*
+	 * (before the allocator's metapage is locked, which every allocation of
+	 * the database waits for: its note in pg_control is synced)
+	 */
+	copies_passed(passed);
 
 	/* the frees: a bit cleared for each, if set (a block is freed once) */
 	if (nfree > 0)
@@ -11876,8 +12260,9 @@ compact_has_room(RelFileLocator rel, BlockNumber below)
 
 /*
  * May data page 'blkno' of reln, at physical block 'phys', move?  Its entry
- * still names the block, which nothing else holds, on a path the relation
- * owns.  The header is held, at least shared.
+ * still names the block, which nothing else holds (nor a copy made without
+ * an image may still read), on a path the relation owns.  The header is
+ * held, at least shared.
  */
 static bool
 compact_page_movable(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
@@ -11890,6 +12275,7 @@ compact_page_movable(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
 		lookup_entry_at(reln, blkno, entry, mp, NULL) &&
 		entry->block == phys &&
 		lookup_ref(rel, phys) == 0 &&
+		!lookup_copy_holds(rel, phys) &&
 		tree_path_own(reln, blkno, header->epoch, false);
 }
 
@@ -12888,8 +13274,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	INJECTION_POINT("bmap-sweep-freeing", NULL);
 
 	/* (a block nothing holds gets no new holder: freed after the lock) */
-	free_blocks(rel, tofree.blocks, tofree.n);
-	result->freed = tofree.n;
+	result->freed = tofree.n - free_blocks(rel, tofree.blocks, tofree.n);
 
 	pfree(allocated);
 	pfree(holders);
@@ -14514,6 +14899,29 @@ forget_cached_size(RelFileLocator rel)
 }
 
 /*
+ * In redo: make sure no later recovery of this server begins before 'need'
+ * (its restart point, a standby's last restartpoint or a backup's start,
+ * at or past it), asking for a restartpoint and waiting for it if not.
+ * 'what' names the record's kind for the log.  False if it is still
+ * before: a restartpoint wasn't made (none can be before the replay is
+ * consistent, nor in a server running alone).
+ */
+static bool
+redo_restart_point_at(XLogRecPtr need, const char *what)
+{
+	if (last_checkpoint_redo() >= need)
+		return true;
+	if (!IsUnderPostmaster)
+		return false;
+	elog(DEBUG1, "redo of %s asks for a restartpoint: its restart point %X/%08X is before %X/%08X",
+		 what, LSN_FORMAT_ARGS(last_checkpoint_redo()), LSN_FORMAT_ARGS(need));
+	/* (a test takes the restartpoint for one that couldn't be made) */
+	if (!IS_INJECTION_POINT_ATTACHED("bmap-redo-no-restartpoint"))
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_WAIT);
+	return last_checkpoint_redo() >= need;
+}
+
+/*
  * In redo of a share that synced its source's own blocks instead of logging
  * them (BMAP_SHARE_SYNCED; see bmapshare()), once the source's pages are
  * written out: the page store is synced, so that this server holds the
@@ -14543,23 +14951,16 @@ redo_share_synced(const xl_bmap_share *xlrec, XLogRecPtr lsn)
 {
 	mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
 	XLogNoteSyncedReplay();
-	if (last_checkpoint_redo() <= xlrec->synced_since && IsUnderPostmaster)
-	{
-		elog(DEBUG1, "redo of a share of %s asks for a restartpoint: its restart point %X/%08X is not past %X/%08X",
-			 relpathperm(xlrec->src, MAIN_FORKNUM).str,
-			 LSN_FORMAT_ARGS(last_checkpoint_redo()),
-			 LSN_FORMAT_ARGS(xlrec->synced_since));
-		/* (a test takes the restartpoint for one that couldn't be made) */
-		if (!IS_INJECTION_POINT_ATTACHED("bmap-share-no-restartpoint"))
-			RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_WAIT);
-		if (last_checkpoint_redo() <= xlrec->synced_since)
-			ereport(WARNING,
-					(errmsg("restart point of recovery %X/%08X is not past the blocks a share of \"%s\" synced",
-							LSN_FORMAT_ARGS(last_checkpoint_redo()),
-							relpathperm(xlrec->src, MAIN_FORKNUM).str),
-					 errdetail("Until a restartpoint is made past %X/%08X, an online backup of this server is refused and a recovery from its restart point fails.",
-							   LSN_FORMAT_ARGS(xlrec->synced_since))));
-	}
+	if (!redo_restart_point_at(xlrec->synced_since + 1,
+							   psprintf("a share of %s",
+										relpathperm(xlrec->src, MAIN_FORKNUM).str)) &&
+		IsUnderPostmaster)
+		ereport(WARNING,
+				(errmsg("restart point of recovery %X/%08X is not past the blocks a share of \"%s\" synced",
+						LSN_FORMAT_ARGS(last_checkpoint_redo()),
+						relpathperm(xlrec->src, MAIN_FORKNUM).str),
+				 errdetail("Until a restartpoint is made past %X/%08X, an online backup of this server is refused and a recovery from its restart point fails.",
+						   LSN_FORMAT_ARGS(xlrec->synced_since))));
 
 	/*
 	 * Said in pg_control once the restartpoint is made, if it could be: a
@@ -14574,6 +14975,184 @@ redo_share_synced(const xl_bmap_share *xlrec, XLogRecPtr lsn)
 		 relpathperm(xlrec->src, MAIN_FORKNUM).str,
 		 LSN_FORMAT_ARGS(last_checkpoint_redo()),
 		 LSN_FORMAT_ARGS(xlrec->synced_since));
+}
+
+/*
+ * The newest copy made without an image (BMAP_REMAP_COPIED) this replay
+ * replayed (from its buffer or its old block: a recovery replaying it
+ * again may take the other), before which the restart point may still be: what a PASSED record's redo moves the restart
+ * point to (redo_copies_passed()).  The startup process's alone, which
+ * replays every such copy again after a restart, from the restart point.
+ */
+static XLogRecPtr redo_copied_newest = InvalidXLogRecPtr;
+
+/*
+ * In redo of a copy of a shared page logged without the page's image
+ * (XLOG_BMAP_REMAP's block 'block_id', the page the copy is of): the page
+ * locked exclusively in its buffer as replay has it, taken before the
+ * leaf names the new block, or InvalidBuffer if the page was given other
+ * storage after the record (smgrreplacedafter()), which needs nothing
+ * from it.  The caller sets its LSN and dirties it, so that it is written
+ * to the new block.
+ *
+ * The primary logs no image when the page has changed since the redo
+ * pointer (XLogInsert()'s rule for a full-page write), so that a page's
+ * image or init since then is in the WAL, from which replay rebuilds the
+ * page in its buffer.  A buffer that holds the page is that page, if the
+ * map as replay reads it gave the block its storage no later than the
+ * page's last change: replay then skipped none of the page's records since
+ * (it skips those from before the map's position, but restores images).
+ * Otherwise (no buffer: evicted, or never read; or one replay may have
+ * skipped records of, its map on disk newer than they are), the page is
+ * read from the old block itself, never through the map, which may name
+ * the new block already (written out after this record before a crash).
+ * Replay writes no page there meanwhile: an evicted page goes through the
+ * map, which names the old block only while replay applies the page's
+ * records, so that it writes there the page as replay rebuilt it.  The
+ * old block holds the page as the copy saw it: shared, it hasn't changed
+ * in place since it was made durable as it came to be shared (synced, or
+ * written by the redo of its image), and no hint is set on it; and it
+ * isn't changed in place nor freed until the restart point of every
+ * server that may replay this record is past it (see "Copies without an
+ * image").
+ */
+static Buffer
+redo_remap_page(XLogReaderState *record, uint8 block_id,
+				const xl_bmap_remap *xlrec)
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	SMgrRelation reln;
+	PrefetchBufferResult r;
+	Buffer		buf;
+	PGIOAlignedBlock copy;
+	void	   *pages[1] = {copy.data};
+
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	redo_copied_newest = record->EndRecPtr;
+	if (smgrreplacedafter(reln, forknum, blkno, record->ReadRecPtr))
+		return InvalidBuffer;
+
+	r = PrefetchSharedBuffer(reln, forknum, blkno);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(rlocator, forknum, blkno, r.recent_buffer))
+	{
+		BmapEntry	entry;
+		MapPage		mp;
+		XLogRecPtr	since = InvalidXLogRecPtr;
+
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (lookup_entry_at(reln, blkno, &entry, &mp, NULL))
+			since = Max(entry.since,
+						remap_ahead(with_relnumber(rlocator, BMAP_STORE_RELNUMBER),
+									mp.blk, MP_SLOT(&mp, blkno)));
+		if (!PageIsNew(BufferGetPage(r.recent_buffer)) &&
+			since <= PageGetLSN(BufferGetPage(r.recent_buffer)))
+			return r.recent_buffer;
+
+		/*
+		 * The map as replay reads it gave the block its storage after the
+		 * page's last change replay made, so that it skipped the records
+		 * since (those of its old block, the map on disk naming the new
+		 * one).  But not an image, which it restores all the same: the
+		 * buffer may hold one of those, older than the page the copy saw.
+		 */
+		UnlockReleaseBuffer(r.recent_buffer);
+	}
+
+	elog(DEBUG1, "redo of a copy of block %u of %s without an image reads the page from block %u",
+		 blkno, relpathperm(rlocator, MAIN_FORKNUM).str, xlrec->old_block);
+	mdreadv(store_smgr(rlocator), MAIN_FORKNUM, xlrec->old_block, pages, 1);
+	if (!PageIsVerified(copy.data, blkno, PIV_LOG_WARNING, NULL) ||
+		PageIsNew(copy.data))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\", copied to block %u for its block %u, is not a page of it",
+						xlrec->old_block, relpathperm(rlocator, MAIN_FORKNUM).str,
+						xlrec->new_block, blkno)));
+	buf = XLogReadBufferExtended(rlocator, forknum, blkno, RBM_ZERO_AND_LOCK,
+								 InvalidBuffer);
+	memcpy(BufferGetPage(buf), copy.data, BLCKSZ);
+	return buf;
+}
+
+/*
+ * In redo of a copy without an image: the old block's reference-count page,
+ * registered as 'block_id', gets the copy's position, the record's end, as
+ * the primary set it once the record was inserted (an image of the page
+ * leaves it out, and the delta can't carry it).  A page newer than the
+ * record (written out before a crash) has a position no older already.
+ */
+static void
+redo_copy_lsn(XLogReaderState *record, uint8 block_id)
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	Buffer		buf;
+
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	buf = XLogReadBufferExtended(rlocator, forknum, blkno, RBM_NORMAL,
+								 InvalidBuffer);
+	if (!BufferIsValid(buf))
+		return;
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (PageGetLSN(BufferGetPage(buf)) == record->EndRecPtr)
+	{
+		page_set_copy_lsn(BufferGetPage(buf), record->EndRecPtr);
+		MarkBufferDirty(buf);
+	}
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * In redo of a PASSED record: blocks copied from without an image up to
+ * 'horizon' may now change in place or be freed, which a recovery from
+ * before such a copy would then read in place of what the copy saw.  So
+ * this server's restart point must be past every such copy this replay
+ * made (a standby's restartpoints lag the primary's checkpoints; a
+ * recovery from archives begins at its backup's start): a restartpoint is
+ * asked for and waited for if it isn't.  It begins at the last checkpoint
+ * record replayed, whose redo pointer is 'horizon' or later, the primary
+ * having logged the record once that checkpoint completed.  Crash
+ * recovery begins there or later, and asks for nothing.  An online backup
+ * taken on this standby meanwhile, which begins at an earlier restartpoint
+ * and copies the blocks as they may change from here on, fails as it stops
+ * (XLogNoteSyncedReplay()).
+ *
+ * And the newest copy passed ('copied') is kept in pg_control, as the
+ * primary keeps it, once the restartpoint is made, if it could be (see
+ * redo_share_synced()): it keeps any recovery of this server from
+ * beginning before the copy, and pg_rewind from rewinding a server from
+ * this one, whether this replay replayed the copy or an earlier one did.
+ */
+static void
+redo_copies_passed(const xl_bmap_passed *xlrec)
+{
+	XLogRecPtr	need;
+
+	if (XLogRecPtrIsInvalid(redo_copied_newest))
+	{
+		XLogNoteSyncedPages(xlrec->copied - 1);
+		return;
+	}
+	need = Min(redo_copied_newest, xlrec->horizon);
+	if (last_checkpoint_redo() < need)
+	{
+		XLogNoteSyncedReplay();
+		if (!redo_restart_point_at(need, "copies without an image") &&
+			IsUnderPostmaster)
+			ereport(WARNING,
+					(errmsg("restart point of recovery %X/%08X is not past copies made without an image at %X/%08X",
+							LSN_FORMAT_ARGS(last_checkpoint_redo()),
+							LSN_FORMAT_ARGS(need)),
+					 errdetail("A crash before the next restartpoint could lose rows of the pages copied.")));
+	}
+	XLogNoteSyncedPages(xlrec->copied - 1);
+	if (redo_copied_newest <= xlrec->horizon)
+		redo_copied_newest = InvalidXLogRecPtr;
 }
 
 void
@@ -14763,15 +15342,23 @@ bmap_redo(XLogReaderState *record)
 				uint8		last = XLogRecMaxBlockId(record);
 
 				bool		zeroed = (xlrec->flags & BMAP_REMAP_ZERO) != 0;
+				bool		copied = (xlrec->flags & BMAP_REMAP_COPIED) != 0 &&
+					!XLogRecBlockImageApply(record, last);
+				Buffer		page = InvalidBuffer;
 
 				/*
 				 * The page store reaches the new block; the page itself is
-				 * the last block, an image, so redo never reads the block,
-				 * or zeroes, which redo writes there.  The old block keeps
-				 * what it had: shared blocks were made durable when shared
-				 * (synced by the share, or logged as images that redo
-				 * writes and a checkpoint after syncs).
+				 * the last block, an image, or zeroes, which redo writes
+				 * there, or the page as replay has it or the old block
+				 * holds it, which redo takes before the leaf names the new
+				 * block (redo_remap_page()); so redo never reads the new
+				 * block.  The old block keeps what it had: shared blocks
+				 * were made durable when shared (synced by the share, or
+				 * logged as images that redo writes and a checkpoint after
+				 * syncs).
 				 */
+				if (copied)
+					page = redo_remap_page(record, last, xlrec);
 				if (!zeroed && xlrec->new_block < xlrec->old_hw)
 					drop_node_buffer(xlrec->locator, xlrec->new_block);
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
@@ -14802,11 +15389,29 @@ bmap_redo(XLogReaderState *record)
 					}
 					UnlockReleaseBuffer(buf);
 				}
+				else if (copied)
+				{
+					/* written to the new block from here on */
+					if (BufferIsValid(page))
+					{
+						if (PageGetLSN(BufferGetPage(page)) < record->EndRecPtr)
+						{
+							PageSetLSN(BufferGetPage(page), record->EndRecPtr);
+							MarkBufferDirty(page);
+						}
+						UnlockReleaseBuffer(page);
+					}
+				}
 				else
 					redo_block(record, last);
+				if (xlrec->flags & BMAP_REMAP_COPIED)
+					redo_copy_lsn(record, last - 1);
 				XLogReplaceBlock(xlrec->locator, MAIN_FORKNUM, xlrec->blkno);
 				break;
 			}
+		case XLOG_BMAP_PASSED:
+			redo_copies_passed((xl_bmap_passed *) XLogRecGetData(record));
+			break;
 		case XLOG_BMAP_PRESERVE:
 			{
 				BlockNumber phys;
@@ -14940,4 +15545,8 @@ bmap_mask(char *pagedata, BlockNumber blkno)
 	 */
 	if (map_page_is(pagedata, BMAP_PAGE_ROOT))
 		PageGetBmapRoot((Page) pagedata)->map_id = 0;
+
+	/* so is a reference-count page's copy position */
+	if (map_page_is(pagedata, BMAP_PAGE_REFS))
+		page_set_copy_lsn((Page) pagedata, InvalidXLogRecPtr);
 }

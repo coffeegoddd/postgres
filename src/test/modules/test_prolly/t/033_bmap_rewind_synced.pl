@@ -10,7 +10,9 @@
 # pg_rewind refuses such a source, leaving the target as it was, and the
 # target can be made a standby again from a base backup.  A share of
 # blocks the source got before that checkpoint leaves the rewind as it
-# was: the replay begins after them.
+# was: the replay begins after them.  Copies of shared pages made without
+# their images, whose old blocks then change, are refused as such shares
+# are.
 
 use strict;
 use warnings FATAL => 'all';
@@ -40,6 +42,7 @@ checkpoint_timeout = 1h
 	$primary->start;
 	sql($primary, q{
 		CREATE EXTENSION test_prolly;
+		CREATE EXTENSION pg_walinspect;
 		CREATE TABLE t (a int, b text);
 		INSERT INTO t SELECT g, 'before ' || g FROM generate_series(1, 2000) g;
 		CHECKPOINT;
@@ -130,6 +133,34 @@ $standby->wait_for_replay_catchup($primary);
 is(sql($primary, $rows_query), $t_rows, 'the rewound server reads t');
 is(sql($primary, qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'and the copy');
+$primary->stop;
+$standby->stop;
+
+# Copies made without an image on the source after the last common
+# checkpoint, of pages t had before it, whose old blocks are then changed
+# in place: the rewound server's replay of the copies would read the old
+# blocks as copied from the source, changed.  pg_rewind refuses the source.
+($primary, $standby, $t) = failover('rewind_copied');
+sql($standby, q{CHECKPOINT; DELETE FROM t WHERE a % 50 = 0;});
+$copy = sql($standby, qq{SELECT test_bmap_share($t)});
+my $start = sql($standby, q{SELECT pg_current_wal_insert_lsn()});
+sql($standby, q{DELETE FROM t WHERE a % 50 = 1});
+is(sql($standby, qq{
+	SELECT count(*) > 0 AND count(*) FILTER (WHERE block_fpi_length > 0) = 0
+	FROM pg_get_wal_block_info('$start', pg_current_wal_insert_lsn(), false)
+	WHERE resource_manager = 'BlockMap' AND record_type = 'REMAP'
+	  AND relfilenode = $t AND relforknumber = 0}),
+	't', 'the source copies t\'s pages without their images');
+my $pages = sql($standby, qq{SELECT count(*) FROM test_bmap_map($copy)});
+sql($standby, qq{CHECKPOINT;
+	SELECT test_bmap_init_block($copy, b) FROM generate_series(0, $pages - 1) b});
+($ret, $stderr) = rewind($primary, $standby);
+ok(!$ret, 'pg_rewind refuses a source that changed blocks copied from without an image after the replay would begin');
+like($stderr, qr/source server synced pages without logging them/,
+	'saying why');
+$primary->start;
+is(sql($primary, q{SELECT count(*) FROM t WHERE a = -1}), '1',
+	'the target, untouched, starts with its own rows');
 $primary->stop;
 $standby->stop;
 

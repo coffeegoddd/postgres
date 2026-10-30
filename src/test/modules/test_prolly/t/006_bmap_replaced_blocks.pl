@@ -19,9 +19,14 @@ use Test::More;
 # extended by a block, takes it.)
 
 # $s_page: the logical block of s that gets r's old block (r's is 0).
+# With $fpw, full-page writes are on: r's change after the checkpoint logs
+# r's page's image, so the copy that lets r's block go logs none, and its
+# redo copies the page from r's old block.  That block isn't reused by s,
+# then, before a checkpoint: a recovery replaying the copy reads it.
 sub scenario
 {
-	my ($name, $s_page) = @_;
+	my ($name, $s_page, $fpw) = @_;
+	my $fpw_conf = $fpw ? 'on' : 'off';
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init;
 	$node->append_conf('postgresql.conf', qq{
@@ -29,7 +34,7 @@ debug_block_mapped_heap = on
 autovacuum = off
 checkpoint_timeout = 1h
 bgwriter_lru_maxpages = 0
-full_page_writes = off
+full_page_writes = $fpw_conf
 });
 	$node->start;
 	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
@@ -38,6 +43,7 @@ full_page_writes = off
 	$sql->(q{
 		CREATE EXTENSION test_prolly;
 		CREATE EXTENSION pg_buffercache;
+		CREATE EXTENSION pg_walinspect;
 		CREATE SCHEMA cow;
 		CREATE TABLE cow.fill (a int8);
 		INSERT INTO cow.fill VALUES (1);
@@ -79,6 +85,7 @@ full_page_writes = off
 
 	# r lets its block go: shared with a copy, r is emptied, truncated and
 	# grown again.  The copy, dropped, frees it.
+	my $before_copy = $sql->(q{SELECT pg_current_wal_insert_lsn()});
 	my $rcopy = $sql->(qq{SELECT test_bmap_share($r)});
 	$sql->(q{DELETE FROM cow.r});
 	$sql->(q{VACUUM cow.r});
@@ -102,8 +109,22 @@ full_page_writes = off
 	$sql->(qq{SELECT test_bmap_unlink($rcopy)});
 	$sql->(qq{SELECT test_bmap_extend($fill, 1)});
 	$sql->(qq{INSERT INTO cow.s VALUES ($first + 1, 'y')});
-	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = $s_page}), $r_block,
-		"$name: s's page $s_page has r's old block");
+	if ($fpw)
+	{
+		isnt($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = $s_page}),
+			$r_block,
+			"$name: s's page $s_page doesn't get r's old block, which r's copy without an image may read");
+		is($sql->(qq{
+			SELECT count(*) FROM pg_get_wal_records_info('$before_copy', pg_current_wal_insert_lsn())
+			WHERE resource_manager = 'BlockMap' AND record_type = 'REMAP'
+			  AND description LIKE 'rel %/%/$r; blk 0; block $r_block %(copied)%'}),
+			'1', "$name: r's page was copied from its old block without an image");
+	}
+	else
+	{
+		is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = $s_page}),
+			$r_block, "$name: s's page $s_page has r's old block");
+	}
 
 	# s's map page reaches disk, r's doesn't; replay has few buffers.
 	$sql->(q{SELECT pg_buffercache_evict_relation('cow.s')});
@@ -125,6 +146,11 @@ scenario('other_block', 1);
 # r's replay finds a page of the same logical block: had s's replay written
 # its page from before it got the block there, r's records would apply to it.
 scenario('same_block', 0);
+
+# The same with full-page writes: r's copy logs no image of r's page, whose
+# redo reads r's old block, which s then doesn't take.
+scenario('other_block_fpw', 1, 1);
+scenario('same_block_fpw', 0, 1);
 
 # A shared page copied before it changes, to a block r had: s's records
 # from before the copy, replayed through s's newer map page, would find r's
