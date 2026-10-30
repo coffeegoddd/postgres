@@ -398,6 +398,12 @@ typedef union WALInsertLockPadded
 static SessionBackupState sessionBackupState = SESSION_BACKUP_NONE;
 
 /*
+ * The synced replays (XLogNoteSyncedReplay()) counted as this session's
+ * online backup began, which a backup on a standby compares as it stops.
+ */
+static uint64 backupSyncedReplays = 0;
+
+/*
  * Shared state data for WAL insertion.
  */
 typedef struct XLogCtlInsert
@@ -555,6 +561,13 @@ typedef struct XLogCtlData
 	 * XLOG_FPW_CHANGE record that instructs full_page_writes is disabled.
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
+
+	/*
+	 * syncedReplays counts the replayed records whose redo relies on pages
+	 * the primary wrote and synced instead of logging them
+	 * (XLogNoteSyncedReplay()).
+	 */
+	uint64		syncedReplays;
 
 	/* current data checksum state of this node */
 	uint32		data_checksum_version;
@@ -7264,6 +7277,43 @@ GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 }
 
 /*
+ * GetBackupState -- the online backups running, and where the latest one
+ * begun on this server starts
+ *
+ * A caller that writes pages out and syncs them instead of logging them
+ * asks before and after: a backup running before, or begun since (its
+ * start moved: a backup copies files only once its start is set), may
+ * have copied a page before it was written.  On a standby, the start
+ * isn't set by its backups, which only the running count tells of.
+ */
+void
+GetBackupState(int *running, XLogRecPtr *last_start)
+{
+	WALInsertLockAcquire();
+	*running = XLogCtl->Insert.runningBackups;
+	*last_start = XLogCtl->Insert.lastBackupStart;
+	WALInsertLockRelease();
+}
+
+/*
+ * XLogNoteSyncedReplay -- a record being replayed relies on pages the
+ * primary wrote and synced instead of logging them
+ *
+ * A backup taken on this standby while the record is replayed may have
+ * copied such a page before its replay wrote it, and no WAL record makes
+ * up for it: so an online backup begun before fails as it stops, as one
+ * fails when WAL without full-page writes was replayed.  The replay
+ * writes and syncs the pages before it calls this.
+ */
+void
+XLogNoteSyncedReplay(void)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->syncedReplays++;
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+/*
  * GetInsertRecPtr -- Returns the current insert position.
  *
  * NOTE: The value *actually* returned is the position of the last full
@@ -9993,6 +10043,10 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 	Assert(state != NULL);
 	backup_started_in_recovery = RecoveryInProgress();
 
+	SpinLockAcquire(&XLogCtl->info_lck);
+	backupSyncedReplays = XLogCtl->syncedReplays;
+	SpinLockRelease(&XLogCtl->info_lck);
+
 	/*
 	 * During recovery, we don't need to check WAL level. Because, if WAL
 	 * level is not sufficient, it's impossible to get here during recovery.
@@ -10410,6 +10464,7 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	if (backup_stopped_in_recovery)
 	{
 		XLogRecPtr	recptr;
+		uint64		synced_replays;
 
 		/*
 		 * Check to see if all WAL replayed during online backup contain
@@ -10429,6 +10484,18 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 							 "Enable \"full_page_writes\" and run CHECKPOINT on the primary, "
 							 "and then try an online backup again.")));
 
+		SpinLockAcquire(&XLogCtl->info_lck);
+		synced_replays = XLogCtl->syncedReplays;
+		SpinLockRelease(&XLogCtl->info_lck);
+
+		if (synced_replays != backupSyncedReplays)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("WAL replayed during online backup relies on pages the primary "
+							"synced without logging them"),
+					 errhint("This means that the backup being taken on the standby "
+							 "is corrupt and should not be used. "
+							 "Try an online backup again.")));
 
 		LWLockAcquire(ControlFileLock, LW_SHARED);
 		state->stoppoint = ControlFile->minRecoveryPoint;

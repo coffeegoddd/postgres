@@ -292,6 +292,8 @@ extern XLogRecPtr XLogRestorePoint(const char *rpName);
 extern XLogRecPtr XLogAssignLSN(void);
 extern void UpdateFullPageWrites(void);
 extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p);
+extern void GetBackupState(int *running, XLogRecPtr *last_start);
+extern void XLogNoteSyncedReplay(void);
 extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(TimeLineID *insertTLI);
