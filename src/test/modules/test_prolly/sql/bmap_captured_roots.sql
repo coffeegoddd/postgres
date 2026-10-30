@@ -115,6 +115,9 @@ SELECT test_bmap_root_held(:big_root) IS NULL AS let_go;
 SELECT test_bmap_root_release(:big_root) AS released_twice;
 SELECT freed > 0 AS freed FROM test_bmap_release_drain();
 SELECT freed, recounted FROM test_bmap_sweep();
+-- (the roots' counts lost what it held as the queue drained, and are as
+-- the roots counted anew make them)
+SELECT whole, differ FROM test_bmap_root_counts();
 
 -- A capture whose transaction rolls back holds nothing, and its slot is
 -- reclaimed.
@@ -133,6 +136,8 @@ SELECT count(*) FROM (SELECT test_bmap_root_capture(:small) FROM generate_series
 SELECT held = :held_before AS as_many_held, slots = :slots_before AS slots_reused
 FROM test_bmap_roots();
 SELECT freed, recounted FROM test_bmap_sweep();
+SELECT whole, differ, counted = (SELECT held FROM test_bmap_roots()) AS all_counted
+FROM test_bmap_root_counts();
 
 -- A capture after one page changed walks the own nodes of the path copied
 -- for it, a node of every leaf of the relation among them: their counts are
@@ -161,6 +166,7 @@ SELECT :capture_buffers - :base_buffers < :leaves AS counts_read_by_page;
 SELECT test_bmap_root_release(:w1) AS let_go;
 DROP TABLE wide;
 SELECT freed, recounted FROM test_bmap_sweep();
+SELECT whole, differ FROM test_bmap_root_counts();
 
 \c :home
 DROP DATABASE bmap_captured_roots;

@@ -84,7 +84,8 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 				appendStringInfo(buf, "rel %u/%u/%u%s",
 								 xlrec->locator.spcOid, xlrec->locator.dbOid,
 								 xlrec->locator.relNumber,
-								 (xlrec->flags & BMAP_UNREF_MAP) ? "; map" : "");
+								 (xlrec->flags & BMAP_UNREF_MAP) ? "; map" :
+								 (xlrec->flags & BMAP_UNREF_ROOTS) ? "; roots' counts" : "");
 				break;
 			}
 		case XLOG_BMAP_TREE:

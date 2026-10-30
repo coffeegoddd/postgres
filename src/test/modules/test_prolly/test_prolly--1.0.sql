@@ -179,6 +179,11 @@ CREATE FUNCTION test_bmap_roots_naming()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION test_bmap_root_counts(OUT whole bool, OUT counted int8,
+	OUT differ int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_roots_reclaim(settle bool DEFAULT false)
 RETURNS int4
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -44,7 +44,8 @@
  * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
  *						(its epoch raised), block 1 the copy's (its length)
  * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
- *						leaf whose entries change (BMAP_UNREF_MAP)
+ *						leaf whose entries change (BMAP_UNREF_MAP); or a
+ *						sweep's roots' counts (BMAP_UNREF_ROOTS)
  * XLOG_BMAP_REMAP		a shared page is copied before it changes: block 0 is
  *						the leaf, then the allocator's metapage and bitmap
  *						pages, the old block's reference-count page if its
@@ -95,9 +96,12 @@ typedef struct xl_bmap_share
 
 /*
  * UNREF's main data.  With BMAP_UNREF_MAP, block 0 is a map page of
- * 'locator' whose entries change; the reference-count pages follow.
+ * 'locator' whose entries change; the reference-count pages follow.  With
+ * BMAP_UNREF_ROOTS, the pages are a sweep's rewrite of the roots' counts
+ * on them, 'locator' the page store.
  */
 #define BMAP_UNREF_MAP			0x01
+#define BMAP_UNREF_ROOTS		0x02
 
 typedef struct xl_bmap_unref
 {
@@ -258,13 +262,25 @@ typedef struct xl_bmap_release
  * names that transaction (owner_hi and owner_lo, the low 48 bits of its
  * FullTransactionId; zero: none): it holds the block only once that
  * commits, and is let go of with nothing released if it doesn't.
+ *
+ * The roots' counts (the holders the captured roots give each block, kept
+ * beside its reference count) follow the entries too.  One with
+ * BMAP_QUEUED_COUNTED is a pointer those counts include, a counted root's
+ * let go of or a counted node's child: letting go of it takes one off the
+ * block's roots' count as well.  One with BMAP_QUEUED_UNCOUNT holds
+ * nothing: it is a pointer of a node that has left what the roots hold
+ * while it stays, which its roots' count is only to lose.
  */
-#define BMAP_QUEUED_BLOCK		0xFFFF
+#define BMAP_QUEUED_BLOCK		0xFF
+
+#define BMAP_QUEUED_COUNTED		0x01
+#define BMAP_QUEUED_UNCOUNT		0x02
 
 typedef struct BmapQueued
 {
 	BlockNumber block;
-	uint16		level;
+	uint8		level;
+	uint8		flags;
 	uint16		owner_hi;
 	BlockNumber first;
 	uint32		owner_lo;
@@ -392,6 +408,8 @@ typedef struct xl_bmap_root
 								 * identity (0: none) */
 	TransactionId frozenxid;	/* the database's datfrozenxid then */
 	MultiXactId minmxid;		/* the database's datminmxid then */
+	uint32		counted;		/* in the roots' counts (set by a sweep) */
+	uint32		unused;
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */
@@ -407,21 +425,32 @@ typedef struct xl_bmap_roots_delta
  * Block data of the roots' metapage: how many pages of slots follow it,
  * the first that may have a free slot, and the last root's sequence number;
  * and, if 'naming' isn't 0, that page of slots (its block number) marked as
- * one whose slots may name a transaction, or with BMAP_DELTA_NAMING_CLEAR,
- * as one whose slots name none.
+ * one whose slots may name a transaction and may hold a root the roots'
+ * counts don't count, or with BMAP_DELTA_NAMING_CLEAR, as one whose slots
+ * name none, or with BMAP_DELTA_UNCOUNTED_CLEAR, as one whose roots are all
+ * counted.  With BMAP_DELTA_COUNTED, 'counted' says whether the roots'
+ * counts are whole.
  */
 typedef struct xl_bmap_roots_meta_delta
 {
 	uint16		kind;			/* BMAP_DELTA_ROOTS_META */
-	uint16		flags;			/* BMAP_DELTA_INIT, BMAP_DELTA_NAMING_CLEAR */
+	uint16		flags;			/* BMAP_DELTA_INIT, BMAP_DELTA_NAMING_CLEAR,
+								 * BMAP_DELTA_UNCOUNTED_CLEAR,
+								 * BMAP_DELTA_COUNTED */
 	uint32		npages;
 	uint32		hint;
 	uint32		naming;
 	uint64		seq;
+	uint32		counted;
+	uint32		unused;
 } xl_bmap_roots_meta_delta;
 
 /* a roots' metapage delta that unmarks its page of slots 'naming' */
 #define BMAP_DELTA_NAMING_CLEAR	0x02
+/* one that marks page 'naming' as holding only roots counted */
+#define BMAP_DELTA_UNCOUNTED_CLEAR	0x04
+/* one that sets whether the roots' counts are whole */
+#define BMAP_DELTA_COUNTED		0x08
 
 /* Block data of the release queue's metapage: how many entries it has. */
 typedef struct xl_bmap_queue_meta_delta
@@ -454,14 +483,18 @@ typedef struct xl_bmap_bits_delta
 /*
  * Block data of a reference-count page: counts set.  A block's count is the
  * number of maps holding it besides the first, the whole uint32 of its slot
- * on the page.
+ * on the page.  Its roots' count follows the counts on the page: how many
+ * of the pages holding it are the captured roots' (a root's slot, or a node
+ * one reaches), with a flag saying whether it is such a node itself;
+ * 'nroots' of them set, after the counts.
  */
 typedef struct xl_bmap_refs_delta
 {
 	uint16		kind;			/* BMAP_DELTA_REFS */
 	uint16		flags;
 	uint32		nrefs;
-	/* xl_bmap_ref_delta refs[nrefs] follow */
+	uint32		nroots;
+	/* xl_bmap_ref_delta refs[nrefs + nroots] follow */
 } xl_bmap_refs_delta;
 
 typedef struct xl_bmap_ref_delta
