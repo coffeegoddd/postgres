@@ -69,8 +69,11 @@ SELECT test_bmap_unlink(:dropped_copy);
 CHECKPOINT;
 
 SELECT * FROM fw.first_writes('fw.plain', :pages) \gset plain_
+SELECT test_bmap_refs_file_asks() AS asks_before \gset
 SELECT * FROM fw.first_writes('fw.shared', :pages) \gset shared_
+SELECT test_bmap_refs_file_asks() AS asks_shared \gset
 SELECT * FROM fw.first_writes('fw.dropped', :pages) \gset dropped_
+SELECT test_bmap_refs_file_asks() AS asks_dropped \gset
 
 -- Every page was copied, or claimed: its entry born in the map's epoch.
 SELECT count(*) FILTER (WHERE epoch < test_bmap_epoch(:shared)) AS shared_not_copied
@@ -89,6 +92,13 @@ SELECT (:shared_buffers - :plain_buffers) <= 8 * :pages AS shared_buffers_bounde
 -- A claim reads at most six: the header, the path, the block's count, and
 -- the leaf to change it, five, and the paths stamped.  (It was nine.)
 SELECT (:dropped_buffers - :plain_buffers) <= 6 * :pages AS dropped_buffers_bounded;
+
+-- The reference counts' file is asked its length a few times at most, not
+-- a page: whether a block's count page exists is answered from the length
+-- known (it was asked, with the file closed and opened again, at each
+-- page's first change).
+SELECT :asks_shared - :asks_before <= 4 AS copies_ask_the_counts_file_little;
+SELECT :asks_dropped - :asks_shared <= 4 AS claims_ask_the_counts_file_little;
 
 -- One record a page more than md.c's: the copy's, or the claim's, plus a
 -- few records copying the table's paths and its visibility map's page,

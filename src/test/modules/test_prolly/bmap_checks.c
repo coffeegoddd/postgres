@@ -807,6 +807,18 @@ test_bmap_roots_naming(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_bmap_refs_file_asks(): how many times this backend asked the
+ * reference-count files' lengths of the file system.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_refs_file_asks);
+
+Datum
+test_bmap_refs_file_asks(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) bmap_refs_file_asks());
+}
+
+/*
  * test_bmap_root_counts(): whether the roots' counts of the database's page
  * store are whole, the roots they count, and the blocks whose counts differ
  * from the roots counted anew

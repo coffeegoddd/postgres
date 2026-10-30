@@ -73,8 +73,11 @@ SELECT test_bmap_unlink(:dropped_copy);
 -- claimed, not copied)
 CHECKPOINT;
 SELECT * FROM fw.first_writes('fw.plain', :pages) \gset plain_
+SELECT test_bmap_refs_file_asks() AS asks_before \gset
 SELECT * FROM fw.first_writes('fw.shared', :pages) \gset shared_
+SELECT test_bmap_refs_file_asks() AS asks_shared \gset
 SELECT * FROM fw.first_writes('fw.dropped', :pages) \gset dropped_
+SELECT test_bmap_refs_file_asks() AS asks_dropped \gset
 -- Every page was copied, or claimed: its entry born in the map's epoch.
 SELECT count(*) FILTER (WHERE epoch < test_bmap_epoch(:shared)) AS shared_not_copied
   FROM test_bmap_map(:shared) WHERE blkno < :pages;
@@ -108,6 +111,22 @@ SELECT (:shared_buffers - :plain_buffers) <= 8 * :pages AS shared_buffers_bounde
 SELECT (:dropped_buffers - :plain_buffers) <= 6 * :pages AS dropped_buffers_bounded;
  dropped_buffers_bounded 
 -------------------------
+ t
+(1 row)
+
+-- The reference counts' file is asked its length a few times at most, not
+-- a page: whether a block's count page exists is answered from the length
+-- known (it was asked, with the file closed and opened again, at each
+-- page's first change).
+SELECT :asks_shared - :asks_before <= 4 AS copies_ask_the_counts_file_little;
+ copies_ask_the_counts_file_little 
+-----------------------------------
+ t
+(1 row)
+
+SELECT :asks_dropped - :asks_shared <= 4 AS claims_ask_the_counts_file_little;
+ claims_ask_the_counts_file_little 
+-----------------------------------
  t
 (1 row)
 
