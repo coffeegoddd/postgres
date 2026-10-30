@@ -2315,6 +2315,7 @@ typedef struct TreeLeaf
 	XLogRecPtr	born;
 	BlockNumber first;			/* the first block it maps */
 	uint32		slot;			/* the block's */
+	uint32		path_epoch;		/* the least epoch of the pointers to it */
 } TreeLeaf;
 
 /* tries of a lookup that finds a node changed under it, outside recovery */
@@ -2381,6 +2382,7 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 		BmapEntry	ptr;
 		PageRead	r;
 		int			level;
+		uint32		path_epoch = PG_UINT32_MAX;
 
 		r = read_entries(reln, false, 1, for_write, cached_only, path.top, 1,
 						 &ptr, &page);
@@ -2405,6 +2407,7 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 
 			if (!BlockNumberIsValid(ptr.block))
 				return TREE_NO_LEAF;
+			path_epoch = Min(path_epoch, ptr.epoch);
 			/* (in recovery, a pointer of a newer page may be past the store) */
 			if (RecoveryInProgress() && !cached_only &&
 				ptr.block >= mdnblocks(store_smgr(rel), MAIN_FORKNUM))
@@ -2422,6 +2425,7 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 				leaf->born = ptr.since;
 				leaf->first = path.first[0];
 				leaf->slot = path.slot[0];
+				leaf->path_epoch = path_epoch;
 				return TREE_LEAF;
 			}
 			ptr = next;
@@ -2518,6 +2522,32 @@ static bool
 lookup_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
 {
 	return lookup_entry_at(reln, blkno, entry, NULL, NULL);
+}
+
+/*
+ * As lookup_entry_at(), outside recovery, and into *path_epoch the least
+ * epoch of the pointers on the path to the leaf (PG_UINT32_MAX without a
+ * leaf).  A path every pointer of which was set in the map's epoch is the
+ * relation's own and stamped (tree_path_own()), which this tells without
+ * reading the path again.
+ */
+static bool
+lookup_entry_path(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry,
+				  MapPage *mp, uint32 *path_epoch)
+{
+	TreeLeaf	leaf;
+
+	Assert(!RecoveryInProgress());
+	*path_epoch = PG_UINT32_MAX;
+	if (tree_find(reln, blkno, false, false, 1, entry, &leaf) != TREE_LEAF)
+	{
+		entry->block = InvalidBlockNumber;
+		entry->since = InvalidXLogRecPtr;
+		return false;
+	}
+	mp_leaf(&leaf, mp);
+	*path_epoch = leaf.path_epoch;
+	return BlockNumberIsValid(entry->block);
 }
 
 /*
@@ -6831,22 +6861,23 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		return;
 	blkno = fork_key(forknum, blkno);
 
-	/* the common case, with share locks alone */
-	epoch = lookup_epoch_end(reln, blkno, &end);
-	if (lookup_entry(reln, blkno, &entry) ? entry.epoch >= epoch :
-		blkno >= end)
-		return;
-
+	/*
+	 * The entry is looked up once, under the header held shared: the common
+	 * case (an entry the map's own, or past the fork's end) ends there, and
+	 * the others go on with what it found, the header held as they need.
+	 */
 	headerbuf = map_read(rel, 0);
 	for (;;)
 	{
+		uint32		path_epoch;
+
 		LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
 		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 		epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
 		end = key_fork_end(PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks,
 						   PageGetBmapHeader(BufferGetPage(headerbuf))->vm_nblocks,
 						   blkno);
-		if (!lookup_entry_at(reln, blkno, &entry, &mp, NULL))
+		if (!lookup_entry_path(reln, blkno, &entry, &mp, &path_epoch))
 		{
 			if (blkno >= end)
 			{
@@ -6880,7 +6911,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			UnlockReleaseBuffer(headerbuf);
 			return;
 		}
-		if (tree_path_own(reln, blkno, epoch, true))
+		/* (every pointer set in the map's epoch: the path is its own) */
+		if (path_epoch >= epoch || tree_path_own(reln, blkno, epoch, true))
 			break;
 
 		/*
