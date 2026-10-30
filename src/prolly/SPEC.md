@@ -241,6 +241,23 @@ Postgres branch also needs its own catalog rows, which is what lets every
 Postgres feature work on it unchanged; the data itself is shared, as in
 Dolt.
 
+**Space complexity**, counting the storage an operation adds and keeps.
+WAL is not counted, nor what an operation leaves for reclaiming: dead row
+versions for VACUUM, and unreferenced chunks for garbage collection.
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Create from HEAD, clean | O(1) | O(C) |
+| Create from HEAD, dirty | O(1) | O(C + D) |
+| Create from an arbitrary commit | O(1) | O(C + D) |
+
+A clean create adds the new branch's catalog rows and one block-map root
+page for each of its tables and indexes, and shares every data page.  A
+dirty create, or a create from an arbitrary commit, also rewrites *D* rows
+on one branch.  Each page those rows are on is copied the first time it is
+written, so the pages added are at most the pages the *D* rows are on,
+plus their index entries.  Dolt adds only the branch's name.
+
 #### Checkout
 
 Checkout discards the session's cached catalog entries; from then on,
@@ -343,6 +360,20 @@ Dolt resets in O(1) because it points the working set at the target's
 tree.  Ours must rewrite the differing rows in the tables' pages, where
 Postgres features read them.
 
+**Space complexity**, counted as for branching:
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Hard reset to HEAD, clean | O(1) | O(1) |
+| Hard reset to HEAD, dirty | O(1) | O(D) |
+| Hard reset to an arbitrary commit, clean | O(1) | O(D) |
+| Hard reset to an arbitrary commit, dirty | O(1) | O(D) |
+
+Ours adds the *D* rewritten rows, as new row versions and index entries,
+and copies any page still shared with another branch the first time it is
+written.  The history store gains nothing, since the working root is set
+to the target's tree, which it already holds.  Dolt only moves a pointer.
+
 #### Merge
 
 A merge of branch *T* into the current branch is computed in the history
@@ -382,6 +413,21 @@ A three-way merge costs about the same in both, since both compute it in
 prolly trees and ours writes only the rows that came from *T*.  A
 fast-forward costs more in ours, because Dolt moves a pointer where ours
 must rewrite the rows *T* changed.
+
+**Space complexity**, counted as for branching:
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Fast-forward | O(1) | O(D), *D* the rows between the two heads |
+| Three-way, no conflicts | O(D<sub>2</sub> log n) | O(D<sub>2</sub> log n) |
+| Three-way, with conflicts | O(D<sub>2</sub> log n + K) | O(D<sub>2</sub> log n + K) |
+
+Both build the merged tree in prolly trees, adding the chunks on the paths
+to the *D<sub>2</sub>* rows that came from *T*, and both store *K*
+conflict rows.  Ours also writes those *D<sub>2</sub>* rows into the
+current branch's tables, which adds O(D<sub>2</sub>) pages and index
+entries, within the bound above.  A fast-forward adds no chunks to either
+store; ours writes the *D* rows into the tables.
 
 ### The window
 
@@ -535,6 +581,37 @@ of a restore is O(P) instead):
 |---|---|---|---|
 | Hard reset to an arbitrary commit | O(L + D log n) | O(L + C) | O(L + C + D' log n) |
 | Create a branch from an arbitrary commit | O(C + D) | O(C) | O(C + D') |
+
+**Space complexity in and outside the window**, counted as in the sections
+above (the storage an operation adds and keeps).  A commit in the window
+lies within about *Δ*/2 rows of a keyframe, so *D'* is at most about
+*Δ*/2; a commit outside it has no keyframe, and is reached by rewriting
+rows from the current state, as in the sections above.  HEAD, and both
+heads of a merge, are always in the window.
+
+| Operation | Outside the window | In the window |
+|---|---|---|
+| Create a branch from HEAD, clean | O(C) | O(C) |
+| Create a branch from HEAD, dirty | O(C + D) | O(C + D) |
+| Create a branch from an arbitrary commit | O(C + D) | O(C + D') |
+| Hard reset to HEAD, clean | O(1) | O(1) |
+| Hard reset to HEAD, dirty | O(D) | O(D) |
+| Hard reset to an arbitrary commit, clean or dirty | O(D) | O(C + D') |
+| Fast-forward merge | O(D) | O(D) |
+| Three-way merge | O(D<sub>2</sub> log n + K) | O(D<sub>2</sub> log n + K) |
+
+In the window, a branch or reset to an arbitrary commit shares its nearest
+keyframe's block maps, one root per table and index, and rewrites only the
+*D'* rows after it; a reset lets go of the pages the working set held.  So
+the space it adds no longer grows with how far back the commit is.
+Operations from HEAD, and merges, are the same in both: they never move to
+another commit's state, and keyframes are not used to merge.  If a merge's
+base was cut from local history, finding it first attaches the cut history
+again, from an archive or a remote, which adds that history back.
+
+Keyframes' own storage is a standing cost of the window, not of any
+operation: about the pages touched by all the change in the window,
+bounded by the storage budget that sets *Δ*.
 
 ### Compared with stock Postgres: OLTP performance
 
