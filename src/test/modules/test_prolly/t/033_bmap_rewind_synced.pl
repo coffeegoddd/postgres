@@ -11,8 +11,9 @@
 # target can be made a standby again from a base backup.  A share of
 # blocks the source got before that checkpoint leaves the rewind as it
 # was: the replay begins after them.  Copies of shared pages made without
-# their images, whose old blocks then change, are refused as such shares
-# are.
+# their images (block_map_copy_images off), whose old blocks then change,
+# are refused as such shares are; with copies logging their images (the
+# default) the rewind goes ahead.
 
 use strict;
 use warnings FATAL => 'all';
@@ -34,7 +35,6 @@ sub failover
 	$primary->init(allows_streaming => 1);
 	$primary->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
-block_map_copy_images = off  # copies without an image, as tested here
 autovacuum = off
 wal_log_hints = on
 wal_keep_size = 512MB
@@ -145,7 +145,7 @@ $standby->stop;
 sql($standby, q{CHECKPOINT; DELETE FROM t WHERE a % 50 = 0;});
 $copy = sql($standby, qq{SELECT test_bmap_share($t)});
 my $start = sql($standby, q{SELECT pg_current_wal_insert_lsn()});
-sql($standby, q{DELETE FROM t WHERE a % 50 = 1});
+sql($standby, q{SET block_map_copy_images = off; DELETE FROM t WHERE a % 50 = 1});
 is(sql($standby, qq{
 	SELECT count(*) > 0 AND count(*) FILTER (WHERE block_fpi_length > 0) = 0
 	FROM pg_get_wal_block_info('$start', pg_current_wal_insert_lsn(), false)
@@ -162,6 +162,37 @@ like($stderr, qr/source server synced pages without logging them/,
 $primary->start;
 is(sql($primary, q{SELECT count(*) FROM t WHERE a = -1}), '1',
 	'the target, untouched, starts with its own rows');
+$primary->stop;
+$standby->stop;
+
+# The same with copies logging their images, the default: the rewound
+# server's replay takes each copy from its image, not the old block, so
+# pg_rewind goes ahead and the rewound server reads t and the copy.
+($primary, $standby, $t) = failover('rewind_copied_images');
+sql($standby, q{CHECKPOINT; DELETE FROM t WHERE a % 50 = 0;});
+$copy = sql($standby, qq{SELECT test_bmap_share($t)});
+$digest = sql($standby, qq{SELECT test_bmap_rows_digest($copy)});
+$start = sql($standby, q{SELECT pg_current_wal_insert_lsn()});
+sql($standby, q{DELETE FROM t WHERE a % 50 = 1});
+is(sql($standby, qq{
+	SELECT count(*) > 0 AND count(*) = count(*) FILTER (WHERE block_fpi_length > 0)
+	FROM pg_get_wal_block_info('$start', pg_current_wal_insert_lsn(), false)
+	WHERE resource_manager = 'BlockMap' AND record_type = 'REMAP'
+	  AND relfilenode = $t AND relforknumber = 0}),
+	't', 'by default the source copies t\'s pages with their images');
+$pages = sql($standby, qq{SELECT count(*) FROM test_bmap_map($copy)});
+sql($standby, qq{CHECKPOINT;
+	SELECT test_bmap_init_block($copy, b) FROM generate_series(0, $pages - 1) b});
+$digest = sql($standby, qq{SELECT test_bmap_rows_digest($copy)});
+$t_rows = sql($standby, $rows_query);
+($ret, $stderr) = rewind($primary, $standby);
+ok($ret, "pg_rewind rewinds from a source whose copies logged their images ($stderr)");
+$primary->enable_streaming($standby);
+$primary->start;
+$standby->wait_for_replay_catchup($primary);
+is(sql($primary, $rows_query), $t_rows, 'the rewound server reads t');
+is(sql($primary, qq{SELECT test_bmap_rows_digest($copy)}), $digest,
+	'and the copy');
 $primary->stop;
 $standby->stop;
 
