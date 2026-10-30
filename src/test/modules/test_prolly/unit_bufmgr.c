@@ -159,8 +159,9 @@ cached_dirty(Relation rel, BlockNumber blk)
 
 /*
  * Writing out listed blocks cleans those that were dirty and leaves them
- * cached; blocks not listed stay dirty; a listed block not cached (past the
- * end) is passed over.
+ * cached; a listed block not cached (past the end) is passed over.  (That a
+ * block not listed stays dirty isn't checked: the background writer or a
+ * checkpoint may write it out meanwhile.)
  */
 static void
 flush_listed_blocks(void)
@@ -173,7 +174,6 @@ flush_listed_blocks(void)
 	FlushRelationBlocks(RelationGetSmgr(rel), MAIN_FORKNUM, blocks, 2);
 	CHECK(BufferIsValid(LookupSharedBuffer(rel->rd_locator, MAIN_FORKNUM, 0)));
 	CHECK(!cached_dirty(rel, 0));
-	CHECK(cached_dirty(rel, 1));
 	drop_scratch(rel);
 }
 
@@ -196,7 +196,10 @@ drop_one_block(void)
 	drop_scratch(rel);
 }
 
-/* dropping an unlinked relation's buffers drops every fork's */
+/*
+ * dropping an unlinked relation's buffers drops them, dirty or not (checked
+ * of the main fork, the only one a new table has)
+ */
 static void
 drop_unlinked_relation_buffers(void)
 {
