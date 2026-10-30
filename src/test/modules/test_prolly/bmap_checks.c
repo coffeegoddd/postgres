@@ -347,7 +347,7 @@ test_bmap_release_drain(PG_FUNCTION_ARGS)
 /*
  * test_bmap_sweep(): the database's page store in its default tablespace
  * swept, as a maintenance command sweeps it: the blocks nothing held freed,
- * the stuck counts rewritten, the blocks the store was shortened by, and
+ * the counts of those zeroed, the blocks the store was shortened by, and
  * those moved down for it.  Flushed, as above.
  */
 PG_FUNCTION_INFO_V1(test_bmap_sweep);

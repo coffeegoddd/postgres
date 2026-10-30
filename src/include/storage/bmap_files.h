@@ -17,7 +17,8 @@
  *							verify checksums from files skip it.  It holds the
  *							nodes of tree maps too, pages of the store itself
  *	BMAP_REFS_RELNUMBER		reference counts: for each physical block, how many
- *							maps (or a tree's pages) hold it besides the first
+ *							maps (or a tree's pages) hold it besides the first,
+ *							a uint32 each, exact however many hold it
  *	BMAP_QUEUE_RELNUMBER	the release queue: subtrees and blocks of dropped
  *							maps, each holding what it names until a
  *							background pass lets go of it

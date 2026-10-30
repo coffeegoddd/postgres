@@ -453,7 +453,8 @@ typedef struct xl_bmap_bits_delta
 
 /*
  * Block data of a reference-count page: counts set.  A block's count is the
- * number of maps holding it besides the first.
+ * number of maps holding it besides the first, the whole uint32 of its slot
+ * on the page.
  */
 typedef struct xl_bmap_refs_delta
 {

@@ -43,7 +43,11 @@
  *
  * Sharing.  A node is held by every page that points to it, and a data
  * block by every leaf holding it, the reference counts
- * saying how many besides the first.  A share copies the root page alone,
+ * saying how many besides the first.  A count is four bytes, exact however
+ * many maps share the block (branches of a table by the thousand), so the
+ * last holder's going frees the block without a sweep; a holder that would
+ * take a count past BMAP_REFS_MAX fails the change adding it, before its
+ * record, rather than wrap the count or let it stick.  A share copies the root page alone,
  * each subtree gaining a holder; the first change under a shared node copies
  * the path down to the leaf (tree_copy_node()), each copy's children
  * gaining a holder, and the data block is then copied as any shared block
@@ -108,15 +112,17 @@
  * (preserve_header_lock()).
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * three cases: a crash between a drop's commit and the records queuing what it
- * didn't queue before its commit record (a prepared transaction's drops), a
- * crash (or an error, not an interrupt, which the header's lock holds off)
+ * two cases: a crash between a drop's commit and the records queuing what it
+ * didn't queue before its commit record (a prepared transaction's drops), and
+ * a crash (or an error, not an interrupt, which the header's lock holds off)
  * between the records letting go of a truncation's blocks and those freeing
- * them, and a count stuck at 255 maps. A sweep drains the release queue, then
+ * them.  (A path copy's crash or error between its records leaves children
+ * counted once too often, likewise freed by a sweep once nothing holds
+ * them.)  A sweep drains the release queue, then
  * counts exactly what every map of a database's page store holds, each
  * relation's read under its header's lock, and what the queue still holds
  * (drains held off meanwhile), and frees the blocks allocated as it began that
- * nothing holds, rewrites the stuck counts that now fit, moves the blocks past
+ * nothing holds (their counts made zero first), moves the blocks past
  * the allocated count down into free ones (compact_store()), and shortens the
  * store to its last allocated block (SHRINK, which redo truncates by too),
  * unless another sweep of it runs, which may still free blocks past that.
@@ -129,8 +135,9 @@
  * empty main fork file then keeps its relation file number until the next
  * checkpoint, as md.c's does.  A tree's node counts once for each page
  * pointing to it, its children once however many reach it.  A path copy (not
- * held off) adds holders only to blocks held already; one adding a holder to a
- * stuck count makes a sweep under way leave the stuck counts as they are.
+ * held off) adds holders only to blocks held already, so it never gives one
+ * to a block the sweep found held by nothing; the sweep rewrites no count of
+ * a block something holds, which a copy under way could make a holder short.
  *
  * Scans (bmap_scan_store()).  A scan of a page store reads every block
  * allocated, or only the ranges of blocks written or freed since an
@@ -241,11 +248,12 @@ int			block_map_replay_entries = 65536;
  * carrying the replaced storage's on), nor a frozen root of which map of
  * its relation; version 11's headers held another epoch before
  * shared_below; version 12's captured roots didn't keep the database's
- * oldest unfrozen transaction and multixact as they were captured.  This
- * server reads only version 13 and refuses anything older
+ * oldest unfrozen transaction and multixact as they were captured; version
+ * 13's reference counts were a byte a block, stuck at 255.  This server
+ * reads only version 14 and refuses anything older
  * (refuse_version()).
  */
-#define BMAP_VERSION		13
+#define BMAP_VERSION		14
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -307,7 +315,8 @@ typedef struct BmapQueueMeta
 	uint32		nentries;
 } BmapQueueMeta;
 
-#define BMAP_REFS_PER_PAGE	((uint32) BMAP_CONTENT_SIZE)
+/* the blocks whose counts a reference-count page holds, a uint32 each */
+#define BMAP_REFS_PER_PAGE	((uint32) (BMAP_CONTENT_SIZE / sizeof(uint32)))
 
 /* the release queue's page and slot of entry 'i' */
 #define BMAP_QUEUE_PER_PAGE \
@@ -315,8 +324,15 @@ typedef struct BmapQueueMeta
 #define QUEUE_PAGE(i)		((BlockNumber) (1 + (i) / BMAP_QUEUE_PER_PAGE))
 #define QUEUE_SLOT(i)		((uint32) ((i) % BMAP_QUEUE_PER_PAGE))
 
-/* a count that reaches this stays, until a sweep counts it exactly */
-#define BMAP_REFS_STUCK		255
+/*
+ * The most a count says: a block held by this many maps besides the first
+ * takes no other holder (refs_add_holders() fails the change instead).  One
+ * short of a uint32's largest value, so that a block's holders, the count
+ * and one, fit the uint32 the sweep counts them in.  A test lowers it to
+ * BMAP_REFS_TEST_MAX with an injection point.
+ */
+#define BMAP_REFS_MAX		((uint32) (PG_UINT32_MAX - 1))
+#define BMAP_REFS_TEST_MAX	1000
 
 /* the lock a sweep holds off branch creation with: an object no catalog has */
 #define BMAP_SWEEP_CLASSID	((Oid) 0x424D5357)
@@ -426,7 +442,7 @@ StaticAssertDecl(BMAP_DELTA_ROOT_TOPS == BMAP_TREE_TOPS,
 #define PageGetBmapEntries(page)	((BmapEntry *) PageGetContents(page))
 #define PageGetBmapMeta(page)	((BmapMeta *) PageGetContents(page))
 #define PageGetBmapBits(page)	((uint64 *) PageGetContents(page))
-#define PageGetBmapRefs(page)	((uint8 *) PageGetContents(page))
+#define PageGetBmapRefs(page)	((uint32 *) PageGetContents(page))
 #define PageGetBmapQueueMeta(page)	((BmapQueueMeta *) PageGetContents(page))
 #define PageGetBmapQueued(page)	((BmapQueued *) PageGetContents(page))
 
@@ -438,18 +454,12 @@ static const PGIOAlignedBlock zero_block;
 /* page stores swept since the server started, remembered at most */
 #define BMAP_SWEPT_MAX		1024
 
-/*
- * A page store swept since the server started: the times a stuck count of
- * it lost a holder (which it keeps, stuck), and how many times that had
- * happened as its last sweep began.
- */
+/* A page store whose sweep began since the server started */
 typedef struct BmapSwept
 {
 	Oid			spcOid;
 	Oid			dbOid;
 	bool		swept;			/* a sweep of it ended */
-	uint64		released;
-	uint64		swept_at;
 } BmapSwept;
 
 /* page stores whose blocks written since their last scan are watched, at most */
@@ -519,7 +529,6 @@ typedef struct BmapStoreSync
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
-	pg_atomic_uint64 stuck_held;	/* holders a stuck count gained, ever */
 	pg_atomic_uint64 watch_key[BMAP_WATCHED_MAX];
 	slock_t		mutex;			/* protects what follows */
 	int			nlisted;
@@ -623,7 +632,6 @@ static void
 BmapShmemInit(void *arg)
 {
 	pg_atomic_init_u32(&bmap_shared->sweeps, 0);
-	pg_atomic_init_u64(&bmap_shared->stuck_held, 0);
 	SpinLockInit(&bmap_shared->mutex);
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
@@ -895,11 +903,11 @@ swept_find(RelFileLocator rel)
 }
 
 /*
- * A sweep of rel's page store begins (*at: the releases so far, to note
- * when it ends), or ends.  Past the most remembered, a store is not.
+ * A sweep of rel's page store begins, or ends.  Past the most remembered, a
+ * store is not.
  */
 static void
-swept_note(RelFileLocator rel, bool begin, uint64 *at)
+swept_note(RelFileLocator rel, bool begin)
 {
 	BmapSwept  *found;
 
@@ -912,29 +920,8 @@ swept_note(RelFileLocator rel, bool begin, uint64 *at)
 		found->spcOid = rel.spcOid;
 		found->dbOid = rel.dbOid;
 	}
-	if (found != NULL && begin)
-		*at = found->released;
-	else if (found != NULL)
-	{
+	if (found != NULL && !begin)
 		found->swept = true;
-		found->swept_at = *at;
-	}
-	SpinLockRelease(&bmap_shared->mutex);
-}
-
-/*
- * A stuck count of rel's page store lost a holder, which it keeps: a sweep
- * may now free the block, or fit its count.
- */
-static void
-stuck_released(RelFileLocator rel)
-{
-	BmapSwept  *found;
-
-	SpinLockAcquire(&bmap_shared->mutex);
-	found = swept_find(rel);
-	if (found != NULL)
-		found->released++;
 	SpinLockRelease(&bmap_shared->mutex);
 }
 
@@ -1195,7 +1182,7 @@ refs_read(RelFileLocator rel, BlockNumber blkno)
 }
 
 /* the count of 'phys' on its locked reference-count page */
-static uint8
+static uint32
 page_ref(Page page, BlockNumber phys)
 {
 	return PageIsNew(page) ? 0 : PageGetBmapRefs(page)[REF_SLOT(phys)];
@@ -1403,15 +1390,15 @@ static void
 apply_refs_delta(Page page, const xl_bmap_refs_delta *delta)
 {
 	const xl_bmap_ref_delta *ref = (const xl_bmap_ref_delta *) (delta + 1);
-	uint8	   *counts;
+	uint32	   *counts;
 
 	if (delta->flags & BMAP_DELTA_INIT)
 		init_page(page, BMAP_PAGE_REFS);
 	counts = PageGetBmapRefs(page);
 	for (uint32 i = 0; i < delta->nrefs; i++)
 	{
-		Assert(ref[i].slot < BMAP_REFS_PER_PAGE && ref[i].count <= BMAP_REFS_STUCK);
-		counts[ref[i].slot] = (uint8) ref[i].count;
+		Assert(ref[i].slot < BMAP_REFS_PER_PAGE && ref[i].count <= BMAP_REFS_MAX);
+		counts[ref[i].slot] = ref[i].count;
 	}
 }
 
@@ -2170,11 +2157,11 @@ lookup_epoch(SMgrRelation reln)
 }
 
 /* the reference count of 'phys', read under a share lock */
-static uint8
+static uint32
 lookup_ref(RelFileLocator rel, BlockNumber phys)
 {
 	Buffer		buf;
-	uint8		count;
+	uint32		count;
 
 	if (REF_PAGE(phys) >= refs_nblocks(rel))
 		return 0;
@@ -2211,7 +2198,7 @@ cmp_ref_wanted(const void *a, const void *b)
  */
 static void
 lookup_refs(RelFileLocator rel, const BlockNumber *phys, uint32 n,
-			uint8 *counts)
+			uint32 *counts)
 {
 	RefWanted  *wanted;
 	BlockNumber nrefs;
@@ -3687,7 +3674,7 @@ refs_find(RefsPages *rp, BlockNumber phys)
 }
 
 /* the count of a block on the locked pages */
-static uint8
+static uint32
 refs_get(RefsPages *rp, BlockNumber phys)
 {
 	return page_ref(BufferGetPage(rp->buf[refs_find(rp, phys)]), phys);
@@ -3695,7 +3682,7 @@ refs_get(RefsPages *rp, BlockNumber phys)
 
 /* set a block's count when the record is made */
 static void
-refs_set(RefsPages *rp, BlockNumber phys, uint8 count)
+refs_set(RefsPages *rp, BlockNumber phys, uint32 count)
 {
 	xl_bmap_refs_delta *delta = rp->delta[refs_find(rp, phys)];
 	xl_bmap_ref_delta *ref = (xl_bmap_ref_delta *) (delta + 1);
@@ -3790,20 +3777,32 @@ log_refs_record(uint8 info, const void *xlrec, uint32 xlrec_size,
 
 /*
  * One holder more of each of the blocks phys[0 .. n), on the pages rp
- * locked; a stuck count stays, and says so: a sweep counting holders
- * meanwhile can't rewrite stuck counts from what it counted.
+ * locked, before the record's critical section.  A count at the most it
+ * says fails the change here, with nothing of this record changed: a count
+ * that wrapped would free a block maps still hold, and one that stuck would
+ * never reach zero as its holders went.  (A path copy's earlier records,
+ * if any, gave children holders already: freed a sweep later, as after a
+ * crash between them.)
  */
 static void
-refs_add_holders(RefsPages *rp, const BlockNumber *phys, uint32 n)
+refs_add_holders(RefsPages *rp, RelFileLocator rel, const BlockNumber *phys,
+				 uint32 n)
 {
 	for (uint32 k = 0; k < n; k++)
 	{
-		uint8		c = refs_get(rp, phys[k]);
+		uint32		c = refs_get(rp, phys[k]);
 
-		if (c != BMAP_REFS_STUCK)
-			refs_set(rp, phys[k], c + 1);
-		else
-			pg_atomic_fetch_add_u64(&bmap_shared->stuck_held, 1);
+		if (c >= BMAP_REFS_MAX ||
+			(c >= BMAP_REFS_TEST_MAX &&
+			 IS_INJECTION_POINT_ATTACHED("bmap-refs-test-max")))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("block %u of the page store of database %u in tablespace %u is shared by too many maps",
+							phys[k], rel.dbOid, rel.spcOid),
+					 errdetail("A block can be held by at most %u maps.",
+							   (c >= BMAP_REFS_MAX ? BMAP_REFS_MAX :
+								BMAP_REFS_TEST_MAX) + 1)));
+		refs_set(rp, phys[k], c + 1);
 	}
 }
 
@@ -3861,7 +3860,7 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	Page		page;
 	XLogRecPtr	lsn;
 	int			id;
-	uint8		c;
+	uint32		c;
 	uint32		hold_pages;
 
 	/* the node, as it stays while shared */
@@ -3906,7 +3905,7 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	{
 		uint32		covered = refs_lock(rel, children + i, n - i, &rp);
 
-		refs_add_holders(&rp, children + i, covered);
+		refs_add_holders(&rp, rel, children + i, covered);
 		xlrec.op = BMAP_TREE_HOLD;
 		log_refs_record(XLOG_BMAP_TREE, &xlrec, sizeof(xlrec), InvalidBuffer,
 						NULL, 0, &rp);
@@ -3940,15 +3939,12 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
 		pfree(all);
 	}
-	refs_add_holders(&rp, children + i, n - i);
+	refs_add_holders(&rp, rel, children + i, n - i);
 	c = refs_get(&rp, ptr->block);
 	if (c == 0)
 		elog(ERROR, "node %u of the page store of \"%s\" is copied but held once",
 			 ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
-	if (c != BMAP_REFS_STUCK)
-		refs_set(&rp, ptr->block, c - 1);
-	else
-		stuck_released(rel);
+	refs_set(&rp, ptr->block, c - 1);
 
 	alloc_take(rel, 1, &node, &alloc);
 	prepare_node_store(rel, node, alloc.old_hw, alloc.new_hw);
@@ -4118,7 +4114,7 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 
 		for (uint32 k = i; k < i + covered; k++)
 		{
-			uint8		c = end > i ? refs_get(&rp, phys[k]) : 0;
+			uint32		c = end > i ? refs_get(&rp, phys[k]) : 0;
 
 			ent[ndelta->nentries].slot = items[k].slot;
 			if (c == 0 && !release)
@@ -4131,10 +4127,8 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 			{
 				if (c == 0)
 					tofree[nfree++] = phys[k];
-				else if (c != BMAP_REFS_STUCK)
-					refs_set(&rp, phys[k], c - 1);
 				else
-					stuck_released(rel);
+					refs_set(&rp, phys[k], c - 1);
 				ent[ndelta->nentries].block = InvalidBlockNumber;
 				ent[ndelta->nentries].epoch = 0;
 			}
@@ -4673,7 +4667,7 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 	BmapEntry  *entries;
 	BlockNumber *ask;
 	uint32	   *slot;
-	uint8	   *counts;
+	uint32	   *counts;
 	uint32		nask = 0;
 	Buffer		buf;
 	bool		done = true;
@@ -4699,7 +4693,7 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 	 */
 	ask = palloc(BMAP_TREE_FANOUT * sizeof(BlockNumber));
 	slot = palloc(BMAP_TREE_FANOUT * sizeof(uint32));
-	counts = palloc(BMAP_TREE_FANOUT * sizeof(uint8));
+	counts = palloc(BMAP_TREE_FANOUT * sizeof(uint32));
 	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
 	{
 		uint64		child = (uint64) first + (level == 0 ? i :
@@ -4924,7 +4918,7 @@ redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
  */
 static bool
 redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
-				uint8 *count)
+				uint32 *count)
 {
 	PGIOAlignedBlock page;
 
@@ -5009,11 +5003,11 @@ redo_share_tops(RelFileLocator dst, xl_bmap_top *tops)
 static bool
 redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			  BlockNumber first, BlockNumber nblocks, uint32 epoch,
-			  XLogRecPtr lsn, uint8 held_more, BlockList *own)
+			  XLogRecPtr lsn, uint32 held_more, BlockList *own)
 {
 	PGIOAlignedBlock page;
 	BmapEntry  *entries;
-	uint8		count;
+	uint32		count;
 	bool		ok = true;
 
 	if (first >= nblocks)
@@ -5168,7 +5162,7 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	if (ntops > 0 && refs_lock(srel, tops, ntops, &rp) != ntops)
 		elog(ERROR, "the subtrees of \"%s\" span too many count pages",
 			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
-	refs_add_holders(&rp, tops, ntops);
+	refs_add_holders(&rp, srel, tops, ntops);
 
 	if (hdelta)
 	{
@@ -5800,7 +5794,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	Buffer		headerbuf;
 	Buffer		refbuf = InvalidBuffer;
 	Buffer		mapbuf;
-	uint8		count = 0;
+	uint32		count = 0;
 	BlockNumber old_block;
 	xl_bmap_node_delta *ndelta;
 	xl_bmap_entry_delta *ent;
@@ -5878,7 +5872,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	{
 		Allocation	alloc;
 		BlockNumber new_block;
-		xl_bmap_refs_delta *rdelta = NULL;
+		xl_bmap_refs_delta *rdelta;
+		xl_bmap_ref_delta *ref;
 		xl_bmap_remap xlrec;
 		int			id;
 		Page		page = BufferGetPage(buffer);
@@ -5912,19 +5907,13 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		prepare_store(rel, alloc.old_hw, alloc.new_hw,
 					  &new_block, zeroed && reused ? 1 : 0, false);
 
-		if (count == BMAP_REFS_STUCK)
-			stuck_released(rel);
-		else
-		{
-			xl_bmap_ref_delta *ref;
-
-			rdelta = palloc0(sizeof(xl_bmap_refs_delta) + sizeof(xl_bmap_ref_delta));
-			rdelta->kind = BMAP_DELTA_REFS;
-			rdelta->nrefs = 1;
-			ref = (xl_bmap_ref_delta *) (rdelta + 1);
-			ref->slot = REF_SLOT(old_block);
-			ref->count = count - 1;
-		}
+		/* the old block, a holder fewer */
+		rdelta = palloc0(sizeof(xl_bmap_refs_delta) + sizeof(xl_bmap_ref_delta));
+		rdelta->kind = BMAP_DELTA_REFS;
+		rdelta->nrefs = 1;
+		ref = (xl_bmap_ref_delta *) (rdelta + 1);
+		ref->slot = REF_SLOT(old_block);
+		ref->count = count - 1;
 
 		mapbuf = mp_read(reln, &mp);
 		map_lock(mapbuf, false);
@@ -5950,14 +5939,11 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		XLogRegisterBuffer(0, mapbuf, REGBUF_STANDARD);
 		XLogRegisterBufData(0, ndelta, node_delta_size(ndelta));
 		id = alloc_apply_register(&alloc, 1);
-		if (rdelta)
-		{
-			apply_refs_delta(BufferGetPage(refbuf), rdelta);
-			MarkBufferDirty(refbuf);
-			XLogRegisterBuffer(id, refbuf, REGBUF_STANDARD);
-			XLogRegisterBufData(id, rdelta, refs_delta_size(rdelta));
-			id++;
-		}
+		apply_refs_delta(BufferGetPage(refbuf), rdelta);
+		MarkBufferDirty(refbuf);
+		XLogRegisterBuffer(id, refbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(id, rdelta, refs_delta_size(rdelta));
+		id++;
 		if (zeroed)
 			XLogRegisterBuffer(id, buffer, REGBUF_WILL_INIT);
 		else
@@ -5966,16 +5952,14 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_REMAP);
 		PageSetLSN(BufferGetPage(mapbuf), lsn);
 		alloc_set_lsn(&alloc, lsn);
-		if (rdelta)
-			PageSetLSN(BufferGetPage(refbuf), lsn);
+		PageSetLSN(BufferGetPage(refbuf), lsn);
 		/* a page of zeroes stays one: a new page has no LSN */
 		if (!zeroed)
 			PageSetLSN(page, lsn);
 		END_CRIT_SECTION();
 
 		alloc_release(&alloc);
-		if (rdelta)
-			pfree(rdelta);
+		pfree(rdelta);
 	}
 
 	map_unlock(mapbuf);
@@ -7072,14 +7056,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	{
 		BlockNumber b = blocks[i].block;
 		uint32		h = blocks[i].holders;
-		uint8		c = REF_PAGE(b) < nrefpages ? refs_get(&rp, b) : 0;
+		uint32		c = REF_PAGE(b) < nrefpages ? refs_get(&rp, b) : 0;
 
-		if (c == BMAP_REFS_STUCK)
-		{
-			for (uint32 j = 0; j < h; j++)
-				stuck_released(rel);
-			continue;
-		}
 		if (c >= h)
 		{
 			refs_set(&rp, b, c - h);
@@ -8117,7 +8095,7 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	if (ntops > 0 && refs_lock(rel, tops, ntops, &rp) != ntops)
 		elog(ERROR, "the subtrees of \"%s\" span too many count pages",
 			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
-	refs_add_holders(&rp, tops, ntops);
+	refs_add_holders(&rp, rel, tops, ntops);
 
 	hdelta.kind = BMAP_DELTA_HEADER;
 	hdelta.flags = 0;
@@ -8535,7 +8513,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 	rp.n = 0;
 	if (ntops > 0 && refs_lock(store, tops, ntops, &rp) != ntops)
 		elog(ERROR, "the subtrees of a captured root span too many count pages");
-	refs_add_holders(&rp, tops, ntops);
+	refs_add_holders(&rp, store, tops, ntops);
 
 	memset(&rdelta, 0, sizeof(rdelta));
 	rdelta.kind = BMAP_DELTA_ROOTS;
@@ -9825,17 +9803,21 @@ bmap_inspect_roots(RelFileLocator store, uint64 *held, uint64 *slots,
  * ----------------------------------------------------------------
  */
 
-/* One more holder of block b (a count past what a count holds stays). */
+/*
+ * One more holder of block b.  A block's holders are at most a count's most
+ * and one, which a uint32 holds; one counted more than that (which no
+ * count could say) stays at the most.
+ */
 static inline void
-hold(uint16 *holders, BlockNumber b)
+hold(uint32 *holders, BlockNumber b)
 {
-	if (holders[b] < PG_UINT16_MAX)
+	if (holders[b] < PG_UINT32_MAX)
 		holders[b]++;
 }
 
 typedef struct SweepHolders
 {
-	uint16	   *holders;
+	uint32	   *holders;
 	uint64	   *reached;		/* the nodes reached, a bit each */
 	BlockNumber hw;
 } SweepHolders;
@@ -9929,7 +9911,7 @@ sweep_relation_read(SMgrRelation reln, void *arg)
  * marked reached with its children left uncounted.
  */
 static void
-sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
+sweep_relation(SMgrRelation reln, uint32 *holders, uint64 *reached,
 			   BlockNumber hw)
 {
 	SweepHolders sh = {holders, reached, hw};
@@ -9967,7 +9949,7 @@ typedef struct OwnHolder
 typedef struct OwnHolders
 {
 	HTAB	   *own;
-	const uint16 *holders;		/* every relation's */
+	const uint32 *holders;		/* every relation's */
 	BlockNumber hw;
 	bool		tree;			/* the tree walked now, not a root */
 	bool		elsewhere[BMAP_TREE_TOPS + 1];	/* each level's node on the
@@ -10415,7 +10397,7 @@ let_go_relation(HeldRelation *held)
  * (hold_relation()).
  */
 static void
-sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw,
+sweep_shared_below(SMgrRelation reln, const uint32 *holders, BlockNumber hw,
 				   const SweepRoots *sr)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
@@ -10528,15 +10510,15 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw,
 }
 
 /*
- * Rewrite the counts of the blocks stuck[0 .. n), sorted: a stuck count
- * whose holders fit a count now, and the count of a block nothing holds
- * (zero, before it is freed).  A stuck count is changed only by a sweep,
- * and nothing adds holders meanwhile, so the holders counted are the
- * block's, or more (a map dropped since).
+ * Zero the counts of the blocks blocks[0 .. n), sorted, which nothing holds,
+ * before they are freed: a count a crash left too high (a holder's going
+ * whose record was lost) would otherwise come with the block when it is
+ * allocated again.  Nothing gives such a block a holder meanwhile, as a
+ * path copy adds holders only to blocks held already.  Returns how many
+ * counts changed.
  */
 static uint32
-sweep_recount(RelFileLocator rel, const BlockNumber *stuck, uint32 n,
-			  const uint16 *holders)
+sweep_recount(RelFileLocator rel, const BlockNumber *blocks, uint32 n)
 {
 	uint32		i = 0;
 	uint32		recounted = 0;
@@ -10544,20 +10526,11 @@ sweep_recount(RelFileLocator rel, const BlockNumber *stuck, uint32 n,
 	while (i < n)
 	{
 		RefsPages	rp;
-		uint32		covered = refs_lock(rel, stuck + i, n - i, &rp);
-		bool		changed = false;
+		uint32		covered = refs_lock(rel, blocks + i, n - i, &rp);
 
 		for (uint32 k = i; k < i + covered; k++)
-		{
-			uint32		h = holders[stuck[k]];
-
-			if (h > 0 && refs_get(&rp, stuck[k]) != BMAP_REFS_STUCK)
-				continue;
-			refs_set(&rp, stuck[k], (uint8) (h > 0 ? h - 1 : 0));
-			changed = true;
-			recounted += h > 0;
-		}
-		if (changed)
+			refs_set(&rp, blocks[k], 0);
+		recounted += covered;
 		{
 			xl_bmap_unref xlrec;
 
@@ -10690,8 +10663,8 @@ sweep_shrink(RelFileLocator rel)
  * block-mapped relation there holds (found by their map files, not by
  * catalog rows), then free the blocks allocated when the sweep began that
  * nothing holds (left by a crash after a drop's commit), what the release
- * queue holds let go of first and the rest counted, rewrite the
- * stuck counts whose holders now fit one, and shorten the store to its
+ * queue holds let go of first and the rest counted, their counts zeroed
+ * first, and shorten the store to its
  * last allocated block.  Branch creation (bmapshare()) is held off while
  * the maps are read and the counts rewritten; extensions and remaps go on,
  * allocating blocks the sweep never frees.
@@ -11207,7 +11180,6 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 {
 	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
 	char	   *path = GetDatabasePath(dbOid, spcOid);
-	uint64		released = 0;
 
 	memset(result, 0, sizeof(*result));
 	if (RecoveryInProgress())
@@ -11224,7 +11196,7 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 		bmap_release_drain(spcOid, dbOid, 0, &done);
 	}
 	INJECTION_POINT("bmap-sweep-drained", NULL);
-	swept_note(rel, true, &released);
+	swept_note(rel, true);
 	sweep_note(rel, true);
 	sweep_nyielded = 0;
 	compacting_clear_at_exit();
@@ -11236,7 +11208,7 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	sweep_done(0, PointerGetDatum(&rel));
 	result->moved = compact_store(rel, path);
 	result->truncated = sweep_shrink(rel);
-	swept_note(rel, false, &released);
+	swept_note(rel, false);
 	pfree(path);
 }
 
@@ -11642,12 +11614,9 @@ bmap_sizes(Oid spcOid, Oid dbOid, BmapRelationVisit visit, void *arg,
 
 /*
  * Is a sweep of a database's page store in a tablespace due?  Once after
- * the server starts (a crash before may have leaked a drop's blocks), and
- * whenever a stuck count has lost a holder since the last
- * sweep began (it keeps it, stuck: the sweep may free the block or fit the
- * count).  A count left stuck by a sweep, its holders all still there, is
- * no reason for another.  Past the most stores remembered, a store not
- * among them isn't due.
+ * the server starts (a crash before may have leaked a drop's blocks): counts
+ * are exact, so a block's last holder going frees it with no sweep.  Past
+ * the most stores remembered, a store not among them isn't due.
  */
 bool
 bmap_sweep_due(Oid spcOid, Oid dbOid)
@@ -11663,7 +11632,7 @@ bmap_sweep_due(Oid spcOid, Oid dbOid)
 	if (found == NULL)
 		due = bmap_shared->nswept < BMAP_SWEPT_MAX;
 	else
-		due = !found->swept || found->released != found->swept_at;
+		due = !found->swept;
 	SpinLockRelease(&bmap_shared->mutex);
 	return due;
 }
@@ -11678,21 +11647,19 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	BmapMeta   *meta;
 	BlockNumber hw;
 	uint64	   *allocated;
-	uint16	   *holders;
+	uint32	   *holders;
 	uint64	   *reached;
 	DIR		   *dir;
 	SweepRoots	sr;
 	struct dirent *de;
 	BlockList	tofree = {0};
-	BlockList	stuck = {0};
+	BlockList	recount = {0};
 	BlockNumber nrefpages;
-	uint64		stuck_held;
 
 	/* the roots whose capturers never committed let go of first, the rest settled */
 	(void) bmap_roots_reclaim(rel, true);
 	SET_LOCKTAG_OBJECT(tag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
-	stuck_held = pg_atomic_read_u64(&bmap_shared->stuck_held);
 
 	/* the blocks allocated as it begins: the only ones it may free */
 	metabuf = alloc_read(rel, 0);
@@ -11719,8 +11686,8 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 
 	/* what every relation holds */
 	holders = MemoryContextAllocHuge(CurrentMemoryContext,
-									 (hw + 1) * sizeof(uint16));
-	memset(holders, 0, (hw + 1) * sizeof(uint16));
+									 (hw + 1) * sizeof(uint32));
+	memset(holders, 0, (hw + 1) * sizeof(uint32));
 	reached = MemoryContextAllocHuge(CurrentMemoryContext,
 									 (hw / 64 + 1) * sizeof(uint64));
 	memset(reached, 0, (hw / 64 + 1) * sizeof(uint64));
@@ -11748,7 +11715,15 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		sweep_queue(rel, sweep_node, sweep_entry, &sh);
 	}
 
-	/* nothing holds them: freed; stuck counts that fit: rewritten */
+	/*
+	 * Nothing holds them: freed, their counts zeroed first if not zero.  The
+	 * count of a block something holds is left as it is: a tree's node
+	 * copied meanwhile (which this lock doesn't hold off) gave its children a
+	 * holder each after their relation was counted, so a count rewritten
+	 * from what was counted could be a holder short.  Counts are exact, so
+	 * none needs rewriting but one a crash left too high, whose block a sweep
+	 * frees once its holders are gone.
+	 */
 	nrefpages = refs_nblocks(rel);
 	for (BlockNumber b = 0; b < hw; b++)
 	{
@@ -11758,39 +11733,11 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		{
 			block_list_add(&tofree, b);
 			if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) != 0)
-				block_list_add(&stuck, b);
-		}
-		else if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) == BMAP_REFS_STUCK)
-		{
-			if (holders[b] - 1 < BMAP_REFS_STUCK)
-				block_list_add(&stuck, b);
-			else
-				result->stuck++;
+				block_list_add(&recount, b);
 		}
 	}
 	INJECTION_POINT("bmap-sweep-counted", NULL);
-
-	/*
-	 * A tree's node copied meanwhile (which this lock doesn't hold off) gave
-	 * its children a holder each, after their relation was counted; one whose
-	 * count was stuck stayed so, but a count rewritten from what was counted
-	 * would be a holder short.  Then the stuck counts are left as they are
-	 * (those of blocks nothing holds, which no copy reaches, still go).
-	 */
-	if (pg_atomic_read_u64(&bmap_shared->stuck_held) != stuck_held)
-	{
-		uint32		kept = 0;
-
-		for (uint32 k = 0; k < stuck.n; k++)
-		{
-			if (holders[stuck.blocks[k]] == 0)
-				stuck.blocks[kept++] = stuck.blocks[k];
-			else
-				result->stuck++;
-		}
-		stuck.n = kept;
-	}
-	result->recounted = sweep_recount(rel, stuck.blocks, stuck.n, holders);
+	result->recounted = sweep_recount(rel, recount.blocks, recount.n);
 
 	/*
 	 * Each relation's shared_below lowered to what other maps still hold,
@@ -11823,8 +11770,8 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	pfree(reached);
 	if (tofree.blocks)
 		pfree(tofree.blocks);
-	if (stuck.blocks)
-		pfree(stuck.blocks);
+	if (recount.blocks)
+		pfree(recount.blocks);
 }
 
 /*
@@ -11893,7 +11840,7 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
  * (InvalidBlockNumber if unmapped), the entry's birth epoch, and how many
  * other maps reach the block: its own count and the counts of the nodes on
  * its path, added up (a node shared by k maps more shares every block under
- * it with them; at most BMAP_REFS_STUCK).
+ * it with them; a sum past a uint32 says the most one holds).
  */
 void
 bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
@@ -11904,7 +11851,7 @@ bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 	TreePath	path;
 	BmapEntry	ptr;
 	Buffer		buf;
-	uint32		n;
+	uint64		n;
 
 	*phys = InvalidBlockNumber;
 	*epoch = 0;
@@ -11930,7 +11877,7 @@ bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 		ptr = PageGetBmapEntries(BufferGetPage(buf))[path.slot[level]];
 		UnlockReleaseBuffer(buf);
 	}
-	*refs = Min(n, BMAP_REFS_STUCK);
+	*refs = (uint32) Min(n, PG_UINT32_MAX);
 }
 typedef struct InspectTree
 {
