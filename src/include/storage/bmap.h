@@ -100,28 +100,27 @@ extern int	bmapfd(SMgrRelation reln, ForkNumber forknum,
 extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
 
 /*
- * Captured roots: a relation's tree as it was at a moment, kept by its
- * page store (not by the relation), so any number of them, each outliving
- * the relation's storage until it is let go of, and any relation of the
- * store may be made of it, another branch's included.  Capturing one is
- * O(1) in the relation's size, but for the pages changed since its last
- * capture, logged as images and written out; and a relation can be made of one in O(1) (bmap_share_root()).  A frozen
- * root (bmap_root_capture_of()) is captured of temporary storage
- * holding frozen copies of a relation's pages changed since its last root,
- * the rest shared with that root, and records the relation and its epoch
- * then, so the next one's changed pages are found by their epochs
- * (bmap_root_base(), bmap_changed_pages(), or bmap_changed_since() to ask
- * only whether one changed).  bmap_root_copy() holds a root
- * again by a root of its own, the same subtrees, in O(1).  Each root
- * records its map's lineage (bmap_lineage()): a relation made of a root to
- * take another storage's place may carry that storage's on, so that the
- * roots captured of the storage it replaced are its own too
- * (bmap_root_of()), with nothing renamed.  A root
- * is held once its capturing (sub)transaction commits, and let go of once
- * the (sub)transaction that lets go of it commits: one whose capturer
- * aborted, or was ended by a crash, holds nothing, and neither does one
- * whose releaser committed; the page store's next captures or sweep reuse
- * their slots.  A root is named by an id (0: none) unique in its store.
+ * Captured roots: a relation's tree as it was at a moment, kept by its page
+ * store (not by the relation), so any number of them, each outliving the
+ * relation's storage until it is let go of, and any relation of the store may
+ * be made of it, another branch's included.  Capturing one is O(1) in the
+ * relation's size, but for the pages changed since its last capture, logged as
+ * images and written out; and a relation can be made of one in O(1)
+ * (bmap_share_root()).  A frozen root (bmap_root_capture_of()) is captured of
+ * temporary storage holding frozen copies of a relation's pages changed since
+ * its last root, the rest shared with that root, and records the relation and
+ * its epoch then, so the next one's changed pages are found by their epochs
+ * (bmap_root_base(), bmap_changed_pages(), or bmap_changed_since() to ask only
+ * whether one changed).  bmap_root_copy() holds a root again by a root of its
+ * own, the same subtrees, in O(1).  Each root records its map's lineage
+ * (bmap_lineage()): a relation made of a root to take another storage's place
+ * may carry that storage's on, so that the roots captured of the storage it
+ * replaced are its own too (bmap_root_of()), with nothing renamed.  A root is
+ * held once its capturing (sub)transaction commits, and let go of once the
+ * (sub)transaction that lets go of it commits: one whose capturer aborted, or
+ * was ended by a crash, holds nothing, and neither does one whose releaser
+ * committed; the page store's next captures or sweep reuse their slots.  A
+ * root is named by an id (0: none) unique in its store.
  */
 typedef uint64 BmapRootId;
 
@@ -203,16 +202,16 @@ extern bool bmap_compaction_let_go(const LOCKTAG *tag, TimestampTz *start);
 
 /*
  * The release queue: a dropped map's subtrees and blocks, queued as it is
- * dropped (in O(1) of the relation's size: its root page's pointers),
- * each holding what it names until a drain lets go of it as a drop of the map would have: a count one less, or the
- * block freed, a node's children queued in its place.  A step is one
- * record: some entries popped, what they let go of, the children pushed.
- * Steps are taken by one backend of a page store at a time; another, or a
- * sweep counting holders, makes a step take none.  A relation dropped at a
- * commit is queued before the commit record, its entries naming the
- * transaction: they hold nothing until it commits (a step stops at them),
- * and are popped with nothing let go of if it doesn't.  With autovacuum
- * off, a relation's extension takes steps first when the store would grow.
+ * dropped (in O(1) of the relation's size: its root page's pointers), each
+ * holding what it names until a drain lets go of it as a drop of the map would
+ * have: a count one less, or the block freed, a node's children queued in its
+ * place.  A step is one record: some entries popped, what they let go of, the
+ * children pushed. Steps are taken by one backend of a page store at a time;
+ * another, or a sweep counting holders, makes a step take none.  A relation
+ * dropped at a commit is queued before the commit record, its entries naming
+ * the transaction: they hold nothing until it commits (a step stops at them),
+ * and are popped with nothing let go of if it doesn't.  A relation's
+ * extension takes steps first when the store would grow.
  */
 typedef struct BmapRelease
 {
