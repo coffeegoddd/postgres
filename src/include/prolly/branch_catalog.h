@@ -73,6 +73,20 @@ typedef struct BranchIdRoutine
 extern PGDLLIMPORT const BranchIdRoutine *BranchIds;
 extern PGDLLIMPORT const BranchIdRoutine SequenceBranchIds;
 
+/*
+ * What branch creation and deletion do to the catalogs: drop removes every
+ * catalog row of a branch (its versioned schemas and all in them), leaving
+ * every other branch's and the shared ones.  Storage is not its concern:
+ * dropping a relation drops its storage as any DROP does.
+ */
+typedef struct BranchCatalogRoutine
+{
+	void		(*drop) (int32 branch);
+} BranchCatalogRoutine;
+
+extern PGDLLIMPORT const BranchCatalogRoutine *BranchCatalogs;
+extern PGDLLIMPORT const BranchCatalogRoutine DependencyBranchCatalogs;
+
 /* The namespace named nspname this session sees: its branch's, else shared. */
 extern HeapTuple SearchNamespaceByName(const char *nspname);
 extern Oid	NamespaceOidByName(const char *nspname);

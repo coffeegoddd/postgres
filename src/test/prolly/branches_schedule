@@ -6,3 +6,4 @@ test: branch_catalogs
 test: branch_shared_catalogs
 test: branch_extensions
 test: branch_references
+test: branch_drop
