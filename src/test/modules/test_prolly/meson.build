@@ -56,6 +56,7 @@ tests += {
       't/009_bmap_evictions.pl',
       't/010_bmap_evict_lock.pl',
       't/011_bmap_relfilenumber_reuse.pl',
+      't/017_vm_set_logical_decoding.pl',
       't/019_bmap_share_maps_minimal.pl',
     ],
     'env': {

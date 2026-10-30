@@ -20,7 +20,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 TAP_TESTS = 1
 
 EXTRA_INSTALL = contrib/pageinspect contrib/pg_buffercache contrib/pg_visibility \
-	contrib/pg_walinspect \
+	contrib/pg_walinspect contrib/test_decoding \
 	src/test/modules/injection_points
 
 export enable_injection_points
