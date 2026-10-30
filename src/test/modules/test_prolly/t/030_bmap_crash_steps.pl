@@ -212,6 +212,35 @@ crash_at('a sweep counting roots', 'bmap-sweep-root-counts',
 is(sql(q{SELECT whole AND differ = 0 FROM test_bmap_root_counts()}), 't',
 	"a sweep counting roots: the roots' counts are whole and exact after");
 
+# The roots' counts as the standby replays them: roots captured, counted
+# by a sweep, changed under, and some let go of and drained, both the
+# pages only they held and nodes the table still holds leaving what the
+# roots hold.  The standby, promoted, has counts as whole and exact as the
+# primary's, so a sweep after a failover begins from counts it can trust.
+my @kept_roots;
+for my $i (1 .. 6)
+{
+	push @kept_roots, sql(qq{UPDATE counted SET b = b || ' r$i' WHERE a = $i * 100;
+		SELECT test_bmap_root_capture($counted)});
+}
+sql(q{SELECT * FROM test_bmap_sweep()});
+sql(qq{SELECT test_bmap_root_release($_)}) for @kept_roots[0 .. 3];
+sql(q{SELECT * FROM test_bmap_release_drain()});
+remember_table('counted');
+is(sql(q{SELECT whole AND differ = 0 FROM test_bmap_root_counts()}), 't',
+	"the primary's roots' counts are whole and exact");
+$primary->wait_for_replay_catchup($standby);
+$standby->promote;
+$standby->poll_query_until('postgres', 'SELECT NOT pg_is_in_recovery()')
+  or die 'the standby did not leave recovery';
+is($standby->safe_psql('postgres',
+		q{SELECT whole AND differ = 0 FROM test_bmap_root_counts()}),
+	't', "the promoted standby's roots' counts are whole and exact");
+is($standby->safe_psql('postgres', q{SELECT freed || ' ' || recounted FROM test_bmap_sweep()}),
+	'0 0', 'and a sweep there frees and recounts nothing');
+ok(check_rows($standby, 'on the promoted standby'),
+	'the promoted standby reads every table');
+
 $standby->stop;
 $primary->stop;
 done_testing();
