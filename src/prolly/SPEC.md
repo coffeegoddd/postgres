@@ -106,10 +106,15 @@ This hybrid storage approach has four key parts:
   chunks inside Postgres, in pages of their own layout that go through
   Postgres's buffer manager and WAL.  History is therefore backed up,
   replicated and recovered with the rest of the database.
-- **Capture.**  Logical decoding reads each branch's committed changes from
-  the WAL and applies them to that branch's working tree in the history
-  store.  A Dolt commit records the tree as of a point in the WAL, without
-  blocking writers.
+- **Capture.**  Capture is the process that copies each branch's changes
+  from its tables into the history store.  Each branch has a working tree:
+  a prolly tree in the history store that holds the same rows as the
+  branch's tables.  Capture reads the branch's committed changes from the
+  WAL with logical decoding, the Postgres feature that turns WAL records
+  back into row-level inserts, updates and deletes, one committed
+  transaction at a time and in commit order.  It applies them to the
+  working tree, so the tree follows the tables a short way behind.  A Dolt commit records the
+  working tree as of a point in the WAL, without blocking writers.
 - **The window.**  A configurable stretch of history in which
   version-control operations are guaranteed to be efficient, at the cost of
   the storage it takes.  Its bounds are set by commits, size or time, or a
@@ -174,7 +179,7 @@ in time and space that neither Postgres nor Dolt pays alone:
   cross, multiplied by the work each row needs on the far side.
 - **Space.**  A versioned table is stored twice, once in each form.  Rows
   rewritten into the working set also leave old tuple versions behind
-  until vacuum reclaims them, and keyframes, when kept, add saved pages.
+  until vacuum reclaims them.
 
 Version-control operations that cross the seam are therefore the ones
 this design must make cheap.
@@ -187,9 +192,7 @@ this design must make cheap.
 - **Moving a branch to another commit applies the difference.**  Reset,
   checkout of an older commit and the result of a merge are computed in the
   history store, and then applied to the branch's tables as ordinary row
-  changes.  When many rows differ, restoring a saved page image (a
-  keyframe) and applying only the rest is cheaper, and a planner chooses
-  between the two from measured costs.
+  changes.
 - **A new branch shares its parent's pages.**  Its tables share pages with
   the parent copy-on-write, so creating it copies no data.
 - **Rebuilding.**  A branch can be rebuilt from any commit's history alone,
@@ -200,122 +203,25 @@ this design must make cheap.
 
 #### Branching
 
-**What a branch is made of.**  A branch *B* of a versioned schema consists
-of five things:
-- **A head pointer**: a row in the history store mapping *B* to the hash of
-  its latest commit.
-- **A working-root pointer**: a row mapping *B* to the hash of its working
-  tree, the prolly tree that capture keeps equal to *B*'s tables.
-- **Catalog rows**: a `pg_namespace` row for the schema, marked as *B*'s,
-  and under it *B*'s own rows in `pg_class`, `pg_attribute`, `pg_index`,
-  `pg_constraint`, `pg_type` and the other catalogs, each with its own
-  object IDs.  Objects in unversioned schemas have no per-branch rows;
-  every branch uses the shared ones.
-- **Block maps**: for each of *B*'s tables and indexes, a map from block
-  number to the physical page that holds it.  A map is a tree whose nodes
-  carry reference counts, so two branches can share a whole map, or any
-  part of one, by pointing to the same node.  A page is shared when more
-  than one branch's map reaches it.
-- **A capture position**: the WAL position up to which *B*'s changes have
-  been applied to its working tree.
+Branches are copy-on-write.  Creating a branch copies no pages: it copies
+the versioned schema's catalog rows and points each of the new branch's
+tables and indexes at the parent's pages, which costs O(C), with *C* the
+number of tables and indexes in the versioned schema.  A page is copied
+only on the first write to it on either branch.  Branching from an
+arbitrary commit starts the same way from HEAD, then rewrites on the new
+branch the rows that differ between HEAD and that commit, which costs
+O(C + D), with *D* the number of differing rows.
+When HEAD is dirty, the uncommitted rows are undone on the branch that must
+not keep them, which also costs O(C + D), with *D* the number of dirty rows.
 
-**Reading and writing pages.**  Reading block *k* of a table on *B* looks
-up *k* in *B*'s block map and reads that page through the buffer manager.
-Writing to it first checks whether the page is shared.  If it is, the
-write allocates a new physical page, copies the 8 KB into it, and points
-*B*'s map entry at the copy, first giving *B* its own copy of any shared
-map node on the way to that entry; then it writes the change to the copy.
-The remapping is WAL-logged with the change.  Every
-other branch keeps pointing at the old page.  Only that one page is ever
-copied, and only on the first write to it.
-
-**Working on a branch.**  A session sets its branch.  Its cached catalog
-entries are discarded, and from then on table names resolve to *B*'s
-catalog rows, its queries of the catalogs (`\d`, `information_schema`,
-`pg_dump`) see only *B*'s definitions, and its reads and writes go through
-*B*'s block maps.  Nothing else changes, so switching costs the same
-whatever the size of the data.
-
-**Creating a branch from HEAD, with a clean working set.**  The parent *P*
-is clean when its tables hold exactly its head commit *H*: capture has
-applied every change, and *P*'s working root equals *H*'s tree.
-1. **Fix a point.**  Writes to *P*'s versioned tables are paused for a
-   moment, so that every block map is read as of the same instant.
-2. **Pointers.**  *B*'s head pointer is set to *H*, and its working-root
-   pointer to *H*'s tree.  Both are new rows; no tree is copied.
-3. **Catalog rows.**  Every catalog row of *P*'s versioned schema is copied
-   under *B*, with new object IDs, and references between them rewritten
-   to the new IDs.  The table statistics are copied with them.
-4. **Block maps.**  Each of *B*'s tables and indexes gets a block map that
-   is *P*'s: *B* points to the root of *P*'s map, and the root's reference
-   count rises by one.  Nothing below the root is touched, and no page is
-   copied.
-5. **Capture position.**  *B*'s capture starts at the WAL position of
-   step 1.  Writes to *P* resume.
-
-From then on, the first write on either branch to a shared page copies
-that page, as above.
-
-**Creating a branch from HEAD, with a dirty working set.**  *P*'s tables
-also hold changes committed in SQL since *H*: its working root *W*
-differs from *H*'s tree.  First, capture applies *P*'s changes up to now,
-so that *W* matches *P*'s tables exactly; then steps 1 to 5 run as above,
-except for the working-root pointer.  The uncommitted changes are never
-copied: they sit in pages that both branches now share.  Which branch keeps
-them follows Dolt's checkout rules; on a branch that must not have them,
-they are undone as row changes, each write copying the page it touches on
-that branch only.
-
-**Creating a branch from an arbitrary commit *X*.**  *B*'s head and
-working-root pointers are set to *X* and *X*'s tree.  The working set is
-then built from the cheapest source at hand:
-- **A keyframe of *X*.**  A keyframe is a saved set of block maps, one per
-  table and index, as of a commit.  *B*'s block maps are set to share the
-  keyframe's, exactly as in step 4, and *B*'s catalog rows are made from
-  *X*'s definitions.  No row is written.
-- **A state close to *X*.**  The block maps of a branch, or of a keyframe,
-  whose tables differ from *X* in few rows are shared as in step 4.  The
-  definitions are then brought to *X*'s by DDL, and the rows that differ
-  are rewritten on *B* as row changes, each write copying the page it
-  touches.
-- **Neither.**  *B*'s tables are created empty from *X*'s definitions and
-  loaded with *X*'s rows.  Every row is written.
-
-**Committing on a branch.**  A marker is written into the WAL, capture
-applies *B*'s changes up to it, and a commit chunk is written that names
-*B*'s working tree and *B*'s previous head.  *B*'s head pointer moves to
-the new commit in the same transaction.  No page of the working set is
-read or written.
-
-**Deleting a branch.**  *B*'s catalog rows are dropped, and its block maps
-are released: each map's root loses a reference, and map nodes and pages
-that no branch's map reaches any more are freed, in the background.  *B*'s head and working-root pointers are
-removed; history no other branch reaches is reclaimed by garbage
-collection.
-
-**Limits.**  Names in the history store are cheap: the prototype creates a
-branch in 2 to 8 microseconds, flat up to a million branches.  What a
-branch costs beyond that is its working set:
-- **Storage.**  A branch costs only the pages it has changed.
-- **Catalog size.**  Each branch adds a copy of the schema's catalog rows,
-  and every object of every branch takes an object ID from a single 32-bit
-  counter shared by the whole cluster.  A schema of 1,000 objects therefore
-  allows on the order of millions of branches before IDs run short.
-- **Catalog filtering.**  Each session filters out other branches' catalog
-  rows, at a cost that grows with the number of objects on other branches
-  (about 2 ms to rebuild after a schema change, at 12,000 hidden objects).
-
-**Time complexity**, with *C* the number of objects in the versioned
-schema, *d* the number of rows that differ and *n* the number of rows in a
-table:
+**Time complexity**, with *n* the number of rows in a table:
 
 | Operation | Dolt | This design |
 |---|---|---|
 | Create from HEAD, clean | O(1) | O(C) |
-| Create from HEAD, dirty | O(1) | O(C + d) |
-| Create from an arbitrary commit | O(1) | O(C + d), or O(C) from a keyframe of that commit |
-| Switch a session's branch | O(1) | O(1) |
-| Commit on a branch | O(d log n) | O(d log n) |
+| Create from HEAD, dirty | O(1) | O(C + D) |
+| Create from an arbitrary commit | O(1) | O(C + D) |
+| Commit on a branch | O(D log n) | O(D log n) |
 | Delete a branch | O(1) | O(C) |
 
 Dolt's creates cost O(1) because a Dolt branch is only a name: its working
@@ -323,6 +229,150 @@ set is a pointer to a tree, shared until written.  Ours cost O(C) because a
 Postgres branch also needs its own catalog rows, which is what lets every
 Postgres feature work on it unchanged; the data itself is shared, as in
 Dolt.
+
+#### Checkout
+
+Checkout discards the session's cached catalog entries; from then on,
+table names resolve to the checked-out branch's catalog rows, and reads and
+writes go through that branch's pages.  No row is read or written, whether
+the working set is clean or dirty: uncommitted changes stay in the pages of
+the branch they were made on.
+
+The one cost that grows is catalog filtering: the session rebuilds the set
+of other branches' catalog rows it must hide, which costs O(B × C), with
+*B* the number of branches (about 2 ms at 12,000 hidden objects in the
+prototype).
+
+Checking out an arbitrary commit rewrites the rows that differ between the
+branch's tables and that commit, which costs O(D), with *D* the number of
+differing rows.
+
+**Time complexity:**
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Check out from HEAD, clean | O(1) | O(1) in rows; O(B × C) in catalog filtering |
+| Check out from HEAD, dirty | O(1) | O(1) in rows; O(B × C) in catalog filtering |
+| Check out an arbitrary commit | O(1) | O(D) |
+
+Dolt checks out a commit in O(1) because it points the working set at that
+commit's tree.  Ours costs O(D) because the rows must be rewritten in the
+table's pages, where Postgres features read them.
+
+#### Diff
+
+Diff compares two prolly trees in the history store, as Dolt does,
+walking only the parts that differ.  This costs O(D log n), with *D* the
+number of differing rows and *n* the number of rows in a table.
+
+To diff the working set, against HEAD or an arbitrary commit, capture
+first catches up: it decodes the branch's committed changes from the WAL
+into the branch's working tree, up to the moment the diff starts.  This
+costs O(L), with *L* the number of changes it had not yet applied.  The
+diffing session's own uncommitted rows, which the WAL does not yet show,
+are then read from its pages and merged into the diff.  Diffing one
+arbitrary commit against another needs no catch-up, so it stays
+O(D log n).
+
+**Time complexity:**
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Diff working set and HEAD | O(D log n) | O(L + D log n) |
+| Diff working set and an arbitrary commit | O(D log n) | O(L + D log n) |
+| Diff an arbitrary commit and another | O(D log n) | O(D log n) |
+
+Dolt needs no catch-up because its writes go straight into its trees.
+Ours go into Postgres pages first, and capture follows them; *L* is how
+far it trails, which stays small while capture keeps up.
+
+#### Reset, soft
+
+A soft reset moves only the branch's head pointer, to HEAD or to an
+arbitrary commit, in one row update in the history store.  The branch's
+tables and working tree are not touched, so whatever the working set
+holds, clean or dirty, it keeps; it now differs from the new head by
+whatever separates the two.  No row is read or written, and capture does
+not need to catch up.
+
+**Time complexity:**
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Soft reset to HEAD, clean | O(1) | O(1) |
+| Soft reset to HEAD, dirty | O(1) | O(1) |
+| Soft reset to an arbitrary commit, clean | O(1) | O(1) |
+| Soft reset to an arbitrary commit, dirty | O(1) | O(1) |
+
+#### Reset, hard
+
+A hard reset moves the branch's head pointer to the target, HEAD or an
+arbitrary commit, and makes the working set equal to the target's tree,
+discarding uncommitted changes.  Unlike the operations above, it crosses
+the seam:
+1. Capture catches up, as for a diff, so the working tree matches the
+   tables, which costs O(L).
+2. The working tree is diffed against the target's tree in the history
+   store, which costs O(D log n), with *D* the number of differing rows.
+3. Each differing row is written into the branch's tables as an ordinary
+   insert, update or delete, with its index entries and WAL, which costs
+   O(D).  Definitions that differ are changed by DDL first.
+4. The working-root pointer is set to the target's tree directly, and
+   capture skips the writes of step 3 instead of decoding them back.
+
+When the working set is clean and the target is HEAD, *D* is zero and
+nothing is written.
+
+**Time complexity:**
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Hard reset to HEAD, clean | O(1) | O(1) |
+| Hard reset to HEAD, dirty | O(1) | O(L + D log n), *D* the dirty rows |
+| Hard reset to an arbitrary commit, clean | O(1) | O(L + D log n), *D* the rows that differ between HEAD and the commit |
+| Hard reset to an arbitrary commit, dirty | O(1) | O(L + D log n), *D* the rows that differ between the working set and the commit |
+
+Dolt resets in O(1) because it points the working set at the target's
+tree.  Ours must rewrite the differing rows in the tables' pages, where
+Postgres features read them.
+
+#### Merge
+
+A merge of branch *T* into the current branch is computed in the history
+store, as in Dolt, and then applied to the current branch's tables:
+1. Capture catches up, so the working tree matches the tables, which costs
+   O(L).
+2. The merge base, the latest commit both branches share, is found by
+   walking the commit graph, as in Dolt.
+3. If the current branch's head is the merge base, the merge is a
+   fast-forward: the result is *T*'s tree.  Otherwise the three trees are
+   merged: the base is diffed against each side, and the two sets of
+   changes are combined, which costs O((D<sub>1</sub> + D<sub>2</sub>) log
+   n), with *D<sub>1</sub>* and *D<sub>2</sub>* the rows each side changed.
+   Uncommitted changes on the current branch count as its side, as in
+   Dolt.
+4. The rows that differ between the working tree and the result are
+   written into the current branch's tables as ordinary row changes, and
+   the working-root pointer is set to the result.  For a three-way merge,
+   these are the *D<sub>2</sub>* rows that came from *T*.
+5. Conflicts, rows both sides changed differently, are written as rows of
+   conflict tables, as in Dolt, which costs O(K), with *K* the number of
+   conflicts.  A merge without conflicts then commits, or for a
+   fast-forward moves the head pointer to *T*'s head.
+
+**Time complexity**, leaving out the search for the merge base, which is
+the same in both:
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Fast-forward | O(1) | O(L + D log n), *D* the rows between the two heads |
+| Three-way, no conflicts | O((D<sub>1</sub> + D<sub>2</sub>) log n) | O(L + (D<sub>1</sub> + D<sub>2</sub>) log n) |
+| Three-way, with conflicts | O((D<sub>1</sub> + D<sub>2</sub>) log n + K) | O(L + (D<sub>1</sub> + D<sub>2</sub>) log n + K) |
+
+A three-way merge costs about the same in both, since both compute it in
+prolly trees and ours writes only the rows that came from *T*.  A
+fast-forward costs more in ours, because Dolt moves a pointer where ours
+must rewrite the rows *T* changed.
 
 ### Compared with stock Postgres: OLTP performance
 
