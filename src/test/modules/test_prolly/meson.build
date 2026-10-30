@@ -43,6 +43,7 @@ tests += {
       'bmap_captured_roots',
       'vacuum_shared',
       'bmap_primitives',
+      'bmap_settle_roots',
     ],
   },
   'tap': {

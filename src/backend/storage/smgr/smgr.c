@@ -199,6 +199,14 @@ typedef struct f_smgr
 	uint32		(*smgr_releasestep) (SMgrRelation reln);
 
 	/*
+	 * Before the current database's oldest transaction id advances, which
+	 * lets the commit log forget older transactions: make whatever state of
+	 * the database's storage names a transaction need the log no more.  In a
+	 * transaction.  May be NULL.
+	 */
+	void		(*smgr_settlexids) (void);
+
+	/*
 	 * May writing out a page of one of a relation's forks read the
 	 * relation's buffers of 'forknum'?  May be NULL (never).
 	 */
@@ -301,6 +309,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_enddrops = bmapenddrops,
 		.smgr_beforeextend = bmapbeforeextend,
 		.smgr_releasestep = bmapreleasestep,
+		.smgr_settlexids = bmapsettlexids,
 		.smgr_writesread = bmapwritesread,
 		.smgr_readsdropped = true,
 		.smgr_unlink = bmapunlink,
@@ -956,6 +965,22 @@ smgrreleasestep(SMgrRelation reln)
 	if (smgrsw[reln->smgr_which].smgr_releasestep == NULL)
 		return 0;
 	return smgrsw[reln->smgr_which].smgr_releasestep(reln);
+}
+
+/*
+ * smgrsettlexids() -- Before the current database's oldest transaction id
+ *					   advances, have every storage manager settle what of
+ *					   its storage names a transaction.
+ *
+ * The commit log may forget transactions older than the new horizon, so
+ * nothing may still need to ask it about them afterwards.
+ */
+void
+smgrsettlexids(void)
+{
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_settlexids)
+			smgrsw[i].smgr_settlexids();
 }
 
 /*

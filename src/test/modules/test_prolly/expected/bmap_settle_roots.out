@@ -1,0 +1,58 @@
+-- A block-mapped page store's captured roots name the transactions that
+-- captured them.  Before the database's oldest transaction id advances,
+-- and the commit log may forget those transactions, VACUUM settles every
+-- root: one held names no transaction any more, and one whose capturer
+-- aborted is reclaimed.  Otherwise, once the log can't say a capturer
+-- aborted, its root would be held for good.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SET debug_block_mapped_heap = on;
+CREATE TABLE settle_t (id int) WITH (autovacuum_enabled = off);
+INSERT INTO settle_t SELECT generate_series(1, 1000);
+SELECT relfilenode AS t FROM pg_class WHERE relname = 'settle_t' \gset
+BEGIN;
+SELECT test_bmap_root_capture(:t) AS kept \gset
+COMMIT;
+BEGIN;
+SELECT test_bmap_root_capture(:t) > 0 AS captured_then_aborted;
+ captured_then_aborted 
+-----------------------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT test_bmap_roots_naming() > 0 AS roots_name_transactions;
+ roots_name_transactions 
+-------------------------
+ t
+(1 row)
+
+VACUUM settle_t;
+SELECT test_bmap_roots_naming() AS roots_naming_after_vacuum;
+ roots_naming_after_vacuum 
+---------------------------
+                         0
+(1 row)
+
+SELECT test_bmap_root_held(:kept) IS NOT NULL AS kept_root_still_held;
+ kept_root_still_held 
+----------------------
+ t
+(1 row)
+
+BEGIN;
+SELECT test_bmap_root_release(:kept);
+ test_bmap_root_release 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE settle_t;
+SELECT entries >= 0 AS drained FROM test_bmap_release_drain();
+ drained 
+---------
+ t
+(1 row)
+
+RESET debug_block_mapped_heap;

@@ -121,6 +121,7 @@ extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer);
 extern uint32 smgrreleasestep(SMgrRelation reln);
+extern void smgrsettlexids(void);
 extern void smgrprecommitdrop(SMgrRelation reln);
 extern bool smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum);

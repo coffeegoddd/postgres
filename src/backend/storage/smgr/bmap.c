@@ -163,8 +163,10 @@
 
 #include "access/bufmask.h"
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -7704,6 +7706,40 @@ root_settle(RelFileLocator store, Buffer buf, uint32 slot,
 	if (memcmp(&settled, r, sizeof(settled)) != 0)
 		roots_set_slot(store, buf, slot, &settled, InvalidBuffer);
 	return cleared;
+}
+
+/*
+ * Settle the captured roots of the current database's page stores, in
+ * every tablespace, so that none needs the commit log to say what became
+ * of a transaction older than any running now (bmap_roots_reclaim()), as
+ * the database's oldest transaction id is about to advance.  A tablespace
+ * with no page store of the database's has nothing to settle.
+ */
+void
+bmapsettlexids(void)
+{
+	Relation	rel = table_open(TableSpaceRelationId, AccessShareLock);
+	TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
+	HeapTuple	tup;
+	List	   *spcs = NIL;
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Oid			spc = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
+
+		if (spc != GLOBALTABLESPACE_OID)
+			spcs = lappend_oid(spcs, spc);
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	foreach_oid(spc, spcs)
+	{
+		RelFileLocator store = {spc, MyDatabaseId, InvalidRelFileNumber};
+
+		(void) bmap_roots_reclaim(store, true);
+	}
+	list_free(spcs);
 }
 
 /*
