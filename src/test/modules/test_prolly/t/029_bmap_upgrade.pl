@@ -8,16 +8,46 @@
 # Sequences are block-mapped too, and moved as tables are: a sequence, a
 # serial column's and an identity column's go on from where they were.
 # A page store is moved even when no relation names it: one holding only
-# a captured root keeps it.
+# a captured root keeps it, in the default tablespace and in another where
+# the database has nothing else.  One run moves files with two jobs.
 
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Digest::MD5;
 
 # (pg_upgrade writes its scripts and logs to the directory it runs in)
 chdir PostgreSQL::Test::Utils::tempdir;
+
+# A database's directory in a tablespace (the server running).
+sub db_dir
+{
+	my ($node, $dbname, $spcname) = @_;
+	my $db = $node->safe_psql($dbname, qq{SELECT oid FROM pg_database WHERE datname = '$dbname'});
+	my $spc = $node->safe_psql($dbname, qq{SELECT oid FROM pg_tablespace WHERE spcname = '$spcname'});
+	my ($version) = glob($node->data_dir . "/pg_tblspc/$spc/PG_*");
+	return "$version/$db";
+}
+
+# The page store's files in a database's directory, by file number, with
+# an MD5 of each (the server stopped).
+sub store_files
+{
+	my ($dir) = @_;
+	my @out;
+	for my $f (9442, 9421, 9420, 9419)
+	{
+		my $path = "$dir/$f";
+		next unless -f $path;
+		open my $fh, '<', $path or die "$path: $!";
+		binmode $fh;
+		push @out, "$f:" . Digest::MD5->new->addfile($fh)->hexdigest;
+		close $fh;
+	}
+	return join(',', @out);
+}
 
 for my $mode ('--copy', '--link', '--swap')
 {
@@ -27,6 +57,7 @@ for my $mode ('--copy', '--link', '--swap')
 	$old->append_conf('postgresql.conf', qq{
 	debug_block_mapped_heap = on
 	autovacuum = off
+	allow_in_place_tablespaces = on
 	});
 	$old->start;
 
@@ -62,11 +93,24 @@ for my $mode ('--copy', '--link', '--swap')
 	my $root = $old->safe_psql('roots', qq{SELECT test_bmap_root_capture($r)});
 	my $r_rows = $old->safe_psql('roots', qq{SELECT test_bmap_rows_digest($r)});
 	$old->safe_psql('roots', q{DROP TABLE r});
+
+	# And a store in a tablespace where the database then has nothing else
+	# (its table dropped, its blocks freed or queued to be).
+	$old->safe_psql('postgres', q{CREATE TABLESPACE ts LOCATION ''});
+	$old->safe_psql('roots', q{
+		CREATE TABLE r2 (a int, b text) TABLESPACE ts;
+		INSERT INTO r2 SELECT g, repeat('s', 100) FROM generate_series(1, 2000) g;
+	});
+	$old->safe_psql('roots', q{DROP TABLE r2; CHECKPOINT;});
+	is($old->safe_psql('roots', q{SELECT count(*) FROM pg_class WHERE reltablespace =
+		(SELECT oid FROM pg_tablespace WHERE spcname = 'ts')}),
+		'0', 'the roots database has no relation in the tablespace');
 	is($old->safe_psql('roots', q{
 		SELECT count(*) FROM pg_class c
 		WHERE c.relkind IN ('r', 'm', 't', 'S', 'i') AND c.oid >= 16384}),
 		'0', 'the roots database has no relation of its own');
 	my $rows = $old->safe_psql('postgres', $rows_query);
+	my $old_ts_dir = db_dir($old, 'roots', 'ts');
 	my $s_rows = $old->safe_psql('postgres', q{SELECT count(*), sum(a) FROM s});
 	my $other_rows = $old->safe_psql('other', $rows_query);
 	my $db = $old->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
@@ -75,12 +119,16 @@ for my $mode ('--copy', '--link', '--swap')
 	my $sq = $old->safe_psql('postgres', q{SELECT pg_relation_filenode('sq')});
 	ok(-f $old->data_dir . "/base/$db/${sq}_bmap", 'and so is its sequence');
 	$old->stop;
+	my $ts_store = store_files($old_ts_dir);
+	like($ts_store, qr/9421:[0-9a-f]{32}/,
+		'the tablespace has the database\'s store');
 
 	my $new = PostgreSQL::Test::Cluster->new("upgrade_new$suffix");
 	$new->init;
 	$new->append_conf('postgresql.conf', qq{
 	debug_block_mapped_heap = on
 	autovacuum = off
+	allow_in_place_tablespaces = on
 	});
 
 	my $bindir = $old->config_data('--bindir');
@@ -93,8 +141,14 @@ for my $mode ('--copy', '--link', '--swap')
 		  '--socketdir' => $new->host,
 		  '--old-port' => $old->port,
 		  '--new-port' => $new->port,
+		  ($mode eq '--link' ? ('--jobs' => 2) : ()),
 		  $mode ],
 		"pg_upgrade $mode upgrades the cluster");
+
+	# (tablespace and database OIDs are kept)
+	(my $new_ts_dir = $old_ts_dir) =~ s/^\Q@{[$old->data_dir]}\E/@{[$new->data_dir]}/;
+	is(store_files($new_ts_dir), $ts_store,
+		'the store in a tablespace where the database had nothing else is moved');
 
 	$new->start;
 	is($new->safe_psql('postgres', $rows_query), $rows, 'the table\'s rows survive');
