@@ -93,10 +93,10 @@ SELECT (:shared_buffers - :plain_buffers) <= 8 * :pages AS shared_buffers_bounde
 -- the leaf to change it, five, and the paths stamped.  (It was nine.)
 SELECT (:dropped_buffers - :plain_buffers) <= 6 * :pages AS dropped_buffers_bounded;
 
--- The reference counts' file is asked its length a few times at most, not
--- a page: whether a block's count page exists is answered from the length
--- known (it was asked, with the file closed and opened again, at each
--- page's first change).
+-- The file system is asked whether the reference counts' file exists, or
+-- its length, a few times at most, not a page: whether a block's count
+-- page exists, or covers it, is answered from the length known (the file
+-- was closed and opened again, and sought, at each page's first change).
 SELECT :asks_shared - :asks_before <= 4 AS copies_ask_the_counts_file_little;
 SELECT :asks_dropped - :asks_shared <= 4 AS claims_ask_the_counts_file_little;
 

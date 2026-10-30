@@ -1250,6 +1250,29 @@ refs_smgr(RelFileLocator rel)
 					INVALID_PROC_NUMBER);
 }
 
+/*
+ * Whether the reference counts' file exists, and its length, asked of the
+ * file system: md.c closes and opens the file again to answer the first,
+ * and seeks for the second.  Every such question of the file goes through
+ * these, which count them (bmap_refs_file_asks()), so a test can tell that
+ * a change asks from the length known instead.
+ */
+static uint64 refs_file_asks = 0;
+
+static bool
+refs_file_exists(SMgrRelation rsrel)
+{
+	refs_file_asks++;
+	return smgrexists(rsrel, MAIN_FORKNUM);
+}
+
+static BlockNumber
+refs_file_nblocks(SMgrRelation rsrel)
+{
+	refs_file_asks++;
+	return smgrnblocks(rsrel, MAIN_FORKNUM);
+}
+
 static SMgrRelation
 queue_smgr(RelFileLocator rel)
 {
@@ -1959,7 +1982,7 @@ ensure_alloc(RelFileLocator rel)
 			smgrcreate(ssrel, MAIN_FORKNUM, false);
 			log_smgrcreate(&sloc, MAIN_FORKNUM);
 		}
-		if (!smgrexists(rsrel, MAIN_FORKNUM))
+		if (!refs_file_exists(rsrel))
 		{
 			smgrcreate(rsrel, MAIN_FORKNUM, false);
 			log_smgrcreate(&rloc, MAIN_FORKNUM);
@@ -1977,7 +2000,7 @@ ensure_alloc(RelFileLocator rel)
 		 */
 		nalloc = smgrnblocks(asrel, MAIN_FORKNUM);
 		nstore = smgrnblocks(ssrel, MAIN_FORKNUM);
-		nrefs = smgrnblocks(rsrel, MAIN_FORKNUM);
+		nrefs = refs_file_nblocks(rsrel);
 		if (nalloc > 1 || nstore != 0 || nrefs != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -2050,7 +2073,7 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
 	/* (the file known to reach that far already: see refs_known()) */
 	if (refs_known(rsrel) != InvalidBlockNumber && refs_known(rsrel) >= need)
 		return;
-	if (!smgrexists(rsrel, MAIN_FORKNUM))
+	if (!refs_file_exists(rsrel))
 	{
 		RelFileLocator rloc = with_relnumber(rel, BMAP_REFS_RELNUMBER);
 
@@ -2058,7 +2081,7 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
 		log_smgrcreate(&rloc, MAIN_FORKNUM);
 	}
 	check_may_read();
-	if (need > 0 && smgrnblocks(rsrel, MAIN_FORKNUM) < need)
+	if (need > 0 && refs_file_nblocks(rsrel) < need)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
 										  EB_SKIP_EXTENSION_LOCK, need,
@@ -2072,24 +2095,22 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
  * exists, so it isn't looked for again, which md.c does by closing and
  * opening it: only its length is asked.
  */
-static uint64 refs_file_asks = 0;
-
 static BlockNumber
 refs_nblocks(RelFileLocator rel)
 {
 	SMgrRelation rsrel = refs_smgr(rel);
 
-	refs_file_asks++;
 	if (refs_known(rsrel) == InvalidBlockNumber &&
-		!smgrexists(rsrel, MAIN_FORKNUM))
+		!refs_file_exists(rsrel))
 		return 0;
-	return smgrnblocks(rsrel, MAIN_FORKNUM);
+	return refs_file_nblocks(rsrel);
 }
 
 /*
- * How many times this backend asked the reference-count files' lengths of
- * the file system (refs_nblocks()): a test's measure that a change asks
- * from the length known instead.
+ * How many times this backend asked the file system whether a reference
+ * counts' file exists, or its length (refs_file_exists(),
+ * refs_file_nblocks()): a test's measure that a change asks from the
+ * length known instead.
  */
 uint64
 bmap_refs_file_asks(void)
@@ -9105,7 +9126,7 @@ roots_exist(RelFileLocator rel)
 {
 	SMgrRelation rsrel = roots_smgr(rel);
 
-	return smgrexists(rsrel, MAIN_FORKNUM) && smgrnblocks(rsrel, MAIN_FORKNUM) > 0;
+	return refs_file_exists(rsrel) && refs_file_nblocks(rsrel) > 0;
 }
 
 /*
@@ -9123,7 +9144,7 @@ ensure_roots(RelFileLocator rel)
 		return;
 	SET_LOCKTAG_RELATION(tag, rel.dbOid, BMAP_ROOTS_RELNUMBER);
 	(void) LockAcquire(&tag, AccessExclusiveLock, false, false);
-	if (!smgrexists(rsrel, MAIN_FORKNUM))
+	if (!refs_file_exists(rsrel))
 	{
 		RelFileLocator rloc = with_relnumber(rel, BMAP_ROOTS_RELNUMBER);
 
@@ -9131,7 +9152,7 @@ ensure_roots(RelFileLocator rel)
 		log_smgrcreate(&rloc, MAIN_FORKNUM);
 	}
 	check_may_read();
-	if (smgrnblocks(rsrel, MAIN_FORKNUM) == 0)
+	if (refs_file_nblocks(rsrel) == 0)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
 										  EB_SKIP_EXTENSION_LOCK, 1,
@@ -9146,7 +9167,7 @@ roots_cover(RelFileLocator rel, BlockNumber need)
 	SMgrRelation rsrel = roots_smgr(rel);
 
 	check_may_read();
-	if (smgrnblocks(rsrel, MAIN_FORKNUM) < need)
+	if (refs_file_nblocks(rsrel) < need)
 		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(rsrel, RELPERSISTENCE_PERMANENT),
 										  MAIN_FORKNUM, NULL,
 										  EB_SKIP_EXTENSION_LOCK, need,
