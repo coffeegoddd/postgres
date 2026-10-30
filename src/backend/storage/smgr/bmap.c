@@ -2003,6 +2003,21 @@ ensure_alloc(RelFileLocator rel)
 }
 
 /*
+ * The length of the reference-count file last learned by this backend, or
+ * InvalidBlockNumber: its storage manager's, which the backend sets as it
+ * asks for the file's length or extends it, and forgets as the file is
+ * closed for good (an invalidation, a drop).  The file only grows while it
+ * exists (a sweep shortens the page store, never its counts), and goes
+ * only with the page store, so the length it says is the file's, or less,
+ * and every page below it exists.
+ */
+static inline BlockNumber
+refs_known(SMgrRelation rsrel)
+{
+	return rsrel->smgr_cached_nblocks[MAIN_FORKNUM];
+}
+
+/*
  * Give every physical block below 'hw' a reference-count page, made (all
  * zeroes, counting zero) before any block it covers is allocated.  Called
  * with the allocator's metapage locked exclusively, which serializes the
@@ -2016,6 +2031,9 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
 	SMgrRelation rsrel = refs_smgr(rel);
 	BlockNumber need = hw == 0 ? 0 : REF_PAGE(hw - 1) + 1;
 
+	/* (the file known to reach that far already: see refs_known()) */
+	if (refs_known(rsrel) != InvalidBlockNumber && refs_known(rsrel) >= need)
+		return;
 	if (!smgrexists(rsrel, MAIN_FORKNUM))
 	{
 		RelFileLocator rloc = with_relnumber(rel, BMAP_REFS_RELNUMBER);
@@ -2033,16 +2051,35 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
 
 /*
  * How many reference-count pages exist: blocks whose page is past them
- * count zero (a database whose allocator predates reference counts).
+ * count zero (pages a crash or a standby never extended the file to, as
+ * they aren't logged).  A length known (refs_known()) says the file
+ * exists, so it isn't looked for again, which md.c does by closing and
+ * opening it: only its length is asked.
  */
 static BlockNumber
 refs_nblocks(RelFileLocator rel)
 {
 	SMgrRelation rsrel = refs_smgr(rel);
 
-	if (!smgrexists(rsrel, MAIN_FORKNUM))
+	if (refs_known(rsrel) == InvalidBlockNumber &&
+		!smgrexists(rsrel, MAIN_FORKNUM))
 		return 0;
 	return smgrnblocks(rsrel, MAIN_FORKNUM);
+}
+
+/*
+ * Does reference-count page 'page' exist?  Asked of the block a change
+ * prepares, every time: answered from the length last known when it is
+ * below that, without a system call.
+ */
+static bool
+refs_has_page(RelFileLocator rel, BlockNumber page)
+{
+	BlockNumber known = refs_known(refs_smgr(rel));
+
+	if (known != InvalidBlockNumber && page < known)
+		return true;
+	return page < refs_nblocks(rel);
 }
 
 /*
@@ -2670,7 +2707,7 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 	Buffer		buf;
 	uint32		count;
 
-	if (REF_PAGE(phys) >= refs_nblocks(rel))
+	if (!refs_has_page(rel, REF_PAGE(phys)))
 		return 0;
 	buf = refs_read(rel, REF_PAGE(phys));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2691,7 +2728,7 @@ lookup_copy_holds(RelFileLocator rel, BlockNumber phys)
 	bool		holds;
 	XLogRecPtr	passed = InvalidXLogRecPtr;
 
-	if (REF_PAGE(phys) >= refs_nblocks(rel))
+	if (!refs_has_page(rel, REF_PAGE(phys)))
 		return false;
 	buf = refs_read(rel, REF_PAGE(phys));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -6859,7 +6896,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	old_block = hole ? InvalidBlockNumber : entry.block;
 	horizon = last_checkpoint_redo();
 
-	if (!hole && REF_PAGE(old_block) < refs_nblocks(rel))
+	if (!hole && refs_has_page(rel, REF_PAGE(old_block)))
 	{
 		refbuf = refs_read(rel, REF_PAGE(old_block));
 		LockBuffer(refbuf, BUFFER_LOCK_EXCLUSIVE);
@@ -13816,6 +13853,9 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 		return;
 	/* at once, as in redo: nothing may use the tablespace any more */
 	smgrdounlinkall(srels, 5, true);
+	/* (nor the lengths this backend knew: see refs_known()) */
+	for (int i = 0; i < 5; i++)
+		srels[i]->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 	store_unwatch(rel);
 }
 
