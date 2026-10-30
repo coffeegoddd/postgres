@@ -6040,6 +6040,8 @@ tree_walk(SMgrRelation reln, TreeNodeVisit visit_node,
  * (bmapreleasestep()): a page a dropped map still holds counts as shared,
  * which VACUUM would otherwise leave as it is or copy to change.  An
  * extension that would grow the store drains first (bmapbeforeextend()).
+ * Autovacuum drains each database's queues in the background, after its
+ * tables, a bounded number of entries a visit (bmapmaintain()).
  *
  * A relation a top-level transaction drops at commit is queued before the
  * commit record (bmapprecommitdrop()), each entry naming the transaction
@@ -7713,14 +7715,11 @@ root_settle(RelFileLocator store, Buffer buf, uint32 slot,
 }
 
 /*
- * Settle the captured roots of the current database's page stores, in
- * every tablespace, so that none needs the commit log to say what became
- * of a transaction older than any running now (bmap_roots_reclaim()), as
- * the database's oldest transaction id is about to advance.  A tablespace
- * with no page store of the database's has nothing to settle.
+ * The tablespaces the current database's page stores may be in: every one
+ * but the global tablespace, which holds no block-mapped storage.
  */
-void
-bmapsettlexids(void)
+static List *
+store_tablespaces(void)
 {
 	Relation	rel = table_open(TableSpaceRelationId, AccessShareLock);
 	TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
@@ -7736,6 +7735,20 @@ bmapsettlexids(void)
 	}
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
+	return spcs;
+}
+
+/*
+ * Settle the captured roots of the current database's page stores, in
+ * every tablespace, so that none needs the commit log to say what became
+ * of a transaction older than any running now (bmap_roots_reclaim()), as
+ * the database's oldest transaction id is about to advance.  A tablespace
+ * with no page store of the database's has nothing to settle.
+ */
+void
+bmapsettlexids(void)
+{
+	List	   *spcs = store_tablespaces();
 
 	foreach_oid(spc, spcs)
 	{
@@ -11829,13 +11842,14 @@ store_free(RelFileLocator rel)
  * empty, take release steps first (not waiting for another drain or a sweep),
  * until enough are free, the queue is empty or its top waits for a drop, or
  * BMAP_GROWTH_RELEASE_STEPS were taken, so that dropped storage is reused
- * before the store grows.  Only in a transaction; nothing else drains the
- * queue in the background yet, so this is what keeps a dropped relation's
- * blocks from being lost to the store.  The caller holds no extension lock (a
- * step takes locks of its own), but may hold a relation's page locked, as a
- * B-tree split does: a step locks the allocator's pages and counts, as the
- * extension's allocation does, and the queue's pages, none of which a backend
- * waits for while holding a relation's page.
+ * before the store grows.  Only in a transaction.  Autovacuum drains the
+ * queue in the background too (bmapmaintain()), but only when it visits the
+ * database, and a store grown meanwhile would keep the blocks it grew by.
+ * The caller holds no extension lock (a step takes locks of its own), but
+ * may hold a relation's page locked, as a B-tree split does: a step locks
+ * the allocator's pages and counts, as the extension's allocation does, and
+ * the queue's pages, none of which a backend waits for while holding a
+ * relation's page.
  */
 void
 bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
@@ -11879,6 +11893,56 @@ bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 			store_free(rel) >= nblocks)
 			break;
 	}
+}
+
+/*
+ * Background maintenance of the current database's page stores, one in
+ * each tablespace that has one.  First their release queues are drained, a
+ * step at a time, not waiting for another drain or a sweep (a queue being
+ * drained by another backend is passed over: it is being let go of
+ * already), until one is empty or its top waits for a drop yet to finish, or
+ * release_max entries in all were let go of (-1: no limit), pace called
+ * after each step.  A step pops up to a record's worth
+ * of entries, so the last may go past the limit by that much.  Then each
+ * store whose sweep is due (bmap_sweep_due()) is swept.  A sweep drains its
+ * queue in full first, whatever the limit, but one is due rarely: once after
+ * the server starts, and after a count it could fix has lost a holder.
+ */
+void
+bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
+{
+	List	   *spcs;
+	BmapRelease released = {0};
+
+	if (RecoveryInProgress())
+		return;
+	spcs = store_tablespaces();
+	foreach_oid(spc, spcs)
+	{
+		while (release_max < 0 || released.entries < (uint64) release_max)
+		{
+			if (!bmap_release_step(spc, MyDatabaseId, false, &released))
+				break;
+			if (pace)
+				pace();
+			else
+				CHECK_FOR_INTERRUPTS();
+		}
+	}
+	done->released += released.entries;
+	done->released_freed += released.freed;
+
+	foreach_oid(spc, spcs)
+	{
+		BmapSweep	swept;
+
+		if (!bmap_sweep_due(spc, MyDatabaseId))
+			continue;
+		bmap_sweep(spc, MyDatabaseId, &swept);
+		done->swept++;
+		done->swept_freed += swept.freed;
+	}
+	list_free(spcs);
 }
 
 /*
