@@ -36,7 +36,8 @@ CREATE FUNCTION test_bmap_digest(relnumber oid)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_bmap_map(relnumber oid,
+-- (fork 0, the main fork, or 2, its visibility map)
+CREATE FUNCTION test_bmap_map(relnumber oid, fork int4 DEFAULT 0,
 	OUT blkno int8, OUT phys int8, OUT epoch int8, OUT refs int4)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

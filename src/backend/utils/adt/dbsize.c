@@ -335,10 +335,13 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	if (forknum == BMAP_FORKNUM)
 		return 0;
 
-	/* a block-mapped main fork's pages are in its database's page store */
-	if (forknum == MAIN_FORKNUM && backend == INVALID_PROC_NUMBER &&
-		bmap_relation_exists(*rfn))
-		return (int64) smgrnblocks(smgropen(*rfn, backend), MAIN_FORKNUM) *
+	/*
+	 * a block-mapped main fork's pages are in its database's page store, as
+	 * are its visibility map's
+	 */
+	if ((forknum == MAIN_FORKNUM || forknum == VISIBILITYMAP_FORKNUM) &&
+		backend == INVALID_PROC_NUMBER && bmap_relation_exists(*rfn))
+		return (int64) smgrnblocks(smgropen(*rfn, backend), forknum) *
 			BLCKSZ;
 
 	relationpath = relpathbackend(*rfn, backend, forknum);

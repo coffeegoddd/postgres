@@ -64,6 +64,9 @@ is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 # own, so redo writes out none.
 $log_offset = -s $standby->logfile;
 my $copy2 = sql(qq{SELECT test_bmap_share($src)});
+# (flushed: a share outside a transaction doesn't flush its WAL, and this
+# one logs nothing else that would)
+sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
 $primary->wait_for_replay_catchup($standby);
 ok( $standby->log_contains(
 		qr/redo of a share of \Q$path\E writes out its own pages: 0,/,
@@ -104,6 +107,8 @@ sql(q{UPDATE t SET b = 'y' WHERE a <= 40});
 my $changed = sql(qq{SELECT count(*) FROM test_bmap_map($src) WHERE refs = 0});
 cmp_ok($changed, '>', 0, 'the update gave the source pages of its own');
 cmp_ok($changed, '<', $pages, 'but not all of them');
+# (and its visibility map's pages, the update's own too, written out alike)
+$changed += sql(qq{SELECT count(*) FROM test_bmap_map($src, 2) WHERE refs = 0});
 my $copy3 = sql(qq{SELECT test_bmap_share($src)});
 my $digest3 = sql(qq{SELECT test_bmap_rows_digest($src)});
 $log_offset = -s $primary->logfile;

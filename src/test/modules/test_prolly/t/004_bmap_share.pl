@@ -87,11 +87,15 @@ is(sql(q{SELECT sum(b) FROM cow.t}), $sum, 'which keeps the source\'s change');
 # Dropping the source frees only the blocks it copied to, and the map nodes
 # only it holds; dropping the copy then frees the rest, on the standby as
 # on the primary.
+# (the visibility map's blocks, fork 2, are the maps' too)
 my $src_own = sql(qq{SELECT count(*) FROM test_bmap_map($src)
 	WHERE phys NOT IN (SELECT phys FROM test_bmap_map($copy))});
+$src_own += sql(qq{SELECT count(*) FROM test_bmap_map($src, 2)
+	WHERE phys NOT IN (SELECT phys FROM test_bmap_map($copy, 2))});
 $src_own += sql(qq{SELECT count(DISTINCT block) FROM test_bmap_tree($src)
 	WHERE block NOT IN (SELECT block FROM test_bmap_tree($copy))});
 my $copy_blocks = sql(qq{SELECT count(*) FROM test_bmap_map($copy)});
+$copy_blocks += sql(qq{SELECT count(*) FROM test_bmap_map($copy, 2)});
 $copy_blocks += sql(qq{SELECT count(DISTINCT block) FROM test_bmap_tree($copy)});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 sql(q{DROP TABLE cow.t});

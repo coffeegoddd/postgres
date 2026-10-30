@@ -389,6 +389,13 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 	old_block = BlockNumberIsValid(block) ? smgrnblocks(RelationGetSmgr(rel), fork) : 0;
 
 	/*
+	 * What the storage manager reads to truncate, read before the critical
+	 * section (smgrpretruncate()).
+	 */
+	if (BlockNumberIsValid(block))
+		smgrpretruncate(RelationGetSmgr(rel), &fork, 1);
+
+	/*
 	 * WAL-logging, buffer dropping, file truncation must be atomic and all on
 	 * one side of a checkpoint.  See RelationTruncate() for discussion.
 	 */
@@ -418,6 +425,10 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 
 	END_CRIT_SECTION();
 	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
+
+	/* (what the truncation left to finish after it) */
+	if (BlockNumberIsValid(block))
+		smgrposttruncate(RelationGetSmgr(rel), &fork, 1);
 
 	/*
 	 * Release the lock right away, not at commit time.

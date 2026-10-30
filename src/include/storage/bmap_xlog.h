@@ -172,7 +172,8 @@ typedef struct xl_bmap_passed
 typedef struct xl_bmap_remap
 {
 	RelFileLocator locator;
-	BlockNumber blkno;
+	BlockNumber blkno;			/* the tree's block: a visibility map's
+								 * block b is the tree's BMAP_VM_BASE + b */
 	BlockNumber old_block;
 	BlockNumber new_block;
 	BlockNumber old_hw;
@@ -342,8 +343,9 @@ typedef struct BmapQueued
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
 /*
- * Block data of a map's header: its relation's length, and its epoch: the
- * entries born before it may be shared with another map.
+ * Block data of a map's header: its relation's length and its visibility
+ * map's, and its epoch: the entries born before it may be shared with
+ * another map.
  */
 typedef struct xl_bmap_header_delta
 {
@@ -352,6 +354,7 @@ typedef struct xl_bmap_header_delta
 	BlockNumber nblocks;
 	uint32		epoch;
 	uint32		shared_below;	/* (BMAP_DELTA_SHARED_BELOW) */
+	BlockNumber vm_nblocks;
 } xl_bmap_header_delta;
 
 /* a header delta that sets the header's shared_below too */
@@ -416,7 +419,7 @@ typedef struct xl_bmap_root_delta
 /*
  * A tree as a captured root keeps it (xl_bmap_root): its id (0: the slot
  * is free), the (sub)transaction that captured it (a FullTransactionId),
- * the relation's length then, the epoch it raised
+ * the relation's length then (and its visibility map's), the epoch it raised
  * the map's to (every entry it holds was born before), and the subtrees it
  * holds.
  */
@@ -426,6 +429,8 @@ typedef struct xl_bmap_snapshot
 	uint64		owner;
 	BlockNumber nblocks;
 	uint32		epoch;			/* the map's epoch it raised the map's to */
+	BlockNumber vm_nblocks;		/* the visibility map's length then */
+	uint32		unused;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
 } xl_bmap_snapshot;
 

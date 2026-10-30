@@ -105,7 +105,8 @@ typedef struct f_smgr
 
 	/*
 	 * Create dst's main fork as a copy of src's that shares its pages until
-	 * either changes them; may be NULL.
+	 * either changes them, and any other fork it shares (smgrshare()); may
+	 * be NULL.
 	 */
 	void		(*smgr_share) (SMgrRelation src, SMgrRelation dst);
 
@@ -273,8 +274,12 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
-	/* before the critical section a truncation runs in; may be NULL */
-	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum);
+	/*
+	 * before the critical section a truncation of the forks runs in, all of
+	 * them told at once; may be NULL
+	 */
+	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber *forknum,
+									 int nforks);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	/* after the critical section a truncation runs in; may be NULL */
@@ -754,7 +759,8 @@ smgrsyncshares(bool isCommit)
 }
 
 /*
- * smgrshare() -- Create dst's main fork as a copy of src's, sharing its pages.
+ * smgrshare() -- Create dst's main fork as a copy of src's, sharing its pages,
+ *				  with any other fork the implementation shares too.
  *
  * dst is a new relation in the same tablespace and database, held by src's
  * implementation from then on.  The pages stay shared until either relation
@@ -1521,11 +1527,8 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 void
 smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
 {
-	for (int i = 0; i < nforks; i++)
-	{
-		if (smgrsw[reln->smgr_which].smgr_pretruncate)
-			smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i]);
-	}
+	if (smgrsw[reln->smgr_which].smgr_pretruncate)
+		smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum, nforks);
 }
 
 /*

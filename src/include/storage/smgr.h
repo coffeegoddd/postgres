@@ -64,10 +64,12 @@ typedef struct SMgrRelationData
 	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
 
 	/*
-	 * for bmap.c: the map's header pinned before a truncation, and the
-	 * lookup of a prepared read
+	 * for bmap.c: the map's header pinned before a truncation (and how many
+	 * of the forks truncated are yet to be), and the lookup of a prepared
+	 * read
 	 */
 	Buffer		bmap_pretrunc;
+	int			bmap_pretrunc_forks;
 	BlockNumber bmap_read_blkno;	/* logical start of a prepared read */
 	BlockNumber bmap_read_phys; /* its physical start */
 	BlockNumber bmap_read_run;	/* physically consecutive blocks */
