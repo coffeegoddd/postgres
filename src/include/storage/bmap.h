@@ -136,6 +136,8 @@ extern BmapRootId bmap_root_copy(RelFileLocator store, BmapRootId id,
 								 RelFileLocator holder);
 extern bool bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since);
 extern bool bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch);
+extern bool bmap_root_horizon(RelFileLocator store, BmapRootId id,
+							  TransactionId *frozenxid, MultiXactId *minmxid);
 extern BmapRootId bmap_made_of(SMgrRelation reln);
 extern uint64 bmap_lineage(SMgrRelation reln);
 extern bool bmap_root_of(SMgrRelation reln, BmapRootId id);

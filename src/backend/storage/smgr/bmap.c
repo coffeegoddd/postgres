@@ -175,6 +175,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -205,6 +206,7 @@
 #include "utils/relfilenumbermap.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -232,10 +234,12 @@ int			block_map_replay_entries = 65536;
  * roots didn't say of which lineage they are (a restore's storage
  * carrying the replaced storage's on), nor a frozen root of which map of
  * its relation; version 11's headers held another epoch before
- * shared_below.  This server reads only version 12 and refuses anything older
+ * shared_below; version 12's captured roots didn't keep the database's
+ * oldest unfrozen transaction and multixact as they were captured.  This
+ * server reads only version 13 and refuses anything older
  * (refuse_version()).
  */
-#define BMAP_VERSION		12
+#define BMAP_VERSION		13
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -7910,6 +7914,28 @@ roots_take_slot(RelFileLocator rel, BmapRootsMeta *metap, bool *isnewp,
 }
 
 /*
+ * The database's oldest unfrozen transaction and multixact (datfrozenxid,
+ * datminmxid), which a root captured now keeps: every one its pages name
+ * unfrozen is no older, so storage made of the root later may be refused
+ * once the database's have passed them (bmap_root_horizon()).  Read before
+ * any buffer lock is taken, from the catalog cache, which may lag behind
+ * an advance: an older horizon is only more cautious.
+ */
+static void
+database_horizon(Oid dbOid, TransactionId *frozenxid, MultiXactId *minmxid)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbOid));
+	Form_pg_database db;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", dbOid);
+	db = (Form_pg_database) GETSTRUCT(tup);
+	*frozenxid = db->datfrozenxid;
+	*minmxid = db->datminmxid;
+	ReleaseSysCache(tup);
+}
+
+/*
  * A root of reln captured into its store's roots: a free slot (one never
  * used, or let go of by a committed releaser) set to the subtrees reln has
  * now and its length, each subtree gaining a holder, and
@@ -7943,12 +7969,15 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	xl_bmap_tree xlrec;
 	XLogRecPtr	lsn;
 	BmapRootId	id;
+	TransactionId frozenxid;
+	MultiXactId minmxid;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot capture a root of a relation during recovery")));
 	ensure_roots(rel);
+	database_horizon(rel.dbOid, &frozenxid, &minmxid);
 
 	/* not while a sweep counts what the maps hold */
 	SET_LOCKTAG_OBJECT(sweeptag, rel.dbOid, BMAP_SWEEP_CLASSID, rel.spcOid, 0);
@@ -8009,6 +8038,8 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 		root_lineage(&root);
 	rdelta.root.live_map = RelFileNumberIsValid(of) ? of_root->map_id : 0;
 	rdelta.root.live_epoch = live_epoch;
+	rdelta.root.frozenxid = frozenxid;
+	rdelta.root.minmxid = minmxid;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		rdelta.root.snap.tops[k].block = root.top[k].block;
@@ -8420,6 +8451,9 @@ bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 	 * are told by the root's own epoch, the holder being made of it)
 	 */
 	rdelta.root.live_epoch = r.live_epoch != 0 ? BMAP_LIVE_EPOCH_COPY : 0;
+	/* (the same pages, so the same horizon) */
+	rdelta.root.frozenxid = r.frozenxid;
+	rdelta.root.minmxid = r.minmxid;
 	memset(&mdelta, 0, sizeof(mdelta));
 	mdelta.kind = BMAP_DELTA_ROOTS_META;
 	mdelta.flags = isnew ? BMAP_DELTA_INIT : 0;
@@ -8977,6 +9011,26 @@ bmap_root_epoch(RelFileLocator store, BmapRootId id, uint32 *epoch)
 	if (!root_read(store, id, -1, &buf, &r))
 		return false;
 	*epoch = r.snap.epoch;
+	return true;
+}
+
+/*
+ * The database's datfrozenxid and datminmxid as root 'id' of the store was
+ * captured (a copy of a root keeps its original's), no newer than any
+ * transaction or multixact its pages name unfrozen: false if the store
+ * holds no such root.
+ */
+bool
+bmap_root_horizon(RelFileLocator store, BmapRootId id,
+				  TransactionId *frozenxid, MultiXactId *minmxid)
+{
+	Buffer		buf;
+	xl_bmap_root r;
+
+	if (!root_read(store, id, -1, &buf, &r))
+		return false;
+	*frozenxid = r.frozenxid;
+	*minmxid = r.minmxid;
 	return true;
 }
 

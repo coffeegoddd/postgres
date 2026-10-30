@@ -19,11 +19,15 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_database.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
@@ -31,11 +35,14 @@
 #include "storage/bmap.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 /* GUC variables */
 int			wal_skip_threshold = 2048;	/* in kilobytes */
@@ -283,6 +290,54 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 }
 
 /*
+ * Refuse to make storage of a root captured before the database's
+ * datfrozenxid or datminmxid passed what it was then: a transaction or
+ * multixact the root's pages name unfrozen may be older than the
+ * database's horizon now, and what became of it forgotten.  Otherwise the
+ * horizon is kept from advancing until the transaction ends
+ * (vac_update_datfrozenxid() takes the same lock exclusively).
+ */
+static void
+check_root_horizon(RelFileLocator rlocator, uint64 root)
+{
+	TransactionId root_xid;
+	MultiXactId root_mxid;
+	HeapTuple	tup;
+	Form_pg_database db;
+	bool		too_old_xid;
+	bool		too_old_mxid;
+
+	if (rlocator.dbOid != MyDatabaseId)
+		elog(ERROR, "cannot make storage of a root of another database");
+	LockDatabaseFrozenIds(ShareLock);
+	if (!bmap_root_horizon(rlocator, root, &root_xid, &root_mxid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("page store of database %u holds no captured root %llu",
+						rlocator.dbOid, (unsigned long long) root)));
+
+	/* (the horizon as the lock leaves it, not as the cache last saw it) */
+	AcceptInvalidationMessages();
+	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	db = (Form_pg_database) GETSTRUCT(tup);
+	too_old_xid = TransactionIdPrecedes(root_xid, db->datfrozenxid);
+	too_old_mxid = MultiXactIdPrecedes(root_mxid, db->datminmxid);
+	if (too_old_xid || too_old_mxid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("captured root %llu is too old to make storage of",
+						(unsigned long long) root),
+				 too_old_xid ?
+				 errdetail("It was captured when the database's oldest unfrozen transaction ID was %u, older than %u now: its pages may name transactions whose outcome is no longer known.",
+						   root_xid, db->datfrozenxid) :
+				 errdetail("It was captured when the database's oldest multixact ID was %u, older than %u now: its pages may name multixacts that no longer exist.",
+						   root_mxid, db->datminmxid)));
+	ReleaseSysCache(tup);
+}
+
+/*
  * RelationCreateStorageFromRoot
  *		Create a permanent relation's storage as a copy of a root captured
  *		into its page store (bmap_root_capture()).
@@ -306,6 +361,15 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * carries that storage's lineage on (so the roots captured of it stay its
  * own); otherwise it begins one of its own.  The storage is deleted if the
  * transaction aborts when register_delete.
+ *
+ * A root's pages may name transactions and multixacts unfrozen, none older
+ * than the database's datfrozenxid and datminmxid were as it was captured
+ * (bmap_root_horizon()).  Once the database's have passed those, the commit
+ * log and multixact files may have forgotten them, so a root captured
+ * before is refused (check_root_horizon()).  The database's horizon can't
+ * advance again until the transaction ends, by which the caller must have
+ * given the relation a relfrozenxid and relminmxid no newer than the
+ * root's.
  */
 SMgrRelation
 RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
@@ -316,6 +380,8 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 	SMgrRelation srel;
 
 	Assert(!IsInParallelMode());
+
+	check_root_horizon(rlocator, root);
 
 	/*
 	 * Registered first: storage made partway holds some of the root's pages,
