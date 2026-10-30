@@ -66,6 +66,7 @@ patch src/backend/catalog/index.c  1a  an index's storage goes to its table's st
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
+patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
@@ -89,6 +90,9 @@ patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose check
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
+patch src/bin/pg_upgrade/dump.c  1a  dumps no sequence data when sequences' files are transferred (TRANSFER_SEQUENCES)
+patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster of version 20 or later, whose sequences may be block-mapped
+patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred
 patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and its database's page store whole (kept in --swap)
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
