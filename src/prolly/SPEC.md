@@ -243,9 +243,9 @@ of other branches' catalog rows it must hide, which costs O(B × C), with
 *B* the number of branches (about 2 ms at 12,000 hidden objects in the
 prototype).
 
-Checking out an arbitrary commit rewrites the rows that differ between the
-branch's tables and that commit, which costs O(D), with *D* the number of
-differing rows.
+As in Dolt, there is no checkout of a commit by itself (a detached HEAD):
+a commit is checked out by creating a branch at it, as described in
+Branching, or a branch is moved to it by a hard reset.
 
 **Time complexity:**
 
@@ -253,11 +253,6 @@ differing rows.
 |---|---|---|
 | Check out from HEAD, clean | O(1) | O(1) in rows; O(B × C) in catalog filtering |
 | Check out from HEAD, dirty | O(1) | O(1) in rows; O(B × C) in catalog filtering |
-| Check out an arbitrary commit | O(1) | O(D) |
-
-Dolt checks out a commit in O(1) because it points the working set at that
-commit's tree.  Ours costs O(D) because the rows must be rewritten in the
-table's pages, where Postgres features read them.
 
 #### Diff
 
@@ -293,7 +288,8 @@ arbitrary commit, in one row update in the history store.  The branch's
 tables and working tree are not touched, so whatever the working set
 holds, clean or dirty, it keeps; it now differs from the new head by
 whatever separates the two.  No row is read or written, and capture does
-not need to catch up.
+not need to catch up.  There is no staging area, so a commit always takes
+the whole working set, and a soft reset to HEAD changes nothing.
 
 **Time complexity:**
 
@@ -349,8 +345,10 @@ store, as in Dolt, and then applied to the current branch's tables:
    merged: the base is diffed against each side, and the two sets of
    changes are combined, which costs O((D<sub>1</sub> + D<sub>2</sub>) log
    n), with *D<sub>1</sub>* and *D<sub>2</sub>* the rows each side changed.
-   Uncommitted changes on the current branch count as its side, as in
-   Dolt.
+   As in Dolt, a merge is refused while the session's transaction has
+   uncommitted writes, or while the working set has uncommitted changes
+   in a table the merge would change; uncommitted changes in other tables
+   are kept.
 4. The rows that differ between the working tree and the result are
    written into the current branch's tables as ordinary row changes, and
    the working-root pointer is set to the result.  For a three-way merge,
@@ -389,7 +387,6 @@ most severe gaps are:
 | Operation | Dolt | Dustgres | At scale |
 |---|---|---|---|
 | Hard reset to an arbitrary commit | O(1) | O(L + D log n) | up to O(n log n) for a distant commit |
-| Check out an arbitrary commit | O(1) | O(L + D log n) | up to O(n log n) for a distant commit |
 | Create a branch from an arbitrary commit | O(1) | O(C + D) | up to O(C + n) for a distant commit |
 | Fast-forward merge | O(1) | O(L + D log n) | up to O(n log n) for a branch far ahead |
 
@@ -437,8 +434,7 @@ commit does not grow with the window.  It works in one of two modes:
   hashes would no longer match.
 
 **Keyframes.**  The operations that move a working set to another commit,
-hard reset, checkout of an arbitrary commit and creating a branch from
-one, cost O(D) in rewritten rows, with *D* the number of rows that differ
+hard reset and creating a branch from an arbitrary commit, cost O(D) in rewritten rows, with *D* the number of rows that differ
 between the working set and the target.  A keyframe removes most of that
 cost.  A keyframe of a commit *X* is a physical copy of the versioned
 schema's working set as of *X*, made of four parts:
@@ -527,7 +523,6 @@ of a restore is O(P) instead):
 | Operation | Without a keyframe | With a keyframe of the target | With a keyframe near the target |
 |---|---|---|---|
 | Hard reset to an arbitrary commit | O(L + D log n) | O(L + C) | O(L + C + D' log n) |
-| Check out an arbitrary commit | O(L + D log n) | O(L + C) | O(L + C + D' log n) |
 | Create a branch from an arbitrary commit | O(C + D) | O(C) | O(C + D') |
 
 ### Compared with stock Postgres: OLTP performance
