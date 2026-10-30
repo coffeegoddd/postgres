@@ -67,6 +67,7 @@ tests += {
       't/019_bmap_share_maps_minimal.pl',
       't/022_bmap_root_horizon.pl',
       't/015_bmap_release_autovacuum.pl',
+      't/016_bmap_drop_buffers_two_passes.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
