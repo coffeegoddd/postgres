@@ -18,10 +18,12 @@
 #include "pg_upgrade.h"
 #include "storage/bmap_files.h"
 
-static void transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace);
+static void transfer_single_new_db(Oid db_oid, FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace);
 static void transfer_relfile(FileNameMap *map, const char *type_suffix);
 static bool is_bmap_relfile(const FileNameMap *map);
-static void transfer_bmap_store(const FileNameMap *map);
+static bool has_bmap_store(Oid db_oid, char *old_tablespace);
+static void transfer_bmap_stores(Oid db_oid, char *old_tablespace, char *new_tablespace);
+static void transfer_bmap_store(Oid db_oid, const char *old_tablespace, const char *new_tablespace);
 static void remove_new_relfile(const FileNameMap *map, const char *type_suffix);
 
 /*
@@ -232,9 +234,14 @@ transfer_all_new_dbs(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 
 		mappings = gen_db_file_maps(old_db, new_db, &n_maps, old_pgdata,
 									new_pgdata);
-		if (n_maps)
+		/*
+		 * A database's block-mapped page store is transferred even when no
+		 * relation is: it may hold only captured roots or queued releases.
+		 */
+		if (n_maps || has_bmap_store(old_db->db_oid, old_tablespace))
 		{
-			transfer_single_new_db(mappings, n_maps, old_tablespace, new_tablespace);
+			transfer_single_new_db(old_db->db_oid, mappings, n_maps,
+								   old_tablespace, new_tablespace);
 		}
 		/* We allocate something even for n_maps == 0 */
 		pg_free(mappings);
@@ -478,7 +485,8 @@ swap_catalog_files(FileNameMap *maps, int size, const char *old_catalog_dir,
  * during pg_restore.
  */
 static void
-do_swap(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace)
+do_swap(Oid db_oid, FileNameMap *maps, int size, char *old_tablespace,
+		char *new_tablespace)
 {
 	char		old_catalog_dir[MAXPGPATH];
 	char		new_db_dir[MAXPGPATH];
@@ -489,7 +497,8 @@ do_swap(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace)
 	 * sure it's sorted by relfilenumber.  maps should already be sorted by
 	 * OID, so in general this shouldn't have much work to do.
 	 */
-	qsort(maps, size, sizeof(FileNameMap), FileNameMapCmp);
+	if (size > 0)
+		qsort(maps, size, sizeof(FileNameMap), FileNameMapCmp);
 
 	/*
 	 * If an old tablespace is given, we only need to process that one.  If no
@@ -498,14 +507,14 @@ do_swap(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace)
 	 */
 	if (old_tablespace)
 	{
-		if (prepare_for_swap(old_tablespace, new_tablespace, maps[0].db_oid,
+		if (prepare_for_swap(old_tablespace, new_tablespace, db_oid,
 							 old_catalog_dir, new_db_dir, moved_db_dir))
 			swap_catalog_files(maps, size,
 							   old_catalog_dir, new_db_dir, moved_db_dir);
 	}
 	else
 	{
-		if (prepare_for_swap(old_cluster.pgdata, new_cluster.pgdata, maps[0].db_oid,
+		if (prepare_for_swap(old_cluster.pgdata, new_cluster.pgdata, db_oid,
 							 old_catalog_dir, new_db_dir, moved_db_dir))
 			swap_catalog_files(maps, size,
 							   old_catalog_dir, new_db_dir, moved_db_dir);
@@ -514,7 +523,7 @@ do_swap(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace)
 		{
 			if (prepare_for_swap(old_cluster.tablespaces[tblnum],
 								 new_cluster.tablespaces[tblnum],
-								 maps[0].db_oid,
+								 db_oid,
 								 old_catalog_dir, new_db_dir, moved_db_dir))
 				swap_catalog_files(maps, size,
 								   old_catalog_dir, new_db_dir, moved_db_dir);
@@ -528,17 +537,19 @@ do_swap(FileNameMap *maps, int size, char *old_tablespace, char *new_tablespace)
  * create links for mappings stored in "maps" array.
  */
 static void
-transfer_single_new_db(FileNameMap *maps, int size,
+transfer_single_new_db(Oid db_oid, FileNameMap *maps, int size,
 					   char *old_tablespace, char *new_tablespace)
 {
 	int			mapnum;
 
-	/* --swap has its own subroutine */
+	/* --swap has its own subroutine; the old page store stays in place */
 	if (user_opts.transfer_mode == TRANSFER_MODE_SWAP)
 	{
-		do_swap(maps, size, old_tablespace, new_tablespace);
+		do_swap(db_oid, maps, size, old_tablespace, new_tablespace);
 		return;
 	}
+
+	transfer_bmap_stores(db_oid, old_tablespace, new_tablespace);
 
 	for (mapnum = 0; mapnum < size; mapnum++)
 	{
@@ -547,13 +558,12 @@ transfer_single_new_db(FileNameMap *maps, int size,
 		{
 			/*
 			 * A block-mapped relation has no main fork file: its pages are in
-			 * its database's page store, which is transferred whole, and its
-			 * map fork names their blocks there.  The relation the new
+			 * its database's page store, transferred whole above, and its map
+			 * fork names their blocks there.  The relation the new
 			 * cluster made in its place, block-mapped or not, gives way.
 			 */
 			if (is_bmap_relfile(&maps[mapnum]))
 			{
-				transfer_bmap_store(&maps[mapnum]);
 				remove_new_relfile(&maps[mapnum], "");
 				transfer_relfile(&maps[mapnum], "_bmap");
 			}
@@ -625,48 +635,118 @@ remove_new_relfile(const FileNameMap *map, const char *type_suffix)
 }
 
 /*
- * Transfer the page store of a block-mapped relation's database and
- * tablespace, the first time one of its relations is transferred: every
- * file of it, in place of the new cluster's.
+ * The old and new directories of a tablespace's databases: base/ in the
+ * data directory, or the tablespace's version directory.
+ */
+static const char *
+old_tablespace_suffix(const char *old_tablespace)
+{
+	return strcmp(old_tablespace, old_cluster.pgdata) == 0 ?
+		"/base" : old_cluster.tablespace_suffix;
+}
+
+static const char *
+new_tablespace_suffix(const char *new_tablespace)
+{
+	return strcmp(new_tablespace, new_cluster.pgdata) == 0 ?
+		"/base" : new_cluster.tablespace_suffix;
+}
+
+/*
+ * Has the old cluster a page store for the database in old_tablespace, or
+ * with old_tablespace NULL, in any tablespace?
+ */
+static bool
+has_bmap_store(Oid db_oid, char *old_tablespace)
+{
+	char		path[MAXPGPATH];
+	struct stat statbuf;
+
+	if (old_tablespace == NULL)
+	{
+		if (has_bmap_store(db_oid, old_cluster.pgdata))
+			return true;
+		for (int tblnum = 0; tblnum < old_cluster.num_tablespaces; tblnum++)
+		{
+			if (has_bmap_store(db_oid, old_cluster.tablespaces[tblnum]))
+				return true;
+		}
+		return false;
+	}
+
+	snprintf(path, sizeof(path), "%s%s/%u/%u", old_tablespace,
+			 old_tablespace_suffix(old_tablespace), db_oid,
+			 BMAP_STORE_RELNUMBER);
+	if (stat(path, &statbuf) == 0)
+		return true;
+	if (errno != ENOENT)
+		pg_fatal("error while checking for file existence \"%s\": %m", path);
+	return false;
+}
+
+/*
+ * Transfer the database's page stores: the one in old_tablespace, or with
+ * old_tablespace NULL, the one in each tablespace.
  */
 static void
-transfer_bmap_store(const FileNameMap *map)
+transfer_bmap_stores(Oid db_oid, char *old_tablespace, char *new_tablespace)
 {
-	static char **done = NULL;
-	static int	ndone = 0;
-	char		key[MAXPGPATH];
-
-	snprintf(key, sizeof(key), "%s%s/%u", map->old_tablespace,
-			 map->old_tablespace_suffix, map->db_oid);
-	for (int i = 0; i < ndone; i++)
+	if (old_tablespace)
 	{
-		if (strcmp(done[i], key) == 0)
-			return;
+		transfer_bmap_store(db_oid, old_tablespace, new_tablespace);
+		return;
 	}
-	done = pg_realloc(done, (ndone + 1) * sizeof(char *));
-	done[ndone++] = pg_strdup(key);
 
+	transfer_bmap_store(db_oid, old_cluster.pgdata, new_cluster.pgdata);
+	for (int tblnum = 0; tblnum < old_cluster.num_tablespaces; tblnum++)
+		transfer_bmap_store(db_oid, old_cluster.tablespaces[tblnum],
+							new_cluster.tablespaces[tblnum]);
+}
+
+/*
+ * Transfer a database's page store in one tablespace: every file of it, in
+ * place of the new cluster's, whether or not a relation names it.  Each
+ * database and tablespace is transferred by exactly one call.
+ */
+static void
+transfer_bmap_store(Oid db_oid, const char *old_tablespace,
+					const char *new_tablespace)
+{
 	for (int i = 0; i < lengthof(bmap_store_relnumbers); i++)
 	{
-		FileNameMap store = *map;
+		FileNameMap store = {0};
 		char		old_file[MAXPGPATH];
+		char		new_dir[MAXPGPATH];
 		struct stat statbuf;
 
+		store.old_tablespace = old_tablespace;
+		store.old_tablespace_suffix = old_tablespace_suffix(old_tablespace);
+		store.new_tablespace = new_tablespace;
+		store.new_tablespace_suffix = new_tablespace_suffix(new_tablespace);
+		store.db_oid = db_oid;
 		store.relfilenumber = bmap_store_relnumbers[i];
 		store.nspname = "pg_catalog";
 		store.relname = "block-mapped page store";
-		snprintf(old_file, sizeof(old_file), "%s/%u", key, store.relfilenumber);
+		snprintf(old_file, sizeof(old_file), "%s%s/%u/%u",
+				 store.old_tablespace, store.old_tablespace_suffix,
+				 db_oid, store.relfilenumber);
+		remove_new_relfile(&store, "");
 		if (stat(old_file, &statbuf) != 0)
 		{
 			if (errno == ENOENT)
-			{
-				remove_new_relfile(&store, "");
 				continue;
-			}
 			pg_fatal("error while checking for file existence \"%s\": %m",
 					 old_file);
 		}
-		remove_new_relfile(&store, "");
+
+		/*
+		 * The new cluster makes a database's directory in a tablespace only
+		 * for the relations there; the store may be all the old one held.
+		 */
+		snprintf(new_dir, sizeof(new_dir), "%s%s/%u",
+				 store.new_tablespace, store.new_tablespace_suffix, db_oid);
+		if (pg_mkdir_p(new_dir, pg_dir_create_mode) != 0)
+			pg_fatal("could not create directory \"%s\": %m", new_dir);
 		transfer_relfile(&store, "");
 	}
 }

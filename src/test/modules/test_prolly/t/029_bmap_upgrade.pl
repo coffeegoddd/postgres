@@ -7,6 +7,8 @@
 # store, which is moved whole, and its map fork names their blocks there.
 # Sequences are block-mapped too, and moved as tables are: a sequence, a
 # serial column's and an identity column's go on from where they were.
+# A page store is moved even when no relation names it: one holding only
+# a captured root keeps it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -48,6 +50,22 @@ for my $mode ('--copy', '--link', '--swap')
 		CREATE TABLE t (a int, b text);
 		INSERT INTO t SELECT g, 'other' FROM generate_series(1, 5000) g;
 	});
+	# A database whose page store holds only a captured root: the table
+	# it was captured of is dropped.
+	$old->safe_psql('postgres', q{CREATE DATABASE roots});
+	$old->safe_psql('roots', q{
+		CREATE EXTENSION test_prolly;
+		CREATE TABLE r (a int, b text);
+		INSERT INTO r SELECT g, repeat('r', 100) FROM generate_series(1, 3000) g;
+	});
+	my $r = $old->safe_psql('roots', q{SELECT pg_relation_filenode('r')});
+	my $root = $old->safe_psql('roots', qq{SELECT test_bmap_root_capture($r)});
+	my $r_rows = $old->safe_psql('roots', qq{SELECT test_bmap_rows_digest($r)});
+	$old->safe_psql('roots', q{DROP TABLE r});
+	is($old->safe_psql('roots', q{
+		SELECT count(*) FROM pg_class c
+		WHERE c.relkind IN ('r', 'm', 't', 'S', 'i') AND c.oid >= 16384}),
+		'0', 'the roots database has no relation of its own');
 	my $rows = $old->safe_psql('postgres', $rows_query);
 	my $s_rows = $old->safe_psql('postgres', q{SELECT count(*), sum(a) FROM s});
 	my $other_rows = $old->safe_psql('other', $rows_query);
@@ -92,6 +110,11 @@ for my $mode ('--copy', '--link', '--swap')
 		'and a serial column');
 	is($new->safe_psql('postgres', q{INSERT INTO ident (v) VALUES (10) RETURNING id}), '10',
 		'and an identity column');
+	is($new->safe_psql('roots', qq{SELECT test_bmap_root_held($root) IS NOT NULL}),
+		't', 'a page store holding only a captured root keeps it');
+	my $made = $new->safe_psql('roots', qq{SELECT test_bmap_storage_from_root($root)});
+	is($new->safe_psql('roots', qq{SELECT test_bmap_rows_digest($made)}), $r_rows,
+		'and storage made of it has the rows captured');
 	$new->safe_psql('postgres', q{
 		UPDATE t SET b = 'after' WHERE a % 5 = 0;
 		INSERT INTO t SELECT g, 'new' FROM generate_series(20001, 25000) g;

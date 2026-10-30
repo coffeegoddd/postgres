@@ -94,7 +94,7 @@ patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages with
 patch src/bin/pg_upgrade/dump.c  1a  dumps no sequence data when sequences' files are transferred (TRANSFER_SEQUENCES)
 patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster of version 20 or later, whose sequences may be block-mapped
 patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred
-patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and its database's page store whole (kept in --swap)
+patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and each database's page store whole in every tablespace that has one, even one no relation names (kept in --swap)
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode
