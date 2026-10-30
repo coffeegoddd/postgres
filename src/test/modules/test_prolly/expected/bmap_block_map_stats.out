@@ -95,8 +95,30 @@ SELECT (SELECT pages_copied FROM pg_stat_block_mapped WHERE relid = 'bms.t'::reg
  t
 (1 row)
 
--- A rewrite gives the relation a new file, whose counts begin anew.
+-- A rewrite gives the relation a new file, whose counts begin anew; the
+-- old file's are dropped with its storage.
+SELECT oid AS db FROM pg_database WHERE datname = current_database() \gset
+SELECT (CASE WHEN reltablespace = 0 THEN (SELECT dattablespace FROM pg_database
+		WHERE datname = current_database()) ELSE reltablespace END)::int8 << 32
+	   | relfilenode::int8 AS c_key
+  FROM pg_class WHERE oid = 'bms.c'::regclass \gset
+SELECT (CASE WHEN reltablespace = 0 THEN (SELECT dattablespace FROM pg_database
+		WHERE datname = current_database()) ELSE reltablespace END)::int8 << 32
+	   | relfilenode::int8 AS t_key
+  FROM pg_class WHERE oid = 'bms.t'::regclass \gset
+SELECT pg_stat_have_stats('block_map', :db, :c_key) AS c_has_stats;
+ c_has_stats 
+-------------
+ t
+(1 row)
+
 TRUNCATE bms.c;
+SELECT pg_stat_have_stats('block_map', :db, :c_key) AS old_file_has_stats;
+ old_file_has_stats 
+--------------------
+ f
+(1 row)
+
 SELECT * FROM pg_stat_get_block_map('bms.c'::regclass);
  pages_copied | pages_claimed | nodes_copied | stats_reset 
 --------------+---------------+--------------+-------------
@@ -120,8 +142,20 @@ SELECT * FROM pg_stat_get_block_map('bms.m'::regclass);
 (1 row)
 
 RESET debug_block_mapped_heap;
+SELECT pg_stat_have_stats('block_map', :db, :t_key) AS t_has_stats;
+ t_has_stats 
+-------------
+ t
+(1 row)
+
 DROP SCHEMA bms CASCADE;
 NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table bms.t
 drop cascades to table bms.c
 drop cascades to table bms.m
+SELECT pg_stat_have_stats('block_map', :db, :t_key) AS dropped_has_stats;
+ dropped_has_stats 
+-------------------
+ f
+(1 row)
+
