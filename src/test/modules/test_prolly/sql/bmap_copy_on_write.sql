@@ -1,7 +1,7 @@
 -- A page shared between copies is copied before its first change, so the
 -- change is one copy's alone: the page moves to a new block in that copy's
 -- map, and the old block loses a reference.  A page no other copy holds
--- any more is claimed in place.
+-- any more is claimed in place, once no recovery would copy it again.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -31,12 +31,31 @@ SELECT phys AS copied_phys FROM test_bmap_map(:copy) WHERE blkno = 3 \gset
 SELECT test_bmap_write(:copy, 3, 43);
 SELECT phys = :copied_phys AS in_place FROM test_bmap_map(:copy) WHERE blkno = 3;
 
--- The source's page, now held by it alone, is claimed: same block, born
--- again in the source's epoch.
+-- The copy was made without the page's image, which the WAL has since
+-- the redo pointer: a recovery from there makes it again, from the old
+-- block.  So the source's page, now held by it alone, isn't claimed until
+-- a checkpoint passes the copy: it is copied as if shared, and the old
+-- block is let go of, but held on the release queue, not freed.
+SELECT phys AS shared_phys4 FROM test_bmap_map(:copy) WHERE blkno = 4 \gset
+SELECT test_bmap_write(:copy, 4, 45);
+SELECT entries >= 0 AS drained_before FROM test_bmap_release_drain();
 SELECT test_bmap_write(:src, 3, 44);
-SELECT phys = :shared_phys AS claimed, epoch = test_bmap_epoch(:src) AS born_now
+SELECT phys <> :shared_phys AS copied, epoch = test_bmap_epoch(:src) AS born_now
   FROM test_bmap_map(:src) WHERE blkno = 3;
 SELECT test_bmap_digest(:copy) <> test_bmap_digest(:src) AS diverged;
+SELECT test_bmap_free_blocks() AS free_before \gset
+SELECT freed AS drain_freed FROM test_bmap_release_drain();
+SELECT test_bmap_free_blocks() = :free_before AS old_block_held;
+
+-- After a checkpoint, the old block is freed by a drain, and a page whose
+-- copy the checkpoint passed is claimed: same block, born again in the
+-- source's epoch.
+CHECKPOINT;
+SELECT freed >= 1 AS drain_freed FROM test_bmap_release_drain();
+SELECT test_bmap_free_blocks() > :free_before AS old_block_freed;
+SELECT test_bmap_write(:src, 4, 46);
+SELECT phys = :shared_phys4 AS claimed, epoch = test_bmap_epoch(:src) AS born_now
+  FROM test_bmap_map(:src) WHERE blkno = 4;
 
 -- Rows changed through SQL are copied the same way.  (Reading the source
 -- may set hint bits on pages still shared, which changes no row.)

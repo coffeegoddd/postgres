@@ -251,7 +251,11 @@ SKIP:
 		SELECT * FROM test_bmap_release_drain();
 	});
 	$node->wait_for_event('client backend', 'bmap-release-step');
-	sql(q{CREATE TABLE wal_flushed_again (a int)});
+	# (its records flushed by a message that takes no lock: the step waits
+	# holding the allocator's metapage, if it frees blocks held until a
+	# checkpoint passed the copies made from them, and a table's creation
+	# reads that page)
+	sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
 	$node->stop('immediate');
 	eval { $s->quit };
 	$node->start;

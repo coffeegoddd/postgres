@@ -80,10 +80,20 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 					appendStringInfoString(buf, "hole");
 				else
 					appendStringInfo(buf, "block %u", xlrec->old_block);
-				appendStringInfo(buf, " -> %u%s; hw %u -> %u",
+				appendStringInfo(buf, " -> %u%s%s; hw %u -> %u",
 								 xlrec->new_block,
 								 (xlrec->flags & BMAP_REMAP_ZERO) ? " (zeroed)" : "",
+								 (xlrec->flags & BMAP_REMAP_COPIED) ? " (copied)" : "",
 								 xlrec->old_hw, xlrec->new_hw);
+				break;
+			}
+		case XLOG_BMAP_PASSED:
+			{
+				xl_bmap_passed *xlrec = (xl_bmap_passed *) rec;
+
+				appendStringInfo(buf, "horizon %X/%08X; copied %X/%08X",
+								 LSN_FORMAT_ARGS(xlrec->horizon),
+								 LSN_FORMAT_ARGS(xlrec->copied));
 				break;
 			}
 		case XLOG_BMAP_UNREF:
@@ -174,6 +184,8 @@ bmap_identify(uint8 info)
 			return "TRUNCATE";
 		case XLOG_BMAP_FREE:
 			return "FREE";
+		case XLOG_BMAP_PASSED:
+			return "PASSED";
 		case XLOG_BMAP_SHARED:
 			return "SHARED";
 		case XLOG_BMAP_UNREF:

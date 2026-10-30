@@ -260,7 +260,7 @@ SKIP:
 	sql(q{CHECKPOINT});
 	$primary->wait_for_replay_catchup($standby);
 	$standby->safe_psql('postgres',
-		q{SELECT injection_points_attach('bmap-share-no-restartpoint', 'notice')});
+		q{SELECT injection_points_attach('bmap-redo-no-restartpoint', 'notice')});
 	$log_offset = -s $standby->logfile;
 	sql(qq{SELECT test_bmap_share($unsafe)});
 	$primary->wait_for_replay_catchup($standby);
