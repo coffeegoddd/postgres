@@ -5,7 +5,9 @@ diffs and merges of a database's tables and schema, with Dolt's semantics.
 It carries its changes as patches and extensions on top of
 postgres/postgres and merges each new upstream release into them.  These
 are the rules every change follows.  [`.github/README.md`](.github/README.md)
-covers building and testing.
+covers building and testing.  (GitHub's "Contributing" link shows
+upstream's `.github/CONTRIBUTING.md`, which is about contributing to
+PostgreSQL itself; this file is the fork's.)
 
 ## Conventions
 
@@ -26,6 +28,8 @@ covers building and testing.
   design documents, issue numbers, roadmap layers or steps; a comment
   explains its reason itself, so it stays true when the documents move on.
   Issues, commit messages and pull request descriptions may cite them.
+  The one deliberate exception is the patch inventory's LAYER column
+  (below), which records which roadmap layer needs each core change.
 - **Stacked pull requests use `gh stack`.**  A piece of work split into
   several pull requests is one stack (see below).
 - **Targeted tests locally, full suites in CI.**  Run only the tests a
@@ -101,8 +105,29 @@ other conflict stops it with the list of files; resolve them by hand on a
 branch of the same name, commit the merge, push, and open the pull request
 with `gh pr create -R coffeegoddd/postgres`.
 
+The script's exit status says what happened: 0, merged (and with
+`--push`, pushed with its pull request open); 2, conflicts to resolve by
+hand; 3, nothing to merge; 4, a sync already under way (today's branch
+exists, or an `upstream-sync-*` pull request is open), so nothing was
+done; 5, merged and pushed, but GitHub refused to let the token open the
+pull request, whose compare URL it prints; 1, any other error.
+
 The `prolly upstream sync` workflow runs the script every Monday and opens
-the pull request, or files an issue when the merge needs a person.
+the pull request, or files an issue when the merge needs a person.  It
+runs with the workflow's own token, which has two limits until one of
+these is done:
+
+- **Turn on "Allow GitHub Actions to create and approve pull requests"**
+  (Settings → Actions → General → Workflow permissions).  Until then
+  GitHub refuses the workflow the pull request: the sync still merges,
+  pushes the branch and runs the `prolly` workflow on it, then files an
+  issue linking the page to open the pull request by hand.
+- **Or add a `PROLLY_SYNC_TOKEN` repository secret** holding a token with
+  the `repo` and `workflow` scopes.  The workflow then uses it for
+  everything, which also lifts the other limits of its own token: a pull
+  request it opens starts the `prolly` workflow by itself, and it may push
+  a merge that changes upstream's workflow files (`pg-ci.yml`), which the
+  workflow's own token cannot.
 
 ## Stacked pull requests
 
@@ -122,8 +147,10 @@ To change a lower layer, check it out (`gh stack down` or
 and `gh stack sync --prune` retire merged layers.
 
 `gh stack` bases a stack on the local `master` branch, so keep it equal to
-`origin/master` (`git fetch origin && git branch -f master origin/master`,
-or `git pull` on master) before starting a stack.
+`origin/master` before starting a stack:
+
+    git fetch origin
+    git switch master && git merge --ff-only origin/master
 
 Use `git add` with explicit paths.  Test directories hold regression
 outputs (`results/`, `output_iso/`, `regression.diffs`) that a wholesale
