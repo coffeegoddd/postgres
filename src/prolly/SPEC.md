@@ -169,8 +169,23 @@ The following are the core features this approach enables:
    change belongs to, in the history store.  Writers never wait for it.
 3. **A Dolt commit marks a point in the WAL.**  Committing writes a marker
    into the WAL and waits until capture reaches it.  The working tree then
-   holds exactly the transactions committed before the marker, and the
-   commit records that tree.  Writers keep going while this happens.
+   holds exactly the transactions committed before the marker, in commit
+   order, and the commit records that tree.  Writers keep going while this
+   happens.
+   - **The committing session's own changes.**  A Dolt commit made outside
+     an explicit transaction first commits the session's work, so its
+     changes come before the marker.  Inside an explicit transaction with
+     uncommitted writes, a Dolt commit is refused, as Dolt refuses a merge
+     over uncommitted writes.  Changes no transaction has committed never
+     enter a commit.
+   - **A crash** before capture reaches the marker loses only the Dolt
+     commit, which never became visible.  The transactions it would have
+     covered are in the WAL, and the next commit covers them.
+   - **Lag and backpressure.**  Capture's lag, *L*, is reported.  The WAL
+     it has not decoded is held for it by its replication slot, up to a
+     limit (`max_slot_wal_keep_size`).  Before the limit, the server warns.
+     Past it, the slot is invalidated, and the branch's working tree is
+     rebuilt from its tables rather than from WAL that is gone.
 4. **History is stored inside Postgres.**  The new tree nodes and the
    commit are written to the history store as chunks.  The branch's
    pointer to its new commit is updated in the same transaction, so the
@@ -225,6 +240,31 @@ O(C + D), with *D* the number of differing rows.
 When HEAD is dirty, the uncommitted rows are undone on the branch that must
 not keep them, which also costs O(C + D), with *D* the number of dirty rows.
 
+**How shared pages stay isolated.**  The invariant is that no change to a
+page shared between branches is seen by any branch but the one that made
+it.  That covers every kind of change: a statement's, VACUUM's, pruning's
+and freezing's, an index's (splits included), a truncation's, a sequence's,
+and replay's during recovery or on a standby.  It is enforced in one place,
+below every access method:
+- **The storage manager maps a relation's logical blocks to physical
+  ones,** through a block map per relation, and counts how many maps hold
+  each physical block.
+- **The buffer manager copies a shared page before it changes.**  Taking a
+  page's exclusive content lock, which every change takes before its
+  critical section, first copies the page to a block of its own and remaps
+  it.  A hint bit, set under a lighter lock, is never written back to a
+  shared page.
+- **The copy is logged before the change that needs it,** so redo always
+  finds the page at its own block, and redo itself never allocates or
+  copies.
+- **Each branch's indexes point into its own heap.**  Item pointers
+  (ctids) name logical blocks, which both branches keep identical until
+  either writes, so an index entry stays valid on each side.
+
+Upstream's regression and isolation suites run with every table stored
+this way.
+
+
 **Time complexity**, with *n* the number of rows in a table:
 
 | Operation | Dolt | This design |
@@ -240,6 +280,20 @@ set is a pointer to a tree, shared until written.  Ours cost O(C) because a
 Postgres branch also needs its own catalog rows, which is what lets every
 Postgres feature work on it unchanged; the data itself is shared, as in
 Dolt.
+
+**Physical work.**  *D* counts rows, and is the cost the tables in this
+section give.  The physical work behind a row change also includes:
+- **P<sub>c</sub>, pages copied on first write:** at most one heap page
+  for each row changed, and usually far fewer, since a page holds many
+  rows.  A page is copied once per branch, so P<sub>c</sub> is bounded by
+  the pages a branch has changed since it was created.
+- **I, index work:** an entry in each index for each row changed, and the
+  index pages those touch, which are copied the same way.
+- **TOAST:** the out-of-line values a changed row holds, and their pages.
+
+So a write to a branch costs what it costs in stock Postgres plus, once
+per page, a copy.  The copy is the overhead to measure, in time and WAL,
+against stock Postgres.
 
 **Space complexity**, counting the storage an operation adds and keeps.
 WAL is not counted, nor what an operation leaves for reclaiming: dead row
@@ -594,6 +648,25 @@ its commit leaves the window.  Keyframes are physical and local: they
 belong to this cluster, are not sent to remotes, and can always be rebuilt
 from the prolly trees, which stay the portable record.
 
+**Keyframes are never needed for correctness.**  A commit's prolly tree is
+its authoritative state.  A keyframe is an acceleration structure only:
+- **Any keyframe can be lost or dropped,** and every operation still works
+  by replaying rows from the trees, only slower.
+- **A keyframe that can't be trusted is not used.**  That covers one of
+  another format (server version, page size, catalog version, cluster), or
+  one whose relations no longer match the target's catalog rows.
+- **A restore runs under apply's lock,** which keeps the branch's writers
+  out.  It becomes visible only at its commit, after these checks:
+  - the relations restored are exactly those the target's relation map
+    names;
+  - each is given new storage and catalog rows in the same transaction;
+  - the working tree is set to the target's tree.
+- **It is not MVCC-safe for snapshots older than it,** like `TRUNCATE`: a
+  reader whose snapshot predates the restore gets an error, never wrong
+  rows.
+- **Every restore is tested against a replay to the same commit,** row by
+  row and with amcheck on every index.
+
 **What is prototyped.**  The planner is built and tested: it prices
 replaying rows against restoring a keyframe, decides when a keyframe is
 worth taking, and recalibrates its costs from what each move actually
@@ -656,8 +729,8 @@ Two changes would replace the cliff with a slope.
   move on, a keyframe would be dropped once its neighbours are closer than
   the spacing at its distance, the way backups are thinned from hourly to
   daily to monthly.
-  - A commit *d* rows back would then be within about *d*(*r* − 1)/2 rows
-    of a keyframe.
+  - A commit *d* rows back would then be within about
+    *d*(*r* − 1)/(2*r*) rows of a keyframe.
   - Covering *H* rows of history would take about 1 +
     log<sub>*r*</sub>(*H* / *Δ<sub>0</sub>*) keyframes, against *H* / *Δ*
     for even spacing.
