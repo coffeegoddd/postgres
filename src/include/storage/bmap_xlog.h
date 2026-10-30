@@ -372,7 +372,9 @@ typedef struct xl_bmap_snapshot
  * and the map it was captured of: its identity (which no other map has,
  * whatever its file number), lineage and file number (or the relation of whose
  * pages it holds frozen copies, and the epoch of that relation since which
- * they changed).  It holds its subtrees
+ * they changed); and the database's datfrozenxid and datminmxid as it was
+ * captured, older than any transaction or multixact its pages may name
+ * unfrozen.  It holds its subtrees
  * while its capturer has committed (or is too old to say) and nobody who
  * let go of it has.
  */
@@ -388,6 +390,8 @@ typedef struct xl_bmap_root
 								 * relnumber's) */
 	uint64		live_map;		/* a frozen root's: relnumber's map's
 								 * identity (0: none) */
+	TransactionId frozenxid;	/* the database's datfrozenxid then */
+	MultiXactId minmxid;		/* the database's datminmxid then */
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */

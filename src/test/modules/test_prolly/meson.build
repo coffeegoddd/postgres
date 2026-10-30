@@ -62,6 +62,7 @@ tests += {
       't/017_vm_set_logical_decoding.pl',
       't/018_autovacuum_freezes_eagerly.pl',
       't/019_bmap_share_maps_minimal.pl',
+      't/022_bmap_root_horizon.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

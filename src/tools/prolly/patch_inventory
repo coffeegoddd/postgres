@@ -60,7 +60,7 @@ patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bo
 patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
-patch src/backend/catalog/storage.c  1a  creates storage in a chosen storage manager or as a share of another relation's; truncation, drop and commit hooks for storage managers
+patch src/backend/catalog/storage.c  1a  creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
