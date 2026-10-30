@@ -2072,15 +2072,29 @@ refs_cover(RelFileLocator rel, BlockNumber hw)
  * exists, so it isn't looked for again, which md.c does by closing and
  * opening it: only its length is asked.
  */
+static uint64 refs_file_asks = 0;
+
 static BlockNumber
 refs_nblocks(RelFileLocator rel)
 {
 	SMgrRelation rsrel = refs_smgr(rel);
 
+	refs_file_asks++;
 	if (refs_known(rsrel) == InvalidBlockNumber &&
 		!smgrexists(rsrel, MAIN_FORKNUM))
 		return 0;
 	return smgrnblocks(rsrel, MAIN_FORKNUM);
+}
+
+/*
+ * How many times this backend asked the reference-count files' lengths of
+ * the file system (refs_nblocks()): a test's measure that a change asks
+ * from the length known instead.
+ */
+uint64
+bmap_refs_file_asks(void)
+{
+	return refs_file_asks;
 }
 
 /*

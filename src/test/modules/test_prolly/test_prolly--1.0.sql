@@ -213,6 +213,12 @@ CREATE FUNCTION test_bmap_roots_naming()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- How many times this backend asked the reference-count files' lengths of
+-- the file system (each an lseek, and an open once the length isn't known).
+CREATE FUNCTION test_bmap_refs_file_asks()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_root_counts(OUT whole bool, OUT counted int8,
 	OUT differ int8)
 RETURNS record

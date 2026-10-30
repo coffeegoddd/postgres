@@ -185,6 +185,7 @@ extern uint32 bmap_roots_reclaim(RelFileLocator store, bool settle);
 /* inspection, for tests */
 extern void bmap_inspect_roots(RelFileLocator store, uint64 *held,
 							   uint64 *slots, uint64 *naming);
+extern uint64 bmap_refs_file_asks(void);
 extern bool bmap_inspect_root_counts(RelFileLocator store, uint64 *counted,
 									 uint64 *differ);
 extern void bmap_inspect_block(SMgrRelation reln, ForkNumber forknum,
