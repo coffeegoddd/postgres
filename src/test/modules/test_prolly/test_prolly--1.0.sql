@@ -80,6 +80,13 @@ CREATE FUNCTION test_bmap_release_drain(max_entries int8 DEFAULT 0,
 RETURNS record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The page store swept: blocks nothing holds freed, stuck counts rewritten,
+-- the store shortened, and the blocks moved down for that.
+CREATE FUNCTION test_bmap_sweep(OUT freed int8, OUT recounted int8,
+	OUT truncated int8, OUT moved int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_release_pending()
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
