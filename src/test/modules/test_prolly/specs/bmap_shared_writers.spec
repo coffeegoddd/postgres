@@ -5,6 +5,8 @@
 # shared.  Updates (HOT and not), deletes, rollbacks, on-access pruning
 # and VACUUM, interleaved, each side seeing only its own rows, through a
 # sequential scan and its index alike, and amcheck finding both sound.
+# Steps run one at a time: this is what each side sees of the other's
+# changes as they interleave; t/043 runs them at once.
 
 setup
 {
@@ -104,7 +106,7 @@ permutation s1b s1u s2b s2u s2r s1c s1chk s2chk
 permutation s1b s1d s2b s2d s2i s1c s1v s2c s2v s1chk s2chk
 permutation s2b s2d s1b s1u s2c s2v s1c s1v s1chk s2chk
 
-# HOT updates of the same row on each side, pruned on access by the other
-# side's reads and by its own, then VACUUM of each.
+# HOT updates of the same row on each side, each side's reads pruning its
+# own pages on access, then VACUUM of each.
 permutation s1hot s1hot s2hot s1prune s2prune s2hot s1hot s2prune s1prune s1v s2v s1chk s2chk
 permutation s1b s1hot s2hot s2prune s2v s1c s1prune s1v s1chk s2chk
