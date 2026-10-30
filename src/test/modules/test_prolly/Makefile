@@ -6,7 +6,8 @@ OBJS = \
 	test_checksum.o \
 	test_prolly.o \
 	unit_harness.o \
-	unit_registry.o
+	unit_registry.o \
+	unit_smgr.o
 PGFILEDESC = "test_prolly - unit tests and interface conformance suites for the version-control engine"
 
 EXTENSION = test_prolly

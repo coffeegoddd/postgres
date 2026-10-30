@@ -89,17 +89,124 @@ typedef struct f_smgr
 {
 	void		(*smgr_init) (void);	/* may be NULL */
 	void		(*smgr_shutdown) (void);	/* may be NULL */
+
+	/*
+	 * Does this implementation hold the relation's storage?  Asked by
+	 * smgropen() of every implementation but md.c, which holds whatever no
+	 * other one claims.  May be NULL.
+	 */
+	bool		(*smgr_claims) (RelFileLocatorBackend rlocator);
 	void		(*smgr_open) (SMgrRelation reln);
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
+
+	/*
+	 * Create dst's main fork as a copy of src's that shares its pages until
+	 * either changes them; may be NULL.
+	 */
+	void		(*smgr_share) (SMgrRelation src, SMgrRelation dst);
+
+	/*
+	 * Make durable what this transaction's shares left to be (at commit), or
+	 * forget it (!isCommit); may be NULL (a share is durable once made).
+	 */
+	void		(*smgr_syncshares) (bool isCommit);
+
+	/*
+	 * Can the fork's blocks be given other storage, which may have held
+	 * another relation's pages?  May be NULL (never).
+	 */
+	bool		(*smgr_replacesblocks) (SMgrRelation reln, ForkNumber forknum);
+
+	/*
+	 * In recovery: was the block given other storage after WAL position
+	 * lsn, so that a record from before then doesn't apply to what it has
+	 * now?  Required if smgr_replacesblocks is set.
+	 */
+	bool		(*smgr_replacedafter) (SMgrRelation reln, ForkNumber forknum,
+									   BlockNumber blocknum, XLogRecPtr lsn);
+
+	/*
+	 * In recovery, before a full-page image of the block from the record at
+	 * WAL position lsn is restored over the version the block has, which may
+	 * be newer.  May be NULL.
+	 */
+	void		(*smgr_prerestore) (SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum, XLogRecPtr lsn);
+
+	/*
+	 * Must a fork's pages be prepared before they change (they may be
+	 * shared)?  Then the buffer manager calls smgr_prepareforchange once a
+	 * page is locked exclusively (or, under a cleanup lock taken without
+	 * preparing, when the holder is about to change it), and
+	 * smgr_pageisshared answers whether the page is another relation's too,
+	 * and whether preparing it would copy it, which it may do for reasons
+	 * of its own.  May be NULL.
+	 */
+	bool		(*smgr_preparesforchanges) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_prepareforchange) (SMgrRelation reln, ForkNumber forknum,
+										  BlockNumber blocknum, Buffer buffer,
+										  bool neutral);
+	bool		(*smgr_pageisshared) (SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber blocknum, bool *copies);
+
+	/*
+	 * Of a page smgr_pageisshared says is shared: may another relation hold
+	 * it, not only snapshots of this one?  May be NULL (always).
+	 */
+	bool		(*smgr_pagesharedelsewhere) (SMgrRelation reln,
+											 ForkNumber forknum,
+											 BlockNumber blocknum);
+	/* before a relation's buffers are dropped to unlink it; may be NULL */
+	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
+
+	/*
+	 * Before the commit record of a transaction that drops the relation at
+	 * commit: what the drop will let go of may be recorded now, as the
+	 * transaction's, so that a crash after the commit can't lose it.  May
+	 * be NULL.
+	 */
+	void		(*smgr_precommitdrop) (SMgrRelation reln);
+
+	/*
+	 * As a top-level transaction's drops are done, at commit or abort; may
+	 * be NULL.
+	 */
+	void		(*smgr_enddrops) (void);
+
+	/*
+	 * Before the fork is extended by nblocks through shared buffers, holding
+	 * no heavyweight lock that takes no others (a relation's extension
+	 * lock); may be NULL.
+	 */
+	void		(*smgr_beforeextend) (SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber nblocks);
+
+	/*
+	 * One step of letting go of what dropped storage still holds in the
+	 * relation's store (pages it may share with the relation, which count as
+	 * shared until then): how many of what it held were let go of, 0 if
+	 * nothing was.  May be NULL.
+	 */
+	uint32		(*smgr_releasestep) (SMgrRelation reln);
+
+	/*
+	 * May writing out a page of one of a relation's forks read the
+	 * relation's buffers of 'forknum'?  May be NULL (never).
+	 */
+	bool		(*smgr_writesread) (ForkNumber forknum);
+
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum, const void *buffer, bool skipFsync);
 	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum, int nblocks, bool skipFsync);
+	/* before WAL-logging blocks that will extend the fork; may be NULL */
+	void		(*smgr_preextend) (SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, int nblocks);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
@@ -107,6 +214,9 @@ typedef struct f_smgr
 	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
 							   BlockNumber blocknum,
 							   void **buffers, BlockNumber nblocks);
+	/* before an asynchronous read's handle is acquired; may be NULL */
+	void		(*smgr_prepareread) (SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber blocknum, BlockNumber nblocks);
 	void		(*smgr_startreadv) (PgAioHandle *ioh,
 									SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum,
@@ -118,8 +228,12 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	/* before the critical section a truncation runs in; may be NULL */
+	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
+	/* after the critical section a truncation runs in; may be NULL */
+	void		(*smgr_posttruncate) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
@@ -127,7 +241,7 @@ typedef struct f_smgr
 
 static const f_smgr smgrsw[] = {
 	/* magnetic disk */
-	{
+	[SMGR_MD] = {
 		.smgr_init = mdinit,
 		.smgr_shutdown = NULL,
 		.smgr_open = mdopen,
@@ -152,6 +266,8 @@ static const f_smgr smgrsw[] = {
 };
 
 static const int NSmgr = lengthof(smgrsw);
+
+static int	smgr_select(RelFileLocatorBackend rlocator);
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
@@ -273,7 +389,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = smgr_select(brlocator);
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -286,6 +402,22 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 	RESUME_INTERRUPTS();
 
 	return reln;
+}
+
+/*
+ * smgr_select() -- Choose the implementation that holds a relation.
+ *
+ * The first implementation after md.c that claims the relation, else md.c.
+ */
+static int
+smgr_select(RelFileLocatorBackend rlocator)
+{
+	for (int i = SMGR_MD + 1; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_claims && smgrsw[i].smgr_claims(rlocator))
+			return i;
+	}
+	return SMGR_MD;
 }
 
 /*
@@ -486,6 +618,280 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 }
 
 /*
+ * smgrcreatewith() -- Create a new relation's fork in a given implementation.
+ *
+ * Like smgrcreate(), but the storage is created by implementation 'which'
+ * (SMGR_*), which holds the relation from then on.  An SMgrRelation opened
+ * before the relation existed was given md.c, so it is switched here.
+ */
+void
+smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum, bool isRedo)
+{
+	Assert(which >= 0 && which < NSmgr);
+
+	HOLD_INTERRUPTS();
+	if (reln->smgr_which != which)
+	{
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+		{
+			smgrsw[reln->smgr_which].smgr_close(reln, fork);
+			reln->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+		}
+		reln->smgr_which = which;
+		smgrsw[which].smgr_open(reln);
+	}
+	smgrsw[which].smgr_create(reln, forknum, isRedo);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrsyncshares() -- Make the transaction's shares durable.
+ *
+ * A share may leave the blocks it shares to be made durable after it, once
+ * the caller no longer keeps src from changing; this does it, for every
+ * share made since the last call.  It is called at commit, and earlier by a
+ * caller that would rather not wait for it there.  At abort (!isCommit)
+ * what is left is forgotten: the copies are dropped.
+ */
+void
+smgrsyncshares(bool isCommit)
+{
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_syncshares)
+			smgrsw[i].smgr_syncshares(isCommit);
+}
+
+/*
+ * smgrshare() -- Create dst's main fork as a copy of src's, sharing its pages.
+ *
+ * dst is a new relation in the same tablespace and database, held by src's
+ * implementation from then on.  The pages stay shared until either relation
+ * changes one, which gives it its own copy of the page.
+ *
+ * The caller keeps src's pages from changing meanwhile, and arranges for dst
+ * to be dropped if the share fails partway, which may leave it holding some
+ * of src's pages.
+ */
+void
+smgrshare(SMgrRelation src, SMgrRelation dst)
+{
+	int			which = src->smgr_which;
+
+	if (smgrsw[which].smgr_share == NULL)
+		elog(ERROR, "storage of relation %s can't be shared",
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+
+	smgrusewhich(dst, which);
+	smgrsw[which].smgr_share(src, dst);
+}
+
+/*
+ * smgrusewhich() -- Have 'reln', a relation not created yet, held by
+ *					 implementation 'which' from now on: one that will make
+ *					 its storage itself (a share, its own way).
+ */
+void
+smgrusewhich(SMgrRelation reln, int which)
+{
+	HOLD_INTERRUPTS();
+	if (reln->smgr_which != which)
+	{
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+		{
+			smgrsw[reln->smgr_which].smgr_close(reln, fork);
+			reln->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+		}
+		reln->smgr_which = which;
+		smgrsw[which].smgr_open(reln);
+	}
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrreplacedafter() -- In recovery, was the block given other storage
+ * after WAL position lsn?
+ *
+ * Redo skips reading a block for a record from before then: what the record
+ * changed is in the page the replacement began with, and the storage the
+ * block has now may still hold another relation's page.
+ */
+bool
+smgrreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				  XLogRecPtr lsn)
+{
+	if (!smgrreplacesblocks(reln, forknum))
+		return false;
+	return smgrsw[reln->smgr_which].smgr_replacedafter(reln, forknum,
+													   blocknum, lsn);
+}
+
+/*
+ * smgrprerestore() -- In recovery, before a full-page image of the block from
+ * the record at WAL position lsn is restored over its current version.
+ *
+ * The version replaced may be newer than the image, and say something
+ * recovery needs to know until replay reaches it.
+ */
+void
+smgrprerestore(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			   XLogRecPtr lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_prerestore != NULL)
+		smgrsw[reln->smgr_which].smgr_prerestore(reln, forknum, blocknum, lsn);
+}
+
+/*
+ * smgrreplacesblocks() -- Can the fork's blocks be given other storage
+ * (smgrreplacedafter()), which may have held another relation's pages?
+ */
+bool
+smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum)
+{
+	if (smgrsw[reln->smgr_which].smgr_replacesblocks == NULL)
+		return false;
+	return smgrsw[reln->smgr_which].smgr_replacesblocks(reln, forknum);
+}
+
+/*
+ * smgrpreparesforchanges() -- Must the fork's pages be prepared before they
+ *							   change?
+ */
+bool
+smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum)
+{
+	return smgrsw[reln->smgr_which].smgr_preparesforchanges != NULL &&
+		smgrsw[reln->smgr_which].smgr_preparesforchanges(reln, forknum);
+}
+
+/*
+ * smgrprepareforchange() -- Prepare a page, locked exclusively in 'buffer',
+ *							 before it changes.
+ *
+ * A page shared with another relation is copied, so the change is this
+ * relation's alone.  A 'neutral' change changes no row the page holds
+ * (pruning, freezing): the storage manager may then leave the page as it
+ * would leave it unchanged.  Called before any critical section: it may
+ * allocate, write and log.
+ */
+void
+smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
+					 BlockNumber blocknum, Buffer buffer, bool neutral)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepareforchange)
+		smgrsw[reln->smgr_which].smgr_prepareforchange(reln, forknum, blocknum,
+													   buffer, neutral);
+}
+
+/*
+ * smgrpageisshared() -- Is the page another relation's too, so that
+ *						 preparing it for a change copies it?
+ *
+ * *copies says whether preparing it would copy it, for that reason or
+ * another.
+ */
+bool
+smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				 bool *copies)
+{
+	*copies = false;
+	return smgrsw[reln->smgr_which].smgr_pageisshared != NULL &&
+		smgrsw[reln->smgr_which].smgr_pageisshared(reln, forknum, blocknum,
+												   copies);
+}
+
+/*
+ * smgrpagesharedelsewhere() -- Of a shared page: may another relation hold
+ *								it, not only the relation's own snapshots?
+ */
+bool
+smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum)
+{
+	return smgrsw[reln->smgr_which].smgr_pagesharedelsewhere == NULL ||
+		smgrsw[reln->smgr_which].smgr_pagesharedelsewhere(reln, forknum,
+														   blocknum);
+}
+
+/*
+ * smgrwritesread() -- May writing out a page of one fork read the buffers of
+ *					   'forknum', of the same relation?
+ *
+ * Asked of every implementation, since a buffer doesn't say which one holds
+ * its page.  Whoever drops such buffers while pages they serve may still be
+ * written out drops them last.
+ */
+bool
+smgrwritesread(ForkNumber forknum)
+{
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_writesread && smgrsw[i].smgr_writesread(forknum))
+			return true;
+	return false;
+}
+
+/* does this relation's storage implementation share pages (smgrshare())? */
+bool
+smgrcanshare(SMgrRelation reln)
+{
+	return smgrsw[reln->smgr_which].smgr_share != NULL;
+}
+
+/*
+ * smgrprecommitdrop() -- Prepare to drop a relation at commit, before the
+ *						  commit record.
+ *
+ * The transaction may still abort after this, leaving the relation as it
+ * is.
+ */
+void
+smgrprecommitdrop(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_precommitdrop != NULL)
+		smgrsw[reln->smgr_which].smgr_precommitdrop(reln);
+}
+
+/*
+ * smgrbeforeextend() -- Prepare to extend a fork by nblocks.
+ *
+ * Called by the buffer manager before it takes the relation's extension
+ * lock.
+ */
+void
+smgrbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_beforeextend != NULL)
+		smgrsw[reln->smgr_which].smgr_beforeextend(reln, forknum, nblocks);
+}
+
+/*
+ * smgrenddrops() -- A top-level transaction's drops are done.
+ */
+void
+smgrenddrops(void)
+{
+	for (int i = 0; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_enddrops)
+			smgrsw[i].smgr_enddrops();
+	}
+}
+
+/*
+ * smgrreleasestep() -- Let go of some of what dropped storage still holds
+ *						in the relation's store.
+ *
+ * Returns how much was let go of, 0 if nothing was (or nothing is held).
+ * In a transaction.
+ */
+uint32
+smgrreleasestep(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_releasestep == NULL)
+		return 0;
+	return smgrsw[reln->smgr_which].smgr_releasestep(reln);
+}
+
+/*
  * smgrdosyncall() -- Immediately sync all forks of all given relations
  *
  * All forks of all given relations are synced out to the store.
@@ -551,11 +957,24 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 */
 	HOLD_INTERRUPTS();
 
+	/* whatever a storage manager must read before the buffers go */
+	for (i = 0; i < nrels; i++)
+	{
+		int			which = rels[i]->smgr_which;
+
+		if (smgrsw[which].smgr_predrop)
+			smgrsw[which].smgr_predrop(rels[i], isRedo);
+	}
+
 	/*
 	 * Get rid of any remaining buffers for the relations.  bufmgr will just
 	 * drop them without bothering to write the contents.
 	 */
 	DropRelationsAllBuffers(rels, nrels);
+
+	/* (what the storage managers held off until the buffers went, let go) */
+	if (!isRedo)
+		smgrenddrops();
 
 	/*
 	 * create an array which contains all relations to be dropped, and close
@@ -668,6 +1087,26 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * smgrpreextend() -- Prepare to extend a fork with blocks logged first.
+ *
+ * A caller that WAL-logs new blocks' contents before writing them with
+ * smgrextend() calls this before logging them, so a storage manager that
+ * must record where a block lives can do so before any record names it.
+ * Afterwards the fork may already be 'blocknum + nblocks' long.
+ */
+void
+smgrpreextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			  int nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_preextend == NULL)
+		return;
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_preextend(reln, forknum, blocknum, nblocks);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+	RESUME_INTERRUPTS();
+}
+
+/*
  * smgrprefetch() -- Initiate asynchronous read of the specified block of a relation.
  *
  * In recovery only, this can return false to indicate that a file
@@ -724,6 +1163,26 @@ smgrreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_readv(reln, forknum, blocknum, buffers,
 										nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrprepareread() -- Prepare to start an asynchronous read.
+ *
+ * Called before the read's I/O handle is acquired; a backend can hold only
+ * one handle, so whatever a storage manager must read to start the read
+ * (a storage manager that maps blocks to storage of its own reads its
+ * map), it reads here.
+ */
+void
+smgrprepareread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+				BlockNumber nblocks)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepareread == NULL)
+		return;
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_prepareread(reln, forknum, blocknum,
+											  nblocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -855,6 +1314,39 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 		return reln->smgr_cached_nblocks[forknum];
 
 	return InvalidBlockNumber;
+}
+
+/*
+ * smgrpretruncate() -- Prepare to truncate the given forks.
+ *
+ * smgrtruncate() runs in a critical section; anything a storage manager
+ * must read to truncate a fork, it reads here, before that section.
+ */
+void
+smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
+{
+	for (int i = 0; i < nforks; i++)
+	{
+		if (smgrsw[reln->smgr_which].smgr_pretruncate)
+			smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i]);
+	}
+}
+
+/*
+ * smgrposttruncate() -- Finish truncating the given forks.
+ *
+ * After smgrtruncate()'s critical section: what a storage manager may do
+ * once the truncation is done, such as letting go of the storage past the
+ * new length.  A crash before it leaves that to the storage manager.
+ */
+void
+smgrposttruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
+{
+	for (int i = 0; i < nforks; i++)
+	{
+		if (smgrsw[reln->smgr_which].smgr_posttruncate)
+			smgrsw[reln->smgr_which].smgr_posttruncate(reln, forknum[i]);
+	}
 }
 
 /*

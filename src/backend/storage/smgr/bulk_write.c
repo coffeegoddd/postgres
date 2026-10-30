@@ -270,6 +270,12 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 			if (!pending_writes[i].page_std)
 				page_std = false;
 		}
+		/* pending_writes is sorted, so the last block is the highest */
+		if (pending_writes[npending - 1].blkno >= bulkstate->relsize)
+			smgrpreextend(bulkstate->smgr, bulkstate->forknum,
+						  bulkstate->relsize,
+						  pending_writes[npending - 1].blkno + 1 -
+						  bulkstate->relsize);
 		log_newpages(&bulkstate->smgr->smgr_rlocator.locator, bulkstate->forknum,
 					 npending, blknos, pages, page_std);
 	}

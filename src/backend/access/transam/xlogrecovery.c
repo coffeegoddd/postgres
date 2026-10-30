@@ -58,6 +58,7 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "utils/datetime.h"
@@ -2504,6 +2505,17 @@ verifyBackupPageConsistency(XLogReaderState *record)
 			 */
 			continue;
 		}
+
+		/*
+		 * A block whose storage was replaced after this record was skipped
+		 * by its redo (XLogReadBufferForRedoExtended(), unless the record
+		 * initializes it), so it has nothing to compare; its storage may
+		 * not even be readable here.
+		 */
+		if ((XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) == 0 &&
+			smgrreplacedafter(smgropen(rlocator, INVALID_PROC_NUMBER),
+							  forknum, blkno, record->ReadRecPtr))
+			continue;
 
 		/*
 		 * Read the contents from the current buffer and store it in a

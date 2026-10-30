@@ -1026,11 +1026,15 @@ _hash_alloc_buckets(Relation rel, BlockNumber firstblock, uint32 nblocks)
 	ovflopaque->hasho_page_id = HASHO_PAGE_ID;
 
 	if (RelationNeedsWAL(rel))
+	{
+		smgrpreextend(RelationGetSmgr(rel), MAIN_FORKNUM, firstblock,
+					  lastblock - firstblock + 1);
 		log_newpage(&rel->rd_locator,
 					MAIN_FORKNUM,
 					lastblock,
 					zerobuf.data,
 					true);
+	}
 
 	PageSetChecksum(page, lastblock);
 	smgrextend(RelationGetSmgr(rel), MAIN_FORKNUM, lastblock, zerobuf.data,

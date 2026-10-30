@@ -122,6 +122,22 @@ SMgrRelation
 RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 					  bool register_delete)
 {
+	return RelationCreateStorageWith(rlocator, relpersistence,
+									 register_delete, SMGR_MD);
+}
+
+/*
+ * RelationCreateStorageWith
+ *		Create physical storage for a relation in a given storage manager.
+ *
+ * As RelationCreateStorage(), but in storage manager 'smgr_which' (SMGR_*).
+ * Storage managers other than md.c hold permanent relations only; other
+ * relations are created in md.c whatever 'smgr_which' says.
+ */
+SMgrRelation
+RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
+						  bool register_delete, int smgr_which)
+{
 	SMgrRelation srel;
 	ProcNumber	procNumber;
 	bool		needs_wal;
@@ -147,8 +163,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			return NULL;		/* placate compiler */
 	}
 
+	/* other storage managers hold permanent relations only */
+	if (relpersistence != RELPERSISTENCE_PERMANENT)
+		smgr_which = SMGR_MD;
+
 	srel = smgropen(rlocator, procNumber);
-	smgrcreate(srel, MAIN_FORKNUM, false);
+	smgrcreatewith(srel, smgr_which, MAIN_FORKNUM, false);
 
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
@@ -177,6 +197,70 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		AddPendingSync(&rlocator);
 	}
 
+	return srel;
+}
+
+/*
+ * RelationCreateStorageShared
+ *		Create a permanent relation's storage as a copy of another's.
+ *
+ * The new main fork shares src's pages until either relation changes one
+ * (smgrshare()); its visibility map and free space map are copies of src's
+ * (its pages are src's, byte for byte, so what src's maps say of them
+ * holds; changes made after clear the new relation's own bits, as any
+ * change does).  As RelationCreateStorage(), the storage is deleted if the
+ * transaction aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
+							bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/*
+	 * Registered first: a share that fails partway leaves the new storage
+	 * holding some of src's pages, which only dropping it gives back.
+	 */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrshare(src, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	/*
+	 * The maps copied, as full-page images (src's buffers written first: the
+	 * copy reads its storage).  Without them the new relation would claim
+	 * no page all-visible, and know of no free space, until vacuumed.
+	 */
+	FlushRelationsAllBuffers(&src, 1);
+	for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+	{
+		if (!smgrexists(src, fork))
+			continue;
+		smgrcreate(srel, fork, false);
+		log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+		RelationCopyStorage(src, srel, fork, RELPERSISTENCE_PERMANENT);
+	}
+
+	/*
+	 * No pending sync, even when WAL is skipped for new relations: the share
+	 * is logged (its source's own blocks as images), and syncing or logging
+	 * the new relation at commit could write every page it shares.
+	 */
 	return srel;
 }
 
@@ -367,6 +451,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * corresponding sync request will be processed before the checkpoint
 	 * completes.
 	 */
+	/* anything the storage manager needs, read before the critical section */
+	smgrpretruncate(RelationGetSmgr(rel), forks, nforks);
+
 	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
 
@@ -425,6 +512,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 
 	/* We've done all the critical work, so checkpoints are OK now. */
 	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
+
+	/* anything the storage manager does once the truncation is done */
+	smgrposttruncate(RelationGetSmgr(rel), forks, nforks);
 
 	/*
 	 * Update upper-level FSM pages to account for the truncation. This is
@@ -732,6 +822,30 @@ smgrDoPendingDeletes(bool isCommit)
 
 		pfree(srels);
 	}
+
+	/* (what a top-level transaction prepared for its drops, let go of) */
+	if (nestLevel == 1)
+		smgrenddrops();
+}
+
+/*
+ *	smgrPreCommitPendingDeletes() -- Before the commit record of a top-level
+ *	transaction, let each storage manager prepare the deletes it will do at
+ *	commit (smgrprecommitdrop()).
+ *
+ * Not for a prepared transaction, whose deletes wait for COMMIT PREPARED.
+ */
+void
+smgrPreCommitPendingDeletes(void)
+{
+	Assert(GetCurrentTransactionNestLevel() == 1);
+	for (PendingRelDelete *pending = pendingDeletes; pending != NULL;
+		 pending = pending->next)
+	{
+		if (!pending->atCommit || pending->procNumber != INVALID_PROC_NUMBER)
+			continue;
+		smgrprecommitdrop(smgropen(pending->rlocator, INVALID_PROC_NUMBER));
+	}
 }
 
 /*
@@ -748,6 +862,9 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 	PendingRelSync *pendingsync;
 
 	Assert(GetCurrentTransactionNestLevel() == 1);
+
+	/* shared storage too (RelationCreateStorageShared()) */
+	smgrsyncshares(isCommit);
 
 	if (!pendingSyncHash)
 		return;					/* no relation needs sync */
@@ -1074,6 +1191,8 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			/* anything the storage manager needs, read before the section */
+			smgrpretruncate(reln, forks, nforks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();

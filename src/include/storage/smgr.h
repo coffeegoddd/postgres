@@ -14,9 +14,11 @@
 #ifndef SMGR_H
 #define SMGR_H
 
+#include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
+#include "storage/buf.h"
 #include "storage/relfilelocator.h"
 
 /*
@@ -52,7 +54,7 @@ typedef struct SMgrRelationData
 	 * Fields below here are intended to be private to smgr.c and its
 	 * submodules.  Do not touch them from elsewhere.
 	 */
-	int			smgr_which;		/* storage manager selector */
+	int			smgr_which;		/* storage manager selector (SMGR_*) */
 
 	/*
 	 * for md.c; per-fork arrays of the number of open segments
@@ -71,6 +73,13 @@ typedef struct SMgrRelationData
 
 typedef SMgrRelationData *SMgrRelation;
 
+/*
+ * Storage manager implementations, the values of smgr_which.  md.c is the
+ * default; smgropen() picks another implementation for a relation that one
+ * claims, and smgrcreatewith() creates a relation's storage in a given one.
+ */
+#define SMGR_MD			0
+
 #define SmgrIsTemp(smgr) \
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
 
@@ -87,12 +96,39 @@ extern void smgrrelease(SMgrRelation reln);
 extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum,
+						   bool isRedo);
+extern void smgrshare(SMgrRelation src, SMgrRelation dst);
+extern void smgrusewhich(SMgrRelation reln, int which);
+extern void smgrsyncshares(bool isCommit);
+extern bool smgrcanshare(SMgrRelation reln);
+extern bool smgrwritesread(ForkNumber forknum);
+extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber blocknum, XLogRecPtr lsn);
+extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
+extern void smgrprerestore(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber blocknum, XLogRecPtr lsn);
+extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
+extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber blocknum, Buffer buffer,
+								 bool neutral);
+extern uint32 smgrreleasestep(SMgrRelation reln);
+extern void smgrprecommitdrop(SMgrRelation reln);
+extern bool smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum);
+extern void smgrenddrops(void);
+extern void smgrbeforeextend(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber nblocks);
+extern bool smgrpageisshared(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber blocknum, bool *copies);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, const void *buffer, bool skipFsync);
 extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, int nblocks, bool skipFsync);
+extern void smgrpreextend(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber blocknum, int nblocks);
 extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks);
 extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -100,6 +136,8 @@ extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
 extern void smgrreadv(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum,
 					  void **buffers, BlockNumber nblocks);
+extern void smgrprepareread(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, BlockNumber nblocks);
 extern void smgrstartreadv(PgAioHandle *ioh,
 						   SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum,
@@ -112,6 +150,8 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks);
+extern void smgrposttruncate(SMgrRelation reln, ForkNumber *forknum, int nforks);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

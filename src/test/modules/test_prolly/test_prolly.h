@@ -60,6 +60,7 @@ typedef struct ProllyConformanceSuite
 /* The suites, each defined in its own source file. */
 extern const ProllyUnitSuite unit_harness_suite;
 extern const ProllyUnitSuite unit_registry_suite;
+extern const ProllyUnitSuite unit_smgr_suite;
 extern const ProllyConformanceSuite conformance_test_checksum_suite;
 
 /* Registration of the example interface's implementations. */
