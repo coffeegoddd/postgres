@@ -43,13 +43,16 @@ patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
 patch src/backend/catalog/storage.c  1a  creates storage in a chosen storage manager or as a share of another relation's; truncation, drop and commit hooks for storage managers
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
-patch src/backend/storage/buffer/bufmgr.c  1a  storage manager hooks before an asynchronous read and before extension
+patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
+patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change; storage manager hooks before an asynchronous read and before extension; single-block lookups, flushes and drops
 patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write; per-relation choice of implementation
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
+patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
+patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
 patch src/test/meson.build     0  runs the requirements suite in src/test/prolly
