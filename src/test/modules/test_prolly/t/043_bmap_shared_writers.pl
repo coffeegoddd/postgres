@@ -219,8 +219,9 @@ SKIP:
 # A lookup reads a map's tree under no lock of its header, a node at a
 # time.  One holding a pointer to a node its map shares, read before its
 # map copied the node, must not follow it into the other map once that
-# map, the node now its own, changes it in place: the node is born again
-# as it is claimed, and the lookup begins again from the root.
+# map, the node now its own, changes it: the node is moved to a new block
+# rather than changed in place, and the lookup, finding the old block no
+# longer the node it named, begins again from the root.
 SKIP:
 {
 	skip 'injection points not supported by this build', 2
@@ -245,10 +246,49 @@ SKIP:
 	sql(q{CHECKPOINT});
 	sql(q{SELECT injection_points_detach('bmap-tree-find-root')});
 	sql(q{SELECT injection_points_wakeup('bmap-tree-find-root')});
-	is($reader->query_safe(q{SELECT :'seen'}), $before,
+	# (the old node's block may be made the source's page by then: read as
+	# a node, it fails verification, warning so, and the lookup begins again)
+	is($reader->query(q{SELECT :'seen'}), $before,
 		'a lookup holding a pointer from before its map copied a node reads its own block');
 	is(sql(qq{SELECT test_bmap_read($x, 3, false)}), '99', 'while the source has its change');
 	$reader->quit;
+}
+
+# Crash recovery keeps a relation's changes made before its node was
+# stamped (the map's epoch raised, nothing shared: in place) or moved (a
+# share since: to a new block), though the map's root page is written out
+# after and the node's page not: a node's incarnation is kept by its birth,
+# which recovery matches the root page's pointer against.
+sql(q{CREATE EXTENSION IF NOT EXISTS pg_buffercache});
+for my $how ('raised', 'shared')
+{
+	sql(qq{
+		CREATE TABLE e_$how (k int, pad text);
+		INSERT INTO e_$how SELECT g, repeat('p', 500) FROM generate_series(1, 100) g;
+		CHECKPOINT;
+	});
+	my $e = sql(qq{SELECT pg_relation_filenode('e_$how')});
+	sql(qq{UPDATE e_$how SET k = k + 1000 WHERE (ctid::text::point)[0] = 2});
+	sql(qq{UPDATE e_$how SET k = k + 1000 WHERE (ctid::text::point)[0] = 2});
+	if ($how eq 'raised')
+	{
+		sql(qq{SELECT test_bmap_raise_epoch($e)});
+	}
+	else
+	{
+		my $copy = sql(qq{SELECT test_bmap_share($e)});
+		sql(qq{SELECT test_bmap_unlink($copy)});
+		sql(q{SELECT * FROM test_bmap_release_drain()});
+	}
+	sql(qq{UPDATE e_$how SET k = k + 1000000 WHERE k = 99});
+	my $sum = sql(qq{SELECT sum(k) FROM e_$how});
+	sql(qq{SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
+		WHERE relfilenode = $e AND relforknumber = 4 AND relblocknumber = 1});
+	$node->stop('immediate');
+	$node->start;
+	is(sql(qq{SELECT sum(k) FROM e_$how}), $sum,
+		"after a crash, the rows keep the changes made before their node was "
+		  . ($how eq 'raised' ? 'stamped' : 'moved'));
 }
 
 $node->stop;
