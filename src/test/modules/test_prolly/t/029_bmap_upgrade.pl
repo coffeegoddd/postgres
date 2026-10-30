@@ -37,7 +37,7 @@ sub store_files
 {
 	my ($dir) = @_;
 	my @out;
-	for my $f (9442, 9421, 9420, 9419)
+	for my $f (9442, 9441, 9421, 9420, 9419)
 	{
 		my $path = "$dir/$f";
 		next unless -f $path;
@@ -181,6 +181,43 @@ for my $mode ('--copy', '--link', '--swap')
 	$new->start;
 	is($new->safe_psql('postgres', q{SELECT count(*) FROM t WHERE b = 'new'}), '5000',
 		'which a crash keeps');
+	$new->stop;
+}
+
+# Where the old cluster has no page store, the new cluster's is left: from
+# a cluster whose sequences' files aren't transferred, pg_restore's
+# sequences are in it.  (An old cluster on md.c alone, a new one making
+# block-mapped storage.)
+{
+	my $old = PostgreSQL::Test::Cluster->new('upgrade_old_md');
+	$old->init;
+	$old->start;
+	$old->safe_psql('postgres', q{
+		CREATE TABLE m (a int);
+		INSERT INTO m SELECT generate_series(1, 100);
+	});
+	my $db = $old->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
+	$old->stop;
+	ok(!-f $old->data_dir . "/base/$db/9421", 'the old cluster has no page store');
+
+	my $new = PostgreSQL::Test::Cluster->new('upgrade_new_bmap');
+	$new->init;
+	$new->append_conf('postgresql.conf', 'debug_block_mapped_heap = on');
+	my $bindir = $old->config_data('--bindir');
+	command_ok(
+		[ 'pg_upgrade', '--no-sync',
+		  '--old-datadir' => $old->data_dir,
+		  '--new-datadir' => $new->data_dir,
+		  '--old-bindir' => $bindir,
+		  '--new-bindir' => $bindir,
+		  '--socketdir' => $new->host,
+		  '--old-port' => $old->port,
+		  '--new-port' => $new->port,
+		  '--copy' ],
+		'pg_upgrade from a cluster on md.c alone');
+	ok(-f $new->data_dir . "/base/$db/9421", 'the new cluster\'s page store is left');
+	$new->start;
+	is($new->safe_psql('postgres', q{SELECT count(*) FROM m}), '100', 'and the rows survive');
 	$new->stop;
 }
 
