@@ -151,10 +151,10 @@ The following are the core features this approach enables:
    changes the branch's heap pages and indexes and writes WAL, exactly as
    in stock Postgres.  Version control adds nothing to the statement or
    to its commit.
-2. **Capture reads the changes back from the WAL.**  A background worker
-   per branch decodes each committed transaction into row changes and
-   applies them, in batches, to that branch's working tree in the history
-   store.  Writers never wait for it.
+2. **Capture reads the changes back from the WAL.**  One background worker
+   per database decodes each committed transaction once into row changes
+   and applies them, in batches, to the working tree of the branch each
+   change belongs to, in the history store.  Writers never wait for it.
 3. **A Dolt commit marks a point in the WAL.**  Committing writes a marker
    into the WAL and waits until capture reaches it.  The working tree then
    holds exactly the transactions committed before the marker, and the
