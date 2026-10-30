@@ -1920,15 +1920,15 @@ read_entries(SMgrRelation reln, bool node, BlockNumber blk, bool for_write,
 
 /* Does a page read_entries() read say it is of 'type' (a map fork's)? */
 static bool
-map_page_is(const PGIOAlignedBlock *page, uint16 type)
+map_page_is(const char *page, uint16 type)
 {
 	const BmapPageOpaqueData *opaque;
 
-	if (PageIsNew(page->data) ||
-		((const PageHeaderData *) page->data)->pd_special !=
+	if (PageIsNew(page) ||
+		((const PageHeaderData *) page)->pd_special !=
 		BLCKSZ - MAXALIGN(sizeof(BmapPageOpaqueData)))
 		return false;
-	opaque = (const BmapPageOpaqueData *) PageGetSpecialPointer(page->data);
+	opaque = (const BmapPageOpaqueData *) PageGetSpecialPointer(page);
 	return opaque->magic == BMAP_MAGIC && opaque->type == type;
 }
 
@@ -2025,7 +2025,7 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 					 errmsg("invalid page in block %u of \"%s\"",
 							1, relpathperm(rel, BMAP_FORKNUM).str)));
 		/* (a map of an older format has something else there) */
-		if (!map_page_is(&page, BMAP_PAGE_ROOT))
+		if (!map_page_is(page.data, BMAP_PAGE_ROOT))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("block 1 of \"%s\" is not the root page of a block map of format version %u, which this server reads only",
@@ -5207,7 +5207,7 @@ redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
 	/* (a page extended and never written counts none) */
 	if (PageIsNew(page.data))
 		return true;
-	if (!map_page_is(&page, BMAP_PAGE_REFS) || PageGetLSN(page.data) > lsn)
+	if (!map_page_is(page.data, BMAP_PAGE_REFS) || PageGetLSN(page.data) > lsn)
 		return false;
 	*count = page_ref(page.data, phys);
 	return true;
@@ -14286,7 +14286,7 @@ keep_newer_entries(Buffer buf, char *newer)
 	uint32		nslots = BMAP_TREE_FANOUT;
 
 	/* (a root page has its pointers, a node its entries) */
-	if (map_page_is((const PGIOAlignedBlock *) newer, BMAP_PAGE_ROOT))
+	if (map_page_is(newer, BMAP_PAGE_ROOT))
 		nslots = BMAP_TREE_TOPS;
 	for (uint32 i = 0; i < nslots; i++)
 	{
@@ -14435,8 +14435,7 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	 */
 	if (action == BLK_DONE && kind == BMAP_DELTA_NODE &&
 		forknum == BMAP_FORKNUM &&
-		map_page_is((const PGIOAlignedBlock *) BufferGetPage(buf),
-					BMAP_PAGE_ROOT))
+		map_page_is(BufferGetPage(buf), BMAP_PAGE_ROOT))
 	{
 		if (apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy))
 			MarkBufferDirty(buf);
@@ -14940,6 +14939,6 @@ bmap_mask(char *pagedata, BlockNumber blkno)
 	 * A map's identity is where the record that made it began, set once it
 	 * is inserted (a record's image of the page is taken before)
 	 */
-	if (map_page_is((const PGIOAlignedBlock *) pagedata, BMAP_PAGE_ROOT))
+	if (map_page_is(pagedata, BMAP_PAGE_ROOT))
 		PageGetBmapRoot((Page) pagedata)->map_id = 0;
 }
