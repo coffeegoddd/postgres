@@ -2723,6 +2723,14 @@ WalSndComputeRecoveryHold(void)
 		limit = insert > cap ? insert - cap : 1;
 	}
 
+	/*
+	 * One at a time, read and published, under the slots' control lock: else
+	 * a process reading before another's change could publish after it (the
+	 * checkpointer clearing a backup a standby just reported).
+	 */
+	if (ReplicationSlotCtl != NULL)
+		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
+
 	if (WalSndCtl != NULL)
 	{
 		for (int i = 0; i < max_wal_senders; i++)
@@ -2761,7 +2769,6 @@ WalSndComputeRecoveryHold(void)
 
 	if (ReplicationSlotCtl != NULL)
 	{
-		LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 		for (int i = 0; i < max_replication_slots; i++)
 		{
 			ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
@@ -2791,10 +2798,11 @@ WalSndComputeRecoveryHold(void)
 			if (!XLogRecPtrIsValid(hold) || h < hold)
 				hold = h;
 		}
-		LWLockRelease(ReplicationSlotControlLock);
 	}
 
 	bmap_set_standby_hold(hold, backups);
+	if (ReplicationSlotCtl != NULL)
+		LWLockRelease(ReplicationSlotControlLock);
 }
 
 /* compute new replication slot xmin horizon if needed */

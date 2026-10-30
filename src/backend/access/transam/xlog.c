@@ -7342,12 +7342,27 @@ GetBackupState(int *running, XLogRecPtr *last_start)
 XLogRecPtr
 GetRecoveryHold(bool *backups)
 {
-	XLogRecPtr	redo;
-	TimeLineID	tli;
+	static XLogRecPtr redo = InvalidXLogRecPtr;
 	XLogRecPtr	since;
 	int			running;
 
-	GetOldestRestartPoint(&redo, &tli);
+	/*
+	 * The restart point, without waiting on pg_control's lock held across
+	 * its fsyncs (a standby's minimum recovery point updates it often): one
+	 * read earlier is no later, as the restart point only advances.
+	 */
+	if (!XLogRecPtrIsValid(redo))
+	{
+		LWLockAcquire(ControlFileLock, LW_SHARED);
+		redo = ControlFile->checkPointCopy.redo;
+		LWLockRelease(ControlFileLock);
+	}
+	else if (LWLockConditionalAcquire(ControlFileLock, LW_SHARED))
+	{
+		redo = ControlFile->checkPointCopy.redo;
+		LWLockRelease(ControlFileLock);
+	}
+
 	WALInsertLockAcquire();
 	running = XLogCtl->Insert.runningBackups;
 	since = XLogCtl->Insert.backupHoldSince;
@@ -10190,6 +10205,10 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 			XLogCtl->Insert.backupHoldSince = hold_since;
 		XLogCtl->Insert.runningBackups++;
 		WALInsertLockRelease();
+
+		/* (a standby says so to its upstream server at once) */
+		if (backup_started_in_recovery)
+			WalRcvRequestApplyReply();
 	}
 
 	/*
