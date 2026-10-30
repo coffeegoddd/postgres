@@ -36,11 +36,13 @@ sql(q{
 });
 my $t = sql(q{SELECT pg_relation_filenode('t')});
 
-# Extended to the last block a relation can have: the blocks between get
-# no physical block, and the last one does.
+# Extended to the last block a relation can have, block 2^32 - 2 (-2 as
+# test_bmap_write() takes it), a length of 2^32 - 1 blocks: its one block
+# and twice 2^31 - 1.  The blocks between get no physical block, and the
+# last one does.
 sql(qq{SELECT test_bmap_extend($t, 2147483647)});
-sql(qq{SELECT test_bmap_extend($t, 2147483646)});
-is(sql(qq{SELECT pg_relation_size('t') / 8192}), '4294967294',
+sql(qq{SELECT test_bmap_extend($t, 2147483647)});
+is(sql(qq{SELECT pg_relation_size('t') / 8192}), '4294967295',
 	'the relation reaches the last block a relation can have');
 cmp_ok(sql(qq{SELECT count(*) FROM test_bmap_map($t)}), '<=', 2,
 	'with a physical block only for the blocks written');
@@ -49,7 +51,7 @@ is(sql(q{SELECT count(*) FROM t}), '1', 'the table reads its row still');
 
 $node->stop('immediate');
 $node->start;
-is(sql(qq{SELECT pg_relation_size('t') / 8192}), '4294967294',
+is(sql(qq{SELECT pg_relation_size('t') / 8192}), '4294967295',
 	'crash recovery keeps the length');
 
 $node->stop;
