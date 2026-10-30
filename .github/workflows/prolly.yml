@@ -112,6 +112,43 @@ jobs:
       - name: Tests of the upstream sync
         run: src/tools/prolly/test_upstream_sync.sh "$RUNNER_TEMP/upstream-sync-test"
 
+  # The recovery and isolation suites, on every pull request: changes to
+  # the storage layer reach redo, standbys and concurrent access, which
+  # the regression suite alone doesn't exercise.
+  recovery-and-isolation:
+    name: recovery and isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build
+        run: |
+          ./configure $CONFIGURE_FLAGS
+          make -s -j4
+          make -s -j4 -C src/test/modules
+
+      - name: Isolation tests
+        run: make -C src/test/isolation check
+
+      - name: Recovery tests
+        run: make -C src/test/recovery check PROVE_FLAGS='-j4 --timer'
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: recovery-and-isolation-logs
+          path: |
+            **/tmp_check/log/**
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore
+
   # The tree also builds with meson; a build file that only one of the two
   # systems knows about breaks the other, so both are built on every change,
   # and the fork's suites run under meson too.
