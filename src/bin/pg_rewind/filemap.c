@@ -342,6 +342,20 @@ process_target_file(const char *path, file_type_t type, size_t size,
 }
 
 /*
+ * Is a relation file number one of block-mapped storage's files of a
+ * database's page store, which are copied in toto (getFileContentType())?
+ */
+static bool
+is_bmap_storage_file(RelFileNumber relNumber)
+{
+	return relNumber == BMAP_ALLOC_RELNUMBER ||
+		relNumber == BMAP_STORE_RELNUMBER ||
+		relNumber == BMAP_REFS_RELNUMBER ||
+		relNumber == BMAP_QUEUE_RELNUMBER ||
+		relNumber == BMAP_ROOTS_RELNUMBER;
+}
+
+/*
  * This callback gets called while we read the WAL in the target, for every
  * block that has changed in the target system.  It decides if the given
  * 'blkno' in the target relfile needs to be overwritten from the source, and
@@ -383,7 +397,7 @@ process_target_wal_block_change(ForkNumber forknum, RelFileLocator rlocator,
 	 * the source. Either way, we can safely ignore it.
 	 */
 	/* (block-mapped storage's files are copied in toto) */
-	if (entry && entry->content_type != FILE_CONTENT_TYPE_RELATION)
+	if (entry && is_bmap_storage_file(rlocator.relNumber))
 		return;
 
 	if (entry)
@@ -672,11 +686,7 @@ getFileContentType(const char *path)
 	 * last common checkpoint, make them consistent, as for a base backup.
 	 */
 	if (result == FILE_CONTENT_TYPE_RELATION &&
-		(rlocator.relNumber == BMAP_ALLOC_RELNUMBER ||
-		 rlocator.relNumber == BMAP_STORE_RELNUMBER ||
-		 rlocator.relNumber == BMAP_REFS_RELNUMBER ||
-		 rlocator.relNumber == BMAP_QUEUE_RELNUMBER ||
-		 rlocator.relNumber == BMAP_ROOTS_RELNUMBER))
+		is_bmap_storage_file(rlocator.relNumber))
 		result = FILE_CONTENT_TYPE_OTHER;
 
 	return result;
