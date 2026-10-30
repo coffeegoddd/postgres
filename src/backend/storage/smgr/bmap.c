@@ -4822,6 +4822,8 @@ tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 	ReleaseBuffer(nodebuf);
 	pfree(entries);
 	pfree(children);
+	pgstat_count_block_map(rel.spcOid, rel.dbOid, rel.relNumber,
+						   PGSTAT_BLOCK_MAP_NODE_COPIED);
 	INJECTION_POINT("bmap-tree-copied", NULL);
 	return copy;
 }
@@ -6910,6 +6912,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	bool		hole = false;
 	bool		held = false;
 	bool		let_go = false;
+	bool		claimed;
 	XLogRecPtr	horizon;
 	XLogRecPtr	copy_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	passed = InvalidXLogRecPtr;
@@ -7030,7 +7033,8 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	ent->slot = MP_SLOT(&mp, blkno);
 	ent->epoch = epoch;
 
-	if (count == 0 && !hole && !held)
+	claimed = count == 0 && !hole && !held;
+	if (claimed)
 	{
 		xl_bmap_unref xlrec;
 		RefsPages	norefs;
@@ -7238,6 +7242,12 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		(void) free_blocks(rel, &old_block, 1);
 	UnlockReleaseBuffer(headerbuf);
 	pfree(ndelta);
+
+	/* (a hole given its first block copied nothing, and claimed nothing) */
+	if (!hole)
+		pgstat_count_block_map(rel.spcOid, rel.dbOid, rel.relNumber,
+							   claimed ? PGSTAT_BLOCK_MAP_PAGE_CLAIMED :
+							   PGSTAT_BLOCK_MAP_PAGE_COPIED);
 }
 
 /*
@@ -14487,6 +14497,11 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		mdunlink(rlocator, forknum, isRedo);
 		return;
 	}
+
+	/* (its statistics go with it; replay keeps none) */
+	if (!isRedo)
+		pgstat_drop_block_map(rlocator.locator.spcOid, rlocator.locator.dbOid,
+							  rlocator.locator.relNumber);
 
 	if (isRedo)
 	{

@@ -22,6 +22,7 @@ OBJS = \
 	arraysubs.o \
 	arrayutils.o \
 	ascii.o \
+	blockmapfuncs.o \
 	bool.o \
 	bytea.o \
 	cash.o \

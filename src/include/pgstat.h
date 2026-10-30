@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBD
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBE
 
 typedef struct PgStat_ArchiverStats
 {
@@ -467,6 +467,31 @@ typedef struct PgStat_StatFuncEntry
 	PgStat_Counter self_time;
 	TimestampTz stat_reset_timestamp;
 } PgStat_StatFuncEntry;
+
+/* ----------
+ * PgStat_StatBlockMapEntry	What a block-mapped relation file's changes did
+ *		to the pages other maps share: pages copied at their first change, as
+ *		another map held them; pages born before the map's epoch taken in
+ *		place at their first change, as no other map held them any more; and
+ *		nodes of the map's tree copied, as another map held them.  Kept by the
+ *		relation file (its tablespace, database and file number): a rewrite
+ *		giving the relation a new file begins anew.
+ * ----------
+ */
+typedef struct PgStat_BlockMapCounts
+{
+	PgStat_Counter pages_copied;
+	PgStat_Counter pages_claimed;
+	PgStat_Counter nodes_copied;
+} PgStat_BlockMapCounts;
+
+typedef struct PgStat_StatBlockMapEntry
+{
+	PgStat_Counter pages_copied;
+	PgStat_Counter pages_claimed;
+	PgStat_Counter nodes_copied;
+	TimestampTz stat_reset_timestamp;
+} PgStat_StatBlockMapEntry;
 
 typedef struct PgStat_StatReplSlotEntry
 {
@@ -925,6 +950,24 @@ extern void pgstat_report_subscription_conflict(Oid subid, ConflictType type);
 extern void pgstat_create_subscription(Oid subid);
 extern void pgstat_drop_subscription(Oid subid);
 extern PgStat_StatSubEntry *pgstat_fetch_stat_subscription(Oid subid);
+
+/*
+ * Functions in pgstat_block_map.c
+ */
+
+typedef enum PgStat_BlockMapEvent
+{
+	PGSTAT_BLOCK_MAP_PAGE_COPIED,
+	PGSTAT_BLOCK_MAP_PAGE_CLAIMED,
+	PGSTAT_BLOCK_MAP_NODE_COPIED,
+} PgStat_BlockMapEvent;
+
+extern void pgstat_count_block_map(Oid spcoid, Oid dboid, Oid relnumber,
+								   PgStat_BlockMapEvent event);
+extern void pgstat_drop_block_map(Oid spcoid, Oid dboid, Oid relnumber);
+extern PgStat_StatBlockMapEntry *pgstat_fetch_stat_block_map(Oid spcoid,
+															 Oid dboid,
+															 Oid relnumber);
 
 
 /*

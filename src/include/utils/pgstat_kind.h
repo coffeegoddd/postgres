@@ -41,8 +41,11 @@
 #define PGSTAT_KIND_SLRU	13
 #define PGSTAT_KIND_WAL	14
 
+/* stats for variable-numbered objects, after the fixed ones */
+#define PGSTAT_KIND_BLOCK_MAP	15	/* per block-mapped relation file */
+
 #define PGSTAT_KIND_BUILTIN_MIN PGSTAT_KIND_DATABASE
-#define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_WAL
+#define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_BLOCK_MAP
 #define PGSTAT_KIND_BUILTIN_SIZE (PGSTAT_KIND_BUILTIN_MAX + 1)
 
 /* Custom stats kinds */

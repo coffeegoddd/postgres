@@ -22,6 +22,7 @@ OBJS = \
 	pgstat_archiver.o \
 	pgstat_backend.o \
 	pgstat_bgwriter.o \
+	pgstat_block_map.o \
 	pgstat_checkpointer.o \
 	pgstat_database.o \
 	pgstat_function.o \

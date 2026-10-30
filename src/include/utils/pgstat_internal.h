@@ -530,6 +530,12 @@ typedef struct PgStatShared_Function
 	PgStat_StatFuncEntry stats;
 } PgStatShared_Function;
 
+typedef struct PgStatShared_BlockMap
+{
+	PgStatShared_Common header;
+	PgStat_StatBlockMapEntry stats;
+} PgStatShared_BlockMap;
+
 typedef struct PgStatShared_Subscription
 {
 	PgStatShared_Common header;
@@ -771,6 +777,9 @@ extern void pgstat_database_reset_timestamp_cb(PgStatShared_Common *header, Time
 /*
  * Functions in pgstat_function.c
  */
+
+extern bool pgstat_block_map_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
+extern void pgstat_block_map_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 extern bool pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_function_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
