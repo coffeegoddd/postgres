@@ -209,10 +209,11 @@ schema to a branch's files and rebuilds those relcache entries.
 
 Versioned and unversioned schemas live side by side in one database
 (`CREATE SCHEMA ... VERSIONED`), so catalogs branch by row, not by file:
-- **one set of catalog files.**  Rows of objects in a versioned schema
-  carry a branch; all other rows carry none and are shared.  A backend
-  sees the shared rows plus its own branch's; unique indexes include the
-  branch; a branch's copy of an object keeps its object id;
+- **one set of catalog files.**  A versioned schema has one `pg_namespace`
+  row per branch, whose `nspbranch` says which branch it belongs to; all
+  other rows are shared.  Each branch's objects are its own rows in the
+  other catalogs, under new object ids, so lookups by object id stay
+  unique.  A backend sees the shared rows plus its own branch's;
 - **dependencies** point only from versioned objects to shared ones;
 - **three classes of catalog data:**
   - versioned, committed to history: names and definitions (`pg_class`,
