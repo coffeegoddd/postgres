@@ -136,11 +136,15 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 				else if (xlrec->op == BMAP_TREE_EPOCH)
 					appendStringInfoString(buf, "epoch raised");
 				else if (xlrec->op == BMAP_TREE_STAMP)
-					appendStringInfo(buf, "node %u stamped, born again", xlrec->node);
+					appendStringInfo(buf, "node %u stamped", xlrec->node);
 				else if (xlrec->op == BMAP_TREE_FREE_SPACE)
 					appendStringInfoString(buf, "free space known");
 				else if (xlrec->op == BMAP_TREE_CREATOR)
 					appendStringInfoString(buf, "taken to be dropped, its transaction never committed");
+				else if (xlrec->op == BMAP_TREE_MOVE)
+					appendStringInfo(buf, "move %u -> %u; hw %u -> %u",
+									 xlrec->from, xlrec->node,
+									 xlrec->old_hw, xlrec->new_hw);
 				else if (xlrec->op == BMAP_TREE_UNHOLD)
 					appendStringInfo(buf, "children of %u held once fewer, it claimed", xlrec->from);
 				else
