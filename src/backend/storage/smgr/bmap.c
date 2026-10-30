@@ -103,8 +103,19 @@
  * past the copies it replayed, asking for a restartpoint if need be, so that a
  * crash of that server never replays a copy after the block changed
  * (redo_copies_passed()); a backup taken on a standby meanwhile fails as it
- * stops.  Crash recovery of the primary begins at that checkpoint, past the
- * copies.  Both the record and its redo keep the copy's position in
+ * stops.  A restartpoint can't always be made (none is while recovery holds
+ * references to pages it couldn't find): the redo then warns and goes on,
+ * and so does a share's whose synced blocks the restart point isn't past
+ * (redo_share_synced()).  Until a restartpoint past the position kept in
+ * pg_control is made (at a later checkpoint record replayed, once the
+ * cause is gone), a crash of that server is one it can't recover from: its
+ * recovery would begin at or before the position, which it refuses
+ * (FATAL) at every start, so it has to be made again from a new base
+ * backup.  That failing safe, rather than replaying a copy from a changed
+ * block, is the price of the images left out, paid only by a server whose
+ * restartpoints fail.  Crash recovery of the primary begins at that
+ * checkpoint, past the copies.  Both the record and its redo keep the
+ * copy's position in
  * pg_control, as a share's synced blocks are kept, where it keeps pg_rewind
  * from rewinding a server from this one (which would replay from before the
  * copy over a page store copied after the change), and any recovery from
