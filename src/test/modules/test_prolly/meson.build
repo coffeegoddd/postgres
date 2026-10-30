@@ -36,6 +36,10 @@ tests += {
       'unit',
       'conformance',
       'bmap_storage',
+      'bmap_copy_on_write',
+      'bmap_sharing',
+      'bmap_tree_share',
+      'bmap_captured_roots',
     ],
   },
   'tap': {

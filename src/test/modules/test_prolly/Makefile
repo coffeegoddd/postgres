@@ -15,7 +15,8 @@ PGFILEDESC = "test_prolly - unit tests and interface conformance suites for the 
 EXTENSION = test_prolly
 DATA = test_prolly--1.0.sql
 
-REGRESS = unit conformance bmap_storage
+REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
+	bmap_tree_share bmap_captured_roots
 TAP_TESTS = 1
 
 ifdef USE_PGXS

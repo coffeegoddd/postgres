@@ -329,6 +329,34 @@ test_bmap_release_drain(PG_FUNCTION_ARGS)
 													  values, nulls)));
 }
 
+/*
+ * test_bmap_sweep(): the database's page store in its default tablespace
+ * swept, as a maintenance command sweeps it: the blocks nothing held freed,
+ * the stuck counts rewritten, the blocks the store was shortened by, and
+ * those moved down for it.  Flushed, as above.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_sweep);
+
+Datum
+test_bmap_sweep(PG_FUNCTION_ARGS)
+{
+	BmapSweep	r;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	bmap_sweep(MyDatabaseTableSpace, MyDatabaseId, &r);
+	XLogFlush(XactLastRecEnd);
+	values[0] = Int64GetDatum((int64) r.freed);
+	values[1] = Int64GetDatum((int64) r.recounted);
+	values[2] = Int64GetDatum((int64) r.truncated);
+	values[3] = Int64GetDatum((int64) r.moved);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
 /* test_bmap_release_pending(): the entries the release queue holds */
 PG_FUNCTION_INFO_V1(test_bmap_release_pending);
 
