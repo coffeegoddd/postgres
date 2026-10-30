@@ -1,0 +1,647 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2shared s1b s1u s2b s2u s1c s2c s1chk s2chk
+step s2shared: 
+	SELECT count(*) FILTER (WHERE refs <> 0) > 0 AS heap_shared
+		FROM test_bmap_map(pg_relation_filenode('c'));
+	SELECT count(*) FILTER (WHERE refs <> 0) > 0 AS index_shared
+		FROM test_bmap_map(pg_relation_filenode('c_pkey'));
+
+heap_shared
+-----------
+t          
+(1 row)
+
+index_shared
+------------
+t           
+(1 row)
+
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s2b: BEGIN;
+step s2u: UPDATE c SET side = 'c', n = n + 2 WHERE k BETWEEN 20 AND 50;
+step s1c: COMMIT;
+step s2c: COMMIT;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  370| 10|79735
+t  |t   |   30| 30|  465
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 40|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  369|  9|79115
+c  |c   |   31| 63| 1085
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 72|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1b s1u s2b s2u s2c s1c s1chk s2chk
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s2b: BEGIN;
+step s2u: UPDATE c SET side = 'c', n = n + 2 WHERE k BETWEEN 20 AND 50;
+step s2c: COMMIT;
+step s1c: COMMIT;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  370| 10|79735
+t  |t   |   30| 30|  465
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 40|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  369|  9|79115
+c  |c   |   31| 63| 1085
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 72|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s2b s2u s1b s1u s1u2 s2u2 s1c s2c s1chk s2chk
+step s2b: BEGIN;
+step s2u: UPDATE c SET side = 'c', n = n + 2 WHERE k BETWEEN 20 AND 50;
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s1u2: UPDATE t SET side = 't', n = n + 10 WHERE k BETWEEN 10 AND 12;
+step s2u2: UPDATE c SET side = 'c', n = n + 20 WHERE k BETWEEN 11 AND 13;
+step s1c: COMMIT;
+step s2c: COMMIT;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  370| 10|79735
+t  |t   |   30| 60|  465
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 70|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  366|  9|79079
+c  |c   |   34|123| 1121
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400|132|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1b s1u s2b s2u s1r s2c s1chk s2chk
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s2b: BEGIN;
+step s2u: UPDATE c SET side = 'c', n = n + 2 WHERE k BETWEEN 20 AND 50;
+step s1r: ROLLBACK;
+step s2c: COMMIT;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  400| 10|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 10|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  369|  9|79115
+c  |c   |   31| 63| 1085
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 72|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1b s1u s2b s2u s2r s1c s1chk s2chk
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s2b: BEGIN;
+step s2u: UPDATE c SET side = 'c', n = n + 2 WHERE k BETWEEN 20 AND 50;
+step s2r: ROLLBACK;
+step s1c: COMMIT;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  370| 10|79735
+t  |t   |   30| 30|  465
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 40|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  400| 10|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 10|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1b s1d s2b s2d s2i s1c s1v s2c s2v s1chk s2chk
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE k BETWEEN 41 AND 80;
+step s2b: BEGIN;
+step s2d: DELETE FROM c WHERE k BETWEEN 1 AND 15;
+step s2i: INSERT INTO c SELECT g, 'c', 5, repeat('q', 150) FROM generate_series(401, 440) g;
+step s1c: COMMIT;
+step s1v: VACUUM t;
+step s2c: COMMIT;
+step s2v: VACUUM c;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  360|  9|77780
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  360|  9|77780
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  385| 10|80080
+c  |c   |   40|200|16820
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  425|210|96900
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s2b s2d s1b s1u s2c s2v s1c s1v s1chk s2chk
+step s2b: BEGIN;
+step s2d: DELETE FROM c WHERE k BETWEEN 1 AND 15;
+step s1b: BEGIN;
+step s1u: UPDATE t SET side = 't', n = n + 1 WHERE k BETWEEN 1 AND 30;
+step s2c: COMMIT;
+step s2v: VACUUM c;
+step s1c: COMMIT;
+step s1v: VACUUM t;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  370| 10|79735
+t  |t   |   30| 30|  465
+(2 rows)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 40|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  385| 10|80080
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  385| 10|80080
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1hot s1hot s2hot s1prune s2prune s2hot s1hot s2prune s1prune s1v s2v s1chk s2chk
+step s1hot: UPDATE t SET n = n + 1 WHERE k = 200;
+step s1hot: UPDATE t SET n = n + 1 WHERE k = 200;
+step s2hot: UPDATE c SET n = n + 2 WHERE k = 200;
+step s1prune: SELECT count(*) FROM t WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s2prune: SELECT count(*) FROM c WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s2hot: UPDATE c SET n = n + 2 WHERE k = 200;
+step s1hot: UPDATE t SET n = n + 1 WHERE k = 200;
+step s2prune: SELECT count(*) FROM c WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s1prune: SELECT count(*) FROM t WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s1v: VACUUM t;
+step s2v: VACUUM c;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  400| 13|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 13|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  400| 14|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 14|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+
+starting permutation: s1b s1hot s2hot s2prune s2v s1c s1prune s1v s1chk s2chk
+step s1b: BEGIN;
+step s1hot: UPDATE t SET n = n + 1 WHERE k = 200;
+step s2hot: UPDATE c SET n = n + 2 WHERE k = 200;
+step s2prune: SELECT count(*) FROM c WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s2v: VACUUM c;
+step s1c: COMMIT;
+step s1prune: SELECT count(*) FROM t WHERE k BETWEEN 190 AND 210;
+count
+-----
+   21
+(1 row)
+
+step s1v: VACUUM t;
+step s1chk: 
+	SELECT 't' AS rel, side, count(*), sum(n), sum(k) FROM t GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 't by index' AS rel, count(*), sum(n), sum(k) FROM t WHERE k BETWEEN 1 AND 400;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS t_heap_problems FROM verify_heapam('t');
+	SELECT bt_index_check('t_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+t  |base|  400| 11|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+t by index|  400| 11|80200
+(1 row)
+
+t_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
+step s2chk: 
+	SELECT 'c' AS rel, side, count(*), sum(n), sum(k) FROM c GROUP BY side ORDER BY side;
+	SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT 'c by index' AS rel, count(*), sum(n), sum(k) FROM c WHERE k BETWEEN 1 AND 440;
+	RESET enable_seqscan; RESET enable_bitmapscan;
+	SELECT count(*) AS c_heap_problems FROM verify_heapam('c');
+	SELECT bt_index_check('c_pkey', true);
+
+rel|side|count|sum|  sum
+---+----+-----+---+-----
+c  |base|  400| 12|80200
+(1 row)
+
+rel       |count|sum|  sum
+----------+-----+---+-----
+c by index|  400| 12|80200
+(1 row)
+
+c_heap_problems
+---------------
+              0
+(1 row)
+
+bt_index_check
+--------------
+              
+(1 row)
+
