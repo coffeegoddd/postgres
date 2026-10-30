@@ -46,6 +46,7 @@ static bool loaded_at_preload = false;
 
 static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_harness_suite,
+	&unit_bufmgr_suite,
 	&unit_registry_suite,
 	&unit_smgr_suite,
 };

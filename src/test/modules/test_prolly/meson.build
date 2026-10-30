@@ -3,6 +3,7 @@
 test_prolly_sources = files(
   'test_checksum.c',
   'test_prolly.c',
+  'unit_bufmgr.c',
   'unit_harness.c',
   'unit_registry.c',
   'unit_smgr.c',

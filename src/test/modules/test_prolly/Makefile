@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	test_checksum.o \
 	test_prolly.o \
+	unit_bufmgr.o \
 	unit_harness.o \
 	unit_registry.o \
 	unit_smgr.o

@@ -231,6 +231,8 @@ extern PrefetchBufferResult PrefetchSharedBuffer(SMgrRelation smgr_reln,
 												 BlockNumber blockNum);
 extern PrefetchBufferResult PrefetchBuffer(Relation reln, ForkNumber forkNum,
 										   BlockNumber blockNum);
+extern Buffer LookupSharedBuffer(RelFileLocator rlocator, ForkNumber forkNum,
+								 BlockNumber blockNum);
 extern bool ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum,
 							 BlockNumber blockNum, Buffer recent_buffer);
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);
@@ -304,7 +306,11 @@ extern void DropRelationBuffers(SMgrRelation smgr_reln,
 								int nforks, BlockNumber *firstDelBlock);
 extern void DropRelationsAllBuffers(SMgrRelation *smgr_reln,
 									int nlocators);
+extern void DropUnlinkedRelationsAllBuffers(SMgrRelation *smgr_reln,
+											int nlocators);
 extern void DropDatabaseBuffers(Oid dbid);
+extern void DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
+							BlockNumber blkno);
 
 #define RelationGetNumberOfBlocks(reln) \
 	RelationGetNumberOfBlocksInFork(reln, MAIN_FORKNUM)
@@ -340,8 +346,17 @@ LockBuffer(Buffer buffer, BufferLockMode mode)
 }
 
 extern bool ConditionalLockBuffer(Buffer buffer);
+extern bool ConditionalLockBufferShared(Buffer buffer);
+extern void MarkRelationPagesShared(RelFileLocator rel);
+extern void FlushRelationBlocks(SMgrRelation reln, ForkNumber forknum,
+								const BlockNumber *blocks, uint32 n);
+extern void BufferPrepareForChange(Buffer buffer);
+extern bool BufferPageIsShared(Buffer buffer);
+extern bool BufferPageIsSharedElsewhere(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
+extern void LockBufferForCleanupUnprepared(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
+extern bool ConditionalLockBufferForCleanupUnprepared(Buffer buffer);
 extern bool IsBufferCleanupOK(Buffer buffer);
 extern bool HoldingBufferPinThatDelaysRecovery(void);
 
