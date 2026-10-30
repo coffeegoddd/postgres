@@ -3,7 +3,8 @@
  * bmap_primitive_checks.c
  *		Functions for testing the block map's primitives that later work
  *		builds on: storage made from a held root, the pages changed since
- *		an epoch, and whether a page is shared and with whom.
+ *		an epoch, whether a page is shared and with whom, and the pages
+ *		two maps differ in.
  *
  * Storage is named by relation file number in the database's default
  * tablespace, as in bmap_checks.c.  Storage made here has no catalog row;
@@ -22,6 +23,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
+#include "executor/instrument.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -133,4 +135,93 @@ test_bmap_page_shared(PG_FUNCTION_ARGS)
 	values[2] = BoolGetDatum(shared &&
 							 smgrpagesharedelsewhere(srel, MAIN_FORKNUM, blkno));
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* the blocks of a diff as a set of int8 rows */
+static void
+put_blocks(FunctionCallInfo fcinfo, const BlockNumber *blknos, uint32 n)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	for (uint32 i = 0; i < n; i++)
+	{
+		Datum		value = Int64GetDatum((int64) blknos[i]);
+		bool		null = false;
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, &value, &null);
+	}
+}
+
+/*
+ * test_bmap_diff(a, b): the logical blocks whose pages differ between the
+ * two relations, ascending, through the storage manager (so storage that
+ * isn't block-mapped is refused there)
+ */
+PG_FUNCTION_INFO_V1(test_bmap_diff);
+
+Datum
+test_bmap_diff(PG_FUNCTION_ARGS)
+{
+	BlockNumber *blknos;
+	uint32		n;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	n = smgrdiff(smgropen(locator_of(PG_GETARG_OID(0)), INVALID_PROC_NUMBER),
+				 smgropen(locator_of(PG_GETARG_OID(1)), INVALID_PROC_NUMBER),
+				 &blknos);
+	put_blocks(fcinfo, blknos, n);
+	return (Datum) 0;
+}
+
+/* test_bmap_diff_root(relnumber, root): the relation against a held root */
+PG_FUNCTION_INFO_V1(test_bmap_diff_root);
+
+Datum
+test_bmap_diff_root(PG_FUNCTION_ARGS)
+{
+	BlockNumber *blknos;
+	uint32		n;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	n = bmap_diff_root(bmap_smgr(PG_GETARG_OID(0)),
+					   (BmapRootId) PG_GETARG_INT64(1), &blknos);
+	put_blocks(fcinfo, blknos, n);
+	return (Datum) 0;
+}
+
+/* test_bmap_diff_roots(a, b): two held roots of the database's store */
+PG_FUNCTION_INFO_V1(test_bmap_diff_roots);
+
+Datum
+test_bmap_diff_roots(PG_FUNCTION_ARGS)
+{
+	BlockNumber *blknos;
+	uint32		n;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	n = bmap_diff_roots(locator_of(InvalidRelFileNumber),
+						(BmapRootId) PG_GETARG_INT64(0),
+						(BmapRootId) PG_GETARG_INT64(1), &blknos);
+	put_blocks(fcinfo, blknos, n);
+	return (Datum) 0;
+}
+
+/*
+ * test_bmap_diff_reads(a, b): the shared buffers a diff of the two
+ * relations reads (map pages, as nothing else is read), to show what it
+ * costs
+ */
+PG_FUNCTION_INFO_V1(test_bmap_diff_reads);
+
+Datum
+test_bmap_diff_reads(PG_FUNCTION_ARGS)
+{
+	SMgrRelation a = bmap_smgr(PG_GETARG_OID(0));
+	SMgrRelation b = bmap_smgr(PG_GETARG_OID(1));
+	BufferUsage before = pgBufferUsage;
+	BlockNumber *blknos;
+
+	(void) bmap_diff(a, b, &blknos);
+	PG_RETURN_INT64((pgBufferUsage.shared_blks_hit - before.shared_blks_hit) +
+					(pgBufferUsage.shared_blks_read - before.shared_blks_read));
 }

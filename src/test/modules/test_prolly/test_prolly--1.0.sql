@@ -208,3 +208,19 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_bmap_page_shared(relnumber oid, blkno int8,
 	OUT shared bool, OUT copies bool, OUT elsewhere bool)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_diff(a oid, b oid)
+RETURNS SETOF int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_diff_root(relnumber oid, root int8)
+RETURNS SETOF int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_diff_roots(a int8, b int8)
+RETURNS SETOF int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_diff_reads(a oid, b oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
