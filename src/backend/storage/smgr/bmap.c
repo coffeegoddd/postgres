@@ -15177,7 +15177,9 @@ redo_copy_lsn(XLogReaderState *record, uint8 block_id)
  * recovery begins there or later, and asks for nothing.  An online backup
  * taken on this standby meanwhile, which begins at an earlier restartpoint
  * and copies the blocks as they may change from here on, fails as it stops
- * (XLogNoteSyncedReplay()).
+ * (XLogNoteSyncedReplay(), when a restartpoint is asked for; and the note
+ * below, past the backup's start, when the restart point passed the copies
+ * already but the backup began before them).
  *
  * And the newest copy passed ('copied') is kept in pg_control, as the
  * primary keeps it, once the restartpoint is made, if it could be (see

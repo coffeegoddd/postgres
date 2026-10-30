@@ -14,6 +14,7 @@ use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+use PostgreSQL::Test::RecursiveCopy;
 use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('copy_without_image');
@@ -256,6 +257,67 @@ $sbackup->query(q{SELECT * FROM pg_backup_stop()});
 like($sbackup->{stderr}, qr/relies on pages the primary synced without logging them/,
 	'a backup on the standby across such a replay fails');
 $sbackup->quit;
+
+# The same when the standby's restart point passed the copies before it
+# replays what changes the blocks: the backup began before the copies, and
+# may have copied a block after it changed; restored, its recovery would
+# replay a copy from it.  Its stop fails, though no restartpoint was asked
+# for.  A backup begun after then restores, reading the table's rows.
+$standby->safe_psql('postgres', q{CHECKPOINT});
+sql(q{
+	CREATE TABLE z (a int, b text) WITH (fillfactor = 50);
+	INSERT INTO z SELECT g, repeat('x', 200) FROM generate_series(1, 40 * 17) g;
+	CHECKPOINT;
+	UPDATE z SET a = a WHERE a % 17 = 1;
+});
+my $z = sql(q{SELECT pg_relation_filenode('z')});
+my $zpages = sql(q{SELECT pg_relation_size('z') / 8192});
+my $zcopy = sql(qq{SELECT test_bmap_share($z)});
+$primary->wait_for_replay_catchup($standby);
+$sbackup = $standby->background_psql('postgres', on_error_stop => 0);
+$sbackup->query_safe(q{SET client_min_messages = warning});
+$sbackup->query_safe(q{SELECT pg_backup_start('copy_without_image', true)});
+my $zstart = sql(q{SELECT pg_current_wal_insert_lsn()});
+sql(q{UPDATE z SET b = 'changed'});
+my ($zremaps, $zimages) = remaps_since($zstart, $z);
+is($zimages, 0, 'z: the table\'s pages are copied without their images');
+sql(q{CHECKPOINT});
+$primary->wait_for_replay_catchup($standby);
+$standby->safe_psql('postgres', q{CHECKPOINT});
+$log_offset = -s $standby->logfile;
+remake_pages($zcopy, $zpages);
+$primary->wait_for_replay_catchup($standby);
+ok(!$standby->log_contains(qr/redo of copies without an image asks for a restartpoint/,
+		$log_offset),
+	'a standby whose restart point is past the copies asks for no restartpoint');
+# (the backup's files, copied now, after the blocks changed)
+my $zcopydir = $standby->backup_dir . '/across_copies';
+PostgreSQL::Test::RecursiveCopy::copypath($standby->data_dir, $zcopydir,
+	filterfn => sub { return $_[0] ne 'postmaster.pid'; });
+my $zlabel = $sbackup->query(q{SELECT labelfile FROM pg_backup_stop()});
+like($sbackup->{stderr}, qr/relies on no recovery beginning at or before/,
+	'and a backup on it begun before the copies fails as it stops');
+$sbackup->quit;
+if ($sbackup->{stderr} !~ /relies on no recovery/)
+{
+	# The stop succeeded: restore the backup, which must then read the rows.
+	PostgreSQL::Test::Utils::append_to_file("$zcopydir/backup_label", $zlabel);
+	my $across = PostgreSQL::Test::Cluster->new('copy_without_image_across');
+	$across->init_from_backup($standby, 'across_copies');
+	ok($across->start(fail_ok => 1), 'the backup it took restores')
+	  and is(rows($across, 'z'), rows($primary, 'z'),
+		'and reads the table\'s rows');
+	$across->stop('immediate') if defined $across->{_pid};
+}
+my $z_rows = rows($primary, 'z');
+$standby->backup('after_copies');
+my $restored = PostgreSQL::Test::Cluster->new('copy_without_image_restored');
+$restored->init_from_backup($standby, 'after_copies');
+$restored->start;
+is(rows($restored, 'z'), $z_rows,
+	'a backup of the standby begun after the copies restores, reading the rows');
+$restored->stop;
+sql(qq{SELECT test_bmap_unlink($zcopy)});
 
 # A copy while a base backup runs logs the page's image: the backup begins
 # before the copy, and may copy the old block after it changes.
