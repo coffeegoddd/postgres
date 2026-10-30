@@ -139,6 +139,25 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 }
 
 /*
+ * NewRelationStorageManager
+ *		The storage manager (SMGR_*) of a new relation's storage.
+ *
+ * Block-mapped, with debug_block_mapped_heap, for a permanent relation that
+ * is neither shared (so in the global tablespace) nor a catalog; md.c
+ * otherwise.  Heap relations (heapam_storage_manager()) and sequences
+ * (heap_create_with_catalog()) both ask here; an index follows its table.
+ */
+int
+NewRelationStorageManager(char relpersistence, bool shared, bool catalog)
+{
+	if (relpersistence != RELPERSISTENCE_PERMANENT || shared || catalog)
+		return SMGR_MD;
+	if (debug_block_mapped_heap)
+		return SMGR_BMAP;
+	return SMGR_MD;
+}
+
+/*
  * RelationCreateStorageWith
  *		Create physical storage for a relation in a given storage manager.
  *

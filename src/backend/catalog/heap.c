@@ -1346,6 +1346,10 @@ heap_create_with_catalog(const char *relname,
 							   &relfrozenxid,
 							   &relminmxid,
 							   true,
+							   relkind == RELKIND_SEQUENCE ?
+							   NewRelationStorageManager(relpersistence,
+														 shared_relation,
+														 IsCatalogNamespace(relnamespace)) :
 							   SMGR_MD);
 
 	Assert(relid == RelationGetRelid(new_rel_desc));

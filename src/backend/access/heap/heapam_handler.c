@@ -488,9 +488,8 @@ tuple_lock_retry:
  * The storage manager for a heap relation's new storage.  Only permanent
  * relations outside the global tablespace may be block-mapped.  Storage
  * made anew for an existing relation stays where the old was, and so does
- * a rewrite's new heap (new_relation_smgr); a new relation is in md.c, or
- * with debug_block_mapped_heap in block-mapped storage if it is a user
- * relation.
+ * a rewrite's new heap (new_relation_smgr); a new relation's is chosen as
+ * any new relation's is (NewRelationStorageManager()).
  */
 static int
 heapam_storage_manager(Relation rel, const RelFileLocator *newrlocator,
@@ -503,11 +502,8 @@ heapam_storage_manager(Relation rel, const RelFileLocator *newrlocator,
 		return RelationGetSmgr(rel)->smgr_which;
 	if (new_relation_smgr >= 0)
 		return new_relation_smgr;
-	if (debug_block_mapped_heap &&
-		!rel->rd_rel->relisshared &&
-		!IsCatalogRelation(rel))
-		return SMGR_BMAP;
-	return SMGR_MD;
+	return NewRelationStorageManager(persistence, rel->rd_rel->relisshared,
+									 IsCatalogRelation(rel));
 }
 
 static void

@@ -28,6 +28,8 @@ extern PGDLLIMPORT int new_relation_smgr;
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,
 										  bool register_delete);
+extern int	NewRelationStorageManager(char relpersistence, bool shared,
+									  bool catalog);
 extern SMgrRelation RelationCreateStorageWith(RelFileLocator rlocator,
 											  char relpersistence,
 											  bool register_delete,
