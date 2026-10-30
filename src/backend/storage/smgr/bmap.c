@@ -4970,8 +4970,16 @@ static int	redo_shares_next = 0;
 static void
 redo_share_begun(RelFileLocator dst, const xl_bmap_top *tops)
 {
-	RedoShare  *rs = &redo_shares[redo_shares_next];
+	RedoShare  *rs;
 
+	/*
+	 * A share to 'dst' begun before and never finished (an error between
+	 * its records) is forgotten: its tops aren't this one's.
+	 */
+	for (int i = 0; i < REDO_SHARES; i++)
+		if (redo_shares[i].valid && RelFileLocatorEquals(redo_shares[i].dst, dst))
+			redo_shares[i].valid = false;
+	rs = &redo_shares[redo_shares_next];
 	redo_shares_next = (redo_shares_next + 1) % REDO_SHARES;
 	rs->dst = dst;
 	memcpy(rs->tops, tops, sizeof(rs->tops));
