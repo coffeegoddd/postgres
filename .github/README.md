@@ -88,7 +88,8 @@ Branch from an up-to-date `master`, commit with explicit paths
 pull request against `master`.  Work split into several pull requests is
 one `gh stack`:
 
-    git fetch origin && git branch -f master origin/master
+    git fetch origin
+    git switch master && git merge --ff-only origin/master
     gh stack init topic/first
     git add <files> && git commit
     gh stack add topic/second
