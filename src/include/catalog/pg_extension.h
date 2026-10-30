@@ -58,7 +58,7 @@ typedef FormData_pg_extension *Form_pg_extension;
 DECLARE_TOAST(pg_extension, 4147, 4148);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_extension_oid_index, 3080, ExtensionOidIndexId, pg_extension, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, ExtensionNameIndexId, pg_extension, btree(extname name_ops));
+DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, ExtensionNameIndexId, pg_extension, btree(extname name_ops, extnamespace oid_ops));
 
 MAKE_SYSCACHE(EXTENSIONOID, pg_extension_oid_index, 2);
 MAKE_SYSCACHE(EXTENSIONNAME, pg_extension_name_index, 2);

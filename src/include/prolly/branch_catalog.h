@@ -17,7 +17,8 @@
  *
  * A name belongs to shared schemas or to versioned ones, never to both:
  * a shared schema cannot be made while any branch has a versioned schema
- * of that name, nor a versioned one while a shared one exists.
+ * of that name, nor a versioned one while a shared one exists.  The same
+ * holds for extensions, whose names are not qualified by a schema.
  *
  * Branch identifiers are allocated per database by a BranchIdRoutine.
  * This file knows only the identifiers; what a branch is called, and what
@@ -86,5 +87,17 @@ extern void NamespaceCheckNameFree(const char *nspname, int32 branch);
 
 /* The branch a new versioned schema goes on: the session's, if it may. */
 extern int32 VersionedNamespaceBranch(const char *nspname);
+
+/*
+ * Extensions are shared (in a shared schema) or a branch's (in one of its
+ * versioned schemas), never both under one name: ExtensionOidByName finds
+ * the one this session sees, ExtensionCheckNameFree errors out unless one
+ * may be made in schema nspid (and locks the name until the transaction
+ * ends), and ExtensionCheckMove refuses a move between the two kinds or
+ * between branches.
+ */
+extern Oid	ExtensionOidByName(const char *extname);
+extern void ExtensionCheckNameFree(const char *extname, Oid nspid);
+extern void ExtensionCheckMove(const char *extname, Oid oldnspid, Oid newnspid);
 
 #endif							/* PROLLY_BRANCH_CATALOG_H */
