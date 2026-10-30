@@ -324,11 +324,13 @@ typedef struct BmapQueueMeta
 
 /*
  * A reference-count page's blocks: a count each, a uint32, then a roots'
- * count each, a uint16 (see "The roots' counts").  The uint16s follow the
- * uint32s, so both are aligned.
+ * count each, another uint32 (see "The roots' counts").  A roots' count
+ * is as wide as a count, so that the roots of a long version history
+ * (one for each commit, every one of them pointing to the same pages of a
+ * table that doesn't change) never take it to its limit.
  */
 #define BMAP_REFS_PER_PAGE \
-	((uint32) (BMAP_CONTENT_SIZE / (sizeof(uint32) + sizeof(uint16))))
+	((uint32) (BMAP_CONTENT_SIZE / (sizeof(uint32) + sizeof(uint32))))
 
 /* the release queue's page and slot of entry 'i' */
 #define BMAP_QUEUE_PER_PAGE \
@@ -456,14 +458,15 @@ StaticAssertDecl(BMAP_DELTA_ROOT_TOPS == BMAP_TREE_TOPS,
 #define PageGetBmapBits(page)	((uint64 *) PageGetContents(page))
 #define PageGetBmapRefs(page)	((uint32 *) PageGetContents(page))
 #define PageGetBmapRootRefs(page) \
-	((uint16 *) (PageGetContents(page) + BMAP_REFS_PER_PAGE * sizeof(uint32)))
+	((uint32 *) (PageGetContents(page) + BMAP_REFS_PER_PAGE * sizeof(uint32)))
 
 /*
  * A block's roots' count: how many of the captured roots' pages hold it,
- * and whether it is a node they reach (whose own pointers they count).
+ * in 31 bits, and whether it is a node they reach (whose own pointers they
+ * count), in the top bit.  A count at ROOTREF_MAX says at least that many.
  */
-#define ROOTREF_IN			0x8000
-#define ROOTREF_MAX			0x7FFF
+#define ROOTREF_IN			((uint32) 0x80000000)
+#define ROOTREF_MAX			((uint32) 0x7FFFFFFF)
 #define ROOTREF_COUNT(v)	((v) & ROOTREF_MAX)
 #define PageGetBmapQueueMeta(page)	((BmapQueueMeta *) PageGetContents(page))
 #define PageGetBmapQueued(page)	((BmapQueued *) PageGetContents(page))
@@ -1425,8 +1428,8 @@ apply_refs_delta(Page page, const xl_bmap_refs_delta *delta)
 	/* (then the roots' counts) */
 	for (uint32 i = delta->nrefs; i < delta->nrefs + delta->nroots; i++)
 	{
-		Assert(ref[i].slot < BMAP_REFS_PER_PAGE && ref[i].count <= PG_UINT16_MAX);
-		PageGetBmapRootRefs(page)[ref[i].slot] = (uint16) ref[i].count;
+		Assert(ref[i].slot < BMAP_REFS_PER_PAGE);
+		PageGetBmapRootRefs(page)[ref[i].slot] = ref[i].count;
 	}
 }
 
@@ -3727,7 +3730,7 @@ refs_set(RefsPages *rp, BlockNumber phys, uint32 count)
 }
 
 /* a block's roots' count on the locked pages */
-static uint16
+static uint32
 refs_get_root(RefsPages *rp, BlockNumber phys)
 {
 	Page		page = BufferGetPage(rp->buf[refs_find(rp, phys)]);
@@ -3737,7 +3740,7 @@ refs_get_root(RefsPages *rp, BlockNumber phys)
 
 /* set a block's roots' count when the record is made (once a record) */
 static void
-refs_set_root(RefsPages *rp, BlockNumber phys, uint16 value)
+refs_set_root(RefsPages *rp, BlockNumber phys, uint32 value)
 {
 	int			k = refs_find(rp, phys);
 
@@ -7149,7 +7152,7 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		BlockNumber b = blocks[i].block;
 		uint32		h = blocks[i].holders;
 		uint32		c = REF_PAGE(b) < nrefpages ? refs_get(&rp, b) : 0;
-		uint16		rv = REF_PAGE(b) < nrefpages ? refs_get_root(&rp, b) : 0;
+		uint32		rv = REF_PAGE(b) < nrefpages ? refs_get_root(&rp, b) : 0;
 		uint32		rc = ROOTREF_COUNT(rv);
 		bool		is_node = node != NULL && b == node->block;
 		bool		frees = false;
@@ -7219,8 +7222,8 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		if (REF_PAGE(b) < nrefpages)
 		{
 			/* (a block freed keeps no roots' count, whatever it said) */
-			uint16		nv = frees ? 0 :
-				(uint16) (rc | ((rv & ROOTREF_IN) && !leaves ? ROOTREF_IN : 0));
+			uint32		nv = frees ? 0 :
+				(rc | ((rv & ROOTREF_IN) && !leaves ? ROOTREF_IN : 0));
 
 			if (nv != rv)
 				refs_set_root(&rp, b, nv);
@@ -9766,13 +9769,15 @@ bmap_diff_roots(RelFileLocator store, BmapRootId a, BmapRootId b,
  * once its capture can no longer be abandoned (its capturer committed) and
  * nothing is releasing it (whose release would push pointers not
  * counted): until then it counts in each sweep's holders alone.  A count
- * that would pass ROOTREF_MAX leaves the counts not whole, each sweep then
- * counting anew.
+ * has 31 bits, past what the roots of any version history give one block;
+ * one that would pass ROOTREF_MAX stays there, leaving the counts not
+ * whole, each sweep then counting anew and taking the block for held
+ * however many pointers it takes off.
  */
 typedef struct RootCounts
 {
 	BlockNumber n;				/* blocks covered: the reference-count pages' */
-	uint16	   *v;				/* each block's roots' count, as counted */
+	uint32	   *v;				/* each block's roots' count, as counted */
 	bool		overflow;		/* a count passed ROOTREF_MAX */
 	BmapEntry  *extra;			/* tops of the roots not counted yet */
 	int			nextra;
@@ -9908,8 +9913,8 @@ roots_meta_change(RelFileLocator rel, uint16 flags, uint32 naming,
  * what it has, 'was': one record of the page.
  */
 static void
-root_counts_write(RelFileLocator rel, BlockNumber p, const uint16 *was,
-				  const uint16 *v)
+root_counts_write(RelFileLocator rel, BlockNumber p, const uint32 *was,
+				  const uint32 *v)
 {
 	xl_bmap_refs_delta *delta;
 	xl_bmap_ref_delta *ref;
@@ -9917,7 +9922,7 @@ root_counts_write(RelFileLocator rel, BlockNumber p, const uint16 *was,
 	Buffer		buf;
 	XLogRecPtr	lsn;
 
-	if (memcmp(was, v, BMAP_REFS_PER_PAGE * sizeof(uint16)) == 0)
+	if (memcmp(was, v, BMAP_REFS_PER_PAGE * sizeof(uint32)) == 0)
 		return;
 	delta = palloc0(sizeof(xl_bmap_refs_delta) +
 					BMAP_REFS_PER_PAGE * sizeof(xl_bmap_ref_delta));
@@ -9980,7 +9985,7 @@ root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
 	uint8	   *marks;
 	bool		whole;
 	BlockNumber nrefpages;
-	uint16	   *was;
+	uint32	   *was;
 	List	   *tomark = NIL;	/* slots to say are counted */
 	List	   *unmark = NIL;	/* pages of slots all counted */
 	int			extra_cap = 0;
@@ -9993,8 +9998,8 @@ root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
 	nrefpages = refs_nblocks(rel);
 	rc->n = nrefpages * BMAP_REFS_PER_PAGE;
 	rc->v = MemoryContextAllocHuge(CurrentMemoryContext,
-								   Max(rc->n, 1) * sizeof(uint16));
-	memset(rc->v, 0, Max(rc->n, 1) * sizeof(uint16));
+								   Max(rc->n, 1) * sizeof(uint32));
+	memset(rc->v, 0, Max(rc->n, 1) * sizeof(uint32));
 	if (!roots_exist(rel))
 		return 0;
 	metabuf = roots_read(rel, 0);
@@ -10015,7 +10020,7 @@ root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
 
 	/* the counts as they are, kept if whole */
 	was = MemoryContextAllocHuge(CurrentMemoryContext,
-								 Max(rc->n, 1) * sizeof(uint16));
+								 Max(rc->n, 1) * sizeof(uint32));
 	for (BlockNumber p = 0; p < nrefpages; p++)
 	{
 		Buffer		buf = refs_read(rel, p);
@@ -10024,15 +10029,15 @@ root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
 		check_refs_page(BufferGetPage(buf), rel, p);
 		if (PageIsNew(BufferGetPage(buf)))
 			memset(was + p * BMAP_REFS_PER_PAGE, 0,
-				   BMAP_REFS_PER_PAGE * sizeof(uint16));
+				   BMAP_REFS_PER_PAGE * sizeof(uint32));
 		else
 			memcpy(was + p * BMAP_REFS_PER_PAGE,
 				   PageGetBmapRootRefs(BufferGetPage(buf)),
-				   BMAP_REFS_PER_PAGE * sizeof(uint16));
+				   BMAP_REFS_PER_PAGE * sizeof(uint32));
 		UnlockReleaseBuffer(buf);
 	}
 	if (whole)
-		memcpy(rc->v, was, rc->n * sizeof(uint16));
+		memcpy(rc->v, was, rc->n * sizeof(uint32));
 
 	/*
 	 * The slots: those of the pages marked, or, the counts not whole, all
@@ -10141,7 +10146,7 @@ root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
 	 * failing before the end leaves them to be counted anew.
 	 */
 	changed = !whole || tomark != NIL || unmark != NIL ||
-		memcmp(was, rc->v, rc->n * sizeof(uint16)) != 0;
+		memcmp(was, rc->v, rc->n * sizeof(uint32)) != 0;
 	if (changed)
 	{
 		if (whole)
@@ -12361,7 +12366,12 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	memset(reached, 0, (hw / 64 + 1) * sizeof(uint64));
 	for (BlockNumber b = 0; b < hw && b < rc.n; b++)
 	{
-		holders[b] = ROOTREF_COUNT(rc.v[b]);
+		/*
+		 * (a count at its limit says at least so many: taken as the most
+		 * holders can say, which no pointer taken off lowers)
+		 */
+		holders[b] = ROOTREF_COUNT(rc.v[b]) == ROOTREF_MAX ? PG_UINT32_MAX :
+			ROOTREF_COUNT(rc.v[b]);
 		if (rc.v[b] & ROOTREF_IN)
 			reached[b / 64] |= UINT64CONST(1) << (b % 64);
 	}
