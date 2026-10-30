@@ -10413,6 +10413,8 @@ bmap_root_unchanged(SMgrRelation reln, BmapRootId id)
  * naming it meanwhile; a header held is locked first, as a capture locks
  * it.
  */
+static uint64 bmap_map_id(SMgrRelation reln);
+
 void
 bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 				SMgrRelation sharer, SMgrRelation lineage_of)
@@ -10424,7 +10426,6 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	xl_bmap_root r;
 	xl_bmap_header_delta hdelta;
 	xl_bmap_header_delta shdelta;
-	uint32		shared_below = 0;
 	uint64		lineage = lineage_of ? bmap_lineage(lineage_of) : 0;
 
 	smgrusewhich(dst, SMGR_BMAP);
@@ -10439,18 +10440,35 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 
 	INJECTION_POINT("bmap-root-share-checked", NULL);
 
-	/* the header of the storage replaced, or of the one captured of */
-	if (replacing != NULL)
+	/*
+	 * The relation the root was captured of, if the caller didn't name it
+	 * and it is still that map (its file number may be another's since):
+	 * it shares the root's nodes with the new storage from now on, so its
+	 * shared_below is raised past them, as a share raises its source's.  A
+	 * node it has alone again once the new storage copies it is then moved
+	 * at its next change rather than changed in place (tree_leaf_for()),
+	 * where a lookup of the new storage holding a pointer to it would read
+	 * the relation's page.  (A frozen root's nodes are of the copy it was
+	 * captured of, whose file number it doesn't keep: that copy is the
+	 * caller's to name, if it outlives the capture.)
+	 */
+	if (sharer == NULL && r.live_map == 0)
 	{
-		RelFileLocator srel = replacing->smgr_rlocator.locator;
-		Buffer		h = map_read(srel, 0);
+		RelFileLocator of = drel;
+		SMgrRelation ofreln;
 
-		LockBuffer(h, BUFFER_LOCK_SHARE);
-		check_page(BufferGetPage(h), BMAP_PAGE_HEADER, srel, BMAP_FORKNUM, 0);
-		shared_below = PageGetBmapHeader(BufferGetPage(h))->shared_below;
-		UnlockReleaseBuffer(h);
+		of.relNumber = r.relnumber;
+		ofreln = smgropen(of, INVALID_PROC_NUMBER);
+		if (!RelFileLocatorEquals(of, drel) &&
+			(replacing == NULL ||
+			 !RelFileLocatorEquals(of, replacing->smgr_rlocator.locator)) &&
+			mdexists(ofreln, BMAP_FORKNUM) &&
+			bmap_map_id(ofreln) == r.map_id)
+			sharer = ofreln;
 	}
-	else if (sharer != NULL)
+
+	/* the header of the one captured of */
+	if (sharer != NULL)
 	{
 		RelFileLocator srel = sharer->smgr_rlocator.locator;
 
@@ -10506,8 +10524,13 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	hdelta.vm_nblocks = r.snap.vm_nblocks;
 	hdelta.free_space_unknown = r.snap.nblocks;
 	hdelta.epoch = r.snap.epoch;
-	hdelta.shared_below = replacing != NULL ?
-		Min(shared_below, hdelta.epoch) : hdelta.epoch;
+	/*
+	 * Every node the new storage holds is the root's, which other maps may
+	 * hold too: so all are born before its shared_below, and a node it has
+	 * alone again is moved, not changed in place (tree_leaf_for()).  (Not
+	 * the storage replaced's lower one: its nodes aren't these.)
+	 */
+	hdelta.shared_below = hdelta.epoch;
 	tree_share_root(dst, dst, snapshot_tops(&r.snap), &hdelta, sheader,
 					&shdelta, id, lineage);
 	UnlockReleaseBuffer(buf);
@@ -10807,7 +10830,6 @@ bmapfreespaceknown(SMgrRelation reln, BlockNumber upto)
  * a root it is a copy of (told by the root's own epoch, live's when made).
  * The epoch into *since.
  */
-static uint64 bmap_map_id(SMgrRelation reln);
 
 bool
 bmap_root_base(SMgrRelation live, BmapRootId id, uint32 *since)

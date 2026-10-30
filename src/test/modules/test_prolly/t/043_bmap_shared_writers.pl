@@ -224,34 +224,51 @@ SKIP:
 # longer the node it named, begins again from the root.
 SKIP:
 {
-	skip 'injection points not supported by this build', 2
+	skip 'injection points not supported by this build', 4
 	  unless $ENV{enable_injection_points} eq 'yes';
-	sql(q{
-		CREATE TABLE x (a int, b text);
-		INSERT INTO x SELECT g, repeat('x', 500) FROM generate_series(1, 200) g;
-		CHECKPOINT;
-	});
-	my $x = sql(q{SELECT pg_relation_filenode('x')});
-	my $xc = sql(qq{SELECT test_bmap_share($x)});
-	sql(q{CHECKPOINT});
-	my $before = sql(qq{SELECT test_bmap_read($x, 3, false)});
-	my $reader = $node->background_psql('postgres');
-	$reader->query_safe(q{SELECT injection_points_set_local()});
-	$reader->query_safe(q{SELECT injection_points_attach('bmap-tree-find-root', 'wait')});
-	$reader->query_until(qr/^$/, "SELECT test_bmap_read($xc, 3, true) AS seen \\gset\n");
-	$node->wait_for_event('client backend', 'bmap-tree-find-root');
-	# the copy's change copies the shared leaf; the source then has it alone
-	sql(qq{SELECT test_bmap_write($xc, 5, 7)});
-	sql(qq{SELECT test_bmap_write($x, 3, 99)});
-	sql(q{CHECKPOINT});
-	sql(q{SELECT injection_points_detach('bmap-tree-find-root')});
-	sql(q{SELECT injection_points_wakeup('bmap-tree-find-root')});
-	# (the old node's block may be made the source's page by then: read as
-	# a node, it fails verification, warning so, and the lookup begins again)
-	is($reader->query(q{SELECT :'seen'}), $before,
-		'a lookup holding a pointer from before its map copied a node reads its own block');
-	is(sql(qq{SELECT test_bmap_read($x, 3, false)}), '99', 'while the source has its change');
-	$reader->quit;
+	# (a copy shared of the source, and storage made of a root captured of
+	# it, the root then let go of: either shares the source's nodes)
+	for my $how ('share', 'root')
+	{
+		sql(qq{
+			CREATE TABLE x_$how (a int, b text);
+			INSERT INTO x_$how SELECT g, repeat('x', 500) FROM generate_series(1, 200) g;
+			CHECKPOINT;
+		});
+		my $x = sql(qq{SELECT pg_relation_filenode('x_$how')});
+		my $xc;
+		if ($how eq 'share')
+		{
+			$xc = sql(qq{SELECT test_bmap_share($x)});
+		}
+		else
+		{
+			my $root = sql(qq{SELECT test_bmap_root_capture($x)});
+			$xc = sql(qq{SELECT test_bmap_share_root($root)});
+			sql(qq{SELECT test_bmap_root_release($root)});
+			sql(q{SELECT * FROM test_bmap_release_drain()});
+		}
+		sql(q{CHECKPOINT});
+		my $before = sql(qq{SELECT test_bmap_read($x, 3, false)});
+		my $reader = $node->background_psql('postgres');
+		$reader->query_safe(q{SELECT injection_points_set_local()});
+		$reader->query_safe(q{SELECT injection_points_attach('bmap-tree-find-root', 'wait')});
+		$reader->query_until(qr/^$/, "SELECT test_bmap_read($xc, 3, true) AS seen \\gset\n");
+		$node->wait_for_event('client backend', 'bmap-tree-find-root');
+		# the copy's change copies the shared leaf; the source then has it alone
+		sql(qq{SELECT test_bmap_write($xc, 5, 7)});
+		sql(qq{SELECT test_bmap_write($x, 3, 99)});
+		sql(q{CHECKPOINT});
+		sql(q{SELECT injection_points_detach('bmap-tree-find-root')});
+		sql(q{SELECT injection_points_wakeup('bmap-tree-find-root')});
+		# (the old node's block may be made the source's page by then: read
+		# as a node, it fails verification, warning so, and the lookup
+		# begins again)
+		is($reader->query(q{SELECT :'seen'}), $before,
+			"a lookup holding a pointer from before its map copied a node reads its own block ($how)");
+		is(sql(qq{SELECT test_bmap_read($x, 3, false)}), '99', "while the source has its change ($how)");
+		$reader->quit;
+	}
 }
 
 # Crash recovery keeps a relation's changes made before its node was
