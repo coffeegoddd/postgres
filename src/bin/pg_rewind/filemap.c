@@ -34,6 +34,7 @@
 #include "datapagemap.h"
 #include "filemap.h"
 #include "pg_rewind.h"
+#include "storage/bmap_files.h"
 
 /*
  * Define a hash table which we can use to store information about the files
@@ -381,6 +382,10 @@ process_target_wal_block_change(ForkNumber forknum, RelFileLocator rlocator,
 	 * was created and dropped in the target system and it never existed in
 	 * the source. Either way, we can safely ignore it.
 	 */
+	/* (block-mapped storage's files are copied in toto) */
+	if (entry && entry->content_type != FILE_CONTENT_TYPE_RELATION)
+		return;
+
 	if (entry)
 	{
 		Assert(entry->content_type == FILE_CONTENT_TYPE_RELATION);
@@ -656,6 +661,23 @@ getFileContentType(const char *path)
 
 		pfree(check_path);
 	}
+
+	/*
+	 * The files of block-mapped storage are copied in toto.  The WAL names a
+	 * block-mapped relation's pages by their logical block numbers, not by
+	 * the blocks of the page store that hold them, so the store's changed
+	 * blocks can't be found from it; and the allocator's, the reference
+	 * counts', the release queue's and the captured roots' pages must agree
+	 * with the store's.  The source's copies, and replay of its WAL from the
+	 * last common checkpoint, make them consistent, as for a base backup.
+	 */
+	if (result == FILE_CONTENT_TYPE_RELATION &&
+		(rlocator.relNumber == BMAP_ALLOC_RELNUMBER ||
+		 rlocator.relNumber == BMAP_STORE_RELNUMBER ||
+		 rlocator.relNumber == BMAP_REFS_RELNUMBER ||
+		 rlocator.relNumber == BMAP_QUEUE_RELNUMBER ||
+		 rlocator.relNumber == BMAP_ROOTS_RELNUMBER))
+		result = FILE_CONTENT_TYPE_OTHER;
 
 	return result;
 }
