@@ -9202,12 +9202,12 @@ diff_read_node(DiffWalk *dw, const BmapEntry *ptr, uint16 level,
 	if (is)
 		memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
 			   BMAP_TREE_FANOUT * sizeof(BmapEntry));
-	UnlockReleaseBuffer(buf);
-	if (!is)
+	else
 	{
 		dw->mismatch = true;
 		dw->mismatched = ptr->block;
 	}
+	UnlockReleaseBuffer(buf);
 	CHECK_FOR_INTERRUPTS();
 	return is;
 }
@@ -9295,10 +9295,12 @@ static bool
 diff_walk(RelFileLocator store, const DiffSide *a, const DiffSide *b,
 		  BlockNumber **blknos, uint32 *n, BlockNumber *mismatched)
 {
-	DiffWalk	dw = {store, {a->nblocks, b->nblocks}, NULL, 0, 0, false,
-	InvalidBlockNumber};
+	DiffWalk	dw = {0};
 	uint64		first = 0;
 
+	dw.store = store;
+	dw.nblocks[0] = a->nblocks;
+	dw.nblocks[1] = b->nblocks;
 	for (int k = 0; k < BMAP_TREE_TOPS && !dw.mismatch; k++)
 	{
 		const BmapEntry *ptr[2];
@@ -9324,7 +9326,7 @@ diff_walk(RelFileLocator store, const DiffSide *a, const DiffSide *b,
 }
 
 /* a diff's walks have found a node not the one its pointer named too often */
-static void
+pg_noreturn static void
 diff_mismatched(RelFileLocator store, BlockNumber block)
 {
 	ereport(ERROR,
@@ -9392,9 +9394,9 @@ diff_check_store(RelFileLocator a, RelFileLocator b)
  * under its own, into *blknos (palloc'd, ascending): how many.  Blocks
  * past both lengths don't count.  A change of either relation meanwhile
  * gives a mixed result, each block as before the change or as after, not
- * an error (see the walk's comment above).  It reads each map's header and root page, and the nodes
- * whose pointers differ between the maps: those on the paths down to the
- * pages that differ, which copy-on-write made each map's own, and those
+ * an error (see the walk's comment above).  It reads each map's header and
+ * root page, and the nodes whose pointers differ between the maps: those on
+ * the paths down to the pages that differ, which copy-on-write made each map's own, and those
  * mapping blocks between the two lengths.  So it costs O(the pages that
  * differ) map pages, at most the tree's height for each, none but the
  * headers and root pages for maps that share every subtree (a share and
@@ -9419,7 +9421,6 @@ bmap_diff(SMgrRelation a, SMgrRelation b, BlockNumber **blknos)
 			return n;
 	}
 	diff_mismatched(store, mismatched);
-	return 0;					/* keep compiler quiet */
 }
 
 /*
@@ -9448,7 +9449,6 @@ bmap_diff_root(SMgrRelation a, BmapRootId id, BlockNumber **blknos)
 			return n;
 	}
 	diff_mismatched(store, mismatched);
-	return 0;					/* keep compiler quiet */
 }
 
 /* bmap_diff() of roots 'a' and 'b' of the page store of 'store' */
@@ -9470,7 +9470,6 @@ bmap_diff_roots(RelFileLocator store, BmapRootId a, BmapRootId b,
 			return n;
 	}
 	diff_mismatched(store, mismatched);
-	return 0;					/* keep compiler quiet */
 }
 
 /*
