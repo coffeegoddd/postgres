@@ -184,6 +184,12 @@ is(sql(qq{
 	SELECT count(*) > 0 FROM pg_get_wal_records_info('$before_free', pg_current_wal_insert_lsn())
 	WHERE resource_manager = 'BlockMap' AND record_type = 'PASSED'}),
 	't', 'logging first that the copies are past the restart point');
+$primary->command_like([ 'pg_controldata', $primary->data_dir ],
+	qr/Pages synced unlogged since: +(?!0\/00000000)[0-9A-F]+\/[0-9A-F]{8}\n/,
+	'pg_controldata shows where the copies passed need recovery to begin past');
+$primary->command_like([ 'pg_controldata', $primary->data_dir ],
+	qr/Times pages synced unlogged: +[1-9][0-9]*\n/,
+	'and how many times pages were synced so');
 sql(qq{SELECT test_bmap_unlink($copy)});
 
 # Blocks held for copies are pushed on top of the queue, over what a drop

@@ -188,7 +188,8 @@ typedef struct ControlFileData
 	 * synced so on this server, by a record it made or replayed, and
 	 * syncedCount how many times one was (XLogNoteSyncedPages()).  Recovery
 	 * refuses to begin at or before syncedSince, as does an online backup
-	 * on a standby whose restart point isn't past it; pg_rewind refuses to
+	 * on a standby whose restart point isn't past it (or stopping once it
+	 * is past the backup's start); pg_rewind refuses to
 	 * rewind from a source that synced pages so since where the target's
 	 * replay would begin, or while it copied files.
 	 */

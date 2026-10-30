@@ -85,6 +85,7 @@ patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_release_max_per_p
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_release_max_per_pass and block_map_replay_entries
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
+patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
 patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and its database's page store whole (kept in --swap)
