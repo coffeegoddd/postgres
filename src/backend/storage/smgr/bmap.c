@@ -108,32 +108,29 @@
  * (preserve_header_lock()).
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * three cases: a crash between a drop's commit and the records queuing what
- * it didn't queue before its commit record (a prepared transaction's
- * drops), a crash (or an error, not an interrupt, which the header's lock
- * holds off) between the records letting go of a truncation's blocks and
- * those freeing them, and a count stuck at 255 maps.
- * A sweep drains the release queue, then counts exactly what every
- * map of a database's page store holds, each
+ * three cases: a crash between a drop's commit and the records queuing what it
+ * didn't queue before its commit record (a prepared transaction's drops), a
+ * crash (or an error, not an interrupt, which the header's lock holds off)
+ * between the records letting go of a truncation's blocks and those freeing
+ * them, and a count stuck at 255 maps. A sweep drains the release queue, then
+ * counts exactly what every map of a database's page store holds, each
  * relation's read under its header's lock, and what the queue still holds
- * (drains held off meanwhile), and
- * frees the blocks allocated as it began that nothing holds, rewrites the
- * stuck counts that now fit, moves the blocks past the allocated count down
- * into free ones (compact_store()), and shortens the store to its last
- * allocated block (SHRINK, which redo truncates by too), unless another
- * sweep of it runs, which may still free blocks past that.  Branch creation (a share,
- * the one thing that adds holders) waits for it while it counts, and the
- * allocator reuses no freed block of the store while a sweep of it runs:
- * one freed and taken again meanwhile could be held by a map the sweep
- * read before.  A dropped
- * relation's map counts until it is removed, once its blocks are queued
- * (a tree's root page is written out with no subtrees once they are
- * queued, as the nodes it named may be freed); an empty main fork file
- * then keeps its relation file number until the next checkpoint, as
- * md.c's does.  A tree's node counts once for each page pointing to
- * it, its children once however many reach it.  A path copy (not held off)
- * adds holders only to blocks held already; one adding a holder to a stuck
- * count makes a sweep under way leave the stuck counts as they are.
+ * (drains held off meanwhile), and frees the blocks allocated as it began that
+ * nothing holds, rewrites the stuck counts that now fit, moves the blocks past
+ * the allocated count down into free ones (compact_store()), and shortens the
+ * store to its last allocated block (SHRINK, which redo truncates by too),
+ * unless another sweep of it runs, which may still free blocks past that.
+ * Branch creation (a share, the one thing that adds holders) waits for it
+ * while it counts, and the allocator reuses no freed block of the store while
+ * a sweep of it runs: one freed and taken again meanwhile could be held by a
+ * map the sweep read before.  A dropped relation's map counts until it is
+ * removed, once its blocks are queued (a tree's root page is written out with
+ * no subtrees once they are queued, as the nodes it named may be freed); an
+ * empty main fork file then keeps its relation file number until the next
+ * checkpoint, as md.c's does.  A tree's node counts once for each page
+ * pointing to it, its children once however many reach it.  A path copy (not
+ * held off) adds holders only to blocks held already; one adding a holder to a
+ * stuck count makes a sweep under way leave the stuck counts as they are.
  *
  * Scans (bmap_scan_store()).  A scan of a page store reads every block
  * allocated, or only the ranges of blocks written or freed since an
@@ -1916,18 +1913,18 @@ map_root_lost(SMgrRelation reln)
  * and 'cached_only'.
  *
  * In recovery a node may not be the incarnation the pointer to it names,
- * however often it is read: the pointer is of a version of its page newer
- * than the replay, and the node it names was made after the replay point
- * (and not yet written out before a crash), or made something else after
- * it was let go of.  Either way the subtree that held the block when the
- * record being replayed was made was replaced or let go of since: copied
- * because it was shared, and then its relation's own pages were logged as
- * images before the share, whose replay writes them to their blocks, so
- * its blocks have what the records before then changed; or let go of by a truncation, a drop or a root
+ * however often it is read: the pointer is of a version of its page newer than
+ * the replay, and the node it names was made after the replay point (and not
+ * yet written out before a crash), or made something else after it was let go
+ * of.  Either way the subtree that held the block when the record being
+ * replayed was made was replaced or let go of since: copied because it was
+ * shared, and then its relation's own pages were logged as images before the
+ * share, whose replay writes them to their blocks, so its blocks have what the
+ * records before then changed; or let go of by a truncation, a drop or a root
  * swap, after which nothing reads its pages.  (A subtree never gets a level
- * above it, which would replace a pointer with one to a node that still
- * needs the old.)  So the block's records from before then are skipped,
- * and its pages go nowhere: TREE_UNAVAILABLE.
+ * above it, which would replace a pointer with one to a node that still needs
+ * the old.)  So the block's records from before then are skipped, and its
+ * pages go nowhere: TREE_UNAVAILABLE.
  */
 static TreeFound
 tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
@@ -5653,11 +5650,11 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
  * by the roots captured of this map?  Its entry born before the map's
  * shared_below (raised by a share, and by a copy made of a root) may be;
  * one born since only by its captured roots, which keep the relation's
- * pages as they were for its own branch.  A hint for callers
+ * pages as they were.  A hint for callers
  * weighing a copy's cost: preparing the page for a change copies it either
- * way.  shared_below rises with a share (a restore's new storage takes its
- * old storage's, which goes); once the other map is gone (a branch
- * deleted), the entries born before it count as shared elsewhere until
+ * way.  shared_below rises with a share (storage made of a root to take
+ * another's place takes that storage's, which goes); once the other map is
+ * gone (dropped), the entries born before it count as shared elsewhere until
  * they change or a page sweep lowers it (sweep_shared_below()), which
  * costs VACUUM's work on them meanwhile, never their contents.
  */
@@ -6035,9 +6032,8 @@ tree_walk(SMgrRelation reln, TreeNodeVisit visit_node,
  * Drains are run by callers of bmap_release_step(), by a sweep before it
  * counts, and before a VACUUM of a relation of the store
  * (bmapreleasestep()): a page a dropped map still holds counts as shared,
- * which VACUUM would otherwise leave as it is or copy to change.  With
- * autovacuum off, an extension that would grow the store drains first
- * (bmapbeforeextend()).
+ * which VACUUM would otherwise leave as it is or copy to change.  An
+ * extension that would grow the store drains first (bmapbeforeextend()).
  *
  * A relation a top-level transaction drops at commit is queued before the
  * commit record (bmapprecommitdrop()), each entry naming the transaction
@@ -6676,11 +6672,11 @@ bmapenddrops(void)
 }
 
 /*
- * Let go of every physical block a dropped relation's map holds: queued, for a drain to free those no other map holds and count
- * the others down.  The records name only the queue's pages: a standby has
- * removed the relation's map by the time it replays them.  Runs after
- * commit or abort, so it must not fail: a problem is reported and the
- * blocks are left allocated, for a sweep.
+ * Let go of every physical block a dropped relation's map holds: queued, for a
+ * drain to free those no other map holds and count the others down.  The
+ * records name only the queue's pages: a standby has removed the relation's
+ * map by the time it replays them.  Runs after commit or abort, so it must not
+ * fail: a problem is reported and the blocks are left allocated, for a sweep.
  */
 static void
 drop_blocks(SMgrRelation reln)
@@ -9867,13 +9863,14 @@ let_go_relation(HeldRelation *held)
 /*
  * Lower a relation's shared_below to just past the newest of its entries
  * another map still holds (0 if none), now that every holder is counted,
- * holders[] (each block's, of every map and the release queue).  Never
- * raised, and never below an entry another map holds: no share adds a holder while the sweep's lock is held, and a copy of a node
- * or a page meanwhile only adds holders, of blocks the counts already
- * hold or of blocks newer than any counted, which count as held
- * elsewhere.  Under the header's lock, WAL-logged as a header delta, the
- * relation's length as it is (a truncation's record, which carries one),
- * the relation held against its drop meanwhile (hold_relation()).
+ * holders[] (each block's, of every map and the release queue).  Never raised,
+ * and never below an entry another map holds: no share adds a holder while the
+ * sweep's lock is held, and a copy of a node or a page meanwhile only adds
+ * holders, of blocks the counts already hold or of blocks newer than any
+ * counted, which count as held elsewhere.  Under the header's lock, WAL-logged
+ * as a header delta, the relation's length as it is (a truncation's record,
+ * which carries one), the relation held against its drop meanwhile
+ * (hold_relation()).
  */
 static void
 sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw,
@@ -10148,11 +10145,10 @@ sweep_shrink(RelFileLocator rel)
 
 /*
  * Sweep a database's page store in a tablespace: count exactly what every
- * block-mapped relation there holds (every branch's copies, so every
- * catalog row of every branch: their maps are files), then free the
- * blocks allocated when the sweep began that nothing holds (left by a
- * crash after a drop's commit), what the
- * release queue holds let go of first and the rest counted, rewrite the
+ * block-mapped relation there holds (found by their map files, not by
+ * catalog rows), then free the blocks allocated when the sweep began that
+ * nothing holds (left by a crash after a drop's commit), what the release
+ * queue holds let go of first and the rest counted, rewrite the
  * stuck counts whose holders now fit one, and shorten the store to its
  * last allocated block.  Branch creation (bmapshare()) is held off while
  * the maps are read and the counts rewritten; extensions and remaps go on,
@@ -10482,12 +10478,11 @@ cmp_move_desc(const void *a, const void *b)
 
 /*
  * Move one relation's blocks from 'target' on, the highest first; each old
- * block goes back to the allocator with its move (compact_page()).  With 'held' (the relation held against
- * its drop), the moves stop once another waits for that hold, so a DDL
- * waits for no more than a move.  Those that only try their locks aren't
- * waiting,
- * and ask through the compaction's slot instead (bmap_compaction_let_go()):
- * the moves stop as well once it is asked.
+ * block goes back to the allocator with its move (compact_page()).  With
+ * 'held' (the relation held against its drop), the moves stop once another
+ * waits for that hold, so a DDL waits for no more than a move.  Those that
+ * only try their locks aren't waiting, and ask through the compaction's slot
+ * instead (bmap_compaction_let_go()): the moves stop as well once it is asked.
  */
 static uint64
 compact_relation(SMgrRelation reln, BlockNumber target,
@@ -11740,17 +11735,17 @@ store_free(RelFileLocator rel)
 
 /*
  * Before reln's main fork is extended by nblocks through shared buffers: if
- * its page store has fewer free blocks than that and its release queue
- * isn't empty, take release steps first (not waiting for another drain or
- * a sweep), until enough are free, the queue is empty or its top waits for
- * a drop, or BMAP_GROWTH_RELEASE_STEPS were taken, so that dropped storage
- * is reused before the store grows.  Only in a transaction; nothing
- * else drains the queue in the background yet, so this is what keeps a
- * dropped relation's blocks from being lost to the store.  The caller holds no extension lock (a step takes locks of
- * its own), but may hold a relation's page locked, as a B-tree split does:
- * a step locks the allocator's pages and counts, as the extension's
- * allocation does, and the queue's pages, none of which a backend waits
- * for while holding a relation's page.
+ * its page store has fewer free blocks than that and its release queue isn't
+ * empty, take release steps first (not waiting for another drain or a sweep),
+ * until enough are free, the queue is empty or its top waits for a drop, or
+ * BMAP_GROWTH_RELEASE_STEPS were taken, so that dropped storage is reused
+ * before the store grows.  Only in a transaction; nothing else drains the
+ * queue in the background yet, so this is what keeps a dropped relation's
+ * blocks from being lost to the store.  The caller holds no extension lock (a
+ * step takes locks of its own), but may hold a relation's page locked, as a
+ * B-tree split does: a step locks the allocator's pages and counts, as the
+ * extension's allocation does, and the queue's pages, none of which a backend
+ * waits for while holding a relation's page.
  */
 void
 bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)

@@ -343,7 +343,9 @@ test_bmap_release_pending(PG_FUNCTION_ARGS)
  * An injection point callback, attached with injection_points_attach(name,
  * 'test_prolly', 'test_bmap_write_one_crash', '\xNN'): of the locked
  * buffers the point passes, write out the one numbered NN alone, then
- * crash, as a crash with only that page written leaves the storage.
+ * crash, as a crash with only that page written leaves the storage.  A
+ * point passing no buffers just crashes; the truncation point that passes
+ * any passes one, the map's header, so NN must be 0.
  */
 extern PGDLLEXPORT void test_bmap_write_one_crash(const char *name,
 												  const void *private_data,
@@ -354,7 +356,14 @@ test_bmap_write_one_crash(const char *name, const void *private_data,
 						  void *arg)
 {
 	uint8		i = *(const uint8 *) private_data;
-	Buffer		buf = ((Buffer *) arg)[i];
+	Buffer		buf;
+
+	if (arg == NULL)
+		elog(PANIC, "crashing at injection point \"%s\"", name);
+	if (i != 0)
+		elog(ERROR, "injection point \"%s\" passes one buffer, not %u",
+			 name, (unsigned) i + 1);
+	buf = ((Buffer *) arg)[i];
 
 	if (BufferIsValid(buf))
 		FlushOneBuffer(buf);
