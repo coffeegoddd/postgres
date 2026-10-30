@@ -234,10 +234,11 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
  * clears the changing relation's own bits, as any change does.  It gets no
  * free space map: copying src's would cost a page of it for every few
  * thousand pages shared, and a free space map is only a hint, which the
- * new relation's VACUUM builds again for the pages it changes.  Until then
- * inserts extend it, which costs no more than filling a shared page would:
- * that copies the page first.  So the share's cost doesn't grow with src's
- * size.  As RelationCreateStorage(), the storage is deleted if the
+ * new relation's first VACUUM builds again, reading the pages it skips as
+ * all-visible only for their free space, as the storage manager says it
+ * may not know theirs (smgrfreespaceunknown()).  Until then inserts extend
+ * it, which costs no more than filling a shared page would: that copies the
+ * page first.  So the share's cost doesn't grow with src's size.  As RelationCreateStorage(), the storage is deleted if the
  * transaction aborts when register_delete.
  */
 SMgrRelation
@@ -337,9 +338,10 @@ check_root_horizon(RelFileLocator rlocator, uint64 root)
  * too, which the root captured with the pages it describes (a root that
  * holds frozen copies of a relation's pages keeps no visibility map, whose
  * bits were of the pages before they were frozen in).  It gets no
- * free space map, so the relation knows of no free space until vacuumed,
- * unless maps_from: then it is a copy of that relation's, a hint that may
- * be wrong of the root's pages without harm.  With replacing,
+ * free space map, so the relation knows of no free space until vacuumed
+ * (whose first VACUUM reads every page for it, as after a share), unless
+ * maps_from: then it is a copy of that relation's, a hint that may be
+ * wrong of the root's pages without harm, which that VACUUM corrects.  With replacing,
  * the storage made takes that storage's place (dropped as the transaction
  * commits: a restore), and shares the pages with no other relation for
  * that; with sharer, a relation that still holds the root's pages is told

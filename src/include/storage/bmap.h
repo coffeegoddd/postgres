@@ -47,6 +47,8 @@ extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
 extern void bmapprerestore(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, XLogRecPtr lsn);
 extern bool bmappreparesforchanges(SMgrRelation reln, ForkNumber forknum);
+extern BlockNumber bmapfreespaceunknown(SMgrRelation reln);
+extern void bmapfreespaceknown(SMgrRelation reln, BlockNumber upto);
 extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer);
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,

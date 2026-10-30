@@ -134,6 +134,8 @@ extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprerestore(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
+extern BlockNumber smgrfreespaceunknown(SMgrRelation reln);
+extern void smgrfreespaceknown(SMgrRelation reln, BlockNumber upto);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer);
 extern uint32 smgrreleasestep(SMgrRelation reln);

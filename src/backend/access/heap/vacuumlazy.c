@@ -368,6 +368,15 @@ typedef struct LVRelState
 	bool		next_unskippable_eager_scanned; /* if it was eagerly scanned */
 	Buffer		next_unskippable_vmbuffer;	/* buffer containing its VM bit */
 
+	/*
+	 * Pages from 0 whose free space the free space map may know nothing of,
+	 * as the storage manager says (smgrfreespaceunknown()), and the end of
+	 * the range being skipped whose pages below that are read anyway, only
+	 * to record their free space.
+	 */
+	BlockNumber free_space_unknown;
+	BlockNumber free_space_only_end;
+
 	/* State related to managing eager scanning of all-visible pages */
 
 	/*
@@ -429,6 +438,13 @@ typedef struct LVSavedErrInfo
 static void lazy_scan_heap(LVRelState *vacrel);
 static void heap_vacuum_eager_scan_setup(LVRelState *vacrel,
 										 const VacuumParams *params);
+/*
+ * What heap_vac_scan_next_block() says of a block, in its per-buffer data:
+ * eagerly scanned, or read only to record its free space.
+ */
+#define VAC_BLK_EAGER_SCANNED		0x01
+#define VAC_BLK_FREE_SPACE_ONLY		0x02
+
 static BlockNumber heap_vac_scan_next_block(ReadStream *stream,
 											void *callback_private_data,
 											void *per_buffer_data);
@@ -1333,6 +1349,9 @@ lazy_scan_heap(LVRelState *vacrel)
 	vacrel->next_unskippable_block = InvalidBlockNumber;
 	vacrel->next_unskippable_eager_scanned = false;
 	vacrel->next_unskippable_vmbuffer = InvalidBuffer;
+	vacrel->free_space_unknown =
+		Min(smgrfreespaceunknown(RelationGetSmgr(vacrel->rel)), rel_pages);
+	vacrel->free_space_only_end = 0;
 
 	/*
 	 * Set up the read stream for vacuum's first pass through the heap.
@@ -1346,7 +1365,7 @@ lazy_scan_heap(LVRelState *vacrel)
 										MAIN_FORKNUM,
 										heap_vac_scan_next_block,
 										vacrel,
-										sizeof(bool));
+										sizeof(uint8));
 
 	while (true)
 	{
@@ -1435,10 +1454,28 @@ lazy_scan_heap(LVRelState *vacrel)
 		if (!BufferIsValid(buf))
 			break;
 
-		was_eager_scanned = *((bool *) per_buffer_data);
 		CheckBufferIsPinnedOnce(buf);
 		page = BufferGetPage(buf);
 		blkno = BufferGetBlockNumber(buf);
+
+		/*
+		 * A page skipped as all-visible but read for its free space, which
+		 * the free space map may not know: recorded, nothing else done.  It
+		 * isn't counted as scanned, so what is decided of the relation's
+		 * horizons is as if it was skipped.
+		 */
+		if (*((uint8 *) per_buffer_data) & VAC_BLK_FREE_SPACE_ONLY)
+		{
+			Size		freespace;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			freespace = PageIsNew(page) ? 0 : PageGetHeapFreeSpace(page);
+			UnlockReleaseBuffer(buf);
+			RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
+			continue;
+		}
+		was_eager_scanned =
+			(*((uint8 *) per_buffer_data) & VAC_BLK_EAGER_SCANNED) != 0;
 
 		vacrel->scanned_pages++;
 		if (was_eager_scanned)
@@ -1697,6 +1734,11 @@ lazy_scan_heap(LVRelState *vacrel)
 	if (rel_pages > next_fsm_block_to_vacuum)
 		FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum, rel_pages);
 
+	/* every page's free space recorded, the ones skipped too */
+	if (vacrel->free_space_unknown > 0)
+		smgrfreespaceknown(RelationGetSmgr(vacrel->rel),
+						   vacrel->free_space_unknown);
+
 	/* report all blocks vacuumed */
 	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_VACUUMED, rel_pages);
 
@@ -1783,10 +1825,37 @@ heap_vac_scan_next_block(ReadStream *stream,
 		 */
 		if (vacrel->next_unskippable_block - next_block >= SKIP_PAGES_THRESHOLD)
 		{
-			next_block = vacrel->next_unskippable_block;
 			if (skipsallvis)
 				vacrel->skippedallvis = true;
+
+			/*
+			 * Pages whose free space the free space map may not know are
+			 * read all the same, only to record it (see below).
+			 */
+			if (next_block < vacrel->free_space_unknown)
+				vacrel->free_space_only_end =
+					Min(vacrel->next_unskippable_block,
+						vacrel->free_space_unknown);
+			else
+				next_block = vacrel->next_unskippable_block;
 		}
+	}
+
+	/*
+	 * A block of a range skipped, read only for its free space; past the
+	 * pages whose free space may be unknown, the rest of the range is
+	 * skipped.
+	 */
+	if (next_block < vacrel->free_space_only_end)
+	{
+		vacrel->current_block = next_block;
+		*((uint8 *) per_buffer_data) = VAC_BLK_FREE_SPACE_ONLY;
+		return vacrel->current_block;
+	}
+	if (vacrel->free_space_only_end > 0)
+	{
+		next_block = vacrel->next_unskippable_block;
+		vacrel->free_space_only_end = 0;
 	}
 
 	/* Now we must be in one of the two remaining states: */
@@ -1799,7 +1868,7 @@ heap_vac_scan_next_block(ReadStream *stream,
 		 */
 		vacrel->current_block = next_block;
 		/* Block was not eager scanned */
-		*((bool *) per_buffer_data) = false;
+		*((uint8 *) per_buffer_data) = 0;
 		return vacrel->current_block;
 	}
 	else
@@ -1811,7 +1880,8 @@ heap_vac_scan_next_block(ReadStream *stream,
 		Assert(next_block == vacrel->next_unskippable_block);
 
 		vacrel->current_block = next_block;
-		*((bool *) per_buffer_data) = vacrel->next_unskippable_eager_scanned;
+		*((uint8 *) per_buffer_data) = vacrel->next_unskippable_eager_scanned ?
+			VAC_BLK_EAGER_SCANNED : 0;
 		return vacrel->current_block;
 	}
 }

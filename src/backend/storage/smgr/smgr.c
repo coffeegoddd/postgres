@@ -171,6 +171,14 @@ typedef struct f_smgr
 	bool		(*smgr_pagesharedelsewhere) (SMgrRelation reln,
 											 ForkNumber forknum,
 											 BlockNumber blocknum);
+	/*
+	 * How many of a relation's first pages the free space map may know
+	 * nothing of (storage made without one, sharing pages whose visibility
+	 * map says VACUUM may skip them); and that VACUUM recorded the free
+	 * space of every page below 'upto'.  May be NULL.
+	 */
+	BlockNumber (*smgr_freespaceunknown) (SMgrRelation reln);
+	void		(*smgr_freespaceknown) (SMgrRelation reln, BlockNumber upto);
 	/* before a relation's buffers are dropped to unlink it; may be NULL */
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 
@@ -332,6 +340,8 @@ static const f_smgr smgrsw[] = {
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
 		.smgr_pagesharedelsewhere = bmappagesharedelsewhere,
+		.smgr_freespaceunknown = bmapfreespaceunknown,
+		.smgr_freespaceknown = bmapfreespaceknown,
 		.smgr_predrop = bmappredrop,
 		.smgr_precommitdrop = bmapprecommitdrop,
 		.smgr_enddrops = bmapenddrops,
@@ -886,6 +896,35 @@ smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum)
 {
 	return smgrsw[reln->smgr_which].smgr_preparesforchanges != NULL &&
 		smgrsw[reln->smgr_which].smgr_preparesforchanges(reln, forknum);
+}
+
+/*
+ * smgrfreespaceunknown() -- How many of the relation's first pages may the
+ *							 free space map know nothing of?
+ *
+ * VACUUM reads those of them it would skip (all-visible), only to record
+ * their free space, then calls smgrfreespaceknown().  Storage made without
+ * a free space map whose pages the visibility map already says are
+ * all-visible (a copy sharing another relation's pages and map) would
+ * otherwise never have their free space found.
+ */
+BlockNumber
+smgrfreespaceunknown(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_freespaceunknown == NULL)
+		return 0;
+	return smgrsw[reln->smgr_which].smgr_freespaceunknown(reln);
+}
+
+/*
+ * smgrfreespaceknown() -- VACUUM recorded the free space of every page
+ *						   below 'upto'.
+ */
+void
+smgrfreespaceknown(SMgrRelation reln, BlockNumber upto)
+{
+	if (smgrsw[reln->smgr_which].smgr_freespaceknown)
+		smgrsw[reln->smgr_which].smgr_freespaceknown(reln, upto);
 }
 
 /*
