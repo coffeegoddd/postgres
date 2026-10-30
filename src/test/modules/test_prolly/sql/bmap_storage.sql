@@ -37,3 +37,23 @@ WHERE oid IN (9419, 9420, 9421, 9441, 9442)
 
 DROP TABLE mapped, temp_t, unlogged_t, plain;
 SELECT entries > 0 AS drained FROM test_bmap_release_drain();
+
+-- A dropped table's blocks are reused before the page store grows, with
+-- autovacuum on as off: the extension that needs them drains the release
+-- queue first.
+SHOW autovacuum;
+SET debug_block_mapped_heap = on;
+CREATE TABLE first_t AS SELECT g AS id, repeat('y', 200) AS pad
+FROM generate_series(1, 20000) g;
+DROP TABLE first_t;
+SELECT setting AS store_path
+FROM (SELECT 'base/' || d.oid || '/9421' AS setting
+	  FROM pg_database d WHERE d.datname = current_database()) s \gset
+SELECT (pg_stat_file(:'store_path')).size AS store_before \gset
+CREATE TABLE second_t AS SELECT g AS id, repeat('y', 200) AS pad
+FROM generate_series(1, 20000) g;
+-- (a block or two for the new map's nodes, not the table's 600-odd pages)
+SELECT ((pg_stat_file(:'store_path')).size - :store_before) / 8192 < 16
+	AS store_did_not_grow;
+DROP TABLE second_t;
+RESET debug_block_mapped_heap;
