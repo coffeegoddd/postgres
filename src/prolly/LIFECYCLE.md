@@ -1390,6 +1390,66 @@ the prolly tree):
 - **Keyframes cost storage:** about 40 MB of new image chunks a commit
   here, 1 GB live across a 20-commit window.
 
+## Real keyframes against replay, at a distance
+
+**The question.**  The measurements above restored pages from saved copies
+of the table's files, not from keyframes, and the one end-to-end run with
+real keyframes restored through libpq at about 150 µs a page, so no
+keyframe ever paid for itself.  Do real keyframes beat replaying rows once
+the target is far enough back?
+
+**What changed in the harness** (`bench/winbench`):
+- `--restore-dir DIR`: a restore reads the target keyframe's pages from its
+  chunks, writes them to a file there, and the server reads them from it,
+  `XLR_MAX_BLOCK_ID` pages a WAL record (`prolly_put_pages_file`).  Writing
+  the file is part of the restore's time.
+- The bench server used `wal_compression = pglz`, which made the server's
+  page writes about 62 µs a page.  With lz4 they are about 9 µs, the
+  mechanism's speed.
+
+**The run** (2026-10-30): 1M rows (23,674 pages), 40 commits of 20,000 random
+row changes each, a keyframe at every commit, lz4, 30 checkouts to random
+commits by restoring the target's keyframe and 30 by replaying rows, every
+one verified against the prolly tree.  The keyframes are the prototype's
+form: page chunks with page and relation maps, taken incrementally on
+the commit's path, and **not frozen** (raw pages, no snapshot).
+
+| Commits back | Replay | Restore the target's keyframe |
+|---|---:|---:|
+| 1 | 324 ms (19k rows) | 1,205–1,247 ms |
+| 4 | 722–989 ms (74k rows) | 1,210–1,466 ms |
+| 10 | 1,188 ms (180k rows) | 1,086–1,277 ms |
+| 19 | 1,744–2,216 ms (313k rows) | 1,217 ms |
+| 26 | 2,496 ms (418k rows) | 1,145 ms |
+| 38 | 3,307 ms (574k rows) | 1,423 ms (37 back) |
+
+- Replay grows with the rows that differ, about 6 µs a row.
+- Restore is flat: 20,000 random changes already touch about 19,000 of the
+  table's pages, so nearly every page differs one commit back, and the pages
+  that differ can't exceed the table's.  This spread is the worst case for
+  keyframes.
+- The crossover is about 10 commits (180k rows); at 38 back the keyframe is
+  2.3× faster, and the gap widens with distance.
+- Of a restore's ~1.2 s, about 550 ms is the restore itself (reading pages
+  from the keyframe, about 200–250 ms; the server writing them, about
+  200–260 ms).  The rest is moving the working set's base point after it,
+  a checkpoint in this prototype.
+- Storage: about 200 MB of new keyframe chunks a commit, 8.4 GB live after
+  40 commits.  A keyframe at every commit can't scale; spacing must bound it.
+
+**The planner choosing** (same history, `--planned`, calibrating from
+lz4-shaped priors): it replayed the near targets (1–3 commits back, 340–625
+ms) and restored the far ones (from about 9 back, 1.1–1.9 s, where replay
+would take 2–3.3 s), its crossover learned at about 6–9 commits.  A few
+choices were its exploration: two restores at 4 back, one replay at 19,
+one slow restore of 4.1 s.
+
+**What this shows and what it doesn't.**  The prototype's keyframes, without
+freezing, beat replay past a crossover, and the planner finds it.  It does
+not measure frozen keyframes, keyframes taken in the background, or the
+production restore by sharing block maps, which should be flat at
+milliseconds rather than at the cost of the pages that differ.
+
 ## Keyframes across the freeze horizon
 
 **The hazard.**  A keyframe is pages, and a heap page names transactions:

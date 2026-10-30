@@ -84,6 +84,8 @@ typedef struct Opts
 	uint64_t	seed;
 	const char *planned;		/* keyframe costs: row,replay_page,page,replay_fixed,restore_fixed,capture */
 	const char *spacing;		/* even:BYTES or exp:BYTES,R */
+	const char *restore_dir;	/* restores read pages from files here */
+	const char *distances;		/* checkouts this many commits back, each both ways */
 } Opts;
 
 typedef struct Rel
@@ -105,7 +107,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL, NULL
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL, NULL, NULL, NULL
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -132,6 +134,7 @@ static uint64_t last_dirty,
 			last_diff;			/* checkout page sources, for reporting */
 static KfPlanner *planner;		/* with --planned */
 static KfSpacing *spacing;		/* with --spacing */
+static int force_path = -1;		/* with --distances: KF_REPLAY or KF_RESTORE, else the planner's */
 
 /* The keyframes held under --spacing, oldest first, at their positions. */
 static PHash held_commit[MAX_COMMITS];
@@ -1063,11 +1066,72 @@ img_diff_fn(void *arg, uint32_t relid, int fork, uint32_t block,
 	pageset_add(arg, relid, fork, block);
 }
 
+/*
+ * With --restore-dir: the pages read from the keyframe's chunks are written
+ * to a file there, in order, and the server reads them from it, logging
+ * XLR_MAX_BLOCK_ID pages a WAL record (prolly_put_pages_file), as a restore
+ * reading its own store would.  Writing the file is part of the restore.
+ */
+static double restore_read_ms,	/* reading pages from the keyframe, writing the file */
+			restore_put_ms;		/* the server writing them */
+
+static void
+write_pages_file(const Rel *rel, int fork, const ImgHeader *target, const uint32_t *blocks,
+				 size_t n)
+{
+	double		t0 = now_ms(),
+				t1;
+	char		path[600];
+	char		oid_s[16];
+	const char *vals[5];
+	Buf			arr = BUF_INIT;
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/restore-%u-%d", o.restore_dir, rel->oid, fork);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	CHECK(fd >= 0);
+	buf_append_byte(&arr, '{');
+	for (size_t i = 0; i < n; i++)
+	{
+		char		num[16];
+		int			len = snprintf(num, sizeof(num), "%s%u", i ? "," : "", blocks[i]);
+		const uint8_t *p;
+		static const uint8_t zero[BLCK];
+
+		buf_append(&arr, num, (size_t) len);
+		if (img_page(&repo.ctx, target, rel->oid, fork, blocks[i], &p) != PROLLY_OK)
+			p = zero;			/* map pages past the image's end */
+		CHECK(write(fd, p, BLCK) == BLCK);
+	}
+	buf_append(&arr, "}", 2);
+	close(fd);
+	t1 = now_ms();
+	restore_read_ms += t1 - t0;
+	snprintf(oid_s, sizeof(oid_s), "%u", rel->oid);
+	vals[0] = oid_s;
+	vals[1] = fork == FORK_VM ? "vm" : "main";
+	vals[2] = (const char *) arr.data;
+	vals[3] = path;
+	vals[4] = "true";
+	PQclear(qp("SELECT prolly_put_pages_file($1::oid::regclass, $2, $3::int4[], $4, $5::bool)",
+			   5, vals, NULL, NULL, 0));
+	restore_put_ms += now_ms() - t1;
+	buf_free(&arr);
+}
+
 static void
 write_pages(const Rel *rel, int fork, const ImgHeader *target, const uint32_t *blocks,
 			size_t n)
 {
 	const size_t batch = 2000;
+
+	if (n == 0)
+		return;
+	if (o.restore_dir)
+	{
+		write_pages_file(rel, fork, target, blocks, n);
+		return;
+	}
 	Buf			arr = BUF_INIT,
 				pages = BUF_INIT;
 
@@ -1126,6 +1190,10 @@ checkout_images(const PHash *target)
 	uint32_t   *blocks = NULL;
 	size_t		bcap = 0;
 
+	double		t0 = now_ms(),
+				t_diff;
+
+	restore_read_ms = restore_put_ms = 0;
 	CHECK(vc_image_get(&repo, target, &timg));
 	CHECK_OK(img_load(&repo.ctx, &timg, &th));
 	CHECK_OK(img_load(&repo.ctx, &base_img, &bh));
@@ -1139,6 +1207,7 @@ checkout_images(const PHash *target)
 		last_diff = s.n - before;
 	}
 	pageset_sort(&s);
+	t_diff = now_ms() - t0;
 
 	qx("BEGIN");
 	qx("LOCK TABLE t IN ACCESS EXCLUSIVE MODE");
@@ -1182,6 +1251,9 @@ checkout_images(const PHash *target)
 	}
 	qx("COMMIT");
 	qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
+	printf("restore,pages=%llu,diff_ms=%.1f,read_ms=%.1f,put_ms=%.1f,total_ms=%.1f\n",
+		   (unsigned long long) written, t_diff, restore_read_ms, restore_put_ms,
+		   now_ms() - t0);
 	set_base_point(&timg);
 	img_header_free(&th);
 	img_header_free(&bh);
@@ -1343,10 +1415,12 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 	uint64_t	rows = rows_between(&work, NULL == target ? &work : &work),
 				done;
 	KfChoice	ch;
+	KfCosts		cur_costs;
 	double		t;
 
 	CHECK(vc_commit_load(&repo.ctx, target, &tc));
 	rows = rows_between(&work, &tc.root);
+	planner->ops->costs(planner, &cur_costs);
 	/* with a spacing: the nearest held keyframes either side of the target */
 	if (spacing)
 	{
@@ -1407,6 +1481,19 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 		m.pages = rp < table_pages ? rp : table_pages;
 		m.warm_pages = warm < m.pages ? warm : m.pages;
 		ch = planner->ops->choose(planner, &m, cand, n);
+		if (force_path == KF_REPLAY)
+			ch.path = KF_REPLAY;
+		else if (force_path == KF_RESTORE && n > 0)
+		{
+			/* the candidate restore is priced lowest for */
+			size_t		best = 0;
+
+			for (size_t i = 1; i < n; i++)
+				if (kf_restore_us(&cur_costs, &cand[i]) < kf_restore_us(&cur_costs, &cand[best]))
+					best = i;
+			ch.path = KF_RESTORE;
+			ch.candidate = best;
+		}
 		t = now_ms();
 		if (ch.path == KF_REPLAY)
 		{
@@ -2487,7 +2574,8 @@ usage(void)
 			"         [--lifecycle [--bg-ms MS] [--bg-rows N] [--diffs N]\n"
 			"                      [--sql-decode [--bg-bytes B]]]\n"
 			"         [--planned REPLAY_FIXED,ROW,COLD_PAGE,WARM_PAGE,RESTORE_FIXED,PAGE,CAPTURE (us)]\n"
-			"         [--spacing even:BYTES | exp:BYTES,R]\n"
+			"         [--spacing even:BYTES | exp:BYTES,R] [--restore-dir DIR]\n"
+			"         [--distances N,N,... (with --planned)]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -2506,6 +2594,7 @@ main(int argc, char **argv)
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
 		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {"spacing", 1, 0, 'Z'},
+		{"restore-dir", 1, 0, 'X'}, {"distances", 1, 0, 'J'},
 		{0, 0, 0, 0}
 	};
 	int			ch;
@@ -2545,6 +2634,8 @@ main(int argc, char **argv)
 			case 'O': o.outside = optarg; break;
 			case 'P': o.planned = optarg; break;
 			case 'Z': o.spacing = optarg; break;
+			case 'X': o.restore_dir = optarg; break;
+			case 'J': o.distances = optarg; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -2668,6 +2759,34 @@ main(int argc, char **argv)
 			dolt_commit(i, name);
 		}
 	}
+	/*
+	 * With --distances: from the head, to the commit that many back and back
+	 * to the head, by replaying rows and then by the nearest keyframe.
+	 */
+	if (o.distances && planner)
+	{
+		uint64_t	dbp = db_pages();
+		PHash		head = commits[ncommits - 1].hash;
+		char		list[256];
+
+		snprintf(list, sizeof(list), "%s", o.distances);
+		for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ","))
+		{
+			int			d = atoi(tok);
+
+			if (d <= 0 || d >= ncommits)
+				continue;
+			for (int way = 0; way < 2; way++)
+			{
+				force_path = way == 0 ? KF_REPLAY : KF_RESTORE;
+				printf("# distance %d by %s\n", d, way == 0 ? "replay" : "keyframe");
+				switch_to(&commits[ncommits - 1 - d].hash, false, dbp);
+				switch_to(&head, false, dbp);
+			}
+		}
+		force_path = -1;
+	}
+
 	/* checkouts to anything in the window, across branches */
 	{
 		uint64_t	dbp = db_pages();
