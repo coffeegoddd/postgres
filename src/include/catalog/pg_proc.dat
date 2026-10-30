@@ -5756,7 +5756,7 @@
   prosrc => 'pg_stat_get_block_map' },
 { oid => '8221',
   descr => 'pages of a block-mapped relation, those shared, and those another map may hold',
-  proname => 'pg_relation_shared_pages', provolatile => 'v',
+  proname => 'pg_relation_shared_pages', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => 'regclass',
   proallargtypes => '{regclass,int8,int8,int8}', proargmodes => '{i,o,o,o}',
   proargnames => '{relation,pages,shared,shared_elsewhere}',

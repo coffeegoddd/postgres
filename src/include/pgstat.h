@@ -470,8 +470,10 @@ typedef struct PgStat_StatFuncEntry
 
 /* ----------
  * PgStat_StatBlockMapEntry	What a block-mapped relation file's changes did
- *		to the pages other maps share: pages copied at their first change, as
- *		another map held them; pages born before the map's epoch taken in
+ *		to the pages other maps share: pages of any of its forks copied at
+ *		their first change, as another map held them, or a copy made without
+ *		an image may still read them (zeroed pages too); pages born before
+ *		the map's epoch taken in
  *		place at their first change, as no other map held them any more; and
  *		nodes of the map's tree copied, as another map held them.  Kept by the
  *		relation file (its tablespace, database and file number): a rewrite

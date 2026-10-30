@@ -128,7 +128,8 @@ SELECT id, name, fixed_amount,
  12 | lock         | t            | f         | t
  13 | slru         | t            | f         | t
  14 | wal          | t            | f         | t
-(14 rows)
+ 15 | block_map    | f            | f         | t
+(15 rows)
 
 -- ensure that both seqscan and indexscan plans are allowed
 SET enable_seqscan TO on;

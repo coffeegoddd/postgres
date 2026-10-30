@@ -52,8 +52,20 @@ SELECT (SELECT pages_copied FROM pg_stat_block_mapped WHERE relid = 'bms.t'::reg
        (SELECT pages_claimed FROM pg_stat_block_mapped WHERE relid = 'bms.t'::regclass)
        AS claims_outnumber_copies;
 
--- A rewrite gives the relation a new file, whose counts begin anew.
+-- A rewrite gives the relation a new file, whose counts begin anew; the
+-- old file's are dropped with its storage.
+SELECT oid AS db FROM pg_database WHERE datname = current_database() \gset
+SELECT (CASE WHEN reltablespace = 0 THEN (SELECT dattablespace FROM pg_database
+		WHERE datname = current_database()) ELSE reltablespace END)::int8 << 32
+	   | relfilenode::int8 AS c_key
+  FROM pg_class WHERE oid = 'bms.c'::regclass \gset
+SELECT (CASE WHEN reltablespace = 0 THEN (SELECT dattablespace FROM pg_database
+		WHERE datname = current_database()) ELSE reltablespace END)::int8 << 32
+	   | relfilenode::int8 AS t_key
+  FROM pg_class WHERE oid = 'bms.t'::regclass \gset
+SELECT pg_stat_have_stats('block_map', :db, :c_key) AS c_has_stats;
 TRUNCATE bms.c;
+SELECT pg_stat_have_stats('block_map', :db, :c_key) AS old_file_has_stats;
 SELECT * FROM pg_stat_get_block_map('bms.c'::regclass);
 
 -- A relation on md.c has neither.
@@ -64,4 +76,6 @@ SELECT * FROM pg_relation_shared_pages('bms.m');
 SELECT * FROM pg_stat_get_block_map('bms.m'::regclass);
 
 RESET debug_block_mapped_heap;
+SELECT pg_stat_have_stats('block_map', :db, :t_key) AS t_has_stats;
 DROP SCHEMA bms CASCADE;
+SELECT pg_stat_have_stats('block_map', :db, :t_key) AS dropped_has_stats;
