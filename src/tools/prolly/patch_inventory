@@ -21,6 +21,7 @@
 # sorted by path.
 
 # The fork's own files.
+own   .github/workflows/prolly-upstream-sync.yml
 own   .github/workflows/prolly.yml
 own   contrib/prolly/
 own   src/backend/prolly/
