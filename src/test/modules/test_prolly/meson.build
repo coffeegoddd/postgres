@@ -40,6 +40,7 @@ tests += {
       'bmap_sharing',
       'bmap_tree_share',
       'bmap_captured_roots',
+      'vacuum_shared',
     ],
   },
   'tap': {

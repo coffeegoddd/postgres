@@ -378,6 +378,13 @@ heap2_desc(StringInfo buf, XLogReaderState *record)
 		infobits_desc(buf, xlrec->infobits_set, "infobits");
 		appendStringInfo(buf, ", flags: 0x%02X", xlrec->flags);
 	}
+	else if (info == XLOG_HEAP2_VM_SET)
+	{
+		xl_heap_vm_set *xlrec = (xl_heap_vm_set *) rec;
+
+		appendStringInfo(buf, "heap_blk: %u, flags: 0x%02X",
+						 xlrec->heap_blkno, xlrec->flags);
+	}
 	else if (info == XLOG_HEAP2_NEW_CID)
 	{
 		xl_heap_new_cid *xlrec = (xl_heap_new_cid *) rec;
@@ -462,6 +469,9 @@ heap2_identify(uint8 info)
 			break;
 		case XLOG_HEAP2_LOCK_UPDATED:
 			id = "LOCK_UPDATED";
+			break;
+		case XLOG_HEAP2_VM_SET:
+			id = "VM_SET";
 			break;
 		case XLOG_HEAP2_NEW_CID:
 			id = "NEW_CID";

@@ -1332,6 +1332,35 @@ heap_redo(XLogReaderState *record)
 	}
 }
 
+/*
+ * Replay XLOG_HEAP2_VM_SET records: the visibility map bits of a heap page
+ * set, the heap page itself unchanged.
+ */
+static void
+heap_xlog_vm_set(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_heap_vm_set *xlrec = (xl_heap_vm_set *) XLogRecGetData(record);
+	RelFileLocator rlocator;
+	Buffer		vmbuffer;
+
+	XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_ON_ERROR, false,
+									  &vmbuffer) == BLK_NEEDS_REDO)
+	{
+		Page		vmpage = BufferGetPage(vmbuffer);
+
+		/* initialize the page if it was read as zeros */
+		if (PageIsNew(vmpage))
+			PageInit(vmpage, BLCKSZ, 0);
+		if (visibilitymap_set(xlrec->heap_blkno, vmbuffer, xlrec->flags,
+							  rlocator) != xlrec->flags)
+			PageSetLSN(vmpage, lsn);
+	}
+	if (BufferIsValid(vmbuffer))
+		UnlockReleaseBuffer(vmbuffer);
+}
+
 void
 heap2_redo(XLogReaderState *record)
 {
@@ -1349,6 +1378,9 @@ heap2_redo(XLogReaderState *record)
 			break;
 		case XLOG_HEAP2_LOCK_UPDATED:
 			heap_xlog_lock_updated(record);
+			break;
+		case XLOG_HEAP2_VM_SET:
+			heap_xlog_vm_set(record);
 			break;
 		case XLOG_HEAP2_NEW_CID:
 
