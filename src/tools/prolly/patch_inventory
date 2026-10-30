@@ -53,7 +53,7 @@ patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
 patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions
 patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
-patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), refusing a recovery or a standby's backup beginning there
+patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start
 patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check of a block whose storage was replaced after the record
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
 patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers

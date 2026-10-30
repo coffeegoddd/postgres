@@ -10524,6 +10524,7 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	if (backup_stopped_in_recovery)
 	{
 		XLogRecPtr	recptr;
+		XLogRecPtr	synced_since;
 		uint64		synced_replays;
 
 		/*
@@ -10557,10 +10558,31 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 							 "is corrupt and should not be used. "
 							 "Try an online backup again.")));
 
+		/*
+		 * Whatever replay noted in pg_control as relying on no recovery
+		 * beginning at or before a position (XLogNoteSyncedPages()) holds
+		 * of this backup too: one that begins at or before it may have
+		 * copied a page that was synced, or kept for a recovery to read,
+		 * after it changed, and its recovery would refuse to begin or read
+		 * the wrong page.  The note can come from a replay that needed no
+		 * restartpoint of its own, so the count above may not have moved.
+		 */
 		LWLockAcquire(ControlFileLock, LW_SHARED);
+		synced_since = ControlFile->syncedSince;
 		state->stoppoint = ControlFile->minRecoveryPoint;
 		state->stoptli = ControlFile->minRecoveryPointTLI;
 		LWLockRelease(ControlFileLock);
+
+		if (XLogRecPtrIsValid(synced_since) && state->startpoint <= synced_since)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("WAL replayed during online backup relies on no recovery beginning at or before %X/%08X, and the backup began at %X/%08X",
+							LSN_FORMAT_ARGS(synced_since),
+							LSN_FORMAT_ARGS(state->startpoint)),
+					 errhint("This means that the backup being taken on the standby "
+							 "is corrupt and should not be used. "
+							 "Run CHECKPOINT on the primary, wait for the standby to replay it, "
+							 "and then try an online backup again.")));
 	}
 	else
 	{
