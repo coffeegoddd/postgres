@@ -161,8 +161,8 @@ extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
 extern void smgrreadv(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum,
 					  void **buffers, BlockNumber nblocks);
-extern void smgrprepareread(SMgrRelation reln, ForkNumber forknum,
-							BlockNumber blocknum, BlockNumber nblocks);
+extern BlockNumber smgrprepareread(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, BlockNumber nblocks);
 extern void smgrstartreadv(PgAioHandle *ioh,
 						   SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum,

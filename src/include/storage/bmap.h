@@ -79,8 +79,8 @@ extern uint32 bmapmaxcombine(SMgrRelation reln, ForkNumber forknum,
 extern void bmapreadv(SMgrRelation reln, ForkNumber forknum,
 					  BlockNumber blocknum, void **buffers,
 					  BlockNumber nblocks);
-extern void bmapprepareread(SMgrRelation reln, ForkNumber forknum,
-							BlockNumber blocknum, BlockNumber nblocks);
+extern BlockNumber bmapprepareread(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, BlockNumber nblocks);
 extern void bmapstartreadv(PgAioHandle *ioh, SMgrRelation reln,
 						   ForkNumber forknum, BlockNumber blocknum,
 						   void **buffers, BlockNumber nblocks);
@@ -181,6 +181,10 @@ typedef void (*BmapNodeInspect) (uint16 level, BlockNumber first,
 								 BlockNumber block, uint32 refs, void *arg);
 extern void bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit,
 							  void *arg);
+typedef void (*BmapEntryInspect) (BlockNumber blkno, BlockNumber phys,
+								  void *arg);
+extern void bmap_inspect_entries(SMgrRelation reln, BmapEntryInspect visit,
+								 void *arg);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
 extern bool bmap_inspect_store_sync(RelFileLocator rel, uint64 *written,

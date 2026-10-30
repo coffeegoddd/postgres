@@ -2069,6 +2069,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	IOObject	io_object;
 	instr_time	io_start;
 	StartBufferIOResult status;
+	BlockNumber holes;
 
 	if (persistence == RELPERSISTENCE_TEMP)
 	{
@@ -2145,8 +2146,8 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	 * handle at a time, so reads the storage manager makes for itself must
 	 * come before the handle is acquired.
 	 */
-	smgrprepareread(operation->smgr, forknum, blocknum,
-					operation->nblocks - nblocks_done);
+	holes = smgrprepareread(operation->smgr, forknum, blocknum,
+							operation->nblocks - nblocks_done);
 
 	ioh = pgaio_io_acquire_nb(CurrentResourceOwner, &operation->io_return);
 	if (unlikely(!ioh))
@@ -2219,6 +2220,30 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 		operation->foreign_io = true;
 
 		return true;
+	}
+
+	/*
+	 * A block the storage manager has no storage for (a hole) reads as
+	 * zeroes: its page is zeroed here, and no read is started for it.  Only
+	 * shared buffers' storage can have holes.
+	 */
+	if (unlikely(holes > 0))
+	{
+		Buffer		buffer = buffers[nblocks_done];
+
+		Assert(persistence != RELPERSISTENCE_TEMP);
+		pgaio_io_release(ioh);
+		memset(BufferGetBlock(buffer), 0, BLCKSZ);
+		TerminateBufferIO(GetBufferDescriptor(buffer - 1), false, BM_VALID,
+						  true, false);
+		operation->nblocks_done += 1;
+		Assert(operation->nblocks_done <= operation->nblocks);
+		*nblocks_progress = 1;
+		TrackBufferHit(io_object, io_context,
+					   operation->rel, operation->persistence,
+					   operation->smgr, operation->forknum,
+					   blocknum);
+		return false;
 	}
 
 	Assert(io_buffers[0] == buffers[nblocks_done]);

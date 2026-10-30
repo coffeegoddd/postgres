@@ -128,7 +128,8 @@ typedef struct xl_bmap_shrink
  * zeroes (BMAP_REMAP_ZERO): then redo zeroes the new block, as extending
  * does.  The old block, which another map still holds, keeps what it has:
  * the primary doesn't write there (the image may have hints only this
- * map's buffer had).
+ * map's buffer had).  A hole given its first block has no old block
+ * (InvalidBlockNumber).
  */
 #define BMAP_REMAP_ZERO		0x01
 
@@ -353,7 +354,18 @@ typedef struct xl_bmap_top
 	XLogRecPtr	since;
 } xl_bmap_top;
 
+/*
+ * The subtrees a root page points to: as many as it takes for the last to
+ * map past MaxBlockNumber with the block size's fanout (four of 509 entries
+ * a node at 8 kB; smaller blocks fan out less and need more).
+ */
+#if BLCKSZ >= 8192
 #define BMAP_DELTA_ROOT_TOPS	4
+#elif BLCKSZ >= 2048
+#define BMAP_DELTA_ROOT_TOPS	5
+#else
+#define BMAP_DELTA_ROOT_TOPS	6
+#endif
 
 typedef struct xl_bmap_root_delta
 {
