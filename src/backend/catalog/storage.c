@@ -291,8 +291,14 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * (bmap_share_root()), O(1) in the relation's size.  It gets no free space
  * map or visibility map, so the relation claims no page all-visible and
  * knows of no free space until vacuumed, unless maps_from: then they are
- * copies of that relation's (the caller knows its pages are the root's
- * still, and VACUUM kept from setting a bit meanwhile).  With replacing,
+ * copies of that relation's.  The caller must know that every bit set in
+ * maps_from's visibility map holds for the root's version of the page: that
+ * no page of maps_from has changed since the root was captured, or at least
+ * none whose bit is set.  Nothing here keeps VACUUM from setting one
+ * meanwhile, and it vacuums a page shared only with roots held of the
+ * relation as the relation's own: it may freeze the relation's copy of a
+ * page and set the bits, while the root keeps the version it had, its
+ * tuples unfrozen.  With replacing,
  * the storage made takes that storage's place (dropped as the transaction
  * commits: a restore), and shares the pages with no other relation for
  * that; with sharer, a relation that still holds the root's pages is told
