@@ -6955,6 +6955,14 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+	/*
+	 * Transactions from here on are this server's: storage of one that
+	 * began before and never committed is an orphan of the crash or of the
+	 * recovery's stop (bmap_drop_orphans()).  Told before recovery is shown
+	 * done, while no backend can be given a transaction id yet.
+	 */
+	bmap_recovery_done(ReadNextFullTransactionId());
+
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -6967,13 +6975,6 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
-
-	/*
-	 * Transactions from here on are this server's: storage of one that
-	 * began before and never committed is an orphan of the crash or of the
-	 * recovery's stop (bmap_drop_orphans()).
-	 */
-	bmap_recovery_done(ReadNextFullTransactionId());
 
 	/*
 	 * Wake up the checkpointer process as there might be a request to disable
