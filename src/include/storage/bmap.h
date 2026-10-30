@@ -147,6 +147,17 @@ extern uint32 bmap_changed_pages(SMgrRelation reln, uint32 since,
 								 BlockNumber **blknos, BlockNumber *nblocks);
 extern bool bmap_changed_since(SMgrRelation reln, uint32 since,
 							   BlockNumber *nblocks);
+
+/*
+ * Diffs: the logical blocks two maps of a page store (relations' or held
+ * roots') map to different pages, found by comparing their trees' pointers,
+ * so in time proportional to what differs, not to the maps' sizes.
+ */
+extern uint32 bmap_diff(SMgrRelation a, SMgrRelation b, BlockNumber **blknos);
+extern uint32 bmap_diff_root(SMgrRelation a, BmapRootId id,
+							 BlockNumber **blknos);
+extern uint32 bmap_diff_roots(RelFileLocator store, BmapRootId a, BmapRootId b,
+							  BlockNumber **blknos);
 extern uint32 bmap_raise_epoch(SMgrRelation reln);
 extern bool bmap_root_release(RelFileLocator store, BmapRootId id);
 extern bool bmap_root_held(RelFileLocator store, BmapRootId id,
