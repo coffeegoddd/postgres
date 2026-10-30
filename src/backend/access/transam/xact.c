@@ -2395,6 +2395,14 @@ CommitTransaction(void)
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
 
+	/*
+	 * What the relations dropped at commit will let go of, recorded as this
+	 * transaction's before its commit record, so that a crash after the
+	 * commit loses none of it.
+	 */
+	if (!is_parallel_worker)
+		smgrPreCommitPendingDeletes();
+
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 

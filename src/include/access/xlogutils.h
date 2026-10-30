@@ -62,11 +62,15 @@ extern PGDLLIMPORT HotStandbyState standbyState;
 
 extern bool XLogHaveInvalidPages(void);
 extern void XLogCheckInvalidPages(void);
+extern void XLogNoteInvalidPage(RelFileLocator locator, ForkNumber forkno,
+								BlockNumber blkno, bool present);
 
 extern void XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum);
 extern void XLogDropDatabase(Oid dbid);
 extern void XLogTruncateRelation(RelFileLocator rlocator, ForkNumber forkNum,
 								 BlockNumber nblocks);
+extern void XLogReplaceBlock(RelFileLocator rlocator, ForkNumber forkNum,
+							 BlockNumber blkno);
 
 /* Result codes for XLogReadBufferForRedo[Extended] */
 typedef enum

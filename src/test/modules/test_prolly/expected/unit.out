@@ -22,7 +22,11 @@ SELECT suite, test, result, detail FROM test_prolly_unit_tests();
  registry | lists_in_registration_order    | ok     | 
  registry | rejects_duplicates             | ok     | 
  registry | rejects_bad_names_and_routines | ok     | 
-(10 rows)
+ smgr     | md_is_chosen                   | ok     | 
+ smgr     | md_pages_are_its_own           | ok     | 
+ smgr     | md_refuses_shares              | ok     | 
+ smgr     | md_hooks_do_nothing            | ok     | 
+(14 rows)
 
 -- one suite, by name
 SELECT suite, test, result FROM test_prolly_unit_tests('harness');

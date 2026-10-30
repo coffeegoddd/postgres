@@ -5,6 +5,7 @@ test_prolly_sources = files(
   'test_prolly.c',
   'unit_harness.c',
   'unit_registry.c',
+  'unit_smgr.c',
 )
 
 if host_system == 'windows'

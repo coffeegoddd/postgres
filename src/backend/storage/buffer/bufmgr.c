@@ -2024,6 +2024,16 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	 * doesn't really allow that because it doesn't have an API to report
 	 * "accumulated" time.
 	 */
+
+	/*
+	 * Let the storage manager read what it needs to start the read, while
+	 * this backend may still start other I/O: a backend holds one I/O
+	 * handle at a time, so reads the storage manager makes for itself must
+	 * come before the handle is acquired.
+	 */
+	smgrprepareread(operation->smgr, forknum, blocknum,
+					operation->nblocks - nblocks_done);
+
 	ioh = pgaio_io_acquire_nb(CurrentResourceOwner, &operation->io_return);
 	if (unlikely(!ioh))
 	{
@@ -2820,6 +2830,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	BlockNumber first_block;
 	IOContext	io_context = IOContextForStrategy(strategy);
 	instr_time	io_start;
+
+	/*
+	 * Before anything is taken for the extension, its storage manager may
+	 * make room for the blocks (reading and changing storage of its own):
+	 * no extension lock is held yet, nor any other, as nobody takes the
+	 * extension lock while holding another lock.
+	 */
+	if (!(flags & EB_SKIP_EXTENSION_LOCK))
+		smgrbeforeextend(BMR_GET_SMGR(bmr), fork, extend_by);
 
 	LimitAdditionalPins(&extend_by);
 

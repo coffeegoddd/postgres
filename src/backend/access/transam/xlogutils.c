@@ -160,6 +160,19 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	}
 }
 
+/*
+ * Note a reference to an invalid page found by a storage manager of its own
+ * in redo (a page of a relation whose storage is gone), as
+ * XLogReadBufferExtended() notes one of a missing file: forgotten as the
+ * relation is dropped or truncated, a failure at consistency otherwise.
+ */
+void
+XLogNoteInvalidPage(RelFileLocator locator, ForkNumber forkno,
+					BlockNumber blkno, bool present)
+{
+	log_invalid_page(locator, forkno, blkno, present);
+}
+
 /* Forget any invalid pages >= minblkno, because they've been dropped */
 static void
 forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,
@@ -281,7 +294,8 @@ XLogCheckInvalidPages(void)
  *	BLK_RESTORED	- block was restored from a full-page image included in
  *					  the record
  *	BLK_NOTFOUND	- block was not found (because it was truncated away by
- *					  an operation later in the WAL stream)
+ *					  an operation later in the WAL stream, or given other
+ *					  storage by one: smgrreplacedafter())
  *
  * On return, the buffer is locked in exclusive-mode, and returned in *buf.
  * Note that the buffer is locked and returned even if it doesn't need
@@ -396,6 +410,13 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
+
+		/*
+		 * The version the image replaces may be newer than the image, and its
+		 * storage manager may need to know what it said.
+		 */
+		smgrprerestore(smgropen(rlocator, INVALID_PROC_NUMBER), forknum,
+					   blkno, record->ReadRecPtr);
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);
@@ -431,6 +452,19 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	}
 	else
 	{
+		/*
+		 * A block given other storage after this record has what the record
+		 * changed in the page the new storage began with; the storage may
+		 * hold another relation's page until then.
+		 */
+		if (!zeromode &&
+			smgrreplacedafter(smgropen(rlocator, INVALID_PROC_NUMBER),
+							  forknum, blkno, record->ReadRecPtr))
+		{
+			*buf = InvalidBuffer;
+			return BLK_NOTFOUND;
+		}
+
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
 		if (BufferIsValid(*buf))
 		{
@@ -517,9 +551,24 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	if (blkno < lastblock)
 	{
+		ReadBufferMode readmode = mode;
+
+		/*
+		 * Where a block's storage can be given to another relation, it may
+		 * hold that relation's page: one this block's replay hasn't reached
+		 * yet (smgrreplacedafter()) and which fails verification here.  It
+		 * reads as uninitialized, so it is logged as invalid, as a page past
+		 * the end would be, and is forgotten when replay reaches the change
+		 * of storage (XLogReplaceBlock()) or what made it possible (a
+		 * truncation); a page truly damaged is reported when recovery
+		 * reaches consistency.
+		 */
+		if (mode == RBM_NORMAL && smgrreplacesblocks(smgr, forknum))
+			readmode = RBM_ZERO_ON_ERROR;
+
 		/* page exists in file */
 		buffer = ReadBufferWithoutRelcache(rlocator, forknum, blkno,
-										   mode, NULL, true);
+										   readmode, NULL, true);
 	}
 	else
 	{
@@ -685,6 +734,27 @@ XLogTruncateRelation(RelFileLocator rlocator, ForkNumber forkNum,
 					 BlockNumber nblocks)
 {
 	forget_invalid_pages(rlocator, forkNum, nblocks);
+}
+
+/*
+ * A block given other storage during XLOG replay
+ *
+ * The records before then were of the storage it had; any "invalid-page"
+ * records they left are superseded, as a truncation's are.
+ */
+void
+XLogReplaceBlock(RelFileLocator rlocator, ForkNumber forkNum,
+				 BlockNumber blkno)
+{
+	xl_invalid_page_key key;
+
+	if (invalid_page_tab == NULL)
+		return;
+	memset(&key, 0, sizeof(key));
+	key.locator = rlocator;
+	key.forkno = forkNum;
+	key.blkno = blkno;
+	hash_search(invalid_page_tab, &key, HASH_REMOVE, NULL);
 }
 
 /*
