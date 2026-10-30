@@ -31,12 +31,14 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/progress.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/lmgr.h"
@@ -482,6 +484,32 @@ tuple_lock_retry:
  * ------------------------------------------------------------------------
  */
 
+/*
+ * The storage manager for a heap relation's new storage.  Only permanent
+ * relations outside the global tablespace may be block-mapped.  Storage
+ * made anew for an existing relation stays where the old was, and so does
+ * a rewrite's new heap (new_relation_smgr); a new relation is in md.c, or
+ * with debug_block_mapped_heap in block-mapped storage if it is a user
+ * relation.
+ */
+static int
+heapam_storage_manager(Relation rel, const RelFileLocator *newrlocator,
+					   char persistence)
+{
+	if (persistence != RELPERSISTENCE_PERMANENT ||
+		newrlocator->spcOid == GLOBALTABLESPACE_OID)
+		return SMGR_MD;
+	if (rel->rd_locator.relNumber != newrlocator->relNumber)
+		return RelationGetSmgr(rel)->smgr_which;
+	if (new_relation_smgr >= 0)
+		return new_relation_smgr;
+	if (debug_block_mapped_heap &&
+		!rel->rd_rel->relisshared &&
+		!IsCatalogRelation(rel))
+		return SMGR_BMAP;
+	return SMGR_MD;
+}
+
 static void
 heapam_relation_set_new_filelocator(Relation rel,
 									const RelFileLocator *newrlocator,
@@ -508,7 +536,9 @@ heapam_relation_set_new_filelocator(Relation rel,
 	 */
 	*minmulti = GetOldestMultiXactId();
 
-	srel = RelationCreateStorage(*newrlocator, persistence, true);
+	srel = RelationCreateStorageWith(*newrlocator, persistence, true,
+									 heapam_storage_manager(rel, newrlocator,
+															persistence));
 
 	/*
 	 * If required, set up an init fork for an unlogged table so that it can
@@ -551,7 +581,9 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	 * NOTE: any conflict in relfilenumber value will be caught in
 	 * RelationCreateStorage().
 	 */
-	dstrel = RelationCreateStorage(*newrlocator, rel->rd_rel->relpersistence, true);
+	dstrel = RelationCreateStorageWith(*newrlocator,
+									   rel->rd_rel->relpersistence, true,
+									   RelationGetSmgr(rel)->smgr_which);
 
 	/* copy main fork */
 	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM,

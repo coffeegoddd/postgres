@@ -28,6 +28,7 @@
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bmap.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
 #include "storage/proc.h"
@@ -38,6 +39,8 @@
 
 /* GUC variables */
 int			wal_skip_threshold = 2048;	/* in kilobytes */
+
+int			new_relation_smgr = -1;
 
 /*
  * We keep a list of all relations (represented as RelFileLocator values)
@@ -72,6 +75,7 @@ typedef struct PendingRelSync
 {
 	RelFileLocator rlocator;
 	bool		is_truncated;	/* Has the file experienced truncation? */
+	bool		wal_required;	/* Must log final contents, even if synced? */
 } PendingRelSync;
 
 static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
@@ -103,6 +107,7 @@ AddPendingSync(const RelFileLocator *rlocator)
 	pending = hash_search(pendingSyncHash, rlocator, HASH_ENTER, &found);
 	Assert(!found);
 	pending->is_truncated = false;
+	pending->wal_required = false;
 }
 
 /*
@@ -195,6 +200,18 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 	{
 		Assert(procNumber == INVALID_PROC_NUMBER);
 		AddPendingSync(&rlocator);
+
+		/*
+		 * Block-mapped storage's pages are logged at commit, whatever their
+		 * size, never only synced: its page store is one file that many
+		 * relations' blocks share, freed and handed out again, and redo of
+		 * earlier holders' records (a block's extension, its images, a
+		 * shrink of the store) can overwrite or cut a block that a sync
+		 * alone made durable.  Images logged at commit, after all of them,
+		 * restore it.
+		 */
+		if (smgr_which == SMGR_BMAP)
+			RelFileLocatorForceWALAtCommit(rlocator);
 	}
 
 	return srel;
@@ -670,6 +687,25 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
 }
 
 /*
+ * Require WAL for the final contents of storage that otherwise skips WAL.
+ * A storage manager that logs an intermediate page image must arrange this
+ * before further unlogged changes: syncing alone would let redo overwrite
+ * the final contents with the earlier image.  Keep any truncation's sync
+ * requirement too, since WAL images do not restore the physical file length.
+ */
+void
+RelFileLocatorForceWALAtCommit(RelFileLocator rlocator)
+{
+	PendingRelSync *pending;
+
+	if (!pendingSyncHash)
+		return;
+	pending = hash_search(pendingSyncHash, &rlocator, HASH_FIND, NULL);
+	if (pending)
+		pending->wal_required = true;
+}
+
+/*
  * EstimatePendingSyncsSpace
  *		Estimate space needed to pass syncs to parallel workers.
  */
@@ -735,7 +771,8 @@ terminate:
  *
  * RelationNeedsWAL() and RelFileLocatorSkippingWAL() must offer the correct
  * answer to parallel workers.  Only smgrDoPendingSyncs() reads the
- * is_truncated field, at end of transaction.  Hence, don't restore it.
+ * is_truncated and wal_required fields, at end of transaction.  Hence,
+ * don't restore them.
  */
 void
 RestorePendingSyncs(char *startAddress)
@@ -898,6 +935,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
+		bool		use_wal;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
 
@@ -909,7 +947,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * files that are smaller than a certain threshold, expecting faster
 		 * commit.  The threshold is defined by the GUC wal_skip_threshold.
 		 */
-		if (!pendingsync->is_truncated)
+		if (!pendingsync->is_truncated || pendingsync->wal_required)
 		{
 			for (fork = 0; fork <= MAX_FORKNUM; fork++)
 			{
@@ -938,9 +976,15 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * emitted WAL instead.  You might think that we could choose WAL if
 		 * the current main fork is longer than ever, but there's a case where
 		 * main fork is longer than ever but FSM fork gets shorter.
+		 *
+		 * A storage manager that logged an intermediate image requires WAL
+		 * for the final contents regardless of size. If it also truncated
+		 * the file, do both: WAL restores contents, sync preserves length.
 		 */
-		if (pendingsync->is_truncated ||
-			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
+		use_wal = pendingsync->wal_required ||
+			(!pendingsync->is_truncated &&
+			 total_blocks < wal_skip_threshold * (uint64) 1024 / BLCKSZ);
+		if (pendingsync->is_truncated || !use_wal)
 		{
 			/* allocate the initial array, or extend it, if needed */
 			if (maxrels == 0)
@@ -956,9 +1000,9 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 
 			srels[nrels++] = srel;
 		}
-		else
+		if (use_wal)
 		{
-			/* Emit WAL records for all blocks.  The file is small enough. */
+			/* Emit WAL for all blocks: the file is small, or WAL is required. */
 			for (fork = 0; fork <= MAX_FORKNUM; fork++)
 			{
 				int			n = nblocks[fork];

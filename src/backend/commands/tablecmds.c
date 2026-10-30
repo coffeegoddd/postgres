@@ -17848,7 +17848,9 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 	 * NOTE: any conflict in relfilenumber value will be caught in
 	 * RelationCreateStorage().
 	 */
-	dstrel = RelationCreateStorage(newrlocator, rel->rd_rel->relpersistence, true);
+	dstrel = RelationCreateStorageWith(newrlocator,
+									   rel->rd_rel->relpersistence, true,
+									   RelationGetSmgr(rel)->smgr_which);
 
 	/* copy main fork */
 	RelationCopyStorage(RelationGetSmgr(rel), dstrel, MAIN_FORKNUM,

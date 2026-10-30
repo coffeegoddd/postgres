@@ -22,6 +22,9 @@
 /* GUC variables */
 extern PGDLLIMPORT int wal_skip_threshold;
 
+/* while not -1, new permanent heap storage goes to this storage manager */
+extern PGDLLIMPORT int new_relation_smgr;
+
 extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  char relpersistence,
 										  bool register_delete);
@@ -39,6 +42,7 @@ extern void RelationTruncate(Relation rel, BlockNumber nblocks);
 extern void RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 								ForkNumber forkNum, char relpersistence);
 extern bool RelFileLocatorSkippingWAL(RelFileLocator rlocator);
+extern void RelFileLocatorForceWALAtCommit(RelFileLocator rlocator);
 extern Size EstimatePendingSyncsSpace(void);
 extern void SerializePendingSyncs(Size maxSize, char *startAddress);
 extern void RestorePendingSyncs(char *startAddress);

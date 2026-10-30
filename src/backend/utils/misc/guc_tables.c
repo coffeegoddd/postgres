@@ -78,6 +78,7 @@
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
 #include "storage/aio.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/copydir.h"

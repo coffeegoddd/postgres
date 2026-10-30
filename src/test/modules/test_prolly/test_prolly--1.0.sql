@@ -23,3 +23,156 @@ AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
 CREATE FUNCTION test_prolly_loaded_at_preload()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Block-mapped storage, below the catalogs: storage is named by
+-- relation file number in the database's default tablespace.  A copy
+-- made by test_bmap_share() lasts until test_bmap_unlink() drops it, or,
+-- if transactional, until the transaction aborts.
+CREATE FUNCTION test_bmap_share(relnumber oid, transactional bool DEFAULT false)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_digest(relnumber oid)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_map(relnumber oid,
+	OUT blkno int8, OUT phys int8, OUT epoch int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The entries a map has past its relation's length.
+CREATE FUNCTION test_bmap_past_end(relnumber oid,
+	OUT blkno int8, OUT phys int8, OUT epoch int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_epoch(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_exists(relnumber oid)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_free_blocks()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The slot following the page store's flushes for shares and captures.
+CREATE FUNCTION test_bmap_store_sync(OUT written int8, OUT flushing int4)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_sweep_due()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- drain: the release queue drained after, as a drop's blocks were freed
+-- before the queue (false leaves them queued)
+CREATE FUNCTION test_bmap_unlink(relnumber oid, drain bool DEFAULT true)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- the release queue drained, of at most max_entries entries (0: all)
+CREATE FUNCTION test_bmap_release_drain(max_entries int8 DEFAULT 0,
+	OUT entries int8, OUT freed int8, OUT unrefs int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_release_pending()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,
+	done bool DEFAULT false)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_extend(relnumber oid, n int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Change a byte of a page's hole, as an access method changes a page.
+CREATE FUNCTION test_bmap_write(relnumber oid, blkno int, value int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A digest of heap pages' rows, leaving out hint bits.
+CREATE FUNCTION test_bmap_rows_digest(relnumber oid)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Read a block zeroed and locked, as an access method about to initialize
+-- it does (only if it isn't in a buffer), and leave it uninitialized.
+CREATE FUNCTION test_bmap_zero_block(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Try for a block's cleanup lock without waiting; true if it was free.
+CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Drop a block's page from the buffer pool without writing it.
+CREATE FUNCTION test_bmap_drop_buffer(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Each of a relation's cached pages checked again before it next changes,
+-- as when its pages begin to be shared.
+CREATE FUNCTION test_bmap_mark_shared(relnumber oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A map's nodes, each time one is reached from the root page.
+CREATE FUNCTION test_bmap_tree(relnumber oid,
+	OUT level int4, OUT first int8, OUT block int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Roots captured into the database's page store: captured (an id), let go
+-- of as the transaction commits, asked of (the length it holds, NULL if not
+-- held), copied into a new relation file number (its main fork alone, which
+-- test_bmap_unlink() drops), counted (those held, and the slots), and the
+-- slots of captures that never committed reclaimed; and those held captured
+-- of a relation file number.
+CREATE FUNCTION test_bmap_root_capture(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_release(id int8)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_root_held(id int8)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_share_root(id int8)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots(OUT held int8, OUT slots int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_of(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The captured roots' slots in use that name a transaction, as capturer
+-- or releaser (VACUUM settles them, so that none needs the commit log).
+CREATE FUNCTION test_bmap_roots_naming()
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_roots_reclaim(settle bool DEFAULT false)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Look up every logical block of the storage 'loops' times, as reading its
+-- pages does (from cached map pages): the microseconds it took.
+CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)
+RETURNS float8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

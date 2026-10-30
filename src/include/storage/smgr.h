@@ -64,6 +64,15 @@ typedef struct SMgrRelationData
 	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
 
 	/*
+	 * for bmap.c: the map's header pinned before a truncation, and the
+	 * lookup of a prepared read
+	 */
+	Buffer		bmap_pretrunc;
+	BlockNumber bmap_read_blkno;	/* logical start of a prepared read */
+	BlockNumber bmap_read_phys; /* its physical start */
+	BlockNumber bmap_read_run;	/* physically consecutive blocks */
+
+	/*
 	 * Pinning support.  If unpinned (ie. pincount == 0), 'node' is a list
 	 * link in list of all unpinned SMgrRelations.
 	 */

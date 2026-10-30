@@ -179,6 +179,7 @@ ABI_compatibility:
 Section: ClassName - WaitEventTimeout
 
 BASE_BACKUP_THROTTLE	"Waiting during base backup when throttling activity."
+BMAP_COMPACTION_LET_GO	"Waiting for a page store's compaction to let go of a relation it was asked for."
 CHECKPOINT_WRITE_DELAY	"Waiting between writes while performing a checkpoint."
 COMMIT_DELAY	"Waiting for commit delay before WAL flush."
 PG_SLEEP	"Waiting due to a call to <function>pg_sleep</function> or a sibling function."

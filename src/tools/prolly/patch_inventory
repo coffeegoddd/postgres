@@ -26,8 +26,13 @@ own   .github/workflows/prolly-upstream-sync.yml
 own   .github/workflows/prolly.yml
 own   CONTRIBUTING-prolly.md
 own   contrib/prolly/
+own   src/backend/access/rmgrdesc/bmapdesc.c
 own   src/backend/prolly/
+own   src/backend/storage/smgr/bmap.c
 own   src/include/prolly/
+own   src/include/storage/bmap.h
+own   src/include/storage/bmap_files.h
+own   src/include/storage/bmap_xlog.h
 own   src/test/modules/test_prolly/
 own   src/test/prolly/
 own   src/tools/prolly/
@@ -38,22 +43,50 @@ patch contrib/Makefile         0  builds the fork's extensions under contrib/pro
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
+patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (block-mapped with debug_block_mapped_heap; kept across rewrites)
+patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
+patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions
+patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
 patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check of a block whose storage was replaced after the record
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
+patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers
+patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bootstrap catalogs
+patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager
+patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/storage.c  1a  creates storage in a chosen storage manager or as a share of another relation's; truncation, drop and commit hooks for storage managers
+patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database
+patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
+patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
+patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
 patch src/backend/storage/buffer/bufmgr.c  1a  pages of storage that shares them are prepared (copied if shared) before they change; storage manager hooks before an asynchronous read and before extension; single-block lookups, flushes and drops
+patch src/backend/storage/smgr/Makefile  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/bulk_write.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
+patch src/backend/storage/smgr/meson.build  1a  builds the block-mapped storage manager
 patch src/backend/storage/smgr/smgr.c  1a  storage manager interface for storage that shares pages copy-on-write; per-relation choice of implementation
+patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page store compaction letting go of a relation
+patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation by its logical length; its map fork counts as none
+patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_replay_entries and debug_block_mapped_heap
+patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
+patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_replay_entries
+patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
+patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
+patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
+patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
+patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
+patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share
+patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write
+patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
 patch src/test/meson.build     0  runs the requirements suite in src/test/prolly
 patch src/test/modules/Makefile     0  builds and runs the engine's unit and conformance tests in test_prolly
