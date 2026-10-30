@@ -1712,6 +1712,13 @@ vc_image_set(VcRepo *r, const PHash *commit, const PHash *image)
 	return VC_OK;
 }
 
+void
+vc_image_drop(VcRepo *r, const PHash *commit)
+{
+	image_release(r, commit);
+	prolly_release_pins(&r->ctx);
+}
+
 bool
 vc_image_get(VcRepo *r, const PHash *commit, PHash *image)
 {

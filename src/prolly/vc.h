@@ -426,6 +426,8 @@ extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
  */
 extern int	vc_image_set(VcRepo *r, const PHash *commit, const PHash *image);
 extern bool vc_image_get(VcRepo *r, const PHash *commit, PHash *image);
+/* Lets go of the image a commit holds, if any (a spacing thinning them). */
+extern void vc_image_drop(VcRepo *r, const PHash *commit);
 
 /* Archives: list and read the manifests of segments exported there. */
 extern void vc_archive_list(ChunkStore *archive, PHash **manifests, size_t *n);

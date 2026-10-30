@@ -7,10 +7,10 @@ CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wno-unused-parameter
 
-SRCS = phash.c chunkfmt.c chunkstore.c memstore.c filestore.c dirstore.c prolly.c vc.c image.c kfplan.c
+SRCS = phash.c chunkfmt.c chunkstore.c memstore.c filestore.c dirstore.c prolly.c vc.c image.c kfplan.c kfspacing.c
 OBJS = $(SRCS:.c=.o)
-HDRS = prolly_util.h phash.h chunkfmt.h chunkstore.h prolly.h vc.h image.h kfplan.h
-TESTS = test/test_prolly test/test_vc test/test_lifetime test/test_window test/test_remote test/test_image test/test_dirstore test/test_kfplan test/test_rewrite
+HDRS = prolly_util.h phash.h chunkfmt.h chunkstore.h prolly.h vc.h image.h kfplan.h kfspacing.h
+TESTS = test/test_prolly test/test_vc test/test_lifetime test/test_window test/test_remote test/test_image test/test_dirstore test/test_kfplan test/test_kfspacing test/test_rewrite
 
 all: libprolly.a
 

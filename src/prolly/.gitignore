@@ -12,6 +12,7 @@
 /bench/deepbench
 /bench/kfbench
 /test/test_kfplan
+/test/test_kfspacing
 /bench/xidbench
 /test/test_rewrite
 /bench/storebench

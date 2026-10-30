@@ -20,6 +20,10 @@
  *				amcheck on both indexes.
  *
  *	--planned	keyframes and checkouts as the keyframe planner (kfplan.h)
+ *	--spacing	which commits keep keyframes (kfspacing.h): even:BYTES or
+ *				exp:BYTES,R, with positions and distances in change bytes;
+ *				with --planned, checkouts then start from the nearest held
+ *				keyframes.  A --window larger than --commits cuts nothing.
  *				decides, calibrating itself from the costs given (measured
  *				by bench/kfbench) as it observes each move: a commit
  *				keeps an image only when the change since the last one
@@ -42,6 +46,7 @@
 #include "pgstore.h"
 #include "../image.h"
 #include "../kfplan.h"
+#include "../kfspacing.h"
 
 #define BLCK 8192
 #define HEAP_PER_VM_PAGE 32672	/* heap blocks one visibility map page covers */
@@ -78,6 +83,7 @@ typedef struct Opts
 	int			bg_rows;		/* stream: apply once this many rows are pending */
 	uint64_t	seed;
 	const char *planned;		/* keyframe costs: row,replay_page,page,replay_fixed,restore_fixed,capture */
+	const char *spacing;		/* even:BYTES or exp:BYTES,R */
 } Opts;
 
 typedef struct Rel
@@ -99,7 +105,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL, NULL
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -125,6 +131,12 @@ static uint64_t snap_dummy_xip[1];
 static uint64_t last_dirty,
 			last_diff;			/* checkout page sources, for reporting */
 static KfPlanner *planner;		/* with --planned */
+static KfSpacing *spacing;		/* with --spacing */
+
+/* The keyframes held under --spacing, oldest first, at their positions. */
+static PHash held_commit[MAX_COMMITS];
+static uint64_t held_at[MAX_COMMITS];
+static size_t nheld;
 static uint64_t rows_since_image;	/* rows committed since the last image */
 static double density = 1.0;	/* pages per row changed, from the images captured */
 
@@ -883,6 +895,81 @@ workload(int seq)
 	free(ids);
 }
 
+/* -------------------------------------------------------------- spacing */
+
+/* A commit's position: its change bytes. */
+static uint64_t
+position(const PHash *commit)
+{
+	VcCommit	c;
+
+	CHECK(vc_commit_load(&repo.ctx, commit, &c));
+	return c.bytes;
+}
+
+static bool
+spacing_take(const PHash *head)
+{
+	return spacing->ops->take(spacing, position(head), nheld ? held_at[nheld - 1] : 0);
+}
+
+static void
+spacing_held(const PHash *commit)
+{
+	CHECK(nheld < MAX_COMMITS);
+	held_commit[nheld] = *commit;
+	held_at[nheld++] = position(commit);
+}
+
+/*
+ * The keyframes the spacing lets go of now that the head is 'head', and
+ * those the window cut, forgotten.
+ */
+static void
+spacing_thin(const PHash *head)
+{
+	static bool drop[MAX_COMMITS];
+	size_t		k = 0,
+				dropped;
+	PHash		img;
+
+	dropped = spacing->ops->thin(spacing, position(head), held_at, nheld, drop);
+	for (size_t i = 0; i < nheld; i++)
+	{
+		if (drop[i])
+			vc_image_drop(&repo, &held_commit[i]);
+		else if (vc_image_get(&repo, &held_commit[i], &img))
+		{
+			held_commit[k] = held_commit[i];
+			held_at[k++] = held_at[i];
+		}
+	}
+	nheld = k;
+	printf("spacing,held=%zu,dropped=%zu,head_at=%llu\n", nheld, dropped,
+		   (unsigned long long) position(head));
+}
+
+/*
+ * The held keyframes nearest to 'target' by position, the newest at or
+ * before it and the oldest after it: up to two, into kf[].
+ */
+static size_t
+spacing_nearest(const PHash *target, PHash *kf)
+{
+	uint64_t	t = position(target);
+	size_t		n = 0;
+	ssize_t		before = -1;
+
+	for (size_t i = 0; i < nheld; i++)
+		if (held_at[i] <= t)
+			before = (ssize_t) i;
+	if (before >= 0)
+		kf[n++] = held_commit[before];
+	if ((size_t) (before + 1) < nheld)
+		kf[n++] = held_commit[before + 1];
+	return n;
+}
+
 /* --------------------------------------------------------------- commit */
 
 static void
@@ -917,11 +1004,14 @@ dolt_commit(int seq, const char *branch)
 		pages = s.n;
 		free(s.v);
 	}
-	if (planner == NULL ||
+	if (spacing ? spacing_take(&c) :
+		planner == NULL ||
 		planner->ops->should_capture(planner, &(KfMove) {rows_since_image, pages, 0}))
 	{
 		img = capture_incremental(&c, lsn, &pages);
 		CHECK(vc_image_set(&repo, &c, &img) == VC_OK);
+		if (spacing)
+			spacing_held(&c);
 		if (rows_since_image > 0)
 			density = 0.8 * density + 0.2 * ((double) pages / (double) rows_since_image);
 		rows_since_image = 0;
@@ -942,6 +1032,8 @@ dolt_commit(int seq, const char *branch)
 	CHECK(vc_sever(&repo, &(VcWindow) {.depth = (uint32_t) o.window}, &seg) == VC_OK);
 	if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
+	if (spacing)
+		spacing_thin(&c);
 
 	CHECK(ncommits < MAX_COMMITS);
 	commits[ncommits].hash = c;
@@ -1255,7 +1347,30 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 
 	CHECK(vc_commit_load(&repo.ctx, target, &tc));
 	rows = rows_between(&work, &tc.root);
+	/* with a spacing: the nearest held keyframes either side of the target */
+	if (spacing)
+	{
+		PHash		near[2];
+		size_t		nn = spacing_nearest(target, near);
+
+		for (size_t i = 0; i < nn; i++)
+		{
+			VcCommit	c;
+			PHash		img;
+
+			CHECK(vc_commit_load(&repo.ctx, &near[i], &c));
+			CHECK(vc_image_get(&repo, &near[i], &img));
+			memset(&cand[n], 0, sizeof(KfCandidate));
+			cand[n].keyframe = near[i];
+			cand[n].pages = restore_pages(&img);
+			cand[n].after.rows = rows_between(&c.root, &tc.root);
+			cand[n].after.pages = (uint64_t) ((double) cand[n].after.rows * density);
+			cand[n].after.warm_pages = cand[n].after.pages;
+			kf[n++] = near[i];
+		}
+	}
 	/* the target's own image, and the nearest imaged ancestor's */
+	else
 	{
 		PHash		h = *target;
 
@@ -2372,6 +2487,7 @@ usage(void)
 			"         [--lifecycle [--bg-ms MS] [--bg-rows N] [--diffs N]\n"
 			"                      [--sql-decode [--bg-bytes B]]]\n"
 			"         [--planned REPLAY_FIXED,ROW,COLD_PAGE,WARM_PAGE,RESTORE_FIXED,PAGE,CAPTURE (us)]\n"
+			"         [--spacing even:BYTES | exp:BYTES,R]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -2389,7 +2505,8 @@ main(int argc, char **argv)
 		{"store-pg", 0, 0, 'G'},
 		{"bg-ms", 1, 0, 'T'}, {"bg-bytes", 1, 0, 'Y'}, {"diffs", 1, 0, 'f'},
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
-		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {0, 0, 0, 0}
+		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {"spacing", 1, 0, 'Z'},
+		{0, 0, 0, 0}
 	};
 	int			ch;
 	PHash		c0,
@@ -2427,6 +2544,7 @@ main(int argc, char **argv)
 			case 'K': o.concurrent = true; break;
 			case 'O': o.outside = optarg; break;
 			case 'P': o.planned = optarg; break;
+			case 'Z': o.spacing = optarg; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -2443,6 +2561,18 @@ main(int argc, char **argv)
 				   &k.capture_page_us) != 7)
 			usage();
 		planner = kf_calibrating_planner(&k, &cal);
+	}
+	if (o.spacing)
+	{
+		unsigned long long d;
+		double		r;
+
+		if (sscanf(o.spacing, "exp:%llu,%lf", &d, &r) == 2)
+			spacing = kf_exponential_spacing(d, r);
+		else if (sscanf(o.spacing, "even:%llu", &d) == 1)
+			spacing = kf_even_spacing(d);
+		else
+			usage();
 	}
 	rng_seed(o.seed);
 	db = PQconnectdb(o.conninfo);
