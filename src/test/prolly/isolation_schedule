@@ -1,3 +1,4 @@
 # Isolation tests of Postgres semantics, run on the access method under
-# test.
+# test.  iso_target comes first: it checks that the settings are in effect.
+test: iso_target
 test: iso_basic

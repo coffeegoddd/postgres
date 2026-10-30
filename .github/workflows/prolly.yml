@@ -110,7 +110,8 @@ jobs:
         run: src/tools/prolly/check_patch_inventory.sh
 
   # The tree also builds with meson; a build file that only one of the two
-  # systems knows about breaks the other, so both are built on every change.
+  # systems knows about breaks the other, so both are built on every change,
+  # and the fork's suites run under meson too.
   meson-build:
     name: meson build
     runs-on: ubuntu-24.04
@@ -128,6 +129,22 @@ jobs:
           meson setup build -Dcassert=true -Dinjection_points=true -Dtap_tests=enabled \
             -Dssl=openssl -Dlz4=enabled
           ninja -C build all testprep
+
+      # (the fork's suites under meson's own runner, which defines them
+      # separately from the Makefiles; "setup" makes the temporary
+      # installation they run from)
+      - name: The fork's suites under meson
+        run: meson test -C build --print-errorlogs --suite setup --suite prolly --suite test_prolly
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: meson-logs
+          path: |
+            build/meson-logs/**
+            build/testrun/**
+          if-no-files-found: ignore
 
   sanitizers:
     name: nightly address and undefined-behavior checks

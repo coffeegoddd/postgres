@@ -2,6 +2,10 @@
 -- a failure shows its error in detail.
 CREATE EXTENSION test_prolly;
 
+-- this run loads the module on first use, not at preload; t/001_preloaded.pl
+-- covers the preloaded case
+SELECT test_prolly_loaded_at_preload();
+
 SELECT suite, test, result, detail FROM test_prolly_unit_tests();
 
 -- one suite, by name

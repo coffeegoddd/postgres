@@ -18,6 +18,12 @@ $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
 
+# (calling any of the module's functions would load it if it were not
+# preloaded, registering its implementations in this backend and letting
+# the checks below pass anyway; so first check it really was preloaded)
+is($node->safe_psql('postgres', 'SELECT test_prolly_loaded_at_preload()'),
+	't', 'the module was loaded at preload');
+
 is( $node->safe_psql(
 		'postgres',
 		"SELECT string_agg(implementation || ' ' || test || ' ' || result, ', '

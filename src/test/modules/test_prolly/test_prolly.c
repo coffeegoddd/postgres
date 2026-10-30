@@ -23,6 +23,7 @@
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "test_prolly.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -33,6 +34,15 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(test_prolly_unit_tests);
 PG_FUNCTION_INFO_V1(test_prolly_conformance);
+PG_FUNCTION_INFO_V1(test_prolly_loaded_at_preload);
+
+/*
+ * Whether this module was loaded through shared_preload_libraries.  A test
+ * that means to check registration at preload needs to know, because the
+ * first call of any of the module's functions loads it anyway, and then
+ * the registrations happen in the calling backend instead.
+ */
+static bool loaded_at_preload = false;
 
 static const ProllyUnitSuite *const unit_suites[] = {
 	&unit_harness_suite,
@@ -54,7 +64,17 @@ typedef struct TestOutcome
 void
 _PG_init(void)
 {
+	loaded_at_preload = process_shared_preload_libraries_in_progress;
 	register_test_checksum_implementations();
+}
+
+/*
+ * test_prolly_loaded_at_preload() returns bool
+ */
+Datum
+test_prolly_loaded_at_preload(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(loaded_at_preload);
 }
 
 /*

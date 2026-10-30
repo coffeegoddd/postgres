@@ -1,0 +1,13 @@
+Parsed test spec with 1 sessions
+
+starting permutation: check_target
+step check_target: 
+	SELECT am.amname = current_setting('prolly_test.table_am') AS on_target
+	FROM pg_class c JOIN pg_am am ON am.oid = c.relam
+	WHERE c.oid = 'target_probe'::regclass;
+
+on_target
+---------
+t        
+(1 row)
+
