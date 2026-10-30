@@ -17,6 +17,8 @@
 #define ENTRY_LEN (2 * PHASH_LEN)
 #define RV_VREFS 2				/* a table entry holds its schema and data root */
 
+static void segment_kf_free(VcSegment *seg);
+
 /*
  * The version-control layer does not yet handle history cut off by the
  * window, so a tree error here is fatal.
@@ -1058,6 +1060,7 @@ vc_repo_free(VcRepo *r)
 		free(r->segs[i].commits);
 		free(r->segs[i].edge);
 		free(r->segs[i].archive_name);
+		segment_kf_free(&r->segs[i]);
 	}
 	free(r->segs);
 	phmap_free(&r->loc);
@@ -1433,6 +1436,13 @@ vc_repo_save(VcRepo *r)
 			put_hash(&b, &sg->commits[j]);
 		put_str(&b, sg->archive_name);
 		put_hash(&b, &sg->manifest);
+		buf_append_uvarint(&b, sg->nkf);
+		for (size_t j = 0; j < sg->nkf; j++)
+		{
+			put_hash(&b, &sg->kf_commits[j]);
+			put_hash(&b, &sg->kf_images[j]);
+			buf_append_uvarint(&b, sg->kf_pos[j]);
+		}
 	}
 	buf_append_uvarint(&b, r->nhints);
 	for (size_t i = 0; i < r->nhints; i++)
@@ -1601,6 +1611,20 @@ vc_repo_open(VcRepo *r, ChunkStore *cs, const ChunkPolicy *policy, const PHash *
 			sg->commits[j] = rd_hash(&rd);
 		sg->archive_name = rd_str(&rd);
 		sg->manifest = rd_hash(&rd);
+		sg->nkf = rd_uv(&rd);
+		if (sg->nkf > len)
+			rd.ok = false;
+		sg->kf_commits = px_malloc((rd.ok ? sg->nkf : 0) * sizeof(PHash) + 1);
+		sg->kf_images = px_malloc((rd.ok ? sg->nkf : 0) * sizeof(PHash) + 1);
+		sg->kf_pos = px_malloc((rd.ok ? sg->nkf : 0) * sizeof(uint64_t) + 1);
+		for (size_t j = 0; j < sg->nkf && rd.ok; j++)
+		{
+			sg->kf_commits[j] = rd_hash(&rd);
+			sg->kf_images[j] = rd_hash(&rd);
+			sg->kf_pos[j] = rd_uv(&rd);
+		}
+		if (!rd.ok)
+			sg->nkf = 0;
 	}
 	n = rd_uv(&rd);
 	for (uint64_t i = 0; i < n && rd.ok; i++)
@@ -1653,6 +1677,59 @@ image_slot(VcRepo *r, const PHash *commit)
 	uint64_t   *v = phmap_find(&r->imgmap, commit);
 
 	return v ? (ssize_t) *v : -1;
+}
+
+/*
+ * Takes a commit's image out of the window's set without letting go of it:
+ * its root hold passes to the caller.  False if it holds none.
+ */
+static bool
+image_detach(VcRepo *r, const PHash *commit, PHash *image)
+{
+	ssize_t		i = image_slot(r, commit);
+
+	if (i < 0)
+		return false;
+	*image = r->img_hash[i];
+	phmap_remove(&r->imgmap, commit);
+	r->nimg--;
+	if ((size_t) i != r->nimg)
+	{
+		r->img_commit[i] = r->img_commit[r->nimg];
+		r->img_hash[i] = r->img_hash[r->nimg];
+		*phmap_find(&r->imgmap, &r->img_commit[i]) = (uint64_t) i;
+	}
+	return true;
+}
+
+/* Gives a commit an image whose root hold the caller passes in. */
+static void
+image_adopt(VcRepo *r, const PHash *commit, const PHash *image)
+{
+	bool		created;
+
+	if (image_slot(r, commit) >= 0)
+	{
+		cs_unref_root(r->ctx.cs, image);
+		return;
+	}
+	px_grow((void **) &r->img_commit, &r->imgcap, r->nimg + 1, sizeof(PHash));
+	r->img_hash = px_realloc(r->img_hash, r->imgcap * sizeof(PHash));
+	r->img_commit[r->nimg] = *commit;
+	r->img_hash[r->nimg] = *image;
+	*phmap_ref(&r->imgmap, commit, &created) = r->nimg;
+	r->nimg++;
+}
+
+static void
+segment_kf_free(VcSegment *seg)
+{
+	free(seg->kf_commits);
+	free(seg->kf_images);
+	free(seg->kf_pos);
+	seg->kf_commits = seg->kf_images = NULL;
+	seg->kf_pos = NULL;
+	seg->nkf = 0;
 }
 
 static void
@@ -2199,9 +2276,13 @@ detach:
 	}
 	r->nheld -= n;
 
-	/* commit images are only for the window: severed commits let theirs go */
-	for (size_t i = 0; i < n; i++)
-		image_release(r, &members[i]);
+	/*
+	 * In REWRITE mode nothing of the cut history stays, keyframes included;
+	 * otherwise the members' keyframes go into the segment (below).
+	 */
+	if (r->history == VC_HISTORY_REWRITE)
+		for (size_t i = 0; i < n; i++)
+			image_release(r, &members[i]);
 
 	if (r->history == VC_HISTORY_REWRITE)
 	{
@@ -2221,6 +2302,23 @@ detach:
 	seg->edge = edge;
 	seg->nedge = nedge;
 	seg->edge_known = edge_known;
+
+	/* the members' keyframes go with them, still held */
+	for (size_t i = 0; i < n; i++)
+	{
+		PHash		img;
+		VcCommit	c;
+
+		if (!image_detach(r, &members[i], &img))
+			continue;
+		seg->kf_commits = px_realloc(seg->kf_commits, (seg->nkf + 1) * sizeof(PHash));
+		seg->kf_images = px_realloc(seg->kf_images, (seg->nkf + 1) * sizeof(PHash));
+		seg->kf_pos = px_realloc(seg->kf_pos, (seg->nkf + 1) * sizeof(uint64_t));
+		seg->kf_commits[seg->nkf] = members[i];
+		seg->kf_images[seg->nkf] = img;
+		seg->kf_pos[seg->nkf] = vc_commit_load(&r->ctx, &members[i], &c) ? c.bytes : 0;
+		seg->nkf++;
+	}
 	for (size_t i = 0; i < n; i++)
 		set_loc(r, &members[i], LOC_SEG_BASE + r->nsegs);
 	*seg_out = (uint32_t) r->nsegs++;
@@ -2423,6 +2521,16 @@ vc_segment_export(VcRepo *r, uint32_t id, const VcSource *archive)
 			return rc;
 		}
 	}
+	for (size_t i = 0; i < seg->nkf; i++)
+	{
+		rc = cs_copy_closure(r->ctx.cs, &ps, &seg->kf_images[i], true, &bad);
+		if (rc != CS_OK)
+		{
+			pinset_free(&ps);
+			r->ctx.err_hash = bad;
+			return rc;
+		}
+	}
 
 	phmap_init(&mem);
 	for (size_t i = 0; i < seg->n; i++)
@@ -2446,6 +2554,13 @@ vc_segment_export(VcRepo *r, uint32_t id, const VcSource *archive)
 	for (size_t i = 0; i < nb; i++)
 		buf_append(&b, bounds[i].b, PHASH_LEN);
 	free(bounds);
+	buf_append_uvarint(&b, seg->nkf);
+	for (size_t i = 0; i < seg->nkf; i++)
+	{
+		buf_append(&b, seg->kf_commits[i].b, PHASH_LEN);
+		buf_append(&b, seg->kf_images[i].b, PHASH_LEN);
+		buf_append_uvarint(&b, seg->kf_pos[i]);
+	}
 	rc = cs_put(archive->cs, b.data, b.len, &manifest, &bad);
 	buf_free(&b);
 	if (rc != CS_OK)
@@ -2459,6 +2574,8 @@ vc_segment_export(VcRepo *r, uint32_t id, const VcSource *archive)
 
 	for (size_t i = 0; i < seg->n; i++)
 		cs_unref_root(r->ctx.cs, &seg->commits[i]);
+	for (size_t i = 0; i < seg->nkf; i++)
+		cs_unref_root(r->ctx.cs, &seg->kf_images[i]);
 	seg->state = VC_SEG_EXPORTED;
 	seg->archive = archive->cs;
 	seg->archive_name = px_memdup(archive->name, strlen(archive->name) + 1);
@@ -2516,10 +2633,15 @@ vc_segment_discard(VcRepo *r, uint32_t id)
 	r->cut_valid = false;
 
 	if (seg->state == VC_SEG_LOCAL)
+	{
 		for (size_t i = 0; i < seg->n; i++)
 			cs_unref_root(r->ctx.cs, &seg->commits[i]);
+		for (size_t i = 0; i < seg->nkf; i++)
+			cs_unref_root(r->ctx.cs, &seg->kf_images[i]);
+	}
 	else
 		cs_unref_root(seg->archive, &seg->manifest);
+	segment_kf_free(seg);
 	free(seg->commits);
 	seg->commits = NULL;
 	seg->n = 0;
@@ -2559,15 +2681,32 @@ vc_segment_attach(VcRepo *r, uint32_t id)
 				return rc;
 			}
 		}
+		for (size_t i = 0; i < seg->nkf; i++)
+		{
+			int			rc = cs_copy_closure(seg->archive, &r->ctx.pins,
+											 &seg->kf_images[i], true, &bad);
+
+			if (rc != CS_OK)
+			{
+				prolly_release_pins(&r->ctx);
+				r->ctx.err_hash = bad;
+				return rc;
+			}
+		}
 		for (size_t i = 0; i < seg->n; i++)
 			cs_ref_root(r->ctx.cs, &seg->commits[i]);
+		for (size_t i = 0; i < seg->nkf; i++)
+			cs_ref_root(r->ctx.cs, &seg->kf_images[i]);
 		prolly_release_pins(&r->ctx);
 	}
 	else if (seg->state != VC_SEG_LOCAL)
 		return VC_ERR;
-	/* the holds move back to the window's history */
+	/* the holds move back to the window's history, keyframes with them */
 	for (size_t i = 0; i < seg->n; i++)
 		enter_window(r, &seg->commits[i]);
+	for (size_t i = 0; i < seg->nkf; i++)
+		image_adopt(r, &seg->kf_commits[i], &seg->kf_images[i]);
+	segment_kf_free(seg);
 	seg->state = VC_SEG_ATTACHED;
 	seg->archive = NULL;
 	return VC_OK;
@@ -2760,6 +2899,22 @@ vc_manifest_load(ChunkStore *archive, const PHash *h, VcManifest *m)
 		p += PHASH_LEN;
 		m->nb++;
 	}
+	if (!read_uvarint(&p, end, &nb) || nb > len)
+		goto bad;
+	m->kf_commits = px_malloc(nb * sizeof(PHash) + 1);
+	m->kf_images = px_malloc(nb * sizeof(PHash) + 1);
+	m->kf_pos = px_malloc(nb * sizeof(uint64_t) + 1);
+	for (uint64_t i = 0; i < nb; i++)
+	{
+		if ((size_t) (end - p) < 2 * PHASH_LEN)
+			goto bad;
+		memcpy(m->kf_commits[i].b, p, PHASH_LEN);
+		memcpy(m->kf_images[i].b, p + PHASH_LEN, PHASH_LEN);
+		p += 2 * PHASH_LEN;
+		if (!read_uvarint(&p, end, &m->kf_pos[i]))
+			goto bad;
+		m->nkf++;
+	}
 	if (p == end)
 		return true;
 bad:
@@ -2774,6 +2929,9 @@ vc_manifest_free(VcManifest *m)
 	free(m->members);
 	free(m->gens);
 	free(m->bounds);
+	free(m->kf_commits);
+	free(m->kf_images);
+	free(m->kf_pos);
 	memset(m, 0, sizeof(*m));
 }
 

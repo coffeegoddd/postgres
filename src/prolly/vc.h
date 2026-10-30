@@ -191,6 +191,14 @@ typedef struct VcSegment
 	PHash	   *edge;
 	size_t		nedge;
 	bool		edge_known;		/* false after an incremental sever */
+	/*
+	 * The keyframes (commit images) of its members, bundled with it: they
+	 * move, are fetched and are discarded with the segment.
+	 */
+	PHash	   *kf_commits;
+	PHash	   *kf_images;
+	uint64_t   *kf_pos;			/* each commit's change bytes */
+	size_t		nkf;
 } VcSegment;
 
 /*
@@ -213,6 +221,10 @@ typedef struct VcManifest
 	size_t		n;
 	PHash	   *bounds;			/* parents of members that are not members */
 	size_t		nb;
+	PHash	   *kf_commits;		/* members with a keyframe bundled */
+	PHash	   *kf_images;		/* and the keyframe, held by the manifest */
+	uint64_t   *kf_pos;
+	size_t		nkf;
 } VcManifest;
 
 #define VC_NO_SEGMENT UINT32_MAX
@@ -421,8 +433,11 @@ extern void vc_locations(VcRepo *r, VcLocFn fn, void *arg);
 
 /*
  * Commit images (see image.h) are local optimization artifacts: a commit
- * in the window may hold one, replacing any it held before, and severing
- * the commit releases it.  They are never exported or sent to remotes.
+ * in the window may hold one, replacing any it held before.  Severing the
+ * commit moves its image into the segment with it: exported to an archive
+ * with the segment, listed by its manifest, and held again locally when
+ * the segment is attached; discarded with it.  They are never sent to
+ * remotes.
  */
 extern int	vc_image_set(VcRepo *r, const PHash *commit, const PHash *image);
 extern bool vc_image_get(VcRepo *r, const PHash *commit, PHash *image);

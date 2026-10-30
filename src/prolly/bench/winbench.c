@@ -86,6 +86,10 @@ typedef struct Opts
 	const char *spacing;		/* even:BYTES or exp:BYTES,R */
 	const char *restore_dir;	/* restores read pages from files here */
 	const char *distances;		/* checkouts this many commits back, each both ways */
+	const char *tier_dir;		/* off-server tier for older keyframes (a dirstore) */
+	int			local_keyframes;	/* with --tier-dir: keyframes kept on the server */
+	bool		restore_all;	/* restores write every page, with no WAL scan */
+	bool		bundle;			/* keyframes travel with their history's segment */
 } Opts;
 
 typedef struct Rel
@@ -107,7 +111,7 @@ typedef struct CommitInfo
 static Opts o = {
 	"host=/tmp port=5499 user=postgres dbname=bench", NULL,
 	"/home/dustin/pgv2-bench/store.dat", 200000, 100, 20, 2000, 10, 10, 10,
-	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL, NULL, NULL, NULL
+	0, 5, 1, true, false, true, false, 1000, 16 << 20, 20, false, false, NULL, 5000, 1, NULL, NULL, NULL, NULL, NULL, 4, false, false
 };
 
 static PGconn *db;				/* the workload and queries */
@@ -136,10 +140,18 @@ static KfPlanner *planner;		/* with --planned */
 static KfSpacing *spacing;		/* with --spacing */
 static int force_path = -1;		/* with --distances: KF_REPLAY or KF_RESTORE, else the planner's */
 
-/* The keyframes held under --spacing, oldest first, at their positions. */
+/*
+ * The keyframes held under --spacing, oldest first, at their positions;
+ * with --tier-dir, those moved off the server name their image there.
+ */
 static PHash held_commit[MAX_COMMITS];
 static uint64_t held_at[MAX_COMMITS];
+static bool held_tiered[MAX_COMMITS];
+static PHash held_img[MAX_COMMITS];
 static size_t nheld;
+static ChunkStore *tier;		/* with --tier-dir */
+static uint64_t tier_exports,
+			tier_export_bytes;
 static uint64_t rows_since_image;	/* rows committed since the last image */
 static double density = 1.0;	/* pages per row changed, from the images captured */
 
@@ -898,6 +910,78 @@ workload(int seq)
 	free(ids);
 }
 
+/*
+ * Space by kind: the bytes of the chunks the keyframes reach (their page
+ * maps, relation maps and pages, each chunk once), and the rest, the
+ * history (commits and prolly trees), on the server and on the tier.
+ */
+typedef struct Walk
+{
+	ChunkStore *cs;
+	PHashMap	seen;
+	uint64_t	bytes;
+} Walk;
+
+static void walk_chunk(Walk *w, const PHash *h);
+
+static void
+walk_ref(void *arg, const PHash *h, bool strong)
+{
+	if (strong)
+		walk_chunk(arg, h);
+}
+
+static void
+walk_chunk(Walk *w, const PHash *h)
+{
+	bool		created;
+	const uint8_t *data;
+	size_t		len;
+
+	phmap_ref(&w->seen, h, &created);
+	if (!created)
+		return;
+	data = cs_get(w->cs, h, &len);
+	if (data == NULL)
+		return;
+	w->bytes += len;
+	CHECK(chunk_refs(data, len, walk_ref, w));
+}
+
+static uint64_t
+keyframe_bytes(ChunkStore *store, bool tiered)
+{
+	Walk		w = {store, {0}, 0};
+
+	phmap_init(&w.seen);
+	if (!tiered)
+		for (size_t i = 0; i < repo.nimg; i++)
+			walk_chunk(&w, &repo.img_hash[i]);
+	else
+		for (size_t i = 0; i < nheld; i++)
+			if (held_tiered[i])
+				walk_chunk(&w, &held_img[i]);
+	phmap_free(&w.seen);
+	return w.bytes;
+}
+
+static void
+space_report(const char *when)
+{
+	uint64_t	s_all = cs->ops->bytes(cs),
+				s_kf = keyframe_bytes(cs, false),
+				t_all = tier ? tier->ops->bytes(tier) : 0,
+				t_kf = tier ? keyframe_bytes(tier, true) : 0;
+	const double mb = 1048576.0;
+
+	printf("space,%s,server_history_mb=%.0f,server_keyframes_mb=%.0f,"
+		   "tier_history_mb=%.0f,tier_keyframes_mb=%.0f,server_file_mb=%.0f,tier_disk_mb=%.0f\n",
+		   when, (s_all - s_kf) / mb, s_kf / mb, (t_all - t_kf) / mb, t_kf / mb,
+		   store_pg ? 0.0 : filestore_file_bytes(cs) / mb,
+		   tier ? dirstore_disk_bytes(tier) / mb : 0.0);
+	fflush(stdout);
+}
+
 /* -------------------------------------------------------------- spacing */
 
 /* A commit's position: its change bytes. */
@@ -921,7 +1005,68 @@ spacing_held(const PHash *commit)
 {
 	CHECK(nheld < MAX_COMMITS);
 	held_commit[nheld] = *commit;
+	held_tiered[nheld] = false;
 	held_at[nheld++] = position(commit);
+}
+
+/*
+ * Moves held keyframe i off the server: its image's closure (page map,
+ * relation map and the pages not already there) copied to the tier, held
+ * there by a root, and let go of locally.
+ */
+static void
+tier_export(size_t i)
+{
+	PHash		img,
+				err;
+	PinSet		ps;
+	uint64_t	b0 = tier->stats.new_bytes;
+
+	CHECK(vc_image_get(&repo, &held_commit[i], &img));
+	pinset_init(&ps, tier);
+	CHECK(cs_copy_closure(cs, &ps, &img, false, &err) == CS_OK);
+	cs_ref_root(tier, &img);
+	pinset_release(&ps);
+	pinset_free(&ps);
+	CHECK(dirstore_flush(tier) == 0);
+	vc_image_drop(&repo, &held_commit[i]);
+	held_img[i] = img;
+	held_tiered[i] = true;
+	tier_exports++;
+	tier_export_bytes += tier->stats.new_bytes - b0;
+}
+
+/*
+ * Brings tiered keyframe i back: the chunks of its image's closure the
+ * server lacks fetched from the tier, and the image held locally again.
+ */
+static void
+tier_fetch(size_t i, uint64_t *chunks, uint64_t *bytes, double *ms)
+{
+	PHash		err;
+	PinSet		ps;
+	uint64_t	g0 = tier->stats.gets,
+				b0 = cs->stats.new_bytes;
+	double		t0 = now_ms();
+
+	pinset_init(&ps, cs);
+	CHECK(cs_copy_closure(tier, &ps, &held_img[i], true, &err) == CS_OK);
+	{
+		ImgHeader	h;
+
+		/* the image fetched is the one taken at the keyframe's commit */
+		CHECK_OK(img_load(&repo.ctx, &held_img[i], &h));
+		CHECK(phash_eq(&h.commit, &held_commit[i]));
+		img_header_free(&h);
+	}
+	CHECK(vc_image_set(&repo, &held_commit[i], &held_img[i]) == VC_OK);
+	pinset_release(&ps);
+	pinset_free(&ps);
+	cs_unref_root(tier, &held_img[i]);
+	held_tiered[i] = false;
+	*chunks = tier->stats.gets - g0;
+	*bytes = cs->stats.new_bytes - b0;
+	*ms = now_ms() - t0;
 }
 
 /*
@@ -939,17 +1084,53 @@ spacing_thin(const PHash *head)
 	dropped = spacing->ops->thin(spacing, position(head), held_at, nheld, drop);
 	for (size_t i = 0; i < nheld; i++)
 	{
-		if (drop[i])
+		bool		local = vc_image_get(&repo, &held_commit[i], &img);
+
+		/* with --bundle, one whose history left keeps travelling with it */
+		if (o.bundle && !local)
+			held_tiered[i] = vc_locate(&repo, &held_commit[i], NULL) == VC_LOC_EXPORTED;
+		else if (o.bundle)
+			held_tiered[i] = false;
+		if (drop[i] && o.bundle && held_tiered[i])
+			drop[i] = false;	/* (inside an exported bundle: kept) */
+		if (drop[i] && held_tiered[i])
+			cs_unref_root(tier, &held_img[i]);
+		else if (drop[i])
 			vc_image_drop(&repo, &held_commit[i]);
-		else if (vc_image_get(&repo, &held_commit[i], &img))
+		else if (held_tiered[i] || local)
 		{
 			held_commit[k] = held_commit[i];
-			held_at[k++] = held_at[i];
+			held_at[k] = held_at[i];
+			held_tiered[k] = held_tiered[i];
+			held_img[k++] = held_img[i];
 		}
 	}
 	nheld = k;
-	printf("spacing,held=%zu,dropped=%zu,head_at=%llu\n", nheld, dropped,
-		   (unsigned long long) position(head));
+
+	/* the oldest local keyframes past --local-keyframes go off the server */
+	if (tier && !o.bundle)
+	{
+		size_t		local = 0;
+
+		for (size_t i = 0; i < nheld; i++)
+			local += !held_tiered[i];
+		for (size_t i = 0; i < nheld && local > (size_t) o.local_keyframes; i++)
+			if (!held_tiered[i])
+			{
+				tier_export(i);
+				local--;
+			}
+	}
+	{
+		size_t		tiered = 0;
+
+		for (size_t i = 0; i < nheld; i++)
+			tiered += held_tiered[i];
+		printf("spacing,held=%zu,tiered=%zu,dropped=%zu,head_at=%llu,local_mb=%.0f,tier_mb=%.0f\n",
+			   nheld, tiered, dropped, (unsigned long long) position(head),
+			   cs->ops->bytes(cs) / 1048576.0,
+			   tier ? tier->ops->bytes(tier) / 1048576.0 : 0.0);
+	}
 }
 
 /*
@@ -957,7 +1138,7 @@ spacing_thin(const PHash *head)
  * before it and the oldest after it: up to two, into kf[].
  */
 static size_t
-spacing_nearest(const PHash *target, PHash *kf)
+spacing_nearest(const PHash *target, PHash *kf, size_t *idx)
 {
 	uint64_t	t = position(target);
 	size_t		n = 0;
@@ -967,9 +1148,15 @@ spacing_nearest(const PHash *target, PHash *kf)
 		if (held_at[i] <= t)
 			before = (ssize_t) i;
 	if (before >= 0)
+	{
+		idx[n] = (size_t) before;
 		kf[n++] = held_commit[before];
+	}
 	if ((size_t) (before + 1) < nheld)
+	{
+		idx[n] = (size_t) before + 1;
 		kf[n++] = held_commit[before + 1];
+	}
 	return n;
 }
 
@@ -1031,9 +1218,17 @@ dolt_commit(int seq, const char *branch)
 	}
 	t3 = now_ms();
 
-	/* the window: what falls out is discarded, images with it */
+	/*
+	 * the window: what falls out is discarded, local images with it; with a
+	 * tier, the history cut is moved there instead
+	 */
 	CHECK(vc_sever(&repo, &(VcWindow) {.depth = (uint32_t) o.window}, &seg) == VC_OK);
-	if (seg != VC_NO_SEGMENT)
+	if (seg != VC_NO_SEGMENT && tier)
+	{
+		CHECK(vc_segment_export(&repo, seg, &(VcSource) {"tier", tier}) == VC_OK);
+		CHECK(dirstore_flush(tier) == 0);
+	}
+	else if (seg != VC_NO_SEGMENT)
 		CHECK(vc_segment_discard(&repo, seg) == VC_OK);
 	if (spacing)
 		spacing_thin(&c);
@@ -1196,15 +1391,48 @@ checkout_images(const PHash *target)
 	restore_read_ms = restore_put_ms = 0;
 	CHECK(vc_image_get(&repo, target, &timg));
 	CHECK_OK(img_load(&repo.ctx, &timg, &th));
+
+	/*
+	 * The keyframe must be of this commit: its header names the commit it
+	 * was taken at, and its bytes hash to the name it is held by, so a
+	 * keyframe of another commit is refused rather than restored.
+	 */
+	if (!phash_eq(&th.commit, target))
+	{
+		fprintf(stderr, "keyframe %s is of commit %s, not %s: refused\n", hex(&timg),
+				hex(&th.commit), hex(target));
+		exit(1);
+	}
 	CHECK_OK(img_load(&repo.ctx, &base_img, &bh));
 	flush_lsn(lsn);
-	wal_pages(base_lsn, lsn, &s);	/* what the working set changed since its base */
-	last_dirty = s.n;
+	if (o.restore_all)
 	{
-		size_t		before = s.n;
+		/*
+		 * Every page of the image, with no WAL scan or image diff: what a
+		 * restore costs once the pages that differ are known in O(1), as the
+		 * engine's block maps give them, at its worst (all of them differ).
+		 */
+		for (int i = 0; i < nrels; i++)
+		{
+			ImgRelation d;
 
-		CHECK_OK(img_diff(&repo.ctx, &bh, &th, img_diff_fn, &s));
-		last_diff = s.n - before;
+			CHECK_OK(img_relation(&repo.ctx, &th, rels[i].oid, &d));
+			for (int f = FORK_MAIN; f <= FORK_VM; f += FORK_VM)
+				for (uint32_t blk = 0; blk < d.nblocks[f]; blk++)
+					pageset_add(&s, rels[i].oid, f, blk);
+		}
+		last_dirty = last_diff = s.n;
+	}
+	else
+	{
+		wal_pages(base_lsn, lsn, &s);	/* what the working set changed since its base */
+		last_dirty = s.n;
+		{
+			size_t		before = s.n;
+
+			CHECK_OK(img_diff(&repo.ctx, &bh, &th, img_diff_fn, &s));
+			last_diff = s.n - before;
+		}
 	}
 	pageset_sort(&s);
 	t_diff = now_ms() - t0;
@@ -1398,6 +1626,7 @@ restore_pages(const PHash *img)
 }
 
 static uint64_t checkout_sql(const PHash *target);
+static double attach_if_outside(const PHash *x, uint64_t *chunks, uint64_t *bytes);
 
 /*
  * Checks out target the way the planner prices cheapest: replay the rows,
@@ -1416,27 +1645,55 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 				done;
 	KfChoice	ch;
 	KfCosts		cur_costs;
+	size_t		cand_idx[2];
+	char		fetched[96] = "";
 	double		t;
+
+	double		tp0 = now_ms(),
+				t_rows,
+				t_cands = 0,
+				t_restore = 0,
+				t_after = 0;
 
 	CHECK(vc_commit_load(&repo.ctx, target, &tc));
 	rows = rows_between(&work, &tc.root);
+	t_rows = now_ms() - tp0;
 	planner->ops->costs(planner, &cur_costs);
+	tp0 = now_ms();
 	/* with a spacing: the nearest held keyframes either side of the target */
 	if (spacing)
 	{
 		PHash		near[2];
-		size_t		nn = spacing_nearest(target, near);
+		size_t		nn = spacing_nearest(target, near, cand_idx);
 
 		for (size_t i = 0; i < nn; i++)
 		{
 			VcCommit	c;
 			PHash		img;
+			uint64_t	hchunks,
+						hbytes;
+			double		hms;
 
+			/* the keyframe's own commit, if the window moved it to the tier */
+			hms = attach_if_outside(&near[i], &hchunks, &hbytes);
+			if (hchunks)
+				printf("%s,keyframe_commit,chunks=%llu,mb=%.1f,ms=%.0f\n",
+					   o.bundle ? "bundle_fetch" : "history_fetch",
+					   (unsigned long long) hchunks, hbytes / 1048576.0, hms);
+			if (o.bundle && held_tiered[cand_idx[i]] &&
+				vc_image_get(&repo, &near[i], &img))
+				held_tiered[cand_idx[i]] = false;	/* came back with its history */
 			CHECK(vc_commit_load(&repo.ctx, &near[i], &c));
-			CHECK(vc_image_get(&repo, &near[i], &img));
 			memset(&cand[n], 0, sizeof(KfCandidate));
 			cand[n].keyframe = near[i];
-			cand[n].pages = restore_pages(&img);
+			/* a keyframe off the server, or any with --restore-all, at every page */
+			if (held_tiered[cand_idx[i]] || o.restore_all)
+				cand[n].pages = table_pages;
+			else
+			{
+				CHECK(vc_image_get(&repo, &near[i], &img));
+				cand[n].pages = restore_pages(&img);
+			}
 			cand[n].after.rows = rows_between(&c.root, &tc.root);
 			cand[n].after.pages = (uint64_t) ((double) cand[n].after.rows * density);
 			cand[n].after.warm_pages = cand[n].after.pages;
@@ -1480,6 +1737,7 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 		m.rows = rows;
 		m.pages = rp < table_pages ? rp : table_pages;
 		m.warm_pages = warm < m.pages ? warm : m.pages;
+		t_cands = now_ms() - tp0;
 		ch = planner->ops->choose(planner, &m, cand, n);
 		if (force_path == KF_REPLAY)
 			ch.path = KF_REPLAY;
@@ -1507,8 +1765,19 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 			const KfCandidate *k = &cand[ch.candidate];
 			double		t2;
 
+			if (spacing && held_tiered[cand_idx[ch.candidate]])
+			{
+				uint64_t	fchunks,
+							fbytes;
+				double		fms;
+
+				tier_fetch(cand_idx[ch.candidate], &fchunks, &fbytes, &fms);
+				snprintf(fetched, sizeof(fetched), ",fetched_chunks=%llu,fetched_mb=%.1f,fetch_ms=%.0f",
+						 (unsigned long long) fchunks, fbytes / 1048576.0, fms);
+			}
 			done = checkout_images(&kf[ch.candidate]);
 			t2 = now_ms();
+			t_restore = t2 - t;
 			planner->ops->observe_restore(planner, k->pages, (t2 - t) * 1000);
 			if (k->after.rows)
 			{
@@ -1520,16 +1789,19 @@ checkout_planned(const PHash *target, uint64_t table_pages, char *how, size_t ho
 				from = table_root(&kc.root);
 				done += replay_diff(db, &from, &to);
 				qx("SELECT pg_replication_slot_advance('prolly', pg_current_wal_flush_lsn())");
+				t_after = now_ms() - t2;
 				planner->ops->observe_replay(planner, &k->after, (now_ms() - t2) * 1000);
 			}
-			snprintf(how, howlen, "restore%s,pages=%llu,rows_after=%llu",
+			snprintf(how, howlen, "restore%s,pages=%llu,rows_after=%llu%s",
 					 k->after.rows ? "+replay" : "", (unsigned long long) k->pages,
-					 (unsigned long long) k->after.rows);
+					 (unsigned long long) k->after.rows, fetched);
 		}
 	}
 	snprintf(how + strlen(how), howlen - strlen(how),
-			 ",est_ms=%.1f,replay_est_ms=%.1f,run_ms=%.1f%s", ch.est_us / 1000,
-			 ch.replay_us / 1000, now_ms() - t, ch.explored ? ",explored" : "");
+			 ",est_ms=%.1f,replay_est_ms=%.1f,run_ms=%.1f%s,rows_diff_ms=%.0f,candidates_ms=%.0f,"
+			 "restore_ms=%.0f,after_ms=%.0f", ch.est_us / 1000,
+			 ch.replay_us / 1000, now_ms() - t, ch.explored ? ",explored" : "", t_rows, t_cands,
+			 t_restore, t_after);
 	return done;
 }
 
@@ -2576,6 +2848,7 @@ usage(void)
 			"         [--planned REPLAY_FIXED,ROW,COLD_PAGE,WARM_PAGE,RESTORE_FIXED,PAGE,CAPTURE (us)]\n"
 			"         [--spacing even:BYTES | exp:BYTES,R] [--restore-dir DIR]\n"
 			"         [--distances N,N,... (with --planned)]\n"
+			"         [--tier-dir DIR [--local-keyframes K] (with --spacing)]\n"
 			"         [--conn STR] --pgdata DIR [--store FILE]\n");
 	exit(2);
 }
@@ -2595,6 +2868,8 @@ main(int argc, char **argv)
 		{"sql-decode", 0, 0, 'Q'}, {"bg-rows", 1, 0, 'W'}, {"concurrent", 0, 0, 'K'},
 		{"outside", 1, 0, 'O'}, {"planned", 1, 0, 'P'}, {"spacing", 1, 0, 'Z'},
 		{"restore-dir", 1, 0, 'X'}, {"distances", 1, 0, 'J'},
+		{"tier-dir", 1, 0, 'U'}, {"local-keyframes", 1, 0, 'V'},
+		{"restore-all", 0, 0, 'A'}, {"bundle", 0, 0, 'E'},
 		{0, 0, 0, 0}
 	};
 	int			ch;
@@ -2636,6 +2911,10 @@ main(int argc, char **argv)
 			case 'Z': o.spacing = optarg; break;
 			case 'X': o.restore_dir = optarg; break;
 			case 'J': o.distances = optarg; break;
+			case 'U': o.tier_dir = optarg; break;
+			case 'V': o.local_keyframes = atoi(optarg); break;
+			case 'A': o.restore_all = true; break;
+			case 'E': o.bundle = true; break;
 			default: usage();
 		}
 	if (o.pgdata == NULL || o.txns < 1 || o.window < 1 || o.pad < 20)
@@ -2652,6 +2931,17 @@ main(int argc, char **argv)
 				   &k.capture_page_us) != 7)
 			usage();
 		planner = kf_calibrating_planner(&k, &cal);
+	}
+	if (o.tier_dir)
+	{
+		char		err[256];
+
+		tier = dirstore_open(o.tier_dir, err, sizeof(err));
+		if (tier == NULL)
+		{
+			fprintf(stderr, "tier: %s\n", err);
+			return 1;
+		}
 	}
 	if (o.spacing)
 	{
@@ -2759,6 +3049,8 @@ main(int argc, char **argv)
 			dolt_commit(i, name);
 		}
 	}
+	space_report("after the commits");
+
 	/*
 	 * With --distances: from the head, to the commit that many back and back
 	 * to the head, by replaying rows and then by the nearest keyframe.
@@ -2778,13 +3070,75 @@ main(int argc, char **argv)
 				continue;
 			for (int way = 0; way < 2; way++)
 			{
+				const PHash *x = &commits[ncommits - 1 - d].hash;
+				uint64_t	hchunks,
+							hbytes;
+				double		hms;
+
 				force_path = way == 0 ? KF_REPLAY : KF_RESTORE;
-				printf("# distance %d by %s\n", d, way == 0 ? "replay" : "keyframe");
+				/* history the window moved to the tier is fetched back first */
+				hms = attach_if_outside(x, &hchunks, &hbytes);
+				printf("# distance %d by %s%s\n", d, way == 0 ? "replay" : "keyframe",
+					   hchunks ? "" : "");
+				if (hchunks)
+					printf("history_fetch,dist=%d,chunks=%llu,mb=%.1f,ms=%.0f\n", d,
+						   (unsigned long long) hchunks, hbytes / 1048576.0, hms);
+				switch_to(x, false, dbp);
+				switch_to(&head, false, dbp);
+			}
+
+			/*
+			 * Again by keyframe, now that what was fetched is local: to the
+			 * same commit, and to one two commits nearer the head.
+			 */
+			if (tier)
+			{
+				int			near_d = d > 2 ? d - 2 : d;
+
+				force_path = KF_RESTORE;
+				printf("# distance %d again by keyframe\n", d);
 				switch_to(&commits[ncommits - 1 - d].hash, false, dbp);
+				switch_to(&head, false, dbp);
+				{
+					uint64_t	hc,
+								hb;
+					double		hm = attach_if_outside(&commits[ncommits - 1 - near_d].hash, &hc, &hb);
+
+					if (hc)
+						printf("history_fetch,dist=%d,chunks=%llu,mb=%.1f,ms=%.0f\n", near_d,
+							   (unsigned long long) hc, hb / 1048576.0, hm);
+				}
+				printf("# distance %d (near %d) by keyframe\n", near_d, d);
+				switch_to(&commits[ncommits - 1 - near_d].hash, false, dbp);
 				switch_to(&head, false, dbp);
 			}
 		}
 		force_path = -1;
+
+		/*
+		 * A keyframe paired with another commit is refused: its header
+		 * names the commit it was taken at.
+		 */
+		if (nheld >= 2)
+		{
+			for (size_t i = 0; i < nheld; i++)
+			{
+				ImgHeader	h;
+				PHash		img;
+				size_t		other = i ? i - 1 : i + 1;
+
+				if (held_tiered[i] || !vc_image_get(&repo, &held_commit[i], &img))
+					continue;
+				CHECK_OK(img_load(&repo.ctx, &img, &h));
+				CHECK(phash_eq(&h.commit, &held_commit[i]));
+				CHECK(!phash_eq(&h.commit, &held_commit[other]));
+				printf("pairing,the keyframe held for %s names it, and would be refused for %s\n",
+					   hex(&held_commit[i]), hex(&held_commit[other]));
+				img_header_free(&h);
+				break;
+			}
+		}
+		space_report("after the checkouts");
 	}
 
 	/* checkouts to anything in the window, across branches */

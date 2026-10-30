@@ -23,8 +23,10 @@
  *			(op byte, uvarint klen, key, [uvarint vlen, value])...
  * Manifest: tag, version, uvarint namelen, source repo name, uvarint n,
  *			(member commit hash (strong), uvarint generation)..., uvarint nb,
- *			(boundary commit hash (weak))...
- *			Describes a segment exported to an archive and holds it there.
+ *			(boundary commit hash (weak))..., uvarint nkf, (commit hash (weak),
+ *			commit image hash (strong), uvarint change bytes)...
+ *			Describes a segment exported to an archive, with the keyframes of
+ *			its members, and holds both there.
  * Page:	tag, version, the page's bytes
  * Image:	tag, version, uvarint pg major, uvarint page size, uvarint
  *			catalog version, 8-byte system id, commit hash (weak), has-base
@@ -53,7 +55,7 @@
  * Covers the encodings and the chunk boundary function; anything that
  * changes the bytes a given set of rows produces must bump it.
  */
-#define CHUNK_FORMAT_VERSION 2
+#define CHUNK_FORMAT_VERSION 3
 
 /* Chunk size policy; chunks average about target_bytes. */
 typedef struct ChunkPolicy

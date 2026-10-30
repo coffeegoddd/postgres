@@ -375,7 +375,7 @@ test_identical_pages_stored_once(void)
 
 /* Images belong to the window: severing a commit frees exactly its image's own pages. */
 static void
-test_images_held_by_window(void)
+test_images_bundled_with_segments(void)
 {
 	ChunkStore *cs = memstore_create();
 	ChunkStore *acs = memstore_create();
@@ -434,23 +434,54 @@ test_images_held_by_window(void)
 		phmap_free(&only);
 	}
 	CHECK(want > 0);
+
+	/* severing moves c0's and c1's images into the segment, freeing nothing */
 	st = cs->stats;
 	CHECK(vc_sever(&r, &depth2, &seg) == VC_OK);
-	CHECK_EQ(STATS_DELTA(cs, st, frees), want);
+	CHECK_EQ(STATS_DELTA(cs, st, frees), 0);
 	CHECK(!vc_image_get(&r, &c[1], &got));
 	CHECK(vc_image_get(&r, &c[2], &got) && phash_eq(&got, &img[2]));
 	CHECK(vc_image_set(&r, &c[1], &img[2]) == VC_ERR_OUTSIDE_WINDOW);
+	CHECK_EQ(r.segs[seg].nkf, 2);
 	check_store(cs, 0);
 
-	/* images never leave: exporting the segment sends no pages */
+	/*
+	 * exporting the segment takes its keyframes with it: its manifest lists
+	 * each with its commit, the archive holds their pages, and here what
+	 * only they (and the segment's history) reached is freed
+	 */
+	st = cs->stats;
 	CHECK(vc_segment_export(&r, seg, &(VcSource) {"cold", acs}) == VC_OK);
+	CHECK(STATS_DELTA(cs, st, frees) >= want);	/* and their history with them */
 	{
 		PHash	   *mans;
 		size_t		nm;
+		VcManifest	m;
 		PHashMap	all;
 		size_t		pages = 0;
 
 		vc_archive_list(acs, &mans, &nm);
+		CHECK_EQ(nm, 1);
+		CHECK(vc_manifest_load(acs, &mans[0], &m));
+		CHECK_EQ(m.nkf, 2);
+		for (size_t k = 0; k < m.nkf; k++)
+		{
+			ImgHeader	h;
+			ProllyCtx	actx;
+
+			prolly_ctx_init(&actx, acs, &small_policy);
+			CHECK_OK(img_load(&actx, &m.kf_images[k], &h));
+			/*
+			 * a keyframe names its commit, the one the manifest pairs it
+			 * with (c0's here is the fixture's base image, of no commit)
+			 */
+			CHECK(phash_eq(&m.kf_commits[k], &c[0]) || phash_eq(&m.kf_commits[k], &c[1]));
+			if (phash_eq(&m.kf_commits[k], &c[1]))
+				CHECK(phash_eq(&h.commit, &c[1]));
+			img_header_free(&h);
+			prolly_ctx_free(&actx);
+		}
+		vc_manifest_free(&m);
 		phmap_init(&all);
 		closure(acs, &mans[0], &all);
 		for (size_t k = 0; k < all.cap; k++)
@@ -459,12 +490,19 @@ test_images_held_by_window(void)
 				size_t		len;
 				const uint8_t *d = acs->ops->get(acs, &all.keys[k], &len);
 
-				pages += d[0] == CHUNK_TAG_PAGE || d[0] == CHUNK_TAG_IMAGE;
+				pages += d[0] == CHUNK_TAG_PAGE;
 			}
-		CHECK_EQ(pages, 0);
+		CHECK(pages > 0);
 		phmap_free(&all);
 		free(mans);
 	}
+	check_store(cs, 0);
+
+	/* attaching brings the history back and the keyframes with it */
+	CHECK(vc_segment_attach(&r, seg) == VC_OK);
+	CHECK(vc_image_get(&r, &c[0], &got) && phash_eq(&got, &img[0]));
+	CHECK(vc_image_get(&r, &c[1], &got) && phash_eq(&got, &img[1]));
+	check_store(cs, 0);
 
 	/* replacing a commit's image frees what only the old one had */
 	CHECK(vc_image_set(&r, &c[3], &img[2]) == VC_OK);
@@ -631,7 +669,7 @@ main(void)
 	RUN(test_incremental_image);
 	RUN(test_builder_rejects_invalid);
 	RUN(test_identical_pages_stored_once);
-	RUN(test_images_held_by_window);
+	RUN(test_images_bundled_with_segments);
 	RUN(test_image_errors);
 	RUN(test_image_scaling);
 	printf("test_image: all tests passed\n");

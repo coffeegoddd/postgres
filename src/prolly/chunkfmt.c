@@ -178,6 +178,17 @@ manifest_refs(const uint8_t *data, size_t len, ChunkRefFn fn, void *arg)
 			return false;
 		fn(arg, &h, false);
 	}
+	if (!read_uvarint(&p, end, &nb) || nb > len)
+		return false;
+	for (uint64_t i = 0; i < nb; i++)
+	{
+		if (!read_hash(&p, end, &h))
+			return false;
+		fn(arg, &h, false);
+		if (!read_hash(&p, end, &h) || !read_uvarint(&p, end, &gen))
+			return false;
+		fn(arg, &h, true);
+	}
 	return p == end;
 }
 
