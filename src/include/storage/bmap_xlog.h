@@ -483,10 +483,11 @@ typedef struct xl_bmap_bits_delta
 /*
  * Block data of a reference-count page: counts set.  A block's count is the
  * number of maps holding it besides the first, the whole uint32 of its slot
- * on the page.  Its roots' count follows the counts on the page: how many
- * of the pages holding it are the captured roots' (a root's slot, or a node
- * one reaches), with a flag saying whether it is such a node itself;
- * 'nroots' of them set, after the counts.
+ * on the page.  Its roots' count, another uint32, follows the counts on the
+ * page: how many of the pages holding it are the captured roots' (a root's
+ * slot, or a node one reaches), in 31 bits, with a flag saying whether it
+ * is such a node itself in the top bit; 'nroots' of them set, after the
+ * counts.
  */
 typedef struct xl_bmap_refs_delta
 {

@@ -11,8 +11,8 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 # a reference-count page's blocks: a page's bytes less its header and
-# special space, six bytes a block (a count and a roots' count)
-my $refs_per_page = int((8192 - 24 - 8) / 6);
+# special space, eight bytes a block (a count and a roots' count)
+my $refs_per_page = int((8192 - 24 - 8) / 8);
 
 my $node = PostgreSQL::Test::Cluster->new('share_limits');
 $node->init;

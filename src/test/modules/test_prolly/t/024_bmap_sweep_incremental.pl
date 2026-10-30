@@ -212,4 +212,46 @@ SKIP:
 }
 
 $node->stop;
+
+# Many roots of a table that doesn't change, one for each commit of a long
+# version history, all pointing to the same subtrees: each block's roots'
+# count passes what fifteen bits hold, and a sweep after one more root is
+# captured still costs what it does with few roots held, the counts whole
+# and exact.
+my $wide = PostgreSQL::Test::Cluster->new('sweep_many_roots');
+$wide->init;
+$wide->append_conf('postgresql.conf', qq{
+debug_block_mapped_heap = on
+autovacuum = off
+checkpoint_timeout = 1h
+fsync = off
+});
+$wide->start;
+$wide->safe_psql('postgres', q{
+	CREATE EXTENSION test_prolly;
+	CREATE TABLE u (a int, b text);
+	INSERT INTO u SELECT g, repeat('u', 100) FROM generate_series(1, 2000) g;
+});
+my $u = $wide->safe_psql('postgres', q{SELECT pg_relation_filenode('u')});
+my $nroots = 40000;
+$wide->safe_psql('postgres', qq{
+	SELECT count(test_bmap_root_capture($u)) FROM generate_series(1, $nroots)});
+$wide->safe_psql('postgres', q{SELECT * FROM test_bmap_sweep()});
+is($wide->safe_psql('postgres', q{
+	SELECT whole AND counted = } . $nroots . q{ AND differ = 0
+	FROM test_bmap_root_counts()}),
+	't', "$nroots roots of one table: the roots' counts are whole and exact");
+$wide->safe_psql('postgres', qq{UPDATE u SET b = 'changed' WHERE a = 7;
+	SELECT test_bmap_root_capture($u)});
+my $plan = decode_json($wide->safe_psql('postgres', q{
+	EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, FORMAT JSON)
+	SELECT * FROM test_bmap_sweep()}))->[0]{Plan};
+my $cost = $plan->{'Shared Hit Blocks'} + $plan->{'Shared Read Blocks'};
+note("a sweep after one more root, $nroots held, looked up $cost buffers");
+cmp_ok($cost, '<=', $few + 20,
+	'a sweep after one more root costs what it does with few roots held');
+is($wide->safe_psql('postgres', q{
+	SELECT whole AND differ = 0 FROM test_bmap_root_counts()}),
+	't', "and the roots' counts stay whole and exact");
+$wide->stop;
 done_testing();
