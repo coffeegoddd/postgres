@@ -300,6 +300,18 @@ test_bmap_sweep_due(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_bmap_drop_orphans(): the storage of transactions that never
+ * committed, dropped at this transaction's commit; how many.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_drop_orphans);
+
+Datum
+test_bmap_drop_orphans(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(bmap_drop_orphans(MyDatabaseTableSpace, MyDatabaseId));
+}
+
+/*
  * test_bmap_unlink(relnumber, drain): drop storage, its blocks queued for
  * release; with drain, the queue drained after, freeing what no copy holds.
  * The records are flushed before returning: this transaction has no

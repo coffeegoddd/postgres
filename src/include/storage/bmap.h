@@ -16,6 +16,7 @@
 #ifndef BMAP_H
 #define BMAP_H
 
+#include "access/transam.h"
 #include "datatype/timestamp.h"
 #include "storage/bmap_files.h"
 #include "storage/bmap_xlog.h"
@@ -28,6 +29,11 @@
 
 /* developer setting: heap tables made in block-mapped storage */
 extern PGDLLIMPORT bool debug_block_mapped_heap;
+
+/* the transaction making a map next, which drops it if it aborts */
+extern void bmap_creating(FullTransactionId xid);
+/* storage of transactions that never committed, dropped at commit */
+extern int	bmap_drop_orphans(Oid spcOid, Oid dbOid);
 
 /* logical blocks recovery remembers a later remap of, at most */
 extern PGDLLIMPORT int block_map_replay_entries;

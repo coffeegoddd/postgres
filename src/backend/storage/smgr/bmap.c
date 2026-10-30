@@ -362,7 +362,7 @@ bool		block_map_copy_images = true;
  * the relation's own.  This server reads only version 18 and refuses
  * anything older (refuse_version()).
  */
-#define BMAP_VERSION		18
+#define BMAP_VERSION		19
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -400,6 +400,9 @@ typedef struct BmapHeader
 	BlockNumber vm_nblocks;		/* its visibility map's length */
 	BlockNumber free_space_unknown; /* pages from 0 whose free space the
 									 * free space map may not know */
+	FullTransactionId creator;	/* the transaction that made it, which
+								 * drops it if it aborts; invalid for one
+								 * made outside any (see bmap_creating()) */
 } BmapHeader;
 
 typedef struct BmapMeta
@@ -1707,6 +1710,8 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 		PageGetBmapHeader(page)->shared_below = delta->shared_below;
 	if (delta->flags & BMAP_DELTA_FREE_SPACE)
 		PageGetBmapHeader(page)->free_space_unknown = delta->free_space_unknown;
+	if (delta->flags & BMAP_DELTA_CREATOR)
+		PageGetBmapHeader(page)->creator = delta->creator;
 }
 
 /*
@@ -14220,6 +14225,85 @@ bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	create_map(reln);
 }
 
+/*
+ * Storage made in a transaction that drops it if it aborts (its creation
+ * registered a pending delete) names that transaction in its map's header,
+ * set here by the caller just before.  A crash, or a recovery stopped at a
+ * point before the transaction ended, leaves such a map with no commit and
+ * no abort record to drop it, holding whatever it was made sharing:
+ * bmap_drop_orphans() finds and drops it.  Storage made outside any such
+ * transaction (a test's copy) names none and is never taken for an orphan.
+ */
+static FullTransactionId creating_xact = {0};
+
+void
+bmap_creating(FullTransactionId xid)
+{
+	creating_xact = xid;
+}
+
+/*
+ * The maps of the database's page store in tablespace spcOid made by a
+ * transaction that is neither in progress nor committed: it aborted
+ * without its abort's record, or the server crashed or a recovery stopped
+ * before it ended.  Each is dropped at the commit of the caller's
+ * transaction, as any relation dropped then is: its holds queued for
+ * release and its map unlinked, logged in the commit record, so that
+ * redo does it too.  A transaction older than the commit log keeps is
+ * taken to have committed.  Returns how many.
+ */
+int
+bmap_drop_orphans(Oid spcOid, Oid dbOid)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	char	   *path = GetDatabasePath(dbOid, spcOid);
+	DIR		   *dir;
+	struct dirent *de;
+	int			n = 0;
+
+	if (RecoveryInProgress())
+		return 0;
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		char	   *end;
+		SMgrRelation reln;
+		Buffer		buf;
+		FullTransactionId creator;
+		TransactionId xid;
+
+		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
+		if (end == de->d_name || strcmp(end, "_bmap") != 0)
+			continue;
+		rel.relNumber = relnumber;
+		reln = smgropen(rel, INVALID_PROC_NUMBER);
+		if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
+			continue;
+		buf = map_read(rel, 0);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		creator = PageIsNew(BufferGetPage(buf)) ? InvalidFullTransactionId :
+			PageGetBmapHeader(BufferGetPage(buf))->creator;
+		UnlockReleaseBuffer(buf);
+		if (!FullTransactionIdIsValid(creator))
+			continue;
+		xid = XidFromFullTransactionId(creator);
+		if (!TransactionIdIsNormal(xid) ||
+			TransactionIdPrecedes(xid, TransamVariables->oldestClogXid) ||
+			TransactionIdIsInProgress(xid) || TransactionIdDidCommit(xid))
+			continue;
+		(void) GetTopTransactionId();
+		RelationDropStorageAtCommit(rel);
+		ereport(LOG,
+				(errmsg("dropping storage \"%s\" made by transaction %u, which did not commit",
+						relpath(reln->smgr_rlocator, MAIN_FORKNUM).str, xid)));
+		n++;
+	}
+	FreeDir(dir);
+	pfree(path);
+	return n;
+}
+
 /* Make reln's map: its header and its root page, of no subtrees, in one record */
 static void
 create_map(SMgrRelation reln)
@@ -14253,6 +14337,7 @@ create_map(SMgrRelation reln)
 			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
 			 BufferGetBlockNumber(rootbuf));
 
+	memset(&delta, 0, sizeof(delta));
 	delta.kind = BMAP_DELTA_HEADER;
 	delta.flags = BMAP_DELTA_INIT;
 	delta.nblocks = 0;
@@ -14260,6 +14345,13 @@ create_map(SMgrRelation reln)
 	delta.free_space_unknown = 0;
 	delta.epoch = 0;
 	delta.shared_below = 0;
+	/* the transaction making it, which drops it if it aborts */
+	if (FullTransactionIdIsValid(creating_xact))
+	{
+		delta.flags |= BMAP_DELTA_CREATOR;
+		delta.creator = creating_xact;
+		creating_xact = InvalidFullTransactionId;
+	}
 	memset(&rdelta, 0, sizeof(rdelta));
 	rdelta.kind = BMAP_DELTA_ROOT;
 	rdelta.flags = BMAP_DELTA_INIT;
@@ -14525,6 +14617,8 @@ bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
 
 		if (!bmap_sweep_due(spc, MyDatabaseId))
 			continue;
+		/* (a sweep is due after a start: what a crash orphaned goes too) */
+		done->orphans += bmap_drop_orphans(spc, MyDatabaseId);
 		bmap_sweep(spc, MyDatabaseId, &swept);
 		done->swept++;
 		done->swept_freed += swept.freed;

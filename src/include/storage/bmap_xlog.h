@@ -19,6 +19,7 @@
 #ifndef BMAP_XLOG_H
 #define BMAP_XLOG_H
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "storage/block.h"
@@ -360,12 +361,15 @@ typedef struct xl_bmap_header_delta
 	uint32		shared_below;	/* (BMAP_DELTA_SHARED_BELOW) */
 	BlockNumber vm_nblocks;
 	BlockNumber free_space_unknown; /* (BMAP_DELTA_FREE_SPACE) */
+	FullTransactionId creator;	/* (BMAP_DELTA_CREATOR) */
 } xl_bmap_header_delta;
 
 /* a header delta that sets the header's shared_below too */
 #define BMAP_DELTA_SHARED_BELOW	0x02
 /* and one that sets how many pages' free space may be unknown */
 #define BMAP_DELTA_FREE_SPACE	0x04
+/* and one that names the transaction that made the map */
+#define BMAP_DELTA_CREATOR		0x08
 
 /*
  * Block data of a map page: entries set.  An entry whose block changes

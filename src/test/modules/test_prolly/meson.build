@@ -91,6 +91,7 @@ tests += {
       't/039_bmap_sequences.pl',
       't/040_bmap_share_index_ams.pl',
       't/041_bmap_pitr_steps.pl',
+      't/042_bmap_orphan_maps.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

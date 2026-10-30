@@ -107,6 +107,8 @@ typedef struct SMgrMaintenance
 	uint64		released_freed; /* blocks those freed */
 	uint64		swept;			/* stores swept */
 	uint64		swept_freed;	/* blocks the sweeps freed */
+	uint64		orphans;		/* storage of transactions that never
+								 * committed, dropped */
 } SMgrMaintenance;
 
 extern void smgrinit(void);

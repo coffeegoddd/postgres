@@ -199,7 +199,10 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
 		smgr_which = SMGR_MD;
 
 	srel = smgropen(rlocator, procNumber);
+	if (register_delete && smgr_which == SMGR_BMAP)
+		bmap_creating(GetTopFullTransactionId());
 	smgrcreatewith(srel, smgr_which, MAIN_FORKNUM, false);
+	bmap_creating(InvalidFullTransactionId);
 
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
@@ -287,7 +290,11 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 	}
 
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	/* (the map names the transaction that drops it if it aborts) */
+	if (register_delete)
+		bmap_creating(GetTopFullTransactionId());
 	smgrshare(src, srel);
+	bmap_creating(InvalidFullTransactionId);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
 	/*
@@ -409,7 +416,10 @@ RelationCreateStorageFromRoot(RelFileLocator rlocator, uint64 root,
 	}
 
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (register_delete)
+		bmap_creating(GetTopFullTransactionId());
 	bmap_share_root(root, srel, replacing, sharer, lineage_of);
+	bmap_creating(InvalidFullTransactionId);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 	if (maps_from && smgrexists(maps_from, FSM_FORKNUM))
 	{
@@ -505,6 +515,29 @@ RelationDropStorage(Relation rel)
 	 */
 
 	RelationCloseSmgr(rel);
+}
+
+/*
+ * RelationDropStorageAtCommit
+ *		Schedule storage, known by its locator alone, to be dropped at commit.
+ *
+ * For storage no relation names any more (block-mapped storage a crashed
+ * transaction made, bmap_drop_orphans()): dropped as RelationDropStorage()
+ * drops a relation's, its drop in the commit record.
+ */
+void
+RelationDropStorageAtCommit(RelFileLocator rlocator)
+{
+	PendingRelDelete *pending;
+
+	pending = (PendingRelDelete *)
+		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+	pending->rlocator = rlocator;
+	pending->procNumber = INVALID_PROC_NUMBER;
+	pending->atCommit = true;	/* delete if commit */
+	pending->nestLevel = GetCurrentTransactionNestLevel();
+	pending->next = pendingDeletes;
+	pendingDeletes = pending;
 }
 
 /*
