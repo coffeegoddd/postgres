@@ -545,6 +545,7 @@ SequenceChangePersistence(Oid relid, char newrelpersistence)
 	Relation	seqrel;
 	Buffer		buf;
 	HeapTupleData seqdatatuple;
+	HeapTuple	tuple;
 
 	/*
 	 * ALTER SEQUENCE acquires this lock earlier.  If we're processing an
@@ -559,10 +560,16 @@ SequenceChangePersistence(Oid relid, char newrelpersistence)
 	if (RelationNeedsWAL(seqrel))
 		GetTopTransactionId();
 
+	/*
+	 * The tuple is copied, as the old page is only share-locked and
+	 * fill_seq_with_data() sets the tuple's header in place.
+	 */
 	(void) read_seq_tuple(seqrel, BUFFER_LOCK_SHARE, &buf, &seqdatatuple);
-	RelationSetNewRelfilenumber(seqrel, newrelpersistence);
-	fill_seq_with_data(seqrel, &seqdatatuple);
+	tuple = heap_copytuple(&seqdatatuple);
 	UnlockReleaseBuffer(buf);
+	RelationSetNewRelfilenumber(seqrel, newrelpersistence);
+	fill_seq_with_data(seqrel, tuple);
+	heap_freetuple(tuple);
 
 	sequence_close(seqrel, NoLock);
 }
