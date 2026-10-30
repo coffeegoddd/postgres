@@ -6,7 +6,7 @@
 # space map, a hint that would have to be copied, is left for the copy to
 # build again.  The copy's visibility map is the source's, so index-only
 # scans of it skip the heap and VACUUM skips its all-visible pages; it stays
-# correct as either relation changes, through a crash and on a standby.
+# correct as either relation changes, and through a crash.
 
 use strict;
 use warnings FATAL => 'all';
@@ -15,7 +15,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('share_maps');
-$node->init(allows_streaming => 1);
+$node->init;
 $node->append_conf('postgresql.conf', qq{
 debug_block_mapped_heap = on
 autovacuum = off
@@ -220,33 +220,6 @@ is(sql(qq{
 	  AND relfilenode = $vm_imaged AND relforknumber = 2}),
 	'1,1', 'a copy of a map page logs its image');
 
-# A standby follows a share, and the changes after it, from a base backup
-# taken before the share.
-$node->backup('before');
-my $standby = PostgreSQL::Test::Cluster->new('share_maps_standby');
-$standby->init_from_backup($node, 'before', has_streaming => 1);
-$standby->start;
-my $medium = make_table('medium', 2000);
-my ($medium_copy) = share_wal($medium);
-adopt('medium_copy', 'medium', $medium_copy);
-sql(q{DELETE FROM medium_copy WHERE a % 100 = 0; DELETE FROM medium WHERE a % 100 = 1});
-sql(q{VACUUM medium_copy});
-# (WAL flushed: VACUUM's records may otherwise wait in the WAL buffers)
-sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
-$node->wait_for_replay_catchup($standby);
-foreach my $t ('medium', 'medium_copy', 'large_copy')
-{
-	is( $standby->safe_psql('postgres',
-			qq{SELECT string_agg(all_visible::int::text || all_frozen::int::text, '' ORDER BY blkno) FROM pg_visibility_map('$t')}),
-		sql(qq{SELECT string_agg(all_visible::int::text || all_frozen::int::text, '' ORDER BY blkno) FROM pg_visibility_map('$t')}),
-		"the standby's map of $t is the primary's");
-	is($standby->safe_psql('postgres', qq{SELECT count(*) FROM pg_check_visible('$t')}),
-		'0', "and right there");
-}
-is($standby->safe_psql('postgres', q{SELECT count(*), sum(a) FROM medium_copy}),
-	sql(q{SELECT count(*), sum(a) FROM medium_copy}),
-	'the standby reads the copy\'s rows');
-
-$standby->stop;
+# (A standby's maps after a share, a crash of it and its promotion: t/036.)
 $node->stop;
 done_testing();
