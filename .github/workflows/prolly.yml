@@ -1,0 +1,167 @@
+# CI for the fork.  Every pull request, including each layer of a stack,
+# builds the tree and runs the suites that must pass before it merges; every
+# push to master runs the same jobs, so master's state is always known.  A
+# nightly run adds sanitizer builds and check-world.
+#
+# Upstream's pg-ci.yml is left as it is: it runs only when the repository
+# variable PG_CI_ENABLED is set.
+
+name: prolly
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: Also run the nightly jobs (sanitizers and check-world)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its older run.  Any other run gets
+# a group of its own commit, so a master or nightly run is never cancelled.
+concurrency:
+  group: prolly-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CONFIGURE_FLAGS: >-
+    --enable-cassert --enable-debug --enable-tap-tests --enable-injection-points
+    --with-openssl --with-lz4
+  APT_PACKAGES: >-
+    bison flex libicu-dev libipc-run-perl liblz4-dev libreadline-dev
+    libssl-dev pkg-config zlib1g-dev
+  PGCTLTIMEOUT: 120
+
+jobs:
+  build-and-test:
+    name: build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build
+        run: |
+          ./configure $CONFIGURE_FLAGS
+          make -s -j4 COPT=-Werror
+          make -s -j4 -C contrib COPT=-Werror
+          make -s -j4 -C src/test/modules COPT=-Werror
+
+      - name: Postgres regression tests
+        run: make check
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-and-test-logs
+          path: |
+            **/regression.diffs
+            **/regression.out
+            **/tmp_check/log/**
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore
+
+  # The tree also builds with meson; a build file that only one of the two
+  # systems knows about breaks the other, so both are built on every change.
+  meson-build:
+    name: meson build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES meson ninja-build
+
+      - name: Build
+        run: |
+          meson setup build -Dcassert=true -Dinjection_points=true -Dtap_tests=enabled \
+            -Dssl=openssl -Dlz4=enabled
+          ninja -C build all testprep
+
+  sanitizers:
+    name: nightly address and undefined-behavior checks
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES clang
+
+      - name: Build
+        run: |
+          ./configure $CONFIGURE_FLAGS CC=clang \
+            CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
+            LDFLAGS='-fsanitize=address,undefined'
+          make -s -j4
+          make -s -j4 -C contrib
+          make -s -j4 -C src/test/modules
+
+      - name: Postgres regression tests
+        run: make check
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: sanitizer-logs
+          path: |
+            **/regression.diffs
+            **/tmp_check/log/**
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore
+
+  check-world:
+    name: nightly check-world
+    if: github.event_name == 'schedule' || inputs.nightly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Build
+        run: |
+          ./configure $CONFIGURE_FLAGS
+          make -s -j4 world-bin
+
+      - name: check-world
+        run: make -j4 -Otarget check-world PROVE_FLAGS=--timer
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: check-world-logs
+          path: |
+            **/regression.diffs
+            **/tmp_check/log/**
+            **/output_iso/regression.diffs
+          if-no-files-found: ignore
