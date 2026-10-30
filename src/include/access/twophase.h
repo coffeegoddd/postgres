@@ -39,6 +39,7 @@ extern void PostPrepare_Twophase(void);
 extern TransactionId TwoPhaseGetXidByVirtualXID(VirtualTransactionId vxid,
 												bool *have_more);
 extern PGPROC *TwoPhaseGetDummyProc(FullTransactionId fxid, bool lock_held);
+extern bool TwoPhaseTransactionIsKnown(FullTransactionId fxid);
 extern int	TwoPhaseGetDummyProcNumber(FullTransactionId fxid, bool lock_held);
 
 extern GlobalTransaction MarkAsPreparing(FullTransactionId fxid, const char *gid,

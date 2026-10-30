@@ -251,6 +251,9 @@ typedef struct xl_bmap_extend
  * BMAP_TREE_FREE_SPACE	VACUUM recorded the free space of every page the
  *						free space map might not know: block 0 is the
  *						header, which then says none
+ * BMAP_TREE_CREATOR	the storage of a transaction that never committed,
+ *						taken to be dropped: block 0 is the header, which
+ *						then names the transaction dropping it
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
@@ -261,6 +264,7 @@ typedef struct xl_bmap_extend
 #define BMAP_TREE_EPOCH			9
 #define BMAP_TREE_STAMP			10
 #define BMAP_TREE_FREE_SPACE	11
+#define BMAP_TREE_CREATOR		12
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_ROOT		0x02

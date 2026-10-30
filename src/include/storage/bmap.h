@@ -32,6 +32,8 @@ extern PGDLLIMPORT bool debug_block_mapped_heap;
 
 /* the transaction making a map next, which drops it if it aborts */
 extern void bmap_creating(FullTransactionId xid);
+/* recovery ended; transactions from 'next' on are this server's */
+extern void bmap_recovery_done(FullTransactionId next);
 /* storage of transactions that never committed, dropped at commit */
 extern int	bmap_drop_orphans(Oid spcOid, Oid dbOid);
 
