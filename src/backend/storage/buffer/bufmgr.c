@@ -690,14 +690,6 @@ static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
 static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr);
 static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
 
-/*
- * Read a page's preparation flags into *buf_state: true if they are
- * settled at the current generation, so that they hold.  Lock-free: a check
- * settling them (under the header's spinlock) sets the generation before it
- * unlocks, so a generation read as current, before flags read unlocked, is
- * theirs.  Flags read locked may be mid-settle: read again once the header
- * is unlocked (as briefly as any holder of it keeps it).
- */
 /* The slot of relation rel's generation of sharing. */
 static inline uint32
 BufferSmgrRelSlot(const RelFileLocator *rel)
@@ -721,6 +713,14 @@ BufferSmgrGenerationOf(BufferDesc *buf_hdr)
 	return pg_atomic_read_u64(&BufferSmgrRelGenerations[BufferSmgrRelSlot(&rel)]) + 1;
 }
 
+/*
+ * Read a page's preparation flags into *buf_state: true if they are
+ * settled at the current generation, so that they hold.  Lock-free: a check
+ * settling them (under the header's spinlock) sets the generation before it
+ * unlocks, so a generation read as current, before flags read unlocked, is
+ * theirs.  Flags read locked may be mid-settle: read again once the header
+ * is unlocked (as briefly as any holder of it keeps it).
+ */
 static inline bool
 BufferSmgrSettled(BufferDesc *buf_hdr, uint64 *buf_state)
 {
@@ -6961,18 +6961,17 @@ UnlockBuffer(Buffer buffer)
 }
 
 /*
- * Pages a storage manager prepares before they change (BM_SMGR_PREPARES),
- * so that a page it shares with another relation is copied first.  Whether
- * a page is to be prepared is settled at its relation's generation of
- * sharing (BufferSmgrGenerationOf()), which the buffer records (smgr_gen): the storage
+ * Pages a storage manager prepares before they change (BM_SMGR_PREPARES), so
+ * that a page it shares with another relation is copied first.  Whether a page
+ * is to be prepared is settled at its relation's generation of sharing
+ * (BufferSmgrGenerationOf()), which the buffer records (smgr_gen): the storage
  * manager raises the generation when it begins sharing pages with another
- * relation (MarkRelationPagesShared()), so that every page settled
- * before then is checked again before it next changes, without visiting
- * them.  A page loaded is settled at no generation.  A check settles it:
- * found shared, it keeps BM_SMGR_PREPARE, with BM_SMGR_SHARED, until a
- * change copies it; found not shared but to be copied all the same (for the
- * storage manager's own reasons), it keeps it with BM_SMGR_OWN; else it
- * loses it.
+ * relation (MarkRelationPagesShared()), so that every page settled before then
+ * is checked again before it next changes, without visiting them.  A page
+ * loaded is settled at no generation.  A check settles it: found shared, it
+ * keeps BM_SMGR_PREPARE, with BM_SMGR_SHARED, until a change copies it; found
+ * not shared but to be copied all the same (for the storage manager's own
+ * reasons), it keeps it with BM_SMGR_OWN; else it loses it.
  *
  * A check notes the generation as it begins, and one that ends at a later
  * generation leaves the page as it was, unsettled: its answer may predate
@@ -7192,16 +7191,15 @@ BufferPageIsSharedElsewhere(Buffer buffer)
  * MarkRelationPagesShared -- have every cached page of relation rel be
  * prepared again before it next changes
  *
- * For a storage manager that has just begun sharing rel's pages with
- * another relation: pages already prepared (or found not shared) would
- * otherwise change in place.  The storage manager publishes the share in
- * its own state first, so that a check begun after the raise sees the
- * share; one begun before it sees the old generation at its end and leaves
- * the page unsettled (BufferSmgrSettle()).  O(1): it raises rel's generation of sharing,
- * at which every page of rel (and of the relations whose generation shares
- * its slot) is checked again (BufferNeedsSmgrPrepare()), each page's next
- * change paying the storage manager's check; other relations' writers go
- * on as they were.
+ * For a storage manager that has just begun sharing rel's pages with another
+ * relation: pages already prepared (or found not shared) would otherwise
+ * change in place.  The storage manager publishes the share in its own state
+ * first, so that a check begun after the raise sees the share; one begun
+ * before it sees the old generation at its end and leaves the page unsettled
+ * (BufferSmgrSettle()).  O(1): it raises rel's generation of sharing, at which
+ * every page of rel (and of the relations whose generation shares its slot) is
+ * checked again (BufferNeedsSmgrPrepare()), each page's next change paying the
+ * storage manager's check; other relations' writers go on as they were.
  */
 void
 MarkRelationPagesShared(RelFileLocator rel)
