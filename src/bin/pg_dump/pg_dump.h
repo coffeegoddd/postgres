@@ -186,6 +186,7 @@ typedef struct _namespaceInfo
 	DumpableObject dobj;
 	DumpableAcl dacl;
 	bool		create;			/* CREATE SCHEMA, or just set owner? */
+	bool		versioned;		/* a versioned schema (one per branch)? */
 	Oid			nspowner;		/* OID of owner */
 	const char *rolname;		/* name of owner */
 } NamespaceInfo;

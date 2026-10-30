@@ -6052,18 +6052,36 @@ getNamespaces(Archive *fout)
 	int			i_nspowner;
 	int			i_nspacl;
 	int			i_acldefault;
+	int			i_versioned;
+	bool		branched;
 
 	query = createPQExpBuffer();
+
+	/*
+	 * A server with versioned schemas has pg_namespace.nspbranch: a schema
+	 * is versioned if its row belongs to a branch.  The dump has the
+	 * session's branch's rows, and makes them on the branch the restore
+	 * runs on.
+	 */
+	res = ExecuteSqlQuery(fout,
+						  "SELECT 1 FROM pg_catalog.pg_attribute "
+						  "WHERE attrelid = 'pg_catalog.pg_namespace'::pg_catalog.regclass "
+						  "AND attname = 'nspbranch'",
+						  PGRES_TUPLES_OK);
+	branched = PQntuples(res) > 0;
+	PQclear(res);
 
 	/*
 	 * we fetch all namespaces including system ones, so that every object we
 	 * read in can be linked to a containing namespace.
 	 */
-	appendPQExpBufferStr(query, "SELECT n.tableoid, n.oid, n.nspname, "
-						 "n.nspowner, "
-						 "n.nspacl, "
-						 "acldefault('n', n.nspowner) AS acldefault "
-						 "FROM pg_namespace n");
+	appendPQExpBuffer(query, "SELECT n.tableoid, n.oid, n.nspname, "
+					  "n.nspowner, "
+					  "n.nspacl, "
+					  "acldefault('n', n.nspowner) AS acldefault, "
+					  "%s AS versioned "
+					  "FROM pg_namespace n",
+					  branched ? "n.nspbranch <> 0" : "false");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -6077,6 +6095,7 @@ getNamespaces(Archive *fout)
 	i_nspowner = PQfnumber(res, "nspowner");
 	i_nspacl = PQfnumber(res, "nspacl");
 	i_acldefault = PQfnumber(res, "acldefault");
+	i_versioned = PQfnumber(res, "versioned");
 
 	for (i = 0; i < ntups; i++)
 	{
@@ -6094,6 +6113,7 @@ getNamespaces(Archive *fout)
 		nspowner = PQgetvalue(res, i, i_nspowner);
 		nsinfo[i].nspowner = atooid(nspowner);
 		nsinfo[i].rolname = getRoleName(nspowner);
+		nsinfo[i].versioned = PQgetvalue(res, i, i_versioned)[0] == 't';
 
 		/* Decide whether to dump this namespace */
 		selectDumpableNamespace(&nsinfo[i], fout);
@@ -11828,7 +11848,8 @@ dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo)
 	if (nspinfo->create)
 	{
 		appendPQExpBuffer(delq, "DROP SCHEMA %s;\n", qnspname);
-		appendPQExpBuffer(q, "CREATE SCHEMA %s;\n", qnspname);
+		appendPQExpBuffer(q, "CREATE SCHEMA %s%s;\n", qnspname,
+						  nspinfo->versioned ? " VERSIONED" : "");
 	}
 	else
 	{
