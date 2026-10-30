@@ -5971,7 +5971,8 @@ unfollowed_pending(XLogRecPtr checkpointed)
  * poisoned slot) since the last checkpoint began.  A store with no slot
  * had none in flight (a slot is let go of only with none, and unpoisoned),
  * but for the flushes no slot follows, while which no store is written out
- * (unfollowed_pending()).  WAL makes the blocks durable (bmapshare()): a
+ * (unfollowed_pending()).  The share made the blocks durable (bmapshare(),
+ * syncing them or logging their images): the write is needed because a
  * relation made of the share reads the blocks, which must hold the pages
  * by then.
  */
@@ -5993,7 +5994,9 @@ store_written_out(RelFileLocator rel)
 /*
  * As the transaction ends: the flushes of its shares' and captures' own
  * blocks still in flight (an error part way) are given up.  Nothing is
- * synced: WAL makes the shared blocks durable (bmapshare()).
+ * synced here: a share that completes makes its blocks durable itself
+ * (bmapshare(), syncing them or logging their images), and one given up
+ * part way left no copy that reads them.
  */
 void
 bmapsyncshares(bool isCommit)
