@@ -75,6 +75,31 @@ jobs:
             **/output_iso/regression.diffs
           if-no-files-found: ignore
 
+  # Every core file the fork changes must be in the patch inventory, which
+  # is what keeps merging upstream releases routine.  The check diffs the
+  # tree against its merge base with postgres/master, so it needs the
+  # history of both (but no file contents: diffing names needs trees only).
+  patch-inventory:
+    name: patch inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Fetch postgres/master
+        run: |
+          git fetch --no-tags --filter=blob:none https://github.com/postgres/postgres.git \
+            +master:refs/remotes/postgres/master
+
+      - name: Tests of the inventory check
+        run: src/tools/prolly/test_check_patch_inventory.sh
+
+      - name: Check the patch inventory
+        run: src/tools/prolly/check_patch_inventory.sh
+
   # The tree also builds with meson; a build file that only one of the two
   # systems knows about breaks the other, so both are built on every change.
   meson-build:
