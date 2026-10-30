@@ -12,6 +12,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+# (pg_upgrade writes its scripts and logs to the directory it runs in)
+chdir PostgreSQL::Test::Utils::tempdir;
+
 for my $mode ('--copy', '--link', '--swap')
 {
 	(my $suffix = $mode) =~ s/^--/_/;
