@@ -5,7 +5,13 @@
 # the pull request, which is merged as a merge commit like any other sync.
 # A merge with other conflicts, or any other failure, files an issue
 # instead (or comments on the open one), for a person to sync by hand with
-# the same script.
+# the same script.  A re-run while a sync is under way (its branch exists
+# or an upstream-sync pull request is open) does nothing.
+#
+# Unless the repository allows Actions to create pull requests, or the
+# PROLLY_SYNC_TOKEN secret is set, GitHub refuses the workflow's token the
+# pull request; the merged branch is then pushed and tested, and an issue
+# links the page to open the pull request by hand.
 #
 # Pull requests opened with the workflow's own token do not start other
 # workflows, so unless the PROLLY_SYNC_TOKEN secret holds a token that may,
@@ -59,31 +65,56 @@ jobs:
           src/tools/prolly/upstream_sync.sh --push --date "$date" 2>&1 | tee sync.log
           status=${PIPESTATUS[0]}
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          # 0: merged and opened; 3: nothing to merge; anything else is
-          # reported by the next step
+          # (the exit statuses are upstream_sync.sh's; the steps below act
+          # on them)
           exit 0
 
+      # (status 5: the merge is clean and pushed, but this token may not
+      # open pull requests; the branch is tested all the same)
       - name: Run the prolly workflow on the sync branch
-        if: steps.sync.outputs.status == '0' && env.HAS_SYNC_TOKEN != 'true'
+        if: (steps.sync.outputs.status == '0' && env.HAS_SYNC_TOKEN != 'true') || steps.sync.outputs.status == '5'
         run: gh workflow run prolly.yml --repo "$GITHUB_REPOSITORY" --ref "${{ steps.sync.outputs.branch }}"
 
+      # Status 3 (nothing to merge) and 4 (a sync already under way) need
+      # nobody.
       - name: Report a sync that needs a person
-        if: steps.sync.outputs.status != '0' && steps.sync.outputs.status != '3'
+        if: steps.sync.outputs.status != '0' && steps.sync.outputs.status != '3' && steps.sync.outputs.status != '4'
+        env:
+          STATUS: ${{ steps.sync.outputs.status }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
         run: |
-          title="Upstream sync needs a manual merge"
-          {
-            echo "The weekly upstream sync ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) could not finish on its own (exit status ${{ steps.sync.outputs.status }}):"
-            echo
-            echo '```'
-            tail -n 60 sync.log
-            echo '```'
-            echo
-            echo 'Run `src/tools/prolly/upstream_sync.sh` in a checkout, resolve the conflicts on the sync branch, push it and open its pull request; merge it as a merge commit.'
-          } > report.md
-          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$STATUS" = 5 ]; then
+            title="Upstream sync pull request needs opening by hand"
+            {
+              echo "The weekly upstream sync ($run_url) merged postgres/master cleanly and pushed \`$BRANCH\`, but GitHub did not let the workflow's token open the pull request."
+              echo
+              echo "Open it here, and merge it as a merge commit: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/master...$BRANCH?expand=1"
+              echo
+              echo "The prolly workflow was started on the branch, so its checks are on the branch's head commit."
+              echo
+              echo "To let future syncs open their pull requests, either:"
+              echo
+              echo "- turn on **Allow GitHub Actions to create and approve pull requests** (Settings → Actions → General → Workflow permissions), or"
+              echo "- add a \`PROLLY_SYNC_TOKEN\` repository secret holding a token with the \`repo\` and \`workflow\` scopes, which also lets a sync push upstream changes to workflow files and start the pull request's own checks."
+            } > report.md
+          else
+            title="Upstream sync needs a manual merge"
+            {
+              echo "The weekly upstream sync ($run_url) could not finish on its own (exit status $STATUS):"
+              echo
+              echo '```'
+              tail -n 60 sync.log
+              echo '```'
+              echo
+              echo 'Run `src/tools/prolly/upstream_sync.sh` in a checkout, resolve the conflicts on the sync branch, push it and open its pull request; merge it as a merge commit.'
+            } > report.md
+          fi
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file report.md
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file report.md
           fi
-          exit 1
+          # (a sync that needs opening by hand is otherwise done)
+          [ "$STATUS" = 5 ]

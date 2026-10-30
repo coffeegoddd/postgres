@@ -29,12 +29,19 @@
 # The second form prints THEIRS with CATALOG_VERSION_NO set one past the
 # larger of the two files' values; the sync uses it to resolve catversion.h.
 #
-# Exit status: 0 when the sync branch is made (and, with --push, pushed
-# with its pull request open); 3 when master already contains
-# postgres/master and there is nothing to merge; 2 when the merge has
-# conflicts this script cannot resolve, in which case the merge is
-# abandoned, the branch deleted and the conflicting files printed; 1 on
-# any other error.
+# Exit status:
+#	0	the sync branch is made (and, with --push, pushed with its pull
+#		request open)
+#	1	any other error
+#	2	the merge has conflicts this script cannot resolve; the merge is
+#		abandoned, the branch deleted and the conflicting files printed
+#	3	master already contains postgres/master: nothing to merge
+#	4	a sync is already under way: today's sync branch exists, here or
+#		on origin, or (with --push) an upstream-sync-* pull request is
+#		open; nothing is changed
+#	5	(with --push) the merge was clean and the branch is pushed, but
+#		GitHub refused to let this token open the pull request; the
+#		compare URL to open it by hand is printed
 #
 # src/tools/prolly/upstream_sync.sh
 
@@ -118,11 +125,31 @@ if git merge-base --is-ancestor "$upstream_rev" origin/master; then
 	exit 3
 fi
 
+# A sync already under way is left alone, whether this is a re-run of the
+# same day's or an earlier one's pull request is still open: a second
+# branch would only conflict with it.
 if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
-	die "branch $branch already exists"
+	echo "branch $branch already exists; a sync is under way"
+	exit 4
 fi
-if [ -n "$(git ls-remote --heads origin "$branch")" ]; then
-	die "branch $branch already exists on origin"
+if ! remote_branch=$(git ls-remote --heads origin "$branch"); then
+	die "cannot list origin's branches"
+fi
+if [ -n "$remote_branch" ]; then
+	echo "branch $branch already exists on origin; a sync is under way"
+	exit 4
+fi
+if $push; then
+	if ! open_syncs=$(gh pr list --repo "$FORK_REPO" --state open --limit 100 \
+		--json headRefName --jq '.[].headRefName' | grep '^upstream-sync-'); then
+		# (grep finds nothing, or gh failed: tell them apart)
+		gh pr list --repo "$FORK_REPO" --state open --limit 1 >/dev/null ||
+			die "cannot list $FORK_REPO's open pull requests"
+	fi
+	if [ -n "$open_syncs" ]; then
+		echo "an upstream sync pull request is already open (from $(head -n 1 <<<"$open_syncs")); merge or close it first"
+		exit 4
+	fi
 fi
 
 start=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
@@ -175,11 +202,22 @@ fi
 
 if $push; then
 	git push --quiet origin "$branch" || die "cannot push $branch"
-	gh pr create --repo "$FORK_REPO" --base master --head "$branch" \
-		--title "Upstream sync $date" \
-		--body "Merges postgres/postgres master ($(git rev-parse --short "$upstream_rev"), $ncommits commits) into the fork, made by \`src/tools/prolly/upstream_sync.sh\`.
+	title="Upstream sync $date"
+	body="Merges postgres/postgres master ($(git rev-parse --short "$upstream_rev"), $ncommits commits) into the fork, made by \`src/tools/prolly/upstream_sync.sh\`.
 
-**Merge this pull request with a merge commit.**  Squashing or rebasing it would rewrite upstream's commits and break the next sync's merge base." ||
+**Merge this pull request with a merge commit.**  Squashing or rebasing it would rewrite upstream's commits and break the next sync's merge base."
+	if ! create_out=$(gh pr create --repo "$FORK_REPO" --base master --head "$branch" \
+		--title "$title" --body "$body" 2>&1); then
+		echo "$create_out" >&2
+		# A workflow's own token may not open pull requests unless the
+		# repository allows it; the branch is ready all the same.
+		if grep -q "not permitted to create or approve pull requests" <<<"$create_out"; then
+			echo "merged and pushed $branch, but this token may not open pull requests; open it by hand, as a merge commit:"
+			echo "  https://github.com/$FORK_REPO/compare/master...$branch?expand=1"
+			exit 5
+		fi
 		die "pushed $branch, but cannot open its pull request"
+	fi
+	echo "$create_out"
 fi
 exit 0

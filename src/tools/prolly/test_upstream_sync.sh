@@ -118,6 +118,52 @@ run_sync()
 	(cd "$work/clone" && "$sync" --date "$1" >"$work/sync-$1.log" 2>&1)
 }
 
+# A stand-in for gh, for the syncs with --push: "pr list" prints the head
+# branches in GH_STUB_OPEN_HEADS, and "pr create" logs its arguments and
+# then succeeds, or fails as GH_STUB_CREATE says ("refuse": as GitHub does
+# when the token may not open pull requests; "error": some other way).
+mkdir -p "$work/bin"
+cat >"$work/bin/gh" <<'STUB'
+#!/bin/bash
+echo "gh $*" >>"$GH_STUB_LOG"
+case "$1 $2" in
+	"pr list")
+		[ -n "${GH_STUB_OPEN_HEADS:-}" ] && printf '%s\n' $GH_STUB_OPEN_HEADS
+		exit 0 ;;
+	"pr create")
+		case "${GH_STUB_CREATE:-ok}" in
+			ok) echo "https://github.com/coffeegoddd/postgres/pull/1"; exit 0 ;;
+			refuse) echo "pull request create failed: GraphQL: GitHub Actions is not permitted to create or approve pull requests (createPullRequest)" >&2; exit 1 ;;
+			*) echo "HTTP 502" >&2; exit 1 ;;
+		esac ;;
+esac
+echo "unexpected gh call: $*" >&2
+exit 1
+STUB
+chmod +x "$work/bin/gh"
+export GH_STUB_LOG="$work/gh.log"
+
+# run_push_sync DATE [VAR=VALUE...]: a sync with --push, gh stubbed.
+run_push_sync()
+{
+	local date=$1
+
+	shift
+	: >"$GH_STUB_LOG"
+	(cd "$work/clone" && env PATH="$work/bin:$PATH" "$@" \
+		"$sync" --push --date "$date" >"$work/sync-$date.log" 2>&1)
+}
+
+# expect_status NAME WANT GOT LOG
+expect_status()
+{
+	if [ "$3" -eq "$2" ]; then
+		ok "$1"
+	else
+		not_ok "$1 (exit $3, expected $2)" "$(cat "$4")"
+	fi
+}
+
 # nothing to merge
 run_sync 2026-01-01
 check "nothing to merge exits 3" [ $? -eq 3 ]
@@ -151,7 +197,7 @@ git -C "$work/clone" switch --quiet master
 printf 'zero\none\ntwo\nthree\nfour\n' >"$work/up/core.c"
 upstream_commit "upstream prepends a line"
 run_sync 2026-01-02
-check "a second sync branch for one day is refused" [ $? -eq 1 ]
+check "a second sync for one day is skipped as under way (exit 4)" [ $? -eq 4 ]
 
 # Land the first sync on the fork's master, as merging its pull request
 # would, so later syncs start from it.
@@ -181,6 +227,51 @@ resolution_committed()
 }
 check "the resolution is committed as the merge" resolution_committed
 check "the upstream change of that sync is merged too" grep -q zero "$work/clone/core.c"
+
+# --- syncs that push and open the pull request ----------------------------
+
+git -C "$work/clone" push --quiet origin upstream-sync-2026-01-03:master
+git -C "$work/clone" fetch --quiet origin
+git -C "$work/clone" switch --quiet master
+git -C "$work/clone" reset --quiet --hard origin/master
+echo new >"$work/up/up_new.c"
+upstream_commit "upstream adds a file"
+
+# an open sync pull request: skipped before anything is made
+run_push_sync 2026-01-06 GH_STUB_OPEN_HEADS="feature/x upstream-sync-2025-12-29"
+expect_status "an open sync pull request skips the sync (exit 4)" 4 $? "$work/sync-2026-01-06.log"
+check "the skip makes no branch" \
+	[ -z "$(git -C "$work/clone" branch --list upstream-sync-2026-01-06)" ]
+check "the skip opens no pull request" bash -c "! grep -q 'pr create' '$GH_STUB_LOG'"
+
+# GitHub refuses the token a pull request: the pushed branch is reported
+run_push_sync 2026-01-06 GH_STUB_CREATE=refuse
+expect_status "a refused pull request after a clean merge exits 5" 5 $? "$work/sync-2026-01-06.log"
+check "the branch is pushed for opening by hand" \
+	[ -n "$(git -C "$work/clone" ls-remote --heads origin upstream-sync-2026-01-06)" ]
+check "the compare URL to open it is printed" \
+	grep -q 'https://github.com/coffeegoddd/postgres/compare/master\.\.\.upstream-sync-2026-01-06?expand=1' \
+	"$work/sync-2026-01-06.log"
+
+# a re-run that day finds the branch: skipped, not a failure
+git -C "$work/clone" switch --quiet master
+git -C "$work/clone" branch --quiet -D upstream-sync-2026-01-06
+run_push_sync 2026-01-06
+expect_status "a re-run finding the branch on origin skips (exit 4)" 4 $? "$work/sync-2026-01-06.log"
+
+# any other failure to open the pull request is an error
+run_push_sync 2026-01-07 GH_STUB_CREATE=error
+expect_status "another pull request failure exits 1" 1 $? "$work/sync-2026-01-07.log"
+
+# the pull request is opened
+git -C "$work/clone" switch --quiet master
+run_push_sync 2026-01-08
+expect_status "a pushed sync opens its pull request (exit 0)" 0 $? "$work/sync-2026-01-08.log"
+check "the pull request is opened on the fork, from the sync branch to master" \
+	grep -q -- '--repo coffeegoddd/postgres --base master --head upstream-sync-2026-01-08' "$GH_STUB_LOG"
+check "the pushed branch is the merge" \
+	[ "$(git -C "$work/clone" ls-remote --heads origin upstream-sync-2026-01-08 | cut -f1)" = \
+	  "$(git -C "$work/clone" rev-parse upstream-sync-2026-01-08)" ]
 
 # a conflict elsewhere: the merge is abandoned and reported
 git -C "$work/clone" switch --quiet master
