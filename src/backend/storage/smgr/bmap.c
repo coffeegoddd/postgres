@@ -5816,34 +5816,58 @@ redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
 	return PageIsVerified(dst, blk, 0, NULL);
 }
 
+/* the nodes, and count pages, redo's walk of a capture or a share read */
+static uint32 redo_walk_nodes = 0;
+static uint32 redo_walk_ref_pages = 0;
+
+/*
+ * The count page redo's walk read last, and the count file's length, for
+ * the lookups after it (redo_lookup_ref()).  A walk's blocks are mostly on
+ * few count pages, a page counting BMAP_REFS_PER_PAGE blocks, so each is
+ * read once, not once a block.  Nothing changes a count page during a walk,
+ * which only reads.
+ */
+typedef struct RedoRefsPage
+{
+	BlockNumber pageno;			/* InvalidBlockNumber: none read */
+	BlockNumber nblocks;		/* InvalidBlockNumber: not asked */
+	bool		usable;			/* read as one replay has reached */
+	PGIOAlignedBlock page;
+} RedoRefsPage;
+
 /*
  * In redo, the count of 'phys' into *count, as lookup_ref() reads it; false
  * if its page can't be read as one replay has reached (redo_walk_read()),
- * isn't a count page, or is newer than 'lsn' (see redo_own_blocks()).
+ * isn't a count page, or is newer than 'lsn' (see redo_own_blocks()).  The
+ * page read is kept in 'rp' for the next lookup.
  */
 static bool
 redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
-				uint32 *count)
+				RedoRefsPage *rp, uint32 *count)
 {
-	PGIOAlignedBlock page;
-
 	*count = 0;
-	if (REF_PAGE(phys) >= refs_nblocks(rel))
+	if (rp->nblocks == InvalidBlockNumber)
+		rp->nblocks = refs_nblocks(rel);
+	if (REF_PAGE(phys) >= rp->nblocks)
 		return true;
-	if (!redo_walk_read(with_relnumber(rel, BMAP_REFS_RELNUMBER),
-						REF_PAGE(phys), page.data))
+	if (rp->pageno != REF_PAGE(phys))
+	{
+		rp->pageno = REF_PAGE(phys);
+		rp->usable = redo_walk_read(with_relnumber(rel, BMAP_REFS_RELNUMBER),
+									rp->pageno, rp->page.data);
+		redo_walk_ref_pages++;
+	}
+	if (!rp->usable)
 		return false;
 	/* (a page extended and never written counts none) */
-	if (PageIsNew(page.data))
+	if (PageIsNew(rp->page.data))
 		return true;
-	if (!map_page_is(page.data, BMAP_PAGE_REFS) || PageGetLSN(page.data) > lsn)
+	if (!map_page_is(rp->page.data, BMAP_PAGE_REFS) ||
+		PageGetLSN(rp->page.data) > lsn)
 		return false;
-	*count = page_ref(page.data, phys);
+	*count = page_ref(rp->page.data, phys);
 	return true;
 }
-
-/* the nodes redo's walk of a capture or a share read (redo_own_blocks()) */
-static uint32 redo_walk_nodes = 0;
 
 /*
  * The shares redo has seen the tree's record of and not yet the record
@@ -5908,7 +5932,8 @@ redo_share_tops(RelFileLocator dst, xl_bmap_top *tops)
 static bool
 redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 			  BlockNumber first, BlockNumber nblocks, BlockNumber vm_nblocks,
-			  uint32 epoch, XLogRecPtr lsn, uint32 held_more, BlockList *own)
+			  uint32 epoch, XLogRecPtr lsn, uint32 held_more, RedoRefsPage *rp,
+			  BlockList *own)
 {
 	PGIOAlignedBlock page;
 	BmapEntry  *entries;
@@ -5920,7 +5945,7 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 		return true;
 	if (ptr->epoch < epoch)
 	{
-		if (!redo_lookup_ref(rel, ptr->block, lsn, &count))
+		if (!redo_lookup_ref(rel, ptr->block, lsn, rp, &count))
 			return false;
 		if (count < held_more)
 			return false;
@@ -5948,8 +5973,8 @@ redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
 		if (level > 0)
 			ok = redo_own_node(rel, &entries[i], level - 1,
 							   (BlockNumber) child, nblocks, vm_nblocks, epoch,
-							   lsn, 0, own);
-		else if (!redo_lookup_ref(rel, entries[i].block, lsn, &count))
+							   lsn, 0, rp, own);
+		else if (!redo_lookup_ref(rel, entries[i].block, lsn, rp, &count))
 			ok = false;
 		else if (count == 0)
 			block_list_add(own, (BlockNumber) child);
@@ -5992,8 +6017,13 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 
 	/* (the map's epoch before the capture raised it) */
 	uint32		epoch = snap->epoch - 1;
+	RedoRefsPage *rp = palloc(sizeof(RedoRefsPage));
+	bool		ok = true;
 
+	rp->pageno = InvalidBlockNumber;
+	rp->nblocks = InvalidBlockNumber;
 	redo_walk_nodes = 0;
+	redo_walk_ref_pages = 0;
 
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
@@ -6006,12 +6036,16 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 			top.since = snap->tops[k].since;
 			if (!redo_own_node(rel, &top, k, (BlockNumber) first,
 							   snap->nblocks, snap->vm_nblocks, epoch, lsn,
-							   tops_held ? 1 : 0, own))
-				return false;
+							   tops_held ? 1 : 0, rp, own))
+			{
+				ok = false;
+				break;
+			}
 		}
 		first += tree_span(k);
 	}
-	return true;
+	pfree(rp);
+	return ok;
 }
 
 /*
@@ -15995,9 +16029,9 @@ bmap_redo(XLogReaderState *record)
 
 					if (walked)
 					{
-						elog(DEBUG1, "redo of a capture of %s writes out its own pages: %u, found reading %u nodes of its map",
+						elog(DEBUG1, "redo of a capture of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages",
 							 relpathperm(xlrec->locator, MAIN_FORKNUM).str,
-							 own.n, redo_walk_nodes);
+							 own.n, redo_walk_nodes, redo_walk_ref_pages);
 						flush_own_blocks(reln, &own);
 					}
 					else
@@ -16192,9 +16226,9 @@ bmap_redo(XLogReaderState *record)
 				 */
 				if (why == NULL)
 				{
-					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map",
+					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages",
 						 relpathperm(xlrec->src, MAIN_FORKNUM).str,
-						 own.n, redo_walk_nodes);
+						 own.n, redo_walk_nodes, redo_walk_ref_pages);
 					flush_own_blocks(src, &own);
 				}
 				else

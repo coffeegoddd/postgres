@@ -57,6 +57,12 @@ ok( !$standby->log_contains(
 		qr/redo of a share of \Q$path\E writes out every buffer of it/,
 		$log_offset),
 	'visiting no other buffer');
+# Each count page is read once by the walk, not once for every block it
+# counts: the source's few dozen blocks are counted on one or two pages.
+my ($ref_pages) = slurp_file($standby->logfile, $log_offset) =~
+  /redo of a share of \Q$path\E writes out its own pages: \d+, found reading \d+ nodes of its map and (\d+) count pages/;
+ok(defined $ref_pages && $ref_pages <= 2,
+	'reading each count page once (' . ($ref_pages // 'none') . " for $pages pages)");
 is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'the standby\'s copy reads the source\'s pages');
 
