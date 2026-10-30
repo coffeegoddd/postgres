@@ -125,8 +125,13 @@ This hybrid storage approach has four key parts:
 - **The window.**  A configurable stretch of history in which
   version-control operations are guaranteed to be efficient, at the cost of
   the storage it takes.  Its bounds are set by commits, size or time, or a
-  combination of them.  History that falls outside it is moved to an
-  archive or a remote, or discarded.
+  combination of them.  Operations at a commit outside the window still
+  work, but pay the full cost of materializing that commit's prolly tree
+  as the restored working set.  History can also be truncated to the
+  window, in one of two ways.  Commits beyond it can be moved off the
+  server, to an archive or a remote, and attached again later.  Or
+  history can be rewritten, squashing everything beyond the window into a
+  new root commit at its boundary.
 
 The following are the core features this approach enables:
 
