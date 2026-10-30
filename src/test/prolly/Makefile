@@ -23,6 +23,15 @@
 #
 #-------------------------------------------------------------------------
 
+# The modules Postgres's recovery suite loads.  check-upstream-bmap runs that
+# suite in a recursive make, where its own Makefile's EXTRA_INSTALL does not
+# reach the temporary installation built here once for every suite.
+EXTRA_INSTALL = contrib/pg_prewarm \
+	contrib/pg_stat_statements \
+	contrib/test_decoding \
+	src/test/modules/injection_points \
+	src/test/modules/test_wait_lsn
+
 subdir = src/test/prolly
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
