@@ -716,6 +716,8 @@ GetLockMethodLocalHash(void)
 /*
  * LockHasWaiters -- look up 'locktag' and check if releasing this
  *		lock would wake up other processes waiting for it.
+ *
+ * The lock may have been taken by the fast path.
  */
 bool
 LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
@@ -761,6 +763,27 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		elog(WARNING, "you don't own a lock of type %s",
 			 lockMethodTable->lockModeNames[lockmode]);
 		return false;
+	}
+
+	/*
+	 * A lock taken by the fast path has no lock object or proclock of ours.
+	 * A strong locker transfers it to the shared lock table before it
+	 * waits, without telling us, so there can be waiters only if the lock
+	 * object is found there now, their modes in its waitMask.
+	 */
+	if (locallock->lock == NULL)
+	{
+		partitionLock = LockHashPartitionLock(locallock->hashcode);
+		LWLockAcquire(partitionLock, LW_SHARED);
+		lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+													&locallock->tag.lock,
+													locallock->hashcode,
+													HASH_FIND, NULL);
+		if (lock != NULL &&
+			(lockMethodTable->conflictTab[lockmode] & lock->waitMask) != 0)
+			hasWaiters = true;
+		LWLockRelease(partitionLock);
+		return hasWaiters;
 	}
 
 	/*
