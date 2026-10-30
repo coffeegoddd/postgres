@@ -270,15 +270,44 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 			continue;
 		smgrcreate(srel, fork, false);
 		log_smgrcreate(&srel->smgr_rlocator.locator, fork);
-		RelationCopyStorage(src, srel, fork, RELPERSISTENCE_PERMANENT);
+		RelationCopyMapFork(src, srel, fork);
 	}
 
 	/*
 	 * No pending sync, even when WAL is skipped for new relations: the share
-	 * is logged (its source's own blocks as images), and syncing or logging
-	 * the new relation at commit could write every page it shares.
+	 * is logged (its source's own blocks as images), as are the maps' pages
+	 * (RelationCopyMapFork()), and syncing or logging the new relation at
+	 * commit could write every page it shares.
 	 */
 	return srel;
+}
+
+/*
+ * RelationCopyMapFork
+ *		Copy a map fork (free space or visibility) of a permanent relation
+ *		into the same fork, just created, of storage made without
+ *		RelationCreateStorage().
+ *
+ * RelationCopyStorage() logs the pages and syncs them, but at
+ * wal_level=minimal it does neither, leaving the sync to the pending sync
+ * RelationCreateStorage() registers, which shared storage has none of: so
+ * the pages are logged as images here instead, through shared buffers,
+ * which a checkpoint then writes out and syncs.  Until then a crash can't
+ * lose or tear them: redo writes them again.
+ */
+void
+RelationCopyMapFork(SMgrRelation src, SMgrRelation dst, ForkNumber forkNum)
+{
+	Relation	rel;
+
+	Assert(forkNum == FSM_FORKNUM || forkNum == VISIBILITYMAP_FORKNUM);
+	RelationCopyStorage(src, dst, forkNum, RELPERSISTENCE_PERMANENT);
+	if (XLogIsNeeded())
+		return;
+	rel = CreateFakeRelcacheEntry(dst->smgr_rlocator.locator);
+	/* (a map page's bits fill the hole a standard page has: kept) */
+	log_newpage_range(rel, forkNum, 0, smgrnblocks(dst, forkNum), false);
+	FreeFakeRelcacheEntry(rel);
 }
 
 /*

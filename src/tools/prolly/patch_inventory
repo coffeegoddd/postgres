@@ -83,7 +83,7 @@ patch src/include/Makefile     0  installs the engine's headers in src/include/p
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
-patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share
+patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, and the copy of a map fork for one
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
