@@ -9140,10 +9140,16 @@ bmap_made_of(SMgrRelation reln)
  * Either side may be a relation's map (its header's length and root page's
  * pointers, read under share locks, as a lookup reads them) or a root
  * captured into the store (its slot's length and pointers).  Each node is
- * read under a share lock, one at a time, and must be the incarnation its
- * pointer names: the caller keeps the relations from changing, as
- * bmap_changed_pages() requires, and the roots from being let go of, so no
- * node either side reaches is replaced or freed meanwhile.
+ * read under a share lock, one at a time, with no lock held between them,
+ * as a lookup reads them (tree_find()).  A relation may change meanwhile:
+ * a node it holds alone changes in place under its buffer lock, and one it
+ * shares is copied, not changed, so a change gives a mixed result, each
+ * block as it was before the change or as it is after.  A node freed and
+ * made something else under the walk (a truncation or a drop of the
+ * relation, a root let go of) isn't the incarnation its pointer names, and
+ * the diff begins again from both sides as they are then, as a lookup
+ * does; only a node that still isn't after TREE_FIND_TRIES walks is an
+ * error.  The caller holds the roots, which a diff can't stand in for.
  */
 
 /* one side of a diff: a tree's pointers and the length its blocks count to */
@@ -9160,6 +9166,8 @@ typedef struct DiffWalk
 	BlockNumber *blknos;
 	uint32		n;
 	uint32		cap;
+	bool		mismatch;		/* a node wasn't the one its pointer named */
+	BlockNumber mismatched;		/* (its block) */
 } DiffWalk;
 
 static void
@@ -9176,26 +9184,32 @@ diff_add(DiffWalk *dw, BlockNumber blkno)
 
 /*
  * The entries of node 'ptr', of 'level', mapping from 'first', into
- * entries[] (BMAP_TREE_FANOUT of them), read under a share lock.
+ * entries[] (BMAP_TREE_FANOUT of them), read under a share lock.  False,
+ * the walk marked to begin again, if the block isn't that node any more.
  */
-static void
+static bool
 diff_read_node(DiffWalk *dw, const BmapEntry *ptr, uint16 level,
 			   BlockNumber first, BmapEntry *entries)
 {
-	Buffer		buf = tree_read(dw->store, ptr->block, RBM_NORMAL);
+	Buffer		buf;
+	bool		is;
+
+	INJECTION_POINT("bmap-diff-node", NULL);
+	buf = tree_read(dw->store, ptr->block, RBM_NORMAL);
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("block %u of page store \"%s\" is not the node of a block map it was",
-						ptr->block,
-						relpathperm(with_relnumber(dw->store, BMAP_STORE_RELNUMBER),
-									MAIN_FORKNUM).str)));
-	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
-		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	is = tree_node_is(BufferGetPage(buf), level, first, ptr->since);
+	if (is)
+		memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+			   BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	UnlockReleaseBuffer(buf);
+	if (!is)
+	{
+		dw->mismatch = true;
+		dw->mismatched = ptr->block;
+	}
 	CHECK_FOR_INTERRUPTS();
+	return is;
 }
 
 /*
@@ -9232,8 +9246,8 @@ diff_walk_node(DiffWalk *dw, const BmapEntry *const *ptr, uint16 level,
 		/* (the same node is read once, for both) */
 		if (s == 1 && same)
 			memcpy(entries[1], entries[0], BMAP_TREE_FANOUT * sizeof(BmapEntry));
-		else
-			diff_read_node(dw, ptr[s], level, first, entries[s]);
+		else if (!diff_read_node(dw, ptr[s], level, first, entries[s]))
+			goto done;
 	}
 
 	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
@@ -9263,22 +9277,29 @@ diff_walk_node(DiffWalk *dw, const BmapEntry *const *ptr, uint16 level,
 					&entries[s][i] : NULL;
 			if (next[0] != NULL || next[1] != NULL)
 				diff_walk_node(dw, next, level - 1, (BlockNumber) child);
+			if (dw->mismatch)
+				break;
 		}
 	}
+done:
 	for (int s = 0; s < 2; s++)
 		if (entries[s] != NULL)
 			pfree(entries[s]);
 }
 
-/* diff_walk_node() from each pair of the sides' subtrees */
-static uint32
+/*
+ * diff_walk_node() from each pair of the sides' subtrees.  False if a node
+ * wasn't the one its pointer named, nothing kept: the diff begins again.
+ */
+static bool
 diff_walk(RelFileLocator store, const DiffSide *a, const DiffSide *b,
-		  BlockNumber **blknos)
+		  BlockNumber **blknos, uint32 *n, BlockNumber *mismatched)
 {
-	DiffWalk	dw = {store, {a->nblocks, b->nblocks}, NULL, 0, 0};
+	DiffWalk	dw = {store, {a->nblocks, b->nblocks}, NULL, 0, 0, false,
+	InvalidBlockNumber};
 	uint64		first = 0;
 
-	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	for (int k = 0; k < BMAP_TREE_TOPS && !dw.mismatch; k++)
 	{
 		const BmapEntry *ptr[2];
 
@@ -9290,8 +9311,28 @@ diff_walk(RelFileLocator store, const DiffSide *a, const DiffSide *b,
 			diff_walk_node(&dw, ptr, k, (BlockNumber) first);
 		first += tree_span(k);
 	}
+	if (dw.mismatch)
+	{
+		if (dw.blknos)
+			pfree(dw.blknos);
+		*mismatched = dw.mismatched;
+		return false;
+	}
 	*blknos = dw.blknos;
-	return dw.n;
+	*n = dw.n;
+	return true;
+}
+
+/* a diff's walks have found a node not the one its pointer named too often */
+static void
+diff_mismatched(RelFileLocator store, BlockNumber block)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("block %u of page store \"%s\" is not the node of a block map it was",
+					block,
+					relpathperm(with_relnumber(store, BMAP_STORE_RELNUMBER),
+								MAIN_FORKNUM).str)));
 }
 
 /* reln's side of a diff: its header's length and its root page's pointers */
@@ -9349,8 +9390,9 @@ diff_check_store(RelFileLocator a, RelFileLocator b)
  * The logical blocks a's and b's maps, of one page store, map to different
  * physical blocks, or that one maps under its length and the other doesn't
  * under its own, into *blknos (palloc'd, ascending): how many.  Blocks
- * past both lengths don't count.  The caller keeps both relations from
- * changing.  It reads each map's header and root page, and the nodes
+ * past both lengths don't count.  A change of either relation meanwhile
+ * gives a mixed result, each block as before the change or as after, not
+ * an error (see the walk's comment above).  It reads each map's header and root page, and the nodes
  * whose pointers differ between the maps: those on the paths down to the
  * pages that differ, which copy-on-write made each map's own, and those
  * mapping blocks between the two lengths.  So it costs O(the pages that
@@ -9361,30 +9403,52 @@ diff_check_store(RelFileLocator a, RelFileLocator b)
 uint32
 bmap_diff(SMgrRelation a, SMgrRelation b, BlockNumber **blknos)
 {
-	DiffSide	sa;
-	DiffSide	sb;
+	RelFileLocator store = a->smgr_rlocator.locator;
+	BlockNumber mismatched = InvalidBlockNumber;
+	uint32		n;
 
-	diff_check_store(a->smgr_rlocator.locator, b->smgr_rlocator.locator);
-	diff_side_of(a, &sa);
-	diff_side_of(b, &sb);
-	return diff_walk(a->smgr_rlocator.locator, &sa, &sb, blknos);
+	diff_check_store(store, b->smgr_rlocator.locator);
+	for (int tries = 0; tries < TREE_FIND_TRIES; tries++)
+	{
+		DiffSide	sa;
+		DiffSide	sb;
+
+		diff_side_of(a, &sa);
+		diff_side_of(b, &sb);
+		if (diff_walk(store, &sa, &sb, blknos, &n, &mismatched))
+			return n;
+	}
+	diff_mismatched(store, mismatched);
+	return 0;					/* keep compiler quiet */
 }
 
 /*
  * bmap_diff() of a's map and root 'id' of its page store, held as this
  * transaction sees it and kept held by the caller: the blocks a changed
- * since the root was captured of it, for one.
+ * since the root was captured of it, for one.  Every change of a page the
+ * root holds copies it first, VACUUM's included: a page shared only with
+ * roots of the relation is vacuumed as the relation's own, which copies it
+ * and leaves the root its version, so it is found here like any other.
  */
 uint32
 bmap_diff_root(SMgrRelation a, BmapRootId id, BlockNumber **blknos)
 {
 	RelFileLocator store = a->smgr_rlocator.locator;
-	DiffSide	sa;
-	DiffSide	sb;
+	BlockNumber mismatched = InvalidBlockNumber;
+	uint32		n;
 
-	diff_side_of_root(store, id, &sb);
-	diff_side_of(a, &sa);
-	return diff_walk(store, &sa, &sb, blknos);
+	for (int tries = 0; tries < TREE_FIND_TRIES; tries++)
+	{
+		DiffSide	sa;
+		DiffSide	sb;
+
+		diff_side_of_root(store, id, &sb);
+		diff_side_of(a, &sa);
+		if (diff_walk(store, &sa, &sb, blknos, &n, &mismatched))
+			return n;
+	}
+	diff_mismatched(store, mismatched);
+	return 0;					/* keep compiler quiet */
 }
 
 /* bmap_diff() of roots 'a' and 'b' of the page store of 'store' */
@@ -9392,12 +9456,21 @@ uint32
 bmap_diff_roots(RelFileLocator store, BmapRootId a, BmapRootId b,
 				BlockNumber **blknos)
 {
-	DiffSide	sa;
-	DiffSide	sb;
+	BlockNumber mismatched = InvalidBlockNumber;
+	uint32		n;
 
-	diff_side_of_root(store, a, &sa);
-	diff_side_of_root(store, b, &sb);
-	return diff_walk(store, &sa, &sb, blknos);
+	for (int tries = 0; tries < TREE_FIND_TRIES; tries++)
+	{
+		DiffSide	sa;
+		DiffSide	sb;
+
+		diff_side_of_root(store, a, &sa);
+		diff_side_of_root(store, b, &sb);
+		if (diff_walk(store, &sa, &sb, blknos, &n, &mismatched))
+			return n;
+	}
+	diff_mismatched(store, mismatched);
+	return 0;					/* keep compiler quiet */
 }
 
 /*

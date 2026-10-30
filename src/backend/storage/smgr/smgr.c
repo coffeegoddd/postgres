@@ -783,7 +783,8 @@ smgrshare(SMgrRelation src, SMgrRelation dst)
  * (smgrshare()) knows which pages two relations hold in common without
  * reading them, so this costs what differs, not the relations' sizes.
  * Both relations must be held by one implementation that can, in the same
- * tablespace and database; the caller keeps both from changing meanwhile.
+ * tablespace and database.  A change of either meanwhile gives a mixed
+ * result, each block's page as before the change or as after, but no error.
  */
 uint32
 smgrdiff(SMgrRelation a, SMgrRelation b, BlockNumber **blknos)

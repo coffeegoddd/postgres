@@ -7,7 +7,8 @@
 # wal_consistency_checking.  A crash at a node's record leaves a tree that
 # holds together.  A leaf's version on disk newer than the replay keeps its
 # later entries.  A dropped tree's map, read before it is unlinked, points
-# to no node its drop freed.  A map of an older format is refused.
+# to no node its drop freed.  A diff that finds a node freed under it
+# begins again.  A map of an older format is refused.
 
 use strict;
 use warnings FATAL => 'all';
@@ -149,6 +150,43 @@ $drop->quit;
 sql(q{DROP TABLE r});
 is(sweep_frees(), '0', 'dropping the trees freed all they held');
 $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+
+# A diff whose next node is freed and made another page under it begins
+# again from both maps as they are then, instead of calling the store
+# corrupt: da's leaf, shared with d's, is copied by a change of da and then
+# freed by d's drop, and every free block is taken.
+sql(q{CREATE TABLE d (a int, b text) WITH (fillfactor = 10);
+	INSERT INTO d SELECT g, repeat('d', 200) FROM generate_series(1, 300) g;
+	CREATE TABLE e (a int, b text) WITH (fillfactor = 10);
+	INSERT INTO e SELECT g, repeat('e', 200) FROM generate_series(1, 30) g});
+my $d = sql(q{SELECT pg_relation_filenode('d')});
+my $e = sql(q{SELECT pg_relation_filenode('e')});
+my $da = sql(qq{SELECT test_bmap_share($d)});
+my $diff = $node->background_psql('postgres', on_error_stop => 0);
+$diff->query_safe(q{SELECT injection_points_set_local()});
+$diff->query_safe(q{SELECT injection_points_attach('bmap-diff-node', 'wait')});
+$diff->query_until(qr/diffing/, qq{\\echo diffing
+SELECT 'diffed ' || count(*) FROM test_bmap_diff($da, $e);
+});
+$node->wait_for_event('client backend', 'bmap-diff-node');
+my $leaf = sql(qq{SELECT block FROM test_bmap_tree($da) WHERE level = 0});
+sql(qq{SELECT test_bmap_write($da, 5, 1)});
+isnt(sql(qq{SELECT block FROM test_bmap_tree($da) WHERE level = 0}),
+	$leaf, 'a change of da copies its leaf');
+sql(q{DROP TABLE d});
+sql(q{SELECT * FROM test_bmap_release_drain()});
+my $nfree = sql(q{SELECT test_bmap_free_blocks()});
+sql(qq{SELECT test_bmap_extend($e, $nfree + 10)});
+is(sql(q{SELECT test_bmap_free_blocks()}), '0',
+	'the leaf, freed, is taken with every other free block');
+$node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-diff-node')});
+$node->safe_psql('postgres', q{SELECT injection_points_wakeup('bmap-diff-node')});
+my $diffed = $diff->query(q{SELECT 'after'});
+is($diff->{stderr}, '', 'a diff whose node was freed under it is no error');
+my $now = sql(qq{SELECT count(*) FROM test_bmap_diff($da, $e)});
+like($diffed, qr/diffed $now\b/, 'and gives the diff of the maps as they are now');
+$diff->quit;
+sql(qq{SELECT test_bmap_unlink($da); DROP TABLE e});
 
 # a map of an older format (the flat maps of version 1) is refused
 sql(q{CREATE TABLE old (a int); INSERT INTO old VALUES (1)});
