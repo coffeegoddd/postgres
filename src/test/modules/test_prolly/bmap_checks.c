@@ -673,6 +673,33 @@ test_bmap_roots_naming(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) naming);
 }
 
+/*
+ * test_bmap_root_counts(): whether the roots' counts of the database's page
+ * store are whole, the roots they count, and the blocks whose counts differ
+ * from the roots counted anew
+ */
+PG_FUNCTION_INFO_V1(test_bmap_root_counts);
+
+Datum
+test_bmap_root_counts(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+	uint64		counted;
+	uint64		differ;
+	bool		whole;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	whole = bmap_inspect_root_counts(locator_of(InvalidRelFileNumber),
+									 &counted, &differ);
+	values[0] = BoolGetDatum(whole);
+	values[1] = Int64GetDatum((int64) counted);
+	values[2] = Int64GetDatum((int64) differ);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
 /* test_bmap_roots_reclaim(settle): the abandoned roots reclaimed */
 PG_FUNCTION_INFO_V1(test_bmap_roots_reclaim);
 

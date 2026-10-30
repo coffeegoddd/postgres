@@ -2,12 +2,13 @@
 
 # A crash between the records of each step of block-mapped storage that
 # takes more than one: a share, a copy of a shared page's path, a drop, a
-# truncation, a sweep and a compaction's move.  The server is stopped at
-# once while a backend waits at an injection point between two of the
-# step's records.  Recovery must leave a consistent map: every table reads
-# its rows, a sweep frees only blocks nothing holds (new rows written over
-# whatever it freed change no table's rows), a second sweep finds nothing
-# more, and a standby reads what the primary does.
+# truncation, a sweep, a compaction's move and a sweep's counting of the
+# captured roots.  The server is stopped at once while a backend waits at
+# an injection point between two of the step's records.  Recovery must
+# leave a consistent map: every table reads its rows, a sweep frees only
+# blocks nothing holds (new rows written over whatever it freed change no
+# table's rows), a second sweep finds nothing more, and a standby reads
+# what the primary does.
 
 use strict;
 use warnings FATAL => 'all';
@@ -199,6 +200,17 @@ make_table('high', 3000);
 sql(qq{SELECT test_bmap_root_release($root)});
 sql(q{SELECT * FROM test_bmap_release_drain()});
 crash_at('a compaction', 'bmap-compact-moved', q{SELECT * FROM test_bmap_sweep()});
+
+# A sweep counting a root captured since the last, between the records of
+# the roots' counts: the next sweep counts every root anew.
+my $counted = make_table('counted', 3000);
+sql(qq{SELECT test_bmap_root_capture($counted)});
+sql(q{UPDATE counted SET b = b || ' later' WHERE a % 3 = 0});
+remember_table('counted');
+crash_at('a sweep counting roots', 'bmap-sweep-root-counts',
+	q{SELECT * FROM test_bmap_sweep()});
+is(sql(q{SELECT whole AND differ = 0 FROM test_bmap_root_counts()}), 't',
+	"a sweep counting roots: the roots' counts are whole and exact after");
 
 $standby->stop;
 $primary->stop;

@@ -244,6 +244,14 @@ SELECT freed, recounted FROM test_bmap_sweep();
      0 |         0
 (1 row)
 
+-- (the roots' counts lost what it held as the queue drained, and are as
+-- the roots counted anew make them)
+SELECT whole, differ FROM test_bmap_root_counts();
+ whole | differ 
+-------+--------
+ t     |      0
+(1 row)
+
 -- A capture whose transaction rolls back holds nothing, and its slot is
 -- reclaimed.
 BEGIN;
@@ -298,6 +306,13 @@ SELECT freed, recounted FROM test_bmap_sweep();
  freed | recounted 
 -------+-----------
      0 |         0
+(1 row)
+
+SELECT whole, differ, counted = (SELECT held FROM test_bmap_roots()) AS all_counted
+FROM test_bmap_root_counts();
+ whole | differ | all_counted 
+-------+--------+-------------
+ t     |      0 | t
 (1 row)
 
 -- A capture after one page changed walks the own nodes of the path copied
@@ -355,6 +370,12 @@ SELECT freed, recounted FROM test_bmap_sweep();
  freed | recounted 
 -------+-----------
      0 |         0
+(1 row)
+
+SELECT whole, differ FROM test_bmap_root_counts();
+ whole | differ 
+-------+--------
+ t     |      0
 (1 row)
 
 \c :home

@@ -138,6 +138,12 @@
  * held off) adds holders only to blocks held already, so it never gives one
  * to a block the sweep found held by nothing; the sweep rewrites no count of
  * a block something holds, which a copy under way could make a holder short.
+ * What the captured roots hold isn't counted anew by each sweep: it is kept
+ * counted, beside the reference counts, a sweep adding the roots captured
+ * since the last and a drain taking off what the roots let go of as it lets
+ * go of it, so that a sweep's cost doesn't grow with the roots held; counts
+ * a failed or crashed sweep left half written are counted anew, all roots
+ * then walked (see "The roots' counts").
  *
  * Scans (bmap_scan_store()).  A scan of a page store reads every block
  * allocated, or only the ranges of blocks written or freed since an
@@ -249,11 +255,12 @@ int			block_map_replay_entries = 65536;
  * its relation; version 11's headers held another epoch before
  * shared_below; version 12's captured roots didn't keep the database's
  * oldest unfrozen transaction and multixact as they were captured; version
- * 13's reference counts were a byte a block, stuck at 255.  This server
- * reads only version 14 and refuses anything older
- * (refuse_version()).
+ * 13's reference counts were a byte a block, stuck at 255; version 14's
+ * reference-count pages didn't keep the roots' counts, nor its release
+ * queue entries whether those counted them.  This server reads only
+ * version 15 and refuses anything older (refuse_version()).
  */
-#define BMAP_VERSION		14
+#define BMAP_VERSION		15
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -315,8 +322,13 @@ typedef struct BmapQueueMeta
 	uint32		nentries;
 } BmapQueueMeta;
 
-/* the blocks whose counts a reference-count page holds, a uint32 each */
-#define BMAP_REFS_PER_PAGE	((uint32) (BMAP_CONTENT_SIZE / sizeof(uint32)))
+/*
+ * A reference-count page's blocks: a count each, a uint32, then a roots'
+ * count each, a uint16 (see "The roots' counts").  The uint16s follow the
+ * uint32s, so both are aligned.
+ */
+#define BMAP_REFS_PER_PAGE \
+	((uint32) (BMAP_CONTENT_SIZE / (sizeof(uint32) + sizeof(uint16))))
 
 /* the release queue's page and slot of entry 'i' */
 #define BMAP_QUEUE_PER_PAGE \
@@ -443,6 +455,16 @@ StaticAssertDecl(BMAP_DELTA_ROOT_TOPS == BMAP_TREE_TOPS,
 #define PageGetBmapMeta(page)	((BmapMeta *) PageGetContents(page))
 #define PageGetBmapBits(page)	((uint64 *) PageGetContents(page))
 #define PageGetBmapRefs(page)	((uint32 *) PageGetContents(page))
+#define PageGetBmapRootRefs(page) \
+	((uint16 *) (PageGetContents(page) + BMAP_REFS_PER_PAGE * sizeof(uint32)))
+
+/*
+ * A block's roots' count: how many of the captured roots' pages hold it,
+ * and whether it is a node they reach (whose own pointers they count).
+ */
+#define ROOTREF_IN			0x8000
+#define ROOTREF_MAX			0x7FFF
+#define ROOTREF_COUNT(v)	((v) & ROOTREF_MAX)
 #define PageGetBmapQueueMeta(page)	((BmapQueueMeta *) PageGetContents(page))
 #define PageGetBmapQueued(page)	((BmapQueued *) PageGetContents(page))
 
@@ -1400,6 +1422,12 @@ apply_refs_delta(Page page, const xl_bmap_refs_delta *delta)
 		Assert(ref[i].slot < BMAP_REFS_PER_PAGE && ref[i].count <= BMAP_REFS_MAX);
 		counts[ref[i].slot] = ref[i].count;
 	}
+	/* (then the roots' counts) */
+	for (uint32 i = delta->nrefs; i < delta->nrefs + delta->nroots; i++)
+	{
+		Assert(ref[i].slot < BMAP_REFS_PER_PAGE && ref[i].count <= PG_UINT16_MAX);
+		PageGetBmapRootRefs(page)[ref[i].slot] = (uint16) ref[i].count;
+	}
 }
 
 static void
@@ -1462,7 +1490,8 @@ bits_delta_size(const xl_bmap_bits_delta *d)
 static Size
 refs_delta_size(const xl_bmap_refs_delta *d)
 {
-	return sizeof(xl_bmap_refs_delta) + d->nrefs * sizeof(xl_bmap_ref_delta);
+	return sizeof(xl_bmap_refs_delta) +
+		(d->nrefs + d->nroots) * sizeof(xl_bmap_ref_delta);
 }
 
 static Size
@@ -3624,6 +3653,9 @@ typedef struct RefsPages
 	BlockNumber blk[BMAP_REFS_PER_RECORD];
 	Buffer		buf[BMAP_REFS_PER_RECORD];
 	xl_bmap_refs_delta *delta[BMAP_REFS_PER_RECORD];
+	/* the roots' counts set, each page's, joined to its delta as it's made */
+	xl_bmap_ref_delta *roots[BMAP_REFS_PER_RECORD];
+	uint32		nroots[BMAP_REFS_PER_RECORD];
 } RefsPages;
 
 /*
@@ -3653,11 +3685,13 @@ refs_lock(RelFileLocator rel, const BlockNumber *phys, uint32 n, RefsPages *rp)
 		rp->buf[rp->n] = refs_read(rel, blk);
 		LockBuffer(rp->buf[rp->n], BUFFER_LOCK_EXCLUSIVE);
 		check_refs_page(BufferGetPage(rp->buf[rp->n]), rel, blk);
-		delta = palloc0(sizeof(xl_bmap_refs_delta) + n * sizeof(xl_bmap_ref_delta));
+		delta = palloc0(sizeof(xl_bmap_refs_delta) + 2 * n * sizeof(xl_bmap_ref_delta));
 		delta->kind = BMAP_DELTA_REFS;
 		if (PageIsNew(BufferGetPage(rp->buf[rp->n])))
 			delta->flags |= BMAP_DELTA_INIT;
 		rp->delta[rp->n] = delta;
+		rp->roots[rp->n] = palloc(n * sizeof(xl_bmap_ref_delta));
+		rp->nroots[rp->n] = 0;
 		rp->n++;
 	}
 	return i;
@@ -3692,6 +3726,26 @@ refs_set(RefsPages *rp, BlockNumber phys, uint32 count)
 	delta->nrefs++;
 }
 
+/* a block's roots' count on the locked pages */
+static uint16
+refs_get_root(RefsPages *rp, BlockNumber phys)
+{
+	Page		page = BufferGetPage(rp->buf[refs_find(rp, phys)]);
+
+	return PageIsNew(page) ? 0 : PageGetBmapRootRefs(page)[REF_SLOT(phys)];
+}
+
+/* set a block's roots' count when the record is made (once a record) */
+static void
+refs_set_root(RefsPages *rp, BlockNumber phys, uint16 value)
+{
+	int			k = refs_find(rp, phys);
+
+	rp->roots[k][rp->nroots[k]].slot = REF_SLOT(phys);
+	rp->roots[k][rp->nroots[k]].count = value;
+	rp->nroots[k]++;
+}
+
 /*
  * In the record's critical section: apply the deltas of the pages that
  * change, and register them from block id 'first'.  Returns the next id.
@@ -3703,7 +3757,14 @@ refs_apply_register(RefsPages *rp, int first)
 
 	for (int k = 0; k < rp->n; k++)
 	{
-		if (rp->delta[k]->nrefs == 0)
+		/* (the roots' counts after the counts) */
+		if (rp->nroots[k] > 0 && rp->delta[k]->nroots == 0)
+		{
+			memcpy((xl_bmap_ref_delta *) (rp->delta[k] + 1) + rp->delta[k]->nrefs,
+				   rp->roots[k], rp->nroots[k] * sizeof(xl_bmap_ref_delta));
+			rp->delta[k]->nroots = rp->nroots[k];
+		}
+		if (rp->delta[k]->nrefs + rp->delta[k]->nroots == 0)
 			continue;
 		apply_refs_delta(BufferGetPage(rp->buf[k]), rp->delta[k]);
 		MarkBufferDirty(rp->buf[k]);
@@ -3720,7 +3781,7 @@ static void
 refs_set_lsn(RefsPages *rp, XLogRecPtr lsn)
 {
 	for (int k = 0; k < rp->n; k++)
-		if (rp->delta[k]->nrefs > 0)
+		if (rp->delta[k]->nrefs + rp->delta[k]->nroots > 0)
 			PageSetLSN(BufferGetPage(rp->buf[k]), lsn);
 }
 
@@ -3731,6 +3792,7 @@ refs_release(RefsPages *rp)
 	{
 		UnlockReleaseBuffer(rp->buf[k]);
 		pfree(rp->delta[k]);
+		pfree(rp->roots[k]);
 	}
 	rp->n = 0;
 }
@@ -6090,6 +6152,11 @@ tree_walk(SMgrRelation reln, TreeNodeVisit visit_node,
  * pushed in its place.  A node another map still
  * holds is only counted down; its subtree isn't read.
  *
+ * An entry may carry a pointer the roots' counts count, and a node they
+ * reach may push entries that take its pointers off them, below which its
+ * hold stays (see "The roots' counts"): a step changes the roots' counts
+ * of the blocks it pops as it changes their reference counts.
+ *
  * A step is one record: the entries popped, the counts they change, the
  * blocks they free and the children they push.  A crash replays it whole
  * or not at all, so no entry is let go of twice and none is lost; what the
@@ -6397,7 +6464,7 @@ queued(BlockNumber block, uint16 level, BlockNumber first, XLogRecPtr since)
 
 	memset(&q, 0, sizeof(q));
 	q.block = block;
-	q.level = level;
+	q.level = (uint8) level;
 	q.first = first;
 	q.since = since;
 	return q;
@@ -6786,11 +6853,19 @@ drop_blocks(SMgrRelation reln)
 	ResourceOwnerDelete(owner);
 }
 
-/* a block popped, and how many of the entries popped hold it */
+static bool roots_exist(RelFileLocator rel);
+static void roots_meta_change(RelFileLocator rel, uint16 flags, uint32 naming,
+							  bool counted);
+
+/*
+ * A block popped, how many of the entries popped hold it, and how many of
+ * them its roots' count counted (BMAP_QUEUED_COUNTED, BMAP_QUEUED_UNCOUNT)
+ */
 typedef struct Popped
 {
 	BlockNumber block;
 	uint32		holders;
+	uint32		uncounts;
 } Popped;
 
 static int
@@ -6908,6 +6983,7 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	int			nchildren = 0;
 	uint32		npushed = 0;
 	uint32		nlet = 0;
+	bool		uncertain = false;
 	const BmapQueued *node = NULL;
 	BlockNumber nrefpages;
 	RefsPages	rp;
@@ -6980,6 +7056,12 @@ release_step(RelFileLocator rel, BmapRelease *done)
 				break;
 			if (!queued_holds(state))
 			{
+				/*
+				 * (one too old to say of may have been let go of by a
+				 * commit: what it counted can't be taken off for sure)
+				 */
+				if (state == OWNER_UNKNOWN && (e.flags & BMAP_QUEUED_COUNTED))
+					uncertain = true;
 				ndiscard++;
 				continue;
 			}
@@ -7009,11 +7091,16 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		return false;
 	}
 
+	/* the roots' counts said not to be whole first, for a sweep to count */
+	if (uncertain && roots_exist(rel))
+		roots_meta_change(rel, BMAP_DELTA_COUNTED, 0, false);
+
 	/* a node's children, read first (an entry not naming its node: none) */
 	nlet = k;
 	if (node != NULL)
 	{
-		children = palloc_array(BmapQueued, BMAP_TREE_FANOUT);
+		/* (and room for an entry that keeps the node's hold) */
+		children = palloc_array(BmapQueued, BMAP_TREE_FANOUT + 1);
 		nchildren = queued_children(rel, node, children);
 		if (nchildren < 0)
 		{
@@ -7026,13 +7113,18 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	for (uint32 i = 0; i < nlet; i++)
 	{
 		blocks[i].block = popped[i].block;
-		blocks[i].holders = 1;
+		blocks[i].holders = (popped[i].flags & BMAP_QUEUED_UNCOUNT) ? 0 : 1;
+		blocks[i].uncounts =
+			(popped[i].flags & (BMAP_QUEUED_COUNTED | BMAP_QUEUED_UNCOUNT)) ? 1 : 0;
 	}
 	qsort(blocks, nlet, sizeof(Popped), cmp_popped);
 	for (uint32 i = 0; i < nlet; i++)
 	{
 		if (nblocks > 0 && blocks[nblocks - 1].block == blocks[i].block)
-			blocks[nblocks - 1].holders++;
+		{
+			blocks[nblocks - 1].holders += blocks[i].holders;
+			blocks[nblocks - 1].uncounts += blocks[i].uncounts;
+		}
 		else
 			blocks[nblocks++] = blocks[i];
 	}
@@ -7057,20 +7149,82 @@ release_step(RelFileLocator rel, BmapRelease *done)
 		BlockNumber b = blocks[i].block;
 		uint32		h = blocks[i].holders;
 		uint32		c = REF_PAGE(b) < nrefpages ? refs_get(&rp, b) : 0;
+		uint16		rv = REF_PAGE(b) < nrefpages ? refs_get_root(&rp, b) : 0;
+		uint32		rc = ROOTREF_COUNT(rv);
+		bool		is_node = node != NULL && b == node->block;
+		bool		frees = false;
+		bool		leaves = false;
 
-		if (c >= h)
+		/*
+		 * Its roots' count, those of the entries it counted fewer.  A node
+		 * that the roots no longer reach leaves what they hold (see "The
+		 * roots' counts").
+		 */
+		rc = rc >= blocks[i].uncounts ? rc - blocks[i].uncounts : 0;
+		if (is_node && (rv & ROOTREF_IN) && rc == 0 && blocks[i].uncounts > 0)
+			leaves = true;
+
+		if (h > 0 && c >= h)
 		{
-			refs_set(&rp, b, c - h);
-			unrefs++;
-			continue;
+			/* (a node leaving keeps its entry's hold: see below) */
+			uint32		let = leaves ? h - 1 : h;
+
+			if (let > 0)
+			{
+				refs_set(&rp, b, c - let);
+				unrefs++;
+			}
 		}
-		/* (the entries were all the holders it had) */
-		Assert(c + 1 == h);
-		if (c > 0)
-			refs_set(&rp, b, 0);
-		tofree[nfree++] = b;
-		if (node != NULL && b == node->block)
+		else if (h > 0)
+		{
+			/* (the entries were all the holders it had) */
+			Assert(c + 1 == h);
+			if (c > 0)
+				refs_set(&rp, b, 0);
+			tofree[nfree++] = b;
+			frees = true;
+		}
+
+		/*
+		 * A node freed lets go of its children, counted ones if the roots
+		 * reached it.  One that the roots no longer reach but that another
+		 * map still holds keeps its children: the counts of its pointers
+		 * are to be taken off, from entries pushed over one that keeps
+		 * its hold (as an entry of a counted root's did), so that nothing
+		 * under it changes before they are (a change under a held node
+		 * copies it first).  An entry that held nothing, under such a
+		 * node, needs no hold of its own: the hold is the one below.
+		 */
+		if (is_node && frees)
+		{
+			for (int j = 0; j < nchildren; j++)
+				if (rv & ROOTREF_IN)
+					children[j].flags |= BMAP_QUEUED_COUNTED;
 			npushed = (uint32) nchildren;
+		}
+		else if (leaves)
+		{
+			bool		hold = (node->flags & BMAP_QUEUED_UNCOUNT) == 0;
+
+			if (hold)
+			{
+				memmove(children + 1, children, nchildren * sizeof(BmapQueued));
+				children[0] = queued(node->block, node->level, node->first,
+									 node->since);
+			}
+			for (int j = hold ? 1 : 0; j < nchildren + (hold ? 1 : 0); j++)
+				children[j].flags |= BMAP_QUEUED_UNCOUNT;
+			npushed = (uint32) nchildren + (hold ? 1 : 0);
+		}
+		if (REF_PAGE(b) < nrefpages)
+		{
+			/* (a block freed keeps no roots' count, whatever it said) */
+			uint16		nv = frees ? 0 :
+				(uint16) (rc | ((rv & ROOTREF_IN) && !leaves ? ROOTREF_IN : 0));
+
+			if (nv != rv)
+				refs_set_root(&rp, b, nv);
+		}
 	}
 
 	/* the frees: a bit cleared for each, if set (a block is freed once) */
@@ -7263,45 +7417,32 @@ bmap_release_pending(Oid spcOid, Oid dbOid)
 }
 
 /*
- * A sweep counts what the queue holds, as it would a map's: each entry a
- * holder of its block, a node's subtree counted as tree_walk() counts it.
- * The sweep holds drains off, so entries are only pushed meanwhile, and
- * those pushed after this read are of maps the sweep read before they were
- * dropped (a drop pushes before it lets go of its root page, under its
- * header's lock).  An entry of a drop yet to commit holds nothing (its map,
- * read before while the drop was yet to commit, still held what it names),
- * nor does one of a drop that didn't, or is too old to say of.  One of a
- * committed drop holds, its drop done or not: the drop may have emptied
- * its map's root page before the map was read (counted twice, if not,
- * which keeps them).
+ * Every entry of rel's store's queue, read under its metapage's lock, into
+ * a palloc'd array; how many in *n.
  */
-static void
-sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
-			TreeEntryVisit visit_entry, void *arg)
+static BmapQueued *
+queue_entries(RelFileLocator rel, uint32 *n)
 {
 	Buffer		metabuf;
-	uint32		n = 0;
 	BmapQueued *entries;
-	SMgrRelation store = store_smgr(rel);
-	FullTransactionId last_owner = InvalidFullTransactionId;
-	OwnerState	last_state = OWNER_NONE;
 
+	*n = 0;
 	if (!queue_exists(rel))
-		return;
+		return palloc(sizeof(BmapQueued));
 	metabuf = queue_read(rel, 0);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	if (!PageIsNew(BufferGetPage(metabuf)))
 	{
 		check_page(BufferGetPage(metabuf), BMAP_PAGE_QUEUE_META,
 				   with_relnumber(rel, BMAP_QUEUE_RELNUMBER), MAIN_FORKNUM, 0);
-		n = PageGetBmapQueueMeta(BufferGetPage(metabuf))->nentries;
+		*n = PageGetBmapQueueMeta(BufferGetPage(metabuf))->nentries;
 	}
 	entries = MemoryContextAllocHuge(CurrentMemoryContext,
-									 Max(n, 1) * sizeof(BmapQueued));
-	for (uint32 i = 0; i < n;)
+									 Max(*n, 1) * sizeof(BmapQueued));
+	for (uint32 i = 0; i < *n;)
 	{
 		Buffer		buf = queue_read(rel, QUEUE_PAGE(i));
-		uint32		take = Min(n - i, BMAP_QUEUE_PER_PAGE - QUEUE_SLOT(i));
+		uint32		take = Min(*n - i, BMAP_QUEUE_PER_PAGE - QUEUE_SLOT(i));
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		check_page(BufferGetPage(buf), BMAP_PAGE_QUEUE,
@@ -7313,6 +7454,38 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 		i += take;
 	}
 	UnlockReleaseBuffer(metabuf);
+	return entries;
+}
+
+/*
+ * A sweep counts what the queue holds, as it would a map's: each entry a
+ * holder of its block, a node's subtree counted as tree_walk() counts it.
+ * The sweep holds drains off, so entries are only pushed meanwhile, and
+ * those pushed after this read are of maps the sweep read before they were
+ * dropped (a drop pushes before it lets go of its root page, under its
+ * header's lock).  An entry of a drop yet to commit holds nothing (its map,
+ * read before while the drop was yet to commit, still held what it names),
+ * nor does one of a drop that didn't, or is too old to say of.  One of a
+ * committed drop holds, its drop done or not: the drop may have emptied
+ * its map's root page before the map was read (counted twice, if not,
+ * which keeps them).
+ *
+ * The roots' counts, which the sweep begins from, count already what an
+ * entry pointing to a block they count holds (BMAP_QUEUED_COUNTED), and
+ * one more for each pointer still to be taken off them
+ * (BMAP_QUEUED_UNCOUNT), which holds nothing: 'visit_uncount' takes it
+ * off.
+ */
+static void
+sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
+			TreeEntryVisit visit_entry, TreeEntryVisit visit_uncount,
+			void *arg)
+{
+	uint32		n;
+	BmapQueued *entries = queue_entries(rel, &n);
+	SMgrRelation store = store_smgr(rel);
+	FullTransactionId last_owner = InvalidFullTransactionId;
+	OwnerState	last_state = OWNER_NONE;
 
 	for (uint32 i = 0; i < n; i++)
 	{
@@ -7331,7 +7504,11 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 		ptr.block = entries[i].block;
 		ptr.epoch = 0;
 		ptr.since = entries[i].since;
-		if (entries[i].level == BMAP_QUEUED_BLOCK)
+		if (entries[i].flags & BMAP_QUEUED_UNCOUNT)
+			visit_uncount(&ptr, InvalidBlockNumber, arg);
+		else if (entries[i].flags & BMAP_QUEUED_COUNTED)
+			continue;
+		else if (entries[i].level == BMAP_QUEUED_BLOCK)
 			visit_entry(&ptr, InvalidBlockNumber, arg);
 		else
 			tree_walk_node(store, &ptr, entries[i].level, entries[i].first,
@@ -7360,17 +7537,22 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
  * doesn't, the slot is reclaimed (its subtrees let go of).  Letting go of
  * a root names the (sub)transaction that does so in the slot and pushes
  * its subtrees onto the release queue as entries naming that transaction
- * too: if it commits, the queue lets go of them and the slot is free; if
- * it doesn't, the entries are popped with nothing let go of and the slot
- * holds as before.  So a root's holders change with the commit that
- * stops naming it, whatever crashes in between.
+ * too (carrying its pointers' roots' counts, if a sweep counted it): if
+ * it commits, the queue lets go of them and the slot is free; if it
+ * doesn't, the entries are popped with nothing let go of and the slot
+ * holds as before.  So a root's holders change with the commit that stops
+ * naming it, whatever crashes in between.
  *
  * The metapage marks each page of slots that may have a slot naming a
  * transaction (a capturer or a releaser, not yet settled), set in the
  * record that names it: so settling and reclaiming (bmap_roots_reclaim())
  * read only the pages marked, as many as the roots captured or let go of
  * since they last ran, not every page of slots.  A page is unmarked once
- * its slots name none, under the metapage's lock and the page's.
+ * its slots name none, under the metapage's lock and the page's.  A page
+ * marked so is marked too as one that may hold a root the roots' counts
+ * don't count yet (see "The roots' counts"), until a sweep has counted
+ * every root on it: so a sweep reads the pages of the roots captured
+ * since the last, not every page of slots.
  *
  * Locks: the metapage exclusively while a slot is chosen and set (a
  * capture holds its relation's header, then the metapage, then the slot's
@@ -7383,15 +7565,19 @@ typedef struct BmapRootsMeta
 	uint32		version;
 	uint32		npages;			/* pages of slots after the metapage */
 	uint32		hint;			/* the first that may have a free slot */
-	uint32		unused;
+	uint32		counted;		/* are the roots' counts whole */
 	uint64		seq;			/* the last root's sequence number */
 	uint8		naming[FLEXIBLE_ARRAY_MEMBER];	/* a bit a page of slots:
-												 * may it name a transaction */
+												 * may it name a transaction;
+												 * then as many: may it hold
+												 * a root not counted */
 } BmapRootsMeta;
 
 /* the pages of slots a metapage's marks cover, at most */
 #define BMAP_ROOTS_NAMING_PAGES \
-	((uint32) ((BMAP_CONTENT_SIZE - offsetof(BmapRootsMeta, naming)) * 8))
+	((uint32) ((BMAP_CONTENT_SIZE - offsetof(BmapRootsMeta, naming)) / 2 * 8))
+#define PageGetBmapRootsUncounted(page) \
+	(PageGetBmapRootsMeta(page)->naming + BMAP_ROOTS_NAMING_PAGES / 8)
 
 #define BMAP_ROOTS_PER_PAGE \
 	((uint32) (BMAP_CONTENT_SIZE / sizeof(xl_bmap_root)))
@@ -7493,15 +7679,24 @@ apply_roots_meta_delta(Page page, const xl_bmap_roots_meta_delta *delta)
 	meta->npages = delta->npages;
 	meta->hint = delta->hint;
 	meta->seq = delta->seq;
+	if (delta->flags & BMAP_DELTA_COUNTED)
+		meta->counted = delta->counted;
 	if (delta->naming != 0)
 	{
 		uint32		p = delta->naming - 1;
+		uint8	   *uncounted = PageGetBmapRootsUncounted(page);
 
 		Assert(p < BMAP_ROOTS_NAMING_PAGES);
 		if (delta->flags & BMAP_DELTA_NAMING_CLEAR)
 			meta->naming[p / 8] &= ~(1 << (p % 8));
+		else if (delta->flags & BMAP_DELTA_UNCOUNTED_CLEAR)
+			uncounted[p / 8] &= ~(1 << (p % 8));
 		else
+		{
+			/* (a slot to name a transaction is a root captured, or let go of) */
 			meta->naming[p / 8] |= 1 << (p % 8);
+			uncounted[p / 8] |= 1 << (p % 8);
+		}
 	}
 }
 
@@ -7908,6 +8103,8 @@ bmap_roots_reclaim(RelFileLocator store, bool settle)
 			BmapQueued	items[BMAP_TREE_TOPS];
 			uint32		nq = queued_tops(snapshot_tops(&abandoned[a].snap), items);
 
+			/* (a sweep counts no root its capturer may still abandon) */
+			Assert(!abandoned[a].counted);
 			(void) queue_push(store, items, nq);
 		}
 		if (nabandoned > 0 || freed)
@@ -8655,7 +8852,12 @@ bmap_root_release(RelFileLocator store, BmapRootId id)
 	 */
 	n = queued_tops(snapshot_tops(&r.snap), items);
 	for (uint32 i = 0; i < n; i++)
+	{
 		queued_set_owner(&items[i], me);
+		/* (a root the roots' counts count: its pointers carry them now) */
+		if (r.counted)
+			items[i].flags |= BMAP_QUEUED_COUNTED;
+	}
 	(void) queue_push(store, items, n);
 	LockRelease(&sweeptag, ShareLock, false);
 	roots_lower_hint(store, ROOT_PAGE(ROOT_SLOT(id)) - 1);
@@ -9524,39 +9726,328 @@ bmap_diff_roots(RelFileLocator store, BmapRootId a, BmapRootId b,
 }
 
 /*
- * A sweep counts what the roots hold, as it counts a map: each root whose
- * slot isn't free (root_state()) a holder of its subtrees.  One pending (its
- * capturer or its releaser yet to commit) holds what it names until then:
- * a capture's holders were added with it, and a releaser's queue entries
- * hold nothing until it commits.  An abandoned one holds until it is
- * reclaimed, whose queue entries then hold in its place.
+ * The roots' counts.  A sweep counts what every holder holds, and captured
+ * roots may be many, one for each commit of a version history, holding
+ * much the same blocks: walked anew by each sweep, they would make each
+ * sweep cost as much as all of them.  So what they hold stays counted, in
+ * each reference-count page's roots' counts (PageGetBmapRootRefs()): for
+ * each block, how many of the roots' pages point to it, and whether it is
+ * a node the roots reach (ROOTREF_IN), whose own pointers are then counted
+ * too, once however many reach it.  The roots' pages are the slots counted
+ * (a slot's 'counted'), the nodes they reach, and the release queue's
+ * entries carrying a pointer counted (BMAP_QUEUED_COUNTED): a counted
+ * root's release pushes its pointers so, and a drain freeing a node the
+ * roots reach pushes its children so.  A sweep adds the roots captured
+ * since the last (the pages of their slots marked in the roots' metapage),
+ * walking only the nodes no counted root reaches yet (root_count_node());
+ * a drain takes off what the pointers it lets go of counted, as it lets go
+ * of them (release_step()).  A sweep then begins its holders from the
+ * roots' counts and walks the relations, the release queue and the roots
+ * not yet counted: its cost has no part that grows with the roots held.
+ *
+ * A node the roots no longer reach (its roots' count gone to zero) while
+ * another map still holds it leaves what they hold, and its pointers'
+ * counts are to be taken off.  It is a page of the other map, which may
+ * change it in place once it holds it alone, so the hold the roots had is
+ * kept, by an entry pushed below entries pointing to its children
+ * (BMAP_QUEUED_UNCOUNT, holding nothing), each taking one off its child's
+ * count and a node child left unreached handled the same way above it,
+ * all before the hold under them is let go of.  Until they are, a sweep
+ * takes them off the counts it begins from.
+ *
+ * Every change of the counts is in the record of the change that makes
+ * it, but a sweep's, which takes several: it first says, in the roots'
+ * metapage, that the counts are not whole ('counted' cleared), then writes
+ * them and the slots it counted, then says they are whole again.  A sweep
+ * that finds them not whole (another failed or crashed between those
+ * records, or none has counted them yet) counts every root and every
+ * counted entry of the queue anew (as a sweep counted the roots before the
+ * counts were kept) and writes the counts it finds.  A root is counted only
+ * once its capture can no longer be abandoned (its capturer committed) and
+ * nothing is releasing it (whose release would push pointers not
+ * counted): until then it counts in each sweep's holders alone.  A count
+ * that would pass ROOTREF_MAX leaves the counts not whole, each sweep then
+ * counting anew.
+ */
+typedef struct RootCounts
+{
+	BlockNumber n;				/* blocks covered: the reference-count pages' */
+	uint16	   *v;				/* each block's roots' count, as counted */
+	bool		overflow;		/* a count passed ROOTREF_MAX */
+	BmapEntry  *extra;			/* tops of the roots not counted yet */
+	int			nextra;
+} RootCounts;
+
+/* One more of the roots' pages pointing to block b. */
+static void
+root_count_add(RootCounts *rc, BlockNumber b)
+{
+	if (b >= rc->n || ROOTREF_COUNT(rc->v[b]) == ROOTREF_MAX)
+	{
+		rc->overflow = true;
+		return;
+	}
+	rc->v[b]++;
+}
+
+/*
+ * A pointer of the roots' pages to node 'ptr', counted, and if no counted
+ * root reached the node before, its own pointers too: a leaf's to each
+ * block it maps once, however many of its entries map it, as the release
+ * queue lets go of them (queued_children()).
  */
 static void
-sweep_roots(RelFileLocator rel, TreeNodeVisit visit_node,
-			TreeEntryVisit visit_entry, void *arg)
+root_count_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
+				BlockNumber first, RootCounts *rc)
 {
-	BmapRootsMeta meta;
-	Buffer		metabuf;
-	SMgrRelation store = store_smgr(rel);
+	BlockNumber b = ptr->block;
+	BmapEntry  *entries;
+	Buffer		buf;
 
-	if (!roots_exist(rel))
+	root_count_add(rc, b);
+	if (b >= rc->n || (rc->v[b] & ROOTREF_IN))
 		return;
+	rc->v[b] |= ROOTREF_IN;
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	buf = tree_read(rel, b, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of database %u is not the node a captured root holds",
+						b, rel.dbOid)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	CHECK_FOR_INTERRUPTS();
+	if (level == 0)
+	{
+		BlockNumber *blocks = palloc(BMAP_TREE_FANOUT * sizeof(BlockNumber));
+		uint32		n = 0;
+
+		for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+			if (BlockNumberIsValid(entries[i].block))
+				blocks[n++] = entries[i].block;
+		qsort(blocks, n, sizeof(BlockNumber), cmp_block);
+		for (uint32 i = 0; i < n; i++)
+			if (i == 0 || blocks[i] != blocks[i - 1])
+				root_count_add(rc, blocks[i]);
+		pfree(blocks);
+	}
+	else
+	{
+		for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+			if (BlockNumberIsValid(entries[i].block))
+				root_count_node(rel, &entries[i], level - 1,
+								(BlockNumber) Min((uint64) first +
+												  i * tree_span(level - 1),
+												  (uint64) MaxBlockNumber),
+								rc);
+	}
+	pfree(entries);
+}
+
+/* a root's subtrees counted, as its slot's pointers */
+static void
+root_count_tops(RelFileLocator rel, const BmapEntry *tops, RootCounts *rc)
+{
+	uint64		first = 0;
+
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		if (BlockNumberIsValid(tops[k].block))
+			root_count_node(rel, &tops[k], k, (BlockNumber) first, rc);
+		first += tree_span(k);
+	}
+}
+
+/* A change of the roots' metapage alone: 'flags', of page 'naming'. */
+static void
+roots_meta_change(RelFileLocator rel, uint16 flags, uint32 naming,
+				  bool counted)
+{
+	Buffer		metabuf = roots_read(rel, 0);
+	BmapRootsMeta *meta;
+	xl_bmap_roots_meta_delta mdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_ROOTS_META,
+			   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 0);
+	meta = PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	memset(&mdelta, 0, sizeof(mdelta));
+	mdelta.kind = BMAP_DELTA_ROOTS_META;
+	mdelta.flags = flags;
+	mdelta.npages = meta->npages;
+	mdelta.hint = meta->hint;
+	mdelta.seq = meta->seq;
+	mdelta.naming = naming;
+	mdelta.counted = counted ? 1 : 0;
+	xlrec.locator = with_relnumber(rel, BMAP_ROOTS_RELNUMBER);
+	xlrec.op = BMAP_TREE_ROOT_SLOT;
+	xlrec.flags = 0;
+	xlrec.node = xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	START_CRIT_SECTION();
+	apply_roots_meta_delta(BufferGetPage(metabuf), &mdelta);
+	MarkBufferDirty(metabuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, metabuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &mdelta, sizeof(mdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(metabuf), lsn);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(metabuf);
+}
+
+/*
+ * Write the roots' counts of reference-count page 'p' that differ from
+ * what it has, 'was': one record of the page.
+ */
+static void
+root_counts_write(RelFileLocator rel, BlockNumber p, const uint16 *was,
+				  const uint16 *v)
+{
+	xl_bmap_refs_delta *delta;
+	xl_bmap_ref_delta *ref;
+	xl_bmap_unref xlrec;
+	Buffer		buf;
+	XLogRecPtr	lsn;
+
+	if (memcmp(was, v, BMAP_REFS_PER_PAGE * sizeof(uint16)) == 0)
+		return;
+	delta = palloc0(sizeof(xl_bmap_refs_delta) +
+					BMAP_REFS_PER_PAGE * sizeof(xl_bmap_ref_delta));
+	ref = (xl_bmap_ref_delta *) (delta + 1);
+	delta->kind = BMAP_DELTA_REFS;
+	for (uint32 i = 0; i < BMAP_REFS_PER_PAGE; i++)
+	{
+		if (was[i] == v[i])
+			continue;
+		ref[delta->nroots].slot = i;
+		ref[delta->nroots].count = v[i];
+		delta->nroots++;
+	}
+	if (delta->nroots == 0)
+	{
+		pfree(delta);
+		return;
+	}
+	buf = refs_read(rel, p);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	check_refs_page(BufferGetPage(buf), rel, p);
+	if (PageIsNew(BufferGetPage(buf)))
+		delta->flags |= BMAP_DELTA_INIT;
+	xlrec.locator = rel;
+	xlrec.flags = BMAP_UNREF_ROOTS;
+
+	START_CRIT_SECTION();
+	apply_refs_delta(BufferGetPage(buf), delta);
+	MarkBufferDirty(buf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, buf, REGBUF_STANDARD |
+					   ((delta->flags & BMAP_DELTA_INIT) ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(0, delta, refs_delta_size(delta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_UNREF);
+	PageSetLSN(BufferGetPage(buf), lsn);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buf);
+	pfree(delta);
+}
+
+/*
+ * Bring rel's store's roots' counts up to date, under the sweep's lock
+ * (held exclusively: nothing is captured, let go of or reclaimed
+ * meanwhile, and no drain runs), for a sweep whose store's high-water
+ * mark is 'hw': the roots captured since the last sweep added, or, if the
+ * counts aren't whole, every root counted anew.  Into *rc the counts, and
+ * the roots not counted yet (held by a transaction still running), whose
+ * holders the sweep counts itself.
+ *
+ * With 'check', for a test, nothing is written: the roots counted are
+ * counted anew, and how many blocks' counts differ from what they have is
+ * returned.
+ */
+static uint64
+root_counts(RelFileLocator rel, BlockNumber hw, RootCounts *rc, bool check)
+{
+	Buffer		metabuf;
+	BmapRootsMeta meta;
+	uint8	   *marks;
+	bool		whole;
+	BlockNumber nrefpages;
+	uint16	   *was;
+	List	   *tomark = NIL;	/* slots to say are counted */
+	List	   *unmark = NIL;	/* pages of slots all counted */
+	int			extra_cap = 0;
+	bool		changed;
+	uint64		differ = 0;
+
+	memset(rc, 0, sizeof(*rc));
+	if (!check)
+		refs_cover(rel, hw);
+	nrefpages = refs_nblocks(rel);
+	rc->n = nrefpages * BMAP_REFS_PER_PAGE;
+	rc->v = MemoryContextAllocHuge(CurrentMemoryContext,
+								   Max(rc->n, 1) * sizeof(uint16));
+	memset(rc->v, 0, Max(rc->n, 1) * sizeof(uint16));
+	if (!roots_exist(rel))
+		return 0;
 	metabuf = roots_read(rel, 0);
 	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
 	if (PageIsNew(BufferGetPage(metabuf)))
 	{
 		UnlockReleaseBuffer(metabuf);
-		return;
+		return 0;
 	}
 	check_page(BufferGetPage(metabuf), BMAP_PAGE_ROOTS_META,
 			   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 0);
 	meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+	marks = palloc((meta.npages + 7) / 8);
+	memcpy(marks, PageGetBmapRootsUncounted(BufferGetPage(metabuf)),
+		   (meta.npages + 7) / 8);
 	UnlockReleaseBuffer(metabuf);
+	whole = meta.counted != 0 && !check;
+
+	/* the counts as they are, kept if whole */
+	was = MemoryContextAllocHuge(CurrentMemoryContext,
+								 Max(rc->n, 1) * sizeof(uint16));
+	for (BlockNumber p = 0; p < nrefpages; p++)
+	{
+		Buffer		buf = refs_read(rel, p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_refs_page(BufferGetPage(buf), rel, p);
+		if (PageIsNew(BufferGetPage(buf)))
+			memset(was + p * BMAP_REFS_PER_PAGE, 0,
+				   BMAP_REFS_PER_PAGE * sizeof(uint16));
+		else
+			memcpy(was + p * BMAP_REFS_PER_PAGE,
+				   PageGetBmapRootRefs(BufferGetPage(buf)),
+				   BMAP_REFS_PER_PAGE * sizeof(uint16));
+		UnlockReleaseBuffer(buf);
+	}
+	if (whole)
+		memcpy(rc->v, was, rc->n * sizeof(uint16));
+
+	/*
+	 * The slots: those of the pages marked, or, the counts not whole, all
+	 * of them, counted anew.
+	 */
 	for (uint32 p = 0; p < meta.npages; p++)
 	{
 		xl_bmap_root page[BMAP_ROOTS_PER_PAGE];
-		Buffer		buf = roots_read(rel, 1 + p);
+		Buffer		buf;
+		bool		marked = (marks[p / 8] & (1 << (p % 8))) != 0;
+		bool		left = false;
 
+		if (whole && !marked)
+			continue;
+		buf = roots_read(rel, 1 + p);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		check_page(BufferGetPage(buf), BMAP_PAGE_ROOTS,
 				   with_relnumber(rel, BMAP_ROOTS_RELNUMBER), MAIN_FORKNUM, 1 + p);
@@ -9565,22 +10056,175 @@ sweep_roots(RelFileLocator rel, TreeNodeVisit visit_node,
 		for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
 		{
 			RootState	state = root_state(&page[i]);
-			uint64		first = 0;
 
-			/* (an abandoned one until it is reclaimed, as its queue entries) */
 			if (state == ROOT_FREE)
 				continue;
-			for (int k = 0; k < BMAP_TREE_TOPS; k++)
+			if (page[i].counted)
 			{
-				const BmapEntry *tops = snapshot_tops(&page[i].snap);
-
-				if (BlockNumberIsValid(tops[k].block))
-					tree_walk_node(store, &tops[k], k, (BlockNumber) first,
-								   true, visit_node, visit_entry, arg);
-				first += tree_span(k);
+				if (!whole)
+					root_count_tops(rel, snapshot_tops(&page[i].snap), rc);
+				continue;
 			}
+			if (check)
+				continue;
+			if (state == ROOT_HELD)
+			{
+				root_count_tops(rel, snapshot_tops(&page[i].snap), rc);
+				tomark = lappend_int(tomark, (int) (p * BMAP_ROOTS_PER_PAGE + i));
+				continue;
+			}
+			/* (pending or abandoned: the sweep's holders alone) */
+			if (rc->nextra == extra_cap)
+			{
+				extra_cap = Max(extra_cap * 2, 8);
+				rc->extra = rc->extra ?
+					repalloc_array(rc->extra, BmapEntry, extra_cap * BMAP_TREE_TOPS) :
+					palloc_array(BmapEntry, extra_cap * BMAP_TREE_TOPS);
+			}
+			memcpy(rc->extra + rc->nextra * BMAP_TREE_TOPS,
+				   snapshot_tops(&page[i].snap), sizeof(BmapEntry) * BMAP_TREE_TOPS);
+			rc->nextra++;
+			left = true;
 		}
+		if (marked && !left)
+			unmark = lappend_int(unmark, (int) p);
 	}
+
+	/*
+	 * Counted anew, the queue's counted entries too, as they hold (those of
+	 * a releaser still running count as their slot), and the pointers still
+	 * to be taken off, one each.
+	 */
+	if (!whole)
+	{
+		uint32		n;
+		BmapQueued *entries = queue_entries(rel, &n);
+
+		for (uint32 i = 0; i < n; i++)
+		{
+			FullTransactionId owner = queued_owner(&entries[i]);
+			BmapEntry	ptr;
+
+			if (entries[i].flags & BMAP_QUEUED_UNCOUNT)
+			{
+				root_count_add(rc, entries[i].block);
+				continue;
+			}
+			if ((entries[i].flags & BMAP_QUEUED_COUNTED) == 0 ||
+				(FullTransactionIdIsValid(owner) &&
+				 owner_state(owner) != OWNER_COMMITTED))
+				continue;
+			if (entries[i].level == BMAP_QUEUED_BLOCK)
+			{
+				root_count_add(rc, entries[i].block);
+				continue;
+			}
+			ptr.block = entries[i].block;
+			ptr.epoch = 0;
+			ptr.since = entries[i].since;
+			root_count_node(rel, &ptr, entries[i].level, entries[i].first, rc);
+		}
+		pfree(entries);
+	}
+
+	if (check)
+	{
+		for (BlockNumber b = 0; b < rc->n; b++)
+			differ += was[b] != rc->v[b];
+		pfree(marks);
+		pfree(was);
+		return differ;
+	}
+
+	/*
+	 * Written, if they changed: said not to be whole first, so that a sweep
+	 * failing before the end leaves them to be counted anew.
+	 */
+	changed = !whole || tomark != NIL || unmark != NIL ||
+		memcmp(was, rc->v, rc->n * sizeof(uint16)) != 0;
+	if (changed)
+	{
+		if (whole)
+			roots_meta_change(rel, BMAP_DELTA_COUNTED, 0, false);
+		for (BlockNumber p = 0; p < nrefpages; p++)
+			root_counts_write(rel, p, was + p * BMAP_REFS_PER_PAGE,
+							  rc->v + p * BMAP_REFS_PER_PAGE);
+		INJECTION_POINT("bmap-sweep-root-counts", NULL);
+		foreach_int(slot, tomark)
+		{
+			Buffer		buf = roots_read(rel, ROOT_PAGE(slot));
+			xl_bmap_root r;
+
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			r = PageGetBmapRoots(BufferGetPage(buf))[ROOT_INDEX(slot)];
+			r.counted = 1;
+			roots_set_slot(rel, buf, (uint32) slot, &r, InvalidBuffer);
+			UnlockReleaseBuffer(buf);
+		}
+		foreach_int(p, unmark)
+			roots_meta_change(rel, BMAP_DELTA_UNCOUNTED_CLEAR, (uint32) p + 1,
+							  false);
+		if (!rc->overflow)
+			roots_meta_change(rel, BMAP_DELTA_COUNTED, 0, true);
+	}
+	list_free(tomark);
+	list_free(unmark);
+	pfree(marks);
+	pfree(was);
+	return 0;
+}
+
+/*
+ * Whether the roots' counts of a store are whole, how many roots they
+ * count, and how many blocks' counts differ from the roots counted anew:
+ * none, if they are kept as they should be.  Under the sweep's lock, so
+ * that nothing changes them meanwhile.  For tests.
+ */
+bool
+bmap_inspect_root_counts(RelFileLocator store, uint64 *counted,
+						 uint64 *differ)
+{
+	LOCKTAG		tag;
+	bool		whole = false;
+	Buffer		metabuf;
+	RootCounts	rc;
+
+	*counted = *differ = 0;
+	if (!alloc_exists(store) || !roots_exist(store))
+		return false;
+	SET_LOCKTAG_OBJECT(tag, store.dbOid, BMAP_SWEEP_CLASSID, store.spcOid, 0);
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	metabuf = roots_read(store, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(metabuf)))
+	{
+		BmapRootsMeta meta = *PageGetBmapRootsMeta(BufferGetPage(metabuf));
+
+		whole = meta.counted != 0;
+		UnlockReleaseBuffer(metabuf);
+		for (uint32 p = 0; p < meta.npages; p++)
+		{
+			Buffer		buf = roots_read(store, 1 + p);
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			for (uint32 i = 0; i < BMAP_ROOTS_PER_PAGE; i++)
+			{
+				const xl_bmap_root *r = &PageGetBmapRoots(BufferGetPage(buf))[i];
+
+				if (root_state(r) != ROOT_FREE && r->counted)
+					(*counted)++;
+			}
+			UnlockReleaseBuffer(buf);
+		}
+		*differ = root_counts(store, 0, &rc, true);
+		pfree(rc.v);
+		if (rc.extra)
+			pfree(rc.extra);
+	}
+	else
+		UnlockReleaseBuffer(metabuf);
+	LockRelease(&tag, ExclusiveLock, false);
+	return whole;
 }
 
 /*
@@ -9598,6 +10242,8 @@ typedef struct SweepRoot
 
 typedef struct SweepRoots
 {
+	RelFileLocator rel;			/* the store */
+	bool		loaded;
 	SweepRoot  *by_map;			/* sorted by map_id */
 	SweepRoot **by_id;			/* the same, sorted by id */
 	int			n;
@@ -9622,13 +10268,16 @@ cmp_root_id(const void *a, const void *b)
 }
 
 static void
-sweep_roots_load(RelFileLocator rel, SweepRoots *sr)
+sweep_roots_load(SweepRoots *sr)
 {
+	RelFileLocator rel = sr->rel;
 	BmapRootsMeta meta;
 	Buffer		metabuf;
 	int			cap = 0;
 
-	memset(sr, 0, sizeof(*sr));
+	if (sr->loaded)
+		return;
+	sr->loaded = true;
 	if (!roots_exist(rel))
 		return;
 	metabuf = roots_read(rel, 0);
@@ -9694,7 +10343,7 @@ sweep_roots_free(SweepRoots *sr)
  * and its own roots.
  */
 static int
-own_root_tops(RelFileLocator rel, const SweepRoots *sr, BmapEntry **tops)
+own_root_tops(RelFileLocator rel, SweepRoots *sr, BmapEntry **tops)
 {
 	Buffer		rootbuf;
 	uint64		map_id;
@@ -9708,6 +10357,7 @@ own_root_tops(RelFileLocator rel, const SweepRoots *sr, BmapEntry **tops)
 	SweepRoot **made;
 
 	*tops = NULL;
+	sweep_roots_load(sr);
 	if (sr->n == 0)
 		return 0;
 	rootbuf = map_read(rel, 1);
@@ -9854,6 +10504,17 @@ sweep_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
 
 	if (entry->block < sh->hw)
 		hold(sh->holders, entry->block);
+}
+
+/* A pointer the roots' counts still count, though gone: one holder fewer. */
+static void
+sweep_uncount(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	SweepHolders *sh = arg;
+
+	if (entry->block < sh->hw && sh->holders[entry->block] > 0 &&
+		sh->holders[entry->block] < PG_UINT32_MAX)
+		sh->holders[entry->block]--;
 }
 
 /*
@@ -10398,7 +11059,7 @@ let_go_relation(HeldRelation *held)
  */
 static void
 sweep_shared_below(SMgrRelation reln, const uint32 *holders, BlockNumber hw,
-				   const SweepRoots *sr)
+				   SweepRoots *sr)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		headerbuf;
@@ -11655,6 +12316,8 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	BlockList	tofree = {0};
 	BlockList	recount = {0};
 	BlockNumber nrefpages;
+	uint32	   *refs;
+	RootCounts	rc;
 
 	/* the roots whose capturers never committed let go of first, the rest settled */
 	(void) bmap_roots_reclaim(rel, true);
@@ -11684,13 +12347,26 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	}
 	UnlockReleaseBuffer(metabuf);
 
-	/* what every relation holds */
+	/*
+	 * What the captured roots hold, as their counts say once brought up to
+	 * date (the nodes they reach counted as reached: their children are
+	 * counted with them)
+	 */
+	(void) root_counts(rel, hw, &rc, false);
 	holders = MemoryContextAllocHuge(CurrentMemoryContext,
 									 (hw + 1) * sizeof(uint32));
 	memset(holders, 0, (hw + 1) * sizeof(uint32));
 	reached = MemoryContextAllocHuge(CurrentMemoryContext,
 									 (hw / 64 + 1) * sizeof(uint64));
 	memset(reached, 0, (hw / 64 + 1) * sizeof(uint64));
+	for (BlockNumber b = 0; b < hw && b < rc.n; b++)
+	{
+		holders[b] = ROOTREF_COUNT(rc.v[b]);
+		if (rc.v[b] & ROOTREF_IN)
+			reached[b / 64] |= UINT64CONST(1) << (b % 64);
+	}
+
+	/* what every relation holds */
 	dir = AllocateDir(path);
 	while ((de = ReadDir(dir, path)) != NULL)
 	{
@@ -11707,12 +12383,49 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	}
 	FreeDir(dir);
 
-	/* and what the captured roots and the release queue hold, read after them */
+	/* and what the roots not counted yet and the release queue hold */
 	{
 		SweepHolders sh = {holders, reached, hw};
+		SMgrRelation store = store_smgr(rel);
 
-		sweep_roots(rel, sweep_node, sweep_entry, &sh);
-		sweep_queue(rel, sweep_node, sweep_entry, &sh);
+		for (int i = 0; i < rc.nextra; i++)
+		{
+			const BmapEntry *tops = rc.extra + i * BMAP_TREE_TOPS;
+			uint64		first = 0;
+
+			for (int k = 0; k < BMAP_TREE_TOPS; k++)
+			{
+				if (BlockNumberIsValid(tops[k].block))
+					tree_walk_node(store, &tops[k], k, (BlockNumber) first,
+								   true, sweep_node, sweep_entry, &sh);
+				first += tree_span(k);
+			}
+		}
+		sweep_queue(rel, sweep_node, sweep_entry, sweep_uncount, &sh);
+	}
+	pfree(rc.v);
+	if (rc.extra)
+		pfree(rc.extra);
+
+	/* the counts, a page at a time */
+	nrefpages = refs_nblocks(rel);
+	refs = MemoryContextAllocHuge(CurrentMemoryContext,
+								  (Size) Max(nrefpages, 1) * BMAP_REFS_PER_PAGE *
+								  sizeof(uint32));
+	for (BlockNumber p = 0; p < nrefpages; p++)
+	{
+		Buffer		buf = refs_read(rel, p);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_refs_page(BufferGetPage(buf), rel, p);
+		if (PageIsNew(BufferGetPage(buf)))
+			memset(refs + (Size) p * BMAP_REFS_PER_PAGE, 0,
+				   BMAP_REFS_PER_PAGE * sizeof(uint32));
+		else
+			memcpy(refs + (Size) p * BMAP_REFS_PER_PAGE,
+				   PageGetBmapRefs(BufferGetPage(buf)),
+				   BMAP_REFS_PER_PAGE * sizeof(uint32));
+		UnlockReleaseBuffer(buf);
 	}
 
 	/*
@@ -11724,7 +12437,6 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	 * none needs rewriting but one a crash left too high, whose block a sweep
 	 * frees once its holders are gone.
 	 */
-	nrefpages = refs_nblocks(rel);
 	for (BlockNumber b = 0; b < hw; b++)
 	{
 		if ((allocated[b / 64] & (UINT64CONST(1) << (b % 64))) == 0)
@@ -11732,7 +12444,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		if (holders[b] == 0)
 		{
 			block_list_add(&tofree, b);
-			if (REF_PAGE(b) < nrefpages && lookup_ref(rel, b) != 0)
+			if (REF_PAGE(b) < nrefpages && refs[b] != 0)
 				block_list_add(&recount, b);
 		}
 	}
@@ -11741,9 +12453,12 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 
 	/*
 	 * Each relation's shared_below lowered to what other maps still hold,
-	 * while no share can add a holder.
+	 * while no share can add a holder.  (The roots are read only for a
+	 * relation whose shared_below is to be lowered.)
 	 */
-	sweep_roots_load(rel, &sr);
+	pfree(refs);
+	memset(&sr, 0, sizeof(sr));
+	sr.rel = rel;
 	dir = AllocateDir(path);
 	while ((de = ReadDir(dir, path)) != NULL)
 	{
