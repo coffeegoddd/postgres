@@ -1,8 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Pages a block-mapped relation shares with a copy: what may reach them and
-# what copies them.  A hint true of the relation alone stays off them; a
-# cleanup lock that isn't granted copies nothing; a page zeroed to be
+# what copies them.  A hint true of the relation alone stays off them;
+# VACUUM copies only the pages it changes; a cleanup lock that isn't
+# granted copies nothing; a page zeroed to be
 # initialized is copied without an image, and its new block reads as
 # zeroes, after a crash too.
 
@@ -60,6 +61,41 @@ $node->start;
 is(sql(qq{SELECT test_bmap_digest($kcopy)}), $kdigest,
 	'and after recovery');
 sql(qq{SELECT test_bmap_unlink($kcopy)});
+
+# VACUUM visits every page under a cleanup lock, and copies those it
+# changes: the heap pages a delete left dead rows on, and the index's
+# leaves that held them.
+sql(q{
+	CREATE TABLE cow.v (a int PRIMARY KEY);
+	INSERT INTO cow.v SELECT g FROM generate_series(1, 20000) g;
+	VACUUM (FREEZE) cow.v;
+	CHECKPOINT;
+});
+my $v = sql(q{SELECT pg_relation_filenode('cow.v')});
+my $vidx = sql(q{SELECT pg_relation_filenode('cow.v_pkey')});
+my $hcopy = sql(qq{SELECT test_bmap_share($v)});
+my $icopy = sql(qq{SELECT test_bmap_share($vidx)});
+my $hpages = sql(qq{SELECT count(*) FROM test_bmap_map($v)});
+my $ipages = sql(qq{SELECT count(*) FROM test_bmap_map($vidx)});
+my $hdigest = sql(qq{SELECT test_bmap_rows_digest($hcopy)});
+my $idigest = sql(qq{SELECT test_bmap_digest($icopy)});
+cmp_ok($hpages, '>', 50, 'the heap has pages to share');
+cmp_ok($ipages, '>', 20, 'so does the index');
+
+sql(q{DELETE FROM cow.v WHERE a <= 1000});
+sql(q{VACUUM (DISABLE_PAGE_SKIPPING) cow.v});
+my $hshared = sql(qq{SELECT count(*) FROM test_bmap_map($v) WHERE refs > 0});
+my $ishared = sql(qq{SELECT count(*) FROM test_bmap_map($vidx) WHERE refs > 0});
+cmp_ok($hshared, '>=', $hpages - 6, 'VACUUM left the heap\'s other pages shared');
+cmp_ok($ishared, '>=', $ipages - 6, 'and the index\'s');
+is(sql(q{SELECT count(*), min(a) FROM cow.v}), '19000|1001',
+	'the rows the delete left');
+is(sql(qq{SELECT test_bmap_rows_digest($hcopy)}), $hdigest,
+	'the copy\'s heap is unchanged');
+is(sql(qq{SELECT test_bmap_digest($icopy)}), $idigest,
+	'and its index');
+sql(qq{SELECT test_bmap_unlink($hcopy)});
+sql(qq{SELECT test_bmap_unlink($icopy)});
 
 # A cleanup lock refused because another backend has the page pinned
 # leaves the page shared.

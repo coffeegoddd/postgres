@@ -57,6 +57,18 @@ VACUUM (FREEZE) cow.t;
 SELECT test_bmap_rows_digest(:copy) = :'copy_digest' AS copy_unaffected_by_vacuum;
 SELECT count(*), sum(b) FROM cow.t;
 
+-- Reads don't copy pages: opportunistic pruning skips a shared page.
+CREATE TABLE cow.p (a int8, b int8, c int8, d int8) WITH (fillfactor = 100);
+INSERT INTO cow.p SELECT g, g, g, g FROM generate_series(1, 1000) g;
+UPDATE cow.p SET b = b + 1;
+SELECT pg_relation_filenode('cow.p') AS p \gset
+SELECT test_bmap_share(:p) AS pcopy \gset
+SELECT string_agg(phys::text, ',' ORDER BY blkno) AS p_map FROM test_bmap_map(:p) \gset
+SELECT count(*) FROM cow.p WHERE b > 0;
+SELECT string_agg(phys::text, ',' ORDER BY blkno) = :'p_map' AS no_page_copied
+  FROM test_bmap_map(:p);
+
 SELECT test_bmap_unlink(:copy);
+SELECT test_bmap_unlink(:pcopy);
 DROP SCHEMA cow CASCADE;
 RESET debug_block_mapped_heap;
