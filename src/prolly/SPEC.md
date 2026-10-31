@@ -496,6 +496,23 @@ store, as in Dolt, and then applied to the current branch's tables:
    merged: the base is diffed against each side, and the two sets of
    changes are combined, which costs O((D<sub>1</sub> + D<sub>2</sub>) log
    n), with *D<sub>1</sub>* and *D<sub>2</sub>* the rows each side changed.
+   - **Subtrees one side changed go in whole.**  As in Dolt's range
+     patches, each diff is walked beside the other side's tree, and a
+     subtree that only one side changed is not walked down to its rows:
+     one of the current branch's stays as it is, and one of *T*'s goes into
+     the result by its hash (a graft), without reading its rows or the
+     base's below it.  Rows are diffed, and conflicts looked for, only in
+     subtrees both sides changed.
+   - **The order makes it exact.**  The grafts go in first, a tree level at
+     a time from the highest, then *T*'s row changes; each step edits the
+     tree the step before left.  So wherever chunk boundaries shift next to
+     a graft, the rechunking reads the merged rows, and the result is the
+     tree that applying both sides' changes to the base would give.
+   - So the leaves a merge reads and writes are those of subtrees both
+     sides changed; the rest is interior nodes.  Its cost does not depend
+     on how much of the history store is cached: measured on 10 million
+     rows, a merge of 10,000 rows changed on each side read 370 chunks
+     outside the cache, and a quarter of the cache added 0.12 s.
    As in Dolt, a merge is refused while the session's transaction has
    uncommitted writes, or while the working set has uncommitted changes
    in a table the merge would change; uncommitted changes in other tables
@@ -537,6 +554,95 @@ conflict rows.  Ours also writes those *D<sub>2</sub>* rows into the
 current branch's tables, which adds O(D<sub>2</sub>) pages and index
 entries, within the bound above.  A fast-forward adds no chunks to either
 store; ours writes the *D* rows into the tables.
+
+#### Clone, push, fetch and pull
+
+Remotes are plain storage, as Dolt's file and object-store remotes are:
+a directory, or a bucket in an object store such as S3.  Nothing runs on
+the remote; every operation is reads and writes of files by the client.
+- **What a remote holds.**  Chunks, in packs: files of chunks with an index
+  at the end giving each chunk's hash, offset and lengths.  Each chunk is
+  compressed (zstd) in the pack when that makes it smaller.  A manifest
+  lists the packs and the branch heads.
+- **Writes are a compare-and-swap of the manifest.**  A push writes its new
+  pack, then replaces the manifest only if it is still the version the
+  push read (a conditional write on an object store, a rename on files).
+  A push that loses the race reads the new manifest and tries again; a
+  pack no manifest names is garbage.
+- **The client keeps the remote's indexes.**  It reads each pack's index
+  once and keeps it, and later operations read only the indexes of packs
+  added since.  Without this, every operation would read every index,
+  which grows with the remote (21.6 MB at 10 million rows).
+- **Transfers go a tree level at a time.**  From the heads to send, each
+  level's chunks the other side lacks are found against the indexes and
+  moved in one batch, the reads coalesced into ranged requests.  A request
+  per chunk would make every operation a round trip per chunk.  A clone
+  streams whole packs instead.
+- **Fetched chunks enter the history store as packs.**  A received pack is
+  appended to the history store's pages in bulk and recorded as one pack,
+  not row by row per chunk.  Its WAL is about the chunks' bytes.
+
+The operations:
+
+- **Fetch** copies a remote branch's new commits and chunks into the
+  history store and moves the remote-tracking branch.  It touches no
+  working set: a remote-tracking branch is history only, so a fetch never
+  crosses the seam.
+- **Push** sends the local branch's new chunks to the remote as a pack and
+  moves the remote's head with the manifest's compare-and-swap.  It reads
+  only the history store, so it does not cross the seam either.
+- **Pull** is a fetch and then a merge of the remote-tracking branch into
+  the current branch, as described under Merge; the rows that came from
+  the remote are written into the branch's tables there.
+- **Clone** copies the remote's packs into a new history store, and then
+  rebuilds each branch's working set from its head's tree, the costliest
+  path across the seam.
+
+**Time complexity**, with *N* the chunks a database holds, *Δ* the rows
+of change being sent, *R* the rows of a branch, and *L* the capture lag:
+
+| Operation | Dolt | This design |
+|---|---|---|
+| Clone | O(N) | O(N + R), the working set rebuilt from history |
+| Fetch | O(Δ log n) | O(Δ log n) |
+| Push | O(Δ log n) | O(L + Δ log n) |
+| Pull | O(Δ log n) plus the merge | O(Δ log n) plus the merge |
+
+Fetch and push cost what changed in both: the chunks on the paths to the
+changed rows.  A push first waits for capture, so the commit it sends
+covers the tables.  A clone costs more in ours, because the rows come
+back across the seam into tables and indexes.
+
+**Measured.**  The prototype ran each operation over HTTP against an
+object store holding packs and a manifest, as above, with 1 ms added to
+every request, on 10 million rows of about 300 bytes.  Against it, the
+same operations with the history kept as chunk files on disk, the way
+Dolt keeps them, to see what the history store's pages cost:
+
+| Operation | Chunk files | History store |
+|---|---:|---:|
+| Clone, history only | 28.7 s | 35.8 s |
+| Push of 10,000 rows | 0.70 s | 0.72 s |
+| Fetch of 10,000 rows | 0.65 s | 0.76 s |
+| Pull of 10,000 rows, each side changed | 1.07 s | 1.28 s |
+| Push of 1 row | | 0.007 s |
+| Fetch of 1 row | | 0.029 s |
+
+- **Every operation costs what changed:** a 1-row push or fetch stays in
+  milliseconds at 10 million rows.
+- **The history store costs about 1.2×** chunk files on disk, in every
+  operation, and the factor does not grow with the database.
+- **Compression cuts bytes 1.7 to 2.6×,** on the wire and on the remote,
+  depending on how compressible the rows are.  On the local link it bought
+  no time; on a slower one, the bytes saved are time saved.
+- **Limits of these runs:** one machine, a local object server rather
+  than S3, each run once; one pusher at a time; and the clone measured
+  without rebuilding the working set, which is the part still to measure.
+
+**Still to settle:** merging packs as pushes accumulate (each push adds
+one, and an index to read once); keeping chunks compressed in the history
+store's own pages; the working-set rebuild after a clone; concurrent
+pushers on one remote; a real object store's latency.
 
 ### The window
 
@@ -988,4 +1094,8 @@ With no window, every commit is kept locally, as in Dolt.
 - **History lives in Postgres pages.**  Its reads go through the buffer
   manager, which is slower than Dolt's memory-mapped chunk files, but it
   is replicated and backed up with the database.
+- **Remotes are Dolt's kind.**  Plain directories and object stores, with
+  the same exchange of only the chunks the other side lacks.  Fetch, push
+  and pull cost about 1.2× the same operations on chunk files, measured
+  at 10 million rows; a clone also rebuilds the working set.
 - **Not yet measured:** the same operations against Dolt itself.
