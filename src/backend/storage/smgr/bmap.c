@@ -15203,7 +15203,9 @@ bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
  * queue in full first, whatever the limit, and isn't paced, as it holds off
  * shares and the reuse of freed blocks while it runs; but one is due rarely:
  * once after the server starts, and after a count it could fix has lost a
- * holder.
+ * holder.  With release_max 0 nothing is done at all, sweeps and the
+ * orphans they drop included: that work is left to VACUUM, extensions and
+ * a sweep run by hand.
  */
 void
 bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
@@ -15228,6 +15230,11 @@ bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
 	}
 	done->released += released.entries;
 	done->released_freed += released.freed;
+	if (release_max == 0)
+	{
+		list_free(spcs);
+		return;
+	}
 
 	foreach_oid(spc, spcs)
 	{
