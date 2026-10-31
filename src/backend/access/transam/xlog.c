@@ -6985,6 +6985,13 @@ StartupXLOG(void)
 	LWLockRelease(ControlFileLock);
 
 	/*
+	 * The block map's standby hold, published from the slots while recovery
+	 * ran, when its cap doesn't apply: computed again, capped, now that
+	 * recovery is over, not at the next checkpoint.
+	 */
+	WalSndComputeRecoveryHold();
+
+	/*
 	 * Wake up the checkpointer process as there might be a request to disable
 	 * logical decoding by concurrent slot drop.
 	 */
