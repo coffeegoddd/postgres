@@ -646,9 +646,9 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 				 bmap_relation_exists(rlocator.locator))
 		{
 			/*
-			 * A block-mapped relation has the name: its main fork has no file
-			 * of its own, only its map fork, which smgropen() would take for
-			 * the new relation's.
+			 * A block-mapped relation already has that number: its main fork
+			 * has no file of its own, only its map fork, which smgropen()
+			 * would take for the new relation's.
 			 */
 			collides = true;
 		}
