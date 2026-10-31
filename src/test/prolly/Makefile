@@ -41,7 +41,7 @@ PROLLY_AM ?= heap
 export PROLLY_AM
 
 # extensions the branched catalogs' tests install on branches
-EXTRA_INSTALL = contrib/hstore contrib/pg_trgm
+EXTRA_INSTALL += contrib/hstore contrib/pg_trgm
 
 AM_CONF = $(abs_top_srcdir)/$(subdir)/am/$(PROLLY_AM).conf
 ifeq ($(wildcard $(AM_CONF)),)
@@ -82,6 +82,9 @@ check-tap-durability: temp-install
 check-branches: temp-install
 	$(pg_regress_check) --temp-config=$(AM_CONF) \
 		--schedule=$(srcdir)/branches_schedule
+	$(MAKE) -C $(top_builddir)/src/test/isolation all
+	$(pg_isolation_regress_check) --temp-config=$(AM_CONF) \
+		--schedule=$(srcdir)/branches_isolation_schedule
 	$(MAKE) check-tap-branches
 
 check-tap-branches: PROVE_TESTS = t/2*.pl

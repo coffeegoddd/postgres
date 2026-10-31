@@ -1,0 +1,44 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_b1 a_begin a_app b_pub a_commit
+step a_b1: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 1), false); END$$;
+step a_begin: BEGIN;
+step a_app: CREATE EXTENSION pg_trgm SCHEMA app;
+step b_pub: CREATE EXTENSION pg_trgm SCHEMA pub; <waiting ...>
+step a_commit: COMMIT;
+step b_pub: <... completed>
+ERROR:  extension "pg_trgm" already exists
+
+starting permutation: a_begin a_pub b_b1 b_app a_commit
+step a_begin: BEGIN;
+step a_pub: CREATE EXTENSION pg_trgm SCHEMA pub;
+step b_b1: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 1), false); END$$;
+step b_app: CREATE EXTENSION pg_trgm SCHEMA app; <waiting ...>
+step a_commit: COMMIT;
+step b_app: <... completed>
+ERROR:  extension "pg_trgm" already exists
+
+starting permutation: a_b1 a_begin a_app b_b1 b_app2 a_commit
+step a_b1: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 1), false); END$$;
+step a_begin: BEGIN;
+step a_app: CREATE EXTENSION pg_trgm SCHEMA app;
+step b_b1: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 1), false); END$$;
+step b_app2: CREATE EXTENSION pg_trgm SCHEMA app2; <waiting ...>
+step a_commit: COMMIT;
+step b_app2: <... completed>
+ERROR:  extension "pg_trgm" already exists
+
+starting permutation: a_b1 a_begin a_app b_b2 b_app a_commit b_count
+step a_b1: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 1), false); END$$;
+step a_begin: BEGIN;
+step a_app: CREATE EXTENSION pg_trgm SCHEMA app;
+step b_b2: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 2), false); END$$;
+step b_app: CREATE EXTENSION pg_trgm SCHEMA app; <waiting ...>
+step a_commit: COMMIT;
+step b_app: <... completed>
+step b_count: SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm';
+count
+-----
+    1
+(1 row)
+

@@ -55,7 +55,25 @@ SET catalog_branch = :b1;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm';
 SELECT round(app.similarity('abc', 'abd')::numeric, 2) AS b1_similarity;
 
+-- a branch's extension is that branch's to drop or reassign: DROP OWNED and
+-- REASSIGN OWNED on another branch leave it
 DROP EXTENSION pg_trgm;
+CREATE ROLE regress_ext_owner;
+DO $$BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO regress_ext_owner', current_database()); END$$;
+GRANT CREATE, USAGE ON SCHEMA app TO regress_ext_owner;
+SET ROLE regress_ext_owner;
+CREATE EXTENSION pg_trgm SCHEMA app;
+RESET ROLE;
+SET catalog_branch = :b2;
+DROP OWNED BY regress_ext_owner;
+REASSIGN OWNED BY regress_ext_owner TO CURRENT_USER;
+SET catalog_branch = :b1;
+SELECT extowner = 'regress_ext_owner'::regrole AS kept FROM pg_extension WHERE extname = 'pg_trgm';
+DROP OWNED BY regress_ext_owner;
+DO $$BEGIN EXECUTE format('REVOKE CREATE ON DATABASE %I FROM regress_ext_owner', current_database()); END$$;
+DROP ROLE regress_ext_owner;
+SELECT count(*) AS dropped_on_b1 FROM pg_extension WHERE extname = 'pg_trgm';
+
 DROP SCHEMA app;
 SET catalog_branch = :b2;
 DROP SCHEMA app;

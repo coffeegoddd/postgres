@@ -33,6 +33,10 @@ tests += {
     'schedule': files('branches_schedule'),
     'regress_args': ['--temp-config', files('am/heap.conf')],
   },
+  'isolation': {
+    'schedule': files('branches_isolation_schedule'),
+    'regress_args': ['--temp-config', files('am/heap.conf')],
+  },
   'tap': {
     'env': {'PROLLY_AM': 'heap'},
     'tests': [

@@ -1,0 +1,2 @@
+# Isolation tests of branched catalogs: sessions on branches at once.
+test: branch_extension_races
