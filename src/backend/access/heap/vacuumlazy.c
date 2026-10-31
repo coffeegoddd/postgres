@@ -551,6 +551,29 @@ heap_vacuum_eager_scan_setup(LVRelState *vacrel, const VacuumParams *params)
 		return;
 
 	/*
+	 * Storage that shares pages freezes its own pages eagerly
+	 * (VacuumCutoffs.freeze_own_eagerly), those a read set all-visible too,
+	 * which a normal VACUUM would skip: every all-visible page not yet
+	 * all-frozen is scanned, from the first region, whatever the table's
+	 * size, under the failure cap (a shared page left as it is counts as a
+	 * failure).
+	 */
+	if (vacrel->cutoffs.freeze_own_eagerly)
+	{
+		visibilitymap_count(vacrel->rel, &allvisible, &allfrozen);
+		vacrel->eager_scan_remaining_successes = allvisible - allfrozen;
+		if (vacrel->eager_scan_remaining_successes == 0)
+			return;
+		Assert(params->max_eager_freeze_failure_rate > 0 &&
+			   params->max_eager_freeze_failure_rate <= 1);
+		vacrel->next_eager_scan_region_start = 0;
+		vacrel->eager_scan_max_fails_per_region =
+			params->max_eager_freeze_failure_rate * EAGER_SCAN_REGION_SIZE;
+		vacrel->eager_scan_remaining_fails = vacrel->eager_scan_max_fails_per_region;
+		return;
+	}
+
+	/*
 	 * Aggressively vacuuming a small relation shouldn't take long, so it
 	 * isn't worth amortizing. We use two times the region size as the size
 	 * cutoff because the eager scan start block is a random spot somewhere in

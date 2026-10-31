@@ -186,10 +186,7 @@ $node->restart;
 is(sql(q{SELECT test_bmap_sweep_due()}), 't', 'a sweep is due after the start');
 my $zero_offset = -s $node->logfile;
 autovacuum(1);
-ok( $node->poll_query_until(
-		'postgres', q{SELECT true}, 't') &&
-	  wait_for_pass($zero_offset),
-	'a worker passes over the database');
+ok(wait_for_pass($zero_offset), 'a worker passes over the database');
 is(sql(q{SELECT test_bmap_sweep_due()}), 't',
 	'and, with block_map_release_max_per_pass 0, leaves the sweep due');
 autovacuum(0);

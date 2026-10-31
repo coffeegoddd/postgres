@@ -15204,8 +15204,9 @@ bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
  * shares and the reuse of freed blocks while it runs; but one is due rarely:
  * once after the server starts, and after a count it could fix has lost a
  * holder.  With release_max 0 nothing is done at all, sweeps and the
- * orphans they drop included: that work is left to VACUUM, extensions and
- * a sweep run by hand.
+ * orphans they drop included: VACUUM still drains the queue of a relation
+ * it vacuums, but nothing else sweeps, so what a crash leaked or orphaned
+ * stays until it is raised.
  */
 void
 bmapmaintain(int64 release_max, void (*pace) (void), SMgrMaintenance *done)
