@@ -5193,8 +5193,7 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 	for (uint32 k = 0; k < nitems; k++)
 		phys[k] = items[k].block;
 	/* (sorted: the last is on the highest page) */
-	nrefpages = nitems > 0 ? refs_nblocks_upto(rel, REF_PAGE(phys[nitems - 1])) :
-		refs_nblocks(rel);
+	nrefpages = refs_nblocks_upto(rel, REF_PAGE(phys[nitems - 1]));
 
 	while (i < nitems)
 	{
@@ -6178,15 +6177,6 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent,
 }
 
 /*
- * In redo's walk of a capture (redo_own_blocks()), page 'blk' of 'rel' (the
- * page store's file or its counts') into dst: as replay holds it in a
- * buffer, if it does, else as it is on disk, if its checksum verifies it.
- * Never through a buffer read for it: the block may hold what the replay
- * hasn't reached, a relation's page (whose checksum is of its logical
- * block) in a node freed since, or a page torn by the crash whose image
- * comes later in the WAL.  False if it is past the file, or not verified.
- */
-/*
  * The lengths of the files redo's walk reads (the page store's, its counts'),
  * asked once a walk (reset by redo_own_blocks()): nothing extends them while
  * a record replays, and asking at every page asked the file system at every
@@ -6219,6 +6209,15 @@ redo_walk_file_length(RelFileLocator rel, SMgrRelation srel)
 	return nblocks;
 }
 
+/*
+ * In redo's walk of a capture (redo_own_blocks()), page 'blk' of 'rel' (the
+ * page store's file or its counts') into dst: as replay holds it in a
+ * buffer, if it does, else as it is on disk, if its checksum verifies it.
+ * Never through a buffer read for it: the block may hold what the replay
+ * hasn't reached, a relation's page (whose checksum is of its logical
+ * block) in a node freed since, or a page torn by the crash whose image
+ * comes later in the WAL.  False if it is past the file, or not verified.
+ */
 static bool
 redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
 {
@@ -16944,7 +16943,7 @@ bmap_redo(XLogReaderState *record)
 					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages, asking %u files' lengths",
 						 relpathperm(xlrec->src, MAIN_FORKNUM).str,
 						 own.n, redo_walk_nodes, redo_walk_ref_pages,
-							 redo_walk_lengths_asked);
+						 redo_walk_lengths_asked);
 					flush_own_blocks(src, &own);
 				}
 				else
