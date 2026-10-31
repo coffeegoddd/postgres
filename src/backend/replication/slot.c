@@ -503,6 +503,7 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	slot->last_saved_confirmed_flush = InvalidXLogRecPtr;
 	slot->last_saved_restart_lsn = InvalidXLogRecPtr;
 	slot->inactive_since = 0;
+	slot->recovery_hold_warned = InvalidXLogRecPtr;
 	slot->slotsync_skip_reason = SS_SKIP_NONE;
 
 	/*

@@ -253,18 +253,35 @@ $standby->append_conf('postgresql.conf', 'wal_receiver_status_interval = 60s');
 $standby->start;
 ok($primary->poll_query_until('postgres', q{SELECT hold IS NOT NULL FROM test_bmap_standby_hold()}),
 	'the standby holds');
-sql(q{CHECKPOINT});
-$primary->wait_for_replay_catchup($standby);
-my $held = sql(q{SELECT hold FROM test_bmap_standby_hold()});
-$standby->safe_psql('postgres', q{CHECKPOINT});
+# (no keepalives, whose replies would carry the hold too; and a move counts
+# only if the standby received no WAL meanwhile, whose reply would: the
+# bgwriter logs running transactions after a checkpoint, so it is tried
+# again then)
+$primary->append_conf('postgresql.conf', 'wal_sender_timeout = 0');
+$primary->reload;
 my $moved = 0;
-for (1 .. 100)
+for my $try (1 .. 5)
 {
-	$moved = sql(qq{SELECT hold > '$held' FROM test_bmap_standby_hold()}) eq 't';
-	last if $moved;
-	usleep(100_000);
+	sql(q{CHECKPOINT});
+	$primary->wait_for_replay_catchup($standby);
+	my $held = sql(q{SELECT hold FROM test_bmap_standby_hold()});
+	my $received = $standby->safe_psql('postgres', q{SELECT pg_last_wal_receive_lsn()});
+	$standby->safe_psql('postgres', q{CHECKPOINT});
+	my $seen = 0;
+	for (1 .. 100)
+	{
+		$seen = sql(qq{SELECT hold > '$held' FROM test_bmap_standby_hold()}) eq 't';
+		last if $seen;
+		usleep(100_000);
+	}
+	my $quiet = $standby->safe_psql('postgres', q{SELECT pg_last_wal_receive_lsn()}) eq $received;
+	if ($quiet)
+	{
+		$moved = $seen;
+		last;
+	}
 }
-ok($moved, 'a restartpoint on the standby moves the primary\'s hold within seconds');
+ok($moved, 'a restartpoint on the standby moves the primary\'s hold within seconds, no WAL received meanwhile');
 
 $standby->stop;
 $primary->stop;
