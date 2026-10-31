@@ -71,6 +71,29 @@ pgstat_drop_block_map(Oid spcoid, Oid dboid, Oid relnumber)
 		pgstat_request_entry_refs_gc();
 }
 
+/* a block map entry of the database and tablespace match_data names */
+static bool
+match_block_map_tablespace(PgStatShared_HashEntry *entry, Datum match_data)
+{
+	uint64		m = DatumGetUInt64(match_data);
+
+	return entry->key.kind == PGSTAT_KIND_BLOCK_MAP &&
+		entry->key.dboid == (Oid) (m & 0xFFFFFFFF) &&
+		(Oid) (entry->key.objid >> 32) == (Oid) (m >> 32);
+}
+
+/*
+ * Drop the statistics of a database's relation files in a tablespace, as
+ * its files there move to another (ALTER DATABASE SET TABLESPACE): keyed by
+ * the old tablespace, no relation file would count them again.
+ */
+void
+pgstat_drop_block_map_tablespace(Oid spcoid, Oid dboid)
+{
+	pgstat_drop_matching_entries(match_block_map_tablespace,
+								 UInt64GetDatum(((uint64) spcoid << 32) | dboid));
+}
+
 /*
  * Support function for the SQL-callable pgstat* functions.  Returns the
  * collected statistics of a relation file, or NULL.

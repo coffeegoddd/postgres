@@ -103,6 +103,7 @@ tests += {
       't/045_bmap_first_share_walk.pl',
       't/046_bmap_reused_stale_since.pl',
       't/047_bmap_passed_restart.pl',
+      't/048_bmap_stats_movedb.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
