@@ -2729,7 +2729,8 @@ WalSndComputeRecoveryHold(void)
 	 * checkpointer clearing a backup a standby just reported).  The cap's
 	 * limit too, under it: one computed in recovery, uncapped, by a process
 	 * that waited for the lock as recovery ended, would publish after the
-	 * startup process's capped hold.
+	 * startup process's capped hold.  (With no slots, max_replication_slots
+	 * 0, there is no lock: walsenders' holds then aren't serialized so.)
 	 */
 	if (ReplicationSlotCtl != NULL)
 		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
@@ -2812,6 +2813,8 @@ WalSndComputeRecoveryHold(void)
 				}
 				continue;
 			}
+			/* (holding again: said again if let go of again) */
+			s->recovery_hold_warned = InvalidXLogRecPtr;
 			if (!XLogRecPtrIsValid(hold) || h < hold)
 				hold = h;
 		}

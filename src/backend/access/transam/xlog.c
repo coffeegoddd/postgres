@@ -8984,7 +8984,9 @@ CreateRestartPoint(int flags)
 	/*
 	 * The walreceiver tells the upstream server where this server's recovery
 	 * may begin now (the block map's standby hold, GetRecoveryHold()): woken,
-	 * so that it says so now, not at its next status interval.
+	 * so that it says so now, not at its next status interval.  Best-effort:
+	 * the walreceiver reads the restart point only if ControlFileLock is
+	 * free, and otherwise says it at its next reply.
 	 */
 	WalRcvRequestApplyReply();
 
