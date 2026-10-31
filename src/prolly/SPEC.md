@@ -567,8 +567,8 @@ the remote; every operation is reads and writes of files by the client.
 - **Writes are a compare-and-swap of the manifest.**  A push writes its new
   pack, then replaces the manifest only if it is still the version the
   push read (a conditional write on an object store, a rename on files).
-  A push that loses the race reads the new manifest and tries again; a
-  pack no manifest names is garbage.
+  A push that loses the race fails, and can be made again after a fetch;
+  its pack, which no manifest names, is garbage.
 - **The client keeps the remote's indexes.**  It reads each pack's index
   once and keeps it, and later operations read only the indexes of packs
   added since.  Without this, every operation would read every index,
@@ -599,19 +599,19 @@ The operations:
   path across the seam.
 
 **Time complexity**, with *N* the chunks a database holds, *Δ* the rows
-of change being sent, *R* the rows of a branch, and *L* the capture lag:
+of change being sent, and *R* the rows of a branch:
 
 | Operation | Dolt | This design |
 |---|---|---|
 | Clone | O(N) | O(N + R), the working set rebuilt from history |
 | Fetch | O(Δ log n) | O(Δ log n) |
-| Push | O(Δ log n) | O(L + Δ log n) |
+| Push | O(Δ log n) | O(Δ log n) |
 | Pull | O(Δ log n) plus the merge | O(Δ log n) plus the merge |
 
 Fetch and push cost what changed in both: the chunks on the paths to the
-changed rows.  A push first waits for capture, so the commit it sends
-covers the tables.  A clone costs more in ours, because the rows come
-back across the seam into tables and indexes.
+changed rows.  A push sends commits already made, so it does not wait
+for capture.  A clone costs more in ours, because the rows come back
+across the seam into tables and indexes.
 
 **Measured.**  The prototype ran each operation over HTTP against an
 object store holding packs and a manifest, as above, with 1 ms added to
