@@ -91,9 +91,9 @@ WHERE resource_manager = 'Heap2' AND record_type = 'VM_SET'
 SELECT test_bmap_unlink(:vcopy);
 
 -- A page shared only with a root held of the relation itself, not with
--- another relation, is vacuumed as the relation's own (copied if VACUUM
--- must change it, the root keeping the version it had), but isn't frozen
--- eagerly: that would copy it, for no tuple old enough to need it.
+-- another relation, is vacuumed as the relation's own: copied when VACUUM
+-- changes it (here, setting it all-visible), the root keeping the version
+-- it had, and frozen as it is copied, which costs no more.
 CREATE TABLE held_t (id int, pad text) WITH (autovacuum_enabled = off);
 INSERT INTO held_t SELECT g, repeat('h', 200) FROM generate_series(1, 3000) g;
 SELECT relfilenode AS h FROM pg_class WHERE relname = 'held_t' \gset
@@ -102,14 +102,30 @@ BEGIN;
 SELECT test_bmap_root_capture(:h) AS root \gset
 COMMIT;
 VACUUM held_t;
-SELECT count(*) = 0 AS held_pages_left_unfrozen
+SELECT count(*) = :hblocks AS held_pages_frozen
 FROM generate_series(0, :hblocks - 1) b
 WHERE (SELECT all_frozen FROM pg_visibility_map('held_t', b));
 BEGIN;
 SELECT test_bmap_root_release(:root);
 COMMIT;
 
-DROP TABLE shared_t, frozen_t, vmset_t, held_t;
+-- Pages a read set all-visible, which a normal VACUUM skips, are still
+-- frozen while the relation's own: they are scanned for it.
+CREATE TABLE read_t (id int, pad text) WITH (autovacuum_enabled = off);
+INSERT INTO read_t SELECT g, repeat('r', 200) FROM generate_series(1, 3000) g;
+SELECT pg_relation_size('read_t') / 8192 AS rblocks \gset
+SELECT count(*) FROM read_t;
+SELECT count(*) FROM read_t;
+SELECT count(*) > 0 AS read_set_all_visible,
+       count(*) FILTER (WHERE all_frozen) = 0 AS none_frozen_yet
+FROM generate_series(0, :rblocks - 1) b, pg_visibility_map('read_t', b)
+WHERE all_visible;
+VACUUM read_t;
+SELECT count(*) = :rblocks AS read_pages_frozen
+FROM generate_series(0, :rblocks - 1) b
+WHERE (SELECT all_frozen FROM pg_visibility_map('read_t', b));
+
+DROP TABLE shared_t, frozen_t, vmset_t, held_t, read_t;
 DROP FUNCTION shared_blocks(oid, oid);
 SELECT entries >= 0 AS drained FROM test_bmap_release_drain();
 RESET debug_block_mapped_heap;

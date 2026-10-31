@@ -1137,11 +1137,13 @@ setting_given(const char *name)
  * can be (VacuumCutoffs.freeze_own_eagerly); one frozen and marked
  * all-frozen then is shared that way (the visibility map goes with the
  * copy), and no VACUUM of either relation needs to copy it to freeze it
- * later.  A shared page freezes by FreezeLimit, as any: its freeze age
- * stays the normal one, so an aggressive VACUUM copies only the shared
- * pages whose tuples are old enough to matter for wraparound, as stock
- * Postgres would freeze them.  The cost is the freeze WAL of the own
- * pages, earlier than it would have been.
+ * later.  So is a shared page VACUUM copies anyway (pruning it, or setting
+ * it all-visible); pages a read set all-visible are scanned for it, under
+ * the eager scan's failure cap.  Otherwise a shared page freezes by
+ * FreezeLimit, as any: its freeze age stays the normal one, so an
+ * aggressive VACUUM copies no shared page only to freeze tuples younger
+ * than it.  The cost is the freeze WAL of the own pages, earlier than it
+ * would have been.
  */
 static bool
 freezes_eagerly(Relation rel)

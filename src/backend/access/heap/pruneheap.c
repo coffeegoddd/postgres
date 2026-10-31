@@ -817,12 +817,16 @@ heap_page_will_freeze(bool did_tuple_hint_fpi,
 
 			/*
 			 * Freezing would make the page all-frozen.  Storage that shares
-			 * pages freezes a page eagerly while it is still the relation's
-			 * own, which copies nothing (VacuumCutoffs.freeze_own_eagerly);
-			 * else, have we already emitted an FPI or will we anyway?
+			 * pages freezes a page eagerly where that copies nothing
+			 * (VacuumCutoffs.freeze_own_eagerly): the relation's own, or a
+			 * shared one this VACUUM copies anyway, pruning it or setting it
+			 * all-visible; else, have we already emitted an FPI or will we
+			 * anyway?
 			 */
 			if (prstate->cutoffs->freeze_own_eagerly &&
-				!BufferPageIsShared(prstate->buffer))
+				(!BufferPageIsShared(prstate->buffer) || do_prune ||
+				 (prstate->attempt_set_vm &&
+				  (prstate->old_vmbits & VISIBILITYMAP_ALL_VISIBLE) == 0)))
 				do_freeze = true;
 			else if (RelationNeedsWAL(prstate->relation))
 			{
