@@ -142,6 +142,13 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 	sizeof(ReplicationSlotOnDisk) - ReplicationSlotOnDiskConstantSize
 
 #define SLOT_MAGIC		0x1051CA1	/* format identifier */
+/*
+ * Version 6 keeps a physical slot's recovery hold (the block map's standby
+ * hold, WalSndComputeRecoveryHold()).  A data directory with slot files of
+ * an older version doesn't start (RestoreSlotFromDisk() PANICs): moving one
+ * to this build, its slots are dropped first and made again after.
+ * pg_upgrade is unaffected: it makes the new cluster's logical slots anew.
+ */
 #define SLOT_VERSION	6		/* version for new files */
 
 /* Control array for replication slot management */

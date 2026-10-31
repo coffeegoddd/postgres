@@ -121,7 +121,7 @@ extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
  * Captured roots: a relation's tree as it was at a moment, kept by its page
  * store (not by the relation), so any number of them, each outliving the
  * relation's storage until it is let go of, and any relation of the store may
- * be made of it, another branch's included.  Capturing one is O(1) in the
+ * be made of it, another relation's included.  Capturing one is O(1) in the
  * relation's size, but for the pages changed since its last capture, logged as
  * images and written out; and a relation can be made of one in O(1)
  * (bmap_share_root()).  A frozen root (bmap_root_capture_of()) is captured of

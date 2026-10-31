@@ -42,6 +42,10 @@
 #define PGSTAT_KIND_WAL	14
 
 /* stats for variable-numbered objects, after the fixed ones */
+/*
+ * (15 is in upstream's range of built-in kinds: a kind upstream adds takes
+ * it at the next sync, and this one the next number free then.)
+ */
 #define PGSTAT_KIND_BLOCK_MAP	15	/* per block-mapped relation file */
 
 #define PGSTAT_KIND_BUILTIN_MIN PGSTAT_KIND_DATABASE
