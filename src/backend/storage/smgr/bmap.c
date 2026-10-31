@@ -5546,12 +5546,30 @@ typedef struct PreserveWalk
  * synced, tree_preserve_node()); 'own' counts the blocks found the
  * relation's own, logged or synced, or that may be.
  */
+typedef struct SyncedLeaf
+{
+	BlockNumber node;			/* its block of the page store */
+	BlockNumber first;			/* the first logical block it maps */
+	XLogRecPtr	born;			/* its incarnation (tree_node_is()) */
+} SyncedLeaf;
+
 typedef struct SyncedBlocks
 {
 	XLogRecPtr	image_from;
 	uint64		n;
 	uint64		own;
 	XLogRecPtr	newest;
+	/*
+	 * The leaves that hold them, as the walk found them: shared by the
+	 * share, so unchanged since (a change copies a shared leaf first), and
+	 * the source's length then.  A backup begun during the share reads its
+	 * blocks' images from them (preserve_synced()).
+	 */
+	SyncedLeaf *leaves;
+	uint32		nleaves;
+	uint32		leafcap;
+	BlockNumber nblocks;
+	BlockNumber vm_nblocks;
 	/* what the walk did, for the share's DEBUG1 summary */
 	uint64		leaves_whole;	/* leaves counted whole, not looked into */
 	uint64		entries;		/* own entries looked at */
@@ -5651,6 +5669,26 @@ preserve_page_idle(RelFileLocator rel, BlockNumber blkno, PreserveWalk *walk)
 	}
 	UnlockReleaseBuffer(buf);
 	return true;
+}
+
+/* note the leaf the walk is in as holding synced blocks, once */
+static void
+synced_note_leaf(SyncedBlocks *synced, BlockNumber node, BlockNumber first,
+				 XLogRecPtr born)
+{
+	if (synced->nleaves > 0 && synced->leaves[synced->nleaves - 1].node == node)
+		return;
+	if (synced->nleaves == synced->leafcap)
+	{
+		synced->leafcap = Max(16, synced->leafcap * 2);
+		synced->leaves = synced->leaves ?
+			repalloc_array(synced->leaves, SyncedLeaf, synced->leafcap) :
+			palloc_array(SyncedLeaf, synced->leafcap);
+	}
+	synced->leaves[synced->nleaves].node = node;
+	synced->leaves[synced->nleaves].first = first;
+	synced->leaves[synced->nleaves].born = born;
+	synced->nleaves++;
 }
 
 /*
@@ -5848,6 +5886,7 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 		}
 		walk->synced->newest = Max(walk->synced->newest, lsn);
 		walk->synced->leaves_whole++;
+		synced_note_leaf(walk->synced, ptr->block, first, ptr->since);
 		pfree(entries);
 		return true;
 	}
@@ -5894,9 +5933,15 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 		if (held_elsewhere)
 			continue;
 		if (level == 0)
+		{
+			uint64		before = walk->synced ? walk->synced->n : 0;
+
 			done = preserve_shared_page(src, (BlockNumber) child,
 										entries[i].block, entries[i].since,
 										walk);
+			if (walk->synced && walk->synced->n > before)
+				synced_note_leaf(walk->synced, ptr->block, first, ptr->since);
+		}
 		else
 			done = tree_preserve_node(src, &entries[i], level - 1,
 									  (BlockNumber) child, nblocks,
@@ -6019,6 +6064,9 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent,
 		{
 			synced->n = synced->own = 0;
 			synced->leaves_whole = synced->entries = synced->asked = 0;
+			synced->nleaves = 0;
+			synced->nblocks = header->nblocks;
+			synced->vm_nblocks = header->vm_nblocks;
 			synced->newest = InvalidXLogRecPtr;
 		}
 		walk.busy = InvalidBlockNumber;
@@ -6521,101 +6569,66 @@ bmap_standby_hold(bool *backups)
 	return pg_atomic_read_u64(&bmap_shared->standby_hold);
 }
 
-/* one block's image, read from the page store, as preserve_synced() logs it */
-static void
-preserve_synced_block(RelFileLocator rel, uint64 key, BlockNumber phys)
-{
-	PGIOAlignedBlock copy;
-	void	   *page = copy.data;
-
-	mdreadv(store_smgr(rel), MAIN_FORKNUM, phys, &page, 1);
-	XLogBeginInsert();
-	XLogRegisterData(&phys, sizeof(phys));
-	XLogRegisterBlock(0, &rel, key_fork(key), key_block(key), copy.data,
-					  REGBUF_FORCE_IMAGE | key_image_flags(key));
-	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
-	CHECK_FOR_INTERRUPTS();
-}
-
-/* preserve_synced() under one node of the tree; the blocks logged, counted */
-static uint64
-preserve_synced_node(RelFileLocator rel, BlockNumber node, uint16 level,
-					 uint64 first, BlockNumber nblocks, BlockNumber vm_nblocks,
-					 XLogRecPtr image_from)
-{
-	BmapEntry  *entries;
-	Buffer		buf;
-	uint64		n = 0;
-
-	if (!range_in_length(nblocks, vm_nblocks, first, first + tree_span(level)))
-		return 0;
-	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
-	buf = tree_read(rel, node, RBM_NORMAL);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
-		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
-	UnlockReleaseBuffer(buf);
-	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
-	{
-		uint64		child = first + (level == 0 ? i : i * tree_span(level - 1));
-
-		if (!BlockNumberIsValid(entries[i].block))
-			continue;
-		if (level > 0)
-			n += preserve_synced_node(rel, entries[i].block, level - 1, child,
-									  nblocks, vm_nblocks, image_from);
-		else if (entries[i].since < image_from &&
-				 range_in_length(nblocks, vm_nblocks, child, child + 1))
-		{
-			preserve_synced_block(rel, child, entries[i].block);
-			n++;
-		}
-	}
-	pfree(entries);
-	return n;
-}
-
 /*
  * Log images of the own blocks a share synced (SyncedBlocks), read from the
  * page store, after the share's record: for a base backup begun while the
- * share ran, which may have copied a block before it was written.  The
- * blocks aren't listed, so the source's map is walked again for every block
- * it got before 'image_from': those the share synced, and those shared
- * before it, which are logged too.  Every one is shared, so nothing changes
- * them in place (and the caller still keeps the source from changing): each
- * holds its page as at the share, which its image's redo writes there
- * again, as preserve_shared_page()'s does.
+ * share ran, which may have copied a block before it was written.  They
+ * are found on the leaves the share's walk noted, read as they were then:
+ * shared by the share, a leaf doesn't change in place (a change copies it
+ * first), as the source may since, in a prune or a row lock.  Each entry
+ * got before 'image_from' is logged, which takes in those of a leaf the
+ * share found shared already too.  The images name the copy, 'dst', whose
+ * map names the same blocks as the leaves, and whose buffer their redo
+ * restores (the source's may name another block by then).  Every block is
+ * shared, so nothing changes it in place: each holds its page as at the
+ * share, which its image's redo writes there again, as
+ * preserve_shared_page()'s does.
  */
 static void
-preserve_synced(SMgrRelation src, SyncedBlocks *synced)
+preserve_synced(SMgrRelation src, SMgrRelation dst, SyncedBlocks *synced)
 {
-	RelFileLocator rel = src->smgr_rlocator.locator;
-	Buffer		buf;
-	BmapHeader	header;
-	BmapRoot	root;
-	uint64		first = 0;
+	RelFileLocator srel = src->smgr_rlocator.locator;
+	RelFileLocator drel = dst->smgr_rlocator.locator;
+	BmapEntry  *entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
 	uint64		n = 0;
 
-	buf = map_read(rel, 0);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	header = *PageGetBmapHeader(BufferGetPage(buf));
-	UnlockReleaseBuffer(buf);
-	buf = map_read(rel, 1);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
-	root = *PageGetBmapRoot(BufferGetPage(buf));
-	UnlockReleaseBuffer(buf);
-	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	for (uint32 l = 0; l < synced->nleaves; l++)
 	{
-		if (BlockNumberIsValid(root.top[k].block))
-			n += preserve_synced_node(rel, root.top[k].block, k, first,
-									  header.nblocks, header.vm_nblocks,
-									  synced->image_from);
-		first += tree_span(k);
+		const SyncedLeaf *leaf = &synced->leaves[l];
+		Buffer		buf = tree_read(srel, leaf->node, RBM_NORMAL);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!tree_node_is(BufferGetPage(buf), 0, leaf->first, leaf->born))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+							leaf->node, relpath(src->smgr_rlocator, MAIN_FORKNUM).str)));
+		memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+			   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+		UnlockReleaseBuffer(buf);
+		for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+		{
+			uint64		key = (uint64) leaf->first + i;
+			PGIOAlignedBlock copy;
+			void	   *page = copy.data;
+
+			if (!BlockNumberIsValid(entries[i].block) ||
+				entries[i].since >= synced->image_from ||
+				!range_in_length(synced->nblocks, synced->vm_nblocks, key, key + 1))
+				continue;
+			mdreadv(store_smgr(srel), MAIN_FORKNUM, entries[i].block, &page, 1);
+			XLogBeginInsert();
+			XLogRegisterData(&entries[i].block, sizeof(BlockNumber));
+			XLogRegisterBlock(0, &drel, key_fork(key), key_block(key), copy.data,
+							  REGBUF_FORCE_IMAGE | key_image_flags(key));
+			XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
+			n++;
+			CHECK_FOR_INTERRUPTS();
+		}
 	}
-	elog(DEBUG1, "a share of %s logged images of " UINT64_FORMAT " blocks it got before the checkpoint, a backup having begun",
-		 relpathperm(rel, MAIN_FORKNUM).str, n);
+	pfree(entries);
+	elog(DEBUG1, "a share of %s logged images of " UINT64_FORMAT " blocks on the %u leaves it synced, a backup having begun",
+		 relpathperm(srel, MAIN_FORKNUM).str, n, synced->nleaves);
 }
 
 /*
@@ -6847,7 +6860,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 		 */
 		backup_state(&backups_now, &backup_start_now);
 		if (backups_now > 0 || backup_start_now != backup_start)
-			preserve_synced(src, &synced);
+			preserve_synced(src, dst, &synced);
 
 		/*
 		 * Said in pg_control, once the blocks are durable: no recovery may
@@ -6859,6 +6872,8 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	if (synced.own > 0)
 		store_flush_end(srel, false);
 	LockRelease(&sweeptag, ShareLock, false);
+	if (synced.leaves)
+		pfree(synced.leaves);
 }
 
 /*
