@@ -187,6 +187,12 @@ CREATE FUNCTION test_bmap_root_capture(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A frozen root captured of storage 'copy', recorded as of 'of' at its
+-- epoch now.
+CREATE FUNCTION test_bmap_root_capture_of(copy oid, "of" oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_root_release(id int8)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

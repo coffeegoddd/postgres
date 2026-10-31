@@ -494,7 +494,9 @@ typedef struct xl_bmap_root
 	TransactionId frozenxid;	/* the database's datfrozenxid then */
 	MultiXactId minmxid;		/* the database's datminmxid then */
 	uint32		counted;		/* in the roots' counts (set by a sweep) */
-	uint32		unused;
+	uint32		map_relnumber;	/* of the map it was captured of, map_id's
+								 * (a frozen root's: the copy's, not
+								 * relnumber) */
 } xl_bmap_root;
 
 /* Block data of a roots page: slot 'index' of the page set. */
