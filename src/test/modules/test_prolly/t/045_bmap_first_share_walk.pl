@@ -106,6 +106,7 @@ my ($mixed_copy, $mwalk) = share('mixed', $mixed);
 cmp_ok($mwalk->{whole}, '>=', 2, 'the leaves unchanged since the checkpoint are counted whole');
 cmp_ok($mwalk->{entries}, '>=', 1, 'the leaf that got blocks since is looked into');
 cmp_ok(images_since($start, $mixed), '>=', 1, 'and those blocks are logged');
+is($mwalk->{asked}, 0, 'with no count asked: they were born in the map\'s epoch');
 
 my $recent = make_table('recent', 200);
 my $recent_digest = sql(qq{SELECT test_bmap_rows_digest($recent)});
@@ -115,17 +116,27 @@ is($rwalk->{whole}, 0, 'a table made since the checkpoint has no leaf counted wh
 cmp_ok(images_since($start, $recent), '>=',
 	sql(q{SELECT pg_relation_size('recent') / 8192}),
 	'every block it got since is logged');
+cmp_ok($rwalk->{entries}, '>=', 1, 'its entries are looked at');
+is($rwalk->{asked}, 0, 'with no count asked: the table was never shared');
 
-# A crash: recovery begins at the checkpoint, before every share, and each
-# copy reads what its source held, as does each source.
+# Each source changed after its share, copying every page to a block of its
+# own, and the buffers written out, the maps too: recovery from the
+# checkpoint, before every share, then skips the sources' records from
+# before it for those blocks.  Each copy must still read what its source
+# held, from the blocks the share synced or logged.
+$node->safe_psql('postgres', q{CREATE EXTENSION pg_buffercache});
+sql(q{UPDATE big SET b = 'changed'});
+sql(q{UPDATE mixed SET b = 'changed'});
+sql(q{UPDATE recent SET b = 'changed'});
+sql(q{SELECT count(*) FROM pg_buffercache_evict_all()});
 $node->stop('immediate');
 $node->start;
 is(sql(qq{SELECT test_bmap_rows_digest($big_copy)}), $big_digest,
 	'the copy of a checkpointed table survives a crash');
-is(sql(qq{SELECT test_bmap_rows_digest($big)}), $big_digest, 'as does its source');
+isnt(sql(qq{SELECT test_bmap_rows_digest($big)}), $big_digest, 'its source has its change');
 is(sql(qq{SELECT test_bmap_rows_digest($mixed_copy)}), $mixed_digest,
 	'the copy of a table changed since the checkpoint survives it');
-is(sql(qq{SELECT test_bmap_rows_digest($mixed)}), $mixed_digest, 'as does its source');
+isnt(sql(qq{SELECT test_bmap_rows_digest($mixed)}), $mixed_digest, 'as does its source');
 is(sql(qq{SELECT test_bmap_rows_digest($recent_copy)}), $recent_digest,
 	'the copy of a table made since the checkpoint survives it');
 

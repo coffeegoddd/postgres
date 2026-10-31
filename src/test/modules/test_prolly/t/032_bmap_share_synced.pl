@@ -217,15 +217,22 @@ SKIP:
 	my $during_backup = $primary->background_psql('postgres');
 	$during_backup->query_safe(q{SET client_min_messages = warning});
 	$during_backup->query_safe(q{SELECT pg_backup_start('share_synced_during', true)});
+	# A row lock on the source meanwhile copies its first page to a block of
+	# its own: the images still come from the blocks the share synced, as
+	# the copy holds them.
+	my $first_block = sql(qq{SELECT phys FROM test_bmap_map($during) WHERE blkno = 0});
+	sql(q{SELECT a FROM during WHERE a = 1 FOR UPDATE});
+	isnt(sql(qq{SELECT phys FROM test_bmap_map($during) WHERE blkno = 0}), $first_block,
+		'a row lock during the share copies the source\'s page');
 	sql(q{SELECT injection_points_detach('bmap-share-sync')});
 	sql(q{SELECT injection_points_wakeup('bmap-share-sync')});
 	my $during_copy = $sharing->query_safe(q{\\echo :during_copy});
 	$sharing->quit;
-	ok($primary->log_contains(qr/a share of .* logged images of \d+ blocks it got before the checkpoint, a backup having begun/,
+	ok($primary->log_contains(qr/a share of .* logged images of \d+ blocks on the \d+ leaves it synced, a backup having begun/,
 			$log_offset),
 		'a backup begun while a share syncs its blocks gets their images');
-	cmp_ok(images_since($start, $during), '>=', sql(q{SELECT pg_relation_size('during') / 8192}),
-		'logged after the share\'s record');
+	cmp_ok(images_since($start, $during_copy), '>=', sql(q{SELECT pg_relation_size('during') / 8192}),
+		'logged after the share\'s record, as the copy\'s, the page copied since too');
 
 	# The backup's files copied, the source's map newer than the share (its
 	# first page copied, and written out), and the backup restored: it
