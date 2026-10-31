@@ -17,6 +17,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $primary = PostgreSQL::Test::Cluster->new('standby_hold');
 $primary->init(allows_streaming => 1);
@@ -222,5 +223,49 @@ $primary->restart;
 is(sql(q{SELECT hold IS NULL FROM test_bmap_standby_hold()}), 't',
 	'after a restart, a hold past the cap is let go of before any checkpoint');
 
+# And after a crash: the end-of-recovery checkpoint computes the hold in
+# recovery, uncapped, so it is the computation as recovery ends that lets
+# it go of; said once, by whichever process computes it first, however many
+# do after (the checkpointer's next checkpoint).
+$primary->append_conf('postgresql.conf', 'block_map_standby_hold_max_size = -1');
+$primary->reload;
+$standby->start;
+ok($primary->poll_query_until('postgres', q{SELECT hold IS NOT NULL FROM test_bmap_standby_hold()}),
+	'with no cap, the slot holds again, before a crash');
+$standby->stop;
+$primary->append_conf('postgresql.conf', 'block_map_standby_hold_max_size = 0');
+my $crash_log = -s $primary->logfile;
+$primary->stop('immediate');
+$primary->start;
+is(sql(q{SELECT hold IS NULL FROM test_bmap_standby_hold()}), 't',
+	'after a crash, a hold past the cap is let go of as recovery ends');
+sql(q{CHECKPOINT});
+my $said = () = slurp_file($primary->logfile, $crash_log) =~
+  /letting go of replication slot "standby"'s hold/g;
+is($said, 1, 'saying so once, though a checkpoint computes the hold again');
+
+# A standby's restartpoint wakes its walreceiver, which reports the hold it
+# moves at once, not at its next status interval (a minute here): the
+# primary holds less, sooner.
+$primary->append_conf('postgresql.conf', 'block_map_standby_hold_max_size = -1');
+$primary->reload;
+$standby->append_conf('postgresql.conf', 'wal_receiver_status_interval = 60s');
+$standby->start;
+ok($primary->poll_query_until('postgres', q{SELECT hold IS NOT NULL FROM test_bmap_standby_hold()}),
+	'the standby holds');
+sql(q{CHECKPOINT});
+$primary->wait_for_replay_catchup($standby);
+my $held = sql(q{SELECT hold FROM test_bmap_standby_hold()});
+$standby->safe_psql('postgres', q{CHECKPOINT});
+my $moved = 0;
+for (1 .. 100)
+{
+	$moved = sql(qq{SELECT hold > '$held' FROM test_bmap_standby_hold()}) eq 't';
+	last if $moved;
+	usleep(100_000);
+}
+ok($moved, 'a restartpoint on the standby moves the primary\'s hold within seconds');
+
+$standby->stop;
 $primary->stop;
 done_testing();

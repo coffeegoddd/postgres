@@ -57,7 +57,7 @@ patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL de
 patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
 patch src/backend/access/transam/twophase.c  1a  says whether a transaction is prepared or being prepared (TwoPhaseTransactionIsKnown), so its block-mapped storage isn't taken for an orphan
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
-patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), and says where (XLogSyncedSince), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start; tells the block map where recovery ended (bmap_recovery_done); says where a recovery of this server may begin, an online backup running on it included (GetRecoveryHold)
+patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), and says where (XLogSyncedSince), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start; tells the block map where recovery ended (bmap_recovery_done); says where a recovery of this server may begin, an online backup running on it included (GetRecoveryHold); wakes the walreceiver after a restartpoint, to report the hold it moved
 patch src/backend/access/transam/xlogrecovery.c  1a  skips the consistency check of a block whose storage was replaced after the record
 patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storage was replaced after the record, and tells the storage manager before a full-page image is restored
 patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers
@@ -127,7 +127,7 @@ patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped
 patch src/include/postmaster/autovacuum.h  1a  declares block_map_release_max_per_pass
-patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold
+patch src/include/replication/slot.h  1a  ReplicationSlotPersistentData.recovery_hold, a physical slot's standby's hold; ReplicationSlot.recovery_hold_warned, the hold last said to be let go of
 patch src/include/replication/walsender.h  1a  declares WalSndComputeRecoveryHold
 patch src/include/replication/walsender_private.h  1a  WalSnd keeps the standby's reported hold and whether a backup runs on it
 patch src/include/storage/buf_internals.h  1a  buffer flags and generation for pages prepared before they change
