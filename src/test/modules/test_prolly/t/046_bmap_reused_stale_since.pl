@@ -130,6 +130,10 @@ $primary->safe_psql('postgres', q{
 	INSERT INTO e SELECT g, repeat('e', 200) FROM generate_series(1, 30 * 34) g;
 });
 $primary->wait_for_replay_catchup($standby);
+# (the replay changed the leaf in its buffer: this check can tell a dirty one)
+cmp_ok($standby->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_buffercache WHERE isdirty AND relfilenode = 9421}), '>', 0,
+	'the extensions\' replay dirtied the leaf before it was written out');
 $standby->safe_psql('postgres', q{SELECT count(*) FROM pg_buffercache_evict_all()});
 $standby->stop('immediate');
 $standby->start;
