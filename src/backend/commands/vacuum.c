@@ -1139,7 +1139,8 @@ setting_given(const char *name)
  * copy), and no VACUUM of either relation needs to copy it to freeze it
  * later.  So is a shared page VACUUM copies anyway (pruning it, or setting
  * it all-visible); pages a read set all-visible are scanned for it, under
- * the eager scan's failure cap.  Otherwise a shared page freezes by
+ * the eager scan's failure cap (none with
+ * vacuum_max_eager_freeze_failure_rate 0).  Otherwise a shared page freezes by
  * FreezeLimit, as any: its freeze age stays the normal one, so an
  * aggressive VACUUM copies no shared page only to freeze tuples younger
  * than it.  The cost is the freeze WAL of the own pages, earlier than it
