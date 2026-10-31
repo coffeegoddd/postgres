@@ -35,5 +35,7 @@ extern uint64_t pgstore_disk_bytes(ChunkStore *cs);
 extern void pgstore_set_cache(ChunkStore *cs, uint64_t bytes);
 /* Reads served by the server since open (not from the store's cache). */
 extern uint64_t pgstore_server_reads(ChunkStore *cs);
+extern double pgstore_server_read_secs(ChunkStore *cs);
+extern uint64_t pgstore_server_read_calls(ChunkStore *cs);
 
 #endif							/* PGSTORE_H */

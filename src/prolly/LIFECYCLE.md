@@ -2079,8 +2079,103 @@ indexes kept:
   likely noise of a single run.)
 
 **Not measured.**  Merging packs; a remote shared by concurrent pushers;
-chunks kept compressed in the page store; the page store's read path for
-pulls; the working-set rebuild after a clone; a real S3.
+chunks kept compressed in the page store; the working-set rebuild after a
+clone; a real S3.  (The page store's read path for pulls: next section.)
+
+## Pulls that scale: grafting merges
+
+With the three adjustments in, a pull of 10,000 changed rows into the page
+store still took 2.5× the directory store's time at 10M rows, against
+1.3× at 1M: it grew with the database.  Pull is a fetch, then a merge of
+the fetched head into the local branch, then a flush.  The merge was the
+part that grew.
+
+**Diagnosis.**  The page store counts its reads of the server and their
+time, and `PROLLY_TRACE=1` prints each step's elapsed time (`trace.h`: the
+transfer's plan, copy and adopt; the merge's diffs and apply; the page
+store's flush, by part).  The bench's cache budget is settable
+(`PGSTORE_CACHE_MB`).  A pull of 10,000 rows each side, levels batched,
+10M rows unless said:
+
+| | 1M rows | 10M rows | 10M rows, cache 8 GB |
+|---|---:|---:|---:|
+| Pull | 1.28 s | 3.02 s | 1.91 s |
+| Chunks the merge read from the server | 3,037 | 33,992 | 0 |
+| Time in those reads | 0.06 s | 0.82 s | 0 |
+
+- **The merge reads every changed leaf, three times over:** a key-by-key
+  three-way merge diffs base to ours and base to theirs down to every row,
+  then applies theirs' rows to ours, reading ours' leaves on each path and
+  writing them anew.  For 10,000 rows changed each side, at random, that
+  is about 10,000 leaves of each of base, ours and theirs, and 27,500 new
+  chunks to flush.
+- **The cache only hides it.**  The local working of a merge is the
+  changed leaves of three trees; at 1M rows they mostly fit the 256 MB
+  client cache, at 10M they mostly do not, and each miss was a round trip
+  (24 µs on a local socket).  An 8 GB cache takes the misses away but is
+  no way to scale.
+- **Batching the reads is not enough either.**  Reading the merge's nodes
+  ahead a tree level at a time, one statement a level (`get_many` on the
+  page store: 2,000 chunks a statement), took the 34k reads to 21 round
+  trips and 0.19 s, and the pull to 2.5 s: the rest was hashing, decoding
+  and rewriting the same leaves.
+
+**What Dolt does.**  Its node cache is the same 256 MiB, capped there; a
+miss is a read of a local file the OS caches, cheap but still a read.
+What keeps its merge small is that `ThreeWayMerge` works in *range
+patches*: the two diffs walk the trees together, and a subtree only one
+side changed comes out as one patch at its level, the range's new
+subtree by address, applied without reading it or the base below it.
+Only ranges both sides changed are split down to rows.
+
+**The grafting merge.**  The same idea, built into `prolly_merge`:
+
+- Each diff is given the other side's tree.  A subtree the diff would
+  descend into, where the other side still has base's subtree with the
+  same keys (the same entry, after the same key, at the same level), is
+  not walked: none of the other side's changes are in it.  For theirs,
+  that subtree is a *graft*: its entry, by ref.
+- Rows are diffed only where both sides changed the same subtree, and
+  conflicts are found among those, as before.
+- The apply puts the grafts in first, a level at a time from the
+  highest, then theirs' row edits, each step an ordinary apply to the
+  tree the step before left.  So every rechunking reads the merged rows:
+  a rechunking that crosses the start of a graft (an edit just before it
+  moving the boundary there) reads theirs' subtree, not base's.  The
+  result is the tree applying both sides' edits to base would give.
+  (Applying the rows first and the grafts after does not: the test
+  catches it.)
+
+`test_merge_grafts` checks the result against applying both sides'
+edits to base for random edits (runs, scattered updates, inserts and
+deletes, one side or both busy, both directions), including the cases
+where a rechunking crosses a graft's start; 5,000 trials passed.  A block
+of 4,000 rows theirs rewrote merges with 13 reads and 2 grafts.
+
+**Measured.**  10M rows, a pull of 10,000 rows each side:
+
+| | Key by key | Grafting |
+|---|---:|---:|
+| Page store, cache 256 MB | 3.02 s | 1.28 s |
+| Page store, cache 64 MB | 2.61 s (read ahead) | 1.60 s |
+| Directory store | 1.42 s | 1.07 s |
+| Merge, page store 256 MB | 1.50 s | 0.32 s |
+| Merge's reads of the server, 256 MB | 33,992 | 370 |
+| Merge's reads of the server, 64 MB | 35,406 | 3,759 |
+| Rows diffed, each side | ~20,000 | ~2,000, and 16,951 grafts on 2 levels |
+
+- **Pull is now 1.2× the directory store,** the same as push and fetch,
+  down from 2.1–2.5×.  The parts, page store against directory store:
+  fetch 0.44 s against 0.46 s, merge 0.32 s against 0.26 s, flush 0.52 s
+  against 0.34 s.
+- **The merge's work follows the changed paths, not the database:** the
+  rows it reads and writes are those of subtrees both sides changed, and
+  the rest is interior nodes.  A quarter of the cache costs 0.12 s more
+  merge, not seconds.
+- **What is left of a pull is its change:** the fetch's chunks and the
+  flush of them, both in proportion to the rows changed.
+- The read-ahead is gone from the merge (it read the leaves grafting
+  skips); the page store keeps `get_many` for transfers.
 
 ## Evidence so far
 

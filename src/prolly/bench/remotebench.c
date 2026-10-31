@@ -239,6 +239,9 @@ typedef struct Snap
 	RemoteStats rs;
 	ChunkStoreStats ls;
 	uint64_t	wal;
+	uint64_t	sreads;			/* the page store's reads of the server */
+	uint64_t	scalls;			/* and the round trips they took */
+	double		sread_secs;
 } Snap;
 
 static Snap
@@ -250,6 +253,9 @@ snap(Remote *rm, ChunkStore *local)
 	s.rs = *remote_stats(rm);
 	s.ls = local ? local->stats : (ChunkStoreStats) {0};
 	s.wal = wal_pos();
+	s.sreads = (local && pg_conninfo) ? pgstore_server_reads(local) : 0;
+	s.scalls = (local && pg_conninfo) ? pgstore_server_read_calls(local) : 0;
+	s.sread_secs = (local && pg_conninfo) ? pgstore_server_read_secs(local) : 0;
 	return s;
 }
 
@@ -261,7 +267,8 @@ report(const char *op, const char *how, Remote *rm, ChunkStore *local,
 	PackStoreStats *pst = ps ? packstore_stats(ps) : NULL;
 
 	printf("%-8s %-12s %8.3f s  open %7.3f s  remote %7.3f s  req %7llu  "
-		   "up %10llu B  down %10llu B  new %7llu chunks %10llu B  ranges %7llu  idx %9llu B  wal %10llu B\n",
+		   "up %10llu B  down %10llu B  new %7llu chunks %10llu B  ranges %7llu  idx %9llu B  wal %10llu B  "
+		   "sreads %7llu in %7llu trips %7.3f s\n",
 		   op, how, b.t - a.t, open_secs, b.rs.secs - a.rs.secs,
 		   (unsigned long long) (b.rs.requests - a.rs.requests),
 		   (unsigned long long) (b.rs.bytes_up - a.rs.bytes_up),
@@ -270,7 +277,9 @@ report(const char *op, const char *how, Remote *rm, ChunkStore *local,
 		   (unsigned long long) (b.ls.new_bytes - a.ls.new_bytes),
 		   (unsigned long long) (pst ? pst->range_gets : 0),
 		   (unsigned long long) (pst ? pst->index_bytes - idx_base : 0),
-		   (unsigned long long) (b.wal - a.wal));
+		   (unsigned long long) (b.wal - a.wal),
+		   (unsigned long long) (b.sreads - a.sreads), (unsigned long long) (b.scalls - a.scalls),
+		   b.sread_secs - a.sread_secs);
 	fflush(stdout);
 }
 
@@ -589,11 +598,27 @@ main(int argc, char **argv)
 					VcMergeResult res;
 					Snap		a = snap(rm, cs3);
 					ChunkStore *ps = client_repo(1, rm, &rr, &os);
-					int			rc = vc_pull(&c3, &rr, "main", 0, &res);
+					PHash		fh;
+					double		t0 = now_secs(),
+								t1,
+								t2;
+					uint64_t	r1;
+					int			rc;
 
+					/* the pull's parts: its fetch, its merge, the flush */
+					if (vc_fetch(&c3, &rr, "main", &fh) != VC_OK)
+						die("pull's fetch failed");
+					t1 = now_secs();
+					r1 = pg_conninfo ? pgstore_server_reads(cs3) : 0;
+					rc = vc_pull(&c3, &rr, "main", 0, &res);
 					if (rc != VC_OK)
 						die("pull failed");
+					t2 = now_secs();
 					local_flush(cs3);
+					printf("#   pull parts: fetch %.3f s, merge %.3f s (%llu server reads), flush %.3f s\n",
+						   t1 - t0, t2 - t1,
+						   (unsigned long long) ((pg_conninfo ? pgstore_server_reads(cs3) : 0) - r1),
+						   now_secs() - t2);
 					report("pull", tag, rm, cs3, ps, a, os);
 					vc_repo_free(&rr);
 					client_done(1, ps, rm);

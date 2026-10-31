@@ -18,10 +18,12 @@
  * the least recently used let go first, and only at a flush (which is when
  * bytes returned by get may become invalid, as with dirstore).
  */
+#include "../trace.h"
 #include <libpq-fe.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "pgstore.h"
 
@@ -68,6 +70,8 @@ typedef struct PgStore
 	bool		has_state,
 				state_dirty;
 	uint64_t	server_reads;
+	double		server_read_secs;	/* spent in them */
+	uint64_t	server_read_calls;	/* round trips for them */
 	uint64_t	tick;
 	uint64_t	cache_budget;	/* bytes of flushed chunks kept across a flush */
 } PgStore;
@@ -265,7 +269,13 @@ pg_get(ChunkStore *cs, const PHash *h, size_t *len)
 
 		snprintf(loc, sizeof(loc), "%lld", (long long) e->loc);
 		snprintf(l, sizeof(l), "%zu", e->len);
+		struct timespec t0,
+					t1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
 		res = PQexecParams(ps->c, sql, 2, NULL, vals, NULL, NULL, 1);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		ps->server_read_secs += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 		free(sql);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
 			(size_t) PQgetlength(res, 0, 0) != e->len)
@@ -276,6 +286,7 @@ pg_get(ChunkStore *cs, const PHash *h, size_t *len)
 		e->data = px_memdup(PQgetvalue(res, 0, 0), e->len);
 		PQclear(res);
 		ps->server_reads++;
+		ps->server_read_calls++;
 		/* what the server sent must be the chunk asked for */
 		{
 			PHash		got;
@@ -290,6 +301,108 @@ pg_get(ChunkStore *cs, const PHash *h, size_t *len)
 	}
 	*len = e->len;
 	return e->data;
+}
+
+#define GET_MANY_BATCH 2000
+
+/*
+ * Several chunks at once: those not cached read from the server in
+ * statements of GET_MANY_BATCH chunks each (one round trip a statement),
+ * each checked against its hash, and kept cached as pg_get keeps them.
+ */
+static bool
+pg_get_many(ChunkStore *cs, const PHash *hs, size_t n, const uint8_t **out,
+			size_t *lens)
+{
+	PgStore    *ps = (PgStore *) cs;
+	PEntry	  **want = px_malloc((n ? n : 1) * sizeof(PEntry *));
+	size_t		nwant = 0;
+	char	   *sql = in_schema(ps, "SELECT cp.cp_read('%s.pages', u.l, u.n) "
+								"FROM unnest($1::int8[], $2::int4[]) WITH ORDINALITY AS u(l, n, o) "
+								"ORDER BY u.o");
+
+	for (size_t i = 0; i < n; i++)
+	{
+		PEntry	   *e = find(ps, &hs[i]);
+
+		if (e && e->data == NULL)
+		{
+			bool		dup = false;
+
+			/* (a hash asked twice is read once) */
+			for (size_t k = nwant > 64 ? nwant - 64 : 0; k < nwant; k++)
+				dup |= want[k] == e;
+			if (!dup)
+				want[nwant++] = e;
+		}
+	}
+	for (size_t lo = 0; lo < nwant; lo += GET_MANY_BATCH)
+	{
+		size_t		hi = lo + GET_MANY_BATCH < nwant ? lo + GET_MANY_BATCH : nwant;
+		Buf			locs = {0},
+					ls = {0};
+		char		num[32];
+		const char *vals[2];
+		PGresult   *res;
+		struct timespec t0,
+					t1;
+
+		buf_append(&locs, "{", 1);
+		buf_append(&ls, "{", 1);
+		for (size_t i = lo; i < hi; i++)
+		{
+			snprintf(num, sizeof(num), "%s%lld", i > lo ? "," : "", (long long) want[i]->loc);
+			buf_append(&locs, num, strlen(num));
+			snprintf(num, sizeof(num), "%s%zu", i > lo ? "," : "", want[i]->len);
+			buf_append(&ls, num, strlen(num));
+		}
+		buf_append(&locs, "}", 2);
+		buf_append(&ls, "}", 2);
+		vals[0] = (const char *) locs.data;
+		vals[1] = (const char *) ls.data;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		res = PQexecParams(ps->c, sql, 2, NULL, vals, NULL, NULL, 1);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		ps->server_read_secs += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+		free(locs.data);
+		free(ls.data);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || (size_t) PQntuples(res) != hi - lo)
+		{
+			fprintf(stderr, "pgstore: reading chunks: %s\n", PQerrorMessage(ps->c));
+			abort();
+		}
+		for (size_t i = lo; i < hi; i++)
+		{
+			PEntry	   *e = want[i];
+			PHash		got;
+
+			if ((size_t) PQgetlength(res, (int) (i - lo), 0) != e->len)
+				abort();
+			e->data = px_memdup(PQgetvalue(res, (int) (i - lo), 0), e->len);
+			e->used = ++ps->tick;
+			phash_compute(e->data, e->len, &got);
+			if (!phash_eq(&got, &e->h))
+			{
+				fprintf(stderr, "pgstore: the server's bytes for a chunk do not match its hash\n");
+				abort();
+			}
+		}
+		PQclear(res);
+		ps->server_reads += hi - lo;
+		ps->server_read_calls++;
+	}
+	free(sql);
+	free(want);
+	for (size_t i = 0; i < n; i++)
+	{
+		PEntry	   *e = find(ps, &hs[i]);
+
+		out[i] = e ? e->data : NULL;
+		lens[i] = e ? e->len : 0;
+		if (e)
+			e->used = ++ps->tick;
+	}
+	return true;
 }
 
 static bool
@@ -393,7 +506,7 @@ quiet(void *arg, const char *message)
 
 static const ChunkStoreOps pg_ops = {
 	pg_get, pg_put, pg_has, pg_meta, pg_del, pg_foreach,
-	pg_count, pg_bytes, pg_destroy, pg_note_root, NULL
+	pg_count, pg_bytes, pg_destroy, pg_note_root, pg_get_many
 };
 
 /* -------------------------------------------------------------- flushing */
@@ -621,9 +734,17 @@ pgstore_flush(ChunkStore *cs)
 		return -1;
 	if (ps->npending == 0 && ps->ndel == 0 && !ps->roots_dirty && !ps->state_dirty)
 		return 0;
+	TraceSpan	tfl = trace_begin("pgstore: flush");
+	size_t		npend = ps->npending;
+
 	must(ps, "BEGIN");
 	if (ps->npending > 0)
+	{
+		TraceSpan	tsn = trace_begin("pgstore: send chunks");
+
 		send_new(ps);
+		trace_end(tsn, "%zu chunks", npend);
+	}
 	if (ps->ndel > 0)
 	{
 		const char *vals[1];
@@ -659,6 +780,8 @@ pgstore_flush(ChunkStore *cs)
 		PQclear(res);
 		ps->ndel = 0;
 	}
+	TraceSpan	trt = trace_begin("pgstore: roots");
+
 	if (ps->roots_dirty)
 	{
 		Buf			counts = {0};
@@ -717,9 +840,17 @@ pgstore_flush(ChunkStore *cs)
 		PQclear(res);
 		ps->state_dirty = false;
 	}
-	must(ps, "COMMIT");
+	trace_end(trt, "and state");
+	{
+		TraceSpan	tc = trace_begin("pgstore: commit");
+
+		must(ps, "COMMIT");
+		trace_end(tc);
+	}
 
 	/* on the server now; the cache keeps the most recently used */
+	TraceSpan	ttrim = trace_begin("pgstore: cache trim");
+
 	{
 		PEntry	  **cached = NULL;
 		size_t		n = 0,
@@ -751,9 +882,11 @@ pgstore_flush(ChunkStore *cs)
 			}
 		}
 		free(cached);
+		trace_end(ttrim, "%zu entries, %zu cached", ps->cap, n);
 	}
 	ps->npending = 0;
 	free(arr.data);
+	trace_end(tfl);
 	return 0;
 }
 
@@ -802,6 +935,18 @@ uint64_t
 pgstore_server_reads(ChunkStore *cs)
 {
 	return ((PgStore *) cs)->server_reads;
+}
+
+double
+pgstore_server_read_secs(ChunkStore *cs)
+{
+	return ((PgStore *) cs)->server_read_secs;
+}
+
+uint64_t
+pgstore_server_read_calls(ChunkStore *cs)
+{
+	return ((PgStore *) cs)->server_read_calls;
 }
 
 static void
@@ -937,6 +1082,8 @@ pgstore_open(const char *conninfo, const char *schema, bool fresh, bool ephemera
 	ps->tab = calloc(ps->cap, sizeof(PEntry));
 	ps->ephemeral = ephemeral;
 	ps->cache_budget = 256 << 20;
+	if (getenv("PGSTORE_CACHE_MB"))
+		ps->cache_budget = (uint64_t) strtoull(getenv("PGSTORE_CACHE_MB"), NULL, 10) << 20;
 	phmap_init(&ps->roots);
 	ps->c = PQconnectdb(conninfo);
 	if (PQstatus(ps->c) != CONNECTION_OK)

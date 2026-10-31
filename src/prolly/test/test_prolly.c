@@ -477,6 +477,132 @@ test_diff_matches_model(void)
 	cs_destroy(cs);
 }
 
+/*
+ * One side's edits for a grafting trial: scattered puts, inserts and
+ * deletes, and runs of them, on keys the other side has not claimed.
+ */
+static void
+graft_side(EditBatch *b, uint8_t *claimed, uint64_t keyspace, int runs,
+		   int scattered, uint64_t version)
+{
+	for (int r = 0; r < runs + scattered; r++)
+	{
+		uint64_t	start = rnd() % keyspace;
+		uint64_t	len = r < runs ? 1 + rnd() % 400 : 1;
+		int			kind = (int) (rnd() % 3);
+
+		for (uint64_t k = start; k < start + len && k < keyspace; k++)
+		{
+			if (claimed[k])
+				continue;
+			claimed[k] = 1;
+			if (kind == 0 && k % 2 == 0)
+				batch_put(b, k, version);	/* an update */
+			else if (kind == 1 && k % 2 == 1)
+				batch_put(b, k, version);	/* an insert */
+			else if (kind == 2 && k % 2 == 0)
+				batch_del(b, k);
+		}
+	}
+}
+
+/*
+ * A merge takes theirs' subtrees ours left alone whole, by ref, and gets
+ * the same tree as applying both sides' edits to the base would, also
+ * where a rechunking next to a graft moves the boundary before it.
+ */
+static void
+test_merge_grafts(void)
+{
+	ChunkStore *cs = memstore_create();
+	ProllyCtx	ctx;
+	uint64_t	rows = 20000,
+				keyspace = rows * 2;
+	/* (in 711 and 1978, theirs onto ours, a rechunking crosses a graft's start) */
+	int			grafted = 0,
+				trials = 42;
+
+	prolly_ctx_init(&ctx, cs, &small_policy);
+	PHash		base = build_even_rows(&ctx, rows);
+
+	for (int trial = 0; trial < trials; trial++)
+	{
+		uint8_t    *claimed = calloc(keyspace, 1);
+		EditBatch	o,
+					t,
+					all;
+		PHash		ours,
+					theirs,
+					expect;
+		ProllyMergeResult mr;
+
+		int			seed = trial < 40 ? trial : trial == 40 ? 711 : 1978;
+
+		rng_seed(7000 + (uint64_t) seed);
+		batch_init(&o, keyspace);
+		batch_init(&t, keyspace);
+		batch_init(&all, keyspace);
+		/* (some trials one-sided, some with both sides busy) */
+		graft_side(&o, claimed, keyspace, seed % 4, 1 + seed % 30, 1);
+		graft_side(&t, claimed, keyspace, (seed / 4) % 5, 1 + seed % 17, 2);
+		for (size_t i = 0; i < o.n; i++)
+			all.e[all.n++] = o.e[i];
+		for (size_t i = 0; i < t.n; i++)
+			all.e[all.n++] = t.e[i];
+		ours = t_apply(&ctx, &base, o.e, o.n);
+		theirs = t_apply(&ctx, &base, t.e, t.n);
+		expect = t_apply(&ctx, &base, all.e, all.n);
+		CHECK_OK(prolly_merge(&ctx, &base, &ours, &theirs, &mr));
+		CHECK_EQ(mr.nconflicts, 0);
+		CHECK(phash_eq(&mr.root, &expect));
+		grafted += mr.ngrafts > 0;
+		prolly_merge_result_free(&mr);
+		CHECK_OK(prolly_merge(&ctx, &base, &theirs, &ours, &mr));
+		CHECK_EQ(mr.nconflicts, 0);
+		CHECK(phash_eq(&mr.root, &expect));
+		prolly_merge_result_free(&mr);
+		batch_free(&o);
+		batch_free(&t);
+		batch_free(&all);
+		free(claimed);
+	}
+	printf("(%d of %d grafted) ", grafted, trials);
+	CHECK(grafted >= trials / 2);
+
+	/*
+	 * Theirs rewrote a block of 4000 rows, ours a few rows elsewhere: the
+	 * merge reads paths, not the block's leaves on either side.
+	 */
+	{
+		EditBatch	o,
+					t;
+		PHash		ours,
+					theirs;
+		ProllyMergeResult mr;
+		uint64_t	gets;
+
+		batch_init(&o, 16);
+		batch_init(&t, 4000);
+		for (uint64_t k = 0; k < 4000; k++)
+			batch_put(&t, 10000 + k * 2, 3);
+		for (uint64_t k = 0; k < 5; k++)
+			batch_put(&o, 30000 + k * 1000, 4);
+		ours = t_apply(&ctx, &base, o.e, o.n);
+		theirs = t_apply(&ctx, &base, t.e, t.n);
+		gets = cs->stats.gets;
+		CHECK_OK(prolly_merge(&ctx, &base, &ours, &theirs, &mr));
+		gets = cs->stats.gets - gets;
+		printf("(%llu reads, %zu grafts) ", (unsigned long long) gets, mr.ngrafts);
+		CHECK(mr.ngrafts > 0);
+		CHECK(gets < 200);
+		prolly_merge_result_free(&mr);
+		batch_free(&o);
+		batch_free(&t);
+	}
+	prolly_ctx_free(&ctx);
+	cs_destroy(cs);
+}
+
 static void
 test_merge(void)
 {
@@ -822,6 +948,7 @@ main(void)
 	RUN(test_iter_from_key);
 	RUN(test_diff_matches_model);
 	RUN(test_merge);
+	RUN(test_merge_grafts);
 	RUN(test_structural_sharing);
 	RUN(test_scaling);
 	printf("test_prolly: all tests passed\n");

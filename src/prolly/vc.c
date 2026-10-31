@@ -9,6 +9,7 @@
  * the window decides otherwise), and each branch holds its working root.
  * Mutating repo calls release the context's pins once results are held.
  */
+#include "trace.h"
 #include <sys/types.h>
 #include <time.h>
 
@@ -3236,12 +3237,25 @@ transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 	/* hashes a rewriting repo gives out do not last: it has no remotes */
 	if (src->history == VC_HISTORY_REWRITE || dst->history == VC_HISTORY_REWRITE)
 		return VC_ERR_REWRITTEN;
+	TraceSpan	tplan = trace_begin("transfer: plan");
+
 	rc = plan_transfer(src, dst, heads, nheads, depth, allow_unrelated, &p);
+	trace_end(tplan, "%zu commits to send", rc == VC_OK ? p.nsend : 0);
 	if (rc != VC_OK)
 		return rc;
-	rc = plan_copy(src, dst, &p);
+	{
+		TraceSpan	tcopy = trace_begin("transfer: copy");
+
+		rc = plan_copy(src, dst, &p);
+		trace_end(tcopy);
+	}
 	if (rc == VC_OK)
+	{
+		TraceSpan	tadopt = trace_begin("transfer: adopt");
+
 		plan_adopt(dst, &p);
+		trace_end(tadopt);
+	}
 	plan_free(&p);
 	return rc;
 }
@@ -3492,8 +3506,14 @@ vc_pull(VcRepo *local, VcRepo *remote, const char *branch, uint32_t max_deepen,
 		return VC_ERR_REWRITTEN;
 
 	memset(res, 0, sizeof(*res));
-	if ((rc = vc_fetch(local, remote, branch, &head)) != VC_OK)
-		return rc;
+	{
+		TraceSpan	tf = trace_begin("pull: fetch");
+
+		rc = vc_fetch(local, remote, branch, &head);
+		trace_end(tf);
+		if (rc != VC_OK)
+			return rc;
+	}
 	snprintf(tracking, sizeof(tracking), "%s/%s", remote->name, branch);
 	if ((rc = load_commit(&local->ctx, &head, &c)) != VC_OK)
 		return rc;
@@ -3509,7 +3529,10 @@ vc_pull(VcRepo *local, VcRepo *remote, const char *branch, uint32_t max_deepen,
 		uint32_t	g,
 					seg;
 
+		TraceSpan	tm = trace_begin("pull: merge");
+
 		rc = vc_merge(local, tracking, res);
+		trace_end(tm);
 		if (rc != VC_ERR_SEVERED || used >= max_deepen)
 			return rc;
 		missing = local->ctx.err_hash;

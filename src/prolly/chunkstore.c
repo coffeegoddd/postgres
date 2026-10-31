@@ -3,6 +3,7 @@
  *	  Chunk lifetime: reference counts, roots, pins, freeing, closure copy
  *	  and the invariant audit.  Backend independent.
  */
+#include "trace.h"
 #include "chunkstore.h"
 
 static bool
@@ -304,6 +305,7 @@ cs_copy_closure(ChunkStore *src, PinSet *dst, const PHash *h, bool verify,
 }
 
 bool		cs_batched_copy = false;
+int			trace_depth = 0;
 
 typedef struct Level
 {
@@ -354,14 +356,19 @@ cs_copy_closure_levels(ChunkStore *src, PinSet *dst, const PHash *roots,
 		lv.data = px_malloc(nfront * sizeof(uint8_t *));
 		lv.len = px_malloc(nfront * sizeof(size_t));
 		src->stats.gets += nfront;
-		if (src->ops->get_many)
 		{
-			if (!src->ops->get_many(src, front, nfront, lv.data, lv.len))
-				rc = CS_ERR_MISSING;
+			TraceSpan	ts = trace_begin("copy: read a level");
+
+			if (src->ops->get_many)
+			{
+				if (!src->ops->get_many(src, front, nfront, lv.data, lv.len))
+					rc = CS_ERR_MISSING;
+			}
+			else
+				for (size_t i = 0; i < nfront; i++)
+					lv.data[i] = src->ops->get(src, &front[i], &lv.len[i]);
+			trace_end(ts, "%zu chunks (level %zu from the top)", nfront, nlevels);
 		}
-		else
-			for (size_t i = 0; i < nfront; i++)
-				lv.data[i] = src->ops->get(src, &front[i], &lv.len[i]);
 		for (size_t i = 0; i < nfront && rc == CS_OK; i++)
 		{
 			HashVec		kids = {0};
@@ -414,6 +421,9 @@ cs_copy_closure_levels(ChunkStore *src, PinSet *dst, const PHash *roots,
 	}
 	free(front);
 	/* bottom-up: a chunk's children are stored before it */
+	TraceSpan	tput = trace_begin("copy: store bottom-up");
+	size_t		nput = 0;
+
 	for (size_t l = nlevels; l-- > 0 && rc == CS_OK;)
 		for (size_t i = levels[l].n; i-- > 0 && rc == CS_OK;)
 		{
@@ -424,7 +434,9 @@ cs_copy_closure_levels(ChunkStore *src, PinSet *dst, const PHash *roots,
 			rc = cs_put(dst->cs, levels[l].data[i], levels[l].len[i], &got, err_hash);
 			if (rc == CS_OK)
 				pinset_add(dst, &got);
+			nput++;
 		}
+	trace_end(tput, "%zu chunks", nput);
 	for (size_t l = 0; l < nlevels; l++)
 	{
 		free(levels[l].h);

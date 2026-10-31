@@ -3,6 +3,7 @@
  *	  Prolly tree nodes, chunking, edits, iteration, diff, merge, chunk
  *	  diff, deltas and repair.  Node layout is in chunkfmt.h.
  */
+#include "trace.h"
 #include "prolly.h"
 
 #define REF_VAL_MAX (PHASH_LEN + 10)
@@ -1014,10 +1015,98 @@ collapse(ProllyCtx *ctx, PHash root, PHash *out)
 	}
 }
 
+/*
+ * A graft: an entry of a node at 'level' (a child's last key and its ref)
+ * to put in place of the same key's entry in another tree, the child
+ * covering the keys (lo, key], from the start of the tree if !has_lo.
+ */
+typedef struct Graft
+{
+	int			level;
+	uint8_t    *key;
+	uint32_t	klen;
+	uint8_t    *lo;
+	uint32_t	lolen;
+	bool		has_lo;
+	uint8_t    *val;
+	uint32_t	vlen;
+} Graft;
+
+typedef struct GraftList
+{
+	Graft	   *v;
+	size_t		n;
+	size_t		cap;
+} GraftList;
+
+static void
+graftlist_free(GraftList *g)
+{
+	for (size_t i = 0; i < g->n; i++)
+	{
+		free(g->v[i].key);
+		free(g->v[i].lo);
+		free(g->v[i].val);
+	}
+	free(g->v);
+	memset(g, 0, sizeof(*g));
+}
+
+/* The edits at one level, merged in key order with the grafts on that level. */
+static ProllyEdit *
+with_grafts(ProllyEdit *cur, size_t *ncur, const GraftList *g, int level)
+{
+	ProllyEdit *out;
+	size_t		n = 0,
+				a = 0;
+
+	for (size_t k = 0; k < g->n; k++)
+		n += g->v[k].level == level;
+	if (n == 0)
+		return cur;
+	out = px_malloc((*ncur + n) * sizeof(ProllyEdit));
+	n = 0;
+	for (size_t k = 0; k < g->n; k++)
+	{
+		const Graft *gr = &g->v[k];
+
+		if (gr->level != level)
+			continue;
+		while (a < *ncur && key_cmp(cur[a].key, cur[a].klen, gr->key, gr->klen) < 0)
+			out[n++] = cur[a++];
+		out[n].key = gr->key;
+		out[n].klen = gr->klen;
+		out[n].val = gr->val;
+		out[n].vlen = gr->vlen;
+		out[n].del = false;
+		n++;
+	}
+	while (a < *ncur)
+		out[n++] = cur[a++];
+	free(cur);
+	*ncur = n;
+	return out;
+}
+
+static int	apply_core(ProllyCtx *ctx, const PHash *root, const ProllyEdit *edits,
+					   size_t n, const GraftList *grafts, int glevel, PHash *out);
+
 int
 prolly_apply(ProllyCtx *ctx, const PHash *root, const ProllyEdit *edits,
 			 size_t n, PHash *out)
 {
+	return apply_core(ctx, root, edits, n, NULL, 0, out);
+}
+
+/*
+ * Applies edits to the items of the tree at root, and, given grafts, puts
+ * the entries of those on level glevel in place, as edits to that level.
+ */
+static int
+apply_core(ProllyCtx *ctx, const PHash *root, const ProllyEdit *edits,
+		   size_t n, const GraftList *grafts, int glevel, PHash *out)
+{
+	int			gtop = grafts ? glevel : -1;
 	SortEdit   *s = px_malloc(n * sizeof(SortEdit));
 	ProllyEdit *cur = px_malloc(n * sizeof(ProllyEdit));
 	size_t		ncur = 0;
@@ -1057,8 +1146,10 @@ prolly_apply(ProllyCtx *ctx, const PHash *root, const ProllyEdit *edits,
 	free(s);
 
 	*out = *root;
-	for (int level = 0; ncur > 0 && rc == PROLLY_OK; level++)
+	for (int level = 0; (ncur > 0 || level <= gtop) && rc == PROLLY_OK; level++)
 	{
+		if (grafts && level == glevel)
+			cur = with_grafts(cur, &ncur, grafts, level);
 		if (level < top)
 		{
 			EditBuf		next = {0};
@@ -1143,13 +1234,81 @@ drain(Cursor *c, bool removed, ProllyDiffFn fn, void *arg)
 }
 
 /*
+ * The key just before the entry the cursor is at on level d: the entry
+ * before it in its node, or, for a node's first entry, the key of the
+ * entry before its parent's (the last key of the subtree before).  False
+ * at the start of the tree.
+ */
+static bool
+entry_prev_key(const Cursor *c, int d, const uint8_t **k, uint32_t *kl)
+{
+	for (int l = d; l <= c->top; l++)
+		if (c->n[l] && c->i[l] > 0)
+		{
+			*k = c->n[l]->k[c->i[l] - 1];
+			*kl = c->n[l]->kl[c->i[l] - 1];
+			return true;
+		}
+	return false;
+}
+
+static bool
+same_lo(bool ha, const uint8_t *a, uint32_t al, bool hb, const uint8_t *b, uint32_t bl)
+{
+	return ha == hb && (!ha || key_cmp(a, al, b, bl) == 0);
+}
+
+/*
+ * Whether the tree at root has, on level 'level', the entry (key -> the
+ * child h), right after the key lo: the same subtree, covering the same
+ * keys.  Reads root's path down to that level.
+ */
+static int
+tree_has_entry(ProllyCtx *ctx, const PHash *root, int level,
+			   const uint8_t *key, uint32_t klen, bool has_lo,
+			   const uint8_t *lo, uint32_t lolen, const PHash *h, bool *has)
+{
+	Cursor		c;
+	int			rc;
+
+	*has = false;
+	rc = cursor_seek(&c, ctx, root, level, key, klen);
+	if (rc == PROLLY_OK && !c.end && c.top >= level && c.n[level] &&
+		c.i[level] < c.n[level]->count)
+	{
+		Node	   *n = c.n[level];
+		uint32_t	i = c.i[level];
+		PHash		ch;
+		uint64_t	t;
+		const uint8_t *pk = NULL;
+		uint32_t	pkl = 0;
+		bool		hp;
+
+		if (key_cmp(n->k[i], n->kl[i], key, klen) == 0)
+		{
+			node_child(n, i, &ch, &t);
+			hp = entry_prev_key(&c, level, &pk, &pkl);
+			*has = phash_eq(&ch, h) && same_lo(hp, pk, pkl, has_lo, lo, lolen);
+		}
+	}
+	cursor_close(&c);
+	return rc;
+}
+
+/*
  * Walks two trees in key order, skipping subtrees with equal hashes
  * without reading them.  Every node either side does read is recorded in
  * la / lb when given.
+ *
+ * With 'other' (a third tree changed from 'from' on its own), a subtree
+ * 'to' changed where 'other' still has from's subtree, covering the same
+ * keys, is not walked either: none of other's changes are in it.  Such a
+ * subtree of 'to' goes to grafts, if given, to be taken whole.
  */
 static int
 diff_core(ProllyCtx *ctx, const PHash *from, const PHash *to,
-		  ProllyDiffFn fn, void *arg, PHashMap *la, PHashMap *lb)
+		  ProllyDiffFn fn, void *arg, PHashMap *la, PHashMap *lb,
+		  const PHash *other, GraftList *grafts)
 {
 	Cursor		a,
 				b;
@@ -1181,6 +1340,50 @@ diff_core(ProllyCtx *ctx, const PHash *from, const PHash *to,
 					cursor_advance(&a);
 					cursor_advance(&b);
 					continue;
+				}
+				if (other)
+				{
+					Node	   *na = a.n[da],
+							   *nb = b.n[db];
+					uint32_t	ia = a.i[da],
+								ib = b.i[db];
+					const uint8_t *la_k = NULL,
+							   *lb_k = NULL;
+					uint32_t	la_l = 0,
+								lb_l = 0;
+					bool		hla = entry_prev_key(&a, da, &la_k, &la_l),
+								hlb = entry_prev_key(&b, db, &lb_k, &lb_l),
+								has = false;
+
+					/* the same keys on both sides, and other has from's */
+					if (key_cmp(na->k[ia], na->kl[ia], nb->k[ib], nb->kl[ib]) == 0 &&
+						same_lo(hla, la_k, la_l, hlb, lb_k, lb_l))
+						rc = tree_has_entry(ctx, other, da, na->k[ia], na->kl[ia],
+											hla, la_k, la_l, &ha, &has);
+					if (rc != PROLLY_OK)
+						continue;
+					if (has)
+					{
+						if (grafts)
+						{
+							Graft	   *g;
+
+							px_grow((void **) &grafts->v, &grafts->cap,
+									grafts->n + 1, sizeof(Graft));
+							g = &grafts->v[grafts->n++];
+							g->level = db;
+							g->key = px_memdup(nb->k[ib], nb->kl[ib]);
+							g->klen = nb->kl[ib];
+							g->has_lo = hlb;
+							g->lo = hlb ? px_memdup(lb_k, lb_l) : NULL;
+							g->lolen = lb_l;
+							g->val = px_memdup(nb->v[ib], nb->vl[ib]);
+							g->vlen = nb->vl[ib];
+						}
+						cursor_advance(&a);
+						cursor_advance(&b);
+						continue;
+					}
 				}
 			}
 			if (da >= db && da > 0)
@@ -1236,7 +1439,7 @@ prolly_diff(ProllyCtx *ctx, const PHash *from, const PHash *to,
 {
 	if (phash_eq(from, to))
 		return PROLLY_OK;
-	return diff_core(ctx, from, to, fn, arg, NULL, NULL);
+	return diff_core(ctx, from, to, fn, arg, NULL, NULL, NULL, NULL);
 }
 
 static void
@@ -1281,7 +1484,7 @@ prolly_chunk_diff(ProllyCtx *ctx, const PHash *a, const PHash *b,
 		return PROLLY_OK;
 	phmap_init(&la);
 	phmap_init(&lb);
-	rc = diff_core(ctx, a, b, NULL, NULL, &la, &lb);
+	rc = diff_core(ctx, a, b, NULL, NULL, &la, &lb, NULL, NULL);
 	if (rc == PROLLY_OK)
 		for (size_t i = 0; i < la.cap; i++)
 			if (la.used[i] && !phmap_find(&lb, &la.keys[i]))
@@ -1301,18 +1504,28 @@ same_change(const ProllyDiff *a, const ProllyDiff *b)
 	return bytes_eq(a->to, a->tlen, b->to, b->tlen);
 }
 
+/*
+ * The three-way merge.  A subtree only one side changed is not walked by
+ * either diff: one of ours stays, one of theirs goes in whole, by its ref
+ * (a graft).  The grafts go in first, a level at a time from the highest,
+ * then theirs' row edits: each step an apply to the tree as the steps
+ * before left it, so every rechunking reads the merged rows.
+ */
 int
 prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 			 const PHash *theirs, ProllyMergeResult *out)
 {
-	ProllyDiffList dours,
-				dtheirs;
+	ProllyDiffList dours = {0},
+				dtheirs = {0};
+	GraftList	grafts = {0};
 	ProllyEdit *edits;
 	size_t		nedits = 0,
 				conflict_cap = 0,
 				a = 0,
 				b = 0;
-	int			rc;
+	int			rc,
+				gtop = 0;
+	PHash		root;
 
 	memset(out, 0, sizeof(*out));
 	out->root = *ours;
@@ -1323,20 +1536,27 @@ prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 		out->root = *theirs;
 		return PROLLY_OK;
 	}
-	rc = prolly_diff_collect(ctx, base, ours, &dours);
+	TraceSpan	td1 = trace_begin("merge: diff base-ours");
+
+	rc = diff_core(ctx, base, ours, collect_fn, &dours, NULL, NULL, theirs, NULL);
+	trace_end(td1, "%zu changes", dours.n);
 	if (rc != PROLLY_OK)
 	{
 		prolly_diff_list_free(&dours);
 		return rc;
 	}
-	rc = prolly_diff_collect(ctx, base, theirs, &dtheirs);
+	TraceSpan	td2 = trace_begin("merge: diff base-theirs");
+
+	rc = diff_core(ctx, base, theirs, collect_fn, &dtheirs, NULL, NULL, ours, &grafts);
+	trace_end(td2, "%zu changes, %zu grafts", dtheirs.n, grafts.n);
 	if (rc != PROLLY_OK)
 	{
 		prolly_diff_list_free(&dours);
 		prolly_diff_list_free(&dtheirs);
+		graftlist_free(&grafts);
 		return rc;
 	}
-	edits = px_malloc(dtheirs.n * sizeof(ProllyEdit));
+	edits = px_malloc((dtheirs.n ? dtheirs.n : 1) * sizeof(ProllyEdit));
 	while (b < dtheirs.n)
 	{
 		const ProllyDiff *t = &dtheirs.v[b];
@@ -1379,11 +1599,24 @@ prolly_merge(ProllyCtx *ctx, const PHash *base, const PHash *ours,
 			a++;
 		b++;
 	}
-	if (nedits)
-		rc = prolly_apply(ctx, ours, edits, nedits, &out->root);
+	TraceSpan	ta = trace_begin("merge: apply");
+
+	root = *ours;
+	for (size_t k = 0; k < grafts.n; k++)
+		if (grafts.v[k].level > gtop)
+			gtop = grafts.v[k].level;
+	for (int level = gtop; level > 0 && rc == PROLLY_OK; level--)
+		rc = apply_core(ctx, &root, NULL, 0, &grafts, level, &root);
+	if (rc == PROLLY_OK && nedits)
+		rc = apply_core(ctx, &root, edits, nedits, NULL, 0, &root);
+	if (rc == PROLLY_OK)
+		out->root = root;
+	trace_end(ta, "%zu edits, %zu grafts on %d levels", nedits, grafts.n, gtop);
+	out->ngrafts = grafts.n;
 	free(edits);
 	prolly_diff_list_free(&dours);
 	prolly_diff_list_free(&dtheirs);
+	graftlist_free(&grafts);
 	if (rc != PROLLY_OK)
 		prolly_merge_result_free(out);
 	return rc;

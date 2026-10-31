@@ -107,6 +107,7 @@ typedef struct ProllyMergeResult
 	PHash		root;			/* ours with every non-conflicting change of theirs */
 	ProllyConflict *conflicts;
 	size_t		nconflicts;
+	size_t		ngrafts;		/* theirs' subtrees taken whole */
 } ProllyMergeResult;
 
 typedef struct ProllyIter ProllyIter;
