@@ -221,7 +221,7 @@ SKIP:
 	sql(q{SELECT injection_points_wakeup('bmap-share-sync')});
 	my $during_copy = $sharing->query_safe(q{\\echo :during_copy});
 	$sharing->quit;
-	ok($primary->log_contains(qr/a share of .* logged images of \d+ blocks it synced, a backup having begun/,
+	ok($primary->log_contains(qr/a share of .* logged images of \d+ blocks it got before the checkpoint, a backup having begun/,
 			$log_offset),
 		'a backup begun while a share syncs its blocks gets their images');
 	cmp_ok(images_since($start, $during), '>=', sql(q{SELECT pg_relation_size('during') / 8192}),
