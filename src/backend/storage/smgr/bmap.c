@@ -2485,7 +2485,10 @@ map_root_lost(SMgrRelation reln)
  * swap, after which nothing reads its pages.  (A subtree never gets a level
  * above it, which would replace a pointer with one to a node that still needs
  * the old.)  So the block's records from before then are skipped, and its
- * pages go nowhere: TREE_UNAVAILABLE.
+ * pages go nowhere: TREE_UNAVAILABLE.  That is for replay (InRecovery) and
+ * write-outs in recovery ('for_write'): a hot standby's read, which begins
+ * only past consistency, finds no such page, and a node its lookup misses
+ * was moved by the replay meanwhile, so it begins again, as a primary's.
  */
 static TreeFound
 tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
@@ -2499,8 +2502,13 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
 	Assert(n > 0);
 
-	/* (a map with no root in recovery: the relation's pages go nowhere) */
-	if (RecoveryInProgress() && !cached_only && map_root_lost(reln))
+	/*
+	 * (a map with no root in replay, or for a write-out in recovery: the
+	 * relation's pages go nowhere; a hot standby's read, past consistency,
+	 * finds the root there)
+	 */
+	if (RecoveryInProgress() && (InRecovery || for_write) && !cached_only &&
+		map_root_lost(reln))
 		return TREE_UNAVAILABLE;
 
 	for (;;)
@@ -2536,8 +2544,12 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 			if (!BlockNumberIsValid(ptr.block))
 				return TREE_NO_LEAF;
 			path_epoch = Min(path_epoch, ptr.epoch);
-			/* (in recovery, a pointer of a newer page may be past the store) */
-			if (RecoveryInProgress() && !cached_only &&
+			/*
+			 * (in replay, or for a write-out in recovery, a pointer of a newer
+			 * page may be past the store)
+			 */
+			if (RecoveryInProgress() && (InRecovery || for_write) &&
+				!cached_only &&
 				ptr.block >= mdnblocks(store_smgr(rel), MAIN_FORKNUM))
 				break;
 			r = read_entries(reln, true, ptr.block, for_write, cached_only,
