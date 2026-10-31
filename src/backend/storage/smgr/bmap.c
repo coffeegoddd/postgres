@@ -2178,6 +2178,23 @@ bmap_refs_file_asks(void)
 }
 
 /*
+ * How many reference-count pages to take as existing, asked for pages no
+ * higher than 'top': the length last known if it covers 'top' (every page
+ * below it exists, the file only growing), without a system call; else the
+ * file's (refs_nblocks()).  A page above 'top' compared with it may be
+ * taken as missing though it exists.
+ */
+static BlockNumber
+refs_nblocks_upto(RelFileLocator rel, BlockNumber top)
+{
+	BlockNumber known = refs_known(refs_smgr(rel));
+
+	if (known != InvalidBlockNumber && top < known)
+		return known;
+	return refs_nblocks(rel);
+}
+
+/*
  * Does reference-count page 'page' exist?  Asked of the block a change
  * prepares, every time: answered from the length last known when it is
  * below that, without a system call.
@@ -2914,7 +2931,6 @@ lookup_refs(RelFileLocator rel, const BlockNumber *phys, uint32 n,
 
 	if (n == 0)
 		return;
-	nrefs = refs_nblocks(rel);
 	wanted = palloc(n * sizeof(RefWanted));
 	for (uint32 i = 0; i < n; i++)
 	{
@@ -2922,6 +2938,7 @@ lookup_refs(RelFileLocator rel, const BlockNumber *phys, uint32 n,
 		wanted[i].i = i;
 	}
 	qsort(wanted, n, sizeof(RefWanted), cmp_ref_wanted);
+	nrefs = refs_nblocks_upto(rel, REF_PAGE(wanted[n - 1].phys));
 	for (uint32 k = 0; k < n; k++)
 	{
 		BlockNumber page = REF_PAGE(wanted[k].phys);
@@ -4466,9 +4483,14 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 	{
 		XLogRecPtr	horizon = copy_horizon();
 		XLogRecPtr	passed = InvalidXLogRecPtr;
-		BlockNumber nrefpages = refs_nblocks(rel);
+		BlockNumber top = 0;
+		BlockNumber nrefpages;
 		Buffer		buf = InvalidBuffer;
 		uint32		nfree = 0;
+
+		for (uint32 k = 0; k < n; k++)
+			top = Max(top, REF_PAGE(blocks[k]));
+		nrefpages = refs_nblocks_upto(rel, top);
 
 		for (uint32 k = 0; k < n; k++)
 		{
@@ -5170,7 +5192,9 @@ unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
 	qsort(items, nitems, sizeof(SlotEntry), cmp_slot_entry);
 	for (uint32 k = 0; k < nitems; k++)
 		phys[k] = items[k].block;
-	nrefpages = refs_nblocks(rel);
+	/* (sorted: the last is on the highest page) */
+	nrefpages = nitems > 0 ? refs_nblocks_upto(rel, REF_PAGE(phys[nitems - 1])) :
+		refs_nblocks(rel);
 
 	while (i < nitems)
 	{
@@ -6162,6 +6186,39 @@ preserve_header_lock_ext(SMgrRelation src, BlockList *own, bool concurrent,
  * block) in a node freed since, or a page torn by the crash whose image
  * comes later in the WAL.  False if it is past the file, or not verified.
  */
+/*
+ * The lengths of the files redo's walk reads (the page store's, its counts'),
+ * asked once a walk (reset by redo_own_blocks()): nothing extends them while
+ * a record replays, and asking at every page asked the file system at every
+ * node.  0: the file doesn't exist.
+ */
+#define REDO_WALK_FILES	2
+static struct
+{
+	RelFileLocator rel;
+	BlockNumber nblocks;
+}			redo_walk_files[REDO_WALK_FILES];
+static int	redo_walk_nfiles = 0;
+static uint32 redo_walk_lengths_asked = 0;	/* for the walk's DEBUG1 line */
+
+static BlockNumber
+redo_walk_file_length(RelFileLocator rel, SMgrRelation srel)
+{
+	BlockNumber nblocks;
+
+	for (int i = 0; i < redo_walk_nfiles; i++)
+		if (RelFileLocatorEquals(redo_walk_files[i].rel, rel))
+			return redo_walk_files[i].nblocks;
+	nblocks = smgrexists(srel, MAIN_FORKNUM) ? mdnblocks(srel, MAIN_FORKNUM) : 0;
+	redo_walk_lengths_asked++;
+	if (redo_walk_nfiles < REDO_WALK_FILES)
+	{
+		redo_walk_files[redo_walk_nfiles].rel = rel;
+		redo_walk_files[redo_walk_nfiles++].nblocks = nblocks;
+	}
+	return nblocks;
+}
+
 static bool
 redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
 {
@@ -6169,7 +6226,7 @@ redo_walk_read(RelFileLocator rel, BlockNumber blk, char *dst)
 	PrefetchBufferResult r;
 	void	   *page = dst;
 
-	if (!smgrexists(srel, MAIN_FORKNUM) || blk >= mdnblocks(srel, MAIN_FORKNUM))
+	if (blk >= redo_walk_file_length(rel, srel))
 		return false;
 	r = PrefetchSharedBuffer(srel, MAIN_FORKNUM, blk);
 	if (BufferIsValid(r.recent_buffer) &&
@@ -6393,6 +6450,8 @@ redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
 	rp.nblocks = InvalidBlockNumber;
 	redo_walk_nodes = 0;
 	redo_walk_ref_pages = 0;
+	redo_walk_nfiles = 0;
+	redo_walk_lengths_asked = 0;
 
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
@@ -8860,7 +8919,13 @@ release_step(RelFileLocator rel, BmapRelease *done)
 	 * Their counts, those holders fewer; a block they leave held by nothing
 	 * is freed (blocks past the counts' pages count zero).
 	 */
-	nrefpages = refs_nblocks(rel);
+	{
+		BlockNumber top = 0;
+
+		for (uint32 i = 0; i < nblocks; i++)
+			top = Max(top, REF_PAGE(blocks[i].block));
+		nrefpages = refs_nblocks_upto(rel, top);
+	}
 	rp.n = 0;
 	{
 		uint32		ncounted = 0;
@@ -16676,9 +16741,10 @@ bmap_redo(XLogReaderState *record)
 
 					if (walked)
 					{
-						elog(DEBUG1, "redo of a capture of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages",
+						elog(DEBUG1, "redo of a capture of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages, asking %u files' lengths",
 							 relpathperm(xlrec->locator, MAIN_FORKNUM).str,
-							 own.n, redo_walk_nodes, redo_walk_ref_pages);
+							 own.n, redo_walk_nodes, redo_walk_ref_pages,
+							 redo_walk_lengths_asked);
 						flush_own_blocks(reln, &own);
 					}
 					else
@@ -16875,9 +16941,10 @@ bmap_redo(XLogReaderState *record)
 				 */
 				if (why == NULL)
 				{
-					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages",
+					elog(DEBUG1, "redo of a share of %s writes out its own pages: %u, found reading %u nodes of its map and %u count pages, asking %u files' lengths",
 						 relpathperm(xlrec->src, MAIN_FORKNUM).str,
-						 own.n, redo_walk_nodes, redo_walk_ref_pages);
+						 own.n, redo_walk_nodes, redo_walk_ref_pages,
+							 redo_walk_lengths_asked);
 					flush_own_blocks(src, &own);
 				}
 				else

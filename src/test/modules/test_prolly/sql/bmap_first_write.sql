@@ -98,10 +98,11 @@ SELECT (:dropped_buffers - :plain_buffers) <= 6 * :pages AS dropped_buffers_boun
 -- page exists, or covers it, is answered from the length known (the file
 -- was closed and opened again, and sought, at each page's first change).
 -- The claims' side moves the nodes on its paths (its copy dropped, another
--- map may have shared them), each move freeing the old block, which asks
--- the length once: a node, not a page.
+-- map may have shared them), each move freeing the old block, whose count
+-- page is answered from the length known too.  (Each freeing asked the
+-- length once, a node's worth.)
 SELECT :asks_shared - :asks_before <= 4 AS copies_ask_the_counts_file_little;
-SELECT :asks_dropped - :asks_shared <= 12 AS claims_ask_the_counts_file_little;
+SELECT :asks_dropped - :asks_shared <= 4 AS claims_ask_the_counts_file_little;
 
 -- One record a page more than md.c's: the copy's, or the claim's, plus a
 -- few records copying the table's paths and its visibility map's page,
