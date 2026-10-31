@@ -406,6 +406,30 @@ filtered_catalog(Oid relid)
 }
 
 bool
+CatalogBranchSees(Oid classid, Oid objid)
+{
+	int32		branch;
+
+	if (!catalog_branch_filter)
+		return true;
+	branch = BranchMap->object_branch(classid, objid);
+	return branch == 0 || branch == catalog_branch;
+}
+
+List *
+CatalogBranchSeenOids(Oid classid, List *oids)
+{
+	List	   *seen = NIL;
+
+	foreach_oid(objid, oids)
+	{
+		if (CatalogBranchSees(classid, objid))
+			seen = lappend_oid(seen, objid);
+	}
+	return seen;
+}
+
+bool
 CatalogBranchFilters(Relation rel, Snapshot snapshot)
 {
 	Oid			relid = RelationGetRelid(rel);
@@ -704,6 +728,8 @@ static const struct
 	{PublicationNamespaceRelationId, PublicationNamespaceObjectIndexId,
 		Anum_pg_publication_namespace_oid,
 	NamespaceRelationId, Anum_pg_publication_namespace_pnnspid},
+	{DefaultAclRelationId, DefaultAclOidIndexId, Anum_pg_default_acl_oid,
+	NamespaceRelationId, Anum_pg_default_acl_defaclnamespace},
 };
 
 /*

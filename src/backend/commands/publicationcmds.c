@@ -37,6 +37,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_relation.h"
+#include "prolly/branch_filter.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -1282,12 +1283,17 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 			{
 				oldrelids = GetExcludedPublicationTables(pubid,
 														 PUBLICATION_PART_ROOT);
+				/* (another branch's tables are that branch's to set) */
+				oldrelids = CatalogBranchSeenOids(RelationRelationId,
+												  oldrelids);
 			}
 		}
 		else
 		{
 			oldrelids = GetIncludedPublicationRelations(pubid,
 														PUBLICATION_PART_ROOT);
+			/* (another branch's tables are that branch's to set) */
+			oldrelids = CatalogBranchSeenOids(RelationRelationId, oldrelids);
 
 			TransformPubWhereClauses(rels, queryString, pubform->pubviaroot);
 
@@ -1472,8 +1478,12 @@ AlterPublicationSchemas(AlterPublicationStmt *stmt,
 		PublicationDropSchemas(pubform->oid, schemaidlist, false);
 	else						/* AP_SetObjects */
 	{
-		List	   *oldschemaids = GetPublicationSchemas(pubform->oid);
+		List	   *oldschemaids;
 		List	   *delschemas = NIL;
+
+		/* (another branch's schemas are that branch's to set) */
+		oldschemaids = CatalogBranchSeenOids(NamespaceRelationId,
+											 GetPublicationSchemas(pubform->oid));
 
 		/* Identify which schemas should be dropped */
 		delschemas = list_difference_oid(oldschemaids, schemaidlist);

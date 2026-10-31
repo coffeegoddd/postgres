@@ -70,10 +70,12 @@ patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given s
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
+patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
 patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
+patch src/backend/commands/publicationcmds.c  1b  ALTER PUBLICATION ... SET leaves another branch's tables and schemas
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write

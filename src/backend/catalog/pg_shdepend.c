@@ -57,6 +57,7 @@
 #include "commands/tablespace.h"
 #include "commands/typecmds.h"
 #include "miscadmin.h"
+#include "prolly/branch_filter.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
@@ -1402,6 +1403,11 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 				sdepForm->dbid != InvalidOid)
 				continue;
 
+			/* ... and of those in it, the session's branch's and shared ones */
+			if (sdepForm->dbid == MyDatabaseId &&
+				!CatalogBranchSees(sdepForm->classid, sdepForm->objid))
+				continue;
+
 			switch (sdepForm->deptype)
 			{
 					/* Shouldn't happen */
@@ -1603,6 +1609,11 @@ shdepReassignOwned(List *roleids, Oid newrole)
 			 */
 			if (sdepForm->dbid != MyDatabaseId &&
 				sdepForm->dbid != InvalidOid)
+				continue;
+
+			/* ... and of those in it, the session's branch's and shared ones */
+			if (sdepForm->dbid == MyDatabaseId &&
+				!CatalogBranchSees(sdepForm->classid, sdepForm->objid))
 				continue;
 
 			/*

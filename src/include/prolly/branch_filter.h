@@ -28,6 +28,7 @@
 #define PROLLY_BRANCH_FILTER_H
 
 #include "access/htup.h"
+#include "nodes/pg_list.h"
 #include "storage/block.h"
 #include "storage/bufpage.h"
 #include "storage/off.h"
@@ -42,6 +43,16 @@ extern bool CatalogBranchFilters(Relation rel, Snapshot snapshot);
 
 /* Whether a visible tuple of rel is another branch's. */
 extern bool CatalogBranchHides(Relation rel, HeapTuple tuple);
+
+/*
+ * Whether the session's queries see an object: a shared one, or its
+ * branch's.  Commands that act on what a role owns, or on what a
+ * publication holds, act on those only.
+ */
+extern bool CatalogBranchSees(Oid classid, Oid objid);
+
+/* The object ids of a class's objects, of oids, that the session sees. */
+extern List *CatalogBranchSeenOids(Oid classid, List *oids);
 
 /*
  * Removes other branches' tuples from the n visible tuples at offsets of a
