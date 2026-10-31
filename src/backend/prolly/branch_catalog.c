@@ -75,8 +75,15 @@ assign_catalog_branch(int newval, void *extra)
 		return;
 
 	catalog_branch_changing = true;
-	CallSyscacheCallbacks(NAMESPACEOID, 0);
-	catalog_branch_changing = false;
+	PG_TRY();
+	{
+		CallSyscacheCallbacks(NAMESPACEOID, 0);
+	}
+	PG_FINALLY();
+	{
+		catalog_branch_changing = false;
+	}
+	PG_END_TRY();
 	CallSyscacheCallbacks(TSCONFIGOID, 0);
 }
 
