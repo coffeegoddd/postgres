@@ -1809,7 +1809,7 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 		/* (in redo, an entry kept from a newer page: see redo_block()) */
 		if (e->since > delta->since)
 			continue;
-		if (e->block != ent[i].block)
+		if (e->block != ent[i].block || (delta->flags & BMAP_DELTA_SINCE))
 			e->since = delta->since;
 		else if (e->epoch == ent[i].epoch)
 			continue;
@@ -4070,13 +4070,21 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, const MapPage *leaf,
 		hdelta.vm_nblocks = (BlockNumber) (Max(to, length) - BMAP_VM_BASE);
 	else
 		hdelta.nblocks = Max(to, length);
+	/*
+	 * The entries given blocks, and those past the length reused: their
+	 * blocks are zeroed, and hold pages made from now on, so they take the
+	 * record's 'since' too (BMAP_DELTA_SINCE), as a block got anew does.  A
+	 * share tells by it whether a block got its page before the checkpoint
+	 * (bmapshare()).
+	 */
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + n * sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
+	ndelta->flags = BMAP_DELTA_SINCE;
 	for (uint32 i = 0; i < n; i++)
 	{
 		xl_bmap_entry_delta *ent = (xl_bmap_entry_delta *) (ndelta + 1);
 
-		if (!need[i])
+		if (!need[i] && from + i < length)
 			continue;
 		ent[ndelta->nentries].slot = MP_SLOT(mp, from + i);
 		ent[ndelta->nentries].block = phys[i];

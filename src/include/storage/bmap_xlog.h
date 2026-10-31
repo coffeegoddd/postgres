@@ -390,7 +390,9 @@ typedef struct xl_bmap_header_delta
 /*
  * Block data of a map page: entries set.  An entry whose block changes
  * takes 'since', a WAL position no later than the record's start and after
- * every earlier record of the logical block.
+ * every earlier record of the logical block; with BMAP_DELTA_SINCE, every
+ * entry set takes it, its block changed or not (a block the record zeroes
+ * and reuses).
  */
 typedef struct xl_bmap_node_delta
 {
@@ -400,6 +402,9 @@ typedef struct xl_bmap_node_delta
 	XLogRecPtr	since;
 	/* xl_bmap_entry_delta entries[nentries] follow */
 } xl_bmap_node_delta;
+
+/* a node delta whose every entry takes its 'since' */
+#define BMAP_DELTA_SINCE		0x02
 
 typedef struct xl_bmap_entry_delta
 {
