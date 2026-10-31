@@ -207,6 +207,20 @@ $primary->wait_for_replay_catchup($standby);
 ok($standby->log_contains($restartpoints, $log_offset),
 	'the standby, no longer held for, makes a restartpoint as it replays');
 
+# A restart publishes the slots' holds while recovery runs, when the cap
+# isn't applied: so the hold is computed again as recovery ends, and a hold
+# past the cap is let go of at once, not at the next checkpoint.
+$primary->append_conf('postgresql.conf', 'block_map_standby_hold_max_size = -1');
+$primary->reload;
+# (a standby reports its hold as it changes, or as it connects)
+$standby->restart;
+ok($primary->poll_query_until('postgres', q{SELECT hold IS NOT NULL FROM test_bmap_standby_hold()}),
+	'with no cap, the slot holds again');
 $standby->stop;
+$primary->append_conf('postgresql.conf', 'block_map_standby_hold_max_size = 0');
+$primary->restart;
+is(sql(q{SELECT hold IS NULL FROM test_bmap_standby_hold()}), 't',
+	'after a restart, a hold past the cap is let go of before any checkpoint');
+
 $primary->stop;
 done_testing();
