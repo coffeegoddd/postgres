@@ -8982,6 +8982,13 @@ CreateRestartPoint(int flags)
 							  timestamptz_to_str(xtime)) : 0);
 
 	/*
+	 * The walreceiver tells the upstream server where this server's recovery
+	 * may begin now (the block map's standby hold, GetRecoveryHold()): woken,
+	 * so that it says so now, not at its next status interval.
+	 */
+	WalRcvRequestApplyReply();
+
+	/*
 	 * Finally, execute archive_cleanup_command, if any.
 	 */
 	if (archiveCleanupCommand && strcmp(archiveCleanupCommand, "") != 0)

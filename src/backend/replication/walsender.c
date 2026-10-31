@@ -2713,7 +2713,26 @@ WalSndComputeRecoveryHold(void)
 	XLogRecPtr	hold = InvalidXLogRecPtr;
 	bool		backups = false;
 	XLogRecPtr	limit = InvalidXLogRecPtr;
-	static XLogRecPtr warned = InvalidXLogRecPtr;
+	/* holds let go of, said once the lock is let go of (a few at most) */
+#define HOLDS_SAID	8
+	struct
+	{
+		NameData	slot;		/* empty: a standby's */
+		XLogRecPtr	hold;
+	}			said[HOLDS_SAID];
+	int			nsaid = 0;
+	int			unsaid = 0;
+
+	/*
+	 * One at a time, read and published, under the slots' control lock: else
+	 * a process reading before another's change could publish after it (the
+	 * checkpointer clearing a backup a standby just reported).  The cap's
+	 * limit too, under it: one computed in recovery, uncapped, by a process
+	 * that waited for the lock as recovery ended, would publish after the
+	 * startup process's capped hold.
+	 */
+	if (ReplicationSlotCtl != NULL)
+		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 
 	if (block_map_standby_hold_max_size >= 0 && !RecoveryInProgress())
 	{
@@ -2722,14 +2741,6 @@ WalSndComputeRecoveryHold(void)
 
 		limit = insert > cap ? insert - cap : 1;
 	}
-
-	/*
-	 * One at a time, read and published, under the slots' control lock: else
-	 * a process reading before another's change could publish after it (the
-	 * checkpointer clearing a backup a standby just reported).
-	 */
-	if (ReplicationSlotCtl != NULL)
-		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 
 	if (WalSndCtl != NULL)
 	{
@@ -2754,11 +2765,13 @@ WalSndComputeRecoveryHold(void)
 				continue;
 			if (XLogRecPtrIsValid(limit) && h < limit)
 			{
-				if (warn)
-					ereport(LOG,
-							(errmsg("letting go of a standby's hold at %X/%08X on blocks copied without an image",
-									LSN_FORMAT_ARGS(h)),
-							 errdetail("The standby's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+				if (warn && nsaid < HOLDS_SAID)
+				{
+					said[nsaid].slot.data[0] = '\0';
+					said[nsaid++].hold = h;
+				}
+				else if (warn)
+					unsaid++;
 				continue;
 			}
 			if (!XLogRecPtrIsValid(hold) || h < hold)
@@ -2785,13 +2798,17 @@ WalSndComputeRecoveryHold(void)
 				continue;
 			if (XLogRecPtrIsValid(limit) && h < limit)
 			{
-				if (h != warned)
+				/* (once for every process: the lock is held) */
+				if (s->recovery_hold_warned != h)
 				{
-					warned = h;
-					ereport(LOG,
-							(errmsg("letting go of replication slot \"%s\"'s hold at %X/%08X on blocks copied without an image",
-									NameStr(s->data.name), LSN_FORMAT_ARGS(h)),
-							 errdetail("The slot's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+					s->recovery_hold_warned = h;
+					if (nsaid < HOLDS_SAID)
+					{
+						namestrcpy(&said[nsaid].slot, NameStr(s->data.name));
+						said[nsaid++].hold = h;
+					}
+					else
+						unsaid++;
 				}
 				continue;
 			}
@@ -2803,6 +2820,25 @@ WalSndComputeRecoveryHold(void)
 	bmap_set_standby_hold(hold, backups);
 	if (ReplicationSlotCtl != NULL)
 		LWLockRelease(ReplicationSlotControlLock);
+
+	for (int i = 0; i < nsaid; i++)
+	{
+		if (said[i].slot.data[0] == '\0')
+			ereport(LOG,
+					(errmsg("letting go of a standby's hold at %X/%08X on blocks copied without an image",
+							LSN_FORMAT_ARGS(said[i].hold)),
+					 errdetail("The standby's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+		else
+			ereport(LOG,
+					(errmsg("letting go of replication slot \"%s\"'s hold at %X/%08X on blocks copied without an image",
+							NameStr(said[i].slot), LSN_FORMAT_ARGS(said[i].hold)),
+					 errdetail("The slot's hold is more than \"block_map_standby_hold_max_size\" behind.")));
+	}
+	if (unsaid > 0)
+		ereport(LOG,
+				(errmsg("letting go of %d more holds on blocks copied without an image",
+						unsaid)));
+#undef HOLDS_SAID
 }
 
 /* compute new replication slot xmin horizon if needed */

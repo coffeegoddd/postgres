@@ -253,6 +253,14 @@ typedef struct ReplicationSlot
 	TimestampTz inactive_since;
 
 	/*
+	 * The recovery hold (data.recovery_hold) last said to be let go of, past
+	 * block_map_standby_hold_max_size, so that it is said once, by whichever
+	 * process computes the hold first (WalSndComputeRecoveryHold()).  Kept
+	 * in shared memory only, under ReplicationSlotControlLock.
+	 */
+	XLogRecPtr	recovery_hold_warned;
+
+	/*
 	 * Latest restart_lsn that has been flushed to disk. For persistent slots
 	 * the flushed LSN should be taken into account when calculating the
 	 * oldest LSN for WAL segments removal.
