@@ -7406,6 +7406,21 @@ XLogNoteSyncedPages(XLogRecPtr since)
 }
 
 /*
+ * XLogSyncedSince -- the newest position XLogNoteSyncedPages() noted, kept
+ * in pg_control across restarts (InvalidXLogRecPtr: none)
+ */
+XLogRecPtr
+XLogSyncedSince(void)
+{
+	XLogRecPtr	since;
+
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	since = ControlFile->syncedSince;
+	LWLockRelease(ControlFileLock);
+	return since;
+}
+
+/*
  * XLogNoteSyncedReplay -- a record being replayed relies on pages the
  * primary wrote and synced instead of logging them
  *
