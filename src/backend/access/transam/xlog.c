@@ -7389,7 +7389,8 @@ GetRecoveryHold(bool *backups)
  * it what it is.  The caller makes its pages durable first, and calls this
  * once it has, whether it made the record that relies on them or replays
  * it, and, making it, once the record is flushed: the note stands for the
- * record (copies_passed() skips a record a note covers).  pg_control keeps the newest such position, which recovery refuses
+ * record (copies_passed() skips a record a note covers).  pg_control
+ * keeps the newest such position, which recovery refuses
  * to begin at or before (StartupXLOG()), as does an online backup on a
  * standby (do_pg_backup_start()), and pg_rewind checks; and counts the
  * calls, by which pg_rewind tells that pages were synced so while it
