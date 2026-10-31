@@ -718,6 +718,21 @@ test_bmap_root_capture(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) bmap_root_capture(bmap_smgr(PG_GETARG_OID(0))));
 }
 
+/*
+ * test_bmap_root_capture_of(copy, of): a frozen root captured of 'copy',
+ * recorded as of 'of' at its epoch now (bmap_root_capture_of())
+ */
+PG_FUNCTION_INFO_V1(test_bmap_root_capture_of);
+
+Datum
+test_bmap_root_capture_of(PG_FUNCTION_ARGS)
+{
+	SMgrRelation of = bmap_smgr(PG_GETARG_OID(1));
+
+	PG_RETURN_INT64((int64) bmap_root_capture_of(bmap_smgr(PG_GETARG_OID(0)),
+												 of, (uint32) bmap_inspect_epoch(of)));
+}
+
 /* test_bmap_root_release(id): let go of it as the transaction commits */
 PG_FUNCTION_INFO_V1(test_bmap_root_release);
 

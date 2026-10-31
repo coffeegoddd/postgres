@@ -224,11 +224,14 @@ SKIP:
 # longer the node it named, begins again from the root.
 SKIP:
 {
-	skip 'injection points not supported by this build', 4
+	skip 'injection points not supported by this build', 6
 	  unless $ENV{enable_injection_points} eq 'yes';
-	# (a copy shared of the source, and storage made of a root captured of
-	# it, the root then let go of: either shares the source's nodes)
-	for my $how ('share', 'root')
+	# (a copy shared of the source, storage made of a root captured of it,
+	# and storage made of a frozen root, captured of a copy of the source
+	# whose path to the page is its own: the source's nodes then are that
+	# copy's, which the root records though the caller names no sharer;
+	# each root then let go of)
+	for my $how ('share', 'root', 'frozen')
 	{
 		sql(qq{
 			CREATE TABLE x_$how (a int, b text);
@@ -240,6 +243,18 @@ SKIP:
 		if ($how eq 'share')
 		{
 			$xc = sql(qq{SELECT test_bmap_share($x)});
+		}
+		elsif ($how eq 'frozen')
+		{
+			my $y = sql(qq{SELECT test_bmap_share($x)});
+			sql(qq{SELECT test_bmap_write($y, 3, 1)});
+			my $root = sql(qq{SELECT test_bmap_root_capture_of($y, $x)});
+			$xc = sql(qq{SELECT test_bmap_share_root($root)});
+			sql(qq{SELECT test_bmap_root_release($root)});
+			sql(q{SELECT * FROM test_bmap_release_drain()});
+			# (the race is between the new storage and the copy whose
+			# nodes it shares)
+			$x = $y;
 		}
 		else
 		{

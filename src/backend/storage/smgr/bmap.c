@@ -384,10 +384,12 @@ int			block_map_standby_hold_max_size = -1;
  * them could count on (a map now has holes); version 16's reference-count
  * pages didn't say which blocks were copied without an image, nor where;
  * version 17's maps held the main fork alone, the visibility map a file of
- * the relation's own.  This server reads only version 18 and refuses
- * anything older (refuse_version()).
+ * the relation's own; version 19's captured roots didn't keep the file
+ * number of the map they were captured of, a frozen root's copy.  This
+ * server reads only version 20 and refuses anything older
+ * (refuse_version()).
  */
-#define BMAP_VERSION		19
+#define BMAP_VERSION		20
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -10081,6 +10083,8 @@ root_capture_slot(SMgrRelation reln, BlockList *own, bool concurrent,
 	rdelta.root.snap.epoch = hdelta.epoch;
 	rdelta.root.relnumber = RelFileNumberIsValid(of) ? of : rel.relNumber;
 	rdelta.root.map_id = root.map_id;
+	/* (the map's own, the copy's for a frozen root: map_id's) */
+	rdelta.root.map_relnumber = rel.relNumber;
 	/* (a frozen root's are the relation's whose pages it froze) */
 	rdelta.root.lineage = RelFileNumberIsValid(of) ? root_lineage(of_root) :
 		root_lineage(&root);
@@ -10493,6 +10497,7 @@ bmap_root_copy(RelFileLocator store, BmapRootId id, RelFileLocator holder)
 	rdelta.root.snap.owner = U64FromFullTransactionId(GetCurrentFullTransactionId());
 	rdelta.root.relnumber = holder.relNumber;
 	rdelta.root.map_id = holder_map;
+	rdelta.root.map_relnumber = holder.relNumber;
 	rdelta.root.lineage = holder_lineage;
 	/*
 	 * (a frozen root's copy is frozen too, but the holder's changes since
@@ -10726,23 +10731,24 @@ bmap_share_root(BmapRootId id, SMgrRelation dst, SMgrRelation replacing,
 	INJECTION_POINT("bmap-root-share-checked", NULL);
 
 	/*
-	 * The relation the root was captured of, if the caller didn't name it
-	 * and it is still that map (its file number may be another's since):
-	 * it shares the root's nodes with the new storage from now on, so its
+	 * The map the root was captured of, if the caller didn't name it and it
+	 * is still that map (its file number may be another's since): it shares
+	 * the root's nodes with the new storage from now on, so its
 	 * shared_below is raised past them, as a share raises its source's.  A
 	 * node it has alone again once the new storage copies it is then moved
 	 * at its next change rather than changed in place (tree_leaf_for()),
 	 * where a lookup of the new storage holding a pointer to it would read
-	 * the relation's page.  (A frozen root's nodes are of the copy it was
-	 * captured of, whose file number it doesn't keep: that copy is the
-	 * caller's to name, if it outlives the capture.)
+	 * the map's page.  A frozen root's nodes are of the copy it was
+	 * captured of, not of the relation it records: the slot keeps the map's
+	 * own file number (map_relnumber) for that.  A map gone since shares
+	 * nothing, and has nothing to raise.
 	 */
-	if (sharer == NULL && r.live_map == 0)
+	if (sharer == NULL && r.map_relnumber != InvalidRelFileNumber)
 	{
 		RelFileLocator of = drel;
 		SMgrRelation ofreln;
 
-		of.relNumber = r.relnumber;
+		of.relNumber = r.map_relnumber;
 		ofreln = smgropen(of, INVALID_PROC_NUMBER);
 		if (!RelFileLocatorEquals(of, drel) &&
 			(replacing == NULL ||
