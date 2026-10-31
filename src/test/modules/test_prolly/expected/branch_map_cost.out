@@ -2,6 +2,7 @@
 -- catalogs once, and again only after the object changes.  Neither a
 -- branch change nor what other branches hold makes a session read again.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
 SELECT pg_branch_id_allocate() AS b1 \gset
 SELECT pg_branch_id_allocate() AS b2 \gset
 -- the same versioned schema on two branches, a hundred tables each
