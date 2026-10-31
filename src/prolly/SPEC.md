@@ -295,6 +295,42 @@ So a write to a branch costs what it costs in stock Postgres plus, once
 per page, a copy.  The copy is the overhead to measure, in time and WAL,
 against stock Postgres.
 
+**Measured.**  The block-mapped storage on NVMe, tables of 1 GB and 10 GB
+frozen and checkpointed, a median of 3 runs, each after a checkpoint.
+Sharing a table, which is what creating a branch does for each table and
+index:
+
+| Share | 1 GB | 10 GB |
+|---|---:|---:|
+| A table's first share | 5.4 ms | 25.4 ms |
+| Any later share | 0.49 ms | 0.92 ms |
+| WAL, either | 25 KB | 42 KB |
+
+- **A table's first share costs its blocks, at about 2 to 4 ms per GB.**
+  Until then every block is the table's own, and before any becomes shared
+  the share makes sure each survives a crash for both tables: a block the
+  last checkpoint made durable is synced, any other is logged as an image.
+  So the share visits every one, about 34 ns a block.  A shared block never
+  changes in place again, so a later share visits only the blocks the table
+  took since the one before, and stays under a millisecond at any size.
+- **WAL stays flat,** growing only with the depth of the block map's tree.
+
+The first write to each page after a share, an update of one row on each
+of 10,000 pages:
+
+| Case | 1 GB, µs a page | 10 GB, µs a page | WAL a page |
+|---|---:|---:|---:|
+| Stock Postgres (`md.c`) | 6.84 | 7.08 | 7,671 B |
+| Block-mapped, never shared | 8.44 | 8.09 | 7,790 B |
+| Block-mapped, shared (the copy) | 10.57 | 9.34 | 7,691 B |
+| Block-mapped, after the copy is dropped | 7.65 | 7.91 | 7,789 B |
+
+- **A page's first write after a share costs 1.3 to 1.55× stock
+  Postgres,** the same at 1 GB and 10 GB, and its WAL is within 1.5% of
+  stock.
+- **Every later write to the page costs what it does in stock Postgres:**
+  the copy is made once per page per branch.
+
 **Space complexity**, counting the storage an operation adds and keeps.
 WAL is not counted, nor what an operation leaves for reclaiming: dead row
 versions for VACUUM, and unreferenced chunks for garbage collection.
@@ -347,7 +383,8 @@ and get a working set when checked out.
 10 tables, each with a primary key and one index, and 300 branches.
 Single runs.  This counts catalog work only: the prototype's catalogs have
 no copy-on-write storage, so a branch's data was created rather than
-shared.  Sharing it costs about 2 ms in production (see The window).
+shared.  Sharing a table costs under a millisecond, and its first share a
+few milliseconds per GB (see Branching).
 
 | Measure | All 300 materialized | 30 materialized | 2 materialized |
 |---|---:|---:|---:|
