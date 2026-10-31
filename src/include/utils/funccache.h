@@ -81,6 +81,13 @@ typedef struct CachedFunctionHashKey
 	 */
 	Oid			inputCollation;
 
+	/*
+	 * The session's branch: the function's names may mean other objects on
+	 * another branch, and the row types it declares other columns, so it is
+	 * compiled for each branch it runs on.
+	 */
+	int32		branch;
+
 	/* Number of arguments (counting input arguments only, ie pronargs) */
 	int			nargs;
 

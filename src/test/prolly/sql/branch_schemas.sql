@@ -63,6 +63,9 @@ SET catalog_branch = :b1;
 CREATE SCHEMA pub VERSIONED;
 CREATE SCHEMA app VERSIONED;
 CREATE SCHEMA IF NOT EXISTS app VERSIONED;
+-- IF NOT EXISTS skips only a schema of the kind asked for
+CREATE SCHEMA IF NOT EXISTS app;
+CREATE SCHEMA IF NOT EXISTS pub VERSIONED;
 ALTER SCHEMA pub RENAME TO app;
 CREATE SCHEMA other VERSIONED;
 ALTER SCHEMA other RENAME TO pub;
@@ -111,12 +114,12 @@ SELECT count(*) FROM app.t;
 ROLLBACK;
 SELECT count(*) FROM app.t;
 
--- a sequence's cached values do not outlive a branch change
+-- a sequence's state is its own: on b2, app.s is b2's sequence, which this
+-- session has not used; back on b1, b1's is as it was
 CREATE SEQUENCE app.s;
 SELECT nextval('app.s');
 SET catalog_branch = :b2;
 SELECT currval('app.s');
-SELECT lastval();
 SET catalog_branch = :b1;
 SELECT currval('app.s');
 

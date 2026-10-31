@@ -48,6 +48,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parsetree.h"
+#include "prolly/branch_catalog.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
@@ -179,6 +180,7 @@ static Node *substitute_actual_parameters(Node *expr, int nargs, List *args,
 static Node *substitute_actual_parameters_mutator(Node *node,
 												  substitute_actual_parameters_context *context);
 static void sql_inline_error_callback(void *arg);
+static bool function_runs_here(HeapTuple func_tuple);
 static Query *inline_sql_function_in_from(PlannerInfo *root,
 										  RangeTblFunction *rtfunc,
 										  FuncExpr *fexpr,
@@ -5483,6 +5485,19 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 }
 
 /*
+ * Whether a function's body means here what it means when it runs: one
+ * that runs on another branch than the session's resolves its names there
+ * (FunctionBranch()), so it is not inlined.
+ */
+static bool
+function_runs_here(HeapTuple func_tuple)
+{
+	int32		branch = FunctionBranch(func_tuple);
+
+	return branch < 0 || branch == catalog_branch;
+}
+
+/*
  * inline_function: try to expand a function call inline
  *
  * If the function is a sufficiently simple SQL-language function
@@ -5550,6 +5565,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		funcform->proretset ||
 		funcform->prorettype == RECORDOID ||
 		!heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL) ||
+		!function_runs_here(func_tuple) ||
 		funcform->pronargs != list_length(args))
 		return NULL;
 
@@ -6098,7 +6114,8 @@ inline_function_in_from(PlannerInfo *root, RangeTblEntry *rte)
 	 * If the function SETs any configuration parameters, inlining would cause
 	 * us to miss making those changes.
 	 */
-	if (!heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL))
+	if (!heap_attisnull(func_tuple, Anum_pg_proc_proconfig, NULL) ||
+		!function_runs_here(func_tuple))
 	{
 		ReleaseSysCache(func_tuple);
 		return NULL;

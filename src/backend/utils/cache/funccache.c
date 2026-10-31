@@ -28,6 +28,7 @@
 #include "commands/trigger.h"
 #include "common/hashfn.h"
 #include "funcapi.h"
+#include "prolly/branch_catalog.h"
 #include "utils/funccache.h"
 #include "utils/hsearch.h"
 #include "utils/syscache.h"
@@ -285,6 +286,9 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 
 	/* get input collation, if known */
 	hashkey->inputCollation = fcinfo->fncollation;
+
+	/* ... and the branch its names are resolved on */
+	hashkey->branch = catalog_branch;
 
 	/*
 	 * We include only input arguments in the hash key, since output argument

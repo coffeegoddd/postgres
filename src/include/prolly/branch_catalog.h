@@ -71,6 +71,15 @@ extern Oid	NamespaceOidByName(const char *nspname);
 extern int32 NamespaceBranch(Oid nspid);
 
 /*
+ * The branch a function runs on, whatever the caller's, given its pg_proc
+ * row; -1 if it runs on the caller's.  A function in a versioned schema
+ * runs on its schema's branch.  A shared security definer function runs on
+ * no branch, unless it sets catalog_branch itself: what its names mean is
+ * its owner's choice, never its caller's.
+ */
+extern int32 FunctionBranch(HeapTuple proctup);
+
+/*
  * Errors out unless a schema named nspname may be made (or renamed to) on
  * branch (0: shared), and locks the name until the transaction ends, so
  * that a concurrent transaction cannot make it the other kind.

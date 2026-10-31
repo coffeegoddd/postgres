@@ -117,6 +117,13 @@ CREATE SCHEMA app VERSIONED;
 ERROR:  schema "app" already exists
 CREATE SCHEMA IF NOT EXISTS app VERSIONED;
 NOTICE:  schema "app" already exists, skipping
+-- IF NOT EXISTS skips only a schema of the kind asked for
+CREATE SCHEMA IF NOT EXISTS app;
+ERROR:  schema "app" already exists
+DETAIL:  It is a versioned schema.
+CREATE SCHEMA IF NOT EXISTS pub VERSIONED;
+ERROR:  schema "pub" already exists
+DETAIL:  It is a shared schema.
 ALTER SCHEMA pub RENAME TO app;
 ERROR:  schema "app" already exists
 DETAIL:  A versioned schema of that name exists on a branch.
@@ -225,7 +232,8 @@ SELECT count(*) FROM app.t;
      2
 (1 row)
 
--- a sequence's cached values do not outlive a branch change
+-- a sequence's state is its own: on b2, app.s is b2's sequence, which this
+-- session has not used; back on b1, b1's is as it was
 CREATE SEQUENCE app.s;
 SELECT nextval('app.s');
  nextval 
@@ -238,11 +246,13 @@ SELECT currval('app.s');
 ERROR:  relation "app.s" does not exist
 LINE 1: SELECT currval('app.s');
                        ^
-SELECT lastval();
-ERROR:  lastval is not yet defined in this session
 SET catalog_branch = :b1;
 SELECT currval('app.s');
-ERROR:  currval of sequence "s" is not yet defined in this session
+ currval 
+---------
+       1
+(1 row)
+
 -- parallel workers resolve names on the leader's branch
 SET debug_parallel_query = on;
 SELECT to_regclass('app.t')::oid = :t1 AS worker_on_b1;

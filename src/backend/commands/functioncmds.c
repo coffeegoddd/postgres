@@ -62,6 +62,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -2267,6 +2268,20 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 	 */
 	if (((Form_pg_proc) GETSTRUCT(tp))->prosecdef)
 		callcontext->atomic = true;
+
+	/*
+	 * Nor in a procedure that runs on another branch than the caller's (see
+	 * FunctionBranch()): its branch is a GUC setting stacked as proconfig's
+	 * are, which a transaction boundary would pop, giving its later
+	 * statements the caller's branch.  (CALL names the procedure, and names
+	 * resolve on the caller's branch, so this is not reached today.)
+	 */
+	{
+		int32		branch = FunctionBranch(tp);
+
+		if (branch >= 0 && branch != catalog_branch)
+			callcontext->atomic = true;
+	}
 
 	ReleaseSysCache(tp);
 

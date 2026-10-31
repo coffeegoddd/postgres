@@ -71,6 +71,7 @@ patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nsp
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
+patch src/backend/commands/functioncmds.c  1b  a procedure that runs on another branch than the caller's is atomic
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
@@ -78,6 +79,7 @@ patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
+patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
@@ -98,9 +100,11 @@ patch src/backend/utils/activity/wait_event_names.txt  1a  wait event of a page 
 patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
+patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per branch
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap
-patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings
+patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch
+patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
@@ -142,6 +146,7 @@ patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage th
 patch src/include/storage/lwlocklist.h  1a  the block map's replay lock is a built-in tranche, so it takes no slot extensions may use
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write, and says which pages' free space a copy's free space map may not know
 patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
+patch src/include/utils/funccache.h  1b  the branch in the compiled-function cache key
 patch src/include/utils/pgstat_internal.h  1a  the block map statistics kind's shared entry and callbacks
 patch src/include/utils/pgstat_kind.h  1a  PGSTAT_KIND_BLOCK_MAP, a variable-numbered kind after the fixed ones
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world

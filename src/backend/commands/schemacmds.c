@@ -129,6 +129,15 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 			ObjectAddressSet(address, NamespaceRelationId, namespaceId);
 			checkMembershipInCurrentExtension(&address);
 
+			/* ... and that it is the kind asked for */
+			if ((NamespaceBranch(namespaceId) != 0) != stmt->versioned)
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_SCHEMA),
+						 errmsg("schema \"%s\" already exists", schemaName),
+						 stmt->versioned ?
+						 errdetail("It is a shared schema.") :
+						 errdetail("It is a versioned schema.")));
+
 			/* OK to skip */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_SCHEMA),

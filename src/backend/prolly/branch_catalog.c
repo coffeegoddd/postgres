@@ -19,11 +19,13 @@
  * configuration named by default_text_search_config, and the replication
  * output plugin's view of which publications cover which tables.  Each of
  * those is kept current by a syscache callback on pg_namespace, so a
- * branch change runs those callbacks as if every schema had changed.  It
- * also discards the session's sequence caches, as DISCARD SEQUENCES does,
- * so that currval() never answers for a sequence the session can no longer
- * name.  None of this reads the catalogs, so it is safe wherever a setting
- * can change, including while a transaction aborts.
+ * branch change runs those callbacks as if every schema had changed.
+ * (The session's sequence state is kept: it is by object id, each branch's
+ * sequences have their own, and currval() of a name asks the branch's.  A
+ * function running on its own branch switches it on each call, and must
+ * not lose its caller's lastval().)  None of this reads the catalogs, so it
+ * is safe wherever a setting can change, including while a transaction
+ * aborts.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -38,8 +40,10 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "commands/sequence.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
@@ -48,6 +52,7 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -66,7 +71,6 @@ assign_catalog_branch(int newval, void *extra)
 
 	CallSyscacheCallbacks(NAMESPACEOID, 0);
 	CallSyscacheCallbacks(TSCONFIGOID, 0);
-	ResetSequenceCaches();
 }
 
 /*
@@ -121,6 +125,40 @@ NamespaceBranch(Oid nspid)
 		ReleaseSysCache(tup);
 	}
 	return branch;
+}
+
+int32
+FunctionBranch(HeapTuple proctup)
+{
+	Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(proctup);
+	int32		branch;
+	Datum		config;
+	bool		isnull;
+
+	/* (initdb's schemas are shared) */
+	if (proc->pronamespace < FirstNormalObjectId && !proc->prosecdef)
+		return -1;
+	branch = NamespaceBranch(proc->pronamespace);
+	if (branch != 0)
+		return branch;
+	if (!proc->prosecdef)
+		return -1;
+
+	config = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proconfig,
+							 &isnull);
+	if (!isnull)
+	{
+		List	   *names;
+		List	   *values;
+
+		TransformGUCArray(DatumGetArrayTypeP(config), &names, &values);
+		foreach_ptr(char, name, names)
+		{
+			if (pg_strcasecmp(name, "catalog_branch") == 0)
+				return -1;
+		}
+	}
+	return 0;
 }
 
 /*

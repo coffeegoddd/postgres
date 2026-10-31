@@ -27,6 +27,7 @@
 #include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgrtab.h"
@@ -206,6 +207,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	if (!ignore_security &&
 		(procedureStruct->prosecdef ||
 		 !heap_attisnull(procedureTuple, Anum_pg_proc_proconfig, NULL) ||
+		 FunctionBranch(procedureTuple) >= 0 ||
 		 FmgrHookIsNeeded(functionId)))
 	{
 		finfo->fn_addr = fmgr_security_definer;
@@ -294,6 +296,7 @@ fmgr_symbol(Oid functionId, char **mod, char **fn)
 
 	if (procedureStruct->prosecdef ||
 		!heap_attisnull(procedureTuple, Anum_pg_proc_proconfig, NULL) ||
+		FunctionBranch(procedureTuple) >= 0 ||
 		FmgrHookIsNeeded(functionId))
 	{
 		*mod = NULL;			/* core binary */
@@ -617,6 +620,7 @@ struct fmgr_security_definer_cache
 	List	   *configNames;	/* GUC names to set, or NIL */
 	List	   *configHandles;	/* GUC handles to set, or NIL */
 	List	   *configValues;	/* GUC values to set, or NIL */
+	int32		branch;			/* catalog_branch to set, or -1 */
 	Datum		arg;			/* passthrough argument for plugin modules */
 };
 
@@ -668,6 +672,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 		if (procedureStruct->prosecdef)
 			fcache->userid = procedureStruct->proowner;
+		fcache->branch = FunctionBranch(tuple);
 
 		datum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_proconfig,
 								&isnull);
@@ -703,8 +708,9 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	/* GetUserIdAndSecContext is cheap enough that no harm in a wasted call */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	if (fcache->configNames != NIL) /* Need a new GUC nesting level */
-		save_nestlevel = NewGUCNestLevel();
+	if (fcache->configNames != NIL ||
+		(fcache->branch >= 0 && fcache->branch != catalog_branch))
+		save_nestlevel = NewGUCNestLevel(); /* Need a new GUC nesting level */
 	else
 		save_nestlevel = 0;		/* keep compiler quiet */
 
@@ -726,6 +732,17 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 		(void) set_config_with_handle(name, handle, value,
 									  context, source, GetUserId(),
 									  action, true, 0, false);
+	}
+
+	/* the branch its names are resolved on (see FunctionBranch()) */
+	if (fcache->branch >= 0 && fcache->branch != catalog_branch)
+	{
+		char		value[12];
+
+		snprintf(value, sizeof(value), "%d", fcache->branch);
+		(void) set_config_option("catalog_branch", value,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
 	}
 
 	/* function manager hook */
@@ -768,7 +785,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	fcinfo->flinfo = save_flinfo;
 
-	if (fcache->configNames != NIL)
+	if (save_nestlevel != 0)
 		AtEOXact_GUC(true, save_nestlevel);
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(save_userid, save_sec_context);
