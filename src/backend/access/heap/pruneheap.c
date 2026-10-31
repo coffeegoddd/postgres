@@ -820,12 +820,12 @@ heap_page_will_freeze(bool did_tuple_hint_fpi,
 			 * pages freezes a page eagerly where that copies nothing
 			 * (VacuumCutoffs.freeze_own_eagerly): the relation's own, or a
 			 * shared one this VACUUM copies anyway, pruning it or setting it
-			 * all-visible; else, have we already emitted an FPI or will we
-			 * anyway?
+			 * all-visible (which dead line pointers left keep it from);
+			 * else, have we already emitted an FPI or will we anyway?
 			 */
 			if (prstate->cutoffs->freeze_own_eagerly &&
 				(!BufferPageIsShared(prstate->buffer) || do_prune ||
-				 (prstate->attempt_set_vm &&
+				 (prstate->attempt_set_vm && prstate->lpdead_items == 0 &&
 				  (prstate->old_vmbits & VISIBILITYMAP_ALL_VISIBLE) == 0)))
 				do_freeze = true;
 			else if (RelationNeedsWAL(prstate->relation))
