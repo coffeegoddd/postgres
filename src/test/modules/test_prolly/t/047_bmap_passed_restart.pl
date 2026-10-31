@@ -24,6 +24,7 @@ autovacuum = off
 checkpoint_timeout = 1h
 max_wal_size = 1GB
 bgwriter_lru_maxpages = 0
+wal_writer_delay = 10s
 });
 $node->start;
 $node->safe_psql('postgres', q{
@@ -87,5 +88,36 @@ sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
 is(passed_since($start), '0', 'after a restart, changing the others logs no PASSED record again');
 $node->stop;
 is(synced_count(), $count, 'nor a note in pg_control');
+
+# The note stands for its record, so the record is flushed before it: a
+# crash right after the note (the WAL writer slow, the change's transaction
+# not committed) leaves both, never the note alone.
+SKIP:
+{
+	skip 'Injection points not supported by this build', 2
+	  if $ENV{enable_injection_points} ne 'yes';
+
+	$node->start;
+	sql(q{CREATE EXTENSION injection_points});
+	my $copy_c = shared_and_copied('c');
+	my $cpages = sql(q{SELECT pg_relation_size('c') / 8192});
+	sql(q{CHECKPOINT});
+	my $before = synced_count();
+	$start = sql(q{SELECT pg_current_wal_insert_lsn()});
+	sql(q{SELECT injection_points_attach('bmap-copies-passed-noted', 'wait')});
+	my $session = $node->background_psql('postgres', on_error_stop => 0);
+	$session->query_until(qr/started/, qq{
+		\\echo started
+		BEGIN;
+		SELECT test_bmap_write($copy_c, b, 9) FROM generate_series(0, $cpages - 1) b;
+	});
+	$node->wait_for_event('client backend', 'bmap-copies-passed-noted');
+	$node->stop('immediate');
+	eval { $session->quit };
+	cmp_ok(synced_count(), '>', $before, 'the crash came after a note');
+	$node->start;
+	cmp_ok(passed_since($start), '>=', 1, 'and the PASSED record the note stands for survived it');
+	$node->stop;
+}
 
 done_testing();

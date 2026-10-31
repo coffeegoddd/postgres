@@ -1602,6 +1602,7 @@ static void
 copies_passed(XLogRecPtr passed)
 {
 	xl_bmap_passed xlrec;
+	XLogRecPtr	lsn;
 
 	if (XLogRecPtrIsInvalid(passed) ||
 		passed <= pg_atomic_read_u64(&bmap_shared->copies_passed))
@@ -1614,23 +1615,31 @@ copies_passed(XLogRecPtr passed)
 	 * Logging again would raise pg_control's count of such notes, by which a
 	 * pg_rewind copying files meanwhile refuses its source.
 	 */
-	if (passed - 1 <= XLogSyncedSince())
 	{
-		pg_atomic_monotonic_advance_u64(&bmap_shared->copies_passed, passed);
-		return;
+		XLogRecPtr	since = XLogSyncedSince();
+
+		if (XLogRecPtrIsValid(since) && passed - 1 <= since)
+		{
+			pg_atomic_monotonic_advance_u64(&bmap_shared->copies_passed, since + 1);
+			return;
+		}
 	}
 	xlrec.horizon = Max(copy_horizon(), passed);
 	xlrec.copied = passed;
 	Assert(passed <= xlrec.horizon);
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	(void) XLogInsert(RM_BMAP_ID, XLOG_BMAP_PASSED);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_PASSED);
 
 	/*
-	 * (the copy's position is its record's end: a recovery beginning
-	 * there doesn't replay it)
+	 * The record durable before the note: a note pg_control keeps stands
+	 * for its record, which skips a later PASSED (above), so a crash
+	 * between them mustn't leave the note alone.  (The copy's position is
+	 * its record's end: a recovery beginning there doesn't replay it.)
 	 */
+	XLogFlush(lsn);
 	XLogNoteSyncedPages(passed - 1);
+	INJECTION_POINT("bmap-copies-passed-noted", NULL);
 	pg_atomic_monotonic_advance_u64(&bmap_shared->copies_passed, passed);
 }
 
@@ -6888,10 +6897,12 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 			preserve_synced(src, dst, &synced);
 
 		/*
-		 * Said in pg_control, once the blocks are durable: no recovery may
-		 * begin at or before the newest of them was given to src, and a
+		 * Said in pg_control, once the blocks are durable and the share's
+		 * record is (the note stands for it: copies_passed()): no recovery
+		 * may begin at or before the newest of them was given to src, and a
 		 * rewind copying files meanwhile can't rely on what it copied.
 		 */
+		XLogFlush(lsn);
 		XLogNoteSyncedPages(synced.newest);
 	}
 	if (synced.own > 0)
