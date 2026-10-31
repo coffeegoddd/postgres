@@ -120,7 +120,8 @@
  * below what they pop, so that it holds up nothing else); nor moved by a
  * compaction; and no hint is set on its page, which a recovery would copy.
  * Its first change in place or free after that is preceded by a PASSED record
- * (copies_passed()), unless one was logged for a later copy already.  The
+ * (copies_passed()), unless one was logged for a later copy already (as
+ * pg_control keeps the newest, across restarts).  The
  * record's redo moves the restart point of a standby or an archive recovery
  * past the copies it replayed, asking for a restartpoint if need be, so that a
  * crash of that server never replays a copy after the block changed
@@ -1605,6 +1606,19 @@ copies_passed(XLogRecPtr passed)
 	if (XLogRecPtrIsInvalid(passed) ||
 		passed <= pg_atomic_read_u64(&bmap_shared->copies_passed))
 		return;
+
+	/*
+	 * Noted already, before a restart that forgot it: pg_control keeps the
+	 * newest position noted, and every one noted was so by a record (this
+	 * one, or a share's) whose redo moves a standby's restart point past it.
+	 * Logging again would raise pg_control's count of such notes, by which a
+	 * pg_rewind copying files meanwhile refuses its source.
+	 */
+	if (passed - 1 <= XLogSyncedSince())
+	{
+		pg_atomic_monotonic_advance_u64(&bmap_shared->copies_passed, passed);
+		return;
+	}
 	xlrec.horizon = Max(copy_horizon(), passed);
 	xlrec.copied = passed;
 	Assert(passed <= xlrec.horizon);

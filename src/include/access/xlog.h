@@ -295,6 +295,7 @@ extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 extern void GetBackupState(int *running, XLogRecPtr *last_start);
 extern XLogRecPtr GetRecoveryHold(bool *backups);
 extern void XLogNoteSyncedPages(XLogRecPtr since);
+extern XLogRecPtr XLogSyncedSince(void);
 extern void XLogNoteSyncedReplay(void);
 extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
