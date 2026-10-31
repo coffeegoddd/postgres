@@ -93,4 +93,51 @@ $node->start;
 is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'the copy reads the rows the source had at the share, reused blocks too');
 
+$node->stop;
+
+# Redo dirties a leaf only if an entry changes: a standby replaying an
+# extension again over a leaf already newer on disk (written out after it
+# replayed it once, then a crash) leaves the leaf's buffer clean, the
+# delta's 'since' for every entry it lists notwithstanding.  No full-page
+# writes, so no image restores a page either.
+my $primary = PostgreSQL::Test::Cluster->new('reused_stale_primary');
+$primary->init(allows_streaming => 1);
+$primary->append_conf('postgresql.conf', qq{
+debug_block_mapped_heap = on
+autovacuum = off
+full_page_writes = off
+block_map_standby_hold_max_size = 0
+checkpoint_timeout = 1h
+});
+$primary->start;
+$primary->safe_psql('postgres', q{CREATE EXTENSION pg_buffercache});
+$primary->backup('base');
+my $standby = PostgreSQL::Test::Cluster->new('reused_stale_standby');
+$standby->init_from_backup($primary, 'base', has_streaming => 1);
+$standby->append_conf('postgresql.conf', 'checkpoint_timeout = 1h');
+$standby->start;
+
+# The table and its map made, and a restartpoint past them; then only
+# extensions, within the leaf made, to replay again.
+$primary->safe_psql('postgres', q{
+	CREATE TABLE e (a int, b text);
+	INSERT INTO e VALUES (0, 'e');
+	CHECKPOINT;
+});
+$primary->wait_for_replay_catchup($standby);
+$standby->safe_psql('postgres', q{CHECKPOINT});
+$primary->safe_psql('postgres', q{
+	INSERT INTO e SELECT g, repeat('e', 200) FROM generate_series(1, 30 * 34) g;
+});
+$primary->wait_for_replay_catchup($standby);
+$standby->safe_psql('postgres', q{SELECT count(*) FROM pg_buffercache_evict_all()});
+$standby->stop('immediate');
+$standby->start;
+$primary->wait_for_replay_catchup($standby);
+is($standby->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_buffercache WHERE isdirty AND relfilenode = 9421}), '0',
+	'replaying extensions over newer leaves dirties none');
+
+$standby->stop;
+$primary->stop;
 done_testing();

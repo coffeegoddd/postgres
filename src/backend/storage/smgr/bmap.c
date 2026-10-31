@@ -1809,10 +1809,12 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 		/* (in redo, an entry kept from a newer page: see redo_block()) */
 		if (e->since > delta->since)
 			continue;
+		/* (an entry already as the delta sets it changes nothing) */
+		if (e->block == ent[i].block && e->epoch == ent[i].epoch &&
+			(!(delta->flags & BMAP_DELTA_SINCE) || e->since == delta->since))
+			continue;
 		if (e->block != ent[i].block || (delta->flags & BMAP_DELTA_SINCE))
 			e->since = delta->since;
-		else if (e->epoch == ent[i].epoch)
-			continue;
 		e->block = ent[i].block;
 		e->epoch = ent[i].epoch;
 		changed = true;
