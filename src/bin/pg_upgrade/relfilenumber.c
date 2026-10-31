@@ -720,7 +720,11 @@ transfer_bmap_stores(Oid db_oid, char *old_tablespace, char *new_tablespace)
  * database and tablespace is transferred by exactly one call.  Where the
  * old cluster has no store, the new cluster's is left: an old cluster
  * whose sequences' files aren't transferred (TRANSFER_SEQUENCES) has no
- * store, and the sequences pg_restore made are in the new one's.
+ * store, and the sequences pg_restore made are in the new one's.  The
+ * blocks it holds for relations pg_restore made block-mapped, whose maps
+ * the transfer of the old relations' files drops (remove_new_relfile()),
+ * are then counted and held by nothing: the sweep due after the new
+ * cluster starts frees them, as it frees what a crash leaked.
  */
 static void
 transfer_bmap_store(Oid db_oid, const char *old_tablespace,

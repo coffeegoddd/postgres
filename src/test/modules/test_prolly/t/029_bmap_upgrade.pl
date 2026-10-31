@@ -195,6 +195,8 @@ for my $mode ('--copy', '--link', '--swap')
 	$old->safe_psql('postgres', q{
 		CREATE TABLE m (a int);
 		INSERT INTO m SELECT generate_series(1, 100);
+		CREATE SEQUENCE ms;
+		SELECT nextval('ms');
 	});
 	my $db = $old->safe_psql('postgres', q{SELECT oid FROM pg_database WHERE datname = 'postgres'});
 	$old->stop;
@@ -203,6 +205,8 @@ for my $mode ('--copy', '--link', '--swap')
 	my $new = PostgreSQL::Test::Cluster->new('upgrade_new_bmap');
 	$new->init;
 	$new->append_conf('postgresql.conf', 'debug_block_mapped_heap = on');
+	# (no autovacuum, which would run the sweep due after a start first)
+	$new->append_conf('postgresql.conf', 'autovacuum = off');
 	my $bindir = $old->config_data('--bindir');
 	command_ok(
 		[ 'pg_upgrade', '--no-sync',
@@ -218,6 +222,18 @@ for my $mode ('--copy', '--link', '--swap')
 	ok(-f $new->data_dir . "/base/$db/9421", 'the new cluster\'s page store is left');
 	$new->start;
 	is($new->safe_psql('postgres', q{SELECT count(*) FROM m}), '100', 'and the rows survive');
+	is($new->safe_psql('postgres', q{SELECT nextval('ms')}), '2', 'and the sequence goes on');
+	# pg_restore made the sequence block-mapped in the new cluster's store,
+	# its page in it, and the upgrade dropped its map for the old file: the
+	# page's block is counted and held by nothing, which the sweep due after
+	# the start frees.
+	$new->safe_psql('postgres', q{CREATE EXTENSION test_prolly});
+	is($new->safe_psql('postgres', q{SELECT test_bmap_sweep_due()}), 't',
+		'a sweep is due after the start');
+	cmp_ok($new->safe_psql('postgres', q{SELECT freed FROM test_bmap_sweep()}), '>', 0,
+		'it frees the blocks of the maps the upgrade dropped');
+	is($new->safe_psql('postgres', q{SELECT freed FROM test_bmap_sweep()}), '0',
+		'and nothing is left held by nothing');
 	$new->stop;
 }
 
