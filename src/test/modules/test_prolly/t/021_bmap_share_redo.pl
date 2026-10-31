@@ -63,6 +63,23 @@ my ($ref_pages) = slurp_file($standby->logfile, $log_offset) =~
   /redo of a share of \Q$path\E writes out its own pages: \d+, found reading \d+ nodes of its map and (\d+) count pages/;
 ok(defined $ref_pages && $ref_pages <= 2,
 	'reading each count page once (' . ($ref_pages // 'none') . " for $pages pages)");
+
+# The page store's and its counts' lengths, asked once each for the walk,
+# not once for every node it reads: a source of thousands of pages, whose
+# walk reads several.
+sql(q{
+	CREATE TABLE big (a int, b text);
+	INSERT INTO big SELECT g, repeat('b', 100) FROM generate_series(1, 3000 * 60) g;
+});
+my $bpath = sql(q{SELECT pg_relation_filepath('big')});
+$log_offset = -s $standby->logfile;
+sql(q{SELECT test_bmap_share(pg_relation_filenode('big'))});
+$primary->wait_for_replay_catchup($standby);
+my ($bnodes, $lengths) = slurp_file($standby->logfile, $log_offset) =~
+  /redo of a share of \Q$bpath\E writes out its own pages: \d+, found reading (\d+) nodes of its map and \d+ count pages, asking (\d+) files' lengths/;
+cmp_ok($bnodes // 0, '>=', 3, 'a big source\'s walk reads several nodes');
+ok(defined $lengths && $lengths <= 2,
+	'asking each file\'s length once (' . ($lengths // 'none') . " for $bnodes nodes)");
 is(ssql(qq{SELECT test_bmap_rows_digest($copy)}), $digest,
 	'the standby\'s copy reads the source\'s pages');
 
