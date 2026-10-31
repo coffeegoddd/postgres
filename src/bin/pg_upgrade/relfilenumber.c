@@ -724,7 +724,8 @@ transfer_bmap_stores(Oid db_oid, char *old_tablespace, char *new_tablespace)
  * blocks it holds for relations pg_restore made block-mapped, whose maps
  * the transfer of the old relations' files drops (remove_new_relfile()),
  * are then counted and held by nothing: the sweep due after the new
- * cluster starts frees them, as it frees what a crash leaked.
+ * cluster starts (autovacuum's, unless block_map_release_max_per_pass is
+ * 0) frees them, as it frees what a crash leaked.
  */
 static void
 transfer_bmap_store(Oid db_oid, const char *old_tablespace,
