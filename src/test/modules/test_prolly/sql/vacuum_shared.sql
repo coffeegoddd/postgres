@@ -33,6 +33,13 @@ VACUUM shared_t;
 SELECT shared_blocks(:t, :copy) = :nblocks AS all_still_shared;
 SELECT count(*) FROM shared_t;
 
+-- An aggressive VACUUM freezes by FreezeLimit, as any: shared pages whose
+-- tuples are younger than it are left shared, not copied to be frozen.
+SET vacuum_freeze_table_age = 0;
+VACUUM shared_t;
+RESET vacuum_freeze_table_age;
+SELECT shared_blocks(:t, :copy) = :nblocks AS aggressive_copies_nothing;
+
 -- Dead tuples on a shared page are reclaimed: that page is copied, and
 -- only that one.
 DELETE FROM shared_t WHERE id <= 10;
@@ -84,8 +91,9 @@ WHERE resource_manager = 'Heap2' AND record_type = 'VM_SET'
 SELECT test_bmap_unlink(:vcopy);
 
 -- A page shared only with a root held of the relation itself, not with
--- another relation, is vacuumed as the relation's own: frozen and set
--- all-visible, copied, while the root keeps the version it had.
+-- another relation, is vacuumed as the relation's own (copied if VACUUM
+-- must change it, the root keeping the version it had), but isn't frozen
+-- eagerly: that would copy it, for no tuple old enough to need it.
 CREATE TABLE held_t (id int, pad text) WITH (autovacuum_enabled = off);
 INSERT INTO held_t SELECT g, repeat('h', 200) FROM generate_series(1, 3000) g;
 SELECT relfilenode AS h FROM pg_class WHERE relname = 'held_t' \gset
@@ -94,7 +102,7 @@ BEGIN;
 SELECT test_bmap_root_capture(:h) AS root \gset
 COMMIT;
 VACUUM held_t;
-SELECT count(*) = :hblocks AS held_pages_frozen
+SELECT count(*) = 0 AS held_pages_left_unfrozen
 FROM generate_series(0, :hblocks - 1) b
 WHERE (SELECT all_frozen FROM pg_visibility_map('held_t', b));
 BEGIN;

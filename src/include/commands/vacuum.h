@@ -297,11 +297,14 @@ struct VacuumCutoffs
 	MultiXactId MultiXactCutoff;
 
 	/*
-	 * Should a normal VACUUM scan every all-visible page that isn't
-	 * all-frozen, to freeze it (rather than eagerly scanning some)?  Set for
-	 * storage that shares pages, whose freeze age then defaults to 0.
+	 * Should a page the relation's storage shares with nothing be frozen
+	 * whenever all its tuples can be, whatever FreezeLimit says (pruning's
+	 * opportunistic freeze, made eager)?  Set for storage that shares pages
+	 * (freezes_eagerly()): its own pages are frozen while they are still its
+	 * own, which copies nothing, so a share made later needn't copy them to
+	 * freeze them; shared pages freeze only by FreezeLimit.
 	 */
-	bool		freeze_all_visible;
+	bool		freeze_own_eagerly;
 };
 
 /*

@@ -48,8 +48,8 @@ patch src/backend/Makefile     0  links the engine's code in src/backend/prolly 
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (NewRelationStorageManager(); kept across rewrites)
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
-patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing
-patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; scans eagerly to freeze while pages are a relation's own; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
+patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing; VACUUM freezes a page the storage shares with nothing whenever all its tuples can be (freeze_own_eagerly)
+patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; counts a shared page left as it is as an eager scan's failure; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
 patch src/backend/access/nbtree/nbtpage.c  1a  B-tree VACUUM takes leaf cleanup locks unprepared and prepares only the pages it changes, so shared leaves aren't copied
 patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
 patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
@@ -73,7 +73,7 @@ patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old h
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
-patch src/backend/commands/vacuum.c  1a  freeze age 0 for storage that shares pages; lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
+patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
@@ -122,7 +122,7 @@ patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
 patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages()
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
-patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_all_visible
+patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped

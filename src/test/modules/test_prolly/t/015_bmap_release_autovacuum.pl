@@ -178,5 +178,34 @@ SKIP:
 		'0', 'nothing is left leaked');
 }
 
+# With block_map_release_max_per_pass 0, autovacuum leaves block-mapped
+# storage alone, sweeps included: the sweep due after a start stays due
+# through a worker's pass over the database.
+$node->append_conf('postgresql.conf', 'block_map_release_max_per_pass = 0');
+$node->restart;
+is(sql(q{SELECT test_bmap_sweep_due()}), 't', 'a sweep is due after the start');
+my $zero_offset = -s $node->logfile;
+autovacuum(1);
+ok( $node->poll_query_until(
+		'postgres', q{SELECT true}, 't') &&
+	  wait_for_pass($zero_offset),
+	'a worker passes over the database');
+is(sql(q{SELECT test_bmap_sweep_due()}), 't',
+	'and, with block_map_release_max_per_pass 0, leaves the sweep due');
+autovacuum(0);
+
 $node->stop;
 done_testing();
+
+# Waits for a worker's storage maintenance pass over database "postgres"
+# after 'offset' in the log.
+sub wait_for_pass
+{
+	my ($offset) = @_;
+	for (1 .. 300)
+	{
+		return 1 if scalar(passes($offset)) > 0;
+		sleep 1;
+	}
+	return 0;
+}

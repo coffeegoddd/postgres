@@ -2728,7 +2728,8 @@ deleted:
  * (smgrmaintain()): what dropped relations' storage still holds is let go
  * of, at most block_map_release_max_per_pass entries a pass, under the
  * cost-based delay, and whatever else is due runs, such as a sweep of a
- * block-mapped page store after a crash may have leaked some of its blocks.
+ * block-mapped page store after a crash may have leaked some of its blocks
+ * (nothing at all, with block_map_release_max_per_pass 0).
  * It is a saving, not the pass's work: an error in it is reported and the
  * worker goes on, the transaction it ran in rolled back.
  */
