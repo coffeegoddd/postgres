@@ -967,6 +967,7 @@ typedef enum PgStat_BlockMapEvent
 extern void pgstat_count_block_map(Oid spcoid, Oid dboid, Oid relnumber,
 								   PgStat_BlockMapEvent event);
 extern void pgstat_drop_block_map(Oid spcoid, Oid dboid, Oid relnumber);
+extern void pgstat_drop_block_map_tablespace(Oid spcoid, Oid dboid);
 extern PgStat_StatBlockMapEntry *pgstat_fetch_stat_block_map(Oid spcoid,
 															 Oid dboid,
 															 Oid relnumber);

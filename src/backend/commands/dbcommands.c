@@ -2348,6 +2348,9 @@ movedb(const char *dbname, const char *tblspcname)
 				(errmsg("some useless files may be left behind in old database directory \"%s\"",
 						src_dbpath)));
 
+	/* the block map statistics of the files moved, keyed by the old one */
+	pgstat_drop_block_map_tablespace(src_tblspcoid, db_id);
+
 	/*
 	 * Record the filesystem change in XLOG
 	 */

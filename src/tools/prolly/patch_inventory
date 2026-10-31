@@ -68,7 +68,7 @@ patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given s
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers
 patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims
-patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database
+patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
