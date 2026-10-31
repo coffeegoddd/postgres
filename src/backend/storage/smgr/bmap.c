@@ -2559,9 +2559,16 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 			ptr = next;
 		}
 
-		/* a node not the one its pointer names */
+		/*
+		 * A node not the one its pointer names.  Replay, and a write-out in
+		 * recovery, take the subtree for one replaced or let go of after the
+		 * record (above) once it misses twice.  A hot standby's query reading
+		 * the block does not: it begins again, as a primary's lookup does,
+		 * its node moved by the replay meanwhile; taking the block for a hole,
+		 * it would read zeroes for the page.
+		 */
 		mismatches++;
-		if (RecoveryInProgress() && mismatches > 1)
+		if (RecoveryInProgress() && (InRecovery || for_write) && mismatches > 1)
 			return TREE_UNAVAILABLE;
 		if (mismatches >= TREE_FIND_TRIES)
 			ereport(ERROR,
