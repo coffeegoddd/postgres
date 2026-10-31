@@ -1850,6 +1850,142 @@ the kept commits oldest first:
   196 ms;
 - saves, reopens, logs, short merge bases and diffs are as in KEEP mode.
 
+## Clone, push, fetch and pull over the wire
+
+**The question.**  The remote operations had only run between two repos
+in one process.  Do they work against a plain-storage remote over HTTP,
+the kind Dolt's `file://` and S3 remotes are, and how do they scale with
+the size of the database, the size of the change and the network's
+latency?  Where are the bottlenecks?
+
+**What was built.**
+- **`bench/objserver`:** a small object server over HTTP with S3's verbs:
+  PUT, conditional PUT (`If-Match`, `If-None-Match`), ranged GET, HEAD,
+  DELETE and LIST, plus a delay added to every request and counters of
+  requests and bytes.  It is not S3: no request signing, multipart uploads
+  or S3's consistency model.  MinIO's images could no longer be pulled.
+- **`bench/remote.c`:** the client's remote layer, a directory (`file://`)
+  or the object server over libcurl, with parallel ranged reads.
+- **`bench/packstore.c`:** a `ChunkStore` on such a remote, with all the
+  logic on the client, as Dolt does it:
+  - each push's new chunks go into one immutable pack, children first,
+    followed by an index of (hash, offset, length);
+  - a manifest names the packs and the repo's state, and is replaced by a
+    conditional PUT, a compare-and-swap;
+  - opening reads the manifest and every pack's index;
+  - the remote's chunks are held by their packs and never freed.
+- **`cs_copy_closure_levels`:** the transfer one level of the tree at a
+  time, each level's missing chunks read in one batch (ranges of a pack
+  closer than 64 KB merged into one read, the reads in parallel), then
+  stored bottom-up.  The transfer as it was asks for one chunk at a time.
+- **`bench/remotebench`:**
+  - builds an origin with N rows of 100 bytes and 5 commits of history;
+  - pushes it to an empty remote (cloning into it);
+  - clones it back a chunk at a time, a level at a time, and by streaming
+    the packs whole;
+  - then, for changes of 1, 100 and 10,000 random rows, pushes from the
+    origin, fetches into the clone, and pulls into the clone (a fetch and
+    a merge with a change of the clone's own).
+
+  The local stores are directory stores, or, with `--local-pg`, the page
+  store (`pgstore`, our own pages inside Postgres) on a cluster of its
+  own, with the WAL each operation writes measured.  Each fetched head is
+  checked against the origin's.
+
+**The runs** (2026-10-31, the NVMe drive, the object server on localhost
+with 16 parallel connections; single runs).
+
+### Latency: a chunk at a time against a level at a time
+
+100,000 rows (33 MB of chunks):
+
+| Operation | No delay | 1 ms a request | 10 ms a request |
+|---|---:|---:|---:|
+| Clone, a chunk at a time (6,757 requests) | 0.60 s | 8.7 s | 72 s |
+| Clone, a level at a time (125 requests) | 0.28 s | 0.31 s | 0.52 s |
+| Clone, packs streamed whole (11 requests) | 0.18 s | 0.19 s | 0.30 s |
+| Fetch of 10,000 rows, a chunk at a time (2,479 requests) | 0.21 s | 3.1 s | 26 s |
+| Fetch of 10,000 rows, a level at a time (36 requests) | 0.09 s | 0.10 s | 0.20 s |
+
+Requests, not bytes, decide a remote operation's time once there is any
+latency: a chunk at a time is one round trip per chunk.
+
+### Size: 100,000 to 10 million rows (1 ms a request, directory stores)
+
+| Operation | 100k rows (33 MB) | 1M rows (334 MB) | 10M rows (3.3 GB) |
+|---|---:|---:|---:|
+| First push | 0.34 s | 3.3 s | 34 s |
+| Clone, a level at a time | 0.31 s | 3.1 s | 29 s |
+| Clone, packs streamed whole | 0.19 s | 1.8 s | 17 s |
+| Pack indexes read to open the remote | 0.2 MB | 2.2 MB | 21.6 MB |
+| Fetch of 1 row | 0.013 s | 0.019 s | 0.072 s |
+| Fetch of 100 rows, a level at a time | 0.019 s | 0.027 s | 0.087 s |
+| Fetch of 10,000 rows, a level at a time | 0.10 s | 0.40 s | 0.70 s |
+| Chunks a fetch of 10,000 random rows sends | 2,486 (11 MB) | 8,080 (45 MB) | 11,740 (68 MB) |
+
+### The page store against the directory store (1 ms a request)
+
+| Operation | 1M rows, directories | 1M rows, pages | 10M rows, directories | 10M rows, pages |
+|---|---:|---:|---:|---:|
+| Clone, packs streamed whole | 1.85 s | 3.76 s | 16.7 s | 41.2 s |
+| Clone, a level at a time | 3.06 s | 5.09 s | 28.7 s | 48.6 s |
+| Fetch of 10,000 rows, a level at a time | 0.40 s | 0.67 s | 0.70 s | 1.10 s |
+| Pull of 10,000 rows, a level at a time | 0.97 s | 1.82 s | 1.42 s | 3.78 s |
+| Fetch of 1 row | 0.019 s | 0.028 s | 0.072 s | 0.086 s |
+| WAL of a clone | — | 360 MB | — | 3.67 GB |
+| WAL of a fetch of 10,000 rows | — | 48 MB | — | 72 MB |
+
+**What it shows.**
+- **The operations work over the wire.**  Clone, push, fetch and pull ran
+  against the object server over HTTP with all the logic on the client,
+  and every fetched head matched the origin's.
+- **A chunk at a time is the first bottleneck.**  Its time is the number
+  of chunks times the round trip: 72 s to clone 33 MB at 10 ms a request.
+  A level at a time needs about one batch per level of the tree, and the
+  clone streamed whole a request per pack.  A protocol for real networks
+  has to batch.
+- **Opening the remote reads every pack's index, which is the second.**
+  It grows with the whole remote, not with the change: 21.6 MB at 10M
+  rows, most of a 1-row fetch's 72 ms, and ~200 MB at 100M rows.  Every
+  push and fetch pays it.  Comparing against the last root known of the
+  remote, as git negotiates from refs, would let a push or a fetch find
+  what to send without the remote's indexes; caching the indexes, which
+  never change, would make reading each one a one-time cost.
+- **Packs pile up.**  Each push adds one, and so a request to open the
+  remote.  Merging small packs is maintenance a plain-storage remote
+  needs, done by a client.  Not measured.
+- **Random changes cost a leaf each.**  10,000 rows changed at random,
+  1 MB of rows, sent 68 MB of chunks at 10M rows: each changed row
+  rewrites its leaf.  This is the prolly tree's, not the protocol's, and
+  the same for every store.
+- **Batching reads more than it needs.**  Merging ranges closer than
+  64 KB read 142 MB for 68 MB of chunks at 10M rows.  The gap trades
+  requests for bytes.
+- **The page store is about 2× slower to receive, and scales the same
+  way.**  A clone streamed into it took 2.0× as long as into a directory
+  store at 1M rows and 2.5× at 10M; a fetch of 10,000 rows 1.6–1.7×.  Its
+  WAL was about 1.1× the bytes received, written again by checkpoints;
+  that is what makes standbys, base backups and point-in-time recovery
+  cover the history store.  The ratio's rise at 10M is likely the 3.3 GB
+  of chunks no longer fitting the server's 2 GB of shared buffers: a
+  cache effect, unconfirmed.  Neither store gets worse than linear in
+  what it receives; the costs that grow faster, the index reads and the
+  requests a chunk, are the remote's and the protocol's.
+- **The directory store held about 10 GB of memory at 10M rows**, the
+  prototype keeping chunks in memory, and rebuilds its reference counts on
+  reopening, O(live chunks).
+
+**Not measured.**
+- A real S3: request signing, multipart uploads and its consistency.
+- Rebuilding the working set after a clone, which is the same for both
+  stores and likely larger than either store's cost.
+- A bulk path for a clone into the page store (pages logged whole, or WAL
+  skipped and synced at the end).
+- The page store written from inside the backend rather than through libpq
+  and COPY, to tell its pages' cost from its client's.
+- Comparing against the remote-tracking root instead of reading indexes,
+  merging packs, and concurrent pushers.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

@@ -72,6 +72,13 @@ typedef struct ChunkStoreOps
 	void		(*destroy) (ChunkStore *cs);
 	/* Optional: told each time a chunk's durable root count changes. */
 	void		(*note_root) (ChunkStore *cs, const PHash *h, uint64_t roots);
+
+	/*
+	 * Optional: several chunks at once (a remote's batched reads); out[i]
+	 * NULL for one absent.  False if a read failed.
+	 */
+	bool		(*get_many) (ChunkStore *cs, const PHash *hs, size_t n,
+							 const uint8_t **out, size_t *lens);
 } ChunkStoreOps;
 
 struct ChunkStore
@@ -139,6 +146,16 @@ extern size_t cs_collect_orphans(ChunkStore *cs);
  * Children are stored before parents, and every copied chunk is pinned in
  * dst.  With verify, each chunk's bytes must hash to its name.
  */
+/*
+ * Copies the closures of roots[0..n) as cs_copy_closure() does, a level at a
+ * time: each level's missing chunks read at once (get_many, if src has it),
+ * then all of them stored bottom-up, children first.  Holds the chunks read
+ * until then: memory for what is copied.  Used for transfers when
+ * cs_batched_copy is set and the source reads in batches.
+ */
+extern bool cs_batched_copy;
+extern int	cs_copy_closure_levels(ChunkStore *src, PinSet *dst, const PHash *roots,
+								   size_t n, bool verify, PHash *err_hash);
 extern int	cs_copy_closure(ChunkStore *src, PinSet *dst, const PHash *h,
 							bool verify, PHash *err_hash);
 

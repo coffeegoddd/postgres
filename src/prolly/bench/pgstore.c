@@ -387,7 +387,7 @@ quiet(void *arg, const char *message)
 
 static const ChunkStoreOps pg_ops = {
 	pg_get, pg_put, pg_has, pg_meta, pg_del, pg_foreach,
-	pg_count, pg_bytes, pg_destroy, pg_note_root
+	pg_count, pg_bytes, pg_destroy, pg_note_root, NULL
 };
 
 /* -------------------------------------------------------------- flushing */

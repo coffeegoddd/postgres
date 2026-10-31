@@ -303,6 +303,139 @@ cs_copy_closure(ChunkStore *src, PinSet *dst, const PHash *h, bool verify,
 	return rc;
 }
 
+bool		cs_batched_copy = false;
+
+typedef struct Level
+{
+	PHash	   *h;
+	const uint8_t **data;
+	size_t	   *len;
+	size_t		n;
+} Level;
+
+int
+cs_copy_closure_levels(ChunkStore *src, PinSet *dst, const PHash *roots,
+					   size_t n, bool verify, PHash *err_hash)
+{
+	PHashMap	seen;
+	Level	   *levels = NULL;
+	size_t		nlevels = 0,
+				levcap = 0;
+	PHash	   *front = NULL;
+	size_t		nfront = 0,
+				frontcap = 0;
+	int			rc = CS_OK;
+
+	phmap_init(&seen);
+	for (size_t i = 0; i < n; i++)
+	{
+		bool		created;
+
+		if (cs_has(dst->cs, &roots[i]))
+		{
+			pinset_add(dst, &roots[i]);
+			continue;
+		}
+		phmap_ref(&seen, &roots[i], &created);
+		if (!created)
+			continue;
+		px_grow((void **) &front, &frontcap, nfront + 1, sizeof(PHash));
+		front[nfront++] = roots[i];
+	}
+	while (nfront > 0 && rc == CS_OK)
+	{
+		Level		lv;
+		PHash	   *next = NULL;
+		size_t		nnext = 0,
+					nextcap = 0;
+
+		lv.h = front;
+		lv.n = nfront;
+		lv.data = px_malloc(nfront * sizeof(uint8_t *));
+		lv.len = px_malloc(nfront * sizeof(size_t));
+		src->stats.gets += nfront;
+		if (src->ops->get_many)
+		{
+			if (!src->ops->get_many(src, front, nfront, lv.data, lv.len))
+				rc = CS_ERR_MISSING;
+		}
+		else
+			for (size_t i = 0; i < nfront; i++)
+				lv.data[i] = src->ops->get(src, &front[i], &lv.len[i]);
+		for (size_t i = 0; i < nfront && rc == CS_OK; i++)
+		{
+			HashVec		kids = {0};
+			PHash		got;
+
+			if (lv.data[i] == NULL)
+			{
+				*err_hash = front[i];
+				rc = CS_ERR_MISSING;
+				break;
+			}
+			if (verify)
+			{
+				phash_compute(lv.data[i], lv.len[i], &got);
+				if (!phash_eq(&got, &front[i]))
+				{
+					*err_hash = front[i];
+					rc = CS_ERR_CORRUPT;
+					break;
+				}
+			}
+			if (!chunk_refs(lv.data[i], lv.len[i], strong_fn, &kids))
+			{
+				*err_hash = front[i];
+				rc = CS_ERR_CORRUPT;
+				break;
+			}
+			for (size_t k = 0; k < kids.n; k++)
+			{
+				bool		created;
+
+				if (cs_has(dst->cs, &kids.v[k]))
+				{
+					pinset_add(dst, &kids.v[k]);
+					continue;
+				}
+				phmap_ref(&seen, &kids.v[k], &created);
+				if (!created)
+					continue;
+				px_grow((void **) &next, &nextcap, nnext + 1, sizeof(PHash));
+				next[nnext++] = kids.v[k];
+			}
+			free(kids.v);
+		}
+		px_grow((void **) &levels, &levcap, nlevels + 1, sizeof(Level));
+		levels[nlevels++] = lv;
+		front = next;
+		nfront = nnext;
+		frontcap = nextcap;
+	}
+	free(front);
+	/* bottom-up: a chunk's children are stored before it */
+	for (size_t l = nlevels; l-- > 0 && rc == CS_OK;)
+		for (size_t i = levels[l].n; i-- > 0 && rc == CS_OK;)
+		{
+			PHash		got;
+
+			if (cs_has(dst->cs, &levels[l].h[i]))
+				continue;
+			rc = cs_put(dst->cs, levels[l].data[i], levels[l].len[i], &got, err_hash);
+			if (rc == CS_OK)
+				pinset_add(dst, &got);
+		}
+	for (size_t l = 0; l < nlevels; l++)
+	{
+		free(levels[l].h);
+		free(levels[l].data);
+		free(levels[l].len);
+	}
+	free(levels);
+	phmap_free(&seen);
+	return rc;
+}
+
 typedef struct Audit
 {
 	ChunkStore *cs;

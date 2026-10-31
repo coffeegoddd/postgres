@@ -433,7 +433,7 @@ static void ds_destroy(ChunkStore *cs);
 
 static const ChunkStoreOps dir_ops = {
 	ds_get, ds_put, ds_has, ds_meta, ds_del, ds_foreach,
-	ds_count, ds_bytes, ds_destroy, ds_note_root
+	ds_count, ds_bytes, ds_destroy, ds_note_root, NULL
 };
 
 /* ------------------------------------------------------------ chunk files */

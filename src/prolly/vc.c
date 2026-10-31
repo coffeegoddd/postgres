@@ -3171,6 +3171,24 @@ plan_transfer(VcRepo *src, VcRepo *dst, const PHash *heads, size_t nheads,
 static int
 plan_copy(VcRepo *src, VcRepo *dst, const Plan *p)
 {
+	if (cs_batched_copy && src->ctx.cs->ops->get_many && p->nsend > 0)
+	{
+		PHash	   *roots = px_malloc(p->nsend * sizeof(PHash));
+		PHash		bad;
+		int			rc;
+
+		for (size_t i = 0; i < p->nsend; i++)
+			roots[i] = p->send[i].h;
+		rc = cs_copy_closure_levels(src->ctx.cs, &dst->ctx.pins, roots, p->nsend,
+									true, &bad);
+		free(roots);
+		if (rc != CS_OK)
+		{
+			dst->ctx.err_hash = bad;
+			prolly_release_pins(&dst->ctx);
+		}
+		return rc;
+	}
 	for (size_t i = 0; i < p->nsend; i++)
 	{
 		PHash		bad;
