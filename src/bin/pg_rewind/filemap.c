@@ -344,11 +344,11 @@ process_target_file(const char *path, file_type_t type, size_t size,
 /*
  * Is a relation file number one of block-mapped storage's files of a
  * database's page store, which are copied in toto (getFileContentType())?
- * Whole, as the maps say which of a store's blocks changed since the fork,
- * not the WAL's block references alone: correct, and bounded by the
- * store's size.  (The blocks the maps' records after the fork name, from
- * the WAL scanned anyway, would do, if rewinds of large stores call for
- * it.)
+ * Whole, as the WAL names a block-mapped relation's pages by logical block,
+ * not by the store's blocks, and the store's other files must agree with
+ * it: correct, and bounded by the store's size.  (Narrowing it would take
+ * every block the WAL after the fork names, data records' too, translated
+ * through the target's maps.)
  */
 static bool
 is_bmap_storage_file(RelFileNumber relNumber)

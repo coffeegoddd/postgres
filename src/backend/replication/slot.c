@@ -145,8 +145,8 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 /*
  * Version 6 keeps a physical slot's recovery hold (the block map's standby
  * hold, WalSndComputeRecoveryHold()).  A data directory with slot files of
- * an older version doesn't start (RestoreSlotFromDisk() PANICs): moving one
- * to this build, its slots are dropped first and made again after.
+ * an older version doesn't start (RestoreSlotFromDisk() PANICs): to move
+ * one to this build, drop its slots first and make them again after.
  * pg_upgrade is unaffected: it makes the new cluster's logical slots anew.
  */
 #define SLOT_VERSION	6		/* version for new files */

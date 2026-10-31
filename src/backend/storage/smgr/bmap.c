@@ -73,12 +73,11 @@
  * is written nowhere.
  *
  * Sharing with other maps (a share, a copy of a captured root) raises the
- * header's shared_below to the map's epoch: an entry born since can be
- * shared only with the roots captured of the map (bmappagesharedelsewhere()),
- * which VACUUM changes as the relation's own (copying them).  A sweep,
- * having counted every
- * holder, lowers it to just past the newest entry another map still
- * holds (sweep_shared_below()), so pages the other map let go of are
+ * header's shared_below to the map's epoch: an entry born since can be shared
+ * only with the roots captured of the map (bmappagesharedelsewhere()), which
+ * VACUUM changes as the relation's own (copying them).  A sweep, having
+ * counted every holder, lowers it to just past the newest entry another map
+ * still holds (sweep_shared_below()), so pages the other map let go of are
  * vacuumed as unshared again.
  *
  * Sharing.  A node is held by every page that points to it, and a data block
@@ -229,39 +228,38 @@
  * tries their locks; it lets go of the header to wait for one
  * (preserve_header_lock()).
  *
- * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * two cases: a crash between a drop's commit and the records queuing what it
+ * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in two
+ * cases: a crash between a drop's commit and the records queuing what it
  * didn't queue before its commit record (a prepared transaction's drops), and
  * a crash (or an error, not an interrupt, which the header's lock holds off)
  * between the records letting go of a truncation's blocks and those freeing
  * them.  (A path copy's crash or error between its records leaves children
- * counted once too often, likewise freed by a sweep once nothing holds
- * them.)  A sweep drains the release queue, then
- * counts exactly what every map of a database's page store holds, each
- * relation's read under its header's lock, and what the queue still holds
- * (drains held off meanwhile), and frees the blocks allocated as it began that
- * nothing holds (their counts made zero first), moves the blocks past
- * the allocated count down into free ones (compact_store()), and shortens the
- * store to its last allocated block (SHRINK, which redo truncates by too),
- * unless another sweep of it runs, which may still free blocks past that.
- * A share (the one thing that adds holders) waits for it
- * while it counts, and the allocator reuses no freed block of the store while
- * a sweep of it runs: one freed and taken again meanwhile could be held by a
- * map the sweep read before.  A dropped relation's map counts until it is
- * removed, once its blocks are queued (a tree's root page is written out with
- * no subtrees once they are queued, as the nodes it named may be freed); an
- * empty main fork file then keeps its relation file number until the next
- * checkpoint, as md.c's does.  A tree's node counts once for each page
- * pointing to it, its children once however many reach it.  A path copy (not
- * held off) adds holders only to blocks held already, so it never gives one
- * to a block the sweep found held by nothing; the sweep rewrites no count of
- * a block something holds, which a copy under way could make a holder short.
- * What the captured roots hold isn't counted anew by each sweep: it is kept
- * counted, beside the reference counts, a sweep adding the roots captured
- * since the last and a drain taking off what the roots let go of as it lets
- * go of it, so that a sweep's cost doesn't grow with the roots held; counts
- * a failed or crashed sweep left half written are counted anew, all roots
- * then walked (see "The roots' counts").
+ * counted once too often, likewise freed by a sweep once nothing holds them.)
+ * A sweep drains the release queue, then counts exactly what every map of a
+ * database's page store holds, each relation's read under its header's lock,
+ * and what the queue still holds (drains held off meanwhile), and frees the
+ * blocks allocated as it began that nothing holds (their counts made zero
+ * first), moves the blocks past the allocated count down into free ones
+ * (compact_store()), and shortens the store to its last allocated block
+ * (SHRINK, which redo truncates by too), unless another sweep of it runs,
+ * which may still free blocks past that.  A share (the one thing that adds
+ * holders) waits for it while it counts, and the allocator reuses no freed
+ * block of the store while a sweep of it runs: one freed and taken again
+ * meanwhile could be held by a map the sweep read before.  A dropped
+ * relation's map counts until it is removed, once its blocks are queued (a
+ * tree's root page is written out with no subtrees once they are queued, as
+ * the nodes it named may be freed); an empty main fork file then keeps its
+ * relation file number until the next checkpoint, as md.c's does.  A tree's
+ * node counts once for each page pointing to it, its children once however
+ * many reach it.  A path copy (not held off) adds holders only to blocks held
+ * already, so it never gives one to a block the sweep found held by nothing;
+ * the sweep rewrites no count of a block something holds, which a copy under
+ * way could make a holder short.  What the captured roots hold isn't counted
+ * anew by each sweep: it is kept counted, beside the reference counts, a sweep
+ * adding the roots captured since the last and a drain taking off what the
+ * roots let go of as it lets go of it, so that a sweep's cost doesn't grow
+ * with the roots held; counts a failed or crashed sweep left half written are
+ * counted anew, all roots then walked (see "The roots' counts").
  *
  * Scans (bmap_scan_store()).  A scan of a page store reads every block
  * allocated, or only the ranges of blocks written or freed since an
@@ -362,19 +360,19 @@ int			block_map_standby_hold_max_size = -1;
 
 #define BMAP_MAGIC			0x424D4150	/* "BMAP" */
 /*
- * The format's version, which headers and allocators' metapages carry. Version
- * 1 maps were flat, an entry per logical block in the relation's own map fork;
- * version 2's were trees of pages of the page store, whose snapshots didn't
- * say who took them; version 3's release queue entries didn't say which drop's
- * transaction they wait for; version 4's headers didn't say which entries may
- * be shared with another map; version 5's root pages didn't name the map, or
- * the captured root it was made a copy of; version 6's captured roots didn't
- * say of whose pages they hold frozen copies; version 8's roots' metapages
- * didn't say which pages of slots may name a transaction; version 9's root
- * pages kept snapshots of the relation's tree; version 10's root pages and
- * captured roots didn't say of which lineage they are (storage made of a root
- * to take another's place carrying that one's on), nor a frozen root of which
- * map of its relation; version 11's headers held another epoch before
+ * The format's version, which headers and allocators' metapages carry.
+ * Version 1 maps were flat, an entry per logical block in the relation's own
+ * map fork; version 2's were trees of pages of the page store, whose snapshots
+ * didn't say who took them; version 3's release queue entries didn't say which
+ * drop's transaction they wait for; version 4's headers didn't say which
+ * entries may be shared with another map; version 5's root pages didn't name
+ * the map, or the captured root it was made a copy of; version 6's captured
+ * roots didn't say of whose pages they hold frozen copies; version 8's roots'
+ * metapages didn't say which pages of slots may name a transaction; version
+ * 9's root pages kept snapshots of the relation's tree; version 10's root
+ * pages and captured roots didn't say of which lineage they are (storage made
+ * of a root to take another's place carrying that one's on), nor a frozen root
+ * of which map of its relation; version 11's headers held another epoch before
  * shared_below; version 12's captured roots didn't keep the database's oldest
  * unfrozen transaction and multixact as they were captured; version 13's
  * reference counts were a byte a block, stuck at 255; version 14's
@@ -682,11 +680,11 @@ typedef struct BmapRoot
 } BmapRoot;
 
 /*
- * A map's lineage: the identity its storage's pages are told by across
- * new storage.  A map begins its own (its map_id, which no other map has),
- * but one made of a captured root to take a relation's storage's place
- * carries on that storage's, so that the roots captured of
- * either are of the relation still and nothing names the storage itself.
+ * A map's lineage: the identity its storage's pages are told by across new
+ * storage.  A map begins its own (its map_id, which no other map has), but one
+ * made of a captured root to take a relation's storage's place carries on that
+ * storage's, so that the roots captured of either are of the relation still
+ * and nothing names the storage itself.
  */
 static inline uint64
 root_lineage(const BmapRoot *root)
@@ -3249,9 +3247,10 @@ drop_node_buffer(RelFileLocator rel, BlockNumber blk)
  * The blocks a page store grows by at once for copies (prepare_store()):
  * enough that md.c allocates them without writing them (more than eight).
  * Redo grows the store only to the records' high-water marks, so a
- * primary's store may be up to BMAP_STORE_AHEAD - 1 blocks longer than a
- * standby's or a recovered server's, zeroes the allocator gives out next:
- * a check of a store's length allows for them.
+ * primary's store may be longer than a standby's or a recovered server's:
+ * by up to BMAP_STORE_AHEAD - 1 blocks in running, and by more after a
+ * crash lost the record of a growth, zeroes the allocator gives out next
+ * either way.
  */
 #define BMAP_STORE_AHEAD	64
 
@@ -10404,7 +10403,7 @@ root_may_hold(const xl_bmap_root *r)
  * and let go of on its own, and naming the map of holder (the relation it is
  * held for) as the one it was captured of: that map's own, and its lineage, as
  * a root captured of it would be (own_root_tops()).  O(1), nothing written
- * out: the blocks are the root's, durable since it was captured. Its id, or 0
+ * out: the blocks are the root's, durable since it was captured.  Its id, or 0
  * if the store holds no such root.
  */
 BmapRootId
@@ -10692,13 +10691,13 @@ bmap_root_unchanged(SMgrRelation reln, BmapRootId id)
  * Make 'dst', a new relation file number, a copy of root 'id' of its page
  * store: its root page gets the root's subtrees, each gaining a holder, and
  * its header the root's length, in one record.  O(1) in the relation's size;
- * the root's blocks were made durable when it was captured. With 'replacing'
+ * the root's blocks were made durable when it was captured.  With 'replacing'
  * (the storage dst takes the place of, dropped as the transaction commits),
- * dst's entries may be shared with another map only where replacing's
- * might.  Otherwise every entry of dst may be; and with 'sharer', a relation
- * still holding the root's pages (another relation's storage the root was kept
- * of), so may those of sharer, which its header's shared_below then says (in
- * the same record), so that its VACUUM leaves them.  With 'lineage_of', dst
+ * dst's entries may be shared with another map only where replacing's might.
+ * Otherwise every entry of dst may be; and with 'sharer', a relation still
+ * holding the root's pages (another relation's storage the root was kept of),
+ * so may those of sharer, which its header's shared_below then says (in the
+ * same record), so that its VACUUM leaves them.  With 'lineage_of', dst
  * carries on that storage's lineage (the one it takes the place of, whose
  * roots are then of dst too); otherwise it begins its own.  Only the main
  * fork.  The root's slot is read under its page's lock, which keeps a releaser
@@ -11237,9 +11236,9 @@ bmap_lineage(SMgrRelation reln)
 }
 
 /*
- * Was root 'id' captured of reln's lineage: of reln, of storage reln took
- * the place of by carrying its lineage on, or of a copy of
- * either's pages frozen as of them?  False if the store holds no such root.
+ * Was root 'id' captured of reln's lineage: of reln, of storage reln took the
+ * place of by carrying its lineage on, or of a copy of either's pages frozen
+ * as of them?  False if the store holds no such root.
  */
 bool
 bmap_root_of(SMgrRelation reln, BmapRootId id)
@@ -12227,14 +12226,13 @@ sweep_roots_free(SweepRoots *sr)
 }
 
 /*
- * The subtrees of rel's own roots that its store still counts (not free),
- * of those the sweep read (sr), BMAP_TREE_TOPS for each, into *tops: how
- * many roots.  Its own are those captured of its map (by the map's
- * identity, whatever file number a map had before it), and the root it was
- * made a copy of: a relation made of a root to take another's place holds
- * it as one captured of it.  They share its pages with no other
- * map.  Under rel's header.  O(log roots)
- * and its own roots.
+ * The subtrees of rel's own roots that its store still counts (not free), of
+ * those the sweep read (sr), BMAP_TREE_TOPS for each, into *tops: how many
+ * roots.  Its own are those captured of its map (by the map's identity,
+ * whatever file number a map had before it), and the root it was made a copy
+ * of: a relation made of a root holds it as one captured of it.  They share
+ * its pages with no other map.  Under rel's header.  O(log roots) and its own
+ * roots.
  */
 static int
 own_root_tops(RelFileLocator rel, SweepRoots *sr, BmapEntry **tops)
@@ -13221,10 +13219,9 @@ sweep_shrink(RelFileLocator rel)
  * catalog rows), then free the blocks allocated when the sweep began that
  * nothing holds (left by a crash after a drop's commit), what the release
  * queue holds let go of first and the rest counted, their counts zeroed
- * first, and shorten the store to its
- * last allocated block.  Shares (bmapshare()) are held off while
- * the maps are read and the counts rewritten; extensions and remaps go on,
- * allocating blocks the sweep never frees.
+ * first, and shorten the store to its last allocated block.  Shares
+ * (bmapshare()) are held off while the maps are read and the counts rewritten;
+ * extensions and remaps go on, allocating blocks the sweep never frees.
  */
 static void
 sweep_done(int code, Datum arg)
