@@ -100,6 +100,7 @@ tests += {
       't/042_bmap_orphan_maps.pl',
       't/043_bmap_shared_writers.pl',
       't/044_bmap_standby_hold.pl',
+      't/045_bmap_first_share_walk.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
