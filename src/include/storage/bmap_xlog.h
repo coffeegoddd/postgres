@@ -39,9 +39,11 @@
  *						makes the same change in its replay
  * XLOG_BMAP_FREE		blocks are freed: block 0 is the allocator's metapage,
  *						then bitmap pages
- * XLOG_BMAP_PRESERVE	before a private block is shared: block 0 is the
- *						source's page image, main data its physical BlockNumber;
- *						redo restores both the source buffer and that store block
+ * XLOG_BMAP_PRESERVE	a block shared keeps its page: block 0 is its page
+ *						image, main data its physical BlockNumber; redo
+ *						restores both that buffer and that store block.  Before
+ *						the SHARED record, block 0 is the source's buffer; after
+ *						it (a backup begun during the share), the copy's
  * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
  *						(its epoch raised), block 1 the copy's (its length);
  *						PRESERVE records may follow it

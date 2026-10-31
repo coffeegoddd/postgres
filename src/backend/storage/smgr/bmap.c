@@ -5538,6 +5538,14 @@ typedef struct PreserveWalk
 	struct SyncedBlocks *synced;	/* own blocks synced, not logged, if given */
 } PreserveWalk;
 
+/* a leaf holding blocks a share synced (SyncedBlocks) */
+typedef struct SyncedLeaf
+{
+	BlockNumber node;			/* its block of the page store */
+	BlockNumber first;			/* the first logical block it maps */
+	XLogRecPtr	born;			/* its incarnation (tree_node_is()) */
+} SyncedLeaf;
+
 /*
  * The own blocks a share writes out and syncs instead of logging their
  * images (preserve_shared_page()): those that got their blocks before
@@ -5546,13 +5554,6 @@ typedef struct PreserveWalk
  * synced, tree_preserve_node()); 'own' counts the blocks found the
  * relation's own, logged or synced, or that may be.
  */
-typedef struct SyncedLeaf
-{
-	BlockNumber node;			/* its block of the page store */
-	BlockNumber first;			/* the first logical block it maps */
-	XLogRecPtr	born;			/* its incarnation (tree_node_is()) */
-} SyncedLeaf;
-
 typedef struct SyncedBlocks
 {
 	XLogRecPtr	image_from;
@@ -16745,9 +16746,11 @@ bmap_redo(XLogReaderState *record)
 				Assert(fork_mapped(forknum));
 
 				/*
-				 * Restore the source buffer too: SHARED flushes it, and must
-				 * not overwrite the preserved block with incomplete redo.
-				 * A newer map sends this buffer nowhere until its remap.
+				 * Restore the buffer the image names too: before SHARED it
+				 * is the source's, which SHARED flushes, and which must not
+				 * overwrite the preserved block with incomplete redo (a
+				 * newer map sends it nowhere until its remap); after it, the
+				 * copy's, whose map names the block (preserve_synced()).
 				 */
 				buf = XLogReadBufferExtended(rel, forknum, blkno,
 											RBM_ZERO_AND_LOCK, InvalidBuffer);

@@ -128,15 +128,17 @@ $node->safe_psql('postgres', q{CREATE EXTENSION pg_buffercache});
 sql(q{UPDATE big SET b = 'changed'});
 sql(q{UPDATE mixed SET b = 'changed'});
 sql(q{UPDATE recent SET b = 'changed'});
+my $big_changed = sql(qq{SELECT test_bmap_rows_digest($big)});
+my $mixed_changed = sql(qq{SELECT test_bmap_rows_digest($mixed)});
 sql(q{SELECT count(*) FROM pg_buffercache_evict_all()});
 $node->stop('immediate');
 $node->start;
 is(sql(qq{SELECT test_bmap_rows_digest($big_copy)}), $big_digest,
 	'the copy of a checkpointed table survives a crash');
-isnt(sql(qq{SELECT test_bmap_rows_digest($big)}), $big_digest, 'its source has its change');
+is(sql(qq{SELECT test_bmap_rows_digest($big)}), $big_changed, 'its source has its change');
 is(sql(qq{SELECT test_bmap_rows_digest($mixed_copy)}), $mixed_digest,
 	'the copy of a table changed since the checkpoint survives it');
-isnt(sql(qq{SELECT test_bmap_rows_digest($mixed)}), $mixed_digest, 'as does its source');
+is(sql(qq{SELECT test_bmap_rows_digest($mixed)}), $mixed_changed, 'and its source its change');
 is(sql(qq{SELECT test_bmap_rows_digest($recent_copy)}), $recent_digest,
 	'the copy of a table made since the checkpoint survives it');
 
