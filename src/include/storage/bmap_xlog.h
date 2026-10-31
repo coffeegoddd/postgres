@@ -471,9 +471,11 @@ typedef struct xl_bmap_snapshot
  * (snap.id 0: the slot is free; snap.owner the capturing
  * (sub)transaction), the (sub)transaction that let go of it (0: none),
  * and the map it was captured of: its identity (which no other map has,
- * whatever its file number), lineage and file number (or the relation of whose
- * pages it holds frozen copies, and the epoch of that relation since which
- * they changed); and the database's datfrozenxid and datminmxid as it was
+ * whatever its file number) and its file number (map_relnumber); the
+ * relation it is recorded as of, with its lineage (relnumber: that map's,
+ * or for a frozen root the relation of whose pages it holds frozen copies,
+ * with the epoch of that relation since which they changed); and the
+ * database's datfrozenxid and datminmxid as it was
  * captured, older than any transaction or multixact its pages may name
  * unfrozen.  It holds its subtrees
  * while its capturer has committed (or is too old to say) and nobody who
