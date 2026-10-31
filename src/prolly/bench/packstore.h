@@ -6,10 +6,11 @@
  *	  and S3 remotes.
  *
  * A pack is one push's new chunks, in the order they were put (a chunk's
- * children before it), then an index of (hash, offset, length) entries.  The
- * manifest is text:
+ * children before it), each zstd-compressed if PACK_ZSTD names a level and
+ * that makes it smaller, then an index of (hash, offset, stored length,
+ * length) entries.  The manifest is text:
  *
- *	prolly-remote 1
+ *	prolly-remote 2
  *	state <hex>
  *	pack <name> <chunks> <data bytes> <index offset> <index bytes>
  *	...
@@ -37,6 +38,7 @@ typedef struct PackStoreStats
 	uint64_t	range_gets;		/* ranges requested for them */
 	uint64_t	packs_written;
 	uint64_t	pack_bytes_written;
+	uint64_t	raw_bytes_written;	/* the chunks' own bytes, before compression */
 	double		pack_build_secs;	/* building packs, upload excluded */
 } PackStoreStats;
 
@@ -51,6 +53,14 @@ extern Remote *packstore_remote(ChunkStore *cs);
  * named; the pack stays as garbage), -1 on error.
  */
 extern int	packstore_flush(ChunkStore *cs, const PHash *state);
+
+/*
+ * Reads the manifest again, and the indexes of the packs added since this
+ * store last read it (packs never change, so the indexes read stay good):
+ * *state the repo state it names.  Fails if the packs it read are no
+ * longer a prefix of the manifest's (the remote was rewritten).
+ */
+extern bool packstore_refresh(ChunkStore *cs, PHash *state);
 
 /* Calls fn for every chunk the remote has, pack by pack, in put order. */
 typedef void (*PackChunkFn) (void *arg, const PHash *h, const uint8_t *data, size_t len);

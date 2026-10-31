@@ -8,13 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <zstd.h>
 
 #include "../phash.h"
 #include "../prolly_util.h"
 
 #define PACK_HOLD	(UINT64_C(1) << 40)		/* the remote's hold on a packed chunk */
 #define COALESCE_GAP (64 * 1024)	/* read across gaps this small */
-#define INDEX_ENT	(PHASH_LEN + 8 + 4)
+#define INDEX_ENT	(PHASH_LEN + 8 + 4 + 4)	/* hash, offset, stored and raw lengths */
 
 typedef struct Pack
 {
@@ -30,8 +31,9 @@ typedef struct Ent
 	PHash		h;
 	int64_t		pack;			/* -1: pending, not yet uploaded */
 	uint64_t	off;
-	uint32_t	len;
-	uint8_t    *data;			/* cached or pending bytes */
+	uint32_t	len;			/* the chunk's length */
+	uint32_t	clen;			/* its length in the pack: compressed if < len */
+	uint8_t    *data;			/* cached or pending bytes (raw) */
 	bool		dead;
 	ChunkMeta	meta;
 } Ent;
@@ -97,6 +99,31 @@ get_le32(const uint8_t *p)
 	for (int i = 3; i >= 0; i--)
 		v = (v << 8) | p[i];
 	return v;
+}
+
+/* A chunk as stored in a pack, raw again (malloc'd). */
+static uint8_t *
+decode(const uint8_t *src, uint32_t clen, uint32_t len)
+{
+	uint8_t    *out = px_malloc(len ? len : 1);
+
+	if (clen == len)
+		memcpy(out, src, len);
+	else if (ZSTD_decompress(out, len, src, clen) != len)
+	{
+		fprintf(stderr, "packstore: a chunk did not decompress\n");
+		abort();
+	}
+	return out;
+}
+
+/* zstd level for new packs' chunks (PACK_ZSTD), 0 for none. */
+static int
+pack_level(void)
+{
+	const char *v = getenv("PACK_ZSTD");
+
+	return v ? atoi(v) : 0;
 }
 
 static bool
@@ -168,13 +195,16 @@ ps_get(ChunkStore *cs, const PHash *h, size_t *len)
 		char	   *key = pack_key(ps->packs[e->pack].name);
 		size_t		got;
 
-		e->data = remote_get(ps->remote, key, e->off, e->len, &got, NULL);
+		uint8_t    *raw = remote_get(ps->remote, key, e->off, e->clen, &got, NULL);
+
 		free(key);
-		if (e->data == NULL || got != e->len)
+		if (raw == NULL || got != e->clen)
 		{
 			fprintf(stderr, "packstore: could not read a chunk from the remote\n");
 			abort();
 		}
+		e->data = decode(raw, e->clen, e->len);
+		free(raw);
 		ps->stats.chunk_gets++;
 		ps->stats.range_gets++;
 		/* (ents may have moved: find again) */
@@ -224,7 +254,7 @@ ps_get_many(ChunkStore *cs, const PHash *hs, size_t n, const uint8_t **out,
 		Ent		   *e = find(ps, &hs[i]);
 
 		if (e && e->data == NULL && e->pack >= 0)
-			w[nw++] = (Want) {(size_t) (e - ps->ents), e->pack, e->off, e->len};
+			w[nw++] = (Want) {(size_t) (e - ps->ents), e->pack, e->off, e->clen};
 	}
 	if (nw > 1)
 		qsort(w, nw, sizeof(Want), want_cmp);
@@ -257,7 +287,7 @@ ps_get_many(ChunkStore *cs, const PHash *hs, size_t n, const uint8_t **out,
 		{
 			Ent		   *e = &ps->ents[w[i].ent];
 
-			e->data = px_memdup(rr[k].data + (w[i].off - rr[k].off), w[i].len);
+			e->data = decode(rr[k].data + (w[i].off - rr[k].off), w[i].len, e->len);
 			ps->stats.chunk_gets++;
 		}
 		free(rr[k].data);
@@ -303,6 +333,7 @@ ps_put(ChunkStore *cs, const PHash *h, const uint8_t *data, size_t len)
 	e = add(ps, h);
 	e->pack = -1;
 	e->len = (uint32_t) len;
+	e->clen = (uint32_t) len;
 	free(e->data);
 	e->data = px_memdup(data, len);
 	memset(&e->meta, 0, sizeof(e->meta));
@@ -391,7 +422,7 @@ manifest_text(PackStore *ps, const PHash *state, size_t *len)
 	size_t		n;
 
 	phash_hex(state, hex);
-	n = (size_t) snprintf(s, cap, "prolly-remote 1\nstate %s\n", hex);
+	n = (size_t) snprintf(s, cap, "prolly-remote 2\nstate %s\n", hex);
 	for (size_t i = 0; i < ps->npacks; i++)
 		n += (size_t) snprintf(s + n, cap - n, "pack %s %llu %llu %llu %llu\n",
 							   ps->packs[i].name,
@@ -403,81 +434,79 @@ manifest_text(PackStore *ps, const PHash *state, size_t *len)
 	return s;
 }
 
-ChunkStore *
-packstore_open(Remote *r, PHash *state, char *err, size_t errlen)
+/*
+ * Reads the manifest into a list of packs, *state the state it names: false
+ * if there is none.  The ETag into etag.
+ */
+static bool
+read_manifest(Remote *r, Pack **packs, size_t *npacks, size_t *packcap,
+			  PHash *state, char *etag)
 {
-	PackStore  *ps = calloc(1, sizeof(PackStore));
-	double		t0 = now_secs();
 	size_t		len;
-	uint8_t    *m;
-	RemoteRange *rr;
+	uint8_t    *m = remote_get(r, "manifest", 0, 0, &len, etag);
+	char	   *text,
+			   *line,
+			   *save;
 
-	ps->base.ops = &packstore_ops;
-	ps->remote = r;
-	phmap_init(&ps->map);
+	*npacks = 0;
 	memset(state, 0, sizeof(*state));
-	m = remote_get(r, "manifest", 0, 0, &len, ps->etag);
-	if (m != NULL)
+	if (m == NULL)
+		return false;
+	text = px_realloc(m, len + 1);
+	text[len] = '\0';
+	for (line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
 	{
-		char	   *text = px_realloc(m, len + 1);
-		char	   *line,
-				   *save;
+		Pack		p;
+		unsigned long long a,
+					b,
+					c,
+					d;
 
-		text[len] = '\0';
-		ps->has_manifest = true;
-		for (line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+		if (strncmp(line, "state ", 6) == 0)
+			parse_hex(line + 6, state);
+		else if (sscanf(line, "pack %80s %llu %llu %llu %llu", p.name, &a, &b, &c, &d) == 5)
 		{
-			Pack		p;
-			unsigned long long a,
-						b,
-						c,
-						d;
-
-			if (strncmp(line, "state ", 6) == 0)
-				parse_hex(line + 6, state);
-			else if (sscanf(line, "pack %80s %llu %llu %llu %llu", p.name, &a, &b, &c, &d) == 5)
-			{
-				p.nchunks = a;
-				p.data_bytes = b;
-				p.index_off = c;
-				p.index_len = d;
-				px_grow((void **) &ps->packs, &ps->packcap, ps->npacks + 1, sizeof(Pack));
-				ps->packs[ps->npacks++] = p;
-			}
+			p.nchunks = a;
+			p.data_bytes = b;
+			p.index_off = c;
+			p.index_len = d;
+			px_grow((void **) packs, packcap, *npacks + 1, sizeof(Pack));
+			(*packs)[(*npacks)++] = p;
 		}
-		free(text);
 	}
+	free(text);
+	return true;
+}
 
-	/* every pack's index, in parallel */
-	rr = px_malloc((ps->npacks ? ps->npacks : 1) * sizeof(RemoteRange));
-	for (size_t i = 0; i < ps->npacks; i++)
-		rr[i] = (RemoteRange) {pack_key(ps->packs[i].name), ps->packs[i].index_off,
-		ps->packs[i].index_len, NULL, 0};
-	if (!remote_get_many(r, rr, ps->npacks))
+/* Reads the indexes of packs [from, npacks), in parallel, into ents. */
+static bool
+load_indexes(PackStore *ps, size_t from)
+{
+	size_t		n = ps->npacks - from;
+	RemoteRange *rr = px_malloc((n ? n : 1) * sizeof(RemoteRange));
+	bool		ok;
+
+	for (size_t i = 0; i < n; i++)
+		rr[i] = (RemoteRange) {pack_key(ps->packs[from + i].name), ps->packs[from + i].index_off,
+		ps->packs[from + i].index_len, NULL, 0};
+	ok = remote_get_many(ps->remote, rr, n);
+	for (size_t i = 0; i < n; i++)
 	{
-		snprintf(err, errlen, "could not read the remote's pack indexes");
-		for (size_t i = 0; i < ps->npacks; i++)
-		{
-			free(rr[i].data);
-			free((char *) rr[i].key);
-		}
-		free(rr);
-		ps_destroy(&ps->base);
-		return NULL;
-	}
-	for (size_t i = 0; i < ps->npacks; i++)
-	{
-		for (uint64_t k = 0; k < ps->packs[i].nchunks; k++)
+		for (uint64_t k = 0; ok && rr[i].data && k < ps->packs[from + i].nchunks; k++)
 		{
 			const uint8_t *p = rr[i].data + k * INDEX_ENT;
 			PHash		h;
 			Ent		   *e;
 
 			memcpy(h.b, p, PHASH_LEN);
+			e = find(ps, &h);
+			if (e != NULL)
+				continue;		/* (in an earlier pack too) */
 			e = add(ps, &h);
-			e->pack = (int64_t) i;
+			e->pack = (int64_t) (from + i);
 			e->off = get_le64(p + PHASH_LEN);
-			e->len = get_le32(p + PHASH_LEN + 8);
+			e->clen = get_le32(p + PHASH_LEN + 8);
+			e->len = get_le32(p + PHASH_LEN + 12);
 			e->meta.roots = PACK_HOLD;
 			ps->bytes += e->len;
 		}
@@ -486,9 +515,67 @@ packstore_open(Remote *r, PHash *state, char *err, size_t errlen)
 		free((char *) rr[i].key);
 	}
 	free(rr);
+	return ok;
+}
+
+ChunkStore *
+packstore_open(Remote *r, PHash *state, char *err, size_t errlen)
+{
+	PackStore  *ps = calloc(1, sizeof(PackStore));
+	double		t0 = now_secs();
+
+	ps->base.ops = &packstore_ops;
+	ps->remote = r;
+	phmap_init(&ps->map);
+	ps->has_manifest = read_manifest(r, &ps->packs, &ps->npacks, &ps->packcap,
+									 state, ps->etag);
+	if (!load_indexes(ps, 0))
+	{
+		snprintf(err, errlen, "could not read the remote's pack indexes");
+		ps_destroy(&ps->base);
+		return NULL;
+	}
 	ps->stats.packs = ps->npacks;
 	ps->stats.open_secs = now_secs() - t0;
 	return &ps->base;
+}
+
+bool
+packstore_refresh(ChunkStore *cs, PHash *state)
+{
+	PackStore  *ps = (PackStore *) cs;
+	double		t0 = now_secs();
+	Pack	   *packs = NULL;
+	size_t		npacks = 0,
+				packcap = 0,
+				known = ps->npacks;
+
+	if (!read_manifest(ps->remote, &packs, &npacks, &packcap, state, ps->etag))
+	{
+		free(packs);
+		return false;
+	}
+	ps->has_manifest = true;
+	if (npacks < known)
+	{
+		free(packs);
+		return false;
+	}
+	for (size_t i = 0; i < known; i++)
+		if (strcmp(packs[i].name, ps->packs[i].name) != 0)
+		{
+			free(packs);
+			return false;
+		}
+	free(ps->packs);
+	ps->packs = packs;
+	ps->npacks = npacks;
+	ps->packcap = packcap;
+	if (!load_indexes(ps, known))
+		return false;
+	ps->stats.packs = ps->npacks;
+	ps->stats.open_secs = now_secs() - t0;
+	return true;
 }
 
 PackStoreStats *
@@ -520,60 +607,80 @@ packstore_flush(ChunkStore *cs, const PHash *state)
 	char		etag[REMOTE_ETAG_LEN];
 	int			rc;
 
-	for (size_t i = 0; i < ps->npending; i++)
 	{
-		Ent		   *e = &ps->ents[ps->pending[i]];
+		int			level = pack_level();
+		uint8_t   **stored = px_malloc((ps->npending ? ps->npending : 1) * sizeof(uint8_t *));
 
-		if (!e->dead)
-		{
-			data_bytes += e->len;
-			live++;
-		}
-	}
-	if (live > 0)
-	{
-		/* the chunks in put order, then the index */
-		buf = px_malloc(data_bytes + live * INDEX_ENT);
+		/* each chunk as stored: compressed, if that is smaller */
 		for (size_t i = 0; i < ps->npending; i++)
 		{
 			Ent		   *e = &ps->ents[ps->pending[i]];
 
+			stored[i] = NULL;
 			if (e->dead)
 				continue;
-			memcpy(buf + off, e->data, e->len);
-			off += e->len;
-		}
-		off = 0;
-		for (size_t i = 0, k = 0; i < ps->npending; i++)
-		{
-			Ent		   *e = &ps->ents[ps->pending[i]];
-			uint8_t    *q;
+			e->clen = e->len;
+			if (level > 0)
+			{
+				size_t		bound = ZSTD_compressBound(e->len);
+				uint8_t    *z = px_malloc(bound);
+				size_t		zn = ZSTD_compress(z, bound, e->data, e->len, level);
 
-			if (e->dead)
-				continue;
-			q = buf + data_bytes + (k++) * INDEX_ENT;
-			memcpy(q, e->h.b, PHASH_LEN);
-			put_le64(q + PHASH_LEN, off);
-			put_le32(q + PHASH_LEN + 8, e->len);
-			off += e->len;
+				if (!ZSTD_isError(zn) && zn < e->len)
+				{
+					stored[i] = z;
+					e->clen = (uint32_t) zn;
+				}
+				else
+					free(z);
+			}
+			data_bytes += e->clen;
+			ps->stats.raw_bytes_written += e->len;
+			live++;
 		}
-		phash_compute(buf, data_bytes + live * INDEX_ENT, &ph);
-		phash_hex(&ph, p.name);
-		p.nchunks = live;
-		p.data_bytes = data_bytes;
-		p.index_off = data_bytes;
-		p.index_len = live * INDEX_ENT;
-		ps->stats.pack_build_secs += now_secs() - t0;
-		key = pack_key(p.name);
-		rc = remote_put(ps->remote, key, buf, data_bytes + live * INDEX_ENT);
-		free(key);
-		free(buf);
-		if (rc != 0)
-			return -1;
-		ps->stats.packs_written++;
-		ps->stats.pack_bytes_written += data_bytes + live * INDEX_ENT;
-		px_grow((void **) &ps->packs, &ps->packcap, ps->npacks + 1, sizeof(Pack));
-		ps->packs[ps->npacks++] = p;
+		if (live > 0)
+		{
+			/* the chunks in put order, then the index */
+			buf = px_malloc(data_bytes + live * INDEX_ENT);
+			for (size_t i = 0, k = 0; i < ps->npending; i++)
+			{
+				Ent		   *e = &ps->ents[ps->pending[i]];
+				uint8_t    *q;
+
+				if (e->dead)
+					continue;
+				memcpy(buf + off, stored[i] ? stored[i] : e->data, e->clen);
+				q = buf + data_bytes + (k++) * INDEX_ENT;
+				memcpy(q, e->h.b, PHASH_LEN);
+				put_le64(q + PHASH_LEN, off);
+				put_le32(q + PHASH_LEN + 8, e->clen);
+				put_le32(q + PHASH_LEN + 12, e->len);
+				off += e->clen;
+			}
+			for (size_t i = 0; i < ps->npending; i++)
+				free(stored[i]);
+			phash_compute(buf, data_bytes + live * INDEX_ENT, &ph);
+			phash_hex(&ph, p.name);
+			p.nchunks = live;
+			p.data_bytes = data_bytes;
+			p.index_off = data_bytes;
+			p.index_len = live * INDEX_ENT;
+			ps->stats.pack_build_secs += now_secs() - t0;
+			key = pack_key(p.name);
+			rc = remote_put(ps->remote, key, buf, data_bytes + live * INDEX_ENT);
+			free(key);
+			free(buf);
+			if (rc != 0)
+			{
+				free(stored);
+				return -1;
+			}
+			ps->stats.packs_written++;
+			ps->stats.pack_bytes_written += data_bytes + live * INDEX_ENT;
+			px_grow((void **) &ps->packs, &ps->packcap, ps->npacks + 1, sizeof(Pack));
+			ps->packs[ps->npacks++] = p;
+		}
+		free(stored);
 	}
 
 	mtext = manifest_text(ps, state, &mlen);
@@ -599,7 +706,7 @@ packstore_flush(ChunkStore *cs, const PHash *state)
 			continue;
 		e->pack = (int64_t) ps->npacks - 1;
 		e->off = off;
-		off += e->len;
+		off += e->clen;
 		e->meta.roots += PACK_HOLD;
 	}
 	ps->npending = 0;
@@ -630,8 +737,14 @@ packstore_stream(ChunkStore *cs, PackChunkFn fn, void *arg)
 			const uint8_t *q = idx + k * INDEX_ENT;
 			PHash		h;
 
+			uint32_t	clen = get_le32(q + PHASH_LEN + 8),
+						len = get_le32(q + PHASH_LEN + 12);
+			uint8_t    *raw;
+
 			memcpy(h.b, q, PHASH_LEN);
-			fn(arg, &h, data + get_le64(q + PHASH_LEN), get_le32(q + PHASH_LEN + 8));
+			raw = decode(data + get_le64(q + PHASH_LEN), clen, len);
+			fn(arg, &h, raw, len);
+			free(raw);
 		}
 		ps->stats.chunk_gets += ps->packs[i].nchunks;
 		ps->stats.range_gets++;

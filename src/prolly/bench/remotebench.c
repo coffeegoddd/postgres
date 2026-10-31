@@ -44,6 +44,11 @@ static uint64_t deltas[16] = {1, 100, 10000};
 static int	ndeltas = 3;
 static int	seq = 0;
 static bool skip_per_chunk_clone = false;
+static bool cache_indexes = false;
+static bool words_rows = false;	/* values of words, not random letters */	/* a client keeps its pack store, refreshing it */
+static Remote *cl_rm[2];
+static ChunkStore *cl_ps[2];
+static uint64_t idx_base;
 static const char *pg_conninfo = NULL;	/* local stores in the page store */
 static PGconn *walconn = NULL;
 
@@ -150,13 +155,45 @@ edit_rows(VcRepo *r, const uint64_t *keys, size_t n, uint64_t ver)
 
 		for (int b = 0; b < 8; b++)
 			kb[i * 8 + b] = (uint8_t) (keys[i] >> (56 - 8 * b));
-		for (size_t b = 0; b < row_bytes; b++)
+		if (words_rows)
 		{
-			x ^= x << 13;
-			x ^= x >> 7;
-			x ^= x << 17;
-			vb[i * row_bytes + b] = (uint8_t) ('a' + x % 26);
+			static const char *words[64] = {
+				"the", "order", "shipped", "pending", "customer", "street", "north",
+				"south", "east", "west", "account", "balance", "credit", "debit",
+				"invoice", "paid", "open", "closed", "red", "green", "blue", "small",
+				"large", "medium", "springfield", "portland", "austin", "denver",
+				"boston", "seattle", "chicago", "atlanta", "monday", "tuesday",
+				"friday", "january", "march", "june", "october", "product", "widget",
+				"gadget", "service", "support", "priority", "normal", "urgent", "note",
+				"refund", "return", "warehouse", "box", "pallet", "unit", "price",
+				"total", "tax", "discount", "member", "gold", "silver", "basic",
+				"active", "inactive"
+			};
+			size_t		b = 0;
+
+			while (b < row_bytes)
+			{
+				char		piece[32];
+				int			n;
+
+				x ^= x << 13;
+				x ^= x >> 7;
+				x ^= x << 17;
+				n = (x % 5 == 0) ?
+					snprintf(piece, sizeof(piece), "%llu ", (unsigned long long) (x >> 8) % 10000) :
+					snprintf(piece, sizeof(piece), "%s ", words[(x >> 8) % 64]);
+				for (int c = 0; c < n && b < row_bytes; c++)
+					vb[i * row_bytes + b++] = (uint8_t) piece[c];
+			}
 		}
+		else
+			for (size_t b = 0; b < row_bytes; b++)
+			{
+				x ^= x << 13;
+				x ^= x >> 7;
+				x ^= x << 17;
+				vb[i * row_bytes + b] = (uint8_t) ('a' + x % 26);
+			}
 		e[i] = (ProllyEdit) {kb + i * 8, 8, vb + i * row_bytes, row_bytes, false};
 	}
 	if (vc_table_edit(&r->ctx, &rv, "t", e, n, &out) != 0)
@@ -232,7 +269,7 @@ report(const char *op, const char *how, Remote *rm, ChunkStore *local,
 		   (unsigned long long) (b.ls.new_chunks - a.ls.new_chunks),
 		   (unsigned long long) (b.ls.new_bytes - a.ls.new_bytes),
 		   (unsigned long long) (pst ? pst->range_gets : 0),
-		   (unsigned long long) (pst ? pst->index_bytes : 0),
+		   (unsigned long long) (pst ? pst->index_bytes - idx_base : 0),
 		   (unsigned long long) (b.wal - a.wal));
 	fflush(stdout);
 }
@@ -257,6 +294,51 @@ open_remote_repo(Remote *rm, VcRepo *rr, double *secs)
 	vc_repo_set_name(rr, "origin");
 	*secs = now_secs() - t0;
 	return ps;
+}
+
+/* A client's remote, kept across operations with --cache-indexes. */
+static Remote *
+client_remote(int c)
+{
+	if (!cache_indexes)
+		return open_remote();
+	if (cl_rm[c] == NULL)
+		cl_rm[c] = open_remote();
+	return cl_rm[c];
+}
+
+/* The remote's repo, its store's indexes refreshed rather than read again. */
+static ChunkStore *
+client_repo(int c, Remote *rm, VcRepo *rr, double *secs)
+{
+	double		t0 = now_secs();
+	PHash		state;
+
+	idx_base = 0;
+	if (!cache_indexes)
+		return open_remote_repo(rm, rr, secs);
+	if (cl_ps[c] == NULL)
+	{
+		cl_ps[c] = open_remote_repo(rm, rr, secs);
+		return cl_ps[c];
+	}
+	idx_base = packstore_stats(cl_ps[c])->index_bytes;
+	if (!packstore_refresh(cl_ps[c], &state))
+		die("could not refresh the remote's store");
+	if (vc_repo_open(rr, cl_ps[c], &prolly_default_policy, &state) != VC_OK)
+		die("could not open the remote's repo");
+	vc_repo_set_name(rr, "origin");
+	*secs = now_secs() - t0;
+	return cl_ps[c];
+}
+
+static void
+client_done(int c, ChunkStore *ps, Remote *rm)
+{
+	if (cache_indexes)
+		return;
+	cs_destroy(ps);
+	remote_close(rm);
 }
 
 static void
@@ -344,6 +426,10 @@ main(int argc, char **argv)
 			nhistory = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--local-pg") == 0 && i + 1 < argc)
 			pg_conninfo = argv[++i];
+		else if (strcmp(argv[i], "--row-kind") == 0 && i + 1 < argc)
+			words_rows = strcmp(argv[++i], "words") == 0;
+		else if (strcmp(argv[i], "--cache-indexes") == 0)
+			cache_indexes = true;
 		else if (strcmp(argv[i], "--skip-per-chunk-clone") == 0)
 			skip_per_chunk_clone = true;
 		else if (strcmp(argv[i], "--parallel") == 0 && i + 1 < argc)
@@ -451,27 +537,26 @@ main(int argc, char **argv)
 
 				change_rows(&origin, deltas[d], 1000 + (uint64_t) d * 2 + mode, "change");
 				{
-					Remote	   *rm = open_remote();
+					Remote	   *rm = client_remote(0);
 					VcRepo		rr;
 					double		os;
 					Snap		a = snap(rm, NULL);
-					ChunkStore *ps = open_remote_repo(rm, &rr, &os);
+					ChunkStore *ps = client_repo(0, rm, &rr, &os);
 
 					if (vc_push(&origin, &rr, "main") != VC_OK)
 						die("push failed");
 					save_remote(&rr, ps);
 					report("push", tag, rm, NULL, ps, a, os);
 					vc_repo_free(&rr);
-					cs_destroy(ps);
-					remote_close(rm);
+					client_done(0, ps, rm);
 				}
 				{
-					Remote	   *rm = open_remote();
+					Remote	   *rm = client_remote(1);
 					VcRepo		rr;
 					double		os;
 					PHash		head;
 					Snap		a = snap(rm, cs3);
-					ChunkStore *ps = open_remote_repo(rm, &rr, &os);
+					ChunkStore *ps = client_repo(1, rm, &rr, &os);
 
 					if (vc_fetch(&c3, &rr, "main", &head) != VC_OK)
 						die("fetch failed");
@@ -480,32 +565,30 @@ main(int argc, char **argv)
 					local_flush(cs3);
 					report("fetch", tag, rm, cs3, ps, a, os);
 					vc_repo_free(&rr);
-					cs_destroy(ps);
-					remote_close(rm);
+					client_done(1, ps, rm);
 				}
 				/* the origin changes again; the clone, with its own change, pulls */
 				change_rows(&origin, deltas[d], 2000 + (uint64_t) d * 2 + mode, "change");
 				{
-					Remote	   *rm = open_remote();
+					Remote	   *rm = client_remote(0);
 					VcRepo		rr;
 					double		os;
-					ChunkStore *ps = open_remote_repo(rm, &rr, &os);
+					ChunkStore *ps = client_repo(0, rm, &rr, &os);
 
 					if (vc_push(&origin, &rr, "main") != VC_OK)
 						die("push failed");
 					save_remote(&rr, ps);
 					vc_repo_free(&rr);
-					cs_destroy(ps);
-					remote_close(rm);
+					client_done(0, ps, rm);
 				}
 				change_rows(&c3, deltas[d], 3000 + (uint64_t) d * 2 + mode, "local");
 				{
-					Remote	   *rm = open_remote();
+					Remote	   *rm = client_remote(1);
 					VcRepo		rr;
 					double		os;
 					VcMergeResult res;
 					Snap		a = snap(rm, cs3);
-					ChunkStore *ps = open_remote_repo(rm, &rr, &os);
+					ChunkStore *ps = client_repo(1, rm, &rr, &os);
 					int			rc = vc_pull(&c3, &rr, "main", 0, &res);
 
 					if (rc != VC_OK)
@@ -513,8 +596,7 @@ main(int argc, char **argv)
 					local_flush(cs3);
 					report("pull", tag, rm, cs3, ps, a, os);
 					vc_repo_free(&rr);
-					cs_destroy(ps);
-					remote_close(rm);
+					client_done(1, ps, rm);
 				}
 			}
 		}

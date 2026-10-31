@@ -1986,6 +1986,102 @@ latency: a chunk at a time is one round trip per chunk.
 - Comparing against the remote-tracking root instead of reading indexes,
   merging packs, and concurrent pushers.
 
+## The page store and remotes: three adjustments
+
+**The question.**  Keeping the page store, which of the costs found in the
+runs above can be cut?  Three adjustments, each measured against the same
+`bench/remotebench` runs (2026-10-31, NVMe, 1 ms a request, the object
+server over HTTP, single runs).
+
+### 1. Receiving packs as packs
+
+Into the page store, every chunk had been a row of a temporary table, a
+row and a B-tree entry in the store's index (`idx`), and a `cp_append` of
+generic WAL records, each registering the meta page again.  With
+`PGSTORE_PACKS` set, a flush instead appends packs of at most 64 MB, each
+the chunks' bytes and an index of (hash, offset, length), in one call, and
+records one row a pack (`packs`); a chunk's copy let go is recorded by its
+place in the log (`gone`), so a chunk put again stays.  Reopening reads
+each pack's index.  `cp_append_bulk` (`contrib/prolly_chunkpages`) also
+logs each whole page it fills as a full-page image, as bulk loads do.
+`test_pgstore` passes in all three modes.
+
+| Operation | A row a chunk | Packs, `cp_append` | Packs, `cp_append_bulk` | Directory store |
+|---|---:|---:|---:|---:|
+| 1M rows: clone, packs streamed whole | 3.81 s | 2.52 s | 2.84 s | 1.85 s |
+| 1M rows: clone, a level at a time | 5.02 s | 3.79 s | 4.06 s | 3.06 s |
+| 1M rows: fetch of 10,000 rows | 0.74 s | 0.52 s | 0.50 s | 0.40 s |
+| 1M rows: WAL of a clone | 360 MB | 340 MB | 340 MB | — |
+| 10M rows: clone, packs streamed whole | 41.2 s | 26.5 s | — | 16.7 s |
+| 10M rows: clone, a level at a time | 48.6 s | 35.9 s | — | 28.7 s |
+| 10M rows: fetch of 10,000 rows | 1.10 s | 0.86 s | — | 0.70 s |
+| 10M rows: pull of 10,000 rows | 3.78 s | 3.56 s | — | 1.42 s |
+| 10M rows: WAL of a clone | 3.67 GB | 3.41 GB | — | — |
+
+- **The page store's cost was mostly its index of a row a chunk.**
+  Without it the page store receives within 1.2–1.6× of the directory
+  store, from 2–2.5×, and its WAL is about 1.02× the chunks' bytes.
+- **Logging whole pages did not help:** `cp_append`'s generic records
+  already log a page new to the log as its image.
+- **A pull is not faster:** its merge reads the clone's chunks back from
+  the page store through SQL, a call a chunk, once they leave the client's
+  256 MB cache.  The page store's read path, not its write path, is what a
+  pull pays for.
+
+### 2. Reading only the packs added since
+
+Opening a remote read every pack's index, 21.6 MB at 10M rows.  Packs
+never change, so a client that keeps its pack store (`--cache-indexes`)
+refreshes it instead (`packstore_refresh()`): the manifest, and the
+indexes of the packs added since.  A fetch's new chunks can only be in
+them, and a push finds what the remote has in the indexes it keeps.
+
+| Operation (10M rows, packs) | Indexes read, before | Indexes read, kept | Time, before | Time, kept |
+|---|---:|---:|---:|---:|
+| Push of 1 row | 21.6 MB | 0 | 0.072 s | 0.007 s |
+| Fetch of 1 row | 21.6 MB | 256 B | 0.086 s | 0.029 s |
+| Fetch of 100 rows | 21.6 MB | 6.9 KB | 0.102 s | 0.044 s |
+| Fetch of 10,000 rows | 22 MB | 376 KB | 0.86 s | 0.81 s |
+
+- **A push's and a fetch's cost now follows the change, not the
+  remote's size.**  What it costs is the client keeping the remote's
+  indexes, 21.6 MB at 10M rows, in memory here; a client would keep them
+  on disk across sessions.
+- **Packs still pile up**, each push one more line of the manifest and
+  one more index to read once.  Merging them is still to measure.
+
+### 3. Compressing chunks
+
+With `PACK_ZSTD` set, each chunk is stored in its pack zstd-compressed
+(level 1) when that makes it smaller; the pack's index gives both lengths
+(format 2), and reads decompress.  Two kinds of rows: random letters, as
+above, and words (`--row-kind words`: values made of 64 common words and
+numbers, like a text column).  1M rows into the page store with packs, the
+indexes kept:
+
+| | Letters | Letters, zstd | Words | Words, zstd |
+|---|---:|---:|---:|---:|
+| First push, bytes sent | 336 MB | 202 MB | 336 MB | 130 MB |
+| Remote on disk | 515 MB | 310 MB | 515 MB | 199 MB |
+| Clone streamed, bytes received | 339 MB | 204 MB | 339 MB | 133 MB |
+| Clone streamed, time | 2.25 s | 2.53 s | 4.48 s | 2.70 s |
+| Fetch of 10,000 rows, bytes received | 46.9 MB | 30.9 MB | 46.9 MB | 22.9 MB |
+
+- **Bytes on the wire and on the remote fall 1.7× for random letters and
+  2.6× for word-like values**; real rows are likelier the second.
+- **On localhost it buys no time:** decompressing cost about as much as
+  the bytes saved.  On a link of 100 MB/s, a clone's 339 MB would take
+  3.4 s against 1.3 s compressed.
+- **The local page store still keeps chunks raw**, so its pages and WAL
+  are unchanged; keeping chunks compressed there too would cut them by the
+  same ratio, and decompress on every read.  Not built.  (The words run
+  without zstd took 4.48 s to clone where the other three took 2.2–2.7 s,
+  likely noise of a single run.)
+
+**Not measured.**  Merging packs; a remote shared by concurrent pushers;
+chunks kept compressed in the page store; the page store's read path for
+pulls; the working-set rebuild after a clone; a real S3.
+
 ## Evidence so far
 
 From `bench/winbench` against a real server (2,000 random row changes per

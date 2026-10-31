@@ -54,11 +54,15 @@ static uint64_t
 server_rows(const char *schema)
 {
 	PGconn	   *c = PQconnectdb(conninfo);
-	char		sql[200];
+	char		sql[400];
 	PGresult   *res;
 	uint64_t	n;
 
-	snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s.idx", schema);
+	/* (a row a chunk, or the chunks of packs less those let go) */
+	snprintf(sql, sizeof(sql),
+			 "SELECT (SELECT count(*) FROM %s.idx) + "
+			 "(SELECT coalesce(sum(nchunks), 0) FROM %s.packs) - "
+			 "(SELECT count(*) FROM %s.gone)", schema, schema, schema);
 	res = PQexec(c, sql);
 	CHECK(PQresultStatus(res) == PGRES_TUPLES_OK);
 	n = strtoull(PQgetvalue(res, 0, 0), NULL, 10);

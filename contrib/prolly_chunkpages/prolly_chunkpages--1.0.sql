@@ -8,6 +8,8 @@ CREATE ACCESS METHOD prolly_chunks TYPE TABLE HANDLER prolly_chunks_handler;
 
 CREATE FUNCTION cp_append(rel regclass, data bytea) RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION cp_append_bulk(rel regclass, data bytea) RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION cp_read(rel regclass, loc int8, len int4) RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION cp_end(rel regclass) RETURNS int8

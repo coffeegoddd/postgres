@@ -27,6 +27,7 @@
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/tableam.h"
+#include "access/xloginsert.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
@@ -45,6 +46,7 @@ PG_MODULE_MAGIC_EXT(.name = "prolly_chunkpages",.version = PG_VERSION);
 
 PG_FUNCTION_INFO_V1(prolly_chunks_handler);
 PG_FUNCTION_INFO_V1(cp_append);
+PG_FUNCTION_INFO_V1(cp_append_bulk);
 PG_FUNCTION_INFO_V1(cp_read);
 PG_FUNCTION_INFO_V1(cp_end);
 
@@ -486,6 +488,97 @@ cp_append(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 		bytes += n;
 		left -= n;
+	}
+	UnlockReleaseBuffer(mbuf);
+	relation_close(rel, NoLock);
+	PG_RETURN_INT64((int64) start);
+}
+
+/*
+ * cp_append_bulk(rel regclass, data bytea) returns int8
+ *
+ * cp_append for many bytes at once (a pack of chunks): the page the log
+ * ends in gets the first bytes with a generic record, as cp_append writes
+ * it; every page after it is new, filled whole (all but the last), and
+ * logged as a full-page image (log_newpage_buffer), as a bulk load logs its
+ * pages; the meta page's end moves once, last.  A crash before that leaves
+ * the new pages past the log's end, written over by the next append.
+ */
+Datum
+cp_append_bulk(PG_FUNCTION_ARGS)
+{
+	Relation	rel = open_store(PG_GETARG_OID(0), ExclusiveLock);
+	bytea	   *data = PG_GETARG_BYTEA_PP(1);
+	const char *bytes = VARDATA_ANY(data);
+	size_t		left = VARSIZE_ANY_EXHDR(data);
+	Buffer		mbuf = log_buffer(rel, META_BLOCK);
+	uint64		start,
+				end;
+
+	if (PageIsNew(BufferGetPage(mbuf)))
+	{
+		GenericXLogState *st = GenericXLogStart(rel);
+		Page		meta = GenericXLogRegisterBuffer(st, mbuf, GENERIC_XLOG_FULL_IMAGE);
+
+		PageInit(meta, BLCKSZ, 0);
+		end = 0;
+		memcpy((char *) meta + AREA_START, &end, sizeof(end));
+		((PageHeader) meta)->pd_lower = AREA_START + sizeof(end);
+		GenericXLogFinish(st);
+	}
+	start = end = meta_end(BufferGetPage(mbuf));
+
+	/* the rest of the page the log ends in, as cp_append writes it */
+	if (left > 0 && end % AREA != 0)
+	{
+		BlockNumber blk = 1 + end / AREA;
+		size_t		off = end % AREA,
+					n = Min(left, AREA - off);
+		Buffer		buf = log_buffer(rel, blk);
+		GenericXLogState *st = GenericXLogStart(rel);
+		Page		page = GenericXLogRegisterBuffer(st, buf, PageIsNew(BufferGetPage(buf)) ?
+													 GENERIC_XLOG_FULL_IMAGE : 0);
+
+		if (PageIsNew(page))
+			PageInit(page, BLCKSZ, 0);
+		memcpy((char *) page + AREA_START + off, bytes, n);
+		((PageHeader) page)->pd_lower = AREA_START + off + n;
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(buf);
+		end += n;
+		bytes += n;
+		left -= n;
+	}
+
+	/* whole pages from here on, each logged as its image */
+	while (left > 0)
+	{
+		BlockNumber blk = 1 + end / AREA;
+		size_t		n = Min(left, AREA);
+		Buffer		buf = log_buffer(rel, blk);
+		Page		page = BufferGetPage(buf);
+
+		START_CRIT_SECTION();
+		PageInit(page, BLCKSZ, 0);
+		memcpy((char *) page + AREA_START, bytes, n);
+		((PageHeader) page)->pd_lower = AREA_START + n;
+		MarkBufferDirty(buf);
+		if (RelationNeedsWAL(rel))
+			log_newpage_buffer(buf, true);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+		end += n;
+		bytes += n;
+		left -= n;
+	}
+
+	/* the log's end, once */
+	{
+		GenericXLogState *st = GenericXLogStart(rel);
+		Page		meta = GenericXLogRegisterBuffer(st, mbuf, 0);
+
+		memcpy((char *) meta + AREA_START, &end, sizeof(end));
+		GenericXLogFinish(st);
 	}
 	UnlockReleaseBuffer(mbuf);
 	relation_close(rel, NoLock);

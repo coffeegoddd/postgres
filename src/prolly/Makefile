@@ -173,6 +173,6 @@ bench/xidbench: bench/xidbench.c test/test_util.h libprolly.a $(HDRS)
 REMOTE_SRCS = bench/remote.c bench/packstore.c
 bench/remotebench: bench/remotebench.c $(REMOTE_SRCS) bench/pgstore.c bench/remote.h bench/packstore.h bench/pgstore.h libprolly.a $(HDRS)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -I. -I$(PGINST)/include -o $@ bench/remotebench.c $(REMOTE_SRCS) bench/pgstore.c libprolly.a \
-		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -lcurl -lcrypto
+		-L$(PGINST)/lib -Wl,-rpath,$(PGINST)/lib -lpq -lcurl -lcrypto -lzstd
 bench/objserver/objserver: bench/objserver/main.go
 	cd bench/objserver && GOPROXY=off go build -o objserver main.go

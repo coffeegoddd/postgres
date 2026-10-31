@@ -48,6 +48,8 @@ typedef struct PgStore
 	char	   *schema;			/* quoted */
 	bool		ephemeral;
 	bool		readonly;		/* a standby: the store is only read */
+	int			packs;			/* 0: a row a chunk; 1: a pack a flush, cp_append;
+								 * 2: a pack a flush, cp_append_bulk */
 	bool		failed;			/* not opened: nothing to flush */
 	PEntry	   *tab;
 	size_t		cap,
@@ -58,8 +60,10 @@ typedef struct PgStore
 	PHashMap	roots;
 	bool		roots_dirty;
 	PHash	   *dels;			/* chunks let go since the last flush */
+	int64_t    *del_locs;		/* (their places in the log) */
 	size_t		ndel,
-				delcap;
+				delcap,
+				dellocap;
 	PHash		state;
 	bool		has_state,
 				state_dirty;
@@ -333,6 +337,8 @@ pg_del(ChunkStore *cs, const PHash *h)
 	else
 	{
 		px_grow((void **) &ps->dels, &ps->delcap, ps->ndel + 1, sizeof(PHash));
+		px_grow((void **) &ps->del_locs, &ps->dellocap, ps->ndel + 1, sizeof(int64_t));
+		ps->del_locs[ps->ndel] = e->loc;
 		ps->dels[ps->ndel++] = *h;
 	}
 	free(e->data);
@@ -393,6 +399,108 @@ static const ChunkStoreOps pg_ops = {
 /* -------------------------------------------------------------- flushing */
 
 /* The chunks not yet on the server, through a binary COPY. */
+#define PACK_ENT (PHASH_LEN + 8 + 4)
+
+static void
+put_be64_at(uint8_t *p, uint64_t v)
+{
+	for (int i = 0; i < 8; i++)
+		p[i] = (uint8_t) (v >> (56 - 8 * i));
+}
+
+static void
+put_be32_at(uint8_t *p, uint32_t v)
+{
+	for (int i = 0; i < 4; i++)
+		p[i] = (uint8_t) (v >> (24 - 8 * i));
+}
+
+#define PACK_MAX	(64 << 20)	/* bytes of chunks a pack, at most */
+
+/*
+ * The chunks not yet on the server as packs of at most PACK_MAX bytes: each
+ * their bytes, then an index of (hash, offset, length), appended to the log
+ * in one call, and one row in packs naming it.  No row, nor index entry, a
+ * chunk.
+ */
+static void
+send_pack_of(PgStore *ps, PEntry **ents, size_t n, uint64_t data_len)
+{
+	uint64_t	off = 0;
+	uint8_t    *pack = px_malloc(data_len + n * PACK_ENT);
+	const char *vals[1];
+	int			lens[1],
+				fmts[1] = {1};
+	PGresult   *res;
+	char	   *sql;
+	int64_t		start;
+	char		row[256];
+
+	for (size_t k = 0; k < n; k++)
+	{
+		uint8_t    *q = pack + data_len + k * PACK_ENT;
+
+		memcpy(pack + off, ents[k]->data, ents[k]->len);
+		memcpy(q, ents[k]->h.b, PHASH_LEN);
+		put_be64_at(q + PHASH_LEN, off);
+		put_be32_at(q + PHASH_LEN + 8, (uint32_t) ents[k]->len);
+		off += ents[k]->len;
+	}
+	vals[0] = (const char *) pack;
+	lens[0] = (int) (data_len + n * PACK_ENT);
+	sql = in_schema(ps, ps->packs == 2 ?
+					"SELECT cp.cp_append_bulk('%s.pages', $1::bytea)" :
+					"SELECT cp.cp_append('%s.pages', $1::bytea)");
+	res = PQexecParams(ps->c, sql, 1, NULL, vals, lens, fmts, 0);
+	free(sql);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, "pgstore: append a pack: %s\n", PQerrorMessage(ps->c));
+		abort();
+	}
+	start = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+	PQclear(res);
+	snprintf(row, sizeof(row), "INSERT INTO %%s.packs VALUES (%lld, %zu, %llu)",
+			 (long long) start, n, (unsigned long long) data_len);
+	must_in(ps, row);
+	off = 0;
+	for (size_t k = 0; k < n; k++)
+	{
+		ents[k]->loc = start + (int64_t) off;
+		off += ents[k]->len;
+	}
+	free(pack);
+}
+
+static void
+send_pack(PgStore *ps)
+{
+	PEntry	  **ents = NULL;
+	size_t		n = 0,
+				cap = 0;
+	uint64_t	data_len = 0;
+
+	for (size_t i = 0; i < ps->cap; i++)
+	{
+		PEntry	   *e = &ps->tab[i];
+
+		if (e->state != SLOT_USED || !e->pending)
+			continue;
+		if (n > 0 && data_len + e->len > PACK_MAX)
+		{
+			send_pack_of(ps, ents, n, data_len);
+			n = 0;
+			data_len = 0;
+		}
+		px_grow((void **) &ents, &cap, n + 1, sizeof(PEntry *));
+		ents[n++] = e;
+		data_len += e->len;
+	}
+	if (n > 0)
+		send_pack_of(ps, ents, n, data_len);
+	free(ents);
+}
+
 static void
 send_new(PgStore *ps)
 {
@@ -400,6 +508,12 @@ send_new(PgStore *ps)
 	PGresult   *res;
 	char	   *sql;
 	static const char header[] = "PGCOPY\n\377\r\n";
+
+	if (ps->packs)
+	{
+		send_pack(ps);
+		return;
+	}
 
 	must(ps, "TRUNCATE prolly_pending");
 	res = PQexec(ps->c, "COPY prolly_pending (hash, data) FROM STDIN (FORMAT binary)");
@@ -515,9 +629,26 @@ pgstore_flush(ChunkStore *cs)
 		const char *vals[1];
 		PGresult   *res;
 
-		hash_array(ps->dels, ps->ndel, &arr);
+		if (ps->packs)
+		{
+			/* (a chunk's copy let go, by its place: it may be put again) */
+			char		num[24];
+
+			arr.len = 0;
+			buf_append(&arr, "{", 1);
+			for (size_t i = 0; i < ps->ndel; i++)
+			{
+				snprintf(num, sizeof(num), "%s%lld", i ? "," : "", (long long) ps->del_locs[i]);
+				buf_append(&arr, num, strlen(num));
+			}
+			buf_append(&arr, "}", 2);
+		}
+		else
+			hash_array(ps->dels, ps->ndel, &arr);
 		vals[0] = (const char *) arr.data;
-		sql = in_schema(ps, "DELETE FROM %s.idx WHERE hash = ANY ($1::bytea[])");
+		sql = in_schema(ps, ps->packs ?
+						"INSERT INTO %s.gone SELECT unnest($1::int8[]) ON CONFLICT DO NOTHING" :
+						"DELETE FROM %s.idx WHERE hash = ANY ($1::bytea[])");
 		res = PQexecParams(ps->c, sql, 1, NULL, vals, NULL, NULL, 0);
 		free(sql);
 		if (!ok(res, NULL, 0, ps->c))
@@ -690,6 +821,7 @@ pg_destroy(ChunkStore *cs)
 			free(ps->tab[i].data);
 	free(ps->tab);
 	free(ps->dels);
+	free(ps->del_locs);
 	phmap_free(&ps->roots);
 	PQfinish(ps->c);
 	free(ps->schema);
@@ -828,6 +960,13 @@ pgstore_open(const char *conninfo, const char *schema, bool fresh, bool ephemera
 		must_in(ps, "CREATE TABLE %s.idx (hash bytea PRIMARY KEY, loc int8 NOT NULL, len int4 NOT NULL)");
 		must_in(ps, "CREATE TABLE %s.roots (hash bytea PRIMARY KEY, n int8 NOT NULL)");
 		must_in(ps, "CREATE TABLE %s.state (k int PRIMARY KEY, root bytea NOT NULL)");
+		must_in(ps, "CREATE TABLE %s.packs (loc int8 PRIMARY KEY, nchunks int8 NOT NULL, data_len int8 NOT NULL)");
+		must_in(ps, "CREATE TABLE %s.gone (loc int8 PRIMARY KEY)");
+	}
+	{
+		const char *m = getenv("PGSTORE_PACKS");
+
+		ps->packs = m ? atoi(m) : 0;
 	}
 	/* a standby is read only: there the store is only read */
 	res = PQexec(ps->c, "SELECT pg_is_in_recovery()");
@@ -859,6 +998,66 @@ pgstore_open(const char *conninfo, const char *schema, bool fresh, bool ephemera
 		ps->bytes += e->len;
 	}
 	PQclear(res);
+
+	/* the chunks of packs, from each pack's index; less the copies let go */
+	{
+		int64_t    *gone = NULL;
+		size_t		ngone = 0,
+					gonecap = 0;
+
+		sql = in_schema(ps, "SELECT loc FROM %s.gone ORDER BY loc");
+		res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+		free(sql);
+		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+			for (int i = 0; i < PQntuples(res); i++)
+			{
+				px_grow((void **) &gone, &gonecap, ngone + 1, sizeof(int64_t));
+				gone[ngone++] = (int64_t) get_be64(PQgetvalue(res, i, 0));
+			}
+		PQclear(res);
+		sql = in_schema(ps, "SELECT loc, nchunks, data_len, "
+						"cp.cp_read('%s.pages', loc + data_len, (nchunks * 32)::int4) FROM %s.packs");
+		res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
+		free(sql);
+		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+		{
+			for (int i = 0; i < PQntuples(res); i++)
+			{
+				int64_t		loc = (int64_t) get_be64(PQgetvalue(res, i, 0));
+				int64_t		nch = (int64_t) get_be64(PQgetvalue(res, i, 1));
+				const char *idx = PQgetvalue(res, i, 3);
+
+				for (int64_t k = 0; k < nch; k++)
+				{
+					const char *q = idx + k * PACK_ENT;
+					int64_t		at = loc + (int64_t) get_be64(q + PHASH_LEN);
+					size_t		lo = 0,
+								hi = ngone;
+					PHash		h;
+					PEntry	   *e;
+
+					while (lo < hi)
+					{
+						size_t		mid = (lo + hi) / 2;
+
+						if (gone[mid] < at)
+							lo = mid + 1;
+						else
+							hi = mid;
+					}
+					if (lo < ngone && gone[lo] == at)
+						continue;
+					memcpy(h.b, q, PHASH_LEN);
+					e = insert(ps, &h);
+					e->loc = at;
+					e->len = get_be32(q + PHASH_LEN + 8);
+					ps->bytes += e->len;
+				}
+			}
+		}
+		PQclear(res);
+		free(gone);
+	}
 
 	sql = in_schema(ps, "SELECT hash, n FROM %s.roots");
 	res = PQexecParams(ps->c, sql, 0, NULL, NULL, NULL, NULL, 1);
