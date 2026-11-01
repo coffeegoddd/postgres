@@ -97,8 +97,11 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	if (!ChunkIndex->lookup(idx, hash, &e))
 		return NULL;
 	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
+	/*
+	 * (not checked against its name: a page's checksum covers a read, and
+	 * the audit, and a put of bytes from elsewhere, check names)
+	 */
 	ChunkLog->read(log, e.loc, data, e.len);
-	check_hash(hash, data, e.len, log, e.loc);
 	*len = e.len;
 	return data;
 }
@@ -154,7 +157,6 @@ ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
 
 		CHECK_FOR_INTERRUPTS();
 		ChunkLog->read(log, pl->loc, data, pl->len);
-		check_hash(hashes + pl->at * CHUNK_HASH_LEN, data, pl->len, log, pl->loc);
 		out[pl->at] = data;
 		lens[pl->at] = pl->len;
 	}

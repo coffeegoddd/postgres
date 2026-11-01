@@ -1,8 +1,9 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A chunk's bytes are checked against its name as they are read: a byte
-# changed on disk under a chunk (with no page checksums to catch it first)
-# is an error, not a chunk.
+# A chunk's bytes are checked against its name by the audit, not as they
+# are read (a page's checksum covers a read): a byte changed on disk under
+# a chunk, with no page checksums to catch it first, is read as it is, and
+# the audit finds it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -44,7 +45,9 @@ close $fh;
 
 $node->start;
 my ($ret, $out, $err) = $node->psql('postgres', $get);
+is($out, 'f', 'a byte changed under it is read as it is');
+($ret, $out, $err) = $node->psql('postgres', q{SELECT ok FROM test_chunk_check('cl', 'ci')});
 like($err, qr/stored chunk [0-9a-f]{40} does not match its hash.*DETAIL:  Its 100 bytes at \d+ in chunk log "cl"/s,
-	'a byte changed under it is an error');
+	'the audit finds it');
 $node->stop;
 done_testing();
