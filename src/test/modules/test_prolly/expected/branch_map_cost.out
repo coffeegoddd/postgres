@@ -301,6 +301,47 @@ SELECT reads < 200 AS learned_at_once FROM test_branch_map_stats();
  t
 (1 row)
 
+-- and its answers are the map's: b1's columns, tables and TOAST tables seen,
+-- b2's hidden
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+ count 
+-------
+    99
+(1 row)
+
+SELECT count(*) AS b1_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c
+	WHERE c.reltoastrelid = t.oid AND c.relnamespace = 'cost'::regnamespace);
+ b1_toast 
+----------
+       99
+(1 row)
+
+SELECT count(*) AS cost_tables FROM pg_class WHERE relnamespace = 'cost'::regnamespace AND relkind = 'r';
+ cost_tables 
+-------------
+          99
+(1 row)
+
+SET catalog_branch_filter = off;
+SELECT count(*) AS every_branch_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.reltoastrelid = t.oid AND n.nspname = 'cost');
+ every_branch_toast 
+--------------------
+                200
+(1 row)
+
+RESET catalog_branch_filter;
+SELECT count(*) AS visible_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.reltoastrelid = t.oid AND n.nspname = 'cost');
+ visible_toast 
+---------------
+            99
+(1 row)
+
 SET client_min_messages = warning;
 DROP SCHEMA cost CASCADE;
 SET catalog_branch = :b2;
