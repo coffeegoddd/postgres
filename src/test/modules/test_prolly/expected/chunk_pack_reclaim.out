@@ -1,0 +1,96 @@
+-- A pack's chunks that fit a page go into pages freed, as a put's do: room
+-- is made a chunk at a time.  (A live chunk past the pages freed keeps
+-- them in the log's middle, which VACUUM would otherwise cut off.)
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SET chunk_free_in_background = off;
+CREATE FUNCTION pr_h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+CREATE FUNCTION pr_blob(tag text, i int) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT 'L'::bytea || decode(repeat(md5(tag || i), 25), 'hex')$$;
+-- pages of chunks, then one kept past them; the chunks freed
+SELECT test_cs_put_many('pages', ARRAY(SELECT pr_h(pr_blob('pr-a', i)) FROM generate_series(1, 400) i ORDER BY i),
+	ARRAY(SELECT pr_blob('pr-a', i) FROM generate_series(1, 400) i ORDER BY i)) AS stored;
+ stored 
+--------
+    400
+(1 row)
+
+\c
+SET chunk_free_in_background = off;
+SELECT (test_cs_put('pages', pr_blob('pr-keep', 1))).stored AS kept;
+ kept 
+------
+ t
+(1 row)
+
+SELECT test_cs_ref_root('pages', pr_h(pr_blob('pr-keep', 1)));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY(SELECT pr_h(pr_blob('pr-a', i)) FROM generate_series(1, 400) i)) AS freed;
+ freed 
+-------
+   400
+(1 row)
+
+VACUUM pg_history.chunk_index;
+SELECT free_pages > 10 AS pages_freed FROM test_chunk_log_space('pg_history.chunks');
+ pages_freed 
+-------------
+ t
+(1 row)
+
+SELECT pg_relation_size('pg_history.chunks') AS size0 \gset
+-- a pack of chunks fitting pages, as many bytes as were freed: into the
+-- pages freed, the log no bigger
+\c
+SET chunk_free_in_background = off;
+SELECT test_cs_put_many('pages', ARRAY(SELECT pr_h(pr_blob('pr-b', i)) FROM generate_series(1, 300) i ORDER BY i),
+	ARRAY(SELECT pr_blob('pr-b', i) FROM generate_series(1, 300) i ORDER BY i)) AS stored;
+ stored 
+--------
+    300
+(1 row)
+
+SELECT pg_relation_size('pg_history.chunks') = :size0 AS no_bigger;
+ no_bigger 
+-----------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_cs_get('pages', pr_h(pr_blob('pr-b', i))) = pr_blob('pr-b', i))
+	AS read_back FROM generate_series(1, 300) i;
+ read_back 
+-----------
+       300
+(1 row)
+
+SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index');
+ ok 
+----
+ t
+(1 row)
+
+-- let go of
+SELECT test_cs_free('pages', ARRAY(SELECT pr_h(pr_blob('pr-b', i)) FROM generate_series(1, 300) i)) AS freed;
+ freed 
+-------
+   300
+(1 row)
+
+SELECT test_cs_unref_root('pages', pr_h(pr_blob('pr-keep', 1)));
+ test_cs_unref_root 
+--------------------
+ 
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY[pr_h(pr_blob('pr-keep', 1))]) AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+DROP FUNCTION pr_h(bytea), pr_blob(text, int);

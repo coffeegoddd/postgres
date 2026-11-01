@@ -230,6 +230,23 @@ bind_store(Relation log, Relation idx)
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), stamp);
 }
 
+/*
+ * Whether the store has the chunk, pinned in this backend's table if so:
+ * looked up, pinned, looked up again (a freer marks a chunk being freed
+ * only if it finds no pin, so one marking it before the pin is seen, and
+ * waited for, by the second lookup)
+ */
+static bool
+found_pinned(Relation idx, const uint8 *hash)
+{
+	ChunkIndexEntry e;
+
+	if (!ChunkIndex->lookup(idx, hash, &e))
+		return false;
+	ChunkPin(hash);
+	return ChunkIndex->lookup(idx, hash, &e);
+}
+
 /* An entry's place: its bytes reserved in the run prepared (does not fail). */
 typedef struct PlaceArg
 {
@@ -282,11 +299,13 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	(void) GetCurrentTransactionId();
 
 	/*
-	 * (pinned before it is looked up, as every chunk it names is: a freer
-	 * that marked one before then sees the pin, or this waits for it)
+	 * Pinned: for this backend, whose own freeing alone could take a chunk
+	 * this transaction puts; and, found there already, in its table too,
+	 * then found again (a freer that marked it before the pin is waited for:
+	 * gone, it is put)
 	 */
-	ChunkPin(hash);
-	if (ChunkIndex->lookup(idx, hash, &e))
+	ChunkPinOwn(hash);
+	if (found_pinned(idx, hash))
 		return false;
 
 	/* a store holds a chunk only if it holds every chunk it references */
@@ -308,17 +327,23 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	 * written after: every wait and failure is before the place is taken,
 	 * and bytes reserved are the entry's, which (aborted) counts them dead
 	 */
-	memset(&e, 0, sizeof(e));
-	memcpy(e.hash, hash, CHUNK_HASH_LEN);
-	e.len = len;
 	ChunkLog->prepare(log, len, &run);
 	place.log = log;
 	place.run = &run;
-	if (!ChunkIndex->insert(idx, &e, reserve_place, &place))
+	for (;;)
 	{
-		/* (another put it meanwhile: nothing reserved) */
-		ChunkLog->release(log, &run);
-		return false;
+		memset(&e, 0, sizeof(e));
+		memcpy(e.hash, hash, CHUNK_HASH_LEN);
+		e.len = len;
+		if (ChunkIndex->insert(idx, &e, reserve_place, &place))
+			break;
+
+		/* (another put it meanwhile: nothing reserved; gone again, put it) */
+		if (found_pinned(idx, hash))
+		{
+			ChunkLog->release(log, &run);
+			return false;
+		}
 	}
 	INJECTION_POINT("chunk-put-entered", NULL);
 	if (len > 0)
@@ -359,6 +384,22 @@ typedef struct PackChunk
 	int			at;				/* its place in the pack */
 } PackChunk;
 
+/* a pack's bytes reserved for its chunks order[from..to), written */
+static void
+write_pack(Relation log, const PackOrder *order, int from, int to,
+		   const bool *fresh, const uint64 *locs, const void *const *datas,
+		   const uint32 *lens)
+{
+	for (int k = from; k < to; k++)
+	{
+		int			i = order[k].at;
+
+		CHECK_FOR_INTERRUPTS();
+		if (fresh[i] && lens[i] > 0)
+			ChunkLog->write(log, locs[i], datas[i], lens[i]);
+	}
+}
+
 uint64
 ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 				  const void *const *datas, const uint32 *lens)
@@ -368,7 +409,6 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	bool	   *fresh = palloc0(Max(n, 1) * sizeof(bool));
 	RefList    *refs = palloc0(Max(n, 1) * sizeof(RefList));
 	uint64	   *locs = palloc(Max(n, 1) * sizeof(uint64));
-	Size		total = 0;
 	uint64		stored = 0;
 	ChunkIndexEntry e;
 
@@ -377,7 +417,10 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		check_hash(hashes + i * CHUNK_HASH_LEN, datas[i], lens[i], NULL, 0);
 	(void) GetCurrentTransactionId();
 
-	/* the pack's chunks the store hasn't, each once (pinned first, as a put's) */
+	/*
+	 * the pack's chunks the store hasn't, each once, pinned as a put's: for
+	 * this backend, and those found there in its table too
+	 */
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = sizeof(PackChunk);
 	ctl.hcxt = CurrentMemoryContext;
@@ -390,19 +433,18 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		bool		found;
 
 		CHECK_FOR_INTERRUPTS();
-		ChunkPin(h);
+		ChunkPinOwn(h);
 		pc = hash_search(pack, h, HASH_ENTER, &found);
 		if (found)
 			continue;
 		pc->at = i;
-		if (ChunkIndex->lookup(idx, h, &e))
-			continue;
-		fresh[i] = true;
+		fresh[i] = !found_pinned(idx, h);
 	}
 
 	/*
-	 * every chunk a new one references, pinned, the store's or the pack's
-	 * (a pack's chunks reference each other in any order)
+	 * every chunk a new one references, the store's (pinned in this
+	 * backend's table, then looked up) or the pack's new ones (a pack's
+	 * chunks reference each other in any order)
 	 */
 	for (int i = 0; i < n; i++)
 	{
@@ -414,9 +456,11 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			const uint8 *rh = refs[i].hashes + r * CHUNK_HASH_LEN;
 			PackChunk  *pc;
 
-			ChunkPin(rh);
 			pc = hash_search(pack, rh, HASH_FIND, NULL);
-			if ((pc == NULL || !fresh[pc->at]) && !ChunkIndex->lookup(idx, rh, &e))
+			if (pc != NULL && fresh[pc->at])
+				continue;
+			ChunkPin(rh);
+			if (!ChunkIndex->lookup(idx, rh, &e))
 				ereport(ERROR,
 						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 						 errmsg("chunk %s references chunk %s, which the store does not have",
@@ -427,29 +471,32 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	bind_store(log, idx);
 
 	/*
-	 * Their entries, room prepared for all their bytes, each one's place
-	 * reserved as it is put, in their names' order (packs naming chunks in
-	 * other orders wait for each other's puts in one order: no deadlock);
-	 * then their bytes, written where reserved.  Every wait and failure is
-	 * before a place is taken, and bytes reserved are their entry's, which
-	 * (aborted) counts them dead: a chunk another put first reserves none.
+	 * Their entries, each one's place reserved as it is put, in their names'
+	 * order (packs naming chunks in other orders wait for each other's puts
+	 * in one order: no deadlock); then their bytes, written where reserved.
+	 * Every wait and failure is before a place is taken, and bytes reserved
+	 * are their entry's, which (aborted) counts them dead: a chunk another
+	 * put first reserves none.  Room is made a chunk at a time, so that a
+	 * chunk fitting a page freed goes into one; the bytes reserved in a
+	 * region are written before it is let go of (it is sealed from where
+	 * they end).
 	 */
 	{
 		PackOrder  *order = palloc(Max(n, 1) * sizeof(PackOrder));
 		int			nfresh = 0;
+		int			unwritten = 0;
+		bool		have_run = false;
 		ChunkLogRun run;
 		PlaceArg	place;
 
 		for (int i = 0; i < n; i++)
 			if (fresh[i])
 			{
-				total += lens[i];
 				order[nfresh].hash = hashes + i * CHUNK_HASH_LEN;
 				order[nfresh].at = i;
 				nfresh++;
 			}
 		qsort(order, nfresh, sizeof(PackOrder), pack_order_cmp);
-		ChunkLog->prepare(log, total, &run);
 		place.log = log;
 		place.run = &run;
 		for (int k = 0; k < nfresh; k++)
@@ -457,31 +504,40 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			int			i = order[k].at;
 
 			CHECK_FOR_INTERRUPTS();
-			memset(&e, 0, sizeof(e));
-			memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
-			e.len = lens[i];
-			if (!ChunkIndex->insert(idx, &e, reserve_place, &place))
-				fresh[i] = false;	/* (another put it meanwhile) */
-			else
+			if (!have_run || run.limit - run.next < lens[i])
 			{
-				locs[i] = e.loc;
-				stored++;
+				write_pack(log, order, unwritten, k, fresh, locs, datas, lens);
+				unwritten = k;
+				if (have_run)
+					ChunkLog->release(log, &run);
+				ChunkLog->prepare(log, lens[i], &run);
+				have_run = true;
+			}
+			for (;;)
+			{
+				memset(&e, 0, sizeof(e));
+				memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+				e.len = lens[i];
+				if (ChunkIndex->insert(idx, &e, reserve_place, &place))
+				{
+					locs[i] = e.loc;
+					stored++;
+					break;
+				}
+
+				/* (another put it meanwhile: nothing reserved; gone again, put it) */
+				if (found_pinned(idx, hashes + i * CHUNK_HASH_LEN))
+				{
+					fresh[i] = false;
+					break;
+				}
 			}
 			INJECTION_POINT("chunk-pack-entry", NULL);
 		}
-
 		INJECTION_POINT("chunk-put-entered", NULL);
-
-		/* (in their places' order: each page written once, in order) */
-		for (int k = 0; k < nfresh; k++)
-		{
-			int			i = order[k].at;
-
-			CHECK_FOR_INTERRUPTS();
-			if (fresh[i] && lens[i] > 0)
-				ChunkLog->write(log, locs[i], datas[i], lens[i]);
-		}
-		ChunkLog->release(log, &run);
+		write_pack(log, order, unwritten, nfresh, fresh, locs, datas, lens);
+		if (have_run)
+			ChunkLog->release(log, &run);
 		pfree(order);
 	}
 

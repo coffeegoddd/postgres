@@ -3,7 +3,8 @@
 # session's): it wrote none of its bytes; those reserved for the entries it
 # put (rolled back) VACUUM counts dead, each once, and the room left goes
 # to the next put.  A chunk put after it keeps the log's tail, which VACUUM
-# would otherwise cut.
+# would otherwise cut.  (Enough chunks that one splits a bucket whatever
+# the index has seen: buckets are never merged.)
 
 setup
 {
@@ -26,14 +27,14 @@ step e_mark		{
 step e_attach	{ SELECT injection_points_attach('chunk-index-split-published', 'error'); }
 step e_pack		{
 	SELECT test_cs_put_many('pages',
-		ARRAY(SELECT pack_h('\x4c'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x4c'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i));
+		ARRAY(SELECT pack_h('\x4c'::bytea || int4send(i)) FROM generate_series(1, 20000) i ORDER BY i),
+		ARRAY(SELECT '\x4c'::bytea || int4send(i) FROM generate_series(1, 20000) i ORDER BY i));
 }
 step e_detach	{ SELECT injection_points_detach('chunk-index-split-published'); }
 step e_live		{ SELECT stored FROM test_cs_put('pages', '\x0a0401'); }
 step e_vacuum	{ VACUUM pg_history.chunk_index; }
 step e_dead		{
-	SELECT more_dead > 0 AND more_dead < 3000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
+	SELECT more_dead > 0 AND more_dead < 20000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
 	FROM (SELECT l.dead - d.dead AS more_dead
 		  FROM test_chunk_log_space('pg_history.chunks') l, dead0 d) x;
 }
@@ -46,7 +47,7 @@ step e_again	{
 }
 step e_none		{
 	SELECT count(*) FILTER (WHERE test_cs_has('pages', pack_h('\x4c'::bytea || int4send(i)))) AS there
-	FROM generate_series(1, 3000) i;
+	FROM generate_series(1, 20000) i;
 }
 step e_free		{ SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0401')]) AS freed; }
 

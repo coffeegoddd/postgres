@@ -29,6 +29,8 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 #define PINS_PER_BACKEND	2048	/* a power of two */
 #define PINS_FULL			(PINS_PER_BACKEND / 4 * 3)
@@ -46,6 +48,9 @@ static int	npin_tables;
 /* the slots this backend has set, to clear at its transaction's end */
 static uint16 my_slots[PINS_FULL];
 static bool callback_registered = false;
+
+/* the chunks this backend's transaction is putting, pinned for it alone */
+static HTAB *own_pins = NULL;
 
 static void ChunkPinShmemRequest(void *arg);
 static void ChunkPinShmemInit(void *arg);
@@ -111,6 +116,8 @@ release_pins(XactEvent event, void *arg)
 		event != XACT_EVENT_PREPARE && event != XACT_EVENT_PARALLEL_COMMIT &&
 		event != XACT_EVENT_PARALLEL_ABORT)
 		return;
+	/* (its memory TopTransactionContext's, gone with it) */
+	own_pins = NULL;
 	t = my_table();
 	for (uint32 i = 0; i < t->used; i++)
 		pg_atomic_write_u64(&t->keys[my_slots[i]], 0);
@@ -158,11 +165,35 @@ ChunkPin(const uint8 *hash)
 	pg_memory_barrier();
 }
 
+void
+ChunkPinOwn(const uint8 *hash)
+{
+	if (!callback_registered)
+	{
+		RegisterXactCallback(release_pins, NULL);
+		callback_registered = true;
+	}
+	if (own_pins == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = CHUNK_HASH_LEN;
+		ctl.entrysize = CHUNK_HASH_LEN;
+		ctl.hcxt = TopTransactionContext;
+		own_pins = hash_create("chunks put by this transaction", 256, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	(void) hash_search(own_pins, hash, HASH_ENTER, NULL);
+}
+
 bool
 ChunkPinned(const uint8 *hash)
 {
 	uint64		key = pin_key(hash);
 
+	/* (this backend's own, which only its own freeing could take) */
+	if (own_pins != NULL && hash_search(own_pins, hash, HASH_FIND, NULL) != NULL)
+		return true;
 	if (npin_tables == 0)
 		npin_tables = pin_table_count();
 	pg_memory_barrier();

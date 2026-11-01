@@ -4,7 +4,8 @@
  *	  Transient holds on the history store's chunks: pins.
  *
  * A transaction pins each chunk it puts (stored, or found stored already)
- * and each chunk that names, until it ends: the chunk is then held by what
+ * and each chunk that names, until it ends (a chunk it stores itself, for
+ * its own backend alone: ChunkPinOwn): the chunk is then held by what
  * the transaction made of it (a reference from a chunk it stored, a root it
  * took) or freeing may have it.  A pin closes the race in which a chunk
  * nothing holds is freed just as a writer is about to use it: the writer
@@ -30,6 +31,14 @@
 
 /* Pins the chunk named hash until this transaction ends. */
 extern void ChunkPin(const uint8 *hash);
+
+/*
+ * Pins, for this backend alone, a chunk this transaction is putting itself
+ * (its entry not committed: no other backend's freer frees it), until the
+ * transaction ends: kept in the backend's memory, not its table, which a
+ * transaction putting many chunks would fill.
+ */
+extern void ChunkPinOwn(const uint8 *hash);
 
 /* Whether any backend has the chunk pinned (or might have). */
 extern bool ChunkPinned(const uint8 *hash);
