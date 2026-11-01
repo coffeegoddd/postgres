@@ -48,8 +48,8 @@ patch doc/src/sgml/config.sgml  1b  catalog_branch
 patch doc/src/sgml/ref/create_schema.sgml  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
-patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time
-patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (NewRelationStorageManager(); kept across rewrites)
+patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time, as of the branch the scan began on
+patch src/backend/access/heap/heapam_handler.c  1a  chooses the storage manager of a heap's new storage (NewRelationStorageManager(); kept across rewrites); also (1b) bitmap scans and sampling of catalogs hide other branches' rows, as of the branch the scan began on
 patch src/backend/access/heap/heapam_indexscan.c  1b  index and index-only scans of catalogs hide other branches' rows, visiting the heap for each
 patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visibility map bits set without changing the heap page
 patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing; VACUUM freezes a page the storage shares with nothing whenever all its tuples can be (freeze_own_eagerly)
@@ -143,7 +143,7 @@ patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block ma
 patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
-patch src/include/access/heapam.h  1b  heap and index scans remember whether they hide other branches' catalog rows
+patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
 patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
 patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown

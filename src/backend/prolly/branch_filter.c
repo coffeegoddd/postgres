@@ -438,43 +438,44 @@ CatalogBranchSeenOids(Oid classid, List *oids)
 	return seen;
 }
 
-bool
+int32
 CatalogBranchFilters(Relation rel, Snapshot snapshot)
 {
 	Oid			relid = RelationGetRelid(rel);
 
-	/* ordinary tables first: this is asked on every heap fetch */
 	if (relid >= FirstNormalObjectId || !catalog_branch_filter)
-		return false;
+		return CATALOG_BRANCH_UNFILTERED;
 	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC ||
 		snapshot->is_catalog)
-		return false;
-	if (!IsNormalProcessingMode())
-		return false;
-	return filtered_catalog(relid);
+		return CATALOG_BRANCH_UNFILTERED;
+	if (!IsNormalProcessingMode() || !filtered_catalog(relid))
+		return CATALOG_BRANCH_UNFILTERED;
+	return catalog_branch;
 }
 
 static inline bool
-branch_hidden(int32 branch)
+branch_hidden(int32 row_branch, int32 branch)
 {
-	return branch != 0 && branch != catalog_branch;
+	return row_branch != 0 && row_branch != branch;
 }
 
 bool
-CatalogBranchHides(Relation rel, HeapTuple tuple)
+CatalogBranchHides(Relation rel, HeapTuple tuple, int32 branch)
 {
 	RowOwners	owners;
 	Oid			relid = RelationGetRelid(rel);
 
 	if (relid == NamespaceRelationId)
-		return branch_hidden(((Form_pg_namespace) GETSTRUCT(tuple))->nspbranch);
+		return branch_hidden(((Form_pg_namespace) GETSTRUCT(tuple))->nspbranch,
+							 branch);
 
 	if (!row_owners(relid, tuple, &owners))
 		return false;
 	for (int i = 0; i < owners.n; i++)
 	{
 		if (branch_hidden(BranchMap->object_branch(owners.classid[i],
-												   owners.objid[i])))
+												   owners.objid[i]),
+						  branch))
 			return true;
 	}
 	return false;
@@ -482,7 +483,7 @@ CatalogBranchHides(Relation rel, HeapTuple tuple)
 
 uint32
 CatalogBranchFilterPage(Relation rel, Page page, BlockNumber block,
-						OffsetNumber *offsets, uint32 n)
+						OffsetNumber *offsets, uint32 n, int32 branch)
 {
 	uint32		kept = 0;
 	HeapTupleData tuple;
@@ -498,7 +499,7 @@ CatalogBranchFilterPage(Relation rel, Page page, BlockNumber block,
 			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			tuple.t_len = ItemIdGetLength(lp);
 			ItemPointerSet(&tuple.t_self, block, offsets[i]);
-			if (!CatalogBranchHides(rel, &tuple))
+			if (!CatalogBranchHides(rel, &tuple, branch))
 				offsets[kept++] = offsets[i];
 		}
 	}
@@ -991,11 +992,10 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 	map_stats.probes++;
 	if (!OidIsValid(objid))
 		return 0;
+	/* (no object's owners are nested this deep) */
 	if (depth > 4)
-	{
-		map_generation++;		/* (not kept: see map_generation) */
-		return 0;
-	}
+		elog(ERROR, "catalog branch of object %u of class %u: owners nested too deep",
+			 objid, classid);
 
 	/*
 	 * Objects initdb made are shared, and need no reading (nor could the
@@ -1054,7 +1054,8 @@ object_namespace(Oid classid, Oid objid, int depth)
 	Datum		value;
 
 	if (depth > 4)
-		return InvalidOid;
+		elog(ERROR, "namespace of object %u of class %u: owners nested too deep",
+			 objid, classid);
 	for (int i = 0; i < lengthof(owned_classes); i++)
 	{
 		if (owned_classes[i].classid != classid)
