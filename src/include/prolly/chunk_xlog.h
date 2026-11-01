@@ -50,6 +50,8 @@
 typedef struct xl_chunk_log_next_block
 {
 	BlockNumber next_block;		/* the first page no region has */
+	uint32		generation;		/* the log's, one more at each tail cut */
+	BlockNumber cut_from;		/* the last tail cut's first page cut */
 } xl_chunk_log_next_block;
 
 typedef struct xl_chunk_log_init_page
@@ -60,14 +62,27 @@ typedef struct xl_chunk_log_init_page
 
 typedef struct xl_chunk_log_append
 {
-	uint32		off;			/* where on the page, after its header (at 0,
-								 * the page is made afresh first) */
+	uint32		off;			/* where on the page, after its header (past
+								 * where it is written: the bytes between
+								 * reserved, never written) */
 	uint32		len;			/* the bytes', block 0's data */
+	uint32		init;			/* the page made afresh first */
 } xl_chunk_log_append;
+
+typedef struct xl_chunk_log_seal
+{
+	uint32		off;			/* where the region's reserved bytes end on
+								 * the page: dead from there */
+	uint32		init;			/* the page made afresh first */
+} xl_chunk_log_seal;
 
 typedef struct xl_chunk_log_mark_dead
 {
-	uint32		len;			/* the bytes counted dead */
+	uint32		off;			/* where on the page */
+	uint32		len;			/* the bytes counted dead (written, or
+								 * reserved and never written: the page
+								 * then written to their end) */
+	uint32		init;			/* the page made afresh first */
 } xl_chunk_log_mark_dead;
 
 extern void chunk_log_redo(XLogReaderState *record);

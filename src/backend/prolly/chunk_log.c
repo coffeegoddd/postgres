@@ -54,7 +54,7 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	4
+#define CHUNK_LOG_VERSION	5
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
@@ -82,6 +82,9 @@ typedef struct ChunkLogMetaData
 	BlockNumber next_block;		/* the first page no region has */
 	uint64		stamp;			/* this storage's, made with it (an index
 								 * of chunks in it names it) */
+	uint32		generation;		/* one more at each tail cut */
+	BlockNumber cut_from;		/* the last cut's first page cut, or
+								 * InvalidBlockNumber */
 } ChunkLogMetaData;
 
 /*
@@ -97,6 +100,7 @@ typedef struct ChunkLogRegion
 	uint64		next;			/* where the next append begins */
 	uint64		limit;			/* where the region ends */
 	uint64		stamp;			/* the storage's stamp, if known, or 0 */
+	uint32		generation;		/* the log's when the region was made */
 } ChunkLogRegion;
 
 /* The bytes of the log a data page holds, after its header. */
@@ -135,27 +139,46 @@ page_make(Page page, bool all_dead)
 	}
 }
 
+/*
+ * A page part used, made full: the bytes from off on dead, those before it
+ * not yet written reserved (an entry's, which counts them dead itself)
+ */
 static void
-page_seal(Page page)
+page_seal(Page page, bool init, size_t off)
 {
-	ChunkPageOpaque opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
+	ChunkPageOpaque opaque;
 
-	opaque->dead += AREA_START + AREA - ((PageHeader) page)->pd_lower;
+	if (init)
+		init_page(page, CHUNK_PAGE_DATA);
+	opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
+	opaque->dead += AREA - off;
 	((PageHeader) page)->pd_lower = AREA_START + AREA;
 }
 
+/*
+ * Bytes written at off: past where the page is written, the bytes between
+ * are reserved and never written (an entry's, counting them dead itself)
+ */
 static void
-page_write(Page page, size_t off, const char *bytes, size_t n)
+page_write(Page page, bool init, size_t off, const char *bytes, size_t n)
 {
-	if (off == 0)
+	if (init)
 		init_page(page, CHUNK_PAGE_DATA);
 	memcpy((char *) page + AREA_START + off, bytes, n);
 	((PageHeader) page)->pd_lower = AREA_START + off + n;
 }
 
+/*
+ * Bytes at off counted dead: reserved and never written, the page is
+ * written to their end
+ */
 static void
-page_add_dead(Page page, size_t n)
+page_add_dead(Page page, bool init, size_t off, size_t n)
 {
+	if (init)
+		init_page(page, CHUNK_PAGE_DATA);
+	if (((PageHeader) page)->pd_lower < AREA_START + off + n)
+		((PageHeader) page)->pd_lower = AREA_START + off + n;
 	((ChunkPageOpaque) PageGetSpecialPointer(page))->dead += n;
 }
 
@@ -250,6 +273,8 @@ init_meta(Page page)
 	meta = (ChunkLogMetaData *) PageGetContents(page);
 	meta->version = CHUNK_LOG_VERSION;
 	meta->next_block = META_BLOCK + 1;
+	meta->generation = 1;
+	meta->cut_from = InvalidBlockNumber;
 	if (!pg_strong_random(&meta->stamp, sizeof(meta->stamp)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -293,17 +318,50 @@ data_buffer(Relation rel, BlockNumber blk)
 
 /* ------------------------------------------------------------- the log */
 
-/* the meta page's next block, mbuf locked exclusively */
+/*
+ * The meta page's next block (and, at a tail cut, its generation and where
+ * the cut began), mbuf locked exclusively
+ */
 static void
-set_next_block(Relation rel, Buffer mbuf, BlockNumber next_block)
+meta_set(ChunkLogMetaData *meta, const xl_chunk_log_next_block *x)
 {
-	xl_chunk_log_next_block xlrec = {.next_block = next_block};
+	meta->next_block = x->next_block;
+	meta->generation = x->generation;
+	meta->cut_from = x->cut_from;
+}
+
+static void
+set_next_block(Relation rel, Buffer mbuf, BlockNumber next_block, bool cut)
+{
+	ChunkLogMetaData *meta = (ChunkLogMetaData *) PageGetContents(BufferGetPage(mbuf));
+	xl_chunk_log_next_block xlrec = {
+		.next_block = next_block,
+		.generation = meta->generation + (cut ? 1 : 0),
+		.cut_from = cut ? next_block : meta->cut_from,
+	};
 
 	START_CRIT_SECTION();
-	((ChunkLogMetaData *) PageGetContents(BufferGetPage(mbuf)))->next_block = next_block;
+	meta_set(meta, &xlrec);
 	log_page_change(rel, mbuf, XLOG_CHUNK_LOG_NEXT_BLOCK, false,
 					&xlrec, sizeof(xlrec), NULL, 0);
 	END_CRIT_SECTION();
+}
+
+/* the log's generation, and where its last tail cut began */
+static uint32
+log_generation(Relation rel, BlockNumber *cut_from)
+{
+	Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
+	ChunkLogMetaData *meta;
+	uint32		gen;
+
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	meta = page_meta(rel, BufferGetPage(mbuf));
+	gen = meta->generation;
+	if (cut_from)
+		*cut_from = meta->cut_from;
+	UnlockReleaseBuffer(mbuf);
+	return gen;
 }
 
 /* a data page made afresh: empty, or written full with every byte dead */
@@ -337,7 +395,7 @@ claim_pages(Relation rel, BlockNumber npages)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("chunk log \"%s\" is full", RelationGetRelationName(rel))));
-	set_next_block(rel, mbuf, first + npages);
+	set_next_block(rel, mbuf, first + npages, false);
 	UnlockReleaseBuffer(mbuf);
 	return first;
 }
@@ -382,7 +440,7 @@ take_free_page(Relation rel)
 	return InvalidBlockNumber;
 }
 
-static void page_mark_dead(Relation rel, uint64 loc, size_t len);
+static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation);
 
 /*
  * Lets go of what is left of a region, from loc to limit: the page loc is
@@ -400,22 +458,31 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 	{
 		BlockNumber blk = LOC_BLOCK(loc);
 		size_t		off = LOC_OFFSET(loc);
-		Buffer		buf = ReadBuffer(rel, blk);
+		Buffer		buf = data_buffer(rel, blk);
+		bool		init = PageIsNew(BufferGetPage(buf));
+		xl_chunk_log_seal xlrec = {.off = off, .init = init};
 		bool		freed;
 
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
-		if (((PageHeader) BufferGetPage(buf))->pd_lower != AREA_START + off)
+		/*
+		 * (written as far as the region's bytes, or short of it: those
+		 * between reserved, never written; nothing past it)
+		 */
+		if (!init)
 		{
-			UnlockReleaseBuffer(buf);
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("block %u of chunk log \"%s\" does not end where its region's appends are",
-							blk, RelationGetRelationName(rel))));
+			check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
+			if (((PageHeader) BufferGetPage(buf))->pd_lower > AREA_START + off)
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("block %u of chunk log \"%s\" is written past where its region's bytes end",
+								blk, RelationGetRelationName(rel))));
+			}
 		}
 		START_CRIT_SECTION();
-		page_seal(BufferGetPage(buf));
-		log_page_change(rel, buf, XLOG_CHUNK_LOG_SEAL_PAGE, false, NULL, 0, NULL, 0);
+		page_seal(BufferGetPage(buf), init, off);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_SEAL_PAGE, init,
+						&xlrec, sizeof(xlrec), NULL, 0);
 		END_CRIT_SECTION();
 		freed = page_free(BufferGetPage(buf));
 		UnlockReleaseBuffer(buf);
@@ -475,128 +542,185 @@ keep_region(Relation rel, const ChunkLogRegion *region)
 		cached->stamp = stamp;
 }
 
-static uint64
-page_append(Relation rel, const void *data, size_t len)
+/*
+ * The checks of every write to the log: by a transaction with an id (its
+ * commit flushes the WAL of its bytes; one without would commit with no
+ * record), before any buffer is touched, as getting one can fail; and
+ * under RowExclusiveLock, which keeps VACUUM from cutting the log's tail
+ * off meanwhile
+ */
+static void
+check_writer(Relation rel)
 {
-	const char *bytes = data;
-	ChunkLogRegion region;
-	ChunkLogRegion *cached = rel->rd_amcache;
-	bool		own_run;
-	uint64		start;
-
-	/*
-	 * The transaction appending gets an id, so that its commit flushes the
-	 * WAL of what it appended (one without would commit without a record);
-	 * before any buffer is touched, as getting one can fail
-	 */
 	PreventCommandIfReadOnly("append to a chunk log");
 	(void) GetCurrentTransactionId();
-
-	/* (what keeps VACUUM from cutting the log's tail off meanwhile) */
 	if (!CheckRelationLockedByMe(rel, RowExclusiveLock, true))
 		elog(ERROR, "chunk log \"%s\" appended to without RowExclusiveLock",
 			 RelationGetRelationName(rel));
+}
 
-	if (len == 0)
-		return 0;
+/*
+ * Room for len bytes in this backend's region: what is left of it, or
+ * else a new one (a page freed, if the bytes fit one, or new pages, more
+ * if the bytes are longer than a region), what was left of the old one
+ * let go of.  The region, kept in the relation's rd_amcache too, in *run.
+ */
+static void
+page_prepare(Relation rel, size_t len, ChunkLogRun *run)
+{
+	ChunkLogRegion *cached = rel->rd_amcache;
+	ChunkLogRegion region;
 
-	/*
-	 * Into this backend's region, or a new one if the bytes don't fit what
-	 * is left of it; bytes longer than a region go into pages of their own,
-	 * leaving the region as it is
-	 */
-	own_run = len > (uint64) REGION_PAGES * AREA;
-	if (own_run)
-		claim_run(rel, len, 0, &region);
+	check_writer(rel);
+	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
+		region = *cached;
 	else
 	{
-		if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
-			region = *cached;
-		else
-		{
-			memset(&region, 0, sizeof(region));
-			region.relnumber = rel->rd_locator.relNumber;
-		}
-		if (region.limit - region.next < len)
-		{
-			BlockNumber blk;
-
-			/* what is left of the region let go of */
-			if (region.limit > 0)
-				seal_region(rel, region.next, region.limit);
-
-			/* a page freed, if the bytes fit one, else a region of new ones */
-			blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
-
-			if (BlockNumberIsValid(blk))
-			{
-				region.relnumber = rel->rd_locator.relNumber;
-				region.next = (uint64) (blk - 1) * AREA;
-				region.limit = region.next + AREA;
-			}
-			else
-				claim_run(rel, len, REGION_PAGES, &region);
-			keep_region(rel, &region);
-		}
+		memset(&region, 0, sizeof(region));
+		region.relnumber = rel->rd_locator.relNumber;
 	}
-	start = region.next;
+	if (region.limit - region.next < len)
+	{
+		BlockNumber blk;
 
-	/* a page at a time, each page's change a record of its own */
+		/* what is left of the region let go of */
+		if (region.limit > 0)
+			seal_region(rel, region.next, region.limit);
+
+		blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
+		if (BlockNumberIsValid(blk))
+		{
+			region.relnumber = rel->rd_locator.relNumber;
+			region.next = (uint64) (blk - 1) * AREA;
+			region.limit = region.next + AREA;
+		}
+		else
+			claim_run(rel, len, REGION_PAGES, &region);
+
+		/*
+		 * (its bytes the generation's: a tail cut, which makes the next,
+		 * needs the relation locked as no put holds it, and its
+		 * invalidation has every backend forget its region)
+		 */
+		region.generation = log_generation(rel, NULL);
+		keep_region(rel, &region);
+	}
+	run->relnumber = region.relnumber;
+	run->next = region.next;
+	run->limit = region.limit;
+	run->generation = region.generation;
+}
+
+/*
+ * len bytes of the room prepared, where they begin: the run, and the
+ * region kept, past them.  Changes nothing but memory: it does not fail.
+ */
+static uint64
+page_reserve(Relation rel, ChunkLogRun *run, size_t len)
+{
+	ChunkLogRegion *cached = rel->rd_amcache;
+	uint64		loc = run->next;
+
+	if (len > run->limit - run->next)
+		elog(PANIC, "chunk log \"%s\": %zu bytes reserved past the room prepared",
+			 RelationGetRelationName(rel), len);
+	run->next += len;
+
+	/*
+	 * (the region, if still kept, past them: should the bytes never be
+	 * written, the region goes on after them, the entry naming them
+	 * counting them dead; one forgotten meanwhile, by an invalidation, is
+	 * kept again once the bytes are written)
+	 */
+	if (cached != NULL && cached->relnumber == run->relnumber &&
+		cached->limit == run->limit)
+		cached->next = run->next;
+	return loc;
+}
+
+/*
+ * Writes len bytes reserved at loc, a page at a time, each page's change a
+ * record of its own.  A page is written in its reserved bytes' order; one
+ * written short of loc has the bytes between reserved, never written.
+ */
+static void
+page_write_at(Relation rel, uint64 loc, const void *data, size_t len)
+{
+	const char *bytes = data;
+
+	check_writer(rel);
 	while (len > 0)
 	{
-		BlockNumber blk = LOC_BLOCK(region.next);
-		size_t		off = LOC_OFFSET(region.next),
+		BlockNumber blk = LOC_BLOCK(loc);
+		size_t		off = LOC_OFFSET(loc),
 					n = Min(len, AREA - off);
 		Buffer		buf;
-		xl_chunk_log_append xlrec = {.off = off, .len = n};
+		Page		page;
+		bool		init;
+		xl_chunk_log_append xlrec;
 
 		CHECK_FOR_INTERRUPTS();
 		buf = data_buffer(rel, blk);
+		page = BufferGetPage(buf);
+		init = PageIsNew(page);
 
-		/*
-		 * A page this backend's appends begin is new, or made afresh to use
-		 * again; one they go on in holds their bytes up to where they go on.
-		 * Anything else is not what the log wrote.
-		 */
-		if (off == 0 ? !(PageIsNew(BufferGetPage(buf)) || page_fresh(BufferGetPage(buf))) :
-			PageIsNew(BufferGetPage(buf)))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("block %u of chunk log \"%s\" is %s, but its region's appends are at %llu",
-							blk, RelationGetRelationName(rel),
-							off == 0 ? "in use" : "empty",
-							(unsigned long long) region.next)));
-		if (off > 0)
+		/* (a page made, or the log's, written no further than loc) */
+		if (!init)
 		{
-			check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
-			if (((PageHeader) BufferGetPage(buf))->pd_lower != AREA_START + off)
+			check_page(rel, blk, page, CHUNK_PAGE_DATA);
+			if (((PageHeader) page)->pd_lower > AREA_START + off)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("block %u of chunk log \"%s\" does not end where its region's appends are",
-								blk, RelationGetRelationName(rel))));
+						 errmsg("block %u of chunk log \"%s\" is written past %llu, where bytes reserved go",
+								blk, RelationGetRelationName(rel),
+								(unsigned long long) loc)));
 		}
-
+		xlrec.off = off;
+		xlrec.len = n;
+		xlrec.init = init;
 		START_CRIT_SECTION();
-		page_write(BufferGetPage(buf), off, bytes, n);
-		log_page_change(rel, buf, XLOG_CHUNK_LOG_APPEND, off == 0,
+		page_write(page, init, off, bytes, n);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_APPEND, init,
 						&xlrec, sizeof(xlrec), bytes, n);
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
-		region.next += n;
+		loc += n;
 		bytes += n;
 		len -= n;
 
-		/* the region as far as written, should what follows fail */
-		if (!own_run)
-			keep_region(rel, &region);
-
 		INJECTION_POINT("chunk-log-append-page", NULL);
 	}
+}
 
-	/* (pages of the bytes' own: the last one's rest let go of at once) */
-	if (own_run)
-		seal_region(rel, region.next, region.limit);
-	return start;
+/* The region kept once more, should an invalidation have forgotten it. */
+static void
+page_release(Relation rel, const ChunkLogRun *run)
+{
+	ChunkLogRegion region = {
+		.relnumber = run->relnumber,
+		.next = run->next,
+		.limit = run->limit,
+		.generation = run->generation,
+	};
+
+	if (run->relnumber == rel->rd_locator.relNumber)
+		keep_region(rel, &region);
+}
+
+static uint64
+page_append(Relation rel, const void *data, size_t len)
+{
+	ChunkLogRun run;
+	uint64		loc;
+
+	check_writer(rel);
+	if (len == 0)
+		return 0;
+	page_prepare(rel, len, &run);
+	loc = page_reserve(rel, &run, len);
+	page_write_at(rel, loc, data, len);
+	page_release(rel, &run);
+	return loc;
 }
 
 static uint64
@@ -668,8 +792,25 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
  * bytes are dead then goes in the free space map, to be used again.
  */
 static void
-page_mark_dead(Relation rel, uint64 loc, size_t len)
+page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
 {
+	BlockNumber cut_from;
+	uint32		current = log_generation(rel, &cut_from);
+
+	/*
+	 * Bytes of a generation before the last tail cut's: those on pages the
+	 * cut took are gone, nothing to count.  Only bytes reserved and never
+	 * written can have been on them (a page with bytes written and not yet
+	 * dead is no free tail), an aborted entry's; and that entry is out
+	 * before another cut, VACUUM taking out every aborted entry it finds
+	 * before it cuts, with no put running.  Bytes written, of any
+	 * generation, are on pages before every cut since.
+	 */
+	if (generation > current)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk log \"%s\" has no bytes of generation %u (it is at %u)",
+						RelationGetRelationName(rel), generation, current)));
 	while (len > 0)
 	{
 		BlockNumber blk = LOC_BLOCK(loc);
@@ -677,22 +818,32 @@ page_mark_dead(Relation rel, uint64 loc, size_t len)
 					n = Min(len, AREA - off);
 		Buffer		buf;
 		Page		page;
-		xl_chunk_log_mark_dead xlrec = {.len = n};
+		bool		init;
+		xl_chunk_log_mark_dead xlrec;
 		bool		freed;
+		size_t		written;
 
 		CHECK_FOR_INTERRUPTS();
-		if (blk >= RelationGetNumberOfBlocks(rel))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("bytes %llu to %llu of chunk log \"%s\" were never written",
-							(unsigned long long) loc, (unsigned long long) (loc + len),
-							RelationGetRelationName(rel))));
-		buf = ReadBuffer(rel, blk);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
+		if (generation != current && BlockNumberIsValid(cut_from) && blk >= cut_from)
+		{
+			loc += n;
+			len -= n;
+			continue;
+		}
+
+		/*
+		 * (bytes reserved and never written may be on a page not made yet,
+		 * or past the file's end: an aborted entry's, its region's later
+		 * bytes only after them)
+		 */
+		buf = data_buffer(rel, blk);
 		page = BufferGetPage(buf);
-		if (((ChunkPageOpaque) PageGetSpecialPointer(page))->dead + n >
-			((PageHeader) page)->pd_lower - AREA_START)
+		init = PageIsNew(page);
+		if (!init)
+			check_page(rel, blk, page, CHUNK_PAGE_DATA);
+		written = init ? 0 : ((PageHeader) page)->pd_lower - AREA_START;
+		if ((init ? 0 : ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead) + n >
+			Max(written, off + n))
 		{
 			UnlockReleaseBuffer(buf);
 			ereport(ERROR,
@@ -700,9 +851,12 @@ page_mark_dead(Relation rel, uint64 loc, size_t len)
 					 errmsg("block %u of chunk log \"%s\" would have more bytes dead than written",
 							blk, RelationGetRelationName(rel))));
 		}
+		xlrec.off = off;
+		xlrec.len = n;
+		xlrec.init = init;
 		START_CRIT_SECTION();
-		page_add_dead(page, n);
-		log_page_change(rel, buf, XLOG_CHUNK_LOG_MARK_DEAD, false,
+		page_add_dead(page, init, off, n);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_MARK_DEAD, init,
 						&xlrec, sizeof(xlrec), NULL, 0);
 		END_CRIT_SECTION();
 		freed = page_free(page);
@@ -808,7 +962,10 @@ tail_page_cuttable(Relation rel, BlockNumber blk)
 
 	/*
 	 * (a page part written all dead too: its backend, if any, can append
-	 * to it no more, with no append running and its region forgotten)
+	 * to it no more, with no append running and its region forgotten.
+	 * Bytes reserved past what is written, an aborted entry's, are not
+	 * counted on it then: the cut makes a generation, and they are of the
+	 * one before)
 	 */
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	cut = PageIsNew(page) || page_free(page) ||
@@ -856,7 +1013,7 @@ ChunkLogTruncateTail(Relation rel)
 		mbuf = ReadBuffer(rel, META_BLOCK);
 		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 		(void) page_meta(rel, BufferGetPage(mbuf));
-		set_next_block(rel, mbuf, keep);
+		set_next_block(rel, mbuf, keep, true);
 		UnlockReleaseBuffer(mbuf);
 
 		msg.rc.id = SHAREDINVALRELCACHE_ID;
@@ -871,6 +1028,10 @@ ChunkLogTruncateTail(Relation rel)
 
 const ChunkLogRoutine PageChunkLog = {
 	.append = page_append,
+	.prepare = page_prepare,
+	.reserve = page_reserve,
+	.write = page_write_at,
+	.release = page_release,
 	.read = page_read,
 	.mark_dead = page_mark_dead,
 	.stamp = page_stamp,
@@ -1385,8 +1546,8 @@ chunk_log_redo(XLogReaderState *record)
 		case XLOG_CHUNK_LOG_NEXT_BLOCK:
 			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
 			{
-				((ChunkLogMetaData *) PageGetContents(BufferGetPage(buf)))->next_block =
-					((xl_chunk_log_next_block *) rec)->next_block;
+				meta_set((ChunkLogMetaData *) PageGetContents(BufferGetPage(buf)),
+						 (xl_chunk_log_next_block *) rec);
 				applied = true;
 			}
 			break;
@@ -1396,19 +1557,24 @@ chunk_log_redo(XLogReaderState *record)
 			applied = true;
 			break;
 		case XLOG_CHUNK_LOG_SEAL_PAGE:
-			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
 			{
-				page_seal(BufferGetPage(buf));
+				xl_chunk_log_seal *xlrec = (xl_chunk_log_seal *) rec;
+
+				if (xlrec->init)
+					buf = XLogInitBufferForRedo(record, 0);
+				else if (XLogReadBufferForRedo(record, 0, &buf) != BLK_NEEDS_REDO)
+					break;
+				page_seal(BufferGetPage(buf), xlrec->init, xlrec->off);
 				applied = true;
+				break;
 			}
-			break;
 		case XLOG_CHUNK_LOG_APPEND:
 			{
 				xl_chunk_log_append *xlrec = (xl_chunk_log_append *) rec;
 				Size		len;
 				char	   *bytes;
 
-				if (xlrec->off == 0)
+				if (xlrec->init)
 					buf = XLogInitBufferForRedo(record, 0);
 				else if (XLogReadBufferForRedo(record, 0, &buf) != BLK_NEEDS_REDO)
 					break;
@@ -1416,17 +1582,22 @@ chunk_log_redo(XLogReaderState *record)
 				if (len != xlrec->len || xlrec->off + len > AREA)
 					elog(PANIC, "chunk_log_redo: an append of %u bytes at %u has %zu",
 						 xlrec->len, xlrec->off, len);
-				page_write(BufferGetPage(buf), xlrec->off, bytes, len);
+				page_write(BufferGetPage(buf), xlrec->init, xlrec->off, bytes, len);
 				applied = true;
 				break;
 			}
 		case XLOG_CHUNK_LOG_MARK_DEAD:
-			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
 			{
-				page_add_dead(BufferGetPage(buf), ((xl_chunk_log_mark_dead *) rec)->len);
+				xl_chunk_log_mark_dead *xlrec = (xl_chunk_log_mark_dead *) rec;
+
+				if (xlrec->init)
+					buf = XLogInitBufferForRedo(record, 0);
+				else if (XLogReadBufferForRedo(record, 0, &buf) != BLK_NEEDS_REDO)
+					break;
+				page_add_dead(BufferGetPage(buf), xlrec->init, xlrec->off, xlrec->len);
 				applied = true;
+				break;
 			}
-			break;
 		default:
 			elog(PANIC, "chunk_log_redo: unknown op code %u", info);
 	}

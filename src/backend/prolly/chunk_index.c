@@ -63,7 +63,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	5
+#define CHUNK_INDEX_VERSION	6
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -1107,7 +1107,8 @@ chain_room(Relation rel, Buffer primary, BlockNumber *space, BlockNumber *last)
  */
 static bool
 add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
-		  BlockNumber last, const ChunkIndexEntry *entry)
+		  BlockNumber last, ChunkIndexEntry *entry, ChunkReserveFn reserve,
+		  void *arg)
 {
 	if (BlockNumberIsValid(space))
 	{
@@ -1123,6 +1124,8 @@ add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
 		lp.will_init = false;
 		lp.data = entry;
 		lp.len = sizeof(*entry);
+		if (reserve)
+			reserve(arg, entry);
 		START_CRIT_SECTION();
 		ipage_add(BufferGetPage(buf), entry);
 		log_index_change(idx, XLOG_CHUNK_INDEX_ADD_ENTRY, NULL, 0, &lp, 1, primary);
@@ -1160,6 +1163,8 @@ add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
 		lps[1] = (LoggedPage) {.buf = lbuf};
 		lps[2] = (LoggedPage) {.buf = nbuf, .will_init = true,
 			.data = entry, .len = sizeof(*entry)};
+		if (reserve)
+			reserve(arg, entry);
 		START_CRIT_SECTION();
 		((IndexMetaData *) PageGetContents(BufferGetPage(mbuf)))->next_block = blk + 1;
 		((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(lbuf)))->next = blk;
@@ -1236,7 +1241,8 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 }
 
 static bool
-page_insert(Relation idx, ChunkIndexEntry *entry, bool *added)
+page_insert(Relation idx, ChunkIndexEntry *entry, ChunkReserveFn reserve,
+			void *arg)
 {
 	uint32		bucket;
 	IndexCache	masks;
@@ -1253,7 +1259,6 @@ page_insert(Relation idx, ChunkIndexEntry *entry, bool *added)
 	entry->xmax = InvalidTransactionId;
 	entry->flags = 0;
 	entry->kind = CHUNK_KIND_CHUNK;
-	entry->unused = 0;
 	for (;;)
 	{
 		primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket,
@@ -1276,9 +1281,7 @@ page_insert(Relation idx, ChunkIndexEntry *entry, bool *added)
 		}
 		break;
 	}
-	grew = add_entry(idx, primary, bucket, space, last, entry);
-	if (added)
-		*added = true;
+	grew = add_entry(idx, primary, bucket, space, last, entry, reserve, arg);
 	UnlockReleaseBuffer(primary);
 
 	/* (counted as a table's inserts are, so that autovacuum VACUUMs it) */
@@ -1401,7 +1404,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		 * changes of one chunk are all in its bucket, and VACUUM takes them)
 		 */
 		chain_room(idx, primary, &space, &last);
-		(void) add_entry(idx, primary, bucket, space, last, &change);
+		(void) add_entry(idx, primary, bucket, space, last, &change, NULL, NULL);
 		pgstat_count_heap_insert(idx, 1);
 	}
 	UnlockReleaseBuffer(primary);
@@ -2209,7 +2212,7 @@ ChunkIndexVacuum(Relation idx)
 		}
 		if (ndead > 0 && log != NULL)
 			for (int i = 0; i < ndead; i++)
-				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len);
+				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);
 		ndead = 0;
 	}
 	if (!log_tried)
@@ -2217,6 +2220,7 @@ ChunkIndexVacuum(Relation idx)
 	if (log != NULL)
 	{
 		ChunkLogRecordFree(log);
+		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		(void) ChunkLogTruncateTail(log);
 
 		/* chunks nothing holds: a freer frees them, and what they held */

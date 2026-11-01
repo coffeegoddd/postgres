@@ -40,7 +40,7 @@ step b_dead:
 
 more_dead
 ---------
-        3
+        0
 (1 row)
 
 step b_free: 
@@ -201,7 +201,7 @@ test_chunk_format_refs
 (1 row)
 
 
-starting permutation: b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_vacuum b_has
+starting permutation: b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_live b_vacuum b_dead b_has b_free_live
 step b_start: VACUUM pg_history.chunk_index;
 step b_mark: 
 	DROP TABLE IF EXISTS dead0;
@@ -235,11 +235,25 @@ step b_dead:
 
 more_dead
 ---------
-        3
+        0
 (1 row)
 
 step a_rollback: ROLLBACK;
+step b_live: SELECT stored FROM test_cs_put('pages', '\x0a0109');
+stored
+------
+t     
+(1 row)
+
 step b_vacuum: VACUUM pg_history.chunk_index;
+step b_dead: 
+	SELECT l.dead - d.dead AS more_dead FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
+
+more_dead
+---------
+        6
+(1 row)
+
 step b_has: 
 	SELECT test_cs_has('pages', pack_h('\x0a0101')) AS first,
 		test_cs_has('pages', pack_h('\x0a0102')) AS second;
@@ -247,5 +261,11 @@ step b_has:
 first|second
 -----+------
 f    |f     
+(1 row)
+
+step b_free_live: SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0109')]) AS freed;
+freed
+-----
+    1
 (1 row)
 

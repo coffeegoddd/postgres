@@ -60,8 +60,16 @@ typedef struct ChunkIndexEntry
 								 * or 0; a change's: its chunk's xmin */
 	uint16		flags;			/* CHUNK_ENTRY_*: what is known of xmin */
 	uint16		kind;			/* CHUNK_KIND_* */
-	uint32		unused;
+	uint32		log_gen;		/* a chunk's: the log's generation its bytes
+								 * were reserved in (prolly/chunk_log.h) */
 } ChunkIndexEntry;
+
+/*
+ * Sets a chunk's entry's place, loc and log_gen, as an insert is about to
+ * put it: after everything that may wait or fail, so that it must not
+ * fail itself (prolly/chunk_log.h's reserve).
+ */
+typedef void (*ChunkReserveFn) (void *arg, ChunkIndexEntry *entry);
 
 /*
  * An entry is a chunk's, or a change of a chunk's counts: refs and roots,
@@ -97,11 +105,13 @@ typedef struct ChunkIndexRoutine
 
 	/*
 	 * Inserts entry, its counts as given, unless one for its hash is there:
-	 * then answers false, and that one in *entry.  *added (if given) is set
-	 * true as soon as the entry is on its page, before anything after (a
-	 * bucket's split) that may fail.
+	 * then answers false, and that one in *entry.  reserve (if given) sets
+	 * the entry's place once it is to be put, everything that may wait or
+	 * fail before it done, and is called for no other entry: the bytes it
+	 * names are then this entry's, whatever follows.
 	 */
-	bool		(*insert) (Relation idx, ChunkIndexEntry *entry, bool *added);
+	bool		(*insert) (Relation idx, ChunkIndexEntry *entry,
+						   ChunkReserveFn reserve, void *arg);
 
 	/*
 	 * Adds drefs and droots to hash's counts, in this transaction (they are

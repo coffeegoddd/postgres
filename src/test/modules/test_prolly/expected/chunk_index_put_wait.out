@@ -31,7 +31,7 @@ t
 step b_dead: SELECT dead FROM test_chunk_log_space('cl');
 dead
 ----
-   1
+   0
 (1 row)
 
 

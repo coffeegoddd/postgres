@@ -46,7 +46,21 @@
 #ifndef PROLLY_CHUNK_LOG_H
 #define PROLLY_CHUNK_LOG_H
 
+#include "storage/relfilelocator.h"
 #include "utils/relcache.h"
+
+/*
+ * Room in a backend's region of a log, prepared for a write: bytes are
+ * reserved from next, before limit.  The caller's, for the time of one
+ * write (a chunk's, or a pack's).
+ */
+typedef struct ChunkLogRun
+{
+	RelFileNumber relnumber;
+	uint64		next;
+	uint64		limit;
+	uint32		generation;		/* the log's, the bytes' (mark_dead's) */
+} ChunkLogRun;
 
 typedef struct ChunkLogRoutine
 {
@@ -64,6 +78,21 @@ typedef struct ChunkLogRoutine
 	uint64		(*append) (Relation rel, const void *data, size_t len);
 
 	/*
+	 * append in its steps, for a caller naming its bytes before they are
+	 * written (an index's entries): prepare makes room for len bytes in this
+	 * backend's region (it may fail); reserve takes len of that room and
+	 * answers where they begin, changing nothing but memory (it does not
+	 * fail); write writes bytes reserved; release keeps the region for the
+	 * next.  Bytes reserved and never written (the write failing, or never
+	 * made) are the reserving entry's, which counts them dead (mark_dead
+	 * takes them, written or not); the region goes on after them.
+	 */
+	void		(*prepare) (Relation rel, size_t len, ChunkLogRun *run);
+	uint64		(*reserve) (Relation rel, ChunkLogRun *run, size_t len);
+	void		(*write) (Relation rel, uint64 loc, const void *data, size_t len);
+	void		(*release) (Relation rel, const ChunkLogRun *run);
+
+	/*
 	 * Reads len bytes of rel's log beginning at loc into dst.  An error if
 	 * they were not all written, or a page they are on is not one of the
 	 * log's.
@@ -74,10 +103,14 @@ typedef struct ChunkLogRoutine
 	uint64		(*end) (Relation rel);
 
 	/*
-	 * Counts len bytes from loc dead: no chunk's any more.  Space all of
-	 * whose bytes are dead is used again for appends.
+	 * Counts len bytes from loc dead: no chunk's any more (written, or
+	 * reserved and never written), of the log's generation given, the run's
+	 * they were reserved in (a tail cut makes the next: bytes of the one
+	 * before on pages it cut are gone).  Space all of whose bytes are dead
+	 * is used again for appends.
 	 */
-	void		(*mark_dead) (Relation rel, uint64 loc, size_t len);
+	void		(*mark_dead) (Relation rel, uint64 loc, size_t len,
+								  uint32 generation);
 
 	/*
 	 * The log's storage's stamp: made with it (and again by a truncation),

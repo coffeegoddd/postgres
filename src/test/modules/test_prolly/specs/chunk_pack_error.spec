@@ -1,8 +1,9 @@
 # A pack whose put fails after one of its entries is on its page (an error
 # in the bucket's split that entry starts, by an injection point of this
-# session's): every byte of the pack is counted dead once, the entries put
-# (rolled back) by VACUUM, the rest at once; none twice.  A chunk put after
-# it keeps the log's tail, which VACUUM would otherwise cut.
+# session's): it wrote none of its bytes; those reserved for the entries it
+# put (rolled back) VACUUM counts dead, each once, and the room left goes
+# to the next put.  A chunk put after it keeps the log's tail, which VACUUM
+# would otherwise cut.
 
 setup
 {
@@ -32,8 +33,16 @@ step e_detach	{ SELECT injection_points_detach('chunk-index-split-published'); }
 step e_live		{ SELECT stored FROM test_cs_put('pages', '\x0a0401'); }
 step e_vacuum	{ VACUUM pg_history.chunk_index; }
 step e_dead		{
-	SELECT l.dead - d.dead AS more_dead, 3000 * 5 AS pack_bytes
-	FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
+	SELECT more_dead > 0 AND more_dead < 3000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
+	FROM (SELECT l.dead - d.dead AS more_dead
+		  FROM test_chunk_log_space('pg_history.chunks') l, dead0 d) x;
+}
+step e_same		{
+	DROP TABLE IF EXISTS dead1;
+	CREATE TEMP TABLE dead1 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+}
+step e_again	{
+	SELECT l.dead = d.dead AS counted_once FROM test_chunk_log_space('pg_history.chunks') l, dead1 d;
 }
 step e_none		{
 	SELECT count(*) FILTER (WHERE test_cs_has('pages', pack_h('\x4c'::bytea || int4send(i)))) AS there
@@ -41,4 +50,4 @@ step e_none		{
 }
 step e_free		{ SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0401')]) AS freed; }
 
-permutation e_start e_mark e_attach e_pack e_detach e_live e_vacuum e_dead e_none e_free
+permutation e_start e_mark e_attach e_pack e_detach e_live e_vacuum e_dead e_same e_vacuum e_again e_none e_free
