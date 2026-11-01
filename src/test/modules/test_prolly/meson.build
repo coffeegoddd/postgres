@@ -6,6 +6,7 @@ test_prolly_sources = files(
   'branch_conformance.c',
   'chunk_index_checks.c',
   'chunk_log_checks.c',
+  'chunk_store_conformance.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_branch_filter.c',
@@ -59,6 +60,8 @@ tests += {
       'chunk_free',
       'chunk_reclaim',
       'history_pointers',
+      'chunk_store_pages',
+      'chunk_store_memory',
     ],
   },
   'isolation': {

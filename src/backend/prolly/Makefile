@@ -21,9 +21,11 @@ OBJS = \
 	chunk_freer.o \
 	chunk_index.o \
 	chunk_log.o \
+	chunk_memstore.o \
 	chunk_pin.o \
 	chunk_pointers.o \
 	chunk_store.o \
+	chunkstore.o \
 	registry.o
 
 include $(top_srcdir)/src/backend/common.mk

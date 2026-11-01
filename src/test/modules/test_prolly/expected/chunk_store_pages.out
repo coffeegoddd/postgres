@@ -1,0 +1,328 @@
+-- The chunk store conformance suite against "pages", the history store of
+-- this database, and its transactional part.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+-- (chunks nothing holds kept: no freer in the background)
+SET chunk_free_in_background = off;
+-- every store registered runs the suite, in a file chunk_store_<name>.sql
+SELECT * FROM test_chunk_stores() ORDER BY name;
+  name  | transactional 
+--------+---------------
+ memory | f
+ pages  | t
+(2 rows)
+
+\set store pages
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set suite :abs_srcdir '/sql/chunk_store_suite.inc'
+\i :suite
+-- The chunk store conformance suite, run against the store named :store
+-- (chunk_store_<store>.sql).  Every statement its own transaction, so that
+-- a put's pins, which last until its transaction ends, are let go of.
+SELECT test_chunk_format_refs(true);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+-- (a chunk of the test format referencing others: 'R', their count, them)
+CREATE FUNCTION pg_temp.parent(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
+		(SELECT string_agg(pg_temp.h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
+CREATE FUNCTION pg_temp.put(d bytea) RETURNS bool LANGUAGE sql
+	AS $$SELECT test_cs_put(current_setting('test.store'), pg_temp.h(d), d)$$;
+CREATE FUNCTION pg_temp.free(d bytea) RETURNS int8 LANGUAGE sql
+	AS $$SELECT test_cs_free(current_setting('test.store'), pg_temp.h(d))$$;
+SELECT set_config('test.store', :'store', false) IS NOT NULL AS store_set;
+ store_set 
+-----------
+ t
+(1 row)
+
+-- (an error's message, or none: what is refused, shown as the same in
+-- every store's output)
+CREATE FUNCTION pg_temp.refused(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'not refused';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLERRM;
+END$$;
+-- puts, has, get, counts
+SELECT pg_temp.put('cs-leaf-a') AS a, pg_temp.put('cs-leaf-b') AS b,
+	pg_temp.put('cs-leaf-a') AS a_again;
+ a | b | a_again 
+---+---+---------
+ t | t | f
+(1 row)
+
+SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-a')) AS has_a,
+	test_cs_has(:'store', pg_temp.h('cs-nowhere')) AS has_nowhere,
+	convert_from(test_cs_get(:'store', pg_temp.h('cs-leaf-a')), 'UTF8') AS get_a,
+	test_cs_get(:'store', pg_temp.h('cs-nowhere')) IS NULL AS get_nowhere;
+ has_a | has_nowhere |   get_a   | get_nowhere 
+-------+-------------+-----------+-------------
+ t     | f           | cs-leaf-a | t
+(1 row)
+
+SELECT * FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-a'));
+ refs | roots 
+------+-------
+    0 |     0
+(1 row)
+
+SELECT * FROM test_cs_counts(:'store', pg_temp.h('cs-nowhere'));
+ refs | roots 
+------+-------
+      |      
+(1 row)
+
+-- refused: bytes that aren't their hash's, a reference to a chunk not there
+SELECT pg_temp.refused($$SELECT test_cs_put(current_setting('test.store'), pg_temp.h('cs-x'), 'cs-y')$$);
+                                    refused                                    
+-------------------------------------------------------------------------------
+ bytes put as chunk ff0230e20f92722c992053f8a6fde4a4b10ab448 do not hash to it
+(1 row)
+
+SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))$$);
+                                                                 refused                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------
+ chunk 234064f1a5b1ab4eee7cacd785435076469f1b5a references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+(1 row)
+
+SELECT test_cs_has(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))) AS refused_there;
+ refused_there 
+---------------
+ f
+(1 row)
+
+-- references, counted per edge
+SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
+ p 
+---
+ t
+(1 row)
+
+SELECT (SELECT refs FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-a'))) AS a_refs,
+	(SELECT refs FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-b'))) AS b_refs,
+	(SELECT refs FROM test_cs_counts(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')))) AS p_refs;
+ a_refs | b_refs | p_refs 
+--------+--------+--------
+      1 |      2 |      0
+(1 row)
+
+-- roots; refused: of a chunk not there, and below none
+SELECT test_cs_ref_root(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+SELECT roots FROM test_cs_counts(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
+ roots 
+-------
+     1
+(1 row)
+
+SELECT pg_temp.refused($$SELECT test_cs_ref_root(current_setting('test.store'), pg_temp.h('cs-nowhere'))$$);
+                             refused                             
+-----------------------------------------------------------------
+ the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+(1 row)
+
+SELECT pg_temp.refused($$SELECT test_cs_unref_root(current_setting('test.store'), pg_temp.h('cs-nowhere'))$$);
+                             refused                             
+-----------------------------------------------------------------
+ the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+(1 row)
+
+SELECT pg_temp.refused($$SELECT test_cs_unref_root(current_setting('test.store'), pg_temp.h('cs-leaf-a'))$$);
+                   refused                    
+----------------------------------------------
+ a chunk's reference counts would be 1 and -1
+(1 row)
+
+-- freeing: nothing held is freed; a chunk let go of goes, and what it alone held
+SELECT pg_temp.free('cs-leaf-b') AS b_held_by_p,
+	pg_temp.free(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p_rooted;
+ b_held_by_p | p_rooted 
+-------------+----------
+           0 |        0
+(1 row)
+
+SELECT test_cs_unref_root(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
+ test_cs_unref_root 
+--------------------
+ 
+(1 row)
+
+SELECT pg_temp.free(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p_and_its_leaves;
+ p_and_its_leaves 
+------------------
+                3
+(1 row)
+
+SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-a')) AS has_a,
+	test_cs_has(:'store', pg_temp.h('cs-leaf-b')) AS has_b;
+ has_a | has_b 
+-------+-------
+ f     | f
+(1 row)
+
+-- a chunk is pinned until its put's transaction ends
+BEGIN;
+SELECT pg_temp.put('cs-leaf-d') AS d;
+ d 
+---
+ t
+(1 row)
+
+SELECT pg_temp.free('cs-leaf-d') AS d_pinned;
+ d_pinned 
+----------
+        0
+(1 row)
+
+COMMIT;
+SELECT pg_temp.free('cs-leaf-d') AS d_freed;
+ d_freed 
+---------
+       1
+(1 row)
+
+-- and found already there, too
+SELECT pg_temp.put('cs-leaf-e') AS e;
+ e 
+---
+ t
+(1 row)
+
+BEGIN;
+SELECT pg_temp.put('cs-leaf-e') AS e_again;
+ e_again 
+---------
+ f
+(1 row)
+
+SELECT pg_temp.free('cs-leaf-e') AS e_pinned;
+ e_pinned 
+----------
+        0
+(1 row)
+
+COMMIT;
+-- every chunk nothing holds
+SELECT test_cs_free_unheld(:'store') > 0 AS freed_some;
+ freed_some 
+------------
+ t
+(1 row)
+
+SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-e')) AS has_e;
+ has_e 
+-------
+ f
+(1 row)
+
+SELECT test_cs_check(:'store') AS audit;
+ audit 
+-------
+ t
+(1 row)
+
+SELECT test_chunk_format_refs(false);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+\set suite :abs_srcdir '/sql/chunk_store_transactional.inc'
+\i :suite
+-- The transactional stores' part of the suite: a put, a root's change and
+-- a free are their transaction's, gone if it aborts.
+SELECT test_chunk_format_refs(true);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+BEGIN;
+SELECT pg_temp.put('cs-tx-f') AS f;
+ f 
+---
+ t
+(1 row)
+
+ROLLBACK;
+SELECT test_cs_has(:'store', pg_temp.h('cs-tx-f')) AS f_after_abort;
+ f_after_abort 
+---------------
+ f
+(1 row)
+
+SELECT pg_temp.put('cs-tx-g') AS g;
+ g 
+---
+ t
+(1 row)
+
+BEGIN;
+SELECT test_cs_ref_root(:'store', pg_temp.h('cs-tx-g'));
+ test_cs_ref_root 
+------------------
+ 
+(1 row)
+
+SELECT roots FROM test_cs_counts(:'store', pg_temp.h('cs-tx-g'));
+ roots 
+-------
+     1
+(1 row)
+
+ROLLBACK;
+SELECT roots FROM test_cs_counts(:'store', pg_temp.h('cs-tx-g'));
+ roots 
+-------
+     0
+(1 row)
+
+BEGIN;
+SELECT pg_temp.free('cs-tx-g') AS g_freed;
+ g_freed 
+---------
+       1
+(1 row)
+
+SELECT test_cs_has(:'store', pg_temp.h('cs-tx-g')) AS g_in_its_transaction;
+ g_in_its_transaction 
+----------------------
+ f
+(1 row)
+
+ROLLBACK;
+SELECT test_cs_has(:'store', pg_temp.h('cs-tx-g')) AS g_after_abort;
+ g_after_abort 
+---------------
+ t
+(1 row)
+
+SELECT pg_temp.free('cs-tx-g') AS g_freed;
+ g_freed 
+---------
+       1
+(1 row)
+
+SELECT test_cs_check(:'store') AS audit;
+ audit 
+-------
+ t
+(1 row)
+
+SELECT test_chunk_format_refs(false);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+

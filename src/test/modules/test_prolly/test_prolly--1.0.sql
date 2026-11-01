@@ -375,3 +375,47 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_chunk_log_space(rel regclass,
 	OUT pages int4, OUT full_pages int4, OUT dead int8, OUT free_pages int4)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+-- The engine's chunk store interface, by store name.
+CREATE FUNCTION test_chunk_stores(OUT name text, OUT transactional bool)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_put(store text, hash bytea, data bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_get(store text, hash bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_has(store text, hash bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_ref_root(store text, hash bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_unref_root(store text, hash bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_counts(store text, hash bytea, OUT refs int8, OUT roots int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_free(store text, hash bytea)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_free_unheld(store text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_check(store text)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_reset_memory()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

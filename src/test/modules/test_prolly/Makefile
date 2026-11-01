@@ -8,6 +8,7 @@ OBJS = \
 	branch_conformance.o \
 	chunk_index_checks.o \
 	chunk_log_checks.o \
+	chunk_store_conformance.o \
 	test_checksum.o \
 	test_prolly.o \
 	unit_branch_filter.o \
@@ -24,7 +25,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
 	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
 	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_reclaim \
-	history_pointers
+	history_pointers chunk_store_pages chunk_store_memory
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait
 REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf
 ISOLATION_OPTS = --temp-config=$(srcdir)/chunk_store.conf
