@@ -45,6 +45,8 @@ patch contrib/Makefile         0  builds the fork's extensions under contrib/pro
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
 patch doc/src/sgml/config.sgml  1b  catalog_branch
+patch doc/src/sgml/libpq.sgml  1b  catalog_branch is reported
+patch doc/src/sgml/protocol.sgml  1b  catalog_branch is reported
 patch doc/src/sgml/ref/create_schema.sgml  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)

@@ -1528,6 +1528,7 @@ SELCT 1/0;<!-- this typo is intentional -->
     ParameterStatus will be generated.  They are:
     <simplelist type="vert" columns="2">
      <member><varname>application_name</varname></member>
+     <member><varname>catalog_branch</varname></member>
      <member><varname>client_encoding</varname></member>
      <member><varname>DateStyle</varname></member>
      <member><varname>default_transaction_read_only</varname></member>

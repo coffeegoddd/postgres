@@ -2264,11 +2264,11 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	ExtensionCheckNameFree(extName, schemaOid);
 
 	/* (made from a branch, in a shared schema: every branch has it) */
-	if (catalog_branch != 0 && NamespaceBranch(schemaOid) == 0)
+	if (catalog_branch != 0 && !IsBinaryUpgrade &&
+		NamespaceBranch(schemaOid) == 0)
 		ereport(NOTICE,
-				(errmsg("extension \"%s\" is shared: schema \"%s\" is not versioned",
-						extName, get_namespace_name(schemaOid)),
-				 errhint("To make it this branch's own, create it WITH SCHEMA a versioned schema.")));
+				(errmsg("extension \"%s\" is shared by every branch: schema \"%s\" is not versioned",
+						extName, get_namespace_name(schemaOid))));
 
 	/*
 	 * Build and insert the pg_extension tuple

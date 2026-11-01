@@ -252,7 +252,8 @@ versioned_namespace_exists(const char *nspname)
  * name with the same hash merely waits.  A shared schema's maker takes it
  * exclusively; a versioned one's shares it, as versioned schemas of one
  * name on different branches do not conflict (and on one branch the
- * unique index keeps one).
+ * unique index keeps one: the later of two makers of one name fails there,
+ * as two makers of a schema do in Postgres).
  */
 static void
 lock_namespace_name(const char *nspname, int32 branch)

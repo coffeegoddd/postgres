@@ -11,8 +11,7 @@ CREATE SCHEMA app VERSIONED;
 -- a shared extension serves both branches
 SET catalog_branch = :b1;
 CREATE EXTENSION hstore SCHEMA pub;
-NOTICE:  extension "hstore" is shared: schema "pub" is not versioned
-HINT:  To make it this branch's own, create it WITH SCHEMA a versioned schema.
+NOTICE:  extension "hstore" is shared by every branch: schema "pub" is not versioned
 SET catalog_branch = :b2;
 SELECT ('a=>1'::pub.hstore) OPERATOR(pub.->) 'a' AS from_b2;
  from_b2 
