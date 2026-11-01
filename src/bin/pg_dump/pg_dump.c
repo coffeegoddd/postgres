@@ -374,6 +374,8 @@ static const char *getFormattedTypeName(Archive *fout, Oid oid, OidOptions opts)
 static void getLOs(Archive *fout);
 static void dumpLO(Archive *fout, const LoInfo *loinfo);
 static int	dumpLOs(Archive *fout, const void *arg);
+static void getHistory(Archive *fout);
+static int	dumpHistoryData(Archive *fout, const void *arg);
 static void dumpPolicy(Archive *fout, const PolicyInfo *polinfo);
 static void dumpPublication(Archive *fout, const PublicationInfo *pubinfo);
 static void dumpPublicationTable(Archive *fout, const PublicationRelInfo *pubrinfo);
@@ -517,6 +519,7 @@ main(int argc, char **argv)
 		{"no-comments", no_argument, &dopt.no_comments, 1},
 		{"no-data", no_argument, NULL, 19},
 		{"no-policies", no_argument, &dopt.no_policies, 1},
+		{"no-history", no_argument, &dopt.no_history, 1},
 		{"no-publications", no_argument, &dopt.no_publications, 1},
 		{"no-schema", no_argument, NULL, 20},
 		{"no-security-labels", no_argument, &dopt.no_security_labels, 1},
@@ -1149,6 +1152,11 @@ main(int argc, char **argv)
 	if (dopt.outputLOs || dopt.binary_upgrade)
 		getLOs(fout);
 
+	/* (the database's own: a whole database's dump alone) */
+	if (dopt.include_everything && dopt.dumpData && !dopt.no_history &&
+		!dopt.binary_upgrade)
+		getHistory(fout);
+
 	/*
 	 * Collect dependency data to assist in ordering the objects.
 	 */
@@ -1353,6 +1361,7 @@ help(const char *progname)
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
 	printf(_("  --no-comments                do not dump comment commands\n"));
 	printf(_("  --no-data                    do not dump data\n"));
+	printf(_("  --no-history                 do not dump the version-control history store\n"));
 	printf(_("  --no-policies                do not dump row security policies\n"));
 	printf(_("  --no-publications            do not dump publications\n"));
 	printf(_("  --no-schema                  do not dump schema\n"));
@@ -4145,6 +4154,117 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
 	}
 
 	destroyPQExpBuffer(cquery);
+}
+
+/*
+ * getHistory:
+ *	The database's version-control history store, if the server has one
+ *	and it has chunks or pointers: its chunks, each after those it
+ *	references, and then its pointers.  A role that cannot read it may not
+ *	dump the database whole but with --no-history (history is never left
+ *	out unless asked).
+ */
+static void
+getHistory(Archive *fout)
+{
+	PGresult   *res;
+	HistoryDataInfo *chunks;
+	HistoryDataInfo *pointers;
+	bool		has;
+
+	res = ExecuteSqlQueryForSingleRow(fout,
+									  "SELECT to_regprocedure('pg_catalog.pg_history_export()') IS NOT NULL");
+	has = PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	if (!has)
+		return;
+	res = ExecuteSqlQueryForSingleRow(fout,
+									  "SELECT has_function_privilege('pg_catalog.pg_history_export()', 'EXECUTE') "
+									  "AND has_table_privilege('pg_history.pointers', 'SELECT')");
+	has = PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	if (!has)
+		pg_fatal("this role cannot read the version-control history store, which pg_dump would dump with the database; "
+				 "dump as a role that can, or use --no-history to leave it out");
+	res = ExecuteSqlQueryForSingleRow(fout,
+									  "SELECT pg_catalog.pg_history_has_chunks() "
+									  "OR EXISTS (SELECT 1 FROM pg_history.pointers)");
+	has = PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	if (!has)
+		return;
+
+	chunks = pg_malloc0_object(HistoryDataInfo);
+	chunks->dobj.objType = DO_HISTORY_DATA;
+	chunks->dobj.catId = nilCatalogId;
+	AssignDumpId(&chunks->dobj);
+	chunks->dobj.name = pg_strdup("HISTORY CHUNKS");
+	chunks->dobj.components |= DUMP_COMPONENT_DATA;
+	chunks->dobj.dump = DUMP_COMPONENT_DATA;
+	chunks->query = "COPY (SELECT hash, data FROM pg_catalog.pg_history_export()) TO stdout;";
+	chunks->copyStmt = "COPY pg_history.chunk_restore (hash, data) FROM stdin;\n";
+
+	pointers = pg_malloc0_object(HistoryDataInfo);
+	pointers->dobj.objType = DO_HISTORY_DATA;
+	pointers->dobj.catId = nilCatalogId;
+	AssignDumpId(&pointers->dobj);
+	pointers->dobj.name = pg_strdup("HISTORY POINTERS");
+	pointers->dobj.components |= DUMP_COMPONENT_DATA;
+	pointers->dobj.dump = DUMP_COMPONENT_DATA;
+	pointers->query = "COPY (SELECT name, hash FROM pg_history.pointers ORDER BY name) TO stdout;";
+	pointers->copyStmt = "COPY pg_history.pointers (name, hash) FROM stdin;\n";
+	/* (each pointer's chunk restored first) */
+	addObjectDependency(&pointers->dobj, chunks->dobj.dumpId);
+}
+
+/*
+ * dumpHistoryData:
+ *	a HistoryDataInfo's rows, as COPY's
+ */
+static int
+dumpHistoryData(Archive *fout, const void *arg)
+{
+	const HistoryDataInfo *hinfo = arg;
+	PGconn	   *conn = GetConnection(fout);
+	PGresult   *res;
+	char	   *copybuf;
+	int			ret;
+
+	pg_log_info("dumping the history store's %s",
+				strcmp(hinfo->dobj.name, "HISTORY CHUNKS") == 0 ? "chunks" : "pointers");
+	res = ExecuteSqlQuery(fout, hinfo->query, PGRES_COPY_OUT);
+	PQclear(res);
+	for (;;)
+	{
+		ret = PQgetCopyData(conn, &copybuf, 0);
+		if (ret < 0)
+			break;
+		if (copybuf)
+		{
+			WriteData(fout, copybuf, ret);
+			PQfreemem(copybuf);
+		}
+	}
+	archprintf(fout, "\\.\n\n\n");
+	if (ret == -2)
+	{
+		pg_log_error("Dumping the history store failed: PQgetCopyData() failed.");
+		pg_log_error_detail("Error message from server: %s", PQerrorMessage(conn));
+		pg_log_error_detail("Command was: %s", hinfo->query);
+		exit_nicely(1);
+	}
+	res = PQgetResult(conn);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		pg_log_error("Dumping the history store failed: PQgetResult() failed.");
+		pg_log_error_detail("Error message from server: %s", PQerrorMessage(conn));
+		pg_log_error_detail("Command was: %s", hinfo->query);
+		exit_nicely(1);
+	}
+	PQclear(res);
+	if (PQgetResult(conn) != NULL)
+		pg_log_warning("unexpected extra results during COPY of the history store");
+	return 1;
 }
 
 /*
@@ -11823,6 +11943,25 @@ dumpDumpableObject(Archive *fout, DumpableObject *dobj)
 			break;
 		case DO_LARGE_OBJECT:
 			dumpLO(fout, (const LoInfo *) dobj);
+			break;
+		case DO_HISTORY_DATA:
+			if (dobj->dump & DUMP_COMPONENT_DATA)
+			{
+				const HistoryDataInfo *hinfo = (const HistoryDataInfo *) dobj;
+				TocEntry   *te;
+
+				te = ArchiveEntry(fout, dobj->catId, dobj->dumpId,
+								  ARCHIVE_OPTS(.tag = dobj->name,
+											   .description = "HISTORY DATA",
+											   .section = SECTION_DATA,
+											   .copyStmt = hinfo->copyStmt,
+											   .deps = dobj->dependencies,
+											   .nDeps = dobj->nDeps,
+											   .dumpFn = dumpHistoryData,
+											   .dumpArg = hinfo));
+				/* (no cheap estimate of its size) */
+				te->dataLength = 8192;
+			}
 			break;
 		case DO_LARGE_OBJECT_DATA:
 			if (dobj->dump & DUMP_COMPONENT_DATA)
@@ -20446,6 +20585,7 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
 			case DO_SEQUENCE_SET:
 			case DO_LARGE_OBJECT:
 			case DO_LARGE_OBJECT_DATA:
+			case DO_HISTORY_DATA:
 				/* Data objects: must come between the boundaries */
 				addObjectDependency(dobj, preDataBound->dumpId);
 				addObjectDependency(postDataBound, dobj->dumpId);

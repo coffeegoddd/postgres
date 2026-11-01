@@ -153,6 +153,8 @@ tests += {
       't/060_chunk_index_redo_readers.pl',
       't/061_history_backups.pl',
       't/062_chunk_entries_first.pl',
+      't/063_chunk_abandoned_regions.pl',
+      't/064_history_dump.pl',
       't/066_history_concurrent.pl',
     ],
     'env': {

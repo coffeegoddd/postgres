@@ -1626,3 +1626,18 @@ ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
 -- (the trigger function is the pointers' alone: on another table it would
 -- take and let go of roots of any chunk)
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
+
+--
+-- The history store dumped and restored: pg_history_export() its chunks,
+-- each after those it references, and pg_history.chunk_restore a view of
+-- none whose INSERT (pg_restore's COPY) puts one, its bytes checked against
+-- its name.  The pointers, restored after, take their roots.
+--
+CREATE VIEW pg_history.chunk_restore AS
+	SELECT NULL::bytea AS hash, NULL::bytea AS data WHERE false;
+CREATE TRIGGER chunk_restore_put
+	INSTEAD OF INSERT ON pg_history.chunk_restore
+	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_chunk_restore();
+REVOKE ALL ON pg_history.chunk_restore FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_export() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_chunk_restore() FROM PUBLIC;
