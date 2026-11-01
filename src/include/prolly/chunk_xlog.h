@@ -9,11 +9,21 @@
  * to, or bytes of it counted dead.  Its redo makes the same change, by the
  * same code.
  *
- * XLOG_CHUNK_INDEX_CLEANUP_INFO precedes VACUUM's taking freed chunks'
- * entries out of a chunk index: their bytes are then dead, for the log to
- * reuse.  A hot standby's queries whose snapshots might have found one of
- * them before its freeing committed (their xmin no later than the latest
- * freeing transaction's) conflict with it, as with heap pruning's.
+ * The index's records, too, say what changed in their pages, and are
+ * replayed by the code that made the change: an entry added to a page (or
+ * with a page of its own, at a chain's end); a change of a chunk's counts
+ * changed again, or added into its chunk's entry; a chunk freed; a page's
+ * entries kept in part (a purge, a split's old bucket, a removal), or one
+ * taken out; a page made with its contents (a split's new pages, a
+ * directory page); a split made public; the index bound to its log; and
+ * VACUUM's fate of each entry of a page.  An entry is moved whole, flags
+ * and all, as the standby has it, whose hints are its own.
+ *
+ * VACUUM's record of a page that takes out freed chunks' entries (their
+ * bytes then dead, for the log to reuse) has the latest freeing
+ * transaction's id: a hot standby's queries whose snapshots might have
+ * found one of them before its freeing committed (their xmin no later than
+ * it) conflict with it, as with heap pruning's.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -66,20 +76,84 @@ extern const char *chunk_log_identify(uint8 info);
 extern void chunk_log_mask(char *pagedata, BlockNumber blkno);
 
 /* ChunkIndex's */
-#define XLOG_CHUNK_INDEX_CLEANUP_INFO	0x00
+#define XLOG_CHUNK_INDEX_VACUUM		0x00	/* 0: the page; VACUUM's fates */
+#define XLOG_CHUNK_INDEX_ADD_ENTRY	0x10	/* 0: the page; the entry */
+#define XLOG_CHUNK_INDEX_ADD_PAGE	0x20	/* 0: meta, 1: the chain's last,
+											 * 2: the new page */
+#define XLOG_CHUNK_INDEX_SET_COUNTS	0x30	/* 0: the page */
+#define XLOG_CHUNK_INDEX_SET_XMAX	0x40	/* 0: the page */
+#define XLOG_CHUNK_INDEX_KEEP		0x50	/* 0: the page; the slots kept */
+#define XLOG_CHUNK_INDEX_REMOVE_SLOT 0x60	/* 0: the page */
+#define XLOG_CHUNK_INDEX_FOLD		0x70	/* 0: the chunk's page, 1: the
+											 * change's (if another) */
+#define XLOG_CHUNK_INDEX_INIT_PAGE	0x80	/* 0: the page; its contents */
+#define XLOG_CHUNK_INDEX_SPLIT		0x90	/* 0: meta, 1: the old bucket's
+											 * first page, 2: the directory
+											 * page (if not new) */
+#define XLOG_CHUNK_INDEX_BIND_LOG	0xA0	/* 0: meta */
 
-typedef struct xl_chunk_index_cleanup_info
+typedef struct xl_chunk_index_vacuum
 {
-	RelFileLocator locator;		/* the chunk index */
-	TransactionId snapshotConflictHorizon;	/* the latest freeing's */
-} xl_chunk_index_cleanup_info;
+	TransactionId snapshotConflictHorizon;	/* the latest freeing's, or 0 */
+	uint16		nentries;		/* then a fate per entry, block 0's data */
+} xl_chunk_index_vacuum;
 
-#define SizeOfChunkIndexCleanupInfo \
-	(offsetof(xl_chunk_index_cleanup_info, snapshotConflictHorizon) + \
-	 sizeof(TransactionId))
+typedef struct xl_chunk_index_slot
+{
+	uint16		slot;			/* SET_COUNTS, SET_XMAX, REMOVE_SLOT */
+	uint32		refs;			/* SET_COUNTS: the counts after */
+	uint32		roots;
+	TransactionId xmax;			/* SET_XMAX: the freeing transaction */
+} xl_chunk_index_slot;
+
+typedef struct xl_chunk_index_add_page
+{
+	uint32		bucket;			/* the new page's (then the entry, its data) */
+} xl_chunk_index_add_page;
+
+typedef struct xl_chunk_index_keep
+{
+	uint16		nkept;			/* then the slots kept, in order, its data */
+} xl_chunk_index_keep;
+
+typedef struct xl_chunk_index_fold
+{
+	uint16		chunk_slot;		/* in block 0 */
+	uint16		change_slot;	/* in block 1, or 0 if it is block 0's */
+	uint32		refs;			/* the chunk's counts after */
+	uint32		roots;
+	bool		same_page;
+} xl_chunk_index_fold;
+
+typedef struct xl_chunk_index_init_page
+{
+	uint16		kind;			/* INDEX_PAGE_* */
+	uint32		bucket;
+	uint32		split_at;
+	BlockNumber next;
+	uint32		len;			/* its contents' (block 0's data) */
+} xl_chunk_index_init_page;
+
+typedef struct xl_chunk_index_split
+{
+	uint32		new_bucket;
+	uint32		lowmask;
+	uint32		highmask;
+	BlockNumber first;			/* the new bucket's first page */
+	BlockNumber next_block;		/* the first page not in use, after */
+	BlockNumber dir_block;		/* the directory page of its slot */
+	bool		new_dir;		/* which is new, made before */
+} xl_chunk_index_split;
+
+typedef struct xl_chunk_index_bind_log
+{
+	Oid			log;
+	uint64		stamp;
+} xl_chunk_index_bind_log;
 
 extern void chunk_index_redo(XLogReaderState *record);
 extern void chunk_index_desc(StringInfo buf, XLogReaderState *record);
 extern const char *chunk_index_identify(uint8 info);
+extern void chunk_index_mask(char *pagedata, BlockNumber blkno);
 
 #endif							/* PROLLY_CHUNK_XLOG_H */

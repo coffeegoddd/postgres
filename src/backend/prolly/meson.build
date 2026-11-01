@@ -11,6 +11,5 @@ backend_sources += files(
   'chunk_pin.c',
   'chunk_pointers.c',
   'chunk_store.c',
-  'chunk_xlog.c',
   'registry.c',
 )

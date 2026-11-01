@@ -36,12 +36,14 @@
  */
 #include "postgres.h"
 
-#include "access/generic_xlog.h"
+#include "access/bufmask.h"
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -53,6 +55,7 @@
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "storage/standby.h"
 #include "utils/timestamp.h"
 #include "utils/injection_point.h"
 #include "utils/hsearch.h"
@@ -121,13 +124,6 @@ typedef struct IndexCache
 
 StaticAssertDecl(sizeof(ChunkIndexEntry) == 56,
 				 "a chunk index entry is 56 bytes");
-
-/*
- * A record that moves entries between a page's slots logs the whole page: a
- * delta would leave out bytes the same on the primary, and a standby may
- * have hint flags of its own in them, which would then be another entry's.
- */
-#define MOVES_ENTRIES	GENERIC_XLOG_FULL_IMAGE
 
 typedef enum EntryState
 {
@@ -310,6 +306,177 @@ set_page_entries(Page page, int n)
 {
 	((PageHeader) page)->pd_lower =
 		SizeOfPageHeaderData + n * sizeof(ChunkIndexEntry);
+}
+
+/*
+ * The changes the index makes to its pages, each WAL-logged as a record of
+ * its own (prolly/chunk_xlog.h) and made again by its redo.  An entry is
+ * moved whole: on a standby, with the hint flags it has there.
+ */
+static void
+ipage_add(Page page, const ChunkIndexEntry *e)
+{
+	int			n = page_entries(page);
+
+	*page_entry(page, n) = *e;
+	set_page_entries(page, n + 1);
+}
+
+static void
+ipage_set_counts(Page page, int at, uint32 refs, uint32 roots)
+{
+	page_entry(page, at)->refs = refs;
+	page_entry(page, at)->roots = roots;
+}
+
+static void
+ipage_set_xmax(Page page, int at, TransactionId xmax)
+{
+	ChunkIndexEntry *e = page_entry(page, at);
+
+	e->xmax = xmax;
+	e->flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+}
+
+/* the entries in slots kept (in order) kept, the rest taken out */
+static void
+ipage_keep(Page page, const uint16 *kept, int nkept)
+{
+	for (int k = 0; k < nkept; k++)
+		*page_entry(page, k) = *page_entry(page, kept[k]);
+	set_page_entries(page, nkept);
+}
+
+/* the entry in slot at taken out, the last moved into it */
+static void
+ipage_remove_slot(Page page, int at)
+{
+	int			n = page_entries(page);
+
+	*page_entry(page, at) = *page_entry(page, n - 1);
+	set_page_entries(page, n - 1);
+}
+
+static void
+ipage_make(Page page, uint16 kind, uint32 bucket, uint32 split_at,
+		   BlockNumber next, const void *contents, uint32 len)
+{
+	init_ipage(page, kind, bucket, split_at);
+	((IndexPageOpaque) PageGetSpecialPointer(page))->next = next;
+	if (len > 0)
+		memcpy(PageGetContents(page), contents, len);
+	((PageHeader) page)->pd_lower = SizeOfPageHeaderData + len;
+}
+
+/* a directory page's slot */
+static void
+idir_set(Page page, uint32 slot, BlockNumber blk)
+{
+	((BlockNumber *) PageGetContents(page))[slot] = blk;
+	((PageHeader) page)->pd_lower = Max(((PageHeader) page)->pd_lower,
+										SizeOfPageHeaderData +
+										(slot + 1) * sizeof(BlockNumber));
+}
+
+/* a split made public, in the meta page */
+static void
+imeta_split(Page page, const xl_chunk_index_split *x)
+{
+	IndexMetaData *meta = (IndexMetaData *) PageGetContents(page);
+
+	if (x->new_dir)
+		meta->dir[meta->ndir++] = x->dir_block;
+	meta->maxbucket = x->new_bucket;
+	meta->lowmask = x->lowmask;
+	meta->highmask = x->highmask;
+	meta->next_block = x->next_block;
+	set_meta_lower(page, meta);
+}
+
+/* A WAL record's page, its change made, and what to register it with. */
+typedef struct LoggedPage
+{
+	Buffer		buf;
+	bool		will_init;		/* made anew: no image needed */
+	const void *data;			/* the block's data, or NULL */
+	size_t		len;
+} LoggedPage;
+
+/*
+ * WAL-logs the change just made to the pages, in the critical section that
+ * made it (dirtying them): rec, the record's data
+ */
+static void
+log_index_change(Relation idx, uint8 info, const void *rec, size_t reclen,
+				 const LoggedPage *pages, int npages)
+{
+	XLogRecPtr	lsn;
+
+	for (int i = 0; i < npages; i++)
+		MarkBufferDirty(pages[i].buf);
+	if (!RelationNeedsWAL(idx))
+		return;
+	XLogBeginInsert();
+	if (reclen > 0)
+		XLogRegisterData(rec, reclen);
+	for (int i = 0; i < npages; i++)
+	{
+		XLogRegisterBuffer(i, pages[i].buf,
+						   REGBUF_STANDARD | (pages[i].will_init ? REGBUF_WILL_INIT : 0));
+		if (pages[i].len > 0)
+			XLogRegisterBufData(i, pages[i].data, pages[i].len);
+	}
+	lsn = XLogInsert(RM_CHUNK_INDEX_ID, info);
+	for (int i = 0; i < npages; i++)
+		PageSetLSN(BufferGetPage(pages[i].buf), lsn);
+}
+
+/* a page's entries kept where keep[slot], WAL-logged; false if all are */
+static bool
+keep_entries(Relation idx, Buffer buf, const bool *keep)
+{
+	Page		page = BufferGetPage(buf);
+	int			n = page_entries(page);
+	uint16		kept[PER_PAGE];
+	xl_chunk_index_keep xlrec;
+	LoggedPage lp;
+
+	xlrec.nkept = 0;
+	for (int i = 0; i < n; i++)
+		if (keep[i])
+			kept[xlrec.nkept++] = i;
+	if (xlrec.nkept == n)
+		return false;
+	lp.buf = buf;
+	lp.will_init = false;
+	lp.data = kept;
+	lp.len = xlrec.nkept * sizeof(uint16);
+	START_CRIT_SECTION();
+	ipage_keep(page, kept, xlrec.nkept);
+	log_index_change(idx, XLOG_CHUNK_INDEX_KEEP, &xlrec, sizeof(xlrec), &lp, 1);
+	END_CRIT_SECTION();
+	return true;
+}
+
+/* one page's change of one slot, WAL-logged */
+static void
+log_slot_change(Relation idx, Buffer buf, uint8 info, const xl_chunk_index_slot *xlrec)
+{
+	LoggedPage	lp = {.buf = buf};
+
+	log_index_change(idx, info, xlrec, sizeof(*xlrec), &lp, 1);
+}
+
+/* the entry in slot at taken out, WAL-logged */
+static void
+remove_slot(Relation idx, Buffer buf, int at)
+{
+	xl_chunk_index_slot xlrec = {.slot = at};
+
+	START_CRIT_SECTION();
+	ipage_remove_slot(BufferGetPage(buf), at);
+	log_slot_change(idx, buf, XLOG_CHUNK_INDEX_REMOVE_SLOT, &xlrec);
+	END_CRIT_SECTION();
 }
 
 /*
@@ -523,21 +690,15 @@ find_entry_freeing(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		{
 			int			kept = 0;
 
+			bool		keep[PER_PAGE];
+
 			for (int i = 0; i < n; i++)
-				if (kept_by_purge(page_entry(page, i), bucket, masks))
+				if ((keep[i] = kept_by_purge(page_entry(page, i), bucket, masks)))
 					kept++;
 			if (kept < n)
 			{
-				GenericXLogState *st = GenericXLogStart(rel);
-				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
-				int			k = 0;
-
-				for (int i = 0; i < n; i++)
-					if (kept_by_purge(page_entry(p, i), bucket, masks))
-						*page_entry(p, k++) = *page_entry(p, i);
-				set_page_entries(p, k);
-				GenericXLogFinish(st);
-				n = k;
+				(void) keep_entries(rel, cur, keep);
+				n = kept;
 			}
 		}
 		for (int i = 0; i < n; i++)
@@ -704,70 +865,81 @@ split_bucket(Relation rel)
 	{
 		BlockNumber blk = first + p;
 		Buffer		buf = new_page_buffer(rel, blk);
-		GenericXLogState *st = GenericXLogStart(rel);
-		Page		page = GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE);
 		int			from = p * PER_PAGE;
-		int			n = Min(nmoving - from, (int) PER_PAGE);
+		int			n = Max(Min(nmoving - from, (int) PER_PAGE), 0);
+		xl_chunk_index_init_page xlrec = {
+			.kind = p == 0 ? INDEX_PAGE_BUCKET : INDEX_PAGE_OVERFLOW,
+			.bucket = new_b,
+			.split_at = new_b,
+			.next = p + 1 < npages ? blk + 1 : InvalidBlockNumber,
+			.len = n * sizeof(ChunkIndexEntry),
+		};
+		LoggedPage	lp = {.buf = buf, .will_init = true,
+			.data = moving + from, .len = xlrec.len};
 
-		init_ipage(page, p == 0 ? INDEX_PAGE_BUCKET : INDEX_PAGE_OVERFLOW,
-				   new_b, new_b);
-		if (p + 1 < npages)
-			((IndexPageOpaque) PageGetSpecialPointer(page))->next = blk + 1;
-		if (n > 0)
-			memcpy(page_entry(page, 0), moving + from, n * sizeof(ChunkIndexEntry));
-		set_page_entries(page, Max(n, 0));
-		GenericXLogFinish(st);
+		START_CRIT_SECTION();
+		ipage_make(BufferGetPage(buf), xlrec.kind, xlrec.bucket, xlrec.split_at,
+				   xlrec.next, moving + from, xlrec.len);
+		log_index_change(rel, XLOG_CHUNK_INDEX_INIT_PAGE, &xlrec, sizeof(xlrec), &lp, 1);
+		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 	}
 	if (new_dir)
 	{
 		Buffer		buf;
-		GenericXLogState *st;
-		Page		page;
+		uint32		slot = new_b % DIR_PER_PAGE;
+		BlockNumber *slots = palloc0((slot + 1) * sizeof(BlockNumber));
+		xl_chunk_index_init_page xlrec = {
+			.kind = INDEX_PAGE_DIR,
+			.next = InvalidBlockNumber,
+			.len = (slot + 1) * sizeof(BlockNumber),
+		};
+		LoggedPage	lp = {.will_init = true, .data = slots, .len = xlrec.len};
 
 		dir_blk = meta->next_block;
+		slots[slot] = first;
 		buf = new_page_buffer(rel, dir_blk);
-		st = GenericXLogStart(rel);
-		page = GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE);
-		init_ipage(page, INDEX_PAGE_DIR, 0, 0);
-		((BlockNumber *) PageGetContents(page))[new_b % DIR_PER_PAGE] = first;
-		((PageHeader) page)->pd_lower = SizeOfPageHeaderData +
-			(new_b % DIR_PER_PAGE + 1) * sizeof(BlockNumber);
-		GenericXLogFinish(st);
+		lp.buf = buf;
+		START_CRIT_SECTION();
+		ipage_make(BufferGetPage(buf), INDEX_PAGE_DIR, 0, 0, InvalidBlockNumber,
+				   slots, xlrec.len);
+		log_index_change(rel, XLOG_CHUNK_INDEX_INIT_PAGE, &xlrec, sizeof(xlrec), &lp, 1);
+		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
+		pfree(slots);
 	}
 	else
 		dir_blk = meta->dir[new_b / DIR_PER_PAGE];
 
 	/* one record makes it a bucket */
 	{
-		GenericXLogState *st = GenericXLogStart(rel);
-		Page		mpage = GenericXLogRegisterBuffer(st, mbuf, 0);
-		Page		opage = GenericXLogRegisterBuffer(st, primary, 0);
+		xl_chunk_index_split xlrec = {
+			.new_bucket = new_b,
+			.lowmask = lowmask,
+			.highmask = highmask,
+			.first = first,
+			.next_block = first + npages,
+			.dir_block = dir_blk,
+			.new_dir = new_dir,
+		};
+		LoggedPage	lps[3] = {{.buf = mbuf}, {.buf = primary}};
 		Buffer		dbuf = InvalidBuffer;
 
 		if (!new_dir)
 		{
-			Page		dpage;
-
 			dbuf = ReadBuffer(rel, dir_blk);
 			LockBuffer(dbuf, BUFFER_LOCK_EXCLUSIVE);
 			check_ipage(rel, dir_blk, BufferGetPage(dbuf), INDEX_PAGE_DIR);
-			dpage = GenericXLogRegisterBuffer(st, dbuf, 0);
-			((BlockNumber *) PageGetContents(dpage))[new_b % DIR_PER_PAGE] = first;
-			((PageHeader) dpage)->pd_lower = SizeOfPageHeaderData +
-				(new_b % DIR_PER_PAGE + 1) * sizeof(BlockNumber);
+			lps[2].buf = dbuf;
 		}
-		meta = (IndexMetaData *) PageGetContents(mpage);
-		if (new_dir)
-			meta->dir[meta->ndir++] = dir_blk;
-		meta->maxbucket = new_b;
-		meta->lowmask = lowmask;
-		meta->highmask = highmask;
-		meta->next_block = first + npages;
-		set_meta_lower(mpage, meta);
-		((IndexPageOpaque) PageGetSpecialPointer(opage))->split_at = new_b;
-		GenericXLogFinish(st);
+		START_CRIT_SECTION();
+		imeta_split(BufferGetPage(mbuf), &xlrec);
+		((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at = new_b;
+		if (!new_dir)
+			idir_set(BufferGetPage(dbuf), new_b % DIR_PER_PAGE, first);
+		log_index_change(rel, XLOG_CHUNK_INDEX_SPLIT, &xlrec, sizeof(xlrec),
+						 lps, new_dir ? 2 : 3);
+		END_CRIT_SECTION();
 		if (BufferIsValid(dbuf))
 			UnlockReleaseBuffer(dbuf);
 	}
@@ -785,23 +957,11 @@ split_bucket(Relation rel)
 			Page		page = BufferGetPage(cur);
 			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			int			n = page_entries(page);
-			int			kept = 0;
+			bool		keep[PER_PAGE];
 
 			for (int i = 0; i < n; i++)
-				if (belongs(page_entry(page, i), old_b, &masks))
-					kept++;
-			if (kept < n)
-			{
-				GenericXLogState *st = GenericXLogStart(rel);
-				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
-				int			k = 0;
-
-				for (int i = 0; i < n; i++)
-					if (belongs(page_entry(p, i), old_b, &masks))
-						*page_entry(p, k++) = *page_entry(p, i);
-				set_page_entries(p, k);
-				GenericXLogFinish(st);
-			}
+				keep[i] = belongs(page_entry(page, i), old_b, &masks);
+			(void) keep_entries(rel, cur, keep);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))
@@ -927,21 +1087,21 @@ add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
 	if (BlockNumberIsValid(space))
 	{
 		Buffer		buf = primary;
-		GenericXLogState *st;
-		Page		page;
-		int			n;
+		LoggedPage	lp;
 
 		if (space != BufferGetBlockNumber(primary))
 		{
 			buf = ReadBuffer(idx, space);
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		}
-		st = GenericXLogStart(idx);
-		page = GenericXLogRegisterBuffer(st, buf, 0);
-		n = page_entries(page);
-		*page_entry(page, n) = *entry;
-		set_page_entries(page, n + 1);
-		GenericXLogFinish(st);
+		lp.buf = buf;
+		lp.will_init = false;
+		lp.data = entry;
+		lp.len = sizeof(*entry);
+		START_CRIT_SECTION();
+		ipage_add(BufferGetPage(buf), entry);
+		log_index_change(idx, XLOG_CHUNK_INDEX_ADD_ENTRY, NULL, 0, &lp, 1);
+		END_CRIT_SECTION();
 		if (buf == primary)
 			return false;
 		UnlockReleaseBuffer(buf);
@@ -955,10 +1115,8 @@ add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
 		Buffer		nbuf;
 		IndexMetaData *meta;
 		BlockNumber blk;
-		GenericXLogState *st;
-		Page		mpage;
-		Page		lpage;
-		Page		npage;
+		xl_chunk_index_add_page xlrec = {.bucket = bucket};
+		LoggedPage	lps[3];
 
 		if (last != BufferGetBlockNumber(primary))
 		{
@@ -973,16 +1131,17 @@ add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("chunk index \"%s\" is full", RelationGetRelationName(idx))));
 		nbuf = new_page_buffer(idx, blk);
-		st = GenericXLogStart(idx);
-		mpage = GenericXLogRegisterBuffer(st, mbuf, 0);
-		lpage = GenericXLogRegisterBuffer(st, lbuf, 0);
-		npage = GenericXLogRegisterBuffer(st, nbuf, GENERIC_XLOG_FULL_IMAGE);
-		((IndexMetaData *) PageGetContents(mpage))->next_block = blk + 1;
-		((IndexPageOpaque) PageGetSpecialPointer(lpage))->next = blk;
-		init_ipage(npage, INDEX_PAGE_OVERFLOW, bucket, 0);
-		*page_entry(npage, 0) = *entry;
-		set_page_entries(npage, 1);
-		GenericXLogFinish(st);
+		lps[0] = (LoggedPage) {.buf = mbuf};
+		lps[1] = (LoggedPage) {.buf = lbuf};
+		lps[2] = (LoggedPage) {.buf = nbuf, .will_init = true,
+			.data = entry, .len = sizeof(*entry)};
+		START_CRIT_SECTION();
+		((IndexMetaData *) PageGetContents(BufferGetPage(mbuf)))->next_block = blk + 1;
+		((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(lbuf)))->next = blk;
+		ipage_make(BufferGetPage(nbuf), INDEX_PAGE_OVERFLOW, bucket, 0,
+				   InvalidBlockNumber, entry, sizeof(*entry));
+		log_index_change(idx, XLOG_CHUNK_INDEX_ADD_PAGE, &xlrec, sizeof(xlrec), lps, 3);
+		END_CRIT_SECTION();
 		UnlockReleaseBuffer(nbuf);
 		UnlockReleaseBuffer(mbuf);
 		if (lbuf != primary)
@@ -1189,16 +1348,18 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		/* this transaction's change of the chunk's counts, changed again */
 		Buffer		buf = own_blk == BufferGetBlockNumber(primary) ? primary :
 			ReadBuffer(idx, own_blk);
-		GenericXLogState *st;
 		ChunkIndexEntry *e;
+		xl_chunk_index_slot xlrec = {.slot = own_at};
 
 		if (buf != primary)
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		st = GenericXLogStart(idx);
-		e = page_entry(GenericXLogRegisterBuffer(st, buf, 0), own_at);
-		e->refs = (uint32) ((int32) e->refs + drefs);
-		e->roots = (uint32) ((int32) e->roots + droots);
-		GenericXLogFinish(st);
+		e = page_entry(BufferGetPage(buf), own_at);
+		xlrec.refs = (uint32) ((int32) e->refs + drefs);
+		xlrec.roots = (uint32) ((int32) e->roots + droots);
+		START_CRIT_SECTION();
+		ipage_set_counts(BufferGetPage(buf), own_at, xlrec.refs, xlrec.roots);
+		log_slot_change(idx, buf, XLOG_CHUNK_INDEX_SET_COUNTS, &xlrec);
+		END_CRIT_SECTION();
 		if (buf != primary)
 			UnlockReleaseBuffer(buf);
 	}
@@ -1237,8 +1398,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 				droots;
 	TransactionId running;
 	TransactionId xid;
-	GenericXLogState *st;
-	ChunkIndexEntry *e;
+	xl_chunk_index_slot xlrec = {0};
 
 	PreventCommandIfReadOnly("free a chunk");
 	xid = GetCurrentTransactionId();
@@ -1250,19 +1410,30 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 		return false;
 	}
 	*out = *page_entry(BufferGetPage(found), at);
+
+	/*
+	 * (the chain's pages are each locked to count the changes: the entry's,
+	 * if not the first, let go of meanwhile, nothing changing a chain but
+	 * with its first page locked, as it is)
+	 */
+	if (found != primary)
+		LockBuffer(found, BUFFER_LOCK_UNLOCK);
 	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
 				  true, &drefs, &droots, &running, NULL, NULL);
+	if (found != primary)
+		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
 	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
 		TransactionIdIsValid(running) || (held && held(hash)))
 	{
 		release_found(primary, found);
 		return false;
 	}
-	st = GenericXLogStart(idx);
-	e = page_entry(GenericXLogRegisterBuffer(st, found, 0), at);
-	e->xmax = xid;
-	e->flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
-	GenericXLogFinish(st);
+	xlrec.slot = at;
+	xlrec.xmax = xid;
+	START_CRIT_SECTION();
+	ipage_set_xmax(BufferGetPage(found), at, xid);
+	log_slot_change(idx, found, XLOG_CHUNK_INDEX_SET_XMAX, &xlrec);
+	END_CRIT_SECTION();
 	pgstat_count_heap_delete(idx);
 	out->refs = 0;
 	out->roots = 0;
@@ -1291,13 +1462,7 @@ page_remove(Relation idx, const uint8 *hash)
 	while (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
 					  false, &found, &at, NULL, NULL, NULL) == ENTRY_VISIBLE)
 	{
-		GenericXLogState *st = GenericXLogStart(idx);
-		Page		page = GenericXLogRegisterBuffer(st, found, MOVES_ENTRIES);
-		int			n = page_entries(page);
-
-		*page_entry(page, at) = *page_entry(page, n - 1);
-		set_page_entries(page, n - 1);
-		GenericXLogFinish(st);
+		remove_slot(idx, found, at);
 		if (found != primary)
 			UnlockReleaseBuffer(found);
 		removed = true;
@@ -1311,23 +1476,11 @@ page_remove(Relation idx, const uint8 *hash)
 			Page		page = BufferGetPage(cur);
 			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			int			n = page_entries(page);
-			int			kept = 0;
+			bool		keep[PER_PAGE];
 
 			for (int i = 0; i < n; i++)
-				if (memcmp(page_entry(page, i)->hash, hash, CHUNK_HASH_LEN) != 0)
-					kept++;
-			if (kept < n)
-			{
-				GenericXLogState *st = GenericXLogStart(idx);
-				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
-				int			k = 0;
-
-				for (int i = 0; i < n; i++)
-					if (memcmp(page_entry(p, i)->hash, hash, CHUNK_HASH_LEN) != 0)
-						*page_entry(p, k++) = *page_entry(p, i);
-				set_page_entries(p, k);
-				GenericXLogFinish(st);
-			}
+				keep[i] = memcmp(page_entry(page, i)->hash, hash, CHUNK_HASH_LEN) != 0;
+			(void) keep_entries(idx, cur, keep);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))
@@ -1483,7 +1636,6 @@ static void
 page_bind_log(Relation idx, Oid log, uint64 stamp)
 {
 	Buffer		mbuf;
-	GenericXLogState *st;
 	IndexMetaData *meta;
 	IndexCache *cache;
 
@@ -1511,11 +1663,16 @@ page_bind_log(Relation idx, Oid log, uint64 stamp)
 						RelationGetRelationName(idx)),
 				 errdetail("Its chunks are of another log, or of this log's storage before it was truncated.")));
 	}
-	st = GenericXLogStart(idx);
-	meta = (IndexMetaData *) PageGetContents(GenericXLogRegisterBuffer(st, mbuf, 0));
-	meta->log = log;
-	meta->log_stamp = stamp;
-	GenericXLogFinish(st);
+	{
+		xl_chunk_index_bind_log xlrec = {.log = log, .stamp = stamp};
+		LoggedPage	lp = {.buf = mbuf};
+
+		START_CRIT_SECTION();
+		meta->log = log;
+		meta->log_stamp = stamp;
+		log_index_change(idx, XLOG_CHUNK_INDEX_BIND_LOG, &xlrec, sizeof(xlrec), &lp, 1);
+		END_CRIT_SECTION();
+	}
 	UnlockReleaseBuffer(mbuf);
 }
 
@@ -1686,11 +1843,9 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 	{
 		Buffer		cbuf,
 					ebuf;
-		GenericXLogState *st;
-		Page		cpage,
-					epage;
-		ChunkIndexEntry *e;
-		int			n;
+		ChunkIndexEntry e;
+		xl_chunk_index_fold xlrec;
+		LoggedPage	lps[2];
 
 		if (!chain_find(idx, primary, committed_change, &increases, &cblk, &cat,
 						&change))
@@ -1706,16 +1861,10 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 			/* (a change of a chunk freed: out with it) */
 			Buffer		buf = cblk == BufferGetBlockNumber(primary) ? primary :
 				ReadBuffer(idx, cblk);
-			Page		p;
 
 			if (buf != primary)
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			st = GenericXLogStart(idx);
-			p = GenericXLogRegisterBuffer(st, buf, MOVES_ENTRIES);
-			n = page_entries(p);
-			*page_entry(p, cat) = *page_entry(p, n - 1);
-			set_page_entries(p, n - 1);
-			GenericXLogFinish(st);
+			remove_slot(idx, buf, cat);
 			if (buf != primary)
 				UnlockReleaseBuffer(buf);
 			continue;
@@ -1727,20 +1876,26 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 			LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
 		if (ebuf != primary && ebuf != cbuf)
 			LockBuffer(ebuf, BUFFER_LOCK_EXCLUSIVE);
-		st = GenericXLogStart(idx);
-		cpage = GenericXLogRegisterBuffer(st, cbuf, MOVES_ENTRIES);
-		epage = ebuf == cbuf ? cpage : GenericXLogRegisterBuffer(st, ebuf, 0);
-		e = page_entry(epage, eat);
-		if (!counts_add(e, (int32) change.refs, (int32) change.roots))
+		e = *page_entry(BufferGetPage(ebuf), eat);
+		if (!counts_add(&e, (int32) change.refs, (int32) change.roots))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("a chunk's reference counts are out of range")));
-		n = page_entries(cpage);
+		xlrec.chunk_slot = eat;
+		xlrec.change_slot = cat;
+		xlrec.refs = e.refs;
+		xlrec.roots = e.roots;
+		xlrec.same_page = ebuf == cbuf;
+		lps[0] = (LoggedPage) {.buf = ebuf};
+		lps[1] = (LoggedPage) {.buf = cbuf};
+		START_CRIT_SECTION();
+		ipage_set_counts(BufferGetPage(ebuf), eat, e.refs, e.roots);
 
 		/* (out by the last entry moved into its slot: the chunk's may be it) */
-		*page_entry(cpage, cat) = *page_entry(cpage, n - 1);
-		set_page_entries(cpage, n - 1);
-		GenericXLogFinish(st);
+		ipage_remove_slot(BufferGetPage(cbuf), cat);
+		log_index_change(idx, XLOG_CHUNK_INDEX_FOLD, &xlrec, sizeof(xlrec),
+						 lps, xlrec.same_page ? 1 : 2);
+		END_CRIT_SECTION();
 		if (ebuf != primary && ebuf != cbuf)
 			UnlockReleaseBuffer(ebuf);
 		if (cbuf != primary)
@@ -1762,21 +1917,33 @@ typedef enum VacuumFate
 } VacuumFate;
 
 /*
- * Before freed chunks' entries are taken out, and their bytes dead, for
- * hot standbys: their queries whose snapshots might have found one before
- * its freeing committed conflict with it (as with heap pruning's), there
- * being no knowing on the primary which chunks those are reading.
+ * VACUUM's fates of a page's entries, made: those taken out out, the rest
+ * frozen or their freeing cleared as their fates say; the entries kept
  */
-static void
-log_cleanup_info(Relation idx, TransactionId horizon)
+static int
+ipage_vacuum(Page page, const uint8 *fates, int n)
 {
-	xl_chunk_index_cleanup_info xlrec;
+	int			k = 0;
 
-	xlrec.locator = idx->rd_locator;
-	xlrec.snapshotConflictHorizon = horizon;
-	XLogBeginInsert();
-	XLogRegisterData(&xlrec, SizeOfChunkIndexCleanupInfo);
-	(void) XLogInsert(RM_CHUNK_INDEX_ID, XLOG_CHUNK_INDEX_CLEANUP_INFO);
+	for (int i = 0; i < n; i++)
+	{
+		ChunkIndexEntry e = *page_entry(page, i);
+
+		if (fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED ||
+			fates[i] == FATE_REMOVE_COPY)
+			continue;
+		if (fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR)
+			e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
+		if (fates[i] == FATE_CLEAR || fates[i] == FATE_FREEZE_CLEAR)
+		{
+			/* (a freeing that aborted, gone with it) */
+			e.flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+			e.xmax = InvalidTransactionId;
+		}
+		*page_entry(page, k++) = e;
+	}
+	set_page_entries(page, k);
+	return k;
 }
 
 /*
@@ -1932,7 +2099,7 @@ ChunkIndexVacuum(Relation idx)
 			Page		page = BufferGetPage(cur);
 			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			int			n = page_entries(page);
-			VacuumFate *fates = palloc(Max(n, 1) * sizeof(VacuumFate));
+			uint8		fates[PER_PAGE];
 			bool		change = false;
 			TransactionId horizon = InvalidTransactionId;
 
@@ -1946,53 +2113,44 @@ ChunkIndexVacuum(Relation idx)
 					 TransactionIdFollows(page_entry(page, i)->xmax, horizon)))
 					horizon = page_entry(page, i)->xmax;
 			}
-			if (TransactionIdIsValid(horizon) && RelationNeedsWAL(idx) &&
-				XLogStandbyInfoActive())
-				log_cleanup_info(idx, horizon);
 			if (change)
 			{
-				GenericXLogState *st = GenericXLogStart(idx);
-				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
-				int			k = 0;
+				/*
+				 * (the latest freeing of a chunk taken out: a hot standby's
+				 * queries whose snapshots might have found one conflict with
+				 * the record, there being no knowing on the primary which
+				 * chunks they are reading)
+				 */
+				xl_chunk_index_vacuum xlrec = {
+					.snapshotConflictHorizon = horizon,
+					.nentries = n,
+				};
+				LoggedPage	lp = {.buf = cur, .data = fates, .len = n};
 
+				/* (a chunk's bytes, dead once its entry is out) */
 				for (int i = 0; i < n; i++)
 				{
-					ChunkIndexEntry e = *page_entry(p, i);
+					ChunkIndexEntry *e = page_entry(page, i);
 
-					if (fates[i] == FATE_REMOVE_COPY)
-						continue;
-					if (fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED)
+					if ((fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED) &&
+						e->kind == CHUNK_KIND_CHUNK && e->len > 0)
 					{
-						/* (a chunk's bytes, dead once its entry is out) */
-						if (e.kind == CHUNK_KIND_CHUNK && e.len > 0)
+						if (ndead == dead_cap)
 						{
-							if (ndead == dead_cap)
-							{
-								dead_cap = dead_cap ? dead_cap * 2 : 64;
-								dead = dead ? repalloc(dead, dead_cap * sizeof(*dead)) :
-									palloc(dead_cap * sizeof(*dead));
-							}
-							dead[ndead++] = e;
+							dead_cap = dead_cap ? dead_cap * 2 : 64;
+							dead = dead ? repalloc(dead, dead_cap * sizeof(*dead)) :
+								palloc(dead_cap * sizeof(*dead));
 						}
-						continue;
+						dead[ndead++] = *e;
 					}
-					if (fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR)
-						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
-					if (fates[i] == FATE_CLEAR || fates[i] == FATE_FREEZE_CLEAR)
-					{
-						/* (a freeing that aborted, gone with it) */
-						e.flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
-						e.xmax = InvalidTransactionId;
-					}
-					*page_entry(p, k++) = e;
 				}
-				set_page_entries(p, k);
-				GenericXLogFinish(st);
-				kept_entries += k;
+				START_CRIT_SECTION();
+				kept_entries += ipage_vacuum(page, fates, n);
+				log_index_change(idx, XLOG_CHUNK_INDEX_VACUUM, &xlrec, sizeof(xlrec), &lp, 1);
+				END_CRIT_SECTION();
 			}
 			else
 				kept_entries += n;
-			pfree(fates);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))
@@ -2098,3 +2256,237 @@ ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
 		}
 	}
 }
+
+/* ------------------------------------------------------------- redo */
+
+/* block id's page, if its change is to be made again */
+static Page
+redo_page(XLogReaderState *record, uint8 id, Buffer *buf)
+{
+	if (XLogReadBufferForRedo(record, id, buf) != BLK_NEEDS_REDO)
+		return NULL;
+	return BufferGetPage(*buf);
+}
+
+static void
+redo_done(XLogReaderState *record, Buffer buf, bool changed)
+{
+	if (changed)
+	{
+		PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
+		MarkBufferDirty(buf);
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+}
+
+/* block id's data, of exactly len bytes */
+static char *
+redo_data(XLogReaderState *record, uint8 id, Size len)
+{
+	Size		got;
+	char	   *data = XLogRecGetBlockData(record, id, &got);
+
+	if (got != len)
+		elog(PANIC, "chunk_index_redo: block %u has %zu bytes of data, not %zu",
+			 id, got, len);
+	return data;
+}
+
+static void
+redo_slot(XLogReaderState *record, uint8 info)
+{
+	xl_chunk_index_slot *xlrec = (xl_chunk_index_slot *) XLogRecGetData(record);
+	Buffer		buf;
+	Page		page = redo_page(record, 0, &buf);
+
+	if (page)
+	{
+		if (xlrec->slot >= page_entries(page))
+			elog(PANIC, "chunk_index_redo: slot %u of a page of %d entries",
+				 xlrec->slot, page_entries(page));
+		if (info == XLOG_CHUNK_INDEX_SET_COUNTS)
+			ipage_set_counts(page, xlrec->slot, xlrec->refs, xlrec->roots);
+		else if (info == XLOG_CHUNK_INDEX_SET_XMAX)
+			ipage_set_xmax(page, xlrec->slot, xlrec->xmax);
+		else
+			ipage_remove_slot(page, xlrec->slot);
+	}
+	redo_done(record, buf, page != NULL);
+}
+
+void
+chunk_index_redo(XLogReaderState *record)
+{
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	char	   *rec = XLogRecGetData(record);
+	Buffer		buf;
+	Page		page;
+
+	switch (info)
+	{
+		case XLOG_CHUNK_INDEX_VACUUM:
+			{
+				xl_chunk_index_vacuum *xlrec = (xl_chunk_index_vacuum *) rec;
+
+				if (InHotStandby && TransactionIdIsValid(xlrec->snapshotConflictHorizon))
+				{
+					RelFileLocator locator;
+
+					XLogRecGetBlockTag(record, 0, &locator, NULL, NULL);
+					ResolveRecoveryConflictWithSnapshot(xlrec->snapshotConflictHorizon,
+														false, locator);
+				}
+				page = redo_page(record, 0, &buf);
+				if (page)
+				{
+					uint8	   *fates = (uint8 *) redo_data(record, 0, xlrec->nentries);
+
+					if (xlrec->nentries != page_entries(page))
+						elog(PANIC, "chunk_index_redo: fates of %u entries for a page of %d",
+							 xlrec->nentries, page_entries(page));
+					(void) ipage_vacuum(page, fates, xlrec->nentries);
+				}
+				redo_done(record, buf, page != NULL);
+				break;
+			}
+		case XLOG_CHUNK_INDEX_ADD_ENTRY:
+			page = redo_page(record, 0, &buf);
+			if (page)
+				ipage_add(page, (ChunkIndexEntry *) redo_data(record, 0, sizeof(ChunkIndexEntry)));
+			redo_done(record, buf, page != NULL);
+			break;
+		case XLOG_CHUNK_INDEX_ADD_PAGE:
+			{
+				xl_chunk_index_add_page *xlrec = (xl_chunk_index_add_page *) rec;
+				BlockNumber blk;
+
+				XLogRecGetBlockTag(record, 2, NULL, NULL, &blk);
+				page = redo_page(record, 0, &buf);
+				if (page)
+					((IndexMetaData *) PageGetContents(page))->next_block = blk + 1;
+				redo_done(record, buf, page != NULL);
+				page = redo_page(record, 1, &buf);
+				if (page)
+					((IndexPageOpaque) PageGetSpecialPointer(page))->next = blk;
+				redo_done(record, buf, page != NULL);
+				buf = XLogInitBufferForRedo(record, 2);
+				ipage_make(BufferGetPage(buf), INDEX_PAGE_OVERFLOW, xlrec->bucket, 0,
+						   InvalidBlockNumber,
+						   redo_data(record, 2, sizeof(ChunkIndexEntry)),
+						   sizeof(ChunkIndexEntry));
+				redo_done(record, buf, true);
+				break;
+			}
+		case XLOG_CHUNK_INDEX_SET_COUNTS:
+		case XLOG_CHUNK_INDEX_SET_XMAX:
+		case XLOG_CHUNK_INDEX_REMOVE_SLOT:
+			redo_slot(record, info);
+			break;
+		case XLOG_CHUNK_INDEX_KEEP:
+			{
+				xl_chunk_index_keep *xlrec = (xl_chunk_index_keep *) rec;
+
+				page = redo_page(record, 0, &buf);
+				if (page)
+					ipage_keep(page, (uint16 *) redo_data(record, 0, xlrec->nkept * sizeof(uint16)),
+							   xlrec->nkept);
+				redo_done(record, buf, page != NULL);
+				break;
+			}
+		case XLOG_CHUNK_INDEX_FOLD:
+			{
+				xl_chunk_index_fold *xlrec = (xl_chunk_index_fold *) rec;
+
+				page = redo_page(record, 0, &buf);
+				if (page)
+				{
+					ipage_set_counts(page, xlrec->chunk_slot, xlrec->refs, xlrec->roots);
+					if (xlrec->same_page)
+						ipage_remove_slot(page, xlrec->change_slot);
+				}
+				redo_done(record, buf, page != NULL);
+				if (!xlrec->same_page)
+				{
+					page = redo_page(record, 1, &buf);
+					if (page)
+						ipage_remove_slot(page, xlrec->change_slot);
+					redo_done(record, buf, page != NULL);
+				}
+				break;
+			}
+		case XLOG_CHUNK_INDEX_INIT_PAGE:
+			{
+				xl_chunk_index_init_page *xlrec = (xl_chunk_index_init_page *) rec;
+
+				buf = XLogInitBufferForRedo(record, 0);
+				ipage_make(BufferGetPage(buf), xlrec->kind, xlrec->bucket, xlrec->split_at,
+						   xlrec->next, redo_data(record, 0, xlrec->len), xlrec->len);
+				redo_done(record, buf, true);
+				break;
+			}
+		case XLOG_CHUNK_INDEX_SPLIT:
+			{
+				xl_chunk_index_split *xlrec = (xl_chunk_index_split *) rec;
+
+				page = redo_page(record, 0, &buf);
+				if (page)
+					imeta_split(page, xlrec);
+				redo_done(record, buf, page != NULL);
+				page = redo_page(record, 1, &buf);
+				if (page)
+					((IndexPageOpaque) PageGetSpecialPointer(page))->split_at = xlrec->new_bucket;
+				redo_done(record, buf, page != NULL);
+				if (!xlrec->new_dir)
+				{
+					page = redo_page(record, 2, &buf);
+					if (page)
+						idir_set(page, xlrec->new_bucket % DIR_PER_PAGE, xlrec->first);
+					redo_done(record, buf, page != NULL);
+				}
+				break;
+			}
+		case XLOG_CHUNK_INDEX_BIND_LOG:
+			{
+				xl_chunk_index_bind_log *xlrec = (xl_chunk_index_bind_log *) rec;
+
+				page = redo_page(record, 0, &buf);
+				if (page)
+				{
+					((IndexMetaData *) PageGetContents(page))->log = xlrec->log;
+					((IndexMetaData *) PageGetContents(page))->log_stamp = xlrec->stamp;
+				}
+				redo_done(record, buf, page != NULL);
+				break;
+			}
+		default:
+			elog(PANIC, "chunk_index_redo: unknown op code %u", info);
+	}
+}
+
+/*
+ * For wal_consistency_checking: a page as replayed is the primary's but for
+ * its LSN, checksum, hint bits, the bytes past its contents, and its
+ * entries' hint flags, which each server learns of its own (FROZEN, made by
+ * VACUUM's records, is no hint)
+ */
+void
+chunk_index_mask(char *pagedata, BlockNumber blkno)
+{
+	Page		page = (Page) pagedata;
+
+	mask_page_lsn_and_checksum(page);
+	mask_page_hint_bits(page);
+	mask_unused_space(page);
+	if (!PageIsNew(page) && PageGetSpecialSize(page) == OPAQUE_SIZE)
+	{
+		uint16		kind = ((IndexPageOpaque) PageGetSpecialPointer(page))->kind;
+
+		if (kind == INDEX_PAGE_BUCKET || kind == INDEX_PAGE_OVERFLOW)
+			for (int i = 0; i < page_entries(page); i++)
+				page_entry(page, i)->flags &=
+					~(CHUNK_ENTRY_COMMITTED | CHUNK_ENTRY_ABORTED |
+					  CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+	}
+}
+
