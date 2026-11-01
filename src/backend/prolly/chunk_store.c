@@ -378,7 +378,10 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	ChunkFormat->refs(data, len, add_ref, &refs);
 	check_refs(idx, hash, &refs, NULL, NULL);
 	for (int i = 0; i < refs.n; i++)
+	{
 		count_ref(idx, hash, refs.hashes + i * CHUNK_HASH_LEN, 1);
+		INJECTION_POINT("chunk-put-ref-counted", NULL);
+	}
 
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
 	bind_store(log, idx);
@@ -796,6 +799,7 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 		/* (one this transaction holds passed by: prolly/chunk_pin.h) */
 		if (!ChunkIndex->free(idx, h, ChunkPinned, &e))
 			continue;
+		INJECTION_POINT("chunk-free-marked", NULL);
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 		ChunkLog->read(log, e.loc, data, e.len);
 		check_hash(h, data, e.len, log, e.loc);
