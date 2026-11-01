@@ -9,9 +9,9 @@ CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS 'SELECT substr(sha256(d), 1, 20)';
 -- a new index: its meta page, directory and first buckets
 SELECT * FROM test_chunk_index_shape('ci');
- buckets | pages 
----------+-------
-       8 |    10
+ buckets | pages | entries 
+---------+-------+---------
+       8 |    10 |       0
 (1 row)
 
 -- one chunk, put once
@@ -69,6 +69,35 @@ SELECT refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
     1 |     1
 (1 row)
 
+-- (a change gives its transaction an id, so that its commit flushes it)
+BEGIN;
+SELECT refs FROM test_chunk_index_adjust('ci', h('\x616263'), 0, 0);
+ refs 
+------
+    1
+(1 row)
+
+SELECT txid_current_if_assigned() IS NOT NULL AS has_id;
+ has_id 
+--------
+ t
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT test_chunk_put('cl', 'ci', h('\x616263'), '\x616263') AS found_there;
+ found_there 
+-------------
+ f
+(1 row)
+
+SELECT txid_current_if_assigned() IS NOT NULL AS has_id;
+ has_id 
+--------
+ t
+(1 row)
+
+COMMIT;
 -- removed
 SELECT test_chunk_index_remove('ci', h('\x616263')) AS removed;
  removed 
@@ -97,11 +126,12 @@ FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 5000
   50000
 (1 row)
 
-SELECT buckets > 200 AS grew, pages < buckets * 2 AS chains_short
+SELECT buckets > 200 AS grew, pages < buckets * 2 AS chains_short,
+	entries AS on_pages
 FROM test_chunk_index_shape('ci');
- grew | chains_short 
-------+--------------
- t    | t
+ grew | chains_short | on_pages 
+------+--------------+----------
+ t    | t            |    50000
 (1 row)
 
 SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(d)) = d) AS found
@@ -144,9 +174,9 @@ FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 5000
 -- truncated, it starts again
 TRUNCATE ci;
 SELECT * FROM test_chunk_index_shape('ci');
- buckets | pages 
----------+-------
-       8 |    10
+ buckets | pages | entries 
+---------+-------+---------
+       8 |    10 |       0
 (1 row)
 
 SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
@@ -155,6 +185,30 @@ SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
  f
 (1 row)
 
+-- and truncated in the transaction that made it
+BEGIN;
+CREATE TABLE ci_once () USING prolly_chunk_index;
+SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored;
+ stored 
+--------
+ t
+(1 row)
+
+TRUNCATE ci_once;
+SELECT * FROM test_chunk_index_shape('ci_once');
+ buckets | pages | entries 
+---------+-------+---------
+       8 |    10 |       0
+(1 row)
+
+SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored_again;
+ stored_again 
+--------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE ci_once;
 -- no tuples, no rewrites
 INSERT INTO ci DEFAULT VALUES;
 ERROR:  a history store relation does not support inserting tuples

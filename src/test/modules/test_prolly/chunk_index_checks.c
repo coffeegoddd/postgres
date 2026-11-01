@@ -175,18 +175,20 @@ test_chunk_index_remove(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(removed);
 }
 
-/* test_chunk_index_shape(idx, OUT buckets, OUT pages) */
+/* test_chunk_index_shape(idx, OUT buckets, OUT pages, OUT entries) */
 Datum
 test_chunk_index_shape(PG_FUNCTION_ARGS)
 {
 	Relation	idx = open_index(PG_GETARG_OID(0), AccessShareLock);
 	uint32		buckets,
 				pages;
-	Datum		values[2];
+	uint64		entries;
+	Datum		values[3];
 
-	ChunkIndexShape(idx, &buckets, &pages);
+	ChunkIndexShape(idx, &buckets, &pages, &entries);
 	relation_close(idx, AccessShareLock);
 	values[0] = Int32GetDatum((int32) buckets);
 	values[1] = Int32GetDatum((int32) pages);
-	return entry_record(fcinfo, values, 2);
+	values[2] = Int64GetDatum((int64) entries);
+	return entry_record(fcinfo, values, 3);
 }

@@ -20,10 +20,13 @@
  * are not b's entries, so lookups pass them by, and an insert into b takes
  * them out.
  *
- * Changes are WAL-logged with generic records.  Locks are taken in one
- * order: a bucket's first page, its chain's pages, the meta page, the
- * directory's pages; a lookup reads the meta page and the directory with
- * nothing else locked.
+ * Changes are WAL-logged with generic records, and each gives its
+ * transaction an id, so that the transaction's commit flushes them.  Locks
+ * are taken in one order: a bucket's first page, its chain's pages, the
+ * meta page, the directory's pages (a split reads the old bucket's chain
+ * with the meta page locked, which it may: only a holder of the bucket's
+ * first page, which it holds, goes through that chain); a lookup reads the
+ * meta page and the directory with nothing else locked.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -34,6 +37,7 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "prolly/chunk_index.h"
 #include "storage/bufmgr.h"
@@ -144,6 +148,11 @@ page_meta(Relation rel, Page page)
 
 	check_ipage(rel, META_BLOCK, page, INDEX_PAGE_META);
 	meta = (IndexMetaData *) PageGetContents(page);
+	if (meta->ndir == 0 || meta->ndir > MAX_DIR)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk index \"%s\" has a meta page of %u directory pages",
+						RelationGetRelationName(rel), meta->ndir)));
 	if (meta->version != CHUNK_INDEX_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -448,7 +457,11 @@ split_bucket(Relation rel)
 
 	primary = ReadBuffer(rel, old_blk);
 	LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
-	check_ipage(rel, old_blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+	if (check_ipage(rel, old_blk, BufferGetPage(primary), INDEX_PAGE_BUCKET)->bucket != old_b)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of chunk index \"%s\" is not bucket %u's",
+						old_blk, RelationGetRelationName(rel), old_b)));
 	mbuf = ReadBuffer(rel, META_BLOCK);
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = page_meta(rel, BufferGetPage(mbuf));
@@ -662,6 +675,7 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 	bool		grew = false;
 
 	PreventCommandIfReadOnly("insert into a chunk index");
+	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
 	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, entry->hash, bucket,
 				   &masks, true, &found, &at, &space, &last))
@@ -763,6 +777,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 				roots;
 
 	PreventCommandIfReadOnly("change a chunk index");
+	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
 	if (!find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
 					false, &found, &at, NULL, NULL))
@@ -804,6 +819,7 @@ page_remove(Relation idx, const uint8 *hash)
 	int			n;
 
 	PreventCommandIfReadOnly("change a chunk index");
+	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
 	if (!find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
 					false, &found, &at, NULL, NULL))
@@ -876,10 +892,30 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 }
 
 void
-ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages)
+ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages, uint64 *entries)
 {
 	IndexCache *cache = load_cache(idx);
+	uint32		nbuckets = cache->maxbucket + 1;
 
-	*buckets = cache->maxbucket + 1;
+	*buckets = nbuckets;
 	*pages = RelationGetNumberOfBlocks(idx);
+	*entries = 0;
+
+	/* every entry on a bucket's pages, its own or not */
+	for (uint32 b = 0; b < nbuckets; b++)
+	{
+		BlockNumber blk = bucket_block(idx, load_cache(idx), b);
+
+		while (BlockNumberIsValid(blk))
+		{
+			Buffer		buf = ReadBuffer(idx, blk);
+			Page		page;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			*entries += page_entries(page);
+			blk = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			UnlockReleaseBuffer(buf);
+		}
+	}
 }
