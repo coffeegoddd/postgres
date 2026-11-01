@@ -10,6 +10,7 @@
  * Entries and their counts are changed in place, WAL-logged, not
  * transactionally: an entry is there from when it is inserted, whatever
  * becomes of the transaction inserting it, and a count changed is changed.
+ * A change gives its transaction an id, so that its commit flushes it.
  *
  * PageChunkIndex keeps the entries in a relation of the prolly_chunk_index
  * table access method, by linear hashing:
@@ -62,7 +63,7 @@ typedef struct ChunkIndexRoutine
 
 	/*
 	 * Adds drefs and droots to hash's counts, and answers the entry after;
-	 * false if there is none.  A count is never taken below zero.
+	 * false if there is none.  Taking a count below zero is an error.
 	 */
 	bool		(*adjust) (Relation idx, const uint8 *hash, int32 drefs,
 						   int32 droots, ChunkIndexEntry *out);
@@ -80,7 +81,11 @@ extern bool RelationIsChunkIndex(Relation rel);
 /* For the access method: a new index's pages, written to its storage. */
 extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
 
-/* For tests: the buckets there are, and the index's pages. */
-extern void ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages);
+/*
+ * For tests: the buckets there are, the index's pages, and the entries on
+ * the buckets' pages (copies a split left included).
+ */
+extern void ChunkIndexShape(Relation idx, uint32 *buckets, uint32 *pages,
+							uint64 *entries);
 
 #endif							/* PROLLY_CHUNK_INDEX_H */

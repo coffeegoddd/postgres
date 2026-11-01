@@ -25,6 +25,15 @@ SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), -1, 0);
 SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), -2, 0);
 SELECT * FROM test_chunk_index_adjust('ci', h('\x646566'), 1, 0);
 SELECT refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
+-- (a change gives its transaction an id, so that its commit flushes it)
+BEGIN;
+SELECT refs FROM test_chunk_index_adjust('ci', h('\x616263'), 0, 0);
+SELECT txid_current_if_assigned() IS NOT NULL AS has_id;
+COMMIT;
+BEGIN;
+SELECT test_chunk_put('cl', 'ci', h('\x616263'), '\x616263') AS found_there;
+SELECT txid_current_if_assigned() IS NOT NULL AS has_id;
+COMMIT;
 
 -- removed
 SELECT test_chunk_index_remove('ci', h('\x616263')) AS removed;
@@ -35,7 +44,8 @@ SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after;
 -- found, and none that wasn't put
 SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(d), d)) AS stored
 FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000) g) s;
-SELECT buckets > 200 AS grew, pages < buckets * 2 AS chains_short
+SELECT buckets > 200 AS grew, pages < buckets * 2 AS chains_short,
+	entries AS on_pages
 FROM test_chunk_index_shape('ci');
 SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(d)) = d) AS found
 FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000) g) s;
@@ -55,6 +65,15 @@ FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 5000
 TRUNCATE ci;
 SELECT * FROM test_chunk_index_shape('ci');
 SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
+-- and truncated in the transaction that made it
+BEGIN;
+CREATE TABLE ci_once () USING prolly_chunk_index;
+SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored;
+TRUNCATE ci_once;
+SELECT * FROM test_chunk_index_shape('ci_once');
+SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored_again;
+COMMIT;
+DROP TABLE ci_once;
 
 -- no tuples, no rewrites
 INSERT INTO ci DEFAULT VALUES;

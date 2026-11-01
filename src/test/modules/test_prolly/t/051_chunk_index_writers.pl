@@ -59,12 +59,13 @@ is($node->safe_psql('postgres', $check), "$n|$n", 'and after a crash');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $check), "$n|$n", 'and on a standby');
 
-# a split an error stops after making the new bucket, before taking its
-# entries out of the old one, as a crash there would: the old bucket keeps
-# copies of them, which lookups pass by and inserts take out
+# splits an error stops after making the new bucket, before taking its
+# entries out of the old one, as a crash there would: the old buckets keep
+# copies, which lookups pass by, inserts take out and later splits of the
+# same buckets leave behind
 SKIP:
 {
-	skip 'injection points not supported by this build', 3
+	skip 'injection points not supported by this build', 4
 	  if $ENV{enable_injection_points} ne 'yes';
 	$node->safe_psql('postgres', q{
 		CREATE EXTENSION injection_points;
@@ -81,7 +82,7 @@ SKIP:
 					INSERT INTO put2 VALUES (substr(sha256(d), 1, 20), md5(d));
 					PERFORM test_chunk_put('cl', 'ci2', substr(sha256(d), 1, 20), d);
 				EXCEPTION WHEN others THEN
-					EXIT;
+					NULL;	-- (each split stops halfway: on to the next)
 				END;
 			END LOOP;
 		END $$;
@@ -90,7 +91,9 @@ SKIP:
 	my $check2 = q{SELECT count(*), count(*) FILTER (WHERE md5(test_chunk_get('cl', 'ci2', hash)) = digest) FROM put2};
 	my ($n2) = split /\|/, $node->safe_psql('postgres', $check2);
 	is($node->safe_psql('postgres', $check2), "$n2|$n2",
-		'every chunk is found after a split stopped halfway');
+		'every chunk is found after splits stopped halfway');
+	ok($node->safe_psql('postgres', q{SELECT entries FROM test_chunk_index_shape('ci2')}) > $n2,
+		'the stopped splits left copies in the buckets they split');
 	# more puts go through the old bucket; then every chunk removed is gone,
 	# with no copy left to find
 	$node->safe_psql('postgres', q{

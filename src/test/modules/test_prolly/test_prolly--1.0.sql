@@ -334,5 +334,5 @@ RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_chunk_index_shape(idx regclass,
-	OUT buckets int4, OUT pages int4)
+	OUT buckets int4, OUT pages int4, OUT entries int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
