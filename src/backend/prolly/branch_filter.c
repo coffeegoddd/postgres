@@ -350,6 +350,13 @@ row_owners(Oid relid, HeapTuple tup, RowOwners *owners)
 	return true;
 }
 
+/*
+ * Set while a page-at-a-time scan filters a page: the full scans that meet
+ * every branch's objects, which alone make the map learn every relation at
+ * once (learn_all_relations()).
+ */
+static bool in_page_scan = false;
+
 /* Whether rows of catalog relid can belong to a branch: row_owners' list. */
 static bool
 filtered_catalog(Oid relid)
@@ -481,16 +488,25 @@ CatalogBranchFilterPage(Relation rel, Page page, BlockNumber block,
 	HeapTupleData tuple;
 
 	tuple.t_tableOid = RelationGetRelid(rel);
-	for (uint32 i = 0; i < n; i++)
+	in_page_scan = true;
+	PG_TRY();
 	{
-		ItemId		lp = PageGetItemId(page, offsets[i]);
+		for (uint32 i = 0; i < n; i++)
+		{
+			ItemId		lp = PageGetItemId(page, offsets[i]);
 
-		tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-		tuple.t_len = ItemIdGetLength(lp);
-		ItemPointerSet(&tuple.t_self, block, offsets[i]);
-		if (!CatalogBranchHides(rel, &tuple))
-			offsets[kept++] = offsets[i];
+			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			tuple.t_len = ItemIdGetLength(lp);
+			ItemPointerSet(&tuple.t_self, block, offsets[i]);
+			if (!CatalogBranchHides(rel, &tuple))
+				offsets[kept++] = offsets[i];
+		}
 	}
+	PG_FINALLY();
+	{
+		in_page_scan = false;
+	}
+	PG_END_TRY();
 	return kept;
 }
 
@@ -568,8 +584,13 @@ evicting_cache(Oid classid)
 }
 
 /*
- * Relations the map had to learn one by one since it last learned them all
- * (learn_all_relations()), and whether it has.
+ * Relations a page-at-a-time scan had the map learn one by one since it
+ * last learned them all (learn_all_relations()), and whether it has.  A
+ * full scan of a catalog that names relations (pg_attribute) learns every
+ * branch's relation anyway: learning them at once costs the memory the
+ * scan's would, an entry of some 50 bytes for each relation (its table,
+ * TOAST table and their indexes) of every branch, in each backend that
+ * scans so.
  */
 static uint32 relation_misses = 0;
 static bool relations_learned = false;
@@ -577,9 +598,17 @@ static bool relations_learned = false;
 /* misses after which the map learns every relation at once */
 #define BRANCH_MAP_BULK_MISSES	64
 
+/*
+ * Counts the map's changes, and the answers it could not keep (an object
+ * not found), so that the last answer is kept only if the map neither
+ * changed nor declined while it was found.
+ */
+static uint64 map_generation = 0;
+
 static void
 map_reset(void)
 {
+	map_generation++;
 	last_answer.valid = false;
 	relation_misses = 0;
 	relations_learned = false;
@@ -599,6 +628,7 @@ map_invalidate(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 	/* a branch change: no object changed branch */
 	if (branch_map == NULL || catalog_branch_changing)
 		return;
+	map_generation++;
 	if (hashvalue == 0)
 	{
 		map_reset();
@@ -907,7 +937,7 @@ learn_all_relations(void)
 
 	map_stats.reads++;
 	rel = table_open(RelationRelationId, AccessShareLock);
-	/* (after the open: invalidations it processes may reset the map) */
+	/* (after the open: invalidations it, and pg_index's, process may reset the map) */
 	relations_learned = true;
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
@@ -959,8 +989,13 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 	bool		found;
 
 	map_stats.probes++;
-	if (!OidIsValid(objid) || depth > 4)
+	if (!OidIsValid(objid))
 		return 0;
+	if (depth > 4)
+	{
+		map_generation++;		/* (not kept: see map_generation) */
+		return 0;
+	}
 
 	/*
 	 * Objects initdb made are shared, and need no reading (nor could the
@@ -979,7 +1014,8 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 	 * for each: past a few, the map reads it once for all of them.
 	 */
 	if ((e == NULL || e->objid != objid) && classid == RelationRelationId &&
-		!relations_learned && ++relation_misses >= BRANCH_MAP_BULK_MISSES)
+		in_page_scan && !relations_learned &&
+		++relation_misses >= BRANCH_MAP_BULK_MISSES)
 	{
 		learn_all_relations();
 		e = hash_search(map_table(), &key, HASH_FIND, NULL);
@@ -991,7 +1027,10 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 		 * that change the table: nothing found in it is kept across this.
 		 */
 		if (!learn(classid, objid, &learned))
+		{
+			map_generation++;	/* (not kept: see map_generation) */
 			return 0;
+		}
 		e = hash_search(map_table(), &key, HASH_ENTER, &found);
 		e->objid = objid;
 		e->owner_class = learned.owner_class;
@@ -1146,6 +1185,7 @@ static int32
 cached_object_branch(Oid classid, Oid objid)
 {
 	int32		branch;
+	uint64		generation;
 
 	if (last_answer.valid && last_answer.objid == objid &&
 		last_answer.classid == classid)
@@ -1153,11 +1193,15 @@ cached_object_branch(Oid classid, Oid objid)
 		map_stats.probes++;
 		return last_answer.branch;
 	}
+	generation = map_generation;
 	branch = cached_object_branch_depth(classid, objid, 0);
-	last_answer.classid = classid;
-	last_answer.objid = objid;
-	last_answer.branch = branch;
-	last_answer.valid = true;
+	if (map_generation == generation)
+	{
+		last_answer.classid = classid;
+		last_answer.objid = objid;
+		last_answer.branch = branch;
+		last_answer.valid = true;
+	}
 	return branch;
 }
 

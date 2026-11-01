@@ -43,11 +43,13 @@ CONF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/log" -w start >/dev/null
 trap '"$BIN/pg_ctl" -D "$DATA" -w stop -m fast >/dev/null' EXIT
 
-psql() { "$BIN/psql" -h "$SOCK" -p "$PORT" -U postgres -d postgres -X -q -At "$@"; }
+psql() { "$BIN/psql" -h "$SOCK" -p "$PORT" -U postgres -d postgres -X -q -At -v ON_ERROR_STOP=1 "$@"; }
 
 start=$(date +%s)
-for b in $(seq 1 "$BRANCHES"); do
-	psql -c "SELECT pg_branch_id_allocate()" >/dev/null
+ids=()
+for n in $(seq 1 "$BRANCHES"); do
+	b=$(psql -c "SELECT pg_branch_id_allocate()")
+	ids+=("$b")
 	PGOPTIONS="-c catalog_branch=$b" psql -c "
 		CREATE SCHEMA app VERSIONED;
 		DO \$\$BEGIN
@@ -75,10 +77,10 @@ timed() {	# label: run QUERY in the open session, report milliseconds
 	echo "SET max_parallel_workers_per_gather = 0;"
 	timed "first scans on branch 1"
 	timed "again"
-	echo "\\! PGOPTIONS='-c catalog_branch=2' $BIN/psql -h $SOCK -p $PORT -U postgres -d postgres -X -q -c 'CREATE FUNCTION app.extra() RETURNS int LANGUAGE sql RETURN 1'"
+	echo "\\! PGOPTIONS='-c catalog_branch=${ids[1]:-${ids[0]}}' '$BIN/psql' -h '$SOCK' -p $PORT -U postgres -d postgres -X -q -c 'CREATE FUNCTION app.extra() RETURNS int LANGUAGE sql RETURN 1'"
 	timed "after a function made on branch 2"
-	echo "SET catalog_branch = 3;"
+	echo "SET catalog_branch = ${ids[2]:-${ids[0]}};"
 	timed "after changing to branch 3"
 	echo "SET catalog_branch_filter = off;"
 	timed "unfiltered: every branch"
-} | PGOPTIONS="-c catalog_branch=1" psql 2>&1
+} | PGOPTIONS="-c catalog_branch=${ids[0]}" psql 2>&1

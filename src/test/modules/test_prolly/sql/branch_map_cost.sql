@@ -57,6 +57,22 @@ SET catalog_branch = :b1;
 SET max_parallel_workers_per_gather = 0;
 SELECT count(*) > 0 AS columns FROM pg_attribute;
 SELECT reads < 200 AS learned_at_once FROM test_branch_map_stats();
+-- and its answers are the map's: b1's columns, tables and TOAST tables seen,
+-- b2's hidden
+SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
+	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
+SELECT count(*) AS b1_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c
+	WHERE c.reltoastrelid = t.oid AND c.relnamespace = 'cost'::regnamespace);
+SELECT count(*) AS cost_tables FROM pg_class WHERE relnamespace = 'cost'::regnamespace AND relkind = 'r';
+SET catalog_branch_filter = off;
+SELECT count(*) AS every_branch_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.reltoastrelid = t.oid AND n.nspname = 'cost');
+RESET catalog_branch_filter;
+SELECT count(*) AS visible_toast FROM pg_class t
+WHERE t.relkind = 't' AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.reltoastrelid = t.oid AND n.nspname = 'cost');
 
 SET client_min_messages = warning;
 DROP SCHEMA cost CASCADE;
