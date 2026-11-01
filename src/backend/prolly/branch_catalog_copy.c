@@ -70,6 +70,17 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_opclass.h"
+#include "catalog/pg_opfamily.h"
+#include "catalog/pg_publication_namespace.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_partitioned_table.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_default_acl.h"
@@ -274,16 +285,18 @@ check_copyable(Oid classid, Oid oid)
 					 c->relkind != RELKIND_TOASTVALUE &&
 					 c->relkind != RELKIND_VIEW &&
 					 c->relkind != RELKIND_MATVIEW &&
-					 c->relkind != RELKIND_COMPOSITE_TYPE) ||
-					c->relispartition || c->relhassubclass ||
+					 c->relkind != RELKIND_COMPOSITE_TYPE &&
+					 c->relkind != RELKIND_PARTITIONED_TABLE &&
+					 c->relkind != RELKIND_PARTITIONED_INDEX) ||
 					c->relpersistence != RELPERSISTENCE_PERMANENT ||
 					OidIsValid(c->reloftype) ||
 					/* (storage made as heap's is: only heap's tables) */
-					((c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW) &&
-					 c->relam != HEAP_TABLE_AM_OID))
+					((c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW ||
+					  c->relkind == RELKIND_PARTITIONED_TABLE) &&
+					 OidIsValid(c->relam) && c->relam != HEAP_TABLE_AM_OID))
 					refuse(classid, oid);
 				/* (a rebuild on the copy would make an invalid index valid) */
-				if (c->relkind == RELKIND_INDEX)
+				if (c->relkind == RELKIND_INDEX || c->relkind == RELKIND_PARTITIONED_INDEX)
 				{
 					HeapTuple	itup = fetch_row(IndexRelationId, IndexRelidIndexId,
 												 Anum_pg_index_indexrelid, oid);
@@ -312,8 +325,8 @@ check_copyable(Oid classid, Oid oid)
 					t->typtype == TYPTYPE_ENUM ||
 					t->typtype == TYPTYPE_RANGE ||
 					t->typtype == TYPTYPE_MULTIRANGE ||
-					(t->typtype == TYPTYPE_BASE && t->typcategory == TYPCATEGORY_ARRAY &&
-					 OidIsValid(t->typelem));
+					/* (a base type's functions, an extension's, are copied with it) */
+					t->typtype == TYPTYPE_BASE;
 				heap_freetuple(tup);
 				if (!ok)
 					refuse(classid, oid);
@@ -331,8 +344,8 @@ check_copyable(Oid classid, Oid oid)
 					  con->contype == CONSTRAINT_FOREIGN ||
 					  con->contype == CONSTRAINT_PRIMARY ||
 					  con->contype == CONSTRAINT_UNIQUE ||
-					  con->contype == CONSTRAINT_NOTNULL) &&
-					!OidIsValid(con->conparentid);
+					  con->contype == CONSTRAINT_NOTNULL ||
+					  con->contype == CONSTRAINT_EXCLUSION);
 				heap_freetuple(tup);
 				if (!ok)
 					refuse(classid, oid);
@@ -341,36 +354,22 @@ check_copyable(Oid classid, Oid oid)
 		case AttrDefaultRelationId:
 		case DefaultAclRelationId:
 		case CastRelationId:
+		case StatisticExtRelationId:
+		case ExtensionRelationId:
+		case PublicationRelRelationId:
+		case PublicationNamespaceRelationId:
+		case OperatorRelationId:
+		case OperatorFamilyRelationId:
+		case OperatorClassRelationId:
+		case AccessMethodOperatorRelationId:
+		case AccessMethodProcedureRelationId:
 		case PolicyRelationId:
 		case RewriteRelationId:
 			return;
 		case ProcedureRelationId:
-			{
-				char		kind;
-
-				tup = fetch_row(ProcedureRelationId, ProcedureOidIndexId,
-								Anum_pg_proc_oid, oid);
-				/* (an aggregate's pg_aggregate row is not copied yet) */
-				kind = ((Form_pg_proc) GETSTRUCT(tup))->prokind;
-				heap_freetuple(tup);
-				if (kind == PROKIND_AGGREGATE)
-					refuse(classid, oid);
-				return;
-			}
+			return;
 		case TriggerRelationId:
-			{
-				Form_pg_trigger trg;
-				bool		ok;
-
-				tup = fetch_row(TriggerRelationId, TriggerOidIndexId,
-								Anum_pg_trigger_oid, oid);
-				trg = (Form_pg_trigger) GETSTRUCT(tup);
-				ok = !OidIsValid(trg->tgparentid);
-				heap_freetuple(tup);
-				if (!ok)
-					refuse(classid, oid);
-				return;
-			}
+			return;
 		default:
 			refuse(classid, oid);
 	}
@@ -647,6 +646,55 @@ assign_oids(CopyState *cs)
 				rel = table_open(TriggerRelationId, RowExclusiveLock);
 				e->newoid = GetNewOidWithIndex(rel, TriggerOidIndexId,
 											   Anum_pg_trigger_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case OperatorRelationId:
+				rel = table_open(OperatorRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, OperatorOidIndexId, Anum_pg_operator_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case OperatorFamilyRelationId:
+				rel = table_open(OperatorFamilyRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, OpfamilyOidIndexId, Anum_pg_opfamily_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case OperatorClassRelationId:
+				rel = table_open(OperatorClassRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, OpclassOidIndexId, Anum_pg_opclass_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case AccessMethodOperatorRelationId:
+				rel = table_open(AccessMethodOperatorRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, AccessMethodOperatorOidIndexId, Anum_pg_amop_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case AccessMethodProcedureRelationId:
+				rel = table_open(AccessMethodProcedureRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, AccessMethodProcedureOidIndexId, Anum_pg_amproc_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case StatisticExtRelationId:
+				rel = table_open(StatisticExtRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, StatisticExtOidIndexId,
+											   Anum_pg_statistic_ext_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case ExtensionRelationId:
+				rel = table_open(ExtensionRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, ExtensionOidIndexId,
+											   Anum_pg_extension_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case PublicationRelRelationId:
+				rel = table_open(PublicationRelRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, PublicationRelObjectIndexId,
+											   Anum_pg_publication_rel_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case PublicationNamespaceRelationId:
+				rel = table_open(PublicationNamespaceRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, PublicationNamespaceObjectIndexId,
+											   Anum_pg_publication_namespace_oid);
 				table_close(rel, RowExclusiveLock);
 				break;
 			case CastRelationId:
@@ -1027,6 +1075,8 @@ remap_mutator(Node *node, CopyState *cs)
 			}
 		case T_NamedArgExpr:
 		case T_JsonIsPredicate:
+		case T_PartitionBoundSpec:
+		case T_PartitionRangeDatum:
 			break;
 		case T_RowCompareExpr:
 			((RowCompareExpr *) node)->opnos =
@@ -1181,6 +1231,7 @@ fix_class(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_class_relnamespace, NamespaceRelationId);
 	MAP(Anum_pg_class_reltype, TypeRelationId);
 	MAP(Anum_pg_class_reltoastrelid, RelationRelationId);
+	MAP_TREE(Anum_pg_class_relpartbound);
 	/* the relation's storage is new: its file number is its object id */
 	if (RELKIND_HAS_STORAGE(relkind))
 		values[Anum_pg_class_relfilenode - 1] = values[Anum_pg_class_oid - 1];
@@ -1335,6 +1386,8 @@ fix_index(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_index_indexrelid, RelationRelationId);
 	MAP(Anum_pg_index_indrelid, RelationRelationId);
+	values[Anum_pg_index_indclass - 1] =
+		map_oidvector(cs, OperatorClassRelationId, values[Anum_pg_index_indclass - 1]);
 	MAP_TREE(Anum_pg_index_indexprs);
 	MAP_TREE(Anum_pg_index_indpred);
 }
@@ -1348,6 +1401,16 @@ fix_constraint(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_constraint_contypid, TypeRelationId);
 	MAP(Anum_pg_constraint_conindid, RelationRelationId);
 	MAP(Anum_pg_constraint_confrelid, RelationRelationId);
+	MAP(Anum_pg_constraint_conparentid, ConstraintRelationId);
+	for (int a = 0; a < 4; a++)
+	{
+		static const AttrNumber ops[] = {Anum_pg_constraint_conpfeqop,
+			Anum_pg_constraint_conppeqop, Anum_pg_constraint_conffeqop,
+		Anum_pg_constraint_conexclop};
+
+		if (!nulls[ops[a] - 1])
+			values[ops[a] - 1] = map_oidarray(cs, OperatorRelationId, values[ops[a] - 1]);
+	}
 	MAP_TREE(Anum_pg_constraint_conbin);
 }
 
@@ -1377,7 +1440,130 @@ fix_trigger(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_trigger_tgconstrindid, RelationRelationId);
 	MAP(Anum_pg_trigger_tgconstraint, ConstraintRelationId);
 	MAP(Anum_pg_trigger_tgfoid, ProcedureRelationId);
+	MAP(Anum_pg_trigger_tgparentid, TriggerRelationId);
 	MAP_TREE(Anum_pg_trigger_tgqual);
+}
+
+static void
+fix_operator(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_operator_oid, OperatorRelationId);
+	MAP(Anum_pg_operator_oprnamespace, NamespaceRelationId);
+	MAP(Anum_pg_operator_oprleft, TypeRelationId);
+	MAP(Anum_pg_operator_oprright, TypeRelationId);
+	MAP(Anum_pg_operator_oprresult, TypeRelationId);
+	MAP(Anum_pg_operator_oprcom, OperatorRelationId);
+	MAP(Anum_pg_operator_oprnegate, OperatorRelationId);
+	MAP(Anum_pg_operator_oprcode, ProcedureRelationId);
+	MAP(Anum_pg_operator_oprrest, ProcedureRelationId);
+	MAP(Anum_pg_operator_oprjoin, ProcedureRelationId);
+}
+
+static void
+fix_opfamily(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_opfamily_oid, OperatorFamilyRelationId);
+	MAP(Anum_pg_opfamily_opfnamespace, NamespaceRelationId);
+}
+
+static void
+fix_opclass(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_opclass_oid, OperatorClassRelationId);
+	MAP(Anum_pg_opclass_opcnamespace, NamespaceRelationId);
+	MAP(Anum_pg_opclass_opcfamily, OperatorFamilyRelationId);
+	MAP(Anum_pg_opclass_opcintype, TypeRelationId);
+	MAP(Anum_pg_opclass_opckeytype, TypeRelationId);
+}
+
+static void
+fix_amop(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_amop_oid, AccessMethodOperatorRelationId);
+	MAP(Anum_pg_amop_amopfamily, OperatorFamilyRelationId);
+	MAP(Anum_pg_amop_amoplefttype, TypeRelationId);
+	MAP(Anum_pg_amop_amoprighttype, TypeRelationId);
+	MAP(Anum_pg_amop_amopopr, OperatorRelationId);
+	MAP(Anum_pg_amop_amopsortfamily, OperatorFamilyRelationId);
+}
+
+static void
+fix_amproc(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_amproc_oid, AccessMethodProcedureRelationId);
+	MAP(Anum_pg_amproc_amprocfamily, OperatorFamilyRelationId);
+	MAP(Anum_pg_amproc_amproclefttype, TypeRelationId);
+	MAP(Anum_pg_amproc_amprocrighttype, TypeRelationId);
+	MAP(Anum_pg_amproc_amproc, ProcedureRelationId);
+}
+
+static void
+fix_inherits(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_inherits_inhrelid, RelationRelationId);
+	MAP(Anum_pg_inherits_inhparent, RelationRelationId);
+}
+
+static void
+fix_partitioned(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_partitioned_table_partrelid, RelationRelationId);
+	MAP(Anum_pg_partitioned_table_partdefid, RelationRelationId);
+	values[Anum_pg_partitioned_table_partclass - 1] =
+		map_oidvector(cs, OperatorClassRelationId,
+					  values[Anum_pg_partitioned_table_partclass - 1]);
+	MAP_TREE(Anum_pg_partitioned_table_partexprs);
+}
+
+static void
+fix_aggregate(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_aggregate_aggfnoid, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggtransfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggfinalfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggcombinefn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggserialfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggdeserialfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggmtransfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggminvtransfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggmfinalfn, ProcedureRelationId);
+	MAP(Anum_pg_aggregate_aggsortop, OperatorRelationId);
+	MAP(Anum_pg_aggregate_aggtranstype, TypeRelationId);
+	MAP(Anum_pg_aggregate_aggmtranstype, TypeRelationId);
+}
+
+static void
+fix_statistic_ext(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_statistic_ext_oid, StatisticExtRelationId);
+	MAP(Anum_pg_statistic_ext_stxrelid, RelationRelationId);
+	MAP(Anum_pg_statistic_ext_stxnamespace, NamespaceRelationId);
+	MAP_TREE(Anum_pg_statistic_ext_stxexprs);
+}
+
+static void
+fix_extension(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_extension_oid, ExtensionRelationId);
+	MAP(Anum_pg_extension_extnamespace, NamespaceRelationId);
+	if (!nulls[Anum_pg_extension_extconfig - 1])
+		values[Anum_pg_extension_extconfig - 1] =
+			map_oidarray(cs, RelationRelationId, values[Anum_pg_extension_extconfig - 1]);
+}
+
+static void
+fix_publication_rel(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_publication_rel_oid, PublicationRelRelationId);
+	MAP(Anum_pg_publication_rel_prrelid, RelationRelationId);
+	MAP_TREE(Anum_pg_publication_rel_prqual);
+}
+
+static void
+fix_publication_namespace(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_publication_namespace_oid, PublicationNamespaceRelationId);
+	MAP(Anum_pg_publication_namespace_pnnspid, NamespaceRelationId);
 }
 
 static void
@@ -1441,6 +1627,11 @@ static void
 fix_statistic(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_statistic_starelid, RelationRelationId);
+	MAP(Anum_pg_statistic_staop1, OperatorRelationId);
+	MAP(Anum_pg_statistic_staop2, OperatorRelationId);
+	MAP(Anum_pg_statistic_staop3, OperatorRelationId);
+	MAP(Anum_pg_statistic_staop4, OperatorRelationId);
+	MAP(Anum_pg_statistic_staop5, OperatorRelationId);
 }
 
 /* errors out if any row of catalog catid names one of the objects */
@@ -1504,7 +1695,8 @@ copy_all_rows(CopyState *cs)
 							 Anum_pg_class_oid, obj.oid, fix_class);
 				copy_rows_of(cs, AttributeRelationId, AttributeRelidNumIndexId,
 							 Anum_pg_attribute_attrelid, obj.oid, fix_attribute);
-				if (get_rel_relkind(obj.oid) == RELKIND_INDEX)
+				if (get_rel_relkind(obj.oid) == RELKIND_INDEX ||
+					get_rel_relkind(obj.oid) == RELKIND_PARTITIONED_INDEX)
 					copy_rows_of(cs, IndexRelationId, IndexRelidIndexId,
 								 Anum_pg_index_indexrelid, obj.oid, fix_index);
 				if (get_rel_relkind(obj.oid) == RELKIND_SEQUENCE)
@@ -1512,6 +1704,13 @@ copy_all_rows(CopyState *cs)
 								 Anum_pg_sequence_seqrelid, obj.oid, fix_sequence);
 				copy_rows_of(cs, StatisticRelationId, StatisticRelidAttnumInhIndexId,
 							 Anum_pg_statistic_starelid, obj.oid, fix_statistic);
+				/* a partition's, or a child's, place under its parent */
+				copy_rows_of(cs, InheritsRelationId, InheritsRelidSeqnoIndexId,
+							 Anum_pg_inherits_inhrelid, obj.oid, fix_inherits);
+				if (get_rel_relkind(obj.oid) == RELKIND_PARTITIONED_TABLE)
+					copy_rows_of(cs, PartitionedRelationId, PartitionedRelidIndexId,
+								 Anum_pg_partitioned_table_partrelid, obj.oid,
+								 fix_partitioned);
 				break;
 			case TypeRelationId:
 				copy_rows_of(cs, TypeRelationId, TypeOidIndexId,
@@ -1530,6 +1729,43 @@ copy_all_rows(CopyState *cs)
 			case ProcedureRelationId:
 				copy_rows_of(cs, ProcedureRelationId, ProcedureOidIndexId,
 							 Anum_pg_proc_oid, obj.oid, fix_proc);
+				if (get_func_prokind(obj.oid) == PROKIND_AGGREGATE)
+					copy_rows_of(cs, AggregateRelationId, AggregateFnoidIndexId,
+								 Anum_pg_aggregate_aggfnoid, obj.oid, fix_aggregate);
+				break;
+			case OperatorRelationId:
+				copy_rows_of(cs, OperatorRelationId, OperatorOidIndexId, Anum_pg_operator_oid, obj.oid, fix_operator);
+				break;
+			case OperatorFamilyRelationId:
+				copy_rows_of(cs, OperatorFamilyRelationId, OpfamilyOidIndexId, Anum_pg_opfamily_oid, obj.oid, fix_opfamily);
+				break;
+			case OperatorClassRelationId:
+				copy_rows_of(cs, OperatorClassRelationId, OpclassOidIndexId, Anum_pg_opclass_oid, obj.oid, fix_opclass);
+				break;
+			case AccessMethodOperatorRelationId:
+				copy_rows_of(cs, AccessMethodOperatorRelationId, AccessMethodOperatorOidIndexId, Anum_pg_amop_oid, obj.oid, fix_amop);
+				break;
+			case AccessMethodProcedureRelationId:
+				copy_rows_of(cs, AccessMethodProcedureRelationId, AccessMethodProcedureOidIndexId, Anum_pg_amproc_oid, obj.oid, fix_amproc);
+				break;
+			case StatisticExtRelationId:
+				/* (its data, which names types, is ANALYZE's to make again) */
+				copy_rows_of(cs, StatisticExtRelationId, StatisticExtOidIndexId,
+							 Anum_pg_statistic_ext_oid, obj.oid, fix_statistic_ext);
+				break;
+			case ExtensionRelationId:
+				copy_rows_of(cs, ExtensionRelationId, ExtensionOidIndexId,
+							 Anum_pg_extension_oid, obj.oid, fix_extension);
+				break;
+			case PublicationRelRelationId:
+				copy_rows_of(cs, PublicationRelRelationId, PublicationRelObjectIndexId,
+							 Anum_pg_publication_rel_oid, obj.oid, fix_publication_rel);
+				break;
+			case PublicationNamespaceRelationId:
+				copy_rows_of(cs, PublicationNamespaceRelationId,
+							 PublicationNamespaceObjectIndexId,
+							 Anum_pg_publication_namespace_oid, obj.oid,
+							 fix_publication_namespace);
 				break;
 			case PolicyRelationId:
 				copy_rows_of(cs, PolicyRelationId, PolicyOidIndexId,

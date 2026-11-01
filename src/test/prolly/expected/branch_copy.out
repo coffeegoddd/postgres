@@ -282,12 +282,13 @@ SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
 (1 row)
 
 -- a branch with an object the copy doesn't know is refused, and nothing made
+CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
 SET catalog_branch = :b3;
 CREATE SCHEMA app VERSIONED CREATE TABLE t (x int);
-CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int);
+CREATE TABLE app.u (x int) USING heap2;
 RESET catalog_branch;
 SELECT pg_branch_catalog_copy(:b3, :b4);
-ERROR:  cannot copy function app.total(integer) to another branch yet
+ERROR:  cannot copy table app.u to another branch yet
 SET catalog_branch_filter = off;
 SELECT count(*) AS b4_schemas FROM pg_namespace WHERE nspbranch = :b4;
  b4_schemas 
@@ -488,6 +489,141 @@ SELECT pg_branch_catalog_drop(:b9), pg_branch_catalog_drop(:b10);
 
 DROP ROLE regress_copy_reader;
 RESET client_min_messages;
+-- partitions, a foreign key into a shared partitioned table, aggregates,
+-- extended statistics, an extension of the branch's own, and membership
+-- of a shared publication
+SELECT pg_branch_id_allocate() AS b12 \gset
+SELECT pg_branch_id_allocate() AS b13 \gset
+CREATE TABLE pub.pp (id int PRIMARY KEY) PARTITION BY RANGE (id);
+CREATE TABLE pub.pp1 PARTITION OF pub.pp FOR VALUES FROM (0) TO (100);
+INSERT INTO pub.pp VALUES (1), (2);
+SET client_min_messages = warning;
+CREATE PUBLICATION branch_copy_pub;
+RESET client_min_messages;
+SET catalog_branch = :b12;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.m (k int, v int, r int REFERENCES pub.pp) PARTITION BY LIST (k);
+CREATE TABLE app.m1 PARTITION OF app.m FOR VALUES IN (1);
+CREATE TABLE app.mdef PARTITION OF app.m DEFAULT;
+CREATE INDEX m_v ON app.m (v);
+CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int, initcond = '0');
+CREATE STATISTICS app.m1_stats (dependencies) ON k, v FROM app.m1;
+CREATE EXTENSION pg_trgm SCHEMA app;
+SET client_min_messages = warning;
+ALTER PUBLICATION branch_copy_pub ADD TABLE app.m1;
+RESET client_min_messages;
+INSERT INTO app.m VALUES (1, 10, 1), (2, 20, 2);
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b12, :b13);
+ pg_branch_catalog_copy 
+------------------------
+ 
+(1 row)
+
+SET catalog_branch = :b13;
+SELECT c.relname, c.relkind, c.relispartition, pg_get_expr(c.relpartbound, c.oid) AS bound
+FROM pg_class c WHERE c.relnamespace = 'app'::regnamespace AND c.relkind IN ('p', 'r', 'I', 'i')
+	AND c.relname LIKE 'm%' ORDER BY 1;
+  relname   | relkind | relispartition |       bound       
+------------+---------+----------------+-------------------
+ m          | p       | f              | 
+ m1         | r       | t              | FOR VALUES IN (1)
+ m1_v_idx   | i       | t              | 
+ m_v        | I       | f              | 
+ mdef       | r       | t              | DEFAULT
+ mdef_v_idx | i       | t              | 
+(6 rows)
+
+SELECT inhrelid::regclass, inhparent::regclass FROM pg_inherits
+WHERE inhparent IN ('app.m'::regclass, 'app.m_v'::regclass) ORDER BY 1;
+    inhrelid    | inhparent 
+----------------+-----------
+ app.m1         | app.m
+ app.mdef       | app.m
+ app.m1_v_idx   | app.m_v
+ app.mdef_v_idx | app.m_v
+(4 rows)
+
+SELECT indexrelid::regclass, indrelid::regclass FROM pg_index
+WHERE indexrelid = 'app.m_v'::regclass;
+ indexrelid | indrelid 
+------------+----------
+ app.m_v    | app.m
+(1 row)
+
+INSERT INTO app.m VALUES (1, 11, 1), (3, 30, 2) RETURNING tableoid::regclass, k;
+ tableoid | k 
+----------+---
+ app.m1   | 1
+ app.mdef | 3
+(2 rows)
+
+INSERT INTO app.m VALUES (1, 12, 99);
+ERROR:  insert or update on table "m1" violates foreign key constraint "m_r_fkey"
+DETAIL:  Key (r)=(99) is not present in table "pp".
+-- the foreign key into the shared partitioned table holds for the copy
+DELETE FROM pub.pp WHERE id = 2;
+ERROR:  update or delete on table "pp1" violates foreign key constraint "m_r_fkey_1" on table "m"
+DETAIL:  Key (id)=(2) is still referenced from table "m".
+SELECT app.total(v) FROM app.m;
+ total 
+-------
+    41
+(1 row)
+
+SELECT stxname FROM pg_statistic_ext WHERE stxrelid = 'app.m1'::regclass;
+ stxname  
+----------
+ m1_stats
+(1 row)
+
+SELECT extname, extnamespace::regnamespace FROM pg_extension WHERE extname = 'pg_trgm';
+ extname | extnamespace 
+---------+--------------
+ pg_trgm | app
+(1 row)
+
+SELECT round(app.similarity('abc', 'abd')::numeric, 2);
+ round 
+-------
+  0.33
+(1 row)
+
+SELECT count(*) AS published FROM pg_publication_tables
+WHERE pubname = 'branch_copy_pub' AND schemaname = 'app';
+ published 
+-----------
+         1
+(1 row)
+
+-- b12's are as they were
+SET catalog_branch = :b12;
+SELECT count(*) FROM app.m;
+ count 
+-------
+     2
+(1 row)
+
+SET catalog_branch_filter = off;
+SELECT count(*) AS publication_members FROM pg_publication_rel r
+	JOIN pg_publication p ON p.oid = r.prpubid WHERE p.pubname = 'branch_copy_pub';
+ publication_members 
+---------------------
+                   2
+(1 row)
+
+RESET catalog_branch_filter;
+SET client_min_messages = warning;
+RESET catalog_branch;
+SELECT pg_branch_catalog_drop(:b12), pg_branch_catalog_drop(:b13);
+ pg_branch_catalog_drop | pg_branch_catalog_drop 
+------------------------+------------------------
+                        | 
+(1 row)
+
+DROP PUBLICATION branch_copy_pub;
+DROP TABLE pub.pp;
+RESET client_min_messages;
 SET client_min_messages = warning;
 SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3),
 	   pg_branch_catalog_drop(:b5), pg_branch_catalog_drop(:b7);
@@ -496,4 +632,5 @@ SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catal
                         |                        |                        |                        | 
 (1 row)
 
+DROP ACCESS METHOD heap2 CASCADE;
 DROP SCHEMA pub CASCADE;

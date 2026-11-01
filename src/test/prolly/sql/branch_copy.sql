@@ -118,9 +118,10 @@ RESET catalog_branch;
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
 
 -- a branch with an object the copy doesn't know is refused, and nothing made
+CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
 SET catalog_branch = :b3;
 CREATE SCHEMA app VERSIONED CREATE TABLE t (x int);
-CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int);
+CREATE TABLE app.u (x int) USING heap2;
 RESET catalog_branch;
 SELECT pg_branch_catalog_copy(:b3, :b4);
 SET catalog_branch_filter = off;
@@ -217,7 +218,68 @@ SELECT pg_branch_catalog_drop(:b9), pg_branch_catalog_drop(:b10);
 DROP ROLE regress_copy_reader;
 RESET client_min_messages;
 
+-- partitions, a foreign key into a shared partitioned table, aggregates,
+-- extended statistics, an extension of the branch's own, and membership
+-- of a shared publication
+SELECT pg_branch_id_allocate() AS b12 \gset
+SELECT pg_branch_id_allocate() AS b13 \gset
+CREATE TABLE pub.pp (id int PRIMARY KEY) PARTITION BY RANGE (id);
+CREATE TABLE pub.pp1 PARTITION OF pub.pp FOR VALUES FROM (0) TO (100);
+INSERT INTO pub.pp VALUES (1), (2);
+SET client_min_messages = warning;
+CREATE PUBLICATION branch_copy_pub;
+RESET client_min_messages;
+SET catalog_branch = :b12;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.m (k int, v int, r int REFERENCES pub.pp) PARTITION BY LIST (k);
+CREATE TABLE app.m1 PARTITION OF app.m FOR VALUES IN (1);
+CREATE TABLE app.mdef PARTITION OF app.m DEFAULT;
+CREATE INDEX m_v ON app.m (v);
+CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int, initcond = '0');
+CREATE STATISTICS app.m1_stats (dependencies) ON k, v FROM app.m1;
+CREATE EXTENSION pg_trgm SCHEMA app;
+SET client_min_messages = warning;
+ALTER PUBLICATION branch_copy_pub ADD TABLE app.m1;
+RESET client_min_messages;
+INSERT INTO app.m VALUES (1, 10, 1), (2, 20, 2);
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b12, :b13);
+
+SET catalog_branch = :b13;
+SELECT c.relname, c.relkind, c.relispartition, pg_get_expr(c.relpartbound, c.oid) AS bound
+FROM pg_class c WHERE c.relnamespace = 'app'::regnamespace AND c.relkind IN ('p', 'r', 'I', 'i')
+	AND c.relname LIKE 'm%' ORDER BY 1;
+SELECT inhrelid::regclass, inhparent::regclass FROM pg_inherits
+WHERE inhparent IN ('app.m'::regclass, 'app.m_v'::regclass) ORDER BY 1;
+SELECT indexrelid::regclass, indrelid::regclass FROM pg_index
+WHERE indexrelid = 'app.m_v'::regclass;
+INSERT INTO app.m VALUES (1, 11, 1), (3, 30, 2) RETURNING tableoid::regclass, k;
+INSERT INTO app.m VALUES (1, 12, 99);
+-- the foreign key into the shared partitioned table holds for the copy
+DELETE FROM pub.pp WHERE id = 2;
+SELECT app.total(v) FROM app.m;
+SELECT stxname FROM pg_statistic_ext WHERE stxrelid = 'app.m1'::regclass;
+SELECT extname, extnamespace::regnamespace FROM pg_extension WHERE extname = 'pg_trgm';
+SELECT round(app.similarity('abc', 'abd')::numeric, 2);
+SELECT count(*) AS published FROM pg_publication_tables
+WHERE pubname = 'branch_copy_pub' AND schemaname = 'app';
+-- b12's are as they were
+SET catalog_branch = :b12;
+SELECT count(*) FROM app.m;
+SET catalog_branch_filter = off;
+SELECT count(*) AS publication_members FROM pg_publication_rel r
+	JOIN pg_publication p ON p.oid = r.prpubid WHERE p.pubname = 'branch_copy_pub';
+RESET catalog_branch_filter;
+
+SET client_min_messages = warning;
+RESET catalog_branch;
+SELECT pg_branch_catalog_drop(:b12), pg_branch_catalog_drop(:b13);
+DROP PUBLICATION branch_copy_pub;
+DROP TABLE pub.pp;
+RESET client_min_messages;
+
 SET client_min_messages = warning;
 SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3),
 	   pg_branch_catalog_drop(:b5), pg_branch_catalog_drop(:b7);
+DROP ACCESS METHOD heap2 CASCADE;
 DROP SCHEMA pub CASCADE;
