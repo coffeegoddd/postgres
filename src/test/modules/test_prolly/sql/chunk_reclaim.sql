@@ -54,9 +54,17 @@ SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
 -- the anchor let go of, everything freed: VACUUM cuts the free tail off,
--- the whole log but its meta page
+-- the whole log but its meta page; not with TRUNCATE off, nor with
+-- vacuum_truncate off (a cut's lock conflicts with a hot standby's readers)
 SELECT roots FROM test_chunk_unref_root('qi', h(blob('anchor')));
 SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
+SELECT pg_relation_size('ql') AS before_cut \gset
+VACUUM (TRUNCATE off) qi;
+SELECT pg_relation_size('ql') = :before_cut AS not_cut_truncate_off;
+SET vacuum_truncate = off;
+VACUUM qi;
+SELECT pg_relation_size('ql') = :before_cut AS not_cut_vacuum_truncate_off;
+RESET vacuum_truncate;
 VACUUM qi;
 SELECT pages, pg_relation_size('ql') = current_setting('block_size')::int AS meta_page_only
 FROM test_chunk_log_space('ql');

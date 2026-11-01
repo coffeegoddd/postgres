@@ -178,9 +178,10 @@ extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
 /*
  * For the access method: takes out the entries of transactions that
  * aborted, notes on every other whether its transaction committed, and
- * advances the relation's relfrozenxid.
+ * advances the relation's relfrozenxid; and cuts its log's free tail off
+ * if truncate (VACUUM's TRUNCATE option, or vacuum_truncate).
  */
-extern void ChunkIndexVacuum(Relation idx);
+extern void ChunkIndexVacuum(Relation idx, bool truncate);
 
 /* For tests: the entries on the buckets' pages not frozen. */
 extern uint64 ChunkIndexUnfrozen(Relation idx);
