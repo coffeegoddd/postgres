@@ -1236,7 +1236,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 }
 
 static bool
-page_insert(Relation idx, ChunkIndexEntry *entry)
+page_insert(Relation idx, ChunkIndexEntry *entry, bool *added)
 {
 	uint32		bucket;
 	IndexCache	masks;
@@ -1277,6 +1277,8 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 		break;
 	}
 	grew = add_entry(idx, primary, bucket, space, last, entry);
+	if (added)
+		*added = true;
 	UnlockReleaseBuffer(primary);
 
 	/* (counted as a table's inserts are, so that autovacuum VACUUMs it) */

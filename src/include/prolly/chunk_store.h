@@ -79,6 +79,13 @@ extern bool ChunkStorePutData(Relation log, Relation idx, const void *data,
  * the log together, in one pass, and a chunk may reference another of the
  * pack, before or after it (a pack's order is its own).  Chunks the store
  * has, and those named twice, are put once.  How many it stored.
+ *
+ * Its entries go in in a subtransaction of their own, so that an error
+ * after the bytes are appended counts those no entry names dead: a
+ * transaction putting many packs takes a subtransaction id for each (past
+ * 64, every snapshot in the cluster reads pg_subtrans until it ends), so
+ * put a transaction's chunks as one pack, or few.  A FATAL error or a crash
+ * between the append and the last entry leaves those bytes uncounted.
  */
 extern uint64 ChunkStorePutMany(Relation log, Relation idx, int n,
 								const uint8 *hashes, const void *const *datas,

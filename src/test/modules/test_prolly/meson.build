@@ -33,6 +33,18 @@ test_install_data += files(
   'test_prolly--1.0.sql',
 )
 
+test_prolly_isolation = [
+  'bmap_shared_writers',
+  'chunk_index_put_wait',
+  'chunk_roots_wait',
+  'chunk_free_wait',
+  'chunk_pack_put_wait',
+]
+# (these need injection points)
+if get_option('injection_points')
+  test_prolly_isolation += ['chunk_pack_order', 'chunk_pack_error']
+endif
+
 tests += {
   'name': 'test_prolly',
   'sd': meson.current_source_dir(),
@@ -66,14 +78,7 @@ tests += {
   },
   'isolation': {
     'regress_args': ['--temp-config', files('chunk_store_isolation.conf')],
-    'specs': [
-      'bmap_shared_writers',
-      'chunk_index_put_wait',
-      'chunk_roots_wait',
-      'chunk_free_wait',
-      'chunk_pack_put_wait',
-      'chunk_pack_order',
-    ],
+    'specs': test_prolly_isolation,
   },
   'tap': {
     'tests': [
