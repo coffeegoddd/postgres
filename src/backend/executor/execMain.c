@@ -177,12 +177,6 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
 	estate = CreateExecutorState();
 
-	/*
-	 * The branch the query's catalog scans see, and its names resolve on,
-	 * each time it runs: a cursor's rows are one branch's, though the session
-	 * changes branch between fetches
-	 */
-	estate->es_catalog_branch = catalog_branch;
 	queryDesc->estate = estate;
 
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
@@ -398,11 +392,11 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	 */
 	estate->es_total_processed += estate->es_processed;
 
+	CatalogBranchLeave(branch_nestlevel);
+
 	/*
 	 * shutdown tuple receiver, if we started it
 	 */
-	CatalogBranchLeave(branch_nestlevel);
-
 	if (sendTuples)
 		dest->rShutdown(dest);
 
@@ -566,6 +560,7 @@ ExecutorRewind(QueryDesc *queryDesc)
 {
 	EState	   *estate;
 	MemoryContext oldcontext;
+	int			branch_nestlevel;
 
 	/* sanity checks */
 	Assert(queryDesc != NULL);
@@ -583,9 +578,11 @@ ExecutorRewind(QueryDesc *queryDesc)
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/*
-	 * rescan plan
+	 * rescan plan (on the query's branch: a rescan evaluates expressions)
 	 */
+	branch_nestlevel = CatalogBranchEnter(estate->es_catalog_branch);
 	ExecReScan(queryDesc->planstate);
+	CatalogBranchLeave(branch_nestlevel);
 
 	MemoryContextSwitchTo(oldcontext);
 }

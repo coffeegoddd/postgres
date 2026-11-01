@@ -57,6 +57,7 @@
 #include "parser/parse_relation.h"
 #include "partitioning/partdesc.h"
 #include "port/pg_bitutils.h"
+#include "prolly/branch_catalog.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -113,6 +114,14 @@ CreateExecutorState(void)
 	 */
 	estate->es_direction = ForwardScanDirection;
 	estate->es_snapshot = InvalidSnapshot;	/* caller must initialize this */
+
+	/*
+	 * The branch the query's catalog scans see, and its names resolve on,
+	 * each time it runs (ExecutorRun() and the others go back to it): a
+	 * cursor's rows are one branch's, though the session changes branch
+	 * between fetches
+	 */
+	estate->es_catalog_branch = catalog_branch;
 	estate->es_crosscheck_snapshot = InvalidSnapshot;	/* no crosscheck */
 	estate->es_range_table = NIL;
 	estate->es_range_table_size = 0;
