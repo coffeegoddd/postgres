@@ -120,6 +120,32 @@ pin(const uint8 *hash)
 	(void) hash_search(pins, hash, HASH_ENTER, NULL);
 }
 
+static bool
+mem_hold(ChunkStore *cs, const uint8 *hash)
+{
+	if (find(hash) == NULL)
+		return false;
+	pin(hash);
+	return true;
+}
+
+static void
+mem_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
+{
+	HASH_SEQ_STATUS seq;
+	MemChunk   *c;
+
+	if (chunks == NULL)
+		return;
+	hash_seq_init(&seq, chunks);
+	while ((c = hash_seq_search(&seq)) != NULL)
+	{
+		ChunkCounts counts = {.refs = c->refs, .roots = c->roots};
+
+		fn(arg, c->hash, c->len, &counts);
+	}
+}
+
 typedef struct RefList
 {
 	uint8	   *hashes;
@@ -500,6 +526,8 @@ const ChunkStoreRoutine MemoryChunkStore = {
 	.counts = mem_counts,
 	.free = mem_free,
 	.free_unheld = mem_free_unheld,
+	.hold = mem_hold,
+	.visit = mem_visit,
 	.check = mem_check,
 };
 

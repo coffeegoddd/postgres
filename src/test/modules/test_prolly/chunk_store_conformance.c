@@ -43,6 +43,9 @@ PG_FUNCTION_INFO_V1(test_cs_free_unheld);
 PG_FUNCTION_INFO_V1(test_cs_check);
 PG_FUNCTION_INFO_V1(test_cs_reset_memory);
 PG_FUNCTION_INFO_V1(test_cs_memory_miscount);
+PG_FUNCTION_INFO_V1(test_cs_hold);
+PG_FUNCTION_INFO_V1(test_cs_visit);
+PG_FUNCTION_INFO_V1(test_cs_stats);
 
 static ChunkStore *
 store_arg(FunctionCallInfo fcinfo)
@@ -306,4 +309,68 @@ test_cs_memory_miscount(PG_FUNCTION_ARGS)
 {
 	MemoryChunkStoreMiscount(hash_arg(fcinfo, 0));
 	PG_RETURN_VOID();
+}
+
+/* test_cs_hold(store, hash): whether the store has it, held if so */
+Datum
+test_cs_hold(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(cs_hold(store_arg(fcinfo), hash_arg(fcinfo, 1)));
+}
+
+typedef struct VisitRows
+{
+	ReturnSetInfo *rsinfo;
+} VisitRows;
+
+static void
+visit_row(void *arg, const uint8 *hash, uint32 len, const ChunkCounts *counts)
+{
+	ReturnSetInfo *rsinfo = ((VisitRows *) arg)->rsinfo;
+	bytea	   *h = palloc(VARHDRSZ + CHUNK_HASH_LEN);
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+
+	SET_VARSIZE(h, VARHDRSZ + CHUNK_HASH_LEN);
+	memcpy(VARDATA(h), hash, CHUNK_HASH_LEN);
+	values[0] = PointerGetDatum(h);
+	values[1] = Int64GetDatum(len);
+	values[2] = Int64GetDatum(counts->refs);
+	values[3] = Int64GetDatum(counts->roots);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/* test_cs_visit(store): each chunk this transaction sees, with its counts */
+Datum
+test_cs_visit(PG_FUNCTION_ARGS)
+{
+	VisitRows	rows;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rows.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	cs_visit(store_arg(fcinfo), visit_row, &rows);
+	return (Datum) 0;
+}
+
+/* test_cs_stats(store, reset): what the store was asked; then reset, if so */
+Datum
+test_cs_stats(PG_FUNCTION_ARGS)
+{
+	ChunkStore *cs = store_arg(fcinfo);
+	const ChunkStoreStats *st = cs_stats(cs);
+	TupleDesc	desc;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum((int64) st->gets);
+	values[1] = Int64GetDatum((int64) st->found);
+	values[2] = Int64GetDatum((int64) st->puts);
+	values[3] = Int64GetDatum((int64) st->stored);
+	values[4] = Int64GetDatum((int64) st->holds);
+	values[5] = Int64GetDatum((int64) st->freed);
+	if (PG_GETARG_BOOL(1))
+		cs_stats_reset(cs);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }

@@ -61,6 +61,24 @@ typedef struct ChunkCounts
 	uint32		roots;
 } ChunkCounts;
 
+/* A chunk as a visit of the store sees it. */
+typedef void (*ChunkVisitFn) (void *arg, const uint8 *hash, uint32 len,
+							  const ChunkCounts *counts);
+
+/*
+ * What a store was asked, counted by the cs_* calls since it was opened (or
+ * its counts reset): for tests and benchmarks to hold costs to.
+ */
+typedef struct ChunkStoreStats
+{
+	uint64		gets;			/* chunks asked for (get, get_many) */
+	uint64		found;			/* ... and found */
+	uint64		puts;			/* chunks put (put, put_many) */
+	uint64		stored;			/* ... and stored (the store had them not) */
+	uint64		holds;			/* chunks held (hold) */
+	uint64		freed;			/* chunks freed (free, free_unheld) */
+} ChunkStoreStats;
+
 typedef struct ChunkStoreRoutine
 {
 	/* puts, root changes and frees are their transactions' */
@@ -71,7 +89,11 @@ typedef struct ChunkStoreRoutine
 
 	bool		(*has) (ChunkStore *cs, const uint8 *hash);
 
-	/* The chunk's bytes, palloc'd, and their length; NULL if absent. */
+	/*
+	 * The chunk's bytes and their length; NULL if absent.  The bytes are a
+	 * copy, palloc'd in the caller's memory context, the caller's to free:
+	 * a long walk resets a context of its own a batch at a time.
+	 */
 	void	   *(*get) (ChunkStore *cs, const uint8 *hash, uint32 *len);
 
 	/*
@@ -104,6 +126,14 @@ typedef struct ChunkStoreRoutine
 	uint64		(*put_many) (ChunkStore *cs, int n, const uint8 *hashes,
 							 const void *const *datas, const uint32 *lens);
 
+	/*
+	 * Whether the store has the chunk, held until the transaction ends if
+	 * so, as a put finding it holds it: for a chunk about to be referenced
+	 * (a root taken, a parent put) without being put, whose freeing
+	 * meanwhile would make that an error.
+	 */
+	bool		(*hold) (ChunkStore *cs, const uint8 *hash);
+
 	/* A root taken or let go of; of a chunk the store hasn't, an error. */
 	void		(*ref_root) (ChunkStore *cs, const uint8 *hash);
 	void		(*unref_root) (ChunkStore *cs, const uint8 *hash);
@@ -121,6 +151,13 @@ typedef struct ChunkStoreRoutine
 	uint64		(*free_unheld) (ChunkStore *cs);
 
 	/*
+	 * Calls fn with each chunk this transaction sees, its counts as it
+	 * sees them, in no order (O(store): archives, repair, audits).  fn may
+	 * not change the store.
+	 */
+	void		(*visit) (ChunkStore *cs, ChunkVisitFn fn, void *arg);
+
+	/*
 	 * The audit: every chunk's bytes its own, every chunk it references
 	 * there, every count of references the edges to it; the chunks, and
 	 * those with no references and no roots (holds, transient, aside), in
@@ -133,6 +170,7 @@ typedef struct ChunkStoreRoutine
 struct ChunkStore
 {
 	const ChunkStoreRoutine *routine;
+	ChunkStoreStats stats;		/* counted by the cs_* calls */
 };
 
 extern PGDLLIMPORT const ChunkStoreRoutine PagesChunkStore;
@@ -160,26 +198,51 @@ cs_has(ChunkStore *cs, const uint8 *hash)
 static inline void *
 cs_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 {
-	return cs->routine->get(cs, hash, len);
+	void	   *data = cs->routine->get(cs, hash, len);
+
+	cs->stats.gets++;
+	if (data != NULL)
+		cs->stats.found++;
+	return data;
 }
 
 static inline void
 cs_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out, uint32 *lens)
 {
 	cs->routine->get_many(cs, hashes, n, out, lens);
+	cs->stats.gets += n;
+	for (int i = 0; i < n; i++)
+		if (out[i] != NULL)
+			cs->stats.found++;
 }
 
 static inline bool
 cs_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
-	return cs->routine->put(cs, data, len, hash);
+	bool		stored = cs->routine->put(cs, data, len, hash);
+
+	cs->stats.puts++;
+	if (stored)
+		cs->stats.stored++;
+	return stored;
 }
 
 static inline uint64
 cs_put_many(ChunkStore *cs, int n, const uint8 *hashes, const void *const *datas,
 			const uint32 *lens)
 {
-	return cs->routine->put_many(cs, n, hashes, datas, lens);
+	uint64		stored = cs->routine->put_many(cs, n, hashes, datas, lens);
+
+	cs->stats.puts += n;
+	cs->stats.stored += stored;
+	return stored;
+}
+
+static inline bool
+cs_hold(ChunkStore *cs, const uint8 *hash)
+{
+	cs->stats.holds++;
+	return cs->routine->hold(cs, hash);
 }
 
 static inline void
@@ -203,13 +266,38 @@ cs_counts(ChunkStore *cs, const uint8 *hash, ChunkCounts *out)
 static inline uint64
 cs_free(ChunkStore *cs, const uint8 *hashes, int n)
 {
-	return cs->routine->free(cs, hashes, n);
+	uint64		freed = cs->routine->free(cs, hashes, n);
+
+	cs->stats.freed += freed;
+	return freed;
 }
 
 static inline uint64
 cs_free_unheld(ChunkStore *cs)
 {
-	return cs->routine->free_unheld(cs);
+	uint64		freed = cs->routine->free_unheld(cs);
+
+	cs->stats.freed += freed;
+	return freed;
+}
+
+static inline void
+cs_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
+{
+	cs->routine->visit(cs, fn, arg);
+}
+
+/* What the store was asked since it was opened, or its counts reset. */
+static inline const ChunkStoreStats *
+cs_stats(ChunkStore *cs)
+{
+	return &cs->stats;
+}
+
+static inline void
+cs_stats_reset(ChunkStore *cs)
+{
+	memset(&cs->stats, 0, sizeof(cs->stats));
 }
 
 static inline bool

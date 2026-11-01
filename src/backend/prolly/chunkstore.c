@@ -218,6 +218,44 @@ pages_free_unheld(ChunkStore *cs)
 }
 
 static bool
+pages_hold(ChunkStore *cs, const uint8 *hash)
+{
+	Relation	idx;
+	bool		held;
+
+	open_store(RowExclusiveLock, NULL, &idx);
+	held = ChunkStoreHold(idx, hash);
+	close_store(NULL, idx);
+	return held;
+}
+
+typedef struct PagesVisit
+{
+	ChunkVisitFn fn;
+	void	   *arg;
+} PagesVisit;
+
+static void
+pages_visit_entry(void *arg, const ChunkIndexEntry *e)
+{
+	PagesVisit *v = arg;
+	ChunkCounts counts = {.refs = e->refs, .roots = e->roots};
+
+	v->fn(v->arg, e->hash, e->len, &counts);
+}
+
+static void
+pages_visit(ChunkStore *cs, ChunkVisitFn fn, void *arg)
+{
+	Relation	idx;
+	PagesVisit	v = {.fn = fn, .arg = arg};
+
+	open_store(AccessShareLock, NULL, &idx);
+	ChunkIndex->visit(idx, pages_visit_entry, &v);
+	close_store(NULL, idx);
+}
+
+static bool
 pages_check(ChunkStore *cs, uint64 *chunks, uint64 *unheld, char **why)
 {
 	Relation	log,
@@ -247,5 +285,7 @@ const ChunkStoreRoutine PagesChunkStore = {
 	.counts = pages_counts,
 	.free = pages_free,
 	.free_unheld = pages_free_unheld,
+	.hold = pages_hold,
+	.visit = pages_visit,
 	.check = pages_check,
 };
