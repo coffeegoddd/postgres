@@ -920,6 +920,9 @@
   proname => 'prolly_chunk_index_tableam_handler', provolatile => 'v',
   prorettype => 'table_am_handler', proargtypes => 'internal',
   prosrc => 'prolly_chunk_index_tableam_handler' },
+{ oid => '9768', descr => 'keep the roots of the history store\'s pointers',
+  proname => 'pg_history_pointer_changed', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '', prosrc => 'pg_history_pointer_changed' },
 
 # Index access method handlers
 { oid => '330', descr => 'btree index access method handler',

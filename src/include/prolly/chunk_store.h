@@ -28,6 +28,14 @@
  */
 extern void ChunkHash(const void *data, size_t len, uint8 *out);
 
+/*
+ * The relations of this database's history store, from initdb:
+ * pg_history.chunks, pg_history.chunk_index and pg_history.pointers.
+ */
+extern Oid	ChunkStoreLogRelid(void);
+extern Oid	ChunkStoreIndexRelid(void);
+extern Oid	ChunkStorePointersRelid(void);
+
 /* Whether the store has the chunk named hash. */
 extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 
