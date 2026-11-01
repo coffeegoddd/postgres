@@ -18,6 +18,7 @@ setup
 			CREATE TABLE app.t (id int PRIMARY KEY, v int);
 			INSERT INTO app.t VALUES (1, 10), (2, 20);
 		END LOOP;
+		PERFORM set_config('catalog_branch', '0', false);
 	END $$;
 }
 
