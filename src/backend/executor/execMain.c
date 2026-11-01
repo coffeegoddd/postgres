@@ -56,6 +56,7 @@
 #include "nodes/queryjumble.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -175,6 +176,13 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * Build EState, switch into per-query memory context for startup.
 	 */
 	estate = CreateExecutorState();
+
+	/*
+	 * The branch the query's catalog scans see, and its names resolve on,
+	 * each time it runs: a cursor's rows are one branch's, though the session
+	 * changes branch between fetches
+	 */
+	estate->es_catalog_branch = catalog_branch;
 	queryDesc->estate = estate;
 
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
@@ -323,6 +331,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	DestReceiver *dest;
 	bool		sendTuples;
 	MemoryContext oldcontext;
+	int			branch_nestlevel;
 
 	/* sanity checks */
 	Assert(queryDesc != NULL);
@@ -361,6 +370,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	if (sendTuples)
 		dest->rStartup(dest, operation, queryDesc->tupDesc);
 
+	branch_nestlevel = CatalogBranchEnter(estate->es_catalog_branch);
+
 	/*
 	 * Run plan, unless direction is NoMovement.
 	 *
@@ -390,6 +401,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	/*
 	 * shutdown tuple receiver, if we started it
 	 */
+	CatalogBranchLeave(branch_nestlevel);
+
 	if (sendTuples)
 		dest->rShutdown(dest);
 
@@ -427,6 +440,7 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 {
 	EState	   *estate;
 	MemoryContext oldcontext;
+	int			branch_nestlevel;
 
 	/* sanity checks */
 	Assert(queryDesc != NULL);
@@ -446,12 +460,16 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	if (queryDesc->query_instr)
 		InstrStart(queryDesc->query_instr);
 
+	branch_nestlevel = CatalogBranchEnter(estate->es_catalog_branch);
+
 	/* Run ModifyTable nodes to completion */
 	ExecPostprocessPlan(estate);
 
 	/* Execute queued AFTER triggers, unless told not to */
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
+
+	CatalogBranchLeave(branch_nestlevel);
 
 	if (queryDesc->query_instr)
 		InstrStop(queryDesc->query_instr);

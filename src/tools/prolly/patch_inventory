@@ -93,6 +93,7 @@ patch src/backend/commands/subscriptioncmds.c  1b  the catalog_branch option: th
 patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's; also (1b) refuses SET UNLOGGED in a versioned schema
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
+patch src/backend/executor/execMain.c  1b  a query runs on the branch it started on (es_catalog_branch, CatalogBranchEnter())
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
 patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
@@ -166,6 +167,7 @@ patch src/include/catalog/storage.h  1a  declares storage creation in a chosen s
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly
 patch src/include/common/relpath.h  1a  the block map fork number
 patch src/include/meson.build  0  installs the engine's headers in src/include/prolly
+patch src/include/nodes/execnodes.h  1b  EState.es_catalog_branch
 patch src/include/nodes/parsenodes.h  1b  CreateSchemaStmt.versioned
 patch src/include/parser/kwlist.h  1b  the VERSIONED keyword
 patch src/include/pgstat.h  1a  the block map's statistics: counts, entry, functions; PGSTAT_FILE_FORMAT_ID bumped
