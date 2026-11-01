@@ -2,3 +2,4 @@
 test: branch_extension_races
 test: branch_drop_races
 test: branch_copy_races
+test: branch_locks
