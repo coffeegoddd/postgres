@@ -1,0 +1,166 @@
+-- The history store's index: a chunk's hash to its place in the log and its
+-- counts, by linear hashing in pages of its own; chunks put, got and found
+-- over a log and its index.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+CREATE TABLE cl () USING prolly_chunks;
+CREATE TABLE ci () USING prolly_chunk_index;
+CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+-- a new index: its meta page, directory and first buckets
+SELECT * FROM test_chunk_index_shape('ci');
+ buckets | pages 
+---------+-------
+       8 |    10
+(1 row)
+
+-- one chunk, put once
+SELECT test_chunk_put('cl', 'ci', h('\x616263'), '\x616263') AS stored;
+ stored 
+--------
+ t
+(1 row)
+
+SELECT test_chunk_put('cl', 'ci', h('\x616263'), '\x616263') AS stored_again;
+ stored_again 
+--------------
+ f
+(1 row)
+
+SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has,
+	test_chunk_get('cl', 'ci', h('\x616263')) AS got,
+	test_chunk_has('cl', 'ci', h('\x646566')) AS has_other,
+	test_chunk_get('cl', 'ci', h('\x646566')) IS NULL AS got_other_null;
+ has |   got    | has_other | got_other_null 
+-----+----------+-----------+----------------
+ t   | \x616263 | f         | t
+(1 row)
+
+SELECT len, refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
+ len | refs | roots 
+-----+------+-------
+   3 |    0 |     0
+(1 row)
+
+-- its counts, changed in place, never below zero
+SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), 2, 1);
+ refs | roots 
+------+-------
+    2 |     1
+(1 row)
+
+SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), -1, 0);
+ refs | roots 
+------+-------
+    1 |     1
+(1 row)
+
+SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), -2, 0);
+ERROR:  a chunk's reference counts would be -1 and 1
+SELECT * FROM test_chunk_index_adjust('ci', h('\x646566'), 1, 0);
+ refs | roots 
+------+-------
+      |      
+(1 row)
+
+SELECT refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
+ refs | roots 
+------+-------
+    1 |     1
+(1 row)
+
+-- removed
+SELECT test_chunk_index_remove('ci', h('\x616263')) AS removed;
+ removed 
+---------
+ t
+(1 row)
+
+SELECT test_chunk_index_remove('ci', h('\x616263')) AS removed_again;
+ removed_again 
+---------------
+ f
+(1 row)
+
+SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after;
+ has_after 
+-----------
+ f
+(1 row)
+
+-- 50,000 chunks: the index grows a bucket at a time, and every chunk is
+-- found, and none that wasn't put
+SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(d), d)) AS stored
+FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000) g) s;
+ stored 
+--------
+  50000
+(1 row)
+
+SELECT buckets > 200 AS grew, pages < buckets * 2 AS chains_short
+FROM test_chunk_index_shape('ci');
+ grew | chains_short 
+------+--------------
+ t    | t
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_get('cl', 'ci', h(d)) = d) AS found
+FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000) g) s;
+ found 
+-------
+ 50000
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci', h(d))) AS found_unput
+FROM (SELECT convert_to('none ' || g, 'UTF8') AS d FROM generate_series(1, 1000) g) s;
+ found_unput 
+-------------
+           0
+(1 row)
+
+-- half removed: the rest found, the half not, and put again
+SELECT count(*) FILTER (WHERE test_chunk_index_remove('ci', h(d))) AS removed
+FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000, 2) g) s;
+ removed 
+---------
+   25000
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci', h(d))) AS found,
+	count(*) FILTER (WHERE g % 2 = 0 AND test_chunk_has('cl', 'ci', h(d))) AS found_kept
+FROM (SELECT g, convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000) g) s;
+ found | found_kept 
+-------+------------
+ 25000 |      25000
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(d), d)) AS stored_again
+FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000, 2) g) s;
+ stored_again 
+--------------
+        25000
+(1 row)
+
+-- truncated, it starts again
+TRUNCATE ci;
+SELECT * FROM test_chunk_index_shape('ci');
+ buckets | pages 
+---------+-------
+       8 |    10
+(1 row)
+
+SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
+ has_after_truncate 
+--------------------
+ f
+(1 row)
+
+-- no tuples, no rewrites
+INSERT INTO ci DEFAULT VALUES;
+ERROR:  a history store relation does not support inserting tuples
+ALTER TABLE ci SET ACCESS METHOD heap;
+ERROR:  cannot rewrite history store relation "ci"
+SELECT test_chunk_index_shape('cl');
+ERROR:  "cl" is not a chunk index relation
+DROP TABLE cl, ci;
+DROP FUNCTION h(bytea);

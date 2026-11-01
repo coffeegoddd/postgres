@@ -66,6 +66,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "replication/logicalrelation.h"
 #include "storage/bufmgr.h"
@@ -1290,10 +1291,10 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	OldHeapDesc = RelationGetDescr(OldHeap);
 
 	/* (a chunk log's bytes are no tuples: a rewrite would leave it empty) */
-	if (RelationIsChunkLog(OldHeap))
+	if (RelationIsChunkLog(OldHeap) || RelationIsChunkIndex(OldHeap))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot rewrite chunk log relation \"%s\"",
+				 errmsg("cannot rewrite history store relation \"%s\"",
 						RelationGetRelationName(OldHeap))));
 
 	/*

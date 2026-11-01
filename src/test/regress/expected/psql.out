@@ -5202,34 +5202,36 @@ Indexes:
 
 -- check printing info about access methods
 \dA
-List of access methods
-     Name      | Type  
----------------+-------
- brin          | Index
- btree         | Index
- gin           | Index
- gist          | Index
- hash          | Index
- heap          | Table
- heap2         | Table
- prolly_chunks | Table
- spgist        | Index
-(9 rows)
+   List of access methods
+        Name        | Type  
+--------------------+-------
+ brin               | Index
+ btree              | Index
+ gin                | Index
+ gist               | Index
+ hash               | Index
+ heap               | Table
+ heap2              | Table
+ prolly_chunk_index | Table
+ prolly_chunks      | Table
+ spgist             | Index
+(10 rows)
 
 \dA *
-List of access methods
-     Name      | Type  
----------------+-------
- brin          | Index
- btree         | Index
- gin           | Index
- gist          | Index
- hash          | Index
- heap          | Table
- heap2         | Table
- prolly_chunks | Table
- spgist        | Index
-(9 rows)
+   List of access methods
+        Name        | Type  
+--------------------+-------
+ brin               | Index
+ btree              | Index
+ gin                | Index
+ gist               | Index
+ hash               | Index
+ heap               | Table
+ heap2              | Table
+ prolly_chunk_index | Table
+ prolly_chunks      | Table
+ spgist             | Index
+(10 rows)
 
 \dA h*
 List of access methods
@@ -5254,34 +5256,36 @@ List of access methods
 
 \dA: extra argument "bar" ignored
 \dA+
-                                     List of access methods
-     Name      | Type  |            Handler            |              Description               
----------------+-------+-------------------------------+----------------------------------------
- brin          | Index | brinhandler                   | block range index (BRIN) access method
- btree         | Index | bthandler                     | b-tree index access method
- gin           | Index | ginhandler                    | GIN index access method
- gist          | Index | gisthandler                   | GiST index access method
- hash          | Index | hashhandler                   | hash index access method
- heap          | Table | heap_tableam_handler          | heap table access method
- heap2         | Table | heap_tableam_handler          | 
- prolly_chunks | Table | prolly_chunks_tableam_handler | chunk log table access method
- spgist        | Index | spghandler                    | SP-GiST index access method
-(9 rows)
+                                          List of access methods
+        Name        | Type  |              Handler               |              Description               
+--------------------+-------+------------------------------------+----------------------------------------
+ brin               | Index | brinhandler                        | block range index (BRIN) access method
+ btree              | Index | bthandler                          | b-tree index access method
+ gin                | Index | ginhandler                         | GIN index access method
+ gist               | Index | gisthandler                        | GiST index access method
+ hash               | Index | hashhandler                        | hash index access method
+ heap               | Table | heap_tableam_handler               | heap table access method
+ heap2              | Table | heap_tableam_handler               | 
+ prolly_chunk_index | Table | prolly_chunk_index_tableam_handler | chunk index table access method
+ prolly_chunks      | Table | prolly_chunks_tableam_handler      | chunk log table access method
+ spgist             | Index | spghandler                         | SP-GiST index access method
+(10 rows)
 
 \dA+ *
-                                     List of access methods
-     Name      | Type  |            Handler            |              Description               
----------------+-------+-------------------------------+----------------------------------------
- brin          | Index | brinhandler                   | block range index (BRIN) access method
- btree         | Index | bthandler                     | b-tree index access method
- gin           | Index | ginhandler                    | GIN index access method
- gist          | Index | gisthandler                   | GiST index access method
- hash          | Index | hashhandler                   | hash index access method
- heap          | Table | heap_tableam_handler          | heap table access method
- heap2         | Table | heap_tableam_handler          | 
- prolly_chunks | Table | prolly_chunks_tableam_handler | chunk log table access method
- spgist        | Index | spghandler                    | SP-GiST index access method
-(9 rows)
+                                          List of access methods
+        Name        | Type  |              Handler               |              Description               
+--------------------+-------+------------------------------------+----------------------------------------
+ brin               | Index | brinhandler                        | block range index (BRIN) access method
+ btree              | Index | bthandler                          | b-tree index access method
+ gin                | Index | ginhandler                         | GIN index access method
+ gist               | Index | gisthandler                        | GiST index access method
+ hash               | Index | hashhandler                        | hash index access method
+ heap               | Table | heap_tableam_handler               | heap table access method
+ heap2              | Table | heap_tableam_handler               | 
+ prolly_chunk_index | Table | prolly_chunk_index_tableam_handler | chunk index table access method
+ prolly_chunks      | Table | prolly_chunks_tableam_handler      | chunk log table access method
+ spgist             | Index | spghandler                         | SP-GiST index access method
+(10 rows)
 
 \dA+ h*
                      List of access methods
