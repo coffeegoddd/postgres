@@ -48,6 +48,8 @@ is($sub->safe_psql('postgres', 'SELECT string_agg(v, \',\' ORDER BY id) FROM app
 on($b1, "INSERT INTO app.t VALUES (2, 'b$b1 second')");
 on($b2, "INSERT INTO app.t VALUES (3, 'b$b2 second')");
 $pub->wait_for_catchup('s');
+# (the publication names b2's table, so b1's isn't published anyway; that
+# decoding leaves another branch's changes out is t/202's)
 is($sub->safe_psql('postgres', 'SELECT string_agg(v, \',\' ORDER BY id) FROM app.t'),
 	"b$b2 first,b$b2 second", 'and its changes are the branch\'s, not the other branch\'s');
 
