@@ -24,6 +24,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/partition.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_publication.h"
@@ -184,6 +185,7 @@ is_publishable_class(Oid relid, Form_pg_class reltuple)
 		!IsCatalogRelationOid(relid) &&
 		!IsConflictLogTableClass(reltuple) &&
 		reltuple->relpersistence == RELPERSISTENCE_PERMANENT &&
+		reltuple->relam != PROLLY_CHUNKS_TABLE_AM_OID &&
 		relid >= FirstNormalObjectId;
 }
 

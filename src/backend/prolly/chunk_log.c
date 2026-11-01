@@ -8,7 +8,11 @@
  * The access method exists so the pages are the log's: nothing reads them
  * as heap pages.  It creates, copies and truncates the relation's storage;
  * VACUUM and ANALYZE pass it by, a scan finds no tuples, and everything
- * else refuses.  The log's changes are WAL-logged with generic records.
+ * else refuses, as does any rewrite of the relation (make_new_heap()),
+ * which would copy no tuples and so leave the log empty.  pg_dump writes
+ * the relation and none of its bytes, its table data being its tuples;
+ * publications leave it out.  The log's changes are WAL-logged with
+ * generic records.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -26,9 +30,11 @@
 #include "catalog/storage_xlog.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -139,16 +145,20 @@ static uint64
 page_append(Relation rel, const void *data, size_t len)
 {
 	const char *bytes = data;
-	Buffer		mbuf = log_buffer(rel, META_BLOCK);
+	Buffer		mbuf;
 	uint64		start,
 				end;
 
 	/*
 	 * The transaction appending gets an id, so that its commit flushes the
-	 * WAL of what it appended (one without would commit without a record)
+	 * WAL of what it appended (one without would commit without a record);
+	 * before any buffer is touched, as getting one can fail
 	 */
+	PreventCommandIfReadOnly("append to a chunk log");
 	(void) GetCurrentTransactionId();
+	Assert(CheckRelationLockedByMe(rel, ExclusiveLock, true));
 
+	mbuf = log_buffer(rel, META_BLOCK);
 	if (PageIsNew(BufferGetPage(mbuf)))
 	{
 		GenericXLogState *st = GenericXLogStart(rel);
@@ -166,38 +176,68 @@ page_append(Relation rel, const void *data, size_t len)
 		GenericXLogFinish(st);
 	}
 	start = end = page_meta(rel, BufferGetPage(mbuf))->end;
+	LockBuffer(mbuf, BUFFER_LOCK_UNLOCK);
 
-	/* a page at a time, each change with the log's new end */
+	/*
+	 * A page at a time, each page's change logged with the log's new end:
+	 * the meta page is locked only for each, so readers wait for a page's
+	 * change at most (the log's only writer is this one, which holds the
+	 * relation's ExclusiveLock).
+	 */
 	while (len > 0)
 	{
 		BlockNumber blk = LOC_BLOCK(end);
 		size_t		off = LOC_OFFSET(end),
 					n = Min(len, AREA - off);
-		Buffer		buf = log_buffer(rel, blk);
-		bool		fresh = PageIsNew(BufferGetPage(buf)) || off == 0;
-		GenericXLogState *st = GenericXLogStart(rel);
-		Page		page = GenericXLogRegisterBuffer(st, buf,
-													 fresh ? GENERIC_XLOG_FULL_IMAGE : 0);
-		Page		mpage = GenericXLogRegisterBuffer(st, mbuf, 0);
+		Buffer		buf;
+		GenericXLogState *st;
+		Page		page;
+		Page		mpage;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = log_buffer(rel, blk);
 
 		/*
-		 * (a page past the log's end is new, or left by an append a crash
-		 * cut short: either way written afresh)
+		 * A page the log begins in is past its end, and new; one it goes on
+		 * in holds the log's bytes up to its end.  Anything else is not what
+		 * the log wrote.
 		 */
-		if (fresh)
+		if (off == 0 ? !PageIsNew(BufferGetPage(buf)) :
+			PageIsNew(BufferGetPage(buf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block %u of chunk log \"%s\" is %s, but the log's end is %llu",
+							blk, RelationGetRelationName(rel),
+							off == 0 ? "in use" : "empty",
+							(unsigned long long) end)));
+		if (off > 0)
+		{
+			check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
+			if (((PageHeader) BufferGetPage(buf))->pd_lower != AREA_START + off)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("block %u of chunk log \"%s\" does not end where the log's end is",
+								blk, RelationGetRelationName(rel))));
+		}
+
+		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+		st = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(st, buf,
+										 off == 0 ? GENERIC_XLOG_FULL_IMAGE : 0);
+		mpage = GenericXLogRegisterBuffer(st, mbuf, 0);
+		if (off == 0)
 			init_page(page, CHUNK_PAGE_DATA);
-		else
-			check_page(rel, blk, page, CHUNK_PAGE_DATA);
 		memcpy((char *) page + AREA_START + off, bytes, n);
 		((PageHeader) page)->pd_lower = AREA_START + off + n;
 		end += n;
 		((ChunkLogMetaData *) PageGetContents(mpage))->end = end;
 		GenericXLogFinish(st);
+		LockBuffer(mbuf, BUFFER_LOCK_UNLOCK);
 		UnlockReleaseBuffer(buf);
 		bytes += n;
 		len -= n;
 	}
-	UnlockReleaseBuffer(mbuf);
+	ReleaseBuffer(mbuf);
 	return start;
 }
 
@@ -328,25 +368,6 @@ cl_scan_getnextslot_tidrange(TableScanDesc scan, ScanDirection direction,
 	pg_unreachable();
 }
 
-static Size
-cl_parallelscan_estimate(Relation rel)
-{
-	refuse("parallel scans");
-	pg_unreachable();
-}
-
-static Size
-cl_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
-{
-	refuse("parallel scans");
-	pg_unreachable();
-}
-
-static void
-cl_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
-{
-	refuse("parallel scans");
-}
 
 static void
 cl_index_scan_begin(IndexScanDesc scan, uint32 flags)
@@ -373,19 +394,18 @@ cl_fetch_tid(Relation rel, ItemPointer tid, Snapshot snapshot, bool *all_dead)
 	pg_unreachable();
 }
 
+/* (no tuple has a TID: a TID scan finds none) */
 static bool
 cl_tuple_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
 						   TupleTableSlot *slot)
 {
-	refuse("fetching tuples");
-	pg_unreachable();
+	return false;
 }
 
 static bool
 cl_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
-	refuse("fetching tuples");
-	pg_unreachable();
+	return false;
 }
 
 static void
@@ -627,9 +647,10 @@ static const TableAmRoutine chunk_log_routine = {
 	.scan_getnextslot = cl_scan_getnextslot,
 	.scan_set_tidrange = cl_scan_set_tidrange,
 	.scan_getnextslot_tidrange = cl_scan_getnextslot_tidrange,
-	.parallelscan_estimate = cl_parallelscan_estimate,
-	.parallelscan_initialize = cl_parallelscan_initialize,
-	.parallelscan_reinitialize = cl_parallelscan_reinitialize,
+	/* (a parallel scan, as a plain one, finds no tuples) */
+	.parallelscan_estimate = table_block_parallelscan_estimate,
+	.parallelscan_initialize = table_block_parallelscan_initialize,
+	.parallelscan_reinitialize = table_block_parallelscan_reinitialize,
 	.index_scan_begin = cl_index_scan_begin,
 	.index_scan_reset = cl_index_scan_reset,
 	.index_scan_end = cl_index_scan_end,

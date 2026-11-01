@@ -33,7 +33,41 @@ CREATE INDEX ON chunks (x);
 VACUUM chunks;
 ANALYZE chunks;
 VACUUM FULL chunks;
+-- nor rewritten, which would leave it empty
+ALTER TABLE chunks ALTER COLUMN x TYPE bigint;
+ALTER TABLE chunks ADD COLUMN y float8 DEFAULT random();
+ALTER TABLE chunks SET ACCESS METHOD heap;
 SELECT test_chunk_log_end('chunks') AS end_kept;
+
+-- a parallel scan and a TID scan find nothing too
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT count(*) FROM chunks;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+SELECT count(*) FROM chunks WHERE ctid = '(1,1)';
+
+-- appends are not transactional: an aborted one's bytes stay, the end past
+-- them (what names chunks is what is transactional)
+BEGIN;
+SELECT test_chunk_log_append('chunks', '\x02') AS rolled_back_at;
+ROLLBACK;
+SELECT test_chunk_log_end('chunks') AS end_after_rollback;
+-- and none in a read-only transaction
+BEGIN READ ONLY;
+SELECT test_chunk_log_append('chunks', '\x03');
+ROLLBACK;
+
+-- publications of all tables leave it out
+SET client_min_messages = warning;
+CREATE PUBLICATION chunk_pub FOR ALL TABLES;
+RESET client_min_messages;
+SELECT count(*) AS published FROM pg_publication_tables WHERE pubname = 'chunk_pub' AND tablename = 'chunks';
+DROP PUBLICATION chunk_pub;
 
 -- truncated, it starts again
 TRUNCATE chunks;

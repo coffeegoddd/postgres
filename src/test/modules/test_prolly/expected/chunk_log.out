@@ -107,13 +107,73 @@ ERROR:  a chunk log relation does not support indexes
 VACUUM chunks;
 ANALYZE chunks;
 VACUUM FULL chunks;
-ERROR:  a chunk log relation does not support VACUUM FULL or CLUSTER
+ERROR:  cannot rewrite chunk log relation "chunks"
+-- nor rewritten, which would leave it empty
+ALTER TABLE chunks ALTER COLUMN x TYPE bigint;
+ERROR:  cannot rewrite chunk log relation "chunks"
+ALTER TABLE chunks ADD COLUMN y float8 DEFAULT random();
+ERROR:  cannot rewrite chunk log relation "chunks"
+ALTER TABLE chunks SET ACCESS METHOD heap;
+ERROR:  cannot rewrite chunk log relation "chunks"
 SELECT test_chunk_log_end('chunks') AS end_kept;
  end_kept 
 ----------
     20004
 (1 row)
 
+-- a parallel scan and a TID scan find nothing too
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SELECT count(*) FROM chunks;
+ count 
+-------
+     0
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+SELECT count(*) FROM chunks WHERE ctid = '(1,1)';
+ count 
+-------
+     0
+(1 row)
+
+-- appends are not transactional: an aborted one's bytes stay, the end past
+-- them (what names chunks is what is transactional)
+BEGIN;
+SELECT test_chunk_log_append('chunks', '\x02') AS rolled_back_at;
+ rolled_back_at 
+----------------
+          20004
+(1 row)
+
+ROLLBACK;
+SELECT test_chunk_log_end('chunks') AS end_after_rollback;
+ end_after_rollback 
+--------------------
+              20005
+(1 row)
+
+-- and none in a read-only transaction
+BEGIN READ ONLY;
+SELECT test_chunk_log_append('chunks', '\x03');
+ERROR:  cannot execute append to a chunk log in a read-only transaction
+ROLLBACK;
+-- publications of all tables leave it out
+SET client_min_messages = warning;
+CREATE PUBLICATION chunk_pub FOR ALL TABLES;
+RESET client_min_messages;
+SELECT count(*) AS published FROM pg_publication_tables WHERE pubname = 'chunk_pub' AND tablename = 'chunks';
+ published 
+-----------
+         0
+(1 row)
+
+DROP PUBLICATION chunk_pub;
 -- truncated, it starts again
 TRUNCATE chunks;
 SELECT test_chunk_log_end('chunks') AS end_truncated;

@@ -40,8 +40,12 @@ typedef struct ChunkLogRoutine
 	/*
 	 * Writes len bytes at the end of rel's log and returns where they
 	 * begin.  The caller holds rel in ExclusiveLock (one writer at a time;
-	 * readers are not blocked).  The bytes are durable once the appending
-	 * transaction commits.
+	 * readers wait for at most a page's change).  The bytes are durable
+	 * once the appending transaction commits, but not transactional:
+	 * readers see them, and the log's end past them, from when each page of
+	 * them is written, and they stay if the transaction aborts.  A crash
+	 * during an append can leave the log ending in a part of its bytes.
+	 * What names chunks (the index) is what is transactional.
 	 */
 	uint64		(*append) (Relation rel, const void *data, size_t len);
 

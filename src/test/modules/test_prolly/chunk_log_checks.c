@@ -16,6 +16,7 @@
 #include "fmgr.h"
 #include "prolly/chunk_log.h"
 #include "storage/lmgr.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "varatt.h"
 
@@ -58,10 +59,10 @@ test_chunk_log_read(PG_FUNCTION_ARGS)
 	int32		len = PG_GETARG_INT32(2);
 	bytea	   *out;
 
-	if (loc < 0 || len < 0)
+	if (loc < 0 || len < 0 || (Size) len > MaxAllocSize - VARHDRSZ)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("a chunk log's place and length are not negative")));
+				 errmsg("a chunk log's place and length are not negative, nor the length too large")));
 	out = palloc(VARHDRSZ + len);
 	SET_VARSIZE(out, VARHDRSZ + len);
 	ChunkLog->read(rel, (uint64) loc, VARDATA(out), (size_t) len);
