@@ -19551,6 +19551,14 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 			if (toLogged)
 				/* nothing to do */
 				return;
+			/* (a versioned schema's relations are logged: heap_create_with_catalog()) */
+			if (NamespaceBranch(RelationGetNamespace(rel)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot make relation \"%s\" unlogged, as it is in a versioned schema",
+								RelationGetRelationName(rel)),
+						 errdetail("A versioned schema's relations are logged, so that branches can share their pages."),
+						 errtable(rel)));
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 			if (!toLogged)
