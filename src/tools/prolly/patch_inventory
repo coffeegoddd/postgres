@@ -155,10 +155,11 @@ patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks g
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
+patch src/include/catalog/pg_am.dat  2  the prolly_chunks table access method (the history store's chunk log)
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
-patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column
+patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler
 patch src/include/catalog/pg_subscription.h  1b  pg_subscription.subcatalogbranch
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly
@@ -188,5 +189,7 @@ patch src/test/modules/Makefile     0  builds and runs the engine's unit and con
 patch src/test/modules/meson.build  0  builds and runs the engine's unit and conformance tests in test_prolly
 patch src/test/recovery/t/016_min_consistency.pl  1a  reads a block-mapped relation's pages from the page store when the suite runs block-mapped
 patch src/test/recovery/t/018_wal_optimize.pl  1a  counts the page store's files and map forks as the relations' when the suite runs block-mapped
+patch src/test/regress/expected/create_am.out  2  pg_am lists prolly_chunks
+patch src/test/regress/expected/psql.out  2  \dA lists prolly_chunks
 patch src/test/regress/expected/rules.out  1a  shows the pg_stat_block_mapped view
 patch src/test/regress/expected/stats.out  1a  lists the block_map statistics kind

@@ -4,6 +4,7 @@ test_prolly_sources = files(
   'bmap_checks.c',
   'bmap_primitive_checks.c',
   'branch_conformance.c',
+  'chunk_log_checks.c',
   'test_checksum.c',
   'test_prolly.c',
   'unit_branch_filter.c',
@@ -50,6 +51,7 @@ tests += {
       'bmap_first_write',
       'bmap_block_map_stats',
       'branch_map_cost',
+      'chunk_log',
     ],
   },
   'isolation': {
@@ -107,6 +109,7 @@ tests += {
       't/046_bmap_reused_stale_since.pl',
       't/047_bmap_passed_restart.pl',
       't/048_bmap_stats_movedb.pl',
+      't/049_chunk_log_recovery.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

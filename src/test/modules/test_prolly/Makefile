@@ -6,6 +6,7 @@ OBJS = \
 	bmap_checks.o \
 	bmap_primitive_checks.o \
 	branch_conformance.o \
+	chunk_log_checks.o \
 	test_checksum.o \
 	test_prolly.o \
 	unit_branch_filter.o \
@@ -21,7 +22,7 @@ DATA = test_prolly--1.0.sql
 REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
 	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
-	branch_map_cost
+	branch_map_cost chunk_log
 ISOLATION = bmap_shared_writers
 TAP_TESTS = 1
 
