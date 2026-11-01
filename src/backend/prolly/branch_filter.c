@@ -567,10 +567,22 @@ evicting_cache(Oid classid)
 	return -1;
 }
 
+/*
+ * Relations the map had to learn one by one since it last learned them all
+ * (learn_all_relations()), and whether it has.
+ */
+static uint32 relation_misses = 0;
+static bool relations_learned = false;
+
+/* misses after which the map learns every relation at once */
+#define BRANCH_MAP_BULK_MISSES	64
+
 static void
 map_reset(void)
 {
 	last_answer.valid = false;
+	relation_misses = 0;
+	relations_learned = false;
 	if (branch_map != NULL)
 	{
 		map_stats.forgotten += hash_get_num_entries(branch_map);
@@ -863,6 +875,81 @@ learn(Oid classid, Oid objid, BranchMapEntry *e)
 	return true;
 }
 
+/* Keeps that object objid of classid is owner_objid's of owner_class. */
+static void
+map_enter(Oid classid, Oid objid, Oid owner_class, Oid owner_objid)
+{
+	BranchMapKey key = map_key(classid, objid);
+	BranchMapEntry *e;
+	bool		found;
+
+	e = hash_search(map_table(), &key, HASH_ENTER, &found);
+	e->objid = objid;
+	e->owner_class = owner_class;
+	e->owner_objid = owner_objid;
+	e->branch = 0;
+}
+
+/*
+ * Learns every relation's owner from one scan of pg_class and one of
+ * pg_index: a relation's namespace, a TOAST table's table (its pg_class row
+ * names it, as toast_owner()'s dependency does), and a TOAST table's index's
+ * table (its pg_index row).  A catalog snapshot sees every
+ * branch's rows.  Relations made after are learned one by one, and those
+ * changed forgotten, as any are.
+ */
+static void
+learn_all_relations(void)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	map_stats.reads++;
+	rel = table_open(RelationRelationId, AccessShareLock);
+	/* (after the open: invalidations it processes may reset the map) */
+	relations_learned = true;
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->oid < FirstNormalObjectId)
+			continue;
+		if (c->relnamespace != PG_TOAST_NAMESPACE)
+			map_enter(RelationRelationId, c->oid,
+					  NamespaceRelationId, c->relnamespace);
+		if (OidIsValid(c->reltoastrelid))
+			map_enter(RelationRelationId, c->reltoastrelid,
+					  RelationRelationId, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	/*
+	 * A TOAST table's index is in pg_toast too, and only pg_index names its
+	 * table: every index the scan above left out is its table's.
+	 */
+	rel = table_open(IndexRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_index i = (Form_pg_index) GETSTRUCT(tup);
+		BranchMapKey key;
+		BranchMapEntry *e;
+
+		if (i->indexrelid < FirstNormalObjectId)
+			continue;
+		key = map_key(RelationRelationId, i->indexrelid);
+		e = hash_search(map_table(), &key, HASH_FIND, NULL);
+		if (e == NULL || e->objid != i->indexrelid)
+			map_enter(RelationRelationId, i->indexrelid,
+					  RelationRelationId, i->indrelid);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+}
+
 static int32
 cached_object_branch_depth(Oid classid, Oid objid, int depth)
 {
@@ -885,6 +972,18 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 
 	key = map_key(classid, objid);
 	e = hash_search(map_table(), &key, HASH_FIND, NULL);
+
+	/*
+	 * A scan meeting many relations the map doesn't know (a full scan of
+	 * pg_attribute, which names every branch's) would read pg_class once
+	 * for each: past a few, the map reads it once for all of them.
+	 */
+	if ((e == NULL || e->objid != objid) && classid == RelationRelationId &&
+		!relations_learned && ++relation_misses >= BRANCH_MAP_BULK_MISSES)
+	{
+		learn_all_relations();
+		e = hash_search(map_table(), &key, HASH_FIND, NULL);
+	}
 	if (e == NULL || e->objid != objid)
 	{
 		/*

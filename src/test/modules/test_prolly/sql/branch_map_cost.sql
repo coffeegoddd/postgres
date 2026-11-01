@@ -48,6 +48,16 @@ SELECT forgotten AS f0 FROM test_branch_map_stats() \gset
 DROP TABLE cost.t1;
 SELECT forgotten > :f0 AS forgot_dropped FROM test_branch_map_stats();
 
+-- a new session's full scan of pg_attribute meets every branch's tables,
+-- their TOAST tables and indexes, and learns them all from one scan of
+-- pg_class and one of pg_index once 64 were read one by one: 108 reads,
+-- where one of each made 1002
+\c
+SET catalog_branch = :b1;
+SET max_parallel_workers_per_gather = 0;
+SELECT count(*) > 0 AS columns FROM pg_attribute;
+SELECT reads < 200 AS learned_at_once FROM test_branch_map_stats();
+
 SET client_min_messages = warning;
 DROP SCHEMA cost CASCADE;
 SET catalog_branch = :b2;
