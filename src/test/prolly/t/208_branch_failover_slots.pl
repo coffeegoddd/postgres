@@ -27,7 +27,6 @@ primary_conninfo = '$conn'
 });
 $primary->append_conf('postgresql.conf', "synchronized_standby_slots = 'sb_slot'");
 $primary->reload;
-$standby->start;
 
 my $b1 = $primary->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
 my $b2 = $primary->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
@@ -41,17 +40,9 @@ for my $b ($b1, $b2)
 	on($primary, $b, 'CREATE SCHEMA app VERSIONED; CREATE TABLE app.t (id int PRIMARY KEY, v int)');
 }
 on($primary, $b1, "SELECT 1 FROM pg_create_logical_replication_slot('fo', 'test_decoding', false, false, true)");
-# (a standby syncs a slot once the primary's has moved past where the
-# standby's copy would begin: its catalog xmin moves on the second snapshot
-# decoded after a transaction)
-$primary->safe_psql('postgres', 'CREATE TABLE shared_t (i int)');
-for (1 .. 2)
-{
-	$primary->safe_psql('postgres', 'INSERT INTO shared_t VALUES (1)');
-	$primary->safe_psql('postgres', 'SELECT pg_log_standby_snapshot()');
-	$primary->safe_psql('postgres',
-		"SELECT 1 FROM pg_replication_slot_advance('fo', pg_current_wal_lsn())");
-}
+# (the standby starts after the slot is made, as a standby's copy is synced
+# only once the primary's slot is past where the copy would begin)
+$standby->start;
 $primary->wait_for_replay_catchup($standby);
 
 # the standby's copy, synced, keeps the slot's branch
@@ -59,6 +50,12 @@ $standby->safe_psql('postgres', 'SELECT pg_sync_replication_slots()');
 is( $standby->safe_psql('postgres',
 		"SELECT synced AND branch = $b1 FROM pg_replication_slots WHERE slot_name = 'fo'"),
 	't', 'the synced copy keeps the slot\'s branch');
+
+# and keeps it on disk
+$standby->restart;
+is( $standby->safe_psql('postgres',
+		"SELECT synced AND branch = $b1 FROM pg_replication_slots WHERE slot_name = 'fo'"),
+	't', 'the synced copy keeps the branch across a restart');
 
 # promoted: changes on both branches, decoded from the copy on no branch,
 # are the slot's branch's
