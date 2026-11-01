@@ -138,6 +138,14 @@ extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
 						  uint64 *dead, uint32 *free_pages);
 
 /* Puts every page free in the free space map (O(log); VACUUM's). */
+/*
+ * For VACUUM of the log's index: lets go of the rest of every region no
+ * live backend holds (one whose backend exited, crashed, or forgot it),
+ * but those in also, live as VACUUM's pass over the index began.
+ */
+struct ChunkRegionSet;
+extern void ChunkLogSealAbandoned(Relation rel, const struct ChunkRegionSet *also);
+
 extern void ChunkLogRecordFree(Relation rel);
 
 /*

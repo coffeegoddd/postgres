@@ -24,7 +24,7 @@ DATA = test_prolly--1.0.sql
 REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	bmap_tree_share bmap_captured_roots vacuum_shared bmap_primitives \
 	bmap_settle_roots bmap_diff bmap_first_write bmap_block_map_stats \
-	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_holds chunk_reclaim \
+	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_holds chunk_reclaim chunk_abandoned \
 	history_pointers chunk_store_pages chunk_store_memory chunk_pack_reclaim
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait \
 	chunk_pack_put_wait chunk_vacuum_cancel chunk_pack_pins chunk_take_back chunk_hold

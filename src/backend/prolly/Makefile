@@ -24,6 +24,7 @@ OBJS = \
 	chunk_memstore.o \
 	chunk_pin.o \
 	chunk_pointers.o \
+	chunk_region.o \
 	chunk_store.o \
 	chunkstore.o \
 	registry.o

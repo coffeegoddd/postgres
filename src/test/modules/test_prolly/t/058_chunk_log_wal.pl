@@ -105,7 +105,8 @@ $primary->safe_psql('postgres', q{
 	INSERT INTO sums SELECT i, 900 FROM generate_series(3001, 3010) i;
 	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i BETWEEN 3001 AND 3010;
 });
-my ($pages_kept) = split / /, $primary->safe_psql('postgres', $space);
+my $size = q{SELECT pg_relation_size('pg_history.chunks')};
+my $size_kept = $primary->safe_psql('postgres', $size);
 $primary->safe_psql('postgres', q{
 	SELECT sum(test_chunk_free('pg_history.chunks', 'pg_history.chunk_index',
 		h(chunk(i, len)))) FROM sums WHERE i > 4000;
@@ -113,7 +114,7 @@ $primary->safe_psql('postgres', q{
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index; CREATE TABLE flush ()');
 my ($pages, $free) = split / /, $primary->safe_psql('postgres', $space);
-is($pages, $pages_kept, 'no tail cut: the pages freed are in the log\'s middle');
+is($primary->safe_psql('postgres', $size), $size_kept, 'no tail cut: the pages freed are in the log\'s middle');
 $primary->wait_for_replay_catchup($standby2);
 $standby2->promote;
 ($pages, $free) = split / /, $standby2->safe_psql('postgres', $space);

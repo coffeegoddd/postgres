@@ -46,6 +46,13 @@ chunk_log_desc(StringInfo buf, XLogReaderState *record)
 		case XLOG_CHUNK_LOG_BIND_INDEX:
 			appendStringInfo(buf, "index: %u", ((xl_chunk_log_bind_index *) rec)->index);
 			break;
+		case XLOG_CHUNK_LOG_MAP:
+			appendStringInfo(buf, "%s bits %u to %u%s",
+							 ((xl_chunk_log_map *) rec)->set ? "set" : "cleared",
+							 ((xl_chunk_log_map *) rec)->first,
+							 ((xl_chunk_log_map *) rec)->first + ((xl_chunk_log_map *) rec)->n - 1,
+							 ((xl_chunk_log_map *) rec)->init ? ", init" : "");
+			break;
 		case XLOG_CHUNK_LOG_MARK_DEAD:
 			appendStringInfo(buf, "off: %u, len: %u%s",
 							 ((xl_chunk_log_mark_dead *) rec)->off,
@@ -72,6 +79,8 @@ chunk_log_identify(uint8 info)
 			return "MARK_DEAD";
 		case XLOG_CHUNK_LOG_BIND_INDEX:
 			return "BIND_INDEX";
+		case XLOG_CHUNK_LOG_MAP:
+			return "MAP";
 	}
 	return NULL;
 }

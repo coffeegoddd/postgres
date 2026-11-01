@@ -376,6 +376,11 @@ CREATE FUNCTION test_chunk_log_space(rel regclass,
 	OUT pages int4, OUT full_pages int4, OUT dead int8, OUT free_pages int4)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 
+-- The regions of the log that live backends hold.
+CREATE FUNCTION test_chunk_log_regions(rel regclass)
+RETURNS int4
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 -- The engine's chunk store interface, by store name.
 CREATE FUNCTION test_chunk_stores(OUT name text, OUT transactional bool)
 RETURNS SETOF record

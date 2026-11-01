@@ -76,6 +76,7 @@ tests += {
       'chunk_free',
       'chunk_holds',
       'chunk_reclaim',
+      'chunk_abandoned',
       'history_pointers',
       'chunk_store_pages',
       'chunk_store_memory',

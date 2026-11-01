@@ -17,6 +17,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_region.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -26,6 +27,7 @@ PG_FUNCTION_INFO_V1(test_chunk_log_append);
 PG_FUNCTION_INFO_V1(test_chunk_log_read);
 PG_FUNCTION_INFO_V1(test_chunk_log_end);
 PG_FUNCTION_INFO_V1(test_chunk_log_space);
+PG_FUNCTION_INFO_V1(test_chunk_log_regions);
 
 static Relation
 open_log(Oid relid, LOCKMODE mode)
@@ -106,4 +108,15 @@ test_chunk_log_space(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) dead);
 	values[3] = Int32GetDatum((int32) free_pages);
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/* test_chunk_log_regions(rel): the regions live backends hold in the log */
+Datum
+test_chunk_log_regions(PG_FUNCTION_ARGS)
+{
+	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
+	ChunkRegionSet *set = ChunkRegionLive(rel->rd_locator);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT32(set->n);
 }
