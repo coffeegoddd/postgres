@@ -40,10 +40,11 @@ $primary->safe_psql('postgres', q{
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	CREATE FUNCTION blob(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 20), 'hex')$$;
-	-- (longer than a page: never into a page freed, but pages new at the end)
+	-- (longer than a page: into a run of pages freed, or pages new at the end)
 	CREATE FUNCTION big(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 600), 'hex')$$;
-	-- (longer than a region: room made for it lets the region go)
+	-- (longer than a region: room made for it lets the region go, and is
+	-- pages new at the end, never pages freed)
 	CREATE FUNCTION huge(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 20000), 'hex')$$;
 });
@@ -108,13 +109,13 @@ my $p = $primary->background_psql('postgres', on_error_stop => 0);
 $p->query_safe(q{SELECT injection_points_set_local()});
 $p->query_safe(q{SELECT injection_points_attach('chunk-put-entered', 'wait')});
 $p->query_safe(q{SET application_name = 'entered'});
-$p->query_until(qr/putting/, "\\echo putting\nSELECT test_cs_put('pages', big(2001));\n");
+$p->query_until(qr/putting/, "\\echo putting\nSELECT test_cs_put('pages', huge(2001));\n");
 $primary->wait_for_event('client backend', 'chunk-put-entered');
 # (another put, past the first's region, rolled back: the log's file made as
 # far as that, the first's pages in it never written, then all of it dead)
 $primary->safe_psql('postgres', q{
 	BEGIN;
-	SELECT test_cs_put('pages', big(2002));
+	SELECT test_cs_put('pages', huge(2002));
 	ROLLBACK;
 });
 my $v = $primary->background_psql('postgres');
