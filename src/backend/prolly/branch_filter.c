@@ -524,6 +524,19 @@ static BranchMapStats map_stats;
 static bool callbacks_registered = false;
 
 /*
+ * The last answer, which most questions repeat: a catalog's rows that
+ * describe one object (a relation's pg_attribute rows) are mostly next to
+ * each other.  Forgotten whenever the map forgets anything.
+ */
+static struct
+{
+	bool		valid;
+	Oid			classid;
+	Oid			objid;
+	int32		branch;
+}			last_answer;
+
+/*
  * The classes whose rows the map forgets on invalidation, and their
  * syscaches.  Each callback is one of a backend's few syscache callback
  * slots, so only the classes whose objects can move between schemas, or
@@ -557,6 +570,7 @@ evicting_cache(Oid classid)
 static void
 map_reset(void)
 {
+	last_answer.valid = false;
 	if (branch_map != NULL)
 	{
 		map_stats.forgotten += hash_get_num_entries(branch_map);
@@ -581,7 +595,10 @@ map_invalidate(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 	key.classid = DatumGetObjectId(arg);
 	key.key = hashvalue;
 	if (hash_search(branch_map, &key, HASH_REMOVE, NULL) != NULL)
+	{
 		map_stats.forgotten++;
+		last_answer.valid = false;
+	}
 }
 
 static HTAB *
@@ -1029,7 +1046,20 @@ CatalogBranchCheckInheritance(Oid childid, Oid parentid)
 static int32
 cached_object_branch(Oid classid, Oid objid)
 {
-	return cached_object_branch_depth(classid, objid, 0);
+	int32		branch;
+
+	if (last_answer.valid && last_answer.objid == objid &&
+		last_answer.classid == classid)
+	{
+		map_stats.probes++;
+		return last_answer.branch;
+	}
+	branch = cached_object_branch_depth(classid, objid, 0);
+	last_answer.classid = classid;
+	last_answer.objid = objid;
+	last_answer.branch = branch;
+	last_answer.valid = true;
+	return branch;
 }
 
 static void
