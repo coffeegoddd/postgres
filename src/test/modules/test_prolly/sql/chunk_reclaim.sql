@@ -92,4 +92,29 @@ SELECT test_chunk_put('ql', 'qi', h(blob('new')), blob('new'));
 VACUUM qi;
 
 DROP TABLE ql, qi;
+
+-- chunks longer than a page, freed, and others as long put again: into
+-- runs of the pages freed, the file no bigger
+CREATE TABLE ql3 () USING prolly_chunks;
+CREATE TABLE qi3 () USING prolly_chunk_index;
+CREATE FUNCTION big(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT convert_to(rpad(tag, 20000, '.'), 'UTF8')$$;
+SELECT count(*) FILTER (WHERE test_chunk_put('ql3', 'qi3', h(big('a' || g)), big('a' || g))) AS put
+FROM generate_series(1, 40) g;
+SELECT test_chunk_put('ql3', 'qi3', h(big('anchor')), big('anchor')) AS anchor;
+SELECT roots FROM test_chunk_ref_root('qi3', h(big('anchor')));
+SELECT pg_relation_size('ql3') AS size3 \gset
+SELECT test_chunk_free_unheld('ql3', 'qi3') AS freed;
+VACUUM qi3;
+SELECT free_pages > 0 AS some_free FROM test_chunk_log_space('ql3');
+\c
+SET chunk_free_in_background = off;
+SELECT count(*) FILTER (WHERE test_chunk_put('ql3', 'qi3', h(big('b' || g)), big('b' || g))) AS put_again
+FROM generate_series(1, 30) g;
+SELECT pg_relation_size('ql3') = :size3 AS no_bigger;
+SELECT count(*) FILTER (WHERE test_chunk_get('ql3', 'qi3', h(big('b' || g))) = big('b' || g)) AS read_back
+FROM generate_series(1, 30) g;
+SELECT ok, chunks FROM test_chunk_check('ql3', 'qi3');
+DROP TABLE ql3, qi3;
+DROP FUNCTION big(text);
 DROP FUNCTION blob(text), h(bytea);

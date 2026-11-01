@@ -526,15 +526,37 @@ claim_pages(Relation rel, uint64 npages)
 	return first;
 }
 
-/*
- * A page the free space map has as free (every byte dead), made afresh for
- * this backend's appends; InvalidBlockNumber if there is none.  The map is
- * a hint, not WAL-logged: a page it has wrongly is passed by, and taken
- * out of it.
- */
-static BlockNumber
-take_free_page(Relation rel, uint32 generation)
+/* whether data page d is free (every byte written and dead), locked a moment */
+static bool
+probe_free(Relation rel, uint64 d, BlockNumber nblocks)
 {
+	BlockNumber blk = DATA_BLOCK(d);
+	Buffer		buf;
+	bool		free_page;
+
+	if (blk >= nblocks)
+		return false;
+	buf = ReadBuffer(rel, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	free_page = !PageIsNew(BufferGetPage(buf)) && page_free(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	return free_page;
+}
+
+/*
+ * npages data pages one after another the free space map has as free (every
+ * byte dead), made afresh for this backend's appends; the first, or -1 if
+ * none are found.  A page the map has is looked at with those before it, for
+ * where a run of free pages begins; the run's pages are then locked in order,
+ * each checked free, and made afresh.  The map is a hint, not WAL-logged: a
+ * page it has wrongly is passed by, and taken out of it.
+ */
+static int64
+take_free_pages(Relation rel, uint32 generation, int npages)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+	Assert(npages >= 1 && npages <= REGION_PAGES);
 	for (int tries = 0; tries < 8; tries++)
 	{
 		/*
@@ -543,36 +565,66 @@ take_free_page(Relation rel, uint32 generation)
 		 * are then checked)
 		 */
 		BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
-		Buffer		buf;
-		Page		page;
+		Buffer		bufs[REGION_PAGES];
+		uint64		first;
+		int			locked = 0;
+		bool		all_free = true;
 
-		if (!BlockNumberIsValid(blk) || blk == META_BLOCK ||
-			blk >= RelationGetNumberOfBlocks(rel))
-			return InvalidBlockNumber;
+		if (!BlockNumberIsValid(blk) || blk == META_BLOCK || blk >= nblocks)
+			return -1;
 		if (IS_MAP_BLOCK(blk))
 		{
 			RecordPageWithFreeSpace(rel, blk, 0);
 			continue;
 		}
-		buf = ReadBuffer(rel, blk);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
-		if (PageIsNew(page) || !page_free(page))
+
+		/* (the run's beginning: free pages before this one, as far as it needs) */
+		first = pages_below(blk);
+		while (npages > 1 && first > 0 && pages_below(blk) - first < (uint64) npages - 1 &&
+			   probe_free(rel, first - 1, nblocks))
+			first--;
+		for (int j = 0; j < npages && all_free; j++)
 		{
-			UnlockReleaseBuffer(buf);
-			RecordPageWithFreeSpace(rel, blk, 0);
+			BlockNumber b = DATA_BLOCK(first + j);
+			Page		page;
+
+			if (b >= nblocks)
+			{
+				all_free = false;
+				break;
+			}
+			bufs[j] = ReadBuffer(rel, b);
+			LockBuffer(bufs[j], BUFFER_LOCK_EXCLUSIVE);
+			locked++;
+			page = BufferGetPage(bufs[j]);
+			if (PageIsNew(page) || !page_free(page))
+			{
+				all_free = false;
+				/* (one the map has wrongly, out of it) */
+				if (b == blk)
+					RecordPageWithFreeSpace(rel, blk, 0);
+			}
+		}
+		if (!all_free)
+		{
+			for (int j = 0; j < locked; j++)
+				UnlockReleaseBuffer(bufs[j]);
 			continue;
 		}
-		/* (this backend's region's, and open, before it is made to use) */
+
+		/* (this backend's region's, and open, before they are made to use) */
 		ChunkRegionPublish(rel->rd_locator, RelationGetRelid(rel), generation,
-						   blk, blk + 1);
-		map_mark(rel, pages_below(blk), 1, true);
-		make_page(rel, buf, false);
-		UnlockReleaseBuffer(buf);
-		RecordPageWithFreeSpace(rel, blk, 0);
-		return blk;
+						   DATA_BLOCK(first), DATA_BLOCK(first + npages - 1) + 1);
+		map_mark(rel, first, npages, true);
+		for (int j = 0; j < npages; j++)
+		{
+			make_page(rel, bufs[j], false);
+			UnlockReleaseBuffer(bufs[j]);
+			RecordPageWithFreeSpace(rel, DATA_BLOCK(first + j), 0);
+		}
+		return (int64) first;
 	}
-	return InvalidBlockNumber;
+	return -1;
 }
 
 static void page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation);
@@ -795,7 +847,8 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	}
 	if (region.limit - region.next < len)
 	{
-		BlockNumber blk;
+		uint64		npages;
+		int64		first;
 		uint32		generation;
 
 		/*
@@ -814,12 +867,18 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		 * invalidation has every backend forget its region)
 		 */
 		generation = log_generation(rel, NULL);
-		blk = len <= AREA ? take_free_page(rel, generation) : InvalidBlockNumber;
-		if (BlockNumberIsValid(blk))
+		/*
+		 * (pages freed first, as many as the bytes need, if no more than a
+		 * region's: a run of them found where the map has one free)
+		 */
+		npages = (len + AREA - 1) / AREA;
+		first = npages <= REGION_PAGES ?
+			take_free_pages(rel, generation, Max(npages, 1)) : -1;
+		if (first >= 0)
 		{
 			region.relnumber = rel->rd_locator.relNumber;
-			region.next = BLOCK_LOC(blk);
-			region.limit = region.next + AREA;
+			region.next = (uint64) first * AREA;
+			region.limit = region.next + (uint64) Max(npages, 1) * AREA;
 		}
 		else
 			claim_run(rel, len, REGION_PAGES, &region);
