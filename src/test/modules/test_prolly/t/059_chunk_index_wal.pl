@@ -69,8 +69,6 @@ $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 $primary->safe_psql('postgres', q{
 	SELECT test_chunk_index_remove('pg_history.chunk_index', h(7));
 	DELETE FROM ids WHERE i = 7;
-	SELECT sum(test_chunk_free('pg_history.chunks', 'pg_history.chunk_index', h(i)))
-		FROM ids WHERE i BETWEEN 5001 AND 5000;
 	BEGIN;
 	SELECT put(9001);
 	ROLLBACK;
@@ -124,7 +122,6 @@ $want = $primary->safe_psql('postgres', $entries);
 $primary->safe_psql('postgres', 'INSERT INTO flush VALUES (1)');
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $entries), $want, 'and the standby has every entry the same');
-like($standby->safe_psql('postgres', q{SELECT 1}), qr/1/, 'alive');
 
 $standby->stop;
 $primary->stop;
