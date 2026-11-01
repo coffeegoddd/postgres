@@ -238,8 +238,16 @@ CREATE INDEX m_v ON app.m (v);
 CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int, initcond = '0');
 CREATE STATISTICS app.m1_stats (dependencies) ON k, v FROM app.m1;
 CREATE EXTENSION pg_trgm SCHEMA app;
+-- (a column of the branch's own extension's type, analyzed: its
+-- statistics' arrays are of that type)
+CREATE EXTENSION hstore SCHEMA app;
+CREATE TABLE app.h (h app.hstore);
+INSERT INTO app.h SELECT ('a=>' || g)::app.hstore FROM generate_series(1, 50) g;
+ANALYZE app.h;
+CREATE SCHEMA app2 VERSIONED CREATE TABLE t2 (x int);
 SET client_min_messages = warning;
 ALTER PUBLICATION branch_copy_pub ADD TABLE app.m1;
+ALTER PUBLICATION branch_copy_pub ADD TABLES IN SCHEMA app2;
 RESET client_min_messages;
 INSERT INTO app.m VALUES (1, 10, 1), (2, 20, 2);
 RESET catalog_branch;
@@ -261,8 +269,11 @@ SELECT app.total(v) FROM app.m;
 SELECT stxname FROM pg_statistic_ext WHERE stxrelid = 'app.m1'::regclass;
 SELECT extname, extnamespace::regnamespace FROM pg_extension WHERE extname = 'pg_trgm';
 SELECT round(app.similarity('abc', 'abd')::numeric, 2);
-SELECT count(*) AS published FROM pg_publication_tables
-WHERE pubname = 'branch_copy_pub' AND schemaname = 'app';
+SELECT schemaname, tablename FROM pg_publication_tables
+WHERE pubname = 'branch_copy_pub' ORDER BY 1, 2;
+SELECT count(*) AS statistics, min(pg_typeof(most_common_vals)::text) IS NOT NULL AS of_its_type
+FROM pg_stats WHERE schemaname = 'app' AND tablename = 'h';
+SELECT h OPERATOR(app.->) 'a' FROM (VALUES ('a=>1'::app.hstore)) v(h);
 -- b12's are as they were
 SET catalog_branch = :b12;
 SELECT count(*) FROM app.m;

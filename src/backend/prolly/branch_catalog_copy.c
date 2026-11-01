@@ -21,11 +21,21 @@
  * branch has, O(C).  Temporary objects that depend on the branch's (a
  * temporary view of its table) are the session's, and are not copied.
  *
- * Copied so far: schemas, tables (their columns, row types and their
- * arrays, TOAST tables), indexes, sequences, constraints (and the triggers
- * of foreign keys), column defaults, and their dependencies, owners,
- * comments and statistics.  A branch with any other kind of object is
- * refused, naming it: no copy is ever half made.
+ * Copied: schemas; tables, partitioned tables and their partitions,
+ * views, materialized views and composite types (their columns, row
+ * types, TOAST tables, inheritance and partition bounds); indexes and
+ * partitioned indexes; sequences; constraints (and foreign keys'
+ * triggers, a shared referenced table's too); column defaults; triggers,
+ * rules and policies; functions, procedures and aggregates; the branch's
+ * own types (domains, enums, ranges, base types), casts, operators and
+ * operator classes and families; extended statistics objects; extensions;
+ * default privileges; membership of shared publications; and every
+ * object's dependencies, owners, comments and statistics.  A branch with
+ * any other kind of object (a collation, a text search object, a foreign
+ * table, an object with initial privileges...) is refused, naming it, as
+ * is one whose tables store values of its own composite, enum or range
+ * types, which name their types in the data the branches share: no copy is
+ * ever half made.
  *
  * Locks: the source branch exclusively, which DDL recording a dependency
  * on the branch's objects holds shared (CatalogBranchCheckDependencies()),
@@ -70,6 +80,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_publication.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_opclass.h"
@@ -317,8 +328,9 @@ check_copyable(Oid classid, Oid oid)
 								Anum_pg_type_oid, oid);
 				t = (Form_pg_type) GETSTRUCT(tup);
 				/*
-				 * a relation's row type, an array, a domain, an enum or a range
-				 * (and its multirange); not a base type, whose functions are C's
+				 * a relation's row type, an array, a domain, an enum, a range
+				 * (and its multirange), or a base type (an extension's, its
+				 * functions copied with it); not a shell or pseudo type
 				 */
 				ok = t->typtype == TYPTYPE_COMPOSITE ||
 					t->typtype == TYPTYPE_DOMAIN ||
@@ -367,7 +379,6 @@ check_copyable(Oid classid, Oid oid)
 		case RewriteRelationId:
 			return;
 		case ProcedureRelationId:
-			return;
 		case TriggerRelationId:
 			return;
 		default:
@@ -1551,9 +1562,24 @@ fix_extension(CopyState *cs, Datum *values, bool *nulls)
 			map_oidarray(cs, RelationRelationId, values[Anum_pg_extension_extconfig - 1]);
 }
 
+/*
+ * A shared publication a copied table or schema is a member of: locked as
+ * ALTER PUBLICATION locks it, against its drop, and there still.
+ */
+static void
+lock_publication(Oid pubid)
+{
+	LockDatabaseObject(PublicationRelationId, pubid, 0, AccessShareLock);
+	if (!SearchSysCacheExists1(PUBLICATIONOID, ObjectIdGetDatum(pubid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a publication of the branch's tables was dropped while it was being copied")));
+}
+
 static void
 fix_publication_rel(CopyState *cs, Datum *values, bool *nulls)
 {
+	lock_publication(DatumGetObjectId(values[Anum_pg_publication_rel_prpubid - 1]));
 	MAP(Anum_pg_publication_rel_oid, PublicationRelRelationId);
 	MAP(Anum_pg_publication_rel_prrelid, RelationRelationId);
 	MAP_TREE(Anum_pg_publication_rel_prqual);
@@ -1562,6 +1588,7 @@ fix_publication_rel(CopyState *cs, Datum *values, bool *nulls)
 static void
 fix_publication_namespace(CopyState *cs, Datum *values, bool *nulls)
 {
+	lock_publication(DatumGetObjectId(values[Anum_pg_publication_namespace_pnpubid - 1]));
 	MAP(Anum_pg_publication_namespace_oid, PublicationNamespaceRelationId);
 	MAP(Anum_pg_publication_namespace_pnnspid, NamespaceRelationId);
 }
@@ -1632,6 +1659,23 @@ fix_statistic(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_statistic_staop3, OperatorRelationId);
 	MAP(Anum_pg_statistic_staop4, OperatorRelationId);
 	MAP(Anum_pg_statistic_staop5, OperatorRelationId);
+
+	/*
+	 * A slot's values are an array of the column's type, whose header names
+	 * it: a copied type's (a base type's values name no object), the copy's
+	 */
+	for (int k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		AttrNumber	att = Anum_pg_statistic_stavalues1 + k;
+
+		if (!nulls[att - 1])
+		{
+			ArrayType  *arr = DatumGetArrayTypePCopy(values[att - 1]);
+
+			ARR_ELEMTYPE(arr) = copy_map(cs, TypeRelationId, ARR_ELEMTYPE(arr));
+			values[att - 1] = PointerGetDatum(arr);
+		}
+	}
 }
 
 /* errors out if any row of catalog catid names one of the objects */
