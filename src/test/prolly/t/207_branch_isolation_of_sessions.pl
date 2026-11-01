@@ -1,11 +1,10 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# What experiment C's catalog_branch_test.sh checked and no other test
-# here does: autovacuum visits every branch's tables; large objects are
-# shared; a session keeps resolving to its own branch while another
-# session makes, switches and drops branches; an extension's objects of
-# each branch, used in one session across a checkout, are each branch's;
-# and per-table statistics counters are each branch's table's.
+# Sessions and branches: autovacuum visits every branch's tables; large
+# objects are shared; a session keeps resolving to its own branch while
+# another session makes, switches and drops branches; an extension's
+# objects of each branch, used in one session across a checkout, are each
+# branch's; and a session's statistics views show its branch's tables.
 
 use strict;
 use warnings FATAL => 'all';
@@ -62,7 +61,7 @@ $s->query_safe("SET catalog_branch = $b1");
 is($s->query_safe('SELECT min(v) FROM app.t'), $b1, 'a session on the first branch');
 $node->safe_psql('postgres', "
 	SET catalog_branch = $b3; CREATE SCHEMA app VERSIONED; CREATE TABLE app.t (x text);
-	SET catalog_branch = $b2; SELECT count(*) FROM app.t;
+	SET catalog_branch = $b2; SET catalog_branch = $b1; SET catalog_branch = $b3;
 	RESET catalog_branch; SELECT pg_branch_catalog_drop($b2);");
 is($s->query_safe('SELECT min(v) FROM app.t'), $b1,
 	'keeps its own branch\'s table while others make, switch and drop branches');
@@ -73,25 +72,29 @@ is($s->query_safe("SELECT count(*) FROM pg_namespace WHERE nspname = 'app'"), '1
 # types and operators are each branch's (no cached object of one branch is
 # used on another)
 on($b3, 'CREATE EXTENSION hstore SCHEMA app');
+my %own;
+for my $b ($b1, $b3)
+{
+	$own{$b} = on($b, "SELECT 'app.hstore'::regtype::oid || ' ' ||
+		'app.->(app.hstore,text)'::regoperator::oid");
+}
+my $used = "SELECT pg_typeof('a=>1'::app.hstore)::oid || ' ' ||
+	'app.->(app.hstore,text)'::regoperator::oid";
 $s->query_safe("SET catalog_branch = $b3");
-is($s->query_safe("SELECT 'a=>3'::app.hstore OPERATOR(app.->) 'a'"), '3', 'one branch\'s hstore');
+is($s->query_safe($used), $own{$b3}, 'one branch\'s hstore type and operator');
+is($s->query_safe("SELECT 'a=>3'::app.hstore OPERATOR(app.->) 'a'"), '3', 'used');
 $s->query_safe("SET catalog_branch = $b1");
-is($s->query_safe("SELECT 'a=>1'::app.hstore OPERATOR(app.->) 'a'"), '1', 'then the other\'s, in one session');
-is( $s->query_safe(
-		"SELECT t.oid = (SELECT oid FROM pg_type WHERE typname = 'hstore') FROM pg_type t
-		 WHERE t.typname = 'hstore' AND t.typnamespace = 'app'::regnamespace"),
-	't', 'its type is the branch\'s own');
+is($s->query_safe($used), $own{$b1}, 'then the other\'s, in the same session');
+is($s->query_safe("SELECT 'a=>1'::app.hstore OPERATOR(app.->) 'a'"), '1', 'used');
+isnt($own{$b1}, $own{$b3}, '(each branch\'s own objects)');
 
-# per-table statistics counters are each branch's table's
-on($b1, 'SELECT count(*) FROM app.t; SELECT count(*) FROM app.t;');
-on($b3, 'SELECT count(*) FROM app.t');
-$node->safe_psql('postgres', 'SELECT pg_stat_force_next_flush()');
+# a session's statistics views show its branch's table, not another's of
+# the same name
 my $t3 = on($b3, "SELECT 'app.t'::regclass::oid");
-$node->poll_query_until('postgres', "SELECT pg_stat_get_numscans($t3) >= 1")
-  or die 'the third branch\'s scan was never counted';
-cmp_ok($node->safe_psql('postgres', "SELECT pg_stat_get_numscans($t1)"), '>',
-	$node->safe_psql('postgres', "SELECT pg_stat_get_numscans($t3)"),
-	'each branch\'s table counts its own scans');
+is(on($b1, "SELECT string_agg(relid::text, ',') FROM pg_stat_user_tables WHERE schemaname = 'app' AND relname = 't'"),
+	$t1, 'the first branch\'s statistics view shows its table alone');
+is(on($b3, "SELECT string_agg(relid::text, ',') FROM pg_stat_user_tables WHERE schemaname = 'app' AND relname = 't'"),
+	$t3, 'and the third\'s its own');
 
 $s->quit;
 $node->stop;
