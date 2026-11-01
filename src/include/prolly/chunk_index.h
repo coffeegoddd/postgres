@@ -94,6 +94,14 @@ typedef void (*ChunkReserveFn) (void *arg, ChunkIndexEntry *entry);
 #define CHUNK_ENTRY_XMAX_COMMITTED	0x08	/* xmax committed (a hint) */
 #define CHUNK_ENTRY_XMAX_ABORTED	0x10	/* xmax aborted, or crashed (a hint) */
 
+/*
+ * Whether this transaction put the entry (its xmin's, not frozen: a frozen
+ * entry keeps its xmin, which a later transaction may come to have)
+ */
+#define ChunkEntryIsMine(e) \
+	(!((e)->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)) && \
+	 TransactionIdIsCurrentTransactionId((e)->xmin))
+
 typedef struct ChunkIndexRoutine
 {
 	/*

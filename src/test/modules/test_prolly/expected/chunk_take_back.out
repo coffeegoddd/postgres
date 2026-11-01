@@ -1,0 +1,52 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_begin a_put u_begin u_unref t_put a_commit u_rollback t_counts
+test_cs_ref_root
+----------------
+                
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+
+step a_begin: BEGIN;
+step a_put: SELECT stored FROM test_cs_put('pages', tb_parent());
+stored
+------
+t     
+(1 row)
+
+step u_begin: BEGIN;
+step u_unref: SELECT test_cs_unref_root('pages', tb_h('\x0a0601'));
+test_cs_unref_root
+------------------
+                  
+(1 row)
+
+step t_put: SELECT stored FROM test_cs_put('pages', tb_parent()); <waiting ...>
+step a_commit: COMMIT;
+step t_put: <... completed>
+stored
+------
+f     
+(1 row)
+
+step u_rollback: ROLLBACK;
+step t_counts: SELECT refs, roots FROM test_cs_counts('pages', tb_h('\x0a0601'));
+refs|roots
+----+-----
+   1|    1
+(1 row)
+
+test_chunk_format_refs
+----------------------
+                      
+(1 row)
+

@@ -34,7 +34,6 @@
 /* Pins the chunk named hash until this transaction ends. */
 extern void ChunkPin(const uint8 *hash);
 
-
 /* Whether any backend has the chunk pinned (or might have). */
 extern bool ChunkPinned(const uint8 *hash);
 
