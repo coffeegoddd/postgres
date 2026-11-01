@@ -1554,7 +1554,9 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * schemas'), whichever the session's branch is.  A subscriber lists the
 	 * tables it subscribes to, and copies them, in sessions on its
 	 * connection's branch: streaming another branch's changes to it would
-	 * reach tables it didn't list, or miss those it did.
+	 * reach tables it didn't list, or miss those it did.  The branches must
+	 * be the same, no branch (0) included: a slot made on no branch decodes
+	 * every branch's changes.
 	 */
 	if (MyReplicationSlot->data.branch != catalog_branch)
 		ereport(ERROR,
