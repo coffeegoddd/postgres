@@ -42,6 +42,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "replication/origin.h"
@@ -84,6 +85,7 @@
 #define SUBOPT_LSN					0x00020000
 #define SUBOPT_ORIGIN				0x00040000
 #define SUBOPT_CONFLICT_LOG_DEST	0x00080000
+#define SUBOPT_CATALOG_BRANCH		0x00100000
 
 /* check if the 'val' has 'bits' set */
 #define IsSet(val, bits)  (((val) & (bits)) == (bits))
@@ -115,6 +117,7 @@ typedef struct SubOpts
 	ConflictLogDest conflictlogdest;
 	XLogRecPtr	lsn;
 	char	   *wal_receiver_timeout;
+	int32		catalog_branch;
 } SubOpts;
 
 /*
@@ -208,6 +211,8 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
 	if (IsSet(supported_opts, SUBOPT_CONFLICT_LOG_DEST))
 		opts->conflictlogdest = CONFLICT_LOG_DEST_LOG;
+	if (IsSet(supported_opts, SUBOPT_CATALOG_BRANCH))
+		opts->catalog_branch = 0;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -373,6 +378,26 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("option \"%s\" cannot be negative", "max_retention_duration"));
+		}
+		else if (IsSet(supported_opts, SUBOPT_CATALOG_BRANCH) &&
+				 strcmp(defel->defname, "catalog_branch") == 0)
+		{
+			if (IsSet(opts->specified_opts, SUBOPT_CATALOG_BRANCH))
+				errorConflictingDefElem(defel, pstate);
+
+			opts->specified_opts |= SUBOPT_CATALOG_BRANCH;
+			opts->catalog_branch = defGetInt32(defel);
+
+			/*
+			 * The branch of the subscriber's own tables the subscription
+			 * replicates into (its workers run on it), not the publisher's
+			 * branch, which the connection names
+			 */
+			if (opts->catalog_branch < 0 ||
+				(opts->catalog_branch > 0 && !BranchIds->allocated(opts->catalog_branch)))
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("branch %d has not been allocated", opts->catalog_branch));
 		}
 		else if (IsSet(supported_opts, SUBOPT_ORIGIN) &&
 				 strcmp(defel->defname, "origin") == 0)
@@ -664,6 +689,29 @@ publicationListToArray(List *publist)
 }
 
 /*
+ * The subscriber's table a publisher's table name names: its branch's, of
+ * the subscription's (which its workers run on), whichever the session's
+ * is.
+ */
+static Oid
+branch_relid(RangeVar *rv, int32 branch)
+{
+	int			nestlevel;
+	char		value[12];
+	Oid			relid;
+
+	if (branch == 0)
+		return RangeVarGetRelid(rv, AccessShareLock, false);
+	nestlevel = NewGUCNestLevel();
+	snprintf(value, sizeof(value), "%d", branch);
+	(void) set_config_option("catalog_branch", value, PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	relid = RangeVarGetRelid(rv, AccessShareLock, false);
+	AtEOXact_GUC(true, nestlevel);
+	return relid;
+}
+
+/*
  * Create new subscription.
  */
 ObjectAddress
@@ -700,7 +748,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 					  SUBOPT_RETAIN_DEAD_TUPLES |
 					  SUBOPT_MAX_RETENTION_DURATION |
 					  SUBOPT_WAL_RECEIVER_TIMEOUT | SUBOPT_ORIGIN |
-					  SUBOPT_CONFLICT_LOG_DEST);
+					  SUBOPT_CONFLICT_LOG_DEST | SUBOPT_CATALOG_BRANCH);
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
 	/*
@@ -865,6 +913,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_subpasswordrequired - 1] = BoolGetDatum(opts.passwordrequired);
 	values[Anum_pg_subscription_subrunasowner - 1] = BoolGetDatum(opts.runasowner);
 	values[Anum_pg_subscription_subfailover - 1] = BoolGetDatum(opts.failover);
+	values[Anum_pg_subscription_subcatalogbranch - 1] = Int32GetDatum(opts.catalog_branch);
 	values[Anum_pg_subscription_subretaindeadtuples - 1] =
 		BoolGetDatum(opts.retaindeadtuples);
 	values[Anum_pg_subscription_submaxretention - 1] =
@@ -1020,7 +1069,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 				char		relkind;
 				RangeVar   *rv = pubrelinfo->rv;
 
-				relid = RangeVarGetRelid(rv, AccessShareLock, false);
+				relid = branch_relid(rv, opts.catalog_branch);
 				relkind = get_rel_relkind(relid);
 
 				/* Check for supported relkind. */
@@ -1220,7 +1269,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 			Oid			relid;
 			char		relkind;
 
-			relid = RangeVarGetRelid(rv, AccessShareLock, false);
+			relid = branch_relid(rv, sub->catalog_branch);
 			relkind = get_rel_relkind(relid);
 
 			/* Check for supported relkind. */
@@ -1714,7 +1763,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 							  SUBOPT_MAX_RETENTION_DURATION |
 							  SUBOPT_WAL_RECEIVER_TIMEOUT |
 							  SUBOPT_ORIGIN |
-							  SUBOPT_CONFLICT_LOG_DEST);
+							  SUBOPT_CONFLICT_LOG_DEST |
+							  SUBOPT_CATALOG_BRANCH);
 			break;
 
 		case ALTER_SUBSCRIPTION_ENABLED:
@@ -1987,6 +2037,18 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 						BoolGetDatum(opts.failover);
 					replaces[Anum_pg_subscription_subfailover - 1] = true;
 				}
+
+				/*
+				 * (the tables it subscribes to are its branch's, by object
+				 * id: another branch's would be another subscription)
+				 */
+				if (IsSet(opts.specified_opts, SUBOPT_CATALOG_BRANCH) &&
+					opts.catalog_branch != sub->catalog_branch)
+					ereport(ERROR,
+							errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot change the branch of subscription \"%s\"",
+								   sub->name),
+							errhint("Make another subscription on the other branch."));
 
 				if (IsSet(opts.specified_opts, SUBOPT_RETAIN_DEAD_TUPLES))
 				{

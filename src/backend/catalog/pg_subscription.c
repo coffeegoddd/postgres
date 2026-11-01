@@ -128,6 +128,7 @@ GetSubscription(Oid subid, bool missing_ok)
 	sub->disableonerr = subform->subdisableonerr;
 	sub->passwordrequired = subform->subpasswordrequired;
 	sub->runasowner = subform->subrunasowner;
+	sub->catalog_branch = subform->subcatalogbranch;
 	sub->failover = subform->subfailover;
 	sub->retaindeadtuples = subform->subretaindeadtuples;
 	sub->maxretention = subform->submaxretention;

@@ -268,6 +268,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "port/pg_bitutils.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -5924,6 +5925,18 @@ InitializeLogRepWorker(void)
 			ApplyLauncherForgetWorkerStartTime(MyLogicalRepWorker->subid);
 
 		proc_exit(0);
+	}
+
+	/*
+	 * The subscriber's tables it replicates into are its branch's: its names
+	 * resolve, and its catalog queries see, on that branch
+	 */
+	if (MySubscription->catalog_branch != 0)
+	{
+		char		branch[12];
+
+		snprintf(branch, sizeof(branch), "%d", MySubscription->catalog_branch);
+		SetConfigOption("catalog_branch", branch, PGC_SUSET, PGC_S_OVERRIDE);
 	}
 
 	if (!MySubscription->enabled)
