@@ -20,7 +20,8 @@ CREATE SCHEMA app VERSIONED;
 CREATE TABLE app.t (id serial PRIMARY KEY, v text DEFAULT 'none' NOT NULL,
 					n int CHECK (n > 0), p int REFERENCES pub.p, big text);
 CREATE INDEX t_lower_v ON app.t (lower(v)) WHERE n > 1;
-CREATE TABLE app.c (id int PRIMARY KEY, t int REFERENCES app.t ON DELETE CASCADE);
+CREATE TABLE app.c (id int PRIMARY KEY, t int REFERENCES app.t ON DELETE CASCADE,
+					rels regclass[] DEFAULT '{pub.p}');
 CREATE TABLE app.ident (id int GENERATED ALWAYS AS IDENTITY, x pub.posint DEFAULT 1,
 						big text, CHECK ((x, id) > (0, 0)));
 CREATE SEQUENCE app.s START 100;
@@ -106,7 +107,7 @@ RESET catalog_branch_filter;
 SET catalog_branch = :b7;
 CREATE SCHEMA app VERSIONED;
 CREATE TABLE app.k (r oid);
-SELECT format('ALTER TABLE app.k ADD CHECK (r <> %L::oid)', 'app.k'::regclass::oid) \gexec
+DO $$BEGIN EXECUTE format('ALTER TABLE app.k ADD CHECK (r <> %L::oid)', 'app.k'::regclass::oid); END$$;
 RESET catalog_branch;
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
 -- and a table holding values of the branch's own composite type
