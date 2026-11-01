@@ -12,8 +12,8 @@
  *	roots	holds from outside the store (branch heads, working sets)
  *	holds	transient holds of the work in flight: a chunk put, or found
  *			already there, is held until the transaction ends (those it
- *			references are held by the references counted), or until the
- *			subtransaction that put it is rolled back
+ *			references are held by the references counted), or at least
+ *			until the subtransaction that put it is rolled back
  * and only if it keeps every chunk the chunk strongly references: a put of
  * a chunk referencing one the store hasn't is refused.  Freeing cascades
  * through strong references, so it costs the chunks freed.
@@ -24,9 +24,10 @@
  * is not makes them at once, and an abort leaves them.
  *
  * Unlike the prototype engine's store (src/prolly), whose layer above kept
- * the counts: holds last until the transaction ends (or a rollback to a
- * savepoint before them), with no letting go of them before; letting go of a chunk's last root frees nothing (cs_free,
- * or a store's own freeing in the background, does); a root of a chunk the
+ * the counts: holds last until the transaction ends (or at least until a
+ * rollback to a savepoint before them), with no letting go of them
+ * before; letting go of a chunk's last root frees nothing (cs_free, or a
+ * store's own freeing in the background, does); a root of a chunk the
  * store hasn't is an error, letting go of one too; and errors are raised,
  * with their codes the contract's: ERRCODE_DATA_CORRUPTED (bytes not their
  * chunk's), ERRCODE_FOREIGN_KEY_VIOLATION (a reference to a chunk not
@@ -84,9 +85,10 @@ typedef struct ChunkStoreRoutine
 	/*
 	 * Stores the chunk the bytes are unless the store has it (true if it
 	 * stored it), its name in *hash, and holds it until the transaction
-	 * ends (by its entry, or by a change of its counts adding nothing).  A strong reference to a
-	 * chunk the store hasn't is an error; each one is counted, which holds
-	 * the chunk it names (a put refused holds none).
+	 * ends (by its entry, or by a change of its counts adding nothing).
+	 * A strong reference to a chunk the store hasn't is an error; each one
+	 * is counted, which holds the chunk it names (a put refused holds
+	 * none).
 	 */
 	bool		(*put) (ChunkStore *cs, const void *data, uint32 len,
 						uint8 *hash);
@@ -121,7 +123,7 @@ typedef struct ChunkStoreRoutine
 	/*
 	 * The audit: every chunk's bytes its own, every chunk it references
 	 * there, every count of references the edges to it; the chunks, and
-	 * those with no references and no roots (pins, transient, aside), in
+	 * those with no references and no roots (holds, transient, aside), in
 	 * *chunks and *unheld, and what is wrong in *why.  O(store).
 	 */
 	bool		(*check) (ChunkStore *cs, uint64 *chunks, uint64 *unheld,

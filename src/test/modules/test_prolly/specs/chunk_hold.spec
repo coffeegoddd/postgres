@@ -35,3 +35,6 @@ permutation a_begin a_free b_put a_commit
 permutation a_begin a_free b_put a_rollback
 # a hold of a subtransaction rolled back holds nothing more
 permutation a_begin a_save a_hold a_rollback_to b_free a_commit b_put
+# ... but one the transaction had already, nothing written for it in the
+# subtransaction, holds on
+permutation a_begin a_hold a_save a_hold a_rollback_to b_free a_commit
