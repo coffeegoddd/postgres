@@ -65,6 +65,15 @@ SET vacuum_truncate = off;
 VACUUM qi;
 SELECT pg_relation_size('ql') = :before_cut AS not_cut_vacuum_truncate_off;
 RESET vacuum_truncate;
+-- (nor with the log's vacuum_truncate off, or the index's)
+ALTER TABLE ql SET (vacuum_truncate = off);
+VACUUM qi;
+SELECT pg_relation_size('ql') = :before_cut AS not_cut_log_off;
+ALTER TABLE ql RESET (vacuum_truncate);
+ALTER TABLE qi SET (vacuum_truncate = off);
+VACUUM qi;
+SELECT pg_relation_size('ql') = :before_cut AS not_cut_index_off;
+ALTER TABLE qi RESET (vacuum_truncate);
 VACUUM qi;
 SELECT pages, pg_relation_size('ql') = current_setting('block_size')::int AS meta_page_only
 FROM test_chunk_log_space('ql');
