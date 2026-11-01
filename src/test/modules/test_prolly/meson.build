@@ -54,12 +54,14 @@ tests += {
       'branch_map_cost',
       'chunk_log',
       'chunk_index',
+      'chunk_refs',
     ],
   },
   'isolation': {
     'specs': [
       'bmap_shared_writers',
       'chunk_index_put_wait',
+      'chunk_roots_wait',
     ],
   },
   'tap': {
@@ -116,6 +118,7 @@ tests += {
       't/050_chunk_log_writers.pl',
       't/051_chunk_index_writers.pl',
       't/052_chunk_hash_verified.pl',
+      't/053_chunk_refs_crash.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

@@ -55,9 +55,21 @@ typedef struct ChunkIndexEntry
 	uint32		refs;			/* strong references from chunks */
 	uint32		roots;			/* references from outside the store */
 	TransactionId xmin;			/* the transaction that inserted it */
+	TransactionId xmax;			/* the transaction that freed it, or 0 */
 	uint16		flags;			/* CHUNK_ENTRY_*: what is known of xmin */
-	uint16		unused;
+	uint16		kind;			/* CHUNK_KIND_* */
+	uint32		unused;
 } ChunkIndexEntry;
+
+/*
+ * An entry is a chunk's, or a change of a chunk's counts: refs and roots,
+ * as signed numbers, to add to the chunk's once the change's transaction
+ * commits.  The counts of a chunk are its entry's and its committed
+ * changes' (and, to the transaction making them, its own); VACUUM adds
+ * committed changes into the chunk's entry, and takes them out.
+ */
+#define CHUNK_KIND_CHUNK		0
+#define CHUNK_KIND_CHANGE		1
 
 #define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed (a hint) */
 #define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted, or crashed (a hint) */
@@ -65,7 +77,10 @@ typedef struct ChunkIndexEntry
 
 typedef struct ChunkIndexRoutine
 {
-	/* The entry for hash into *out; false if there is none. */
+	/*
+	 * The entry for hash into *out, its counts as this transaction sees
+	 * them; false if there is none.
+	 */
 	bool		(*lookup) (Relation idx, const uint8 *hash,
 						   ChunkIndexEntry *out);
 
@@ -76,11 +91,22 @@ typedef struct ChunkIndexRoutine
 	bool		(*insert) (Relation idx, ChunkIndexEntry *entry);
 
 	/*
-	 * Adds drefs and droots to hash's counts, and answers the entry after;
-	 * false if there is none.  Taking a count below zero is an error.
+	 * Adds drefs and droots to hash's counts, in this transaction (they are
+	 * the chunk's when it commits), and answers the entry's counts after,
+	 * as this transaction sees them; false if there is no entry.  Taking a
+	 * count below zero is an error; a decrease waits for another
+	 * transaction changing the chunk's counts to end.
 	 */
 	bool		(*adjust) (Relation idx, const uint8 *hash, int32 drefs,
 						   int32 droots, ChunkIndexEntry *out);
+
+	/*
+	 * Calls fn with each chunk's entry this transaction sees, its counts as
+	 * it sees them.  For audits; O(index).
+	 */
+	void		(*visit) (Relation idx,
+						  void (*fn) (void *arg, const ChunkIndexEntry *e),
+						  void *arg);
 
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);

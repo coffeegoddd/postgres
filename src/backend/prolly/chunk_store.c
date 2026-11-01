@@ -16,8 +16,10 @@
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_format.h"
 #include "prolly/chunk_store.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
 #include "utils/rel.h"
 
 void
@@ -90,11 +92,58 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	return data;
 }
 
+/* ------------------------------------------------------- references */
+
+static void
+leaf_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
+{
+}
+
+const ChunkFormatRoutine LeafChunkFormat = {
+	.refs = leaf_refs,
+};
+
+const ChunkFormatRoutine *ChunkFormat = &LeafChunkFormat;
+
+typedef struct RefList
+{
+	uint8	   *hashes;
+	int			n;
+	int			cap;
+} RefList;
+
+static void
+add_ref(void *arg, const uint8 *hash)
+{
+	RefList    *list = arg;
+
+	if (list->n == list->cap)
+	{
+		list->cap = list->cap ? list->cap * 2 : 16;
+		list->hashes = list->hashes ?
+			repalloc(list->hashes, list->cap * CHUNK_HASH_LEN) :
+			palloc(list->cap * CHUNK_HASH_LEN);
+	}
+	memcpy(list->hashes + list->n * CHUNK_HASH_LEN, hash, CHUNK_HASH_LEN);
+	list->n++;
+}
+
+static char *
+hash_text(const uint8 *hash)
+{
+	char	   *out = palloc(2 * CHUNK_HASH_LEN + 1);
+
+	hex_encode((const char *) hash, CHUNK_HASH_LEN, out);
+	out[2 * CHUNK_HASH_LEN] = '\0';
+	return out;
+}
+
 bool
 ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 			  const void *data, uint32 len)
 {
 	ChunkIndexEntry e;
+	RefList		refs = {0};
 
 	PreventCommandIfReadOnly("put a chunk");
 	check_hash(hash, data, len, NULL, 0);
@@ -106,9 +155,164 @@ ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 	(void) GetCurrentTransactionId();
 	if (ChunkIndex->lookup(idx, hash, &e))
 		return false;
+
+	/* a store holds a chunk only if it holds every chunk it references */
+	ChunkFormat->refs(data, len, add_ref, &refs);
+	for (int i = 0; i < refs.n; i++)
+		if (!ChunkIndex->lookup(idx, refs.hashes + i * CHUNK_HASH_LEN, &e))
+			ereport(ERROR,
+					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+					 errmsg("chunk %s references chunk %s, which the store does not have",
+							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
+
 	memset(&e, 0, sizeof(e));
 	memcpy(e.hash, hash, CHUNK_HASH_LEN);
 	e.len = len;
 	e.loc = ChunkLog->append(log, data, len);
-	return ChunkIndex->insert(idx, &e);
+	if (!ChunkIndex->insert(idx, &e))
+		return false;
+
+	/*
+	 * each edge a reference of the chunk it names, in this transaction: an
+	 * abort, or a crash, takes them back with the chunk
+	 */
+	for (int i = 0; i < refs.n; i++)
+		if (!ChunkIndex->adjust(idx, refs.hashes + i * CHUNK_HASH_LEN, 1, 0, &e))
+			ereport(ERROR,
+					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+					 errmsg("chunk %s references chunk %s, which the store does not have",
+							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
+	if (refs.hashes)
+		pfree(refs.hashes);
+	return true;
+}
+
+static void
+change_root(Relation idx, const uint8 *hash, int32 droots, ChunkIndexEntry *out)
+{
+	PreventCommandIfReadOnly("change a chunk's roots");
+	if (!ChunkIndex->adjust(idx, hash, 0, droots, out))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the store has no chunk %s", hash_text(hash))));
+}
+
+void
+ChunkStoreRefRoot(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+{
+	change_root(idx, hash, 1, out);
+}
+
+void
+ChunkStoreUnrefRoot(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+{
+	change_root(idx, hash, -1, out);
+}
+
+/* ------------------------------------------------------- the audit */
+
+typedef struct AuditEntry
+{
+	uint8		hash[CHUNK_HASH_LEN];	/* (the key) */
+	uint32		refs;			/* the entry's */
+	uint32		roots;
+	uint32		len;
+	uint64		loc;
+	uint64		edges;			/* strong references found to it */
+} AuditEntry;
+
+typedef struct AuditState
+{
+	HTAB	   *chunks;
+	uint64		n;
+} AuditState;
+
+static void
+audit_collect(void *arg, const ChunkIndexEntry *e)
+{
+	AuditState *as = arg;
+	AuditEntry *a;
+	bool		found;
+
+	a = hash_search(as->chunks, e->hash, HASH_ENTER, &found);
+	if (found)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the store has two entries for chunk %s", hash_text(e->hash))));
+	a->refs = e->refs;
+	a->roots = e->roots;
+	a->len = e->len;
+	a->loc = e->loc;
+	a->edges = 0;
+	as->n++;
+}
+
+typedef struct EdgeState
+{
+	AuditState *as;
+	const uint8 *from;
+	char	   *why;			/* the first fault found, or NULL */
+} EdgeState;
+
+static void
+audit_edge(void *arg, const uint8 *hash)
+{
+	EdgeState  *es = arg;
+	AuditEntry *a = hash_search(es->as->chunks, hash, HASH_FIND, NULL);
+
+	if (a)
+		a->edges++;
+	else if (es->why == NULL)
+		es->why = psprintf("chunk %s references chunk %s, which the store does not have",
+						   hash_text(es->from), hash_text(hash));
+}
+
+bool
+ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
+				char **why)
+{
+	HASHCTL		ctl;
+	AuditState	as = {0};
+	EdgeState	es = {0};
+	HASH_SEQ_STATUS seq;
+	AuditEntry *a;
+
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = sizeof(AuditEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	as.chunks = hash_create("chunk store audit", 1024, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	ChunkIndex->visit(idx, audit_collect, &as);
+
+	/* every chunk's bytes are its own, and every chunk it names is there */
+	es.as = &as;
+	hash_seq_init(&seq, as.chunks);
+	while ((a = hash_seq_search(&seq)) != NULL)
+	{
+		void	   *data = palloc_extended(Max(a->len, 1), MCXT_ALLOC_HUGE);
+
+		ChunkLog->read(log, a->loc, data, a->len);
+		check_hash(a->hash, data, a->len, log, a->loc);
+		es.from = a->hash;
+		ChunkFormat->refs(data, a->len, audit_edge, &es);
+		pfree(data);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* and every count of references is the edges to it */
+	*chunks = as.n;
+	*unheld = 0;
+	hash_seq_init(&seq, as.chunks);
+	while ((a = hash_seq_search(&seq)) != NULL)
+	{
+		if (es.why == NULL && a->edges != a->refs)
+			es.why = psprintf("chunk %s has %u references counted, and %llu edges to it",
+							  hash_text(a->hash), a->refs,
+							  (unsigned long long) a->edges);
+		if (a->refs == 0 && a->roots == 0)
+			(*unheld)++;
+	}
+	hash_destroy(as.chunks);
+	*why = es.why;
+	return es.why == NULL;
 }
