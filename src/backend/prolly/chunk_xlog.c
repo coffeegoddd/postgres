@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * chunk_xlog.c
- *	  Replay of the history store's WAL records (prolly/chunk_xlog.h).
+ *	  Replay of the chunk index's WAL records (prolly/chunk_xlog.h); the
+ *	  chunk log's are replayed in prolly/chunk_log.c.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -17,7 +18,7 @@
 #include "storage/standby.h"
 
 void
-chunk_redo(XLogReaderState *record)
+chunk_index_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
@@ -34,6 +35,6 @@ chunk_redo(XLogReaderState *record)
 				break;
 			}
 		default:
-			elog(PANIC, "chunk_redo: unknown op code %u", info);
+			elog(PANIC, "chunk_index_redo: unknown op code %u", info);
 	}
 }
