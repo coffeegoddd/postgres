@@ -71,6 +71,7 @@ tests += {
       'chunk_index_put_wait',
       'chunk_roots_wait',
       'chunk_free_wait',
+      'chunk_pack_put_wait',
     ],
   },
   'tap': {

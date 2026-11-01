@@ -74,6 +74,17 @@ extern bool ChunkStorePutData(Relation log, Relation idx, const void *data,
 							  uint32 len, uint8 *hash);
 
 /*
+ * A pack's chunks put at once: hashes[i]'s bytes datas[i], lens[i] long.
+ * Each is put as ChunkStorePut puts it, but their bytes are appended to
+ * the log together, in one pass, and a chunk may reference another of the
+ * pack, before or after it (a pack's order is its own).  Chunks the store
+ * has, and those named twice, are put once.  How many it stored.
+ */
+extern uint64 ChunkStorePutMany(Relation log, Relation idx, int n,
+								const uint8 *hashes, const void *const *datas,
+								const uint32 *lens);
+
+/*
  * A root of the chunk (a hold from outside the store: a branch's head, a
  * working set), taken or let go of in this transaction, its counts after
  * in *out.  Letting go of one it hasn't is an error.
