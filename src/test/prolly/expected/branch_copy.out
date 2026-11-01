@@ -1,0 +1,206 @@
+-- Copying a branch's catalog rows to another branch: every versioned
+-- schema and object in it made anew there, under new object ids, every
+-- reference between them rewritten, the shared ones kept.  The copies'
+-- storage is empty, a sequence's value aside.
+SELECT pg_branch_id_allocate() AS b1 \gset
+SELECT pg_branch_id_allocate() AS b2 \gset
+SELECT pg_branch_id_allocate() AS b3 \gset
+SELECT pg_branch_id_allocate() AS b4 \gset
+CREATE SCHEMA pub;
+CREATE TABLE pub.p (id int PRIMARY KEY);
+INSERT INTO pub.p VALUES (1), (2);
+SET catalog_branch = :b1;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id serial PRIMARY KEY, v text DEFAULT 'none' NOT NULL,
+					n int CHECK (n > 0), p int REFERENCES pub.p, big text);
+CREATE INDEX t_lower_v ON app.t (lower(v)) WHERE n > 1;
+CREATE TABLE app.c (id int PRIMARY KEY, t int REFERENCES app.t ON DELETE CASCADE);
+CREATE SEQUENCE app.s START 100;
+COMMENT ON TABLE app.t IS 'the copied table';
+COMMENT ON COLUMN app.t.v IS 'a column';
+INSERT INTO app.t (v, n, p) SELECT 'v' || g, g, 1 FROM generate_series(1, 5) g;
+SELECT nextval('app.s'), nextval('app.s');
+ nextval | nextval 
+---------+---------
+     100 |     101
+(1 row)
+
+ANALYZE app.t;
+SELECT 'app.t'::regclass::oid AS t1 \gset
+-- (this session's temporary view of b1's table is its own: not copied)
+CREATE TEMP VIEW tv AS SELECT id FROM app.t;
+CREATE FUNCTION pg_temp.try(q text) RETURNS text LANGUAGE plpgsql AS
+$$BEGIN EXECUTE q; RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN RETURN regexp_replace(SQLERRM, '[0-9]+', 'N', 'g'); END$$;
+-- copy b1 to b2, from a session on no branch
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b1, :b2);
+ pg_branch_catalog_copy 
+------------------------
+ 
+(1 row)
+
+SELECT count(*) AS copied_temp_views FROM pg_class WHERE relname = 'tv';
+ copied_temp_views 
+-------------------
+                 1
+(1 row)
+
+-- b2 has the same definitions under its own object ids, and empty tables
+SET catalog_branch = :b2;
+SELECT 'app.t'::regclass::oid <> :t1 AS own_oid;
+ own_oid 
+---------
+ t
+(1 row)
+
+SELECT c.relname, c.relkind FROM pg_class c
+WHERE c.relnamespace = 'app'::regnamespace ORDER BY 1;
+  relname  | relkind 
+-----------+---------
+ c         | r
+ c_pkey    | i
+ s         | S
+ t         | r
+ t_id_seq  | S
+ t_lower_v | i
+ t_pkey    | i
+(7 rows)
+
+SELECT pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid IN ('app.t'::regclass, 'app.c'::regclass) ORDER BY 1;
+                  pg_get_constraintdef                  
+--------------------------------------------------------
+ CHECK ((n > 0))
+ FOREIGN KEY (p) REFERENCES pub.p(id)
+ FOREIGN KEY (t) REFERENCES app.t(id) ON DELETE CASCADE
+ NOT NULL id
+ NOT NULL id
+ NOT NULL v
+ PRIMARY KEY (id)
+ PRIMARY KEY (id)
+(8 rows)
+
+SELECT pg_get_indexdef('app.t_lower_v'::regclass);
+                           pg_get_indexdef                            
+----------------------------------------------------------------------
+ CREATE INDEX t_lower_v ON app.t USING btree (lower(v)) WHERE (n > 1)
+(1 row)
+
+SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'app.t'::regclass ORDER BY 1;
+ adnum |            pg_get_expr            
+-------+-----------------------------------
+     1 | nextval('app.t_id_seq'::regclass)
+     2 | 'none'::text
+(2 rows)
+
+SELECT obj_description('app.t'::regclass, 'pg_class'), col_description('app.t'::regclass, 2);
+ obj_description  | col_description 
+------------------+-----------------
+ the copied table | a column
+(1 row)
+
+SELECT count(*) > 0 AS statistics FROM pg_statistic WHERE starelid = 'app.t'::regclass;
+ statistics 
+------------
+ t
+(1 row)
+
+SELECT count(*) FROM app.t;
+ count 
+-------
+     0
+(1 row)
+
+-- the sequence's value came with it; the serial's default is b2's sequence
+SELECT nextval('app.s');
+ nextval 
+---------
+     102
+(1 row)
+
+INSERT INTO app.t (n, p) VALUES (7, 2) RETURNING id, v, n;
+ id |  v   | n 
+----+------+---
+  6 | none | 7
+(1 row)
+
+INSERT INTO app.t (n) VALUES (0);
+ERROR:  new row for relation "t" violates check constraint "t_n_check"
+DETAIL:  Failing row contains (7, none, 0, null, null).
+INSERT INTO app.t (n, p) VALUES (1, 99);
+ERROR:  insert or update on table "t" violates foreign key constraint "t_p_fkey"
+DETAIL:  Key (p)=(99) is not present in table "p".
+INSERT INTO app.c VALUES (1, 6);
+INSERT INTO app.c VALUES (2, 1);
+ERROR:  insert or update on table "c" violates foreign key constraint "c_t_fkey"
+DETAIL:  Key (t)=(1) is not present in table "t".
+-- a shared row b2's copy references can't go: its foreign key checks it
+DELETE FROM pub.p WHERE id = 2;
+ERROR:  update or delete on table "p" violates foreign key constraint "t_p_fkey" on table "t"
+DETAIL:  Key (id)=(2) is still referenced from table "t".
+DELETE FROM app.t;
+SELECT count(*) FROM app.c;
+ count 
+-------
+     0
+(1 row)
+
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM app.t WHERE lower(v) = 'x' AND n > 1;
+              QUERY PLAN              
+--------------------------------------
+ Index Scan using t_lower_v on t
+   Index Cond: (lower(v) = 'x'::text)
+(2 rows)
+
+RESET enable_seqscan;
+-- b1 is as it was
+SET catalog_branch = :b1;
+SELECT count(*), sum(n) FROM app.t;
+ count | sum 
+-------+-----
+     5 |  15
+(1 row)
+
+SELECT nextval('app.s');
+ nextval 
+---------
+     102
+(1 row)
+
+-- a branch with an object the copy doesn't know is refused, and nothing made
+SET catalog_branch = :b3;
+CREATE SCHEMA app VERSIONED CREATE TABLE t (x int) CREATE VIEW v AS SELECT x FROM t;
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b3, :b4);
+ERROR:  cannot copy view app.v to another branch yet
+SET catalog_branch_filter = off;
+SELECT count(*) AS b4_schemas FROM pg_namespace WHERE nspbranch = :b4;
+ b4_schemas 
+------------
+          0
+(1 row)
+
+RESET catalog_branch_filter;
+-- nor onto a branch that has schemas, or from a branch to itself
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b2));
+             try              
+------------------------------
+ branch N has schemas already
+(1 row)
+
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b1));
+               try                
+----------------------------------
+ cannot copy branch N to branch N
+(1 row)
+
+SET client_min_messages = warning;
+SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3);
+ pg_branch_catalog_drop | pg_branch_catalog_drop | pg_branch_catalog_drop 
+------------------------+------------------------+------------------------
+                        |                        | 
+(1 row)
+
+DROP SCHEMA pub CASCADE;

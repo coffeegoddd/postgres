@@ -88,6 +88,22 @@ typedef struct BranchCatalogRoutine
 extern PGDLLIMPORT const BranchCatalogRoutine *BranchCatalogs;
 extern PGDLLIMPORT const BranchCatalogRoutine DependencyBranchCatalogs;
 
+/*
+ * Copies a branch's catalog rows to another branch: copy makes every one
+ * of src's versioned schemas, and every object in them, anew on dst (which
+ * has none), under new object ids, every reference between them rewritten
+ * to the copies' (see branch_catalog_copy.c).  Each relation copied gets
+ * storage of its own.  It errors out, copying nothing, if src holds an
+ * object it doesn't know how to copy.
+ */
+typedef struct BranchCatalogCopyRoutine
+{
+	void		(*copy) (int32 src, int32 dst);
+} BranchCatalogCopyRoutine;
+
+extern PGDLLIMPORT const BranchCatalogCopyRoutine *BranchCatalogCopy;
+extern PGDLLIMPORT const BranchCatalogCopyRoutine DependencyBranchCatalogCopy;
+
 /* The namespace named nspname this session sees: its branch's, else shared. */
 extern HeapTuple SearchNamespaceByName(const char *nspname);
 extern Oid	NamespaceOidByName(const char *nspname);
