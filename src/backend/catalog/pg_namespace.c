@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/transam.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -95,6 +96,21 @@ NamespaceCreateOnBranch(const char *nspName, Oid ownerId, bool isTemp,
 
 	nspoid = GetNewOidWithIndex(nspdesc, NamespaceOidIndexId,
 								Anum_pg_namespace_oid);
+
+	/*
+	 * Object ids below FirstNormalObjectId are initdb's objects', which are
+	 * shared and answered so without reading the catalogs.  A server started
+	 * in single-user mode right after initdb still hands them out: no
+	 * versioned schema then, nor so any of its objects.  (Once the counter is
+	 * past them, it never hands them out again.)
+	 */
+	if (branch != 0 && nspoid < FirstNormalObjectId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot make versioned schema \"%s\" before the server first starts",
+						nspName),
+				 errdetail("Object ids below %u are kept for initdb's objects, which are shared.",
+						   FirstNormalObjectId)));
 	values[Anum_pg_namespace_oid - 1] = ObjectIdGetDatum(nspoid);
 	namestrcpy(&nname, nspName);
 	values[Anum_pg_namespace_nspname - 1] = NameGetDatum(&nname);

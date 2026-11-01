@@ -34,14 +34,14 @@ SELECT reads - :r0 AS reads_after_branch_change FROM test_branch_map_stats();
 
 -- DDL on one branch costs only the objects it changed: a new table's
 -- relation, row and array types, TOAST table and index (learned by the
--- check of its dependencies and by the next scan), not the two hundred
--- tables already known
+-- check of its dependencies and by the next scan; 17 reads in all), not
+-- the two hundred tables already known
 SELECT reads AS r1 FROM test_branch_map_stats() \gset
 CREATE TABLE cost.extra (a int, b text);
 SET catalog_branch = :b1;
 SELECT count(*) FROM pg_attribute WHERE attname = 'b' AND attrelid IN
 	(SELECT oid FROM pg_class WHERE relnamespace = 'cost'::regnamespace);
-SELECT reads - :r1 BETWEEN 1 AND 25 AS reads_what_changed FROM test_branch_map_stats();
+SELECT reads - :r1 BETWEEN 1 AND 20 AS reads_what_changed FROM test_branch_map_stats();
 
 -- a dropped table's answers are forgotten
 SELECT forgotten AS f0 FROM test_branch_map_stats() \gset
