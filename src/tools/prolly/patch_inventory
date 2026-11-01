@@ -152,7 +152,7 @@ patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
 patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
-patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager; also (2) RM_CHUNK_STORE_ID
+patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager; also (2) RM_CHUNK_LOG_ID, RM_CHUNK_INDEX_ID
 patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
 patch src/include/access/xlog.h  1a  declares GetBackupState, GetRecoveryHold, XLogNoteSyncedPages, XLogSyncedSince and XLogNoteSyncedReplay
 patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records; also (2) XLOG_PAGE_MAGIC for ChunkStore

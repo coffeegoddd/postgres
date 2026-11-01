@@ -129,6 +129,7 @@ tests += {
       't/055_history_pointers.pl',
       't/056_history_upgrade.pl',
       't/057_history_standby.pl',
+      't/058_chunk_log_wal.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

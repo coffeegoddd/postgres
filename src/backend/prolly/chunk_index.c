@@ -1776,7 +1776,7 @@ log_cleanup_info(Relation idx, TransactionId horizon)
 	xlrec.snapshotConflictHorizon = horizon;
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfChunkIndexCleanupInfo);
-	(void) XLogInsert(RM_CHUNK_STORE_ID, XLOG_CHUNK_INDEX_CLEANUP_INFO);
+	(void) XLogInsert(RM_CHUNK_INDEX_ID, XLOG_CHUNK_INDEX_CLEANUP_INFO);
 }
 
 /*

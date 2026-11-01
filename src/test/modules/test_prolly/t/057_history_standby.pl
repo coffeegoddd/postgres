@@ -124,10 +124,10 @@ is($standby->safe_psql('postgres', $conflicts), '1', 'and no query conflicted');
 
 # pg_waldump describes the record
 my $end_lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
-($stdout, $stderr) = run_command([ 'pg_waldump', '--rmgr' => 'ChunkStore',
+($stdout, $stderr) = run_command([ 'pg_waldump', '--rmgr' => 'ChunkIndex',
 	'--path' => $primary->data_dir . '/pg_wal',
 	'--start' => $start_lsn, '--end' => $end_lsn ]);
-like($stdout, qr/rmgr: ChunkStore .*desc: INDEX_CLEANUP_INFO rel \d+\/\d+\/\d+; snapshotConflictHorizon: \d+/,
+like($stdout, qr/rmgr: ChunkIndex .*desc: INDEX_CLEANUP_INFO rel \d+\/\d+\/\d+; snapshotConflictHorizon: \d+/,
 	'pg_waldump describes the cleanup records');
 
 $standby->stop;

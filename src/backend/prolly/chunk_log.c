@@ -22,11 +22,13 @@
  */
 #include "postgres.h"
 
-#include "access/generic_xlog.h"
+#include "access/bufmask.h"
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "executor/tuptable.h"
@@ -35,6 +37,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
@@ -115,6 +118,67 @@ init_page(Page page, uint16 kind)
 	opaque->kind = kind;
 	opaque->unused = 0;
 	opaque->dead = 0;
+}
+
+/*
+ * The changes the log makes to its pages, each WAL-logged as a record of
+ * its own (prolly/chunk_xlog.h) and made again by its redo.
+ */
+static void
+page_make(Page page, bool all_dead)
+{
+	init_page(page, CHUNK_PAGE_DATA);
+	if (all_dead)
+	{
+		((PageHeader) page)->pd_lower = AREA_START + AREA;
+		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead = AREA;
+	}
+}
+
+static void
+page_seal(Page page)
+{
+	ChunkPageOpaque opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
+
+	opaque->dead += AREA_START + AREA - ((PageHeader) page)->pd_lower;
+	((PageHeader) page)->pd_lower = AREA_START + AREA;
+}
+
+static void
+page_write(Page page, size_t off, const char *bytes, size_t n)
+{
+	if (off == 0)
+		init_page(page, CHUNK_PAGE_DATA);
+	memcpy((char *) page + AREA_START + off, bytes, n);
+	((PageHeader) page)->pd_lower = AREA_START + off + n;
+}
+
+static void
+page_add_dead(Page page, size_t n)
+{
+	((ChunkPageOpaque) PageGetSpecialPointer(page))->dead += n;
+}
+
+/*
+ * WAL-logs the change just made to buf's page, in the critical section
+ * that made it: rec, the record's, and data, block 0's (or none)
+ */
+static void
+log_page_change(Relation rel, Buffer buf, uint8 info, bool will_init,
+				const void *rec, size_t reclen, const void *data, size_t len)
+{
+	XLogRecPtr	lsn;
+
+	MarkBufferDirty(buf);
+	if (!RelationNeedsWAL(rel))
+		return;
+	XLogBeginInsert();
+	XLogRegisterData(rec, reclen);
+	XLogRegisterBuffer(0, buf, REGBUF_STANDARD | (will_init ? REGBUF_WILL_INIT : 0));
+	if (len > 0)
+		XLogRegisterBufData(0, data, len);
+	lsn = XLogInsert(RM_CHUNK_LOG_ID, info);
+	PageSetLSN(BufferGetPage(buf), lsn);
 }
 
 /* a page whose every byte was written, and is dead: free to use again */
@@ -229,6 +293,32 @@ data_buffer(Relation rel, BlockNumber blk)
 
 /* ------------------------------------------------------------- the log */
 
+/* the meta page's next block, mbuf locked exclusively */
+static void
+set_next_block(Relation rel, Buffer mbuf, BlockNumber next_block)
+{
+	xl_chunk_log_next_block xlrec = {.next_block = next_block};
+
+	START_CRIT_SECTION();
+	((ChunkLogMetaData *) PageGetContents(BufferGetPage(mbuf)))->next_block = next_block;
+	log_page_change(rel, mbuf, XLOG_CHUNK_LOG_NEXT_BLOCK, false,
+					&xlrec, sizeof(xlrec), NULL, 0);
+	END_CRIT_SECTION();
+}
+
+/* a data page made afresh: empty, or written full with every byte dead */
+static void
+make_page(Relation rel, Buffer buf, bool all_dead)
+{
+	xl_chunk_log_init_page xlrec = {.all_dead = all_dead};
+
+	START_CRIT_SECTION();
+	page_make(BufferGetPage(buf), all_dead);
+	log_page_change(rel, buf, XLOG_CHUNK_LOG_INIT_PAGE, true,
+					&xlrec, sizeof(xlrec), NULL, 0);
+	END_CRIT_SECTION();
+}
+
 /*
  * Claims npages new pages for this backend's appends, from the meta page:
  * the one place appends meet, for one short record per claim.
@@ -237,22 +327,17 @@ static BlockNumber
 claim_pages(Relation rel, BlockNumber npages)
 {
 	Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
-	GenericXLogState *st;
-	Page		page;
 	ChunkLogMetaData *meta;
 	BlockNumber first;
 
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
-	st = GenericXLogStart(rel);
-	page = GenericXLogRegisterBuffer(st, mbuf, 0);
-	meta = page_meta(rel, page);
+	meta = page_meta(rel, BufferGetPage(mbuf));
 	first = meta->next_block;
 	if (npages > MaxBlockNumber - first)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("chunk log \"%s\" is full", RelationGetRelationName(rel))));
-	meta->next_block = first + npages;
-	GenericXLogFinish(st);
+	set_next_block(rel, mbuf, first + npages);
 	UnlockReleaseBuffer(mbuf);
 	return first;
 }
@@ -275,7 +360,6 @@ take_free_page(Relation rel)
 		 */
 		BlockNumber blk = GetPageWithFreeSpace(rel, AREA / 2);
 		Buffer		buf;
-		GenericXLogState *st;
 		Page		page;
 
 		if (!BlockNumberIsValid(blk) || blk == META_BLOCK ||
@@ -290,10 +374,7 @@ take_free_page(Relation rel)
 			RecordPageWithFreeSpace(rel, blk, 0);
 			continue;
 		}
-		st = GenericXLogStart(rel);
-		init_page(GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE),
-				  CHUNK_PAGE_DATA);
-		GenericXLogFinish(st);
+		make_page(rel, buf, false);
 		UnlockReleaseBuffer(buf);
 		RecordPageWithFreeSpace(rel, blk, 0);
 		return blk;
@@ -320,9 +401,6 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 		BlockNumber blk = LOC_BLOCK(loc);
 		size_t		off = LOC_OFFSET(loc);
 		Buffer		buf = ReadBuffer(rel, blk);
-		GenericXLogState *st;
-		Page		page;
-		ChunkPageOpaque opaque;
 		bool		freed;
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -335,13 +413,11 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 					 errmsg("block %u of chunk log \"%s\" does not end where its region's appends are",
 							blk, RelationGetRelationName(rel))));
 		}
-		st = GenericXLogStart(rel);
-		page = GenericXLogRegisterBuffer(st, buf, 0);
-		opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
-		((PageHeader) page)->pd_lower = AREA_START + AREA;
-		opaque->dead += AREA - off;
-		freed = page_free(page);
-		GenericXLogFinish(st);
+		START_CRIT_SECTION();
+		page_seal(BufferGetPage(buf));
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_SEAL_PAGE, false, NULL, 0, NULL, 0);
+		END_CRIT_SECTION();
+		freed = page_free(BufferGetPage(buf));
 		UnlockReleaseBuffer(buf);
 		if (freed)
 		{
@@ -355,8 +431,6 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 		 blk++, loc += AREA)
 	{
 		Buffer		buf = ReadBuffer(rel, blk);
-		GenericXLogState *st;
-		Page		page;
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		if (!PageIsNew(BufferGetPage(buf)))
@@ -365,12 +439,7 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
-		st = GenericXLogStart(rel);
-		page = GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE);
-		init_page(page, CHUNK_PAGE_DATA);
-		((PageHeader) page)->pd_lower = AREA_START + AREA;
-		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead = AREA;
-		GenericXLogFinish(st);
+		make_page(rel, buf, true);
 		UnlockReleaseBuffer(buf);
 		RecordPageWithFreeSpace(rel, blk, AREA);
 		FreeSpaceMapVacuumRange(rel, blk, blk + 1);
@@ -479,8 +548,7 @@ page_append(Relation rel, const void *data, size_t len)
 		size_t		off = LOC_OFFSET(region.next),
 					n = Min(len, AREA - off);
 		Buffer		buf;
-		GenericXLogState *st;
-		Page		page;
+		xl_chunk_log_append xlrec = {.off = off, .len = n};
 
 		CHECK_FOR_INTERRUPTS();
 		buf = data_buffer(rel, blk);
@@ -508,14 +576,11 @@ page_append(Relation rel, const void *data, size_t len)
 								blk, RelationGetRelationName(rel))));
 		}
 
-		st = GenericXLogStart(rel);
-		page = GenericXLogRegisterBuffer(st, buf,
-										 off == 0 ? GENERIC_XLOG_FULL_IMAGE : 0);
-		if (off == 0)
-			init_page(page, CHUNK_PAGE_DATA);
-		memcpy((char *) page + AREA_START + off, bytes, n);
-		((PageHeader) page)->pd_lower = AREA_START + off + n;
-		GenericXLogFinish(st);
+		START_CRIT_SECTION();
+		page_write(BufferGetPage(buf), off, bytes, n);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_APPEND, off == 0,
+						&xlrec, sizeof(xlrec), bytes, n);
+		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 		region.next += n;
 		bytes += n;
@@ -611,9 +676,8 @@ page_mark_dead(Relation rel, uint64 loc, size_t len)
 		size_t		off = LOC_OFFSET(loc),
 					n = Min(len, AREA - off);
 		Buffer		buf;
-		GenericXLogState *st;
 		Page		page;
-		ChunkPageOpaque opaque;
+		xl_chunk_log_mark_dead xlrec = {.len = n};
 		bool		freed;
 
 		CHECK_FOR_INTERRUPTS();
@@ -626,21 +690,22 @@ page_mark_dead(Relation rel, uint64 loc, size_t len)
 		buf = ReadBuffer(rel, blk);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
-		st = GenericXLogStart(rel);
-		page = GenericXLogRegisterBuffer(st, buf, 0);
-		opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
-		if (opaque->dead + n > ((PageHeader) page)->pd_lower - AREA_START)
+		page = BufferGetPage(buf);
+		if (((ChunkPageOpaque) PageGetSpecialPointer(page))->dead + n >
+			((PageHeader) page)->pd_lower - AREA_START)
 		{
-			GenericXLogAbort(st);
 			UnlockReleaseBuffer(buf);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("block %u of chunk log \"%s\" would have more bytes dead than written",
 							blk, RelationGetRelationName(rel))));
 		}
-		opaque->dead += n;
+		START_CRIT_SECTION();
+		page_add_dead(page, n);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_MARK_DEAD, false,
+						&xlrec, sizeof(xlrec), NULL, 0);
+		END_CRIT_SECTION();
 		freed = page_free(page);
-		GenericXLogFinish(st);
 		UnlockReleaseBuffer(buf);
 		if (freed)
 		{
@@ -783,8 +848,6 @@ ChunkLogTruncateTail(Relation rel)
 	if (keep < nblocks)
 	{
 		Buffer		mbuf;
-		GenericXLogState *st;
-		ChunkLogMetaData *meta;
 		SharedInvalidationMessage msg;
 
 		RelationTruncate(rel, keep);
@@ -792,10 +855,8 @@ ChunkLogTruncateTail(Relation rel)
 		/* (no region from the cut on: the next claim starts there) */
 		mbuf = ReadBuffer(rel, META_BLOCK);
 		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
-		st = GenericXLogStart(rel);
-		meta = page_meta(rel, GenericXLogRegisterBuffer(st, mbuf, 0));
-		meta->next_block = keep;
-		GenericXLogFinish(st);
+		(void) page_meta(rel, BufferGetPage(mbuf));
+		set_next_block(rel, mbuf, keep);
 		UnlockReleaseBuffer(mbuf);
 
 		msg.rc.id = SHAREDINVALRELCACHE_ID;
@@ -1304,4 +1365,101 @@ Datum
 prolly_chunk_index_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(index_routine());
+}
+
+/* ------------------------------------------------------------- redo */
+
+void
+chunk_log_redo(XLogReaderState *record)
+{
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	char	   *rec = XLogRecGetData(record);
+	RelFileLocator locator;
+	BlockNumber blk;
+	Buffer		buf = InvalidBuffer;
+	bool		applied = false;
+
+	XLogRecGetBlockTag(record, 0, &locator, NULL, &blk);
+	switch (info)
+	{
+		case XLOG_CHUNK_LOG_NEXT_BLOCK:
+			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+			{
+				((ChunkLogMetaData *) PageGetContents(BufferGetPage(buf)))->next_block =
+					((xl_chunk_log_next_block *) rec)->next_block;
+				applied = true;
+			}
+			break;
+		case XLOG_CHUNK_LOG_INIT_PAGE:
+			buf = XLogInitBufferForRedo(record, 0);
+			page_make(BufferGetPage(buf), ((xl_chunk_log_init_page *) rec)->all_dead);
+			applied = true;
+			break;
+		case XLOG_CHUNK_LOG_SEAL_PAGE:
+			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+			{
+				page_seal(BufferGetPage(buf));
+				applied = true;
+			}
+			break;
+		case XLOG_CHUNK_LOG_APPEND:
+			{
+				xl_chunk_log_append *xlrec = (xl_chunk_log_append *) rec;
+				Size		len;
+				char	   *bytes;
+
+				if (xlrec->off == 0)
+					buf = XLogInitBufferForRedo(record, 0);
+				else if (XLogReadBufferForRedo(record, 0, &buf) != BLK_NEEDS_REDO)
+					break;
+				bytes = XLogRecGetBlockData(record, 0, &len);
+				if (len != xlrec->len || xlrec->off + len > AREA)
+					elog(PANIC, "chunk_log_redo: an append of %u bytes at %u has %zu",
+						 xlrec->len, xlrec->off, len);
+				page_write(BufferGetPage(buf), xlrec->off, bytes, len);
+				applied = true;
+				break;
+			}
+		case XLOG_CHUNK_LOG_MARK_DEAD:
+			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+			{
+				page_add_dead(BufferGetPage(buf), ((xl_chunk_log_mark_dead *) rec)->len);
+				applied = true;
+			}
+			break;
+		default:
+			elog(PANIC, "chunk_log_redo: unknown op code %u", info);
+	}
+	if (applied)
+	{
+		PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
+		MarkBufferDirty(buf);
+	}
+	if (BufferIsValid(buf))
+	{
+		/*
+		 * (the free space map as the primary keeps it, for after promotion:
+		 * a page all dead is free, one made afresh to append to is not)
+		 */
+		bool		data_page = blk != META_BLOCK;
+		bool		freed = data_page && page_free(BufferGetPage(buf));
+
+		UnlockReleaseBuffer(buf);
+		if (freed)
+			XLogRecordPageWithFreeSpace(locator, blk, AREA);
+		else if (info == XLOG_CHUNK_LOG_INIT_PAGE)
+			XLogRecordPageWithFreeSpace(locator, blk, 0);
+	}
+}
+
+/*
+ * For wal_consistency_checking: a page as replayed is the primary's but for
+ * its LSN, checksum, hint bits and the bytes past where it is written
+ */
+void
+chunk_log_mask(char *pagedata, BlockNumber blkno)
+{
+	mask_page_lsn_and_checksum(pagedata);
+	mask_page_hint_bits(pagedata);
+	mask_unused_space(pagedata);
 }

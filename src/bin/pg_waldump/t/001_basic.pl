@@ -98,7 +98,8 @@ Generic
 LogicalMessage
 XLOG2
 BlockMap
-ChunkStore$/,
+ChunkLog
+ChunkIndex$/,
 	'rmgr list');
 
 
