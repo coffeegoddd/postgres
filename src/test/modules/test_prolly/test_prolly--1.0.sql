@@ -388,6 +388,10 @@ CREATE FUNCTION test_cs_get(store text, hash bytea)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
+CREATE FUNCTION test_cs_get_many(store text, hashes bytea[])
+RETURNS bytea[]
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
 CREATE FUNCTION test_cs_has(store text, hash bytea)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

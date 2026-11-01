@@ -47,6 +47,15 @@ extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 						   uint32 *len);
 
 /*
+ * Many chunks' bytes at once: out[i] (palloc'd) and lens[i] for hashes[i],
+ * NULL for one absent.  Read in the log's order, whatever the order asked
+ * (a tree's level read at once reads its pages through once); a name asked
+ * twice is read twice.
+ */
+extern void ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes,
+							  int n, void **out, uint32 *lens);
+
+/*
  * Stores the chunk unless the store has it; true if it stored it.  A hash
  * that isn't the bytes' is an error, as is a strong reference (as
  * ChunkFormat finds them) to a chunk the store doesn't have.  Storing it

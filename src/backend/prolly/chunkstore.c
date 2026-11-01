@@ -108,6 +108,18 @@ pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 	return data;
 }
 
+static void
+pages_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
+			   uint32 *lens)
+{
+	Relation	log,
+				idx;
+
+	open_store(AccessShareLock, &log, &idx);
+	ChunkStoreGetMany(log, idx, hashes, n, out, lens);
+	close_store(log, idx);
+}
+
 static bool
 pages_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
@@ -213,6 +225,7 @@ const ChunkStoreRoutine PagesChunkStore = {
 	.open = pages_open,
 	.has = pages_has,
 	.get = pages_get,
+	.get_many = pages_get_many,
 	.put = pages_put,
 	.ref_root = pages_ref_root,
 	.unref_root = pages_unref_root,

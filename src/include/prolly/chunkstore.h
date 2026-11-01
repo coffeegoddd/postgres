@@ -72,6 +72,14 @@ typedef struct ChunkStoreRoutine
 	void	   *(*get) (ChunkStore *cs, const uint8 *hash, uint32 *len);
 
 	/*
+	 * get of each of hashes[0..n): out[i] and lens[i], NULL for one absent,
+	 * read in the store's own order (a tree's level at once; the caller
+	 * bounds how many, all of their bytes held at once)
+	 */
+	void		(*get_many) (ChunkStore *cs, const uint8 *hashes, int n,
+							 void **out, uint32 *lens);
+
+	/*
 	 * Stores the chunk the bytes are unless the store has it (true if it
 	 * stored it), its name in *hash, and pins it, and every chunk it
 	 * references.  A strong reference to a chunk the store hasn't is an
@@ -137,6 +145,12 @@ static inline void *
 cs_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 {
 	return cs->routine->get(cs, hash, len);
+}
+
+static inline void
+cs_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out, uint32 *lens)
+{
+	cs->routine->get_many(cs, hashes, n, out, lens);
 }
 
 static inline bool
