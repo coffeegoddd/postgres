@@ -200,6 +200,15 @@ entry_of(RelFileLocator log)
 	return -1;
 }
 
+/* (a subtransaction aborted ends any append it was in) */
+static void
+end_append_sub(SubXactEvent event, SubTransactionId mySubid,
+			   SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		appending = false;
+}
+
 void
 ChunkRegionPublish(RelFileLocator log, Oid relid, uint32 generation,
 				   BlockNumber first, BlockNumber end)
@@ -212,6 +221,7 @@ ChunkRegionPublish(RelFileLocator log, Oid relid, uint32 generation,
 		on_shmem_exit(clear_regions, (Datum) 0);
 		CacheRegisterRelcacheCallback(forget_regions, (Datum) 0);
 		RegisterXactCallback(drop_forgotten, NULL);
+		RegisterSubXactCallback(end_append_sub, NULL);
 		callbacks_registered = true;
 	}
 	j = entry_of(log);

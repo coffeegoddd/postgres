@@ -239,7 +239,7 @@ is($primary->safe_psql('postgres', q{SELECT ok FROM test_chunk_check('gl', 'gi')
 $idle->quit;
 # (a region forgotten to another's invalidation, taken in as a transaction
 # begins, no put running: let go of at once, not as that transaction ends)
-my $a = $primary->background_psql('postgres');
+my $a = $primary->background_psql('postgres', on_error_stop => 0);
 $a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(420)), blob(420))});
 is($primary->safe_psql('postgres', q{SELECT test_chunk_log_regions('gl')}), '1', 'a backend\'s region');
 $primary->safe_psql('postgres', 'GRANT SELECT ON gl TO PUBLIC');
@@ -247,6 +247,23 @@ $a->query_safe('BEGIN');
 $a->query_safe('SELECT 1');
 is($primary->safe_psql('postgres', q{SELECT test_chunk_log_regions('gl')}), '0',
 	'forgotten to another\'s invalidation, let go of at once');
+$a->query_safe('COMMIT');
+# (and so after a put that failed in a subtransaction, rolled back to)
+$a->query_safe(q{BEGIN});
+$a->query_safe(q{SELECT test_chunk_put('gl', 'gi', h(blob(421)), blob(421))});
+$a->query_safe(q{SAVEPOINT s});
+$a->query_safe(q{SELECT injection_points_set_local()});
+$a->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});
+$a->query(q{SELECT test_chunk_put('gl', 'gi', h(huge(421)), huge(421))});
+like($a->{stderr}, qr/error triggered for injection point chunk-log-region-sealed/, 'a put failing');
+$a->{stderr} = '';
+$a->query_safe(q{ROLLBACK TO s});
+$a->query_safe(q{SELECT injection_points_detach('chunk-log-region-sealed')});
+is($primary->safe_psql('postgres', q{SELECT test_chunk_log_regions('gl')}), '1', 'its region after');
+$primary->safe_psql('postgres', 'REVOKE SELECT ON gl FROM PUBLIC');
+$a->query_safe(q{SELECT test_chunk_log_regions('gl')});
+is($primary->safe_psql('postgres', q{SELECT test_chunk_log_regions('gl')}), '0',
+	'forgotten after a put failed in a subtransaction, let go of at once');
 $a->query_safe('COMMIT');
 $a->quit;
 
