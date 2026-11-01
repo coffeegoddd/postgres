@@ -3,6 +3,7 @@
 # used by frontend programs like pg_waldump
 rmgr_desc_sources = files(
   'bmapdesc.c',
+  'chunkdesc.c',
   'brindesc.c',
   'clogdesc.c',
   'committsdesc.c',

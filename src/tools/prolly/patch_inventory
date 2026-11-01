@@ -57,10 +57,11 @@ patch src/backend/access/heap/heapam_xlog.c  1a  replays XLOG_HEAP2_VM_SET, visi
 patch src/backend/access/heap/pruneheap.c  1a  on-access pruning leaves shared pages to VACUUM or a change, so reads copy nothing; VACUUM freezes a page the storage shares with nothing whenever all its tuples can be (freeze_own_eagerly)
 patch src/backend/access/heap/vacuumlazy.c  1a  leaves block-mapped pages another relation shares as they are when nothing on them is reclaimable; counts a shared page left as it is as an eager scan's failure; reads pages it skips as all-visible for their free space while the storage manager says the free space map may not know them (smgrfreespaceunknown)
 patch src/backend/access/nbtree/nbtpage.c  1a  B-tree VACUUM takes leaf cleanup locks unprepared and prepares only the pages it changes, so shared leaves aren't copied
-patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions
+patch src/backend/access/rmgrdesc/Makefile  1a  builds the block map's WAL descriptions; also (2) chunkdesc.o
+patch src/backend/access/rmgrdesc/chunkdesc.c  2  the history store's WAL records (ChunkStore)
 patch src/backend/access/rmgrdesc/heapdesc.c  1a  describes XLOG_HEAP2_VM_SET
-patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions
-patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager
+patch src/backend/access/rmgrdesc/meson.build  1a  builds the block map's WAL descriptions; also (2) chunkdesc.c
+patch src/backend/access/transam/rmgr.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
 patch src/backend/access/transam/twophase.c  1a  says whether a transaction is prepared or being prepared (TwoPhaseTransactionIsKnown), so its block-mapped storage isn't taken for an orphan
 patch src/backend/access/transam/xact.c  1a  lets storage managers prepare drops before the commit record (smgrPreCommitPendingDeletes)
 patch src/backend/access/transam/xlog.c  1a  tells a storage manager whether an online backup runs or began (GetBackupState); fails a standby's backup that replayed pages synced instead of logged (XLogNoteSyncedReplay); keeps in pg_control where pages synced instead of logged need recovery to begin past (XLogNoteSyncedPages), and says where (XLogSyncedSince), refusing a recovery or a standby's backup beginning there, or a standby's backup stopping once a replay noted it past the backup's start; tells the block map where recovery ended (bmap_recovery_done); says where a recovery of this server may begin, an online backup running on it included (GetRecoveryHold); wakes the walreceiver after a restartpoint, to report the hold it moved
@@ -144,17 +145,17 @@ patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster o
 patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred
 patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation's map fork for its absent main fork, and each database's page store whole in every tablespace that has one, even one no relation names (kept in --swap)
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
-patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
+patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager; also (2) prolly/chunk_xlog.h
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode
 patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
 patch src/include/access/heapam.h  1b  heap and index scans remember the branch whose catalog rows they see
 patch src/include/access/heapam_xlog.h  1a  XLOG_HEAP2_VM_SET, reusing the value 0x40 that upstream freed when it removed XLOG_HEAP2_VISIBLE
-patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager
+patch src/include/access/rmgrlist.h  1a  the block map's WAL resource manager; also (2) RM_CHUNK_STORE_ID
 patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
 patch src/include/access/xlog.h  1a  declares GetBackupState, GetRecoveryHold, XLogNoteSyncedPages, XLogSyncedSince and XLogNoteSyncedReplay
-patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records
+patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records; also (2) XLOG_PAGE_MAGIC for ChunkStore
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/catalog.h  2  IsHistoryStoreNamespace()
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs

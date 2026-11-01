@@ -38,6 +38,7 @@
 #include "replication/decode.h"
 #include "replication/message.h"
 #include "replication/origin.h"
+#include "prolly/chunk_xlog.h"
 #include "storage/bmap_xlog.h"
 #include "storage/standby.h"
 #include "utils/relmapper.h"

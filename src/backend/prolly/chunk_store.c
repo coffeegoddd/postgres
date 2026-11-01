@@ -23,6 +23,7 @@
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 void
 ChunkHash(const void *data, size_t len, uint8 *out)
@@ -85,6 +86,13 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	ChunkIndexEntry e;
 	void	   *data;
 
+	/*
+	 * (a chunk freed is taken out, and its bytes reused, once no snapshot
+	 * might have found it before: a reader without one has none of that
+	 * protection, as a TOAST fetch would not)
+	 */
+	if (!HaveRegisteredOrActiveSnapshot())
+		elog(ERROR, "cannot read the history store without an active snapshot");
 	if (!ChunkIndex->lookup(idx, hash, &e))
 		return NULL;
 	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);

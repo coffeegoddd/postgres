@@ -23,6 +23,7 @@ OBJS = \
 	chunk_log.o \
 	chunk_pin.o \
 	chunk_pointers.o \
+	chunk_xlog.o \
 	chunk_store.o \
 	registry.o
 
