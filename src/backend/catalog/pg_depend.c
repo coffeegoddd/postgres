@@ -88,7 +88,8 @@ recordMultipleDependencies(const ObjectAddress *depender,
 		return;
 
 	/* a shared object must not depend on a branch's */
-	CatalogBranchCheckDependencies(depender, referenced, nreferenced);
+	CatalogBranchCheckDependencies(depender, referenced, nreferenced,
+								   behavior);
 
 	dependDesc = table_open(DependRelationId, RowExclusiveLock);
 

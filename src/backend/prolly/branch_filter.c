@@ -925,7 +925,7 @@ object_namespace(Oid classid, Oid objid, int depth)
 void
 CatalogBranchCheckDependencies(const ObjectAddress *depender,
 							   const ObjectAddress *referenced,
-							   int nreferenced)
+							   int nreferenced, DependencyType deptype)
 {
 	int32		depender_branch = -1;
 
@@ -936,7 +936,38 @@ CatalogBranchCheckDependencies(const ObjectAddress *depender,
 		branch = BranchMap->object_branch(referenced[i].classId,
 										  referenced[i].objectId);
 		if (branch == 0)
+		{
+			/*
+			 * A branch's object may depend on a shared one, but not belong
+			 * to it: dropping an object that belongs to another drops that
+			 * one, and so dropping the branch's would drop the shared one,
+			 * and everything of every branch that depends on it.
+			 */
+			if (deptype == DEPENDENCY_INTERNAL ||
+				deptype == DEPENDENCY_EXTENSION)
+			{
+				/*
+				 * (by their schemas, which finds objects made earlier in
+				 * this command too: the map takes those for shared)
+				 */
+				Oid			depnsp = object_namespace(depender->classId,
+													  depender->objectId, 0);
+				Oid			refnsp;
+
+				/* (shared DDL, the common case, needs no second read) */
+				if (!OidIsValid(depnsp) || NamespaceBranch(depnsp) == 0)
+					continue;
+				refnsp = object_namespace(referenced[i].classId,
+										  referenced[i].objectId, 0);
+				if (OidIsValid(refnsp) && NamespaceBranch(refnsp) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("an object in a versioned schema cannot belong to %s",
+									getObjectDescription(&referenced[i], false)),
+							 errdetail("A shared object's parts are shared too.")));
+			}
 			continue;
+		}
 		if (depender_branch < 0)
 			depender_branch = BranchMap->object_branch(depender->classId,
 													   depender->objectId);

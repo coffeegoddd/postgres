@@ -9,8 +9,12 @@
  * machinery, so that every row an object has anywhere goes with it, and
  * its storage with it.  The cascade cannot reach another branch's objects
  * nor shared ones, since no object depends on a branch's but that
- * branch's own (and temporary objects, which go too).  It costs what the
- * branch has: O(C) in the objects of its schemas.
+ * branch's own (and temporary objects, which go too), and none of the
+ * branch's belongs to a shared one (an internal or extension dependency,
+ * which would turn the drop of the branch's object into a drop of the
+ * shared one).  It costs what the branch has in the objects of its
+ * schemas, and a scan of pg_namespace, whose rows are every branch's
+ * schemas.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -42,6 +46,9 @@ dependency_drop(int32 branch)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%d is not a branch", branch)));
+
+	/* no schema is made on the branch meanwhile, nor after, uncommitted */
+	LockBranchCatalogs(branch, AccessExclusiveLock);
 
 	/* the branch's schemas: pg_namespace holds few rows */
 	rel = table_open(NamespaceRelationId, AccessShareLock);

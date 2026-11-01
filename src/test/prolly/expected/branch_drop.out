@@ -22,6 +22,11 @@ CREATE TABLE app.t (id int PRIMARY KEY, p int REFERENCES pub.p, m app.mood,
 					h pub.hstore);
 CREATE VIEW app.v AS SELECT id FROM app.t;
 CREATE FUNCTION app.f() RETURNS int LANGUAGE sql RETURN 2;
+-- a branch's object cannot belong to a shared extension: dropping the
+-- branch would drop the extension, and every branch's columns of its type
+ALTER EXTENSION hstore ADD FUNCTION app.f();
+ERROR:  an object in a versioned schema cannot belong to extension hstore
+DETAIL:  A shared object's parts are shared too.
 CREATE SCHEMA app2 VERSIONED CREATE TABLE u (x text);
 CREATE EXTENSION pg_trgm SCHEMA app2;
 INSERT INTO app.t VALUES (2, 1, 'ok', 'b=>2');

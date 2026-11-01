@@ -34,7 +34,8 @@
 #define PROLLY_BRANCH_CATALOG_H
 
 #include "access/htup.h"
-#include "catalog/objectaddress.h"
+#include "catalog/dependency.h"
+#include "storage/lockdefs.h"
 #include "utils/relcache.h"
 
 /* The branch whose catalog rows this session sees (0: none). */
@@ -110,7 +111,18 @@ extern int32 FunctionBranch(HeapTuple proctup);
  */
 extern void NamespaceCheckNameFree(const char *nspname, int32 branch);
 
-/* The branch a new versioned schema goes on: the session's, if it may. */
+/*
+ * Locks a branch's catalog rows in mode until the transaction ends: making
+ * a versioned schema on the branch takes AccessShareLock, dropping the
+ * branch's rows AccessExclusiveLock, so that no schema is made on a branch
+ * while its rows are dropped.
+ */
+extern void LockBranchCatalogs(int32 branch, LOCKMODE mode);
+
+/*
+ * The branch a new versioned schema goes on: the session's, if it may (its
+ * branch locked against a drop of its rows).
+ */
 extern int32 VersionedNamespaceBranch(const char *nspname);
 
 /*
@@ -138,12 +150,15 @@ extern bool CatalogBranchSkipsRelation(Relation rel);
  * must not change when one branch changes.  (A temporary object may
  * depend on the session's versioned objects: it is the session's alone.)
  * CatalogBranchCheckDependencies errors out if depender may not depend on
- * referenced; CatalogBranchCheckMove if an object may not move from one
+ * referenced (nor belong to a shared object: an internal or extension
+ * dependency, which a drop of the depender turns into a drop of the
+ * shared object); CatalogBranchCheckMove if an object may not move from one
  * schema to another, which would change its branch.
  */
 extern void CatalogBranchCheckDependencies(const ObjectAddress *depender,
 										   const ObjectAddress *referenced,
-										   int nreferenced);
+										   int nreferenced,
+										   DependencyType deptype);
 extern void CatalogBranchCheckMove(Oid oldnspid, Oid newnspid);
 
 /*

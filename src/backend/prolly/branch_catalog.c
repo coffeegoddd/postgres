@@ -45,6 +45,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
@@ -288,7 +289,19 @@ VersionedNamespaceBranch(const char *nspname)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("branch %d has not been allocated", catalog_branch),
 				 errhint("Allocate a branch with pg_branch_id_allocate().")));
+	LockBranchCatalogs(catalog_branch, AccessShareLock);
 	return catalog_branch;
+}
+
+/*
+ * A branch's lock is a database object lock of pg_database's class on the
+ * branch's number, with sub-id 1: a database's own locks are shared
+ * objects', under database 0, so no lock of a database is the same.
+ */
+void
+LockBranchCatalogs(int32 branch, LOCKMODE mode)
+{
+	LockDatabaseObject(DatabaseRelationId, (Oid) branch, 1, mode);
 }
 
 /*

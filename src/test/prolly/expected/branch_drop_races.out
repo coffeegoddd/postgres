@@ -1,0 +1,14 @@
+Parsed test spec with 2 sessions
+
+starting permutation: m_begin m_make d_drop m_commit d_count
+step m_begin: BEGIN;
+step m_make: CREATE SCHEMA app VERSIONED CREATE TABLE t (x int);
+step d_drop: SELECT FROM pg_branch_catalog_drop((SELECT b FROM branch_ids WHERE n = 1)); <waiting ...>
+step m_commit: COMMIT;
+step d_drop: <... completed>
+step d_count: SET catalog_branch_filter = off; SELECT count(*) AS schemas FROM pg_namespace WHERE nspbranch = (SELECT b FROM branch_ids WHERE n = 1); RESET catalog_branch_filter;
+schemas
+-------
+      0
+(1 row)
+
