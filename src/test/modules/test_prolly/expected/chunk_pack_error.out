@@ -20,8 +20,8 @@ injection_points_attach
 
 step e_pack: 
 	SELECT test_cs_put_many('pages',
-		ARRAY(SELECT pack_h('\x4c'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
-		ARRAY(SELECT '\x4c'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i));
+		ARRAY(SELECT pack_h('\x4c'::bytea || int4send(i)) FROM generate_series(1, 20000) i ORDER BY i),
+		ARRAY(SELECT '\x4c'::bytea || int4send(i) FROM generate_series(1, 20000) i ORDER BY i));
 
 ERROR:  error triggered for injection point chunk-index-split-published
 step e_detach: SELECT injection_points_detach('chunk-index-split-published');
@@ -38,7 +38,7 @@ t
 
 step e_vacuum: VACUUM pg_history.chunk_index;
 step e_dead: 
-	SELECT more_dead > 0 AND more_dead < 3000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
+	SELECT more_dead > 0 AND more_dead < 20000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
 	FROM (SELECT l.dead - d.dead AS more_dead
 		  FROM test_chunk_log_space('pg_history.chunks') l, dead0 d) x;
 
@@ -63,7 +63,7 @@ t
 
 step e_none: 
 	SELECT count(*) FILTER (WHERE test_cs_has('pages', pack_h('\x4c'::bytea || int4send(i)))) AS there
-	FROM generate_series(1, 3000) i;
+	FROM generate_series(1, 20000) i;
 
 there
 -----
