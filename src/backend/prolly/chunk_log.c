@@ -85,6 +85,8 @@ typedef struct ChunkLogMetaData
 	uint32		generation;		/* one more at each tail cut */
 	BlockNumber cut_from;		/* the last cut's first page cut, or
 								 * InvalidBlockNumber */
+	Oid			index;			/* the one chunk index naming its bytes, or
+								 * InvalidOid */
 } ChunkLogMetaData;
 
 /*
@@ -101,6 +103,7 @@ typedef struct ChunkLogRegion
 	uint64		limit;			/* where the region ends */
 	uint64		stamp;			/* the storage's stamp, if known, or 0 */
 	uint32		generation;		/* the log's when the region was made */
+	Oid			index;			/* the index the log is known bound to */
 } ChunkLogRegion;
 
 /* The bytes of the log a data page holds, after its header. */
@@ -275,6 +278,7 @@ init_meta(Page page)
 	meta->next_block = META_BLOCK + 1;
 	meta->generation = 1;
 	meta->cut_from = InvalidBlockNumber;
+	meta->index = InvalidOid;
 	if (!pg_strong_random(&meta->stamp, sizeof(meta->stamp)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -297,8 +301,8 @@ write_meta(SMgrRelation srel, bool use_wal)
 /*
  * Data page blk, locked exclusively; the relation extended to it if needed
  * (another backend may extend the relation past blk meanwhile, with zero
- * pages: blk is a page of this backend's region not yet written, and
- * nobody else writes it).
+ * pages, or make blk itself: a page of a region, written by its backend,
+ * and by VACUUM where bytes reserved in it were never written).
  */
 static Buffer
 data_buffer(Relation rel, BlockNumber blk)
@@ -312,8 +316,15 @@ data_buffer(Relation rel, BlockNumber blk)
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		return buf;
 	}
-	return ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0, blk + 1,
-							   RBM_ZERO_AND_LOCK);
+	/*
+	 * (read, not made zero, if another made it meanwhile: VACUUM counting
+	 * bytes reserved and never written dead extends the log too, as their
+	 * region's backend may at once)
+	 */
+	buf = ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0, blk + 1,
+							  RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	return buf;
 }
 
 /* ------------------------------------------------------------- the log */
@@ -531,15 +542,71 @@ keep_region(Relation rel, const ChunkLogRegion *region)
 {
 	ChunkLogRegion *cached = rel->rd_amcache;
 	uint64		stamp = 0;
+	Oid			index = InvalidOid;
 
 	if (cached == NULL)
 		cached = rel->rd_amcache = MemoryContextAllocZero(CacheMemoryContext,
 														  sizeof(ChunkLogRegion));
 	else if (cached->relnumber == region->relnumber)
+	{
 		stamp = cached->stamp;
+		index = cached->index;
+	}
 	*cached = *region;
 	if (cached->stamp == 0)
 		cached->stamp = stamp;
+	if (!OidIsValid(cached->index))
+		cached->index = index;
+}
+
+/*
+ * Binds the log to the one chunk index naming its bytes, or checks it is
+ * bound to it: a tail cut is safe only made by the VACUUM of every index
+ * naming the log's bytes, which takes out every aborted entry it finds
+ * before it cuts (prolly/chunk_log.h's mark_dead)
+ */
+static void
+page_bind_index(Relation rel, Oid index)
+{
+	ChunkLogRegion *cached = rel->rd_amcache;
+	Buffer		mbuf;
+	ChunkLogMetaData *meta;
+
+	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber &&
+		cached->index == index)
+		return;
+	mbuf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	meta = page_meta(rel, BufferGetPage(mbuf));
+	if (OidIsValid(meta->index) && meta->index != index)
+	{
+		UnlockReleaseBuffer(mbuf);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("chunk log \"%s\" is another chunk index's",
+						RelationGetRelationName(rel)),
+				 errdetail("A chunk log's bytes are named by one chunk index.")));
+	}
+	if (!OidIsValid(meta->index))
+	{
+		xl_chunk_log_bind_index xlrec = {.index = index};
+
+		START_CRIT_SECTION();
+		meta->index = index;
+		log_page_change(rel, mbuf, XLOG_CHUNK_LOG_BIND_INDEX, false,
+						&xlrec, sizeof(xlrec), NULL, 0);
+		END_CRIT_SECTION();
+	}
+	UnlockReleaseBuffer(mbuf);
+	if (cached == NULL)
+		cached = rel->rd_amcache = MemoryContextAllocZero(CacheMemoryContext,
+														  sizeof(ChunkLogRegion));
+	if (cached->relnumber != rel->rd_locator.relNumber)
+	{
+		memset(cached, 0, sizeof(ChunkLogRegion));
+		cached->relnumber = rel->rd_locator.relNumber;
+	}
+	cached->index = index;
 }
 
 /*
@@ -583,9 +650,15 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	{
 		BlockNumber blk;
 
-		/* what is left of the region let go of */
+		/*
+		 * What is left of the region let go of, forgotten first: should what
+		 * follows fail (a claim, an I/O), no put reserves in a region sealed
+		 */
+		if (cached != NULL && cached->relnumber == region.relnumber)
+			cached->next = cached->limit = 0;
 		if (region.limit > 0)
 			seal_region(rel, region.next, region.limit);
+		INJECTION_POINT("chunk-log-region-sealed", NULL);
 
 		blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
 		if (BlockNumberIsValid(blk))
@@ -1032,6 +1105,7 @@ const ChunkLogRoutine PageChunkLog = {
 	.reserve = page_reserve,
 	.write = page_write_at,
 	.release = page_release,
+	.bind_index = page_bind_index,
 	.read = page_read,
 	.mark_dead = page_mark_dead,
 	.stamp = page_stamp,
@@ -1548,6 +1622,14 @@ chunk_log_redo(XLogReaderState *record)
 			{
 				meta_set((ChunkLogMetaData *) PageGetContents(BufferGetPage(buf)),
 						 (xl_chunk_log_next_block *) rec);
+				applied = true;
+			}
+			break;
+		case XLOG_CHUNK_LOG_BIND_INDEX:
+			if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+			{
+				((ChunkLogMetaData *) PageGetContents(BufferGetPage(buf)))->index =
+					((xl_chunk_log_bind_index *) rec)->index;
 				applied = true;
 			}
 			break;

@@ -88,16 +88,17 @@ COMMIT;
 -- VACUUM takes aborted transactions' entries out, notes the rest
 -- committed, and advances the index's relfrozenxid
 CREATE TABLE ci3 () USING prolly_chunk_index;
+CREATE TABLE cl3 () USING prolly_chunks;
 SELECT relfrozenxid <> '0'::xid AS has_frozenxid FROM pg_class WHERE relname = 'ci3';
 BEGIN;
-SELECT count(test_chunk_put('cl', 'ci3', h(d), d)) AS aborted
+SELECT count(test_chunk_put('cl3', 'ci3', h(d), d)) AS aborted
 FROM (SELECT convert_to('gone ' || g, 'UTF8') AS d FROM generate_series(1, 300) g) s;
 ROLLBACK;
-SELECT count(test_chunk_put('cl', 'ci3', h(d), d)) AS committed
+SELECT count(test_chunk_put('cl3', 'ci3', h(d), d)) AS committed
 FROM (SELECT convert_to('kept ' || g, 'UTF8') AS d FROM generate_series(1, 300) g) s;
 SELECT entries AS before_vacuum FROM test_chunk_index_shape('ci3');
 -- (lookups note commits on entries, but freeze none: only VACUUM does)
-SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS looked_up
+SELECT count(*) FILTER (WHERE test_chunk_has('cl3', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS looked_up
 FROM generate_series(1, 300) g;
 SELECT test_chunk_index_unfrozen('ci3') AS unfrozen_before;
 SELECT age(relfrozenxid) AS age_before FROM pg_class WHERE relname = 'ci3' \gset
@@ -106,10 +107,14 @@ VACUUM ci3;
 SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
 FROM test_chunk_index_shape('ci3');
 SELECT age(relfrozenxid) < :age_before AS frozenxid_advanced FROM pg_class WHERE relname = 'ci3';
-SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS kept,
-	count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('gone ' || g, 'UTF8')))) AS gone
+SELECT count(*) FILTER (WHERE test_chunk_has('cl3', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS kept,
+	count(*) FILTER (WHERE test_chunk_has('cl3', 'ci3', h(convert_to('gone ' || g, 'UTF8')))) AS gone
 FROM generate_series(1, 300) g;
-DROP TABLE ci3;
+-- a log's bytes are one index's: a put through another index, bound to
+-- no log yet, refused (and the index not bound to it)
+CREATE TABLE ci4 () USING prolly_chunk_index;
+SELECT test_chunk_put('cl3', 'ci4', h('\x0c'), '\x0c');
+DROP TABLE ci3, ci4, cl3;
 
 -- truncated, it starts again
 TRUNCATE ci;
@@ -118,12 +123,13 @@ SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has_after_truncate;
 -- and truncated in the transaction that made it
 BEGIN;
 CREATE TABLE ci_once () USING prolly_chunk_index;
-SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored;
+CREATE TABLE cl_once () USING prolly_chunks;
+SELECT test_chunk_put('cl_once', 'ci_once', h('\x01'), '\x01') AS stored;
 TRUNCATE ci_once;
 SELECT * FROM test_chunk_index_shape('ci_once');
-SELECT test_chunk_put('cl', 'ci_once', h('\x01'), '\x01') AS stored_again;
+SELECT test_chunk_put('cl_once', 'ci_once', h('\x01'), '\x01') AS stored_again;
 COMMIT;
-DROP TABLE ci_once;
+DROP TABLE ci_once, cl_once;
 
 -- no tuples, no rewrites
 INSERT INTO ci DEFAULT VALUES;

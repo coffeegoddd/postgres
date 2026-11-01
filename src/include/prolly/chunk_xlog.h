@@ -46,6 +46,7 @@
 #define XLOG_CHUNK_LOG_SEAL_PAGE	0x20	/* a page part written made full */
 #define XLOG_CHUNK_LOG_APPEND		0x30	/* bytes appended to a page */
 #define XLOG_CHUNK_LOG_MARK_DEAD	0x40	/* bytes of a page counted dead */
+#define XLOG_CHUNK_LOG_BIND_INDEX	0x50	/* the meta page's chunk index */
 
 typedef struct xl_chunk_log_next_block
 {
@@ -84,6 +85,11 @@ typedef struct xl_chunk_log_mark_dead
 								 * then written to their end) */
 	uint32		init;			/* the page made afresh first */
 } xl_chunk_log_mark_dead;
+
+typedef struct xl_chunk_log_bind_index
+{
+	Oid			index;			/* the one naming the log's bytes */
+} xl_chunk_log_bind_index;
 
 extern void chunk_log_redo(XLogReaderState *record);
 extern void chunk_log_desc(StringInfo buf, XLogReaderState *record);
