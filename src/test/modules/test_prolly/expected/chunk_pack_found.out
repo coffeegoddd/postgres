@@ -54,7 +54,7 @@ test_chunk_format_refs
 (1 row)
 
 
-starting permutation: p_attach p_begin p_pack o_free_p1 o_wake o_free_all p_commit o_has
+starting permutation: p_attach p_begin p_pack o_free_p1 o_wake p_packed o_free_all p_commit o_has
 stored
 ------
 t     
@@ -102,6 +102,12 @@ step p_pack: <... completed>
 stored
 ------
      1
+(1 row)
+
+step p_packed: SELECT 'packed' AS p;
+p     
+------
+packed
 (1 row)
 
 step o_free_all: 
