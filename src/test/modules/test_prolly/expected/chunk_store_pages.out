@@ -17,8 +17,9 @@ SELECT * FROM test_chunk_stores() ORDER BY name;
 \set suite :abs_srcdir '/sql/chunk_store_suite.inc'
 \i :suite
 -- The chunk store conformance suite, run against the store named :store
--- (chunk_store_<store>.sql).  Every statement its own transaction, so that
--- a put's pins, which last until its transaction ends, are let go of.
+-- (chunk_store_<store>.sql).  A put's pins last until its transaction
+-- ends: each step is a statement of its own, but where a transaction is
+-- what is shown.
 SELECT test_chunk_format_refs(true);
  test_chunk_format_refs 
 ------------------------
@@ -31,25 +32,41 @@ CREATE FUNCTION pg_temp.h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 CREATE FUNCTION pg_temp.parent(VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
 	AS $$SELECT 'R'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids)) ||
 		(SELECT string_agg(pg_temp.h(k), '' ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))$$;
-CREATE FUNCTION pg_temp.put(d bytea) RETURNS bool LANGUAGE sql
-	AS $$SELECT test_cs_put(current_setting('test.store'), pg_temp.h(d), d)$$;
-CREATE FUNCTION pg_temp.free(d bytea) RETURNS int8 LANGUAGE sql
-	AS $$SELECT test_cs_free(current_setting('test.store'), pg_temp.h(d))$$;
+-- (a put, checked to name the chunk by its hash)
+CREATE FUNCTION pg_temp.put(d bytea) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+BEGIN
+	SELECT * INTO r FROM test_cs_put(current_setting('test.store'), d);
+	IF r.hash <> pg_temp.h(d) THEN
+		RAISE 'a put named a chunk %, not its hash', r.hash;
+	END IF;
+	RETURN r.stored;
+END$$;
+CREATE FUNCTION pg_temp.free(VARIADIC ds bytea[]) RETURNS int8 LANGUAGE sql
+	AS $$SELECT test_cs_free(current_setting('test.store'), ARRAY(SELECT pg_temp.h(d) FROM unnest(ds) d))$$;
+CREATE FUNCTION pg_temp.has(d bytea) RETURNS bool LANGUAGE sql
+	AS $$SELECT test_cs_has(current_setting('test.store'), pg_temp.h(d))$$;
+CREATE FUNCTION pg_temp.root(d bytea, ref bool) RETURNS void LANGUAGE sql
+	AS $$SELECT CASE WHEN ref THEN test_cs_ref_root(current_setting('test.store'), pg_temp.h(d))
+		ELSE test_cs_unref_root(current_setting('test.store'), pg_temp.h(d)) END$$;
+CREATE FUNCTION pg_temp.refs(d bytea) RETURNS text LANGUAGE sql
+	AS $$SELECT refs || '/' || roots FROM test_cs_counts(current_setting('test.store'), pg_temp.h(d))$$;
+-- (an error's code and message, or none: what is refused, shown the same
+-- in every store's output)
+CREATE FUNCTION pg_temp.refused(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'not refused';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || SQLERRM;
+END$$;
 SELECT set_config('test.store', :'store', false) IS NOT NULL AS store_set;
  store_set 
 -----------
  t
 (1 row)
 
--- (an error's message, or none: what is refused, shown as the same in
--- every store's output)
-CREATE FUNCTION pg_temp.refused(q text) RETURNS text LANGUAGE plpgsql AS $$
-BEGIN
-	EXECUTE q;
-	RETURN 'not refused';
-EXCEPTION WHEN OTHERS THEN
-	RETURN SQLERRM;
-END$$;
 -- puts, has, get, counts
 SELECT pg_temp.put('cs-leaf-a') AS a, pg_temp.put('cs-leaf-b') AS b,
 	pg_temp.put('cs-leaf-a') AS a_again;
@@ -58,8 +75,7 @@ SELECT pg_temp.put('cs-leaf-a') AS a, pg_temp.put('cs-leaf-b') AS b,
  t | t | f
 (1 row)
 
-SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-a')) AS has_a,
-	test_cs_has(:'store', pg_temp.h('cs-nowhere')) AS has_nowhere,
+SELECT pg_temp.has('cs-leaf-a') AS has_a, pg_temp.has('cs-nowhere') AS has_nowhere,
 	convert_from(test_cs_get(:'store', pg_temp.h('cs-leaf-a')), 'UTF8') AS get_a,
 	test_cs_get(:'store', pg_temp.h('cs-nowhere')) IS NULL AS get_nowhere;
  has_a | has_nowhere |   get_a   | get_nowhere 
@@ -67,81 +83,76 @@ SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-a')) AS has_a,
  t     | f           | cs-leaf-a | t
 (1 row)
 
-SELECT * FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-a'));
- refs | roots 
-------+-------
-    0 |     0
+SELECT pg_temp.refs('cs-leaf-a') AS a, pg_temp.refs('cs-nowhere') AS nowhere;
+  a  | nowhere 
+-----+---------
+ 0/0 | 
 (1 row)
 
-SELECT * FROM test_cs_counts(:'store', pg_temp.h('cs-nowhere'));
- refs | roots 
-------+-------
-      |      
-(1 row)
-
--- refused: bytes that aren't their hash's, a reference to a chunk not there
-SELECT pg_temp.refused($$SELECT test_cs_put(current_setting('test.store'), pg_temp.h('cs-x'), 'cs-y')$$);
-                                    refused                                    
--------------------------------------------------------------------------------
- bytes put as chunk ff0230e20f92722c992053f8a6fde4a4b10ab448 do not hash to it
-(1 row)
-
+-- refused: a reference to a chunk not there
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))$$);
-                                                                 refused                                                                 
------------------------------------------------------------------------------------------------------------------------------------------
- chunk 234064f1a5b1ab4eee7cacd785435076469f1b5a references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+                                                                    refused                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------
+ 23503: chunk 234064f1a5b1ab4eee7cacd785435076469f1b5a references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
 (1 row)
 
-SELECT test_cs_has(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))) AS refused_there;
+SELECT pg_temp.has(pg_temp.parent('cs-leaf-a', 'cs-nowhere')) AS refused_there;
  refused_there 
 ---------------
  f
 (1 row)
 
--- references, counted per edge
+-- references, counted per edge; the audit counting them, and the chunks
+SELECT chunks AS chunks0, unheld AS unheld0 FROM test_cs_check(:'store') \gset
 SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
  p 
 ---
  t
 (1 row)
 
-SELECT (SELECT refs FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-a'))) AS a_refs,
-	(SELECT refs FROM test_cs_counts(:'store', pg_temp.h('cs-leaf-b'))) AS b_refs,
-	(SELECT refs FROM test_cs_counts(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')))) AS p_refs;
- a_refs | b_refs | p_refs 
---------+--------+--------
-      1 |      2 |      0
+SELECT pg_temp.refs('cs-leaf-a') AS a, pg_temp.refs('cs-leaf-b') AS b,
+	pg_temp.refs(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
+  a  |  b  |  p  
+-----+-----+-----
+ 1/0 | 2/0 | 0/0
+(1 row)
+
+SELECT ok, chunks - :chunks0 AS more_chunks, unheld - :unheld0 AS more_unheld, why
+FROM test_cs_check(:'store');
+ ok | more_chunks | more_unheld | why 
+----+-------------+-------------+-----
+ t  |           1 |          -1 | 
 (1 row)
 
 -- roots; refused: of a chunk not there, and below none
-SELECT test_cs_ref_root(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
- test_cs_ref_root 
-------------------
+SELECT pg_temp.root(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b'), true);
+ root 
+------
  
 (1 row)
 
-SELECT roots FROM test_cs_counts(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
- roots 
--------
-     1
+SELECT pg_temp.refs(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p;
+  p  
+-----
+ 0/1
 (1 row)
 
-SELECT pg_temp.refused($$SELECT test_cs_ref_root(current_setting('test.store'), pg_temp.h('cs-nowhere'))$$);
-                             refused                             
------------------------------------------------------------------
- the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', true)$$);
+                                refused                                 
+------------------------------------------------------------------------
+ 42704: the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
 (1 row)
 
-SELECT pg_temp.refused($$SELECT test_cs_unref_root(current_setting('test.store'), pg_temp.h('cs-nowhere'))$$);
-                             refused                             
------------------------------------------------------------------
- the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
+SELECT pg_temp.refused($$SELECT pg_temp.root('cs-nowhere', false)$$);
+                                refused                                 
+------------------------------------------------------------------------
+ 42704: the store has no chunk 3086d148563cd9bbe6deed948e452abc19eccc3b
 (1 row)
 
-SELECT pg_temp.refused($$SELECT test_cs_unref_root(current_setting('test.store'), pg_temp.h('cs-leaf-a'))$$);
-                   refused                    
-----------------------------------------------
- a chunk's reference counts would be 1 and -1
+SELECT pg_temp.refused($$SELECT pg_temp.root('cs-leaf-a', false)$$);
+                       refused                       
+-----------------------------------------------------
+ 22023: a chunk's reference counts would be 1 and -1
 (1 row)
 
 -- freeing: nothing held is freed; a chunk let go of goes, and what it alone held
@@ -152,9 +163,9 @@ SELECT pg_temp.free('cs-leaf-b') AS b_held_by_p,
            0 |        0
 (1 row)
 
-SELECT test_cs_unref_root(:'store', pg_temp.h(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')));
- test_cs_unref_root 
---------------------
+SELECT pg_temp.root(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b'), false);
+ root 
+------
  
 (1 row)
 
@@ -164,11 +175,44 @@ SELECT pg_temp.free(pg_temp.parent('cs-leaf-a', 'cs-leaf-b', 'cs-leaf-b')) AS p_
                 3
 (1 row)
 
-SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-a')) AS has_a,
-	test_cs_has(:'store', pg_temp.h('cs-leaf-b')) AS has_b;
+SELECT pg_temp.has('cs-leaf-a') AS has_a, pg_temp.has('cs-leaf-b') AS has_b;
  has_a | has_b 
 -------+-------
  f     | f
+(1 row)
+
+-- a leaf two parents share: freeing one leaves it
+SELECT pg_temp.put('cs-shared') AS l, pg_temp.put(pg_temp.parent('cs-shared')) AS p1,
+	pg_temp.put(pg_temp.parent('cs-shared', 'cs-shared')) AS p2;
+ l | p1 | p2 
+---+----+----
+ t | t  | t
+(1 row)
+
+SELECT pg_temp.free(pg_temp.parent('cs-shared')) AS p1_alone;
+ p1_alone 
+----------
+        1
+(1 row)
+
+SELECT pg_temp.has('cs-shared') AS has_l, pg_temp.refs('cs-shared') AS l;
+ has_l |  l  
+-------+-----
+ t     | 2/0
+(1 row)
+
+-- many at once: a parent and its leaf, one named twice, one not there
+SELECT pg_temp.put('cs-pair') AS leaf, pg_temp.put(pg_temp.parent('cs-pair')) AS parent;
+ leaf | parent 
+------+--------
+ t    | t
+(1 row)
+
+SELECT pg_temp.free(pg_temp.parent('cs-pair'), 'cs-pair', pg_temp.parent('cs-pair'), 'cs-nowhere')
+	AS pair;
+ pair 
+------
+    2
 (1 row)
 
 -- a chunk is pinned until its put's transaction ends
@@ -192,7 +236,7 @@ SELECT pg_temp.free('cs-leaf-d') AS d_freed;
        1
 (1 row)
 
--- and found already there, too
+-- and found already there, too; and a chunk a refused put referenced
 SELECT pg_temp.put('cs-leaf-e') AS e;
  e 
 ---
@@ -213,23 +257,83 @@ SELECT pg_temp.free('cs-leaf-e') AS e_pinned;
 (1 row)
 
 COMMIT;
--- every chunk nothing holds
+BEGIN;
+SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-e', 'cs-nowhere'))$$);
+                                                                    refused                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------
+ 23503: chunk 66f5c0d3d3a8d301fe743e2a1437bf4e08aeb72f references chunk 3086d148563cd9bbe6deed948e452abc19eccc3b, which the store does not have
+(1 row)
+
+SELECT pg_temp.free('cs-leaf-e') AS e_pinned_by_refused_put;
+ e_pinned_by_refused_put 
+-------------------------
+                       0
+(1 row)
+
+COMMIT;
+-- every chunk nothing holds: the held kept (rooted, or referenced by one
+-- rooted), the rest freed
+SELECT pg_temp.root(pg_temp.parent('cs-shared', 'cs-shared'), true);
+ root 
+------
+ 
+(1 row)
+
+SELECT pg_temp.put('cs-rooted') AS r;
+ r 
+---
+ t
+(1 row)
+
+SELECT pg_temp.root('cs-rooted', true);
+ root 
+------
+ 
+(1 row)
+
+SELECT pg_temp.put('cs-loose') AS loose;
+ loose 
+-------
+ t
+(1 row)
+
 SELECT test_cs_free_unheld(:'store') > 0 AS freed_some;
  freed_some 
 ------------
  t
 (1 row)
 
-SELECT test_cs_has(:'store', pg_temp.h('cs-leaf-e')) AS has_e;
- has_e 
--------
- f
+SELECT pg_temp.has('cs-rooted') AS rooted, pg_temp.has('cs-shared') AS shared,
+	pg_temp.has(pg_temp.parent('cs-shared', 'cs-shared')) AS p2,
+	pg_temp.has('cs-loose') AS loose, pg_temp.has('cs-leaf-e') AS e;
+ rooted | shared | p2 | loose | e 
+--------+--------+----+-------+---
+ t      | t      | t  | f     | f
 (1 row)
 
-SELECT test_cs_check(:'store') AS audit;
- audit 
--------
- t
+SELECT ok, why FROM test_cs_check(:'store');
+ ok | why 
+----+-----
+ t  | 
+(1 row)
+
+-- let go of
+SELECT pg_temp.root('cs-rooted', false);
+ root 
+------
+ 
+(1 row)
+
+SELECT pg_temp.root(pg_temp.parent('cs-shared', 'cs-shared'), false);
+ root 
+------
+ 
+(1 row)
+
+SELECT pg_temp.free('cs-rooted', pg_temp.parent('cs-shared', 'cs-shared')) AS rest;
+ rest 
+------
+    3
 (1 row)
 
 SELECT test_chunk_format_refs(false);
@@ -241,7 +345,8 @@ SELECT test_chunk_format_refs(false);
 \set suite :abs_srcdir '/sql/chunk_store_transactional.inc'
 \i :suite
 -- The transactional stores' part of the suite: a put, a root's change and
--- a free are their transaction's, gone if it aborts.
+-- a free are their transaction's, gone, with what they counted, if it
+-- aborts.
 SELECT test_chunk_format_refs(true);
  test_chunk_format_refs 
 ------------------------
@@ -256,12 +361,13 @@ SELECT pg_temp.put('cs-tx-f') AS f;
 (1 row)
 
 ROLLBACK;
-SELECT test_cs_has(:'store', pg_temp.h('cs-tx-f')) AS f_after_abort;
+SELECT pg_temp.has('cs-tx-f') AS f_after_abort;
  f_after_abort 
 ---------------
  f
 (1 row)
 
+-- a parent's put rolled back: its leaf's reference with it
 SELECT pg_temp.put('cs-tx-g') AS g;
  g 
 ---
@@ -269,25 +375,73 @@ SELECT pg_temp.put('cs-tx-g') AS g;
 (1 row)
 
 BEGIN;
-SELECT test_cs_ref_root(:'store', pg_temp.h('cs-tx-g'));
- test_cs_ref_root 
-------------------
- 
+SELECT pg_temp.put(pg_temp.parent('cs-tx-g')) AS parent;
+ parent 
+--------
+ t
 (1 row)
 
-SELECT roots FROM test_cs_counts(:'store', pg_temp.h('cs-tx-g'));
- roots 
--------
-     1
+SELECT pg_temp.refs('cs-tx-g') AS g;
+  g  
+-----
+ 1/0
 (1 row)
 
 ROLLBACK;
-SELECT roots FROM test_cs_counts(:'store', pg_temp.h('cs-tx-g'));
- roots 
--------
-     0
+SELECT pg_temp.refs('cs-tx-g') AS g, pg_temp.has(pg_temp.parent('cs-tx-g')) AS parent;
+  g  | parent 
+-----+--------
+ 0/0 | f
 (1 row)
 
+-- roots taken, and let go of, rolled back
+BEGIN;
+SELECT pg_temp.root('cs-tx-g', true);
+ root 
+------
+ 
+(1 row)
+
+SELECT pg_temp.refs('cs-tx-g') AS g;
+  g  
+-----
+ 0/1
+(1 row)
+
+ROLLBACK;
+SELECT pg_temp.refs('cs-tx-g') AS g;
+  g  
+-----
+ 0/0
+(1 row)
+
+SELECT pg_temp.root('cs-tx-g', true);
+ root 
+------
+ 
+(1 row)
+
+BEGIN;
+SELECT pg_temp.root('cs-tx-g', false);
+ root 
+------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT pg_temp.refs('cs-tx-g') AS g;
+  g  
+-----
+ 0/1
+(1 row)
+
+SELECT pg_temp.root('cs-tx-g', false);
+ root 
+------
+ 
+(1 row)
+
+-- a free, and a cascade, rolled back
 BEGIN;
 SELECT pg_temp.free('cs-tx-g') AS g_freed;
  g_freed 
@@ -295,29 +449,49 @@ SELECT pg_temp.free('cs-tx-g') AS g_freed;
        1
 (1 row)
 
-SELECT test_cs_has(:'store', pg_temp.h('cs-tx-g')) AS g_in_its_transaction;
+SELECT pg_temp.has('cs-tx-g') AS g_in_its_transaction;
  g_in_its_transaction 
 ----------------------
  f
 (1 row)
 
 ROLLBACK;
-SELECT test_cs_has(:'store', pg_temp.h('cs-tx-g')) AS g_after_abort;
+SELECT pg_temp.has('cs-tx-g') AS g_after_abort;
  g_after_abort 
 ---------------
  t
 (1 row)
 
-SELECT pg_temp.free('cs-tx-g') AS g_freed;
- g_freed 
----------
-       1
+SELECT pg_temp.put(pg_temp.parent('cs-tx-g')) AS parent;
+ parent 
+--------
+ t
 (1 row)
 
-SELECT test_cs_check(:'store') AS audit;
- audit 
--------
- t
+BEGIN;
+SELECT pg_temp.free(pg_temp.parent('cs-tx-g')) AS parent_and_g;
+ parent_and_g 
+--------------
+            2
+(1 row)
+
+ROLLBACK;
+SELECT pg_temp.has(pg_temp.parent('cs-tx-g')) AS parent, pg_temp.refs('cs-tx-g') AS g;
+ parent |  g  
+--------+-----
+ t      | 1/0
+(1 row)
+
+SELECT pg_temp.free(pg_temp.parent('cs-tx-g')) AS parent_and_g;
+ parent_and_g 
+--------------
+            2
+(1 row)
+
+SELECT ok, why FROM test_cs_check(:'store');
+ ok | why 
+----+-----
+ t  | 
 (1 row)
 
 SELECT test_chunk_format_refs(false);

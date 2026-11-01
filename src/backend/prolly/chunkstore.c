@@ -30,9 +30,9 @@ register_stores(void)
 
 	if (registered)
 		return;
-	registered = true;
 	ProllyRegisterImplementation(CHUNK_STORE_IFACE, "pages", &PagesChunkStore);
 	ProllyRegisterImplementation(CHUNK_STORE_IFACE, "memory", &MemoryChunkStore);
+	registered = true;
 }
 
 ChunkStore *
@@ -86,13 +86,12 @@ close_store(Relation log, Relation idx)
 static bool
 pages_has(ChunkStore *cs, const uint8 *hash)
 {
-	Relation	log,
-				idx;
+	Relation	idx;
 	bool		has;
 
-	open_store(AccessShareLock, &log, &idx);
-	has = ChunkStoreHas(log, idx, hash);
-	close_store(log, idx);
+	open_store(AccessShareLock, NULL, &idx);
+	has = ChunkStoreHas(NULL, idx, hash);
+	close_store(NULL, idx);
 	return has;
 }
 
@@ -110,14 +109,14 @@ pages_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 }
 
 static bool
-pages_put(ChunkStore *cs, const uint8 *hash, const void *data, uint32 len)
+pages_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
 	Relation	log,
 				idx;
 	bool		stored;
 
 	open_store(RowExclusiveLock, &log, &idx);
-	stored = ChunkStorePut(log, idx, hash, data, len);
+	stored = ChunkStorePutData(log, idx, data, len, hash);
 	close_store(log, idx);
 	return stored;
 }
@@ -199,7 +198,11 @@ pages_check(ChunkStore *cs, uint64 *chunks, uint64 *unheld, char **why)
 				idx;
 	bool		ok;
 
-	open_store(AccessShareLock, &log, &idx);
+	/*
+	 * (under the ShareLock the audit takes, at once, not upgraded to it from
+	 * a reader's: so on a primary only)
+	 */
+	open_store(ShareLock, &log, &idx);
 	ok = ChunkStoreCheck(log, idx, chunks, unheld, why);
 	close_store(log, idx);
 	return ok;

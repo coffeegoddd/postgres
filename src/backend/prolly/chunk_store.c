@@ -148,15 +148,34 @@ hash_text(const uint8 *hash)
 	return out;
 }
 
+static bool put_hashed(Relation log, Relation idx, const uint8 *hash,
+					   const void *data, uint32 len);
+
 bool
 ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 			  const void *data, uint32 len)
 {
-	ChunkIndexEntry e;
-	RefList		refs = {0};
-
 	PreventCommandIfReadOnly("put a chunk");
 	check_hash(hash, data, len, NULL, 0);
+	return put_hashed(log, idx, hash, data, len);
+}
+
+bool
+ChunkStorePutData(Relation log, Relation idx, const void *data, uint32 len,
+				  uint8 *hash)
+{
+	PreventCommandIfReadOnly("put a chunk");
+	ChunkHash(data, len, hash);
+	return put_hashed(log, idx, hash, data, len);
+}
+
+/* ChunkStorePut of bytes known to be the chunk hash names */
+static bool
+put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
+		   uint32 len)
+{
+	ChunkIndexEntry e;
+	RefList		refs = {0};
 
 	/*
 	 * (a transaction id first, so that the commit of a put that finds the

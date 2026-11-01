@@ -62,7 +62,8 @@ make_table(const char *name, Size entrysize)
 static void
 release_pins(XactEvent event, void *arg)
 {
-	if (pins && (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+	if (pins && hash_get_num_entries(pins) > 0 &&
+		(event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
 				 event == XACT_EVENT_PARALLEL_COMMIT ||
 				 event == XACT_EVENT_PARALLEL_ABORT || event == XACT_EVENT_PREPARE))
 	{
@@ -163,22 +164,19 @@ mem_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 }
 
 static bool
-mem_put(ChunkStore *cs, const uint8 *hash, const void *data, uint32 len)
+mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
-	uint8		actual[CHUNK_HASH_LEN];
 	RefList		refs = {0};
 	MemChunk   *c;
 	bool		found;
 
-	ChunkHash(data, len, actual);
-	if (memcmp(actual, hash, CHUNK_HASH_LEN) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("bytes put as chunk %s do not hash to it", hash_text(hash))));
+	ChunkHash(data, len, hash);
 	pin(hash);
 	if (find(hash))
 		return false;
 	ChunkFormat->refs(data, len, add_ref, &refs);
+	for (int i = 0; i < refs.n; i++)
+		pin(refs.hashes + i * CHUNK_HASH_LEN);
 	for (int i = 0; i < refs.n; i++)
 		if (!find(refs.hashes + i * CHUNK_HASH_LEN))
 			ereport(ERROR,
@@ -192,10 +190,7 @@ mem_put(ChunkStore *cs, const uint8 *hash, const void *data, uint32 len)
 	c->refs = 0;
 	c->roots = 0;
 	for (int i = 0; i < refs.n; i++)
-	{
 		find(refs.hashes + i * CHUNK_HASH_LEN)->refs++;
-		pin(refs.hashes + i * CHUNK_HASH_LEN);
-	}
 	if (refs.hashes)
 		pfree(refs.hashes);
 	return true;
@@ -274,6 +269,8 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 		if (c == NULL || !unheld(c))
 			continue;
 		ChunkFormat->refs(c->data, c->len, add_ref, &refs);
+
+		/* (every reference checked before any is let go of) */
 		for (int i = 0; i < refs.n; i++)
 		{
 			MemChunk   *r = find(refs.hashes + i * CHUNK_HASH_LEN);
@@ -283,6 +280,11 @@ mem_free(ChunkStore *cs, const uint8 *hashes, int n)
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("chunk %s references chunk %s, which the store does not have",
 								hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
+		}
+		for (int i = 0; i < refs.n; i++)
+		{
+			MemChunk   *r = find(refs.hashes + i * CHUNK_HASH_LEN);
+
 			r->refs--;
 			add_ref(&work, r->hash);
 		}
@@ -362,7 +364,7 @@ mem_check(ChunkStore *cs, uint64 *nchunks, uint64 *nunheld, char **why)
 		uint8		actual[CHUNK_HASH_LEN];
 
 		(*nchunks)++;
-		if (unheld(c))
+		if (c->refs == 0 && c->roots == 0)
 			(*nunheld)++;
 		ChunkHash(c->data, c->len, actual);
 		if (st.why == NULL && memcmp(actual, c->hash, CHUNK_HASH_LEN) != 0)
@@ -397,3 +399,16 @@ const ChunkStoreRoutine MemoryChunkStore = {
 	.free_unheld = mem_free_unheld,
 	.check = mem_check,
 };
+
+void
+MemoryChunkStoreMiscount(const uint8 *hash)
+{
+	MemChunk   *c = chunks ? find(hash) : NULL;
+
+	if (c == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the store has no chunk %s", hash_text(hash))));
+	c->refs++;
+}
+
