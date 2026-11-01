@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_begin a_put b_has b_put a_commit b_has
+step a_begin: BEGIN;
+step a_put: SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01');
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step b_has: SELECT test_chunk_has('cl', 'ci', substr(sha256('\x01'), 1, 20));
+test_chunk_has
+--------------
+f             
+(1 row)
+
+step b_put: SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01'); <waiting ...>
+step a_commit: COMMIT;
+step b_put: <... completed>
+test_chunk_put
+--------------
+f             
+(1 row)
+
+step b_has: SELECT test_chunk_has('cl', 'ci', substr(sha256('\x01'), 1, 20));
+test_chunk_has
+--------------
+t             
+(1 row)
+
+
+starting permutation: a_begin a_put b_put a_rollback b_has
+step a_begin: BEGIN;
+step a_put: SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01');
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step b_put: SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01'); <waiting ...>
+step a_rollback: ROLLBACK;
+step b_put: <... completed>
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step b_has: SELECT test_chunk_has('cl', 'ci', substr(sha256('\x01'), 1, 20));
+test_chunk_has
+--------------
+t             
+(1 row)
+

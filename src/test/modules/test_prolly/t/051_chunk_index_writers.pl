@@ -53,11 +53,26 @@ is($node->safe_psql('postgres', $check), "$n|$n", 'every chunk put is found with
 like($node->safe_psql('postgres', q{SELECT buckets FROM test_chunk_index_shape('ci')}),
 	qr/^\d{3,}$/, 'the index grew under them');
 
+# a put whose transaction a crash cuts short is nobody's afterwards
+my $open = $node->background_psql('postgres');
+$open->query_safe(q{BEGIN});
+$open->query_safe(q{SELECT test_chunk_put('cl', 'ci', substr(sha256('\xdead'), 1, 20), '\xdead')});
+$node->safe_psql('postgres', 'CHECKPOINT');
+
 $node->stop('immediate');
+$open->{run}->finish;
 $node->start;
 is($node->safe_psql('postgres', $check), "$n|$n", 'and after a crash');
+is($node->safe_psql('postgres', q{SELECT test_chunk_has('cl', 'ci', substr(sha256('\xdead'), 1, 20))}),
+	'f', 'a put the crash cut short is not found');
+my $before = $node->safe_psql('postgres', q{SELECT entries FROM test_chunk_index_shape('ci')});
+$node->safe_psql('postgres', 'VACUUM ci');
+is($node->safe_psql('postgres', q{SELECT entries FROM test_chunk_index_shape('ci')}),
+	$before - 1, 'VACUUM takes it out');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $check), "$n|$n", 'and on a standby');
+is($standby->safe_psql('postgres', q{SELECT test_chunk_has('cl', 'ci', substr(sha256('\xdead'), 1, 20))}),
+	'f', 'nor on a standby');
 
 # splits an error stops after making the new bucket, before taking its
 # entries out of the old one, as a crash there would: the old buckets keep
