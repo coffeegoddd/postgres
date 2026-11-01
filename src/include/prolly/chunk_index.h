@@ -14,9 +14,10 @@
  * as an insert into a unique index does.  An entry's counts are changed in
  * place, WAL-logged, not transactionally.  A change gives its transaction
  * an id, so that its commit flushes it.  What is learned of the inserting
- * transaction is kept in the entry's flags, as heap tuples keep hint bits;
- * VACUUM writes it to every entry (WAL-logged), so that an entry needs the
- * commit log only until the index's relfrozenxid passes it.
+ * transaction is kept in the entry's flags, as heap tuples keep hint bits
+ * (not WAL-logged); VACUUM freezes every committed entry, WAL-logged, so
+ * that no entry needs the commit log once the index's relfrozenxid passes
+ * it.
  *
  * PageChunkIndex keeps the entries in a relation of the prolly_chunk_index
  * table access method, by linear hashing:
@@ -58,8 +59,9 @@ typedef struct ChunkIndexEntry
 	uint16		unused;
 } ChunkIndexEntry;
 
-#define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed */
-#define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted (or crashed) */
+#define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed (a hint) */
+#define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted, or crashed (a hint) */
+#define CHUNK_ENTRY_FROZEN		0x04	/* xmin committed, WAL-logged by VACUUM */
 
 typedef struct ChunkIndexRoutine
 {
@@ -99,6 +101,9 @@ extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
  * advances the relation's relfrozenxid.
  */
 extern void ChunkIndexVacuum(Relation idx);
+
+/* For tests: the entries on the buckets' pages not frozen. */
+extern uint64 ChunkIndexUnfrozen(Relation idx);
 
 /*
  * For tests: the buckets there are, the index's pages, and the entries on

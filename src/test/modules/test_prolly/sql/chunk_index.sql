@@ -90,8 +90,16 @@ ROLLBACK;
 SELECT count(test_chunk_put('cl', 'ci3', h(d), d)) AS committed
 FROM (SELECT convert_to('kept ' || g, 'UTF8') AS d FROM generate_series(1, 300) g) s;
 SELECT entries AS before_vacuum FROM test_chunk_index_shape('ci3');
+-- (lookups note commits on entries, but freeze none: only VACUUM does)
+SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS looked_up
+FROM generate_series(1, 300) g;
+SELECT test_chunk_index_unfrozen('ci3') AS unfrozen_before;
+SELECT age(relfrozenxid) AS age_before FROM pg_class WHERE relname = 'ci3' \gset
+SELECT txid_current() IS NOT NULL AS advanced_xid;
 VACUUM ci3;
-SELECT entries AS after_vacuum FROM test_chunk_index_shape('ci3');
+SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
+FROM test_chunk_index_shape('ci3');
+SELECT age(relfrozenxid) < :age_before AS frozenxid_advanced FROM pg_class WHERE relname = 'ci3';
 SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS kept,
 	count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('gone ' || g, 'UTF8')))) AS gone
 FROM generate_series(1, 300) g;

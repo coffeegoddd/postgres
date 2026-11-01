@@ -29,6 +29,7 @@ PG_FUNCTION_INFO_V1(test_chunk_index_entry);
 PG_FUNCTION_INFO_V1(test_chunk_index_adjust);
 PG_FUNCTION_INFO_V1(test_chunk_index_remove);
 PG_FUNCTION_INFO_V1(test_chunk_index_shape);
+PG_FUNCTION_INFO_V1(test_chunk_index_unfrozen);
 
 static Relation
 open_index(Oid relid, LOCKMODE mode)
@@ -191,4 +192,15 @@ test_chunk_index_shape(PG_FUNCTION_ARGS)
 	values[1] = Int32GetDatum((int32) pages);
 	values[2] = Int64GetDatum((int64) entries);
 	return entry_record(fcinfo, values, 3);
+}
+
+/* test_chunk_index_unfrozen(idx) returns int8 */
+Datum
+test_chunk_index_unfrozen(PG_FUNCTION_ARGS)
+{
+	Relation	idx = open_index(PG_GETARG_OID(0), AccessShareLock);
+	uint64		n = ChunkIndexUnfrozen(idx);
+
+	relation_close(idx, AccessShareLock);
+	PG_RETURN_INT64((int64) n);
 }
