@@ -131,6 +131,21 @@ my ($pages2, $free2) = split / /, $standby2->safe_psql('postgres', $space);
 is($pages2, $pages, 'and puts there use them again, the log not growing');
 cmp_ok($free2, '<', $free, 'fewer pages free');
 
+# a pack of small chunks: their bytes written a page at a time, a record
+# a page, not one a chunk
+$primary->safe_psql('postgres', 'CHECKPOINT');
+my $pack_start = $primary->safe_psql('postgres', 'SELECT pg_current_wal_insert_lsn()');
+$primary->safe_psql('postgres', q{
+	SELECT test_cs_put_many('pages',
+		ARRAY(SELECT h(chunk(i, 100)) FROM generate_series(9001, 10000) i),
+		ARRAY(SELECT chunk(i, 100) FROM generate_series(9001, 10000) i));
+});
+my ($dump) = run_command([ 'pg_waldump', '--rmgr' => 'ChunkLog',
+	'--path' => $primary->data_dir . '/pg_wal', '--start' => $pack_start,
+	'--end' => $primary->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()') ]);
+my $appends = () = $dump =~ /desc: APPEND/g;
+cmp_ok($appends, '<=', 20, "a pack of 1,000 chunks of 100 bytes in $appends append records, about a page each");
+
 $standby2->stop;
 $primary->stop;
 done_testing();

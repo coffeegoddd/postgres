@@ -518,20 +518,56 @@ hold_found(Relation idx, int n, const uint8 *hashes, const void *const *datas,
 	pfree(queue);
 }
 
-/* a pack's bytes reserved for its chunks order[from..to), written */
+/* the bytes written at once, of chunks one after another in the log */
+#define PACK_WRITE_RUN	(64 * 1024)
+
+/*
+ * A pack's bytes reserved for its chunks order[from..to), written: those of
+ * chunks one after another in the log at once (a write of the log is a
+ * record a page), up to PACK_WRITE_RUN, a chunk longer than that alone
+ */
 static void
 write_pack(Relation log, const PackOrder *order, int from, int to,
 		   const bool *fresh, const uint64 *locs, const void *const *datas,
 		   const uint32 *lens)
 {
-	for (int k = from; k < to; k++)
+	char	   *run = NULL;
+	uint64		run_loc = 0;
+	uint32		run_len = 0;
+
+	for (int k = from; k <= to; k++)
 	{
-		int			i = order[k].at;
+		int			i = k < to ? order[k].at : -1;
+		bool		next = i >= 0 && fresh[i] && lens[i] > 0;
 
 		CHECK_FOR_INTERRUPTS();
-		if (fresh[i] && lens[i] > 0)
+		if (i >= 0 && !next)
+			continue;
+
+		/* (the run so far written, unless this chunk goes on with it) */
+		if (run_len > 0 &&
+			(!next || locs[i] != run_loc + run_len ||
+			 run_len + lens[i] > PACK_WRITE_RUN))
+		{
+			ChunkLog->write(log, run_loc, run, run_len);
+			run_len = 0;
+		}
+		if (!next)
+			continue;
+		if (lens[i] > PACK_WRITE_RUN)
+		{
 			ChunkLog->write(log, locs[i], datas[i], lens[i]);
+			continue;
+		}
+		if (run == NULL)
+			run = palloc(PACK_WRITE_RUN);
+		if (run_len == 0)
+			run_loc = locs[i];
+		memcpy(run + run_len, datas[i], lens[i]);
+		run_len += lens[i];
 	}
+	if (run)
+		pfree(run);
 }
 
 uint64
