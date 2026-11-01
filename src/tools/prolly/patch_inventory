@@ -68,7 +68,7 @@ patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bo
 patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's; also (1b) refuses an unlogged relation in a versioned schema
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
-patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; also (1b) a search path matcher notes the branch names resolved on
+patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; a search path matcher notes the branch names resolved on
 patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
@@ -172,7 +172,9 @@ patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
 patch src/include/utils/funccache.h  1b  the branch in the compiled-function cache key
 patch src/include/utils/pgstat_internal.h  1a  the block map statistics kind's shared entry and callbacks
 patch src/include/utils/pgstat_kind.h  1a  PGSTAT_KIND_BLOCK_MAP, a variable-numbered kind after the fixed ones
+patch src/include/utils/plancache.h  1b  a cached expression's branch (CachedExpressionIsValid())
 patch src/include/utils/snapshot.h  1b  SnapshotData.is_catalog, set on catalog snapshots
+patch src/pl/plpgsql/src/pl_exec.c  1b  a cached cast is used on the branch it was planned on
 patch src/test/Makefile        0  runs the requirements suite in src/test/prolly from check-world
 patch src/test/meson.build     0  runs the requirements suite in src/test/prolly
 patch src/test/modules/Makefile     0  builds and runs the engine's unit and conformance tests in test_prolly

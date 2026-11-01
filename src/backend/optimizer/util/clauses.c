@@ -5494,7 +5494,7 @@ function_runs_here(HeapTuple func_tuple)
 {
 	int32		branch = FunctionBranch(func_tuple);
 
-	return branch < 0 || branch == catalog_branch;
+	return branch < 0 || branch == CatalogBranchOfNames();
 }
 
 /*
