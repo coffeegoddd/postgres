@@ -31,8 +31,8 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
-#include "prolly/branch_catalog.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "storage/bmap.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
@@ -151,7 +151,10 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
  * (heap_create_with_catalog()) both ask here; an index follows its table,
  * and so does a TOAST table (create_toast_table()), its schema pg_toast.
  * A relation never moves between a versioned schema and another kind
- * (CatalogBranchCheckMove()), so what is chosen here stays right.
+ * (CatalogBranchCheckMove()), nor is one unlogged (heap_create_with_catalog()),
+ * so what is chosen here stays right.  (Only heap's tables, and sequences,
+ * ask: a table access method of an extension that makes its storage with
+ * RelationCreateStorage() gets md.c's, in a versioned schema too.)
  */
 int
 NewRelationStorageManager(char relpersistence, bool shared, bool catalog,

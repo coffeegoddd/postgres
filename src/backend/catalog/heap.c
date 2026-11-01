@@ -67,6 +67,7 @@
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/array.h"
@@ -1180,6 +1181,19 @@ heap_create_with_catalog(const char *relname,
 	 * sanity checks
 	 */
 	Assert(IsNormalProcessingMode() || IsBootstrapProcessingMode());
+
+	/*
+	 * A versioned schema's relations are block-mapped, so that branches share
+	 * their pages, and block-mapped storage is built on WAL: an unlogged
+	 * relation, which writes none and is emptied by a crash, cannot be one.
+	 */
+	if (relpersistence == RELPERSISTENCE_UNLOGGED &&
+		NamespaceBranch(relnamespace) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create unlogged relation \"%s\" in versioned schema \"%s\"",
+						relname, get_namespace_name(relnamespace)),
+				 errdetail("A versioned schema's relations are logged, so that branches can share their pages.")));
 
 	/*
 	 * Validate proposed tupdesc for the desired relkind.  If
