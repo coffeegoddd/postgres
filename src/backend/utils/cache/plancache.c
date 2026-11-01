@@ -63,10 +63,10 @@
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
-#include "prolly/branch_catalog.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "prolly/branch_catalog.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "tcop/pquery.h"
@@ -1855,6 +1855,7 @@ GetCachedExpression(Node *expr)
 	cexpr->magic = CACHEDEXPR_MAGIC;
 	cexpr->expr = copyObject(expr);
 	cexpr->is_valid = true;
+	cexpr->branch = CatalogBranchOfNames();
 	cexpr->relationOids = copyObject(relationOids);
 	cexpr->invalItems = copyObject(invalItems);
 	cexpr->context = cexpr_context;
@@ -1873,6 +1874,12 @@ GetCachedExpression(Node *expr)
 	dlist_push_tail(&cached_expression_list, &cexpr->node);
 
 	return cexpr;
+}
+
+bool
+CachedExpressionIsValid(CachedExpression *cexpr)
+{
+	return cexpr->is_valid && cexpr->branch == CatalogBranchOfNames();
 }
 
 /*

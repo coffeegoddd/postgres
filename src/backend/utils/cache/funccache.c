@@ -288,7 +288,7 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 	hashkey->inputCollation = fcinfo->fncollation;
 
 	/* ... and the branch its names are resolved on */
-	hashkey->branch = catalog_branch;
+	hashkey->branch = CatalogBranchOfNames();
 
 	/*
 	 * We include only input arguments in the hash key, since output argument

@@ -102,6 +102,27 @@ EXECUTE qual;
 DEALLOCATE qual;
 RESET plan_cache_mode;
 
+-- nor does plpgsql's session-wide cache of casts outlive one (it casts a
+-- function's result to its result type): a shared cast function, inlined,
+-- calls the branch's own function
+SET catalog_branch = :b1;
+CREATE FUNCTION app.k() RETURNS int LANGUAGE sql STABLE AS 'SELECT 1';
+SET catalog_branch = :b2;
+CREATE FUNCTION app.k() RETURNS int LANGUAGE sql STABLE AS 'SELECT 2';
+RESET catalog_branch;
+CREATE TYPE pubf.ta AS (x int);
+SET check_function_bodies = off;
+CREATE FUNCTION pubf.conv(pubf.ta) RETURNS int LANGUAGE sql STABLE AS 'SELECT app.k()';
+RESET check_function_bodies;
+CREATE CAST (pubf.ta AS int) WITH FUNCTION pubf.conv(pubf.ta) AS ASSIGNMENT;
+CREATE FUNCTION pubf.via_cast() RETURNS int LANGUAGE plpgsql AS
+$$BEGIN RETURN ROW(0)::pubf.ta; END$$;
+SET catalog_branch = :b1;
+SELECT pubf.via_cast();
+SET catalog_branch = :b2;
+SELECT pubf.via_cast();
+SET catalog_branch = :b1;
+
 DROP SCHEMA app CASCADE;
 SET catalog_branch = :b2;
 DROP SCHEMA app CASCADE;

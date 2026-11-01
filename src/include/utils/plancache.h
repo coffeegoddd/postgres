@@ -189,6 +189,7 @@ typedef struct CachedExpression
 	int			magic;			/* should equal CACHEDEXPR_MAGIC */
 	Node	   *expr;			/* planned form of expression */
 	bool		is_valid;		/* is the expression still valid? */
+	int32		branch;			/* the branch its names were resolved on */
 	/* remaining fields should be treated as private to plancache.c: */
 	List	   *relationOids;	/* OIDs of relations the expr depends on */
 	List	   *invalItems;		/* other dependencies, as PlanInvalItems */
@@ -199,6 +200,13 @@ typedef struct CachedExpression
 
 extern void InitPlanCache(void);
 extern void ResetPlanCache(void);
+
+/*
+ * Whether a cached expression may be used: valid, and planned on the branch
+ * names now resolve on (an inlined function's body names another branch's
+ * objects there)
+ */
+extern bool CachedExpressionIsValid(CachedExpression *cexpr);
 
 extern void ReleaseAllPlanCacheRefsInOwner(ResourceOwner owner);
 

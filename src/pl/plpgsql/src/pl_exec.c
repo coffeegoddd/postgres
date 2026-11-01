@@ -8095,7 +8095,7 @@ get_cast_hashentry(PLpgSQL_execstate *estate,
 	}
 
 	if (expr_entry->cast_cexpr == NULL ||
-		!expr_entry->cast_cexpr->is_valid)
+		!CachedExpressionIsValid(expr_entry->cast_cexpr))
 	{
 		/*
 		 * We've not looked up this coercion before, or we have but the cached
