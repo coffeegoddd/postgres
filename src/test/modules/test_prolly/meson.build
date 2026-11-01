@@ -55,6 +55,7 @@ tests += {
       'chunk_log',
       'chunk_index',
       'chunk_refs',
+      'chunk_free',
     ],
   },
   'isolation': {
@@ -62,6 +63,7 @@ tests += {
       'bmap_shared_writers',
       'chunk_index_put_wait',
       'chunk_roots_wait',
+      'chunk_free_wait',
     ],
   },
   'tap': {

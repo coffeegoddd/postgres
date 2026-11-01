@@ -20,6 +20,7 @@ OBJS = \
 	branch_filter.o \
 	chunk_index.o \
 	chunk_log.o \
+	chunk_pin.o \
 	chunk_store.o \
 	registry.o
 

@@ -1,0 +1,72 @@
+Parsed test spec with 2 sessions
+
+starting permutation: f_begin f_free p_put f_commit
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step f_begin: BEGIN;
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step p_put: SELECT test_chunk_put('fl', 'fi', substr(sha256('\x01'), 1, 20), '\x01') AS stored; <waiting ...>
+step f_commit: COMMIT;
+step p_put: <... completed>
+stored
+------
+t     
+(1 row)
+
+
+starting permutation: f_begin f_free p_put f_rollback
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step f_begin: BEGIN;
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step p_put: SELECT test_chunk_put('fl', 'fi', substr(sha256('\x01'), 1, 20), '\x01') AS stored; <waiting ...>
+step f_rollback: ROLLBACK;
+step p_put: <... completed>
+stored
+------
+f     
+(1 row)
+
+
+starting permutation: p_begin p_put f_free p_commit f_free
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step p_begin: BEGIN;
+step p_put: SELECT test_chunk_put('fl', 'fi', substr(sha256('\x01'), 1, 20), '\x01') AS stored;
+stored
+------
+f     
+(1 row)
+
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    0
+(1 row)
+
+step p_commit: COMMIT;
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    1
+(1 row)
+

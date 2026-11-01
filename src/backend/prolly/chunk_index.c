@@ -132,31 +132,80 @@ typedef enum EntryState
  * only once its record is flushed, or the page's own changes are after it,
  * lest the page reach disk noting a commit a crash then loses.
  */
-static EntryState
-entry_state(ChunkIndexEntry *e, Buffer buf)
+/* whether xid committed, a hint of it set in the entry (or of its abort) */
+static bool
+hinted_commit(ChunkIndexEntry *e, Buffer buf, TransactionId xid,
+			  uint16 committed_flag, uint16 aborted_flag)
 {
-	bool		committed;
+	bool		committed = TransactionIdDidCommit(xid);
 
-	if (e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED))
-		return ENTRY_VISIBLE;
-	if (e->flags & CHUNK_ENTRY_ABORTED)
-		return ENTRY_DEAD;
-	if (TransactionIdIsCurrentTransactionId(e->xmin))
-		return ENTRY_VISIBLE;
-	if (TransactionIdIsInProgress(e->xmin))
-		return ENTRY_IN_PROGRESS;
-	committed = TransactionIdDidCommit(e->xmin);
 	if (committed)
 	{
-		XLogRecPtr	commit_lsn = TransactionIdGetCommitLSN(e->xmin);
+		XLogRecPtr	commit_lsn = TransactionIdGetCommitLSN(xid);
 
 		if (!XLogNeedsFlush(commit_lsn) || BufferGetLSNAtomic(buf) >= commit_lsn)
-			(void) BufferSetHintBits16(&e->flags,
-									   e->flags | CHUNK_ENTRY_COMMITTED, buf);
+			(void) BufferSetHintBits16(&e->flags, e->flags | committed_flag, buf);
 	}
 	else
-		(void) BufferSetHintBits16(&e->flags, e->flags | CHUNK_ENTRY_ABORTED, buf);
-	return committed ? ENTRY_VISIBLE : ENTRY_DEAD;
+		(void) BufferSetHintBits16(&e->flags, e->flags | aborted_flag, buf);
+	return committed;
+}
+
+/*
+ * What the entry is to this transaction: its xmin's, and, of a chunk's
+ * entry visible, its xmax's (freed, being freed, or not).  The transaction
+ * to wait for, if the entry is another's in progress, in *wait.
+ */
+static EntryState
+entry_state_wait(ChunkIndexEntry *e, Buffer buf, TransactionId *wait)
+{
+	if (!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
+	{
+		if (e->flags & CHUNK_ENTRY_ABORTED)
+			return ENTRY_DEAD;
+		if (!TransactionIdIsCurrentTransactionId(e->xmin))
+		{
+			if (TransactionIdIsInProgress(e->xmin))
+			{
+				if (wait)
+					*wait = e->xmin;
+				return ENTRY_IN_PROGRESS;
+			}
+			if (!hinted_commit(e, buf, e->xmin, CHUNK_ENTRY_COMMITTED,
+							   CHUNK_ENTRY_ABORTED))
+				return ENTRY_DEAD;
+		}
+	}
+	if (e->kind != CHUNK_KIND_CHUNK || !TransactionIdIsValid(e->xmax) ||
+		(e->flags & CHUNK_ENTRY_XMAX_ABORTED))
+		return ENTRY_VISIBLE;
+	if (e->flags & CHUNK_ENTRY_XMAX_COMMITTED)
+		return ENTRY_DEAD;
+	if (TransactionIdIsCurrentTransactionId(e->xmax))
+		return ENTRY_DEAD;
+	if (TransactionIdIsInProgress(e->xmax))
+	{
+		if (wait)
+			*wait = e->xmax;
+		return ENTRY_IN_PROGRESS;
+	}
+	return hinted_commit(e, buf, e->xmax, CHUNK_ENTRY_XMAX_COMMITTED,
+						 CHUNK_ENTRY_XMAX_ABORTED) ? ENTRY_DEAD : ENTRY_VISIBLE;
+}
+
+static inline EntryState
+entry_state(ChunkIndexEntry *e, Buffer buf)
+{
+	return entry_state_wait(e, buf, NULL);
+}
+
+/* the entry a change is of: its chunk's, by xmin and loc */
+static inline bool
+change_of(const ChunkIndexEntry *change, const ChunkIndexEntry *chunk)
+{
+	return change->kind == CHUNK_KIND_CHANGE &&
+		memcmp(change->hash, chunk->hash, CHUNK_HASH_LEN) == 0 &&
+		change->xmax == chunk->xmin && change->loc == chunk->loc;
 }
 
 /* ------------------------------------------------------------ the pages */
@@ -449,15 +498,13 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
 				!belongs(e, bucket, masks))
 				continue;
-			switch (entry_state(e, cur))
+			switch (entry_state_wait(e, cur, running))
 			{
 				case ENTRY_VISIBLE:
 					*found_buf = cur;
 					*found_at = i;
 					return ENTRY_VISIBLE;
 				case ENTRY_IN_PROGRESS:
-					if (running)
-						*running = e->xmin;
 					result = ENTRY_IN_PROGRESS;
 					break;
 				case ENTRY_DEAD:
@@ -723,8 +770,9 @@ split_bucket(Relation rel)
  * *own_blk and *own_at, if they are given.
  */
 static void
-count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
-			  uint32 bucket, const IndexCache *masks, int64 *drefs,
+count_changes(Relation rel, Buffer primary, int mode,
+			  const ChunkIndexEntry *chunk, uint32 bucket,
+			  const IndexCache *masks, bool any_running, int64 *drefs,
 			  int64 *droots, TransactionId *running, BlockNumber *own_blk,
 			  int *own_at)
 {
@@ -746,9 +794,7 @@ count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 
-			if (e->kind != CHUNK_KIND_CHANGE ||
-				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
-				!belongs(e, bucket, masks))
+			if (!change_of(e, chunk) || !belongs(e, bucket, masks))
 				continue;
 			switch (entry_state(e, cur))
 			{
@@ -762,7 +808,8 @@ count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
 					}
 					break;
 				case ENTRY_IN_PROGRESS:
-					if (running && ((int32) e->refs < 0 || (int32) e->roots < 0))
+					if (running &&
+						(any_running || (int32) e->refs < 0 || (int32) e->roots < 0))
 						*running = e->xmin;
 					break;
 				case ENTRY_DEAD:
@@ -920,8 +967,8 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	*out = *page_entry(BufferGetPage(found), at);
 	if (found != primary)
 		UnlockReleaseBuffer(found);
-	count_changes(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
-				  &drefs, &droots, NULL, NULL, NULL);
+	count_changes(idx, primary, BUFFER_LOCK_SHARE, out, bucket, &masks,
+				  false, &drefs, &droots, NULL, NULL, NULL);
 	UnlockReleaseBuffer(primary);
 	if (!counts_add(out, drefs, droots))
 		ereport(ERROR,
@@ -1020,8 +1067,8 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		*out = *page_entry(BufferGetPage(found), at);
 		if (found != primary)
 			UnlockReleaseBuffer(found);
-		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-					  &crefs, &croots, &running, &own_blk, &own_at);
+		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
+					  false, &crefs, &croots, &running, &own_blk, &own_at);
 
 		/*
 		 * (a decrease waits for another's decreases, as a row's update waits
@@ -1072,6 +1119,9 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	}
 	else
 	{
+		change.loc = out->loc;
+		change.xmax = out->xmin;
+
 		/*
 		 * (a change past the bucket's first page splits no bucket: the
 		 * changes of one chunk are all in its bucket, and VACUUM takes them)
@@ -1081,6 +1131,97 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	}
 	UnlockReleaseBuffer(primary);
 	return true;
+}
+
+/*
+ * Sets xmax of the chunk's entry, this transaction's, if nothing holds the
+ * chunk: its counts (committed, and this transaction's) zero, no other
+ * transaction changing them, and not being freed already.
+ */
+static bool
+page_free(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary;
+	Buffer		found;
+	int			at;
+	int64		drefs,
+				droots;
+	TransactionId running;
+	TransactionId xid;
+	GenericXLogState *st;
+	ChunkIndexEntry *e;
+
+	PreventCommandIfReadOnly("free a chunk");
+	xid = GetCurrentTransactionId();
+	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+	{
+		UnlockReleaseBuffer(primary);
+		return false;
+	}
+	*out = *page_entry(BufferGetPage(found), at);
+	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
+				  true, &drefs, &droots, &running, NULL, NULL);
+	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
+		TransactionIdIsValid(running))
+	{
+		release_found(primary, found);
+		return false;
+	}
+	st = GenericXLogStart(idx);
+	e = page_entry(GenericXLogRegisterBuffer(st, found, 0), at);
+	e->xmax = xid;
+	e->flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+	GenericXLogFinish(st);
+	out->refs = 0;
+	out->roots = 0;
+	release_found(primary, found);
+	return true;
+}
+
+static void
+page_unfree(Relation idx, const uint8 *hash)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary;
+	Buffer		cur;
+	TransactionId xid = GetCurrentTransactionId();
+
+	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+	cur = primary;
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
+
+		for (int i = 0; i < n; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+
+			if (e->kind == CHUNK_KIND_CHUNK && e->xmax == xid &&
+				memcmp(e->hash, hash, CHUNK_HASH_LEN) == 0)
+			{
+				GenericXLogState *st = GenericXLogStart(idx);
+
+				page_entry(GenericXLogRegisterBuffer(st, cur, 0), i)->xmax =
+					InvalidTransactionId;
+				GenericXLogFinish(st);
+			}
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			break;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+	UnlockReleaseBuffer(primary);
 }
 
 static bool
@@ -1230,7 +1371,7 @@ page_visit(Relation idx, void (*fn) (void *arg, const ChunkIndexEntry *e),
 
 			/* (summed first: in no order, they may dip below zero midway) */
 			for (int j = 0; j < nchanges; j++)
-				if (memcmp(changes[j].hash, chunks[i].hash, CHUNK_HASH_LEN) == 0)
+				if (change_of(&changes[j], &chunks[i]))
 				{
 					drefs += (int32) changes[j].refs;
 					droots += (int32) changes[j].roots;
@@ -1253,6 +1394,8 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.lookup = page_lookup,
 	.insert = page_insert,
 	.adjust = page_adjust,
+	.free = page_free,
+	.unfree = page_unfree,
 	.remove = page_remove,
 	.visit = page_visit,
 };
@@ -1311,15 +1454,27 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 static EntryState
 entry_state_unhinted(const ChunkIndexEntry *e)
 {
-	if (e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED))
+	if (!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
+	{
+		if (e->flags & CHUNK_ENTRY_ABORTED)
+			return ENTRY_DEAD;
+		if (!TransactionIdIsCurrentTransactionId(e->xmin))
+		{
+			if (TransactionIdIsInProgress(e->xmin))
+				return ENTRY_IN_PROGRESS;
+			if (!TransactionIdDidCommit(e->xmin))
+				return ENTRY_DEAD;
+		}
+	}
+	if (e->kind != CHUNK_KIND_CHUNK || !TransactionIdIsValid(e->xmax) ||
+		(e->flags & CHUNK_ENTRY_XMAX_ABORTED))
 		return ENTRY_VISIBLE;
-	if (e->flags & CHUNK_ENTRY_ABORTED)
+	if ((e->flags & CHUNK_ENTRY_XMAX_COMMITTED) ||
+		TransactionIdIsCurrentTransactionId(e->xmax))
 		return ENTRY_DEAD;
-	if (TransactionIdIsCurrentTransactionId(e->xmin))
-		return ENTRY_VISIBLE;
-	if (TransactionIdIsInProgress(e->xmin))
+	if (TransactionIdIsInProgress(e->xmax))
 		return ENTRY_IN_PROGRESS;
-	return TransactionIdDidCommit(e->xmin) ? ENTRY_VISIBLE : ENTRY_DEAD;
+	return TransactionIdDidCommit(e->xmax) ? ENTRY_DEAD : ENTRY_VISIBLE;
 }
 
 /* The page and slot of the first entry on the chain that match wants. */
@@ -1366,12 +1521,12 @@ committed_change(const ChunkIndexEntry *e, const void *arg)
 		entry_state_unhinted(e) == ENTRY_VISIBLE;
 }
 
+/* the entry (not freed) the change arg is of */
 static bool
 chunk_of(const ChunkIndexEntry *e, const void *arg)
 {
 	return e->kind == CHUNK_KIND_CHUNK &&
-		memcmp(e->hash, arg, CHUNK_HASH_LEN) == 0 &&
-		entry_state_unhinted(e) == ENTRY_VISIBLE;
+		change_of(arg, e) && entry_state_unhinted(e) != ENTRY_DEAD;
 }
 
 /*
@@ -1414,11 +1569,25 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 			continue;
 		}
 
-		if (!chain_find(idx, primary, chunk_of, change.hash, &eblk, &eat, &chunk))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("chunk index \"%s\" has a change of the counts of a chunk it hasn't",
-							RelationGetRelationName(idx))));
+		if (!chain_find(idx, primary, chunk_of, &change, &eblk, &eat, &chunk))
+		{
+			/* (a change of a chunk freed: out with it) */
+			Buffer		buf = cblk == BufferGetBlockNumber(primary) ? primary :
+				ReadBuffer(idx, cblk);
+			Page		p;
+
+			if (buf != primary)
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			st = GenericXLogStart(idx);
+			p = GenericXLogRegisterBuffer(st, buf, MOVES_ENTRIES);
+			n = page_entries(p);
+			*page_entry(p, cat) = *page_entry(p, n - 1);
+			set_page_entries(p, n - 1);
+			GenericXLogFinish(st);
+			if (buf != primary)
+				UnlockReleaseBuffer(buf);
+			continue;
+		}
 		cbuf = cblk == BufferGetBlockNumber(primary) ? primary : ReadBuffer(idx, cblk);
 		ebuf = eblk == BufferGetBlockNumber(primary) ? primary :
 			eblk == cblk ? cbuf : ReadBuffer(idx, eblk);
@@ -1491,7 +1660,8 @@ ChunkIndexVacuum(Relation idx)
 				states[i] = entry_state_unhinted(e);
 				if (!belongs(e, b, &masks) || states[i] == ENTRY_DEAD ||
 					(states[i] == ENTRY_VISIBLE && e->kind == CHUNK_KIND_CHUNK &&
-					 !(e->flags & CHUNK_ENTRY_FROZEN)))
+					 (!(e->flags & CHUNK_ENTRY_FROZEN) ||
+					  TransactionIdIsValid(e->xmax))))
 					change = true;
 			}
 			if (change)
@@ -1507,7 +1677,12 @@ ChunkIndexVacuum(Relation idx)
 					if (!belongs(&e, b, &masks) || states[i] == ENTRY_DEAD)
 						continue;
 					if (states[i] == ENTRY_VISIBLE && e.kind == CHUNK_KIND_CHUNK)
+					{
+						/* (a freeing that aborted, gone with it) */
 						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
+						e.flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
+						e.xmax = InvalidTransactionId;
+					}
 					*page_entry(p, k++) = e;
 				}
 				set_page_entries(p, k);

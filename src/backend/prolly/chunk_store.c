@@ -17,6 +17,7 @@
 #include "miscadmin.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_format.h"
+#include "prolly/chunk_pin.h"
 #include "prolly/chunk_store.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
@@ -154,11 +155,19 @@ ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 	 * chunk there already flushes the WAL that put it, whoever wrote it)
 	 */
 	(void) GetCurrentTransactionId();
+
+	/*
+	 * (pinned before it is looked up, as every chunk it names is: a freer
+	 * that marked one before then sees the pin, or this waits for it)
+	 */
+	ChunkPin(hash);
 	if (ChunkIndex->lookup(idx, hash, &e))
 		return false;
 
 	/* a store holds a chunk only if it holds every chunk it references */
 	ChunkFormat->refs(data, len, add_ref, &refs);
+	for (int i = 0; i < refs.n; i++)
+		ChunkPin(refs.hashes + i * CHUNK_HASH_LEN);
 	for (int i = 0; i < refs.n; i++)
 		if (!ChunkIndex->lookup(idx, refs.hashes + i * CHUNK_HASH_LEN, &e))
 			ereport(ERROR,
@@ -208,6 +217,91 @@ void
 ChunkStoreUnrefRoot(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 {
 	change_root(idx, hash, -1, out);
+}
+
+/* ------------------------------------------------------- freeing */
+
+uint64
+ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
+{
+	RefList		work = {0};
+	uint64		freed = 0;
+
+	for (int i = 0; i < n; i++)
+		add_ref(&work, hashes + i * CHUNK_HASH_LEN);
+
+	/*
+	 * Each chunk nothing holds, freed, and a reference of each chunk it
+	 * names let go of, in this transaction: those its references held are
+	 * then freed too, and the whole is freed, or not, as it commits
+	 */
+	for (int i = 0; i < work.n; i++)
+	{
+		const uint8 *h = work.hashes + i * CHUNK_HASH_LEN;
+		ChunkIndexEntry e;
+		RefList		kids = {0};
+		void	   *data;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!ChunkIndex->free(idx, h, &e))
+			continue;
+
+		/* (marked, then pins looked for: see prolly/chunk_pin.h) */
+		if (ChunkPinned(h))
+		{
+			ChunkIndex->unfree(idx, h);
+			continue;
+		}
+		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
+		ChunkLog->read(log, e.loc, data, e.len);
+		check_hash(h, data, e.len, log, e.loc);
+		ChunkFormat->refs(data, e.len, add_ref, &kids);
+		pfree(data);
+		for (int k = 0; k < kids.n; k++)
+		{
+			const uint8 *kid = kids.hashes + k * CHUNK_HASH_LEN;
+			ChunkIndexEntry ke;
+
+			if (!ChunkIndex->adjust(idx, kid, -1, 0, &ke))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("chunk %s references chunk %s, which the store does not have",
+								hash_text(h), hash_text(kid))));
+			if (ke.refs == 0 && ke.roots == 0)
+				add_ref(&work, kid);
+		}
+		if (kids.hashes)
+			pfree(kids.hashes);
+		freed++;
+	}
+	if (work.hashes)
+		pfree(work.hashes);
+	return freed;
+}
+
+typedef struct UnheldState
+{
+	RefList		list;
+} UnheldState;
+
+static void
+collect_unheld(void *arg, const ChunkIndexEntry *e)
+{
+	if (e->refs == 0 && e->roots == 0)
+		add_ref(&((UnheldState *) arg)->list, e->hash);
+}
+
+uint64
+ChunkStoreFreeUnheld(Relation log, Relation idx)
+{
+	UnheldState st = {0};
+	uint64		freed;
+
+	ChunkIndex->visit(idx, collect_unheld, &st);
+	freed = ChunkStoreFree(log, idx, st.list.hashes, st.list.n);
+	if (st.list.hashes)
+		pfree(st.list.hashes);
+	return freed;
 }
 
 /* ------------------------------------------------------- the audit */

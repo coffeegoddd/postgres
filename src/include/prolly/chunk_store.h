@@ -60,6 +60,19 @@ extern void ChunkStoreUnrefRoot(Relation idx, const uint8 *hash,
 								ChunkIndexEntry *out);
 
 /*
+ * Frees the chunks of hashes[0..n) that nothing holds (no references, no
+ * roots, no pins, no other transaction changing their counts), and those
+ * their references alone held, and so on; answers how many it freed.  The
+ * freeing is this transaction's: the chunks are gone as it commits, and
+ * nothing is if it aborts.  Time is the chunks freed's.
+ */
+extern uint64 ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes,
+							 int n);
+
+/* ChunkStoreFree of every chunk nothing holds (O(store): for tests). */
+extern uint64 ChunkStoreFreeUnheld(Relation log, Relation idx);
+
+/*
  * The audit: every chunk's bytes are its own, every chunk it references is
  * in the store, and every chunk's count of references is the edges to it.
  * The chunks, and those nothing holds, in *chunks and *unheld; the first

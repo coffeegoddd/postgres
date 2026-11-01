@@ -358,3 +358,16 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_chunk_check(log regclass, idx regclass,
 	OUT ok bool, OUT chunks int8, OUT unheld int8, OUT why text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+-- Freeing: chunks nothing holds, and those their references held; pins.
+CREATE FUNCTION test_chunk_free(log regclass, idx regclass, hash bytea)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_free_unheld(log regclass, idx regclass)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_pin(hash bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
