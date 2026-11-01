@@ -19,7 +19,7 @@ SELECT pg_relation_size('ql') AS size_full \gset
 -- pages free
 SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
-SELECT pages, full_pages, dead = 200 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
+SELECT pages, full_pages, dead >= 200 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
 FROM test_chunk_log_space('ql');
 
 -- 150 more, from a backend with no region of its own (one with a region
@@ -32,13 +32,43 @@ SELECT count(*) FILTER (WHERE test_chunk_get('ql', 'qi', h(blob('b' || g))) = bl
 FROM generate_series(1, 150) g;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
--- a put rolled back: its bytes dead once VACUUM takes its entry out
-SELECT dead AS dead_before FROM test_chunk_log_space('ql') \gset
-BEGIN;
-SELECT test_chunk_put('ql', 'qi', h(blob('gone')), blob('gone')) AS put;
-ROLLBACK;
+-- and again: pages used again are freed again (a page a region leaves
+-- part written is made full, its rest dead), and used a third time
+SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
-SELECT dead - :dead_before AS dead_added FROM test_chunk_log_space('ql');
+SELECT free_pages = full_pages AS full_ones_free_again FROM test_chunk_log_space('ql');
+\c
+SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
+FROM generate_series(1, 150) g;
+SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
+SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
+
+-- a put rolled back: its bytes dead once VACUUM takes its entry out (a
+-- log of its own, with no page free: a page used again starts with none
+-- dead)
+CREATE TABLE ql2 () USING prolly_chunks;
+CREATE TABLE qi2 () USING prolly_chunk_index;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('kept')), blob('kept')) AS put;
+BEGIN;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('gone')), blob('gone')) AS put;
+ROLLBACK;
+VACUUM qi2;
+SELECT dead AS dead_after_rollback FROM test_chunk_log_space('ql2');
+-- and so when it's looked up, and put again, before VACUUM
+BEGIN;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('again')), blob('again')) AS put;
+ROLLBACK;
+SELECT test_chunk_has('ql2', 'qi2', h(blob('again'))) AS has_after_rollback;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('again')), blob('again')) AS put_again;
+VACUUM qi2;
+SELECT dead AS dead_after_second FROM test_chunk_log_space('ql2');
+DROP TABLE ql2, qi2;
+
+-- the log truncated alone is another log's storage: the index refuses it,
+-- and VACUUM counts nothing dead in it
+TRUNCATE ql;
+SELECT test_chunk_put('ql', 'qi', h(blob('new')), blob('new'));
+VACUUM qi;
 
 DROP TABLE ql, qi;
 DROP FUNCTION blob(text), h(bytea);

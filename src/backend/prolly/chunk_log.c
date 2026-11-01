@@ -49,7 +49,7 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	3
+#define CHUNK_LOG_VERSION	4
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
@@ -75,6 +75,8 @@ typedef struct ChunkLogMetaData
 {
 	uint32		version;		/* CHUNK_LOG_VERSION */
 	BlockNumber next_block;		/* the first page no region has */
+	uint64		stamp;			/* this storage's, made with it (an index
+								 * of chunks in it names it) */
 } ChunkLogMetaData;
 
 /*
@@ -89,6 +91,7 @@ typedef struct ChunkLogRegion
 	RelFileNumber relnumber;	/* the storage it is in */
 	uint64		next;			/* where the next append begins */
 	uint64		limit;			/* where the region ends */
+	uint64		stamp;			/* the storage's stamp, if known, or 0 */
 } ChunkLogRegion;
 
 /* The bytes of the log a data page holds, after its header. */
@@ -181,6 +184,10 @@ init_meta(Page page)
 	meta = (ChunkLogMetaData *) PageGetContents(page);
 	meta->version = CHUNK_LOG_VERSION;
 	meta->next_block = META_BLOCK + 1;
+	if (!pg_strong_random(&meta->stamp, sizeof(meta->stamp)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not make a chunk log's stamp")));
 	((PageHeader) page)->pd_lower =
 		(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
 }
@@ -292,6 +299,82 @@ take_free_page(Relation rel)
 	return InvalidBlockNumber;
 }
 
+static void page_mark_dead(Relation rel, uint64 loc, size_t len);
+
+/*
+ * Lets go of what is left of a region, from loc to limit: the page loc is
+ * on, written part way, is made full, its rest dead (a page part written
+ * would never be free, and its backend appends to it no more); and each
+ * page after it that the file has, never written, is made a page all
+ * dead.  Either may then be used again.
+ */
+static void
+seal_region(Relation rel, uint64 loc, uint64 limit)
+{
+	if (loc >= limit)
+		return;
+	if (LOC_OFFSET(loc) > 0)
+	{
+		BlockNumber blk = LOC_BLOCK(loc);
+		size_t		off = LOC_OFFSET(loc);
+		Buffer		buf = ReadBuffer(rel, blk);
+		GenericXLogState *st;
+		Page		page;
+		ChunkPageOpaque opaque;
+		bool		freed;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(rel, blk, BufferGetPage(buf), CHUNK_PAGE_DATA);
+		if (((PageHeader) BufferGetPage(buf))->pd_lower != AREA_START + off)
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block %u of chunk log \"%s\" does not end where its region's appends are",
+							blk, RelationGetRelationName(rel))));
+		}
+		st = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(st, buf, 0);
+		opaque = (ChunkPageOpaque) PageGetSpecialPointer(page);
+		((PageHeader) page)->pd_lower = AREA_START + AREA;
+		opaque->dead += AREA - off;
+		freed = page_free(page);
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(buf);
+		if (freed)
+		{
+			RecordPageWithFreeSpace(rel, blk, AREA);
+			FreeSpaceMapVacuumRange(rel, blk, blk + 1);
+		}
+		loc += AREA - off;
+	}
+	for (BlockNumber blk = LOC_BLOCK(loc);
+		 loc < limit && blk < RelationGetNumberOfBlocks(rel);
+		 blk++, loc += AREA)
+	{
+		Buffer		buf = ReadBuffer(rel, blk);
+		GenericXLogState *st;
+		Page		page;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		if (!PageIsNew(BufferGetPage(buf)))
+		{
+			/* (not this region's to let go of: it never wrote it) */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		st = GenericXLogStart(rel);
+		page = GenericXLogRegisterBuffer(st, buf, GENERIC_XLOG_FULL_IMAGE);
+		init_page(page, CHUNK_PAGE_DATA);
+		((PageHeader) page)->pd_lower = AREA_START + AREA;
+		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead = AREA;
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(buf);
+		RecordPageWithFreeSpace(rel, blk, AREA);
+		FreeSpaceMapVacuumRange(rel, blk, blk + 1);
+	}
+}
+
 /* pages enough for len bytes, from the first */
 static void
 claim_run(Relation rel, uint64 len, BlockNumber npages, ChunkLogRegion *run)
@@ -308,10 +391,17 @@ claim_run(Relation rel, uint64 len, BlockNumber npages, ChunkLogRegion *run)
 static void
 keep_region(Relation rel, const ChunkLogRegion *region)
 {
-	if (rel->rd_amcache == NULL)
-		rel->rd_amcache = MemoryContextAlloc(CacheMemoryContext,
-											 sizeof(ChunkLogRegion));
-	*(ChunkLogRegion *) rel->rd_amcache = *region;
+	ChunkLogRegion *cached = rel->rd_amcache;
+	uint64		stamp = 0;
+
+	if (cached == NULL)
+		cached = rel->rd_amcache = MemoryContextAllocZero(CacheMemoryContext,
+														  sizeof(ChunkLogRegion));
+	else if (cached->relnumber == region->relnumber)
+		stamp = cached->stamp;
+	*cached = *region;
+	if (cached->stamp == 0)
+		cached->stamp = stamp;
 }
 
 static uint64
@@ -348,11 +438,20 @@ page_append(Relation rel, const void *data, size_t len)
 		if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
 			region = *cached;
 		else
-			region.next = region.limit = 0;
+		{
+			memset(&region, 0, sizeof(region));
+			region.relnumber = rel->rd_locator.relNumber;
+		}
 		if (region.limit - region.next < len)
 		{
+			BlockNumber blk;
+
+			/* what is left of the region let go of */
+			if (region.limit > 0)
+				seal_region(rel, region.next, region.limit);
+
 			/* a page freed, if the bytes fit one, else a region of new ones */
-			BlockNumber blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
+			blk = len <= AREA ? take_free_page(rel) : InvalidBlockNumber;
 
 			if (BlockNumberIsValid(blk))
 			{
@@ -422,6 +521,10 @@ page_append(Relation rel, const void *data, size_t len)
 
 		INJECTION_POINT("chunk-log-append-page", NULL);
 	}
+
+	/* (pages of the bytes' own: the last one's rest let go of at once) */
+	if (own_run)
+		seal_region(rel, region.next, region.limit);
 	return start;
 }
 
@@ -570,10 +673,65 @@ ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full, uint64 *dead,
 	}
 }
 
+static uint64
+page_stamp(Relation rel)
+{
+	ChunkLogRegion *cached = rel->rd_amcache;
+	Buffer		buf;
+	uint64		stamp;
+
+	/* (kept with the backend's region: every put asks) */
+	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber &&
+		cached->stamp != 0)
+		return cached->stamp;
+	buf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	stamp = page_meta(rel, BufferGetPage(buf))->stamp;
+	UnlockReleaseBuffer(buf);
+	if (rel->rd_amcache == NULL)
+	{
+		ChunkLogRegion none = {0};
+
+		none.relnumber = rel->rd_locator.relNumber;
+		keep_region(rel, &none);
+	}
+	cached = rel->rd_amcache;
+	if (cached->relnumber == rel->rd_locator.relNumber)
+		cached->stamp = stamp;
+	return stamp;
+}
+
+/*
+ * Puts every page free (written full, all dead) in the free space map:
+ * the map is not WAL-logged, and a crash, a standby's promotion or a move
+ * to another tablespace leaves it without pages freed since it was last
+ * written.  O(log).
+ */
+void
+ChunkLogRecordFree(Relation rel)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+
+	for (BlockNumber blk = META_BLOCK + 1; blk < nblocks; blk++)
+	{
+		Buffer		buf = ReadBuffer(rel, blk);
+		bool		freed;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		freed = !PageIsNew(BufferGetPage(buf)) && page_free(BufferGetPage(buf));
+		UnlockReleaseBuffer(buf);
+		if (freed)
+			RecordPageWithFreeSpace(rel, blk, AREA);
+		CHECK_FOR_INTERRUPTS();
+	}
+	FreeSpaceMapVacuum(rel);
+}
+
 const ChunkLogRoutine PageChunkLog = {
 	.append = page_append,
 	.read = page_read,
 	.mark_dead = page_mark_dead,
+	.stamp = page_stamp,
 	.end = page_end,
 };
 

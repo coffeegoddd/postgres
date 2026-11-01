@@ -78,6 +78,13 @@ typedef struct ChunkLogRoutine
 	 * whose bytes are dead is used again for appends.
 	 */
 	void		(*mark_dead) (Relation rel, uint64 loc, size_t len);
+
+	/*
+	 * The log's storage's stamp: made with it (and again by a truncation),
+	 * kept by a move to another tablespace, so that an index of chunks in
+	 * one log's storage knows another's.
+	 */
+	uint64		(*stamp) (Relation rel);
 } ChunkLogRoutine;
 
 extern PGDLLIMPORT const ChunkLogRoutine *ChunkLog;
@@ -89,6 +96,9 @@ extern PGDLLIMPORT const ChunkLogRoutine PageChunkLog;
  */
 extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
 						  uint64 *dead, uint32 *free_pages);
+
+/* Puts every page free in the free space map (O(log); VACUUM's). */
+extern void ChunkLogRecordFree(Relation rel);
 
 /* The prolly_chunks table access method's relations are a PageChunkLog's. */
 extern bool RelationIsChunkLog(Relation rel);
