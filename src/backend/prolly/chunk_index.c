@@ -111,6 +111,13 @@ typedef struct IndexCache
 StaticAssertDecl(sizeof(ChunkIndexEntry) == 48,
 				 "a chunk index entry is 48 bytes");
 
+/*
+ * A record that moves entries between a page's slots logs the whole page: a
+ * delta would leave out bytes the same on the primary, and a standby may
+ * have hint flags of its own in them, which would then be another entry's.
+ */
+#define MOVES_ENTRIES	GENERIC_XLOG_FULL_IMAGE
+
 typedef enum EntryState
 {
 	ENTRY_VISIBLE,				/* committed, or this transaction's */
@@ -130,7 +137,7 @@ entry_state(ChunkIndexEntry *e, Buffer buf)
 {
 	bool		committed;
 
-	if (e->flags & CHUNK_ENTRY_COMMITTED)
+	if (e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED))
 		return ENTRY_VISIBLE;
 	if (e->flags & CHUNK_ENTRY_ABORTED)
 		return ENTRY_DEAD;
@@ -387,10 +394,7 @@ belongs(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
  * not the bucket's.  Notes in *space the first page with room, and in
  * *last the chain's last page.
  */
-/*
- * (a purge takes out entries not the bucket's, and those of transactions
- * known to have aborted)
- */
+/* (a purge takes out entries not the bucket's, and aborted ones) */
 static inline bool
 kept_by_purge(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
 {
@@ -426,7 +430,7 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 			if (kept < n)
 			{
 				GenericXLogState *st = GenericXLogStart(rel);
-				Page		p = GenericXLogRegisterBuffer(st, cur, 0);
+				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
 				int			k = 0;
 
 				for (int i = 0; i < n; i++)
@@ -684,7 +688,7 @@ split_bucket(Relation rel)
 			if (kept < n)
 			{
 				GenericXLogState *st = GenericXLogStart(rel);
-				Page		p = GenericXLogRegisterBuffer(st, cur, 0);
+				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
 				int			k = 0;
 
 				for (int i = 0; i < n; i++)
@@ -914,7 +918,7 @@ page_remove(Relation idx, const uint8 *hash)
 		return false;
 	}
 	st = GenericXLogStart(idx);
-	page = GenericXLogRegisterBuffer(st, found, 0);
+	page = GenericXLogRegisterBuffer(st, found, MOVES_ENTRIES);
 	n = page_entries(page);
 	*page_entry(page, at) = *page_entry(page, n - 1);
 	set_page_entries(page, n - 1);
@@ -977,27 +981,47 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	smgr_bulk_finish(bulk);
 }
 
+/*
+ * entry_state without hints: what VACUUM rewrites is decided from the flags
+ * as they were (a hint set meanwhile would hide an entry not yet frozen)
+ */
+static EntryState
+entry_state_unhinted(const ChunkIndexEntry *e)
+{
+	if (e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED))
+		return ENTRY_VISIBLE;
+	if (e->flags & CHUNK_ENTRY_ABORTED)
+		return ENTRY_DEAD;
+	if (TransactionIdIsCurrentTransactionId(e->xmin))
+		return ENTRY_VISIBLE;
+	if (TransactionIdIsInProgress(e->xmin))
+		return ENTRY_IN_PROGRESS;
+	return TransactionIdDidCommit(e->xmin) ? ENTRY_VISIBLE : ENTRY_DEAD;
+}
+
 void
 ChunkIndexVacuum(Relation idx)
 {
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
-	IndexCache *cache = load_cache(idx);
-	uint32		nbuckets = cache->maxbucket + 1;
-	IndexCache	masks = *cache;
+	double		kept_entries = 0;
 
 	/*
 	 * Every transaction older than frozen has ended: past its bucket's
-	 * pages, each of its entries is out or noted committed, and none needs
-	 * the commit log again.  (A split meanwhile only moves entries, flags
-	 * and all; buckets made after the copy of the meta page was read are
-	 * made of entries of buckets before them.)
+	 * pages, each of its entries is out or frozen (WAL-logged), and none
+	 * needs the commit log again.  Buckets split meanwhile are walked too
+	 * (the highest bucket is read again after each): a split moves entries,
+	 * flags and all, from a bucket to a higher one, and an entry inserted
+	 * meanwhile is of a transaction past frozen.
 	 */
-	for (uint32 b = 0; b < nbuckets; b++)
+	for (uint32 b = 0; b <= load_cache(idx)->maxbucket; b++)
 	{
-		BlockNumber blk = bucket_block(idx, cache, b);
-		Buffer		primary = ReadBuffer(idx, blk);
+		IndexCache	masks = *(IndexCache *) idx->rd_amcache;
+		BlockNumber blk = bucket_block(idx, &masks, b);
+		Buffer		primary;
 		Buffer		cur;
 
+		vacuum_delay_point(false);
+		primary = ReadBuffer(idx, blk);
 		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
 		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
 		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
@@ -1008,37 +1032,41 @@ ChunkIndexVacuum(Relation idx)
 			Page		page = BufferGetPage(cur);
 			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			int			n = page_entries(page);
+			EntryState *states = palloc(Max(n, 1) * sizeof(EntryState));
 			bool		change = false;
 
-			for (int i = 0; i < n && !change; i++)
+			for (int i = 0; i < n; i++)
 			{
 				ChunkIndexEntry *e = page_entry(page, i);
-				EntryState	state = entry_state(e, cur);
 
-				change = !belongs(e, b, &masks) || state == ENTRY_DEAD ||
-					(state == ENTRY_VISIBLE && !(e->flags & CHUNK_ENTRY_COMMITTED));
+				states[i] = entry_state_unhinted(e);
+				if (!belongs(e, b, &masks) || states[i] == ENTRY_DEAD ||
+					(states[i] == ENTRY_VISIBLE && !(e->flags & CHUNK_ENTRY_FROZEN)))
+					change = true;
 			}
 			if (change)
 			{
 				GenericXLogState *st = GenericXLogStart(idx);
-				Page		p = GenericXLogRegisterBuffer(st, cur, 0);
+				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
 				int			k = 0;
 
-				/* (each entry's state from the buffer's page, not the copy) */
 				for (int i = 0; i < n; i++)
 				{
-					EntryState	state = entry_state(page_entry(page, i), cur);
 					ChunkIndexEntry e = *page_entry(p, i);
 
-					if (!belongs(&e, b, &masks) || state == ENTRY_DEAD)
+					if (!belongs(&e, b, &masks) || states[i] == ENTRY_DEAD)
 						continue;
-					if (state == ENTRY_VISIBLE)
-						e.flags |= CHUNK_ENTRY_COMMITTED;
+					if (states[i] == ENTRY_VISIBLE)
+						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
 					*page_entry(p, k++) = e;
 				}
 				set_page_entries(p, k);
 				GenericXLogFinish(st);
+				kept_entries += k;
 			}
+			else
+				kept_entries += n;
+			pfree(states);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))
@@ -1051,8 +1079,37 @@ ChunkIndexVacuum(Relation idx)
 		UnlockReleaseBuffer(primary);
 	}
 
-	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), 0, 0, 0, false,
-						frozen, InvalidMultiXactId, NULL, NULL, false);
+	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), kept_entries, 0, 0,
+						false, frozen, InvalidMultiXactId, NULL, NULL, false);
+}
+
+uint64
+ChunkIndexUnfrozen(Relation idx)
+{
+	uint32		nbuckets = load_cache(idx)->maxbucket + 1;
+	uint64		unfrozen = 0;
+
+	for (uint32 b = 0; b < nbuckets; b++)
+	{
+		BlockNumber blk = bucket_block(idx, load_cache(idx), b);
+
+		while (BlockNumberIsValid(blk))
+		{
+			Buffer		buf = ReadBuffer(idx, blk);
+			Page		page;
+			int			n;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			n = page_entries(page);
+			for (int i = 0; i < n; i++)
+				if (!(page_entry(page, i)->flags & CHUNK_ENTRY_FROZEN))
+					unfrozen++;
+			blk = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			UnlockReleaseBuffer(buf);
+		}
+	}
+	return unfrozen;
 }
 
 void

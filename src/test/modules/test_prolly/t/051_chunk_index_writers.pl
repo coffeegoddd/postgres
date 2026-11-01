@@ -65,14 +65,19 @@ $node->start;
 is($node->safe_psql('postgres', $check), "$n|$n", 'and after a crash');
 is($node->safe_psql('postgres', q{SELECT test_chunk_has('cl', 'ci', substr(sha256('\xdead'), 1, 20))}),
 	'f', 'a put the crash cut short is not found');
+$node->wait_for_replay_catchup($standby);
+is($standby->safe_psql('postgres', q{SELECT test_chunk_has('cl', 'ci', substr(sha256('\xdead'), 1, 20))}),
+	'f', 'nor on a standby');
 my $before = $node->safe_psql('postgres', q{SELECT entries FROM test_chunk_index_shape('ci')});
 $node->safe_psql('postgres', 'VACUUM ci');
 is($node->safe_psql('postgres', q{SELECT entries FROM test_chunk_index_shape('ci')}),
 	$before - 1, 'VACUUM takes it out');
+is($node->safe_psql('postgres', q{SELECT test_chunk_index_unfrozen('ci')}), '0',
+	'and freezes every other entry');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $check), "$n|$n", 'and on a standby');
-is($standby->safe_psql('postgres', q{SELECT test_chunk_has('cl', 'ci', substr(sha256('\xdead'), 1, 20))}),
-	'f', 'nor on a standby');
+is($standby->safe_psql('postgres', q{SELECT test_chunk_index_unfrozen('ci')}), '0',
+	'the standby has the entries frozen too');
 
 # splits an error stops after making the new bucket, before taking its
 # entries out of the old one, as a crash there would: the old buckets keep

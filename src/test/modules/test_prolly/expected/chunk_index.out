@@ -254,11 +254,39 @@ SELECT entries AS before_vacuum FROM test_chunk_index_shape('ci3');
            600
 (1 row)
 
-VACUUM ci3;
-SELECT entries AS after_vacuum FROM test_chunk_index_shape('ci3');
- after_vacuum 
+-- (lookups note commits on entries, but freeze none: only VACUUM does)
+SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS looked_up
+FROM generate_series(1, 300) g;
+ looked_up 
+-----------
+       300
+(1 row)
+
+SELECT test_chunk_index_unfrozen('ci3') AS unfrozen_before;
+ unfrozen_before 
+-----------------
+             600
+(1 row)
+
+SELECT age(relfrozenxid) AS age_before FROM pg_class WHERE relname = 'ci3' \gset
+SELECT txid_current() IS NOT NULL AS advanced_xid;
+ advanced_xid 
 --------------
-          300
+ t
+(1 row)
+
+VACUUM ci3;
+SELECT entries AS after_vacuum, test_chunk_index_unfrozen('ci3') AS unfrozen_after
+FROM test_chunk_index_shape('ci3');
+ after_vacuum | unfrozen_after 
+--------------+----------------
+          300 |              0
+(1 row)
+
+SELECT age(relfrozenxid) < :age_before AS frozenxid_advanced FROM pg_class WHERE relname = 'ci3';
+ frozenxid_advanced 
+--------------------
+ t
 (1 row)
 
 SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS kept,
