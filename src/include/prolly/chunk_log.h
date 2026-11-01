@@ -93,6 +93,13 @@ typedef struct ChunkLogRoutine
 	void		(*release) (Relation rel, const ChunkLogRun *run);
 
 	/*
+	 * Binds the log to the one chunk index naming its bytes (the first to
+	 * ask), or errors if it is another's: a tail cut, by that index's
+	 * VACUUM, needs every entry naming the log's bytes to have been seen.
+	 */
+	void		(*bind_index) (Relation rel, Oid index);
+
+	/*
 	 * Reads len bytes of rel's log beginning at loc into dst.  An error if
 	 * they were not all written, or a page they are on is not one of the
 	 * log's.

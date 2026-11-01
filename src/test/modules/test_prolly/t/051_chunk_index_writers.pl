@@ -90,6 +90,7 @@ SKIP:
 	$node->safe_psql('postgres', q{
 		CREATE EXTENSION injection_points;
 		CREATE TABLE ci2 () USING prolly_chunk_index;
+		CREATE TABLE cl2 () USING prolly_chunks;
 		CREATE TABLE put2 (hash bytea, digest text);
 		SELECT injection_points_attach('chunk-index-split-published', 'error');
 		DO $$
@@ -100,7 +101,7 @@ SKIP:
 				d := convert_to('split ' || i, 'UTF8');
 				BEGIN
 					INSERT INTO put2 VALUES (substr(sha256(d), 1, 20), md5(d));
-					PERFORM test_chunk_put('cl', 'ci2', substr(sha256(d), 1, 20), d);
+					PERFORM test_chunk_put('cl2', 'ci2', substr(sha256(d), 1, 20), d);
 				EXCEPTION WHEN others THEN
 					NULL;	-- (each split stops halfway: on to the next)
 				END;
@@ -108,7 +109,7 @@ SKIP:
 		END $$;
 		SELECT injection_points_detach('chunk-index-split-published');
 	});
-	my $check2 = q{SELECT count(*), count(*) FILTER (WHERE md5(test_chunk_get('cl', 'ci2', hash)) = digest) FROM put2};
+	my $check2 = q{SELECT count(*), count(*) FILTER (WHERE md5(test_chunk_get('cl2', 'ci2', hash)) = digest) FROM put2};
 	my ($n2) = split /\|/, $node->safe_psql('postgres', $check2);
 	is($node->safe_psql('postgres', $check2), "$n2|$n2",
 		'every chunk is found after splits stopped halfway');
@@ -117,12 +118,12 @@ SKIP:
 	# more puts go through the old bucket; then every chunk removed is gone,
 	# with no copy left to find
 	$node->safe_psql('postgres', q{
-		SELECT count(test_chunk_put('cl', 'ci2', substr(sha256(d), 1, 20), d))
+		SELECT count(test_chunk_put('cl2', 'ci2', substr(sha256(d), 1, 20), d))
 		FROM (SELECT convert_to('more ' || g, 'UTF8') AS d FROM generate_series(1, 2000) g) s;
 	});
 	is($node->safe_psql('postgres', q{SELECT count(*) FILTER (WHERE test_chunk_index_remove('ci2', hash)) FROM put2}),
 		$n2, 'each removed once');
-	is($node->safe_psql('postgres', q{SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci2', hash)) FROM put2}),
+	is($node->safe_psql('postgres', q{SELECT count(*) FILTER (WHERE test_chunk_has('cl2', 'ci2', hash)) FROM put2}),
 		'0', 'and none found again');
 }
 

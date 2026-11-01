@@ -43,6 +43,9 @@ $primary->safe_psql('postgres', q{
 	-- (longer than a page: never into a page freed, but pages new at the end)
 	CREATE FUNCTION big(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 600), 'hex')$$;
+	-- (longer than a region: room made for it lets the region go)
+	CREATE FUNCTION huge(i int) RETURNS bytea LANGUAGE sql IMMUTABLE
+		AS $$SELECT 'L'::bytea || decode(repeat(md5('ef' || i), 20000), 'hex')$$;
 });
 $primary->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('entries_first_standby');
@@ -63,13 +66,40 @@ $s->query_safe(q{SELECT injection_points_set_local()});
 $s->query_safe(q{SELECT injection_points_attach('chunk-put-entered', 'wait')});
 $s->query_until(qr/putting/, "\\echo putting\nSELECT test_cs_put('pages', blob(1001));\n");
 $primary->wait_for_event('client backend', 'chunk-put-entered');
+# (a commit of another's that wrote, flushing the WAL of the entry put
+# before it: one that wrote nothing would flush nothing)
+$primary->safe_psql('postgres', 'CREATE TABLE flushed ()');
 $primary->stop('immediate');
 $s->{run}->finish;
 $primary->start;
 is($primary->safe_psql('postgres',
 		q{SELECT test_cs_has('pages', h(blob(1001)))}), 'f', 'after the crash, the put is not there');
+# (its entry there, aborted, for VACUUM to take out, counting its bytes
+# dead: where they were, at the log's end, then cut off)
+my $entries = q{SELECT entries FROM test_chunk_index_shape('pg_history.chunk_index')};
+my $entries0 = $primary->safe_psql('postgres', $entries);
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
-is($primary->safe_psql('postgres', $audit), 't', 'VACUUM counted its bytes, never written, dead; the audit clean');
+is($entries0 - $primary->safe_psql('postgres', $entries), 1,
+	'VACUUM took its entry, aborted, out, counting its bytes, never written, dead');
+is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
+
+# a region let go of, sealed, and the put making the next one failing: the
+# region forgotten, a put after makes another (one in it would reserve
+# bytes in pages sealed, which their entry, aborted, counts dead again)
+my $r = $primary->background_psql('postgres', on_error_stop => 0);
+$r->query_safe(q{SELECT injection_points_set_local()});
+$r->query_safe(q{SELECT (test_cs_put('pages', blob(1501))).stored});
+$r->query_safe(q{SELECT injection_points_attach('chunk-log-region-sealed', 'error')});
+$r->query(q{SELECT test_cs_put('pages', huge(1502))});
+like($r->{stderr}, qr/error triggered for injection point chunk-log-region-sealed/,
+	'a put failing once its backend\'s region is sealed');
+$r->{stderr} = '';
+$r->query_safe(q{SELECT injection_points_detach('chunk-log-region-sealed')});
+is($r->query_safe(q{SELECT (test_cs_put('pages', blob(1503))).stored}), 't',
+	'a put after, in another region');
+$r->quit;
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
 # 2. a tail cut between VACUUM's finding a put running and its entry's end
 # (the put's bytes on pages new at the log's end, past them another put's,

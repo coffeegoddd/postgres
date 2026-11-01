@@ -281,6 +281,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
 
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
+	ChunkLog->bind_index(log, RelationGetRelid(idx));
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
 
 	/*
@@ -404,6 +405,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		}
 	}
 
+	ChunkLog->bind_index(log, RelationGetRelid(idx));
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
 
 	/*

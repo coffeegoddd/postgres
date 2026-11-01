@@ -97,7 +97,7 @@ SELECT b, lower, special, pagesize FROM generate_series(0, 3) b,
 	LATERAL page_header(get_raw_page('chunks', b)) ORDER BY b;
  b | lower | special | pagesize 
 ---+-------+---------+----------
- 0 |    48 |    8176 |     8192
+ 0 |    56 |    8176 |     8192
  1 |  8176 |    8176 |     8192
  2 |  8176 |    8176 |     8192
  3 |  3724 |    8176 |     8192

@@ -2124,6 +2124,13 @@ ChunkIndexVacuum(Relation idx)
 		Buffer		cur;
 
 		vacuum_delay_point(false);
+
+		/*
+		 * (a bucket's entries taken out, then their bytes counted dead, not
+		 * interrupted between: a cancel there would leave them counted by
+		 * nobody)
+		 */
+		HOLD_INTERRUPTS();
 		primary = ReadBuffer(idx, blk);
 		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
 		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
@@ -2214,6 +2221,7 @@ ChunkIndexVacuum(Relation idx)
 			for (int i = 0; i < ndead; i++)
 				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len, dead[i].log_gen);
 		ndead = 0;
+		RESUME_INTERRUPTS();
 	}
 	if (!log_tried)
 		log = open_bound_log(idx);
