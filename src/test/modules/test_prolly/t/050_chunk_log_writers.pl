@@ -24,8 +24,8 @@ my $standby = PostgreSQL::Test::Cluster->new('chunk_writers_standby');
 $standby->init_from_backup($node, 'base', has_streaming => 1);
 $standby->start;
 
-# each transaction appends a chunk of 1 to 20,000 bytes and notes where it
-# went (a third span pages)
+# each transaction appends a chunk of 32 to 20,032 bytes and notes where it
+# went (most span pages)
 $node->pgbench(
 	'--no-vacuum --client=8 --jobs=4 --transactions=300',
 	0,
@@ -56,6 +56,27 @@ $node->start;
 is($node->safe_psql('postgres', $check), '2400|2400|2400', 'and after a crash');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $check), '2400|2400|2400', 'and on a standby');
+
+# an append an error stops partway leaves this backend's region where its
+# last page ends: the session's next appends go on after it
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  if $ENV{enable_injection_points} ne 'yes';
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	my ($ret, $out, $err) = $node->psql('postgres', q{
+		SELECT injection_points_attach('chunk-log-append-page', 'error');
+		SELECT test_chunk_log_append('chunks', convert_to(repeat('x', 20000), 'UTF8'));
+		SELECT injection_points_detach('chunk-log-append-page');
+		SELECT test_chunk_log_read('chunks', test_chunk_log_append('chunks', '\x0102'), 2) = '\x0102',
+			md5(test_chunk_log_read('chunks',
+				test_chunk_log_append('chunks', convert_to(repeat('y', 20000), 'UTF8')), 20000))
+			= md5(convert_to(repeat('y', 20000), 'UTF8'));
+	}, on_error_stop => 0);
+	like($err, qr/error triggered for injection point chunk-log-append-page/,
+		'an append stopped after its first page');
+	like($out, qr/^t\|t$/m, 'the same session appends after it');
+}
 
 $standby->stop;
 $node->stop;
