@@ -55,7 +55,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	4
+#define CHUNK_INDEX_VERSION	5
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -91,6 +91,7 @@ typedef struct IndexMetaData
 	uint32		highmask;
 	BlockNumber next_block;		/* the first page not in use */
 	Oid			log;			/* the chunk log the entries are of, or 0 */
+	uint64		log_stamp;		/* and its storage's stamp */
 	uint32		ndir;			/* the directory's pages */
 	BlockNumber dir[FLEXIBLE_ARRAY_MEMBER];
 } IndexMetaData;
@@ -105,6 +106,7 @@ typedef struct IndexCache
 {
 	RelFileNumber relnumber;
 	Oid			log;
+	uint64		log_stamp;
 	uint32		maxbucket;
 	uint32		lowmask;
 	uint32		highmask;
@@ -344,6 +346,7 @@ load_cache(Relation rel)
 	meta = page_meta(rel, BufferGetPage(mbuf));
 	cache.relnumber = rel->rd_locator.relNumber;
 	cache.log = meta->log;
+	cache.log_stamp = meta->log_stamp;
 	cache.maxbucket = meta->maxbucket;
 	cache.lowmask = meta->lowmask;
 	cache.highmask = meta->highmask;
@@ -455,11 +458,17 @@ static EntryState find_entry_freeing(Relation rel, Buffer primary, int mode,
 									 BlockNumber *space, BlockNumber *last,
 									 TransactionId *running, bool *freeing);
 
-/* (a purge takes out entries not the bucket's, and aborted ones) */
+/*
+ * (a purge takes out entries not the bucket's, and aborted changes; an
+ * aborted chunk's entry with bytes is left to VACUUM, which counts its
+ * bytes dead in its log as it takes it out)
+ */
 static inline bool
 kept_by_purge(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
 {
-	return belongs(e, bucket, masks) && !(e->flags & CHUNK_ENTRY_ABORTED);
+	return belongs(e, bucket, masks) &&
+		!((e->flags & CHUNK_ENTRY_ABORTED) &&
+		  !(e->kind == CHUNK_KIND_CHUNK && e->len > 0));
 }
 
 static EntryState
@@ -1404,31 +1413,67 @@ page_visit(Relation idx, void (*fn) (void *arg, const ChunkIndexEntry *e),
 }
 
 static Oid
-page_log_of(Relation idx)
+page_log_of(Relation idx, uint64 *stamp)
 {
 	Buffer		mbuf = ReadBuffer(idx, META_BLOCK);
+	IndexMetaData *meta;
 	Oid			log;
 
 	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
-	log = page_meta(idx, BufferGetPage(mbuf))->log;
+	meta = page_meta(idx, BufferGetPage(mbuf));
+	log = meta->log;
+	*stamp = meta->log_stamp;
 	UnlockReleaseBuffer(mbuf);
 	return log;
 }
 
+/*
+ * The log the index's entries are of, opened, if it is the one they are
+ * of (the same storage), else NULL, with a WARNING: its dead bytes are
+ * then not counted (left, not wrongly counted).
+ */
+static Relation
+open_bound_log(Relation idx)
+{
+	uint64		stamp;
+	Oid			logid = page_log_of(idx, &stamp);
+	Relation	log;
+
+	if (!OidIsValid(logid))
+		return NULL;
+	log = try_relation_open(logid, RowExclusiveLock);
+	if (log == NULL)
+		return NULL;
+	if (!RelationIsChunkLog(log) || ChunkLog->stamp(log) != stamp)
+	{
+		ereport(WARNING,
+				(errmsg("chunk index \"%s\" is of chunk log \"%s\" as it was: the bytes of chunks it takes out are not counted dead",
+						RelationGetRelationName(idx), RelationGetRelationName(log))));
+		relation_close(log, RowExclusiveLock);
+		return NULL;
+	}
+	return log;
+}
+
 static void
-page_bind_log(Relation idx, Oid log)
+page_bind_log(Relation idx, Oid log, uint64 stamp)
 {
 	Buffer		mbuf;
 	GenericXLogState *st;
 	IndexMetaData *meta;
+	IndexCache *cache;
 
 	/* (once bound, as a backend's copy of the meta page says: every put) */
-	if (get_cache(idx)->log == log || load_cache(idx)->log == log)
+	cache = get_cache(idx);
+	if (cache->log == log && cache->log_stamp == stamp)
+		return;
+	cache = load_cache(idx);
+	if (cache->log == log && cache->log_stamp == stamp)
 		return;
 	mbuf = ReadBuffer(idx, META_BLOCK);
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = page_meta(idx, BufferGetPage(mbuf));
-	if (meta->log == log)
+	if (meta->log == log && meta->log_stamp == stamp)
 	{
 		UnlockReleaseBuffer(mbuf);
 		return;
@@ -1439,10 +1484,13 @@ page_bind_log(Relation idx, Oid log)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("chunk index \"%s\" is another chunk log's",
-						RelationGetRelationName(idx))));
+						RelationGetRelationName(idx)),
+				 errdetail("Its chunks are of another log, or of this log's storage before it was truncated.")));
 	}
 	st = GenericXLogStart(idx);
-	((IndexMetaData *) PageGetContents(GenericXLogRegisterBuffer(st, mbuf, 0)))->log = log;
+	meta = (IndexMetaData *) PageGetContents(GenericXLogRegisterBuffer(st, mbuf, 0));
+	meta->log = log;
+	meta->log_stamp = stamp;
 	GenericXLogFinish(st);
 	UnlockReleaseBuffer(mbuf);
 }
@@ -1482,6 +1530,7 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 	meta->highmask = 2 * INIT_BUCKETS - 1;
 	meta->next_block = 2 + INIT_BUCKETS;
 	meta->log = InvalidOid;
+	meta->log_stamp = 0;
 	meta->ndir = 1;
 	meta->dir[0] = 1;
 	set_meta_lower(page, meta);
@@ -1693,7 +1742,8 @@ typedef enum VacuumFate
  * horizon); xmax, committed, makes the entry dead, aborted, gone
  */
 static VacuumFate
-vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
+vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
+			TransactionId frozen)
 {
 	bool		freeze;
 	bool		clear = false;
@@ -1715,13 +1765,20 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
 	if (TransactionIdIsValid(e->xmax))
 	{
 		if (e->flags & CHUNK_ENTRY_XMAX_COMMITTED)
-			return FATE_REMOVE;
+			return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE :
+				(freeze ? FATE_FREEZE : FATE_KEEP);
 		if (e->flags & CHUNK_ENTRY_XMAX_ABORTED)
 			clear = true;
 		else if (!TransactionIdIsInProgress(e->xmax))
 		{
+			/*
+			 * (freed: out once no transaction running could have found it
+			 * before the freeing, and be reading its bytes, which then go
+			 * to others)
+			 */
 			if (TransactionIdDidCommit(e->xmax))
-				return FATE_REMOVE;
+				return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE :
+					(freeze ? FATE_FREEZE : FATE_KEEP);
 			clear = true;
 		}
 	}
@@ -1734,9 +1791,8 @@ ChunkIndexVacuum(Relation idx)
 {
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
 	double		kept_entries = 0;
-	Oid			logid = page_log_of(idx);
-	Relation	log = OidIsValid(logid) ?
-		try_relation_open(logid, RowExclusiveLock) : NULL;
+	Relation	log = NULL;
+	bool		log_tried = false;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -1773,7 +1829,7 @@ ChunkIndexVacuum(Relation idx)
 
 			for (int i = 0; i < n; i++)
 			{
-				fates[i] = vacuum_fate(page_entry(page, i), b, &masks);
+				fates[i] = vacuum_fate(page_entry(page, i), b, &masks, frozen);
 				if (fates[i] != FATE_KEEP)
 					change = true;
 			}
@@ -1833,14 +1889,27 @@ ChunkIndexVacuum(Relation idx)
 		fold_changes(idx, primary, b, &masks);
 		UnlockReleaseBuffer(primary);
 
-		/* the bytes of the chunks taken out, dead in their log */
+		/*
+		 * the bytes of the chunks taken out, dead in their log (found when
+		 * there are some: a first put may have bound the index meanwhile)
+		 */
+		if (ndead > 0 && !log_tried)
+		{
+			log = open_bound_log(idx);
+			log_tried = true;
+		}
 		if (ndead > 0 && log != NULL)
 			for (int i = 0; i < ndead; i++)
 				ChunkLog->mark_dead(log, dead[i].loc, dead[i].len);
 		ndead = 0;
 	}
+	if (!log_tried)
+		log = open_bound_log(idx);
 	if (log != NULL)
+	{
+		ChunkLogRecordFree(log);
 		relation_close(log, NoLock);
+	}
 
 	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), kept_entries, 0, 0,
 						false, frozen, InvalidMultiXactId, NULL, NULL, false);

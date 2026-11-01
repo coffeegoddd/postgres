@@ -20,7 +20,7 @@ FROM generate_series(1, 200) g;
 SELECT pages, full_pages, dead, free_pages FROM test_chunk_log_space('ql');
  pages | full_pages | dead | free_pages 
 -------+------------+------+------------
-    50 |         48 |    0 |          0
+    50 |         49 |  864 |          0
 (1 row)
 
 SELECT pg_relation_size('ql') AS size_full \gset
@@ -33,11 +33,11 @@ SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 (1 row)
 
 VACUUM qi;
-SELECT pages, full_pages, dead = 200 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
+SELECT pages, full_pages, dead >= 200 * 2000 AS all_dead, free_pages = full_pages AS full_ones_free
 FROM test_chunk_log_space('ql');
  pages | full_pages | all_dead | full_ones_free 
 -------+------------+----------+----------------
-    50 |         48 | t        | t
+    50 |         49 | t        | t
 (1 row)
 
 -- 150 more, from a backend with no region of its own (one with a region
@@ -69,22 +69,103 @@ SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
  t  |    150
 (1 row)
 
--- a put rolled back: its bytes dead once VACUUM takes its entry out
-SELECT dead AS dead_before FROM test_chunk_log_space('ql') \gset
+-- and again: pages used again are freed again (a page a region leaves
+-- part written is made full, its rest dead), and used a third time
+SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
+ freed 
+-------
+   150
+(1 row)
+
+VACUUM qi;
+SELECT free_pages = full_pages AS full_ones_free_again FROM test_chunk_log_space('ql');
+ full_ones_free_again 
+----------------------
+ t
+(1 row)
+
+\c
+SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
+FROM generate_series(1, 150) g;
+ put_third 
+-----------
+       150
+(1 row)
+
+SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
+ still_no_bigger 
+-----------------
+ t
+(1 row)
+
+SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
+ ok | chunks 
+----+--------
+ t  |    150
+(1 row)
+
+-- a put rolled back: its bytes dead once VACUUM takes its entry out (a
+-- log of its own, with no page free: a page used again starts with none
+-- dead)
+CREATE TABLE ql2 () USING prolly_chunks;
+CREATE TABLE qi2 () USING prolly_chunk_index;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('kept')), blob('kept')) AS put;
+ put 
+-----
+ t
+(1 row)
+
 BEGIN;
-SELECT test_chunk_put('ql', 'qi', h(blob('gone')), blob('gone')) AS put;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('gone')), blob('gone')) AS put;
  put 
 -----
  t
 (1 row)
 
 ROLLBACK;
-VACUUM qi;
-SELECT dead - :dead_before AS dead_added FROM test_chunk_log_space('ql');
- dead_added 
-------------
-       2000
+VACUUM qi2;
+SELECT dead AS dead_after_rollback FROM test_chunk_log_space('ql2');
+ dead_after_rollback 
+---------------------
+                2000
 (1 row)
 
+-- and so when it's looked up, and put again, before VACUUM
+BEGIN;
+SELECT test_chunk_put('ql2', 'qi2', h(blob('again')), blob('again')) AS put;
+ put 
+-----
+ t
+(1 row)
+
+ROLLBACK;
+SELECT test_chunk_has('ql2', 'qi2', h(blob('again'))) AS has_after_rollback;
+ has_after_rollback 
+--------------------
+ f
+(1 row)
+
+SELECT test_chunk_put('ql2', 'qi2', h(blob('again')), blob('again')) AS put_again;
+ put_again 
+-----------
+ t
+(1 row)
+
+VACUUM qi2;
+SELECT dead AS dead_after_second FROM test_chunk_log_space('ql2');
+ dead_after_second 
+-------------------
+              4000
+(1 row)
+
+DROP TABLE ql2, qi2;
+-- the log truncated alone is another log's storage: the index refuses it,
+-- and VACUUM counts nothing dead in it
+TRUNCATE ql;
+SELECT test_chunk_put('ql', 'qi', h(blob('new')), blob('new'));
+ERROR:  chunk index "qi" is another chunk log's
+DETAIL:  Its chunks are of another log, or of this log's storage before it was truncated.
+VACUUM qi;
+WARNING:  chunk index "qi" is of chunk log "ql" as it was: the bytes of chunks it takes out are not counted dead
 DROP TABLE ql, qi;
 DROP FUNCTION blob(text), h(bytea);

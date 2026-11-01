@@ -176,7 +176,7 @@ ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
 
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
-	ChunkIndex->bind_log(idx, RelationGetRelid(log));
+	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
 
 	memset(&e, 0, sizeof(e));
 	memcpy(e.hash, hash, CHUNK_HASH_LEN);
