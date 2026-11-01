@@ -2139,7 +2139,7 @@ count_unheld(Relation idx, Buffer primary)
 }
 
 void
-ChunkIndexVacuum(Relation idx)
+ChunkIndexVacuum(Relation idx, bool truncate)
 {
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
 	TimestampTz starttime = GetCurrentTimestamp();
@@ -2296,7 +2296,12 @@ ChunkIndexVacuum(Relation idx)
 			ChunkLogSweepEnd(log, sweep);
 		ChunkLogRecordFree(log);
 		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
-		(void) ChunkLogTruncateTail(log);
+		/*
+		 * (unless VACUUM is not to truncate: the cut's AccessExclusiveLock,
+		 * WAL-logged, conflicts with a hot standby's readers of the log)
+		 */
+		if (truncate)
+			(void) ChunkLogTruncateTail(log);
 
 		/* chunks nothing holds: a freer frees them, and what they held */
 		if (unheld > 0)

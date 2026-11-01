@@ -31,6 +31,7 @@
 #include "access/xlogutils.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "commands/vacuum.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -1929,7 +1930,7 @@ static void
 ci_relation_vacuum(Relation rel, const VacuumParams *params,
 				   BufferAccessStrategy bstrategy)
 {
-	ChunkIndexVacuum(rel);
+	ChunkIndexVacuum(rel, params->truncate != VACOPTVALUE_DISABLED);
 }
 
 static void
