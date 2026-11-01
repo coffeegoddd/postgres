@@ -43,6 +43,7 @@ test_prolly_isolation = [
   'chunk_pack_pins',
   'chunk_take_back',
   'chunk_hold',
+  'chunk_run_seal',
 ]
 # (these need injection points)
 if get_option('injection_points')
