@@ -767,6 +767,12 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 	ChunkLogRegion region;
 
 	check_writer(rel);
+
+	/*
+	 * (until the region's release, a region an invalidation has this
+	 * backend forget is let go of only if not kept again)
+	 */
+	ChunkRegionAppending(true);
 	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
 		region = *cached;
 	else
@@ -921,6 +927,7 @@ page_release(Relation rel, const ChunkLogRun *run)
 
 	if (run->relnumber == rel->rd_locator.relNumber)
 		keep_region(rel, &region);
+	ChunkRegionAppending(false);
 }
 
 static uint64
@@ -1146,23 +1153,34 @@ static void
 map_clear_full(Relation rel, const uint64 *pages, const bool *done, int n)
 {
 	Buffer		bufs[CLEAR_BATCH];
+	bool		locked[CLEAR_BATCH];
+	bool		any = false;
 	Buffer		mbuf;
 	uint8	   *bits;
 	bool		changed = false;
 
 	for (int i = 0; i < n; i++)
+	{
 		bufs[i] = done[i] ? ReadBuffer(rel, DATA_BLOCK(pages[i])) : InvalidBuffer;
+		any |= done[i];
+	}
+	if (!any)
+		return;
 	mbuf = ReadBuffer(rel, MAP_BLOCK(pages[0]));
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	check_page(rel, MAP_BLOCK(pages[0]), BufferGetPage(mbuf), CHUNK_PAGE_MAP);
 	bits = (uint8 *) PageGetContents(BufferGetPage(mbuf));
+
+	/* (the pages locked, those that can be, before the change is made) */
+	for (int i = 0; i < n; i++)
+		locked[i] = BufferIsValid(bufs[i]) && ConditionalLockBufferShared(bufs[i]);
 	START_CRIT_SECTION();
 	for (int i = 0; i < n; i++)
 	{
 		uint32		bit = MAP_BIT(pages[i]);
 		Page		page;
 
-		if (!BufferIsValid(bufs[i]) || !ConditionalLockBuffer(bufs[i]))
+		if (!locked[i])
 			continue;
 		page = BufferGetPage(bufs[i]);
 		if (!PageIsNew(page) && ((PageHeader) page)->pd_lower == AREA_START + AREA &&
@@ -1171,7 +1189,6 @@ map_clear_full(Relation rel, const uint64 *pages, const bool *done, int n)
 			bits[bit / 8] &= (uint8) ~(1 << (bit % 8));
 			changed = true;
 		}
-		LockBuffer(bufs[i], BUFFER_LOCK_UNLOCK);
 	}
 	if (changed)
 	{
@@ -1180,6 +1197,9 @@ map_clear_full(Relation rel, const uint64 *pages, const bool *done, int n)
 			log_newpage_buffer(mbuf, true);
 	}
 	END_CRIT_SECTION();
+	for (int i = 0; i < n; i++)
+		if (locked[i])
+			LockBuffer(bufs[i], BUFFER_LOCK_UNLOCK);
 	UnlockReleaseBuffer(mbuf);
 	for (int i = 0; i < n; i++)
 		if (BufferIsValid(bufs[i]))
@@ -1215,6 +1235,7 @@ ChunkLogSweepBegin(Relation rel)
 	sweep->generation = meta->generation;
 	UnlockReleaseBuffer(mbuf);
 	live = ChunkRegionLive(rel->rd_locator, sweep->generation);
+	INJECTION_POINT("chunk-log-sweep-begin", NULL);
 	nblocks = RelationGetNumberOfBlocks(rel);
 
 	for (uint64 group = 0; group * MAP_BITS < npages; group++)
@@ -1270,6 +1291,12 @@ ChunkLogSweepBegin(Relation rel)
 void
 ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep)
 {
+	/*
+	 * (the regions held now, once: one published since on a page found has
+	 * made it afresh, a page free, its LSN then past the pass's beginning)
+	 */
+	ChunkRegionSet *live = ChunkRegionLive(rel->rd_locator, sweep->generation);
+
 	for (int k = 0; k < sweep->n; k++)
 	{
 		uint64		d = sweep->pages[k];
@@ -1288,7 +1315,7 @@ ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep)
 		if (!PageIsNew(page) && ((PageHeader) page)->pd_lower == AREA_START + AREA)
 			done = true;
 		else if (sweep->candidate[k] && PageGetLSN(page) <= sweep->start &&
-				 !ChunkRegionHeld(rel->rd_locator, sweep->generation, blk))
+				 !ChunkRegionSetHas(live, blk))
 		{
 			if (PageIsNew(page))
 				make_page(rel, buf, true);
@@ -1316,6 +1343,10 @@ ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep)
 		}
 	}
 
+	pfree(live->first);
+	pfree(live->end);
+	pfree(live);
+
 	/* the pages found full marked so no more, a batch at a time */
 	for (int k = 0; k < sweep->n;)
 	{
@@ -1334,6 +1365,64 @@ ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep)
 		pfree(sweep->candidate);
 	}
 	pfree(sweep);
+}
+
+bool
+ChunkLogCheckLive(Relation rel, int n, const uint64 *locs, const uint32 *lens,
+				  char **why)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	uint64		npages = pages_below(nblocks);
+	uint32	   *live = MemoryContextAllocHuge(CurrentMemoryContext,
+											  Max(npages, 1) * sizeof(uint32));
+
+	memset(live, 0, Max(npages, 1) * sizeof(uint32));
+	*why = NULL;
+	for (int i = 0; i < n; i++)
+	{
+		uint64		loc = locs[i];
+		uint64		len = lens[i];
+
+		while (len > 0)
+		{
+			uint64		d = loc / AREA;
+			uint64		k = Min(len, AREA - LOC_OFFSET(loc));
+
+			if (d >= npages)
+			{
+				*why = psprintf("bytes at %llu of chunk log \"%s\" are past its end",
+								(unsigned long long) loc, RelationGetRelationName(rel));
+				pfree(live);
+				return false;
+			}
+			live[d] += (uint32) k;
+			loc += k;
+			len -= k;
+		}
+	}
+	for (uint64 d = 0; d < npages && *why == NULL; d++)
+	{
+		BlockNumber blk = DATA_BLOCK(d);
+		Buffer		buf = ReadBuffer(rel, blk);
+		Page		page = BufferGetPage(buf);
+		uint32		written = 0,
+					dead = 0;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(page))
+		{
+			check_page(rel, blk, page, CHUNK_PAGE_DATA);
+			written = ((PageHeader) page)->pd_lower - AREA_START;
+			dead = ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead;
+		}
+		UnlockReleaseBuffer(buf);
+		if ((uint64) live[d] + dead > written)
+			*why = psprintf("block %u of chunk log \"%s\" has %u bytes of live chunks, %u dead, and %u written",
+							blk, RelationGetRelationName(rel), live[d], dead, written);
+		CHECK_FOR_INTERRUPTS();
+	}
+	pfree(live);
+	return *why == NULL;
 }
 
 void

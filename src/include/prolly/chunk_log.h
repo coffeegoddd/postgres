@@ -154,6 +154,14 @@ extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
 extern void ChunkLogRecordFree(Relation rel);
 
 /*
+ * For audits: whether no page counts bytes of the chunks given (at locs,
+ * lens long) dead, its live bytes and dead bytes no more than it has
+ * written; what is wrong in *why if not.  O(log).
+ */
+extern bool ChunkLogCheckLive(Relation rel, int n, const uint64 *locs,
+							  const uint32 *lens, char **why);
+
+/*
  * Cuts the log's free tail off, if it gets the relation's exclusive lock
  * without waiting (VACUUM's); answers the pages cut.
  */

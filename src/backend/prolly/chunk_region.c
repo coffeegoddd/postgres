@@ -59,6 +59,7 @@ static int	nregion_tables;
 static LocalEntry local[REGIONS_PER_BACKEND];
 static uint64 use_clock = 0;
 static bool callbacks_registered = false;
+static bool appending = false;	/* between a region's prepare and release */
 
 static void ChunkRegionShmemRequest(void *arg);
 static void ChunkRegionShmemInit(void *arg);
@@ -147,14 +148,24 @@ clear_regions(int code, Datum arg)
 	pg_memory_barrier();
 }
 
-/* (a relcache entry invalidated forgets the region kept in it) */
+/*
+ * (a relcache entry invalidated forgets the region kept in it: let go of
+ * at once if no append runs, or else as the transaction ends unless the
+ * append keeps it again)
+ */
 static void
 forget_regions(Datum arg, Oid relid)
 {
 	for (int j = 0; j < REGIONS_PER_BACKEND; j++)
 		if (OidIsValid(local[j].relid) &&
 			(!OidIsValid(relid) || local[j].relid == relid))
-			local[j].forgotten = true;
+		{
+			if (appending)
+				local[j].forgotten = true;
+			else
+				clear_entry(j);
+		}
+	pg_memory_barrier();
 }
 
 /*
@@ -170,6 +181,7 @@ drop_forgotten(XactEvent event, void *arg)
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
 		event != XACT_EVENT_PREPARE)
 		return;
+	appending = false;
 	t = my_table();
 	for (int j = 0; j < REGIONS_PER_BACKEND; j++)
 		if (local[j].forgotten && RelFileNumberIsValid(t->entries[j].log.relNumber))
@@ -242,6 +254,12 @@ ChunkRegionMine(RelFileLocator log, BlockNumber end)
 		return false;
 	local[j].used = ++use_clock;
 	return true;
+}
+
+void
+ChunkRegionAppending(bool on)
+{
+	appending = on;
 }
 
 void
@@ -349,16 +367,4 @@ ChunkRegionSetHas(const ChunkRegionSet *set, BlockNumber blk)
 			hi = mid;
 	}
 	return lo > 0 && set->end[lo - 1] > blk;
-}
-
-bool
-ChunkRegionHeld(RelFileLocator log, uint32 generation, BlockNumber blk)
-{
-	ChunkRegionSet *now = ChunkRegionLive(log, generation);
-	bool		held = ChunkRegionSetHas(now, blk);
-
-	pfree(now->first);
-	pfree(now->end);
-	pfree(now);
-	return held;
 }
