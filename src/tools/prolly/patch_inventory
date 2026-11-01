@@ -99,6 +99,7 @@ patch src/backend/meson.build  0  links the engine's code in src/backend/prolly 
 patch src/backend/optimizer/util/clauses.c  1b  a function that runs on another branch than the session's is not inlined
 patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
+patch src/backend/postmaster/bgworker.c  2  the chunk freer, a built-in background worker
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
 patch src/backend/replication/logical/slotsync.c  1b  a synced slot keeps the primary's slot's branch
@@ -127,7 +128,7 @@ patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per
 patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
-patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch
+patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch; also (2) chunk_free_in_background
 patch src/backend/utils/misc/guc_tables.c  1a  includes the block map's settings; also (1b) includes the branched catalogs' settings
 patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries and block_map_standby_hold_max_size
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole

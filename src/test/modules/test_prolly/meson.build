@@ -37,6 +37,7 @@ tests += {
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'regress': {
+    'regress_args': ['--temp-config', files('chunk_store.conf')],
     'sql': [
       'unit',
       'conformance',
@@ -60,6 +61,7 @@ tests += {
     ],
   },
   'isolation': {
+    'regress_args': ['--temp-config', files('chunk_store.conf')],
     'specs': [
       'bmap_shared_writers',
       'chunk_index_put_wait',
@@ -122,6 +124,7 @@ tests += {
       't/051_chunk_index_writers.pl',
       't/052_chunk_hash_verified.pl',
       't/053_chunk_refs_crash.pl',
+      't/054_chunk_freer.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

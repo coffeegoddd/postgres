@@ -492,6 +492,14 @@
   max => 'INT_MAX',
 },
 
+{ name => 'chunk_free_in_background', type => 'bool', context => 'PGC_SUSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Frees the history store\'s chunks nothing holds after VACUUM of its index.',
+  long_desc => 'VACUUM of a chunk index starts a background worker that frees the chunks nothing holds.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'chunk_free_in_background',
+  boot_val => 'true',
+},
+
 { name => 'client_connection_check_interval', type => 'int', context => 'PGC_USERSET', group => 'CONN_AUTH_TCP',
   short_desc => 'Sets the time interval between checks for disconnection while running queries.',
   long_desc => '0 disables connection checks.',

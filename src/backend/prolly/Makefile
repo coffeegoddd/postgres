@@ -18,6 +18,7 @@ OBJS = \
 	branch_catalog_copy.o \
 	branch_catalog_ops.o \
 	branch_filter.o \
+	chunk_freer.o \
 	chunk_index.o \
 	chunk_log.o \
 	chunk_pin.o \

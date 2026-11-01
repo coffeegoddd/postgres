@@ -12,7 +12,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('chunk_refs');
 $node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', "autovacuum = off\nchunk_free_in_background = off");
 $node->start;
 $node->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('chunk_refs_standby');
