@@ -29,8 +29,8 @@
  * before; letting go of a chunk's last root frees nothing (cs_free, or a
  * store's own freeing in the background, does); a root of a chunk the
  * store hasn't is an error, letting go of one too; and errors are raised,
- * with their codes the contract's: ERRCODE_DATA_CORRUPTED (bytes not their
- * chunk's), ERRCODE_FOREIGN_KEY_VIOLATION (a reference to a chunk not
+ * with their codes the contract's: ERRCODE_DATA_CORRUPTED (bytes put, or
+ * found by the audit, not their name's), ERRCODE_FOREIGN_KEY_VIOLATION (a reference to a chunk not
  * there), ERRCODE_UNDEFINED_OBJECT (a root of one not there), and
  * ERRCODE_INVALID_PARAMETER_VALUE (a root let go of that it hasn't).  A
  * store may need an active snapshot to read ("pages" does).

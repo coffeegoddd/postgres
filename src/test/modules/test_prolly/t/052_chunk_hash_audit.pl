@@ -45,7 +45,7 @@ close $fh;
 
 $node->start;
 my ($ret, $out, $err) = $node->psql('postgres', $get);
-is($out, 'f', 'a byte changed under it is read as it is');
+is($ret . $out . $err, '0f', 'a byte changed under it is read as it is, no error');
 ($ret, $out, $err) = $node->psql('postgres', q{SELECT ok FROM test_chunk_check('cl', 'ci')});
 like($err, qr/stored chunk [0-9a-f]{40} does not match its hash.*DETAIL:  Its 100 bytes at \d+ in chunk log "cl"/s,
 	'the audit finds it');
