@@ -306,3 +306,33 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 CREATE FUNCTION test_chunk_log_end(rel regclass)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+-- The history store's index and chunks: put, get and has over a log and
+-- its index; an entry, its counts changed, removed; the index's shape.
+CREATE FUNCTION test_chunk_put(log regclass, idx regclass, hash bytea, data bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_get(log regclass, idx regclass, hash bytea)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION test_chunk_has(log regclass, idx regclass, hash bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION test_chunk_index_entry(idx regclass, hash bytea,
+	OUT len int4, OUT loc int8, OUT refs int8, OUT roots int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+CREATE FUNCTION test_chunk_index_adjust(idx regclass, hash bytea,
+	drefs int4, droots int4, OUT refs int8, OUT roots int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_index_remove(idx regclass, hash bytea)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_index_shape(idx regclass,
+	OUT buckets int4, OUT pages int4)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

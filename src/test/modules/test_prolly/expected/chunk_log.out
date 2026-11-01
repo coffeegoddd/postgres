@@ -111,21 +111,21 @@ SELECT count(*) FROM chunks;
 (1 row)
 
 INSERT INTO chunks DEFAULT VALUES;
-ERROR:  a chunk log relation does not support inserting tuples
+ERROR:  a history store relation does not support inserting tuples
 ALTER TABLE chunks ADD COLUMN x int;
 CREATE INDEX ON chunks (x);
-ERROR:  a chunk log relation does not support indexes
+ERROR:  a history store relation does not support indexes
 VACUUM chunks;
 ANALYZE chunks;
 VACUUM FULL chunks;
-ERROR:  cannot rewrite chunk log relation "chunks"
+ERROR:  cannot rewrite history store relation "chunks"
 -- nor rewritten, which would leave it empty
 ALTER TABLE chunks ALTER COLUMN x TYPE bigint;
-ERROR:  cannot rewrite chunk log relation "chunks"
+ERROR:  cannot rewrite history store relation "chunks"
 ALTER TABLE chunks ADD COLUMN y float8 DEFAULT random();
-ERROR:  cannot rewrite chunk log relation "chunks"
+ERROR:  cannot rewrite history store relation "chunks"
 ALTER TABLE chunks SET ACCESS METHOD heap;
-ERROR:  cannot rewrite chunk log relation "chunks"
+ERROR:  cannot rewrite history store relation "chunks"
 SELECT test_chunk_log_end('chunks') AS end_kept;
  end_kept 
 ----------
@@ -229,14 +229,14 @@ CREATE TABLE not_chunks (x int);
 SELECT test_chunk_log_end('not_chunks');
 ERROR:  "not_chunks" is not a chunk log relation
 CREATE UNLOGGED TABLE chunks_unlogged () USING prolly_chunks;
-ERROR:  a chunk log relation must be permanent
+ERROR:  a history store relation must be permanent
 CREATE TEMP TABLE chunks_temp () USING prolly_chunks;
-ERROR:  a chunk log relation must be permanent
+ERROR:  a history store relation must be permanent
 SELECT pg_branch_id_allocate() AS b \gset
 SET catalog_branch = :b;
 CREATE SCHEMA chunk_branch VERSIONED;
 CREATE TABLE chunk_branch.chunks () USING prolly_chunks;
-ERROR:  a chunk log relation cannot be in a versioned schema
+ERROR:  a history store relation cannot be in a versioned schema
 DROP SCHEMA chunk_branch;
 RESET catalog_branch;
 DROP TABLE chunks, not_chunks;

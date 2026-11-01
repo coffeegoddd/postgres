@@ -33,6 +33,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "prolly/branch_catalog.h"
+#include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
@@ -426,7 +427,7 @@ refuse(const char *what)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("a chunk log relation does not support %s", what)));
+			 errmsg("a history store relation does not support %s", what)));
 }
 
 static const TupleTableSlotOps *
@@ -612,6 +613,25 @@ cl_finish_bulk_insert(Relation rel, uint32 options)
  * The history store's relation is ordinary storage, WAL-logged: neither
  * unlogged nor temporary, and not a branch's (in a versioned schema).
  */
+static SMgrRelation
+create_store_storage(Relation rel, const RelFileLocator *newrlocator,
+					 char persistence, TransactionId *freezeXid,
+					 MultiXactId *minmulti)
+{
+	if (persistence != RELPERSISTENCE_PERMANENT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a history store relation must be permanent")));
+	if (NamespaceBranch(RelationGetNamespace(rel)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a history store relation cannot be in a versioned schema")));
+
+	*freezeXid = InvalidTransactionId;
+	*minmulti = InvalidMultiXactId;
+	return RelationCreateStorageWith(*newrlocator, persistence, true, SMGR_MD);
+}
+
 static void
 cl_relation_set_new_filelocator(Relation rel,
 								const RelFileLocator *newrlocator,
@@ -619,20 +639,8 @@ cl_relation_set_new_filelocator(Relation rel,
 								TransactionId *freezeXid,
 								MultiXactId *minmulti)
 {
-	SMgrRelation srel;
-
-	if (persistence != RELPERSISTENCE_PERMANENT)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a chunk log relation must be permanent")));
-	if (NamespaceBranch(RelationGetNamespace(rel)) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a chunk log relation cannot be in a versioned schema")));
-
-	*freezeXid = InvalidTransactionId;
-	*minmulti = InvalidMultiXactId;
-	srel = RelationCreateStorageWith(*newrlocator, persistence, true, SMGR_MD);
+	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
+											 freezeXid, minmulti);
 
 	/*
 	 * (logged unless WAL is minimal, when the new storage is synced at
@@ -640,6 +648,33 @@ cl_relation_set_new_filelocator(Relation rel,
 	 */
 	write_meta(srel, XLogIsNeeded());
 	smgrclose(srel);
+}
+
+/* a chunk index's storage: its own first pages (prolly/chunk_index.h) */
+static void
+ci_relation_set_new_filelocator(Relation rel,
+								const RelFileLocator *newrlocator,
+								char persistence,
+								TransactionId *freezeXid,
+								MultiXactId *minmulti)
+{
+	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
+											 freezeXid, minmulti);
+
+	ChunkIndexInitStorage(srel, XLogIsNeeded());
+	smgrclose(srel);
+}
+
+static void
+ci_relation_nontransactional_truncate(Relation rel)
+{
+	RelationTruncate(rel, 0);
+	ChunkIndexInitStorage(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+	if (rel->rd_amcache != NULL)
+	{
+		pfree(rel->rd_amcache);
+		rel->rd_amcache = NULL;
+	}
 }
 
 static void
@@ -816,14 +851,48 @@ static const TableAmRoutine chunk_log_routine = {
 	.scan_sample_next_tuple = cl_scan_sample_next_tuple,
 };
 
+/*
+ * A chunk index's relation is a chunk log's but for its pages: the same
+ * callbacks, its storage made with the index's first pages.
+ */
+static TableAmRoutine chunk_index_routine;
+static bool chunk_index_routine_made = false;
+
+static const TableAmRoutine *
+index_routine(void)
+{
+	if (!chunk_index_routine_made)
+	{
+		chunk_index_routine = chunk_log_routine;
+		chunk_index_routine.relation_set_new_filelocator =
+			ci_relation_set_new_filelocator;
+		chunk_index_routine.relation_nontransactional_truncate =
+			ci_relation_nontransactional_truncate;
+		chunk_index_routine_made = true;
+	}
+	return &chunk_index_routine;
+}
+
 bool
 RelationIsChunkLog(Relation rel)
 {
 	return rel->rd_tableam == &chunk_log_routine;
 }
 
+bool
+RelationIsChunkIndex(Relation rel)
+{
+	return rel->rd_tableam == index_routine();
+}
+
 Datum
 prolly_chunks_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&chunk_log_routine);
+}
+
+Datum
+prolly_chunk_index_tableam_handler(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(index_routine());
 }
