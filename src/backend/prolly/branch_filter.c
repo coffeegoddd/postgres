@@ -329,7 +329,11 @@ row_owners(Oid relid, HeapTuple tup, RowOwners *owners)
 			{
 				Form_pg_shdepend d = (Form_pg_shdepend) row;
 
-				if (d->dbid == MyDatabaseId)
+				/*
+				 * (another database's rows are not: their objects' branches
+				 * are known only there)
+				 */
+				if (OidIsValid(MyDatabaseId) && d->dbid == MyDatabaseId)
 					add_owner(owners, d->classid, d->objid);
 				break;
 			}

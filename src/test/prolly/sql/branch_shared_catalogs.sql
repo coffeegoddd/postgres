@@ -14,6 +14,10 @@ CREATE TABLE app.t (id int PRIMARY KEY, extra int);
 ALTER TABLE app.t OWNER TO regress_branch_shared;
 SET client_min_messages = error;
 CREATE PUBLICATION pub_t FOR TABLE app.t;
+-- (an extension whose script revokes privileges records initial ones)
+CREATE EXTENSION pg_stat_statements SCHEMA app;
+LOAD 'dummy_seclabel';
+SECURITY LABEL ON TABLE app.t IS 'classified';
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO regress_branch_shared;
 SET catalog_branch = :b1;
 CREATE PUBLICATION pub_app FOR TABLES IN SCHEMA app;
@@ -27,7 +31,10 @@ INSERT INTO probes VALUES
 	('pg_publication_rel', $$SELECT count(*) FROM pg_publication_rel r JOIN pg_publication p ON p.oid = r.prpubid WHERE p.pubname = 'pub_t'$$),
 	('pg_publication_namespace', $$SELECT count(*) FROM pg_publication_namespace n JOIN pg_publication p ON p.oid = n.pnpubid WHERE p.pubname = 'pub_app'$$),
 	('pg_publication_tables', $$SELECT string_agg(pubname || ':' || tablename, ',' ORDER BY pubname) FROM pg_publication_tables WHERE schemaname = 'app'$$),
-	('pg_publication (shared)', $$SELECT count(*) FROM pg_publication WHERE pubname IN ('pub_t', 'pub_app')$$);
+	('pg_publication (shared)', $$SELECT count(*) FROM pg_publication WHERE pubname IN ('pub_t', 'pub_app')$$),
+	('pg_seclabel', $$SELECT count(*) FROM pg_seclabel WHERE provider = 'dummy' AND label = 'classified'$$),
+	('pg_init_privs', $$SELECT count(*) > 0 FROM pg_init_privs i JOIN pg_proc p ON i.classoid = 'pg_proc'::regclass AND p.oid = i.objoid WHERE p.proname = 'pg_stat_statements_reset'$$),
+	('pg_init_privs (unjoined)', $$SELECT count(*) > 0 FROM pg_init_privs WHERE classoid = 'pg_proc'::regclass AND objoid >= 16384$$);
 CREATE FUNCTION pg_temp.probe(q text) RETURNS text LANGUAGE plpgsql AS
 $$DECLARE r text; BEGIN EXECUTE q INTO r; RETURN r; END$$;
 
