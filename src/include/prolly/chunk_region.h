@@ -50,6 +50,9 @@ extern void ChunkRegionPublish(RelFileLocator log, Oid relid, uint32 generation,
 /* Whether this backend's entry for the log is its region ending at end. */
 extern bool ChunkRegionMine(RelFileLocator log, BlockNumber end);
 
+/* Whether this backend is between a region's prepare and its release. */
+extern void ChunkRegionAppending(bool on);
+
 /* This backend keeps its region in the log (in its relcache entry) again. */
 extern void ChunkRegionKept(RelFileLocator log);
 
@@ -59,7 +62,5 @@ extern ChunkRegionSet *ChunkRegionLive(RelFileLocator log, uint32 generation);
 /* Whether a region of the set has page blk. */
 extern bool ChunkRegionSetHas(const ChunkRegionSet *set, BlockNumber blk);
 
-/* Whether a live backend's region of the log's generation has page blk. */
-extern bool ChunkRegionHeld(RelFileLocator log, uint32 generation, BlockNumber blk);
 
 #endif							/* PROLLY_CHUNK_REGION_H */

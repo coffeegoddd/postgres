@@ -877,6 +877,10 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 	EdgeState	es = {0};
 	HASH_SEQ_STATUS seq;
 	AuditEntry *a;
+	uint64	   *locs;
+	uint32	   *lens;
+	int			nlive = 0;
+	char	   *dead_why;
 
 	/* (with no writer meanwhile: a split during it would show chunks twice) */
 	LockRelationOid(RelationGetRelid(idx), ShareLock);
@@ -889,10 +893,15 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 
 	/* every chunk's bytes are its own, and every chunk it names is there */
 	es.as = &as;
+	locs = palloc(Max(hash_get_num_entries(as.chunks), 1) * sizeof(uint64));
+	lens = palloc(Max(hash_get_num_entries(as.chunks), 1) * sizeof(uint32));
 	hash_seq_init(&seq, as.chunks);
 	while ((a = hash_seq_search(&seq)) != NULL)
 	{
 		void	   *data = palloc_extended(Max(a->len, 1), MCXT_ALLOC_HUGE);
+
+		locs[nlive] = a->loc;
+		lens[nlive++] = a->len;
 
 		ChunkLog->read(log, a->loc, data, a->len);
 		check_hash(a->hash, data, a->len, log, a->loc);
@@ -916,6 +925,12 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 			(*unheld)++;
 	}
 	hash_destroy(as.chunks);
+
+	/* and no live chunk's bytes are counted dead */
+	if (!ChunkLogCheckLive(log, nlive, locs, lens, &dead_why) && es.why == NULL)
+		es.why = dead_why;
+	pfree(locs);
+	pfree(lens);
 	*why = es.why;
 	return es.why == NULL;
 }
