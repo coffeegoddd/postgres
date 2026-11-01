@@ -99,8 +99,8 @@ typedef struct HeapScanDescData
 	/* Current heap block's corresponding page in the visibility map */
 	Buffer		rs_vmbuffer;
 
-	/* hide other branches' catalog rows (see prolly/branch_filter.h)? */
-	bool		rs_branch_filter;
+	/* the branch whose catalog rows the scan sees (prolly/branch_filter.h) */
+	int32		rs_filter_branch;
 
 	/* these fields only used in page-at-a-time mode and for bitmap scans */
 	uint32		rs_cindex;		/* current tuple's index in vistuples */
@@ -135,8 +135,8 @@ typedef struct IndexScanHeapData
 
 	uint16		xs_blkswitch_count; /* number of heap blocks fetched */
 
-	/* hide other branches' catalog rows (see prolly/branch_filter.h)? */
-	bool		xs_branch_filter;
+	/* the branch whose catalog rows the scan sees (prolly/branch_filter.h) */
+	int32		xs_filter_branch;
 } IndexScanHeapData;
 
 /* Result codes for HeapTupleSatisfiesVacuum */

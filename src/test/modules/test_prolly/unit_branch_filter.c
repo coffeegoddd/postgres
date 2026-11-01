@@ -137,9 +137,9 @@ check_row(const Fixture *f, Oid relid, int n, const AttrNumber *atts,
 	tup->t_tableOid = relid;
 
 	set_branch(0);
-	CHECK(CatalogBranchHides(rel, tup) == hidden_on_no_branch);
+	CHECK(CatalogBranchHides(rel, tup, 0) == hidden_on_no_branch);
 	set_branch(f->branch);
-	CHECK(!CatalogBranchHides(rel, tup));
+	CHECK(!CatalogBranchHides(rel, tup, f->branch));
 
 	table_close(rel, AccessShareLock);
 }
@@ -240,16 +240,16 @@ check_filtered_scans(const Fixture *f)
 	Snapshot	snap = GetTransactionSnapshot();
 
 	/* queries' snapshots filter; catalog snapshots, and the filter off, don't */
-	CHECK(CatalogBranchFilters(rel, snap));
-	CHECK(!CatalogBranchFilters(rel, GetCatalogSnapshot(DescriptionRelationId)));
+	CHECK(CatalogBranchFilters(rel, snap) != CATALOG_BRANCH_UNFILTERED);
+	CHECK(CATALOG_BRANCH_UNFILTERED == CatalogBranchFilters(rel, GetCatalogSnapshot(DescriptionRelationId)));
 	SetConfigOption("catalog_branch_filter", "off", PGC_SUSET, PGC_S_SESSION);
-	CHECK(!CatalogBranchFilters(rel, snap));
+	CHECK(CATALOG_BRANCH_UNFILTERED == CatalogBranchFilters(rel, snap));
 	SetConfigOption("catalog_branch_filter", "on", PGC_SUSET, PGC_S_SESSION);
 	table_close(rel, AccessShareLock);
 
 	/* nor are other tables filtered */
 	rel = table_open(f->table, AccessShareLock);
-	CHECK(!CatalogBranchFilters(rel, snap));
+	CHECK(CATALOG_BRANCH_UNFILTERED == CatalogBranchFilters(rel, snap));
 	table_close(rel, AccessShareLock);
 }
 

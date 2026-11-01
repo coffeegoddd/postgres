@@ -702,10 +702,11 @@ heap_prepare_pagescan(TableScanDesc sscan)
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 	/* other branches' catalog rows, with the page unlocked */
-	if (scan->rs_branch_filter)
+	if (scan->rs_filter_branch != CATALOG_BRANCH_UNFILTERED)
 		scan->rs_ntuples = CatalogBranchFilterPage(scan->rs_base.rs_rd, page,
 												   block, scan->rs_vistuples,
-												   scan->rs_ntuples);
+												   scan->rs_ntuples,
+												   scan->rs_filter_branch);
 }
 
 /*
@@ -1226,8 +1227,8 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	 * runs on the tuples found visible on a page once its lock is released,
 	 * so such a scan runs page at a time.
 	 */
-	scan->rs_branch_filter = CatalogBranchFilters(relation, snapshot);
-	if (scan->rs_branch_filter)
+	scan->rs_filter_branch = CatalogBranchFilters(relation, snapshot);
+	if (scan->rs_filter_branch != CATALOG_BRANCH_UNFILTERED)
 		scan->rs_base.rs_flags |= SO_ALLOW_PAGEMODE;
 
 	/* Check that a historic snapshot is not used for non-catalog tables */
@@ -1364,7 +1365,8 @@ heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 		else
 			scan->rs_base.rs_flags &= ~SO_ALLOW_SYNC;
 
-		if ((allow_pagemode || scan->rs_branch_filter) &&
+		if ((allow_pagemode ||
+			 scan->rs_filter_branch != CATALOG_BRANCH_UNFILTERED) &&
 			scan->rs_base.rs_snapshot &&
 			IsMVCCSnapshot(scan->rs_base.rs_snapshot))
 			scan->rs_base.rs_flags |= SO_ALLOW_PAGEMODE;
@@ -1775,9 +1777,14 @@ heap_fetch(Relation relation,
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 	/* another branch's catalog row, with the page unlocked */
-	if (valid && CatalogBranchFilters(relation, snapshot) &&
-		CatalogBranchHides(relation, tuple))
-		valid = false;
+	if (valid && RelationGetRelid(relation) < FirstNormalObjectId)
+	{
+		int32		branch = CatalogBranchFilters(relation, snapshot);
+
+		if (branch != CATALOG_BRANCH_UNFILTERED &&
+			CatalogBranchHides(relation, tuple, branch))
+			valid = false;
+	}
 
 	if (valid)
 	{

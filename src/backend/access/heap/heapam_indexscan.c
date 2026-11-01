@@ -84,7 +84,7 @@ heapam_index_scan_begin(IndexScanDesc scan, uint32 flags)
 	hscan->xs_readonly = (flags & SO_HINT_REL_READ_ONLY) != 0;
 
 	/* A query of a catalog does not see other branches' rows */
-	hscan->xs_branch_filter = CatalogBranchFilters(scan->heapRelation,
+	hscan->xs_filter_branch = CatalogBranchFilters(scan->heapRelation,
 												   scan->xs_snapshot);
 
 	/* Resolve which xs_getnext_slot implementation to use for this scan */
@@ -371,7 +371,8 @@ heapam_index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 										 &hscan->xs_vmbuffer);
 
 			/* (the catalog filter must see each row) */
-			if (unlikely(!all_visible || hscan->xs_branch_filter))
+			if (unlikely(!all_visible ||
+						 hscan->xs_filter_branch != CATALOG_BRANCH_UNFILTERED))
 			{
 				/* Page isn't all-visible, so need a heap fetch */
 				if (!heapam_index_only_heap_fetch(scan))
@@ -498,8 +499,9 @@ heapam_index_heap_fetch(IndexScanDesc scan, IndexScanHeapData *hscan,
 	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_UNLOCK);
 
 	/* another branch's catalog row, with the page unlocked */
-	if (got_heap_tuple && unlikely(hscan->xs_branch_filter) &&
-		CatalogBranchHides(rel, heapTuple))
+	if (got_heap_tuple &&
+		unlikely(hscan->xs_filter_branch != CATALOG_BRANCH_UNFILTERED) &&
+		CatalogBranchHides(rel, heapTuple, hscan->xs_filter_branch))
 	{
 		got_heap_tuple = false;
 		all_dead = false;

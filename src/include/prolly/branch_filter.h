@@ -38,11 +38,17 @@
 /* Whether queries hide other branches' catalog rows (on by default). */
 extern PGDLLIMPORT bool catalog_branch_filter;
 
-/* Whether a scan of rel with snapshot must hide other branches' rows. */
-extern bool CatalogBranchFilters(Relation rel, Snapshot snapshot);
+/*
+ * The branch whose rows, and the shared ones, a scan of rel with snapshot
+ * sees: the session's when the scan begins, kept for the whole scan, so
+ * that a cursor's rows are one branch's however the session's changes
+ * meanwhile; CATALOG_BRANCH_UNFILTERED if the scan hides nothing.
+ */
+#define CATALOG_BRANCH_UNFILTERED (-1)
+extern int32 CatalogBranchFilters(Relation rel, Snapshot snapshot);
 
-/* Whether a visible tuple of rel is another branch's. */
-extern bool CatalogBranchHides(Relation rel, HeapTuple tuple);
+/* Whether a visible tuple of rel is another branch's than branch. */
+extern bool CatalogBranchHides(Relation rel, HeapTuple tuple, int32 branch);
 
 /*
  * Whether the session's queries see an object: a shared one, or its
@@ -55,13 +61,14 @@ extern bool CatalogBranchSees(Oid classid, Oid objid);
 extern List *CatalogBranchSeenOids(Oid classid, List *oids);
 
 /*
- * Removes other branches' tuples from the n visible tuples at offsets of a
- * pinned (not locked) page of rel, keeping their order; returns how many
- * remain.
+ * Removes other branches' tuples than branch's from the n visible tuples
+ * at offsets of a pinned (not locked) page of rel, keeping their order;
+ * returns how many remain.
  */
 extern uint32 CatalogBranchFilterPage(Relation rel, Page page,
 									  BlockNumber block,
-									  OffsetNumber *offsets, uint32 n);
+									  OffsetNumber *offsets, uint32 n,
+									  int32 branch);
 
 /*
  * The branch of every catalog object, by class and object id: 0 for a

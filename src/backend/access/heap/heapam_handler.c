@@ -2305,7 +2305,8 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 
 
 			/* (the catalog filter left only some of the page's tuples) */
-			if (all_visible && !hscan->rs_branch_filter)
+			if (all_visible &&
+				hscan->rs_filter_branch == CATALOG_BRANCH_UNFILTERED)
 				visible = true;
 			else
 				visible = SampleHeapTupleVisible(scan, hscan->rs_cbuf,
@@ -2662,9 +2663,10 @@ BitmapHeapScanNextBlock(TableScanDesc scan,
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 	/* other branches' catalog rows, with the page unlocked */
-	if (hscan->rs_branch_filter)
+	if (hscan->rs_filter_branch != CATALOG_BRANCH_UNFILTERED)
 		ntup = CatalogBranchFilterPage(scan->rs_rd, BufferGetPage(buffer),
-									   block, hscan->rs_vistuples, ntup);
+									   block, hscan->rs_vistuples, ntup,
+									   hscan->rs_filter_branch);
 
 	Assert(ntup <= MaxHeapTuplesPerPage);
 	hscan->rs_ntuples = ntup;

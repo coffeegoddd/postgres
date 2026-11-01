@@ -407,6 +407,55 @@ FROM pg_class WHERE oid IN (:t1, :t2);
 (1 row)
 
 RESET catalog_branch_filter;
+-- a cursor's rows are the branch's it began on, though the session
+-- changes branch between fetches: by a sequential scan and an index scan
+CREATE FUNCTION pg_temp.cursor_rows(q text, then_branch int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	c refcursor;
+	r record;
+	got text[] := '{}';
+BEGIN
+	OPEN c FOR EXECUTE q;
+	FETCH c INTO r;
+	got := got || r.x;
+	PERFORM set_config('catalog_branch', then_branch::text, true);
+	LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		got := got || r.x;
+	END LOOP;
+	RETURN (SELECT string_agg(g, ',' ORDER BY g) FROM unnest(got) g);
+END $$;
+SET catalog_branch = :b1;
+SELECT format('SELECT CASE oid WHEN %s THEN ''b1'' WHEN %s THEN ''b2'' ELSE relname END AS x
+	FROM pg_class WHERE relname IN (''pg_class'', ''t'')', :t1, :t2) AS q \gset
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT pg_temp.cursor_rows(:'q', :b2) AS by_seqscan;
+ by_seqscan  
+-------------
+ b1,pg_class
+(1 row)
+
+RESET enable_bitmapscan;
+SET enable_seqscan = off;
+SET enable_indexscan = on;
+SELECT pg_temp.cursor_rows(:'q', :b2) AS by_indexscan;
+ by_indexscan 
+--------------
+ b1,pg_class
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+SELECT current_setting('catalog_branch')::int = :b1 AS back_on_b1;
+ back_on_b1 
+------------
+ t
+(1 row)
+
+SET catalog_branch = :b2;
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 4 other objects
 DETAIL:  drop cascades to type app.mood
