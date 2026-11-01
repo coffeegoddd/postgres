@@ -5229,6 +5229,19 @@ getSubscriptions(Archive *fout)
 		appendPQExpBufferStr(query,
 							 " false AS subfailover,\n");
 
+	/* (a server with branched catalogs: a subscription's branch) */
+	{
+		PGresult   *res2 = ExecuteSqlQuery(fout,
+										   "SELECT 1 FROM pg_catalog.pg_attribute "
+										   "WHERE attrelid = 'pg_catalog.pg_subscription'::pg_catalog.regclass "
+										   "AND attname = 'subcatalogbranch'",
+										   PGRES_TUPLES_OK);
+
+		appendPQExpBufferStr(query, PQntuples(res2) > 0 ?
+							 " s.subcatalogbranch,\n" : " 0 AS subcatalogbranch,\n");
+		PQclear(res2);
+	}
+
 	if (fout->remoteVersion >= 190000)
 		appendPQExpBufferStr(query,
 							 " s.subretaindeadtuples,\n");
@@ -5332,6 +5345,8 @@ getSubscriptions(Archive *fout)
 			(strcmp(PQgetvalue(res, i, i_subrunasowner), "t") == 0);
 		subinfo[i].subfailover =
 			(strcmp(PQgetvalue(res, i, i_subfailover), "t") == 0);
+		subinfo[i].subcatalogbranch =
+			atoi(PQgetvalue(res, i, PQfnumber(res, "subcatalogbranch")));
 		subinfo[i].subretaindeadtuples =
 			(strcmp(PQgetvalue(res, i, i_subretaindeadtuples), "t") == 0);
 		subinfo[i].submaxretention =
@@ -5606,6 +5621,9 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 
 	if (subinfo->subfailover)
 		appendPQExpBufferStr(query, ", failover = true");
+
+	if (subinfo->subcatalogbranch != 0)
+		appendPQExpBuffer(query, ", catalog_branch = %d", subinfo->subcatalogbranch);
 
 	if (subinfo->subretaindeadtuples)
 		appendPQExpBufferStr(query, ", retain_dead_tuples = true");

@@ -70,6 +70,35 @@ $sub->safe_psql('postgres', 'ALTER SUBSCRIPTION s REFRESH PUBLICATION');
 $sub->wait_for_subscription_sync($pub, 's');
 is(on_sub($s2, 'SELECT count(*) FROM app.u'), '1', 'a refresh finds the branch\'s new table');
 
+# pg_dump writes the subscription's branch
+my ($dump, $derr);
+IPC::Run::run([ 'pg_dump', '--no-sync', '-s', '-d', $sub->connstr('postgres') ],
+	'>', \$dump, '2>', \$derr);
+like($dump, qr/CREATE SUBSCRIPTION s .*catalog_branch = $s2/, 'pg_dump writes the subscription\'s branch');
+
+# made from a session on a branch, without the option: the session's branch
+on_sub($s1, 'CREATE TABLE app.u (id int PRIMARY KEY)');
+on_sub($s1, "CREATE SUBSCRIPTION s_on_branch CONNECTION \$\$" . $pub->connstr('postgres') .
+	"\$\$ PUBLICATION p WITH (slot_name = s_on_branch)");
+$sub->wait_for_subscription_sync($pub, 's_on_branch');
+is($sub->safe_psql('postgres', "SELECT subcatalogbranch = $s1 FROM pg_subscription WHERE subname = 's_on_branch'"),
+	't', 'a subscription made on a branch is the branch\'s');
+is(on_sub($s1, 'SELECT count(*) FROM app.t'), '2', 'and replicates into its tables');
+$sub->safe_psql('postgres', 'DROP SUBSCRIPTION s_on_branch');
+
+# a trigger on the subscriber's branch table whose function is a shared
+# security definer one runs on no branch, as anywhere: the worker's branch
+# doesn't capture it
+$sub->safe_psql('postgres', "CREATE TABLE public.seen (b text);
+	CREATE FUNCTION public.note() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS
+	\$\$BEGIN INSERT INTO public.seen VALUES (current_setting('catalog_branch')); RETURN NEW; END\$\$");
+on_sub($s2, "CREATE TRIGGER t_note AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION public.note();
+	ALTER TABLE app.t ENABLE ALWAYS TRIGGER t_note");
+$pub->safe_psql('postgres', "INSERT INTO app.t VALUES (4, 'fourth')");
+$pub->wait_for_catchup('s');
+is($sub->safe_psql('postgres', 'SELECT string_agg(b, \',\') FROM public.seen'), '0',
+	'a shared definer trigger function runs on no branch inside the worker');
+
 $sub->safe_psql('postgres', 'DROP SUBSCRIPTION s');
 $sub->stop;
 $pub->stop;
