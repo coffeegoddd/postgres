@@ -132,6 +132,7 @@ tests += {
       't/058_chunk_log_wal.pl',
       't/059_chunk_index_wal.pl',
       't/060_chunk_index_redo_readers.pl',
+      't/061_history_backups.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
