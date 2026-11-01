@@ -13,7 +13,9 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/htup_details.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "prolly/chunk_log.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"
@@ -23,6 +25,7 @@
 PG_FUNCTION_INFO_V1(test_chunk_log_append);
 PG_FUNCTION_INFO_V1(test_chunk_log_read);
 PG_FUNCTION_INFO_V1(test_chunk_log_end);
+PG_FUNCTION_INFO_V1(test_chunk_log_space);
 
 static Relation
 open_log(Oid relid, LOCKMODE mode)
@@ -79,4 +82,28 @@ test_chunk_log_end(PG_FUNCTION_ARGS)
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64((int64) end);
+}
+
+/* test_chunk_log_space(rel, OUT pages, OUT full, OUT dead, OUT free_pages) */
+Datum
+test_chunk_log_space(PG_FUNCTION_ARGS)
+{
+	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
+	uint32		pages,
+				full,
+				free_pages;
+	uint64		dead;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+
+	ChunkLogSpace(rel, &pages, &full, &dead, &free_pages);
+	relation_close(rel, AccessShareLock);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int32GetDatum((int32) pages);
+	values[1] = Int32GetDatum((int32) full);
+	values[2] = Int64GetDatum((int64) dead);
+	values[3] = Int32GetDatum((int32) free_pages);
+	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
 }

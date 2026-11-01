@@ -175,12 +175,24 @@ ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 					 errmsg("chunk %s references chunk %s, which the store does not have",
 							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
 
+	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
+	ChunkIndex->bind_log(idx, RelationGetRelid(log));
+
 	memset(&e, 0, sizeof(e));
 	memcpy(e.hash, hash, CHUNK_HASH_LEN);
 	e.len = len;
 	e.loc = ChunkLog->append(log, data, len);
-	if (!ChunkIndex->insert(idx, &e))
-		return false;
+	{
+		uint64		appended = e.loc;
+
+		if (!ChunkIndex->insert(idx, &e))
+		{
+			/* (another put it meanwhile: the bytes appended are no chunk's) */
+			if (len > 0)
+				ChunkLog->mark_dead(log, appended, len);
+			return false;
+		}
+	}
 
 	/*
 	 * each edge a reference of the chunk it names, in this transaction: an

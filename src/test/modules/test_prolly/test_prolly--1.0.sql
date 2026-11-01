@@ -371,3 +371,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_chunk_pin(hash bytea)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_log_space(rel regclass,
+	OUT pages int4, OUT full_pages int4, OUT dead int8, OUT free_pages int4)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;

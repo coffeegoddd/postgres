@@ -44,7 +44,7 @@ SELECT test_chunk_log_append('chunks', '\x7a') AS last_at;
 SELECT test_chunk_log_end('chunks') AS end_after;
  end_after 
 -----------
-    261120
+    260864
 (1 row)
 
 SELECT pg_relation_size('chunks') / current_setting('block_size')::int AS blocks;
@@ -97,10 +97,10 @@ SELECT b, lower, special, pagesize FROM generate_series(0, 3) b,
 	LATERAL page_header(get_raw_page('chunks', b)) ORDER BY b;
  b | lower | special | pagesize 
 ---+-------+---------+----------
- 0 |    32 |    8184 |     8192
- 1 |  8184 |    8184 |     8192
- 2 |  8184 |    8184 |     8192
- 3 |  3708 |    8184 |     8192
+ 0 |    32 |    8176 |     8192
+ 1 |  8176 |    8176 |     8192
+ 2 |  8176 |    8176 |     8192
+ 3 |  3724 |    8176 |     8192
 (4 rows)
 
 -- no tuples, and none taken
@@ -129,7 +129,7 @@ ERROR:  cannot rewrite history store relation "chunks"
 SELECT test_chunk_log_end('chunks') AS end_kept;
  end_kept 
 ----------
-   261120
+   260864
 (1 row)
 
 -- a parallel scan and a TID scan find nothing too
@@ -159,14 +159,14 @@ BEGIN;
 SELECT test_chunk_log_append('chunks', '\x02') AS rolled_back_at;
  rolled_back_at 
 ----------------
-         261120
+         260864
 (1 row)
 
 ROLLBACK;
 SELECT test_chunk_log_end('chunks') AS end_after_rollback;
  end_after_rollback 
 --------------------
-             522240
+             521728
 (1 row)
 
 -- and none in a read-only transaction
