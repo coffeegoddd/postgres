@@ -1124,8 +1124,18 @@ CatalogBranchCheckDependencies(const ObjectAddress *depender,
 			continue;
 		}
 		if (depender_branch < 0)
+		{
 			depender_branch = BranchMap->object_branch(depender->classId,
 													   depender->objectId);
+
+			/*
+			 * DDL on a branch's objects holds the branch while its
+			 * transaction runs, so that a copy of the branch's catalog rows
+			 * doesn't run meanwhile (LockBranchCatalogs())
+			 */
+			if (depender_branch == branch)
+				LockBranchCatalogs(branch, AccessShareLock);
+		}
 		if (depender_branch == branch)
 			continue;
 		if (depender_branch == 0)

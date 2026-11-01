@@ -1,0 +1,14 @@
+Parsed test spec with 2 sessions
+
+starting permutation: d_begin d_make c_copy d_commit c_check
+step d_begin: BEGIN;
+step d_make: CREATE TABLE app.t2 (id int PRIMARY KEY, t int REFERENCES app.t);
+step c_copy: SELECT FROM pg_branch_catalog_copy((SELECT b FROM branch_ids WHERE n = 1), (SELECT b FROM branch_ids WHERE n = 2)); <waiting ...>
+step d_commit: COMMIT;
+step c_copy: <... completed>
+step c_check: DO $$BEGIN PERFORM set_config('catalog_branch', (SELECT b::text FROM branch_ids WHERE n = 2), false); END$$; SELECT to_regclass('app.t2') IS NOT NULL AS t2_copied, (SELECT count(*) FROM pg_constraint WHERE conrelid = to_regclass('app.t2') AND contype = 'f') AS its_foreign_key;
+t2_copied|its_foreign_key
+---------+---------------
+t        |              1
+(1 row)
+
