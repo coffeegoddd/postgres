@@ -24,7 +24,6 @@
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/rel.h"
-#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
 void
@@ -211,6 +210,23 @@ hash_text(const uint8 *hash)
 static bool put_hashed(Relation log, Relation idx, const uint8 *hash,
 					   const void *data, uint32 len);
 
+/* An entry's place: its bytes reserved in the run prepared (does not fail). */
+typedef struct PlaceArg
+{
+	Relation	log;
+	ChunkLogRun *run;
+} PlaceArg;
+
+static void
+reserve_place(void *arg, ChunkIndexEntry *entry)
+{
+	PlaceArg   *place = arg;
+
+	entry->loc = entry->len > 0 ?
+		ChunkLog->reserve(place->log, place->run, entry->len) : 0;
+	entry->log_gen = place->run->generation;
+}
+
 bool
 ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 			  const void *data, uint32 len)
@@ -236,6 +252,8 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 {
 	ChunkIndexEntry e;
 	RefList		refs = {0};
+	ChunkLogRun run;
+	PlaceArg	place;
 
 	/*
 	 * (a transaction id first, so that the commit of a put that finds the
@@ -265,21 +283,27 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
 
+	/*
+	 * The entry first, its bytes' place reserved as it is put, the bytes
+	 * written after: every wait and failure is before the place is taken,
+	 * and bytes reserved are the entry's, which (aborted) counts them dead
+	 */
 	memset(&e, 0, sizeof(e));
 	memcpy(e.hash, hash, CHUNK_HASH_LEN);
 	e.len = len;
-	e.loc = ChunkLog->append(log, data, len);
+	ChunkLog->prepare(log, len, &run);
+	place.log = log;
+	place.run = &run;
+	if (!ChunkIndex->insert(idx, &e, reserve_place, &place))
 	{
-		uint64		appended = e.loc;
-
-		if (!ChunkIndex->insert(idx, &e, NULL))
-		{
-			/* (another put it meanwhile: the bytes appended are no chunk's) */
-			if (len > 0)
-				ChunkLog->mark_dead(log, appended, len);
-			return false;
-		}
+		/* (another put it meanwhile: nothing reserved) */
+		ChunkLog->release(log, &run);
+		return false;
 	}
+	INJECTION_POINT("chunk-put-entered", NULL);
+	if (len > 0)
+		ChunkLog->write(log, e.loc, data, len);
+	ChunkLog->release(log, &run);
 
 	/*
 	 * each edge a reference of the chunk it names, in this transaction: an
@@ -315,20 +339,6 @@ typedef struct PackChunk
 	int			at;				/* its place in the pack */
 } PackChunk;
 
-/*
- * Bytes counted dead, uninterrupted: a cancel part way would leave some
- * counted and the rest never, or have them counted again
- */
-static void
-mark_dead_now(Relation log, uint64 loc, uint32 len)
-{
-	if (len == 0)
-		return;
-	HOLD_INTERRUPTS();
-	ChunkLog->mark_dead(log, loc, len);
-	RESUME_INTERRUPTS();
-}
-
 uint64
 ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 				  const void *const *datas, const uint32 *lens)
@@ -339,7 +349,6 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	RefList    *refs = palloc0(Max(n, 1) * sizeof(RefList));
 	uint64	   *locs = palloc(Max(n, 1) * sizeof(uint64));
 	Size		total = 0;
-	uint64		base = 0;
 	uint64		stored = 0;
 	ChunkIndexEntry e;
 
@@ -397,100 +406,63 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 
 	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
 
-	/* the new chunks' bytes appended together, in the pack's order */
-	for (int i = 0; i < n; i++)
-		if (fresh[i])
-			total += lens[i];
-	if (total > 0)
-	{
-		char	   *bytes = palloc_extended(total, MCXT_ALLOC_HUGE);
-		Size		off = 0;
-
-		for (int i = 0; i < n; i++)
-			if (fresh[i])
-			{
-				memcpy(bytes + off, datas[i], lens[i]);
-				locs[i] = off;
-				off += lens[i];
-			}
-		base = ChunkLog->append(log, bytes, total);
-		pfree(bytes);
-	}
-
 	/*
-	 * Their entries, in their names' order, so that packs naming chunks in
-	 * other orders wait for each other's puts in one order (no deadlock), in
-	 * a subtransaction: should one fail (a wait for another's put cancelled,
-	 * a deadlock's victim), the bytes of those not yet named are counted
-	 * dead, as no entry would ever name them, and the entries made are
-	 * rolled back (VACUUM takes them out, and their bytes, as any aborted).
+	 * Their entries, room prepared for all their bytes, each one's place
+	 * reserved as it is put, in their names' order (packs naming chunks in
+	 * other orders wait for each other's puts in one order: no deadlock);
+	 * then their bytes, written where reserved.  Every wait and failure is
+	 * before a place is taken, and bytes reserved are their entry's, which
+	 * (aborted) counts them dead: a chunk another put first reserves none.
 	 */
 	{
 		PackOrder  *order = palloc(Max(n, 1) * sizeof(PackOrder));
-		bool	   *named = palloc0(Max(n, 1) * sizeof(bool));
 		int			nfresh = 0;
-		MemoryContext cxt = CurrentMemoryContext;
-		ResourceOwner owner = CurrentResourceOwner;
+		ChunkLogRun run;
+		PlaceArg	place;
 
 		for (int i = 0; i < n; i++)
 			if (fresh[i])
 			{
+				total += lens[i];
 				order[nfresh].hash = hashes + i * CHUNK_HASH_LEN;
 				order[nfresh].at = i;
 				nfresh++;
 			}
 		qsort(order, nfresh, sizeof(PackOrder), pack_order_cmp);
-
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(cxt);
-		PG_TRY();
+		ChunkLog->prepare(log, total, &run);
+		place.log = log;
+		place.run = &run;
+		for (int k = 0; k < nfresh; k++)
 		{
-			for (int k = 0; k < nfresh; k++)
+			int			i = order[k].at;
+
+			CHECK_FOR_INTERRUPTS();
+			memset(&e, 0, sizeof(e));
+			memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+			e.len = lens[i];
+			if (!ChunkIndex->insert(idx, &e, reserve_place, &place))
+				fresh[i] = false;	/* (another put it meanwhile) */
+			else
 			{
-				int			i = order[k].at;
-
-				CHECK_FOR_INTERRUPTS();
-				memset(&e, 0, sizeof(e));
-				memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
-				e.len = lens[i];
-				e.loc = lens[i] > 0 ? base + locs[i] : 0;
-				/*
-				 * (named as soon as an entry names its bytes, or they are
-				 * counted dead: never both, nor twice)
-				 */
-				if (!ChunkIndex->insert(idx, &e, &named[i]))
-				{
-					/* (another put it meanwhile: the bytes appended are no chunk's) */
-					named[i] = true;
-					fresh[i] = false;
-					mark_dead_now(log, base + locs[i], lens[i]);
-				}
-				else
-					stored++;
-				INJECTION_POINT("chunk-pack-entry", NULL);
+				locs[i] = e.loc;
+				stored++;
 			}
-			ReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(cxt);
-			CurrentResourceOwner = owner;
+			INJECTION_POINT("chunk-pack-entry", NULL);
 		}
-		PG_CATCH();
-		{
-			ErrorData  *edata;
 
-			MemoryContextSwitchTo(cxt);
-			edata = CopyErrorData();
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(cxt);
-			CurrentResourceOwner = owner;
-			for (int i = 0; i < n; i++)
-				if (fresh[i] && !named[i])
-					mark_dead_now(log, base + locs[i], lens[i]);
-			ReThrowError(edata);
+		INJECTION_POINT("chunk-put-entered", NULL);
+
+		/* (in their places' order: each page written once, in order) */
+		for (int k = 0; k < nfresh; k++)
+		{
+			int			i = order[k].at;
+
+			CHECK_FOR_INTERRUPTS();
+			if (fresh[i] && lens[i] > 0)
+				ChunkLog->write(log, locs[i], datas[i], lens[i]);
 		}
-		PG_END_TRY();
+		ChunkLog->release(log, &run);
 		pfree(order);
-		pfree(named);
 	}
 
 	/* then each edge a reference of the chunk it names */

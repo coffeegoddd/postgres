@@ -1,9 +1,10 @@
 # A pack put while another transaction is putting one of its chunks: the
 # pack's put waits for that transaction to end, as a put of the chunk does,
-# then has it there (committed: the bytes the pack appended for it are
-# dead, its other chunks put) or puts it (aborted).  A chunk of the pack
-# referencing it counts its reference either way.  A pack's put cancelled
-# while it waits leaves the bytes of the chunks it hadn't named dead.
+# then has it there (committed: the pack reserved and wrote no bytes for
+# it, none dead; its other chunks put) or puts it (aborted).  A chunk of
+# the pack referencing it counts its reference either way.  A pack's put
+# cancelled while it waits wrote none of its bytes: those reserved for the
+# chunks it had put, their entries aborted, VACUUM counts dead.
 
 setup
 {
@@ -47,6 +48,9 @@ step b_dead		{
 	SELECT l.dead - d.dead AS more_dead FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
 }
 step b_vacuum	{ VACUUM pg_history.chunk_index; }
+# (a chunk after the pack's, keeping the log's tail, which VACUUM would cut)
+step b_live		{ SELECT stored FROM test_cs_put('pages', '\x0a0109'); }
+step b_free_live	{ SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0109')]) AS freed; }
 step b_free		{
 	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0101'), pack_h('\x0a0102')]) AS freed;
 }
@@ -78,8 +82,8 @@ permutation b_start b_mark a_begin a_put b_pack a_rollback b_has b_free
 # whether that one is the other's put or the pack's
 permutation b_start b_mark a_begin a_put_leaf b_parent a_commit b_leaf b_free_parent
 permutation b_start b_mark a_begin a_put_leaf b_parent a_rollback b_leaf b_free_parent
-# cancelled while it waits (for the first of its chunks by name, '\x0a0102'
-# put before it): the bytes of the one it waited for, never named, dead at
-# once (the other's, named and rolled back, dead once VACUUM has its entry
-# out); neither there
-permutation b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_vacuum b_has
+# cancelled while it waits (for the second of its chunks by name, the first,
+# '\x0a0102', put): nothing written, nothing dead; once VACUUM has the
+# entries out, the bytes reserved for the one it put (3) dead, and those
+# the other's put, rolled back, wrote (3); neither there
+permutation b_start b_mark a_begin a_put b_pack c_cancel b_dead a_rollback b_live b_vacuum b_dead b_has b_free_live

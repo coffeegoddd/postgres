@@ -28,7 +28,7 @@ step b_put		{ SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '
 step b_dead		{ SELECT dead FROM test_chunk_log_space('cl'); }
 
 # another's chunk is not found until it commits; a put of it waits, then
-# finds it, and the bytes it appended are dead
+# finds it, having reserved and written no bytes for it (none dead)
 permutation a_begin a_put b_has b_put a_commit b_has b_dead
 # or, if it aborts, puts it
 permutation a_begin a_put b_put a_rollback b_has

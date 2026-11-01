@@ -1,6 +1,6 @@
 Parsed test spec with 1 sessions
 
-starting permutation: e_start e_mark e_attach e_pack e_detach e_live e_vacuum e_dead e_none e_free
+starting permutation: e_start e_mark e_attach e_pack e_detach e_live e_vacuum e_dead e_same e_vacuum e_again e_none e_free
 injection_points_set_local
 --------------------------
                           
@@ -38,12 +38,27 @@ t
 
 step e_vacuum: VACUUM pg_history.chunk_index;
 step e_dead: 
-	SELECT l.dead - d.dead AS more_dead, 3000 * 5 AS pack_bytes
-	FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
+	SELECT more_dead > 0 AND more_dead < 3000 * 5 AND more_dead % 5 = 0 AS reserved_ones_dead
+	FROM (SELECT l.dead - d.dead AS more_dead
+		  FROM test_chunk_log_space('pg_history.chunks') l, dead0 d) x;
 
-more_dead|pack_bytes
----------+----------
-    15000|     15000
+reserved_ones_dead
+------------------
+t                 
+(1 row)
+
+e: NOTICE:  table "dead1" does not exist, skipping
+step e_same: 
+	DROP TABLE IF EXISTS dead1;
+	CREATE TEMP TABLE dead1 AS SELECT dead FROM test_chunk_log_space('pg_history.chunks');
+
+step e_vacuum: VACUUM pg_history.chunk_index;
+step e_again: 
+	SELECT l.dead = d.dead AS counted_once FROM test_chunk_log_space('pg_history.chunks') l, dead1 d;
+
+counted_once
+------------
+t           
 (1 row)
 
 step e_none: 

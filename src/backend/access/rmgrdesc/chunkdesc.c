@@ -24,20 +24,30 @@ chunk_log_desc(StringInfo buf, XLogReaderState *record)
 	switch (info)
 	{
 		case XLOG_CHUNK_LOG_NEXT_BLOCK:
-			appendStringInfo(buf, "next_block: %u",
-							 ((xl_chunk_log_next_block *) rec)->next_block);
+			appendStringInfo(buf, "next_block: %u, generation: %u, cut_from: %u",
+							 ((xl_chunk_log_next_block *) rec)->next_block,
+							 ((xl_chunk_log_next_block *) rec)->generation,
+							 ((xl_chunk_log_next_block *) rec)->cut_from);
 			break;
 		case XLOG_CHUNK_LOG_INIT_PAGE:
 			appendStringInfoString(buf, ((xl_chunk_log_init_page *) rec)->all_dead ?
 								   "all dead" : "empty");
 			break;
+		case XLOG_CHUNK_LOG_SEAL_PAGE:
+			appendStringInfo(buf, "off: %u%s", ((xl_chunk_log_seal *) rec)->off,
+							 ((xl_chunk_log_seal *) rec)->init ? ", init" : "");
+			break;
 		case XLOG_CHUNK_LOG_APPEND:
-			appendStringInfo(buf, "off: %u, len: %u",
+			appendStringInfo(buf, "off: %u, len: %u%s",
 							 ((xl_chunk_log_append *) rec)->off,
-							 ((xl_chunk_log_append *) rec)->len);
+							 ((xl_chunk_log_append *) rec)->len,
+							 ((xl_chunk_log_append *) rec)->init ? ", init" : "");
 			break;
 		case XLOG_CHUNK_LOG_MARK_DEAD:
-			appendStringInfo(buf, "len: %u", ((xl_chunk_log_mark_dead *) rec)->len);
+			appendStringInfo(buf, "off: %u, len: %u%s",
+							 ((xl_chunk_log_mark_dead *) rec)->off,
+							 ((xl_chunk_log_mark_dead *) rec)->len,
+							 ((xl_chunk_log_mark_dead *) rec)->init ? ", init" : "");
 			break;
 	}
 }
