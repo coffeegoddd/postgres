@@ -59,13 +59,22 @@ $primary->backup('full');
 my $full = $primary->backup_dir . '/full';
 command_ok([ 'pg_verifybackup', $full ], 'pg_verifybackup accepts a full backup of the store');
 
-# B: more chunks; some freed (bytes dead, pages freed, maybe the tail cut);
-# the pointer moved; the incremental backup; a restore point
+# B: more chunks; some freed (bytes dead, pages freed); the log's last
+# chunk (one longer than a region, in pages of its own at the end) freed,
+# and the tail cut off, then the log grown again; the pointer moved; the
+# incremental backup
+my $log_size = q{SELECT pg_relation_size('pg_history.chunks')};
 $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(2001, 4000) i;
 	SELECT sum(free(i)) FROM generate_series(2, 2000) i WHERE i % 7 = 0;
-	VACUUM pg_history.chunk_index;
-	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(4001, 4200) i;
+	SELECT put(4500);
+	SELECT free(4500);
+});
+my $before_cut = $primary->safe_psql('postgres', $log_size);
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+cmp_ok($primary->safe_psql('postgres', $log_size), '<', $before_cut, 'the log\'s tail cut off');
+$primary->safe_psql('postgres', q{
+	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(4201, 4400) i;
 	UPDATE pg_history.pointers SET hash = h(2001);
 });
 $primary->command_ok(
@@ -76,18 +85,33 @@ $primary->command_ok(
 		'--incremental' => "$full/backup_manifest"
 	],
 	'an incremental backup of the store');
+my $incr = $primary->backup_dir . '/incr';
+for my $rel ('pg_history.chunks')
+{
+	my $path = $primary->safe_psql('postgres', "SELECT pg_relation_filepath('$rel')");
+	$path =~ s{([^/]+)$}{INCREMENTAL.$1};
+	ok(-f "$incr/$path", "the incremental backup has ${rel}'s changed blocks alone");
+}
 my $combined = $primary->backup_dir . '/combined';
 command_ok([ 'pg_combinebackup', '--no-sync', '--output' => $combined, $full,
 	$primary->backup_dir . '/incr' ], 'combined with the full one');
-command_ok([ 'pg_verifybackup', '--no-parse-wal', $combined ],
-	'pg_verifybackup accepts the combined backup');
+command_ok([ 'pg_verifybackup', $combined ], 'pg_verifybackup accepts the combined backup');
+
+# more after the incremental backup, for both recoveries to replay: puts,
+# frees and VACUUM, the pointer moved; then the restore point
+$primary->safe_psql('postgres', q{
+	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(4401, 4600) i;
+	SELECT sum(free(i)) FROM generate_series(2002, 2100) i;
+	VACUUM pg_history.chunk_index;
+	UPDATE pg_history.pointers SET hash = h(4401);
+});
 my $state_b = $primary->safe_psql('postgres', $state);
 $primary->safe_psql('postgres', "SELECT pg_create_restore_point('after_b')");
 
 # C: past the restore point; its WAL archived
 $primary->safe_psql('postgres', q{
-	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(4201, 5000) i;
-	UPDATE pg_history.pointers SET hash = h(4201);
+	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(4601, 5000) i;
+	UPDATE pg_history.pointers SET hash = h(4601);
 });
 my $lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 $primary->safe_psql('postgres', 'SELECT txid_current(); SELECT pg_switch_wal()');
@@ -115,19 +139,22 @@ archive_mode = off
 		"recovered to the restore point from the $backup backup, the store as it was there");
 	is($node->safe_psql('postgres', $audit), 't', 'its audit clean');
 	$node->stop;
+	command_ok([ 'pg_checksums', '--check', '--pgdata' => $node->data_dir ],
+		'pg_checksums accepts its pages');
 }
 
 # a crash after a checkpoint replays from it; then pg_checksums
 $primary->safe_psql('postgres', q{
 	CHECKPOINT;
 	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(5001, 5500) i;
-	SELECT sum(free(i)) FROM generate_series(4001, 4200) i;
+	SELECT sum(free(i)) FROM generate_series(4201, 4400) i;
 	VACUUM pg_history.chunk_index;
 });
 my $want = $primary->safe_psql('postgres', $state);
 $primary->stop('immediate');
 $primary->start;
 is($primary->safe_psql('postgres', $state), $want, 'a crash after a checkpoint loses nothing');
+is($primary->safe_psql('postgres', $audit), 't', 'its audit clean');
 $primary->stop;
 command_ok([ 'pg_checksums', '--check', '--pgdata' => $primary->data_dir ],
 	'pg_checksums accepts the store\'s pages');
@@ -137,17 +164,22 @@ $primary->start;
 $primary->backup('for_standby');
 my $standby = PostgreSQL::Test::Cluster->new('backups_standby');
 $standby->init_from_backup($primary, 'for_standby', has_streaming => 1);
+$standby->append_conf('postgresql.conf', 'archive_mode = off');
 $standby->start;
 $primary->wait_for_replay_catchup($standby);
 $standby->promote;
 $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(6001, 6300) i;
 	SELECT sum(free(i)) FROM generate_series(5001, 5100) i;
-	VACUUM pg_history.chunk_index;
+	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(6301, 6500) i;
+	SELECT sum(free(i)) FROM generate_series(6301, 6500) i;
 	UPDATE pg_history.pointers SET hash = h(6001);
 	INSERT INTO pg_history.pointers VALUES ('old_only', h(6002));
-	CHECKPOINT;
 });
+$before_cut = $primary->safe_psql('postgres', $log_size);
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index; CHECKPOINT');
+cmp_ok($primary->safe_psql('postgres', $log_size), '<', $before_cut,
+	'the old primary cut its log\'s tail off, diverging');
 $standby->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE put(i)) FROM generate_series(7001, 7300) i;
 	UPDATE pg_history.pointers SET hash = h(7001);
@@ -173,7 +205,11 @@ $primary->start;
 $standby->wait_for_replay_catchup($primary);
 is($primary->safe_psql('postgres', $state), $new_state,
 	'rewound and following the new primary, the old primary has its store, its own writes gone');
-
+$standby->safe_psql('postgres', 'CHECKPOINT');
+$standby->wait_for_replay_catchup($primary);
 $primary->stop;
+command_ok([ 'pg_checksums', '--check', '--pgdata' => $primary->data_dir ],
+	'pg_checksums accepts the rewound primary\'s pages');
+
 $standby->stop;
 done_testing();
