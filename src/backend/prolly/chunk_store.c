@@ -272,7 +272,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	{
 		uint64		appended = e.loc;
 
-		if (!ChunkIndex->insert(idx, &e))
+		if (!ChunkIndex->insert(idx, &e, NULL))
 		{
 			/* (another put it meanwhile: the bytes appended are no chunk's) */
 			if (len > 0)
@@ -314,6 +314,20 @@ typedef struct PackChunk
 	uint8		hash[CHUNK_HASH_LEN];	/* the key */
 	int			at;				/* its place in the pack */
 } PackChunk;
+
+/*
+ * Bytes counted dead, uninterrupted: a cancel part way would leave some
+ * counted and the rest never, or have them counted again
+ */
+static void
+mark_dead_now(Relation log, uint64 loc, uint32 len)
+{
+	if (len == 0)
+		return;
+	HOLD_INTERRUPTS();
+	ChunkLog->mark_dead(log, loc, len);
+	RESUME_INTERRUPTS();
+}
 
 uint64
 ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
@@ -440,16 +454,19 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 				memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
 				e.len = lens[i];
 				e.loc = lens[i] > 0 ? base + locs[i] : 0;
-				if (!ChunkIndex->insert(idx, &e))
+				/*
+				 * (named as soon as an entry names its bytes, or they are
+				 * counted dead: never both, nor twice)
+				 */
+				if (!ChunkIndex->insert(idx, &e, &named[i]))
 				{
 					/* (another put it meanwhile: the bytes appended are no chunk's) */
-					if (lens[i] > 0)
-						ChunkLog->mark_dead(log, base + locs[i], lens[i]);
+					named[i] = true;
 					fresh[i] = false;
+					mark_dead_now(log, base + locs[i], lens[i]);
 				}
 				else
 					stored++;
-				named[i] = true;
 				INJECTION_POINT("chunk-pack-entry", NULL);
 			}
 			ReleaseCurrentSubTransaction();
@@ -467,8 +484,8 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
 			for (int i = 0; i < n; i++)
-				if (fresh[i] && !named[i] && lens[i] > 0)
-					ChunkLog->mark_dead(log, base + locs[i], lens[i]);
+				if (fresh[i] && !named[i])
+					mark_dead_now(log, base + locs[i], lens[i]);
 			ReThrowError(edata);
 		}
 		PG_END_TRY();

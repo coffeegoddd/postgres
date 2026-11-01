@@ -97,9 +97,11 @@ typedef struct ChunkIndexRoutine
 
 	/*
 	 * Inserts entry, its counts as given, unless one for its hash is there:
-	 * then answers false, and that one in *entry.
+	 * then answers false, and that one in *entry.  *added (if given) is set
+	 * true as soon as the entry is on its page, before anything after (a
+	 * bucket's split) that may fail.
 	 */
-	bool		(*insert) (Relation idx, ChunkIndexEntry *entry);
+	bool		(*insert) (Relation idx, ChunkIndexEntry *entry, bool *added);
 
 	/*
 	 * Adds drefs and droots to hash's counts, in this transaction (they are

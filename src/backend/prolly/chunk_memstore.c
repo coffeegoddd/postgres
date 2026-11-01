@@ -282,7 +282,7 @@ mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 		c->len = lens[i];
 		c->refs = 0;
 		c->roots = 0;
-			stored++;
+		stored++;
 	}
 	for (int i = 0; i < n; i++)
 	{
