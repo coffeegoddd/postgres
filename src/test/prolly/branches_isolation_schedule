@@ -1,3 +1,4 @@
 # Isolation tests of branched catalogs: sessions on branches at once.
 test: branch_extension_races
 test: branch_drop_races
+test: branch_copy_races

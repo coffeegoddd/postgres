@@ -63,6 +63,8 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_default_acl.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -127,7 +129,10 @@ typedef struct CopyState
 	int			nobjs;
 	int			cap;
 	List	   *made;			/* (Oid catalog, HeapTuple) of each row made */
+	CopyKey		current;		/* the object whose rows are being copied */
 } CopyState;
+
+static void refuse(Oid classid, Oid oid);
 
 typedef struct MadeRow
 {
@@ -259,8 +264,21 @@ check_copyable(Oid classid, Oid oid)
 					 c->relkind != RELKIND_TOASTVALUE) ||
 					c->relispartition || c->relhassubclass ||
 					c->relpersistence != RELPERSISTENCE_PERMANENT ||
-					OidIsValid(c->reloftype))
+					OidIsValid(c->reloftype) ||
+					/* (storage made as heap's is: only heap's tables) */
+					((c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW) &&
+					 c->relam != HEAP_TABLE_AM_OID))
 					refuse(classid, oid);
+				/* (a rebuild on the copy would make an invalid index valid) */
+				if (c->relkind == RELKIND_INDEX)
+				{
+					HeapTuple	itup = fetch_row(IndexRelationId, IndexRelidIndexId,
+												 Anum_pg_index_indexrelid, oid);
+
+					if (!((Form_pg_index) GETSTRUCT(itup))->indisvalid)
+						refuse(classid, oid);
+					heap_freetuple(itup);
+				}
 				heap_freetuple(tup);
 				return;
 			}
@@ -303,6 +321,7 @@ check_copyable(Oid classid, Oid oid)
 				return;
 			}
 		case AttrDefaultRelationId:
+		case DefaultAclRelationId:
 			return;
 		case TriggerRelationId:
 			{
@@ -389,8 +408,16 @@ collect(CopyState *cs)
 		CopyKey		obj = cs->objs[i];
 		ScanKeyData key[2];
 
+		/*
+		 * (no index made, no ANALYZE, nor a sequence's value moved, while
+		 * it's copied; DML may run, the copy's storage being its own)
+		 */
 		if (obj.classid == RelationRelationId)
-			LockRelationOid(obj.oid, AccessShareLock);
+		{
+			LockRelationOid(obj.oid, ShareUpdateExclusiveLock);
+			if (get_rel_relkind(obj.oid) == RELKIND_SEQUENCE)
+				LockRelationOid(obj.oid, ShareLock);
+		}
 		ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
 					F_OIDEQ, ObjectIdGetDatum(obj.classid));
 		ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
@@ -409,6 +436,64 @@ collect(CopyState *cs)
 		systable_endscan(scan);
 	}
 	table_close(rel, AccessShareLock);
+}
+
+/*
+ * A value of a composite, enum or range type names its type's object ids
+ * in the table data that holds it (an enum's value is its label's id, a
+ * composite's and an array's header its type's), which the copy and its
+ * source would share: a copied table may not store a value of a copied
+ * one, directly, in an array or through a domain.
+ */
+static bool
+type_stored_names_copy(CopyState *cs, Oid typid)
+{
+	for (;;)
+	{
+		Oid			elem = get_element_type(typid);
+
+		if (OidIsValid(elem))
+			typid = elem;
+		else if (get_typtype(typid) == TYPTYPE_DOMAIN)
+			typid = getBaseType(typid);
+		else
+			break;
+	}
+	return in_copy(cs, TypeRelationId, typid) &&
+		(get_typtype(typid) == TYPTYPE_COMPOSITE ||
+		 get_typtype(typid) == TYPTYPE_ENUM ||
+		 get_typtype(typid) == TYPTYPE_RANGE ||
+		 get_typtype(typid) == TYPTYPE_MULTIRANGE);
+}
+
+static void
+check_stored_types(CopyState *cs)
+{
+	for (int i = 0; i < cs->nobjs; i++)
+	{
+		CopyKey		obj = cs->objs[i];
+		Relation	rel;
+
+		if (obj.classid != RelationRelationId ||
+			!RELKIND_HAS_STORAGE(get_rel_relkind(obj.oid)) ||
+			get_rel_relkind(obj.oid) == RELKIND_INDEX)
+			continue;
+		rel = relation_open(obj.oid, NoLock);
+		for (int a = 0; a < RelationGetDescr(rel)->natts; a++)
+		{
+			Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), a);
+
+			if (!att->attisdropped && type_stored_names_copy(cs, att->atttypid))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot copy table %s to another branch: column \"%s\" holds values of the branch's own type %s",
+								get_rel_name(obj.oid), NameStr(att->attname),
+								format_type_be(att->atttypid)),
+						 errdetail("The table's data, which the branches share, names the type's object ids."),
+						 errhint("Make the type in a shared schema.")));
+		}
+		relation_close(rel, NoLock);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -471,6 +556,12 @@ assign_oids(CopyState *cs)
 											   Anum_pg_trigger_oid);
 				table_close(rel, RowExclusiveLock);
 				break;
+			case DefaultAclRelationId:
+				rel = table_open(DefaultAclRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, DefaultAclOidIndexId,
+											   Anum_pg_default_acl_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
 			default:
 				refuse(obj.classid, obj.oid);
 		}
@@ -509,9 +600,36 @@ map_const(CopyState *cs, Const *c)
 {
 	Oid			classid;
 
-	c->consttype = map_type(cs, c->consttype);
+	/*
+	 * A value of a copied type, or an array of one (a composite's, an
+	 * array's header names its type), would name the source's type: refused
+	 */
+	if (copy_map(cs, TypeRelationId, c->consttype) != c->consttype ||
+		(OidIsValid(get_element_type(c->consttype)) &&
+		 copy_map(cs, TypeRelationId, get_element_type(c->consttype)) !=
+		 get_element_type(c->consttype)))
+		refuse(cs->current.classid, cs->current.oid);
 	if (c->constisnull)
 		return;
+	/* (an array of object ids can't be rewritten in place: none may be copied) */
+	if (c->consttype == OIDARRAYOID || c->consttype == REGCLASSARRAYOID ||
+		c->consttype == REGTYPEARRAYOID || c->consttype == REGPROCARRAYOID ||
+		c->consttype == REGPROCEDUREARRAYOID)
+	{
+		Datum	   *elems;
+		int			n;
+
+		deconstruct_array_builtin(DatumGetArrayTypeP(c->constvalue),
+								  get_element_type(c->consttype), &elems, NULL, &n);
+		for (int i = 0; i < n; i++)
+		{
+			Oid			oid = DatumGetObjectId(elems[i]);
+
+			if (hash_search(cs->sources, &oid, HASH_FIND, NULL) != NULL)
+				refuse(cs->current.classid, cs->current.oid);
+		}
+		return;
+	}
 	switch (c->consttype)
 	{
 		case REGCLASSOID:
@@ -536,6 +654,16 @@ map_const(CopyState *cs, Const *c)
 	}
 	c->constvalue = ObjectIdGetDatum(copy_map(cs, classid,
 											  DatumGetObjectId(c->constvalue)));
+}
+
+static List *
+map_oid_list(CopyState *cs, Oid classid, List *oids)
+{
+	List	   *mapped = NIL;
+
+	foreach_oid(oid, oids)
+		mapped = lappend_oid(mapped, copy_map(cs, classid, oid));
+	return mapped;
 }
 
 /*
@@ -651,11 +779,38 @@ remap_mutator(Node *node, CopyState *cs)
 				s->refrestype = map_type(cs, s->refrestype);
 				break;
 			}
+		case T_NamedArgExpr:
+		case T_JsonIsPredicate:
+			break;
+		case T_RowCompareExpr:
+			((RowCompareExpr *) node)->opnos =
+				map_oid_list(cs, OperatorRelationId, ((RowCompareExpr *) node)->opnos);
+			break;
+		case T_FieldStore:
+			((FieldStore *) node)->resulttype = map_type(cs, ((FieldStore *) node)->resulttype);
+			break;
+		case T_ConvertRowtypeExpr:
+			((ConvertRowtypeExpr *) node)->resulttype =
+				map_type(cs, ((ConvertRowtypeExpr *) node)->resulttype);
+			break;
+		case T_CoerceToDomain:
+			((CoerceToDomain *) node)->resulttype = map_type(cs, ((CoerceToDomain *) node)->resulttype);
+			break;
+		case T_CoerceToDomainValue:
+			((CoerceToDomainValue *) node)->typeId = map_type(cs, ((CoerceToDomainValue *) node)->typeId);
+			break;
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot copy an expression with a node of type %d to another branch yet",
-							(int) nodeTag(node))));
+			{
+				ObjectAddress addr;
+
+				ObjectAddressSet(addr, cs->current.classid, cs->current.oid);
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot copy %s to another branch yet",
+								getObjectDescription(&addr, false)),
+						 errdetail("Its expression has a node of type %d, which the copy doesn't rewrite yet.",
+								   (int) nodeTag(node))));
+			}
 	}
 	return node;
 }
@@ -859,6 +1014,13 @@ fix_trigger(CopyState *cs, Datum *values, bool *nulls)
 }
 
 static void
+fix_default_acl(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_default_acl_oid, DefaultAclRelationId);
+	MAP(Anum_pg_default_acl_defaclnamespace, NamespaceRelationId);
+}
+
+static void
 fix_attrdef(CopyState *cs, Datum *values, bool *nulls)
 {
 	MAP(Anum_pg_attrdef_oid, AttrDefaultRelationId);
@@ -952,6 +1114,8 @@ copy_all_rows(CopyState *cs)
 		CopyKey		obj = cs->objs[i];
 		ScanKeyData key[3];
 
+		cs->current = obj;
+
 		switch (obj.classid)
 		{
 			case NamespaceRelationId:
@@ -985,12 +1149,22 @@ copy_all_rows(CopyState *cs)
 				copy_rows_of(cs, AttrDefaultRelationId, AttrDefaultOidIndexId,
 							 Anum_pg_attrdef_oid, obj.oid, fix_attrdef);
 				break;
+			case DefaultAclRelationId:
+				copy_rows_of(cs, DefaultAclRelationId, DefaultAclOidIndexId,
+							 Anum_pg_default_acl_oid, obj.oid, fix_default_acl);
+				break;
 			case TriggerRelationId:
 				{
 					HeapTuple	tup = fetch_row(TriggerRelationId, TriggerOidIndexId,
 												Anum_pg_trigger_oid, obj.oid);
 					Oid			tgrelid = ((Form_pg_trigger) GETSTRUCT(tup))->tgrelid;
 
+					/*
+					 * (a shared referenced table: locked as ADD FOREIGN KEY
+					 * locks it, so that no change of it misses the trigger)
+					 */
+					if (!in_copy(cs, RelationRelationId, tgrelid))
+						LockRelationOid(tgrelid, ShareRowExclusiveLock);
 					copy_rows_of(cs, TriggerRelationId, TriggerOidIndexId,
 								 Anum_pg_trigger_oid, obj.oid, fix_trigger);
 
@@ -1094,16 +1268,32 @@ static void
 check_tree(CopyState *cs, Oid catid, const char *text, const char *column)
 {
 	CheckConsts cc = {cs, catid, column};
+	const char *field = "";
+	int			fieldlen = 0;
 
 	(void) check_consts_walker(stringToNode(text), &cc);
+
 	for (const char *p = text; *p;)
 	{
-		if (isdigit((unsigned char) *p) && (p == text || !isalnum((unsigned char) p[-1])))
+		if (*p == ':' && isalpha((unsigned char) p[1]))
+		{
+			/* a field's name: its numbers follow it */
+			field = ++p;
+			while (isalnum((unsigned char) *p) || *p == '_')
+				p++;
+			fieldlen = p - field;
+		}
+		else if (isdigit((unsigned char) *p) && (p == text || !isalnum((unsigned char) p[-1])))
 		{
 			char	   *end;
 			unsigned long v = strtoul(p, &end, 10);
+			bool		not_oid;
 
-			if (v <= PG_UINT32_MAX)
+			/* (a position in the statement's text, a typmod, a length) */
+			not_oid = (fieldlen == 8 && strncmp(field, "location", 8) == 0) ||
+				memmem(field, fieldlen, "typmod", 6) != NULL ||
+				(fieldlen >= 3 && strncmp(field + fieldlen - 3, "len", 3) == 0);
+			if (!not_oid && v <= PG_UINT32_MAX)
 				check_oid(cs, catid, (Oid) v, column);
 			p = end;
 		}
@@ -1162,6 +1352,11 @@ check_made(CopyState *cs)
 				case PG_NODE_TREEOID:
 					check_tree(cs, made->catid, TextDatumGetCString(values[i]), column);
 					break;
+				case ANYARRAYOID:
+					/* (statistics' values: an array's header names its type) */
+					check_oid(cs, made->catid,
+							  ARR_ELEMTYPE(DatumGetArrayTypeP(values[i])), column);
+					break;
 			}
 		}
 		table_close(rel, AccessShareLock);
@@ -1214,6 +1409,41 @@ make_storage(CopyState *cs)
 		ReindexParams params = {0};
 
 		(void) reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &params);
+	}
+	CommandCounterIncrement();
+
+	/*
+	 * A rebuild counted the empty tables' pages and rows: the copies keep
+	 * their sources' counts, as their statistics, so that their storage,
+	 * shared with the source's, is planned for as the source's is.
+	 */
+	{
+		Relation	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+		for (int i = 0; i < cs->nobjs; i++)
+		{
+			CopyKey		obj = cs->objs[i];
+			HeapTuple	src;
+			HeapTuple	dst;
+			Form_pg_class s;
+			Form_pg_class d;
+
+			if (obj.classid != RelationRelationId ||
+				!RELKIND_HAS_STORAGE(get_rel_relkind(obj.oid)))
+				continue;
+			src = fetch_row(RelationRelationId, ClassOidIndexId, Anum_pg_class_oid, obj.oid);
+			dst = fetch_row(RelationRelationId, ClassOidIndexId, Anum_pg_class_oid,
+							copy_map(cs, RelationRelationId, obj.oid));
+			s = (Form_pg_class) GETSTRUCT(src);
+			d = (Form_pg_class) GETSTRUCT(dst);
+			d->relpages = s->relpages;
+			d->reltuples = s->reltuples;
+			d->relallvisible = s->relallvisible;
+			CatalogTupleUpdate(pg_class, &dst->t_self, dst);
+			heap_freetuple(src);
+			heap_freetuple(dst);
+		}
+		table_close(pg_class, RowExclusiveLock);
 	}
 }
 
@@ -1274,6 +1504,7 @@ dependency_copy(int32 src, int32 dst)
 	}
 
 	collect(&cs);
+	check_stored_types(&cs);
 	assign_oids(&cs);
 	copy_all_rows(&cs);
 	check_made(&cs);

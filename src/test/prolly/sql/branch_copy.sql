@@ -6,9 +6,14 @@ SELECT pg_branch_id_allocate() AS b1 \gset
 SELECT pg_branch_id_allocate() AS b2 \gset
 SELECT pg_branch_id_allocate() AS b3 \gset
 SELECT pg_branch_id_allocate() AS b4 \gset
+SELECT pg_branch_id_allocate() AS b5 \gset
+SELECT pg_branch_id_allocate() AS b6 \gset
+SELECT pg_branch_id_allocate() AS b7 \gset
+SELECT pg_branch_id_allocate() AS b8 \gset
 CREATE SCHEMA pub;
 CREATE TABLE pub.p (id int PRIMARY KEY);
 INSERT INTO pub.p VALUES (1), (2);
+CREATE DOMAIN pub.posint AS int CHECK (VALUE > 0);
 
 SET catalog_branch = :b1;
 CREATE SCHEMA app VERSIONED;
@@ -16,7 +21,10 @@ CREATE TABLE app.t (id serial PRIMARY KEY, v text DEFAULT 'none' NOT NULL,
 					n int CHECK (n > 0), p int REFERENCES pub.p, big text);
 CREATE INDEX t_lower_v ON app.t (lower(v)) WHERE n > 1;
 CREATE TABLE app.c (id int PRIMARY KEY, t int REFERENCES app.t ON DELETE CASCADE);
+CREATE TABLE app.ident (id int GENERATED ALWAYS AS IDENTITY, x pub.posint DEFAULT 1,
+						big text, CHECK ((x, id) > (0, 0)));
 CREATE SEQUENCE app.s START 100;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
 COMMENT ON TABLE app.t IS 'the copied table';
 COMMENT ON COLUMN app.t.v IS 'a column';
 INSERT INTO app.t (v, n, p) SELECT 'v' || g, g, 1 FROM generate_series(1, 5) g;
@@ -55,16 +63,58 @@ INSERT INTO app.c VALUES (1, 6);
 INSERT INTO app.c VALUES (2, 1);
 -- a shared row b2's copy references can't go: its foreign key checks it
 DELETE FROM pub.p WHERE id = 2;
+-- an identity column from its own sequence, a shared domain's default, a
+-- toasted value in the copy's own TOAST table, named after the copy
+INSERT INTO app.ident (big) SELECT string_agg(md5(g::text), '') FROM generate_series(1, 300) g
+	RETURNING id, x, length(big);
+SELECT t.relname = 'pg_toast_' || 'app.ident'::regclass::oid AS toast_named_after_copy
+FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid WHERE c.oid = 'app.ident'::regclass;
+SELECT count(*) AS default_privileges FROM pg_default_acl WHERE defaclnamespace = 'app'::regnamespace;
+-- DDL on the copy afterwards
+ALTER TABLE app.ident ADD COLUMN extra int;
 DELETE FROM app.t;
 SELECT count(*) FROM app.c;
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT * FROM app.t WHERE lower(v) = 'x' AND n > 1;
 RESET enable_seqscan;
 
--- b1 is as it was
+-- b1 is as it was: its rows, its sequences, its foreign key, its triggers
 SET catalog_branch = :b1;
 SELECT count(*), sum(n) FROM app.t;
 SELECT nextval('app.s');
+SELECT last_value FROM app.t_id_seq;
+DELETE FROM pub.p WHERE id = 1;
+SELECT count(*) AS triggers_on_pub_p FROM pg_trigger WHERE tgrelid = 'pub.p'::regclass;
+
+-- a copy of a copy, from b2 to b5
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b2, :b5);
+SET catalog_branch = :b5;
+SELECT count(*) AS tables FROM pg_class WHERE relnamespace = 'app'::regnamespace AND relkind = 'r';
+SELECT nextval('app.s');
+
+-- a copy rolled back leaves nothing
+RESET catalog_branch;
+BEGIN;
+SELECT pg_branch_catalog_copy(:b1, :b6);
+ROLLBACK;
+SET catalog_branch_filter = off;
+SELECT count(*) AS b6_schemas FROM pg_namespace WHERE nspbranch = :b6;
+RESET catalog_branch_filter;
+
+-- every row made is checked: a constant naming a source object refuses the copy
+SET catalog_branch = :b7;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.k (r oid);
+SELECT format('ALTER TABLE app.k ADD CHECK (r <> %L::oid)', 'app.k'::regclass::oid) \gexec
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
+-- and a table holding values of the branch's own composite type
+SET catalog_branch = :b7;
+ALTER TABLE app.k DROP CONSTRAINT k_r_check;
+CREATE TABLE app.holder (k app.k);
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
 
 -- a branch with an object the copy doesn't know is refused, and nothing made
 SET catalog_branch = :b3;
@@ -79,5 +129,6 @@ SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b2));
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b1));
 
 SET client_min_messages = warning;
-SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3);
+SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3),
+	   pg_branch_catalog_drop(:b5), pg_branch_catalog_drop(:b7);
 DROP SCHEMA pub CASCADE;
