@@ -81,6 +81,7 @@ enum dbObjectTypePriorities
 	PRIO_SEQUENCE_SET,
 	PRIO_LARGE_OBJECT,
 	PRIO_LARGE_OBJECT_DATA,
+	PRIO_HISTORY_DATA,
 	PRIO_STATISTICS_DATA_DATA,
 	PRIO_POST_DATA_BOUNDARY,	/* boundary! */
 	PRIO_CONSTRAINT,
@@ -152,6 +153,7 @@ static const int dbObjectTypePriority[] =
 	[DO_REL_STATS] = PRIO_STATISTICS_DATA_DATA,
 	[DO_SUBSCRIPTION] = PRIO_SUBSCRIPTION,
 	[DO_SUBSCRIPTION_REL] = PRIO_SUBSCRIPTION_REL,
+	[DO_HISTORY_DATA] = PRIO_HISTORY_DATA,
 };
 
 StaticAssertDecl(lengthof(dbObjectTypePriority) == NUM_DUMPABLE_OBJECT_TYPES,
@@ -1713,6 +1715,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
 			snprintf(buf, bufsize,
 					 "LARGE OBJECT DATA  (ID %d)",
 					 obj->dumpId);
+			return;
+		case DO_HISTORY_DATA:
+			snprintf(buf, bufsize,
+					 "%s  (ID %d)",
+					 obj->name, obj->dumpId);
 			return;
 		case DO_POLICY:
 			snprintf(buf, bufsize,

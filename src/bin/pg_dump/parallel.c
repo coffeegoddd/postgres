@@ -1304,8 +1304,8 @@ lockTableForWorker(ArchiveHandle *AH, TocEntry *te)
 	PQExpBuffer query;
 	PGresult   *res;
 
-	/* Nothing to do for BLOBS */
-	if (strcmp(te->desc, "BLOBS") == 0)
+	/* Nothing to do for BLOBS, nor the history store's data */
+	if (strcmp(te->desc, "BLOBS") == 0 || strcmp(te->desc, "HISTORY DATA") == 0)
 		return;
 
 	query = createPQExpBuffer();

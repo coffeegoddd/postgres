@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#include "utils/guc.h"
+
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "fmgr.h"
@@ -236,6 +238,29 @@ test_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
 static const ChunkFormatRoutine TestChunkFormat = {
 	.refs = test_refs,
 };
+
+/*
+ * The test format for every backend from its start (test_prolly.chunk_format_refs,
+ * the module preloaded): for programs' sessions, pg_dump's and pg_restore's
+ */
+static bool format_refs_setting = false;
+
+extern void test_chunk_format_define_setting(void);
+
+static void
+assign_format_refs(bool newval, void *extra)
+{
+	ChunkFormat = newval ? &TestChunkFormat : &LeafChunkFormat;
+}
+
+void
+test_chunk_format_define_setting(void)
+{
+	DefineCustomBoolVariable("test_prolly.chunk_format_refs",
+							 "Chunks of the test format, with references, for every session.",
+							 NULL, &format_refs_setting, false, PGC_SUSET, 0,
+							 NULL, assign_format_refs, NULL);
+}
 
 /* test_chunk_format_refs(on bool): the test format for this backend, or not */
 Datum

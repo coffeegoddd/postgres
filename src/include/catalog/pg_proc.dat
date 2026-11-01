@@ -923,6 +923,17 @@
 { oid => '9768', descr => 'keep the roots of the history store\'s pointers',
   proname => 'pg_history_pointer_changed', provolatile => 'v',
   prorettype => 'trigger', proargtypes => '', prosrc => 'pg_history_pointer_changed' },
+{ oid => '9769', descr => 'the history store\'s chunks, each after those it references, for pg_dump',
+  proname => 'pg_history_export', prorows => '1000', proretset => 't',
+  provolatile => 'v', prorettype => 'record', proargtypes => '',
+  proallargtypes => '{bytea,bytea}', proargmodes => '{o,o}',
+  proargnames => '{hash,data}', prosrc => 'pg_history_export' },
+{ oid => '9770', descr => 'whether the history store has a chunk',
+  proname => 'pg_history_has_chunks', provolatile => 'v', prorettype => 'bool',
+  proargtypes => '', prosrc => 'pg_history_has_chunks' },
+{ oid => '9771', descr => 'put a chunk restored into the history store',
+  proname => 'pg_history_chunk_restore', provolatile => 'v',
+  prorettype => 'trigger', proargtypes => '', prosrc => 'pg_history_chunk_restore' },
 
 # Index access method handlers
 { oid => '330', descr => 'btree index access method handler',

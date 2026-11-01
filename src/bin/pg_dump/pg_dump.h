@@ -86,9 +86,10 @@ typedef enum
 	DO_REL_STATS,
 	DO_SUBSCRIPTION,
 	DO_SUBSCRIPTION_REL,		/* see note for SubRelInfo */
+	DO_HISTORY_DATA,			/* see note for HistoryDataInfo */
 } DumpableObjectType;
 
-#define NUM_DUMPABLE_OBJECT_TYPES (DO_SUBSCRIPTION_REL + 1)
+#define NUM_DUMPABLE_OBJECT_TYPES (DO_HISTORY_DATA + 1)
 
 /*
  * DumpComponents is a bitmask of the potentially dumpable components of
@@ -635,6 +636,18 @@ typedef struct _defaultACLInfo
  * multiple LoInfo groups, which will each spawn a BLOB METADATA and a BLOBS
  * (data) TOC entry.  This allows more parallelism during restore.
  */
+/*
+ * The database's version-control history store: its chunks (each after
+ * those it references), then its pointers, which take their roots on them
+ * as they are restored.  Each a COPY of a query's rows into its target.
+ */
+typedef struct _historyDataInfo
+{
+	DumpableObject dobj;
+	const char *query;			/* COPY (...) TO stdout */
+	const char *copyStmt;		/* COPY ... FROM stdin, to restore it */
+} HistoryDataInfo;
+
 typedef struct _loInfo
 {
 	DumpableObject dobj;

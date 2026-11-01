@@ -185,6 +185,7 @@ typedef struct _dumpOptions
 	int			column_inserts;
 	int			if_exists;
 	int			no_comments;
+	int			no_history;		/* Skip the version-control history store */
 	int			no_policies;	/* Skip row security policies */
 	int			no_publications;
 	int			no_security_labels;
