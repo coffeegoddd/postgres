@@ -21,7 +21,9 @@
  * those is kept current by a syscache callback on pg_namespace, so a
  * branch change runs those callbacks as if every schema had changed (the
  * catalog filter's map of objects to branches, which does not depend on
- * the session's branch, ignores that; see catalog_branch_changing).  (The
+ * the session's branch, ignores that, and so do cached plans, which note
+ * the branch their names were resolved on with their search path and are
+ * planned again only if used on another; see catalog_branch_changing).  (The
  * session's sequence state is kept: it is by object id, each branch's
  * sequences have their own, and currval() of a name asks the branch's.  A
  * function running on its own branch switches it on each call, and must
@@ -127,11 +129,17 @@ CatalogBranchResolveRestore(int32 saved)
 	resolve_branch = saved;
 }
 
+int32
+CatalogBranchOfNames(void)
+{
+	return resolve_branch >= 0 ? resolve_branch : catalog_branch;
+}
+
 HeapTuple
 SearchNamespaceByName(const char *nspname)
 {
 	HeapTuple	tup = NULL;
-	int32		branch = resolve_branch >= 0 ? resolve_branch : catalog_branch;
+	int32		branch = CatalogBranchOfNames();
 
 	if (branch != 0)
 		tup = search_namespace(nspname, branch);

@@ -63,6 +63,7 @@
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "prolly/branch_catalog.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
@@ -2373,6 +2374,13 @@ PlanCacheRoleCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 static void
 PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
+	/*
+	 * A branch change changes no schema: plans note the branch their names
+	 * were resolved on (SearchPathMatcher), and are planned again only if
+	 * used on another one
+	 */
+	if (cacheid == NAMESPACEOID && catalog_branch_changing)
+		return;
 	ResetPlanCache();
 }
 

@@ -3949,6 +3949,7 @@ GetSearchPathMatcher(MemoryContext context)
 		schemas = list_delete_first(schemas);
 	}
 	result->schemas = schemas;
+	result->branch = CatalogBranchOfNames();
 	result->generation = activePathGeneration;
 
 	MemoryContextSwitchTo(oldcxt);
@@ -3970,6 +3971,7 @@ CopySearchPathMatcher(SearchPathMatcher *path)
 	result->schemas = list_copy(path->schemas);
 	result->addCatalog = path->addCatalog;
 	result->addTemp = path->addTemp;
+	result->branch = path->branch;
 	result->generation = path->generation;
 
 	return result;
@@ -3990,6 +3992,13 @@ SearchPathMatchesCurrentEnvironment(SearchPathMatcher *path)
 			   *lcp;
 
 	recomputeNamespacePath();
+
+	/*
+	 * A schema-qualified name means another branch's schema on another
+	 * branch, whatever the search path is
+	 */
+	if (path->branch != CatalogBranchOfNames())
+		return false;
 
 	/* Quick out if already known equal to active path. */
 	if (path->generation == activePathGeneration)

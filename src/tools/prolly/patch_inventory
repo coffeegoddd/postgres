@@ -68,7 +68,7 @@ patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bo
 patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's; also (1b) refuses an unlogged relation in a versioned schema
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
-patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema
+patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; also (1b) a search path matcher notes the branch names resolved on
 patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
@@ -115,6 +115,7 @@ patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL function
 patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve names on its table's branch, whatever branch the session is on
 patch src/backend/utils/adt/ruleutils.c  1b  a constraint rebuilt by DDL is looked up with a catalog snapshot
 patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per branch
+patch src/backend/utils/cache/plancache.c  1b  a branch change discards no cached plan (plans note their branch)
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one
 patch src/backend/utils/misc/guc_parameters.dat  1a  block_map_copy_images, block_map_release_max_per_pass, block_map_replay_entries, block_map_standby_hold_max_size and debug_block_mapped_heap; also (1b) catalog_branch
@@ -146,6 +147,7 @@ patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the blo
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
+patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index

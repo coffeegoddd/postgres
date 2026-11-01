@@ -79,6 +79,7 @@ typedef struct SearchPathMatcher
 	List	   *schemas;		/* OIDs of explicitly named schemas */
 	bool		addCatalog;		/* implicitly prepend pg_catalog? */
 	bool		addTemp;		/* implicitly prepend temp schema? */
+	int32		branch;			/* the branch names resolved on */
 	uint64		generation;		/* for quick detection of equality to active */
 } SearchPathMatcher;
 
