@@ -155,6 +155,8 @@ tests += {
       't/062_chunk_entries_first.pl',
       't/063_chunk_abandoned_regions.pl',
       't/064_history_dump.pl',
+      't/065_history_crash_steps.pl',
+      't/066_history_concurrent.pl',
       't/066_history_concurrent.pl',
     ],
     'env': {

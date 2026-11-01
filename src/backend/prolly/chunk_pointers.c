@@ -32,6 +32,7 @@
 #include "fmgr.h"
 #include "prolly/chunk_store.h"
 #include "utils/fmgrprotos.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "varatt.h"
@@ -128,6 +129,7 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 		if (memcmp(old, new, CHUNK_HASH_LEN) != 0)
 		{
 			ChunkStoreRefRoot(idx, new, &e);
+			INJECTION_POINT("history-pointer-moving", NULL);
 			ChunkStoreUnrefRoot(idx, old, &e);
 		}
 	}
