@@ -44,6 +44,8 @@ own   src/tools/prolly_bench/
 patch contrib/Makefile         0  builds the fork's extensions under contrib/prolly
 patch contrib/meson.build      0  builds the fork's extensions under contrib/prolly
 patch contrib/pg_visibility/pg_visibility.c  1a  prepares and finishes a visibility map's truncation with the storage manager, as RelationTruncate() does
+patch doc/src/sgml/config.sgml  1b  catalog_branch
+patch doc/src/sgml/ref/create_schema.sgml  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/Makefile     0  links the engine's code in src/backend/prolly into the server
 patch src/backend/access/hash/hashpage.c  1a  tells the storage manager of blocks logged before they are written (smgrpreextend)
 patch src/backend/access/heap/heapam.c  1b  scans of catalogs hide other branches' rows (prolly/branch_filter.h) with the page unlocked, page at a time
@@ -69,6 +71,7 @@ patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-m
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's; also (1b) refuses an unlogged relation in a versioned schema
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; a search path matcher notes the branch names resolved on
+patch src/backend/catalog/objectaddress.c  1b  the pg_namespace name cache is NAMESPACENAMEBRANCH
 patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
@@ -137,6 +140,7 @@ patch src/bin/pg_upgrade/relfilenumber.c  1a  transfers a block-mapped relation'
 patch src/bin/pg_waldump/.gitignore  1a  ignores the copied block map WAL description source
 patch src/bin/pg_waldump/rmgrdesc.c  1a  includes the block map's WAL resource manager
 patch src/bin/pg_waldump/t/001_basic.pl  1a  the rmgr list includes the block map's, and its records decode
+patch src/bin/psql/tab-complete.in.c  1b  CREATE SCHEMA ... VERSIONED
 patch src/common/relpath.c  1a  names the block map fork ("bmap")
 patch src/include/Makefile     0  installs the engine's headers in src/include/prolly
 patch src/include/access/heapam.h  1b  heap and index scans remember whether they hide other branches' catalog rows

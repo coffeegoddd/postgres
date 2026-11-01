@@ -63,7 +63,7 @@ DECLARE_TOAST(pg_namespace, 4163, 4164);
 DECLARE_UNIQUE_INDEX(pg_namespace_nspname_index, 2684, NamespaceNameIndexId, pg_namespace, btree(nspname name_ops, nspbranch int4_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_namespace_oid_index, 2685, NamespaceOidIndexId, pg_namespace, btree(oid oid_ops));
 
-MAKE_SYSCACHE(NAMESPACENAME, pg_namespace_nspname_index, 4);
+MAKE_SYSCACHE(NAMESPACENAMEBRANCH, pg_namespace_nspname_index, 4);
 MAKE_SYSCACHE(NAMESPACEOID, pg_namespace_oid_index, 16);
 
 /*

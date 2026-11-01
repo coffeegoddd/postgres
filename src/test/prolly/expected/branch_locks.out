@@ -1,4 +1,4 @@
-Parsed test spec with 2 sessions
+Parsed test spec with 3 sessions
 
 starting permutation: o_begin o_lock w_update o_commit
 step o_begin: BEGIN;
@@ -49,3 +49,19 @@ step o_make: CREATE TABLE app.only (x int);
 step w_make: CREATE TABLE app.only (y int, z int);
 step o_commit: COMMIT;
 step w_commit: COMMIT;
+
+starting permutation: o_begin w_begin o_schema w_schema o_commit w_commit
+step o_begin: BEGIN;
+step w_begin: BEGIN;
+step o_schema: CREATE SCHEMA other VERSIONED;
+step w_schema: CREATE SCHEMA other VERSIONED;
+step o_commit: COMMIT;
+step w_commit: COMMIT;
+
+starting permutation: o_begin o_schema n_schema o_commit
+step o_begin: BEGIN;
+step o_schema: CREATE SCHEMA other VERSIONED;
+step n_schema: CREATE SCHEMA other; <waiting ...>
+step o_commit: COMMIT;
+step n_schema: <... completed>
+ERROR:  schema "other" already exists

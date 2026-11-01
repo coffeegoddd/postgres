@@ -21,10 +21,10 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
-CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ]
-CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_specification</replaceable>
+CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ VERSIONED ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ VERSIONED ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ VERSIONED ]
+CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ VERSIONED ]
 
 <phrase>where <replaceable class="parameter">role_specification</replaceable> can be:</phrase>
 
@@ -91,6 +91,21 @@ CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_sp
         defaults to the user executing the command.  To create a schema
         owned by another role, you must be able to
         <literal>SET ROLE</literal> to that role.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>VERSIONED</literal></term>
+      <listitem>
+       <para>
+        Make the schema on the session's branch
+        (<xref linkend="guc-catalog-branch"/>), which must not be
+        <literal>0</literal>.  A versioned schema, and every object in it, is
+        seen only by sessions on that branch; another branch can have a
+        versioned schema of the same name, with objects of its own.  A shared
+        (not versioned) schema and a versioned one cannot have the same name.
+        Objects in shared schemas may not depend on a versioned schema's.
        </para>
       </listitem>
      </varlistentry>

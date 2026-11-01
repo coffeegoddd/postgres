@@ -417,7 +417,7 @@ static const ObjectPropertyType ObjectProperty[] =
 		NamespaceRelationId,
 		NamespaceOidIndexId,
 		NAMESPACEOID,
-		NAMESPACENAME,
+		NAMESPACENAMEBRANCH,
 		Anum_pg_namespace_oid,
 		Anum_pg_namespace_nspname,
 		InvalidAttrNumber,

@@ -103,7 +103,7 @@ search_namespace(const char *nspname, int32 branch)
 {
 	HeapTuple	tup;
 
-	tup = SearchSysCache2(NAMESPACENAME, CStringGetDatum(nspname),
+	tup = SearchSysCache2(NAMESPACENAMEBRANCH, CStringGetDatum(nspname),
 						  Int32GetDatum(branch));
 	return HeapTupleIsValid(tup) ? tup : NULL;
 }
@@ -248,14 +248,18 @@ versioned_namespace_exists(const char *nspname)
  * the name first.  The lock is on an object no catalog row has (sub-id 1
  * of an object id made from the name), so it conflicts only with another
  * schema of a name with the same hash being made or renamed; an unrelated
- * name with the same hash merely waits.
+ * name with the same hash merely waits.  A shared schema's maker takes it
+ * exclusively; a versioned one's shares it, as versioned schemas of one
+ * name on different branches do not conflict (and on one branch the
+ * unique index keeps one).
  */
 static void
-lock_namespace_name(const char *nspname)
+lock_namespace_name(const char *nspname, int32 branch)
 {
 	uint32		h = hash_bytes((const unsigned char *) nspname, strlen(nspname));
 
-	LockDatabaseObject(NamespaceRelationId, (Oid) h, 1, ExclusiveLock);
+	LockDatabaseObject(NamespaceRelationId, (Oid) h, 1,
+					   branch == 0 ? ExclusiveLock : ShareLock);
 }
 
 void
@@ -263,7 +267,7 @@ NamespaceCheckNameFree(const char *nspname, int32 branch)
 {
 	HeapTuple	tup;
 
-	lock_namespace_name(nspname);
+	lock_namespace_name(nspname, branch);
 
 	tup = search_namespace(nspname, branch);
 	if (tup == NULL && branch != 0)
@@ -452,7 +456,10 @@ sequence_allocated(int32 branch)
 
 	/*
 	 * pg_sequence_last_value answers NULL before the first nextval, and for
-	 * a user who may not read the sequence; PUBLIC may.
+	 * a user who may not read the sequence; PUBLIC may.  After a crash it
+	 * answers the last value logged, up to 32 past the last handed out: those
+	 * ids count as allocated but are never handed out, so a session may work
+	 * on one, and no other allocation will share it.
 	 */
 	InitFunctionCallInfoData(*fcinfo, NULL, 1, InvalidOid, NULL, NULL);
 	fcinfo->args[0].value = ObjectIdGetDatum(branch_id_sequence());
