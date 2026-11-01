@@ -2161,10 +2161,10 @@ CreateExtension(ParseState *pstate, CreateExtensionStmt *stmt)
 	check_valid_extension_name(stmt->extname);
 
 	/*
-	 * Check for duplicate extension name.  The unique index on
-	 * pg_extension.extname would catch this anyway, and serves as a backstop
-	 * in case of race conditions; but this is a friendlier error message, and
-	 * besides we need a check to support IF NOT EXISTS.
+	 * Check for duplicate extension name, among the extensions the session
+	 * sees (shared ones and its branch's), for IF NOT EXISTS.  One of the
+	 * name another branch has is refused when the schema is known
+	 * (ExtensionCheckNameFree(), under a lock on the name).
 	 */
 	if (get_extension_oid(stmt->extname, true) != InvalidOid)
 	{
@@ -2262,6 +2262,13 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 
 	/* an extension is shared or a branch's, never both */
 	ExtensionCheckNameFree(extName, schemaOid);
+
+	/* (made from a branch, in a shared schema: every branch has it) */
+	if (catalog_branch != 0 && NamespaceBranch(schemaOid) == 0)
+		ereport(NOTICE,
+				(errmsg("extension \"%s\" is shared: schema \"%s\" is not versioned",
+						extName, get_namespace_name(schemaOid)),
+				 errhint("To make it this branch's own, create it WITH SCHEMA a versioned schema.")));
 
 	/*
 	 * Build and insert the pg_extension tuple
@@ -3280,10 +3287,6 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 
 	nspOid = LookupCreationNamespace(newschema);
 
-	/* a shared extension stays shared, and a branch's on its branch */
-	ExtensionCheckMove(extensionName, get_extension_schema(extensionOid),
-					   nspOid);
-
 	/*
 	 * Permission check: must own extension.  Note that we don't bother to
 	 * check ownership of the individual member objects ...
@@ -3296,6 +3299,10 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 	aclresult = object_aclcheck(NamespaceRelationId, nspOid, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA, newschema);
+
+	/* a shared extension stays shared, and a branch's on its branch */
+	ExtensionCheckMove(extensionName, get_extension_schema(extensionOid),
+					   nspOid);
 
 	/*
 	 * If the schema is currently a member of the extension, disallow moving

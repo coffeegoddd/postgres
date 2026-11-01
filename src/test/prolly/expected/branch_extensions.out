@@ -11,6 +11,8 @@ CREATE SCHEMA app VERSIONED;
 -- a shared extension serves both branches
 SET catalog_branch = :b1;
 CREATE EXTENSION hstore SCHEMA pub;
+NOTICE:  extension "hstore" is shared: schema "pub" is not versioned
+HINT:  To make it this branch's own, create it WITH SCHEMA a versioned schema.
 SET catalog_branch = :b2;
 SELECT ('a=>1'::pub.hstore) OPERATOR(pub.->) 'a' AS from_b2;
  from_b2 
@@ -66,6 +68,60 @@ SELECT count(*) AS b1_functions FROM pg_proc WHERE proname = 'similarity';
             1
 (1 row)
 
+-- IF NOT EXISTS skips the branch's own, whatever schema is named; on no
+-- branch, where that one isn't seen, a shared one is still refused
+CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA pub;
+NOTICE:  extension "pg_trgm" already exists, skipping
+RESET catalog_branch;
+CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA pub;
+ERROR:  extension "pg_trgm" already exists
+DETAIL:  A branch has its own copy of the extension; a shared one cannot be made beside it.
+-- a comment on a branch's extension is that branch's
+SET catalog_branch = :b1;
+COMMENT ON EXTENSION pg_trgm IS 'b1 trigrams';
+SET catalog_branch = :b2;
+SELECT obj_description(oid, 'pg_extension') AS b2_comment FROM pg_extension WHERE extname = 'pg_trgm';
+                            b2_comment                             
+-------------------------------------------------------------------
+ text similarity measurement and index searching based on trigrams
+(1 row)
+
+SET catalog_branch = :b1;
+SELECT obj_description(oid, 'pg_extension') AS b1_comment FROM pg_extension WHERE extname = 'pg_trgm';
+ b1_comment  
+-------------
+ b1 trigrams
+(1 row)
+
+-- CASCADE makes what an extension requires in the same schema, the branch's
+CREATE EXTENSION earthdistance SCHEMA app CASCADE;
+NOTICE:  installing required extension "cube"
+SELECT extname, extnamespace = 'app'::regnamespace AS in_app
+FROM pg_extension WHERE extname IN ('cube', 'earthdistance') ORDER BY extname;
+    extname    | in_app 
+---------------+--------
+ cube          | t
+ earthdistance | t
+(2 rows)
+
+SET catalog_branch = :b2;
+SELECT count(*) AS b2_sees FROM pg_extension WHERE extname IN ('cube', 'earthdistance');
+ b2_sees 
+---------
+       0
+(1 row)
+
+SET catalog_branch = :b1;
+DROP EXTENSION earthdistance, cube;
+-- moving another's extension is refused for that first, whatever the schema
+CREATE ROLE regress_ext_other;
+GRANT CREATE ON SCHEMA pub TO regress_ext_other;
+SET ROLE regress_ext_other;
+ALTER EXTENSION pg_trgm SET SCHEMA pub;
+ERROR:  must be owner of extension pg_trgm
+RESET ROLE;
+REVOKE CREATE ON SCHEMA pub FROM regress_ext_other;
+DROP ROLE regress_ext_other;
 -- a branch updates its own
 SET catalog_branch = :b2;
 ALTER EXTENSION pg_trgm UPDATE TO '1.6';
