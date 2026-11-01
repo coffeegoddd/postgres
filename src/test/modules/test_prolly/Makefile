@@ -27,7 +27,7 @@ REGRESS = unit conformance bmap_storage bmap_copy_on_write bmap_sharing \
 	branch_map_cost chunk_log chunk_index chunk_refs chunk_free chunk_reclaim \
 	history_pointers chunk_store_pages chunk_store_memory
 ISOLATION = bmap_shared_writers chunk_index_put_wait chunk_roots_wait chunk_free_wait \
-	chunk_pack_put_wait
+	chunk_pack_put_wait chunk_vacuum_cancel
 REGRESS_OPTS = --temp-config=$(srcdir)/chunk_store.conf
 ISOLATION_OPTS = --temp-config=$(srcdir)/chunk_store_isolation.conf
 TAP_TESTS = 1

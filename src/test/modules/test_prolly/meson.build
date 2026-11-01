@@ -39,6 +39,7 @@ test_prolly_isolation = [
   'chunk_roots_wait',
   'chunk_free_wait',
   'chunk_pack_put_wait',
+  'chunk_vacuum_cancel',
 ]
 # (these need injection points)
 if get_option('injection_points')
