@@ -19,6 +19,10 @@ SELECT test_chunk_has('cl', 'ci', h('\x616263')) AS has,
 	test_chunk_get('cl', 'ci', h('\x646566')) IS NULL AS got_other_null;
 SELECT len, refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
 
+-- a chunk is put by its own name only
+SELECT test_chunk_put('cl', 'ci', h('\x646566'), '\x616263');
+SELECT test_chunk_has('cl', 'ci', h('\x646566')) AS has_misnamed;
+
 -- its counts, changed in place, never below zero
 SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), 2, 1);
 SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), -1, 0);
