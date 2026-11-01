@@ -4178,6 +4178,12 @@ getHistory(Archive *fout)
 	PQclear(res);
 	if (!has)
 		return;
+	/* (a pointer names a chunk the store has: chunks or none, history or none) */
+	res = ExecuteSqlQueryForSingleRow(fout, "SELECT pg_catalog.pg_history_has_chunks()");
+	has = PQgetvalue(res, 0, 0)[0] == 't';
+	PQclear(res);
+	if (!has)
+		return;
 	res = ExecuteSqlQueryForSingleRow(fout,
 									  "SELECT has_function_privilege('pg_catalog.pg_history_export()', 'EXECUTE') "
 									  "AND has_table_privilege('pg_history.pointers', 'SELECT')");
@@ -4186,13 +4192,6 @@ getHistory(Archive *fout)
 	if (!has)
 		pg_fatal("this role cannot read the version-control history store, which pg_dump would dump with the database; "
 				 "dump as a role that can, or use --no-history to leave it out");
-	res = ExecuteSqlQueryForSingleRow(fout,
-									  "SELECT pg_catalog.pg_history_has_chunks() "
-									  "OR EXISTS (SELECT 1 FROM pg_history.pointers)");
-	has = PQgetvalue(res, 0, 0)[0] == 't';
-	PQclear(res);
-	if (!has)
-		return;
 
 	chunks = pg_malloc0_object(HistoryDataInfo);
 	chunks->dobj.objType = DO_HISTORY_DATA;
