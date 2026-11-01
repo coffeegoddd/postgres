@@ -141,14 +141,14 @@ $v->quit;
 my $after_cut = $primary->safe_psql('postgres', $size);
 cmp_ok($after_cut, '<', $before_cut, 'VACUUM cut the tail, the aborted put\'s pages with it');
 # (puts after the cut, past a region of them, in pages made again where the
-# aborted put's were)
+# aborted put's were: each longer than a region, never into pages freed)
 $primary->safe_psql('postgres', q{
-	SELECT count(*) FILTER (WHERE (test_cs_put('pages', big(i))).stored) FROM generate_series(4001, 4040) i;
+	SELECT count(*) FILTER (WHERE (test_cs_put('pages', huge(i))).stored) FROM generate_series(4001, 4004) i;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 is($primary->safe_psql('postgres', q{
-	SELECT count(*) FILTER (WHERE test_cs_get('pages', h(big(i))) = big(i)) FROM generate_series(4001, 4040) i}),
-	'40', 'the next VACUUM, taking the aborted entry out, counts nothing of its pages cut: those made again are the puts\' after');
+	SELECT count(*) FILTER (WHERE test_cs_get('pages', h(huge(i))) = huge(i)) FROM generate_series(4001, 4004) i}),
+	'4', 'the next VACUUM, taking the aborted entry out, counts nothing of its pages cut: those made again are the puts\' after');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
 # 3. puts after the cut, freed, and the tail cut again; then the chunks put

@@ -569,6 +569,7 @@ take_free_pages(Relation rel, uint32 generation, int npages)
 		uint64		first;
 		int			locked = 0;
 		bool		all_free = true;
+		bool		blk_wrong = false;
 
 		if (!BlockNumberIsValid(blk) || blk == META_BLOCK || blk >= nblocks)
 			return -1;
@@ -600,15 +601,16 @@ take_free_pages(Relation rel, uint32 generation, int npages)
 			if (PageIsNew(page) || !page_free(page))
 			{
 				all_free = false;
-				/* (one the map has wrongly, out of it) */
-				if (b == blk)
-					RecordPageWithFreeSpace(rel, blk, 0);
+				blk_wrong = b == blk;
 			}
 		}
 		if (!all_free)
 		{
 			for (int j = 0; j < locked; j++)
 				UnlockReleaseBuffer(bufs[j]);
+			/* (one the map has wrongly, out of it, once nothing is locked) */
+			if (blk_wrong)
+				RecordPageWithFreeSpace(rel, blk, 0);
 			continue;
 		}
 
@@ -617,11 +619,12 @@ take_free_pages(Relation rel, uint32 generation, int npages)
 						   DATA_BLOCK(first), DATA_BLOCK(first + npages - 1) + 1);
 		map_mark(rel, first, npages, true);
 		for (int j = 0; j < npages; j++)
-		{
 			make_page(rel, bufs[j], false);
+		for (int j = 0; j < npages; j++)
 			UnlockReleaseBuffer(bufs[j]);
+		/* (the map told, once nothing is locked: it may extend itself) */
+		for (int j = 0; j < npages; j++)
 			RecordPageWithFreeSpace(rel, DATA_BLOCK(first + j), 0);
-		}
 		return (int64) first;
 	}
 	return -1;
@@ -688,9 +691,13 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 		Buffer		buf = ReadBuffer(rel, blk);
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		if (!PageIsNew(BufferGetPage(buf)))
+
+		/*
+		 * (a page never written: new, or made afresh for this region, from
+		 * pages freed; another, written, is not this region's to let go of)
+		 */
+		if (!PageIsNew(BufferGetPage(buf)) && !page_fresh(BufferGetPage(buf)))
 		{
-			/* (not this region's to let go of: it never wrote it) */
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
@@ -808,8 +815,9 @@ check_writer(Relation rel)
 
 /*
  * Room for len bytes in this backend's region: what is left of it, or
- * else a new one (a page freed, if the bytes fit one, or new pages, more
- * if the bytes are longer than a region), what was left of the old one
+ * else a new one (a run of pages freed, if the bytes fit no more than a
+ * region's pages, or new pages, more if the bytes are longer than a
+ * region), what was left of the old one
  * let go of.  The region, kept in the relation's rd_amcache too, in *run.
  */
 static void

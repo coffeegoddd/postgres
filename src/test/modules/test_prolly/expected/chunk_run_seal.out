@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: b_vacuum b_free a_begin a_put b_put a_commit b_free b_put_more b_free
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+test_chunk_free_unheld
+----------------------
+                    30
+(1 row)
+
+step b_vacuum: VACUUM ri;
+step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
+free_pages
+----------
+        73
+(1 row)
+
+step a_begin: BEGIN;
+step a_put: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('x', 20000)), rs_big('x', 20000)) AS put;
+put
+---
+t  
+(1 row)
+
+step b_put: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('x', 20000)), rs_big('x', 20000)) AS put; <waiting ...>
+step a_commit: COMMIT;
+step b_put: <... completed>
+put
+---
+f  
+(1 row)
+
+step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
+free_pages
+----------
+        67
+(1 row)
+
+step b_put_more: SELECT test_chunk_put('rl', 'ri', rs_h(rs_big('z', 30000)), rs_big('z', 30000)) AS put;
+put
+---
+t  
+(1 row)
+
+step b_free: SELECT free_pages FROM test_chunk_log_space('rl');
+free_pages
+----------
+        66
+(1 row)
+
