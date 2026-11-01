@@ -48,6 +48,7 @@
 #include "prolly/chunk_freer.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
@@ -195,6 +196,13 @@ entry_state_wait(ChunkIndexEntry *e, Buffer buf, TransactionId *wait)
 		return ENTRY_DEAD;
 	if (TransactionIdIsInProgress(e->xmax))
 	{
+		/*
+		 * (a hot standby's, which can't wait for the primary's transactions:
+		 * the chunk is there, its freeing not committed; should it commit,
+		 * taking the entry out conflicts with this snapshot first)
+		 */
+		if (RecoveryInProgress())
+			return ENTRY_VISIBLE;
 		if (wait)
 			*wait = e->xmax;
 		return ENTRY_IN_PROGRESS;
@@ -1738,12 +1746,31 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 typedef enum VacuumFate
 {
 	FATE_KEEP,
-	FATE_REMOVE,				/* aborted, or freed: its bytes dead */
+	FATE_REMOVE,				/* aborted: its bytes dead */
+	FATE_REMOVE_FREED,			/* freed: its bytes dead */
 	FATE_REMOVE_COPY,			/* not the bucket's: another's bytes */
 	FATE_FREEZE,				/* xmin committed, not noted so in WAL */
 	FATE_CLEAR,					/* xmax aborted: no freeing now */
 	FATE_FREEZE_CLEAR,
 } VacuumFate;
+
+/*
+ * Before freed chunks' entries are taken out, and their bytes dead, for
+ * hot standbys: their queries whose snapshots might have found one before
+ * its freeing committed conflict with it (as with heap pruning's), there
+ * being no knowing on the primary which chunks those are reading.
+ */
+static void
+log_cleanup_info(Relation idx, TransactionId horizon)
+{
+	xl_chunk_index_cleanup_info xlrec;
+
+	xlrec.locator = idx->rd_locator;
+	xlrec.snapshotConflictHorizon = horizon;
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfChunkIndexCleanupInfo);
+	(void) XLogInsert(RM_CHUNK_STORE_ID, XLOG_CHUNK_INDEX_CLEANUP_INFO);
+}
 
 /*
  * Each transaction id an entry names on its own: xmin, committed, is
@@ -1774,7 +1801,7 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
 	if (TransactionIdIsValid(e->xmax))
 	{
 		if (e->flags & CHUNK_ENTRY_XMAX_COMMITTED)
-			return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE :
+			return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE_FREED :
 				(freeze ? FATE_FREEZE : FATE_KEEP);
 		if (e->flags & CHUNK_ENTRY_XMAX_ABORTED)
 			clear = true;
@@ -1786,7 +1813,7 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
 			 * to others)
 			 */
 			if (TransactionIdDidCommit(e->xmax))
-				return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE :
+				return TransactionIdPrecedes(e->xmax, frozen) ? FATE_REMOVE_FREED :
 					(freeze ? FATE_FREEZE : FATE_KEEP);
 			clear = true;
 		}
@@ -1900,13 +1927,21 @@ ChunkIndexVacuum(Relation idx)
 			int			n = page_entries(page);
 			VacuumFate *fates = palloc(Max(n, 1) * sizeof(VacuumFate));
 			bool		change = false;
+			TransactionId horizon = InvalidTransactionId;
 
 			for (int i = 0; i < n; i++)
 			{
 				fates[i] = vacuum_fate(page_entry(page, i), b, &masks, frozen);
 				if (fates[i] != FATE_KEEP)
 					change = true;
+				if (fates[i] == FATE_REMOVE_FREED &&
+					(!TransactionIdIsValid(horizon) ||
+					 TransactionIdFollows(page_entry(page, i)->xmax, horizon)))
+					horizon = page_entry(page, i)->xmax;
 			}
+			if (TransactionIdIsValid(horizon) && RelationNeedsWAL(idx) &&
+				XLogStandbyInfoActive())
+				log_cleanup_info(idx, horizon);
 			if (change)
 			{
 				GenericXLogState *st = GenericXLogStart(idx);
@@ -1919,7 +1954,7 @@ ChunkIndexVacuum(Relation idx)
 
 					if (fates[i] == FATE_REMOVE_COPY)
 						continue;
-					if (fates[i] == FATE_REMOVE)
+					if (fates[i] == FATE_REMOVE || fates[i] == FATE_REMOVE_FREED)
 					{
 						/* (a chunk's bytes, dead once its entry is out) */
 						if (e.kind == CHUNK_KIND_CHUNK && e.len > 0)

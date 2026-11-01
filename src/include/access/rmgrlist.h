@@ -49,3 +49,4 @@ PG_RMGR(RM_GENERIC_ID, "Generic", generic_redo, generic_desc, generic_identify, 
 PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, logicalmsg_identify, NULL, NULL, NULL, logicalmsg_decode)
 PG_RMGR(RM_XLOG2_ID, "XLOG2", xlog2_redo, xlog2_desc, xlog2_identify, NULL, NULL, NULL, xlog2_decode)
 PG_RMGR(RM_BMAP_ID, "BlockMap", bmap_redo, bmap_desc, bmap_identify, NULL, NULL, bmap_mask, NULL)
+PG_RMGR(RM_CHUNK_STORE_ID, "ChunkStore", chunk_redo, chunk_desc, chunk_identify, NULL, NULL, NULL, NULL)
