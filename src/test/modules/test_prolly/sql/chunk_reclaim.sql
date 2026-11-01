@@ -12,6 +12,10 @@ CREATE FUNCTION blob(tag text) RETURNS bytea LANGUAGE sql IMMUTABLE
 -- 200 chunks of 2000 bytes, about four a page
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('a' || g)), blob('a' || g))) AS put
 FROM generate_series(1, 200) g;
+-- and one with a root, at the log's end, so that VACUUM doesn't cut the
+-- freed pages off (see below), and they are used again
+SELECT test_chunk_put('ql', 'qi', h(blob('anchor')), blob('anchor')) AS anchor;
+SELECT roots FROM test_chunk_ref_root('qi', h(blob('anchor')));
 SELECT pages, full_pages, dead, free_pages FROM test_chunk_log_space('ql');
 SELECT pg_relation_size('ql') AS size_full \gset
 
@@ -41,6 +45,17 @@ SELECT free_pages = full_pages AS full_ones_free_again FROM test_chunk_log_space
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
 FROM generate_series(1, 150) g;
 SELECT pg_relation_size('ql') = :size_full AS still_no_bigger;
+SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
+
+-- the anchor let go of, everything freed: VACUUM cuts the free tail off,
+-- the whole log but its meta page
+SELECT roots FROM test_chunk_unref_root('qi', h(blob('anchor')));
+SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
+VACUUM qi;
+SELECT pages, pg_relation_size('ql') = current_setting('block_size')::int AS meta_page_only
+FROM test_chunk_log_space('ql');
+SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('d' || g)), blob('d' || g))) AS put_after_cut
+FROM generate_series(1, 20) g;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
 -- a put rolled back: its bytes dead once VACUUM takes its entry out (a

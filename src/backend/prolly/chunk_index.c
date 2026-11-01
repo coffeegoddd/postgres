@@ -44,6 +44,8 @@
 #include "access/xlog.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "prolly/chunk_freer.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
@@ -1075,6 +1077,9 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 	grew = add_entry(idx, primary, bucket, space, last, entry);
 	UnlockReleaseBuffer(primary);
 
+	/* (counted as a table's inserts are, so that autovacuum VACUUMs it) */
+	pgstat_count_heap_insert(idx, 1);
+
 	/*
 	 * An entry past a bucket's first page: the index grows a bucket, so that
 	 * buckets stay a page long, mostly
@@ -1786,6 +1791,46 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
 		(clear ? FATE_CLEAR : FATE_KEEP);
 }
 
+/*
+ * The chunks on the bucket's chain nothing holds: counts zero, no change
+ * of them left (VACUUM has added the committed ones in), not being freed.
+ */
+static uint64
+count_unheld(Relation idx, Buffer primary)
+{
+	Buffer		cur = primary;
+	uint64		n = 0;
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			ne = page_entries(page);
+
+		for (int i = 0; i < ne; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+			bool		changed = false;
+
+			if (e->kind != CHUNK_KIND_CHUNK || e->refs != 0 || e->roots != 0 ||
+				TransactionIdIsValid(e->xmax) ||
+				entry_state_unhinted(e) != ENTRY_VISIBLE)
+				continue;
+			for (int j = 0; j < ne && !changed; j++)
+				changed = change_of(page_entry(page, j), e);
+			if (!changed)
+				n++;
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			return n;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+}
+
 void
 ChunkIndexVacuum(Relation idx)
 {
@@ -1793,6 +1838,7 @@ ChunkIndexVacuum(Relation idx)
 	double		kept_entries = 0;
 	Relation	log = NULL;
 	bool		log_tried = false;
+	uint64		unheld = 0;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
 				dead_cap = 0;
@@ -1887,6 +1933,7 @@ ChunkIndexVacuum(Relation idx)
 			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 		}
 		fold_changes(idx, primary, b, &masks);
+		unheld += count_unheld(idx, primary);
 		UnlockReleaseBuffer(primary);
 
 		/*
@@ -1908,6 +1955,11 @@ ChunkIndexVacuum(Relation idx)
 	if (log != NULL)
 	{
 		ChunkLogRecordFree(log);
+		(void) ChunkLogTruncateTail(log);
+
+		/* chunks nothing holds: a freer frees them, and what they held */
+		if (unheld > 0)
+			(void) ChunkFreerLaunch(RelationGetRelid(log), RelationGetRelid(idx));
 		relation_close(log, NoLock);
 	}
 

@@ -100,6 +100,12 @@ extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
 /* Puts every page free in the free space map (O(log); VACUUM's). */
 extern void ChunkLogRecordFree(Relation rel);
 
+/*
+ * Cuts the log's free tail off, if it gets the relation's exclusive lock
+ * without waiting (VACUUM's); answers the pages cut.
+ */
+extern BlockNumber ChunkLogTruncateTail(Relation rel);
+
 /* The prolly_chunks table access method's relations are a PageChunkLog's. */
 extern bool RelationIsChunkLog(Relation rel);
 

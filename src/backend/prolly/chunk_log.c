@@ -41,6 +41,7 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
+#include "utils/inval.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -725,6 +726,63 @@ ChunkLogRecordFree(Relation rel)
 		CHECK_FOR_INTERRUPTS();
 	}
 	FreeSpaceMapVacuum(rel);
+}
+
+/*
+ * Cuts the log's free tail off: the pages at its end all free, or never
+ * written.  Only with the relation's AccessExclusiveLock got without
+ * waiting (as VACUUM cuts a heap's empty end), so never while an append
+ * runs, and kept to the transaction's end, which sends a relcache
+ * invalidation: a backend whose region lay in the tail cut forgets it
+ * before its next append.  Answers the pages cut.
+ */
+BlockNumber
+ChunkLogTruncateTail(Relation rel)
+{
+	BlockNumber nblocks;
+	BlockNumber keep;
+
+	if (!ConditionalLockRelation(rel, AccessExclusiveLock))
+		return 0;
+	nblocks = RelationGetNumberOfBlocks(rel);
+	for (keep = nblocks; keep > META_BLOCK + 1; keep--)
+	{
+		Buffer		buf = ReadBuffer(rel, keep - 1);
+		Page		page = BufferGetPage(buf);
+		bool		cut;
+
+		/*
+		 * (a page part written all dead too: its backend, if any, can append
+		 * to it no more, with no append running now and its region
+		 * forgotten after)
+		 */
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		cut = PageIsNew(page) || page_free(page) ||
+			(PageGetSpecialSize(page) == MAXALIGN(sizeof(ChunkPageOpaqueData)) &&
+			 ((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
+			 ((ChunkPageOpaque) PageGetSpecialPointer(page))->dead ==
+			 ((PageHeader) page)->pd_lower - AREA_START);
+		UnlockReleaseBuffer(buf);
+		if (!cut)
+			break;
+	}
+	if (keep < nblocks)
+	{
+		Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
+		GenericXLogState *st;
+		ChunkLogMetaData *meta;
+
+		/* (no region from the cut on: the next claim starts there) */
+		LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+		st = GenericXLogStart(rel);
+		meta = page_meta(rel, GenericXLogRegisterBuffer(st, mbuf, 0));
+		meta->next_block = keep;
+		GenericXLogFinish(st);
+		UnlockReleaseBuffer(mbuf);
+		RelationTruncate(rel, keep);
+		CacheInvalidateRelcache(rel);
+	}
+	return nblocks - keep;
 }
 
 const ChunkLogRoutine PageChunkLog = {

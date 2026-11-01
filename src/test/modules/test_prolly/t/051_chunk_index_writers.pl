@@ -13,7 +13,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('chunk_index');
 $node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', "autovacuum = off\nchunk_free_in_background = off");
 $node->start;
 $node->safe_psql('postgres', q{
 	CREATE EXTENSION test_prolly;
