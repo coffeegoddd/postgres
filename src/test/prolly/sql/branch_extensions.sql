@@ -33,6 +33,38 @@ FROM pg_extension WHERE extname = 'pg_trgm';
 SELECT round(app.similarity('abc', 'abd')::numeric, 2) AS b1_similarity;
 SELECT count(*) AS b1_functions FROM pg_proc WHERE proname = 'similarity';
 
+-- IF NOT EXISTS skips the branch's own, whatever schema is named; on no
+-- branch, where that one isn't seen, a shared one is still refused
+CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA pub;
+RESET catalog_branch;
+CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA pub;
+
+-- a comment on a branch's extension is that branch's
+SET catalog_branch = :b1;
+COMMENT ON EXTENSION pg_trgm IS 'b1 trigrams';
+SET catalog_branch = :b2;
+SELECT obj_description(oid, 'pg_extension') AS b2_comment FROM pg_extension WHERE extname = 'pg_trgm';
+SET catalog_branch = :b1;
+SELECT obj_description(oid, 'pg_extension') AS b1_comment FROM pg_extension WHERE extname = 'pg_trgm';
+
+-- CASCADE makes what an extension requires in the same schema, the branch's
+CREATE EXTENSION earthdistance SCHEMA app CASCADE;
+SELECT extname, extnamespace = 'app'::regnamespace AS in_app
+FROM pg_extension WHERE extname IN ('cube', 'earthdistance') ORDER BY extname;
+SET catalog_branch = :b2;
+SELECT count(*) AS b2_sees FROM pg_extension WHERE extname IN ('cube', 'earthdistance');
+SET catalog_branch = :b1;
+DROP EXTENSION earthdistance, cube;
+
+-- moving another's extension is refused for that first, whatever the schema
+CREATE ROLE regress_ext_other;
+GRANT CREATE ON SCHEMA pub TO regress_ext_other;
+SET ROLE regress_ext_other;
+ALTER EXTENSION pg_trgm SET SCHEMA pub;
+RESET ROLE;
+REVOKE CREATE ON SCHEMA pub FROM regress_ext_other;
+DROP ROLE regress_ext_other;
+
 -- a branch updates its own
 SET catalog_branch = :b2;
 ALTER EXTENSION pg_trgm UPDATE TO '1.6';

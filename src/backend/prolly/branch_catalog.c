@@ -59,6 +59,7 @@
 #include "replication/slot.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -338,9 +339,9 @@ CatalogBranchSkipsRelation(Relation rel)
 
 /*
  * Extensions.  pg_extension's name index is (extname, extnamespace), so an
- * extension name can have one row per branch; the rows of one name are
- * adjacent in it, and there are only as many as there are branches with
- * their own copy.
+ * extension name can have one row per branch; the name cache finds those of
+ * one name by its first key, and there are only as many as there are
+ * branches with their own copy.
  */
 typedef enum ExtensionMatch
 {
@@ -351,19 +352,15 @@ typedef enum ExtensionMatch
 static Oid
 find_extension(const char *extname, ExtensionMatch match, int32 branch)
 {
-	Relation	rel;
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tup;
+	CatCList   *list;
 	Oid			result = InvalidOid;
 
-	rel = table_open(ExtensionRelationId, AccessShareLock);
-	ScanKeyInit(&key, Anum_pg_extension_extname, BTEqualStrategyNumber,
-				F_NAMEEQ, CStringGetDatum(extname));
-	scan = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, &key);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	/* (the name cache's rows of one name: a lookup by its first key) */
+	list = SearchSysCacheList1(EXTENSIONNAME, CStringGetDatum(extname));
+	for (int i = 0; i < list->n_members; i++)
 	{
-		Form_pg_extension e = (Form_pg_extension) GETSTRUCT(tup);
+		Form_pg_extension e =
+			(Form_pg_extension) GETSTRUCT(&list->members[i]->tuple);
 		int32		b = NamespaceBranch(e->extnamespace);
 		bool		hit;
 
@@ -377,8 +374,7 @@ find_extension(const char *extname, ExtensionMatch match, int32 branch)
 			break;
 		}
 	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
+	ReleaseSysCacheList(list);
 	return result;
 }
 
