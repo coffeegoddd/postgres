@@ -30,7 +30,7 @@ extern SMgrRelation RelationCreateStorage(RelFileLocator rlocator,
 										  bool register_delete);
 extern void RelationDropStorageAtCommit(RelFileLocator rlocator);
 extern int	NewRelationStorageManager(char relpersistence, bool shared,
-									  bool catalog);
+									  bool catalog, Oid relnamespace);
 extern SMgrRelation RelationCreateStorageWith(RelFileLocator rlocator,
 											  char relpersistence,
 											  bool register_delete,

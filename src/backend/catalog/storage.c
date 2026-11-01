@@ -31,6 +31,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
+#include "prolly/branch_catalog.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bulk_write.h"
@@ -142,17 +143,23 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
  * NewRelationStorageManager
  *		The storage manager (SMGR_*) of a new relation's storage.
  *
- * Block-mapped, with debug_block_mapped_heap, for a permanent relation that
- * is neither shared (so in the global tablespace) nor a catalog; md.c
- * otherwise.  Heap relations (heapam_storage_manager()) and sequences
- * (heap_create_with_catalog()) both ask here; an index follows its table.
+ * Block-mapped for a permanent relation in a versioned schema, whose pages
+ * branches share; md.c for every other relation, unless
+ * debug_block_mapped_heap makes every permanent relation that is neither
+ * shared (so in the global tablespace) nor a catalog block-mapped.  Heap
+ * relations (heapam_storage_manager()) and sequences
+ * (heap_create_with_catalog()) both ask here; an index follows its table,
+ * and so does a TOAST table (create_toast_table()), its schema pg_toast.
+ * A relation never moves between a versioned schema and another kind
+ * (CatalogBranchCheckMove()), so what is chosen here stays right.
  */
 int
-NewRelationStorageManager(char relpersistence, bool shared, bool catalog)
+NewRelationStorageManager(char relpersistence, bool shared, bool catalog,
+						  Oid relnamespace)
 {
 	if (relpersistence != RELPERSISTENCE_PERMANENT || shared || catalog)
 		return SMGR_MD;
-	if (debug_block_mapped_heap)
+	if (debug_block_mapped_heap || NamespaceBranch(relnamespace) != 0)
 		return SMGR_BMAP;
 	return SMGR_MD;
 }

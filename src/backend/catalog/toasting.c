@@ -27,6 +27,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/storage.h"
 #include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -132,6 +133,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 {
 	Oid			relOid = RelationGetRelid(rel);
 	HeapTuple	reltup;
+	int			saved_smgr;
 	TupleDesc	tupdesc;
 	bool		shared_relation;
 	bool		mapped_relation;
@@ -303,27 +305,43 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	/* It's mapped if and only if its parent is, too */
 	mapped_relation = RelationIsMapped(rel);
 
-	toast_relid = heap_create_with_catalog(toast_relname,
-										   namespaceid,
-										   rel->rd_rel->reltablespace,
-										   toastOid,
-										   InvalidOid,
-										   InvalidOid,
-										   rel->rd_rel->relowner,
-										   table_relation_toast_am(rel),
-										   tupdesc,
-										   NIL,
-										   RELKIND_TOASTVALUE,
-										   rel->rd_rel->relpersistence,
-										   shared_relation,
-										   mapped_relation,
-										   ONCOMMIT_NOOP,
-										   reloptions,
-										   false,
-										   true,
-										   true,
-										   OIDOldToast,
-										   NULL);
+	/*
+	 * A TOAST table's storage manager is its table's: its schema is pg_toast,
+	 * whichever schema its table is in (a rewrite's new heap already says
+	 * which, new_relation_smgr).
+	 */
+	saved_smgr = new_relation_smgr;
+	if (new_relation_smgr < 0 && RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		new_relation_smgr = RelationGetSmgr(rel)->smgr_which;
+	PG_TRY();
+	{
+		toast_relid = heap_create_with_catalog(toast_relname,
+											   namespaceid,
+											   rel->rd_rel->reltablespace,
+											   toastOid,
+											   InvalidOid,
+											   InvalidOid,
+											   rel->rd_rel->relowner,
+											   table_relation_toast_am(rel),
+											   tupdesc,
+											   NIL,
+											   RELKIND_TOASTVALUE,
+											   rel->rd_rel->relpersistence,
+											   shared_relation,
+											   mapped_relation,
+											   ONCOMMIT_NOOP,
+											   reloptions,
+											   false,
+											   true,
+											   true,
+											   OIDOldToast,
+											   NULL);
+	}
+	PG_FINALLY();
+	{
+		new_relation_smgr = saved_smgr;
+	}
+	PG_END_TRY();
 	Assert(toast_relid != InvalidOid);
 
 	/* make the toast relation visible, else table_open will fail */
