@@ -44,6 +44,7 @@ tests += {
       't/201_branch_sessions.pl',
       't/202_branch_decoding.pl',
       't/203_branch_initdb_oids.pl',
+      't/204_branch_pg_upgrade.pl',
     ],
   },
 }

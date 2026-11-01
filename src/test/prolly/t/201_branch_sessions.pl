@@ -94,12 +94,17 @@ $s1->quit;
 $s2->quit;
 
 # pg_dump answers per branch
+my $dump_with = sub {
+	my ($options, @args) = @_;
+	local $ENV{PGOPTIONS} = $options;
+	my ($stdout, $stderr);
+	IPC::Run::run([ 'pg_dump', '-s', @args, '-d', $node->connstr('postgres') ],
+		'>', \$stdout, '2>', \$stderr);
+	return ($stdout, $stderr);
+};
 my $dump = sub {
 	my ($branch) = @_;
-	local $ENV{PGOPTIONS} = "-c catalog_branch=$branch";
-	my ($stdout, $stderr);
-	IPC::Run::run([ 'pg_dump', '-s', '-n', 'app', '-d', $node->connstr('postgres') ],
-		'>', \$stdout, '2>', \$stderr);
+	my ($stdout) = $dump_with->("-c catalog_branch=$branch", '-n', 'app');
 	return $stdout;
 };
 my $d1 = $dump->($b1);
@@ -108,8 +113,22 @@ like($d1, qr/CREATE INDEX t_v1/, 'the first branch\'s dump has its index');
 unlike($d1, qr/extra/, 'and not the other\'s column');
 like($d2, qr/extra integer DEFAULT 7/, 'the second branch\'s dump has its column');
 unlike($d2, qr/t_v1/, 'and not the other\'s index');
-unlike($dump->(0), qr/CREATE TABLE/, 'a dump on no branch has no versioned table');
 like($d1, qr/CREATE SCHEMA app VERSIONED;/, 'a versioned schema is dumped as one');
+
+# a dump on no branch has the shared schemas alone, and says what it leaves out
+my ($d0, $e0) = $dump_with->('-c catalog_branch=0');
+unlike($d0, qr/CREATE SCHEMA app|CREATE TABLE app\./, 'a dump on no branch has no versioned schema');
+like($d0, qr/CREATE TABLE pub\.p/, 'but has the shared ones');
+like($e0, qr/the dump leaves out 1 versioned schemas, which belong to branches/,
+	'and warns of the versioned schemas it leaves out');
+
+# with the catalog filter off for the session, pg_dump turns it on: a dump
+# is the branch's, never every branch's mixed
+my ($d1_off, $e1_off) = $dump_with->("-c catalog_branch=$b1 -c catalog_branch_filter=off", '-n', 'app');
+is($e1_off, '', 'a dump with the filter off makes no complaint');
+# (each dump restricts psql with a key of its own)
+my $unkeyed = sub { my ($d) = @_; $d =~ s/^\\(un)?restrict \S+$//mg; return $d; };
+is($unkeyed->($d1_off), $unkeyed->($d1), 'and is the branch\'s dump');
 
 # a new branch made from the first branch's dump, definitions and rows
 my $b3 = $node->safe_psql('postgres', 'SELECT pg_branch_id_allocate()');
@@ -119,6 +138,7 @@ my ($full, $err);
 	IPC::Run::run([ 'pg_dump', '-n', 'app', '-d', $node->connstr('postgres') ],
 		'>', \$full, '2>', \$err);
 }
+is($err, '', 'a branch\'s dump makes no complaint');
 {
 	local $ENV{PGOPTIONS} = "-c catalog_branch=$b3";
 	my ($out, $rerr);

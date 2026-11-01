@@ -1512,6 +1512,22 @@ setup_connection(Archive *AH, const char *dumpencoding,
 		ExecuteSqlStatement(AH, "SET row_security = off");
 
 	/*
+	 * On a server with branched catalogs, the dump is of the session's
+	 * branch and the shared schemas: with catalog_branch_filter off, its
+	 * catalog queries would see every branch's rows, and mix them.
+	 */
+	if (AH->remoteVersion >= 90600)
+	{
+		PGresult   *res;
+
+		res = ExecuteSqlQueryForSingleRow(AH,
+										  "SELECT pg_catalog.current_setting('catalog_branch_filter', true)");
+		if (!PQgetisnull(res, 0, 0) && strcmp(PQgetvalue(res, 0, 0), "off") == 0)
+			ExecuteSqlStatement(AH, "SET catalog_branch_filter = on");
+		PQclear(res);
+	}
+
+	/*
 	 * For security reasons, we restrict the expansion of non-system views and
 	 * access to foreign tables during the pg_dump process. This restriction
 	 * is adjusted when dumping foreign table data.
@@ -6070,6 +6086,34 @@ getNamespaces(Archive *fout)
 						  PGRES_TUPLES_OK);
 	branched = PQntuples(res) > 0;
 	PQclear(res);
+
+	/*
+	 * On no branch, the dump has the shared schemas alone.  Say so when
+	 * branches have versioned schemas (which only a superuser can count):
+	 * a dump that looks whole would not be.
+	 */
+	if (branched)
+	{
+		res = ExecuteSqlQueryForSingleRow(fout,
+										  "SELECT pg_catalog.current_setting('catalog_branch') = '0' "
+										  "AND pg_catalog.current_setting('is_superuser') = 'on'");
+		if (PQgetvalue(res, 0, 0)[0] == 't')
+		{
+			PQclear(res);
+			ExecuteSqlStatement(fout, "SET catalog_branch_filter = off");
+			res = ExecuteSqlQueryForSingleRow(fout,
+											  "SELECT pg_catalog.count(DISTINCT nspname) FROM pg_catalog.pg_namespace "
+											  "WHERE nspbranch <> 0");
+			ExecuteSqlStatement(fout, "SET catalog_branch_filter = on");
+			if (atoi(PQgetvalue(res, 0, 0)) > 0)
+			{
+				pg_log_warning("the dump leaves out %s versioned schemas, which belong to branches",
+							   PQgetvalue(res, 0, 0));
+				pg_log_warning_hint("Set \"catalog_branch\" (for example with PGOPTIONS) to dump a branch's.");
+			}
+		}
+		PQclear(res);
+	}
 
 	/*
 	 * we fetch all namespaces including system ones, so that every object we

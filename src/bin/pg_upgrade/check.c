@@ -23,6 +23,7 @@ static void check_new_cluster_is_empty(void);
 static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
+static void check_for_branches(ClusterInfo *cluster);
 static void check_for_prepared_transactions(ClusterInfo *cluster);
 static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
 static void check_for_user_defined_postfix_ops(ClusterInfo *cluster);
@@ -606,6 +607,7 @@ check_and_dump_old_cluster(void)
 	 * Check for various failure cases
 	 */
 	check_is_install_user(&old_cluster);
+	check_for_branches(&old_cluster);
 	check_for_prepared_transactions(&old_cluster);
 	check_for_oldestxid_consistency(&old_cluster);
 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
@@ -1277,6 +1279,54 @@ check_for_prepared_transactions(ClusterInfo *cluster)
 	PQclear(res);
 
 	PQfinish(conn);
+
+	check_ok();
+}
+
+/*
+ * check_for_branches()
+ *
+ * A server with branched catalogs keeps each branch's catalog rows beside
+ * the shared ones, and its queries see only the session's branch's: the
+ * schema dump, and the lists of relations, made on no branch, would leave
+ * out every branch's objects, and their storage would be freed.  Until
+ * every branch can be upgraded, a cluster with versioned schemas, or with
+ * a branch allocated in any database, is refused.
+ */
+static void
+check_for_branches(ClusterInfo *cluster)
+{
+	prep_status("Checking for branches");
+
+	for (int dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
+	{
+		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
+		PGresult   *res;
+		bool		branched;
+
+		res = executeQueryOrDie(conn,
+								"SELECT 1 FROM pg_catalog.pg_attribute "
+								"WHERE attrelid = 'pg_catalog.pg_namespace'::pg_catalog.regclass "
+								"AND attname = 'nspbranch'");
+		branched = PQntuples(res) > 0;
+		PQclear(res);
+		if (branched)
+		{
+			PQclear(executeQueryOrDie(conn, "SET catalog_branch_filter = off"));
+			res = executeQueryOrDie(conn,
+									"SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_namespace "
+									"        WHERE nspbranch <> 0) > 0 OR "
+									"       (SELECT is_called FROM pg_catalog.pg_branch_id_seq)");
+			if (PQgetvalue(res, 0, 0)[0] == 't')
+				pg_fatal("Database \"%s\" has branches, which cannot be upgraded yet.\n"
+						 "Its versioned schemas, or the branches allocated in it, belong to\n"
+						 "branches whose catalog rows the upgrade would leave out.",
+						 active_db->db_name);
+			PQclear(res);
+		}
+		PQfinish(conn);
+	}
 
 	check_ok();
 }
