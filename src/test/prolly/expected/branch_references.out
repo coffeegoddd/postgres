@@ -88,6 +88,87 @@ SELECT count(*) FROM app2.c;
      1
 (1 row)
 
+-- default privileges in a versioned schema are its branch's
+SET catalog_branch = :b1;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE SELECT ON TABLES FROM PUBLIC;
+-- a cast from a shared type to a branch's type is that branch's
+CREATE FUNCTION app.tomood(int) RETURNS app.mood LANGUAGE sql IMMUTABLE
+	AS $$SELECT 'ok'::app.mood$$;
+CREATE CAST (int AS app.mood) WITH FUNCTION app.tomood(int);
+SELECT 1::app.mood;
+ mood 
+------
+ ok
+(1 row)
+
+DROP CAST (int AS app.mood);
+-- a branch's table cannot inherit from, or be a partition of, a shared one
+RESET catalog_branch;
+CREATE TABLE pub.ip (a int);
+CREATE TABLE pub.parent (a int) PARTITION BY LIST (a);
+SET catalog_branch = :b1;
+CREATE TABLE app.ch () INHERITS (pub.ip);
+ERROR:  "ch" cannot inherit from, or be a partition of, "ip"
+DETAIL:  A table and its parent must both be shared, or both be one branch's: a parent's scans and changes reach its children.
+CREATE TABLE app.part PARTITION OF pub.parent FOR VALUES IN (1);
+ERROR:  "part" cannot inherit from, or be a partition of, "parent"
+DETAIL:  A table and its parent must both be shared, or both be one branch's: a parent's scans and changes reach its children.
+CREATE TABLE app.loose (a int);
+ALTER TABLE app.loose INHERIT pub.ip;
+ERROR:  "loose" cannot inherit from, or be a partition of, "ip"
+DETAIL:  A table and its parent must both be shared, or both be one branch's: a parent's scans and changes reach its children.
+ALTER TABLE pub.parent ATTACH PARTITION app.loose FOR VALUES IN (2);
+ERROR:  "loose" cannot inherit from, or be a partition of, "parent"
+DETAIL:  A table and its parent must both be shared, or both be one branch's: a parent's scans and changes reach its children.
+-- one branch's tables may, and a temporary table may inherit from a shared one
+CREATE TABLE app.bparent (a int) PARTITION BY LIST (a);
+CREATE TABLE app.bpart PARTITION OF app.bparent FOR VALUES IN (1);
+CREATE TEMP TABLE tch () INHERITS (pub.ip);
+DROP TABLE tch;
+-- detaching a partition of a shared referenced table checks each branch's
+-- referencing table, whichever branch the session is on
+RESET catalog_branch;
+CREATE TABLE pub.pp (id int PRIMARY KEY) PARTITION BY LIST (id);
+CREATE TABLE pub.pp1 PARTITION OF pub.pp FOR VALUES IN (1);
+INSERT INTO pub.pp VALUES (1);
+SET catalog_branch = :b1;
+CREATE TABLE app.r (p int REFERENCES pub.pp);
+INSERT INTO app.r VALUES (1);
+SET catalog_branch = :b2;
+CREATE TABLE app.r (p int);
+ALTER TABLE pub.pp DETACH PARTITION pub.pp1;
+ERROR:  removing partition "pp1" violates foreign key constraint "r_p_fkey_1"
+DETAIL:  Key (p)=(1) is still referenced from table "r".
+SET catalog_branch = :b1;
+DROP TABLE app.r;
+-- a shared table's column type changed on no branch rebuilds each branch's
+-- foreign keys into it, which its queries don't see, and checks them on
+-- their own branch's tables
+RESET catalog_branch;
+ALTER TABLE pub.p ALTER COLUMN id TYPE bigint;
+SET catalog_branch = :b1;
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'pub.p'::regclass ORDER BY 1;
+ conname  |                  pg_get_constraintdef                   
+----------+---------------------------------------------------------
+ c_p_fkey | FOREIGN KEY (p) REFERENCES pub.p(id) ON DELETE CASCADE
+ c_r_fkey | FOREIGN KEY (r) REFERENCES pub.p(id) ON DELETE RESTRICT
+(2 rows)
+
+INSERT INTO app.c VALUES (13, 99, NULL);
+ERROR:  insert or update on table "c" violates foreign key constraint "c_p_fkey"
+DETAIL:  Key (p)=(99) is not present in table "p".
+SET catalog_branch = :b2;
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'pub.p'::regclass ORDER BY 1;
+ conname  |                  pg_get_constraintdef                   
+----------+---------------------------------------------------------
+ c_p_fkey | FOREIGN KEY (p) REFERENCES pub.p(id) ON DELETE CASCADE
+ c_r_fkey | FOREIGN KEY (r) REFERENCES pub.p(id) ON DELETE RESTRICT
+(2 rows)
+
+SET catalog_branch = :b2;
 SET client_min_messages = warning;
 DROP SCHEMA app, app2 CASCADE;
 SET catalog_branch = :b1;

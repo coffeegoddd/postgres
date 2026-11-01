@@ -81,7 +81,7 @@ patch src/backend/commands/publicationcmds.c  1b  ALTER PUBLICATION ... SET leav
 patch src/backend/commands/repack.c  1a  a rewrite's new heap stays in the old heap's storage manager
 patch src/backend/commands/schemacmds.c  1b  CREATE SCHEMA ... VERSIONED; renaming and changing the owner of the session's branch's schema
 patch src/backend/commands/sequence.c  1a  reads a sequence's value under a share lock, so a reader doesn't copy a page shared copy-on-write
-patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager
+patch src/backend/commands/tablecmds.c  1a  an index moved to another tablespace keeps its storage manager; also (1b) a branch's table cannot inherit from, or be a partition of, a shared one or another branch's
 patch src/backend/commands/tablespace.c  1a  removes a database's empty block map before its tablespace directory
 patch src/backend/commands/vacuum.c  1a  its own pages frozen eagerly for storage that shares pages, the freeze age the normal one (freezes_eagerly); lets go of dropped storage before vacuuming; settles captured roots before datfrozenxid advances
 patch src/backend/meson.build  0  links the engine's code in src/backend/prolly into the server
@@ -109,6 +109,7 @@ patch src/backend/utils/adt/Makefile  1a  builds the block map's SQL functions (
 patch src/backend/utils/adt/dbsize.c  1a  sizes a block-mapped relation and its visibility map by their logical lengths; its map fork counts as none
 patch src/backend/utils/adt/meson.build  1a  builds the block map's SQL functions (blockmapfuncs.c)
 patch src/backend/utils/adt/ri_triggers.c  1b  a foreign key's queries resolve names on its table's branch, whatever branch the session is on
+patch src/backend/utils/adt/ruleutils.c  1b  a constraint rebuilt by DDL is looked up with a catalog snapshot
 patch src/backend/utils/cache/funccache.c  1b  compiled functions are cached per branch
 patch src/backend/utils/cache/relcache.c  1a  a relation's new relfilenumber keeps its storage manager; an index follows its table
 patch src/backend/utils/fmgr/fmgr.c  1b  a function in a versioned schema runs on its schema's branch, a shared security definer function on no branch unless it sets one

@@ -2200,7 +2200,14 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 	StringInfoData buf;
 	SysScanDesc scandesc;
 	ScanKeyData scankey[1];
-	Snapshot	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+
+	/*
+	 * (a command rebuilding the constraint looks it up by object id, as
+	 * other DDL does, with a catalog snapshot, which sees every branch's)
+	 */
+	Snapshot	snapshot = RegisterSnapshot(fullCommand ?
+											GetCatalogSnapshot(ConstraintRelationId) :
+											GetTransactionSnapshot());
 	Relation	relation = table_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scankey[0],

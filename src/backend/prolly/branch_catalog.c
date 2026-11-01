@@ -107,44 +107,16 @@ search_namespace(const char *nspname, int32 branch)
 
 /*
  * The branch names resolve on while referential integrity runs a query for
- * a constraint of another branch's table (-1: the session's).  Reset when
- * a transaction or subtransaction aborts, since the code that set it is
- * then gone.
+ * a constraint (-1: the session's).  Its callers restore it on error too.
  */
 static int32 resolve_branch = -1;
-static bool resolve_callbacks = false;
-
-static void
-resolve_xact_callback(XactEvent event, void *arg)
-{
-	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
-		resolve_branch = -1;
-}
-
-static void
-resolve_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
-						 SubTransactionId parentSubid, void *arg)
-{
-	if (event == SUBXACT_EVENT_ABORT_SUB)
-		resolve_branch = -1;
-}
 
 int32
 CatalogBranchResolveAs(Oid nspid)
 {
 	int32		saved = resolve_branch;
-	int32		branch = NamespaceBranch(nspid);
 
-	if (branch != 0)
-	{
-		if (!resolve_callbacks)
-		{
-			RegisterXactCallback(resolve_xact_callback, NULL);
-			RegisterSubXactCallback(resolve_subxact_callback, NULL);
-			resolve_callbacks = true;
-		}
-		resolve_branch = branch;
-	}
+	resolve_branch = NamespaceBranch(nspid);
 	return saved;
 }
 

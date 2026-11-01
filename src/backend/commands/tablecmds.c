@@ -87,6 +87,7 @@
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
@@ -3613,6 +3614,8 @@ StoreCatalogInheritance1(Oid relationId, Oid parentOid,
 {
 	ObjectAddress childobject,
 				parentobject;
+
+	CatalogBranchCheckInheritance(relationId, parentOid);
 
 	/* store the pg_inherits row */
 	StoreSingleInheritance(relationId, parentOid, seqNumber);

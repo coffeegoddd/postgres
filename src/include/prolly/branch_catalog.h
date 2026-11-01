@@ -133,10 +133,18 @@ extern void CatalogBranchCheckDependencies(const ObjectAddress *depender,
 extern void CatalogBranchCheckMove(Oid oldnspid, Oid newnspid);
 
 /*
- * Resolves schema names as on the branch of namespace nspid (when it is a
- * versioned schema's) until CatalogBranchResolveRestore is given what this
- * returned, or the (sub)transaction aborts.  Referential integrity uses it
- * for the queries it runs on another branch's tables, which name them.
+ * Errors out unless table childid may inherit from (or be a partition of)
+ * table parentid: both shared, or both one branch's.  A dependency from a
+ * branch's table on a shared parent points the right way, but the parent's
+ * scans, row routing and DDL would reach into the branch.
+ */
+extern void CatalogBranchCheckInheritance(Oid childid, Oid parentid);
+
+/*
+ * Resolves schema names as on the branch of namespace nspid (no branch, if
+ * it is a shared schema) until CatalogBranchResolveRestore is given what
+ * this returned, on error too.  Referential integrity uses it for the
+ * queries it runs on another branch's tables, which name them.
  */
 extern int32 CatalogBranchResolveAs(Oid nspid);
 extern void CatalogBranchResolveRestore(int32 saved);

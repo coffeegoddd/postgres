@@ -52,6 +52,63 @@ CREATE SCHEMA app2 VERSIONED;
 ALTER TABLE app.c SET SCHEMA app2;
 SELECT count(*) FROM app2.c;
 
+-- default privileges in a versioned schema are its branch's
+SET catalog_branch = :b1;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE SELECT ON TABLES FROM PUBLIC;
+
+-- a cast from a shared type to a branch's type is that branch's
+CREATE FUNCTION app.tomood(int) RETURNS app.mood LANGUAGE sql IMMUTABLE
+	AS $$SELECT 'ok'::app.mood$$;
+CREATE CAST (int AS app.mood) WITH FUNCTION app.tomood(int);
+SELECT 1::app.mood;
+DROP CAST (int AS app.mood);
+
+-- a branch's table cannot inherit from, or be a partition of, a shared one
+RESET catalog_branch;
+CREATE TABLE pub.ip (a int);
+CREATE TABLE pub.parent (a int) PARTITION BY LIST (a);
+SET catalog_branch = :b1;
+CREATE TABLE app.ch () INHERITS (pub.ip);
+CREATE TABLE app.part PARTITION OF pub.parent FOR VALUES IN (1);
+CREATE TABLE app.loose (a int);
+ALTER TABLE app.loose INHERIT pub.ip;
+ALTER TABLE pub.parent ATTACH PARTITION app.loose FOR VALUES IN (2);
+-- one branch's tables may, and a temporary table may inherit from a shared one
+CREATE TABLE app.bparent (a int) PARTITION BY LIST (a);
+CREATE TABLE app.bpart PARTITION OF app.bparent FOR VALUES IN (1);
+CREATE TEMP TABLE tch () INHERITS (pub.ip);
+DROP TABLE tch;
+
+-- detaching a partition of a shared referenced table checks each branch's
+-- referencing table, whichever branch the session is on
+RESET catalog_branch;
+CREATE TABLE pub.pp (id int PRIMARY KEY) PARTITION BY LIST (id);
+CREATE TABLE pub.pp1 PARTITION OF pub.pp FOR VALUES IN (1);
+INSERT INTO pub.pp VALUES (1);
+SET catalog_branch = :b1;
+CREATE TABLE app.r (p int REFERENCES pub.pp);
+INSERT INTO app.r VALUES (1);
+SET catalog_branch = :b2;
+CREATE TABLE app.r (p int);
+ALTER TABLE pub.pp DETACH PARTITION pub.pp1;
+SET catalog_branch = :b1;
+DROP TABLE app.r;
+
+-- a shared table's column type changed on no branch rebuilds each branch's
+-- foreign keys into it, which its queries don't see, and checks them on
+-- their own branch's tables
+RESET catalog_branch;
+ALTER TABLE pub.p ALTER COLUMN id TYPE bigint;
+SET catalog_branch = :b1;
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'pub.p'::regclass ORDER BY 1;
+INSERT INTO app.c VALUES (13, 99, NULL);
+SET catalog_branch = :b2;
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE confrelid = 'pub.p'::regclass ORDER BY 1;
+
+SET catalog_branch = :b2;
 SET client_min_messages = warning;
 DROP SCHEMA app, app2 CASCADE;
 SET catalog_branch = :b1;

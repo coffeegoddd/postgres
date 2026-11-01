@@ -1583,6 +1583,54 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 }
 
 /*
+ * The queries referential integrity runs name the referencing table, and
+ * the referenced one: their names are resolved as on the branch of the
+ * referencing table, whatever branch this session is on (a referenced
+ * table is shared, or the referencing table's branch's).
+ */
+static SPIPlanPtr
+ri_prepare_on_branch(Relation fk_rel, const char *query, int nargs,
+					 const Oid *argtypes)
+{
+	int32		saved = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
+	SPIPlanPtr	plan;
+
+	PG_TRY();
+	{
+		plan = SPI_prepare(query, nargs, argtypes);
+	}
+	PG_FINALLY();
+	{
+		CatalogBranchResolveRestore(saved);
+	}
+	PG_END_TRY();
+	return plan;
+}
+
+static int
+ri_execute_on_branch(Relation fk_rel, SPIPlanPtr plan,
+					 const Datum *vals, const char *nulls,
+					 Snapshot snapshot, Snapshot crosscheck_snapshot,
+					 bool read_only, bool fire_triggers, long tcount)
+{
+	int32		saved = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
+	int			result;
+
+	PG_TRY();
+	{
+		result = SPI_execute_snapshot(plan, vals, nulls, snapshot,
+									  crosscheck_snapshot, read_only,
+									  fire_triggers, tcount);
+	}
+	PG_FINALLY();
+	{
+		CatalogBranchResolveRestore(saved);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/*
  * RI_Initial_Check -
  *
  * Check an entire table for non-matching values using a single query.
@@ -1797,7 +1845,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 * Generate the plan.  We don't need to cache it, and there are no
 	 * arguments to the plan.
 	 */
-	qplan = SPI_prepare(querybuf.data, 0, NULL);
+	qplan = ri_prepare_on_branch(fk_rel, querybuf.data, 0, NULL);
 
 	if (qplan == NULL)
 		elog(ERROR, "SPI_prepare returned %s for %s",
@@ -1810,7 +1858,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 * register the snapshot, because SPI_execute_snapshot will see to it. We
 	 * need at most one tuple returned, so pass limit = 1.
 	 */
-	spi_result = SPI_execute_snapshot(qplan,
+	spi_result = ri_execute_on_branch(fk_rel, qplan,
 									  NULL, NULL,
 									  GetLatestSnapshot(),
 									  InvalidSnapshot,
@@ -2036,7 +2084,7 @@ RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 * Generate the plan.  We don't need to cache it, and there are no
 	 * arguments to the plan.
 	 */
-	qplan = SPI_prepare(querybuf.data, 0, NULL);
+	qplan = ri_prepare_on_branch(fk_rel, querybuf.data, 0, NULL);
 
 	if (qplan == NULL)
 		elog(ERROR, "SPI_prepare returned %s for %s",
@@ -2049,7 +2097,7 @@ RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 * register the snapshot, because SPI_execute_snapshot will see to it. We
 	 * need at most one tuple returned, so pass limit = 1.
 	 */
-	spi_result = SPI_execute_snapshot(qplan,
+	spi_result = ri_execute_on_branch(fk_rel, qplan,
 									  NULL, NULL,
 									  GetLatestSnapshot(),
 									  InvalidSnapshot,
@@ -2579,7 +2627,6 @@ ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
 	Relation	query_rel;
 	Oid			save_userid;
 	int			save_sec_context;
-	int32		save_branch;
 
 	/*
 	 * Use the query type code to determine whether the query is run against
@@ -2600,9 +2647,7 @@ ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
 	 * Create the plan, resolving the names in it as on the branch of the
 	 * referencing table, whatever branch this session is on
 	 */
-	save_branch = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
-	qplan = SPI_prepare(querystr, nargs, argtypes);
-	CatalogBranchResolveRestore(save_branch);
+	qplan = ri_prepare_on_branch(fk_rel, querystr, nargs, argtypes);
 
 	if (qplan == NULL)
 		elog(ERROR, "SPI_prepare returned %s for %s", SPI_result_code_string(SPI_result), querystr);
@@ -2637,7 +2682,6 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	int			spi_result;
 	Oid			save_userid;
 	int			save_sec_context;
-	int32		save_branch;
 	Datum		vals[RI_MAX_NUMKEYS * 2];
 	char		nulls[RI_MAX_NUMKEYS * 2];
 
@@ -2728,12 +2772,10 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	 * the outer query's after-trigger context and fire after all RI updates
 	 * on the same row are complete, rather than immediately.
 	 */
-	save_branch = CatalogBranchResolveAs(RelationGetNamespace(fk_rel));
-	spi_result = SPI_execute_snapshot(qplan,
+	spi_result = ri_execute_on_branch(fk_rel, qplan,
 									  vals, nulls,
 									  test_snapshot, crosscheck_snapshot,
 									  false, false, limit);
-	CatalogBranchResolveRestore(save_branch);
 
 	/* Restore UID and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);

@@ -111,6 +111,7 @@
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -720,8 +721,6 @@ static const struct
 	OperatorFamilyRelationId, Anum_pg_amop_amopfamily},
 	{AccessMethodProcedureRelationId, AccessMethodProcedureOidIndexId, Anum_pg_amproc_oid,
 	OperatorFamilyRelationId, Anum_pg_amproc_amprocfamily},
-	{CastRelationId, CastOidIndexId, Anum_pg_cast_oid,
-	TypeRelationId, Anum_pg_cast_castsource},
 	{TransformRelationId, TransformOidIndexId, Anum_pg_transform_oid,
 	TypeRelationId, Anum_pg_transform_trftype},
 	{ExtensionRelationId, ExtensionOidIndexId, Anum_pg_extension_oid,
@@ -734,6 +733,8 @@ static const struct
 	{DefaultAclRelationId, DefaultAclOidIndexId, Anum_pg_default_acl_oid,
 	NamespaceRelationId, Anum_pg_default_acl_defaclnamespace},
 };
+
+static int32 cached_object_branch_depth(Oid classid, Oid objid, int depth);
 
 /*
  * Learns an object's branch, or its owner, from the catalogs.  Returns
@@ -755,6 +756,29 @@ learn(Oid classid, Oid objid, BranchMapEntry *e)
 						 Anum_pg_namespace_nspbranch, &value))
 			return false;
 		e->branch = DatumGetInt32(value);
+		return true;
+	}
+
+	/*
+	 * A cast is a branch's if either of its types is (casts from a shared
+	 * type to a branch's are how extensions such as citext reach their
+	 * types): its source's, else its target's.  Their rows are hidden as
+	 * either type's (row_owners()); the cast is the one branch's that may
+	 * have it.
+	 */
+	if (classid == CastRelationId)
+	{
+		Datum		target;
+
+		if (!read_column(CastRelationId, CastOidIndexId, Anum_pg_cast_oid,
+						 objid, Anum_pg_cast_castsource, &value) ||
+			!read_column(CastRelationId, CastOidIndexId, Anum_pg_cast_oid,
+						 objid, Anum_pg_cast_casttarget, &target))
+			return false;
+		e->owner_class = TypeRelationId;
+		e->owner_objid = DatumGetObjectId(value);
+		if (cached_object_branch_depth(TypeRelationId, e->owner_objid, 1) == 0)
+			e->owner_objid = DatumGetObjectId(target);
 		return true;
 	}
 
@@ -832,6 +856,14 @@ cached_object_branch_depth(Oid classid, Oid objid, int depth)
 
 	map_stats.probes++;
 	if (!OidIsValid(objid) || depth > 4)
+		return 0;
+
+	/*
+	 * Objects initdb made are shared, and need no reading (nor could the
+	 * TOAST tables of the catalogs be found an owner: pinned objects have no
+	 * dependencies recorded)
+	 */
+	if (objid < FirstNormalObjectId)
 		return 0;
 
 	key = map_key(classid, objid);
@@ -941,6 +973,26 @@ CatalogBranchCheckMove(Oid oldnspid, Oid newnspid)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot move objects between a versioned schema and another kind or branch of schema")));
+}
+
+void
+CatalogBranchCheckInheritance(Oid childid, Oid parentid)
+{
+	Oid			childnsp = get_rel_namespace(childid);
+	Oid			parentnsp = get_rel_namespace(parentid);
+
+	/*
+	 * (a temporary table is the session's alone: its parent's scans in
+	 * other sessions pass over it)
+	 */
+	if (isAnyTempNamespace(childnsp))
+		return;
+	if (NamespaceBranch(childnsp) != NamespaceBranch(parentnsp))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("\"%s\" cannot inherit from, or be a partition of, \"%s\"",
+						get_rel_name(childid), get_rel_name(parentid)),
+				 errdetail("A table and its parent must both be shared, or both be one branch's: a parent's scans and changes reach its children.")));
 }
 
 static int32
