@@ -1016,7 +1016,7 @@ count_changes(Relation rel, Buffer primary, int mode,
 			  const ChunkIndexEntry *chunk, uint32 bucket,
 			  const IndexCache *masks, bool any_running, int64 *drefs,
 			  int64 *droots, TransactionId *running, BlockNumber *own_blk,
-			  int *own_at)
+			  int *own_at, bool *any_own)
 {
 	Buffer		cur = primary;
 	TransactionId mine = own_blk ? GetCurrentTransactionIdIfAny() : InvalidTransactionId;
@@ -1024,6 +1024,8 @@ count_changes(Relation rel, Buffer primary, int mode,
 	*drefs = *droots = 0;
 	if (running)
 		*running = InvalidTransactionId;
+	if (any_own)
+		*any_own = false;
 	if (own_blk)
 		*own_blk = InvalidBlockNumber;
 	for (;;)
@@ -1043,6 +1045,8 @@ count_changes(Relation rel, Buffer primary, int mode,
 				case ENTRY_VISIBLE:
 					*drefs += (int32) e->refs;
 					*droots += (int32) e->roots;
+					if (any_own && TransactionIdIsCurrentTransactionId(e->xmin))
+						*any_own = true;
 					if (own_blk && TransactionIdIsValid(mine) && e->xmin == mine)
 					{
 						*own_blk = BufferGetBlockNumber(cur);
@@ -1231,7 +1235,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	if (found != primary)
 		UnlockReleaseBuffer(found);
 	count_changes(idx, primary, BUFFER_LOCK_SHARE, out, bucket, &masks,
-				  false, &drefs, &droots, NULL, NULL, NULL);
+				  false, &drefs, &droots, NULL, NULL, NULL, NULL);
 	UnlockReleaseBuffer(primary);
 	if (!counts_add(out, drefs, droots))
 		ereport(ERROR,
@@ -1336,6 +1340,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	TransactionId running;
 	BlockNumber own_blk;
 	int			own_at;
+	bool		any_own;
 
 	PreventCommandIfReadOnly("change a chunk index");
 	memset(&change, 0, sizeof(change));
@@ -1366,7 +1371,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		if (found != primary)
 			UnlockReleaseBuffer(found);
 		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
-					  false, &crefs, &croots, &running, &own_blk, &own_at);
+					  false, &crefs, &croots, &running, &own_blk, &own_at, &any_own);
 
 		/*
 		 * (a decrease waits for another's decreases, as a row's update waits
@@ -1400,9 +1405,12 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		out->roots = (uint32) roots;
 	}
 
-	if (BlockNumberIsValid(own_blk) && drefs == 0 && droots == 0)
+	if (any_own && drefs == 0 && droots == 0)
 	{
-		/* (this transaction's change of the chunk's counts holds it already) */
+		/*
+		 * (a change of this transaction's, or of one it is part of, holds the
+		 * chunk already, for as long as this subtransaction runs)
+		 */
 	}
 	else if (BlockNumberIsValid(own_blk))
 	{
@@ -1480,7 +1488,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_UNLOCK);
 	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
-				  true, &drefs, &droots, &running, NULL, NULL);
+				  true, &drefs, &droots, &running, NULL, NULL, NULL);
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
 	/*

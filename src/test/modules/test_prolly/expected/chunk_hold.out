@@ -1,0 +1,89 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_begin a_free b_put a_commit
+stored
+------
+t     
+(1 row)
+
+step a_begin: BEGIN;
+step a_free: SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0801'), 1, 20)]) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step b_put: SELECT stored FROM test_cs_put('pages', '\x0a0801'); <waiting ...>
+step a_commit: COMMIT;
+step b_put: <... completed>
+stored
+------
+t     
+(1 row)
+
+test_cs_free
+------------
+           1
+(1 row)
+
+
+starting permutation: a_begin a_free b_put a_rollback
+stored
+------
+t     
+(1 row)
+
+step a_begin: BEGIN;
+step a_free: SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0801'), 1, 20)]) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step b_put: SELECT stored FROM test_cs_put('pages', '\x0a0801'); <waiting ...>
+step a_rollback: ROLLBACK;
+step b_put: <... completed>
+stored
+------
+f     
+(1 row)
+
+test_cs_free
+------------
+           1
+(1 row)
+
+
+starting permutation: a_begin a_save a_hold a_rollback_to b_free a_commit b_put
+stored
+------
+t     
+(1 row)
+
+step a_begin: BEGIN;
+step a_save: SAVEPOINT s;
+step a_hold: SELECT test_chunk_hold('pg_history.chunk_index', substr(sha256('\x0a0801'), 1, 20)) AS held;
+held
+----
+t   
+(1 row)
+
+step a_rollback_to: ROLLBACK TO s;
+step b_free: SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0801'), 1, 20)]) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step a_commit: COMMIT;
+step b_put: SELECT stored FROM test_cs_put('pages', '\x0a0801');
+stored
+------
+t     
+(1 row)
+
+test_cs_free
+------------
+           1
+(1 row)
+

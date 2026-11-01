@@ -1,0 +1,99 @@
+-- A transaction holds each chunk it puts until it ends: a chunk found
+-- stored already, by a change of its counts adding nothing, written once
+-- (not again by the transaction, nor a subtransaction of one that has
+-- one); a pack's chunks found that another found of the pack references,
+-- held by that one's references, with nothing written.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SET chunk_free_in_background = off;
+SELECT test_chunk_format_refs(true);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+CREATE FUNCTION hh(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+-- (a leaf, and a chunk referencing it)
+CREATE FUNCTION leaf() RETURNS bytea LANGUAGE sql IMMUTABLE AS $$SELECT '\x0a0701'::bytea$$;
+CREATE FUNCTION parent() RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x5201'::bytea || hh(leaf())$$;
+SELECT (test_cs_put('pages', leaf())).stored AS leaf, (test_cs_put('pages', parent())).stored AS parent;
+ leaf | parent 
+------+--------
+ t    | t
+(1 row)
+
+VACUUM pg_history.chunk_index;
+SELECT entries AS e0 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
+BEGIN;
+SELECT test_cs_put_many('pages', ARRAY[hh(parent()), hh(leaf())], ARRAY[parent(), leaf()]) AS stored;
+ stored 
+--------
+      0
+(1 row)
+
+SELECT entries - :e0 AS holds_written FROM test_chunk_index_shape('pg_history.chunk_index');
+ holds_written 
+---------------
+             1
+(1 row)
+
+SELECT test_chunk_hold('pg_history.chunk_index', hh(parent())) AS held_again;
+ held_again 
+------------
+ t
+(1 row)
+
+SAVEPOINT s;
+SELECT test_chunk_hold('pg_history.chunk_index', hh(parent())) AS held_in_subtransaction;
+ held_in_subtransaction 
+------------------------
+ t
+(1 row)
+
+SELECT entries - :e0 AS holds_still FROM test_chunk_index_shape('pg_history.chunk_index');
+ holds_still 
+-------------
+           1
+(1 row)
+
+RELEASE s;
+-- (its own freeing passes both by)
+SELECT test_cs_free('pages', ARRAY[hh(parent()), hh(leaf())]) AS freed_own;
+ freed_own 
+-----------
+         0
+(1 row)
+
+COMMIT;
+-- a hold is a change, refused in a read-only transaction
+BEGIN READ ONLY;
+SELECT test_chunk_hold('pg_history.chunk_index', hh(parent()));
+ERROR:  cannot execute hold a chunk in a read-only transaction
+ROLLBACK;
+-- a pack refused for a reference the store lacks counts none of the others
+VACUUM pg_history.chunk_index;
+SELECT entries AS e1 FROM test_chunk_index_shape('pg_history.chunk_index') \gset
+SELECT test_cs_put_many('pages', ARRAY[hh('\x5202'::bytea || hh(leaf()) || hh('\x0a0799'))],
+	ARRAY['\x5202'::bytea || hh(leaf()) || hh('\x0a0799')]);
+ERROR:  chunk 4c1fc5d06505bdc64a1f32b6643c48d33594e5a0 references chunk 31843ebe1c26f3b46134ba82e5dc2aaf63d6666d, which the store does not have
+SELECT entries - :e1 AS left_behind FROM test_chunk_index_shape('pg_history.chunk_index');
+ left_behind 
+-------------
+           0
+(1 row)
+
+SELECT test_cs_free('pages', ARRAY[hh(parent()), hh(leaf())]) AS freed;
+ freed 
+-------
+     2
+(1 row)
+
+SELECT test_chunk_format_refs(false);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+DROP FUNCTION hh(bytea), leaf(), parent();

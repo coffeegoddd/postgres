@@ -1,7 +1,6 @@
-# A pack of many new chunks, its transaction open, holds them with no pins
-# (no other backend's freer frees chunks whose entries are not committed,
-# and its own passes them by): its table of pins does not fill, which would
-# count as pinning every chunk, and another's freeing goes on.  Its own
+# A pack of many new chunks, its transaction open, holds them by their
+# entries (no other backend's freer frees chunks whose entries are not
+# committed, and its own passes them by), and another's freeing goes on.  Its own
 # freeing keeps them.  So too a pack whose chunks reference many the store
 # has (their references, counted, hold them), one put again in the same
 # transaction (its chunks found its own), and one whose chunks are all the

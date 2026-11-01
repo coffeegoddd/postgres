@@ -126,8 +126,11 @@ typedef struct ChunkIndexRoutine
 	 * the chunk's when it commits), and answers the entry's counts after,
 	 * as this transaction sees them; false if there is no entry.  Taking a
 	 * count below zero is an error; a decrease waits for another
-	 * transaction decreasing the chunk's counts to end.  A transaction's
-	 * changes of one chunk's counts are one change.
+	 * transaction decreasing the chunk's counts to end.  A subtransaction's
+	 * changes of one chunk's counts are one change.  Adding nothing holds
+	 * the chunk: no other transaction frees it while this one runs (a
+	 * change is written, unless this transaction, or one it is part of,
+	 * has one of the chunk already).
 	 */
 	bool		(*adjust) (Relation idx, const uint8 *hash, int32 drefs,
 						   int32 droots, ChunkIndexEntry *out);
@@ -143,9 +146,8 @@ typedef struct ChunkIndexRoutine
 	/*
 	 * Marks the chunk's entry freed by this transaction, its entry (counts
 	 * and all) in *out, if nothing holds it: its counts zero, no other
-	 * transaction changing them, and held(hash) false (asked with the
-	 * chunk's bucket locked, so that whatever looks the chunk up after
-	 * sees it being freed).  False otherwise.
+	 * transaction changing them, this transaction not putting it, and
+	 * held(hash) false (this transaction's own holds).  False otherwise.
 	 */
 	bool		(*free) (Relation idx, const uint8 *hash,
 						 bool (*held) (const uint8 *hash),

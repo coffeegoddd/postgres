@@ -42,6 +42,7 @@ test_prolly_isolation = [
   'chunk_vacuum_cancel',
   'chunk_pack_pins',
   'chunk_take_back',
+  'chunk_hold',
 ]
 # (these need injection points)
 if get_option('injection_points')
@@ -73,6 +74,7 @@ tests += {
       'chunk_index',
       'chunk_refs',
       'chunk_free',
+      'chunk_holds',
       'chunk_reclaim',
       'history_pointers',
       'chunk_store_pages',
