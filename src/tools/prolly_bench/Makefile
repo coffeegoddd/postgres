@@ -19,9 +19,13 @@ subdir = src/tools/prolly_bench
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-BENCHMARKS =
+BENCHMARKS = bench-branch-filter
 
 all:
+
+# what the catalog filter costs a session at 1000 branches of a schema
+bench-branch-filter:
+	$(srcdir)/branch_filter.sh '$(bindir)' '$(abs_top_builddir)/$(subdir)/tmp_bench'
 
 run: $(BENCHMARKS)
 
