@@ -27,6 +27,13 @@
  * comments and statistics.  A branch with any other kind of object is
  * refused, naming it: no copy is ever half made.
  *
+ * Locks: the source branch exclusively, which DDL recording a dependency
+ * on the branch's objects holds shared (CatalogBranchCheckDependencies()),
+ * then each of its relations against index builds and ANALYZE (and its
+ * sequences against nextval()).  DDL takes its relations' locks first, so
+ * a transaction of several DDL statements on the branch racing a copy can
+ * deadlock with it; the deadlock detector then aborts one of them.
+ *
  * Every row made is then checked: no object id column, and no number in an
  * expression tree, may name an object of the source branch.  A reference a
  * copy failed to rewrite is so an error, not a branch that reads another
@@ -415,6 +422,12 @@ collect(CopyState *cs)
 		if (obj.classid == RelationRelationId)
 		{
 			LockRelationOid(obj.oid, ShareUpdateExclusiveLock);
+			/* (dropped while the copy waited for it) */
+			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(obj.oid)))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("a relation of branch %d was dropped while it was being copied",
+								cs->src)));
 			if (get_rel_relkind(obj.oid) == RELKIND_SEQUENCE)
 				LockRelationOid(obj.oid, ShareLock);
 		}
@@ -594,6 +607,39 @@ map_type(CopyState *cs, Oid typid)
 	return copy_map(cs, TypeRelationId, typid);
 }
 
+/* whether type typid's values are object ids (oid, regclass, ...) */
+static bool
+oid_valued_type(Oid typid)
+{
+	switch (typid)
+	{
+		case OIDOID:
+		case REGCLASSOID:
+		case REGTYPEOID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGNAMESPACEOID:
+		case REGCOLLATIONOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+		case REGROLEOID:
+			return true;
+	}
+	return false;
+}
+
+/* an array of object ids' elements */
+static void
+oid_array_elems(Datum array, Datum **elems, int *n)
+{
+	ArrayType  *arr = DatumGetArrayTypeP(array);
+
+	deconstruct_array(arr, ARR_ELEMTYPE(arr), sizeof(Oid), true, TYPALIGN_INT,
+					  elems, NULL, n);
+}
+
 /* a constant of an object identifier type names an object: its copy's */
 static void
 map_const(CopyState *cs, Const *c)
@@ -612,15 +658,12 @@ map_const(CopyState *cs, Const *c)
 	if (c->constisnull)
 		return;
 	/* (an array of object ids can't be rewritten in place: none may be copied) */
-	if (c->consttype == OIDARRAYOID || c->consttype == REGCLASSARRAYOID ||
-		c->consttype == REGTYPEARRAYOID || c->consttype == REGPROCARRAYOID ||
-		c->consttype == REGPROCEDUREARRAYOID)
+	if (oid_valued_type(get_element_type(c->consttype)))
 	{
 		Datum	   *elems;
 		int			n;
 
-		deconstruct_array_builtin(DatumGetArrayTypeP(c->constvalue),
-								  get_element_type(c->consttype), &elems, NULL, &n);
+		oid_array_elems(c->constvalue, &elems, &n);
 		for (int i = 0; i < n; i++)
 		{
 			Oid			oid = DatumGetObjectId(elems[i]);
@@ -1213,8 +1256,25 @@ check_oid(CopyState *cs, Oid catid, Oid oid, const char *column)
 {
 	if (OidIsValid(oid) &&
 		hash_search(cs->sources, &oid, HASH_FIND, NULL) != NULL)
-		elog(ERROR, "a copy of a row of %s names object %u of the source branch in column %s",
-			 get_rel_name(catid), oid, column);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a copy of a row of %s names object %u of the source branch in column %s",
+						get_rel_name(catid), oid, column),
+				 errdetail("The copy doesn't rewrite that reference yet.")));
+}
+
+/* whether a field's name (not NUL-terminated) has part in it */
+static bool
+field_has(const char *field, int len, const char *part)
+{
+	int			plen = strlen(part);
+
+	for (int i = 0; i + plen <= len; i++)
+	{
+		if (strncmp(field + i, part, plen) == 0)
+			return true;
+	}
+	return false;
 }
 
 typedef struct CheckConsts
@@ -1234,25 +1294,17 @@ check_consts_walker(Node *node, CheckConsts *cc)
 	{
 		Const	   *c = (Const *) node;
 
-		if (!c->constisnull)
+		if (!c->constisnull && oid_valued_type(c->consttype))
+			check_oid(cc->cs, cc->catid, DatumGetObjectId(c->constvalue),
+					  cc->column);
+		else if (!c->constisnull && oid_valued_type(get_element_type(c->consttype)))
 		{
-			switch (c->consttype)
-			{
-				case OIDOID:
-				case REGCLASSOID:
-				case REGTYPEOID:
-				case REGPROCOID:
-				case REGPROCEDUREOID:
-				case REGOPEROID:
-				case REGOPERATOROID:
-				case REGNAMESPACEOID:
-				case REGCOLLATIONOID:
-				case REGCONFIGOID:
-				case REGDICTIONARYOID:
-					check_oid(cc->cs, cc->catid, DatumGetObjectId(c->constvalue),
-							  cc->column);
-					break;
-			}
+			Datum	   *elems;
+			int			n;
+
+			oid_array_elems(c->constvalue, &elems, &n);
+			for (int i = 0; i < n; i++)
+				check_oid(cc->cs, cc->catid, DatumGetObjectId(elems[i]), cc->column);
 		}
 		return false;
 	}
@@ -1291,7 +1343,7 @@ check_tree(CopyState *cs, Oid catid, const char *text, const char *column)
 
 			/* (a position in the statement's text, a typmod, a length) */
 			not_oid = (fieldlen == 8 && strncmp(field, "location", 8) == 0) ||
-				memmem(field, fieldlen, "typmod", 6) != NULL ||
+				field_has(field, fieldlen, "typmod") ||
 				(fieldlen >= 3 && strncmp(field + fieldlen - 3, "len", 3) == 0);
 			if (!not_oid && v <= PG_UINT32_MAX)
 				check_oid(cs, catid, (Oid) v, column);
@@ -1439,6 +1491,7 @@ make_storage(CopyState *cs)
 			d->relpages = s->relpages;
 			d->reltuples = s->reltuples;
 			d->relallvisible = s->relallvisible;
+			d->relallfrozen = s->relallfrozen;
 			CatalogTupleUpdate(pg_class, &dst->t_self, dst);
 			heap_freetuple(src);
 			heap_freetuple(dst);
