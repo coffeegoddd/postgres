@@ -731,6 +731,7 @@ typedef struct EState
 									 * ExecutorRun() calls. */
 
 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
+	int32		es_catalog_branch;	/* catalog_branch when the query started */
 	int			es_instrument;	/* OR of InstrumentOption flags */
 	bool		es_finished;	/* true when ExecutorFinish is done */
 

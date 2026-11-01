@@ -136,6 +136,29 @@ CatalogBranchOfNames(void)
 	return resolve_branch >= 0 ? resolve_branch : catalog_branch;
 }
 
+int
+CatalogBranchEnter(int32 branch)
+{
+	int			nestlevel;
+	char		value[12];
+
+	if (branch == catalog_branch)
+		return -1;
+	nestlevel = NewGUCNestLevel();
+	snprintf(value, sizeof(value), "%d", branch);
+	(void) set_config_option("catalog_branch", value,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return nestlevel;
+}
+
+void
+CatalogBranchLeave(int nestlevel)
+{
+	if (nestlevel >= 0)
+		AtEOXact_GUC(true, nestlevel);
+}
+
 HeapTuple
 SearchNamespaceByName(const char *nspname)
 {

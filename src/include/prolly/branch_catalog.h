@@ -111,6 +111,15 @@ extern PGDLLIMPORT const BranchCatalogCopyRoutine DependencyBranchCatalogCopy;
  */
 extern int32 CatalogBranchOfNames(void);
 
+/*
+ * Runs what follows on branch, as a query runs each time on the branch it
+ * started on: answers the GUC nesting level to give CatalogBranchLeave(), or
+ * -1 if the session is on it already.  (An error unwinds it with the
+ * transaction or subtransaction, as it does a function's SET clause.)
+ */
+extern int	CatalogBranchEnter(int32 branch);
+extern void CatalogBranchLeave(int nestlevel);
+
 /* The namespace named nspname this session sees: its branch's, else shared. */
 extern HeapTuple SearchNamespaceByName(const char *nspname);
 extern Oid	NamespaceOidByName(const char *nspname);
