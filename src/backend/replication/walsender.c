@@ -71,6 +71,7 @@
 #include "miscadmin.h"
 #include "nodes/replnodes.h"
 #include "pgstat.h"
+#include "prolly/branch_catalog.h"
 #include "postmaster/interrupt.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
@@ -1547,6 +1548,21 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	Assert(!MyReplicationSlot);
 
 	ReplicationSlotAcquire(cmd->slotname, true, true);
+
+	/*
+	 * A slot made on a branch decodes that branch's changes (and the shared
+	 * schemas'), whichever the session's branch is.  A subscriber lists the
+	 * tables it subscribes to, and copies them, in sessions on its
+	 * connection's branch: streaming another branch's changes to it would
+	 * reach tables it didn't list, or miss those it did.
+	 */
+	if (MyReplicationSlot->data.branch != catalog_branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("replication slot \"%s\" was made on branch %d, and this connection is on branch %d",
+						cmd->slotname, MyReplicationSlot->data.branch, catalog_branch),
+				 errhint("Connect on the slot's branch (options=-c catalog_branch=%d).",
+						 MyReplicationSlot->data.branch)));
 
 	/*
 	 * Force a disconnect, so that the decoding code doesn't need to care
