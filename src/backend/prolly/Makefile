@@ -23,8 +23,8 @@ OBJS = \
 	chunk_log.o \
 	chunk_pin.o \
 	chunk_pointers.o \
-	chunk_xlog.o \
 	chunk_store.o \
+	chunk_xlog.o \
 	registry.o
 
 include $(top_srcdir)/src/backend/common.mk
