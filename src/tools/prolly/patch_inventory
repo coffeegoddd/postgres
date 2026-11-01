@@ -135,8 +135,11 @@ patch src/backend/utils/misc/postgresql.conf.sample  1a  block_map_copy_images, 
 patch src/backend/utils/time/snapmgr.c  1b  marks catalog snapshots, whose scans the catalog filter leaves whole
 patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose checksums use logical block numbers; refuses --enable with block-mapped storage
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
-patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA ... VERSIONED; turns catalog_branch_filter on, and warns of the versioned schemas a dump on no branch leaves out; writes a subscription's catalog_branch
-patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch
+patch src/bin/pg_dump/parallel.c  2  a worker locks no relation for the history store's data (HISTORY DATA)
+patch src/bin/pg_dump/pg_backup.h  2  --no-history (DumpOptions.no_history)
+patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA ... VERSIONED; turns catalog_branch_filter on, and warns of the versioned schemas a dump on no branch leaves out; writes a subscription's catalog_branch; also (2) dumps the history store (HISTORY DATA: its chunks, then its pointers), --no-history
+patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch; also (2) DO_HISTORY_DATA, HistoryDataInfo
+patch src/bin/pg_dump/pg_dump_sort.c  2  DO_HISTORY_DATA's place in the data section
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
 patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) a cluster whose history store holds chunks or pointers is refused
