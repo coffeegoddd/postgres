@@ -122,13 +122,14 @@ typedef struct ChunkIndexRoutine
 
 	/*
 	 * Marks the chunk's entry freed by this transaction, its entry (counts
-	 * and all) in *out, if nothing holds it: its counts zero, and no
-	 * other transaction changing them.  False otherwise.
+	 * and all) in *out, if nothing holds it: its counts zero, no other
+	 * transaction changing them, and held(hash) false (asked with the
+	 * chunk's bucket locked, so that whatever looks the chunk up after
+	 * sees it being freed).  False otherwise.
 	 */
-	bool		(*free) (Relation idx, const uint8 *hash, ChunkIndexEntry *out);
-
-	/* Takes back this transaction's freeing of the chunk. */
-	void		(*unfree) (Relation idx, const uint8 *hash);
+	bool		(*free) (Relation idx, const uint8 *hash,
+						 bool (*held) (const uint8 *hash),
+						 ChunkIndexEntry *out);
 
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);

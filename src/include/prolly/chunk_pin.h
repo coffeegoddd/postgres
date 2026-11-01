@@ -3,13 +3,15 @@
  * chunk_pin.h
  *	  Transient holds on the history store's chunks: pins.
  *
- * A transaction pins each chunk it stores or finds already stored, until it
- * ends: the chunk is then held by what the transaction made of it (a
- * reference from a chunk it stored, a root it took) or freeing may have it.
- * A pin closes the race in which a chunk nothing holds is freed just as a
- * writer is about to use it: the writer pins, then looks the chunk up; the
- * freer marks the chunk being freed, then looks for pins, and lets it be if
- * it finds one.
+ * A transaction pins each chunk it puts (stored, or found stored already)
+ * and each chunk that names, until it ends: the chunk is then held by what
+ * the transaction made of it (a reference from a chunk it stored, a root it
+ * took) or freeing may have it.  A pin closes the race in which a chunk
+ * nothing holds is freed just as a writer is about to use it: the writer
+ * pins, then looks the chunk up; the freer, with the chunk's bucket locked,
+ * looks for pins, and marks the chunk being freed only if it finds none, so
+ * that a writer looking it up after waits for the freeing to end.  (A
+ * chunk only looked up, not put, is not pinned.)
  *
  * Pins are in shared memory, a table per backend of the chunks' hashes (a
  * prefix of each), written only by its backend and read by freers; they

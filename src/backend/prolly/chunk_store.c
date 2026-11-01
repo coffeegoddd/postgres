@@ -243,15 +243,10 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 		void	   *data;
 
 		CHECK_FOR_INTERRUPTS();
-		if (!ChunkIndex->free(idx, h, &e))
-			continue;
 
-		/* (marked, then pins looked for: see prolly/chunk_pin.h) */
-		if (ChunkPinned(h))
-		{
-			ChunkIndex->unfree(idx, h);
+		/* (pins looked for, then marked, the chunk locked: prolly/chunk_pin.h) */
+		if (!ChunkIndex->free(idx, h, ChunkPinned, &e))
 			continue;
-		}
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 		ChunkLog->read(log, e.loc, data, e.len);
 		check_hash(h, data, e.len, log, e.loc);
