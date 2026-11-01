@@ -52,6 +52,12 @@ CREATE SCHEMA app2 VERSIONED;
 ALTER TABLE app.c SET SCHEMA app2;
 SELECT count(*) FROM app2.c;
 
+-- a standalone composite type of a versioned schema (its relation's row is
+-- made after its row type's dependency is recorded)
+SET catalog_branch = :b1;
+CREATE TYPE app.pair AS (a int, b int);
+SELECT (ROW(1, 2)::app.pair).b;
+
 -- default privileges in a versioned schema are its branch's
 SET catalog_branch = :b1;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;

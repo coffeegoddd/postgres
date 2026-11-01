@@ -70,8 +70,11 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_cast.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_range.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -268,7 +271,10 @@ check_copyable(Oid classid, Oid oid)
 				if ((c->relkind != RELKIND_RELATION &&
 					 c->relkind != RELKIND_INDEX &&
 					 c->relkind != RELKIND_SEQUENCE &&
-					 c->relkind != RELKIND_TOASTVALUE) ||
+					 c->relkind != RELKIND_TOASTVALUE &&
+					 c->relkind != RELKIND_VIEW &&
+					 c->relkind != RELKIND_MATVIEW &&
+					 c->relkind != RELKIND_COMPOSITE_TYPE) ||
 					c->relispartition || c->relhassubclass ||
 					c->relpersistence != RELPERSISTENCE_PERMANENT ||
 					OidIsValid(c->reloftype) ||
@@ -297,12 +303,17 @@ check_copyable(Oid classid, Oid oid)
 				tup = fetch_row(TypeRelationId, TypeOidIndexId,
 								Anum_pg_type_oid, oid);
 				t = (Form_pg_type) GETSTRUCT(tup);
-				/* a table's row type, or its array (checked as the row type is) */
-				ok = (t->typtype == TYPTYPE_COMPOSITE && OidIsValid(t->typrelid) &&
-					  get_rel_relkind(t->typrelid) != RELKIND_COMPOSITE_TYPE) ||
-					(t->typcategory == TYPCATEGORY_ARRAY && OidIsValid(t->typelem) &&
-					 OidIsValid(get_typ_typrelid(t->typelem)) &&
-					 get_rel_relkind(get_typ_typrelid(t->typelem)) != RELKIND_COMPOSITE_TYPE);
+				/*
+				 * a relation's row type, an array, a domain, an enum or a range
+				 * (and its multirange); not a base type, whose functions are C's
+				 */
+				ok = t->typtype == TYPTYPE_COMPOSITE ||
+					t->typtype == TYPTYPE_DOMAIN ||
+					t->typtype == TYPTYPE_ENUM ||
+					t->typtype == TYPTYPE_RANGE ||
+					t->typtype == TYPTYPE_MULTIRANGE ||
+					(t->typtype == TYPTYPE_BASE && t->typcategory == TYPCATEGORY_ARRAY &&
+					 OidIsValid(t->typelem));
 				heap_freetuple(tup);
 				if (!ok)
 					refuse(classid, oid);
@@ -321,7 +332,7 @@ check_copyable(Oid classid, Oid oid)
 					  con->contype == CONSTRAINT_PRIMARY ||
 					  con->contype == CONSTRAINT_UNIQUE ||
 					  con->contype == CONSTRAINT_NOTNULL) &&
-					!OidIsValid(con->contypid) && !OidIsValid(con->conparentid);
+					!OidIsValid(con->conparentid);
 				heap_freetuple(tup);
 				if (!ok)
 					refuse(classid, oid);
@@ -329,7 +340,23 @@ check_copyable(Oid classid, Oid oid)
 			}
 		case AttrDefaultRelationId:
 		case DefaultAclRelationId:
+		case CastRelationId:
+		case PolicyRelationId:
+		case RewriteRelationId:
 			return;
+		case ProcedureRelationId:
+			{
+				char		kind;
+
+				tup = fetch_row(ProcedureRelationId, ProcedureOidIndexId,
+								Anum_pg_proc_oid, oid);
+				/* (an aggregate's pg_aggregate row is not copied yet) */
+				kind = ((Form_pg_proc) GETSTRUCT(tup))->prokind;
+				heap_freetuple(tup);
+				if (kind == PROKIND_AGGREGATE)
+					refuse(classid, oid);
+				return;
+			}
 		case TriggerRelationId:
 			{
 				Form_pg_trigger trg;
@@ -338,9 +365,7 @@ check_copyable(Oid classid, Oid oid)
 				tup = fetch_row(TriggerRelationId, TriggerOidIndexId,
 								Anum_pg_trigger_oid, oid);
 				trg = (Form_pg_trigger) GETSTRUCT(tup);
-				/* (a foreign key's) */
-				ok = trg->tgisinternal && OidIsValid(trg->tgconstraint) &&
-					!OidIsValid(trg->tgparentid);
+				ok = !OidIsValid(trg->tgparentid);
 				heap_freetuple(tup);
 				if (!ok)
 					refuse(classid, oid);
@@ -514,6 +539,55 @@ check_stored_types(CopyState *cs)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * An enum's labels' new object ids: an even id compares as the labels'
+ * order (enum_cmp()), so, as EnumValuesCreate() does, even ids are taken,
+ * sorted, and given in the labels' order.  A constant of the enum names a
+ * label (its value is the label's id), so each label is mapped, as an
+ * object, and is one of the source's for the check of rows made.
+ */
+static void
+assign_enum_oids(CopyState *cs, Oid typid)
+{
+	Relation	rel = table_open(EnumRelationId, RowExclusiveLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *labels = NIL;
+	Oid		   *oids;
+	int			n;
+	int			i;
+
+	ScanKeyInit(&key, Anum_pg_enum_enumtypid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typid));
+	scan = systable_beginscan(rel, EnumTypIdSortOrderIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		labels = lappend_oid(labels, ((Form_pg_enum) GETSTRUCT(tup))->oid);
+	systable_endscan(scan);
+
+	n = list_length(labels);
+	oids = palloc_array(Oid, Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		do
+			oids[i] = GetNewOidWithIndex(rel, EnumOidIndexId, Anum_pg_enum_oid);
+		while (oids[i] & 1);
+	}
+	qsort(oids, n, sizeof(Oid), oid_cmp);
+	table_close(rel, RowExclusiveLock);
+
+	i = 0;
+	/* (in the map and the source's ids, not among the objects copied) */
+	foreach_oid(label, labels)
+	{
+		CopyKey		k = {EnumRelationId, label};
+		CopyEntry  *e = hash_search(cs->map, &k, HASH_ENTER, NULL);
+
+		e->newoid = oids[i++];
+		(void) hash_search(cs->sources, &label, HASH_ENTER, NULL);
+	}
+}
+
 static void
 assign_oids(CopyState *cs)
 {
@@ -550,6 +624,8 @@ assign_oids(CopyState *cs)
 				e->newoid = GetNewOidWithIndex(rel, TypeOidIndexId,
 											   Anum_pg_type_oid);
 				table_close(rel, RowExclusiveLock);
+				if (get_typtype(obj.oid) == TYPTYPE_ENUM)
+					assign_enum_oids(cs, obj.oid);
 				break;
 			case ConstraintRelationId:
 				rel = table_open(ConstraintRelationId, RowExclusiveLock);
@@ -569,10 +645,34 @@ assign_oids(CopyState *cs)
 											   Anum_pg_trigger_oid);
 				table_close(rel, RowExclusiveLock);
 				break;
+			case CastRelationId:
+				rel = table_open(CastRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, CastOidIndexId,
+											   Anum_pg_cast_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
 			case DefaultAclRelationId:
 				rel = table_open(DefaultAclRelationId, RowExclusiveLock);
 				e->newoid = GetNewOidWithIndex(rel, DefaultAclOidIndexId,
 											   Anum_pg_default_acl_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case ProcedureRelationId:
+				rel = table_open(ProcedureRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, ProcedureOidIndexId,
+											   Anum_pg_proc_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case PolicyRelationId:
+				rel = table_open(PolicyRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, PolicyOidIndexId,
+											   Anum_pg_policy_oid);
+				table_close(rel, RowExclusiveLock);
+				break;
+			case RewriteRelationId:
+				rel = table_open(RewriteRelationId, RowExclusiveLock);
+				e->newoid = GetNewOidWithIndex(rel, RewriteOidIndexId,
+											   Anum_pg_rewrite_oid);
 				table_close(rel, RowExclusiveLock);
 				break;
 			default:
@@ -646,8 +746,19 @@ map_const(CopyState *cs, Const *c)
 {
 	Oid			classid;
 
+	/* an enum's value is its label's id: the copy's label's */
+	if (in_copy(cs, TypeRelationId, c->consttype) &&
+		get_typtype(c->consttype) == TYPTYPE_ENUM)
+	{
+		c->consttype = map_type(cs, c->consttype);
+		if (!c->constisnull)
+			c->constvalue = ObjectIdGetDatum(copy_map(cs, EnumRelationId,
+													  DatumGetObjectId(c->constvalue)));
+		return;
+	}
+
 	/*
-	 * A value of a copied type, or an array of one (a composite's, an
+	 * A value of another copied type, or an array of one (a composite's, an
 	 * array's header names its type), would name the source's type: refused
 	 */
 	if (copy_map(cs, TypeRelationId, c->consttype) != c->consttype ||
@@ -709,9 +820,33 @@ map_oid_list(CopyState *cs, Oid classid, List *oids)
 	return mapped;
 }
 
+static Node *remap_mutator(Node *node, CopyState *cs);
+
+/*
+ * A query (a view's, a rule's, a SQL function body's, a subquery's): its
+ * parts by the mutator, and what the mutator doesn't reach, its range table
+ * entries and their permission entries, here.
+ */
+static Query *
+remap_query(Query *query, CopyState *cs)
+{
+	Query	   *q = query_tree_mutator(query, remap_mutator, cs,
+									   QTW_EXAMINE_SORTGROUP);
+
+	foreach_node(RangeTblEntry, rte, q->rtable)
+	{
+		rte->relid = copy_map(cs, RelationRelationId, rte->relid);
+		rte->coltypes = map_oid_list(cs, TypeRelationId, rte->coltypes);
+	}
+	foreach_node(RTEPermissionInfo, perm, q->rteperminfos)
+		perm->relid = copy_map(cs, RelationRelationId, perm->relid);
+	return q;
+}
+
 /*
  * Rewrites the object ids of an expression tree's nodes, of the kinds a
- * default, a check constraint or an index expression holds; any other kind
+ * default, a constraint, an index expression, a policy, a trigger's
+ * condition, a view or rule, or a SQL function's body holds; any other kind
  * is refused, as a reference it might hold would not be rewritten.
  */
 static Node *
@@ -719,9 +854,71 @@ remap_mutator(Node *node, CopyState *cs)
 {
 	if (node == NULL)
 		return NULL;
+	if (IsA(node, Query))
+		return (Node *) remap_query((Query *) node, cs);
 	node = expression_tree_mutator(node, remap_mutator, cs);
 	switch (nodeTag(node))
 	{
+		case T_FromExpr:
+		case T_JoinExpr:
+		case T_RangeTblRef:
+		case T_SubLink:
+		case T_GroupingFunc:
+		case T_WithCheckOption:
+			break;
+		case T_TargetEntry:
+			((TargetEntry *) node)->resorigtbl =
+				copy_map(cs, RelationRelationId, ((TargetEntry *) node)->resorigtbl);
+			break;
+		case T_SortGroupClause:
+			{
+				SortGroupClause *sgc = (SortGroupClause *) node;
+
+				sgc->eqop = copy_map(cs, OperatorRelationId, sgc->eqop);
+				sgc->sortop = copy_map(cs, OperatorRelationId, sgc->sortop);
+				break;
+			}
+		case T_WindowClause:
+			{
+				WindowClause *wc = (WindowClause *) node;
+
+				wc->startInRangeFunc = copy_map(cs, ProcedureRelationId, wc->startInRangeFunc);
+				wc->endInRangeFunc = copy_map(cs, ProcedureRelationId, wc->endInRangeFunc);
+				break;
+			}
+		case T_Aggref:
+			{
+				Aggref	   *a = (Aggref *) node;
+
+				a->aggfnoid = copy_map(cs, ProcedureRelationId, a->aggfnoid);
+				a->aggtype = map_type(cs, a->aggtype);
+				a->aggtranstype = map_type(cs, a->aggtranstype);
+				a->aggargtypes = map_oid_list(cs, TypeRelationId, a->aggargtypes);
+				break;
+			}
+		case T_WindowFunc:
+			{
+				WindowFunc *w = (WindowFunc *) node;
+
+				w->winfnoid = copy_map(cs, ProcedureRelationId, w->winfnoid);
+				w->wintype = map_type(cs, w->wintype);
+				break;
+			}
+		case T_CommonTableExpr:
+			((CommonTableExpr *) node)->ctecoltypes =
+				map_oid_list(cs, TypeRelationId, ((CommonTableExpr *) node)->ctecoltypes);
+			break;
+		case T_RangeTblFunction:
+			((RangeTblFunction *) node)->funccoltypes =
+				map_oid_list(cs, TypeRelationId, ((RangeTblFunction *) node)->funccoltypes);
+			break;
+		case T_SetOperationStmt:
+			((SetOperationStmt *) node)->colTypes =
+				map_oid_list(cs, TypeRelationId, ((SetOperationStmt *) node)->colTypes);
+			break;
+		case T_SetToDefault:
+			((SetToDefault *) node)->typeId = map_type(cs, ((SetToDefault *) node)->typeId);
+			break;
 		case T_List:
 		case T_BoolExpr:
 		case T_NullTest:
@@ -979,9 +1176,11 @@ fix_class(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_class_reltype, TypeRelationId);
 	MAP(Anum_pg_class_reltoastrelid, RelationRelationId);
 	/* the relation's storage is new: its file number is its object id */
-	values[Anum_pg_class_relfilenode - 1] = values[Anum_pg_class_oid - 1];
+	if (RELKIND_HAS_STORAGE(relkind))
+		values[Anum_pg_class_relfilenode - 1] = values[Anum_pg_class_oid - 1];
 	values[Anum_pg_class_relrewrite - 1] = ObjectIdGetDatum(InvalidOid);
-	if (relkind == RELKIND_RELATION || relkind == RELKIND_TOASTVALUE)
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_TOASTVALUE ||
+		relkind == RELKIND_MATVIEW)
 	{
 		values[Anum_pg_class_relfrozenxid - 1] = TransactionIdGetDatum(RecentXmin);
 		values[Anum_pg_class_relminmxid - 1] = MultiXactIdGetDatum(GetOldestMultiXactId());
@@ -1005,7 +1204,123 @@ fix_type(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_type_typrelid, RelationRelationId);
 	MAP(Anum_pg_type_typelem, TypeRelationId);
 	MAP(Anum_pg_type_typarray, TypeRelationId);
+	MAP(Anum_pg_type_typbasetype, TypeRelationId);
+	MAP(Anum_pg_type_typsubscript, ProcedureRelationId);
+	MAP(Anum_pg_type_typinput, ProcedureRelationId);
+	MAP(Anum_pg_type_typoutput, ProcedureRelationId);
+	MAP(Anum_pg_type_typreceive, ProcedureRelationId);
+	MAP(Anum_pg_type_typsend, ProcedureRelationId);
+	MAP(Anum_pg_type_typmodin, ProcedureRelationId);
+	MAP(Anum_pg_type_typmodout, ProcedureRelationId);
+	MAP(Anum_pg_type_typanalyze, ProcedureRelationId);
 	MAP_TREE(Anum_pg_type_typdefaultbin);
+}
+
+static void
+fix_range(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_range_rngtypid, TypeRelationId);
+	MAP(Anum_pg_range_rngsubtype, TypeRelationId);
+	MAP(Anum_pg_range_rngmultitypid, TypeRelationId);
+	MAP(Anum_pg_range_rngconstruct2, ProcedureRelationId);
+	MAP(Anum_pg_range_rngconstruct3, ProcedureRelationId);
+	MAP(Anum_pg_range_rngmltconstruct0, ProcedureRelationId);
+	MAP(Anum_pg_range_rngmltconstruct1, ProcedureRelationId);
+	MAP(Anum_pg_range_rngmltconstruct2, ProcedureRelationId);
+	MAP(Anum_pg_range_rngcanonical, ProcedureRelationId);
+	MAP(Anum_pg_range_rngsubdiff, ProcedureRelationId);
+}
+
+/* an oidvector's or oid[]'s object ids, each its copy's */
+static Datum
+map_oidvector(CopyState *cs, Oid classid, Datum v)
+{
+	oidvector  *old = (oidvector *) DatumGetPointer(v);
+	Oid		   *oids = palloc_array(Oid, Max(old->dim1, 1));
+
+	for (int i = 0; i < old->dim1; i++)
+		oids[i] = copy_map(cs, classid, old->values[i]);
+	return PointerGetDatum(buildoidvector(oids, old->dim1));
+}
+
+static Datum
+map_oidarray(CopyState *cs, Oid classid, Datum a)
+{
+	Datum	   *elems;
+	int			n;
+
+	deconstruct_array_builtin(DatumGetArrayTypeP(a), OIDOID, &elems, NULL, &n);
+	for (int i = 0; i < n; i++)
+		elems[i] = ObjectIdGetDatum(copy_map(cs, classid, DatumGetObjectId(elems[i])));
+	return PointerGetDatum(construct_array_builtin(elems, n, OIDOID));
+}
+
+static void
+fix_proc(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_proc_oid, ProcedureRelationId);
+	MAP(Anum_pg_proc_pronamespace, NamespaceRelationId);
+	MAP(Anum_pg_proc_prorettype, TypeRelationId);
+	MAP(Anum_pg_proc_provariadic, TypeRelationId);
+	MAP(Anum_pg_proc_prosupport, ProcedureRelationId);
+	values[Anum_pg_proc_proargtypes - 1] =
+		map_oidvector(cs, TypeRelationId, values[Anum_pg_proc_proargtypes - 1]);
+	if (!nulls[Anum_pg_proc_proallargtypes - 1])
+		values[Anum_pg_proc_proallargtypes - 1] =
+			map_oidarray(cs, TypeRelationId, values[Anum_pg_proc_proallargtypes - 1]);
+	if (!nulls[Anum_pg_proc_protrftypes - 1])
+		values[Anum_pg_proc_protrftypes - 1] =
+			map_oidarray(cs, TypeRelationId, values[Anum_pg_proc_protrftypes - 1]);
+	MAP_TREE(Anum_pg_proc_prosqlbody);
+}
+
+static void
+fix_policy(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_policy_oid, PolicyRelationId);
+	MAP(Anum_pg_policy_polrelid, RelationRelationId);
+	MAP_TREE(Anum_pg_policy_polqual);
+	MAP_TREE(Anum_pg_policy_polwithcheck);
+}
+
+static void
+fix_rewrite(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_rewrite_oid, RewriteRelationId);
+	MAP(Anum_pg_rewrite_ev_class, RelationRelationId);
+	MAP_TREE(Anum_pg_rewrite_ev_qual);
+	MAP_TREE(Anum_pg_rewrite_ev_action);
+}
+
+/* An enum's labels, each anew, under the ids assign_enum_oids() gave them */
+static void
+copy_enum(CopyState *cs, Oid typid)
+{
+	Relation	rel = table_open(EnumRelationId, RowExclusiveLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *rows = NIL;
+
+	ScanKeyInit(&key, Anum_pg_enum_enumtypid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typid));
+	scan = systable_beginscan(rel, EnumTypIdSortOrderIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		rows = lappend(rows, heap_copytuple(tup));
+	systable_endscan(scan);
+
+	foreach_ptr(HeapTupleData, row, rows)
+	{
+		Datum	   *values = palloc_array(Datum, desc->natts);
+		bool	   *nulls = palloc_array(bool, desc->natts);
+
+		heap_deform_tuple(row, desc, values, nulls);
+		MAP(Anum_pg_enum_oid, EnumRelationId);
+		MAP(Anum_pg_enum_enumtypid, TypeRelationId);
+		insert_row(cs, rel, values, nulls);
+	}
+	table_close(rel, RowExclusiveLock);
 }
 
 static void
@@ -1023,6 +1338,7 @@ fix_constraint(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_constraint_oid, ConstraintRelationId);
 	MAP(Anum_pg_constraint_connamespace, NamespaceRelationId);
 	MAP(Anum_pg_constraint_conrelid, RelationRelationId);
+	MAP(Anum_pg_constraint_contypid, TypeRelationId);
 	MAP(Anum_pg_constraint_conindid, RelationRelationId);
 	MAP(Anum_pg_constraint_confrelid, RelationRelationId);
 	MAP_TREE(Anum_pg_constraint_conbin);
@@ -1053,7 +1369,17 @@ fix_trigger(CopyState *cs, Datum *values, bool *nulls)
 	MAP(Anum_pg_trigger_tgconstrrelid, RelationRelationId);
 	MAP(Anum_pg_trigger_tgconstrindid, RelationRelationId);
 	MAP(Anum_pg_trigger_tgconstraint, ConstraintRelationId);
+	MAP(Anum_pg_trigger_tgfoid, ProcedureRelationId);
 	MAP_TREE(Anum_pg_trigger_tgqual);
+}
+
+static void
+fix_cast(CopyState *cs, Datum *values, bool *nulls)
+{
+	MAP(Anum_pg_cast_oid, CastRelationId);
+	MAP(Anum_pg_cast_castsource, TypeRelationId);
+	MAP(Anum_pg_cast_casttarget, TypeRelationId);
+	MAP(Anum_pg_cast_castfunc, ProcedureRelationId);
 }
 
 static void
@@ -1183,6 +1509,28 @@ copy_all_rows(CopyState *cs)
 			case TypeRelationId:
 				copy_rows_of(cs, TypeRelationId, TypeOidIndexId,
 							 Anum_pg_type_oid, obj.oid, fix_type);
+				switch (get_typtype(obj.oid))
+				{
+					case TYPTYPE_ENUM:
+						copy_enum(cs, obj.oid);
+						break;
+					case TYPTYPE_RANGE:
+						copy_rows_of(cs, RangeRelationId, RangeTypidIndexId,
+									 Anum_pg_range_rngtypid, obj.oid, fix_range);
+						break;
+				}
+				break;
+			case ProcedureRelationId:
+				copy_rows_of(cs, ProcedureRelationId, ProcedureOidIndexId,
+							 Anum_pg_proc_oid, obj.oid, fix_proc);
+				break;
+			case PolicyRelationId:
+				copy_rows_of(cs, PolicyRelationId, PolicyOidIndexId,
+							 Anum_pg_policy_oid, obj.oid, fix_policy);
+				break;
+			case RewriteRelationId:
+				copy_rows_of(cs, RewriteRelationId, RewriteOidIndexId,
+							 Anum_pg_rewrite_oid, obj.oid, fix_rewrite);
 				break;
 			case ConstraintRelationId:
 				copy_rows_of(cs, ConstraintRelationId, ConstraintOidIndexId,
@@ -1191,6 +1539,10 @@ copy_all_rows(CopyState *cs)
 			case AttrDefaultRelationId:
 				copy_rows_of(cs, AttrDefaultRelationId, AttrDefaultOidIndexId,
 							 Anum_pg_attrdef_oid, obj.oid, fix_attrdef);
+				break;
+			case CastRelationId:
+				copy_rows_of(cs, CastRelationId, CastOidIndexId,
+							 Anum_pg_cast_oid, obj.oid, fix_cast);
 				break;
 			case DefaultAclRelationId:
 				copy_rows_of(cs, DefaultAclRelationId, DefaultAclOidIndexId,
@@ -1433,7 +1785,8 @@ make_storage(CopyState *cs)
 		Relation	dst;
 		SMgrRelation dstsmgr;
 
-		if (obj.classid != RelationRelationId)
+		if (obj.classid != RelationRelationId ||
+			!RELKIND_HAS_STORAGE(get_rel_relkind(obj.oid)))
 			continue;
 		newoid = copy_map(cs, RelationRelationId, obj.oid);
 		src = relation_open(obj.oid, AccessShareLock);
@@ -1448,7 +1801,8 @@ make_storage(CopyState *cs)
 			RelationCopyStorage(RelationGetSmgr(src), dstsmgr, MAIN_FORKNUM,
 								src->rd_rel->relpersistence);
 		}
-		if (src->rd_rel->relkind == RELKIND_RELATION)
+		if (src->rd_rel->relkind == RELKIND_RELATION ||
+			src->rd_rel->relkind == RELKIND_MATVIEW)
 			tables = lappend_oid(tables, newoid);
 		relation_close(dst, NoLock);
 		relation_close(src, NoLock);

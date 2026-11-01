@@ -88,6 +88,16 @@ SELECT count(*) FROM app2.c;
      1
 (1 row)
 
+-- a standalone composite type of a versioned schema (its relation's row is
+-- made after its row type's dependency is recorded)
+SET catalog_branch = :b1;
+CREATE TYPE app.pair AS (a int, b int);
+SELECT (ROW(1, 2)::app.pair).b;
+ b 
+---
+ 2
+(1 row)
+
 -- default privileges in a versioned schema are its branch's
 SET catalog_branch = :b1;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
