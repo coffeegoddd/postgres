@@ -24,6 +24,7 @@ static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
 static void check_for_connection_status(ClusterInfo *cluster);
 static void check_for_branches(ClusterInfo *cluster);
+static void check_for_history(ClusterInfo *cluster);
 static void check_for_prepared_transactions(ClusterInfo *cluster);
 static void check_for_isn_and_int8_passing_mismatch(ClusterInfo *cluster);
 static void check_for_user_defined_postfix_ops(ClusterInfo *cluster);
@@ -608,6 +609,7 @@ check_and_dump_old_cluster(void)
 	 */
 	check_is_install_user(&old_cluster);
 	check_for_branches(&old_cluster);
+	check_for_history(&old_cluster);
 	check_for_prepared_transactions(&old_cluster);
 	check_for_oldestxid_consistency(&old_cluster);
 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
@@ -1322,6 +1324,51 @@ check_for_branches(ClusterInfo *cluster)
 				pg_fatal("Database \"%s\" has branches, which cannot be upgraded yet.\n"
 						 "Its versioned schemas, or the branches allocated in it, belong to\n"
 						 "branches whose catalog rows the upgrade would leave out.",
+						 active_db->db_name);
+			PQclear(res);
+		}
+		PQfinish(conn);
+	}
+
+	check_ok();
+}
+
+/*
+ * check_for_history()
+ *
+ * Each database's version-control history store (pg_history: its chunk
+ * log, chunk index and pointers) is made by initdb, and the upgrade carries
+ * over only the relations users made: the new cluster's stores would be
+ * empty.  Until the upgrade carries them, a cluster in which any store has
+ * a pointer, or a chunk log of more than its meta page, is refused.
+ */
+static void
+check_for_history(ClusterInfo *cluster)
+{
+	prep_status("Checking for history stores");
+
+	for (int dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
+	{
+		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
+		PGresult   *res;
+		bool		has_store;
+
+		res = executeQueryOrDie(conn,
+								"SELECT 1 FROM pg_catalog.pg_namespace "
+								"WHERE nspname = 'pg_history'");
+		has_store = PQntuples(res) > 0;
+		PQclear(res);
+		if (has_store)
+		{
+			res = executeQueryOrDie(conn,
+									"SELECT EXISTS (SELECT 1 FROM pg_history.pointers) OR "
+									"       pg_catalog.pg_relation_size('pg_history.chunks') > "
+									"       pg_catalog.current_setting('block_size')::pg_catalog.int8");
+			if (PQgetvalue(res, 0, 0)[0] == 't')
+				pg_fatal("Database \"%s\" has version-control history, which cannot be upgraded yet.\n"
+						 "Its history store (pg_history) holds chunks or pointers the upgrade\n"
+						 "would leave out.",
 						 active_db->db_name);
 			PQclear(res);
 		}

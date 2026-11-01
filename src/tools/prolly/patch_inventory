@@ -69,14 +69,14 @@ patch src/backend/access/transam/xlogutils.c  1a  redo skips blocks whose storag
 patch src/backend/backup/basebackup.c  1a  skips checksum verification of the page store, whose checksums use logical block numbers
 patch src/backend/backup/basebackup_incremental.c  1a  sends the block-mapped page store in full in incremental backups (WAL summaries don't name its physical blocks)
 patch src/backend/bootstrap/bootparse.y  1a  passes md.c to heap_create() for bootstrap catalogs
-patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file
+patch src/backend/catalog/catalog.c  1a  GetNewRelFileNumber() refuses a block-mapped relation's file number, whose main fork has no file; also (2) pg_history's relations are the system's (IsHistoryStoreNamespace)
 patch src/backend/catalog/heap.c  1a  heap_create() creates storage in a given storage manager; a sequence's is chosen as a new heap's; also (1b) refuses an unlogged relation in a versioned schema
 patch src/backend/catalog/index.c  1a  an index's storage goes to its table's storage manager
 patch src/backend/catalog/namespace.c  1b  schema names resolve to the session's branch's versioned schema, then to a shared one; objects do not move between kinds or branches of schema; a search path matcher notes the branch names resolved on
 patch src/backend/catalog/objectaddress.c  1b  the pg_namespace name cache is NAMESPACENAMEBRANCH
 patch src/backend/catalog/pg_depend.c  1b  refuses a dependency of a shared object on a versioned one, or across branches
 patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nspbranch), refusing a name used by the other kind of schema
-patch src/backend/catalog/pg_publication.c  2  publications leave chunk log relations out
+patch src/backend/catalog/pg_publication.c  2  publications leave chunk log relations out; also (2) the history store's relations, and pg_history, are not publishable
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
@@ -138,7 +138,7 @@ patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA .
 patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
-patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet
+patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) a cluster whose history store holds chunks or pointers is refused
 patch src/bin/pg_upgrade/dump.c  1a  dumps no sequence data when sequences' files are transferred (TRANSFER_SEQUENCES)
 patch src/bin/pg_upgrade/info.c  1a  transfers sequences' files from a cluster of version 20 or later, whose sequences may be block-mapped
 patch src/bin/pg_upgrade/pg_upgrade.h  1a  TRANSFER_SEQUENCES: whether sequences' files are transferred
@@ -156,6 +156,7 @@ patch src/include/access/twophase.h  1a  declares TwoPhaseTransactionIsKnown
 patch src/include/access/xlog.h  1a  declares GetBackupState, GetRecoveryHold, XLogNoteSyncedPages, XLogSyncedSince and XLogNoteSyncedReplay
 patch src/include/access/xlog_internal.h  1a  XLOG_PAGE_MAGIC bumped for the block map's changed WAL records
 patch src/include/access/xlogutils.h  1a  declares the redo helpers for blocks given other storage
+patch src/include/catalog/catalog.h  2  IsHistoryStoreNamespace()
 patch src/include/catalog/catversion.h  1a  bumped for the block map's statistics functions and view; also (1b) the catalog changes of branched catalogs
 patch src/include/catalog/heap.h  1a  heap_create() takes a storage manager
 patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
@@ -164,7 +165,7 @@ patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced 
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.dat  2  pg_history, the history store's schema
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
-patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler
+patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler; also (2) prolly_chunk_index_tableam_handler(), pg_history_pointer_changed()
 patch src/include/catalog/pg_subscription.h  1b  pg_subscription.subcatalogbranch
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly

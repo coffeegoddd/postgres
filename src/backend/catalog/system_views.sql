@@ -1615,8 +1615,14 @@ CREATE TABLE pg_history.pointers (
 	hash bytea NOT NULL CHECK (octet_length(hash) = 20)
 );
 CREATE TRIGGER pointers_roots
-	AFTER INSERT OR UPDATE OF hash OR DELETE ON pg_history.pointers
+	AFTER INSERT OR UPDATE OR DELETE ON pg_history.pointers
 	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();
 CREATE TRIGGER pointers_no_truncate
 	BEFORE TRUNCATE ON pg_history.pointers
 	FOR EACH STATEMENT EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();
+-- (whatever session_replication_role is: a session of a bulk load's too)
+ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_roots;
+ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
+-- (the trigger function is the pointers' alone: on another table it would
+-- take and let go of roots of any chunk)
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;

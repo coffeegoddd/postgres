@@ -57,6 +57,46 @@ SELECT test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('\x03')) 
 	count(*) AS new_pointers FROM pg_history.pointers WHERE name = 'new';
 SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index');
 
+-- two pointers swapped in one statement, one made and dropped in one
+-- transaction, and one dropped and made again in one statement
+INSERT INTO pg_history.pointers VALUES ('other', h('\x01'));
+UPDATE pg_history.pointers SET hash = CASE name WHEN 'trunk' THEN h('\x01') ELSE h('\x02') END;
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+BEGIN;
+INSERT INTO pg_history.pointers VALUES ('brief', h('\x01'));
+DELETE FROM pg_history.pointers WHERE name = 'brief';
+COMMIT;
+WITH gone AS (DELETE FROM pg_history.pointers WHERE name = 'other' RETURNING name)
+INSERT INTO pg_history.pointers SELECT 'other2', h('\x01') FROM gone;
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index');
+
+-- the roots kept whatever session_replication_role is
+SET session_replication_role = replica;
+UPDATE pg_history.pointers SET hash = h('\x02') WHERE name = 'other2';
+RESET session_replication_role;
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+
+-- the store's relations are the system's, and the trigger the pointers' alone
+ALTER TABLE pg_history.pointers DISABLE TRIGGER pointers_roots;
+DROP TABLE pg_history.chunk_index;
+CREATE PUBLICATION history_pub FOR TABLE pg_history.pointers;
+CREATE PUBLICATION history_pub FOR TABLES IN SCHEMA pg_history;
+CREATE TABLE pg_temp.fake (hash bytea);
+CREATE TRIGGER fake AFTER DELETE ON pg_temp.fake
+	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();
+INSERT INTO pg_temp.fake VALUES (h('\x02'));
+DELETE FROM pg_temp.fake;
+SELECT roots('\x02') AS two_roots;
+CREATE ROLE regress_history_user;
+SET ROLE regress_history_user;
+CREATE TABLE pg_temp.fake2 (hash bytea);
+CREATE TRIGGER fake2 AFTER DELETE ON pg_temp.fake2
+	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();
+DROP TABLE pg_temp.fake2;
+RESET ROLE;
+DROP ROLE regress_history_user;
+
 DELETE FROM pg_history.pointers;
 SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
 DROP FUNCTION roots(bytea), put(bytea), h(bytea);
