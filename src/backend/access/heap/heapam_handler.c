@@ -504,7 +504,8 @@ heapam_storage_manager(Relation rel, const RelFileLocator *newrlocator,
 	if (new_relation_smgr >= 0)
 		return new_relation_smgr;
 	return NewRelationStorageManager(persistence, rel->rd_rel->relisshared,
-									 IsCatalogRelation(rel));
+									 IsCatalogRelation(rel),
+									 RelationGetNamespace(rel));
 }
 
 static void
