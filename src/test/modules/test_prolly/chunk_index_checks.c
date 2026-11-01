@@ -18,7 +18,6 @@
 #include "funcapi.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_log.h"
-#include "prolly/chunk_pin.h"
 #include "prolly/chunk_store.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"

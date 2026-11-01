@@ -306,6 +306,8 @@ found_held(Relation idx, const uint8 *hash)
 bool
 ChunkStoreHold(Relation idx, const uint8 *hash)
 {
+	PreventCommandIfReadOnly("hold a chunk");
+	(void) GetCurrentTransactionId();
 	return found_held(idx, hash);
 }
 
@@ -427,6 +429,94 @@ pack_order_cmp(const void *a, const void *b)
 				  CHUNK_HASH_LEN);
 }
 
+/*
+ * Which of a pack's chunks the store has, each held until the transaction
+ * ends (fresh[i] for each the store hasn't, the first of its hash).  A
+ * chunk the store has that another the pack's the store has references is
+ * held by that one's references (counted, committed or this transaction's,
+ * while it is held): only those no such one references are held by
+ * themselves.  So they are taken parents first, a chunk once every one
+ * referencing it is: held by a parent held, or else by itself (a parent
+ * freed meanwhile, found no more, holds nothing; the chunk is then put if
+ * gone too).
+ */
+static void
+hold_found(Relation idx, int n, const uint8 *hashes, const void *const *datas,
+		   const uint32 *lens, HTAB *pack, bool *fresh)
+{
+	bool	   *has = palloc0(Max(n, 1) * sizeof(bool));
+	bool	   *held = palloc0(Max(n, 1) * sizeof(bool));
+	bool	   *covered = palloc0(Max(n, 1) * sizeof(bool));
+	int		   *parents = palloc0(Max(n, 1) * sizeof(int));
+	RefList    *kids = palloc0(Max(n, 1) * sizeof(RefList));
+	int		   *queue = palloc(Max(n, 1) * sizeof(int));
+	int			head = 0,
+				tail = 0;
+
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
+		PackChunk  *pc = hash_search(pack, h, HASH_FIND, NULL);
+		ChunkIndexEntry e;
+
+		CHECK_FOR_INTERRUPTS();
+		if (pc->at == i)
+			has[i] = ChunkIndex->lookup(idx, h, &e);
+	}
+
+	/* each chunk the store has, as many parents as the pack's it has */
+	for (int i = 0; i < n; i++)
+	{
+		if (!has[i])
+			continue;
+		ChunkFormat->refs(datas[i], lens[i], add_ref, &kids[i]);
+		for (int r = 0; r < kids[i].n; r++)
+		{
+			PackChunk  *pc = hash_search(pack, kids[i].hashes + r * CHUNK_HASH_LEN,
+										 HASH_FIND, NULL);
+
+			if (pc != NULL && has[pc->at])
+				parents[pc->at]++;
+		}
+	}
+	for (int i = 0; i < n; i++)
+		if (has[i] && parents[i] == 0)
+			queue[tail++] = i;
+	while (head < tail)
+	{
+		int			i = queue[head++];
+
+		CHECK_FOR_INTERRUPTS();
+		held[i] = covered[i] || found_held(idx, hashes + i * CHUNK_HASH_LEN);
+		for (int r = 0; r < kids[i].n; r++)
+		{
+			PackChunk  *pc = hash_search(pack, kids[i].hashes + r * CHUNK_HASH_LEN,
+										 HASH_FIND, NULL);
+
+			if (pc == NULL || !has[pc->at])
+				continue;
+			if (held[i])
+				covered[pc->at] = true;
+			if (--parents[pc->at] == 0)
+				queue[tail++] = pc->at;
+		}
+	}
+	for (int i = 0; i < n; i++)
+	{
+		PackChunk  *pc = hash_search(pack, hashes + i * CHUNK_HASH_LEN, HASH_FIND, NULL);
+
+		fresh[i] = pc->at == i && !held[i];
+		if (kids[i].hashes)
+			pfree(kids[i].hashes);
+	}
+	pfree(has);
+	pfree(held);
+	pfree(covered);
+	pfree(parents);
+	pfree(kids);
+	pfree(queue);
+}
+
 /* a pack's bytes reserved for its chunks order[from..to), written */
 static void
 write_pack(Relation log, const PackOrder *order, int from, int to,
@@ -473,17 +563,17 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	for (int i = 0; i < n; i++)
 	{
-		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
 		PackChunk  *pc;
 		bool		found;
 
 		CHECK_FOR_INTERRUPTS();
-		pc = hash_search(pack, h, HASH_ENTER, &found);
-		if (found)
-			continue;
-		pc->at = i;
-		fresh[i] = planned[i] = !found_held(idx, h);
+		pc = hash_search(pack, hashes + i * CHUNK_HASH_LEN, HASH_ENTER, &found);
+		if (!found)
+			pc->at = i;
 	}
+	hold_found(idx, n, hashes, datas, lens, pack, fresh);
+	for (int i = 0; i < n; i++)
+		planned[i] = fresh[i];
 
 	/*
 	 * every chunk a new one references, the store's (its reference counted
@@ -664,7 +754,7 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/* (pins looked for, then marked, the chunk locked: prolly/chunk_pin.h) */
+		/* (one this transaction holds passed by: prolly/chunk_pin.h) */
 		if (!ChunkIndex->free(idx, h, ChunkPinned, &e))
 			continue;
 		data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);

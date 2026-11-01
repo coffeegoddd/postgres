@@ -4,7 +4,8 @@
  *	  Transient holds on the history store's chunks, for this transaction's
  *	  own freeing.
  *
- * A transaction holds each chunk it puts until it ends: one it stores, by
+ * A transaction holds each chunk it puts until it ends (or the
+ * subtransaction that put it is rolled back): one it stores, by
  * its entry (not committed: no other's freer frees it, and its own freeing
  * passes by); one it finds stored already, by a change of the chunk's
  * counts adding nothing (running: no other's freer frees the chunk while
