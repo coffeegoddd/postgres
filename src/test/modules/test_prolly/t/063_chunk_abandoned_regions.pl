@@ -7,9 +7,13 @@
 # - a backend gone during VACUUM, its put's entry put and its bytes not
 #   written: that VACUUM leaves its region (the entry, aborted, is the next
 #   one's, which counts its bytes dead, and then lets the region go);
+# - a backend whose region begins after VACUUM's pass began, gone before
+#   the pass ends, its put's entry put and bytes not written: that VACUUM
+#   leaves its region too (the pass may not have seen the entry);
 # - a log past its first map page's group: its bytes past the map page,
-#   regions there let go of, and every page freed, the log cut back to its
-#   meta page, map pages and all.
+#   regions there let go of; a tail cut ending in the second group, and
+#   regions after it, over pages marked before the cut; and every page
+#   freed, the log cut back to its meta page, map pages and all.
 # With wal_consistency_checking, a standby and crash recovery replay it all
 # page for page.
 
@@ -108,7 +112,44 @@ is($ok, 0, 'the next VACUUM counts the gone put\'s bytes dead, and lets its regi
 is($stderr, '', 'no byte counted dead twice');
 is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
 
-# 3. a log past its first map page's group (4096 data pages)
+# 3. a backend whose region begins after VACUUM's pass began, gone (the
+# put's entry in a bucket the pass had passed) before the pass ends
+$v = $primary->background_psql('postgres');
+$v->query_safe(q{SELECT injection_points_set_local()});
+$v->query_safe(q{SELECT injection_points_attach('chunk-index-vacuum-sweep', 'wait')});
+$v->query_until(qr/vacuuming/, "\\echo vacuuming\nVACUUM pg_history.chunk_index;\n");
+$primary->wait_for_event('client backend', 'chunk-index-vacuum-sweep');
+$p = $primary->background_psql('postgres', on_error_stop => 0);
+$p->query_safe(q{SELECT (test_cs_put('pages', blob(202))).stored});
+$p->query_safe(q{SELECT injection_points_set_local()});
+$p->query_safe(q{SELECT injection_points_attach('chunk-put-entered', 'wait')});
+$p->query_safe(q{SET application_name = 'entered'});
+$p->query_until(qr/putting/, "\\echo putting\nSELECT test_cs_put('pages', blob(201));\n");
+$primary->wait_for_event('client backend', 'chunk-put-entered');
+$primary->safe_psql('postgres',
+	q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'entered'});
+$primary->poll_query_until('postgres',
+	q{SELECT test_chunk_log_regions('pg_history.chunks') = 0})
+  or die 'the put\'s backend did not exit';
+$p->{run}->finish;
+$primary->safe_psql('postgres', q{
+	SELECT injection_points_detach('chunk-index-vacuum-sweep');
+	SELECT injection_points_wakeup('chunk-index-vacuum-sweep');
+});
+$v->query_safe('SELECT 1');
+$v->quit;
+# (the next takes the entry out, and the one after lets the region go)
+for my $i (1 .. 2)
+{
+	$stderr = '';
+	$ok = $primary->psql('postgres', 'VACUUM pg_history.chunk_index', stderr => \$stderr);
+	is($ok . $stderr, '0', "VACUUM $i after counts the gone put's bytes dead once");
+}
+is($primary->safe_psql('postgres', $audit), 't', 'the audit clean');
+is($primary->safe_psql('postgres', q{SELECT test_cs_get('pages', h(blob(202))) = blob(202)}), 't',
+	'the chunk put on the region\'s page reads back');
+
+# 4. a log past its first map page's group (4096 data pages)
 $primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE test_chunk_put('ml', 'mi', h(huge(i)), huge(i))) FROM generate_series(1, 110) i;
 	SELECT roots FROM test_chunk_ref_root('mi', h(huge(110)));
@@ -124,8 +165,32 @@ is($primary->safe_psql('postgres', q{
 	SELECT count(*) FILTER (WHERE test_chunk_get('ml', 'mi', h(huge(i))) = huge(i)) FROM generate_series(1, 110) i}),
 	'110', 'the bytes read back, across the map page');
 is($primary->safe_psql('postgres', q{SELECT ok FROM test_chunk_check('ml', 'mi')}), 't', 'the audit clean');
+# (a tail cut ending in the second group, after huge(105)'s pages; puts
+# after it over pages marked before the cut, by a backend that exits)
+my $blocks = q{SELECT pg_relation_size('ml') / current_setting('block_size')::int};
 $primary->safe_psql('postgres', q{
+	SELECT roots FROM test_chunk_ref_root('mi', h(huge(105)));
 	SELECT roots FROM test_chunk_unref_root('mi', h(huge(110)));
+	SELECT test_chunk_free_unheld('ml', 'mi');
+});
+my $before_cut = $primary->safe_psql('postgres', $blocks);
+$primary->safe_psql('postgres', 'VACUUM mi');
+my $after_cut = $primary->safe_psql('postgres', $blocks);
+cmp_ok($after_cut, '<', $before_cut, 'a tail cut');
+cmp_ok($after_cut, '>', 4098, '... ending in the second group');
+$primary->safe_psql('postgres', q{
+	SELECT count(*) FILTER (WHERE test_chunk_put('ml', 'mi', h(huge(i)), huge(i))) FROM generate_series(201, 203) i;
+	SELECT test_chunk_put('ml', 'mi', h(blob(8)), blob(8));
+});
+$primary->safe_psql('postgres', 'VACUUM mi');
+is($primary->safe_psql('postgres', q{SELECT pages = full_pages FROM test_chunk_log_space('ml')}), 't',
+	'regions after the cut, their backend gone, let go of');
+is($primary->safe_psql('postgres', q{
+	SELECT count(*) FILTER (WHERE test_chunk_get('ml', 'mi', h(huge(i))) = huge(i)) FROM generate_series(201, 203) i}),
+	'3', 'their chunks read back');
+is($primary->safe_psql('postgres', q{SELECT ok FROM test_chunk_check('ml', 'mi')}), 't', 'the audit clean');
+$primary->safe_psql('postgres', q{
+	SELECT roots FROM test_chunk_unref_root('mi', h(huge(105)));
 	SELECT test_chunk_free_unheld('ml', 'mi');
 });
 $primary->safe_psql('postgres', 'VACUUM mi');

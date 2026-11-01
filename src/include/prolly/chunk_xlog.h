@@ -6,8 +6,8 @@
  *
  * Each of the log's records is of one page, and says what changed in it:
  * the meta page's next block, a data page made afresh, sealed, appended
- * to, or bytes of it counted dead, or a map page's bits of open pages.  Its redo makes the same change, by the
- * same code.
+ * to, or bytes of it counted dead, or a map page's bits of open pages.
+ * Its redo makes the same change, by the same code.
  *
  * The index's records, too, say what changed in their pages, and are
  * replayed by the code that made the change: an entry added to a page (or
@@ -47,7 +47,7 @@
 #define XLOG_CHUNK_LOG_APPEND		0x30	/* bytes appended to a page */
 #define XLOG_CHUNK_LOG_MARK_DEAD	0x40	/* bytes of a page counted dead */
 #define XLOG_CHUNK_LOG_BIND_INDEX	0x50	/* the meta page's chunk index */
-#define XLOG_CHUNK_LOG_MAP			0x60	/* a map page's bits set or cleared */
+#define XLOG_CHUNK_LOG_MAP			0x60	/* a map page's bits */
 
 typedef struct xl_chunk_log_next_block
 {

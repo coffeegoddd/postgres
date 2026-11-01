@@ -50,7 +50,6 @@
 #include "prolly/chunk_freer.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
-#include "prolly/chunk_region.h"
 #include "prolly/chunk_xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
@@ -2148,7 +2147,7 @@ ChunkIndexVacuum(Relation idx)
 	Relation	log = NULL;
 	bool		log_tried = false;
 	bool		any_pass = false;
-	ChunkRegionSet *also = NULL;
+	ChunkLogSweep *sweep = NULL;
 	uint64		unheld = 0;
 	ChunkIndexEntry *dead = NULL;
 	int			ndead = 0,
@@ -2189,11 +2188,11 @@ ChunkIndexVacuum(Relation idx)
 				log_tried = true;
 
 				/*
-				 * (the regions live as the pass begins, for letting go of
-				 * those held by none after it: see ChunkLogSealAbandoned)
+				 * (the pages of regions held by none as the pass begins, to
+				 * let go of after it if unchanged: see ChunkLogSweepBegin)
 				 */
 				if (log != NULL && !any_pass)
-					also = ChunkRegionLive(log->rd_locator);
+					sweep = ChunkLogSweepBegin(log);
 			}
 		}
 		any_pass = true;
@@ -2293,8 +2292,8 @@ ChunkIndexVacuum(Relation idx)
 	{
 		/* (the regions of backends gone, or that forgot them, let go of) */
 		INJECTION_POINT("chunk-index-vacuum-sweep", NULL);
-		if (also != NULL)
-			ChunkLogSealAbandoned(log, also);
+		if (sweep != NULL)
+			ChunkLogSweepEnd(log, sweep);
 		ChunkLogRecordFree(log);
 		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		(void) ChunkLogTruncateTail(log);

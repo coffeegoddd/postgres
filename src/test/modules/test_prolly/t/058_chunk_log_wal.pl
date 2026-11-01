@@ -90,6 +90,8 @@ is($primary->safe_psql('postgres', $all), $want, 'and crash recovery');
 # freed in the log's middle, its tail kept: no truncation replayed, whose
 # map vacuum would tell the root too.
 $standby->stop;
+# (the regions of the sessions before let go of, their pages free counted)
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 my (undef, $nfree) = split / /, $primary->safe_psql('postgres', $space);
 $primary->safe_psql('postgres', qq{
 	INSERT INTO sums SELECT i, 900 FROM generate_series(4001, 4000 + $nfree * 9 + 20) i;
@@ -105,6 +107,8 @@ $primary->safe_psql('postgres', q{
 	INSERT INTO sums SELECT i, 900 FROM generate_series(3001, 3010) i;
 	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i BETWEEN 3001 AND 3010;
 });
+# (that session's region let go of, its pages never written cut)
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
 my $size = q{SELECT pg_relation_size('pg_history.chunks')};
 my $size_kept = $primary->safe_psql('postgres', $size);
 $primary->safe_psql('postgres', q{

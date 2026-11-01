@@ -141,10 +141,15 @@ extern void ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full,
 /*
  * For VACUUM of the log's index: lets go of the rest of every region no
  * live backend holds (one whose backend exited, crashed, or forgot it),
- * but those in also, live as VACUUM's pass over the index began.
+ * its pages found so as VACUUM's pass over the index begins, and not
+ * changed by its end.
  */
-struct ChunkRegionSet;
-extern void ChunkLogSealAbandoned(Relation rel, const struct ChunkRegionSet *also);
+typedef struct ChunkLogSweep ChunkLogSweep;
+
+/* The log's generation: one more at each tail cut. */
+extern uint32 ChunkLogGeneration(Relation rel);
+extern ChunkLogSweep *ChunkLogSweepBegin(Relation rel);
+extern void ChunkLogSweepEnd(Relation rel, ChunkLogSweep *sweep);
 
 extern void ChunkLogRecordFree(Relation rel);
 
