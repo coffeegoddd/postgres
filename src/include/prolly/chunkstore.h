@@ -66,8 +66,9 @@ typedef void (*ChunkVisitFn) (void *arg, const uint8 *hash, uint32 len,
 							  const ChunkCounts *counts);
 
 /*
- * What a store was asked, counted by the cs_* calls since it was opened (or
- * its counts reset): for tests and benchmarks to hold costs to.
+ * What a store was asked, counted by the cs_* calls since the backend first
+ * opened it (or its counts were reset): for tests and benchmarks to hold
+ * costs to.  A call that fails counts nothing.
  */
 typedef struct ChunkStoreStats
 {
@@ -75,7 +76,8 @@ typedef struct ChunkStoreStats
 	uint64		found;			/* ... and found */
 	uint64		puts;			/* chunks put (put, put_many) */
 	uint64		stored;			/* ... and stored (the store had them not) */
-	uint64		holds;			/* chunks held (hold) */
+	uint64		holds;			/* chunks asked to be held (hold) */
+	uint64		held;			/* ... and held (the store had them) */
 	uint64		freed;			/* chunks freed (free, free_unheld) */
 } ChunkStoreStats;
 
@@ -241,8 +243,12 @@ cs_put_many(ChunkStore *cs, int n, const uint8 *hashes, const void *const *datas
 static inline bool
 cs_hold(ChunkStore *cs, const uint8 *hash)
 {
+	bool		held = cs->routine->hold(cs, hash);
+
 	cs->stats.holds++;
-	return cs->routine->hold(cs, hash);
+	if (held)
+		cs->stats.held++;
+	return held;
 }
 
 static inline void

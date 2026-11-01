@@ -564,10 +564,11 @@ SELECT test_cs_get(:'store', pg_temp.h('cs-stat')) IS NOT NULL AS got,
  t   | t
 (1 row)
 
-SELECT test_cs_hold(:'store', pg_temp.h('cs-stat')) AS held;
- held 
-------
- t
+SELECT test_cs_hold(:'store', pg_temp.h('cs-stat')) AS held,
+	test_cs_hold(:'store', pg_temp.h('cs-nothing')) AS absent_held;
+ held | absent_held 
+------+-------------
+ t    | f
 (1 row)
 
 SELECT pg_temp.free('cs-stat') AS freed;
@@ -576,10 +577,37 @@ SELECT pg_temp.free('cs-stat') AS freed;
      1
 (1 row)
 
-SELECT * FROM test_cs_stats(:'store', false);
- gets | found | puts | stored | holds | freed 
-------+-------+------+--------+-------+-------
-    2 |     1 |    2 |      1 |     1 |     1
+SELECT * FROM test_cs_stats(:'store', true);
+ gets | found | puts | stored | holds | held | freed 
+------+-------+------+--------+-------+------+-------
+    2 |     1 |    2 |      1 |     2 |    1 |     1
+(1 row)
+
+-- (and of packs, many at once, and of every chunk nothing holds)
+SELECT test_cs_put_many(:'store', ARRAY[pg_temp.h('cs-pack1'), pg_temp.h('cs-pack2'), pg_temp.h('cs-pack1')],
+	ARRAY['cs-pack1', 'cs-pack2', 'cs-pack1']::bytea[]) AS packed;
+ packed 
+--------
+      2
+(1 row)
+
+SELECT count(*) FILTER (WHERE d IS NOT NULL) AS got_many
+FROM unnest(test_cs_get_many(:'store', ARRAY[pg_temp.h('cs-pack1'), pg_temp.h('cs-nothing'), pg_temp.h('cs-pack2')])) d;
+ got_many 
+----------
+        2
+(1 row)
+
+SELECT test_cs_free_unheld(:'store') >= 2 AS freed_unheld;
+ freed_unheld 
+--------------
+ t
+(1 row)
+
+SELECT gets, found, puts, stored, holds, held, freed >= 2 AS freed FROM test_cs_stats(:'store', false);
+ gets | found | puts | stored | holds | held | freed 
+------+-------+------+--------+-------+------+-------
+    3 |     2 |    3 |      2 |     0 |    0 | t
 (1 row)
 
 -- let go of

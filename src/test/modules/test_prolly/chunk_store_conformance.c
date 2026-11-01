@@ -359,8 +359,8 @@ test_cs_stats(PG_FUNCTION_ARGS)
 	ChunkStore *cs = store_arg(fcinfo);
 	const ChunkStoreStats *st = cs_stats(cs);
 	TupleDesc	desc;
-	Datum		values[6];
-	bool		nulls[6] = {false, false, false, false, false, false};
+	Datum		values[7];
+	bool		nulls[7] = {false, false, false, false, false, false, false};
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -369,7 +369,8 @@ test_cs_stats(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) st->puts);
 	values[3] = Int64GetDatum((int64) st->stored);
 	values[4] = Int64GetDatum((int64) st->holds);
-	values[5] = Int64GetDatum((int64) st->freed);
+	values[5] = Int64GetDatum((int64) st->held);
+	values[6] = Int64GetDatum((int64) st->freed);
 	if (PG_GETARG_BOOL(1))
 		cs_stats_reset(cs);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
