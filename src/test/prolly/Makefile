@@ -42,7 +42,7 @@ export PROLLY_AM
 
 # extensions the branched catalogs' tests install on branches (their
 # decoding test's output plugin is the recovery suite's, above)
-EXTRA_INSTALL += contrib/hstore contrib/pg_trgm
+EXTRA_INSTALL += contrib/hstore contrib/pg_trgm src/test/modules/dummy_seclabel
 
 AM_CONF = $(abs_top_srcdir)/$(subdir)/am/$(PROLLY_AM).conf
 ifeq ($(wildcard $(AM_CONF)),)

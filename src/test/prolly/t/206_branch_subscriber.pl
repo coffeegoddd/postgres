@@ -70,6 +70,13 @@ $sub->safe_psql('postgres', 'ALTER SUBSCRIPTION s REFRESH PUBLICATION');
 $sub->wait_for_subscription_sync($pub, 's');
 is(on_sub($s2, 'SELECT count(*) FROM app.u'), '1', 'a refresh finds the branch\'s new table');
 
+# the subscription's tables are its branch's: their pg_subscription_rel
+# rows are seen on that branch alone
+my $rel_rows = "SELECT count(*) FROM pg_subscription_rel r JOIN pg_subscription s ON s.oid = r.srsubid WHERE s.subname = 's'";
+is(on_sub($s2, $rel_rows), '2', 'the subscription\'s tables, on its branch');
+is(on_sub($s1, $rel_rows), '0', 'none on another branch');
+is($sub->safe_psql('postgres', $rel_rows), '0', 'nor on no branch');
+
 # pg_dump writes the subscription's branch
 my ($dump, $derr);
 IPC::Run::run([ 'pg_dump', '--no-sync', '-s', '-d', $sub->connstr('postgres') ],
