@@ -46,6 +46,7 @@ tests += {
       't/203_branch_initdb_oids.pl',
       't/204_branch_pg_upgrade.pl',
       't/205_branch_subscriptions.pl',
+      't/206_branch_subscriber.pl',
     ],
   },
 }

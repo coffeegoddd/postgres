@@ -96,6 +96,9 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 																 * server */
 
 	Oid			subconflictlogrelid;	/* Relid of the conflict log table. */
+
+	int32		subcatalogbranch BKI_DEFAULT(0);	/* the branch its workers
+													 * run on (0: none) */
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/*
@@ -159,6 +162,7 @@ typedef struct Subscription
 								 * occurs */
 	bool		passwordrequired;	/* Must connection use a password? */
 	bool		runasowner;		/* Run replication as subscription owner */
+	int32		catalog_branch; /* the branch its workers run on (0: none) */
 	bool		failover;		/* True if the associated replication slots
 								 * (i.e. the main slot and the table sync
 								 * slots) in the upstream database are enabled
