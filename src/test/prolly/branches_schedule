@@ -9,3 +9,4 @@ test: branch_extensions
 test: branch_references
 test: branch_drop
 test: branch_storage
+test: branch_copy

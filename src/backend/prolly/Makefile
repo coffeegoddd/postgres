@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	branch_catalog.o \
+	branch_catalog_copy.o \
 	branch_catalog_ops.o \
 	branch_filter.o \
 	registry.o
