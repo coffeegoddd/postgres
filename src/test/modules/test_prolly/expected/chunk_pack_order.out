@@ -1,0 +1,54 @@
+Parsed test spec with 3 sessions
+
+starting permutation: b_begin d_begin b_pack d_pack c_wake b_commit d_commit b_free
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step b_begin: BEGIN;
+step d_begin: BEGIN;
+step b_pack: 
+	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0301'), pack_h('\x0a0302')],
+		ARRAY['\x0a0301', '\x0a0302']::bytea[]) AS stored;
+ <waiting ...>
+step d_pack: 
+	SELECT test_cs_put_many('pages', ARRAY[pack_h('\x0a0302'), pack_h('\x0a0301')],
+		ARRAY['\x0a0302', '\x0a0301']::bytea[]) AS stored;
+ <waiting ...>
+step c_wake: 
+	SELECT injection_points_detach('chunk-pack-entry');
+	SELECT injection_points_wakeup('chunk-pack-entry');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step b_pack: <... completed>
+stored
+------
+     2
+(1 row)
+
+step b_commit: COMMIT;
+step d_pack: <... completed>
+stored
+------
+     0
+(1 row)
+
+step d_commit: COMMIT;
+step b_free: 
+	SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0301'), pack_h('\x0a0302')]) AS freed;
+
+freed
+-----
+    2
+(1 row)
+

@@ -334,6 +334,44 @@ FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex') 
   300
 (1 row)
 
+-- a pack longer than a region (in pages of its own), and one with a chunk
+-- of no bytes
+SELECT test_cs_put_many(:'store', ARRAY(
+		SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex'))
+		FROM generate_series(1, 500) i ORDER BY i),
+	ARRAY(SELECT 'L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex')
+		FROM generate_series(1, 500) i ORDER BY i)) AS stored;
+ stored 
+--------
+    500
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_cs_get(:'store', pg_temp.h(d)) = d) AS same
+FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-big-' || i), 64), 'hex') d
+	FROM generate_series(1, 500) i) x;
+ same 
+------
+  500
+(1 row)
+
+SELECT pg_temp.put_pack('', 'cs-pack-z') AS stored;
+ stored 
+--------
+      2
+(1 row)
+
+SELECT test_cs_get(:'store', pg_temp.h('')) = '' AS empty_chunk, pg_temp.refs('') AS refs;
+ empty_chunk | refs 
+-------------+------
+ t           | 0/0
+(1 row)
+
+SELECT pg_temp.free('', 'cs-pack-z') AS freed;
+ freed 
+-------
+     2
+(1 row)
+
 -- freed as any chunks are: the pack's parent, and what it alone held (the
 -- chunk the store had before too)
 SELECT pg_temp.free(pg_temp.parent('cs-pack-a', 'cs-pack-b', 'cs-pack-old')) AS parent_and_three;

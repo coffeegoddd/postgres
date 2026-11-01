@@ -65,13 +65,14 @@ tests += {
     ],
   },
   'isolation': {
-    'regress_args': ['--temp-config', files('chunk_store.conf')],
+    'regress_args': ['--temp-config', files('chunk_store_isolation.conf')],
     'specs': [
       'bmap_shared_writers',
       'chunk_index_put_wait',
       'chunk_roots_wait',
       'chunk_free_wait',
       'chunk_pack_put_wait',
+      'chunk_pack_order',
     ],
   },
   'tap': {

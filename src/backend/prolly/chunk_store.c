@@ -22,7 +22,9 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
 void
@@ -294,6 +296,19 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	return true;
 }
 
+typedef struct PackOrder
+{
+	const uint8 *hash;
+	int			at;
+} PackOrder;
+
+static int
+pack_order_cmp(const void *a, const void *b)
+{
+	return memcmp(((const PackOrder *) a)->hash, ((const PackOrder *) b)->hash,
+				  CHUNK_HASH_LEN);
+}
+
 typedef struct PackChunk
 {
 	uint8		hash[CHUNK_HASH_LEN];	/* the key */
@@ -388,26 +403,80 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		pfree(bytes);
 	}
 
-	/* their entries, then each edge a reference of the chunk it names */
-	for (int i = 0; i < n; i++)
+	/*
+	 * Their entries, in their names' order, so that packs naming chunks in
+	 * other orders wait for each other's puts in one order (no deadlock), in
+	 * a subtransaction: should one fail (a wait for another's put cancelled,
+	 * a deadlock's victim), the bytes of those not yet named are counted
+	 * dead, as no entry would ever name them, and the entries made are
+	 * rolled back (VACUUM takes them out, and their bytes, as any aborted).
+	 */
 	{
-		if (!fresh[i])
-			continue;
-		CHECK_FOR_INTERRUPTS();
-		memset(&e, 0, sizeof(e));
-		memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
-		e.len = lens[i];
-		e.loc = lens[i] > 0 ? base + locs[i] : 0;
-		if (!ChunkIndex->insert(idx, &e))
+		PackOrder  *order = palloc(Max(n, 1) * sizeof(PackOrder));
+		bool	   *named = palloc0(Max(n, 1) * sizeof(bool));
+		int			nfresh = 0;
+		MemoryContext cxt = CurrentMemoryContext;
+		ResourceOwner owner = CurrentResourceOwner;
+
+		for (int i = 0; i < n; i++)
+			if (fresh[i])
+			{
+				order[nfresh].hash = hashes + i * CHUNK_HASH_LEN;
+				order[nfresh].at = i;
+				nfresh++;
+			}
+		qsort(order, nfresh, sizeof(PackOrder), pack_order_cmp);
+
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(cxt);
+		PG_TRY();
 		{
-			/* (another put it meanwhile: the bytes appended are no chunk's) */
-			if (lens[i] > 0)
-				ChunkLog->mark_dead(log, base + locs[i], lens[i]);
-			fresh[i] = false;
-			continue;
+			for (int k = 0; k < nfresh; k++)
+			{
+				int			i = order[k].at;
+
+				CHECK_FOR_INTERRUPTS();
+				memset(&e, 0, sizeof(e));
+				memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+				e.len = lens[i];
+				e.loc = lens[i] > 0 ? base + locs[i] : 0;
+				if (!ChunkIndex->insert(idx, &e))
+				{
+					/* (another put it meanwhile: the bytes appended are no chunk's) */
+					if (lens[i] > 0)
+						ChunkLog->mark_dead(log, base + locs[i], lens[i]);
+					fresh[i] = false;
+				}
+				else
+					stored++;
+				named[i] = true;
+				INJECTION_POINT("chunk-pack-entry", NULL);
+			}
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
 		}
-		stored++;
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(cxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
+			for (int i = 0; i < n; i++)
+				if (fresh[i] && !named[i] && lens[i] > 0)
+					ChunkLog->mark_dead(log, base + locs[i], lens[i]);
+			ReThrowError(edata);
+		}
+		PG_END_TRY();
+		pfree(order);
+		pfree(named);
 	}
+
+	/* then each edge a reference of the chunk it names */
 	for (int i = 0; i < n; i++)
 	{
 		if (!fresh[i])

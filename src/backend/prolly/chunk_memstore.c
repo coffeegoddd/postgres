@@ -35,7 +35,6 @@ typedef struct MemChunk
 	uint32		len;
 	uint32		refs;
 	uint32		roots;
-	bool		fresh;			/* put_many's, its references not yet counted */
 } MemChunk;
 
 typedef struct MemPin
@@ -202,7 +201,6 @@ mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 	c->len = len;
 	c->refs = 0;
 	c->roots = 0;
-	c->fresh = false;
 	for (int i = 0; i < refs.n; i++)
 		find(refs.hashes + i * CHUNK_HASH_LEN)->refs++;
 	if (refs.hashes)
@@ -211,82 +209,94 @@ mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 }
 
 /*
- * (each checked first, its name and what it references, the store's or
- * the pack's, so that a pack refused leaves none of it)
+ * (each checked first, every name, then what each new chunk references,
+ * the store's or the pack's, as "pages" checks them: a pack refused
+ * leaves none of it)
  */
 static uint64
 mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
 			 const void *const *datas, const uint32 *lens)
 {
+	HASHCTL		ctl;
+	HTAB	   *pack;
+	bool	   *fresh = palloc0(Max(n, 1) * sizeof(bool));
 	uint64		stored = 0;
 	uint8		hash[CHUNK_HASH_LEN];
 
 	for (int i = 0; i < n; i++)
 	{
-		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
-		RefList		refs = {0};
-
 		ChunkHash(datas[i], lens[i], hash);
-		if (memcmp(hash, h, CHUNK_HASH_LEN) != 0)
+		if (memcmp(hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("bytes put as chunk %s do not hash to it", hash_text(h))));
+					 errmsg("bytes put as chunk %s do not hash to it",
+							hash_text(hashes + i * CHUNK_HASH_LEN))));
+	}
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = CHUNK_HASH_LEN;
+	ctl.hcxt = CurrentMemoryContext;
+	pack = hash_create("memory chunk pack", Max(n, 16), &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
+		bool		found;
+
 		pin(h);
+		(void) hash_search(pack, h, HASH_ENTER, &found);
+		fresh[i] = !found && find(h) == NULL;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		RefList		refs = {0};
+
+		if (!fresh[i])
+			continue;
 		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs);
 		for (int r = 0; r < refs.n; r++)
 		{
 			const uint8 *rh = refs.hashes + r * CHUNK_HASH_LEN;
-			bool		in_pack = false;
 
 			pin(rh);
-			for (int j = 0; j < n && !in_pack; j++)
-				in_pack = memcmp(hashes + j * CHUNK_HASH_LEN, rh, CHUNK_HASH_LEN) == 0;
-			if (!in_pack && !find(rh))
+			if (hash_search(pack, rh, HASH_FIND, NULL) == NULL && !find(rh))
 				ereport(ERROR,
 						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 						 errmsg("chunk %s references chunk %s, which the store does not have",
-								hash_text(h), hash_text(rh))));
+								hash_text(hashes + i * CHUNK_HASH_LEN), hash_text(rh))));
 		}
 		if (refs.hashes)
 			pfree(refs.hashes);
 	}
+	hash_destroy(pack);
 
 	/* then stored, every one before any reference is counted */
 	for (int i = 0; i < n; i++)
 	{
-		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
 		MemChunk   *c;
-		bool		found;
 
-		c = hash_search(chunks, h, HASH_ENTER, &found);
-		if (found)
-		{
-			/* (the store's already, or the pack's: a chunk counted once) */
-			if (c->data != NULL)
-				continue;
-		}
+		if (!fresh[i])
+			continue;
+		c = hash_search(chunks, hashes + i * CHUNK_HASH_LEN, HASH_ENTER, NULL);
 		c->data = MemoryContextAlloc(mem_cxt, Max(lens[i], 1));
 		memcpy(c->data, datas[i], lens[i]);
 		c->len = lens[i];
 		c->refs = 0;
 		c->roots = 0;
-		c->fresh = true;
-		stored++;
+			stored++;
 	}
 	for (int i = 0; i < n; i++)
 	{
-		MemChunk   *c = find(hashes + i * CHUNK_HASH_LEN);
 		RefList		refs = {0};
 
-		if (!c->fresh)
+		if (!fresh[i])
 			continue;
-		c->fresh = false;
-		ChunkFormat->refs(c->data, c->len, add_ref, &refs);
+		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs);
 		for (int r = 0; r < refs.n; r++)
 			find(refs.hashes + r * CHUNK_HASH_LEN)->refs++;
 		if (refs.hashes)
 			pfree(refs.hashes);
 	}
+	pfree(fresh);
 	return stored;
 }
 
