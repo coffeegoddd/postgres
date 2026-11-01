@@ -170,6 +170,7 @@ typedef struct RemoteSlot
 	char	   *database;
 	bool		two_phase;
 	bool		failover;
+	int32		branch;			/* the branch decoding from it is on */
 	XLogRecPtr	restart_lsn;
 	XLogRecPtr	confirmed_lsn;
 	XLogRecPtr	two_phase_at;
@@ -389,6 +390,7 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 	if (remote_dbid != slot->data.database ||
 		remote_slot->two_phase != slot->data.two_phase ||
 		remote_slot->failover != slot->data.failover ||
+		remote_slot->branch != slot->data.branch ||
 		strcmp(remote_slot->plugin, NameStr(slot->data.plugin)) != 0 ||
 		remote_slot->two_phase_at != slot->data.two_phase_at)
 	{
@@ -403,6 +405,7 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 		slot->data.two_phase = remote_slot->two_phase;
 		slot->data.two_phase_at = remote_slot->two_phase_at;
 		slot->data.failover = remote_slot->failover;
+		slot->data.branch = remote_slot->branch;
 		SpinLockRelease(&slot->mutex);
 
 		updated_config = true;
@@ -867,6 +870,11 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 							  remote_slot->failover,
 							  true);
 
+		/* (the primary's slot's branch, not this worker's) */
+		SpinLockAcquire(&MyReplicationSlot->mutex);
+		MyReplicationSlot->data.branch = remote_slot->branch;
+		SpinLockRelease(&MyReplicationSlot->mutex);
+
 		/*
 		 * The remote slot information can predate a status change record that
 		 * this standby has already replayed. That happens when the last
@@ -971,9 +979,9 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 static List *
 fetch_remote_slots(WalReceiverConn *wrconn, List *slot_names)
 {
-#define SLOTSYNC_COLUMN_COUNT 10
+#define SLOTSYNC_COLUMN_COUNT 11
 	Oid			slotRow[SLOTSYNC_COLUMN_COUNT] = {TEXTOID, TEXTOID, LSNOID,
-	LSNOID, XIDOID, BOOLOID, LSNOID, BOOLOID, TEXTOID, TEXTOID};
+	LSNOID, XIDOID, BOOLOID, LSNOID, BOOLOID, TEXTOID, TEXTOID, INT4OID};
 
 	WalRcvExecResult *res;
 	TupleTableSlot *tupslot;
@@ -985,7 +993,7 @@ fetch_remote_slots(WalReceiverConn *wrconn, List *slot_names)
 						   "SELECT slot_name, plugin, confirmed_flush_lsn,"
 						   " restart_lsn, catalog_xmin, two_phase,"
 						   " two_phase_at, failover,"
-						   " database, invalidation_reason"
+						   " database, invalidation_reason, branch"
 						   " FROM pg_catalog.pg_replication_slots"
 						   " WHERE failover and NOT temporary");
 
@@ -1066,6 +1074,11 @@ fetch_remote_slots(WalReceiverConn *wrconn, List *slot_names)
 		d = slot_getattr(tupslot, ++col, &isnull);
 		remote_slot->invalidated = isnull ? RS_INVAL_NONE :
 			GetSlotInvalidationCause(TextDatumGetCString(d));
+
+		/* (the branch decoding from it is on, which its copy keeps) */
+		remote_slot->branch = DatumGetInt32(slot_getattr(tupslot, ++col,
+														 &isnull));
+		Assert(!isnull);
 
 		/* Sanity check */
 		Assert(col == SLOTSYNC_COLUMN_COUNT);

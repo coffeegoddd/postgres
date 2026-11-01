@@ -417,14 +417,6 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cannot enable failover for a replication slot created on the standby"));
 
-		/*
-		 * Nor a slot on a branch: a standby's synced copy would not keep the
-		 * branch, and would decode every branch's changes after a failover.
-		 */
-		if (db_specific && catalog_branch != 0 && !IsSyncingReplicationSlots())
-			ereport(ERROR,
-					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cannot enable failover for a replication slot made on a branch"));
 
 		/*
 		 * Do not allow users to create failover enabled temporary slots,
@@ -1015,12 +1007,6 @@ ReplicationSlotAlter(const char *name, const bool *failover,
 
 	if (failover)
 	{
-		/* (see ReplicationSlotCreate()) */
-		if (*failover && MyReplicationSlot->data.branch != 0)
-			ereport(ERROR,
-					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cannot enable failover for a replication slot made on a branch"));
-
 		/*
 		 * Do not allow users to enable failover for temporary slots as we do
 		 * not support syncing temporary slots to the standby.

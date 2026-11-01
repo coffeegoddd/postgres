@@ -48,6 +48,7 @@ tests += {
       't/205_branch_subscriptions.pl',
       't/206_branch_subscriber.pl',
       't/207_branch_isolation_of_sessions.pl',
+      't/208_branch_failover_slots.pl',
     ],
   },
 }

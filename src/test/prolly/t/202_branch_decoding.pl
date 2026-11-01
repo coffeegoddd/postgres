@@ -72,16 +72,16 @@ is($peek->('copy_b1', 0), 'app.t: INSERT:501,pub.p: INSERT,app.t: UPDATE:511',
 	'a copy, made on no branch, keeps the source\'s branch');
 $node->safe_psql('postgres', "SELECT pg_drop_replication_slot('copy_b1')");
 
-# a failover slot on a branch is refused: a standby's synced copy would not
-# keep the branch
-my ($ret, $out, $err) = $node->psql('postgres',
-	"SET catalog_branch = $b1; SELECT pg_create_logical_replication_slot('fo', 'test_decoding', false, false, true)");
-like($err, qr/cannot enable failover for a replication slot made on a branch/,
-	'a failover slot cannot be made on a branch');
-($ret, $out, $err) = $node->psql('postgres', "ALTER_REPLICATION_SLOT on_b1 (FAILOVER)",
-	replication => 'database');
-like($err, qr/cannot enable failover for a replication slot made on a branch/,
-	'nor a branch\'s slot made one');
+# pg_replication_slots shows each slot's branch; a failover slot may be on
+# a branch (a standby's synced copy keeps it: t/208)
+is( $node->safe_psql('postgres',
+		"SELECT string_agg(slot_name || ':' || (branch = CASE slot_name WHEN 'on_b1' THEN $b1 WHEN 'on_b2' THEN $b2 ELSE 0 END), ',' ORDER BY slot_name)
+		 FROM pg_replication_slots"),
+	'on_b1:true,on_b2:true,on_none:true', 'each slot shows its branch');
+on($b1, "SELECT 1 FROM pg_create_logical_replication_slot('fo', 'test_decoding', false, false, true)");
+is($node->safe_psql('postgres', "SELECT failover AND branch = $b1 FROM pg_replication_slots WHERE slot_name = 'fo'"),
+	't', 'a failover slot made on a branch');
+$node->safe_psql('postgres', "SELECT pg_drop_replication_slot('fo')");
 
 # a transaction on both branches, each table's values toasted: a slot on
 # the second branch has the second's whole, the first's left out
