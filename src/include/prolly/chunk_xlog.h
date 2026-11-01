@@ -75,7 +75,10 @@ extern void chunk_log_desc(StringInfo buf, XLogReaderState *record);
 extern const char *chunk_log_identify(uint8 info);
 extern void chunk_log_mask(char *pagedata, BlockNumber blkno);
 
-/* ChunkIndex's */
+/*
+ * ChunkIndex's.  (Their fields are laid out with no padding, every byte
+ * of a record set.)
+ */
 #define XLOG_CHUNK_INDEX_VACUUM		0x00	/* 0: the page; VACUUM's fates */
 #define XLOG_CHUNK_INDEX_ADD_ENTRY	0x10	/* 0: the page; the entry */
 #define XLOG_CHUNK_INDEX_ADD_PAGE	0x20	/* 0: meta, 1: the chain's last,
@@ -96,14 +99,16 @@ typedef struct xl_chunk_index_vacuum
 {
 	TransactionId snapshotConflictHorizon;	/* the latest freeing's, or 0 */
 	uint16		nentries;		/* then a fate per entry, block 0's data */
+	uint16		unused;
 } xl_chunk_index_vacuum;
 
 typedef struct xl_chunk_index_slot
 {
-	uint16		slot;			/* SET_COUNTS, SET_XMAX, REMOVE_SLOT */
 	uint32		refs;			/* SET_COUNTS: the counts after */
 	uint32		roots;
 	TransactionId xmax;			/* SET_XMAX: the freeing transaction */
+	uint16		slot;			/* SET_COUNTS, SET_XMAX, REMOVE_SLOT */
+	uint16		unused;
 } xl_chunk_index_slot;
 
 typedef struct xl_chunk_index_add_page
@@ -118,20 +123,23 @@ typedef struct xl_chunk_index_keep
 
 typedef struct xl_chunk_index_fold
 {
-	uint16		chunk_slot;		/* in block 0 */
-	uint16		change_slot;	/* in block 1, or 0 if it is block 0's */
 	uint32		refs;			/* the chunk's counts after */
 	uint32		roots;
-	bool		same_page;
+	uint16		chunk_slot;		/* in block 0 */
+	uint16		change_slot;	/* in block 1, or in block 0 if same_page */
+	uint8		same_page;
+	uint8		chunk_on_bucket_page;	/* block 0 is its bucket's first page */
+	uint16		unused;
 } xl_chunk_index_fold;
 
 typedef struct xl_chunk_index_init_page
 {
-	uint16		kind;			/* INDEX_PAGE_* */
 	uint32		bucket;
 	uint32		split_at;
 	BlockNumber next;
 	uint32		len;			/* its contents' (block 0's data) */
+	uint16		kind;			/* INDEX_PAGE_* */
+	uint16		unused;
 } xl_chunk_index_init_page;
 
 typedef struct xl_chunk_index_split
@@ -142,13 +150,14 @@ typedef struct xl_chunk_index_split
 	BlockNumber first;			/* the new bucket's first page */
 	BlockNumber next_block;		/* the first page not in use, after */
 	BlockNumber dir_block;		/* the directory page of its slot */
-	bool		new_dir;		/* which is new, made before */
+	uint32		new_dir;		/* which is new, made before */
 } xl_chunk_index_split;
 
 typedef struct xl_chunk_index_bind_log
 {
-	Oid			log;
 	uint64		stamp;
+	Oid			log;
+	uint32		unused;
 } xl_chunk_index_bind_log;
 
 extern void chunk_index_redo(XLogReaderState *record);
