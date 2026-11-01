@@ -983,6 +983,22 @@ restore_toc_entry(ArchiveHandle *AH, TocEntry *te, bool is_parallel)
 
 					AH->outputKind = OUTPUT_SQLCMDS;
 				}
+				else if (strcmp(te->desc, "HISTORY DATA") == 0)
+				{
+					/*
+					 * The version-control history store: a COPY into a view
+					 * of its own, whose trigger puts each row (no table's
+					 * triggers to disable, owner to become, or truncation)
+					 */
+					pg_log_info("processing the history store");
+					_selectOutputSchema(AH, "pg_catalog");
+					ahprintf(AH, "%s", te->copyStmt);
+					AH->outputKind = OUTPUT_COPYDATA;
+					AH->PrintTocDataPtr(AH, te);
+					if (AH->outputKind == OUTPUT_COPYDATA && RestoringToDB(AH))
+						EndDBCopyMode(&AH->public, te->tag);
+					AH->outputKind = OUTPUT_SQLCMDS;
+				}
 				else
 				{
 					bool		use_truncate;

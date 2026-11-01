@@ -48,13 +48,24 @@ $node->safe_psql('src', q{
 		('half', h(node(VARIADIC ARRAY(SELECT d FROM parents WHERE p < 15 ORDER BY p))));
 	-- (a loose leaf, held by nothing)
 	SELECT test_cs_put('pages', leaf(1000));
+	-- a chain twenty deep, deeper than the export's walk starts room for
+	CREATE TABLE chain (k int, d bytea);
+	INSERT INTO chain VALUES (0, leaf(500));
+	DO $$BEGIN
+		FOR depth IN 1 .. 20 LOOP
+			INSERT INTO chain SELECT depth, node(c.d) FROM chain c WHERE c.k = depth - 1;
+		END LOOP;
+	END$$;
+	SELECT count(*) FROM chain, LATERAL test_cs_put('pages', d) ORDER BY 1;
+	INSERT INTO pg_history.pointers SELECT 'deep', h(d) FROM chain WHERE k = 20;
 });
 
 my $state = q{SELECT (SELECT chunks || ' ' || unheld || ' ' || ok FROM test_cs_check('pages')) || ' / ' ||
 	(SELECT string_agg(name || ':' || encode(hash, 'hex'), ',' ORDER BY name) FROM pg_history.pointers) || ' / ' ||
 	(SELECT string_agg(roots::text, ',' ORDER BY name) FROM pg_history.pointers p, LATERAL test_cs_counts('pages', p.hash))};
 my $want = $node->safe_psql('src', $state);
-like($want, qr/^333 1 true \/ half:\w+,main:\w+ \/ 1,1$/, 'the source store: 333 chunks, one unheld, two pointers');
+like($want, qr/^354 1 true \/ deep:\w+,half:\w+,main:\w+ \/ 1,1,1$/,
+	'the source store: 354 chunks, one unheld, three pointers');
 
 my $dir = PostgreSQL::Test::Utils::tempdir;
 my $restore = sub {
@@ -82,15 +93,73 @@ $node->command_ok([ 'pg_dump', '--format' => 'directory', '--jobs' => 2, '--file
 	$node->connstr('src') ], 'pg_dump, directory format');
 is($restore->('dd', 'pg_restore', '--jobs' => 2, "$dir/srcdir"), $want, 'parallel restore: the store as it was');
 
+# schema, then data with triggers disabled: the history store's COPY is no
+# table's, its triggers left as they are
+$node->safe_psql('postgres', 'CREATE DATABASE ds TEMPLATE template0');
+$node->command_ok([ 'pg_restore', '--schema-only', '--dbname' => $node->connstr('ds'), "$dir/src.dump" ],
+	'schema restored');
+$node->command_ok([ 'pg_restore', '--data-only', '--disable-triggers', '--exit-on-error',
+	'--dbname' => $node->connstr('ds'), "$dir/src.dump" ], 'data restored, triggers disabled');
+is($node->safe_psql('ds', $state), $want, 'data only, triggers disabled: the store as it was');
+
+# the store as of the dump's snapshot: a pointer let go of, and what it
+# alone held freed, after the snapshot is taken, are in the dump
+my $snap = $node->background_psql('src');
+$snap->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $snapshot = $snap->query_safe('SELECT pg_export_snapshot()');
+$node->safe_psql('src', q{
+	DELETE FROM pg_history.pointers WHERE name = 'deep';
+	SELECT test_chunk_format_refs(true);
+});
+my $freed = $node->safe_psql('src', q{SELECT test_chunk_format_refs(true); SELECT test_cs_free_unheld('pages')});
+$freed =~ s/^\n//;
+cmp_ok($freed, '>=', 21, 'the deep chain, and the loose leaf, freed after the snapshot');
+$node->safe_psql('src', 'VACUUM pg_history.chunk_index');
+$node->command_ok([ 'pg_dump', '--format' => 'custom', '--snapshot' => $snapshot,
+	'--file' => "$dir/snap.dump", $node->connstr('src') ], 'pg_dump with the snapshot');
+$snap->query_safe('COMMIT');
+$snap->quit;
+is($restore->('dsn', 'pg_restore', "$dir/snap.dump"), $want, 'the store as of the snapshot');
+
+# bytes not their chunk's, and a chunk referenced and left out, refused
+my $plain = slurp_file("$dir/src.sql");
+my ($rows) = $plain =~ /COPY pg_history\.chunk_restore \(hash, data, name\) FROM stdin;\n(.*?)\n\\\.\n/s;
+ok(defined $rows, 'the plain dump has the store\'s rows');
+my @rows = split /\n/, $rows;
+# (the store in one COPY, one statement, so in one transaction: no chunk
+# restored is freed before the pointers holding it)
+my @copies = $plain =~ /^COPY pg_history\./mg;
+is(scalar(@copies), 1, 'the store restored by one COPY, its chunks and pointers');
+my $tampered = $plain;
+my $bad = $rows[0];
+$bad =~ s/(\t\\\\x..)(.)/$1 . ($2 eq '0' ? '1' : '0')/e;
+$tampered =~ s/\Q$rows[0]\E/$bad/;
+append_to_file("$dir/tampered.sql", $tampered);
+$node->safe_psql('postgres', 'CREATE DATABASE dt TEMPLATE template0');
+my ($out, $err) = run_command([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1',
+	'--file' => "$dir/tampered.sql", '--dbname' => $node->connstr('dt') ]);
+like($err, qr/do not hash to it|does not match|not their name/, 'a chunk\'s bytes changed: refused');
+my $missing = $plain;
+$missing =~ s/\Q$rows[0]\E\n//;
+append_to_file("$dir/missing.sql", $missing);
+$node->safe_psql('postgres', 'CREATE DATABASE dm TEMPLATE template0');
+($out, $err) = run_command([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1',
+	'--file' => "$dir/missing.sql", '--dbname' => $node->connstr('dm') ]);
+like($err, qr/references chunk \w+, which the store does not have/, 'a chunk referenced, left out: refused');
+
 # --no-history
 $node->command_ok([ 'pg_dump', '--no-history', '--file' => "$dir/nohist.sql", $node->connstr('src') ],
 	'pg_dump --no-history');
 my $nohist = slurp_file("$dir/nohist.sql");
 unlike($nohist, qr/pg_history/, 'no history in it');
+$node->safe_psql('postgres', 'CREATE DATABASE dn TEMPLATE template0');
+$node->command_ok([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1', '--file' => "$dir/nohist.sql",
+	'--dbname' => $node->connstr('dn') ], 'restored without history');
+is($node->safe_psql('dn', q{SELECT pg_history_has_chunks()}), 'f', 'its store empty');
 
 # a role that cannot read the store
 $node->safe_psql('src', 'CREATE ROLE dumper LOGIN; GRANT pg_read_all_data TO dumper');
-my ($out, $err) = run_command([ 'pg_dump', '--file' => "$dir/role.sql",
+($out, $err) = run_command([ 'pg_dump', '--file' => "$dir/role.sql",
 	$node->connstr('src') . ' user=dumper' ]);
 like($err, qr/cannot read the version-control history store.*--no-history/,
 	'a role that cannot read the store may not dump the database whole');

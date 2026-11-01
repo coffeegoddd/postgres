@@ -199,8 +199,8 @@ add_ref(void *arg, const uint8 *hash)
 	list->n++;
 }
 
-static char *
-hash_text(const uint8 *hash)
+char *
+ChunkHashText(const uint8 *hash)
 {
 	char	   *out = palloc(2 * CHUNK_HASH_LEN + 1);
 
@@ -218,7 +218,7 @@ missing_ref(const uint8 *chunk, const uint8 *target)
 	ereport(ERROR,
 			(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 			 errmsg("chunk %s references chunk %s, which the store does not have",
-					hash_text(chunk), hash_text(target))));
+					ChunkHashText(chunk), ChunkHashText(target))));
 }
 
 typedef struct PackChunk
@@ -753,7 +753,7 @@ change_root(Relation idx, const uint8 *hash, int32 droots, ChunkIndexEntry *out)
 	if (!ChunkIndex->adjust(idx, hash, 0, droots, out))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("the store has no chunk %s", hash_text(hash))));
+				 errmsg("the store has no chunk %s", ChunkHashText(hash))));
 }
 
 void
@@ -810,7 +810,7 @@ ChunkStoreFree(Relation log, Relation idx, const uint8 *hashes, int n)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("chunk %s references chunk %s, which the store does not have",
-								hash_text(h), hash_text(kid))));
+								ChunkHashText(h), ChunkHashText(kid))));
 			if (ke.refs == 0 && ke.roots == 0)
 				add_ref(&work, kid);
 		}
@@ -877,7 +877,7 @@ audit_collect(void *arg, const ChunkIndexEntry *e)
 	if (found)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("the store has two entries for chunk %s", hash_text(e->hash))));
+				 errmsg("the store has two entries for chunk %s", ChunkHashText(e->hash))));
 	a->refs = e->refs;
 	a->roots = e->roots;
 	a->len = e->len;
@@ -903,7 +903,7 @@ audit_edge(void *arg, const uint8 *hash)
 		a->edges++;
 	else if (es->why == NULL)
 		es->why = psprintf("chunk %s references chunk %s, which the store does not have",
-						   hash_text(es->from), hash_text(hash));
+						   ChunkHashText(es->from), ChunkHashText(hash));
 }
 
 bool
@@ -957,7 +957,7 @@ ChunkStoreCheck(Relation log, Relation idx, uint64 *chunks, uint64 *unheld,
 	{
 		if (es.why == NULL && a->edges != a->refs)
 			es.why = psprintf("chunk %s has %u references counted, and %llu edges to it",
-							  hash_text(a->hash), a->refs,
+							  ChunkHashText(a->hash), a->refs,
 							  (unsigned long long) a->edges);
 		if (a->refs == 0 && a->roots == 0)
 			(*unheld)++;

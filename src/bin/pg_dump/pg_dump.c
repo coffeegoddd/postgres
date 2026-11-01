@@ -4159,8 +4159,8 @@ dumpLO(Archive *fout, const LoInfo *loinfo)
 /*
  * getHistory:
  *	The database's version-control history store, if the server has one
- *	and it has chunks or pointers: its chunks, each after those it
- *	references, and then its pointers.  A role that cannot read it may not
+ *	and it has a chunk: its chunks, each after those it references, and
+ *	then its pointers, as of the dump's snapshot.  A role that cannot read it may not
  *	dump the database whole but with --no-history (history is never left
  *	out unless asked).
  */
@@ -4168,8 +4168,7 @@ static void
 getHistory(Archive *fout)
 {
 	PGresult   *res;
-	HistoryDataInfo *chunks;
-	HistoryDataInfo *pointers;
+	HistoryDataInfo *history;
 	bool		has;
 
 	res = ExecuteSqlQueryForSingleRow(fout,
@@ -4193,27 +4192,24 @@ getHistory(Archive *fout)
 		pg_fatal("this role cannot read the version-control history store, which pg_dump would dump with the database; "
 				 "dump as a role that can, or use --no-history to leave it out");
 
-	chunks = pg_malloc0_object(HistoryDataInfo);
-	chunks->dobj.objType = DO_HISTORY_DATA;
-	chunks->dobj.catId = nilCatalogId;
-	AssignDumpId(&chunks->dobj);
-	chunks->dobj.name = pg_strdup("HISTORY CHUNKS");
-	chunks->dobj.components |= DUMP_COMPONENT_DATA;
-	chunks->dobj.dump = DUMP_COMPONENT_DATA;
-	chunks->query = "COPY (SELECT hash, data FROM pg_catalog.pg_history_export()) TO stdout;";
-	chunks->copyStmt = "COPY pg_history.chunk_restore (hash, data) FROM stdin;\n";
+	history = pg_malloc0_object(HistoryDataInfo);
+	history->dobj.objType = DO_HISTORY_DATA;
+	history->dobj.catId = nilCatalogId;
+	AssignDumpId(&history->dobj);
+	history->dobj.name = pg_strdup("HISTORY");
+	history->dobj.components |= DUMP_COMPONENT_DATA;
+	history->dobj.dump = DUMP_COMPONENT_DATA;
 
-	pointers = pg_malloc0_object(HistoryDataInfo);
-	pointers->dobj.objType = DO_HISTORY_DATA;
-	pointers->dobj.catId = nilCatalogId;
-	AssignDumpId(&pointers->dobj);
-	pointers->dobj.name = pg_strdup("HISTORY POINTERS");
-	pointers->dobj.components |= DUMP_COMPONENT_DATA;
-	pointers->dobj.dump = DUMP_COMPONENT_DATA;
-	pointers->query = "COPY (SELECT name, hash FROM pg_history.pointers ORDER BY name) TO stdout;";
-	pointers->copyStmt = "COPY pg_history.pointers (name, hash) FROM stdin;\n";
-	/* (each pointer's chunk restored first) */
-	addObjectDependency(&pointers->dobj, chunks->dobj.dumpId);
+	/*
+	 * (one COPY, of the store as of the dump's snapshot: its chunks, then
+	 * its pointers, restored in one statement, so that none restored is
+	 * freed before the pointers holding it are)
+	 */
+	history->query = "COPY (SELECT hash, data, name FROM pg_catalog.pg_history_export()) TO stdout;";
+	history->copyStmt = "COPY pg_history.chunk_restore (hash, data, name) FROM stdin;\n";
+	res = ExecuteSqlQueryForSingleRow(fout, "SELECT pg_relation_size('pg_history.chunks')");
+	history->size = (pgoff_t) strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+	PQclear(res);
 }
 
 /*
@@ -4229,8 +4225,7 @@ dumpHistoryData(Archive *fout, const void *arg)
 	char	   *copybuf;
 	int			ret;
 
-	pg_log_info("dumping the history store's %s",
-				strcmp(hinfo->dobj.name, "HISTORY CHUNKS") == 0 ? "chunks" : "pointers");
+	pg_log_info("dumping the history store");
 	res = ExecuteSqlQuery(fout, hinfo->query, PGRES_COPY_OUT);
 	PQclear(res);
 	for (;;)
@@ -11958,8 +11953,8 @@ dumpDumpableObject(Archive *fout, DumpableObject *dobj)
 											   .nDeps = dobj->nDeps,
 											   .dumpFn = dumpHistoryData,
 											   .dumpArg = hinfo));
-				/* (no cheap estimate of its size) */
-				te->dataLength = 8192;
+				/* (the log's size, for a parallel dump's order) */
+				te->dataLength = hinfo->size;
 			}
 			break;
 		case DO_LARGE_OBJECT_DATA:

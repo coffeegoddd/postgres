@@ -81,7 +81,7 @@ patch src/backend/catalog/pg_publication.c  2  publications leave chunk log rela
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
-patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable; also (1b) pg_replication_slots.branch; also (2) the history store's relations and the pointers' triggers
+patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable; also (1b) pg_replication_slots.branch; also (2) the history store's relations and the pointers' triggers; also (2) pg_history.chunk_restore, a view its dump is restored into
 patch src/backend/catalog/toasting.c  1b  a TOAST table's storage manager is its table's, its schema being pg_toast
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
 patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
@@ -137,9 +137,11 @@ patch src/bin/pg_checksums/pg_checksums.c  1a  skips the page store, whose check
 patch src/bin/pg_controldata/pg_controldata.c  1a  shows where pages synced instead of logged need recovery to begin past, and how many times pages were synced so (syncedSince, syncedCount)
 patch src/bin/pg_dump/parallel.c  2  a worker locks no relation for the history store's data (HISTORY DATA)
 patch src/bin/pg_dump/pg_backup.h  2  --no-history (DumpOptions.no_history)
+patch src/bin/pg_dump/pg_backup_archiver.c  2  restores the history store's data (HISTORY DATA) as a COPY of its own, no table's triggers, owner or truncation
 patch src/bin/pg_dump/pg_dump.c  1b  dumps a versioned schema as CREATE SCHEMA ... VERSIONED; turns catalog_branch_filter on, and warns of the versioned schemas a dump on no branch leaves out; writes a subscription's catalog_branch; also (2) dumps the history store (HISTORY DATA: its chunks, then its pointers), --no-history
 patch src/bin/pg_dump/pg_dump.h  1b  NamespaceInfo.versioned; also (1b) a subscription's branch; also (2) DO_HISTORY_DATA, HistoryDataInfo
 patch src/bin/pg_dump/pg_dump_sort.c  2  DO_HISTORY_DATA's place in the data section
+patch src/bin/pg_dump/pg_dumpall.c  2  --no-history, passed to pg_dump
 patch src/bin/pg_rewind/filemap.c  1a  copies block-mapped storage's files whole: the WAL names a block-mapped relation's pages by logical block, not by the page store's blocks
 patch src/bin/pg_rewind/pg_rewind.c  1a  refuses a source that synced pages without logging them where the rewound server's replay would begin, or while files were copied
 patch src/bin/pg_upgrade/check.c  1b  refuses an old cluster with branches (versioned schemas, or a branch allocated), which it cannot upgrade yet; also (2) a cluster whose history store holds chunks or pointers is refused
@@ -169,7 +171,7 @@ patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced 
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.dat  2  pg_history, the history store's schema
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
-patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler; also (2) prolly_chunk_index_tableam_handler(), pg_history_pointer_changed()
+patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column; also (2) prolly_chunks_tableam_handler; also (2) prolly_chunk_index_tableam_handler(), pg_history_pointer_changed(); also (2) pg_history_export(), pg_history_has_chunks(), pg_history_chunk_restore()
 patch src/include/catalog/pg_subscription.h  1b  pg_subscription.subcatalogbranch
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly
