@@ -18,6 +18,7 @@
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 
 void
 ChunkHash(const void *data, size_t len, uint8 *out)
@@ -33,8 +34,13 @@ ChunkHash(const void *data, size_t len, uint8 *out)
 	memcpy(out, digest, CHUNK_HASH_LEN);
 }
 
+/*
+ * Bytes that aren't hash's are an error: of the chunk read from log at loc,
+ * or (log NULL) of a put.
+ */
 static void
-check_hash(const uint8 *hash, const void *data, size_t len, bool stored)
+check_hash(const uint8 *hash, const void *data, size_t len, Relation log,
+		   uint64 loc)
 {
 	uint8		actual[CHUNK_HASH_LEN];
 
@@ -50,9 +56,13 @@ check_hash(const uint8 *hash, const void *data, size_t len, bool stored)
 		got[2 * CHUNK_HASH_LEN] = '\0';
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 stored ?
+				 log ?
 				 errmsg("stored chunk %s does not match its hash", want) :
 				 errmsg("bytes put as chunk %s do not hash to it", want),
+				 log ?
+				 errdetail("Its %zu bytes at %llu in chunk log \"%s\" hash to %s.",
+						   len, (unsigned long long) loc,
+						   RelationGetRelationName(log), got) :
 				 errdetail("Its %zu bytes hash to %s.", len, got)));
 	}
 }
@@ -75,7 +85,7 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 		return NULL;
 	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
 	ChunkLog->read(log, e.loc, data, e.len);
-	check_hash(hash, data, e.len, true);
+	check_hash(hash, data, e.len, log, e.loc);
 	*len = e.len;
 	return data;
 }
@@ -86,12 +96,13 @@ ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 {
 	ChunkIndexEntry e;
 
+	PreventCommandIfReadOnly("put a chunk");
+	check_hash(hash, data, len, NULL, 0);
+
 	/*
 	 * (a transaction id first, so that the commit of a put that finds the
 	 * chunk there already flushes the WAL that put it, whoever wrote it)
 	 */
-	PreventCommandIfReadOnly("put a chunk");
-	check_hash(hash, data, len, false);
 	(void) GetCurrentTransactionId();
 	if (ChunkIndex->lookup(idx, hash, &e))
 		return false;

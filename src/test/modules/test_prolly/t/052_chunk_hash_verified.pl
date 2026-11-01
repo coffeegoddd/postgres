@@ -11,7 +11,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('chunk_hash');
-$node->init(extra => ['--no-data-checksums']);
+$node->init(no_data_checksums => 1);
 $node->append_conf('postgresql.conf', 'autovacuum = off');
 $node->start;
 $node->safe_psql('postgres', q{
@@ -25,12 +25,15 @@ my $get = q{SELECT test_chunk_get('cl', 'ci', substr(sha256(convert_to(repeat('A
 	= convert_to(repeat('A', 100), 'UTF8')};
 is($node->safe_psql('postgres', $get), 't', 'the chunk reads back');
 
-# where its 10th byte is in the log's file: a page holds 8160 bytes after
-# a 24-byte header, and the log's block 1 holds its first
+# where its 10th byte is in the log's file: a page holds its bytes after a
+# 24-byte header and before an 8-byte special space, and the log's block 1
+# holds its first
 my $loc = $node->safe_psql('postgres',
 	q{SELECT loc FROM test_chunk_index_entry('ci', substr(sha256(convert_to(repeat('A', 100), 'UTF8')), 1, 20))});
 my $path = $node->data_dir . '/' . $node->safe_psql('postgres', q{SELECT pg_relation_filepath('cl')});
-my $at = (1 + int($loc / 8160)) * 8192 + 24 + ($loc % 8160) + 10;
+my $bs = $node->safe_psql('postgres', q{SELECT current_setting('block_size')});
+my $area = $bs - 24 - 8;
+my $at = (1 + int($loc / $area)) * $bs + 24 + ($loc % $area) + 10;
 $node->stop;
 
 open(my $fh, '+<', $path) or die "open $path: $!";
@@ -41,7 +44,7 @@ close $fh;
 
 $node->start;
 my ($ret, $out, $err) = $node->psql('postgres', $get);
-like($err, qr/stored chunk [0-9a-f]{40} does not match its hash/,
+like($err, qr/stored chunk [0-9a-f]{40} does not match its hash.*DETAIL:  Its 100 bytes at \d+ in chunk log "cl"/s,
 	'a byte changed under it is an error');
 $node->stop;
 done_testing();
