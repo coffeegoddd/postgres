@@ -148,7 +148,7 @@ SELECT test_chunk_ref_root('ri', h(node('q', '\x61', '\x61'))) IS NOT NULL AS q_
 SELECT entries AS entries_before FROM test_chunk_index_shape('ri');
  entries_before 
 ----------------
-             14
+             15
 (1 row)
 
 VACUUM ri;

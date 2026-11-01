@@ -210,6 +210,19 @@ hash_text(const uint8 *hash)
 static bool put_hashed(Relation log, Relation idx, const uint8 *hash,
 					   const void *data, uint32 len);
 
+/* A reference of target's (from chunk) counted, or taken back. */
+static void
+count_ref(Relation idx, const uint8 *chunk, const uint8 *target, int32 drefs)
+{
+	ChunkIndexEntry e;
+
+	if (!ChunkIndex->adjust(idx, target, drefs, 0, &e))
+		ereport(ERROR,
+				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+				 errmsg("chunk %s references chunk %s, which the store does not have",
+						hash_text(chunk), hash_text(target))));
+}
+
 /*
  * The log and its index bound to each other (an index is one log
  * storage's, a log one index's), each checked before either is: a
@@ -243,6 +256,10 @@ found_pinned(Relation idx, const uint8 *hash)
 
 	if (!ChunkIndex->lookup(idx, hash, &e))
 		return false;
+
+	/* (this transaction's own, put before: held by it, no pin needed) */
+	if (TransactionIdIsCurrentTransactionId(e.xmin))
+		return true;
 	ChunkPin(hash);
 	return ChunkIndex->lookup(idx, hash, &e);
 }
@@ -299,25 +316,23 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	(void) GetCurrentTransactionId();
 
 	/*
-	 * Pinned: for this backend, whose own freeing alone could take a chunk
-	 * this transaction puts; and, found there already, in its table too,
-	 * then found again (a freer that marked it before the pin is waited for:
-	 * gone, it is put)
+	 * Found there already, pinned, then found again (a freer that marked it
+	 * before the pin is waited for: gone, it is put).  Put by this
+	 * transaction, it is held by it until it ends, with no pin.
 	 */
-	ChunkPinOwn(hash);
 	if (found_pinned(idx, hash))
 		return false;
 
-	/* a store holds a chunk only if it holds every chunk it references */
+	/*
+	 * A store holds a chunk only if it holds every chunk it references: each
+	 * edge a reference of the chunk it names, counted now, in this
+	 * transaction (its change, running, holds the chunk: no freer frees it
+	 * meanwhile, and no pin is needed), taken back if another puts the
+	 * chunk first; an abort, or a crash, takes them back with the chunk
+	 */
 	ChunkFormat->refs(data, len, add_ref, &refs);
 	for (int i = 0; i < refs.n; i++)
-		ChunkPin(refs.hashes + i * CHUNK_HASH_LEN);
-	for (int i = 0; i < refs.n; i++)
-		if (!ChunkIndex->lookup(idx, refs.hashes + i * CHUNK_HASH_LEN, &e))
-			ereport(ERROR,
-					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
-					 errmsg("chunk %s references chunk %s, which the store does not have",
-							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
+		count_ref(idx, hash, refs.hashes + i * CHUNK_HASH_LEN, 1);
 
 	/* (an index is one log's: VACUUM counts the bytes it takes out there) */
 	bind_store(log, idx);
@@ -342,6 +357,8 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 		if (found_pinned(idx, hash))
 		{
 			ChunkLog->release(log, &run);
+			for (int i = 0; i < refs.n; i++)
+				count_ref(idx, hash, refs.hashes + i * CHUNK_HASH_LEN, -1);
 			return false;
 		}
 	}
@@ -350,16 +367,6 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 		ChunkLog->write(log, e.loc, data, len);
 	ChunkLog->release(log, &run);
 
-	/*
-	 * each edge a reference of the chunk it names, in this transaction: an
-	 * abort, or a crash, takes them back with the chunk
-	 */
-	for (int i = 0; i < refs.n; i++)
-		if (!ChunkIndex->adjust(idx, refs.hashes + i * CHUNK_HASH_LEN, 1, 0, &e))
-			ereport(ERROR,
-					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
-					 errmsg("chunk %s references chunk %s, which the store does not have",
-							hash_text(hash), hash_text(refs.hashes + i * CHUNK_HASH_LEN))));
 	if (refs.hashes)
 		pfree(refs.hashes);
 	return true;
@@ -407,6 +414,8 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	HASHCTL		ctl;
 	HTAB	   *pack;
 	bool	   *fresh = palloc0(Max(n, 1) * sizeof(bool));
+	bool	   *planned = palloc0(Max(n, 1) * sizeof(bool));	/* fresh when looked
+																 * up */
 	RefList    *refs = palloc0(Max(n, 1) * sizeof(RefList));
 	uint64	   *locs = palloc(Max(n, 1) * sizeof(uint64));
 	uint64		stored = 0;
@@ -418,8 +427,8 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	(void) GetCurrentTransactionId();
 
 	/*
-	 * the pack's chunks the store hasn't, each once, pinned as a put's: for
-	 * this backend, and those found there in its table too
+	 * the pack's chunks the store hasn't, each once; those it has pinned, as
+	 * a put's are
 	 */
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = sizeof(PackChunk);
@@ -433,18 +442,18 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		bool		found;
 
 		CHECK_FOR_INTERRUPTS();
-		ChunkPinOwn(h);
 		pc = hash_search(pack, h, HASH_ENTER, &found);
 		if (found)
 			continue;
 		pc->at = i;
-		fresh[i] = !found_pinned(idx, h);
+		fresh[i] = planned[i] = !found_pinned(idx, h);
 	}
 
 	/*
-	 * every chunk a new one references, the store's (pinned in this
-	 * backend's table, then looked up) or the pack's new ones (a pack's
-	 * chunks reference each other in any order)
+	 * every chunk a new one references, the store's (its reference counted
+	 * now, as a put's are: its change, running, holds it) or the pack's new
+	 * ones (counted once they are put: a pack's chunks reference each other
+	 * in any order)
 	 */
 	for (int i = 0; i < n; i++)
 	{
@@ -457,14 +466,9 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 			PackChunk  *pc;
 
 			pc = hash_search(pack, rh, HASH_FIND, NULL);
-			if (pc != NULL && fresh[pc->at])
+			if (pc != NULL && planned[pc->at])
 				continue;
-			ChunkPin(rh);
-			if (!ChunkIndex->lookup(idx, rh, &e))
-				ereport(ERROR,
-						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
-						 errmsg("chunk %s references chunk %s, which the store does not have",
-								hash_text(hashes + i * CHUNK_HASH_LEN), hash_text(rh))));
+			count_ref(idx, hashes + i * CHUNK_HASH_LEN, rh, 1);
 		}
 	}
 
@@ -474,9 +478,9 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	 * Their entries, each one's place reserved as it is put, in their names'
 	 * order (packs naming chunks in other orders wait for each other's puts
 	 * in one order: no deadlock); then their bytes, written where reserved.
-	 * Every wait and failure is before a place is taken, and bytes reserved
-	 * are their entry's, which (aborted) counts them dead: a chunk another
-	 * put first reserves none.  Room is made a chunk at a time, so that a
+	 * Each entry's waits and failures are before its place is taken, and
+	 * bytes reserved are their entry's, which (aborted) counts them dead,
+	 * written or not: a chunk another put first reserves none.  Room is made a chunk at a time, so that a
 	 * chunk fitting a page freed goes into one; the bytes reserved in a
 	 * region are written before it is let go of (it is sealed from where
 	 * they end).
@@ -541,23 +545,32 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		pfree(order);
 	}
 
-	/* then each edge a reference of the chunk it names */
+	/*
+	 * then each edge to a new chunk of the pack a reference of it; a chunk
+	 * another put first takes back those counted of the store's (its own
+	 * put counted its references)
+	 */
 	for (int i = 0; i < n; i++)
 	{
-		if (!fresh[i])
+		if (!planned[i])
 			continue;
 		for (int r = 0; r < refs[i].n; r++)
-			if (!ChunkIndex->adjust(idx, refs[i].hashes + r * CHUNK_HASH_LEN, 1, 0, &e))
-				ereport(ERROR,
-						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
-						 errmsg("chunk %s references chunk %s, which the store does not have",
-								hash_text(hashes + i * CHUNK_HASH_LEN),
-								hash_text(refs[i].hashes + r * CHUNK_HASH_LEN))));
+		{
+			const uint8 *rh = refs[i].hashes + r * CHUNK_HASH_LEN;
+			PackChunk  *pc = hash_search(pack, rh, HASH_FIND, NULL);
+			bool		in_pack = pc != NULL && planned[pc->at];
+
+			if (fresh[i] && in_pack)
+				count_ref(idx, hashes + i * CHUNK_HASH_LEN, rh, 1);
+			else if (!fresh[i] && !in_pack)
+				count_ref(idx, hashes + i * CHUNK_HASH_LEN, rh, -1);
+		}
 		if (refs[i].hashes)
 			pfree(refs[i].hashes);
 	}
 	hash_destroy(pack);
 	pfree(fresh);
+	pfree(planned);
 	pfree(refs);
 	pfree(locs);
 	return stored;

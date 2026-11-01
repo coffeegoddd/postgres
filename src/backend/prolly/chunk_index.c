@@ -1453,8 +1453,13 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 				  true, &drefs, &droots, &running, NULL, NULL);
 	if (found != primary)
 		LockBuffer(found, BUFFER_LOCK_EXCLUSIVE);
+	/*
+	 * (a chunk this transaction is putting is held by it until it ends:
+	 * another's freer sees no such chunk, its entry not committed)
+	 */
 	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
-		TransactionIdIsValid(running) || (held && held(hash)))
+		TransactionIdIsValid(running) || TransactionIdIsCurrentTransactionId(out->xmin) ||
+		(held && held(hash)))
 	{
 		release_found(primary, found);
 		return false;

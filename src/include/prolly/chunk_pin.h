@@ -3,13 +3,15 @@
  * chunk_pin.h
  *	  Transient holds on the history store's chunks: pins.
  *
- * A transaction pins each chunk it puts (stored, or found stored already)
- * and each chunk that names, until it ends (a chunk it stores itself, for
- * its own backend alone: ChunkPinOwn): the chunk is then held by what
+ * A transaction pins each chunk it finds stored already, until it ends (a
+ * chunk it stores itself is held by it without a pin: its entry, until it
+ * commits, is the transaction's, which no other's freer frees, and its own
+ * freeing passes by): the chunk is then held by what
  * the transaction made of it (a reference from a chunk it stored, a root it
  * took) or freeing may have it.  A pin closes the race in which a chunk
  * nothing holds is freed just as a writer is about to use it: the writer
- * pins, then looks the chunk up; the freer, with the chunk's bucket locked,
+ * pins, then looks the chunk up (again, if it found it before pinning);
+ * the freer, with the chunk's bucket locked,
  * looks for pins, and marks the chunk being freed only if it finds none, so
  * that a writer looking it up after waits for the freeing to end.  (A
  * chunk only looked up, not put, is not pinned.)
@@ -32,13 +34,6 @@
 /* Pins the chunk named hash until this transaction ends. */
 extern void ChunkPin(const uint8 *hash);
 
-/*
- * Pins, for this backend alone, a chunk this transaction is putting itself
- * (its entry not committed: no other backend's freer frees it), until the
- * transaction ends: kept in the backend's memory, not its table, which a
- * transaction putting many chunks would fill.
- */
-extern void ChunkPinOwn(const uint8 *hash);
 
 /* Whether any backend has the chunk pinned (or might have). */
 extern bool ChunkPinned(const uint8 *hash);
