@@ -22,6 +22,7 @@ chunk_free_in_background = off
 $primary->start;
 $primary->safe_psql('postgres', q{
 	CREATE EXTENSION test_prolly;
+	CREATE TABLE flush (x int);
 	CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
 		AS 'SELECT substr(sha256(d), 1, 20)';
 	SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d), d)
@@ -46,10 +47,11 @@ my $has = sub {
 	my ($d) = @_;
 	return qq{SELECT test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('$d'))};
 };
-# (VACUUM commits nothing: a write that does flushes its WAL, to replay)
+# (VACUUM commits nothing: a write that does flushes its WAL, to replay;
+# one leaving no catalog rows dead, whose pruning would conflict too)
+my $flush = 'INSERT INTO flush VALUES (1)';
 my $vacuum = sub {
-	$primary->safe_psql('postgres',
-		'VACUUM pg_history.chunk_index; CREATE TABLE IF NOT EXISTS flush (); DROP TABLE flush');
+	$primary->safe_psql('postgres', "VACUUM pg_history.chunk_index; $flush");
 };
 my $conflicts = q{SELECT confl_snapshot FROM pg_stat_database_conflicts WHERE datname = 'postgres'};
 my $free = sub {
@@ -66,7 +68,7 @@ like($stderr, qr/cannot execute put a chunk in a read-only transaction/, 'and a 
 my $freeing = $primary->background_psql('postgres');
 $freeing->query_safe('BEGIN');
 $freeing->query_safe($free->('\x01'));
-$primary->safe_psql('postgres', 'CREATE TABLE flush ()');
+$primary->safe_psql('postgres', $flush);
 $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', "SET statement_timeout = '5s'; " . $has->('\x01')),
 	't', 'a chunk being freed on the primary is there on the standby, no waiting');
@@ -81,6 +83,7 @@ my $reader = $standby->background_psql('postgres', on_error_stop => 0);
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $reader->query_safe($get->('\x02'));
 my $offset = -s $standby->logfile;
+my $start_lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 $primary->safe_psql('postgres', $free->('\x02'));
 $vacuum->();
 $primary->wait_for_replay_catchup($standby);
@@ -120,9 +123,10 @@ $primary->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $conflicts), '1', 'and no query conflicted');
 
 # pg_waldump describes the record
-my $wal = $primary->safe_psql('postgres', 'SELECT pg_walfile_name(pg_current_wal_lsn())');
+my $end_lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()');
 ($stdout, $stderr) = run_command([ 'pg_waldump', '--rmgr' => 'ChunkStore',
-	$primary->data_dir . "/pg_wal/$wal" ]);
+	'--path' => $primary->data_dir . '/pg_wal',
+	'--start' => $start_lsn, '--end' => $end_lsn ]);
 like($stdout, qr/rmgr: ChunkStore .*desc: INDEX_CLEANUP_INFO rel \d+\/\d+\/\d+; snapshotConflictHorizon: \d+/,
 	'pg_waldump describes the cleanup records');
 

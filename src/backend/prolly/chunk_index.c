@@ -199,7 +199,9 @@ entry_state_wait(ChunkIndexEntry *e, Buffer buf, TransactionId *wait)
 		/*
 		 * (a hot standby's, which can't wait for the primary's transactions:
 		 * the chunk is there, its freeing not committed; should it commit,
-		 * taking the entry out conflicts with this snapshot first)
+		 * taking the entry out conflicts with this snapshot first.  So a
+		 * visit there sees the chunk too, where one on the primary passes it
+		 * by.)
 		 */
 		if (RecoveryInProgress())
 			return ENTRY_VISIBLE;
@@ -554,8 +556,13 @@ find_entry_freeing(Relation rel, Buffer primary, int mode, const uint8 *hash,
 					return ENTRY_VISIBLE;
 				case ENTRY_IN_PROGRESS:
 					result = ENTRY_IN_PROGRESS;
+					/*
+					 * (a chunk put and freed by one transaction running is
+					 * not the store's to wait for: whatever it does, the
+					 * chunk is gone)
+					 */
 					if (freeing && running)
-						*freeing = (*running == e->xmax);
+						*freeing = (*running == e->xmax && e->xmax != e->xmin);
 					break;
 				case ENTRY_DEAD:
 					break;

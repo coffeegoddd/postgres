@@ -10,8 +10,8 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	bmapdesc.o \
-	chunkdesc.o \
 	brindesc.o \
+	chunkdesc.o \
 	clogdesc.o \
 	committsdesc.o \
 	dbasedesc.o \
