@@ -39,7 +39,7 @@ PG_FUNCTION_INFO_V1(test_chunk_unref_root);
 PG_FUNCTION_INFO_V1(test_chunk_check);
 PG_FUNCTION_INFO_V1(test_chunk_free);
 PG_FUNCTION_INFO_V1(test_chunk_free_unheld);
-PG_FUNCTION_INFO_V1(test_chunk_pin);
+PG_FUNCTION_INFO_V1(test_chunk_hold);
 
 static Relation
 open_index(Oid relid, LOCKMODE mode)
@@ -331,10 +331,13 @@ test_chunk_free_unheld(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) freed);
 }
 
-/* test_chunk_pin(hash): pins the chunk until the transaction ends */
+/* test_chunk_hold(idx, hash): holds the chunk until the transaction ends */
 Datum
-test_chunk_pin(PG_FUNCTION_ARGS)
+test_chunk_hold(PG_FUNCTION_ARGS)
 {
-	ChunkPin(arg_hash(PG_GETARG_BYTEA_PP(0)));
-	PG_RETURN_VOID();
+	Relation	idx = open_index(PG_GETARG_OID(0), RowExclusiveLock);
+	bool		held = ChunkStoreHold(idx, arg_hash(PG_GETARG_BYTEA_PP(1)));
+
+	relation_close(idx, NoLock);
+	PG_RETURN_BOOL(held);
 }

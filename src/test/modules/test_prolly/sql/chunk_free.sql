@@ -52,13 +52,22 @@ SELECT put('\x61') AND put(node('r', '\x61')) AND put(node('s', '\x61')) AS made
 SELECT free(node('r', '\x61')) AS freed, (test_chunk_index_entry('fi', h('\x61'))).refs AS a_refs;
 SELECT free(node('s', '\x61')) AS freed, has('\x61') AS a;
 
--- a pin holds a chunk until its transaction ends
+-- a hold holds a chunk until its transaction ends
 SELECT put('\x7a') AS z;
 BEGIN;
-SELECT test_chunk_pin(h('\x7a'));
-SELECT free('\x7a') AS freed_pinned;
+SELECT test_chunk_hold('fi', h('\x7a')) AS held;
+SELECT free('\x7a') AS freed_held;
 COMMIT;
 SELECT free('\x7a') AS freed;
+
+-- a put refused for a reference the store lacks counts none of the others
+-- (no change left behind, aborted, for VACUUM)
+SELECT put('\x61') AS a;
+VACUUM fi;
+SELECT entries AS entries_before FROM test_chunk_index_shape('fi') \gset
+SELECT put(node('m', '\x61', '\x6d'));
+SELECT entries - :entries_before AS left_behind FROM test_chunk_index_shape('fi');
+SELECT free('\x61') AS freed;
 
 -- freed and put again, it starts afresh: none of its old changes count
 SELECT put('\x78') AS x;

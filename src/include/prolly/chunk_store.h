@@ -67,6 +67,12 @@ extern bool ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 						  const void *data, uint32 len);
 
 /*
+ * Whether the store has the chunk, held by this transaction until it ends
+ * if so, as a put that finds it holds it (prolly/chunk_pin.h).
+ */
+extern bool ChunkStoreHold(Relation idx, const uint8 *hash);
+
+/*
  * ChunkStorePut of the chunk the bytes are, named in *hash (hashed here,
  * once).
  */
