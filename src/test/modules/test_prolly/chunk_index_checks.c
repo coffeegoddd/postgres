@@ -16,9 +16,11 @@
 #include "access/relation.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "prolly/chunk_format.h"
 #include "prolly/chunk_log.h"
 #include "prolly/chunk_store.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/rel.h"
 #include "varatt.h"
 
@@ -30,6 +32,10 @@ PG_FUNCTION_INFO_V1(test_chunk_index_adjust);
 PG_FUNCTION_INFO_V1(test_chunk_index_remove);
 PG_FUNCTION_INFO_V1(test_chunk_index_shape);
 PG_FUNCTION_INFO_V1(test_chunk_index_unfrozen);
+PG_FUNCTION_INFO_V1(test_chunk_format_refs);
+PG_FUNCTION_INFO_V1(test_chunk_ref_root);
+PG_FUNCTION_INFO_V1(test_chunk_unref_root);
+PG_FUNCTION_INFO_V1(test_chunk_check);
 
 static Relation
 open_index(Oid relid, LOCKMODE mode)
@@ -203,4 +209,94 @@ test_chunk_index_unfrozen(PG_FUNCTION_ARGS)
 
 	relation_close(idx, AccessShareLock);
 	PG_RETURN_INT64((int64) n);
+}
+
+/*
+ * A format for the store's tests: a chunk of 'R', a count n, and n hashes
+ * (then anything) references those n chunks; any other chunk is a leaf.
+ */
+static void
+test_refs(const void *data, size_t len, ChunkRefFn fn, void *arg)
+{
+	const uint8 *b = data;
+
+	if (len < 2 || b[0] != 'R')
+		return;
+	if (len < 2 + (size_t) b[1] * CHUNK_HASH_LEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a test chunk names %u references and holds fewer", b[1])));
+	for (int i = 0; i < b[1]; i++)
+		fn(arg, b + 2 + i * CHUNK_HASH_LEN);
+}
+
+static const ChunkFormatRoutine TestChunkFormat = {
+	.refs = test_refs,
+};
+
+/* test_chunk_format_refs(on bool): the test format for this backend, or not */
+Datum
+test_chunk_format_refs(PG_FUNCTION_ARGS)
+{
+	ChunkFormat = PG_GETARG_BOOL(0) ? &TestChunkFormat : &LeafChunkFormat;
+	PG_RETURN_VOID();
+}
+
+static Datum
+root_change(FunctionCallInfo fcinfo, bool ref)
+{
+	Relation	idx = open_index(PG_GETARG_OID(0), RowExclusiveLock);
+	ChunkIndexEntry e;
+	Datum		values[2];
+
+	if (ref)
+		ChunkStoreRefRoot(idx, arg_hash(PG_GETARG_BYTEA_PP(1)), &e);
+	else
+		ChunkStoreUnrefRoot(idx, arg_hash(PG_GETARG_BYTEA_PP(1)), &e);
+	relation_close(idx, NoLock);
+	values[0] = Int64GetDatum((int64) e.refs);
+	values[1] = Int64GetDatum((int64) e.roots);
+	return entry_record(fcinfo, values, 2);
+}
+
+/* test_chunk_ref_root(idx, hash, OUT refs, OUT roots) */
+Datum
+test_chunk_ref_root(PG_FUNCTION_ARGS)
+{
+	return root_change(fcinfo, true);
+}
+
+/* test_chunk_unref_root(idx, hash, OUT refs, OUT roots) */
+Datum
+test_chunk_unref_root(PG_FUNCTION_ARGS)
+{
+	return root_change(fcinfo, false);
+}
+
+/* test_chunk_check(log, idx, OUT ok, OUT chunks, OUT unheld, OUT why) */
+Datum
+test_chunk_check(PG_FUNCTION_ARGS)
+{
+	Relation	log = open_log(PG_GETARG_OID(0), AccessShareLock);
+	Relation	idx = open_index(PG_GETARG_OID(1), AccessShareLock);
+	uint64		chunks,
+				unheld;
+	char	   *why;
+	bool		ok = ChunkStoreCheck(log, idx, &chunks, &unheld, &why);
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+
+	relation_close(idx, AccessShareLock);
+	relation_close(log, AccessShareLock);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = BoolGetDatum(ok);
+	values[1] = Int64GetDatum((int64) chunks);
+	values[2] = Int64GetDatum((int64) unheld);
+	if (why)
+		values[3] = CStringGetTextDatum(why);
+	else
+		nulls[3] = true;
+	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
 }

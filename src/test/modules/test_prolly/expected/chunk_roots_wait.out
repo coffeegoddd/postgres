@@ -1,0 +1,62 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_begin a_unref b_unref a_commit
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+step a_begin: BEGIN;
+step a_unref: SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    0
+(1 row)
+
+step b_unref: SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20)); <waiting ...>
+step a_commit: COMMIT;
+step b_unref: <... completed>
+ERROR:  a chunk's reference counts would be 0 and -1
+
+starting permutation: a_begin a_unref b_unref a_rollback
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+step a_begin: BEGIN;
+step a_unref: SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    0
+(1 row)
+
+step b_unref: SELECT * FROM test_chunk_unref_root('ri', substr(sha256('\x01'), 1, 20)); <waiting ...>
+step a_rollback: ROLLBACK;
+step b_unref: <... completed>
+refs|roots
+----+-----
+   0|    0
+(1 row)
+
+
+starting permutation: a_begin a_ref b_ref a_commit
+test_chunk_ref_root
+-------------------
+(0,1)              
+(1 row)
+
+step a_begin: BEGIN;
+step a_ref: SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    2
+(1 row)
+
+step b_ref: SELECT * FROM test_chunk_ref_root('ri', substr(sha256('\x01'), 1, 20));
+refs|roots
+----+-----
+   0|    2
+(1 row)
+
+step a_commit: COMMIT;

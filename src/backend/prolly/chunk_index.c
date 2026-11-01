@@ -53,7 +53,7 @@
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	2
+#define CHUNK_INDEX_VERSION	3
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -108,8 +108,8 @@ typedef struct IndexCache
 	BlockNumber dir[MAX_DIR];
 } IndexCache;
 
-StaticAssertDecl(sizeof(ChunkIndexEntry) == 48,
-				 "a chunk index entry is 48 bytes");
+StaticAssertDecl(sizeof(ChunkIndexEntry) == 56,
+				 "a chunk index entry is 56 bytes");
 
 /*
  * A record that moves entries between a page's slots logs the whole page: a
@@ -445,7 +445,8 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 
-			if (memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
+			if (e->kind != CHUNK_KIND_CHUNK ||
+				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
 				!belongs(e, bucket, masks))
 				continue;
 			switch (entry_state(e, cur))
@@ -713,68 +714,101 @@ split_bucket(Relation rel)
 
 /* ------------------------------------------------------- the routine */
 
-static bool
-page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+/*
+ * The changes of hash's counts on the chain of the bucket whose first page
+ * is primary (locked): those this transaction sees added to *drefs and
+ * *droots, and the transaction of one it doesn't (another's, running) in
+ * *running, if it is given.
+ */
+static void
+count_changes(Relation rel, Buffer primary, int mode, const uint8 *hash,
+			  uint32 bucket, const IndexCache *masks, int64 *drefs,
+			  int64 *droots, TransactionId *running)
 {
-	uint32		bucket;
-	IndexCache	masks;
-	Buffer		primary = lock_bucket(idx, hash, BUFFER_LOCK_SHARE, &bucket, &masks);
-	Buffer		found;
-	int			at;
-	bool		hit;
+	Buffer		cur = primary;
 
-	hit = find_entry(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
-					 false, &found, &at, NULL, NULL, NULL) == ENTRY_VISIBLE;
-	if (hit)
-	{
-		*out = *page_entry(BufferGetPage(found), at);
-		release_found(primary, found);
-	}
-	else
-		UnlockReleaseBuffer(primary);
-	return hit;
-}
-
-static bool
-page_insert(Relation idx, ChunkIndexEntry *entry)
-{
-	uint32		bucket;
-	IndexCache	masks;
-	Buffer		primary;
-	Buffer		found;
-	int			at;
-	BlockNumber space;
-	BlockNumber last;
-	bool		grew = false;
-	TransactionId running;
-
-	PreventCommandIfReadOnly("insert into a chunk index");
-	entry->xmin = GetCurrentTransactionId();
-	entry->flags = 0;
-	entry->unused = 0;
+	*drefs = *droots = 0;
+	if (running)
+		*running = InvalidTransactionId;
 	for (;;)
 	{
-		primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket,
-							  &masks);
-		switch (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, entry->hash,
-						   bucket, &masks, true, &found, &at, &space, &last,
-						   &running))
-		{
-			case ENTRY_VISIBLE:
-				*entry = *page_entry(BufferGetPage(found), at);
-				release_found(primary, found);
-				return false;
-			case ENTRY_IN_PROGRESS:
-				/* (as for a unique index: whether it is there is up to it) */
-				UnlockReleaseBuffer(primary);
-				XactLockTableWait(running, NULL, NULL, XLTW_None);
-				continue;
-			case ENTRY_DEAD:
-				break;
-		}
-		break;
-	}
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
 
+		for (int i = 0; i < n; i++)
+		{
+			ChunkIndexEntry *e = page_entry(page, i);
+
+			if (e->kind != CHUNK_KIND_CHANGE ||
+				memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
+				!belongs(e, bucket, masks))
+				continue;
+			switch (entry_state(e, cur))
+			{
+				case ENTRY_VISIBLE:
+					*drefs += (int32) e->refs;
+					*droots += (int32) e->roots;
+					break;
+				case ENTRY_IN_PROGRESS:
+					if (running)
+						*running = e->xmin;
+					break;
+				case ENTRY_DEAD:
+					break;
+			}
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			return;
+		cur = ReadBuffer(rel, next);
+		LockBuffer(cur, mode);
+		check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+}
+
+/*
+ * The first page with room on the chain of the bucket whose first page is
+ * primary (locked exclusively), or InvalidBlockNumber, and its last page.
+ */
+static void
+chain_room(Relation rel, Buffer primary, BlockNumber *space, BlockNumber *last)
+{
+	Buffer		cur = primary;
+
+	*space = InvalidBlockNumber;
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+
+		if (*space == InvalidBlockNumber && page_entries(page) < PER_PAGE)
+			*space = BufferGetBlockNumber(cur);
+		if (!BlockNumberIsValid(next))
+		{
+			*last = BufferGetBlockNumber(cur);
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			return;
+		}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		cur = ReadBuffer(rel, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(rel, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+}
+
+/*
+ * Adds entry to the bucket whose first page is primary (locked
+ * exclusively): onto the page with room space, or a new page at the
+ * chain's end, last.  Answers whether the entry went past the first page.
+ */
+static bool
+add_entry(Relation idx, Buffer primary, uint32 bucket, BlockNumber space,
+		  BlockNumber last, const ChunkIndexEntry *entry)
+{
 	if (BlockNumberIsValid(space))
 	{
 		Buffer		buf = primary;
@@ -793,11 +827,10 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 		*page_entry(page, n) = *entry;
 		set_page_entries(page, n + 1);
 		GenericXLogFinish(st);
-		if (buf != primary)
-		{
-			UnlockReleaseBuffer(buf);
-			grew = true;
-		}
+		if (buf == primary)
+			return false;
+		UnlockReleaseBuffer(buf);
+		return true;
 	}
 	else
 	{
@@ -839,8 +872,95 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 		UnlockReleaseBuffer(mbuf);
 		if (lbuf != primary)
 			UnlockReleaseBuffer(lbuf);
-		grew = true;
+		return true;
 	}
+}
+
+static bool
+counts_add(ChunkIndexEntry *out, int64 drefs, int64 droots)
+{
+	int64		refs = (int64) out->refs + drefs;
+	int64		roots = (int64) out->roots + droots;
+
+	if (refs < 0 || roots < 0 || refs > PG_UINT32_MAX || roots > PG_UINT32_MAX)
+		return false;
+	out->refs = (uint32) refs;
+	out->roots = (uint32) roots;
+	return true;
+}
+
+static bool
+page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary = lock_bucket(idx, hash, BUFFER_LOCK_SHARE, &bucket, &masks);
+	Buffer		found;
+	int			at;
+	int64		drefs,
+				droots;
+
+	if (find_entry(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
+				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+	{
+		UnlockReleaseBuffer(primary);
+		return false;
+	}
+	*out = *page_entry(BufferGetPage(found), at);
+	if (found != primary)
+		UnlockReleaseBuffer(found);
+	count_changes(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
+				  &drefs, &droots, NULL);
+	UnlockReleaseBuffer(primary);
+	if (!counts_add(out, drefs, droots))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a chunk's reference counts are out of range")));
+	return true;
+}
+
+static bool
+page_insert(Relation idx, ChunkIndexEntry *entry)
+{
+	uint32		bucket;
+	IndexCache	masks;
+	Buffer		primary;
+	Buffer		found;
+	int			at;
+	BlockNumber space;
+	BlockNumber last;
+	bool		grew;
+	TransactionId running;
+
+	PreventCommandIfReadOnly("insert into a chunk index");
+	entry->xmin = GetCurrentTransactionId();
+	entry->xmax = InvalidTransactionId;
+	entry->flags = 0;
+	entry->kind = CHUNK_KIND_CHUNK;
+	entry->unused = 0;
+	for (;;)
+	{
+		primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket,
+							  &masks);
+		switch (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, entry->hash,
+						   bucket, &masks, true, &found, &at, &space, &last,
+						   &running))
+		{
+			case ENTRY_VISIBLE:
+				*entry = *page_entry(BufferGetPage(found), at);
+				release_found(primary, found);
+				return false;
+			case ENTRY_IN_PROGRESS:
+				/* (as for a unique index: whether it is there is up to it) */
+				UnlockReleaseBuffer(primary);
+				XactLockTableWait(running, NULL, NULL, XLTW_None);
+				continue;
+			case ENTRY_DEAD:
+				break;
+		}
+		break;
+	}
+	grew = add_entry(idx, primary, bucket, space, last, entry);
 	UnlockReleaseBuffer(primary);
 
 	/*
@@ -861,38 +981,69 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	Buffer		primary;
 	Buffer		found;
 	int			at;
-	GenericXLogState *st;
-	ChunkIndexEntry *e;
-	int64		refs,
-				roots;
+	BlockNumber space;
+	BlockNumber last;
+	ChunkIndexEntry change;
+	int64		crefs,
+				croots;
+	TransactionId running;
+	bool		grew;
 
 	PreventCommandIfReadOnly("change a chunk index");
-	(void) GetCurrentTransactionId();
-	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+	memset(&change, 0, sizeof(change));
+	memcpy(change.hash, hash, CHUNK_HASH_LEN);
+	change.refs = (uint32) drefs;
+	change.roots = (uint32) droots;
+	change.xmin = GetCurrentTransactionId();
+	change.kind = CHUNK_KIND_CHANGE;
+	for (;;)
 	{
-		UnlockReleaseBuffer(primary);
-		return false;
+		primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
+		if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+					   true, &found, &at, &space, &last, NULL) != ENTRY_VISIBLE)
+		{
+			UnlockReleaseBuffer(primary);
+			return false;
+		}
+		*out = *page_entry(BufferGetPage(found), at);
+		if (found != primary)
+			UnlockReleaseBuffer(found);
+		count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+					  &crefs, &croots, &running);
+
+		/*
+		 * (a decrease waits for another's changes, as a row's update waits
+		 * for another's: two taking the last root away would both see it)
+		 */
+		if ((drefs < 0 || droots < 0) && TransactionIdIsValid(running))
+		{
+			UnlockReleaseBuffer(primary);
+			XactLockTableWait(running, NULL, NULL, XLTW_None);
+			continue;
+		}
+		break;
 	}
-	st = GenericXLogStart(idx);
-	e = page_entry(GenericXLogRegisterBuffer(st, found, 0), at);
-	refs = (int64) e->refs + drefs;
-	roots = (int64) e->roots + droots;
-	if (refs < 0 || roots < 0 || refs > PG_UINT32_MAX || roots > PG_UINT32_MAX)
 	{
-		GenericXLogAbort(st);
-		release_found(primary, found);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("a chunk's reference counts would be %lld and %lld",
-						(long long) refs, (long long) roots)));
+		int64		refs = (int64) out->refs + crefs + drefs;
+		int64		roots = (int64) out->roots + croots + droots;
+
+		if (refs < 0 || roots < 0 || refs > PG_UINT32_MAX || roots > PG_UINT32_MAX)
+		{
+			UnlockReleaseBuffer(primary);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a chunk's reference counts would be %lld and %lld",
+							(long long) refs, (long long) roots)));
+		}
+		out->refs = (uint32) refs;
+		out->roots = (uint32) roots;
 	}
-	e->refs = (uint32) refs;
-	e->roots = (uint32) roots;
-	*out = *e;
-	GenericXLogFinish(st);
-	release_found(primary, found);
+
+	chain_room(idx, primary, &space, &last);
+	grew = add_entry(idx, primary, bucket, space, last, &change);
+	UnlockReleaseBuffer(primary);
+	if (grew)
+		split_bucket(idx);
 	return true;
 }
 
@@ -904,27 +1055,159 @@ page_remove(Relation idx, const uint8 *hash)
 	Buffer		primary;
 	Buffer		found;
 	int			at;
-	GenericXLogState *st;
-	Page		page;
-	int			n;
+	bool		removed = false;
 
 	PreventCommandIfReadOnly("change a chunk index");
 	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+
+	/* the chunk's entry, and every change of its counts */
+	while (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+					  false, &found, &at, NULL, NULL, NULL) == ENTRY_VISIBLE)
 	{
-		UnlockReleaseBuffer(primary);
-		return false;
+		GenericXLogState *st = GenericXLogStart(idx);
+		Page		page = GenericXLogRegisterBuffer(st, found, MOVES_ENTRIES);
+		int			n = page_entries(page);
+
+		*page_entry(page, at) = *page_entry(page, n - 1);
+		set_page_entries(page, n - 1);
+		GenericXLogFinish(st);
+		if (found != primary)
+			UnlockReleaseBuffer(found);
+		removed = true;
 	}
-	st = GenericXLogStart(idx);
-	page = GenericXLogRegisterBuffer(st, found, MOVES_ENTRIES);
-	n = page_entries(page);
-	*page_entry(page, at) = *page_entry(page, n - 1);
-	set_page_entries(page, n - 1);
-	GenericXLogFinish(st);
-	release_found(primary, found);
-	return true;
+	if (removed)
+	{
+		Buffer		cur = primary;
+
+		for (;;)
+		{
+			Page		page = BufferGetPage(cur);
+			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			int			n = page_entries(page);
+			int			kept = 0;
+
+			for (int i = 0; i < n; i++)
+				if (memcmp(page_entry(page, i)->hash, hash, CHUNK_HASH_LEN) != 0)
+					kept++;
+			if (kept < n)
+			{
+				GenericXLogState *st = GenericXLogStart(idx);
+				Page		p = GenericXLogRegisterBuffer(st, cur, MOVES_ENTRIES);
+				int			k = 0;
+
+				for (int i = 0; i < n; i++)
+					if (memcmp(page_entry(p, i)->hash, hash, CHUNK_HASH_LEN) != 0)
+						*page_entry(p, k++) = *page_entry(p, i);
+				set_page_entries(p, k);
+				GenericXLogFinish(st);
+			}
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			if (!BlockNumberIsValid(next))
+				break;
+			cur = ReadBuffer(idx, next);
+			LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+		}
+	}
+	UnlockReleaseBuffer(primary);
+	return removed;
+}
+
+/*
+ * Each chunk's entry this transaction sees, a bucket at a time: its counts
+ * added up on the bucket's pages, and fn called with the bucket unlocked.
+ */
+static void
+page_visit(Relation idx, void (*fn) (void *arg, const ChunkIndexEntry *e),
+			 void *arg)
+{
+	for (uint32 b = 0; b <= load_cache(idx)->maxbucket; b++)
+	{
+		IndexCache	masks = *(IndexCache *) idx->rd_amcache;
+		BlockNumber blk = bucket_block(idx, &masks, b);
+		Buffer		primary = ReadBuffer(idx, blk);
+		Buffer		cur;
+		ChunkIndexEntry *chunks = NULL;
+		ChunkIndexEntry *changes = NULL;
+		int			nchunks = 0,
+					nchanges = 0,
+					cap1 = 0,
+					cap2 = 0;
+
+		LockBuffer(primary, BUFFER_LOCK_SHARE);
+		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
+			masks = *load_cache(idx);
+		cur = primary;
+		for (;;)
+		{
+			Page		page = BufferGetPage(cur);
+			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			int			n = page_entries(page);
+
+			for (int i = 0; i < n; i++)
+			{
+				ChunkIndexEntry *e = page_entry(page, i);
+
+				if (!belongs(e, b, &masks) || entry_state(e, cur) != ENTRY_VISIBLE)
+					continue;
+				if (e->kind == CHUNK_KIND_CHUNK)
+				{
+					if (nchunks == cap1)
+					{
+						cap1 = cap1 ? cap1 * 2 : 64;
+						chunks = chunks ? repalloc(chunks, cap1 * sizeof(*chunks)) :
+							palloc(cap1 * sizeof(*chunks));
+					}
+					chunks[nchunks++] = *e;
+				}
+				else
+				{
+					if (nchanges == cap2)
+					{
+						cap2 = cap2 ? cap2 * 2 : 64;
+						changes = changes ? repalloc(changes, cap2 * sizeof(*changes)) :
+							palloc(cap2 * sizeof(*changes));
+					}
+					changes[nchanges++] = *e;
+				}
+			}
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			if (!BlockNumberIsValid(next))
+				break;
+			cur = ReadBuffer(idx, next);
+			LockBuffer(cur, BUFFER_LOCK_SHARE);
+			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+		}
+		UnlockReleaseBuffer(primary);
+
+		for (int i = 0; i < nchunks; i++)
+		{
+			int64		drefs = 0,
+						droots = 0;
+
+			/* (summed first: in no order, they may dip below zero midway) */
+			for (int j = 0; j < nchanges; j++)
+				if (memcmp(changes[j].hash, chunks[i].hash, CHUNK_HASH_LEN) == 0)
+				{
+					drefs += (int32) changes[j].refs;
+					droots += (int32) changes[j].roots;
+				}
+			if (!counts_add(&chunks[i], drefs, droots))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a chunk's reference counts are out of range")));
+			fn(arg, &chunks[i]);
+		}
+		if (chunks)
+			pfree(chunks);
+		if (changes)
+			pfree(changes);
+		CHECK_FOR_INTERRUPTS();
+	}
 }
 
 const ChunkIndexRoutine PageChunkIndex = {
@@ -932,6 +1215,7 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.insert = page_insert,
 	.adjust = page_adjust,
 	.remove = page_remove,
+	.visit = page_visit,
 };
 
 const ChunkIndexRoutine *ChunkIndex = &PageChunkIndex;
@@ -999,6 +1283,132 @@ entry_state_unhinted(const ChunkIndexEntry *e)
 	return TransactionIdDidCommit(e->xmin) ? ENTRY_VISIBLE : ENTRY_DEAD;
 }
 
+/* The page and slot of the first entry on the chain that match wants. */
+typedef bool (*EntryTest) (const ChunkIndexEntry *e, const void *arg);
+
+static bool
+chain_find(Relation idx, Buffer primary, EntryTest wants, const void *arg,
+		   BlockNumber *blk, int *at, ChunkIndexEntry *copy)
+{
+	Buffer		cur = primary;
+
+	for (;;)
+	{
+		Page		page = BufferGetPage(cur);
+		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+		int			n = page_entries(page);
+
+		for (int i = 0; i < n; i++)
+			if (wants(page_entry(page, i), arg))
+			{
+				*blk = BufferGetBlockNumber(cur);
+				*at = i;
+				*copy = *page_entry(page, i);
+				if (cur != primary)
+					UnlockReleaseBuffer(cur);
+				return true;
+			}
+		if (cur != primary)
+			UnlockReleaseBuffer(cur);
+		if (!BlockNumberIsValid(next))
+			return false;
+		cur = ReadBuffer(idx, next);
+		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+	}
+}
+
+/* a committed change: of increases (arg true), or of any */
+static bool
+committed_change(const ChunkIndexEntry *e, const void *arg)
+{
+	return e->kind == CHUNK_KIND_CHANGE &&
+		(!*(const bool *) arg || ((int32) e->refs >= 0 && (int32) e->roots >= 0)) &&
+		entry_state_unhinted(e) == ENTRY_VISIBLE;
+}
+
+static bool
+chunk_of(const ChunkIndexEntry *e, const void *arg)
+{
+	return e->kind == CHUNK_KIND_CHUNK &&
+		memcmp(e->hash, arg, CHUNK_HASH_LEN) == 0 &&
+		entry_state_unhinted(e) == ENTRY_VISIBLE;
+}
+
+/*
+ * Adds each committed change of a chunk's counts on the bucket's chain into
+ * the chunk's entry, and takes it out, both in one record: a crash leaves
+ * a change in or out, never in twice.  (The bucket's first page, primary,
+ * locked exclusively, keeps everyone else off its chain.)
+ */
+static void
+fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *masks)
+{
+	BlockNumber cblk,
+				eblk;
+	int			cat,
+				eat;
+	ChunkIndexEntry change,
+				chunk;
+	bool		increases = true;
+
+	/*
+	 * Increases first: each decrease was made against counts with the
+	 * increases committed before it, so none takes a count below zero
+	 */
+	for (;;)
+	{
+		Buffer		cbuf,
+					ebuf;
+		GenericXLogState *st;
+		Page		cpage,
+					epage;
+		ChunkIndexEntry *e;
+		int			n;
+
+		if (!chain_find(idx, primary, committed_change, &increases, &cblk, &cat,
+						&change))
+		{
+			if (!increases)
+				break;
+			increases = false;
+			continue;
+		}
+
+		if (!chain_find(idx, primary, chunk_of, change.hash, &eblk, &eat, &chunk))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("chunk index \"%s\" has a change of the counts of a chunk it hasn't",
+							RelationGetRelationName(idx))));
+		cbuf = cblk == BufferGetBlockNumber(primary) ? primary : ReadBuffer(idx, cblk);
+		ebuf = eblk == BufferGetBlockNumber(primary) ? primary :
+			eblk == cblk ? cbuf : ReadBuffer(idx, eblk);
+		if (cbuf != primary)
+			LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+		if (ebuf != primary && ebuf != cbuf)
+			LockBuffer(ebuf, BUFFER_LOCK_EXCLUSIVE);
+		st = GenericXLogStart(idx);
+		cpage = GenericXLogRegisterBuffer(st, cbuf, MOVES_ENTRIES);
+		epage = ebuf == cbuf ? cpage : GenericXLogRegisterBuffer(st, ebuf, 0);
+		e = page_entry(epage, eat);
+		if (!counts_add(e, (int32) change.refs, (int32) change.roots))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a chunk's reference counts are out of range")));
+		n = page_entries(cpage);
+
+		/* (out by the last entry moved into its slot: the chunk's may be it) */
+		*page_entry(cpage, cat) = *page_entry(cpage, n - 1);
+		set_page_entries(cpage, n - 1);
+		GenericXLogFinish(st);
+		if (ebuf != primary && ebuf != cbuf)
+			UnlockReleaseBuffer(ebuf);
+		if (cbuf != primary)
+			UnlockReleaseBuffer(cbuf);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 void
 ChunkIndexVacuum(Relation idx)
 {
@@ -1041,7 +1451,8 @@ ChunkIndexVacuum(Relation idx)
 
 				states[i] = entry_state_unhinted(e);
 				if (!belongs(e, b, &masks) || states[i] == ENTRY_DEAD ||
-					(states[i] == ENTRY_VISIBLE && !(e->flags & CHUNK_ENTRY_FROZEN)))
+					(states[i] == ENTRY_VISIBLE && e->kind == CHUNK_KIND_CHUNK &&
+					 !(e->flags & CHUNK_ENTRY_FROZEN)))
 					change = true;
 			}
 			if (change)
@@ -1056,7 +1467,7 @@ ChunkIndexVacuum(Relation idx)
 
 					if (!belongs(&e, b, &masks) || states[i] == ENTRY_DEAD)
 						continue;
-					if (states[i] == ENTRY_VISIBLE)
+					if (states[i] == ENTRY_VISIBLE && e.kind == CHUNK_KIND_CHUNK)
 						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
 					*page_entry(p, k++) = e;
 				}
@@ -1076,6 +1487,7 @@ ChunkIndexVacuum(Relation idx)
 			LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
 			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 		}
+		fold_changes(idx, primary, b, &masks);
 		UnlockReleaseBuffer(primary);
 	}
 
@@ -1103,7 +1515,8 @@ ChunkIndexUnfrozen(Relation idx)
 			page = BufferGetPage(buf);
 			n = page_entries(page);
 			for (int i = 0; i < n; i++)
-				if (!(page_entry(page, i)->flags & CHUNK_ENTRY_FROZEN))
+				if (page_entry(page, i)->kind != CHUNK_KIND_CHUNK ||
+					!(page_entry(page, i)->flags & CHUNK_ENTRY_FROZEN))
 					unfrozen++;
 			blk = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			UnlockReleaseBuffer(buf);

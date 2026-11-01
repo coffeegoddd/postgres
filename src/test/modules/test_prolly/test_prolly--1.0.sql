@@ -340,3 +340,21 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
 CREATE FUNCTION test_chunk_index_unfrozen(idx regclass)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+-- References and roots: a test format of chunks naming others ('R', a
+-- count, hashes), roots taken and let go of, and the store's audit.
+CREATE FUNCTION test_chunk_format_refs(on_ bool)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_ref_root(idx regclass, hash bytea,
+	OUT refs int8, OUT roots int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_unref_root(idx regclass, hash bytea,
+	OUT refs int8, OUT roots int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_chunk_check(log regclass, idx regclass,
+	OUT ok bool, OUT chunks int8, OUT unheld int8, OUT why text)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
