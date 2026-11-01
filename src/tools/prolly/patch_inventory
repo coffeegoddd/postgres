@@ -74,7 +74,7 @@ patch src/backend/catalog/pg_namespace.c  1b  makes a namespace on a branch (nsp
 patch src/backend/catalog/pg_shdepend.c  1b  DROP OWNED and REASSIGN OWNED act on the session's branch's objects and the shared ones
 patch src/backend/catalog/pg_subscription.c  1b  a subscription's branch
 patch src/backend/catalog/storage.c  1a  chooses a new relation's storage manager (NewRelationStorageManager); names the transaction making block-mapped storage (bmap_creating); drops storage by its locator at commit (RelationDropStorageAtCommit); creates storage in a chosen storage manager, as a share of another relation's, or of a captured root (refused once the database's oldest unfrozen transaction passed it); truncation, drop and commit hooks for storage managers; also (1b) a versioned schema's relations are block-mapped
-patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable
+patch src/backend/catalog/system_views.sql  1a  the pg_stat_block_mapped view, a block-mapped relation file's page copies and claims; also (1b) makes the sequence that allocates branch identifiers in each database; also (1b) pg_subscription.subcatalogbranch readable; also (1b) pg_replication_slots.branch
 patch src/backend/catalog/toasting.c  1b  a TOAST table's storage manager is its table's, its schema being pg_toast
 patch src/backend/commands/dbcommands.c  1a  forgets the block map's recovery state for a dropped database; drops the block map statistics a database moved to another tablespace left under the old one
 patch src/backend/commands/extension.c  1b  an extension name resolves to a shared extension or the session's branch's; refuses one of the other kind beside it, and moves between kinds
@@ -93,9 +93,10 @@ patch src/backend/parser/gram.y  1b  CREATE SCHEMA ... VERSIONED
 patch src/backend/postmaster/autovacuum.c  1a  workers run the storage managers' background maintenance of a database after its tables (smgrmaintain), block_map_release_max_per_pass; leaves the freeze age to VACUUM when no setting gives one (-1), so storage that shares pages freezes eagerly under autovacuum too
 patch src/backend/replication/logical/decode.c  1a  logical decoding passes over XLOG_HEAP2_VM_SET
 patch src/backend/replication/logical/reorderbuffer.c  1b  decoding on a branch leaves out other branches' tables
+patch src/backend/replication/logical/slotsync.c  1b  a synced slot keeps the primary's slot's branch
 patch src/backend/replication/logical/worker.c  1b  a subscription's workers run on its branch (catalog_branch)
-patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed; also (1b) a logical slot keeps the branch it was made on (SLOT_VERSION bumped)
-patch src/backend/replication/slotfuncs.c  1b  a copied logical slot keeps the source's branch
+patch src/backend/replication/slot.c  1a  a physical slot keeps its standby's hold on blocks of block-mapped storage (SLOT_VERSION bumped); recomputes the hold as slots are restored, dropped and checkpointed; also (1b) a logical slot keeps the branch it was made on (SLOT_VERSION bumped); also (1b) failover slots may be made on a branch
+patch src/backend/replication/slotfuncs.c  1b  a copied logical slot keeps the source's branch; also (1b) pg_get_replication_slots() shows a slot's branch
 patch src/backend/replication/walreceiver.c  1a  reports in each status reply where a recovery of the standby may begin and whether a backup runs on it, for the block map's standby hold
 patch src/backend/replication/walsender.c  1a  keeps each standby's reported hold, in its physical slot too, and publishes the earliest to the block map (WalSndComputeRecoveryHold), capped by block_map_standby_hold_max_size; also (1b) refuses streaming from a logical slot of another branch than the connection's
 patch src/backend/storage/buffer/buf_init.c  1a  allocates the generations of sharing that say when cached pages must be checked again
@@ -151,7 +152,7 @@ patch src/include/catalog/namespace.h  1b  SearchPathMatcher.branch
 patch src/include/catalog/pg_control.h  1a  pg_control keeps where pages synced instead of logged need recovery to begin past (syncedSince, syncedCount)
 patch src/include/catalog/pg_extension.h  1b  the name index is (extname, extnamespace), so each branch may have its own copy
 patch src/include/catalog/pg_namespace.h  1b  nspbranch, the branch a schema's row belongs to, ends the name index
-patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate()
+patch src/include/catalog/pg_proc.dat  1a  pg_stat_get_block_map() and pg_relation_shared_pages(); also (1b) pg_branch_id_allocate(); also (1b) pg_get_replication_slots()'s branch column
 patch src/include/catalog/pg_subscription.h  1b  pg_subscription.subcatalogbranch
 patch src/include/catalog/storage.h  1a  declares storage creation in a chosen storage manager and as a share, the copy of a map fork for one, and a drop at commit by locator
 patch src/include/commands/vacuum.h  1a  VacuumCutoffs.freeze_own_eagerly

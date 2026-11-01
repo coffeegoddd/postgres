@@ -264,7 +264,7 @@ pg_drop_replication_slot(PG_FUNCTION_ARGS)
 Datum
 pg_get_replication_slots(PG_FUNCTION_ARGS)
 {
-#define PG_GET_REPLICATION_SLOTS_COLS 21
+#define PG_GET_REPLICATION_SLOTS_COLS 22
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	XLogRecPtr	currlsn;
 	int			slotno;
@@ -476,6 +476,9 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 		else
 			values[i++] = CStringGetTextDatum(SlotSyncSkipReasonNames[slot_contents.slotsync_skip_reason]);
+
+		/* a logical slot's branch (0: none), which decoding from it is on */
+		values[i++] = Int32GetDatum(slot_contents.data.branch);
 
 		Assert(i == PG_GET_REPLICATION_SLOTS_COLS);
 
