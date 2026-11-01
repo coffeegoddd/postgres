@@ -425,6 +425,10 @@ BEGIN
 		EXIT WHEN NOT FOUND;
 		got := got || r.x;
 	END LOOP;
+	-- (each fetch went back to the session's branch after)
+	IF current_setting('catalog_branch')::int <> then_branch THEN
+		RAISE 'fetches left the session on branch %', current_setting('catalog_branch');
+	END IF;
 	RETURN (SELECT string_agg(g, ',' ORDER BY g) FROM unnest(got) g);
 END $$;
 SET catalog_branch = :b1;
@@ -462,10 +466,13 @@ SELECT pg_temp.cursor_rows(:'q', :b2) AS by_union;
 
 -- and rows fetched by TID
 SET catalog_branch_filter = off;
-SELECT format('SELECT CASE oid WHEN %s THEN ''b1'' WHEN %s THEN ''b2'' ELSE relname END AS x
-	FROM pg_class WHERE ctid = ANY (ARRAY[%L, %L]::tid[])',
-	:t1, :t2, (SELECT ctid FROM pg_class WHERE oid = 'pg_class'::regclass),
-	(SELECT ctid FROM pg_class WHERE oid = :t2)) AS q \gset
+-- (a TID scan per row of the outer list, in its order: pg_class's row
+-- fetched first, the other branch's after the switch)
+SELECT format('SELECT s.x FROM unnest(ARRAY[%L, %L]::tid[]) u(tid),
+	LATERAL (SELECT CASE oid WHEN %s THEN ''b1'' WHEN %s THEN ''b2'' ELSE relname END AS x
+		FROM pg_class WHERE ctid = u.tid) s',
+	(SELECT ctid FROM pg_class WHERE oid = 'pg_class'::regclass),
+	(SELECT ctid FROM pg_class WHERE oid = :t2), :t1, :t2) AS q \gset
 RESET catalog_branch_filter;
 SELECT pg_temp.cursor_rows(:'q', :b2) AS by_tid;
   by_tid  
@@ -473,6 +480,38 @@ SELECT pg_temp.cursor_rows(:'q', :b2) AS by_tid;
  pg_class
 (1 row)
 
+-- a cursor of SQL's own, fetched, closed and held across a change
+BEGIN;
+DECLARE c CURSOR FOR SELECT CASE oid WHEN :t1 THEN 'b1' WHEN :t2 THEN 'b2' ELSE relname END
+	FROM pg_class WHERE relname IN ('pg_class', 't');
+SET catalog_branch = :b2;
+FETCH ALL FROM c;
+ relname  
+----------
+ pg_class
+ b1
+(2 rows)
+
+CLOSE c;
+SET catalog_branch = :b1;
+DECLARE h CURSOR WITH HOLD FOR SELECT CASE oid WHEN :t1 THEN 'b1' WHEN :t2 THEN 'b2' ELSE relname END
+	FROM pg_class WHERE relname = 't';
+SET catalog_branch = :b2;
+COMMIT;
+FETCH ALL FROM h;
+ relname 
+---------
+ b1
+(1 row)
+
+CLOSE h;
+SELECT current_setting('catalog_branch')::int = :b2 AS on_b2;
+ on_b2 
+-------
+ t
+(1 row)
+
+SET catalog_branch = :b1;
 SELECT current_setting('catalog_branch')::int = :b1 AS back_on_b1;
  back_on_b1 
 ------------
