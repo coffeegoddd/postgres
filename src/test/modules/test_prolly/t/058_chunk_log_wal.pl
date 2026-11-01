@@ -144,7 +144,8 @@ my ($dump) = run_command([ 'pg_waldump', '--rmgr' => 'ChunkLog',
 	'--path' => $primary->data_dir . '/pg_wal', '--start' => $pack_start,
 	'--end' => $primary->safe_psql('postgres', 'SELECT pg_current_wal_flush_lsn()') ]);
 my $appends = () = $dump =~ /desc: APPEND/g;
-cmp_ok($appends, '<=', 20, "a pack of 1,000 chunks of 100 bytes in $appends append records, about a page each");
+# (about 100 kB: some 13 pages)
+ok($appends >= 10 && $appends <= 20, "a pack of 1,000 chunks of 100 bytes in $appends append records, about a page each");
 
 $standby2->stop;
 $primary->stop;
