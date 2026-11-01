@@ -1599,3 +1599,24 @@ GRANT SELECT ON pg_aios TO pg_read_all_stats;
 CREATE SEQUENCE pg_branch_id_seq AS integer NO CYCLE;
 REVOKE ALL ON pg_branch_id_seq FROM PUBLIC;
 GRANT SELECT ON pg_branch_id_seq TO PUBLIC;
+
+--
+-- The version-control history store of each database: its chunk log, the
+-- index of its chunks, and its pointers (branch heads, working roots, the
+-- repository's state), each naming a chunk and holding a root on it.  The
+-- triggers keep the roots: a pointer made takes one, moved moves it, and
+-- dropped lets it go; TRUNCATE, which fires no row's, is refused.
+--
+
+CREATE TABLE pg_history.chunks () USING prolly_chunks;
+CREATE TABLE pg_history.chunk_index () USING prolly_chunk_index;
+CREATE TABLE pg_history.pointers (
+	name text COLLATE "C" PRIMARY KEY,
+	hash bytea NOT NULL CHECK (octet_length(hash) = 20)
+);
+CREATE TRIGGER pointers_roots
+	AFTER INSERT OR UPDATE OF hash OR DELETE ON pg_history.pointers
+	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();
+CREATE TRIGGER pointers_no_truncate
+	BEFORE TRUNCATE ON pg_history.pointers
+	FOR EACH STATEMENT EXECUTE FUNCTION pg_catalog.pg_history_pointer_changed();

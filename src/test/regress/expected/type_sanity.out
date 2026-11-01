@@ -602,9 +602,10 @@ WHERE (is_catalog_text_unique_index_oid(indexrelid) <>
         indexrelid < 16384 AND
         EXISTS (SELECT 1 FROM pg_attribute
                 WHERE attrelid = indexrelid AND atttypid = 'text'::regtype)));
- indexrelid 
-------------
-(0 rows)
+        indexrelid        
+--------------------------
+ pg_history.pointers_pkey
+(1 row)
 
 -- **************** pg_range ****************
 -- Look for illegal values in pg_range fields.

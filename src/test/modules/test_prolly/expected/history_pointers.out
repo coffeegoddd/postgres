@@ -1,0 +1,135 @@
+-- Each database's history store, from initdb, and its pointers: a pointer
+-- made takes a root on the chunk it names, moved moves it, dropped lets it
+-- go, in the pointer's transaction; one to a chunk the store hasn't, and
+-- TRUNCATE of the pointers, are refused.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
+SELECT c.relname, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+WHERE c.relnamespace = 'pg_history'::regnamespace AND c.relkind = 'r' ORDER BY 1;
+   relname   |       amname       
+-------------+--------------------
+ chunk_index | prolly_chunk_index
+ chunks      | prolly_chunks
+ pointers    | heap
+(3 rows)
+
+CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+CREATE FUNCTION put(d bytea) RETURNS bool LANGUAGE sql
+	AS $$SELECT test_chunk_put('pg_history.chunks', 'pg_history.chunk_index', h(d), d)$$;
+CREATE FUNCTION roots(d bytea) RETURNS int8 LANGUAGE sql
+	AS $$SELECT roots FROM test_chunk_index_entry('pg_history.chunk_index', h(d))$$;
+SELECT put('\x01') AS one, put('\x02') AS two;
+ one | two 
+-----+-----
+ t   | t
+(1 row)
+
+-- made: a root on its chunk
+INSERT INTO pg_history.pointers VALUES ('main', h('\x01'));
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+ one_roots | two_roots 
+-----------+-----------
+         1 |         0
+(1 row)
+
+-- renamed: nothing moves
+UPDATE pg_history.pointers SET name = 'trunk' WHERE name = 'main';
+SELECT roots('\x01') AS one_roots;
+ one_roots 
+-----------
+         1
+(1 row)
+
+-- moved: the root goes with it
+UPDATE pg_history.pointers SET hash = h('\x02') WHERE name = 'trunk';
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+ one_roots | two_roots 
+-----------+-----------
+         0 |         1
+(1 row)
+
+-- a second pointer to the same chunk: two roots
+INSERT INTO pg_history.pointers VALUES ('feature', h('\x02'));
+SELECT roots('\x02') AS two_roots;
+ two_roots 
+-----------
+         2
+(1 row)
+
+-- dropped: let go of
+DELETE FROM pg_history.pointers WHERE name = 'feature';
+SELECT roots('\x02') AS two_roots;
+ two_roots 
+-----------
+         1
+(1 row)
+
+-- each of these in a transaction rolled back changes nothing
+BEGIN;
+INSERT INTO pg_history.pointers VALUES ('tmp', h('\x01'));
+UPDATE pg_history.pointers SET hash = h('\x01') WHERE name = 'trunk';
+DELETE FROM pg_history.pointers WHERE name = 'trunk';
+SELECT roots('\x01') AS one_roots_in, roots('\x02') AS two_roots_in;
+ one_roots_in | two_roots_in 
+--------------+--------------
+            1 |            0
+(1 row)
+
+ROLLBACK;
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+ one_roots | two_roots 
+-----------+-----------
+         0 |         1
+(1 row)
+
+-- refused: a pointer to a chunk the store hasn't, and TRUNCATE
+INSERT INTO pg_history.pointers VALUES ('nowhere', h('\x7a'));
+ERROR:  the store has no chunk 594e519ae499312b29433b7dd8a97ff068defcba
+UPDATE pg_history.pointers SET hash = h('\x7a') WHERE name = 'trunk';
+ERROR:  the store has no chunk 594e519ae499312b29433b7dd8a97ff068defcba
+INSERT INTO pg_history.pointers VALUES ('short', '\x01');
+ERROR:  new row for relation "pointers" violates check constraint "pointers_hash_check"
+DETAIL:  Failing row contains (short, \x01).
+TRUNCATE pg_history.pointers;
+ERROR:  cannot truncate the history store's pointers
+HINT:  Delete them: each holds a root on the chunk it names.
+SELECT name, hash = h('\x02') AS at_two FROM pg_history.pointers;
+ name  | at_two 
+-------+--------
+ trunk | t
+(1 row)
+
+-- a chunk put and pointed to in one transaction are one: both, or neither
+BEGIN;
+SELECT put('\x03') AS three;
+ three 
+-------
+ t
+(1 row)
+
+INSERT INTO pg_history.pointers VALUES ('new', h('\x03'));
+ROLLBACK;
+SELECT test_chunk_has('pg_history.chunks', 'pg_history.chunk_index', h('\x03')) AS three_there,
+	count(*) AS new_pointers FROM pg_history.pointers WHERE name = 'new';
+ three_there | new_pointers 
+-------------+--------------
+ f           |            0
+(1 row)
+
+SELECT ok FROM test_chunk_check('pg_history.chunks', 'pg_history.chunk_index');
+ ok 
+----
+ t
+(1 row)
+
+DELETE FROM pg_history.pointers;
+SELECT roots('\x01') AS one_roots, roots('\x02') AS two_roots;
+ one_roots | two_roots 
+-----------+-----------
+         0 |         0
+(1 row)
+
+DROP FUNCTION roots(bytea), put(bytea), h(bytea);
