@@ -21,14 +21,23 @@
 
 #include "prolly/chunk_index.h"
 
+/* A chunk's name: the first CHUNK_HASH_LEN bytes of the SHA-256 of its bytes. */
+extern void ChunkHash(const void *data, size_t len, uint8 *out);
+
 /* Whether the store has the chunk named hash. */
 extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 
-/* The chunk's bytes, palloc'd, and their length in *len; NULL if absent. */
+/*
+ * The chunk's bytes, palloc'd, and their length in *len; NULL if absent.
+ * Bytes that don't hash to its name are an error.
+ */
 extern void *ChunkStoreGet(Relation log, Relation idx, const uint8 *hash,
 						   uint32 *len);
 
-/* Stores the chunk unless the store has it; true if it stored it. */
+/*
+ * Stores the chunk unless the store has it; true if it stored it.  A hash
+ * that isn't the bytes' is an error.
+ */
 extern bool ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 						  const void *data, uint32 len);
 

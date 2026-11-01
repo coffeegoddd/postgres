@@ -115,6 +115,7 @@ tests += {
       't/049_chunk_log_recovery.pl',
       't/050_chunk_log_writers.pl',
       't/051_chunk_index_writers.pl',
+      't/052_chunk_hash_verified.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

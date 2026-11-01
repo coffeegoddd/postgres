@@ -42,6 +42,16 @@ SELECT len, refs, roots FROM test_chunk_index_entry('ci', h('\x616263'));
    3 |    0 |     0
 (1 row)
 
+-- a chunk is put by its own name only
+SELECT test_chunk_put('cl', 'ci', h('\x646566'), '\x616263');
+ERROR:  bytes put as chunk cb8379ac2098aa165029e3938a51da0bcecfc008 do not hash to it
+DETAIL:  Its 3 bytes hash to ba7816bf8f01cfea414140de5dae2223b00361a3.
+SELECT test_chunk_has('cl', 'ci', h('\x646566')) AS has_misnamed;
+ has_misnamed 
+--------------
+ f
+(1 row)
+
 -- its counts, changed in place, never below zero
 SELECT * FROM test_chunk_index_adjust('ci', h('\x616263'), 2, 1);
  refs | roots 
