@@ -5929,9 +5929,9 @@ InitializeLogRepWorker(void)
 
 	/*
 	 * The subscriber's tables it replicates into are its branch's: its names
-	 * resolve, and its catalog queries see, on that branch
+	 * resolve, and its catalog queries see, on that branch (no branch, 0,
+	 * too: not whatever a role's or the database's settings say)
 	 */
-	if (MySubscription->catalog_branch != 0)
 	{
 		char		branch[12];
 

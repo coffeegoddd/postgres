@@ -719,6 +719,7 @@ typedef struct _SubscriptionInfo
 	bool		subpasswordrequired;
 	bool		subrunasowner;
 	bool		subfailover;
+	int			subcatalogbranch;	/* the subscriber's branch (0: none) */
 	bool		subretaindeadtuples;
 	int			submaxretention;
 	char	   *subservername;

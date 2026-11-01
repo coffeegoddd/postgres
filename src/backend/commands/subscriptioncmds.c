@@ -211,8 +211,9 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
 	if (IsSet(supported_opts, SUBOPT_CONFLICT_LOG_DEST))
 		opts->conflictlogdest = CONFLICT_LOG_DEST_LOG;
+	/* (made from a session on a branch: that branch's) */
 	if (IsSet(supported_opts, SUBOPT_CATALOG_BRANCH))
-		opts->catalog_branch = 0;
+		opts->catalog_branch = catalog_branch;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -689,26 +690,28 @@ publicationListToArray(List *publist)
 }
 
 /*
- * The subscriber's table a publisher's table name names: its branch's, of
- * the subscription's (which its workers run on), whichever the session's
- * is.
+ * The subscriber's tables a publisher's table names name are its branch's,
+ * of the subscription's (which its workers run on), whichever the
+ * session's is: names are looked up on it from branch_begin() to
+ * branch_end() (once around a loop of them: a branch change discards the
+ * session's cached plans).
  */
-static Oid
-branch_relid(RangeVar *rv, int32 branch)
+static int
+branch_begin(int32 branch)
 {
-	int			nestlevel;
+	int			nestlevel = NewGUCNestLevel();
 	char		value[12];
-	Oid			relid;
 
-	if (branch == 0)
-		return RangeVarGetRelid(rv, AccessShareLock, false);
-	nestlevel = NewGUCNestLevel();
 	snprintf(value, sizeof(value), "%d", branch);
 	(void) set_config_option("catalog_branch", value, PGC_SUSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
-	relid = RangeVarGetRelid(rv, AccessShareLock, false);
+	return nestlevel;
+}
+
+static void
+branch_end(int nestlevel)
+{
 	AtEOXact_GUC(true, nestlevel);
-	return relid;
 }
 
 /*
@@ -729,6 +732,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	char	   *conninfo = NULL;
 	char		originname[NAMEDATALEN];
 	List	   *publications;
+	int			nestlevel;
 	uint32		supported_opts;
 	SubOpts		opts = {0};
 	AclResult	aclresult;
@@ -1063,13 +1067,14 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 			 */
 			pubrels = fetch_relation_list(wrconn, publications);
 
+			nestlevel = branch_begin(opts.catalog_branch);
 			foreach_ptr(PublicationRelKind, pubrelinfo, pubrels)
 			{
 				Oid			relid;
 				char		relkind;
 				RangeVar   *rv = pubrelinfo->rv;
 
-				relid = branch_relid(rv, opts.catalog_branch);
+				relid = RangeVarGetRelid(rv, AccessShareLock, false);
 				relkind = get_rel_relkind(relid);
 
 				/* Check for supported relkind. */
@@ -1079,6 +1084,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 				AddSubscriptionRelState(subid, relid, relation_state,
 										InvalidXLogRecPtr, true);
 			}
+			branch_end(nestlevel);
 
 			/*
 			 * If requested, create permanent slot for the subscription. We
@@ -1174,6 +1180,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 	int			off;
 	int			tbl_count = 0;
 	int			seq_count = 0;
+	int			nestlevel;
 	Relation	rel = NULL;
 	typedef struct SubRemoveRels
 	{
@@ -1263,13 +1270,14 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 		off = 0;
 		pubrel_local_oids = palloc_array(Oid, list_length(pubrels));
 
+		nestlevel = branch_begin(sub->catalog_branch);
 		foreach_ptr(PublicationRelKind, pubrelinfo, pubrels)
 		{
 			RangeVar   *rv = pubrelinfo->rv;
 			Oid			relid;
 			char		relkind;
 
-			relid = branch_relid(rv, sub->catalog_branch);
+			relid = RangeVarGetRelid(rv, AccessShareLock, false);
 			relkind = get_rel_relkind(relid);
 
 			/* Check for supported relkind. */
@@ -1292,6 +1300,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 										rv->schemaname, rv->relname, sub->name));
 			}
 		}
+		branch_end(nestlevel);
 
 		/*
 		 * Next remove state for tables we should not care about anymore using
