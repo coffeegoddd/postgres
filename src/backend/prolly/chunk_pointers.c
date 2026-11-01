@@ -108,6 +108,12 @@ pg_history_pointer_changed(PG_FUNCTION_ARGS)
 	if (!TRIGGER_FIRED_FOR_ROW(td->tg_event) || !TRIGGER_FIRED_AFTER(td->tg_event))
 		elog(ERROR, "pg_history_pointer_changed is an AFTER ROW trigger");
 
+	/* (another table's rows are no pointers: their roots aren't theirs) */
+	if (RelationGetRelid(td->tg_relation) != ChunkStorePointersRelid())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_history_pointer_changed is pg_history.pointers' trigger alone")));
+
 	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
 	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
 		ChunkStoreRefRoot(idx, row_hash(td, td->tg_trigtuple), &e);

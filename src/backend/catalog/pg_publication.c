@@ -116,6 +116,13 @@ check_publication_add_relation(PublicationRelInfo *pri)
 				 errmsg(errormsg, relname),
 				 errdetail("This operation is not supported for conflict log tables.")));
 
+	/* nor the history store's: its pointers' roots move by their trigger */
+	if (IsHistoryStoreNamespace(RelationGetNamespace(targetrel)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg(errormsg, relname),
+				 errdetail("This operation is not supported for the history store's relations.")));
+
 	/* UNLOGGED and TEMP relations cannot be part of publication. */
 	if (targetrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 		ereport(ERROR,
@@ -138,7 +145,7 @@ check_publication_add_schema(Oid schemaid)
 {
 	/* Can't be system namespace */
 	if (IsCatalogNamespace(schemaid) || IsToastNamespace(schemaid) ||
-		IsConflictLogTableNamespace(schemaid))
+		IsConflictLogTableNamespace(schemaid) || IsHistoryStoreNamespace(schemaid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cannot add schema \"%s\" to publication",

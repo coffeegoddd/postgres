@@ -127,6 +127,7 @@ tests += {
       't/053_chunk_refs_crash.pl',
       't/054_chunk_freer.pl',
       't/055_history_pointers.pl',
+      't/056_history_upgrade.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

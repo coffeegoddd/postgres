@@ -89,7 +89,8 @@ IsSystemClass(Oid relid, Form_pg_class reltuple)
 	/* IsCatalogRelationOid is a bit faster, so test that first */
 	return (IsCatalogRelationOid(relid) ||
 			IsToastClass(reltuple) ||
-			IsConflictLogTableClass(reltuple));
+			IsConflictLogTableClass(reltuple) ||
+			IsHistoryStoreNamespace(reltuple->relnamespace));
 }
 
 /*
@@ -291,6 +292,20 @@ bool
 IsConflictLogTableNamespace(Oid namespaceId)
 {
 	return namespaceId == PG_CONFLICT_NAMESPACE;
+}
+
+/*
+ * IsHistoryStoreNamespace
+ *		True iff namespace is pg_history, the version-control history
+ *		store's: its relations are the system's, so that altering, dropping
+ *		or adding triggers to them needs allow_system_table_mods.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsHistoryStoreNamespace(Oid namespaceId)
+{
+	return namespaceId == PG_HISTORY_NAMESPACE;
 }
 
 /*

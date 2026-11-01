@@ -34,6 +34,7 @@ extern bool IsInplaceUpdateOid(Oid relid);
 extern bool IsCatalogNamespace(Oid namespaceId);
 extern bool IsToastNamespace(Oid namespaceId);
 extern bool IsConflictLogTableNamespace(Oid namespaceId);
+extern bool IsHistoryStoreNamespace(Oid namespaceId);
 
 extern bool IsReservedName(const char *name);
 
