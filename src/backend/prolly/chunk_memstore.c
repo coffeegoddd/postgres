@@ -163,6 +163,18 @@ mem_get(ChunkStore *cs, const uint8 *hash, uint32 *len)
 	return data;
 }
 
+static void
+mem_get_many(ChunkStore *cs, const uint8 *hashes, int n, void **out,
+			 uint32 *lens)
+{
+	for (int i = 0; i < n; i++)
+	{
+		out[i] = mem_get(cs, hashes + i * CHUNK_HASH_LEN, &lens[i]);
+		if (out[i] == NULL)
+			lens[i] = 0;
+	}
+}
+
 static bool
 mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
@@ -391,6 +403,7 @@ const ChunkStoreRoutine MemoryChunkStore = {
 	.open = mem_open,
 	.has = mem_has,
 	.get = mem_get,
+	.get_many = mem_get_many,
 	.put = mem_put,
 	.ref_root = mem_ref_root,
 	.unref_root = mem_unref_root,

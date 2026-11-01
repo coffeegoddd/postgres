@@ -102,6 +102,64 @@ ChunkStoreGet(Relation log, Relation idx, const uint8 *hash, uint32 *len)
 	return data;
 }
 
+typedef struct ChunkPlace
+{
+	uint64		loc;
+	uint32		len;
+	int			at;				/* where it was asked for */
+} ChunkPlace;
+
+static int
+place_cmp(const void *a, const void *b)
+{
+	const ChunkPlace *pa = a,
+			   *pb = b;
+
+	if (pa->loc != pb->loc)
+		return pa->loc < pb->loc ? -1 : 1;
+	return pa->at - pb->at;
+}
+
+void
+ChunkStoreGetMany(Relation log, Relation idx, const uint8 *hashes, int n,
+				  void **out, uint32 *lens)
+{
+	ChunkPlace *places = palloc(Max(n, 1) * sizeof(ChunkPlace));
+	int			found = 0;
+
+	if (!HaveRegisteredOrActiveSnapshot())
+		elog(ERROR, "cannot read the history store without an active snapshot");
+	for (int i = 0; i < n; i++)
+	{
+		ChunkIndexEntry e;
+
+		out[i] = NULL;
+		lens[i] = 0;
+		if (ChunkIndex->lookup(idx, hashes + i * CHUNK_HASH_LEN, &e))
+		{
+			places[found].loc = e.loc;
+			places[found].len = e.len;
+			places[found].at = i;
+			found++;
+		}
+	}
+
+	/* (in the log's order: its pages each read through once) */
+	qsort(places, found, sizeof(ChunkPlace), place_cmp);
+	for (int k = 0; k < found; k++)
+	{
+		ChunkPlace *pl = &places[k];
+		void	   *data = palloc_extended(Max(pl->len, 1), MCXT_ALLOC_HUGE);
+
+		CHECK_FOR_INTERRUPTS();
+		ChunkLog->read(log, pl->loc, data, pl->len);
+		check_hash(hashes + pl->at * CHUNK_HASH_LEN, data, pl->len, log, pl->loc);
+		out[pl->at] = data;
+		lens[pl->at] = pl->len;
+	}
+	pfree(places);
+}
+
 /* ------------------------------------------------------- references */
 
 static void

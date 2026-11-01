@@ -89,6 +89,49 @@ SELECT pg_temp.refs('cs-leaf-a') AS a, pg_temp.refs('cs-nowhere') AS nowhere;
  0/0 | 
 (1 row)
 
+-- many at once: each where it was asked, absent ones NULL, one asked twice twice
+SELECT convert_from(c, 'UTF8') AS got, o FROM unnest(test_cs_get_many(:'store',
+	ARRAY[pg_temp.h('cs-leaf-b'), pg_temp.h('cs-nowhere'), pg_temp.h('cs-leaf-a'),
+		  pg_temp.h('cs-leaf-b')])) WITH ORDINALITY u(c, o);
+    got    | o 
+-----------+---
+ cs-leaf-b | 1
+           | 2
+ cs-leaf-a | 3
+ cs-leaf-b | 4
+(4 rows)
+
+SELECT cardinality(test_cs_get_many(:'store', '{}')) AS none_asked;
+ none_asked 
+------------
+          0
+(1 row)
+
+SELECT pg_temp.refused($$SELECT test_cs_get_many(current_setting('test.store'), ARRAY[NULL::bytea])$$);
+              refused              
+-----------------------------------
+ 22004: a chunk's hash is not null
+(1 row)
+
+-- many, across pages, asked backwards: each as get has it (leaves: 'L'
+-- first, no 'R')
+SELECT count(*) FILTER (WHERE pg_temp.put('L'::bytea || decode(repeat(md5('cs-many-' || i), 64), 'hex')))
+	AS put FROM generate_series(1, 300) i;
+ put 
+-----
+ 300
+(1 row)
+
+SELECT count(*) AS asked, count(*) FILTER (WHERE m.c = test_cs_get(:'store', pg_temp.h(d))) AS same
+FROM (SELECT i, 'L'::bytea || decode(repeat(md5('cs-many-' || i), 64), 'hex') d FROM generate_series(1, 300) i) x
+JOIN unnest(test_cs_get_many(:'store', ARRAY(
+	SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-many-' || i), 64), 'hex'))
+	FROM generate_series(1, 300) i ORDER BY i DESC))) WITH ORDINALITY m(c, o) ON m.o = 301 - x.i;
+ asked | same 
+-------+------
+   300 |  300
+(1 row)
+
 -- refused: a reference to a chunk not there
 SELECT pg_temp.refused($$SELECT pg_temp.put(pg_temp.parent('cs-leaf-a', 'cs-nowhere'))$$);
                                                                     refused                                                                     

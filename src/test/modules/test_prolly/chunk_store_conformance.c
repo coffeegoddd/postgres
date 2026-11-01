@@ -32,6 +32,7 @@
 PG_FUNCTION_INFO_V1(test_chunk_stores);
 PG_FUNCTION_INFO_V1(test_cs_put);
 PG_FUNCTION_INFO_V1(test_cs_get);
+PG_FUNCTION_INFO_V1(test_cs_get_many);
 PG_FUNCTION_INFO_V1(test_cs_has);
 PG_FUNCTION_INFO_V1(test_cs_ref_root);
 PG_FUNCTION_INFO_V1(test_cs_unref_root);
@@ -143,6 +144,37 @@ test_cs_get(PG_FUNCTION_ARGS)
 	SET_VARSIZE(out, VARHDRSZ + len);
 	memcpy(VARDATA(out), data, len);
 	PG_RETURN_BYTEA_P(out);
+}
+
+/* test_cs_get_many(store, hashes bytea[]): the chunks' bytes, NULLs for absent */
+Datum
+test_cs_get_many(PG_FUNCTION_ARGS)
+{
+	int			n;
+	uint8	   *hashes = hashes_arg(fcinfo, 1, &n);
+	void	  **out = palloc(Max(n, 1) * sizeof(void *));
+	uint32	   *lens = palloc(Max(n, 1) * sizeof(uint32));
+	Datum	   *res = palloc(Max(n, 1) * sizeof(Datum));
+	bool	   *resnulls = palloc(Max(n, 1) * sizeof(bool));
+	int			dims[1];
+	int			lbs[1] = {1};
+
+	cs_get_many(store_arg(fcinfo), hashes, n, out, lens);
+	for (int i = 0; i < n; i++)
+	{
+		resnulls[i] = out[i] == NULL;
+		if (out[i])
+		{
+			bytea	   *b = palloc(VARHDRSZ + lens[i]);
+
+			SET_VARSIZE(b, VARHDRSZ + lens[i]);
+			memcpy(VARDATA(b), out[i], lens[i]);
+			res[i] = PointerGetDatum(b);
+		}
+	}
+	dims[0] = n;
+	PG_RETURN_ARRAYTYPE_P(construct_md_array(res, resnulls, 1, dims, lbs,
+											 BYTEAOID, -1, false, TYPALIGN_INT));
 }
 
 Datum
