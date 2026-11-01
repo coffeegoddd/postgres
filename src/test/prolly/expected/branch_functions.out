@@ -164,6 +164,38 @@ EXECUTE qual;
 
 DEALLOCATE qual;
 RESET plan_cache_mode;
+-- lastval() is the session's, across a switch: the value b2's sequence
+-- last gave, though b1 has no such sequence
+SET catalog_branch = :b2;
+SELECT nextval('app.seq') AS gave \gset
+SET catalog_branch = :b1;
+SELECT lastval() = :gave AS kept;
+ kept 
+------
+ t
+(1 row)
+
+SELECT to_regclass('app.seq') IS NULL AS b1_has_none;
+ b1_has_none 
+-------------
+ t
+(1 row)
+
+-- DISCARD ALL goes back to no branch, as RESET ALL does
+DISCARD ALL;
+SHOW catalog_branch;
+ catalog_branch 
+----------------
+ 0
+(1 row)
+
+SELECT to_regclass('app.t') IS NULL AS app_unseen;
+ app_unseen 
+------------
+ t
+(1 row)
+
+SET catalog_branch = :b1;
 -- nor does plpgsql's session-wide cache of casts outlive one (it casts a
 -- function's result to its result type): a shared cast function, inlined,
 -- calls the branch's own function
@@ -195,16 +227,13 @@ SELECT pubf.via_cast();
 
 SET catalog_branch = :b1;
 DROP SCHEMA app CASCADE;
-NOTICE:  drop cascades to 10 other objects
+NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.allowed
 drop cascades to function app.max_v()
-drop cascades to default value for column x of table tt
 drop cascades to function app.base()
 drop cascades to function app.plus(integer)
-drop cascades to view ti
 drop cascades to function app.rows()
-drop cascades to view tv
 drop cascades to function app.k()
 SET catalog_branch = :b2;
 DROP SCHEMA app CASCADE;

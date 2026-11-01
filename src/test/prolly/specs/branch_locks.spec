@@ -40,6 +40,7 @@ step o_read	{ SELECT sum(v) FROM app.t; }
 step o_write	{ UPDATE app.t SET v = v + 1 WHERE id = 1; }
 step o_ddl	{ ALTER TABLE app.t ADD COLUMN extra int; }
 step o_make	{ CREATE TABLE app.only (x int); }
+step o_schema	{ CREATE SCHEMA other VERSIONED; }
 step o_commit	{ COMMIT; }
 
 session two
@@ -50,7 +51,11 @@ step w_update	{ UPDATE app.t SET v = v + 1 WHERE id = 1; }
 step w_read	{ SELECT sum(v) FROM app.t; }
 step w_write	{ UPDATE app.t SET v = v + 1 WHERE id = 2; }
 step w_make	{ CREATE TABLE app.only (y int, z int); }
+step w_schema	{ CREATE SCHEMA other VERSIONED; }
 step w_commit	{ COMMIT; }
+
+session none
+step n_schema	{ CREATE SCHEMA other; }
 
 # a row lock on one branch's row 1 doesn't hold up an update of the other's
 permutation o_begin o_lock w_update o_commit
@@ -61,3 +66,8 @@ permutation o_serial w_serial o_read w_read o_write w_write o_commit w_commit
 permutation w_begin w_read o_ddl w_commit
 # the same name made on both branches at once, both transactions open
 permutation o_begin w_begin o_make w_make o_commit w_commit
+# a versioned schema of one name made on both branches at once: no wait
+permutation o_begin w_begin o_schema w_schema o_commit w_commit
+# a shared schema of that name waits for the versioned one's maker, then
+# is refused
+permutation o_begin o_schema n_schema o_commit

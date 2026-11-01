@@ -437,7 +437,7 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		 * Determine the modified ACL for the new owner.  This is only
 		 * necessary when the ACL is non-null.
 		 */
-		aclDatum = SysCacheGetAttr(NAMESPACENAME, tup,
+		aclDatum = SysCacheGetAttr(NAMESPACENAMEBRANCH, tup,
 								   Anum_pg_namespace_nspacl,
 								   &isNull);
 		if (!isNull)

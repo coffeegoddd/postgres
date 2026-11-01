@@ -102,6 +102,20 @@ EXECUTE qual;
 DEALLOCATE qual;
 RESET plan_cache_mode;
 
+-- lastval() is the session's, across a switch: the value b2's sequence
+-- last gave, though b1 has no such sequence
+SET catalog_branch = :b2;
+SELECT nextval('app.seq') AS gave \gset
+SET catalog_branch = :b1;
+SELECT lastval() = :gave AS kept;
+SELECT to_regclass('app.seq') IS NULL AS b1_has_none;
+
+-- DISCARD ALL goes back to no branch, as RESET ALL does
+DISCARD ALL;
+SHOW catalog_branch;
+SELECT to_regclass('app.t') IS NULL AS app_unseen;
+SET catalog_branch = :b1;
+
 -- nor does plpgsql's session-wide cache of casts outlive one (it casts a
 -- function's result to its result type): a shared cast function, inlined,
 -- calls the branch's own function

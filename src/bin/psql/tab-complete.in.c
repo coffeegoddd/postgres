@@ -3762,9 +3762,9 @@ match_previous_words(int pattern_id,
 								 Keywords_for_list_of_owner_roles);
 	else if (Matches("CREATE", "SCHEMA", "AUTHORIZATION", MatchAny) ||
 			 Matches("CREATE", "SCHEMA", MatchAny, "AUTHORIZATION", MatchAny))
-		COMPLETE_WITH("CREATE", "GRANT");
+		COMPLETE_WITH("CREATE", "GRANT", "VERSIONED");
 	else if (Matches("CREATE", "SCHEMA", MatchAny))
-		COMPLETE_WITH("AUTHORIZATION", "CREATE", "GRANT");
+		COMPLETE_WITH("AUTHORIZATION", "CREATE", "GRANT", "VERSIONED");
 
 /* CREATE SEQUENCE --- is allowed inside CREATE SCHEMA, so use TailMatches */
 	else if (TailMatches("CREATE", "SEQUENCE", MatchAny) ||
