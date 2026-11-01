@@ -368,8 +368,8 @@ CREATE FUNCTION test_chunk_free_unheld(log regclass, idx regclass)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_chunk_pin(hash bytea)
-RETURNS void
+CREATE FUNCTION test_chunk_hold(idx regclass, hash bytea)
+RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_chunk_log_space(rel regclass,

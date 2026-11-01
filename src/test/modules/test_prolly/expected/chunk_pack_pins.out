@@ -156,3 +156,66 @@ freed
     0
 (1 row)
 
+
+starting permutation: p_pack o_put p_begin p_pack_again o_free o_free_found p_own_free p_commit p_free
+step p_pack: 
+	SELECT test_cs_put_many('pages',
+		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
+		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored;
+
+stored
+------
+  3000
+(1 row)
+
+step o_put: SELECT stored FROM test_cs_put('pages', '\x0a0501');
+stored
+------
+t     
+(1 row)
+
+step p_begin: BEGIN;
+step p_pack_again: 
+	SELECT test_cs_put_many('pages',
+		ARRAY(SELECT pack_h('\x50'::bytea || int4send(i)) FROM generate_series(1, 3000) i ORDER BY i),
+		ARRAY(SELECT '\x50'::bytea || int4send(i) FROM generate_series(1, 3000) i ORDER BY i)) AS stored_again;
+
+stored_again
+------------
+           0
+(1 row)
+
+step o_free: SELECT test_cs_free('pages', ARRAY[pack_h('\x0a0501')]) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step o_free_found: 
+	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x50'::bytea || int4send(i))
+		FROM generate_series(1, 10) i)) AS freed_found;
+
+freed_found
+-----------
+          0
+(1 row)
+
+step p_own_free: 
+	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x50'::bytea || int4send(i))
+		FROM generate_series(1, 3000) i)) AS freed_own;
+
+freed_own
+---------
+        0
+(1 row)
+
+step p_commit: COMMIT;
+step p_free: 
+	SELECT test_cs_free('pages', ARRAY(SELECT pack_h('\x50'::bytea || int4send(i))
+		FROM generate_series(1, 3000) i)) AS freed;
+
+freed
+-----
+ 3000
+(1 row)
+

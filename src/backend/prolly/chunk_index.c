@@ -1400,7 +1400,11 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		out->roots = (uint32) roots;
 	}
 
-	if (BlockNumberIsValid(own_blk))
+	if (BlockNumberIsValid(own_blk) && drefs == 0 && droots == 0)
+	{
+		/* (this transaction's change of the chunk's counts holds it already) */
+	}
+	else if (BlockNumberIsValid(own_blk))
 	{
 		/* this transaction's change of the chunk's counts, changed again */
 		Buffer		buf = own_blk == BufferGetBlockNumber(primary) ? primary :

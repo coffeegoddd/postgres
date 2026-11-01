@@ -53,6 +53,9 @@ is($node->safe_psql('postgres', $check), "$n|$n", 'every chunk put is found with
 like($node->safe_psql('postgres', q{SELECT buckets FROM test_chunk_index_shape('ci')}),
 	qr/^\d{3,}$/, 'the index grew under them');
 
+# (the changes holding chunks puts found, adding nothing, folded away)
+$node->safe_psql('postgres', 'VACUUM ci');
+
 # a put whose transaction a crash cuts short is nobody's afterwards
 my $open = $node->background_psql('postgres');
 $open->query_safe(q{BEGIN});

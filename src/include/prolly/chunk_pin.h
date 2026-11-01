@@ -1,26 +1,18 @@
 /*-------------------------------------------------------------------------
  *
  * chunk_pin.h
- *	  Transient holds on the history store's chunks: pins.
+ *	  Transient holds on the history store's chunks, for this transaction's
+ *	  own freeing.
  *
- * A transaction pins each chunk it finds stored already, until it ends (a
- * chunk it stores itself is held by it without a pin: its entry, until it
- * commits, is the transaction's, which no other's freer frees, and its own
- * freeing passes by): the chunk is then held by what
- * the transaction made of it (a reference from a chunk it stored, a root it
- * took) or freeing may have it.  A pin closes the race in which a chunk
- * nothing holds is freed just as a writer is about to use it: the writer
- * pins, then looks the chunk up (again, if it found it before pinning);
- * the freer, with the chunk's bucket locked,
- * looks for pins, and marks the chunk being freed only if it finds none, so
- * that a writer looking it up after waits for the freeing to end.  (A
- * chunk only looked up, not put, is not pinned.)
- *
- * Pins are in shared memory, a table per backend of the chunks' hashes (a
- * prefix of each), written only by its backend and read by freers; they
- * are never WAL-logged, and a backend's are let go of at its transaction's
- * end.  A backend whose table fills counts as pinning every chunk until
- * then.
+ * A transaction holds each chunk it puts until it ends: one it stores, by
+ * its entry (not committed: no other's freer frees it, and its own freeing
+ * passes by); one it finds stored already, by a change of the chunk's
+ * counts adding nothing (running: no other's freer frees the chunk while
+ * it does, and one freeing it as it is found is waited for), and by a pin.
+ * A pin is the transaction's own note that it holds the chunk, so that its
+ * own freeing, which counts its own changes as made, passes the chunk by.
+ * Pins are this backend's alone, in its memory, let go of as its
+ * transaction ends; none is shared, and there is no limit to them.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -31,10 +23,10 @@
 #ifndef PROLLY_CHUNK_PIN_H
 #define PROLLY_CHUNK_PIN_H
 
-/* Pins the chunk named hash until this transaction ends. */
+/* Notes that this transaction holds the chunk named hash, until it ends. */
 extern void ChunkPin(const uint8 *hash);
 
-/* Whether any backend has the chunk pinned (or might have). */
+/* Whether this transaction holds the chunk (for its own freeing). */
 extern bool ChunkPinned(const uint8 *hash);
 
 #endif							/* PROLLY_CHUNK_PIN_H */

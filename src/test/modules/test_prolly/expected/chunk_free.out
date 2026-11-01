@@ -134,7 +134,7 @@ SELECT free(node('s', '\x61')) AS freed, has('\x61') AS a;
      2 | f
 (1 row)
 
--- a pin holds a chunk until its transaction ends
+-- a hold holds a chunk until its transaction ends
 SELECT put('\x7a') AS z;
  z 
 ---
@@ -142,20 +142,44 @@ SELECT put('\x7a') AS z;
 (1 row)
 
 BEGIN;
-SELECT test_chunk_pin(h('\x7a'));
- test_chunk_pin 
-----------------
- 
+SELECT test_chunk_hold('fi', h('\x7a')) AS held;
+ held 
+------
+ t
 (1 row)
 
-SELECT free('\x7a') AS freed_pinned;
- freed_pinned 
---------------
-            0
+SELECT free('\x7a') AS freed_held;
+ freed_held 
+------------
+          0
 (1 row)
 
 COMMIT;
 SELECT free('\x7a') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+-- a put refused for a reference the store lacks counts none of the others
+-- (no change left behind, aborted, for VACUUM)
+SELECT put('\x61') AS a;
+ a 
+---
+ t
+(1 row)
+
+VACUUM fi;
+SELECT entries AS entries_before FROM test_chunk_index_shape('fi') \gset
+SELECT put(node('m', '\x61', '\x6d'));
+ERROR:  chunk 05a413855bfe9cfa284ee9e3172eb294604eb578 references chunk 62c66a7a5dd70c3146618063c344e531e6d4b59e, which the store does not have
+SELECT entries - :entries_before AS left_behind FROM test_chunk_index_shape('fi');
+ left_behind 
+-------------
+           0
+(1 row)
+
+SELECT free('\x61') AS freed;
  freed 
 -------
      1

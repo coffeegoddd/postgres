@@ -210,6 +210,21 @@ hash_text(const uint8 *hash)
 static bool put_hashed(Relation log, Relation idx, const uint8 *hash,
 					   const void *data, uint32 len);
 
+static void
+missing_ref(const uint8 *chunk, const uint8 *target)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+			 errmsg("chunk %s references chunk %s, which the store does not have",
+					hash_text(chunk), hash_text(target))));
+}
+
+typedef struct PackChunk
+{
+	uint8		hash[CHUNK_HASH_LEN];	/* the key */
+	int			at;				/* its place in the pack */
+} PackChunk;
+
 /* A reference of target's (from chunk) counted, or taken back. */
 static void
 count_ref(Relation idx, const uint8 *chunk, const uint8 *target, int32 drefs)
@@ -217,10 +232,33 @@ count_ref(Relation idx, const uint8 *chunk, const uint8 *target, int32 drefs)
 	ChunkIndexEntry e;
 
 	if (!ChunkIndex->adjust(idx, target, drefs, 0, &e))
-		ereport(ERROR,
-				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
-				 errmsg("chunk %s references chunk %s, which the store does not have",
-						hash_text(chunk), hash_text(target))));
+		missing_ref(chunk, target);
+}
+
+/*
+ * Each of a chunk's references the store's, looked up before any is
+ * counted: a put refused for one it lacks counts none (a count, then the
+ * refusal, would leave a change behind, aborted, for VACUUM)
+ */
+static void
+check_refs(Relation idx, const uint8 *chunk, const RefList *refs, HTAB *pack,
+		   const bool *planned)
+{
+	for (int i = 0; i < refs->n; i++)
+	{
+		const uint8 *rh = refs->hashes + i * CHUNK_HASH_LEN;
+		ChunkIndexEntry e;
+
+		if (pack != NULL)
+		{
+			PackChunk  *pc = hash_search(pack, rh, HASH_FIND, NULL);
+
+			if (pc != NULL && planned[pc->at])
+				continue;
+		}
+		if (!ChunkIndex->lookup(idx, rh, &e))
+			missing_ref(chunk, rh);
+	}
 }
 
 /*
@@ -244,24 +282,31 @@ bind_store(Relation log, Relation idx)
 }
 
 /*
- * Whether the store has the chunk, pinned in this backend's table if so:
- * looked up, pinned, looked up again (a freer marks a chunk being freed
- * only if it finds no pin, so one marking it before the pin is seen, and
- * waited for, by the second lookup)
+ * Whether the store has the chunk, held by this transaction if so until
+ * it ends: by a change of its counts adding nothing (running, it keeps
+ * another's freer off; one freeing the chunk as it is made is waited for,
+ * and the chunk, freed, is not found), and pinned, for this transaction's
+ * own freeing to pass by.  One this transaction put is held by its entry.
  */
 static bool
-found_pinned(Relation idx, const uint8 *hash)
+found_held(Relation idx, const uint8 *hash)
 {
 	ChunkIndexEntry e;
 
 	if (!ChunkIndex->lookup(idx, hash, &e))
 		return false;
-
-	/* (this transaction's own, put before: held by it, no pin needed) */
 	if (ChunkEntryIsMine(&e))
 		return true;
+	if (!ChunkIndex->adjust(idx, hash, 0, 0, &e))
+		return false;
 	ChunkPin(hash);
-	return ChunkIndex->lookup(idx, hash, &e);
+	return true;
+}
+
+bool
+ChunkStoreHold(Relation idx, const uint8 *hash)
+{
+	return found_held(idx, hash);
 }
 
 /* An entry's place: its bytes reserved in the run prepared (does not fail). */
@@ -315,12 +360,8 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	 */
 	(void) GetCurrentTransactionId();
 
-	/*
-	 * Found there already, pinned, then found again (a freer that marked it
-	 * before the pin is waited for: gone, it is put).  Put by this
-	 * transaction, it is held by it until it ends, with no pin.
-	 */
-	if (found_pinned(idx, hash))
+	/* found there already: held until the transaction ends */
+	if (found_held(idx, hash))
 		return false;
 
 	/*
@@ -331,6 +372,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	 * chunk first; an abort, or a crash, takes them back with the chunk
 	 */
 	ChunkFormat->refs(data, len, add_ref, &refs);
+	check_refs(idx, hash, &refs, NULL, NULL);
 	for (int i = 0; i < refs.n; i++)
 		count_ref(idx, hash, refs.hashes + i * CHUNK_HASH_LEN, 1);
 
@@ -354,7 +396,7 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 			break;
 
 		/* (another put it meanwhile: nothing reserved; gone again, put it) */
-		if (found_pinned(idx, hash))
+		if (found_held(idx, hash))
 		{
 			ChunkLog->release(log, &run);
 			for (int i = 0; i < refs.n; i++)
@@ -384,12 +426,6 @@ pack_order_cmp(const void *a, const void *b)
 	return memcmp(((const PackOrder *) a)->hash, ((const PackOrder *) b)->hash,
 				  CHUNK_HASH_LEN);
 }
-
-typedef struct PackChunk
-{
-	uint8		hash[CHUNK_HASH_LEN];	/* the key */
-	int			at;				/* its place in the pack */
-} PackChunk;
 
 /* a pack's bytes reserved for its chunks order[from..to), written */
 static void
@@ -427,8 +463,8 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	(void) GetCurrentTransactionId();
 
 	/*
-	 * the pack's chunks the store hasn't, each once; those it has pinned, as
-	 * a put's are
+	 * the pack's chunks the store hasn't, each once; those it has held, as a
+	 * put's are
 	 */
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = sizeof(PackChunk);
@@ -446,7 +482,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 		if (found)
 			continue;
 		pc->at = i;
-		fresh[i] = planned[i] = !found_pinned(idx, h);
+		fresh[i] = planned[i] = !found_held(idx, h);
 	}
 
 	/*
@@ -456,10 +492,15 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 	 * in any order)
 	 */
 	for (int i = 0; i < n; i++)
+		if (fresh[i])
+		{
+			ChunkFormat->refs(datas[i], lens[i], add_ref, &refs[i]);
+			check_refs(idx, hashes + i * CHUNK_HASH_LEN, &refs[i], pack, planned);
+		}
+	for (int i = 0; i < n; i++)
 	{
 		if (!fresh[i])
 			continue;
-		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs[i]);
 		for (int r = 0; r < refs[i].n; r++)
 		{
 			const uint8 *rh = refs[i].hashes + r * CHUNK_HASH_LEN;
@@ -530,7 +571,7 @@ ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
 				}
 
 				/* (another put it meanwhile: nothing reserved; gone again, put it) */
-				if (found_pinned(idx, hashes + i * CHUNK_HASH_LEN))
+				if (found_held(idx, hashes + i * CHUNK_HASH_LEN))
 				{
 					fresh[i] = false;
 					break;
