@@ -2559,6 +2559,8 @@ chunk_index_redo(XLogReaderState *record)
 					chunk_page = redo_page(&rp, 0);
 				if (!xlrec->same_page)
 					cpage = redo_page(&rp, 1);
+				if (!xlrec->chunk_on_bucket_page && !xlrec->same_page)
+					INJECTION_POINT("chunk-index-redo-fold", NULL);
 				if (!xlrec->chunk_on_bucket_page)
 					chunk_page = redo_page(&rp, 0);
 				if ((chunk_page && xlrec->chunk_slot >= page_entries(chunk_page)) ||
