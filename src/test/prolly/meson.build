@@ -47,6 +47,7 @@ tests += {
       't/204_branch_pg_upgrade.pl',
       't/205_branch_subscriptions.pl',
       't/206_branch_subscriber.pl',
+      't/207_branch_isolation_of_sessions.pl',
     ],
   },
 }

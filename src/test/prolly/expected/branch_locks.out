@@ -1,0 +1,51 @@
+Parsed test spec with 2 sessions
+
+starting permutation: o_begin o_lock w_update o_commit
+step o_begin: BEGIN;
+step o_lock: SELECT v FROM app.t WHERE id = 1 FOR UPDATE;
+ v
+--
+10
+(1 row)
+
+step w_update: UPDATE app.t SET v = v + 1 WHERE id = 1;
+step o_commit: COMMIT;
+
+starting permutation: o_serial w_serial o_read w_read o_write w_write o_commit w_commit
+step o_serial: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step w_serial: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step o_read: SELECT sum(v) FROM app.t;
+sum
+---
+ 30
+(1 row)
+
+step w_read: SELECT sum(v) FROM app.t;
+sum
+---
+ 30
+(1 row)
+
+step o_write: UPDATE app.t SET v = v + 1 WHERE id = 1;
+step w_write: UPDATE app.t SET v = v + 1 WHERE id = 2;
+step o_commit: COMMIT;
+step w_commit: COMMIT;
+
+starting permutation: w_begin w_read o_ddl w_commit
+step w_begin: BEGIN;
+step w_read: SELECT sum(v) FROM app.t;
+sum
+---
+ 30
+(1 row)
+
+step o_ddl: ALTER TABLE app.t ADD COLUMN extra int;
+step w_commit: COMMIT;
+
+starting permutation: o_begin w_begin o_make w_make o_commit w_commit
+step o_begin: BEGIN;
+step w_begin: BEGIN;
+step o_make: CREATE TABLE app.only (x int);
+step w_make: CREATE TABLE app.only (y int, z int);
+step o_commit: COMMIT;
+step w_commit: COMMIT;
