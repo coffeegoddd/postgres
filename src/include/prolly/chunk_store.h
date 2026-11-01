@@ -58,6 +58,13 @@ extern bool ChunkStorePut(Relation log, Relation idx, const uint8 *hash,
 						  const void *data, uint32 len);
 
 /*
+ * ChunkStorePut of the chunk the bytes are, named in *hash (hashed here,
+ * once).
+ */
+extern bool ChunkStorePutData(Relation log, Relation idx, const void *data,
+							  uint32 len, uint8 *hash);
+
+/*
  * A root of the chunk (a hold from outside the store: a branch's head, a
  * working set), taken or let go of in this transaction, its counts after
  * in *out.  Letting go of one it hasn't is an error.

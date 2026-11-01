@@ -5,7 +5,7 @@
  *	  (prolly/chunkstore.h), for its conformance suite.
  *
  * Each takes the name of a registered store.  The suite
- * (sql/include/chunk_store_conformance.sql) runs against each store in a
+ * (sql/chunk_store_suite.inc) runs against each store in a
  * file of its own; chunk_store_stores lists those registered, so that a
  * store registered without its file shows.
  *
@@ -23,6 +23,8 @@
 #include "funcapi.h"
 #include "prolly/chunkstore.h"
 #include "prolly/registry.h"
+#include "catalog/pg_type.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/tuplestore.h"
 #include "varatt.h"
@@ -38,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_cs_free);
 PG_FUNCTION_INFO_V1(test_cs_free_unheld);
 PG_FUNCTION_INFO_V1(test_cs_check);
 PG_FUNCTION_INFO_V1(test_cs_reset_memory);
+PG_FUNCTION_INFO_V1(test_cs_memory_miscount);
 
 static ChunkStore *
 store_arg(FunctionCallInfo fcinfo)
@@ -76,14 +79,54 @@ test_chunk_stores(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-/* test_cs_put(store, hash, data): true if it stored the chunk */
+/* test_cs_put(store, data, OUT stored, OUT hash): whether it stored it, and its name */
 Datum
 test_cs_put(PG_FUNCTION_ARGS)
 {
-	bytea	   *data = PG_GETARG_BYTEA_PP(2);
+	bytea	   *data = PG_GETARG_BYTEA_PP(1);
+	uint8		hash[CHUNK_HASH_LEN];
+	bytea	   *h = palloc(VARHDRSZ + CHUNK_HASH_LEN);
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
 
-	PG_RETURN_BOOL(cs_put(store_arg(fcinfo), hash_arg(fcinfo, 1),
-						  VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data)));
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = BoolGetDatum(cs_put(store_arg(fcinfo), VARDATA_ANY(data),
+									VARSIZE_ANY_EXHDR(data), hash));
+	SET_VARSIZE(h, VARHDRSZ + CHUNK_HASH_LEN);
+	memcpy(VARDATA(h), hash, CHUNK_HASH_LEN);
+	values[1] = PointerGetDatum(h);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
+}
+
+/* hashes bytea[] argument n, flattened */
+static uint8 *
+hashes_arg(FunctionCallInfo fcinfo, int argno, int *n)
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	uint8	   *hashes;
+
+	deconstruct_array(PG_GETARG_ARRAYTYPE_P(argno), BYTEAOID, -1, false,
+					  TYPALIGN_INT, &elems, &nulls, n);
+	hashes = palloc(Max(*n, 1) * CHUNK_HASH_LEN);
+	for (int i = 0; i < *n; i++)
+	{
+		bytea	   *b;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("a chunk's hash is not null")));
+		b = DatumGetByteaPP(elems[i]);
+		if (VARSIZE_ANY_EXHDR(b) != CHUNK_HASH_LEN)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
+		memcpy(hashes + i * CHUNK_HASH_LEN, VARDATA_ANY(b), CHUNK_HASH_LEN);
+	}
+	return hashes;
 }
 
 /* test_cs_get(store, hash): the chunk's bytes, or NULL */
@@ -143,11 +186,14 @@ test_cs_counts(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 
-/* test_cs_free(store, hash): how many it freed, the cascade's included */
+/* test_cs_free(store, hashes bytea[]): how many it freed, the cascade's included */
 Datum
 test_cs_free(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64((int64) cs_free(store_arg(fcinfo), hash_arg(fcinfo, 1), 1));
+	int			n;
+	uint8	   *hashes = hashes_arg(fcinfo, 1, &n);
+
+	PG_RETURN_INT64((int64) cs_free(store_arg(fcinfo), hashes, n));
 }
 
 Datum
@@ -156,22 +202,40 @@ test_cs_free_unheld(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) cs_free_unheld(store_arg(fcinfo)));
 }
 
-/* test_cs_check(store): the audit's verdict, and what is wrong */
+/* test_cs_check(store, OUT ok, OUT chunks, OUT unheld, OUT why): the audit */
 Datum
 test_cs_check(PG_FUNCTION_ARGS)
 {
 	uint64		chunks,
 				unheld;
 	char	   *why = NULL;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 
-	if (!cs_check(store_arg(fcinfo), &chunks, &unheld, &why))
-		ereport(NOTICE, (errmsg("the store's audit: %s", why)));
-	PG_RETURN_BOOL(why == NULL);
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = BoolGetDatum(cs_check(store_arg(fcinfo), &chunks, &unheld, &why));
+	values[1] = Int64GetDatum((int64) chunks);
+	values[2] = Int64GetDatum((int64) unheld);
+	if (why)
+		values[3] = CStringGetTextDatum(why);
+	else
+		nulls[3] = true;
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }
 
 Datum
 test_cs_reset_memory(PG_FUNCTION_ARGS)
 {
 	MemoryChunkStoreReset();
+	PG_RETURN_VOID();
+}
+
+/* test_cs_memory_miscount(hash): a reference too many counted, in "memory" */
+Datum
+test_cs_memory_miscount(PG_FUNCTION_ARGS)
+{
+	MemoryChunkStoreMiscount(hash_arg(fcinfo, 0));
 	PG_RETURN_VOID();
 }

@@ -381,8 +381,7 @@ CREATE FUNCTION test_chunk_stores(OUT name text, OUT transactional bool)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_cs_put(store text, hash bytea, data bytea)
-RETURNS bool
+CREATE FUNCTION test_cs_put(store text, data bytea, OUT stored bool, OUT hash bytea)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_cs_get(store text, hash bytea)
@@ -404,7 +403,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 CREATE FUNCTION test_cs_counts(store text, hash bytea, OUT refs int8, OUT roots int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_cs_free(store text, hash bytea)
+CREATE FUNCTION test_cs_free(store text, hashes bytea[])
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
@@ -412,10 +411,14 @@ CREATE FUNCTION test_cs_free_unheld(store text)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-CREATE FUNCTION test_cs_check(store text)
-RETURNS bool
+CREATE FUNCTION test_cs_check(store text, OUT ok bool, OUT chunks int8, OUT unheld int8,
+	OUT why text)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 CREATE FUNCTION test_cs_reset_memory()
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+CREATE FUNCTION test_cs_memory_miscount(hash bytea)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
