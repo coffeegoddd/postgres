@@ -37,6 +37,7 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_region.h"
 #include "prolly/chunk_xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
@@ -54,10 +55,11 @@
 /* ------------------------------------------------------------ the pages */
 
 #define CHUNK_LOG_MAGIC		0x50434C47	/* "PCLG" */
-#define CHUNK_LOG_VERSION	5
+#define CHUNK_LOG_VERSION	6
 
 #define CHUNK_PAGE_META		1
 #define CHUNK_PAGE_DATA		2
+#define CHUNK_PAGE_MAP		3
 
 #define META_BLOCK			0
 
@@ -68,7 +70,7 @@
 typedef struct ChunkPageOpaqueData
 {
 	uint32		magic;			/* CHUNK_LOG_MAGIC */
-	uint16		kind;			/* CHUNK_PAGE_META or CHUNK_PAGE_DATA */
+	uint16		kind;			/* CHUNK_PAGE_META, _DATA or _MAP */
 	uint16		unused;
 	uint32		dead;			/* a data page's bytes no chunk's any more */
 } ChunkPageOpaqueData;
@@ -111,8 +113,44 @@ typedef struct ChunkLogRegion
 #define AREA			(BLCKSZ - SizeOfPageHeaderData - \
 						 MAXALIGN(sizeof(ChunkPageOpaqueData)))
 
-#define LOC_BLOCK(loc)	((BlockNumber) (1 + (loc) / AREA))
+/*
+ * The open-page map: a map page heads each group of MAP_BITS data pages,
+ * a bit for each, set as the page is handed to a backend's region, and
+ * cleared by VACUUM once it finds the page full (or makes it full: a page
+ * no live backend's region has, which its backend, gone, or having
+ * forgotten its region, will never let go of).  The pages from block 1
+ * are a map page, its group's data pages, the next map page, and so on;
+ * the log's bytes are on its data pages alone, in order.
+ */
+#define MAP_BITS		4096
+#define MAP_GROUP		(MAP_BITS + 1)
+
+/* data page d's block, the block of its group's map page, and its bit */
+#define DATA_BLOCK64(d)	(1 + ((uint64) (d) / MAP_BITS) * MAP_GROUP + 1 + \
+						 (uint64) (d) % MAP_BITS)
+#define DATA_BLOCK(d)	((BlockNumber) DATA_BLOCK64(d))
+#define MAP_BLOCK(d)	((BlockNumber) (1 + ((d) / MAP_BITS) * MAP_GROUP))
+#define MAP_BIT(d)		((uint32) ((d) % MAP_BITS))
+#define IS_MAP_BLOCK(blk) ((blk) != META_BLOCK && ((blk) - 1) % MAP_GROUP == 0)
+
+#define LOC_BLOCK(loc)	DATA_BLOCK((loc) / AREA)
 #define LOC_OFFSET(loc)	((size_t) ((loc) % AREA))
+
+/* the data pages before block blk, and so where its bytes begin */
+static inline uint64
+pages_below(BlockNumber blk)
+{
+	uint64		b,
+				in_group;
+
+	if (blk <= META_BLOCK + 1)
+		return 0;
+	b = blk - 1;
+	in_group = b % MAP_GROUP;
+	return (b / MAP_GROUP) * MAP_BITS + (in_group > 0 ? in_group - 1 : 0);
+}
+
+#define BLOCK_LOC(blk)	(pages_below(blk) * AREA)
 
 static void
 init_page(Page page, uint16 kind)
@@ -185,6 +223,28 @@ page_add_dead(Page page, bool init, size_t off, size_t n)
 	((ChunkPageOpaque) PageGetSpecialPointer(page))->dead += n;
 }
 
+/* Bits first..first+n-1 of a map page set, or cleared. */
+static void
+page_map_set(Page page, bool init, uint32 first, uint32 n, bool set)
+{
+	uint8	   *bits;
+
+	if (init)
+	{
+		init_page(page, CHUNK_PAGE_MAP);
+		((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + MAP_BITS / 8;
+		memset(PageGetContents(page), 0, MAP_BITS / 8);
+	}
+	bits = (uint8 *) PageGetContents(page);
+	for (uint32 i = first; i < first + n; i++)
+	{
+		if (set)
+			bits[i / 8] |= (uint8) (1 << (i % 8));
+		else
+			bits[i / 8] &= (uint8) ~(1 << (i % 8));
+	}
+}
+
 /*
  * WAL-logs the change just made to buf's page, in the critical section
  * that made it: rec, the record's, and data, block 0's (or none)
@@ -211,7 +271,8 @@ log_page_change(Relation rel, Buffer buf, uint8 info, bool will_init,
 static inline bool
 page_free(Page page)
 {
-	return ((PageHeader) page)->pd_lower == AREA_START + AREA &&
+	return ((ChunkPageOpaque) PageGetSpecialPointer(page))->kind == CHUNK_PAGE_DATA &&
+		((PageHeader) page)->pd_lower == AREA_START + AREA &&
 		((ChunkPageOpaque) PageGetSpecialPointer(page))->dead == AREA;
 }
 
@@ -243,7 +304,8 @@ check_page(Relation rel, BlockNumber blk, Page page, uint16 kind)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("block %u of \"%s\" is not a %s page of a chunk log",
 						blk, RelationGetRelationName(rel),
-						kind == CHUNK_PAGE_META ? "meta" : "data")));
+						kind == CHUNK_PAGE_META ? "meta" :
+						kind == CHUNK_PAGE_MAP ? "map" : "data")));
 }
 
 static ChunkLogMetaData *
@@ -389,24 +451,60 @@ make_page(Relation rel, Buffer buf, bool all_dead)
 }
 
 /*
- * Claims npages new pages for this backend's appends, from the meta page:
- * the one place appends meet, for one short record per claim.
+ * Data pages first..first+n-1 marked open in their groups' map pages (each
+ * made, if new); or, set false, page first marked so no more.
  */
-static BlockNumber
-claim_pages(Relation rel, BlockNumber npages)
+static void
+map_mark(Relation rel, uint64 first, uint64 n, bool set)
+{
+	while (n > 0)
+	{
+		uint32		bit = MAP_BIT(first);
+		uint32		k = (uint32) Min(n, (uint64) (MAP_BITS - bit));
+		Buffer		buf = data_buffer(rel, MAP_BLOCK(first));
+		Page		page = BufferGetPage(buf);
+		bool		init = PageIsNew(page);
+		xl_chunk_log_map xlrec = {.first = bit, .n = k, .set = set, .init = init};
+
+		if (!init)
+			check_page(rel, MAP_BLOCK(first), page, CHUNK_PAGE_MAP);
+		START_CRIT_SECTION();
+		page_map_set(page, init, bit, k, set);
+		log_page_change(rel, buf, XLOG_CHUNK_LOG_MAP, init,
+						&xlrec, sizeof(xlrec), NULL, 0);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+		first += k;
+		n -= k;
+	}
+}
+
+/*
+ * Claims npages new data pages for this backend's appends, from the meta
+ * page: the one place appends meet, for one short record per claim.  The
+ * pages are this backend's region's (published) and marked open before
+ * they are the log's: VACUUM finds none of them unheld and not open.
+ * Answers the first.
+ */
+static uint64
+claim_pages(Relation rel, uint64 npages)
 {
 	Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
 	ChunkLogMetaData *meta;
-	BlockNumber first;
+	uint64		first;
 
 	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
 	meta = page_meta(rel, BufferGetPage(mbuf));
-	first = meta->next_block;
-	if (npages > MaxBlockNumber - first)
+	first = pages_below(meta->next_block);
+	if (npages > (uint64) MaxBlockNumber ||
+		DATA_BLOCK64(first + npages - 1) >= (uint64) MaxBlockNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("chunk log \"%s\" is full", RelationGetRelationName(rel))));
-	set_next_block(rel, mbuf, first + npages, false);
+	ChunkRegionPublish(rel->rd_locator, DATA_BLOCK(first),
+					   DATA_BLOCK(first + npages - 1) + 1);
+	map_mark(rel, first, npages, true);
+	set_next_block(rel, mbuf, DATA_BLOCK(first + npages - 1) + 1, false);
 	UnlockReleaseBuffer(mbuf);
 	return first;
 }
@@ -434,6 +532,11 @@ take_free_page(Relation rel)
 		if (!BlockNumberIsValid(blk) || blk == META_BLOCK ||
 			blk >= RelationGetNumberOfBlocks(rel))
 			return InvalidBlockNumber;
+		if (IS_MAP_BLOCK(blk))
+		{
+			RecordPageWithFreeSpace(rel, blk, 0);
+			continue;
+		}
 		buf = ReadBuffer(rel, blk);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
@@ -443,6 +546,9 @@ take_free_page(Relation rel)
 			RecordPageWithFreeSpace(rel, blk, 0);
 			continue;
 		}
+		/* (this backend's region's, and open, before it is made to use) */
+		ChunkRegionPublish(rel->rd_locator, blk, blk + 1);
+		map_mark(rel, pages_below(blk), 1, true);
 		make_page(rel, buf, false);
 		UnlockReleaseBuffer(buf);
 		RecordPageWithFreeSpace(rel, blk, 0);
@@ -504,10 +610,11 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 		}
 		loc += AREA - off;
 	}
-	for (BlockNumber blk = LOC_BLOCK(loc);
-		 loc < limit && blk < RelationGetNumberOfBlocks(rel);
-		 blk++, loc += AREA)
+	for (uint64 d = loc / AREA;
+		 loc < limit && DATA_BLOCK(d) < RelationGetNumberOfBlocks(rel);
+		 d++, loc += AREA)
 	{
+		BlockNumber blk = DATA_BLOCK(d);
 		Buffer		buf = ReadBuffer(rel, blk);
 
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -526,14 +633,14 @@ seal_region(Relation rel, uint64 loc, uint64 limit)
 
 /* pages enough for len bytes, from the first */
 static void
-claim_run(Relation rel, uint64 len, BlockNumber npages, ChunkLogRegion *run)
+claim_run(Relation rel, uint64 len, uint64 npages, ChunkLogRegion *run)
 {
-	BlockNumber first;
+	uint64		first;
 
 	npages = Max(npages, (len + AREA - 1) / AREA);
 	first = claim_pages(rel, npages);
 	run->relnumber = rel->rd_locator.relNumber;
-	run->next = (uint64) (first - 1) * AREA;
+	run->next = first * AREA;
 	run->limit = run->next + (uint64) npages * AREA;
 }
 
@@ -664,7 +771,7 @@ page_prepare(Relation rel, size_t len, ChunkLogRun *run)
 		if (BlockNumberIsValid(blk))
 		{
 			region.relnumber = rel->rd_locator.relNumber;
-			region.next = (uint64) (blk - 1) * AREA;
+			region.next = BLOCK_LOC(blk);
 			region.limit = region.next + AREA;
 		}
 		else
@@ -804,7 +911,7 @@ page_end(Relation rel)
 
 	buf = ReadBuffer(rel, META_BLOCK);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	end = (uint64) (page_meta(rel, BufferGetPage(buf))->next_block - 1) * AREA;
+	end = BLOCK_LOC(page_meta(rel, BufferGetPage(buf))->next_block);
 	UnlockReleaseBuffer(buf);
 	return end;
 }
@@ -944,6 +1051,99 @@ page_mark_dead(Relation rel, uint64 loc, size_t len, uint32 generation)
 	}
 }
 
+/*
+ * Lets go of what is left of the regions no live backend holds: each page
+ * marked open, unless a region live now, or in also, has it, is made full
+ * (its rest dead, or, never written, all dead), and is marked so no more,
+ * as is each found full.  Regions in also are those live as VACUUM began
+ * its pass over the index: one let go of since may have bytes reserved,
+ * never written, of an entry the pass did not see, to count dead once
+ * that entry is out (counting them here would count them twice).
+ */
+void
+ChunkLogSealAbandoned(Relation rel, const ChunkRegionSet *also)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	Buffer		mbuf;
+	uint64		npages;
+
+	mbuf = ReadBuffer(rel, META_BLOCK);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	npages = pages_below(page_meta(rel, BufferGetPage(mbuf))->next_block);
+	UnlockReleaseBuffer(mbuf);
+
+	for (uint64 group = 0; group * MAP_BITS < npages; group++)
+	{
+		BlockNumber mblk = MAP_BLOCK(group * MAP_BITS);
+		uint8		bits[MAP_BITS / 8];
+		Buffer		buf;
+
+		if (mblk >= nblocks)
+			break;
+		buf = ReadBuffer(rel, mblk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (PageIsNew(BufferGetPage(buf)))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		check_page(rel, mblk, BufferGetPage(buf), CHUNK_PAGE_MAP);
+		memcpy(bits, PageGetContents(BufferGetPage(buf)), sizeof(bits));
+		UnlockReleaseBuffer(buf);
+
+		for (uint32 bit = 0; bit < MAP_BITS; bit++)
+		{
+			uint64		d = group * MAP_BITS + bit;
+			BlockNumber blk = DATA_BLOCK(d);
+			Page		page;
+			bool		done = false,
+						freed = false;
+
+			if (d >= npages || blk >= nblocks)
+				break;
+			if (!(bits[bit / 8] & (1 << (bit % 8))))
+				continue;
+			CHECK_FOR_INTERRUPTS();
+			buf = ReadBuffer(rel, blk);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			page = BufferGetPage(buf);
+			if (!PageIsNew(page))
+				check_page(rel, blk, page, CHUNK_PAGE_DATA);
+			if (!PageIsNew(page) && ((PageHeader) page)->pd_lower == AREA_START + AREA)
+				done = true;
+			else if (!ChunkRegionHeld(rel->rd_locator, blk, also))
+			{
+				if (PageIsNew(page))
+					make_page(rel, buf, true);
+				else
+				{
+					size_t		off = ((PageHeader) page)->pd_lower - AREA_START;
+					xl_chunk_log_seal xlrec = {.off = off, .init = false};
+
+					START_CRIT_SECTION();
+					page_seal(page, false, off);
+					log_page_change(rel, buf, XLOG_CHUNK_LOG_SEAL_PAGE, false,
+									&xlrec, sizeof(xlrec), NULL, 0);
+					END_CRIT_SECTION();
+				}
+				done = true;
+			}
+			if (done)
+			{
+				/* (under the page's lock: a backend taking it marks it first) */
+				map_mark(rel, d, 1, false);
+				freed = page_free(page);
+			}
+			UnlockReleaseBuffer(buf);
+			if (freed)
+			{
+				RecordPageWithFreeSpace(rel, blk, AREA);
+				FreeSpaceMapVacuumRange(rel, blk, blk + 1);
+			}
+		}
+	}
+}
+
 void
 ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full, uint64 *dead,
 			  uint32 *free_pages)
@@ -954,8 +1154,13 @@ ChunkLogSpace(Relation rel, uint32 *pages, uint32 *full, uint64 *dead,
 	*dead = 0;
 	for (BlockNumber blk = META_BLOCK + 1; blk < nblocks; blk++)
 	{
-		Buffer		buf = ReadBuffer(rel, blk);
-		Page		page = BufferGetPage(buf);
+		Buffer		buf;
+		Page		page;
+
+		if (IS_MAP_BLOCK(blk))
+			continue;
+		buf = ReadBuffer(rel, blk);
+		page = BufferGetPage(buf);
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		if (!PageIsNew(page))
@@ -1012,8 +1217,12 @@ ChunkLogRecordFree(Relation rel)
 
 	for (BlockNumber blk = META_BLOCK + 1; blk < nblocks; blk++)
 	{
-		Buffer		buf = ReadBuffer(rel, blk);
+		Buffer		buf;
 		bool		freed;
+
+		if (IS_MAP_BLOCK(blk))
+			continue;
+		buf = ReadBuffer(rel, blk);
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		freed = !PageIsNew(BufferGetPage(buf)) && page_free(BufferGetPage(buf));
@@ -1029,9 +1238,15 @@ ChunkLogRecordFree(Relation rel)
 static bool
 tail_page_cuttable(Relation rel, BlockNumber blk)
 {
-	Buffer		buf = ReadBuffer(rel, blk);
-	Page		page = BufferGetPage(buf);
+	Buffer		buf;
+	Page		page;
 	bool		cut;
+
+	/* (a map page goes with the last of its group's pages) */
+	if (IS_MAP_BLOCK(blk))
+		return true;
+	buf = ReadBuffer(rel, blk);
+	page = BufferGetPage(buf);
 
 	/*
 	 * (a page part written all dead too: its backend, if any, can append
@@ -1668,6 +1883,19 @@ chunk_log_redo(XLogReaderState *record)
 				applied = true;
 				break;
 			}
+		case XLOG_CHUNK_LOG_MAP:
+			{
+				xl_chunk_log_map *xlrec = (xl_chunk_log_map *) rec;
+
+				if (xlrec->init)
+					buf = XLogInitBufferForRedo(record, 0);
+				else if (XLogReadBufferForRedo(record, 0, &buf) != BLK_NEEDS_REDO)
+					break;
+				page_map_set(BufferGetPage(buf), xlrec->init, xlrec->first,
+							 xlrec->n, xlrec->set);
+				applied = true;
+				break;
+			}
 		case XLOG_CHUNK_LOG_MARK_DEAD:
 			{
 				xl_chunk_log_mark_dead *xlrec = (xl_chunk_log_mark_dead *) rec;
@@ -1698,7 +1926,7 @@ chunk_log_redo(XLogReaderState *record)
 		 * not written out for this, as with heap's, and VACUUM after
 		 * promotion puts every free page in again.)
 		 */
-		bool		data_page = blk != META_BLOCK;
+		bool		data_page = blk != META_BLOCK && !IS_MAP_BLOCK(blk);
 		bool		freed = data_page && page_free(BufferGetPage(buf));
 
 		UnlockReleaseBuffer(buf);
@@ -1710,7 +1938,7 @@ chunk_log_redo(XLogReaderState *record)
 			FreeSpaceMapVacuumRange(rel, blk, blk + 1);
 			FreeFakeRelcacheEntry(rel);
 		}
-		else if (info == XLOG_CHUNK_LOG_INIT_PAGE)
+		else if (data_page && info == XLOG_CHUNK_LOG_INIT_PAGE)
 			XLogRecordPageWithFreeSpace(locator, blk, 0);
 	}
 }

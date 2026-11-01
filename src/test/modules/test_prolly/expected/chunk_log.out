@@ -50,7 +50,7 @@ SELECT test_chunk_log_end('chunks') AS end_after;
 SELECT pg_relation_size('chunks') / current_setting('block_size')::int AS blocks;
  blocks 
 --------
-      4
+      5
 (1 row)
 
 SELECT test_chunk_log_read('chunks', 0, 3) AS first;
@@ -98,9 +98,9 @@ SELECT b, lower, special, pagesize FROM generate_series(0, 3) b,
  b | lower | special | pagesize 
 ---+-------+---------+----------
  0 |    56 |    8176 |     8192
- 1 |  8176 |    8176 |     8192
+ 1 |   536 |    8176 |     8192
  2 |  8176 |    8176 |     8192
- 3 |  3724 |    8176 |     8192
+ 3 |  8176 |    8176 |     8192
 (4 rows)
 
 -- no tuples, and none taken

@@ -40,10 +40,12 @@ FROM generate_series(1, 150) g;
 SELECT ok, chunks FROM test_chunk_check('ql', 'qi');
 
 -- and again: pages used again are freed again (a page a region leaves
--- part written is made full, its rest dead), and used a third time
+-- part written is made full, its rest dead), and used a third time.  The
+-- first backend's last page, the anchor's, made full too, once it exited:
+-- every full page free but that one
 SELECT test_chunk_free_unheld('ql', 'qi') AS freed;
 VACUUM qi;
-SELECT free_pages = full_pages AS full_ones_free_again FROM test_chunk_log_space('ql');
+SELECT full_pages - free_pages AS full_not_free FROM test_chunk_log_space('ql');
 \c
 SET chunk_free_in_background = off;
 SELECT count(*) FILTER (WHERE test_chunk_put('ql', 'qi', h(blob('c' || g)), blob('c' || g))) AS put_third
