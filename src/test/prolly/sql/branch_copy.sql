@@ -144,13 +144,14 @@ CREATE TABLE app.items (id int PRIMARY KEY, owner text, n app.small, cnt int DEF
 CREATE TABLE app.log (item int, what text);
 CREATE FUNCTION app.double(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x * 2;
 CREATE FUNCTION app.pair_sum(p app.pair) RETURNS int LANGUAGE sql RETURN p.a + p.b;
-CREATE FUNCTION app.happier(m app.mood) RETURNS bool LANGUAGE sql RETURN m > 'ok'::app.mood;
+CREATE FUNCTION app.happier(m app.mood DEFAULT 'sad') RETURNS bool LANGUAGE sql RETURN m > 'ok'::app.mood;
 CREATE FUNCTION app.in_span(x int) RETURNS bool LANGUAGE sql RETURN x <@ app.span(1, 10);
 CREATE FUNCTION app.logit() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN INSERT INTO app.log VALUES (NEW.id, TG_OP); RETURN NEW; END $$;
 CREATE TRIGGER items_log AFTER INSERT ON app.items FOR EACH ROW EXECUTE FUNCTION app.logit();
 CREATE VIEW app.doubled AS SELECT id, app.double(n) AS d FROM app.items WHERE n > 1;
 CREATE VIEW app.glad AS SELECT 'glad'::app.mood > 'ok'::app.mood AS gladder;
+CREATE VIEW app.by_owner AS SELECT id, owner FROM app.items GROUP BY id;
 CREATE MATERIALIZED VIEW app.counted AS SELECT count(*) AS c FROM app.items;
 CREATE RULE items_count AS ON UPDATE TO app.items DO ALSO
 	INSERT INTO app.log VALUES (NEW.id, 'updated');
@@ -166,6 +167,7 @@ SET catalog_branch = :b10;
 SELECT proname FROM pg_proc WHERE pronamespace = 'app'::regnamespace ORDER BY 1;
 SELECT app.double(21), app.pair_sum(ROW(1, 2)::app.pair), app.happier('glad'), app.in_span(5);
 SELECT * FROM app.glad;
+SELECT app.happier();
 -- the trigger, the rule, the view and the domain act on b10's own objects
 INSERT INTO app.items (id, owner) VALUES (2, 'regress_copy_reader') RETURNING n;
 INSERT INTO app.items (id, owner, n) VALUES (3, 'x', 500);
@@ -194,6 +196,18 @@ SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
 SET catalog_branch = :b9;
 DROP TABLE app.moods;
 CREATE TABLE app.spans (s app.span[]);
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
+-- and an array of the branch's own domain (its header names the domain),
+-- and an index holding the branch's own enum
+SET catalog_branch = :b9;
+DROP TABLE app.spans;
+CREATE TABLE app.smalls (xs app.small[]);
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
+SET catalog_branch = :b9;
+DROP TABLE app.smalls;
+CREATE INDEX items_mood ON app.items ((CASE WHEN n > 1 THEN 'glad'::app.mood ELSE 'sad'::app.mood END));
 RESET catalog_branch;
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
 

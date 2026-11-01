@@ -490,6 +490,9 @@ type_stored_names_copy(CopyState *cs, Oid typid)
 	{
 		Oid			elem = get_element_type(typid);
 
+		/* (an array's header names its element type, whatever it is) */
+		if (OidIsValid(elem) && in_copy(cs, TypeRelationId, elem))
+			return true;
 		if (OidIsValid(elem))
 			typid = elem;
 		else if (get_typtype(typid) == TYPTYPE_DOMAIN)
@@ -512,9 +515,9 @@ check_stored_types(CopyState *cs)
 		CopyKey		obj = cs->objs[i];
 		Relation	rel;
 
+		/* (an index's tuples hold its expressions' values too) */
 		if (obj.classid != RelationRelationId ||
-			!RELKIND_HAS_STORAGE(get_rel_relkind(obj.oid)) ||
-			get_rel_relkind(obj.oid) == RELKIND_INDEX)
+			!RELKIND_HAS_STORAGE(get_rel_relkind(obj.oid)))
 			continue;
 		rel = relation_open(obj.oid, NoLock);
 		for (int a = 0; a < RelationGetDescr(rel)->natts; a++)
@@ -524,8 +527,9 @@ check_stored_types(CopyState *cs)
 			if (!att->attisdropped && type_stored_names_copy(cs, att->atttypid))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot copy table %s to another branch: column \"%s\" holds values of the branch's own type %s",
-								get_rel_name(obj.oid), NameStr(att->attname),
+						 errmsg("cannot copy %s to another branch: column \"%s\" holds values of the branch's own type %s",
+								getObjectDescription(&(ObjectAddress) {RelationRelationId, obj.oid, 0}, false),
+								NameStr(att->attname),
 								format_type_be(att->atttypid)),
 						 errdetail("The table's data, which the branches share, names the type's object ids."),
 						 errhint("Make the type in a shared schema.")));
@@ -840,6 +844,8 @@ remap_query(Query *query, CopyState *cs)
 	}
 	foreach_node(RTEPermissionInfo, perm, q->rteperminfos)
 		perm->relid = copy_map(cs, RelationRelationId, perm->relid);
+	/* (the constraints, a primary key's, that a GROUP BY relies on) */
+	q->constraintDeps = map_oid_list(cs, ConstraintRelationId, q->constraintDeps);
 	return q;
 }
 
@@ -1272,6 +1278,7 @@ fix_proc(CopyState *cs, Datum *values, bool *nulls)
 		values[Anum_pg_proc_protrftypes - 1] =
 			map_oidarray(cs, TypeRelationId, values[Anum_pg_proc_protrftypes - 1]);
 	MAP_TREE(Anum_pg_proc_prosqlbody);
+	MAP_TREE(Anum_pg_proc_proargdefaults);
 }
 
 static void
