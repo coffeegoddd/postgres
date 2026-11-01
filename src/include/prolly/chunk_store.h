@@ -21,7 +21,11 @@
 
 #include "prolly/chunk_index.h"
 
-/* A chunk's name: the first CHUNK_HASH_LEN bytes of the SHA-256 of its bytes. */
+/*
+ * A chunk's name: the first CHUNK_HASH_LEN bytes of the SHA-256 of its
+ * bytes.  (It needs a resource owner, as pg_cryptohash does: a caller
+ * outside a transaction makes one.)
+ */
 extern void ChunkHash(const void *data, size_t len, uint8 *out);
 
 /* Whether the store has the chunk named hash. */
