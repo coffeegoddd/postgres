@@ -443,6 +443,13 @@ belongs(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
  * not the bucket's.  Notes in *space the first page with room, and in
  * *last the chain's last page.
  */
+static EntryState find_entry_freeing(Relation rel, Buffer primary, int mode,
+									 const uint8 *hash, uint32 bucket,
+									 const IndexCache *masks, bool purge,
+									 Buffer *found_buf, int *found_at,
+									 BlockNumber *space, BlockNumber *last,
+									 TransactionId *running, bool *freeing);
+
 /* (a purge takes out entries not the bucket's, and aborted ones) */
 static inline bool
 kept_by_purge(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
@@ -455,6 +462,21 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		   uint32 bucket, const IndexCache *masks, bool purge,
 		   Buffer *found_buf, int *found_at,
 		   BlockNumber *space, BlockNumber *last, TransactionId *running)
+{
+	return find_entry_freeing(rel, primary, mode, hash, bucket, masks, purge,
+							  found_buf, found_at, space, last, running, NULL);
+}
+
+/*
+ * find_entry, and whether a chunk's entry another transaction (*running)
+ * holds is being freed by it, in *freeing, rather than being put
+ */
+static EntryState
+find_entry_freeing(Relation rel, Buffer primary, int mode, const uint8 *hash,
+				   uint32 bucket, const IndexCache *masks, bool purge,
+				   Buffer *found_buf, int *found_at,
+				   BlockNumber *space, BlockNumber *last,
+				   TransactionId *running, bool *freeing)
 {
 	EntryState	result = ENTRY_DEAD;	/* (none found) */
 
@@ -506,6 +528,8 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 					return ENTRY_VISIBLE;
 				case ENTRY_IN_PROGRESS:
 					result = ENTRY_IN_PROGRESS;
+					if (freeing && running)
+						*freeing = (*running == e->xmax);
 					break;
 				case ENTRY_DEAD:
 					break;
@@ -952,17 +976,33 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 {
 	uint32		bucket;
 	IndexCache	masks;
-	Buffer		primary = lock_bucket(idx, hash, BUFFER_LOCK_SHARE, &bucket, &masks);
+	Buffer		primary;
 	Buffer		found;
 	int			at;
 	int64		drefs,
 				droots;
+	TransactionId running;
+	bool		freeing;
 
-	if (find_entry(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
-				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
+	/*
+	 * (a chunk being freed is waited for: it is there again, or gone; one
+	 * being put by another is not the store's yet)
+	 */
+	for (;;)
 	{
+		EntryState	st;
+
+		freeing = false;
+		primary = lock_bucket(idx, hash, BUFFER_LOCK_SHARE, &bucket, &masks);
+		st = find_entry_freeing(idx, primary, BUFFER_LOCK_SHARE, hash, bucket,
+								&masks, false, &found, &at, NULL, NULL,
+								&running, &freeing);
+		if (st == ENTRY_VISIBLE)
+			break;
 		UnlockReleaseBuffer(primary);
-		return false;
+		if (st != ENTRY_IN_PROGRESS || !freeing)
+			return false;
+		XactLockTableWait(running, NULL, NULL, XLTW_None);
 	}
 	*out = *page_entry(BufferGetPage(found), at);
 	if (found != primary)
@@ -1057,12 +1097,21 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	change.kind = CHUNK_KIND_CHANGE;
 	for (;;)
 	{
+		EntryState	st;
+		bool		freeing = false;
+
 		primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-		if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-					   true, &found, &at, &space, &last, NULL) != ENTRY_VISIBLE)
+		st = find_entry_freeing(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket,
+								&masks, true, &found, &at, &space, &last,
+								&running, &freeing);
+		if (st != ENTRY_VISIBLE)
 		{
 			UnlockReleaseBuffer(primary);
-			return false;
+			if (st != ENTRY_IN_PROGRESS || !freeing)
+				return false;
+			/* (being freed: wait to see) */
+			XactLockTableWait(running, NULL, NULL, XLTW_None);
+			continue;
 		}
 		*out = *page_entry(BufferGetPage(found), at);
 		if (found != primary)
@@ -1139,7 +1188,8 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
  * transaction changing them, and not being freed already.
  */
 static bool
-page_free(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
+page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
+		  ChunkIndexEntry *out)
 {
 	uint32		bucket;
 	IndexCache	masks;
@@ -1166,7 +1216,7 @@ page_free(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	count_changes(idx, primary, BUFFER_LOCK_EXCLUSIVE, out, bucket, &masks,
 				  true, &drefs, &droots, &running, NULL, NULL);
 	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
-		TransactionIdIsValid(running))
+		TransactionIdIsValid(running) || (held && held(hash)))
 	{
 		release_found(primary, found);
 		return false;
@@ -1180,48 +1230,6 @@ page_free(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	out->roots = 0;
 	release_found(primary, found);
 	return true;
-}
-
-static void
-page_unfree(Relation idx, const uint8 *hash)
-{
-	uint32		bucket;
-	IndexCache	masks;
-	Buffer		primary;
-	Buffer		cur;
-	TransactionId xid = GetCurrentTransactionId();
-
-	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	cur = primary;
-	for (;;)
-	{
-		Page		page = BufferGetPage(cur);
-		BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
-		int			n = page_entries(page);
-
-		for (int i = 0; i < n; i++)
-		{
-			ChunkIndexEntry *e = page_entry(page, i);
-
-			if (e->kind == CHUNK_KIND_CHUNK && e->xmax == xid &&
-				memcmp(e->hash, hash, CHUNK_HASH_LEN) == 0)
-			{
-				GenericXLogState *st = GenericXLogStart(idx);
-
-				page_entry(GenericXLogRegisterBuffer(st, cur, 0), i)->xmax =
-					InvalidTransactionId;
-				GenericXLogFinish(st);
-			}
-		}
-		if (cur != primary)
-			UnlockReleaseBuffer(cur);
-		if (!BlockNumberIsValid(next))
-			break;
-		cur = ReadBuffer(idx, next);
-		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
-		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
-	}
-	UnlockReleaseBuffer(primary);
 }
 
 static bool
@@ -1395,7 +1403,6 @@ const ChunkIndexRoutine PageChunkIndex = {
 	.insert = page_insert,
 	.adjust = page_adjust,
 	.free = page_free,
-	.unfree = page_unfree,
 	.remove = page_remove,
 	.visit = page_visit,
 };
@@ -1617,6 +1624,58 @@ fold_changes(Relation idx, Buffer primary, uint32 bucket, const IndexCache *mask
 	}
 }
 
+/* What VACUUM does with an entry, by what it knows of xmin and xmax. */
+typedef enum VacuumFate
+{
+	FATE_KEEP,
+	FATE_REMOVE,				/* not the bucket's, aborted, or freed */
+	FATE_FREEZE,				/* xmin committed, not noted so in WAL */
+	FATE_CLEAR,					/* xmax aborted: no freeing now */
+	FATE_FREEZE_CLEAR,
+} VacuumFate;
+
+/*
+ * Each transaction id an entry names on its own: xmin, committed, is
+ * frozen whatever xmax is (a freeing running leaves it, being past the
+ * horizon); xmax, committed, makes the entry dead, aborted, gone
+ */
+static VacuumFate
+vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
+{
+	bool		freeze;
+	bool		clear = false;
+
+	if (!belongs(e, bucket, masks))
+		return FATE_REMOVE;
+	if (!(e->flags & (CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED)))
+	{
+		if (e->flags & CHUNK_ENTRY_ABORTED)
+			return FATE_REMOVE;
+		if (TransactionIdIsInProgress(e->xmin))
+			return FATE_KEEP;
+		if (!TransactionIdDidCommit(e->xmin))
+			return FATE_REMOVE;
+	}
+	if (e->kind != CHUNK_KIND_CHUNK)
+		return FATE_KEEP;		/* (a change is added in, not frozen) */
+	freeze = !(e->flags & CHUNK_ENTRY_FROZEN);
+	if (TransactionIdIsValid(e->xmax))
+	{
+		if (e->flags & CHUNK_ENTRY_XMAX_COMMITTED)
+			return FATE_REMOVE;
+		if (e->flags & CHUNK_ENTRY_XMAX_ABORTED)
+			clear = true;
+		else if (!TransactionIdIsInProgress(e->xmax))
+		{
+			if (TransactionIdDidCommit(e->xmax))
+				return FATE_REMOVE;
+			clear = true;
+		}
+	}
+	return freeze ? (clear ? FATE_FREEZE_CLEAR : FATE_FREEZE) :
+		(clear ? FATE_CLEAR : FATE_KEEP);
+}
+
 void
 ChunkIndexVacuum(Relation idx)
 {
@@ -1650,18 +1709,13 @@ ChunkIndexVacuum(Relation idx)
 			Page		page = BufferGetPage(cur);
 			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
 			int			n = page_entries(page);
-			EntryState *states = palloc(Max(n, 1) * sizeof(EntryState));
+			VacuumFate *fates = palloc(Max(n, 1) * sizeof(VacuumFate));
 			bool		change = false;
 
 			for (int i = 0; i < n; i++)
 			{
-				ChunkIndexEntry *e = page_entry(page, i);
-
-				states[i] = entry_state_unhinted(e);
-				if (!belongs(e, b, &masks) || states[i] == ENTRY_DEAD ||
-					(states[i] == ENTRY_VISIBLE && e->kind == CHUNK_KIND_CHUNK &&
-					 (!(e->flags & CHUNK_ENTRY_FROZEN) ||
-					  TransactionIdIsValid(e->xmax))))
+				fates[i] = vacuum_fate(page_entry(page, i), b, &masks);
+				if (fates[i] != FATE_KEEP)
 					change = true;
 			}
 			if (change)
@@ -1674,12 +1728,13 @@ ChunkIndexVacuum(Relation idx)
 				{
 					ChunkIndexEntry e = *page_entry(p, i);
 
-					if (!belongs(&e, b, &masks) || states[i] == ENTRY_DEAD)
+					if (fates[i] == FATE_REMOVE)
 						continue;
-					if (states[i] == ENTRY_VISIBLE && e.kind == CHUNK_KIND_CHUNK)
+					if (fates[i] == FATE_FREEZE || fates[i] == FATE_FREEZE_CLEAR)
+						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
+					if (fates[i] == FATE_CLEAR || fates[i] == FATE_FREEZE_CLEAR)
 					{
 						/* (a freeing that aborted, gone with it) */
-						e.flags |= CHUNK_ENTRY_FROZEN | CHUNK_ENTRY_COMMITTED;
 						e.flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
 						e.xmax = InvalidTransactionId;
 					}
@@ -1691,7 +1746,7 @@ ChunkIndexVacuum(Relation idx)
 			}
 			else
 				kept_entries += n;
-			pfree(states);
+			pfree(fates);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
 			if (!BlockNumberIsValid(next))

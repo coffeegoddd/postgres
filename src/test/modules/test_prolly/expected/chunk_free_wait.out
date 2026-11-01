@@ -70,3 +70,65 @@ freed
     1
 (1 row)
 
+
+starting permutation: p_begin p_put f_free p_ref p_commit f_free
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step p_begin: BEGIN;
+step p_put: SELECT test_chunk_put('fl', 'fi', substr(sha256('\x01'), 1, 20), '\x01') AS stored;
+stored
+------
+f     
+(1 row)
+
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    0
+(1 row)
+
+step p_ref: SELECT roots FROM test_chunk_ref_root('fi', substr(sha256('\x01'), 1, 20));
+roots
+-----
+    1
+(1 row)
+
+step p_commit: COMMIT;
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    0
+(1 row)
+
+
+starting permutation: f_begin f_free p_vacuum p_unfrozen f_rollback p_vacuum p_unfrozen
+test_chunk_put
+--------------
+t             
+(1 row)
+
+step f_begin: BEGIN;
+step f_free: SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed;
+freed
+-----
+    1
+(1 row)
+
+step p_vacuum: VACUUM fi;
+step p_unfrozen: SELECT test_chunk_index_unfrozen('fi') AS unfrozen;
+unfrozen
+--------
+       0
+(1 row)
+
+step f_rollback: ROLLBACK;
+step p_vacuum: VACUUM fi;
+step p_unfrozen: SELECT test_chunk_index_unfrozen('fi') AS unfrozen;
+unfrozen
+--------
+       0
+(1 row)
+
