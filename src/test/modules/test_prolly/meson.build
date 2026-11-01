@@ -130,6 +130,7 @@ tests += {
       't/056_history_upgrade.pl',
       't/057_history_standby.pl',
       't/058_chunk_log_wal.pl',
+      't/059_chunk_index_wal.pl',
     ],
     'env': {
       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',

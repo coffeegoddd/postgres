@@ -50,4 +50,4 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 PG_RMGR(RM_XLOG2_ID, "XLOG2", xlog2_redo, xlog2_desc, xlog2_identify, NULL, NULL, NULL, xlog2_decode)
 PG_RMGR(RM_BMAP_ID, "BlockMap", bmap_redo, bmap_desc, bmap_identify, NULL, NULL, bmap_mask, NULL)
 PG_RMGR(RM_CHUNK_LOG_ID, "ChunkLog", chunk_log_redo, chunk_log_desc, chunk_log_identify, NULL, NULL, chunk_log_mask, NULL)
-PG_RMGR(RM_CHUNK_INDEX_ID, "ChunkIndex", chunk_index_redo, chunk_index_desc, chunk_index_identify, NULL, NULL, NULL, NULL)
+PG_RMGR(RM_CHUNK_INDEX_ID, "ChunkIndex", chunk_index_redo, chunk_index_desc, chunk_index_identify, NULL, NULL, chunk_index_mask, NULL)
