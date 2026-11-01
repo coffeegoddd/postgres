@@ -2297,10 +2297,13 @@ ChunkIndexVacuum(Relation idx, bool truncate)
 		ChunkLogRecordFree(log);
 		INJECTION_POINT("chunk-index-vacuum-cut", NULL);
 		/*
-		 * (unless VACUUM is not to truncate: the cut's AccessExclusiveLock,
-		 * WAL-logged, conflicts with a hot standby's readers of the log)
+		 * (unless VACUUM is not to truncate, or the log's own
+		 * vacuum_truncate is off: the cut's AccessExclusiveLock, WAL-logged,
+		 * conflicts with a hot standby's readers of the log)
 		 */
-		if (truncate)
+		if (truncate &&
+			!(log->rd_options != NULL &&
+			  ((StdRdOptions *) log->rd_options)->vacuum_truncate == PG_TERNARY_FALSE))
 			(void) ChunkLogTruncateTail(log);
 
 		/* chunks nothing holds: a freer frees them, and what they held */
