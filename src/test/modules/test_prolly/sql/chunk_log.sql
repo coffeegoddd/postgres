@@ -4,6 +4,8 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 CREATE TABLE chunks () USING prolly_chunks;
 SELECT test_chunk_log_end('chunks') AS empty_end;
+-- (its meta page made with it)
+SELECT pg_relation_size('chunks') / current_setting('block_size')::int AS blocks_made;
 
 SELECT test_chunk_log_append('chunks', '\x616263') AS first_at;
 SELECT test_chunk_log_append('chunks', convert_to(repeat('0123456789', 2000), 'UTF8')) AS spanning_at;
@@ -73,6 +75,16 @@ DROP PUBLICATION chunk_pub;
 TRUNCATE chunks;
 SELECT test_chunk_log_end('chunks') AS end_truncated;
 SELECT test_chunk_log_append('chunks', '\x01') AS at_after_truncate;
+
+-- truncated in the transaction that made it, and appended to again
+BEGIN;
+CREATE TABLE chunks_once () USING prolly_chunks;
+SELECT test_chunk_log_append('chunks_once', '\x0102') AS at_before;
+TRUNCATE chunks_once;
+SELECT test_chunk_log_append('chunks_once', '\x0304') AS at_after;
+SELECT test_chunk_log_read('chunks_once', 0, 2) AS read_after;
+COMMIT;
+DROP TABLE chunks_once;
 
 -- a heap is not a chunk log, nor is a chunk log anything but permanent and
 -- shared

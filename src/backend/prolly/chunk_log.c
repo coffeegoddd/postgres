@@ -26,6 +26,7 @@
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "executor/tuptable.h"
@@ -34,9 +35,11 @@
 #include "prolly/branch_catalog.h"
 #include "prolly/chunk_log.h"
 #include "storage/bufmgr.h"
+#include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/fmgrprotos.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -71,9 +74,11 @@ typedef struct ChunkLogMetaData
 } ChunkLogMetaData;
 
 /*
- * The region a backend appends into, in the relation's rd_amcache: a relcache
- * reset (the relation's storage replaced, or a rollback) forgets it, and
- * the rest of it stays unused.
+ * The region a backend appends into, in the relation's rd_amcache, kept as
+ * each page of an append is written (so an append an error stops leaves it
+ * where its last page ends).  A relcache reset forgets it (the relation's
+ * storage replaced, or any invalidation of the relation), as does a
+ * truncation, and the rest of it stays unused.
  */
 typedef struct ChunkLogRegion
 {
@@ -138,23 +143,53 @@ page_meta(Relation rel, Page page)
 	return meta;
 }
 
-/* Block blk, locked exclusively; the relation extended to it if needed. */
+/*
+ * A new log's meta page, in a page buffer: made with its storage, and after
+ * a truncation, so that no append ever makes it (two backends doing so at
+ * once could both claim the first region).
+ */
+static void
+init_meta(Page page)
+{
+	ChunkLogMetaData *meta;
+
+	init_page(page, CHUNK_PAGE_META);
+	meta = (ChunkLogMetaData *) PageGetContents(page);
+	meta->version = CHUNK_LOG_VERSION;
+	meta->next_block = META_BLOCK + 1;
+	((PageHeader) page)->pd_lower =
+		(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
+}
+
+static void
+write_meta(SMgrRelation srel, bool use_wal)
+{
+	BulkWriteState *bulk = smgr_bulk_start_smgr(srel, MAIN_FORKNUM, use_wal);
+	BulkWriteBuffer buf = smgr_bulk_get_buf(bulk);
+
+	init_meta((Page) buf);
+	smgr_bulk_write(bulk, META_BLOCK, buf, true);
+	smgr_bulk_finish(bulk);
+}
+
+/*
+ * Data page blk, locked exclusively; the relation extended to it if needed
+ * (another backend may extend the relation past blk meanwhile, with zero
+ * pages: blk is a page of this backend's region not yet written, and
+ * nobody else writes it).
+ */
 static Buffer
-log_buffer(Relation rel, BlockNumber blk)
+data_buffer(Relation rel, BlockNumber blk)
 {
 	Buffer		buf;
 
+	Assert(blk != META_BLOCK);
 	if (blk < RelationGetNumberOfBlocks(rel))
 	{
 		buf = ReadBuffer(rel, blk);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		return buf;
 	}
-
-	/*
-	 * (another backend may extend the relation past blk meanwhile, with zero
-	 * pages: blk is in this backend's region, and nobody else writes it)
-	 */
 	return ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0, blk + 1,
 							   RBM_ZERO_AND_LOCK);
 }
@@ -163,32 +198,21 @@ log_buffer(Relation rel, BlockNumber blk)
 
 /*
  * Claims npages new pages for this backend's appends, from the meta page:
- * the one place appends meet, for one short record per region.
+ * the one place appends meet, for one short record per claim.
  */
 static BlockNumber
 claim_pages(Relation rel, BlockNumber npages)
 {
-	Buffer		mbuf = log_buffer(rel, META_BLOCK);
-	GenericXLogState *st = GenericXLogStart(rel);
+	Buffer		mbuf = ReadBuffer(rel, META_BLOCK);
+	GenericXLogState *st;
 	Page		page;
 	ChunkLogMetaData *meta;
 	BlockNumber first;
 
-	if (PageIsNew(BufferGetPage(mbuf)))
-	{
-		page = GenericXLogRegisterBuffer(st, mbuf, GENERIC_XLOG_FULL_IMAGE);
-		init_page(page, CHUNK_PAGE_META);
-		meta = (ChunkLogMetaData *) PageGetContents(page);
-		meta->version = CHUNK_LOG_VERSION;
-		meta->next_block = META_BLOCK + 1;
-		((PageHeader) page)->pd_lower =
-			(char *) meta + sizeof(ChunkLogMetaData) - (char *) page;
-	}
-	else
-	{
-		page = GenericXLogRegisterBuffer(st, mbuf, 0);
-		meta = page_meta(rel, page);
-	}
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	st = GenericXLogStart(rel);
+	page = GenericXLogRegisterBuffer(st, mbuf, 0);
+	meta = page_meta(rel, page);
 	first = meta->next_block;
 	if (npages > MaxBlockNumber - first)
 		ereport(ERROR,
@@ -200,12 +224,35 @@ claim_pages(Relation rel, BlockNumber npages)
 	return first;
 }
 
+/* pages enough for len bytes, from the first */
+static void
+claim_run(Relation rel, uint64 len, BlockNumber npages, ChunkLogRegion *run)
+{
+	BlockNumber first;
+
+	npages = Max(npages, (len + AREA - 1) / AREA);
+	first = claim_pages(rel, npages);
+	run->relnumber = rel->rd_locator.relNumber;
+	run->next = (uint64) (first - 1) * AREA;
+	run->limit = run->next + (uint64) npages * AREA;
+}
+
+static void
+keep_region(Relation rel, const ChunkLogRegion *region)
+{
+	if (rel->rd_amcache == NULL)
+		rel->rd_amcache = MemoryContextAlloc(CacheMemoryContext,
+											 sizeof(ChunkLogRegion));
+	*(ChunkLogRegion *) rel->rd_amcache = *region;
+}
+
 static uint64
 page_append(Relation rel, const void *data, size_t len)
 {
 	const char *bytes = data;
 	ChunkLogRegion region;
 	ChunkLogRegion *cached = rel->rd_amcache;
+	bool		own_run;
 	uint64		start;
 
 	/*
@@ -221,21 +268,24 @@ page_append(Relation rel, const void *data, size_t len)
 		return 0;
 
 	/*
-	 * This backend's region, or a new one if the bytes don't fit what is left
-	 * of it (bytes longer than a region get pages enough of their own)
+	 * Into this backend's region, or a new one if the bytes don't fit what
+	 * is left of it; bytes longer than a region go into pages of their own,
+	 * leaving the region as it is
 	 */
-	if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
-		region = *cached;
+	own_run = len > (uint64) REGION_PAGES * AREA;
+	if (own_run)
+		claim_run(rel, len, 0, &region);
 	else
-		region.next = region.limit = 0;
-	if (region.limit - region.next < len)
 	{
-		BlockNumber npages = Max(REGION_PAGES, (len + AREA - 1) / AREA);
-		BlockNumber first = claim_pages(rel, npages);
-
-		region.relnumber = rel->rd_locator.relNumber;
-		region.next = (uint64) (first - 1) * AREA;
-		region.limit = region.next + (uint64) npages * AREA;
+		if (cached != NULL && cached->relnumber == rel->rd_locator.relNumber)
+			region = *cached;
+		else
+			region.next = region.limit = 0;
+		if (region.limit - region.next < len)
+		{
+			claim_run(rel, len, REGION_PAGES, &region);
+			keep_region(rel, &region);
+		}
 	}
 	start = region.next;
 
@@ -250,7 +300,7 @@ page_append(Relation rel, const void *data, size_t len)
 		Page		page;
 
 		CHECK_FOR_INTERRUPTS();
-		buf = log_buffer(rel, blk);
+		buf = data_buffer(rel, blk);
 
 		/*
 		 * A page this backend's appends begin is new; one they go on in holds
@@ -287,13 +337,13 @@ page_append(Relation rel, const void *data, size_t len)
 		region.next += n;
 		bytes += n;
 		len -= n;
-	}
 
-	/* (a relcache reset meanwhile forgot the region: it is kept anew) */
-	if (rel->rd_amcache == NULL)
-		rel->rd_amcache = MemoryContextAlloc(CacheMemoryContext,
-											 sizeof(ChunkLogRegion));
-	*(ChunkLogRegion *) rel->rd_amcache = region;
+		/* the region as far as written, should what follows fail */
+		if (!own_run)
+			keep_region(rel, &region);
+
+		INJECTION_POINT("chunk-log-append-page", NULL);
+	}
 	return start;
 }
 
@@ -303,12 +353,9 @@ page_end(Relation rel)
 	Buffer		buf;
 	uint64		end;
 
-	if (RelationGetNumberOfBlocks(rel) == 0)
-		return 0;
 	buf = ReadBuffer(rel, META_BLOCK);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	end = PageIsNew(BufferGetPage(buf)) ? 0 :
-		(uint64) (page_meta(rel, BufferGetPage(buf))->next_block - 1) * AREA;
+	end = (uint64) (page_meta(rel, BufferGetPage(buf))->next_block - 1) * AREA;
 	UnlockReleaseBuffer(buf);
 	return end;
 }
@@ -346,8 +393,10 @@ page_read(Relation rel, uint64 loc, void *dst, size_t len)
 		buf = ReadBuffer(rel, blk);
 		page = BufferGetPage(buf);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		check_page(rel, blk, page, CHUNK_PAGE_DATA);
-		if (AREA_START + off + n > ((PageHeader) page)->pd_lower)
+		if (!PageIsNew(page))
+			check_page(rel, blk, page, CHUNK_PAGE_DATA);
+		if (PageIsNew(page) ||
+			AREA_START + off + n > ((PageHeader) page)->pd_lower)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("bytes %llu to %llu of chunk log \"%s\" were never written",
@@ -584,6 +633,12 @@ cl_relation_set_new_filelocator(Relation rel,
 	*freezeXid = InvalidTransactionId;
 	*minmulti = InvalidMultiXactId;
 	srel = RelationCreateStorageWith(*newrlocator, persistence, true, SMGR_MD);
+
+	/*
+	 * (logged unless WAL is minimal, when the new storage is synced at
+	 * commit instead, as RelationCreateStorage arranged)
+	 */
+	write_meta(srel, XLogIsNeeded());
 	smgrclose(srel);
 }
 
@@ -591,6 +646,14 @@ static void
 cl_relation_nontransactional_truncate(Relation rel)
 {
 	RelationTruncate(rel, 0);
+	write_meta(RelationGetSmgr(rel), RelationNeedsWAL(rel));
+
+	/* (the region this backend had is gone with its pages) */
+	if (rel->rd_amcache != NULL)
+	{
+		pfree(rel->rd_amcache);
+		rel->rd_amcache = NULL;
+	}
 }
 
 /* (ALTER TABLE ... SET TABLESPACE: the pages as they are) */

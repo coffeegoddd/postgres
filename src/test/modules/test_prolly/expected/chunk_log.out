@@ -10,6 +10,13 @@ SELECT test_chunk_log_end('chunks') AS empty_end;
          0
 (1 row)
 
+-- (its meta page made with it)
+SELECT pg_relation_size('chunks') / current_setting('block_size')::int AS blocks_made;
+ blocks_made 
+-------------
+           1
+(1 row)
+
 SELECT test_chunk_log_append('chunks', '\x616263') AS first_at;
  first_at 
 ----------
@@ -192,6 +199,30 @@ SELECT test_chunk_log_append('chunks', '\x01') AS at_after_truncate;
                  0
 (1 row)
 
+-- truncated in the transaction that made it, and appended to again
+BEGIN;
+CREATE TABLE chunks_once () USING prolly_chunks;
+SELECT test_chunk_log_append('chunks_once', '\x0102') AS at_before;
+ at_before 
+-----------
+         0
+(1 row)
+
+TRUNCATE chunks_once;
+SELECT test_chunk_log_append('chunks_once', '\x0304') AS at_after;
+ at_after 
+----------
+        0
+(1 row)
+
+SELECT test_chunk_log_read('chunks_once', 0, 2) AS read_after;
+ read_after 
+------------
+ \x0304
+(1 row)
+
+COMMIT;
+DROP TABLE chunks_once;
 -- a heap is not a chunk log, nor is a chunk log anything but permanent and
 -- shared
 CREATE TABLE not_chunks (x int);
