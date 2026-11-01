@@ -43,6 +43,7 @@
 
 #include "storage/smgr.h"
 #include "utils/relcache.h"
+#include "utils/snapshot.h"
 
 /* A chunk's hash: the first bytes of the SHA-256 of its bytes. */
 #define CHUNK_HASH_LEN	20
@@ -169,6 +170,20 @@ typedef struct ChunkIndexRoutine
 
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);
+
+	/*
+	 * A chunk's entry as of snapshot, and each chunk's (fn called with
+	 * nothing locked, until it answers false): a chunk the store had then,
+	 * its insert committed before the snapshot and its freeing not (a chunk
+	 * freed since is the store's still, to a snapshot that could find it:
+	 * its entry and bytes are taken out once none could).  Counts are not
+	 * asked of: an entry's own, alone.  For a dump, under its snapshot.
+	 */
+	bool		(*lookup_as_of) (Relation idx, const uint8 *hash,
+								 Snapshot snap, ChunkIndexEntry *out);
+	void		(*visit_as_of) (Relation idx, Snapshot snap,
+								bool (*fn) (void *arg, const ChunkIndexEntry *e),
+								void *arg);
 } ChunkIndexRoutine;
 
 extern PGDLLIMPORT const ChunkIndexRoutine *ChunkIndex;

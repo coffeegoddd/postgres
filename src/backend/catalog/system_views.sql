@@ -1628,13 +1628,14 @@ ALTER TABLE pg_history.pointers ENABLE ALWAYS TRIGGER pointers_no_truncate;
 REVOKE EXECUTE ON FUNCTION pg_catalog.pg_history_pointer_changed() FROM PUBLIC;
 
 --
--- The history store dumped and restored: pg_history_export() its chunks,
--- each after those it references, and pg_history.chunk_restore a view of
--- none whose INSERT (pg_restore's COPY) puts one, its bytes checked against
--- its name.  The pointers, restored after, take their roots.
+-- The history store dumped and restored: pg_history_export() the store as
+-- of the snapshot, its chunks (each after those it references) and then its
+-- pointers, and pg_history.chunk_restore a view of none whose INSERT
+-- (pg_restore's COPY, one statement) puts a chunk, its bytes checked
+-- against its name, or inserts a pointer, which takes its root.
 --
 CREATE VIEW pg_history.chunk_restore AS
-	SELECT NULL::bytea AS hash, NULL::bytea AS data WHERE false;
+	SELECT NULL::bytea AS hash, NULL::bytea AS data, NULL::text AS name WHERE false;
 CREATE TRIGGER chunk_restore_put
 	INSTEAD OF INSERT ON pg_history.chunk_restore
 	FOR EACH ROW EXECUTE FUNCTION pg_catalog.pg_history_chunk_restore();

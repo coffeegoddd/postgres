@@ -36,6 +36,9 @@ extern Oid	ChunkStoreLogRelid(void);
 extern Oid	ChunkStoreIndexRelid(void);
 extern Oid	ChunkStorePointersRelid(void);
 
+/* A chunk's name, in hex, palloc'd: for messages. */
+extern char *ChunkHashText(const uint8 *hash);
+
 /* Whether the store has the chunk named hash. */
 extern bool ChunkStoreHas(Relation log, Relation idx, const uint8 *hash);
 

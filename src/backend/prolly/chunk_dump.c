@@ -1,16 +1,20 @@
 /*-------------------------------------------------------------------------
  *
  * chunk_dump.c
- *	  The history store's chunks taken out, and put back, by pg_dump and
- *	  pg_restore.
+ *	  The history store taken out, and put back, by pg_dump and pg_restore.
  *
- * pg_history_export() is every chunk of the store this transaction sees,
- * each after the chunks it references (as ChunkFormat finds them), so that
- * they are put back in order, each put finding what it references there
- * already.  pg_history.chunk_restore is a view of no rows whose INSERT
- * puts a chunk (its bytes checked against its name), for pg_restore to
- * COPY them into; the pointers, COPYd after, take their roots by their own
- * trigger.  pg_history_has_chunks() says whether there are any to dump.
+ * pg_history_export() is the store as of the transaction's snapshot: every
+ * chunk it had then, each after the chunks it references (as ChunkFormat
+ * finds them), then every pointer, as rows (hash, data, name): a chunk's
+ * with no name, a pointer's with no data.  A chunk freed since the
+ * snapshot is the store's still to it (its entry and bytes are taken out
+ * once no snapshot might find it), so the chunks and the pointers are one
+ * moment's.  pg_history.chunk_restore is a view of no rows whose INSERT
+ * puts a chunk (its bytes checked against its name), or inserts a pointer
+ * (which takes its root, by the pointers' trigger): pg_restore COPYs the
+ * rows into it in one statement, one transaction, so no chunk restored is
+ * freed before the pointers holding it are.  pg_history_has_chunks() says
+ * whether the store has a chunk (a pointer names one), for pg_dump.
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -23,7 +27,9 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -35,18 +41,9 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
 #include "varatt.h"
-
-static char *
-hash_text(const uint8 *hash)
-{
-	char	   *s = palloc(CHUNK_HASH_LEN * 2 + 1);
-
-	for (int i = 0; i < CHUNK_HASH_LEN; i++)
-		sprintf(s + i * 2, "%02x", hash[i]);
-	return s;
-}
 
 typedef struct HashList
 {
@@ -69,10 +66,11 @@ hash_list_add(HashList *l, const uint8 *hash)
 	l->n++;
 }
 
-static void
+static bool
 collect_chunk(void *arg, const ChunkIndexEntry *e)
 {
 	hash_list_add((HashList *) arg, e->hash);
+	return true;
 }
 
 static void
@@ -102,43 +100,65 @@ to_bytea(const void *data, uint32 len)
 }
 
 static void
-emit(ReturnSetInfo *rsinfo, const DumpFrame *f)
+emit_chunk(ReturnSetInfo *rsinfo, const DumpFrame *f)
 {
-	Datum		values[2];
-	bool		nulls[2] = {false, false};
+	Datum		values[3];
+	bool		nulls[3] = {false, false, true};
 	bytea	   *h = to_bytea(f->hash, CHUNK_HASH_LEN);
 	bytea	   *d = to_bytea(f->data, f->len);
 
 	values[0] = PointerGetDatum(h);
 	values[1] = PointerGetDatum(d);
+	values[2] = (Datum) 0;
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	pfree(h);
 	pfree(d);
 }
 
+/* a chunk's bytes as of the snapshot; an error if the store had none */
+static void *
+read_as_of(Relation log, Relation idx, Snapshot snap, const uint8 *hash,
+		   uint32 *len)
+{
+	ChunkIndexEntry e;
+	void	   *data;
+
+	if (!ChunkIndex->lookup_as_of(idx, hash, snap, &e))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the history store has no chunk %s, which another references",
+						ChunkHashText(hash))));
+	data = palloc_extended(Max(e.len, 1), MCXT_ALLOC_HUGE);
+	ChunkLog->read(log, e.loc, data, e.len);
+	*len = e.len;
+	return data;
+}
+
 /*
- * pg_history_export(): every chunk, each after those it references, its
- * name and bytes.  Each is visited once (a set of those out, or on the way),
- * by a walk down from each in turn, a chunk out once the chunks it names
- * are.  O(store).
+ * pg_history_export(): the store as of the snapshot, its chunks each after
+ * those it references, then its pointers.  Each chunk is visited once (a set
+ * of those out, or on the way), by a walk down from each in turn, a chunk
+ * out once the chunks it names are.  O(store), in memory a set of the
+ * chunks' names (the rows themselves go to the function's tuplestore,
+ * which spills to disk).
  */
 Datum
 pg_history_export(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Snapshot	snap = GetActiveSnapshot();
 	Relation	log;
 	Relation	idx;
 	HashList	all = {0};
 	HASHCTL		ctl;
 	HTAB	   *seen;
 	DumpFrame  *stack;
-	int			depth = 0;
 	int			cap = 16;
 
 	InitMaterializedSRF(fcinfo, 0);
 	log = relation_open(ChunkStoreLogRelid(), AccessShareLock);
 	idx = relation_open(ChunkStoreIndexRelid(), AccessShareLock);
-	ChunkIndex->visit(idx, collect_chunk, &all);
+	ChunkIndex->visit_as_of(idx, snap, collect_chunk, &all);
 
 	ctl.keysize = CHUNK_HASH_LEN;
 	ctl.entrysize = CHUNK_HASH_LEN;
@@ -149,6 +169,7 @@ pg_history_export(PG_FUNCTION_ARGS)
 	for (int i = 0; i < all.n; i++)
 	{
 		const uint8 *root = all.hashes + (Size) i * CHUNK_HASH_LEN;
+		int			depth;
 		bool		found;
 
 		(void) hash_search(seen, root, HASH_ENTER, &found);
@@ -166,12 +187,7 @@ pg_history_export(PG_FUNCTION_ARGS)
 			CHECK_FOR_INTERRUPTS();
 			if (f->data == NULL)
 			{
-				f->data = ChunkStoreGet(log, idx, f->hash, &f->len);
-				if (f->data == NULL)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("the history store has no chunk %s, which another references",
-									hash_text(f->hash))));
+				f->data = read_as_of(log, idx, snap, f->hash, &f->len);
 				memset(&f->refs, 0, sizeof(f->refs));
 				ChunkFormat->refs(f->data, f->len, collect_ref, &f->refs);
 				f->next = 0;
@@ -194,7 +210,7 @@ pg_history_export(PG_FUNCTION_ARGS)
 				depth++;
 				continue;
 			}
-			emit(rsinfo, f);
+			emit_chunk(rsinfo, f);
 			pfree(f->data);
 			if (f->refs.hashes)
 				pfree(f->refs.hashes);
@@ -203,30 +219,52 @@ pg_history_export(PG_FUNCTION_ARGS)
 	}
 	relation_close(idx, AccessShareLock);
 	relation_close(log, AccessShareLock);
+
+	/* the pointers, read under the same snapshot */
+	SPI_connect();
+	if (SPI_execute("SELECT name, hash FROM pg_history.pointers ORDER BY name", true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the history store's pointers");
+	for (uint64 r = 0; r < SPI_processed; r++)
+	{
+		Datum		values[3];
+		bool		nulls[3] = {false, true, false};
+		bool		isnull;
+
+		values[2] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull);
+		values[0] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &isnull);
+		values[1] = (Datum) 0;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	SPI_finish();
 	return (Datum) 0;
 }
 
-static void
+static bool
 note_chunk(void *arg, const ChunkIndexEntry *e)
 {
 	*(bool *) arg = true;
+	return false;
 }
 
-/* pg_history_has_chunks(): whether the store has a chunk this transaction sees */
+/*
+ * pg_history_has_chunks(): whether the store has a chunk as of the snapshot
+ * (a pointer names one), the index read only as far as the first
+ */
 Datum
 pg_history_has_chunks(PG_FUNCTION_ARGS)
 {
 	Relation	idx = relation_open(ChunkStoreIndexRelid(), AccessShareLock);
 	bool		any = false;
 
-	ChunkIndex->visit(idx, note_chunk, &any);
+	ChunkIndex->visit_as_of(idx, GetActiveSnapshot(), note_chunk, &any);
 	relation_close(idx, AccessShareLock);
 	PG_RETURN_BOOL(any);
 }
 
 /*
- * The INSTEAD OF INSERT trigger of pg_history.chunk_restore: puts the row's
- * chunk, its bytes checked against its name (hash, data)
+ * The INSTEAD OF INSERT trigger of pg_history.chunk_restore: a row of
+ * (hash, data, name) puts its chunk, its bytes checked against its name, or,
+ * with a name and no bytes, inserts its pointer
  */
 Datum
 pg_history_chunk_restore(PG_FUNCTION_ARGS)
@@ -234,11 +272,13 @@ pg_history_chunk_restore(PG_FUNCTION_ARGS)
 	TriggerData *td = (TriggerData *) fcinfo->context;
 	HeapTuple	tuple;
 	TupleDesc	desc;
-	bool		isnull;
+	Datum		hash_d,
+				data_d,
+				name_d;
+	bool		hash_null,
+				data_null,
+				name_null;
 	bytea	   *hash;
-	bytea	   *data;
-	Relation	log;
-	Relation	idx;
 
 	if (!CALLED_AS_TRIGGER(fcinfo) || !TRIGGER_FIRED_INSTEAD(td->tg_event) ||
 		!TRIGGER_FIRED_BY_INSERT(td->tg_event) || !TRIGGER_FIRED_FOR_ROW(td->tg_event) ||
@@ -248,21 +288,39 @@ pg_history_chunk_restore(PG_FUNCTION_ARGS)
 				 errmsg("pg_history_chunk_restore() is pg_history.chunk_restore's trigger alone")));
 	tuple = td->tg_trigtuple;
 	desc = RelationGetDescr(td->tg_relation);
-	hash = DatumGetByteaPP(heap_getattr(tuple, 1, desc, &isnull));
-	if (isnull || VARSIZE_ANY_EXHDR(hash) != CHUNK_HASH_LEN)
+	hash_d = heap_getattr(tuple, 1, desc, &hash_null);
+	data_d = heap_getattr(tuple, 2, desc, &data_null);
+	name_d = heap_getattr(tuple, 3, desc, &name_null);
+	if (hash_null || VARSIZE_ANY_EXHDR(DatumGetByteaPP(hash_d)) != CHUNK_HASH_LEN)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("a chunk's hash is %d bytes", CHUNK_HASH_LEN)));
-	data = DatumGetByteaPP(heap_getattr(tuple, 2, desc, &isnull));
-	if (isnull)
+	hash = DatumGetByteaPP(hash_d);
+	if (data_null == name_null)
 		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("a chunk restored has no bytes")));
-	log = relation_open(ChunkStoreLogRelid(), RowExclusiveLock);
-	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
-	(void) ChunkStorePut(log, idx, (const uint8 *) VARDATA_ANY(hash),
-						 VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
-	relation_close(idx, NoLock);
-	relation_close(log, NoLock);
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a row restored is a chunk's (its bytes) or a pointer's (its name), one of them")));
+	if (!data_null)
+	{
+		bytea	   *data = DatumGetByteaPP(data_d);
+		Relation	log = relation_open(ChunkStoreLogRelid(), RowExclusiveLock);
+		Relation	idx = relation_open(ChunkStoreIndexRelid(), RowExclusiveLock);
+
+		(void) ChunkStorePut(log, idx, (const uint8 *) VARDATA_ANY(hash),
+							 VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
+		relation_close(idx, NoLock);
+		relation_close(log, NoLock);
+	}
+	else
+	{
+		Oid			types[2] = {TEXTOID, BYTEAOID};
+		Datum		args[2] = {name_d, PointerGetDatum(hash)};
+
+		SPI_connect();
+		if (SPI_execute_with_args("INSERT INTO pg_history.pointers (name, hash) VALUES ($1, $2)",
+								  2, types, args, NULL, false, 0) != SPI_OK_INSERT)
+			elog(ERROR, "could not restore a history store's pointer");
+		SPI_finish();
+	}
 	return PointerGetDatum(tuple);
 }
