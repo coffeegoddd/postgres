@@ -11,8 +11,8 @@
  * else refuses, as does any rewrite of the relation (make_new_heap()),
  * which would copy no tuples and so leave the log empty.  pg_dump writes
  * the relation and none of its bytes, its table data being its tuples;
- * publications leave it out.  The log's changes are WAL-logged with
- * generic records.
+ * publications leave it out.  The log's changes are WAL-logged as records
+ * of its own resource manager, ChunkLog (prolly/chunk_xlog.h).
  *
  * Portions Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -1439,14 +1439,24 @@ chunk_log_redo(XLogReaderState *record)
 	{
 		/*
 		 * (the free space map as the primary keeps it, for after promotion:
-		 * a page all dead is free, one made afresh to append to is not)
+		 * a page all dead is free, its upper levels told so, as the primary
+		 * does, or a search from the root would not find it; one made afresh
+		 * to append to is not.  With checksums, a standby's map pages are
+		 * not written out for this, as with heap's, and VACUUM after
+		 * promotion puts every free page in again.)
 		 */
 		bool		data_page = blk != META_BLOCK;
 		bool		freed = data_page && page_free(BufferGetPage(buf));
 
 		UnlockReleaseBuffer(buf);
 		if (freed)
+		{
+			Relation	rel = CreateFakeRelcacheEntry(locator);
+
 			XLogRecordPageWithFreeSpace(locator, blk, AREA);
+			FreeSpaceMapVacuumRange(rel, blk, blk + 1);
+			FreeFakeRelcacheEntry(rel);
+		}
 		else if (info == XLOG_CHUNK_LOG_INIT_PAGE)
 			XLogRecordPageWithFreeSpace(locator, blk, 0);
 	}

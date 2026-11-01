@@ -84,25 +84,48 @@ $primary->stop('immediate');
 $primary->start;
 is($primary->safe_psql('postgres', $all), $want, 'and crash recovery');
 
-# a standby promoted: the free space map its replay kept has the freed pages
+# a standby promoted: the free space map its replay kept has the pages
+# freed, found from its root.  A standby from a backup whose map has no
+# page free (every one used, and VACUUM telling the map's root); then pages
+# freed in the log's middle, its tail kept: no truncation replayed, whose
+# map vacuum would tell the root too.
+$standby->stop;
+my (undef, $nfree) = split / /, $primary->safe_psql('postgres', $space);
+$primary->safe_psql('postgres', qq{
+	INSERT INTO sums SELECT i, 900 FROM generate_series(4001, 4000 + $nfree * 9 + 20) i;
+	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i > 4000;
+});
+$primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index');
+is((split / /, $primary->safe_psql('postgres', $space))[1], '0', 'every page in use');
+$primary->backup('mid');
+my $standby2 = PostgreSQL::Test::Cluster->new('log_wal_standby2');
+$standby2->init_from_backup($primary, 'mid', has_streaming => 1);
+$standby2->start;
+$primary->safe_psql('postgres', q{
+	INSERT INTO sums SELECT i, 900 FROM generate_series(3001, 3010) i;
+	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i BETWEEN 3001 AND 3010;
+});
+my ($pages_kept) = split / /, $primary->safe_psql('postgres', $space);
 $primary->safe_psql('postgres', q{
 	SELECT sum(test_chunk_free('pg_history.chunks', 'pg_history.chunk_index',
-		h(chunk(i, len)))) FROM sums WHERE i > 1000;
-	DELETE FROM sums WHERE i > 1000;
+		h(chunk(i, len)))) FROM sums WHERE i > 4000;
+	DELETE FROM sums WHERE i > 4000;
 });
 $primary->safe_psql('postgres', 'VACUUM pg_history.chunk_index; CREATE TABLE flush ()');
-$primary->wait_for_replay_catchup($standby);
-$standby->promote;
-my ($pages, $free) = split / /, $standby->safe_psql('postgres', $space);
+my ($pages, $free) = split / /, $primary->safe_psql('postgres', $space);
+is($pages, $pages_kept, 'no tail cut: the pages freed are in the log\'s middle');
+$primary->wait_for_replay_catchup($standby2);
+$standby2->promote;
+($pages, $free) = split / /, $standby2->safe_psql('postgres', $space);
 cmp_ok($free, '>', 0, 'the promoted standby has pages freed');
-$standby->safe_psql('postgres', q{
+$standby2->safe_psql('postgres', q{
 	INSERT INTO sums SELECT i, 900 FROM generate_series(2001, 2005) i;
-	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i > 2000;
+	SELECT count(*) FILTER (WHERE put(chunk(i, len))) FROM sums WHERE i BETWEEN 2001 AND 2005;
 });
-my ($pages2, $free2) = split / /, $standby->safe_psql('postgres', $space);
+my ($pages2, $free2) = split / /, $standby2->safe_psql('postgres', $space);
 is($pages2, $pages, 'and puts there use them again, the log not growing');
 cmp_ok($free2, '<', $free, 'fewer pages free');
 
-$standby->stop;
+$standby2->stop;
 $primary->stop;
 done_testing();
