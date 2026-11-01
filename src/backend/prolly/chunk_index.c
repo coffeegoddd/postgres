@@ -1296,6 +1296,29 @@ page_insert(Relation idx, ChunkIndexEntry *entry, ChunkReserveFn reserve,
 	return true;
 }
 
+/* whether this transaction's own change of a chunk has drefs and droots in it */
+static bool
+own_change_covers(Relation idx, Buffer primary, BlockNumber own_blk, int own_at,
+				  int32 drefs, int32 droots)
+{
+	ChunkIndexEntry own;
+
+	if (!BlockNumberIsValid(own_blk))
+		return false;
+	if (own_blk == BufferGetBlockNumber(primary))
+		own = *page_entry(BufferGetPage(primary), own_at);
+	else
+	{
+		Buffer		buf = ReadBuffer(idx, own_blk);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		own = *page_entry(BufferGetPage(buf), own_at);
+		UnlockReleaseBuffer(buf);
+	}
+	return (int64) (int32) own.refs + drefs >= 0 &&
+		(int64) (int32) own.roots + droots >= 0;
+}
+
 static bool
 page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 			ChunkIndexEntry *out)
@@ -1347,9 +1370,12 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 
 		/*
 		 * (a decrease waits for another's decreases, as a row's update waits
-		 * for another's: two taking the last root away would both see it)
+		 * for another's: two taking the last root away would both see it.
+		 * One taking back no more than this transaction's own increase does
+		 * not: no other sees what it takes back)
 		 */
-		if ((drefs < 0 || droots < 0) && TransactionIdIsValid(running))
+		if ((drefs < 0 || droots < 0) && TransactionIdIsValid(running) &&
+			!own_change_covers(idx, primary, own_blk, own_at, drefs, droots))
 		{
 			UnlockReleaseBuffer(primary);
 			XactLockTableWait(running, NULL, NULL, XLTW_None);
@@ -1458,7 +1484,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 	 * another's freer sees no such chunk, its entry not committed)
 	 */
 	if ((int64) out->refs + drefs != 0 || (int64) out->roots + droots != 0 ||
-		TransactionIdIsValid(running) || TransactionIdIsCurrentTransactionId(out->xmin) ||
+		TransactionIdIsValid(running) || ChunkEntryIsMine(out) ||
 		(held && held(hash)))
 	{
 		release_found(primary, found);

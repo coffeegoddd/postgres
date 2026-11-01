@@ -82,7 +82,8 @@ typedef struct ChunkStoreRoutine
 
 	/*
 	 * Stores the chunk the bytes are unless the store has it (true if it
-	 * stored it), its name in *hash, and pins it.  A strong reference to a
+	 * stored it), its name in *hash, and holds it until the transaction
+	 * ends (pinned, or held by its entry).  A strong reference to a
 	 * chunk the store hasn't is an error; each one is counted, which holds
 	 * the chunk it names (a put refused holds none).
 	 */

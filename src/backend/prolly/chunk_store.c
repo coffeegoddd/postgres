@@ -258,7 +258,7 @@ found_pinned(Relation idx, const uint8 *hash)
 		return false;
 
 	/* (this transaction's own, put before: held by it, no pin needed) */
-	if (TransactionIdIsCurrentTransactionId(e.xmin))
+	if (ChunkEntryIsMine(&e))
 		return true;
 	ChunkPin(hash);
 	return ChunkIndex->lookup(idx, hash, &e);
