@@ -61,6 +61,42 @@ FROM (SELECT g, convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 5
 SELECT count(*) FILTER (WHERE test_chunk_put('cl', 'ci', h(d), d)) AS stored_again
 FROM (SELECT convert_to('chunk ' || g, 'UTF8') AS d FROM generate_series(1, 50000, 2) g) s;
 
+-- an aborted transaction's chunk is nobody's: found by it, then by none,
+-- and put again by another
+BEGIN;
+SELECT test_chunk_put('cl', 'ci', h('\x0a'), '\x0a') AS stored;
+SELECT test_chunk_has('cl', 'ci', h('\x0a')) AS has_own;
+ROLLBACK;
+SELECT test_chunk_has('cl', 'ci', h('\x0a')) AS has_after_abort;
+SELECT test_chunk_index_adjust('ci', h('\x0a'), 1, 0) IS NULL AS no_counts;
+SELECT test_chunk_put('cl', 'ci', h('\x0a'), '\x0a') AS stored_again,
+	test_chunk_get('cl', 'ci', h('\x0a')) AS got;
+-- and a subtransaction's
+BEGIN;
+SAVEPOINT s;
+SELECT test_chunk_put('cl', 'ci', h('\x0b'), '\x0b') AS stored;
+ROLLBACK TO s;
+SELECT test_chunk_has('cl', 'ci', h('\x0b')) AS has_after_rollback_to;
+COMMIT;
+
+-- VACUUM takes aborted transactions' entries out, notes the rest
+-- committed, and advances the index's relfrozenxid
+CREATE TABLE ci3 () USING prolly_chunk_index;
+SELECT relfrozenxid <> '0'::xid AS has_frozenxid FROM pg_class WHERE relname = 'ci3';
+BEGIN;
+SELECT count(test_chunk_put('cl', 'ci3', h(d), d)) AS aborted
+FROM (SELECT convert_to('gone ' || g, 'UTF8') AS d FROM generate_series(1, 300) g) s;
+ROLLBACK;
+SELECT count(test_chunk_put('cl', 'ci3', h(d), d)) AS committed
+FROM (SELECT convert_to('kept ' || g, 'UTF8') AS d FROM generate_series(1, 300) g) s;
+SELECT entries AS before_vacuum FROM test_chunk_index_shape('ci3');
+VACUUM ci3;
+SELECT entries AS after_vacuum FROM test_chunk_index_shape('ci3');
+SELECT count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('kept ' || g, 'UTF8')))) AS kept,
+	count(*) FILTER (WHERE test_chunk_has('cl', 'ci3', h(convert_to('gone ' || g, 'UTF8')))) AS gone
+FROM generate_series(1, 300) g;
+DROP TABLE ci3;
+
 -- truncated, it starts again
 TRUNCATE ci;
 SELECT * FROM test_chunk_index_shape('ci');

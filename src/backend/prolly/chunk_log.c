@@ -43,6 +43,7 @@
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 /* ------------------------------------------------------------ the pages */
 
@@ -661,8 +662,18 @@ ci_relation_set_new_filelocator(Relation rel,
 	SMgrRelation srel = create_store_storage(rel, newrlocator, persistence,
 											 freezeXid, minmulti);
 
+	/* (its entries name the transactions that inserted them) */
+	*freezeXid = RecentXmin;
 	ChunkIndexInitStorage(srel, XLogIsNeeded());
 	smgrclose(srel);
+}
+
+/* a chunk index's VACUUM: aborted transactions' entries out, the rest frozen */
+static void
+ci_relation_vacuum(Relation rel, const VacuumParams *params,
+				   BufferAccessStrategy bstrategy)
+{
+	ChunkIndexVacuum(rel);
 }
 
 static void
@@ -868,6 +879,7 @@ index_routine(void)
 			ci_relation_set_new_filelocator;
 		chunk_index_routine.relation_nontransactional_truncate =
 			ci_relation_nontransactional_truncate;
+		chunk_index_routine.relation_vacuum = ci_relation_vacuum;
 		chunk_index_routine_made = true;
 	}
 	return &chunk_index_routine;

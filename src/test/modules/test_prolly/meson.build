@@ -59,6 +59,7 @@ tests += {
   'isolation': {
     'specs': [
       'bmap_shared_writers',
+      'chunk_index_put_wait',
     ],
   },
   'tap': {

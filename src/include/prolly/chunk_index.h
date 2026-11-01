@@ -7,10 +7,16 @@
  * A ChunkIndexRoutine keeps one entry per chunk: its hash, the place and
  * length of its bytes in the log, the strong references to it from other
  * chunks (refs) and the references from outside the store (roots).
- * Entries and their counts are changed in place, WAL-logged, not
- * transactionally: an entry is there from when it is inserted, whatever
- * becomes of the transaction inserting it, and a count changed is changed.
- * A change gives its transaction an id, so that its commit flushes it.
+ * An entry is the chunk's once the transaction inserting it commits: until
+ * then only that transaction finds it, and if it aborts (or was running at
+ * a crash) nobody does, and inserts and VACUUM take the entry out.  An
+ * insert of a chunk another transaction is inserting waits for it to end,
+ * as an insert into a unique index does.  An entry's counts are changed in
+ * place, WAL-logged, not transactionally.  A change gives its transaction
+ * an id, so that its commit flushes it.  What is learned of the inserting
+ * transaction is kept in the entry's flags, as heap tuples keep hint bits;
+ * VACUUM writes it to every entry (WAL-logged), so that an entry needs the
+ * commit log only until the index's relfrozenxid passes it.
  *
  * PageChunkIndex keeps the entries in a relation of the prolly_chunk_index
  * table access method, by linear hashing:
@@ -47,7 +53,13 @@ typedef struct ChunkIndexEntry
 	uint64		loc;			/* where its bytes begin in the log */
 	uint32		refs;			/* strong references from chunks */
 	uint32		roots;			/* references from outside the store */
+	TransactionId xmin;			/* the transaction that inserted it */
+	uint16		flags;			/* CHUNK_ENTRY_*: what is known of xmin */
+	uint16		unused;
 } ChunkIndexEntry;
+
+#define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed */
+#define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted (or crashed) */
 
 typedef struct ChunkIndexRoutine
 {
@@ -80,6 +92,13 @@ extern bool RelationIsChunkIndex(Relation rel);
 
 /* For the access method: a new index's pages, written to its storage. */
 extern void ChunkIndexInitStorage(SMgrRelation srel, bool use_wal);
+
+/*
+ * For the access method: takes out the entries of transactions that
+ * aborted, notes on every other whether its transaction committed, and
+ * advances the relation's relfrozenxid.
+ */
+extern void ChunkIndexVacuum(Relation idx);
 
 /*
  * For tests: the buckets there are, the index's pages, and the entries on

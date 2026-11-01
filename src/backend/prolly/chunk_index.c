@@ -37,17 +37,23 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "prolly/chunk_index.h"
 #include "storage/bufmgr.h"
 #include "storage/bulk_write.h"
+#include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
 #define CHUNK_INDEX_MAGIC	0x50434958	/* "PCIX" */
-#define CHUNK_INDEX_VERSION	1
+#define CHUNK_INDEX_VERSION	2
 
 #define INDEX_PAGE_META		1
 #define INDEX_PAGE_DIR		2
@@ -102,8 +108,49 @@ typedef struct IndexCache
 	BlockNumber dir[MAX_DIR];
 } IndexCache;
 
-StaticAssertDecl(sizeof(ChunkIndexEntry) == 40,
-				 "a chunk index entry is 40 bytes");
+StaticAssertDecl(sizeof(ChunkIndexEntry) == 48,
+				 "a chunk index entry is 48 bytes");
+
+typedef enum EntryState
+{
+	ENTRY_VISIBLE,				/* committed, or this transaction's */
+	ENTRY_IN_PROGRESS,			/* another transaction's, running */
+	ENTRY_DEAD,					/* its transaction aborted */
+} EntryState;
+
+/*
+ * What the entry's inserting transaction is to this one, learned from the
+ * commit log and kept in the entry's flags as heap tuples keep hint bits
+ * (not WAL-logged, and set under a share lock): an abort always, a commit
+ * only once its record is flushed, or the page's own changes are after it,
+ * lest the page reach disk noting a commit a crash then loses.
+ */
+static EntryState
+entry_state(ChunkIndexEntry *e, Buffer buf)
+{
+	bool		committed;
+
+	if (e->flags & CHUNK_ENTRY_COMMITTED)
+		return ENTRY_VISIBLE;
+	if (e->flags & CHUNK_ENTRY_ABORTED)
+		return ENTRY_DEAD;
+	if (TransactionIdIsCurrentTransactionId(e->xmin))
+		return ENTRY_VISIBLE;
+	if (TransactionIdIsInProgress(e->xmin))
+		return ENTRY_IN_PROGRESS;
+	committed = TransactionIdDidCommit(e->xmin);
+	if (committed)
+	{
+		XLogRecPtr	commit_lsn = TransactionIdGetCommitLSN(e->xmin);
+
+		if (!XLogNeedsFlush(commit_lsn) || BufferGetLSNAtomic(buf) >= commit_lsn)
+			(void) BufferSetHintBits16(&e->flags,
+									   e->flags | CHUNK_ENTRY_COMMITTED, buf);
+	}
+	else
+		(void) BufferSetHintBits16(&e->flags, e->flags | CHUNK_ENTRY_ABORTED, buf);
+	return committed ? ENTRY_VISIBLE : ENTRY_DEAD;
+}
 
 /* ------------------------------------------------------------ the pages */
 
@@ -340,12 +387,24 @@ belongs(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
  * not the bucket's.  Notes in *space the first page with room, and in
  * *last the chain's last page.
  */
-static bool
+/*
+ * (a purge takes out entries not the bucket's, and those of transactions
+ * known to have aborted)
+ */
+static inline bool
+kept_by_purge(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks)
+{
+	return belongs(e, bucket, masks) && !(e->flags & CHUNK_ENTRY_ABORTED);
+}
+
+static EntryState
 find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		   uint32 bucket, const IndexCache *masks, bool purge,
 		   Buffer *found_buf, int *found_at,
-		   BlockNumber *space, BlockNumber *last)
+		   BlockNumber *space, BlockNumber *last, TransactionId *running)
 {
+	EntryState	result = ENTRY_DEAD;	/* (none found) */
+
 	Buffer		cur = primary;
 
 	if (space)
@@ -362,7 +421,7 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 			int			kept = 0;
 
 			for (int i = 0; i < n; i++)
-				if (belongs(page_entry(page, i), bucket, masks))
+				if (kept_by_purge(page_entry(page, i), bucket, masks))
 					kept++;
 			if (kept < n)
 			{
@@ -371,7 +430,7 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				int			k = 0;
 
 				for (int i = 0; i < n; i++)
-					if (belongs(page_entry(p, i), bucket, masks))
+					if (kept_by_purge(page_entry(p, i), bucket, masks))
 						*page_entry(p, k++) = *page_entry(p, i);
 				set_page_entries(p, k);
 				GenericXLogFinish(st);
@@ -382,12 +441,22 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
 
-			if (memcmp(e->hash, hash, CHUNK_HASH_LEN) == 0 &&
-				belongs(e, bucket, masks))
+			if (memcmp(e->hash, hash, CHUNK_HASH_LEN) != 0 ||
+				!belongs(e, bucket, masks))
+				continue;
+			switch (entry_state(e, cur))
 			{
-				*found_buf = cur;
-				*found_at = i;
-				return true;
+				case ENTRY_VISIBLE:
+					*found_buf = cur;
+					*found_at = i;
+					return ENTRY_VISIBLE;
+				case ENTRY_IN_PROGRESS:
+					if (running)
+						*running = e->xmin;
+					result = ENTRY_IN_PROGRESS;
+					break;
+				case ENTRY_DEAD:
+					break;
 			}
 		}
 		if (space && *space == InvalidBlockNumber && n < PER_PAGE)
@@ -399,7 +468,7 @@ find_entry(Relation rel, Buffer primary, int mode, const uint8 *hash,
 				*last = BufferGetBlockNumber(cur);
 			if (cur != primary)
 				UnlockReleaseBuffer(cur);
-			return false;
+			return result;
 		}
 		if (cur != primary)
 			UnlockReleaseBuffer(cur);
@@ -651,7 +720,7 @@ page_lookup(Relation idx, const uint8 *hash, ChunkIndexEntry *out)
 	bool		hit;
 
 	hit = find_entry(idx, primary, BUFFER_LOCK_SHARE, hash, bucket, &masks,
-					 false, &found, &at, NULL, NULL);
+					 false, &found, &at, NULL, NULL, NULL) == ENTRY_VISIBLE;
 	if (hit)
 	{
 		*out = *page_entry(BufferGetPage(found), at);
@@ -673,16 +742,33 @@ page_insert(Relation idx, ChunkIndexEntry *entry)
 	BlockNumber space;
 	BlockNumber last;
 	bool		grew = false;
+	TransactionId running;
 
 	PreventCommandIfReadOnly("insert into a chunk index");
-	(void) GetCurrentTransactionId();
-	primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, entry->hash, bucket,
-				   &masks, true, &found, &at, &space, &last))
+	entry->xmin = GetCurrentTransactionId();
+	entry->flags = 0;
+	entry->unused = 0;
+	for (;;)
 	{
-		*entry = *page_entry(BufferGetPage(found), at);
-		release_found(primary, found);
-		return false;
+		primary = lock_bucket(idx, entry->hash, BUFFER_LOCK_EXCLUSIVE, &bucket,
+							  &masks);
+		switch (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, entry->hash,
+						   bucket, &masks, true, &found, &at, &space, &last,
+						   &running))
+		{
+			case ENTRY_VISIBLE:
+				*entry = *page_entry(BufferGetPage(found), at);
+				release_found(primary, found);
+				return false;
+			case ENTRY_IN_PROGRESS:
+				/* (as for a unique index: whether it is there is up to it) */
+				UnlockReleaseBuffer(primary);
+				XactLockTableWait(running, NULL, NULL, XLTW_None);
+				continue;
+			case ENTRY_DEAD:
+				break;
+		}
+		break;
 	}
 
 	if (BlockNumberIsValid(space))
@@ -779,8 +865,8 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 	PreventCommandIfReadOnly("change a chunk index");
 	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	if (!find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-					false, &found, &at, NULL, NULL))
+	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
 	{
 		UnlockReleaseBuffer(primary);
 		return false;
@@ -821,8 +907,8 @@ page_remove(Relation idx, const uint8 *hash)
 	PreventCommandIfReadOnly("change a chunk index");
 	(void) GetCurrentTransactionId();
 	primary = lock_bucket(idx, hash, BUFFER_LOCK_EXCLUSIVE, &bucket, &masks);
-	if (!find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
-					false, &found, &at, NULL, NULL))
+	if (find_entry(idx, primary, BUFFER_LOCK_EXCLUSIVE, hash, bucket, &masks,
+				   false, &found, &at, NULL, NULL, NULL) != ENTRY_VISIBLE)
 	{
 		UnlockReleaseBuffer(primary);
 		return false;
@@ -889,6 +975,84 @@ ChunkIndexInitStorage(SMgrRelation srel, bool use_wal)
 		smgr_bulk_write(bulk, 2 + b, buf, true);
 	}
 	smgr_bulk_finish(bulk);
+}
+
+void
+ChunkIndexVacuum(Relation idx)
+{
+	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
+	IndexCache *cache = load_cache(idx);
+	uint32		nbuckets = cache->maxbucket + 1;
+	IndexCache	masks = *cache;
+
+	/*
+	 * Every transaction older than frozen has ended: past its bucket's
+	 * pages, each of its entries is out or noted committed, and none needs
+	 * the commit log again.  (A split meanwhile only moves entries, flags
+	 * and all; buckets made after the copy of the meta page was read are
+	 * made of entries of buckets before them.)
+	 */
+	for (uint32 b = 0; b < nbuckets; b++)
+	{
+		BlockNumber blk = bucket_block(idx, cache, b);
+		Buffer		primary = ReadBuffer(idx, blk);
+		Buffer		cur;
+
+		LockBuffer(primary, BUFFER_LOCK_EXCLUSIVE);
+		check_ipage(idx, blk, BufferGetPage(primary), INDEX_PAGE_BUCKET);
+		if (((IndexPageOpaque) PageGetSpecialPointer(BufferGetPage(primary)))->split_at > masks.maxbucket)
+			masks = *load_cache(idx);
+		cur = primary;
+		for (;;)
+		{
+			Page		page = BufferGetPage(cur);
+			BlockNumber next = ((IndexPageOpaque) PageGetSpecialPointer(page))->next;
+			int			n = page_entries(page);
+			bool		change = false;
+
+			for (int i = 0; i < n && !change; i++)
+			{
+				ChunkIndexEntry *e = page_entry(page, i);
+				EntryState	state = entry_state(e, cur);
+
+				change = !belongs(e, b, &masks) || state == ENTRY_DEAD ||
+					(state == ENTRY_VISIBLE && !(e->flags & CHUNK_ENTRY_COMMITTED));
+			}
+			if (change)
+			{
+				GenericXLogState *st = GenericXLogStart(idx);
+				Page		p = GenericXLogRegisterBuffer(st, cur, 0);
+				int			k = 0;
+
+				/* (each entry's state from the buffer's page, not the copy) */
+				for (int i = 0; i < n; i++)
+				{
+					EntryState	state = entry_state(page_entry(page, i), cur);
+					ChunkIndexEntry e = *page_entry(p, i);
+
+					if (!belongs(&e, b, &masks) || state == ENTRY_DEAD)
+						continue;
+					if (state == ENTRY_VISIBLE)
+						e.flags |= CHUNK_ENTRY_COMMITTED;
+					*page_entry(p, k++) = e;
+				}
+				set_page_entries(p, k);
+				GenericXLogFinish(st);
+			}
+			if (cur != primary)
+				UnlockReleaseBuffer(cur);
+			if (!BlockNumberIsValid(next))
+				break;
+			CHECK_FOR_INTERRUPTS();
+			cur = ReadBuffer(idx, next);
+			LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+			check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
+		}
+		UnlockReleaseBuffer(primary);
+	}
+
+	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), 0, 0, 0, false,
+						frozen, InvalidMultiXactId, NULL, NULL, false);
 }
 
 void
