@@ -104,6 +104,13 @@ typedef struct BranchCatalogCopyRoutine
 extern PGDLLIMPORT const BranchCatalogCopyRoutine *BranchCatalogCopy;
 extern PGDLLIMPORT const BranchCatalogCopyRoutine DependencyBranchCatalogCopy;
 
+/*
+ * The branch schema names resolve on now: the session's, or the one
+ * referential integrity resolves a constraint's query on
+ * (CatalogBranchResolveAs()).
+ */
+extern int32 CatalogBranchOfNames(void);
+
 /* The namespace named nspname this session sees: its branch's, else shared. */
 extern HeapTuple SearchNamespaceByName(const char *nspname);
 extern Oid	NamespaceOidByName(const char *nspname);

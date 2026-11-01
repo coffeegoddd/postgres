@@ -87,6 +87,21 @@ SELECT pubf.first_v();
 SET catalog_branch = :b1;
 SELECT pubf.first_v();
 
+-- a branch change discards no cached plan, but a plan is planned again
+-- when used on another branch than its names were resolved on, even for a
+-- schema-qualified name the search path doesn't name
+SET plan_cache_mode = force_generic_plan;
+SET catalog_branch = :b1;
+PREPARE qual AS SELECT count(*) FROM app.t;
+EXECUTE qual;
+SET catalog_branch = :b2;
+INSERT INTO app.t VALUES (21, 2), (22, 2);
+EXECUTE qual;
+SET catalog_branch = :b1;
+EXECUTE qual;
+DEALLOCATE qual;
+RESET plan_cache_mode;
+
 DROP SCHEMA app CASCADE;
 SET catalog_branch = :b2;
 DROP SCHEMA app CASCADE;

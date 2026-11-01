@@ -135,6 +135,35 @@ SELECT pubf.first_v();
       10
 (1 row)
 
+-- a branch change discards no cached plan, but a plan is planned again
+-- when used on another branch than its names were resolved on, even for a
+-- schema-qualified name the search path doesn't name
+SET plan_cache_mode = force_generic_plan;
+SET catalog_branch = :b1;
+PREPARE qual AS SELECT count(*) FROM app.t;
+EXECUTE qual;
+ count 
+-------
+     1
+(1 row)
+
+SET catalog_branch = :b2;
+INSERT INTO app.t VALUES (21, 2), (22, 2);
+EXECUTE qual;
+ count 
+-------
+     3
+(1 row)
+
+SET catalog_branch = :b1;
+EXECUTE qual;
+ count 
+-------
+     1
+(1 row)
+
+DEALLOCATE qual;
+RESET plan_cache_mode;
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 9 other objects
 DETAIL:  drop cascades to table app.t
