@@ -7,6 +7,7 @@ backend_sources += files(
   'branch_filter.c',
   'chunk_index.c',
   'chunk_log.c',
+  'chunk_pin.c',
   'chunk_store.c',
   'registry.c',
 )

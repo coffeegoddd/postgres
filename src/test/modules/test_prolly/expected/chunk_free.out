@@ -1,0 +1,252 @@
+-- Freeing: a chunk nothing holds is freed, and the chunks its references
+-- alone held with it, in the freeing transaction: gone if it commits,
+-- all there if it aborts.  Pins hold a chunk too.  A chunk freed and put
+-- again starts with nothing of the one before.
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+NOTICE:  extension "test_prolly" already exists, skipping
+SELECT test_chunk_format_refs(true);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+
+CREATE TABLE fl () USING prolly_chunks;
+CREATE TABLE fi () USING prolly_chunk_index;
+CREATE FUNCTION h(d bytea) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS 'SELECT substr(sha256(d), 1, 20)';
+CREATE FUNCTION node(tag text, VARIADIC kids bytea[]) RETURNS bytea LANGUAGE sql IMMUTABLE
+	AS $$SELECT '\x52'::bytea || set_byte('\x00'::bytea, 0, cardinality(kids))
+		|| (SELECT string_agg(h(k), ''::bytea ORDER BY o) FROM unnest(kids) WITH ORDINALITY u(k, o))
+		|| convert_to(tag, 'UTF8')$$;
+CREATE FUNCTION put(d bytea) RETURNS bool LANGUAGE sql
+	AS $$SELECT test_chunk_put('fl', 'fi', h(d), d)$$;
+CREATE FUNCTION has(d bytea) RETURNS bool LANGUAGE sql
+	AS $$SELECT test_chunk_has('fl', 'fi', h(d))$$;
+CREATE FUNCTION free(d bytea) RETURNS int8 LANGUAGE sql
+	AS $$SELECT test_chunk_free('fl', 'fi', h(d))$$;
+CREATE FUNCTION tree() RETURNS bool LANGUAGE sql AS $$
+	SELECT put('\x61') AND put('\x62') AND put(node('p', '\x61', '\x62'))
+		AND put(node('q', node('p', '\x61', '\x62')))
+		AND test_chunk_ref_root('fi', h(node('q', node('p', '\x61', '\x62')))) IS NOT NULL$$;
+-- a tree, q -> p -> a, b, with a root on q: nothing of it is free
+SELECT tree() AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT free('\x61') AS a_held, free(node('q', node('p', '\x61', '\x62'))) AS q_rooted;
+ a_held | q_rooted 
+--------+----------
+      0 |        0
+(1 row)
+
+-- the root let go of, freeing q frees the tree
+SELECT test_chunk_unref_root('fi', h(node('q', node('p', '\x61', '\x62')))) IS NOT NULL AS unrooted;
+ unrooted 
+----------
+ t
+(1 row)
+
+SELECT free(node('q', node('p', '\x61', '\x62'))) AS freed;
+ freed 
+-------
+     4
+(1 row)
+
+SELECT has('\x61') AS a, has('\x62') AS b, has(node('p', '\x61', '\x62')) AS p,
+	has(node('q', node('p', '\x61', '\x62'))) AS q;
+ a | b | p | q 
+---+---+---+---
+ f | f | f | f
+(1 row)
+
+SELECT ok, chunks, unheld FROM test_chunk_check('fl', 'fi');
+ ok | chunks | unheld 
+----+--------+--------
+ t  |      0 |      0
+(1 row)
+
+-- freed in a transaction that rolls back, all of it is there after
+SELECT tree() AS made_again;
+ made_again 
+------------
+ t
+(1 row)
+
+SELECT test_chunk_unref_root('fi', h(node('q', node('p', '\x61', '\x62')))) IS NOT NULL AS unrooted;
+ unrooted 
+----------
+ t
+(1 row)
+
+BEGIN;
+SELECT free(node('q', node('p', '\x61', '\x62'))) AS freed;
+ freed 
+-------
+     4
+(1 row)
+
+SELECT has('\x61') AS a_in;
+ a_in 
+------
+ f
+(1 row)
+
+ROLLBACK;
+SELECT has('\x61') AS a, has(node('q', node('p', '\x61', '\x62'))) AS q,
+	(test_chunk_index_entry('fi', h('\x61'))).refs AS a_refs;
+ a | q | a_refs 
+---+---+--------
+ t | t |      1
+(1 row)
+
+SELECT ok, chunks, unheld FROM test_chunk_check('fl', 'fi');
+ ok | chunks | unheld 
+----+--------+--------
+ t  |      4 |      1
+(1 row)
+
+SELECT free(node('q', node('p', '\x61', '\x62'))) AS freed;
+ freed 
+-------
+     4
+(1 row)
+
+-- a chunk another still names stays
+SELECT put('\x61') AND put(node('r', '\x61')) AND put(node('s', '\x61')) AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT free(node('r', '\x61')) AS freed, (test_chunk_index_entry('fi', h('\x61'))).refs AS a_refs;
+ freed | a_refs 
+-------+--------
+     1 |      1
+(1 row)
+
+SELECT free(node('s', '\x61')) AS freed, has('\x61') AS a;
+ freed | a 
+-------+---
+     2 | f
+(1 row)
+
+-- a pin holds a chunk until its transaction ends
+SELECT put('\x7a') AS z;
+ z 
+---
+ t
+(1 row)
+
+BEGIN;
+SELECT test_chunk_pin(h('\x7a'));
+ test_chunk_pin 
+----------------
+ 
+(1 row)
+
+SELECT free('\x7a') AS freed_pinned;
+ freed_pinned 
+--------------
+            0
+(1 row)
+
+COMMIT;
+SELECT free('\x7a') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+-- freed and put again, it starts afresh: none of its old changes count
+SELECT put('\x78') AS x;
+ x 
+---
+ t
+(1 row)
+
+SELECT test_chunk_ref_root('fi', h('\x78')) IS NOT NULL AS rooted;
+ rooted 
+--------
+ t
+(1 row)
+
+VACUUM fi;
+SELECT test_chunk_unref_root('fi', h('\x78')) IS NOT NULL AS unrooted;
+ unrooted 
+----------
+ t
+(1 row)
+
+SELECT free('\x78') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+SELECT put('\x78') AS x_again;
+ x_again 
+---------
+ t
+(1 row)
+
+SELECT refs, roots FROM test_chunk_index_entry('fi', h('\x78'));
+ refs | roots 
+------+-------
+    0 |     0
+(1 row)
+
+-- VACUUM takes freed chunks' entries out, and their changes
+SELECT free('\x78') AS freed;
+ freed 
+-------
+     1
+(1 row)
+
+VACUUM fi;
+SELECT entries, test_chunk_index_unfrozen('fi') AS unfrozen FROM test_chunk_index_shape('fi');
+ entries | unfrozen 
+---------+----------
+       0 |        0
+(1 row)
+
+SELECT ok, chunks, unheld FROM test_chunk_check('fl', 'fi');
+ ok | chunks | unheld 
+----+--------+--------
+ t  |      0 |      0
+(1 row)
+
+-- every chunk nothing holds, at once
+SELECT tree() AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT put('\x63') AS c;
+ c 
+---
+ t
+(1 row)
+
+SELECT test_chunk_free_unheld('fl', 'fi') AS freed_unheld;
+ freed_unheld 
+--------------
+            1
+(1 row)
+
+SELECT ok, chunks, unheld FROM test_chunk_check('fl', 'fi');
+ ok | chunks | unheld 
+----+--------+--------
+ t  |      4 |      0
+(1 row)
+
+DROP TABLE fl, fi;
+DROP FUNCTION tree(), free(bytea), has(bytea), put(bytea), node(text, bytea[]), h(bytea);
+SELECT test_chunk_format_refs(false);
+ test_chunk_format_refs 
+------------------------
+ 
+(1 row)
+

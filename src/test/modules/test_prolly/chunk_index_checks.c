@@ -18,6 +18,7 @@
 #include "funcapi.h"
 #include "prolly/chunk_format.h"
 #include "prolly/chunk_log.h"
+#include "prolly/chunk_pin.h"
 #include "prolly/chunk_store.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
@@ -36,6 +37,9 @@ PG_FUNCTION_INFO_V1(test_chunk_format_refs);
 PG_FUNCTION_INFO_V1(test_chunk_ref_root);
 PG_FUNCTION_INFO_V1(test_chunk_unref_root);
 PG_FUNCTION_INFO_V1(test_chunk_check);
+PG_FUNCTION_INFO_V1(test_chunk_free);
+PG_FUNCTION_INFO_V1(test_chunk_free_unheld);
+PG_FUNCTION_INFO_V1(test_chunk_pin);
 
 static Relation
 open_index(Oid relid, LOCKMODE mode)
@@ -299,4 +303,38 @@ test_chunk_check(PG_FUNCTION_ARGS)
 	else
 		nulls[3] = true;
 	return HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls));
+}
+
+/* test_chunk_free(log, idx, hash) returns int8: the chunks freed */
+Datum
+test_chunk_free(PG_FUNCTION_ARGS)
+{
+	Relation	log = open_log(PG_GETARG_OID(0), AccessShareLock);
+	Relation	idx = open_index(PG_GETARG_OID(1), RowExclusiveLock);
+	uint64		freed = ChunkStoreFree(log, idx, arg_hash(PG_GETARG_BYTEA_PP(2)), 1);
+
+	relation_close(idx, NoLock);
+	relation_close(log, AccessShareLock);
+	PG_RETURN_INT64((int64) freed);
+}
+
+/* test_chunk_free_unheld(log, idx) returns int8: the chunks freed */
+Datum
+test_chunk_free_unheld(PG_FUNCTION_ARGS)
+{
+	Relation	log = open_log(PG_GETARG_OID(0), AccessShareLock);
+	Relation	idx = open_index(PG_GETARG_OID(1), RowExclusiveLock);
+	uint64		freed = ChunkStoreFreeUnheld(log, idx);
+
+	relation_close(idx, NoLock);
+	relation_close(log, AccessShareLock);
+	PG_RETURN_INT64((int64) freed);
+}
+
+/* test_chunk_pin(hash): pins the chunk until the transaction ends */
+Datum
+test_chunk_pin(PG_FUNCTION_ARGS)
+{
+	ChunkPin(arg_hash(PG_GETARG_BYTEA_PP(0)));
+	PG_RETURN_VOID();
 }

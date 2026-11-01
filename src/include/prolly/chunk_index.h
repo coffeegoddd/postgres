@@ -51,11 +51,13 @@ typedef struct ChunkIndexEntry
 {
 	uint8		hash[CHUNK_HASH_LEN];
 	uint32		len;			/* the chunk's length */
-	uint64		loc;			/* where its bytes begin in the log */
+	uint64		loc;			/* where its bytes begin in the log (a
+								 * change's: its chunk's) */
 	uint32		refs;			/* strong references from chunks */
 	uint32		roots;			/* references from outside the store */
 	TransactionId xmin;			/* the transaction that inserted it */
-	TransactionId xmax;			/* the transaction that freed it, or 0 */
+	TransactionId xmax;			/* a chunk's: the transaction that freed it,
+								 * or 0; a change's: its chunk's xmin */
 	uint16		flags;			/* CHUNK_ENTRY_*: what is known of xmin */
 	uint16		kind;			/* CHUNK_KIND_* */
 	uint32		unused;
@@ -66,7 +68,14 @@ typedef struct ChunkIndexEntry
  * as signed numbers, to add to the chunk's once the change's transaction
  * commits.  The counts of a chunk are its entry's and its committed
  * changes' (and, to the transaction making them, its own); VACUUM adds
- * committed changes into the chunk's entry, and takes them out.
+ * committed changes into the chunk's entry, and takes them out.  A change
+ * names the entry it is of by the entry's xmin and loc, so that a chunk
+ * freed and put again starts with no changes of the one before.
+ *
+ * A chunk is freed by a transaction setting its entry's xmax: from then
+ * the chunk is nobody's to put or find but by waiting for that transaction
+ * (it is the chunk's again if it aborts), and once it commits the entry is
+ * dead, for VACUUM to take out.
  */
 #define CHUNK_KIND_CHUNK		0
 #define CHUNK_KIND_CHANGE		1
@@ -74,6 +83,8 @@ typedef struct ChunkIndexEntry
 #define CHUNK_ENTRY_COMMITTED	0x01	/* xmin committed (a hint) */
 #define CHUNK_ENTRY_ABORTED		0x02	/* xmin aborted, or crashed (a hint) */
 #define CHUNK_ENTRY_FROZEN		0x04	/* xmin committed, WAL-logged by VACUUM */
+#define CHUNK_ENTRY_XMAX_COMMITTED	0x08	/* xmax committed (a hint) */
+#define CHUNK_ENTRY_XMAX_ABORTED	0x10	/* xmax aborted, or crashed (a hint) */
 
 typedef struct ChunkIndexRoutine
 {
@@ -108,6 +119,16 @@ typedef struct ChunkIndexRoutine
 	void		(*visit) (Relation idx,
 						  void (*fn) (void *arg, const ChunkIndexEntry *e),
 						  void *arg);
+
+	/*
+	 * Marks the chunk's entry freed by this transaction, its entry (counts
+	 * and all) in *out, if nothing holds it: its counts zero, and no
+	 * other transaction changing them.  False otherwise.
+	 */
+	bool		(*free) (Relation idx, const uint8 *hash, ChunkIndexEntry *out);
+
+	/* Takes back this transaction's freeing of the chunk. */
+	void		(*unfree) (Relation idx, const uint8 *hash);
 
 	/* Removes hash's entry; false if there was none. */
 	bool		(*remove) (Relation idx, const uint8 *hash);

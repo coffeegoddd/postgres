@@ -77,6 +77,7 @@ PG_SHMEM_SUBSYSTEM(BmapShmemCallbacks)
 /* other modules that need some shared memory space */
 PG_SHMEM_SUBSYSTEM(BTreeShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(SyncScanShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(ChunkPinShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(AsyncShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(StatsShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(WaitEventCustomShmemCallbacks)

@@ -180,7 +180,7 @@ patch src/include/storage/buf_internals.h  1a  buffer flags and generation for p
 patch src/include/storage/bufmgr.h  1a  declares the buffer calls for storage that shares pages
 patch src/include/storage/lwlocklist.h  1a  the block map's replay lock is a built-in tranche, so it takes no slot extensions may use
 patch src/include/storage/smgr.h  1a  storage manager interface for storage that shares pages copy-on-write, and says which pages' free space a copy's free space map may not know
-patch src/include/storage/subsystemlist.h  1a  the block map's shared memory
+patch src/include/storage/subsystemlist.h  1a  the block map's shared memory; also (2) the history store's pins
 patch src/include/utils/funccache.h  1b  the branch in the compiled-function cache key
 patch src/include/utils/pgstat_internal.h  1a  the block map statistics kind's shared entry and callbacks
 patch src/include/utils/pgstat_kind.h  1a  PGSTAT_KIND_BLOCK_MAP, a variable-numbered kind after the fixed ones
