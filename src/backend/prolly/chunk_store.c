@@ -294,6 +294,141 @@ put_hashed(Relation log, Relation idx, const uint8 *hash, const void *data,
 	return true;
 }
 
+typedef struct PackChunk
+{
+	uint8		hash[CHUNK_HASH_LEN];	/* the key */
+	int			at;				/* its place in the pack */
+} PackChunk;
+
+uint64
+ChunkStorePutMany(Relation log, Relation idx, int n, const uint8 *hashes,
+				  const void *const *datas, const uint32 *lens)
+{
+	HASHCTL		ctl;
+	HTAB	   *pack;
+	bool	   *fresh = palloc0(Max(n, 1) * sizeof(bool));
+	RefList    *refs = palloc0(Max(n, 1) * sizeof(RefList));
+	uint64	   *locs = palloc(Max(n, 1) * sizeof(uint64));
+	Size		total = 0;
+	uint64		base = 0;
+	uint64		stored = 0;
+	ChunkIndexEntry e;
+
+	PreventCommandIfReadOnly("put a chunk");
+	for (int i = 0; i < n; i++)
+		check_hash(hashes + i * CHUNK_HASH_LEN, datas[i], lens[i], NULL, 0);
+	(void) GetCurrentTransactionId();
+
+	/* the pack's chunks the store hasn't, each once (pinned first, as a put's) */
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = sizeof(PackChunk);
+	ctl.hcxt = CurrentMemoryContext;
+	pack = hash_create("chunk pack", Max(n, 16), &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
+		PackChunk  *pc;
+		bool		found;
+
+		CHECK_FOR_INTERRUPTS();
+		ChunkPin(h);
+		pc = hash_search(pack, h, HASH_ENTER, &found);
+		if (found)
+			continue;
+		pc->at = i;
+		if (ChunkIndex->lookup(idx, h, &e))
+			continue;
+		fresh[i] = true;
+	}
+
+	/*
+	 * every chunk a new one references, pinned, the store's or the pack's
+	 * (a pack's chunks reference each other in any order)
+	 */
+	for (int i = 0; i < n; i++)
+	{
+		if (!fresh[i])
+			continue;
+		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs[i]);
+		for (int r = 0; r < refs[i].n; r++)
+		{
+			const uint8 *rh = refs[i].hashes + r * CHUNK_HASH_LEN;
+			PackChunk  *pc;
+
+			ChunkPin(rh);
+			pc = hash_search(pack, rh, HASH_FIND, NULL);
+			if ((pc == NULL || !fresh[pc->at]) && !ChunkIndex->lookup(idx, rh, &e))
+				ereport(ERROR,
+						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+						 errmsg("chunk %s references chunk %s, which the store does not have",
+								hash_text(hashes + i * CHUNK_HASH_LEN), hash_text(rh))));
+		}
+	}
+
+	ChunkIndex->bind_log(idx, RelationGetRelid(log), ChunkLog->stamp(log));
+
+	/* the new chunks' bytes appended together, in the pack's order */
+	for (int i = 0; i < n; i++)
+		if (fresh[i])
+			total += lens[i];
+	if (total > 0)
+	{
+		char	   *bytes = palloc_extended(total, MCXT_ALLOC_HUGE);
+		Size		off = 0;
+
+		for (int i = 0; i < n; i++)
+			if (fresh[i])
+			{
+				memcpy(bytes + off, datas[i], lens[i]);
+				locs[i] = off;
+				off += lens[i];
+			}
+		base = ChunkLog->append(log, bytes, total);
+		pfree(bytes);
+	}
+
+	/* their entries, then each edge a reference of the chunk it names */
+	for (int i = 0; i < n; i++)
+	{
+		if (!fresh[i])
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		memset(&e, 0, sizeof(e));
+		memcpy(e.hash, hashes + i * CHUNK_HASH_LEN, CHUNK_HASH_LEN);
+		e.len = lens[i];
+		e.loc = lens[i] > 0 ? base + locs[i] : 0;
+		if (!ChunkIndex->insert(idx, &e))
+		{
+			/* (another put it meanwhile: the bytes appended are no chunk's) */
+			if (lens[i] > 0)
+				ChunkLog->mark_dead(log, base + locs[i], lens[i]);
+			fresh[i] = false;
+			continue;
+		}
+		stored++;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		if (!fresh[i])
+			continue;
+		for (int r = 0; r < refs[i].n; r++)
+			if (!ChunkIndex->adjust(idx, refs[i].hashes + r * CHUNK_HASH_LEN, 1, 0, &e))
+				ereport(ERROR,
+						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+						 errmsg("chunk %s references chunk %s, which the store does not have",
+								hash_text(hashes + i * CHUNK_HASH_LEN),
+								hash_text(refs[i].hashes + r * CHUNK_HASH_LEN))));
+		if (refs[i].hashes)
+			pfree(refs[i].hashes);
+	}
+	hash_destroy(pack);
+	pfree(fresh);
+	pfree(refs);
+	pfree(locs);
+	return stored;
+}
+
 static void
 change_root(Relation idx, const uint8 *hash, int32 droots, ChunkIndexEntry *out)
 {

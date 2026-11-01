@@ -88,6 +88,17 @@ typedef struct ChunkStoreRoutine
 	bool		(*put) (ChunkStore *cs, const void *data, uint32 len,
 						uint8 *hash);
 
+	/*
+	 * A pack's chunks put at once, as a put of each, hashes[i] naming
+	 * datas[i] (bytes not their name's an error), but a chunk may reference
+	 * another of the pack, before or after it; those the store has, and
+	 * those named twice, put once.  How many it stored.  A store may put
+	 * them more cheaply than one at a time ("pages" appends their bytes
+	 * together, in one pass).
+	 */
+	uint64		(*put_many) (ChunkStore *cs, int n, const uint8 *hashes,
+							 const void *const *datas, const uint32 *lens);
+
 	/* A root taken or let go of; of a chunk the store hasn't, an error. */
 	void		(*ref_root) (ChunkStore *cs, const uint8 *hash);
 	void		(*unref_root) (ChunkStore *cs, const uint8 *hash);
@@ -157,6 +168,13 @@ static inline bool
 cs_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 {
 	return cs->routine->put(cs, data, len, hash);
+}
+
+static inline uint64
+cs_put_many(ChunkStore *cs, int n, const uint8 *hashes, const void *const *datas,
+			const uint32 *lens)
+{
+	return cs->routine->put_many(cs, n, hashes, datas, lens);
 }
 
 static inline void

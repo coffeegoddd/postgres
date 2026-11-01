@@ -97,6 +97,38 @@ SELECT pg_temp.put('cs-pair') AS leaf, pg_temp.put(pg_temp.parent('cs-pair')) AS
 SELECT pg_temp.free(pg_temp.parent('cs-pair'), 'cs-pair', pg_temp.parent('cs-pair'), 'cs-nowhere')
 	AS pair;
 
+-- a pack put at once: its parent first, a chunk the store has, one twice
+CREATE FUNCTION pg_temp.put_pack(VARIADIC ds bytea[]) RETURNS int8 LANGUAGE sql
+	AS $$SELECT test_cs_put_many(current_setting('test.store'),
+		ARRAY(SELECT pg_temp.h(d) FROM unnest(ds) WITH ORDINALITY u(d, o) ORDER BY o), ds)$$;
+SELECT pg_temp.put('cs-pack-old') AS old;
+SELECT pg_temp.put_pack(pg_temp.parent('cs-pack-a', 'cs-pack-b', 'cs-pack-old'), 'cs-pack-a',
+	'cs-pack-b', 'cs-pack-old', 'cs-pack-a') AS stored;
+SELECT pg_temp.refs('cs-pack-a') AS a, pg_temp.refs('cs-pack-b') AS b, pg_temp.refs('cs-pack-old') AS old,
+	convert_from(test_cs_get(:'store', pg_temp.h('cs-pack-b')), 'UTF8') AS get_b;
+SELECT test_cs_put_many(:'store', '{}', '{}') AS empty;
+-- refused, and none of it put: a reference to a chunk neither the store's
+-- nor the pack's, bytes not their name's
+SELECT pg_temp.refused($$SELECT pg_temp.put_pack('cs-pack-c', pg_temp.parent('cs-pack-c', 'cs-nowhere'))$$);
+SELECT pg_temp.has('cs-pack-c') AS c;
+SELECT pg_temp.refused($$SELECT test_cs_put_many(current_setting('test.store'),
+	ARRAY[pg_temp.h('cs-pack-d'), pg_temp.h('cs-pack-x')], ARRAY['cs-pack-d', 'cs-pack-y']::bytea[])$$);
+SELECT pg_temp.has('cs-pack-d') AS d;
+-- a pack across pages, each chunk as a put of it would be
+SELECT test_cs_put_many(:'store', ARRAY(
+		SELECT pg_temp.h('L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex'))
+		FROM generate_series(1, 300) i ORDER BY i),
+	ARRAY(SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex')
+		FROM generate_series(1, 300) i ORDER BY i)) AS stored;
+SELECT count(*) FILTER (WHERE test_cs_get(:'store', pg_temp.h(d)) = d) AS same
+FROM (SELECT 'L'::bytea || decode(repeat(md5('cs-pack-many-' || i), 40), 'hex') d
+	FROM generate_series(1, 300) i) x;
+-- freed as any chunks are: the pack's parent, and what it alone held (the
+-- chunk the store had before too)
+SELECT pg_temp.free(pg_temp.parent('cs-pack-a', 'cs-pack-b', 'cs-pack-old')) AS parent_and_three;
+SELECT pg_temp.has('cs-pack-a') AS a, pg_temp.has('cs-pack-old') AS old;
+SELECT ok, why FROM test_cs_check(:'store');
+
 -- a chunk is pinned until its put's transaction ends
 BEGIN;
 SELECT pg_temp.put('cs-leaf-d') AS d;

@@ -1,0 +1,88 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_begin a_put b_pack a_commit b_has b_dead b_free
+b: NOTICE:  table "dead0" does not exist, skipping
+step a_begin: BEGIN;
+step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+stored
+------
+t     
+(1 row)
+
+step b_pack: 
+	SELECT test_cs_put_many('pages',
+		ARRAY[substr(sha256('\x0a0101'), 1, 20), substr(sha256('\x0a0102'), 1, 20)],
+		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+ <waiting ...>
+step a_commit: COMMIT;
+step b_pack: <... completed>
+stored
+------
+     1
+(1 row)
+
+step b_has: 
+	SELECT test_cs_has('pages', substr(sha256('\x0a0101'), 1, 20)) AS first,
+		test_cs_has('pages', substr(sha256('\x0a0102'), 1, 20)) AS second;
+
+first|second
+-----+------
+t    |t     
+(1 row)
+
+step b_dead: 
+	SELECT l.dead - d.dead AS more_dead FROM test_chunk_log_space('pg_history.chunks') l, dead0 d;
+
+more_dead
+---------
+        3
+(1 row)
+
+step b_free: 
+	SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0101'), 1, 20),
+		substr(sha256('\x0a0102'), 1, 20)]) AS freed;
+
+freed
+-----
+    2
+(1 row)
+
+
+starting permutation: a_begin a_put b_pack a_rollback b_has b_free
+step a_begin: BEGIN;
+step a_put: SELECT stored FROM test_cs_put('pages', '\x0a0101');
+stored
+------
+t     
+(1 row)
+
+step b_pack: 
+	SELECT test_cs_put_many('pages',
+		ARRAY[substr(sha256('\x0a0101'), 1, 20), substr(sha256('\x0a0102'), 1, 20)],
+		ARRAY['\x0a0101', '\x0a0102']::bytea[]) AS stored;
+ <waiting ...>
+step a_rollback: ROLLBACK;
+step b_pack: <... completed>
+stored
+------
+     2
+(1 row)
+
+step b_has: 
+	SELECT test_cs_has('pages', substr(sha256('\x0a0101'), 1, 20)) AS first,
+		test_cs_has('pages', substr(sha256('\x0a0102'), 1, 20)) AS second;
+
+first|second
+-----+------
+t    |t     
+(1 row)
+
+step b_free: 
+	SELECT test_cs_free('pages', ARRAY[substr(sha256('\x0a0101'), 1, 20),
+		substr(sha256('\x0a0102'), 1, 20)]) AS freed;
+
+freed
+-----
+    2
+(1 row)
+

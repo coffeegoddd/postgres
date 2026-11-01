@@ -35,6 +35,7 @@ typedef struct MemChunk
 	uint32		len;
 	uint32		refs;
 	uint32		roots;
+	bool		fresh;			/* put_many's, its references not yet counted */
 } MemChunk;
 
 typedef struct MemPin
@@ -201,11 +202,92 @@ mem_put(ChunkStore *cs, const void *data, uint32 len, uint8 *hash)
 	c->len = len;
 	c->refs = 0;
 	c->roots = 0;
+	c->fresh = false;
 	for (int i = 0; i < refs.n; i++)
 		find(refs.hashes + i * CHUNK_HASH_LEN)->refs++;
 	if (refs.hashes)
 		pfree(refs.hashes);
 	return true;
+}
+
+/*
+ * (each checked first, its name and what it references, the store's or
+ * the pack's, so that a pack refused leaves none of it)
+ */
+static uint64
+mem_put_many(ChunkStore *cs, int n, const uint8 *hashes,
+			 const void *const *datas, const uint32 *lens)
+{
+	uint64		stored = 0;
+	uint8		hash[CHUNK_HASH_LEN];
+
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
+		RefList		refs = {0};
+
+		ChunkHash(datas[i], lens[i], hash);
+		if (memcmp(hash, h, CHUNK_HASH_LEN) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("bytes put as chunk %s do not hash to it", hash_text(h))));
+		pin(h);
+		ChunkFormat->refs(datas[i], lens[i], add_ref, &refs);
+		for (int r = 0; r < refs.n; r++)
+		{
+			const uint8 *rh = refs.hashes + r * CHUNK_HASH_LEN;
+			bool		in_pack = false;
+
+			pin(rh);
+			for (int j = 0; j < n && !in_pack; j++)
+				in_pack = memcmp(hashes + j * CHUNK_HASH_LEN, rh, CHUNK_HASH_LEN) == 0;
+			if (!in_pack && !find(rh))
+				ereport(ERROR,
+						(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+						 errmsg("chunk %s references chunk %s, which the store does not have",
+								hash_text(h), hash_text(rh))));
+		}
+		if (refs.hashes)
+			pfree(refs.hashes);
+	}
+
+	/* then stored, every one before any reference is counted */
+	for (int i = 0; i < n; i++)
+	{
+		const uint8 *h = hashes + i * CHUNK_HASH_LEN;
+		MemChunk   *c;
+		bool		found;
+
+		c = hash_search(chunks, h, HASH_ENTER, &found);
+		if (found)
+		{
+			/* (the store's already, or the pack's: a chunk counted once) */
+			if (c->data != NULL)
+				continue;
+		}
+		c->data = MemoryContextAlloc(mem_cxt, Max(lens[i], 1));
+		memcpy(c->data, datas[i], lens[i]);
+		c->len = lens[i];
+		c->refs = 0;
+		c->roots = 0;
+		c->fresh = true;
+		stored++;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		MemChunk   *c = find(hashes + i * CHUNK_HASH_LEN);
+		RefList		refs = {0};
+
+		if (!c->fresh)
+			continue;
+		c->fresh = false;
+		ChunkFormat->refs(c->data, c->len, add_ref, &refs);
+		for (int r = 0; r < refs.n; r++)
+			find(refs.hashes + r * CHUNK_HASH_LEN)->refs++;
+		if (refs.hashes)
+			pfree(refs.hashes);
+	}
+	return stored;
 }
 
 static void
@@ -405,6 +487,7 @@ const ChunkStoreRoutine MemoryChunkStore = {
 	.get = mem_get,
 	.get_many = mem_get_many,
 	.put = mem_put,
+	.put_many = mem_put_many,
 	.ref_root = mem_ref_root,
 	.unref_root = mem_unref_root,
 	.counts = mem_counts,

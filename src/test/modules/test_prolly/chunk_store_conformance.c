@@ -33,6 +33,7 @@ PG_FUNCTION_INFO_V1(test_chunk_stores);
 PG_FUNCTION_INFO_V1(test_cs_put);
 PG_FUNCTION_INFO_V1(test_cs_get);
 PG_FUNCTION_INFO_V1(test_cs_get_many);
+PG_FUNCTION_INFO_V1(test_cs_put_many);
 PG_FUNCTION_INFO_V1(test_cs_has);
 PG_FUNCTION_INFO_V1(test_cs_ref_root);
 PG_FUNCTION_INFO_V1(test_cs_unref_root);
@@ -175,6 +176,41 @@ test_cs_get_many(PG_FUNCTION_ARGS)
 	dims[0] = n;
 	PG_RETURN_ARRAYTYPE_P(construct_md_array(res, resnulls, 1, dims, lbs,
 											 BYTEAOID, -1, false, TYPALIGN_INT));
+}
+
+/* test_cs_put_many(store, hashes bytea[], datas bytea[]): how many it stored */
+Datum
+test_cs_put_many(PG_FUNCTION_ARGS)
+{
+	int			n;
+	uint8	   *hashes = hashes_arg(fcinfo, 1, &n);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			ndatas;
+	const void **datas;
+	uint32	   *lens;
+
+	deconstruct_array(PG_GETARG_ARRAYTYPE_P(2), BYTEAOID, -1, false,
+					  TYPALIGN_INT, &elems, &nulls, &ndatas);
+	if (ndatas != n)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%d hashes for %d chunks", n, ndatas)));
+	datas = palloc(Max(n, 1) * sizeof(void *));
+	lens = palloc(Max(n, 1) * sizeof(uint32));
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *b;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("a chunk's bytes are not null")));
+		b = DatumGetByteaPP(elems[i]);
+		datas[i] = VARDATA_ANY(b);
+		lens[i] = VARSIZE_ANY_EXHDR(b);
+	}
+	PG_RETURN_INT64((int64) cs_put_many(store_arg(fcinfo), n, hashes, datas, lens));
 }
 
 Datum
