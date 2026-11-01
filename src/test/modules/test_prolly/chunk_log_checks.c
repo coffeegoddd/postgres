@@ -115,7 +115,8 @@ Datum
 test_chunk_log_regions(PG_FUNCTION_ARGS)
 {
 	Relation	rel = open_log(PG_GETARG_OID(0), AccessShareLock);
-	ChunkRegionSet *set = ChunkRegionLive(rel->rd_locator);
+	ChunkRegionSet *set = ChunkRegionLive(rel->rd_locator,
+										  ChunkLogGeneration(rel));
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT32(set->n);

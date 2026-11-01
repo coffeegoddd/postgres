@@ -91,5 +91,109 @@ SELECT ok, chunks FROM test_chunk_check('al2', 'ai2');
  t  |      2
 (1 row)
 
-DROP TABLE al, ai, al2, ai2;
+-- a region forgotten, its relcache entry invalidated (a GRANT), let go of
+-- as the transaction ends; the next put in another region, the first
+-- then VACUUM's to let go of
+CREATE TABLE al3 () USING prolly_chunks;
+CREATE TABLE ai3 () USING prolly_chunk_index;
+SELECT test_chunk_put('al3', 'ai3', ah(ablob('f1')), ablob('f1')) AS put;
+ put 
+-----
+ t
+(1 row)
+
+SELECT test_chunk_log_regions('al3') AS regions;
+ regions 
+---------
+       1
+(1 row)
+
+GRANT SELECT ON al3 TO PUBLIC;
+SELECT test_chunk_log_regions('al3') AS regions_forgotten;
+ regions_forgotten 
+-------------------
+                 0
+(1 row)
+
+SELECT test_chunk_put('al3', 'ai3', ah(ablob('f2')), ablob('f2')) AS put;
+ put 
+-----
+ t
+(1 row)
+
+SELECT pages, full_pages FROM test_chunk_log_space('al3');
+ pages | full_pages 
+-------+------------
+     2 |          0
+(1 row)
+
+VACUUM ai3;
+SELECT pages, full_pages AS first_region_let_go FROM test_chunk_log_space('al3');
+ pages | first_region_let_go 
+-------+---------------------
+    33 |                  32
+(1 row)
+
+SELECT ok, chunks FROM test_chunk_check('al3', 'ai3');
+ ok | chunks 
+----+--------
+ t  |      2
+(1 row)
+
+-- a backend with regions in more logs than it has room for: the one used
+-- longest ago let go of, never appended to again, VACUUM's to let go of
+CREATE FUNCTION make_logs(n int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		EXECUTE format('CREATE TABLE ol%s () USING prolly_chunks', i);
+		EXECUTE format('CREATE TABLE oi%s () USING prolly_chunk_index', i);
+	END LOOP;
+END $$;
+SELECT make_logs(9);
+ make_logs 
+-----------
+ 
+(1 row)
+
+SELECT count(*) FILTER (WHERE test_chunk_put(('ol' || i)::regclass, ('oi' || i)::regclass,
+	ah(ablob('o' || i)), ablob('o' || i))) AS put FROM generate_series(1, 9) i;
+ put 
+-----
+   9
+(1 row)
+
+SELECT test_chunk_log_regions('ol1') AS first_let_go, test_chunk_log_regions('ol9') AS last_held;
+ first_let_go | last_held 
+--------------+-----------
+            0 |         1
+(1 row)
+
+SELECT test_chunk_put('ol1', 'oi1', ah(ablob('o1b')), ablob('o1b')) AS put_again;
+ put_again 
+-----------
+ t
+(1 row)
+
+SELECT pages, full_pages FROM test_chunk_log_space('ol1');
+ pages | full_pages 
+-------+------------
+     2 |          0
+(1 row)
+
+VACUUM oi1;
+SELECT pages, full_pages AS old_region_let_go FROM test_chunk_log_space('ol1');
+ pages | old_region_let_go 
+-------+-------------------
+    33 |                32
+(1 row)
+
+SELECT ok, chunks FROM test_chunk_check('ol1', 'oi1');
+ ok | chunks 
+----+--------
+ t  |      2
+(1 row)
+
+DROP TABLE al, ai, al2, ai2, al3, ai3;
+DO $$BEGIN FOR i IN 1 .. 9 LOOP EXECUTE format('DROP TABLE ol%s, oi%s', i, i); END LOOP; END $$;
+DROP FUNCTION make_logs(int);
 DROP FUNCTION ah(bytea), ablob(text);
