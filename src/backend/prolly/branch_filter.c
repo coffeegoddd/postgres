@@ -1150,6 +1150,24 @@ CatalogBranchCheckDependencies(const ObjectAddress *depender,
 			 */
 			if (isAnyTempNamespace(nspid) || nspid == PG_TOAST_NAMESPACE)
 				continue;
+
+			/*
+			 * A standalone composite type's relation depends on its row
+			 * type, which is made, and its dependency recorded, before the
+			 * relation's row is: the row type names the relation as its own
+			 */
+			if (!OidIsValid(nspid) && deptype == DEPENDENCY_INTERNAL &&
+				depender->classId == RelationRelationId &&
+				referenced[i].classId == TypeRelationId)
+			{
+				Datum		typrelid;
+
+				if (read_column(TypeRelationId, TypeOidIndexId, Anum_pg_type_oid,
+								referenced[i].objectId, Anum_pg_type_typrelid,
+								&typrelid) &&
+					DatumGetObjectId(typrelid) == depender->objectId)
+					continue;
+			}
 		}
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),

@@ -119,7 +119,8 @@ SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b7, :b8));
 
 -- a branch with an object the copy doesn't know is refused, and nothing made
 SET catalog_branch = :b3;
-CREATE SCHEMA app VERSIONED CREATE TABLE t (x int) CREATE VIEW v AS SELECT x FROM t;
+CREATE SCHEMA app VERSIONED CREATE TABLE t (x int);
+CREATE AGGREGATE app.total(int) (sfunc = int4pl, stype = int);
 RESET catalog_branch;
 SELECT pg_branch_catalog_copy(:b3, :b4);
 SET catalog_branch_filter = off;
@@ -128,6 +129,79 @@ RESET catalog_branch_filter;
 -- nor onto a branch that has schemas, or from a branch to itself
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b2));
 SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b1, :b1));
+
+-- functions, triggers, policies, views, rules, and types of the branch's own
+SELECT pg_branch_id_allocate() AS b9 \gset
+SELECT pg_branch_id_allocate() AS b10 \gset
+CREATE ROLE regress_copy_reader;
+SET catalog_branch = :b9;
+CREATE SCHEMA app VERSIONED;
+CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'glad');
+CREATE TYPE app.pair AS (a int, b int);
+CREATE TYPE app.span AS RANGE (subtype = int);
+CREATE DOMAIN app.small AS int CHECK (VALUE < 100) DEFAULT 7;
+CREATE TABLE app.items (id int PRIMARY KEY, owner text, n app.small, cnt int DEFAULT 0);
+CREATE TABLE app.log (item int, what text);
+CREATE FUNCTION app.double(x int) RETURNS int LANGUAGE sql IMMUTABLE RETURN x * 2;
+CREATE FUNCTION app.pair_sum(p app.pair) RETURNS int LANGUAGE sql RETURN p.a + p.b;
+CREATE FUNCTION app.happier(m app.mood) RETURNS bool LANGUAGE sql RETURN m > 'ok'::app.mood;
+CREATE FUNCTION app.in_span(x int) RETURNS bool LANGUAGE sql RETURN x <@ app.span(1, 10);
+CREATE FUNCTION app.logit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN INSERT INTO app.log VALUES (NEW.id, TG_OP); RETURN NEW; END $$;
+CREATE TRIGGER items_log AFTER INSERT ON app.items FOR EACH ROW EXECUTE FUNCTION app.logit();
+CREATE VIEW app.doubled AS SELECT id, app.double(n) AS d FROM app.items WHERE n > 1;
+CREATE VIEW app.glad AS SELECT 'glad'::app.mood > 'ok'::app.mood AS gladder;
+CREATE MATERIALIZED VIEW app.counted AS SELECT count(*) AS c FROM app.items;
+CREATE RULE items_count AS ON UPDATE TO app.items DO ALSO
+	INSERT INTO app.log VALUES (NEW.id, 'updated');
+ALTER TABLE app.items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own ON app.items FOR SELECT USING (owner = current_user);
+GRANT USAGE ON SCHEMA app TO regress_copy_reader;
+GRANT SELECT ON app.items TO regress_copy_reader;
+INSERT INTO app.items (id, owner, n) VALUES (1, 'regress_copy_reader', 5);
+RESET catalog_branch;
+SELECT pg_branch_catalog_copy(:b9, :b10);
+
+SET catalog_branch = :b10;
+SELECT proname FROM pg_proc WHERE pronamespace = 'app'::regnamespace ORDER BY 1;
+SELECT app.double(21), app.pair_sum(ROW(1, 2)::app.pair), app.happier('glad'), app.in_span(5);
+SELECT * FROM app.glad;
+-- the trigger, the rule, the view and the domain act on b10's own objects
+INSERT INTO app.items (id, owner) VALUES (2, 'regress_copy_reader') RETURNING n;
+INSERT INTO app.items (id, owner, n) VALUES (3, 'x', 500);
+UPDATE app.items SET cnt = 1 WHERE id = 2;
+SELECT * FROM app.log ORDER BY 1, 2;
+SELECT * FROM app.doubled ORDER BY 1;
+REFRESH MATERIALIZED VIEW app.counted;
+SELECT * FROM app.counted;
+-- the policy: another role sees only its own rows
+INSERT INTO app.items (id, owner, n) VALUES (4, 'someone else', 2);
+SET ROLE regress_copy_reader;
+SELECT id FROM app.items ORDER BY 1;
+RESET ROLE;
+-- b9's are as they were
+SET catalog_branch = :b9;
+SELECT count(*) AS b9_log FROM app.log;
+SELECT count(*) AS b9_items FROM app.items;
+
+-- a table storing values of the branch's own enum, or range, is refused:
+-- its data, which the branches share, names their object ids
+SELECT pg_branch_id_allocate() AS b11 \gset
+SET catalog_branch = :b9;
+CREATE TABLE app.moods (m app.mood);
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
+SET catalog_branch = :b9;
+DROP TABLE app.moods;
+CREATE TABLE app.spans (s app.span[]);
+RESET catalog_branch;
+SELECT pg_temp.try(format('SELECT pg_branch_catalog_copy(%s, %s)', :b9, :b11));
+
+SET client_min_messages = warning;
+RESET catalog_branch;
+SELECT pg_branch_catalog_drop(:b9), pg_branch_catalog_drop(:b10);
+DROP ROLE regress_copy_reader;
+RESET client_min_messages;
 
 SET client_min_messages = warning;
 SELECT pg_branch_catalog_drop(:b1), pg_branch_catalog_drop(:b2), pg_branch_catalog_drop(:b3),
