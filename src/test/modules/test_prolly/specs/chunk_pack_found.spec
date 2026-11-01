@@ -44,6 +44,7 @@ step p_pack		{
 	SELECT test_cs_put_many('pages', ARRAY[pf_h(pf_p1()), pf_h(pf_p2()), pf_h('\x0a0901')],
 		ARRAY[pf_p1(), pf_p2(), '\x0a0901'::bytea]) AS stored;
 }
+step p_packed	{ SELECT 'packed' AS p; }
 step p_commit	{ COMMIT; SELECT injection_points_detach('chunk-pack-found'); }
 
 session q
@@ -70,4 +71,5 @@ step o_has		{
 permutation q_begin q_pack o_free_all q_commit o_has
 # a parent freed between the pack's finding and holding it: put again,
 # the leaf held by the other parent
-permutation p_attach p_begin p_pack o_free_p1 o_wake o_free_all(p_pack) p_commit o_has
+# (p_packed, the pack's session's next, once the pack is done)
+permutation p_attach p_begin p_pack o_free_p1 o_wake p_packed o_free_all p_commit o_has
