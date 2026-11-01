@@ -3,6 +3,8 @@
 -- go of; every change of counts is its transaction's; VACUUM adds them up;
 -- and the audit checks every count against the edges.
 CREATE EXTENSION IF NOT EXISTS test_prolly;
+-- (chunks nothing holds kept across VACUUM: no freer in the background)
+SET chunk_free_in_background = off;
 SELECT test_chunk_format_refs(true);
 CREATE TABLE rl () USING prolly_chunks;
 CREATE TABLE ri () USING prolly_chunk_index;

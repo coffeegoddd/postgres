@@ -17,12 +17,14 @@ teardown
 }
 
 session f
+setup		{ SET chunk_free_in_background = off; }
 step f_begin	{ BEGIN; }
 step f_free		{ SELECT test_chunk_free('fl', 'fi', substr(sha256('\x01'), 1, 20)) AS freed; }
 step f_commit	{ COMMIT; }
 step f_rollback	{ ROLLBACK; }
 
 session p
+setup		{ SET chunk_free_in_background = off; }
 step p_begin	{ BEGIN; }
 step p_put		{ SELECT test_chunk_put('fl', 'fi', substr(sha256('\x01'), 1, 20), '\x01') AS stored; }
 step p_ref		{ SELECT roots FROM test_chunk_ref_root('fi', substr(sha256('\x01'), 1, 20)); }

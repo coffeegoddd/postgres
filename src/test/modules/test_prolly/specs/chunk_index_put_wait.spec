@@ -15,12 +15,14 @@ teardown
 }
 
 session a
+setup		{ SET chunk_free_in_background = off; }
 step a_begin	{ BEGIN; }
 step a_put		{ SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01'); }
 step a_commit	{ COMMIT; }
 step a_rollback	{ ROLLBACK; }
 
 session b
+setup		{ SET chunk_free_in_background = off; }
 step b_has		{ SELECT test_chunk_has('cl', 'ci', substr(sha256('\x01'), 1, 20)); }
 step b_put		{ SELECT test_chunk_put('cl', 'ci', substr(sha256('\x01'), 1, 20), '\x01'); }
 step b_dead		{ SELECT dead FROM test_chunk_log_space('cl'); }

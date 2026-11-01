@@ -22,9 +22,11 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
+#include "prolly/chunk_format.h"
 #include "prolly/chunk_freer.h"
 #include "prolly/chunk_index.h"
 #include "prolly/chunk_log.h"
@@ -51,6 +53,14 @@ ChunkFreerLaunch(Oid log, Oid idx)
 	ChunkFreerArgs args;
 
 	if (!chunk_free_in_background)
+		return false;
+
+	/*
+	 * (the freer frees by the leaf format, the only one a backend starts
+	 * with: from a session using another it would let go of no chunk's
+	 * references, which would stay counted)
+	 */
+	if (ChunkFormat != &LeafChunkFormat)
 		return false;
 	memset(&bgw, 0, sizeof(bgw));
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -84,6 +94,16 @@ ChunkFreerMain(Datum main_arg)
 
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "freeing chunks nothing holds");
+
+	/* (one freer of an index at a time: another would do the same again) */
+	if (!ConditionalLockDatabaseObject(RelationRelationId, args.idx, 0,
+									   ExclusiveLock))
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		proc_exit(0);
+	}
 	log = try_relation_open(args.log, AccessShareLock);
 	idx = try_relation_open(args.idx, RowExclusiveLock);
 	if (log == NULL || idx == NULL || !RelationIsChunkLog(log) ||

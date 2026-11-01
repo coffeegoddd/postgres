@@ -52,7 +52,9 @@
 #include "storage/bulk_write.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/timestamp.h"
 #include "utils/injection_point.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -1196,6 +1198,7 @@ page_adjust(Relation idx, const uint8 *hash, int32 drefs, int32 droots,
 		 */
 		chain_room(idx, primary, &space, &last);
 		(void) add_entry(idx, primary, bucket, space, last, &change);
+		pgstat_count_heap_insert(idx, 1);
 	}
 	UnlockReleaseBuffer(primary);
 	return true;
@@ -1245,6 +1248,7 @@ page_free(Relation idx, const uint8 *hash, bool (*held) (const uint8 *hash),
 	e->xmax = xid;
 	e->flags &= ~(CHUNK_ENTRY_XMAX_COMMITTED | CHUNK_ENTRY_XMAX_ABORTED);
 	GenericXLogFinish(st);
+	pgstat_count_heap_delete(idx);
 	out->refs = 0;
 	out->roots = 0;
 	release_found(primary, found);
@@ -1793,14 +1797,25 @@ vacuum_fate(const ChunkIndexEntry *e, uint32 bucket, const IndexCache *masks,
 
 /*
  * The chunks on the bucket's chain nothing holds: counts zero, no change
- * of them left (VACUUM has added the committed ones in), not being freed.
+ * of them left on the chain (VACUUM has added the committed ones in), not
+ * being freed.  (A count, for whether to start a freer, which looks again.)
  */
 static uint64
 count_unheld(Relation idx, Buffer primary)
 {
-	Buffer		cur = primary;
+	HTAB	   *changed;
+	HASHCTL		ctl;
+	ChunkIndexEntry *zero = NULL;
+	int			nzero = 0,
+				cap = 0;
 	uint64		n = 0;
+	Buffer		cur = primary;
 
+	ctl.keysize = CHUNK_HASH_LEN;
+	ctl.entrysize = CHUNK_HASH_LEN;
+	ctl.hcxt = CurrentMemoryContext;
+	changed = hash_create("chunks changed", 64, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	for (;;)
 	{
 		Page		page = BufferGetPage(cur);
@@ -1810,31 +1825,44 @@ count_unheld(Relation idx, Buffer primary)
 		for (int i = 0; i < ne; i++)
 		{
 			ChunkIndexEntry *e = page_entry(page, i);
-			bool		changed = false;
 
-			if (e->kind != CHUNK_KIND_CHUNK || e->refs != 0 || e->roots != 0 ||
-				TransactionIdIsValid(e->xmax) ||
-				entry_state_unhinted(e) != ENTRY_VISIBLE)
-				continue;
-			for (int j = 0; j < ne && !changed; j++)
-				changed = change_of(page_entry(page, j), e);
-			if (!changed)
-				n++;
+			if (e->kind == CHUNK_KIND_CHANGE)
+				(void) hash_search(changed, e->hash, HASH_ENTER, NULL);
+			else if (e->refs == 0 && e->roots == 0 &&
+					 !TransactionIdIsValid(e->xmax) &&
+					 entry_state_unhinted(e) == ENTRY_VISIBLE)
+			{
+				if (nzero == cap)
+				{
+					cap = cap ? cap * 2 : 64;
+					zero = zero ? repalloc(zero, cap * sizeof(*zero)) :
+						palloc(cap * sizeof(*zero));
+				}
+				zero[nzero++] = *e;
+			}
 		}
 		if (cur != primary)
 			UnlockReleaseBuffer(cur);
 		if (!BlockNumberIsValid(next))
-			return n;
+			break;
 		cur = ReadBuffer(idx, next);
-		LockBuffer(cur, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(cur, BUFFER_LOCK_SHARE);
 		check_ipage(idx, next, BufferGetPage(cur), INDEX_PAGE_OVERFLOW);
 	}
+	for (int i = 0; i < nzero; i++)
+		if (hash_search(changed, zero[i].hash, HASH_FIND, NULL) == NULL)
+			n++;
+	hash_destroy(changed);
+	if (zero)
+		pfree(zero);
+	return n;
 }
 
 void
 ChunkIndexVacuum(Relation idx)
 {
 	TransactionId frozen = GetOldestNonRemovableTransactionId(idx);
+	TimestampTz starttime = GetCurrentTimestamp();
 	double		kept_entries = 0;
 	Relation	log = NULL;
 	bool		log_tried = false;
@@ -1965,6 +1993,9 @@ ChunkIndexVacuum(Relation idx)
 
 	vac_update_relstats(idx, RelationGetNumberOfBlocks(idx), kept_entries, 0, 0,
 						false, frozen, InvalidMultiXactId, NULL, NULL, false);
+
+	/* (as a heap's VACUUM does: autovacuum counts inserts from here) */
+	pgstat_report_vacuum(idx, (PgStat_Counter) kept_entries, 0, starttime);
 }
 
 uint64
