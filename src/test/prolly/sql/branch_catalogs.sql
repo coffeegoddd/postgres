@@ -189,6 +189,12 @@ SET enable_indexscan = on;
 SELECT pg_temp.cursor_rows(:'q', :b2) AS by_indexscan;
 RESET enable_seqscan;
 RESET enable_indexscan;
+-- (a scan that begins after the switch, as the second of a UNION ALL
+-- does, sees the new branch's)
+SELECT format('SELECT relname AS x FROM pg_class WHERE relname = ''pg_class''
+	UNION ALL SELECT CASE oid WHEN %s THEN ''b1'' WHEN %s THEN ''b2'' END
+	FROM pg_class WHERE relname = ''t''', :t1, :t2) AS q \gset
+SELECT pg_temp.cursor_rows(:'q', :b2) AS by_union;
 SELECT current_setting('catalog_branch')::int = :b1 AS back_on_b1;
 SET catalog_branch = :b2;
 

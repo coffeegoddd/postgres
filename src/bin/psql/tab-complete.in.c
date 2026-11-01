@@ -3765,6 +3765,9 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH("CREATE", "GRANT", "VERSIONED");
 	else if (Matches("CREATE", "SCHEMA", MatchAny))
 		COMPLETE_WITH("AUTHORIZATION", "CREATE", "GRANT", "VERSIONED");
+	else if (Matches("CREATE", "SCHEMA", MatchAny, "VERSIONED") ||
+			 Matches("CREATE", "SCHEMA", MatchAny, "AUTHORIZATION", MatchAny, "VERSIONED"))
+		COMPLETE_WITH("CREATE", "GRANT");
 
 /* CREATE SEQUENCE --- is allowed inside CREATE SCHEMA, so use TailMatches */
 	else if (TailMatches("CREATE", "SEQUENCE", MatchAny) ||

@@ -110,12 +110,6 @@ SET catalog_branch = :b1;
 SELECT lastval() = :gave AS kept;
 SELECT to_regclass('app.seq') IS NULL AS b1_has_none;
 
--- DISCARD ALL goes back to no branch, as RESET ALL does
-DISCARD ALL;
-SHOW catalog_branch;
-SELECT to_regclass('app.t') IS NULL AS app_unseen;
-SET catalog_branch = :b1;
-
 -- nor does plpgsql's session-wide cache of casts outlive one (it casts a
 -- function's result to its result type): a shared cast function, inlined,
 -- calls the branch's own function
@@ -142,3 +136,8 @@ SET catalog_branch = :b2;
 DROP SCHEMA app CASCADE;
 RESET catalog_branch;
 DROP SCHEMA pubf CASCADE;
+
+-- DISCARD ALL goes back to no branch, as RESET ALL does
+SET catalog_branch = :b1;
+DISCARD ALL;
+SHOW catalog_branch;

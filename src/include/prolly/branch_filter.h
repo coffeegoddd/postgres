@@ -41,8 +41,10 @@ extern PGDLLIMPORT bool catalog_branch_filter;
 /*
  * The branch whose rows, and the shared ones, a scan of rel with snapshot
  * sees: the session's when the scan begins, kept for the whole scan, so
- * that a cursor's rows are one branch's however the session's changes
- * meanwhile; CATALOG_BRANCH_UNFILTERED if the scan hides nothing.
+ * that a scan a cursor has begun goes on seeing one branch's rows however
+ * the session's changes meanwhile; CATALOG_BRANCH_UNFILTERED if the scan
+ * hides nothing.  (A scan that begins after the change, as executor nodes
+ * begin theirs on their first row, sees the new branch's.)
  */
 #define CATALOG_BRANCH_UNFILTERED (-1)
 extern int32 CatalogBranchFilters(Relation rel, Snapshot snapshot);

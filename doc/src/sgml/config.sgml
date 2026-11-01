@@ -10319,14 +10319,21 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         session sees only shared schemas.  A branch is a number from
         <function>pg_branch_id_allocate()</function>; a versioned schema
         cannot be made on one not handed out.  A function in a versioned schema runs on its
-        schema's branch, whatever the caller's.
+        schema's branch, whatever the caller's, unless its definition sets
+        <varname>catalog_branch</varname>.
        </para>
        <para>
-        Client tools that run over every table, such as
-        <application>vacuumdb</application>, <application>reindexdb</application>
-        and <application>pg_amcheck</application>, see only the tables of the
+        Commands and client tools that list the tables to work on with a
+        query of the catalogs, such as <application>vacuumdb</application>,
+        <application>reindexdb</application> with <option>-j</option> and
+        <application>pg_amcheck</application>, see only the tables of the
         branch their sessions are on; to run them on a branch, set it in
         <envar>PGOPTIONS</envar> (<literal>-c catalog_branch=N</literal>).
+        <command>VACUUM</command> and <command>ANALYZE</command> without a
+        table, <command>REINDEX DATABASE</command> and
+        <command>REINDEX SYSTEM</command> (and so
+        <application>reindexdb</application> without <option>-j</option>)
+        work on every branch's tables.
        </para>
       </listitem>
      </varlistentry>
